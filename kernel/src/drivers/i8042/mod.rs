@@ -575,19 +575,25 @@ fn aux_reenable() {
 }
 
 pub fn init(rsdp_addr: u64) {
+    // Three answers, and only one of them is firmware's. A refusal from the
+    // parser says nothing about the hardware — it says the table could not be
+    // believed — so it must never be spelled the way "absent" is, and it must
+    // not stop the probe. On a laptop with a dead keyboard this line is the
+    // whole question: did firmware tell us not to touch the controller, or did
+    // we decide that for ourselves out of a table we could not read?
     match crate::drivers::acpi::iapc_boot_arch(rsdp_addr) {
         // Bit 1 is "8042 present", and it is only meaningful from revision 2.
         // On a machine that clears it, 0x60/0x64 may be decoded by something
         // else, so they are never touched at all.
-        Some((revision, flags)) if revision >= 2 && flags & 0x0002 == 0 => {
+        Ok((revision, flags)) if revision >= 2 && flags & 0x0002 == 0 => {
             log!("i8042: absent (FADT rev {} iapc_boot_arch={:#06x})", revision, flags);
             return;
         }
-        Some((revision, flags)) if revision < 2 => {
+        Ok((revision, flags)) if revision < 2 => {
             log!("i8042: FADT rev {} says nothing (flags {:#06x}), probing", revision, flags);
         }
-        Some(_) => {}
-        None => log!("i8042: no FADT, probing"),
+        Ok(_) => {}
+        Err(e) => log!("i8042: no trustworthy FADT ({e:?}) — firmware said nothing either way, probing"),
     }
 
     // The whole probe, from the first port touch to the last. Every stage

@@ -3,6 +3,21 @@ use crate::fs::FsError;
 
 const BITS_PER_BLOCK: u64 = (BLOCK_SIZE * 8) as u64;
 
+/// A run of blocks the allocator actually reserved.
+///
+/// `len` is what you got, never what you asked for. The pair this replaced was
+/// `(BlockNum, u32)`, which reads as "here is your block, and how many" and was
+/// destructured positionally at three sites; one of them then addressed a block
+/// past the end of the short run it had just recorded, so a sparse write on a
+/// fragmented volume landed on another file. A struct cannot be read as "all
+/// of it" by accident.
+#[must_use]
+#[derive(Debug, Clone, Copy)]
+pub struct Run {
+    pub start: BlockNum,
+    pub len: u32,
+}
+
 /// Bitmap-based block allocator.
 ///
 /// The bitmap is stored on disk starting at `bitmap_start` and spanning
@@ -73,21 +88,48 @@ impl BitmapAllocator {
 
     /// Allocate a single block.
     pub fn alloc_block(&mut self, io: &dyn BlockIO) -> Result<BlockNum, FsError> {
-        match self.alloc_contiguous(io, 1)? {
-            (block, 1) => Ok(block),
-            _ => unreachable!(),
-        }
+        Ok(self.alloc_exact(io, 1)?.start)
     }
 
-    /// Try to allocate up to `wanted` contiguous blocks.
+    /// Reserve as much of `wanted` as one contiguous run can cover.
     ///
-    /// Returns (start_block, actual_count) where actual_count >= 1.
-    /// Scans from `next_alloc` cursor, wrapping once around the bitmap.
-    pub fn alloc_contiguous(
-        &mut self,
-        io: &dyn BlockIO,
-        wanted: u32,
-    ) -> Result<(BlockNum, u32), FsError> {
+    /// The run is never empty and may be shorter than asked for, so every
+    /// caller has to loop or has to be wrong.
+    pub fn alloc_up_to(&mut self, io: &dyn BlockIO, wanted: u32) -> Result<Run, FsError> {
+        // A zero-length run would let a caller's loop spin without progress.
+        let wanted = wanted.max(1);
+        let (start, len) = self.longest_free_run(io, wanted)?;
+        Ok(self.reserve(io, start, len.min(wanted)))
+    }
+
+    /// Reserve all of `count` or nothing, for callers that cannot place a
+    /// short run. Nothing is marked used unless the whole run is there.
+    pub fn alloc_exact(&mut self, io: &dyn BlockIO, count: u32) -> Result<Run, FsError> {
+        let (start, len) = self.longest_free_run(io, count)?;
+        if len < count {
+            return Err(FsError::NoSpace {
+                requested: count,
+                available: self.free_blocks,
+            });
+        }
+        Ok(self.reserve(io, start, count))
+    }
+
+    /// Mark a run used and move the cursor past it.
+    fn reserve(&mut self, io: &dyn BlockIO, start: u64, len: u32) -> Run {
+        let start_block = BlockNum::new(start);
+        self.set_range_used(io, start_block, len as u64);
+        self.free_blocks -= len as u64;
+        self.next_alloc = start + len as u64;
+        if self.next_alloc >= self.total_blocks {
+            self.next_alloc = 0;
+        }
+        Run { start: start_block, len }
+    }
+
+    /// The longest free run found scanning from the `next_alloc` cursor,
+    /// wrapping once, stopping early once `wanted` blocks are in hand.
+    fn longest_free_run(&self, io: &dyn BlockIO, wanted: u32) -> Result<(u64, u32), FsError> {
         if self.free_blocks == 0 {
             return Err(FsError::NoSpace {
                 requested: wanted,
@@ -168,18 +210,7 @@ impl BitmapAllocator {
             available: self.free_blocks,
         })?;
 
-        let count = best_count.min(wanted);
-        let start_block = BlockNum::new(start);
-
-        // Mark allocated blocks as used
-        self.set_range_used(io, start_block, count as u64);
-        self.free_blocks -= count as u64;
-        self.next_alloc = start + count as u64;
-        if self.next_alloc >= total {
-            self.next_alloc = 0;
-        }
-
-        Ok((start_block, count))
+        Ok((start, best_count))
     }
 
     /// Free a contiguous range of blocks.

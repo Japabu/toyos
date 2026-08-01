@@ -7,8 +7,19 @@ use crate::fs::FsError;
 pub const NODE_MAGIC: [u8; 4] = *b"BTND";
 const NODE_HEADER_SIZE: usize = 32;
 const KEY_HEADER_SIZE: usize = 24;
-const CRC_START: usize = 8; // CRC covers bytes [8..4096]
+pub(crate) const CRC_START: usize = 8; // CRC covers bytes [8..4096]
 const MAX_PAYLOAD: usize = BLOCK_SIZE - NODE_HEADER_SIZE;
+
+/// A child pointer is one block number, and nothing else ever appears in an
+/// interior node's value.
+const CHILD_VALUE_SIZE: usize = 8;
+const CHILD_DISK_SIZE: usize = (KEY_HEADER_SIZE + CHILD_VALUE_SIZE + 7) & !7;
+
+/// The most entries a 4096-byte block can physically hold.
+///
+/// The count is a `u16` on disk with 387 times this range, and it used to size
+/// a `Vec` before a single byte of the block had been looked at.
+const MAX_ENTRIES: usize = MAX_PAYLOAD / KEY_HEADER_SIZE;
 
 /// The largest `Entry::disk_size` any node can ever hold.
 ///
@@ -20,8 +31,8 @@ const MAX_PAYLOAD: usize = BLOCK_SIZE - NODE_HEADER_SIZE;
 /// one extent per discontiguous run of a file).
 pub const MAX_ENTRY_SIZE: usize = MAX_PAYLOAD;
 
-/// Total on-disk size of a node holding these entries.
-fn node_size(entries: &[Entry]) -> usize {
+/// Total on-disk size of a leaf holding these entries.
+fn leaf_size(entries: &[Entry]) -> usize {
     NODE_HEADER_SIZE + entries.iter().map(|e| e.disk_size()).sum::<usize>()
 }
 
@@ -32,6 +43,28 @@ pub fn check_entry_fits(entry: &Entry) -> Result<(), FsError> {
         return Err(FsError::EntryTooLarge { size, max: MAX_ENTRY_SIZE });
     }
     Ok(())
+}
+
+/// How much further a descent is allowed to go.
+///
+/// The shape of the tree is on the disk, and a disk is not ours. A child
+/// pointer naming its own node, or any cycle at all, is a descent that never
+/// reaches a leaf; nothing in the block format forbids one, so the bound is
+/// carried by the only operation that can go deeper.
+#[derive(Clone, Copy)]
+struct Depth(u8);
+
+impl Depth {
+    /// A B+ tree whose interior nodes hold at least two children is at most
+    /// `log2(blocks)` deep, and a block number is a `u64`.
+    const ROOT: Self = Self(64);
+
+    fn descend(self, from: BlockNum) -> Result<Self, FsError> {
+        match self.0.checked_sub(1) {
+            Some(left) => Ok(Self(left)),
+            None => Err(FsError::TreeTooDeep(from)),
+        }
+    }
 }
 
 /// On-disk key stored in B+ tree nodes.
@@ -85,7 +118,7 @@ impl TryFrom<u16> for KeyType {
     }
 }
 
-/// A key-value entry in a B+ tree node.
+/// A key-value entry in a B+ tree leaf.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub key: Key,
@@ -100,25 +133,62 @@ impl Entry {
     }
 }
 
-/// Parsed B+ tree node.
-pub struct Node {
-    pub level: u16,
-    pub entries: Vec<Entry>,
+/// A child pointer: the minimum key of the subtree, and the block it lives in.
+#[derive(Debug, Clone, Copy)]
+pub struct Child {
+    pub key: Key,
+    pub block: BlockNum,
+}
+
+/// A parsed B+ tree node.
+///
+/// The variant *is* the leaf/interior distinction. It is decided once, by
+/// [`Node::parse`], which is also where a child pointer is turned into a
+/// `BlockNum` — checked to be eight bytes long and to name a block that exists
+/// on the device. Six descent sites used to do that decode themselves, from a
+/// value whose length nothing had constrained.
+///
+/// `level` rides along so the header round-trips; the only arithmetic on it is
+/// the checked increment that gives a new root its level.
+pub enum Node {
+    Leaf(Vec<Entry>),
+    /// `children` is never empty: an interior node with no children is a
+    /// subtree with no bottom.
+    Interior { level: u16, children: Vec<Child> },
 }
 
 impl Node {
-    pub fn is_leaf(&self) -> bool {
-        self.level == 0
+    fn level(&self) -> u16 {
+        match self {
+            Node::Leaf(_) => 0,
+            Node::Interior { level, .. } => *level,
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            Node::Leaf(entries) => entries.len(),
+            Node::Interior { children, .. } => children.len(),
+        }
+    }
+
+    /// Bytes this node's entries occupy after the header.
+    fn payload_size(&self) -> usize {
+        match self {
+            Node::Leaf(entries) => entries.iter().map(|e| e.disk_size()).sum(),
+            Node::Interior { children, .. } => children.len() * CHILD_DISK_SIZE,
+        }
     }
 
     /// Read and parse a node from disk, verifying magic and CRC.
     pub fn read(io: &dyn BlockIO, block: BlockNum) -> Result<Self, FsError> {
+        let device_blocks = io.block_count();
         let mut buf = BlockBuf::zeroed();
         io.read_block(block, &mut buf);
-        Self::parse(&buf, block)
+        Self::parse(&buf, block, device_blocks)
     }
 
-    fn parse(buf: &BlockBuf, block: BlockNum) -> Result<Self, FsError> {
+    fn parse(buf: &BlockBuf, block: BlockNum, device_blocks: u64) -> Result<Self, FsError> {
         let b = buf.as_bytes();
 
         let magic = [b[0], b[1], b[2], b[3]];
@@ -129,7 +199,7 @@ impl Node {
             });
         }
 
-        let stored_crc = u32::from_le_bytes(b[4..8].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
         let computed_crc = crc32c(&b[CRC_START..]);
         if stored_crc != computed_crc {
             return Err(FsError::ChecksumMismatch {
@@ -139,10 +209,17 @@ impl Node {
             });
         }
 
-        let level = u16::from_le_bytes(b[8..10].try_into().unwrap());
-        let entry_count = u16::from_le_bytes(b[10..12].try_into().unwrap()) as usize;
+        let level = u16::from_le_bytes([b[8], b[9]]);
+        let entry_count = u16::from_le_bytes([b[10], b[11]]) as usize;
+        if entry_count > MAX_ENTRIES {
+            return Err(FsError::CorruptedNode(block));
+        }
 
-        let mut entries = Vec::with_capacity(entry_count);
+        // Grown, not reserved: `entry_count` is a number off the disk, and
+        // reserving from it asked the kernel allocator for 3,145,680 bytes
+        // against a 2 MiB ceiling. What the block can actually hold is what
+        // gets allocated, and the refusal above is the fail-fast on top.
+        let mut entries: Vec<Entry> = Vec::new();
         let mut offset = NODE_HEADER_SIZE;
 
         for _ in 0..entry_count {
@@ -150,13 +227,15 @@ impl Node {
                 return Err(FsError::CorruptedNode(block));
             }
 
-            let name_hash = u64::from_le_bytes(b[offset..offset + 8].try_into().unwrap());
-            let name_hash_hi =
-                u64::from_le_bytes(b[offset + 8..offset + 16].try_into().unwrap());
-            let key_type_raw =
-                u16::from_le_bytes(b[offset + 16..offset + 18].try_into().unwrap());
-            let val_len =
-                u32::from_le_bytes(b[offset + 18..offset + 22].try_into().unwrap()) as usize;
+            let name_hash = read_u64(b, offset);
+            let name_hash_hi = read_u64(b, offset + 8);
+            let key_type_raw = u16::from_le_bytes([b[offset + 16], b[offset + 17]]);
+            let val_len = u32::from_le_bytes([
+                b[offset + 18],
+                b[offset + 19],
+                b[offset + 20],
+                b[offset + 21],
+            ]) as usize;
 
             let key_type = KeyType::try_from(key_type_raw)?;
 
@@ -166,32 +245,36 @@ impl Node {
                 return Err(FsError::CorruptedNode(block));
             }
 
-            let value = b[val_start..val_end].to_vec();
-            let entry = Entry {
-                key: Key {
-                    name_hash,
-                    name_hash_hi,
-                    key_type,
-                },
-                value,
-            };
+            entries.push(Entry {
+                key: Key { name_hash, name_hash_hi, key_type },
+                value: b[val_start..val_end].to_vec(),
+            });
 
-            // Advance to next 8-byte aligned position
             offset = (val_end + 7) & !7;
-            entries.push(entry);
         }
 
-        Ok(Self { level, entries })
-    }
+        if level == 0 {
+            return Ok(Node::Leaf(entries));
+        }
+        if entries.is_empty() {
+            return Err(FsError::CorruptedNode(block));
+        }
 
-    /// Compute how many bytes this node's entries use on disk.
-    fn entries_size(&self) -> usize {
-        self.entries.iter().map(|e| e.disk_size()).sum()
-    }
-
-    /// Check if an entry with the given disk_size can fit.
-    pub fn can_fit(&self, entry_disk_size: usize) -> bool {
-        NODE_HEADER_SIZE + self.entries_size() + entry_disk_size <= BLOCK_SIZE
+        let mut children = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let raw = entry
+                .value
+                .get(..CHILD_VALUE_SIZE)
+                .ok_or(FsError::CorruptedNode(block))?;
+            let mut bytes = [0u8; CHILD_VALUE_SIZE];
+            bytes.copy_from_slice(raw);
+            let child = u64::from_le_bytes(bytes);
+            if child >= device_blocks {
+                return Err(FsError::BlockOffDevice { block: child, device_blocks });
+            }
+            children.push(Child { key: entry.key, block: BlockNum::new(child) });
+        }
+        Ok(Node::Interior { level, children })
     }
 
     /// Serialize this node to a block buffer, computing the CRC.
@@ -201,7 +284,7 @@ impl Node {
     /// kernel bug to scream about. This bound is also what keeps every slice
     /// index below sound — the final offset is `NODE_HEADER_SIZE + used`.
     pub fn write_to(&self, buf: &mut BlockBuf) -> Result<(), FsError> {
-        let used = self.entries_size();
+        let used = self.payload_size();
         if used > MAX_PAYLOAD {
             return Err(FsError::NodeOverfull { used, max: MAX_PAYLOAD });
         }
@@ -211,27 +294,24 @@ impl Node {
 
         b[0..4].copy_from_slice(&NODE_MAGIC);
         // CRC at [4..8] filled last
-        b[8..10].copy_from_slice(&self.level.to_le_bytes());
-        b[10..12].copy_from_slice(&(self.entries.len() as u16).to_le_bytes());
+        b[8..10].copy_from_slice(&self.level().to_le_bytes());
+        b[10..12].copy_from_slice(&(self.count() as u16).to_le_bytes());
 
         let free_space = (MAX_PAYLOAD - used) as u32;
         b[12..16].copy_from_slice(&free_space.to_le_bytes());
 
         let mut offset = NODE_HEADER_SIZE;
-        for entry in &self.entries {
-            b[offset..offset + 8].copy_from_slice(&entry.key.name_hash.to_le_bytes());
-            b[offset + 8..offset + 16]
-                .copy_from_slice(&entry.key.name_hash_hi.to_le_bytes());
-            b[offset + 16..offset + 18]
-                .copy_from_slice(&(entry.key.key_type as u16).to_le_bytes());
-            b[offset + 18..offset + 22]
-                .copy_from_slice(&(entry.value.len() as u32).to_le_bytes());
-            // [22..24] reserved = 0
-
-            let val_start = offset + KEY_HEADER_SIZE;
-            b[val_start..val_start + entry.value.len()].copy_from_slice(&entry.value);
-
-            offset = (val_start + entry.value.len() + 7) & !7;
+        match self {
+            Node::Leaf(entries) => {
+                for entry in entries {
+                    offset = write_entry(b, offset, &entry.key, &entry.value);
+                }
+            }
+            Node::Interior { children, .. } => {
+                for child in children {
+                    offset = write_entry(b, offset, &child.key, &child.block.raw().to_le_bytes());
+                }
+            }
         }
 
         let crc = crc32c(&b[CRC_START..]);
@@ -248,46 +328,60 @@ impl Node {
     }
 }
 
+fn read_u64(b: &[u8; BLOCK_SIZE], off: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&b[off..off + 8]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Write one key header and its value, returning the next entry's offset.
+fn write_entry(b: &mut [u8; BLOCK_SIZE], offset: usize, key: &Key, value: &[u8]) -> usize {
+    b[offset..offset + 8].copy_from_slice(&key.name_hash.to_le_bytes());
+    b[offset + 8..offset + 16].copy_from_slice(&key.name_hash_hi.to_le_bytes());
+    b[offset + 16..offset + 18].copy_from_slice(&(key.key_type as u16).to_le_bytes());
+    b[offset + 18..offset + 22].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    // [22..24] reserved = 0
+
+    let val_start = offset + KEY_HEADER_SIZE;
+    b[val_start..val_start + value.len()].copy_from_slice(value);
+    (val_start + value.len() + 7) & !7
+}
+
 // --- B+ tree operations ---
 
-/// Find the child block to descend into for a given key in an interior node.
-fn find_child(node: &Node, key: &Key) -> BlockNum {
-    // Interior node entries are sorted. Each entry's key is the minimum key
-    // of that child subtree. Find the last entry whose key <= search key.
-    // Default to first child (covers keys from -infinity to second entry's key).
-    debug_assert!(!node.entries.is_empty(), "interior node has no children");
-    let mut child_block =
-        BlockNum::new(u64::from_le_bytes(node.entries[0].value[..8].try_into().unwrap()));
-    for entry in &node.entries {
-        if entry.key <= *key {
-            child_block =
-                BlockNum::new(u64::from_le_bytes(entry.value[..8].try_into().unwrap()));
+/// The child to descend into for `key`.
+///
+/// Interior children are sorted and each key is the minimum key of that
+/// child's subtree, so the answer is the last child whose key is `<= key`,
+/// defaulting to the first — which covers everything below the second key.
+fn find_child(children: &[Child], key: &Key) -> Option<BlockNum> {
+    let mut chosen = children.first()?.block;
+    for child in children {
+        if child.key <= *key {
+            chosen = child.block;
         } else {
             break;
         }
     }
-    child_block
+    Some(chosen)
 }
 
 /// Search the B+ tree for an exact key match. Returns the leaf entry's value.
-pub fn search(io: &dyn BlockIO, root: BlockNum, root_level: u16, key: &Key) -> Result<Option<Vec<u8>>, FsError> {
+pub fn search(io: &dyn BlockIO, root: BlockNum, key: &Key) -> Result<Option<Vec<u8>>, FsError> {
     let mut block = root;
-    let mut level = root_level;
+    let mut depth = Depth::ROOT;
 
     loop {
-        let node = Node::read(io, block)?;
-
-        if level == 0 {
-            for entry in &node.entries {
-                if entry.key == *key {
-                    return Ok(Some(entry.value.clone()));
-                }
+        match Node::read(io, block)? {
+            Node::Leaf(entries) => {
+                return Ok(entries.into_iter().find(|e| e.key == *key).map(|e| e.value));
             }
-            return Ok(None);
+            Node::Interior { children, .. } => {
+                let next = find_child(&children, key).ok_or(FsError::CorruptedNode(block))?;
+                depth = depth.descend(block)?;
+                block = next;
+            }
         }
-
-        block = find_child(&node, key);
-        level -= 1;
     }
 }
 
@@ -297,7 +391,6 @@ pub fn search(io: &dyn BlockIO, root: BlockNum, root_level: u16, key: &Key) -> R
 pub fn search_by_hash(
     io: &dyn BlockIO,
     root: BlockNum,
-    root_level: u16,
     name_hash: u64,
 ) -> Result<Vec<Entry>, FsError> {
     // Use the MAXIMUM possible key for this name_hash so we descend to the
@@ -311,112 +404,73 @@ pub fn search_by_hash(
     };
 
     let mut block = root;
-    let mut level = root_level;
+    let mut depth = Depth::ROOT;
 
     loop {
-        let node = Node::read(io, block)?;
-        if level == 0 {
-            let mut results = Vec::new();
-            for entry in &node.entries {
-                if entry.key.name_hash == name_hash && entry.key.key_type != KeyType::Deleted {
-                    results.push(entry.clone());
-                }
+        match Node::read(io, block)? {
+            Node::Leaf(entries) => {
+                return Ok(entries
+                    .into_iter()
+                    .filter(|e| e.key.name_hash == name_hash && e.key.key_type != KeyType::Deleted)
+                    .collect());
             }
-            return Ok(results);
+            Node::Interior { children, .. } => {
+                let next =
+                    find_child(&children, &search_key).ok_or(FsError::CorruptedNode(block))?;
+                depth = depth.descend(block)?;
+                block = next;
+            }
         }
-        block = find_child(&node, &search_key);
-        level -= 1;
     }
 }
 
 /// Delete an exact key from the B+ tree. Returns the old value if found.
 /// Does not merge underflowing nodes — just removes the entry from the leaf.
-pub fn delete(io: &dyn BlockIO, root: BlockNum, root_level: u16, key: &Key) -> Result<Option<Vec<u8>>, FsError> {
+pub fn delete(io: &dyn BlockIO, root: BlockNum, key: &Key) -> Result<Option<Vec<u8>>, FsError> {
     let mut block = root;
-    let mut level = root_level;
+    let mut depth = Depth::ROOT;
 
     loop {
-        let mut node = Node::read(io, block)?;
-        if level == 0 {
-            if let Some(pos) = node.entries.iter().position(|e| e.key == *key) {
-                let old = node.entries.remove(pos);
-                node.write(io, block)?;
+        match Node::read(io, block)? {
+            Node::Leaf(mut entries) => {
+                let Some(pos) = entries.iter().position(|e| e.key == *key) else {
+                    return Ok(None);
+                };
+                let old = entries.remove(pos);
+                Node::Leaf(entries).write(io, block)?;
                 return Ok(Some(old.value));
             }
-            return Ok(None);
-        }
-        block = find_child(&node, key);
-        level -= 1;
-    }
-}
-
-/// Delete all entries matching a predicate by scanning the entire tree.
-/// Returns the number of entries deleted.
-pub fn delete_matching(
-    io: &dyn BlockIO,
-    root: BlockNum,
-    root_level: u16,
-    predicate: &dyn Fn(&Entry) -> bool,
-) -> Result<usize, FsError> {
-    let mut count = 0;
-    delete_matching_recursive(io, root, root_level, predicate, &mut count)?;
-    Ok(count)
-}
-
-fn delete_matching_recursive(
-    io: &dyn BlockIO,
-    block: BlockNum,
-    level: u16,
-    predicate: &dyn Fn(&Entry) -> bool,
-    count: &mut usize,
-) -> Result<(), FsError> {
-    let mut node = Node::read(io, block)?;
-    if level == 0 {
-        let before = node.entries.len();
-        node.entries.retain(|e| !predicate(e));
-        let removed = before - node.entries.len();
-        if removed > 0 {
-            *count += removed;
-            node.write(io, block)?;
-        }
-    } else {
-        // Collect child block numbers first (to avoid borrowing issues)
-        let children: Vec<BlockNum> = node.entries.iter()
-            .map(|e| BlockNum::new(u64::from_le_bytes(e.value[..8].try_into().unwrap())))
-            .collect();
-        for child in children {
-            delete_matching_recursive(io, child, level - 1, predicate, count)?;
+            Node::Interior { children, .. } => {
+                let next = find_child(&children, key).ok_or(FsError::CorruptedNode(block))?;
+                depth = depth.descend(block)?;
+                block = next;
+            }
         }
     }
-    Ok(())
 }
 
 /// Collect all leaf entries by iterating the entire tree.
-pub fn collect_all(io: &dyn BlockIO, root: BlockNum, root_level: u16) -> Result<Vec<Entry>, FsError> {
+pub fn collect_all(io: &dyn BlockIO, root: BlockNum) -> Result<Vec<Entry>, FsError> {
     let mut results = Vec::new();
-    collect_recursive(io, root, root_level, &mut results)?;
+    collect_recursive(io, root, Depth::ROOT, &mut results)?;
     Ok(results)
 }
 
 fn collect_recursive(
     io: &dyn BlockIO,
     block: BlockNum,
-    level: u16,
+    depth: Depth,
     results: &mut Vec<Entry>,
 ) -> Result<(), FsError> {
-    let node = Node::read(io, block)?;
-
-    if level == 0 {
-        for entry in node.entries {
-            if entry.key.key_type != KeyType::Deleted {
-                results.push(entry);
-            }
+    match Node::read(io, block)? {
+        Node::Leaf(entries) => {
+            results.extend(entries.into_iter().filter(|e| e.key.key_type != KeyType::Deleted));
         }
-    } else {
-        for entry in &node.entries {
-            let child =
-                BlockNum::new(u64::from_le_bytes(entry.value[..8].try_into().unwrap()));
-            collect_recursive(io, child, level - 1, results)?;
+        Node::Interior { children, .. } => {
+            let deeper = depth.descend(block)?;
+            for child in children {
+                collect_recursive(io, child.block, deeper, results)?;
+            }
         }
     }
     Ok(())
@@ -424,38 +478,35 @@ fn collect_recursive(
 
 /// Insert a key-value pair into the B+ tree.
 ///
-/// Returns the (possibly new) root block and root level if the root was split.
+/// Returns the root block, which changes when the old root was split.
 pub fn insert(
     io: &dyn BlockIO,
     alloc: &mut BitmapAllocator,
     root: BlockNum,
-    root_level: u16,
     entry: Entry,
-) -> Result<(BlockNum, u16), FsError> {
+) -> Result<BlockNum, FsError> {
     check_entry_fits(&entry)?;
-    let split = insert_recursive(io, alloc, root, root_level, entry)?;
 
-    match split {
-        InsertResult::Done => Ok((root, root_level)),
+    match insert_recursive(io, alloc, root, Depth::ROOT, entry)? {
+        InsertResult::Done => Ok(root),
         InsertResult::Split { new_block, split_key } => {
+            let level = Node::read(io, root)?
+                .level()
+                .checked_add(1)
+                .ok_or(FsError::CorruptedNode(root))?;
+            let old_min_key = min_key(io, root, Depth::ROOT)?;
             let new_root_block = alloc.alloc_block(io)?;
-            let old_min_key = find_min_key(io, root, root_level)?;
 
-            let mut new_root = Node {
-                level: root_level + 1,
-                entries: Vec::with_capacity(2),
+            let new_root = Node::Interior {
+                level,
+                children: alloc::vec![
+                    Child { key: old_min_key, block: root },
+                    Child { key: split_key, block: new_block },
+                ],
             };
-            new_root.entries.push(Entry {
-                key: old_min_key,
-                value: root.raw().to_le_bytes().to_vec(),
-            });
-            new_root.entries.push(Entry {
-                key: split_key,
-                value: new_block.raw().to_le_bytes().to_vec(),
-            });
             new_root.write(io, new_root_block)?;
 
-            Ok((new_root_block, root_level + 1))
+            Ok(new_root_block)
         }
     }
 }
@@ -472,128 +523,126 @@ fn insert_recursive(
     io: &dyn BlockIO,
     alloc: &mut BitmapAllocator,
     block: BlockNum,
-    level: u16,
+    depth: Depth,
     entry: Entry,
 ) -> Result<InsertResult, FsError> {
-    let mut node = Node::read(io, block)?;
-
-    if level == 0 {
-        // Leaf — insert into sorted position, replacing if key matches
-        let pos = match node.entries.binary_search_by(|e| e.key.cmp(&entry.key)) {
-            Ok(i) => {
-                node.entries[i] = entry.clone();
-                None
+    match Node::read(io, block)? {
+        Node::Leaf(mut entries) => {
+            match entries.binary_search_by(|e| e.key.cmp(&entry.key)) {
+                Ok(i) => entries[i] = entry,
+                Err(i) => entries.insert(i, entry),
             }
-            Err(i) => {
-                node.entries.insert(i, entry.clone());
-                Some(i)
-            }
-        };
-
-        if node.can_fit(0) || (pos.is_none() && node.entries_size() <= MAX_PAYLOAD) {
-            if NODE_HEADER_SIZE + node.entries_size() <= BLOCK_SIZE {
-                node.write(io, block)?;
-                return Ok(InsertResult::Done);
-            }
+            write_or_split(io, alloc, block, Node::Leaf(entries))
         }
-
-        return split_node(io, alloc, block, node);
-    }
-
-    // Interior node — find child and recurse
-    let child_idx = {
-        let mut idx = 0;
-        for (i, e) in node.entries.iter().enumerate() {
-            if e.key <= entry.key {
-                idx = i;
-            } else {
-                break;
+        Node::Interior { level, children } => {
+            let mut idx = 0;
+            for (i, child) in children.iter().enumerate() {
+                if child.key <= entry.key {
+                    idx = i;
+                } else {
+                    break;
+                }
             }
-        }
-        idx
-    };
+            let child_block = children.get(idx).ok_or(FsError::CorruptedNode(block))?.block;
+            let deeper = depth.descend(block)?;
 
-    let child_block =
-        BlockNum::new(u64::from_le_bytes(node.entries[child_idx].value[..8].try_into().unwrap()));
-
-    let result = insert_recursive(io, alloc, child_block, level - 1, entry)?;
-
-    match result {
-        InsertResult::Done => Ok(InsertResult::Done),
-        InsertResult::Split { new_block, split_key } => {
-            // Child was split — insert new pointer into this interior node
-            let new_entry = Entry {
-                key: split_key,
-                value: new_block.raw().to_le_bytes().to_vec(),
-            };
-
-            let pos = match node.entries.binary_search_by(|e| e.key.cmp(&new_entry.key)) {
-                Ok(i) => i + 1,
-                Err(i) => i,
-            };
-            node.entries.insert(pos, new_entry);
-
-            if NODE_HEADER_SIZE + node.entries_size() <= BLOCK_SIZE {
-                node.write(io, block)?;
-                Ok(InsertResult::Done)
-            } else {
-                split_node(io, alloc, block, node)
+            match insert_recursive(io, alloc, child_block, deeper, entry)? {
+                InsertResult::Done => Ok(InsertResult::Done),
+                InsertResult::Split { new_block, split_key } => {
+                    let mut children = children;
+                    let pos = match children.binary_search_by(|c| c.key.cmp(&split_key)) {
+                        Ok(i) => i + 1,
+                        Err(i) => i,
+                    };
+                    children.insert(pos, Child { key: split_key, block: new_block });
+                    write_or_split(io, alloc, block, Node::Interior { level, children })
+                }
             }
         }
     }
+}
+
+fn write_or_split(
+    io: &dyn BlockIO,
+    alloc: &mut BitmapAllocator,
+    block: BlockNum,
+    node: Node,
+) -> Result<InsertResult, FsError> {
+    if NODE_HEADER_SIZE + node.payload_size() <= BLOCK_SIZE {
+        node.write(io, block)?;
+        return Ok(InsertResult::Done);
+    }
+    split_node(io, alloc, block, node)
 }
 
 fn split_node(
     io: &dyn BlockIO,
     alloc: &mut BitmapAllocator,
     block: BlockNum,
-    mut node: Node,
+    node: Node,
 ) -> Result<InsertResult, FsError> {
-    // One entry is not a split problem. Halving by *count* used to produce
-    // `mid == 0` here, which drained every entry into the right node and left
-    // an empty one behind — and the right node was still the oversized entry.
-    if node.entries.len() < 2 {
-        let size = node.entries.first().map_or(0, |e| e.disk_size());
-        return Err(FsError::EntryTooLarge { size, max: MAX_ENTRY_SIZE });
+    match node {
+        Node::Leaf(mut entries) => {
+            // One entry is not a split problem. Halving by *count* used to
+            // produce `mid == 0` here, which drained every entry into the right
+            // node and left an empty one behind — and the right node was still
+            // the oversized entry.
+            if entries.len() < 2 {
+                let size = entries.first().map_or(0, |e| e.disk_size());
+                return Err(FsError::EntryTooLarge { size, max: MAX_ENTRY_SIZE });
+            }
+
+            // By size, not by count: leaf entries are variable-length (a file's
+            // extent list lives inline), so half the entries can be far more
+            // than half the bytes.
+            let mid = split_point(&entries);
+
+            // Both halves are checked before either is written. A split that
+            // has already replaced the left node on disk and then fails is a
+            // corrupt tree; a split that fails before writing is an error the
+            // caller can return.
+            if leaf_size(&entries[..mid]) > BLOCK_SIZE || leaf_size(&entries[mid..]) > BLOCK_SIZE {
+                // Unreachable while every entry is <= MAX_ENTRY_SIZE and the
+                // node was legal before this insert, except for one shape: a
+                // node of large entries where the new one lands in the middle.
+                // Splitting three ways is what would fix it; extent merging is
+                // what stops values getting near that size in the first place.
+                return Err(FsError::NodeOverfull {
+                    used: leaf_size(&entries) - NODE_HEADER_SIZE,
+                    max: MAX_PAYLOAD,
+                });
+            }
+
+            let right: Vec<Entry> = entries.drain(mid..).collect();
+            let Some(split_key) = right.first().map(|e| e.key) else {
+                return Err(FsError::CorruptedNode(block));
+            };
+
+            let right_block = alloc.alloc_block(io)?;
+            Node::Leaf(entries).write(io, block)?;
+            Node::Leaf(right).write(io, right_block)?;
+
+            Ok(InsertResult::Split { new_block: right_block, split_key })
+        }
+        Node::Interior { level, mut children } => {
+            if children.len() < 2 {
+                return Err(FsError::CorruptedNode(block));
+            }
+            // Every child costs the same 32 bytes, so halving by count is
+            // halving by bytes — the rule leaves are not allowed to use.
+            let mid = children.len() / 2;
+            let right: Vec<Child> = children.drain(mid..).collect();
+            let Some(split_key) = right.first().map(|c| c.key) else {
+                return Err(FsError::CorruptedNode(block));
+            };
+
+            let right_block = alloc.alloc_block(io)?;
+            Node::Interior { level, children }.write(io, block)?;
+            Node::Interior { level, children: right }.write(io, right_block)?;
+
+            Ok(InsertResult::Split { new_block: right_block, split_key })
+        }
     }
-
-    // By size, not by count: entries are variable-length (a file's extent list
-    // lives inline), so half the entries can be far more than half the bytes.
-    let mid = split_point(&node.entries);
-
-    // Both halves are checked before either is written. A split that has
-    // already replaced the left node on disk and then fails is a corrupt tree;
-    // a split that fails before writing is an error the caller can return.
-    if node_size(&node.entries[..mid]) > BLOCK_SIZE
-        || node_size(&node.entries[mid..]) > BLOCK_SIZE
-    {
-        // Unreachable while every entry is <= MAX_ENTRY_SIZE and the node was
-        // legal before this insert, except for one shape: a node of large
-        // entries where the new one lands in the middle. Splitting three ways
-        // is what would fix it; extent merging is what stops values getting
-        // near that size in the first place.
-        return Err(FsError::NodeOverfull {
-            used: node_size(&node.entries) - NODE_HEADER_SIZE,
-            max: MAX_PAYLOAD,
-        });
-    }
-
-    let right_entries: Vec<Entry> = node.entries.drain(mid..).collect();
-    let split_key = right_entries[0].key;
-
-    let right_block = alloc.alloc_block(io)?;
-    let right_node = Node {
-        level: node.level,
-        entries: right_entries,
-    };
-
-    node.write(io, block)?;
-    right_node.write(io, right_block)?;
-
-    Ok(InsertResult::Split {
-        new_block: right_block,
-        split_key,
-    })
 }
 
 /// The largest prefix of `entries` that still fits in a node, clamped so both
@@ -613,17 +662,13 @@ fn split_point(entries: &[Entry]) -> usize {
 }
 
 /// Find the minimum key in a subtree.
-fn find_min_key(io: &dyn BlockIO, block: BlockNum, level: u16) -> Result<Key, FsError> {
-    let node = Node::read(io, block)?;
-    if node.entries.is_empty() {
-        return Ok(Key::ZERO);
-    }
-    if level == 0 {
-        Ok(node.entries[0].key)
-    } else {
-        let child =
-            BlockNum::new(u64::from_le_bytes(node.entries[0].value[..8].try_into().unwrap()));
-        find_min_key(io, child, level - 1)
+fn min_key(io: &dyn BlockIO, block: BlockNum, depth: Depth) -> Result<Key, FsError> {
+    match Node::read(io, block)? {
+        Node::Leaf(entries) => Ok(entries.first().map_or(Key::ZERO, |e| e.key)),
+        Node::Interior { children, .. } => {
+            let first = children.first().ok_or(FsError::CorruptedNode(block))?.block;
+            min_key(io, first, depth.descend(block)?)
+        }
     }
 }
 
@@ -634,6 +679,28 @@ mod tests {
 
     fn entry(value_len: usize) -> Entry {
         Entry { key: Key::ZERO, value: vec![0u8; value_len] }
+    }
+
+    /// A block holding a node header the caller chose and no valid entries.
+    /// The CRC is computed last, so every case below is a block the parser
+    /// accepts as authentic — which is the point: a checksum says the bytes
+    /// are the bytes somebody wrote.
+    fn crafted(level: u16, entry_count: u16, entries: &[(u32, &[u8])]) -> BlockBuf {
+        let mut buf = BlockBuf::zeroed();
+        let b = buf.as_bytes_mut();
+        b[0..4].copy_from_slice(&NODE_MAGIC);
+        b[8..10].copy_from_slice(&level.to_le_bytes());
+        b[10..12].copy_from_slice(&entry_count.to_le_bytes());
+        let mut offset = NODE_HEADER_SIZE;
+        for (declared_len, value) in entries {
+            b[offset + 18..offset + 22].copy_from_slice(&declared_len.to_le_bytes());
+            let val_start = offset + KEY_HEADER_SIZE;
+            b[val_start..val_start + value.len()].copy_from_slice(value);
+            offset = (val_start + *declared_len as usize + 7) & !7;
+        }
+        let crc = crc32c(&b[CRC_START..]);
+        b[4..8].copy_from_slice(&crc.to_le_bytes());
+        buf
     }
 
     #[test]
@@ -649,9 +716,9 @@ mod tests {
         let skewed = [entry(1000), entry(3000), entry(3000)];
         let mid = split_point(&skewed);
         assert_eq!(mid, 2);
-        assert!(node_size(&skewed[..mid]) <= BLOCK_SIZE, "left half does not fit");
-        assert!(node_size(&skewed[mid..]) <= BLOCK_SIZE, "right half does not fit");
-        assert!(node_size(&skewed[..2]) > BLOCK_SIZE / 2, "the shape under test is not skewed");
+        assert!(leaf_size(&skewed[..mid]) <= BLOCK_SIZE, "left half does not fit");
+        assert!(leaf_size(&skewed[mid..]) <= BLOCK_SIZE, "right half does not fit");
+        assert!(leaf_size(&skewed[..2]) > BLOCK_SIZE / 2, "the shape under test is not skewed");
     }
 
     #[test]
@@ -680,8 +747,76 @@ mod tests {
 
     #[test]
     fn write_to_refuses_an_overfull_node_instead_of_underflowing() {
-        let node = Node { level: 0, entries: vec![entry(3000), entry(3000)] };
+        let node = Node::Leaf(vec![entry(3000), entry(3000)]);
         let mut buf = BlockBuf::zeroed();
         assert!(matches!(node.write_to(&mut buf), Err(FsError::NodeOverfull { .. })));
+    }
+
+    #[test]
+    fn an_interior_child_shorter_than_a_block_number_is_refused() {
+        // Four bytes where a child pointer belongs. Six descent sites used to
+        // index `value[..8]` here.
+        let buf = crafted(1, 1, &[(4, &[1, 0, 0, 0])]);
+        assert!(matches!(
+            Node::parse(&buf, BlockNum::new(7), 64),
+            Err(FsError::CorruptedNode(_)),
+        ));
+    }
+
+    #[test]
+    fn an_interior_node_with_no_children_is_refused() {
+        let buf = crafted(1, 0, &[]);
+        assert!(matches!(
+            Node::parse(&buf, BlockNum::new(7), 64),
+            Err(FsError::CorruptedNode(_)),
+        ));
+    }
+
+    #[test]
+    fn a_child_pointer_off_the_device_is_refused() {
+        let buf = crafted(1, 1, &[(8, &u64::MAX.to_le_bytes())]);
+        assert!(matches!(
+            Node::parse(&buf, BlockNum::new(7), 64),
+            Err(FsError::BlockOffDevice { .. }),
+        ));
+    }
+
+    #[test]
+    fn a_crafted_entry_count_never_reaches_the_allocator() {
+        // The declared count is a `u16`; the block has room for MAX_ENTRIES.
+        // Reserving from the former asked for more than the kernel's whole
+        // allocation ceiling, and returned the *same* error while doing it —
+        // so the peak allocation, not the return value, is the instrument.
+        assert_eq!(MAX_ENTRIES, 169);
+        let ceiling = 2 * 1024 * 1024 - 4096; // mm::MAX_HEAP_ALLOC
+        let reserved_from_disk = u16::MAX as usize * core::mem::size_of::<Entry>();
+        assert!(
+            reserved_from_disk > ceiling,
+            "{reserved_from_disk} bytes is under the ceiling — this test proves nothing",
+        );
+
+        let buf = crafted(0, u16::MAX, &[]);
+        crate::alloc_probe::take_peak();
+        let parsed = Node::parse(&buf, BlockNum::new(7), 64);
+        let peak = crate::alloc_probe::take_peak();
+
+        assert!(matches!(parsed, Err(FsError::CorruptedNode(_))));
+        assert!(
+            peak <= BLOCK_SIZE,
+            "parsing a block that declares {} entries asked the allocator for {peak} bytes",
+            u16::MAX,
+        );
+    }
+
+    #[test]
+    fn a_descent_gives_up_before_it_runs_out_of_stack() {
+        let mut depth = Depth::ROOT;
+        for _ in 0..64 {
+            depth = depth.descend(BlockNum::new(1)).expect("64 levels is a legal tree");
+        }
+        assert!(matches!(
+            depth.descend(BlockNum::new(1)),
+            Err(FsError::TreeTooDeep(_)),
+        ));
     }
 }

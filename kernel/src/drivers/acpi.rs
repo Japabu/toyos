@@ -1,5 +1,25 @@
+//! ACPI table parsing.
+//!
+//! Every byte here is **firmware-supplied, i.e. untrusted input**, and the
+//! distinction CLAUDE.md draws applies in full: fail-fast is for kernel bugs,
+//! not for a length a machine we have never booted put in a header. So this
+//! module has no panic on any input path. A table that cannot be believed is a
+//! [`TableError`] with a reason, and the caller decides — because the callers
+//! want opposite things from the same refusal. The i8042 driver must tell
+//! "firmware says there is no 8042" from "firmware's answer is not readable":
+//! the first means never touch ports 0x60/0x64, the second means probe and say
+//! why. They used to be the same code path.
+//!
+//! Nothing reads a table except through [`Table::open`], which is what makes
+//! the bounds hold by construction rather than by review. The two subtractions
+//! that replaced — `length - size_of::<SdtHeader>()` in the XSDT walk and
+//! `length - size_of::<Madt>()` in the MADT walk — were both "the header
+//! declared itself shorter than its own header", and with overflow checks off
+//! the first one produces an entry count near 2^61 and walks arbitrary
+//! physical memory as if it were a table pointer array.
+
 use alloc::vec::Vec;
-use core::mem::size_of;
+use core::mem::{offset_of, size_of};
 use core::ptr::{read_unaligned, read_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use crate::log;
@@ -29,7 +49,52 @@ pub struct SourceOverride {
     pub flags: u16,
 }
 
-// ACPI table structures (all packed — tables are not guaranteed aligned)
+/// Why a firmware table cannot be used.
+///
+/// Every variant is a distinct instruction to the caller, which is the whole
+/// reason this is not an `Option`. `Absent` is firmware answering the
+/// question; everything else is firmware failing to answer it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TableError {
+    /// The RSDP UEFI handed us has the wrong signature or does not checksum.
+    BadRsdp,
+    /// An ACPI 1.0 root pointer, or a null XSDT address. There is no RSDT
+    /// fallback and there will not be one: this kernel is UEFI-only and every
+    /// machine it targets publishes an XSDT.
+    NoXsdt,
+    /// No table with that signature in the XSDT.
+    Absent,
+    /// The declared length cannot hold the fields the caller reads, or is
+    /// outside anything a real table has.
+    Length { declared: u32, needed: usize },
+    /// The declared bytes do not sum to zero. Which table is not carried
+    /// here: every call site names the table in its own log line, and a
+    /// `[u8; 4]` renders as four decimal numbers nobody reads as "FACP".
+    Checksum,
+}
+
+/// The largest length a table may declare. A DSDT is the biggest table anyone
+/// ships and those run to tens of KiB, so this is three orders of magnitude of
+/// headroom — and it is what bounds the checksum walk and every derived entry
+/// count to something the direct map certainly covers. Policy, not physics.
+const MAX_TABLE_LEN: usize = 1024 * 1024;
+
+/// x86-64's architectural physical-address ceiling is 52 bits — CPUID's
+/// MAXPHYADDR may be smaller, never larger — so a table pointer at or above
+/// this is not an address at all. It is also what stops `DirectMap::as_ptr`'s
+/// unchecked `+ PHYS_OFFSET` from wrapping a firmware-supplied `u64` round
+/// into the user half, where the read would be a fault at best.
+const MAX_PHYS: u64 = 1 << 52;
+
+/// A physical address that could name a table, or `None`.
+fn table_at(phys: u64) -> Option<DirectMap> {
+    (phys != 0 && phys < MAX_PHYS).then(|| DirectMap::from_phys(phys))
+}
+
+// ACPI table structures. All packed: tables are not guaranteed aligned, and
+// these exist to derive offsets with `offset_of!` rather than to be
+// dereferenced — a reference to one would assert that every byte to the end of
+// the struct is readable, which is exactly what the firmware has not proved.
 
 #[repr(C, packed)]
 struct SdtHeader {
@@ -116,12 +181,14 @@ struct Madt {
 }
 
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct MadtEntryHeader {
     entry_type: u8,
     length: u8,
 }
 
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct MadtLocalApic {
     header: MadtEntryHeader,
     processor_id: u8,
@@ -130,6 +197,7 @@ struct MadtLocalApic {
 }
 
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct MadtIoApic {
     header: MadtEntryHeader,
     io_apic_id: u8,
@@ -139,6 +207,7 @@ struct MadtIoApic {
 }
 
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct MadtSourceOverride {
     header: MadtEntryHeader,
     bus: u8,
@@ -148,6 +217,7 @@ struct MadtSourceOverride {
 }
 
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct MadtLocalX2Apic {
     header: MadtEntryHeader,
     _reserved: u16,
@@ -173,54 +243,248 @@ struct HpetTable {
     base_address_value: u64,
 }
 
+/// The MCFG's first allocation structure sits one 8-byte reserved field past
+/// the header.
+const MCFG_FIRST_ENTRY: usize = size_of::<SdtHeader>() + 8;
+
 const SLP_EN: u16 = 1 << 13;
 
 static PM1A_CNT_PORT: AtomicU16 = AtomicU16::new(0);
 static SLP_TYPA: AtomicU16 = AtomicU16::new(0);
 
+/// A firmware table whose declared length has been checked to cover the bytes
+/// the caller is about to read, and whose declared bytes sum to zero.
+///
+/// Constructing one is the only way to read a table in this module, and
+/// [`Table::field`] is the only way to read out of one. Together they are why
+/// no arithmetic here can underflow and no read can leave the table: the
+/// length is validated once, at the only place it enters the module.
+#[derive(Clone, Copy)]
+struct Table {
+    base: DirectMap,
+    len: usize,
+}
+
+impl Table {
+    /// Validate the table at `base`: signature, a length that is plausible and
+    /// long enough for `needed` bytes, then the checksum over exactly the
+    /// declared length.
+    ///
+    /// Order matters. The checksum walks `length` bytes, so it must not run
+    /// until `length` has been bounded — otherwise a header declaring 4 GiB
+    /// turns the integrity check into the out-of-bounds read it exists to
+    /// prevent.
+    fn open(base: DirectMap, signature: &[u8; 4], needed: usize) -> Result<Table, TableError> {
+        let found: [u8; 4] =
+            unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(SdtHeader, signature)).cast()) };
+        if &found != signature {
+            return Err(TableError::Absent);
+        }
+        let declared: u32 =
+            unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(SdtHeader, length)).cast()) };
+        let len = declared as usize;
+        let floor = needed.max(size_of::<SdtHeader>());
+        if len < floor || len > MAX_TABLE_LEN {
+            return Err(TableError::Length { declared, needed: floor });
+        }
+        if !sums_to_zero(base, len) {
+            return Err(TableError::Checksum);
+        }
+        Ok(Table { base, len })
+    }
+
+    /// A copy of the `T` at `offset`, or `None` when the table is not that
+    /// long. Unaligned by construction — ACPI tables are byte-packed and the
+    /// direct map does not align them.
+    ///
+    /// The read is a copy rather than a reference on purpose: a `&T` into a
+    /// table asserts that all of `T` is valid memory, which for a struct whose
+    /// tail runs past the declared length is exactly the claim being checked.
+    fn field<T: Copy>(&self, offset: usize) -> Option<T> {
+        let end = offset.checked_add(size_of::<T>())?;
+        if end > self.len {
+            return None;
+        }
+        Some(unsafe { read_unaligned(self.base.as_ptr::<u8>().add(offset).cast::<T>()) })
+    }
+
+    /// Like [`Table::field`], but for a caller that has already proved the
+    /// length covers `offset`. Used only inside the MADT walk, whose bound is
+    /// re-established per entry.
+    fn field_unchecked<T: Copy>(&self, offset: usize) -> T {
+        unsafe { read_unaligned(self.base.as_ptr::<u8>().add(offset).cast::<T>()) }
+    }
+}
+
+/// The ACPI integrity check: a table is intact when its declared bytes sum to
+/// zero in 8 bits. `len` is bounded by the caller before this runs.
+fn sums_to_zero(base: DirectMap, len: usize) -> bool {
+    let p = base.as_ptr::<u8>();
+    let mut sum: u8 = 0;
+    for i in 0..len {
+        sum = sum.wrapping_add(unsafe { read_volatile(p.add(i)) });
+    }
+    sum == 0
+}
+
+/// The XSDT, validated, from the RSDP UEFI handed the bootloader.
+///
+/// The RSDP is the one structure with no self-describing length: the ACPI 1.0
+/// part is 20 bytes by spec and the 2.0 part declares its own size. So the
+/// first checksum covers the fixed 20 and the second covers what the RSDP
+/// claims, and neither is read before the one before it passed.
+fn xsdt(rsdp_addr: u64) -> Result<Table, TableError> {
+    const RSDP_V1_LEN: usize = 20;
+    /// An RSDP is 36 bytes today and has never been anything else; the bound
+    /// exists so the extended checksum cannot be pointed at the whole map.
+    const RSDP_MAX_LEN: usize = 64;
+
+    let base = DirectMap::from_phys(rsdp_addr);
+    let signature: [u8; 8] = unsafe { read_unaligned(base.as_ptr::<[u8; 8]>()) };
+    if &signature != b"RSD PTR " {
+        return Err(TableError::BadRsdp);
+    }
+    if !sums_to_zero(base, RSDP_V1_LEN) {
+        return Err(TableError::BadRsdp);
+    }
+
+    let revision: u8 =
+        unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(Rsdp, revision))) };
+    if revision < 2 {
+        return Err(TableError::NoXsdt);
+    }
+
+    let declared: u32 =
+        unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(Rsdp, length)).cast()) };
+    let len = declared as usize;
+    if len < size_of::<Rsdp>() || len > RSDP_MAX_LEN {
+        return Err(TableError::Length { declared, needed: size_of::<Rsdp>() });
+    }
+    if !sums_to_zero(base, len) {
+        return Err(TableError::BadRsdp);
+    }
+
+    let address: u64 =
+        unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(Rsdp, xsdt_address)).cast()) };
+    let root = table_at(address).ok_or(TableError::NoXsdt)?;
+    Table::open(root, b"XSDT", size_of::<SdtHeader>())
+}
+
+/// The first table in the XSDT with this signature, validated far enough to
+/// read `needed` bytes out of it.
+///
+/// The *first* signature match is the answer even when it fails to validate.
+/// A second table with the same signature is not a fallback — reporting the
+/// defect in the one firmware pointed at first is the whole point, and a
+/// silent second choice is how a machine ends up running on a table nobody
+/// looked at.
+fn find_table(rsdp_addr: u64, signature: &[u8; 4], needed: usize) -> Result<Table, TableError> {
+    let xsdt = xsdt(rsdp_addr)?;
+    // `Table::open` guarantees `len >= size_of::<SdtHeader>()`, which is what
+    // makes this subtraction total. It is the underflow that was here.
+    let entry_count = (xsdt.len - size_of::<SdtHeader>()) / size_of::<u64>();
+
+    for i in 0..entry_count {
+        let offset = size_of::<SdtHeader>() + i * size_of::<u64>();
+        let Some(phys) = xsdt.field::<u64>(offset) else { break };
+        let Some(base) = table_at(phys) else { continue };
+        match Table::open(base, signature, needed) {
+            Err(TableError::Absent) => continue,
+            other => return other,
+        }
+    }
+    Err(TableError::Absent)
+}
+
+/// Log a refusal with the reason firmware earned, and hand the caller a
+/// `None`. Every one of these lines is a line the owner of a machine that
+/// will not boot needs to see; none of them may be a panic.
+fn refuse<T>(what: &str, error: TableError) -> Option<T> {
+    log!("ACPI: {what} unusable: {error:?}");
+    None
+}
+
 /// Given the RSDP address from UEFI, parse XSDT -> MCFG -> return ECAM base address.
 pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
-    let rsdp = DirectMap::from_phys(rsdp_addr);
-    log!("ACPI: RSDP at {:#x}", rsdp_addr);
+    log!("ACPI: RSDP at {rsdp_addr:#x}");
+    let needed = MCFG_FIRST_ENTRY + size_of::<McfgEntry>();
+    let mcfg = match find_table(rsdp_addr, b"MCFG", needed) {
+        Ok(table) => table,
+        Err(e) => return refuse("MCFG", e),
+    };
+    log!("ACPI: MCFG found at {}", mcfg.base);
 
-    let xsdt = get_xsdt(rsdp);
-    log!("ACPI: XSDT at {}", xsdt);
-
-    let mcfg = find_table(xsdt, b"MCFG")?;
-    log!("ACPI: MCFG found at {}", mcfg);
-
-    let entry = unsafe { &*mcfg.as_ptr::<u8>().add(size_of::<SdtHeader>() + 8).cast::<McfgEntry>() };
-    let ecam_base = entry.base_address;
-    log!("ACPI: ECAM base address: {:#x}", ecam_base);
-
+    let ecam_base = mcfg.field::<u64>(MCFG_FIRST_ENTRY + offset_of!(McfgEntry, base_address))?;
+    log!("ACPI: ECAM base address: {ecam_base:#x}");
     Some(ecam_base)
 }
 
 /// Parse FADT and DSDT to prepare for ACPI shutdown.
+///
+/// A machine whose tables do not support this keeps booting without soft-off:
+/// [`shutdown`] already halts when no PM1a port was ever published, so the
+/// degradation is defined and the boot says which table failed. Refusing to
+/// boot because firmware cannot spell its own power block would be a
+/// firmware-triggered kernel panic wearing fail-fast's clothes.
 pub fn init_power(rsdp_addr: u64) {
-    let xsdt = get_xsdt(DirectMap::from_phys(rsdp_addr));
+    const FADT_FOR_POWER: usize =
+        offset_of!(Fadt, pm1a_control_block) + size_of::<u32>();
+    const FADT_FOR_X_DSDT: usize = offset_of!(Fadt, x_dsdt) + size_of::<u64>();
 
-    let fadt_phys = find_table(xsdt, b"FACP").expect("ACPI: FADT not found");
-    let fadt = unsafe { &*fadt_phys.as_ptr::<Fadt>() };
-
-    let pm1a = fadt.pm1a_control_block as u16;
-    PM1A_CNT_PORT.store(pm1a, Ordering::Relaxed);
-
-    // Prefer X_DSDT (64-bit, ACPI 2.0+) over DSDT (32-bit)
-    let dsdt_addr = if fadt.header.revision >= 2 && fadt.x_dsdt != 0 {
-        fadt.x_dsdt
-    } else {
-        fadt.dsdt as u64
+    let fadt = match find_table(rsdp_addr, b"FACP", FADT_FOR_POWER) {
+        Ok(table) => table,
+        Err(e) => {
+            log!("ACPI: FADT unusable: {e:?} — no soft-off, shutdown will halt instead");
+            return;
+        }
     };
-    assert!(dsdt_addr != 0, "ACPI: DSDT not found");
-    let dsdt_phys = DirectMap::from_phys(dsdt_addr);
 
-    let dsdt = dsdt_phys.as_ptr::<SdtHeader>();
-    let dsdt_len = unsafe { read_unaligned(&raw const (*dsdt).length) } as usize;
+    let Some(pm1a) = fadt.field::<u32>(offset_of!(Fadt, pm1a_control_block)) else {
+        log!("ACPI: FADT has no PM1a control block — no soft-off");
+        return;
+    };
+    let pm1a = pm1a as u16;
 
-    let slp_typ = find_s5_slp_typ(dsdt_phys.as_ptr(), dsdt_len).expect("ACPI: \\_S5_ not found in DSDT");
+    // Prefer X_DSDT (64-bit, ACPI 2.0+) over DSDT (32-bit). A revision that
+    // claims 2.0 does not prove the table is long enough to hold the field,
+    // which is why the length is asked and not the revision alone.
+    let revision = fadt.field::<u8>(offset_of!(Fadt, header) + offset_of!(SdtHeader, revision));
+    let x_dsdt = match revision {
+        Some(r) if r >= 2 => fadt.field::<u64>(offset_of!(Fadt, x_dsdt)).filter(|a| *a != 0),
+        _ => None,
+    };
+    let dsdt_addr = match x_dsdt {
+        Some(addr) => addr,
+        None => fadt.field::<u32>(offset_of!(Fadt, dsdt)).unwrap_or(0) as u64,
+    };
+    if dsdt_addr == 0 {
+        log!(
+            "ACPI: FADT names no DSDT (rev {:?}, needs {FADT_FOR_X_DSDT} bytes for X_DSDT) — no soft-off",
+            revision
+        );
+        return;
+    }
+
+    let Some(dsdt_base) = table_at(dsdt_addr) else {
+        log!("ACPI: FADT points the DSDT at {dsdt_addr:#x}, which is not an address — no soft-off");
+        return;
+    };
+    let dsdt = match Table::open(dsdt_base, b"DSDT", size_of::<SdtHeader>()) {
+        Ok(table) => table,
+        Err(e) => {
+            log!("ACPI: DSDT at {dsdt_addr:#x} unusable: {e:?} — no soft-off");
+            return;
+        }
+    };
+
+    let Some(slp_typ) = find_s5_slp_typ(&dsdt) else {
+        log!("ACPI: no \\_S5_ package in the DSDT — no soft-off");
+        return;
+    };
+
+    PM1A_CNT_PORT.store(pm1a, Ordering::Relaxed);
     SLP_TYPA.store(slp_typ, Ordering::Relaxed);
-    log!("ACPI: PM1a={:#x} SLP_TYPa={}", pm1a, slp_typ);
+    log!("ACPI: PM1a={pm1a:#x} SLP_TYPa={slp_typ}");
 }
 
 /// FADT revision and the IA-PC boot architecture flags.
@@ -230,11 +494,20 @@ pub fn init_power(rsdp_addr: u64) {
 /// with it and the caller decides. On a machine with no 8042, ports
 /// 0x60/0x64 may be decoded by something else entirely, which is why this is
 /// asked before they are touched.
-pub fn iapc_boot_arch(rsdp_addr: u64) -> Option<(u8, u16)> {
-    let xsdt = get_xsdt(DirectMap::from_phys(rsdp_addr));
-    let fadt_phys = find_table(xsdt, b"FACP")?;
-    let fadt = unsafe { &*fadt_phys.as_ptr::<Fadt>() };
-    Some((fadt.header.revision, fadt.iapc_boot_arch))
+///
+/// The error is not an absence and must not be treated as one. A caller that
+/// collapses `Err` into "the 8042 is absent" turns every firmware quirk into a
+/// dead keyboard with a log line blaming the vendor.
+pub fn iapc_boot_arch(rsdp_addr: u64) -> Result<(u8, u16), TableError> {
+    const NEEDED: usize = offset_of!(Fadt, iapc_boot_arch) + size_of::<u16>();
+    let fadt = find_table(rsdp_addr, b"FACP", NEEDED)?;
+    let revision = fadt
+        .field::<u8>(offset_of!(Fadt, header) + offset_of!(SdtHeader, revision))
+        .ok_or(TableError::Length { declared: fadt.len as u32, needed: NEEDED })?;
+    let flags = fadt
+        .field::<u16>(offset_of!(Fadt, iapc_boot_arch))
+        .ok_or(TableError::Length { declared: fadt.len as u32, needed: NEEDED })?;
+    Ok((revision, flags))
 }
 
 /// Trigger ACPI S5 (soft-off) shutdown.
@@ -253,74 +526,60 @@ pub fn shutdown() -> ! {
     crate::arch::cpu::halt();
 }
 
-/// Read XSDT physical address from RSDP.
-fn get_xsdt(rsdp_addr: DirectMap) -> DirectMap {
-    let rsdp = unsafe { &*rsdp_addr.as_ptr::<Rsdp>() };
-    DirectMap::from_phys(rsdp.xsdt_address)
-}
-
-/// Iterate XSDT entries looking for a table with the given 4-byte signature.
-/// Returns the physical address of the matching table.
-fn find_table(xsdt: DirectMap, signature: &[u8; 4]) -> Option<DirectMap> {
-    let header = unsafe { &*xsdt.as_ptr::<SdtHeader>() };
-    let length = header.length as usize;
-    let entry_count = (length - size_of::<SdtHeader>()) / 8;
-
-    let entries_base = unsafe { xsdt.as_ptr::<u8>().add(size_of::<SdtHeader>()) } as *const u64;
-
-    for i in 0..entry_count {
-        let table_phys = DirectMap::from_phys(unsafe { read_unaligned(entries_base.add(i)) });
-        let table_header = unsafe { &*table_phys.as_ptr::<SdtHeader>() };
-
-        if &table_header.signature == signature {
-            return Some(table_phys);
-        }
-    }
-
-    None
-}
-
 /// Given the RSDP address, parse XSDT -> HPET table -> return HPET MMIO base address.
 pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
-    let xsdt = get_xsdt(DirectMap::from_phys(rsdp_addr));
-    let hpet_phys = find_table(xsdt, b"HPET")?;
-    let hpet = unsafe { &*hpet_phys.as_ptr::<HpetTable>() };
-    let base = hpet.base_address_value;
-    log!("ACPI: HPET at {:#x}", base);
+    let needed = offset_of!(HpetTable, base_address_value) + size_of::<u64>();
+    let hpet = match find_table(rsdp_addr, b"HPET", needed) {
+        Ok(table) => table,
+        Err(e) => return refuse("HPET", e),
+    };
+    let base = hpet.field::<u64>(offset_of!(HpetTable, base_address_value))?;
+    log!("ACPI: HPET at {base:#x}");
     Some(base)
 }
 
 /// Parse MADT (signature "APIC") to discover per-CPU APIC IDs.
 pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
-    let xsdt = get_xsdt(DirectMap::from_phys(rsdp_addr));
-    let madt_phys = find_table(xsdt, b"APIC")?;
-    let madt = unsafe { &*madt_phys.as_ptr::<Madt>() };
-
-    let length = madt.header.length as usize;
+    let madt = match find_table(rsdp_addr, b"APIC", size_of::<Madt>()) {
+        Ok(table) => table,
+        Err(e) => return refuse("MADT", e),
+    };
 
     let mut apic_ids = Vec::new();
     let mut io_apics = Vec::new();
     let mut source_overrides = Vec::new();
-    let entries_base: *const u8 = unsafe { madt_phys.as_ptr::<u8>().add(size_of::<Madt>()) };
+
+    // Total because `Table::open` was given `size_of::<Madt>()` as the floor.
+    // This is the second underflow that was here.
+    let entries_len = madt.len - size_of::<Madt>();
     let mut offset = 0usize;
-    let entries_len = length - size_of::<Madt>();
 
     while offset + size_of::<MadtEntryHeader>() <= entries_len {
-        let entry = unsafe { &*(entries_base.add(offset) as *const MadtEntryHeader) };
+        let base = size_of::<Madt>() + offset;
+        let entry: MadtEntryHeader = madt.field_unchecked(base);
         let entry_len = entry.length as usize;
-        if entry_len == 0 { break; }
+        // A zero length would not advance, and one that runs past the table is
+        // firmware describing an entry it did not supply. Both end the walk:
+        // there is no way to resynchronise a self-describing list that lied
+        // about an element's size.
+        if entry_len < size_of::<MadtEntryHeader>() || offset + entry_len > entries_len {
+            log!(
+                "ACPI: MADT entry at +{offset} declares {entry_len} bytes of a {entries_len}-byte list — stopping"
+            );
+            break;
+        }
 
         match entry.entry_type {
             // Type 0 = Processor Local APIC
             0 if entry_len >= size_of::<MadtLocalApic>() => {
-                let lapic = unsafe { &*(entries_base.add(offset) as *const MadtLocalApic) };
+                let lapic: MadtLocalApic = madt.field_unchecked(base);
                 if lapic.flags & 1 != 0 {
                     apic_ids.push(lapic.apic_id as u32);
                 }
             }
             // Type 1 = I/O APIC
             1 if entry_len >= size_of::<MadtIoApic>() => {
-                let io = unsafe { &*(entries_base.add(offset) as *const MadtIoApic) };
+                let io: MadtIoApic = madt.field_unchecked(base);
                 io_apics.push(IoApicEntry {
                     id: io.io_apic_id,
                     address: io.address,
@@ -329,7 +588,7 @@ pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
             }
             // Type 2 = Interrupt Source Override
             2 if entry_len >= size_of::<MadtSourceOverride>() => {
-                let iso = unsafe { &*(entries_base.add(offset) as *const MadtSourceOverride) };
+                let iso: MadtSourceOverride = madt.field_unchecked(base);
                 source_overrides.push(SourceOverride {
                     bus: iso.bus,
                     source_irq: iso.source_irq,
@@ -339,7 +598,7 @@ pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
             }
             // Type 9 = Processor Local x2APIC (32-bit APIC IDs)
             9 if entry_len >= size_of::<MadtLocalX2Apic>() => {
-                let x2 = unsafe { &*(entries_base.add(offset) as *const MadtLocalX2Apic) };
+                let x2: MadtLocalX2Apic = madt.field_unchecked(base);
                 if x2.flags & 1 != 0 {
                     apic_ids.push(x2.x2apic_id);
                 }
@@ -355,27 +614,25 @@ pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
 }
 
 /// Scan DSDT AML bytecode for the \_S5_ package and extract SLP_TYPa.
-fn find_s5_slp_typ(dsdt: *const u8, len: usize) -> Option<u16> {
+///
+/// The scan reads through [`Table::field`] rather than off a raw pointer, so
+/// the declared length is what bounds it — the previous version took that
+/// length from an unvalidated header and walked it.
+fn find_s5_slp_typ(dsdt: &Table) -> Option<u16> {
     let s5 = b"_S5_";
+    let len = dsdt.len;
 
-    for i in 0..len.saturating_sub(7) {
-        // Match "_S5_"
-        let mut found = true;
-        for j in 0..4 {
-            if unsafe { read_volatile(dsdt.add(i + j)) } != s5[j] {
-                found = false;
-                break;
-            }
+    for i in size_of::<SdtHeader>()..len.saturating_sub(7) {
+        if (0..4).any(|j| dsdt.field::<u8>(i + j) != Some(s5[j])) {
+            continue;
         }
-        if !found { continue; }
-
         // Expect PackageOp (0x12) after the name
-        if unsafe { read_volatile(dsdt.add(i + 4)) } != 0x12 {
+        if dsdt.field::<u8>(i + 4) != Some(0x12) {
             continue;
         }
 
         // Parse PkgLength to skip past it
-        let pkg_lead = unsafe { read_volatile(dsdt.add(i + 5)) };
+        let pkg_lead = dsdt.field::<u8>(i + 5)?;
         let pkg_len_bytes = match (pkg_lead >> 6) & 0x03 {
             0 => 1usize,
             n => (n + 1) as usize,
@@ -383,19 +640,14 @@ fn find_s5_slp_typ(dsdt: *const u8, len: usize) -> Option<u16> {
 
         // Skip: "_S5_"(4) + PackageOp(1) + PkgLength + NumElements(1)
         let val_off = i + 4 + 1 + pkg_len_bytes + 1;
-        if val_off >= len { return None; }
-
-        let byte = unsafe { read_volatile(dsdt.add(val_off)) };
-        let slp_typ = if byte == 0x0A {
+        let byte = dsdt.field::<u8>(val_off)?;
+        return Some(if byte == 0x0A {
             // BytePrefix -- next byte is the value
-            if val_off + 1 >= len { return None; }
-            (unsafe { read_volatile(dsdt.add(val_off + 1)) }) as u16
+            dsdt.field::<u8>(val_off + 1)? as u16
         } else {
             // ZeroOp (0x00), OneOp (0x01), or raw value
             byte as u16
-        };
-
-        return Some(slp_typ);
+        });
     }
 
     None

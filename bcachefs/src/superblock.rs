@@ -39,7 +39,6 @@ const _: () = assert!(
 pub struct Superblock {
     pub block_count: u64,
     pub root_node: BlockNum,
-    pub root_level: u16,
     pub next_alloc: u64,
     pub free_blocks: u64,
     pub bitmap_start: BlockNum,
@@ -52,7 +51,7 @@ pub struct Superblock {
 }
 
 impl Superblock {
-    const CRC_START: usize = 12; // CRC covers bytes [12..4096]
+    pub(crate) const CRC_START: usize = 12; // CRC covers bytes [12..4096]
 
     pub fn is_clean(&self) -> bool {
         self.flags & 1 != 0
@@ -67,6 +66,12 @@ impl Superblock {
     }
 
     /// Parse a superblock from a block buffer. Verifies magic, version, and CRC.
+    ///
+    /// The envelope only. Every field below is a number the disk chose, and a
+    /// CRC is not authentication — whoever writes the image writes the CRC.
+    /// [`Superblock::read`] is the entry point that also refuses a superblock
+    /// describing a device other than the one it came off, and it is the only
+    /// road to a mount.
     pub fn parse(buf: &BlockBuf) -> Result<Self, FsError> {
         let b = buf.as_bytes();
 
@@ -96,7 +101,6 @@ impl Superblock {
         Ok(Self {
             block_count: read_u64(b, 12),
             root_node: BlockNum::new(read_u64(b, 24)),
-            root_level: read_u16(b, 32),
             next_alloc: read_u64(b, 36),
             free_blocks: read_u64(b, 44),
             bitmap_start: BlockNum::new(read_u64(b, 52)),
@@ -121,8 +125,9 @@ impl Superblock {
         write_u64(b, 12, self.block_count);
         write_u32(b, 20, BLOCK_SIZE as u32);
         write_u64(b, 24, self.root_node.raw());
-        write_u16(b, 32, self.root_level);
-        // [34..36] pad
+        // [32..36] pad — the tree's depth used to live here, and drove three
+        // recursions against a 128 KiB kernel stack. The descent ends at a
+        // `Node::Leaf` now, so the disk has no say in how deep it goes.
         write_u64(b, 36, self.next_alloc);
         write_u64(b, 44, self.free_blocks);
         write_u64(b, 52, self.bitmap_start.raw());
@@ -137,16 +142,63 @@ impl Superblock {
         write_u32(b, 8, crc);
     }
 
+    /// Refuse a superblock that does not describe the device it was read from.
+    ///
+    /// Nine of these fields are indices into a device whose size the
+    /// superblock does not get to declare, and `Mounted::open` copied five of
+    /// them straight into the allocator. An unchecked `bitmap_start` puts
+    /// bitmap writes on arbitrary blocks; an unchecked `block_count` above the
+    /// device puts the backup superblock past the end of it.
+    fn check(&self, device_blocks: u64) -> Result<(), FsError> {
+        let bad = |field| Err(FsError::BadSuperblock { field });
+
+        if self.block_count == 0 || self.block_count > device_blocks {
+            return bad("block_count");
+        }
+        if self.root_node.raw() >= self.block_count {
+            return bad("root_node");
+        }
+        // Block 0 is the superblock, so a bitmap starting there overwrites it.
+        if self.bitmap_start.raw() == 0 || self.bitmap_start.raw() >= self.block_count {
+            return bad("bitmap_start");
+        }
+        let bitmap_needed = self.block_count.div_ceil(BLOCK_SIZE as u64 * 8);
+        let bitmap_end = self.bitmap_start.raw().checked_add(self.bitmap_blocks);
+        if self.bitmap_blocks < bitmap_needed
+            || bitmap_end.is_none_or(|end| end > self.block_count)
+        {
+            return bad("bitmap_blocks");
+        }
+        if self.journal_start.raw() >= self.block_count {
+            return bad("journal_start");
+        }
+        if self.free_blocks > self.block_count {
+            return bad("free_blocks");
+        }
+        if self.next_alloc >= self.block_count {
+            return bad("next_alloc");
+        }
+        Ok(())
+    }
+
     /// Read superblock from disk, trying block 0 first, then backup at last block.
     pub fn read(io: &dyn BlockIO) -> Result<Self, FsError> {
+        let device_blocks = io.block_count();
+        if device_blocks == 0 {
+            return Err(FsError::BadSuperblock { field: "device has no blocks" });
+        }
+
+        let checked = |buf: &BlockBuf| {
+            Self::parse(buf).and_then(|sb| sb.check(device_blocks).map(|()| sb))
+        };
+
         let mut buf = BlockBuf::zeroed();
         io.read_block(BlockNum::new(0), &mut buf);
-        match Self::parse(&buf) {
+        match checked(&buf) {
             Ok(sb) => Ok(sb),
             Err(primary_err) => {
-                let last = BlockNum::new(io.block_count() - 1);
-                io.read_block(last, &mut buf);
-                Self::parse(&buf).map_err(|_| primary_err)
+                io.read_block(BlockNum::new(device_blocks - 1), &mut buf);
+                checked(&buf).map_err(|_| primary_err)
             }
         }
     }

@@ -50,6 +50,15 @@ pub enum FsError {
     ChecksumMismatch { block: BlockNum, stored: u32, computed: u32 },
     CorruptedKey(u16),
     CorruptedNode(BlockNum),
+    /// A block number off the end of the device it was read from. On-disk
+    /// pointers are the disk's claim about itself; the device is the arbiter.
+    BlockOffDevice { block: u64, device_blocks: u64 },
+    /// A descent that has gone deeper than any tree over this device can be,
+    /// which means it is following a cycle.
+    TreeTooDeep(BlockNum),
+    /// A superblock that does not describe the device it was read from. The
+    /// CRC only says the bytes are the bytes somebody wrote.
+    BadSuperblock { field: &'static str },
     NotFound,
     NoSpace { requested: u32, available: u64 },
     NameTooLong { len: usize, max: usize },
@@ -331,10 +340,7 @@ impl<IO: BlockIO> Formatted<IO> {
         );
 
         // Write empty root leaf
-        let root = Node {
-            level: 0,
-            entries: Vec::new(),
-        };
+        let root = Node::Leaf(Vec::new());
         // The only infallible node write in the crate: an empty node's entries
         // occupy zero bytes, so the bound `write_to` checks cannot be crossed.
         root.write(&io, BlockNum::new(root_block_num))
@@ -349,7 +355,6 @@ impl<IO: BlockIO> Formatted<IO> {
         let sb = Superblock {
             block_count,
             root_node: BlockNum::new(root_block_num),
-            root_level: 0,
             next_alloc: total_metadata,
             free_blocks: alloc.free_blocks,
             bitmap_start,
@@ -377,10 +382,7 @@ impl<IO: BlockIO> Formatted<IO> {
         let key = make_key(&self.sb.hash_seed, name, KeyType::File);
         let entry = Entry { key, value };
 
-        let (new_root, new_level) =
-            btree::insert(&self.io, &mut self.alloc, self.sb.root_node, self.sb.root_level, entry)?;
-        self.sb.root_node = new_root;
-        self.sb.root_level = new_level;
+        self.sb.root_node = btree::insert(&self.io, &mut self.alloc, self.sb.root_node, entry)?;
 
         Ok(())
     }
@@ -397,10 +399,7 @@ impl<IO: BlockIO> Formatted<IO> {
         let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
         let entry = Entry { key, value };
 
-        let (new_root, new_level) =
-            btree::insert(&self.io, &mut self.alloc, self.sb.root_node, self.sb.root_level, entry)?;
-        self.sb.root_node = new_root;
-        self.sb.root_level = new_level;
+        self.sb.root_node = btree::insert(&self.io, &mut self.alloc, self.sb.root_node, entry)?;
 
         Ok(())
     }
@@ -417,7 +416,8 @@ impl<IO: BlockIO> Formatted<IO> {
         let mut data_offset = 0usize;
 
         while remaining > 0 {
-            let (start, count) = self.alloc.alloc_contiguous(&self.io, remaining)?;
+            let run = self.alloc.alloc_up_to(&self.io, remaining)?;
+            let (start, count) = (run.start, run.len);
             push_extent(&mut extents, start.raw(), count);
 
             // Write data blocks
@@ -501,7 +501,7 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
     fn find_by_name(&self, name: &str) -> Result<Option<(Key, Vec<u8>)>, FsError> {
         // Try as File first (most common)
         let key = make_key(&self.sb.hash_seed, name, KeyType::File);
-        if let Some(value) = btree::search(&self.io, self.sb.root_node, self.sb.root_level, &key)? {
+        if let Some(value) = btree::search(&self.io, self.sb.root_node, &key)? {
             let leaf = decode_leaf_value(&value)?;
             if leaf.name() == name {
                 return Ok(Some((key, value)));
@@ -510,7 +510,7 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
 
         // Try as Symlink
         let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
-        if let Some(value) = btree::search(&self.io, self.sb.root_node, self.sb.root_level, &key)? {
+        if let Some(value) = btree::search(&self.io, self.sb.root_node, &key)? {
             let leaf = decode_leaf_value(&value)?;
             if leaf.name() == name {
                 return Ok(Some((key, value)));
@@ -556,7 +556,7 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
 
     /// List all files. Returns (name, size) pairs.
     pub fn list(&self) -> Result<Vec<(String, u64)>, FsError> {
-        let entries = btree::collect_all(&self.io, self.sb.root_node, self.sb.root_level)?;
+        let entries = btree::collect_all(&self.io, self.sb.root_node)?;
         let mut result = Vec::new();
         for entry in &entries {
             if let Ok(leaf) = decode_leaf_value(&entry.value) {
@@ -615,10 +615,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         let key = make_key(&self.sb.hash_seed, name, KeyType::File);
         let entry = Entry { key, value };
 
-        let (new_root, new_level) =
-            btree::insert(&self.io, &mut self.alloc, self.sb.root_node, self.sb.root_level, entry)?;
-        self.sb.root_node = new_root;
-        self.sb.root_level = new_level;
+        self.sb.root_node = btree::insert(&self.io, &mut self.alloc, self.sb.root_node, entry)?;
         Ok(())
     }
 
@@ -636,10 +633,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
         let entry = Entry { key, value };
 
-        let (new_root, new_level) =
-            btree::insert(&self.io, &mut self.alloc, self.sb.root_node, self.sb.root_level, entry)?;
-        self.sb.root_node = new_root;
-        self.sb.root_level = new_level;
+        self.sb.root_node = btree::insert(&self.io, &mut self.alloc, self.sb.root_node, entry)?;
         Ok(())
     }
 
@@ -651,7 +645,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
     /// Delete all entries whose name starts with the given prefix.
     pub fn delete_prefix(&mut self, prefix: &str) {
         // Collect entries, find matching ones, free their blocks, remove from tree
-        let entries = match btree::collect_all(&self.io, self.sb.root_node, self.sb.root_level) {
+        let entries = match btree::collect_all(&self.io, self.sb.root_node) {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -664,7 +658,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
                         self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
                     }
                     // Delete from btree
-                    let _ = btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &entry.key);
+                    let _ = btree::delete(&self.io, self.sb.root_node, &entry.key);
                 }
             }
         }
@@ -691,7 +685,8 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         let mut data_offset = 0usize;
 
         while remaining > 0 {
-            let (start, count) = self.alloc.alloc_contiguous(&self.io, remaining)?;
+            let run = self.alloc.alloc_up_to(&self.io, remaining)?;
+            let (start, count) = (run.start, run.len);
             push_extent(&mut extents, start.raw(), count);
 
             let mut buf = BlockBuf::zeroed();
@@ -717,7 +712,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
     fn delete_by_name(&mut self, name: &str) -> bool {
         // Try File key
         let key = make_key(&self.sb.hash_seed, name, KeyType::File);
-        if let Ok(Some(value)) = btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &key) {
+        if let Ok(Some(value)) = btree::delete(&self.io, self.sb.root_node, &key) {
             if let Ok(leaf) = decode_leaf_value(&value) {
                 if leaf.name() == name {
                     for ext in leaf.extents() {
@@ -730,7 +725,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
 
         // Try Symlink key
         let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
-        if let Ok(Some(value)) = btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &key) {
+        if let Ok(Some(value)) = btree::delete(&self.io, self.sb.root_node, &key) {
             if let Ok(leaf) = decode_leaf_value(&value) {
                 if leaf.name() == name {
                     for ext in leaf.extents() {
@@ -763,19 +758,17 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
             entry_type, new_name, leaf.size(), leaf.mtime(), leaf.extents(),
         );
         let new_key = make_key(&self.sb.hash_seed, new_name, old_key.key_type);
-        let (new_root, new_level) = btree::insert(
+        self.sb.root_node = btree::insert(
             &self.io, &mut self.alloc,
-            self.sb.root_node, self.sb.root_level,
+            self.sb.root_node,
             Entry { key: new_key, value: new_value },
         )?;
-        self.sb.root_node = new_root;
-        self.sb.root_level = new_level;
 
         // 3. DELETE target's old entry if it existed (frees target's blocks)
         self.delete_by_name(new_name);
 
         // 4. DELETE source's old entry (without freeing blocks — they're in the new entry)
-        if let Ok(Some(_)) = btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &old_key) {
+        if let Ok(Some(_)) = btree::delete(&self.io, self.sb.root_node, &old_key) {
             // Blocks are NOT freed — they now belong to the new entry
         }
 
@@ -806,39 +799,227 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
 
         // Delete keeps the blocks: the new extents usually reference the same
         // ones. Blocks the caller drops from the extent list are leaked.
-        btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &old_key)?;
+        btree::delete(&self.io, self.sb.root_node, &old_key)?;
 
-        let (new_root, new_level) = btree::insert(
+        self.sb.root_node = btree::insert(
             &self.io, &mut self.alloc,
-            self.sb.root_node, self.sb.root_level,
+            self.sb.root_node,
             new_entry,
         )?;
-        self.sb.root_node = new_root;
-        self.sb.root_level = new_level;
         Ok(())
     }
 
-    /// Resolve a page index to a block number, allocating a new block if needed.
-    /// Returns (block_number, extents_were_extended).
+    /// Resolve a page index to a block number, allocating blocks to reach it.
+    ///
+    /// The allocator answers with a run that may be shorter than the request,
+    /// so covering a page means looping until the extents reach it — the same
+    /// loop `write_data` has always had. Reading the short run as a complete
+    /// one returned a block past the end of the extent that had just been
+    /// recorded: the page's write went to a block belonging to another file,
+    /// and a later read of the same page resolved somewhere else again.
     pub fn resolve_or_alloc_block(
         &mut self,
         extents: &mut Vec<Extent>,
         page_idx: u32,
     ) -> Result<u64, FsError> {
-        // Check if page_idx is within existing extents
-        let mut cursor = 0u32;
-        for ext in extents.iter() {
-            if page_idx < cursor + ext.block_count {
-                return Ok(ext.start_block + (page_idx - cursor) as u64);
-            }
-            cursor += ext.block_count;
+        if let Some(block) = block_for(extents, page_idx) {
+            return Ok(block);
         }
 
-        // Page is beyond existing extents — allocate new blocks to cover it
-        let needed = page_idx + 1 - cursor;
-        let (start, count) = self.alloc.alloc_contiguous(&self.io, needed)?;
-        push_extent(extents, start.raw(), count);
-        // The requested page_idx is at offset (page_idx - cursor) within the new extent
-        Ok(start.raw() + (page_idx - cursor) as u64)
+        let target = page_idx as u64;
+        let mut covered: u64 = extents.iter().map(|e| e.block_count as u64).sum();
+        while covered <= target {
+            let want = (target - covered + 1).min(u32::MAX as u64) as u32;
+            let run = self.alloc.alloc_up_to(&self.io, want)?;
+            push_extent(extents, run.start.raw(), run.len);
+            covered += run.len as u64;
+        }
+
+        block_for(extents, page_idx).ok_or(FsError::NotFound)
+    }
+}
+
+/// The block holding `page_idx`, if the extents already reach that far.
+///
+/// The one definition of where a page lives, used both to answer a resolve and
+/// to answer it again after allocating — so an allocation that came up short
+/// cannot produce a block the lookup would not agree with.
+fn block_for(extents: &[Extent], page_idx: u32) -> Option<u64> {
+    let mut cursor = 0u64;
+    for ext in extents {
+        let end = cursor + ext.block_count as u64;
+        if (page_idx as u64) < end {
+            return Some(ext.start_block + (page_idx as u64 - cursor));
+        }
+        cursor = end;
+    }
+    None
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use crate::block_io::VecBlockIO;
+    use crate::btree::NODE_MAGIC;
+    use crate::crc32c::crc32c;
+
+    /// A real volume with a real file on it, as raw bytes to be tampered with.
+    ///
+    /// Every crafted block below is resealed with the checksum the format asks
+    /// for, so the parser accepts all of them as authentic. That is the whole
+    /// point: whoever writes the image writes the CRC.
+    fn image(blocks: u64) -> Vec<u8> {
+        let mut fs = Formatted::format(VecBlockIO::new(blocks));
+        fs.create("victim.txt", b"a file that was already here", 1).expect("create");
+        fs.into_io().into_vec()
+    }
+
+    fn seal_node(raw: &mut [u8], block: u64) {
+        let at = block as usize * BLOCK_SIZE;
+        let crc = crc32c(&raw[at + crate::btree::CRC_START..at + BLOCK_SIZE]);
+        raw[at + 4..at + 8].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn seal_superblock(raw: &mut [u8], block: u64) {
+        let at = block as usize * BLOCK_SIZE;
+        let crc = crc32c(&raw[at + Superblock::CRC_START..at + BLOCK_SIZE]);
+        raw[at + 8..at + 12].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Patch a little-endian `u64` into both copies of the superblock.
+    fn patch_superblock(raw: &mut [u8], blocks: u64, off: usize, val: u64) {
+        for sb_block in [0, blocks - 1] {
+            let at = sb_block as usize * BLOCK_SIZE;
+            raw[at + off..at + off + 8].copy_from_slice(&val.to_le_bytes());
+            seal_superblock(raw, sb_block);
+        }
+    }
+
+    /// Point both superblocks at `root`, and set the depth field to its maximum
+    /// while we are here — that field is what three recursions used to descend
+    /// on, and a disk saying 65535 is the shape that killed the kernel.
+    fn set_root(raw: &mut [u8], blocks: u64, root: u64) {
+        for sb_block in [0, blocks - 1] {
+            let at = sb_block as usize * BLOCK_SIZE;
+            raw[at + 24..at + 32].copy_from_slice(&root.to_le_bytes());
+            raw[at + 32..at + 34].copy_from_slice(&u16::MAX.to_le_bytes());
+            seal_superblock(raw, sb_block);
+        }
+    }
+
+    /// An interior node at `block` with one child pointer, `value_len` bytes
+    /// wide, naming `child`.
+    fn craft_interior(raw: &mut [u8], block: u64, child: u64, value_len: u32) {
+        let at = block as usize * BLOCK_SIZE;
+        raw[at..at + BLOCK_SIZE].fill(0);
+        raw[at..at + 4].copy_from_slice(&NODE_MAGIC);
+        raw[at + 8..at + 10].copy_from_slice(&1u16.to_le_bytes());
+        raw[at + 10..at + 12].copy_from_slice(&1u16.to_le_bytes());
+
+        let entry = at + 32;
+        raw[entry + 18..entry + 22].copy_from_slice(&value_len.to_le_bytes());
+        let value = entry + 24;
+        let bytes = child.to_le_bytes();
+        let n = (value_len as usize).min(bytes.len());
+        raw[value..value + n].copy_from_slice(&bytes[..n]);
+        seal_node(raw, block);
+    }
+
+    fn mount(raw: Vec<u8>) -> Result<Mounted<VecBlockIO, ReadOnly>, FsError> {
+        Mounted::<_, ReadOnly>::open(VecBlockIO::from_vec(raw))
+    }
+
+    #[test]
+    fn a_root_that_points_at_itself_is_refused_not_followed() {
+        let blocks = 128;
+        let mut raw = image(blocks);
+        craft_interior(&mut raw, 3, 3, 8);
+        set_root(&mut raw, blocks, 3);
+
+        let fs = mount(raw).expect("the volume still describes its device");
+        match fs.list() {
+            Err(FsError::TreeTooDeep(_)) => {}
+            other => panic!("expected TreeTooDeep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_interior_value_too_short_for_a_block_number_is_refused() {
+        let blocks = 128;
+        let mut raw = image(blocks);
+        craft_interior(&mut raw, 3, 4, 4);
+        set_root(&mut raw, blocks, 3);
+
+        let fs = mount(raw).expect("mount");
+        match fs.list() {
+            Err(FsError::CorruptedNode(_)) => {}
+            other => panic!("expected CorruptedNode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_child_pointer_past_the_end_of_the_device_is_refused() {
+        let blocks = 128;
+        let mut raw = image(blocks);
+        craft_interior(&mut raw, 3, u64::MAX, 8);
+        set_root(&mut raw, blocks, 3);
+
+        let fs = mount(raw).expect("mount");
+        match fs.list() {
+            Err(FsError::BlockOffDevice { .. }) => {}
+            other => panic!("expected BlockOffDevice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_superblock_claiming_more_blocks_than_the_device_has_is_refused() {
+        let blocks = 128;
+        let mut raw = image(blocks);
+        patch_superblock(&mut raw, blocks, 12, 1 << 40);
+
+        match mount(raw) {
+            Err(FsError::BadSuperblock { field }) => assert_eq!(field, "block_count"),
+            Err(other) => panic!("expected BadSuperblock, got {other:?}"),
+            Ok(_) => panic!("mounted a superblock describing a device 8192 times this one"),
+        }
+    }
+
+    #[test]
+    fn a_bitmap_outside_the_volume_is_refused() {
+        // `set_used`, `set_free` and `is_free` all compute
+        // `bitmap_start + byte_idx / 4096` and check it against nothing, so a
+        // mounted volume with this field wrong writes its bitmap over whatever
+        // is at those blocks.
+        let blocks = 128;
+        let mut raw = image(blocks);
+        patch_superblock(&mut raw, blocks, 52, 1 << 40);
+
+        match mount(raw) {
+            Err(FsError::BadSuperblock { field }) => assert_eq!(field, "bitmap_start"),
+            Err(other) => panic!("expected BadSuperblock, got {other:?}"),
+            Ok(_) => panic!("mounted a volume whose bitmap is not on the device"),
+        }
+    }
+
+    #[test]
+    fn a_bitmap_too_small_to_cover_the_volume_is_refused() {
+        // One bit per block is not negotiable: a shorter bitmap means blocks
+        // whose free/used state is read out of whatever follows it.
+        let blocks = 128;
+        let mut raw = image(blocks);
+        patch_superblock(&mut raw, blocks, 60, 0);
+
+        match mount(raw) {
+            Err(FsError::BadSuperblock { field }) => assert_eq!(field, "bitmap_blocks"),
+            Err(other) => panic!("expected BadSuperblock, got {other:?}"),
+            Ok(_) => panic!("mounted a volume with no bitmap at all"),
+        }
+    }
+
+    #[test]
+    fn an_untampered_volume_still_mounts_and_reads() {
+        let blocks = 128;
+        let fs = mount(image(blocks)).expect("a volume this crate wrote must mount");
+        assert_eq!(fs.read_file("victim.txt").expect("read"), b"a file that was already here");
     }
 }

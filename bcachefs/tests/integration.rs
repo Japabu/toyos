@@ -599,7 +599,7 @@ fn format_mount_unmount_create_mount_roundtrip() {
 
 /// The path the kernel's flush takes: one `resolve_or_alloc_block` per dirty
 /// page, in ascending order, then one `update_metadata` for the whole file.
-fn write_pages(fs: &mut Mounted<VecBlockIO, ReadWrite>, name: &str, pages: u32) -> Vec<bcachefs::Extent> {
+fn write_pages(fs: &mut Mounted<VecBlockIO, ReadWrite>, pages: u32) -> Vec<bcachefs::Extent> {
     let mut extents = Vec::new();
     for page in 0..pages {
         fs.resolve_or_alloc_block(&mut extents, page).expect("allocate a block for the page");
@@ -612,7 +612,7 @@ fn a_sequential_file_needs_one_extent() {
     let mut fs = Formatted::format(VecBlockIO::new(4096)).mount();
     fs.create("seq.bin", b"", 1).expect("create");
 
-    let extents = write_pages(&mut fs, "seq.bin", 600);
+    let extents = write_pages(&mut fs, 600);
 
     // 600 pages used to be 600 extents of 16 bytes — 9600 bytes into a value
     // that has to fit a 4040-byte node payload.
@@ -630,7 +630,7 @@ fn a_file_past_the_old_extent_cap_round_trips() {
     let mut fs = Formatted::format(VecBlockIO::new(4096)).mount();
     fs.create("big.bin", b"", 1).expect("create");
 
-    let extents = write_pages(&mut fs, "big.bin", 1000);
+    let extents = write_pages(&mut fs, 1000);
     let size = 1000 * 4096;
     fs.update_metadata("big.bin", &extents, size, 7).expect("metadata for a 1000-page file");
 
@@ -696,4 +696,90 @@ fn entries_of_mixed_size_survive_node_splits() {
     for n in &names {
         assert_eq!(fs.read_file(n).expect("read back"), b"x", "{n} did not survive splitting");
     }
+}
+
+
+// --- A short allocation is not the allocation that was asked for ---
+
+/// A volume whose free space is nothing but one-block holes, so the allocator
+/// can only ever report a run shorter than a multi-block request.
+///
+/// Returns the surviving files' single data blocks alongside it: a block the
+/// allocator did *not* hand out is the ground truth for "this write landed on
+/// somebody else's file".
+fn one_block_holes(blocks: u64) -> (Mounted<VecBlockIO, ReadWrite>, Vec<(String, u64)>) {
+    let mut fs = Formatted::format(VecBlockIO::new(blocks)).mount();
+    let mut made = Vec::new();
+    for i in 0..blocks {
+        let name = format!("f{i:03}");
+        if fs.create(&name, &vec![0xAAu8; 4096], 0).is_err() {
+            break;
+        }
+        made.push(name);
+    }
+    assert!(made.len() > 8, "volume too small to fragment: {} files", made.len());
+    for (i, name) in made.iter().enumerate() {
+        if i % 2 == 0 {
+            assert!(fs.delete(name), "delete {name}");
+        }
+    }
+    let survivors = made
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, n)| {
+            let (extents, _) = fs.file_extents(n).expect("a survivor kept its extents");
+            assert_eq!(extents.len(), 1);
+            assert_eq!(extents[0].block_count, 1);
+            (n.clone(), extents[0].start_block)
+        })
+        .collect();
+    (fs, survivors)
+}
+
+#[test]
+fn a_sparse_write_resolves_inside_the_blocks_it_reserved() {
+    let (mut fs, survivors) = one_block_holes(64);
+
+    // Page 3 of an empty file needs four blocks, and no free run here is
+    // longer than one. `alloc_contiguous` says so in its second return value;
+    // this caller used to read it as "all four, starting here".
+    let mut extents = Vec::new();
+    let block = fs.resolve_or_alloc_block(&mut extents, 3).expect("allocate page 3");
+
+    let reserved: Vec<u64> = extents
+        .iter()
+        .flat_map(|e| (0..e.block_count as u64).map(move |i| e.start_block + i))
+        .collect();
+    assert!(
+        reserved.contains(&block),
+        "page 3 resolved to block {block}, outside the extents it recorded: {extents:?}",
+    );
+    assert!(
+        !survivors.iter().any(|(_, b)| *b == block),
+        "page 3 resolved to block {block}, which belongs to {:?}",
+        survivors.iter().find(|(_, b)| *b == block).map(|(n, _)| n),
+    );
+}
+
+#[test]
+fn every_page_of_a_fragmented_file_owns_a_distinct_block() {
+    let (mut fs, _) = one_block_holes(64);
+
+    let mut extents = Vec::new();
+    fs.resolve_or_alloc_block(&mut extents, 5).expect("allocate through page 5");
+    let covered: u32 = extents.iter().map(|e| e.block_count).sum();
+    assert_eq!(covered, 6, "six pages need six blocks, got {extents:?}");
+
+    let mut seen: Vec<u64> = Vec::new();
+    for page in 0..=5 {
+        let block = fs.resolve_or_alloc_block(&mut extents, page).expect("resolve");
+        assert!(!seen.contains(&block), "page {page} shares block {block} with an earlier page");
+        seen.push(block);
+    }
+    assert_eq!(
+        extents.iter().map(|e| e.block_count).sum::<u32>(),
+        6,
+        "resolving a page that already has a block allocated another: {extents:?}",
+    );
 }
