@@ -11,11 +11,6 @@ use crate::AsHandle;
 
 pub use toyos_abi::io_uring::{IORING_POLL_IN, IORING_POLL_OUT};
 
-/// Deepest submission ring the kernel will create — mirrors `MAX_SQ_DEPTH` in
-/// `kernel/src/io_uring.rs`. A larger request is clamped rather than refused;
-/// see [`Poller::new`].
-const MAX_ENTRIES: u32 = 256;
-
 /// An io_uring instance for polling fd readiness.
 ///
 /// Owns the ring fd and shared memory mapping. Submissions are batched
@@ -46,15 +41,20 @@ unsafe impl Send for Poller {}
 unsafe impl Sync for Poller {}
 
 impl Poller {
+    /// Widest handle set one poller can carry — the kernel's deepest
+    /// submission ring, `MAX_SQ_DEPTH` in `kernel/src/io_uring.rs`. A caller
+    /// that must bound its own watched set has to bound it below this.
+    pub const MAX_HANDLES: u32 = 256;
+
     /// Create a poller sized for `handles` concurrently watched handles.
     ///
-    /// The kernel only builds power-of-two rings up to [`MAX_ENTRIES`], so the
+    /// The kernel only builds power-of-two rings up to [`MAX_HANDLES`], so the
     /// request is rounded up and clamped rather than rejected. Registering more
     /// handles than the ring holds stays correct (see
     /// [`poll_add_fd`](Self::poll_add_fd)); the depth only decides how many
     /// reach the kernel per batch.
     pub fn new(handles: u32) -> Self {
-        let entries = handles.clamp(1, MAX_ENTRIES).next_power_of_two();
+        let entries = handles.clamp(1, Self::MAX_HANDLES).next_power_of_two();
         let (ring_fd, shm_token) = syscall::io_uring_setup(entries)
             .expect("Poller::new: io_uring_setup failed");
         let base = unsafe { syscall::try_map_shared(shm_token) }

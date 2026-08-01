@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use toyos_abi::Fd;
-use toyos::poller::IORING_POLL_IN;
+use toyos::poller::{IORING_POLL_IN, Poller};
 use toyos::ipc;
 use toyos::pipe;
 use toyos_abi::syscall as toyos_nic;
@@ -273,6 +273,54 @@ fn recv_request<T: IpcPayload>(fd: Fd, header: &ipc::IpcHeader) -> Option<T> {
     ipc::recv_payload(fd, header).ok()
 }
 
+/// Poll registrations that are not piped connections: the service listener and
+/// the NIC fd.
+const FIXED_POLL_FDS: u32 = 2;
+
+/// Hard ceiling on live piped connections, from the poller rather than from
+/// memory: netd registers every tx pipe in the same batch as those two fds,
+/// and `Poller::MAX_HANDLES` is the widest set one poller can carry. The
+/// memory budget below is what binds on any machine with less than 8 GiB.
+const MAX_PIPED_SLOTS: u64 = (Poller::MAX_HANDLES - FIXED_POLL_FDS) as u64;
+
+/// Physical memory one piped connection costs. A kernel pipe is exactly one
+/// 2 MiB page (`kernel/src/pipe.rs`: `PIPE_SIZE = PAGE_2M`) and a piped socket
+/// is two of them, one per direction. The client allocates them, but netd
+/// holding the far ends is what keeps them alive, so this is netd's to bound.
+const PIPED_CONNECTION_BYTES: u64 = 2 * 2 * 1024 * 1024;
+
+/// Share of physical memory netd will keep tied up in client pipes.
+///
+/// Policy, not derivation, and the same eighth the compositor takes for the
+/// same reason: nothing in the kernel says what a process may use — no
+/// per-process limit, no pressure signal, no OOM killer — so the quantity that
+/// would make this derivable does not exist yet.
+const PIPE_BUDGET_SHARE: u64 = 8;
+
+/// How many piped connections netd will hold, given total physical memory.
+///
+/// An eighth of memory divided by the two pipes a connection costs, floored at
+/// one and capped at what one poller can watch.
+///
+/// **A mitigation, not a policy anyone chose.** A piped connection's 4 MiB is
+/// charged to nobody — no per-process limit, no pressure signal, no OOM killer
+/// (`specs/known-issues.md` §1) — so without a cap a client that opens sockets
+/// in a loop walks the machine into exhaustion, and netd has no way to tell
+/// that from ordinary use. Delete this in favour of a kernel memory limit, not
+/// in favour of a bigger number.
+fn max_piped_connections(total_mem: u64) -> usize {
+    let budget = total_mem / PIPE_BUDGET_SHARE;
+    (budget / PIPED_CONNECTION_BYTES).clamp(1, MAX_PIPED_SLOTS) as usize
+}
+
+/// Total physical memory, as the kernel reports it.
+fn total_memory() -> u64 {
+    let mut buf = [0u8; toyos::system::SYSINFO_HEADER_SIZE];
+    let n = toyos::system::sysinfo(&mut buf);
+    assert!(n >= toyos::system::SYSINFO_HEADER_SIZE, "sysinfo returned {n} bytes");
+    u64::from_le_bytes(buf[0..8].try_into().unwrap())
+}
+
 struct NetDaemon {
     sockets: HashMap<u32, SocketKind>,
     next_id: u32,
@@ -284,10 +332,11 @@ struct NetDaemon {
     piped_listeners: HashMap<u32, PipedListener>,
     pending_piped_connects: Vec<PendingPipedConnect>,
     udp_pipes: HashMap<u32, UdpPipes>,
+    max_piped_connections: usize,
 }
 
 impl NetDaemon {
-    fn new(dns_handle: SocketHandle) -> Self {
+    fn new(dns_handle: SocketHandle, max_piped_connections: usize) -> Self {
         Self {
             sockets: HashMap::new(),
             next_id: 1,
@@ -299,7 +348,18 @@ impl NetDaemon {
             piped_listeners: HashMap::new(),
             pending_piped_connects: Vec::new(),
             udp_pipes: HashMap::new(),
+            max_piped_connections,
         }
+    }
+
+    /// Is there room for one more piped connection?
+    ///
+    /// Counts the connects still waiting for their SYN-ACK: they each already
+    /// name a pair of pipes, so leaving them out would let a burst of
+    /// `TCP_CONNECT_PIPED` overshoot the cap by the whole burst.
+    fn piped_room(&self) -> bool {
+        self.piped_connections.len() + self.pending_piped_connects.len()
+            < self.max_piped_connections
     }
 
     fn alloc_id(&mut self) -> u32 {
@@ -660,6 +720,19 @@ impl NetDaemon {
             toyos_abi::syscall::close(client_fd);
             return;
         };
+        // Refused before the socket exists, so a refusal leaves nothing to
+        // unwind and no SYN on the wire. An error return, never a panic: the
+        // request is a client's and asking for one connection too many is not
+        // a bug in netd.
+        if !self.piped_room() {
+            eprintln!(
+                "netd: refusing connect, {} piped connections already (max {})",
+                self.piped_connections.len(),
+                self.max_piped_connections,
+            );
+            send_error_close(client_fd, ERR_CONNECTION_REFUSED);
+            return;
+        }
         let remote = IpEndpoint::new(
             IpAddress::Ipv4(Ipv4Addr::from(req.addr)),
             req.port,
@@ -751,6 +824,15 @@ impl NetDaemon {
             toyos_abi::syscall::close(client_fd);
             return;
         };
+        if !self.piped_room() {
+            eprintln!(
+                "netd: refusing accept, {} piped connections already (max {})",
+                self.piped_connections.len(),
+                self.max_piped_connections,
+            );
+            send_error_close(client_fd, ERR_CONNECTION_REFUSED);
+            return;
+        }
         let Some(listener) = self.piped_listeners.get(&req.socket_id) else {
             send_error_close(client_fd, ERR_NOT_CONNECTED);
             return;
@@ -1052,12 +1134,21 @@ fn main() {
     let dns_socket = dns::Socket::new(dns_servers, vec![]);
     let dns_handle = socket_set.add(dns_socket);
 
-    let mut daemon = NetDaemon::new(dns_handle);
+    let total_mem = total_memory();
+    let max_piped = max_piped_connections(total_mem);
+    let mut daemon = NetDaemon::new(dns_handle, max_piped);
 
-    eprintln!("netd: ready");
+    eprintln!(
+        "netd: ready, at most {max_piped} piped connections \
+         ({} MiB each of {} MiB total)",
+        PIPED_CONNECTION_BYTES / (1024 * 1024),
+        total_mem / (1024 * 1024),
+    );
 
-    // Create io_uring for event multiplexing
-    let poller = toyos::poller::Poller::new(64);
+    // Sized for the slot ceiling rather than for `max_piped`: the batch
+    // between two `wait` calls is the two fixed fds plus one per live piped
+    // connection, and the ceiling is what that can never exceed.
+    let poller = Poller::new(FIXED_POLL_FDS + MAX_PIPED_SLOTS as u32);
     const TOKEN_LISTENER: u64 = 0;
     const TOKEN_NIC: u64 = 1;
     const TOKEN_TX_PIPE_BASE: u64 = 0x1000;

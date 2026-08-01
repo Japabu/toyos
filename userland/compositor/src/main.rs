@@ -53,6 +53,74 @@ const LAUNCHER_APPS: &[LauncherEntry] = &[
 
 const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
 
+/// Fds the compositor watches that are not windows: keyboard, mouse, listener.
+const FIXED_POLL_FDS: u32 = 3;
+
+/// Hard ceiling on live windows, from the poller rather than from memory.
+///
+/// Every window's fd is registered in the same batch as the three fixed ones,
+/// and [`Poller::MAX_HANDLES`] is the widest set one poller can carry. Unlike
+/// [`max_windows`] this does not move when the resolution does, which is why
+/// the poller is sized from it: `MSG_SET_RESOLUTION` can make windows cheaper
+/// mid-run, and a poller sized for the old screen would then be too small.
+/// At any resolution this machine can actually scan out, the memory budget is
+/// far below this and is what binds.
+const MAX_WINDOW_SLOTS: u32 = Poller::MAX_HANDLES - FIXED_POLL_FDS;
+
+/// Share of physical memory the compositor will hold in window buffers.
+///
+/// Policy, not derivation. Nothing in the kernel says what a process may use —
+/// no per-process limit, no pressure signal, no OOM killer — so the quantity
+/// that would make this derivable does not exist yet. An eighth leaves seven
+/// eighths for the kernel, the other daemons, and the clients' own heaps.
+const WINDOW_BUDGET_SHARE: u64 = 8;
+
+/// Most physical memory one window can cost at this screen size.
+///
+/// A screen-sized content buffer is the largest the compositor ever hands out:
+/// `MSG_CREATE_WINDOW` refuses a request bigger than the screen, and every
+/// path that grows a window afterwards — maximize, snap, drag-resize — is
+/// bounded by the screen too. The kernel rounds every shared region up to a
+/// 2 MiB page (`shared_memory::alloc` calls `align_2m`), so that, not the pixel
+/// count, is what a window takes out of physical memory: a one-pixel window
+/// still costs 2 MiB.
+///
+/// Deliberately a function of the screen — a bigger screen means bigger windows
+/// means fewer of them — which no bare constant expresses.
+fn window_bytes(screen_w: usize, screen_h: usize) -> usize {
+    const PAGE_2M: usize = 2 * 1024 * 1024;
+    (screen_w * screen_h * 4).div_ceil(PAGE_2M).max(1) * PAGE_2M
+}
+
+/// How many windows the compositor will hold at this screen size.
+///
+/// One eighth of physical memory divided by what a window costs there, floored
+/// at one — a compositor that can never open a window is worse than one over
+/// its budget by a single window — and capped at what one poller can watch.
+///
+/// **This is a mitigation, and the thing it mitigates is the real defect.** A
+/// window buffer is charged to nobody: there is no per-process memory limit, no
+/// pressure signal and no OOM killer (`specs/known-issues.md` §1), so without a
+/// cap any client can walk the machine into exhaustion by asking for windows,
+/// and the compositor cannot tell a desktop from an attack. The 2 MiB rounding
+/// amplifies it: at 2048x2048 a window costs exactly 16 MiB, so 64 windows is
+/// a gigabyte. Read this as "how much we can afford to hand out while nothing
+/// can make us take it back", not as a considered UX limit — the number to
+/// delete this in favour of is a kernel memory limit.
+fn max_windows(total_mem: u64, screen_w: usize, screen_h: usize) -> usize {
+    let budget = total_mem / WINDOW_BUDGET_SHARE;
+    let affordable = budget / window_bytes(screen_w, screen_h) as u64;
+    affordable.clamp(1, MAX_WINDOW_SLOTS as u64) as usize
+}
+
+/// Total physical memory, as the kernel reports it.
+fn total_memory() -> u64 {
+    let mut buf = [0u8; system::SYSINFO_HEADER_SIZE];
+    let n = system::sysinfo(&mut buf);
+    assert!(n >= system::SYSINFO_HEADER_SIZE, "sysinfo returned {n} bytes");
+    u64::from_le_bytes(buf[0..8].try_into().unwrap())
+}
+
 struct WindowState {
     fd: Connection,
     pid: u32,
@@ -744,7 +812,18 @@ fn main() {
     let token_mouse = mouse.fd().0 as u64;
     let token_listener = listener.fd().0 as u64;
 
-    let poller = Poller::new(256);
+    let total_mem = total_memory();
+    let mut max_windows = max_windows(total_mem, screen.width(), screen.height());
+    eprintln!(
+        "compositor: at most {max_windows} windows ({} MiB each of {} MiB total)",
+        window_bytes(screen.width(), screen.height()) / (1024 * 1024),
+        total_mem / (1024 * 1024),
+    );
+
+    // Sized for the slot ceiling rather than for `max_windows`: the batch
+    // between two `wait` calls is the three fixed fds plus one per live
+    // window, and `MSG_SET_RESOLUTION` can raise `max_windows` mid-run.
+    let poller = Poller::new(FIXED_POLL_FDS + MAX_WINDOW_SLOTS);
 
     poller.poll_add(&kb, IORING_POLL_IN, token_kb);
     poller.poll_add(&mouse, IORING_POLL_IN, token_mouse);
@@ -1320,6 +1399,33 @@ fn main() {
                     let req_w = req.width as usize;
                     let req_h = req.height as usize;
 
+                    // Both refusals are answers to untrusted input, so neither
+                    // is a panic and neither is a silent shrink of what was
+                    // asked for. Without the size check `req` reaches
+                    // `SharedMemory::allocate` unbounded, where `alloc_shared`
+                    // asserts on a token the kernel refused — one message from
+                    // any client, and the compositor is gone.
+                    let refusal = if windows.len() >= max_windows {
+                        Some(window::REFUSED_AT_CAPACITY)
+                    } else if req_w > screen_w || req_h > screen_h {
+                        Some(window::REFUSED_TOO_LARGE)
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = refusal {
+                        eprintln!(
+                            "compositor: refusing {req_w}x{req_h} window from pid {client_pid} \
+                             ({} live, max {max_windows}), reason {reason}",
+                            windows.len()
+                        );
+                        let _ = ipc::send(
+                            client_fd,
+                            window::MSG_WINDOW_REFUSED,
+                            &window::WindowRefused { reason },
+                        );
+                        continue;
+                    }
+
                     let (win_x, win_y, win_w, win_h);
                     if req_w > 0 && req_h > 0 {
                         let chrome_w = BORDER_WIDTH * 2;
@@ -1433,6 +1539,12 @@ fn main() {
                             );
                             screen_w = screen.width() as i32;
                             screen_h = screen.height() as i32;
+                            // What a window costs moved, so what we can afford
+                            // moved with it. Windows already open are left
+                            // alone if the new figure is below their count —
+                            // the cap gates creation, it does not evict.
+                            max_windows =
+                                self::max_windows(total_mem, screen.width(), screen.height());
                             wallpaper = scale_wallpaper(
                                 wallpaper_pixels,
                                 wallpaper_w,
