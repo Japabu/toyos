@@ -32,7 +32,7 @@ The name has no meaning. This is not a hobby project. The quality bar is the sam
 
 **Scheduling** — Efficient, event-driven, fair-share. Per-CPU run queues. Must scale to 128+ cores without excessive overhead.
 
-**Filesystem** — VFS with mount points. Initrd, tmpfs, NVMe. **The kernel never formats a disk it was not given.** `bcachefs_adapter::probe` reads block 0: a bcachefs superblock is ours and gets mounted, a designation stamp (magic + that device's block count, written by `create_sparse`) authorises a format, anything else is `Foreign` and is never written to — `/home` falls back to a tmpfs. A failed mount is not consent; treating it as consent is what would have reformatted the T14's disk on its second boot.
+**Filesystem** — VFS with mount points. Initrd, tmpfs, NVMe. **The kernel never formats a disk it was not given.** `bcachefs_adapter::probe` reads block 0: a bcachefs superblock is ours and gets mounted, a designation stamp (magic + that device's block count, written by `create_sparse`) authorises a format, anything else is `Foreign` and is never written to — `/home` falls back to a tmpfs. A failed mount is not consent; treating it as consent is what would have reformatted the T14's disk on its second boot. The ESP is FAT32 by UEFI mandate, not by legacy: `toyos-fat32/` reads and writes it, has no code that could write a BPB, and treats the volume as untrusted input throughout — no kernel adapter yet.
 
 **Input** — One held-set and one button-merge for the whole machine (`keyboard::handle_key`, `mouse::handle_motion`), so two keyboards or two pointers compose rather than contradict. USB HID over xHCI and PS/2 over the i8042 both feed it in HID usage codes; wire decoding is `toyos-ps2/`. Pin interrupts arrive through `drivers/ioapic.rs`, everything else is MSI-X.
 
@@ -111,6 +111,7 @@ bootloader/       UEFI bootloader
 userland/         All userland programs + ecosystem forks
 toyos-abi/        Kernel ABI (types, constants, syscall numbers, syscall wrappers)
 toyos/            Userland SDK (typed handles, IPC, services, shm, net, Ring)
+toyos-fat32/      FAT32 driver, read + write (the ESP; no format path by design)
 toyos-ld/         Custom linker
 toyos-cc/         Custom C compiler
 rust/             Rust compiler/std fork (submodule)
@@ -143,7 +144,7 @@ diag/system.toml  The same, for `--diag-boot`: no framebuffer claimer at all
 - If something is blocking, stop and report it. Don't work around it.
 - Never degrade audible or visual quality — even temporarily, even for a big win elsewhere — without the owner's explicit sign-off. Quality tradeoffs are the owner's call.
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce output. If a command produces a lot of output or takes long, run it in the background — background tasks automatically get their output written to a file.
-- Host tests outside the QEMU suite: `cargo test` inside `toyos-sched/` and inside `toyos-ps2/`.
+- Host tests outside the QEMU suite: `cargo test` inside `toyos-sched/`, `toyos-ps2/` and `toyos-fat32/` (the last needs macOS `newfs_msdos`/`hdiutil`/`fsck_msdos`; it builds real images in `$TMPDIR`).
 - **`cargo test` and `cargo run` produce large output** (std rebuild warnings, initrd listing, serial output). Always run them in the background so the Bash tool doesn't silently truncate the output — `... [N characters truncated] ...` in tool output means data was lost. Read the output file afterward. **ToyOS is fast** — full boot is under a second and incremental builds usually finish in seconds, so never assume slowness.
 - **Always be empirical.** Never assume a command succeeded or failed — read the actual output. Never assume code works — run it. Never guess at root causes — investigate. Guessing is unproductive; verify everything.
 - **Any number in a comment, commit message, or spec must come from a command that was actually run.** If a figure is an estimate, or a bound from a datasheet, it says so. A plausible invented number is worse than no number: the next reader has no reason to doubt it, and it survives every review that only checks whether the prose reads sensibly. Real case: an IST1 stack measurement was written as 5936/2216 before anything was run; the true figures were 9968/4512, and nothing about the invented pair looked wrong. The estimate it replaced had been off by 4x for months and was load-bearing for a proposed fix that would have shipped broken.
