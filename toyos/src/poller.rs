@@ -23,10 +23,16 @@ const MAX_ENTRIES: u32 = 256;
 ///
 /// Registering more handles than the ring is deep is safe — the batch is
 /// flushed and refilled — but it is not unlimited: each registration can
-/// produce one completion, the kernel's completion queue is twice the
-/// submission ring, and it asserts rather than overflows. A caller that
-/// watches more than `2 × handles` distinct fds between two [`wait`](Self::wait)
-/// calls is outside what this type can carry; size it for the set instead.
+/// produce one completion, and the kernel's completion queue is twice the
+/// submission ring. A caller that watches more than `2 × handles` distinct fds
+/// between two [`wait`](Self::wait) calls is outside what this type can carry;
+/// size it for the set instead.
+///
+/// This said the kernel "asserts rather than overflows", which stopped being
+/// true when `post_cqe` switched to recording a drop and returning — prose
+/// asserting a property of another component that nobody re-checked. Losing
+/// the assert lost the diagnosis too: the overflow became silent. [`wait`](Self::wait)
+/// reads the kernel's drop counter, so it is loud again.
 pub struct Poller {
     ring_fd: Fd,
     base: *mut u8,
@@ -126,6 +132,25 @@ impl Poller {
         let cq_hdr = unsafe {
             &*(self.base.add(CQ_RING_OFF as usize) as *const IoUringRingHeader)
         };
+
+        // The kernel drops a completion it cannot post and records it here.
+        // Nobody asked, so a dropped completion became a caller waiting forever
+        // for readiness that was thrown away — a hang with no cause on the
+        // machine that has it. Asking turns it into a diagnosable failure.
+        //
+        // It is reachable without corrupting anything: `poll_add_fd` flushes a
+        // full SQ mid-registration, the kernel processes those entries at once,
+        // and already-ready fds post completions while the caller is still
+        // registering. Past `cq_size` they are dropped. The counter is
+        // cumulative and the kernel never clears it, so this stays tripped.
+        let dropped = cq_hdr.dropped.load(Ordering::Relaxed);
+        assert_eq!(
+            dropped, 0,
+            "Poller: the kernel dropped {dropped} completion(s) — more fds were \
+             registered between two wait() calls than the completion ring holds. \
+             Size the Poller for the whole watched set.",
+        );
+
         loop {
             let head = cq_hdr.head.load(Ordering::Acquire);
             let tail = cq_hdr.tail.load(Ordering::Acquire);
