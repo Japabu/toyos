@@ -78,7 +78,8 @@ pub const SYS_LISTEN: u64 = 85;
 pub const SYS_ACCEPT: u64 = 86;
 pub const SYS_CONNECT: u64 = 87;
 /// Allocate a TLS block for a dlopen'd module on the current thread.
-/// Arg0: module_id (1-based DTV index). Returns physical address of allocated block.
+/// Arg0: module_id (1-based DTV index). Returns the block's virtual address,
+/// or a `SyscallError` word — see [`tls_alloc_block`].
 pub const SYS_TLS_ALLOC_BLOCK: u64 = 88;
 pub const SYS_IO_URING_SETUP: u64 = 89;
 pub const SYS_IO_URING_ENTER: u64 = 90;

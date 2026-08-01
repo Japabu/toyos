@@ -600,6 +600,86 @@ Any process can allocate unbounded physical memory until the system runs out.
 No per-process limits, no memory pressure signals, no OOM killer. A single
 misbehaving process starves everything.
 
+### CLOSED — the SDK's IPC framing trusted the peer, and what is left after it
+
+`788decd`. `ipc::send<T: Copy>` published `size_of::<T>()` bytes of the
+sender's memory: `StreamOpenResponse` measures 32 against 28 bytes of fields
+(rustc `offset_of`), soundd builds it with a struct literal, and bytes 4..8 went
+to every audio client. `recv_payload<T: Copy>` asserted on `header.len` off the
+wire and transmuted arbitrary bytes into any `Copy` type through `mem::zeroed`.
+Bound by `IpcPayload`, which had existed one module away in `net.rs` bounding
+only `NetdConn::request`; padding is now a compile error via `ipc_payload!`, and
+a malformed frame is `Err`. `MAX_FRAME_LEN` (8192) is the SDK's second `MAX_`
+constant — `Poller::MAX_HANDLES` was the first and only.
+
+**Four residuals, and the first is worse than what was fixed.**
+
+1. **The compositor's accept path blocks in `recv_header`.** `main.rs:1351`
+   calls it on a freshly accepted fd, and `read_exact` is a *blocking* `read`.
+   A client that connects and sends four bytes parks the compositor's entire
+   event loop until it disconnects — no window redraws, no input, nothing. The
+   frame bound cannot help: the length has not been read yet. Closing it needs
+   a pending-connection table so a partial header is buffered the way an
+   established window's already is (`win.recv_buf`), which is why the hostile
+   peer test has no case for it: a case the fix does not close is a case that
+   is red on both sides. **This is the reason `ipc_hostile_peer` sends whole
+   headers.**
+2. **`Window::set_clipboard` bounds nothing and the compositor reads 116
+   bytes.** `window/src/lib.rs:349` sends `text.as_bytes()` with no check,
+   while the free `clipboard_set` (`:213`) switches to shared memory above
+   4096 — and `compositor/src/main.rs:1537` receives `MSG_CLIPBOARD_SET` into
+   `[u8; 116]`. So clipboard text between 117 and 4096 bytes is silently
+   truncated to 116 today, and the `MSG_CLIPBOARD_SET_SHM` doc comment
+   (`:45`) names 116 as the threshold the sender does not use. Three numbers,
+   one protocol. Past `MAX_FRAME_LEN` the send is now refused rather than
+   truncated, which is a different silence, not a fix — `set_clipboard` should
+   route through shm like its free-function twin.
+3. **`device::read_info<T: Copy>`** (`toyos/src/device.rs:10`) still builds a
+   `T` with `mem::zeroed` and fills it from a read. Lower stakes than
+   `recv_payload` — the bytes come from the kernel, not a peer — but it is the
+   same shape, and `IpcPayload` is the bound it wants.
+4. **netd is the same client-kills-the-daemon shape and has no gate.**
+   `recv_request`'s `.ok()` never caught the assert, because `.ok()` does not
+   catch a panic. It is fixed by the same change, but only the compositor has
+   a hostile-peer test; netd's would need `tests/netcase`.
+
+### ASSIGNED — two ABI wrappers return an error word as a value, and a fork blocks each
+
+`syscall::pipe()` and `syscall::tls_alloc_block()` cannot express failures the
+kernel already returns. Both fixes are one line of ABI each and both are
+**blocked on an edit outside the monorepo**, so the wrappers carry a doc comment
+saying they are dishonest until someone has the quiet-tree window.
+
+`pipe()` — `sys_pipe` answers `ResourceExhausted` on three paths (`syscall.rs:835-849`:
+no pipe pages, and either `fds.insert` hitting `MAX_FDS`). Computed:
+`ResourceExhausted.to_u64() = 0xfffffffffffffff8`, which the wrapper splits into
+`read = Fd(-1)`, `write = Fd(-8)`. In-tree that surfaces as a **soundd panic**:
+`soundd/src/main.rs:427-428` does `syscall::pipe()` then
+`pipe_id(..).expect("pipe_id failed")`, so a client that exhausts the fd table
+kills the audio daemon. `net.rs` survives by accident — its next call is
+`pipe_id` too, but `map_err`'d. Fix: `pub fn pipe() -> Result<PipeFds, SyscallError>`.
+**Fork edit owed:** `mio`, branch `toyos`, `src/sys/toyos/waker.rs:13` —
+`let pipe = toyos_abi::syscall::pipe();` becomes `let pipe = toyos_abi::syscall::pipe()
+.map_err(|_| io::Error::other("pipe"))?;` (`Waker::new` already returns
+`io::Result<Waker>`). Eight other in-tree call sites gain a `?`.
+
+`tls_alloc_block()` — the kernel returns `InvalidArgument` for `module_id == 0`
+or a module outside the process's list, and `ResourceExhausted` past
+`DTV_INITIAL_CAPACITY` (`arch/syscall.rs:1720-1789`). The doc comment claimed
+"Panics in the kernel", which stopped being true at the hardening pass, and
+claimed a *physical* address where the kernel returns a **virtual** one — both
+corrected in place. Consequence: `__tls_get_addr_slow` adds `offset` to a value
+near `u64::MAX` and returns the wrap as a pointer; computed, `InvalidArgument`
+plus an offset of 16 is `0xb`. Fix: wrap in `check`.
+**std edit owed:** `rust/library/std/src/sys/pal/toyos/tls.rs:29-31` — the
+variable is even named `block_phys`. `__tls_get_addr`'s ABI is that it returns
+an address and there is no caller to return an error to, so the right answer is
+`rtabort!`, which is what the current code is reaching for and constructing the
+wrong pointer instead.
+
+Batch them: one quiet-tree window covers both, and the audit's F9 (`get_env`,
+`waitpid`) is the same window again.
+
 ---
 
 ## 2. The panic path

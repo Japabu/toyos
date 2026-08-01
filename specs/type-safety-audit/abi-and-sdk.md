@@ -169,6 +169,17 @@ consumer through `AudioStream::open` and gets a rebuild from `[patch]`.
    (`PendingResponse::response`, `net.rs:363-366`, routes here). CLAUDE.md's
    "an `expect()` on a value that crossed the trust boundary", one boundary out
    from the kernel — a userland-triggered *daemon* panic.
+
+   **Correction, from running it (`788decd`): the soundd half is wrong.**
+   soundd never calls `recv_payload` — it frames client messages itself in
+   `MsgBuf` (`soundd/src/main.rs:990-1046`), which reads to the header
+   boundary, checks the declared length against
+   `size_of::<StreamOpenRequest>()`, and disconnects the client on an
+   oversized one. It is the only daemon that already did this. The compositor
+   (four `recv_payload` sites) and netd (whose `.ok()` cannot catch a panic)
+   are the real ones; measured red-before on the compositor, which panicked at
+   `ipc.rs:223` on a `len = 0` `MSG_CREATE_WINDOW` and left "no compositor is
+   running" behind it.
 2. **`T: Copy` is not `T: FromBytes`.** Arbitrary wire bytes become a `T` with
    no validity check. Today's payloads are integer aggregates so nothing is
    unsound in practice; adding a `bool`, a fieldless enum, or a `NonZeroU32`
