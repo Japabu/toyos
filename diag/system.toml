@@ -1,0 +1,23 @@
+# The diagnostic boot: a machine that reaches `Boot: complete` and then leaves
+# the kernel's boot log on the panel, for a machine that has no serial port.
+#
+# `panic_console::boot_checkpoint` paints the tail of the log ring at every boot
+# phase boundary and returns immediately once anything claims
+# DEVICE_FRAMEBUFFER. On the image that was flashed to the T14 the compositor
+# claimed it tens of milliseconds after the last checkpoint, so every line the
+# kernel logged — including the one `i8042:` line that says why the integrated
+# keyboard is dead — was on screen for about a tenth of a second and then gone.
+#
+# The guarantee here is structural rather than a property of this list: the
+# compositor is the only process that claims the framebuffer, and it is not
+# built into this image at all. Nothing that *could* take the screen exists to
+# be started by accident.
+#
+# The list cannot be empty — `kernel/src/main.rs` asserts the bootloader handed
+# it one, and a violated assert paints a panic report instead of a boot log — so
+# it is the shipping list's own first entry, which reads a config file that does
+# not exist on a fresh disk and returns.
+init = ["/bin/toybox locale --load"]
+
+[programs]
+toybox = {}
