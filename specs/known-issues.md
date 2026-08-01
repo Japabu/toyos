@@ -10,7 +10,8 @@ display entry against `883a84d` (2026-07-31); §8's three metal-sim entries
 against M1 (2026-07-31); §1's and §3's allocation-sizing entries against
 `a6935c6` (2026-07-31), from the sweep that followed the T14's first boot;
 §2's allocator-lock entry and §1's two readdir entries against `da433f1`
-(2026-08-01), all four figures in them off a running guest.
+and their fixes against `2571b97` (2026-08-01), every figure in them off a
+running guest.
 
 ---
 
@@ -181,22 +182,29 @@ a capability, or `#[cfg(debug_assertions)]`, or deletion.
 
 ### Untrusted-input panics that remain
 
-**`SYS_READDIR` over a large enough tmpfs directory — demonstrated, and the
-cheapest one on this list.** `Vfs::list` builds a `Vec<(String, u64)>` with one
-entry per file and no cap, so its 32,769th `push` doubles the buffer to 65,536
-entries — 2,097,152 bytes, one allocation, past `mm::MAX_HEAP_ALLOC`. Measured
-directly: a guest program that creates files in `/tmp` and lists after each
-batch listed cleanly at 32,768 files and died before 34,816, with
-`RawVec<(String, u64)>::grow_one` under `<kernel::vfs::Vfs>::list` in the
-backtrace asking for exactly that. Total elapsed 1.8 s, so this is an
-afternoon's worth of nothing, not a stress test. No privilege, no crafting:
-`fs::write` in a loop and one `read_dir`.
+CLOSED and kept for the residual: **`SYS_READDIR` over a large enough tmpfs
+directory** was the cheapest one on this list — `Vfs::list` built a
+`Vec<(String, u64)>` with one entry per file and no cap, and its 32,769th
+`push` doubled the buffer to 65,536 entries, 2,097,152 bytes, past
+`mm::MAX_HEAP_ALLOC`. 1.8 s, `fs::write` in a loop, no privilege. Bounded at
+`vfs::MAX_LIST_ENTRIES` (16,384) and refused with `ResourceExhausted`;
+`readdir_bound` is the gate.
 
-Worse than the allocation, because the allocation is now merely a dead process:
-it panics **inside `vfs::lock()`**, so the VFS lock is stranded and every later
-filesystem operation on the machine spins on it. Two of the three bounds this
-wants are the same one — a cap on the listing, and the cap being an error
-return rather than a truncation (below).
+**The residual is that the bound is on the *mount*, not the directory**, and it
+has to be: `FileSystem::list` returns every name in the mount and `Vfs::list`
+filters, because there is no per-directory index anywhere in the VFS. So a
+tmpfs with 16,385 files cannot list any directory in it, including an empty
+one, and every `readdir` is O(mount). The fix for that is a real directory
+index, not a bigger constant.
+
+**And `bcachefs` is still unbounded underneath it.** The trait takes the limit
+so an implementation can refuse *before* it allocates; `TmpFs` does.
+`BcacheFsAdapter` and `ReadOnlyBcacheFsAdapter` check the result instead,
+because `bcachefs::Mounted::list` has no count primitive and
+`btree::collect_all` materialises every entry first. Their refusal is uniform;
+their allocation is not bounded. `/home` is writable by userland, so this is a
+live path — for the `bcachefs` owner, alongside the 3 MiB `split_node`
+underflow.
 
 `SYS_SYSINFO` collects one 24-byte entry per live thread into a `Vec`
 (`syscall.rs:1273`) and thread count is uncapped, so ~87,000 threads makes it a
@@ -204,20 +212,30 @@ single >2 MiB allocation and `mm/alloc.rs`'s `MAX_HEAP_ALLOC` assert fires. Any
 process may call it. Second-order rather than cheap — building the thread count
 is itself unbounded — which is what puts the tmpfs route above it.
 
-### `SYS_READDIR` silently truncates, the same way `getcwd` did
+### CLOSED — `SYS_READDIR` silently truncated, the same way `getcwd` did
 
-Found on the way to the entry above and unrelated to it. `sys_readdir(path,
-buf)` serialises into a fixed user buffer and reports what fit, with no signal
-that anything was left out. Measured: `std::fs::read_dir("/tmp")` returned
-**4125** entries out of **34,816** files, and returned it as success. Between
-2048 and 4096 files it was exact, so the ceiling is the buffer and nothing
-about it is visible to the caller.
+`sys_readdir` filled the caller's buffer, stopped, and reported the bytes it
+had written, which is indistinguishable from a complete listing. Measured:
+`std::fs::read_dir("/tmp")` returned **4125** entries of **34,816**, as
+success; exact between 2048 and 4096 files, so the ceiling was the buffer and
+nothing about it was visible to the caller. Closed with the bound above — the
+return is the size the listing *needs* and nothing is written unless all of it
+fits, the contract `sys_getcwd` already had.
 
-Exactly the `std::env::current_dir()` defect one directory up, and the same
-judgement applies: a refusal would be a limitation, a wrong answer that looks
-right is a correctness defect, because every consumer inherits it silently. A
-program that enumerates a directory to delete it, or to check a name is absent,
-gets a confident wrong answer.
+**Kept because the pair is the lesson, not either half.** A bound plus a silent
+truncation is a quieter version of the same defect: the cap would have turned a
+kernel panic into a listing that was merely wrong, which is worse in the one
+way that matters — it is invisible. Whenever a collection gets a cap, the
+question after "what is the bound" is "what does the caller see when it is
+hit", and the answer has to be an error rather than a smaller answer. Same
+judgement as `std::env::current_dir()`: a refusal is a limitation, a wrong
+answer that looks right is a correctness defect.
+
+Three more places took the return as a length and would have inherited the new
+contract as a *lie* rather than a limitation — std's `readdir` (which sliced
+`buf[..n]`), std's `exists`/`stat`, and libc's `opendir` (which stored it as
+`DIR::len`, past its own buffer). **The audit that matters when a return value
+changes meaning is of its readers, not of its writer.**
 
 The crafted-ELF panics are closed (`679086d`, `ad38148`, `fa1e9d4`, `b362082`):
 `vaddr_to_file_offset` returns `Option` and `checked_add`s, both `align_2m`
@@ -509,14 +527,13 @@ thread never releases it. Pre-existing and unchanged by the panic-recovery fix; 
 for its own holder too. The general shape — locks a dead thread can strand —
 belongs to the capability-handles/ownership work.
 
-**The VFS lock is the same shape and is now the one that bites first**, because
-it is what the reachable over-ceiling routes are holding when they die: a
-`read_dir` over 32,769 files panics inside `vfs::lock()`, and every later
-filesystem operation on the machine spins on it. Measured after `889d611` — the
+**The VFS lock is the same shape**, and it was the one that bit first: a
+`read_dir` over 32,769 files panicked inside `vfs::lock()`, and every later
+filesystem operation on the machine spun on it. Measured after `889d611` — the
 process was killed and the harness still got its end marker, because the test
-runner's report path does not touch the VFS. So the allocator half is closed
-and the general "locks a dead thread strands" class is not; the allocator was
-only the worst instance of it, because every context allocates.
+runner's report path does not touch the VFS. That particular route is bounded
+now (§1), but the class is not: any panic under `vfs::lock()` still strands it,
+and the allocator was only the worst instance because every context allocates.
 
 ### The on-screen console shows only what serial has *not* consumed
 
