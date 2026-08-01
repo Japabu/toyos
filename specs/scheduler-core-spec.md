@@ -839,16 +839,29 @@ cutover for attributability, replaced by a per-CPU frontier in a **scheduled, si
 `RunQueue` = `rt: VecDeque<ReadyTask>` (FIFO, drained first) + `fair: BTreeMap<(u64, u64),
 ReadyTask>`, keyed by `(vruntime, insert_seq)` with a monotonic insertion sequence.
 
-**The tie-break must not be `TaskKey`.** All threads of a process share one vruntime, so an
-identity tie-break starves siblings: the same thread wins every tie and the others only run
-when it blocks. With a monotonic sequence a re-inserted thread goes *behind* its
-equal-vruntime siblings, so they round-robin without gaining cross-process share.
-`queue.rs:18-24` carries this reasoning next to the field. Related: `pop_surplus` takes the
-*last* fair task (`keys().next_back()`), so a steal never hands away the next-to-run one.
+**The tie-break must not be `TaskKey`, and the sequence must be monotonic**: a re-inserted
+thread has to land *behind* its equal-vruntime siblings, or the same thread can win every tie
+and the others only run when it blocks. `queue.rs:18-24` carries this next to the field.
+Related: `pop_surplus` takes the *last* fair task (`keys().next_back()`), so a steal never
+hands away the next-to-run one.
 
 > This section previously specified `BTreeMap<(u64, TaskKey), ReadyTask>` and called it
 > "today's ordering, deliberately". That is the ordering the code rejects as a starvation
 > bug; anyone implementing from the old text would have reintroduced it.
+
+**What that rule is worth today is smaller than the paragraph above reads, and it is now
+measured rather than asserted.** The share's pot is charged for every nanosecond any of its
+threads runs, so a thread re-inserted after a dispatch already carries a key *strictly* above
+every sibling queued before it: the fair band serves a share's threads in insertion order
+whatever the tie-break is. Exact ties survive only where no charge separates two inserts — a
+`wake_all` of siblings, or the spawn burst — and one dispatch dissolves them. Ported literally,
+`(vruntime, TaskKey)` is invisible to invariant I13 on `sibling_storm`
+(`scenarios::fair_identity_tiebreak`, kept as a standing control for exactly that reason). The
+rule stands because the *pot* is what is doing the work, and a policy change that stops
+charging it once per dispatch — an ordered map of shares each holding a FIFO of its ready
+threads, say — hands the whole job back to this field. That is what I13 exists to guard: its
+gate `fair_identity_within_share` serves the leading share's lowest-keyed ready thread every
+time and starves the rest, and invariant I5 reports a perfectly even split throughout.
 
 `dispatch` sets `quantum_end = now + QUANTUM_NS`;
 `finish()` arms `min(quantum_end, heap min)`. RT tasks round-robin within the band on the same
@@ -1007,13 +1020,14 @@ checkers.
 | I10 | Scenario end: all tasks finalized exactly once, mailboxes empty, CPUs idle, no leaks | sim |
 | I11 | No migrate/finalize of a task whose `ctx_saved` shadow is false | sim |
 | I12 | ≤1 `Wake` and ≤1 `Retire` node in flight per task; steal node free ⇔ unlinked | sim + loom |
+| I13 | Fairness, inside a share: threads of one share get equal service over I5's window, narrowed to intervals where every CPU carries the same number of each member's runnable threads | sim (+ negative gate `fair_identity_within_share`, control `fair_identity_tiebreak`) |
 
 ### 10.6 Loom scope (honest division of labor)
 
 Loom owns the primitives the sim's step granularity assumes correct: mailbox push/drain (IRQ torn
 push; the forbidden preempted-producer strand), doorbell edge/IPI accounting, ticket CAS protocol
 (wake/commit/cancel/timeout), kill-bit vs wake ordering, retire-node re-post, sleep handshake.
-The simulator proves that the protocol above linearizable primitives keeps I1–I12 across
+The simulator proves that the protocol above linearizable primitives keeps I1–I13 across
 schedules. Neither overpromises: loom does not scale to the whole scheduler; the sim does not
 model weak memory.
 

@@ -239,8 +239,9 @@ cargo run --release -p toyos-sched-sim -- gate 10000        # 10^4 seeds/scenari
 cargo run --release -p toyos-sched-sim -- fuzz-sweep 10000000  # 10^7 fuzz steps/scenario
 ```
 
-The harnesses' teeth are proven by five negative gates, every one of which is
-required and every one of which is a *port of a shape the kernel actually had*:
+The harnesses' teeth are proven by the negative gates below. Every one is
+required, and each is either a port of a shape the kernel actually had or a
+port of a shape the code explicitly names as the thing it is avoiding:
 
 1. `TOYOS_LOOM_RAW=1 cargo test -p toyos-sched-loom --features no-preempt-guard`
    must FAIL. It does, on invariant I2.
@@ -258,6 +259,25 @@ required and every one of which is a *port of a shape the kernel actually had*:
    caught in 500 of 500 seeds, all on I9; under the shipped park all 500 are
    clean, so it gates the park and not the workload. The **old** I9 form catches
    0 of 500, measured rather than argued.
+6. The two fairness gates for I5, `fair_share_per_thread` (spec §13.9's rejected
+   per-thread vruntime) and `fair_double_charge` (a share charged twice for what
+   it ran), which fail in opposite directions — service against entitlement has
+   two ways of being wrong and half an instrument sees one of them.
+7. `overlong_pass`, the second aborting gate: `SimHw` charges every pass five
+   times `cpu::MAX_PASS_NS`, without which the check build's pass-duration
+   assert is an expression computing `0 <= 200_000`.
+8. `fair_identity_within_share` for I13, the per-thread half of fairness. The
+   leading share's *lowest-keyed* ready thread is dispatched every time, so the
+   pot advances exactly as before, I5 reports an even split, and two of `trio`'s
+   three threads never run. Caught in 500 of 500 seeds, on I13 **alone** — that
+   exclusivity is the gate's content, since it is what says I5 could not have
+   stood in for it. Its control `fair_identity_tiebreak` is the `(vruntime,
+   TaskKey)` ordering `queue.rs` warns against, ported literally, and it must
+   stay **clean**: the pot is charged once per dispatch, so the band already
+   serves a share's threads in insertion order and the tie-break decides
+   nothing. That control is why the gate had to be written the stronger way,
+   and the reason the rule still stands is that a per-share FIFO redesign hands
+   the ordering job straight back to the tie-break.
 
 ## Defects the migration found and fixed
 

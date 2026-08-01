@@ -27,7 +27,7 @@ use toyos_sched_sim::sweep;
 use toyos_sched_sim::workload::ParkShape;
 
 /// Seeds per scenario in the in-test sweep. Every seed is a complete
-/// exploration with all of I1–I12 checked after every step.
+/// exploration with all of I1–I13 checked after every step.
 const SEEDS: u64 = 500;
 
 /// Steps per scenario in the in-test fuzz sweep.

@@ -1,4 +1,4 @@
-//! The global walks — spec §10.5, invariants I1–I12.
+//! The global walks — spec §10.5, invariants I1–I13.
 //!
 //! These run after **every** step. They are the reason the simulator exists:
 //! the linear types make most of these states unrepresentable in *scheduler*

@@ -844,11 +844,38 @@ average schedule. **The mechanism and the scaling are the policy's; the magnitud
 is a worst case.** Do not quote these numbers as expected behaviour.
 
 **Connected to §9.2's tie-break, and that is why this is hard.** Threads of a
-process sharing one vruntime is *why* an identity tie-break starves siblings, and
-*why* the insertion sequence exists (`specs/scheduler-core-spec.md` §9.2,
-`queue.rs:18-22`). The degradation here and that starvation are two faces of one
-decision: **per-process accounting with per-thread queueing.** Anything that
-fixes one has to answer for the other.
+process sharing one vruntime is *why* the insertion sequence exists
+(`specs/scheduler-core-spec.md` §9.2, `queue.rs:18-22`). The degradation here and
+sibling starvation are two faces of one decision: **per-process accounting with
+per-thread queueing.** Anything that fixes one has to answer for the other.
+
+**But only the per-process face degrades, and that is now measured.** Simulator
+invariant I13 measures service per *thread* inside a share over the same
+contention windows, narrowed to intervals where every CPU carries the same
+number of each member's runnable threads (otherwise the number is placement, not
+ordering). From `measure fairness_storm:<cpus>`, against a derived bound of
+60 ms at every width — `(rivals + 1) × (QUANTUM + max KernelSection +
+2 × RUN_CHUNK)`, five dispatches of one run queue's fair band, with **no lag
+term** because a share holds one vruntime and one lag for all its threads:
+
+| CPUs | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| I13 worst | 10 | 30 | 28 | 28 | 31 | 32 | 35 | 37 | 42 | 50 |
+| I5 worst | 30 | 102 | 125 | 198 | 324 | 418 | 634 | 612 | 1046 | 1386 |
+
+Flat where the per-process split runs away. **And the tie-break is not what
+keeps it flat** — the pot is charged for every nanosecond any thread of the
+share runs, so a re-inserted thread already carries a key strictly above every
+sibling queued before it and the band serves them in insertion order whatever
+the tie-break is. `(vruntime, TaskKey)` ported literally
+(`scenarios::fair_identity_tiebreak`) is invisible to I13, which is why the
+negative gate had to be the stronger `fair_identity_within_share`. **The
+consequence for the fix**: a redesign replacing per-thread queue keys with an
+ordered map of shares each holding a FIFO of its ready threads takes the
+ordering job *away* from the pot and hands it to that FIFO, so this face stops
+being benign the moment the fix lands. I13 is the gate that says so; it is green
+today and its own gate is red on the broken shape, on I13 alone — I5 reports a
+perfectly even split while two of three sibling threads never run.
 
 Found only because I5 measures *service* — nanoseconds actually delivered — rather
 than checking vruntime bookkeeping against itself, which would have been true by

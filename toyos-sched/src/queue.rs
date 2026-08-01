@@ -41,11 +41,24 @@ pub struct RunQueue<X: SchedPayload> {
     rt: VecDeque<ReadyTask<X>>,
     /// Ordered by `(vruntime, insertion sequence)`.
     ///
-    /// The tie-break must **not** be `TaskKey`. All threads of a process share
-    /// one vruntime, so an identity tie-break starves siblings: the same thread
-    /// wins every tie and the others only run when it blocks. With a monotonic
-    /// sequence a re-inserted thread goes *behind* its equal-vruntime siblings,
-    /// so they round-robin without gaining cross-process share.
+    /// The tie-break must **not** be `TaskKey`, and the sequence must be
+    /// monotonic: a re-inserted thread has to land *behind* its equal-vruntime
+    /// siblings, or the same thread can win every tie and the others only run
+    /// when it blocks.
+    ///
+    /// What that is worth *today* is smaller than it reads, and the simulator
+    /// measured it rather than this comment asserting it. A share's pot is
+    /// charged for every nanosecond any of its threads runs, so a thread
+    /// re-inserted after a dispatch already carries a key strictly above every
+    /// sibling queued before it: the band serves a share's threads in insertion
+    /// order whatever the tie-break is. Exact ties survive only where no charge
+    /// separates two inserts — a `wake_all` of siblings, the spawn burst — and
+    /// one dispatch dissolves them. [`FairOrder::IdentityTiebreak`] is this
+    /// field's warning ported literally, and it is invisible to simulator
+    /// invariant I13. The rule stands because the *pot* is doing the work: a
+    /// policy that stops charging it once per dispatch — an ordered map of
+    /// shares each holding a FIFO of its ready threads, say — hands the whole
+    /// job back here, which is what I13 is in place to guard.
     fair: BTreeMap<(u64, u64), ReadyTask<X>>,
     insert_seq: u64,
     /// Negative-gate escape hatch only; see [`FairOrder`].

@@ -4,7 +4,7 @@
 //!
 //! Two host-side harnesses compile against these same sources: the simulator
 //! (`toyos-sched/sim/`), which explores the protocol against invariants
-//! I1–I12, and the `toyos-sched-loom` package (`toyos-sched/loom/`), which
+//! I1–I13, and the `toyos-sched-loom` package (`toyos-sched/loom/`), which
 //! swaps in loom's instrumented atomics — see [`sync`] for why loom is a
 //! separate package rather than a `cfg(loom)` dependency.
 
