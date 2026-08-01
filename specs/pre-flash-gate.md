@@ -63,8 +63,8 @@ Do not substitute "the storage tests pass".
 | | |
 |---|---|
 | **Run** | `git grep -n "pub fn format\|pub fn mount\|pub fn probe" -- kernel/src/bcachefs_adapter.rs` |
-| **Expect** | `fn format()` and `fn mount()` **without** `pub` (currently `:299`, `:306`); `pub fn probe()` (currently `:343`) the only public entry. |
-| **False pass** | `pub(crate)` reads as "not public" to a skim but opens the whole kernel. Grep for `pub(` too. Equally: `probe` itself gaining a parameter that lets a caller skip the designation check — the signature is public API, so a new argument is a widened gate that this grep will not show. |
+| **Expect** | `fn format()` and `fn mount()` **without** `pub` (currently `:299`, `:306`), and every public route to `format()` passing through `probe()` (currently `:343`). The module has three public entries, not one — `probe`, `open_home` (`:397`) and `mount_initrd` (`:406`) — and the property is that `open_home` reaches `format()` only through `probe`'s `Designated` arm, not that `probe` stands alone. |
+| **False pass** | `pub(crate)` reads as "not public" to a skim but opens the whole kernel. Grep for `pub(` too. Equally: `probe` itself gaining a parameter that lets a caller skip the designation check — the signature is public API, so a new argument is a widened gate that this grep will not show. And the grep alone cannot see a *new* public wrapper that reaches `format()`: list the module's `pub` items, do not just match the three names above. |
 
 ### 1.3 No write path bypasses `probe`
 
@@ -191,8 +191,84 @@ not "the feature works".
 | Change | Run | Expect | False pass |
 |---|---|---|---|
 | `cwd` bound | Boot and confirm init sequence completes | `Boot: complete`, all `system.toml` init programs start | The bound only bites over 256 bytes; a normal boot exercises none of it, so a pass says nothing about the fix. It is here to confirm **no regression**, not to validate the bound. |
-| Ring modulus | `cargo test -- pipe` and `cargo test -- audio` (fast tier) | Unchanged from the last recorded run | Ring wrap needs sustained throughput; a short test never reaches the modulus. Compare against a recorded baseline rather than "it passed". |
-| Poller tripwire | Boot with compositor + netd + soundd running | All three daemons reach steady state | The tripwire fires past `cq_size`; a quiet boot never approaches it. Confirms no regression only. |
+| Ring modulus | `cargo test` inside `toyos-abi/` (~13 s), plus `cargo test -- pipe` and `cargo test -- audio` (fast tier) for no-regression | The three host tests pass, `a_stream_survives_the_cursor_reaching_two_to_the_thirty_two` among them; the guest suites unchanged | **The original wording — "unchanged from the last recorded run", "compare against a recorded baseline" — is not a check: no baseline for `pipe` was ever recorded, and a pass/fail test has no distribution to compare.** Struck and replaced. The real coverage is the host tests, which push 4 GiB through one ring and cross the new wrap ~32,800 times; the guest suites only confirm no regression, because ring wrap needs sustained throughput a short test never reaches. |
+| Poller tripwire | Superseded — see §5A, item 3 | | §5 describes `697072e`, step 1 of 3, which made the dropped completion *loud*. `414f5fb` then made it unrepresentable and turned two cases into panics. Certifying the old behaviour would be certifying code that is gone. |
+
+---
+
+## 5A. Changes that landed after this gate was drafted
+
+§5 is a snapshot of the tree at `7a52b13`, the commit that drafted this file.
+Eight commits touching the kernel, the build, or the boot path landed after it.
+**A gate that certifies a tree which no longer exists cannot fail** — the exact
+defect shape the rest of this document exists to catch, pointed at the safeguard
+itself. So these are added as items rather than folded into §5, so the gate says
+what it checked.
+
+Same rule as §5: each check is "boot is unchanged", not "the feature works".
+
+### 5A.1 Artifact staging — `9ee156c`
+
+This one changed how **the artifact the owner flashes is produced**, so it
+outranks the rest of this section.
+
+| | |
+|---|---|
+| **Run** | On a quiet tree: `cargo run -- --build-only`. Then search `target/bootable.img` for the root `system.toml` init string (`/bin/toybox locale --load;/bin/compositor;/bin/soundd;/bin/netd;/bin/sshd`) **and** for `/bin/test-runner`. Confirm `target/kernel-*` and `target/bootloader.efi-*` staged copies exist. |
+| **Expect** | The root init list present, `test-runner` absent, staged copies present. |
+| **False pass** | The init list is **compiled into `bootloader.efi`** (`bootloader/build.rs` declares `rerun-if-env-changed=INIT_PROGRAMS`), and cargo keyed the artifact path on `(crate, target, profile)` and nothing else — so before this commit an image built while a `cargo test` ran got *another config's bootloader* with a plausible initrd. That failure is invisible to a size check, to `fdisk -l`, and to §2 entirely: the image is well-formed, it just boots the wrong init list. Two consequences. First, checking only that the right string is *present* passes on an image that also contains the wrong one — assert `test-runner`'s **absence** too. Second, **build on a quiet tree**: a concurrent harness run is the precise condition this commit fixes, so building under contention tests the fix rather than the artifact. |
+
+### 5A.2 A CPU declines to halt while the log ring is non-empty — `a8a7204`
+
+| | |
+|---|---|
+| **Run** | Read `log_ring::drain_chunk_to_serial` and `serial::uart_write_bytes`. Confirm the drain calls `drain_into` (which advances `tail`, decrements `len` and stores `OWED`) **before** `backend.write_raw`, and that `uart_write_bytes` returns immediately when `!uart_present()`. Then `cargo test -- screen` and `cargo test -- audio`. |
+| **Expect** | On a machine with no serial the drain still empties the ring, so `has_pending()` self-clears and the idle CPU halts on the next trip round the loop. |
+| **False pass** | **No test observes a muted, idle machine — which is the T14's steady state.** `screen_panic_muted` is the only profile with no console at all, and it panics rather than idling; every profile that idles has a console draining the ring for it. If the drain did not consume, all cores would spin at 100% on the laptop and nothing in this suite would show it. Record this item as **read-verified**, not test-verified, and say which read: `drain_into` consumes unconditionally and `uart_write_bytes`'s first line is `if !uart_present() { return; }`. Note also that `LogRing::retained` is independent of draining, so the on-screen scrollback survives this change — CLAUDE.md's "the ring is drained continuously, so there is no scrollback behind it" predates `3108e3a` and is stale. |
+
+### 5A.3 Poller capacity is now enforced by panic — `414f5fb`, `8edbd5b`
+
+Supersedes §5's "Poller tripwire" row.
+
+| | |
+|---|---|
+| **Run** | `cargo test -- poller_capacity`. Boot with compositor + netd + soundd and confirm all three reach steady state. Read every `Poller::new` argument in `userland/`. |
+| **Expect** | No `Poller::new:` panic. Compositor `3 + (MAX_HANDLES - 3)`, netd `2 + (MAX_HANDLES - 2)`, soundd `64` and `MAX_CONTROL_CLIENTS + 1 = 64`, terminal `4`, window `1`. |
+| **False pass** | Compositor and netd sit **exactly on** `MAX_HANDLES = 256`, so a boot with either one alive says the boundary is inclusive and nothing more. Both sums are `const` and derived from `MAX_HANDLES` itself, so they cannot exceed it by construction — which means a green boot certifies nothing about the new panic. The only caller whose count is not first-party is `libc`'s `poll()`; confirm it returns `-1`/`EINVAL` above `MAX_HANDLES` **by reading `userland/libc/src/posix_io.rs`**, not by inferring it from a quiet boot. |
+
+### 5A.4 `create_dir` returns a `Result` the boot path `expect`s — `781f2d6`
+
+| | |
+|---|---|
+| **Run** | Read `kernel/src/main.rs`'s two boot-path `create_dir` callers. Then `git ls-tree HEAD rust` and compare against the `rust/` submodule's own HEAD. |
+| **Expect** | `/home/root` and `/home/root/.config` created; boot completes. The pin is `3cd2144` ("std: toyos getcwd must not silently truncate the cwd") and matches the submodule. |
+| **False pass** | Two **new `.expect` sites on the boot path**, and a boot proves only that two kernel literals are under `MAX_PATH` (4096) — which they are by four orders of magnitude. The item that can actually fail is the other half: `SYS_GETCWD`'s return contract changed in the same commit, with the matching std change in the **submodule**, not this repo. A stale pin gives a std that mis-reads the new return, and **nothing on the boot path would say so** — `current_dir()` would quietly hand back a valid-looking path to a different directory. Check the pin; do not assume the submodule moved with the commit that needed it. |
+
+### 5A.5 ELF loader bounds what it *derives* — `b554798`
+
+Runs for every program spawned and every `dlopen`, so every boot exercises it.
+
+| | |
+|---|---|
+| **Run** | Boot and confirm every `system.toml` init program starts. `cargo test -- abuse_elf_loader`. |
+| **Expect** | All init programs spawn; the relocation prescan still caches `libtls_cranelift.so`. |
+| **False pass** | The flashed `system.toml` is five init programs and none of them is the case this commit nearly broke: the commit records that a bound taken on total entry count would have **silently** put the largest library in the tree (211 K relocation entries, 77 stored) back on the scan-every-clone path. A silent fallback to a slower path is invisible to "all programs started". Look for the cache line or record it as unmeasured. |
+
+### 5A.6 libc gives `FILE` a buffer — `8de0a95`, `14120a5`
+
+| | |
+|---|---|
+| **Run** | Any boot whose assertions read console text. Confirm the buffer is flushed on process exit. |
+| **Expect** | Console output unchanged in content. |
+| **False pass** | This change *improves* the known line-atomicity defect (kernel `log!` interleaving with userspace `println!` mid-word), so a suite that was intermittently red on interleaving can go green for a reason unrelated to what is being certified — read a green run as weaker evidence than usual, not stronger. The failure it introduces instead is a **lost tail**: a program that exits without flushing loses its last partial line. On the T14 the screen is the only channel, so a lost tail is a lost diagnostic. |
+
+### 5A.7 The window protocol can say no — `8529cb3`, `8edbd5b`
+
+| | |
+|---|---|
+| **Run** | `cargo test -- window`, `cargo test -- metal_sim_window_caps`, `cargo test -- compositor`. |
+| **Expect** | A client survives a compositor that refuses. |
+| **False pass** | **This certifies almost nothing about the flash.** The T14 boots the compositor with no client until a terminal exists, and input is dead on that machine, so no window is ever created and the refusal path is never reached. Its value here is only "the compositor still starts". |
 
 ---
 
@@ -205,11 +281,27 @@ Record, per section: **pass / fail / read-verified-only**, and name who checked.
 - §1 is pass, with §1.1–§1.3 confirmed by *reading callers*, not by a green suite.
 - §2 is pass, with alignment and the backup GPT measured **on the file**.
 - §4 is pass — no exceptions; it is the only channel that reports anything else.
-- §3 and §5 are pass or explicitly recorded as read-verified with the reason
-  (§3.2 and §3.3 are expected to be read-verified; QEMU cannot exercise either).
+- §3, §5 and §5A are pass or explicitly recorded as read-verified with the
+  reason (§3.2, §3.3 and §5A.2 are expected to be read-verified; QEMU cannot
+  exercise any of the three).
 
 **No-go on any unresolved false pass**, even where the command printed success.
 That is the entire purpose of this document.
+
+Two things this gate cannot close, to be recorded rather than resolved:
+
+- **§2.3 is only half executable.** `hosted-rustc` lives in the root
+  `system.toml`, which governs `target/bootable.img` alone; every `cargo test`
+  boot builds its image from `tests/metalcase/system.toml` or
+  `tests/testcases/system.toml`, neither of which carries the key. So the flag
+  can be flipped and the size drop measured, but **the artifact the owner
+  actually flashes is booted by nothing in this tree** — booting it needs
+  `cargo run`, which opens a window on the owner's desktop. The nearest
+  evidence is the metal-sim profiles, which are boot-tested headlessly and
+  differ from `bootable.img` in exactly two ways: a different init list, and no
+  hosted rustc in the initrd.
+- **§1.4 is the owner's decision, not a check.** Record his answer; absence of
+  an answer is not a fail.
 
 State the three uncovered items from the top to the owner as expected outcomes
 before he boots, so a scancode-set refusal or a dead touchpad is not mistaken for
