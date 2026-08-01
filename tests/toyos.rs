@@ -118,6 +118,7 @@ const MACHINE_TESTS: &[&str] = &[
     "usb_storage_write_error",
     "usb_flush_optional",
     "xhci_deaf_registers",
+    "xhci_descriptor_walk",
     "esp_filesystem",
     "esp_log_file",
     "cache_eviction",
@@ -3358,6 +3359,51 @@ fn run_machine_test(
             eprintln!("  [i8042] {}", quiet.trim());
             eprintln!("  [i8042] {}", line.trim());
             eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
+            Ok(())
+        }
+        "xhci_descriptor_walk" => {
+            // A configuration descriptor is the device's, and a device is not
+            // kernel code. Every device QEMU can attach describes itself
+            // correctly, so a boot certifies that the parser handles a correct
+            // descriptor and nothing else — while the interesting inputs are
+            // the wrong ones, and one of them is an endpoint address naming
+            // endpoint 0, whose device context index is the slot context or
+            // EP0's. The parser is pure, so the driver runs it over nine
+            // crafted descriptors at init under this feature.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    profile: qemu::Profile::Metal,
+                    kernel_features: &["xhci-descriptor-selftest"],
+                    ..Default::default()
+                },
+            );
+            let log = qemu.boot_log().to_string();
+            if let Some(bad) = log.lines().find(|l| l.contains("descriptor selftest FAILED")) {
+                return Err(format!("{bad}\n{log}"));
+            }
+            let Some(verdict) = log.lines().find(|l| l.contains("descriptor selftest")) else {
+                return Err(format!("the parser's self-test never ran:\n{log}"));
+            };
+            // `9/9`, not "no failures": a self-test that ran zero cases would
+            // satisfy the absence of a FAILED line.
+            if !verdict.contains("9/9") {
+                return Err(format!("not every descriptor was parsed as required: {verdict}"));
+            }
+            // Once for the machine. It reads no register, so a per-controller
+            // run would be two verdicts about the same nine byte arrays.
+            let ran = log.matches("descriptor selftest").count();
+            if ran != 1 {
+                return Err(format!("the self-test ran {ran} times, wanted once\n{log}"));
+            }
+            // And the ordinary boot beside it: the same parser bound the boot
+            // stick off a descriptor a real controller delivered.
+            if !log.contains("usb-storage: 1 device(s)") {
+                return Err(format!("the boot stick did not bind on this boot\n{log}"));
+            }
+            eprintln!("  [xhci] {}", verdict.trim());
             Ok(())
         }
         "xhci_xecp_walk" => {
