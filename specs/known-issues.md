@@ -886,9 +886,21 @@ perfectly even split while two of three sibling threads never run.
 
 **Entry criteria for the per-share-FIFO redesign.** I5 and I13 together are
 close to sufficient and are not sufficient. Three gaps, all prerequisites rather
-than follow-ups:
+than follow-ups, and the first is *the* one — the other two are conditions on
+trusting the answer, this one is a hole where the answer would be.
 
-1. **I13's reach is a silent casualty of the change it guards.** Its window
+1. **The redesign's most novel path has no coverage in the workload class that
+   exercises it.** Where a woken thread lands in its share's order falls out of
+   the pot today; after the redesign it is decided by the FIFO push, which *is*
+   the new code. Nothing measures it. A block drops a thread from I13's measured
+   set, so I13's reach inverts exactly against the workloads that would exercise
+   it — 96–99% on the fairness storms, where nothing blocks, against
+   `crash_md_exit_race` 37%, `rt_wake_latency` 29%, `fork_storm` 9%,
+   `futex_storm` 5% and `audio_pipeline` **0%**. **I13 would stay green straight
+   through a redesign that got the wake path's ordering wrong**, and it is the
+   check that nominally guards fairness. A wake-heavy workload with windows long
+   enough to measure does not exist and has to be built first.
+2. **I13's reach is a silent casualty of the change it guards.** Its window
    closes when a member's threads stop being evenly spread over the CPUs, and
    the redesign must reimplement `pop_surplus`, which feeds
    `answer_steal_requests` and can therefore change placement — so a redesign
@@ -899,20 +911,17 @@ than follow-ups:
    it against 96% / 69% / 99%, and forcing the balance condition false takes it
    to 0% and reds the test. **A/B that number across the redesign; a collapse is
    as loud as a violation.** Named as the third gate-failure shape in
-   `specs/metal-track-history.md`, alongside "could not fail" and "nothing
-   measured the cost". Note the reach already falls with width — 55% at four
-   CPUs, 45% at eight — because threads exit at slightly different moments and
-   unbalance a wide machine sooner.
-2. **Nothing measures where a woken thread lands in its share's order.** A block
-   drops a thread from I13's measured set, and every scenario that blocks gives
-   windows of 0–10 ms (`audio_pipeline` reaches 0%). Today that ordering falls
-   out of the pot; after the redesign it is decided by the FIFO push, which is
-   precisely the new code. A wake-heavy workload with windows long enough to
-   measure does not exist yet and has to.
+   `specs/spec-staleness-sweep.md`, with the evidence in
+   `specs/metal-track-history.md`.
 3. **The margin at 32 CPUs is 1.2× and trending up** — 10 ms at one CPU to
    50 ms at 32 against a 60 ms bound — with nothing measured above 32, while
    spec §11 Stage 9 gates on 1–128. Measure 64 and 128 first, or a red at high
    width cannot be attributed to the redesign rather than to the width.
+   Compounded by the reach falling with width for an unrelated reason — 55% at
+   four CPUs, 45% at eight, because threads exit at slightly different moments
+   and unbalance a wide machine sooner. **At the widths Stage 9 targets, I13
+   certifies less than half the run**, which is a limit on the invariant and not
+   a defect in it.
 
 Found only because I5 measures *service* — nanoseconds actually delivered — rather
 than checking vruntime bookkeeping against itself, which would have been true by
