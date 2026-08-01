@@ -37,12 +37,19 @@ const CBW_LEN: u32 = 31;
 const CSW_LEN: u32 = 13;
 
 /// What the configuration descriptor said about a mass-storage interface.
+///
+/// The device context indices are resolved by `parse_config`, where the
+/// descriptor is, and carried here rather than recomputed: an address naming
+/// endpoint 0 has no index this driver may use, and that is a fact about the
+/// descriptor, not about the moment a Configure Endpoint command is built.
 pub struct MscInterface {
     pub iface_num: u8,
     pub in_ep: u8,
+    pub in_dci: u8,
     pub in_max_packet: u16,
     pub in_max_burst: u8,
     pub out_ep: u8,
+    pub out_dci: u8,
     pub out_max_packet: u16,
     pub out_max_burst: u8,
 }
@@ -628,8 +635,7 @@ pub fn bind(
         return false;
     };
 
-    let in_dci = (info.in_ep & 0x0F) * 2 + 1;
-    let out_dci = (info.out_ep & 0x0F) * 2;
+    let (in_dci, out_dci) = (info.in_dci, info.out_dci);
     let dma = ctrl.dma();
     let in_ring = TrbRing::init(dma.subslice(block + MSC_IN_RING, PAGE));
     let out_ring = TrbRing::init(dma.subslice(block + MSC_OUT_RING, PAGE));

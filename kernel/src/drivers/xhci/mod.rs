@@ -708,6 +708,11 @@ fn arm_interrupt(pci_dev: &PciDevice) -> Option<&'static str> {
 /// the first match reported that the T14 had no USB HID at all, which was true
 /// of that controller and false of the machine.
 pub fn init(devices: &[PciDevice]) {
+    // Once for the machine, not once per controller: it reads no register and
+    // touches no device, so a second run would say the same thing twice.
+    #[cfg(feature = "xhci-descriptor-selftest")]
+    device::selftest();
+
     let mut controllers = Vec::new();
     let mut disks = 0;
     let mut present = 0;

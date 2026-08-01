@@ -21,8 +21,24 @@ struct HidInterfaceInfo {
     protocol: HidType,
     iface_num: u8,
     ep_addr: u8,
+    ep_dci: u8,
     ep_max_packet: u16,
     ep_interval: u8,
+}
+
+/// The device context index of a non-control endpoint, which is the only kind
+/// this driver configures.
+///
+/// `None` for an address naming endpoint 0, and that is the whole reason this
+/// is a function. `0x80` and `0x10` are non-zero bytes — which is all the
+/// acceptance tests used to be — and they resolve to DCI 1, EP0's own endpoint
+/// context, and DCI 0, the slot context. A driver that configures a bulk
+/// endpoint at either writes it over the device's control endpoint or over its
+/// speed and root-hub port, from bytes the device chose, and relies on the host
+/// controller to reject the command it built.
+fn endpoint_dci(addr: u8) -> Option<u8> {
+    let num = addr & 0x0F;
+    (num != 0).then(|| num * 2 + u8::from(addr & 0x80 != 0))
 }
 
 /// What one configuration descriptor offered that this driver can drive.
@@ -97,9 +113,11 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
                     Some(Function::Msc(MscInterface {
                         iface_num: desc[2],
                         in_ep: 0,
+                        in_dci: 0,
                         in_max_packet: 0,
                         in_max_burst: 0,
                         out_ep: 0,
+                        out_dci: 0,
                         out_max_packet: 0,
                         out_max_burst: 0,
                     }))
@@ -115,6 +133,7 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
                             protocol,
                             iface_num: desc[2],
                             ep_addr: 0,
+                            ep_dci: 0,
                             ep_max_packet: 0,
                             ep_interval: 0,
                         })
@@ -129,26 +148,39 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
                 let transfer = desc[3] & 0x3;
                 let max_packet = le16(desc, 4);
                 last_ep_in = None;
-                match &mut current {
-                    Some(Function::Hid(h)) if addr & 0x80 != 0 && h.ep_addr == 0 => {
-                        h.ep_addr = addr;
-                        h.ep_max_packet = max_packet;
-                        h.ep_interval = desc[6];
-                    }
-                    // Bulk only: a mass-storage interface's interrupt endpoint
-                    // belongs to CBI, which this driver does not speak.
-                    Some(Function::Msc(m)) if transfer == 2 => {
-                        if addr & 0x80 != 0 && m.in_ep == 0 {
-                            m.in_ep = addr;
-                            m.in_max_packet = max_packet;
-                            last_ep_in = Some(true);
-                        } else if addr & 0x80 == 0 && m.out_ep == 0 {
-                            m.out_ep = addr;
-                            m.out_max_packet = max_packet;
-                            last_ep_in = Some(false);
+                // An address this driver cannot turn into a device context
+                // index is one it cannot configure, so as far as everything
+                // below here is concerned it is not an endpoint. The context
+                // index is resolved once, here, where the descriptor is — the
+                // two hand-rolled copies of the arithmetic further down each
+                // read the address themselves and neither looked at the
+                // endpoint *number*.
+                if let Some(dci) = endpoint_dci(addr) {
+                    match &mut current {
+                        Some(Function::Hid(h)) if addr & 0x80 != 0 && h.ep_addr == 0 => {
+                            h.ep_addr = addr;
+                            h.ep_dci = dci;
+                            h.ep_max_packet = max_packet;
+                            h.ep_interval = desc[6];
                         }
+                        // Bulk only: a mass-storage interface's interrupt
+                        // endpoint belongs to CBI, which this driver does not
+                        // speak.
+                        Some(Function::Msc(m)) if transfer == 2 => {
+                            if addr & 0x80 != 0 && m.in_ep == 0 {
+                                m.in_ep = addr;
+                                m.in_dci = dci;
+                                m.in_max_packet = max_packet;
+                                last_ep_in = Some(true);
+                            } else if addr & 0x80 == 0 && m.out_ep == 0 {
+                                m.out_ep = addr;
+                                m.out_dci = dci;
+                                m.out_max_packet = max_packet;
+                                last_ep_in = Some(false);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             // SuperSpeed Endpoint Companion, which is where a SuperSpeed
@@ -176,14 +208,17 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
         }
     }
 
+    // On the DCIs and not on the addresses. They are non-zero for exactly the
+    // endpoints `endpoint_dci` accepted, which is the property `bind` needs and
+    // is not the property "the descriptor's address byte was non-zero".
     if let Some(m) = msc {
-        if m.in_ep != 0 && m.out_ep != 0 {
+        if m.in_dci != 0 && m.out_dci != 0 {
             return Some((config_val, Function::Msc(m)));
         }
         log!("xHCI: mass-storage interface {} has no bulk pair, skipping", m.iface_num);
     }
     let h = hid?;
-    (h.ep_addr != 0).then(|| (config_val, Function::Hid(h)))
+    (h.ep_dci != 0).then(|| (config_val, Function::Hid(h)))
 }
 
 /// Initialize and configure one USB device on a port.
@@ -337,8 +372,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         HidType::Mouse => "mouse",
         HidType::Tablet => "tablet",
     };
-    let ep_num = info.ep_addr & 0x0F;
-    let int_ep_dci = ep_num * 2 + 1;
+    let int_ep_dci = info.ep_dci;
     log!("xHCI: HID {} iface={} ep={:#x} max_pkt={} interval={} dci={}",
         kind, info.iface_num, info.ep_addr, info.ep_max_packet, info.ep_interval, int_ep_dci);
 
@@ -456,4 +490,98 @@ pub fn scan_ports(ctrl: &mut XhciController, op_base: &Mmio, max_ports: u8) {
             init_device(ctrl, op_base, p);
         }
     }
+}
+
+/// Configuration descriptors no device in reach will hand us.
+///
+/// Same reason `legacy::selftest` exists, and the same shape: `parse_config` is
+/// a pure function over bytes a *device* chose, and every device QEMU can
+/// attach describes itself correctly — so the refusals below have no boot to
+/// point at. Each case's expected value is what the parser must decide, and the
+/// two that matter are the endpoint addresses naming endpoint 0: they are
+/// non-zero bytes, which is all the acceptance tests used to be, and they
+/// resolve to the slot context and to EP0's.
+#[cfg(feature = "xhci-descriptor-selftest")]
+pub fn selftest() {
+    /// (kind, config value, first DCI, second DCI); kind 1 is HID, 2 is mass
+    /// storage. A tuple rather than the enum, because what is under test is the
+    /// numbers the parser resolved and `Function` has no equality.
+    type Verdict = Option<(u8, u8, u8, u8)>;
+
+    fn summarise(got: Option<(u8, Function)>) -> Verdict {
+        match got? {
+            (cfg, Function::Hid(h)) => Some((1, cfg, h.ep_dci, 0)),
+            (cfg, Function::Msc(m)) => Some((2, cfg, m.in_dci, m.out_dci)),
+        }
+    }
+
+    /// A config descriptor whose `wTotalLength` is `total` and whose body is
+    /// one interface followed by `eps`, each `(address, transfer type)`.
+    fn build(buf: &mut [u8; 64], class: (u8, u8, u8), eps: &[(u8, u8)], total: u16) -> usize {
+        buf.fill(0);
+        buf[..9].copy_from_slice(&[9, 2, total as u8, (total >> 8) as u8, 1, 0x42, 0, 0, 0]);
+        buf[9..18].copy_from_slice(&[9, 4, 0, 0, eps.len() as u8, class.0, class.1, class.2, 0]);
+        let mut at = 18;
+        for &(addr, transfer) in eps {
+            buf[at..at + 7].copy_from_slice(&[7, 5, addr, transfer, 64, 0, 8]);
+            at += 7;
+        }
+        at
+    }
+
+    const MSC: (u8, u8, u8) = (0x08, 0x06, 0x50);
+    const KBD: (u8, u8, u8) = (3, 1, 1);
+    const CASES: usize = 9;
+
+    let mut passed = 0usize;
+    let mut buf = [0u8; 64];
+    let mut check = |name: &str, desc: &[u8], want: Verdict| {
+        let got = summarise(parse_config(desc));
+        if got == want {
+            passed += 1;
+        } else {
+            log!("xHCI: descriptor selftest FAILED on {name}: got {got:?}, want {want:?}");
+        }
+    };
+
+    // Bulk IN 0x81 is DCI 3, bulk OUT 0x02 is DCI 4.
+    let len = build(&mut buf, MSC, &[(0x81, 2), (0x02, 2)], 32);
+    check("an ordinary disk", &buf[..len], Some((2, 0x42, 3, 4)));
+
+    // 0x80 is endpoint 0 IN, whose DCI is 1 — the control endpoint a Configure
+    // Endpoint command must not add, and the ring `clear_stall` drives.
+    let len = build(&mut buf, MSC, &[(0x80, 2), (0x02, 2)], 32);
+    check("a bulk IN endpoint naming endpoint 0", &buf[..len], None);
+
+    // 0x10 is endpoint 0 OUT, whose DCI is 0 — the slot context, holding the
+    // speed and the root hub port this device was addressed on.
+    let len = build(&mut buf, MSC, &[(0x81, 2), (0x10, 2)], 32);
+    check("a bulk OUT endpoint naming endpoint 0", &buf[..len], None);
+
+    // Interrupt rather than bulk: CBI, which this driver does not speak.
+    let len = build(&mut buf, MSC, &[(0x81, 3), (0x02, 3)], 32);
+    check("a mass-storage interface with no bulk pair", &buf[..len], None);
+
+    let len = build(&mut buf, KBD, &[(0x81, 3)], 25);
+    check("an ordinary keyboard", &buf[..len], Some((1, 0x42, 3, 0)));
+
+    let len = build(&mut buf, KBD, &[(0x80, 3)], 25);
+    check("a keyboard whose interrupt endpoint is endpoint 0", &buf[..len], None);
+
+    // A zero length is the walk's one non-advancing step, and the reason it
+    // terminates rather than reading the same descriptor forever.
+    let len = build(&mut buf, KBD, &[(0x81, 3)], 25);
+    buf[9] = 0;
+    check("a descriptor claiming zero length", &buf[..len], None);
+
+    // wTotalLength is the device's, so it is clamped to what was actually
+    // requested; the interface before the lie is still found.
+    let len = build(&mut buf, KBD, &[(0x81, 3)], u16::MAX);
+    check("wTotalLength past the buffer", &buf[..len], Some((1, 0x42, 3, 0)));
+
+    // The last descriptor runs off the end of what the device sent.
+    let len = build(&mut buf, KBD, &[(0x81, 3)], 25);
+    check("a truncated final descriptor", &buf[..len - 3], None);
+
+    log!("xHCI: descriptor selftest {passed}/{CASES} configurations parsed as required");
 }

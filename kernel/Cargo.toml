@@ -72,6 +72,12 @@ usb-flush-fails = []
 # See `xhci/mod.rs`'s `settles`.
 xhci-deaf-controller = []
 xhci-deaf-port = []
+# Run `parse_config` over nine crafted configuration descriptors at init. The
+# bytes come from a device and every device QEMU can attach describes itself
+# correctly, so without this the parser's refusals — an endpoint address naming
+# endpoint 0 above all, which resolves to the slot context or to EP0's — would
+# ship never having executed. See `xhci/device.rs`'s `selftest`.
+xhci-descriptor-selftest = []
 # Shrink both disk caches to 64 entries each. The honest ceilings are tens of
 # megabytes, so a test that reached them by doing real I/O would spend minutes
 # proving what 256 KiB proves in a second. The eviction code under test is the
