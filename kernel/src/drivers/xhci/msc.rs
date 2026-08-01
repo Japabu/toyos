@@ -75,6 +75,15 @@ pub struct MscDevice {
 }
 
 impl MscDevice {
+    /// Whether the driver will still speak to this device.
+    ///
+    /// Published rather than inferred, because the geometry survives a failure:
+    /// it is what the device reported before it broke, so `blocks > 0` answers
+    /// "did this disk ever come up", not "is it still there".
+    pub fn online(&self) -> bool {
+        !self.failed
+    }
+
     pub fn geometry(&self) -> StorageGeometry {
         StorageGeometry {
             logical_block_bytes: self.logical_block_bytes,
@@ -104,11 +113,64 @@ enum Bot {
 /// The completion of one SCSI command, after the transport's own recovery.
 enum Scsi {
     Ok { delivered: u32 },
-    /// The command failed or the device broke. Both are "do not believe the
-    /// buffer"; `bring_up` is the only caller that needs to tell them apart,
-    /// and it drives the transport directly to do so.
-    Error,
+    /// The device understood the command and declined it, carrying the sense
+    /// key, ASC and ASCQ it gave for declining. Carried rather than logged and
+    /// dropped, because a caller issuing an *optional* command has to tell
+    /// "I will not" from "I cannot" and these three bytes are the only place
+    /// that answer exists.
+    Refused { key: u8, asc: u8, ascq: u8 },
+    /// The transport broke, or the device contradicted itself. Nothing about
+    /// the buffer is known.
+    Broken,
 }
+
+impl Scsi {
+    /// SBC's ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE: the device does
+    /// not have this opcode. For a command SBC makes optional that is an
+    /// answer and not a failure.
+    fn unimplemented(&self) -> bool {
+        matches!(self, Self::Refused { key: 0x05, asc: 0x20, ascq: 0x00 })
+    }
+}
+
+/// The one line a device's refusal produces, wherever it is noticed.
+///
+/// One function and not three, because the three callers of [`scsi`] make the
+/// same report about the same device, and a per-caller wording would make the
+/// log say which code path noticed rather than what the device said.
+///
+/// [`scsi`]: XhciController::scsi
+fn log_refusal(cdb: &[u8], key: u8, asc: u8, ascq: u8) {
+    log!(
+        "usb-storage: SCSI {:#04x} failed, sense {key:#04x}/{asc:#04x}/{ascq:#04x}",
+        cdb.first().copied().unwrap_or(0)
+    );
+}
+
+/// The sense a test makes SYNCHRONIZE CACHE answer with, in place of the
+/// device's own answer, or `None` on a shipped kernel.
+///
+/// A kernel feature because nothing on the host side can stage it: QEMU's
+/// `scsi-disk` implements 0x35 for every front end that reaches it —
+/// `usb-storage` and `usb-bot` over `scsi-hd` and `scsi-block` alike — and no
+/// device or drive property turns it off, while `scsi-generic` would need a
+/// real host SCSI device the harness cannot assume exists. The command is
+/// issued either way, so the transport under the injection is the shipped
+/// transport; only the CSW's verdict is replaced. Same reason `xhci-one-slot`
+/// and `i8042-fault` exist.
+///
+/// The two values are the two halves of the same question. ILLEGAL REQUEST /
+/// INVALID COMMAND OPERATION CODE is what a conformant stick without a write
+/// cache answers, and must not be a failure; HARDWARE ERROR / INTERNAL TARGET
+/// FAILURE is a flush that was tried and did not work, and must reach the
+/// caller as one.
+const FLUSH_SENSE: Option<(u8, u8, u8)> = if cfg!(feature = "usb-flush-unimplemented") {
+    Some((0x05, 0x20, 0x00))
+} else if cfg!(feature = "usb-flush-fails") {
+    Some((0x04, 0x44, 0x00))
+} else {
+    None
+};
 
 /// Which way a block transfer moves, so one batching loop serves both without
 /// a `&[u8]` pretending to be a `&mut [u8]`.
@@ -162,7 +224,28 @@ impl XhciController {
             // LBA 0, block count 0: the whole medium, which is the only thing
             // a cache flush above a block device can mean.
             let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            matches!(ctrl.scsi(dev, &cdb, 10, 0, 0, false), Scsi::Ok { .. })
+            let issued = ctrl.scsi(dev, &cdb, 10, 0, 0, false);
+            let outcome = match FLUSH_SENSE {
+                Some((key, asc, ascq)) => Scsi::Refused { key, asc, ascq },
+                None => issued,
+            };
+            // SYNCHRONIZE CACHE is optional in SBC and a great many USB sticks
+            // do not have it. A device with no write cache has nothing this
+            // command could have made durable, so the writes before it are
+            // already as durable as they will get: reporting a failure reports
+            // the wrong thing, and the caller above turns a failed sync into a
+            // log line, which is itself the next flush.
+            if outcome.unimplemented() {
+                return true;
+            }
+            match outcome {
+                Scsi::Ok { .. } => true,
+                Scsi::Refused { key, asc, ascq } => {
+                    log_refusal(&cdb, key, asc, ascq);
+                    false
+                }
+                Scsi::Broken => false,
+            }
         })
         .unwrap_or(false)
     }
@@ -240,7 +323,11 @@ impl XhciController {
                     log!("usb-storage: {delivered} of {bytes} B at block {}", lba + done as u64);
                     return false;
                 }
-                Scsi::Error => return false,
+                Scsi::Refused { key, asc, ascq } => {
+                    log_refusal(&cdb, key, asc, ascq);
+                    return false;
+                }
+                Scsi::Broken => return false,
             }
 
             if let Host::Into(dst) = &mut host {
@@ -277,18 +364,11 @@ impl XhciController {
             // then uses to decide how much of the buffer is real.
             Bot::Done { residue } => {
                 log!("usb-storage: CSW claims {residue} B unmoved of {data_len}");
-                Scsi::Error
+                Scsi::Broken
             }
             Bot::Failed => {
-                let sense = self.request_sense(dev);
-                log!(
-                    "usb-storage: SCSI {:#04x} failed, sense {:#04x}/{:#04x}/{:#04x}",
-                    cdb.first().copied().unwrap_or(0),
-                    sense.0,
-                    sense.1,
-                    sense.2
-                );
-                Scsi::Error
+                let (key, asc, ascq) = self.request_sense(dev);
+                Scsi::Refused { key, asc, ascq }
             }
             Bot::Broken => {
                 log!("usb-storage: transport broke on SCSI {:#04x}, resetting",
@@ -297,13 +377,16 @@ impl XhciController {
                     log!("usb-storage: reset recovery failed; disk is offline");
                     dev.failed = true;
                 }
-                Scsi::Error
+                Scsi::Broken
             }
         }
     }
 
-    /// REQUEST SENSE as a diagnostic, never as a decision. Returns
-    /// (sense key, ASC, ASCQ), zeroed if the device would not say.
+    /// REQUEST SENSE, as (sense key, ASC, ASCQ) and zeroed if the device would
+    /// not say. Never a decision about the *transport*, which is what
+    /// [`Bot::Broken`] covers and what recovery answers; the sense bytes decide
+    /// only what the device meant by declining a command it understood, and
+    /// zeroes fall on the failing side of every such decision.
     fn request_sense(&mut self, dev: &mut MscDevice) -> (u8, u8, u8) {
         let dma = self.dma();
         let phys = dma.phys() + (dev.block + MSC_SCRATCH) as u64;
@@ -665,6 +748,10 @@ fn bring_up(ctrl: &mut XhciController, dev: &mut MscDevice) -> bool {
                     );
                 }
                 true
+            }
+            Scsi::Refused { key, asc, ascq } => {
+                log_refusal(cdb, key, asc, ascq);
+                false
             }
             _ => false,
         }

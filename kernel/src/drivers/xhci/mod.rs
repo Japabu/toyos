@@ -113,6 +113,39 @@ fn deadline() -> u64 {
     crate::clock::nanos_since_boot() + USB_TIMEOUT_NS
 }
 
+/// Spin until `ready`, and say whether that happened inside [`USB_TIMEOUT_NS`].
+///
+/// The register bits this covers are ones the controller sets in microseconds;
+/// one that never sets belongs to a controller or a port this driver cannot
+/// drive, and every caller turns `false` into a refusal that names it. Before
+/// this existed the five of them were bare `spin_loop`s, which on a machine
+/// with no serial port is the same picture as every other way a boot can stop:
+/// `Boot: peripherals ready` painted on the panel, forever.
+fn settles(ready: impl Fn() -> bool) -> bool {
+    let deadline = deadline();
+    while !ready() {
+        if crate::clock::nanos_since_boot() >= deadline {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+/// Let a test starve one of those waits on a controller that is otherwise
+/// answering perfectly.
+///
+/// Kernel features because nothing on the host side can stage them: QEMU's xHC
+/// halts, resets, clears CNR and starts in microseconds, and its ports finish a
+/// reset synchronously — there is no device or machine property that makes a
+/// register bit not settle, and unplugging between the scan and the reset is
+/// not expressible either. The rest of bring-up runs unchanged, so what these
+/// certify is the deadline and the refusal, which is exactly the code that has
+/// no other way to execute. Same reason `xhci-one-slot` and `i8042-fault`
+/// exist.
+const CONTROLLER_ANSWERS: bool = !cfg!(feature = "xhci-deaf-controller");
+const PORT_ANSWERS: bool = !cfg!(feature = "xhci-deaf-port");
+
 const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
 
 /// Event Ring Segment Table entry (16 bytes).
@@ -624,6 +657,11 @@ pub fn storage_geometry(index: usize) -> Option<StorageGeometry> {
     with_disk(index, |ctrl, local| ctrl.storage[local].geometry())
 }
 
+/// Whether the machine's `index`-th disk is still being spoken to.
+pub fn storage_online(index: usize) -> Option<bool> {
+    with_disk(index, |ctrl, local| ctrl.storage[local].online())
+}
+
 /// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
 /// `buf` holds nothing the caller may believe.
 pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
@@ -729,29 +767,60 @@ fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
     let csz = ((hccparams1 >> 2) & 1) != 0;
     let context_size: usize = if csz { 64 } else { 32 };
 
+    // Everything below refuses this controller by name rather than taking the
+    // machine with it. Two controllers is the target laptop's shape, and a
+    // property of the empty Thunderbolt one is no reason the PCH's ports should
+    // not come up.
+    let refuse = |why: core::fmt::Arguments| {
+        log!("xHCI: NOT INITIALISED at PCI {:02x}:{:02x}.{} — {why}. No USB device on it can \
+             be used.", pci_dev.bus, pci_dev.dev, pci_dev.func);
+    };
+
+    // The BAR is mapped at a fixed 64 KiB and both offsets are the controller's
+    // own 32-bit numbers, so this is where a controller that puts its doorbells
+    // or its runtime registers outside the window has to be refused: the
+    // subtraction below it underflows, and with overflow checks off it wraps
+    // back to exactly `bar_size`, which `Mmio::subregion`'s own assertion then
+    // accepts — an `Mmio` based outside the mapping, faulting on the first
+    // doorbell write.
     let bar_size = 0x10000u64;
+    let (Some(db_len), Some(rt_len)) =
+        (bar_size.checked_sub(db_offset), bar_size.checked_sub(rts_offset))
+    else {
+        refuse(format_args!(
+            "DBOFF={db_offset:#x} RTSOFF={rts_offset:#x} put its registers outside the \
+             {bar_size:#x} window this driver maps"
+        ));
+        return None;
+    };
     let op_base = bar.subregion(cap_length, bar_size - cap_length);
-    let db_base = bar.subregion(db_offset, bar_size - db_offset);
-    let rt_base = bar.subregion(rts_offset, bar_size - rts_offset);
+    let db_base = bar.subregion(db_offset, db_len);
+    let rt_base = bar.subregion(rts_offset, rt_len);
 
     let pagesize = op_base.read_u32(OP_PAGESIZE) & 0xFFFF;
     log!("xHCI: max_slots={} max_ports={} ctx_size={} pagesize={:#x}",
         max_slots, max_ports, context_size, pagesize);
-    // Bit 0, and only bit 0, means 4 KiB. The scratchpad is the whole exposure:
-    // its entries are one PAGE apart, so a controller that means 8 KiB writes
-    // each buffer over the next and the last one past `dev_base` into block 0's
-    // interrupt ring — memory corruption with no diagnostic. Every other
-    // consequence runs the safe way, since a larger page size only relaxes the
-    // rule that the DCBAA and the contexts must not cross one.
-    assert_eq!(pagesize, 1,
-        "xHCI: controller wants a page size this driver does not implement, PAGESIZE={pagesize:#x}");
+    // Bit 0 is 4 KiB, and it is the only bit this driver can use — the register
+    // is a mask of the page sizes the controller supports, so the test is that
+    // the bit is set and not that it is alone. The scratchpad is the whole
+    // exposure: its entries are one PAGE apart, so a controller placing them at
+    // 8 KiB writes each buffer over the next and the last one past `dev_base`
+    // into block 0's interrupt ring — memory corruption with no diagnostic.
+    // Every other consequence runs the safe way, since a larger page size only
+    // relaxes the rule that the DCBAA and the contexts must not cross one.
+    if pagesize & 1 == 0 {
+        refuse(format_args!(
+            "PAGESIZE={pagesize:#x} does not include 4 KiB, and every ring, context and \
+             scratchpad buffer here is placed at 4 KiB"
+        ));
+        return None;
+    }
 
     let max_sp_hi = ((hcsparams2 >> 21) & 0x1F) as usize;
     let max_sp_lo = ((hcsparams2 >> 27) & 0x1F) as usize;
     let layout = Layout::new((max_sp_hi << 5) | max_sp_lo, max_slots);
     log!("xHCI: dma {} KiB: scratchpad={} device blocks={} of {} B (max_slots={})",
         layout.pool_size / 1024, layout.scratch_count, layout.dev_blocks, DEV_STRIDE, max_slots);
-    let pool = DmaPool::alloc(layout.pool_size);
 
     // Before the controller is touched at all: on a PC the firmware may still
     // own it for legacy keyboard emulation, and resetting a controller SMM is
@@ -762,18 +831,27 @@ fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
     if usbcmd & 1 != 0 {
         op_base.write_u32(OP_USBCMD, usbcmd & !1);
     }
-    while op_base.read_u32(OP_USBSTS) & 1 == 0 {
-        core::hint::spin_loop();
+    let deadline_ms = USB_TIMEOUT_NS / 1_000_000;
+    if !settles(|| CONTROLLER_ANSWERS && op_base.read_u32(OP_USBSTS) & 1 != 0) {
+        refuse(format_args!("it never halted, within {deadline_ms} ms of being asked to"));
+        return None;
     }
 
     op_base.write_u32(OP_USBCMD, 1 << 1);
-    while op_base.read_u32(OP_USBCMD) & (1 << 1) != 0 {
-        core::hint::spin_loop();
+    if !settles(|| CONTROLLER_ANSWERS && op_base.read_u32(OP_USBCMD) & (1 << 1) == 0) {
+        refuse(format_args!("it held HCRST for {deadline_ms} ms"));
+        return None;
     }
-    while op_base.read_u32(OP_USBSTS) & (1 << 11) != 0 {
-        core::hint::spin_loop();
+    if !settles(|| CONTROLLER_ANSWERS && op_base.read_u32(OP_USBSTS) & (1 << 11) == 0) {
+        refuse(format_args!("it stayed Controller Not Ready for {deadline_ms} ms after its reset"));
+        return None;
     }
     log!("xHCI: controller reset");
+
+    // After the reset, so a controller refused above costs no physical memory
+    // at all — and the pool is freed with the `DmaPool` on every refusal below,
+    // since `PhysPage` gives its page back when dropped.
+    let pool = DmaPool::alloc(layout.pool_size);
 
     // MaxSlotsEn is what the driver can track, not what the controller can
     // offer: a conformant xHC then refuses Enable Slot past it rather than
@@ -822,8 +900,9 @@ fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
 
     // Start controller (R/S + INTE for interrupt delivery)
     op_base.write_u32(OP_USBCMD, 1 | (1 << 2));
-    while op_base.read_u32(OP_USBSTS) & 1 != 0 {
-        core::hint::spin_loop();
+    if !settles(|| CONTROLLER_ANSWERS && op_base.read_u32(OP_USBSTS) & 1 == 0) {
+        refuse(format_args!("it stayed halted for {deadline_ms} ms after R/S"));
+        return None;
     }
     log!("xHCI: controller started");
 

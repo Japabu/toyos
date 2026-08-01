@@ -192,10 +192,15 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let portsc = op_base.read_u32(portsc_off);
     op_base.write_u32(portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PR);
 
-    loop {
-        let ps = op_base.read_u32(portsc_off);
-        if ps & PORTSC_PRC != 0 { break; }
-        core::hint::spin_loop();
+    // A port that asserts CCS and then never asserts PRC — a device pulled
+    // between the scan and the reset, a marginal cable, a reset the controller
+    // will not run — costs that port and not the boot. This spin had no
+    // deadline, on the boot CPU, before the scheduler exists and with nothing
+    // logged.
+    if !super::settles(|| super::PORT_ANSWERS && op_base.read_u32(portsc_off) & PORTSC_PRC != 0) {
+        log!("xHCI: port {} never finished its reset (PORTSC {:#010x}); skipping it",
+            port_idx + 1, op_base.read_u32(portsc_off));
+        return;
     }
     let portsc = op_base.read_u32(portsc_off);
     op_base.write_u32(portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PRC);

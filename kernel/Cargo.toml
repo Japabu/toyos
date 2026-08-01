@@ -52,6 +52,26 @@ xhci-xecp-selftest = []
 # not the flag, is what decides which disk gets written: the boot stick is on
 # the same bus and must come back untouched. See `kernel/src/usb_gate.rs`.
 usb-storage-gate = []
+# Answer SYNCHRONIZE CACHE with a device's refusal instead of its own verdict:
+# `usb-flush-unimplemented` with the ILLEGAL REQUEST / INVALID COMMAND
+# OPERATION CODE a stick with no write cache gives, `usb-flush-fails` with a
+# HARDWARE ERROR. QEMU's `scsi-disk` implements 0x35 for every front end that
+# reaches it — `usb-storage` and `usb-bot`, `scsi-hd` and `scsi-block` — and no
+# device or drive property turns it off, so the difference between a device
+# that will not flush and one that cannot is unreachable from the host side.
+# The command is still issued; only its verdict is replaced. See
+# `xhci/msc.rs`'s `FLUSH_SENSE`.
+usb-flush-unimplemented = []
+usb-flush-fails = []
+# Starve one of the xHCI bring-up register waits on a controller that is
+# otherwise answering: `xhci-deaf-controller` the four in `init_one`,
+# `xhci-deaf-port` the port-reset wait in `init_device`. QEMU's xHC halts,
+# resets, clears CNR and starts in microseconds and finishes a port reset
+# synchronously; no device or machine property makes a register bit not settle,
+# and unplugging between the port scan and the reset is not expressible either.
+# See `xhci/mod.rs`'s `settles`.
+xhci-deaf-controller = []
+xhci-deaf-port = []
 # Shrink both disk caches to 64 entries each. The honest ceilings are tens of
 # megabytes, so a test that reached them by doing real I/O would spend minutes
 # proving what 256 KiB proves in a second. The eviction code under test is the
