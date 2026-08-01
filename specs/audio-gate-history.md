@@ -233,3 +233,95 @@ Worth remembering as a class: a "guest hang" that only ever appears on the audio
 tests is more likely to be the shared console than the scheduler. The underlying
 writer-side defect — the virtio-console has no line atomicity — is still open;
 see `specs/known-issues.md`.
+
+## 2026-08-01: the gate's first real catch, and it was the filesystem
+
+The thorough tier went red at `1e49994` on five statistics — `audio_tone.smp1`
+wake lateness 6698 → 15519 us (z=6.65), `audio_tone.smp8` 6658 → 10305,
+`audio_tone_load.smp8` 7134 → 10415, both `wakes` medians down, and 7 of 30
+dropouts on `audio_tone_load.smp8` against 0 of 30 recorded. Nothing in the
+scheduler had moved. The cause was `esp_log`, and underneath it the ESP block
+adapter.
+
+### The fingerprint named the subsystem before anything was measured
+
+`audio_tone_load.smp1` was the **only** config that did not regress. It is also
+the only one whose CPU is never idle — one CPU with a hog on it. Everything that
+regressed has an idle CPU somewhere: `smp1` with no load idles between audio
+periods, and `smp8` has seven idle CPUs whatever the load. That pattern says
+"the idle loop", and it is worth reaching for first: gate A runs four configs
+precisely so a defect can be located by which of them it spares.
+
+### Same-session A/B, and why a recorded sample was not enough to conclude from
+
+Cross-batch drift on this host is real (top of this file), so the red run alone
+could not distinguish a regression from drift. Three arms, N=6, ~205 s each,
+inside twenty minutes on a quiet tree, medians per config in the order
+`tone.smp1 / tone.smp8 / load.smp1 / load.smp8`:
+
+| arm | | | | | verdict |
+|---|---|---|---|---|---|
+| recorded (n=30) | 6698 | 6658 | 7042 | 7134 | — |
+| A: HEAD | 15523 | 14349 | 6531 | 11109 | FAIL, 2 statistics |
+| B: `esp_log::install()` skipped | 6745 | 6686 | 7116 | 7575 | PASS |
+| C: HEAD + resident ESP blocks | 7262 | 7438 | 6864 | 7295 | PASS |
+
+Arm A's and arm B's `audio_tone.smp1` samples do not overlap at all
+(14180–17299 against 5896–8218). Arm B is the same-session baseline the drift
+warning demands, and it lands on the recorded sample, which is what makes the
+recorded sample usable again.
+
+N=6 rather than 30 costs power, and that is the whole cost: at n=6 the gate can
+only see a shift as large as this one. It is a localiser, not a verdict — the
+confirmation was run at 30.
+
+### What it actually was
+
+Instrumented in-guest, one 6.3 s boot: **23 flushes, 11 KB of log, 4,352 device
+reads and 694 writes**, 94% of the time in `vfs::flush_file`, 5% in the device
+cache sync. ~192 block reads per flush of ~540 bytes — `Fat32::write` 91,
+`set_len` 78, `extents` 23.
+
+`Fat32` reads a FAT entry as four bytes; `BlockDevice`'s only transfer unit is
+4096; nothing sat in between. So a cluster-chain walk was one USB transfer per
+cluster, on a volume this project formats with **512-byte clusters**. One flush
+cost **7.2–26.0 ms** against a pipeline depth of 23.219 ms — a single flush
+could empty the whole audio pipeline, which is exactly what a median wake
+lateness of 15.5 ms is made of.
+
+Eight resident blocks in `EspDevice` took the boot from **4,352 device reads to
+25**, and the mean flush from 8.9 ms to 2.8 ms.
+
+### Two things the module's own documentation asserted that were not true
+
+Both are in `specs/known-issues.md` and both are the reusable part:
+
+* *"It costs nothing when nothing is logged."* Userland console output is in the
+  same ring, so every `println!` is a device write from the idle loop. soundd's
+  own stats line is one of them.
+* *"A busy machine reaches the idle loop rarely."* A busy machine has idle
+  *CPUs*.
+
+A cost argument about a shared buffer has to name every producer of it.
+
+### The defect found on the way, which is the better story
+
+Making the ESP faster turned `esp_log_file` red, and the reason was not the
+change: `MAX_BLOCKED_POLLS = 1000` gave up on the VFS lock after a thousand
+*polls*, meant as a bound on a thread that panicked holding it. A thousand polls
+of a spinning idle loop is about **2 ms**; an ordinary `spawn` holds that lock
+for **13–17 ms** reading an ELF. So a healthy machine switched its own kernel
+log off mid-boot, permanently — and it did so at HEAD too, caught on an
+`audio_tone` boot's serial (`stops at 8417 bytes`) before any of this landed.
+It is now a duration.
+
+That also means gate A's red run was measured on a tree where the regression
+partly hid itself: a boot that lost its log sink early stopped paying for it.
+The bimodal `audio_tone.smp8` arm-A sample (two runs at ~6.7 ms, four at
+11–15 ms) is that.
+
+**A bound whose unit is "iterations of a loop somewhere else" re-tunes itself
+whenever that loop changes speed.** And this one was silent by construction: the
+give-up announces itself into the ring it is switching off, so the one place the
+line could be read on a machine with no serial port is the file it says has
+stopped.

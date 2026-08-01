@@ -2729,7 +2729,7 @@ into a directory built to collide returns `NoSpace`); `MAX_LFN_CHARS` (255,
 this one *is* the format). A `walk` or `read_dir` past the caller's `limit`
 refuses rather than truncating, for the reason `vfs::MAX_LIST_ENTRIES` gives.
 
-### No caching, deliberately, so performance depends on what is underneath
+### CLOSED in the adapter — no caching, deliberately, so performance depended on what is underneath
 
 Every FAT entry read is a 4-byte device read; the only buffer in the crate is
 one sector, invalidated by every write, and it exists so a directory scan
@@ -2737,6 +2737,17 @@ reads one sector per sixteen entries instead of one per entry. That is right
 when the kernel's page cache sits directly under `BlockAccess` — caching twice
 is a coherence hazard for no gain — and wrong for any adapter without one. The
 adapter is where that decision gets made.
+
+It was made, and this entry is why gate A went red. Nothing sat under
+`EspDevice`, so a 4-byte FAT read was a 4 KiB USB transfer and a chain walk
+cost one transfer per cluster — on a volume this project formats with
+**512-byte clusters**. Measured in-guest over one 6.3 s boot: **4,352 device
+reads and 694 writes to append 11 KB of log**, ~192 reads per flush of ~540
+bytes, attributed `Fat32::write` 91, `set_len` 78, `extents` 23. `EspDevice`
+now keeps `RESIDENT_BLOCKS = 8` blocks resident: **4,352 → 25 reads** for the
+whole boot, and mean flush 8.9 ms → 2.8 ms. The crate is unchanged and this
+entry's judgement stands — the decision belongs to the adapter, and the adapter
+had not made it.
 
 ### A handle's fingerprint cannot survive a delete-and-recreate under the same name
 
@@ -2966,15 +2977,62 @@ and `kernel.elf` in a state that may not boot. The panic path keeps the
 on-screen console, which takes no lock at all. What the file has after a panic
 is everything up to the last idle pass.
 
-### A stranded VFS lock costs up to 1000 idle passes of spin
+### CLOSED — a healthy machine turned its own kernel log off during a spawn
 
 `log_ring::file_has_pending` is in the idle loop's awake condition, so a CPU
 with nothing to run will not sleep while the sink is owed bytes. `esp_log::poll`
-takes the VFS lock with `try_lock` and gives up after `MAX_BLOCKED_POLLS`
-(1000), which turns the sink off and clears the condition. Between a thread
-dying with the VFS lock held and that bound expiring, an idle CPU spins. It is
-bounded and self-clearing, which is what the scheduler spec's argument for the
-other two terms requires, but it is not free.
+takes the VFS lock with `try_lock` and gave up after `MAX_BLOCKED_POLLS` (1000)
+consecutive failures, which turns the sink off permanently and clears the
+condition.
+
+A count is not a duration, and only a duration was ever meant: the bound exists
+for a thread that *panicked* holding the VFS lock. 1000 polls of a spinning
+idle loop elapse in about **2 ms**, while an ordinary `spawn` holds the VFS
+lock for **13–17 ms** reading an ELF — so the give-up fired on a working
+machine, mid-boot, and the log stopped there for good. Caught on the guest's
+own serial in two unrelated boots: an `audio_tone` boot (`stops at 8417 bytes`,
+during `spawn: /bin/test_rs_audio_tone`) and an `esp_log_file` boot (`stops at
+0 bytes`, during `spawn: /bin/shutdown`, which is what made the shutdown's last
+line reach no generation). Present at HEAD before the ESP work below, and made
+frequent by it. Now `MAX_BLOCKED_NANOS = 10 s`.
+
+Two lessons worth more than the fix. **A bound whose unit is "iterations of a
+loop somewhere else" silently re-tunes itself whenever that loop gets faster** —
+this one was correct until the ESP path stopped re-reading the FAT. And the
+failure was *silent by construction*: the give-up announces itself into the
+very ring it is switching off, so on a machine with no serial port the one
+place that line could be read is the file it says has stopped.
+
+### The ESP log's flush is unbounded, uninterruptible, and in front of the scheduler pass
+
+Not closed, and it is the residual under gate A's red run. `idle_loop` is
+`drain_serial(); esp_log::poll(); pass()`, so a wake that arrives while a CPU is
+inside the flush waits for the whole filesystem write plus a device cache sync
+before any pass can dispatch it. `wait_transfer` spins, and `Lock` holds off
+preemption, so nothing shortens it.
+
+Measured in-guest: **7.2–26.0 ms per flush** before the resident-block change,
+against a DMA pipeline depth of 23.219 ms — a single flush could empty the
+entire audio pipeline. After it, 2.0–9.7 ms, which is what let gate A pass, and
+still a third of a pipeline at the tail.
+
+Two premises in `esp_log`'s own documentation do not hold, and both are worth
+carrying:
+
+* *"It costs nothing when nothing is logged."* True of `log!`, and the ring is
+  shared with **userland console output** (`SerialWriter::console` →
+  `log_ring::write_chunk_blocking`), so every `println!` any process makes is a
+  device write from the idle loop. soundd's own 2-second stats line is one.
+* *"A busy machine reaches the idle loop rarely, so each flush carries more."*
+  A busy machine has idle *CPUs*: at `--smp 8` seven of them are in this loop,
+  and at `--smp 1` the machine is idle between audio periods. The one gate A
+  config that did **not** regress was `audio_tone_load.smp1` — the only one
+  whose single CPU is never idle. That fingerprint is what identified the
+  module.
+
+What it would take to remove rather than shrink: the flush has to become
+resumable, or move off the idle path into something the scheduler can preempt.
+Both are design decisions and neither is a bounds check.
 
 ### What the adapter does *not* re-check about the partition table
 

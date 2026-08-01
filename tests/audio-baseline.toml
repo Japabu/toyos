@@ -63,6 +63,28 @@
 # that statistic across sessions. Cross-batch drift on this host is real;
 # only same-session A/B numbers mean anything (CLAUDE.md).
 #
+# Drift note, FOURTH instance, 2026-08-01, and this one is measured against a
+# same-session control rather than argued. Two N=30 arms back to back (1026 s
+# and 1024 s, quiet host), differing only in whether `esp_log::install()` runs:
+#
+#                            recorded   esp_log ON   esp_log OFF
+#   audio_tone.smp1  wakes        920    902 z=4.12    908 z=3.63
+#   audio_tone.smp8  wakes        872    815 z=4.79    816 z=4.73
+#
+# `wakes` reds in BOTH arms, at the same magnitude, with the suspect entirely
+# removed — so it is drift, not the change under test. Harm null in both:
+# dropouts 0/120 and 0/120, ceiling breaches 0/120 and 0/120, underruns and
+# drains all-zero. Four consecutive sessions have now failed `wakes` downward
+# with every harm measure clean, so a re-record of that statistic is owed —
+# but NOT taken here, because no mechanism was identified and this file's
+# protocol wants one. Read the fourth instance as evidence for the owner, not
+# as licence.
+#
+# The one statistic that separated the arms was audio_tone.smp8 wake lateness:
+# 6691 with the sink off, 7346 with it on (recorded 6658). That is the ESP
+# log's residual flush cost on the idle path, not drift, and it is written up
+# in specs/known-issues.md §10 rather than recorded here.
+#
 # Why the counters are here at all: the wav is a rare-event detector. One 3s
 # tone samples ~1100 device periods once per run, so it only fires when a
 # dropout happens to land inside the tone — a 0-10% per-run event that cannot
