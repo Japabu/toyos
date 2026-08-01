@@ -34,6 +34,7 @@ mod file_cache;
 mod tmpfs;
 mod file_backing;
 mod bcachefs_adapter;
+mod fat32_adapter;
 #[allow(dead_code)]
 mod vfs;
 mod elf;
@@ -386,6 +387,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     }
     #[cfg(feature = "usb-storage-gate")]
     usb_gate::run();
+    // Here rather than beside the NVMe probe: this machine boots off a USB
+    // stick, so the disk carrying the boot partition does not exist until the
+    // controller above has bound it.
+    fat32_adapter::probe_boot_disks();
     i8042::init(kernel_args.rsdp_addr);
     acpi::init_power(kernel_args.rsdp_addr);
 
@@ -421,6 +426,16 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         }
     }
     vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()));
+
+    // The partition firmware loaded us from, under the name of its role rather
+    // than of its type: `/esp` would say what the format is, and selecting a
+    // volume by what it looks like is the mistake `gpt` exists to make
+    // unrepresentable. A machine that cannot identify its boot partition has
+    // no `/boot` and boots exactly as it did before.
+    match fat32_adapter::mount_boot() {
+        Some(fs) => vfs::lock().mount("boot", Box::new(fs)),
+        None => log!("esp: no boot volume — the kernel has no /boot this boot"),
+    }
 
     // Kernel string literals, not untrusted input: these are orders of
     // magnitude under `MAX_PATH`, so a refusal here is a kernel bug and gets
