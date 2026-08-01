@@ -2084,11 +2084,14 @@ to observe.
 ### The xHCI driver never gives a slot back
 
 `init_device` enables a slot for every connected port and issues no Disable
-Slot, on any path: not for the non-HID devices it walks past (the boot stick
-and any hub, camera or fingerprint reader), not when Address Device fails, not
-when the descriptor fetch fails, and not when the slot id comes back past the
-pool's device blocks (`device.rs:194`, the `layout.device()` `None` branch).
-Each of those keeps a slot for a device the driver will never talk to again.
+Slot, on any path: not for the devices it walks past (a hub, camera or
+fingerprint reader), not when Address Device fails, not when the descriptor
+fetch fails, and not when the slot id comes back past the pool's device blocks
+(the `layout.device()` `None` branch). Each of those keeps a slot for a device
+the driver will never talk to again. Mass storage added three more: a disk
+whose interface has no bulk pair, one the pool has no mass-storage block for,
+and one that fails `bring_up` — and the boot stick came *off* the list, since
+it now binds.
 
 The fourth is the one with a test behind it: `xhci_slot_exhaustion` leaves five
 slots enabled with a zero DCBAA entry every run, which makes the entry's own
@@ -2146,16 +2149,24 @@ Change events included. `scan_ports` has exactly one caller, inside `init`. So
 the set of USB devices is whatever was connected at boot, forever.
 
 **Read this before wiring `scan_ports` to Port Status Change events.** The
-driver keeps one EP0 ring, one input context and one descriptor buffer for all
-devices, and the only thing that makes that safe is that enumeration is serial:
+driver keeps one input context and one descriptor buffer for all devices, and
+the only thing that makes that safe is that enumeration is serial:
 `init_device` runs once per port, from `init`, on one CPU. The invariant is
-written at `mod.rs:reset_ep0_ring` and `device.rs:scan_ports`, and hotplug is
-exactly the thing that breaks it — enumeration would then run while other
-devices are live, and two devices enumerating at once share an EP0 ring. What
-hotplug needs is an enumeration lock, not more rings. The other half of the
-problem, demuxing the event ring so a bound device's interrupt completion is
-not mistaken for the enumerating device's, is already done: both waits match
-the slot id and hand everything else to `dispatch_event`.
+written at `device.rs:scan_ports`, and hotplug is exactly the thing that breaks
+it — enumeration would then run while other devices are live, and two devices
+enumerating at once share the input context. What hotplug needs is an
+enumeration lock, not more buffers.
+
+The EP0 ring used to be on that list and is not any more: mass storage needs
+control transfers *after* enumeration (Clear-Feature(HALT), Bulk-Only Reset),
+which the shared rewound ring could not serve, so every device now has its own
+in its device block. That removes one of hotplug's three obstacles as a side
+effect, and it is the only one it removes.
+
+The other half of the problem, demuxing the event ring so a bound device's
+interrupt completion is not mistaken for the enumerating device's, is already
+done: both waits match the slot id — and, since mass storage put three
+endpoints on one slot, the endpoint id too.
 
 This was masked until f76ea04: a machine with no USB HID panicked the boot, so
 "no keyboard, plug one in" could not happen. Now it survives, and plugging a
@@ -2342,19 +2353,39 @@ What was actually established, and what was not:
   the MMIO window is a real redirection table. `route`'s destination check is
   satisfied by the BSP's `LAPIC: x2APIC enabled (ID 0)`.
 
-### `i8042::init`'s stage budgets sum past the total budget they clamp to
+### CLOSED — the T14's FADT denies its own 8042, and the gate believed it
 
-`budget = deadline(1500)` is taken once at entry (`i8042/mod.rs:596`) and every
-stage clamps to it: self-test 500 ms (`:631`), keyboard 750 ms (`:669`), aux
-device reset 600 ms (`:718`). 500 + 750 + 600 = 1850 ms. QEMU answers every step
-in microseconds, so the sum has never been approached — the whole probe runs
-0.099 → 0.100 s in a metal-sim boot. On an EC that spends a real fraction of any
-stage (a PS/2 device reset's BAT is the obvious one; the driver sends `0xFF` to
-the aux port), the budget expires and every subsequent `wait_writable` /
-`read_data` returns immediately. The last thing to run is the arming config
-write at `:791`, so the visible outcome is `i8042: DISABLED — cfg … did not
-take`, i.e. both devices lost to a *timeout* wearing a controller fault's
-clothes. Unmeasured in either direction: no real EC timing has ever been taken.
+The laptop's first `--diag-boot` printed one line and stopped:
+`i8042: absent (FADT rev 6 iapc_boot_arch=0x0011)`. The checksum passed, so that
+is firmware speaking rather than an unreadable table, and `0x0011` decodes as
+`LEGACY_DEVICES` set, **8042 clear**, `NO_ASPM` set (ACPICA `actbl.h`). The
+driver refused on bit 1 and never touched the controller; the keyboard and the
+TrackPoint were never asked.
+
+Fixed by deleting the gate, not by relaxing it. The residual is stated here
+because it is the part a future reader will want: **nothing in this tree knows
+whether the T14 has a working 8042.** All that has been established is that the
+handshake now runs. Three outcomes are possible on the next boot and they are
+distinguished by which line appears — `kbd set2+xlat` (firmware's bit was
+wrong), `absent — port 0x64 reads 0xff` (nothing decodes the ports, so the bit
+was honest and the keyboard is not PS/2 at all), or one of the fourteen other
+refusals (a controller that answers but not the way the driver asked).
+
+Two things the QEMU gates do *not* cover, both structural:
+
+- **QEMU cannot make the FADT bit and the hardware disagree.** It derives the
+  bit by resolving `TYPE_I8042` in the QOM tree, so `-machine q35,i8042=off`
+  clears the bit *and* removes the device, and `-device i8042` restores both.
+  `i8042_fadt_denial` therefore uses a kernel feature to substitute the T14's
+  own answer, which tests the driver's response to the value and says nothing
+  about the parse that produced it.
+- **`absent — port 0x64 reads 0xff` is what QEMU's no-controller machine
+  produces, and the T14 may not.** A machine that traps 0x60/0x64 in SMM for USB
+  legacy emulation returns whatever the SMI handler emulates, so the floating-bus
+  test is the *cheap* answer, not the complete one. The xHCI USBLEGSUP handoff
+  runs immediately before `i8042::init` and clears the controller's SMI enables,
+  which is the reason to expect the trap to be disarmed by then — argued, never
+  observed.
 
 - PCID + INVPCID codepaths untested on real hardware — QEMU TCG supports
   neither. Both are CPUID-gated, so TCG falls back to a CR3 reload. Needs KVM or
@@ -2504,3 +2535,79 @@ already had. The lesson that generalises past FAT32: **mutating the
 implementation tests the paths you wrote; it says nothing about the states you
 did not think to construct.** Both are needed, and the second is the one a
 green suite hides.
+
+### `bcachefs::BlockIO` is infallible, so the device error channel stops one layer short
+
+`BlockDevice` reports a failed transfer as of this session, and the page cache
+propagates it — but `bcachefs::BlockIO::read_block` returns `()`, so
+`PageCacheBlockIO` has to turn a failure into *something*. It turns it into
+zeros and a log line.
+
+That is fail-closed rather than correct. Zeros fail bcachefs's own structural
+checks; the alternative the fix replaced — the previous tenant of the cache
+slot — is a **valid** block that parses as the one that was asked for, which is
+why it was worth changing even without the trait. A panic was the third option
+and is not available: a device is untrusted input.
+
+Making `BlockIO` fallible is the real fix. Sixteen call sites inside the
+`bcachefs` crate (`superblock.rs`, `btree.rs`, `alloc_bitmap.rs`, `fs.rs`),
+every one in a function that returns something other than a `Result` today, so
+it is a whole-crate change and it collides with whatever else is in that crate
+at the time. Counted with `grep -rn "read_block(\|write_block(" bcachefs/src`.
+
+Same shape one layer up: `FileBacking::read_page` and `vfs::FileSystem`'s write
+path have no error channel either, so `file_backing.rs` leaves the caller a
+hole of zeros and says so in the log.
+
+### The page cache's un-index on a failed fill has no test that can fail
+
+`PageCache::read` now unbinds the slot when the fill fails, so a slot cannot
+stay labelled with a block whose read did not happen. **Measured, not
+asserted**: with the `self.unbind(slot, block)` line deleted, all three USB
+storage tests still pass — 3/3 green in the same session that saw them go red
+for a real driver defect. Nothing in the suite drives a *failing* read through
+the page cache, because the page cache's device is NVMe and QEMU's NVMe does
+not fail a read.
+
+What it would take is a fault-injection actuator on the page cache's own
+device, in the shape `i8042-fault` already has: a kernel feature that makes one
+read fail, plus an in-guest sequence that fills the cache, forces an eviction
+into the failing block, and reads it twice. Two device reads is the assertion —
+one means the slot stayed bound and the second reader got the previous tenant.
+Roughly 80 lines of kernel and 40 of harness; not built.
+
+### USB mass storage: what is not implemented
+
+The driver serves one logical unit per device and speaks the SCSI commands a
+disk needs. Deliberately absent, each with its reason:
+
+- **Multiple LUNs.** `GET MAX LUN` is not issued and `bCBWLUN` is always 0. A
+  card reader with four slots presents four LUNs and this would see the first.
+- **UAS** (USB Attached SCSI, protocol 0x62). A modern enclosure advertises
+  both; the driver takes the BOT interface, which every such device still
+  offers. UAS is a different transport with its own streams support in the
+  endpoint context.
+- **CBI/CB** (subclass 0x00–0x05, protocol 0x00/0x01). Floppy-era transports.
+- **READ(16)/WRITE(16).** The driver refuses a device whose last LBA does not
+  fit 32 bits rather than serving its first 2 TiB. `READ CAPACITY(16)` *is*
+  implemented, because it is how such a device reports the size that gets it
+  refused — and `Profile::UsbDiskHuge` is the only place either runs.
+- **Removable media.** No `PREVENT ALLOW MEDIUM REMOVAL`, no unit-attention
+  handling beyond the `REQUEST SENSE` that clears it during bring-up. A card
+  swapped under a running system is not noticed.
+- **MODE SENSE.** Write-protect is discovered by a WRITE failing, not in
+  advance.
+- **Concurrency.** One command at a time per controller, under the xHCI lock,
+  with preemption disabled for its duration. Fine at boot; a filesystem doing
+  real I/O over USB will want the queue depth the transfer rings already allow.
+
+### `BlockError` is a marker type because `SyscallError` has no I/O variant
+
+`BlockDevice`'s error is a unit struct in `kernel/src/block.rs`. None of
+`SyscallError`'s nine variants means "the device did not do it", and adding one
+is an ABI change that wanted discussion rather than a unilateral edit. It is
+reachable-but-unwritten rather than wrong: nothing above the trait reports an
+I/O failure to userland today, because the filesystem boundary above it
+swallows the error (previous entry), so the conversion has no call site to be
+written against. When `BlockIO` becomes fallible, that changes and
+`SyscallError::Io` is the thing to add.
