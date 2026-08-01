@@ -769,26 +769,70 @@ virtio device — that is what `--metal-sim` is for.
 Not a doc bug — a plan defect. A plan that fails the suite is not ready to execute, and the
 suite is right here. Whoever picks R2 up must re-scope it against those tests first.
 
-### The scheduler's fair split degrades as the machine widens
+### The scheduler's fair split degrades as the machine widens — settled: it is the policy
 
-Measured in the host simulator over 400 seeds: worst service spread is **30 ms at
-1 CPU and 1056 ms at 24 CPUs** — roughly 35x, and a real offset rather than noise.
-CLAUDE.md's stated requirement is scaling to 128+ cores without excessive
-overhead, and this is the fairness half of that claim failing well below 128.
+Worst service spread against the derived bound, in ms, from
+`measure fairness_storm:<cpus> 500`:
 
-Two qualifications, both load-bearing for whoever picks this up:
+| CPUs | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| worst | 30 | 84 | 125 | **198** | **324** | **418** | **634** | 720 | 1056 | 1386 |
+| bound | 60 | 108 | 156 | 204 | 300 | 396 | 588 | 780 | 1164 | 1548 |
 
-- **Simulator, not hardware.** Whether this is a property of the shipped policy or
-  an artifact of the simulator's model is *not established*, and that distinction
-  decides whether this is a defect or an instrument problem. **No conclusion is
-  recorded here** pending that answer.
-- **It was only findable because I5 measures service** — nanoseconds actually
-  delivered per process — rather than checking the vruntime bookkeeping against
-  itself. The bookkeeping form would have been true by construction and could
-  never have surfaced this. That is the dead-gate lesson
-  (`specs/spec-staleness-sweep.md`) from the other direction: the first question
-  about a gate is not whether it passes but whether it measures the quantity you
-  care about.
+**Both questions the earlier filing left open are now measured, not argued.**
+
+**Offset, not drift.** Holding the seed count and scaling the storm's per-thread
+work: one CPU stays at 30 ms at every window length, while eight go 362 → 602 →
+548 ms as the window doubles twice. It saturates rather than accumulating.
+
+**Policy, not model.** Everything deciding who runs next is the shipped core —
+`RunQueue`'s insertion-time keys, `FairShare`'s one vruntime pot per process,
+`CpuSched::pick`, `answer_steal_requests`' surplus rule. The simulator mocks
+time, timer, IPI, halt and switch: the parts that decide *when*, not *who*.
+
+**The mechanism, which is why this is a design consequence and not an
+implementation bug.** Every running thread of a process charges one pot, so the
+pot advances at the process's *aggregate* rate while each queued thread's key
+stays frozen at its insertion. One dispatch of staleness therefore buys more
+wall-clock service the more of that process runs at once. That is why it scales
+with width, and why careful coding cannot close it — the fix is a policy change.
+
+**Caveat, and it is load-bearing.** These are worst-of-N over adversarially
+chosen interleavings, seeded and PCT — not the split hardware would show on an
+average schedule. **The mechanism and the scaling are the policy's; the magnitude
+is a worst case.** Do not quote these numbers as expected behaviour.
+
+**Connected to §9.2's tie-break, and that is why this is hard.** Threads of a
+process sharing one vruntime is *why* an identity tie-break starves siblings, and
+*why* the insertion sequence exists (`specs/scheduler-core-spec.md` §9.2,
+`queue.rs:18-22`). The degradation here and that starvation are two faces of one
+decision: **per-process accounting with per-thread queueing.** Anything that
+fixes one has to answer for the other.
+
+Found only because I5 measures *service* — nanoseconds actually delivered — rather
+than checking vruntime bookkeeping against itself, which would have been true by
+construction. The dead-gate lesson from the other side: the first question about a
+gate is not whether it passes, but whether it measures the quantity you care
+about (`specs/spec-staleness-sweep.md`).
+
+### The scheduler crosses its own derived granularity bound at four of ten widths
+
+Distinct from the entry above, and deliberately not merged with it. That one says
+fairness degrades as the machine widens. **This one says the shipped scheduler
+exceeds a limit its own design implies** — a different and sharper statement.
+
+The bound is derived from granularities the policy itself picked:
+`lag_spread + (ΣT_i + 1) × (QUANTUM + max KernelSection + 2 × RUN_CHUNK)`. It is
+crossed at **4, 6, 8 and 12 CPUs**, by 116, 324, 418 and 634 ms (bold in the table
+above).
+
+**The gate handles this honestly rather than hiding it**, which is the part worth
+preserving. It reds on `max(derived, recorded allowance)`, so a sampled scenario
+is gated on not regressing — but `Outcome::fair_over_bound` records every crossing
+of the *derived* bound regardless, and the sweep prints
+`N ns PAST THE DERIVED BOUND on the recorded allowance`. **The allowance cannot
+quietly become the standard**, which is the failure mode of every temporary
+baseline and the reason most of them end up permanent.
 
 ### `src/build.rs` cannot enable `sched-check`, so no CI run exercises it
 
