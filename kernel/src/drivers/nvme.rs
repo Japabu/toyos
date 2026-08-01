@@ -320,6 +320,14 @@ impl NvmeBlockDevice {
             id, block_count, block_count * 4096 / (1024 * 1024));
         Self { ctrl, id, sectors_per_block, block_count }
     }
+
+    /// The namespace's own logical block size. `BlockDevice` deliberately
+    /// hides it — everything above this driver is written in 4 KiB blocks —
+    /// but a GPT is laid out in the device's blocks and in nothing else, so
+    /// the one caller that has to speak the device's units asks here.
+    pub fn sector_size(&self) -> u32 {
+        self.ctrl.sector_size
+    }
 }
 
 impl BlockDevice for NvmeBlockDevice {

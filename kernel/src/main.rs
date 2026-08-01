@@ -26,6 +26,7 @@ mod mouse;
 #[cfg(feature = "test-input-merge")]
 mod input_merge_test;
 mod block;
+mod gpt;
 mod page_cache;
 mod file_cache;
 mod tmpfs;
@@ -342,6 +343,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let ecam = mm::paging::kernel().lock().as_mut().unwrap().map_mmio(ecam_base, 256 * 32 * 8 * 4096);
     pci::enumerate(&ecam);
     file_cache::init();
+    gpt::init(kernel_args);
 
     // No controller is a configuration, not a failure — the same call this
     // kernel already makes for a missing xHCI, a missing NIC and a missing
@@ -355,7 +357,13 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // `None` from `open_home` is the other half and means something different:
     // there *is* a disk and it is not ours to write to. Both land on a tmpfs.
     let home_volume = match nvme::init(&ecam) {
-        Some(nvme_dev) => {
+        Some(mut nvme_dev) => {
+            // Before the page cache takes the device: this is the one place
+            // that has it in the device's own logical blocks, and asking a
+            // disk where our boot partition is has to happen whether or not
+            // anything on it turns out to be ours.
+            let sector_size = nvme_dev.sector_size();
+            gpt::probe(&mut nvme_dev, sector_size);
             page_cache::init(Box::new(nvme_dev));
             bcachefs_adapter::open_home()
         }

@@ -79,6 +79,7 @@ debug = true
 [dependencies]
 bcachefs = { path = "../bcachefs", default-features = false }
 toyos-abi = { path = "../toyos-abi" }
+toyos-gpt = { path = "../toyos-gpt" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
 rustc-demangle = "0.1"
