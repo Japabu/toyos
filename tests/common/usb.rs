@@ -274,7 +274,10 @@ pub fn usb_storage_gate(
         },
     )?;
     gate_ran(&log, 2)?;
-    if log.contains("usb-gate: disk designated") {
+    // ` designated, blocks=` and not `usb-gate: disk designated`, which the
+    // kernel has never printed — the disk index sits between the two words, so
+    // the assertion could not fire whatever the guest did.
+    if log.contains(" designated, blocks=") {
         return Err(format!("the gate claimed an unstamped disk\n{log}"));
     }
     if fingerprint(&foreign, bytes) != before {
