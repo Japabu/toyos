@@ -483,7 +483,17 @@ pub fn chdir(path: &[u8]) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_CHDIR, path.as_ptr() as u64, path.len() as u64, 0, 0))
 }
 
-/// Get current working directory. Returns bytes written to `buf`.
+/// Get the current working directory.
+///
+/// Returns the length the path *needs*, not the number of bytes written:
+/// `n <= buf.len()` means the path is in `buf[..n]`, and `n > buf.len()` means
+/// nothing was written and `n` is the size to allocate before retrying. Pass an
+/// empty buffer to ask the length alone. `0` is the error return.
+///
+/// Reporting the required length rather than a truncated count is what lets a
+/// caller be correct: the previous contract could not distinguish an exact fit
+/// from a silent truncation, so a caller with a fixed buffer got a valid-looking
+/// path to the wrong directory.
 pub fn getcwd(buf: &mut [u8]) -> usize {
     let n = syscall(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
     if SyscallError::from_u64(n).is_some() { 0 } else { n as usize }

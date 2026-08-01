@@ -410,8 +410,11 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     }
     vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()));
 
-    vfs::lock().create_dir("/home/root");
-    vfs::lock().create_dir("/home/root/.config");
+    // Kernel string literals, not untrusted input: these are orders of
+    // magnitude under `MAX_PATH`, so a refusal here is a kernel bug and gets
+    // fail-fast rather than the error return `sys_mkdir` hands userland.
+    vfs::lock().create_dir("/home/root").expect("boot: /home/root exceeds MAX_PATH");
+    vfs::lock().create_dir("/home/root/.config").expect("boot: /home/root/.config exceeds MAX_PATH");
 
     boot_phase!("subsystems ready", t_subsys);
 

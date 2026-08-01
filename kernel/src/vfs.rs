@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 
 use core::ops::{Deref, DerefMut};
+use toyos_abi::syscall::SyscallError;
 use crate::file_cache::FileId;
 use crate::sync::{Lock, LockGuard};
 
@@ -441,8 +442,24 @@ impl Vfs {
         fs.rename(&old_fs_path, &new_fs_path)
     }
 
-    pub fn create_dir(&mut self, path: &str) {
+    /// Record a directory, or refuse a path no directory could have.
+    ///
+    /// `cd` bounds what it returns by `MAX_PATH`, so a longer path names a
+    /// directory nothing could ever chdir into. Storing one would grow
+    /// `created_dirs` for a name that is unreachable by construction, and would
+    /// make `cd`'s `None` a lie — it would be reporting "no such directory" for
+    /// something this function had just accepted.
+    ///
+    /// The `Result` is the point as much as the bound is: `sys_mkdir` used to
+    /// discard this outcome and report success unconditionally, so a bound
+    /// added here without changing the return would have been a *silent*
+    /// failure — the caller told nothing, the directory simply absent.
+    pub fn create_dir(&mut self, path: &str) -> Result<(), SyscallError> {
+        if path.len() > MAX_PATH {
+            return Err(SyscallError::InvalidArgument);
+        }
         self.created_dirs.insert(String::from(path));
+        Ok(())
     }
 
     pub fn remove_dir(&mut self, path: &str) {

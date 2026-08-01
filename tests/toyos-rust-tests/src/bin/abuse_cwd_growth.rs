@@ -163,6 +163,95 @@ fn kernel_still_healthy() {
     std::env::set_current_dir("/").expect("chdir back to /");
 }
 
+/// `getcwd` reports the length the path needs, and writes nothing when it does
+/// not fit.
+///
+/// The old contract returned `min(cwd.len(), buf.len())` after writing a
+/// prefix, so "fit exactly" and "silently truncated" were the same answer.
+/// That is how `std::env::current_dir` — which passes a fixed 256-byte buffer —
+/// came to hand back a shorter, valid-looking path to a *different* directory.
+fn getcwd_contract() {
+    let root = format!("{DIR}/getcwd");
+    fs::create_dir_all(&root).expect("create getcwd dir");
+    std::env::set_current_dir(&root).expect("chdir into getcwd dir");
+
+    let truth = cwd_len();
+    assert!(truth > 8, "cwd is implausibly short: {truth}");
+
+    // An empty buffer is a pure size query: same answer, nothing touched.
+    let mut empty: [u8; 0] = [];
+    assert_eq!(
+        toyos_abi::syscall::getcwd(&mut empty),
+        truth,
+        "an empty buffer must still report the required length",
+    );
+
+    // A buffer one byte short must report the requirement and write *nothing*:
+    // a partial path names the wrong directory.
+    let mut small = vec![0xAAu8; truth - 1];
+    let n = toyos_abi::syscall::getcwd(&mut small);
+    assert_eq!(n, truth, "a short buffer must report the required length, got {n}");
+    assert!(
+        small.iter().all(|&b| b == 0xAA),
+        "a short buffer was written to; a truncated path is a path to the wrong directory",
+    );
+
+    // Exactly enough succeeds, and the answer round-trips.
+    let mut exact = vec![0u8; truth];
+    assert_eq!(toyos_abi::syscall::getcwd(&mut exact), truth);
+    assert_eq!(
+        core::str::from_utf8(&exact).expect("cwd is utf-8"),
+        root,
+        "getcwd did not return the directory we chdir'd into",
+    );
+}
+
+/// The bug the contract change exists to fix, end to end.
+///
+/// A cwd past std's fixed 256-byte buffer used to come back truncated, so
+/// `current_dir()` named a directory the process was not in and every path
+/// built from it pointed somewhere wrong. Now std allocates and retries.
+fn current_dir_survives_a_long_cwd() {
+    std::env::set_current_dir(DIR).expect("chdir into DIR");
+    let mut depth = 0;
+    while cwd_len() <= 300 {
+        let name = "d".repeat(64);
+        let _ = fs::create_dir(&name);
+        if std::env::set_current_dir(&name).is_err() {
+            break;
+        }
+        depth += 1;
+    }
+    let truth_len = cwd_len();
+    assert!(
+        truth_len > 256,
+        "could not build a cwd past std's 256-byte buffer (got {truth_len} at depth {depth})",
+    );
+
+    let via_std = std::env::current_dir().expect("current_dir with a long cwd");
+    assert_eq!(
+        via_std.to_string_lossy().len(),
+        truth_len,
+        "current_dir returned a {}-byte path for a {truth_len}-byte cwd — still truncating",
+        via_std.to_string_lossy().len(),
+    );
+    std::env::set_current_dir("/").expect("chdir back to /");
+}
+
+/// `mkdir` reports a path it refuses instead of returning success.
+///
+/// `sys_mkdir` discarded `create_dir`'s outcome and always returned 0, so a
+/// bound added without changing that return would have been a silent failure:
+/// the caller told nothing, the directory simply absent.
+fn mkdir_refuses_overlong() {
+    std::env::set_current_dir("/").expect("chdir to /");
+    let huge = format!("{DIR}/{}", "m".repeat(HUGE_COMPONENT));
+    let err = fs::create_dir(&huge)
+        .expect_err("mkdir accepted a path longer than MAX_PATH");
+    // The point is that it is reported at all, rather than reported as success.
+    let _ = err;
+}
+
 fn main() {
     fs::create_dir_all(DIR).expect("create /home/abuse_cwd");
     std::env::set_current_dir(DIR).expect("chdir into DIR");
@@ -170,6 +259,9 @@ fn main() {
     drive_cwd_growth();
     drive_component_growth();
     legal_nesting_still_works();
+    getcwd_contract();
+    current_dir_survives_a_long_cwd();
+    mkdir_refuses_overlong();
     kernel_still_healthy();
 
     let _ = fs::remove_dir_all(DIR);

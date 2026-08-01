@@ -733,12 +733,36 @@ fn sys_chdir(path: &str) -> u64 {
     }
 }
 
+/// Copy the cwd into `buf`; return the length the cwd *needs*.
+///
+/// The return is the required length, not the number of bytes written, so a
+/// caller compares it against the buffer it passed: `n <= buf.len()` means the
+/// path is in the buffer, `n > buf.len()` means nothing was written and `n` is
+/// the size to allocate before retrying.
+///
+/// That distinction is the whole point. The old contract returned
+/// `min(cwd.len(), buf.len())` and wrote a prefix, so "fit exactly" and
+/// "silently truncated" were the same answer — and `std::env::current_dir`,
+/// which passes a fixed 256-byte buffer, handed back a *different, valid-
+/// looking* path for any longer cwd. A wrong answer that looks right is worse
+/// than an error: it propagates into every path the program derives from it.
+///
+/// Nothing is written when the buffer is too small. A partial path names the
+/// wrong directory, and leaving one in the caller's buffer invites its use.
+///
+/// An empty buffer is therefore a size query, which falls out rather than
+/// being bolted on: the dispatch hands `user_slice_mut` a zero length back as
+/// an empty slice, so `getcwd(NULL, 0)` reports the length and touches nothing.
+///
+/// `vfs::MAX_PATH` bounds `cwd`, so the required length is always far below the
+/// range `SyscallError` encodes and can never be misread as one.
 fn sys_getcwd(buf: &mut [u8]) -> u64 {
     process::with_fd_owner_data(|data| {
-        let cwd = &data.cwd;
-        let len = cwd.len().min(buf.len());
-        buf[..len].copy_from_slice(&cwd.as_bytes()[..len]);
-        len as u64
+        let cwd = data.cwd.as_bytes();
+        if cwd.len() <= buf.len() {
+            buf[..cwd.len()].copy_from_slice(cwd);
+        }
+        cwd.len() as u64
     })
 }
 
@@ -1449,8 +1473,10 @@ fn sys_mkdir(path: &str) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
-    vfs.create_dir(&resolved);
-    0
+    match vfs.create_dir(&resolved) {
+        Ok(()) => 0,
+        Err(e) => e.to_u64(),
+    }
 }
 
 fn sys_rmdir(path: &str) -> u64 {
