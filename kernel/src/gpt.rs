@@ -218,7 +218,15 @@ impl Sectors for DeviceSectors<'_> {
             return false;
         }
         if self.cached != Some(block) {
-            self.dev.read_blocks(block, 1, &mut self.buf);
+            // The tag has to be dropped with the read, not just the read
+            // refused: a failed read leaves the buffer holding the *previous*
+            // block, and a cache still claiming this one would serve those
+            // bytes to the next LBA in the same block with nothing to mark
+            // them stale.
+            if self.dev.read_blocks(block, 1, &mut self.buf).is_err() {
+                self.cached = None;
+                return false;
+            }
             self.cached = Some(block);
         }
         let at = (lba % self.lbas_per_block) as usize * self.lba_bytes as usize;

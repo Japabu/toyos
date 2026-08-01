@@ -1261,6 +1261,49 @@ zero and the next line divides by zero. Both are firmware/device values, not
 userland, but "the device said so" is not a bound — and the metal track is
 exactly where a device we did not write starts answering these queries.
 
+### The boot partition is identified but nothing asks the disk it is actually on
+
+`kernel/src/gpt.rs` resolves the boot partition by asking each block device
+whether it carries the unique partition GUID firmware handed the bootloader.
+Exactly one device is asked today — the NVMe namespace, from `kernel_main`'s
+storage phase — and on every machine in this tree the boot partition is on the
+USB stick instead. So `gpt::boot_volume()` returns `None` on real hardware and
+on every profile, and the positive path is exercised only by
+`boot_partition_identity`, which hands the NVMe a table carrying the stick's
+GUID on purpose.
+
+Wiring is one call: whoever owns the USB mass-storage block device calls
+`gpt::probe(&mut dev, sector_size)` as the device is registered, exactly as
+`kernel_main` does for NVMe. Until then nothing can mount the ESP by identity,
+which is the whole point of the module — `toyos-fat32` landed at `124c2ac` and
+has no mount site either.
+
+Note the interaction that call turns on: probing both the stick and an NVMe
+disk that is a copy of it makes the resolution `Ambiguous` and
+`boot_volume()` `None` forever, by design. That is correct — nothing can say
+which of two identical partitions firmware read — but it means the
+`boot_partition_identity` gate's crafted NVMe table would poison the answer
+once the stick is also probed. The gate asserts on the *per-device* line
+rather than the global resolution for that reason, so it stays green; the
+kernel's behaviour is the thing that would change, and it should be revisited
+when the second probe lands.
+
+### The backup GPT is never consulted
+
+`toyos_gpt::locate` reads the protective MBR, the primary header at LBA 1 and
+the primary entry array, and refuses if any of them fails its checks. UEFI puts
+a full second copy at the end of the device precisely so that a torn write to
+the front is recoverable, and nothing here looks at it: a single bad block at
+LBA 1 makes a perfectly good disk unidentifiable.
+
+Not a safety hole — the failure mode is a refusal, which is the safe direction —
+but it is the difference between "this stick is worn" and "this stick is
+unusable", on the machine class ToyOS boots from. The cost is a second
+`parse_header` call against `lba_count - 1` and a second array walk; the design
+question is what to do when the two copies disagree, and the answer is almost
+certainly to refuse rather than to pick, since a disagreement means one of them
+describes a disk this is not.
+
 ### Two unreproduced observations
 
 `ps` appeared to stall for >2 s under heavy single-core load; later runs fine. If
