@@ -116,13 +116,31 @@ Still ungated, in rough order of damage:
 
 - `SYS_LISTEN` — no namespace, so the first process to claim a well-known name
   impersonates that service.
-- ~~`SYS_GRANT_SHARED`~~ — **retired, verified at HEAD.** `e7d842f` closed all
-  three halves: `grant` is owner-only (`shared_memory.rs:179-181` rejects a
-  non-owner with `PermissionDenied`, so a grantee cannot re-grant), the target
-  must name a live process (`syscall.rs:1096-1102` checks `PROCESS_TABLE` and
-  returns `InvalidArgument`), and `release` retains the pid out of `allowed`
-  (`:256`, `:295`). `abuse_shared_grant.rs` and `shm_release_reclaims.rs` cover
-  it. The audit snapshot that recorded this predates the fix.
+- `SYS_GRANT_SHARED` — **narrowed, not retired: an owner cannot withdraw a grant
+  it has made.** Two of the three original clauses are closed by `e7d842f`:
+  `grant` is owner-only (`shared_memory.rs:179-181` rejects a non-owner, so a
+  grantee cannot re-grant) and the target must name a live process
+  (`syscall.rs:1096-1102`). `abuse_shared_grant.rs` and `shm_release_reclaims.rs`
+  cover both.
+
+  **The "no revoke" clause survives, and this file briefly retired it by mistake
+  — on `release`, which is a different operation.** `release` is a grantee
+  dropping *its own* access: `sys_release_shared` passes
+  `process::current_process()` (`syscall.rs:1128`) and no syscall lets a caller
+  name another pid. `destroy` is owner-only but removes the region for everyone,
+  which is not withdrawal of one grantee. **Nothing lets an owner revoke a
+  specific grantee**, against its wishes, possibly while mapped.
+
+  Deliberate, and currently sound: with `grant` owner-only, the set that can ever
+  map is exactly the set the owner named, so revocation has no caller today.
+  `specs/capability-handles-spec.md` §14.5 rejects unmap-others by name, and
+  unmapping a running process's pages is a second instance of the
+  `gpu::set_resolution` hazard — freeing memory while a consumer may hold
+  pointers into it.
+
+  **It stops being sound the moment the reachable set is no longer exactly what
+  the owner named** — if delegation or re-grant is reintroduced, or when
+  `SYS_HANDLE_SEND` makes a grant transferable. Revisit it then, not before.
 - `SYS_SET_KEYBOARD_LAYOUT`.
 
 `a88e4ee` gated the GPU present/cursor path, `SYS_AUDIO_SUBMIT`, the NIC
@@ -269,6 +287,43 @@ Lower severity than the kernel entries above: it runs before ExitBootServices,
 on files we put on the ESP ourselves. It is on the list because the metal track
 makes the ESP a thing a user can write to, and because none of the kernel's
 protections exist yet at that point.
+
+### ASSIGNED — `std::env::current_dir()` silently returns a wrong path
+
+`getcwd` in `rust/library/std/src/sys/pal/toyos/os.rs:7` passes a fixed
+`[u8; 256]`, and `sys_getcwd` copies `min(cwd.len(), buf.len())` and returns that
+length with **no error and no signal that it truncated**
+(`kernel/src/arch/syscall.rs:736-743`). Any cwd over 256 bytes yields a
+truncated path, which the program then builds every other path from.
+
+**A correctness defect, not a path-length limitation.** A refusal would be a
+limitation; a wrong answer that looks right is worse, because every consumer
+inherits it silently. Found the hard way — it reported 256 bytes for a 2 KiB cwd
+and made an agent's test fail against a broken instrument, which is the specific
+cost of an instrument that lies rather than refuses.
+
+Fix approved and staged as two halves, and **the kernel half must land first**:
+`sys_getcwd` reports the required length instead of claiming success, then std
+allocates and retries. Landing the std half alone would have nothing to retry
+against.
+
+### ASSIGNED — two syscalls discard a failure signal they already have
+
+`sys_mkdir` calls `vfs.create_dir(&resolved)` and returns `0` unconditionally
+(`syscall.rs:1424-1430`). `sys_connect` calls `listener::push_connection(..)`,
+which returns `bool`, as a bare statement (`syscall.rs:1042`; `listener.rs:97`).
+
+Filed as one entry because the pattern is the finding, not either instance:
+**a bound is only as good as the caller's willingness to hear "no".** In both
+cases the underlying operation can already refuse, and the syscall layer throws
+the answer away — which is exactly why neither can be given a bound today
+without the bound becoming a silent failure.
+
+It is the direct counterpart of the class above. There, a client's request is an
+allocation request that needs an owner who can say no. Here the owner *does* say
+no and nobody is listening, so adding the cap without fixing the caller would
+convert an unbounded resource into a silently dropped request — a worse failure,
+because the first is at least visible.
 
 ### THE CLASS: a client's request is an allocation request
 

@@ -99,6 +99,24 @@ behaviour rather than on the mechanism, so it does not go red for an unrelated
 refactor; and the failure message names the *expected* transition, so whoever
 trips it does not read it as a regression and re-file it.
 
+## Resolve the verb before you resolve the claim
+
+An entry that uses a verb naming more than one operation can be retired against
+the wrong one, which silently deletes a real limitation.
+
+`SYS_GRANT_SHARED`'s "no revoke" was retired on the existence of `release` — but
+`release` is a *grantee dropping its own access* (`sys_release_shared` passes
+`current_process()`), while the entry meant *the owner withdrawing a grantee's
+access*, which still has no mechanism. Both are "giving up access"; only one was
+what the entry claimed. The tell was context: the clause sat alongside
+"re-grantable" and "unvalidated target", all three about the owner's control over
+who ends up with the region.
+
+Not a stale claim — **two people using one word for two operations.** When a
+retirement turns on a verb like revoke, release, close, drop, reset or flush, name
+the actor and the object first: *who* does it, *to whom*, and *over their
+objection or not*. Then check whether that is what the code provides.
+
 ## The two traps that actually bit
 
 **Grep misses calls that go through a guard or trait object.** Searching
