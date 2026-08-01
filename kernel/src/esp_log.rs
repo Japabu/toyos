@@ -89,8 +89,9 @@ const MOUNT: &str = "boot";
 /// already in the ring when the sink installs and go out in one flush. At 1 KiB
 /// that is a *single* rotation — the remaining 864 bytes never fill a second
 /// file — and a single rotation never renames over an existing `kernel.log.1`,
-/// which is the half of the path that has to delete first. 256 rotates three
-/// times on the same boot, which `esp_log_file` asserts.
+/// which is the half of the path that has to delete first. 256 rotates three or
+/// four times on the same boot depending on how the flushes fall, and
+/// `esp_log_file` requires at least two.
 const MAX_LOG_BYTES: u64 = if cfg!(feature = "esp-log-rotate-fast") {
     256
 } else {
