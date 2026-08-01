@@ -417,12 +417,11 @@ impl<IO: BlockIO> Formatted<IO> {
 
         while remaining > 0 {
             let run = self.alloc.alloc_up_to(&self.io, remaining)?;
-            let (start, count) = (run.start, run.len);
-            push_extent(&mut extents, start.raw(), count);
+            push_extent(&mut extents, run.start.raw(), run.len);
 
             // Write data blocks
             let mut buf = BlockBuf::zeroed();
-            for i in 0..count as u64 {
+            for i in 0..run.len as u64 {
                 buf.0.fill(0);
                 let chunk_start = data_offset;
                 let chunk_end = (data_offset + BLOCK_SIZE).min(data.len());
@@ -430,11 +429,11 @@ impl<IO: BlockIO> Formatted<IO> {
                     let len = chunk_end - chunk_start;
                     buf.0[..len].copy_from_slice(&data[chunk_start..chunk_end]);
                 }
-                self.io.write_block(BlockNum::new(start.raw() + i), &buf);
+                self.io.write_block(BlockNum::new(run.start.raw() + i), &buf);
                 data_offset += BLOCK_SIZE;
             }
 
-            remaining -= count;
+            remaining -= run.len;
         }
 
         Ok(extents)
@@ -686,11 +685,10 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
 
         while remaining > 0 {
             let run = self.alloc.alloc_up_to(&self.io, remaining)?;
-            let (start, count) = (run.start, run.len);
-            push_extent(&mut extents, start.raw(), count);
+            push_extent(&mut extents, run.start.raw(), run.len);
 
             let mut buf = BlockBuf::zeroed();
-            for i in 0..count as u64 {
+            for i in 0..run.len as u64 {
                 buf.0.fill(0);
                 let chunk_start = data_offset;
                 let chunk_end = (data_offset + BLOCK_SIZE).min(data.len());
@@ -698,11 +696,11 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
                     let len = chunk_end - chunk_start;
                     buf.0[..len].copy_from_slice(&data[chunk_start..chunk_end]);
                 }
-                self.io.write_block(BlockNum::new(start.raw() + i), &buf);
+                self.io.write_block(BlockNum::new(run.start.raw() + i), &buf);
                 data_offset += BLOCK_SIZE;
             }
 
-            remaining -= count;
+            remaining -= run.len;
         }
 
         Ok(extents)
