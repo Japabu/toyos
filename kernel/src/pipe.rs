@@ -112,10 +112,10 @@ struct Pipe {
 unsafe impl Send for Pipe {}
 
 impl Pipe {
-    fn new(creator: Pid) -> Self {
-        let page = pmm::alloc_page(pmm::Category::Pipe).expect("pipe: allocation failed");
+    fn new(creator: Pid) -> Option<Self> {
+        let page = pmm::alloc_page(pmm::Category::Pipe)?;
         RingHeader::init(page.direct_map().as_mut_ptr(), PIPE_SIZE);
-        Self {
+        Some(Self {
             page,
             creator,
             readers: 0,
@@ -124,7 +124,7 @@ impl Pipe {
             readers_wq: new_queue(WaitClass::Pipe),
             writers_wq: new_queue(WaitClass::Pipe),
             rt_boost_pending: false,
-        }
+        })
     }
 
     fn header(&self) -> &RingHeader {
@@ -149,11 +149,17 @@ pub fn init() {
 }
 
 /// Create a new pipe. Returns owned reader + writer references.
-pub fn create(creator: Pid) -> (PipeReader, PipeWriter) {
-    let id = with_pipes_mut(|pipes| pipes.insert(Pipe::new(creator)));
+///
+/// `None` when the 2 MiB ring page cannot be allocated. Both callers are
+/// syscalls acting for userland, and physical memory is a resource userland
+/// drives — `SYS_PIPE` or `SYS_CONNECT` in a loop — so exhaustion is an error
+/// return rather than the `.expect` that used to take the kernel with it.
+pub fn create(creator: Pid) -> Option<(PipeReader, PipeWriter)> {
+    let pipe = Pipe::new(creator)?;
+    let id = with_pipes_mut(|pipes| pipes.insert(pipe));
     add_reader(id);
     add_writer(id);
-    (PipeReader(id), PipeWriter(id))
+    Some((PipeReader(id), PipeWriter(id)))
 }
 
 /// The process that created this pipe, or `None` if the id names no pipe.

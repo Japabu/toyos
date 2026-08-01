@@ -94,13 +94,39 @@ pub fn owner(name: &str) -> Option<Pid> {
     reg.by_id.get(id).map(|l| l.owner)
 }
 
-pub fn push_connection(name: &str, conn: PendingConnection) -> bool {
+/// Why a connection could not be queued.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PushError {
+    /// The name stopped being served between the caller's `owner` lookup and
+    /// here.
+    NoListener,
+    /// The server already holds `MAX_PENDING_CONNECTIONS` it has not accepted.
+    QueueFull,
+}
+
+/// Connections one listener may hold unaccepted.
+///
+/// Each pins two 2 MiB rings until the server accepts, so this number times
+/// 4 MiB — 128 MiB — is what a listener that never accepts can pin. It is a
+/// burst allowance rather than a backlog: every server in the tree accepts
+/// from its event loop, and the largest real burst is one connection per app
+/// launch. Policy, like `MAX_FDS`, and the number that rises once a pending
+/// connection stops costing two eagerly-allocated pages.
+///
+/// It bounds one listener, not the machine: nothing caps how many listeners
+/// exist, so the reachable total is still `listeners * 32 * 4 MiB`.
+pub const MAX_PENDING_CONNECTIONS: usize = 32;
+
+pub fn push_connection(name: &str, conn: PendingConnection) -> Result<(), PushError> {
     let mut guard = LISTENERS.lock();
     let reg = guard.as_mut().unwrap();
-    let Some(&id) = reg.by_name.get(name) else { return false };
-    let Some(listener) = reg.by_id.get_mut(id) else { return false };
+    let Some(&id) = reg.by_name.get(name) else { return Err(PushError::NoListener) };
+    let Some(listener) = reg.by_id.get_mut(id) else { return Err(PushError::NoListener) };
+    if listener.pending.len() >= MAX_PENDING_CONNECTIONS {
+        return Err(PushError::QueueFull);
+    }
     listener.pending.push_back(conn);
-    true
+    Ok(())
 }
 
 pub fn pop_connection(id: ListenerId) -> Option<PendingConnection> {

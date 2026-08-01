@@ -758,7 +758,9 @@ fn fd_result(r: Result<u32, SyscallError>) -> u64 {
 }
 
 fn sys_pipe() -> u64 {
-    let (reader, writer) = pipe::create(process::current_process());
+    let Some((reader, writer)) = pipe::create(process::current_process()) else {
+        return SyscallError::ResourceExhausted.to_u64();
+    };
     process::with_fd_owner_data(|data| {
         let Ok(read_fd) = data.fds.insert(fd::Descriptor::PipeRead(reader)) else {
             return SyscallError::ResourceExhausted.to_u64();
@@ -1034,25 +1036,47 @@ fn sys_connect(name: &str) -> u64 {
     };
 
     let client_pid = process::current_process();
-    let (cs_reader, cs_writer) = pipe::create(client_pid); // client → server
-    let (sc_reader, sc_writer) = pipe::create(client_pid); // server → client
+    let Some((cs_reader, cs_writer)) = pipe::create(client_pid) else { // client → server
+        return SyscallError::ResourceExhausted.to_u64();
+    };
+    let Some((sc_reader, sc_writer)) = pipe::create(client_pid) else { // server → client
+        return SyscallError::ResourceExhausted.to_u64();
+    };
+
+    // The client's own end first. Installing it can fail on a full fd table,
+    // and a connection queued for a server whose client never got a
+    // descriptor is one the server accepts and finds already dead.
+    let fd = match process::with_fd_owner_data(|data| {
+        data.fds.insert(fd::Descriptor::Socket {
+            rx: sc_reader,   // client reads from server→client
+            tx: cs_writer,   // client writes to client→server
+            peer: server_pid,
+        })
+    }) {
+        Ok(fd) => fd,
+        Err(e) => return e.to_u64(),
+    };
 
     // Queue the server's end. PipeReader/PipeWriter in the queue keep pipes
-    // alive even if the client disconnects before accept.
-    crate::listener::push_connection(name, listener::PendingConnection {
+    // alive even if the client disconnects before accept — which is also why
+    // the queue needs a depth: each entry pins two 2 MiB rings until the
+    // server accepts, and this return value used to be discarded.
+    let queued = crate::listener::push_connection(name, listener::PendingConnection {
         rx: cs_reader,   // server reads from client→server
         tx: sc_writer,   // server writes to server→client
         client_pid,
     });
+    if let Err(e) = queued {
+        process::with_fd_owner_data(|data| {
+            fd::close(&mut data.fds, &mut *vfs::lock(), fd, client_pid);
+        });
+        return match e {
+            listener::PushError::NoListener => SyscallError::NotFound.to_u64(),
+            listener::PushError::QueueFull => SyscallError::ResourceExhausted.to_u64(),
+        };
+    }
     wake_poll_waiters(name);
-
-    process::with_fd_owner_data(|data| {
-        fd_result(data.fds.insert(fd::Descriptor::Socket {
-            rx: sc_reader,   // client reads from server→client
-            tx: cs_writer,   // client writes to client→server
-            peer: server_pid,
-        }))
-    })
+    fd as u64
 }
 
 /// Wake processes interested in this specific listener (direct blockers + io_uring watchers).
