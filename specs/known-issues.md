@@ -1371,6 +1371,50 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
+### A second toolchain-contention window, distinct from the one `69bca9a` closed
+
+`69bca9a` removed the `rustup toolchain link` window — the symlink being
+unlinked and recreated on every build, so a concurrent `rustc` proxy landing in
+it died with `'rustc' is not installed for the custom toolchain 'toyos'`. That
+fix is real and that signature should be gone. **It is not this one**, and the
+risk is precisely that the link fix reads as having closed the class.
+
+This window is inside the std bootstrap, and its signature is:
+
+```
+error: couldn't create a temp dir: No such file or directory (os error 2)
+  at path "<repo>/rust/build/<host>/stage1-std/<target>/dist/deps/rmetaXXXXXX"
+error: could not compile `core` (lib) due to 1 previous error
+Build completed unsuccessfully in 0:00:43
+thread 'main' panicked at src/toolchain.rs:215:5:
+std rebuild failed
+```
+
+The target varies — seen on both `x86_64-unknown-toyos` and
+`x86_64-unknown-none`, which is the tell that it is about the *directory* and
+not about any one build. One builder's bootstrap removes and recreates
+`stage1-std/<target>/dist/deps` while another's `rustc` is trying to create a
+temp file inside it, so the loser dies compiling `core` — the first crate
+through, which makes it look like a broken checkout rather than contention.
+
+Recognising it: the path in the error **exists a moment later**. Listing it
+after a failure showed `dist/deps` present with a fresh timestamp, because the
+winner had finished recreating it. That asymmetry is the same one that
+identified the link race (a probe succeeding between failures) and it is the
+cheapest check.
+
+Cost so far: two consecutive full-suite runs lost by one agent, plus the seven
+consecutive attempts that left `4fce59c` unverified for a session (§4). A third
+attempt succeeded unchanged, so it is a race, not a broken tree.
+
+Not fixed, and deliberately not worked around. Retrying is what everyone does
+and it usually works, but the failure is expensive because it is diagnosed
+from scratch each time. A fix wants either the bootstrap serialised across
+builders or `dist/deps` created rather than recreated; `69bca9a` preferred
+removing the window to serialising around it, and the same preference should
+apply here if the bootstrap can be made not to recreate a directory it already
+has.
+
 ### std leaks a whole thread stack on every `thread::spawn`
 
 `rust/library/std/src/sys/thread/toyos.rs` allocates the stack with
