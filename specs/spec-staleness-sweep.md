@@ -75,6 +75,30 @@ tested.
 twelve certifications that could not fail. This is the method that would have
 caught them.
 
+## The inverse: a test that enforces a documented limitation
+
+The dead-gate pattern is prose claiming a test proves something. Its **inverse**
+is a test that asserts the current, *known-wrong* behaviour on purpose, so that
+fixing the behaviour turns the test red and tells you the limitation lifted.
+
+`pipe_peer_scope` is the model. It asserts `be604ef`'s stated residual — a peer
+that only ever called `connect()` can open a pipe it was never handed and read
+another client's data. It passes today. The day `SYS_HANDLE_SEND` lands it goes
+red, with a panic message that says what to do:
+
+> `GOOD NEWS, BAD TEST: delete this file and assert the refusal instead.`
+
+**Use this whenever an entry is blocked on a named condition.** Of the three
+isolation items currently blocked, it is the only one that can watch for its own
+unblock; the other two rely on someone remembering. A stopgap's residual is
+exactly what gets forgotten once the headline is fixed, and a test is the only
+thing in this tree that reliably remembers.
+
+Two properties make it work, and both are required: the assertion is on the
+behaviour rather than on the mechanism, so it does not go red for an unrelated
+refactor; and the failure message names the *expected* transition, so whoever
+trips it does not read it as a regression and re-file it.
+
 ## The two traps that actually bit
 
 **Grep misses calls that go through a guard or trait object.** Searching

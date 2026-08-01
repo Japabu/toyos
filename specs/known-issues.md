@@ -116,8 +116,13 @@ Still ungated, in rough order of damage:
 
 - `SYS_LISTEN` — no namespace, so the first process to claim a well-known name
   impersonates that service.
-- `SYS_GRANT_SHARED` — any grantee can re-grant, the target PID is unvalidated,
-  and there is no revoke (`kernel/src/shared_memory.rs`, `grant`).
+- ~~`SYS_GRANT_SHARED`~~ — **retired, verified at HEAD.** `e7d842f` closed all
+  three halves: `grant` is owner-only (`shared_memory.rs:179-181` rejects a
+  non-owner with `PermissionDenied`, so a grantee cannot re-grant), the target
+  must name a live process (`syscall.rs:1096-1102` checks `PROCESS_TABLE` and
+  returns `InvalidArgument`), and `release` retains the pid out of `allowed`
+  (`:256`, `:295`). `abuse_shared_grant.rs` and `shm_release_reclaims.rs` cover
+  it. The audit snapshot that recorded this predates the fix.
 - `SYS_SET_KEYBOARD_LAYOUT`.
 
 `a88e4ee` gated the GPU present/cursor path, `SYS_AUDIO_SUBMIT`, the NIC
@@ -264,6 +269,29 @@ Lower severity than the kernel entries above: it runs before ExitBootServices,
 on files we put on the ESP ourselves. It is on the list because the metal track
 makes the ESP a thing a user can write to, and because none of the kernel's
 protections exist yet at that point.
+
+### THE CLASS: a client's request is an allocation request
+
+> **A client's request is an allocation request, and every one of them needs an
+> owner who can say no.**
+
+Three instances, and the statement is here because none of the three says it
+alone — it is what predicts the fourth:
+
+- the compositor's windows (below),
+- netd's piped connections (below),
+- `SYS_CONNECT` pinning 4 MiB into an unbounded pending queue.
+
+**The third is worse than it looks, because the attacker does not need to find a
+service to abuse — `SYS_LISTEN` is ungated, so it can be its own.** Register a
+name, connect to yourself, never accept. No victim required and nothing to
+guess.
+
+Independent of the missing cap, and cheaper: **`push_connection` already returns
+`bool` (`listener.rs:97`) and `sys_connect` ignores it** (`syscall.rs:1042`).
+The queue can already refuse; nobody listens. An ignored failure return is a
+defect on its own terms — the mechanism exists and the caller throws the answer
+away.
 
 ### ASSIGNED — the compositor and netd do not bound what they accept
 
