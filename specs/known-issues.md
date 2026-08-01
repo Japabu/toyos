@@ -242,6 +242,47 @@ declared length in the header rather than by reaching the heap assert. Those
 tests are honest about what they cover, but the ceiling itself is unexercised
 end to end.
 
+### Derived allocations: one route demonstrated, one unbounded-but-unstaged, one bound
+
+`b554798`. The class is allocations the loader *derives* from inputs, as opposed
+to the ones it reads — a per-input ceiling does not constrain a collection fed
+from several of them. Three routes were examined and they are **not** equally
+established; recording them as one finding would overstate two of them.
+
+- **Route A — demonstrated and fixed.** Two relocation tables of 87,210 entries,
+  each individually accepted by `MAX_HEAP_ALLOC`, feeding one index:
+  `GlobalAlloc: dlmalloc asked for 2162688 bytes`. A real panic from real input.
+- **Route C (`prescan_relocs`) — genuinely unbounded, fixed, NOT staged.** Its
+  inputs are `KernelSlice`s over the loaded image and are never gated by
+  `MAX_HEAP_ALLOC` at all, so there is no ceiling anywhere on the path. Staging a
+  reproducer needs a multi-MiB `.so` whose millions of entries all pass
+  `load_shared_lib`'s validation. **Fixed on reading, not on a reproduction** —
+  which is the weakest standard this project accepts, and is recorded as such.
+- **Route D (`DT_NEEDED` with no `DT_NULL`) — a bound, not a demonstrated
+  defect.** It could not be shown to panic: the input ceiling caps that Vec at
+  ~1 MiB, so it stays under. Tightened anyway. Do not let it be cited later as a
+  fixed vulnerability.
+
+**The fix shape is better than a bound, and is the reusable part: count by type,
+then reserve exactly.** That removes growth-by-doubling overshoot — the actual
+trigger — and needs no invented number, so there is nothing to justify or
+re-derive later. The only explicit ceiling check left is where two
+separately-bounded inputs feed one collection, which is exactly the place a bound
+on either input cannot help.
+
+### `RelocationIndex::new()` outlived its callers and should be deleted
+
+`elf.rs:642`, alongside `with_capacity` at `:654`. **It has no caller in the
+loader path** — verified, zero hits for `RelocationIndex::new()` in `kernel/`.
+
+It is the unbounded constructor: the shape that permitted the growth Route A
+tripped over. Deleting it so it cannot come back is the right end state, and the
+reason it is still here is worth recording so this does not read as an oversight
+to whoever finds it: **removing it is an API change that could not be re-verified
+on the budget remaining**, and an unverified API change is how the next defect
+arrives. Left deliberately, to be deleted by someone who can re-run the loader
+tests.
+
 ### Two allocation guards that do not cover what they claim
 
 `OwnedAlloc::new`'s `size >= PAGE_2M` guard (`process.rs:54`) is short by
@@ -952,7 +993,18 @@ each time pushing the line's tail onto the following line.
 `tests/common/audio.rs` reassembles both cases (strip `[kernel …]` spans; resume
 a field's digits after the next newline), but that is a reader-side workaround
 for a writer-side defect — any tool parsing serial output has the same problem.
-Serial writes of a whole line should be atomic.
+
+**FIXED at `8de0a95`, and not where this entry pointed.** The heading blames the
+virtio-console, i.e. the kernel. It was a **libc** defect: `FILE` had no buffer,
+so a single `printf` became several `write` syscalls and the splice happened
+between them. Giving `FILE` a buffer makes a line one write.
+
+The premise was checked before anything was built, and the measurement is why
+the fix went to the right file: **151,047 lines of existing on-disk logs, 37
+splices, zero of them cutting a kernel line.** One command against logs already
+present. Had the kernel been changed instead, it would have been a wrong change
+*and* a wrong record — the entry would have read "fixed" over an untouched
+defect.
 
 Related class: a "guest hang" that only ever appears on the audio tests is more
 likely to be the shared console than the scheduler. See

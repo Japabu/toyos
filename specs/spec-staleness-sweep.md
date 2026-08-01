@@ -99,6 +99,58 @@ behaviour rather than on the mechanism, so it does not go red for an unrelated
 refactor; and the failure message names the *expected* transition, so whoever
 trips it does not read it as a regression and re-file it.
 
+## Ask what a bound refuses that it shouldn't
+
+The dead-gate pattern is a check that cannot fail. **This is its mirror: a
+correct-looking check whose *cost* nothing observes.** Both survive review
+indefinitely, for opposite reasons — one because nothing makes it go red, the
+other because going red is invisible.
+
+A `prescan_relocs` bound was first written against *total* entry count.
+`libtls_cranelift.so` has **211,000 relocations of which 77 are stored** — the
+prescan exists precisely because a library is ~99.5% RELATIVE and none of those
+are kept. A total-count bound would have refused to cache the largest library in
+the tree, silently returning it to the scan-every-clone path, **with every test
+in the suite still green.**
+
+The step that catches it:
+
+> I only caught it by asking **"what does this refuse that it shouldn't?"**
+> rather than "does this refuse what it should?".
+
+**Every bound gets both questions. The suite only ever asks the second.** When
+you add a bound to a cache or a fast path, ask what happens to the thing it
+protects when the bound bites — and whether any test would notice.
+
+## A fix for a shape is not a fix for that shape recursively
+
+The same agent's *first* fix for the two-inputs-one-collection class made that
+exact mistake one level down: it bounded per relocation table when the collection
+accumulated from both. It was fixing the class and reproduced it while doing so.
+
+> Reasoning that has been correct once about a shape is not thereby correct about
+> that shape recursively.
+
+Writing the test before the fix is what surfaced it. Worth noting because it is
+the exception to today's pattern: **every other proof confirmed a fix; this one
+refuted one.** A test written after a fix tends to confirm it, since it is
+written by someone who already believes the fix works.
+
+## Check the premise before building
+
+Cheapest check here and the one that saved most. Twice in one session an approved
+change turned out to belong to a different owner: boot-log capture already
+existed, and serial interleaving was a **libc** defect, not the kernel one its
+own known-issues heading named.
+
+Both times checking cost minutes. Not checking would have cost a wrong change
+*and* a wrong record — a "fixed" note over an untouched defect, which is worse
+than no note, because it stops the next person looking.
+
+The serial case is the model: **151,047 lines of on-disk logs, 37 splices, zero
+cutting a kernel line.** One command against data already present, and it moved
+the fix to a different crate.
+
 ## Resolve the verb before you resolve the claim
 
 An entry that uses a verb naming more than one operation can be retired against
