@@ -85,6 +85,25 @@ const _: () = assert!(core::mem::size_of::<Extent>() == 16);
 /// Offsets are relative to the partition. Nothing above this struct can name a
 /// byte outside it, which is the property that makes a filesystem bug on this
 /// volume a filesystem bug rather than damage to the disk it sits on.
+///
+/// # Why blocks stay resident
+///
+/// This boundary is where read amplification is *created*, so it is where it
+/// has to be paid off. `toyos-fat32` reasons in the volume's own units — a FAT
+/// entry is four bytes — while the device's only transfer unit is 4096, so a
+/// chain walk cost one USB transfer per cluster and the volume this project
+/// builds has 512-byte clusters. One device block covers 1024 FAT entries;
+/// re-reading it per entry is the whole cost.
+///
+/// # Why keeping copies is sound here
+///
+/// Nothing is ever held back: a write reaches the device before this returns,
+/// and the copy is updated (partial block) or dropped (whole blocks) as part
+/// of issuing it. So the resident set can be stale only if something else
+/// writes these blocks, and after [`mount_boot`] nothing can — `ESP` is the
+/// only handle to the boot partition that exists. `probe_boot_disks` opens its
+/// own handles and only reads, before the mount; `usb_gate` writes only a disk
+/// whose block 0 carries the designation stamp, which this one does not.
 struct EspDevice {
     dev: Box<dyn BlockDevice>,
     /// Where the partition starts, in bytes from the start of the device.
@@ -95,7 +114,26 @@ struct EspDevice {
     /// because the deepest caller of this is the idle loop, whose stack is
     /// 16 KiB and has no guard page.
     scratch: Vec<u8>,
+    /// [`RESIDENT_BLOCKS`] blocks, each tagged with the block it holds.
+    resident: Vec<u8>,
+    tags: [Option<u64>; RESIDENT_BLOCKS],
+    /// Round-robin, because the access pattern this exists for touches every
+    /// resident block on every append. Recency cannot rank blocks that are all
+    /// used once per operation, so anything cleverer would cost a counter to
+    /// arrive at the same eviction.
+    next_victim: usize,
 }
+
+/// Device blocks [`EspDevice`] keeps a copy of.
+///
+/// Sized to hold what one append touches at once, which is what makes the
+/// difference between one device read per FAT entry and one per operation:
+/// the active FAT's block for the file's clusters, the mirror FAT's block at
+/// the same index (`set_fat_entry` writes every FAT and a 4-byte write is a
+/// read-modify-write), the directory block carrying the entry, the FSInfo
+/// block, and the data block being appended to. That is five, or seven when
+/// the file's chain straddles a FAT block boundary.
+const RESIDENT_BLOCKS: usize = 8;
 
 impl EspDevice {
     /// The device byte offset `offset` names, or [`IoError`] if the request
@@ -108,9 +146,47 @@ impl EspDevice {
         Ok(self.start + offset)
     }
 
+    fn slot_of(&self, block: u64) -> Option<usize> {
+        self.tags.iter().position(|&t| t == Some(block))
+    }
+
+    /// Leave `block` in `scratch`, reading it only if it is not already here.
+    fn load(&mut self, block: u64) -> Result<(), IoError> {
+        if let Some(slot) = self.slot_of(block) {
+            let at = slot * BLOCK as usize;
+            self.scratch.copy_from_slice(&self.resident[at..at + BLOCK as usize]);
+            return Ok(());
+        }
+        let Self { dev, scratch, .. } = self;
+        dev.read_blocks(block, 1, scratch).map_err(|_| IoError)?;
+        self.retain(block);
+        Ok(())
+    }
+
+    /// Record `scratch` as this device's `block`. Only ever called where the
+    /// device holds those bytes already — after reading them, or after writing
+    /// them — so nothing here is a copy the disk is waiting for.
+    fn retain(&mut self, block: u64) {
+        let slot = self.slot_of(block).unwrap_or_else(|| {
+            let s = self.next_victim;
+            self.next_victim = (s + 1) % RESIDENT_BLOCKS;
+            s
+        });
+        let at = slot * BLOCK as usize;
+        self.resident[at..at + BLOCK as usize].copy_from_slice(&self.scratch);
+        self.tags[slot] = Some(block);
+    }
+
+    fn forget(&mut self, first: u64, count: u64) {
+        for tag in &mut self.tags {
+            if tag.is_some_and(|b| b >= first && b < first + count) {
+                *tag = None;
+            }
+        }
+    }
+
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
         let base = self.locate(offset, buf.len())?;
-        let Self { dev, scratch, .. } = self;
         let mut done = 0usize;
         while done < buf.len() {
             let at = base + done as u64;
@@ -120,12 +196,14 @@ impl EspDevice {
             if within == 0 && left >= BLOCK as usize {
                 let count = left / BLOCK as usize;
                 let end = done + count * BLOCK as usize;
-                dev.read_blocks(block, count as u32, &mut buf[done..end]).map_err(|_| IoError)?;
+                self.dev
+                    .read_blocks(block, count as u32, &mut buf[done..end])
+                    .map_err(|_| IoError)?;
                 done = end;
             } else {
                 let n = (BLOCK as usize - within).min(left);
-                dev.read_blocks(block, 1, scratch).map_err(|_| IoError)?;
-                buf[done..done + n].copy_from_slice(&scratch[within..within + n]);
+                self.load(block)?;
+                buf[done..done + n].copy_from_slice(&self.scratch[within..within + n]);
                 done += n;
             }
         }
@@ -134,7 +212,6 @@ impl EspDevice {
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), IoError> {
         let base = self.locate(offset, buf.len())?;
-        let Self { dev, scratch, .. } = self;
         let mut done = 0usize;
         while done < buf.len() {
             let at = base + done as u64;
@@ -144,16 +221,21 @@ impl EspDevice {
             if within == 0 && left >= BLOCK as usize {
                 let count = left / BLOCK as usize;
                 let end = done + count * BLOCK as usize;
-                dev.write_blocks(block, count as u32, &buf[done..end]).map_err(|_| IoError)?;
+                self.forget(block, count as u64);
+                self.dev
+                    .write_blocks(block, count as u32, &buf[done..end])
+                    .map_err(|_| IoError)?;
                 done = end;
             } else {
                 // The bytes this request does not cover belong to whoever wrote
                 // them — another file, or the partition table itself when the
                 // partition does not start on a 4 KiB boundary.
                 let n = (BLOCK as usize - within).min(left);
-                dev.read_blocks(block, 1, scratch).map_err(|_| IoError)?;
-                scratch[within..within + n].copy_from_slice(&buf[done..done + n]);
+                self.load(block)?;
+                self.scratch[within..within + n].copy_from_slice(&buf[done..done + n]);
+                let Self { dev, scratch, .. } = self;
                 dev.write_blocks(block, 1, scratch).map_err(|_| IoError)?;
+                self.retain(block);
                 done += n;
             }
         }
@@ -590,7 +672,15 @@ pub fn mount_boot() -> Option<EspFs> {
         return None;
     }
 
-    *ESP.lock() = Some(EspDevice { dev, start, len, scratch: vec![0u8; BLOCK as usize] });
+    *ESP.lock() = Some(EspDevice {
+        dev,
+        start,
+        len,
+        scratch: vec![0u8; BLOCK as usize],
+        resident: vec![0u8; RESIDENT_BLOCKS * BLOCK as usize],
+        tags: [None; RESIDENT_BLOCKS],
+        next_victim: 0,
+    });
 
     // `probe` is a total read and takes no ownership, which is what lets the
     // bound be tightened from the partition to the volume before anything can
