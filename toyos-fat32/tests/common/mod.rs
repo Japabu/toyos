@@ -126,11 +126,27 @@ pub struct SparseDevice {
     sectors: HashMap<u64, [u8; 512]>,
     capacity: u64,
     pub fail_reads_past: Option<u64>,
+    /// The volume's own declared size, when the device is deliberately larger
+    /// than it — a partition with slack, or an adapter that reports the whole
+    /// device. Requests past it are still served, and counted.
+    pub volume_bytes: Option<u64>,
+    /// Requests the crate made outside the volume. Must stay zero: the
+    /// `BlockAccess` contract says the crate never asks for bytes it has not
+    /// bounded, and an adapter is entitled to build on that. Counting rather
+    /// than refusing is the point — refusing would let a crate that asks look
+    /// identical to one that does not.
+    pub out_of_volume: u32,
 }
 
 impl SparseDevice {
     pub fn from_prefix(prefix: &[u8], capacity: u64) -> SparseDevice {
-        let mut dev = SparseDevice { sectors: HashMap::new(), capacity, fail_reads_past: None };
+        let mut dev = SparseDevice {
+            sectors: HashMap::new(),
+            capacity,
+            fail_reads_past: None,
+            volume_bytes: None,
+            out_of_volume: 0,
+        };
         for (i, chunk) in prefix.chunks(512).enumerate() {
             let mut s = [0u8; 512];
             s[..chunk.len()].copy_from_slice(chunk);
@@ -155,6 +171,12 @@ impl SparseDevice {
             let slot = self.sectors.entry(sector).or_insert([0u8; 512]);
             slot[within..within + n].copy_from_slice(&bytes[done..done + n]);
             done += n;
+        }
+    }
+
+    fn note_range(&mut self, end: u64) {
+        if self.volume_bytes.is_some_and(|v| end > v) {
+            self.out_of_volume += 1;
         }
     }
 
@@ -189,6 +211,7 @@ impl BlockAccess for SparseDevice {
                 return Err(IoError);
             }
         }
+        self.note_range(end);
         self.read_bytes(offset, buf);
         Ok(())
     }
@@ -198,6 +221,7 @@ impl BlockAccess for SparseDevice {
         if end > self.capacity {
             return Err(IoError);
         }
+        self.note_range(end);
         self.poke(offset, buf);
         Ok(())
     }
@@ -421,8 +445,8 @@ pub fn assert_fats_agree<D: BlockAccess>(fs: &mut toyos_fat32::Fat32<D>) {
     while at < used {
         let n = (used - at).min(a.len() as u64) as usize;
         for fat in 1..g.num_fats {
-            let base = g.fat_entry_offset(0, 0) + at;
-            let mirror = g.fat_entry_offset(fat, 0) + at;
+            let base = g.fat_base_offset(0) + at;
+            let mirror = g.fat_base_offset(fat) + at;
             fs.device().read_at(base, &mut a[..n]).expect("read FAT 0");
             fs.device().read_at(mirror, &mut b[..n]).expect("read mirror");
             let diff = a[..n].iter().zip(&b[..n]).position(|(x, y)| x != y);
@@ -444,7 +468,7 @@ pub fn short_names_in<D: BlockAccess>(
 ) -> Vec<[u8; 11]> {
     let g = *fs.geometry();
     let mut out = Vec::new();
-    let mut cluster = first_cluster;
+    let mut cluster = g.cluster(first_cluster).expect("directory cluster is in the volume");
     let mut buf = vec![0u8; g.bytes_per_cluster() as usize];
     for _ in 0..4096 {
         fs.device().read_at(g.cluster_offset(cluster), &mut buf).expect("read directory cluster");
@@ -465,11 +489,10 @@ pub fn short_names_in<D: BlockAccess>(
         fs.device()
             .read_at(g.fat_entry_offset(0, cluster), &mut link)
             .expect("read chain link");
-        let next = u32::from_le_bytes(link) & 0x0FFF_FFFF;
-        if next < 2 || next > g.max_cluster() {
-            return out;
+        match g.cluster(u32::from_le_bytes(link) & 0x0FFF_FFFF) {
+            Some(next) => cluster = next,
+            None => return out,
         }
-        cluster = next;
     }
     out
 }

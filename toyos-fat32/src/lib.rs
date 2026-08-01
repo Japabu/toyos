@@ -72,7 +72,7 @@ mod fs;
 mod name;
 mod time;
 
-pub use boot::{Geometry, MIN_FAT32_CLUSTERS};
+pub use boot::{Cluster, Geometry, MIN_FAT32_CLUSTERS};
 pub use device::{BlockAccess, IoError};
 pub use dir::MAX_DIR_ENTRIES;
 pub use error::Error;

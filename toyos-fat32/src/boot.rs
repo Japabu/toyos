@@ -23,6 +23,25 @@ const LEGAL_SECTOR_SIZES: [u32; 4] = [512, 1024, 2048, 4096];
 /// would otherwise be caught only by the arithmetic it overflows.
 const MAX_NUM_FATS: u32 = 8;
 
+/// A cluster number that has been checked against the volume it came from.
+///
+/// [`Geometry::cluster`] is the only way to make one, and the field is private
+/// to this module, so a number that came off the stick cannot become a byte
+/// offset without passing the check. That is the whole point: the check
+/// existed before, at nine sites, and the one place it was written with a
+/// condition in front of it — a directory entry's cluster was validated only
+/// when the entry was a directory or had a non-zero size — was a write of 256
+/// GiB outside the volume, reported as success. A precondition in a doc
+/// comment is a precondition nobody enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Cluster(u32);
+
+impl Cluster {
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 /// Everything about the volume's layout, derived once and then trusted.
 ///
 /// The point of computing this at mount is that afterwards nothing has to
@@ -198,23 +217,34 @@ impl Geometry {
         sector as u64 * self.bytes_per_sector as u64
     }
 
-    /// Byte offset of a cluster's first sector. `cluster` must have passed
-    /// [`Self::valid_cluster`]; the caller's check is what makes the result
-    /// land inside the volume.
-    pub fn cluster_offset(&self, cluster: u32) -> u64 {
+    /// The only constructor for a [`Cluster`]. `None` for anything that is not
+    /// a data cluster of this volume — including 0, which a directory entry
+    /// uses to mean "no data at all".
+    pub fn cluster(&self, raw: u32) -> Option<Cluster> {
+        (raw >= 2 && raw <= self.max_cluster()).then_some(Cluster(raw))
+    }
+
+    /// The root directory's first cluster. Always valid: [`Self::parse`]
+    /// refuses a volume whose root cluster is outside it.
+    pub fn root(&self) -> Cluster {
+        Cluster(self.root_cluster)
+    }
+
+    pub fn cluster_offset(&self, cluster: Cluster) -> u64 {
         let sector = self.first_data_sector as u64
-            + (cluster as u64 - 2) * self.sectors_per_cluster as u64;
+            + (cluster.0 as u64 - 2) * self.sectors_per_cluster as u64;
         sector * self.bytes_per_sector as u64
     }
 
-    pub fn valid_cluster(&self, cluster: u32) -> bool {
-        cluster >= 2 && cluster <= self.max_cluster()
+    pub fn fat_entry_offset(&self, fat: u32, cluster: Cluster) -> u64 {
+        self.fat_base_offset(fat) + cluster.0 as u64 * 4
     }
 
-    /// Byte offset of `cluster`'s entry in FAT number `fat`.
-    pub fn fat_entry_offset(&self, fat: u32, cluster: u32) -> u64 {
+    /// Where FAT number `fat` starts. The scanning loops work in whole FAT
+    /// sectors and have no cluster to offset from.
+    pub fn fat_base_offset(&self, fat: u32) -> u64 {
         let fat_start = self.reserved_sectors as u64 + fat as u64 * self.fat_sectors as u64;
-        fat_start * self.bytes_per_sector as u64 + cluster as u64 * 4
+        fat_start * self.bytes_per_sector as u64
     }
 
     /// Which FATs a write must reach. One when the volume disabled mirroring,
@@ -238,7 +268,7 @@ impl Geometry {
 #[derive(Debug, Clone, Copy)]
 pub struct FsInfo {
     pub free_count: Option<u32>,
-    pub next_free: Option<u32>,
+    pub next_free: Option<Cluster>,
     pub dirty: bool,
 }
 
@@ -262,11 +292,10 @@ impl FsInfo {
         {
             return FsInfo::UNKNOWN;
         }
-        let in_range = |v: u32| if geom.valid_cluster(v) { Some(v) } else { None };
         let free_raw = u32_at(buf, 488);
         FsInfo {
             free_count: if free_raw <= geom.cluster_count { Some(free_raw) } else { None },
-            next_free: in_range(u32_at(buf, 492)),
+            next_free: geom.cluster(u32_at(buf, 492)),
             dirty: false,
         }
     }
@@ -292,7 +321,7 @@ impl FsInfo {
             }
         };
         put(buf, 488, self.free_count.unwrap_or(0xFFFF_FFFF));
-        put(buf, 492, self.next_free.unwrap_or(0xFFFF_FFFF));
+        put(buf, 492, self.next_free.map_or(0xFFFF_FFFF, Cluster::raw));
         dev.write_at(offset, buf)?;
         Ok(())
     }

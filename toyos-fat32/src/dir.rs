@@ -1,8 +1,9 @@
 use alloc::string::String;
 
+use crate::boot::Cluster;
 use crate::device::BlockAccess;
 use crate::error::Error;
-use crate::fs::Fat32;
+use crate::fs::{Fat32, Loc};
 use crate::name::{
     self, ShortName, MAX_LFN_ENTRIES, MAX_SHORT_NAME_CANDIDATES, UNITS_PER_LFN_ENTRY,
 };
@@ -99,6 +100,15 @@ impl RawEntry {
         self.0[18..20].copy_from_slice(&date.to_le_bytes());
     }
 
+    /// The five creation-time bytes: tenths, time, date. Half of a handle's
+    /// fingerprint, because the 8.3 name alone repeats across a delete and a
+    /// recreate.
+    pub fn create_stamp(&self) -> [u8; 5] {
+        let mut out = [0u8; 5];
+        out.copy_from_slice(&self.0[13..18]);
+        out
+    }
+
     pub fn set_create_time(&mut self, t: FatTime) {
         let (date, time, tenths) = t.raw();
         self.0[13] = tenths;
@@ -141,17 +151,16 @@ impl RawEntry {
 /// cursor that could go backwards would need either a second walk or a cache
 /// of the chain, both of which cost more than they save.
 pub struct EntryCursor {
-    dir_start: u32,
-    cluster: u32,
+    dir_start: Cluster,
+    cluster: Cluster,
     cluster_index: u32,
 }
 
 impl EntryCursor {
-    pub fn new(dir_start: u32) -> EntryCursor {
+    pub fn new(dir_start: Cluster) -> EntryCursor {
         EntryCursor { dir_start, cluster: dir_start, cluster_index: 0 }
     }
 
-    /// Byte offset of entry `index`, or `None` when the chain ends before it.
     pub fn offset_of<D: BlockAccess>(
         &mut self,
         fs: &mut Fat32<D>,
@@ -185,6 +194,8 @@ pub struct Located {
     pub raw: RawEntry,
     /// Index of the short entry.
     pub index: u32,
+    /// Byte offset of the short entry on the device.
+    pub offset: u64,
     /// Index of the first entry of the run — the first long-name entry, or the
     /// short entry when there is no long name.
     pub first_index: u32,
@@ -213,7 +224,7 @@ pub struct DirScan {
 }
 
 impl DirScan {
-    pub fn new(dir_start: u32) -> DirScan {
+    pub fn new(dir_start: Cluster) -> DirScan {
         DirScan {
             cursor: EntryCursor::new(dir_start),
             index: 0,
@@ -283,7 +294,7 @@ impl DirScan {
             };
             let first_index = if long_len > 0 { self.run_start } else { index };
             self.drop_run();
-            return Ok(Some(Located { raw, index, first_index, long_len }));
+            return Ok(Some(Located { raw, index, offset, first_index, long_len }));
         }
     }
 
@@ -377,7 +388,7 @@ impl<D: BlockAccess> Fat32<D> {
     }
 
     /// Entries the directory's currently allocated clusters can hold.
-    fn dir_capacity(&mut self, dir_start: u32) -> Result<u32, Error> {
+    fn dir_capacity(&mut self, dir_start: Cluster) -> Result<u32, Error> {
         let per_cluster = self.geometry().bytes_per_cluster() / ENTRY_SIZE;
         let max_clusters = (MAX_DIR_ENTRIES / per_cluster).max(1) as u64;
         let clusters = self.chain_len(dir_start, max_clusters)?;
@@ -386,7 +397,7 @@ impl<D: BlockAccess> Fat32<D> {
 
     /// The index of the first run of `count` consecutive free slots, growing
     /// the directory by a cluster if there is no such run.
-    fn find_free_run(&mut self, dir_start: u32, count: u32) -> Result<u32, Error> {
+    fn find_free_run(&mut self, dir_start: Cluster, count: u32) -> Result<u32, Error> {
         let mut capacity = self.dir_capacity(dir_start)?;
         loop {
             if let Some(index) = self.scan_free_run(dir_start, count, capacity)? {
@@ -399,14 +410,14 @@ impl<D: BlockAccess> Fat32<D> {
             let max_clusters = (MAX_DIR_ENTRIES / per_cluster).max(1) as u64;
             let last = self.chain_last(dir_start, max_clusters)?;
             let new = self.alloc_zeroed_cluster()?;
-            self.set_fat_entry(last, new)?;
+            self.set_fat_entry(last, new.raw())?;
             capacity += per_cluster;
         }
     }
 
     fn scan_free_run(
         &mut self,
-        dir_start: u32,
+        dir_start: Cluster,
         count: u32,
         capacity: u32,
     ) -> Result<Option<u32>, Error> {
@@ -434,7 +445,7 @@ impl<D: BlockAccess> Fat32<D> {
         Ok(None)
     }
 
-    fn short_name_taken(&mut self, dir_start: u32, short: &ShortName) -> Result<bool, Error> {
+    fn short_name_taken(&mut self, dir_start: Cluster, short: &ShortName) -> Result<bool, Error> {
         let mut scan = DirScan::new(dir_start);
         while let Some(loc) = scan.next(self)? {
             if &loc.raw.short() == short {
@@ -445,13 +456,23 @@ impl<D: BlockAccess> Fat32<D> {
     }
 
     /// Create a directory entry for `name`, carrying the cluster, size and
-    /// attributes of `template`. Returns the index of its short entry.
+    /// attributes of `template`. Returns where it went and what was actually
+    /// written — the short name is chosen here, so the caller's `template` is
+    /// not the entry that lands, and a handle fingerprinting the template
+    /// would not recognise its own file.
+    ///
+    /// Returns the whole [`Loc`] rather than the short entry's index, because
+    /// the two indices are what the caller would otherwise have to guess at:
+    /// `create` used to fill both fields with the short index, which is
+    /// `groups` entries too high for any name with a long-name run, and would
+    /// have orphaned those entries the first time something erased through a
+    /// handle.
     pub(crate) fn insert_entry(
         &mut self,
-        dir_start: u32,
+        dir_start: Cluster,
         name: &str,
         template: &RawEntry,
-    ) -> Result<u32, Error> {
+    ) -> Result<(Loc, RawEntry), Error> {
         name::validate_component(name)?;
         let basis = name::basis_name(name);
         let short_only = name::fits_short(name, &basis);
@@ -505,19 +526,14 @@ impl<D: BlockAccess> Fat32<D> {
         let index = start + groups as u32;
         let offset = cursor.offset_of(self, index)?.ok_or(Error::NoSpace)?;
         self.write_entry_at(offset, &entry)?;
-        Ok(index)
+        Ok((Loc { dir_start, first_index: start, index, entry_offset: offset }, entry))
     }
 
     /// Mark every entry of a run free. Does not touch the cluster chain — a
     /// rename moves an entry and must not free what it still points at.
-    pub(crate) fn erase_entries(
-        &mut self,
-        dir_start: u32,
-        first_index: u32,
-        last_index: u32,
-    ) -> Result<(), Error> {
-        let mut cursor = EntryCursor::new(dir_start);
-        for index in first_index..=last_index {
+    pub(crate) fn erase_entries(&mut self, loc: Loc) -> Result<(), Error> {
+        let mut cursor = EntryCursor::new(loc.dir_start);
+        for index in loc.first_index..=loc.index {
             let Some(offset) = cursor.offset_of(self, index)? else { break };
             let mut raw = self.read_entry_at(offset)?;
             raw.0[0] = FREE;
@@ -527,27 +543,22 @@ impl<D: BlockAccess> Fat32<D> {
     }
 
     /// Whether a directory holds nothing but `.`, `..` and free slots.
-    pub(crate) fn dir_is_empty(&mut self, dir_start: u32) -> Result<bool, Error> {
+    pub(crate) fn dir_is_empty(&mut self, dir_start: Cluster) -> Result<bool, Error> {
         let mut scan = DirScan::new(dir_start);
         Ok(scan.next(self)?.is_none())
     }
 
     /// Write the `.` and `..` pair a new directory must begin with.
-    ///
-    /// `parent` is 0 when the parent is the root, which is what the format
-    /// requires and what `fsck` checks: the root has no cluster number a `..`
-    /// entry may name.
     pub(crate) fn init_dot_entries(
         &mut self,
-        cluster: u32,
-        parent: u32,
+        cluster: Cluster,
+        parent: Cluster,
         time: FatTime,
     ) -> Result<(), Error> {
-        let root = self.geometry().root_cluster;
-        let parent = if parent == root { 0 } else { parent };
+        let parent = self.dotdot_target(parent);
         let mut cursor = EntryCursor::new(cluster);
         for (index, (short, target)) in
-            [(b".          ", cluster), (b"..         ", parent)].into_iter().enumerate()
+            [(b".          ", cluster.raw()), (b"..         ", parent)].into_iter().enumerate()
         {
             let mut raw = RawEntry::zeroed();
             raw.set_short(short);
@@ -561,10 +572,16 @@ impl<D: BlockAccess> Fat32<D> {
         Ok(())
     }
 
+    /// What a `..` entry must name for a given parent. Zero when the parent is
+    /// the root, which is what the format requires and what `fsck` checks: the
+    /// root has no cluster number a `..` entry may name.
+    fn dotdot_target(&self, parent: Cluster) -> u32 {
+        if parent == self.geometry().root() { 0 } else { parent.raw() }
+    }
+
     /// Repoint a directory's `..` entry after it moves to a new parent.
-    pub(crate) fn set_dot_dot(&mut self, cluster: u32, parent: u32) -> Result<(), Error> {
-        let root = self.geometry().root_cluster;
-        let parent = if parent == root { 0 } else { parent };
+    pub(crate) fn set_dot_dot(&mut self, cluster: Cluster, parent: Cluster) -> Result<(), Error> {
+        let parent = self.dotdot_target(parent);
         let mut cursor = EntryCursor::new(cluster);
         let Some(offset) = cursor.offset_of(self, 1)? else { return Err(Error::CorruptDirectory) };
         let mut raw = self.read_entry_at(offset)?;

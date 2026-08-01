@@ -18,7 +18,7 @@ mod common;
 use std::sync::OnceLock;
 
 use common::{pattern, Image, SparseDevice};
-use toyos_fat32::{Error, Fat32, FatTime, MAX_DIR_ENTRIES};
+use toyos_fat32::{BlockAccess, Error, Fat32, FatTime, MAX_DIR_ENTRIES};
 
 /// Enough of the volume to hold the reserved sectors, both FATs, and the first
 /// thousand data clusters. Everything past it reads as zeroes, which is what
@@ -634,4 +634,197 @@ fn writes_past_the_format_limit_are_refused() {
     assert_eq!(fs.write(&mut f, u64::MAX, &[1]).unwrap_err(), Error::TooLarge);
     assert_eq!(fs.set_len(&mut f, 1 << 40).unwrap_err(), Error::TooLarge);
     assert_eq!(fs.free_bytes().expect("free"), before, "a refused write still allocated");
+}
+
+// ------------------------------------- the write path, after the 2026-08-01 audit
+//
+// Each of these was a working reproducer in `specs/type-safety-audit/storage-stack.md`.
+// They are grouped because they have one shape: a value that came off the disk
+// reached a device operation without the check that gives it meaning, because
+// the check sat behind a condition — `is_dir || size > 0`, `steps > 0`, "the
+// walk revisits". The `Cluster` type closes the first two; the other two are
+// orderings and needed their own fix.
+
+/// Write a raw 32-byte entry into the root's first free slot, and answer with
+/// the offset it went to.
+fn craft_root_entry(dev: &mut SparseDevice, l: &Layout, entry: &[u8; 32]) -> u64 {
+    let root = l.cluster(l.root);
+    for i in 0..(l.bps * l.spc / 32) {
+        let at = root + i * 32;
+        let existing = dev.peek(at, 32);
+        if existing[0] == 0x00 || existing[0] == 0xE5 {
+            dev.poke(at, entry);
+            return at;
+        }
+    }
+    panic!("no free slot in the root directory");
+}
+
+/// An entry naming a cluster that is not in the volume, with `size == 0`.
+///
+/// F1. The validity check ran only when the entry was a directory or had a
+/// non-zero size, and `advance(c, 0)` never entered the loop that would have
+/// caught it — so `write` computed a byte offset from the crafted number and
+/// issued it. On a device larger than the volume (a partition with slack, or
+/// an adapter reporting the whole device) the audit landed 18 bytes at
+/// 274,877,906,944 of a 64 MiB volume and got `Ok(())` back.
+#[test]
+fn a_crafted_zero_size_entry_cannot_write_outside_the_volume() {
+    let l = layout();
+    let (prefix, _) = corpus();
+    // Twice the volume, so an out-of-volume offset is inside the device and
+    // the device cannot mask the bug by refusing.
+    let volume = l.bps * u64::from(u32::from_le_bytes(
+        SparseDevice::from_prefix(prefix, 1).peek(32, 4).try_into().expect("4 bytes"),
+    ));
+    let mut dev = SparseDevice::from_prefix(prefix, volume * 2);
+    dev.volume_bytes = Some(volume);
+
+    let mut entry = [0u8; 32];
+    entry[..11].copy_from_slice(b"CRAFTED BIN");
+    entry[11] = 0x20;
+    entry[26..28].copy_from_slice(&0x0002u16.to_le_bytes());
+    entry[20..22].copy_from_slice(&0x2000u16.to_le_bytes());
+    craft_root_entry(&mut dev, &l, &entry);
+
+    let mut fs = Fat32::mount(dev).expect("mount");
+    assert_eq!(fs.open("CRAFTED.BIN").map(|_| ()).unwrap_err(), Error::CorruptDirectory);
+    assert_eq!(fs.metadata("CRAFTED.BIN").unwrap_err(), Error::CorruptDirectory);
+    assert_eq!(fs.extents("CRAFTED.BIN", 16).unwrap_err(), Error::CorruptDirectory);
+    // A listing validates only what it follows, so the crafted entry is
+    // *reported*: it is on the disk, and saying so computes no offset from it.
+    // One bad entry making a whole directory unlistable would be a denial of
+    // service on a volume that is otherwise fine.
+    assert!(fs.walk(1024).expect("walk").iter().any(|(n, _)| n == "CRAFTED.BIN"));
+    assert_eq!(fs.device().out_of_volume, 0, "the crate asked for bytes outside the volume");
+}
+
+/// F6, the other half of the same entry: it must still be deletable.
+///
+/// Refusing to resolve it is right for a read and wrong for a delete — an ESP
+/// log rotation that wedges permanently on one crafted entry is a machine that
+/// fills up and cannot be fixed in the field.
+#[test]
+fn a_crafted_entry_can_still_be_deleted() {
+    let l = layout();
+    let mut dev = pristine();
+    let mut entry = [0u8; 32];
+    entry[..11].copy_from_slice(b"CRAFTED BIN");
+    entry[11] = 0x20;
+    entry[26..28].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    entry[20..22].copy_from_slice(&0x0FFFu16.to_le_bytes());
+    craft_root_entry(&mut dev, &l, &entry);
+
+    let mut fs = Fat32::mount(dev).expect("mount");
+    assert!(fs.read_dir("", 256).expect("read_dir").iter().any(|e| e.name == "CRAFTED.BIN"));
+    fs.remove("CRAFTED.BIN").expect("a crafted entry must still be removable");
+    assert!(!fs.read_dir("", 256).expect("read_dir").iter().any(|e| e.name == "CRAFTED.BIN"));
+    assert_eq!(fs.metadata("CRAFTED.BIN").unwrap_err(), Error::NotFound);
+}
+
+/// The head cluster of the corpus file that spans several clusters.
+fn multi_cluster_head(l: &Layout) -> u32 {
+    let mut fs = Fat32::mount(pristine()).expect("mount");
+    let ext = fs.extents("A Long Name For Entries.bin", 64).expect("extents");
+    ((ext[0].offset / l.bps - l.first_data) / l.spc + 2) as u32
+}
+
+/// F3. Truncating a chain that loops back through the cluster being kept.
+///
+/// `truncate_chain` writes the end-of-chain marker first, and the free walk
+/// then arrives at that cluster, reads the marker, and exits normally — having
+/// freed the one cluster the file still needs. The audit saw `Ok(())` with
+/// every cluster of the truncated file free and the entry still naming the
+/// first of them, which the next allocation turns into a cross-link.
+#[test]
+fn truncating_a_cyclic_chain_does_not_free_the_clusters_it_keeps() {
+    let l = layout();
+    let head = multi_cluster_head(&l);
+    let mut dev = pristine();
+    // head → head+1 → head+2 → head, a rho closing above the truncation point.
+    l.set_chain(&mut dev, head + 2, head);
+
+    let mut fs = Fat32::mount(dev).expect("mount");
+    let mut f = fs.open("A Long Name For Entries.bin").expect("open");
+    assert_eq!(fs.set_len(&mut f, 600).unwrap_err(), Error::CorruptChain);
+
+    // The kept cluster must still be allocated. Reading it back through the
+    // FAT is the only way to see this: the directory entry looks fine either
+    // way, which is what made the original silent.
+    let g = *fs.geometry();
+    let mut link = [0u8; 4];
+    let cluster = g.cluster(head).expect("head is in the volume");
+    fs.device().read_at(g.fat_entry_offset(0, cluster), &mut link).expect("read link");
+    assert_ne!(
+        u32::from_le_bytes(link) & 0x0FFF_FFFF,
+        0,
+        "truncation freed the cluster it was keeping"
+    );
+}
+
+/// F4. Deleting a file whose chain is cyclic.
+///
+/// The free walk detects the cycle, but only after freeing part of it, and the
+/// `?` then skipped the erase — leaving a live directory entry naming free
+/// clusters. Erasing first makes a failure leak instead, which `fsck`
+/// reclaims.
+#[test]
+fn removing_a_cyclic_chain_never_leaves_an_entry_naming_free_clusters() {
+    let l = layout();
+    let head = multi_cluster_head(&l);
+    let mut dev = pristine();
+    l.set_chain(&mut dev, head + 2, head);
+
+    let mut fs = Fat32::mount(dev).expect("mount");
+    let result = fs.remove("A Long Name For Entries.bin");
+    assert_eq!(
+        fs.metadata("A Long Name For Entries.bin").unwrap_err(),
+        Error::NotFound,
+        "the entry survived a remove that reported {result:?}"
+    );
+}
+
+/// F2. A handle to a file that was empty when it was opened.
+///
+/// The guard compared first clusters, and 0 is every unwritten file's first
+/// cluster — so a slot freed and refilled by another *empty* file matched, and
+/// the stale handle wrote its own size and cluster into the newcomer's entry.
+/// `fsck_msdos` called the result clean. The existing
+/// `a_stale_handle_is_refused` removes a 12-byte file, so it leaves through
+/// the `is_free` branch and never reaches the comparison at all.
+#[test]
+fn a_stale_handle_over_a_reused_empty_slot_is_refused() {
+    let mut fs = Fat32::mount(pristine()).expect("mount");
+    let t = FatTime::EPOCH;
+
+    let mut stale = fs.create("AAA.TXT", t).expect("create");
+    fs.flush_meta(&mut stale, t).expect("flush");
+    fs.remove("AAA.TXT").expect("remove");
+
+    let mut newcomer = fs.create("BBB.TXT", t).expect("create");
+    fs.flush_meta(&mut newcomer, t).expect("flush");
+
+    assert_eq!(fs.write(&mut stale, 0, &[1u8; 4096]).unwrap_err(), Error::NotFound);
+    assert_eq!(fs.flush_meta(&mut stale, t).unwrap_err(), Error::NotFound);
+    assert_eq!(fs.metadata("BBB.TXT").expect("metadata").len, 0, "the newcomer was rewritten");
+}
+
+/// F5. Writing through a handle whose entry is gone.
+///
+/// It allocated real clusters, returned `Ok(())`, and nothing ever gave them
+/// back — 128 orphaned clusters in the audit, on a volume whose only repair
+/// tool is a host `fsck`. `write`'s own contract promises all-or-nothing, and
+/// this write did not fail, so no rollback ran.
+#[test]
+fn a_write_through_a_dead_handle_allocates_nothing() {
+    let mut fs = Fat32::mount(pristine()).expect("mount");
+    let t = FatTime::EPOCH;
+    let mut f = fs.create("DOOMED.BIN", t).expect("create");
+    fs.flush_meta(&mut f, t).expect("flush");
+    fs.remove("DOOMED.BIN").expect("remove");
+
+    let before = fs.free_bytes().expect("free");
+    assert_eq!(fs.write(&mut f, 0, &[7u8; 65_536]).unwrap_err(), Error::NotFound);
+    assert_eq!(fs.set_len(&mut f, 65_536).unwrap_err(), Error::NotFound);
+    assert_eq!(fs.free_bytes().expect("free"), before, "a dead handle took clusters with it");
 }
