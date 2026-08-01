@@ -1524,32 +1524,21 @@ zero and the next line divides by zero. Both are firmware/device values, not
 userland, but "the device said so" is not a bound — and the metal track is
 exactly where a device we did not write starts answering these queries.
 
-### The boot partition is identified but nothing asks the disk it is actually on
+### A machine that boots off its internal disk gets no `/boot`
 
-`kernel/src/gpt.rs` resolves the boot partition by asking each block device
-whether it carries the unique partition GUID firmware handed the bootloader.
-Exactly one device is asked today — the NVMe namespace, from `kernel_main`'s
-storage phase — and on every machine in this tree the boot partition is on the
-USB stick instead. So `gpt::boot_volume()` returns `None` on real hardware and
-on every profile, and the positive path is exercised only by
-`boot_partition_identity`, which hands the NVMe a table carrying the stick's
-GUID on purpose.
+`gpt::probe` runs twice now — `kernel_main` asks the NVMe namespace, and
+`fat32_adapter::probe_boot_disks` asks every USB disk — so the stick this
+project boots from is found and `/boot` mounts. The NVMe call is the one that
+cannot lead anywhere: `page_cache::init` takes sole ownership of the device
+immediately afterwards, so even when the boot partition *is* on the internal
+disk, `gpt::boot_volume()` names a device nothing can hand the FAT32 adapter.
+That is the installed-ToyOS case, which is where this ends up.
 
-Wiring is one call: whoever owns the USB mass-storage block device calls
-`gpt::probe(&mut dev, sector_size)` as the device is registered, exactly as
-`kernel_main` does for NVMe. Until then nothing can mount the ESP by identity,
-which is the whole point of the module — `toyos-fat32` landed at `124c2ac` and
-has no mount site either.
-
-Note the interaction that call turns on: probing both the stick and an NVMe
-disk that is a copy of it makes the resolution `Ambiguous` and
-`boot_volume()` `None` forever, by design. That is correct — nothing can say
-which of two identical partitions firmware read — but it means the
-`boot_partition_identity` gate's crafted NVMe table would poison the answer
-once the stick is also probed. The gate asserts on the *per-device* line
-rather than the global resolution for that reason, so it stays green; the
-kernel's behaviour is the thing that would change, and it should be revisited
-when the second probe lands.
+The `Resolution::Ambiguous` arm is now live and exercised: `boot_partition_identity`
+puts the image's own partition GUID on a crafted NVMe disk while the real stick
+carries it too, and the machine correctly reports it has no boot volume. Worth
+knowing before adding a third probe — two devices claiming one unique partition
+GUID poisons the answer permanently, by design.
 
 ### The backup GPT is never consulted
 
