@@ -8,7 +8,9 @@ narrative belongs in a dated investigation doc, not here.
 Verified against `a88e4ee` (2026-07-30); §2's panic-path additions and §8's
 display entry against `883a84d` (2026-07-31); §8's three metal-sim entries
 against M1 (2026-07-31); §1's and §3's allocation-sizing entries against
-`a6935c6` (2026-07-31), from the sweep that followed the T14's first boot.
+`a6935c6` (2026-07-31), from the sweep that followed the T14's first boot;
+§2's allocator-lock entry and §1's two readdir entries against `da433f1`
+(2026-08-01), all four figures in them off a running guest.
 
 ---
 
@@ -179,10 +181,43 @@ a capability, or `#[cfg(debug_assertions)]`, or deletion.
 
 ### Untrusted-input panics that remain
 
+**`SYS_READDIR` over a large enough tmpfs directory — demonstrated, and the
+cheapest one on this list.** `Vfs::list` builds a `Vec<(String, u64)>` with one
+entry per file and no cap, so its 32,769th `push` doubles the buffer to 65,536
+entries — 2,097,152 bytes, one allocation, past `mm::MAX_HEAP_ALLOC`. Measured
+directly: a guest program that creates files in `/tmp` and lists after each
+batch listed cleanly at 32,768 files and died before 34,816, with
+`RawVec<(String, u64)>::grow_one` under `<kernel::vfs::Vfs>::list` in the
+backtrace asking for exactly that. Total elapsed 1.8 s, so this is an
+afternoon's worth of nothing, not a stress test. No privilege, no crafting:
+`fs::write` in a loop and one `read_dir`.
+
+Worse than the allocation, because the allocation is now merely a dead process:
+it panics **inside `vfs::lock()`**, so the VFS lock is stranded and every later
+filesystem operation on the machine spins on it. Two of the three bounds this
+wants are the same one — a cap on the listing, and the cap being an error
+return rather than a truncation (below).
+
 `SYS_SYSINFO` collects one 24-byte entry per live thread into a `Vec`
 (`syscall.rs:1273`) and thread count is uncapped, so ~87,000 threads makes it a
-single >2 MiB allocation and the `mm/alloc.rs:12` assert fires. Any process may
-call it.
+single >2 MiB allocation and `mm/alloc.rs`'s `MAX_HEAP_ALLOC` assert fires. Any
+process may call it. Second-order rather than cheap — building the thread count
+is itself unbounded — which is what puts the tmpfs route above it.
+
+### `SYS_READDIR` silently truncates, the same way `getcwd` did
+
+Found on the way to the entry above and unrelated to it. `sys_readdir(path,
+buf)` serialises into a fixed user buffer and reports what fit, with no signal
+that anything was left out. Measured: `std::fs::read_dir("/tmp")` returned
+**4125** entries out of **34,816** files, and returned it as success. Between
+2048 and 4096 files it was exact, so the ceiling is the buffer and nothing
+about it is visible to the caller.
+
+Exactly the `std::env::current_dir()` defect one directory up, and the same
+judgement applies: a refusal would be a limitation, a wrong answer that looks
+right is a correctness defect, because every consumer inherits it silently. A
+program that enumerates a directory to delete it, or to check a name is absent,
+gets a confident wrong answer.
 
 The crafted-ELF panics are closed (`679086d`, `ad38148`, `fa1e9d4`, `b362082`):
 `vaddr_to_file_offset` returns `Option` and `checked_add`s, both `align_2m`
@@ -423,37 +458,47 @@ misbehaving process starves everything.
 
 ## 2. The panic path
 
-### A panic holding the allocator lock wedges the recovered CPU
+### CLOSED — a panic holding the allocator lock wedged the recovered CPU
 
-The *reporting* half is fixed: `e9f3356` flushes the crash report in the panic
-handler itself, before the recovery branch, so the report reaches serial even if
-nothing on that CPU ever runs again (measured byte-identical on the recovering
-path, and the flush is idempotent against the `halt_all_cpus` one).
+Fixed at `889d611`. `KernelPageSource::alloc` is total now — a size it cannot
+back is a `null`, not an assert — and the fail-fast moved up to
+`KernelAllocator::alloc`, which checks `mm::MAX_HEAP_ALLOC` *before* taking
+`self.dlmalloc.lock()`. Nothing inside that lock panics, so there is nothing to
+force-release and no window in which dlmalloc's chunk and segment lists are
+abandoned mid-mutation. `heap_ceiling_recovery` is the gate: red on the
+timeout before, green in 5 s after, same actuator and same one-CPU boot.
 
-What remains: `mm/alloc.rs:12`'s >2 MiB assert fires inside
-`KernelPageSource::alloc` while `KernelAllocator::alloc` holds
-`self.dlmalloc.lock()` (`alloc.rs:78`). After `try_recover_from_panic` rejoins
-the scheduler, the idle loop's first allocation or free (watcher-list `Vec`
-clones in `net.rs`/`audio.rs`, mailbox `Box`es, BTreeMap frees — `dealloc` takes
-the same lock) spins forever on the lock the dead thread still holds. The
-reentry guard cannot help: a spin is not a panic, and `main.rs` disarms the
-guard before recovery anyway. Same family as the `PROCESS_TABLE` hang below —
-any fix should cover both (a per-CPU in-panic flag that poisons or force-releases
-locks the dying thread holds). There is no `#[alloc_error_handler]`, so a null
-return from dlmalloc wedges identically with a worse message.
+**Two things this entry got wrong, and they are the reusable part.**
 
-**Scoping result: this does not need a test-only actuator, and it is the same
-problem as the missing bound.** `KernelAllocator::alloc` takes the dlmalloc lock
-(`alloc.rs:78`) and then calls `dlm.malloc`, which calls back into
-`KernelPageSource::alloc`, whose `assert!(size <= PAGE_2M)` fires **inside that
-lock**. So "panicked while holding the allocator lock" is reachable from any
-syscall path that can be driven to request a kernel allocation over 2 MiB — an
-ordinary workload route, not injection. The same unchecked size is independently a
-userland-triggered kernel panic, so the two entries are one defect seen from two
-ends: bound the allocation and both close.
+**"It is the same problem as the missing bound" was false, and measured false.**
+This entry said the two were one defect and that bounding the allocation closed
+both. `memalign` pads by the alignment *before* asking for backing, so
+`MAX_HEAP_ALLOC` with a 4096-byte alignment — a request that satisfies any
+entry bound you could write — still asks the page source for 2,162,688 bytes.
+Run against the old code it panicked inside `Dlmalloc::malloc` and the guest
+went silent, exactly as an oversized request did. No bound at the entry could
+ever have closed that one; only a total page source can. The general shape:
+**a check upstream of an allocator does not constrain what the allocator asks
+its backing for**, because the allocator's own padding sits in between.
 
-Whether such a path exists is a read-only audit, in progress. **No conclusion is
-recorded here** — that is what the audit is for.
+**"This does not need a test-only actuator" was also wrong, for a reason worth
+keeping.** Ordinary routes past the ceiling do exist — a `read_dir` over 32,769
+files in one tmpfs directory is one, measured — but every one of them is inside
+`vfs::lock()` when it dies, so the panic strands the VFS lock too and the
+machine wedges either way. Reachability was never the question; *isolation*
+was. `test-heap-ceiling`'s three `SYS_DEBUG` actions hold nothing but the
+allocator, which is why the gate can tell the allocator's recovery from the
+filesystem's.
+
+The reporting half was already fixed at `e9f3356`, which is what made the
+before/after readable at all: the crash report reaches serial even when nothing
+on that CPU runs again, so the wedge shows up as a report followed by silence
+rather than as a blank window.
+
+Still open from this: there is no `#[alloc_error_handler]`, so a `null` from
+dlmalloc — now reachable at the alignment corner as well as on real exhaustion
+— lands in `handle_alloc_error`. That panic is outside the lock and the machine
+survives it, but the message is worse than the assert's.
 
 ### A panic while holding `PROCESS_TABLE` hangs the panicking CPU
 
@@ -463,6 +508,15 @@ thread never releases it. Pre-existing and unchanged by the panic-recovery fix; 
 `try_lock` could not have saved it either, since a spinlock's `try_lock` fails
 for its own holder too. The general shape — locks a dead thread can strand —
 belongs to the capability-handles/ownership work.
+
+**The VFS lock is the same shape and is now the one that bites first**, because
+it is what the reachable over-ceiling routes are holding when they die: a
+`read_dir` over 32,769 files panics inside `vfs::lock()`, and every later
+filesystem operation on the machine spins on it. Measured after `889d611` — the
+process was killed and the harness still got its end marker, because the test
+runner's report path does not touch the VFS. So the allocator half is closed
+and the general "locks a dead thread strands" class is not; the allocator was
+only the worst instance of it, because every context allocates.
 
 ### The on-screen console shows only what serial has *not* consumed
 
@@ -516,8 +570,8 @@ mechanism of last resort could hang the machine. And `main.rs`'s NVMe-absence
 panic, now covered by `Profile::Diskless` (`tests/common/qemu.rs:59`), which makes
 device **presence** a shape dimension alongside size and sector size.
 
-Still open from this entry: `crash_report`'s `try_lock`, and the recovered CPU
-wedging on the allocator lock.
+Still open from this entry: `crash_report`'s `try_lock`. The recovered CPU
+wedging on the allocator lock is closed at `889d611`.
 
 ### Nothing distinguishes `panic_console::capture` from a no-op
 
