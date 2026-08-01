@@ -35,6 +35,8 @@ const RUST_SKIP: &[&str] = &[
     // Needs a live compositor, which `tests/testcases` does not boot.
     // `metal_sim_window_caps` runs it on the config that does.
     "window_caps",
+    // Same reason, same config: `metal_sim_ipc_hostile_peer` runs it.
+    "ipc_hostile_peer",
     // Needs netd with a NIC. `netd_connection_caps` runs it on tests/netcase.
     "netd_caps",
 ];
@@ -84,6 +86,7 @@ const MACHINE_TESTS: &[&str] = &[
     "metal_sim_compositor",
     "metal_sim_input",
     "metal_sim_window_caps",
+    "metal_sim_ipc_hostile_peer",
     "netd_connection_caps",
     "foreign_disk_untouched",
     "boot_partition_identity",
@@ -3075,6 +3078,65 @@ fn run_machine_test(
                 ));
             }
             eprintln!("  [metal-sim] compositor cap {declared} windows, {granted} granted then refused");
+            Ok(())
+        }
+        "metal_sim_ipc_hostile_peer" => {
+            // A client that lies about its frame lengths, against the one
+            // config that boots a compositor an in-guest binary can talk to.
+            //
+            // The guest binary carries the assertions — it is the only side
+            // that can see whether the compositor closed the connection it
+            // ruled on — so the host's job is to boot it and to insist the
+            // count it reports is the whole case list. A guest that skipped
+            // cases would otherwise exit 0 having proved nothing.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            let bins: Vec<(String, Vec<u8>)> = rust_bins
+                .iter()
+                .filter(|(name, _)| name == "ipc_hostile_peer")
+                .cloned()
+                .collect();
+            if bins.is_empty() {
+                return Err("ipc_hostile_peer was not built".to_string());
+            }
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
+            let result = qemu.run_test("test_rs_ipc_hostile_peer", Duration::from_secs(120));
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            if result.exit_code != Some(0) {
+                return Err(format!(
+                    "ipc_hostile_peer exited {:?}:\n{}",
+                    result.exit_code, result.stdout
+                ));
+            }
+            let Some(refused) = result
+                .stdout
+                .split("hostile peer: ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return Err(format!(
+                    "ipc_hostile_peer printed no count:\n{}",
+                    result.stdout
+                ));
+            };
+            // The guest's own case list, restated here so a case deleted on
+            // one side is a red run rather than a quieter test.
+            const CASES: usize = 3;
+            if refused != CASES {
+                return Err(format!(
+                    "the compositor refused {refused} malformed frames, not {CASES}:\n{}",
+                    result.stdout
+                ));
+            }
+            eprintln!("  [metal-sim] {refused} malformed frames refused, compositor still serving");
             Ok(())
         }
         "netd_connection_caps" => {
