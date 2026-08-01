@@ -1891,6 +1891,134 @@ from hung. That is the natural first thing to try on the T14 in the M1→M2
 window. Reproducible under `--metal-sim` with QMP `device_add usb-kbd,bus=xhci.0`
 after boot.
 
+### The i8042's one diagnostic line cannot be read on the machine it is for
+
+The T14 booted from `target/bootable-diet.img` (sha256
+`9bda620d…e531aa`, the file still on disk and re-hashed) and reached the
+compositor with the integrated keyboard and the TrackPoint dead. The driver's
+entire contingency for that — `specs/metal-boot-plan.md` M2, the pre-flash
+gate's "what this gate does NOT cover" item 1, and `1bf5f61`'s commit message —
+is **"one loud line on the laptop's own screen instead of a bisect"**. That line
+is not readable, and this is the defect that made the first metal input attempt
+uninterpretable.
+
+`panic_console::boot_checkpoint` returns immediately once
+`SCREEN_OWNED_BY_USERLAND` is set (`panic_console/mod.rs:478`), and
+`device::try_claim(DEVICE_FRAMEBUFFER)` sets it (`device.rs:83`) as the
+compositor's third statement (`compositor/src/main.rs:719`). So the last
+kernel screenful ever painted is the one at `Boot: complete`, and the compositor
+overwrites it with the desktop a few tens of milliseconds later. Measured on
+`cargo test --test toyos-build -- metal_sim --nocapture`, the
+`metal_sim_compositor` boot: the three `i8042:` lines at 0.099–0.100 s,
+`Boot: complete (196ms)`, and the compositor's own first console line after the
+daemon-exit lines at 0.244 s. **The screen carrying the answer is up for well
+under a fifth of a second and there is no key that pauses it** — `page_forever`
+is reached only from `halt_all_cpus`, so a *successful* boot never pages.
+
+The content is there, which is the frustrating part: 26 kernel log lines
+separate the last `i8042:` line from `Boot: complete` in that run, against 67
+text rows on a 1920x1080 panel, and the longest line in the range is 158
+characters against 240 columns — so the line is on the final boot screen, just
+not for long enough to read or photograph by hand.
+
+Consequences, in the order they bite:
+
+- **Every one of the driver's seventeen refusal paths is silent in practice.**
+  `i8042::init` has sixteen `return`s that each log one line, plus a success
+  line whose tail reads `MASKED` when the unmask failed. On the flashed
+  configuration all of them look identical from the owner's chair: a desktop
+  with dead input.
+- **A keyboard-side refusal also costs the pointer.** Every `return` in the
+  keyboard block (`i8042/mod.rs:670-709` — `0xF5`, `0xF0 0x02`, the `0xF0 0x00`
+  read-back, the four wire-format arms, `0xF4`) happens *before* the aux block
+  at `:712`, so the TrackPoint is never initialised either. "Keyboard and
+  TrackPoint both dead" therefore discriminates nothing — it is the signature of
+  every failure mode, including the ones that are purely keyboard-side.
+- **The intended reading of a dead touchpad is destroyed.** The gate told the
+  owner a dead touchpad is expected (I2C-HID, unbuilt) and a keyboard refusal is
+  the driver working. Neither statement is checkable without the line.
+
+The fix is an output channel that survives userland taking the screen. The
+cheapest instrument that needs no code — usable on the stick that already
+exists, minus one rebuild — is to flash an image whose `system.toml` init list
+spawns nothing that claims `DEVICE_FRAMEBUFFER`: the `Boot: complete` screenful
+then stays up indefinitely and the answer is a photograph. `specs/metal-log-capture.md`
+is the durable version of the same problem and its Phase 2 fixed the *panic*
+half only.
+
+### The pre-flash gate certified everything except the milestone
+
+`specs/pre-flash-gate.md` §7 records **GO** at `b82fc4a` with a 182/182 guest
+suite. Its six sections are storage safety, image well-formedness, boot-time
+panics, the on-screen console, and two sections of "recent changes do not alter
+boot". **There is no input section**, and the seventeen-row verdict table has no
+input row. Input — the thing M2 exists for and the reason the stick was flashed
+— appears only as items 1 and 2 of "What this gate does NOT cover".
+
+That is the hole, and it is not "the gate ran the wrong test". The gate's own
+method is to ask a false-pass question per item, and it asks it well for the two
+items whose QEMU-versus-hardware divergence it noticed: §3.2 (TCG always reports
+FSGSBASE) and §3.3 (QEMU's `stride == width`), both explicitly recorded as
+read-verified because QEMU cannot exercise them. The i8042 has **more** such
+branches than either, every one of them silent (above), and no item asks about
+any of them.
+
+What was actually established, and what was not:
+
+- `metal_sim_input` is a real test and it passes: `cargo test --test toyos-build --
+  metal_sim` is 3/3 in 15.7 s, `metal_sim_input` in 9 s. Its guest program
+  (`tests/toyos-rust-tests/src/bin/input_events.rs`) prints only bytes it read
+  from the two device fds; the assertions are `typed.contains("hello")` and an
+  exact `(DX*scale_x, DY*scale_y)` delta with the scale read out of the kernel's
+  own boot line; and `metal_sim_argv_check` rules out the classic false pass
+  (QEMU routing injected input to a USB HID handler). It certifies i8042
+  → userland delivery on QEMU's i8042 and nothing about Lenovo's EC.
+- **Its teeth were never re-proved after the rewrite.** `0977c8c` records three
+  negative demonstrations (`i8042::init` returning immediately, the aux port
+  never enabled, the keyboard GSI never unmasked) — all of them against the
+  *pixel* version, which `efbeed7` deleted the same day and replaced with the
+  event-parsing version. `efbeed7`'s message proves teeth for
+  `screen_late_panic` and not for the new `metal_sim_input`. Nothing suggests it
+  is vacuous; it has simply never been shown red.
+- The flashed kernel is the tested kernel. `target/bootable-diet.img` contains
+  `i8042: kbd set2+xlat` and `i8042: absent (FADT rev ` and does **not** contain
+  `i8042: fault injection armed`, `i8042: drain bytes=`, `test-late-panic` or
+  `debug-wait`, so it is the plain default-feature kernel that `metal_sim_input`
+  boots (`BootOptions::default()` is `kernel_features: &[]`; `src/build.rs:405`
+  passes none for a non-debug `--build-only`). The root init string is present
+  exactly once and `test-runner` and `librustc_driver` not at all.
+- **Two shape dimensions the harness never varies.** Every `BootOptions` defaults
+  to `smp: 2` and no input test overrides it; the T14's own boot line reads
+  `MADT cpus=[0, 2, 4, 6, 1, 3, 5, 7]`. And all six tests that inject i8042
+  input drive a guest that busy-polls `read_nonblock`
+  (`i8042_keyboard.rs`, `input_events.rs`); none blocks in `sys_read` or in
+  `Poller::wait`, which is what the compositor — the flashed machine's only
+  consumer — actually does. The wake path itself is shared with the xHCI HID
+  path from `sched/driver.rs:drain_irqs` onward and is exercised by every
+  usb-kbd boot, so this is a coverage gap rather than a suspected defect.
+- The interrupt topology is the one hardware risk that can be **downgraded**
+  rather than assumed, from the T14's own first-boot photograph (`first-boot.jpg`,
+  `0e267bb`): `ioapic: id=2 at 0xfec00000 ver=0x20 gsi 0..119 masked 120/120` and
+  `ioapic: iso bus:irq->gsi [0:0->2 edge/high, 0:9->9 level/high]`. No override
+  covers IRQ 1 or IRQ 12, so `gsi_for_isa_irq` returns identity/edge/high exactly
+  as under QEMU; the unit covers both GSIs; and 120/120 masked read-backs prove
+  the MMIO window is a real redirection table. `route`'s destination check is
+  satisfied by the BSP's `LAPIC: x2APIC enabled (ID 0)`.
+
+### `i8042::init`'s stage budgets sum past the total budget they clamp to
+
+`budget = deadline(1500)` is taken once at entry (`i8042/mod.rs:596`) and every
+stage clamps to it: self-test 500 ms (`:631`), keyboard 750 ms (`:669`), aux
+device reset 600 ms (`:718`). 500 + 750 + 600 = 1850 ms. QEMU answers every step
+in microseconds, so the sum has never been approached — the whole probe runs
+0.099 → 0.100 s in a metal-sim boot. On an EC that spends a real fraction of any
+stage (a PS/2 device reset's BAT is the obvious one; the driver sends `0xFF` to
+the aux port), the budget expires and every subsequent `wait_writable` /
+`read_data` returns immediately. The last thing to run is the arming config
+write at `:791`, so the visible outcome is `i8042: DISABLED — cfg … did not
+take`, i.e. both devices lost to a *timeout* wearing a controller fault's
+clothes. Unmeasured in either direction: no real EC timing has ever been taken.
+
 - PCID + INVPCID codepaths untested on real hardware — QEMU TCG supports
   neither. Both are CPUID-gated, so TCG falls back to a CR3 reload. Needs KVM or
   bare metal.
