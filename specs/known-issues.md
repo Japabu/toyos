@@ -99,6 +99,57 @@ backings on unlink — reimplements refcounting badly at one call site while eve
 other cached reference keeps the same shape. Unassigned deliberately: it should
 be done with that spec, not before it.
 
+### A `SYS_PIPE_MAP` mapping outlives the page it names
+
+Read off the code while fixing the ring header, **not reproduced** — the
+reproduction is three syscalls and is written out below so the next agent stages
+it rather than believing this entry.
+
+`SYS_PIPE`, `SYS_PIPE_MAP` on either fd, then close both fds. The last
+`PipeReader`/`PipeWriter` drop takes the refcount to zero, `close_read` calls
+`free_pipe`, the `PhysPage` drops, and the PMM has the 2 MiB page back — while
+the caller's mapping of it is still live and still writable. Nothing on the
+fd-close path unmaps it and nothing records the mapping against the pipe:
+`sys_pipe_map` calls `process::vma_map` and returns the address
+(`arch/syscall.rs:918-940`). Whatever the PMM hands that page to next — another
+process's pipe, a kernel heap region, a DMA buffer — is then readable and
+writable by a process that owns nothing.
+
+Same class as the `FileBacking` entry above, and the same resolution:
+`specs/capability-handles-spec.md`'s refcounted objects, where a mapping is a
+reference that keeps its page alive. A local unmap-on-close reimplements
+refcounting at one call site while every other cached reference keeps the shape
+it has.
+
+Worth stating next to it, because it bounds how much this costs: the *whole*
+purpose of `SYS_PIPE_MAP` today is netd polling two bits of `flags`. Nothing else
+in the tree maps a pipe, and since the ring-header fix nothing reads the mapped
+page's cursors either. A writable 2 MiB kernel page is a large answer to that
+question.
+
+### The ring's closed flags are userland's to forge, and netd believes them
+
+The kernel no longer reads `RingHeader::flags`: its own `readers`/`writers`
+counts decided every one of the four sites that used to consult them, and the
+flag — unlike the count — is in the page `SYS_PIPE_MAP` maps writable.
+
+netd still reads them. `bridge_piped` treats `rx_ring.is_reader_closed()` as "the
+client died" and `tx_ring.is_writer_closed()` as "the client stopped writing, so
+close the socket"; `cleanup_dead_listeners` aborts a listener's socket on the
+same bit (`userland/netd/src/main.rs:943`, `:948`, `:982`). Anyone who can map
+one of those pipes can set the bit and make netd tear the connection down.
+
+Today that is the connection's own client, so it is self-harm — but the bound on
+*who* is `may_open_pipe`, which is a relationship check and not a capability, and
+whose own stated residual is that a peer entitled to one of a creator's pipes is
+entitled to all of them. netd's exposure is bounded by that residual, not by
+anything netd does.
+
+The general statement, since it is the same one the kernel just had to learn: a
+publication is not a channel. netd is reading a value its peer writes and
+treating it as a fact about its peer. The kernel's answer was to ask the side
+that knows; netd has no such side to ask, which is the actual design gap.
+
 ### Process isolation does not hold: what is still ungated
 
 `be604ef` (2026-07-28) closed the headline. `SYS_PIPE_OPEN` now requires that the
@@ -2583,10 +2634,11 @@ Two things the QEMU gates do *not* cover, both structural:
 
 ## 9. toyos-fat32
 
-The crate is new (`toyos-fat32/`, host tests: `cargo test` inside it) and no
-kernel adapter exists yet. Nothing below is a defect found later — these are
-the residuals its own gate identified while it was being written, recorded so
-the adapter's author does not have to rediscover them.
+The crate is new (`toyos-fat32/`, host tests: `cargo test` inside it). Its
+kernel adapter is `kernel/src/fat32_adapter.rs`; §10 carries what that found.
+Nothing below is a defect found later — these are the residuals its own gate
+identified while it was being written, recorded so the adapter's author did not
+have to rediscover them.
 
 ### A cyclic chain under a *file* is bounded, not detected
 
@@ -2794,3 +2846,122 @@ I/O failure to userland today, because the filesystem boundary above it
 swallows the error (previous entry), so the conversion has no call site to be
 written against. When `BlockIO` becomes fallible, that changes and
 `SyscallError::Io` is the thing to add.
+
+## 10. The boot partition as a filesystem, and the log on it
+
+`/boot` is `kernel/src/fat32_adapter.rs` over `toyos-fat32`, mounted from
+`gpt::boot_volume()`; `kernel/src/esp_log.rs` writes the kernel's log to
+`/boot/toyos/kernel.log`. Gated by `esp_filesystem` and `esp_log_file`
+(`tests/common/esp.rs`).
+
+### The boot image this project builds is not `fsck_msdos`-clean, and never was
+
+Found by pointing the new gate at the image *before* any guest ran. Twelve
+complaints, from `fatfs` 0.3.6 as `src/image.rs` drives it, and both causes
+are specification violations rather than style:
+
+- **A long-name entry ahead of each `.` and `..`.** Read straight off a diag
+  image: the first entry of `/EFI` is an `attr=0x0f` LFN whose name field is
+  `A.\0\0\0\xff…`, and the `.` short entry is second. FAT requires `.` and
+  `..` to be the first two entries of a subdirectory, which is why
+  `fsck_msdos` reports the parent's view of it — `Item /EFI does not appear to
+  be a subdirectory`.
+- **`..` carries the root's cluster number.** It is 2, and the specification
+  requires 0 when the parent is the root: `` `..' entry in /toyos has non-zero
+  start cluster ``.
+
+OVMF boots it, `toyos-fat32` reads it, macOS mounts it. What is unknown is
+whether a real UEFI implementation is as tolerant, and the machine that would
+answer that is the one being flashed. The fix is in `fatfs`, so it needs a
+fork; nothing in this repo can fix it locally.
+
+Consequence for the gate: `esp_filesystem` and `esp_log_file` compare the
+complaint *set* before and after the boot and require the guest to add none,
+rather than requiring silence. That is honest but weaker in one specific way:
+if the guest ever produced one of those twelve for its own reason, the gate
+would not see it.
+
+### Nothing stops userland damaging the stick the machine boots from
+
+`/boot` has no permission model of any kind — the mount is in the VFS and every
+process can write it. Proved rather than reasoned: a guest test binary running
+`fs::write("/boot/toyos/kernel.elf", "TEETH")` truncated the kernel image to
+five bytes, which the host-side check caught (that run was a deliberate
+breakage to prove the check has teeth, and it does; the property it revealed is
+this one). The same applies to `BOOTx64.EFI`. Same class as `SYS_OPEN_DEVICE`
+being first-come: the capability work in `specs/capability-handles-spec.md` is
+where a "the kernel's own volume is not userland's to write" rule would live.
+
+### The mount is not certain, and one failure is unexplained
+
+Across the boots recorded while this was built, `esp: no boot volume` appeared
+on a handful. Two instances are explained and closed: `gpt: device 16 has no
+partition table we can use: EntryArrayCrc { … }`, which is a *read* off the
+stick coming back wrong, from the window where `BlockDevice::read_blocks`
+returned `()` and `DeviceSectors::read_lba` served the previous block's bytes
+under the new block's tag — closed at `3c5a7b8` and `kernel/src/gpt.rs`'s cache
+now drops the tag with the read. One instance after that fix is unexplained,
+because the failing run was not captured with serial output. `esp_lines` now
+includes `gpt:` and `usb-storage:` lines in the failure message, so the next
+one will say which it is.
+
+### `/boot` exists only on a machine that boots from USB
+
+`mount_boot` resolves the `DeviceId` in `BootVolume` through
+`usb_storage::open`, and there is no second arm. A machine that boots from an
+internal disk has its NVMe taken by `page_cache::init` at storage time, and
+there is no second handle to it — so `gpt::boot_volume()` would answer and the
+mount would still refuse. Closing it means either a shared block-device handle
+or moving the page cache off sole ownership; neither is a two-line change, and
+the machine this project targets boots from a stick.
+
+### An `EspBacking` outlives the file it names, exactly as `/home`'s does
+
+`FileSystem::delete` on this mount drops the *write* handle unconditionally, so
+a `write_page` through an fd held across an unlink returns `"file not open"`
+rather than putting one process's bytes into another's clusters — which is more
+than the bcachefs adapters do. The read side is unchanged and shares §1's live
+cross-process leak: an `Arc<EspBacking>` already handed to the file cache still
+names byte ranges the allocator is free to reissue.
+
+### The bound is one generation, and after a rotation the newest bytes are in
+### the older-looking file
+
+`kernel.log` rotates to `kernel.log.1` at 1 MiB and the previous `.1` is
+deleted. A rotation can be the last thing a boot does, which leaves
+`kernel.log` empty and the tail in `kernel.log.1` — so anything reading the log
+has to read both. `esp_log_file` asserts the shutdown's last line is in one of
+them rather than in `kernel.log`, for that reason.
+
+### The panic path does not write the log, deliberately
+
+Not a gap to close later: `esp_log`'s module documentation states the argument.
+A panic-time flush needs the sink lock, the VFS lock, the file cache lock, the
+heap, the ESP device lock and the xHCI lock, and a panicking thread may hold any
+of them — so it would deadlock in precisely the cases the log exists for. And
+the deadlock is the better outcome, because a FAT write interrupted between
+allocating a cluster and recording it leaves the volume that holds `BOOTx64.EFI`
+and `kernel.elf` in a state that may not boot. The panic path keeps the
+on-screen console, which takes no lock at all. What the file has after a panic
+is everything up to the last idle pass.
+
+### A stranded VFS lock costs up to 1000 idle passes of spin
+
+`log_ring::file_has_pending` is in the idle loop's awake condition, so a CPU
+with nothing to run will not sleep while the sink is owed bytes. `esp_log::poll`
+takes the VFS lock with `try_lock` and gives up after `MAX_BLOCKED_POLLS`
+(1000), which turns the sink off and clears the condition. Between a thread
+dying with the VFS lock held and that bound expiring, an idle CPU spins. It is
+bounded and self-clearing, which is what the scheduler spec's argument for the
+other two terms requires, but it is not free.
+
+### What the adapter does *not* re-check about the partition table
+
+`toyos-gpt`'s own residuals (a `last_usable_lba` that may cover the backup GPT,
+and two entries in one table sharing a unique GUID resolving first-wins) are in
+`specs/type-safety-audit/storage-stack.md` and are the parser's to fix. The
+adapter deliberately does not duplicate them: it cannot know whether an extent
+is *right*, only whether it is being respected, and two copies of a rule that
+can disagree is worse than one. What it does enforce is that no I/O leaves the
+extent it was given — and, tighter, that none leaves the FAT volume inside it,
+since `Fat32::probe` reads the sector count before anything can write.
