@@ -52,6 +52,12 @@ pub struct Outcome {
     /// Worst spread past the *derived* bound, even where the recorded sample
     /// allowed the run to pass. Zero means the run met the standard.
     pub fair_over_bound: u64,
+    /// Invariant I13's measurement, in the same three roles: the widest service
+    /// spread between threads of one share, the bound in force when it was
+    /// seen, and any crossing of the derived bound the allowance let pass.
+    pub thread_spread: u64,
+    pub thread_bound: u64,
+    pub thread_over_bound: u64,
 }
 
 impl Outcome {
@@ -62,7 +68,8 @@ impl Outcome {
     pub fn report(&self) -> String {
         if self.passed() {
             return format!(
-                "{}: ok ({} steps, {} ns, {} switches, {} kicks, I5 spread {}/{} ns)",
+                "{}: ok ({} steps, {} ns, {} switches, {} kicks, I5 spread {}/{} ns, \
+                 I13 spread {}/{} ns)",
                 self.scenario,
                 self.steps,
                 self.elapsed,
@@ -70,6 +77,8 @@ impl Outcome {
                 self.kicks,
                 self.fair_spread,
                 self.fair_bound,
+                self.thread_spread,
+                self.thread_bound,
             );
         }
         format!(
@@ -179,6 +188,9 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         fair_spread: vm.fair_spread,
         fair_bound: vm.fair_bound,
         fair_over_bound: vm.fair_over_bound,
+        thread_spread: vm.thread_spread,
+        thread_bound: vm.thread_bound,
+        thread_over_bound: vm.thread_over_bound,
     }
 }
 

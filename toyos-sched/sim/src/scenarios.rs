@@ -5,6 +5,7 @@
 //! workload, and a scenario that takes ten thousand steps to quiesce buys one
 //! schedule per second instead of a thousand.
 
+use toyos_sched::queue::FairOrder;
 use toyos_sched::task::WaitClass;
 
 use crate::workload::{
@@ -36,8 +37,10 @@ fn scenario(
         park: ParkShape::ReleaseLend,
         share: ShareShape::PerProcess,
         charge: ChargeShape::Honest,
+        order: FairOrder::InsertSequence,
         pass_cost_ns: 0,
         fair_allowance_ns: 0,
+        thread_allowance_ns: 0,
         max_steps: 20_000,
         max_tasks: 32,
     }
@@ -640,25 +643,83 @@ fn fair_allowance(cpus: usize) -> u64 {
 ///   first third of it — and a bound that carries a quantum per thread needs a
 ///   window many quanta wide before a broken split can clear it.
 pub fn fairness_storm(cpus: usize) -> Scenario {
-    /// One `trio` thread's work: six quanta. `solo`'s threads run three times
-    /// this, which is what equalizes the two processes' totals.
-    const WORK: u64 = 60 * MS;
-    let hog = |ns| Script::new(vec![Op::Run(ns)]);
-    let mut scenario = scenario(
+    let mut scenario = fair_workload(
         if cpus == 1 {
             "fairness_storm"
         } else {
             "fairness_storm_smp"
         },
         cpus,
+        WORK,
+    );
+    scenario.fair_allowance_ns = fair_allowance(cpus);
+    scenario
+}
+
+/// One `trio` thread's work in [`fairness_storm`]: six quanta. `solo`'s threads
+/// run three times this, which is what equalizes the two processes' totals.
+const WORK: u64 = 60 * MS;
+
+/// The shape both fairness workloads share, with the per-thread work as the one
+/// parameter — see [`fairness_storm`] for why every other part of it is what it
+/// is, and [`sibling_storm`] for why one of the two needs longer threads.
+///
+/// **The recorded per-thread sample.** What the shipped scheduler's worst
+/// invariant-I13 service spread over one contention window actually *is*, per
+/// machine width, against the 60 ms the bound derives from the fair band's own
+/// granularity (five dispatches of one run queue: four rivals plus the leader,
+/// at `QUANTUM + 2 × RUN_CHUNK` each). Every number came from
+///
+/// ```text
+/// cargo run --release -p toyos-sched-sim -- measure fairness_storm:<cpus> <seeds>
+/// ```
+///
+/// on `be4b34a` with this change applied, on one host, with no other
+/// measurement running:
+///
+/// | cpus | seeds | worst I13 spread | worst I5 spread, same runs |
+/// |---|---|---|---|
+/// | 1  | 10 000 | 10 ms |   30 ms |
+/// | 2  | 10 000 | 30 ms |  102 ms |
+/// | 3  |    500 | 28 ms |  125 ms |
+/// | 4  |    500 | 28 ms |  198 ms |
+/// | 6  |    500 | 31 ms |  324 ms |
+/// | 8  |    500 | 32 ms |  418 ms |
+/// | 12 |    200 | 35 ms |  634 ms |
+/// | 16 |    200 | 37 ms |  612 ms |
+/// | 24 |    200 | 42 ms | 1046 ms |
+/// | 32 |    200 | 50 ms | 1386 ms |
+///
+/// `sibling_storm` itself, at 300 seeds: 10 ms.
+///
+/// Two things the table says out loud. **No width crosses the derived bound**,
+/// so no width has a `thread_allowance_ns` — an allowance is a licence to sit
+/// above the standard and nothing here needs one. Handing out the sample plus a
+/// quarter regardless, the way [`fair_allowance`] does, would put the 32-CPU
+/// ceiling at 62 ms against a derived 60: the allowance quietly becoming the
+/// standard, which is the exact failure the two-tier shape exists to prevent.
+/// If a width ever does cross, its allowance goes on the scenario and
+/// `Outcome::thread_over_bound` reports the gap on every run regardless.
+///
+/// And **the per-thread split does not degrade as the machine widens** — 10 ms
+/// at one CPU against 50 ms at 32, against I5's 30 ms against 1386 ms over the
+/// identical runs. The width degradation filed as a known issue is a
+/// *per-process* phenomenon; inside a share the ordering holds flat, which is
+/// what the insertion-time keys of one monotone pot are worth. The slow climb
+/// is worth watching: at 32 CPUs the spread is 83% of the bound, and no width
+/// above 32 has been measured.
+fn fair_workload(name: &'static str, cpus: usize, work: u64) -> Scenario {
+    let hog = |ns| Script::new(vec![Op::Run(ns)]);
+    let mut scenario = scenario(
+        name,
+        cpus,
         // No wait queues: a queue nobody blocks on would only be scaffolding.
         Vec::new(),
         vec![
-            process("solo", vec![0; cpus], vec![hog(3 * WORK)]),
-            process("trio", vec![0; 3 * cpus], vec![hog(WORK)]),
+            process("solo", vec![0; cpus], vec![hog(3 * work)]),
+            process("trio", vec![0; 3 * cpus], vec![hog(work)]),
         ],
     );
-    scenario.fair_allowance_ns = fair_allowance(cpus);
     scenario.max_tasks = 4 * cpus;
     // Quadratic in the machine, measured: 440 steps at one CPU, 980 at two,
     // 71k at 32 and 265k at 64. The *work* is linear in `cpus` (360 run chunks
@@ -666,7 +727,71 @@ pub fn fairness_storm(cpus: usize) -> Scenario {
     // is a per-CPU cost paid against every other CPU. A safety net sized on the
     // linear term alone reports non-termination on a run that was progressing
     // fine, which is what the first version of this line did at 64 and 128.
-    scenario.max_steps = 20_000 + 100 * cpus * cpus;
+    scenario.max_steps = 20_000 + (work / WORK) as usize * 20_000 + 100 * cpus * cpus;
+    scenario
+}
+
+/// Invariant I13's workload: [`fairness_storm`] at one CPU with threads five
+/// times as long.
+///
+/// The length is the whole difference, and it is derived rather than picked.
+/// I5's bound grows with the machine's thread count, so `fairness_storm`'s
+/// six-quantum threads are already many times it; I13's bound is a *per-CPU*
+/// constant — 60 ms, five dispatches of one run queue's fair band — and six
+/// quanta of work per thread means a completely starved sibling separates from
+/// a completely served one by 60 ms and then exits. That is the bound exactly,
+/// and a gate that can only reach its own threshold is not a gate. Five times
+/// the work makes total starvation a 300 ms separation, so the two negative
+/// gates below are caught on the way to the failure rather than at it.
+///
+/// One CPU, because the property is a property of one run queue: the fair band
+/// orders the threads that are in *it*, and a second CPU adds placement, which
+/// I13's window deliberately declines to measure across.
+pub fn sibling_storm() -> Scenario {
+    fair_workload("sibling_storm", 1, 5 * WORK)
+}
+
+/// Negative gate for invariant I13, first of two: the fair band's tie-break
+/// switched from the monotonic insertion sequence to `TaskKey` — the identity
+/// tie-break `queue.rs` warns against in the comment beside the field.
+///
+/// **It passes, and that is the finding.** The warning is written as though the
+/// tie-break were what round-robins a share's threads; it is not. A share's pot
+/// is charged for every nanosecond any of its threads runs, so a thread
+/// re-inserted after a dispatch carries a key strictly above every sibling
+/// queued before it and the ordering is already insertion order *without* the
+/// tie-break doing anything. Exact ties survive only where no charge separates
+/// two inserts — a `wake_all` of siblings, or the spawn burst — and one
+/// dispatch dissolves them. Measured, not argued: 300 seeds of
+/// [`sibling_storm`] under this ordering are clean, and the same 300 under
+/// [`fair_identity_within_share`] fail on I13 every time.
+///
+/// It is kept for the reason `old_commit_fused` is kept: it is the control that
+/// turns "the obvious break is invisible here" from a claim into a measurement,
+/// and it is what says the second gate below had to be written the way it is.
+pub fn fair_identity_tiebreak() -> Scenario {
+    let mut scenario = sibling_storm().with_order(FairOrder::IdentityTiebreak);
+    scenario.name = "fair_identity_tiebreak";
+    scenario
+}
+
+/// Negative gate for invariant I13, second of two, and the one with teeth: the
+/// `queue.rs` warning made total. Whichever share leads the fair band, its
+/// *lowest-keyed* ready thread is dispatched — so the same thread wins every
+/// time, not merely every tie.
+///
+/// It **must fail**, and it must fail on I13 *alone*. That second half is the
+/// point of the whole check: the share's pot advances at exactly the rate it
+/// did before, because it is charged for the time the process ran and not for
+/// which of its threads ran it. `solo` and `trio` split the machine as evenly as
+/// ever and invariant I5 — which measures service per *process* — sees a
+/// perfectly fair scheduler while two of `trio`'s three threads never run at
+/// all. This is the hole I13 was built for, and the redesign it has to guard
+/// (an ordered map of shares, each holding a FIFO of its ready threads) puts
+/// precisely this code path at the centre of the scheduler.
+pub fn fair_identity_within_share() -> Scenario {
+    let mut scenario = sibling_storm().with_order(FairOrder::IdentityWithinShare);
+    scenario.name = "fair_identity_within_share";
     scenario
 }
 
@@ -741,6 +866,7 @@ pub fn all() -> Vec<Scenario> {
         fork_storm(),
         fairness_storm(1),
         fairness_storm(2),
+        sibling_storm(),
         old_park_kept_the_lend(),
     ]
 }
@@ -756,6 +882,8 @@ pub fn by_name(name: &str) -> Option<Scenario> {
         "old_steal_port" => Some(old_steal_port()),
         "fair_share_per_thread" => Some(fair_share_per_thread()),
         "fair_double_charge" => Some(fair_double_charge()),
+        "fair_identity_tiebreak" => Some(fair_identity_tiebreak()),
+        "fair_identity_within_share" => Some(fair_identity_within_share()),
         "overlong_pass" => Some(overlong_pass()),
         "old_park_kept_the_lend" => Some(old_park_kept_the_lend()),
         "old_commit_before_pass" => Some(old_commit_before_pass()),

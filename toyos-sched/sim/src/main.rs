@@ -48,8 +48,10 @@ fn main() -> ExitCode {
             println!("old_preemptible_window  (negative gate: must abort)");
             println!("fair_share_per_thread   (negative gate: must fail)");
             println!("fair_double_charge      (negative gate: must fail)");
+            println!("fair_identity_within_share (negative gate: must fail)");
             println!("overlong_pass           (negative gate: must abort)");
             println!("old_commit_fused        (control: passes, and that is the point)");
+            println!("fair_identity_tiebreak  (control: passes, and that is the point)");
             ExitCode::SUCCESS
         }
         "run" | "pct" => {
@@ -109,6 +111,7 @@ fn main() -> ExitCode {
                     scenarios::old_commit_before_pass(),
                     scenarios::fair_share_per_thread(),
                     scenarios::fair_double_charge(),
+                    scenarios::fair_identity_within_share(),
                 ] {
                     let name = negative.name;
                     let result = sweep::seed_sweep(&negative, budget.min(500), 1);
@@ -150,20 +153,34 @@ fn main() -> ExitCode {
                     }
                     clean &= caught.is_some();
                 }
-                // And the control: the same shape with the block's two halves
-                // fused into one step must come back *clean*, because that is
-                // the blind spot this harness used to have.
-                let control = sweep::seed_sweep(&scenarios::old_commit_fused(), budget.min(500), 1);
-                println!(
-                    "old_commit_fused: {} runs, {}",
-                    control.runs,
-                    if control.passed() {
-                        "clean (the control: no step boundary, no bug in sight)"
-                    } else {
-                        "FAILED — the control no longer controls for anything"
-                    },
-                );
-                clean &= control.passed();
+                // And the controls, both of which must come back *clean*: the
+                // same blocking shape with the two halves fused into one step,
+                // which is the blind spot this harness used to have, and the
+                // identity *tie-break*, which is the break `queue.rs` warns
+                // about and which the shipped pot makes a no-op.
+                for (control, why) in [
+                    (
+                        scenarios::old_commit_fused(),
+                        "clean (the control: no step boundary, no bug in sight)",
+                    ),
+                    (
+                        scenarios::fair_identity_tiebreak(),
+                        "clean (the control: the pot already orders siblings)",
+                    ),
+                ] {
+                    let name = control.name;
+                    let result = sweep::seed_sweep(&control, budget.min(500), 1);
+                    println!(
+                        "{name}: {} runs, {}",
+                        result.runs,
+                        if result.passed() {
+                            why
+                        } else {
+                            "FAILED — the control no longer controls for anything"
+                        },
+                    );
+                    clean &= result.passed();
+                }
             }
             ok(clean)
         }

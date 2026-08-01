@@ -11,6 +11,7 @@
 //! `Futex`. Giving it a second opcode would be modelling a second wake path
 //! — the very thing §8.2 removes.
 
+use toyos_sched::queue::FairOrder;
 use toyos_sched::task::WaitClass;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -217,6 +218,12 @@ pub struct Scenario {
     pub park: ParkShape,
     pub share: ShareShape,
     pub charge: ChargeShape,
+    /// How the fair band picks between two ready threads of one share. A
+    /// scenario dimension for the same reason [`ShareShape`] is, and the type is
+    /// the core's own rather than a parallel copy of it: the broken orderings
+    /// live in `queue.rs` behind `protocol-port`, so the kernel cannot reach
+    /// them and the simulator drives the real code either way.
+    pub order: FairOrder,
     /// What one scheduler pass is modelled to cost. Zero everywhere but
     /// `scenarios::overlong_pass`; see [`crate::hw_impl::SimHwState`].
     pub pass_cost_ns: u64,
@@ -226,6 +233,11 @@ pub struct Scenario {
     /// allowance is a statement that a measurement was taken, and a scenario
     /// nobody has measured has no allowance to offer.
     pub fair_allowance_ns: u64,
+    /// Invariant I13's recorded ceiling, in the same role and with the same
+    /// default as `fair_allowance_ns`: zero unless somebody has measured this
+    /// scenario and found the shipped scheduler past the derived per-thread
+    /// bound.
+    pub thread_allowance_ns: u64,
     /// Safety net: a run that has not quiesced by here is reported as a
     /// non-termination failure rather than looping forever.
     pub max_steps: usize,
@@ -285,6 +297,11 @@ impl Scenario {
 
     pub fn with_charge(mut self, charge: ChargeShape) -> Self {
         self.charge = charge;
+        self
+    }
+
+    pub fn with_order(mut self, order: FairOrder) -> Self {
+        self.order = order;
         self
     }
 

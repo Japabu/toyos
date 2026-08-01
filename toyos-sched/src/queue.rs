@@ -11,6 +11,32 @@ use alloc::collections::{BTreeMap, VecDeque};
 
 use crate::task::{ReadyTask, SchedPayload, TaskKey};
 
+/// How the fair band decides between two ready threads of the *same* share —
+/// spec §9.2's tie-break, and what simulator invariant I13 exists to hold.
+///
+/// The two broken orderings are reproduced for the simulator's negative gates
+/// (spec §10.3) behind a feature the kernel does not enable, exactly as
+/// [`crate::cpu::CpuSched::set_park_keeps_lapsed_lend`] is. A check that cannot
+/// tell these apart from the shipped one is not measuring the rule it names.
+#[cfg(feature = "protocol-port")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FairOrder {
+    /// Spec §9.2 and the shipped code: `(vruntime, monotonic insertion
+    /// sequence)`.
+    #[default]
+    InsertSequence,
+    /// `(vruntime, TaskKey)` — the identity tie-break the field comment below
+    /// warns against, ported as literally as it is written.
+    IdentityTiebreak,
+    /// That warning made total. Whichever share leads the band, its
+    /// *lowest-keyed* ready thread is the one dispatched, whatever vruntime each
+    /// of them was inserted with — so the same thread wins every time and not
+    /// merely every tie. The share's pot advances at the same rate either way,
+    /// so the process keeps its half of the machine and invariant I5 sees
+    /// nothing at all.
+    IdentityWithinShare,
+}
+
 pub struct RunQueue<X: SchedPayload> {
     rt: VecDeque<ReadyTask<X>>,
     /// Ordered by `(vruntime, insertion sequence)`.
@@ -22,6 +48,9 @@ pub struct RunQueue<X: SchedPayload> {
     /// so they round-robin without gaining cross-process share.
     fair: BTreeMap<(u64, u64), ReadyTask<X>>,
     insert_seq: u64,
+    /// Negative-gate escape hatch only; see [`FairOrder`].
+    #[cfg(feature = "protocol-port")]
+    order: FairOrder,
 }
 
 impl<X: SchedPayload> RunQueue<X> {
@@ -30,7 +59,14 @@ impl<X: SchedPayload> RunQueue<X> {
             rt: VecDeque::new(),
             fair: BTreeMap::new(),
             insert_seq: 0,
+            #[cfg(feature = "protocol-port")]
+            order: FairOrder::InsertSequence,
         }
+    }
+
+    #[cfg(feature = "protocol-port")]
+    pub fn set_order(&mut self, order: FairOrder) {
+        self.order = order;
     }
 
     /// `vruntime` orders the fair band and is ignored for RT tasks, which
@@ -40,7 +76,14 @@ impl<X: SchedPayload> RunQueue<X> {
             self.rt.push_back(task);
         } else {
             self.insert_seq += 1;
-            let previous = self.fair.insert((vruntime, self.insert_seq), task);
+            #[cfg(not(feature = "protocol-port"))]
+            let tie = self.insert_seq;
+            #[cfg(feature = "protocol-port")]
+            let tie = match self.order {
+                FairOrder::IdentityTiebreak => task.key().0,
+                FairOrder::InsertSequence | FairOrder::IdentityWithinShare => self.insert_seq,
+            };
+            let previous = self.fair.insert((vruntime, tie), task);
             assert!(
                 previous.is_none(),
                 "two ready tasks with one (vruntime, sequence)",
@@ -53,9 +96,32 @@ impl<X: SchedPayload> RunQueue<X> {
         if let Some(task) = self.rt.pop_front() {
             return Some((0, task));
         }
+        #[cfg(feature = "protocol-port")]
+        if self.order == FairOrder::IdentityWithinShare {
+            return self.pop_lowest_key_of_leading_share();
+        }
         let key = *self.fair.keys().next()?;
         let task = self.fair.remove(&key).expect("key came from the map");
         Some((key.0, task))
+    }
+
+    /// [`FairOrder::IdentityWithinShare`]: find the share that leads the band,
+    /// then serve its lowest-keyed ready thread rather than its earliest-keyed
+    /// one. Which share runs next is unchanged, so the per-process split is
+    /// untouched; which *thread* of it runs never varies.
+    #[cfg(feature = "protocol-port")]
+    fn pop_lowest_key_of_leading_share(&mut self) -> Option<(u64, ReadyTask<X>)> {
+        let leader = *self.fair.keys().next()?;
+        let share = self.fair[&leader].share().clone();
+        let chosen = *self
+            .fair
+            .iter()
+            .filter(|(_, task)| crate::sync::Arc::ptr_eq(task.share(), &share))
+            .min_by_key(|(_, task)| task.key().0)
+            .expect("the leader is its own share's member")
+            .0;
+        let task = self.fair.remove(&chosen).expect("key came from the map");
+        Some((chosen.0, task))
     }
 
     /// The task a [`crate::msg::Msg::StealRequest`] is answered with: the

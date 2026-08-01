@@ -295,6 +295,13 @@ impl<X: SchedPayload> CpuSched<X> {
     pub fn set_park_keeps_lapsed_lend(&mut self, keep: bool) {
         self.park_keeps_lapsed_lend = keep;
     }
+
+    /// Order the fair band by something other than spec §9.2's insertion
+    /// sequence. Invariant I13 must catch what that does to a share's threads;
+    /// `scenarios::sibling_storm`'s two gates are what prove it does.
+    pub fn set_fair_order(&mut self, order: crate::queue::FairOrder) {
+        self.rq.set_order(order);
+    }
 }
 
 /// The environment a pass runs against. One value, threaded by reference, so

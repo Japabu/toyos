@@ -243,6 +243,11 @@ pub struct Vm<'q> {
     /// summed at the same clock advances `busy_ns` is, so the two are exact
     /// against each other.
     pub service_ns: Vec<u64>,
+    /// Invariant I13's measurement: the same nanoseconds, attributed to the
+    /// *thread* that consumed them. A share is one pot for every thread of a
+    /// process, so `service_ns` cannot tell a share that round-robins its
+    /// threads from one that runs a single thread and starves the rest.
+    pub thread_service: BTreeMap<TaskKey, u64>,
     /// The contention window I5 measures service over; see
     /// [`crate::invariants`].
     pub fair_epoch: FairEpoch,
@@ -255,6 +260,13 @@ pub struct Vm<'q> {
     /// recorded allowance let the run pass. This is the gap between the standard
     /// and the shipped scheduler, surfaced by the instrument on every run.
     pub fair_over_bound: u64,
+    /// Invariant I13's three numbers, in the same three roles as I5's above:
+    /// the widest service spread seen *between threads of one share*, the bound
+    /// in force when it was seen, and the worst crossing of the derived bound
+    /// whatever the recorded allowance permitted.
+    pub thread_spread: u64,
+    pub thread_bound: u64,
+    pub thread_over_bound: u64,
 }
 
 /// One contention window: a maximal interval over which the same set of
@@ -275,6 +287,23 @@ pub struct FairEpoch {
     /// separation it helped create.
     pub threads: u32,
     pub lag_spread: u64,
+    /// Invariant I13's members: every thread that was runnable when *its*
+    /// window opened, with its `thread_service` at that instant. Entries are
+    /// only ever removed — a thread that stops being runnable is owed nothing
+    /// further and never rejoins — so a thread blocking or exiting narrows the
+    /// comparison instead of restarting it.
+    ///
+    /// I13's window is a sub-interval of this one, re-baselined whenever the
+    /// members' threads stop being spread evenly across the CPUs; see
+    /// [`crate::invariants`].
+    pub thread_base: BTreeMap<TaskKey, u64>,
+    /// The widest count of members' runnable threads that *one CPU* held inside
+    /// I13's window — how many dispatches a waiting thread can be passed over
+    /// by before its own key comes up, and the only term of I13's bound. Well
+    /// defined only because that window requires every CPU to carry the same
+    /// number of each member's threads, which is the same reason it is a
+    /// per-CPU count where I5's `threads` is a machine-wide one.
+    pub thread_rivals: u32,
 }
 
 impl<'q> Vm<'q> {
@@ -288,6 +317,7 @@ impl<'q> Vm<'q> {
             handles.push(CpuHandle::new(CpuId(i as u32), tx));
             let mut cpu = CpuSched::new(CpuId(i as u32), rx, SimCtx::default());
             cpu.set_park_keeps_lapsed_lend(scenario.park == ParkShape::KeepLapsedLend);
+            cpu.set_fair_order(scenario.order);
             cpus.push(cpu);
         }
         hw.set_pass_cost(scenario.pass_cost_ns);
@@ -336,10 +366,14 @@ impl<'q> Vm<'q> {
             rt_pending_since: vec![None; n],
             boosted_run: BTreeMap::new(),
             service_ns: vec![0; process_count],
+            thread_service: BTreeMap::new(),
             fair_epoch: FairEpoch::default(),
             fair_spread: 0,
             fair_bound: 0,
             fair_over_bound: 0,
+            thread_spread: 0,
+            thread_bound: 0,
+            thread_over_bound: 0,
             next_irq,
             next_key: 1,
             next_spawn_cpu: 0,
@@ -643,6 +677,7 @@ impl<'q> Vm<'q> {
                     .expect("a running task's share is runnable");
             }
             self.service_ns[process] += delta;
+            *self.thread_service.entry(key).or_default() += delta;
             let entry = self.boosted_run.entry(key).or_insert((rt.lends, 0));
             if entry.0 != rt.lends {
                 *entry = (rt.lends, 0);

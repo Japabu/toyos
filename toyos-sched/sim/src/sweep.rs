@@ -24,6 +24,12 @@ pub struct SweepResult {
     /// the standard-versus-shipped gap, not a test failure — the run passed on
     /// the recorded allowance.
     pub worst_over_bound: u64,
+    /// Invariant I13's three, in the same three roles: the worst service spread
+    /// between threads of one share, the bound in force when it happened, and
+    /// any crossing of the derived per-thread bound the allowance let pass.
+    pub worst_thread_spread: u64,
+    pub worst_thread_bound: u64,
+    pub worst_thread_over_bound: u64,
 }
 
 impl SweepResult {
@@ -39,25 +45,27 @@ impl SweepResult {
             self.worst_fair_bound = outcome.fair_bound;
         }
         self.worst_over_bound = self.worst_over_bound.max(outcome.fair_over_bound);
+        if outcome.thread_spread > self.worst_thread_spread {
+            self.worst_thread_spread = outcome.thread_spread;
+            self.worst_thread_bound = outcome.thread_bound;
+        }
+        self.worst_thread_over_bound = self.worst_thread_over_bound.max(outcome.thread_over_bound);
     }
 
     pub fn report(&self) -> String {
         if self.passed() {
             format!(
-                "{}: {} runs, {} steps, clean (I5 worst spread {}/{} ns{})",
+                "{}: {} runs, {} steps, clean (I5 worst spread {}/{} ns{}, \
+                 I13 worst spread {}/{} ns{})",
                 self.scenario,
                 self.runs,
                 self.steps,
                 self.worst_fair_spread,
                 self.worst_fair_bound,
-                if self.worst_over_bound == 0 {
-                    String::new()
-                } else {
-                    format!(
-                        ", {} ns PAST THE DERIVED BOUND on the recorded allowance",
-                        self.worst_over_bound,
-                    )
-                },
+                past_the_bound(self.worst_over_bound),
+                self.worst_thread_spread,
+                self.worst_thread_bound,
+                past_the_bound(self.worst_thread_over_bound),
             )
         } else {
             format!(
@@ -77,6 +85,15 @@ impl SweepResult {
     }
 }
 
+/// The standard-versus-shipped gap, in the one place both fairness invariants
+/// report it, so neither can render it differently from the other.
+fn past_the_bound(over: u64) -> String {
+    if over == 0 {
+        return String::new();
+    }
+    format!(", {over} ns PAST THE DERIVED BOUND on the recorded allowance")
+}
+
 /// `seeds` seeded runs, alternating the uniform driver with PCT so both
 /// exploration strategies contribute to the same budget.
 pub fn seed_sweep(scenario: &Scenario, seeds: u64, keep_failures: usize) -> SweepResult {
@@ -88,6 +105,9 @@ pub fn seed_sweep(scenario: &Scenario, seeds: u64, keep_failures: usize) -> Swee
         worst_fair_spread: 0,
         worst_fair_bound: 0,
         worst_over_bound: 0,
+        worst_thread_spread: 0,
+        worst_thread_bound: 0,
+        worst_thread_over_bound: 0,
     };
     for seed in 0..seeds {
         let mut choices = if seed % 2 == 0 {
@@ -141,6 +161,9 @@ pub fn fuzz_sweep(scenario: &Scenario, budget: u64, keep_failures: usize) -> Swe
         worst_fair_spread: 0,
         worst_fair_bound: 0,
         worst_over_bound: 0,
+        worst_thread_spread: 0,
+        worst_thread_bound: 0,
+        worst_thread_over_bound: 0,
     };
     let mut generator = 0x9E3779B97F4A7C15u64;
     while result.steps < budget {

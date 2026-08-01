@@ -670,3 +670,162 @@ fn old_park_keeping_the_lend_is_caught() {
         );
     }
 }
+
+/// Invariant I13 is *alive*, which is a separate claim from I13 being green —
+/// and, unlike I5, it is a claim nothing else in this file would notice was
+/// false. I5 measures service per *process*, so it reports a perfectly even
+/// split while one thread of a share never runs; if I13's windows never opened,
+/// every fairness verdict in this tree would still read clean and sibling
+/// starvation would be unguarded.
+///
+/// So the spread is required to be non-zero on all three widths of the fairness
+/// workload — some window has to have opened, stayed open, and been measured —
+/// and to be within a factor of four of its own bound somewhere, or the bound
+/// has stopped constraining anything. All three meet the *derived* bound today
+/// (the recorded sample on `scenarios::fair_workload`), so
+/// `worst_thread_over_bound` must be zero, and that is asserted: if the recorded allowance ever starts carrying these, the
+/// suite says so rather than passing quietly on it.
+#[test]
+fn invariant_i13_is_measured_and_holds() {
+    let mut tightest = u64::MAX;
+    for scenario in [
+        scenarios::fairness_storm(1),
+        scenarios::fairness_storm(2),
+        scenarios::sibling_storm(),
+    ] {
+        let name = scenario.name;
+        let result = sweep::seed_sweep(&scenario, FAIR_SEEDS, 3);
+        assert!(result.passed(), "{}", result.report());
+        assert!(
+            result.worst_thread_spread > 0,
+            "{name}: invariant I13 never opened a contention window it could \
+             measure, so its clean verdict on every other scenario is a verdict \
+             about nothing: {}",
+            result.report(),
+        );
+        assert_eq!(
+            result.worst_thread_over_bound, 0,
+            "{name}: the shipped scheduler has started crossing the *derived* \
+             per-thread bound and is passing on the recorded allowance alone. \
+             That is a regression against the standard even though the gate is \
+             green — see the recorded sample on scenarios::fair_workload: {}",
+            result.report(),
+        );
+        tightest = tightest.min(result.worst_thread_bound / result.worst_thread_spread.max(1));
+    }
+    assert!(
+        tightest <= 4,
+        "every fairness width sat more than 4x under the per-thread bound \
+         (closest was {tightest}x); the bound has stopped constraining anything",
+    );
+}
+
+/// The eighth self-validation gate, and the one I5 is structurally incapable of
+/// standing in for: within a share, the *lowest-keyed* ready thread is
+/// dispatched every time instead of the earliest-inserted one.
+///
+/// It **must fail**, and it must fail on I13 and nothing else. That second half
+/// is the whole point. A share's pot is charged for the time the *process* ran,
+/// not for which of its threads ran it, so this ordering leaves the per-process
+/// split exactly as it was: `solo` and `trio` still take half the machine each,
+/// I5 still reports an even split, I6's refcounts are still right — and two of
+/// `trio`'s three threads never run at all. If I5 ever starts firing here as
+/// well, this has stopped being a test of the thing I13 was built for.
+#[test]
+fn identity_ordering_within_a_share_is_caught() {
+    let broken = scenarios::fair_identity_within_share();
+    let mut caught = 0;
+    let mut starved = 0;
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    for seed in 0..FAIR_SEEDS {
+        let mut choices = ChoiceStream::from_seed(seed);
+        let outcome = run(broken.clone(), &mut choices);
+        if outcome.passed() {
+            continue;
+        }
+        caught += 1;
+        // A starved sibling, not merely an uneven one: the report has to show a
+        // thread of the share on zero nanoseconds of service.
+        if outcome.violations.iter().any(|v| v.contains("=0")) {
+            starved += 1;
+        }
+        for violation in &outcome.violations {
+            let id = violation.split(':').next().unwrap_or("?").to_string();
+            *kinds.entry(id).or_default() += 1;
+        }
+    }
+    assert_eq!(
+        caught, FAIR_SEEDS as usize,
+        "a share serving one of its three threads and starving the other two \
+         went undetected in {}/{FAIR_SEEDS} schedules",
+        FAIR_SEEDS as usize - caught,
+    );
+    assert_eq!(
+        starved, caught,
+        "the gate fired without a sibling on zero service; it is catching \
+         something other than starvation",
+    );
+    assert_eq!(
+        kinds.len(),
+        1,
+        "sibling starvation must be caught by I13 and by I13 alone — I5 sees an \
+         even per-process split here, which is exactly why I13 exists: {kinds:?}",
+    );
+    assert!(
+        kinds.contains_key("I13"),
+        "expected the per-thread service violation; got {kinds:?}",
+    );
+
+    // The control: the identical workload under the shipped ordering, or the
+    // gate is detecting the workload rather than the ordering.
+    let shipped = sweep::seed_sweep(&scenarios::sibling_storm(), FAIR_SEEDS, 1);
+    assert!(shipped.passed(), "{}", shipped.report());
+}
+
+/// The control that makes `identity_ordering_within_a_share_is_caught` a
+/// measurement rather than a guess about which break was needed — and a finding
+/// in its own right.
+///
+/// `queue.rs` says the fair band's tie-break must not be `TaskKey` because "the
+/// same thread wins every tie and the others only run when it blocks". Ported
+/// exactly as written, that ordering is **invisible**: a share's pot is charged
+/// for every nanosecond any of its threads runs, so a thread re-inserted after
+/// a dispatch already carries a key strictly above every sibling queued before
+/// it. The ordering is insertion order whatever the tie-break is; exact ties
+/// survive only where no charge separates two inserts, and one dispatch
+/// dissolves them.
+///
+/// So this asserts two things: that the tie-break really is a different
+/// scheduler — some seed must produce a different run, or the mode is a no-op
+/// and proves nothing — and that I13 nonetheless comes back clean on every one.
+#[test]
+fn an_identity_tiebreak_changes_the_schedule_and_not_the_sibling_split() {
+    let shipped = scenarios::sibling_storm();
+    let broken = scenarios::fair_identity_tiebreak();
+    let mut diverged = 0;
+    for seed in 0..FAIR_SEEDS {
+        let mut choices = ChoiceStream::from_seed(seed);
+        let with = run(broken.clone(), &mut choices);
+        assert!(
+            with.passed(),
+            "the identity tie-break is expected to be invisible to I13; if it \
+             now fails, the control has stopped controlling and the second gate \
+             may no longer be the one that was needed: {}",
+            with.report(),
+        );
+        let mut choices = ChoiceStream::from_seed(seed);
+        let without = run(shipped.clone(), &mut choices);
+        assert!(without.passed(), "{}", without.report());
+        if (with.steps, with.switches, with.fair_spread)
+            != (without.steps, without.switches, without.fair_spread)
+        {
+            diverged += 1;
+        }
+    }
+    assert!(
+        diverged > 0,
+        "the identity tie-break produced an identical run on all {FAIR_SEEDS} \
+         seeds, so `FairOrder::IdentityTiebreak` is not reaching the queue at \
+         all and its clean verdict says nothing",
+    );
+}
