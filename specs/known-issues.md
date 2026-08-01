@@ -284,6 +284,11 @@ is the cost of leaving a closed entry standing.
 
 ### CLOSED — a short allocation was read as a complete one, and the write landed on another file
 
+`677efae` — which is an ACPI commit. Another agent's bare `git commit` swept
+these `bcachefs/` hunks out of the index between the `add` and the `commit` that
+were meant to carry them, so the message on that commit describes none of this.
+Fixed forward, per CLAUDE.md; the code is intact.
+
 `fs.rs`'s `resolve_or_alloc_block` asked the allocator for `needed` blocks and
 returned `start + needed - 1`, while `alloc_contiguous` was documented and
 implemented to return *up to* that many. On a volume with no free run longer
@@ -308,7 +313,7 @@ callers looped; the one that did not was the one on the kernel's write path.
 
 ### CLOSED — the `bcachefs` parse path treated the disk as trusted
 
-Four defects, one edit, because they were one defect: nothing decided what a
+`677efae`, same sweep as above. Four defects, one edit, because they were one defect: nothing decided what a
 node *was* until each descent site decided for itself.
 
 - **Six sites decoded a child pointer as `value[..8]` with no length check.** A
