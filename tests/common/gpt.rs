@@ -102,6 +102,27 @@ pub fn boot_partition_identity(
         ));
     }
 
+    // And then the arm nothing else reaches. The stick this guest booted from
+    // is on the bus and carries the same partition — it is the real one, and
+    // the crafted NVMe entry above is a clone of it. Two devices claiming one
+    // unique partition GUID is the state `Resolution::Ambiguous` exists for,
+    // and the only safe answer is that this machine has no boot volume at all.
+    // Nothing tested that until `fat32_adapter::probe_boot_disks` started
+    // asking the USB bus as well.
+    if !log.contains("carries the same partition GUID as device 1") {
+        return Err(format!(
+            "a second device carrying the boot partition GUID did not make the answer \
+             ambiguous.\n{}",
+            gpt_lines(&log)
+        ));
+    }
+    if !log.contains("this machine now has no boot volume") {
+        return Err(format!(
+            "the kernel kept a boot volume two devices were claiming.\n{}",
+            gpt_lines(&log)
+        ));
+    }
+
     // A GPT disk is not a ToyOS volume and carries no designation stamp, so
     // the interlock that keeps the kernel off other people's disks has to
     // still refuse it — a boot partition on a disk is not consent to format
@@ -140,9 +161,19 @@ pub fn boot_partition_identity(
             gpt_lines(&log)
         ));
     }
-    if log.contains("carries the boot partition") {
+    if log.contains("gpt: device 1 carries the boot partition") {
         return Err(format!(
             "the kernel claimed a boot volume it had just refused:\n{}",
+            gpt_lines(&log)
+        ));
+    }
+    // The stick is still the stick. Refusing the decoy must not cost the real
+    // partition, which is on the USB bus and where firmware said it was — and
+    // with the decoy refused there is no second claimant, so this boot *does*
+    // have a boot volume where the agreeing one above does not.
+    if !log.contains("gpt: device 16 carries the boot partition") {
+        return Err(format!(
+            "refusing the shifted decoy cost the boot partition on the stick.\n{}",
             gpt_lines(&log)
         ));
     }
@@ -153,7 +184,10 @@ pub fn boot_partition_identity(
     let _ = std::fs::remove_file(&boot_image);
     let _ = std::fs::remove_file(&agreeing);
     let _ = std::fs::remove_file(&disagreeing);
-    eprintln!("  [gpt] matched behind an ESP-typed decoy, and refused an eight-block shift");
+    eprintln!(
+        "  [gpt] matched behind an ESP-typed decoy, went ambiguous when a second device claimed \
+         it, and refused an eight-block shift"
+    );
     Ok(())
 }
 
