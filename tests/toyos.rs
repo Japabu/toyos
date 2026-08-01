@@ -98,6 +98,8 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_many_devices",
     "xhci_second_controller",
     "xhci_two_controllers",
+    "xhci_msi_only",
+    "xhci_no_interrupt",
     "nvme_large_device",
     "nvme_wide_sector",
     "readdir_bound",
@@ -2101,6 +2103,254 @@ fn run_machine_test(
                 "  [xhci] 2 controllers, 4 HID; both pointers on slot {}, merging as sources {} \
                  and {}",
                 pointers[0].0, pointers[0].1, pointers[1].1
+            );
+            Ok(())
+        }
+        "xhci_msi_only" => {
+            // The T14's Thunderbolt controller printed `xHCI: no MSI-X
+            // capability, using polled mode` on a real boot. There was no
+            // polled mode: every read of an event ring in this driver is
+            // `poll_if_pending`, gated on an `irq_ring` record that only
+            // vector 0x21's ISR publishes, and that ISR is delivered only
+            // through the MSI-X table the driver had just declined to program.
+            // The controller was reset, started, and never read again — with
+            // `USB keyboard ready on slot N` printed above it.
+            //
+            // Every controller in this suite had MSI-X, so this branch had
+            // never executed. `msix=off` is the actuator.
+            let options = BootOptions {
+                profile: qemu::Profile::MetalXhciMsi,
+                qmp: true,
+                // As in `xhci_second_controller`: with a PS/2 keyboard on the
+                // machine, QEMU could deliver the injected keystroke over it
+                // and every assertion below would pass with the USB path dead.
+                i8042: false,
+                ..Default::default()
+            };
+            let argv = qemu::profile_argv(&options);
+            // The actuator is a device property, and argv is the only place a
+            // device property is visible: a controller that quietly kept its
+            // MSI-X table would make this whole test a re-run of the happy
+            // path under a different name.
+            let controllers = xhci_argv(&argv);
+            let [storage, hid] = controllers[..] else {
+                return Err(format!("this profile is two controllers; argv has {controllers:?}"));
+            };
+            if !hid.contains("msix=off") {
+                return Err(format!("{hid} still has its MSI-X table"));
+            }
+            if hid.contains("msi=off") {
+                return Err(format!(
+                    "{hid} has no MSI either, so there is nothing to fall through to and the \
+                     driver is expected to refuse it — that is xhci_no_interrupt"
+                ));
+            }
+            // And the boot stick's controller has nothing at all, so the guest
+            // does no USB storage I/O. Without this the test cannot fail:
+            // `wait_transfer` drains the entire event ring and dispatches
+            // every HID report in it, so the ESP log's idle-loop writes
+            // deliver a keyboard's reports with no interrupt anywhere. That is
+            // measured, not feared — the first shape of this profile passed
+            // with MSI deliberately left disabled.
+            for want in ["msix=off", "msi=off"] {
+                if !storage.contains(want) {
+                    return Err(format!(
+                        "{storage} carries the boot stick and still has {want}'s mechanism, so \
+                         storage I/O would drain the HID controller's ring for free"
+                    ));
+                }
+            }
+            let usb = usb_argv(&argv);
+            for want in ["usb-kbd", "usb-mouse"] {
+                if !usb.iter().any(|d| d.starts_with(want) && d.contains("bus=xhci1.0")) {
+                    return Err(format!("no {want} on the MSI-only controller: {usb:?}"));
+                }
+            }
+            if !argv.iter().any(|a| a.contains("i8042=off")) {
+                return Err("the i8042 is on; a PS/2 keyboard could deliver instead".to_string());
+            }
+
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let boot = serial::Serial::boot(&qemu);
+
+            // What the driver programmed, off its own line. Both halves are
+            // needed: MSI-X absent says the actuator did something, MSI
+            // present says the driver found the other mechanism rather than
+            // refusing the controller.
+            boot.must_not_say("xHCI: MSI-X enabled")?;
+            boot.must_say("xHCI: MSI enabled (vector 0x21)")?;
+            // The line that named a mechanism this driver does not have.
+            boot.must_not_say("polled mode")?;
+            boot.must_be_clean()?;
+            for want in ["keyboard", "mouse"] {
+                let binds = parse_xhci_binds(boot.text());
+                if binds.iter().filter(|b| b.kind == want).count() != 1 {
+                    return Err(format!("{want} not bound exactly once: {binds:?}\n{}",
+                        boot.text()));
+                }
+            }
+            // The guest's half of the isolation above: no disk was bound, so
+            // nothing in this boot can drain an event ring except an interrupt.
+            boot.must_not_say("usb-storage: disk")?;
+
+            // And then the half no log line can show, which is the whole
+            // point: a driver that logs `MSI enabled` and programs the
+            // capability wrong is indistinguishable from this one until a
+            // device actually interrupts. Ground truth is the host's own
+            // injection at the device boundary.
+            let Some((scale_x, scale_y)) = parse_rel_scale(boot.text()) else {
+                return Err(format!("the kernel never said what pointer scale it used:\n{}",
+                    boot.text()));
+            };
+            const DX: i32 = 40;
+            const DY: i32 = -30;
+            let result = qemu.run_test_hooked(
+                "test_rs_input_events",
+                Duration::from_secs(30),
+                "===INPUT_READY===",
+                |socket| {
+                    let mut input = qemu::QmpInput::open(socket);
+                    // Off the origin first: the accumulated position clamps at
+                    // 0, so a move up or left from there is invisible.
+                    input.mouse(100, 100, None);
+                    thread::sleep(Duration::from_millis(100));
+                    input.mouse(DX, DY, None);
+                    thread::sleep(Duration::from_millis(100));
+                    input.mouse(0, 0, Some(("left", true)));
+                    thread::sleep(Duration::from_millis(50));
+                    input.mouse(0, 0, Some(("left", false)));
+                    thread::sleep(Duration::from_millis(100));
+                    for key in ["h", "e", "l", "l", "o"] {
+                        input.keys(&[(key, true), (key, false)]);
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+
+            let keys = parse_key_events(&result.stdout);
+            let typed: String = keys
+                .iter()
+                .filter(|e| e.modifiers & 0x10 == 0)
+                .map(|e| e.translated.as_str())
+                .collect();
+            if !typed.contains("hello") {
+                return Err(format!(
+                    "typed {typed:?}, want it to contain \"hello\" — the keyboard on an \
+                     MSI-only controller never reached userland:\n{}",
+                    result.stdout
+                ));
+            }
+
+            let pointer = parse_mouse_events(&result.stdout);
+            let want = (DX * scale_x, DY * scale_y);
+            let deltas: Vec<(i32, i32)> = pointer
+                .windows(2)
+                .map(|w| (w[1].x as i32 - w[0].x as i32, w[1].y as i32 - w[0].y as i32))
+                .collect();
+            if !deltas.contains(&want) {
+                return Err(format!(
+                    "no pointer event moved by {want:?}; deltas seen: {deltas:?}\n{}",
+                    result.stdout
+                ));
+            }
+            let Some(down) = pointer.iter().position(|e| e.buttons == 0x01) else {
+                return Err(format!("no left-button-down event; buttons seen: {:?}",
+                    pointer.iter().map(|e| e.buttons).collect::<std::collections::BTreeSet<_>>()));
+            };
+            if !pointer[down + 1..].iter().any(|e| e.buttons == 0x00) {
+                return Err(format!("the left button went down and never came up: {pointer:?}"));
+            }
+            eprintln!(
+                "  [xhci] no MSI-X table; MSI took vector 0x21, {} key events (typed {typed:?}), \
+                 {} pointer events, delta {want:?} delivered",
+                keys.len(),
+                pointer.len()
+            );
+            Ok(())
+        }
+        "xhci_no_interrupt" => {
+            // The terminal case of the same defect: a controller offering
+            // neither mechanism. Nothing on a PCIe bus is really built that
+            // way, which is exactly why the branch needs staging — "I cannot
+            // drive this controller" is a state the driver has to be able to
+            // reach and say, and it used to say "using polled mode" instead
+            // and then enumerate a keyboard on it.
+            //
+            // Two controllers, and the crippled one is the second: the first
+            // carries the boot stick, so a refusal that took the machine down
+            // with it would show up here as a boot that never reaches userland.
+            let options = BootOptions {
+                profile: qemu::Profile::MetalXhciNoIrq,
+                ..Default::default()
+            };
+            let argv = qemu::profile_argv(&options);
+            let controllers = xhci_argv(&argv);
+            let [good, crippled] = controllers[..] else {
+                return Err(format!("this profile is two controllers; argv has {controllers:?}"));
+            };
+            for want in ["msix=off", "msi=off"] {
+                if !crippled.contains(want) {
+                    return Err(format!("{crippled} still has {want}'s mechanism"));
+                }
+            }
+            if good.contains("msi") {
+                return Err(format!(
+                    "{good} is crippled too; then a refusal could not be shown to be per \
+                     controller and the machine would have no boot stick"
+                ));
+            }
+            let usb = usb_argv(&argv);
+            // The HID is on the controller that will be refused — otherwise
+            // "nothing claimed a device" below is true because there was no
+            // device to claim, which is not the same statement at all.
+            if let Some(bad) = usb
+                .iter()
+                .filter(|d| !d.starts_with("usb-storage"))
+                .find(|d| !d.contains("bus=xhci1.0"))
+            {
+                return Err(format!("{bad} is not on the controller under test"));
+            }
+            if !usb.iter().any(|d| d.starts_with("usb-kbd") && d.contains("bus=xhci1.0")) {
+                return Err(format!("no keyboard for the driver to refuse: {usb:?}"));
+            }
+            if !usb.iter().any(|d| d.starts_with("usb-storage") && d.contains("bus=xhci.0")) {
+                return Err(format!("the boot stick is not on the good controller: {usb:?}"));
+            }
+
+            let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let boot = serial::Serial::boot(&qemu);
+
+            // Both controllers were looked at, one was refused by name, and
+            // the refusal says what it means rather than naming a mode.
+            if boot.text().matches("xHCI: found at PCI ").count() != 2 {
+                return Err(format!("both controllers should be reached:\n{}", boot.text()));
+            }
+            boot.must_say("xHCI: NOT INITIALISED at PCI")?;
+            boot.must_not_say("polled mode")?;
+
+            // And nothing claimed a device on it. This is the assertion the
+            // old code failed: it bound the keyboard, printed
+            // `USB keyboard ready on slot 2`, and delivered nothing.
+            let binds = parse_xhci_binds(boot.text());
+            if !binds.is_empty() {
+                return Err(format!(
+                    "a device was announced on a controller nothing can read: {binds:?}\n{}",
+                    boot.text()
+                ));
+            }
+            boot.must_say("xHCI: 1 controller(s), 0 HID device(s)")?;
+            // The good controller is untouched by its neighbour's refusal,
+            // and the machine reached userland — `boot_log` ends at the ready
+            // marker, so having one at all is that assertion.
+            boot.must_say("usb-storage: disk 0 ready")?;
+            boot.must_be_clean()?;
+            eprintln!(
+                "  [xhci] 2 controllers, the second with neither MSI-X nor MSI: refused by \
+                 name, 0 HID announced, boot stick on the first still bound"
             );
             Ok(())
         }

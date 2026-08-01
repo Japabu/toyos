@@ -51,8 +51,6 @@ const IR0_ERSTSZ: u64 = 0x28;
 const IR0_ERSTBA: u64 = 0x30; // 64-bit
 const IR0_ERDP:   u64 = 0x38; // 64-bit
 
-// MSI-X PCI capability ID
-const PCI_CAP_MSIX: u8 = 0x11;
 // xHCI interrupt vector
 const XHCI_VECTOR: u8 = 0x21;
 
@@ -569,13 +567,13 @@ impl XhciController {
 /// driver that kept one controller reported that the T14 had no USB input.
 static XHCI: Lock<Vec<XhciController>> = Lock::new(Vec::new());
 
-/// Process xHCI events only if this CPU has an unserviced MSI-X record.
+/// Process xHCI events only if this CPU has an unserviced interrupt record.
 /// Records live on the CPU that took the interrupt (which its ISR forces
 /// into the scheduler via need_resched), so on every other CPU this is one
 /// uncontended atomic op on its own cache line — callers need no cpu gate.
 ///
-/// Every controller is polled, because every controller's MSI-X entry carries
-/// the same vector and `irq_ring` keeps one record per source: the record says
+/// Every controller is polled, because every controller's message carries the
+/// same vector and `irq_ring` keeps one record per source: the record says
 /// that *an* xHC interrupted, never which. Polling a quiet controller costs one
 /// read of its event ring's next TRB.
 ///
@@ -640,35 +638,22 @@ pub fn storage_flush(index: usize) -> bool {
     with_disk(index, |ctrl, local| ctrl.msc_flush(local)).unwrap_or(false)
 }
 
-fn setup_msix(pci_dev: &PciDevice) {
-    let cap = pci_dev.capabilities().find(|c| c.id() == PCI_CAP_MSIX);
-    let cap = match cap {
-        Some(c) => c,
-        None => {
-            log!("xHCI: no MSI-X capability, using polled mode");
-            return;
-        }
-    };
-
-    let table_info = cap.read_u32(4);
-    let table_bir = (table_info & 0x7) as u8;
-    let table_offset = (table_info & !0x7) as u64;
-    let table_bar = pci_dev.read_bar_64(table_bir);
-    let table_addr = table_bar + table_offset;
-
-    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000);
-
-    // Configure entry 0: route to LAPIC with vector XHCI_VECTOR
-    table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base
-    table.write_u32(0x04, 0);            // msg_addr_hi
-    table.write_u32(0x08, XHCI_VECTOR as u32); // msg_data: vector
-    table.write_u32(0x0C, 0);            // vector control: unmask
-
-    // Enable MSI-X in capability (bit 15), clear function mask (bit 14)
-    let msg_ctrl = cap.read_u16(2);
-    cap.write_u16(2, (msg_ctrl | (1 << 15)) & !(1 << 14));
-
-    log!("xHCI: MSI-X enabled (vector {:#x})", XHCI_VECTOR);
+/// Point this controller's interrupts at [`XHCI_VECTOR`] and name the
+/// mechanism that took them, or `None` when the function offers neither.
+///
+/// `None` has to be a refusal and not a degradation, and that is the whole
+/// shape of this function. Every read of an event ring in this driver is
+/// `poll_if_pending`, which runs only behind an `irq_ring` record that
+/// nothing but vector 0x21's ISR publishes — so a controller whose messages
+/// cannot reach a CPU is one whose ring is never read again. This used to log
+/// "no MSI-X capability, using polled mode" and carry on: there is no polled
+/// mode, and every device on such a controller enumerated, logged itself
+/// ready, and delivered nothing for the life of the boot.
+fn arm_interrupt(pci_dev: &PciDevice) -> Option<&'static str> {
+    if pci_dev.enable_msix(XHCI_VECTOR) {
+        return Some("MSI-X");
+    }
+    pci_dev.enable_msi(XHCI_VECTOR).then_some("MSI")
 }
 
 /// Bring up every xHCI controller on the machine.
@@ -681,7 +666,9 @@ fn setup_msix(pci_dev: &PciDevice) {
 pub fn init(devices: &[PciDevice]) {
     let mut controllers = Vec::new();
     let mut disks = 0;
+    let mut present = 0;
     for pci_dev in devices.iter().filter(|d| d.matches_class(0x0C, 0x03, Some(0x30))) {
+        present += 1;
         if let Some(ctrl) = init_one(pci_dev, disks) {
             disks += ctrl.storage.len();
             controllers.push(ctrl);
@@ -689,7 +676,14 @@ pub fn init(devices: &[PciDevice]) {
     }
 
     if controllers.is_empty() {
-        log!("xHCI: no controller on this machine, USB input unavailable");
+        // A machine with no xHC and a machine whose xHCs this driver refused
+        // are different machines, and the second used to print the first's
+        // line. The per-controller refusal above says why; this says that
+        // nothing was left.
+        match present {
+            0 => log!("xHCI: no controller on this machine, USB input unavailable"),
+            n => log!("xHCI: {n} controller(s) present, none of them usable, USB unavailable"),
+        }
         return;
     }
     let hid: usize = controllers.iter().map(|c| c.devices.len()).sum();
@@ -705,9 +699,23 @@ fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
     pci_dev.enable_bus_master();
     log!("xHCI: BAR0={:#x}", bar_addr);
 
-    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x10000);
+    // Ahead of the reset and ahead of the port scan, because a controller
+    // whose interrupts cannot be delivered must not reach either: the reset
+    // is what makes it ours, and the port scan is what prints
+    // `USB keyboard ready`. Refusing here leaves the controller exactly as
+    // firmware left it, with nothing enumerated on it to claim otherwise.
+    let Some(irq) = arm_interrupt(pci_dev) else {
+        log!(
+            "xHCI: NOT INITIALISED at PCI {:02x}:{:02x}.{} — the controller offers neither \
+             MSI-X nor MSI, and this driver has no other way to be told it has anything to \
+             say. No USB device on it can be used.",
+            pci_dev.bus, pci_dev.dev, pci_dev.func
+        );
+        return None;
+    };
+    log!("xHCI: {irq} enabled (vector {XHCI_VECTOR:#x})");
 
-    setup_msix(pci_dev);
+    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x10000);
 
     let cap_length = bar.read_u8(CAP_CAPLENGTH) as u64;
     let hcsparams1 = bar.read_u32(CAP_HCSPARAMS1);
@@ -837,9 +845,9 @@ fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
     device::scan_ports(&mut ctrl, &op_base, max_ports);
 
     // A controller with no HID on it is still a controller, and returning it
-    // is not a formality: it has been reset, started and armed with MSI-X, so
-    // dropping it here leaves a live interrupter with nothing draining its
-    // event ring. It is also the ordinary state of the target laptop, whose
+    // is not a formality: it has been reset, started and armed, so dropping it
+    // here leaves a live interrupter with nothing draining its event ring. It
+    // is also the ordinary state of the target laptop, whose
     // keyboard is PS/2 and whose touchpad is I2C-HID — under metal-sim this
     // `None` reached `kernel_main`'s `.expect` and panicked the boot.
     if ctrl.devices.is_empty() {

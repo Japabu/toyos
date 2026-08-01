@@ -121,6 +121,28 @@ pub enum Profile {
     /// device lists here are shaped so both pointers land on the same slot id
     /// of their own controller.
     MetalXhciBoth,
+    /// The HID controller has no MSI-X, and nothing else can drain its ring.
+    ///
+    /// The T14's Thunderbolt xHCI has no MSI-X capability — the laptop's own
+    /// boot log says so — and every controller in this suite had one, so the
+    /// branch that handles its absence had never executed. It logged "using
+    /// polled mode" and returned, and there is no polled mode: the driver
+    /// reads an event ring only when vector 0x21 has fired. This profile is
+    /// the machine where the driver has to fall through to MSI and where an
+    /// injected keystroke is the only thing that can prove it did — which
+    /// takes a machine with no USB storage on it at all, for the reason the
+    /// shape below states.
+    MetalXhciMsi,
+    /// Two controllers, the second with neither MSI-X nor MSI.
+    ///
+    /// A function offering neither is not a machine that ships — QEMU is the
+    /// only place it can be built — but "this driver cannot drive this
+    /// controller" is a state the code has to be able to reach and say, and
+    /// nothing else can stage it. The first controller is ordinary and carries
+    /// the boot stick, so the refusal is visibly *per controller*: the machine
+    /// boots, and the HID on the crippled one is refused by name rather than
+    /// enumerated and left mute.
+    MetalXhciNoIrq,
 }
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -148,6 +170,16 @@ const XHCI_WIDE: &str = "nec-usb-xhci,id=xhci,p2=8";
 /// by class, subclass and prog_if, which is why taking the first PCI match
 /// looked right for as long as it did.
 const XHCI_SECOND: &str = "nec-usb-xhci,id=xhci1";
+/// A controller with no MSI-X table, which leaves `msi=auto` to give it MSI —
+/// the shape of the T14's Thunderbolt xHCI and of Intel PCH parts generally.
+const XHCI_MSI_ONLY: &str = "nec-usb-xhci,id=xhci1,msix=off";
+/// A controller with no message-signalled interrupts at all, in each of the
+/// two bus positions a profile puts one in. Nothing on a PCIe bus is really
+/// built this way; it is how the harness reaches the branch where the driver
+/// has to refuse a controller instead of driving it blind — and, in the first
+/// position, how it takes USB storage off a machine entirely.
+const XHCI_NO_IRQ_FIRST: &str = "nec-usb-xhci,id=xhci,msix=off,msi=off";
+const XHCI_NO_IRQ_SECOND: &str = "nec-usb-xhci,id=xhci1,msix=off,msi=off";
 
 /// Everything a profile decides about the machine, in one table. A new
 /// variant answers every question here or does not compile — which `self !=
@@ -410,6 +442,42 @@ impl Profile {
                     "usb-kbd,bus=xhci1.0",
                     "usb-mouse,bus=xhci1.0",
                 ],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
+            },
+            // The boot stick's controller is the one with no interrupt
+            // mechanism at all, so the driver refuses it and the machine does
+            // no USB storage I/O whatsoever. That is the load-bearing part of
+            // this shape, not decoration: `wait_transfer` drains the *whole*
+            // event ring and dispatches every HID report in it, so a keyboard
+            // sharing a controller with the boot stick delivers on the back of
+            // the ESP log's idle-loop writes whether or not its interrupt
+            // works. Measured — the first version of this profile put both on
+            // one controller and passed with MSI deliberately left disabled.
+            Self::MetalXhciMsi => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: &[XHCI_NO_IRQ_FIRST, XHCI_MSI_ONLY],
+                storage_bus: "xhci.0",
+                usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
+            },
+            // Boot stick on the good controller, HID on the crippled one. A
+            // keyboard is what makes the absence assertion mean something:
+            // the driver has a device it would otherwise bind and announce.
+            Self::MetalXhciNoIrq => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: &[XHCI_DEFAULT, XHCI_NO_IRQ_SECOND],
+                storage_bus: "xhci.0",
+                usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,

@@ -16,6 +16,25 @@ const CAPABILITIES_PTR: u64 = 0x34;
 const MULTI_FUNCTION: u8 = 0x80;
 const INVALID_VENDOR: u16 = 0xFFFF;
 
+const CAP_MSI: u8 = 0x05;
+const CAP_MSIX: u8 = 0x11;
+
+const MSI_ENABLE: u16 = 1 << 0;
+const MSI_MULTI_MSG_ENABLE: u16 = 0x7 << 4;
+const MSI_ADDR_64: u16 = 1 << 7;
+const MSI_PER_VECTOR_MASK: u16 = 1 << 8;
+
+const MSIX_FUNCTION_MASK: u16 = 1 << 14;
+const MSIX_ENABLE: u16 = 1 << 15;
+
+/// The address a message-signalled interrupt is DMA'd to, in either form:
+/// the LAPIC window, physical destination 0, fixed delivery, edge. Every
+/// device in this kernel already targets it, so every device interrupt lands
+/// on the boot CPU and is spread from there by `irq_ring` plus the scheduler
+/// rather than by the interrupt controller. Written once because MSI and
+/// MSI-X differ in where the address is configured and not in what it is.
+const MSG_ADDR: u32 = 0xFEE0_0000;
+
 pub struct Capability<'a> {
     device: &'a PciDevice,
     offset: u64,
@@ -40,6 +59,10 @@ impl Capability<'_> {
 
     pub fn write_u16(&self, field: u64, val: u16) {
         self.device.write_config_u16(self.offset + field, val)
+    }
+
+    pub fn write_u32(&self, field: u64, val: u32) {
+        self.device.write_config_u32(self.offset + field, val)
     }
 }
 
@@ -97,10 +120,78 @@ impl PciDevice {
         self.mmio.write_u16(offset, val)
     }
 
+    pub fn write_config_u32(&self, offset: u64, val: u32) {
+        self.mmio.write_u32(offset, val)
+    }
+
     /// Enable memory space access and bus mastering in PCI command register.
     pub fn enable_bus_master(&self) {
         let cmd = self.mmio.read_u16(COMMAND);
         self.mmio.write_u16(COMMAND, cmd | 0x06);
+    }
+
+    /// Point this function's MSI-X table entry 0 at `vector` and enable it.
+    ///
+    /// `false` is "this function has no MSI-X capability" and nothing else —
+    /// what to do about that is the driver's decision, because for a virtio
+    /// device the answer is a panic and for an xHC it is [`Self::enable_msi`].
+    pub fn enable_msix(&self, vector: u8) -> bool {
+        let Some(cap) = self.capabilities().find(|c| c.id() == CAP_MSIX) else {
+            return false;
+        };
+
+        let table_info = cap.read_u32(4);
+        let table_bir = (table_info & 0x7) as u8;
+        let table_offset = (table_info & !0x7) as u64;
+        let table_addr = self.read_bar_64(table_bir) + table_offset;
+        let table = crate::mm::paging::kernel()
+            .lock()
+            .as_mut()
+            .unwrap()
+            .map_mmio(table_addr, 0x1000);
+
+        table.write_u32(0x00, MSG_ADDR);
+        table.write_u32(0x04, 0);
+        table.write_u32(0x08, vector as u32);
+        table.write_u32(0x0C, 0); // vector control: unmask
+
+        let ctrl = cap.read_u16(2);
+        cap.write_u16(2, (ctrl | MSIX_ENABLE) & !MSIX_FUNCTION_MASK);
+        true
+    }
+
+    /// Point this function's single MSI message at `vector` and enable it.
+    ///
+    /// Not a lesser or older mechanism than MSI-X: the device performs the
+    /// same LAPIC write, with the address and data configured in config space
+    /// instead of in a table in a BAR. A PCIe function that omits MSI-X
+    /// essentially always offers this one, which is the difference between a
+    /// controller this kernel can be told about and one it cannot.
+    ///
+    /// The one thing that moves is the data register, which sits four bytes
+    /// later on a function that takes a 64-bit address.
+    pub fn enable_msi(&self, vector: u8) -> bool {
+        let Some(cap) = self.capabilities().find(|c| c.id() == CAP_MSI) else {
+            return false;
+        };
+
+        let ctrl = cap.read_u16(2);
+        let wide = ctrl & MSI_ADDR_64 != 0;
+        cap.write_u32(0x04, MSG_ADDR);
+        if wide {
+            cap.write_u32(0x08, 0);
+        }
+        cap.write_u16(if wide { 0x0C } else { 0x08 }, vector as u16);
+        // Only when the function says it has the register: at these offsets
+        // an unconditional write lands in whatever capability comes next.
+        if ctrl & MSI_PER_VECTOR_MASK != 0 {
+            cap.write_u32(if wide { 0x10 } else { 0x0C }, 0);
+        }
+        // Multiple Message Enable back to zero — one vector, the one just
+        // written. A function left at the count it advertises as capable
+        // raises consecutive vectors this kernel has no IDT gate for.
+        cap.write_u16(2, (ctrl & !MSI_MULTI_MSG_ENABLE) | MSI_ENABLE);
+        true
     }
 
     pub fn capabilities(&self) -> CapabilityIter<'_> {
