@@ -469,3 +469,314 @@ fn check_geometry(log: &str, bytes: u64, lba: u32) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The two answers a device can give to an *optional* SCSI command, and the
+/// loop that reading them as one answer produced.
+///
+/// SYNCHRONIZE CACHE (0x35) is optional in SBC and a great many USB flash
+/// drives answer ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE. `msc_flush`
+/// read that as a failed flush; `EspFs::sync` logged the failure and returned
+/// `()`; the line it logged was new pending content in the ring `esp_log` was
+/// draining, and `Sink::flush` still said `Ok`, so the sink's disable path
+/// never ran. Every idle pass was then a file write, a FAT write and another
+/// SYNCHRONIZE CACHE on the stick the machine booted from, forever — and
+/// `MAX_LOG_BYTES` rotates the boot log off the stick while it happens.
+///
+/// Two boots, because the two halves of the fix are separately observable and
+/// each is invisible to the other's boot:
+///
+/// - `usb-flush-unimplemented` — the refusal is an answer, and the log has to
+///   keep reaching the device exactly as on an ordinary boot. Fixing
+///   `sync_mount` alone cannot produce that: the returned error disables the
+///   sink and the file stops before `Boot: complete`.
+/// - `usb-flush-fails` — the same command really failing. The sink has to
+///   notice once and stop. Fixing `msc_flush` alone cannot produce that: the
+///   error is swallowed and the loop is the one above.
+///
+/// Neither boot can be green because the feature was not on: each asserts a
+/// line that only the injected answer produces.
+pub fn usb_flush_optional(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    optional_flush_keeps_the_log(test_config, c_bins, rust_bins)?;
+    failed_flush_stops_once(test_config, c_bins, rust_bins)
+}
+
+/// Boot with a stick that has no write cache. Nothing about the log changes.
+fn optional_flush_keeps_the_log(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURE: &[&str] = &["usb-flush-unimplemented"];
+    const REPORTED: &str = "usb-storage: disk 0 does not implement SYNCHRONIZE CACHE";
+
+    let image_path = test_dir().join("usb-flush-optional.img");
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURE);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+    let (start, len) = super::esp::esp_extent(&image, &image_path)?;
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::Metal,
+            boot_image: Some(image_path.clone()),
+            kernel_features: FEATURE,
+            ..Default::default()
+        },
+    );
+    let boot = qemu.boot_log().to_string();
+
+    // Mid-run and polled, exactly as `esp_log_file` does it: the claim is that
+    // the sink is still running, and the only place that is visible is the
+    // device while the machine is up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut on_device;
+    loop {
+        on_device = String::from_utf8_lossy(
+            &super::esp::log_on_device(&image_path, start, len, "toyos/kernel.log")?,
+        )
+        .into_owned();
+        if on_device.contains("Boot: complete") || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
+    drop(qemu);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} on a stick with no write cache\n{log}"));
+        }
+    }
+
+    // The injection reached the driver, and the driver said so once. Once is
+    // half the assertion: a line per flush is itself the loop, because this
+    // log's own bytes are what the next flush writes.
+    let said = log.matches(REPORTED).count();
+    if said != 1 {
+        return Err(format!(
+            "the guest printed {REPORTED:?} {said} times, wanted exactly one\n{log}"
+        ));
+    }
+    for wrong in ["usb-storage: cache flush failed", "usb-storage: SCSI 0x35 failed"] {
+        if log.contains(wrong) {
+            return Err(format!(
+                "an optional command a device does not have was reported as a failure ({wrong:?})\
+                 \n{log}"
+            ));
+        }
+    }
+    if log.contains("stops at") {
+        return Err(format!("the sink gave up on a stick that is working\n{log}"));
+    }
+    if !on_device.contains("Boot: complete") {
+        return Err(format!(
+            "the log on the device stops before `Boot: complete` at {} bytes — a stick with no \
+             write cache cost the machine its log",
+            on_device.len()
+        ));
+    }
+
+    let after = super::esp::log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+    let after = String::from_utf8_lossy(&after).into_owned();
+    if !after.contains("Shutting down.") {
+        return Err(format!(
+            "the shutdown's last line never reached the file: {} bytes",
+            after.len()
+        ));
+    }
+    let _ = std::fs::remove_file(&image_path);
+    eprintln!(
+        "  [usb] SYNCHRONIZE CACHE refused as unimplemented: reported once, {} bytes of kernel \
+         log still on the stick",
+        after.len()
+    );
+    Ok(())
+}
+
+/// Boot with a stick whose flush genuinely fails. The sink says so once and
+/// stops, rather than writing the device that just refused it.
+fn failed_flush_stops_once(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURE: &[&str] = &["usb-flush-fails"];
+    /// A per-failure line, and the thing that has to stay bounded. Before the
+    /// fix it is emitted by every pass of the idle loop for the life of the
+    /// boot; after it, once by the flush that gives up and once by the
+    /// shutdown's `sync_all`, which is the last caller left.
+    const BOUND: usize = 4;
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::Metal,
+            kernel_features: FEATURE,
+            ..Default::default()
+        },
+    );
+    let boot = qemu.boot_log().to_string();
+    // Long enough for a loop to be a loop: the flush runs from the idle loop,
+    // which on this machine goes round thousands of times a second.
+    std::thread::sleep(Duration::from_secs(2));
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
+    drop(qemu);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} on a stick that cannot flush\n{log}"));
+        }
+    }
+
+    if !log.contains("usb-storage: SCSI 0x35 failed, sense 0x04/0x44/0x00") {
+        return Err(format!("the injected flush failure never reached the driver\n{log}"));
+    }
+    let gave_up = log
+        .matches("esp-log: the boot volume's device refused the sync — /boot/toyos/kernel.log \
+                  stops at")
+        .count();
+    if gave_up != 1 {
+        return Err(format!(
+            "the sink gave up {gave_up} times, wanted exactly one — a failed sync has to reach \
+             `Sink::flush` as an error\n{log}"
+        ));
+    }
+    let failures = log.matches("usb-storage: cache flush failed").count();
+    if failures > BOUND {
+        return Err(format!(
+            "the guest issued {failures} failing flushes, over the bound of {BOUND}: a failed \
+             sync is still producing the log line that asks for the next one\n{log}"
+        ));
+    }
+    eprintln!(
+        "  [usb] a flush the device refuses: {failures} failing flushes over a 2 s idle run, sink \
+         disabled once"
+    );
+    Ok(())
+}
+
+/// The kernel timestamp on the first line carrying `needle`, in seconds.
+///
+/// `[kernel 0.218 cpu0] ...`, and `[kernel 1.042 cpu0 tid=3] ...` — the field
+/// is in the same place either way.
+fn stamp_of(log: &str, needle: &str) -> Result<f64, String> {
+    let line = log
+        .lines()
+        .find(|l| l.contains(needle))
+        .ok_or_else(|| format!("no line carrying {needle:?}"))?;
+    let rest = line.split_once("[kernel ").ok_or("line has no kernel timestamp")?.1;
+    let secs = rest.split_once(' ').ok_or("timestamp is not followed by a field")?.0;
+    secs.parse::<f64>().map_err(|e| format!("timestamp {secs:?}: {e}"))
+}
+
+/// That the wait between `from` and `refusal` really was the transfer budget.
+///
+/// Without this the gate would stay green for a `settles` that gave up on its
+/// first read: QEMU answers every one of these registers before the deadline is
+/// ever consulted, so no other test in the suite would notice either, and a
+/// driver that refused every controller after zero nanoseconds would ship.
+fn waited_out_the_budget(log: &str, from: &str, refusal: &str) -> Result<f64, String> {
+    let waited = stamp_of(log, refusal)? - stamp_of(log, from)?;
+    // The budget is 2 s and the serial stamps have millisecond resolution.
+    if waited < 1.5 {
+        return Err(format!(
+            "the refusal came {waited:.3} s after {from:?}; the wait is supposed to be the 2 s \
+             transfer budget, so this driver gave up without waiting"
+        ));
+    }
+    Ok(waited)
+}
+
+/// A controller and a port that stop answering, which on the machine this is
+/// for is a silent hang and nothing else.
+///
+/// The 2 s deadline covered `wait_command` and `wait_transfer` and nothing
+/// around them: the port-reset spin in `init_device` and four register spins in
+/// `init_one` — halt, HCRST, CNR and R/S — were bare `spin_loop`s. On a T14
+/// that is `Boot: peripherals ready` painted on the panel forever, which is
+/// also what a dead port, a dead controller and every other wedge look like.
+///
+/// Both boots assert the same shape: the thing that did not answer is named,
+/// and the machine gets to the shell anyway. `arm_interrupt` already refuses a
+/// controller by name; these waits bypassed that machinery entirely.
+pub fn xhci_deaf_registers(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    // The whole machine boots off this controller's stick, so refusing it also
+    // costs `/boot` — which is the honest cost and the reason the line has to
+    // name the controller rather than the mount that went missing.
+    let log = boot_and_shutdown(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::Metal,
+            kernel_features: &["xhci-deaf-controller"],
+            ..Default::default()
+        },
+    )?;
+    if !log.contains("it never halted, within 2000 ms of being asked to") {
+        return Err(format!("the controller that would not halt was not named\n{log}"));
+    }
+    if !log.contains("xHCI: 1 controller(s) present, none of them usable, USB unavailable") {
+        return Err(format!(
+            "a refused controller did not reach `init`'s own summary — a machine with no xHC and \
+             one whose xHC was refused are different machines\n{log}"
+        ));
+    }
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish without its USB controller\n{log}"));
+    }
+    let controller_wait = waited_out_the_budget(&log, "xHCI: found at PCI", "it never halted")
+        .map_err(|e| format!("{e}\n{log}"))?;
+
+    // And the port, which is the wait an ordinary machine can actually reach:
+    // a device pulled between the port scan and the reset lands here.
+    let log = boot_and_shutdown(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::Metal,
+            kernel_features: &["xhci-deaf-port"],
+            ..Default::default()
+        },
+    )?;
+    let skipped = log.matches("never finished its reset").count();
+    if skipped == 0 {
+        return Err(format!("no port was named as having failed its reset\n{log}"));
+    }
+    // The controller itself came up, which is what makes this a *port* refusal
+    // and not the previous boot again.
+    if !log.contains("xHCI: controller started") {
+        return Err(format!("the controller did not start; this is not the port path\n{log}"));
+    }
+    if !log.contains("usb-storage: 0 device(s)") {
+        return Err(format!("a port that never reset still bound a disk\n{log}"));
+    }
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish past a port that would not reset\n{log}"));
+    }
+    let port_wait = waited_out_the_budget(&log, "port 1 connected", "never finished its reset")
+        .map_err(|e| format!("{e}\n{log}"))?;
+    eprintln!(
+        "  [usb] a controller that will not halt is refused by name after {controller_wait:.3} s; \
+         {skipped} port(s) that will not reset are skipped after {port_wait:.3} s; both machines \
+         reach `Boot: complete`"
+    );
+    Ok(())
+}

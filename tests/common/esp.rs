@@ -61,7 +61,7 @@ fn test_dir() -> PathBuf {
 /// per-run nonce that the host knows before the machine starts and that only
 /// this boot's kernel can have logged. `esp_log_file` uses it to tell this
 /// boot's log from a file left behind by anything else.
-fn esp_extent(image: &[u8], path: &Path) -> Result<(usize, usize), String> {
+pub fn esp_extent(image: &[u8], path: &Path) -> Result<(usize, usize), String> {
     let disk = gpt::GptConfig::new()
         .writable(false)
         .logical_block_size(LogicalBlockSize::Lb512)
@@ -627,7 +627,7 @@ fn rotation(
 }
 
 /// One file read out of the ESP inside a disk image on the host.
-fn log_on_device(
+pub fn log_on_device(
     image_path: &Path,
     start: usize,
     len: usize,
