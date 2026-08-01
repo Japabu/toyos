@@ -563,6 +563,25 @@ pub fn fork_storm() -> Scenario {
 /// own granularity bound at every width, crossing it at four of the ten
 /// measured: the mechanism is saturating the limit its insertion-time keys
 /// impose, rather than staying comfortably inside it.
+///
+/// **It is a bounded offset, not an accumulating drift**, which is the
+/// difference between a granularity and a persistent unfair split. Measured by
+/// scaling `WORK` and holding the seed count at 200: at one CPU the worst spread
+/// is 30 ms at every window length; at eight it is 362 ms, 602 ms and 548 ms as
+/// the window doubles and doubles again, so it saturates rather than growing
+/// with time.
+///
+/// **And it is the policy's, not the model's.** Everything that decides who runs
+/// next — `RunQueue`'s insertion-time keys, `FairShare`'s one vruntime pot per
+/// process, `CpuSched::pick`, the surplus rule in `answer_steal_requests` — is
+/// the shipped core; what the simulator mocks is time, timer, IPI, halt and
+/// switch. The width scaling follows from §9.1 directly: every running thread of
+/// a process charges the same pot, so the pot advances at the process's
+/// aggregate rate while each queued thread's key stays frozen at its insert, and
+/// one dispatch's worth of staleness therefore buys more wall-clock service the
+/// more of that process is running at once. What the *model* contributes is the
+/// search: these are worst-of-N figures over adversarially chosen interleavings
+/// (seeded and PCT), not the split hardware would show on an average schedule.
 const FAIRNESS_SAMPLE: &[(usize, u64)] = &[
     (1, 30 * MS),
     (2, 102 * MS),
