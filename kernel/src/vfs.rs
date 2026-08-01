@@ -70,7 +70,40 @@ pub struct Vfs {
     created_dirs: hashbrown::HashSet<String>,
 }
 
+/// Longest absolute path the VFS will hand back, and so the longest a process's
+/// `cwd` can ever be.
+///
+/// This exists because a bound can be defeated by composition. `MAX_USER_STR`
+/// (64 KiB) really does bound every path *argument*, and its own derivation
+/// says the number is set by the largest allocation derived from it. But
+/// `resolve_absolute` prepends `cwd` before handing the result to `normalize`,
+/// and `cwd` was bounded by nothing — so the input `MAX_USER_STR` was sized
+/// against stopped being the input `normalize` actually saw. The check was
+/// real; the assumption behind it had quietly stopped holding.
+///
+/// The number is derived, not picked. Let `L = MAX_PATH + 1 + MAX_USER_STR` be
+/// the longest string reaching `normalize`. Its largest derived allocation is
+/// the `Vec<&str>` of components: 16 bytes each, and a path of `"a/a/a/…"`
+/// yields one component per two input bytes, so the vector holds up to
+/// `ceil(L/2)` of them. `Vec` grows by doubling, so the buffer is
+/// `next_pow2(ceil(L/2)) * 16` — and that single allocation must stay under
+/// `mm::MAX_HEAP_ALLOC` (2_093_056), above which the kernel heap's page source
+/// asserts *inside the allocator lock*.
+///
+/// At 4096: `L = 69_633`, `ceil(L/2) = 34_817`, `next_pow2 = 65_536`, so the
+/// vector is 1 MiB — a factor of two under the ceiling. The joined `String` is
+/// at most `L` bytes and never competes.
+///
+/// `MAX_USER_STR` dominates that sum, so this bound is a function of it: if
+/// `MAX_USER_STR` ever rises, re-run the arithmetic above rather than assuming
+/// this constant still holds. 64 KiB is already close to the cliff on its own —
+/// `MAX_PATH = 65_535` would put `ceil(L/2)` at 65_537, one element past the
+/// doubling step that lands on 2 MiB.
+pub const MAX_PATH: usize = 4096;
+
 fn normalize(path: &str) -> String {
+    // `parts` is the allocation MAX_PATH is derived against — see its comment.
+    // Callers guarantee `path` is at most `MAX_PATH + 1 + MAX_USER_STR` bytes.
     let mut parts: Vec<&str> = Vec::new();
     for part in path.split('/') {
         match part {
@@ -167,6 +200,16 @@ impl Vfs {
         } else {
             format!("/{}/{}", mount, subdir)
         };
+
+        // The one place a process's `cwd` is grown: `sys_chdir` stores whatever
+        // this returns. Refused rather than truncated — a shortened path names a
+        // *different* directory, and every later `resolve_absolute` against it
+        // would silently resolve to the wrong file. Checked before the three
+        // `Some(abs)` returns below so none of them can hand back an over-long
+        // path, and after `mount.is_empty()`, whose "/" is a byte long.
+        if abs.len() > MAX_PATH {
+            return None;
+        }
 
         if self.created_dirs.contains(&abs) {
             return Some(abs);
