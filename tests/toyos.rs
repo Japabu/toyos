@@ -1470,11 +1470,7 @@ fn run_machine_test(
             // And nothing panicked on the way. A daemon that dies on its
             // absent device fails the positive check above; this catches the
             // rest of the boot dying instead.
-            for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
-                if console.contains(bad) {
-                    return Err(format!("{bad:?} on a boot that should be clean:\n{console}"));
-                }
-            }
+            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
             eprintln!("  [metal-sim] compositor up on {}", mode.trim());
             eprintln!("  [metal-sim] soundd and netd both exited on their absent device");
             Ok(())
@@ -1590,11 +1586,7 @@ fn run_machine_test(
                     usb.len() - binds.len()
                 ));
             }
-            for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
-                if log.contains(bad) {
-                    return Err(format!("{bad:?} on a boot that should be clean:\n{log}"));
-                }
-            }
+            serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
             eprintln!(
                 "  [xhci] {} devices, {} slots, {keyboards} keyboards on {} distinct rings; \
                  {} blocks of {} B for max_slots={}, scratchpad={}, pool {} KiB",
@@ -1692,13 +1684,13 @@ fn run_machine_test(
                 }
             }
 
-            for (what, text) in [("boot", &log), ("shutdown", &tail)] {
-                for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
-                    if text.contains(bad) {
-                        return Err(format!("{bad:?} during {what}, which should be clean:\n{text}"));
-                    }
-                }
-            }
+            // The shutdown half is the one this conversion is for: `tail` is a
+            // `drain_serial` window, and an empty drain used to pass its panic
+            // scan in silence. It carries kernel lines of its own -- measured,
+            // five, including both lines asserted just above -- so requiring
+            // liveness of it is a real check and not a new flake.
+            serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+            serial::Serial::named("shutdown drain", tail.as_str()).must_be_clean()?;
 
             // Ground truth at the hardware boundary: the backing file is what
             // the *device* received, so this is the one place a storage claim
@@ -2021,11 +2013,7 @@ fn run_machine_test(
                     "want exactly one device walked past, the stick that fit:\n{log}"
                 ));
             }
-            for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
-                if log.contains(bad) {
-                    return Err(format!("{bad:?} — the driver died on a full pool:\n{log}"));
-                }
-            }
+            serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
             eprintln!(
                 "  [xhci] 1 block of {} for {} devices, {over} dropped, slot 1 addressed",
                 dma.stride,

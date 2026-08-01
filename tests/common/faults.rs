@@ -108,19 +108,16 @@ pub fn diskless_boot(
     }
 
     let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
-    let log = qemu.boot_log().to_string();
+    let log = crate::common::serial::Serial::boot(&qemu);
 
-    for bad in ["!!! PANIC !!!", "panicked at", "no controller found"] {
-        if log.contains(bad) {
-            return Err(format!("{bad:?}: a machine with no disk must still boot\n{log}"));
-        }
-    }
-    if !log.contains("NVMe: no controller on this machine") {
-        return Err(format!("the kernel did not report the absent controller\n{log}"));
-    }
-    if !log.contains("Boot: complete") {
-        return Err(format!("the boot did not complete without a disk\n{log}"));
-    }
+    // The two absence claims are only claims if the console carried anything,
+    // and `must_not_say` is what establishes that. The positives below made
+    // this safe by luck rather than by design -- reorder them and the panic
+    // scan is a claim about nothing again.
+    log.must_be_clean()?;
+    log.must_not_say("no controller found")?;
+    log.must_say("NVMe: no controller on this machine")?;
+    log.must_say("Boot: complete")?;
     Ok(())
 }
 
