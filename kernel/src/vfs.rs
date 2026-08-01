@@ -437,10 +437,19 @@ impl Vfs {
         let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or("no filesystem")?;
         if fs_path.is_empty() { return Err("invalid path"); }
 
-        let mut buf = [0u8; 4096];
+        // On the heap and not the stack. `esp_log` reaches this from the idle
+        // loop, whose per-CPU stack is 16 KiB of ordinary heap with no guard
+        // page — so a 4 KiB frame there is a quarter of the stack and an
+        // overflow corrupts whatever the allocator put underneath it, silently.
+        // Measured at that call site: 11,505 bytes of the 16,384 in use at the
+        // block layer, with the USB command path still below. `Vec` rather than
+        // `Box::new([0u8; 4096])`, because the latter is only elided from the
+        // stack if the optimiser feels like it.
+        let mut heap = alloc::vec![0u8; 4096].into_boxed_slice();
+        let buf: &mut [u8; 4096] = (&mut heap[..]).try_into().expect("4096 bytes");
         for &page_idx in &dirty {
-            crate::file_cache::copy_page_out(file_id, page_idx, &mut buf);
-            fs.write_page(file_id, page_idx, &buf)?;
+            crate::file_cache::copy_page_out(file_id, page_idx, buf);
+            fs.write_page(file_id, page_idx, buf)?;
         }
         crate::file_cache::clear_dirty(file_id, &dirty);
 

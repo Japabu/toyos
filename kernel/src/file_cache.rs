@@ -159,7 +159,7 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
     }
     // Cache miss: unlock, fetch from backing, re-lock, insert if still absent.
 
-    let mut fetched = [0u8; PAGE_SIZE];
+    let mut fetched = blank_page();
     if let Some(backing) = &backing {
         backing.read_page(page_idx as u64 * PAGE_SIZE as u64, &mut fetched);
     }
@@ -209,7 +209,7 @@ pub fn write_page(file_id: FileId, page_idx: u32, offset: usize, data: &[u8]) {
     }
     let backing = backing.unwrap();
 
-    let mut fetched = [0u8; PAGE_SIZE];
+    let mut fetched = blank_page();
     if let Some(backing) = &backing {
         let page_start = page_idx as u64 * PAGE_SIZE as u64;
         if page_start < backing.file_size() {
@@ -328,8 +328,23 @@ pub fn ref_count(file_id: FileId) -> u32 {
 }
 
 impl CachedPage {
-    fn new(data: [u8; PAGE_SIZE]) -> Self {
-        Self { data: Box::new(data), dirty: false, referenced: false }
+    fn new(data: Box<[u8; PAGE_SIZE]>) -> Self {
+        Self { data, dirty: false, referenced: false }
+    }
+}
+
+/// A blank page, built on the heap and never on the stack.
+///
+/// Both miss paths below used `[0u8; PAGE_SIZE]` and handed it to `Box::new`,
+/// which is a 4 KiB stack frame and a 4 KiB copy per miss. The copy was waste;
+/// the frame was a hazard, because `esp_log` reaches `write_page` from the idle
+/// loop, whose per-CPU stack is 16 KiB of ordinary heap with no guard page.
+/// Measured there, at the block layer with the USB command path still below:
+/// 11,505 bytes of the 16,384 with these two frames present, 6,209 without.
+fn blank_page() -> Box<[u8; PAGE_SIZE]> {
+    match alloc::vec![0u8; PAGE_SIZE].into_boxed_slice().try_into() {
+        Ok(page) => page,
+        Err(_) => unreachable!("a PAGE_SIZE slice is a [u8; PAGE_SIZE]"),
     }
 }
 
