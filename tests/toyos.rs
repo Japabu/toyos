@@ -28,6 +28,8 @@ const RUST_SKIP: &[&str] = &[
     // Needs a live compositor, which `tests/testcases` does not boot.
     // `metal_sim_window_caps` runs it on the config that does.
     "window_caps",
+    // Needs netd with a NIC. `netd_connection_caps` runs it on tests/netcase.
+    "netd_caps",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -73,6 +75,7 @@ const MACHINE_TESTS: &[&str] = &[
     "metal_sim_compositor",
     "metal_sim_input",
     "metal_sim_window_caps",
+    "netd_connection_caps",
     "foreign_disk_untouched",
     "double_fault_stack",
     "diskless_boot",
@@ -2622,6 +2625,91 @@ fn run_machine_test(
                 ));
             }
             eprintln!("  [metal-sim] compositor cap {declared} windows, {granted} granted then refused");
+            Ok(())
+        }
+        "netd_connection_caps" => {
+            // The only boot that runs netd at all. Its `main` opens the NIC
+            // first and returns on `NotFound`, so metal-sim never reaches a
+            // line of the daemon, and `tests/testcases` does not build netd —
+            // between them a full suite run contained zero `netd:` lines and
+            // the daemon's bound had no evidence behind it whatsoever.
+            //
+            // Same assertion design as `metal_sim_window_caps`: netd announces
+            // the cap it derived, the guest measures where the refusals start,
+            // and these must be the same number.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/netcase");
+            let bins: Vec<(String, Vec<u8>)> = rust_bins
+                .iter()
+                .filter(|(name, _)| name == "netd_caps")
+                .cloned()
+                .collect();
+            if bins.is_empty() {
+                return Err("netd_caps was not built".to_string());
+            }
+            // Headless is the profile with virtio-net; without a NIC netd
+            // exits before reaching anything this test is about.
+            let options = BootOptions {
+                profile: qemu::Profile::Headless,
+                ..Default::default()
+            };
+            if !qemu::profile_argv(&options).iter().any(|a| a.contains("virtio-net")) {
+                return Err("this test needs a NIC and the profile has none".to_string());
+            }
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
+
+            let mut console = qemu.boot_log().to_string();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline && !console.contains("netd: ready, at most ") {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            let Some(declared) = console
+                .lines()
+                .find_map(|l| l.split("netd: ready, at most ").nth(1))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return Err(format!(
+                    "netd never said how many piped connections it would hold:\n{console}"
+                ));
+            };
+            if declared == 0 {
+                return Err("netd derived a cap of zero connections".to_string());
+            }
+
+            // The cap is passed as the burst size, not as the answer: the
+            // guest still measures the boundary itself.
+            let result = qemu.run_test(
+                &format!("test_rs_netd_caps {declared}"),
+                Duration::from_secs(120),
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            if result.exit_code != Some(0) {
+                return Err(format!(
+                    "netd_caps exited {:?}:\n{}",
+                    result.exit_code, result.stdout
+                ));
+            }
+
+            let Some(granted) = result
+                .stdout
+                .split("netd caps: ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return Err(format!("netd_caps printed no count:\n{}", result.stdout));
+            };
+            if granted != declared {
+                return Err(format!(
+                    "netd declared a cap of {declared} piped connections and accepted \
+                     {granted} — the derivation and the enforcement disagree:\n{}",
+                    result.stdout
+                ));
+            }
+            eprintln!("  [netcase] netd cap {declared} piped connections, {granted} accepted then refused");
             Ok(())
         }
         "metal_sim_input" => {

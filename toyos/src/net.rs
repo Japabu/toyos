@@ -66,6 +66,20 @@ pub const ERR_TIMED_OUT: u32 = 3;
 pub const ERR_ADDR_IN_USE: u32 = 4;
 pub const ERR_NOT_CONNECTED: u32 = 5;
 pub const ERR_INVALID_INPUT: u32 = 6;
+/// netd will not hold another connection of this kind right now.
+///
+/// Distinct from [`ERR_CONNECTION_REFUSED`] on purpose, and the distinction is
+/// not cosmetic: the two ask the client for opposite responses. A peer that
+/// refused the SYN will keep refusing it, so the right move is to give up on
+/// that peer; netd being full is a condition of this machine that clears when
+/// something closes, so the right move is to back off and retry the same peer.
+/// A client that cannot tell them apart cannot do either correctly.
+///
+/// The conflation was real, not hypothetical: `netd`'s own pending-connect
+/// path answers a socket that reached `Closed` with `ERR_CONNECTION_REFUSED`,
+/// so a capacity refusal on that code is indistinguishable from an ordinary
+/// failed connection — including to a test trying to find where the cap is.
+pub const ERR_RESOURCE_EXHAUSTED: u32 = 7;
 pub const ERR_OTHER: u32 = 255;
 
 pub const OPT_NODELAY: u32 = 1;
@@ -79,6 +93,9 @@ pub enum NetError {
     AddrInUse,
     NotConnected,
     InvalidInput,
+    /// netd is at its own limit. Retryable against the same peer, unlike
+    /// [`NetError::ConnectionRefused`] — see [`ERR_RESOURCE_EXHAUSTED`].
+    ResourceExhausted,
     Protocol(u32),
     Io,
 }
@@ -92,7 +109,10 @@ impl NetError {
             ERR_ADDR_IN_USE => NetError::AddrInUse,
             ERR_NOT_CONNECTED => NetError::NotConnected,
             ERR_INVALID_INPUT => NetError::InvalidInput,
+            ERR_RESOURCE_EXHAUSTED => NetError::ResourceExhausted,
             ERR_OTHER => NetError::Io,
+            // An older client meets a newer netd here rather than at a panic:
+            // an unknown code is still an error, and still says which one.
             code => NetError::Protocol(code),
         }
     }

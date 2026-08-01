@@ -1,0 +1,16 @@
+# The one boot that runs netd with a NIC in front of it.
+#
+# netd's `main` opens the NIC before anything else and returns on `NotFound`,
+# so metal-sim — which has no NIC by design — never reaches a line of the
+# daemon proper, and `tests/testcases` does not build netd at all. Between them
+# the whole daemon was unreached by `cargo test`: zero `netd:` lines in a full
+# run. This config exists so its bound has evidence behind it.
+#
+# test-runner is here for the same reason it is in metalcase: it makes the boot
+# announce itself and lets an in-guest binary be driven over the
+# ===TEST_START=== protocol.
+init = ["/bin/netd", "/bin/test-runner"]
+
+[programs]
+netd = {}
+test-runner = {}

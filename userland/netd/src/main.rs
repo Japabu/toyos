@@ -358,8 +358,15 @@ impl NetDaemon {
     /// name a pair of pipes, so leaving them out would let a burst of
     /// `TCP_CONNECT_PIPED` overshoot the cap by the whole burst.
     fn piped_room(&self) -> bool {
+        self.piped_live() < self.max_piped_connections
+    }
+
+    /// Connections the cap is counting. Reported by both refusals, because
+    /// `piped_connections.len()` alone reads as "0 already, max 126" when a
+    /// burst of connects fills the pending list — a refusal that looks like a
+    /// bug in the check rather than the check working.
+    fn piped_live(&self) -> usize {
         self.piped_connections.len() + self.pending_piped_connects.len()
-            < self.max_piped_connections
     }
 
     fn alloc_id(&mut self) -> u32 {
@@ -724,13 +731,18 @@ impl NetDaemon {
         // unwind and no SYN on the wire. An error return, never a panic: the
         // request is a client's and asking for one connection too many is not
         // a bug in netd.
+        //
+        // Not `ERR_CONNECTION_REFUSED`, which this file already uses below for
+        // a pending connect whose socket reached `Closed` — the peer's answer.
+        // On one code a client cannot tell "this machine is full, back off"
+        // from "that peer says no, give up".
         if !self.piped_room() {
             eprintln!(
                 "netd: refusing connect, {} piped connections already (max {})",
-                self.piped_connections.len(),
+                self.piped_live(),
                 self.max_piped_connections,
             );
-            send_error_close(client_fd, ERR_CONNECTION_REFUSED);
+            send_error_close(client_fd, ERR_RESOURCE_EXHAUSTED);
             return;
         }
         let remote = IpEndpoint::new(
@@ -827,10 +839,10 @@ impl NetDaemon {
         if !self.piped_room() {
             eprintln!(
                 "netd: refusing accept, {} piped connections already (max {})",
-                self.piped_connections.len(),
+                self.piped_live(),
                 self.max_piped_connections,
             );
-            send_error_close(client_fd, ERR_CONNECTION_REFUSED);
+            send_error_close(client_fd, ERR_RESOURCE_EXHAUSTED);
             return;
         }
         let Some(listener) = self.piped_listeners.get(&req.socket_id) else {
