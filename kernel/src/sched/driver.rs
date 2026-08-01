@@ -489,7 +489,38 @@ fn execute(action: Action<KernelPayload>) {
             let awake = cpus().get(cpu).doorbell().kick_pending()
                 || crate::preempt::need_resched()
                 || crate::irq_ring::any_pending_self()
-                || !with_cpu(|c| c.mailbox_is_empty());
+                || !with_cpu(|c| c.mailbox_is_empty())
+                // The log ring owes the host bytes, so this CPU must not sleep
+                // on them. `idle_loop` drains *before* the pass, and a line
+                // logged after that drain — by `drain_irqs`, by a driver it
+                // polls, by anything inside the pass — would otherwise wait for
+                // the next wake. The LAPIC timer is one-shot, so on a genuinely
+                // quiet machine there may not be one: the last thing the kernel
+                // said before going silent is then not evidence of anything.
+                //
+                // It closes the window rather than narrowing it, by the same
+                // argument §7.5 makes for the mailbox. A write that lands
+                // between this load and the `hlt` came from an interrupt on this
+                // CPU (which ends the halt through the STI shadow) or from
+                // another CPU that is still running — and that CPU runs this
+                // same check before it halts. The ring is one global buffer, so
+                // whoever drains drains everything: the last CPU to sleep
+                // flushes what all of them wrote.
+                //
+                // Declining rather than draining here is the point. A drain is
+                // serial I/O, and `uart_write_bytes` spins on THRE; doing that
+                // with interrupts off would put an unbounded wait exactly where
+                // the machine is trying to go quiet. Returning sends this CPU
+                // round the idle loop, which drains with interrupts on, one
+                // bounded chunk per backend acquisition.
+                //
+                // The condition self-clears, which is what stops it becoming
+                // the spin `i8042::service` documents for `any_pending_self`:
+                // `drain_serial` loops until the ring reports empty, so one
+                // trip round the idle loop always satisfies it. What would spin
+                // a CPU is something on the *pass* path logging unconditionally
+                // — which would also flood the ring, so it is already a bug.
+                || crate::drivers::log_ring::has_pending();
             if awake {
                 unsafe { asm!("sti", options(nomem, nostack)) };
                 drop(token);

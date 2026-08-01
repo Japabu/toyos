@@ -34,7 +34,7 @@
 //! stream anyway.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const RING_SIZE: usize = 64 * 1024;
 
@@ -87,6 +87,7 @@ impl LogRing {
                 self.retained += 1;
             }
         }
+        OWED.store(self.len, Ordering::Relaxed);
         dropped
     }
 
@@ -97,6 +98,7 @@ impl LogRing {
             self.tail = (self.tail + 1) % RING_SIZE;
         }
         self.len -= n;
+        OWED.store(self.len, Ordering::Relaxed);
         n
     }
 }
@@ -107,6 +109,19 @@ unsafe impl Sync for RingCell {}
 static RING: RingCell = RingCell(UnsafeCell::new(LogRing::new()));
 static RING_LOCKED: AtomicBool = AtomicBool::new(false);
 static DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// A lock-free mirror of `LogRing::len` — what serial still owes the host.
+///
+/// It exists for exactly one reader: the pre-halt recheck in
+/// `sched::driver::execute`, which runs with interrupts off and must not take
+/// the ring lock there. Written only under `RingGuard`, by the two methods that
+/// move `len`, so it cannot drift from them.
+static OWED: AtomicUsize = AtomicUsize::new(0);
+
+/// Does serial still owe the host bytes? Lock-free, for the interrupts-off
+/// pre-halt check; see [`OWED`].
+pub fn has_pending() -> bool {
+    OWED.load(Ordering::Relaxed) != 0
+}
 
 /// CLI-aware spinlock for ring access. `log!()` can be called from IRQ
 /// handlers, so the spinning side must run with interrupts disabled to prevent
