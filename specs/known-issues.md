@@ -2417,6 +2417,17 @@ Three things it does **not** give, in the order they will bite:
   boot log. The list is therefore the shipping list's own first entry,
   `/bin/toybox locale --load`, which reads a config file that does not exist on a
   fresh disk and returns.
+- **Every em-dash in a kernel log line is three dots on the panel.** `font8x16`
+  holds codepoints 0x20..=0x7E and `draw_glyph` maps everything else to `.`
+  (`panic_console/mod.rs:778`), so a 3-byte UTF-8 `—` renders as `...` and costs
+  three columns instead of one. Measured on `screen_i8042_health`'s decoded
+  screen: `0 interrupts ... the pin has never asserted`. 44 of the kernel's 448
+  `log!` sites contain one, and the i8042's diagnostic lines are among the
+  densest. Cosmetic on its own; it is not cosmetic against the T14's 240-column
+  wrap, which is what decides whether a line is one display row or two, and
+  therefore whether it is on the page the checkpoint paints. Cheapest fix is to
+  render the three-byte sequence as a single `-`; the honest one is to stop
+  putting non-ASCII in `log!`.
 
 `specs/metal-log-capture.md` is the durable version of the same problem and its
 Phase 2 fixed the *panic* half only.
