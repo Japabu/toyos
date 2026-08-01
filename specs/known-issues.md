@@ -2271,38 +2271,66 @@ HID so both mice land on **slot 3**, and the driver logs
 `xHCI: pointer on slot 3 merges as source N`. With the slot-keyed source
 restored, both lines read `source 3`.
 
-### A controller with no MSI-X is never polled at all, and the log says otherwise
+### CLOSED — a controller with no MSI-X was never polled at all, and the log said otherwise
 
-`setup_msix` looks for capability 0x11 and, not finding it, logs
-`xHCI: no MSI-X capability, using polled mode` and returns. There is no polled
+`setup_msix` looked for capability 0x11 and, not finding it, logged
+`xHCI: no MSI-X capability, using polled mode` and returned. There is no polled
 mode. Every call site of `XhciController::poll` is inside `poll_if_pending`,
 which runs only when `irq_ring::take(IrqSource::Xhci)` returns a record, and
-the only producer of that record is the vector-0x21 ISR — which is delivered
-only through the MSI-X table `setup_msix` just declined to program. So the
-controller is reset, started, and its event ring is never read again: no HID
-report is ever dispatched, no command completion is ever consumed after
-enumeration, and there is no log line saying so.
+the only producer of that record is the vector-0x21 ISR — delivered only
+through the MSI-X table `setup_msix` had just declined to program. The real
+boot logged that line on the T14's `00:0d.0`.
 
-The real boot logged that line on `00:0d.0`. Whether the PCH controller at
-`00:14.0` differs is **not known** — the kernel never initialised it, so
-nothing has ever read its capability list. Now that both controllers come up,
-the next boot's log answers it directly. Both possible answers matter: if the
-PCH one has MSI-X, USB HID works on the T14 and the Thunderbolt controller is
-merely inert; if it does not, USB HID does not work on that laptop and this is
-the blocker rather than the controller count. Intel PCH xHCI parts commonly
-expose MSI (capability 0x05) and not MSI-X, and this driver has no MSI path —
-that is a reason to check, not a finding.
+Two things replaced it, and the second is the one that matters:
 
-Untested because every profile's controller has MSI-X: `xHCI: MSI-X enabled
-(vector 0x21)` on both controllers of both new two-controller profiles.
-`nec-usb-xhci,msix=off` is the actuator (verified present on QEMU 11.0.2,
-alongside `msi=<OnOffAuto>`), so the shape is stageable whenever this is picked
-up. The honest minimum is that the line stop claiming a mode that does not
-exist.
+- **MSI.** `PciDevice::enable_msi` (capability 0x05) beside `enable_msix`,
+  both in `pci.rs` where a capability write belongs. This is not a fallback to
+  something older and lesser: it is the same LAPIC write with the address and
+  data in config space instead of a BAR table, and Intel PCH xHCI parts
+  commonly offer it and not MSI-X. `arm_interrupt` prefers MSI-X and takes MSI
+  otherwise.
+- **A refusal.** A function offering neither is not initialised at all —
+  refused before the HCRST and before `scan_ports`, so nothing on it can print
+  `USB keyboard ready`. `xHCI: NOT INITIALISED at PCI …` says why in one line.
+  Per controller: on `MetalXhciNoIrq` the good controller still binds the boot
+  stick.
 
-CLAUDE.md records that the three MSI-X setup copies have already diverged, with
-xHCI degrading to "polled" where virtio-net and virtio-sound panic. This is the
-xHCI copy's version of that: it degrades to nothing.
+I/O APIC pin delivery was considered and is not implementable here: a PCI
+function's INTx lands on a GSI named by `_PRT`, and this kernel has no AML
+interpreter — `acpi.rs` byte-scans the DSDT for `_S5_` and nothing else. That
+is a stronger objection than "legacy".
+
+Gated by `xhci_msi_only` (input delivered over MSI) and `xhci_no_interrupt`
+(refused by name, nothing announced). Teeth, all four measured: dropping the
+MSI arm reds the first on its log assertion; **programming MSI without setting
+the enable bit reds it on `keys=0 pointer=0` while still logging
+`MSI enabled`**, which is the assertion that matters; restoring the old
+degrade reds the second; and with *every* log assertion deleted from the second
+it still reds on `a device was announced on a controller nothing can read`.
+
+**The finding underneath it, which cost this test two shapes.** The first
+`MetalXhciMsi` put the boot stick and the HID on one controller and **passed
+with MSI deliberately disabled** — 10 key events, the right pointer delta, late
+and reordered but all present. `wait_transfer` and `wait_command` drain the
+*whole* event ring and hand every unmatched TRB to `dispatch_event`, so any
+storage I/O on a controller dispatches that controller's queued HID reports.
+`esp_log` writes `/boot/toyos/kernel.log` from the idle loop, so on a machine
+that boots off a stick there is an accidental polled mode, at the ESP log's
+cadence, for every HID device on the same controller. Two consequences:
+
+- A test that wants to prove an interrupt arrived must run on a controller
+  with no storage on it. `MetalXhciMsi` now gives the boot stick to a
+  `msi=off,msix=off` controller the driver refuses, so the guest does no USB
+  storage I/O at all.
+- `poll_if_pending` polls *every* controller off one `irq_ring` record, so a
+  second, healthy controller's interrupts would have drained the ring too. Two
+  independent ways for this test to pass vacuously; only removing storage
+  entirely closes both.
+
+Whether the T14's PCH controller at `00:14.0` has MSI-X is still unknown — the
+kernel had never initialised it, so nothing has read its capability list. It no
+longer decides whether the keyboard works: MSI-X takes it, MSI takes it, and
+only a part with neither is refused, loudly.
 
 ### First-match device selection that remains, and why
 
