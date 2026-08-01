@@ -92,6 +92,11 @@ test-heap-ceiling = []
 # audio path. A bring-up, bisect or bare-metal build wants it; a build being
 # measured does not.
 sched-check = ["toyos-sched/check"]
+# Rotate `/boot/toyos/kernel.log` at 256 bytes instead of 1 MiB. Filling a megabyte
+# by logging would take a boot far longer than a test should wait, and the
+# rotation code this drives is the shipped code — only the bound moves, exactly
+# as `test-small-caches` moves the cache ceilings. See `esp_log::MAX_LOG_BYTES`.
+esp-log-rotate-fast = []
 
 # debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]
