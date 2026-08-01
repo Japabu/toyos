@@ -357,8 +357,7 @@ pub fn esp_filesystem(
 
     let _ = std::fs::remove_file(&image_path);
     eprintln!(
-        "  [esp] {BLOB_LEN} bytes and two files verified host-side, {} build artifacts intact, \
-         fsck clean before and after",
+        "  [esp] {BLOB_LEN} bytes and two files verified host-side, {} build artifacts intact",
         UNTOUCHED.len()
     );
     Ok(())
