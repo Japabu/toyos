@@ -1,10 +1,14 @@
 # Type-safety audit: `kernel/src/drivers/` and `kernel/src/arch/`
 
-Read-only audit, 2026-08-01, against the working tree at `3e2c975`. 13,073 lines
-across 33 files (`find … | xargs wc -l`). Nothing was built or run; every number
-below comes from a `grep`/`wc` recorded beside it. Numbers describing code that
-does not exist yet are marked **(projected)** and were derived by writing the
-replacement out, not estimated.
+Read-only audit, 2026-08-01, against the **working tree** at `3e2c975`. 13,073
+lines across 33 files (`find … | xargs wc -l`). Nothing was built or run; every
+number below comes from a `grep`/`wc` recorded beside it. Numbers describing code
+that does not exist yet are marked **(projected)** and were derived by writing
+the replacement out, not estimated.
+
+> **Three cited files are not in `main`** — `xhci/msc.rs`, `usb_storage.rs`,
+> `usb_gate.rs` are another agent's uncommitted work. **§7 says exactly which
+> findings that touches and which are unaffected.** Read it before acting on F3.
 
 ## The test applied
 
@@ -1139,7 +1143,53 @@ exception is F1's `id as u16`**, which is why it is F1.
 
 ---
 
-## 7. Method, and what was not done
+## 7. Three cited files are not at HEAD
+
+Checked after the audit was written, with `git cat-file -e HEAD:<path>`, because
+known-issues §1's postscript says to: *"In a tree with six agents committing, the
+working tree is somebody's uncommitted opinion. `git show HEAD:<path>` is the
+arbiter."* That warning is usually about a finding looking **fixed** by
+work-in-progress on disk. This is the mirror case — a finding looking
+**supported** by it.
+
+**Not at HEAD** (untracked, another agent's in-flight work):
+`kernel/src/drivers/xhci/msc.rs`, `kernel/src/drivers/usb_storage.rs`,
+`kernel/src/usb_gate.rs`.
+
+**At HEAD, verified:** `block.rs` (and `read_blocks` still returns `()` there —
+`git show HEAD:kernel/src/block.rs:14`), `nvme.rs`, `page_cache.rs`,
+`virtio.rs` (`DescSlot(id as u16)` at `HEAD:virtio.rs:368`), `acpi.rs`, and all
+three `setup_msix` functions.
+
+What this changes, precisely:
+
+- **F1, F2, F5, F6, F7, F8, F9, F10, F12 stand at HEAD unaltered.** F1's
+  out-of-bounds read is in `virtio_console.rs`; F2's three copies are all at
+  HEAD; F5's underflows are at HEAD.
+- **F3 stands at HEAD on the NVMe half only.** The trait and its `()` return are
+  at HEAD, all six discarded NVMe statuses are at HEAD, and `page_cache.rs:235`'s
+  stale-slot consequence is at HEAD. The `usb_storage.rs` half — the second
+  implementation, its `healthy()` workaround, and the `usb_gate.rs:90`
+  fail-safe-by-accident analysis — is about uncommitted code. It strengthens the
+  finding and is not what the finding rests on.
+- **F11 loses one of its eight sites at HEAD**: `xhci/device.rs:195` is in a
+  file that *is* at HEAD, so all eight stand; but the `msc.rs` waits I checked
+  as already-bounded are not, so "the other ten are deadline-bounded" is a claim
+  about the working tree.
+- **`msc.rs` is cited four times as the exemplar** — in §2, §3, F1's asymmetry
+  argument and §6's parse-step defence. Those citations are to code that is real
+  and readable today and is not in `main`. If it never lands, §6's "the parse
+  step is present and is the interesting code" loses one of its three examples
+  (`nvme.rs:207-229` and `virtio_sound.rs:62-99` are both at HEAD and both
+  survive), and F1's "four consumers, three standards" becomes an argument from
+  `virtio_sound.rs`'s two `assert!`s alone, which is weaker but still true.
+
+Nothing here was re-derived against HEAD beyond the checks above; the audit was
+read against the working tree, which is the tree the next person will also see.
+
+---
+
+## 8. Method, and what was not done
 
 Read in full: all 17 files under `kernel/src/drivers/` and all 16 under
 `kernel/src/arch/` except `syscall.rs` (1,925 lines, skimmed for the audited
