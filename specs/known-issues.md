@@ -2141,6 +2141,15 @@ The fourth is the one with a test behind it: `xhci_slot_exhaustion` leaves five
 slots enabled with a zero DCBAA entry every run, which makes the entry's own
 test the largest producer of the leak it describes.
 
+**The count is 11, not four plus three**, enumerated in
+`specs/type-safety-audit/usb-storage.md` F12 by reading every path between the
+successful Enable Slot and a bound device. Three of them are named nowhere
+else: SET_CONFIGURATION failing (`device.rs`), Configure Endpoint failing for
+the bulk pair (`msc.rs`) and for the HID interrupt endpoint (`device.rs`), plus
+`PointerSource::claim` running out. A fix that adds Disable Slot to the four
+named above leaves seven behind, and this entry is what somebody will work
+from.
+
 Harmless where slots outnumber ports, which is every machine in reach: QEMU
 reports 64, Intel's PCH controllers 32 or more, and no root hub has that many
 ports. It stops being harmless on a controller whose slot count is below its
@@ -2149,14 +2158,22 @@ one. `xhci_slot_exhaustion` is what would catch the regression — it proves the
 machine survives the shortage and that the one device which fit was enumerated
 to completion, not that the right devices win it.
 
-### The xHCI driver refuses a controller whose PAGESIZE is not 4 KiB
+### The xHCI driver refuses a controller whose PAGESIZE does not include 4 KiB
 
-`init` logs OP_PAGESIZE and then asserts it is bit 0, which is the bit that
-says 4 KiB; every shipping xHC sets exactly that bit. Every structure the
-driver places — rings, contexts, scratchpad buffers — is sized and aligned to
-a hardcoded 4 KiB, so a controller reporting 8 KiB or 64 KiB is unimplemented,
-not merely unusual, and the machine says so at init instead of corrupting
-memory silently.
+`init` logs OP_PAGESIZE and refuses the controller by PCI address if bit 0 —
+the bit that says 4 KiB — is clear. Every structure the driver places — rings,
+contexts, scratchpad buffers — is sized and aligned to a hardcoded 4 KiB, so a
+controller that cannot do 4 KiB is unimplemented, not merely unusual, and the
+machine says so at init instead of corrupting memory silently.
+
+**It used to `assert_eq!(pagesize, 1)`, which was wrong twice** and is fixed at
+`5fde1c5`. The register is a *mask* of the page sizes the controller supports,
+so equality is stricter than the requirement (Linux reads it with `ffs()`);
+and a panic takes the machine for one controller's property on a laptop that
+has two, which is the exact failure the drive-every-controller work exists to
+prevent. Sixty lines above, a controller with neither MSI-X nor MSI is refused
+by name and `init` carries on. Both are equally fatal to that controller and
+neither is fatal to the machine; now both read the same.
 
 The scratchpad is the whole exposure. Its entries are one 4 KiB page apart,
 so at PAGESIZE 8 KiB with `max_scratchpad = 8` entry 7 sits at 0xF000 and the
@@ -2843,6 +2860,123 @@ into the failing block, and reads it twice. Two device reads is the assertion �
 one means the slot stayed bound and the second reader got the previous tenant.
 Roughly 80 lines of kernel and 40 of harness; not built.
 
+### CLOSED — an endpoint address naming endpoint 0 was configured over EP0 or the slot context
+
+Closed at `fdc9cee` + `9dfd044`, gated by `xhci_descriptor_walk`. `parse_config`
+accepted an endpoint descriptor on its direction bit and its transfer type and
+never looked at the endpoint *number*; the completeness gate tested the whole
+address byte. `0x80` and `0x10` are non-zero bytes and resolve to DCI 1, EP0's
+own endpoint context, and DCI 0, the slot context — so `bind` wrote a bulk
+endpoint's max-packet, burst and dequeue pointer over one of them, set A1 in the
+Add Context flags, and relied on the host controller to reject the command,
+which a conformant one does with a line naming Configure Endpoint rather than
+the descriptor. No out-of-bounds write; the largest context index reached is 32
+and `32 * 64 + 16` is inside the 4 KiB input context.
+
+**The residual after the first fix is the interesting part.** Checking the
+resolved DCI still left "this endpoint was not filled in" encoded as a zero
+*address*, so the OUT direction was guarded by design and the IN direction only
+by the accident that a legal OUT address of `0x00` and the sentinel are the same
+byte. `Endpoint` now has one constructor, private to the parser, that refuses
+endpoint 0; `Walk` is the interface while its endpoints are `Option`s and
+`Function` is only ever the complete form. Both completeness guards, eleven
+zero-initialised fields and three `== 0` comparisons went away — the same shape
+`toyos-fat32`'s `Cluster` newtype closed, in a driver reading bytes a device
+chose.
+
+The gate is `legacy.rs`'s selftest applied to the other untrusted byte stream:
+`parse_config` is pure, so `xhci-descriptor-selftest` runs it over nine crafted
+descriptors at init. Deleting `num != 0` from the constructor gives `6/9` with
+`Some((2, 66, 1, 4))`, `Some((2, 66, 3, 0))` and `Some((1, 66, 1, 0))` — DCI 1
+and DCI 0, exactly the two contexts. Six of the nine also cover the walk's own
+bounds, which had been verified by reading only: a descriptor claiming zero
+length, a `wTotalLength` past the buffer, a truncated final descriptor.
+
+### CLOSED — a stick that does not implement SYNCHRONIZE CACHE was a permanent write loop
+
+Closed at `5fde1c5` + `5b8565b`, gated by `usb_flush_optional`. SYNCHRONIZE
+CACHE (0x35) is optional in SBC and a great many USB flash drives answer
+ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE. `msc_flush` read anything
+other than `Scsi::Ok` as a failed flush, and the chain above it closed a loop:
+`EspFs::sync` logged the failure and returned `()`, that line was new pending
+content in the ring `esp_log` was draining, `Sink::flush` still returned `Ok`
+so the sink's disable path never ran, and the next idle pass did it again.
+
+Measured on the pre-fix tree under `usb-flush-unimplemented`: **45 flushes in
+the 89 ms** between the first one and the shutdown, three log lines each,
+stopping only because the machine did. On the T14 that is the state the machine
+boots into and never leaves — continuous writes to the stick it booted from,
+and `MAX_LOG_BYTES` rotating the boot log off it while it happens.
+
+Two defects and both were needed. `Scsi` now carries the sense bytes the driver
+already fetched (`Refused { key, asc, ascq }`) apart from a broken transport,
+and `msc_flush` reads 0x05/0x20/0x00 as an answer, reporting the missing
+command once per device. `FileSystem::sync` returns `Result`, `sync_mount`
+returns it, and `Sink::flush` propagates it — so a flush that really fails
+disables the sink once instead of asking for the next one. With only the second
+half in place the same boot loops **1031 times over a 2 s idle run**; with only
+the first, a stick that genuinely cannot flush still loops.
+
+**The general shape, because it will recur.** An error path that logs is an
+error path that produces work for the thing that failed, and on a machine whose
+log lives on the failing device that work is another attempt at the same
+operation. Every `log!` under `Sink::flush` has this hazard. The three that
+remain are bounded by the disable path (`usb-storage: cache flush failed`,
+`usb-storage: SCSI 0x35 failed`, `esp-log: … stops at …`), measured at 2 per
+boot; the one that is not a failure at all — the no-write-cache report — is
+latched per device for exactly this reason.
+
+**QEMU cannot stage it.** `scsi-disk` implements 0x35 for every front end that
+reaches it, `usb-storage` and `usb-bot` over `scsi-hd` and `scsi-block` alike,
+with no device or drive property to turn it off; `scsi-generic` would need a
+host SCSI device the harness cannot assume. Hence `usb-flush-unimplemented` and
+`usb-flush-fails`.
+
+### CLOSED — five xHCI bring-up waits had no deadline, which on the T14 is a silent hang
+
+Closed at `5fde1c5`, gated by `xhci_deaf_registers`. `USB_TIMEOUT_NS` covered
+`wait_command` and `wait_transfer`; the port-reset spin in `init_device` and
+four register spins in `init_one` — halt, HCRST clear, CNR clear, and leaving
+Halted after R/S — were bare `spin_loop`s. **Five, not the six the audit's
+heading says**; its own location list has five and its summary sentence
+("the port-reset spin in `init_device`, and four register spins in `init_one`")
+agrees. `legacy.rs`'s handoff wait was already bounded.
+
+Pre-fix, both injected configurations hung and the harness timed out after 10 s
+waiting for `===READY===`. That is the T14's failure exactly: on a machine with
+no serial port a spin here paints `Boot: peripherals ready` and nothing else,
+forever, which is what a dead port, a dead controller and every other wedge all
+look like.
+
+`settles` gives each the transfer budget and every caller turns expiry into a
+refusal — the controller by PCI address through the machinery `arm_interrupt`
+already established, the port by number. Both machines now reach `Boot:
+complete`. The gate brackets each wait against the serial timestamps and
+requires ≥1.5 s of it (measured 2.001 s and 2.000 s), because without that it
+would stay green for a `settles` that gave up on its first read — and so would
+every other test in the suite, since QEMU answers all five registers before the
+deadline is ever consulted.
+
+The `DmaPool` moved after the reset, so a controller refused before it costs no
+physical memory; one refused after it gives the pool back when the `DmaPool` is
+dropped.
+
+### CLOSED — `healthy()` answered a different question from the one it documents
+
+Closed at `5fde1c5`. `UsbBlockDevice::healthy` asked
+`storage_geometry(..).is_some_and(|g| g.blocks > 0)`, and `MscDevice::failed` —
+the flag that says the driver will never speak to this device again — does not
+disturb the geometry, which is what the device reported before it broke. So the
+one question the doc comment says it exists to answer, *after a run of
+failures, is there still something there*, was the one it got wrong, in the
+direction that keeps a caller retrying a disk the driver has written off. It now
+asks `xhci::storage_online`, which publishes the flag. Corroborated
+independently by `specs/type-safety-audit/usb-gate-teeth.md`, which called it a
+tautology.
+
+Still true that nothing in the suite sets `failed`, because the recovery path
+is unexecuted — see the Reset Endpoint entry below.
+
 ### USB mass storage: what is not implemented
 
 The driver serves one logical unit per device and speaks the SCSI commands a
@@ -2867,6 +3001,65 @@ disk needs. Deliberately absent, each with its reason:
 - **Concurrency.** One command at a time per controller, under the xHCI lock,
   with preemption disabled for its duration. Fine at boot; a filesystem doing
   real I/O over USB will want the queue depth the transfer rings already allow.
+
+### `reset_recovery` issues Reset Endpoint on an endpoint that is not halted
+
+Filed, not fixed. `Bot::Broken` means four different things — a phase error, a
+malformed or mistagged CSW, a stall the endpoint reset did not clear, or
+**silence** — and `scsi` answers all four with `reset_recovery`, whose first
+step for each endpoint is a Reset Endpoint command. The xHCI spec permits that
+command only on a Halted endpoint. On the silence path the device NAKed until
+`wait_transfer` gave up and the endpoint is still Running, so a conformant xHC
+answers Context State Error, `clear_stall` returns false, `reset_recovery`
+returns false, and `dev.failed` is set. **Nothing clears it**: no re-probe, no
+reset, no rebind. One transfer that times out takes the boot disk offline for
+the life of the boot, and on a machine booting off USB that is `/boot`,
+`esp_log`, and every diagnostic after it.
+
+**Why the one-line version is a no-op wearing a fix's clothes.** Accepting
+`CC_CONTEXT_STATE_ERROR` from Reset Endpoint leaves Set TR Dequeue Pointer
+next, which the spec permits only on a Stopped or Halted endpoint either — so
+recovery still fails, `dev.failed` is still set, and the change buys a
+different completion code in a log line. The real shape is the audit's:
+`Bot` distinguishes `Halted` from `Silent`, `Halted` keeps today's three
+steps, and `Silent` issues **Stop Endpoint** (TRB type 15, legal on a Running
+endpoint) before Set TR Dequeue and skips CLEAR_FEATURE(HALT) for an endpoint
+that is not halted.
+
+**The whole recovery path is unexecuted in a full run** — zero occurrences of
+`transport broke`, `Reset Endpoint` or `Set TR Dequeue` — so anything changed
+there is untested by construction until the actuator exists. That actuator is a
+kernel feature in `xhci-deaf-port`'s shape: make the next bulk transfer's
+`wait_transfer` return `None` without waiting. Two assertions worth having: the
+log says `transport broke`, and the *next* `read_blocks` on the same disk
+succeeds. A second half of the finding is that a `clear_stall` that succeeded
+and one that was never called are indistinguishable in the log, because it logs
+nothing on success — the `panic_console::capture` shape.
+
+Detail and the proposed enum in `specs/type-safety-audit/usb-storage.md` F3.
+
+### `bot`'s length assertion names `MSC_DATA_LEN` and binds a different buffer
+
+Filed, not fixed. `bot` asserts `data_len as usize <= MSC_DATA_LEN` (32 KiB),
+and four of its five call sites point at `MSC_SCRATCH`, whose length is 64.
+The assertion permits a 32,768-byte transfer into a 64-byte buffer. Today's
+largest is 36 (INQUIRY) so there is no live bug; the next command added is
+where it becomes one, and the assertion is what the person adding it will read
+to decide the buffer is big enough. Same shape as `IpcPayload`: a bound in the
+right place with the wrong operand. The fix is to give `bot` the *region*
+rather than a physical address it cannot reason about. `usb-storage.md` F6.
+
+### `READY_BUDGET_NS` bounds the retries, not the boot time it claims to
+
+Filed, not fixed. The comment says "Boot time is what is being protected, and
+boot time is what this measures". It measures when to stop *starting*
+attempts and bounds nothing about the one already running: a device that NAKs
+indefinitely costs one CBW timeout (2 s), then Bulk-Only Reset (2 s), then two
+CLEAR_FEATURE(HALT)s (2 s each) — about 10 s of the boot for one device
+against a 500 ms budget, times however many such devices are on the bus.
+`Profile::MetalUsb` puts six on one controller. The honest statement is that
+`READY_BUDGET_NS` bounds the retries and `USB_TIMEOUT_NS` times what each
+costs, and the *product* is the boot-time figure. `usb-storage.md` F11.
 
 ### `BlockError` is a marker type because `SyscallError` has no I/O variant
 
