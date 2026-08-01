@@ -311,12 +311,16 @@ return a handle sharing the first module's id and TLS block, and
 `std_tls_dlopen`'s test 10 exercises exactly that case. It needs its own change
 with its own test, not a hardening drive-by.
 
-### ASSIGNED — `RingHeader` wraps at 4 GiB and silently corrupts every pipe and `TcpStream`
+### CLOSED — `RingHeader` wraps at 4 GiB and silently corrupts every pipe and `TcpStream`
 
-The ring's byte counters are `u32`. Past 4 GiB of cumulative throughput on a single pipe or
-socket they wrap, and the wrap is silent: no assert, no error, just wrong data. Every pipe and
-every `TcpStream` is affected, and 4 GiB is an afternoon of file transfer, not a theoretical
-bound. Assigned to the `pipe.rs` owner.
+Closed by `af4616d`: the cursors count modulo `2 * capacity`, which `capacity`
+divides, instead of modulo their own `2^32`, which it does not. The counters are
+still `u32` and the layout did not move. Three host tests in `toyos-abi/`, the
+slowest putting 4 GiB through one ring and checking it byte-exact.
+
+Entry left CLOSED rather than deleted because it was still marked ASSIGNED a day
+after the fix landed, and the wrap argument is subtle enough that the next reader
+of `Ring::modulus` should be able to find why it is what it is.
 
 ### ASSIGNED — a machine with no NVMe controller panics the boot
 

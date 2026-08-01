@@ -34,10 +34,9 @@ prevent work, and §Not flagged says which items it dropped and why.
 
 ## Summary
 
-1. **The kernel does pointer arithmetic on a ring header userland can write**
-   (`pipe.rs`). `capacity = 0` divides by zero in kernel context; a large
-   `capacity` gives an attacker-chosen kernel write offset. io_uring in the same
-   tree solved exactly this and wrote the rule down; `pipe.rs` does not follow it.
+1. **FIXED.** The kernel did pointer arithmetic on a ring header userland can
+   write (`pipe.rs`). Reproduced, then closed by making the kernel stop reading
+   the header rather than by validating it — see §1.
 2. **`Descriptor` releases four kinds of resource in two hand-copied `match`
    arms, not in `Drop`** (`fd.rs`). `FdTable::insert_at` documents that it
    replaces a live descriptor, and the replaced one leaks everything `fd::close`
@@ -81,135 +80,36 @@ Two framings worth keeping regardless of which land:
 
 ---
 
-## 1. The pipe ring header is untrusted input the kernel treats as a bound
+## 1. The pipe ring header is untrusted input the kernel treats as a bound — FIXED
 
-**Location.** `pipe.rs:117` (`RingHeader::init` on the page), `:130-133`
-(`Pipe::header`), `:192-213` (`try_read`), `:220-232` (`try_write`), `:234-248`
-(`has_data`/`has_space`). Header type: `toyos-abi/src/ring.rs:11-17`. Mapping:
-`arch/syscall.rs:918-940` → `process::vma_map` (`process.rs:30-36`) →
-`alloc_and_map(.., writable = true)`.
+Reproduced on a guest, then fixed. `tests/toyos-rust-tests/src/bin/abuse_pipe_ring.rs`
+is the gate; the commit carries the before/after output. `Ring` now owns the
+base, the capacity and both cursors in kernel memory, and `RingHeader` in the
+shared page keeps only `flags`, which the kernel no longer reads either.
 
-**The shape.** `RingHeader` sits at offset 0 of the pipe's 2 MiB page.
-`SYS_PIPE_MAP` maps that page into the calling process, writable — by design:
-`toyos-abi/src/syscall.rs:861` says it "Returns a pointer to the `RingHeader` at
-the start of the mapped region", and `userland/netd/src/main.rs:215` holds one as
-`*const RingHeader`. The kernel then reads the same fields on every read/write
-syscall. `RingHeader::read`:
+Three things this file got wrong, kept because they are the kind of thing a
+read-only audit gets wrong:
 
-```rust
-let cap = self.capacity as usize;              // userland-writable
-let r   = self.read_cursor.load(Relaxed) as usize;
-let offset = r % cap;                          // cap == 0  ->  #DE in kernel context
-core::ptr::copy_nonoverlapping(self.data_ptr().add(offset), buf.as_mut_ptr(), first);
-```
+- **Not `#DE`.** `capacity = 0` is `%` by a runtime zero, which rustc lowers to
+  `panic_const_rem_by_zero`. A kernel panic, not a hardware divide error.
+- **The consequence is worse than the panic.** The panic fires inside
+  `with_pipes`, and a syscall-context panic is *recovered* — the process is
+  killed and `PIPES` stays held forever. The reproduction did not crash the
+  machine; it wedged every pipe in the system, which is all IPC, and the harness
+  reported a timeout. Reasoning from "the guest takes the machine down" would
+  have missed that the severity comes from the stranded lock.
+- **It is not an SPSC ring shared with userland.** Nothing outside `ring.rs` has
+  ever read or written a cursor, and `write_cursor`/`read_cursor`/`capacity` had
+  zero readers in the whole tree (netd maps the header only for
+  `is_reader_closed`/`is_writer_closed`). So the proposed
+  `read_with_capacity(cap, buf) -> Result<_, RingCorrupt>` solved a problem that
+  does not exist: with both cursors kernel-owned there is no untrusted input to
+  validate, no error to return, and no call site to thread a capacity through.
+  Checking who reads a field is one grep, and it changed the design.
 
-**The bug it permits**, from a process that owns a pipe and nothing else:
-
-- `capacity = 0` → `modulus()` is 0 → `available()` computes `% 0` → divide error
-  on the syscall path.
-- `capacity = 0xFFFF_FFFF` → `offset = w % cap` is attacker-chosen up to ~4 GiB,
-  and `data.add(offset)` is a kernel direct-map pointer the syscall
-  `copy_nonoverlapping`s the caller's buffer into. A kernel write primitive with
-  attacker-chosen offset and contents.
-- With `capacity` untouched but `write_cursor` arbitrary, `available()` is
-  bounded by `2 * capacity` rather than `capacity`, so `read`'s second copy runs
-  past the end of the ring page into whatever the PMM handed out next — a
-  disclosure into the caller's own read buffer.
-
-Three stores and a `write`. No crafted file, no race.
-
-**Reproduction to stage (not run).** A guest program: `SYS_PIPE`, `SYS_PIPE_MAP`
-on the write fd, `(*hdr).capacity = 0`, `write(fd, b"x")`. Expected today: the
-guest takes the machine down. `tests/toyos-rust-tests/src/bin/` already has the
-`abuse_*.rs` family (`abuse_pipe_owner.rs`, `abuse_io_uring.rs`,
-`abuse_listener_hijack.rs`); this is one more.
-
-**The tree states the rule already.** `io_uring.rs:163-167`:
-
-> The authoritative CQ tail. The copy in the shared header is a publication for
-> userspace, which only ever reads it — **the kernel must not read its own tail
-> back out of a page the process can write.**
-
-io_uring holds `sq_size`/`cq_size` in `IoUringInstance`, masks every index with
-the kernel's own copy (`:398`, `:204`), keeps `cq_tail` in a `Cell` outside the
-shared page, and refuses rather than clamps when the shared cursors disagree
-(`:395-397`). `pipe.rs` was written to the opposite convention.
-
-### Both ways, at `pipe.rs:192-213`
-
-Current:
-
-```rust
-pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
-    let (result, boost) = with_pipes_mut(|pipes| {
-        let Some(pipe) = pipes.get_mut(pipe_id) else { return (None, false) };
-        let header = pipe.header();
-        if header.available() > 0 {                       // trusts capacity
-            let n = header.read(buf);                     // trusts capacity + cursors
-            let boost = pipe.rt_boost_pending;
-            pipe.rt_boost_pending = false;
-            (Some(n), boost)
-        } else if pipe.writers == 0 || header.is_writer_closed() {
-            (Some(0), false)
-        } else {
-            (None, false)
-        }
-    });
-```
-
-Proposed — one extra field on `Pipe`, and the trust boundary becomes visible in
-the call itself:
-
-```rust
-pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
-    let (result, boost) = with_pipes_mut(|pipes| {
-        let Some(pipe) = pipes.get_mut(pipe_id) else { return (None, false) };
-        let header = pipe.header();
-        match header.read_with_capacity(pipe.capacity, buf) {
-            Ok(n) if n > 0 => {
-                let boost = pipe.rt_boost_pending;
-                pipe.rt_boost_pending = false;
-                (Some(n), boost)
-            }
-            // A ring whose cursors its capacity cannot explain is a peer that
-            // scribbled on its own ring. EOF is the honest answer; a clamp
-            // would be the quiet version of the same defect.
-            Err(RingCorrupt) => (Some(0), false),
-            Ok(_) if pipe.writers == 0 || header.is_writer_closed() => (Some(0), false),
-            Ok(_) => (None, false),
-        }
-    });
-```
-
-The proposed version is the same length, reads the same, and the one thing that
-changed — `header.read(buf)` → `header.read_with_capacity(pipe.capacity, buf)` —
-is the entire security property, stated at the call site. That is the argument
-for it: not that it is shorter, but that the trusted quantity is now named where
-a reader can see it, instead of being invisible inside a shared-memory field.
-
-ABI side:
-
-```rust
-impl RingHeader {
-    /// Returns the capacity it installed, so a kernel-side owner can keep it.
-    pub fn init(ptr: *mut u8, total_size: usize) -> u32 { ... }
-
-    /// For a reader that does not trust the header. `cap` must be what `init`
-    /// returned. `Err` means the cursors are unexplainable by that capacity.
-    pub fn read_with_capacity(&self, cap: u32, buf: &mut [u8]) -> Result<usize, RingCorrupt>;
-    pub fn write_with_capacity(&self, cap: u32, buf: &[u8]) -> Result<usize, RingCorrupt>;
-}
-```
-
-**Blast radius.** `toyos-abi/src/ring.rs` (its host tests thread the capacity
-through — they already construct the ring and know it), `kernel/src/pipe.rs`
-(5 call sites), and the userland readers of `RingHeader` if the trusting form is
-removed rather than kept alongside. No layout change, so no bootloader or
-`KernelArgs` coupling.
-
-**Relation to filed work.** Distinct from known-issues §1's "`RingHeader` wraps
-at 4 GiB" (ASSIGNED): that is arithmetic both sides get wrong honestly. This is
-the kernel believing a field an attacker owns. Same struct, same owner.
+What the finding got right, and what to carry: the tree already stated the rule
+(`io_uring.rs:163`), and "the answer is already in the tree" was the correct
+frame. So was declining to clamp.
 
 ---
 
