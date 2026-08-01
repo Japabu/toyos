@@ -207,6 +207,14 @@ what it checked.
 
 Same rule as §5: each check is "boot is unchanged", not "the feature works".
 
+**Standing rule, because this section is itself perishable.** Before flashing,
+run `git log <the commit this section last covered>..HEAD --name-only` over
+`kernel/ bootloader/ src/ toyos-abi/ toyos/ userland/` and add an item for
+anything new. §5 went stale in under two hours; this section went stale once
+*while being written*, which is how 5A.8 came to exist. A section that lists
+commits by hash tells you exactly when it stopped being true — that is the only
+reason to write it this way.
+
 ### 5A.1 Artifact staging — `9ee156c`
 
 This one changed how **the artifact the owner flashes is produced**, so it
@@ -269,6 +277,16 @@ Runs for every program spawned and every `dlopen`, so every boot exercises it.
 | **Run** | `cargo test -- window`, `cargo test -- metal_sim_window_caps`, `cargo test -- compositor`. |
 | **Expect** | A client survives a compositor that refuses. |
 | **False pass** | **This certifies almost nothing about the flash.** The T14 boots the compositor with no client until a terminal exists, and input is dead on that machine, so no window is ever created and the refusal path is never reached. Its value here is only "the compositor still starts". |
+
+### 5A.8 netd's capacity refusal and its new error code — `dd91b14`
+
+Landed while §5A was being written, which is why the standing rule above exists.
+
+| | |
+|---|---|
+| **Run** | `cargo test -- netd`, and confirm from a metal-sim boot that netd still exits gracefully on a machine with no NIC. |
+| **Expect** | `netd_caps` passes on `tests/netcase`; under metal-sim netd finds no device and exits, unchanged. |
+| **False pass** | **The changed code cannot execute on the T14 at all.** netd's `main` opens the NIC and returns on `NotFound`, so on a machine with no NIC — metal-sim by design, and the laptop, which has no driver for its hardware — not one line of the new cap, the refusal sites or the widened poller runs. `tests/netcase` is the *only* config that puts a NIC in front of netd, so a green `netd_caps` is evidence about a configuration the owner is not flashing. What this item actually checks is the **unchanged** half: that netd still exits rather than panicking, which `metal_sim_compositor` reads from the daemon's own words. Do not let a green network gate read as coverage of the flashed machine. |
 
 ---
 
