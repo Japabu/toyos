@@ -35,6 +35,7 @@ mod tmpfs;
 mod file_backing;
 mod bcachefs_adapter;
 mod fat32_adapter;
+mod esp_log;
 #[allow(dead_code)]
 mod vfs;
 mod elf;
@@ -430,7 +431,13 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // unrepresentable. A machine that cannot identify its boot partition has
     // no `/boot` and boots exactly as it did before.
     match fat32_adapter::mount_boot() {
-        Some(fs) => vfs::lock().mount("boot", Box::new(fs)),
+        Some(fs) => {
+            vfs::lock().mount("boot", Box::new(fs));
+            // Immediately after the mount and before anything else can fail:
+            // what a machine with no serial port most needs in the file is the
+            // boot that did not finish.
+            esp_log::install();
+        }
         None => log!("esp: no boot volume — the kernel has no /boot this boot"),
     }
 
