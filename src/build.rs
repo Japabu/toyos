@@ -215,6 +215,79 @@ fn cargo_build(
     }
 }
 
+// --- Artifact staging ---
+//
+// The bootloader's init list is *compiled in* (`bootloader/build.rs` declares
+// `rerun-if-env-changed=INIT_PROGRAMS`; `main.rs` reads `env!("INIT_PROGRAMS")`),
+// and the kernel's features likewise change its binary. But cargo keys the
+// artifact path on (crate, target, profile) and nothing else, so every config
+// writes and reads one path.
+//
+// The window is not a moment: `build_test_image` builds the bootloader, then
+// runs the entire userland build and initrd assembly, and only then reads the
+// `.efi`. Seconds to minutes, during which another config's build overwrites it.
+// Observed: an image carrying metalcase's initrd and another config's bootloader,
+// whose 28-byte init string was `"/bin/soundd;/bin/test-runner"`. The compositor
+// was never spawned and the test failed as though the daemon under test were
+// broken.
+//
+// So: hold a lock across each build→stage pair, and copy the artifact to a name
+// carrying what it is actually keyed by. Readers use the staged name, which no
+// other config can overwrite.
+
+/// Advisory lock over the shared cargo artifact paths.
+///
+/// `flock` is released by the kernel on process exit, so a killed builder cannot
+/// strand it — which a lock file with a PID in it could.
+struct ArtifactLock {
+    /// Never read: the lock is released when this `File` closes, so holding it
+    /// *is* the lock. Dropping the field would release on acquire.
+    _file: fs::File,
+}
+
+impl ArtifactLock {
+    fn acquire(root: &Path) -> Self {
+        let path = root.join("target/.artifact-lock");
+        fs::create_dir_all(root.join("target")).ok();
+        let file = fs::File::create(&path)
+            .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_EX: i32 = 2;
+            // SAFETY: `file` owns the fd for the duration of this call and the
+            // returned guard.
+            let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+            assert_eq!(rc, 0, "flock on {} failed", path.display());
+        }
+        Self { _file: file }
+    }
+}
+
+fn key_hash(parts: &[&str]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Copy a just-built artifact to a path carrying its build key, and return that
+/// path. Must be called with [`ArtifactLock`] held, before anything else can
+/// rebuild the same crate.
+fn stage_artifact(root: &Path, built: &Path, stem: &str, key: u64) -> PathBuf {
+    let staged = root.join(format!("target/{stem}-{key:016x}"));
+    fs::create_dir_all(root.join("target")).ok();
+    fs::copy(built, &staged).unwrap_or_else(|e| {
+        panic!("stage {} -> {}: {e}", built.display(), staged.display())
+    });
+    staged
+}
+
 // --- Shared initrd assembly ---
 
 /// Build all programs from a config and assemble an initrd.
@@ -329,50 +402,73 @@ pub fn build(root: &Path, debug: bool, release: bool) {
     invalidate_stale(root, &config, &fp);
 
     let init_programs = config.init.join(";");
-    let kernel_handle = {
-        let root = root.to_path_buf();
-        let path_env = path_env.clone();
-        let release = release;
-        let debug = debug;
-        std::thread::spawn(move || {
+    let kernel_features = if debug { "debug-wait" } else { "" };
+
+    // Same lock-and-stage as `build_test_image`: `cargo run --build-only` and
+    // `cargo test` share these paths, so this races the harness too.
+    let (kernel_art, bl_art) = {
+        let _lock = ArtifactLock::acquire(root);
+        let kernel_handle = {
+            let root = root.to_path_buf();
+            let path_env = path_env.clone();
+            std::thread::spawn(move || {
+                let mut extra = Vec::new();
+                if release {
+                    extra.push("--release");
+                }
+                if debug {
+                    extra.push("--features");
+                    extra.push("debug-wait");
+                }
+                cargo_build(
+                    &root.join("kernel"),
+                    "x86_64-unknown-none",
+                    &extra,
+                    &path_env,
+                    &[],
+                    false,
+                );
+            })
+        };
+        {
             let mut extra = Vec::new();
             if release {
                 extra.push("--release");
             }
-            if debug {
-                extra.push("--features");
-                extra.push("debug-wait");
-            }
             cargo_build(
-                &root.join("kernel"),
-                "x86_64-unknown-none",
+                &root.join("bootloader"),
+                "x86_64-unknown-uefi",
                 &extra,
                 &path_env,
-                &[],
+                &[("INIT_PROGRAMS", init_programs.as_str())],
                 false,
             );
-        })
-    };
-    {
-        let mut extra = Vec::new();
-        if release {
-            extra.push("--release");
         }
-        cargo_build(
-            &root.join("bootloader"),
-            "x86_64-unknown-uefi",
-            &extra,
-            &path_env,
-            &[("INIT_PROGRAMS", init_programs.as_str())],
-            false,
-        );
-    }
-    kernel_handle.join().expect("kernel build thread panicked");
+        kernel_handle.join().expect("kernel build thread panicked");
+        (
+            stage_artifact(
+                root,
+                &root.join(format!("kernel/target/x86_64-unknown-none/{profile}/kernel")),
+                "kernel",
+                key_hash(&[profile, kernel_features]),
+            ),
+            stage_artifact(
+                root,
+                &root.join(format!(
+                    "bootloader/target/x86_64-unknown-uefi/{profile}/bootloader.efi"
+                )),
+                "bootloader.efi",
+                key_hash(&[profile, &init_programs]),
+            ),
+        )
+    };
 
     let initrd_bytes =
         build_and_assemble(root, &config, profile, &path_env, &[], false);
 
-    let disk_bytes = image::create_boot_image(&initrd_bytes, profile);
+    let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
+    let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
+    let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes);
     fs::write(root.join("target/bootable.img"), disk_bytes).expect("Failed to write image");
 
     let nvme_path = root.join("target/nvme.img");
@@ -455,22 +551,42 @@ pub fn build_test_image(
         kernel_extra.push("--features");
         kernel_extra.push(&features);
     }
-    cargo_build(
-        &root.join("kernel"),
-        "x86_64-unknown-none",
-        &kernel_extra,
-        &path_env,
-        &[],
-        quiet,
-    );
-    cargo_build(
-        &root.join("bootloader"),
-        "x86_64-unknown-uefi",
-        &[],
-        &path_env,
-        &[("INIT_PROGRAMS", init_programs.as_str())],
-        quiet,
-    );
+    // Build and stage under one lock. Releasing before `build_and_assemble` is
+    // deliberate: the userland build is long, takes no shared artifact path, and
+    // the staged copies below are already immune to another config's rebuild.
+    let (kernel_art, bl_art) = {
+        let _lock = ArtifactLock::acquire(root);
+        cargo_build(
+            &root.join("kernel"),
+            "x86_64-unknown-none",
+            &kernel_extra,
+            &path_env,
+            &[],
+            quiet,
+        );
+        cargo_build(
+            &root.join("bootloader"),
+            "x86_64-unknown-uefi",
+            &[],
+            &path_env,
+            &[("INIT_PROGRAMS", init_programs.as_str())],
+            quiet,
+        );
+        (
+            stage_artifact(
+                root,
+                &root.join("kernel/target/x86_64-unknown-none/debug/kernel"),
+                "kernel",
+                key_hash(&["debug", &features]),
+            ),
+            stage_artifact(
+                root,
+                &root.join("bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi"),
+                "bootloader.efi",
+                key_hash(&["debug", &init_programs]),
+            ),
+        )
+    };
 
     let initrd_bytes = build_and_assemble(
         root,
@@ -481,11 +597,8 @@ pub fn build_test_image(
         quiet,
     );
 
-    let kernel_bytes = fs::read(root.join("kernel/target/x86_64-unknown-none/debug/kernel"))
-        .expect("Failed to read kernel");
-    let bl_bytes =
-        fs::read(root.join("bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi"))
-            .expect("Failed to read bootloader");
+    let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
+    let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
 
     let esp = image::create_fat_volume(&kernel_bytes, &bl_bytes, &initrd_bytes);
     image::create_gpt_disk(esp)

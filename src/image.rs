@@ -1,5 +1,4 @@
 use fatfs::FsOptions;
-use std::fs;
 use std::io::{Cursor, Read, Write};
 
 use bcachefs::{Formatted, VecBlockIO};
@@ -40,13 +39,11 @@ pub fn create_initrd(
     fs.into_io().into_vec()
 }
 
-pub fn create_boot_image(initrd_bytes: &[u8], profile: &str) -> Vec<u8> {
-    let kernel_bytes = fs::read(format!("kernel/target/x86_64-unknown-none/{profile}/kernel"))
-        .expect("Failed to read kernel");
-    let bl_bytes = fs::read(format!("bootloader/target/x86_64-unknown-uefi/{profile}/bootloader.efi"))
-        .expect("Failed to read bootloader");
-
-    let esp_volume = create_fat_volume(&kernel_bytes, &bl_bytes, initrd_bytes);
+/// Takes the artifacts as bytes rather than reading them: the caller stages them
+/// under a build-key-derived name first, because cargo's own path is shared by
+/// every config and is overwritten by any concurrent build (see `build.rs`).
+pub fn create_boot_image(kernel_bytes: &[u8], bl_bytes: &[u8], initrd_bytes: &[u8]) -> Vec<u8> {
+    let esp_volume = create_fat_volume(kernel_bytes, bl_bytes, initrd_bytes);
     create_gpt_disk(esp_volume)
 }
 
