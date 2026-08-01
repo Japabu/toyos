@@ -5,14 +5,9 @@
 //! and kernel pipes.
 
 use toyos_abi::syscall;
-use crate::ipc::IpcHeader;
+use crate::ipc::{IpcHeader, IpcPayload};
+use crate::ipc_payload;
 use crate::{Connection, Pipe, Handle};
-
-/// Marker trait for types safe to transmit over IPC.
-///
-/// # Safety
-/// Implementors must be `#[repr(C)]` with no padding bytes and no pointers.
-pub unsafe trait IpcPayload: Copy {}
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,158 +121,109 @@ pub struct UdpSocketId(pub u32);
 
 // Protocol request/response structs
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TcpConnectPipedRequest {
-    pub addr: [u8; 4],
-    pub port: u16,
-    pub _pad: u16,
-    pub timeout_ms: u32,
-    pub _pad2: u32,
-    pub rx_pipe_id: u64,
-    pub tx_pipe_id: u64,
-}
-unsafe impl IpcPayload for TcpConnectPipedRequest {}
+ipc_payload! {
+    pub struct TcpConnectPipedRequest {
+        pub addr: [u8; 4],
+        pub port: u16,
+        pub _pad: u16,
+        pub timeout_ms: u32,
+        pub _pad2: u32,
+        pub rx_pipe_id: u64,
+        pub tx_pipe_id: u64,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TcpConnectResponse {
-    pub socket_id: u32,
-    pub local_port: u16,
-    pub _pad: u16,
-}
-unsafe impl IpcPayload for TcpConnectResponse {}
+    pub struct TcpConnectResponse {
+        pub socket_id: u32,
+        pub local_port: u16,
+        pub _pad: u16,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SocketCloseRequest {
-    pub socket_id: u32,
-}
-unsafe impl IpcPayload for SocketCloseRequest {}
+    pub struct SocketCloseRequest {
+        pub socket_id: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TcpBindPipedRequest {
-    pub addr: [u8; 4],
-    pub port: u16,
-    pub _pad: u16,
-    pub notify_pipe_id: u64,
-}
-unsafe impl IpcPayload for TcpBindPipedRequest {}
+    pub struct TcpBindPipedRequest {
+        pub addr: [u8; 4],
+        pub port: u16,
+        pub _pad: u16,
+        pub notify_pipe_id: u64,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TcpBindResponse {
-    pub socket_id: u32,
-    pub bound_port: u16,
-    pub _pad: u16,
-}
-unsafe impl IpcPayload for TcpBindResponse {}
+    pub struct TcpBindResponse {
+        pub socket_id: u32,
+        pub bound_port: u16,
+        pub _pad: u16,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TcpShutdownRequest {
-    pub socket_id: u32,
-    pub how: u32,
-}
-unsafe impl IpcPayload for TcpShutdownRequest {}
+    pub struct TcpShutdownRequest {
+        pub socket_id: u32,
+        pub how: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TcpAcceptPipedRequest {
-    pub socket_id: u32,
-    pub _pad: u32,
-    pub rx_pipe_id: u64,
-    pub tx_pipe_id: u64,
-}
-unsafe impl IpcPayload for TcpAcceptPipedRequest {}
+    pub struct TcpAcceptPipedRequest {
+        pub socket_id: u32,
+        pub _pad: u32,
+        pub rx_pipe_id: u64,
+        pub tx_pipe_id: u64,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TcpAcceptPipedResponse {
-    pub socket_id: u32,
-    pub remote_addr: [u8; 4],
-    pub remote_port: u16,
-    pub local_port: u16,
-}
-unsafe impl IpcPayload for TcpAcceptPipedResponse {}
+    pub struct TcpAcceptPipedResponse {
+        pub socket_id: u32,
+        pub remote_addr: [u8; 4],
+        pub remote_port: u16,
+        pub local_port: u16,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct UdpBindRequest {
-    pub addr: [u8; 4],
-    pub port: u16,
-    pub _pad: u16,
-    pub tx_pipe_id: u64,
-    pub rx_pipe_id: u64,
-}
-unsafe impl IpcPayload for UdpBindRequest {}
+    pub struct UdpBindRequest {
+        pub addr: [u8; 4],
+        pub port: u16,
+        pub _pad: u16,
+        pub tx_pipe_id: u64,
+        pub rx_pipe_id: u64,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct UdpBindResponse {
-    pub socket_id: u32,
-    pub bound_port: u16,
-    pub _pad: u16,
-}
-unsafe impl IpcPayload for UdpBindResponse {}
+    pub struct UdpBindResponse {
+        pub socket_id: u32,
+        pub bound_port: u16,
+        pub _pad: u16,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct UdpSendToRequest {
-    pub socket_id: u32,
-    pub addr: [u8; 4],
-    pub port: u16,
-    pub len: u16,
-}
-unsafe impl IpcPayload for UdpSendToRequest {}
+    pub struct UdpSendToRequest {
+        pub socket_id: u32,
+        pub addr: [u8; 4],
+        pub port: u16,
+        pub len: u16,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct UdpRecvFromRequest {
-    pub socket_id: u32,
-    pub max_len: u32,
-}
-unsafe impl IpcPayload for UdpRecvFromRequest {}
+    pub struct UdpRecvFromRequest {
+        pub socket_id: u32,
+        pub max_len: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct UdpRecvResponse {
-    pub addr: [u8; 4],
-    pub port: u16,
-    pub len: u16,
-}
-unsafe impl IpcPayload for UdpRecvResponse {}
+    pub struct UdpRecvResponse {
+        pub addr: [u8; 4],
+        pub port: u16,
+        pub len: u16,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SocketOptionRequest {
-    pub socket_id: u32,
-    pub option: u32,
-    pub value: u32,
-}
-unsafe impl IpcPayload for SocketOptionRequest {}
+    pub struct SocketOptionRequest {
+        pub socket_id: u32,
+        pub option: u32,
+        pub value: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SocketOptionResponse {
-    pub value: u32,
-}
-unsafe impl IpcPayload for SocketOptionResponse {}
+    pub struct SocketOptionResponse {
+        pub value: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ErrorResponse {
-    pub code: u32,
-}
-unsafe impl IpcPayload for ErrorResponse {}
+    pub struct ErrorResponse {
+        pub code: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SentBytes {
-    value: u32,
+    struct SentBytes {
+        value: u32,
+    }
 }
-unsafe impl IpcPayload for SentBytes {}
 
 // Return types
 
@@ -372,7 +318,7 @@ impl PendingResponse {
 
     pub fn status(self) -> Result<(), NetError> {
         let header = self.recv_checked_header()?;
-        if header.len > 0 {
+        if header.len() > 0 {
             let mut skip = [0u8; 128];
             let _ = self.conn().recv_bytes(&header, &mut skip);
         }

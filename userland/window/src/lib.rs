@@ -51,10 +51,10 @@ pub const MSG_CLIPBOARD_PASTE_SHM: u32 = 11;
 pub const REFUSED_AT_CAPACITY: u32 = 1;
 pub const REFUSED_TOO_LARGE: u32 = 2;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct WindowRefused {
-    pub reason: u32,
+toyos::ipc_payload! {
+    pub struct WindowRefused {
+        pub reason: u32,
+    }
 }
 
 /// Why creating a window failed.
@@ -100,35 +100,29 @@ impl CreateError {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ClipboardShmMsg {
-    pub token: u32,
-    pub len: u32,
-}
+toyos::ipc_payload! {
+    pub struct ClipboardShmMsg {
+        pub token: u32,
+        pub len: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ResolutionRequest {
-    pub width: u32,
-    pub height: u32,
-}
+    pub struct ResolutionRequest {
+        pub width: u32,
+        pub height: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ResolutionInfo {
-    pub width: u32,
-    pub height: u32,
-}
+    pub struct ResolutionInfo {
+        pub width: u32,
+        pub height: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CreateWindowRequest {
-    pub width: u32,
-    pub height: u32,
-    pub flags: u8,
-    pub title_len: u8,
-    pub title: [u8; 30],
+    pub struct CreateWindowRequest {
+        pub width: u32,
+        pub height: u32,
+        pub flags: u8,
+        pub title_len: u8,
+        pub title: [u8; 30],
+    }
 }
 
 pub const MOUSE_MOVE: u8 = 0;
@@ -136,36 +130,32 @@ pub const MOUSE_PRESS: u8 = 1;
 pub const MOUSE_RELEASE: u8 = 2;
 pub const MOUSE_SCROLL: u8 = 3;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MouseEvent {
-    pub x: u16,
-    pub y: u16,
-    pub buttons: u8,
-    pub event_type: u8,
-    pub changed: u8,
-    pub scroll: i8,
-}
+toyos::ipc_payload! {
+    pub struct MouseEvent {
+        pub x: u16,
+        pub y: u16,
+        pub buttons: u8,
+        pub event_type: u8,
+        pub changed: u8,
+        pub scroll: i8,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct WindowInfo {
-    pub token: u32,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub pixel_format: u32,
-}
+    pub struct WindowInfo {
+        pub token: u32,
+        pub width: u32,
+        pub height: u32,
+        pub stride: u32,
+        pub pixel_format: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ResizeInfo {
-    pub token: u32,
-    pub old_token: u32,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub pixel_format: u32,
+    pub struct ResizeInfo {
+        pub token: u32,
+        pub old_token: u32,
+        pub width: u32,
+        pub height: u32,
+        pub stride: u32,
+        pub pixel_format: u32,
+    }
 }
 
 pub const MOD_SHIFT: u8 = 1;
@@ -174,13 +164,13 @@ pub const MOD_ALT: u8 = 4;
 pub const MOD_GUI: u8 = 8;
 pub const MOD_RELEASED: u8 = 0x10;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct KeyEvent {
-    pub keycode: u8,
-    pub modifiers: u8,
-    pub len: u8,
-    pub translated: [u8; 5],
+toyos::ipc_payload! {
+    pub struct KeyEvent {
+        pub keycode: u8,
+        pub modifiers: u8,
+        pub len: u8,
+        pub translated: [u8; 5],
+    }
 }
 
 impl KeyEvent {
@@ -269,8 +259,8 @@ impl Window {
         conn.send(MSG_CREATE_WINDOW, &req).map_err(|_| CreateError::NoCompositor)?;
 
         // Header first, then the payload the message type calls for: the two
-        // answers carry different structs, and `recv_payload` asserts on a
-        // payload shorter than the type it was asked for.
+        // answers carry different structs, and a payload shorter than the type
+        // it was asked for is a refusal from `recv_payload`, not a window.
         let header = conn.recv_header().map_err(|_| CreateError::NoCompositor)?;
         match header.msg_type {
             MSG_WINDOW_CREATED => {}
@@ -311,12 +301,23 @@ impl Window {
         }
     }
 
+    /// A message the compositor cannot have meant closes the window rather
+    /// than killing the client: this side is a library inside somebody else's
+    /// program, and it has a way to say "the session is over".
     fn decode_event(&mut self, header: &ipc::IpcHeader) -> Event {
         match header.msg_type {
-            MSG_KEY_INPUT => Event::KeyInput(self.conn.recv_payload(header).unwrap()),
-            MSG_MOUSE_INPUT => Event::MouseInput(self.conn.recv_payload(header).unwrap()),
+            MSG_KEY_INPUT => match self.conn.recv_payload(header) {
+                Ok(ev) => Event::KeyInput(ev),
+                Err(_) => Event::Close,
+            },
+            MSG_MOUSE_INPUT => match self.conn.recv_payload(header) {
+                Ok(ev) => Event::MouseInput(ev),
+                Err(_) => Event::Close,
+            },
             MSG_WINDOW_RESIZED => {
-                let info: ResizeInfo = self.conn.recv_payload(header).unwrap();
+                let Ok(info) = self.conn.recv_payload::<ResizeInfo>(header) else {
+                    return Event::Close;
+                };
                 let buf_size = info.stride as usize * info.height as usize * 4;
                 self.shm = SharedMemory::map(info.token, buf_size);
                 self.width = info.width;
@@ -326,11 +327,15 @@ impl Window {
             }
             MSG_CLIPBOARD_PASTE => {
                 let mut buf = [0u8; 4096];
-                let n = self.conn.recv_bytes(header, &mut buf).unwrap();
+                let Ok(n) = self.conn.recv_bytes(header, &mut buf) else {
+                    return Event::Close;
+                };
                 Event::ClipboardPaste(buf[..n].to_vec())
             }
             MSG_CLIPBOARD_PASTE_SHM => {
-                let info: ClipboardShmMsg = self.conn.recv_payload(header).unwrap();
+                let Ok(info) = self.conn.recv_payload::<ClipboardShmMsg>(header) else {
+                    return Event::Close;
+                };
                 let shm = SharedMemory::map(info.token, info.len as usize);
                 let data = shm.as_slice()[..info.len as usize].to_vec();
                 Event::ClipboardPaste(data)

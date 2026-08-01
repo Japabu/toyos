@@ -16,30 +16,30 @@ pub const MSG_STREAM_ERROR: u32 = 5;
 /// The only sample format currently implemented end-to-end.
 pub const FORMAT_S16LE: u16 = 0;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct StreamOpenRequest {
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub format: u16,
-}
+crate::ipc_payload! {
+    pub struct StreamOpenRequest {
+        pub sample_rate: u32,
+        pub channels: u16,
+        pub format: u16,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct StreamOpenResponse {
-    pub shm_token: u32,
-    pub signal_pipe_id: u64,
-    pub client_period_frames: u32,
-    pub client_period_bytes: u32,
-    pub device_sample_rate: u32,
-    pub device_channels: u16,
-    pub slot_count: u16,
-}
+    pub struct StreamOpenResponse {
+        pub shm_token: u32,
+        /// The compiler reserved these bytes to align `signal_pipe_id`; naming
+        /// them is what stops soundd's struct literal from sending whatever
+        /// its stack held to every audio client.
+        pub _pad0: u32,
+        pub signal_pipe_id: u64,
+        pub client_period_frames: u32,
+        pub client_period_bytes: u32,
+        pub device_sample_rate: u32,
+        pub device_channels: u16,
+        pub slot_count: u16,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct StreamSetVolume {
-    pub gain: f32,
+    pub struct StreamSetVolume {
+        pub gain: f32,
+    }
 }
 
 pub fn audio_submit(buf_idx: u32, len: u32) -> Result<(), syscall::SyscallError> {

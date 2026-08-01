@@ -376,6 +376,12 @@ pub fn debug(action: u64) -> u64 {
 }
 
 /// Create a pipe. Returns the read and write file descriptors.
+///
+/// The return type is dishonest and the caller must not trust it: `sys_pipe`
+/// answers `ResourceExhausted` on three paths (no pipe pages, and either fd
+/// insert hitting `MAX_FDS`), and that one word splits into `read = Fd(-1)`,
+/// `write = Fd(-8)` here. Both are rejected by any later syscall, so the
+/// failure surfaces as whatever the *next* call decides to do about a bad fd.
 pub fn pipe() -> PipeFds {
     let raw = syscall(SYS_PIPE, 0, 0, 0, 0);
     PipeFds {
@@ -899,8 +905,14 @@ pub fn audio_submit(buf_idx: u32, len: u32) -> Result<(), SyscallError> {
 }
 
 /// Allocate a TLS block for a dlopen'd module on the current thread.
-/// Returns the physical address of the allocated block (as stored in the DTV).
-/// Panics in the kernel if module_id is invalid or allocation fails.
+/// Returns the block's *virtual* address, which is what the kernel writes into
+/// the DTV.
+///
+/// The return type is dishonest and the caller must not trust it: the kernel
+/// answers `InvalidArgument` for a `module_id` of 0 or one outside the
+/// process's module list, and `ResourceExhausted` past `DTV_INITIAL_CAPACITY`
+/// or when the mapping fails. Each arrives here as a value near `u64::MAX`
+/// that `__tls_get_addr_slow` adds an offset to and returns as a pointer.
 pub fn tls_alloc_block(module_id: u64) -> u64 {
     syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0)
 }

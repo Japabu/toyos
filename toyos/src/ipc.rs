@@ -6,16 +6,136 @@ use toyos_abi::Fd;
 use toyos_abi::syscall::{self, SyscallError};
 use crate::{AsHandle, Handle};
 
-#[repr(C)]
+/// A type that may cross an IPC boundary as a payload.
+///
+/// # Safety
+/// Implementors must be `#[repr(C)]`, contain no padding bytes, hold no
+/// pointers, and have no invalid bit patterns. All three are load-bearing:
+/// [`send`] publishes `size_of::<T>()` bytes of the sender's memory to a peer,
+/// so a padding byte no field owns is whatever the sender's stack held; and
+/// [`recv_payload`] reinterprets bytes a *peer* chose, so a `bool`, a
+/// fieldless enum or a `NonZeroU32` would be UB the moment it arrives.
+///
+/// Declare payload structs with [`ipc_payload!`], which proves the first two
+/// mechanically. A hand-written `unsafe impl` is checking them by eye.
+///
+/// `usize` and `isize` are deliberately absent: a wire type has one width.
+pub unsafe trait IpcPayload: Copy {
+    /// Exists so [`ipc_payload!`]'s padding assertion can only sum field
+    /// types that are payloads themselves — which is what makes the
+    /// no-padding property hold through a nested struct.
+    #[doc(hidden)]
+    const SIZE: usize = core::mem::size_of::<Self>();
+}
+
+macro_rules! payload_primitives {
+    ($($t:ty),* $(,)?) => { $(unsafe impl IpcPayload for $t {})* };
+}
+payload_primitives!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+
+unsafe impl<T: IpcPayload, const N: usize> IpcPayload for [T; N] {}
+
+/// Declare a `#[repr(C)]` IPC payload struct.
+///
+/// The expansion asserts that the struct's size equals the sum of its field
+/// sizes, which for `repr(C)` holds exactly when there is no padding, and it
+/// sums them through [`IpcPayload::SIZE`], so every field must be a payload
+/// too. A struct that would publish bytes no field owns does not compile, and
+/// neither does one carrying a type whose bit patterns are not all valid.
+#[macro_export]
+macro_rules! ipc_payload {
+    ($(
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $($(#[$fmeta:meta])* $fvis:vis $field:ident : $ty:ty),* $(,)?
+        }
+    )+) => {$(
+        $(#[$meta])*
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        $vis struct $name {
+            $($(#[$fmeta])* $fvis $field: $ty,)*
+        }
+
+        const _: () = assert!(
+            core::mem::size_of::<$name>()
+                == 0 $(+ <$ty as $crate::ipc::IpcPayload>::SIZE)*,
+            concat!(
+                stringify!($name),
+                " has padding: an IPC payload must not publish bytes no field owns",
+            ),
+        );
+
+        unsafe impl $crate::ipc::IpcPayload for $name {}
+    )+};
+}
+
+/// The largest payload this endpoint will frame, in either direction.
+///
+/// Derived, not picked: the largest payload struct in the tree is
+/// `window::CreateWindowRequest` at 40 bytes, and the largest byte payload any
+/// protocol here produces is 4096 — the threshold at which `window`'s
+/// clipboard set and the compositor's paste both switch to shared memory
+/// instead. 8192 is one doubling of headroom, so a protocol can grow its
+/// largest inline message without the SDK becoming the thing that refuses it.
+///
+/// What the bound buys is a refusal in O(1). A peer's `len` sizes a
+/// [`recv_bytes`] tail-skip, so `len = u32::MAX` obliges the reader to consume
+/// every byte that peer will ever send before it returns to its event loop.
+/// Bounded, that frame is an error at the header and the peer can be dropped.
+pub const MAX_FRAME_LEN: u32 = 8192;
+
+/// A frame header. `len` is private because it carries an invariant a peer
+/// does not: every `IpcHeader` in existence has a length within
+/// [`MAX_FRAME_LEN`], because [`IpcHeader::from_wire`] is the only way to make
+/// one out of bytes somebody else chose.
 #[derive(Clone, Copy)]
 pub struct IpcHeader {
     pub msg_type: u32,
-    pub len: u32,
+    len: u32,
+}
+
+impl IpcHeader {
+    const WIRE_SIZE: usize = 8;
+
+    /// Build a header from a length that has not been trusted yet.
+    pub fn from_wire(msg_type: u32, len: u32) -> Result<Self, IpcError> {
+        if len > MAX_FRAME_LEN {
+            return Err(IpcError::Malformed);
+        }
+        Ok(Self { msg_type, len })
+    }
+
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    fn to_wire(self) -> [u8; Self::WIRE_SIZE] {
+        let mut bytes = [0u8; Self::WIRE_SIZE];
+        bytes[..4].copy_from_slice(&self.msg_type.to_ne_bytes());
+        bytes[4..].copy_from_slice(&self.len.to_ne_bytes());
+        bytes
+    }
+
+    /// The same header, built from a length this endpoint chose itself.
+    fn frame(msg_type: u32, len: usize) -> Result<Self, IpcError> {
+        if len > MAX_FRAME_LEN as usize {
+            return Err(IpcError::TooLarge);
+        }
+        Ok(Self { msg_type, len: len as u32 })
+    }
 }
 
 #[derive(Debug)]
 pub enum IpcError {
     Disconnected,
+    /// The peer's frame does not describe a message this endpoint can read:
+    /// a length past [`MAX_FRAME_LEN`], or one shorter than the payload the
+    /// caller asked for.
+    Malformed,
+    /// This endpoint will not frame a payload that large. Distinct from
+    /// [`IpcError::Malformed`] because the two blame different sides.
+    TooLarge,
     Syscall(SyscallError),
 }
 
@@ -30,7 +150,7 @@ impl AsHandle for Connection {
 impl Connection {
     pub fn fd(&self) -> Fd { self.0.fd() }
 
-    pub fn send<T: Copy>(&self, msg_type: u32, payload: &T) -> Result<(), IpcError> {
+    pub fn send<T: IpcPayload>(&self, msg_type: u32, payload: &T) -> Result<(), IpcError> {
         send(self.fd(), msg_type, payload)
     }
 
@@ -46,11 +166,11 @@ impl Connection {
         recv_header(self.fd())
     }
 
-    pub fn recv_payload<T: Copy>(&self, header: &IpcHeader) -> Result<T, IpcError> {
+    pub fn recv_payload<T: IpcPayload>(&self, header: &IpcHeader) -> Result<T, IpcError> {
         recv_payload(self.fd(), header)
     }
 
-    pub fn recv<T: Copy>(&self) -> Result<(u32, T), IpcError> {
+    pub fn recv<T: IpcPayload>(&self) -> Result<(u32, T), IpcError> {
         recv(self.fd())
     }
 
@@ -70,20 +190,19 @@ impl Connection {
 // Free functions — used by consumers that hold raw Fds (compositor, netd).
 // Will become pub(crate) once all callers migrate to Connection methods.
 
-pub fn send<T: Copy>(fd: Fd, msg_type: u32, payload: &T) -> Result<(), IpcError> {
-    let header = IpcHeader { msg_type, len: core::mem::size_of::<T>() as u32 };
-    write_all(fd, as_bytes(&header))?;
+pub fn send<T: IpcPayload>(fd: Fd, msg_type: u32, payload: &T) -> Result<(), IpcError> {
+    let header = IpcHeader::frame(msg_type, core::mem::size_of::<T>())?;
+    write_all(fd, &header.to_wire())?;
     write_all(fd, as_bytes(payload))
 }
 
 pub fn signal(fd: Fd, msg_type: u32) -> Result<(), IpcError> {
-    let header = IpcHeader { msg_type, len: 0 };
-    write_all(fd, as_bytes(&header))
+    write_all(fd, &IpcHeader { msg_type, len: 0 }.to_wire())
 }
 
 pub fn send_bytes(fd: Fd, msg_type: u32, data: &[u8]) -> Result<(), IpcError> {
-    let header = IpcHeader { msg_type, len: data.len() as u32 };
-    write_all(fd, as_bytes(&header))?;
+    let header = IpcHeader::frame(msg_type, data.len())?;
+    write_all(fd, &header.to_wire())?;
     if !data.is_empty() {
         write_all(fd, data)?;
     }
@@ -91,23 +210,31 @@ pub fn send_bytes(fd: Fd, msg_type: u32, data: &[u8]) -> Result<(), IpcError> {
 }
 
 pub fn recv_header(fd: Fd) -> Result<IpcHeader, IpcError> {
-    let mut header = IpcHeader { msg_type: 0, len: 0 };
-    read_exact(fd, as_bytes_mut(&mut header))?;
-    Ok(header)
+    let mut bytes = [0u8; IpcHeader::WIRE_SIZE];
+    read_exact(fd, &mut bytes)?;
+    IpcHeader::from_wire(
+        u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    )
 }
 
-
-pub fn recv_payload<T: Copy>(fd: Fd, header: &IpcHeader) -> Result<T, IpcError> {
+pub fn recv_payload<T: IpcPayload>(fd: Fd, header: &IpcHeader) -> Result<T, IpcError> {
     let size = core::mem::size_of::<T>();
-    assert!(header.len as usize >= size);
-    let mut val = unsafe { core::mem::zeroed::<T>() };
-    read_exact(fd, as_bytes_mut(&mut val))?;
+    if (header.len as usize) < size {
+        return Err(IpcError::Malformed);
+    }
+    let mut val = core::mem::MaybeUninit::<T>::uninit();
+    // SAFETY: the slice covers exactly the `T` being filled, and `IpcPayload`
+    // promises every bit pattern `read_exact` can write is a valid `T`.
+    read_exact(fd, unsafe {
+        core::slice::from_raw_parts_mut(val.as_mut_ptr() as *mut u8, size)
+    })?;
     skip(fd, header.len as usize - size)?;
-    Ok(val)
+    Ok(unsafe { val.assume_init() })
 }
 
 /// Receive header + typed payload in one call.
-pub fn recv<T: Copy>(fd: Fd) -> Result<(u32, T), IpcError> {
+pub fn recv<T: IpcPayload>(fd: Fd) -> Result<(u32, T), IpcError> {
     let header = recv_header(fd)?;
     let payload = recv_payload(fd, &header)?;
     Ok((header.msg_type, payload))
@@ -123,12 +250,8 @@ pub fn recv_bytes(fd: Fd, header: &IpcHeader, buf: &mut [u8]) -> Result<usize, I
     Ok(count)
 }
 
-fn as_bytes<T>(val: &T) -> &[u8] {
+fn as_bytes<T: IpcPayload>(val: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>()) }
-}
-
-fn as_bytes_mut<T>(val: &mut T) -> &mut [u8] {
-    unsafe { core::slice::from_raw_parts_mut(val as *mut T as *mut u8, core::mem::size_of::<T>()) }
 }
 
 fn skip(fd: Fd, mut remaining: usize) -> Result<(), IpcError> {

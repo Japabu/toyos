@@ -431,6 +431,7 @@ fn open_stream(
 
     if control.send(MSG_STREAM_OPENED, &StreamOpenResponse {
         shm_token,
+        _pad0: 0,
         signal_pipe_id,
         client_period_frames,
         client_period_bytes,

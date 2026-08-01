@@ -23,7 +23,7 @@ pub fn pick_file(mode: PickerMode, start_dir: &str) -> Option<String> {
     conn.send_bytes(MSG_FILEPICKER_REQUEST, &data[..1 + len]).ok();
 
     let header = conn.recv_header().ok()?;
-    if header.msg_type == MSG_FILEPICKER_RESULT && header.len > 0 {
+    if header.msg_type == MSG_FILEPICKER_RESULT && header.len() > 0 {
         let mut buf = [0u8; 4096];
         let n = conn.recv_bytes(&header, &mut buf).unwrap_or(0);
         String::from_utf8(buf[..n].to_vec()).ok()

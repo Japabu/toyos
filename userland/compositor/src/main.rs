@@ -375,6 +375,22 @@ fn mark_dirty(dirty_rect: &mut Option<DirtyRect>, r: DirtyRect) {
     });
 }
 
+/// Drop a client that sent a frame the protocol cannot describe.
+///
+/// The compositor cannot locate the next message boundary in that stream, so
+/// there is nothing to resynchronise to — and a client is not entitled to end
+/// the compositor by mis-declaring a payload length.
+fn drop_out_of_protocol(
+    windows: &mut Vec<WindowState>,
+    fd: Fd,
+    dirty_rect: &mut Option<DirtyRect>,
+    screen_w: i32,
+    screen_h: i32,
+) {
+    windows.retain(|w| w.fd.fd() != fd);
+    mark_dirty(dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+}
+
 fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_h: i32, launcher_open: bool) -> HitZone {
     // Launcher popup
     if launcher_open {
@@ -1364,12 +1380,17 @@ fn main() {
                     Ok(n) => {
                         win.recv_len += n;
                         if win.recv_len >= 8 {
-                            let header = ipc::IpcHeader {
-                                msg_type: u32::from_ne_bytes([win.recv_buf[0], win.recv_buf[1], win.recv_buf[2], win.recv_buf[3]]),
-                                len: u32::from_ne_bytes([win.recv_buf[4], win.recv_buf[5], win.recv_buf[6], win.recv_buf[7]]),
-                            };
+                            let header = ipc::IpcHeader::from_wire(
+                                u32::from_ne_bytes([win.recv_buf[0], win.recv_buf[1], win.recv_buf[2], win.recv_buf[3]]),
+                                u32::from_ne_bytes([win.recv_buf[4], win.recv_buf[5], win.recv_buf[6], win.recv_buf[7]]),
+                            );
                             win.recv_len = 0;
-                            client_msgs.push((win.fd.fd(), win.pid, header, None));
+                            match header {
+                                Ok(header) => client_msgs.push((win.fd.fd(), win.pid, header, None)),
+                                // A frame no protocol here can produce. Nothing
+                                // after it can be located, so the client goes.
+                                Err(_) => dead_fds.push(win.fd.fd()),
+                            }
                         }
                         // else: partial header, continue next iteration
                     }
@@ -1385,7 +1406,12 @@ fn main() {
         for (client_fd, client_pid, header, new_conn) in client_msgs {
             match header.msg_type {
                 window::MSG_CREATE_WINDOW => {
-                    let req: window::CreateWindowRequest = ipc::recv_payload(client_fd, &header).unwrap();
+                    // `new_conn` is dropped by `continue`, which closes the fd:
+                    // there is no window to remove yet.
+                    let Ok(req) = ipc::recv_payload::<window::CreateWindowRequest>(client_fd, &header)
+                    else {
+                        continue;
+                    };
                     let title = if req.title_len > 0 {
                         let len = (req.title_len as usize).min(30);
                         String::from_utf8_lossy(&req.title[..len]).into_owned()
@@ -1509,22 +1535,36 @@ fn main() {
                 }
                 window::MSG_CLIPBOARD_SET => {
                     let mut buf = [0u8; 116];
-                    let n = ipc::recv_bytes(client_fd, &header, &mut buf).unwrap();
+                    let Ok(n) = ipc::recv_bytes(client_fd, &header, &mut buf) else {
+                        drop_out_of_protocol(&mut windows, client_fd, &mut dirty_rect, screen_w, screen_h);
+                        continue;
+                    };
                     clipboard = String::from_utf8_lossy(&buf[..n]).into_owned();
                 }
                 window::MSG_CLIPBOARD_SET_SHM => {
-                    let info: window::ClipboardShmMsg = ipc::recv_payload(client_fd, &header).unwrap();
+                    let Ok(info) = ipc::recv_payload::<window::ClipboardShmMsg>(client_fd, &header)
+                    else {
+                        drop_out_of_protocol(&mut windows, client_fd, &mut dirty_rect, screen_w, screen_h);
+                        continue;
+                    };
                     let shm = SharedMemory::map(info.token, info.len as usize);
                     clipboard = String::from_utf8_lossy(&shm.as_slice()[..info.len as usize]).into_owned();
                 }
                 window::MSG_SET_CURSOR => {
-                    let style: u32 = ipc::recv_payload(client_fd, &header).unwrap();
+                    let Ok(style) = ipc::recv_payload::<u32>(client_fd, &header) else {
+                        drop_out_of_protocol(&mut windows, client_fd, &mut dirty_rect, screen_w, screen_h);
+                        continue;
+                    };
                     if let Some(win) = windows.iter_mut().find(|w| w.fd.fd() == client_fd) {
                         win.cursor_style = style as u8;
                     }
                 }
                 window::MSG_SET_RESOLUTION => {
-                    let req: window::ResolutionRequest = ipc::recv_payload(client_fd, &header).unwrap();
+                    let Ok(req) = ipc::recv_payload::<window::ResolutionRequest>(client_fd, &header)
+                    else {
+                        drop_out_of_protocol(&mut windows, client_fd, &mut dirty_rect, screen_w, screen_h);
+                        continue;
+                    };
                     let reply = match gpu::set_resolution(req.width, req.height) {
                         Ok(new_fb_info) => {
                             fb_info = new_fb_info;

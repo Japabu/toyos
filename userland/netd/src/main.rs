@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use toyos_abi::Fd;
 use toyos::poller::{IORING_POLL_IN, Poller};
 use toyos::ipc;
+use toyos::ipc::IpcPayload;
 use toyos::pipe;
 use toyos_abi::syscall as toyos_nic;
 use toyos::services;
@@ -253,7 +254,7 @@ fn send_error_close(fd: Fd, code: u32) {
     toyos_abi::syscall::close(fd);
 }
 
-fn send_result_close<T: Copy>(fd: Fd, payload: &T) {
+fn send_result_close<T: IpcPayload>(fd: Fd, payload: &T) {
     let _ = ipc::send(fd, RESP_RESULT, payload);
     toyos_abi::syscall::close(fd);
 }
