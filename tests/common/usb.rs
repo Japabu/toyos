@@ -248,7 +248,7 @@ pub fn usb_storage_gate(
     )?;
     gate_ran(&log, 2)?;
     check_geometry(&log, bytes, lba)?;
-    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true healthy=true") {
+    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true wr_err=0 healthy=true") {
         return Err(format!("the guest did not report a clean pass\n{log}"));
     }
     verify(&image, bytes, nonce)?;
@@ -336,7 +336,7 @@ pub fn usb_storage_shapes(
     )?;
     gate_ran(&log, 2)?;
     check_geometry(&log, bytes, lba)?;
-    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true healthy=true") {
+    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true wr_err=0 healthy=true") {
         return Err(format!("the 4 KiB-sector disk did not pass\n{log}"));
     }
     verify(&image, bytes, nonce)?;
@@ -415,7 +415,12 @@ pub fn usb_storage_write_error(
     // the trait carried a result this line read `writes=ok` on exactly this
     // machine, because a refused write was indistinguishable from a completed
     // one.
-    if !log.contains("usb-gate: disk done reads=ok writes=bad") {
+    // Three write calls, three refusals *reported through the trait*. Not
+    // `writes=bad`, which this profile makes true anyway: the readback of a
+    // write that never landed differs whether or not the driver said so, and
+    // an assertion on it stayed green with `write_blocks` hard-wired to
+    // `Ok(())`. `wr_err` is zero in that build and three in this one.
+    if !log.contains("usb-gate: disk done reads=ok writes=bad refusal=true wr_err=3") {
         return Err(format!(
             "the guest did not see the device refuse its writes\n{log}"
         ));

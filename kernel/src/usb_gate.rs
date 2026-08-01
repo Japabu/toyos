@@ -143,11 +143,18 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     // hold the right kind of data.
     let guest_nonce = !nonce;
     let mut writes_ok = true;
+    // Counted separately from `writes_ok`, and reported separately, because
+    // the two can disagree and the difference is the whole point: on a disk
+    // that refuses writes the readback below fails either way, so a summary
+    // that only said `writes=bad` would stay true with the error channel
+    // deleted. This number is zero unless a write *said* it failed.
+    let mut write_errors = 0usize;
     for index in GUEST_BLOCKS {
         let block = at(blocks, index);
         fill(&mut buf, guest_nonce, block);
         if disk.write_blocks(block, 1, &buf).is_err() {
             writes_ok = false;
+            write_errors += 1;
             log!("usb-gate: block {block} refused the write");
         }
     }
@@ -160,6 +167,7 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     }
     if disk.write_blocks(RUN_START, RUN_LEN, &run).is_err() {
         writes_ok = false;
+        write_errors += 1;
         log!("usb-gate: the {RUN_LEN}-block run refused the write");
     }
     if disk.flush().is_err() {
@@ -192,7 +200,7 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     }
 
     log!(
-        "usb-gate: disk done reads={} writes={} refusal={past_end} healthy={}",
+        "usb-gate: disk done reads={} writes={} refusal={past_end} wr_err={write_errors} healthy={}",
         if reads_ok { "ok" } else { "bad" },
         if writes_ok { "ok" } else { "bad" },
         disk.healthy()
