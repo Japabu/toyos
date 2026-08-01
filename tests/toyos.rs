@@ -25,6 +25,9 @@ const RUST_SKIP: &[&str] = &[
     "i8042_mouse",
     "input_events",
     "va_exhaustion",
+    // Needs a live compositor, which `tests/testcases` does not boot.
+    // `metal_sim_window_caps` runs it on the config that does.
+    "window_caps",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -69,6 +72,7 @@ const MACHINE_TESTS: &[&str] = &[
     "input_merge",
     "metal_sim_compositor",
     "metal_sim_input",
+    "metal_sim_window_caps",
     "foreign_disk_untouched",
     "double_fault_stack",
     "diskless_boot",
@@ -2537,6 +2541,87 @@ fn run_machine_test(
             }
             eprintln!("  [i8042] {}", line.trim());
             eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
+            Ok(())
+        }
+        "metal_sim_window_caps" => {
+            // The compositor's window cap, end to end, on the only config that
+            // boots a compositor an in-guest binary can talk to.
+            //
+            // The assertion that matters is not "a refusal arrived" — it is
+            // that the number the compositor *derived* from total memory and
+            // the screen is the number of windows a client actually gets. A
+            // constant on both sides would agree with itself forever; this
+            // fails if the derivation and the enforcement ever drift apart.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            // One binary, not the whole rust set: metalcase's initrd is four
+            // programs, and the rest would add tens of megabytes to a boot
+            // that needs exactly one of them.
+            let bins: Vec<(String, Vec<u8>)> = rust_bins
+                .iter()
+                .filter(|(name, _)| name == "window_caps")
+                .cloned()
+                .collect();
+            if bins.is_empty() {
+                return Err("window_caps was not built".to_string());
+            }
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
+
+            // The compositor announces what it derived. Read rather than
+            // recomputed here: recomputing it would copy the formula into the
+            // test and stop asking whether the compositor uses it.
+            let mut console = qemu.boot_log().to_string();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline && !console.contains("compositor: at most ") {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            let Some(declared) = console
+                .lines()
+                .find_map(|l| l.split("compositor: at most ").nth(1))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return Err(format!(
+                    "the compositor never said how many windows it would hold:\n{console}"
+                ));
+            };
+            if declared == 0 {
+                return Err("the compositor derived a cap of zero windows".to_string());
+            }
+
+            let result = qemu.run_test("test_rs_window_caps", Duration::from_secs(120));
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            if result.exit_code != Some(0) {
+                return Err(format!(
+                    "window_caps exited {:?}:\n{}",
+                    result.exit_code, result.stdout
+                ));
+            }
+
+            let Some(granted) = result
+                .stdout
+                .split("oversized refused, ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return Err(format!("window_caps printed no count:\n{}", result.stdout));
+            };
+            if granted != declared {
+                return Err(format!(
+                    "the compositor declared a cap of {declared} windows and granted \
+                     {granted} — the derivation and the enforcement disagree:\n{}",
+                    result.stdout
+                ));
+            }
+            eprintln!("  [metal-sim] compositor cap {declared} windows, {granted} granted then refused");
             Ok(())
         }
         "metal_sim_input" => {
