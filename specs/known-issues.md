@@ -2125,21 +2125,157 @@ What is still not built is honouring such a controller. If a machine ever
 trips the assert, the fix is to derive `PAGE` from the register instead of
 raising the bound.
 
-### The xHCI driver resets the controller without taking ownership from firmware
+### PARTLY CLOSED — the xHCI driver reset the controller without taking it from firmware
 
-`mod.rs:392` reads `hccparams1` and uses bit 2 (`csz`) and nothing else. The
-xECP pointer in bits 31:16 is never followed, so there is no USBLEGSUP
-BIOS-owned-semaphore handoff (xHCI §4.22.1) and no Supported Protocol parse
-before the unconditional HCRST at `mod.rs:416`. Grep the whole driver for
-`xecp|LEGSUP|legacy|BIOS` and only the `CAP_HCCPARAMS1` constant comes back.
+Closed at `755b591` + `d83c53b`: `kernel/src/drivers/xhci/legacy.rs` walks the
+extended-capability list from `HCCPARAMS1.xECP`, and when it finds capability
+ID 1 it sets the OS-Owned Semaphore, waits a bounded second for the BIOS-Owned
+Semaphore to clear, and clears USBLEGCTLSTS's SMI enables and its RW1C status
+bits whatever the semaphore said. It runs immediately before the halt and
+HCRST, an absent capability and a malformed list both cost the handoff and
+never the boot, and the driver proceeds either way — a machine that will not
+boot is worse than one whose firmware is fighting it, and the point is the log
+line naming the fight.
 
-QEMU cannot fail this: nothing owns the controller once OVMF's USB stack
-releases it at ExitBootServices, so the path is certified exactly where it
-cannot go wrong. On the T14, firmware that leaves USB legacy support armed with
-SMI-on-OS-ownership gets a controller reset out from under it — the machine
-fights for it, or SMIs fire, and on a serial-less laptop that presents as a
-wedge after "storage ready" with the last checkpoint still on screen. It is the
-one xHCI-shaped first-boot risk M1's fix does not touch.
+**What remains is that no machine in reach can fail it.** QEMU's controller
+publishes an extended-capability list with no Legacy Support capability in it
+(`xECP=0x8`, measured), and nothing owns the controller once OVMF's USB stack
+releases it at ExitBootServices. So a green `xhci_xecp_walk` certifies exactly
+two things: the walk runs on a real controller and terminates, and it runs
+*before* HCRST rather than after. Both halves of the interesting behaviour —
+firmware that holds the semaphore, and firmware with SMI-on-OS-ownership armed
+— are first observed on the T14 or not at all.
+
+The untrusted-input half is testable and is tested, because it needed no
+hardware: `xhci-xecp-selftest` walks eight synthetic lists at init (a pointer
+past the register window, a link that leaves it, a window reading all ones, a
+chain of minimum-length links, ours first/last/absent) and logs how many were
+refused. The walk cannot loop, for three independent reasons — the next pointer
+is a strictly positive forward delta, every read is bounds-checked against the
+mapped window, and the iteration count is capped at 64 — and the self-test's
+teeth were shown by deleting the end-of-list check, which turned one case into
+`Err(TooMany)` instead of `Ok(None)`: still bounded, still red.
+
+Not built: the Supported Protocol capability (ID 2) is walked past. Nothing
+reads it yet, so this is a gap in the parse rather than in behaviour.
+
+### CLOSED — the kernel initialised one xHCI controller, and the T14 has two
+
+Found on the laptop's own screen, on a real boot. PCI enumeration printed both
+of these, identical in class, subclass and prog_if:
+
+```
+PCI 00:0d.0 [0c03] vendor=8086 device=9a13 prog_if=30
+PCI 00:14.0 [0c03] vendor=8086 device=a0ed prog_if=30
+```
+
+`00:0d.0` is Tiger Lake's Thunderbolt 4 / USB4 xHCI in the TCSS block —
+corroborated by `00:0d.2` (9a1b) and `00:0d.3` (9a1d), the Thunderbolt NHI
+functions, beside it in the same log. `00:14.0` is the PCH USB 3.2 xHCI, where
+a ThinkPad's internal USB devices and its USB-A ports are. The kernel logged
+one `xHCI: found at PCI 00:0d.0`, then `max_slots=64 max_ports=5`, then
+**`xHCI: no HID devices found`** — a true statement about the Thunderbolt
+controller and a false one about the machine.
+
+`PciDevice::find` returned the first match and there was no enumerate-all.
+`pci::enumerate` now walks the bus once for the whole kernel and returns every
+function (bounded at `MAX_DEVICES = 256`); `find`, `find_by_id` and `scan` are
+gone and each driver selects from the list, so whether it takes one device or
+all of them is visible at the call site.
+
+Two things inside the driver were single-controller assumptions rather than
+transfer logic, and both moved per controller: the DMA pool (one static, and
+every offset in `Layout` is relative to a pool base, so two controllers sharing
+one pool would have put both DCBAAs, both command rings and both slot-1 device
+contexts at one address) and the controller itself. Disk indices flatten across
+controllers in `with_disk`, so `usb_storage::open(0)` still names one device.
+
+Gated by `xhci_second_controller` and `xhci_two_controllers`.
+
+**Residual, and the reason a fix here is not the whole answer: see the MSI-X
+entry below.** The same boot reported no MSI-X on the controller it did find,
+and that is not a degradation.
+
+### CLOSED — the button merge was keyed by xHCI slot id, which is per controller
+
+The same root cause one level up, and the reason "two keyboards or two pointers
+compose rather than contradict" needed checking against the code rather than
+quoting. It held for keyboards and not for pointers.
+
+`keyboard::HELD` is keyed by HID usage, so two keyboards on two controllers
+already compose: the modifier mask is the union and nothing in that path names
+a device. `mouse::PointerSource` was `PointerSource::usb(slot_id)`, and its
+doc claimed slot ids were "the whole space a `PointerSource` can name — no
+allocation, no eviction, and no way for two devices to alias". That was true of
+one controller. Slot ids are allocated by the controller, so a machine with two
+has a slot 1 on each: two mice would share one entry in `BUTTONS`, and because
+`handle_motion` publishes the OR and stores each source's byte unconditionally,
+every report from one would republish the other's buttons — a pointer that
+holds a button while the other moves flaps it at the combined polling rate,
+which is the exact defect the per-source table exists to prevent.
+
+Sources are now numbered as devices bind (`PointerSource::claim`, a
+`fetch_update` with `checked_add`, so the 255th pointer gets `None` rather than
+wrapping onto the i8042's entry at 0), and a pointer that cannot be numbered is
+not bound. `HidDevice` carries the source it claimed; `HidType` stayed as the
+parse-time answer and `HidRole` is what a bound device is, which removed the
+Mouse/Tablet distinction from the dispatch path entirely — the two differed
+only in report size, and `mouse::handle_report` already branches on length.
+
+Staged, not argued: `MetalXhciBoth` puts a hub ahead of the second controller's
+HID so both mice land on **slot 3**, and the driver logs
+`xHCI: pointer on slot 3 merges as source N`. With the slot-keyed source
+restored, both lines read `source 3`.
+
+### A controller with no MSI-X is never polled at all, and the log says otherwise
+
+`setup_msix` looks for capability 0x11 and, not finding it, logs
+`xHCI: no MSI-X capability, using polled mode` and returns. There is no polled
+mode. Every call site of `XhciController::poll` is inside `poll_if_pending`,
+which runs only when `irq_ring::take(IrqSource::Xhci)` returns a record, and
+the only producer of that record is the vector-0x21 ISR — which is delivered
+only through the MSI-X table `setup_msix` just declined to program. So the
+controller is reset, started, and its event ring is never read again: no HID
+report is ever dispatched, no command completion is ever consumed after
+enumeration, and there is no log line saying so.
+
+The real boot logged that line on `00:0d.0`. Whether the PCH controller at
+`00:14.0` differs is **not known** — the kernel never initialised it, so
+nothing has ever read its capability list. Now that both controllers come up,
+the next boot's log answers it directly. Both possible answers matter: if the
+PCH one has MSI-X, USB HID works on the T14 and the Thunderbolt controller is
+merely inert; if it does not, USB HID does not work on that laptop and this is
+the blocker rather than the controller count. Intel PCH xHCI parts commonly
+expose MSI (capability 0x05) and not MSI-X, and this driver has no MSI path —
+that is a reason to check, not a finding.
+
+Untested because every profile's controller has MSI-X: `xHCI: MSI-X enabled
+(vector 0x21)` on both controllers of both new two-controller profiles.
+`nec-usb-xhci,msix=off` is the actuator (verified present on QEMU 11.0.2,
+alongside `msi=<OnOffAuto>`), so the shape is stageable whenever this is picked
+up. The honest minimum is that the line stop claiming a mode that does not
+exist.
+
+CLAUDE.md records that the three MSI-X setup copies have already diverged, with
+xHCI degrading to "polled" where virtio-net and virtio-sound panic. This is the
+xHCI copy's version of that: it degrades to nothing.
+
+### First-match device selection that remains, and why
+
+`pci::enumerate` returns every function now, so a driver taking the first match
+does so visibly. Two do, and both are deliberate:
+
+- **NVMe.** `nvme::init` takes the first class-0108 controller. A machine with
+  two NVMe drives loses the second, and there is nowhere to put it:
+  `page_cache::init` takes a single `Box<dyn BlockDevice>`. Making this an
+  enumerate-all is a storage-stack change, not a PCI one.
+- **The four virtio drivers.** Each takes the first device with its
+  (vendor, device) pair. A second NIC or a second GPU would be dropped. These
+  are QEMU-only devices — no virtio function appears on the T14 — so the
+  exposure is a test-shape one, and no profile declares two of anything virtio.
+
+Neither is a defect today. Both become one the moment a second such device is
+reachable, and the enumerate-all they would need now exists.
 
 ### USB hotplug does nothing, and M1 made that reachable
 
@@ -2241,10 +2377,32 @@ carries zero occurrences of either asserted string.
 
 Three things it does **not** give, in the order they will bite:
 
-- **Nothing after `Boot: complete` is visible.** The last checkpoint is the last
-  paint on a successful boot, so a daemon that dies later is exactly as silent as
-  before. The mode answers "how far did the kernel get and what did it say",
-  which is the i8042 question, and nothing else.
+- **Almost nothing after `Boot: complete` is visible.** The last checkpoint is
+  otherwise the last paint on a successful boot, so a daemon that dies later is
+  exactly as silent as before. The mode answers "how far did the kernel get and
+  what did it say", which is the i8042 question, and nothing else.
+
+  The one exception is deliberate and is the i8042's own health verdict
+  (`d13efa6`). The driver now says once whether the pin it armed has ever
+  asserted — a quiet verdict emitted from the first scheduler pass that finds a
+  CPU with nothing left to run, and an alive line emitted by the pass the first
+  interrupt itself schedules — and repaints the panel through
+  `boot_checkpoint` for each, *only* on a machine with no console at all
+  (`serial::has_console()`, the same predicate `panic_flush` refuses on). On a
+  diag boot that turns the dead-input question into an interaction: the frozen
+  screen ends in `armed at 106ms, idle at 221ms, 0 interrupts — the pin has
+  never asserted`, the owner presses a key, and either the screen repaints with
+  `the pin asserts — N interrupts, N bytes, N keys` or it does not move.
+  `screen_i8042_health` is the gate, on a muted metal-sim guest; its teeth are
+  a `to_screen` that returns immediately (the line is in the ring and not on the
+  glass) and a `verdict_due` that never arms (nothing to paint).
+
+  **It does not reach the shipping image.** `boot_checkpoint` still paints
+  nothing once the compositor claims the framebuffer, so on `bootable.img` both
+  lines reach the log ring and stop there. The health *signal* is the fix; the
+  *surface* is still the open problem this entry is about, and the durable
+  answer is a log sink that survives userland — the USB-storage/FAT32/GPT work,
+  not another boot mode.
 - **The T14 pages, and only the footer says so.** Measured on the shipped image's
   own log: 75 display rows at the panel's 240 columns against a 67-row grid, so
   `pagination` gives two pages and the checkpoint paints `[page 2/2]` with the

@@ -193,10 +193,13 @@ bar; QEMU cannot.
   a block was enumerated to completion — but not that a HID survives the
   shortage and delivers, because the one device that fits is the boot stick:
   QEMU puts it on the first SuperSpeed port register, ahead of every USB2 one,
-  so it takes slot 1 and binds nothing. Two xHCI items remain in known issues §8, both
-  still M4-shaped: the missing USBLEGSUP ownership handoff before HCRST, which
-  QEMU structurally cannot fail and Lenovo firmware can, and hotplug, which
-  does nothing at all and became reachable when M1 removed the zero-HID panic.
+  so it takes slot 1 and binds nothing. One xHCI item remains in known issues §8
+  and it is still M4-shaped: hotplug does nothing at all, and became reachable
+  when M1 removed the zero-HID panic. The USBLEGSUP ownership handoff is built
+  (`xhci/legacy.rs`), runs before the HCRST, and disarms the controller's SMI
+  enables — but QEMU publishes no Legacy Support capability, so what a green
+  suite certifies is that the walk terminates and runs in the right order, not
+  that a handoff ever happened.
 - **FLASH TRIGGER: metal-sim boots to the compositor with the PS/2 keyboard
   working and panics render on screen → flash the stick. MET.**
   `metal_sim_input` certifies it every run, on the machine shape and the plain
