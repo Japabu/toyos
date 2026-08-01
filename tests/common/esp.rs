@@ -54,7 +54,13 @@ fn test_dir() -> PathBuf {
     dir
 }
 
-/// Where the ESP sits inside a GPT disk image, in bytes.
+/// Where the ESP sits inside a GPT disk image, in bytes, and the unique
+/// partition GUID the table gives it.
+///
+/// The GUID is drawn fresh by `create_gpt_disk` for every image, so it is a
+/// per-run nonce that the host knows before the machine starts and that only
+/// this boot's kernel can have logged. `esp_log_file` uses it to tell this
+/// boot's log from a file left behind by anything else.
 fn esp_extent(image: &[u8], path: &Path) -> Result<(usize, usize), String> {
     let disk = gpt::GptConfig::new()
         .writable(false)
@@ -75,6 +81,24 @@ fn esp_extent(image: &[u8], path: &Path) -> Result<(usize, usize), String> {
         return Err(format!("the ESP runs to {} in an image of {}", start + len, image.len()));
     }
     Ok((start, len))
+}
+
+/// The unique partition GUID of a boot image's ESP, as the kernel prints it.
+fn esp_guid(path: &Path) -> Result<String, String> {
+    let disk = gpt::GptConfig::new()
+        .writable(false)
+        .logical_block_size(LogicalBlockSize::Lb512)
+        .open(path)
+        .map_err(|e| format!("the built image has no readable GPT: {e}"))?;
+    let esps: Vec<_> = disk
+        .partitions()
+        .values()
+        .filter(|p| p.part_type_guid == partition_types::EFI)
+        .collect();
+    let [esp] = esps.as_slice() else {
+        return Err(format!("the built image has {} ESPs, expected one", esps.len()));
+    };
+    Ok(esp.part_guid.to_string().to_uppercase())
 }
 
 /// Read several files out of a FAT volume in one mount. `None` is a file that
@@ -363,11 +387,256 @@ pub fn esp_filesystem(
     Ok(())
 }
 
-/// Every `esp:` line the guest printed, for a failure message.
+/// Everything the guest said about identifying and mounting its boot volume.
+///
+/// Wider than `esp:` on purpose. A mount that does not happen is usually not
+/// the mount's fault: the two recorded instances were `gpt::probe` reporting an
+/// entry-array CRC mismatch, which is a *read* off the stick coming back wrong,
+/// and a failure message showing only the `esp:` line said nothing about that.
 fn esp_lines(log: &str) -> String {
-    let lines: Vec<&str> = log.lines().filter(|l| l.contains("esp:")).collect();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("esp:") || l.contains("esp-log:") || l.contains("gpt:")
+            || l.contains("usb-storage:"))
+        .collect();
     if lines.is_empty() {
-        return format!("the guest printed no esp: line at all\n{log}");
+        return format!("the guest said nothing about its boot volume at all\n{log}");
     }
     format!("what it said:\n{}", lines.join("\n"))
+}
+
+/// The kernel's own log, written to the stick it booted from.
+///
+/// The claim under test is *continuity*: not that a log file exists at the end,
+/// but that the tail of what the kernel said is on the device while the machine
+/// is still running — because the failure it is for is a machine that stops
+/// without panicking, on a laptop with no serial port, where nothing else is
+/// left. So the file is read **mid-run**, before any shutdown, and only the
+/// idle-loop sink can have put anything there.
+///
+/// Three things could make this green without the sink working, and each has an
+/// assertion aimed at it:
+///
+/// - **A file left over from something else.** The log must carry this image's
+///   own unique partition GUID, which `create_gpt_disk` draws fresh per build
+///   and no earlier run can have.
+/// - **A single flush at install time.** `esp_log::install` runs in the
+///   subsystem phase and seeds the file with the ring's retained tail, so a
+///   sink that then did nothing would still produce a file. `Boot: complete` is
+///   logged two phases later, so requiring it requires a flush after install.
+/// - **The shutdown path standing in for the continuous one.** The mid-run read
+///   happens before `run shutdown` and must already have `Boot: complete`; the
+///   post-shutdown read must additionally have the shutdown's own last line,
+///   which only `flush_final` can deliver.
+///
+/// A second boot, with `esp-log-rotate-fast`, drives the bound: rotation is what
+/// stops the file filling the owner's stick, and at the shipped megabyte no test
+/// would ever reach it.
+pub fn esp_log_file(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let image_path = test_dir().join("esp-log-boot.img");
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, &[]);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+    let (start, len) = esp_extent(&image, &image_path)?;
+    let guid = esp_guid(&image_path)?;
+    let complaints_before = fsck_complaints(&image[start..start + len], "esp-log-before")?;
+
+    // The line the kernel logs when firmware hands it the partition GUID. The
+    // host knows it before the machine starts; the guest can only have it from
+    // this boot.
+    let nonce = format!("gpt: firmware booted us from partition {guid} ");
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: qemu::Profile::Metal,
+            boot_image: Some(image_path.clone()),
+            ..Default::default()
+        },
+    );
+    let boot = qemu.boot_log().to_string();
+    serial::Serial::named("boot console", boot.as_str()).must_be_clean()?;
+    if !boot.contains("esp-log: this boot's kernel log continues in") {
+        return Err(format!("the sink never installed:\n{}", esp_lines(&boot)));
+    }
+
+    // Mid-run, with the guest still up and nothing shut down. Whatever is here
+    // was put there by the idle loop.
+    //
+    // Polled rather than read once, because the claim is "promptly", not
+    // "instantly": the ready marker is printed by a userland process and the
+    // flush happens on the next idle pass, so a single read races a window the
+    // design does not promise to close. Ten seconds is three orders of
+    // magnitude above what a working sink needs — the measurement below says
+    // what it actually took — so a broken one still reds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let began = std::time::Instant::now();
+    let mut running;
+    let mut running_text;
+    loop {
+        running = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+        running_text = String::from_utf8_lossy(&running).into_owned();
+        if running_text.contains("Boot: complete") || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let took = began.elapsed();
+    if !running_text.contains(&nonce) {
+        return Err(format!(
+            "the log on the device does not carry this boot's partition GUID ({nonce:?}); it is \
+             {} bytes and starts {:?}",
+            running.len(),
+            running_text.chars().take(120).collect::<String>()
+        ));
+    }
+    if !running_text.contains("Boot: complete") {
+        return Err(format!(
+            "the log on the device stops before `Boot: complete` at {} bytes — the sink wrote \
+             once at install and never again",
+            running.len()
+        ));
+    }
+    if running_text.contains("Shutting down.") {
+        return Err("the guest shut down before the mid-run read".to_string());
+    }
+    eprintln!(
+        "  [esp-log] {} bytes on the device {} ms after the ready marker, with the machine still \
+         running and through `Boot: complete`",
+        running.len(),
+        took.as_millis()
+    );
+
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    let tail = qemu.drain_serial(Duration::from_secs(20));
+    drop(qemu);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if tail.contains(bad) {
+            return Err(format!("{bad:?} on the way down\n{tail}"));
+        }
+    }
+
+    let after = std::fs::read(&image_path).map_err(|e| format!("read the image back: {e}"))?;
+    let final_log = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+    let final_text = String::from_utf8_lossy(&final_log).into_owned();
+    if !final_text.contains("Shutting down.") {
+        return Err(format!(
+            "the shutdown's own last line never reached the file: {} bytes, ending {:?}",
+            final_log.len(),
+            final_text.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+    if final_log.len() <= running.len() {
+        return Err(format!(
+            "the file is {} bytes after the shutdown and was {} before it",
+            final_log.len(),
+            running.len()
+        ));
+    }
+
+    let complaints_after = fsck_complaints(&after[start..start + len], "esp-log-after")?;
+    let fresh: Vec<&String> =
+        complaints_after.iter().filter(|c| !complaints_before.contains(c)).collect();
+    if !fresh.is_empty() {
+        return Err(format!(
+            "writing the log gave fsck_msdos something new to say:\n{}",
+            fresh.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
+        ));
+    }
+    eprintln!(
+        "  [esp-log] {} bytes after the shutdown, carrying its last line; fsck has nothing new",
+        final_log.len()
+    );
+    let _ = std::fs::remove_file(&image_path);
+
+    rotation(test_config, c_bins, rust_bins)
+}
+
+/// The bound. `esp-log-rotate-fast` moves it from a megabyte to 8 KiB, which one
+/// boot's own log crosses, so the rotation path runs on the shipped code.
+fn rotation(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURE: &[&str] = &["esp-log-rotate-fast"];
+    let image_path = test_dir().join("esp-log-rotate.img");
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURE);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+    let (start, len) = esp_extent(&image, &image_path)?;
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: qemu::Profile::Metal,
+            boot_image: Some(image_path.clone()),
+            kernel_features: FEATURE,
+            ..Default::default()
+        },
+    );
+    let mut log = qemu.boot_log().to_string();
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
+    drop(qemu);
+
+    // At least twice, not at least once: the second rotation is the one that
+    // renames over an existing `kernel.log.1`, and FAT has no atomic
+    // replacement — so the adapter has to delete the destination first, and a
+    // single rotation would never run that half.
+    let rotations = log.matches("became /boot/toyos/kernel.log.1").count();
+    if rotations < 2 {
+        return Err(format!("the log rotated {rotations} times, wanted at least two:\n{}", esp_lines(&log)));
+    }
+    let current = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+    let previous = log_on_device(&image_path, start, len, "toyos/kernel.log.1")?;
+    // The generation that filled must be at least the bound; the current one
+    // must be shorter than it, or nothing was actually moved aside.
+    if previous.len() < 256 {
+        return Err(format!("kernel.log.1 is {} bytes, under the 256-byte bound", previous.len()));
+    }
+    // The newest line is in whichever of the two the last flush landed in: a
+    // rotation can be the last thing that happens, which leaves `kernel.log`
+    // empty and the tail in `kernel.log.1`. What must not happen is the tail
+    // being in neither.
+    let tail_in = |b: &[u8]| String::from_utf8_lossy(b).contains("Shutting down.");
+    if !tail_in(&current) && !tail_in(&previous) {
+        return Err(format!(
+            "the shutdown's last line is in neither generation: kernel.log is {} bytes and \
+             kernel.log.1 is {}",
+            current.len(),
+            previous.len()
+        ));
+    }
+    let _ = std::fs::remove_file(&image_path);
+    eprintln!(
+        "  [esp-log] rotated {rotations} times at the 256-byte bound: {} bytes in kernel.log.1, \
+         {} in kernel.log",
+        previous.len(),
+        current.len()
+    );
+    Ok(())
+}
+
+/// One file read out of the ESP inside a disk image on the host.
+fn log_on_device(
+    image_path: &Path,
+    start: usize,
+    len: usize,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    let image = std::fs::read(image_path).map_err(|e| format!("read the image: {e}"))?;
+    if start + len > image.len() {
+        return Err(format!("the image shrank to {} bytes", image.len()));
+    }
+    let mut found = read_files(&image[start..start + len], &[name])?;
+    need(found.pop().flatten(), name)
 }

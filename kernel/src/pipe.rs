@@ -1,6 +1,6 @@
 use crate::mm::pmm;
 
-use toyos_abi::ring::{RingHeader, RING_READER_CLOSED, RING_WRITER_CLOSED};
+use toyos_abi::ring::Ring;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -88,6 +88,10 @@ pub const PIPE_SIZE: usize = PAGE_2M as usize;
 
 struct Pipe {
     page: pmm::PhysPage,
+    /// The ring's cursors and capacity. Kernel memory, because `SYS_PIPE_MAP`
+    /// maps `page` into the process writable: anything read back out of that
+    /// page is a value the process chose.
+    ring: Ring,
     /// The process that called `create`. `PipeId`s are dense sequential
     /// integers and userland passes raw ones to `SYS_PIPE_OPEN`, so this is
     /// the only thing that distinguishes "a peer handed me this id" from
@@ -114,9 +118,12 @@ unsafe impl Send for Pipe {}
 impl Pipe {
     fn new(creator: Pid) -> Option<Self> {
         let page = pmm::alloc_page(pmm::Category::Pipe)?;
-        RingHeader::init(page.direct_map().as_mut_ptr(), PIPE_SIZE);
+        // SAFETY: a fresh 2 MiB page this `Pipe` owns for as long as the
+        // `Ring` addresses it.
+        let ring = unsafe { Ring::new(page.direct_map().as_mut_ptr(), PIPE_SIZE) };
         Some(Self {
             page,
+            ring,
             creator,
             readers: 0,
             writers: 0,
@@ -125,10 +132,6 @@ impl Pipe {
             writers_wq: new_queue(WaitClass::Pipe),
             rt_boost_pending: false,
         })
-    }
-
-    fn header(&self) -> &RingHeader {
-        unsafe { &*self.page.direct_map().as_ptr::<RingHeader>() }
     }
 }
 
@@ -192,13 +195,12 @@ pub fn phys_addr(pipe_id: PipeId) -> Option<DirectMap> {
 pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
     let (result, boost) = with_pipes_mut(|pipes| {
         let Some(pipe) = pipes.get_mut(pipe_id) else { return (None, false) };
-        let header = pipe.header();
-        if header.available() > 0 {
-            let n = header.read(buf);
+        if pipe.ring.available() > 0 {
+            let n = pipe.ring.read(buf);
             let boost = pipe.rt_boost_pending;
             pipe.rt_boost_pending = false;
             (Some(n), boost)
-        } else if pipe.writers == 0 || header.is_writer_closed() {
+        } else if pipe.writers == 0 {
             (Some(0), false)
         } else {
             (None, false)
@@ -218,13 +220,12 @@ pub enum PipeWrite {
 }
 
 pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
-    with_pipes(|pipes| {
-        let pipe = pipes.get(pipe_id)?;
-        let header = pipe.header();
-        if pipe.readers == 0 || header.is_reader_closed() {
+    with_pipes_mut(|pipes| {
+        let pipe = pipes.get_mut(pipe_id)?;
+        if pipe.readers == 0 {
             Some(PipeWrite::BrokenPipe)
-        } else if header.space() > 0 {
-            Some(PipeWrite::Wrote(header.write(buf)))
+        } else if pipe.ring.space() > 0 {
+            Some(PipeWrite::Wrote(pipe.ring.write(buf)))
         } else {
             None
         }
@@ -233,17 +234,13 @@ pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
 
 pub fn has_data(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| {
-            p.header().available() > 0 || p.writers == 0 || p.header().is_writer_closed()
-        })
+        pipes.get(pipe_id).map_or(false, |p| p.ring.available() > 0 || p.writers == 0)
     })
 }
 
 pub fn has_space(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| {
-            p.header().space() > 0 || p.readers == 0 || p.header().is_reader_closed()
-        })
+        pipes.get(pipe_id).map_or(false, |p| p.ring.space() > 0 || p.readers == 0)
     })
 }
 
@@ -263,7 +260,7 @@ fn add_reader(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("add_reader: pipe not found");
         pipe.readers = pipe.readers.checked_add(1).expect("pipe reader overflow");
-        pipe.header().flags.fetch_and(!RING_READER_CLOSED, core::sync::atomic::Ordering::Release);
+        pipe.ring.open_reader();
     });
 }
 
@@ -271,7 +268,7 @@ fn add_writer(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("add_writer: pipe not found");
         pipe.writers = pipe.writers.checked_add(1).expect("pipe writer overflow");
-        pipe.header().flags.fetch_and(!RING_WRITER_CLOSED, core::sync::atomic::Ordering::Release);
+        pipe.ring.open_writer();
     });
 }
 
@@ -280,7 +277,7 @@ fn close_read(pipe_id: PipeId) {
         let pipe = pipes.get_mut(pipe_id).expect("close_read: pipe not found");
         pipe.readers = pipe.readers.checked_sub(1).expect("pipe reader underflow");
         if pipe.readers == 0 {
-            pipe.header().close_reader();
+            pipe.ring.close_reader();
         }
         if pipe.readers == 0 && pipe.writers == 0 {
             let pipe = pipes.remove(pipe_id).unwrap();
@@ -308,7 +305,7 @@ fn close_write(pipe_id: PipeId) {
         let pipe = pipes.get_mut(pipe_id).expect("close_write: pipe not found");
         pipe.writers = pipe.writers.checked_sub(1).expect("pipe writer underflow");
         if pipe.writers == 0 {
-            pipe.header().close_writer();
+            pipe.ring.close_writer();
         }
         if pipe.readers == 0 && pipe.writers == 0 {
             let pipe = pipes.remove(pipe_id).unwrap();

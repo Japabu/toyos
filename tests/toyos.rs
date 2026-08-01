@@ -115,6 +115,7 @@ const MACHINE_TESTS: &[&str] = &[
     "usb_storage_shapes",
     "usb_storage_write_error",
     "esp_filesystem",
+    "esp_log_file",
     "cache_eviction",
     "va_exhaustion",
     "heap_ceiling_recovery",
@@ -1669,6 +1670,7 @@ fn run_machine_test(
         "usb_storage_shapes" => usb::usb_storage_shapes(test_config, c_bins, rust_bins),
         // Body in `tests/common/esp.rs`, same reason.
         "esp_filesystem" => common::esp::esp_filesystem(test_config, c_bins, rust_bins),
+        "esp_log_file" => common::esp::esp_log_file(test_config, c_bins, rust_bins),
         "usb_storage_write_error" => usb::usb_storage_write_error(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),

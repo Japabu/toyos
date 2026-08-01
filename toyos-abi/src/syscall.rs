@@ -866,6 +866,9 @@ pub fn socket_create(rx_pipe_id: u64, tx_pipe_id: u64) -> Result<Fd, SyscallErro
 
 /// Map a pipe's shared-memory ring buffer into this process's address space.
 /// Returns a pointer to the `RingHeader` at the start of the mapped region.
+///
+/// The mapping is writable, and the header is a publication: writing it tells
+/// the kernel nothing. Reads and writes still go through `SYS_READ`/`SYS_WRITE`.
 pub fn pipe_map(fd: Fd) -> Result<*mut u8, SyscallError> {
     check(syscall(SYS_PIPE_MAP, fd.0 as u64, 0, 0, 0)).map(|v| v as *mut u8)
 }
