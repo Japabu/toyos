@@ -25,6 +25,9 @@ const RUST_SKIP: &[&str] = &[
     "i8042_mouse",
     "input_events",
     "va_exhaustion",
+    // Needs SYS_DEBUG actions 5 and 6, which only the `test-heap-ceiling`
+    // kernel has. `heap_ceiling_recovery` boots that kernel.
+    "heap_ceiling",
     // Needs a live compositor, which `tests/testcases` does not boot.
     // `metal_sim_window_caps` runs it on the config that does.
     "window_caps",
@@ -90,6 +93,7 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_slot_exhaustion",
     "cache_eviction",
     "va_exhaustion",
+    "heap_ceiling_recovery",
     "serial_vocabulary",
 ];
 
@@ -1825,6 +1829,59 @@ fn run_machine_test(
             serial::Serial::named("boot console", boot).must_be_clean()?;
             serial::Serial::named("test serial", result.serial.as_str()).must_be_clean()?;
             eprintln!("  [va] {}", result.stdout.trim());
+            Ok(())
+        }
+        "heap_ceiling_recovery" => {
+            // A panic inside the kernel allocator's own lock left the heap
+            // locked for the rest of the boot: the panicking thread never
+            // unwinds, so `now` never advances, and the CPU that recovered
+            // spun `Lock::lock` to its 500M-spin deadline on its next `alloc`
+            // or `free` — then panicked again, forever. The fix moved the
+            // ceiling check to `KernelAllocator::alloc`, before the lock.
+            //
+            // `smp: 1` is what makes the claim precise. The property is that
+            // *the recovered CPU* survives its next allocation; on a wider
+            // machine `/bin/echo` could run somewhere else and pass without
+            // touching it. With one CPU there is nowhere else.
+            //
+            // The actuator is `test-heap-ceiling`'s three SYS_DEBUG actions,
+            // and the reason it is not an ordinary workload is on the feature
+            // in `kernel/Cargo.toml`: routes past the ceiling do still exist,
+            // and each of them holds the VFS lock when it dies, so the
+            // machine wedges either way and the allocator's recovery cannot
+            // be observed on its own.
+            let options = BootOptions {
+                smp: 1,
+                kernel_features: &["test-heap-ceiling"],
+                ..Default::default()
+            };
+            let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            serial::Serial::boot(&qemu).must_be_clean()?;
+
+            let result = qemu.run_test("test_rs_heap_ceiling", Duration::from_secs(30));
+            if let Some(err) = &result.error {
+                // The wedge's signature. Before the fix this is where the test
+                // ends: the child's panic strands the allocator, the guest
+                // stops answering, and `run_test` runs out of window.
+                return Err(format!(
+                    "the guest stopped answering after the over-ceiling panic: {err}\n\
+                     serial:\n{}",
+                    result.serial
+                ));
+            }
+            if !check_rust_result(&result) {
+                return Err(format!("heap_ceiling failed:\n{}", result.stdout));
+            }
+
+            // The panic must be the one this test asked for, and it must have
+            // fired where the fix put it. `mm/alloc.rs` appears in the report
+            // either way — the old assert was in the same file — so the needle
+            // is the message, which names the ceiling rather than the page
+            // source's own request.
+            let serial = serial::Serial::named("test serial", result.serial.as_str());
+            serial.must_say("!!! PANIC !!!")?;
+            let line = serial.must_say("exceeds MAX_HEAP_ALLOC")?;
+            eprintln!("  [heap] {}", line.trim());
             Ok(())
         }
         "cache_eviction" => {
