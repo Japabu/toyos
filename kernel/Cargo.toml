@@ -30,6 +30,12 @@ test-input-merge = []
 # `nec-usb-xhci,slots=N` does not reach HCSPARAMS1 and its Enable Slot ignores
 # the MaxSlotsEn a driver writes, so nothing on the host side can stage it.
 xhci-one-slot = []
+# Read and write every USB disk that carries the gate's stamp in block 0, at
+# the end of the peripheral phase. A raw block device has no path to userland,
+# so the kernel is the only in-guest actor that can drive one — and the stamp,
+# not the flag, is what decides which disk gets written: the boot stick is on
+# the same bus and must come back untouched. See `kernel/src/usb_gate.rs`.
+usb-storage-gate = []
 # Shrink both disk caches to 64 entries each. The honest ceilings are tens of
 # megabytes, so a test that reached them by doing real I/O would spend minutes
 # proving what 256 KiB proves in a second. The eviction code under test is the

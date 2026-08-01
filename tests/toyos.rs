@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
-use common::{audio, compile, faults, screen, serial, stats, storage};
+use common::{audio, compile, faults, screen, serial, stats, storage, usb};
 
 struct TestDef {
     name: String,
@@ -63,6 +63,7 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 const SCREEN_TESTS: &[&str] = &[
     "screen_decoder",
     "screen_diag_boot",
+    "screen_i8042_health",
     "screen_recoverable_untouched",
     "screen_early_panic",
     "screen_late_panic",
@@ -92,12 +93,16 @@ const MACHINE_TESTS: &[&str] = &[
     "nvme_large_device",
     "nvme_wide_sector",
     "readdir_bound",
+    "i8042_health",
     "i8042_keyboard",
     "i8042_no_spurious_wake",
     "i8042_mouse",
     "i8042_absent",
     "i8042_quarantine",
+    "i8042_budget_expiry",
     "xhci_slot_exhaustion",
+    "usb_storage_gate",
+    "usb_storage_shapes",
     "cache_eviction",
     "va_exhaustion",
     "heap_ceiling_recovery",
@@ -1233,6 +1238,64 @@ fn run_screen_test(
             );
             Ok(())
         }
+        "screen_i8042_health" => {
+            // The health verdict on the only machine that needs it on glass: no
+            // 16550, no virtio-console, so the log ring has nowhere to drain and
+            // the panel is the whole diagnostic. Nothing in this image claims
+            // DEVICE_FRAMEBUFFER, which is the other half of the condition.
+            //
+            // Not a panic: `screen_late_panic` covers the fatal path, and what
+            // is under test here is a *successful* boot repainting to say
+            // something the last boot checkpoint could not have known yet.
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                mute: true,
+                ..Default::default()
+            };
+            let argv = qemu::profile_argv(&options);
+            metal_sim_argv_check(&argv)?;
+            match argv.iter().position(|a| a == "-serial") {
+                Some(i) if argv.get(i + 1).is_some_and(|v| v == "none") => {}
+                _ => return Err(format!("the muted profile still has a 16550: {argv:?}")),
+            }
+
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            // The verdict waits for a CPU with nothing left to run, so it lands
+            // after the last boot checkpoint by construction. 30s covers
+            // firmware plus the initrd read off USB.
+            let dump = qemu.screendump_until("never asserted", Duration::from_secs(30));
+            let text = dump.text();
+            print_screen(name, &text);
+            if !text.contains("never asserted") {
+                return Err(format!(
+                    "the i8042 health verdict never reached the panel of a guest with no \
+                     console at all\ndecoded screen:\n{text}"
+                ));
+            }
+            // A panic carries the log tail too, and would satisfy the search
+            // above while meaning something entirely different.
+            if dump.fill() != FILL_BOOT {
+                return Err(format!(
+                    "screen fill is {:?}, want the boot checkpoint's {FILL_BOOT:?} — this is \
+                     a panic report, not a health verdict\ndecoded screen:\n{text}",
+                    dump.fill()
+                ));
+            }
+            // The line the verdict follows on from must still be there: a
+            // repaint that dropped the boot log would be a worse diagnostic
+            // than no repaint.
+            if !text.contains("Boot: complete") {
+                return Err(format!(
+                    "the repaint lost the boot log it was supposed to extend\n\
+                     decoded screen:\n{text}"
+                ));
+            }
+            let row = dump.row_index("never asserted").expect("checked above");
+            eprintln!("  [i8042] on the panel of a console-less guest: {}", dump.rows()[row]);
+            Ok(())
+        }
         "screen_panic_muted" => {
             // The machine the whole M0/M1 line exists for: metal-sim with the
             // 16550 taken away, so `uart_present()` is false, `panic_flush`
@@ -1589,6 +1652,9 @@ fn run_machine_test(
         "foreign_disk_untouched" => storage::foreign_disk_untouched(test_config, c_bins, rust_bins),
         // Body in `tests/common/gpt.rs`, same reason.
         "boot_partition_identity" => common::gpt::boot_partition_identity(test_config, c_bins, rust_bins),
+        // Bodies in `tests/common/usb.rs`, for the same reason.
+        "usb_storage_gate" => usb::usb_storage_gate(test_config, c_bins, rust_bins),
+        "usb_storage_shapes" => usb::usb_storage_shapes(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
@@ -1748,20 +1814,26 @@ fn run_machine_test(
                     rings.len()
                 ));
             }
-            // And the devices that are not HID were walked past rather than
-            // stumbled over: the stick and the hub both take a slot and bind
-            // nothing.
+            // And every device on the bus is accounted for exactly once: the
+            // HIDs bound above, the boot stick bound as a disk, the hub walked
+            // past. An inequality here would let a driver that bound the stick
+            // *and* skipped it, or that stopped enumerating early, pass.
+            let disks = log.matches("usb-storage: disk ").count();
             let skipped = log.matches("no HID boot interface found").count();
-            if skipped < usb.len() - binds.len() {
+            if binds.len() + disks + skipped != usb.len() {
                 return Err(format!(
-                    "{skipped} devices skipped, want {}:\n{log}",
-                    usb.len() - binds.len()
+                    "{} HID + {disks} disk + {skipped} skipped is not the {} devices on the bus:\n{log}",
+                    binds.len(),
+                    usb.len()
                 ));
+            }
+            if disks != 1 {
+                return Err(format!("{disks} disks bound, want the boot stick:\n{log}"));
             }
             serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
             eprintln!(
-                "  [xhci] {} devices, {} slots, {keyboards} keyboards on {} distinct rings; \
-                 {} blocks of {} B for max_slots={}, scratchpad={}, pool {} KiB",
+                "  [xhci] {} devices, {} slots, {keyboards} keyboards on {} distinct rings, \
+                 {disks} disk; {} blocks of {} B for max_slots={}, scratchpad={}, pool {} KiB",
                 usb.len(),
                 slots.len(),
                 rings.len(),
@@ -2248,11 +2320,11 @@ fn run_machine_test(
             // completion, which is what makes "the extra devices and nothing
             // else" more than the absence of a panic. On this bus that device
             // is the boot stick — QEMU puts it on the controller's first
-            // SuperSpeed port register, ahead of every USB2 one — so it binds
-            // nothing and what this proves is block 0's output context, not a
-            // HID's interrupt ring. A `dev_base` that overlapped the shared
-            // head would put slot 1's device context on the command ring and
-            // the next command would fail here.
+            // SuperSpeed port register, ahead of every USB2 one — so what it
+            // proves is block 0's output context, its EP0 ring and its bulk
+            // pair, not a HID's interrupt ring. A `dev_base` that overlapped
+            // the shared head would put slot 1's device context on the command
+            // ring and the next command would fail here.
             for bad in [
                 "Enable Slot failed",
                 "Address Device failed",
@@ -2267,10 +2339,14 @@ fn run_machine_test(
             if !log.contains("xHCI: device addressed") {
                 return Err(format!("slot 1 got a block and was never addressed:\n{log}"));
             }
-            if log.matches("no HID boot interface found").count() != 1 {
-                return Err(format!(
-                    "want exactly one device walked past, the stick that fit:\n{log}"
-                ));
+            // And it was driven all the way to a disk. The device blocks are
+            // what ran short, not the mass-storage blocks, so the one device
+            // that fit has to come out the far end with a capacity.
+            if log.matches("usb-storage: disk ").count() != 1 {
+                return Err(format!("the stick that fit did not bind as a disk:\n{log}"));
+            }
+            if !log.contains("usb-storage: 1 device(s)") {
+                return Err(format!("want exactly one disk, the stick that fit:\n{log}"));
             }
             serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
             eprintln!(
@@ -2675,6 +2751,128 @@ fn run_machine_test(
                 events.len(),
                 events.last().unwrap().buttons
             );
+            Ok(())
+        }
+        "i8042_health" => {
+            // The failure mode that had no line at all: `init` arms the pin,
+            // prints its green line, and nothing ever asserts. Both transitions
+            // out of that state are asserted in one boot, and their *order* is
+            // the assertion — a quiet verdict before any key is pressed, an
+            // alive line after one is. Either alone would go green on a driver
+            // that printed a constant.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions { profile: qemu::Profile::Metal, qmp: true, ..Default::default() },
+            );
+            let boot = qemu.boot_log().to_string();
+            if !boot.contains("i8042: kbd set2+xlat") {
+                return Err(format!("the PS/2 keyboard never came up:\n{boot}"));
+            }
+            let result = qemu.run_test_hooked(
+                "test_rs_i8042_keyboard",
+                Duration::from_secs(20),
+                "===I8042_READY===",
+                |socket| {
+                    qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+
+            // The console in time order: everything before the ready marker,
+            // then everything the test run produced.
+            let log = format!("{boot}\n{}", result.serial);
+            let Some(quiet) = log.find("the pin has never asserted") else {
+                return Err(format!(
+                    "the driver never said it was armed and silent:\n{log}"
+                ));
+            };
+            let Some(alive) = log.find("the pin asserts") else {
+                return Err(format!(
+                    "a key was injected and the driver never said the pin asserts:\n{log}"
+                ));
+            };
+            if quiet > alive {
+                return Err(format!(
+                    "the quiet verdict landed after the first interrupt, so it is not \
+                     reporting silence — it is reporting nothing\n{log}"
+                ));
+            }
+            // The counters, not the sentence: a report that printed a constant
+            // would satisfy every search above.
+            let line = log[alive..].lines().next().unwrap_or_default();
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let field = |name: &str| -> Option<u64> {
+                let at = words.iter().position(|w| w.trim_end_matches(',') == name)?;
+                words.get(at.checked_sub(1)?)?.parse().ok()
+            };
+            let irqs = field("interrupts")
+                .ok_or_else(|| format!("unreadable health line: {line}"))?;
+            let keys = field("keys").ok_or_else(|| format!("unreadable health line: {line}"))?;
+            if irqs == 0 || keys == 0 {
+                return Err(format!(
+                    "the alive line reports {irqs} interrupts and {keys} key events: {line}"
+                ));
+            }
+            // `verdict_due` keeps a CPU awake for one pass. If it ever failed to
+            // self-clear, that CPU would spin instead of halting — the exact
+            // failure the quarantine path already had once.
+            let health = result.serial.matches("sched: cpu=").count();
+            if health > 50 {
+                return Err(format!(
+                    "{health} idle-health lines — the health verdict is holding a CPU awake"
+                ));
+            }
+            eprintln!("  [i8042] {}", log[quiet..].lines().next().unwrap_or_default().trim());
+            eprintln!("  [i8042] {}", line.trim());
+            eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
+            Ok(())
+        }
+        "i8042_budget_expiry" => {
+            // The arithmetic defect this feature stages: stage budgets summing
+            // past the total they clamp to. With the total spent before the
+            // probe starts, every wait below returns immediately on a
+            // controller that is answering perfectly — which is what a slow EC
+            // looks like from inside the driver, and what used to surface as
+            // `DISABLED — cfg … did not take`, a controller fault.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    profile: qemu::Profile::Metal,
+                    kernel_features: &["i8042-budget-expired"],
+                    ..Default::default()
+                },
+            );
+            let log = qemu.boot_log().to_string();
+            let Some(line) = log.lines().find(|l| l.contains("init budget")) else {
+                return Err(format!(
+                    "the budget was spent before the probe began and nothing said so:\n{log}"
+                ));
+            };
+            // Naming the stage is the whole point: "it timed out" is not a
+            // diagnosis on a machine that cannot be single-stepped.
+            const STAGES: &[&str] = &["self-test", "keyboard", "aux reset", "the pin could be armed"];
+            if !STAGES.iter().any(|s| line.contains(s)) {
+                return Err(format!(
+                    "a budget expiry that does not name what ran out: {line}"
+                ));
+            }
+            // And it must not still be wearing a controller fault's clothes.
+            if let Some(wrong) = log.lines().find(|l| l.contains("did not take")) {
+                return Err(format!(
+                    "a timeout still reports as a controller fault: {wrong}"
+                ));
+            }
+            // Losing the keyboard must not cost the boot.
+            if boot_millis(&log).is_none() {
+                return Err(format!("the boot did not finish:\n{log}"));
+            }
+            eprintln!("  [i8042] {}", line.trim());
             Ok(())
         }
         "i8042_absent" => {

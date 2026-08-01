@@ -16,3 +16,5 @@ pub mod serial;
 pub mod stats;
 #[allow(dead_code)]
 pub mod storage;
+#[allow(dead_code)]
+pub mod usb;

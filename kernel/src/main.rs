@@ -25,6 +25,8 @@ mod keyboard;
 mod mouse;
 #[cfg(feature = "test-input-merge")]
 mod input_merge_test;
+#[cfg(feature = "usb-storage-gate")]
+mod usb_gate;
 mod block;
 mod gpt;
 mod page_cache;
@@ -382,6 +384,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         Some(ctrl) => xhci::set_global(ctrl),
         None => log!("xHCI: no controller on this machine, USB input unavailable"),
     }
+    #[cfg(feature = "usb-storage-gate")]
+    usb_gate::run();
     i8042::init(kernel_args.rsdp_addr);
     acpi::init_power(kernel_args.rsdp_addr);
 

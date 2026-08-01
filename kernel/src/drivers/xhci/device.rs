@@ -1,77 +1,34 @@
-use core::mem::size_of;
-use core::ptr::{read_volatile, write_volatile, write_bytes};
+use core::ptr::{write_volatile, write_bytes};
 
 use crate::log;
-use super::{Mmio, Trb, TrbRing, XhciController, dma, PAGE, RING_SIZE};
-use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_EP0_RING, OFF_DATA_BUF};
-use super::{DEV_INT_RING, DEV_OUT_CTX, DEV_REPORT};
-use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, TRB_LINK};
+use super::{Mmio, Trb, TrbRing, XhciController, dma, PAGE};
+use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
+use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
+use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, CC_SUCCESS, CC_SHORT_PACKET};
 use super::{OP_PORT_BASE, PORT_REG_SIZE, PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC, PORTSC_RW1C};
 use super::hid::{HidType, HidDevice};
+use super::msc::MscInterface;
 
-// Standard USB descriptor structures (packed because they come from hardware)
-
-#[repr(C, packed)]
-struct UsbDeviceDescriptor {
-    b_length: u8,
-    b_descriptor_type: u8,
-    bcd_usb: u16,
-    b_device_class: u8,
-    b_device_sub_class: u8,
-    b_device_protocol: u8,
-    b_max_packet_size0: u8,
-    id_vendor: u16,
-    id_product: u16,
-    bcd_device: u16,
-    i_manufacturer: u8,
-    i_product: u8,
-    i_serial_number: u8,
-    b_num_configurations: u8,
-}
-
-#[repr(C, packed)]
-struct UsbConfigDescriptor {
-    b_length: u8,
-    b_descriptor_type: u8,
-    w_total_length: u16,
-    b_num_interfaces: u8,
-    b_configuration_value: u8,
-    i_configuration: u8,
-    bm_attributes: u8,
-    b_max_power: u8,
-}
-
-#[repr(C, packed)]
-struct UsbInterfaceDescriptor {
-    b_length: u8,
-    b_descriptor_type: u8,
-    b_interface_number: u8,
-    b_alternate_setting: u8,
-    b_num_endpoints: u8,
-    b_interface_class: u8,
-    b_interface_sub_class: u8,
-    b_interface_protocol: u8,
-    i_interface: u8,
-}
-
-#[repr(C, packed)]
-struct UsbEndpointDescriptor {
-    b_length: u8,
-    b_descriptor_type: u8,
-    b_endpoint_address: u8,
-    bm_attributes: u8,
-    w_max_packet_size: u16,
-    b_interval: u8,
-}
+/// How much of a configuration descriptor the driver reads and parses.
+///
+/// It is also the size of the GET_DESCRIPTOR request, so a device cannot make
+/// the parser walk past it: `wTotalLength` is clamped to what was actually
+/// asked for, and the scratch page is four times this.
+const MAX_CONFIG_DESC: usize = 256;
 
 /// Result of parsing a USB device's configuration descriptor for HID interfaces.
 struct HidInterfaceInfo {
     protocol: HidType,
-    config_val: u8,
     iface_num: u8,
     ep_addr: u8,
     ep_max_packet: u16,
     ep_interval: u8,
+}
+
+/// What one configuration descriptor offered that this driver can drive.
+enum Function {
+    Hid(HidInterfaceInfo),
+    Msc(MscInterface),
 }
 
 fn max_packet_for_speed(speed: u8) -> u16 {
@@ -84,76 +41,149 @@ fn max_packet_for_speed(speed: u8) -> u16 {
     }
 }
 
-/// Parse the configuration descriptor for a HID interface.
-fn parse_hid_config(data_buf: *const u8) -> Option<HidInterfaceInfo> {
-    unsafe {
-        let buf = data_buf;
-        let config = &*(buf as *const UsbConfigDescriptor);
-        let total_len = (config.w_total_length as usize).min(256);
-        let config_val = config.b_configuration_value;
+/// A little-endian 16-bit field at `at`, or 0 past the end. Descriptors are
+/// byte-aligned in the wire format and land wherever the previous descriptor's
+/// length put them, so the packed-struct reads this replaces were unaligned as
+/// well as unbounded.
+fn le16(buf: &[u8], at: usize) -> u16 {
+    let lo = buf.get(at).copied().unwrap_or(0) as u16;
+    let hi = buf.get(at + 1).copied().unwrap_or(0) as u16;
+    lo | (hi << 8)
+}
 
-        let mut found_protocol: Option<HidType> = None;
-        let mut iface_num: u8 = 0;
-        let mut ep_addr: u8 = 0;
-        let mut ep_max_packet: u16 = 0;
-        let mut ep_interval: u8 = 0;
+/// Walk a configuration descriptor for the first interface this driver can
+/// bind, returning it with its configuration value.
+///
+/// Every field read here is device-supplied, including the lengths that decide
+/// where the next descriptor starts — so the walk is bounded by the buffer, a
+/// zero length terminates it rather than looping forever, and every field is
+/// read through `get`. Mass storage wins a tie with HID because a device
+/// offering a disk is a disk; nothing in this tree offers both.
+fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
+    let total_len = (le16(buf, 2) as usize).min(buf.len());
+    let config_val = *buf.get(5)?;
 
-        let mut offset = 0usize;
-        while offset + 2 <= total_len {
-            let desc_len = read_volatile(buf.add(offset)) as usize;
-            let desc_type = read_volatile(buf.add(offset + 1));
-            if desc_len == 0 { break; }
+    let mut hid: Option<HidInterfaceInfo> = None;
+    let mut msc: Option<MscInterface> = None;
+    // Which interface the endpoint descriptors that follow belong to.
+    let mut current: Option<Function> = None;
+    // A SuperSpeed companion describes the endpoint immediately before it.
+    let mut last_ep_in: Option<bool> = None;
 
-            match desc_type {
-                4 if offset + size_of::<UsbInterfaceDescriptor>() <= total_len => {
-                    let intf = &*(buf.add(offset) as *const UsbInterfaceDescriptor);
-                    if intf.b_interface_class == 3 {
-                        found_protocol = if intf.b_interface_sub_class == 1 {
-                            // Boot protocol interface
-                            match intf.b_interface_protocol {
-                                1 => Some(HidType::Keyboard),
-                                2 => Some(HidType::Mouse),
-                                _ => None,
-                            }
-                        } else if intf.b_interface_sub_class == 0 {
-                            // Non-boot HID device (e.g. USB tablet)
-                            Some(HidType::Tablet)
-                        } else {
-                            None
-                        };
-                        if found_protocol.is_some() {
-                            iface_num = intf.b_interface_number;
-                        }
-                    } else {
-                        found_protocol = None;
-                    }
-                }
-                5 if found_protocol.is_some() && offset + size_of::<UsbEndpointDescriptor>() <= total_len => {
-                    let ep = &*(buf.add(offset) as *const UsbEndpointDescriptor);
-                    if ep.b_endpoint_address & 0x80 != 0 && ep_addr == 0 {
-                        ep_addr = ep.b_endpoint_address;
-                        ep_max_packet = ep.w_max_packet_size;
-                        ep_interval = ep.b_interval;
-                    }
-                }
-                _ => {}
-            }
-            offset += desc_len;
+    let mut offset = 0usize;
+    while offset + 2 <= total_len {
+        let desc_len = buf[offset] as usize;
+        let desc_type = buf[offset + 1];
+        if desc_len == 0 {
+            break;
         }
+        let desc = match buf.get(offset..(offset + desc_len).min(total_len)) {
+            Some(d) => d,
+            None => break,
+        };
 
-        if ep_addr != 0 && found_protocol.is_some() {
-            Some(HidInterfaceInfo {
-                protocol: found_protocol.unwrap(),
-                config_val,
-                iface_num,
-                ep_addr,
-                ep_max_packet,
-                ep_interval,
-            })
-        } else {
-            None
+        match desc_type {
+            // Interface
+            4 if desc.len() >= 9 => {
+                if let Some(done) = current.take() {
+                    match done {
+                        Function::Hid(h) if hid.is_none() => hid = Some(h),
+                        Function::Msc(m) if msc.is_none() => msc = Some(m),
+                        _ => {}
+                    }
+                }
+                let (class, sub, proto) = (desc[5], desc[6], desc[7]);
+                current = if class == 0x08 && sub == 0x06 && proto == 0x50 {
+                    Some(Function::Msc(MscInterface {
+                        iface_num: desc[2],
+                        in_ep: 0,
+                        in_max_packet: 0,
+                        in_max_burst: 0,
+                        out_ep: 0,
+                        out_max_packet: 0,
+                        out_max_burst: 0,
+                    }))
+                } else if class == 3 {
+                    let protocol = match (sub, proto) {
+                        (1, 1) => Some(HidType::Keyboard),
+                        (1, 2) => Some(HidType::Mouse),
+                        (0, _) => Some(HidType::Tablet),
+                        _ => None,
+                    };
+                    protocol.map(|protocol| {
+                        Function::Hid(HidInterfaceInfo {
+                            protocol,
+                            iface_num: desc[2],
+                            ep_addr: 0,
+                            ep_max_packet: 0,
+                            ep_interval: 0,
+                        })
+                    })
+                } else {
+                    None
+                };
+            }
+            // Endpoint
+            5 if desc.len() >= 7 => {
+                let addr = desc[2];
+                let transfer = desc[3] & 0x3;
+                let max_packet = le16(desc, 4);
+                last_ep_in = None;
+                match &mut current {
+                    Some(Function::Hid(h)) if addr & 0x80 != 0 && h.ep_addr == 0 => {
+                        h.ep_addr = addr;
+                        h.ep_max_packet = max_packet;
+                        h.ep_interval = desc[6];
+                    }
+                    // Bulk only: a mass-storage interface's interrupt endpoint
+                    // belongs to CBI, which this driver does not speak.
+                    Some(Function::Msc(m)) if transfer == 2 => {
+                        if addr & 0x80 != 0 && m.in_ep == 0 {
+                            m.in_ep = addr;
+                            m.in_max_packet = max_packet;
+                            last_ep_in = Some(true);
+                        } else if addr & 0x80 == 0 && m.out_ep == 0 {
+                            m.out_ep = addr;
+                            m.out_max_packet = max_packet;
+                            last_ep_in = Some(false);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // SuperSpeed Endpoint Companion, which is where a SuperSpeed
+            // device states the burst size of the endpoint just above it.
+            // Zero is legal and means one packet per burst, so a device that
+            // omits this costs throughput and nothing else.
+            0x30 if desc.len() >= 3 => {
+                if let (Some(Function::Msc(m)), Some(is_in)) = (&mut current, last_ep_in) {
+                    if is_in {
+                        m.in_max_burst = desc[2];
+                    } else {
+                        m.out_max_burst = desc[2];
+                    }
+                }
+            }
+            _ => {}
+        }
+        offset += desc_len;
+    }
+    if let Some(done) = current {
+        match done {
+            Function::Hid(h) if hid.is_none() => hid = Some(h),
+            Function::Msc(m) if msc.is_none() => msc = Some(m),
+            _ => {}
         }
     }
+
+    if let Some(m) = msc {
+        if m.in_ep != 0 && m.out_ep != 0 {
+            return Some((config_val, Function::Msc(m)));
+        }
+        log!("xHCI: mass-storage interface {} has no bulk pair, skipping", m.iface_num);
+    }
+    let h = hid?;
+    (h.ep_addr != 0).then(|| (config_val, Function::Hid(h)))
 }
 
 /// Initialize and configure one USB device on a port.
@@ -181,12 +211,17 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let mut enable_slot = Trb::ZERO;
     enable_slot.control = TRB_ENABLE_SLOT;
     ctrl.submit_command(enable_slot);
-    let (code, slot_id) = ctrl.wait_command();
-    if code != 1 {
-        log!("xHCI: Enable Slot failed, code={}", code);
-        return;
-    }
-    let slot_id = slot_id as u8;
+    let slot_id = match ctrl.wait_command() {
+        Some((CC_SUCCESS, slot_id)) => slot_id as u8,
+        Some((code, _)) => {
+            log!("xHCI: Enable Slot failed, code={}", code);
+            return;
+        }
+        None => {
+            log!("xHCI: Enable Slot timed out on port {}", port_idx + 1);
+            return;
+        }
+    };
     // A slot id is the controller's answer, not the driver's, and CONFIG's
     // MaxSlotsEn is only advisory to a controller that chooses to ignore it —
     // QEMU's does. Nothing of the driver's is written for this device yet, so
@@ -199,12 +234,10 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
             slot_id, ctrl.layout.dev_blocks, port_idx + 1);
         return;
     };
-    ctrl.active_slot = slot_id;
     log!("xHCI: slot {} enabled (dma +{:#x})", slot_id, block);
 
-    ctrl.reset_ep0_ring();
-
     let dma = dma();
+    let mut ep0_ring = TrbRing::init(dma.subslice(block + DEV_EP0_RING, PAGE));
     let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
     let input_ctx_ptr = input_ctx.base();
     let input_ctx_phys = input_ctx.phys();
@@ -218,7 +251,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let max_packet = max_packet_for_speed(speed);
     let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((max_packet as u32) << 16);
     ctrl.write_ctx32(input_ctx_ptr, 2, 1, ep0_dw1);
-    let ep0_dequeue = dma.phys() + OFF_EP0_RING as u64 | 1;
+    let ep0_dequeue = ep0_ring.dequeue();
     ctrl.write_ctx32(input_ctx_ptr, 2, 2, ep0_dequeue as u32);
     ctrl.write_ctx32(input_ctx_ptr, 2, 3, (ep0_dequeue >> 32) as u32);
     ctrl.write_ctx32(input_ctx_ptr, 2, 4, 8);
@@ -233,47 +266,65 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let mut addr_dev = Trb::ZERO;
     addr_dev.param = input_ctx_phys;
     addr_dev.control = TRB_ADDRESS_DEVICE | ((slot_id as u32) << 24);
-    ctrl.submit_command(addr_dev);
-    let (code, _) = ctrl.wait_command();
-    if code != 1 {
-        log!("xHCI: Address Device failed, code={}", code);
+    if ctrl.run_command(addr_dev, "Address Device").is_none() {
         return;
     }
     log!("xHCI: device addressed");
 
-    // Descriptor scratch, and shared for the same reason the input context and
-    // the EP0 ring are: it is dead the moment this function returns. The
-    // report buffer below is the one that is not, so it lives in the device's
-    // own block.
+    // Descriptor scratch, and shared for the same reason the input context is:
+    // it is dead the moment this function returns. The report buffer below is
+    // the one that is not, so it lives in the device's own block.
     let data_buf = dma.subslice(OFF_DATA_BUF, PAGE);
     let data_buf_ptr = data_buf.base();
     let data_buf_phys = data_buf.phys();
-    unsafe { write_bytes(data_buf_ptr, 0, 256); }
-    let code = ctrl.control_transfer(0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 18);
-    if code != 1 && code != 13 {
-        log!("xHCI: GET_DESCRIPTOR(Device) failed, code={}", code);
+    unsafe { write_bytes(data_buf_ptr, 0, MAX_CONFIG_DESC); }
+    let code = ctrl.control_transfer(
+        slot_id, &mut ep0_ring, 0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 18,
+    );
+    if !matches!(code, Some(CC_SUCCESS) | Some(CC_SHORT_PACKET)) {
+        log!("xHCI: GET_DESCRIPTOR(Device) failed, code={:?}", code);
         return;
     }
 
-    let (dev_class, vendor_id, product_id) = unsafe {
-        let desc = &*(data_buf_ptr as *const UsbDeviceDescriptor);
-        (desc.b_device_class, desc.id_vendor, desc.id_product)
-    };
-    log!("xHCI: device class={:#x} vendor={:04x} product={:04x}", dev_class, vendor_id, product_id);
+    let descriptor = unsafe { core::slice::from_raw_parts(data_buf_ptr, MAX_CONFIG_DESC) };
+    log!("xHCI: device class={:#x} vendor={:04x} product={:04x}",
+        descriptor[4], le16(descriptor, 8), le16(descriptor, 10));
 
-    unsafe { write_bytes(data_buf_ptr, 0, 256); }
-    let code = ctrl.control_transfer(0x80, 0x06, 0x0200, 0, Some(data_buf_phys), 256);
-    if code != 1 && code != 13 {
-        log!("xHCI: GET_DESCRIPTOR(Config) failed, code={}", code);
+    unsafe { write_bytes(data_buf_ptr, 0, MAX_CONFIG_DESC); }
+    let code = ctrl.control_transfer(
+        slot_id, &mut ep0_ring, 0x80, 0x06, 0x0200, 0,
+        Some(data_buf_phys), MAX_CONFIG_DESC as u16,
+    );
+    if !matches!(code, Some(CC_SUCCESS) | Some(CC_SHORT_PACKET)) {
+        log!("xHCI: GET_DESCRIPTOR(Config) failed, code={:?}", code);
         return;
     }
 
-    let info = match parse_hid_config(data_buf_ptr) {
-        Some(i) => i,
+    let (config_val, function) = match parse_config(descriptor) {
+        Some(f) => f,
         None => {
             log!("xHCI: no HID boot interface found, skipping");
             return;
         }
+    };
+
+    let code = ctrl.control_transfer(
+        slot_id, &mut ep0_ring, 0x00, 0x09, config_val as u16, 0, None, 0,
+    );
+    if code != Some(CC_SUCCESS) {
+        log!("xHCI: SET_CONFIGURATION failed, code={:?}", code);
+        return;
+    }
+    log!("xHCI: configuration set");
+
+    let info = match function {
+        Function::Msc(msc) => {
+            log!("xHCI: mass storage iface={} in={:#x}/{} out={:#x}/{}",
+                msc.iface_num, msc.in_ep, msc.in_max_packet, msc.out_ep, msc.out_max_packet);
+            super::msc::bind(ctrl, ep0_ring, slot_id, speed, port_idx, &msc);
+            return;
+        }
+        Function::Hid(info) => info,
     };
 
     let kind = match info.protocol {
@@ -286,18 +337,13 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     log!("xHCI: HID {} iface={} ep={:#x} max_pkt={} interval={} dci={}",
         kind, info.iface_num, info.ep_addr, info.ep_max_packet, info.ep_interval, int_ep_dci);
 
-    let code = ctrl.control_transfer(0x00, 0x09, info.config_val as u16, 0, None, 0);
-    if code != 1 {
-        log!("xHCI: SET_CONFIGURATION failed, code={}", code);
-        return;
-    }
-    log!("xHCI: configuration set");
-
     // SET_PROTOCOL (boot protocol) — only for boot-interface devices
     if info.protocol != HidType::Tablet {
-        let code = ctrl.control_transfer(0x21, 0x0B, 0, info.iface_num as u16, None, 0);
-        if code != 1 {
-            log!("xHCI: SET_PROTOCOL failed, code={}", code);
+        let code = ctrl.control_transfer(
+            slot_id, &mut ep0_ring, 0x21, 0x0B, 0, info.iface_num as u16, None, 0,
+        );
+        if code != Some(CC_SUCCESS) {
+            log!("xHCI: SET_PROTOCOL failed, code={:?}", code);
         }
     }
 
@@ -305,12 +351,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let report_phys = report.phys();
     let report_ptr = report.base();
 
-    let int_ring = dma.subslice(block + DEV_INT_RING, PAGE);
-    unsafe { int_ring.zero(); }
-    let mut int_link = Trb::ZERO;
-    int_link.param = int_ring.phys();
-    int_link.control = TRB_LINK | (1 << 1);
-    unsafe { write_volatile((int_ring.base() as *mut Trb).add(RING_SIZE - 1), int_link); }
+    let int_ring = TrbRing::init(dma.subslice(block + DEV_INT_RING, PAGE));
 
     let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
     let input_ctx_ptr = input_ctx.base();
@@ -338,7 +379,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let ep_dw1 = (3u32 << 1) | (7u32 << 3) | ((info.ep_max_packet as u32) << 16);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 1, ep_dw1);
 
-    let int_dequeue = int_ring.phys() | 1;
+    let int_dequeue = int_ring.dequeue();
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 2, int_dequeue as u32);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 3, (int_dequeue >> 32) as u32);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 4, 8);
@@ -346,10 +387,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let mut config_ep = Trb::ZERO;
     config_ep.param = input_ctx_phys;
     config_ep.control = TRB_CONFIGURE_EP | ((slot_id as u32) << 24);
-    ctrl.submit_command(config_ep);
-    let (code, _) = ctrl.wait_command();
-    if code != 1 {
-        log!("xHCI: Configure Endpoint failed, code={}", code);
+    if ctrl.run_command(config_ep, "Configure Endpoint").is_none() {
         return;
     }
     log!("xHCI: endpoint configured");
@@ -362,7 +400,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let mut dev = HidDevice {
         slot_id,
         int_ep_dci,
-        int_ring: TrbRing::new(int_ring),
+        int_ring,
         report_phys,
         report_ptr,
         report_size,

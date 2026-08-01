@@ -6,6 +6,7 @@ pub mod ioapic;
 pub mod pci;
 pub mod nvme;
 pub mod xhci;
+pub mod usb_storage;
 pub mod virtio;
 pub mod virtio_console;
 pub mod virtio_gpu;

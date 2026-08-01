@@ -1,5 +1,7 @@
 mod device;
 mod hid;
+mod legacy;
+mod msc;
 
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
@@ -81,10 +83,37 @@ const TRB_LINK:         u32 = trb_type(6);
 const TRB_ENABLE_SLOT:    u32 = trb_type(9);
 const TRB_ADDRESS_DEVICE: u32 = trb_type(11);
 const TRB_CONFIGURE_EP:   u32 = trb_type(12);
+const TRB_RESET_ENDPOINT: u32 = trb_type(14);
+const TRB_SET_TR_DEQUEUE: u32 = trb_type(16);
 
 // Event TRB types (read from event ring, encoded in bits [15:10])
 const EVENT_TRANSFER:     u32 = 32;
 const EVENT_CMD_COMPLETE: u32 = 33;
+
+// Completion codes worth naming. A transfer that moved less than it asked for
+// reports Short Packet, which is a success with a residue and not an error —
+// reading it as one is the classic mass-storage bug, since every SCSI command
+// that under-delivers takes that path.
+const CC_SUCCESS: u32 = 1;
+const CC_STALL: u32 = 6;
+const CC_SHORT_PACKET: u32 = 13;
+
+/// How long the driver waits on any one command or transfer.
+///
+/// A device that never answers must cost that device and not the CPU that
+/// asked it — which is the whole reason this exists, because every wait in
+/// this driver used to be an unbounded `spin_loop`. The bound is generous on
+/// purpose: the transfers it covers complete in microseconds even under TCG,
+/// so nothing but a dead device can reach it.
+const USB_TIMEOUT_NS: u64 = 2_000_000_000;
+
+/// When a wait started now would give up. Before `clock::init` this is 0 plus
+/// the timeout and `nanos_since_boot` stays 0, so the wait is unbounded — the
+/// behaviour this driver had everywhere, and reachable only by a caller that
+/// runs before phase 2.
+fn deadline() -> u64 {
+    crate::clock::nanos_since_boot() + USB_TIMEOUT_NS
+}
 
 const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
 
@@ -96,6 +125,7 @@ struct ErstEntry {
     _reserved: u32,
 }
 
+#[derive(Clone, Copy)]
 struct TrbRing {
     base: *mut Trb,
     base_phys: u64,
@@ -104,8 +134,31 @@ struct TrbRing {
 }
 
 impl TrbRing {
+    /// A ring the controller has never seen: zeroed, with the wrap link TRB
+    /// already at the last slot and the enqueue pointer at the first.
+    ///
+    /// Also the recovery primitive. After a stall the controller's dequeue
+    /// pointer is somewhere in the middle of a ring holding TRBs it will never
+    /// run, so recovery is this plus a Set TR Dequeue Pointer naming
+    /// [`Self::dequeue`] — the two have to agree or the endpoint resumes on
+    /// stale TRBs.
+    fn init(buf: KernelSlice) -> Self {
+        assert!(buf.size() >= RING_SIZE * core::mem::size_of::<Trb>());
+        unsafe { buf.zero(); }
+        let mut link = Trb::ZERO;
+        link.param = buf.phys();
+        link.control = TRB_LINK | (1 << 1); // TC (Toggle Cycle)
+        unsafe { write_volatile((buf.base() as *mut Trb).add(RING_SIZE - 1), link); }
+        Self { base: buf.base() as *mut Trb, base_phys: buf.phys(), tail: 0, cycle: true }
+    }
+
     fn new(buf: KernelSlice) -> Self {
         Self { base: buf.base() as *mut Trb, base_phys: buf.phys(), tail: 0, cycle: true }
+    }
+
+    /// Where the controller should resume, with the cycle state it must expect.
+    fn dequeue(&self) -> u64 {
+        self.base_phys + (self.tail as u64) * 16 | (self.cycle as u64)
     }
 
     fn enqueue(&mut self, mut trb: Trb) {
@@ -142,19 +195,59 @@ const OFF_CMD_RING: usize  = 1 * PAGE;
 const OFF_ERST: usize      = 2 * PAGE;
 const OFF_EVT_RING: usize  = 3 * PAGE;
 const OFF_INPUT_CTX: usize = 4 * PAGE; // 33 contexts, so 2112 B at ctx_size 64
-const OFF_EP0_RING: usize  = 5 * PAGE;
-const OFF_DATA_BUF: usize  = 6 * PAGE;
-const SHARED_SIZE: usize   = 7 * PAGE;
+const OFF_DATA_BUF: usize  = 5 * PAGE;
+const SHARED_SIZE: usize   = 6 * PAGE;
 
-// One of these per device the controller gives us a slot for. All three
+// One of these per device the controller gives us a slot for. All four
 // outlive enumeration: the controller writes the output context and the report
 // buffer for as long as the device is attached, and the interrupt ring carries
 // that device's transfers. Sharing any of them between two devices is a
 // silent data race, which is what keying the interrupt ring by HID class did.
-const DEV_INT_RING: usize = 0;             // 256 TRBs, exactly one page
-const DEV_OUT_CTX: usize  = PAGE;          // 32 contexts, 2 KiB at ctx_size 64
-const DEV_REPORT: usize   = PAGE + 0x800;  // 8 B, the largest boot report
-const DEV_STRIDE: usize   = 2 * PAGE;
+//
+// The EP0 ring is here for the same reason and used to be one shared page.
+// That was sound only while every control transfer happened during that
+// device's own enumeration: the ring is rewound for each device, so a device
+// enumerated earlier has an EP0 dequeue pointer into a ring whose contents and
+// cycle state have since moved under it. Mass storage is the first thing that
+// needs to talk to a device *after* boot — Clear-Feature(HALT) and Bulk-Only
+// Reset are control transfers on the recovery path — so the ring has to belong
+// to the device rather than to the enumeration.
+const DEV_INT_RING: usize = 0;                 // 256 TRBs, exactly one page
+const DEV_EP0_RING: usize = PAGE;              // likewise
+const DEV_OUT_CTX: usize  = 2 * PAGE;          // 32 contexts, 2 KiB at ctx_size 64
+const DEV_REPORT: usize   = 2 * PAGE + 0x800;  // 8 B, the largest boot report
+const DEV_STRIDE: usize   = 3 * PAGE;
+
+// One of these per mass-storage device, and separate from the device block
+// above because the two are three orders of magnitude apart in appetite: a
+// keyboard needs 8 bytes of report buffer and a disk needs a transfer buffer.
+// Folding the larger into `DEV_STRIDE` would hand every keyboard, hub and
+// camera on the bus a 64 KiB block it never touches, and would divide the
+// number of devices the pool can track by eight.
+const MSC_IN_RING: usize   = 0;
+const MSC_OUT_RING: usize  = PAGE;
+const MSC_CBW: usize       = 2 * PAGE;         // 31 B
+const MSC_CSW: usize       = 2 * PAGE + 0x40;  // 13 B
+const MSC_SCRATCH: usize   = 2 * PAGE + 0x80;  // INQUIRY, READ CAPACITY, sense
+const MSC_SCRATCH_LEN: usize = 64;
+/// The bulk data buffer, placed so it cannot cross a 64 KiB boundary — which
+/// is the one placement rule an xHCI Normal TRB's buffer has. `msc_base` is
+/// aligned to `MSC_STRIDE` and the pool's physical base is 2 MiB aligned, so
+/// every block starts on a 64 KiB boundary and this buffer occupies its
+/// second half exactly.
+const MSC_DATA: usize      = 8 * PAGE;
+const MSC_DATA_LEN: usize  = 8 * PAGE;
+const MSC_STRIDE: usize    = 16 * PAGE;
+
+/// Mass-storage devices the pool has blocks for. Two, because that is what a
+/// machine booting off a USB stick with a second one plugged in has, and each
+/// costs 64 KiB whether or not it is used. A third stick is refused by name
+/// rather than served from somebody else's block.
+const MSC_BLOCKS: usize = 2;
+
+/// The largest run of 4 KiB blocks one SCSI command moves, which is the data
+/// buffer over the trait's block size. Every caller-facing loop batches to it.
+const MSC_MAX_BLOCKS: u32 = (MSC_DATA_LEN / 4096) as u32;
 
 /// Device blocks to size the pool for before the controller's slot count is
 /// consulted. Only a controller with a scratchpad demand that lands just under
@@ -182,6 +275,7 @@ struct Layout {
     scratch_array: usize,
     scratch_buffers: usize,
     scratch_count: usize,
+    msc_base: usize,
     dev_base: usize,
     /// Device blocks the pool holds, which is also the MaxSlotsEn written to
     /// CONFIG: the controller is told exactly what the driver can track.
@@ -196,13 +290,20 @@ impl Layout {
     /// It is also what makes the plain `align_2m` below safe where every other
     /// caller taking a size from outside the kernel needs `align_2m_checked`:
     /// `max_scratchpad` is two 5-bit HCSPARAMS2 fields (`init` masks both with
-    /// `0x1F`), so it is at most 1023 and `dev_base` at most about 4.2 MiB. A
-    /// controller cannot report a number that overflows this, whatever it says.
+    /// `0x1F`), so it is at most 1023, and the mass-storage array adds a fixed
+    /// 128 KiB on top — `dev_base` is at most about 4.4 MiB. A controller
+    /// cannot report a number that overflows this, whatever it says.
     fn new(max_scratchpad: usize, max_slots: u8) -> Self {
         let scratch_array = SHARED_SIZE;
         let array_bytes = (max_scratchpad * 8 + PAGE - 1) & !(PAGE - 1);
         let scratch_buffers = scratch_array + array_bytes;
-        let dev_base = scratch_buffers + max_scratchpad * PAGE;
+        // Ahead of the device array rather than behind it, so the device array
+        // still absorbs all of the pool's slack and MaxSlotsEn is unchanged by
+        // storage existing. The alignment is what makes each block's data
+        // buffer stay inside one 64 KiB region.
+        let msc_base =
+            (scratch_buffers + max_scratchpad * PAGE + MSC_STRIDE - 1) & !(MSC_STRIDE - 1);
+        let dev_base = msc_base + MSC_BLOCKS * MSC_STRIDE;
 
         // DmaPool hands out whole 2 MiB pages. The head above already forces
         // one, so every block that fits in its slack is free — and asking for
@@ -218,6 +319,7 @@ impl Layout {
             scratch_array,
             scratch_buffers,
             scratch_count: max_scratchpad,
+            msc_base,
             dev_base,
             dev_blocks,
             pool_size,
@@ -229,6 +331,11 @@ impl Layout {
     fn device(&self, slot_id: u8) -> Option<usize> {
         let index = (slot_id as usize).checked_sub(1)?;
         (index < self.dev_blocks).then(|| self.dev_base + index * DEV_STRIDE)
+    }
+
+    /// The block for the `index`-th mass-storage device bound this boot.
+    fn msc(&self, index: usize) -> Option<usize> {
+        (index < MSC_BLOCKS).then(|| self.msc_base + index * MSC_STRIDE)
     }
 }
 
@@ -258,18 +365,13 @@ pub struct XhciController {
     layout: Layout,
 
     cmd_ring: TrbRing,
-    ep0_ring: TrbRing,
 
     event_ring: *const Trb,
     event_head: u16,
     event_phase: bool,
 
-    /// The device `init_device` is enumerating: which doorbell EP0 transfers
-    /// ring, and which slot id their completions must carry to be this
-    /// enumeration's rather than a bound device's.
-    active_slot: u8,
-
     devices: Vec<HidDevice>,
+    storage: Vec<msc::MscDevice>,
 }
 
 impl XhciController {
@@ -313,16 +415,40 @@ impl XhciController {
         }
     }
 
-    fn wait_command(&mut self) -> (u32, u32) {
+    /// The completion code and slot id of the command just submitted, or
+    /// `None` if the controller never answered.
+    fn wait_command(&mut self) -> Option<(u32, u32)> {
+        let deadline = deadline();
         loop {
             let Some(event) = self.next_event() else {
+                if crate::clock::nanos_since_boot() >= deadline {
+                    return None;
+                }
                 core::hint::spin_loop();
                 continue;
             };
             if (event.control >> 10) & 0x3F == EVENT_CMD_COMPLETE {
-                return ((event.status >> 24) & 0xFF, (event.control >> 24) & 0xFF);
+                return Some(((event.status >> 24) & 0xFF, (event.control >> 24) & 0xFF));
             }
             self.dispatch_event(event);
+        }
+    }
+
+    /// Submit `trb` and report the completion code, logging and returning
+    /// `None` on anything the controller did not accept. `what` names the
+    /// command in that line, because a bare code is unreadable at 3am.
+    fn run_command(&mut self, trb: Trb, what: &str) -> Option<u32> {
+        self.submit_command(trb);
+        match self.wait_command() {
+            Some((CC_SUCCESS, _)) => Some(CC_SUCCESS),
+            Some((code, _)) => {
+                log!("xHCI: {what} failed, code={code}");
+                None
+            }
+            None => {
+                log!("xHCI: {what} timed out");
+                None
+            }
         }
     }
 
@@ -336,44 +462,54 @@ impl XhciController {
         self.rt_base.write_u32(IR0_IMAN, 3); // clear IP (W1C) + keep IE
     }
 
-    fn enqueue_ep0(&mut self, trb: Trb) {
-        self.ep0_ring.enqueue(trb);
-    }
-
-    fn ring_ep0_doorbell(&self) {
+    fn ring_doorbell(&self, slot: u8, dci: u8) {
         fence(Ordering::Release);
-        self.db_base.write_u32(self.active_slot as u64 * 4, 1);
+        self.db_base.write_u32(slot as u64 * 4, dci as u32);
     }
 
-    /// The completion of the transfer just queued on the shared EP0 ring, which
-    /// is the one carrying the enumerating device's slot id. Any other transfer
-    /// event is a bound device delivering a report while this port enumerates;
-    /// returning its completion code would have the caller read a descriptor
-    /// buffer the controller has not written into yet.
-    fn wait_transfer(&mut self) -> u32 {
+    /// The completion of the transfer just queued on (`slot`, `dci`), as a
+    /// completion code and the number of bytes the controller did *not* move.
+    ///
+    /// The event ring is one queue for the whole controller, so anything that
+    /// arrives here and is not ours belongs to a bound device delivering a
+    /// report — handing it to `dispatch_event` rather than dropping it is what
+    /// keeps that device's interrupt ring fed. Matching on the endpoint as
+    /// well as the slot matters for mass storage, where one slot carries three
+    /// endpoints and a stalled one still completes.
+    fn wait_transfer(&mut self, slot: u8, dci: u8) -> Option<(u32, u32)> {
+        let deadline = deadline();
         loop {
             let Some(event) = self.next_event() else {
+                if crate::clock::nanos_since_boot() >= deadline {
+                    return None;
+                }
                 core::hint::spin_loop();
                 continue;
             };
             let trb_type = (event.control >> 10) & 0x3F;
-            let slot = ((event.control >> 24) & 0xFF) as u8;
-            if trb_type == EVENT_TRANSFER && slot == self.active_slot {
-                return (event.status >> 24) & 0xFF;
+            let ev_slot = ((event.control >> 24) & 0xFF) as u8;
+            let ev_dci = ((event.control >> 16) & 0x1F) as u8;
+            if trb_type == EVENT_TRANSFER && ev_slot == slot && ev_dci == dci {
+                return Some(((event.status >> 24) & 0xFF, event.status & 0x00FF_FFFF));
             }
             self.dispatch_event(event);
         }
     }
 
+    /// One control transfer on `ring`, which must be the EP0 ring named by
+    /// `slot`'s device context. Returns the completion code, or `None` when
+    /// the device never answered.
     fn control_transfer(
         &mut self,
+        slot: u8,
+        ring: &mut TrbRing,
         bm_request_type: u8,
         b_request: u8,
         w_value: u16,
         w_index: u16,
         data_buf: Option<u64>,
         data_len: u16,
-    ) -> u32 {
+    ) -> Option<u32> {
         let is_in = (bm_request_type & 0x80) != 0;
         let has_data = data_len > 0 && data_buf.is_some();
         let trt = if !has_data { 0u32 } else if is_in { 3 } else { 2 };
@@ -382,7 +518,7 @@ impl XhciController {
         setup.param = setup_packet(bm_request_type, b_request, w_value, w_index, data_len);
         setup.status = 8;
         setup.control = TRB_SETUP_STAGE | (1 << 6) | (trt << 16);
-        self.enqueue_ep0(setup);
+        ring.enqueue(setup);
 
         if has_data {
             let mut data = Trb::ZERO;
@@ -390,37 +526,16 @@ impl XhciController {
             data.status = data_len as u32;
             let dir = if is_in { 1u32 << 16 } else { 0 };
             data.control = TRB_DATA_STAGE | dir;
-            self.enqueue_ep0(data);
+            ring.enqueue(data);
         }
 
         let mut status = Trb::ZERO;
         let status_dir = if has_data && is_in { 0 } else { 1u32 << 16 };
         status.control = TRB_STATUS_STAGE | (1 << 5) | status_dir;
-        self.enqueue_ep0(status);
+        ring.enqueue(status);
 
-        self.ring_ep0_doorbell();
-        self.wait_transfer()
-    }
-
-    /// Hand the one EP0 ring to the device being enumerated. Every device
-    /// addressed before this one still points its EP0 context here, which is
-    /// safe only because nothing rings their doorbells again: `init_device` is
-    /// the sole caller, it runs once per port from `init`, and each of its
-    /// control transfers completes before the next starts — the last of which
-    /// holds only because `wait_transfer` matches the completion's slot id
-    /// against the enumerating device, so a bound device delivering a report
-    /// cannot end this transfer early and let the zeroing below land on a ring
-    /// still in flight. Hotplug breaks the serial part and has to take an
-    /// enumeration lock, not a second ring.
-    fn reset_ep0_ring(&mut self) {
-        let dma = dma();
-        let ring = dma.subslice(OFF_EP0_RING, PAGE);
-        unsafe { ring.zero(); }
-        let mut link = Trb::ZERO;
-        link.param = ring.phys();
-        link.control = TRB_LINK | (1 << 1);
-        unsafe { write_volatile((ring.base() as *mut Trb).add(RING_SIZE - 1), link); }
-        self.ep0_ring = TrbRing::new(ring);
+        self.ring_doorbell(slot, 1);
+        self.wait_transfer(slot, 1).map(|(code, _)| code)
     }
 
     pub fn poll(&mut self) {
@@ -455,6 +570,49 @@ pub fn poll_if_pending() {
         if let Some(ctrl) = guard.as_mut() {
             ctrl.poll();
         }
+    }
+}
+
+/// Everything above the controller needs to know about one bound disk.
+#[derive(Clone, Copy, Debug)]
+pub struct StorageGeometry {
+    /// What the device itself addresses in, straight off READ CAPACITY.
+    pub logical_block_bytes: u32,
+    /// The same capacity in the 4 KiB blocks `BlockDevice` is written in.
+    pub blocks: u64,
+}
+
+pub fn storage_count() -> usize {
+    XHCI.lock().as_ref().map_or(0, |c| c.storage.len())
+}
+
+pub fn storage_geometry(index: usize) -> Option<StorageGeometry> {
+    XHCI.lock().as_ref()?.storage.get(index).map(msc::MscDevice::geometry)
+}
+
+/// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
+/// `buf` holds nothing the caller may believe.
+pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+    let mut guard = XHCI.lock();
+    match guard.as_mut() {
+        Some(ctrl) => ctrl.msc_read(index, lba, count, buf),
+        None => false,
+    }
+}
+
+pub fn storage_write(index: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
+    let mut guard = XHCI.lock();
+    match guard.as_mut() {
+        Some(ctrl) => ctrl.msc_write(index, lba, count, buf),
+        None => false,
+    }
+}
+
+pub fn storage_flush(index: usize) -> bool {
+    let mut guard = XHCI.lock();
+    match guard.as_mut() {
+        Some(ctrl) => ctrl.msc_flush(index),
+        None => false,
     }
 }
 
@@ -537,6 +695,11 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
         layout.pool_size / 1024, layout.scratch_count, layout.dev_blocks, DEV_STRIDE, max_slots);
     *XHCI_DMA_POOL.lock() = Some(DmaPool::alloc(layout.pool_size));
 
+    // Before the controller is touched at all: on a PC the firmware may still
+    // own it for legacy keyboard emulation, and resetting a controller SMM is
+    // driving is a fight with no diagnostic.
+    legacy::take_ownership(&bar, bar_size, hccparams1);
+
     let usbcmd = op_base.read_u32(OP_USBCMD);
     if usbcmd & 1 != 0 {
         op_base.write_u32(OP_USBCMD, usbcmd & !1);
@@ -579,12 +742,8 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
 
     op_base.write_u64(OP_DCBAAP, dma.phys() + OFF_DCBAA as u64);
 
-    let cmd_ring_buf = dma.subslice(OFF_CMD_RING, PAGE);
-    let mut link = Trb::ZERO;
-    link.param = cmd_ring_buf.phys();
-    link.control = TRB_LINK | (1 << 1);
-    unsafe { write_volatile((cmd_ring_buf.base() as *mut Trb).add(RING_SIZE - 1), link); }
-    op_base.write_u64(OP_CRCR, cmd_ring_buf.phys() | 1);
+    let cmd_ring = TrbRing::init(dma.subslice(OFF_CMD_RING, PAGE));
+    op_base.write_u64(OP_CRCR, dma.phys() + OFF_CMD_RING as u64 | 1);
 
     let evt_ring_buf = dma.subslice(OFF_EVT_RING, PAGE);
     let erst = dma.ptr_at(OFF_ERST) as *mut ErstEntry;
@@ -603,13 +762,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     rt_base.write_u32(IR0_IMOD, 0);
     rt_base.write_u32(IR0_IMAN, 3);
 
-    // EP0 Ring (will be reset per device)
-    let ep0_buf = dma.subslice(OFF_EP0_RING, PAGE);
-    let mut ep0_link = Trb::ZERO;
-    ep0_link.param = ep0_buf.phys();
-    ep0_link.control = TRB_LINK | (1 << 1);
-    unsafe { write_volatile((ep0_buf.base() as *mut Trb).add(RING_SIZE - 1), ep0_link); }
-
     // Start controller (R/S + INTE for interrupt delivery)
     op_base.write_u32(OP_USBCMD, 1 | (1 << 2));
     while op_base.read_u32(OP_USBSTS) & 1 != 0 {
@@ -622,13 +774,12 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
         rt_base,
         context_size,
         layout,
-        cmd_ring: TrbRing::new(cmd_ring_buf),
-        ep0_ring: TrbRing::new(ep0_buf),
+        cmd_ring,
         event_ring: evt_ring_buf.base() as *const Trb,
         event_head: 0,
         event_phase: true,
-        active_slot: 0,
         devices: Vec::new(),
+        storage: Vec::new(),
     };
 
     device::scan_ports(&mut ctrl, &op_base, max_ports);
@@ -642,6 +793,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     if ctrl.devices.is_empty() {
         log!("xHCI: no HID devices found");
     }
+    log!("usb-storage: {} device(s)", ctrl.storage.len());
 
     Some(ctrl)
 }
