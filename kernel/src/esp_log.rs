@@ -107,15 +107,26 @@ const MAX_LOG_BYTES: u64 = if cfg!(feature = "esp-log-rotate-fast") {
 /// [`log_ring::DRAIN_CHUNK`].
 const CHUNK: usize = 512;
 
-/// Consecutive polls that may find the VFS lock held before the sink gives up.
+/// How long the VFS lock may stay held before the sink gives up on it.
 ///
-/// Not a timeout on a busy filesystem: a lock holder runs with preemption
-/// disabled and always makes progress, so ordinary contention clears in
-/// microseconds. It bounds the one case that never clears — a thread that
-/// panicked holding the VFS lock, which known issues records as live. Without
-/// it the ring would report bytes pending forever and the idle loop, which
-/// declines to sleep on that, would spin a CPU with nothing to do about it.
-const MAX_BLOCKED_POLLS: u32 = 1000;
+/// It bounds the one case that never clears — a thread that panicked holding
+/// the VFS lock, which known issues records as live. Without it the ring would
+/// report bytes pending forever and the idle loop, which declines to sleep on
+/// that, would spin a CPU with nothing to do about it.
+///
+/// A *duration* and not a count of polls, which is what it was. A count only
+/// stands for a duration if you know how fast the idle loop goes round, and
+/// nothing here does: 1000 polls elapse in about two milliseconds, while an
+/// ordinary `spawn` holds the VFS lock for 13-17 ms reading an ELF. So a
+/// healthy machine turned its own log off during a spawn — seen on both an
+/// audio boot and a shutdown boot, permanently, and on the machine this
+/// feature exists for there is no other channel to notice it on.
+///
+/// Ten seconds because the thing on the other side of it is a panic, and
+/// nothing legitimate holds this lock for anywhere near that. Erring long
+/// costs a spinning CPU on a machine that has already lost a thread; erring
+/// short costs the log on a machine that is working.
+const MAX_BLOCKED_NANOS: u64 = 10_000_000_000;
 
 struct Sink {
     file_id: FileId,
@@ -123,7 +134,8 @@ struct Sink {
     /// Kept here rather than read back from the file cache so a disagreement
     /// shows up as a wrong offset rather than being silently corrected.
     size: u64,
-    blocked: u32,
+    /// When the current run of polls that found the VFS lock held began.
+    blocked_since: Option<u64>,
 }
 
 static SINK: Lock<Option<Sink>> = Lock::new(None);
@@ -150,7 +162,7 @@ pub fn install() {
             return;
         }
     };
-    *SINK.lock() = Some(Sink { file_id, size, blocked: 0 });
+    *SINK.lock() = Some(Sink { file_id, size, blocked_since: None });
     log_ring::enable_file_sink();
     log!("esp-log: this boot's kernel log continues in {PATH}, which holds {size} bytes");
 }
@@ -166,8 +178,9 @@ pub fn poll() {
     let Some(sink) = guard.as_mut() else { return };
 
     let Some(mut vfs) = vfs::try_lock() else {
-        sink.blocked += 1;
-        if sink.blocked < MAX_BLOCKED_POLLS {
+        let now = crate::clock::nanos_since_boot();
+        let since = *sink.blocked_since.get_or_insert(now);
+        if now.saturating_sub(since) < MAX_BLOCKED_NANOS {
             return;
         }
         let size = sink.size;
@@ -175,12 +188,12 @@ pub fn poll() {
         drop(guard);
         log_ring::disable_file_sink();
         log!(
-            "esp-log: the VFS lock has been held for {MAX_BLOCKED_POLLS} consecutive polls — \
-             {PATH} stops at {size} bytes"
+            "esp-log: the VFS lock has been held for {}s — {PATH} stops at {size} bytes",
+            MAX_BLOCKED_NANOS / 1_000_000_000
         );
         return;
     };
-    sink.blocked = 0;
+    sink.blocked_since = None;
     let outcome = sink.flush(&mut vfs);
     drop(vfs);
     if let Err(e) = outcome {
