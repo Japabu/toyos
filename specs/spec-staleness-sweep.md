@@ -46,6 +46,31 @@ evict" is evidence that someone intended to; the call site is evidence they did.
 Check that `init` has a caller, that the guard has a non-`usize::MAX` value, that
 the deleted function is actually gone.
 
+## Three ways a gate fails, and the one question that finds all three
+
+**Ask what would make this gate green other than the thing it is testing.**
+
+| | Shape | That question's answer | Found |
+|---|---|---|---|
+| 1 | **A gate that cannot fail** — prose claims a test proves something and nobody checked it fails | "nothing ever made it red" | five times, once in seven places at once |
+| 2 | **A bound whose cost nothing measures** — a correct-looking check that silently disables what it protects | "the protected path stopped being exercised" | once, in a relocation prescan |
+| 3 | **A gate that goes quiet** — the change under test narrows the check's coverage rather than violating it | "the window stopped opening" | once, *prospectively*, before the change existed |
+
+Shape 3 is the newest and the least intuitive. I13 measures per-thread service only
+inside windows where placement is balanced; unbalanced placement closes the window. The
+planned per-share-FIFO redesign must reimplement `pop_surplus`, which feeds
+`answer_steal_requests` and can therefore change placement — so that redesign could shrink
+I13's measured coverage toward zero and **the gate would go quiet, not red.**
+
+Nothing currently asserts that a check's coverage survived the change it was written to
+guard. The remedy, recorded as a requirement on that work: **measure how many nanoseconds
+I13 actually covers on the current tree, and A/B that number across the change. A coverage
+collapse must be as loud as a violation.**
+
+Generalised: whenever a change touches the machinery a gate's *precondition* depends on,
+the gate's reach is a silent casualty. Treat coverage as a measured quantity, not an
+assumed one.
+
 ## Break it and run it — the one check you cannot do by reading
 
 **The pattern: a claim that a named test proves something, where nobody ever
@@ -135,6 +160,22 @@ Writing the test before the fix is what surfaced it. Worth noting because it is
 the exception to today's pattern: **every other proof confirmed a fix; this one
 refuted one.** A test written after a fix tends to confirm it, since it is
 written by someone who already believes the fix works.
+
+## A comment can be wrong about *why*, not only about *what*
+
+`queue.rs`'s tie-break rule was correct and its stated reason was false: it said an identity
+tie-break starves siblings. It does not — the pot is charged for every nanosecond any thread
+of the share runs, so a re-inserted thread already carries a key strictly above every sibling
+queued before it. The rule survives for a different reason (the pot is doing the work, and a
+policy that stops charging per dispatch hands the job back).
+
+Same class as every other stale-prose finding, applied to a justification rather than a
+claim — and **harder to catch, because the rule it defends is right.** Nothing goes wrong,
+tests stay green, and review sees a sound rule. It fails only when someone tests the
+justification and discards the rule with it.
+
+When a comment gives a reason, the reason is a claim too. Ask whether it is measured or
+merely plausible.
 
 ## Check the premise before building
 

@@ -846,8 +846,12 @@ Related: `pop_surplus` takes the *last* fair task (`keys().next_back()`), so a s
 hands away the next-to-run one.
 
 > This section previously specified `BTreeMap<(u64, TaskKey), ReadyTask>` and called it
-> "today's ordering, deliberately". That is the ordering the code rejects as a starvation
-> bug; anyone implementing from the old text would have reintroduced it.
+> "today's ordering, deliberately". That is not the ordering the code uses, so anyone
+> implementing from the old text would have written something else. An interim correction
+> then justified the rule by saying an identity tie-break *starves siblings* — measurement
+> says it does not, for the reason set out below. **The rule was right and the reason was
+> wrong**, which is the harder failure to catch: a correct rule with a false justification
+> survives review, and gets discarded the moment someone tests the justification.
 
 **What that rule is worth today is smaller than the paragraph above reads, and it is now
 measured rather than asserted.** The share's pot is charged for every nanosecond any of its

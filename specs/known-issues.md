@@ -810,7 +810,7 @@ virtio device — that is what `--metal-sim` is for.
 Not a doc bug — a plan defect. A plan that fails the suite is not ready to execute, and the
 suite is right here. Whoever picks R2 up must re-scope it against those tests first.
 
-### The scheduler's fair split degrades as the machine widens — settled: it is the policy
+### The scheduler's *per-process* fair split degrades as the machine widens — settled: it is the policy
 
 Worst service spread against the derived bound, in ms, from
 `measure fairness_storm:<cpus> 500`:
@@ -819,6 +819,13 @@ Worst service spread against the derived bound, in ms, from
 |---|---|---|---|---|---|---|---|---|---|---|
 | worst | 30 | 84 | 125 | **198** | **324** | **418** | **634** | 720 | 1056 | 1386 |
 | bound | 60 | 108 | 156 | 204 | 300 | 396 | 588 | 780 | 1164 | 1548 |
+
+**Per-process only, and that is a real bound on the defect.** The *per-thread* split does
+not degrade with width: measured 10 ms at 1 CPU to 50 ms at 32, against a 60 ms derived
+bound — inside its bound at every width — over the same runs where I5 went 30 → 1386. So
+threads of a process are shared out fairly among themselves at any machine size; it is the
+split *between processes* that widens. The fix has a smaller target than "fairness degrades"
+implies.
 
 **Both questions the earlier filing left open are now measured, not argued.**
 
