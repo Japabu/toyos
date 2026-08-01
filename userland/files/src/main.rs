@@ -51,7 +51,10 @@ struct FileBrowser {
 
 impl FileBrowser {
     fn new() -> Self {
-        let window = Window::create_with_title(0, 0, "Files");
+        let window = Window::create_with_title(0, 0, "Files").unwrap_or_else(|e| {
+            eprintln!("files: {e}");
+            std::process::exit(1);
+        });
         let fb = window.framebuffer();
 
         let font_data = fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font").expect("failed to read font");

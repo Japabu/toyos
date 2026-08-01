@@ -34,10 +34,71 @@ pub const MSG_MOUSE_INPUT: u32 = 5;
 pub const MSG_CLIPBOARD_PASTE: u32 = 6;
 pub const MSG_FRAME: u32 = 7;
 pub const MSG_RESOLUTION_CHANGED: u32 = 8;
+/// The compositor will not create the window that was asked for. Payload is a
+/// [`WindowRefused`]. The only server→client message that answers
+/// `MSG_CREATE_WINDOW` other than [`MSG_WINDOW_CREATED`], and the reason
+/// [`Window::create`] is fallible: without it a compositor that cannot afford
+/// another window has no move except to serve it or to drop the connection.
+pub const MSG_WINDOW_REFUSED: u32 = 9;
 
 // Shared-memory clipboard (for payloads > 116 bytes)
 pub const MSG_CLIPBOARD_SET_SHM: u32 = 10;
 pub const MSG_CLIPBOARD_PASTE_SHM: u32 = 11;
+
+/// Wire reasons carried by [`MSG_WINDOW_REFUSED`]. A client that does not know
+/// a reason still knows it was refused, so adding one is backwards compatible
+/// with an older client — [`CreateError::Refused`] carries the raw value.
+pub const REFUSED_AT_CAPACITY: u32 = 1;
+pub const REFUSED_TOO_LARGE: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WindowRefused {
+    pub reason: u32,
+}
+
+/// Why creating a window failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateError {
+    /// Nothing is serving the `compositor` service, or it went away between
+    /// the request and the reply.
+    NoCompositor,
+    /// The compositor is already holding as many windows as it can afford.
+    AtCapacity,
+    /// The requested size is bigger than the screen it would be drawn on.
+    TooLarge,
+    /// Refused for a reason this build of the client does not know.
+    Refused(u32),
+    /// The compositor answered `MSG_CREATE_WINDOW` with a message that is
+    /// neither [`MSG_WINDOW_CREATED`] nor [`MSG_WINDOW_REFUSED`].
+    Protocol(u32),
+}
+
+impl std::fmt::Display for CreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCompositor => write!(f, "no compositor is running"),
+            Self::AtCapacity => write!(f, "the compositor is at its window limit"),
+            Self::TooLarge => write!(f, "the window is larger than the screen"),
+            Self::Refused(reason) => write!(f, "the compositor refused (reason {reason})"),
+            Self::Protocol(msg_type) => {
+                write!(f, "the compositor answered with message type {msg_type}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CreateError {}
+
+impl CreateError {
+    fn from_wire(reason: u32) -> Self {
+        match reason {
+            REFUSED_AT_CAPACITY => Self::AtCapacity,
+            REFUSED_TOO_LARGE => Self::TooLarge,
+            other => Self::Refused(other),
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -169,20 +230,30 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn create(width: u32, height: u32) -> Self {
+    /// Ask the compositor for a window. `0, 0` asks it to pick a size.
+    ///
+    /// Fails rather than panics: the compositor is entitled to say no — it
+    /// bounds what it will hold — and "you may not have a window" is an
+    /// ordinary answer to an ordinary request, not a bug in the caller.
+    pub fn create(width: u32, height: u32) -> Result<Self, CreateError> {
         Self::create_with_title(width, height, "")
     }
 
-    pub fn create_with_title(width: u32, height: u32, title: &str) -> Self {
+    pub fn create_with_title(width: u32, height: u32, title: &str) -> Result<Self, CreateError> {
         Self::create_with_flags(width, height, title, 0)
     }
 
-    pub fn create_topmost(width: u32, height: u32, title: &str) -> Self {
+    pub fn create_topmost(width: u32, height: u32, title: &str) -> Result<Self, CreateError> {
         Self::create_with_flags(width, height, title, WINDOW_FLAG_TOPMOST)
     }
 
-    fn create_with_flags(width: u32, height: u32, title: &str, flags: u8) -> Self {
-        let conn = services::connect("compositor").expect("compositor not running");
+    fn create_with_flags(
+        width: u32,
+        height: u32,
+        title: &str,
+        flags: u8,
+    ) -> Result<Self, CreateError> {
+        let conn = services::connect("compositor").map_err(|_| CreateError::NoCompositor)?;
 
         let mut req = CreateWindowRequest {
             width,
@@ -195,15 +266,31 @@ impl Window {
         let len = bytes.len().min(30);
         req.title[..len].copy_from_slice(&bytes[..len]);
         req.title_len = len as u8;
-        conn.send(MSG_CREATE_WINDOW, &req).expect("compositor not responding");
+        conn.send(MSG_CREATE_WINDOW, &req).map_err(|_| CreateError::NoCompositor)?;
 
-        let (msg_type, info): (u32, WindowInfo) = conn.recv().expect("compositor not responding");
-        assert_eq!(msg_type, MSG_WINDOW_CREATED, "unexpected response from compositor");
+        // Header first, then the payload the message type calls for: the two
+        // answers carry different structs, and `recv_payload` asserts on a
+        // payload shorter than the type it was asked for.
+        let header = conn.recv_header().map_err(|_| CreateError::NoCompositor)?;
+        match header.msg_type {
+            MSG_WINDOW_CREATED => {}
+            MSG_WINDOW_REFUSED => {
+                let refused: WindowRefused = conn
+                    .recv_payload(&header)
+                    .map_err(|_| CreateError::NoCompositor)?;
+                return Err(CreateError::from_wire(refused.reason));
+            }
+            other => return Err(CreateError::Protocol(other)),
+        }
+        let info: WindowInfo = conn
+            .recv_payload(&header)
+            .map_err(|_| CreateError::NoCompositor)?;
+
         let buf_size = info.stride as usize * info.height as usize * 4;
         let shm = SharedMemory::map(info.token, buf_size);
 
         let poller = Poller::new(1);
-        Self { conn, poller, shm, width: info.width, height: info.height, pixel_format: info.pixel_format }
+        Ok(Self { conn, poller, shm, width: info.width, height: info.height, pixel_format: info.pixel_format })
     }
 
     pub fn recv_event(&mut self) -> Event {

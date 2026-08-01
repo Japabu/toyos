@@ -396,7 +396,18 @@ fn run_picker(mode: PickerMode, start_dir: &str, client: &Connection) {
         "Open File"
     };
 
-    let mut window = Window::create_topmost(500, 400, title);
+    // A refusal ends this session, not the daemon: the next request may well
+    // arrive after whatever was holding the compositor's windows has exited.
+    // The client is answered as if the user cancelled, because from its side
+    // that is exactly what happened — no file was picked.
+    let mut window = match Window::create_topmost(500, 400, title) {
+        Ok(window) => window,
+        Err(e) => {
+            eprintln!("filepicker: {e}");
+            let _ = client.send_bytes(MSG_FILEPICKER_RESULT, &[]);
+            return;
+        }
+    };
     let mut fb = window.framebuffer();
 
     let font_data = fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font").expect("Failed to load font");

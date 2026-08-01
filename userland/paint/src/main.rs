@@ -159,7 +159,10 @@ struct PaintApp {
 
 impl PaintApp {
     fn new() -> Self {
-        let window = Window::create_with_title(0, 0, "Paint");
+        let window = Window::create_with_title(0, 0, "Paint").unwrap_or_else(|e| {
+            eprintln!("paint: {e}");
+            std::process::exit(1);
+        });
         window.set_cursor(window::CURSOR_CROSSHAIR);
         let fb = window.framebuffer();
         let canvas_w = fb.width().saturating_sub(PALETTE_WIDTH);

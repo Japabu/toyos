@@ -88,7 +88,7 @@ pr = "none — blocked on publishing"
 [winit]
 upstream = "rust-windowing/winit"
 base = "c4afadbf"
-delta = "+1234"
+delta = "+1235"
 tier = "sibling"
 why = "Adds the winit-toyos sibling crate — the model case for this tier."
 pr = "none — winit-toyos must be published before upstream can depend on it by version"

@@ -18,7 +18,10 @@ fn main() {
         .spawn()
         .expect("failed to spawn shell");
 
-    let mut window = Window::create_with_title(0, 0, "Terminal");
+    let mut window = Window::create_with_title(0, 0, "Terminal").unwrap_or_else(|e| {
+        eprintln!("terminal: {e}");
+        std::process::exit(1);
+    });
     let fb = window.framebuffer();
     let font_data = std::fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);

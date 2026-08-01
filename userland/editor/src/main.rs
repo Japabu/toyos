@@ -1435,7 +1435,10 @@ fn main() {
         None => "editor".to_string(),
     };
 
-    let mut window = Window::create_with_title(0, 0, &title);
+    let mut window = Window::create_with_title(0, 0, &title).unwrap_or_else(|e| {
+        eprintln!("editor: {e}");
+        std::process::exit(1);
+    });
     let mut fb = window.framebuffer();
 
     let font_data = fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font")

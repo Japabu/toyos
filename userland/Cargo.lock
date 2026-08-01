@@ -877,7 +877,7 @@ dependencies = [
 [[package]]
 name = "dpi"
 version = "0.1.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 
 [[package]]
 name = "ecdsa"
@@ -1036,7 +1036,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2895,7 +2895,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3888,7 +3888,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4161,7 +4161,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "bitflags 2.11.0",
  "cfg_aliases",
@@ -4186,7 +4186,7 @@ dependencies = [
 [[package]]
 name = "winit-android"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "android-activity",
  "bitflags 2.11.0",
@@ -4201,7 +4201,7 @@ dependencies = [
 [[package]]
 name = "winit-appkit"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "bitflags 2.11.0",
  "block2",
@@ -4223,7 +4223,7 @@ dependencies = [
 [[package]]
 name = "winit-common"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "block2",
  "objc2",
@@ -4238,7 +4238,7 @@ dependencies = [
 [[package]]
 name = "winit-core"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "bitflags 2.11.0",
  "cursor-icon",
@@ -4252,7 +4252,7 @@ dependencies = [
 [[package]]
 name = "winit-orbital"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "bitflags 2.11.0",
  "dpi",
@@ -4268,7 +4268,7 @@ dependencies = [
 [[package]]
 name = "winit-toyos"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "bitflags 2.11.0",
  "dpi",
@@ -4282,7 +4282,7 @@ dependencies = [
 [[package]]
 name = "winit-uikit"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "bitflags 2.11.0",
  "block2",
@@ -4302,7 +4302,7 @@ dependencies = [
 [[package]]
 name = "winit-web"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "atomic-waker",
  "bitflags 2.11.0",
@@ -4324,7 +4324,7 @@ dependencies = [
 [[package]]
 name = "winit-win32"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#1315f598288622507db296331579a36f39b668a9"
+source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
 dependencies = [
  "bitflags 2.11.0",
  "cursor-icon",
