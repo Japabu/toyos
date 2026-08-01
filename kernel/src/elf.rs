@@ -78,13 +78,45 @@ pub struct CachedRelocs {
 }
 
 /// Scan rela/jmprel tables and extract non-RELATIVE entries.
-fn prescan_relocs(rela: &Option<KernelSlice>, jmprel: &Option<KernelSlice>) -> CachedRelocs {
+///
+/// `None` when the scan would not fit one kernel allocation. Unlike the exe's
+/// tables these are `KernelSlice`s over the loaded image, bounded by the
+/// image's own size rather than by `MAX_HEAP_ALLOC`, so a large enough `.so`
+/// reaches the heap's assert through here. Refusing costs only the cache:
+/// `cache_loaded_lib` already has a path for "could not cache" and every
+/// consumer of `cached_relocs` falls back to scanning the tables directly.
+fn prescan_relocs(rela: &Option<KernelSlice>, jmprel: &Option<KernelSlice>) -> Option<CachedRelocs> {
+    // Counted by type, not by table size. The whole point of the prescan is
+    // that a library is ~99.5% RELATIVE and none of those are kept, so
+    // bounding by the total would refuse to cache `libtls_cranelift.so` —
+    // 211K entries, of which about a thousand are stored — and silently put
+    // the largest library in the tree back on the scan-every-clone path.
+    let mut counts = [0usize; 5];
+    for table in [rela, jmprel] {
+        let Some(table) = table else { continue };
+        for i in 0..table.size() / RELA_SIZE as usize {
+            let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
+            match rela_type(&rela) {
+                6 | 7 => counts[0] += 1,
+                R_X86_64_TPOFF64 => counts[1] += 1,
+                R_X86_64_TPOFF32 => counts[2] += 1,
+                R_X86_64_DTPMOD64 => counts[3] += 1,
+                R_X86_64_DTPOFF64 => counts[4] += 1,
+                _ => {}
+            }
+        }
+    }
+    let widest = core::mem::size_of::<(u64, u32, i64)>();
+    if counts.iter().any(|n| n.checked_mul(widest).is_none_or(|b| b > MAX_HEAP_ALLOC)) {
+        log!("dlopen: prescan {:?} will not fit one allocation, not caching", counts);
+        return None;
+    }
     let mut relocs = CachedRelocs {
-        bind: alloc::vec::Vec::new(),
-        tpoff64: alloc::vec::Vec::new(),
-        tpoff32: alloc::vec::Vec::new(),
-        dtpmod64: alloc::vec::Vec::new(),
-        dtpoff64: alloc::vec::Vec::new(),
+        bind: alloc::vec::Vec::with_capacity(counts[0]),
+        tpoff64: alloc::vec::Vec::with_capacity(counts[1]),
+        tpoff32: alloc::vec::Vec::with_capacity(counts[2]),
+        dtpmod64: alloc::vec::Vec::with_capacity(counts[3]),
+        dtpoff64: alloc::vec::Vec::with_capacity(counts[4]),
     };
     for table in [rela, jmprel] {
         let Some(table) = table else { continue };
@@ -101,7 +133,7 @@ fn prescan_relocs(rela: &Option<KernelSlice>, jmprel: &Option<KernelSlice>) -> C
             }
         }
     }
-    relocs
+    Some(relocs)
 }
 
 // ── Shared library cache ─────────────────────────────────────────────────
@@ -147,7 +179,12 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_offset: usize, rw_size: usize
     };
     let alloc_ptr = alloc.ptr();
 
-    let relocs = prescan_relocs(&lib.rela, &lib.jmprel);
+    // Refusing to prescan means refusing to cache: the cached image is what
+    // `cached_relocs` describes, so a lib without one must keep taking the
+    // scan-every-table path.
+    let Some(relocs) = prescan_relocs(&lib.rela, &lib.jmprel) else {
+        return LoadedLib { memory: LibMemory::Owned(alloc), ..lib };
+    };
     log!("dlopen: cached {} with {} bind + {} tpoff64 + {} tpoff32 + {} dtpmod64 + {} dtpoff64 pre-scanned relocs",
         path, relocs.bind.len(), relocs.tpoff64.len(), relocs.tpoff32.len(),
         relocs.dtpmod64.len(), relocs.dtpoff64.len());
@@ -396,6 +433,11 @@ impl DynamicInfo {
 /// Parse DT_* entries from raw PT_DYNAMIC segment data.
 pub fn parse_dynamic(data: &[u8]) -> DynamicInfo {
     let mut info = DynamicInfo::empty();
+    // A dynamic table with no DT_NULL runs to the end of the buffer, and every
+    // entry in it can be a DT_NEEDED. Reserved exactly, that is `len / 16 * 8`
+    // — half the input, which was already bounded — instead of a doubling
+    // sequence whose last step is larger than the input.
+    info.needed_strtab_offsets.reserve_exact(data.len() / 16);
     let table = DynamicTable::new(AnyEndian::Little, elf::file::Class::ELF64, data);
     for entry in table.iter() {
         match entry.d_tag {
@@ -601,6 +643,29 @@ impl RelocationIndex {
         Self { entries_u64: Vec::new(), entries_i32: Vec::new() }
     }
 
+    /// Reserve exactly for `u64_count` u64 writes and `i32_count` i32 writes,
+    /// or `None` if either does not fit one kernel allocation.
+    ///
+    /// This is the one place in the loader that needs a ceiling check of its
+    /// own rather than inheriting one. `DT_RELASZ` and `DT_PLTRELSZ` are
+    /// bounded *separately* at `MAX_HEAP_ALLOC` and both feed this single
+    /// index, so two tables that are each acceptable sum to 174,420 entries —
+    /// 2.7 MiB in one Vec, which no bound on either input can catch.
+    pub fn with_capacity(u64_count: usize, i32_count: usize) -> Option<Self> {
+        let fits = |n: usize, width: usize| {
+            n.checked_mul(width).is_some_and(|bytes| bytes <= MAX_HEAP_ALLOC)
+        };
+        if !fits(u64_count, core::mem::size_of::<(u64, u64)>())
+            || !fits(i32_count, core::mem::size_of::<(u64, i32)>())
+        {
+            return None;
+        }
+        Some(Self {
+            entries_u64: Vec::with_capacity(u64_count),
+            entries_i32: Vec::with_capacity(i32_count),
+        })
+    }
+
     pub fn add_u64(&mut self, offset: u64, value: u64) {
         self.entries_u64.push((offset, value));
     }
@@ -675,12 +740,49 @@ pub struct ParsedRelaEntries {
 }
 
 /// Parse raw rela tables into categorized entries by relocation type.
-pub fn parse_rela_entries(rela_data: &[u8], jmprel_data: &[u8]) -> ParsedRelaEntries {
+pub fn parse_rela_entries(rela_data: &[u8], jmprel_data: &[u8]) -> Option<ParsedRelaEntries> {
+    // Count first, reserve exactly. `Vec` grows by doubling, which overshoots
+    // the heap's per-allocation ceiling on a table the ceiling *accepted*: the
+    // largest `DT_RELASZ` that gets past `read_elf_table` is 87,210 entries,
+    // whose 16-byte records are 1.3 MiB — but the doubling that reaches them
+    // asks for 2 MiB, and the page source asserts.
+    //
+    // Exact reservation is not on its own enough, and the first version of
+    // this thought it was. Each of the four accumulates from *both* tables,
+    // and `DT_RELASZ` and `DT_PLTRELSZ` are bounded separately — so "at most
+    // input_len / 24 * 16, smaller than an input that was already bounded" is
+    // true per table and false per Vec. Two acceptable tables of 87,210
+    // RELATIVE entries reserve 2.7 MiB in `relative` alone. Measured, by the
+    // test that was written before this: `dlmalloc asked for 2818048 bytes`.
+    //
+    // So the counts are checked before anything is reserved.
+    let mut counts = [0usize; 4];
+    for data in [rela_data, jmprel_data] {
+        for i in 0..data.len() / 24 {
+            let r_type = (u64::from_le_bytes(data[i * 24 + 8..i * 24 + 16].try_into().unwrap())
+                & 0xFFFF_FFFF) as u32;
+            match r_type {
+                R_X86_64_RELATIVE => counts[0] += 1,
+                6 | 7 => counts[1] += 1,
+                R_X86_64_TPOFF64 => counts[2] += 1,
+                R_X86_64_TPOFF32 => counts[3] += 1,
+                _ => {}
+            }
+        }
+    }
+    // `relative` holds the widest record of the four.
+    let widest = core::mem::size_of::<(u64, u32, i64)>();
+    if counts.iter().any(|n| {
+        n.checked_mul(widest).is_none_or(|bytes| bytes > MAX_HEAP_ALLOC)
+    }) {
+        log!("ELF: {:?} relocation entries will not fit one allocation", counts);
+        return None;
+    }
     let mut result = ParsedRelaEntries {
-        relative: Vec::new(),
-        glob_dat: Vec::new(),
-        tpoff64: Vec::new(),
-        tpoff32: Vec::new(),
+        relative: Vec::with_capacity(counts[0]),
+        glob_dat: Vec::with_capacity(counts[1]),
+        tpoff64: Vec::with_capacity(counts[2]),
+        tpoff32: Vec::with_capacity(counts[3]),
     };
     for data in [rela_data, jmprel_data] {
         let count = data.len() / 24;
@@ -700,7 +802,7 @@ pub fn parse_rela_entries(rela_data: &[u8], jmprel_data: &[u8]) -> ParsedRelaEnt
             }
         }
     }
-    result
+    Some(result)
 }
 
 /// Compute .dynsym entry count from a GNU hash table stored in a byte slice.

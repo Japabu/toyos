@@ -588,9 +588,23 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     } else {
         Vec::new()
     };
-    let parsed_relas = elf::parse_rela_entries(&rela_data, &jmprel_data);
+    let Some(parsed_relas) = elf::parse_rela_entries(&rela_data, &jmprel_data) else {
+        log!("spawn: {}: relocation tables do not fit one allocation", path);
+        return Err(SyscallError::ResourceExhausted);
+    };
 
-    let mut reloc_index = elf::RelocationIndex::new();
+    // Reserved from the counts rather than grown: `add_u64` is called for
+    // every RELATIVE and TPOFF64 entry and for each GLOB_DAT that resolves, so
+    // these are exact upper bounds and nothing here reallocates.
+    let u64_writes = parsed_relas.relative.len()
+        + parsed_relas.glob_dat.len()
+        + parsed_relas.tpoff64.len();
+    let Some(mut reloc_index) =
+        elf::RelocationIndex::with_capacity(u64_writes, parsed_relas.tpoff32.len())
+    else {
+        log!("spawn: {}: {} relocations do not fit one index", path, u64_writes);
+        return Err(SyscallError::ResourceExhausted);
+    };
     for &(r_offset, r_addend) in &parsed_relas.relative {
         reloc_index.add_u64(r_offset, (base as i64 + r_addend) as u64);
     }

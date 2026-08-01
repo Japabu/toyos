@@ -56,10 +56,13 @@ const DT_SYMTAB: i64 = 6;
 const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
 const DT_STRSZ: i64 = 10;
+const DT_JMPREL: i64 = 23;
+const DT_PLTRELSZ: i64 = 2;
 const DT_GNU_HASH: i64 = 0x6fff_fef5u32 as i32 as i64;
 
 const SHT_DYNSYM: u32 = 11;
 
+const R_X86_64_RELATIVE: u64 = 8;
 const R_X86_64_DTPMOD64: u64 = 16;
 
 const PH_OFF: usize = 64;
@@ -397,6 +400,49 @@ fn main() {
             .poke(0x2018, &1u32.to_le_bytes())
             .build(),
     );
+
+    // 12. Two relocation tables the ceiling *accepts*, whose derived index
+    //     does not fit. This is the gap in cases 8 and 9: they prove an input
+    //     over the ceiling is refused, and say nothing about an input under it
+    //     from which the kernel derives something over.
+    //
+    //     `DT_RELASZ` and `DT_PLTRELSZ` are bounded separately at
+    //     MAX_HEAP_ALLOC and both feed one `RelocationIndex`, so two tables of
+    //     87,210 entries each are 174,420 entries of 16 bytes = 2.7 MiB in a
+    //     single Vec. Under the old growth-by-doubling that overshot to 4 MiB
+    //     on the push.
+    //
+    //     This case is also the actuator for the allocator-lock defect
+    //     (known-issues §2): the >2 MiB assert fires inside
+    //     `KernelAllocator::alloc` *while it holds the dlmalloc lock*, so the
+    //     recovered CPU's next allocation spins on a lock the dead thread
+    //     still owns. Nothing else in the suite stages that, which is part of
+    //     why it has stayed open -- do not build a second one.
+    {
+        const N: usize = 87_210; // MAX_HEAP_ALLOC / 24, the most either table can declare
+        const SZ: usize = N * 24;
+        const RELA: usize = 0x4000;
+        const JMPREL: usize = RELA + SZ;
+        let total = JMPREL + SZ;
+        let mut bytes = Elf::new(total)
+            .ph(Phdr::load(0, 0, total as u64, total as u64, PF_R | PF_W))
+            .ph(Phdr { kind: PT_DYNAMIC, flags: PF_R, offset: 0x1000, vaddr: 0x1000, filesz: 0x200, memsz: 0x200, align: 8 })
+            .entry(0)
+            .dynamic(0x1000, &[
+                (DT_RELA, RELA as u64), (DT_RELASZ, SZ as u64),
+                (DT_JMPREL, JMPREL as u64), (DT_PLTRELSZ, SZ as u64),
+            ])
+            .build();
+        for i in 0..N * 2 {
+            let at = RELA + i * 24;
+            bytes[at..at + 8].copy_from_slice(&((i as u64) * 8).to_le_bytes());
+            bytes[at + 8..at + 16].copy_from_slice(&R_X86_64_RELATIVE.to_le_bytes());
+        }
+        refused(
+            "rela_index_past_heap",
+            spawn_path(&write_file_in(BIG_DIR, "rela_index_past_heap", &bytes)),
+        );
+    }
 
     // 11. A DTPMOD64 relocation naming a TLS symbol no loaded module defines.
     //     Its two resolvers panicked where every other unresolved-symbol path
