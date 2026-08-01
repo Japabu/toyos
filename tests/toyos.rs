@@ -85,6 +85,7 @@ const MACHINE_TESTS: &[&str] = &[
     "metal_sim_window_caps",
     "netd_connection_caps",
     "foreign_disk_untouched",
+    "boot_partition_identity",
     "double_fault_stack",
     "diskless_boot",
     "xhci_many_devices",
@@ -1586,6 +1587,8 @@ fn run_machine_test(
         // Body in `tests/common/storage.rs`, so the hunk in this shared file
         // stays one line.
         "foreign_disk_untouched" => storage::foreign_disk_untouched(test_config, c_bins, rust_bins),
+        // Body in `tests/common/gpt.rs`, same reason.
+        "boot_partition_identity" => common::gpt::boot_partition_identity(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {

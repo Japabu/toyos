@@ -239,6 +239,14 @@ pub struct BootOptions {
     /// and none of them can observe what it does with one it is not. This is
     /// how a test hands the guest somebody else's disk.
     pub nvme_image: Option<PathBuf>,
+    /// Boot this disk image instead of the one this call would build.
+    ///
+    /// The built image is written fresh every boot and its GPT gets a fresh
+    /// random partition GUID with it, so a test that has to know what is on
+    /// the boot disk *before* the machine starts cannot use it — and asserting
+    /// on the partition table firmware read is exactly that. Such a test
+    /// builds the image itself, reads it, and hands it over here.
+    pub boot_image: Option<PathBuf>,
 }
 
 /// The in-guest test runner's startup marker.
@@ -257,6 +265,7 @@ impl Default for BootOptions {
             mute: false,
             ready_marker: DEFAULT_READY,
             nvme_image: None,
+            boot_image: None,
         }
     }
 }
@@ -358,8 +367,14 @@ impl QemuInstance {
         let test_dir = env::temp_dir().join(format!("toyos-tests-{pid}"));
         fs::create_dir_all(&test_dir).ok();
 
-        let boot_image = test_dir.join("test-bootable.img");
-        fs::write(&boot_image, &disk).expect("Failed to write test boot image");
+        let boot_image = match &options.boot_image {
+            Some(path) => path.clone(),
+            None => {
+                let path = test_dir.join("test-bootable.img");
+                fs::write(&path, &disk).expect("Failed to write test boot image");
+                path
+            }
+        };
 
         // Named by size, so two profiles that disagree about the device do
         // not hand each other a filesystem formatted for the wrong one.
