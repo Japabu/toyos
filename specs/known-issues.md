@@ -2303,15 +2303,37 @@ hang or an unbounded allocation. A self-loop (`c → c`) is rejected because the
 comparison is free. A longer cycle under a file is not: the read returns that
 file's own earlier bytes again, within its declared size.
 
-Detecting it needs either a tortoise-and-hare, which doubles the FAT reads on
-every sequential access, or a full walk from the head at open time — and the
-second is incompatible with the position hint that makes sequential access
-O(1) rather than O(n²) in the first place. The cases where a cycle would do
-damage rather than confuse *are* detected: `free_chain` (a cluster freed
-twice, caught because freeing writes zero and a zero mid-chain is
-`CorruptChain`), `chain_len` and `chain_last` (a directory that never ends).
-`a_longer_cycle_is_bounded_rather_than_endless` pins the behaviour so a future
-change has to be deliberate.
+Detecting it on the read path needs either a tortoise-and-hare, which doubles
+the FAT reads on every sequential access, or a full walk from the head at open
+time — and the second is incompatible with the position hint that makes
+sequential access O(1) rather than O(n²) in the first place.
+
+**The write path does detect it, and this entry used to claim more than was
+true.** The original wording said the damaging cases were all covered by
+`free_chain`, `chain_len` and `chain_last`. `free_chain`'s cycle detection is
+"a revisited cluster reads as free" — it needs the walk to *revisit*, and
+`truncate_chain` writes an end-of-chain marker at the cluster it is keeping,
+which is an exit the walk takes instead. The audit
+(`specs/type-safety-audit/storage-stack.md` F3) demonstrated `set_len`
+returning `Ok(())` having freed every cluster the truncated file still needed,
+with the directory entry still naming the first of them. A residual that
+overstates what is detected is worse than one that admits the gap, because
+nobody re-checks it.
+
+What holds now: `truncate_chain` is preceded by `Fat32::verify_acyclic`, a
+tortoise-and-hare that runs **before** anything is written, so a cyclic chain
+leaves the volume untouched. It is the only cycle detection in the crate and
+it is affordable exactly where the read path's is not — truncation is one
+operation that already walks the whole chain, rather than one per page.
+`free_chain` also takes an anchor now, which guards the last retained cluster;
+that alone was not enough, because the audit's cycle closed above it.
+`chain_len` and `chain_last` do bound a directory that never ends, and that
+part of the original claim was correct.
+
+Two tests pin the split: `a_longer_cycle_is_bounded_rather_than_endless` (read
+path, bounded, no error) and
+`truncating_a_cyclic_chain_does_not_free_the_clusters_it_keeps` (write path,
+refused with nothing freed).
 
 ### `walk` cannot see an empty directory
 
@@ -2349,6 +2371,24 @@ when the kernel's page cache sits directly under `BlockAccess` — caching twice
 is a coherence hazard for no gain — and wrong for any adapter without one. The
 adapter is where that decision gets made.
 
+### A handle's fingerprint cannot survive a delete-and-recreate under the same name
+
+`File` identifies its directory entry by the 8.3 field plus the five creation
+stamp bytes, and `Fat32::live_entry` checks it on every `write`, `set_len` and
+`flush_meta`. That catches the slot being taken by a *different* file, which is
+the dangerous case and the one the audit demonstrated (F2: the guard compared
+first clusters, and 0 is every unwritten file's first cluster, so a slot
+refilled by another empty file matched and the stale handle rewrote the
+newcomer's entry — with `fsck_msdos` calling the volume clean).
+
+What it still cannot distinguish is a file deleted and recreated under the same
+name with the same creation timestamp, because FAT has nowhere to put a
+generation number. The stamp's resolution is 10 ms, so a caller that stamps
+from a real clock is safe and a caller that passes a constant — every test in
+this crate does — is not. The kernel adapter should hold handles for as long as
+its own file objects live and no longer, rather than relying on this to be a
+generation counter, which it is not.
+
 ### Two things `fsck_msdos` does not check, found by breaking the code on purpose
 
 Recorded because it generalises past this crate: **a host validator's silence
@@ -2373,3 +2413,14 @@ exits 0 while printing `Fix?` for problems it declined to repair, and exits 0
 on a volume it has just declared dirty.** `common::Image::fsck` matches the
 output line by line against the exact shape of a clean run instead. A gate
 written the obvious way would have been green on a corrupt volume.
+
+**The 2026-08-01 audit is the sequel to that paragraph and the sharper version
+of it.** Sixteen breakages of the *code* caught fourteen; an independent
+auditor attacking the *state space* instead — a file that is empty, a chain
+that is cyclic, an entry that is crafted — found six more, four of them on the
+write path and one that wrote 256 GiB outside the volume and returned `Ok(())`.
+Every one of them was reachable through the public API on a volume this suite
+already had. The lesson that generalises past FAT32: **mutating the
+implementation tests the paths you wrote; it says nothing about the states you
+did not think to construct.** Both are needed, and the second is the one a
+green suite hides.
