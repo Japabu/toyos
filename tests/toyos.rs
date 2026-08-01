@@ -28,6 +28,10 @@ const RUST_SKIP: &[&str] = &[
     // Needs SYS_DEBUG actions 5 and 6, which only the `test-heap-ceiling`
     // kernel has. `heap_ceiling_recovery` boots that kernel.
     "heap_ceiling",
+    // Fills /tmp to the VFS listing limit, so it needs a boot nothing else
+    // shares — every later `read_dir("/tmp")` in it would be refused.
+    // `readdir_bound` gives it one.
+    "readdir_bound",
     // Needs a live compositor, which `tests/testcases` does not boot.
     // `metal_sim_window_caps` runs it on the config that does.
     "window_caps",
@@ -85,6 +89,7 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_many_devices",
     "nvme_large_device",
     "nvme_wide_sector",
+    "readdir_bound",
     "i8042_keyboard",
     "i8042_no_spurious_wake",
     "i8042_mouse",
@@ -1829,6 +1834,40 @@ fn run_machine_test(
             serial::Serial::named("boot console", boot).must_be_clean()?;
             serial::Serial::named("test serial", result.serial.as_str()).must_be_clean()?;
             eprintln!("  [va] {}", result.stdout.trim());
+            Ok(())
+        }
+        "readdir_bound" => {
+            // Two defects, one workload, no kernel feature: `Vfs::list` had no
+            // cap and `SYS_READDIR` reported the bytes it managed to write, so
+            // a directory of 32,769 files panicked the kernel and one of 34,816
+            // came back as 4125 entries and a success.
+            //
+            // Its own boot because it fills `/tmp` to the listing limit and
+            // leaves it there — in the shared boot every later
+            // `read_dir("/tmp")` would be refused, which is a cascade rather
+            // than a failure.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions::default(),
+            );
+            serial::Serial::boot(&qemu).must_be_clean()?;
+
+            let result = qemu.run_test("test_rs_readdir_bound", Duration::from_secs(60));
+            if let Some(err) = &result.error {
+                return Err(format!("the guest stopped answering: {err}\nserial:\n{}", result.serial));
+            }
+            if !check_rust_result(&result) {
+                return Err(format!("readdir_bound failed:\n{}", result.stdout));
+            }
+            // The refusal must be an error return and nothing else. A panic
+            // inside `Vfs::list` is the defect this replaced, and the guest
+            // process exiting 0 does not rule one out on another CPU.
+            serial::Serial::named("test serial", result.serial.as_str()).must_be_clean()?;
+            for line in result.stdout.lines().filter(|l| l.contains("PASS")) {
+                eprintln!("  [readdir]{}", line.trim_start_matches("  PASS"));
+            }
             Ok(())
         }
         "heap_ceiling_recovery" => {
