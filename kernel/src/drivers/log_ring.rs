@@ -61,6 +61,13 @@ struct LogRing {
     /// serial's bookkeeping alone.
     tail: usize,
     len: usize,
+    /// The same pair for the file sink (`esp_log`). Two consumers, two
+    /// cursors, one buffer: serial and the boot volume are at different points
+    /// in the stream and neither may consume the other's bytes. Only advanced
+    /// while [`FILE_SINK`] is set, so a machine with no `/boot` pays nothing
+    /// for them and can never report bytes pending that nobody will collect.
+    file_tail: usize,
+    file_len: usize,
     /// Bytes behind `head` that have not been overwritten, so at most
     /// `RING_SIZE`. Independent of draining, which is what makes it the
     /// window the on-screen console reads.
@@ -69,25 +76,41 @@ struct LogRing {
 
 impl LogRing {
     const fn new() -> Self {
-        Self { buf: [0; RING_SIZE], head: 0, tail: 0, len: 0, retained: 0 }
+        Self { buf: [0; RING_SIZE], head: 0, tail: 0, len: 0, file_tail: 0, file_len: 0, retained: 0 }
     }
 
     fn append(&mut self, data: &[u8]) -> usize {
         let mut dropped = 0;
+        let mut file_dropped = 0u64;
+        let to_file = FILE_SINK.load(Ordering::Relaxed);
         for &b in data {
             if self.len == RING_SIZE {
                 self.tail = (self.tail + 1) % RING_SIZE;
                 self.len -= 1;
                 dropped += 1;
             }
+            if to_file && self.file_len == RING_SIZE {
+                self.file_tail = (self.file_tail + 1) % RING_SIZE;
+                self.file_len -= 1;
+                file_dropped += 1;
+            }
             self.buf[self.head] = b;
             self.head = (self.head + 1) % RING_SIZE;
             self.len += 1;
+            if to_file {
+                self.file_len += 1;
+            }
             if self.retained < RING_SIZE {
                 self.retained += 1;
             }
         }
         OWED.store(self.len, Ordering::Relaxed);
+        if to_file {
+            FILE_OWED.store(self.file_len, Ordering::Relaxed);
+        }
+        if file_dropped > 0 {
+            FILE_DROPPED.fetch_add(file_dropped, Ordering::Relaxed);
+        }
         dropped
     }
 
@@ -99,6 +122,17 @@ impl LogRing {
         }
         self.len -= n;
         OWED.store(self.len, Ordering::Relaxed);
+        n
+    }
+
+    fn drain_into_file(&mut self, out: &mut [u8]) -> usize {
+        let n = self.file_len.min(out.len());
+        for i in 0..n {
+            out[i] = self.buf[self.file_tail];
+            self.file_tail = (self.file_tail + 1) % RING_SIZE;
+        }
+        self.file_len -= n;
+        FILE_OWED.store(self.file_len, Ordering::Relaxed);
         n
     }
 }
@@ -121,6 +155,61 @@ static OWED: AtomicUsize = AtomicUsize::new(0);
 /// pre-halt check; see [`OWED`].
 pub fn has_pending() -> bool {
     OWED.load(Ordering::Relaxed) != 0
+}
+
+/// Whether `esp_log` is collecting from this ring at all.
+///
+/// False until a `/boot` exists and `esp_log::install` runs, and false again
+/// the moment that sink gives up — which is what keeps `file_has_pending`
+/// from reporting bytes owed to a consumer that no longer exists, and the idle
+/// loop from declining to sleep on them forever.
+static FILE_SINK: AtomicBool = AtomicBool::new(false);
+static FILE_OWED: AtomicUsize = AtomicUsize::new(0);
+static FILE_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Does the file sink still owe the boot volume bytes? Same shape and same
+/// reason as [`has_pending`]: read from the pre-halt check with interrupts off.
+pub fn file_has_pending() -> bool {
+    FILE_OWED.load(Ordering::Relaxed) != 0
+}
+
+/// Start collecting for the file sink, from the oldest byte still readable.
+///
+/// Seeded from `retained` rather than from `head`, so the file opens with this
+/// boot's log from its first line rather than from the moment `/boot` mounted
+/// — which is four phases in, and exactly the part a machine that dies early
+/// needs.
+pub fn enable_file_sink() {
+    let mut g = RingGuard::lock();
+    let ring = g.ring();
+    ring.file_len = ring.retained;
+    ring.file_tail = (ring.head + RING_SIZE - ring.retained) % RING_SIZE;
+    FILE_OWED.store(ring.file_len, Ordering::Relaxed);
+    FILE_SINK.store(true, Ordering::Relaxed);
+}
+
+/// Stop collecting, and forget what was owed.
+pub fn disable_file_sink() {
+    FILE_SINK.store(false, Ordering::Relaxed);
+    let mut g = RingGuard::lock();
+    g.ring().file_len = 0;
+    FILE_OWED.store(0, Ordering::Relaxed);
+}
+
+/// Move up to `out.len()` of the bytes the file sink is owed. Thread context
+/// only: the caller writes them to a disk.
+pub fn drain_to_file(out: &mut [u8]) -> usize {
+    let mut g = RingGuard::lock();
+    g.ring().drain_into_file(out)
+}
+
+/// Bytes the file sink lost to ring overflow since the last call.
+///
+/// Reported rather than silent, for the reason `take_drop_marker` exists: a
+/// log with a hole in it and nothing saying so is worse than one that says
+/// where the hole is.
+pub fn take_file_drops() -> u64 {
+    FILE_DROPPED.swap(0, Ordering::Relaxed)
 }
 
 /// CLI-aware spinlock for ring access. `log!()` can be called from IRQ

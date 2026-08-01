@@ -30,6 +30,22 @@ pub fn lock() -> VfsGuard {
     VfsGuard(VFS.lock())
 }
 
+/// The VFS, or `None` if another CPU has it.
+///
+/// For a caller that must not wait on a filesystem — the idle loop, which is
+/// about to run a scheduler pass — and for the one case where waiting would
+/// not merely be slow: a thread that panicked while holding this lock never
+/// releases it, and `Lock::lock` turns that into a second panic after 500M
+/// spins. Known issues records that hazard; this is how a caller declines to
+/// inherit it.
+pub fn try_lock() -> Option<VfsGuard> {
+    let guard = VFS.try_lock()?;
+    if guard.is_none() {
+        return None;
+    }
+    Some(VfsGuard(guard))
+}
+
 /// Trait abstracting filesystem operations so the VFS can hold
 /// heterogeneous mount points (initrd on SliceDisk, nvme on NvmeDisk).
 pub trait FileSystem: Send {
@@ -553,6 +569,18 @@ impl Vfs {
 
     pub fn delete(&mut self, path: &str) -> bool {
         self.delete_file(path)
+    }
+
+    /// Make one mount's writes durable.
+    ///
+    /// [`Vfs::sync_all`] is the wrong tool for a caller that knows which
+    /// filesystem it wrote to: on a machine with a `/home` on NVMe it is a
+    /// btree write-back and a device flush for a byte that went to the boot
+    /// stick.
+    pub fn sync_mount(&mut self, name: &str) {
+        if let Some(fs) = self.mounts.get_mut(name) {
+            fs.sync();
+        }
     }
 
     pub fn sync_all(&mut self) {
