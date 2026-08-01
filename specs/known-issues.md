@@ -2996,3 +2996,21 @@ the boot stick, which is new code running in exactly that state and reaching a
 block device through a filesystem. That is a lead, not a diagnosis — nobody has
 symbolized `rip` against the boot's `Kernel memory located at` line yet, and
 that is the first thing to do.
+
+**Measured since, and one contributing cause closed at `5bb1193`.** The
+per-CPU idle stack is 16 KiB of ordinary heap with **no guard page**, so an
+overflow there does not fault — it rewrites whatever the allocator put
+underneath, and a `BTreeMap` node with an out-of-range index (seen: `slice::
+get_unchecked` in `CpuSched::drain`) or a write to `0x4` is what that looks
+like from the scheduler's parked map. Instrumented at the block layer, with the
+USB command path still below the probe, the sink's path used **11,505 bytes of
+the 16,384**. Three 4 KiB page buffers accounted for most of it —
+`Vfs::flush_file`'s, and `file_cache`'s two miss buffers, which were
+`[0u8; PAGE_SIZE]` handed to `Box::new`. Moving all three to the heap took the
+high water to **6,209**.
+
+What that does *not* establish: that the overflow happened. 11,505 plus the
+xHCI/MSC chain is close to 16,384 but nothing was caught crossing it, and the
+A/B is only three runs each way — three clean with `esp_log::poll` removed from
+the idle loop, three not clean with it. If it recurs at `5bb1193` or later, the
+stack is no longer the first suspect and the `rip` symbolization is.
