@@ -2969,3 +2969,30 @@ is *right*, only whether it is being respected, and two copies of a rule that
 can disagree is worse than one. What it does enforce is that no I/O leaves the
 extent it was given — and, tighter, that none leaves the FAT volume inside it,
 since `Fat32::probe` reads the sector count before anything can write.
+
+### OPEN, unassigned — `cache_eviction` wedges or faults on an *idle* CPU after the test has exited
+
+Seen three times in one session on `main` at `b0e69c5`. The in-guest test
+always succeeds: `cache eviction ok: 1168 page reads verified`, exit code 0, at
+3.6-5.0 s. What fails is what happens afterwards.
+
+- Full-suite run: `KERNEL PANIC: read unmapped address at 0x58` at 3.615 s on
+  cpu1, `#PF SKIP: cr2=0x58 rip=0xffff80007d48f396 err=0x0 (no tid, not user)`,
+  12 ms after `exit: test_rs_cache_eviction pid=2 code=0`.
+- Two of three isolated re-runs: the harness times out after 180 s, with
+  `!!! DOUBLE PANIC !!!` on cpu1 `tid=0` at 66.1 s — 61 s after the exit.
+- One of three: clean pass.
+
+**Not the page cache's fallible-read change**, which landed just before it.
+Every error path that change added logs a line, and `grep` over the failing
+run's serial finds zero of `could not be cached`, `serving zeros`,
+`write-back .* failed`, `no slot could be freed`. The cache did the 1168 reads
+and reported them correct.
+
+The shape points at the idle path rather than at the workload: no current
+thread, after the process is gone, on the CPU that is not running the test.
+`4a1f898` and `a10c459` put a log sink on the idle loop that writes a file to
+the boot stick, which is new code running in exactly that state and reaching a
+block device through a filesystem. That is a lead, not a diagnosis — nobody has
+symbolized `rip` against the boot's `Kernel memory located at` line yet, and
+that is the first thing to do.
