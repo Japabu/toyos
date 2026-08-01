@@ -5,6 +5,8 @@ use alloc::vec::Vec;
 
 use crate::file_backing::FileBacking;
 use crate::file_cache::{self, FileId};
+use toyos_abi::syscall::SyscallError;
+
 use crate::vfs::FileSystem;
 
 /// Reads a tmpfs file for the ELF loader, which demand-pages every executable
@@ -51,10 +53,16 @@ impl TmpFs {
 }
 
 impl FileSystem for TmpFs {
-    fn list(&mut self) -> Vec<(String, u64)> {
-        self.files.iter().map(|(name, (file_id, _))| {
+    /// The one implementation that can honour the limit before it allocates,
+    /// and the one that needs to: nothing caps how many files a process may
+    /// create here.
+    fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError> {
+        if self.files.len() > limit {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        Ok(self.files.iter().map(|(name, (file_id, _))| {
             (name.clone(), file_cache::size(*file_id))
-        }).collect()
+        }).collect())
     }
 
     fn file_size(&mut self, name: &str) -> Option<u64> {

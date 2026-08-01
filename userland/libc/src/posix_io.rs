@@ -326,12 +326,28 @@ const DT_REG: u8 = 8;
 #[no_mangle]
 pub unsafe extern "C" fn opendir(path: *const u8) -> *mut DIR {
     let path_bytes = c_str_to_bytes(path);
-    let buf_size = 65536;
-    let buf = super::memory::malloc(buf_size);
+    let mut buf_size = 65536;
+    let mut buf = super::memory::malloc(buf_size);
     if buf.is_null() { return ptr::null_mut(); }
 
-    let slice = core::slice::from_raw_parts_mut(buf, buf_size);
-    let n = syscall::readdir(path_bytes, slice);
+    // `readdir` returns the size the listing *needs* and writes nothing when
+    // it does not fit, so taking the return as a length without checking it
+    // would hand `DIR` a `len` past the end of its own buffer. One retry at
+    // the reported size; the kernel bounds the listing, so it cannot run away.
+    let mut n = match syscall::readdir(path_bytes, core::slice::from_raw_parts_mut(buf, buf_size)) {
+        Ok(n) => n,
+        Err(_) => { super::memory::free(buf); return ptr::null_mut(); }
+    };
+    if n > buf_size {
+        super::memory::free(buf);
+        buf_size = n;
+        buf = super::memory::malloc(buf_size);
+        if buf.is_null() { return ptr::null_mut(); }
+        n = match syscall::readdir(path_bytes, core::slice::from_raw_parts_mut(buf, buf_size)) {
+            Ok(n) if n <= buf_size => n,
+            _ => { super::memory::free(buf); return ptr::null_mut(); }
+        };
+    }
 
     let dir = super::memory::malloc(core::mem::size_of::<DIR>()) as *mut DIR;
     if dir.is_null() {

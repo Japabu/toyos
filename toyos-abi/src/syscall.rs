@@ -467,10 +467,21 @@ pub fn fsync(fd: Fd) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_FSYNC, fd.0 as u64, 0, 0, 0))
 }
 
-/// Read directory entries. Returns bytes written to `buf`.
-pub fn readdir(path: &[u8], buf: &mut [u8]) -> usize {
+/// Read directory entries. Returns the number of bytes the listing *needs*.
+///
+/// `Ok(n)` with `n <= buf.len()` means the entries are in `buf`; `n >
+/// buf.len()` means nothing was written and `n` is the size to retry with.
+/// The kernel never writes a partial listing — see `sys_readdir`.
+///
+/// The error is returned rather than folded into `0`, which is what this did
+/// before: "the directory is too large to list" and "the directory is empty"
+/// are different answers and a caller has to be able to tell them apart.
+pub fn readdir(path: &[u8], buf: &mut [u8]) -> Result<usize, SyscallError> {
     let n = syscall(SYS_READDIR, path.as_ptr() as u64, path.len() as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
-    if SyscallError::from_u64(n).is_some() { 0 } else { n as usize }
+    match SyscallError::from_u64(n) {
+        Some(e) => Err(e),
+        None => Ok(n as usize),
+    }
 }
 
 /// Delete a file or directory.

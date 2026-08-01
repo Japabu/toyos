@@ -7,6 +7,8 @@ use bcachefs::{BlockIO, BlockBuf, BlockNum, Mounted, ReadWrite, ReadOnly, Format
 use crate::file_backing::{FileBacking, NvmeBacking, InitrdBacking};
 use crate::file_cache::{self, FileId};
 use crate::page_cache;
+use toyos_abi::syscall::SyscallError;
+
 use crate::vfs::FileSystem;
 
 /// BlockIO implementation that wraps the kernel's global PageCache.
@@ -59,8 +61,17 @@ impl BcacheFsAdapter {
 }
 
 impl FileSystem for BcacheFsAdapter {
-    fn list(&mut self) -> Vec<(String, u64)> {
-        self.fs.list().unwrap_or_default()
+    /// The limit is checked on the result rather than before the work.
+    /// `bcachefs::Mounted::list` exposes no count and `btree::collect_all`
+    /// under it materialises the whole entry set first, so this makes the
+    /// refusal uniform without making the allocation bounded — that half is
+    /// the `bcachefs` crate's, and is filed.
+    fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError> {
+        let names = self.fs.list().unwrap_or_default();
+        if names.len() > limit {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        Ok(names)
     }
 
     fn file_size(&mut self, name: &str) -> Option<u64> {
@@ -216,8 +227,17 @@ impl ReadOnlyBcacheFsAdapter {
 }
 
 impl FileSystem for ReadOnlyBcacheFsAdapter {
-    fn list(&mut self) -> Vec<(String, u64)> {
-        self.fs.list().unwrap_or_default()
+    /// The limit is checked on the result rather than before the work.
+    /// `bcachefs::Mounted::list` exposes no count and `btree::collect_all`
+    /// under it materialises the whole entry set first, so this makes the
+    /// refusal uniform without making the allocation bounded — that half is
+    /// the `bcachefs` crate's, and is filed.
+    fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError> {
+        let names = self.fs.list().unwrap_or_default();
+        if names.len() > limit {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        Ok(names)
     }
 
     fn file_size(&mut self, name: &str) -> Option<u64> {

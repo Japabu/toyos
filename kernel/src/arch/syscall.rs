@@ -721,21 +721,38 @@ fn sys_random(buf: &mut [u8]) -> u64 {
     0
 }
 
+/// Encode a directory listing into `buf`; return the length it *needs*.
+///
+/// Same contract as `sys_getcwd`, for the same reason and after the same
+/// defect: this used to fill the buffer, stop, and report the bytes it had
+/// written, which is indistinguishable from a complete listing. Measured
+/// before the change: `std::fs::read_dir` reported **4125** entries of
+/// **34,816**, as success. A caller enumerating a directory to delete it, or
+/// to check a name is absent, acts on that.
+///
+/// So the listing is written only when all of it fits, and the return is the
+/// size either way: `n <= buf.len()` means the entries are in the buffer,
+/// `n > buf.len()` means nothing was written and `n` is what to allocate.
+/// Refusing to write a partial answer is the point — a caller that ignores
+/// the return still gets zeroes rather than a plausible short listing.
 fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let entries = match vfs::lock().list(&cwd, path) {
         Ok(e) => e,
-        Err(_) => return SyscallError::NotFound.to_u64(),
+        Err(e) => return e.to_u64(),
     };
+
+    // A directory name is stored with its trailing slash and encoded without.
+    let encoded = |name: &alloc::string::String| 1 + name.trim_end_matches('/').len() + 1 + 8;
+    let needed: usize = entries.iter().map(|(name, _)| encoded(name)).sum();
+    if needed > buf.len() {
+        return needed as u64;
+    }
 
     let mut pos = 0;
     for (name, size) in &entries {
         let is_dir = name.ends_with('/');
         let clean_name = if is_dir { &name[..name.len() - 1] } else { name.as_str() };
-        let needed = 1 + clean_name.len() + 1 + 8;
-        if pos + needed > buf.len() {
-            break;
-        }
         buf[pos] = if is_dir { 2 } else { 1 };
         pos += 1;
         buf[pos..pos + clean_name.len()].copy_from_slice(clean_name.as_bytes());
@@ -745,6 +762,7 @@ fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
         buf[pos..pos + 8].copy_from_slice(&size.to_le_bytes());
         pos += 8;
     }
+    debug_assert_eq!(pos, needed);
     pos as u64
 }
 

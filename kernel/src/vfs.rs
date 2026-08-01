@@ -33,7 +33,22 @@ pub fn lock() -> VfsGuard {
 /// Trait abstracting filesystem operations so the VFS can hold
 /// heterogeneous mount points (initrd on SliceDisk, nvme on NvmeDisk).
 pub trait FileSystem: Send {
-    fn list(&mut self) -> Vec<(String, u64)>;
+    /// Every name in this mount, or `ResourceExhausted` if there are more than
+    /// `limit` of them.
+    ///
+    /// The limit is on the mount and not on the directory being listed, because
+    /// that is what this call materialises: there is no per-directory index
+    /// anywhere in the VFS, so every `readdir` builds the whole mount's listing
+    /// and filters it. `limit` is [`MAX_LIST_ENTRIES`] at the only call sites.
+    ///
+    /// **An implementation must refuse before it allocates**, which is the only
+    /// reason this takes a limit rather than the caller checking the length it
+    /// gets back. `TmpFs` does; the two bcachefs adapters cannot, because
+    /// `bcachefs::Mounted::list` has no count primitive and `btree::collect_all`
+    /// under it builds the whole entry set first. Their check is on the result,
+    /// so it makes the refusal uniform without making the allocation bounded —
+    /// see known issues.
+    fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError>;
     fn file_size(&mut self, name: &str) -> Option<u64>;
     fn file_mtime(&mut self, name: &str) -> u64;
     fn read_link(&mut self, name: &str) -> Option<String>;
@@ -88,8 +103,8 @@ pub struct Vfs {
 /// yields one component per two input bytes, so the vector holds up to
 /// `ceil(L/2)` of them. `Vec` grows by doubling, so the buffer is
 /// `next_pow2(ceil(L/2)) * 16` — and that single allocation must stay under
-/// `mm::MAX_HEAP_ALLOC` (2_093_056), above which the kernel heap's page source
-/// asserts *inside the allocator lock*.
+/// `mm::MAX_HEAP_ALLOC` (2_093_056), above which `KernelAllocator::alloc`
+/// asserts.
 ///
 /// At 4096: `L = 69_633`, `ceil(L/2) = 34_817`, `next_pow2 = 65_536`, so the
 /// vector is 1 MiB — a factor of two under the ceiling. The joined `String` is
@@ -101,6 +116,40 @@ pub struct Vfs {
 /// `MAX_PATH = 65_535` would put `ceil(L/2)` at 65_537, one element past the
 /// doubling step that lands on 2 MiB.
 pub const MAX_PATH: usize = 4096;
+
+/// The most entries one `FileSystem::list` may materialise.
+///
+/// The listing is a *derived* collection and `MAX_PATH` does not constrain it:
+/// every name in it is individually short, and it is the count that grows. A
+/// `read_dir` over 32,769 files in one tmpfs directory panicked the kernel —
+/// measured, 1.8 s, from `fs::write` in a loop — which is the same shape as the
+/// `cwd` accumulation `MAX_PATH` closed, one collection further out.
+///
+/// Derived, not picked. Three allocations scale with the entry count `N`, and
+/// each must stay under `mm::MAX_HEAP_ALLOC` (2_093_056):
+///
+/// - the `Vec<(String, u64)>` `FileSystem::list` returns: `N * 32`, and the
+///   32 is const-asserted below rather than believed.
+/// - `Vfs::list`'s own `result`, same element: reserved *exactly* from a
+///   counting pass, so it is `<= N * 32` with no growth-by-doubling overshoot.
+///   That overshoot is what actually fired — `RawVec::grow_one` asking for the
+///   *doubled* capacity, at half the entry count the element size suggests.
+/// - `seen_dirs`, a `hashbrown::HashSet<String>` holding one entry per distinct
+///   subdirectory name — worst case `N`, when every entry is `d<i>/f`.
+///   hashbrown rounds to a power-of-two bucket count above `N * 8/7` and pays
+///   24 bytes plus one control byte per bucket.
+///
+/// At 16_384 those are 524_288, at most 524_288, and `32_768 * 25 = 819_216`:
+/// the worst is a factor of 2.5 under the ceiling, which is margin for a
+/// hashbrown whose per-bucket cost changes rather than a number that has to be
+/// re-derived when it does. Both worst cases are exercised at exactly this
+/// count by `readdir_bound`, so the derivation is checked and not just written
+/// down.
+///
+/// This bounds the *mount*, not the directory — see `FileSystem::list`.
+pub const MAX_LIST_ENTRIES: usize = 16_384;
+
+const _: () = assert!(core::mem::size_of::<(String, u64)>() == 32);
 
 fn normalize(path: &str) -> String {
     // `parts` is the allocation MAX_PATH is derived against — see its comment.
@@ -223,7 +272,10 @@ impl Vfs {
 
         if let Some((fs, fs_path)) = self.resolve_fs(&mount, &subdir) {
             let prefix = format!("{}/", fs_path);
-            if fs.list().iter().any(|(name, _)| name.starts_with(&prefix) || *name == fs_path) {
+            // A mount too large to list is not a mount you can `cd` into
+            // either — the answer would need the same allocation.
+            let Ok(names) = fs.list(MAX_LIST_ENTRIES) else { return None };
+            if names.iter().any(|(name, _)| name.starts_with(&prefix) || *name == fs_path) {
                 return Some(abs);
             }
         }
@@ -231,7 +283,14 @@ impl Vfs {
         None
     }
 
-    pub fn list(&mut self, cwd: &str, path: &str) -> Result<Vec<(String, u64)>, &'static str> {
+    /// Every entry of one directory.
+    ///
+    /// Refuses above [`MAX_LIST_ENTRIES`] rather than truncating: a listing
+    /// short of the truth is worse than no listing, because a caller
+    /// enumerating a directory to delete it, or to check a name is absent,
+    /// gets a confident wrong answer. The refusal reaches userland as
+    /// `ResourceExhausted`.
+    pub fn list(&mut self, cwd: &str, path: &str) -> Result<Vec<(String, u64)>, SyscallError> {
         let (mount, subdir) = if path.is_empty() {
             self.resolve_path(cwd, "")
         } else {
@@ -250,7 +309,7 @@ impl Vfs {
             }
 
             if let Some(root) = self.root.as_deref_mut() {
-                for (name, _size) in root.list() {
+                for (name, _size) in root.list(MAX_LIST_ENTRIES)? {
                     if let Some(slash_pos) = name.find('/') {
                         let dir_name = format!("{}/", &name[..slash_pos]);
                         if seen_dirs.insert(dir_name.clone()) {
@@ -264,8 +323,8 @@ impl Vfs {
         }
 
         let (fs, fs_path) = self.resolve_fs(&mount, &subdir)
-            .ok_or("no such directory")?;
-        let all_files = fs.list();
+            .ok_or(SyscallError::NotFound)?;
+        let all_files = fs.list(MAX_LIST_ENTRIES)?;
 
         let prefix = if fs_path.is_empty() {
             String::new()
@@ -273,17 +332,21 @@ impl Vfs {
             format!("{}/", fs_path)
         };
 
-        let mut result = Vec::new();
+        fn under_prefix<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+            if prefix.is_empty() { Some(name) } else { name.strip_prefix(prefix) }
+        }
+
+        // Counted first, then reserved exactly — the `elf.rs` shape. Growth by
+        // doubling asks for the capacity it is moving *to*, so a `Vec` that
+        // ends up holding N entries transiently requests up to `2N`, and it
+        // was that overshoot rather than the final size that crossed the heap
+        // ceiling. Dedup only removes entries, so this is an upper bound.
+        let matching = all_files.iter().filter(|(n, _)| under_prefix(n, &prefix).is_some()).count();
+        let mut result = Vec::with_capacity(matching);
         let mut seen_dirs = hashbrown::HashSet::new();
 
         for (name, size) in &all_files {
-            let rest = if prefix.is_empty() {
-                name.as_str()
-            } else if let Some(r) = name.strip_prefix(prefix.as_str()) {
-                r
-            } else {
-                continue;
-            };
+            let Some(rest) = under_prefix(name, &prefix) else { continue };
 
             if let Some(slash_pos) = rest.find('/') {
                 let dir_name = format!("{}/", &rest[..slash_pos]);
@@ -296,7 +359,7 @@ impl Vfs {
         }
 
         if !prefix.is_empty() && result.is_empty() {
-            Err("no such directory")
+            Err(SyscallError::NotFound)
         } else {
             Ok(result)
         }
