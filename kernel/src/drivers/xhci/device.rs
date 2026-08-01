@@ -16,35 +16,102 @@ use super::msc::MscInterface;
 /// asked for, and the scratch page is four times this.
 const MAX_CONFIG_DESC: usize = 256;
 
+/// One endpoint from a configuration descriptor, which this driver has decided
+/// it can configure.
+///
+/// [`Self::new`] is the only way to make one and is private to this module, so
+/// a `dci` that exists is a device context index the driver may write — and
+/// "does this endpoint exist" is `Option<Endpoint>` rather than a zero in a
+/// field. That is the whole point: the sentinel it replaces was the endpoint
+/// *address*, and one direction was guarded by design while the other was
+/// guarded by the accident that a zero address and the "not filled in yet"
+/// value are the same byte.
+///
+/// One type for both kinds, with a field each kind ignores, because the
+/// alternative is two types with two copies of the constructor — and the
+/// constructor is the invariant.
+#[derive(Clone, Copy)]
+pub(super) struct Endpoint {
+    pub(super) addr: u8,
+    pub(super) dci: u8,
+    pub(super) max_packet: u16,
+    /// The SuperSpeed companion's burst size. Zero is legal and means one
+    /// packet per burst, which is what a device that omits the companion means.
+    pub(super) max_burst: u8,
+    /// bInterval. Only an interrupt endpoint uses it.
+    pub(super) interval: u8,
+}
+
+impl Endpoint {
+    /// `None` for an address naming endpoint 0, which is the check this type
+    /// exists to make unforgettable. `0x80` and `0x10` are non-zero bytes and
+    /// they resolve to DCI 1, EP0's own endpoint context, and DCI 0, the slot
+    /// context: a driver that configures a bulk endpoint at either writes it
+    /// over the device's control endpoint or over its speed and root-hub port,
+    /// from bytes the device chose, and then relies on the host controller to
+    /// reject the command it built.
+    fn new(addr: u8, max_packet: u16, interval: u8) -> Option<Self> {
+        let num = addr & 0x0F;
+        (num != 0).then(|| Self {
+            addr,
+            dci: num * 2 + u8::from(addr & 0x80 != 0),
+            max_packet,
+            max_burst: 0,
+            interval,
+        })
+    }
+}
+
 /// Result of parsing a USB device's configuration descriptor for HID interfaces.
 struct HidInterfaceInfo {
     protocol: HidType,
     iface_num: u8,
-    ep_addr: u8,
-    ep_dci: u8,
-    ep_max_packet: u16,
-    ep_interval: u8,
-}
-
-/// The device context index of a non-control endpoint, which is the only kind
-/// this driver configures.
-///
-/// `None` for an address naming endpoint 0, and that is the whole reason this
-/// is a function. `0x80` and `0x10` are non-zero bytes — which is all the
-/// acceptance tests used to be — and they resolve to DCI 1, EP0's own endpoint
-/// context, and DCI 0, the slot context. A driver that configures a bulk
-/// endpoint at either writes it over the device's control endpoint or over its
-/// speed and root-hub port, from bytes the device chose, and relies on the host
-/// controller to reject the command it built.
-fn endpoint_dci(addr: u8) -> Option<u8> {
-    let num = addr & 0x0F;
-    (num != 0).then(|| num * 2 + u8::from(addr & 0x80 != 0))
+    ep: Endpoint,
 }
 
 /// What one configuration descriptor offered that this driver can drive.
+///
+/// Both variants are *complete*: there is no value of this type describing an
+/// interface whose endpoints the driver has not resolved, which is why the
+/// walk below accumulates into [`Walk`] and converts once.
 enum Function {
     Hid(HidInterfaceInfo),
     Msc(MscInterface),
+}
+
+/// The same interface while the walk is still reading its endpoints.
+///
+/// Separate from [`Function`] so that "one bulk endpoint so far" is a state the
+/// walk can be in and the rest of the driver cannot. The conversion in
+/// [`Walk::finish`] *is* the completeness test, and it is the only one — two
+/// tests on `!= 0` further down deleted themselves when this landed.
+enum Walk {
+    Hid { protocol: HidType, iface_num: u8, ep: Option<Endpoint> },
+    Msc { iface_num: u8, in_ep: Option<Endpoint>, out_ep: Option<Endpoint> },
+}
+
+impl Walk {
+    /// Move a finished interface into the running answer, if it is one this
+    /// driver can bind.
+    fn finish(self, hid: &mut Option<HidInterfaceInfo>, msc: &mut Option<MscInterface>) {
+        match self {
+            Self::Hid { protocol, iface_num, ep: Some(ep) } => {
+                if hid.is_none() {
+                    *hid = Some(HidInterfaceInfo { protocol, iface_num, ep });
+                }
+            }
+            Self::Hid { .. } => {}
+            Self::Msc { iface_num, in_ep: Some(in_ep), out_ep: Some(out_ep) } => {
+                if msc.is_none() {
+                    *msc = Some(MscInterface { iface_num, in_ep, out_ep });
+                }
+            }
+            Self::Msc { iface_num, .. } => {
+                log!("xHCI: mass-storage interface {iface_num} has no pair of bulk endpoints \
+                     this driver can configure, skipping");
+            }
+        }
+    }
 }
 
 fn max_packet_for_speed(speed: u8) -> u16 {
@@ -82,7 +149,7 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
     let mut hid: Option<HidInterfaceInfo> = None;
     let mut msc: Option<MscInterface> = None;
     // Which interface the endpoint descriptors that follow belong to.
-    let mut current: Option<Function> = None;
+    let mut current: Option<Walk> = None;
     // A SuperSpeed companion describes the endpoint immediately before it.
     let mut last_ep_in: Option<bool> = None;
 
@@ -102,25 +169,11 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
             // Interface
             4 if desc.len() >= 9 => {
                 if let Some(done) = current.take() {
-                    match done {
-                        Function::Hid(h) if hid.is_none() => hid = Some(h),
-                        Function::Msc(m) if msc.is_none() => msc = Some(m),
-                        _ => {}
-                    }
+                    done.finish(&mut hid, &mut msc);
                 }
                 let (class, sub, proto) = (desc[5], desc[6], desc[7]);
                 current = if class == 0x08 && sub == 0x06 && proto == 0x50 {
-                    Some(Function::Msc(MscInterface {
-                        iface_num: desc[2],
-                        in_ep: 0,
-                        in_dci: 0,
-                        in_max_packet: 0,
-                        in_max_burst: 0,
-                        out_ep: 0,
-                        out_dci: 0,
-                        out_max_packet: 0,
-                        out_max_burst: 0,
-                    }))
+                    Some(Walk::Msc { iface_num: desc[2], in_ep: None, out_ep: None })
                 } else if class == 3 {
                     let protocol = match (sub, proto) {
                         (1, 1) => Some(HidType::Keyboard),
@@ -128,54 +181,35 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
                         (0, _) => Some(HidType::Tablet),
                         _ => None,
                     };
-                    protocol.map(|protocol| {
-                        Function::Hid(HidInterfaceInfo {
-                            protocol,
-                            iface_num: desc[2],
-                            ep_addr: 0,
-                            ep_dci: 0,
-                            ep_max_packet: 0,
-                            ep_interval: 0,
-                        })
-                    })
+                    protocol.map(|protocol| Walk::Hid { protocol, iface_num: desc[2], ep: None })
                 } else {
                     None
                 };
             }
             // Endpoint
             5 if desc.len() >= 7 => {
-                let addr = desc[2];
                 let transfer = desc[3] & 0x3;
-                let max_packet = le16(desc, 4);
                 last_ep_in = None;
                 // An address this driver cannot turn into a device context
-                // index is one it cannot configure, so as far as everything
-                // below here is concerned it is not an endpoint. The context
-                // index is resolved once, here, where the descriptor is — the
-                // two hand-rolled copies of the arithmetic further down each
-                // read the address themselves and neither looked at the
-                // endpoint *number*.
-                if let Some(dci) = endpoint_dci(addr) {
+                // index is not an endpoint as far as anything below here is
+                // concerned, and `Endpoint::new` is the only place that is
+                // decided. `if let` and not a `let ... else`: the offset
+                // advance is at the bottom of this loop.
+                if let Some(ep) = Endpoint::new(desc[2], le16(desc, 4), desc[6]) {
+                    let is_in = ep.addr & 0x80 != 0;
                     match &mut current {
-                        Some(Function::Hid(h)) if addr & 0x80 != 0 && h.ep_addr == 0 => {
-                            h.ep_addr = addr;
-                            h.ep_dci = dci;
-                            h.ep_max_packet = max_packet;
-                            h.ep_interval = desc[6];
+                        Some(Walk::Hid { ep: slot, .. }) if is_in && slot.is_none() => {
+                            *slot = Some(ep);
                         }
                         // Bulk only: a mass-storage interface's interrupt
                         // endpoint belongs to CBI, which this driver does not
                         // speak.
-                        Some(Function::Msc(m)) if transfer == 2 => {
-                            if addr & 0x80 != 0 && m.in_ep == 0 {
-                                m.in_ep = addr;
-                                m.in_dci = dci;
-                                m.in_max_packet = max_packet;
+                        Some(Walk::Msc { in_ep, out_ep, .. }) if transfer == 2 => {
+                            if is_in && in_ep.is_none() {
+                                *in_ep = Some(ep);
                                 last_ep_in = Some(true);
-                            } else if addr & 0x80 == 0 && m.out_ep == 0 {
-                                m.out_ep = addr;
-                                m.out_dci = dci;
-                                m.out_max_packet = max_packet;
+                            } else if !is_in && out_ep.is_none() {
+                                *out_ep = Some(ep);
                                 last_ep_in = Some(false);
                             }
                         }
@@ -185,14 +219,12 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
             }
             // SuperSpeed Endpoint Companion, which is where a SuperSpeed
             // device states the burst size of the endpoint just above it.
-            // Zero is legal and means one packet per burst, so a device that
-            // omits this costs throughput and nothing else.
             0x30 if desc.len() >= 3 => {
-                if let (Some(Function::Msc(m)), Some(is_in)) = (&mut current, last_ep_in) {
-                    if is_in {
-                        m.in_max_burst = desc[2];
-                    } else {
-                        m.out_max_burst = desc[2];
+                if let (Some(Walk::Msc { in_ep, out_ep, .. }), Some(is_in)) =
+                    (&mut current, last_ep_in)
+                {
+                    if let Some(ep) = if is_in { in_ep } else { out_ep } {
+                        ep.max_burst = desc[2];
                     }
                 }
             }
@@ -201,24 +233,16 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
         offset += desc_len;
     }
     if let Some(done) = current {
-        match done {
-            Function::Hid(h) if hid.is_none() => hid = Some(h),
-            Function::Msc(m) if msc.is_none() => msc = Some(m),
-            _ => {}
-        }
+        done.finish(&mut hid, &mut msc);
     }
 
-    // On the DCIs and not on the addresses. They are non-zero for exactly the
-    // endpoints `endpoint_dci` accepted, which is the property `bind` needs and
-    // is not the property "the descriptor's address byte was non-zero".
+    // Mass storage wins a tie with HID because a device offering a disk is a
+    // disk. No completeness test here: an interface that reached `hid` or `msc`
+    // has one, because `Walk::finish` could not have built it otherwise.
     if let Some(m) = msc {
-        if m.in_dci != 0 && m.out_dci != 0 {
-            return Some((config_val, Function::Msc(m)));
-        }
-        log!("xHCI: mass-storage interface {} has no bulk pair, skipping", m.iface_num);
+        return Some((config_val, Function::Msc(m)));
     }
-    let h = hid?;
-    (h.ep_dci != 0).then(|| (config_val, Function::Hid(h)))
+    Some((config_val, Function::Hid(hid?)))
 }
 
 /// Initialize and configure one USB device on a port.
@@ -360,7 +384,8 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let info = match function {
         Function::Msc(msc) => {
             log!("xHCI: mass storage iface={} in={:#x}/{} out={:#x}/{}",
-                msc.iface_num, msc.in_ep, msc.in_max_packet, msc.out_ep, msc.out_max_packet);
+                msc.iface_num, msc.in_ep.addr, msc.in_ep.max_packet,
+                msc.out_ep.addr, msc.out_ep.max_packet);
             super::msc::bind(ctrl, ep0_ring, slot_id, speed, port_idx, &msc);
             return;
         }
@@ -372,9 +397,9 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         HidType::Mouse => "mouse",
         HidType::Tablet => "tablet",
     };
-    let int_ep_dci = info.ep_dci;
+    let int_ep_dci = info.ep.dci;
     log!("xHCI: HID {} iface={} ep={:#x} max_pkt={} interval={} dci={}",
-        kind, info.iface_num, info.ep_addr, info.ep_max_packet, info.ep_interval, int_ep_dci);
+        kind, info.iface_num, info.ep.addr, info.ep.max_packet, info.ep.interval, int_ep_dci);
 
     // SET_PROTOCOL (boot protocol) — only for boot-interface devices
     if info.protocol != HidType::Tablet {
@@ -404,18 +429,18 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     ctrl.write_ctx32(input_ctx_ptr, 1, 1, (port_idx as u32 + 1) << 16);
 
     let ep_ctx_index = int_ep_dci as usize + 1;
-    let interval_val = if info.ep_interval == 0 { 0u32 } else if speed <= 2 {
-        let frames = (info.ep_interval as u32) * 8;
+    let interval_val = if info.ep.interval == 0 { 0u32 } else if speed <= 2 {
+        let frames = (info.ep.interval as u32) * 8;
         let mut exp = 0u32;
         let mut v = frames;
         while v > 1 { v >>= 1; exp += 1; }
         exp
     } else {
-        (info.ep_interval - 1) as u32
+        (info.ep.interval - 1) as u32
     };
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 0, interval_val << 16);
 
-    let ep_dw1 = (3u32 << 1) | (7u32 << 3) | ((info.ep_max_packet as u32) << 16);
+    let ep_dw1 = (3u32 << 1) | (7u32 << 3) | ((info.ep.max_packet as u32) << 16);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 1, ep_dw1);
 
     let int_dequeue = int_ring.dequeue();
@@ -510,8 +535,8 @@ pub fn selftest() {
 
     fn summarise(got: Option<(u8, Function)>) -> Verdict {
         match got? {
-            (cfg, Function::Hid(h)) => Some((1, cfg, h.ep_dci, 0)),
-            (cfg, Function::Msc(m)) => Some((2, cfg, m.in_dci, m.out_dci)),
+            (cfg, Function::Hid(h)) => Some((1, cfg, h.ep.dci, 0)),
+            (cfg, Function::Msc(m)) => Some((2, cfg, m.in_ep.dci, m.out_ep.dci)),
         }
     }
 

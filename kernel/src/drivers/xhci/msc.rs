@@ -10,6 +10,7 @@
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
+use super::device::Endpoint;
 use super::{Trb, TrbRing, XhciController, StorageGeometry, PAGE};
 use super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, TRB_CONFIGURE_EP};
 use super::{TRB_RESET_ENDPOINT, TRB_SET_TR_DEQUEUE, OFF_INPUT_CTX};
@@ -38,20 +39,14 @@ const CSW_LEN: u32 = 13;
 
 /// What the configuration descriptor said about a mass-storage interface.
 ///
-/// The device context indices are resolved by `parse_config`, where the
-/// descriptor is, and carried here rather than recomputed: an address naming
-/// endpoint 0 has no index this driver may use, and that is a fact about the
-/// descriptor, not about the moment a Configure Endpoint command is built.
+/// Both endpoints, always. A value of this type cannot describe an interface
+/// with one bulk endpoint or with an address this driver may not turn into a
+/// device context index, because [`Endpoint`] has one constructor and it is
+/// private to the parser — so `bind` has nothing left to check.
 pub struct MscInterface {
     pub iface_num: u8,
-    pub in_ep: u8,
-    pub in_dci: u8,
-    pub in_max_packet: u16,
-    pub in_max_burst: u8,
-    pub out_ep: u8,
-    pub out_dci: u8,
-    pub out_max_packet: u16,
-    pub out_max_burst: u8,
+    pub in_ep: Endpoint,
+    pub out_ep: Endpoint,
 }
 
 /// One bound disk. `Copy` because every operation takes it out of the
@@ -635,7 +630,7 @@ pub fn bind(
         return false;
     };
 
-    let (in_dci, out_dci) = (info.in_dci, info.out_dci);
+    let (in_dci, out_dci) = (info.in_ep.dci, info.out_ep.dci);
     let dma = ctrl.dma();
     let in_ring = TrbRing::init(dma.subslice(block + MSC_IN_RING, PAGE));
     let out_ring = TrbRing::init(dma.subslice(block + MSC_OUT_RING, PAGE));
@@ -654,8 +649,8 @@ pub fn bind(
     // and the endpoint's own maximum packet size is the honest answer for a
     // driver that issues one TRB per transfer.
     for (dci, ep_type, mps, burst, ring) in [
-        (out_dci, 2u32, info.out_max_packet, info.out_max_burst, &out_ring),
-        (in_dci, 6u32, info.in_max_packet, info.in_max_burst, &in_ring),
+        (out_dci, 2u32, info.out_ep.max_packet, info.out_ep.max_burst, &out_ring),
+        (in_dci, 6u32, info.in_ep.max_packet, info.in_ep.max_burst, &in_ring),
     ] {
         let ctx = dci as usize + 1;
         ctrl.write_ctx32(input_ctx_ptr, ctx, 0, 0);
@@ -681,8 +676,8 @@ pub fn bind(
     let mut dev = MscDevice {
         slot_id,
         iface: info.iface_num,
-        in_ep: info.in_ep,
-        out_ep: info.out_ep,
+        in_ep: info.in_ep.addr,
+        out_ep: info.out_ep.addr,
         in_dci,
         out_dci,
         block,
