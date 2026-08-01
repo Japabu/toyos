@@ -2089,3 +2089,92 @@ clothes. Unmeasured in either direction: no real EC timing has ever been taken.
 - The LAPIC timer uses one-shot mode; it should use TSC deadline mode
   (`IA32_TSC_DEADLINE` MSR) for precise absolute-time wakeups. The TSC is already
   calibrated for `nanos_since_boot()`.
+
+---
+
+## 9. toyos-fat32
+
+The crate is new (`toyos-fat32/`, host tests: `cargo test` inside it) and no
+kernel adapter exists yet. Nothing below is a defect found later — these are
+the residuals its own gate identified while it was being written, recorded so
+the adapter's author does not have to rediscover them.
+
+### A cyclic chain under a *file* is bounded, not detected
+
+`fat.rs::advance` walks a chain by a step count derived from something the
+chain cannot influence — a file's size field, `MAX_DIR_ENTRIES`, the volume's
+cluster count — so a cycle costs a bounded number of FAT reads and never a
+hang or an unbounded allocation. A self-loop (`c → c`) is rejected because the
+comparison is free. A longer cycle under a file is not: the read returns that
+file's own earlier bytes again, within its declared size.
+
+Detecting it needs either a tortoise-and-hare, which doubles the FAT reads on
+every sequential access, or a full walk from the head at open time — and the
+second is incompatible with the position hint that makes sequential access
+O(1) rather than O(n²) in the first place. The cases where a cycle would do
+damage rather than confuse *are* detected: `free_chain` (a cluster freed
+twice, caught because freeing writes zero and a zero mid-chain is
+`CorruptChain`), `chain_len` and `chain_last` (a directory that never ends).
+`a_longer_cycle_is_bounded_rather_than_endless` pins the behaviour so a future
+change has to be deliberate.
+
+### `walk` cannot see an empty directory
+
+`Fat32::walk` returns files only, with directories implied by the `/` in a
+path — which is exactly the convention `vfs::FileSystem::list` expects, and
+what `TmpFs` and both bcachefs adapters do. The consequence is the same one
+the VFS already has: a directory with nothing in it is invisible through
+`list`, and the VFS's `created_dirs` set only covers directories created in
+this boot. An empty directory that was already on the ESP will not appear.
+`Fat32::read_dir` answers correctly per directory; nothing calls it yet.
+
+### `rename` refuses an existing destination
+
+FAT gives no way to make a replacement atomic. Deleting the destination first
+leaves a window in which neither name resolves, which is worse than an error
+the caller can act on — so `Fat32::rename` returns `AlreadyExists`. A VFS
+`rename` that wants POSIX overwrite semantics has to do the delete itself and
+own that window.
+
+### Bounds that are policy, not format
+
+Each is a number this crate picked, with its derivation at the definition:
+`MAX_DIR_ENTRIES` (65,536 entries, 2 MiB, ~20k files in one directory);
+`MAX_WALK_DEPTH` (32); `MAX_SHORT_NAME_CANDIDATES` (64, after which a create
+into a directory built to collide returns `NoSpace`); `MAX_LFN_CHARS` (255,
+this one *is* the format). A `walk` or `read_dir` past the caller's `limit`
+refuses rather than truncating, for the reason `vfs::MAX_LIST_ENTRIES` gives.
+
+### No caching, deliberately, so performance depends on what is underneath
+
+Every FAT entry read is a 4-byte device read; the only buffer in the crate is
+one sector, invalidated by every write, and it exists so a directory scan
+reads one sector per sixteen entries instead of one per entry. That is right
+when the kernel's page cache sits directly under `BlockAccess` — caching twice
+is a coherence hazard for no gain — and wrong for any adapter without one. The
+adapter is where that decision gets made.
+
+### Two things `fsck_msdos` does not check, found by breaking the code on purpose
+
+Recorded because it generalises past this crate: **a host validator's silence
+is evidence about the validator, not only about the code.** Sixteen deliberate
+breakages were run against the suite. Fourteen went red. Two did not, and
+neither was harmless:
+
+- **A stale FAT mirror.** `fsck_msdos -n` does not compare the FAT copies, and
+  a mount reads only the active one — so a driver that updates FAT 0 and
+  leaves FAT 1 behind passes fsck, passes a real mount, and passes every
+  read-back test, while leaving a volume that reads differently the moment
+  anything consults the mirror.
+- **Duplicate 8.3 names.** Neither fsck nor a mount looks at short names; both
+  use the long ones. Dropping short-name uniquification entirely was invisible.
+
+Both now have a test that reads the raw bytes off the device
+(`every_fat_copy_stays_in_step`, and the tail of
+`colliding_short_names_stay_unique`), and both mutations go red.
+
+Related, and the reason the gate does not read an exit code: **`fsck_msdos -n`
+exits 0 while printing `Fix?` for problems it declined to repair, and exits 0
+on a volume it has just declared dirty.** `common::Image::fsck` matches the
+output line by line against the exact shape of a clean run instead. A gate
+written the obvious way would have been green on a corrupt volume.
