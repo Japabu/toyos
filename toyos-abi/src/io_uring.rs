@@ -54,9 +54,17 @@ pub struct IoUringRingHeader {
     pub tail: core::sync::atomic::AtomicU32,
     pub ring_size: u32,
     /// Completions the kernel could not post because the completion ring
-    /// reported itself full. With honest indices and 2x sizing this stays 0
-    /// forever; a non-zero value means this process corrupted its own ring
-    /// head, and this is how it can tell.
+    /// reported itself full. Cumulative, and never cleared.
+    ///
+    /// 2x sizing makes this unreachable only for a process that keeps its
+    /// registrations within the depth it asked for. It said a non-zero value
+    /// meant the process had corrupted its own ring head; honest
+    /// over-registration reaches it with no corruption at all, because
+    /// flushing a full submission ring mid-registration makes the kernel post
+    /// completions for the fds that are already ready while the caller is
+    /// still registering the rest. `toyos`'s `Poller` sizes its rings so that
+    /// cannot happen and reads this on every wait, so the reachable case now
+    /// has a name and an owner.
     pub dropped: core::sync::atomic::AtomicU32,
 }
 

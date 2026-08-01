@@ -16,21 +16,32 @@ pub use toyos_abi::io_uring::{IORING_POLL_IN, IORING_POLL_OUT};
 /// Owns the ring fd and shared memory mapping. Submissions are batched
 /// and flushed on [`wait`](Self::wait).
 ///
-/// Registering more handles than the ring is deep is safe — the batch is
-/// flushed and refilled — but it is not unlimited: each registration can
-/// produce one completion, and the kernel's completion queue is twice the
-/// submission ring. A caller that watches more than `2 × handles` distinct fds
-/// between two [`wait`](Self::wait) calls is outside what this type can carry;
-/// size it for the set instead.
+/// **A poller has a declared capacity and cannot lose a completion inside it.**
+/// [`new`](Self::new) takes the number of handles the caller will watch at once
+/// and sizes both rings from it: the submission ring holds them all, so no
+/// batch is ever flushed mid-registration, and the kernel's completion ring —
+/// always twice the submission ring — holds the most completions that can exist
+/// between two [`wait`](Self::wait) calls, which is two per watched handle (a
+/// registration left over from the previous round firing, and this round's
+/// registration finding the handle ready).
 ///
-/// This said the kernel "asserts rather than overflows", which stopped being
-/// true when `post_cqe` switched to recording a drop and returning — prose
-/// asserting a property of another component that nobody re-checked. Losing
-/// the assert lost the diagnosis too: the overflow became silent. [`wait`](Self::wait)
-/// reads the kernel's drop counter, so it is loud again.
+/// Going past the capacity is a contract violation and panics, because it is
+/// the caller's own bug and the alternative is the failure this replaced: the
+/// kernel silently dropping a completion and the caller blocking forever on
+/// readiness that was thrown away. The capacity is the number of handles, not
+/// the number of calls — re-registering the same handle within a round is
+/// deduplicated by the kernel but still counts here, so declare the set.
+///
+/// The doc that used to be here said the kernel "asserts rather than
+/// overflows", which stopped being true when `post_cqe` switched to recording
+/// a drop and returning: prose asserting a property of another component that
+/// nobody re-checked. [`wait`](Self::wait) still reads the kernel's drop
+/// counter — an assert that should now be unreachable, kept because that is
+/// the shape a fail-fast check is supposed to have.
 pub struct Poller {
     ring_fd: Fd,
     base: *mut u8,
+    capacity: u32,
     sq_size: u32,
     cq_size: u32,
 }
@@ -46,15 +57,21 @@ impl Poller {
     /// that must bound its own watched set has to bound it below this.
     pub const MAX_HANDLES: u32 = 256;
 
-    /// Create a poller sized for `handles` concurrently watched handles.
+    /// Create a poller for `capacity` simultaneously watched handles.
     ///
-    /// The kernel only builds power-of-two rings up to [`MAX_HANDLES`], so the
-    /// request is rounded up and clamped rather than rejected. Registering more
-    /// handles than the ring holds stays correct (see
-    /// [`poll_add_fd`](Self::poll_add_fd)); the depth only decides how many
-    /// reach the kernel per batch.
-    pub fn new(handles: u32) -> Self {
-        let entries = handles.clamp(1, Self::MAX_HANDLES).next_power_of_two();
+    /// `capacity` is a declaration, not a hint: the rings are rounded up to the
+    /// power of two that holds it, and registering past it panics. A capacity
+    /// above [`MAX_HANDLES`] is refused for the same reason — it used to be
+    /// clamped, which handed the caller a ring smaller than the set it just
+    /// said it had and made the loss reachable while looking like a success.
+    pub fn new(capacity: u32) -> Self {
+        assert!(
+            capacity >= 1 && capacity <= Self::MAX_HANDLES,
+            "Poller::new: {capacity} handles is outside 1..={}; \
+             bound the watched set below the kernel's deepest ring",
+            Self::MAX_HANDLES,
+        );
+        let entries = capacity.next_power_of_two();
         let (ring_fd, shm_token) = syscall::io_uring_setup(entries)
             .expect("Poller::new: io_uring_setup failed");
         let base = unsafe { syscall::try_map_shared(shm_token) }
@@ -62,7 +79,12 @@ impl Poller {
         let params = unsafe { &*(base as *const IoUringParams) };
         let sq_size = params.sq_ring_size;
         let cq_size = params.cq_ring_size;
-        Self { ring_fd, base, sq_size, cq_size }
+        // The whole point of the sizing: `capacity` registrations fit the
+        // submission ring with no mid-batch flush, and the completions they can
+        // produce fit the completion ring.
+        assert!(sq_size >= capacity && cq_size >= 2 * capacity,
+            "Poller::new: kernel built {sq_size}/{cq_size} rings for {capacity} handles");
+        Self { ring_fd, base, capacity, sq_size, cq_size }
     }
 
     /// Submit a poll request for the given handle.
@@ -77,13 +99,18 @@ impl Poller {
     ///
     /// Prefer [`poll_add`](Self::poll_add) when you have a typed handle.
     pub fn poll_add_fd(&self, fd: Fd, flags: u32, token: u64) {
-        // The SQ is a transport, not the caller's queue. Writing past its depth
-        // would wrap onto entries the kernel has not read yet, and it refuses
-        // an over-deep batch wholesale — so nothing would ever be submitted.
-        // Flushing first costs one syscall per ring depth and keeps every entry.
-        if self.pending() == self.sq_size {
-            self.submit(0, 0);
-        }
+        // A panic, because this is first-party code exceeding a bound it
+        // declared itself. There used to be a mid-batch flush here instead;
+        // that is what made completions reachable while the caller was still
+        // registering, and past the completion ring the kernel dropped them
+        // and the caller blocked forever on readiness it had been told about.
+        // With the ring sized for `capacity` this is unreachable.
+        assert!(
+            self.pending() < self.capacity,
+            "Poller: {} handles registered since the last wait(), capacity is {}",
+            self.pending(),
+            self.capacity,
+        );
         let sq_hdr = unsafe {
             &*(self.base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader)
         };
@@ -133,22 +160,19 @@ impl Poller {
             &*(self.base.add(CQ_RING_OFF as usize) as *const IoUringRingHeader)
         };
 
-        // The kernel drops a completion it cannot post and records it here.
-        // Nobody asked, so a dropped completion became a caller waiting forever
-        // for readiness that was thrown away — a hang with no cause on the
-        // machine that has it. Asking turns it into a diagnosable failure.
-        //
-        // It is reachable without corrupting anything: `poll_add_fd` flushes a
-        // full SQ mid-registration, the kernel processes those entries at once,
-        // and already-ready fds post completions while the caller is still
-        // registering. Past `cq_size` they are dropped. The counter is
-        // cumulative and the kernel never clears it, so this stays tripped.
+        // Unreachable, and kept for that reason: `capacity` bounds the
+        // registrations and the rings are sized from `capacity`, so nothing a
+        // conforming caller does can make the kernel drop a completion here.
+        // The counter is cumulative and never cleared, so if the reasoning is
+        // wrong this fires and stays fired instead of turning into a caller
+        // blocked forever on readiness that was thrown away — which is what it
+        // was before anyone read this field at all.
         let dropped = cq_hdr.dropped.load(Ordering::Relaxed);
         assert_eq!(
             dropped, 0,
-            "Poller: the kernel dropped {dropped} completion(s) — more fds were \
-             registered between two wait() calls than the completion ring holds. \
-             Size the Poller for the whole watched set.",
+            "Poller: the kernel dropped {dropped} completion(s) with capacity {} \
+             and rings {}/{} — the sizing rule is wrong, not the caller.",
+            self.capacity, self.sq_size, self.cq_size,
         );
 
         loop {

@@ -449,6 +449,15 @@ pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: u32, timeout: i32) -> i32 
         return 0;
     }
 
+    // A poller watches at most `MAX_HANDLES` fds and now says so by panicking
+    // rather than by quietly handing back a smaller ring. A C caller asking to
+    // watch more is not a bug in this library, so it gets POSIX's own answer
+    // for an nfds it cannot serve.
+    if nfds > toyos::poller::Poller::MAX_HANDLES {
+        super::stdio::errno = EINVAL;
+        return -1;
+    }
+
     let timeout_ns = if timeout < 0 { None } else { Some(timeout as u64 * 1_000_000) };
 
     let n = nfds as usize;
