@@ -62,6 +62,7 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 /// untouched by the thrash.
 const SCREEN_TESTS: &[&str] = &[
     "screen_decoder",
+    "screen_diag_boot",
     "screen_recoverable_untouched",
     "screen_early_panic",
     "screen_late_panic",
@@ -107,6 +108,19 @@ const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
 const ALERT: [u8; 3] = [0xFF, 0x50, 0x50];
 /// And the fill a halted machine leaves behind.
 const FILL_FATAL: [u8; 3] = [0x60, 0x00, 0x00];
+/// The fill a boot checkpoint leaves behind. It is the only thing that tells a
+/// diagnostic boot's screen from a fatal report's — both carry the same log
+/// lines, and one of them means the machine died.
+const FILL_BOOT: [u8; 3] = [0x00, 0x00, 0x00];
+
+/// The T14 Gen 2's panel as the console grids it: 1080/16 rows of 1920/8
+/// columns. QEMU's stdvga GOP is *larger* — the bootloader picks the
+/// most-pixels mode and `MAX_ROWS`/`MAX_COLS` cap that at 96x256 — so a line
+/// can sit comfortably on the test's screen and fall off the laptop's. Every
+/// geometry claim `screen_diag_boot` makes is made against these two numbers
+/// and not against the screen it is reading.
+const T14_ROWS: usize = 1080 / 16;
+const T14_COLS: usize = 1920 / 8;
 
 /// The line `SYS_DEBUG` action 3 logs immediately before halting every CPU.
 /// Action 3 exists only under the `test-fatal-halt` kernel feature, which
@@ -1077,6 +1091,145 @@ fn run_screen_test(
     match name {
         "screen_decoder" => {
             screen::self_test();
+            Ok(())
+        }
+        "screen_diag_boot" => {
+            // The diagnostic boot mode, on the machine shape it exists for.
+            // What is under test is not that the console renders —
+            // `screen_late_panic` has that — but that a *successful* boot
+            // leaves its log on the glass. `boot_checkpoint` is the only
+            // painter on this path and it returns immediately once anything
+            // claims DEVICE_FRAMEBUFFER, so on the flashed image the answer
+            // to "why is the keyboard dead" was up for about a tenth of a
+            // second. This image contains no process that can claim it.
+            //
+            // Same config file `--diag-boot` builds from, and no test binaries
+            // in the initrd, so the image booted here is the image flashed.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("diag");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                // No test-runner in this image, so the kernel's own last phase
+                // line is the marker. It says the ring drained, not that the
+                // paint happened, which is why the screen is polled below.
+                ready_marker: "Boot: complete",
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            let console = qemu.boot_log().to_string();
+            qemu.screendump_until("Boot: complete", Duration::from_secs(30));
+
+            // The window the mode exists to close: on the flashed image the
+            // compositor's first output landed 48 ms after `Boot: complete`.
+            // Holding two orders of magnitude longer than that is what makes
+            // "indefinitely" a measurement rather than a claim.
+            thread::sleep(Duration::from_secs(5));
+            let dump = qemu.screendump();
+            let text = dump.text();
+            print_screen(name, &text);
+
+            // A fatal report carries the same log lines. Without the fill and
+            // a clean console this would go green on a kernel that panicked
+            // its way to the same text.
+            if dump.fill() != FILL_BOOT {
+                return Err(format!(
+                    "screen fill is {:?}, want the boot checkpoint's {FILL_BOOT:?}\n\
+                     decoded screen:\n{text}",
+                    dump.fill()
+                ));
+            }
+            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+
+            for want in ["Boot: complete", "i8042:"] {
+                if !text.contains(want) {
+                    return Err(format!(
+                        "{want:?} is not on screen five seconds after the boot \
+                         finished\ndecoded screen:\n{text}"
+                    ));
+                }
+            }
+
+            // A log longer than the screen is shown as its tail, and the rule
+            // is that it may never be a *silent* tail: `paint` gives an
+            // overflowing text a `[page n/m]` footer and `Page::Last` numbers
+            // it as the last page. So either the whole log is up, or the
+            // footer says out loud that it is not. Which branch runs is a
+            // property of the log's length, not of the mode — this boot fits
+            // today and the footer branch is the guard for when it stops
+            // fitting, which the T14's shorter panel is already close to.
+            let rows = dump.rows();
+            let paged = rows.iter().find(|r| r.starts_with("[page "));
+            match paged {
+                Some(f) => {
+                    let n: Vec<&str> = f
+                        .trim_start_matches("[page ")
+                        .trim_end_matches(']')
+                        .split('/')
+                        .collect();
+                    if n.len() != 2 || n[0] != n[1] {
+                        return Err(format!(
+                            "a boot checkpoint paints the newest page, so its footer \
+                             must read [page m/m]; got {f:?}"
+                        ));
+                    }
+                }
+                None => {
+                    let Some(first) = console.lines().find(|l| qemu::is_kernel_line(l)) else {
+                        return Err(format!("no kernel line on the console at all:\n{console}"));
+                    };
+                    // A fragment rather than the line: rows are wrapped at the
+                    // screen's width, and a whole line can straddle two of them.
+                    let fragment: String = first.chars().skip(20).take(24).collect();
+                    if !text.contains(fragment.trim()) {
+                        return Err(format!(
+                            "no footer, so the screen claims to hold the whole log — \
+                             but its first line {first:?} is not on it\n\
+                             decoded screen:\n{text}"
+                        ));
+                    }
+                }
+            }
+
+            // And the same claim against the panel that gets flashed, which is
+            // smaller than this one in both directions.
+            let i8042_row = dump.row_index("i8042:").expect("checked above");
+            let last_text = rows
+                .iter()
+                .rposition(|r| !r.is_empty() && !r.starts_with("[page "))
+                .unwrap_or(0);
+            let above_end = last_text.saturating_sub(i8042_row);
+            if above_end >= T14_ROWS {
+                return Err(format!(
+                    "the first `i8042:` line is {above_end} rows above the end of the \
+                     log; the T14's panel holds {T14_ROWS}, so it would not be on the \
+                     flashed machine's screen at all\ndecoded screen:\n{text}"
+                ));
+            }
+            if let Some(wide) = rows[i8042_row..=last_text]
+                .iter()
+                .find(|r| r.chars().count() > T14_COLS)
+            {
+                return Err(format!(
+                    "a row inside that window is {} columns wide against the panel's \
+                     {T14_COLS}; it wraps there, which pushes the `i8042:` line further \
+                     up than this screen shows: {wide:?}",
+                    wide.chars().count()
+                ));
+            }
+
+            eprintln!("  [diag] five seconds after Boot: complete, still on screen:");
+            eprintln!("  [diag]   {}", rows[i8042_row]);
+            eprintln!(
+                "  [diag] {above_end} rows above the end of the log; the T14 panel holds {T14_ROWS}"
+            );
+            eprintln!(
+                "  [diag] {}",
+                match paged {
+                    Some(f) => format!("log longer than the screen, footer reads {f}"),
+                    None => "whole log on one screen, no footer".to_string(),
+                }
+            );
             Ok(())
         }
         "screen_panic_muted" => {
