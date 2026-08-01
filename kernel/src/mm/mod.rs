@@ -40,20 +40,26 @@ pub const fn align_2m_checked(size: usize) -> Option<usize> {
 
 /// The largest single allocation the kernel heap can serve.
 ///
-/// [`alloc::KernelPageSource`] hands out one 2 MiB page and asserts above
-/// `PAGE_2M`, because a 2 MiB page is all it has. dlmalloc rounds a request up
-/// to a whole granule *plus* its own chunk and segment bookkeeping, so a
-/// request that merely fits in 2 MiB still asks the page source for 4 MiB and
-/// trips that assert — which is why the ceiling is not `PAGE_2M` itself.
+/// `KernelPageSource` hands out one 2 MiB page and can hand out no more.
+/// dlmalloc rounds a request up to a whole granule *plus* its own chunk and
+/// segment bookkeeping, so a request that merely fits in 2 MiB still asks the
+/// page source for more than one page — which is why the ceiling is not
+/// `PAGE_2M` itself. Measured: a 2,097,152-byte request asks for 2,162,688.
 ///
 /// The 4 KiB of headroom is policy, in the same sense as
 /// `user_ptr::MAX_USER_STR`: the number is chosen, the reason it exists is
-/// not. dlmalloc's overhead is tens of bytes, so one page is orders of
-/// magnitude of margin and no real allocation lives in the gap.
+/// not. It is enough for dlmalloc's own bookkeeping, which is tens of bytes —
+/// a request of exactly this size is served — and it is *not* enough to
+/// absorb an alignment: `memalign` pads by the alignment before asking for
+/// backing, so this size with a 4096-byte alignment asks the page source for
+/// 2,162,688 as well and is refused. Both figures are off the guest.
 ///
 /// Anything sized from outside the kernel must be refused above this rather
-/// than reaching the assert. `OwnedAlloc::new` enforces it for its own
-/// allocations; a bare `Vec::with_capacity` has to check.
+/// than reaching the allocator. `KernelAllocator::alloc` asserts it for every
+/// heap allocation, before it takes dlmalloc's lock, and `OwnedAlloc::new`
+/// refuses its own; a bare `Vec::with_capacity` sized from untrusted input
+/// still has to check, because the assert is a fail-fast for kernel bugs and
+/// not an error return.
 pub const MAX_HEAP_ALLOC: usize = PAGE_2M as usize - 4096;
 
 /// Whether an address is in the kernel's high-half direct map.

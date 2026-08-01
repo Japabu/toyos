@@ -48,6 +48,28 @@ static LOCK_ACROSS_SWITCH_ARMED: core::sync::atomic::AtomicBool =
 #[cfg(feature = "test-fatal-halt")]
 pub const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
 
+/// One kernel heap allocation of `bytes` at `align`, taken and released.
+/// `SYS_DEBUG` actions 5, 6 and 7 are its only callers.
+///
+/// Raw `alloc`/`dealloc` rather than a `Vec` that is immediately dropped:
+/// LLVM is allowed to delete a malloc/free pair whose result is never
+/// observed, and an actuator the optimiser can remove certifies nothing. The
+/// null return is reported rather than unwrapped for the same reason — a
+/// refusal and a success have to be distinguishable from userland.
+#[cfg(feature = "test-heap-ceiling")]
+fn debug_heap_alloc(bytes: usize, align: usize) -> u64 {
+    let Ok(layout) = core::alloc::Layout::from_size_align(bytes, align) else {
+        return SyscallError::InvalidArgument.to_u64();
+    };
+    let p = unsafe { alloc::alloc::alloc(layout) };
+    if p.is_null() {
+        return SyscallError::ResourceExhausted.to_u64();
+    }
+    unsafe { core::ptr::write_volatile(p, 1u8) };
+    unsafe { alloc::alloc::dealloc(p, layout) };
+    0
+}
+
 pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
@@ -511,6 +533,17 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                     );
                 }
             }
+            // Both sides of `mm::MAX_HEAP_ALLOC`, and the alignment corner
+            // between them. 5 must succeed, 6 must panic, and 7 — the same
+            // size page-aligned, which `memalign` pads past what one page can
+            // back — must come back as an error rather than as a panic taken
+            // inside the allocator's lock, which is what it used to be.
+            #[cfg(feature = "test-heap-ceiling")]
+            5 => debug_heap_alloc(crate::mm::MAX_HEAP_ALLOC, 8),
+            #[cfg(feature = "test-heap-ceiling")]
+            6 => debug_heap_alloc(crate::mm::PAGE_2M as usize, 8),
+            #[cfg(feature = "test-heap-ceiling")]
+            7 => debug_heap_alloc(crate::mm::MAX_HEAP_ALLOC, 4096),
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => {

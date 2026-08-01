@@ -50,6 +50,14 @@ test-double-fault = []
 # drive the ordinary fatal panic — the one path where the report reaches the
 # screen only because the panic handler captured it before draining the ring.
 test-late-panic = []
+# SYS_DEBUG actions 5, 6 and 7: one kernel heap allocation at
+# `mm::MAX_HEAP_ALLOC`, one a page over it, and one at the ceiling but
+# page-aligned. Ordinary code can still ask for more than one page backs — a
+# 65,537-entry tmpfs listing does — but every such route runs under the VFS
+# lock, so the panic strands that lock too and the allocator's own recovery
+# cannot be told apart from the filesystem's. These three hold nothing but the
+# allocator, which is the property under test. See `mm::MAX_HEAP_ALLOC`.
+test-heap-ceiling = []
 # The on-target half of the scheduler spec's invariants (spec §10.2, §10.5).
 # Turns on `toyos-sched/check`, which asserts container-vs-state-word agreement
 # and invariant T at the end of every scheduler pass, and asserts the pass

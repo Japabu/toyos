@@ -1,16 +1,36 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use super::MAX_HEAP_ALLOC;
 use super::PHYS_OFFSET;
 use super::PAGE_2M;
 use super::pmm;
 
+/// DESIGN RULE: nothing this type does may panic.
+///
+/// Every method here runs inside `KernelAllocator`'s `dlmalloc.lock()`, in the
+/// middle of dlmalloc mutating its own chunk and segment lists, and the kernel
+/// does not unwind — so a panic from in here abandons the heap in whatever
+/// state it was in, with the lock held forever. The CPU that recovers from
+/// that panic then spins `Lock::lock` on its next `alloc` or `free`, and the
+/// machine goes quiet.
+///
+/// So a size this source cannot back is a `null`, not an assert: dlmalloc
+/// hands the null back to the caller with its structures consistent, the lock
+/// drops, and whatever the caller does about it — `handle_alloc_error`, an
+/// `Option` — happens outside. The fail-fast for a caller asking the heap for
+/// page-scale memory is [`MAX_HEAP_ALLOC`], checked in `KernelAllocator::alloc`
+/// *before* the lock is taken.
+///
+/// `pmm::alloc_page` is the only thing reached from here, and it is
+/// panic-free by the same rule.
 struct KernelPageSource;
 
 unsafe impl dlmalloc::Allocator for KernelPageSource {
     fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
-        assert!(size <= PAGE_2M as usize,
-            "GlobalAlloc: dlmalloc asked for {} bytes — a caller is using alloc for page-scale memory", size);
+        if size > PAGE_2M as usize {
+            return (core::ptr::null_mut(), 0, 0);
+        }
         if let Some(page) = pmm::alloc_page(pmm::Category::KernelHeap) {
             let ptr = page.direct_map().as_mut_ptr::<u8>();
             core::mem::forget(page); // dlmalloc manages the lifetime
@@ -75,6 +95,26 @@ unsafe impl GlobalAlloc for KernelAllocator {
             _ => {
                 assert!(layout.align() < PAGE_2M as usize,
                     "GlobalAlloc: {:#x} bytes with {:#x} align — use PageAlloc", layout.size(), layout.align());
+                // Before the lock, deliberately. This is the ceiling every
+                // bound upstream of the heap is derived against, and it used
+                // to be enforced one level down in `KernelPageSource::alloc`
+                // — inside `dlmalloc.lock()`, which is where a panic costs
+                // the machine rather than the process.
+                //
+                // `MAX_HEAP_ALLOC` rather than whatever dlmalloc's padding
+                // happens to permit, so the documented number is the enforced
+                // number — the way `MAX_FDS` and `MAX_USER_STR` are at their
+                // own primitives. Measured: 2,097,152 asks the page source
+                // for 2,162,688, which it cannot back.
+                //
+                // Being past this is sufficient for a request to fail and not
+                // necessary, which is why the page source is total rather
+                // than merely unreachable: 2,093,056 with 4096-byte alignment
+                // satisfies the check and still asks for 2,162,688, because
+                // `memalign` pads by the alignment first.
+                assert!(layout.size() <= MAX_HEAP_ALLOC,
+                    "GlobalAlloc: {} bytes exceeds MAX_HEAP_ALLOC ({}) — a caller is using alloc for page-scale memory",
+                    layout.size(), MAX_HEAP_ALLOC);
                 let mut dlm = self.dlmalloc.lock();
                 dlm.malloc(layout.size(), layout.align())
             }
