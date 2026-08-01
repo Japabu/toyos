@@ -60,7 +60,14 @@ impl FileBacking for NvmeBacking {
             // Direct disk read — bypasses block page cache.
             // File cache is the sole cache for file data.
             let mut raw = [0u8; BLOCK_SIZE];
-            page_cache::raw_block_read(block, &mut raw);
+            // `buf` is already zeroed, so a failed read leaves the caller a
+            // hole rather than another file's data. `read_page` has no way to
+            // say more than that; the trait above it is the one that needs an
+            // error channel next.
+            if page_cache::raw_block_read(block, &mut raw).is_err() {
+                log!("file: read of block {block} failed; serving zeros");
+                return;
+            }
             let valid = BLOCK_SIZE.min((self.size - file_offset) as usize);
             buf[..valid].copy_from_slice(&raw[..valid]);
         }

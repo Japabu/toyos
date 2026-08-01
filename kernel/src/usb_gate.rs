@@ -86,7 +86,10 @@ pub fn run() {
 fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     let blocks = disk.block_count();
     let mut head = vec![0u8; BLOCK];
-    disk.read_blocks(0, 1, &mut head);
+    if disk.read_blocks(0, 1, &mut head).is_err() {
+        log!("usb-gate: disk {index} would not give up block 0");
+        return;
+    }
     if &head[..MAGIC.len()] != MAGIC {
         log!("usb-gate: disk {index} carries no stamp, leaving it alone");
         return;
@@ -112,7 +115,11 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     for index in HOST_BLOCKS {
         let block = at(blocks, index);
         buf.fill(0);
-        disk.read_blocks(block, 1, &mut buf);
+        if disk.read_blocks(block, 1, &mut buf).is_err() {
+            reads_ok = false;
+            log!("usb-gate: host block {block} could not be read");
+            continue;
+        }
         match first_bad(&buf, nonce, block) {
             None => log!("usb-gate: host block {block} verified"),
             Some((i, got, want)) => {
@@ -122,15 +129,27 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
         }
     }
 
+    // A read the device cannot serve, and the one assertion here that is about
+    // the *error channel* rather than about bytes. `BlockDevice` returned `()`
+    // until this landed, so a caller had no way to tell a refusal from data —
+    // which is precisely how a failed fill used to reach the page cache and be
+    // served under the block number it never held.
+    let past_end = disk.read_blocks(blocks, 1, &mut buf).is_err();
+    log!("usb-gate: read past the last block refused={past_end}");
+
     // The guest's own bytes are keyed on the inverted nonce, so the host can
     // tell what the guest wrote from what it wrote itself — and a driver that
     // returned the wrong block cannot pass by returning a block that happens to
     // hold the right kind of data.
     let guest_nonce = !nonce;
+    let mut writes_ok = true;
     for index in GUEST_BLOCKS {
         let block = at(blocks, index);
         fill(&mut buf, guest_nonce, block);
-        disk.write_blocks(block, 1, &buf);
+        if disk.write_blocks(block, 1, &buf).is_err() {
+            writes_ok = false;
+            log!("usb-gate: block {block} refused the write");
+        }
     }
 
     let mut run = vec![0u8; RUN_LEN as usize * BLOCK];
@@ -139,13 +158,21 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
         let at = i as usize * BLOCK;
         fill(&mut run[at..at + BLOCK], guest_nonce, block);
     }
-    disk.write_blocks(RUN_START, RUN_LEN, &run);
-    disk.flush();
+    if disk.write_blocks(RUN_START, RUN_LEN, &run).is_err() {
+        writes_ok = false;
+        log!("usb-gate: the {RUN_LEN}-block run refused the write");
+    }
+    if disk.flush().is_err() {
+        writes_ok = false;
+        log!("usb-gate: the disk refused to flush");
+    }
 
     let mut back = vec![0u8; RUN_LEN as usize * BLOCK];
-    disk.read_blocks(RUN_START, RUN_LEN, &mut back);
-    let mut writes_ok = true;
-    if back != run {
+    if disk.read_blocks(RUN_START, RUN_LEN, &mut back).is_err() {
+        writes_ok = false;
+        log!("usb-gate: the {RUN_LEN}-block run could not be read back");
+    }
+    if writes_ok && back != run {
         writes_ok = false;
         let at = back.iter().zip(&run).position(|(a, b)| a != b).unwrap_or(0);
         log!("usb-gate: readback of the {RUN_LEN}-block run differs at byte {at}");
@@ -153,7 +180,11 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     for index in GUEST_BLOCKS {
         let block = at(blocks, index);
         buf.fill(0);
-        disk.read_blocks(block, 1, &mut buf);
+        if disk.read_blocks(block, 1, &mut buf).is_err() {
+            writes_ok = false;
+            log!("usb-gate: block {block} could not be read back");
+            continue;
+        }
         if let Some((i, got, want)) = first_bad(&buf, guest_nonce, block) {
             writes_ok = false;
             log!("usb-gate: readback of block {block} differs at byte {i}: {got:#04x} not {want:#04x}");
@@ -161,7 +192,7 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     }
 
     log!(
-        "usb-gate: disk done reads={} writes={} healthy={}",
+        "usb-gate: disk done reads={} writes={} refusal={past_end} healthy={}",
         if reads_ok { "ok" } else { "bad" },
         if writes_ok { "ok" } else { "bad" },
         disk.healthy()

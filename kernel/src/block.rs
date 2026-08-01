@@ -1,24 +1,56 @@
 /// Unique identifier for a block device, used as page cache key.
 pub type DeviceId = u32;
 
+/// A transfer the device did not complete.
+///
+/// Deliberately not an enum. Above this trait there is exactly one thing to do
+/// with the answer — stop, and do not believe the buffer — while *why* it
+/// failed (which endpoint stalled, what the sense key was, whether the device
+/// answered at all) is in the driver's own log line, where it can be read. An
+/// enum here would be a vocabulary nothing matches on and every new driver
+/// would have to guess an arm from.
+///
+/// It is not `SyscallError` because none of that enum's nine variants means
+/// "the device did not do it", and inventing one is an ABI change. Nothing
+/// above this trait reports an I/O failure to userland yet — the filesystem
+/// boundary swallows it — so that conversion has no call site to be written
+/// against; known-issues carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockError;
+
+pub type BlockResult = Result<(), BlockError>;
+
 /// Block-oriented storage device interface.
 ///
 /// All I/O is in whole 4KB blocks. No byte-level addressing — that's the
 /// filesystem's job. The page cache sits between the filesystem and this trait.
+///
+/// Every method is fallible because every implementation is: an NVMe command
+/// carries a status, and a USB stick can stall, refuse, or be pulled out
+/// mid-transfer. When these returned `()` the NVMe driver discarded six
+/// completion statuses and the page cache filled a slot from a read that had
+/// not happened — which is worse than losing the data, because the slot was
+/// already labelled with the new block's number and the *previous tenant's*
+/// bytes were then served under it.
 pub trait BlockDevice: Send {
     fn device_id(&self) -> DeviceId;
     fn block_count(&self) -> u64;
 
     /// Read `count` contiguous blocks starting at `lba` into `buf`.
-    /// `buf.len()` must equal `count as usize * block_size() as usize`.
-    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]);
+    /// `buf.len()` must equal `count as usize * 4096`.
+    ///
+    /// On `Err` the contents of `buf` are whatever they were before the call.
+    #[must_use = "a failed read leaves the buffer holding whatever it held before"]
+    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> BlockResult;
 
     /// Write `count` contiguous blocks starting at `lba` from `buf`.
-    /// `buf.len()` must equal `count as usize * block_size() as usize`.
-    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]);
+    /// `buf.len()` must equal `count as usize * 4096`.
+    #[must_use = "a failed write did not reach the device"]
+    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> BlockResult;
 
     /// Flush any hardware write caches to persistent storage.
-    fn flush(&mut self);
+    #[must_use = "a failed flush means the writes before it are not durable"]
+    fn flush(&mut self) -> BlockResult;
 }
 
 /// How much of RAM the two caches above this trait may hold, in 4 KiB pages.

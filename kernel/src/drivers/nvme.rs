@@ -3,7 +3,7 @@ use core::sync::atomic::{fence, Ordering};
 use crate::mm::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
-use crate::block::{BlockDevice, DeviceId};
+use crate::block::{BlockDevice, BlockError, BlockResult, DeviceId};
 use crate::log;
 use crate::mm::KernelSlice;
 use crate::sync::Lock;
@@ -157,18 +157,30 @@ impl NvmeController {
         cid
     }
 
-    fn identify_controller(&mut self) {
+    /// An admin command, with the status the controller returned actually
+    /// looked at. Six calls here discarded it, so a controller that refused to
+    /// identify itself or to create a queue produced a driver that went on to
+    /// read whatever the DMA buffer held and derive a geometry from it.
+    fn admin(&mut self, cmd: SqEntry, what: &str) -> bool {
+        let status = self.admin.submit_and_wait(&self.bar, cmd);
+        if status != 0 {
+            log!("NVMe: {what} failed, status={status:#x}");
+            return false;
+        }
+        true
+    }
+
+    fn identify_controller(&mut self) -> bool {
         let dma = dma();
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_IDENTIFY as u32;
         cmd.prp1 = dma.phys() + OFF_IDENTIFY as u64;
         cmd.cdw10 = 1;
-        self.admin.submit_and_wait(&self.bar, cmd);
-        log!("NVMe: Identify Controller OK");
+        self.admin(cmd, "Identify Controller")
     }
 
-    fn create_io_cq(&mut self) {
+    fn create_io_cq(&mut self) -> bool {
         unsafe { write_bytes(self.io.cq as *mut u8, 0, QUEUE_DEPTH * core::mem::size_of::<CqEntry>()); }
         let dma = dma();
         let cid = self.alloc_cid();
@@ -177,10 +189,10 @@ impl NvmeController {
         cmd.prp1 = dma.phys() + OFF_IO_CQ as u64;
         cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1;
         cmd.cdw11 = 1;
-        self.admin.submit_and_wait(&self.bar, cmd);
+        self.admin(cmd, "Create I/O Completion Queue")
     }
 
-    fn create_io_sq(&mut self) {
+    fn create_io_sq(&mut self) -> bool {
         unsafe { write_bytes(self.io.sq as *mut u8, 0, QUEUE_DEPTH * core::mem::size_of::<SqEntry>()); }
         let dma = dma();
         let cid = self.alloc_cid();
@@ -189,10 +201,10 @@ impl NvmeController {
         cmd.prp1 = dma.phys() + OFF_IO_SQ as u64;
         cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1;
         cmd.cdw11 = (1 << 16) | 1;
-        self.admin.submit_and_wait(&self.bar, cmd);
+        self.admin(cmd, "Create I/O Submission Queue")
     }
 
-    fn identify_namespace(&mut self) {
+    fn identify_namespace(&mut self) -> bool {
         let dma = dma();
         let identify_ptr = dma.ptr_at(OFF_IDENTIFY);
         unsafe { write_bytes(identify_ptr, 0, 4096); }
@@ -202,7 +214,9 @@ impl NvmeController {
         cmd.nsid = 1;
         cmd.prp1 = dma.phys() + OFF_IDENTIFY as u64;
         cmd.cdw10 = 0;
-        self.admin.submit_and_wait(&self.bar, cmd);
+        if !self.admin(cmd, "Identify Namespace") {
+            return false;
+        }
 
         let ns = unsafe { &*(identify_ptr as *const IdentifyNamespace) };
         let fmt_idx = (ns.flbas & 0x0F) as usize;
@@ -227,11 +241,12 @@ impl NvmeController {
         self.sector_size = 1 << lba_ds;
         self.ns_size = ns.nsze;
         log!("NVMe: NS1 size={} sectors, sector_size={}", ns.nsze, self.sector_size);
+        true
     }
 
     /// Read `sector_count` contiguous sectors starting at `lba` into `buf`.
     /// Handles PRP list setup for multi-page transfers.
-    fn read_sectors(&mut self, lba: u64, sector_count: u32, buf: &mut [u8]) {
+    fn read_sectors(&mut self, lba: u64, sector_count: u32, buf: &mut [u8]) -> BlockResult {
         let total_bytes = sector_count as usize * self.sector_size as usize;
         assert!(buf.len() >= total_bytes);
         assert!(total_bytes <= MAX_DATA_PAGES * 4096);
@@ -259,12 +274,17 @@ impl NvmeController {
             cmd.prp2 = dma.phys() + OFF_PRP_LIST as u64;
         }
 
-        self.io.submit_and_wait(&self.bar, cmd);
+        let status = self.io.submit_and_wait(&self.bar, cmd);
+        if status != 0 {
+            log!("NVMe: read of {sector_count} sectors at {lba} failed, status={status:#x}");
+            return Err(BlockError);
+        }
 
         unsafe { copy_nonoverlapping(dma.ptr_at(OFF_DATA) as *const u8, buf.as_mut_ptr(), total_bytes); }
+        Ok(())
     }
 
-    fn write_sectors(&mut self, lba: u64, sector_count: u32, buf: &[u8]) {
+    fn write_sectors(&mut self, lba: u64, sector_count: u32, buf: &[u8]) -> BlockResult {
         let total_bytes = sector_count as usize * self.sector_size as usize;
         assert!(buf.len() >= total_bytes);
         assert!(total_bytes <= MAX_DATA_PAGES * 4096);
@@ -294,7 +314,12 @@ impl NvmeController {
             cmd.prp2 = dma.phys() + OFF_PRP_LIST as u64;
         }
 
-        self.io.submit_and_wait(&self.bar, cmd);
+        let status = self.io.submit_and_wait(&self.bar, cmd);
+        if status != 0 {
+            log!("NVMe: write of {sector_count} sectors at {lba} failed, status={status:#x}");
+            return Err(BlockError);
+        }
+        Ok(())
     }
 }
 
@@ -334,7 +359,7 @@ impl BlockDevice for NvmeBlockDevice {
     fn device_id(&self) -> DeviceId { self.id }
     fn block_count(&self) -> u64 { self.block_count }
 
-    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) {
+    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> BlockResult {
         assert_eq!(buf.len(), count as usize * 4096);
         let mut remaining = count;
         let mut block = lba;
@@ -346,15 +371,16 @@ impl BlockDevice for NvmeBlockDevice {
             let sector_count = batch * self.sectors_per_block;
             let bytes = batch as usize * 4096;
 
-            self.ctrl.read_sectors(sector_lba, sector_count, &mut buf[offset..offset + bytes]);
+            self.ctrl.read_sectors(sector_lba, sector_count, &mut buf[offset..offset + bytes])?;
 
             block += batch as u64;
             offset += bytes;
             remaining -= batch;
         }
+        Ok(())
     }
 
-    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) {
+    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> BlockResult {
         assert_eq!(buf.len(), count as usize * 4096);
         let mut remaining = count;
         let mut block = lba;
@@ -366,17 +392,19 @@ impl BlockDevice for NvmeBlockDevice {
             let sector_count = batch * self.sectors_per_block;
             let bytes = batch as usize * 4096;
 
-            self.ctrl.write_sectors(sector_lba, sector_count, &buf[offset..offset + bytes]);
+            self.ctrl.write_sectors(sector_lba, sector_count, &buf[offset..offset + bytes])?;
 
             block += batch as u64;
             offset += bytes;
             remaining -= batch;
         }
+        Ok(())
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self) -> BlockResult {
         // NVMe writes are synchronous (submit_and_wait), so data is on disk
         // after write_blocks returns. Nothing to flush.
+        Ok(())
     }
 }
 
@@ -435,10 +463,18 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<NvmeBlockDevice> {
         ns_size: 0,
     };
 
-    ctrl.identify_controller();
-    ctrl.create_io_cq();
-    ctrl.create_io_sq();
-    ctrl.identify_namespace();
+    // A controller that refuses any of these has not given the driver a
+    // namespace to serve. Going on regardless is what discarding the statuses
+    // amounted to: `identify_namespace` would read a zeroed DMA buffer and
+    // derive its geometry from it.
+    if !ctrl.identify_controller()
+        || !ctrl.create_io_cq()
+        || !ctrl.create_io_sq()
+        || !ctrl.identify_namespace()
+    {
+        log!("NVMe: controller did not come up; this machine has no NVMe storage");
+        return None;
+    }
 
     Some(NvmeBlockDevice::new(ctrl, 1))
 }

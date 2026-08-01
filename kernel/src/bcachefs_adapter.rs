@@ -14,19 +14,39 @@ use crate::vfs::FileSystem;
 /// BlockIO implementation that wraps the kernel's global PageCache.
 pub struct PageCacheBlockIO;
 
+/// `bcachefs::BlockIO` is infallible, so this is where a device error stops
+/// being propagated and has to become *something*.
+///
+/// Zeros, and a log line. Not stale bytes and not a panic: a panic hands a
+/// device the power to kill the kernel, and the previous tenant of a cache
+/// slot is a *valid* block that bcachefs would happily parse as the one it
+/// asked for. An all-zero block fails its structural checks instead, which is
+/// the difference between a mount that refuses and a filesystem that walks
+/// into somebody else's btree node.
+///
+/// Making `BlockIO` fallible is the real fix and it is a whole-crate change —
+/// sixteen call sites inside `bcachefs`, every one of them in a function that
+/// returns something other than a `Result` today. Filed, not done here.
 impl BlockIO for PageCacheBlockIO {
     fn read_block(&self, block: BlockNum, buf: &mut BlockBuf) {
         let mut guard = page_cache::lock();
         let (cache, dev) = guard.cache_and_dev();
-        let page = cache.read(dev, block.raw());
-        buf.as_bytes_mut().copy_from_slice(page);
+        match cache.read(dev, block.raw()) {
+            Ok(page) => buf.as_bytes_mut().copy_from_slice(page),
+            Err(_) => {
+                log!("bcachefs: read of block {} failed; serving zeros", block.raw());
+                buf.as_bytes_mut().fill(0);
+            }
+        }
     }
 
     fn write_block(&self, block: BlockNum, buf: &BlockBuf) {
         let mut guard = page_cache::lock();
         let (cache, dev) = guard.cache_and_dev();
-        let page = cache.write_new(dev, block.raw());
-        page.copy_from_slice(buf.as_bytes());
+        match cache.write_new(dev, block.raw()) {
+            Ok(page) => page.copy_from_slice(buf.as_bytes()),
+            Err(_) => log!("bcachefs: block {} could not be cached; write dropped", block.raw()),
+        }
     }
 
     fn block_count(&self) -> u64 {
@@ -37,7 +57,9 @@ impl BlockIO for PageCacheBlockIO {
     fn sync(&self) {
         let mut guard = page_cache::lock();
         let (cache, dev) = guard.cache_and_dev();
-        cache.sync(dev);
+        if cache.sync(dev).is_err() {
+            log!("bcachefs: sync did not reach the device");
+        }
     }
 }
 
@@ -186,7 +208,7 @@ impl FileSystem for BcacheFsAdapter {
         let info = self.open_files.get_mut(&file_id).ok_or("file not open")?;
         let block = self.fs.resolve_or_alloc_block(&mut info.extents, page_idx)
             .map_err(|_| "block allocation failed")?;
-        page_cache::raw_block_write(block, data);
+        page_cache::raw_block_write(block, data).map_err(|_| "block write failed")?;
         Ok(())
     }
 
@@ -385,7 +407,12 @@ fn designated() -> bool {
     let mut guard = page_cache::lock();
     let blocks = guard.block_count();
     let (cache, dev) = guard.cache_and_dev();
-    let block0 = cache.read(dev, 0);
+    // A disk whose block 0 cannot be read has not said this kernel may format
+    // it, and a read error is the least convincing consent there is.
+    let Ok(block0) = cache.read(dev, 0) else {
+        log!("storage: block 0 could not be read; this disk is not ours to format");
+        return false;
+    };
 
     let magic = bcachefs::DESIGNATION_MAGIC;
     if block0.len() < bcachefs::DESIGNATION_BLOCKS_OFFSET + 8

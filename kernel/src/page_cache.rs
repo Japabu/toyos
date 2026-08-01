@@ -3,7 +3,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use crate::block::{self, BlockDevice, DeviceId};
+use crate::block::{self, BlockDevice, BlockError, BlockResult, DeviceId};
 use crate::sync::Lock;
 
 // Separate locks: device I/O and cache data structures.
@@ -58,20 +58,26 @@ impl core::ops::DerefMut for PageCacheGuard {
 /// Read a block directly from disk, bypassing the cache.
 /// Locks only the device — no contention with metadata cache operations.
 /// Used by NvmeBacking for file data reads (file cache is the sole data cache).
-pub fn raw_block_read(block: u64, buf: &mut [u8; 4096]) {
+#[must_use = "a failed read leaves the buffer holding whatever it held before"]
+pub fn raw_block_read(block: u64, buf: &mut [u8; 4096]) -> BlockResult {
     let mut dev = BLOCK_DEV.lock();
     let dev = dev.as_mut().expect("block device not initialized");
-    dev.read_blocks(block, 1, buf);
+    dev.read_blocks(block, 1, buf)
 }
 
 /// Write a block directly to disk, bypassing the cache.
 /// Locks only the device.
 /// Used by filesystem write_page for file data writeback.
-pub fn raw_block_write(block: u64, buf: &[u8; 4096]) {
+#[must_use = "a failed write did not reach the device"]
+pub fn raw_block_write(block: u64, buf: &[u8; 4096]) -> BlockResult {
     let mut dev = BLOCK_DEV.lock();
     let dev = dev.as_mut().expect("block device not initialized");
-    dev.write_blocks(block, 1, buf);
+    dev.write_blocks(block, 1, buf)
 }
+
+/// The block number of a slot that names nothing — see [`PageCache::unbind`].
+/// No device can have this block: `block_count` is a byte count over 4096.
+const NO_BLOCK: u64 = u64::MAX;
 
 /// Pages per chunk. 256 pages = 1MB per chunk allocation.
 const PAGES_PER_CHUNK: usize = 256;
@@ -133,7 +139,12 @@ impl PageCache {
         self.block_to_slot.capacity()
     }
 
-    fn alloc_slot(&mut self, dev: &mut dyn BlockDevice, block: u64) -> u32 {
+    /// A slot bound to `block`, or `None` when nothing could be freed for it.
+    ///
+    /// `None` is reachable only when every resident slot is dirty *and* the
+    /// write-back that would clean them failed, which is a device error and
+    /// not the fail-fast this used to be.
+    fn alloc_slot(&mut self, dev: &mut dyn BlockDevice, block: u64) -> Option<u32> {
         let slot = if self.slot_to_block.len() < self.max_slots {
             let slot = self.slot_to_block.len() as u32;
             self.slot_to_block.push(block);
@@ -150,7 +161,7 @@ impl PageCache {
             }
             slot
         } else {
-            let slot = self.take_victim(dev);
+            let slot = self.take_victim(dev)?;
             self.block_to_slot.remove(&self.slot_to_block[slot as usize]);
             self.slot_to_block[slot as usize] = block;
             self.dirty[slot as usize] = false;
@@ -167,7 +178,22 @@ impl PageCache {
         };
         self.referenced[slot as usize] = true;
         self.block_to_slot.insert(block, slot);
-        slot
+        Some(slot)
+    }
+
+    /// Undo a binding whose fill never happened.
+    ///
+    /// The slot still holds the evicted block's bytes, so the one thing that
+    /// must not survive is the *label*. With the index entry gone and the slot
+    /// naming nothing, the next reader misses and asks the device again
+    /// instead of being handed the previous tenant's data under the new
+    /// number — which is what a discarded read status used to produce, and it
+    /// parses, because it is a real block.
+    fn unbind(&mut self, slot: u32, block: u64) {
+        self.block_to_slot.remove(&block);
+        self.slot_to_block[slot as usize] = NO_BLOCK;
+        self.dirty[slot as usize] = false;
+        self.referenced[slot as usize] = false;
     }
 
     /// Free a slot for reuse, writing back first if that is what it takes.
@@ -176,15 +202,18 @@ impl PageCache {
     /// filesystem has no journal and `sync` already commits every dirty slot
     /// in whatever order the block numbers fall, so eviction can only reorder
     /// writes that were never ordered.
-    fn take_victim(&mut self, dev: &mut dyn BlockDevice) -> u32 {
+    fn take_victim(&mut self, dev: &mut dyn BlockDevice) -> Option<u32> {
         if let Some(slot) = self.clock_pick() {
-            return slot;
+            return Some(slot);
         }
         // Every resident block is dirty. One coalesced write-back is the same
         // work unmount does and turns the whole cache clean, so the next scan
-        // cannot fail.
-        self.sync(dev);
-        self.clock_pick().expect("page cache: no clean slot after a full write-back")
+        // cannot fail — unless the device refused the write-back, in which
+        // case the slots that stayed dirty are the ones this cannot have.
+        if self.sync(dev).is_err() {
+            log!("page cache: write-back failed; no slot could be freed");
+        }
+        self.clock_pick()
     }
 
     /// CLOCK second chance over clean slots. Two revolutions: the first can
@@ -225,31 +254,38 @@ impl PageCache {
         self.block_to_slot.get(&block).copied()
     }
 
-    pub fn read(&mut self, dev: &mut dyn BlockDevice, block: u64) -> &[u8] {
+    pub fn read(&mut self, dev: &mut dyn BlockDevice, block: u64) -> Result<&[u8], BlockError> {
         if let Some(slot) = self.slot_of(block) {
             self.referenced[slot as usize] = true;
-            return self.slot_data(slot);
+            return Ok(self.slot_data(slot));
         }
-        let slot = self.alloc_slot(dev, block);
+        let slot = self.alloc_slot(dev, block).ok_or(BlockError)?;
         let page = self.slot_data_mut(slot);
-        dev.read_blocks(block, 1, page);
-        self.slot_data(slot)
+        if let Err(e) = dev.read_blocks(block, 1, page) {
+            self.unbind(slot, block);
+            return Err(e);
+        }
+        Ok(self.slot_data(slot))
     }
 
-    pub fn write_new(&mut self, dev: &mut dyn BlockDevice, block: u64) -> &mut [u8] {
+    pub fn write_new(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        block: u64,
+    ) -> Result<&mut [u8], BlockError> {
         let slot = match self.slot_of(block) {
             Some(slot) => {
                 self.referenced[slot as usize] = true;
                 slot
             }
-            None => self.alloc_slot(dev, block),
+            None => self.alloc_slot(dev, block).ok_or(BlockError)?,
         };
         self.dirty[slot as usize] = true;
         let page = self.slot_data_mut(slot);
         // A reused slot still holds the evicted block's bytes, and the caller
         // is entitled to a blank block.
         page.fill(0);
-        page
+        Ok(page)
     }
 
     /// Write every dirty slot back, coalescing runs of consecutive blocks.
@@ -257,17 +293,18 @@ impl PageCache {
     /// The run walks slots rather than block numbers, so the write-back needs
     /// no index lookups at all — `slot_to_block` is the direction this pass
     /// wants, and the index is the wrong way round for it.
-    pub fn sync(&mut self, dev: &mut dyn BlockDevice) {
+    pub fn sync(&mut self, dev: &mut dyn BlockDevice) -> BlockResult {
         let mut pending: Vec<u32> = (0..self.slot_to_block.len() as u32)
             .filter(|&s| self.dirty[s as usize])
             .collect();
 
         if pending.is_empty() {
-            return;
+            return Ok(());
         }
         pending.sort_unstable_by_key(|&s| self.slot_to_block[s as usize]);
 
         let mut buf = vec![0u8; 32 * 4096];
+        let mut failed = false;
         let mut i = 0;
         while i < pending.len() {
             let start = self.slot_to_block[pending[i] as usize];
@@ -285,15 +322,29 @@ impl PageCache {
                 buf[j * 4096..(j + 1) * 4096].copy_from_slice(page);
             }
 
-            dev.write_blocks(start, count as u32, &buf[..count * 4096]);
-
-            for j in 0..count {
-                self.dirty[pending[i + j] as usize] = false;
+            // A run that did not land stays dirty, so a later sync tries it
+            // again and `take_victim` will not hand the slot to another block.
+            // Carrying on with the remaining runs is deliberate: one bad run
+            // is not a reason to leave the rest of the cache unwritten.
+            match dev.write_blocks(start, count as u32, &buf[..count * 4096]) {
+                Ok(()) => {
+                    for j in 0..count {
+                        self.dirty[pending[i + j] as usize] = false;
+                    }
+                }
+                Err(_) => {
+                    log!("page cache: write-back of {count} blocks at {start} failed");
+                    failed = true;
+                }
             }
 
             i += count;
         }
 
-        dev.flush();
+        if dev.flush().is_err() {
+            log!("page cache: flush failed; the write-back above is not durable");
+            failed = true;
+        }
+        if failed { Err(BlockError) } else { Ok(()) }
     }
 }

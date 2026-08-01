@@ -7,7 +7,7 @@
 //! geometry the device reported, so the controller lock is taken per operation
 //! and never held across one.
 
-use crate::block::{BlockDevice, DeviceId};
+use crate::block::{BlockDevice, BlockError, BlockResult, DeviceId};
 use crate::log;
 use super::xhci;
 
@@ -42,14 +42,11 @@ pub struct UsbBlockDevice {
 }
 
 impl UsbBlockDevice {
-    /// Whether the last operation left the disk unusable.
+    /// Whether the controller still has a disk under this index at all.
     ///
-    /// [`BlockDevice`] has no error channel — `read_blocks` returns `()` — so a
-    /// transfer that fails can only log and leave the caller's buffer alone.
-    /// That is survivable for a device the kernel owns and wrong for one a user
-    /// can pull out mid-write; the trait is what has to change, and it is filed
-    /// rather than changed here because NVMe, the page cache and bcachefs all
-    /// sit on the current shape.
+    /// Distinct from a failed transfer, which the trait reports: this answers
+    /// "is there still something there", which is what a caller asks after a
+    /// run of failures.
     pub fn healthy(&self) -> bool {
         xhci::storage_geometry(self.index).is_some_and(|g| g.blocks > 0)
     }
@@ -64,21 +61,27 @@ impl BlockDevice for UsbBlockDevice {
         self.blocks
     }
 
-    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) {
-        if !xhci::storage_read(self.index, lba, count, buf) {
-            log!("usb-storage: read of {count} blocks at {lba} failed on disk {}", self.index);
+    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> BlockResult {
+        if xhci::storage_read(self.index, lba, count, buf) {
+            return Ok(());
         }
+        log!("usb-storage: read of {count} blocks at {lba} failed on disk {}", self.index);
+        Err(BlockError)
     }
 
-    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) {
-        if !xhci::storage_write(self.index, lba, count, buf) {
-            log!("usb-storage: write of {count} blocks at {lba} failed on disk {}", self.index);
+    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> BlockResult {
+        if xhci::storage_write(self.index, lba, count, buf) {
+            return Ok(());
         }
+        log!("usb-storage: write of {count} blocks at {lba} failed on disk {}", self.index);
+        Err(BlockError)
     }
 
-    fn flush(&mut self) {
-        if !xhci::storage_flush(self.index) {
-            log!("usb-storage: cache flush failed on disk {}", self.index);
+    fn flush(&mut self) -> BlockResult {
+        if xhci::storage_flush(self.index) {
+            return Ok(());
         }
+        log!("usb-storage: cache flush failed on disk {}", self.index);
+        Err(BlockError)
     }
 }
