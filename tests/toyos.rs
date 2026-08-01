@@ -1817,13 +1817,14 @@ fn run_machine_test(
             // that nothing in the kernel panicked on the way: the process
             // exiting 0 says its own syscalls returned, not that some other
             // CPU stayed up.
-            for (what, text) in [("boot", &boot), ("run", &result.serial)] {
-                for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
-                    if text.contains(bad) {
-                        return Err(format!("{bad:?} during {what}:\n{text}"));
-                    }
-                }
-            }
+            //
+            // Two captures, two `Serial`s rather than one with the second
+            // pushed into it: concatenating them would let the boot half's
+            // kernel lines vouch for the run half's liveness, which is the
+            // vacuum this is being converted out of. Measured: the run window
+            // carries 14 kernel lines of its own.
+            serial::Serial::named("boot console", boot).must_be_clean()?;
+            serial::Serial::named("test serial", result.serial.as_str()).must_be_clean()?;
             eprintln!("  [va] {}", result.stdout.trim());
             Ok(())
         }
