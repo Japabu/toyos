@@ -520,7 +520,18 @@ fn execute(action: Action<KernelPayload>) {
                 // trip round the idle loop always satisfies it. What would spin
                 // a CPU is something on the *pass* path logging unconditionally
                 // — which would also flood the ring, so it is already a bug.
-                || crate::drivers::log_ring::has_pending();
+                || crate::drivers::log_ring::has_pending()
+                // A CPU with nothing left to run is the moment the i8042's
+                // "the pin has never asserted" verdict stops being premature:
+                // before it, silence only says the boot is still busy. A
+                // wall-clock deadline cannot serve, because the driver is only
+                // reached from inside a pass and the machine the verdict exists
+                // for reaches `Boot: complete` and then has nothing to do — so
+                // no pass would run to notice the deadline and the line would
+                // never appear at all. Self-clearing on the same argument as the
+                // ring above: the next pass emits the line and moves the state
+                // on, so this costs one trip round the loop and never a spin.
+                || crate::drivers::i8042::verdict_due();
             if awake {
                 unsafe { asm!("sti", options(nomem, nostack)) };
                 drop(token);

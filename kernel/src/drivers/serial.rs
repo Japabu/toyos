@@ -61,6 +61,16 @@ pub fn uart_present() -> bool {
     UART_PRESENT.load(Ordering::Relaxed)
 }
 
+/// Whether the log ring has anywhere to go. False is the T14's shape: the ring
+/// still fills and still holds its tail, but nothing drains it off the machine,
+/// so the framebuffer is the only surface a diagnostic can reach.
+///
+/// The predicate a caller wants before falling back to the screen, and the same
+/// one [`panic_flush`] refuses on.
+pub fn has_console() -> bool {
+    uart_present() || super::virtio_console::is_ready()
+}
+
 // Backend access — slow path, used by drain / input / panic.
 
 static BACKEND_LOCKED: AtomicBool = AtomicBool::new(false);
@@ -203,7 +213,7 @@ pub unsafe fn panic_flush() {
     // second. The report is then gone from the one place still holding it,
     // the on-screen console included. This has to be checked before the
     // locked path, not after: that path is the common one.
-    if !uart_present() && !super::virtio_console::is_ready() {
+    if !has_console() {
         return;
     }
     for _ in 0..PANIC_LOCK_SPIN_LIMIT {

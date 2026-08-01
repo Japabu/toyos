@@ -21,6 +21,11 @@ i8042-trace = []
 # quarantine path runs. A controller that chatters forever is the one case the
 # bound alone still lets livelock a CPU, and nothing else can stage it.
 i8042-fault = []
+# Set the i8042 probe's whole init budget to zero, so its expiry paths run on a
+# controller that is answering perfectly. QEMU answers every step in
+# microseconds — the whole probe measures 0.099 s to 0.100 s on a metal-sim
+# boot — and no real EC has ever been timed, so nothing else can reach them.
+i8042-budget-expired = []
 # Script the input core directly at end of boot. QEMU activates one input
 # handler per device class, so two keyboards or two pointers can never both be
 # live in a guest — the merge has no end-to-end test and this is its only one.
@@ -30,6 +35,10 @@ test-input-merge = []
 # `nec-usb-xhci,slots=N` does not reach HCSPARAMS1 and its Enable Slot ignores
 # the MaxSlotsEn a driver writes, so nothing on the host side can stage it.
 xhci-one-slot = []
+# Run the xHCI extended-capability walk over eight malformed lists at init.
+# The list comes from firmware and QEMU's controller publishes none at all, so
+# without this the bounds in `xhci/legacy.rs` would ship never having executed.
+xhci-xecp-selftest = []
 # Read and write every USB disk that carries the gate's stamp in block 0, at
 # the end of the peripheral phase. A raw block device has no path to userland,
 # so the kernel is the only in-guest actor that can drive one — and the stamp,

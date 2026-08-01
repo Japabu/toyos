@@ -47,7 +47,7 @@
 //! ISR already executing nor a vector already latched in that CPU's LAPIC, and
 //! an edge asserted on a masked edge-triggered entry is dropped outright.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use toyos_ps2::{KeyDecoder, KeyOutcome, MouseDecoder, MouseOutcome};
 
@@ -100,6 +100,18 @@ static DROPPED: AtomicU32 = AtomicU32::new(0);
 static KEYBOARD_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 static AUX_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// Times the pin has actually asserted. The ISR's only bookkeeping, and the
+/// one number that answers the question `init`'s success line cannot: that
+/// line says the driver armed the line, not that anything ever came back over
+/// it.
+///
+/// Entries and not bytes, deliberately. `handler_poll` puts bytes in the ring
+/// from `init` with interrupts off, so a byte count cannot tell a delivered
+/// interrupt from a byte that was already sitting in the output buffer — which
+/// is exactly the confusion this counter exists to remove.
+static IRQS: AtomicU32 = AtomicU32::new(0);
+static RX_BYTES: AtomicU32 = AtomicU32::new(0);
+
 /// The CPU the vector is pinned to. Two things are only true there: the ISR is
 /// the sole reader of port 0x60, and an `irq_ring` record for this source can
 /// exist at all (records are strictly per-CPU). Both are load-bearing below.
@@ -107,6 +119,133 @@ static IRQ_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 
 fn is_irq_cpu() -> bool {
     IRQ_CPU.load(Ordering::Relaxed) == crate::arch::percpu::cpu_id()
+}
+
+// The health verdict.
+//
+// `init` reports what it did; nothing reported what happened afterwards. A
+// driver that armed the pin and then never received a byte said one green line
+// at 0.1 s and nothing ever again, which on a machine whose only channel is the
+// panel is indistinguishable from a driver that is working and a user who has
+// not typed. Both transitions out of that state are now stated out loud.
+//
+// Neither is a poll, and neither can be silently dropped:
+//
+// - The **first interrupt** is reported by the pass that interrupt schedules.
+//   It cannot be missed, because the event being reported is what causes the
+//   report to run.
+// - The **quiet verdict** is reported from the first pass that finds a CPU with
+//   nothing left to run (`verdict_due`, wired into the idle loop's pre-halt
+//   check). A wall-clock deadline was the obvious alternative and it is the
+//   wrong one: `service` only runs inside a scheduler pass, so on the machine
+//   this exists for — a diagnostic boot that reaches `Boot: complete` and then
+//   has nothing to do — no pass would run to notice the deadline and the line
+//   would simply never appear. "The machine has gone still" is also the moment
+//   the statement first means anything: before it, "nothing has arrived" only
+//   says the boot is still busy.
+//
+// The cost is one relaxed load per scheduler pass and one per idle entry, both
+// of which fall to a single load-and-compare for the life of the boot once the
+// verdict is out.
+
+/// `init` never armed the pin, so there is nothing to say.
+const HEALTH_OFF: u8 = 0;
+/// Armed and watching.
+const HEALTH_ARMED: u8 = 1;
+/// A CPU has run out of work; the quiet verdict is owed and one more pass will
+/// emit it.
+const HEALTH_QUIET_DUE: u8 = 2;
+/// The quiet verdict is out. Still watching, because an interrupt that arrives
+/// afterwards — the owner finally pressing a key — is the answer.
+const HEALTH_QUIET_SAID: u8 = 3;
+/// Nothing further to report.
+const HEALTH_DONE: u8 = 4;
+
+static HEALTH: AtomicU8 = AtomicU8::new(HEALTH_OFF);
+static ARMED_NS: AtomicU64 = AtomicU64::new(0);
+
+fn claim_health(from: u8, to: u8) -> bool {
+    HEALTH
+        .compare_exchange(from, to, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Called from the idle loop with interrupts off, before a CPU halts: pure
+/// atomics, no lock, no port I/O.
+///
+/// `true` keeps that CPU awake for exactly one more pass, which is what emits
+/// the verdict — the same self-clearing shape as the log ring's pre-halt check
+/// beside it. It cannot spin: the pass moves the state on, and an inactive
+/// driver (quarantined, or one `init` never armed) answers `false` outright, so
+/// no path leaves a CPU awake for a report nobody will make.
+pub fn verdict_due() -> bool {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    match HEALTH.load(Ordering::Relaxed) {
+        HEALTH_ARMED => {
+            claim_health(HEALTH_ARMED, HEALTH_QUIET_DUE);
+            true
+        }
+        HEALTH_QUIET_DUE => true,
+        _ => false,
+    }
+}
+
+fn millis_since_boot() -> u64 {
+    crate::clock::nanos_since_boot() / 1_000_000
+}
+
+/// Say once whether the armed pin has ever asserted. Runs in thread context
+/// from `service`, on whichever CPU took the pass; the compare-exchange is what
+/// keeps two CPUs from both reporting.
+fn report_health(state: u8) {
+    let irqs = IRQS.load(Ordering::Relaxed);
+    if irqs > 0 {
+        if claim_health(state, HEALTH_DONE) {
+            log!(
+                "i8042: the pin asserts — {} interrupts, {} bytes, {} keys, {} motion, first seen at {}ms",
+                irqs,
+                RX_BYTES.load(Ordering::Relaxed),
+                KBD_EVENTS.load(Ordering::Relaxed),
+                AUX_EVENTS.load(Ordering::Relaxed),
+                millis_since_boot()
+            );
+            to_screen();
+        }
+        return;
+    }
+    if state == HEALTH_QUIET_DUE && claim_health(HEALTH_QUIET_DUE, HEALTH_QUIET_SAID) {
+        log!(
+            "i8042: armed at {}ms, idle at {}ms, 0 interrupts — the pin has never asserted (kbd GSI {}, aux GSI {})",
+            ARMED_NS.load(Ordering::Relaxed) / 1_000_000,
+            millis_since_boot(),
+            KEYBOARD_GSI.load(Ordering::Relaxed) as i64,
+            AUX_GSI.load(Ordering::Relaxed) as i64
+        );
+        to_screen();
+    }
+}
+
+/// Put the verdict on the panel as well as in the log ring, and only on a
+/// machine that has nowhere else to put it.
+///
+/// The ring is the primary channel and the permanent one: it is what a serial
+/// console carries today and what any later log sink drains. This is the
+/// fallback for the machine the panic console was built for in the first place
+/// — no UART, no virtio-console — and `panic_flush` declines on exactly the
+/// same test. Repainting over a working console would cost a screenful and the
+/// full framebuffer write for a line the owner can already read.
+///
+/// Best-effort by construction: `boot_checkpoint` returns without painting once
+/// userland claims the framebuffer, so on an image that starts a compositor
+/// this does nothing. That is what `diag/system.toml` exists to avoid and it is
+/// not this driver's to solve.
+fn to_screen() {
+    if crate::drivers::serial::has_console() {
+        return;
+    }
+    crate::drivers::panic_console::boot_checkpoint();
 }
 
 /// The decoder saw a device reset. Handled on `IRQ_CPU`, whichever CPU noticed.
@@ -190,6 +329,7 @@ fn buffer_full(status: u8) -> bool {
 /// Rust half of the pin-interrupt handler. Read the module doc before adding
 /// anything to it.
 pub extern "sysv64" fn handler() {
+    IRQS.fetch_add(1, Ordering::Relaxed);
     let timestamp = crate::clock::nanos_since_boot();
     let mut n = 0;
     while n < ISR_BURST {
@@ -242,9 +382,21 @@ pub fn service() {
     }
     // Unconditional, not gated on `recorded`: this is what detects a lost
     // edge and what heals it in the same pass.
-    if !has_bytes() {
-        return;
+    if has_bytes() {
+        service_bytes(recorded);
     }
+    // Last, so the line it may print counts the bytes this pass just decoded.
+    // Reported from the top, the first interrupt's own pass said `2 interrupts,
+    // 0 bytes` — true at the instant it was read and useless to read.
+    let health = HEALTH.load(Ordering::Relaxed);
+    if health != HEALTH_DONE {
+        report_health(health);
+    }
+}
+
+/// Decode what the ISR left in the ring and wake whoever it belongs to.
+/// `recorded` is whether this pass found an `irq_ring` record for the source.
+fn service_bytes(recorded: bool) {
     // Only `IRQ_CPU` can hold a record for this source, so only `IRQ_CPU` can
     // read anything into its absence. On any other CPU `!recorded` is a fact
     // about `irq_ring`'s per-CPU shape, and counting it there reported a lost
@@ -364,6 +516,7 @@ fn drain() -> Drained {
 
     KBD_EVENTS.fetch_add(out.keys as u32, Ordering::Relaxed);
     AUX_EVENTS.fetch_add(out.motion as u32, Ordering::Relaxed);
+    RX_BYTES.fetch_add(out.bytes as u32, Ordering::Relaxed);
     out
 }
 
@@ -372,6 +525,9 @@ fn drain() -> Drained {
 fn quarantine() {
     QUARANTINE.store(false, Ordering::Relaxed);
     ACTIVE.store(false, Ordering::Relaxed);
+    // The line below carries the same counters the health verdict would, and
+    // the pin is about to be masked, so there is nothing left for it to say.
+    HEALTH.store(HEALTH_DONE, Ordering::Relaxed);
     // Whatever was down stays down otherwise: no further report can arrive to
     // lift it, and the pointer merge republishes it on every other pointer's
     // motion for the rest of the boot.
@@ -421,12 +577,68 @@ fn deadline(millis: u64) -> u64 {
     crate::clock::nanos_since_boot() + millis * 1_000_000
 }
 
-/// A stage's own deadline, never past the whole probe's. Each stage's number is
-/// what that step is worth waiting *from here*; the budget is what the boot is
-/// worth spending in total, and without the clamp the stages add up instead of
-/// fitting inside it.
-fn stage(millis: u64, budget: u64) -> u64 {
-    deadline(millis).min(budget)
+/// Everything that is not inside a named stage draws on this: the initial
+/// disable and flush, the config read-modify-write and its read-back, both
+/// interface tests, and the arming write at the end. Each is a controller
+/// command with no PS/2 device behind it, so none of them waits on an EC's
+/// firmware — but the time is still spent, and leaving it out of the total is
+/// what made the total wrong.
+///
+/// An allowance, not a measurement. No real EC has ever been timed here, in
+/// either direction.
+const CONTROLLER_MS: u64 = 250;
+/// `0xAA`. A machine with no controller reads 0xFF from a floating bus and
+/// every status bit reads set, so this wait is what separates "controller"
+/// from "nothing".
+const SELFTEST_MS: u64 = 500;
+/// `0xF5`, `0xF0 0x02`, the `0xF0 0x00` read-back and `0xF4`, each acknowledged
+/// by the keyboard itself rather than by the controller.
+const KEYBOARD_MS: u64 = 750;
+/// The aux port's `0xFF` is a *device reset*: a real PS/2 device answers it
+/// with a self-test that takes real time, which is why this stage is the one
+/// that must not be shortened to make an arithmetic error go away.
+const AUX_RESET_MS: u64 = 600;
+
+/// Derived, never written down independently.
+///
+/// It used to be a literal 1500 against stages summing to 1850, so a machine
+/// slow enough to use a meaningful fraction of each stage ran out of budget
+/// with the arming write still to come — and every wait after that returned
+/// immediately, making a *timeout* present as `DISABLED — cfg … did not take`,
+/// a controller fault. Deriving the total is what makes that disagreement
+/// unrepresentable; naming the stage that ran out is what makes the remaining
+/// case legible. The direction of the fix is forced: each stage number is what
+/// that step is worth waiting *from here*, so shrinking one silently shortens a
+/// real device's wait, and the aux reset's is the last one to touch.
+#[cfg(not(feature = "i8042-budget-expired"))]
+const INIT_BUDGET_MS: u64 = CONTROLLER_MS + SELFTEST_MS + KEYBOARD_MS + AUX_RESET_MS;
+/// Spend the whole budget before the probe starts, so the expiry paths run on a
+/// controller that is answering perfectly. QEMU answers every step in
+/// microseconds and no real EC timing has ever been taken, so nothing else can
+/// reach them.
+#[cfg(feature = "i8042-budget-expired")]
+const INIT_BUDGET_MS: u64 = 0;
+
+/// A stage's own deadline, never past the whole probe's — and `None` when the
+/// probe's is already spent.
+///
+/// The clamp alone cannot say *why* a step gave up. With the budget gone every
+/// `wait_writable` and `read_data` below returns immediately, so a slow EC
+/// produces the log line a broken controller produces. On a machine that cannot
+/// be single-stepped, naming the stage that ran out is the whole difference
+/// between "your firmware is slow" and "your controller is broken".
+fn stage(millis: u64, budget: u64, name: &str) -> Option<u64> {
+    if crate::clock::nanos_since_boot() >= budget {
+        log!(
+            "i8042: {INIT_BUDGET_MS}ms init budget spent before the {name} stage — no PS/2 input"
+        );
+        return None;
+    }
+    Some(deadline(millis).min(budget))
+}
+
+fn budget_spent(budget: u64) -> bool {
+    crate::clock::nanos_since_boot() >= budget
 }
 
 fn wait_writable(deadline: u64) -> bool {
@@ -597,9 +809,10 @@ pub fn init(rsdp_addr: u64) {
     }
 
     // The whole probe, from the first port touch to the last. Every stage
-    // clamps to it, so a machine whose EC answers everything slowly costs the
-    // boot this and not the sum of the stages.
-    let budget = deadline(1500);
+    // clamps to it, and it is the sum of the stages plus what the controller
+    // steps between them are allowed, so no machine can spend it before the
+    // last stage has had its own.
+    let budget = deadline(INIT_BUDGET_MS);
 
     // Firmware may leave scanning on. A keystroke arriving mid-handshake
     // makes the config read return a scancode and everything after garbage.
@@ -634,12 +847,14 @@ pub fn init(rsdp_addr: u64) {
     // On a machine with no controller `inb(0x64)` returns 0xFF from a
     // floating bus and every status bit reads set. The self-test is what
     // separates "controller" from "nothing".
-    let selftest_deadline = stage(500, budget);
+    let Some(selftest_deadline) = stage(SELFTEST_MS, budget, "self-test") else {
+        return;
+    };
     command(CMD_SELF_TEST, selftest_deadline);
     match read_data(selftest_deadline) {
         Some(0x55) => {}
         other => {
-            log!("i8042: absent (self-test {:?}, 500ms) — no PS/2 input", other);
+            log!("i8042: absent (self-test {:?}, {SELFTEST_MS}ms) — no PS/2 input", other);
             return;
         }
     }
@@ -654,7 +869,7 @@ pub fn init(rsdp_addr: u64) {
     }
     // Enabling port 2 clears its clock-disable bit iff the port exists. The
     // interface test is then the cheap way to learn it does not, instead of
-    // waiting out a 600 ms device-reset timeout on every machine without one.
+    // waiting out the whole aux-reset stage on every machine without one.
     command(CMD_ENABLE_AUX, budget);
     let dual = read_config(budget).is_some_and(|c| c & CFG_PORT2_CLOCK_OFF == 0);
     command(CMD_DISABLE_AUX, budget);
@@ -672,7 +887,9 @@ pub fn init(rsdp_addr: u64) {
     );
 
     // The slowest step on a real EC, hence its own budget.
-    let kbd = stage(750, budget);
+    let Some(kbd) = stage(KEYBOARD_MS, budget, "keyboard") else {
+        return;
+    };
     if !device_command(&[0xF5], kbd) {
         log!("i8042: kbd would not stop scanning — disabled");
         return;
@@ -718,25 +935,26 @@ pub fn init(rsdp_addr: u64) {
     // every step logs and falls through rather than returning.
     let aux = port2 && {
         command(CMD_ENABLE_AUX, budget);
-        let reset = stage(600, budget);
-        // 0xFF answers 0xFA, then 0xAA (BAT ok), then the device id.
-        aux_command(&[0xFF], reset)
-            && read_data(reset) == Some(0xAA)
-            && read_data(reset).is_some()
-            && aux_command(&[0xF2], reset)
-            && {
-                let id = read_data(reset);
-                if id != Some(0x00) {
-                    log!("i8042: aux id {:?}, not a plain 3-byte mouse — framing anyway", id);
+        stage(AUX_RESET_MS, budget, "aux reset").is_some_and(|reset| {
+            // 0xFF answers 0xFA, then 0xAA (BAT ok), then the device id.
+            aux_command(&[0xFF], reset)
+                && read_data(reset) == Some(0xAA)
+                && read_data(reset).is_some()
+                && aux_command(&[0xF2], reset)
+                && {
+                    let id = read_data(reset);
+                    if id != Some(0x00) {
+                        log!("i8042: aux id {:?}, not a plain 3-byte mouse — framing anyway", id);
+                    }
+                    true
                 }
-                true
-            }
-            // 100 samples/s, 8 counts/mm. No IntelliMouse knock: the
-            // TrackPoint has no wheel, and a fixed 3-byte frame is what
-            // makes resync trivially self-healing.
-            && aux_command(&[0xF3, 0x64], reset)
-            && aux_command(&[0xE8, 0x03], reset)
-            && aux_command(&[0xF4], reset)
+                // 100 samples/s, 8 counts/mm. No IntelliMouse knock: the
+                // TrackPoint has no wheel, and a fixed 3-byte frame is what
+                // makes resync trivially self-healing.
+                && aux_command(&[0xF3, 0x64], reset)
+                && aux_command(&[0xE8, 0x03], reset)
+                && aux_command(&[0xF4], reset)
+        })
     };
     if port2 && !aux {
         log!("i8042: aux init failed — no pointer");
@@ -798,16 +1016,28 @@ pub fn init(rsdp_addr: u64) {
     let readback = read_config(budget);
     if !wrote || readback != Some(config) {
         crate::arch::cpu::enable_interrupts();
-        match readback {
-            Some(v) => log!(
-                "i8042: DISABLED — cfg {:#04x} did not take (read back {:#04x}); the pin would never assert",
-                config,
-                v
-            ),
-            None => log!(
-                "i8042: DISABLED — cfg {:#04x} did not take (no config byte came back); the pin would never assert",
-                config
-            ),
+        // The last step of the probe, so it is also where a budget that ran out
+        // anywhere upstream surfaces: with the budget gone this write and its
+        // read-back both give up instantly and look exactly like a controller
+        // that dropped them. Saying which it was is the difference between
+        // "your EC is slow" and "your controller is broken", on the one machine
+        // that cannot be single-stepped.
+        if budget_spent(budget) {
+            log!(
+                "i8042: DISABLED — the {INIT_BUDGET_MS}ms init budget was spent before the pin could be armed; this is a timeout, not a controller fault"
+            );
+        } else {
+            match readback {
+                Some(v) => log!(
+                    "i8042: DISABLED — cfg {:#04x} did not take (read back {:#04x}); the pin would never assert",
+                    config,
+                    v
+                ),
+                None => log!(
+                    "i8042: DISABLED — cfg {:#04x} did not take (no config byte came back); the pin would never assert",
+                    config
+                ),
+            }
         }
         return;
     }
@@ -816,6 +1046,8 @@ pub fn init(rsdp_addr: u64) {
         let _ = ioapic::set_masked(l.gsi, false);
     }
     ACTIVE.store(true, Ordering::Relaxed);
+    ARMED_NS.store(crate::clock::nanos_since_boot(), Ordering::Relaxed);
+    HEALTH.store(HEALTH_ARMED, Ordering::Relaxed);
     handler_poll();
     crate::arch::cpu::enable_interrupts();
 
