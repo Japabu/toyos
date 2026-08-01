@@ -324,3 +324,122 @@ Two things this gate cannot close, to be recorded rather than resolved:
 State the three uncovered items from the top to the owner as expected outcomes
 before he boots, so a scancode-set refusal or a dead touchpad is not mistaken for
 a regression on a machine where debugging is nearly blind.
+
+---
+
+## 7. Recorded verdict — 2026-08-01, tree `b82fc4a`
+
+**GO.** Executed by an agent that did not write the gate, which is the point:
+the author reads what they meant rather than what they wrote. Every item was
+run, and for every item the false-pass question was asked explicitly and
+answered. Run on a quiet tree, after killing one orphan QEMU (pid 92876,
+reparented to PID 1, its harness gone, 7.6 s of CPU in 60 minutes elapsed and
+not advancing — established *before* killing it, since a still-progressing
+guest is somebody's measurement).
+
+Guest suite **182/182 in 197.5 s**, timings scattered from 2 ms to 13 s, so the
+"uniform timings mean one shared cause" diagnostic was not needed.
+
+| Section | Result | How |
+|---|---|---|
+| §1.1 | pass | read; the range holds one commit, `5dff9aa`, the interlock itself |
+| §1.2 | pass, wording corrected | read; three public entries, not one |
+| §1.3 | pass | read + `~/.cargo/git/checkouts/` swept, 0 hits across 15 forks |
+| §1.4 | **unanswered** | owner's decision |
+| §2.1 | pass | measured on the file |
+| §2.2 | pass | measured on the tail |
+| §2.3 | pass, better than partial | see below |
+| §3.1 | pass | `diskless_boot`, plus the argv |
+| §3.2 | read-verified | QEMU always reports FSGSBASE |
+| §3.3 | read-verified | QEMU's `stride == width` |
+| §3.4 | pass, empirically | the log line, not the test name |
+| §4.1 | pass, for rendering | capture is out of scope; see below |
+| §4.2 | pass | no input on either side |
+| §4.3 | pass | argv asserted against the same builder the boot uses |
+| §5 | pass, one row struck | no `pipe` baseline ever existed |
+| §5A.1–.8 | pass | §5A.2 read-verified |
+
+### The artifact
+
+Verified and left at **`target/bootable-diet.img`**, **123,076,608 bytes**,
+sha256 `9bda620dc29f26445d6008f56eeeb3b11a9eaa79af8b0268301e8f43fbe531aa`.
+Built with `hosted-rustc = false`; `system.toml` reverted afterwards and
+`git diff` confirmed empty, and `target/bootable.img` rebuilt so it matches the
+committed config again rather than being left as a stale image contradicting
+it.
+
+§2.1, §2.2 and §5A.1 were re-run **against that file**, because all three are
+artifact-specific and results from a differently-configured sibling do not
+transfer: 240,384 whole sectors (`% 512 == 0`), `EFI PART` in the final sector,
+the root init string present exactly once, and `test-runner` and
+`librustc_driver` absent entirely.
+
+### §2.3, resolved rather than waived
+
+The item cannot be executed as written — `hosted-rustc` lives in the root
+`system.toml`, and every harness boot builds from `tests/metalcase/` or
+`tests/testcases/`, neither of which carries the key. But its *substance* is
+already covered: the harness images have **never** contained the hosted rustc
+(the metal-sim initrd is 17 entries with no rustc; the `true` image carries
+`bin/rustc` and a 207 MB `librustc_driver`). So every metal-sim boot in the
+suite is already a no-hosted-rustc boot. Flipping the flag moved the image
+674,885,632 → 123,076,608 bytes, which is what rules out the stale-`target/`
+false pass the item warns about.
+
+### Three findings to carry forward
+
+**The interlock holds by enumeration, not by construction.** Every write path
+was traced and every one is downstream of `probe` — but `PageCacheBlockIO` is a
+`pub` unit struct with a `pub` trait impl, and `page_cache::raw_block_write` is
+`pub`, so any future kernel module can write blocks without consulting the
+stamp. Nothing does today. That is a fact about this tree at this commit, not a
+property of the design, and it is why §1.1's "read every hunk" instruction has
+to be obeyed on every future flash rather than trusted once.
+
+**`capture` being a no-op no longer implies a lost report.** The dead gate is
+still open (`known-issues` §522: `screen_late_panic` passes with `capture`'s
+body replaced by `return`), but `daabd3c` established that capture's original
+reason is gone — retention (`3108e3a`) means `live_tail` after the flush
+returns the same text. So the consequence of the untested path has changed from
+"blank screen" to "shifted window", the residual being a sibling CPU pushing
+more than 32 KiB through the ring between the panic and the paint. Unlikely,
+unstaged, and bounded. §4.1 therefore passes for *rendering*, which is what the
+item claims, with capture explicitly out of scope.
+
+**`sshd` and `/bin/toybox locale --load` are in the root init list and in no
+test config.** `tests/metalcase` boots compositor, soundd, netd, test-runner;
+`tests/testcases` boots soundd, test-runner. So two of the five programs the
+flashed machine runs at boot have never been spawned at boot by anything in
+this tree. Both are read-verified safe — sshd's `NotConnected` arm prints and
+returns cleanly (`userland/sshd/src/main.rs:243`), and `locale --load` returns
+on any read error, which is what it will get since `/home` will be a tmpfs on a
+refused disk — but read-verified is all they are.
+
+### What could not be checked
+
+1. **§2.3's boot half.** Nothing in this tree boots the root image; it needs
+   `cargo run`. Inspection is all there is, which is why the inspection above is
+   of that exact file.
+2. **§1.4.** The owner's answer. It is the only item that makes a §1 failure
+   survivable rather than merely unlikely, so it should be answered before the
+   boot even though its absence is not a fail.
+3. **`sshd` and `locale --load` at boot**, per above.
+4. **A muted, idle machine** — the T14's steady state. The only console-less
+   profile panics rather than idles, and every idling profile has a console
+   draining for it. §5A.2 is read-verified for this reason.
+
+### The four things the owner is signing up for
+
+1. **Whether his EC lands in scancode set 2 with translation on is unknown, and
+   only the hardware answers.** The driver's `0xF0 0x00` read-back decides the
+   wire format and refuses to attach to one it did not ask for. **A refusal to
+   attach is the driver working correctly** — one line on his own screen rather
+   than a bisect.
+2. **The touchpad is I2C-HID and unbuilt. A dead touchpad is the expected
+   outcome**, not a regression, and it should not consume debugging time at the
+   machine.
+3. **Real-hardware performance is unmeasured.** TCG cannot test the 2× bar; the
+   T14 is the first honest instrument.
+4. **The artifact he flashes is booted by nothing in this tree.** Verified by
+   inspection only — size, alignment, backup GPT, and the compiled-in init
+   string.
