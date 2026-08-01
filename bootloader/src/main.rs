@@ -12,6 +12,8 @@ use uefi::{
     prelude::*,
     CStr16,
     proto::console::gop::{GraphicsOutput, PixelFormat},
+    proto::device_path::{media::{PartitionFormat, PartitionSignature}, DevicePath, DevicePathNode, DeviceType, DeviceSubType},
+    proto::loaded_image::LoadedImage,
     proto::media::file::{File, FileInfo, FileMode},
     table::{boot::{MemoryType, PAGE_SIZE}, cfg::ACPI2_GUID},
 };
@@ -101,6 +103,62 @@ fn alloc_uninit(size: usize) -> vec::Vec<u8> {
     let ptr = unsafe { alloc::alloc::alloc(layout) };
     assert!(!ptr.is_null(), "file buffer allocation failed ({size} bytes)");
     unsafe { vec::Vec::from_raw_parts(ptr, size, size) }
+}
+
+/// Which partition this image was loaded from, as firmware knows it.
+struct BootPartition {
+    guid: [u8; 16],
+    start_lba: u64,
+    blocks: u64,
+}
+
+/// Ask firmware which partition it loaded us from.
+///
+/// `LoadedImage->DeviceHandle` is the handle the image came off, and the
+/// HARDDRIVE node of that handle's device path carries the partition's
+/// **unique** GUID — a name for one partition on one disk, which is what the
+/// kernel needs and what neither a type GUID nor a disk GUID can give it. It
+/// has to be read here, because the device path protocol dies with Boot
+/// Services and there is no way to ask afterwards.
+///
+/// `None` is a machine, not a failure: PXE, an unpartitioned device, and a
+/// signature type firmware chose not to fill in all land here, and the kernel
+/// is expected to boot on all of them knowing it has no partition of its own.
+/// Every early-return below is one of those, so none of them panics — which
+/// makes this the one function in this file that does not.
+fn boot_partition(handle: Handle, system_table: &SystemTable<Boot>) -> Option<BootPartition> {
+    let bs = system_table.boot_services();
+    let image = bs.open_protocol_exclusive::<LoadedImage>(handle).ok()?;
+    let device = image.device()?;
+    let path = bs.open_protocol_exclusive::<DevicePath>(device).ok()?;
+
+    let is_hard_drive = |node: &&DevicePathNode| {
+        node.full_type() == (DeviceType::MEDIA, DeviceSubType::MEDIA_HARD_DRIVE)
+    };
+    // Exactly one, not the last one. A path with two HARDDRIVE nodes describes
+    // a partition inside a partition, and picking either is guessing which of
+    // the two the kernel's block device will be looking at.
+    let mut nodes = path.node_iter().filter(is_hard_drive);
+    let node = nodes.next()?;
+    if nodes.next().is_some() {
+        println!("Boot partition: the device path has more than one HARDDRIVE node — ignoring it");
+        return None;
+    }
+
+    let hd: &uefi::proto::device_path::media::HardDrive = node.try_into().ok()?;
+    if hd.partition_format() != PartitionFormat::GPT {
+        println!("Boot partition: firmware says this is not a GPT partition — ignoring it");
+        return None;
+    }
+    let PartitionSignature::Guid(guid) = hd.partition_signature() else {
+        println!("Boot partition: firmware named it with no GUID signature — ignoring it");
+        return None;
+    };
+    Some(BootPartition {
+        guid: guid.to_bytes(),
+        start_lba: hd.partition_start(),
+        blocks: hd.partition_size(),
+    })
 }
 
 /// Kernel virtual base: all physical memory is mapped here in the kernel's address space.
@@ -330,7 +388,7 @@ unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
     pml4 as u64
 }
 
-fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, system_table: SystemTable<Boot>) -> ! {
+fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, boot_part: Option<BootPartition>, system_table: SystemTable<Boot>) -> ! {
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
     let mut memory_map = vec::Vec::<MemoryMapEntry>::with_capacity(memory_map_entry_count);
@@ -359,6 +417,12 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
             None => (0, 0, 0, 0, 0, 0),
         };
 
+    let (boot_partition_guid, boot_partition_start_lba, boot_partition_blocks, boot_partition_present) =
+        match &boot_part {
+            Some(p) => (p.guid, p.start_lba, p.blocks, 1),
+            None => ([0u8; 16], 0, 0, 0),
+        };
+
     // KernelArgs: all addresses are PHYSICAL (kernel translates to virtual)
     let kernel_phys = kernel.memory.as_ptr() as u64;
     let mut kernel_args = KernelArgs {
@@ -382,6 +446,10 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         gop_stride,
         gop_pixel_format,
         boot_pml4_addr: 0, // set below after page tables are built
+        boot_partition_start_lba,
+        boot_partition_blocks,
+        boot_partition_guid,
+        boot_partition_present,
     };
 
     // Build boot page tables: identity map + high-half map for first 4GB.
@@ -416,6 +484,15 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         .expect("ACPI 2.0 RSDP not found in UEFI config table");
     println!("RSDP address: {:#x}", rsdp_addr);
 
+    let boot_part = boot_partition(handle, &system_table);
+    match &boot_part {
+        Some(p) => println!(
+            "Boot partition: LBA {}+{} signature {:02x?}",
+            p.start_lba, p.blocks, p.guid
+        ),
+        None => println!("Boot partition: this machine has none"),
+    }
+
     println!("Loading kernel...");
     let kernel_bytes = load_file_bytes(handle, &system_table, cstr16!("\\toyos\\kernel.elf"));
     println!("Kernel: {} bytes", kernel_bytes.len());
@@ -431,5 +508,5 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let gop = query_gop(&system_table);
 
     println!("Starting kernel...");
-    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, gop, system_table);
+    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, gop, boot_part, system_table);
 }

@@ -23,7 +23,52 @@ pub struct KernelArgs {
     /// Physical address of the bootloader's page table (has both identity map and high-half).
     /// Used by the SMP trampoline for AP boot transition.
     pub boot_pml4_addr: u64,
+    /// First logical block of the partition the firmware loaded this image
+    /// from, in that device's own block size.
+    pub boot_partition_start_lba: u64,
+    /// That partition's length, in the same blocks.
+    ///
+    /// Firmware's number, kept alongside the GUID so the kernel has two
+    /// independent accounts of the partition's extent — this one and the GPT
+    /// entry it finds. A disagreement means the table on the disk is not the
+    /// table firmware read, and the kernel refuses rather than picking one.
+    pub boot_partition_blocks: u64,
+    /// The partition's *unique* GUID, exactly as it sits in the HARDDRIVE
+    /// device path node and in the GPT entry — no byte order conversion on
+    /// either side, so the comparison that decides which partition is ours
+    /// cannot be got backwards.
+    pub boot_partition_guid: [u8; 16],
+    /// Zero when this machine has no designated boot partition, in which case
+    /// the three fields above are zero as well.
+    ///
+    /// Not an error: booting over the network, or off a device with no
+    /// partition table, is a machine ToyOS is expected to come up on. The
+    /// kernel simply knows it has no partition it is entitled to write to.
+    pub boot_partition_present: u32,
 }
+
+/// The kernel's `_start` reads three of these fields out of `rdi` by hardcoded
+/// byte offset, before Rust code runs and before there is a stack to call a
+/// getter on. Adding a field anywhere but the end moves them silently, and the
+/// symptom is a stack pointer pointing at nothing.
+///
+/// The size and alignment are here for the other half of the contract: the
+/// bootloader writes this struct and the kernel reads it, and the two are
+/// separate binaries built for separate targets. They share this file, so they
+/// cannot disagree about the layout — but only as long as nothing else does
+/// the arithmetic by hand.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    assert!(offset_of!(KernelArgs, kernel_memory_addr) == 16);
+    assert!(offset_of!(KernelArgs, kernel_stack_addr) == 32);
+    assert!(offset_of!(KernelArgs, kernel_stack_size) == 40);
+    assert!(offset_of!(KernelArgs, boot_partition_start_lba) == 144);
+    assert!(offset_of!(KernelArgs, boot_partition_blocks) == 152);
+    assert!(offset_of!(KernelArgs, boot_partition_guid) == 160);
+    assert!(offset_of!(KernelArgs, boot_partition_present) == 176);
+    assert!(size_of::<KernelArgs>() == 184);
+    assert!(align_of::<KernelArgs>() == 8);
+};
 
 #[repr(C)]
 #[derive(Debug)]
