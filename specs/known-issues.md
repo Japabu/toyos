@@ -203,8 +203,8 @@ so an implementation can refuse *before* it allocates; `TmpFs` does.
 because `bcachefs::Mounted::list` has no count primitive and
 `btree::collect_all` materialises every entry first. Their refusal is uniform;
 their allocation is not bounded. `/home` is writable by userland, so this is a
-live path — for the `bcachefs` owner, alongside the 3 MiB `split_node`
-underflow.
+live path — still open for the `bcachefs` owner. `Node::parse` no longer reserves
+from an on-disk count, but `collect_all` still materialises the whole tree.
 
 `SYS_SYSINFO` collects one 24-byte entry per live thread into a `Vec`
 (`syscall.rs:1273`) and thread count is uncapped, so ~87,000 threads makes it a
@@ -274,12 +274,135 @@ xHCI's zero-HID panic: a machine that simply lacks a device is not a kernel bug,
 track exists precisely because the target machine's device set is not the one we chose.
 Assigned to the `main.rs` owner.
 
-### A 3 MiB `fs::write` to `/home` panics the kernel
+### CLOSED — a 3 MiB `fs::write` to `/home` panicked the kernel
 
-`bcachefs/src/btree.rs:184` — `MAX_PAYLOAD - used` underflows, reached via
-`split_node` ← `sys_close` ← `flush_file`. No crafting: an ordinary userland
-write of a few megabytes. This is a "the kernel must never crash from userland"
-violation of the plainest kind. Assigned to the bcachefs owner.
+`bccab15`. `btree.rs:184` is the `Ok(...)` that ends `Node::parse` now, and
+`Node::write_to` returns `FsError::NodeOverfull` before the subtraction that
+underflowed. **This entry outlived its fix by a day**, and a read-only audit had
+to correct it before anyone could tell what in `bcachefs` was still open — which
+is the cost of leaving a closed entry standing.
+
+### CLOSED — a short allocation was read as a complete one, and the write landed on another file
+
+`fs.rs`'s `resolve_or_alloc_block` asked the allocator for `needed` blocks and
+returned `start + needed - 1`, while `alloc_contiguous` was documented and
+implemented to return *up to* that many. On a volume with no free run longer
+than one block, resolving page 3 of a sparse file recorded
+`Extent { start_block: 3, block_count: 1 }` and returned **block 6** — a live
+block belonging to another file. `write_page` hands that straight to
+`page_cache::raw_block_write`, so the page's data was lost and a foreign file
+was clobbered, and a later read of the same page resolved somewhere else again.
+Reproduced on a 64-block volume filled with one-block files and then punched
+with one-block holes; a freshly formatted `/home` hides it completely, because
+the allocator hands out contiguous runs.
+
+The type carries it now: `alloc_contiguous -> (BlockNum, u32)` is gone, replaced
+by `alloc_up_to -> Run { start, len }` and `alloc_exact`, so the second element
+can no longer be read as "all of it" by a caller that destructures positionally.
+`alloc_block`'s `unreachable!()` went with it. **The lesson is the shape, not the
+arithmetic**: a function that can return less than you asked for and says so only
+in a doc comment is `known-issues` §1's ignored-failure-return with the refusal
+replaced by a partial success — worse, because there is no `no` to notice and the
+wrong answer is a block number that looks exactly like a right one. Two of three
+callers looped; the one that did not was the one on the kernel's write path.
+
+### CLOSED — the `bcachefs` parse path treated the disk as trusted
+
+Four defects, one edit, because they were one defect: nothing decided what a
+node *was* until each descent site decided for itself.
+
+- **Six sites decoded a child pointer as `value[..8]` with no length check.** A
+  level-1 node whose first entry has a four-byte value panicked the kernel with
+  `range end index 8 out of range for slice of length 4`, inside `vfs::lock()`.
+  Demonstrated: putting the unchecked index back produces exactly that panic.
+- **Tree depth came from the superblock** (`root_level`, a `u16`) and drove three
+  recursions, each of which puts a 4096-byte `BlockBuf` on the stack, against
+  `process::KERNEL_STACK_SIZE` = 128 KiB. One `ls /home` on a crafted disk.
+- **`Node::parse` sized a `Vec` from the on-disk entry count**, a `u16` admitting
+  65535 against the 169 a 4096-byte block can hold.
+- **No superblock field was ever validated against the device.**
+
+`Node` is now an enum — `Leaf(Vec<Entry>)` or `Interior { level, children }` —
+parsed once, with every child decoded to a `BlockNum` and range-checked against
+`io.block_count()` at that single point. The variant is the leaf/interior branch,
+so `root_level` is not read from the superblock at all any more and the field is
+deleted; descent terminates at a `Leaf` and is bounded by a `Depth` budget of 64
+that only `descend` can spend. The entry `Vec` is grown rather than reserved, so
+no allocation is derived from an on-disk number, and a count above the physical
+maximum is refused outright. `Superblock::read` refuses a superblock whose
+`block_count`, `root_node`, `bitmap_start`, `bitmap_blocks`, `journal_start`,
+`free_blocks` or `next_alloc` does not describe the device it was read from.
+
+Gates, all red before and green after, all in `bcachefs/`'s host tests: a
+crafted node whose child pointer is four bytes, is off the device, or is absent
+entirely; a root that names itself; a block declaring 65535 entries; three
+tampered superblocks. The entry-count one measures the **peak allocation**
+through a `#[cfg(test)]` global allocator, because the parse returns the same
+`CorruptedNode` either way — a test that checks only the return value passes with
+the bug in, and did.
+
+### `bcachefs`: three residual untrusted-input holes and a mount-policy question
+
+Left open deliberately, in the same crate:
+
+1. **`decode_leaf_value` does not range-check an extent.** A file's
+   `start_block` comes off the disk unchecked and reaches `read_extents` (via
+   `read_link`, which *is* on the adapter) and `NvmeBacking`'s demand paging (via
+   `file_extents`). With the child-pointer check removed, a `u64::MAX` block
+   number reaches `BlockNum`'s byte-offset multiply and panics with "attempt to
+   multiply with overflow" — measured, and the same multiply is what an extent
+   reaches today with nothing in the way. `Extent.start_block` is a bare `u64`
+   crossing the crate boundary into `kernel/src/file_backing.rs`, which is why.
+2. **`read_extents` sizes `vec![0u8; size]` from the on-disk file size.** The
+   honest bound is one line — a file cannot be longer than the blocks it names.
+3. **`BlockNum::to_byte_offset` multiplies unchecked**, next to a `checked_add`.
+
+And the policy question, for the owner, **not changed here**: `probe()` mounts
+any disk whose block 0 carries `BCFS`, version 1, and a CRC32C that checks out.
+A CRC is not authentication — whoever writes the image writes the CRC — so the
+split is *a token naming this device authorises a format, a checksum anybody can
+compute authorises a read-write mount*, and both actions write to the disk.
+Detail and a recommendation are below, under "`probe()` mounts on a checksum".
+
+### `probe()` mounts on a checksum, and a stamp over a used volume does not reformat
+
+Two things, from reading `bcachefs_adapter::probe` against the crate:
+
+**The threshold does not match the consequence.** `Storage::Ours` is a
+read-write mount: `sync()` rewrites both superblocks, and any file operation
+writes the bitmap, btree nodes and data. So mounting a stranger's disk modifies
+it, which is a weaker form of the wrong the designation stamp exists to prevent.
+Accidental collision is not the risk — random block-0 bytes satisfy 4 bytes of
+magic, 4 of version and a 32-bit CRC with probability about 2^-64 — and neither
+is a *genuine* upstream bcachefs volume, which does not begin with ASCII `BCFS`
+(this crate shares the name and nothing else; §3). The risk is a **deliberately
+crafted block 0** on a disk somebody hands you, which is the metal track's
+situation exactly.
+
+Recommendation, for the owner to decide:
+
+- **Now, nearly free:** tighten `Superblock::check` from
+  `block_count <= device_blocks` to `==`. `format` already writes the device's
+  own size, so a volume image copied onto a different disk stops mounting, the
+  same property the designation stamp's block count gives a format. It is not
+  authentication — an attacker who knows the disk size writes the right number —
+  but it costs one character and removes the accidental cases.
+- **Then:** close residuals 1–3 above. "Mounting a hostile volume is merely
+  rude" is not true while an unchecked extent reaches a block read.
+- **The real fix, if the threat model wants one:** read-write requires
+  something the attacker cannot compute — a keyed MAC, or a designation-like
+  stamp — and everything else mounts read-only. ToyOS has no key store and no
+  TPM support, so this is a metal-track decision, not a patch.
+
+**Separately, and reproduced:** a designation stamp written over a disk that
+already held a ToyOS volume does **not** cause a reformat. `designate_for_format`
+writes block 0 only, `Superblock::read` falls back to the backup superblock at
+the last block when block 0 does not parse, and a stamp does not parse — so
+`mount()` succeeds from the backup and `probe()` returns `Ours`, mounting the old
+volume. Harmless for the harness, which stamps freshly created sparse files, but
+it means "re-stamp the disk to reformat `/home`" is not a workflow that works.
+`probe`'s doc comment claims the decision comes "from one read of block 0"; it
+comes from two, and the second one wins.
 
 ### `ftruncate` to a larger size does not persist on `/home`
 
@@ -1614,6 +1737,30 @@ CLAUDE.md's diagnostics roadmap.
 ---
 
 ## 6. Build and toolchain
+
+### INCIDENT — `677efae` swept six staged `bcachefs/` files that are not mine
+
+2026-08-01. Whoever is working in `bcachefs/` (`alloc_bitmap.rs`, `btree.rs`,
+`fs.rs`, `lib.rs`, `superblock.rs`, `tests/integration.rs`, +1288/−499 across
+the commit): **your staged snapshot is in `677efae`**, whose message is about
+the ACPI parser and says nothing about it. Nothing is lost — your working tree
+was not touched, and `git show 677efae -- bcachefs/` is exactly what you had
+staged. Fix forward; do not undo.
+
+How, so the next agent does not repeat it. `git commit -- <paths>` commits only
+those paths and is the safe form, but it commits the **working tree** version of
+them — which is no good for a change that has to be staged as a partial hunk.
+Mine did: `i8042/mod.rs` also held another agent's in-flight work, so I built a
+patch of my hunk alone and `git apply --cached`ed it, and then had to use a bare
+`git commit` to commit the index. A bare `git commit` takes **everything**
+staged, including six files another agent staged between my check and my call.
+
+I even printed `already staged by others: 6` in the same tool call and committed
+anyway, which is the actual lesson: **the check has to gate the commit, not
+precede it.** `git diff --cached --name-only | grep -v <my paths>` must be
+*empty* before a bare `git commit` runs, in the same shell, with `&&`. There is
+no lock; the window is real either way, but a conditional makes the common case
+safe instead of merely observed.
 
 ### A second toolchain-contention window, distinct from the one `69bca9a` closed
 
