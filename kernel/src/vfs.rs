@@ -88,7 +88,16 @@ pub trait FileSystem: Send {
     fn update_metadata(&mut self, file_id: FileId, size: u64, mtime: u64) -> Result<(), &'static str>;
 
     fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str>;
-    fn sync(&mut self);
+
+    /// Push everything this filesystem has buffered all the way to the device,
+    /// the device's own write cache included.
+    ///
+    /// Fallible for the same reason [`crate::block::BlockDevice::read_blocks`]
+    /// is: a sync whose failure the caller cannot see is indistinguishable from
+    /// one that worked, and the caller here is a log that writes a line when it
+    /// is told something went wrong — so swallowing the error made every failed
+    /// sync produce the pending bytes that ask for the next one.
+    fn sync(&mut self) -> Result<(), &'static str>;
 
     /// Open a file backing for demand-paged ELF loading (separate from fd I/O).
     fn open_backing(&mut self, _name: &str) -> Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>> { None }
@@ -586,18 +595,24 @@ impl Vfs {
     /// filesystem it wrote to: on a machine with a `/home` on NVMe it is a
     /// btree write-back and a device flush for a byte that went to the boot
     /// stick.
-    pub fn sync_mount(&mut self, name: &str) {
-        if let Some(fs) = self.mounts.get_mut(name) {
-            fs.sync();
-        }
+    pub fn sync_mount(&mut self, name: &str) -> Result<(), &'static str> {
+        self.mounts.get_mut(name).ok_or("no such mount")?.sync()
     }
 
+    /// Every mount, on the way down. Failures are logged here and not returned:
+    /// the caller is `SYS_SHUTDOWN`, which has nowhere to put a `Result` and
+    /// nothing left to try, and one mount refusing must not stop the rest from
+    /// being written out.
     pub fn sync_all(&mut self) {
         if let Some(root) = &mut self.root {
-            root.sync();
+            if let Err(e) = root.sync() {
+                log!("vfs: the root filesystem would not sync: {e}");
+            }
         }
-        for fs in self.mounts.values_mut() {
-            fs.sync();
+        for (name, fs) in self.mounts.iter_mut() {
+            if let Err(e) = fs.sync() {
+                log!("vfs: /{name} would not sync: {e}");
+            }
         }
     }
 

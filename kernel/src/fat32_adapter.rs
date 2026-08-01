@@ -604,10 +604,16 @@ impl FileSystem for EspFs {
         Err("FAT32 has no symlinks")
     }
 
-    fn sync(&mut self) {
-        if let Err(e) = self.fs.sync() {
-            log!("esp: sync failed: {e}");
-        }
+    /// The error is returned rather than logged, and that is the whole point of
+    /// the signature: this mount is where the kernel's own log lives, so a line
+    /// written here is pending ring content, which is the next flush, which is
+    /// the next sync. Swallowing it made a device that declines to flush into a
+    /// permanent write loop from the idle loop.
+    fn sync(&mut self) -> Result<(), &'static str> {
+        self.fs.sync().map_err(|e| match e {
+            Error::Io => "the boot volume's device refused the sync",
+            _ => "the boot volume would not sync",
+        })
     }
 
     fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {

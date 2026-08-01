@@ -152,7 +152,9 @@ impl FileSystem for TmpFs {
         Ok(())
     }
 
-    fn sync(&mut self) {}
+    fn sync(&mut self) -> Result<(), &'static str> {
+        Ok(())
+    }
 
     fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
         let (file_id, _) = self.files.get(name)?;

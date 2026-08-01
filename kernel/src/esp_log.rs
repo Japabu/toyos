@@ -251,7 +251,7 @@ impl Sink {
         // own write cache has not. A log that survives a wedge has to survive
         // the power being cut with it, which is the whole point, so the flush
         // is not optional and is per batch rather than per line.
-        vfs.sync_mount(MOUNT);
+        vfs.sync_mount(MOUNT)?;
 
         if self.size >= MAX_LOG_BYTES {
             self.rotate(vfs)?;

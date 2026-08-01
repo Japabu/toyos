@@ -222,8 +222,12 @@ impl FileSystem for BcacheFsAdapter {
         self.fs.create_symlink(name, target).map_err(|_| "symlink failed")
     }
 
-    fn sync(&mut self) {
+    /// `Ok` unconditionally, and honestly so: `bcachefs::Mounted::sync` has no
+    /// failure to report, because its own device writes are `()`. That is the
+    /// same defect one layer down and it is already filed as `BlockIO`'s.
+    fn sync(&mut self) -> Result<(), &'static str> {
         self.fs.sync();
+        Ok(())
     }
 
     fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
@@ -326,7 +330,9 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
         Err("read-only filesystem")
     }
 
-    fn sync(&mut self) {}
+    fn sync(&mut self) -> Result<(), &'static str> {
+        Ok(())
+    }
 
     fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
         let (extents, size) = self.fs.file_extents(name)?;
