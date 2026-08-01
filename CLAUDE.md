@@ -148,7 +148,7 @@ diag/system.toml  The same, for `--diag-boot`: no framebuffer claimer at all
 
 - Stay focused on the current task. Record findings and issues in `specs/known-issues.md`, don't go fix them — a separate agent will handle it. Add a one-line summary here only if a future agent must not miss it.
 - After each task, audit CLAUDE.md and update if the architecture or project state changed. **Keep this file under ~200 lines**: it loads into every session and every subagent. Detail belongs in `specs/`, resolved narrative in `git log`.
-- If something is blocking, stop and report it. Don't work around it.
+- If something is blocking, stop and report it. Don't work around it. **Report results, never narration** — no running commentary on what you are about to do, what you considered, or what you decided not to do.
 - Never degrade audible or visual quality — even temporarily, even for a big win elsewhere — without the owner's explicit sign-off. Quality tradeoffs are the owner's call.
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce output. If a command produces a lot of output or takes long, run it in the background — background tasks automatically get their output written to a file.
 - Host tests outside the QEMU suite: `cargo test` inside `toyos-sched/`, `toyos-ps2/`, `toyos-gpt/` and `toyos-fat32/` (the last needs macOS `newfs_msdos`/`hdiutil`/`fsck_msdos`; it builds real images in `$TMPDIR`).
