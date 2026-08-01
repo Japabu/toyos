@@ -875,6 +875,63 @@ of the *derived* bound regardless, and the sweep prints
 quietly become the standard**, which is the failure mode of every temporary
 baseline and the reason most of them end up permanent.
 
+### CLOSED — concurrent configs overwrote each other's kernel and bootloader
+
+Fixed at `9ee156c`. Recorded in full because the symptom was
+*indistinguishable from a regression in the code under test*, and because it was
+being routed around as advice for most of a session rather than filed as a bug.
+
+**The trace.** The init string is not in the image — it is compiled into
+`bootloader.efi`: `bootloader/build.rs` declares
+`rerun-if-env-changed=INIT_PROGRAMS`, `bootloader/src/main.rs:225` is
+`env!("INIT_PROGRAMS")`, and `src/build.rs` passed `config.init.join(";")` into
+the bootloader's `cargo build`. Cargo keys the artifact path on
+(crate, target, profile) **and nothing else**, so every config wrote and read one
+path. The kernel varies the same way, by feature.
+
+**The window was not a moment.** `build_test_image` built the bootloader, then
+ran the entire userland build and initrd assembly, and only then read the `.efi`
+— seconds to minutes, unprotected. `build()` had the identical shape, so
+`cargo test` raced `cargo run --build-only` too.
+
+**Observed:** `init_program_len: 28`, exactly `"/bin/soundd;/bin/test-runner"`,
+in an image whose initrd was metalcase's — compositor and netd both present,
+metalcase's own string being 54 bytes. One image, one config's initrd, another
+config's bootloader. The compositor was never spawned and the test failed with
+`"compositor: ready" never reached the console`.
+
+**Why this one was worse than the kernel-feature variant of the same mechanism:**
+the kernel case turns an actuator off, so a test goes red for a visible reason.
+The bootloader case silently boots a *different init list*, and the failure looks
+like the daemon under test is broken.
+
+**Fix:** an `flock` held across each build→stage pair, artifacts copied to a name
+carrying their build key, readers using the staged name. `flock` because the
+kernel releases it on process exit, so a killed builder cannot strand it.
+Demonstrated rather than reasoned: two bootloader artifacts now coexist, each
+containing exactly one config's init string and not the other's.
+
+**A partial fix would have been worse than none.** A lock in
+`tests/common/qemu.rs` alone covers `cargo test` against `cargo test` but not
+against `cargo run --build-only` — making the flake rarer and therefore harder to
+diagnose. That option was rejected on those grounds.
+
+**Not `04b21b4`'s window.** That one is `rust/build/.../dist/deps` inside the std
+bootstrap. This one is the toyos artifact paths. Together with the
+`rustup toolchain link` race, that is **three distinct concurrency defects in one
+build system** — conflating any two will cost someone an afternoon.
+
+**Eventual shape, not done:** stop baking the init list into the bootloader at
+all and put it in the ESP or initrd. That is the structural answer; it changes
+the boot contract across bootloader, kernel and `KernelArgs`, so it is a separate
+piece of work.
+
+**Not addressed, and worth being honest about:** this does not stop rebuild churn
+when agents alternate configs. Cargo still writes to its own single path, so each
+config still invalidates the other's *cargo* build; the staging protects the read,
+not the build. Killing the churn needs a per-config `--target-dir`, which
+multiplies disk usage and was not attempted here.
+
 ### `src/build.rs` cannot enable `sched-check`, so no CI run exercises it
 
 The kernel check build is reachable now — `kernel/Cargo.toml:63` forwards
