@@ -1891,7 +1891,7 @@ from hung. That is the natural first thing to try on the T14 in the M1→M2
 window. Reproducible under `--metal-sim` with QMP `device_add usb-kbd,bus=xhci.0`
 after boot.
 
-### The i8042's one diagnostic line cannot be read on the machine it is for
+### PARTLY CLOSED — the i8042's one diagnostic line could not be read on the machine it is for
 
 The T14 booted from `target/bootable-diet.img` (sha256
 `9bda620d…e531aa`, the file still on disk and re-hashed) and reached the
@@ -1938,13 +1938,75 @@ Consequences, in the order they bite:
   owner a dead touchpad is expected (I2C-HID, unbuilt) and a keyboard refusal is
   the driver working. Neither statement is checkable without the line.
 
-The fix is an output channel that survives userland taking the screen. The
-cheapest instrument that needs no code — usable on the stick that already
-exists, minus one rebuild — is to flash an image whose `system.toml` init list
-spawns nothing that claims `DEVICE_FRAMEBUFFER`: the `Boot: complete` screenful
-then stays up indefinitely and the answer is a photograph. `specs/metal-log-capture.md`
-is the durable version of the same problem and its Phase 2 fixed the *panic*
-half only.
+**Built, as `--diag-boot`.** `diag/system.toml` plus a flag on the build system,
+the way `--gop` and `--metal-sim` are flags: it writes `target/bootable-diag.img`
+instead of `bootable.img`, so no edit to the shared `system.toml` and no image
+left contradicting the committed config. The guarantee is structural rather than
+a property of the init list — the compositor is the only process that claims the
+framebuffer and it is not built into the image at all — and the kernel and
+bootloader binaries are unchanged by the flag, so what the owner reads off a diag
+boot is what the shipping kernel does. Gated by `screen_diag_boot`
+(`tests/toyos.rs`, in `SCREEN_TESTS`): boots the same config on `Profile::Metal`,
+polls until the last checkpoint has painted, holds five seconds, and asserts an
+`i8042:` line and `Boot: complete` are still decodable. Teeth: with
+`/bin/compositor` put back into the init list the fill check reds on
+`[24, 24, 37]` against the checkpoint's `[0, 0, 0]`, and the decoded desktop
+carries zero occurrences of either asserted string.
+
+Three things it does **not** give, in the order they will bite:
+
+- **Nothing after `Boot: complete` is visible.** The last checkpoint is the last
+  paint on a successful boot, so a daemon that dies later is exactly as silent as
+  before. The mode answers "how far did the kernel get and what did it say",
+  which is the i8042 question, and nothing else.
+- **The T14 pages, and only the footer says so.** Measured on the shipped image's
+  own log: 75 display rows at the panel's 240 columns against a 67-row grid, so
+  `pagination` gives two pages and the checkpoint paints `[page 2/2]` with the
+  newest 66 rows — the first nine rows of the log are above the window. The first
+  `i8042:` line is 19 rows above the end, so it is on that page with room to
+  spare. QEMU's stdvga grid is 96x256 and the same log is 74 rows there, i.e. one
+  page and no footer, so **the footer branch of `screen_diag_boot` has never
+  executed**: it is a guard, not a certification, and the machine that will
+  exercise it is the laptop.
+- **`kernel/src/main.rs:463` asserts a non-empty init list**, so "spawn nothing"
+  is not available; a violated assert would paint a panic report instead of a
+  boot log. The list is therefore the shipping list's own first entry,
+  `/bin/toybox locale --load`, which reads a config file that does not exist on a
+  fresh disk and returns.
+
+`specs/metal-log-capture.md` is the durable version of the same problem and its
+Phase 2 fixed the *panic* half only.
+
+### An image built from this checkout carries five other agents' uncommitted work
+
+Found while producing the diag image, and it is the sharper form of "the artifact
+the owner actually flashes is booted by nothing in this tree". The first
+`cargo run -- --diag-boot --build-only` produced a 35,753,984-byte image whose
+kernel contained `usb-storage:` log lines — an in-flight USB mass-storage driver
+from another agent, uncommitted, with a 449/254-line delta across
+`xhci/device.rs` and `xhci/mod.rs` and three untracked files. `cargo` builds the
+working tree, and the working tree is shared.
+
+That is not a cosmetic provenance problem: the xHCI probe runs at 0.10 s and the
+i8042 probe at 0.11 s, so unproven USB code sits **upstream** of the exact line
+the flash is meant to read. A hang or panic there and the answer never gets
+logged at all.
+
+The artifact was rebuilt from committed `HEAD` in a detached `git worktree` with
+`rust/` and `toyos-ld/target` symlinked to the main checkout, driven by a
+throwaway bin that calls `build::build` directly. That last part is not
+optional: `build_test_image` and `build_toyos_bins` both call
+`toolchain::ensure`, whose `link_toolchain` compares the *unresolved*
+`root.join("rust/build/…/stage2")` against the rustup symlink — from any other
+root that comparison fails and it re-runs `rustup toolchain link`, which is the
+contention window §6 documents. So **the test harness cannot be run from a
+worktree** without hurting every other agent, and a worktree-built image can be
+verified only by booting QEMU directly.
+
+The general rule, which nothing enforces: **a flashable artifact is built from a
+committed tree, and its provenance is stated with the commit.** Today that is a
+procedure, not a mechanism — `build::build` reads the working tree and says
+nothing about it.
 
 ### The pre-flash gate certified everything except the milestone
 
