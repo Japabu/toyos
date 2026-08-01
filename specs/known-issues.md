@@ -884,6 +884,36 @@ being benign the moment the fix lands. I13 is the gate that says so; it is green
 today and its own gate is red on the broken shape, on I13 alone — I5 reports a
 perfectly even split while two of three sibling threads never run.
 
+**Entry criteria for the per-share-FIFO redesign.** I5 and I13 together are
+close to sufficient and are not sufficient. Three gaps, all prerequisites rather
+than follow-ups:
+
+1. **I13's reach is a silent casualty of the change it guards.** Its window
+   closes when a member's threads stop being evenly spread over the CPUs, and
+   the redesign must reimplement `pop_surplus`, which feeds
+   `answer_steal_requests` and can therefore change placement — so a redesign
+   that disturbs placement makes I13 measure *less* rather than fail, with the
+   sweep still printing `clean`. Instrumented rather than left as vigilance:
+   `SweepResult::thread_coverage_pct` publishes the fraction of executed time
+   I13 had a comparison open for, `invariant_i13_is_measured_and_holds` gates on
+   it against 96% / 69% / 99%, and forcing the balance condition false takes it
+   to 0% and reds the test. **A/B that number across the redesign; a collapse is
+   as loud as a violation.** Named as the third gate-failure shape in
+   `specs/metal-track-history.md`, alongside "could not fail" and "nothing
+   measured the cost". Note the reach already falls with width — 55% at four
+   CPUs, 45% at eight — because threads exit at slightly different moments and
+   unbalance a wide machine sooner.
+2. **Nothing measures where a woken thread lands in its share's order.** A block
+   drops a thread from I13's measured set, and every scenario that blocks gives
+   windows of 0–10 ms (`audio_pipeline` reaches 0%). Today that ordering falls
+   out of the pot; after the redesign it is decided by the FIFO push, which is
+   precisely the new code. A wake-heavy workload with windows long enough to
+   measure does not exist yet and has to.
+3. **The margin at 32 CPUs is 1.2× and trending up** — 10 ms at one CPU to
+   50 ms at 32 against a 60 ms bound — with nothing measured above 32, while
+   spec §11 Stage 9 gates on 1–128. Measure 64 and 128 first, or a red at high
+   width cannot be attributed to the redesign rather than to the width.
+
 Found only because I5 measures *service* — nanoseconds actually delivered — rather
 than checking vruntime bookkeeping against itself, which would have been true by
 construction. The dead-gate lesson from the other side: the first question about a

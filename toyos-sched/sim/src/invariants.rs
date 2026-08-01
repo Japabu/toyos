@@ -333,6 +333,10 @@ fn note_rt_service(vm: &mut Vm<'_>) -> bool {
 /// never hides the standard: `Vm::fair_over_bound` records every crossing of the
 /// derived bound whatever the allowance permits, and the sweep prints it.
 fn check_fairness(vm: &mut Vm<'_>, rt_present: bool) {
+    // Cleared here and re-established only by a comparison that actually
+    // happened, so `Vm::thread_covered_ns` counts the reach I13 has and not the
+    // reach it would have if every window stayed open.
+    vm.thread_window_open = false;
     let (runnable, per_cpu, live_threads) = runnable_now(vm);
     let saturated = (0..vm.scenario.cpus).all(|cpu| vm.cpus[cpu].running().is_some());
     let mut members: Vec<usize> = if rt_present || !saturated {
@@ -586,6 +590,7 @@ fn check_thread_service(vm: &mut Vm<'_>, members: &[usize]) {
         }
         measured.push((process, high - low));
     }
+    vm.thread_window_open = !measured.is_empty();
 
     let mut problems = Vec::new();
     for (process, spread) in measured {

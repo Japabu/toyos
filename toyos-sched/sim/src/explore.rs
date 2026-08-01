@@ -58,6 +58,10 @@ pub struct Outcome {
     pub thread_spread: u64,
     pub thread_bound: u64,
     pub thread_over_bound: u64,
+    /// Virtual nanoseconds I13 had a comparison open for. Its *reach*, which is
+    /// a separate question from its verdict and one a change to the pick or the
+    /// balance can silently shrink; see [`crate::vm::Vm::thread_covered_ns`].
+    pub thread_covered_ns: u64,
 }
 
 impl Outcome {
@@ -191,6 +195,7 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         thread_spread: vm.thread_spread,
         thread_bound: vm.thread_bound,
         thread_over_bound: vm.thread_over_bound,
+        thread_covered_ns: vm.thread_covered_ns,
     }
 }
 

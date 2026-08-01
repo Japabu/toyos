@@ -681,20 +681,39 @@ fn old_park_keeping_the_lend_is_caught() {
 /// So the spread is required to be non-zero on all three widths of the fairness
 /// workload — some window has to have opened, stayed open, and been measured —
 /// and to be within a factor of four of its own bound somewhere, or the bound
-/// has stopped constraining anything. All three meet the *derived* bound today
+/// has stopped constraining anything.
+///
+/// **And the *reach* is asserted, not only the verdict.** I13's window closes
+/// when a member's threads stop being spread evenly over the CPUs, so a change
+/// to the pick or the balance can make this check measure less instead of
+/// failing — a live gate switched off by the thing it guards. The recorded
+/// figures are 96%, 69% and 99% of executed time (`measure <scenario> 100`, on
+/// `be4b34a` with this change applied); a halving reds. The falloff with width
+/// is real and worth knowing: 55% at four CPUs and 45% at eight, because
+/// threads exit at slightly different moments and unbalance the machine sooner
+/// the wider it is. All three meet the *derived* bound today
 /// (the recorded sample on `scenarios::fair_workload`), so
 /// `worst_thread_over_bound` must be zero, and that is asserted: if the recorded allowance ever starts carrying these, the
 /// suite says so rather than passing quietly on it.
 #[test]
 fn invariant_i13_is_measured_and_holds() {
     let mut tightest = u64::MAX;
-    for scenario in [
-        scenarios::fairness_storm(1),
-        scenarios::fairness_storm(2),
-        scenarios::sibling_storm(),
+    for (scenario, reach) in [
+        (scenarios::fairness_storm(1), 96),
+        (scenarios::fairness_storm(2), 69),
+        (scenarios::sibling_storm(), 99),
     ] {
         let name = scenario.name;
         let result = sweep::seed_sweep(&scenario, FAIR_SEEDS, 3);
+        assert!(
+            result.thread_coverage_pct() * 2 >= reach,
+            "{name}: invariant I13 had a comparison open for {}% of the run \
+             against {reach}% recorded. Its *reach* has collapsed, which is not \
+             the same as its verdict being clean — read this as loudly as a \
+             violation and find what closed the windows: {}",
+            result.thread_coverage_pct(),
+            result.report(),
+        );
         assert!(result.passed(), "{}", result.report());
         assert!(
             result.worst_thread_spread > 0,

@@ -260,6 +260,22 @@ pub struct Vm<'q> {
     /// recorded allowance let the run pass. This is the gap between the standard
     /// and the shipped scheduler, surfaced by the instrument on every run.
     pub fair_over_bound: u64,
+    /// How many virtual nanoseconds invariant I13 actually had a comparison
+    /// open for, and whether it has one open right now.
+    ///
+    /// **A live gate can be switched off by the very change it guards**, and
+    /// I13 is exposed to exactly that: its window closes when a member's threads
+    /// stop being evenly spread over the CPUs, so a change that disturbs
+    /// *placement* makes this check measure less rather than fail. The reach is
+    /// therefore a published number, to be compared across any change to the
+    /// pick or the balance — a collapse here has to be read as loudly as a
+    /// violation. See [`crate::invariants`].
+    ///
+    /// The flag is consulted by `advance`, which runs before the step's checks,
+    /// so the accounting lags the window by one step. That is a rounding error
+    /// against a run and not worth a second traversal to remove.
+    pub thread_covered_ns: u64,
+    pub thread_window_open: bool,
     /// Invariant I13's three numbers, in the same three roles as I5's above:
     /// the widest service spread seen *between threads of one share*, the bound
     /// in force when it was seen, and the worst crossing of the derived bound
@@ -371,6 +387,8 @@ impl<'q> Vm<'q> {
             fair_spread: 0,
             fair_bound: 0,
             fair_over_bound: 0,
+            thread_covered_ns: 0,
+            thread_window_open: false,
             thread_spread: 0,
             thread_bound: 0,
             thread_over_bound: 0,
@@ -685,6 +703,9 @@ impl<'q> Vm<'q> {
             if rt.inherited.is_some() {
                 entry.1 += delta;
             }
+        }
+        if self.thread_window_open {
+            self.thread_covered_ns += delta;
         }
         self.clock = self.clock.after(delta);
         self.hw.with(|s| s.now = self.clock);

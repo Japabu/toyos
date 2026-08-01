@@ -30,6 +30,13 @@ pub struct SweepResult {
     pub worst_thread_spread: u64,
     pub worst_thread_bound: u64,
     pub worst_thread_over_bound: u64,
+    /// I13's *reach* over the whole sweep: virtual nanoseconds it had a
+    /// comparison open for, against the nanoseconds the sweep executed. A
+    /// change to the pick or the balance can close I13's windows instead of
+    /// failing them, so this is the number to A/B across one — a collapse here
+    /// means the gate went quiet, which is not the same as the gate passing.
+    pub thread_covered_ns: u64,
+    pub elapsed_ns: u64,
 }
 
 impl SweepResult {
@@ -50,13 +57,24 @@ impl SweepResult {
             self.worst_thread_bound = outcome.thread_bound;
         }
         self.worst_thread_over_bound = self.worst_thread_over_bound.max(outcome.thread_over_bound);
+        self.thread_covered_ns += outcome.thread_covered_ns;
+        self.elapsed_ns += outcome.elapsed;
+    }
+
+    /// What fraction of the sweep's executed time I13 had a comparison open
+    /// for, in percent. The reach, as one number to compare across a change.
+    pub fn thread_coverage_pct(&self) -> u64 {
+        if self.elapsed_ns == 0 {
+            return 0;
+        }
+        self.thread_covered_ns * 100 / self.elapsed_ns
     }
 
     pub fn report(&self) -> String {
         if self.passed() {
             format!(
                 "{}: {} runs, {} steps, clean (I5 worst spread {}/{} ns{}, \
-                 I13 worst spread {}/{} ns{})",
+                 I13 worst spread {}/{} ns{}, I13 reach {}%)",
                 self.scenario,
                 self.runs,
                 self.steps,
@@ -66,6 +84,7 @@ impl SweepResult {
                 self.worst_thread_spread,
                 self.worst_thread_bound,
                 past_the_bound(self.worst_thread_over_bound),
+                self.thread_coverage_pct(),
             )
         } else {
             format!(
@@ -108,6 +127,8 @@ pub fn seed_sweep(scenario: &Scenario, seeds: u64, keep_failures: usize) -> Swee
         worst_thread_spread: 0,
         worst_thread_bound: 0,
         worst_thread_over_bound: 0,
+        thread_covered_ns: 0,
+        elapsed_ns: 0,
     };
     for seed in 0..seeds {
         let mut choices = if seed % 2 == 0 {
@@ -164,6 +185,8 @@ pub fn fuzz_sweep(scenario: &Scenario, budget: u64, keep_failures: usize) -> Swe
         worst_thread_spread: 0,
         worst_thread_bound: 0,
         worst_thread_over_bound: 0,
+        thread_covered_ns: 0,
+        elapsed_ns: 0,
     };
     let mut generator = 0x9E3779B97F4A7C15u64;
     while result.steps < budget {
