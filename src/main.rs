@@ -54,6 +54,14 @@ fn main() {
     let smp = parse_smp(&args);
     let profile = parse_profile(&args);
     let mute = args.iter().any(|a| a == "--mute");
+    // A machine with no serial port has the framebuffer and nothing else, and
+    // the kernel stops painting it the moment userland claims it. `--diag-boot`
+    // builds the image that never does.
+    let boot = if args.iter().any(|a| a == "--diag-boot") {
+        toyos_build::build::Boot::Diag
+    } else {
+        toyos_build::build::Boot::Normal
+    };
     assert!(
         !(dump_audio && profile == qemu::Profile::Metal),
         "--dump-audio needs virtio-sound, which --metal-sim removes"
@@ -79,11 +87,12 @@ fn main() {
     toyos_build::toolchain::ensure(&root, rebuild_toolchain);
 
     // Build everything
-    toyos_build::build::build(&root, debug, release);
+    let image = toyos_build::build::build(&root, debug, release, boot);
     println!("Build finished.");
+    println!("Boot image: {}", image.display());
 
     if !build_only {
-        qemu::launch(&qemu::Options { debug, dump_audio, profile, smp, mute });
+        qemu::launch(&qemu::Options { debug, dump_audio, profile, smp, mute, image });
     }
 }
 

@@ -392,11 +392,47 @@ fn build_and_assemble(
 
 // --- Public API ---
 
-/// Full build: kernel, bootloader, all programs, boot image.
-pub fn build(root: &Path, debug: bool, release: bool) {
+/// Which boot the image being built is for.
+///
+/// The two differ only in the config they read, and that is the point: the
+/// diagnostic image's kernel and bootloader are byte-identical to the ordinary
+/// one's, so what the owner reads off a diag boot is what the shipping kernel
+/// does. A `#[cfg]` could not have given us that.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Boot {
+    Normal,
+    /// `diag/system.toml`: nothing in the image can claim the framebuffer, so
+    /// the kernel's last boot checkpoint stays on screen. `tests/toyos.rs`'s
+    /// `screen_diag_boot` boots this same config, so the tested image and the
+    /// flashed image are the same image.
+    Diag,
+}
+
+impl Boot {
+    fn config(self) -> &'static str {
+        match self {
+            Self::Normal => "system.toml",
+            Self::Diag => "diag/system.toml",
+        }
+    }
+
+    /// A separate output, so a diag build never leaves `bootable.img` quietly
+    /// contradicting the committed config. The previous flashed artifact was
+    /// made by editing `system.toml` and reverting it afterwards, which is
+    /// exactly the state this avoids.
+    fn image(self) -> &'static str {
+        match self {
+            Self::Normal => "target/bootable.img",
+            Self::Diag => "target/bootable-diag.img",
+        }
+    }
+}
+
+/// Full build: kernel, bootloader, all programs, boot image. Returns the image.
+pub fn build(root: &Path, debug: bool, release: bool, boot: Boot) -> PathBuf {
     let profile = if release { "release" } else { "debug" };
     let path_env = toolchain::path_with_toyos_ld(root);
-    let config = parse_config(&root.join("system.toml"));
+    let config = parse_config(&root.join(boot.config()));
     let fp = external_fingerprint(root);
 
     invalidate_stale(root, &config, &fp);
@@ -469,12 +505,15 @@ pub fn build(root: &Path, debug: bool, release: bool) {
     let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
     let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
     let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes);
-    fs::write(root.join("target/bootable.img"), disk_bytes).expect("Failed to write image");
+    let image_path = root.join(boot.image());
+    fs::write(&image_path, disk_bytes).expect("Failed to write image");
 
     let nvme_path = root.join("target/nvme.img");
     if !nvme_path.exists() {
         create_sparse(&nvme_path, 1024 * 1024 * 1024);
     }
+
+    image_path
 }
 
 /// Create an empty disk image the guest sees at full size and the host pays

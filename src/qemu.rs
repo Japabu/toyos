@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// The hardware shape QEMU presents to the guest.
@@ -57,6 +58,10 @@ pub struct Options {
     /// machine is identical, so this is the observability question and not
     /// the device-shape one.
     pub mute: bool,
+    /// The image to boot from, which `--diag-boot` moves off `bootable.img`.
+    /// Passed rather than hardcoded so a diag build cannot launch the ordinary
+    /// image and read the wrong screen.
+    pub image: PathBuf,
 }
 
 pub fn launch(opts: &Options) {
@@ -92,7 +97,10 @@ pub fn launch(opts: &Options) {
         .arg("-device")
         .arg("nec-usb-xhci,id=xhci")
         .arg("-drive")
-        .arg("if=none,id=stick,format=raw,file=target/bootable.img")
+        .arg(format!(
+            "if=none,id=stick,format=raw,file={}",
+            opts.image.display()
+        ))
         .arg("-device")
         .arg("usb-storage,bus=xhci.0,drive=stick,bootindex=0")
         .arg("-drive")
