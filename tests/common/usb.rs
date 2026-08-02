@@ -877,6 +877,132 @@ pub fn xhci_slow_connect(
     Ok(())
 }
 
+/// A controller on which PORTSC's write-1-to-clear bits mean what the spec says
+/// they mean — which QEMU's does not, and which is why every test in this suite
+/// was green while five devices on the T14 all reported "not enabled after
+/// reset".
+///
+/// PED is bit 1 and it is RW1CS: "A port may be disabled by software writing a
+/// '1' to this flag" (xHCI 1.2 §5.4.8 Table 5-27), and §4.19.1.1.6 takes the
+/// port from Enabled to Disabled when that write lands. §4.19.5 leaves PED and
+/// PRC both set after a successful reset, so a read-modify-write that cleared
+/// PRC by handing back everything else it read disabled the port it had just
+/// enabled — on every port, on every controller, on any machine whose PORTSC is
+/// made of silicon.
+///
+/// **The actuator is a kernel feature because nothing on the host side can
+/// reach it.** QEMU's `xhci_port_write` clears only
+/// `CSC|PEC|WRC|OCC|PRC|PLC|CEC` on a written '1', and PED is in neither that
+/// set nor its read/write set, so writing PED=1 there does nothing at all
+/// (`hw/usb/hcd-xhci.c`). No device or machine property changes that, and no
+/// sequence of register writes reaches a PED=0/CCS=1 port either — clearing PP
+/// is the closest and leaves PP=0, a different register state and a different
+/// diagnosis. `xhci-portsc-rw1c` replaces the *register*: after the driver
+/// writes PED=1 that port reads PED clear for every reader, and only a reset
+/// clears it, because a reset is what takes a real port out of Disabled
+/// (§4.19.1.1.3).
+///
+/// The count line is what stops this from passing because the feature was off.
+/// Only the emulation prints it, and it has to say zero — so "the injection is
+/// live" and "the driver never wrote PED" are separate assertions, and the
+/// per-port ones below are the register's own consequence rather than a verdict.
+pub fn xhci_portsc_rw1c(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    // Six devices rather than one, because the T14's failure was every port at
+    // once: a machine with a single stick cannot tell "one port survived" from
+    // "ports survive". The hub is a device the driver walks past, and the boot
+    // stick attaches at SuperSpeed, so both protocols' reset paths run here.
+    let options = BootOptions {
+        profile: Profile::MetalUsb,
+        kernel_features: &["xhci-portsc-rw1c"],
+        ..Default::default()
+    };
+    let argv = qemu::profile_argv(&options);
+    let usb = crate::usb_argv(&argv);
+    if usb.len() < 4 {
+        return Err(format!("this gate needs a crowded bus, argv has {usb:?}"));
+    }
+
+    let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+    let log = qemu.boot_log().to_string();
+
+    // The emulation ran and saw nothing. Without the first half a boot with the
+    // feature accidentally off passes everything below it.
+    const ACCOUNTED: &str = "xHCI: PED as RW1C, ";
+    let Some(verdict) = log.lines().find(|l| l.contains(ACCOUNTED)) else {
+        return Err(format!("the PED emulation never reported; was it compiled in?\n{log}"));
+    };
+    if !verdict.contains("0 port(s) disabled by a driver write") {
+        return Err(format!("the driver wrote PED=1 to a port: {verdict:?}\n{log}"));
+    }
+
+    // And the register's own consequence: every port that connected came out of
+    // its reset enabled. This is the pair of counts the T14 printed as 5 and 0.
+    let mut connected = 0usize;
+    let mut enabled = 0usize;
+    let mut refused: Vec<&str> = Vec::new();
+    for line in log.lines() {
+        let Some(rest) = line.split("xHCI: port ").nth(1) else { continue };
+        if rest.contains("connected") {
+            connected += 1;
+        }
+        if rest.contains("reset, speed=") {
+            enabled += 1;
+        }
+        if rest.contains("not enabled") || rest.contains("never finished its reset") {
+            refused.push(line);
+        }
+    }
+    if !refused.is_empty() {
+        return Err(format!("{} port(s) refused: {refused:?}\n{log}", refused.len()));
+    }
+    if connected != usb.len() {
+        return Err(format!(
+            "{connected} port(s) reported a device, {} on the bus:\n{log}",
+            usb.len()
+        ));
+    }
+    if enabled != connected {
+        return Err(format!(
+            "{connected} port(s) connected and {enabled} reached the Enabled state:\n{log}"
+        ));
+    }
+
+    // Enabled is not enumerated. A port can read PED=1 and still produce
+    // nothing, so the devices behind these ports have to come out the far end.
+    let slots = crate::parse_xhci_slots(&log);
+    if slots.len() != usb.len() {
+        return Err(format!(
+            "{} slots enabled for {} devices ({slots:?}):\n{log}",
+            slots.len(),
+            usb.len()
+        ));
+    }
+    let binds = crate::parse_xhci_binds(&log);
+    let keyboards = binds.iter().filter(|b| b.kind == "keyboard").count();
+    if keyboards != 2 {
+        return Err(format!("{keyboards} keyboards bound, want 2: {binds:?}\n{log}"));
+    }
+    let disks = log.matches("usb-storage: disk ").count();
+    if disks != 1 {
+        return Err(format!("{disks} disks bound, want the boot stick:\n{log}"));
+    }
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish\n{log}"));
+    }
+    serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+
+    eprintln!(
+        "  [xhci] PED honoured as RW1C: {connected}/{connected} ports connected reached Enabled, \
+         0 disabled by a driver write, {} slots, {keyboards} keyboards, {disks} disk",
+        slots.len()
+    );
+    Ok(())
+}
+
 /// A disk the driver refuses, on the port the controller enumerates *first*.
 ///
 /// `bind` claims a 64 KiB DMA pool block, issues Configure Endpoint — which
