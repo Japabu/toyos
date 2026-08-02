@@ -280,6 +280,22 @@ impl BlockAccess for EspVolume {
     }
 }
 
+/// Whether a page re-read of a `/boot` file is allowed to succeed.
+///
+/// A kernel feature because nothing on the host side can stage it: the boot
+/// stick *is* the disk the guest is running from, so every QEMU-side way to
+/// make its reads fail — `readonly=on` is writes only, detaching the device,
+/// a smaller image — takes away the mount the failure has to be observed
+/// through, or the kernel the machine is running. `werror`/`rerror` act on the
+/// whole drive and would break the boot before there is a log to write.
+///
+/// The read is still *issued*, and only its verdict is replaced. Overriding it
+/// before the call would make this the mistake `FLUSH_SENSE` makes — an
+/// injection that also hides a broken transport, so the gate goes green on a
+/// boot where the device was never asked. Same reason `xhci-one-slot` and
+/// `i8042-fault` exist.
+const ESP_BACKING_READS: bool = !cfg!(feature = "esp-backing-read-fails");
+
 /// A file on the boot volume, as byte ranges the page-fault path can read
 /// without going back through the filesystem.
 struct EspBacking {
@@ -288,10 +304,10 @@ struct EspBacking {
 }
 
 impl FileBacking for EspBacking {
-    fn read_page(&self, file_offset: u64, buf: &mut [u8; 4096]) {
+    fn read_page(&self, file_offset: u64, buf: &mut [u8; 4096]) -> crate::block::BlockResult {
         buf.fill(0);
         if file_offset >= self.size {
-            return;
+            return Ok(());
         }
         let valid = (4096u64).min(self.size - file_offset) as usize;
         let mut done = 0usize;
@@ -301,7 +317,7 @@ impl FileBacking for EspBacking {
         let mut base = 0u64;
         for extent in &self.extents {
             if done >= valid {
-                return;
+                return Ok(());
             }
             let want = file_offset + done as u64;
             if want >= base + extent.len {
@@ -311,14 +327,34 @@ impl FileBacking for EspBacking {
             let within = want - base;
             let n = ((extent.len - within) as usize).min(valid - done);
             let mut guard = ESP.lock();
-            let Some(dev) = guard.as_mut() else { return };
-            if dev.read_at(extent.offset + within, &mut buf[done..done + n]).is_err() {
-                return;
+            let Some(dev) = guard.as_mut() else {
+                // Only reachable if a mount failed after installing the device
+                // — but silence here is what the other two backings do not do,
+                // and `serving zeros` is the string a triage greps for.
+                log!("esp: the boot volume is not mounted; serving zeros");
+                return Err(crate::block::BlockError);
+            };
+            let served = dev.read_at(extent.offset + within, &mut buf[done..done + n]);
+            if !ESP_BACKING_READS {
+                // The read above was issued and is the shipped one, so a
+                // transport that really broke is still what `served` says —
+                // the injection cannot hide it. What it does replace is the
+                // whole outcome of a failed read, verdict *and* buffer: a real
+                // failure returns here with these bytes still holding the zeros
+                // from `buf.fill(0)`, and a caller that got the data anyway
+                // would make every assertion about the consequences vacuous.
+                buf[done..done + n].fill(0);
+            }
+            if served.is_err() || !ESP_BACKING_READS {
+                log!("esp: read of {n} B at volume offset {} failed; serving zeros",
+                    extent.offset + within);
+                return Err(crate::block::BlockError);
             }
             drop(guard);
             done += n;
             base += extent.len;
         }
+        Ok(())
     }
 
     fn file_size(&self) -> u64 {

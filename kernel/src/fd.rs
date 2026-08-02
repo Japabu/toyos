@@ -459,24 +459,43 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
                 return Some(SyscallError::PermissionDenied.to_u64());
             }
             let mut written = 0;
+            let mut refused = false;
             while written < buf.len() {
                 let abs_pos = file.position + written;
                 let page_idx = (abs_pos / 4096) as u32;
                 let offset_in_page = abs_pos % 4096;
                 let remaining_in_page = 4096 - offset_in_page;
                 let to_write = remaining_in_page.min(buf.len() - written);
-                file_cache::write_page(
+                // A partial write whose page could not be re-read off the
+                // device is refused rather than merged into zeros, so this
+                // stops short instead of claiming bytes that are not in the
+                // file. Short counts are what `write` means; before this the
+                // return was `buf.len()` unconditionally.
+                if file_cache::write_page(
                     file.file_id,
                     page_idx,
                     offset_in_page,
                     &buf[written..written + to_write],
-                );
+                )
+                .is_err()
+                {
+                    refused = true;
+                    break;
+                }
                 written += to_write;
             }
-            file.position += buf.len();
+            if written == 0 && refused {
+                // The honest code does not exist: none of `SyscallError`'s nine
+                // variants means "the device did not do it", and adding one is
+                // an ABI change that needs discussing. `Unknown` is the only
+                // one that does not claim something false. Known issues carries
+                // the conversion; this is its first call site.
+                return Some(SyscallError::Unknown.to_u64());
+            }
+            file.position += written;
             file.modified = true;
             file.mtime = crate::clock::nanos_since_boot();
-            Some(buf.len() as u64)
+            Some(written as u64)
         }
         Descriptor::PipeWrite(w) | Descriptor::TtyWrite(w) => {
             match pipe::try_write(w.id(), buf) {

@@ -121,6 +121,7 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_descriptor_walk",
     "esp_filesystem",
     "esp_log_file",
+    "esp_backing_read_error",
     "cache_eviction",
     "va_exhaustion",
     "heap_ceiling_recovery",
@@ -1676,6 +1677,9 @@ fn run_machine_test(
         // Body in `tests/common/esp.rs`, same reason.
         "esp_filesystem" => common::esp::esp_filesystem(test_config, c_bins, rust_bins),
         "esp_log_file" => common::esp::esp_log_file(test_config, c_bins, rust_bins),
+        "esp_backing_read_error" => {
+            common::esp::esp_backing_read_error(test_config, c_bins, rust_bins)
+        }
         "usb_storage_write_error" => usb::usb_storage_write_error(test_config, c_bins, rust_bins),
         "usb_flush_optional" => usb::usb_flush_optional(test_config, c_bins, rust_bins),
         "xhci_deaf_registers" => usb::xhci_deaf_registers(test_config, c_bins, rust_bins),

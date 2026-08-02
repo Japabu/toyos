@@ -21,12 +21,14 @@ struct TmpfsBacking {
 }
 
 impl FileBacking for TmpfsBacking {
-    fn read_page(&self, file_offset: u64, buf: &mut [u8; 4096]) {
+    /// Never `Err`: the pages are the file, so there is no device to refuse.
+    fn read_page(&self, file_offset: u64, buf: &mut [u8; 4096]) -> crate::block::BlockResult {
         if file_offset >= file_cache::size(self.file_id) {
             buf.fill(0);
-            return;
+            return Ok(());
         }
         file_cache::copy_page_out(self.file_id, (file_offset / 4096) as u32, buf);
+        Ok(())
     }
 
     fn file_size(&self) -> u64 {

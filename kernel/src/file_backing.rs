@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
 use bcachefs::Extent;
+use crate::block::{BlockError, BlockResult};
 use crate::page_cache;
 
 const BLOCK_SIZE: usize = 4096;
@@ -12,7 +13,19 @@ const BLOCK_SIZE_U64: u64 = 4096;
 pub trait FileBacking: Send + Sync {
     /// Read one 4KB page of file data at `file_offset` into `buf`.
     /// If the offset extends beyond the file, zero-fill the remainder.
-    fn read_page(&self, file_offset: u64, buf: &mut [u8; BLOCK_SIZE]);
+    ///
+    /// `Err` means the store could not be read and `buf` holds zeros rather
+    /// than the file's bytes — fallible for the same reason every
+    /// [`BlockDevice`] method is: a hole and data must not be the same value.
+    /// The caller that must not ignore it is [`file_cache::write_page`], which
+    /// re-fetches through here before merging a partial write. Merging into a
+    /// fetch that failed and then flushing the result is how a 4 KiB region of
+    /// a file on disk becomes zeros.
+    ///
+    /// [`BlockDevice`]: crate::block::BlockDevice
+    /// [`file_cache::write_page`]: crate::file_cache::write_page
+    #[must_use = "a failed read left the buffer zeroed; it does not hold the file's bytes"]
+    fn read_page(&self, file_offset: u64, buf: &mut [u8; BLOCK_SIZE]) -> BlockResult;
 
     /// Total file size in bytes.
     fn file_size(&self) -> u64;
@@ -51,26 +64,27 @@ impl NvmeBacking {
 }
 
 impl FileBacking for NvmeBacking {
-    fn read_page(&self, file_offset: u64, buf: &mut [u8; BLOCK_SIZE]) {
+    fn read_page(&self, file_offset: u64, buf: &mut [u8; BLOCK_SIZE]) -> BlockResult {
         buf.fill(0);
         if file_offset >= self.size {
-            return;
+            return Ok(());
         }
         if let Some(block) = self.file_offset_to_block(file_offset) {
             // Direct disk read — bypasses block page cache.
             // File cache is the sole cache for file data.
             let mut raw = [0u8; BLOCK_SIZE];
             // `buf` is already zeroed, so a failed read leaves the caller a
-            // hole rather than another file's data. `read_page` has no way to
-            // say more than that; the trait above it is the one that needs an
-            // error channel next.
+            // hole rather than another file's data — and now says so in the
+            // return as well as in the log, so a caller that is about to merge
+            // a partial write into this page can decline instead.
             if page_cache::raw_block_read(block, &mut raw).is_err() {
                 log!("file: read of block {block} failed; serving zeros");
-                return;
+                return Err(BlockError);
             }
             let valid = BLOCK_SIZE.min((self.size - file_offset) as usize);
             buf[..valid].copy_from_slice(&raw[..valid]);
         }
+        Ok(())
     }
 
     fn file_size(&self) -> u64 {
@@ -116,10 +130,12 @@ impl InitrdBacking {
 }
 
 impl FileBacking for InitrdBacking {
-    fn read_page(&self, file_offset: u64, buf: &mut [u8; BLOCK_SIZE]) {
+    /// Never `Err`: the initrd is one image already in memory, so there is no
+    /// device under this to refuse.
+    fn read_page(&self, file_offset: u64, buf: &mut [u8; BLOCK_SIZE]) -> BlockResult {
         buf.fill(0);
         if file_offset >= self.size {
-            return;
+            return Ok(());
         }
         if let Some(ptr) = self.file_offset_to_ptr(file_offset & !(BLOCK_SIZE_U64 - 1)) {
             let valid = BLOCK_SIZE.min((self.size - file_offset) as usize);
@@ -127,6 +143,7 @@ impl FileBacking for InitrdBacking {
                 core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), valid);
             }
         }
+        Ok(())
     }
 
     fn file_size(&self) -> u64 {

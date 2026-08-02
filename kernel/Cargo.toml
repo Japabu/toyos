@@ -123,6 +123,17 @@ sched-check = ["toyos-sched/check"]
 # rotation code this drives is the shipped code — only the bound moves, exactly
 # as `test-small-caches` moves the cache ceilings. See `esp_log::MAX_LOG_BYTES`.
 esp-log-rotate-fast = []
+# Fail every re-read of a `/boot` file's page through `EspBacking`, with the
+# mount and the filesystem underneath it working. The boot stick is the disk
+# the guest is running from, so no QEMU-side way of failing its reads leaves
+# the machine booted and the volume mounted — `readonly=on` is writes only and
+# `rerror` takes the whole drive. The read is still issued and only its verdict
+# is replaced, so the injection cannot hide a device that was never asked. What
+# it drives is the partial write `esp_log` makes into an evicted page: before
+# the error channel existed, that merged the new bytes into a page of zeros and
+# flushed it back over `/boot/toyos/kernel.log`. See `fat32_adapter.rs`'s
+# `ESP_BACKING_READS`.
+esp-backing-read-fails = []
 
 # debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]

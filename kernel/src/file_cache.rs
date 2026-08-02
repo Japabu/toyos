@@ -161,7 +161,15 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
 
     let mut fetched = blank_page();
     if let Some(backing) = &backing {
-        backing.read_page(page_idx as u64 * PAGE_SIZE as u64, &mut fetched);
+        // A fetch that failed must not become a resident page. `buf` gets the
+        // zeros either way — this path has no error channel and adding one is
+        // an ABI change — but caching them would let the next partial write
+        // through `write_page` find the page resident, merge into the zeros
+        // and flush them back over the file.
+        if backing.read_page(page_idx as u64 * PAGE_SIZE as u64, &mut fetched).is_err() {
+            buf.fill(0);
+            return;
+        }
     }
     // else: tmpfs miss → zero-filled page (fetched is already zeroed)
 
@@ -186,7 +194,20 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
 
 /// Write data into a file page. Handles cache miss via the file's backing.
 /// Lock is NOT held during disk I/O for cache misses.
-pub fn write_page(file_id: FileId, page_idx: u32, offset: usize, data: &[u8]) {
+///
+/// `Err` means the page could not be re-read and **nothing was written**. A
+/// partial write into a page the cache does not hold has to fetch the bytes it
+/// is not overwriting; if that fetch fails, the only two options are to merge
+/// into zeros — which `flush_file` then persists, destroying 4 KiB of a file
+/// that was fine — or to refuse. It refuses. The caller decides what to do
+/// about a write that did not happen, which is a decision this layer does not
+/// have the standing to make silently.
+pub fn write_page(
+    file_id: FileId,
+    page_idx: u32,
+    offset: usize,
+    data: &[u8],
+) -> Result<(), block::BlockError> {
     // A resident page is written under the acquisition that found it. The
     // fetch path below drops the lock, and a sibling CPU's eviction inside
     // that window would otherwise leave the write merging into a blank page.
@@ -194,7 +215,7 @@ pub fn write_page(file_id: FileId, page_idx: u32, offset: usize, data: &[u8]) {
     {
         let mut cache = FILE_CACHE.lock();
         {
-            let Some(file) = cache.files.get_mut(&file_id) else { return };
+            let Some(file) = cache.files.get_mut(&file_id) else { return Ok(()) };
             if file.pages.contains_key(&page_idx) {
                 apply_write(file, page_idx, offset, data);
                 backing = None;
@@ -204,7 +225,7 @@ pub fn write_page(file_id: FileId, page_idx: u32, offset: usize, data: &[u8]) {
         }
         if backing.is_none() {
             evict_if_needed(&mut cache);
-            return;
+            return Ok(());
         }
     }
     let backing = backing.unwrap();
@@ -212,8 +233,10 @@ pub fn write_page(file_id: FileId, page_idx: u32, offset: usize, data: &[u8]) {
     let mut fetched = blank_page();
     if let Some(backing) = &backing {
         let page_start = page_idx as u64 * PAGE_SIZE as u64;
+        // Past the end there is nothing to preserve, so no fetch and no way
+        // for one to fail: this is a pure extension of the file.
         if page_start < backing.file_size() {
-            backing.read_page(page_start, &mut fetched);
+            backing.read_page(page_start, &mut fetched)?;
         }
     }
 
@@ -223,7 +246,7 @@ pub fn write_page(file_id: FileId, page_idx: u32, offset: usize, data: &[u8]) {
     let mut cache = FILE_CACHE.lock();
     let mut added = 0;
     {
-        let Some(file) = cache.files.get_mut(&file_id) else { return };
+        let Some(file) = cache.files.get_mut(&file_id) else { return Ok(()) };
         if !file.pages.contains_key(&page_idx) {
             file.pages.insert(page_idx, CachedPage::new(fetched));
             added = file.is_cache() as usize;
@@ -232,6 +255,7 @@ pub fn write_page(file_id: FileId, page_idx: u32, offset: usize, data: &[u8]) {
     }
     cache.cached_pages += added;
     evict_if_needed(&mut cache);
+    Ok(())
 }
 
 fn apply_write(file: &mut CachedFile, page_idx: u32, offset: usize, data: &[u8]) {

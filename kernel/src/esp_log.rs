@@ -239,7 +239,7 @@ impl Sink {
             if n == 0 {
                 break;
             }
-            self.append(&buf[..n]);
+            self.append(&buf[..n])?;
             moved += n;
         }
         if moved == 0 {
@@ -260,16 +260,27 @@ impl Sink {
     }
 
     /// Append into the file cache, page by page, exactly as `fd::write` does.
-    fn append(&mut self, data: &[u8]) {
+    ///
+    /// The error is the one this sink most needs to hear. An append is almost
+    /// always a partial write — [`Self::size`] is rarely a multiple of 4096 —
+    /// so once the tail page has been evicted, every line goes through a
+    /// re-read of it from the stick. If that read fails and the cache merges
+    /// into zeros anyway, the flush below writes 4 KiB of zeros over the log
+    /// this feature exists to produce, from the idle loop, on the one device in
+    /// the machine that can be pulled out. Propagating instead disables the
+    /// sink, which is what [`poll`] already does with a flush error.
+    fn append(&mut self, data: &[u8]) -> Result<(), &'static str> {
         let mut done = 0usize;
         while done < data.len() {
             let page = (self.size / 4096) as u32;
             let within = (self.size % 4096) as usize;
             let n = (4096 - within).min(data.len() - done);
-            file_cache::write_page(self.file_id, page, within, &data[done..done + n]);
+            file_cache::write_page(self.file_id, page, within, &data[done..done + n])
+                .map_err(|_| "the boot volume would not give back the page being appended to")?;
             self.size += n as u64;
             done += n;
         }
+        Ok(())
     }
 
     /// Make room by moving the full file aside, keeping one generation.

@@ -282,7 +282,15 @@ pub(crate) fn read_file_range(backing: &dyn crate::file_backing::FileBacking, of
         let off_in_block = (file_off % 4096) as usize;
         let chunk = (4096 - off_in_block).min(remaining);
 
-        backing.read_page(file_off - off_in_block as u64, &mut page_buf);
+        // A page the store would not give up ends the read here rather than
+        // contributing zeros. That is the same answer as EOF, and it is the
+        // answer this function's callers already handle: every one of them
+        // length-checks before indexing and treats a short return as a
+        // truncated table. Zeros would instead be a table full of null
+        // entries, which is a different and much quieter kind of wrong.
+        if backing.read_page(file_off - off_in_block as u64, &mut page_buf).is_err() {
+            break;
+        }
         result.extend_from_slice(&page_buf[off_in_block..off_in_block + chunk]);
 
         file_off += chunk as u64;
@@ -867,7 +875,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             log!("spawn: {}: cannot allocate a {}-byte TLS template", path, layout.tls_memsz);
             return Err(SyscallError::ResourceExhausted);
         };
-        elf::read_backing_into(backing.as_ref(), tls_file_off, tls_buf.ptr(), layout.tls_filesz);
+        if elf::read_backing_into(backing.as_ref(), tls_file_off, tls_buf.ptr(), layout.tls_filesz)
+            .is_err()
+        {
+            log!("spawn: {}: the TLS template could not be read off the device", path);
+            return Err(SyscallError::NotFound);
+        }
         Some(tls_buf)
     } else {
         None

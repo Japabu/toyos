@@ -640,3 +640,165 @@ pub fn log_on_device(
     let mut found = read_files(&image[start..start + len], &[name])?;
     need(found.pop().flatten(), name)
 }
+
+/// A `/boot` file's page that the device will not give back, and the partial
+/// write that used to merge into the hole and persist it.
+///
+/// `esp_log::Sink::append` writes at `size % 4096`, so an append is almost
+/// always a *partial* page write. `file_cache::write_page` re-reads such a page
+/// through the file's backing before merging, and once the page has been
+/// evicted that read goes to the stick. `EspBacking::read_page` returned `()`,
+/// so a failed read was indistinguishable from a page of zeros: the new bytes
+/// were merged into those zeros and `flush_file` wrote the result back over
+/// `/boot/toyos/kernel.log` — from the idle loop, with no line saying so, on
+/// the volume whose entire purpose is to be the diagnostic for a machine with
+/// no serial port.
+///
+/// Three separate claims, and none of them is the others:
+///
+/// - the failure is **reported** (`serving zeros`, the marker triage greps for,
+///   which this path could not emit at all);
+/// - the failure **propagates** — `EspBacking` → `file_cache::write_page` →
+///   `Sink::append` → `Sink::flush` → `poll`, which disables the sink. Every
+///   one of those five returned `()` or swallowed on some link of the chain;
+/// - the file on the device is **not corrupted**, checked on the host. This is
+///   the claim the other two exist to serve, and it is the one that stays
+///   meaningful if the log lines are ever reworded.
+pub fn esp_backing_read_error(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    // `test-small-caches` is what makes the page actually get evicted: at the
+    // shipped ceiling the log's few pages stay resident for the whole boot and
+    // the re-read the injection targets never happens. The eviction code is the
+    // shipped code; only the bound moves.
+    const FEATURES: &[&str] = &["esp-backing-read-fails", "test-small-caches"];
+    const SERVING_ZEROS: &str = "failed; serving zeros";
+    const GAVE_UP: &str = "esp-log: the boot volume would not give back the page being appended \
+                           to — /boot/toyos/kernel.log stops at";
+
+    let image_path = test_dir().join("esp-backing-read-fails.img");
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURES);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+    let (start, len) = esp_extent(&image, &image_path)?;
+
+    let boot_once = |what: &str| -> Result<String, String> {
+        let mut qemu = QemuInstance::boot_with_options(
+            test_config,
+            c_bins,
+            rust_bins,
+            BootOptions {
+                profile: qemu::Profile::Metal,
+                boot_image: Some(image_path.clone()),
+                kernel_features: FEATURES,
+                ..Default::default()
+            },
+        );
+        let boot = qemu.boot_log().to_string();
+        // Long enough for the idle loop to go round thousands of times, so a
+        // sink that kept trying would have written many pages by now.
+        std::thread::sleep(Duration::from_secs(2));
+        writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+        qemu.flush_stdin();
+        let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
+        drop(qemu);
+        for bad in ["!!! PANIC !!!", "panicked at"] {
+            if log.contains(bad) {
+                return Err(format!("{bad:?} on the {what} boot\n{log}"));
+            }
+        }
+        Ok(log)
+    };
+
+    // The first boot exists to leave a `kernel.log` behind, and that is the
+    // whole reason there are two. Within one boot the sink's own pages never
+    // leave the cache — every append sets the CLOCK reference bit, so the page
+    // it is appending to is the last one eviction would ever take, and the
+    // re-read this injection targets simply does not happen. It happens on the
+    // boot *after*: `esp_log::install` reopens a file that already has bytes,
+    // `EspFs::open_file` hands the cache a backing for it, nothing is resident,
+    // and the first append is a partial write into a page that has to come off
+    // the stick. Appending across boots is a documented property of the sink,
+    // not a contrivance for this test.
+    let first = boot_once("seeding")?;
+    if !first.contains("esp-log: this boot's kernel log continues in") {
+        return Err(format!("the sink never installed on the seeding boot\n{first}"));
+    }
+    let seeded = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+    if seeded.is_empty() {
+        return Err("the seeding boot left no kernel.log, so the second boot re-reads \
+                    nothing".to_string());
+    }
+
+    let log = boot_once("re-reading")?;
+    if !log.contains("esp-log: this boot's kernel log continues in") {
+        return Err(format!("the sink never installed on the second boot\n{log}"));
+    }
+
+    // 1. The injection reached the code, and the code said so. Before this
+    //    landed there was no string here to find: the two sibling backings
+    //    print `serving zeros` and this one returned in silence.
+    let reported = log.matches(SERVING_ZEROS).count();
+    if reported == 0 {
+        return Err(format!(
+            "no {SERVING_ZEROS:?} line — either the injection never reached a page re-read (so \
+             this boot proves nothing) or the ESP backing is still failing silently\n{log}"
+        ));
+    }
+
+    // 3. And the machine is fine. A refusal that costs the boot is not a fix.
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish with its log sink disabled\n{log}"));
+    }
+    if !log.contains("Shutting down.") {
+        return Err(format!("the guest did not shut down cleanly\n{log}"));
+    }
+
+    // 4. Ground truth: the file on the device. A page merged into a failed
+    //    re-fetch is `within` zero bytes followed by the appended text, so the
+    //    corruption is a run of NULs inside a file that is otherwise entirely
+    //    printable. Checked here rather than trusted from the console, because
+    //    the console is exactly what the guest would be wrong about.
+    let on_device = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+    if let Some(at) = on_device.iter().position(|&b| b == 0) {
+        let run = on_device[at..].iter().take_while(|&&b| b == 0).count();
+        return Err(format!(
+            "{run} NUL bytes at offset {at} of the {} the log holds on the device: a partial \
+             write was merged into a page the device would not give back, and flushed",
+            on_device.len()
+        ));
+    }
+    // And the seeding boot's own bytes are still there. This is the sharper
+    // half: the page the second boot could not re-read is the page the first
+    // boot's last lines are *in*, so merging into zeros does not append a hole,
+    // it replaces text that was already on the stick.
+    if !on_device.starts_with(&seeded) {
+        let at = on_device.iter().zip(&seeded).position(|(a, b)| a != b);
+        return Err(format!(
+            "the second boot rewrote the first boot's log: {} bytes became {}, first differing \
+             at {at:?}",
+            seeded.len(),
+            on_device.len()
+        ));
+    }
+
+    // 2. It propagated the whole way. `poll` is five call frames above the
+    //    device and only prints this if `write_page` refused rather than
+    //    merging — which is the fix.
+    let gave_up = log.matches(GAVE_UP).count();
+    if gave_up != 1 {
+        return Err(format!(
+            "the sink gave up {gave_up} times, wanted exactly one: a refused page has to reach \
+             `Sink::flush` as an error instead of being merged into zeros\n{log}"
+        ));
+    }
+
+    let _ = std::fs::remove_file(&image_path);
+    eprintln!(
+        "  [esp-log] {reported} page re-read(s) refused by the device: reported, propagated to \
+         the sink once, and the {} bytes the previous boot left in kernel.log are intact",
+        seeded.len()
+    );
+    Ok(())
+}

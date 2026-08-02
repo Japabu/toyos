@@ -1069,7 +1069,18 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<UserAddr> {
 
 /// Read from a file backing directly into a destination pointer.
 /// No heap allocation — reads 4KB at a time from the backing.
-pub(crate) fn read_backing_into(backing: &dyn crate::file_backing::FileBacking, offset: u64, dst: *mut u8, len: usize) {
+///
+/// `Err` on the first page the store would not give up, with the destination
+/// holding zeros from there on. Both callers refuse rather than continue: an
+/// image assembled from a failed read is a process built out of a hole, and
+/// the fault it eventually takes says nothing about the disk that caused it.
+#[must_use = "an image assembled from a failed read is zeros, not the program"]
+pub(crate) fn read_backing_into(
+    backing: &dyn crate::file_backing::FileBacking,
+    offset: u64,
+    dst: *mut u8,
+    len: usize,
+) -> crate::block::BlockResult {
     let mut remaining = len;
     let mut file_off = offset;
     let mut buf_off = 0usize;
@@ -1077,7 +1088,7 @@ pub(crate) fn read_backing_into(backing: &dyn crate::file_backing::FileBacking, 
     while remaining > 0 {
         let off_in_block = (file_off % 4096) as usize;
         let chunk = (4096 - off_in_block).min(remaining);
-        backing.read_page(file_off - off_in_block as u64, &mut page_buf);
+        backing.read_page(file_off - off_in_block as u64, &mut page_buf)?;
         unsafe {
             core::ptr::copy_nonoverlapping(
                 page_buf[off_in_block..off_in_block + chunk].as_ptr(),
@@ -1089,6 +1100,7 @@ pub(crate) fn read_backing_into(backing: &dyn crate::file_backing::FileBacking, 
         buf_off += chunk;
         remaining -= chunk;
     }
+    Ok(())
 }
 
 /// A loaded module image, addressed by the module's own virtual addresses.
@@ -1185,7 +1197,8 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     // of whatever the PMM handed out after this allocation.
     for seg in &layout.segments {
         let dst = image.subslice((seg.vaddr - vaddr_min) as usize, seg.filesz as usize);
-        read_backing_into(backing, seg.file_offset, dst.base(), dst.size());
+        read_backing_into(backing, seg.file_offset, dst.base(), dst.size())
+            .map_err(|_| "a segment could not be read off the device")?;
     }
     let t3 = crate::clock::nanos_since_boot();
 
