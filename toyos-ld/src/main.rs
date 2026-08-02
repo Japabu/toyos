@@ -61,13 +61,20 @@ fn main() {
         }
     }
 
-    let output_name = args.output.file_name().unwrap_or_default().to_string_lossy();
-    eprintln!("[toyos-ld] {output_name}: {:.3}s (resolve {:.3}s, link {:.3}s, {} objects, {:.1} MB)",
-        total_start.elapsed().as_secs_f64(),
-        resolve_time.as_secs_f64(),
-        link_time.as_secs_f64(),
-        objects.len(),
-        objects.iter().map(|(_, d)| d.len()).sum::<usize>() as f64 / 1_048_576.0);
+    // rustc invokes this, and reports anything on our stderr as a warning, so
+    // stderr is the channel a real linker warning has to arrive on and nothing
+    // else may share it. An env var rather than a flag because rustc passes the
+    // environment down untouched, where a flag would need -C link-arg at every
+    // site the build system sets rustflags.
+    if env::var_os("TOYOS_LD_TIMING").is_some() {
+        let output_name = args.output.file_name().unwrap_or_default().to_string_lossy();
+        eprintln!("[toyos-ld] {output_name}: {:.3}s (resolve {:.3}s, link {:.3}s, {} objects, {:.1} MB)",
+            total_start.elapsed().as_secs_f64(),
+            resolve_time.as_secs_f64(),
+            link_time.as_secs_f64(),
+            objects.len(),
+            objects.iter().map(|(_, d)| d.len()).sum::<usize>() as f64 / 1_048_576.0);
+    }
 }
 
 fn generate_map(output: &[u8], output_path: &PathBuf, inputs: &[(String, Vec<u8>)]) -> String {
