@@ -68,14 +68,29 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 const SCREEN_TESTS: &[&str] = &[
     "screen_decoder",
     "screen_diag_boot",
+    "screen_console_shell",
     "screen_i8042_health",
     "screen_recoverable_untouched",
     "screen_early_panic",
     "screen_late_panic",
     "screen_paged_scrollback",
     "screen_panic_muted",
+    "screen_console_panic",
     "screen_fatal_halt",
 ];
+
+/// What `screen_console_shell` types, and what it then looks for on its own.
+///
+/// The command's *output* differs from the command, which is the whole point:
+/// the shell echoes what is typed, so an assertion satisfiable by the echo says
+/// only that the console drew a key, not that anything ran. This is asserted as
+/// a whole trimmed row, so the echoed `/home/root> echo zqjxk` cannot satisfy
+/// it either.
+const CONSOLE_NONCE: &str = "zqjxk";
+/// `/bin/shell` cds to `$HOME` before its first prompt, and prints
+/// `"{cwd}> "` — without the trailing space, which the decoder trims off the
+/// end of every row.
+const CONSOLE_PROMPT: &str = "/home/root>";
 
 /// Tests whose machine shape *is* the test: metal-sim, where the PS/2
 /// keyboard is the only input source and no virtio device exists, or a q35
@@ -1258,6 +1273,187 @@ fn run_screen_test(
                     Some(f) => format!("log longer than the screen, footer reads {f}"),
                     None => "whole log on one screen, no footer".to_string(),
                 }
+            );
+            Ok(())
+        }
+        "screen_console_shell" => {
+            // The third boot mode, on the machine shape that gets flashed.
+            // What is under test is the whole chain a question travels on a
+            // machine with no serial port: the i8042 pin, the kernel's
+            // translation, `/bin/console`, the shell's stdin, its stdout, and
+            // the panel. **A test that asserted only that a prompt rendered
+            // would pass on a console that cannot read the keyboard**, which
+            // is exactly the path this program exists to bring up.
+            //
+            // Same config file `--console-boot` builds from and no test
+            // binaries in the initrd, so the image booted here is the image
+            // flashed — the property `screen_diag_boot` has for its mode.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("console");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                ready_marker: "console: ready",
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            let console = qemu.boot_log().to_string();
+            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+
+            let font = screen::ConsoleFont::load();
+            let dump = qemu.screendump_while(
+                Duration::from_secs(30),
+                Duration::from_millis(200),
+                |d| d.console_text(&font).contains(CONSOLE_PROMPT),
+            );
+            let before = dump.console_text(&font);
+            if !before.contains(CONSOLE_PROMPT) {
+                return Err(format!(
+                    "no {CONSOLE_PROMPT:?} on the panel 30 s after `console: ready`\n\
+                     decoded screen:\n{before}"
+                ));
+            }
+
+            // The seed. Claiming DEVICE_FRAMEBUFFER stops `boot_checkpoint`
+            // painting for the rest of the boot, so a console that merely
+            // cleared the screen would have traded the diagnostic that works
+            // today for one that might — and this is the line the metal track
+            // keeps having to read.
+            if !before.contains("i8042:") {
+                return Err(format!(
+                    "no `i8042:` line above the prompt: `/boot/toyos/kernel.log` never \
+                     reached the scrollback, so this console starts blank where the \
+                     diagnostic boot starts with the log\ndecoded screen:\n{before}"
+                ));
+            }
+            // Non-vacuity, and not a formality: a boot checkpoint paints the
+            // same lines off the same ring, so on a boot where the console
+            // never ran the assertion above could be satisfied by the kernel's
+            // own paint. It cannot, because that paint is in `font8x16.bin`
+            // and this screen decodes under the console's — which is a claim,
+            // so it is checked here and in `console_self_test` rather than
+            // assumed.
+            let kernel_font = dump.text();
+            if kernel_font.contains("i8042:") {
+                return Err(format!(
+                    "the kernel's own font decodes this screen, so what is up is a boot \
+                     checkpoint and not the console's paint\ndecoded screen:\n{kernel_font}"
+                ));
+            }
+
+            {
+                let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+                input.type_text(&format!("echo {CONSOLE_NONCE}\n"));
+            }
+
+            let dump = qemu.screendump_while(
+                Duration::from_secs(30),
+                Duration::from_millis(200),
+                |d| d.console_rows(&font).iter().any(|r| r.trim() == CONSOLE_NONCE),
+            );
+            let after = dump.console_text(&font);
+            print_screen(name, &after);
+            // A whole trimmed row, because the shell echoes what is typed:
+            // `contains` would be satisfied by `/home/root> echo zqjxk`, which
+            // says the console drew a keystroke and nothing about anything
+            // having run.
+            if !dump.console_rows(&font).iter().any(|r| r.trim() == CONSOLE_NONCE) {
+                return Err(format!(
+                    "typed `echo {CONSOLE_NONCE}` at the prompt and no row of the panel is \
+                     its output; the keyboard, the shell or the console did not carry it\n\
+                     decoded screen:\n{after}"
+                ));
+            }
+            if !after.contains(&format!("{CONSOLE_PROMPT} echo {CONSOLE_NONCE}")) {
+                return Err(format!(
+                    "the output is on screen but the echoed command line is not, so the \
+                     console is not showing what was typed\ndecoded screen:\n{after}"
+                ));
+            }
+            let rows = dump.console_rows(&font);
+            let log_rows = rows.iter().filter(|r| r.contains("[kernel ")).count();
+            eprintln!(
+                "  [console] {log_rows} kernel log rows above a prompt, and `echo \
+                 {CONSOLE_NONCE}` typed on the i8042 answered on the panel"
+            );
+            Ok(())
+        }
+        "screen_console_panic" => {
+            // Does claiming the framebuffer silence the panic report? Read off
+            // the code the answer is no — `render` ignores
+            // SCREEN_OWNED_BY_USERLAND entirely and only `boot_checkpoint`
+            // honours it — but nothing in the suite had ever staged the state
+            // that answers it: `screen_fatal_halt` boots `tests/testcases`,
+            // whose init list contains no framebuffer claimer at all, so the
+            // flag is false on every screen test that panics.
+            //
+            // Staged the real way round: the panic is triggered *through the
+            // console*, by typing at its prompt, so the screen the report has
+            // to paint over is a screen a userland process drew and owns.
+            // Unlike `screen_console_shell` this one carries the test binaries
+            // and a kernel feature, so it is not the flashed image — what it
+            // certifies is the kernel's behaviour, not the artifact.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("console");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                kernel_features: &["test-fatal-halt"],
+                ready_marker: "console: ready",
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu =
+                QemuInstance::boot_with_options(&config, c_bins, rust_bins, options);
+
+            let font = screen::ConsoleFont::load();
+            let before = qemu.screendump_while(
+                Duration::from_secs(30),
+                Duration::from_millis(200),
+                |d| d.console_text(&font).contains(CONSOLE_PROMPT),
+            );
+            // The premise. Without a console-drawn screen underneath, a
+            // report reaching the panel proves nothing about ownership and
+            // this test would be `screen_fatal_halt` on a different config.
+            if !before.console_text(&font).contains(CONSOLE_PROMPT) {
+                return Err(format!(
+                    "no console prompt to panic over\ndecoded screen:\n{}",
+                    before.console_text(&font)
+                ));
+            }
+
+            {
+                let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+                input.type_text("test_rs_test_panic_child 3\n");
+            }
+
+            let dump = qemu.screendump_until(FATAL_HALT_NONCE, Duration::from_secs(40));
+            let text = dump.text();
+            print_screen(name, &text);
+            if !text.contains(FATAL_HALT_NONCE) {
+                return Err(format!(
+                    "the fatal report never took the screen back from the console — which \
+                     would make `/bin/console` a downgrade on the machine it is for\n\
+                     decoded screen (kernel font):\n{text}\n\
+                     decoded screen (console font):\n{}",
+                    dump.console_text(&font)
+                ));
+            }
+            // The fill is what says the report repainted the *whole* screen
+            // rather than landing in a corner of the console's.
+            if dump.fill() != FILL_FATAL {
+                return Err(format!(
+                    "the report is on screen but the fill is {:?}, not the fatal {FILL_FATAL:?}",
+                    dump.fill()
+                ));
+            }
+            if dump.console_text(&font).contains(CONSOLE_PROMPT) {
+                return Err(format!(
+                    "the console's prompt survived the report, so the panic painted over \
+                     part of the screen and left the rest\ndecoded screen:\n{text}"
+                ));
+            }
+            eprintln!(
+                "  [console] the fatal report took the screen back from a userland owner"
             );
             Ok(())
         }

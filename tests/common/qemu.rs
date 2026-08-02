@@ -1204,6 +1204,24 @@ impl QmpInput {
         self.send(&body);
     }
 
+    /// Type `text` on the guest's keyboard, one character at a time.
+    ///
+    /// The gap between characters is the wire's, not a settling delay for the
+    /// assertion: the i8042 carries one scancode per interrupt and the guest
+    /// has to drain each before the next, which is the same reason
+    /// `metal_sim_input` spaces its five keys.
+    pub fn type_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            let (qcode, shift) = qcode(ch);
+            if shift {
+                self.keys(&[("shift", true), (qcode, true), (qcode, false), ("shift", false)]);
+            } else {
+                self.keys(&[(qcode, true), (qcode, false)]);
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+    }
+
     /// One pointer packet: relative motion and/or a button transition.
     pub fn mouse(&mut self, dx: i32, dy: i32, button: Option<(&str, bool)>) {
         let mut body: Vec<String> = Vec::new();
@@ -1220,6 +1238,32 @@ impl QmpInput {
             }
         }
         self.send(&body);
+    }
+}
+
+/// The QEMU qcode for `ch`, and whether Shift is held to produce it.
+///
+/// A US layout, because that is what `kernel/src/keyboard.rs` boots with. Only
+/// the characters a console test types: an unmapped one panics rather than
+/// being dropped, since a command missing a character is a test asserting on
+/// output nothing was ever asked to produce.
+fn qcode(ch: char) -> (&'static str, bool) {
+    const LOWER: [&str; 26] = [
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
+        "s", "t", "u", "v", "w", "x", "y", "z",
+    ];
+    const DIGIT: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    match ch {
+        'a'..='z' => (LOWER[ch as usize - 'a' as usize], false),
+        'A'..='Z' => (LOWER[ch as usize - 'A' as usize], true),
+        '0'..='9' => (DIGIT[ch as usize - '0' as usize], false),
+        ' ' => ("spc", false),
+        '\n' => ("ret", false),
+        '-' => ("minus", false),
+        '_' => ("minus", true),
+        '.' => ("dot", false),
+        '/' => ("slash", false),
+        _ => panic!("no qcode for {ch:?}; add it rather than typing something else"),
     }
 }
 
