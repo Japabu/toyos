@@ -1867,6 +1867,32 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
+### Two C tests capture soundd's stdout instead of the program's
+
+`cargo test` at `dbbdcbe` is 215 passed, 2 failed, and both failures are
+`toyos-cc`'s: `71_macro_empty_arg` and `76_dollars_in_identifiers`, each
+"output mismatch". Neither is a compiler defect. The captured output *is*
+soundd's:
+
+```
+--- expected ---
+17
+--- actual ---
+soundd: ready, 8 buffers, 44100Hz 2ch, 512 bytes/period, 128 frames/period
+soundd: suspended
+```
+
+and `76`'s capture holds seven correct lines of the program's own output
+followed by nothing, cut off mid-run. So the window between `===TEST_START===`
+and `===TEST_END===` is picking up a daemon's lines and losing the tail of the
+program's — the console line-atomicity problem `Serial::interleaved` already
+names, on a test family that compares whole stdout rather than searching it.
+
+**Not caused by whatever you are working on** unless you are in `toyos-cc` or
+the console: reproduced with `git show HEAD:kernel/src/drivers/xhci/*` put back
+in the worktree, which is how the xHCI work at `dbbdcbe` established that these
+two were already red.
+
 ### INCIDENT — `677efae` swept six staged `bcachefs/` files that are not mine
 
 2026-08-01. Whoever is working in `bcachefs/` (`alloc_bitmap.rs`, `btree.rs`,
@@ -3101,8 +3127,9 @@ asks `xhci::storage_online`, which publishes the flag. Corroborated
 independently by `specs/type-safety-audit/usb-gate-teeth.md`, which called it a
 tautology.
 
-Still true that nothing in the suite sets `failed`, because the recovery path
-is unexecuted — see the Reset Endpoint entry below.
+The recovery path is no longer unexecuted: `usb-transport-break` drives it, and
+`usb_transport_break` asserts `healthy=true` across a break — which is the
+question this method exists to answer.
 
 ### USB mass storage: what is not implemented
 
@@ -3129,41 +3156,61 @@ disk needs. Deliberately absent, each with its reason:
   with preemption disabled for its duration. Fine at boot; a filesystem doing
   real I/O over USB will want the queue depth the transfer rings already allow.
 
-### `reset_recovery` issues Reset Endpoint on an endpoint that is not halted
+### CLOSED — recovery issued Reset Endpoint on an endpoint that was not halted
 
-Filed, not fixed. `Bot::Broken` means four different things — a phase error, a
-malformed or mistagged CSW, a stall the endpoint reset did not clear, or
-**silence** — and `scsi` answers all four with `reset_recovery`, whose first
-step for each endpoint is a Reset Endpoint command. The xHCI spec permits that
-command only on a Halted endpoint. On the silence path the device NAKed until
-`wait_transfer` gave up and the endpoint is still Running, so a conformant xHC
-answers Context State Error, `clear_stall` returns false, `reset_recovery`
-returns false, and `dev.failed` is set. **Nothing clears it**: no re-probe, no
-reset, no rebind. One transfer that times out takes the boot disk offline for
-the life of the boot, and on a machine booting off USB that is `/boot`,
-`log_file`, and every diagnostic after it.
+Gated by `usb_transport_break`. **Which recovery command is legal is a property
+of the endpoint's state, not of the error that ended the transfer.** Reset
+Endpoint is defined only for a Halted endpoint (xHCI 1.2 §4.6.8), Stop Endpoint
+only for a Running one (§4.6.9), Set TR Dequeue Pointer only for Stopped or
+Error (§4.6.10) — and `clear_stall` opened with Reset Endpoint whatever had
+happened. On the shapes that leave the endpoint Running, a conformant xHC
+answers Context State Error, recovery reported failure, and `dev.failed` was set
+with nothing in the driver able to clear it.
 
-**Why the one-line version is a no-op wearing a fix's clothes.** Accepting
-`CC_CONTEXT_STATE_ERROR` from Reset Endpoint leaves Set TR Dequeue Pointer
-next, which the spec permits only on a Stopped or Halted endpoint either — so
-recovery still fails, `dev.failed` is still set, and the change buys a
-different completion code in a log line. The real shape is the audit's:
-`Bot` distinguishes `Halted` from `Silent`, `Halted` keeps today's three
-steps, and `Silent` issues **Stop Endpoint** (TRB type 15, legal on a Running
-endpoint) before Set TR Dequeue and skips CLEAR_FEATURE(HALT) for an endpoint
-that is not halted.
+That is what the first metal boot with a working USB stack did. It mounted
+`/boot` off a stick and then lost it: `transport broke on SCSI 0x2a`, two
+`Reset Endpoint failed, code=19`, `reset recovery failed; disk is offline`, and
+the kernel log on that stick — the only diagnostic channel a T14 has — stopped
+where it stood.
 
-**The whole recovery path is unexecuted in a full run** — zero occurrences of
-`transport broke`, `Reset Endpoint` or `Set TR Dequeue` — so anything changed
-there is untested by construction until the actuator exists. That actuator is a
-kernel feature in `xhci-deaf-port`'s shape: make the next bulk transfer's
-`wait_transfer` return `None` without waiting. Two assertions worth having: the
-log says `transport broke`, and the *next* `read_blocks` on the same disk
-succeeds. A second half of the finding is that a `clear_stall` that succeeded
-and one that was never called are indistinguishable in the log, because it logs
-nothing on success — the `panic_console::capture` shape.
+`restart_endpoint` now reads the Endpoint State field of the device's *output*
+context and branches: Halted keeps the three steps, Running issues Stop
+Endpoint first, Stopped goes straight to Set TR Dequeue, and Disabled/Error are
+refused by name. CLEAR_FEATURE(ENDPOINT_HALT) goes out only for a halt, because
+a device that never halted may stall the request for asking. The state it found
+is logged, so a `restart_endpoint` that succeeded and one that was never called
+are no longer indistinguishable.
 
-Detail and the proposed enum in `specs/type-safety-audit/usb-storage.md` F3.
+`Bot::Broken` also stood for four different things and `scsi` logged none of
+them. It is now the error half of `bot`'s `Result`, a `Broke` naming the phase
+and the completion code — which is the line a machine with no serial port has to
+be diagnosed from, and the reason the cause of the T14's own break is still not
+known: the driver threw it away.
+
+**Reproduced on QEMU, both directions.** With the recovery forced back to an
+unconditional Reset Endpoint, `usb_transport_break` prints the T14's log
+verbatim — two `code=19`, disk offline, `wr_err=3 healthy=false`. With the fix,
+`wr_err=1 healthy=true` and every block the guest wrote after the break is
+byte-correct in the backing file on the host.
+
+Detail and the enum this grew out of in `specs/type-safety-audit/usb-storage.md`
+F3, whose `Halted`/`Silent` split is subsumed: the endpoint's own state answers
+the question that enum was inferring.
+
+### A control transfer that stalls during enumeration leaves EP0 halted for good
+
+Filed, not fixed, and visible on any boot of `Profile::MetalFullSpeed`:
+QEMU's `usb-wacom-tablet` stalls SET_PROTOCOL, and the driver logs
+`xHCI: SET_PROTOCOL on port 6: status stage completion code 6` and carries on.
+A stall halts EP0, and nothing clears it — there is no `restart_endpoint` for a
+control endpoint. Harmless today because enumeration issues no further control
+transfer to that device and the interrupt endpoint is configured afterwards
+regardless, so the tablet binds and delivers. It stops being harmless the moment
+anything wants to talk to a bound HID over EP0, which is what the mass-storage
+path already does on its recovery path.
+
+The same hole one level up: if `reset_recovery`'s Bulk-Only Reset request itself
+stalls, EP0 is halted and only the *bulk* endpoints are restarted.
 
 ### `bot`'s length assertion names `MSC_DATA_LEN` and binds a different buffer
 
