@@ -112,6 +112,7 @@ const MACHINE_TESTS: &[&str] = &[
     "i8042_budget_expiry",
     "i8042_fadt_denial",
     "i8042_kbd_echo",
+    "i8042_undecoded_bytes",
     "xhci_xecp_walk",
     "xhci_slot_exhaustion",
     "usb_storage_gate",
@@ -3312,6 +3313,11 @@ fn run_machine_test(
             if let Some(wrong) = quiet_log.lines().find(|l| l.contains("the pin asserts")) {
                 return Err(format!("the pin asserted with nothing to assert it: {wrong}"));
             }
+            // Nor its mute twin, which is reached from the same `irqs > 0` gate
+            // and would otherwise be a second line free to print on every boot.
+            if let Some(wrong) = quiet_log.lines().find(|l| l.contains("nothing decoded")) {
+                return Err(format!("bytes decoded to nothing with no bytes at all: {wrong}"));
+            }
             drop(quiet_boot);
 
             // Boot two: the same kernel, one keystroke.
@@ -3653,6 +3659,80 @@ fn run_machine_test(
             eprintln!("  [i8042] {}", refusal.trim());
             eprintln!("  [i8042] {}", attached.trim());
             eprintln!("  [i8042] typed {typed:?} on a keyboard that will not report its set");
+            Ok(())
+        }
+        "i8042_undecoded_bytes" => {
+            // The T14 said `1 interrupts, 1 bytes, 0 keys, 0 motion` and the
+            // counters could not name a suspect: 84 of the 256 single byte
+            // values decode to nothing under set 1, so the same arithmetic
+            // covers an extended key's harmless `0xE0` prefix, a `0xAA` from a
+            // keyboard that reset, a late `0xFA`, and a wire carrying raw
+            // set 2. Only the byte separates them.
+            //
+            // Pause is the injection because it is the one key whose whole
+            // sequence decodes to nothing by design — `E1 1D 45 E1 9D C5`,
+            // swallowed to keep the stream in frame — so bytes-with-zero-events
+            // is reproduced without a kernel feature and without depending on
+            // how the drain happens to batch. Then one plain letter, which is
+            // the other half: the first line must not be the last word on a
+            // keyboard that works.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions { profile: qemu::Profile::Metal, qmp: true, ..Default::default() },
+            );
+            if !qemu.boot_log().contains("i8042: kbd set2+xlat") {
+                return Err(format!("the PS/2 keyboard never came up:\n{}", qemu.boot_log()));
+            }
+            let result = qemu.run_test_hooked(
+                "test_rs_i8042_keyboard",
+                Duration::from_secs(20),
+                "===I8042_READY===",
+                |socket| {
+                    qemu::qmp_send_keys(socket, &[("pause", true), ("pause", false)]);
+                    thread::sleep(Duration::from_millis(200));
+                    qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            let Some(mute) = result.serial.lines().find(|l| l.contains("nothing decoded")) else {
+                return Err(format!(
+                    "bytes arrived and decoded to nothing and the driver never said so:\n{}",
+                    result.serial
+                ));
+            };
+            // The datum, not the count. `0xE1` is Pause's prefix and the first
+            // byte of the sequence whichever way the drain batched it; a line
+            // that reports only "N bytes, 0 keys" is the one this test exists
+            // to reject.
+            if !mute.contains("no event from [0xe1") {
+                return Err(format!("the line names no byte: {mute}"));
+            }
+            // And the picture corrects itself. A one-shot report would freeze
+            // the panel on the half-arrived sequence and never say the
+            // keyboard works after all — which on the T14 is a reflash.
+            let Some(alive) = result.serial.lines().find(|l| l.contains("the pin asserts")) else {
+                return Err(format!(
+                    "a letter was typed after the undecoded bytes and the driver never \
+                     revised its verdict:\n{}",
+                    result.serial
+                ));
+            };
+            let keys = alive
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find(|w| w[1].trim_end_matches(',') == "keys")
+                .and_then(|w| w[0].parse::<u64>().ok())
+                .ok_or_else(|| format!("unreadable alive line: {alive}"))?;
+            if keys == 0 {
+                return Err(format!("the revised verdict still decodes nothing: {alive}"));
+            }
+            eprintln!("  [i8042] {}", mute.trim());
+            eprintln!("  [i8042] {}", alive.trim());
             Ok(())
         }
         "i8042_absent" => {

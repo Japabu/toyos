@@ -194,6 +194,38 @@ bar; QEMU cannot.
   type — since a driver that logs the assumption and arms nothing passes every
   log-line assertion in it.
 
+  **The boot after that one worked.** First time on the metal it was written
+  for:
+
+  ```
+  i8042: kbd set2+xlat (assumed, the set query was refused) scanning on, GSI 1 -> vec 0x24 apic 0 on
+  i8042: aux rate=100 res=8/mm, GSI 12 -> vec 0x24 apic 0
+  i8042: armed at 1460ms, idle at 3394ms, 0 interrupts ... the pin has never asserted
+  i8042: the pin asserts ... 1 interrupts, 1 bytes, 0 keys, 0 motion, first seen at 11375ms
+  ```
+
+  Three things that had never happened. The driver attaches. The **aux port
+  initialises fully** — `rate=100 res=8/mm` is the TrackPoint answering its
+  whole reset/id/rate/resolution sequence, unreachable before because every
+  keyboard-side refusal returns ahead of that block. And a physical keypress
+  raised a real interrupt on GSI 1, which retires **R3**: the topology read off
+  the first-boot photograph is the topology that delivers, so `route`'s
+  read-back, the identity GSI and the unmask are all correct on Tiger Lake.
+  Two measurements fall out: the EC is slow but inside its budget (`armed at
+  1460ms` against a 2100 ms total), and `Boot: peripherals ready` went 6 ms →
+  398 ms, which is the aux reset stage running against a device that takes real
+  time rather than QEMU's microseconds.
+
+  **What it did not do is decode.** `1 bytes, 0 keys` — and the counters could
+  not name a suspect, because 84 of the 256 single byte values decode to nothing
+  under set 1 and `handle_key` drops a break for a usage nothing held. An
+  extended key's `0xE0`, where nothing is wrong, is indistinguishable in that
+  arithmetic from `0xAA`, `0xFA`, `0xEE` or a raw set-2 Enter (`0x5A`). The
+  health line now names the bytes that produced no event, and revises itself
+  once if a later byte does decode — `i8042_undecoded_bytes` gates both, by
+  injecting Pause, the one key whose whole sequence is swallowed by design.
+  Filed in known issues §8; the next diag boot answers it in one line.
+
   What is left of R1 is the residue: `0xEE` is a *response* byte, and the only
   defined meaning of `0xEE` on this wire is ECHO's reply, so an EC that answers
   it to something nobody echoed is an EC answering a command it does not
