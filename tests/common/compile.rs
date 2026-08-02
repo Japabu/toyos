@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::{env, fs};
 
 /// Root of the repository.
@@ -16,38 +17,46 @@ fn libc_dir() -> PathBuf {
     repo_root().join("userland/libc")
 }
 
-/// Build (if needed) and return the toyos libc archive path.
+/// Build and return the toyos libc archive every C test links against.
+///
+/// Cargo decides whether the archive is stale, because it is the only thing
+/// here that can: an existence check cannot see a source change, and an archive
+/// that outlives the libc it was built from links the C tests against a libc
+/// that is not in the tree. Once per process — 156 C tests link this.
 fn libc_archive_toyos() -> PathBuf {
-    let libc_dir = libc_dir();
-    let target = "x86_64-unknown-toyos";
-    let target_dir = libc_dir.join("target");
-    let archive = target_dir.join(format!("{target}/release/libtoyos_libc.a"));
+    static ARCHIVE: OnceLock<PathBuf> = OnceLock::new();
+    ARCHIVE
+        .get_or_init(|| {
+            let libc_dir = libc_dir();
+            let target = "x86_64-unknown-toyos";
+            let target_dir = libc_dir.join("target");
+            let archive = target_dir.join(format!("{target}/release/libtoyos_libc.a"));
 
-    if !archive.exists() {
-        let mut cmd = std::process::Command::new("cargo");
-        for (key, _) in env::vars() {
-            if key.starts_with("CARGO") || key == "RUSTC" || key == "RUSTFLAGS" {
-                cmd.env_remove(&key);
+            let mut cmd = std::process::Command::new("cargo");
+            for (key, _) in env::vars() {
+                if key.starts_with("CARGO") || key == "RUSTC" || key == "RUSTFLAGS" {
+                    cmd.env_remove(&key);
+                }
             }
-        }
-        let output = cmd
-            .env("RUSTUP_TOOLCHAIN", "toyos")
-            .args(["rustc", "--release", "--target", target, "--crate-type", "staticlib"])
-            .arg("--manifest-path")
-            .arg(libc_dir.join("Cargo.toml"))
-            .arg("--target-dir")
-            .arg(&target_dir)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to run cargo for toyos-libc: {e}"));
-        assert!(
-            output.status.success(),
-            "toyos-libc build failed:\n{}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
+            let output = cmd
+                .env("RUSTUP_TOOLCHAIN", "toyos")
+                .args(["rustc", "--release", "--target", target, "--crate-type", "staticlib"])
+                .arg("--manifest-path")
+                .arg(libc_dir.join("Cargo.toml"))
+                .arg("--target-dir")
+                .arg(&target_dir)
+                .output()
+                .unwrap_or_else(|e| panic!("failed to run cargo for toyos-libc: {e}"));
+            assert!(
+                output.status.success(),
+                "toyos-libc build failed:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
 
-    assert!(archive.exists(), "expected staticlib at {}", archive.display());
-    archive
+            assert!(archive.exists(), "expected staticlib at {}", archive.display());
+            archive
+        })
+        .clone()
 }
 
 /// Include paths for toyos-libc headers.
