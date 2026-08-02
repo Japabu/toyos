@@ -1867,31 +1867,74 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
-### Two C tests capture soundd's stdout instead of the program's
+### CLOSED — two C tests lost their last unterminated line, and the three ways it was read
 
-`cargo test` at `dbbdcbe` is 215 passed, 2 failed, and both failures are
-`toyos-cc`'s: `71_macro_empty_arg` and `76_dollars_in_identifiers`, each
-"output mismatch". Neither is a compiler defect. The captured output *is*
-soundd's:
+`1d0d448` and `5d0c5bd`. Three agents recorded a facet of this on 2026-08-02
+and none of the three was the whole of it, so it is written here as one story.
 
-```
---- expected ---
-17
---- actual ---
-soundd: ready, 8 buffers, 44100Hz 2ch, 512 bytes/period, 128 frames/period
-soundd: suspended
-```
+**The defect.** `start_c` in `userland/libc/src/lib.rs` called
+`toyos_abi::syscall::exit` directly, so a C program that returned from `main`
+ran neither the atexit table nor `fflush(NULL)`. C defines returning from
+`main` as calling `exit`; this never did. Harmless until `8de0a95`
+(2026-08-01) gave `FILE` a buffer: stdout on a serial console resolves to
+`IOLBF`, so from then on exactly the final *unterminated* segment was dropped.
+That is the whole selection rule for which tests failed —
+`71_macro_empty_arg` is one bare `printf("%d", ...)` and printed nothing at
+all, `76_dollars_in_identifiers` lost only `$$$=money`, and every other C test
+ends in a newline.
 
-and `76`'s capture holds seven correct lines of the program's own output
-followed by nothing, cut off mid-run. So the window between `===TEST_START===`
-and `===TEST_END===` is picking up a daemon's lines and losing the tail of the
-program's — the console line-atomicity problem `Serial::interleaved` already
-names, on a test family that compares whole stdout rather than searching it.
+**Why it appeared a day after the commit that caused it, in one that could
+not.** The suite was green at `f8ee2ac` with `8de0a95` already an ancestor,
+and `dbbdcbe`'s only libc change was renaming `VaList::arg` to `next_arg` at
+18 call sites — a misread variadic argument would print wrong digits rather
+than none, and would take every other C test that prints through the same
+`printf` with it. Neither fact needs explaining away.
 
-**Not caused by whatever you are working on** unless you are in `toyos-cc` or
-the console: reproduced with `git show HEAD:kernel/src/drivers/xhci/*` put back
-in the worktree, which is how the xHCI work at `dbbdcbe` established that these
-two were already red.
+`tests/common/compile.rs::libc_archive_toyos` built the archive every C test
+links **only if it did not exist**, so a source change never replaced it: the
+C tests had been linking a libc older than `8de0a95` all along. `dbbdcbe`'s
+`src/toolchain.rs` hunk drops `userland/libc/target/x86_64-unknown-toyos` on a
+toolchain rebuild, for the unrelated reason that its rlibs go stale with the
+sysroot. That deleted the archive, the next run rebuilt it, and a day-old
+defect surfaced under a commit that did not contain it. **The generalisation
+worth keeping: a build artifact that is only ever created, never invalidated,
+decouples "when a defect was written" from "when it is seen", and the second
+date is the one that gets blamed.**
+
+**Why the captures looked like soundd's stdout.** With the program's own
+output gone, what remained in `71`'s window was whatever else the shared
+console emitted, which was soundd's two boot lines. That was the symptom, not
+a second defect — but the window *is* porous, and that part is open below.
+
+`128_run_atexit` stays skipped: `exit` runs the atexit table now, but the file
+has no `main` without a per-config `-D`, `on_exit` does not exist in this
+libc, and `start_c` runs neither `.init_array` nor `.fini_array`. Its skip
+reason said "needs atexit" and no longer did.
+
+### A daemon's boot lines land in whichever test window is open
+
+`run_test` captures every non-kernel console line between `===TEST_START===`
+and `===TEST_END===` as the program's stdout, and the C family compares that
+whole capture against an `.expect` file. soundd prints `soundd: ready, ...`
+and one `soundd: suspended` once, at its own startup, on the same console —
+so whichever test is running then absorbs them and fails on output that is
+not its own.
+
+Where they land is a race with no fixed answer. At `dbbdcbe` it was
+`71_macro_empty_arg`, mid-C-section of a full run. In the full run at
+`5d0c5bd` nothing in the C family caught them. **A filtered single-test run is
+the worst case, not a cleaner one**: `cargo test -- 90_stdio_buffering` at
+`5d0c5bd` fails with `soundd: suspended` prepended to an otherwise byte-exact
+capture, because the one window opened is the one soundd's startup falls in.
+Judge the C family from a full run, and read a filtered red for *which* line
+differs before believing it.
+
+No cheap honest fix. The kernel tags its own lines `[kernel `, which is why
+those are already filtered; userland writes carry no attribution, so a daemon's
+line and the child's are the same bytes on the same fd. Either the child gets
+a capture channel of its own (the in-guest runner piping and framing its
+stdout, which has to keep the line-by-line liveness `run_test_hooked` depends
+on) or console writes gain a writer tag. Both are design calls, not repairs.
 
 ### INCIDENT — `677efae` swept six staged `bcachefs/` files that are not mine
 
