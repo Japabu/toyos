@@ -33,6 +33,14 @@ i8042-budget-expired = []
 # into the QOM tree the bit is read from, so there the claim and the hardware
 # always agree.
 i8042-fadt-denial = []
+# Answer the i8042 probe's `0xF0 0x00` scancode-set query with `0xEE` — ECHO's
+# own reply, and what the T14's EC answered on the laptop's own screen — on a
+# keyboard that is otherwise working. QEMU's PS/2 keyboard implements `0xF0`
+# to the letter (`hw/input/ps2.c`, `KBD_CMD_SCANCODE`) and no device or machine
+# property makes it stop, so the host side cannot hand the driver a keyboard
+# that will not report its set. Only the verdict is replaced; both bytes still
+# go out.
+i8042-kbd-echo = []
 # Script the input core directly at end of boot. QEMU activates one input
 # handler per device class, so two keyboards or two pointers can never both be
 # live in a guest — the merge has no end-to-end test and this is its only one.

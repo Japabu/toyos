@@ -605,8 +605,8 @@ const CONTROLLER_MS: u64 = 250;
 /// "a controller" from "something else decoding 0x60/0x64" — firmware trapping
 /// the ports in SMM for USB legacy emulation is the case that exists.
 const SELFTEST_MS: u64 = 500;
-/// `0xF5`, `0xF0 0x02`, the `0xF0 0x00` read-back and `0xF4`, each acknowledged
-/// by the keyboard itself rather than by the controller.
+/// `0xF5`, the `0xF0 0x00` read-back and `0xF4`, each acknowledged by the
+/// keyboard itself rather than by the controller.
 const KEYBOARD_MS: u64 = 750;
 /// The aux port's `0xFF` is a *device reset*: a real PS/2 device answers it
 /// with a self-test that takes real time, which is why this stage is the one
@@ -746,6 +746,70 @@ fn device_command(bytes: &[u8], deadline: u64) -> bool {
         }
     }
     true
+}
+
+/// What `0xF0 0x00` established.
+enum SetQuery {
+    /// The read-back byte, translated by the controller like every other byte
+    /// from port 1 — so it names the wire format, not just the set.
+    Told(u8),
+    /// A byte that is not an ack came back. The device does not implement the
+    /// exchange, and the byte is the diagnosis.
+    Refused(u8),
+    /// Nothing came back at all, or the controller never took a write.
+    Silent,
+}
+
+/// Ask the keyboard which scancode set it is in. Read, never write.
+///
+/// The matching write, `0xF0 0x02`, is not sent. On a translating controller
+/// nothing else in the machine's life sends it either: Linux's
+/// `atkbd_select_set` returns set 2 outright when `atkbd->translated` (which
+/// `i8042.c` derives from the XLATE bit of the config byte the BIOS left), and
+/// EDK2's `Ps2KeyboardDxe` selects a set only under `ExtendedVerification`,
+/// which its own comment says is skipped when booting an OS. A write cannot
+/// improve on a read that already answers, and an EC that mishandles it is left
+/// in a state nothing can name.
+fn query_scancode_set(deadline: u64) -> SetQuery {
+    if !write_data(0xF0, deadline) {
+        return SetQuery::Silent;
+    }
+    match read_data(deadline) {
+        Some(0xFA) => {}
+        Some(other) => return SetQuery::Refused(other),
+        None => return SetQuery::Silent,
+    }
+    if !write_data(0x00, deadline) {
+        return SetQuery::Silent;
+    }
+    // The T14 refused here, on the argument, having acked the command byte.
+    match echo_the_argument(read_data(deadline)) {
+        Some(0xFA) => {}
+        Some(other) => return SetQuery::Refused(other),
+        None => return SetQuery::Silent,
+    }
+    match read_data(deadline) {
+        Some(set) => SetQuery::Told(set),
+        None => SetQuery::Silent,
+    }
+}
+
+/// Under `i8042-kbd-echo`, the argument byte is answered `0xEE` — ECHO's own
+/// reply, and what the ThinkPad T14 Gen 2's EC answered on its own screen.
+/// QEMU's PS/2 keyboard implements `0xF0` to the letter and no device or
+/// machine property makes it stop, so nothing on the host side can hand the
+/// driver a keyboard that will not report its set. Only the verdict is
+/// replaced: the two bytes still go out and the reply the device queued behind
+/// them stays in the output buffer, which is the residue a real EC in an
+/// unnameable state would leave.
+#[cfg(feature = "i8042-kbd-echo")]
+fn echo_the_argument(_real: Option<u8>) -> Option<u8> {
+    Some(0xEE)
+}
+
+#[cfg(not(feature = "i8042-kbd-echo"))]
+fn echo_the_argument(real: Option<u8>) -> Option<u8> {
+    real
 }
 
 /// Same, for the aux port: every byte has to be prefixed with the controller
@@ -952,38 +1016,59 @@ pub fn init(rsdp_addr: u64) {
         log!("i8042: kbd would not stop scanning — disabled");
         return;
     }
-    if !device_command(&[0xF0, 0x02], kbd) {
-        log!("i8042: kbd refused scancode set 2 — disabled");
-        return;
-    }
-    if !device_command(&[0xF0, 0x00], kbd) {
-        log!("i8042: kbd refused the set read-back — disabled");
-        return;
-    }
-    let Some(mode) = read_data(kbd) else {
-        log!("i8042: kbd read-back never answered — disabled");
-        return;
-    };
-    // The controller translates the reply too, so the four answers fully
-    // determine the wire format. Refusing to decode a format we did not ask
-    // for is the point: one loud line naming the observed byte beats a
-    // keyboard that types nonsense on a machine we cannot single-step.
-    match mode {
-        0x41 => {}
-        0x01 => log!("i8042: kbd already set 1, translation off — decodable, unexpected"),
-        0x43 => {
+    // The controller translates the reply too, so the read-back names the wire
+    // format outright. Refusing to decode a format we did not ask for is the
+    // point: one loud line naming the observed byte beats a keyboard that types
+    // nonsense on a machine we cannot single-step.
+    //
+    // A device that will not answer at all — the ThinkPad T14 Gen 2's EC, which
+    // returns ECHO — is not a device that answers wrongly. There the
+    // wire format falls back to the *only* other evidence there is: the
+    // translate bit firmware itself left in the config byte. That is not a
+    // weaker version of the read-back, it is Linux's entire test — `i8042.c`
+    // sets `i8042_direct` from XLATE in the BIOS-left CTR and `atkbd` decodes
+    // set 1 on the strength of it, sending neither `0xF0` nor even `0xF2` on a
+    // portable device. Enabling a set2->set1 translator is coherent only for a
+    // device emitting set 2, so firmware having enabled it *is* a statement
+    // about the wire, made by the one party that had a working keyboard on it.
+    // Firmware having left translation off says nothing at all, and there the
+    // driver still refuses.
+    let (wire, how) = match query_scancode_set(kbd) {
+        SetQuery::Told(0x41) => ("set2+xlat", "readback 0x41"),
+        SetQuery::Told(0x01) => ("set1 raw", "readback 0x01, translation not applied"),
+        SetQuery::Told(0x43) => {
             log!("i8042: kbd DISABLED — readback 0x43 means set 1 through the set2 table");
             return;
         }
-        0x02 => {
+        SetQuery::Told(0x02) => {
             log!("i8042: kbd DISABLED — readback 0x02 means set 2 raw on the wire");
             return;
         }
-        other => {
+        SetQuery::Told(other) => {
             log!("i8042: kbd DISABLED — readback {:#04x} names no known wire format", other);
             return;
         }
-    }
+        SetQuery::Refused(byte) if before & CFG_TRANSLATE != 0 => {
+            log!(
+                "i8042: kbd will not report its scancode set (0xF0 0x00 answered {:#04x}); firmware's own cfg {:#04x} has translate on, so the wire is set 1",
+                byte,
+                before
+            );
+            ("set2+xlat", "assumed, the set query was refused")
+        }
+        SetQuery::Refused(byte) => {
+            log!(
+                "i8042: kbd DISABLED - the set query answered {:#04x} and firmware's cfg {:#04x} has translate off, so nothing says what the wire carries",
+                byte,
+                before
+            );
+            return;
+        }
+        SetQuery::Silent => {
+            log!("i8042: kbd DISABLED - the 0xF0 0x00 set query did not complete");
+            return;
+        }
+    };
     if !device_command(&[0xF4], kbd) {
         log!("i8042: kbd would not resume scanning — disabled");
         return;
@@ -1110,8 +1195,9 @@ pub fn init(rsdp_addr: u64) {
     crate::arch::cpu::enable_interrupts();
 
     log!(
-        "i8042: kbd set2+xlat (readback {:#04x}) scanning on, GSI {} -> vec {:#04x} apic {} {}",
-        mode,
+        "i8042: kbd {} ({}) scanning on, GSI {} -> vec {:#04x} apic {} {}",
+        wire,
+        how,
         kbd_line.gsi.0,
         I8042_VECTOR,
         apic_id,
