@@ -5,7 +5,7 @@ use super::{Trb, TrbRing, XhciController, PAGE};
 use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
 use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, CC_SUCCESS, CC_SHORT_PACKET};
-use super::{OP_PORT_BASE, PORT_REG_SIZE, PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC, PORTSC_RW1C};
+use super::{PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC};
 use super::hid::{HidType, HidRole, HidDevice};
 use super::msc::MscInterface;
 
@@ -257,27 +257,26 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
 
 /// Initialize and configure one USB device on a port.
 pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
-    let op_base = ctrl.op_base;
-    let portsc_off = OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE;
-    let portsc = super::read_portsc(&op_base, port_idx);
-    op_base.write_u32(portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PR);
+    let portsc = ctrl.read_portsc(port_idx);
+    ctrl.write_portsc(port_idx, super::portsc_neutral(portsc) | PORTSC_PR);
 
     // A port that asserts CCS and then never asserts PRC — a device pulled
     // between the scan and the reset, a marginal cable, a reset the controller
     // will not run — costs that port and not the boot. This spin had no
     // deadline, on the boot CPU, before the scheduler exists and with nothing
     // logged.
-    if !super::settles(|| super::PORT_ANSWERS && op_base.read_u32(portsc_off) & PORTSC_PRC != 0) {
+    if !super::settles(|| super::PORT_ANSWERS && ctrl.read_portsc(port_idx) & PORTSC_PRC != 0) {
         log!("xHCI: port {} never finished its reset (PORTSC {:#010x}); skipping it",
-            port_idx + 1, op_base.read_u32(portsc_off));
+            port_idx + 1, ctrl.read_portsc(port_idx));
         return;
     }
-    let portsc = super::read_portsc(&op_base, port_idx);
-    op_base.write_u32(portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PRC);
+    let portsc = ctrl.read_portsc(port_idx);
+    ctrl.write_portsc(port_idx, super::portsc_neutral(portsc) | PORTSC_PRC);
 
-    let portsc = super::read_portsc(&op_base, port_idx);
+    let portsc = ctrl.read_portsc(port_idx);
     if portsc & PORTSC_PED == 0 {
-        log!("xHCI: port {} not enabled after reset", port_idx + 1);
+        log!("xHCI: port {} reset but not enabled (PORTSC {portsc:#010x}); skipping it",
+            port_idx + 1);
         return;
     }
     let speed = ((portsc >> 10) & 0xF) as u8;
@@ -522,14 +521,20 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
 /// The root hubs must have settled first — [`super::await_connect_settle`] is
 /// what makes `PORTSC.CCS` a question with an answer.
 pub fn scan_ports(ctrl: &mut XhciController) {
-    let op_base = ctrl.op_base;
     for p in 0..ctrl.max_ports {
-        let portsc = super::read_portsc(&op_base, p);
-        if portsc & PORTSC_CCS != 0 {
-            log!("xHCI: port {} connected, speed={}", p + 1, (portsc >> 10) & 0xF);
+        // No speed here, deliberately: §4.19.5 says the Port Speed field "shall
+        // not be considered valid by software until after the PR bit transitions
+        // from a '1' to a '0'". QEMU fills it in from the QOM tree before any
+        // reset, so a line printing it here reads as fact on QEMU and as noise
+        // on hardware. The `port N reset, speed=` line below is the valid one.
+        if ctrl.read_portsc(p) & PORTSC_CCS != 0 {
+            log!("xHCI: port {} connected", p + 1);
             init_device(ctrl, p);
         }
     }
+    #[cfg(feature = "xhci-portsc-rw1c")]
+    log!("xHCI: PED as RW1C, {} port(s) disabled by a driver write",
+        ctrl.software_disabled_ports());
 }
 
 /// Configuration descriptors no device in reach will hand us.

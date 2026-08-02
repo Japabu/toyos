@@ -41,9 +41,26 @@ const PORTSC_PP:  u32 = 1 << 9;
 const PORTSC_SPEED: u32 = 0xF << 10;
 const PORTSC_CSC: u32 = 1 << 17;
 const PORTSC_PRC: u32 = 1 << 21;
-// All write-1-to-clear bits in PORTSC (must be masked during read-modify-write)
-const PORTSC_RW1C: u32 = PORTSC_CSC | (1 << 18) | (1 << 19) | (1 << 20)
-    | PORTSC_PRC | (1 << 22) | (1 << 23);
+
+/// PORTSC bits a write cannot change: CCS, OCA, the speed field, DR.
+const PORTSC_RO: u32 = PORTSC_CCS | (1 << 3) | PORTSC_SPEED | (1 << 30);
+/// PORTSC bits where writing back what was read reproduces the port's state:
+/// PLS, PP, PIC, and the three wake enables.
+const PORTSC_RWS: u32 = (0xF << 5) | PORTSC_PP | (0x3 << 14) | (0x7 << 25);
+
+/// The value to build a PORTSC write on top of, so that setting one bit sets
+/// exactly that bit.
+///
+/// Everything outside [`PORTSC_RO`] and [`PORTSC_RWS`] *acts* on a written '1':
+/// PR and WPR are RW1S, and PED and the seven change flags are RW1C. Writing
+/// back what was read therefore does something, and for PED — bit 1, RW1CS,
+/// "A port may be disabled by software writing a '1' to this flag", xHCI 1.2
+/// §5.4.8 Table 5-27 — what it does is take the port from Enabled to Disabled
+/// (§4.19.1.1.6). Linux calls this `xhci_port_state_to_neutral` and its
+/// `XHCI_PORT_RW1CS` is `(1<<1) | (0x7f<<17)`, PED included.
+fn portsc_neutral(portsc: u32) -> u32 {
+    portsc & (PORTSC_RO | PORTSC_RWS)
+}
 
 /// HCCPARAMS1 bit 3: the controller has Port Power Control, which is also what
 /// decides whether PORTSC's PP comes out of a reset clear or set.
@@ -212,30 +229,13 @@ const PORT_POLL_NS: u64 = 1_000_000;
 #[cfg(feature = "xhci-slow-connect")]
 const SLOW_CONNECT_NS: u64 = 300_000_000;
 
-/// Every read of a port register in this driver, so that what the connect
-/// settle sees and what `init_device` acts on cannot disagree.
-fn read_portsc(op_base: &Mmio, port_idx: u8) -> u32 {
-    let raw = op_base.read_u32(OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE);
-    #[cfg(feature = "xhci-slow-connect")]
-    if crate::clock::nanos_since_boot() < SLOW_CONNECT_NS {
-        return raw & !(PORTSC_CCS | PORTSC_PED | PORTSC_SPEED);
-    }
-    raw
-}
-
 /// One bit per root-hub port. HCSPARAMS1's MaxPorts is a byte, so four words
 /// cover every controller that can exist, and "did the connect state change"
 /// is one comparison rather than a per-port history.
 type PortMask = [u64; 4];
 
-fn connected_ports(op_base: &Mmio, max_ports: u8) -> PortMask {
-    let mut mask = [0u64; 4];
-    for p in 0..max_ports {
-        if read_portsc(op_base, p) & PORTSC_CCS != 0 {
-            mask[p as usize / 64] |= 1 << (p % 64);
-        }
-    }
-    mask
+fn port_bit(mask: &PortMask, port_idx: u8) -> bool {
+    mask[port_idx as usize / 64] & (1 << (port_idx % 64)) != 0
 }
 
 /// Wait for every root hub on the machine to stop changing its mind.
@@ -266,7 +266,7 @@ fn await_connect_settle(controllers: &[XhciController]) {
     let Some(powered_at) = controllers.iter().map(|c| c.powered_at).max() else { return };
     let mut seen: Vec<(PortMask, u64)> = controllers
         .iter()
-        .map(|c| (connected_ports(&c.op_base, c.max_ports), c.powered_at))
+        .map(|c| (c.connected_ports(), c.powered_at))
         .collect();
 
     loop {
@@ -291,7 +291,7 @@ fn await_connect_settle(controllers: &[XhciController]) {
             core::hint::spin_loop();
         }
         for (ctrl, (mask, changed_at)) in controllers.iter().zip(seen.iter_mut()) {
-            let now_mask = connected_ports(&ctrl.op_base, ctrl.max_ports);
+            let now_mask = ctrl.connected_ports();
             if now_mask != *mask {
                 *mask = now_mask;
                 *changed_at = crate::clock::nanos_since_boot();
@@ -608,11 +608,88 @@ pub struct XhciController {
     /// here even though the failing path would run one: releasing the block *is*
     /// the bug.
     msc_claimed: usize,
+
+    /// Ports this driver has written PED=1 to, which on a real controller are
+    /// Disabled and read PED clear until they are reset again.
+    ///
+    /// Kernel feature because nothing on the host side can stage it. QEMU's
+    /// `xhci_port_write` clears only `CSC|PEC|WRC|OCC|PRC|PLC|CEC` on a written
+    /// '1', and PED is in neither that set nor its read/write set, so a write of
+    /// PED=1 is a no-op there (`hw/usb/hcd-xhci.c`). On a real controller it
+    /// disables the port. No device or machine property changes that, and no
+    /// sequence of register writes reaches a PED=0/CCS=1 port on QEMU either:
+    /// clearing PP is the closest and leaves PP=0, which is a different register
+    /// state and a different diagnosis.
+    ///
+    /// What this replaces is the *register*, not a verdict — after the write the
+    /// port reads PED clear for every reader, which is the state the T14 showed
+    /// on all five of its ports — and only a reset clears it, because a reset is
+    /// the one thing that takes a real port out of Disabled (§4.19.1.1.3). Same
+    /// reason `xhci-slow-connect` and `xhci-deaf-port` exist.
+    #[cfg(feature = "xhci-portsc-rw1c")]
+    software_disabled: PortMask,
 }
 
 impl XhciController {
     pub(super) fn dma(&self) -> KernelSlice {
         self.pool.slice()
+    }
+
+    /// Every read of a port register in this driver, so that what the connect
+    /// settle sees and what `init_device` acts on cannot disagree.
+    fn read_portsc(&self, port_idx: u8) -> u32 {
+        let raw = self.op_base.read_u32(OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE);
+        #[cfg(feature = "xhci-slow-connect")]
+        if crate::clock::nanos_since_boot() < SLOW_CONNECT_NS {
+            return raw & !(PORTSC_CCS | PORTSC_PED | PORTSC_SPEED);
+        }
+        #[cfg(feature = "xhci-portsc-rw1c")]
+        if port_bit(&self.software_disabled, port_idx) {
+            return raw & !PORTSC_PED;
+        }
+        raw
+    }
+
+    /// Every write of a port register, for the same reason — and because the
+    /// bits that must not be written back are only maskable at one place.
+    fn write_portsc(&mut self, port_idx: u8, value: u32) {
+        // xHCI 1.2 §5.4.8 note 82: "The PED and PR flags are mutually exclusive.
+        // Writing the PORTSC register with PED and PR set to '1' shall result in
+        // undefined behavior." Unreachable from [`portsc_neutral`], which clears
+        // both, so this guards the next edit rather than this one.
+        assert!(value & (PORTSC_PED | PORTSC_PR) != PORTSC_PED | PORTSC_PR,
+            "xHCI: PORTSC write {value:#010x} sets PED and PR together on port {}", port_idx + 1);
+        #[cfg(feature = "xhci-portsc-rw1c")]
+        {
+            let word = port_idx as usize / 64;
+            let bit = 1u64 << (port_idx % 64);
+            if value & PORTSC_PED != 0 {
+                self.software_disabled[word] |= bit;
+            }
+            if value & PORTSC_PR != 0 {
+                self.software_disabled[word] &= !bit;
+            }
+        }
+        self.op_base.write_u32(OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE, value);
+    }
+
+    /// How many of this controller's ports the driver has disabled by writing
+    /// PED=1. Zero on a driver that neutralises PORTSC before writing it, and
+    /// the reason the gate can tell "the emulation is compiled in and saw
+    /// nothing" from "the emulation is not compiled in".
+    #[cfg(feature = "xhci-portsc-rw1c")]
+    fn software_disabled_ports(&self) -> u32 {
+        self.software_disabled.iter().map(|w| w.count_ones()).sum()
+    }
+
+    fn connected_ports(&self) -> PortMask {
+        let mut mask = [0u64; 4];
+        for p in 0..self.max_ports {
+            if self.read_portsc(p) & PORTSC_CCS != 0 {
+                mask[p as usize / 64] |= 1 << (p % 64);
+            }
+        }
+        mask
     }
 
     /// Take the next mass-storage pool block, for good.
@@ -1161,7 +1238,7 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         let off = OP_PORT_BASE + p as u64 * PORT_REG_SIZE;
         let portsc = op_base.read_u32(off);
         if portsc & PORTSC_PP == 0 {
-            op_base.write_u32(off, (portsc & !PORTSC_RW1C) | PORTSC_PP);
+            op_base.write_u32(off, portsc_neutral(portsc) | PORTSC_PP);
         }
         if op_base.read_u32(off) & PORTSC_PP != 0 {
             powered += 1;
@@ -1195,5 +1272,7 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         devices: Vec::new(),
         storage: Vec::new(),
         msc_claimed: 0,
+        #[cfg(feature = "xhci-portsc-rw1c")]
+        software_disabled: [0u64; 4],
     })
 }

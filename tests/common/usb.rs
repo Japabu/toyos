@@ -840,7 +840,11 @@ pub fn xhci_slow_connect(
     // would be green on a driver that never waits and a QEMU that answers
     // instantly, which is exactly the pair that shipped.
     let started = stamp_of(&log, "xHCI: controller started")?;
-    let first_seen = stamp_of(&log, " connected, speed=")?;
+    // The first line this driver prints about any port at all. Every other
+    // per-port line is preceded by that port's connect line, so the first match
+    // is the first connect whichever port register it lands on — which the
+    // profile does not fix, since a SuperSpeed stick appears on a high one.
+    let first_seen = stamp_of(&log, "xHCI: port ")?;
     let waited = first_seen - started;
     if waited < HELD_EMPTY_S {
         return Err(format!(

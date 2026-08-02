@@ -91,6 +91,15 @@ xhci-deaf-port = []
 # does, and the device that appears afterwards enumerates by the ordinary path.
 # See `xhci/mod.rs`'s `SLOW_CONNECT_NS`.
 xhci-slow-connect = []
+# Give PORTSC's PED bit (bit 1) the RW1CS meaning xHCI 1.2 §5.4.8 gives it: a
+# port software writes a '1' to goes from Enabled to Disabled (§4.19.1.1.6) and
+# reads PED clear until it is reset again. QEMU's `xhci_port_write` clears only
+# CSC|PEC|WRC|OCC|PRC|PLC|CEC on a written '1' and PED is in neither that set nor
+# its read/write set, so a write of PED=1 is a no-op there and no device, machine
+# property or register sequence makes it anything else. The register is replaced,
+# not a verdict: the port reads exactly what the T14's five ports read.
+# See `XhciController::software_disabled`.
+xhci-portsc-rw1c = []
 # Run `parse_config` over nine crafted configuration descriptors at init. The
 # bytes come from a device and every device QEMU can attach describes itself
 # correctly, so without this the parser's refusals — an endpoint address naming
