@@ -478,8 +478,8 @@ fn check_geometry(log: &str, bytes: u64, lba: u32) -> Result<(), String> {
 ///
 /// SYNCHRONIZE CACHE (0x35) is optional in SBC and a great many USB flash
 /// drives answer ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE. `msc_flush`
-/// read that as a failed flush; `EspFs::sync` logged the failure and returned
-/// `()`; the line it logged was new pending content in the ring `esp_log` was
+/// read that as a failed flush; `FatFs::sync` logged the failure and returned
+/// `()`; the line it logged was new pending content in the ring `log_file` was
 /// draining, and `Sink::flush` still said `Ok`, so the sink's disable path
 /// never ran. Every idle pass was then a file write, a FAT write and another
 /// SYNCHRONIZE CACHE on the stick the machine booted from, forever — and
@@ -519,7 +519,7 @@ fn optional_flush_keeps_the_log(
     let image_path = test_dir().join("usb-flush-optional.img");
     let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURE);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
-    let (start, len) = super::esp::esp_extent(&image, &image_path)?;
+    let (start, len) = super::volumes::log_extent(&image, &image_path)?;
 
     let mut qemu = QemuInstance::boot_with_options(
         test_config,
@@ -534,14 +534,14 @@ fn optional_flush_keeps_the_log(
     );
     let boot = qemu.boot_log().to_string();
 
-    // Mid-run and polled, exactly as `esp_log_file` does it: the claim is that
+    // Mid-run and polled, exactly as `kernel_log_file` does it: the claim is that
     // the sink is still running, and the only place that is visible is the
     // device while the machine is up.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut on_device;
     loop {
         on_device = String::from_utf8_lossy(
-            &super::esp::log_on_device(&image_path, start, len, "toyos/kernel.log")?,
+            &super::volumes::log_on_device(&image_path, start, len, "kernel.log")?,
         )
         .into_owned();
         if on_device.contains("Boot: complete") || std::time::Instant::now() >= deadline {
@@ -588,7 +588,7 @@ fn optional_flush_keeps_the_log(
         ));
     }
 
-    let after = super::esp::log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+    let after = super::volumes::log_on_device(&image_path, start, len, "kernel.log")?;
     let after = String::from_utf8_lossy(&after).into_owned();
     if !after.contains("Shutting down.") {
         return Err(format!(
@@ -647,7 +647,7 @@ fn failed_flush_stops_once(
         return Err(format!("the injected flush failure never reached the driver\n{log}"));
     }
     let gave_up = log
-        .matches("esp-log: the boot volume's device refused the sync — /boot/toyos/kernel.log \
+        .matches("log-file: the volume's device refused the sync — /log/kernel.log \
                   stops at")
         .count();
     if gave_up != 1 {

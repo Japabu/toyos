@@ -140,8 +140,10 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_portsc_rw1c",
     "xhci_descriptor_walk",
     "esp_filesystem",
-    "esp_log_file",
-    "esp_backing_read_error",
+    "kernel_log_file",
+    "log_backing_read_error",
+    "log_partition_layout",
+    "log_partition_identity",
     "cache_eviction",
     "va_exhaustion",
     "heap_ceiling_recovery",
@@ -1878,11 +1880,17 @@ fn run_machine_test(
         "usb_refused_disk_first" => {
             usb::usb_refused_disk_first(test_config, c_bins, rust_bins)
         }
-        // Body in `tests/common/esp.rs`, same reason.
-        "esp_filesystem" => common::esp::esp_filesystem(test_config, c_bins, rust_bins),
-        "esp_log_file" => common::esp::esp_log_file(test_config, c_bins, rust_bins),
-        "esp_backing_read_error" => {
-            common::esp::esp_backing_read_error(test_config, c_bins, rust_bins)
+        // Body in `tests/common/volumes.rs`, same reason.
+        "esp_filesystem" => common::volumes::esp_filesystem(test_config, c_bins, rust_bins),
+        "kernel_log_file" => common::volumes::kernel_log_file(test_config, c_bins, rust_bins),
+        "log_partition_layout" => {
+            common::volumes::log_partition_layout(test_config, c_bins, rust_bins)
+        }
+        "log_partition_identity" => {
+            common::volumes::log_partition_identity(test_config, c_bins, rust_bins)
+        }
+        "log_backing_read_error" => {
+            common::volumes::log_backing_read_error(test_config, c_bins, rust_bins)
         }
         "usb_storage_write_error" => usb::usb_storage_write_error(test_config, c_bins, rust_bins),
         "usb_flush_optional" => usb::usb_flush_optional(test_config, c_bins, rust_bins),
