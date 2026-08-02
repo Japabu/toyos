@@ -1,10 +1,11 @@
 use core::ptr::{write_volatile, write_bytes};
 
 use crate::log;
-use super::{Trb, TrbRing, XhciController, PAGE};
+use super::{Control, Trb, TrbRing, XhciController, PAGE};
 use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
 use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
-use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, CC_SUCCESS, CC_SHORT_PACKET};
+use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, TRB_EVALUATE_CONTEXT};
+use super::CC_SUCCESS;
 use super::{PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC};
 use super::hid::{HidType, HidRole, HidDevice};
 use super::msc::MscInterface;
@@ -124,14 +125,64 @@ impl Walk {
     }
 }
 
-fn max_packet_for_speed(speed: u8) -> u16 {
+/// EP0's Max Packet Size before the device has been asked, and `None` for a
+/// speed this driver has no encoding for.
+///
+/// Low, High and SuperSpeed each fix it — 8, 64 and 512 — and a device of that
+/// speed may report nothing else. **Full Speed does not.** `bMaxPacketSize0` is
+/// 8, 16, 32 or 64 there, and it is not known until the first eight bytes of
+/// the device descriptor have been read, which is itself a transfer over EP0.
+/// 8 is the size every full-speed device can answer at, so it is what Address
+/// Device carries and what Evaluate Context replaces once the device has said
+/// (xHCI 1.2 §4.3.4; Linux does the same in `xhci_setup_addressable_virt_dev`).
+///
+/// The old table answered 64 for Full Speed and **8 for everything it did not
+/// recognise**, so a SuperSpeedPlus port — speed 5, 6 or 7, which is every
+/// Gen 2 and every two-lane link — was addressed with a 64-fold undersized
+/// control endpoint and no line said so.
+fn initial_ep0_packet(speed: u8) -> Option<u16> {
     match speed {
-        2 => 8,    // Low Speed
-        1 => 64,   // Full Speed
-        3 => 64,   // High Speed
-        4 => 512,  // Super Speed
-        _ => 8,
+        1 | 2 => Some(8),
+        3 => Some(64),
+        4..=7 => Some(512),
+        _ => None,
     }
+}
+
+/// What `bMaxPacketSize0` means at this speed, or `None` when the device named
+/// a size a device of that speed does not have.
+///
+/// SuperSpeed states the *exponent*: the byte is 9 and the size is 512 (USB 3.2
+/// §9.6.1). Everything below it states the size itself, and only Full Speed has
+/// a choice to state.
+fn ep0_packet_from_descriptor(speed: u8, stated: u8) -> Option<u16> {
+    match (speed, stated) {
+        (1, 8 | 16 | 32 | 64) => Some(stated as u16),
+        (2, 8) => Some(8),
+        (3, 64) => Some(64),
+        (4..=7, 9) => Some(512),
+        _ => None,
+    }
+}
+
+/// Tell the controller the Max Packet Size of EP0 that only the device knew.
+///
+/// Evaluate Context rather than Configure Endpoint: §4.6.7 defines it as the
+/// command that changes exactly this field on a device that is already
+/// addressed, and the A1 flag alone is what says EP0 is the context to look at.
+fn evaluate_ep0_packet(ctrl: &mut XhciController, slot_id: u8, max_packet: u16) -> bool {
+    let dma = ctrl.dma();
+    let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
+    let input_ctx_ptr = input_ctx.base();
+    unsafe { input_ctx.zero(); }
+    ctrl.write_ctx32(input_ctx_ptr, 0, 1, 1 << 1);
+    let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((max_packet as u32) << 16);
+    ctrl.write_ctx32(input_ctx_ptr, 2, 1, ep0_dw1);
+
+    let mut evaluate = Trb::ZERO;
+    evaluate.param = input_ctx.phys();
+    evaluate.control = TRB_EVALUATE_CONTEXT | ((slot_id as u32) << 24);
+    ctrl.run_command(evaluate, "Evaluate Context (EP0 packet size)")
 }
 
 /// A little-endian 16-bit field at `at`, or 0 past the end. Descriptors are
@@ -281,6 +332,11 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
     }
     let speed = ((portsc >> 10) & 0xF) as u8;
     log!("xHCI: port {} reset, speed={}", port_idx + 1, speed);
+    let Some(initial_packet) = initial_ep0_packet(speed) else {
+        log!("xHCI: port {} came up at speed {speed}, which is not a speed this driver has a \
+             control-endpoint packet size for; skipping it", port_idx + 1);
+        return;
+    };
 
     let mut enable_slot = Trb::ZERO;
     enable_slot.control = TRB_ENABLE_SLOT;
@@ -322,8 +378,7 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
     ctrl.write_ctx32(input_ctx_ptr, 1, 0, slot_dw0);
     ctrl.write_ctx32(input_ctx_ptr, 1, 1, (port_idx as u32 + 1) << 16);
 
-    let max_packet = max_packet_for_speed(speed);
-    let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((max_packet as u32) << 16);
+    let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((initial_packet as u32) << 16);
     ctrl.write_ctx32(input_ctx_ptr, 2, 1, ep0_dw1);
     let ep0_dequeue = ep0_ring.dequeue();
     ctrl.write_ctx32(input_ctx_ptr, 2, 2, ep0_dequeue as u32);
@@ -340,7 +395,7 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
     let mut addr_dev = Trb::ZERO;
     addr_dev.param = input_ctx_phys;
     addr_dev.control = TRB_ADDRESS_DEVICE | ((slot_id as u32) << 24);
-    if ctrl.run_command(addr_dev, "Address Device").is_none() {
+    if !ctrl.run_command(addr_dev, "Address Device") {
         return;
     }
     log!("xHCI: device addressed");
@@ -351,30 +406,67 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
     let data_buf = dma.subslice(OFF_DATA_BUF, PAGE);
     let data_buf_ptr = data_buf.base();
     let data_buf_phys = data_buf.phys();
+
+    // Eight bytes, and only eight. `bMaxPacketSize0` is the eighth of them and
+    // on a full-speed device it is what decides whether a longer read can be
+    // transferred at all — so the prefix is read at a size every device of the
+    // speed can answer at and the endpoint context is corrected before the rest
+    // of the descriptor is asked for.
     unsafe { write_bytes(data_buf_ptr, 0, MAX_CONFIG_DESC); }
-    let code = ctrl.control_transfer(
-        slot_id, &mut ep0_ring, 0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 18,
+    let got = ctrl.control_transfer(
+        slot_id, &mut ep0_ring, 0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 8,
     );
-    if !matches!(code, Some(CC_SUCCESS) | Some(CC_SHORT_PACKET)) {
-        log!("xHCI: GET_DESCRIPTOR(Device) failed, code={:?}", code);
+    if !got.moved(8) {
+        log!("xHCI: port {} would not give up the first 8 bytes of its device descriptor: {got}",
+            port_idx + 1);
         return;
     }
+    let stated = unsafe { *data_buf_ptr.add(7) };
+    let Some(ep0_packet) = ep0_packet_from_descriptor(speed, stated) else {
+        log!("xHCI: port {} states bMaxPacketSize0={stated}, which is not a control packet size a \
+             speed-{speed} device has; skipping it", port_idx + 1);
+        return;
+    };
+    if ep0_packet != initial_packet {
+        log!("xHCI: port {} EP0 packet size {initial_packet} -> {ep0_packet}", port_idx + 1);
+        if !evaluate_ep0_packet(ctrl, slot_id, ep0_packet) {
+            return;
+        }
+    }
 
-    let descriptor = unsafe { core::slice::from_raw_parts(data_buf_ptr, MAX_CONFIG_DESC) };
+    unsafe { write_bytes(data_buf_ptr, 0, MAX_CONFIG_DESC); }
+    let got = ctrl.control_transfer(
+        slot_id, &mut ep0_ring, 0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 18,
+    );
+    if !got.moved(18) {
+        log!("xHCI: GET_DESCRIPTOR(Device) on port {}: {got}", port_idx + 1);
+        return;
+    }
+    let descriptor = unsafe { core::slice::from_raw_parts(data_buf_ptr, 18) };
     log!("xHCI: device class={:#x} vendor={:04x} product={:04x}",
         descriptor[4], le16(descriptor, 8), le16(descriptor, 10));
 
     unsafe { write_bytes(data_buf_ptr, 0, MAX_CONFIG_DESC); }
-    let code = ctrl.control_transfer(
+    let got = ctrl.control_transfer(
         slot_id, &mut ep0_ring, 0x80, 0x06, 0x0200, 0,
         Some(data_buf_phys), MAX_CONFIG_DESC as u16,
     );
-    if !matches!(code, Some(CC_SUCCESS) | Some(CC_SHORT_PACKET)) {
-        log!("xHCI: GET_DESCRIPTOR(Config) failed, code={:?}", code);
+    // Nine bytes is a configuration descriptor's own header, which is where
+    // `wTotalLength` lives; fewer than that is not one. The parser is then
+    // bounded by what *arrived* rather than by what was asked for, so the
+    // zeroes behind a short answer are never walked as descriptors.
+    let Control::Done { delivered } = got else {
+        log!("xHCI: GET_DESCRIPTOR(Config) on port {}: {got}", port_idx + 1);
+        return;
+    };
+    if delivered < 9 {
+        log!("xHCI: port {} answered {delivered} B to GET_DESCRIPTOR(Config); a configuration \
+             descriptor is at least 9", port_idx + 1);
         return;
     }
+    let config = unsafe { core::slice::from_raw_parts(data_buf_ptr, delivered as usize) };
 
-    let (config_val, function) = match parse_config(descriptor) {
+    let (config_val, function) = match parse_config(config) {
         Some(f) => f,
         None => {
             log!("xHCI: no HID boot interface found, skipping");
@@ -382,11 +474,11 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
         }
     };
 
-    let code = ctrl.control_transfer(
+    let set = ctrl.control_transfer(
         slot_id, &mut ep0_ring, 0x00, 0x09, config_val as u16, 0, None, 0,
     );
-    if code != Some(CC_SUCCESS) {
-        log!("xHCI: SET_CONFIGURATION failed, code={:?}", code);
+    if !set.done() {
+        log!("xHCI: SET_CONFIGURATION on port {}: {set}", port_idx + 1);
         return;
     }
     log!("xHCI: configuration set");
@@ -396,7 +488,7 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
             log!("xHCI: mass storage iface={} in={:#x}/{} out={:#x}/{}",
                 msc.iface_num, msc.in_ep.addr, msc.in_ep.max_packet,
                 msc.out_ep.addr, msc.out_ep.max_packet);
-            super::msc::bind(ctrl, ep0_ring, slot_id, speed, port_idx, &msc);
+            super::msc::bind(ctrl, ep0_ring, slot_id, block, speed, port_idx, &msc);
             return;
         }
         Function::Hid(info) => info,
@@ -413,11 +505,11 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
 
     // SET_PROTOCOL (boot protocol) — only for boot-interface devices
     if info.protocol != HidType::Tablet {
-        let code = ctrl.control_transfer(
+        let set = ctrl.control_transfer(
             slot_id, &mut ep0_ring, 0x21, 0x0B, 0, info.iface_num as u16, None, 0,
         );
-        if code != Some(CC_SUCCESS) {
-            log!("xHCI: SET_PROTOCOL failed, code={:?}", code);
+        if !set.done() {
+            log!("xHCI: SET_PROTOCOL on port {}: {set}", port_idx + 1);
         }
     }
 
@@ -461,7 +553,7 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
     let mut config_ep = Trb::ZERO;
     config_ep.param = input_ctx_phys;
     config_ep.control = TRB_CONFIGURE_EP | ((slot_id as u32) << 24);
-    if ctrl.run_command(config_ep, "Configure Endpoint").is_none() {
+    if !ctrl.run_command(config_ep, "Configure Endpoint") {
         return;
     }
     log!("xHCI: endpoint configured");

@@ -104,7 +104,9 @@ const TRB_LINK:         u32 = trb_type(6);
 const TRB_ENABLE_SLOT:    u32 = trb_type(9);
 const TRB_ADDRESS_DEVICE: u32 = trb_type(11);
 const TRB_CONFIGURE_EP:   u32 = trb_type(12);
+const TRB_EVALUATE_CONTEXT: u32 = trb_type(13);
 const TRB_RESET_ENDPOINT: u32 = trb_type(14);
+const TRB_STOP_ENDPOINT:  u32 = trb_type(15);
 const TRB_SET_TR_DEQUEUE: u32 = trb_type(16);
 
 // Event TRB types (read from event ring, encoded in bits [15:10])
@@ -118,6 +120,102 @@ const EVENT_CMD_COMPLETE: u32 = 33;
 const CC_SUCCESS: u32 = 1;
 const CC_STALL: u32 = 6;
 const CC_SHORT_PACKET: u32 = 13;
+
+/// How one control transfer ended.
+///
+/// `Done` carries the bytes the device actually moved, because the completion
+/// code cannot say: the Status Stage reports Success whether the Data Stage
+/// filled the buffer or left it untouched. A `GET_DESCRIPTOR` that returned
+/// nothing and one that returned all 18 bytes were the same value here, and the
+/// caller printed the buffer either way — which is how a T14 port that answered
+/// no descriptor at all was logged as `class=0x0 vendor=0000 product=0000`.
+///
+/// Three variants and no `Option`: the old `Option<u32>` had no code to carry
+/// on the one path where the device never answered, so every failure line read
+/// `code=Some(4)` and the reader had to know that `None` meant a timeout.
+#[derive(Clone, Copy)]
+enum Control {
+    /// Both stages completed. `delivered` is what the device moved in the data
+    /// stage, and zero for a transfer that has none.
+    Done { delivered: u16 },
+    /// The controller reported `code` for the named stage.
+    Failed { stage: &'static str, code: u32 },
+    /// The named stage never completed inside [`USB_TIMEOUT_NS`].
+    Silent { stage: &'static str },
+}
+
+impl Control {
+    /// Whether the device both finished the transfer and moved everything that
+    /// was asked of it. The two halves are one question for a descriptor read
+    /// and the caller has no use for them apart.
+    fn moved(self, wanted: u16) -> bool {
+        matches!(self, Self::Done { delivered } if delivered >= wanted)
+    }
+
+    /// Whether the transfer completed, for the requests that carry no data
+    /// stage and so have no byte count to check.
+    fn done(self) -> bool {
+        matches!(self, Self::Done { .. })
+    }
+}
+
+impl core::fmt::Display for Control {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Done { delivered } => write!(f, "{delivered} B delivered"),
+            Self::Failed { stage, code } => write!(f, "{stage} stage completion code {code}"),
+            Self::Silent { stage } => write!(
+                f,
+                "no answer to the {stage} stage in {} ms",
+                USB_TIMEOUT_NS / 1_000_000
+            ),
+        }
+    }
+}
+
+/// What the controller believes about one endpoint, out of the Endpoint State
+/// field of its *output* context (xHCI 1.2 Table 6-8, dword 0 bits 2:0).
+///
+/// Read rather than inferred from whatever ended the transfer, because the two
+/// disagree exactly where it matters: a transfer the driver abandoned on its
+/// deadline leaves no completion code at all and an endpoint that is still
+/// Running, and a Reset Endpoint aimed at one of those is the Context State
+/// Error a T14 answered twice before calling its own boot disk offline.
+#[derive(Clone, Copy, PartialEq)]
+enum EndpointState {
+    Disabled,
+    Running,
+    Halted,
+    Stopped,
+    /// 4 is Error, 5-7 are reserved and no xHC should report one. Neither has a
+    /// way back that does not re-run Configure Endpoint, so they are one case
+    /// here — and the number is carried because it is what the refusal names.
+    Unusable(u8),
+}
+
+impl EndpointState {
+    fn decode(raw: u32) -> Self {
+        match raw & 0x7 {
+            0 => Self::Disabled,
+            1 => Self::Running,
+            2 => Self::Halted,
+            3 => Self::Stopped,
+            other => Self::Unusable(other as u8),
+        }
+    }
+}
+
+impl core::fmt::Display for EndpointState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("Disabled"),
+            Self::Running => f.write_str("Running"),
+            Self::Halted => f.write_str("Halted"),
+            Self::Stopped => f.write_str("Stopped"),
+            Self::Unusable(n) => write!(f, "endpoint state {n}"),
+        }
+    }
+}
 
 /// How long the driver waits on any one command or transfer.
 ///
@@ -765,22 +863,38 @@ impl XhciController {
         }
     }
 
-    /// Submit `trb` and report the completion code, logging and returning
-    /// `None` on anything the controller did not accept. `what` names the
-    /// command in that line, because a bare code is unreadable at 3am.
-    fn run_command(&mut self, trb: Trb, what: &str) -> Option<u32> {
+    /// Submit `trb` and say whether the controller accepted it, logging
+    /// anything it did not. `what` names the command in that line, because a
+    /// bare code is unreadable at 3am.
+    ///
+    /// A `bool` and not the `Option<u32>` it was: the only `Some` that value
+    /// ever held was `CC_SUCCESS`, so every caller's `is_none()` was asking a
+    /// question the type pretended was open.
+    fn run_command(&mut self, trb: Trb, what: &str) -> bool {
         self.submit_command(trb);
         match self.wait_command() {
-            Some((CC_SUCCESS, _)) => Some(CC_SUCCESS),
+            Some((CC_SUCCESS, _)) => true,
             Some((code, _)) => {
                 log!("xHCI: {what} failed, code={code}");
-                None
+                false
             }
             None => {
                 log!("xHCI: {what} timed out");
-                None
+                false
             }
         }
+    }
+
+    /// The Endpoint State the controller published for (`dev_block`'s device,
+    /// `dci`).
+    ///
+    /// The output device context is DMA the controller owns, so this is a
+    /// volatile read of its dword 0. Endpoint contexts are indexed by DCI there
+    /// — unlike the *input* context, where the Input Control Context shifts
+    /// everything by one.
+    fn endpoint_state(&self, dev_block: usize, dci: u8) -> EndpointState {
+        let at = dev_block + DEV_OUT_CTX + dci as usize * self.context_size;
+        EndpointState::decode(unsafe { read_volatile(self.dma().ptr_at(at) as *const u32) })
     }
 
     fn advance_event_ring(&mut self) {
@@ -828,8 +942,7 @@ impl XhciController {
     }
 
     /// One control transfer on `ring`, which must be the EP0 ring named by
-    /// `slot`'s device context. Returns the completion code, or `None` when
-    /// the device never answered.
+    /// `slot`'s device context.
     fn control_transfer(
         &mut self,
         slot: u8,
@@ -840,7 +953,7 @@ impl XhciController {
         w_index: u16,
         data_buf: Option<u64>,
         data_len: u16,
-    ) -> Option<u32> {
+    ) -> Control {
         let is_in = (bm_request_type & 0x80) != 0;
         let has_data = data_len > 0 && data_buf.is_some();
         let trt = if !has_data { 0u32 } else if is_in { 3 } else { 2 };
@@ -856,7 +969,13 @@ impl XhciController {
             data.param = data_buf.unwrap();
             data.status = data_len as u32;
             let dir = if is_in { 1u32 << 16 } else { 0 };
-            data.control = TRB_DATA_STAGE | dir;
+            // ISP and IOC, which this TRB carried neither of. Without IOC the
+            // data stage produces no event at all and the only thing the driver
+            // ever sees is the status stage's Success; without ISP a device that
+            // answers short is not required to say so. Between them the two are
+            // the whole of "how many bytes are actually in that buffer", and a
+            // descriptor read has no other way to ask.
+            data.control = TRB_DATA_STAGE | dir | (1 << 2) | (1 << 5);
             ring.enqueue(data);
         }
 
@@ -866,7 +985,28 @@ impl XhciController {
         ring.enqueue(status);
 
         self.ring_doorbell(slot, 1);
-        self.wait_transfer(slot, 1).map(|(code, _)| code)
+
+        let mut delivered = 0u16;
+        if has_data {
+            match self.wait_transfer(slot, 1) {
+                Some((CC_SUCCESS | CC_SHORT_PACKET, residue)) => {
+                    // A residue past the length asked for is a controller
+                    // contradicting itself; believing it would report more bytes
+                    // delivered than the buffer holds.
+                    delivered = data_len.saturating_sub(residue.min(u16::MAX as u32) as u16);
+                }
+                // The status stage is deliberately not waited for. An errored
+                // data stage halts EP0, so the TRB behind it never runs, and
+                // waiting would spend the whole transfer budget learning that.
+                Some((code, _)) => return Control::Failed { stage: "data", code },
+                None => return Control::Silent { stage: "data" },
+            }
+        }
+        match self.wait_transfer(slot, 1) {
+            Some((CC_SUCCESS, _)) => Control::Done { delivered },
+            Some((code, _)) => Control::Failed { stage: "status", code },
+            None => Control::Silent { stage: "status" },
+        }
     }
 
     pub fn poll(&mut self) {

@@ -11,9 +11,10 @@ use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
 use super::device::Endpoint;
-use super::{Trb, TrbRing, XhciController, StorageGeometry, PAGE};
+use super::{EndpointState, Trb, TrbRing, XhciController, StorageGeometry, PAGE};
 use super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, TRB_CONFIGURE_EP};
-use super::{TRB_RESET_ENDPOINT, TRB_SET_TR_DEQUEUE, OFF_INPUT_CTX};
+use super::{TRB_RESET_ENDPOINT, TRB_STOP_ENDPOINT, TRB_SET_TR_DEQUEUE, OFF_INPUT_CTX};
+use super::USB_TIMEOUT_NS;
 use super::{MSC_IN_RING, MSC_OUT_RING, MSC_CBW, MSC_CSW, MSC_SCRATCH, MSC_SCRATCH_LEN};
 use super::{MSC_DATA, MSC_DATA_LEN, MSC_MAX_BLOCKS};
 
@@ -66,6 +67,10 @@ pub struct MscDevice {
     out_dci: u8,
     /// Byte offset of this device's block in its controller's DMA pool.
     block: usize,
+    /// And of the *device* block, which is a different one: it holds the output
+    /// device context the controller publishes this device's endpoint states
+    /// in, and those states are what decides which recovery command is legal.
+    dev_block: usize,
     ep0_ring: TrbRing,
     in_ring: TrbRing,
     out_ring: TrbRing,
@@ -110,17 +115,104 @@ impl MscDevice {
     }
 }
 
-/// How one Bulk-Only round trip ended.
+/// How one Bulk-Only round trip ended, when it ended at all.
+///
+/// Two variants and not three: everything that used to be `Broken` is the error
+/// half of [`XhciController::bot`]'s `Result`, and `residue` is bounded by the
+/// transfer it describes because the check that bounds it now runs before this
+/// value exists.
 enum Bot {
     /// CSW status 0. `residue` is what the device did not move, which for a
     /// READ or WRITE means the command did less than it was asked.
     Done { residue: u32 },
     /// CSW status 1: the device understood and refused. Sense data says why.
     Failed,
-    /// The device must be put back together before the next command: a phase
-    /// error, a malformed or mistagged CSW, a stall the endpoint reset did not
-    /// clear, or silence.
-    Broken,
+}
+
+/// Why a Bulk-Only round trip could not be completed.
+///
+/// One word used to stand for all of these, and `scsi` threw the rest away. On
+/// a machine with no serial port that is the whole diagnosis: a T14 booting off
+/// a stick said `transport broke on SCSI 0x2a` and nothing whatever about how,
+/// on the one path where *what happened* is what decides which recovery command
+/// is even legal.
+enum Broke {
+    /// The controller reported this completion code for the named phase.
+    Code { phase: &'static str, code: u32 },
+    /// Nothing came back for the named phase inside the transfer budget.
+    Silence { phase: &'static str },
+    /// The phase completed and moved the wrong number of bytes. A command block
+    /// and a status block are fixed-length structures, so a short one is not a
+    /// short transfer — it is a device that did not take the whole thing.
+    Short { phase: &'static str, moved: u32, wanted: u32 },
+    /// The endpoint stalled and the reset did not take.
+    Stall { phase: &'static str },
+    /// CSW status 2. The class calls this a phase error and requires Reset
+    /// Recovery for it — and it is one of the shapes that leaves both endpoints
+    /// *Running*, which is what makes an unconditional Reset Endpoint illegal.
+    PhaseError,
+    /// The CSW arrived and named somebody else's transfer.
+    Csw { what: &'static str, got: u32, want: u32 },
+    /// The CSW claims more bytes unmoved than the transfer had. Believing it
+    /// would underflow the byte count every caller then uses to decide how much
+    /// of the buffer is real.
+    Residue { unmoved: u32, of: u32 },
+}
+
+impl core::fmt::Display for Broke {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Code { phase, code } => write!(f, "{phase} phase completion code {code}"),
+            Self::Silence { phase } => write!(
+                f,
+                "no answer in the {phase} phase in {} ms",
+                USB_TIMEOUT_NS / 1_000_000
+            ),
+            Self::Short { phase, moved, wanted } => {
+                write!(f, "{phase} phase moved {moved} of {wanted} B")
+            }
+            Self::Stall { phase } => {
+                write!(f, "the {phase} phase stalled and the endpoint reset did not clear it")
+            }
+            Self::PhaseError => f.write_str("the device reported a phase error"),
+            Self::Csw { what, got, want } => write!(f, "CSW {what} {got:#x}, not {want:#x}"),
+            Self::Residue { unmoved, of } => {
+                write!(f, "CSW claims {unmoved} B unmoved of {of}")
+            }
+        }
+    }
+}
+
+/// Abandon one bulk transfer without waiting for it, once per boot, on the
+/// first WRITE(10) the driver issues.
+///
+/// **A kernel feature because nothing on the host side can stage it.** QEMU's
+/// `usb-storage` answers every CBW, data phase and CSW it is handed, in
+/// microseconds and in order; no device, drive or machine property makes one
+/// bulk transfer not complete, and `rerror`/`werror` fail the whole drive rather
+/// than leaving a transfer in flight. What is replaced is not a verdict — no
+/// completion code is invented and no CSW is forged. The TRB really is on the
+/// ring, the endpoint really is Running, and the controller really does complete
+/// the transfer afterwards; only the *wait* is skipped, which is precisely the
+/// state a transfer that ran out [`USB_TIMEOUT_NS`] leaves behind. So the
+/// recovery below runs against a real endpoint state, which is the whole thing
+/// under test. Same reason `xhci-one-slot` and `xhci-slow-connect` exist.
+#[cfg(feature = "usb-transport-break")]
+mod transport_break {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static UNSPENT: AtomicBool = AtomicBool::new(true);
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    /// Called where the driver is about to run a WRITE(10) data phase.
+    pub fn arm() {
+        ARMED.store(UNSPENT.swap(false, Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    /// Called after the doorbell, where the wait would otherwise begin.
+    pub fn take() -> bool {
+        ARMED.swap(false, Ordering::Relaxed)
+    }
 }
 
 /// The completion of one SCSI command, after the transport's own recovery.
@@ -375,22 +467,13 @@ impl XhciController {
         data_in: bool,
     ) -> Scsi {
         match self.bot(dev, cdb, cdb_len, data_phys, data_len, data_in) {
-            Bot::Done { residue } if residue <= data_len => {
-                Scsi::Ok { delivered: data_len - residue }
-            }
-            // A residue larger than the transfer is a device contradicting
-            // itself. Believing it would underflow the byte count every caller
-            // then uses to decide how much of the buffer is real.
-            Bot::Done { residue } => {
-                log!("usb-storage: CSW claims {residue} B unmoved of {data_len}");
-                Scsi::Broken
-            }
-            Bot::Failed => {
+            Ok(Bot::Done { residue }) => Scsi::Ok { delivered: data_len - residue },
+            Ok(Bot::Failed) => {
                 let (key, asc, ascq) = self.request_sense(dev);
                 Scsi::Refused { key, asc, ascq }
             }
-            Bot::Broken => {
-                log!("usb-storage: transport broke on SCSI {:#04x}, resetting",
+            Err(broke) => {
+                log!("usb-storage: transport broke on SCSI {:#04x}: {broke}",
                     cdb.first().copied().unwrap_or(0));
                 if !self.reset_recovery(dev) {
                     log!("usb-storage: reset recovery failed; disk is offline");
@@ -414,7 +497,7 @@ impl XhciController {
         // Recursion is not possible: a failing REQUEST SENSE goes through
         // `bot` directly, so it cannot ask for sense data about itself.
         match self.bot(dev, &cdb, 6, phys, 18, true) {
-            Bot::Done { residue } if residue <= 5 => {
+            Ok(Bot::Done { residue }) if residue <= 5 => {
                 let mut resp = [0u8; 18];
                 unsafe {
                     copy_nonoverlapping(
@@ -429,6 +512,29 @@ impl XhciController {
         }
     }
 
+    /// One fixed-length leg of the round trip — the command block or the status
+    /// block — which the device has to take or give in full. `what` names it in
+    /// the line a break produces.
+    fn framed_phase(
+        &mut self,
+        dev: &mut MscDevice,
+        in_dir: bool,
+        phys: u64,
+        len: u32,
+        what: &'static str,
+    ) -> Result<(), Broke> {
+        match self.bulk(dev, in_dir, phys, len) {
+            Some((CC_SUCCESS, 0)) => Ok(()),
+            Some((CC_SUCCESS | CC_SHORT_PACKET, residue)) => Err(Broke::Short {
+                phase: what,
+                moved: len.saturating_sub(residue),
+                wanted: len,
+            }),
+            Some((code, _)) => Err(Broke::Code { phase: what, code }),
+            None => Err(Broke::Silence { phase: what }),
+        }
+    }
+
     /// The Bulk-Only Transport round trip: command block out, data, status in.
     fn bot(
         &mut self,
@@ -438,7 +544,7 @@ impl XhciController {
         data_phys: u64,
         data_len: u32,
         data_in: bool,
-    ) -> Bot {
+    ) -> Result<Bot, Broke> {
         // The CDBs are this file's own, so their shape is a kernel invariant.
         assert!(cdb_len as usize <= cdb.len() && cdb_len <= 16);
         assert!(data_len as usize <= MSC_DATA_LEN);
@@ -458,43 +564,42 @@ impl XhciController {
         }
 
         let cbw_phys = dma.phys() + (dev.block + MSC_CBW) as u64;
-        match self.bulk(dev, false, cbw_phys, CBW_LEN) {
-            Some((CC_SUCCESS, 0)) => {}
-            _ => return Bot::Broken,
-        }
+        self.framed_phase(dev, false, cbw_phys, CBW_LEN, "command")?;
 
         if data_len > 0 {
+            #[cfg(feature = "usb-transport-break")]
+            if cdb.first() == Some(&0x2A) {
+                transport_break::arm();
+            }
             match self.bulk(dev, data_in, data_phys, data_len) {
-                Some((CC_SUCCESS, _)) | Some((CC_SHORT_PACKET, _)) => {}
+                Some((CC_SUCCESS | CC_SHORT_PACKET, _)) => {}
                 // A stalled data phase is ordinary — an unsupported command
                 // or a read past the end stalls here — and the CSW still
                 // arrives once the endpoint is unhalted. Recovering and then
                 // reading the status is what turns it into a clean refusal.
                 Some((CC_STALL, _)) => {
-                    if !self.clear_stall(dev, data_in) {
-                        return Bot::Broken;
+                    if !self.restart_endpoint(dev, data_in) {
+                        return Err(Broke::Stall { phase: "data" });
                     }
                 }
-                _ => return Bot::Broken,
+                Some((code, _)) => return Err(Broke::Code { phase: "data", code }),
+                None => return Err(Broke::Silence { phase: "data" }),
             }
         }
 
         let csw_phys = dma.phys() + (dev.block + MSC_CSW) as u64;
         unsafe { write_bytes(dma.ptr_at(dev.block + MSC_CSW), 0, CSW_LEN as usize); }
-        let mut got = self.bulk(dev, true, csw_phys, CSW_LEN);
-        if let Some((CC_STALL, _)) = got {
+        let mut got = self.framed_phase(dev, true, csw_phys, CSW_LEN, "status");
+        if let Err(Broke::Code { code: CC_STALL, .. }) = got {
             // The spec's one legal retry: the device may stall the status
             // phase once, and a second stall means it has lost the plot.
-            if !self.clear_stall(dev, true) {
-                return Bot::Broken;
+            if !self.restart_endpoint(dev, true) {
+                return Err(Broke::Stall { phase: "status" });
             }
             unsafe { write_bytes(dma.ptr_at(dev.block + MSC_CSW), 0, CSW_LEN as usize); }
-            got = self.bulk(dev, true, csw_phys, CSW_LEN);
+            got = self.framed_phase(dev, true, csw_phys, CSW_LEN, "status");
         }
-        match got {
-            Some((CC_SUCCESS, 0)) => {}
-            _ => return Bot::Broken,
-        }
+        got?;
 
         let csw = dma.subslice(dev.block + MSC_CSW, CSW_LEN as usize);
         let (signature, csw_tag, residue, status) = unsafe {
@@ -506,21 +611,22 @@ impl XhciController {
             )
         };
         if signature != CSW_SIGNATURE {
-            log!("usb-storage: CSW signature {signature:#010x}");
-            return Bot::Broken;
+            return Err(Broke::Csw { what: "signature", got: signature, want: CSW_SIGNATURE });
         }
         // A CSW carrying somebody else's tag is a device out of step with the
         // driver, and accepting it would attribute one command's status to
         // another — the failure mode where a write reports the success of the
         // read before it.
         if csw_tag != tag {
-            log!("usb-storage: CSW tag {csw_tag} for command {tag}");
-            return Bot::Broken;
+            return Err(Broke::Csw { what: "tag", got: csw_tag, want: tag });
+        }
+        if residue > data_len {
+            return Err(Broke::Residue { unmoved: residue, of: data_len });
         }
         match status {
-            0 => Bot::Done { residue },
-            1 => Bot::Failed,
-            _ => Bot::Broken,
+            0 => Ok(Bot::Done { residue }),
+            1 => Ok(Bot::Failed),
+            _ => Err(Broke::PhaseError),
         }
     }
 
@@ -546,29 +652,63 @@ impl XhciController {
         ring.enqueue(trb);
         let slot = dev.slot_id;
         self.ring_doorbell(slot, dci);
+        #[cfg(feature = "usb-transport-break")]
+        if transport_break::take() {
+            return None;
+        }
         self.wait_transfer(slot, dci)
     }
 
-    /// Take one bulk endpoint from Halted back to a state that runs TRBs.
+    /// Take one bulk endpoint back to a state that runs TRBs, by the route its
+    /// current state permits.
     ///
-    /// Three steps and all three are load-bearing: Reset Endpoint moves the
-    /// xHC's endpoint out of Halted, Set TR Dequeue tells it where to resume
-    /// (the ring is rewound, because the TRBs after the stalled one belong to
-    /// a transfer nobody is waiting for), and CLEAR_FEATURE(ENDPOINT_HALT)
-    /// clears the condition at the *device*, which otherwise stalls the next
-    /// packet exactly as it stalled this one.
-    fn clear_stall(&mut self, dev: &mut MscDevice, in_dir: bool) -> bool {
+    /// **Which command is legal is a property of the endpoint's state, not of
+    /// whatever ended the transfer.** Reset Endpoint is defined only for a
+    /// Halted endpoint (xHCI 1.2 §4.6.8), Stop Endpoint only for a Running one
+    /// (§4.6.9), and Set TR Dequeue Pointer for an endpoint already in Stopped
+    /// or Error (§4.6.10). A recovery that opens with Reset Endpoint every time
+    /// gets Context State Error whenever the break was not a halt — which is
+    /// silence, a phase error and a mistagged CSW, three of the shapes [`Broke`]
+    /// enumerates — and this driver read that answer as "the disk is gone".
+    ///
+    /// The ring is rewound whichever route was taken, because the TRBs behind
+    /// the one that broke belong to a transfer nobody is waiting for and Set TR
+    /// Dequeue is what tells the controller so. CLEAR_FEATURE(ENDPOINT_HALT)
+    /// goes out only for a halt: it clears the condition at the *device*, and a
+    /// device that never halted has nothing to clear and may stall the request
+    /// for asking.
+    fn restart_endpoint(&mut self, dev: &mut MscDevice, in_dir: bool) -> bool {
         let (dci, ep_addr, ring_off) = if in_dir {
             (dev.in_dci, dev.in_ep, MSC_IN_RING)
         } else {
             (dev.out_dci, dev.out_ep, MSC_OUT_RING)
         };
         let slot = dev.slot_id as u32;
+        let state = self.endpoint_state(dev.dev_block, dci);
+        log!("usb-storage: slot {} endpoint {dci} is {state}, recovering", dev.slot_id);
 
-        let mut reset = Trb::ZERO;
-        reset.control = TRB_RESET_ENDPOINT | (slot << 24) | ((dci as u32) << 16);
-        if self.run_command(reset, "Reset Endpoint").is_none() {
-            return false;
+        match state {
+            EndpointState::Halted => {
+                let mut reset = Trb::ZERO;
+                reset.control = TRB_RESET_ENDPOINT | (slot << 24) | ((dci as u32) << 16);
+                if !self.run_command(reset, "Reset Endpoint") {
+                    return false;
+                }
+            }
+            EndpointState::Running => {
+                let mut stop = Trb::ZERO;
+                stop.control = TRB_STOP_ENDPOINT | (slot << 24) | ((dci as u32) << 16);
+                if !self.run_command(stop, "Stop Endpoint") {
+                    return false;
+                }
+            }
+            EndpointState::Stopped => {}
+            EndpointState::Disabled | EndpointState::Unusable(_) => {
+                log!("usb-storage: slot {} endpoint {dci} is {state}; nothing short of Configure \
+                     Endpoint takes an endpoint out of that, and this driver does not \
+                     re-configure a bound disk", dev.slot_id);
+                return false;
+            }
         }
 
         let fresh = TrbRing::init(self.dma().subslice(dev.block + ring_off, PAGE));
@@ -582,35 +722,40 @@ impl XhciController {
         let mut set_dq = Trb::ZERO;
         set_dq.param = dequeue;
         set_dq.control = TRB_SET_TR_DEQUEUE | (slot << 24) | ((dci as u32) << 16);
-        if self.run_command(set_dq, "Set TR Dequeue").is_none() {
+        if !self.run_command(set_dq, "Set TR Dequeue") {
             return false;
         }
 
+        if state != EndpointState::Halted {
+            return true;
+        }
         let slot_id = dev.slot_id;
-        matches!(
-            self.control_transfer(slot_id, &mut dev.ep0_ring, 0x02, 0x01, 0, ep_addr as u16, None, 0),
-            Some(CC_SUCCESS)
-        )
+        let cleared =
+            self.control_transfer(slot_id, &mut dev.ep0_ring, 0x02, 0x01, 0, ep_addr as u16, None, 0);
+        if !cleared.done() {
+            log!("usb-storage: slot {slot_id} would not clear the halt on endpoint {ep_addr:#04x}: \
+                 {cleared}");
+        }
+        cleared.done()
     }
 
-    /// Bulk-Only Mass Storage Reset plus both endpoint clears: what the class
-    /// specification requires after a phase error, and the only way back from
-    /// a device whose command/data/status state machine no longer agrees with
-    /// the driver's.
+    /// Bulk-Only Mass Storage Reset plus whatever each endpoint needs: what the
+    /// class specification requires once the device's command/data/status state
+    /// machine no longer agrees with the driver's.
     fn reset_recovery(&mut self, dev: &mut MscDevice) -> bool {
         let slot = dev.slot_id;
         let iface = dev.iface as u16;
-        let reset = matches!(
-            self.control_transfer(slot, &mut dev.ep0_ring, 0x21, 0xFF, 0, iface, None, 0),
-            Some(CC_SUCCESS)
-        );
-        // Both clears run even if the reset request itself did not land: the
-        // endpoints are what the next command touches, and leaving one halted
-        // because the other step failed turns a recoverable device into a
-        // permanently offline one.
-        let cleared_in = self.clear_stall(dev, true);
-        let cleared_out = self.clear_stall(dev, false);
-        reset && cleared_in && cleared_out
+        let reset = self.control_transfer(slot, &mut dev.ep0_ring, 0x21, 0xFF, 0, iface, None, 0);
+        if !reset.done() {
+            log!("usb-storage: slot {slot} would not take a Bulk-Only Reset: {reset}");
+        }
+        // Both endpoints are restarted even if the class request did not land:
+        // the endpoints are what the next command touches, and leaving one
+        // stopped because the other step failed turns a recoverable device into
+        // a permanently offline one.
+        let restarted_in = self.restart_endpoint(dev, true);
+        let restarted_out = self.restart_endpoint(dev, false);
+        reset.done() && restarted_in && restarted_out
     }
 }
 
@@ -625,6 +770,7 @@ pub fn bind(
     ctrl: &mut XhciController,
     ep0_ring: TrbRing,
     slot_id: u8,
+    dev_block: usize,
     speed: u8,
     port_idx: u8,
     info: &MscInterface,
@@ -678,7 +824,7 @@ pub fn bind(
     let mut configure = Trb::ZERO;
     configure.param = input_ctx.phys();
     configure.control = TRB_CONFIGURE_EP | ((slot_id as u32) << 24);
-    if ctrl.run_command(configure, "Configure Endpoint (bulk)").is_none() {
+    if !ctrl.run_command(configure, "Configure Endpoint (bulk)") {
         return;
     }
 
@@ -690,6 +836,7 @@ pub fn bind(
         in_dci,
         out_dci,
         block,
+        dev_block,
         ep0_ring,
         in_ring,
         out_ring,
@@ -733,12 +880,13 @@ fn bring_up(ctrl: &mut XhciController, dev: &mut MscDevice) -> bool {
     let mut ready = false;
     loop {
         match ctrl.bot(dev, &[0x00u8; 6], 6, 0, 0, false) {
-            Bot::Done { .. } => {
+            Ok(Bot::Done { .. }) => {
                 ready = true;
                 break;
             }
-            Bot::Failed => sense = ctrl.request_sense(dev),
-            Bot::Broken => {
+            Ok(Bot::Failed) => sense = ctrl.request_sense(dev),
+            Err(broke) => {
+                log!("usb-storage: slot {} broke on TEST UNIT READY: {broke}", dev.slot_id);
                 if !ctrl.reset_recovery(dev) {
                     dev.failed = true;
                 }

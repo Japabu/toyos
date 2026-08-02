@@ -71,6 +71,17 @@ usb-storage-gate = []
 # `xhci/msc.rs`'s `FLUSH_SENSE`.
 usb-flush-unimplemented = []
 usb-flush-fails = []
+# Abandon the data phase of the first WRITE(10) of the boot without waiting for
+# it. QEMU's `usb-storage` answers every CBW, data phase and CSW it is handed,
+# in microseconds and in order; no device, drive or machine property makes one
+# bulk transfer not complete, and `rerror`/`werror` fail the whole drive instead
+# of leaving a transfer in flight. Nothing is faked: the TRB is really on the
+# ring, the endpoint is really left Running, and the controller really completes
+# the transfer afterwards — only the wait is skipped, which is the state a
+# transfer that ran out `USB_TIMEOUT_NS` leaves behind, and the state a
+# conformant xHC answers Reset Endpoint with Context State Error for. See
+# `xhci/msc.rs`'s `transport_break`.
+usb-transport-break = []
 # Starve one of the xHCI bring-up register waits on a controller that is
 # otherwise answering: `xhci-deaf-controller` the four in `init_one`,
 # `xhci-deaf-port` the port-reset wait in `init_device`. QEMU's xHC halts,
