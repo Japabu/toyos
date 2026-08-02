@@ -50,8 +50,10 @@ int main(void)
     fflush(stdout);
     fputs("stderr line\n", stderr);
 
-    /* Left pending deliberately: only exit's fflush(NULL) can emit this, so
-     * its absence from the expect file would mean exit stopped flushing. */
-    fputs("pending at exit\n", stdout);
+    /* Left pending deliberately, and with no newline: a terminated line would
+     * be flushed by line buffering on its way in, so only exit's fflush(NULL)
+     * can emit this one. Its absence means returning from main stopped going
+     * through exit. */
+    fputs("pending at exit", stdout);
     return 0;
 }

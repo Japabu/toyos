@@ -211,7 +211,7 @@ const C_SKIP: &[&str] = &[
     "125_atomic_misc",        // needs stdatomic.h (calls process::exit, not catchable)
     "126_bound_global",       // needs bounds checking
     "127_asm_goto",           // needs inline asm
-    "128_run_atexit",         // needs atexit
+    "128_run_atexit",         // needs on_exit, and a -D per config to have a main
     "132_bound_test",         // needs bounds checking
     "136_atomic_gcc_style",   // needs stdatomic.h (calls process::exit, not catchable)
 ];

@@ -37,12 +37,16 @@ mod runtime {
         );
     }
 
+    // Returning from `main` is defined as calling `exit` with its value, so this
+    // goes through libc's `exit` rather than the syscall: the atexit table and
+    // `fflush(NULL)` are what stand between a program's last unterminated line
+    // and the fd.
     extern "C" fn start_c(argc: i32, argv: *const *const u8) -> ! {
         unsafe extern "C" {
             fn main(argc: i32, argv: *const *const u8) -> i32;
         }
         let code = unsafe { main(argc, argv) };
-        toyos_abi::syscall::exit(code)
+        unsafe { crate::misc::exit(code) }
     }
 
     struct Stderr;
