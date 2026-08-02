@@ -37,11 +37,17 @@ const PORT_REG_SIZE: u64 = 0x10;
 const PORTSC_CCS: u32 = 1 << 0;
 const PORTSC_PED: u32 = 1 << 1;
 const PORTSC_PR:  u32 = 1 << 4;
+const PORTSC_PP:  u32 = 1 << 9;
+const PORTSC_SPEED: u32 = 0xF << 10;
 const PORTSC_CSC: u32 = 1 << 17;
 const PORTSC_PRC: u32 = 1 << 21;
 // All write-1-to-clear bits in PORTSC (must be masked during read-modify-write)
 const PORTSC_RW1C: u32 = PORTSC_CSC | (1 << 18) | (1 << 19) | (1 << 20)
     | PORTSC_PRC | (1 << 22) | (1 << 23);
+
+/// HCCPARAMS1 bit 3: the controller has Port Power Control, which is also what
+/// decides whether PORTSC's PP comes out of a reset clear or set.
+const HCC_PPC: u32 = 1 << 3;
 
 // Runtime Register offsets (from rt_base = BAR0 + rts_offset)
 // Interrupter 0 starts at offset 0x20
@@ -145,6 +151,154 @@ fn settles(ready: impl Fn() -> bool) -> bool {
 /// exist.
 const CONTROLLER_ANSWERS: bool = !cfg!(feature = "xhci-deaf-controller");
 const PORT_ANSWERS: bool = !cfg!(feature = "xhci-deaf-port");
+
+/// How long a root hub's connect state must hold still before the driver acts
+/// on it.
+///
+/// USB 2.0 §7.1.7.3 requires 100 ms of debounce between an attach being
+/// detected and the port reset that follows it — TATTDB, the interval Linux's
+/// `hub_port_debounce` calls `HUB_DEBOUNCE_STABLE`.
+const PORT_DEBOUNCE_NS: u64 = 100_000_000;
+
+/// How long a machine on which *nothing at all* has connected keeps looking.
+///
+/// The debounce above cannot answer this on its own, and that is not a detail:
+/// an empty port set has been "stable" since the instant power was applied, so
+/// a settle written only as "wait for the set to hold still" returns
+/// immediately on exactly the machine this code exists for. A device that is
+/// slow to appear and a bus with nothing on it are the same reading until one
+/// of them changes, so the only way to tell them apart without hotplug is to
+/// keep looking.
+///
+/// The asymmetry is deliberate: this is paid **only** by a machine that would
+/// otherwise report an empty bus, which is the outcome that cost the T14 its
+/// `/boot`. Any machine with one USB device anywhere settles on the debounce.
+///
+/// One second is policy, not physics. It covers the longest detection path a
+/// spec puts a number on — a SuperSpeed link that fails to train spends
+/// `tPollingLFPSTimeout` (360 ms, USB 3.2 §7.5.4.3) before it falls back, and
+/// the USB2 connect and debounce behind that add ~100 ms — and it sits under
+/// Linux's `HUB_DEBOUNCE_TIMEOUT` of 1500 ms.
+const EMPTY_BUS_NS: u64 = 1_000_000_000;
+
+/// When the driver stops waiting for a root hub that keeps changing its mind.
+///
+/// Policy, and the number is Linux's `HUB_DEBOUNCE_TIMEOUT`. What the caller
+/// sees when it is hit is a line naming the machine's port state and a scan of
+/// whatever is connected at that moment — a flapping port costs the boot a
+/// bounded second and a half, never the machine.
+const PORT_SETTLE_CEILING_NS: u64 = 1_500_000_000;
+
+/// How often the settle re-reads the port registers. Each pass is one MMIO read
+/// per port, so on the widest controller in reach this is 16 reads per
+/// millisecond of the debounce.
+const PORT_POLL_NS: u64 = 1_000_000;
+
+/// Report an empty root hub for the first [`SLOW_CONNECT_NS`] of the boot.
+///
+/// A kernel feature because nothing on the host side can stage it. QEMU fills
+/// PORTSC in from the QOM tree — an attached device reads CCS the instant the
+/// register is touched, before and after HCRST alike — so "connected in 300 ms,
+/// not now", which is what every physical root hub does after a controller
+/// reset, is not expressible as a device or a machine property. `device_add`
+/// cannot reach it either: the port scan runs in the peripheral phase, tens of
+/// milliseconds into a boot, and QMP cannot be aimed at that window.
+///
+/// What is replaced is the *register*, not a verdict. During the window the
+/// port reads exactly as an unpopulated one does — no CCS, no PED, speed zero —
+/// so a driver that believes it gets nothing to enumerate, and the device that
+/// appears afterwards is enumerated by the ordinary path with the ordinary
+/// bytes behind it. Same reason `xhci-one-slot` and `xhci-deaf-port` exist.
+#[cfg(feature = "xhci-slow-connect")]
+const SLOW_CONNECT_NS: u64 = 300_000_000;
+
+/// Every read of a port register in this driver, so that what the connect
+/// settle sees and what `init_device` acts on cannot disagree.
+fn read_portsc(op_base: &Mmio, port_idx: u8) -> u32 {
+    let raw = op_base.read_u32(OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE);
+    #[cfg(feature = "xhci-slow-connect")]
+    if crate::clock::nanos_since_boot() < SLOW_CONNECT_NS {
+        return raw & !(PORTSC_CCS | PORTSC_PED | PORTSC_SPEED);
+    }
+    raw
+}
+
+/// One bit per root-hub port. HCSPARAMS1's MaxPorts is a byte, so four words
+/// cover every controller that can exist, and "did the connect state change"
+/// is one comparison rather than a per-port history.
+type PortMask = [u64; 4];
+
+fn connected_ports(op_base: &Mmio, max_ports: u8) -> PortMask {
+    let mut mask = [0u64; 4];
+    for p in 0..max_ports {
+        if read_portsc(op_base, p) & PORTSC_CCS != 0 {
+            mask[p as usize / 64] |= 1 << (p % 64);
+        }
+    }
+    mask
+}
+
+/// Wait for every root hub on the machine to stop changing its mind.
+///
+/// **`PORTSC.CCS` is not a question that can be asked at an instant.** HCRST
+/// returns every port to the state it has with nothing attached (spec §4.19.1.1
+/// for USB2, §4.19.1.2 for USB3), so a device firmware had already enumerated
+/// has to be detected all over again — and detection is a physical process:
+/// port power settling, a USB2 pull-up being debounced, a USB3 link running
+/// receiver detection and training. A scan issued in the same microsecond as
+/// `USBCMD.R/S` reports an empty bus on any machine whose ports are real. That
+/// is what the T14 did on both of its controllers while booting off a stick
+/// plugged into one of them: `controller started` and `no HID devices` share a
+/// millisecond in its log and no `port N connected` line sits between them.
+///
+/// QEMU's controller has no port state machine and no timer. `xhci_reset()`
+/// calls `xhci_port_update()` for every port, which assigns PORTSC from the QOM
+/// tree — CCS, CSC, PP, the speed, and PED for a SuperSpeed device — so the
+/// register is in its terminal state before the guest's first MMIO access. That
+/// is the whole reason a driver that never waited here passed every test in
+/// this suite.
+///
+/// Machine-wide rather than per controller because the wait is wall-clock: a
+/// laptop with two xHCs would otherwise pay for an interval both of them were
+/// already inside. On the T14 that is the difference between one debounce and
+/// two.
+fn await_connect_settle(controllers: &[XhciController]) {
+    let Some(powered_at) = controllers.iter().map(|c| c.powered_at).max() else { return };
+    let mut seen: Vec<(PortMask, u64)> = controllers
+        .iter()
+        .map(|c| (connected_ports(&c.op_base, c.max_ports), c.powered_at))
+        .collect();
+
+    loop {
+        let now = crate::clock::nanos_since_boot();
+        let empty = seen.iter().all(|(mask, _)| *mask == [0u64; 4]);
+        let debounced = seen
+            .iter()
+            .all(|(_, at)| now.saturating_sub(*at) >= PORT_DEBOUNCE_NS);
+        let looked_long_enough = !empty || now.saturating_sub(powered_at) >= EMPTY_BUS_NS;
+        if debounced && looked_long_enough {
+            return;
+        }
+        if now.saturating_sub(powered_at) >= PORT_SETTLE_CEILING_NS {
+            log!("xHCI: no root hub on this machine held one connect state for {} ms within \
+                 {} ms; enumerating whatever is connected now",
+                PORT_DEBOUNCE_NS / 1_000_000, PORT_SETTLE_CEILING_NS / 1_000_000);
+            return;
+        }
+
+        let next = now + PORT_POLL_NS;
+        while crate::clock::nanos_since_boot() < next {
+            core::hint::spin_loop();
+        }
+        for (ctrl, (mask, changed_at)) in controllers.iter().zip(seen.iter_mut()) {
+            let now_mask = connected_ports(&ctrl.op_base, ctrl.max_ports);
+            if now_mask != *mask {
+                *mask = now_mask;
+                *changed_at = crate::clock::nanos_since_boot();
+            }
+        }
+    }
+}
 
 const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
 
@@ -393,8 +547,23 @@ fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, 
 unsafe impl Send for XhciController {}
 
 pub struct XhciController {
+    /// The function this controller is, so every line about it after `init_one`
+    /// has returned can still name which of the machine's controllers it means.
+    pci: PciDevice,
+
+    op_base: Mmio,
     db_base: Mmio,
     rt_base: Mmio,
+
+    /// HCSPARAMS1's MaxPorts: every port register this controller has, both
+    /// speed-specific views of a paired receptacle included.
+    max_ports: u8,
+
+    /// When this controller's root-hub ports were powered, which is the last
+    /// instant their connect state is known to have changed and therefore where
+    /// [`PORT_DEBOUNCE_NS`] is measured from. Kept per controller so the
+    /// debounces of a machine with two overlap instead of adding up.
+    powered_at: u64,
 
     context_size: usize, // 32 or 64
     layout: Layout,
@@ -760,14 +929,32 @@ pub fn init(devices: &[PciDevice]) {
     #[cfg(feature = "xhci-descriptor-selftest")]
     device::selftest();
 
+    // Every controller is brought up and its ports powered before any of them
+    // is scanned, because the scan cannot start until the root hub has settled
+    // and that wait is wall-clock. Interleaving bring-up with enumeration would
+    // make a machine with two controllers pay `PORT_DEBOUNCE_NS` twice for a
+    // interval both of them were already inside.
     let mut controllers = Vec::new();
-    let mut disks = 0;
     let mut present = 0;
     for pci_dev in devices.iter().filter(|d| d.matches_class(0x0C, 0x03, Some(0x30))) {
         present += 1;
-        if let Some(ctrl) = init_one(pci_dev, disks) {
-            disks += ctrl.storage.len();
+        if let Some(ctrl) = init_one(pci_dev) {
             controllers.push(ctrl);
+        }
+    }
+
+    await_connect_settle(&controllers);
+
+    let mut disks = 0;
+    for ctrl in controllers.iter_mut() {
+        // Disks are numbered across the machine, so this controller's first one
+        // follows everything the controllers before it bound.
+        ctrl.disk_base = disks;
+        device::scan_ports(ctrl);
+        disks += ctrl.storage.len();
+        if ctrl.devices.is_empty() {
+            log!("xHCI: no HID devices on the controller at {:02x}:{:02x}.{}",
+                ctrl.pci.bus, ctrl.pci.dev, ctrl.pci.func);
         }
     }
 
@@ -788,7 +975,7 @@ pub fn init(devices: &[PciDevice]) {
     *XHCI.lock() = controllers;
 }
 
-fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
+fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
     let bar_addr = pci_dev.read_bar_64(0);
@@ -964,13 +1151,43 @@ fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
     }
     log!("xHCI: controller started");
 
-    let mut ctrl = XhciController {
+    // HCRST returns every root-hub port to the state it has with nothing
+    // attached, and on a controller with Port Power Control that state is
+    // unpowered — a port with no power reports no device, for the life of the
+    // boot. PP is RW there and reads back set on a controller without PPC, so
+    // the write is unconditional and the count is what says which happened.
+    let mut powered = 0;
+    for p in 0..max_ports {
+        let off = OP_PORT_BASE + p as u64 * PORT_REG_SIZE;
+        let portsc = op_base.read_u32(off);
+        if portsc & PORTSC_PP == 0 {
+            op_base.write_u32(off, (portsc & !PORTSC_RW1C) | PORTSC_PP);
+        }
+        if op_base.read_u32(off) & PORTSC_PP != 0 {
+            powered += 1;
+        }
+    }
+    let powered_at = crate::clock::nanos_since_boot();
+    log!("xHCI: {powered}/{max_ports} root-hub ports powered (PPC={})",
+        u8::from(hccparams1 & HCC_PPC != 0));
+
+    // A controller with no HID on it is still a controller, and keeping it is
+    // not a formality: it has been reset, started and armed, so dropping it
+    // leaves a live interrupter with nothing draining its event ring. It is
+    // also the ordinary state of the target laptop, whose keyboard is PS/2 and
+    // whose touchpad is I2C-HID — under metal-sim a `None` here reached
+    // `kernel_main`'s `.expect` and panicked the boot.
+    Some(XhciController {
+        pci: *pci_dev,
+        op_base,
         db_base,
         rt_base,
+        max_ports,
+        powered_at,
         context_size,
         layout,
         pool,
-        disk_base,
+        disk_base: 0,
         cmd_ring,
         event_ring: evt_ring_buf.base() as *const Trb,
         event_head: 0,
@@ -978,20 +1195,5 @@ fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
         devices: Vec::new(),
         storage: Vec::new(),
         msc_claimed: 0,
-    };
-
-    device::scan_ports(&mut ctrl, &op_base, max_ports);
-
-    // A controller with no HID on it is still a controller, and returning it
-    // is not a formality: it has been reset, started and armed, so dropping it
-    // here leaves a live interrupter with nothing draining its event ring. It
-    // is also the ordinary state of the target laptop, whose
-    // keyboard is PS/2 and whose touchpad is I2C-HID — under metal-sim this
-    // `None` reached `kernel_main`'s `.expect` and panicked the boot.
-    if ctrl.devices.is_empty() {
-        log!("xHCI: no HID devices on the controller at {:02x}:{:02x}.{}",
-            pci_dev.bus, pci_dev.dev, pci_dev.func);
-    }
-
-    Some(ctrl)
+    })
 }

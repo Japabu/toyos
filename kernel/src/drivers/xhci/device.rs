@@ -1,7 +1,7 @@
 use core::ptr::{write_volatile, write_bytes};
 
 use crate::log;
-use super::{Mmio, Trb, TrbRing, XhciController, PAGE};
+use super::{Trb, TrbRing, XhciController, PAGE};
 use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
 use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, CC_SUCCESS, CC_SHORT_PACKET};
@@ -256,9 +256,10 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
 }
 
 /// Initialize and configure one USB device on a port.
-pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
+pub fn init_device(ctrl: &mut XhciController, port_idx: u8) {
+    let op_base = ctrl.op_base;
     let portsc_off = OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE;
-    let portsc = op_base.read_u32(portsc_off);
+    let portsc = super::read_portsc(&op_base, port_idx);
     op_base.write_u32(portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PR);
 
     // A port that asserts CCS and then never asserts PRC — a device pulled
@@ -271,10 +272,10 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
             port_idx + 1, op_base.read_u32(portsc_off));
         return;
     }
-    let portsc = op_base.read_u32(portsc_off);
+    let portsc = super::read_portsc(&op_base, port_idx);
     op_base.write_u32(portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PRC);
 
-    let portsc = op_base.read_u32(portsc_off);
+    let portsc = super::read_portsc(&op_base, port_idx);
     if portsc & PORTSC_PED == 0 {
         log!("xHCI: port {} not enabled after reset", port_idx + 1);
         return;
@@ -511,18 +512,22 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     ctrl.devices.push(dev);
 }
 
-/// Scan all ports on the controller and initialize connected HID devices.
+/// Scan all ports on the controller and initialize connected devices.
 /// Enumeration is serial by construction, which is what lets the input
 /// context, the EP0 ring and the descriptor buffer be one each. Serial does not
 /// mean quiet: a device bound on an earlier port is armed and delivering while
 /// a later port enumerates, so the event ring carries its completions too and
 /// both waits demux by slot id rather than by TRB type alone.
-pub fn scan_ports(ctrl: &mut XhciController, op_base: &Mmio, max_ports: u8) {
-    for p in 0..max_ports {
-        let portsc = op_base.read_u32(OP_PORT_BASE + p as u64 * PORT_REG_SIZE);
+///
+/// The root hubs must have settled first — [`super::await_connect_settle`] is
+/// what makes `PORTSC.CCS` a question with an answer.
+pub fn scan_ports(ctrl: &mut XhciController) {
+    let op_base = ctrl.op_base;
+    for p in 0..ctrl.max_ports {
+        let portsc = super::read_portsc(&op_base, p);
         if portsc & PORTSC_CCS != 0 {
             log!("xHCI: port {} connected, speed={}", p + 1, (portsc >> 10) & 0xF);
-            init_device(ctrl, op_base, p);
+            init_device(ctrl, p);
         }
     }
 }

@@ -80,6 +80,17 @@ usb-flush-fails = []
 # See `xhci/mod.rs`'s `settles`.
 xhci-deaf-controller = []
 xhci-deaf-port = []
+# Report an empty root hub for the first 300 ms of the boot, so the port scan
+# runs against a controller that has not finished detecting its devices yet.
+# That is what every physical root hub does after HCRST and what QEMU's cannot:
+# it answers PORTSC from the QOM tree, so an attached device reads CCS the
+# instant the register is touched and no device or machine property changes
+# that. `device_add` cannot reach the window either — the scan runs tens of
+# milliseconds into the boot. The register is replaced, not a verdict: during
+# the window the port reads CCS, PED and speed exactly as an unpopulated one
+# does, and the device that appears afterwards enumerates by the ordinary path.
+# See `xhci/mod.rs`'s `SLOW_CONNECT_NS`.
+xhci-slow-connect = []
 # Run `parse_config` over nine crafted configuration descriptors at init. The
 # bytes come from a device and every device QEMU can attach describes itself
 # correctly, so without this the parser's refusals — an endpoint address naming
