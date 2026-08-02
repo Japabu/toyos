@@ -2104,17 +2104,6 @@ Underneath it: nothing serialises `toolchain::ensure` across agents, so two
 `cargo test` runs in this tree can both decide the toolchain is stale and both
 start `x.py build` in the same directory. That is the window this defect needs.
 
-### Two C tests regressed with the 2026-08-02 toolchain upgrade
-
-`71_macro_empty_arg` prints nothing where `17` is expected, and
-`76_dollars_in_identifiers` loses its last line (`$$$=money`). Both compile;
-both are output mismatches, and both are shaped like variadics. `dbbdcbe`
-migrated `userland/libc/src/printf.rs` from `VaList::arg` to
-`VaList::next_arg` at every call site, which is the only change in the tree
-that can reach a `printf` result. Reproduced in isolation at `973141f`, twice
-each. Not investigated further here — recorded rather than fixed, per the
-workflow rule.
-
 ### A clean and a build in one target dir, unserialised — the evidence for #81
 
 2026-08-02, hit by the owner mid-suite. His `cargo test` log, in order:
