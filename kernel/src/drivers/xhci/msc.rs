@@ -617,7 +617,10 @@ impl XhciController {
 /// Configure the two bulk endpoints and bring the disk up. `dev_block` is the
 /// device's own block, which is where its EP0 ring already lives.
 ///
-/// Returns whether the device joined `ctrl.storage`.
+/// No return value: every failure path below logs, so there was nothing in the
+/// `bool` this used to produce that the one caller wanted — and it discarded it
+/// in statement position, silently, because Rust does not warn about a dropped
+/// `bool`.
 pub fn bind(
     ctrl: &mut XhciController,
     ep0_ring: TrbRing,
@@ -625,12 +628,15 @@ pub fn bind(
     speed: u8,
     port_idx: u8,
     info: &MscInterface,
-) -> bool {
-    let index = ctrl.storage.len();
-    let Some(block) = ctrl.layout.msc(index) else {
+) {
+    // Claimed before the endpoints are configured and never released, so the
+    // block cannot be reissued while the previous holder's contexts still name
+    // it. `storage.len()` was the old answer and is a different question: it
+    // counts the disks that *finished*.
+    let Some(block) = ctrl.claim_msc_block() else {
         log!("usb-storage: slot {slot_id} is the {}th disk; this driver serves {}",
-            index + 1, super::MSC_BLOCKS);
-        return false;
+            ctrl.msc_claimed + 1, super::MSC_BLOCKS);
+        return;
     };
 
     let (in_dci, out_dci) = (info.in_ep.dci(), info.out_ep.dci());
@@ -673,7 +679,7 @@ pub fn bind(
     configure.param = input_ctx.phys();
     configure.control = TRB_CONFIGURE_EP | ((slot_id as u32) << 24);
     if ctrl.run_command(configure, "Configure Endpoint (bulk)").is_none() {
-        return false;
+        return;
     }
 
     let mut dev = MscDevice {
@@ -696,23 +702,23 @@ pub fn bind(
     };
 
     if !bring_up(ctrl, &mut dev) {
-        return false;
+        return;
     }
-    // The machine-wide number, which is what `usb_storage::open` indexes by.
-    // `index` is this controller's own and is what picked the pool block; on a
-    // two-controller machine the two disagree, and printing the local one
-    // would call two different disks "disk 0".
+    // The machine-wide number, which is what `usb_storage::open` indexes by:
+    // this controller's disks start at `disk_base`, so on a two-controller
+    // machine printing the local index would call two different disks "disk 0".
+    // It is `storage.len()` and no longer the pool-block selector as well —
+    // those are two different questions and the block is claimed above.
     log!(
         "usb-storage: disk {} ready on slot {slot_id}, {} blocks of {} B \
          ({} MiB), msc_block +{:#x}",
-        ctrl.disk_base + index,
+        ctrl.disk_base + ctrl.storage.len(),
         dev.blocks,
         dev.logical_block_bytes,
         dev.blocks * HOST_BLOCK as u64 / (1024 * 1024),
         block
     );
     ctrl.storage.push(dev);
-    true
 }
 
 /// TEST UNIT READY, INQUIRY and READ CAPACITY: everything between a configured

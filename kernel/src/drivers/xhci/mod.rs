@@ -370,7 +370,11 @@ impl Layout {
         (index < self.dev_blocks).then(|| self.dev_base + index * DEV_STRIDE)
     }
 
-    /// The block for the `index`-th mass-storage device bound this boot.
+    /// The block for the `index`-th mass-storage device *claimed* this boot.
+    ///
+    /// Private to [`XhciController::claim_msc_block`], which is the only caller
+    /// and the only thing that decides what `index` is. That is deliberate:
+    /// `bind` used to pass `storage.len()`, and `storage.len()` goes back down.
     fn msc(&self, index: usize) -> Option<usize> {
         (index < MSC_BLOCKS).then(|| self.msc_base + index * MSC_STRIDE)
     }
@@ -416,11 +420,43 @@ pub struct XhciController {
 
     devices: Vec<HidDevice>,
     storage: Vec<msc::MscDevice>,
+
+    /// Mass-storage pool blocks handed out this boot. Monotone, and
+    /// deliberately not `storage.len()`.
+    ///
+    /// `bind` issues Configure Endpoint — which puts the device's two bulk
+    /// endpoints into the Running state with their transfer rings inside this
+    /// block — and only *then* asks the disk what it is. A disk refused after
+    /// that point never joins `storage`, so keying off `storage.len()` handed
+    /// the next disk a block whose memory a live endpoint context still names,
+    /// with whatever transfer `wait_transfer` abandoned on its 2 s deadline
+    /// still outstanding on it. That completion lands in the next disk's
+    /// `MSC_SCRATCH`, which is where READ CAPACITY's block size and last LBA
+    /// arrive.
+    ///
+    /// So the block is never given back — the same policy the slot behind it
+    /// already has, and for the same reason. A `Drop` guard is not the fix
+    /// here even though the failing path would run one: releasing the block *is*
+    /// the bug.
+    msc_claimed: usize,
 }
 
 impl XhciController {
     pub(super) fn dma(&self) -> KernelSlice {
         self.pool.slice()
+    }
+
+    /// Take the next mass-storage pool block, for good.
+    ///
+    /// The only way to obtain one, so there is no path that gets a block
+    /// without spending it — which is the property [`Self::msc_claimed`]
+    /// exists for, and the one `ctrl.layout.msc(ctrl.storage.len())` did not
+    /// have. `None` when the pool is out; nothing is spent then, because
+    /// nothing was handed out.
+    fn claim_msc_block(&mut self) -> Option<usize> {
+        let block = self.layout.msc(self.msc_claimed)?;
+        self.msc_claimed += 1;
+        Some(block)
     }
 
     fn submit_command(&mut self, trb: Trb) {
@@ -941,6 +977,7 @@ fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
         event_phase: true,
         devices: Vec::new(),
         storage: Vec::new(),
+        msc_claimed: 0,
     };
 
     device::scan_ports(&mut ctrl, &op_base, max_ports);

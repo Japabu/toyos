@@ -111,10 +111,12 @@ const MACHINE_TESTS: &[&str] = &[
     "i8042_quarantine",
     "i8042_budget_expiry",
     "i8042_fadt_denial",
+    "i8042_kbd_echo",
     "xhci_xecp_walk",
     "xhci_slot_exhaustion",
     "usb_storage_gate",
     "usb_storage_shapes",
+    "usb_refused_disk_first",
     "usb_storage_write_error",
     "usb_flush_optional",
     "xhci_deaf_registers",
@@ -1674,6 +1676,9 @@ fn run_machine_test(
         // Bodies in `tests/common/usb.rs`, for the same reason.
         "usb_storage_gate" => usb::usb_storage_gate(test_config, c_bins, rust_bins),
         "usb_storage_shapes" => usb::usb_storage_shapes(test_config, c_bins, rust_bins),
+        "usb_refused_disk_first" => {
+            usb::usb_refused_disk_first(test_config, c_bins, rust_bins)
+        }
         // Body in `tests/common/esp.rs`, same reason.
         "esp_filesystem" => common::esp::esp_filesystem(test_config, c_bins, rust_bins),
         "esp_log_file" => common::esp::esp_log_file(test_config, c_bins, rust_bins),
@@ -3570,6 +3575,82 @@ fn run_machine_test(
             }
             eprintln!("  [i8042] {}", claim.trim());
             eprintln!("  [i8042] typed {typed:?} through a controller firmware denied");
+            Ok(())
+        }
+        "i8042_kbd_echo" => {
+            // The T14's second answer, reproduced: a healthy controller whose
+            // keyboard will not report its scancode set. `i8042-kbd-echo`
+            // answers the `0xF0 0x00` argument byte with `0xEE` — ECHO's own
+            // reply, the byte the laptop printed — because QEMU's PS/2 keyboard
+            // implements the command and nothing on the host side turns that
+            // off.
+            //
+            // Two assertions, and the second is the one with teeth. The log
+            // line proves the driver took the *assumed* branch rather than
+            // reading the set: it names the byte, and its parenthetical is not
+            // `readback 0x41`, so a driver that quietly kept reading the set
+            // would fail here even though the keyboard works. Typing "hello"
+            // through to a userland process proves the branch delivers, which
+            // no log line can: a driver that logs the assumption and then
+            // refuses, or that arms a pin nothing decodes, is green on the
+            // first assertion alone.
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                kernel_features: &["i8042-kbd-echo"],
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let boot = qemu.boot_log().to_string();
+            let want = "0xF0 0x00 answered 0xee";
+            let Some(refusal) = boot.lines().find(|l| l.contains(want)) else {
+                return Err(format!("the keyboard never refused the set query:\n{boot}"));
+            };
+            let Some(attached) =
+                boot.lines().find(|l| l.contains("i8042: kbd set2+xlat (assumed,"))
+            else {
+                return Err(format!("the driver refused the keyboard outright:\n{boot}"));
+            };
+            if boot.contains("(readback 0x41)") {
+                return Err(format!(
+                    "the injection did not take: the driver still read the set back:\n{boot}"
+                ));
+            }
+            let result = qemu.run_test_hooked(
+                "test_rs_i8042_keyboard",
+                Duration::from_secs(20),
+                "===I8042_READY===",
+                |socket| {
+                    for key in ["h", "e", "l", "l", "o"] {
+                        qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            let typed: String = parse_key_events(&result.stdout)
+                .iter()
+                .filter(|e| e.modifiers & 0x10 == 0)
+                .map(|e| e.translated.as_str())
+                .collect();
+            if !typed.contains("hello") {
+                return Err(format!(
+                    "typed {typed:?} — a keyboard that will not report its set does not reach \
+                     userland"
+                ));
+            }
+            // The TrackPoint is on the far side of the keyboard block, so a
+            // refusal that returns costs the pointer too. It must not here.
+            if !boot.contains("i8042: aux rate=100") {
+                return Err(format!("the aux port never came up behind the refusal:\n{boot}"));
+            }
+            eprintln!("  [i8042] {}", refusal.trim());
+            eprintln!("  [i8042] {}", attached.trim());
+            eprintln!("  [i8042] typed {typed:?} on a keyboard that will not report its set");
             Ok(())
         }
         "i8042_absent" => {

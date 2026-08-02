@@ -783,3 +783,107 @@ pub fn xhci_deaf_registers(
     );
     Ok(())
 }
+
+/// A disk the driver refuses, on the port the controller enumerates *first*.
+///
+/// `bind` claims a 64 KiB DMA pool block, issues Configure Endpoint — which
+/// puts the device's two bulk endpoints into the Running state with their
+/// transfer rings inside that block — and only then asks the disk how big it
+/// is. A disk refused at that last step never joins `ctrl.storage`, so a block
+/// keyed on `ctrl.storage.len()` was handed straight to the next disk, while
+/// the first device's slot was still enabled, its endpoint contexts still named
+/// that memory, and any transfer `wait_transfer` had abandoned on its 2 s
+/// deadline was still outstanding on a Running endpoint. The late completion
+/// lands in the next disk's `MSC_SCRATCH` — where READ CAPACITY's block size
+/// and last LBA arrive.
+///
+/// Every other USB profile puts the boot stick on port 1, where it binds and
+/// the reuse cannot happen; that is why a full gate boot never reached this.
+/// The actuator is not a kernel feature: QEMU can already stage a disk this
+/// driver refuses (3 TB, more sectors than READ(10) addresses) and it assigns
+/// ports in device-creation order, so attaching it ahead of the boot stick is
+/// the whole injection. Nothing about the driver is modified to run this.
+///
+/// The assertion is the *block offset in the log line*, because that is the
+/// only place the reuse is visible from outside: both boots bind one disk,
+/// both print `1 device(s)`, and both reach the shell.
+pub fn usb_refused_disk_first(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let (huge, _) = Profile::UsbDiskRefusedFirst.usb_disk().expect("the profile declares a disk");
+
+    // The claim is about which device QEMU creates first, and argv is the only
+    // place it is visible — a console line cannot distinguish "the refused disk
+    // was enumerated first" from "the driver happened to bind them in that
+    // order".
+    let options = BootOptions {
+        profile: Profile::UsbDiskRefusedFirst,
+        kernel_features: GATE,
+        ..Default::default()
+    };
+    let argv = qemu::profile_argv(&options);
+    let sticks: Vec<&String> = argv
+        .iter()
+        .filter(|a| a.starts_with("usb-storage,"))
+        .collect();
+    match sticks.as_slice() {
+        [first, second] if first.contains("drive=usbdisk") && second.contains("drive=stick") => {}
+        other => {
+            return Err(format!(
+                "want the data disk created before the boot stick, got {other:?}"
+            ));
+        }
+    }
+
+    let log = boot_and_shutdown(test_config, c_bins, rust_bins, options)?;
+
+    // The refusal happened, and it happened on slot 1 — the first device the
+    // controller enumerated. Without this the test would pass on a boot where
+    // the ordering silently went back to stick-first.
+    let sectors = huge / 512;
+    let refusal = format!(
+        "usb-storage: slot 1 has {sectors} sectors; this driver issues READ(10)"
+    );
+    if !log.contains(&refusal) {
+        return Err(format!(
+            "the first disk enumerated was not the one the driver refuses ({refusal:?})\n{log}"
+        ));
+    }
+
+    // And the boot stick behind it got the *second* pool block. `MSC_STRIDE` is
+    // 0x10000 and `msc_base` is where block 0 starts, so `+0x10000` is the
+    // block the refused disk's endpoint contexts still name and `+0x20000` is
+    // the next one. This is the whole finding: before the fix the line below
+    // reads `+0x10000`.
+    if !log.contains("msc_block +0x20000") {
+        let got = log
+            .lines()
+            .find(|l| l.contains("msc_block +"))
+            .unwrap_or("<no disk bound at all>");
+        return Err(format!(
+            "the disk after the refused one was given the refused one's pool block: {got:?}"
+        ));
+    }
+    if log.matches("msc_block +").count() != 1 {
+        return Err(format!("want exactly one disk bound on this machine\n{log}"));
+    }
+
+    // Refused, not fatal: the stick still binds, still carries /boot, and the
+    // machine still comes up. A fix that leaked the whole pool would fail here.
+    if !log.contains("usb-storage: 1 device(s)") {
+        return Err(format!("the boot stick did not bind behind the refused disk\n{log}"));
+    }
+    gate_ran(&log, 1)?;
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish\n{log}"));
+    }
+    serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+
+    eprintln!(
+        "  [usb] a {huge} B disk refused on slot 1, enumerated first: the boot stick behind it \
+         binds at msc_block +0x20000, not the refused disk's block"
+    );
+    Ok(())
+}

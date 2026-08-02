@@ -101,6 +101,18 @@ pub enum Profile {
     /// one boot shows the error channel carrying a failure and not carrying a
     /// success.
     UsbDiskReadOnly,
+    /// [`Profile::UsbDiskHuge`] with the 3 TB disk attached *ahead* of the boot
+    /// stick, so the controller enumerates the disk the driver refuses first.
+    ///
+    /// Order is the whole shape. `bind` configures a device's two bulk
+    /// endpoints into a pool block and only then asks the disk how big it is,
+    /// so a disk refused for its size has already pointed the controller's
+    /// endpoint contexts at that block. Every other USB profile puts the boot
+    /// stick on port 1, where it binds successfully and the question never
+    /// arises; here the refusal comes first, and what the *next* disk is given
+    /// is the assertion. QEMU assigns ports in device-creation order, measured
+    /// against the kernel's own `port N connected` lines.
+    UsbDiskRefusedFirst,
     /// Two xHCI controllers, with every device on the *second* one.
     ///
     /// The T14 Gen 2's literal shape, and the one that had never been staged:
@@ -227,6 +239,12 @@ struct Shape {
     /// device rather than by the driver. Nothing else in this suite can make a
     /// real device say no to an I/O the driver was right to issue.
     usb_disk_readonly: bool,
+    /// Attach it *ahead* of the boot stick, so the controller enumerates it
+    /// first. Which disk comes first is a shape dimension the moment one of
+    /// them can be refused: a driver that hands the pool block of a failed
+    /// bind to the next disk is only observable when the failure is first, and
+    /// QEMU assigns ports in device-creation order.
+    usb_disk_first: bool,
 }
 
 /// What every profile but [`Profile::MetalDisk`] gives the guest. Large
@@ -273,6 +291,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             Self::Gop => Shape {
                 vga: "std",
@@ -285,6 +304,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             Self::Diskless => Shape {
                 vga: "std",
@@ -299,6 +319,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             Self::Metal => Shape {
                 vga: "std",
@@ -311,6 +332,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             // Two keyboards and two pointers, because the collision this
             // stages is between devices of the same HID class; a hub for a
@@ -333,6 +355,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             Self::MetalDisk => Shape {
                 vga: "std",
@@ -345,6 +368,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             Self::NvmeWideSector => Shape {
                 vga: "std",
@@ -357,6 +381,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             Self::UsbDisk => Shape {
                 vga: "std",
@@ -369,6 +394,7 @@ impl Profile {
                 usb_disk_bytes: USB_STICK_BYTES,
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             Self::UsbDisk4k => Shape {
                 vga: "std",
@@ -381,6 +407,7 @@ impl Profile {
                 usb_disk_bytes: USB_STICK_BYTES,
                 usb_disk_lba_bytes: 4096,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             Self::UsbDiskHuge => Shape {
                 vga: "std",
@@ -393,6 +420,20 @@ impl Profile {
                 usb_disk_bytes: USB_HUGE_BYTES,
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
+            },
+            Self::UsbDiskRefusedFirst => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: USB_HUGE_BYTES,
+                usb_disk_lba_bytes: 512,
+                usb_disk_readonly: false,
+                usb_disk_first: true,
             },
             Self::UsbDiskReadOnly => Shape {
                 vga: "std",
@@ -405,6 +446,7 @@ impl Profile {
                 usb_disk_bytes: USB_STICK_BYTES,
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: true,
+                usb_disk_first: false,
             },
             // The first controller carries nothing at all — not even the boot
             // stick, which is on the second with the HID. That is the laptop
@@ -423,6 +465,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             // A hub ahead of the second controller's HID, so that controller's
             // devices take the same slot ids as the first's: the boot stick is
@@ -447,6 +490,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             // The boot stick's controller is the one with no interrupt
             // mechanism at all, so the driver refuses it and the machine does
@@ -468,6 +512,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
             // Boot stick on the good controller, HID on the crippled one. A
             // keyboard is what makes the absence assertion mean something:
@@ -483,6 +528,7 @@ impl Profile {
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
+                usb_disk_first: false,
             },
         }
     }
@@ -1256,6 +1302,30 @@ fn qemu_command(
         qemu.arg("-device").arg(*controller);
     }
 
+    // The data stick's own arguments, emitted either side of the boot stick's
+    // `-device`. QEMU hands out ports in the order devices are created, so this
+    // is the only thing that decides which disk the guest enumerates first.
+    let data_stick: Vec<String> = if shape.usb_disk_bytes != 0 {
+        vec![
+            "-drive".to_string(),
+            format!(
+                "if=none,id=usbdisk,format=raw,file={}{}",
+                usb_image.display(),
+                if shape.usb_disk_readonly { ",readonly=on" } else { "" }
+            ),
+            "-device".to_string(),
+            format!(
+                "usb-storage,bus={1},drive=usbdisk,logical_block_size={0},physical_block_size={0}",
+                shape.usb_disk_lba_bytes, shape.storage_bus
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+    if shape.usb_disk_first {
+        qemu.args(&data_stick);
+    }
+
     qemu.arg("-device")
         .arg(format!(
             "usb-storage,bus={},drive=stick,bootindex=0",
@@ -1292,19 +1362,8 @@ fn qemu_command(
     // the boot stick is on the same bus and carries the image the guest is
     // running from. Its logical block size is stated rather than left to the
     // default for the same reason the namespace's is.
-    if shape.usb_disk_bytes != 0 {
-        qemu.arg("-drive")
-            .arg(format!(
-                "if=none,id=usbdisk,format=raw,file={}{}",
-                usb_image.display(),
-                if shape.usb_disk_readonly { ",readonly=on" } else { "" }
-            ))
-            .arg("-device")
-            .arg(format!(
-                "usb-storage,bus={1},drive=usbdisk,logical_block_size={0},physical_block_size={0}",
-                shape.usb_disk_lba_bytes,
-                shape.storage_bus
-            ));
+    if !shape.usb_disk_first {
+        qemu.args(&data_stick);
     }
 
     for dev in shape.usb {
