@@ -195,15 +195,16 @@ const PORT_DEBOUNCE_NS: u64 = 100_000_000;
 /// spec puts a number on — a SuperSpeed link that fails to train spends
 /// `tPollingLFPSTimeout` (360 ms, USB 3.2 §7.5.4.3) before it falls back, and
 /// the USB2 connect and debounce behind that add ~100 ms — and it sits under
-/// Linux's `HUB_DEBOUNCE_TIMEOUT` of 1500 ms.
+/// Linux's `HUB_DEBOUNCE_TIMEOUT`, which is 2000 ms in `drivers/usb/core/hub.c`.
 const EMPTY_BUS_NS: u64 = 1_000_000_000;
 
 /// When the driver stops waiting for a root hub that keeps changing its mind.
 ///
-/// Policy, and the number is Linux's `HUB_DEBOUNCE_TIMEOUT`. What the caller
-/// sees when it is hit is a line naming the machine's port state and a scan of
-/// whatever is connected at that moment — a flapping port costs the boot a
-/// bounded second and a half, never the machine.
+/// Policy, and under Linux's `HUB_DEBOUNCE_TIMEOUT`, which is 2000 ms in
+/// `drivers/usb/core/hub.c`. What the caller sees when it is hit is a line
+/// naming the machine's port state and a scan of whatever is connected at that
+/// moment — a flapping port costs the boot a bounded second and a half, never
+/// the machine.
 const PORT_SETTLE_CEILING_NS: u64 = 1_500_000_000;
 
 /// How often the settle re-reads the port registers. Each pass is one MMIO read
