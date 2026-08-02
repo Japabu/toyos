@@ -751,3 +751,54 @@ that takes a raw pointer and an unbounded index, at 23 sites, and it is what
 So: converging, not accumulating — but converging one layer per defect. The
 useful prediction is that the next hole is not somewhere new; it is one call
 outward from `9dfd044`, and F1, F2 and F3 are where that is.
+
+---
+
+## Closed
+
+Worked in the session after this audit was written. Each was verified red before
+and green after, with the fix backed out and the actuator left in.
+
+| # | commit | gate | evidence |
+|---|---|---|---|
+| F2 | `be70cc3` | the compiler | the reproducer's `Endpoint { dci: 200, .. }` in `msc.rs` builds with zero warnings against the tree with the field `pub(super)`, and is `E0451` with it private. `write_ctx32`'s parameter is `ctx_index`; it gets no bound and now states why it needs none |
+| F3 | `64b89b8` | `esp_backing_read_error` | with the fix backed out: **3247 NUL bytes at offset 4096** of a 14,750-byte `kernel.log`, read off the image on the host |
+| F1 | `05ae01e` | `usb_refused_disk_first` | with the fix backed out: `disk 0 ready on slot 2 … msc_block +0x10000`, the block the disk refused on slot 1 had just configured its endpoints into |
+| F7 | `05ae01e` | — | `bind`'s `-> bool` deleted with F1, same function |
+
+Three notes for whoever takes the rest.
+
+**F3's reach was larger than the finding.** The log line was the trivial half, as
+predicted. The other half was that `FileBacking::read_page` returned `()`, so
+`file_cache::write_page` could not tell a hole from data and merged a partial
+write into it. Making the trait fallible moved five more call sites:
+`file_cache::read_page` (which must not *cache* a failed fetch — the same
+corruption through the other door), `esp_log::append`, `fd::try_write`,
+`process::handle_page_fault`, `elf::read_backing_into` and
+`loader::read_file_range`. The residual — `fd::try_write` has no honest errno —
+is filed under §1.
+
+**The prediction held, and one layer further than stated.** "The next hole is
+one call outward from `9dfd044`" was right for all three. F3's own fix then had
+a hole one call outward *of it*: `write_page` refusing is useless if
+`read_page` caches the zeros instead, and that call site is in the same file
+and was not in the finding.
+
+**An injection that replaces only the verdict can make its own gate vacuous.**
+The first version of `esp-backing-read-fails` overrode the return of
+`EspBacking::read_page` but left the buffer holding the bytes the device had
+actually delivered — so the corruption never materialised and the host-side
+assertion passed with the defect present. It now replaces verdict *and* buffer,
+which is the state a real failed read leaves. F6 below is the same shape and is
+still open; this is what it looks like when it bites.
+
+## Not taken
+
+- **F4** (`gpt::probe`'s `lba_bytes`), **F5** (`with_storage -> Option` that is
+  never `None`, three dead `.unwrap_or(false)`), **F6** (`FLUSH_SENSE`
+  overriding a broken transport), **F8** (`count` + `buf.len()` across
+  `BlockDevice`), **F9** (`EspDevice.len` / `EspVolume.bytes`), **F10** (`Mmio`
+  will not report its size). None is a live defect; F6 is the one with teeth,
+  because it is an instrument that can go green on a boot where nothing
+  happened, and the session that closed F1–F3 hit exactly that failure mode in a
+  new actuator. Take F6 next.

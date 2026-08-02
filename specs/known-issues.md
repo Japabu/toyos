@@ -2839,9 +2839,18 @@ every one in a function that returns something other than a `Result` today, so
 it is a whole-crate change and it collides with whatever else is in that crate
 at the time. Counted with `grep -rn "read_block(\|write_block(" bcachefs/src`.
 
-Same shape one layer up: `FileBacking::read_page` and `vfs::FileSystem`'s write
-path have no error channel either, so `file_backing.rs` leaves the caller a
-hole of zeros and says so in the log.
+**`FileBacking::read_page` is fallible as of `64b89b8`** and is no longer part
+of this entry: it returns `BlockResult`, is `#[must_use]`, and every caller
+carries the error as far as its own signature allows. `vfs::FileSystem`'s write
+path is still the layer with no channel.
+
+What is left of that fix, and it is a real gap: `fd::try_write` has no honest
+error code for "the device did not do it". It stops at the failed page and
+returns the short count, which is what `write` means — but a request whose
+*first* page fails gets `SyscallError::Unknown`, because none of the nine
+variants says this and adding one is an ABI change that needs discussing. This
+is the call site `BlockError`'s own doc comment says does not exist yet; it
+exists now.
 
 ### The page cache's un-index on a failed fill has no test that can fail
 
