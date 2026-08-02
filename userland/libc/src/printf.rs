@@ -291,7 +291,7 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
         // Width
         let mut width: usize = 0;
         if i < fmt.len() && fmt[i] == b'*' {
-            let w = ap.arg::<i32>();
+            let w = ap.next_arg::<i32>();
             if w < 0 { left_align = true; width = (-w) as usize; } else { width = w as usize; }
             i += 1;
         } else {
@@ -307,7 +307,7 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
             i += 1;
             let mut prec = 0;
             if i < fmt.len() && fmt[i] == b'*' {
-                prec = ap.arg::<i32>().max(0) as usize;
+                prec = ap.next_arg::<i32>().max(0) as usize;
                 i += 1;
             } else {
                 while i < fmt.len() && fmt[i].is_ascii_digit() {
@@ -341,43 +341,43 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
         let pad_char = if zero_pad && !left_align { '0' } else { ' ' };
         match fmt[i] {
             b'd' | b'i' => {
-                let val: i64 = if long_long || long { ap.arg::<i64>() } else { ap.arg::<i32>() as i64 };
+                let val: i64 = if long_long || long { ap.next_arg::<i64>() } else { ap.next_arg::<i32>() as i64 };
                 let mut tmp = [0u8; 24];
                 let s = format_signed(val, &mut tmp, plus_sign, space_sign);
                 let prefix = s.len() - s.trim_start_matches(|c: char| !c.is_ascii_digit()).len();
                 write_int_padded(&mut w, s, prefix, width, pad_char, left_align, precision);
             }
             b'u' => {
-                let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
+                let val: u64 = if long_long || long { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
                 let mut tmp = [0u8; 24];
                 let s = format_unsigned(val, 10, false, &mut tmp);
                 write_int_padded(&mut w, s, 0, width, pad_char, left_align, precision);
             }
             b'x' => {
-                let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
+                let val: u64 = if long_long || long { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
                 let mut tmp = [0u8; 20];
                 let s = format_unsigned(val, 16, false, &mut tmp);
                 write_int_padded(&mut w, s, 0, width, pad_char, left_align, precision);
             }
             b'X' => {
-                let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
+                let val: u64 = if long_long || long { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
                 let mut tmp = [0u8; 20];
                 let s = format_unsigned(val, 16, true, &mut tmp);
                 write_int_padded(&mut w, s, 0, width, pad_char, left_align, precision);
             }
             b'o' => {
-                let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
+                let val: u64 = if long_long || long { ap.next_arg::<u64>() } else { ap.next_arg::<u32>() as u64 };
                 let mut tmp = [0u8; 24];
                 let s = format_unsigned(val, 8, false, &mut tmp);
                 write_int_padded(&mut w, s, 0, width, pad_char, left_align, precision);
             }
             b'c' => {
-                let c = ap.arg::<i32>() as u8;
+                let c = ap.next_arg::<i32>() as u8;
                 let s = core::str::from_utf8_unchecked(core::slice::from_ref(&c));
                 write_padded(&mut w, s, width, ' ', left_align);
             }
             b's' => {
-                let p: *const u8 = ap.arg::<*const u8>();
+                let p: *const u8 = ap.next_arg::<*const u8>();
                 if p.is_null() {
                     write_padded(&mut w, "(null)", width, ' ', left_align);
                 } else {
@@ -388,7 +388,7 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
                 }
             }
             b'p' => {
-                let p: *const u8 = ap.arg::<*const u8>();
+                let p: *const u8 = ap.next_arg::<*const u8>();
                 let mut hex = [0u8; 20];
                 let hex_s = format_unsigned(p as u64, 16, false, &mut hex);
                 let mut tmp = [0u8; 22];
@@ -400,7 +400,7 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
                 write_padded(&mut w, s, width, ' ', left_align);
             }
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
-                let val: f64 = ap.arg::<f64>();
+                let val: f64 = ap.next_arg::<f64>();
                 let mut tmp = [0u8; 512];
                 let s = format_float(val, fmt[i], precision, plus_sign, space_sign, &mut tmp);
                 write_padded(&mut w, s, width, pad_char, left_align);
@@ -490,7 +490,7 @@ pub unsafe extern "C" fn sscanf(input: *const u8, fmt: *const u8, mut args: ...)
             if fi >= fmt.len() { break; }
             match fmt[fi] {
                 b'd' => {
-                    let p: *mut i32 = args.arg::<*mut i32>();
+                    let p: *mut i32 = args.next_arg::<*mut i32>();
                     while si < input.len() && (input[si] as char).is_ascii_whitespace() { si += 1; }
                     let mut endptr: *mut u8 = core::ptr::null_mut();
                     let val = super::misc::strtol(input.as_ptr().add(si), &mut endptr, 10);
@@ -501,7 +501,7 @@ pub unsafe extern "C" fn sscanf(input: *const u8, fmt: *const u8, mut args: ...)
                     matched += 1;
                 }
                 b's' => {
-                    let p: *mut u8 = args.arg::<*mut u8>();
+                    let p: *mut u8 = args.next_arg::<*mut u8>();
                     while si < input.len() && (input[si] as char).is_ascii_whitespace() { si += 1; }
                     let mut j = 0;
                     while si < input.len() && !(input[si] as char).is_ascii_whitespace() {

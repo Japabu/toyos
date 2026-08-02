@@ -1,5 +1,8 @@
 use core::ptr;
 
+// This libc spells C strings and buffers as `*const u8`, not `c_char`/`c_void`:
+// same ABI, different element type from the declaration std links against.
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
     let mut len = 0;

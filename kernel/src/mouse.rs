@@ -42,7 +42,7 @@ impl PointerSource {
     /// device's buttons then flap on every report.
     pub fn claim() -> Option<Self> {
         NEXT_SOURCE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .ok()
             .map(Self)
     }

@@ -104,8 +104,12 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
 
     // Ensure toyos-libc is built and installed in the sysroot.
     // Invalidate stamp when toolchain was rebuilt (sysroot rlibs replaced).
+    // Its own cross artifacts go too: they were compiled against the sysroot
+    // that was just replaced, and cargo judges them fresh against source that
+    // has not changed.
     if rebuilt {
         let _ = fs::remove_file(stamps_dir.join("toyos-libc.stamp"));
+        let _ = fs::remove_dir_all(root.join("userland/libc/target/x86_64-unknown-toyos"));
     }
     crate::libc::ensure(root, &rust_dir);
 

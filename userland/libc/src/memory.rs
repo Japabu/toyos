@@ -89,6 +89,9 @@ pub unsafe extern "C" fn realloc(p: *mut u8, new_size: usize) -> *mut u8 {
 // memcpy, memmove, memset, memcmp — implemented in inline asm to avoid
 // infinite recursion (Rust's ptr::copy_nonoverlapping emits calls to memcpy).
 
+// This libc spells C strings and buffers as `*const u8`, not `c_char`/`c_void`:
+// same ABI, different element type from the declaration std links against.
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     core::arch::asm!(
@@ -101,6 +104,7 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
     dest
 }
 
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     if (dest as usize) <= (src as usize) || (dest as usize) >= (src as usize) + n {
@@ -120,6 +124,7 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
     dest
 }
 
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
     core::arch::asm!(
@@ -132,6 +137,7 @@ pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
     dest
 }
 
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
     for i in 0..n {
