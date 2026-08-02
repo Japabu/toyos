@@ -2072,6 +2072,76 @@ that can reach a `printf` result. Reproduced in isolation at `973141f`, twice
 each. Not investigated further here — recorded rather than fixed, per the
 workflow rule.
 
+### A clean and a build in one target dir, unserialised — the evidence for #81
+
+2026-08-02, hit by the owner mid-suite. His `cargo test` log, in order:
+
+- `Building toyos-ld...` — the harness rebuilt the linker, because
+  `toyos-ld/src/main.rs` was edited in the tree while the suite ran.
+- `external deps changed: cleaning .../kernel`, `Removed 21703 files, 6.6GiB
+  total` — `ensure_fresh` invalidates on a fingerprint that includes the
+  linker binary's size and mtime (`src/build.rs:103`), so a new toyos-ld
+  cleans kernel, bootloader and userland.
+- the harness's own kernel build then died: `error copying object file ... to
+  incremental directory ...: No such file or directory`, then `failed to
+  create file .../.fingerprint/kernel-.../output-bin-kernel`, then `panicked
+  at src/build.rs:214:9`, reported as `FAIL screen_early_panic`.
+- and its next clean died from the other side: `error: failed to remove file
+  .../userland/target/.../incremental/soundd-.../....o: No such file or
+  directory`.
+
+ENOENT on a file you are removing is the proof: two processes were deleting
+the same tree. A second agent was running `cargo run -- --build-only` in this
+tree over 22:00:14–22:01:44 and 22:02:32–22:04:14, against the harness's last
+write at 22:04:13, and had made the same fingerprint decision and run the same
+cleans.
+
+Cargo's build lock does not cover it. `ensure_fresh` runs `cargo clean`, which
+removes the whole `target/`, and the lock lives inside it at
+`target/<profile>/.cargo-lock` — the clean deletes the file the other
+process's lock is on.
+
+*This* window is not caused or widened by `dbbdcbe`'s build fix, whatever else
+that hunk surfaced — it adds one `remove_dir_all` of
+`userland/libc/target/<triple>` under `if rebuilt`, a directory only
+`src/libc.rs` uses, while the directories here are `kernel/target` and
+`userland/target`, cleaned by `invalidate_stale`/`ensure_fresh`, which
+predates it. What the upgrade work supplied was the trigger — an edit under
+`toyos-ld/src` while a suite runs — and the second racer.
+
+Task #81 serialises this; the four lines above are what it has to make
+unreachable.
+
+### rustup narrates its cargo fallback on every invocation
+
+`info: cargo is unavailable for the active toolchain` followed by `info:
+falling back to ".../nightly-.../bin/cargo"`, one pair per cargo call: 5 pairs
+in `cargo run -- --build-only`, 249 in a full `cargo test`. The build system
+sets `RUSTUP_TOOLCHAIN=toyos` (`src/build.rs:185`,
+`tests/common/compile.rs:42`) or passes `+toyos` (`src/libc.rs:29`), and the
+linked `toyos` toolchain is rust's stage2 sysroot, which ships `rustc` and
+`rustdoc` and no `cargo`.
+
+Recorded rather than fixed, because each way out costs more than the noise:
+
+- **Ask rustup once and reuse the answer.** It will not answer:
+  `RUSTUP_TOOLCHAIN=toyos rustup which cargo` fails with `'cargo' is not
+  installed for the toolchain 'toyos'`. Only the shim applies the fallback and
+  only by narrating it, so "resolve once" means parsing the path out of a
+  human-facing `info:` line — a diagnostic used as an interface.
+- **Reimplement the fallback rule** in the build system. Duplicates rustup
+  policy; when the two disagree the symptom is a cargo/rustc mismatch rather
+  than a clear failure.
+- **Give the toolchain a cargo** — symlink `rust/build/<host>/stage0/bin/cargo`
+  into stage2's `bin/` from `link_toolchain`. Smallest, and arguably the right
+  pairing, since stage0's cargo is the one rust's own bootstrap runs against
+  this compiler where the ambient fallback is four months older (1.96.0-nightly
+  driving a 1.99.0-dev rustc). But it writes into a directory `x.py` owns and
+  changes the cargo behind every ToyOS build, so it needs a verification run of
+  its own.
+
+Not by redirecting the shim's stderr: rustup reports real errors on it.
+
 ---
 
 ## 7. Design debt
