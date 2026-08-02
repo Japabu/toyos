@@ -120,6 +120,7 @@ const MACHINE_TESTS: &[&str] = &[
     "usb_storage_write_error",
     "usb_flush_optional",
     "xhci_deaf_registers",
+    "xhci_slow_connect",
     "xhci_descriptor_walk",
     "esp_filesystem",
     "esp_log_file",
@@ -1688,6 +1689,7 @@ fn run_machine_test(
         "usb_storage_write_error" => usb::usb_storage_write_error(test_config, c_bins, rust_bins),
         "usb_flush_optional" => usb::usb_flush_optional(test_config, c_bins, rust_bins),
         "xhci_deaf_registers" => usb::xhci_deaf_registers(test_config, c_bins, rust_bins),
+        "xhci_slow_connect" => usb::xhci_slow_connect(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {

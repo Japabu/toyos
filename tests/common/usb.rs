@@ -784,6 +784,95 @@ pub fn xhci_deaf_registers(
     Ok(())
 }
 
+/// A root hub that has not finished detecting its devices when the driver first
+/// looks — which is every root hub that is made of copper.
+///
+/// HCRST puts the ports back to the state they have with nothing attached, so a
+/// device firmware had already enumerated has to be detected again, and
+/// detection takes milliseconds: power settling, a USB2 pull-up being debounced,
+/// a USB3 link training. The T14 logged `controller started` and
+/// `no HID devices` in the same millisecond, on both controllers, while running
+/// off a stick plugged into one of them.
+///
+/// **The actuator is a kernel feature, and the reason is timing rather than
+/// expressiveness.** QEMU *can* stage a late attach: `usb-bot` and `usb-uas`
+/// are the two devices whose QOM `attached` property is settable, so
+/// `qom-set /machine/peripheral/<id> attached false|true` detaches and
+/// reattaches at runtime and does generate a Port Status Change Event
+/// (`xhci_attach` → `xhci_port_update` → `xhci_port_notify`, QEMU 11.0.2
+/// `hw/usb/hcd-xhci.c`). What it cannot do is *aim*: the port scan happens
+/// ~0.1 s into a boot and the driver's detection window is bounded, so a
+/// host-wall-clock QMP write would have to land inside a window the guest
+/// opens. That makes the outcome a race rather than an assertion.
+/// `xhci-slow-connect` replaces the *register* instead — during the window the
+/// port reads CCS, PED and speed exactly as an unpopulated one does — so what
+/// appears afterwards is QEMU's own device with its own descriptors and its own
+/// bytes, and the host-side verification below is the same one the ordinary
+/// gate runs.
+pub fn xhci_slow_connect(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURES: &[&str] = &["usb-storage-gate", "xhci-slow-connect"];
+    /// Mirrors `xhci/mod.rs`'s `SLOW_CONNECT_NS`. The two are one wire format
+    /// in the same sense the gate's stamp is: a change to either without the
+    /// other shows up as a failed assertion, not as a silent pass.
+    const HELD_EMPTY_S: f64 = 0.300;
+
+    let (bytes, lba) = Profile::UsbDisk.usb_disk().expect("UsbDisk declares a disk");
+    let image = test_dir().join("usb-slow-connect.img");
+    let nonce = stage(&image, bytes);
+
+    let log = boot_and_shutdown(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::UsbDisk,
+            kernel_features: FEATURES,
+            usb_image: Some(image.clone()),
+            ..Default::default()
+        },
+    )?;
+
+    // The driver looked at an empty bus and kept looking. Without this the test
+    // would be green on a driver that never waits and a QEMU that answers
+    // instantly, which is exactly the pair that shipped.
+    let started = stamp_of(&log, "xHCI: controller started")?;
+    let first_seen = stamp_of(&log, " connected, speed=")?;
+    let waited = first_seen - started;
+    if waited < HELD_EMPTY_S {
+        return Err(format!(
+            "the first port was seen {waited:.3} s after the controller started, inside the \
+             {HELD_EMPTY_S} s the ports are held empty for — the injection did not reach the \
+             driver\n{log}"
+        ));
+    }
+
+    // And it found everything, and the bytes are the host's.
+    if !log.contains("usb-storage: 2 device(s)") {
+        return Err(format!("the driver did not bind both sticks after the wait\n{log}"));
+    }
+    gate_ran(&log, 2)?;
+    check_geometry(&log, bytes, lba)?;
+    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true wr_err=0 healthy=true") {
+        return Err(format!("the guest did not report a clean pass\n{log}"));
+    }
+    verify(&image, bytes, nonce)?;
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish\n{log}"));
+    }
+    serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+    let _ = std::fs::remove_file(&image);
+
+    eprintln!(
+        "  [usb] ports empty for {HELD_EMPTY_S} s after `controller started`: first connect seen \
+         at +{waited:.3} s, both sticks bound, host bytes verified host-side"
+    );
+    Ok(())
+}
+
 /// A disk the driver refuses, on the port the controller enumerates *first*.
 ///
 /// `bind` claims a 64 KiB DMA pool block, issues Configure Endpoint — which
