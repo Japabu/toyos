@@ -1,0 +1,34 @@
+# The console boot: a shell on the panel of a machine with no serial port.
+#
+# `--diag-boot` is the other half of this and neither replaces the other. That
+# image contains nothing that can claim the framebuffer, so the kernel's last
+# boot checkpoint stays on the glass — which is the only thing that works on a
+# machine that wedges before userland, and is the answer to exactly one
+# question. This image answers the rest by being asked them: `/bin/console`
+# claims the screen, seeds its scrollback from `/boot/toyos/kernel.log` so the
+# boot log is not lost with the checkpoint, and puts a prompt underneath.
+#
+# Deliberately three programs. Every extra one is something that can fail
+# between the kernel and a prompt, on the machine where a failure costs a
+# reflash — and there is no daemon here that a shell needs.
+init = ["/bin/console"]
+
+assets = ["assets"]
+
+[programs]
+console = {}
+shell = {}
+toybox = {}
+
+[symlinks]
+"bin/cat" = "/bin/toybox"
+"bin/echo" = "/bin/toybox"
+"bin/free" = "/bin/toybox"
+"bin/grep" = "/bin/toybox"
+"bin/ls" = "/bin/toybox"
+"bin/mkdir" = "/bin/toybox"
+"bin/ps" = "/bin/toybox"
+"bin/pwd" = "/bin/toybox"
+"bin/rm" = "/bin/toybox"
+"bin/shutdown" = "/bin/toybox"
+"bin/stats" = "/bin/toybox"
