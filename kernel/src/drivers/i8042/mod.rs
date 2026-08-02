@@ -47,7 +47,7 @@
 //! ISR already executing nor a vector already latched in that CPU's LAPIC, and
 //! an edge asserted on a masked edge-triggered entry is dropped outright.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use toyos_ps2::{KeyDecoder, KeyOutcome, MouseDecoder, MouseOutcome};
 
@@ -126,6 +126,14 @@ static AUX_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 static IRQS: AtomicU32 = AtomicU32::new(0);
 static RX_BYTES: AtomicU32 = AtomicU32::new(0);
 
+/// When the pin first asserted. Set in the handler beside `IRQS`, which is the
+/// only place the two can be made to agree — the health line says "first seen"
+/// and there is now more than one line, so reading the clock where the line is
+/// written dates the second one to when it was printed rather than to the event
+/// it reports. Never written by `handler_poll`: those bytes came from a poll
+/// and no pin asserted for them.
+static FIRST_IRQ_NS: AtomicU64 = AtomicU64::new(0);
+
 /// The CPU the vector is pinned to. Two things are only true there: the ISR is
 /// the sole reader of port 0x60, and an `irq_ring` record for this source can
 /// exist at all (records are strictly per-CPU). Both are load-bearing below.
@@ -174,9 +182,70 @@ const HEALTH_QUIET_DUE: u8 = 2;
 const HEALTH_QUIET_SAID: u8 = 3;
 /// Nothing further to report.
 const HEALTH_DONE: u8 = 4;
+/// Bytes arrived and decoded to nothing. Said once, and still watching: the
+/// byte that completes a sequence is one interrupt away, and a first line
+/// reading `1 bytes, 0 keys` on a keyboard that is in fact working must not be
+/// the last word.
+const HEALTH_MUTE_SAID: u8 = 5;
 
 static HEALTH: AtomicU8 = AtomicU8::new(HEALTH_OFF);
 static ARMED_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes the drain did not turn into an event, oldest first.
+///
+/// `N bytes, 0 keys` is a true statement that names no suspect. 84 of the 256
+/// single byte values decode to nothing under set 1, and `handle_key` drops a
+/// break for a usage that was not held, so the arithmetic alone cannot separate
+/// an extended key's `0xE0` prefix — where nothing is wrong and the rest of the
+/// keystroke is one interrupt behind — from a keyboard that reset behind our
+/// back (`0xAA`, which is left Shift's break under translation), a late ack
+/// (`0xFA`), or a wire carrying raw set 2, where Enter is `0x5A` and Backspace
+/// `0x66` and 23 such codes land on unmapped slots. The byte tells them apart
+/// and nothing else does. The aux flag rides along because a lone pointer byte
+/// frames no packet and is equally invisible in `0 motion`.
+///
+/// Written only from `drain`, which holds `PS2` and is the one place that knows
+/// both the byte and whether anything came of it.
+const UNEXPLAINED_LEN: usize = 8;
+static UNEXPLAINED: [AtomicU16; UNEXPLAINED_LEN] = [const { AtomicU16::new(0) }; UNEXPLAINED_LEN];
+static UNEXPLAINED_N: AtomicU32 = AtomicU32::new(0);
+const UNEXPLAINED_AUX: u16 = 1 << 8;
+
+fn record_unexplained(byte: u8, aux: bool) {
+    let n = UNEXPLAINED_N.fetch_add(1, Ordering::Relaxed) as usize;
+    if let Some(slot) = UNEXPLAINED.get(n) {
+        slot.store(u16::from(byte) | if aux { UNEXPLAINED_AUX } else { 0 }, Ordering::Relaxed);
+    }
+}
+
+/// Renders ` no event from [0xe0, aux 0x08],` — and nothing at all when every
+/// byte became an event, because a clause naming an empty list is a column of
+/// panel width for no information.
+struct Unexplained;
+
+impl core::fmt::Display for Unexplained {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let seen = UNEXPLAINED_N.load(Ordering::Relaxed) as usize;
+        if seen == 0 {
+            return Ok(());
+        }
+        write!(f, " no event from [")?;
+        for (i, slot) in UNEXPLAINED.iter().take(seen).enumerate() {
+            let value = slot.load(Ordering::Relaxed);
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            if value & UNEXPLAINED_AUX != 0 {
+                write!(f, "aux ")?;
+            }
+            write!(f, "{:#04x}", value as u8)?;
+        }
+        if seen > UNEXPLAINED_LEN {
+            write!(f, ", +{}", seen - UNEXPLAINED_LEN)?;
+        }
+        write!(f, "],")
+    }
+}
 
 fn claim_health(from: u8, to: u8) -> bool {
     HEALTH
@@ -210,23 +279,48 @@ fn millis_since_boot() -> u64 {
     crate::clock::nanos_since_boot() / 1_000_000
 }
 
+fn first_irq_ms() -> u64 {
+    FIRST_IRQ_NS.load(Ordering::Relaxed) / 1_000_000
+}
+
 /// Say once whether the armed pin has ever asserted. Runs in thread context
 /// from `service`, on whichever CPU took the pass; the compare-exchange is what
 /// keeps two CPUs from both reporting.
 fn report_health(state: u8) {
     let irqs = IRQS.load(Ordering::Relaxed);
     if irqs > 0 {
-        if claim_health(state, HEALTH_DONE) {
+        let keys = KBD_EVENTS.load(Ordering::Relaxed);
+        let motion = AUX_EVENTS.load(Ordering::Relaxed);
+        // Two lines at most, and the second only when the picture changes from
+        // "nothing decoded" to "something did". The first interrupt's own pass
+        // is the earliest moment this can be said and also the least settled
+        // one: a keystroke is up to six bytes and the pass runs between them,
+        // so a report that went straight to DONE would freeze the panel on a
+        // half-arrived sequence and never correct itself.
+        let next = if keys + motion == 0 { HEALTH_MUTE_SAID } else { HEALTH_DONE };
+        if next == state || !claim_health(state, next) {
+            return;
+        }
+        if next == HEALTH_MUTE_SAID {
             log!(
-                "i8042: the pin asserts — {} interrupts, {} bytes, {} keys, {} motion, first seen at {}ms",
+                "i8042: {} interrupts and {} bytes, nothing decoded —{} first seen at {}ms",
                 irqs,
                 RX_BYTES.load(Ordering::Relaxed),
-                KBD_EVENTS.load(Ordering::Relaxed),
-                AUX_EVENTS.load(Ordering::Relaxed),
-                millis_since_boot()
+                Unexplained,
+                first_irq_ms()
             );
-            to_screen();
+        } else {
+            log!(
+                "i8042: the pin asserts — {} interrupts, {} bytes, {} keys, {} motion,{} first seen at {}ms",
+                irqs,
+                RX_BYTES.load(Ordering::Relaxed),
+                keys,
+                motion,
+                Unexplained,
+                first_irq_ms()
+            );
         }
+        to_screen();
         return;
     }
     if state == HEALTH_QUIET_DUE && claim_health(HEALTH_QUIET_DUE, HEALTH_QUIET_SAID) {
@@ -345,6 +439,11 @@ fn buffer_full(status: u8) -> bool {
 pub extern "sysv64" fn handler() {
     IRQS.fetch_add(1, Ordering::Relaxed);
     let timestamp = crate::clock::nanos_since_boot();
+    // No compare-exchange: delivery is pinned to one CPU behind an interrupt
+    // gate, so this handler cannot nest and there is no second writer.
+    if FIRST_IRQ_NS.load(Ordering::Relaxed) == 0 {
+        FIRST_IRQ_NS.store(timestamp, Ordering::Relaxed);
+    }
     let mut n = 0;
     while n < ISR_BURST {
         let status = inb(STATUS);
@@ -490,6 +589,7 @@ fn drain() -> Drained {
 
     while let Some((byte, aux, arrived)) = pop() {
         out.bytes += 1;
+        let produced = out.keys + out.motion;
         if aux {
             match state.pointer.feed(byte, arrived) {
                 MouseOutcome::Packet { buttons, dx, dy } => {
@@ -505,16 +605,22 @@ fn drain() -> Drained {
                 MouseOutcome::Reset => out.aux_reset = true,
                 MouseOutcome::None => {}
             }
-            continue;
-        }
-        match state.keys.feed(byte) {
-            KeyOutcome::Key { usage, pressed } => {
-                if crate::keyboard::handle_key(usage, pressed) {
-                    out.keys += 1;
+        } else {
+            match state.keys.feed(byte) {
+                KeyOutcome::Key { usage, pressed } => {
+                    if crate::keyboard::handle_key(usage, pressed) {
+                        out.keys += 1;
+                    }
                 }
+                KeyOutcome::Lost => lost = true,
+                KeyOutcome::None => {}
             }
-            KeyOutcome::Lost => lost = true,
-            KeyOutcome::None => {}
+        }
+        // The whole path, not the decoder's verdict: `handle_key` drops a break
+        // for a usage nothing held, which is a byte that produced no event just
+        // as much as an unmapped code is.
+        if out.keys + out.motion == produced {
+            record_unexplained(byte, aux);
         }
     }
 
