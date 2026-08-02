@@ -1,15 +1,24 @@
-//! Which partition this machine booted from, and where it is.
+//! Which partitions this machine was given, and where they are.
 //!
-//! Two halves that must not be confused. **Identity** comes from firmware:
-//! the bootloader reads the unique partition GUID out of its own
-//! `LoadedImage` device path while Boot Services are alive and puts it in
-//! [`KernelArgs`]. **Location** comes from the disk: [`probe`] parses a block
-//! device's GPT and looks for that exact GUID.
+//! Two halves that must not be confused. **Identity** comes from the
+//! bootloader: the unique partition GUID of the volume firmware loaded it
+//! from, read out of its own `LoadedImage` device path while Boot Services are
+//! alive, and the unique GUID of the log partition, read out of a file on that
+//! same volume. Both arrive in [`KernelArgs`]. **Location** comes from the
+//! disk: [`probe`] parses a block device's GPT and looks for those exact GUIDs.
 //!
-//! The kernel is *given* its boot device. It never goes looking for one. The
-//! difference is not academic — "mount whatever looks like an ESP" is the same
-//! shape as "format whatever fails to mount", and the second one nearly took
-//! the owner's 244 GB NVMe (`5dff9aa`, and `bcachefs_adapter::probe`'s comment).
+//! The kernel is *given* both. It never goes looking for either. The difference
+//! is not academic — "mount whatever looks like an ESP" is the same shape as
+//! "format whatever fails to mount", and the second one nearly took the owner's
+//! 244 GB NVMe (`5dff9aa`, and `bcachefs_adapter::probe`'s comment). It is the
+//! reason the log partition is not found by its type or by being the only other
+//! FAT32 on the stick, both of which would have needed no handoff at all.
+//!
+//! The two identities are not equally sourced and the code says so. The boot
+//! partition has two independent accounts, firmware's and the table's, and a
+//! disagreement refuses it. The log partition has one, so it is anchored to the
+//! boot partition instead: it counts only on the device that carries the boot
+//! partition, because the file that named it is on that volume.
 //!
 //! Nothing here writes. Parsing is [`toyos_gpt`], which treats the table as
 //! hostile bytes and has no panicking path; this file is the adapter from the
@@ -32,9 +41,9 @@ pub struct BootPartition {
     pub blocks: u64,
 }
 
-/// The boot partition as a place on a device this kernel can actually read.
+/// A partition this kernel was given, as a place on a device it can read.
 #[derive(Clone, Copy, Debug)]
-pub struct BootVolume {
+pub struct Volume {
     pub device: DeviceId,
     /// The device's logical block size. Both LBAs below are in these units,
     /// not in the 4 KiB blocks `BlockDevice` speaks.
@@ -43,24 +52,38 @@ pub struct BootVolume {
     pub blocks: u64,
 }
 
-/// What the kernel knows about where its boot partition lives.
+/// What the kernel knows about where the partitions it was given live.
 ///
 /// `Ambiguous` is a state and not an error return because it is a property of
 /// the machine, not of a call: two devices carrying one unique partition GUID
 /// means one is a clone of the other, and nothing on this side can tell which
 /// one firmware read. The only safe answer to "which is mine" is then "I do
 /// not know", forever, and never "the first one I saw".
+///
+/// `log` is an `Option` inside `Found` because that is a state a real stick
+/// reaches: an image flashed before the log partition existed, or a table that
+/// no longer carries the entry the ESP names. It means the machine keeps its
+/// `/boot` and has no `/log`, and it is a refusal that says which GUID it could
+/// not find — never a fallback onto some other partition.
 enum Resolution {
     Unknown,
-    Found(BootVolume),
+    Found { boot: Volume, log: Option<Volume> },
     Ambiguous,
 }
 
 static FIRMWARE: Lock<Option<BootPartition>> = Lock::new(None);
+/// The log partition's identity. `None` only before [`init`] — the handoff
+/// always carries one, because the bootloader refuses a volume that does not
+/// name it.
+static LOG_GUID: Lock<Option<Guid>> = Lock::new(None);
 static RESOLVED: Lock<Resolution> = Lock::new(Resolution::Unknown);
 
-/// Take the boot partition's identity out of the bootloader's handoff.
+/// Take both partitions' identities out of the bootloader's handoff.
 pub fn init(args: &KernelArgs) {
+    let log_guid = Guid(args.log_partition_guid);
+    log!("gpt: the boot volume names {log_guid} as the log partition");
+    *LOG_GUID.lock() = Some(log_guid);
+
     if args.boot_partition_present == 0 {
         log!("gpt: firmware named no boot partition — this machine has none");
         return;
@@ -85,9 +108,17 @@ pub fn boot_partition() -> Option<BootPartition> {
 ///
 /// This is what a filesystem mount asks: the answer is an LBA range on a named
 /// device, or nothing at all. There is no third answer and no "probably".
-pub fn boot_volume() -> Option<BootVolume> {
+pub fn boot_volume() -> Option<Volume> {
     match *RESOLVED.lock() {
-        Resolution::Found(v) => Some(v),
+        Resolution::Found { boot, .. } => Some(boot),
+        Resolution::Unknown | Resolution::Ambiguous => None,
+    }
+}
+
+/// Where the log partition is, on the device that carries the boot partition.
+pub fn log_volume() -> Option<Volume> {
+    match *RESOLVED.lock() {
+        Resolution::Found { log, .. } => log,
         Resolution::Unknown | Resolution::Ambiguous => None,
     }
 }
@@ -135,15 +166,21 @@ pub fn probe(dev: &mut dyn BlockDevice, lba_bytes: u32) {
         return;
     }
 
-    let volume = BootVolume {
+    let volume = Volume {
         device: id,
         lba_bytes,
         start_lba: part.first_lba,
         blocks: part.lba_count(),
     };
+
     let mut resolved = RESOLVED.lock();
     match *resolved {
         Resolution::Unknown => {
+            // Only here, and so only on this device. The GUID came off a file
+            // on the volume this table has just placed, so a partition of that
+            // name on some *other* disk is not the one that file meant — and a
+            // machine whose boot volume is ambiguous has no such file to trust.
+            let log = locate_log(&mut sectors, id, lba_bytes);
             log!(
                 "gpt: device {id} carries the boot partition at LBA {}+{} ({}-byte blocks), \
                  entry {} of {} on disk {}{}",
@@ -155,9 +192,9 @@ pub fn probe(dev: &mut dyn BlockDevice, lba_bytes: u32) {
                 found.disk_guid,
                 if part.is_efi_system() { "" } else { " — and its type is not ESP" }
             );
-            *resolved = Resolution::Found(volume);
+            *resolved = Resolution::Found { boot: volume, log };
         }
-        Resolution::Found(first) => {
+        Resolution::Found { boot: first, .. } => {
             log!(
                 "gpt: device {id} carries the same partition GUID as device {} — one of them is \
                  a copy and nothing here can say which one we booted from, so this machine now \
@@ -168,6 +205,43 @@ pub fn probe(dev: &mut dyn BlockDevice, lba_bytes: u32) {
         }
         Resolution::Ambiguous => {
             log!("gpt: device {id} also carries the boot partition GUID");
+        }
+    }
+}
+
+/// The log partition on the device that has just proved it carries the boot
+/// partition, or a refusal that names what it looked for.
+///
+/// No second account to cross-check against: firmware describes one partition
+/// and this is not it. What stands in for that is where the name came from —
+/// `\toyos\log.guid` on the volume firmware *did* describe — plus this call
+/// being reachable only from the device carrying that volume.
+fn locate_log(sectors: &mut DeviceSectors<'_>, id: DeviceId, lba_bytes: u32) -> Option<Volume> {
+    let target = LOG_GUID.lock().expect("gpt::init runs before any device is probed");
+    match toyos_gpt::locate(sectors, target) {
+        Ok(found) => {
+            let part = found.partition;
+            log!(
+                "gpt: device {id} carries the log partition {target} at LBA {}+{}, entry {} of {}",
+                part.first_lba,
+                part.lba_count(),
+                part.index,
+                found.used_entries
+            );
+            Some(Volume {
+                device: id,
+                lba_bytes,
+                start_lba: part.first_lba,
+                blocks: part.lba_count(),
+            })
+        }
+        Err(e) => {
+            log!(
+                "gpt: device {id} carries the boot partition but nothing with the log partition's \
+                 GUID {target}: {e:?} — this stick has no log partition and the kernel's log \
+                 stays in memory"
+            );
+            None
         }
     }
 }

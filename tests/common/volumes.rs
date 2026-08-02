@@ -1,11 +1,28 @@
-//! The boot partition, mounted and written from inside ToyOS.
+//! The boot stick's two partitions, mounted and written from inside ToyOS.
+//!
+//! The ESP holds what firmware and the bootloader read. The log partition
+//! beside it holds the kernel's own log and exists for one reason: it is typed
+//! so that a desktop OS mounts it on plug-in, which an EFI-typed partition is
+//! not. Both are FAT32 and neither is found by being FAT32 — the kernel is
+//! handed both by unique GUID, and `log_partition_identity` is the gate that
+//! says so by moving the name and watching the mount disappear.
 //!
 //! Ground truth is the disk image the *device* received, read on the host by
-//! two implementations that are not ours: the `fatfs` crate, and macOS's
-//! `fsck_msdos`. The guest's own account of a write it made is exactly what is
-//! in question, so it cannot also be the evidence — `esp_files` asserts what
-//! only a process inside the machine can see, and everything it claims about
-//! bytes is checked again here.
+//! implementations that are not ours: the `fatfs` crate and macOS's
+//! `fsck_msdos`. The guest's account of a write it made is exactly what is in
+//! question, so it cannot also be the evidence; `esp_files` asserts what only a
+//! process inside the machine can see, and everything it claims about bytes is
+//! checked again here.
+//!
+//! **Where this stops.** `log_partition_layout` pins the image: type GUID,
+//! attribute bits, labels, alignment, and that our own GPT parser finds the
+//! partition the ESP names. It does not assert that any operating system
+//! *mounts* it. Whether macOS attaches a Basic Data partition is
+//! `diskarbitrationd`'s policy, not our contract — it moves between macOS
+//! versions and host settings, it would put a volume on the owner's desktop
+//! every test run, and it would race concurrent runs. That end of the contract
+//! was verified once by hand, on 2026-08-02, and is re-verified when a stick is
+//! flashed.
 //!
 //! The image is built and modified before the boot rather than after, because
 //! the host-writes-guest-reads direction has no other staging point: a file the
@@ -54,51 +71,67 @@ fn test_dir() -> PathBuf {
     dir
 }
 
-/// Where the ESP sits inside a GPT disk image, in bytes, and the unique
-/// partition GUID the table gives it.
+/// Where a partition sits inside a GPT disk image, in bytes, and the unique
+/// GUID the table gives it.
 ///
-/// The GUID is drawn fresh by `create_gpt_disk` for every image, so it is a
+/// Selected by *type*, which is right in exactly one place and this is it: the
+/// host has no handoff to be given, and it is the thing asking whether the
+/// image builder produced the layout it claims. Exactly one partition of each
+/// type, or this fails.
+///
+/// The GUID is drawn fresh by `create_boot_image` for every image, so it is a
 /// per-run nonce that the host knows before the machine starts and that only
-/// this boot's kernel can have logged. `esp_log_file` uses it to tell this
+/// this boot's kernel can have logged. `kernel_log_file` uses it to tell this
 /// boot's log from a file left behind by anything else.
-pub fn esp_extent(image: &[u8], path: &Path) -> Result<(usize, usize), String> {
+struct Extent {
+    start: usize,
+    len: usize,
+    guid: String,
+}
+
+fn extent(
+    image: &[u8],
+    path: &Path,
+    kind: partition_types::Type,
+    what: &str,
+) -> Result<Extent, String> {
     let disk = gpt::GptConfig::new()
         .writable(false)
         .logical_block_size(LogicalBlockSize::Lb512)
         .open(path)
         .map_err(|e| format!("the built image has no readable GPT: {e}"))?;
-    let esps: Vec<_> = disk
-        .partitions()
-        .values()
-        .filter(|p| p.part_type_guid == partition_types::EFI)
-        .collect();
-    let [esp] = esps.as_slice() else {
-        return Err(format!("the built image has {} ESPs, expected one", esps.len()));
+    let found: Vec<_> =
+        disk.partitions().values().filter(|p| p.part_type_guid == kind).collect();
+    let [part] = found.as_slice() else {
+        return Err(format!("the built image has {} of {what}, expected one", found.len()));
     };
-    let start = esp.first_lba as usize * 512;
-    let len = (esp.last_lba - esp.first_lba + 1) as usize * 512;
+    let start = part.first_lba as usize * 512;
+    let len = (part.last_lba - part.first_lba + 1) as usize * 512;
     if start + len > image.len() {
-        return Err(format!("the ESP runs to {} in an image of {}", start + len, image.len()));
+        return Err(format!(
+            "the {what} runs to {} in an image of {}",
+            start + len,
+            image.len()
+        ));
     }
-    Ok((start, len))
+    Ok(Extent { start, len, guid: part.part_guid.to_string().to_uppercase() })
+}
+
+/// The ESP's byte range: what firmware and the bootloader read.
+pub fn esp_extent(image: &[u8], path: &Path) -> Result<(usize, usize), String> {
+    let e = extent(image, path, partition_types::EFI, "ESP")?;
+    Ok((e.start, e.len))
+}
+
+/// The log partition's byte range: where `/log/kernel.log` lands.
+pub fn log_extent(image: &[u8], path: &Path) -> Result<(usize, usize), String> {
+    let e = extent(image, path, partition_types::BASIC, "log partition")?;
+    Ok((e.start, e.len))
 }
 
 /// The unique partition GUID of a boot image's ESP, as the kernel prints it.
-fn esp_guid(path: &Path) -> Result<String, String> {
-    let disk = gpt::GptConfig::new()
-        .writable(false)
-        .logical_block_size(LogicalBlockSize::Lb512)
-        .open(path)
-        .map_err(|e| format!("the built image has no readable GPT: {e}"))?;
-    let esps: Vec<_> = disk
-        .partitions()
-        .values()
-        .filter(|p| p.part_type_guid == partition_types::EFI)
-        .collect();
-    let [esp] = esps.as_slice() else {
-        return Err(format!("the built image has {} ESPs, expected one", esps.len()));
-    };
-    Ok(esp.part_guid.to_string().to_uppercase())
+fn esp_guid(image: &[u8], path: &Path) -> Result<String, String> {
+    Ok(extent(image, path, partition_types::EFI, "ESP")?.guid)
 }
 
 /// Read several files out of a FAT volume in one mount. `None` is a file that
@@ -266,10 +299,10 @@ pub fn esp_filesystem(
     );
     let boot = qemu.boot_log().to_string();
     serial::Serial::named("boot console", boot.as_str()).must_be_clean()?;
-    if !boot.contains("esp: boot partition mounted") {
+    if !boot.contains("boot-volume: partition mounted") {
         return Err(format!(
             "the kernel did not mount the boot partition:\n{}",
-            esp_lines(&boot)
+            volume_lines(&boot)
         ));
     }
 
@@ -387,25 +420,27 @@ pub fn esp_filesystem(
     Ok(())
 }
 
-/// Everything the guest said about identifying and mounting its boot volume.
+/// Everything the guest said about identifying and mounting its volumes.
 ///
-/// Wider than `esp:` on purpose. A mount that does not happen is usually not
-/// the mount's fault: the two recorded instances were `gpt::probe` reporting an
-/// entry-array CRC mismatch, which is a *read* off the stick coming back wrong,
-/// and a failure message showing only the `esp:` line said nothing about that.
-fn esp_lines(log: &str) -> String {
+/// Wider than the mount's own lines on purpose. A mount that does not happen is
+/// usually not the mount's fault: the two recorded instances were `gpt::probe`
+/// reporting an entry-array CRC mismatch, which is a *read* off the stick
+/// coming back wrong, and a failure message showing only the mount line said
+/// nothing about that.
+fn volume_lines(log: &str) -> String {
     let lines: Vec<&str> = log
         .lines()
-        .filter(|l| l.contains("esp:") || l.contains("esp-log:") || l.contains("gpt:")
+        .filter(|l| l.contains("-volume:") || l.contains("log-file:") || l.contains("gpt:")
             || l.contains("usb-storage:"))
         .collect();
     if lines.is_empty() {
-        return format!("the guest said nothing about its boot volume at all\n{log}");
+        return format!("the guest said nothing about its volumes at all\n{log}");
     }
     format!("what it said:\n{}", lines.join("\n"))
 }
 
-/// The kernel's own log, written to the stick it booted from.
+/// The kernel's own log, written to the log partition of the stick it booted
+/// from.
 ///
 /// The claim under test is *continuity*: not that a log file exists at the end,
 /// but that the tail of what the kernel said is on the device while the machine
@@ -418,9 +453,9 @@ fn esp_lines(log: &str) -> String {
 /// assertion aimed at it:
 ///
 /// - **A file left over from something else.** The log must carry this image's
-///   own unique partition GUID, which `create_gpt_disk` draws fresh per build
-///   and no earlier run can have.
-/// - **A single flush at install time.** `esp_log::install` runs in the
+///   own unique ESP GUID, which `create_boot_image` draws fresh per build and
+///   no earlier run can have.
+/// - **A single flush at install time.** `log_file::install` runs in the
 ///   subsystem phase and seeds the file with the ring's retained tail, so a
 ///   sink that then did nothing would still produce a file. `Boot: complete` is
 ///   logged two phases later, so requiring it requires a flush after install.
@@ -429,20 +464,30 @@ fn esp_lines(log: &str) -> String {
 ///   post-shutdown read must additionally have the shutdown's own last line,
 ///   which only `flush_final` can deliver.
 ///
-/// A second boot, with `esp-log-rotate-fast`, drives the bound: rotation is what
-/// stops the file filling the owner's stick, and at the shipped megabyte no test
-/// would ever reach it.
-pub fn esp_log_file(
+/// A second boot, with `log-rotate-fast`, drives the bound: rotation is what
+/// stops the file filling the owner's stick, and at the shipped four megabytes
+/// no test would ever reach it.
+pub fn kernel_log_file(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    let image_path = test_dir().join("esp-log-boot.img");
+    let image_path = test_dir().join("kernel-log-boot.img");
     let image = qemu::build_boot_image(test_config, c_bins, rust_bins, &[]);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
-    let (start, len) = esp_extent(&image, &image_path)?;
-    let guid = esp_guid(&image_path)?;
-    let complaints_before = fsck_complaints(&image[start..start + len], "esp-log-before")?;
+    let (start, len) = log_extent(&image, &image_path)?;
+    let guid = esp_guid(&image, &image_path)?;
+    // Born clean, and asserted so rather than assumed: `create_log_volume`
+    // formats an empty volume and records its free-cluster count, so unlike the
+    // ESP there is nothing here for the guest's own complaints to hide behind.
+    let complaints_before = fsck_complaints(&image[start..start + len], "kernel-log-before")?;
+    if !complaints_before.is_empty() {
+        return Err(format!(
+            "the log partition was not born fsck-clean, so this gate cannot tell a complaint the \
+             guest caused from one it inherited:\n{}",
+            complaints_before.join("\n")
+        ));
+    }
 
     // The line the kernel logs when firmware hands it the partition GUID. The
     // host knows it before the machine starts; the guest can only have it from
@@ -461,8 +506,8 @@ pub fn esp_log_file(
     );
     let boot = qemu.boot_log().to_string();
     serial::Serial::named("boot console", boot.as_str()).must_be_clean()?;
-    if !boot.contains("esp-log: this boot's kernel log continues in") {
-        return Err(format!("the sink never installed:\n{}", esp_lines(&boot)));
+    if !boot.contains("log-file: this boot's kernel log continues in") {
+        return Err(format!("the sink never installed:\n{}", volume_lines(&boot)));
     }
 
     // Mid-run, with the guest still up and nothing shut down. Whatever is here
@@ -479,7 +524,7 @@ pub fn esp_log_file(
     let mut running;
     let mut running_text;
     loop {
-        running = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+        running = log_on_device(&image_path, start, len, "kernel.log")?;
         running_text = String::from_utf8_lossy(&running).into_owned();
         if running_text.contains("Boot: complete") || std::time::Instant::now() >= deadline {
             break;
@@ -506,7 +551,7 @@ pub fn esp_log_file(
         return Err("the guest shut down before the mid-run read".to_string());
     }
     eprintln!(
-        "  [esp-log] {} bytes on the device {} ms after the ready marker, with the machine still \
+        "  [log] {} bytes on the device {} ms after the ready marker, with the machine still \
          running and through `Boot: complete`",
         running.len(),
         took.as_millis()
@@ -523,7 +568,7 @@ pub fn esp_log_file(
     }
 
     let after = std::fs::read(&image_path).map_err(|e| format!("read the image back: {e}"))?;
-    let final_log = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+    let final_log = log_on_device(&image_path, start, len, "kernel.log")?;
     let final_text = String::from_utf8_lossy(&final_log).into_owned();
     if !final_text.contains("Shutting down.") {
         return Err(format!(
@@ -540,17 +585,16 @@ pub fn esp_log_file(
         ));
     }
 
-    let complaints_after = fsck_complaints(&after[start..start + len], "esp-log-after")?;
-    let fresh: Vec<&String> =
-        complaints_after.iter().filter(|c| !complaints_before.contains(c)).collect();
-    if !fresh.is_empty() {
+    let complaints_after = fsck_complaints(&after[start..start + len], "kernel-log-after")?;
+    if !complaints_after.is_empty() {
         return Err(format!(
-            "writing the log gave fsck_msdos something new to say:\n{}",
-            fresh.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
+            "writing the log gave fsck_msdos something to say about a volume it had nothing to \
+             say about:\n{}",
+            complaints_after.join("\n")
         ));
     }
     eprintln!(
-        "  [esp-log] {} bytes after the shutdown, carrying its last line; fsck has nothing new",
+        "  [log] {} bytes after the shutdown, carrying its last line; fsck still silent",
         final_log.len()
     );
     let _ = std::fs::remove_file(&image_path);
@@ -558,18 +602,19 @@ pub fn esp_log_file(
     rotation(test_config, c_bins, rust_bins)
 }
 
-/// The bound. `esp-log-rotate-fast` moves it from a megabyte to 8 KiB, which one
-/// boot's own log crosses, so the rotation path runs on the shipped code.
+/// The bound. `log-rotate-fast` moves it from four megabytes to 256 bytes, which
+/// one boot's own log crosses several times over, so the rotation path runs on
+/// the shipped code.
 fn rotation(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURE: &[&str] = &["esp-log-rotate-fast"];
-    let image_path = test_dir().join("esp-log-rotate.img");
+    const FEATURE: &[&str] = &["log-rotate-fast"];
+    let image_path = test_dir().join("kernel-log-rotate.img");
     let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURE);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
-    let (start, len) = esp_extent(&image, &image_path)?;
+    let (start, len) = log_extent(&image, &image_path)?;
 
     let mut qemu = QemuInstance::boot_with_options(
         test_config,
@@ -592,12 +637,12 @@ fn rotation(
     // renames over an existing `kernel.log.1`, and FAT has no atomic
     // replacement — so the adapter has to delete the destination first, and a
     // single rotation would never run that half.
-    let rotations = log.matches("became /boot/toyos/kernel.log.1").count();
+    let rotations = log.matches("became /log/kernel.log.1").count();
     if rotations < 2 {
-        return Err(format!("the log rotated {rotations} times, wanted at least two:\n{}", esp_lines(&log)));
+        return Err(format!("the log rotated {rotations} times, wanted at least two:\n{}", volume_lines(&log)));
     }
-    let current = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
-    let previous = log_on_device(&image_path, start, len, "toyos/kernel.log.1")?;
+    let current = log_on_device(&image_path, start, len, "kernel.log")?;
+    let previous = log_on_device(&image_path, start, len, "kernel.log.1")?;
     // The generation that filled must be at least the bound; the current one
     // must be shorter than it, or nothing was actually moved aside.
     if previous.len() < 256 {
@@ -618,7 +663,7 @@ fn rotation(
     }
     let _ = std::fs::remove_file(&image_path);
     eprintln!(
-        "  [esp-log] rotated {rotations} times at the 256-byte bound: {} bytes in kernel.log.1, \
+        "  [log] rotated {rotations} times at the 256-byte bound: {} bytes in kernel.log.1, \
          {} in kernel.log",
         previous.len(),
         current.len()
@@ -626,7 +671,7 @@ fn rotation(
     Ok(())
 }
 
-/// One file read out of the ESP inside a disk image on the host.
+/// One file read out of a partition inside a disk image on the host.
 pub fn log_on_device(
     image_path: &Path,
     start: usize,
@@ -641,30 +686,30 @@ pub fn log_on_device(
     need(found.pop().flatten(), name)
 }
 
-/// A `/boot` file's page that the device will not give back, and the partial
-/// write that used to merge into the hole and persist it.
+/// A page of `/log/kernel.log` that the device will not give back, and the
+/// partial write that used to merge into the hole and persist it.
 ///
-/// `esp_log::Sink::append` writes at `size % 4096`, so an append is almost
+/// `log_file::Sink::append` writes at `size % 4096`, so an append is almost
 /// always a *partial* page write. `file_cache::write_page` re-reads such a page
 /// through the file's backing before merging, and once the page has been
-/// evicted that read goes to the stick. `EspBacking::read_page` returned `()`,
+/// evicted that read goes to the stick. `FatBacking::read_page` returned `()`,
 /// so a failed read was indistinguishable from a page of zeros: the new bytes
-/// were merged into those zeros and `flush_file` wrote the result back over
-/// `/boot/toyos/kernel.log` — from the idle loop, with no line saying so, on
-/// the volume whose entire purpose is to be the diagnostic for a machine with
-/// no serial port.
+/// were merged into those zeros and `flush_file` wrote the result back over the
+/// kernel's own log — from the idle loop, with no line saying so, on the volume
+/// whose entire purpose is to be the diagnostic for a machine with no serial
+/// port.
 ///
 /// Three separate claims, and none of them is the others:
 ///
 /// - the failure is **reported** (`serving zeros`, the marker triage greps for,
 ///   which this path could not emit at all);
-/// - the failure **propagates** — `EspBacking` → `file_cache::write_page` →
+/// - the failure **propagates** — `FatBacking` → `file_cache::write_page` →
 ///   `Sink::append` → `Sink::flush` → `poll`, which disables the sink. Every
 ///   one of those five returned `()` or swallowed on some link of the chain;
 /// - the file on the device is **not corrupted**, checked on the host. This is
 ///   the claim the other two exist to serve, and it is the one that stays
 ///   meaningful if the log lines are ever reworded.
-pub fn esp_backing_read_error(
+pub fn log_backing_read_error(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
@@ -673,15 +718,15 @@ pub fn esp_backing_read_error(
     // shipped ceiling the log's few pages stay resident for the whole boot and
     // the re-read the injection targets never happens. The eviction code is the
     // shipped code; only the bound moves.
-    const FEATURES: &[&str] = &["esp-backing-read-fails", "test-small-caches"];
+    const FEATURES: &[&str] = &["fat-backing-read-fails", "test-small-caches"];
     const SERVING_ZEROS: &str = "failed; serving zeros";
-    const GAVE_UP: &str = "esp-log: the boot volume would not give back the page being appended \
-                           to — /boot/toyos/kernel.log stops at";
+    const GAVE_UP: &str = "log-file: the log volume would not give back the page being appended \
+                           to — /log/kernel.log stops at";
 
-    let image_path = test_dir().join("esp-backing-read-fails.img");
+    let image_path = test_dir().join("fat-backing-read-fails.img");
     let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURES);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
-    let (start, len) = esp_extent(&image, &image_path)?;
+    let (start, len) = log_extent(&image, &image_path)?;
 
     let boot_once = |what: &str| -> Result<String, String> {
         let mut qemu = QemuInstance::boot_with_options(
@@ -716,23 +761,23 @@ pub fn esp_backing_read_error(
     // leave the cache — every append sets the CLOCK reference bit, so the page
     // it is appending to is the last one eviction would ever take, and the
     // re-read this injection targets simply does not happen. It happens on the
-    // boot *after*: `esp_log::install` reopens a file that already has bytes,
-    // `EspFs::open_file` hands the cache a backing for it, nothing is resident,
+    // boot *after*: `log_file::install` reopens a file that already has bytes,
+    // `FatFs::open_file` hands the cache a backing for it, nothing is resident,
     // and the first append is a partial write into a page that has to come off
     // the stick. Appending across boots is a documented property of the sink,
     // not a contrivance for this test.
     let first = boot_once("seeding")?;
-    if !first.contains("esp-log: this boot's kernel log continues in") {
+    if !first.contains("log-file: this boot's kernel log continues in") {
         return Err(format!("the sink never installed on the seeding boot\n{first}"));
     }
-    let seeded = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+    let seeded = log_on_device(&image_path, start, len, "kernel.log")?;
     if seeded.is_empty() {
         return Err("the seeding boot left no kernel.log, so the second boot re-reads \
                     nothing".to_string());
     }
 
     let log = boot_once("re-reading")?;
-    if !log.contains("esp-log: this boot's kernel log continues in") {
+    if !log.contains("log-file: this boot's kernel log continues in") {
         return Err(format!("the sink never installed on the second boot\n{log}"));
     }
 
@@ -743,7 +788,7 @@ pub fn esp_backing_read_error(
     if reported == 0 {
         return Err(format!(
             "no {SERVING_ZEROS:?} line — either the injection never reached a page re-read (so \
-             this boot proves nothing) or the ESP backing is still failing silently\n{log}"
+             this boot proves nothing) or the FAT backing is still failing silently\n{log}"
         ));
     }
 
@@ -760,7 +805,7 @@ pub fn esp_backing_read_error(
     //    corruption is a run of NULs inside a file that is otherwise entirely
     //    printable. Checked here rather than trusted from the console, because
     //    the console is exactly what the guest would be wrong about.
-    let on_device = log_on_device(&image_path, start, len, "toyos/kernel.log")?;
+    let on_device = log_on_device(&image_path, start, len, "kernel.log")?;
     if let Some(at) = on_device.iter().position(|&b| b == 0) {
         let run = on_device[at..].iter().take_while(|&&b| b == 0).count();
         return Err(format!(
@@ -796,9 +841,336 @@ pub fn esp_backing_read_error(
 
     let _ = std::fs::remove_file(&image_path);
     eprintln!(
-        "  [esp-log] {reported} page re-read(s) refused by the device: reported, propagated to \
+        "  [log] {reported} page re-read(s) refused by the device: reported, propagated to \
          the sink once, and the {} bytes the previous boot left in kernel.log are intact",
         seeded.len()
+    );
+    Ok(())
+}
+
+/// The image side of the whole exercise, with nothing mounted and nothing
+/// booted: the log partition is what a desktop OS will pick up on plug-in.
+///
+/// Every claim here is about bytes this build produced, which is the boundary
+/// the suite tests to. What another operating system then *does* with those
+/// bytes is that OS's policy and is deliberately not asserted anywhere — see
+/// this module's header.
+///
+/// The type GUID is written out in full rather than compared against
+/// `partition_types::BASIC`, because the image builder used that same constant
+/// and a comparison against it would agree with any value it held.
+pub fn log_partition_layout(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    /// Microsoft Basic Data. Every desktop OS treats a partition of this type
+    /// as one of its own to mount; an EFI-typed one macOS will not touch, which
+    /// is why the log moved off the ESP.
+    const BASIC_DATA: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
+    const ESP_TYPE: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+
+    let image_path = test_dir().join("log-layout.img");
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, &[]);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+
+    let disk = gpt::GptConfig::new()
+        .writable(false)
+        .logical_block_size(LogicalBlockSize::Lb512)
+        .open(&image_path)
+        .map_err(|e| format!("the built image has no readable GPT: {e}"))?;
+    let table: Vec<_> = disk.partitions().values().collect();
+    let [esp, log] = table.as_slice() else {
+        return Err(format!("the built image has {} partitions, wanted two", table.len()));
+    };
+
+    let types = [
+        (esp.part_type_guid.guid.to_uppercase(), ESP_TYPE, "ESP"),
+        (log.part_type_guid.guid.to_uppercase(), BASIC_DATA, "log partition"),
+    ];
+    for (got, want, what) in types {
+        if got != want {
+            return Err(format!("the {what} is typed {got}, wanted {want}"));
+        }
+    }
+
+    // The attribute field, spelled out. Bit 0 marks a partition the firmware
+    // requires and bit 62 marks one hidden from mounting, and either would
+    // undo the type: an installer that set them would leave a partition that
+    // parses correctly and never appears.
+    if log.flags != 0 {
+        return Err(format!(
+            "the log partition carries attributes {:#018x}; bit 0 (required) is {}, bit 62 \
+             (hidden) is {} — both stop a host mounting it and neither is ever wanted here",
+            log.flags,
+            log.flags & 1,
+            (log.flags >> 62) & 1
+        ));
+    }
+
+    let (esp_guid, log_guid) = (esp.part_guid, log.part_guid);
+    if esp_guid.is_nil() || log_guid.is_nil() {
+        return Err("a partition was given the all-zero GUID, which GPT reads as unused".to_string());
+    }
+    if esp_guid == log_guid {
+        return Err(format!("both partitions carry the unique GUID {esp_guid}"));
+    }
+
+    // The alignment `create_gpt_disk` asserts, checked again from the table:
+    // the kernel mounts both of these over one 4 KiB block device and caches
+    // device blocks per volume, so a block belonging to both would be held
+    // twice and go stale on the other's write.
+    let (esp_start, esp_end) = (esp.first_lba * 512, (esp.last_lba + 1) * 512);
+    let (log_start, log_end) = (log.first_lba * 512, (log.last_lba + 1) * 512);
+    for (what, start, end) in
+        [("ESP", esp_start, esp_end), ("log partition", log_start, log_end)]
+    {
+        if start % 4096 != 0 || end % 4096 != 0 {
+            return Err(format!(
+                "the {what} spans bytes {start}..{end}, which is not whole 4 KiB device blocks"
+            ));
+        }
+    }
+    if esp_end > log_start {
+        return Err(format!("the ESP runs to {esp_end} and the log partition starts at {log_start}"));
+    }
+
+    // What the bootloader will read, and the kernel will be given. The file and
+    // the entry are the same sixteen bytes in the same order or the handoff is
+    // pointing at nothing.
+    let (start, len) = esp_extent(&image, &image_path)?;
+    let named = log_on_device(&image_path, start, len, "toyos/log.guid")?;
+    let named: [u8; 16] = named
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("toyos/log.guid is {} bytes, wanted 16", named.len()))?;
+    if named != log_guid.to_bytes_le() {
+        return Err(format!(
+            "toyos/log.guid holds {named:02x?}, and the log partition's entry holds {:02x?}",
+            log_guid.to_bytes_le()
+        ));
+    }
+
+    // And the parser that will actually do this on the machine agrees, run
+    // here over the same bytes: `toyos_gpt::locate` is the kernel's, and it is
+    // given the GUID exactly as the file carries it.
+    let located = toyos_gpt::locate(&mut ImageSectors { bytes: &image }, toyos_gpt::Guid(named))
+        .map_err(|e| format!("the kernel's own GPT parser cannot find the log partition: {e:?}"))?;
+    if located.partition.first_lba != log.first_lba
+        || located.partition.last_lba != log.last_lba
+    {
+        return Err(format!(
+            "the kernel's parser puts the log partition at LBA {}..{} and the table says {}..{}",
+            located.partition.first_lba, located.partition.last_lba, log.first_lba, log.last_lba
+        ));
+    }
+
+    // Both places a FAT label lives. The boot-sector field is what a mount
+    // reads without walking the root directory; the `VOLUME_ID` entry is what a
+    // tool that walks it reads. Written by one call, checked as two, because a
+    // volume with one of them is a volume called `NO NAME` somewhere.
+    let (log_start, log_len) = log_extent(&image, &image_path)?;
+    for (what, at, size, label) in [
+        ("ESP", start, len, "TOYOS-BOOT"),
+        ("log partition", log_start, log_len, "TOYOS-LOG"),
+    ] {
+        let fs = fatfs::FileSystem::new(Cursor::new(image[at..at + size].to_vec()), FsOptions::new())
+            .map_err(|e| format!("the built {what} does not mount on the host: {e}"))?;
+        if fs.volume_label() != label {
+            return Err(format!(
+                "the {what}'s boot sector calls it {:?}, wanted {label:?}",
+                fs.volume_label()
+            ));
+        }
+        let root = fs
+            .read_volume_label_from_root_dir()
+            .map_err(|e| format!("reading the {what}'s root-directory label: {e}"))?;
+        if root.as_deref() != Some(label) {
+            return Err(format!(
+                "the {what}'s root directory carries the label {root:?}, wanted {label:?}"
+            ));
+        }
+    }
+
+    // Born clean. The ESP is not and cannot be until `fatfs` is forked (known
+    // issues §10); this volume has no subdirectory for either of those defects
+    // to arise in, and its free-cluster count is recorded at format time.
+    let complaints = fsck_complaints(&image[log_start..log_start + log_len], "log-layout")?;
+    if !complaints.is_empty() {
+        return Err(format!(
+            "the log partition is not born fsck-clean:\n{}",
+            complaints.join("\n")
+        ));
+    }
+
+    let _ = std::fs::remove_file(&image_path);
+    eprintln!(
+        "  [log] {BASIC_DATA} with attributes 0, labelled TOYOS-LOG in both places, 4 KiB-aligned \
+         and disjoint from the ESP, fsck-clean, and named by toyos/log.guid"
+    );
+    Ok(())
+}
+
+/// A disk image in 512-byte LBAs, for the kernel's own GPT parser.
+struct ImageSectors<'a> {
+    bytes: &'a [u8],
+}
+
+impl toyos_gpt::Sectors for ImageSectors<'_> {
+    fn lba_bytes(&self) -> u32 {
+        512
+    }
+
+    fn lba_count(&self) -> u64 {
+        (self.bytes.len() / 512) as u64
+    }
+
+    fn read_lba(&mut self, lba: u64, out: &mut [u8]) -> bool {
+        let at = lba as usize * 512;
+        match self.bytes.get(at..at + out.len()) {
+            Some(src) => {
+                out.copy_from_slice(src);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The log partition is named, never discovered — proved by moving the name.
+///
+/// Everything about the partition stays as it was: still second in the table,
+/// still typed Microsoft Basic Data, still the only other FAT32 on the stick,
+/// still exactly where it was. The only change is the sixteen bytes in
+/// `\toyos\log.guid` on the ESP, which is what the bootloader hands the kernel.
+/// A kernel that found the volume by type, by format or by position would mount
+/// it anyway and this gate would go green on the defect it exists for.
+///
+/// The refusal has three halves and each is separately checkable:
+///
+/// - it is **named**: the `gpt:` line says which GUID it could not find, which
+///   is what a person holding the stick needs;
+/// - it costs **nothing else**: `/boot` still mounts and the boot still
+///   completes, because a missing diagnostic is not worth a machine;
+/// - and it is not a **fallback**: the log partition is read back on the host
+///   afterwards and must still be empty. Falling back to the ESP would also
+///   leave it empty, so `log-file:` must not have installed either.
+pub fn log_partition_identity(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    /// A GUID no table this build produces can contain: `create_boot_image`
+    /// draws v4 UUIDs, whose version nibble is 4 and whose variant bits are
+    /// `10`. Written in GPT entry byte order, which is the order everything
+    /// from the file to the comparison uses.
+    const FORGED: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+        0xFF,
+    ];
+    // As `Guid`'s Display prints it: three little-endian fields then raw bytes.
+    const FORGED_TEXT: &str = "33221100-5544-7766-8899-AABBCCDDEEFF";
+
+    let image_path = test_dir().join("log-identity-boot.img");
+    let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, &[]);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+    let (esp_start, esp_len) = esp_extent(&image, &image_path)?;
+    let (log_start, log_len) = log_extent(&image, &image_path)?;
+
+    {
+        let volume = &mut image[esp_start..esp_start + esp_len];
+        let fs = fatfs::FileSystem::new(Cursor::new(&mut *volume), FsOptions::new())
+            .map_err(|e| format!("the built ESP does not mount on the host: {e}"))?;
+        let dir = fs
+            .root_dir()
+            .open_dir("toyos")
+            .map_err(|e| format!("the built ESP has no toyos directory: {e}"))?;
+        let mut file = dir
+            .create_file("log.guid")
+            .map_err(|e| format!("opening log.guid on the ESP: {e}"))?;
+        file.truncate().map_err(|e| format!("truncating log.guid: {e}"))?;
+        file.write_all(&FORGED).map_err(|e| format!("writing log.guid: {e}"))?;
+    }
+    std::fs::write(&image_path, &image).map_err(|e| format!("rewrite the boot image: {e}"))?;
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: qemu::Profile::Metal,
+            boot_image: Some(image_path.clone()),
+            ..Default::default()
+        },
+    );
+    let mut log = qemu.boot_log().to_string();
+    log.push_str(&qemu.drain_serial(Duration::from_millis(500)));
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
+    drop(qemu);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} on a stick whose log partition is not named\n{log}"));
+        }
+    }
+
+    // The bootloader read the forged file and handed it on unconverted. A
+    // mixed-endian slip anywhere on that path shows up here as a different
+    // GUID rather than as a mysteriously absent partition.
+    let named = format!("gpt: the boot volume names {FORGED_TEXT} as the log partition");
+    if !log.contains(&named) {
+        return Err(format!(
+            "the handoff did not carry the bytes the ESP holds.\nwanted: {named}\n{}",
+            volume_lines(&log)
+        ));
+    }
+    let refused = format!("nothing with the log partition's GUID {FORGED_TEXT}");
+    if !log.contains(&refused) {
+        return Err(format!(
+            "the kernel did not refuse the log partition by name.\nwanted: {refused}\n{}",
+            volume_lines(&log)
+        ));
+    }
+    if !log.contains("log-volume: not mounted") {
+        return Err(format!("the kernel mounted a log volume it was never given:\n{}", volume_lines(&log)));
+    }
+    if log.contains("log-file: this boot's kernel log continues in") {
+        return Err(format!(
+            "the sink installed with no log partition — a fallback is exactly what this must not \
+             do:\n{}",
+            volume_lines(&log)
+        ));
+    }
+
+    // And nothing else was lost. The stick is a working stick with one file
+    // changed on it.
+    if !log.contains("boot-volume: partition mounted") {
+        return Err(format!("a missing log partition cost the machine /boot:\n{}", volume_lines(&log)));
+    }
+    if !log.contains("Boot: complete") {
+        return Err(format!("a missing log partition cost the boot:\n{log}"));
+    }
+
+    // Ground truth: the partition itself. It is still there, still FAT32, and
+    // the kernel wrote nothing to it.
+    let after = std::fs::read(&image_path).map_err(|e| format!("read the image back: {e}"))?;
+    let volume = &after[log_start..log_start + log_len];
+    let found = read_files(volume, &["kernel.log", "kernel.log.1"])?;
+    if found.iter().any(Option::is_some) {
+        return Err(
+            "the kernel wrote to a partition it had just refused to identify".to_string()
+        );
+    }
+    let complaints = fsck_complaints(volume, "log-identity")?;
+    if !complaints.is_empty() {
+        return Err(format!("the untouched log partition is not clean:\n{}", complaints.join("\n")));
+    }
+
+    let _ = std::fs::remove_file(&image_path);
+    eprintln!(
+        "  [log] the name moved and the mount went with it: refused {FORGED_TEXT} by name, /boot \
+         and the boot unaffected, nothing written to the partition"
     );
     Ok(())
 }

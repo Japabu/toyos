@@ -2360,8 +2360,8 @@ with MSI deliberately disabled** — 10 key events, the right pointer delta, lat
 and reordered but all present. `wait_transfer` and `wait_command` drain the
 *whole* event ring and hand every unmatched TRB to `dispatch_event`, so any
 storage I/O on a controller dispatches that controller's queued HID reports.
-`esp_log` writes `/boot/toyos/kernel.log` from the idle loop, so on a machine
-that boots off a stick there is an accidental polled mode, at the ESP log's
+`log_file` writes `/log/kernel.log` from the idle loop, so on a machine
+that boots off a stick there is an accidental polled mode, at the log sink's
 cadence, for every HID device on the same controller. Two consequences:
 
 - A test that wants to prove an interrupt arrived must run on a controller
@@ -2505,17 +2505,17 @@ Three things it does **not** give, in the order they will bite:
 
   **`--console-boot` is the other half and does not replace this one.**
   `/bin/console` claims the framebuffer, seeds its scrollback from
-  `/boot/toyos/kernel.log` so the boot log survives the claim, and puts a shell
+  `/log/kernel.log` so the boot log survives the claim, and puts a shell
   underneath — so anything after `Boot: complete` is one typed command away.
   What it cannot do is what diag exists for: claiming the screen is exactly
   what stops `boot_checkpoint` painting, so a machine that wedges *before*
   userland shows nothing at all in that mode. Two images, two questions.
 
   Its own residuals: the seed is read once at startup, because the console
-  copies the shell's output to its own stdout and that is the ring `esp_log`
-  drains — a tail would feed itself; and it needs `/boot`, which
-  `mount_boot` gives only to a machine that booted from USB (below), so on
-  anything else the console starts with one line saying the log is not there.
+  copies the shell's output to its own stdout and that is the ring `log_file`
+  drains — a tail would feed itself; and it needs `/log`, which
+  `fat32_adapter::mount` gives only to a machine that booted from USB (below), so
+  on anything else the console starts with one line saying the log is not there.
 
   The one exception is deliberate and is the i8042's own health verdict
   (`d13efa6`). The driver now says once whether the pin it armed has ever
@@ -3025,8 +3025,8 @@ Closed at `5fde1c5` + `5b8565b`, gated by `usb_flush_optional`. SYNCHRONIZE
 CACHE (0x35) is optional in SBC and a great many USB flash drives answer
 ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE. `msc_flush` read anything
 other than `Scsi::Ok` as a failed flush, and the chain above it closed a loop:
-`EspFs::sync` logged the failure and returned `()`, that line was new pending
-content in the ring `esp_log` was draining, `Sink::flush` still returned `Ok`
+`FatFs::sync` logged the failure and returned `()`, that line was new pending
+content in the ring `log_file` was draining, `Sink::flush` still returned `Ok`
 so the sink's disable path never ran, and the next idle pass did it again.
 
 Measured on the pre-fix tree under `usb-flush-unimplemented`: **45 flushes in
@@ -3049,7 +3049,7 @@ error path that produces work for the thing that failed, and on a machine whose
 log lives on the failing device that work is another attempt at the same
 operation. Every `log!` under `Sink::flush` has this hazard. The three that
 remain are bounded by the disable path (`usb-storage: cache flush failed`,
-`usb-storage: SCSI 0x35 failed`, `esp-log: … stops at …`), measured at 2 per
+`usb-storage: SCSI 0x35 failed`, `log-file: … stops at …`), measured at 2 per
 boot; the one that is not a failure at all — the no-write-cache report — is
 latched per device for exactly this reason.
 
@@ -3141,7 +3141,7 @@ answers Context State Error, `clear_stall` returns false, `reset_recovery`
 returns false, and `dev.failed` is set. **Nothing clears it**: no re-probe, no
 reset, no rebind. One transfer that times out takes the boot disk offline for
 the life of the boot, and on a machine booting off USB that is `/boot`,
-`esp_log`, and every diagnostic after it.
+`log_file`, and every diagnostic after it.
 
 **Why the one-line version is a no-op wearing a fix's clothes.** Accepting
 `CC_CONTEXT_STATE_ERROR` from Reset Endpoint leaves Set TR Dequeue Pointer
@@ -3199,12 +3199,14 @@ swallows the error (previous entry), so the conversion has no call site to be
 written against. When `BlockIO` becomes fallible, that changes and
 `SyscallError::Io` is the thing to add.
 
-## 10. The boot partition as a filesystem, and the log on it
+## 10. The stick's two partitions as filesystems, and the log on one of them
 
-`/boot` is `kernel/src/fat32_adapter.rs` over `toyos-fat32`, mounted from
-`gpt::boot_volume()`; `kernel/src/esp_log.rs` writes the kernel's log to
-`/boot/toyos/kernel.log`. Gated by `esp_filesystem` and `esp_log_file`
-(`tests/common/esp.rs`).
+`/boot` and `/log` are both `kernel/src/fat32_adapter.rs` over `toyos-fat32`,
+mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
+`kernel/src/log_file.rs` writes the kernel's log to `/log/kernel.log`. Gated by
+`esp_filesystem`, `kernel_log_file`, `log_backing_read_error`,
+`log_partition_automount` and `log_partition_identity`
+(`tests/common/volumes.rs`).
 
 ### The boot image this project builds is not `fsck_msdos`-clean, and never was
 
@@ -3227,11 +3229,17 @@ whether a real UEFI implementation is as tolerant, and the machine that would
 answer that is the one being flashed. The fix is in `fatfs`, so it needs a
 fork; nothing in this repo can fix it locally.
 
-Consequence for the gate: `esp_filesystem` and `esp_log_file` compare the
-complaint *set* before and after the boot and require the guest to add none,
-rather than requiring silence. That is honest but weaker in one specific way:
-if the guest ever produced one of those twelve for its own reason, the gate
-would not see it.
+Consequence for the gate: `esp_filesystem` compares the complaint *set* before
+and after the boot and requires the guest to add none, rather than requiring
+silence. That is honest but weaker in one specific way: if the guest ever
+produced one of those twelve for its own reason, the gate would not see it.
+
+The **log partition does not inherit this**, and `kernel_log_file` therefore
+requires silence rather than sameness on it. `create_log_volume` formats an
+empty volume — no subdirectory, so neither cause above can arise — and records
+its free-cluster count, which `format_volume` otherwise leaves unset for
+`fsck_msdos` to complain about. A fresh one is clean; so is one the guest has
+written its log to.
 
 ### Nothing stops userland damaging the stick the machine boots from
 
@@ -3246,7 +3254,8 @@ where a "the kernel's own volume is not userland's to write" rule would live.
 
 ### The mount is not certain, and one failure is unexplained
 
-Across the boots recorded while this was built, `esp: no boot volume` appeared
+Across the boots recorded while this was built, `esp: no boot volume` (as the
+line then read) appeared
 on a handful. Two instances are explained and closed: `gpt: device 16 has no
 partition table we can use: EntryArrayCrc { … }`, which is a *read* off the
 stick coming back wrong, from the window where `BlockDevice::read_blocks`
@@ -3259,7 +3268,7 @@ one will say which it is.
 
 ### `/boot` exists only on a machine that boots from USB
 
-`mount_boot` resolves the `DeviceId` in `BootVolume` through
+`fat32_adapter::mount` resolves the `DeviceId` in `gpt::Volume` through
 `usb_storage::open`, and there is no second arm. A machine that boots from an
 internal disk has its NVMe taken by `page_cache::init` at storage time, and
 there is no second handle to it — so `gpt::boot_volume()` would answer and the
@@ -3267,40 +3276,41 @@ mount would still refuse. Closing it means either a shared block-device handle
 or moving the page cache off sole ownership; neither is a two-line change, and
 the machine this project targets boots from a stick.
 
-### An `EspBacking` outlives the file it names, exactly as `/home`'s does
+### A `FatBacking` outlives the file it names, exactly as `/home`'s does
 
 `FileSystem::delete` on this mount drops the *write* handle unconditionally, so
 a `write_page` through an fd held across an unlink returns `"file not open"`
 rather than putting one process's bytes into another's clusters — which is more
 than the bcachefs adapters do. The read side is unchanged and shares §1's live
-cross-process leak: an `Arc<EspBacking>` already handed to the file cache still
+cross-process leak: an `Arc<FatBacking>` already handed to the file cache still
 names byte ranges the allocator is free to reissue.
 
 ### The bound is one generation, and after a rotation the newest bytes are in
 ### the older-looking file
 
-`kernel.log` rotates to `kernel.log.1` at 1 MiB and the previous `.1` is
+`kernel.log` rotates to `kernel.log.1` at 4 MiB and the previous `.1` is
 deleted. A rotation can be the last thing a boot does, which leaves
 `kernel.log` empty and the tail in `kernel.log.1` — so anything reading the log
-has to read both. `esp_log_file` asserts the shutdown's last line is in one of
+has to read both. `kernel_log_file` asserts the shutdown's last line is in one of
 them rather than in `kernel.log`, for that reason.
 
 ### The panic path does not write the log, deliberately
 
-Not a gap to close later: `esp_log`'s module documentation states the argument.
+Not a gap to close later: `log_file`'s module documentation states the argument.
 A panic-time flush needs the sink lock, the VFS lock, the file cache lock, the
-heap, the ESP device lock and the xHCI lock, and a panicking thread may hold any
-of them — so it would deadlock in precisely the cases the log exists for. And
-the deadlock is the better outcome, because a FAT write interrupted between
-allocating a cluster and recording it leaves the volume that holds `BOOTx64.EFI`
-and `kernel.elf` in a state that may not boot. The panic path keeps the
+heap, the log volume's device lock and the xHCI lock, and a panicking thread may hold any
+of them — so it would deadlock in precisely the cases the log exists for. The
+second half of this argument used to be that a torn FAT write leaves the volume
+holding `BOOTx64.EFI` and `kernel.elf` unbootable; with the log on its own
+partition that is gone, and the worst a half-finished write costs is the
+diagnostic itself. The lock argument stands alone. The panic path keeps the
 on-screen console, which takes no lock at all. What the file has after a panic
 is everything up to the last idle pass.
 
 ### CLOSED — a healthy machine turned its own kernel log off during a spawn
 
 `log_ring::file_has_pending` is in the idle loop's awake condition, so a CPU
-with nothing to run will not sleep while the sink is owed bytes. `esp_log::poll`
+with nothing to run will not sleep while the sink is owed bytes. `log_file::poll`
 takes the VFS lock with `try_lock` and gave up after `MAX_BLOCKED_POLLS` (1000)
 consecutive failures, which turns the sink off permanently and clears the
 condition.
@@ -3311,7 +3321,7 @@ idle loop elapse in about **2 ms**, while an ordinary `spawn` holds the VFS
 lock for **13–17 ms** reading an ELF — so the give-up fired on a working
 machine, mid-boot, and the log stopped there for good. Caught on the guest's
 own serial in two unrelated boots: an `audio_tone` boot (`stops at 8417 bytes`,
-during `spawn: /bin/test_rs_audio_tone`) and an `esp_log_file` boot (`stops at
+during `spawn: /bin/test_rs_audio_tone`) and an `kernel_log_file` boot (`stops at
 0 bytes`, during `spawn: /bin/shutdown`, which is what made the shutdown's last
 line reach no generation). Present at HEAD before the ESP work below, and made
 frequent by it. Now `MAX_BLOCKED_NANOS = 10 s`.
@@ -3323,10 +3333,10 @@ failure was *silent by construction*: the give-up announces itself into the
 very ring it is switching off, so on a machine with no serial port the one
 place that line could be read is the file it says has stopped.
 
-### The ESP log's flush is unbounded, uninterruptible, and in front of the scheduler pass
+### The kernel log's flush is unbounded, uninterruptible, and in front of the scheduler pass
 
 Not closed, and it is the residual under gate A's red run. `idle_loop` is
-`drain_serial(); esp_log::poll(); pass()`, so a wake that arrives while a CPU is
+`drain_serial(); log_file::poll(); pass()`, so a wake that arrives while a CPU is
 inside the flush waits for the whole filesystem write plus a device cache sync
 before any pass can dispatch it. `wait_transfer` spins, and `Lock` holds off
 preemption, so nothing shortens it.
@@ -3336,7 +3346,7 @@ against a DMA pipeline depth of 23.219 ms — a single flush could empty the
 entire audio pipeline. After it, 2.0–9.7 ms, which is what let gate A pass, and
 still a third of a pipeline at the tail.
 
-Two premises in `esp_log`'s own documentation do not hold, and both are worth
+Two premises in `log_file`'s own documentation do not hold, and both are worth
 carrying:
 
 * *"It costs nothing when nothing is logged."* True of `log!`, and the ring is
@@ -3406,6 +3416,6 @@ high water to **6,209**.
 
 What that does *not* establish: that the overflow happened. 11,505 plus the
 xHCI/MSC chain is close to 16,384 but nothing was caught crossing it, and the
-A/B is only three runs each way — three clean with `esp_log::poll` removed from
+A/B is only three runs each way — three clean with `log_file::poll` removed from
 the idle loop, three not clean with it. If it recurs at `5bb1193` or later, the
 stack is no longer the first suspect and the `rip` symbolization is.

@@ -3,8 +3,6 @@ pub mod audio;
 #[allow(dead_code)]
 pub mod compile;
 #[allow(dead_code)]
-pub mod esp;
-#[allow(dead_code)]
 pub mod faults;
 #[allow(dead_code)]
 pub mod gpt;
@@ -20,3 +18,5 @@ pub mod stats;
 pub mod storage;
 #[allow(dead_code)]
 pub mod usb;
+#[allow(dead_code)]
+pub mod volumes;

@@ -1,4 +1,4 @@
-//! The kernel's log, as a file on the partition it booted from.
+//! The kernel's log, as a file on a partition made to be readable elsewhere.
 //!
 //! A ThinkPad T14 Gen 2 has no serial port. Once the compositor claims the
 //! framebuffer the kernel's only remaining channel is the on-screen console,
@@ -7,6 +7,17 @@
 //! nothing at all, which is why a real boot failure there was undiagnosable.
 //! This gives it a channel that survives the power being cut: the stick it
 //! booted from.
+//!
+//! # Why not the ESP
+//!
+//! Because the log has to be *read*, and it is read on another machine. macOS
+//! never auto-mounts an EFI-typed partition and this host refuses even a manual
+//! non-root mount of one, so a log beside `kernel.elf` needed the admin account
+//! to get at. The log partition is typed Microsoft Basic Data, which Finder,
+//! Windows and Linux all mount on plug-in with nothing configured, and it is
+//! labelled `TOYOS-LOG` so the icon says what it is. The kernel is *given* it by
+//! unique GUID (`gpt`, `KernelArgs::log_partition_guid`) and never goes looking
+//! for the other FAT32 on the stick.
 //!
 //! # Not a special path
 //!
@@ -37,22 +48,26 @@
 //!
 //! # The panic path does not write here, and cannot be made to
 //!
-//! Stated rather than attempted. A panic-time flush would need, in order: this
-//! module's lock, the VFS lock, the file cache lock, the kernel heap
-//! (`toyos-fat32` keeps its sector scratch in a `Vec` and builds a `String` per
-//! path component), the ESP device lock, and the xHCI controller lock. A
-//! panicking thread may hold any of them — the VFS lock especially, since every
-//! reachable kernel panic from filesystem code holds it — so a panic-time flush
-//! would deadlock in precisely the cases the log is for.
+//! Stated rather than attempted, and the reason is locks alone. A panic-time
+//! flush would need, in order: this module's lock, the VFS lock, the file cache
+//! lock, the kernel heap (`toyos-fat32` keeps its sector scratch in a `Vec` and
+//! builds a `String` per path component), the log volume's device lock, and the
+//! xHCI controller lock. A panicking thread may hold any of them — the VFS lock
+//! especially, since every reachable kernel panic from filesystem code holds it
+//! — so a panic-time flush would deadlock in precisely the cases the log is for.
 //!
-//! And the deadlock is the *good* outcome. This volume holds `BOOTx64.EFI` and
-//! `kernel.elf`: a FAT write interrupted between allocating a cluster and
-//! recording it leaves a volume that may not boot, so a half-finished
-//! panic-time write trades a diagnostic for the machine. The panic path keeps
-//! the on-screen console, which takes no lock of any kind. What the file gives
-//! a panic is everything up to the last idle pass — on any machine that reached
-//! the idle loop, everything but the panic itself, and the panic is on the
-//! screen.
+//! What is *no longer* an argument, and was: that a torn FAT write costs the
+//! machine. It did while the log shared the ESP with `BOOTx64.EFI` and
+//! `kernel.elf`, where a write interrupted between allocating a cluster and
+//! recording it leaves a volume that may not boot. On its own partition the
+//! worst a half-finished write can cost is this file and the one generation
+//! beside it, which is a diagnostic and not the stick. The deadlock is what
+//! keeps the panic path out, and it is enough on its own.
+//!
+//! The panic path keeps the on-screen console, which takes no lock of any kind.
+//! What the file gives a panic is everything up to the last idle pass — on any
+//! machine that reached the idle loop, everything but the panic itself, and the
+//! panic is on the screen.
 
 use crate::drivers::log_ring;
 use crate::file_cache::{self, FileId};
@@ -61,41 +76,50 @@ use crate::vfs::{self, Vfs};
 
 /// Where the log goes.
 ///
-/// Beside `kernel.elf` and `initrd.img`, in the directory the bootloader
-/// already reads from: it exists on every ToyOS stick by construction, so
-/// nothing here creates a directory on somebody's ESP, and a human looking for
-/// the log finds it next to the things they flashed.
-const PATH: &str = "/boot/toyos/kernel.log";
+/// The root of the log partition, so that plugging the stick into another
+/// machine puts `kernel.log` at the top of the window that opens. Nothing else
+/// is on this volume and nothing else is meant to be.
+const PATH: &str = "/log/kernel.log";
 /// What the previous [`PATH`] becomes when it fills.
-const PREVIOUS: &str = "/boot/toyos/kernel.log.1";
+const PREVIOUS: &str = "/log/kernel.log.1";
 
 /// The mount [`PATH`] is on, for the per-mount sync each flush ends with.
-const MOUNT: &str = "boot";
+const MOUNT: &str = "log";
 
 /// How large [`PATH`] may get before it is rotated.
 ///
-/// Derived from the space a ToyOS stick guarantees, not picked.
-/// `create_fat_volume` sizes the ESP at `content + 4 MiB`, so 4 MiB is the
-/// least slack any image has; two files of 1 MiB take half of it and leave the
-/// rest for anything else that ever wants to write there.
+/// Derived from the partition, not picked. `create_log_volume` makes the
+/// smallest volume there is a FAT32 for, and `fsck_msdos` reports 68,551 free
+/// clusters of 512 bytes on a fresh one — 35,098,112 bytes. Two generations at
+/// this bound are 8 MiB, under a quarter of that, so a boot that rotates
+/// repeatedly cannot fill the volume and there is room left for anything a
+/// later diagnostic wants to drop beside it.
+///
+/// The other end of the bound is that both generations are *read* in full:
+/// `/bin/console` seeds its scrollback from them at every framebuffer boot,
+/// off USB, before it paints anything. That is what stops this being the
+/// quarter-of-the-volume 8 MiB the space alone would allow.
+///
+/// For scale rather than as a limit: a metal-sim boot's whole log to
+/// `Shutting down.` measured 7,910 bytes, so 4 MiB is several hundred boots of
+/// history in the current generation alone.
 ///
 /// The rotate-fast value exists for the same reason `test-small-caches` does:
-/// filling a megabyte by logging would take a boot far longer than a test
-/// should wait, and the rotation code it drives is the shipped code — only the
-/// bound moves.
+/// filling megabytes by logging would take a boot far longer than a test should
+/// wait, and the rotation code it drives is the shipped code — only the bound
+/// moves.
 ///
-/// 256 rather than something rounder, and the number is measured. A metal-sim
-/// boot's whole log to `Shutting down.` is 7,348 bytes, of which 6,484 are
-/// already in the ring when the sink installs and go out in one flush. At 1 KiB
-/// that is a *single* rotation — the remaining 864 bytes never fill a second
-/// file — and a single rotation never renames over an existing `kernel.log.1`,
-/// which is the half of the path that has to delete first. 256 rotates three or
-/// four times on the same boot depending on how the flushes fall, and
-/// `esp_log_file` requires at least two.
-const MAX_LOG_BYTES: u64 = if cfg!(feature = "esp-log-rotate-fast") {
+/// 256 rather than something rounder, and the number is measured. Of such a
+/// boot, 7,052 bytes are already in the ring when the sink installs and go out
+/// in one flush. At 1 KiB that is a *single* rotation — the remaining 858 bytes
+/// never fill a second file — and a single rotation never renames over an
+/// existing `kernel.log.1`, which is the half of the path that has to delete
+/// first. 256 rotates three or four times on the same boot depending on how the
+/// flushes fall, and `kernel_log_file` requires at least two.
+const MAX_LOG_BYTES: u64 = if cfg!(feature = "log-rotate-fast") {
     256
 } else {
-    1024 * 1024
+    4 * 1024 * 1024
 };
 
 /// Bytes moved per pass of the drain loop, and the size of the stack buffer it
@@ -140,7 +164,7 @@ struct Sink {
 
 static SINK: Lock<Option<Sink>> = Lock::new(None);
 
-/// Start writing the kernel's log to the boot volume. Call once, after `/boot`
+/// Start writing the kernel's log to the log volume. Call once, after `/log`
 /// is mounted.
 ///
 /// Appends across boots rather than truncating: a machine that failed on its
@@ -158,13 +182,13 @@ pub fn install() {
     let (file_id, size) = match opened {
         Ok(pair) => pair,
         Err(e) => {
-            log!("esp-log: cannot open {PATH}: {e}");
+            log!("log-file: cannot open {PATH}: {e}");
             return;
         }
     };
     *SINK.lock() = Some(Sink { file_id, size, blocked_since: None });
     log_ring::enable_file_sink();
-    log!("esp-log: this boot's kernel log continues in {PATH}, which holds {size} bytes");
+    log!("log-file: this boot's kernel log continues in {PATH}, which holds {size} bytes");
 }
 
 /// Move whatever the ring owes into the file. Called from the idle loop.
@@ -188,7 +212,7 @@ pub fn poll() {
         drop(guard);
         log_ring::disable_file_sink();
         log!(
-            "esp-log: the VFS lock has been held for {}s — {PATH} stops at {size} bytes",
+            "log-file: the VFS lock has been held for {}s — {PATH} stops at {size} bytes",
             MAX_BLOCKED_NANOS / 1_000_000_000
         );
         return;
@@ -201,7 +225,7 @@ pub fn poll() {
         *guard = None;
         drop(guard);
         log_ring::disable_file_sink();
-        log!("esp-log: {e} — {PATH} stops at {size} bytes");
+        log!("log-file: {e} — {PATH} stops at {size} bytes");
     }
 }
 
@@ -219,7 +243,7 @@ pub fn flush_final() {
     drop(vfs);
     if let Err(e) = outcome {
         drop(guard);
-        log!("esp-log: the final flush failed: {e}");
+        log!("log-file: the final flush failed: {e}");
     }
 }
 
@@ -229,7 +253,7 @@ impl Sink {
         if lost > 0 {
             // Into the ring, so this line is itself in the batch below and the
             // hole is described in the file it is a hole in.
-            log!("esp-log: {lost} bytes were overwritten in the ring before they reached {PATH}");
+            log!("log-file: {lost} bytes were overwritten in the ring before they reached {PATH}");
         }
 
         let mut buf = [0u8; CHUNK];
@@ -276,7 +300,7 @@ impl Sink {
             let within = (self.size % 4096) as usize;
             let n = (4096 - within).min(data.len() - done);
             file_cache::write_page(self.file_id, page, within, &data[done..done + n])
-                .map_err(|_| "the boot volume would not give back the page being appended to")?;
+                .map_err(|_| "the log volume would not give back the page being appended to")?;
             self.size += n as u64;
             done += n;
         }
@@ -287,8 +311,9 @@ impl Sink {
     ///
     /// One and not more: two files is the difference between "the log ends
     /// where it filled up" and "there is a log", while every further generation
-    /// costs another [`MAX_LOG_BYTES`] of somebody's boot stick for a boot they
-    /// are less likely to care about.
+    /// costs another [`MAX_LOG_BYTES`] of the volume, and another read of it
+    /// every time `/bin/console` seeds a screen, for a boot they are less
+    /// likely to care about.
     fn rotate(&mut self, vfs: &mut Vfs) -> Result<(), &'static str> {
         let full = self.file_id;
         let bytes = self.size;
@@ -298,7 +323,7 @@ impl Sink {
         }
         self.file_id = vfs.create_file(PATH, crate::clock::nanos_since_boot())?;
         self.size = 0;
-        log!("esp-log: {PATH} reached {bytes} bytes and became {PREVIOUS}");
+        log!("log-file: {PATH} reached {bytes} bytes and became {PREVIOUS}");
         Ok(())
     }
 }

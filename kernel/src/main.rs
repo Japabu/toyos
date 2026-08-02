@@ -35,7 +35,7 @@ mod tmpfs;
 mod file_backing;
 mod bcachefs_adapter;
 mod fat32_adapter;
-mod esp_log;
+mod log_file;
 #[allow(dead_code)]
 mod vfs;
 mod elf;
@@ -425,20 +425,29 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     }
     vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()));
 
-    // The partition firmware loaded us from, under the name of its role rather
-    // than of its type: `/esp` would say what the format is, and selecting a
-    // volume by what it looks like is the mistake `gpt` exists to make
-    // unrepresentable. A machine that cannot identify its boot partition has
-    // no `/boot` and boots exactly as it did before.
-    match fat32_adapter::mount_boot() {
+    // The two partitions the handoff named, each under the name of its role
+    // rather than of its type: `/esp` would say what the format is, and
+    // selecting a volume by what it looks like is the mistake `gpt` exists to
+    // make unrepresentable — both of these are FAT32 and neither is chosen for
+    // being FAT32. A machine that cannot identify one of them simply does not
+    // have that mount, and boots exactly as it did before.
+    use fat32_adapter::Role;
+    match fat32_adapter::mount(Role::Boot) {
+        Some(fs) => vfs::lock().mount(Role::Boot.mount(), Box::new(fs)),
+        None => log!("boot-volume: not mounted; the kernel has no /boot this boot"),
+    }
+    match fat32_adapter::mount(Role::Log) {
         Some(fs) => {
-            vfs::lock().mount("boot", Box::new(fs));
+            vfs::lock().mount(Role::Log.mount(), Box::new(fs));
             // Immediately after the mount and before anything else can fail:
             // what a machine with no serial port most needs in the file is the
             // boot that did not finish.
-            esp_log::install();
+            log_file::install();
         }
-        None => log!("esp: no boot volume — the kernel has no /boot this boot"),
+        // A refusal `gpt:` has already named the missing GUID for, and never a
+        // fallback onto `/boot`: a stick with no log partition keeps its log in
+        // the ring, where the screen and the console can still reach it.
+        None => log!("log-volume: not mounted; this boot's kernel log stays in memory"),
     }
 
     // Kernel string literals, not untrusted input: these are orders of

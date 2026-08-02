@@ -1,21 +1,28 @@
-//! The boot partition as a mounted filesystem.
+//! The two partitions this kernel was given, as mounted filesystems.
 //!
 //! UEFI mandates FAT32 on the partition firmware loads a bootloader from, so
 //! this is the one filesystem a ToyOS machine is guaranteed to have before it
-//! has any other. `toyos-fat32` reads and writes it; this file is the two
-//! things that crate deliberately does not know about — the kernel's 4 KiB
-//! [`BlockDevice`], and [`vfs::FileSystem`].
+//! has any other. The log partition beside it is FAT32 for a different reason —
+//! it is the format every desktop OS mounts off a stick without being asked.
+//! `toyos-fat32` reads and writes both; this file is the two things that crate
+//! deliberately does not know about — the kernel's 4 KiB [`BlockDevice`], and
+//! [`vfs::FileSystem`].
 //!
-//! # Why the ESP cannot become "some disk we found"
+//! # Why neither can become "some disk we found"
 //!
-//! Three independent gates, and the volume is untouched unless all three pass:
+//! Three independent gates, and a volume is untouched unless all three pass:
 //!
-//! 1. **Which partition.** [`gpt::boot_volume`] answers, and it answers only
-//!    for the unique partition GUID firmware handed the kernel through
-//!    `KernelArgs`, cross-checked against the table's own extent, and only
-//!    when exactly one device carries it. Nothing here scans for a FAT
-//!    signature and nothing here looks at a partition *type*.
-//! 2. **Which bytes.** [`EspDevice`] clamps every read and every write to the
+//! 1. **Which partition.** [`gpt::boot_volume`] and [`gpt::log_volume`] answer,
+//!    and they answer only for unique partition GUIDs the kernel was handed
+//!    through `KernelArgs` — the boot partition's from firmware, cross-checked
+//!    against the table's own extent and accepted only when exactly one device
+//!    carries it, and the log partition's from a file on that volume, looked
+//!    for only on the device the boot partition was found on. Nothing here
+//!    scans for a FAT signature and nothing here looks at a partition *type*.
+//!    In particular the log partition is not "the other FAT32 on the stick",
+//!    which would have needed no handoff at all and is the defect the handoff
+//!    exists to make unrepresentable.
+//! 2. **Which bytes.** [`FatDevice`] clamps every read and every write to the
 //!    volume before it reaches the device, so a filesystem that computed a wild
 //!    offset gets [`IoError`] rather than a neighbour's blocks. This is the
 //!    adapter's invariant and not the filesystem's to be trusted about:
@@ -23,26 +30,27 @@
 //!    it has not already bounded against the volume", and the storage-stack
 //!    audit reproduced a crafted directory entry driving a write 256 GiB past
 //!    the end of one. A driver escaping its partition is how a boot stick's
-//!    other partitions get destroyed, so the check belongs here whatever the
-//!    crate does.
+//!    other partitions get destroyed — and with two mounted at once, the
+//!    neighbour it would escape into is the other one.
 //!
 //!    The bound is the *volume*, tighter than the partition: [`Fat32::probe`]
 //!    reads the boot sector without mounting, and the sector count in it is
 //!    what the filesystem may legitimately address. Slack between the volume
-//!    and the end of the partition is then unreachable too. The partition's
-//!    first byte need not be 4 KiB-aligned, so a write to it is a
-//!    read-modify-write of a device block it shares with the partition table —
-//!    which preserves those bytes rather than authoring them.
+//!    and the end of the partition is then unreachable too. A partition's first
+//!    byte need not be 4 KiB-aligned in general, so a write to it is a
+//!    read-modify-write of a device block it shares with whatever is next to
+//!    it — which preserves those bytes rather than authoring them.
 //! 3. **Whether it is already ours.** `toyos-fat32` contains no code that can
-//!    write a BPB. A volume that does not parse as FAT32 makes [`mount_boot`]
-//!    return `None` after nothing but reads, and there is no path from there
-//!    to a format, because no such path exists to take.
+//!    write a BPB. A volume that does not parse as FAT32 makes [`mount`] return
+//!    `None` after nothing but reads, and there is no path from there to a
+//!    format, because no such path exists to take.
 //!
-//! # What this mount is not
+//! # What these mounts are not
 //!
-//! Not a general FAT32 mount service. One volume, chosen by firmware, mounted
-//! once at boot. A second FAT32 partition on the same disk is not reachable
-//! from here and should not become reachable without the same three gates.
+//! Not a general FAT32 mount service. Two volumes, both named by the handoff,
+//! mounted once at boot. A third FAT32 partition on the same disk is not
+//! reachable from here and should not become reachable without the same three
+//! gates.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -65,6 +73,52 @@ use crate::vfs::FileSystem;
 /// The only transfer unit [`BlockDevice`] has.
 const BLOCK: u64 = 4096;
 
+/// Which of the two partitions a mount is.
+///
+/// A mount is named for its role and never for its format: `/esp` would say
+/// what the filesystem is, and selecting a volume by what it looks like is the
+/// mistake [`gpt`] exists to make unrepresentable. Both of these are FAT32 and
+/// neither is mounted for being FAT32.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    /// The partition firmware loaded the bootloader from.
+    Boot,
+    /// The partition that volume names, which the kernel's log goes on. Its own
+    /// partition because macOS never auto-mounts an EFI-typed one, so a log on
+    /// the ESP is unreadable on the machine the owner would read it from.
+    Log,
+}
+
+impl Role {
+    /// The VFS mount name, which is also the top-level directory.
+    pub fn mount(self) -> &'static str {
+        match self {
+            Role::Boot => "boot",
+            Role::Log => "log",
+        }
+    }
+
+    fn slot(self) -> usize {
+        match self {
+            Role::Boot => 0,
+            Role::Log => 1,
+        }
+    }
+
+    fn volume(self) -> Option<gpt::Volume> {
+        match self {
+            Role::Boot => gpt::boot_volume(),
+            Role::Log => gpt::log_volume(),
+        }
+    }
+}
+
+impl core::fmt::Display for Role {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.mount())
+    }
+}
+
 /// Extents one file's data may be split into before [`Fat32::extents`] refuses.
 ///
 /// Derived, not picked. An [`Extent`] is two `u64`s, and the `Vec` holding them
@@ -79,8 +133,8 @@ const MAX_EXTENTS: usize = 65_536;
 
 const _: () = assert!(core::mem::size_of::<Extent>() == 16);
 
-/// The boot partition, seen as a byte range, over a device that only does
-/// whole 4 KiB blocks.
+/// One partition, seen as a byte range, over a device that only does whole
+/// 4 KiB blocks.
 ///
 /// Offsets are relative to the partition. Nothing above this struct can name a
 /// byte outside it, which is the property that makes a filesystem bug on this
@@ -91,8 +145,8 @@ const _: () = assert!(core::mem::size_of::<Extent>() == 16);
 /// This boundary is where read amplification is *created*, so it is where it
 /// has to be paid off. `toyos-fat32` reasons in the volume's own units — a FAT
 /// entry is four bytes — while the device's only transfer unit is 4096, so a
-/// chain walk cost one USB transfer per cluster and the volume this project
-/// builds has 512-byte clusters. One device block covers 1024 FAT entries;
+/// chain walk cost one USB transfer per cluster and the volumes this project
+/// builds have 512-byte clusters. One device block covers 1024 FAT entries;
 /// re-reading it per entry is the whole cost.
 ///
 /// # Why keeping copies is sound here
@@ -100,11 +154,18 @@ const _: () = assert!(core::mem::size_of::<Extent>() == 16);
 /// Nothing is ever held back: a write reaches the device before this returns,
 /// and the copy is updated (partial block) or dropped (whole blocks) as part
 /// of issuing it. So the resident set can be stale only if something else
-/// writes these blocks, and after [`mount_boot`] nothing can — `ESP` is the
-/// only handle to the boot partition that exists. `probe_boot_disks` opens its
-/// own handles and only reads, before the mount; `usb_gate` writes only a disk
-/// whose block 0 carries the designation stamp, which this one does not.
-struct EspDevice {
+/// writes these blocks, and after [`mount`] nothing can. There is one of these
+/// per [`Role`] and no other handle to either partition: `probe_boot_disks`
+/// opens its own and only reads, before the mounts; `usb_gate` writes only a
+/// disk whose block 0 carries the designation stamp, which this one does not.
+///
+/// The two roles' resident sets cannot alias each other either, and that is a
+/// property of the *image* rather than of this code: `create_gpt_disk` aligns
+/// both partitions to 1 MiB and asserts that no 4 KiB device block belongs to
+/// both. Unaligned, the ESP ended a quarter of the way into a block the log
+/// partition began in, and each mount's copy of it would have gone stale on the
+/// other's write with nothing here able to see it.
+struct FatDevice {
     dev: Box<dyn BlockDevice>,
     /// Where the partition starts, in bytes from the start of the device.
     start: u64,
@@ -124,7 +185,7 @@ struct EspDevice {
     next_victim: usize,
 }
 
-/// Device blocks [`EspDevice`] keeps a copy of.
+/// Device blocks [`FatDevice`] keeps a copy of.
 ///
 /// Sized to hold what one append touches at once, which is what makes the
 /// difference between one device read per FAT entry and one per operation:
@@ -135,7 +196,7 @@ struct EspDevice {
 /// the file's chain straddles a FAT block boundary.
 const RESIDENT_BLOCKS: usize = 8;
 
-impl EspDevice {
+impl FatDevice {
     /// The device byte offset `offset` names, or [`IoError`] if the request
     /// leaves the partition. Every read and write goes through here.
     fn locate(&self, offset: u64, len: usize) -> Result<u64, IoError> {
@@ -243,48 +304,56 @@ impl EspDevice {
     }
 }
 
-/// The mounted partition's device, reachable without the VFS lock.
+/// Each mounted partition's device, reachable without the VFS lock.
 ///
-/// A static for the same reason `page_cache`'s device is one: a [`FileBacking`]
+/// Statics for the same reason `page_cache`'s device is one: a [`FileBacking`]
 /// serves a page-fault miss with `&self` and no filesystem in hand, so the
 /// device cannot live inside the `Box<dyn FileSystem>` the VFS owns. Lock
-/// order is VFS → here → `XHCI`; nothing takes them the other way.
-static ESP: Lock<Option<EspDevice>> = Lock::new(None);
+/// order is VFS → here → `XHCI`; nothing takes them the other way, and no path
+/// holds two of these at once — [`Role`] indexes one of them and every caller
+/// has exactly one role in hand.
+static VOLUMES: [Lock<Option<FatDevice>>; 2] = [Lock::new(None), Lock::new(None)];
 
-/// [`ESP`] in the shape `toyos-fat32` asks for.
+fn device(role: Role) -> &'static Lock<Option<FatDevice>> {
+    &VOLUMES[role.slot()]
+}
+
+/// One [`VOLUMES`] entry in the shape `toyos-fat32` asks for.
 ///
-/// Zero state beyond the capacity, so the filesystem holding one of these can
-/// be moved into the VFS while the device stays put.
-pub struct EspVolume {
+/// Zero state beyond the role and the capacity, so the filesystem holding one
+/// of these can be moved into the VFS while the device stays put.
+pub struct FatVolume {
+    role: Role,
     bytes: u64,
 }
 
-impl BlockAccess for EspVolume {
+impl BlockAccess for FatVolume {
     fn capacity(&self) -> u64 {
         self.bytes
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
-        let mut guard = ESP.lock();
+        let mut guard = device(self.role).lock();
         guard.as_mut().ok_or(IoError)?.read_at(offset, buf)
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), IoError> {
-        let mut guard = ESP.lock();
+        let mut guard = device(self.role).lock();
         guard.as_mut().ok_or(IoError)?.write_at(offset, buf)
     }
 
     fn flush(&mut self) -> Result<(), IoError> {
-        let mut guard = ESP.lock();
+        let mut guard = device(self.role).lock();
         guard.as_mut().ok_or(IoError)?.dev.flush().map_err(|_| IoError)
     }
 }
 
-/// Whether a page re-read of a `/boot` file is allowed to succeed.
+/// Whether a page re-read of a file on either of these volumes is allowed to
+/// succeed.
 ///
-/// A kernel feature because nothing on the host side can stage it: the boot
-/// stick *is* the disk the guest is running from, so every QEMU-side way to
-/// make its reads fail — `readonly=on` is writes only, detaching the device,
+/// A kernel feature because nothing on the host side can stage it: both
+/// partitions are on the disk the guest is running from, so every QEMU-side way
+/// to make its reads fail — `readonly=on` is writes only, detaching the device,
 /// a smaller image — takes away the mount the failure has to be observed
 /// through, or the kernel the machine is running. `werror`/`rerror` act on the
 /// whole drive and would break the boot before there is a log to write.
@@ -294,16 +363,17 @@ impl BlockAccess for EspVolume {
 /// injection that also hides a broken transport, so the gate goes green on a
 /// boot where the device was never asked. Same reason `xhci-one-slot` and
 /// `i8042-fault` exist.
-const ESP_BACKING_READS: bool = !cfg!(feature = "esp-backing-read-fails");
+const FAT_BACKING_READS: bool = !cfg!(feature = "fat-backing-read-fails");
 
-/// A file on the boot volume, as byte ranges the page-fault path can read
+/// A file on one of these volumes, as byte ranges the page-fault path can read
 /// without going back through the filesystem.
-struct EspBacking {
+struct FatBacking {
+    role: Role,
     extents: Vec<Extent>,
     size: u64,
 }
 
-impl FileBacking for EspBacking {
+impl FileBacking for FatBacking {
     fn read_page(&self, file_offset: u64, buf: &mut [u8; 4096]) -> crate::block::BlockResult {
         buf.fill(0);
         if file_offset >= self.size {
@@ -313,7 +383,7 @@ impl FileBacking for EspBacking {
         let mut done = 0usize;
         // Where the extent under consideration starts, in file bytes. A page
         // can span two of them whenever the volume's cluster is smaller than
-        // 4096, which an ESP a few tens of megabytes across usually is.
+        // 4096, which a volume a few tens of megabytes across usually is.
         let mut base = 0u64;
         for extent in &self.extents {
             if done >= valid {
@@ -326,16 +396,16 @@ impl FileBacking for EspBacking {
             }
             let within = want - base;
             let n = ((extent.len - within) as usize).min(valid - done);
-            let mut guard = ESP.lock();
+            let mut guard = device(self.role).lock();
             let Some(dev) = guard.as_mut() else {
                 // Only reachable if a mount failed after installing the device
                 // — but silence here is what the other two backings do not do,
                 // and `serving zeros` is the string a triage greps for.
-                log!("esp: the boot volume is not mounted; serving zeros");
+                log!("{}-volume: not mounted; serving zeros", self.role);
                 return Err(crate::block::BlockError);
             };
             let served = dev.read_at(extent.offset + within, &mut buf[done..done + n]);
-            if !ESP_BACKING_READS {
+            if !FAT_BACKING_READS {
                 // The read above was issued and is the shipped one, so a
                 // transport that really broke is still what `served` says —
                 // the injection cannot hide it. What it does replace is the
@@ -345,9 +415,9 @@ impl FileBacking for EspBacking {
                 // would make every assertion about the consequences vacuous.
                 buf[done..done + n].fill(0);
             }
-            if served.is_err() || !ESP_BACKING_READS {
-                log!("esp: read of {n} B at volume offset {} failed; serving zeros",
-                    extent.offset + within);
+            if served.is_err() || !FAT_BACKING_READS {
+                log!("{}-volume: read of {n} B at volume offset {} failed; serving zeros",
+                    self.role, extent.offset + within);
                 return Err(crate::block::BlockError);
             }
             drop(guard);
@@ -373,7 +443,7 @@ struct OpenFile {
     file: toyos_fat32::File,
 }
 
-/// VFS adapter for the boot partition.
+/// VFS adapter for one of the two partitions.
 ///
 /// A file's identity here is its **path**, which is what [`by_name`] keys on.
 /// The trait requires the same [`FileId`] for the same file across opens, and
@@ -389,9 +459,10 @@ struct OpenFile {
 /// re-keys. What it cannot survive is an fd held across an unlink — see
 /// [`FileSystem::delete`].
 ///
-/// [`by_name`]: EspFs::by_name
-pub struct EspFs {
-    fs: Fat32<EspVolume>,
+/// [`by_name`]: FatFs::by_name
+pub struct FatFs {
+    role: Role,
+    fs: Fat32<FatVolume>,
     open: HashMap<FileId, OpenFile>,
     by_name: HashMap<String, FileId>,
     /// Unix seconds at `nanos_since_boot() == 0`.
@@ -405,11 +476,12 @@ pub struct EspFs {
     boot_unix_secs: u64,
 }
 
-impl EspFs {
-    fn new(fs: Fat32<EspVolume>) -> Self {
+impl FatFs {
+    fn new(role: Role, fs: Fat32<FatVolume>) -> Self {
         let now = crate::rtc::read_epoch_secs();
         let up = crate::clock::nanos_since_boot() / 1_000_000_000;
         Self {
+            role,
             fs,
             open: HashMap::new(),
             by_name: HashMap::new(),
@@ -426,9 +498,9 @@ impl EspFs {
     fn backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
         let size = self.fs.metadata(name).ok()?.len;
         match self.fs.extents(name, MAX_EXTENTS) {
-            Ok(extents) => Some(Arc::new(EspBacking { extents, size })),
+            Ok(extents) => Some(Arc::new(FatBacking { role: self.role, extents, size })),
             Err(e) => {
-                log!("esp: {name} has no readable extent list: {e}");
+                log!("{}-volume: {name} has no readable extent list: {e}", self.role);
                 None
             }
         }
@@ -446,7 +518,7 @@ impl EspFs {
     }
 }
 
-impl FileSystem for EspFs {
+impl FileSystem for FatFs {
     /// The bound is honoured before the allocation, not after it.
     ///
     /// `Fat32::walk` checks `limit` against the count it has *before* each
@@ -459,7 +531,7 @@ impl FileSystem for EspFs {
             Ok(names) => Ok(names),
             Err(Error::LimitExceeded) => Err(SyscallError::ResourceExhausted),
             Err(e) => {
-                log!("esp: cannot list the boot volume: {e}");
+                log!("{}-volume: cannot list it: {e}", self.role);
                 Err(SyscallError::NotFound)
             }
         }
@@ -540,7 +612,7 @@ impl FileSystem for EspFs {
     /// fd held across an unlink can no longer write the file back. That is the
     /// right answer: the file it would write back does not exist.
     ///
-    /// The read side is not closed here — the `EspBacking` an open fd already
+    /// The read side is not closed here — the `FatBacking` an open fd already
     /// holds still names those byte ranges, which is the same live
     /// cross-process leak known issues records for `/home`. This closes the
     /// destructive half only.
@@ -553,7 +625,7 @@ impl FileSystem for EspFs {
             Ok(()) => true,
             Err(Error::NotFound) => false,
             Err(e) => {
-                log!("esp: cannot delete {name}: {e}");
+                log!("{}-volume: cannot delete {name}: {e}", self.role);
                 false
             }
         }
@@ -561,7 +633,7 @@ impl FileSystem for EspFs {
 
     fn delete_prefix(&mut self, prefix: &str) {
         let Ok(names) = self.fs.walk(crate::vfs::MAX_LIST_ENTRIES) else {
-            log!("esp: cannot enumerate {prefix} to delete it");
+            log!("{}-volume: cannot enumerate {prefix} to delete it", self.role);
             return;
         };
         let doomed: Vec<String> =
@@ -641,14 +713,17 @@ impl FileSystem for EspFs {
     }
 
     /// The error is returned rather than logged, and that is the whole point of
-    /// the signature: this mount is where the kernel's own log lives, so a line
-    /// written here is pending ring content, which is the next flush, which is
-    /// the next sync. Swallowing it made a device that declines to flush into a
-    /// permanent write loop from the idle loop.
+    /// the signature: the log mount is where the kernel's own log lives, so a
+    /// line written here is pending ring content, which is the next flush,
+    /// which is the next sync. Swallowing it made a device that declines to
+    /// flush into a permanent write loop from the idle loop.
+    ///
+    /// A `&'static str` and so not role-tagged: the caller names the file it was
+    /// syncing, which says which volume it was on.
     fn sync(&mut self) -> Result<(), &'static str> {
         self.fs.sync().map_err(|e| match e {
-            Error::Io => "the boot volume's device refused the sync",
-            _ => "the boot volume would not sync",
+            Error::Io => "the volume's device refused the sync",
+            _ => "the volume would not sync",
         })
     }
 
@@ -657,7 +732,7 @@ impl FileSystem for EspFs {
     }
 }
 
-/// Ask every USB disk whether it carries the boot partition.
+/// Ask every USB disk whether it carries the partitions this kernel was given.
 ///
 /// Read-only, and the missing half of the GPT work: `gpt::probe` ran for NVMe
 /// only, so on a machine that boots off a stick — which is every machine this
@@ -674,7 +749,7 @@ pub fn probe_boot_disks() {
 /// The bound disk carrying `id`, or `None` when no driver here serves it.
 ///
 /// Only USB today. A machine that boots off an internal disk lands in the
-/// `None` arm and gets no `/boot`, because the NVMe device is owned by the
+/// `None` arm and gets neither mount, because the NVMe device is owned by the
 /// page cache from the moment storage comes up and there is no second handle
 /// to it — see the report in known issues rather than a workaround here.
 fn device_carrying(id: crate::block::DeviceId) -> Option<Box<dyn BlockDevice>> {
@@ -684,19 +759,19 @@ fn device_carrying(id: crate::block::DeviceId) -> Option<Box<dyn BlockDevice>> {
         .map(|disk| Box::new(disk) as Box<dyn BlockDevice>)
 }
 
-/// Open the partition this machine booted from, if it can be found and if it
-/// carries a filesystem we recognise.
+/// Open the partition `role` names, if it can be found and if it carries a
+/// filesystem we recognise.
 ///
 /// `None` is an ordinary outcome and never a reason to write anything: no
-/// firmware handoff, no device carrying that GUID, two devices carrying it, a
-/// device this kernel has no driver for, or a volume that is not FAT32. The
-/// caller simply has no `/boot`.
-pub fn mount_boot() -> Option<EspFs> {
-    let volume = gpt::boot_volume()?;
+/// handoff, no device carrying that GUID, two devices carrying it, a device
+/// this kernel has no driver for, or a volume that is not FAT32. The caller
+/// simply has no mount for that role.
+pub fn mount(role: Role) -> Option<FatFs> {
+    let volume = role.volume()?;
 
     let Some(dev) = device_carrying(volume.device) else {
         log!(
-            "esp: the boot partition is on device {} and no driver here can open it",
+            "{role}-volume: the partition is on device {} and no driver here can open it",
             volume.device
         );
         return None;
@@ -708,13 +783,13 @@ pub fn mount_boot() -> Option<EspFs> {
     let device_bytes = dev.block_count().checked_mul(BLOCK)?;
     if start.checked_add(len)? > device_bytes {
         log!(
-            "esp: the table puts the boot partition at {start}+{len} on a device of \
+            "{role}-volume: the table puts the partition at {start}+{len} on a device of \
              {device_bytes} bytes — refusing to mount past the end of it"
         );
         return None;
     }
 
-    *ESP.lock() = Some(EspDevice {
+    *device(role).lock() = Some(FatDevice {
         dev,
         start,
         len,
@@ -728,35 +803,35 @@ pub fn mount_boot() -> Option<EspFs> {
     // bound be tightened from the partition to the volume before anything can
     // write. A boot sector describing more than the partition holds is already
     // `Error::Truncated`, so this only ever shrinks.
-    let mut volume = EspVolume { bytes: len };
+    let mut volume = FatVolume { role, bytes: len };
     let geom = match Fat32::probe(&mut volume) {
         Ok(geom) => geom,
         Err(e) => {
-            log!("esp: the boot partition holds no FAT32 volume this kernel can mount: {e}");
-            *ESP.lock() = None;
+            log!("{role}-volume: the partition holds no FAT32 this kernel can mount: {e}");
+            *device(role).lock() = None;
             return None;
         }
     };
     let volume_bytes = geom.total_sectors as u64 * geom.bytes_per_sector as u64;
     volume.bytes = volume_bytes;
-    if let Some(esp) = ESP.lock().as_mut() {
-        esp.len = volume_bytes;
+    if let Some(mounted) = device(role).lock().as_mut() {
+        mounted.len = volume_bytes;
     }
 
     match Fat32::mount(volume) {
         Ok(fs) => {
             log!(
-                "esp: boot partition mounted, {volume_bytes} bytes of a {len}-byte partition at \
-                 device offset {start}, {}-byte sectors, {}-byte clusters, {} clusters",
+                "{role}-volume: partition mounted, {volume_bytes} bytes of a {len}-byte partition \
+                 at device offset {start}, {}-byte sectors, {}-byte clusters, {} clusters",
                 geom.bytes_per_sector,
                 geom.bytes_per_cluster(),
                 geom.cluster_count
             );
-            Some(EspFs::new(fs))
+            Some(FatFs::new(role, fs))
         }
         Err(e) => {
-            log!("esp: the boot partition holds no FAT32 volume this kernel can mount: {e}");
-            *ESP.lock() = None;
+            log!("{role}-volume: the partition holds no FAT32 this kernel can mount: {e}");
+            *device(role).lock() = None;
             None
         }
     }

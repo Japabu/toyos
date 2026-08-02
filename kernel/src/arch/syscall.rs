@@ -245,7 +245,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // After that line and before power goes: on a machine with no
             // serial port these last two lines exist nowhere but the ring, and
             // `acpi::shutdown` does not come back.
-            crate::esp_log::flush_final();
+            crate::log_file::flush_final();
             acpi::shutdown();
         }
         SYS_CHDIR => {

@@ -61,7 +61,7 @@ struct LogRing {
     /// serial's bookkeeping alone.
     tail: usize,
     len: usize,
-    /// The same pair for the file sink (`esp_log`). Two consumers, two
+    /// The same pair for the file sink (`log_file`). Two consumers, two
     /// cursors, one buffer: serial and the boot volume are at different points
     /// in the stream and neither may consume the other's bytes. Only advanced
     /// while [`FILE_SINK`] is set, so a machine with no `/boot` pays nothing
@@ -157,9 +157,9 @@ pub fn has_pending() -> bool {
     OWED.load(Ordering::Relaxed) != 0
 }
 
-/// Whether `esp_log` is collecting from this ring at all.
+/// Whether `log_file` is collecting from this ring at all.
 ///
-/// False until a `/boot` exists and `esp_log::install` runs, and false again
+/// False until a `/log` exists and `log_file::install` runs, and false again
 /// the moment that sink gives up — which is what keeps `file_has_pending`
 /// from reporting bytes owed to a consumer that no longer exists, and the idle
 /// loop from declining to sleep on them forever.

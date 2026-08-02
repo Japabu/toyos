@@ -274,7 +274,7 @@ bar; QEMU cannot.
   `SCREEN_OWNED_BY_USERLAND`, after which `boot_checkpoint` never paints again,
   so a console that merely cleared the screen would have traded the diagnostic
   that works today for one that might. No syscall reads the kernel's log ring;
-  `esp_log` writes the same bytes to `/boot/toyos/kernel.log` and seeds that
+  `log_file` writes the same bytes to `/log/kernel.log` and seeds that
   sink from the ring's *retained* window, so the file starts at the boot's first
   line. Measured on the first metal-sim boot: 6768 bytes, 87 kernel log rows on
   the panel above the prompt, `i8042:` lines included.

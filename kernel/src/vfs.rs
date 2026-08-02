@@ -446,7 +446,7 @@ impl Vfs {
         let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or("no filesystem")?;
         if fs_path.is_empty() { return Err("invalid path"); }
 
-        // On the heap and not the stack. `esp_log` reaches this from the idle
+        // On the heap and not the stack. `log_file` reaches this from the idle
         // loop, whose per-CPU stack is 16 KiB of ordinary heap with no guard
         // page — so a 4 KiB frame there is a quarter of the stack and an
         // overflow corrupts whatever the allocator put underneath it, silently.

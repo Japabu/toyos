@@ -536,7 +536,7 @@ fn execute(action: Action<KernelPayload>) {
                 // cursor into the same ring: a machine with no serial port is
                 // the one this matters on, and there the log ring drains into
                 // nothing while `/boot/toyos/kernel.log` is the only surviving
-                // copy. Self-clearing like the two above — `esp_log::poll`
+                // copy. Self-clearing like the two above — `log_file::poll`
                 // runs at the top of the loop and writes everything it is
                 // owed, and the paths on which it cannot (a VFS lock a dead
                 // thread still holds) turn the sink off after a bounded number
@@ -622,7 +622,7 @@ extern "C" fn idle_loop() -> ! {
         // After the serial drain and before the pass, for the same reason that
         // one is here: both are I/O off the critical path, and this is the one
         // context that provably holds none of the locks a filesystem needs.
-        crate::esp_log::poll();
+        crate::log_file::poll();
         pass(Dispose::None);
     }
 }

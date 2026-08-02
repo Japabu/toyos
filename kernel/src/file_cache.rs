@@ -361,7 +361,7 @@ impl CachedPage {
 ///
 /// Both miss paths below used `[0u8; PAGE_SIZE]` and handed it to `Box::new`,
 /// which is a 4 KiB stack frame and a 4 KiB copy per miss. The copy was waste;
-/// the frame was a hazard, because `esp_log` reaches `write_page` from the idle
+/// the frame was a hazard, because `log_file` reaches `write_page` from the idle
 /// loop, whose per-CPU stack is 16 KiB of ordinary heap with no guard page.
 /// Measured there, at the block layer with the USB command path still below:
 /// 11,505 bytes of the 16,384 with these two frames present, 6,209 without.

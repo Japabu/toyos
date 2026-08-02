@@ -11,7 +11,7 @@
 //!   `DEVICE_FRAMEBUFFER` stops `panic_console::boot_checkpoint` from ever
 //!   painting again, so a console that merely cleared the screen would trade
 //!   the diagnostic that works today for one that might. The log comes from
-//!   `/boot/toyos/kernel.log`, which is the same bytes: no syscall reads the
+//!   `/log/kernel.log`, which is the same bytes: no syscall reads the
 //!   kernel's ring and adding one is not this program's call.
 //! - **A fatal panic still takes the screen back.** `render` ignores
 //!   `SCREEN_OWNED_BY_USERLAND` entirely — only boot checkpoints honour it —
@@ -33,10 +33,10 @@ use window::Framebuffer;
 
 const FONT: &str = "/share/fonts/JetBrainsMono-Regular-8x16.font";
 
-/// `esp_log`'s two generations, oldest first: `kernel.log` rotates *to*
+/// `log_file`'s two generations, oldest first: `kernel.log` rotates *to*
 /// `kernel.log.1`, and a rotation can be the last thing a boot does — which
 /// leaves the newest bytes in the older-looking file (known issues §10).
-const KERNEL_LOG: [&str; 2] = ["/boot/toyos/kernel.log.1", "/boot/toyos/kernel.log"];
+const KERNEL_LOG: [&str; 2] = ["/log/kernel.log.1", "/log/kernel.log"];
 
 /// HID usage codes. `kernel/src/keyboard.rs` translates both to escape
 /// sequences; this program consumes them instead.
@@ -187,12 +187,11 @@ fn main() {
 
 /// Push this boot's kernel log into the scrollback; returns the bytes written.
 ///
-/// Reading a file rather than the ring itself is not a workaround: `esp_log`
+/// Reading a file rather than the ring itself is not a workaround: `log_file`
 /// seeds the sink from the ring's *retained* window, so the file opens at this
 /// boot's first line and carries everything up to the last idle pass. What it
 /// cannot carry is anything logged after this program read it — for that the
-/// owner has a shell and `cat /boot/toyos/kernel.log`, which is the whole
-/// point.
+/// owner has a shell and `cat /log/kernel.log`, which is the whole point.
 fn seed_kernel_log(console: &mut Console) -> usize {
     let mut log = Vec::new();
     for path in KERNEL_LOG {
@@ -204,7 +203,7 @@ fn seed_kernel_log(console: &mut Console) -> usize {
         // Never silently: a blank screen where the boot log used to be is the
         // one outcome that would make this program a downgrade.
         console.write_bytes(
-            b"[console] no kernel log at /boot/toyos/kernel.log - this machine has no /boot,\n\
+            b"[console] no kernel log at /log/kernel.log - this machine has no /log,\n\
               [console] so the screen starts here rather than at the first boot line.\n\n",
         );
         return 0;
