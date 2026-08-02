@@ -838,7 +838,9 @@ dependencies = [
  "serde_json",
  "toml",
  "toyos-cc",
+ "toyos-gpt",
  "toyos-ld",
+ "uuid",
 ]
 
 [[package]]
@@ -852,6 +854,10 @@ dependencies = [
  "target-lexicon",
  "toyos-ld",
 ]
+
+[[package]]
+name = "toyos-gpt"
+version = "0.1.0"
 
 [[package]]
 name = "toyos-ld"

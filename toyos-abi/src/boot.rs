@@ -45,6 +45,22 @@ pub struct KernelArgs {
     /// partition table, is a machine ToyOS is expected to come up on. The
     /// kernel simply knows it has no partition it is entitled to write to.
     pub boot_partition_present: u32,
+    /// The unique GUID of the partition the kernel's log goes on, read out of
+    /// `\toyos\log.guid` on the volume the bootloader loaded itself from, in
+    /// the same raw byte order as [`Self::boot_partition_guid`].
+    ///
+    /// No presence flag, unlike the boot partition above, and not because the
+    /// state cannot arise but because it is not a machine. A machine really can
+    /// have no boot partition to be named — PXE, an unpartitioned disk. But
+    /// this GUID comes from a file `create_fat_volume` writes beside
+    /// `kernel.elf` and `initrd.img`, so a volume carrying those two and not
+    /// this one was not built by this project, and the bootloader refuses it by
+    /// name rather than starting a kernel that would silently have nowhere to
+    /// put its log.
+    ///
+    /// Naming the partition is all this does. Whether one with that GUID is on
+    /// the disk is the kernel's question, and its answer there may well be no.
+    pub log_partition_guid: [u8; 16],
 }
 
 /// The kernel's `_start` reads three of these fields out of `rdi` by hardcoded
@@ -66,7 +82,8 @@ const _: () = {
     assert!(offset_of!(KernelArgs, boot_partition_blocks) == 152);
     assert!(offset_of!(KernelArgs, boot_partition_guid) == 160);
     assert!(offset_of!(KernelArgs, boot_partition_present) == 176);
-    assert!(size_of::<KernelArgs>() == 184);
+    assert!(offset_of!(KernelArgs, log_partition_guid) == 180);
+    assert!(size_of::<KernelArgs>() == 200);
     assert!(align_of::<KernelArgs>() == 8);
 };
 

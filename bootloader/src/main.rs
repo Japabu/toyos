@@ -161,6 +161,26 @@ fn boot_partition(handle: Handle, system_table: &SystemTable<Boot>) -> Option<Bo
     })
 }
 
+/// Name the partition the kernel's log goes on, without reading it.
+///
+/// Written beside `kernel.elf` and `initrd.img` by `src/image.rs`, which draws
+/// the GUID and stamps the same sixteen bytes into the GPT entry. Read here
+/// because this is the volume firmware designated and because the kernel has no
+/// filesystem yet: the identity is *given* all the way down, and nothing at any
+/// level scans for a partition of the right type or format.
+///
+/// A missing or short file panics, like every other check in this file. The
+/// same function writes all three, so a volume with two of them was assembled
+/// by something that is not this project — and booting it anyway would mean a
+/// kernel that quietly has nowhere to write its log, on the machine that has no
+/// other channel.
+fn log_partition_guid(handle: Handle, system_table: &SystemTable<Boot>) -> [u8; 16] {
+    let bytes = load_file_bytes(handle, system_table, cstr16!("\\toyos\\log.guid"));
+    <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or_else(|_| {
+        panic!("\\toyos\\log.guid holds {} bytes, wanted 16", bytes.len())
+    })
+}
+
 /// Kernel virtual base: all physical memory is mapped here in the kernel's address space.
 const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
@@ -388,7 +408,7 @@ unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
     pml4 as u64
 }
 
-fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, boot_part: Option<BootPartition>, system_table: SystemTable<Boot>) -> ! {
+fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, boot_part: Option<BootPartition>, log_partition_guid: [u8; 16], system_table: SystemTable<Boot>) -> ! {
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
     let mut memory_map = vec::Vec::<MemoryMapEntry>::with_capacity(memory_map_entry_count);
@@ -450,6 +470,7 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         boot_partition_blocks,
         boot_partition_guid,
         boot_partition_present,
+        log_partition_guid,
     };
 
     // Build boot page tables: identity map + high-half map for first 4GB.
@@ -501,6 +522,9 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let initrd = load_file_bytes(handle, &system_table, cstr16!("\\toyos\\initrd.img"));
     println!("Initrd: {} bytes", initrd.len());
 
+    let log_guid = log_partition_guid(handle, &system_table);
+    println!("Log partition: signature {:02x?}", log_guid);
+
     println!("Loading kernel elf...");
     let loaded_kernel = load_kernel_elf(&kernel_bytes);
 
@@ -508,5 +532,5 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let gop = query_gop(&system_table);
 
     println!("Starting kernel...");
-    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, gop, boot_part, system_table);
+    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, gop, boot_part, log_guid, system_table);
 }

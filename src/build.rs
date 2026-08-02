@@ -647,8 +647,7 @@ pub fn build_test_image(
     let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
     let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
 
-    let esp = image::create_fat_volume(&kernel_bytes, &bl_bytes, &initrd_bytes);
-    image::create_gpt_disk(esp)
+    image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes)
 }
 
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
