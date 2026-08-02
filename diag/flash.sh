@@ -26,7 +26,6 @@ while [ $# -gt 0 ]; do
         -h|--help)
             echo "usage: $0 [--image PATH] [--disk diskN] [--dry-run]"
             echo "  --disk is only needed when more than one USB disk is attached."
-            echo "  TOYOS_FLASH_SU=<admin user> elevates via su instead of sudo."
             exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -101,20 +100,9 @@ case "$reply" in
 esac
 
 diskutil unmountDisk "/dev/$DISK"
-
-# /dev/rdiskN is root:operator mode 640, so writing one needs root and no group
-# membership short of it will do. Which mechanism reaches root is the operator's
-# to choose: set TOYOS_FLASH_SU to an admin account and this goes through `su`
-# instead of `sudo`, for a login that is deliberately not a sudoer.
-#
-# rdisk is the raw node: no buffer cache, roughly an order of magnitude faster
-# than /dev/diskN. Ctrl-T prints progress; macOS dd has no status=progress.
-if [ -n "${TOYOS_FLASH_SU:-}" ]; then
-    su "$TOYOS_FLASH_SU" -c "sudo dd if=$(printf %q "$IMAGE") of=/dev/r$DISK bs=4m"
-else
-    sudo dd if="$IMAGE" of="/dev/r$DISK" bs=4m
-fi
-
+# rdisk is the raw node: no buffer cache, roughly an order of magnitude faster.
+# Ctrl-T prints progress; macOS dd has no status=progress.
+sudo dd if="$IMAGE" of="/dev/r$DISK" bs=4m
 sync
 diskutil eject "/dev/$DISK"
 echo "done — $IMG_SHA on /dev/$DISK"
