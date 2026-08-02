@@ -192,8 +192,9 @@ Read the spec before touching the subsystem it covers.
 
 **`specs/known-issues.md` is the list and the file to update** — ten sections, every open item with its evidence and its reproduction. Read it before touching a subsystem. Nothing is duplicated here.
 
-Three bite an agent who is *not* working on the subsystem:
+Four bite an agent who is *not* working on the subsystem:
 
 - **Gate A can fail a run on `drains` alone**, with no gap and no underrun. A per-run failure should require evidence of harm.
 - **`log_file`'s flush is unbounded and uninterruptible, in `idle_loop` before `pass()`.** Anything added to the idle loop is an audio change, and userland `println!` shares that ring.
 - **The fork estate is outside every check the tree runs on itself.** "I enumerated the call sites" is only true if the enumeration covered `~/.cargo/git/checkouts/`.
+- **A filtered C-test run can be red for a daemon's line rather than for its own output.** `cargo test -- <name>` opens one capture window, soundd's boot lines land in it, and that family compares whole stdout. Judge it from a full run.
