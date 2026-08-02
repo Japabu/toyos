@@ -112,7 +112,7 @@ bar; QEMU cannot.
 
   Four QEMU-side questions the design left open are now answered. `0xF0 0x00`
   reads back **0x41** (keyboard in set 2, controller translating, set-1 on the
-  wire), so QEMU honours both `0xF0 0x02` and the XLAT config bit; clearing
+  wire), so QEMU honours the XLAT config bit; clearing
   the bit makes it answer 0x02 and the driver refuses to attach rather than
   decode garbage. `-machine q35,i8042=off` **does** clear the FADT
   `IAPC_BOOT_ARCH` 8042 bit — which was how the gate got tested, and is now how
@@ -148,13 +148,62 @@ bar; QEMU cannot.
   the probe refuses in one `inb` rather than waiting out the init budget.
   `i8042_absent` and `i8042_fadt_denial` are the two gates.
 
-  What QEMU still cannot decide is **R1**: whether the T14's eSPI EC lands in
-  set 2 + translation on. The read-back is a full determination of the wire
-  format and the driver disables rather than decodes a format it did not ask
-  for, so the first metal boot answers it in one short line on the laptop's
-  own screen. Contingency is one commit (set-2 tables, clear bit 6). R0's
-  answer is what makes R1 reachable at all — until now the probe stopped
-  before the question was asked.
+  **R1 — ANSWERED ON THE LAPTOP, and it changed the design too.** The question
+  was which wire format the T14's eSPI EC lands in. The answer is that it
+  will not say. With bit 1 no longer gating, the probe got all the way to the
+  keyboard and stopped one step from the end:
+
+  ```
+  i8042: ok selftest=0x55 cfg=0x77->0x64 port1=ok port2=ok
+  i8042: kbd cmd 0x02 answered Some(238), not ack
+  i8042: kbd refused scancode set 2 ... disabled
+  ```
+
+  Self-test `0x55`, both interface tests passed, config byte read `0x77` and
+  written back `0x64`: the controller is real and healthy, and `0xF5` had
+  already been acknowledged, so the keyboard answers commands. 238 is `0xEE`,
+  ECHO's own reply, returned for the **argument byte** of `0xF0 0x02` after the
+  command byte was acked. The refusal worked as designed and cost the keyboard
+  and — because the aux block sits past it — the TrackPoint as well.
+
+  **The driver reads the set now and never writes it.** Nothing else in that
+  machine's life issues the write: Linux's `atkbd_select_set` returns set 2
+  outright when `atkbd->translated`, which `i8042.c` derives from the XLATE bit
+  of the CTR the BIOS left, and `atkbd_skip_getid` withholds even `0xF2` from
+  every portable device; EDK2's `Ps2KeyboardDxe` selects a set only under
+  `ExtendedVerification`, which its own comment says is skipped when booting an
+  OS. A write cannot improve on a read that already answers, and it leaves an EC
+  that mishandles it in a state nothing can name.
+
+  **And a refusal of the read is no longer the end.** The read-back stays the
+  determination wherever the device gives one. Where it does not, the wire
+  format falls back to the translate bit *firmware itself left in the config
+  byte* — `before & CFG_TRANSLATE`, which on the T14 is `0x77`. That is not a
+  weaker read-back, it is Linux's entire test, on the same byte; enabling a
+  set2→set1 translator is coherent only for a device emitting set 2, so
+  firmware having enabled it is a statement about the wire made by the one party
+  that had a working keyboard on it. Firmware having left translation *off* says
+  nothing, and there the driver still refuses. The success line says which of
+  the two happened — `(readback 0x41)` or `(assumed, the set query was
+  refused)` — so the panel never claims a determination that was not made.
+
+  `i8042_kbd_echo` is the gate: the `i8042-kbd-echo` feature answers the query's
+  argument byte with `0xEE` on QEMU's otherwise-perfect keyboard, because
+  QEMU implements `0xF0` to the letter and no host-side property turns that off.
+  Its teeth are the delivery assertion — the same "hello" the other input tests
+  type — since a driver that logs the assumption and arms nothing passes every
+  log-line assertion in it.
+
+  What is left of R1 is the residue: `0xEE` is a *response* byte, and the only
+  defined meaning of `0xEE` on this wire is ECHO's reply, so an EC that answers
+  it to something nobody echoed is an EC answering a command it does not
+  implement. Ruled out as the source: translation mangling the ack (the same
+  translator passed two `0xFA`s in the two commands immediately before, and the
+  standard table is identity above `0x80` except `0x83`→`0x41` and
+  `0x84`→`0x54`); a stale or aux byte (scanning was off by the acked `0xF5` and
+  the aux clock off by `0xA7`, so both device ports were silent by the
+  controller's own configuration, and no set-2 scancode translates to `0xEE`);
+  and timing (the two preceding acks in the same exchange were read correctly).
 
   Also untested outside QEMU, in rough order of risk: the interrupt topology
   (design §12.5, R3) — QEMU has one textbook I/O APIC at 0xFEC00000 with

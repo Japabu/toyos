@@ -2440,11 +2440,14 @@ Consequences, in the order they bite:
   configuration all of them look identical from the owner's chair: a desktop
   with dead input.
 - **A keyboard-side refusal also costs the pointer.** Every `return` in the
-  keyboard block (`i8042/mod.rs:670-709` — `0xF5`, `0xF0 0x02`, the `0xF0 0x00`
-  read-back, the four wire-format arms, `0xF4`) happens *before* the aux block
-  at `:712`, so the TrackPoint is never initialised either. "Keyboard and
-  TrackPoint both dead" therefore discriminates nothing — it is the signature of
-  every failure mode, including the ones that are purely keyboard-side.
+  keyboard block (`i8042/mod.rs:1015-1075` — `0xF5`, the `0xF0 0x00` read-back's
+  five refusing arms, `0xF4`) happens *before* the aux block at `:1077`, so the
+  TrackPoint is never initialised either. "Keyboard and TrackPoint both dead"
+  therefore discriminates nothing — it is the signature of every failure mode,
+  including the ones that are purely keyboard-side. The T14's own first answer
+  was one of these, and it is no longer among them: a keyboard that will not
+  report its scancode set now attaches on firmware's translate bit and the aux
+  block runs, which `i8042_kbd_echo` asserts. The other refusals are unchanged.
 - **The intended reading of a dead touchpad is destroyed.** The gate told the
   owner a dead touchpad is expected (I2C-HID, unbuilt) and a keyboard refusal is
   the driver working. Neither statement is checkable without the line.
@@ -2634,14 +2637,11 @@ is firmware speaking rather than an unreadable table, and `0x0011` decodes as
 driver refused on bit 1 and never touched the controller; the keyboard and the
 TrackPoint were never asked.
 
-Fixed by deleting the gate, not by relaxing it. The residual is stated here
-because it is the part a future reader will want: **nothing in this tree knows
-whether the T14 has a working 8042.** All that has been established is that the
-handshake now runs. Three outcomes are possible on the next boot and they are
-distinguished by which line appears — `kbd set2+xlat` (firmware's bit was
-wrong), `absent — port 0x64 reads 0xff` (nothing decodes the ports, so the bit
-was honest and the keyboard is not PS/2 at all), or one of the fourteen other
-refusals (a controller that answers but not the way the driver asked).
+Fixed by deleting the gate, not by relaxing it. **The next boot answered the
+residual, and firmware's bit was wrong**: `i8042: ok selftest=0x55
+cfg=0x77->0x64 port1=ok port2=ok` — a real, healthy controller on a machine
+whose FADT denies it. That boot then stopped at the fifteenth refusal, which has
+its own entry below.
 
 Two things the QEMU gates do *not* cover, both structural:
 
@@ -2658,6 +2658,50 @@ Two things the QEMU gates do *not* cover, both structural:
   runs immediately before `i8042::init` and clears the controller's SMI enables,
   which is the reason to expect the trap to be disarmed by then — argued, never
   observed.
+
+### The T14's keyboard will not report its scancode set, and has still never typed
+
+The boot after the FADT gate came out reached the keyboard and stopped one step
+from the end:
+
+```
+i8042: ok selftest=0x55 cfg=0x77->0x64 port1=ok port2=ok
+i8042: kbd cmd 0x02 answered Some(238), not ack
+i8042: kbd refused scancode set 2 ... disabled
+```
+
+238 is `0xEE`, ECHO's own reply, returned for the **argument** of `0xF0 0x02`
+after the command byte was acked and after `0xF5` had been acked — so the EC
+answers commands and does not implement this one. The driver now reads the set
+rather than writing it, and where the read is refused it decides the wire format
+from the translate bit firmware left in the config byte (`0x77` on this
+machine), which is exactly what Linux's `i8042.c`/`atkbd` do and all they do on
+a portable device. `i8042_kbd_echo` gates it.
+
+What is open:
+
+- **Nothing has seen the T14 deliver a keystroke.** The fix is certified on
+  QEMU's keyboard with the EC's answer injected. The `0xEE` was for the
+  *argument* byte; whether the EC also refuses the command byte, answers the
+  query differently from the set, or stops answering at all, is unmeasured —
+  those land on `SetQuery::Refused` at the first byte and on `SetQuery::Silent`,
+  and only the first of the three attaches. The next diag boot distinguishes
+  them by which line appears.
+- **The fallback's evidence is firmware's intent, not a read-back.** `before &
+  CFG_TRANSLATE` says firmware enabled a set2→set1 translator; that it did so
+  for a device emitting set 2 is inference, tight but inference. The success
+  line says `(assumed, the set query was refused)` rather than `(readback
+  0x41)` precisely so the panel does not claim otherwise. A machine where the
+  inference is wrong types nonsense, which is the outcome the read-back exists
+  to prevent — there is no third instrument for it on this wire.
+- **`0xF2` is not that instrument.** A translating controller answers the MF2 id
+  `AB 83` as `AB 41` (`translate_table[0x83] == 0x41`, QEMU `hw/input/ps2.c`;
+  QEMU's own keyboard hardcodes the same pair), which would prove the translator
+  is live on the data path and not merely enabled in a bit. It is not sent,
+  because Linux's `atkbd_skip_getid` withholds `0xF2` from every translated
+  portable device — "on many modern laptops ATKBD_CMD_GETID may cause problems"
+  — and the T14 is one. Sending a command Linux avoids on this exact machine
+  class to shore up an inference is the wrong trade.
 
 - PCID + INVPCID codepaths untested on real hardware — QEMU TCG supports
   neither. Both are CPUID-gated, so TCG falls back to a CR3 reload. Needs KVM or
