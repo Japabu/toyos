@@ -7,7 +7,9 @@ const DEFAULT_FG: Color = Color { r: 255, g: 255, b: 255 };
 const DEFAULT_BG: Color = Color { r: 0, g: 0, b: 0 };
 const SEL_FG: Color = Color { r: 255, g: 255, b: 255 };
 const SEL_BG: Color = Color { r: 58, g: 110, b: 165 };
-const SCROLLBACK_ROWS: usize = 1000;
+/// Public because a caller that pre-fills the scrollback has to bound what it
+/// writes, and the honest bound is this number rather than one of its own.
+pub const SCROLLBACK_ROWS: usize = 1000;
 const SCROLLBAR_WIDTH: usize = 6;
 const SCROLLBAR_TRACK: Color = Color { r: 0x20, g: 0x20, b: 0x20 };
 const SCROLLBAR_THUMB: Color = Color { r: 0x60, g: 0x60, b: 0x60 };

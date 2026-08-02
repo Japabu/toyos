@@ -1,10 +1,9 @@
-mod console;
-
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::toyos::process;
 use std::process::Command;
 
+use terminal::Console;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::Fd;
 use window::Window;
@@ -25,7 +24,7 @@ fn main() {
     let fb = window.framebuffer();
     let font_data = std::fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
-    let mut console = console::Console::new(fb, font);
+    let mut console = Console::new(fb, font);
 
     let mut shell_stdin = child.stdin.take().unwrap();
     let mut shell_stdout = child.stdout.take().unwrap();
