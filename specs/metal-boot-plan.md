@@ -208,9 +208,12 @@ bar; QEMU cannot.
   initialises fully** — `rate=100 res=8/mm` is the TrackPoint answering its
   whole reset/id/rate/resolution sequence, unreachable before because every
   keyboard-side refusal returns ahead of that block. And a physical keypress
-  raised a real interrupt on GSI 1, which retires **R3**: the topology read off
-  the first-boot photograph is the topology that delivers, so `route`'s
-  read-back, the identity GSI and the unmask are all correct on Tiger Lake.
+  raised a real interrupt on GSI 1, which retires **R3 for the keyboard line**:
+  the topology read off the first-boot photograph is the topology that delivers,
+  so `route`'s read-back, the identity GSI and the unmask are all correct on
+  Tiger Lake. GSI 12 is programmed the same way and has still never asserted —
+  nothing has touched the TrackPoint — so the aux half of R3 is argued from the
+  keyboard half, not observed.
   Two measurements fall out: the EC is slow but inside its budget (`armed at
   1460ms` against a 2100 ms total), and `Boot: peripherals ready` went 6 ms →
   398 ms, which is the aux reset stage running against a device that takes real
