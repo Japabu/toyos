@@ -113,6 +113,28 @@ pub enum Profile {
     /// is the assertion. QEMU assigns ports in device-creation order, measured
     /// against the kernel's own `port N connected` lines.
     UsbDiskRefusedFirst,
+    /// metal-sim with a device that attaches at **full speed**.
+    ///
+    /// Speed is a shape dimension and it was one no profile varied: every USB
+    /// device in this suite is high or SuperSpeed, and those two are the speeds
+    /// whose EP0 max packet size is fixed by the specification. Full speed is
+    /// the one where it is not — 8, 16, 32 or 64, and unknown until the first
+    /// eight bytes of the device descriptor have been read over the very
+    /// endpoint being sized. A T14 port answered a USB Transaction Error to a
+    /// driver that assumed 64 and read 18 bytes in one go, and no test here
+    /// could have seen it.
+    ///
+    /// Two of them, because `bMaxPacketSize0` is the dimension under test and a
+    /// profile with one value of it cannot tell "the driver read the device's
+    /// answer" from "the driver's guess happened to match": the tablet answers
+    /// **8** and the smartcard reader answers **64**, so one boot carries both
+    /// the correction and its absence. Both are full-speed only — QEMU gives
+    /// each a `.full` descriptor set and no `.high` one, so `usb_desc_attach`
+    /// has no faster speed to pick — and neither needs a chardev, drive or
+    /// audiodev to enumerate. Measured with `info usb` on QEMU 11.0.2: both
+    /// report 12 Mb/s, and `usb-kbd`, which every other profile uses, reports
+    /// 480.
+    MetalFullSpeed,
     /// Two xHCI controllers, with every device on the *second* one.
     ///
     /// The T14 Gen 2's literal shape, and the one that had never been staged:
@@ -454,6 +476,19 @@ impl Profile {
             // controller is empty until something is plugged into it. It also
             // means the disk index the block layer holds names a device on a
             // controller that is not the first, which nothing else stages.
+            Self::MetalFullSpeed => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &["usb-wacom-tablet,bus=xhci.0", "usb-ccid,bus=xhci.0"],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
+                usb_disk_first: false,
+            },
             Self::MetalXhciSecond => Shape {
                 vga: "std",
                 virtio: false,

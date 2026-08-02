@@ -106,6 +106,19 @@ fn stage(path: &Path, bytes: u64) -> u64 {
 
 /// Every claim the host can make about what the guest did to the disk.
 fn verify(path: &Path, bytes: u64, nonce: u64) -> Result<(), String> {
+    verify_except(path, bytes, nonce, &[])
+}
+
+/// The same, for a boot in which one of the guest's writes was deliberately
+/// broken mid-flight.
+///
+/// `unwritten` names the blocks whose *content* is nobody's claim afterwards —
+/// the injected break abandons a data phase the emulator has already been handed,
+/// so whether those bytes reached the medium before the Bulk-Only Reset cancelled
+/// the command is QEMU's to decide. Everything else is still checked, which is
+/// the whole assertion: a disk taken offline by one broken transfer writes none
+/// of it.
+fn verify_except(path: &Path, bytes: u64, nonce: u64, unwritten: &[i64]) -> Result<(), String> {
     let blocks = bytes / BLOCK;
     let guest_nonce = !nonce;
     let mut file = std::fs::OpenOptions::new()
@@ -116,6 +129,9 @@ fn verify(path: &Path, bytes: u64, nonce: u64) -> Result<(), String> {
 
     // What the guest wrote, at the LBAs it was told to write them.
     for index in GUEST_BLOCKS {
+        if unwritten.contains(&index) {
+            continue;
+        }
         let block = block_of(blocks, index);
         let got = read_block(&mut file, block);
         if let Some(at) = (0..BLOCK as usize).find(|&i| got[i] != pattern(guest_nonce, block, i)) {
@@ -999,6 +1015,264 @@ pub fn xhci_portsc_rw1c(
         "  [xhci] PED honoured as RW1C: {connected}/{connected} ports connected reached Enabled, \
          0 disabled by a driver write, {} slots, {keyboards} keyboards, {disks} disk",
         slots.len()
+    );
+    Ok(())
+}
+
+/// A bulk transfer that breaks **without halting the endpoint**, which is the
+/// shape the recovery path had no answer for.
+///
+/// The first metal boot with a working USB stack mounted `/boot` off a stick and
+/// then lost it: a WRITE(10) broke, `clear_stall` opened with a Reset Endpoint
+/// command, and the controller answered **completion code 19, Context State
+/// Error** — twice, once per endpoint. xHCI 1.2 §4.6.8 defines Reset Endpoint
+/// only for a Halted endpoint; §4.6.9's Stop Endpoint is the command for a
+/// Running one. `reset_recovery` returned false, `dev.failed` was set, nothing
+/// in this driver ever clears that flag, and the machine's own boot disk was
+/// offline for the rest of the boot with `/boot/toyos/kernel.log` — the only
+/// diagnostic channel that machine has — stopped where it stood.
+///
+/// **The actuator is a kernel feature, and it replaces no verdict.** QEMU's
+/// `usb-storage` answers every CBW, data phase and CSW it is handed; nothing on
+/// the host side makes one bulk transfer not complete, and `rerror`/`werror`
+/// fail a whole drive rather than leaving a transfer in flight.
+/// `usb-transport-break` skips the *wait* on one data phase and nothing else:
+/// the TRB is really on the ring, the endpoint is really left Running, and the
+/// controller really completes the transfer afterwards. That is the state a
+/// transfer which ran out `USB_TIMEOUT_NS` leaves behind, byte for byte, so the
+/// recovery under test runs against a real endpoint state rather than a flag.
+///
+/// The assertion that decides it is host-side and is about bytes: everything the
+/// guest wrote *after* the break is byte-correct in the backing file. Before the
+/// fix the disk is offline from the break onward, so the nine-block run and the
+/// second guest block never leave the guest at all.
+pub fn usb_transport_break(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURES: &[&str] = &["usb-storage-gate", "usb-transport-break"];
+    /// The kernel arms the injection on the first WRITE(10) of the boot, and
+    /// the gate's first write is `GUEST_BLOCKS[0]`. If anything ever writes a
+    /// USB disk earlier the `wr_err=1` assertion below stops matching, which is
+    /// what keeps this constant honest.
+    const EATEN: i64 = GUEST_BLOCKS[0];
+
+    let (bytes, lba) = Profile::UsbDisk.usb_disk().expect("UsbDisk declares a disk");
+    let image = test_dir().join("usb-transport-break.img");
+    let nonce = stage(&image, bytes);
+
+    let log = boot_and_shutdown(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::UsbDisk,
+            kernel_features: FEATURES,
+            usb_image: Some(image.clone()),
+            ..Default::default()
+        },
+    )?;
+    gate_ran(&log, 2)?;
+    check_geometry(&log, bytes, lba)?;
+
+    // The injection reached the driver, and the driver said *what* broke. Both
+    // halves are assertions: without the first this is a boot with nothing
+    // injected, and without the second the log says only that something went
+    // wrong — which is the line the T14 produced, and the reason the cause of
+    // that break cannot be read out of its log today.
+    const BROKE: &str = "usb-storage: transport broke on SCSI 0x2a: no answer in the data phase";
+    if !log.contains(BROKE) {
+        return Err(format!("the guest never printed {BROKE:?}; did the injection run?\n{log}"));
+    }
+    let breaks = log.matches("transport broke").count();
+    if breaks != 1 {
+        return Err(format!(
+            "the transport broke {breaks} times; the injection is armed once per boot, so \
+             anything else is a break this test did not stage\n{log}"
+        ));
+    }
+
+    // The endpoint state the recovery had to be chosen for, read out of the
+    // controller's own output device context. `Halted` here would mean the
+    // injection staged the other shape and everything below proves nothing.
+    if !log.contains("is Running, recovering") {
+        let states: Vec<&str> = log.lines().filter(|l| l.contains(", recovering")).collect();
+        return Err(format!(
+            "no endpoint was found Running after the break, so this is not the non-halt \
+             shape: {states:?}\n{log}"
+        ));
+    }
+
+    // `run_command` logs only failures, so each of these lines is the
+    // controller refusing a command the driver should not have sent — which is
+    // exactly what the T14 printed twice.
+    for illegal in [
+        "Reset Endpoint failed",
+        "Stop Endpoint failed",
+        "Set TR Dequeue failed",
+        "reset recovery failed; disk is offline",
+    ] {
+        if log.contains(illegal) {
+            return Err(format!(
+                "{illegal:?}: the recovery did not pick a command the endpoint's state \
+                 permits\n{log}"
+            ));
+        }
+    }
+
+    // One write reported a failure, and the disk stayed online through it.
+    // Before the fix this line reads `wr_err=3 healthy=false`.
+    if !log.contains("usb-gate: disk done reads=ok writes=bad refusal=true wr_err=1 healthy=true") {
+        return Err(format!("the disk did not survive one broken transfer\n{log}"));
+    }
+
+    // And the bytes, which is the claim nothing in the guest can make for
+    // itself: everything written after the break is in the backing file, the
+    // host's own blocks are unchanged, and the blocks either side of the run
+    // are still zero.
+    verify_except(&image, bytes, nonce, &[EATEN])?;
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish after the break\n{log}"));
+    }
+    serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+    let _ = std::fs::remove_file(&image);
+
+    eprintln!(
+        "  [usb] a bulk transfer abandoned mid-flight: the endpoint was found Running and \
+         stopped rather than reset, the disk stayed online, and every write after the break \
+         verified host-side"
+    );
+    Ok(())
+}
+
+/// A device that attaches at **full speed**, where EP0's max packet size is a
+/// thing only the device knows.
+///
+/// Low, High and SuperSpeed each fix it at 8, 64 and 512, and every USB device
+/// in this suite was one of those — so a driver that answered 64 for full speed
+/// and read all 18 bytes of the device descriptor in one go passed everything
+/// here. A T14's port 9 came up at speed 1 and answered
+/// `GET_DESCRIPTOR(Config) failed, code=Some(4)` — USB Transaction Error — after
+/// the driver had already logged `vendor=0000 product=0000` off a buffer no
+/// transfer had filled.
+///
+/// Two things are asserted and they are separate. The **sequence**: the driver
+/// reads eight bytes, takes `bMaxPacketSize0` from them, and only then reads the
+/// rest. The **error channel**: what it prints about a device is what the device
+/// sent, so a read that delivered nothing can never be logged as a device whose
+/// identifiers are zero.
+///
+/// Ground truth is host-side in the sense that matters here — QEMU's descriptor
+/// tables are the host's bytes and a guest cannot invent them. `usb-wacom-tablet`
+/// is full-speed only: QEMU gives it a `.full` descriptor set and no `.high` one,
+/// so `usb_desc_attach` has no faster speed to choose.
+pub fn xhci_full_speed_device(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    /// Each device's own `idVendor`, out of QEMU's descriptor tables: PenPartner
+    /// for the tablet, Gemalto for the reader. The host's bytes, and the thing in
+    /// a device descriptor a guest cannot have guessed.
+    const VENDORS: [&str; 2] = ["vendor=056a", "vendor=08e6"];
+    /// What the reader answers to the eight-byte prefix, measured on QEMU
+    /// 11.0.2. The tablet answers 8 and so needs no correction — which is the
+    /// other half of the claim, because a driver that wrote a constant would
+    /// produce this line for both devices or for neither.
+    const CORRECTED: &str = "EP0 packet size 8 -> 64";
+
+    let options = BootOptions {
+        profile: Profile::MetalFullSpeed,
+        ..Default::default()
+    };
+    // The claim is that full-speed devices are on the bus, and argv is where a
+    // device's presence is visible: no console line distinguishes "the driver
+    // did not enumerate it" from "it was never attached".
+    let argv = qemu::profile_argv(&options);
+    let usb = crate::usb_argv(&argv);
+    for want in ["usb-wacom-tablet", "usb-ccid"] {
+        if !usb.iter().any(|d| d.starts_with(want)) {
+            return Err(format!("this gate needs {want} on the bus, argv has {usb:?}"));
+        }
+    }
+
+    let log = boot_and_shutdown(test_config, c_bins, rust_bins, options)?;
+
+    // Speed 1 is Full Speed in PORTSC, and it is the premise of the whole test:
+    // on a bus of high- and SuperSpeed devices EP0's packet size is fixed by
+    // the specification and nothing below here has anything to measure.
+    let full_speed: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("xHCI: port ") && l.contains("reset, speed=1"))
+        .collect();
+    if full_speed.len() != 2 {
+        return Err(format!(
+            "{} port(s) came up at full speed, want both: {full_speed:?}\n{log}",
+            full_speed.len()
+        ));
+    }
+
+    // **The sequence.** 64 is a number the driver can only have got by reading
+    // the first eight bytes of the reader's device descriptor and issuing
+    // Evaluate Context with what it found — the eighth byte is `bMaxPacketSize0`
+    // and QEMU's `desc_device_ccid` is where this 64 comes from. Exactly one
+    // such line, because the tablet on the same bus answers 8: a driver that
+    // wrote a constant for full speed produces this line twice or not at all,
+    // and the shipped one produced it never.
+    let corrected: Vec<&str> = log.lines().filter(|l| l.contains("EP0 packet size")).collect();
+    match corrected.as_slice() {
+        [only] if only.contains(CORRECTED) => {}
+        other => {
+            return Err(format!(
+                "want exactly one endpoint resized, to the {CORRECTED:?} the reader asked \
+                 for; got {other:?}\n{log}"
+            ));
+        }
+    }
+
+    // **The error channel.** What the driver prints about a device is what the
+    // device sent. Both identities are the host's bytes; an all-zero one is what
+    // an unfilled buffer looks like, and it is what a T14 port printed off a
+    // transfer that had delivered no descriptor at all.
+    for vendor in VENDORS {
+        if !log.contains(vendor) {
+            return Err(format!(
+                "the driver never reported {vendor:?}; a device descriptor that was not \
+                 delivered must not be logged as one that was\n{log}"
+            ));
+        }
+    }
+    if log.contains("vendor=0000 product=0000") {
+        return Err(format!(
+            "a device was logged with an all-zero identity, which is what an unfilled \
+             descriptor buffer looks like\n{log}"
+        ));
+    }
+    for wrong in ["GET_DESCRIPTOR(Device)", "GET_DESCRIPTOR(Config)", "code=Some("] {
+        if let Some(line) = log.lines().find(|l| l.contains(wrong)) {
+            return Err(format!("{line:?}\n{log}"));
+        }
+    }
+
+    // And one came out the far end: a full-speed HID enumerated, bound, and took
+    // a button-merge source. `Enabled` is not `enumerated`, and neither is
+    // `addressed`. The reader is not a HID and is walked past by name.
+    let binds = crate::parse_xhci_binds(&log);
+    if binds.len() != 1 || binds[0].kind != "mouse" {
+        return Err(format!("want exactly the full-speed pointer bound, got {binds:?}\n{log}"));
+    }
+    if !log.contains("xHCI: no HID boot interface found") {
+        return Err(format!("the reader was not walked past\n{log}"));
+    }
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish\n{log}"));
+    }
+    serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+
+    eprintln!(
+        "  [xhci] two full-speed devices enumerated: one EP0 resized to 64 from the reader's \
+         own bMaxPacketSize0 and the tablet's 8 left alone, both identities read off the wire"
     );
     Ok(())
 }
