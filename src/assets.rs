@@ -94,6 +94,20 @@ fn rasterize_font(ttf_bytes: &[u8], cell_width: usize, cell_height: usize) -> Ve
     out
 }
 
+/// The pre-rasterized 8x16 font the initrd carries as
+/// `/share/fonts/JetBrainsMono-Regular-8x16.font`, which `/bin/console` and
+/// `/bin/terminal` blit.
+///
+/// Produced by the same `rasterize_font` [`collect`] calls, so the screendump
+/// decoder in `tests/common/screen.rs` reads the exact table the guest drew
+/// with — the property the checked-in `font8x16.bin` gives the panic console,
+/// obtained here from one producer instead of one file.
+pub fn console_font(root: &Path) -> Vec<u8> {
+    let ttf = fs::read(root.join("assets/JetBrainsMono-Regular.ttf"))
+        .expect("console_font: JetBrainsMono-Regular.ttf not found");
+    rasterize_font(&ttf, 8, 16)
+}
+
 /// Where the kernel's panic-console font lives, relative to the repo root.
 pub const PANIC_FONT_PATH: &str = "kernel/src/drivers/panic_console/font8x16.bin";
 

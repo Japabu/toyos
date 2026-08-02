@@ -56,11 +56,16 @@ fn main() {
     let mute = args.iter().any(|a| a == "--mute");
     // A machine with no serial port has the framebuffer and nothing else, and
     // the kernel stops painting it the moment userland claims it. `--diag-boot`
-    // builds the image that never does.
-    let boot = if args.iter().any(|a| a == "--diag-boot") {
-        toyos_build::build::Boot::Diag
-    } else {
-        toyos_build::build::Boot::Normal
+    // builds the image that never does; `--console-boot` builds the one that
+    // claims it deliberately and puts a shell there, having first copied the
+    // boot log into its scrollback.
+    let diag = args.iter().any(|a| a == "--diag-boot");
+    let console = args.iter().any(|a| a == "--console-boot");
+    assert!(!(diag && console), "--diag-boot and --console-boot are two images; build one");
+    let boot = match (diag, console) {
+        (true, _) => toyos_build::build::Boot::Diag,
+        (_, true) => toyos_build::build::Boot::Console,
+        _ => toyos_build::build::Boot::Normal,
     };
     assert!(
         !(dump_audio && profile == qemu::Profile::Metal),

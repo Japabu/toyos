@@ -406,6 +406,12 @@ pub enum Boot {
     /// `screen_diag_boot` boots this same config, so the tested image and the
     /// flashed image are the same image.
     Diag,
+    /// `console/system.toml`: `/bin/console` claims the framebuffer and runs
+    /// the shell on it. A third mode rather than a replacement for [`Diag`] —
+    /// claiming the screen is what stops the boot checkpoints painting, so a
+    /// machine that wedges before userland is readable in that mode and in no
+    /// other. `screen_console_shell` boots this config.
+    Console,
 }
 
 impl Boot {
@@ -413,6 +419,7 @@ impl Boot {
         match self {
             Self::Normal => "system.toml",
             Self::Diag => "diag/system.toml",
+            Self::Console => "console/system.toml",
         }
     }
 
@@ -424,6 +431,7 @@ impl Boot {
         match self {
             Self::Normal => "target/bootable.img",
             Self::Diag => "target/bootable-diag.img",
+            Self::Console => "target/bootable-console.img",
         }
     }
 }
