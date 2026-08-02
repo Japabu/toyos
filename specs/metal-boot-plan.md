@@ -261,6 +261,43 @@ bar; QEMU cannot.
   translation (filed); and coexistence of a USB and a PS/2 keyboard, which QEMU
   structurally cannot stage — it is argued from one shared held-set and tested
   in-kernel by `input_merge`.
+- **M2.5 — a console on the panel. BUILT.** `cargo run -- --console-boot`
+  builds `target/bootable-console.img`: `/bin/console` claims
+  `DEVICE_FRAMEBUFFER`, reuses `/bin/terminal`'s emulator (which never knew the
+  compositor was below it — `Console::new` always took a raw framebuffer), and
+  runs `/bin/shell` on the glass with the bytes the kernel already translates
+  off the i8042. It is what turns every further question about the T14 from a
+  reflash and a photograph into a typed command, and it is the first thing that
+  puts a character on that panel *from that keyboard*.
+
+  It starts with the boot log above the prompt. Claiming the framebuffer sets
+  `SCREEN_OWNED_BY_USERLAND`, after which `boot_checkpoint` never paints again,
+  so a console that merely cleared the screen would have traded the diagnostic
+  that works today for one that might. No syscall reads the kernel's log ring;
+  `esp_log` writes the same bytes to `/boot/toyos/kernel.log` and seeds that
+  sink from the ring's *retained* window, so the file starts at the boot's first
+  line. Measured on the first metal-sim boot: 6768 bytes, 87 kernel log rows on
+  the panel above the prompt, `i8042:` lines included.
+
+  A fatal panic still takes the screen back — `render` ignores
+  `SCREEN_OWNED_BY_USERLAND` entirely, only `boot_checkpoint` honours it — and
+  that is now staged rather than read: `screen_console_panic` triggers the panic
+  *through* the console, by typing at its prompt. Nothing had staged it before,
+  because `screen_fatal_halt` boots `tests/testcases`, whose init list has no
+  framebuffer claimer in it.
+
+  `screen_console_shell` is the gate that matters: it types `echo zqjxk` on the
+  emulated i8042 and asserts the *output* is a row of the panel. A
+  prompt-only assertion would pass on a console that cannot read the keyboard,
+  which is the path this exists to bring up.
+
+  What it does **not** answer, and only the laptop can: whether the T14's EC
+  produces bytes that *decode*. The last metal boot logged `1 bytes, 0 keys`,
+  and this program is downstream of that — it renders what
+  `kernel/src/keyboard.rs` translated, so a wire the driver reads wrongly types
+  nonsense here rather than nothing. The health line and
+  `i8042_undecoded_bytes` are still what name the byte; this is what makes the
+  answer readable without a reflash.
 - **M3 — USB image diet.** `hosted-rustc = false` (the initrd is 666 MB,
   rustc 478 MB of it; see `specs/boot-image-split.md`).
 - **M4 — real-firmware robustness.** Fragmented UEFI memory map vs the

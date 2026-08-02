@@ -2474,6 +2474,20 @@ Three things it does **not** give, in the order they will bite:
   exactly as silent as before. The mode answers "how far did the kernel get and
   what did it say", which is the i8042 question, and nothing else.
 
+  **`--console-boot` is the other half and does not replace this one.**
+  `/bin/console` claims the framebuffer, seeds its scrollback from
+  `/boot/toyos/kernel.log` so the boot log survives the claim, and puts a shell
+  underneath — so anything after `Boot: complete` is one typed command away.
+  What it cannot do is what diag exists for: claiming the screen is exactly
+  what stops `boot_checkpoint` painting, so a machine that wedges *before*
+  userland shows nothing at all in that mode. Two images, two questions.
+
+  Its own residuals: the seed is read once at startup, because the console
+  copies the shell's output to its own stdout and that is the ring `esp_log`
+  drains — a tail would feed itself; and it needs `/boot`, which
+  `mount_boot` gives only to a machine that booted from USB (below), so on
+  anything else the console starts with one line saying the log is not there.
+
   The one exception is deliberate and is the i8042's own health verdict
   (`d13efa6`). The driver now says once whether the pin it armed has ever
   asserted — a quiet verdict emitted from the first scheduler pass that finds a
