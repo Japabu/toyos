@@ -41,8 +41,11 @@ const CSW_LEN: u32 = 13;
 ///
 /// Both endpoints, always. A value of this type cannot describe an interface
 /// with one bulk endpoint or with an address this driver may not turn into a
-/// device context index, because [`Endpoint`] has one constructor and it is
-/// private to the parser — so `bind` has nothing left to check.
+/// device context index, because [`Endpoint`] carries a private field and so
+/// can only be built by its own constructor, in the parser — so `bind` has
+/// nothing left to check. The private *field* is what buys that; a private
+/// constructor beside public fields would leave `bind`'s own struct literal
+/// able to name any `dci` at all.
 pub struct MscInterface {
     pub iface_num: u8,
     pub in_ep: Endpoint,
@@ -630,7 +633,7 @@ pub fn bind(
         return false;
     };
 
-    let (in_dci, out_dci) = (info.in_ep.dci, info.out_ep.dci);
+    let (in_dci, out_dci) = (info.in_ep.dci(), info.out_ep.dci());
     let dma = ctrl.dma();
     let in_ring = TrbRing::init(dma.subslice(block + MSC_IN_RING, PAGE));
     let out_ring = TrbRing::init(dma.subslice(block + MSC_OUT_RING, PAGE));

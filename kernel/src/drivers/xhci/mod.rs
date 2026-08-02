@@ -592,8 +592,19 @@ impl XhciController {
         }
     }
 
-    fn write_ctx32(&self, ctx_base: *mut u8, slot_index: usize, dword: usize, val: u32) {
-        let offset = (slot_index * self.context_size) + (dword * 4);
+    /// One dword of one *device context*, in the input context `ctx_base`
+    /// points at: index 0 is the input control context, 1 the slot context,
+    /// and `dci + 1` an endpoint's. The old name for this parameter was
+    /// `slot_index`, which named the one thing no caller ever passes.
+    ///
+    /// No bound, and it needs none: `Endpoint::dci` is 2..=31 by construction
+    /// and its field is private, so the largest index any of the 23 call sites
+    /// can reach is 32, and `32 * 64 + 4 * 4` is 2064 bytes into the 4096 the
+    /// input context is. That sentence is what `Endpoint`'s private field is
+    /// for; before it, a struct literal under `xhci` could put this write
+    /// 12,880 bytes in.
+    fn write_ctx32(&self, ctx_base: *mut u8, ctx_index: usize, dword: usize, val: u32) {
+        let offset = (ctx_index * self.context_size) + (dword * 4);
         unsafe { write_volatile(ctx_base.add(offset) as *mut u32, val); }
     }
 }

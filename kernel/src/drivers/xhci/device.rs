@@ -19,13 +19,16 @@ const MAX_CONFIG_DESC: usize = 256;
 /// One endpoint from a configuration descriptor, which this driver has decided
 /// it can configure.
 ///
-/// [`Self::new`] is the only way to make one and is private to this module, so
-/// a `dci` that exists is a device context index the driver may write — and
-/// "does this endpoint exist" is `Option<Endpoint>` rather than a zero in a
-/// field. That is the whole point: the sentinel it replaces was the endpoint
-/// *address*, and one direction was guarded by design while the other was
-/// guarded by the accident that a zero address and the "not filled in yet"
-/// value are the same byte.
+/// [`Self::new`] is the only way to make one, and what enforces that is the
+/// *private field* below rather than the private `fn`: a constructor beside
+/// public fields constrains nothing, because a struct literal needs only that
+/// the struct and its fields be visible. With `dci` private, no module under
+/// `xhci` can build one — so a `dci` that exists is a device context index the
+/// driver may write, and "does this endpoint exist" is `Option<Endpoint>`
+/// rather than a zero in a field. That is the whole point: the sentinel it
+/// replaces was the endpoint *address*, and one direction was guarded by
+/// design while the other was guarded by the accident that a zero address and
+/// the "not filled in yet" value are the same byte.
 ///
 /// One type for both kinds, with a field each kind ignores, because the
 /// alternative is two types with two copies of the constructor — and the
@@ -33,7 +36,10 @@ const MAX_CONFIG_DESC: usize = 256;
 #[derive(Clone, Copy)]
 pub(super) struct Endpoint {
     pub(super) addr: u8,
-    pub(super) dci: u8,
+    /// 2..=31 by construction, and private so that stays true. `bind` shifts
+    /// `1u32` by this and indexes the input context with it, and `write_ctx32`
+    /// bounds neither.
+    dci: u8,
     pub(super) max_packet: u16,
     /// The SuperSpeed companion's burst size. Zero is legal and means one
     /// packet per burst, which is what a device that omits the companion means.
@@ -43,6 +49,10 @@ pub(super) struct Endpoint {
 }
 
 impl Endpoint {
+    pub(super) fn dci(&self) -> u8 {
+        self.dci
+    }
+
     /// `None` for an address naming endpoint 0, which is the check this type
     /// exists to make unforgettable. `0x80` and `0x10` are non-zero bytes and
     /// they resolve to DCI 1, EP0's own endpoint context, and DCI 0, the slot
@@ -397,7 +407,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         HidType::Mouse => "mouse",
         HidType::Tablet => "tablet",
     };
-    let int_ep_dci = info.ep.dci;
+    let int_ep_dci = info.ep.dci();
     log!("xHCI: HID {} iface={} ep={:#x} max_pkt={} interval={} dci={}",
         kind, info.iface_num, info.ep.addr, info.ep.max_packet, info.ep.interval, int_ep_dci);
 
@@ -535,8 +545,8 @@ pub fn selftest() {
 
     fn summarise(got: Option<(u8, Function)>) -> Verdict {
         match got? {
-            (cfg, Function::Hid(h)) => Some((1, cfg, h.ep.dci, 0)),
-            (cfg, Function::Msc(m)) => Some((2, cfg, m.in_ep.dci, m.out_ep.dci)),
+            (cfg, Function::Hid(h)) => Some((1, cfg, h.ep.dci(), 0)),
+            (cfg, Function::Msc(m)) => Some((2, cfg, m.in_ep.dci(), m.out_ep.dci())),
         }
     }
 
