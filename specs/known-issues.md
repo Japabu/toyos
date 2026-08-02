@@ -2038,6 +2038,40 @@ Either delete `src/toyos.rs` and let `stub.rs` serve, or drop the toyos gate in
 `map_anon`, are correct in the fork). Exactly one of the two should exist. Three
 real bugs in that module were found and fixed 2026-07-28 — see `forks.toml`.
 
+### cargo caches a *failed* `rustc -vV` and replays it until the file is deleted
+
+Found 2026-08-02, and it turned a two-minute window into a forty-minute one.
+Two agents ran `x.py build` in `rust/` concurrently; for the seconds during
+which `librustc_driver-*.dylib` was being replaced, loading it failed with
+`code signature ... not valid for use in process: library load disallowed by
+system policy`. Cargo probes the compiler with `rustc -vV` and memoises the
+result in `<target-dir>/.rustc_info.json` — **including that failure** — so
+every later build replayed the same error, with the same `dyld[84171]` pid in
+it, long after `rustc +toyos -vV` succeeded from a shell. The tell is exactly
+that: an unchanging pid in a message that claims to be from this run.
+
+`rm userland/libc/target/.rustc_info.json` cleared it. This is not repairing
+the toolchain — it is a cargo memo in a build target directory — but it looks
+like a toolchain failure and reads like one in the log, which is why it is
+recorded here. `src/toolchain.rs` drops `userland/libc/target/<triple>` on a
+rebuild for a neighbouring reason; `.rustc_info.json` sits one level above that
+and is not covered.
+
+Underneath it: nothing serialises `toolchain::ensure` across agents, so two
+`cargo test` runs in this tree can both decide the toolchain is stale and both
+start `x.py build` in the same directory. That is the window this defect needs.
+
+### Two C tests regressed with the 2026-08-02 toolchain upgrade
+
+`71_macro_empty_arg` prints nothing where `17` is expected, and
+`76_dollars_in_identifiers` loses its last line (`$$$=money`). Both compile;
+both are output mismatches, and both are shaped like variadics. `dbbdcbe`
+migrated `userland/libc/src/printf.rs` from `VaList::arg` to
+`VaList::next_arg` at every call site, which is the only change in the tree
+that can reach a `printf` result. Reproduced in isolation at `973141f`, twice
+each. Not investigated further here — recorded rather than fixed, per the
+workflow rule.
+
 ---
 
 ## 7. Design debt
