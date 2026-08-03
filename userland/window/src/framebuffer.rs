@@ -1,6 +1,8 @@
 use core::cell::Cell;
 use core::ptr;
 
+use crate::Rect;
+
 pub use font::Color;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -49,6 +51,12 @@ pub struct Screen {
     /// panel it is being asked about.
     written: Cell<u64>,
     blits: Cell<u64>,
+    /// Where the blits since the last [`Screen::take_damage`] landed.
+    ///
+    /// The surface is the one thing that sees every blit, so it is the one
+    /// thing that can answer "what changed" without its owner keeping a second
+    /// account that can disagree with the pixels.
+    damage: Cell<Option<Rect>>,
 }
 
 impl Screen {
@@ -64,7 +72,19 @@ impl Screen {
             pixel_format: PixelFormat::from_raw(pixel_format),
             written: Cell::new(0),
             blits: Cell::new(0),
+            damage: Cell::new(None),
         }
+    }
+
+    /// The area every blit since the last call landed in, and `None` when
+    /// there has been none.
+    ///
+    /// One rectangle rather than a list: what asks is a client about to name
+    /// its damage to the compositor, and one message describing one box is
+    /// cheaper than the pixels a second box would save at the sizes a client
+    /// dirties between two frames.
+    pub fn take_damage(&self) -> Option<Rect> {
+        self.damage.take()
     }
 
     pub fn width(&self) -> usize {
@@ -116,6 +136,11 @@ impl Screen {
         }
         self.written.set(self.written.get() + (row_bytes * h) as u64);
         self.blits.set(self.blits.get() + 1);
+        let painted = Rect { x: x as u32, y: y as u32, w: w as u32, h: h as u32 };
+        self.damage.set(Some(match self.damage.get() {
+            Some(prev) => prev.union(painted),
+            None => painted,
+        }));
     }
 }
 

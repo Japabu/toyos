@@ -753,6 +753,16 @@ impl Console {
         self.screen.traffic()
     }
 
+    /// Which pixels of the surface this console has repainted since the last
+    /// call, for a caller that has to name its damage to a compositor.
+    ///
+    /// `None` when nothing was repainted — a key that changed no cell, a drag
+    /// inside one — and a caller with nothing to hand over should hand nothing
+    /// over rather than a zero-sized rect.
+    pub fn take_damage(&self) -> Option<window::Rect> {
+        self.screen.take_damage()
+    }
+
     fn selection_range(&self) -> Option<(usize, usize)> {
         let (ac, ar) = self.sel_anchor?;
         let (ec, er) = self.sel_end?;

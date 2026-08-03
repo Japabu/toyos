@@ -6,7 +6,7 @@ use toyos::ipc::RxStep;
 use toyos::{gpu, ipc, services, system, Connection, Keyboard, Mouse, FramebufferDev};
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos_abi::Fd;
-use window::{Color, Framebuffer, Traffic};
+use window::{Color, Framebuffer, Screen, Traffic};
 
 const TITLE_BAR_HEIGHT: usize = 28;
 const BORDER_WIDTH: usize = 1;
@@ -465,6 +465,111 @@ impl DirtyRect {
         self.x < other.x + other.w && self.x + self.w > other.x
             && self.y < other.y + other.h && self.y + self.h > other.y
     }
+
+    fn contains(self, other: Self) -> bool {
+        other.x >= self.x
+            && other.y >= self.y
+            && other.x + other.w <= self.x + self.w
+            && other.y + other.h <= self.y + self.h
+    }
+
+    fn area(self) -> usize {
+        self.w * self.h
+    }
+
+    fn is_empty(self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    /// The part of `self` above `y`, which is where the wallpaper stops and
+    /// the taskbar starts.
+    fn above(self, y: usize) -> Self {
+        Self { h: self.h.min(y.saturating_sub(self.y)), ..self }
+    }
+}
+
+/// Where the desktop changed since the last composited frame.
+///
+/// A list rather than one bounding box, and that is the whole of why the clock
+/// ticking no longer repaints a window in the middle of the screen: two damaged
+/// regions far apart used to be unioned into everything between them, so a
+/// character typed into a terminal at the same moment as the taskbar's second
+/// cost a repaint of both plus the gap.
+///
+/// Bounded, because damage arrives from clients and a list that grew with it
+/// would be a client deciding how much the compositor allocates. Past the bound
+/// the two rects whose union wastes the fewest pixels are merged, which is the
+/// same trade one bounding box makes and only where the budget runs out.
+#[derive(Default)]
+struct Damage {
+    rects: Vec<DirtyRect>,
+}
+
+/// How many disjoint regions one frame may carry.
+///
+/// Policy. The shapes it has to hold without merging are the ones a desktop
+/// produces every frame: the cursor's two positions, a window's old and new
+/// place while it is dragged, the taskbar's clock, and a client's own damage.
+/// That is five; eight leaves room for a second window doing the same.
+const MAX_DAMAGE_RECTS: usize = 8;
+
+impl Damage {
+    fn add(&mut self, r: DirtyRect) {
+        if r.is_empty() {
+            return;
+        }
+        // Merge into anything it touches, then re-check: a rect can bridge two
+        // that were disjoint, and leaving them separate would blit the overlap
+        // twice.
+        let mut merged = r;
+        let mut i = 0;
+        while i < self.rects.len() {
+            if self.rects[i].contains(merged) {
+                return;
+            }
+            if self.rects[i].overlaps(merged) || merged.contains(self.rects[i]) {
+                merged = merged.union(self.rects.swap_remove(i));
+                i = 0;
+                continue;
+            }
+            i += 1;
+        }
+        self.rects.push(merged);
+        while self.rects.len() > MAX_DAMAGE_RECTS {
+            self.merge_cheapest();
+        }
+    }
+
+    /// Union the pair whose combined box wastes the fewest pixels.
+    fn merge_cheapest(&mut self) {
+        let mut best = (0usize, 1usize, usize::MAX);
+        for a in 0..self.rects.len() {
+            for b in a + 1..self.rects.len() {
+                let waste = self.rects[a].union(self.rects[b]).area()
+                    - self.rects[a].area()
+                    - self.rects[b].area();
+                if waste < best.2 {
+                    best = (a, b, waste);
+                }
+            }
+        }
+        let (a, b, _) = best;
+        let second = self.rects.swap_remove(b);
+        self.rects[a] = self.rects[a].union(second);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
+
+    fn take(&mut self, screen_w: usize, screen_h: usize) -> Vec<DirtyRect> {
+        let mut out = core::mem::take(&mut self.rects);
+        out.retain_mut(|r| {
+            *r = r.clamp(screen_w, screen_h);
+            !r.is_empty()
+        });
+        out
+    }
 }
 
 fn window_screen_rect(win: &WindowState) -> DirtyRect {
@@ -475,12 +580,72 @@ fn window_screen_rect(win: &WindowState) -> DirtyRect {
     DirtyRect { x, y, w, h }
 }
 
-fn mark_dirty(dirty_rect: &mut Option<DirtyRect>, r: DirtyRect) {
-    *dirty_rect = Some(match dirty_rect.take() {
-        Some(old) => old.union(r),
-        None => r,
-    });
+/// Whether everything inside `win`'s screen rect comes from `win`.
+///
+/// False while a drag-resize is ahead of the buffer the client was given: the
+/// content blit is clipped to the buffer, so the rest of the rect is whatever
+/// was under it and the wallpaper below still has to be composed.
+fn window_is_opaque(win: &WindowState) -> bool {
+    !win.minimized && win.width <= win.buf_width && win.height <= win.buf_height
 }
+
+/// Damage every window and the taskbar, for a change that reorders or
+/// re-focuses them.
+///
+/// Bounded by what is on screen rather than by the screen: two small windows
+/// cost those two and the bar, where the full-screen repaint this replaces
+/// cost the wallpaper under everything as well. Minimized windows are damaged
+/// too — one of them may be the window that just stopped being minimized, and
+/// a caller that had to know which is a caller that will one day be wrong.
+fn damage_windows(
+    damage: &mut Damage,
+    windows: &[WindowState],
+    screen_w: usize,
+    screen_h: usize,
+) {
+    for win in windows {
+        damage.add(window_screen_rect(win));
+    }
+    damage.add(taskbar_rect(screen_w, screen_h));
+}
+
+fn launcher_dirty(windows: &[WindowState], screen_h: i32) -> DirtyRect {
+    let (lx, ly, lw, lh) = launcher_rect(windows, screen_h);
+    DirtyRect {
+        x: lx.max(0) as usize,
+        y: ly.max(0) as usize,
+        w: lw.max(0) as usize,
+        h: lh.max(0) as usize,
+    }
+}
+
+fn taskbar_rect(screen_w: usize, screen_h: usize) -> DirtyRect {
+    DirtyRect { x: 0, y: screen_h - TASKBAR_HEIGHT, w: screen_w, h: TASKBAR_HEIGHT }
+}
+
+/// The taskbar's right-hand status readout — memory, CPU and the clock.
+///
+/// A fixed box rather than one sized to the text: it is repainted once a
+/// second for the clock, and a rect that moved with the string's length would
+/// leave the tail of a longer one behind. [`MAX_STATUS_CHARS`] is what the box
+/// is wide enough for, and a longer string is truncated to it.
+fn status_rect(screen_w: usize, screen_h: usize, font_w: usize) -> DirtyRect {
+    let w = MAX_STATUS_CHARS * font_w + STATUS_MARGIN * 2;
+    DirtyRect {
+        x: screen_w.saturating_sub(w),
+        y: screen_h - TASKBAR_HEIGHT,
+        w: w.min(screen_w),
+        h: TASKBAR_HEIGHT,
+    }
+}
+
+/// Widest status readout the taskbar will show.
+///
+/// `"65536M/65536M  CPU 100%  23:59"` is 30 characters at the largest figures
+/// a machine this runs on produces, and `used_mb` is bounded by `total_mb`.
+/// Four more so a bigger machine truncates rather than overflows its box.
+const MAX_STATUS_CHARS: usize = 34;
+const STATUS_MARGIN: usize = 12;
 
 /// Why a client is going.
 ///
@@ -633,8 +798,16 @@ enum Interaction {
 
 const DRAG_THRESHOLD: i32 = 5;
 
-fn redraw(
-    screen: &Framebuffer,
+/// Compose `region` of the desktop into `back`.
+///
+/// `back` is system RAM and the panel is not touched here: the frame is
+/// finished first and handed over whole, which is why nothing on screen is
+/// ever half-composed. Composing against the scanout also made every
+/// `fill_rect` read the row it was replicating back out of the panel, and
+/// under both memory types firmware maps a framebuffer with, a read is
+/// uncached.
+fn compose(
+    back: &Framebuffer,
     font: &font::Font,
     windows: &[WindowState],
     icons: &TitleBarIcons,
@@ -643,32 +816,47 @@ fn redraw(
     stats: &SystemStats,
     region: DirtyRect,
 ) {
-    // Only blit wallpaper within the dirty region
-    let wp_offset = (region.y * screen.width() + region.x) * 4;
-    screen.blit(region.x, region.y, region.w, region.h, screen.width(), &wallpaper[wp_offset..]);
-
     let focused_idx = focused_window_idx(windows);
+    let bar = taskbar_rect(back.width(), back.height());
+
+    // The wallpaper is the bottom layer, so any of it under something opaque
+    // is composed and then thrown away. The taskbar covers its strip always,
+    // and a window that is not mid-resize covers its own rect.
+    let uncovered = region.above(bar.y);
+    let hidden = windows
+        .iter()
+        .any(|w| window_is_opaque(w) && window_screen_rect(w).contains(uncovered));
+    if !uncovered.is_empty() && !hidden {
+        let wp_offset = (uncovered.y * back.width() + uncovered.x) * 4;
+        back.blit(
+            uncovered.x,
+            uncovered.y,
+            uncovered.w,
+            uncovered.h,
+            back.width(),
+            &wallpaper[wp_offset..],
+        );
+    }
 
     for (i, win) in windows.iter().enumerate() {
         if win.minimized {
             continue;
         }
         if region.overlaps(window_screen_rect(win)) {
-            draw_window(screen, font, win, Some(i) == focused_idx, icons, region);
+            draw_window(back, font, win, Some(i) == focused_idx, icons, region);
         }
     }
 
-    let taskbar_rect = DirtyRect { x: 0, y: screen.height() - TASKBAR_HEIGHT, w: screen.width(), h: TASKBAR_HEIGHT };
-    if region.overlaps(taskbar_rect) {
-        draw_taskbar(screen, font, windows, focused_idx, stats);
+    if region.overlaps(bar) {
+        draw_taskbar(back, font, windows, focused_idx, stats, region);
     }
 
     // Draw launcher popup last so it's always on top of windows
     if launcher_open {
-        let (lx, ly, lw, lh) = launcher_rect(windows, screen.height() as i32);
+        let (lx, ly, lw, lh) = launcher_rect(windows, back.height() as i32);
         let launcher_dirty = DirtyRect { x: lx as usize, y: ly as usize, w: lw as usize, h: lh as usize };
         if region.overlaps(launcher_dirty) {
-            draw_launcher(screen, font, lx as usize, ly as usize, lw as usize, lh as usize);
+            draw_launcher(back, font, lx as usize, ly as usize, lw as usize, lh as usize);
         }
     }
 }
@@ -752,23 +940,70 @@ struct SystemStats {
     cpu_pct: u64,
 }
 
+/// The desktop as it will look, one screen of system RAM.
+///
+/// Everything composes here and the panel receives finished rectangles, which
+/// is the whole of "nothing composes against the scanout" for this process.
+/// `surface` points into `pixels`, so the two are replaced together and the
+/// vector is never grown.
+struct BackBuffer {
+    pixels: Vec<u8>,
+    surface: Framebuffer,
+}
+
+impl BackBuffer {
+    fn new(width: usize, height: usize, pixel_format: u32) -> Self {
+        let mut pixels = vec![0u8; width * height * 4];
+        let surface = Framebuffer::new(pixels.as_mut_ptr(), width, height, width, pixel_format);
+        Self { pixels, surface }
+    }
+
+    /// The rows of `region`, ready to hand to the panel.
+    fn region(&self, region: DirtyRect) -> &[u8] {
+        &self.pixels[(region.y * self.surface.width() + region.x) * 4..]
+    }
+}
+
+/// Paint the parts of the taskbar `clip` reaches.
+///
+/// Every element tests `clip` for itself. The clock ticks once a second and
+/// nothing else about the bar changes with it, so a bar that repainted whole
+/// for the clock was a second's worth of tabs and titles per second — visible
+/// as a flicker for as long as it was composed straight onto the panel, and
+/// wasted work afterwards.
 fn draw_taskbar(
-    screen: &Framebuffer,
+    back: &Framebuffer,
     font: &font::Font,
     windows: &[WindowState],
     focused_idx: Option<usize>,
     stats: &SystemStats,
+    clip: DirtyRect,
 ) {
-    let screen_w = screen.width();
-    let screen_h = screen.height();
+    let screen_w = back.width();
+    let screen_h = back.height();
     let taskbar_y = screen_h - TASKBAR_HEIGHT;
-    screen.fill_rect(0, taskbar_y, screen_w, TASKBAR_HEIGHT, TASKBAR_COLOR);
-
     let text_y = taskbar_y + (TASKBAR_HEIGHT - 16) / 2;
+    let strip = |x: usize, w: usize| DirtyRect { x, y: taskbar_y, w, h: TASKBAR_HEIGHT };
+
+    let tabs_end = (windows.len() * TASKBAR_ITEM_WIDTH + TASKBAR_HEIGHT).min(screen_w);
+    let status = status_rect(screen_w, screen_h, font.width());
+    // The bar's own background, where no tab and no status box will cover it.
+    let gap = DirtyRect {
+        x: tabs_end,
+        y: taskbar_y,
+        w: status.x.saturating_sub(tabs_end),
+        h: TASKBAR_HEIGHT,
+    };
+    if clip.overlaps(gap) {
+        back.fill_rect(gap.x, gap.y, gap.w, gap.h, TASKBAR_COLOR);
+    }
 
     for (i, win) in windows.iter().enumerate() {
-        let focused = Some(i) == focused_idx;
         let tab_x = i * TASKBAR_ITEM_WIDTH;
+        if !clip.overlaps(strip(tab_x, TASKBAR_ITEM_WIDTH)) {
+            continue;
+        }
+        let focused = Some(i) == focused_idx;
         let (bg, fg) = if win.minimized {
             (TASKBAR_MINIMIZED_COLOR, TASKBAR_MINIMIZED_TEXT)
         } else if focused {
@@ -776,7 +1011,8 @@ fn draw_taskbar(
         } else {
             (TASKBAR_COLOR, TASKBAR_TEXT_COLOR)
         };
-        screen.fill_rect(
+        back.fill_rect(tab_x, taskbar_y, TASKBAR_ITEM_WIDTH, TASKBAR_HEIGHT, TASKBAR_COLOR);
+        back.fill_rect(
             tab_x + 1,
             taskbar_y + TASKBAR_PADDING,
             TASKBAR_ITEM_WIDTH - 2,
@@ -786,34 +1022,38 @@ fn draw_taskbar(
         let max_chars = (TASKBAR_ITEM_WIDTH - 16) / font.width();
         let title = if win.title.is_empty() { "Window" } else { &win.title };
         let display: String = title.chars().take(max_chars).collect();
-        font.draw_string(screen, tab_x + 8, text_y, &display, fg, bg);
+        font.draw_string(back, tab_x + 8, text_y, &display, fg, bg);
     }
 
     // "+" button after window tabs
     let new_x = windows.len() * TASKBAR_ITEM_WIDTH;
-    screen.fill_rect(
-        new_x + 1,
-        taskbar_y + TASKBAR_PADDING,
-        TASKBAR_HEIGHT - 2,
-        TASKBAR_HEIGHT - TASKBAR_PADDING * 2,
-        TASKBAR_NEW_COLOR,
-    );
-    let plus_x = new_x + (TASKBAR_HEIGHT - 8) / 2;
-    font.draw_char(screen, plus_x, text_y, '+', TASKBAR_NEW_TEXT, TASKBAR_NEW_COLOR);
+    if clip.overlaps(strip(new_x, TASKBAR_HEIGHT)) {
+        back.fill_rect(new_x, taskbar_y, TASKBAR_HEIGHT, TASKBAR_HEIGHT, TASKBAR_COLOR);
+        back.fill_rect(
+            new_x + 1,
+            taskbar_y + TASKBAR_PADDING,
+            TASKBAR_HEIGHT - 2,
+            TASKBAR_HEIGHT - TASKBAR_PADDING * 2,
+            TASKBAR_NEW_COLOR,
+        );
+        let plus_x = new_x + (TASKBAR_HEIGHT - 8) / 2;
+        font.draw_char(back, plus_x, text_y, '+', TASKBAR_NEW_TEXT, TASKBAR_NEW_COLOR);
+    }
 
-    // System stats + clock on the right
-    let time = system::clock_realtime();
-    let hours = time.hours;
-    let minutes = time.minutes;
-
-    let status_str = format!(
-        "{}M/{}M  CPU {}%  {:02}:{:02}",
-        stats.used_mb, stats.total_mb, stats.cpu_pct, hours, minutes
-    );
-    let status_w = status_str.len() * font.width();
-    let status_x = screen_w - status_w - 12;
-    font.draw_string(screen, status_x, text_y, &status_str, TASKBAR_ACTIVE_TEXT, TASKBAR_COLOR);
-
+    if clip.overlaps(status) {
+        let time = system::clock_realtime();
+        let status_str: String = format!(
+            "{}M/{}M  CPU {}%  {:02}:{:02}",
+            stats.used_mb, stats.total_mb, stats.cpu_pct, time.hours, time.minutes
+        )
+        .chars()
+        .take(MAX_STATUS_CHARS)
+        .collect();
+        back.fill_rect(status.x, status.y, status.w, status.h, TASKBAR_COLOR);
+        let status_w = status_str.chars().count() * font.width();
+        let status_x = status.x + status.w - STATUS_MARGIN - status_w;
+        font.draw_string(back, status_x, text_y, &status_str, TASKBAR_ACTIVE_TEXT, TASKBAR_COLOR);
+    }
 }
 
 fn draw_launcher(screen: &Framebuffer, font: &font::Font, x: usize, y: usize, w: usize, h: usize) {
@@ -851,7 +1091,10 @@ fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite, hw_cursor: bool) 
     }
 }
 
-/// Draw the cursor sprite directly into the framebuffer (software cursor fallback).
+/// Draw the cursor sprite into the composed frame (software cursor fallback).
+///
+/// It blends, so it reads the pixel under every partly transparent one — which
+/// is why it draws into the back buffer and not the panel.
 fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, cy: i32) {
     let data = sprite.data();
     let sw = sprite.width();
@@ -890,31 +1133,35 @@ fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, 
 /// says nothing with no clients.
 ///
 /// Here to be read off `/log/kernel.log` on a machine whose only other
-/// instrument is the panel. `scanout_rd_bytes` is what it is for: the
-/// compositor composes *against* the scanout, so `fill_rect` reads back every
-/// row it replicates and a blended cursor pixel reads the pixel under it, and
-/// on hardware — unlike QEMU, where the framebuffer is host RAM — those reads
-/// are uncached. Composing in RAM and blitting damage would hold it at zero.
+/// instrument is the panel. `damage_px_max` is the one to read first: it is the
+/// largest single frame any interval contained, so it says whether one typed
+/// character, one clock tick or one dragged window still costs a repaint of
+/// something much larger than itself. `damage_px` over `frames` is the average
+/// of the same question.
 ///
-/// Both byte figures are lower bounds, and for one reason: they count what
-/// went through `Framebuffer`. Glyphs go through `put_pixel`, which is
-/// uncounted by design, and the title-bar icons are handed `screen.ptr()` and
-/// blend through it — reading the scanout as well as writing it — outside the
-/// counters entirely.
+/// There is no scanout *read* figure because there is nothing that could
+/// produce one: the panel is held as a [`Screen`], which returns no pixel and
+/// hands out no pointer. `back_rd_bytes` is where the reads went instead — the
+/// cursor's blend and `fill_rect`'s row replication, in system RAM.
 #[derive(Default)]
 struct FrameStats {
     frames: u32,
     cursor_draws: u32,
+    rects: u32,
+    damage_px: u64,
+    damage_px_max: u64,
     composite_ns_min: u64,
     composite_ns_max: u64,
     composite_ns_total: u64,
 }
 
 impl FrameStats {
-    /// `composite_ns` covers the redraw and the software cursor, not the
-    /// `present` that follows: that one is a syscall, and mixing it in would
-    /// hide the cost this is aimed at.
-    fn record(&mut self, composite_ns: u64) {
+    /// `composite_ns` covers composing every region of the frame, the software
+    /// cursor and the blits that carry them to the panel — everything between
+    /// one frame's damage being taken and it being on screen. Not the
+    /// `gpu::present` calls that follow: those are syscalls, and on the
+    /// firmware framebuffer they do nothing at all.
+    fn record(&mut self, composite_ns: u64, rects: usize, damage_px: usize) {
         self.composite_ns_min = if self.frames == 0 {
             composite_ns
         } else {
@@ -922,24 +1169,31 @@ impl FrameStats {
         };
         self.composite_ns_max = self.composite_ns_max.max(composite_ns);
         self.composite_ns_total += composite_ns;
+        self.rects += rects as u32;
+        self.damage_px += damage_px as u64;
+        self.damage_px_max = self.damage_px_max.max(damage_px as u64);
         self.frames += 1;
     }
 
-    /// `moved` is the scanout traffic of this window alone. Totals rather than
-    /// a mean: with `frames` beside it the mean is a division, and the total is
-    /// the share of the window that compositing cost, which the mean is not.
-    fn report(&self, moved: Traffic, windows: usize) {
+    /// `moved` is the panel traffic of this window alone and `composed` the
+    /// back buffer's. Totals rather than means: with `frames` beside them the
+    /// mean is a division, and the total is the share of the window that
+    /// compositing cost, which the mean is not.
+    fn report(&self, moved: (u64, u64), composed: Traffic, windows: usize) {
         eprintln!(
-            "compositor: frames={} composite_us_min={} composite_us_max={} composite_us_total={} \
-             scanout_wr_bytes={} scanout_rd_bytes={} rd_px={} rd_bulk={} cursor={} windows={}",
+            "compositor: frames={} rects={} damage_px={} damage_px_max={} \
+             composite_us_min={} composite_us_max={} composite_us_total={} \
+             scanout_wr_bytes={} scanout_blits={} back_rd_bytes={} cursor={} windows={}",
             self.frames,
+            self.rects,
+            self.damage_px,
+            self.damage_px_max,
             self.composite_ns_min / 1_000,
             self.composite_ns_max / 1_000,
             self.composite_ns_total / 1_000,
-            moved.written,
-            moved.read,
-            moved.pixel_reads,
-            moved.bulk_reads,
+            moved.0,
+            moved.1,
+            composed.read,
             self.cursor_draws,
             windows,
         );
@@ -956,13 +1210,14 @@ fn main() {
     let mut fb_info = fb_dev.info().expect("failed to read framebuffer info");
     let fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
     let mut fb_shm = SharedMemory::map(fb_info.token[0], fb_size);
-    let mut screen = Framebuffer::new(
+    let mut screen = Screen::new(
         fb_shm.as_ptr(),
         fb_info.width as usize,
         fb_info.height as usize,
         fb_info.stride as usize,
         fb_info.pixel_format,
     );
+    let mut back = BackBuffer::new(screen.width(), screen.height(), screen.pixel_format_raw());
 
     // Set up cursor
     let hw_cursor = fb_info.flags & FLAG_HARDWARE_CURSOR != 0;
@@ -1027,7 +1282,8 @@ fn main() {
     if hw_cursor {
         gpu::move_cursor(cursor_x as u32, cursor_y as u32).expect("compositor owns the framebuffer");
     }
-    let mut dirty_rect: Option<DirtyRect> = Some(DirtyRect::full(screen_w as usize, screen_h as usize));
+    let mut damage = Damage::default();
+    damage.add(DirtyRect::full(screen_w as usize, screen_h as usize));
     let mut prev_buttons: u8 = 0;
     let mut interaction = Interaction::None;
     let mut last_title_click_time = Instant::now();
@@ -1042,6 +1298,7 @@ fn main() {
     let mut cached_stats = SystemStats { used_mb: 0, total_mb: 0, cpu_pct: 0 };
     let mut frame_stats = FrameStats::default();
     let mut reported_traffic = screen.traffic();
+    let mut reported_composed = back.surface.traffic();
     let mut next_frame_stats = Instant::now() + STATS_INTERVAL;
 
     // Every token is its fd number, system and client alike; the dispatch
@@ -1125,7 +1382,7 @@ fn main() {
                 if launcher_open && event.pressed() && event.keycode == 0x29 {
                     // Escape: close launcher
                     launcher_open = false;
-                    mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                    damage.add(launcher_dirty(&windows, screen_h));
                 } else if event.pressed() && event.alt() && event.keycode == 0x2B {
                     // Alt+Tab: rotate focus among non-topmost windows
                     let first_topmost = windows.iter().position(|w| w.topmost).unwrap_or(windows.len());
@@ -1136,11 +1393,17 @@ fn main() {
                         if first_topmost > 0 {
                             windows[first_topmost - 1].minimized = false;
                         }
-                        mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                        damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                     }
                 } else if event.pressed() && event.gui() {
                     if let Some(idx) = focused_window_idx(&windows) {
                         let pixel_format = screen.pixel_format_raw();
+                        // Which of these move a window, so the rest — a paste,
+                        // a combo forwarded to the app — cost the desktop
+                        // nothing. Taken before the match, because the rect a
+                        // window is vacating is only knowable there.
+                        let moves = matches!(event.keycode, 0x50 | 0x4F | 0x52 | 0x51 | 0x14);
+                        let vacated = window_screen_rect(&windows[idx]);
                         match event.keycode {
                             0x50 => {
                                 // Super+Left: snap left or restore
@@ -1232,7 +1495,15 @@ fn main() {
                                 deliver(&mut dead, &windows[idx], window::MSG_KEY_INPUT, event);
                             }
                         }
-                        mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                        if moves {
+                            damage.add(vacated);
+                            damage_windows(
+                                &mut damage,
+                                &windows,
+                                screen_w as usize,
+                                screen_h as usize,
+                            );
+                        }
                     }
                 } else if event.pressed() && event.ctrl() && event.keycode == 0x11 {
                     // Ctrl+N: spawn terminal
@@ -1289,8 +1560,8 @@ fn main() {
                     // Software cursor: mark old and new cursor regions dirty
                     let cw = 20usize;
                     let ch = 20usize;
-                    mark_dirty(&mut dirty_rect, DirtyRect { x: old_cursor_x as usize, y: old_cursor_y as usize, w: cw, h: ch });
-                    mark_dirty(&mut dirty_rect, DirtyRect { x: cursor_x as usize, y: cursor_y as usize, w: cw, h: ch });
+                    damage.add(DirtyRect { x: old_cursor_x as usize, y: old_cursor_y as usize, w: cw, h: ch });
+                    damage.add(DirtyRect { x: cursor_x as usize, y: cursor_y as usize, w: cw, h: ch });
                 }
 
                 // Cursor deltas for drag/resize operations
@@ -1346,16 +1617,18 @@ fn main() {
                     match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
+                            damage.add(window_screen_rect(&win));
                             let _ = win.fd.try_signal(window::MSG_WINDOW_CLOSE);
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                         }
                         HitZone::MinimizeButton(idx) => {
                             windows[idx].minimized = true;
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                         }
                         HitZone::MaximizeButton(idx) => {
                             let new_idx = bring_to_front(&mut windows, idx);
                             let pixel_format = screen.pixel_format_raw();
+                            damage.add(window_screen_rect(&windows[new_idx]));
                             if windows[new_idx].mode != WindowMode::Normal {
                                 restore_window(&mut windows[new_idx], pixel_format, &mut dead);
                             } else {
@@ -1367,10 +1640,11 @@ fn main() {
                                     &mut dead,
                                 );
                             }
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                         }
                         HitZone::TitleBar(idx) => {
                             let new_idx = bring_to_front(&mut windows, idx);
+                            damage.add(window_screen_rect(&windows[new_idx]));
 
                             // Double-click detection
                             let now = Instant::now();
@@ -1409,20 +1683,28 @@ fn main() {
                                     };
                                 }
                             }
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                         }
                         HitZone::ResizeCorner(idx) => {
                             let new_idx = bring_to_front(&mut windows, idx);
                             interaction = Interaction::Resizing {
                                 window_idx: new_idx,
                             };
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                         }
                         HitZone::Content(idx) => {
-                            launcher_open = false;
+                            if launcher_open {
+                                launcher_open = false;
+                                damage.add(launcher_dirty(&windows, screen_h));
+                            }
                             let new_idx = bring_to_front(&mut windows, idx);
                             if new_idx != idx {
-                                mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                                damage_windows(
+                                    &mut damage,
+                                    &windows,
+                                    screen_w as usize,
+                                    screen_h as usize,
+                                );
                             }
                             let win = &windows[new_idx];
                             let ev = make_mouse_event(win, window::MOUSE_PRESS, 1, 0);
@@ -1438,22 +1720,23 @@ fn main() {
                                 } else {
                                     bring_to_front(&mut windows, idx);
                                 }
-                                mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                                damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                             }
                         }
                         HitZone::TaskbarNew => {
                             launcher_open = !launcher_open;
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            damage.add(launcher_dirty(&windows, screen_h));
+                            damage.add(taskbar_rect(screen_w as usize, screen_h as usize));
                         }
                         HitZone::LauncherItem(idx) => {
                             Command::new(LAUNCHER_APPS[idx].path).spawn().ok();
                             launcher_open = false;
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            damage.add(launcher_dirty(&windows, screen_h));
                         }
                         HitZone::Desktop => {
                             if launcher_open {
                                 launcher_open = false;
-                                mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                                damage.add(launcher_dirty(&windows, screen_h));
                             }
                         }
                     }
@@ -1472,6 +1755,7 @@ fn main() {
                         Interaction::Dragging { window_idx } => {
                             // Snap detection on drag release
                             let pixel_format = screen.pixel_format_raw();
+                            damage.add(window_screen_rect(&windows[window_idx]));
                             if cursor_x <= 2 {
                                 snap_left(
                                     &mut windows[window_idx],
@@ -1497,7 +1781,7 @@ fn main() {
                                     &mut dead,
                                 );
                             }
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                         }
                         Interaction::Resizing { window_idx } => {
                             let pixel_format = screen.pixel_format_raw();
@@ -1505,7 +1789,7 @@ fn main() {
                             let new_w = win.width;
                             let new_h = win.height;
                             resize_window(win, new_w, new_h, pixel_format, &mut dead);
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                         }
                         Interaction::None => {}
                     }
@@ -1540,10 +1824,7 @@ fn main() {
                                         .max(BORDER_WIDTH);
                                     win.content_y = (cursor_y as usize)
                                         .max(BORDER_WIDTH + TITLE_BAR_HEIGHT);
-                                    mark_dirty(
-                                        &mut dirty_rect,
-                                        DirtyRect::full(screen_w as usize, screen_h as usize),
-                                    );
+                                    damage.add(DirtyRect::full(screen_w as usize, screen_h as usize));
                                 }
                                 interaction = Interaction::Dragging { window_idx };
                             }
@@ -1558,7 +1839,7 @@ fn main() {
                             win.content_y =
                                 (win.content_y as i32 + cursor_dy).max(min_y) as usize;
                             let new_rect = window_screen_rect(&windows[window_idx]);
-                            mark_dirty(&mut dirty_rect, old_rect.union(new_rect));
+                            damage.add(old_rect.union(new_rect));
                         }
                         Interaction::Resizing { window_idx } => {
                             let old_rect = window_screen_rect(&windows[window_idx]);
@@ -1570,7 +1851,7 @@ fn main() {
                                 .max(MIN_CONTENT_HEIGHT as i32)
                                 as usize;
                             let new_rect = window_screen_rect(&windows[window_idx]);
-                            mark_dirty(&mut dirty_rect, old_rect.union(new_rect));
+                            damage.add(old_rect.union(new_rect));
                         }
                         Interaction::None => {
                             // Forward mouse move to focused app for drag selection
@@ -1803,18 +2084,39 @@ fn main() {
                             pixel_format,
                         },
                     );
-                    mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w, screen_h));
+                    damage_windows(&mut damage, &windows, screen_w, screen_h);
                 }
                 window::MSG_PRESENT => {
+                    // The rect is the client's claim about its own buffer and
+                    // is clamped to the window rather than believed: a bad one
+                    // is a client scribbling on the desktop, and there is no
+                    // reading of it that is worth a repaint of the screen.
+                    let Ok(rect) = ipc::decode_payload::<window::Rect>(payload) else {
+                        mark_dead(&mut dead, client_fd, client_pid, DropReason::OutOfProtocol);
+                        continue;
+                    };
                     if let Some(win) = windows.iter_mut().find(|w| w.fd.fd() == client_fd) {
                         win.presented = true;
-                        mark_dirty(&mut dirty_rect, window_screen_rect(win));
+                        let local = DirtyRect {
+                            x: rect.x as usize,
+                            y: rect.y as usize,
+                            w: rect.w as usize,
+                            h: rect.h as usize,
+                        }
+                        .clamp(win.width, win.height);
+                        damage.add(DirtyRect {
+                            x: win.content_x + local.x,
+                            y: win.content_y + local.y,
+                            w: local.w,
+                            h: local.h,
+                        });
                     }
                 }
                 window::MSG_DESTROY_WINDOW => {
                     if let Some(idx) = windows.iter().position(|w| w.fd.fd() == client_fd) {
-                        windows.remove(idx);
-                        mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                        let gone = windows.remove(idx);
+                        damage.add(window_screen_rect(&gone));
+                        damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                     }
                 }
                 window::MSG_CLIPBOARD_SET => {
@@ -1861,16 +2163,22 @@ fn main() {
                             fb_info = new_fb_info;
                             let new_fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
                             fb_shm = SharedMemory::map(fb_info.token[0], new_fb_size);
-                            screen = Framebuffer::new(
+                            screen = Screen::new(
                                 fb_shm.as_ptr(),
                                 fb_info.width as usize,
                                 fb_info.height as usize,
                                 fb_info.stride as usize,
                                 fb_info.pixel_format,
                             );
+                            back = BackBuffer::new(
+                                screen.width(),
+                                screen.height(),
+                                screen.pixel_format_raw(),
+                            );
                             // The counters belong to the mapping, and this is a
                             // new one starting at zero.
                             reported_traffic = screen.traffic();
+                            reported_composed = back.surface.traffic();
                             screen_w = screen.width() as i32;
                             screen_h = screen.height() as i32;
                             // What a window costs moved, so what we can afford
@@ -1912,7 +2220,7 @@ fn main() {
                             cursor_x = cursor_x.min(screen_w - 1);
                             cursor_y = cursor_y.min(screen_h - 1);
 
-                            mark_dirty(&mut dirty_rect, DirtyRect::full(sw, sh));
+                            damage.add(DirtyRect::full(sw, sh));
 
                             window::ResolutionInfo { width: fb_info.width, height: fb_info.height }
                         }
@@ -1946,10 +2254,20 @@ fn main() {
         }
         if !dead.is_empty() {
             let before = windows.len();
+            // The rect a dropped window vacates is only knowable while it is
+            // still in the list.
+            let vacated: Vec<DirtyRect> = windows
+                .iter()
+                .filter(|w| dead.iter().any(|(fd, _, _)| *fd == w.fd.fd()))
+                .map(window_screen_rect)
+                .collect();
             windows.retain(|w| !dead.iter().any(|(fd, _, _)| *fd == w.fd.fd()));
             pending.retain(|p| !dead.iter().any(|(fd, _, _)| *fd == p.conn.fd()));
             if windows.len() != before {
-                mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                for rect in vacated {
+                    damage.add(rect);
+                }
+                damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
             }
         }
 
@@ -2003,44 +2321,88 @@ fn main() {
                 };
             }
 
-            let taskbar_dirty = DirtyRect {
-                x: 0, y: screen_h as usize - TASKBAR_HEIGHT,
-                w: screen_w as usize, h: TASKBAR_HEIGHT,
-            };
-            mark_dirty(&mut dirty_rect, taskbar_dirty);
+            // Only the readout, which is the only thing about the bar a second
+            // changes. A whole-bar repaint here is what the owner saw as the
+            // taskbar flickering once a second.
+            damage.add(status_rect(screen_w as usize, screen_h as usize, font.width()));
         }
 
         // Composite once per frame
-        if let Some(rect) = dirty_rect.take() {
-            let rect = rect.clamp(screen_w as usize, screen_h as usize);
-            if rect.w > 0 && rect.h > 0 {
+        if !damage.is_empty() {
+            let regions = damage.take(screen_w as usize, screen_h as usize);
+            if !regions.is_empty() {
                 // Two clock syscalls per composited frame — 120/s at the frame
                 // cap — which is what any measure of a frame costs here.
                 let composite_start = Instant::now();
-                redraw(&screen, &font, &windows, &icons, &wallpaper, launcher_open, &cached_stats, rect);
+                for region in &regions {
+                    compose(
+                        &back.surface,
+                        &font,
+                        &windows,
+                        &icons,
+                        &wallpaper,
+                        launcher_open,
+                        &cached_stats,
+                        *region,
+                    );
+                }
 
-                // Draw software cursor if no hardware cursor
+                // Draw software cursor if no hardware cursor. Into the back
+                // buffer, so a region that contains it carries it over with
+                // everything else rather than the panel being touched twice.
                 if !hw_cursor {
                     let sprite = match current_cursor_style {
                         window::CURSOR_CROSSHAIR => &cursor_crosshair,
                         window::CURSOR_RESIZE => &cursor_resize,
                         _ => &cursor_default,
                     };
-                    draw_software_cursor(&screen, sprite, cursor_x, cursor_y);
-                    frame_stats.cursor_draws += 1;
+                    let cursor_rect = DirtyRect {
+                        x: cursor_x as usize,
+                        y: cursor_y as usize,
+                        w: sprite.width(),
+                        h: sprite.height(),
+                    };
+                    if regions.iter().any(|r| r.overlaps(cursor_rect)) {
+                        draw_software_cursor(&back.surface, sprite, cursor_x, cursor_y);
+                        frame_stats.cursor_draws += 1;
+                    }
+                }
+
+                let mut damage_px = 0;
+                for region in &regions {
+                    screen.blit(
+                        region.x,
+                        region.y,
+                        region.w,
+                        region.h,
+                        back.surface.width(),
+                        back.region(*region),
+                    );
+                    damage_px += region.area();
                 }
                 let composited_at = Instant::now();
                 frame_stats.record(
                     composited_at.duration_since(composite_start).as_nanos() as u64,
+                    regions.len(),
+                    damage_px,
                 );
 
-                gpu::present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32)
+                for region in &regions {
+                    gpu::present(
+                        region.x as u32,
+                        region.y as u32,
+                        region.w as u32,
+                        region.h as u32,
+                    )
                     .expect("compositor owns the framebuffer");
+                }
 
                 // Send frame callbacks to windows that presented and were composited
                 let mut frame_dead: Vec<Dead> = Vec::new();
                 for win in windows.iter_mut() {
-                    if win.presented && !win.minimized && rect.overlaps(window_screen_rect(win)) {
+                    let win_rect = window_screen_rect(win);
+                    if win.presented && !win.minimized && regions.iter().any(|r| r.overlaps(win_rect))
+                    {
                         deliver_signal(&mut frame_dead, win, window::MSG_FRAME);
                         win.presented = false;
                     }
@@ -2049,15 +2411,26 @@ fn main() {
                     eprintln!("compositor: dropping pid {pid} — {}", reason.why());
                 }
                 if !frame_dead.is_empty() {
+                    for win in windows.iter().filter(|w| {
+                        frame_dead.iter().any(|(fd, _, _)| *fd == w.fd.fd())
+                    }) {
+                        damage.add(window_screen_rect(win));
+                    }
                     windows.retain(|w| !frame_dead.iter().any(|(fd, _, _)| *fd == w.fd.fd()));
-                    mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                    damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                 }
 
                 if composited_at >= next_frame_stats {
                     let traffic = screen.traffic();
-                    frame_stats.report(traffic.since(reported_traffic), windows.len());
+                    let composed = back.surface.traffic();
+                    frame_stats.report(
+                        (traffic.0 - reported_traffic.0, traffic.1 - reported_traffic.1),
+                        composed.since(reported_composed),
+                        windows.len(),
+                    );
                     frame_stats = FrameStats::default();
                     reported_traffic = traffic;
+                    reported_composed = composed;
                     next_frame_stats = composited_at + STATS_INTERVAL;
                 }
             }

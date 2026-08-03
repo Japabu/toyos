@@ -114,6 +114,20 @@ impl CreateError {
 }
 
 toyos::ipc_payload! {
+    /// A rectangle of a surface, in that surface's own pixels.
+    ///
+    /// The payload of [`MSG_PRESENT`], where it is the client's claim about
+    /// which of its pixels changed. A compositor that has to assume the whole
+    /// window changed repaints the whole window for one typed character —
+    /// which is what this exists to stop — so the claim is load-bearing and
+    /// the compositor clamps it to the window rather than trusting it.
+    pub struct Rect {
+        pub x: u32,
+        pub y: u32,
+        pub w: u32,
+        pub h: u32,
+    }
+
     pub struct ClipboardShmMsg {
         pub token: u32,
         pub len: u32,
@@ -135,6 +149,16 @@ toyos::ipc_payload! {
         pub flags: u8,
         pub title_len: u8,
         pub title: [u8; 30],
+    }
+}
+
+impl Rect {
+    pub fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.w).max(other.x + other.w);
+        let bottom = (self.y + self.h).max(other.y + other.h);
+        Self { x, y, w: right - x, h: bottom - y }
     }
 }
 
@@ -490,8 +514,23 @@ impl Window {
         let _ = self.conn.send_bytes(MSG_CLIPBOARD_SET, text.as_bytes());
     }
 
+    /// Hand over the whole window.
+    ///
+    /// For a client that draws without keeping track of where — the honest
+    /// answer for one of those is "all of it", and a damage rect it made up
+    /// would cost the compositor correctness rather than time.
     pub fn present(&self) {
-        let _ = self.conn.signal(MSG_PRESENT);
+        self.present_damage(Rect { x: 0, y: 0, w: self.width, h: self.height });
+    }
+
+    /// Hand over `damage` and nothing else.
+    ///
+    /// The rect is in window pixels. Pixels outside it are the compositor's to
+    /// leave alone, so a client that names less than it changed leaves a stale
+    /// screen — [`Screen::take_damage`] is where the rect comes from for a
+    /// client that composes through one.
+    pub fn present_damage(&self, damage: Rect) {
+        let _ = self.conn.send(MSG_PRESENT, &damage);
     }
 
     pub fn fd(&self) -> toyos_abi::Fd {

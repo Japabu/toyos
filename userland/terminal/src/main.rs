@@ -23,6 +23,19 @@ const TOKEN_WINDOW: u64 = 2;
 const TOKEN_LISTEN: u64 = 3;
 const TOKEN_CLIENT: u64 = 4;
 
+/// Give the compositor the cells the emulator just repainted, and nothing when
+/// it repainted none.
+///
+/// The whole of why a typed character does not cost a window repaint: the
+/// emulator already blits one cell into the shared buffer, and before this the
+/// compositor was told only that *something* had changed and had to assume all
+/// of it had.
+fn present(console: &Console, window: &Window) {
+    if let Some(damage) = console.take_damage() {
+        window.present_damage(damage);
+    }
+}
+
 fn main() {
     let mut name = [0u8; surface::MAX_NAME];
     let name = surface::service_name(std::process::id(), &mut name).to_string();
@@ -74,7 +87,7 @@ fn main() {
             }
             console.write_bytes(&buf[..n]);
             std::io::stdout().lock().write_all(&buf[..n]).ok();
-            window.present();
+            present(&console, &window);
         }
 
         if ready[TOKEN_STDERR as usize] {
@@ -83,7 +96,7 @@ fn main() {
             if n > 0 {
                 console.write_bytes(&buf[..n]);
                 std::io::stdout().lock().write_all(&buf[..n]).ok();
-                window.present();
+                present(&console, &window);
             }
         }
 
@@ -134,17 +147,17 @@ fn main() {
                     match ev.event_type {
                         window::MOUSE_PRESS if ev.changed == 1 => {
                             console.mouse_down(col, row);
-                            window.present();
+                            present(&console, &window);
                         }
                         window::MOUSE_MOVE if ev.buttons & 1 != 0 => {
                             console.mouse_drag(col, row);
-                            window.present();
+                            present(&console, &window);
                         }
                         window::MOUSE_RELEASE if ev.changed == 1 => {
                             if let Some(text) = console.mouse_up(col, row) {
                                 window::clipboard_set(&text);
                             }
-                            window.present();
+                            present(&console, &window);
                         }
                         window::MOUSE_SCROLL => {
                             if ev.scroll < 0 {
@@ -152,7 +165,7 @@ fn main() {
                             } else if ev.scroll > 0 {
                                 console.scroll_view_down(1);
                             }
-                            window.present();
+                            present(&console, &window);
                         }
                         _ => {}
                     }
@@ -160,7 +173,7 @@ fn main() {
                 window::Event::Close => break,
                 window::Event::Resized => {
                     console.resize(window.screen());
-                    window.present();
+                    present(&console, &window);
                 }
                 window::Event::Frame => {}
             }

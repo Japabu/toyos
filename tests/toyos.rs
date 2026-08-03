@@ -87,6 +87,9 @@ const RUST_SKIP: &[&str] = &[
     "ipc_hostile_peer",
     // Same again: `metal_sim_compositor_stall` runs it.
     "compositor_stall",
+    // Same again, and it also needs a host injecting pointer packets:
+    // `metal_sim_window_drag` runs it.
+    "window_drag",
     // Needs netd with a NIC. `netd_connection_caps` runs it on tests/netcase.
     "netd_caps",
     // Needs a boot image the harness staged a file into before the machine
@@ -181,6 +184,11 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // A thousand pointer packets paced from the host, with a settle sized for
     // "QEMU coalescing rel events it has not been polled for".
     ("metal_sim_pointer_churn", Sched::Serial),
+    // A window dragged by injected pointer packets. Its own boot rather than
+    // the desktop group's: it leaves the pointer somewhere else and a window
+    // in a different place than it found them, and it is a conversation typed
+    // from the host, which is what makes every other one of those serial.
+    ("metal_sim_window_drag", Sched::Serial),
     // A host-measured drain rate with an 8 s ceiling on a 3.3 s expectation.
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
@@ -229,6 +237,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // the stand-in `locale_gate` is. Each costs a boot of a different image.
     ("console_locale_detect", Sched::Serial),
     ("desktop_locale_detect", Sched::Serial),
+    // A conversation typed from the host, like the four above, and it reads a
+    // counter the compositor only prints from a composited frame.
+    ("desktop_typing_damage", Sched::Serial),
     // Two boots of one machine compared on the guest's own `Boot: complete`
     // with a 300 ms allowance, which is the whole assertion.
     ("i8042_absent", Sched::Serial),
@@ -2554,6 +2565,29 @@ fn metal_sim_argv_check(argv: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// One `key=value` out of a `compositor: frames=…` line.
+///
+/// Every compositor gate reads this line, so they read it the same way: a key
+/// that is not there is a compositor whose instrument changed shape, which is
+/// a different failure from a number that is too large and says so.
+fn compositor_field(stats: &str, key: &str) -> Result<u64, String> {
+    let raw = stats
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix(key))
+        .ok_or_else(|| format!("no {key} in the compositor's stats line: {stats}"))?;
+    raw.parse::<u64>().map_err(|_| format!("{key}{raw} is not a number: {stats}"))
+}
+
+/// How many pixels the compositor said it was given, off its own startup line.
+///
+/// Read rather than assumed: every damage gate is a fraction of the screen, and
+/// a fraction of a number the harness hardcoded would keep agreeing with itself
+/// on a machine whose panel is a different size.
+fn compositor_screen_px(console: &str) -> Result<u64, String> {
+    let (w, h) = compositor_screen_size(console)?;
+    Ok(w as u64 * h as u64)
+}
+
 /// Which processes survive the T14's device shape, in their own words.
 ///
 /// The compositor claims a firmware framebuffer and says what it got; netd finds
@@ -2590,12 +2624,18 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
     // port and the log is only a file on the stick. It is emitted from
     // a composited frame, so its absence is a compositor that stopped
     // drawing as much as an instrument that never ran.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    //
+    // Three of them, not one: the first covers the boot, which repaints the
+    // whole screen, and what the idle gate below is about is every interval
+    // after that.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline
-        && !boot
+        && boot
             .console
             .lines()
-            .any(|l| l.contains("compositor: frames=") && l.contains("windows="))
+            .filter(|l| l.contains("compositor: frames=") && l.contains("windows="))
+            .count()
+            < 3
     {
         boot.drain(Duration::from_millis(250));
     }
@@ -2619,38 +2659,73 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
             "the compositor never reported a composited frame:\n{console}"
         ));
     };
-    let field = |key: &str| -> Result<u64, String> {
-        let raw = stats
-            .split_whitespace()
-            .find_map(|f| f.strip_prefix(key))
-            .ok_or_else(|| format!("no {key} in the compositor's stats line: {stats}"))?;
-        raw.parse::<u64>()
-            .map_err(|_| format!("{key}{raw} is not a number: {stats}"))
-    };
-    let frames = field("frames=")?;
-    let min_us = field("composite_us_min=")?;
-    let max_us = field("composite_us_max=")?;
-    let total_us = field("composite_us_total=")?;
-    let cursor = field("cursor=")?;
-    // Read for their presence and their shape; what they measure is
-    // uncached reads, which QEMU's host-RAM framebuffer cannot show.
-    field("scanout_wr_bytes=")?;
-    field("scanout_rd_bytes=")?;
-    field("rd_px=")?;
-    field("rd_bulk=")?;
-    field("windows=")?;
+    let frames = compositor_field(stats, "frames=")?;
+    let min_us = compositor_field(stats, "composite_us_min=")?;
+    let max_us = compositor_field(stats, "composite_us_max=")?;
+    let total_us = compositor_field(stats, "composite_us_total=")?;
+    let cursor = compositor_field(stats, "cursor=")?;
+    // Read for their presence and their shape; what they measure is the cost
+    // of moving bytes to a panel, which QEMU's host-RAM framebuffer cannot
+    // show. There is deliberately no scanout *read* figure: the compositor
+    // holds the mapping as a `window::Screen`, which returns no pixel and
+    // hands out no pointer, so a counter for it could only ever be zero.
+    compositor_field(stats, "scanout_wr_bytes=")?;
+    compositor_field(stats, "scanout_blits=")?;
+    compositor_field(stats, "back_rd_bytes=")?;
+    compositor_field(stats, "rects=")?;
+    compositor_field(stats, "damage_px=")?;
+    compositor_field(stats, "windows=")?;
     if frames == 0 || total_us == 0 {
         return Err(format!("the compositor reported a dead instrument: {stats}"));
     }
     if min_us > max_us || max_us > total_us {
         return Err(format!("min/max/total do not order: {stats}"));
     }
-    // GOP hands out no hardware cursor (`flags: 0`), so the compositor
-    // draws one into the scanout on every frame it composites.
-    if cursor != frames {
+    // GOP hands out no hardware cursor (`flags: 0`), so the compositor draws
+    // one itself — into the back buffer, and only into frames whose damage
+    // reaches it. The first frame repaints the whole screen, so it does. That
+    // it is *not* every frame is the point: a cursor nobody moved does not
+    // need repainting, and drawing it per frame is what a compositor that
+    // composed straight onto the panel had to do.
+    if cursor == 0 || cursor > frames {
         return Err(format!(
             "{frames} frames on a shape with no hardware cursor drew {cursor} cursors: \
              {stats}"
+        ));
+    }
+
+    // What one second of an idle desktop costs. Nothing is on this screen but
+    // the wallpaper and the taskbar, and the only thing that changes is the
+    // clock — so the largest frame in a settled interval is the readout's own
+    // box and nothing else.
+    //
+    // One percent of the screen is the line because the two shapes it
+    // separates are far apart: the readout box is 0.46% of a 1920x1080 panel,
+    // the whole taskbar strip is 2.96%, and a full repaint is 100%. The
+    // taskbar redrawing whole once a second is what the owner saw flicker.
+    let screen_px = compositor_screen_px(console)?;
+    let settled: Vec<&str> = console
+        .lines()
+        .filter(|l| l.contains("compositor: frames="))
+        .skip(1)
+        .collect();
+    let Some(idle) = settled.last() else {
+        return Err(format!(
+            "the compositor reported one interval and no more, so nothing here saw a settled \
+             desktop:\n{console}"
+        ));
+    };
+    let windows = compositor_field(idle, "windows=")?;
+    if windows != 0 {
+        return Err(format!(
+            "this desktop was supposed to have no windows on it, and has {windows}: {idle}"
+        ));
+    }
+    let biggest = compositor_field(idle, "damage_px_max=")?;
+    if biggest * 100 > screen_px {
+        return Err(format!(
+            "an idle desktop's largest frame repainted {biggest} of {screen_px} pixels — over a \
+             percent of the screen for a clock tick: {idle}"
         ));
     }
     // And nothing panicked on the way. A daemon mishandling its
@@ -2659,8 +2734,244 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
     serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
     eprintln!("  [metal-sim] compositor up on {}", mode.trim());
     eprintln!("  [metal-sim] {}", stats.trim());
+    eprintln!(
+        "  [metal-sim] idle: {biggest} px is the biggest frame of {screen_px} on screen — {}",
+        idle.trim()
+    );
     eprintln!("  [metal-sim] soundd on a null sink, netd exited — both handled their absent device");
     Ok(())
+}
+
+/// Pixels one relative pointer count is worth, on a screen of this size.
+///
+/// `kernel/src/mouse.rs` scales a count into the square 0..32767 space by
+/// `REL_SCALE * short / axis`, and the compositor maps that space back by the
+/// axis — so the axis cancels and a count is `REL_SCALE * short / 32768` px on
+/// both, which is the whole reason the scaling is per-axis. Duplicated here
+/// because a test cannot link the kernel, and *checked* rather than trusted:
+/// the calibration press in [`metal_sim_window_drag`] is where the cursor
+/// actually is, and it fails by name if this arithmetic put it somewhere else.
+fn px_per_count(screen_w: u32, screen_h: u32) -> f64 {
+    const REL_SCALE: f64 = 64.0;
+    REL_SCALE * screen_w.min(screen_h) as f64 / 32768.0
+}
+
+/// A window dragged across the desktop by its title bar, and what that cost.
+///
+/// The owner's report was that moving a window redraws everything. Two things
+/// made it true and both are visible from here: the press that starts a drag
+/// marked the whole screen dirty, and every damaged pixel was written to the
+/// panel more than once because the desktop was composed *onto* the panel. The
+/// gate is the compositor's own `damage_px_max`, which is the largest single
+/// frame of an interval — the frame the press produced, if the press is still
+/// repainting the screen.
+///
+/// Nothing here aims at the title bar from constants. The client reports the
+/// content-local name of every pixel the host presses, so the window's origin
+/// is measured, and the same press repeated after the drag is what proves the
+/// window moved rather than that the injection was ignored.
+fn metal_sim_window_drag(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let bins: Vec<(String, Vec<u8>)> =
+        rust_bins.iter().filter(|(name, _)| name == "window_drag").cloned().collect();
+    if bins.is_empty() {
+        return Err("the window_drag client was not built".to_string());
+    }
+
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+    let options =
+        BootOptions { profile: qemu::Profile::Metal, qmp: true, ..Default::default() };
+    metal_sim_argv_check(&qemu::profile_argv(&options))?;
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
+
+    // The compositor announces its screen after the ready marker, so this
+    // waits for the line rather than reading a boot log that cannot have it.
+    //
+    // And it waits for the first *stats* line too, which is the one carrying
+    // the frame that painted the desktop for the first time: a gate about what
+    // a drag costs must not be handed the boot's own full-screen repaint.
+    let mut boot_log = qemu.boot_log().to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline
+        && !boot_log.contains("compositor: frames=")
+    {
+        boot_log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    boot_log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    let screen_px = compositor_screen_px(&boot_log)?;
+    let (screen_w, screen_h) = compositor_screen_size(&boot_log)?;
+    let ppc = px_per_count(screen_w, screen_h);
+
+    // Where the host presses, twice: the middle of the screen, which is where
+    // the compositor centres a window it was given a size for.
+    let probe_x = screen_w / 2;
+    let probe_y = screen_h / 2;
+    // How far the drag carries the window. Big enough that a rounded count is
+    // not most of it, small enough that the pressed pixel is still inside the
+    // content afterwards, which is what the second press reads.
+    const DRAG_DX: u32 = 120;
+    const DRAG_DY: u32 = 60;
+
+    let result = qemu.run_test_hooked(
+        "test_rs_window_drag",
+        Duration::from_secs(120),
+        "===DRAG_READY===",
+        |socket| {
+            let mut input = qemu::QmpInput::open(socket);
+            let counts = |px: f64| (px / ppc).round() as i32;
+            // A packet nobody could produce by hand teleports the cursor, and
+            // the compositor damages where it was and where it went — so an
+            // injection that moves it a screen at a time makes a frame this
+            // gate then reads as a defect. Every step here is a plausible
+            // flick of a real mouse.
+            const STEP_PX: f64 = 120.0;
+            let travel = |input: &mut qemu::QmpInput, dx: i32, dy: i32| {
+                let step = counts(STEP_PX).max(1);
+                let steps = (dx.abs().max(dy.abs()) + step - 1) / step;
+                for i in 0..steps.max(1) {
+                    let from_x = i * dx / steps.max(1);
+                    let to_x = (i + 1) * dx / steps.max(1);
+                    let from_y = i * dy / steps.max(1);
+                    let to_y = (i + 1) * dy / steps.max(1);
+                    input.mouse(to_x - from_x, to_y - from_y, None);
+                    thread::sleep(Duration::from_millis(25));
+                }
+            };
+            // Everything is relative to a pointer at the origin, and the
+            // kernel clamps its accumulator there, so driving into the corner
+            // is a way to know where it is without being told.
+            let home = |input: &mut qemu::QmpInput| {
+                travel(input, -counts(screen_w as f64 * 2.0), -counts(screen_h as f64 * 2.0));
+            };
+            let click = |input: &mut qemu::QmpInput| {
+                input.mouse(0, 0, Some(("left", true)));
+                thread::sleep(Duration::from_millis(60));
+                input.mouse(0, 0, Some(("left", false)));
+                thread::sleep(Duration::from_millis(60));
+            };
+
+            // One: name the pixel under the middle of the screen.
+            home(&mut input);
+            travel(&mut input, counts(probe_x as f64), counts(probe_y as f64));
+            click(&mut input);
+
+            // Two: up onto the title bar and drag. The window is centred and
+            // its content is `CLIENT_H` tall, so the middle of the screen is
+            // `CLIENT_H/2` below the content's top edge give or take the few
+            // pixels by which the taskbar and the title bar differ — and a
+            // little further up is the strip a person grabs to move a window.
+            // If this lands in the content instead, the client reports a third
+            // press and the assertions below say so by name.
+            travel(&mut input, 0, -counts(CLIENT_H as f64 / 2.0 + TITLE_PROBE_PX));
+            input.mouse(0, 0, Some(("left", true)));
+            thread::sleep(Duration::from_millis(60));
+            travel(&mut input, counts(DRAG_DX as f64), counts(DRAG_DY as f64));
+            input.mouse(0, 0, Some(("left", false)));
+            thread::sleep(Duration::from_millis(120));
+
+            // Three: name the same screen pixel again. It is a different
+            // pixel of the window now, by exactly what the drag carried.
+            home(&mut input);
+            travel(&mut input, counts(probe_x as f64), counts(probe_y as f64));
+            click(&mut input);
+        },
+    );
+
+    if result.error.is_some() || result.exit_code != Some(0) {
+        return Err(format!(
+            "window_drag exited {:?} ({:?}):\n{}",
+            result.exit_code, result.error, result.stdout
+        ));
+    }
+
+    let text = result.serial.clone();
+    if !text.contains(&format!("drag probe: {CLIENT_W}x{CLIENT_H} window up")) {
+        return Err(format!(
+            "the client did not report a {CLIENT_W}x{CLIENT_H} window, so the aim below is for a \
+             window that is not there:\n{text}"
+        ));
+    }
+    let presses: Vec<(i64, i64)> = text
+        .lines()
+        .filter_map(|l| l.split("drag probe: press at ").nth(1))
+        .filter_map(|rest| rest.trim().split_once(','))
+        .filter_map(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))
+        .collect();
+    if presses.len() != 2 {
+        return Err(format!(
+            "the client was pressed inside its content {} times, not twice — the injected \
+             pointer never reached it, or the title-bar probe landed in the content:\n{text}",
+            presses.len()
+        ));
+    }
+    let (before, after) = (presses[0], presses[1]);
+    // The window moved, so the screen pixel the host pressed is now nearer the
+    // window's top-left corner by what the drag carried.
+    let moved_x = before.0 - after.0;
+    let moved_y = before.1 - after.1;
+    let slack = 8;
+    if (moved_x - DRAG_DX as i64).abs() > slack || (moved_y - DRAG_DY as i64).abs() > slack {
+        return Err(format!(
+            "the drag was supposed to carry the window {DRAG_DX},{DRAG_DY} px and carried it \
+             {moved_x},{moved_y} — the press missed the title bar, or the drag was not followed:\
+             \n{text}"
+        ));
+    }
+
+    // A fifth of the screen. The window is 400x160 with its chrome, so a drag
+    // of it damages the place it left and the place it arrived — well under a
+    // tenth of a 1920x1080 panel. A press that still marks the screen dirty is
+    // 100%, which is what this separates.
+    let mut biggest = 0;
+    let mut lines = 0;
+    for line in text.lines().filter(|l| l.contains("compositor: frames=")) {
+        lines += 1;
+        biggest = biggest.max(compositor_field(line, "damage_px_max=")?);
+    }
+    if lines == 0 {
+        return Err(format!("the compositor reported no interval during the drag:\n{text}"));
+    }
+    if biggest * 5 > screen_px {
+        return Err(format!(
+            "dragging a {CLIENT_W}x{CLIENT_H} window repainted {biggest} of {screen_px} pixels in \
+             one frame — over a fifth of the screen:\n{text}"
+        ));
+    }
+
+    eprintln!(
+        "  [metal-sim] drag carried the window {moved_x},{moved_y} px; biggest frame {biggest} \
+         of {screen_px} px over {lines} intervals"
+    );
+    Ok(())
+}
+
+/// How far above its content the host reaches for a window's title bar.
+///
+/// Not the compositor's title-bar height — this is a probe, and what it needs
+/// is to land inside a strip whose size it does not know. Twelve pixels is
+/// above any border and inside any title bar a person could grab, and either
+/// kind of miss is caught by name: too little and the client reports a third
+/// press, too much and the window never moves.
+const TITLE_PROBE_PX: f64 = 12.0;
+
+/// The window `window_drag` asks for, which is how the host knows where to
+/// press. Asserted against the client's own report rather than assumed.
+const CLIENT_W: u32 = 400;
+const CLIENT_H: u32 = 160;
+
+/// The screen the compositor said it was given, off its own startup line.
+fn compositor_screen_size(console: &str) -> Result<(u32, u32), String> {
+    let mode = console
+        .lines()
+        .find_map(|l| l.split("compositor: wallpaper ").nth(1))
+        .and_then(|rest| rest.split("scaling to ").nth(1))
+        .ok_or_else(|| format!("the compositor never said what screen it got:\n{console}"))?;
+    let (w, h) = mode
+        .trim()
+        .split_once('x')
+        .ok_or_else(|| format!("unreadable screen size {mode:?}"))?;
+    let w: u32 = w.trim().parse().map_err(|_| format!("unreadable width in {mode:?}"))?;
+    let h: u32 = h.trim().parse().map_err(|_| format!("unreadable height in {mode:?}"))?;
+    Ok((w, h))
 }
 
 /// A key injected at the controller, decoded, mapped and delivered to a
@@ -2992,6 +3303,90 @@ fn shell_answers(qemu: &mut QemuInstance, log: &mut String) -> bool {
         }
     }
     false
+}
+
+/// What a typed character costs the desktop.
+///
+/// The owner's report, in his words: entering one character into the terminal
+/// redraws the entire terminal. It did, and the mechanism was that `MSG_PRESENT`
+/// carried no damage — the emulator already blits one cell into the shared
+/// buffer, and the compositor, told only that something had changed, repainted
+/// the whole window. The terminal here fills most of the screen, so that was
+/// nine tenths of the panel per keystroke.
+///
+/// The gate is the compositor's own `damage_px_max`, the largest single frame
+/// of a reporting interval, over the intervals in which the typing happened.
+/// The clock's readout is 0.46% of this screen and is in every interval; a
+/// typed character is a two-cell span, far below it; a repainted window is 89%.
+/// Two percent sits between them by a factor of forty either way.
+fn desktop_typing_damage() -> Result<(), String> {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopcase");
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        qmp: true,
+        ready_marker: "compositor: ready",
+        ..Default::default()
+    };
+    metal_sim_argv_check(&qemu::profile_argv(&options))?;
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let mut log = qemu.boot_log().to_string();
+    if !shell_answers(&mut qemu, &mut log) {
+        return Err(format!("nothing typed at the terminal window reached a shell:\n{log}"));
+    }
+    let screen_px = compositor_screen_px(&log)?;
+
+    // Let the interval carrying the boot's full-screen repaint and the
+    // terminal's first paint close before anything here is measured. Those are
+    // real frames and they are not what this is about.
+    if !serial_until(&mut qemu, &mut log, "compositor: frames=", Duration::from_secs(20)) {
+        return Err(format!("the compositor never reported an interval:\n{log}"));
+    }
+    log.push_str(&qemu.drain_serial(Duration::from_secs(3)));
+    let before = log.len();
+
+    // Eight lines, each typed a character at a time — the shell's echo of each
+    // keystroke is a present of its own, which is the thing being measured.
+    const NONCE: &str = "typing-damage-gate";
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        for _ in 0..8 {
+            type_line(&mut input, &format!("echo {NONCE}"));
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+    if !serial_until(&mut qemu, &mut log, NONCE, Duration::from_secs(10)) {
+        return Err(format!("the typed line never came back out of the shell:\n{log}"));
+    }
+    log.push_str(&qemu.drain_serial(Duration::from_secs(3)));
+
+    let typed = &log[before..];
+    let echoes = typed.matches(NONCE).count();
+    if echoes < 8 {
+        return Err(format!(
+            "{echoes} of the eight typed lines reached the shell, so most of what this measures \
+             never happened:\n{typed}"
+        ));
+    }
+    let mut biggest = 0;
+    let mut intervals = 0;
+    for line in typed.lines().filter(|l| l.contains("compositor: frames=")) {
+        intervals += 1;
+        biggest = biggest.max(compositor_field(line, "damage_px_max=")?);
+    }
+    if intervals == 0 {
+        return Err(format!("the compositor reported no interval while typing:\n{typed}"));
+    }
+    if biggest * 50 > screen_px {
+        return Err(format!(
+            "a keystroke's frame repainted {biggest} of {screen_px} pixels — over two percent of \
+             the screen for one character:\n{typed}"
+        ));
+    }
+    eprintln!(
+        "  [desktop] {echoes} lines typed; biggest frame {biggest} of {screen_px} px over \
+         {intervals} intervals"
+    );
+    Ok(())
 }
 
 /// The wizard under `/bin/console`, which is the whole of the surface tree on
@@ -3637,6 +4032,7 @@ fn run_machine_test(
         }
         "console_locale_detect" => console_locale_detect(),
         "desktop_locale_detect" => desktop_locale_detect(),
+        "desktop_typing_damage" => desktop_typing_damage(),
         "xhci_many_devices" => {
             // The T14's internal controller carries a camera, Bluetooth and a
             // fingerprint reader next to the boot stick, and every profile in
@@ -5569,6 +5965,7 @@ fn run_machine_test(
             eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
             Ok(())
         }
+        "metal_sim_window_drag" => metal_sim_window_drag(rust_bins),
         "metal_sim_pointer_churn" => {
             // The owner froze his desktop twice by plugging a mouse in and
             // pulling it out again, and the second freeze landed on the fourth
