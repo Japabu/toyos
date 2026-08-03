@@ -2238,6 +2238,27 @@ timing window is the shape to look for when triaging a landing red, alongside
 the boot timeout**, and `Sched::Serial` does not protect it: serial is one guest
 per *test process*, and the contention is between processes.
 
+**Third shape, same session, and this one has no mechanism yet.** The very next
+landing gate — same branch, same tree, 238 of 240 again — failed a *different*
+pair: `usb_flush_optional` with "read the image: No such file or directory" and
+`usb_transport_break` with the same `NotFound` out of `tests/common/usb.rs:127`.
+Both pass alone (8 s and 4 s). Both are a staged disk image missing from the
+lane directory that the same test wrote it to.
+
+What is established: `lane::dir()` is `$TMPDIR/toyos-tests-{pid}[/lane-N]`, keyed
+on the *test process* id, and **nothing in the tree removes a `toyos-tests-*`
+directory** — grepped, one hit, the constructor. So a second suite cannot be
+deleting the first's scratch by name, and the obvious explanation is wrong. The
+three shapes so far are a boot timeout, a host-staged window the guest slid past,
+and an artifact that is not there; only the first two have a mechanism. Worth an
+hour from whoever builds §6's semaphore, because "re-run it" stops being an
+adequate answer once the failure can be a missing file rather than a slow one.
+
+Method note, cheap and it cost twenty minutes here: **`pgrep -f "toyos-build
+--land"` matches the waiting shell's own command line**, and another agent's
+waiter too, so a wait-until-it-exits loop written that way never exits. Match on
+`cargo run -- --land`, or count `[q]emu-system`.
+
 ### rustup narrates its cargo fallback on every invocation
 
 `info: cargo is unavailable for the active toolchain` followed by `info:
