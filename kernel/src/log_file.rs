@@ -191,6 +191,12 @@ pub fn install() {
     log!("log-file: this boot's kernel log continues in {PATH}, which holds {size} bytes");
 }
 
+/// Where this boot's log can be read, or `None` when no sink installed — no
+/// `/log`, or a volume that would not give back the file.
+pub fn destination() -> Option<&'static str> {
+    SINK.lock().is_some().then_some(PATH)
+}
+
 /// Move whatever the ring owes into the file. Called from the idle loop.
 pub fn poll() {
     if !log_ring::file_has_pending() {
