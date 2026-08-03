@@ -2271,6 +2271,27 @@ stop naming sizes at all.
 
 ## 8. Hardware and performance gaps
 
+### `xhci_slow_connect` has a 2 ms margin on a 300 ms host-timed window
+
+Seen red once, in a full suite run sharing the host with other agents:
+
+```
+FAIL xhci_slow_connect: the first port was seen 0.298 s after the controller
+started, inside the 0.3 s the ports are held empty for — the injection did not
+reach the driver
+```
+
+0.298 against 0.300. Re-run in isolation immediately afterwards it passed four
+times out of four, so what the run measured was the host, not the driver: the
+window is held open by the harness on wall clock, and this dev host is a laptop
+that is regularly building three other things.
+
+Not diagnosed further and not touched — the observation is recorded so the next
+person to see this red does not spend the afternoon on the xHCI driver. The
+question for whoever does own it is whether the guest-side event can be timed
+against something the host does not have to hold, since a margin this thin
+cannot survive a shared machine.
+
 ### Two framebuffer clients still pay the scanout's price, and the panic console pays it worst
 
 Closed for `/bin/console` in `45b5010`: the terminal emulator composed against
