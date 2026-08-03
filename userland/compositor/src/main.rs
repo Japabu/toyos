@@ -5,7 +5,7 @@ use toyos::shm::SharedMemory;
 use toyos::{gpu, ipc, services, system, Connection, Keyboard, Mouse, FramebufferDev};
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos_abi::Fd;
-use window::{Color, Framebuffer};
+use window::{Color, Framebuffer, Traffic};
 
 const TITLE_BAR_HEIGHT: usize = 28;
 const BORDER_WIDTH: usize = 1;
@@ -20,6 +20,7 @@ const TASKBAR_ITEM_WIDTH: usize = 160;
 const TASKBAR_PADDING: usize = 4;
 const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
 const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667); // ~60fps
+const STATS_INTERVAL: Duration = Duration::from_secs(2);
 
 const FOCUSED_TITLE_COLOR: Color = Color { r: 0x3a, g: 0x3a, b: 0x4e };
 const UNFOCUSED_TITLE_COLOR: Color = Color { r: 0x28, g: 0x28, b: 0x32 };
@@ -727,6 +728,61 @@ fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, 
     }
 }
 
+/// Counters for one reporting window, flushed from a composited frame and
+/// never otherwise: a compositor with nothing to draw says nothing, as soundd
+/// says nothing with no clients.
+///
+/// Here to be read off `/log/kernel.log` on a machine whose only other
+/// instrument is the panel. `scanout_rd_bytes` is what it is for: the
+/// compositor composes *against* the scanout, so `fill_rect` reads back every
+/// row it replicates and a blended cursor pixel reads the pixel under it, and
+/// on hardware — unlike QEMU, where the framebuffer is host RAM — those reads
+/// are uncached. Composing in RAM and blitting damage would hold it at zero.
+#[derive(Default)]
+struct FrameStats {
+    frames: u32,
+    cursor_draws: u32,
+    composite_ns_min: u64,
+    composite_ns_max: u64,
+    composite_ns_total: u64,
+}
+
+impl FrameStats {
+    /// `composite_ns` covers the redraw and the software cursor, not the
+    /// `present` that follows: that one is a syscall, and mixing it in would
+    /// hide the cost this is aimed at.
+    fn record(&mut self, composite_ns: u64) {
+        self.composite_ns_min = if self.frames == 0 {
+            composite_ns
+        } else {
+            self.composite_ns_min.min(composite_ns)
+        };
+        self.composite_ns_max = self.composite_ns_max.max(composite_ns);
+        self.composite_ns_total += composite_ns;
+        self.frames += 1;
+    }
+
+    /// `moved` is the scanout traffic of this window alone. Totals rather than
+    /// a mean: with `frames` beside it the mean is a division, and the total is
+    /// the share of the window that compositing cost, which the mean is not.
+    fn report(&self, moved: Traffic, windows: usize) {
+        eprintln!(
+            "compositor: frames={} composite_us_min={} composite_us_max={} composite_us_total={} \
+             scanout_wr_bytes={} scanout_rd_bytes={} rd_px={} rd_bulk={} cursor={} windows={}",
+            self.frames,
+            self.composite_ns_min / 1_000,
+            self.composite_ns_max / 1_000,
+            self.composite_ns_total / 1_000,
+            moved.written,
+            moved.read,
+            moved.pixel_reads,
+            moved.bulk_reads,
+            self.cursor_draws,
+            windows,
+        );
+    }
+}
+
 fn main() {
     let listener = services::listen("compositor").expect("compositor already running");
 
@@ -821,6 +877,9 @@ fn main() {
     let mut cpu_pct: u64 = 0;
     let mut last_taskbar_update = Instant::now();
     let mut cached_stats = SystemStats { used_mb: 0, total_mb: 0, cpu_pct: 0 };
+    let mut frame_stats = FrameStats::default();
+    let mut reported_traffic = screen.traffic();
+    let mut next_frame_stats = Instant::now() + STATS_INTERVAL;
 
     // Every token is its fd number, system and client alike; the dispatch
     // below tells them apart by comparing against the known system fds.
@@ -1577,6 +1636,9 @@ fn main() {
                                 fb_info.stride as usize,
                                 fb_info.pixel_format,
                             );
+                            // The counters belong to the mapping, and this is a
+                            // new one starting at zero.
+                            reported_traffic = screen.traffic();
                             screen_w = screen.width() as i32;
                             screen_h = screen.height() as i32;
                             // What a window costs moved, so what we can afford
@@ -1686,6 +1748,9 @@ fn main() {
         if let Some(rect) = dirty_rect.take() {
             let rect = rect.clamp(screen_w as usize, screen_h as usize);
             if rect.w > 0 && rect.h > 0 {
+                // Two clock syscalls per composited frame — 120/s at the frame
+                // cap — which is what any measure of a frame costs here.
+                let composite_start = Instant::now();
                 redraw(&screen, &font, &windows, &icons, &wallpaper, launcher_open, &cached_stats, rect);
 
                 // Draw software cursor if no hardware cursor
@@ -1696,7 +1761,12 @@ fn main() {
                         _ => &cursor_default,
                     };
                     draw_software_cursor(&screen, sprite, cursor_x, cursor_y);
+                    frame_stats.cursor_draws += 1;
                 }
+                let composited_at = Instant::now();
+                frame_stats.record(
+                    composited_at.duration_since(composite_start).as_nanos() as u64,
+                );
 
                 gpu::present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32)
                     .expect("compositor owns the framebuffer");
@@ -1709,6 +1779,13 @@ fn main() {
                     }
                 }
 
+                if composited_at >= next_frame_stats {
+                    let traffic = screen.traffic();
+                    frame_stats.report(traffic.since(reported_traffic), windows.len());
+                    frame_stats = FrameStats::default();
+                    reported_traffic = traffic;
+                    next_frame_stats = composited_at + STATS_INTERVAL;
+                }
             }
         }
     }
