@@ -25,7 +25,7 @@ The name has no meaning. This is not a hobby project. The quality bar is the sam
 
 **Userspace daemons** — compositor, netd, soundd, sshd. Each claims a device from the kernel, maps hardware buffers into its own memory, and serves clients over IPC. Crash a daemon, the kernel is fine.
 
-**IPC** — Named services via listen/accept/connect. Pipes backed by shared-memory ring buffers.
+**IPC** — Named services via listen/accept/connect. Pipes backed by shared-memory ring buffers. **A server never blocks on a client**: accept and the first frame are two events, a frame is buffered until whole before anything acts on it, and a write is one `try_send` whose refusal drops the peer by name. `ipc::recv_header`/`recv_payload`/`send` on a peer's fd is a client deciding when the server runs again — the compositor is the worked example, netd still has the old shape.
 
 **Memory** — 2MB pages only. Demand paging. Shared memory across processes.
 
