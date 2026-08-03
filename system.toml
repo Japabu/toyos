@@ -1,6 +1,5 @@
 # Init programs (run at boot, in order)
 init = [
-    "/bin/toybox locale --load",
     "/bin/compositor",
     "/bin/soundd",
     "/bin/netd",

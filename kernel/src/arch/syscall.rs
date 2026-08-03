@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use super::{apic, cpu, gdt};
 use crate::drivers::acpi;
 use crate::user_ptr::SyscallContext;
-use crate::{device, fd, keyboard, listener, log, pipe, process, shared_memory, vfs};
+use crate::{device, fd, listener, log, pipe, process, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
 
 // MSR addresses

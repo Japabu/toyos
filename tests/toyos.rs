@@ -44,10 +44,9 @@ const RUST_SKIP: &[&str] = &[
     // Needs a boot image the harness staged a file into before the machine
     // started, which only `esp_filesystem` builds.
     "esp_files",
-    // Three modes, each waiting to be typed at through QMP; on its own nothing
-    // ever answers it. `swiss_german_layout`, `locale_detect`,
-    // `locale_detect_unrecognized` and `locale_detect_refuses_a_held_keyboard`
-    // drive it.
+    // Two modes, each waiting to be typed at through QMP; on its own nothing
+    // ever answers it. `swiss_german_layout`, `locale_detect` and
+    // `locale_detect_unrecognized` drive it.
     "locale_gate",
 ];
 
@@ -154,7 +153,10 @@ const MACHINE_TESTS: &[&str] = &[
     "swiss_german_layout",
     "locale_detect",
     "locale_detect_unrecognized",
-    "locale_detect_refuses_a_held_keyboard",
+    // The wizard on the two surfaces the machine actually has, rather than on
+    // the stand-in `locale_gate` is. Each costs a boot of a different image.
+    "console_locale_detect",
+    "desktop_locale_detect",
     "i8042_absent",
     "i8042_quarantine",
     "i8042_budget_expiry",
@@ -2375,8 +2377,9 @@ fn boot_i8042_trace(
 /// activates one input handler per device class, so with a USB HID present the
 /// injected keys would not reach the i8042 — and these tests are about which
 /// HID usage a physical key position reports. `tests/testcases` boots neither
-/// the compositor nor `/bin/console`, so the keyboard claim is free, which is
-/// what `locale detect` needs.
+/// the compositor nor `/bin/console`, so the keyboard claim is free for
+/// `locale_gate` to take — which it does, because it is standing in for a
+/// surface and a surface holds the keyboard.
 fn boot_locale(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -2691,6 +2694,15 @@ fn swiss_german_layout(qemu: &mut QemuInstance) -> Result<(), String> {
     if !result.stdout.contains("locale: Keyboard layout set to 'swiss-german'") {
         return Err(format!("the real command did not select the layout:\n{}", result.stdout));
     }
+    // And the surface was told, and re-read the config rather than being sent
+    // a name it had to trust. Without this the assertion below would pass on a
+    // gate binary that had simply been built with the layout hard-coded.
+    if !result.stdout.contains("surface: layout is now swiss-german") {
+        return Err(format!(
+            "the surface hosting `locale` never re-read the config it wrote:\n{}",
+            result.stdout
+        ));
+    }
 
     let events = parse_key_events(&result.stdout);
     if events.is_empty() {
@@ -2755,6 +2767,12 @@ fn locale_detect(qemu: &mut QemuInstance) -> Result<(), String> {
         "detect: Press the key labelled  \u{a7}",
         "detect: That is 'swiss-german'",
         "detect: Keyboard layout set to 'swiss-german'",
+        // The wizard held the surface's keys for the whole conversation, and
+        // the surface acted on the config it wrote. Both are new: this ran on
+        // a machine whose keyboard the gate binary claims, which is the state
+        // that used to make the wizard refuse.
+        "surface: pid",
+        "surface: layout is now swiss-german",
     ] {
         if !result.stdout.contains(want) {
             return Err(format!("no {want:?} in:\n{}", result.stdout));
@@ -2793,30 +2811,192 @@ fn locale_detect_unrecognized(qemu: &mut QemuInstance) -> Result<(), String> {
     Ok(())
 }
 
-/// The wizard needs the keyboard device, which is claimed exclusively — so it
-/// refuses by name rather than reading translated bytes and guessing.
-fn locale_detect_refuses_a_held_keyboard(qemu: &mut QemuInstance) -> Result<(), String> {
-    // Hooked with no marker so it fires on the first line: this test injects
-    // nothing of its own, and without the keys the ring would hold its last
-    // line. The wizard cannot read them — that is the property under test.
-    let result = qemu.run_test_hooked(
-        "test_rs_locale_gate busy",
-        Duration::from_secs(20),
-        "",
-        |socket| keep_the_ring_moving(&mut qemu::QmpInput::open(socket)),
-    );
-    if let Some(err) = &result.error {
-        return Err(format!("{err}\n{}", result.stdout));
+/// Keep collecting serial into `log` until `marker` shows up.
+///
+/// The layout surfaces have no in-guest test runner, so there is no
+/// `===TEST_END===` and nothing to hook: the assertion is what a real program
+/// printed on the console of a real image.
+fn serial_until(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    marker: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        log.push_str(&qemu.drain_serial(Duration::from_millis(200)));
+        if log.contains(marker) {
+            return true;
+        }
     }
-    if !result.stdout.contains("detect-err: locale: cannot read the keyboard directly") {
-        return Err(format!("the wizard did not refuse a held keyboard:\n{}", result.stdout));
+    false
+}
+
+/// The wizard's two answers, as a Swiss keyboard's owner gives them: the key
+/// that prints `Z`, the key that prints `§`, then Enter to confirm.
+const SWISS_ANSWERS: [&str; 3] = ["y", "grave_accent", "ret"];
+
+/// Type `line` and press Enter, at whatever prompt is in front of the guest.
+fn type_line(input: &mut qemu::QmpInput, line: &str) {
+    input.type_text(line);
+    input.keys(&[("ret", true), ("ret", false)]);
+}
+
+/// Wait until keys typed at the guest reach a shell and come back out.
+///
+/// **There is no prompt to wait for.** `/bin/shell` writes `"{cwd}> "` with no
+/// newline and the harness's serial reader is line-based, so the prompt is not
+/// a line and never will be — which is why `screen_console_shell` reads the
+/// panel instead. The handshake here is a command whose *echo* is a line, and
+/// it is retried because the first keystrokes can land before the shell has
+/// its stdin.
+fn shell_answers(qemu: &mut QemuInstance, log: &mut String) -> bool {
+    const NONCE: &str = "surface-up-zqjxk";
+    for _ in 0..10 {
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            type_line(&mut input, &format!("echo {NONCE}"));
+        }
+        if serial_until(qemu, log, NONCE, Duration::from_secs(2)) {
+            return true;
+        }
     }
-    if !result.stdout.contains("locale --list") {
-        return Err(format!("the refusal did not say what to do instead:\n{}", result.stdout));
+    false
+}
+
+/// The wizard under `/bin/console`, which is the whole of the surface tree on
+/// a machine with no compositor — and the image that gets flashed.
+///
+/// This is one of the two tests that replaced the refusal gate. `/bin/console`
+/// claims the keyboard for its entire run, which is exactly the state that
+/// used to make `locale detect` print "cannot read the keyboard directly" and
+/// stop; the wizard now asks the console for the transitions instead. The
+/// closing assertion is that the console's *own* translator moved with the
+/// config: the key a US board prints `[` on types `ü` afterwards, and nothing
+/// but a re-read of the file this wizard wrote can do that.
+fn console_locale_detect() -> Result<(), String> {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("console");
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        qmp: true,
+        ready_marker: "console: ready",
+        ..Default::default()
+    };
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let mut log = qemu.boot_log().to_string();
+    if !shell_answers(&mut qemu, &mut log) {
+        return Err(format!("nothing typed at /bin/console reached a shell:\n{log}"));
     }
-    if result.stdout.contains("Press the key labelled") {
-        return Err(format!("the wizard asked for a key it could not read:\n{}", result.stdout));
+
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "locale detect");
+        if !serial_until(&mut qemu, &mut log, "Press the key labelled", Duration::from_secs(20)) {
+            return Err(format!(
+                "the wizard never asked for a key under /bin/console — the console did not \
+                 lend it the keyboard\n{log}"
+            ));
+        }
+        for key in SWISS_ANSWERS {
+            input.keys(&[(key, true), (key, false)]);
+            thread::sleep(Duration::from_millis(120));
+        }
     }
+
+    for want in ["That is 'swiss-german'", "Keyboard layout set to 'swiss-german'"] {
+        if !serial_until(&mut qemu, &mut log, want, Duration::from_secs(20)) {
+            return Err(format!("no {want:?} under /bin/console:\n{log}"));
+        }
+    }
+    // The console acted on the notification. A prefix, not the whole line: the
+    // console is shared and not line-atomic, so a kernel line lands inside
+    // this one often enough to matter (it did, first time this ran). *Which*
+    // layout it re-read is the assertion below, which does not depend on a
+    // line surviving intact.
+    if !serial_until(&mut qemu, &mut log, "console: keyboard layout", Duration::from_secs(10)) {
+        return Err(format!("the console never re-read the config the wizard wrote:\n{log}"));
+    }
+
+    // And the layout is in force for what is typed next. `bracket_left` is the
+    // key a US board prints `[` on and a Swiss one prints `ü` on, so this is
+    // the substitution the whole exercise exists to make, taken through the
+    // console's translator and the shell.
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        input.type_text("echo ");
+        input.keys(&[("bracket_left", true), ("bracket_left", false)]);
+        input.keys(&[("ret", true), ("ret", false)]);
+    }
+    if !serial_until(&mut qemu, &mut log, "\u{fc}", Duration::from_secs(20)) {
+        return Err(format!(
+            "typing the `[` key after the wizard did not produce `ü`, so the console is still \
+             translating with the layout it booted with\n{log}"
+        ));
+    }
+    eprintln!("  [console] the wizard identified swiss-german and the console adopted it");
+    Ok(())
+}
+
+/// The wizard under `/bin/terminal`, on a desktop.
+///
+/// The other half of the refusal gate's replacement, and the deepest the
+/// surface tree goes: the compositor claims the keyboard and forwards whole
+/// transitions to the focused window, `window::Window` holds the terminal's
+/// translator, and the terminal lends the transitions to the wizard three
+/// processes below it. Every one of those hops is a place the old design had
+/// nothing but translated bytes.
+fn desktop_locale_detect() -> Result<(), String> {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopcase");
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        qmp: true,
+        ready_marker: "compositor: ready",
+        ..Default::default()
+    };
+    metal_sim_argv_check(&qemu::profile_argv(&options))?;
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let mut log = qemu.boot_log().to_string();
+    if !shell_answers(&mut qemu, &mut log) {
+        return Err(format!("nothing typed at the terminal window reached a shell:\n{log}"));
+    }
+
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "locale detect");
+        if !serial_until(&mut qemu, &mut log, "Press the key labelled", Duration::from_secs(20)) {
+            return Err(format!(
+                "the wizard never asked for a key inside a terminal — the compositor or the \
+                 terminal did not carry the transitions\n{log}"
+            ));
+        }
+        for key in SWISS_ANSWERS {
+            input.keys(&[(key, true), (key, false)]);
+            thread::sleep(Duration::from_millis(120));
+        }
+    }
+
+    for want in ["That is 'swiss-german'", "Keyboard layout set to 'swiss-german'"] {
+        if !serial_until(&mut qemu, &mut log, want, Duration::from_secs(20)) {
+            return Err(format!("no {want:?} inside a terminal:\n{log}"));
+        }
+    }
+
+    // The same substitution as the console gate, one surface deeper: the
+    // config went up to the compositor and came back down to this window's
+    // translator.
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        input.type_text("echo ");
+        input.keys(&[("bracket_left", true), ("bracket_left", false)]);
+        input.keys(&[("ret", true), ("ret", false)]);
+    }
+    if !serial_until(&mut qemu, &mut log, "\u{fc}", Duration::from_secs(20)) {
+        return Err(format!(
+            "typing the `[` key after the wizard did not produce `ü`, so the compositor's \
+             broadcast never reached the terminal's translator\n{log}"
+        ));
+    }
+    eprintln!("  [desktop] the wizard ran three processes below the compositor");
     Ok(())
 }
 
@@ -3325,9 +3505,8 @@ fn run_machine_test(
         "locale_detect_unrecognized" => {
             locale_detect_unrecognized(&mut boot_locale(test_config, c_bins, rust_bins))
         }
-        "locale_detect_refuses_a_held_keyboard" => {
-            locale_detect_refuses_a_held_keyboard(&mut boot_locale(test_config, c_bins, rust_bins))
-        }
+        "console_locale_detect" => console_locale_detect(),
+        "desktop_locale_detect" => desktop_locale_detect(),
         "xhci_many_devices" => {
             // The T14's internal controller carries a camera, Bluetooth and a
             // fingerprint reader next to the boot stick, and every profile in

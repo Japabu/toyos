@@ -16,6 +16,20 @@ pub use toyos_abi::input::{RawKeyEvent, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_GUI, M
 static KEY_BUF: Lock<VecDeque<RawKeyEvent>> = Lock::new(VecDeque::new());
 static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
 
+/// How many transitions the kernel holds for a reader that is not reading.
+///
+/// Policy, not physics: nothing about a keyboard says 512, and the queue used
+/// to have no bound at all, so a machine whose only reader had exited grew it
+/// for as long as anyone leaned on a key. **The overflow policy is
+/// drop-oldest** — what is worth keeping when nobody is reading is what was
+/// typed most recently, and a queue that refuses new events instead would
+/// answer the eventual reader with the first 512 transitions after it stopped
+/// and none of the ones since.
+///
+/// 1 KiB at two bytes an event, and about ten seconds of a stuck typematic
+/// repeat.
+pub const MAX_QUEUED_EVENTS: usize = 512;
+
 /// Ctrl+Alt+D is recorded here, not acted on. `handle_key` runs under whichever
 /// driver's guard produced the transition — `PS2` on the i8042 path, `XHCI` on
 /// the USB one — and `dump_blocked` walks the scheduler and logs a line per
@@ -109,11 +123,22 @@ pub fn handle_key(usage: u8, pressed: bool) -> bool {
         return false;
     }
 
-    KEY_BUF.lock().push_back(RawKeyEvent {
+    let mut buf = KEY_BUF.lock();
+    if buf.len() >= MAX_QUEUED_EVENTS {
+        buf.pop_front();
+    }
+    buf.push_back(RawKeyEvent {
         keycode: usage,
         modifiers: if pressed { modifiers } else { modifiers | MOD_RELEASED },
     });
     true
+}
+
+/// Throw away everything queued. Called when the device changes hands: what
+/// was typed while nobody was reading belongs to nobody, and handing it to the
+/// next claimant gives one program another's keystrokes.
+pub fn discard_queued() {
+    KEY_BUF.lock().clear();
 }
 
 /// Synthesise a release for every held usage. The self-heal for a keyboard

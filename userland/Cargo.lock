@@ -489,6 +489,7 @@ dependencies = [
  "font",
  "terminal",
  "toyos",
+ "toyos-abi",
  "window",
 ]
 
@@ -3913,6 +3914,7 @@ dependencies = [
  "font",
  "toyos",
  "toyos-abi",
+ "toyos-keymap",
 ]
 
 [[package]]

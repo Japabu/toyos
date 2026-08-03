@@ -367,7 +367,8 @@ pub enum RxStep {
 /// read and discarded, so a peer cannot make the server hold what it will not
 /// look at. A protocol whose messages are all bare headers takes `KEEP = 0`.
 pub struct FrameRx<const KEEP: usize> {
-    buf: [u8; IpcHeader::WIRE_SIZE + KEEP],
+    header: [u8; IpcHeader::WIRE_SIZE],
+    buf: [u8; KEEP],
     len: usize,
     state: RxState,
 }
@@ -386,7 +387,12 @@ impl<const KEEP: usize> Default for FrameRx<KEEP> {
 
 impl<const KEEP: usize> FrameRx<KEEP> {
     pub const fn new() -> Self {
-        Self { buf: [0; IpcHeader::WIRE_SIZE + KEEP], len: 0, state: RxState::Header }
+        Self {
+            header: [0; IpcHeader::WIRE_SIZE],
+            buf: [0; KEEP],
+            len: 0,
+            state: RxState::Header,
+        }
     }
 
     /// The payload of the frame the last [`RxStep::Frame`] announced.
@@ -403,13 +409,13 @@ impl<const KEEP: usize> FrameRx<KEEP> {
         loop {
             match self.state {
                 RxState::Header => {
-                    match fill(conn, &mut self.buf[..IpcHeader::WIRE_SIZE], &mut self.len) {
+                    match fill(conn, &mut self.header, &mut self.len) {
                         Fill::Idle => return RxStep::Idle,
                         Fill::Eof => return RxStep::Eof,
                         Fill::Filled => {}
                     }
-                    let msg_type = u32::from_ne_bytes(self.buf[0..4].try_into().unwrap());
-                    let wire_len = u32::from_ne_bytes(self.buf[4..8].try_into().unwrap());
+                    let msg_type = u32::from_ne_bytes(self.header[0..4].try_into().unwrap());
+                    let wire_len = u32::from_ne_bytes(self.header[4..8].try_into().unwrap());
                     // The bound belongs to `IpcHeader`, so it is asked rather
                     // than restated: a length past `MAX_FRAME_LEN` is a frame
                     // this endpoint refuses to describe, not a long one.

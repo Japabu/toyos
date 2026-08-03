@@ -283,7 +283,7 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
     };
     let sources = [desc.read_source(), desc.write_source()];
     if sources.iter().any(|s| s.is_some()) {
-        crate::io_uring::remove_fd(fd, &sources);
+        crate::io_uring::remove_fd(&sources);
     }
     match &desc {
         Descriptor::File(file) => {

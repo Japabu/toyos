@@ -1,3 +1,11 @@
+//! A shell in a window: the compositor's keys in, the emulator's pixels out.
+//!
+//! It is a surface in both directions. Above it the compositor forwards whole
+//! key transitions and `window::Window` holds this process's translator;
+//! below it `toyos::surface::Host` lets a child ask for the transitions
+//! instead of the bytes, which is what `locale detect` needs and what a
+//! terminal writing only translated bytes into a pipe could never give it.
+
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::toyos::process;
@@ -5,12 +13,26 @@ use std::process::Command;
 
 use terminal::Console;
 use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::surface::{self, Delivery, Host, Notice};
 use toyos::Fd;
 use window::Window;
 
+const TOKEN_STDOUT: u64 = 0;
+const TOKEN_STDERR: u64 = 1;
+const TOKEN_WINDOW: u64 = 2;
+const TOKEN_LISTEN: u64 = 3;
+const TOKEN_CLIENT: u64 = 4;
+
 fn main() {
+    let mut name = [0u8; surface::MAX_NAME];
+    let name = surface::service_name(std::process::id(), &mut name).to_string();
+    // The name is this process's pid, so nothing else can be holding it: a
+    // refusal here is the kernel's registry disagreeing with `getpid`.
+    let mut host = Host::listen(&name).expect("terminal: cannot serve its own surface name");
+
     // Spawn shell first so it initializes while we load the font
     let mut child = Command::new("/bin/shell")
+        .env(surface::HOST_ENV, &name)
         .stdin(process::tty_piped())
         .stdout(process::tty_piped())
         .stderr(process::tty_piped())
@@ -28,19 +50,23 @@ fn main() {
     let mut shell_stdin = child.stdin.take().unwrap();
     let mut shell_stdout = child.stdout.take().unwrap();
     let mut shell_stderr = child.stderr.take().unwrap();
-    let poller = Poller::new(4);
+    let poller = Poller::new(3 + Host::POLL_HANDLES);
 
     loop {
-        poller.poll_add_fd(Fd(shell_stdout.as_raw_fd()), IORING_POLL_IN, 0);
-        poller.poll_add_fd(Fd(shell_stderr.as_raw_fd()), IORING_POLL_IN, 1);
-        poller.poll_add_fd(window.fd(), IORING_POLL_IN, 2);
+        poller.poll_add_fd(Fd(shell_stdout.as_raw_fd()), IORING_POLL_IN, TOKEN_STDOUT);
+        poller.poll_add_fd(Fd(shell_stderr.as_raw_fd()), IORING_POLL_IN, TOKEN_STDERR);
+        poller.poll_add_fd(window.fd(), IORING_POLL_IN, TOKEN_WINDOW);
+        poller.poll_add_fd(host.listener_fd(), IORING_POLL_IN, TOKEN_LISTEN);
+        for fd in host.client_fds() {
+            poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
+        }
 
-        let mut ready = [false; 3];
+        let mut ready = [false; 5];
         poller.wait(1, u64::MAX, |token| {
-            if (token as usize) < 3 { ready[token as usize] = true; }
+            if (token as usize) < ready.len() { ready[token as usize] = true; }
         });
 
-        if ready[0] {
+        if ready[TOKEN_STDOUT as usize] {
             let mut buf = [0u8; 4096];
             let n = shell_stdout.read(&mut buf).unwrap_or(0);
             if n == 0 {
@@ -51,7 +77,7 @@ fn main() {
             window.present();
         }
 
-        if ready[1] {
+        if ready[TOKEN_STDERR as usize] {
             let mut buf = [0u8; 4096];
             let n = shell_stderr.read(&mut buf).unwrap_or(0);
             if n > 0 {
@@ -61,18 +87,44 @@ fn main() {
             }
         }
 
-        if ready[2] {
+        if ready[TOKEN_LISTEN as usize] {
+            host.accept();
+        }
+
+        while let Some(notice) = host.poll() {
+            match notice {
+                // Up, not down: the compositor is the root of the tree and
+                // broadcasts to every window, this one included, so the
+                // re-read arrives back through `Event::LayoutChanged`.
+                Notice::LayoutChanged => window.notify_layout_changed(),
+                Notice::Grabbed { pid } => {
+                    eprintln!("terminal: pid {pid} has the keyboard until it exits")
+                }
+                Notice::Released { pid } => eprintln!("terminal: pid {pid} gave the keyboard back"),
+                Notice::Dropped { pid, why } => {
+                    eprintln!("terminal: dropping pid {pid} — {why}")
+                }
+            }
+        }
+
+        if ready[TOKEN_WINDOW as usize] {
             match window.recv_event() {
-                window::Event::KeyInput(event) => {
-                    if event.gui() && event.keycode == 0x06 {
-                        // Cmd+C: copy selection to clipboard
-                        if let Some(text) = console.get_selection() {
-                            window::clipboard_set(&text);
-                        }
-                    } else if event.len > 0 {
-                        shell_stdin.write_all(&event.translated[..event.len as usize]).ok();
+                // A client holding the grab takes the transition whole, and
+                // the translator is not advanced — see `Window::text`.
+                window::Event::KeyInput(key) if host.deliver(key.into()) == Delivery::Sent => {}
+                window::Event::KeyInput(key) if key.gui() && key.keycode == 0x06 => {
+                    // Cmd+C: copy selection to clipboard
+                    if let Some(text) = console.get_selection() {
+                        window::clipboard_set(&text);
                     }
                 }
+                window::Event::KeyInput(key) => {
+                    let press = window.press(key);
+                    if !press.text().is_empty() {
+                        shell_stdin.write_all(press.text().as_bytes()).ok();
+                    }
+                }
+                window::Event::LayoutChanged => host.notify_layout(),
                 window::Event::ClipboardPaste(data) => {
                     shell_stdin.write_all(&data).ok();
                 }

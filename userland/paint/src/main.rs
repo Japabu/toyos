@@ -1,7 +1,7 @@
 use filepicker_api::PickerMode;
 use font::Font;
 use std::collections::VecDeque;
-use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
+use window::{Color, Event, Framebuffer, KeyPress, MouseEvent, Window};
 
 // Layout
 const TOOLBAR_HEIGHT: usize = 32;
@@ -990,15 +990,11 @@ impl PaintApp {
         }
     }
 
-    fn handle_key(&mut self, ev: KeyEvent) {
+    fn handle_key(&mut self, ev: KeyPress) {
         if ev.released() { return; }
 
         let cmd = ev.ctrl() || ev.gui();
-        let ch = if ev.len > 0 {
-            Some(ev.translated[0] as char)
-        } else {
-            None
-        };
+        let ch = ev.text().chars().next();
 
         if cmd {
             match ch.map(|c| c.to_ascii_lowercase()) {
@@ -1085,7 +1081,10 @@ impl PaintApp {
         loop {
             match self.window.poll_event(50_000_000) {
                 Some(Event::MouseInput(ev)) => self.handle_mouse(ev),
-                Some(Event::KeyInput(ev)) => self.handle_key(ev),
+                Some(Event::KeyInput(ev)) => {
+                    let press = self.window.press(ev);
+                    self.handle_key(press);
+                }
                 Some(Event::Resized) => self.handle_resize(),
                 Some(Event::Close) => break,
                 _ => {}
