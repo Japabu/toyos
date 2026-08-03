@@ -574,14 +574,25 @@ controllers). A unique GUID is minted once and never means anything else. It is
 the same identity, in the same raw byte order with no conversion on either side,
 that `boot_partition_guid` and `log_partition_guid` already use.
 
-**Consequence, accepted deliberately: ToyOS cannot make a blank disk usable.**
-A disk with no GPT has no partition GUIDs to name, and the kernel writing a
-partition table is a strictly larger authority than formatting a partition it was
-handed. Partition the disk with a host tool (or, later, a userland `disk`
-partition editor that writes through an explicitly adopted *device* — a separate
-decision, not this one). This is not a gap; it is CLAUDE.md's rule holding under
-pressure: *the kernel is given its partitions by the bootloader, never asked to
-find any.*
+**Scope this wave defers — NOT a limit on ToyOS (owner ruling, 2026-08-04):
+this wave does not make a blank disk usable, and the infrastructure must never
+assume it can't.** ToyOS is a full operating system; erasing a device, writing a
+GPT, laying down partitions, and installing alongside another OS on the internal
+NVMe (dual-boot beside Windows) are all wanted features, and the consent model
+here must extend to them without being redesigned. What this wave builds is the
+*narrower* authority — format a partition the disk already names — because it is
+the piece HDA and `/home` need first, not because whole-disk authority is
+forbidden. The design carries the seam: adoption is expressed against a **device
+and a witnessed layout**, so "adopt this whole disk and write it a new GPT" is
+the same consent shape with the unit widened from partition to device, and the
+witness widened from "this partition in this state" to "this device with exactly
+this table (or empty)". The dual-boot case is the north star that keeps the
+model honest: writing partitions into a disk's free space must never be able to
+touch an extent the witness did not account for — which is *stronger* care than
+this wave needs, not weaker, and is why the model is built witness-first now.
+CLAUDE.md's rule — *the kernel is given its partitions by the bootloader, never
+asked to find any* — governs the **boot** identity, not what an explicitly
+adopted device may later become.
 
 **I2 — Naming is necessary and not sufficient: the request carries a second,
 independent account.** `KernelArgs` already carries firmware's LBA and length

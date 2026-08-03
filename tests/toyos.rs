@@ -107,11 +107,16 @@ const GRAFFITI: [u8; 3] = [0x00, 0xC0, 0x00];
 /// so each costs its own. `run_machine_test` dispatches them.
 /// Feature-carrying ones last, as SCREEN_TESTS does: each distinct kernel
 /// feature set is another kernel rebuild.
+///
+/// A few adjacent runs of names share *one* boot between them — see
+/// [`group_boot`], which is what makes adjacency here load-bearing rather than
+/// tidy.
 const MACHINE_TESTS: &[&str] = &[
     "ioapic_topology",
     "input_merge",
-    "metal_sim_compositor",
     "metal_sim_input",
+    // One boot from here to `metal_sim_compositor_stall` (`METAL_SIM_DESKTOP`).
+    "metal_sim_compositor",
     "metal_sim_window_caps",
     "metal_sim_ipc_hostile_peer",
     "metal_sim_compositor_stall",
@@ -131,6 +136,7 @@ const MACHINE_TESTS: &[&str] = &[
     "iommu_discovery",
     "readdir_bound",
     "i8042_health",
+    // And one from here to `i8042_mouse` (`I8042_TRACE`).
     "i8042_keyboard",
     "i8042_no_spurious_wake",
     "i8042_mouse",
@@ -2222,6 +2228,132 @@ fn catching(f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     })
 }
 
+/// The boot a run of adjacent machine tests shares.
+struct Boot {
+    group: &'static str,
+    qemu: QemuInstance,
+    /// What the group has collected off the console since the ready marker.
+    ///
+    /// **A console is a stream and `drain_serial` consumes it.** The first
+    /// member to wait for a line the compositor prints once takes that line
+    /// away from every later member — which cost `metal_sim_window_caps` the
+    /// `compositor: at most` line the first time these four shared a boot. So
+    /// the group holds the console and the members that read boot-time lines
+    /// read *this*, which carries the same text each of them got when it owned
+    /// the boot. It is not everything the guest ever said: a member wanting a
+    /// window that starts empty still drains for itself.
+    console: String,
+}
+
+/// The boot a run of adjacent machine tests shares, if one is up.
+type Grouped = Option<Boot>;
+
+const METAL_SIM_DESKTOP: &str = "metal-sim desktop";
+const I8042_TRACE: &str = "i8042 trace";
+
+impl Boot {
+    /// Drain for `dur` into the group's console, and hand back the whole of it.
+    fn drain(&mut self, dur: Duration) -> &str {
+        let more = self.qemu.drain_serial(dur);
+        self.console.push_str(&more);
+        &self.console
+    }
+}
+
+/// The shared boot this machine test runs on, or `None` if it owns its own.
+///
+/// **Two conditions decide membership and neither is cost.** No member may kill
+/// the guest, because the rest of the group is queued behind it; and no member
+/// may leave state a later one reads. `readdir_bound` is the standing
+/// counter-example — it fills `/tmp` to the VFS listing limit and would refuse
+/// every later `read_dir` in that guest — and it is why the answer has to be
+/// obviously no rather than probably. Where a member does write something the
+/// compositor holds, the group's order is the argument: the observer runs
+/// against an untouched desktop and the window cap runs before anything else
+/// has taken a window.
+///
+/// Adjacency in [`MACHINE_TESTS`] is what makes a group one boot rather than
+/// two: a non-member between two members takes the guest down, because only one
+/// may exist at a time (see [`run_machine_test`]).
+fn group_of(name: &str) -> Option<&'static str> {
+    match name {
+        "metal_sim_compositor"
+        | "metal_sim_window_caps"
+        | "metal_sim_ipc_hostile_peer"
+        | "metal_sim_compositor_stall" => Some(METAL_SIM_DESKTOP),
+        "i8042_keyboard" | "i8042_no_spurious_wake" | "i8042_mouse" => Some(I8042_TRACE),
+        _ => None,
+    }
+}
+
+/// The machine every member of `group` runs on, booted by the first member to
+/// ask for it.
+fn group_boot<'a>(
+    held: &'a mut Grouped,
+    group: &'static str,
+    boot: impl FnOnce() -> QemuInstance,
+) -> &'a mut Boot {
+    if held.is_none() {
+        let qemu = boot();
+        let console = qemu.boot_log().to_string();
+        *held = Some(Boot { group, qemu, console });
+    }
+    let up = held.as_mut().expect("just booted");
+    assert_eq!(up.group, group, "run_machine_test releases a boot before another group asks");
+    up
+}
+
+/// `tests/metalcase` on [`qemu::Profile::Metal`]: the T14's device shape with a
+/// compositor on the firmware framebuffer, carrying the three client binaries
+/// its members run.
+///
+/// Those three and not the whole rust set — metalcase's initrd is four programs
+/// and the rest would add tens of megabytes to a boot that needs three of them.
+fn boot_metal_sim_desktop(rust_bins: &[(String, Vec<u8>)]) -> QemuInstance {
+    const CLIENTS: [&str; 3] = ["window_caps", "ipc_hostile_peer", "compositor_stall"];
+    let missing: Vec<&str> = CLIENTS
+        .iter()
+        .copied()
+        .filter(|want| !rust_bins.iter().any(|(name, _)| name == want))
+        .collect();
+    assert!(missing.is_empty(), "the metal-sim clients were not built: {missing:?}");
+    let bins: Vec<(String, Vec<u8>)> = rust_bins
+        .iter()
+        .filter(|(name, _)| CLIENTS.contains(&name.as_str()))
+        .cloned()
+        .collect();
+
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        ..Default::default()
+    };
+    metal_sim_argv_check(&qemu::profile_argv(&options)).unwrap_or_else(|e| panic!("{e}"));
+    QemuInstance::boot_with_options(&config, &[], &bins, options)
+}
+
+/// Metal-sim with the i8042 driver's per-drain trace on and QMP open, which is
+/// how a test injects a key or a pointer packet and then reads what the driver
+/// made of it.
+fn boot_i8042_trace(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> QemuInstance {
+    // On metal-sim, because that is the machine the driver is for and the
+    // absent USB HID is what makes these tests measure anything: QEMU routes
+    // injected input to one handler per device class, and with a usb-kbd
+    // present that handler is not the PS/2 one.
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        qmp: true,
+        kernel_features: &["i8042-trace"],
+        ..Default::default()
+    };
+    metal_sim_argv_check(&qemu::profile_argv(&options)).unwrap_or_else(|e| panic!("{e}"));
+    QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options)
+}
+
 /// Every negative claim `Profile::Metal` makes, read off the argv QEMU is
 /// launched with. A claim about which devices do *not* exist is a claim about
 /// this list and nothing else — no console line and no screendump can see a
@@ -2255,14 +2387,629 @@ fn metal_sim_argv_check(argv: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Which processes survive the T14's device shape, in their own words.
+///
+/// The compositor claims a firmware framebuffer and says what it got, soundd
+/// and netd find no device and exit rather than panic. The earlier version
+/// read the bottom pixel row instead, which says nothing about soundd or netd
+/// and stayed green with their graceful exit reverted.
+///
+/// First in its group, and that is the assertion talking: `cursor == frames`
+/// and the stats line are read off a desktop no client has connected to yet.
+fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
+    // init spawns all four programs without waiting, so test-runner's
+    // ready marker races the daemons' own lines. Keep draining until
+    // every line has been said or the window closes.
+    const WANT: [&str; 3] = [
+        "compositor: ready",
+        "soundd: no audio device on this machine, exiting",
+        "netd: no NIC on this machine, exiting",
+    ];
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline
+        && !WANT.iter().all(|w| boot.console.contains(w))
+    {
+        boot.drain(Duration::from_millis(250));
+    }
+    for want in WANT {
+        if !boot.console.contains(want) {
+            return Err(format!("{want:?} never reached the console:\n{}", boot.console));
+        }
+    }
+    // The compositor's periodic self-measurement, which is how the
+    // T14 reports what compositing cost it once it is off the serial
+    // port and the log is only a file on the stick. It is emitted from
+    // a composited frame, so its absence is a compositor that stopped
+    // drawing as much as an instrument that never ran.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline
+        && !boot
+            .console
+            .lines()
+            .any(|l| l.contains("compositor: frames=") && l.contains("windows="))
+    {
+        boot.drain(Duration::from_millis(250));
+    }
+    // One more drain so the tail of that line cannot still be in
+    // flight when it is parsed.
+    boot.drain(Duration::from_millis(250));
+    let console = &boot.console;
+    // The compositor reports the mode it was handed, which is the
+    // proof it claimed a real firmware framebuffer rather than
+    // starting on nothing.
+    let Some(mode) = console
+        .lines()
+        .find_map(|l| l.split("compositor: wallpaper ").nth(1))
+    else {
+        return Err(format!(
+            "the compositor never said what framebuffer it got:\n{console}"
+        ));
+    };
+    let Some(stats) = console.lines().find(|l| l.contains("compositor: frames=")) else {
+        return Err(format!(
+            "the compositor never reported a composited frame:\n{console}"
+        ));
+    };
+    let field = |key: &str| -> Result<u64, String> {
+        let raw = stats
+            .split_whitespace()
+            .find_map(|f| f.strip_prefix(key))
+            .ok_or_else(|| format!("no {key} in the compositor's stats line: {stats}"))?;
+        raw.parse::<u64>()
+            .map_err(|_| format!("{key}{raw} is not a number: {stats}"))
+    };
+    let frames = field("frames=")?;
+    let min_us = field("composite_us_min=")?;
+    let max_us = field("composite_us_max=")?;
+    let total_us = field("composite_us_total=")?;
+    let cursor = field("cursor=")?;
+    // Read for their presence and their shape; what they measure is
+    // uncached reads, which QEMU's host-RAM framebuffer cannot show.
+    field("scanout_wr_bytes=")?;
+    field("scanout_rd_bytes=")?;
+    field("rd_px=")?;
+    field("rd_bulk=")?;
+    field("windows=")?;
+    if frames == 0 || total_us == 0 {
+        return Err(format!("the compositor reported a dead instrument: {stats}"));
+    }
+    if min_us > max_us || max_us > total_us {
+        return Err(format!("min/max/total do not order: {stats}"));
+    }
+    // GOP hands out no hardware cursor (`flags: 0`), so the compositor
+    // draws one into the scanout on every frame it composites.
+    if cursor != frames {
+        return Err(format!(
+            "{frames} frames on a shape with no hardware cursor drew {cursor} cursors: \
+             {stats}"
+        ));
+    }
+    // And nothing panicked on the way. A daemon that dies on its
+    // absent device fails the positive check above; this catches the
+    // rest of the boot dying instead.
+    serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+    eprintln!("  [metal-sim] compositor up on {}", mode.trim());
+    eprintln!("  [metal-sim] {}", stats.trim());
+    eprintln!("  [metal-sim] soundd and netd both exited on their absent device");
+    Ok(())
+}
+
+/// A key injected at the controller, decoded, mapped and delivered to a
+/// userland process — IRQ delivery, set-1 decode, the HID mapping and the
+/// shared translate/layout path, in one run.
+fn i8042_keyboard(boot: &mut Boot) -> Result<(), String> {
+    let qemu = &mut boot.qemu;
+    let boot = qemu.boot_log().to_string();
+    if !boot.contains("i8042: kbd set2+xlat (readback 0x41)") {
+        return Err(format!("the PS/2 keyboard never came up:\n{boot}"));
+    }
+
+    let result = qemu.run_test_hooked(
+        "test_rs_i8042_keyboard",
+        Duration::from_secs(20),
+        "===I8042_READY===",
+        |socket| {
+            for key in ["h", "e", "l", "l", "o"] {
+                qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
+                thread::sleep(Duration::from_millis(20));
+            }
+            qemu::qmp_send_keys(
+                socket,
+                &[("shift", true), ("b", true), ("b", false), ("shift", false)],
+            );
+            thread::sleep(Duration::from_millis(20));
+            for key in ["left", "esc"] {
+                qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
+                thread::sleep(Duration::from_millis(20));
+            }
+            // A modifier on its own, so a stuck one is visible.
+            qemu::qmp_send_keys(socket, &[("shift", true)]);
+            thread::sleep(Duration::from_millis(20));
+            qemu::qmp_send_keys(socket, &[("shift", false)]);
+        },
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+
+    let events = parse_key_events(&result.stdout);
+    if events.is_empty() {
+        return Err(format!("no key event reached userland:\n{}", result.stdout));
+    }
+    // Presses spell the injected text: IRQ delivery, set-1 decode,
+    // the HID mapping, the shared translate/layout path, and arrival
+    // in a userland process, in one assertion.
+    let typed: String = events
+        .iter()
+        .filter(|e| e.modifiers & 0x10 == 0)
+        .map(|e| e.translated.as_str())
+        .collect();
+    if !typed.contains("hello") {
+        return Err(format!("typed {typed:?}, want it to contain \"hello\""));
+    }
+    if !typed.contains('B') {
+        return Err(format!("typed {typed:?} — Shift+b did not produce a capital"));
+    }
+    if !typed.contains("\u{1b}[D") {
+        return Err(format!("typed {typed:?} — Left arrow produced no escape sequence"));
+    }
+    for want in [0x29u8, 0x50, 0xE1] {
+        if !events.iter().any(|e| e.usage == want) {
+            return Err(format!("no event for HID usage {want:#04x} in {events:?}"));
+        }
+    }
+    // Every press is matched by a release.
+    for usage in [0x0Bu8, 0x08, 0x0F, 0x12, 0x05, 0x29, 0x50, 0xE1] {
+        let presses = events.iter().filter(|e| e.usage == usage && e.modifiers & 0x10 == 0).count();
+        let releases = events.iter().filter(|e| e.usage == usage && e.modifiers & 0x10 != 0).count();
+        if presses == 0 || presses != releases {
+            return Err(format!(
+                "usage {usage:#04x}: {presses} presses, {releases} releases"
+            ));
+        }
+    }
+    // Nothing is left held: the bare Shift came back up.
+    let last = events.last().unwrap();
+    if last.modifiers & !0x10 != 0 {
+        return Err(format!("a modifier is stuck down: last event {last:?}"));
+    }
+    // And they came from the i8042, not from somewhere else.
+    let drained: usize = qemu
+        .boot_log()
+        .lines()
+        .chain(result.serial.lines())
+        .filter_map(trace_keys)
+        .filter(|&k| k > 0)
+        .sum();
+    if drained == 0 {
+        return Err("no i8042 drain reported a key event".to_string());
+    }
+    eprintln!("  [i8042] {} events to userland, {drained} from the driver", events.len());
+    Ok(())
+}
+
+/// The direct regression for the readiness defect: a stimulus that produces
+/// bytes and no events must produce no wake. Pause is that stimulus — six
+/// bytes, deliberately swallowed.
+///
+/// It drives the same in-guest reader as [`i8042_keyboard`], and not only for
+/// the userland half of the assertion: on a fully idle machine the kernel's
+/// log ring flushes one line behind, so the last trace line would never reach
+/// the console (filed in known-issues). A guest polling its fd keeps the ring
+/// moving.
+fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
+    let qemu = &mut boot.qemu;
+    let result = qemu.run_test_hooked(
+        "test_rs_i8042_keyboard",
+        Duration::from_secs(20),
+        "===I8042_READY===",
+        |socket| {
+            for _ in 0..2 {
+                qemu::qmp_send_keys(socket, &[("pause", true), ("pause", false)]);
+                thread::sleep(Duration::from_millis(50));
+                qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
+                thread::sleep(Duration::from_millis(50));
+            }
+        },
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+
+    let mut zero_event_drains = 0;
+    let mut key_drains = 0;
+    for line in result.serial.lines() {
+        let Some(keys) = trace_keys(line) else { continue };
+        let woke = line.contains("woke_kb=1");
+        if keys == 0 {
+            zero_event_drains += 1;
+            if woke {
+                return Err(format!("a drain with no events woke the queue: {line}"));
+            }
+        } else {
+            key_drains += 1;
+            if !woke {
+                return Err(format!("a drain with events did not wake the queue: {line}"));
+            }
+        }
+    }
+    if zero_event_drains == 0 {
+        return Err(format!(
+            "no drain produced zero events — the stimulus never landed:\n{}",
+            result.serial
+        ));
+    }
+    if key_drains == 0 {
+        return Err(format!("no drain produced any event:\n{}", result.serial));
+    }
+    // And the swallowed bytes stayed swallowed all the way out.
+    let events = parse_key_events(&result.stdout);
+    if events.iter().any(|e| e.usage == 0x48) {
+        return Err(format!("Pause reached userland as a key: {events:?}"));
+    }
+    if !events.iter().any(|e| e.usage == 0x04) {
+        return Err(format!("the real key never arrived: {events:?}"));
+    }
+    eprintln!(
+        "  [i8042] {zero_event_drains} zero-event drains, none woke; {key_drains} real ones, all did"
+    );
+    Ok(())
+}
+
+/// The TrackPoint path, and a thousand packets through the framer after it.
+fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
+    let qemu = &mut boot.qemu;
+    let boot = qemu.boot_log().to_string();
+    if !boot.contains("i8042: aux rate=100") {
+        return Err(format!("the TrackPoint path never came up:\n{boot}"));
+    }
+
+    const BURST: usize = 1000;
+    let result = qemu.run_test_hooked(
+        "test_rs_i8042_mouse",
+        Duration::from_secs(30),
+        "===I8042_MOUSE_READY===",
+        |socket| {
+            let mut input = qemu::QmpInput::open(socket);
+            // Off the origin first: the position clamps at 0, so a
+            // move up from there would be invisible.
+            input.mouse(100, 100, None);
+            thread::sleep(Duration::from_millis(100));
+            input.mouse(40, -30, None);
+            thread::sleep(Duration::from_millis(100));
+            input.mouse(0, 0, Some(("left", true)));
+            thread::sleep(Duration::from_millis(50));
+            input.mouse(0, 0, Some(("left", false)));
+            thread::sleep(Duration::from_millis(100));
+            // One command per packet, because QEMU syncs input once
+            // per command: 1000 commands is 1000 packets, 3000 bytes
+            // through the framer.
+            for i in 0..BURST {
+                input.mouse(if i % 2 == 0 { 1 } else { -1 }, 0, None);
+            }
+            thread::sleep(Duration::from_millis(200));
+            input.mouse(0, 0, Some(("left", true)));
+            thread::sleep(Duration::from_millis(50));
+            input.mouse(0, 0, Some(("left", false)));
+        },
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+
+    let events = parse_mouse_events(&result.stdout);
+    if events.len() < BURST / 2 {
+        return Err(format!(
+            "only {} pointer events reached userland, want at least {}",
+            events.len(),
+            BURST / 2
+        ));
+    }
+    // A sign error in dy is invisible to any test that only checks
+    // "it moved", and the PS/2 wire points the opposite way to the
+    // screen — so both directions are asserted separately.
+    if !events.windows(2).any(|w| w[1].x > w[0].x) {
+        return Err("the pointer never moved right".to_string());
+    }
+    if !events.windows(2).any(|w| w[1].y < w[0].y) {
+        return Err(format!(
+            "the pointer never moved up — dy inverted? ys: {:?}",
+            events.iter().take(8).map(|e| e.y).collect::<Vec<_>>()
+        ));
+    }
+    // PS/2 bit 0 is left, and so is HID boot-mouse bit 0.
+    if !events.iter().any(|e| e.buttons == 0x01) {
+        return Err(format!(
+            "no left-button-down event; buttons seen: {:?}",
+            events.iter().map(|e| e.buttons).collect::<std::collections::BTreeSet<_>>()
+        ));
+    }
+    // And after 3000 bytes of packets the framer is still aligned:
+    // the last click is reported as a click, not as motion or as the
+    // wrong button.
+    let last_press = events.iter().rposition(|e| e.buttons == 0x01);
+    let Some(last_press) = last_press else {
+        return Err("no button press at all".to_string());
+    };
+    if events[last_press..].last().map(|e| e.buttons) != Some(0x00) {
+        return Err(format!(
+            "framing drifted: after the final click the button state is {:?}",
+            events.last()
+        ));
+    }
+    // The T14's line, staged. Its log read
+    //   `6 bytes, 0 keys, 2 motion, no event from
+    //    [aux 0x08, aux 0x06, aux 0x08, aux 0x0e]`
+    // on a pointer that was framing perfectly: two whole packets, and
+    // the four bytes named were their heads and first body bytes. That
+    // sent a field investigation after a desync that had not happened.
+    // Three thousand bytes of healthy packets is the same claim with
+    // three orders of magnitude more of it: a driver that cannot tell a
+    // byte it is holding from a byte it threw away names two thirds of
+    // them here.
+    let named: Vec<&str> =
+        result.serial.lines().filter(|l| l.contains("no event from")).collect();
+    if !named.is_empty() {
+        return Err(format!(
+            "{BURST} clean packets and the driver still named bytes as undecodable:\n{}",
+            named.join("\n")
+        ));
+    }
+    // And the count that says so directly. A discard is the byte-level
+    // resync and nothing else, so an intact stream owes zero of them —
+    // which is what makes any non-zero value on the T14's next boot
+    // mean the pointer really did lose the frame.
+    if let Some(counters) = result.serial.lines().find(|l| l.contains("discarded")) {
+        if !counters.contains("0 discarded") {
+            return Err(format!("an intact pointer stream discarded bytes: {counters}"));
+        }
+        eprintln!("  [i8042] {}", counters.trim());
+    }
+    eprintln!(
+        "  [i8042] {} pointer events, last button state {:#04x}",
+        events.len(),
+        events.last().unwrap().buttons
+    );
+    Ok(())
+}
+
+/// The compositor's window cap, end to end, on the only config that boots a
+/// compositor an in-guest binary can talk to.
+///
+/// The assertion that matters is not "a refusal arrived" — it is that the
+/// number the compositor *derived* from total memory and the screen is the
+/// number of windows a client actually gets. A constant on both sides would
+/// agree with itself forever; this fails if the derivation and the enforcement
+/// ever drift apart.
+///
+/// Runs before the two clients that abuse the compositor, because a cap is
+/// only countable from a desktop with every window still free.
+fn metal_sim_window_caps(boot: &mut Boot) -> Result<(), String> {
+    // The compositor announces what it derived. Read rather than
+    // recomputed here: recomputing it would copy the formula into the
+    // test and stop asking whether the compositor uses it. Off the group's
+    // console, because the compositor says it once and an earlier member of
+    // the group has already drained the line off the wire.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !boot.console.contains("compositor: at most ") {
+        boot.drain(Duration::from_millis(250));
+    }
+    let Some(declared) = boot
+        .console
+        .lines()
+        .find_map(|l| l.split("compositor: at most ").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+    else {
+        return Err(format!(
+            "the compositor never said how many windows it would hold:\n{}",
+            boot.console
+        ));
+    };
+    if declared == 0 {
+        return Err("the compositor derived a cap of zero windows".to_string());
+    }
+
+    let result = boot.qemu.run_test("test_rs_window_caps", Duration::from_secs(120));
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if result.exit_code != Some(0) {
+        return Err(format!(
+            "window_caps exited {:?}:\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+
+    let Some(granted) = result
+        .stdout
+        .split("oversized refused, ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+    else {
+        return Err(format!("window_caps printed no count:\n{}", result.stdout));
+    };
+    if granted != declared {
+        return Err(format!(
+            "the compositor declared a cap of {declared} windows and granted \
+             {granted} — the derivation and the enforcement disagree:\n{}",
+            result.stdout
+        ));
+    }
+    eprintln!("  [metal-sim] compositor cap {declared} windows, {granted} granted then refused");
+    Ok(())
+}
+
+/// A client that lies about its frame lengths.
+///
+/// The guest binary carries the assertions — it is the only side that can see
+/// whether the compositor closed the connection it ruled on — so the host's
+/// job is to boot it and to insist the count it reports is the whole case
+/// list. A guest that skipped cases would otherwise exit 0 having proved
+/// nothing.
+fn metal_sim_ipc_hostile_peer(boot: &mut Boot) -> Result<(), String> {
+    let qemu = &mut boot.qemu;
+    let result = qemu.run_test("test_rs_ipc_hostile_peer", Duration::from_secs(120));
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if result.exit_code != Some(0) {
+        return Err(format!(
+            "ipc_hostile_peer exited {:?}:\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+    let Some(refused) = result
+        .stdout
+        .split("hostile peer: ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+    else {
+        return Err(format!(
+            "ipc_hostile_peer printed no count:\n{}",
+            result.stdout
+        ));
+    };
+    // The guest's own case list, restated here so a case deleted on
+    // one side is a red run rather than a quieter test.
+    const CASES: usize = 3;
+    if refused != CASES {
+        return Err(format!(
+            "the compositor refused {refused} malformed frames, not {CASES}:\n{}",
+            result.stdout
+        ));
+    }
+    eprintln!("  [metal-sim] {refused} malformed frames refused, compositor still serving");
+    Ok(())
+}
+
+/// A client that stops talking, stops listening, or never stops.
+///
+/// The guest carries the "is it still answering" half, because only it can put
+/// a deadline on the answer; the host carries the half the guest cannot see —
+/// whether the desktop is still *painting*, and whether every client the
+/// compositor got rid of was named.
+///
+/// The two halves are not redundant. A compositor parked on one client answers
+/// nobody, so the guest catches that; a compositor livelocked on one client
+/// answers everybody and draws nothing, which only the frame counter shows.
+///
+/// Last in its group: it is the one that abuses the compositor hardest, and
+/// its own final assertion is that the desktop is still compositing after it.
+fn metal_sim_compositor_stall(boot: &mut Boot) -> Result<(), String> {
+    let qemu = &mut boot.qemu;
+    let result = qemu.run_test("test_rs_compositor_stall", Duration::from_secs(240));
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if result.exit_code != Some(0) {
+        return Err(format!(
+            "compositor_stall exited {:?}:\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+    // The guest's own case list, restated here so a case deleted on
+    // one side is a red run rather than a quieter test.
+    const CASES: usize = 6;
+    if !result
+        .stdout
+        .contains(&format!("compositor stall: {CASES} stalls survived"))
+    {
+        return Err(format!(
+            "the guest did not report {CASES} survived stalls:\n{}",
+            result.stdout
+        ));
+    }
+
+    let frames = |text: &str| text.matches("compositor: frames=").count();
+
+    // Starvation, which is the one shape the guest cannot see. Between
+    // these two markers one window is sending on every pass; a drain
+    // loop that ends only when nothing is ready never gets to `redraw`
+    // and this window holds zero frames.
+    let Some(stream) = result
+        .stdout
+        .split("compositor stall: stream start")
+        .nth(1)
+        .and_then(|rest| rest.split("compositor stall: stream end").next())
+    else {
+        return Err(format!(
+            "the guest never bracketed its streaming window:\n{}",
+            result.stdout
+        ));
+    };
+    if frames(stream) == 0 {
+        return Err(format!(
+            "the compositor composited nothing while one client streamed:\n{stream}"
+        ));
+    }
+
+    // Dropped by name, never silently. Three connections never finish
+    // a first frame, and one window stops reading its mail.
+    const TIMED_OUT: &str = "it never finished its first message";
+    let timed_out = result.stdout.matches(TIMED_OUT).count();
+    if timed_out < 3 {
+        return Err(format!(
+            "three connections went quiet mid-handshake and {timed_out} were named:\n{}",
+            result.stdout
+        ));
+    }
+    const NOT_READING: &str = "it is not reading";
+    if !result.stdout.contains(NOT_READING) {
+        return Err(format!(
+            "a window stopped reading and the compositor never said so:\n{}",
+            result.stdout
+        ));
+    }
+
+    // And it is still painting once every stall is behind it, on a
+    // capture that starts empty — so this counts frames the compositor
+    // produced *after* the last case, not frames it produced before
+    // the first. Its reporting interval is 2 s.
+    let mut after = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && frames(&after) < 2 {
+        after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    if frames(&after) < 2 {
+        return Err(format!(
+            "the compositor reported {} frame batches in the 20 s after the last stall:\
+             \n{after}",
+            frames(&after)
+        ));
+    }
+
+    let console = format!("{}\n{after}", result.serial);
+    serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+    eprintln!(
+        "  [metal-sim] {CASES} stalls survived, {timed_out} handshakes timed out by name, \
+         desktop still compositing"
+    );
+    Ok(())
+}
+
 /// Run one machine-shape test. Like `run_screen_test`, each of these owns its
-/// QEMU: the machine shape *is* the test.
+/// QEMU — the machine shape *is* the test — except for the runs of adjacent
+/// names that share one through `held` (see [`group_boot`]).
 fn run_machine_test(
     name: &str,
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
+    held: &mut Grouped,
 ) -> Result<(), String> {
+    // **Only one QEMU may be up at a time in this process.** Every instance
+    // shares one QMP socket path and one `test-bootable.img` under the pid's
+    // temp dir, so a guest still running when the next one starts takes that
+    // one's socket and it exits before its first line — which is what every
+    // test after a group reported the first time a group outlived its members.
+    // (It is also what `specs/test-cost-audit.md` §3.3's parallel boots would
+    // have to fix first.)
+    if group_of(name) != held.as_ref().map(|up| up.group) {
+        *held = None;
+    }
     match name {
         // Body in `tests/common/storage.rs`, so the hunk in this shared file
         // stays one line.
@@ -2309,117 +3056,34 @@ fn run_machine_test(
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
-            // M1's permanent config: the whole boot with no virtio device
-            // anywhere. What it certifies is which processes survive the
-            // T14's device shape — the compositor claims a firmware
-            // framebuffer and says what it got, soundd and netd find no
-            // device and exit rather than panic. All three are the process's
-            // own words. The earlier version read the bottom pixel row
-            // instead, which says nothing about soundd or netd and stayed
-            // green with their graceful exit reverted.
-            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
-            let options = BootOptions {
-                profile: qemu::Profile::Metal,
-                ..Default::default()
-            };
-            metal_sim_argv_check(&qemu::profile_argv(&options))?;
-
-            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
-            // init spawns all four programs without waiting, so test-runner's
-            // ready marker races the daemons' own lines. Keep draining until
-            // every line has been said or the window closes.
-            const WANT: [&str; 3] = [
-                "compositor: ready",
-                "soundd: no audio device on this machine, exiting",
-                "netd: no NIC on this machine, exiting",
-            ];
-            let mut console = qemu.boot_log().to_string();
-            let deadline = std::time::Instant::now() + Duration::from_secs(15);
-            while std::time::Instant::now() < deadline
-                && !WANT.iter().all(|w| console.contains(w))
-            {
-                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
-            }
-            for want in WANT {
-                if !console.contains(want) {
-                    return Err(format!("{want:?} never reached the console:\n{console}"));
-                }
-            }
-            // The compositor's periodic self-measurement, which is how the
-            // T14 reports what compositing cost it once it is off the serial
-            // port and the log is only a file on the stick. It is emitted from
-            // a composited frame, so its absence is a compositor that stopped
-            // drawing as much as an instrument that never ran.
-            let deadline = std::time::Instant::now() + Duration::from_secs(15);
-            while std::time::Instant::now() < deadline
-                && !console
-                    .lines()
-                    .any(|l| l.contains("compositor: frames=") && l.contains("windows="))
-            {
-                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
-            }
-            // One more drain so the tail of that line cannot still be in
-            // flight when it is parsed.
-            console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
-            // The compositor reports the mode it was handed, which is the
-            // proof it claimed a real firmware framebuffer rather than
-            // starting on nothing.
-            let Some(mode) = console
-                .lines()
-                .find_map(|l| l.split("compositor: wallpaper ").nth(1))
-            else {
-                return Err(format!(
-                    "the compositor never said what framebuffer it got:\n{console}"
-                ));
-            };
-            let Some(stats) = console.lines().find(|l| l.contains("compositor: frames=")) else {
-                return Err(format!(
-                    "the compositor never reported a composited frame:\n{console}"
-                ));
-            };
-            let field = |key: &str| -> Result<u64, String> {
-                let raw = stats
-                    .split_whitespace()
-                    .find_map(|f| f.strip_prefix(key))
-                    .ok_or_else(|| format!("no {key} in the compositor's stats line: {stats}"))?;
-                raw.parse::<u64>()
-                    .map_err(|_| format!("{key}{raw} is not a number: {stats}"))
-            };
-            let frames = field("frames=")?;
-            let min_us = field("composite_us_min=")?;
-            let max_us = field("composite_us_max=")?;
-            let total_us = field("composite_us_total=")?;
-            let cursor = field("cursor=")?;
-            // Read for their presence and their shape; what they measure is
-            // uncached reads, which QEMU's host-RAM framebuffer cannot show.
-            field("scanout_wr_bytes=")?;
-            field("scanout_rd_bytes=")?;
-            field("rd_px=")?;
-            field("rd_bulk=")?;
-            field("windows=")?;
-            if frames == 0 || total_us == 0 {
-                return Err(format!("the compositor reported a dead instrument: {stats}"));
-            }
-            if min_us > max_us || max_us > total_us {
-                return Err(format!("min/max/total do not order: {stats}"));
-            }
-            // GOP hands out no hardware cursor (`flags: 0`), so the compositor
-            // draws one into the scanout on every frame it composites.
-            if cursor != frames {
-                return Err(format!(
-                    "{frames} frames on a shape with no hardware cursor drew {cursor} cursors: \
-                     {stats}"
-                ));
-            }
-            // And nothing panicked on the way. A daemon that dies on its
-            // absent device fails the positive check above; this catches the
-            // rest of the boot dying instead.
-            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
-            eprintln!("  [metal-sim] compositor up on {}", mode.trim());
-            eprintln!("  [metal-sim] {}", stats.trim());
-            eprintln!("  [metal-sim] soundd and netd both exited on their absent device");
-            Ok(())
+            metal_sim_compositor(group_boot(held, METAL_SIM_DESKTOP, || {
+                boot_metal_sim_desktop(rust_bins)
+            }))
         }
+        "metal_sim_window_caps" => {
+            metal_sim_window_caps(group_boot(held, METAL_SIM_DESKTOP, || {
+                boot_metal_sim_desktop(rust_bins)
+            }))
+        }
+        "metal_sim_ipc_hostile_peer" => {
+            metal_sim_ipc_hostile_peer(group_boot(held, METAL_SIM_DESKTOP, || {
+                boot_metal_sim_desktop(rust_bins)
+            }))
+        }
+        "metal_sim_compositor_stall" => {
+            metal_sim_compositor_stall(group_boot(held, METAL_SIM_DESKTOP, || {
+                boot_metal_sim_desktop(rust_bins)
+            }))
+        }
+        "i8042_keyboard" => i8042_keyboard(group_boot(held, I8042_TRACE, || {
+            boot_i8042_trace(test_config, c_bins, rust_bins)
+        })),
+        "i8042_no_spurious_wake" => i8042_no_spurious_wake(group_boot(held, I8042_TRACE, || {
+            boot_i8042_trace(test_config, c_bins, rust_bins)
+        })),
+        "i8042_mouse" => i8042_mouse(group_boot(held, I8042_TRACE, || {
+            boot_i8042_trace(test_config, c_bins, rust_bins)
+        })),
         "xhci_many_devices" => {
             // The T14's internal controller carries a camera, Bluetooth and a
             // fingerprint reader next to the boot stick, and every profile in
@@ -3674,310 +4338,6 @@ fn run_machine_test(
             }
             Ok(())
         }
-        "i8042_keyboard" => {
-            // On metal-sim, because that is the machine the driver is for and
-            // the absent USB HID is what makes the test measure anything:
-            // QEMU routes injected keys to one handler per device class, and
-            // with a usb-kbd present that handler is not the PS/2 one.
-            let options = BootOptions {
-                profile: qemu::Profile::Metal,
-                qmp: true,
-                kernel_features: &["i8042-trace"],
-                ..Default::default()
-            };
-            metal_sim_argv_check(&qemu::profile_argv(&options))?;
-            let mut qemu =
-                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
-            let boot = qemu.boot_log().to_string();
-            if !boot.contains("i8042: kbd set2+xlat (readback 0x41)") {
-                return Err(format!("the PS/2 keyboard never came up:\n{boot}"));
-            }
-
-            let result = qemu.run_test_hooked(
-                "test_rs_i8042_keyboard",
-                Duration::from_secs(20),
-                "===I8042_READY===",
-                |socket| {
-                    for key in ["h", "e", "l", "l", "o"] {
-                        qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                    qemu::qmp_send_keys(
-                        socket,
-                        &[("shift", true), ("b", true), ("b", false), ("shift", false)],
-                    );
-                    thread::sleep(Duration::from_millis(20));
-                    for key in ["left", "esc"] {
-                        qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                    // A modifier on its own, so a stuck one is visible.
-                    qemu::qmp_send_keys(socket, &[("shift", true)]);
-                    thread::sleep(Duration::from_millis(20));
-                    qemu::qmp_send_keys(socket, &[("shift", false)]);
-                },
-            );
-            if let Some(err) = &result.error {
-                return Err(format!("{err}\n{}", result.stdout));
-            }
-
-            let events = parse_key_events(&result.stdout);
-            if events.is_empty() {
-                return Err(format!("no key event reached userland:\n{}", result.stdout));
-            }
-            // Presses spell the injected text: IRQ delivery, set-1 decode,
-            // the HID mapping, the shared translate/layout path, and arrival
-            // in a userland process, in one assertion.
-            let typed: String = events
-                .iter()
-                .filter(|e| e.modifiers & 0x10 == 0)
-                .map(|e| e.translated.as_str())
-                .collect();
-            if !typed.contains("hello") {
-                return Err(format!("typed {typed:?}, want it to contain \"hello\""));
-            }
-            if !typed.contains('B') {
-                return Err(format!("typed {typed:?} — Shift+b did not produce a capital"));
-            }
-            if !typed.contains("\u{1b}[D") {
-                return Err(format!("typed {typed:?} — Left arrow produced no escape sequence"));
-            }
-            for want in [0x29u8, 0x50, 0xE1] {
-                if !events.iter().any(|e| e.usage == want) {
-                    return Err(format!("no event for HID usage {want:#04x} in {events:?}"));
-                }
-            }
-            // Every press is matched by a release.
-            for usage in [0x0Bu8, 0x08, 0x0F, 0x12, 0x05, 0x29, 0x50, 0xE1] {
-                let presses = events.iter().filter(|e| e.usage == usage && e.modifiers & 0x10 == 0).count();
-                let releases = events.iter().filter(|e| e.usage == usage && e.modifiers & 0x10 != 0).count();
-                if presses == 0 || presses != releases {
-                    return Err(format!(
-                        "usage {usage:#04x}: {presses} presses, {releases} releases"
-                    ));
-                }
-            }
-            // Nothing is left held: the bare Shift came back up.
-            let last = events.last().unwrap();
-            if last.modifiers & !0x10 != 0 {
-                return Err(format!("a modifier is stuck down: last event {last:?}"));
-            }
-            // And they came from the i8042, not from somewhere else.
-            let drained: usize = qemu
-                .boot_log()
-                .lines()
-                .chain(result.serial.lines())
-                .filter_map(trace_keys)
-                .filter(|&k| k > 0)
-                .sum();
-            if drained == 0 {
-                return Err("no i8042 drain reported a key event".to_string());
-            }
-            eprintln!("  [i8042] {} events to userland, {drained} from the driver", events.len());
-            Ok(())
-        }
-        "i8042_no_spurious_wake" => {
-            // The direct regression for the readiness defect: a stimulus that
-            // produces bytes and no events must produce no wake. Pause is
-            // that stimulus — six bytes, deliberately swallowed.
-            //
-            // It drives the same in-guest reader as `i8042_keyboard`, and not
-            // only for the userland half of the assertion: on a fully idle
-            // machine the kernel's log ring flushes one line behind, so the
-            // last trace line would never reach the console (filed in
-            // known-issues). A guest polling its fd keeps the ring moving.
-            let mut qemu = QemuInstance::boot_with_options(
-                test_config,
-                c_bins,
-                rust_bins,
-                BootOptions {
-                    profile: qemu::Profile::Metal,
-                    qmp: true,
-                    kernel_features: &["i8042-trace"],
-                    ..Default::default()
-                },
-            );
-            let result = qemu.run_test_hooked(
-                "test_rs_i8042_keyboard",
-                Duration::from_secs(20),
-                "===I8042_READY===",
-                |socket| {
-                    for _ in 0..2 {
-                        qemu::qmp_send_keys(socket, &[("pause", true), ("pause", false)]);
-                        thread::sleep(Duration::from_millis(50));
-                        qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                },
-            );
-            if let Some(err) = &result.error {
-                return Err(format!("{err}\n{}", result.stdout));
-            }
-
-            let mut zero_event_drains = 0;
-            let mut key_drains = 0;
-            for line in result.serial.lines() {
-                let Some(keys) = trace_keys(line) else { continue };
-                let woke = line.contains("woke_kb=1");
-                if keys == 0 {
-                    zero_event_drains += 1;
-                    if woke {
-                        return Err(format!("a drain with no events woke the queue: {line}"));
-                    }
-                } else {
-                    key_drains += 1;
-                    if !woke {
-                        return Err(format!("a drain with events did not wake the queue: {line}"));
-                    }
-                }
-            }
-            if zero_event_drains == 0 {
-                return Err(format!(
-                    "no drain produced zero events — the stimulus never landed:\n{}",
-                    result.serial
-                ));
-            }
-            if key_drains == 0 {
-                return Err(format!("no drain produced any event:\n{}", result.serial));
-            }
-            // And the swallowed bytes stayed swallowed all the way out.
-            let events = parse_key_events(&result.stdout);
-            if events.iter().any(|e| e.usage == 0x48) {
-                return Err(format!("Pause reached userland as a key: {events:?}"));
-            }
-            if !events.iter().any(|e| e.usage == 0x04) {
-                return Err(format!("the real key never arrived: {events:?}"));
-            }
-            eprintln!(
-                "  [i8042] {zero_event_drains} zero-event drains, none woke; {key_drains} real ones, all did"
-            );
-            Ok(())
-        }
-        "i8042_mouse" => {
-            let mut qemu = QemuInstance::boot_with_options(
-                test_config,
-                c_bins,
-                rust_bins,
-                BootOptions {
-                    profile: qemu::Profile::Metal,
-                    qmp: true,
-                    kernel_features: &["i8042-trace"],
-                    ..Default::default()
-                },
-            );
-            let boot = qemu.boot_log().to_string();
-            if !boot.contains("i8042: aux rate=100") {
-                return Err(format!("the TrackPoint path never came up:\n{boot}"));
-            }
-
-            const BURST: usize = 1000;
-            let result = qemu.run_test_hooked(
-                "test_rs_i8042_mouse",
-                Duration::from_secs(30),
-                "===I8042_MOUSE_READY===",
-                |socket| {
-                    let mut input = qemu::QmpInput::open(socket);
-                    // Off the origin first: the position clamps at 0, so a
-                    // move up from there would be invisible.
-                    input.mouse(100, 100, None);
-                    thread::sleep(Duration::from_millis(100));
-                    input.mouse(40, -30, None);
-                    thread::sleep(Duration::from_millis(100));
-                    input.mouse(0, 0, Some(("left", true)));
-                    thread::sleep(Duration::from_millis(50));
-                    input.mouse(0, 0, Some(("left", false)));
-                    thread::sleep(Duration::from_millis(100));
-                    // One command per packet, because QEMU syncs input once
-                    // per command: 1000 commands is 1000 packets, 3000 bytes
-                    // through the framer.
-                    for i in 0..BURST {
-                        input.mouse(if i % 2 == 0 { 1 } else { -1 }, 0, None);
-                    }
-                    thread::sleep(Duration::from_millis(200));
-                    input.mouse(0, 0, Some(("left", true)));
-                    thread::sleep(Duration::from_millis(50));
-                    input.mouse(0, 0, Some(("left", false)));
-                },
-            );
-            if let Some(err) = &result.error {
-                return Err(format!("{err}\n{}", result.stdout));
-            }
-
-            let events = parse_mouse_events(&result.stdout);
-            if events.len() < BURST / 2 {
-                return Err(format!(
-                    "only {} pointer events reached userland, want at least {}",
-                    events.len(),
-                    BURST / 2
-                ));
-            }
-            // A sign error in dy is invisible to any test that only checks
-            // "it moved", and the PS/2 wire points the opposite way to the
-            // screen — so both directions are asserted separately.
-            if !events.windows(2).any(|w| w[1].x > w[0].x) {
-                return Err("the pointer never moved right".to_string());
-            }
-            if !events.windows(2).any(|w| w[1].y < w[0].y) {
-                return Err(format!(
-                    "the pointer never moved up — dy inverted? ys: {:?}",
-                    events.iter().take(8).map(|e| e.y).collect::<Vec<_>>()
-                ));
-            }
-            // PS/2 bit 0 is left, and so is HID boot-mouse bit 0.
-            if !events.iter().any(|e| e.buttons == 0x01) {
-                return Err(format!(
-                    "no left-button-down event; buttons seen: {:?}",
-                    events.iter().map(|e| e.buttons).collect::<std::collections::BTreeSet<_>>()
-                ));
-            }
-            // And after 3000 bytes of packets the framer is still aligned:
-            // the last click is reported as a click, not as motion or as the
-            // wrong button.
-            let last_press = events.iter().rposition(|e| e.buttons == 0x01);
-            let Some(last_press) = last_press else {
-                return Err("no button press at all".to_string());
-            };
-            if events[last_press..].last().map(|e| e.buttons) != Some(0x00) {
-                return Err(format!(
-                    "framing drifted: after the final click the button state is {:?}",
-                    events.last()
-                ));
-            }
-            // The T14's line, staged. Its log read
-            //   `6 bytes, 0 keys, 2 motion, no event from
-            //    [aux 0x08, aux 0x06, aux 0x08, aux 0x0e]`
-            // on a pointer that was framing perfectly: two whole packets, and
-            // the four bytes named were their heads and first body bytes. That
-            // sent a field investigation after a desync that had not happened.
-            // Three thousand bytes of healthy packets is the same claim with
-            // three orders of magnitude more of it: a driver that cannot tell a
-            // byte it is holding from a byte it threw away names two thirds of
-            // them here.
-            let named: Vec<&str> =
-                result.serial.lines().filter(|l| l.contains("no event from")).collect();
-            if !named.is_empty() {
-                return Err(format!(
-                    "{BURST} clean packets and the driver still named bytes as undecodable:\n{}",
-                    named.join("\n")
-                ));
-            }
-            // And the count that says so directly. A discard is the byte-level
-            // resync and nothing else, so an intact stream owes zero of them —
-            // which is what makes any non-zero value on the T14's next boot
-            // mean the pointer really did lose the frame.
-            if let Some(counters) = result.serial.lines().find(|l| l.contains("discarded")) {
-                if !counters.contains("0 discarded") {
-                    return Err(format!("an intact pointer stream discarded bytes: {counters}"));
-                }
-                eprintln!("  [i8042] {}", counters.trim());
-            }
-            eprintln!(
-                "  [i8042] {} pointer events, last button state {:#04x}",
-                events.len(),
-                events.last().unwrap().buttons
-            );
-            Ok(())
-        }
         "i8042_health_cadence" => {
             // The T14 lost keyboard, TrackPoint and touchpad — all three behind
             // this controller — 6.6 s into a session, and the driver's last
@@ -4654,262 +5014,6 @@ fn run_machine_test(
             }
             eprintln!("  [i8042] {}", line.trim());
             eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
-            Ok(())
-        }
-        "metal_sim_window_caps" => {
-            // The compositor's window cap, end to end, on the only config that
-            // boots a compositor an in-guest binary can talk to.
-            //
-            // The assertion that matters is not "a refusal arrived" — it is
-            // that the number the compositor *derived* from total memory and
-            // the screen is the number of windows a client actually gets. A
-            // constant on both sides would agree with itself forever; this
-            // fails if the derivation and the enforcement ever drift apart.
-            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
-            // One binary, not the whole rust set: metalcase's initrd is four
-            // programs, and the rest would add tens of megabytes to a boot
-            // that needs exactly one of them.
-            let bins: Vec<(String, Vec<u8>)> = rust_bins
-                .iter()
-                .filter(|(name, _)| name == "window_caps")
-                .cloned()
-                .collect();
-            if bins.is_empty() {
-                return Err("window_caps was not built".to_string());
-            }
-            let options = BootOptions {
-                profile: qemu::Profile::Metal,
-                ..Default::default()
-            };
-            metal_sim_argv_check(&qemu::profile_argv(&options))?;
-
-            let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
-
-            // The compositor announces what it derived. Read rather than
-            // recomputed here: recomputing it would copy the formula into the
-            // test and stop asking whether the compositor uses it.
-            let mut console = qemu.boot_log().to_string();
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while Instant::now() < deadline && !console.contains("compositor: at most ") {
-                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
-            }
-            let Some(declared) = console
-                .lines()
-                .find_map(|l| l.split("compositor: at most ").nth(1))
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|n| n.parse::<usize>().ok())
-            else {
-                return Err(format!(
-                    "the compositor never said how many windows it would hold:\n{console}"
-                ));
-            };
-            if declared == 0 {
-                return Err("the compositor derived a cap of zero windows".to_string());
-            }
-
-            let result = qemu.run_test("test_rs_window_caps", Duration::from_secs(120));
-            if let Some(err) = &result.error {
-                return Err(format!("{err}\n{}", result.stdout));
-            }
-            if result.exit_code != Some(0) {
-                return Err(format!(
-                    "window_caps exited {:?}:\n{}",
-                    result.exit_code, result.stdout
-                ));
-            }
-
-            let Some(granted) = result
-                .stdout
-                .split("oversized refused, ")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|n| n.parse::<usize>().ok())
-            else {
-                return Err(format!("window_caps printed no count:\n{}", result.stdout));
-            };
-            if granted != declared {
-                return Err(format!(
-                    "the compositor declared a cap of {declared} windows and granted \
-                     {granted} — the derivation and the enforcement disagree:\n{}",
-                    result.stdout
-                ));
-            }
-            eprintln!("  [metal-sim] compositor cap {declared} windows, {granted} granted then refused");
-            Ok(())
-        }
-        "metal_sim_ipc_hostile_peer" => {
-            // A client that lies about its frame lengths, against the one
-            // config that boots a compositor an in-guest binary can talk to.
-            //
-            // The guest binary carries the assertions — it is the only side
-            // that can see whether the compositor closed the connection it
-            // ruled on — so the host's job is to boot it and to insist the
-            // count it reports is the whole case list. A guest that skipped
-            // cases would otherwise exit 0 having proved nothing.
-            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
-            let bins: Vec<(String, Vec<u8>)> = rust_bins
-                .iter()
-                .filter(|(name, _)| name == "ipc_hostile_peer")
-                .cloned()
-                .collect();
-            if bins.is_empty() {
-                return Err("ipc_hostile_peer was not built".to_string());
-            }
-            let options = BootOptions {
-                profile: qemu::Profile::Metal,
-                ..Default::default()
-            };
-            metal_sim_argv_check(&qemu::profile_argv(&options))?;
-
-            let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
-            let result = qemu.run_test("test_rs_ipc_hostile_peer", Duration::from_secs(120));
-            if let Some(err) = &result.error {
-                return Err(format!("{err}\n{}", result.stdout));
-            }
-            if result.exit_code != Some(0) {
-                return Err(format!(
-                    "ipc_hostile_peer exited {:?}:\n{}",
-                    result.exit_code, result.stdout
-                ));
-            }
-            let Some(refused) = result
-                .stdout
-                .split("hostile peer: ")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|n| n.parse::<usize>().ok())
-            else {
-                return Err(format!(
-                    "ipc_hostile_peer printed no count:\n{}",
-                    result.stdout
-                ));
-            };
-            // The guest's own case list, restated here so a case deleted on
-            // one side is a red run rather than a quieter test.
-            const CASES: usize = 3;
-            if refused != CASES {
-                return Err(format!(
-                    "the compositor refused {refused} malformed frames, not {CASES}:\n{}",
-                    result.stdout
-                ));
-            }
-            eprintln!("  [metal-sim] {refused} malformed frames refused, compositor still serving");
-            Ok(())
-        }
-        "metal_sim_compositor_stall" => {
-            // A client that stops talking, stops listening, or never stops.
-            // The guest carries the "is it still answering" half, because only
-            // it can put a deadline on the answer; the host carries the half
-            // the guest cannot see — whether the desktop is still *painting*,
-            // and whether every client the compositor got rid of was named.
-            //
-            // The two halves are not redundant. A compositor parked on one
-            // client answers nobody, so the guest catches that; a compositor
-            // livelocked on one client answers everybody and draws nothing,
-            // which only the frame counter shows.
-            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
-            let bins: Vec<(String, Vec<u8>)> = rust_bins
-                .iter()
-                .filter(|(name, _)| name == "compositor_stall")
-                .cloned()
-                .collect();
-            if bins.is_empty() {
-                return Err("compositor_stall was not built".to_string());
-            }
-            let options = BootOptions {
-                profile: qemu::Profile::Metal,
-                ..Default::default()
-            };
-            metal_sim_argv_check(&qemu::profile_argv(&options))?;
-
-            let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
-            let result = qemu.run_test("test_rs_compositor_stall", Duration::from_secs(240));
-            if let Some(err) = &result.error {
-                return Err(format!("{err}\n{}", result.stdout));
-            }
-            if result.exit_code != Some(0) {
-                return Err(format!(
-                    "compositor_stall exited {:?}:\n{}",
-                    result.exit_code, result.stdout
-                ));
-            }
-            // The guest's own case list, restated here so a case deleted on
-            // one side is a red run rather than a quieter test.
-            const CASES: usize = 6;
-            if !result
-                .stdout
-                .contains(&format!("compositor stall: {CASES} stalls survived"))
-            {
-                return Err(format!(
-                    "the guest did not report {CASES} survived stalls:\n{}",
-                    result.stdout
-                ));
-            }
-
-            let frames = |text: &str| text.matches("compositor: frames=").count();
-
-            // Starvation, which is the one shape the guest cannot see. Between
-            // these two markers one window is sending on every pass; a drain
-            // loop that ends only when nothing is ready never gets to `redraw`
-            // and this window holds zero frames.
-            let Some(stream) = result
-                .stdout
-                .split("compositor stall: stream start")
-                .nth(1)
-                .and_then(|rest| rest.split("compositor stall: stream end").next())
-            else {
-                return Err(format!(
-                    "the guest never bracketed its streaming window:\n{}",
-                    result.stdout
-                ));
-            };
-            if frames(stream) == 0 {
-                return Err(format!(
-                    "the compositor composited nothing while one client streamed:\n{stream}"
-                ));
-            }
-
-            // Dropped by name, never silently. Three connections never finish
-            // a first frame, and one window stops reading its mail.
-            const TIMED_OUT: &str = "it never finished its first message";
-            let timed_out = result.stdout.matches(TIMED_OUT).count();
-            if timed_out < 3 {
-                return Err(format!(
-                    "three connections went quiet mid-handshake and {timed_out} were named:\n{}",
-                    result.stdout
-                ));
-            }
-            const NOT_READING: &str = "it is not reading";
-            if !result.stdout.contains(NOT_READING) {
-                return Err(format!(
-                    "a window stopped reading and the compositor never said so:\n{}",
-                    result.stdout
-                ));
-            }
-
-            // And it is still painting once every stall is behind it, on a
-            // capture that starts empty — so this counts frames the compositor
-            // produced *after* the last case, not frames it produced before
-            // the first. Its reporting interval is 2 s.
-            let mut after = String::new();
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            while std::time::Instant::now() < deadline && frames(&after) < 2 {
-                after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
-            }
-            if frames(&after) < 2 {
-                return Err(format!(
-                    "the compositor reported {} frame batches in the 20 s after the last stall:\
-                     \n{after}",
-                    frames(&after)
-                ));
-            }
-
-            let console = format!("{}\n{after}", result.serial);
-            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
-            eprintln!(
-                "  [metal-sim] {CASES} stalls survived, {timed_out} handshakes timed out by name, \
-                 desktop still compositing"
-            );
             Ok(())
         }
         "metal_sim_pointer_churn" => {
@@ -5833,9 +5937,13 @@ fn main() {
     // SCREEN_TESTS does.
     if !machine_to_run.is_empty() {
         eprintln!("  --- machine ---");
+        // Dropped with this block, so no group's guest outlives the machine
+        // tests into the screen ones.
+        let mut held: Grouped = None;
         for name in &machine_to_run {
             let start = std::time::Instant::now();
-            let outcome = catching(|| run_machine_test(name, &test_config, &c_bins, &rust_bins));
+            let outcome =
+                catching(|| run_machine_test(name, &test_config, &c_bins, &rust_bins, &mut held));
             let elapsed = start.elapsed();
             match outcome {
                 Ok(()) => {
