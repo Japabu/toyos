@@ -690,6 +690,51 @@ Two things to verify on the first `intremap=on` boot rather than assume, both fl
 above: that QEMU blocks compatibility-format interrupts when `CFI` is clear, and that
 the unit's own fault-event MSI is exempt from that block.
 
+### 8.1 What the unit actually says, measured at I1
+
+Read by the kernel on 2026-08-03 under
+`-device intel-iommu,intremap=on,caching-mode=on,aw-bits=48` on
+`-machine q35,kernel-irqchip=split`, QEMU 11.0.2, and printed by
+`cargo test -- iommu_discovery`:
+
+```
+DMAR haw=48 flags=0x01 intr_remap=y x2apic_opt_out=n dma_ctrl_opt_in=n
+unit0 @0xfed90000 seg=0 pci_all=n ver=1.0
+      cap=0x80d2008c222f06c6 ecap=0x0000000000f00f0a
+      aw=48 sagaw=0x06 mgaw=48 nd=65536 sps2m=y cm=y psi=y nfr=1 fro=0x220
+      qi=y ir=y eim=n pt=n coherent=n
+```
+
+Four of those contradict what this file assumed, and each changes a decision a
+later stage was going to make on the strength of it:
+
+- **`ECAP.C` is clear.** §5.2 says "QEMU sets `ECAP.C`" and builds its argument on
+  the `C=0` path being dead code on every machine in reach. It is the opposite:
+  every machine in reach is `C=0`, and the *untestable* arm is `C=1`. The decision
+  §5.2 reaches — flush unconditionally, never branch — is unchanged and now has a
+  stronger reason. Note `snoop-control=on` sets `ECAP.SC` (bit 7), which is a
+  different bit from `ECAP.C` (bit 0) and does not make the unit coherent.
+- **`ECAP.PT` is clear.** §5.7 makes passthrough for kernel-owned devices "the
+  single largest de-risking decision in the plan". It is not available here, so the
+  fallback §5.7 calls "one extra code path that would be exercised only on such a
+  unit" is the *only* path the harness can run: at I2 every kernel device gets an
+  identity-mapped translated domain, on every profile.
+- **`ECAP.EIM` is clear** with `eim=auto`. §4.2 makes that a refusal "on a machine
+  using x2APIC ids above 255", and this kernel enables x2APIC. Whether `eim=on`
+  changes it is unmeasured; if it does not, I5's refusal would refuse the harness's
+  own machines and the rule needs restating in terms of the ids actually in use.
+- **The DRHD carries no `INCLUDE_PCI_ALL`.** §4.1 calls that unit "the catch-all",
+  and QEMU publishes none: the DRHD lists every PCI function on the machine as its
+  own device scope, plus one for the I/O APIC on pseudo-bus `0xff`. §5.1's rule that
+  every enumerated function gets a context entry therefore has no catch-all to fall
+  back on here, and the scope list is the mapping. Verified against the raw 120-byte
+  table rather than inferred.
+
+`aw-bits=39` moves `sagaw` to `0x02`, `mgaw` to 39 and the DMAR's own `haw` to 39;
+`intremap=off` moves `ecap` to `0x0000000000000f02` and clears the DMAR flag. Those
+two differences are what `iommu_discovery` asserts on, and they are the only reason
+the decode is known to be reading registers at all.
+
 ---
 
 ## 9. Stages
@@ -706,6 +751,27 @@ descriptions.
 | **I3** | **Interrupt remapping on.** Remappable IOAPIC RTEs and remappable `pci::enable_msi`/`enable_msix`; IRTA, `SIRTP`, `IRE=1`, `CFI=0`; every IRTE `SVT`-verified. | `cargo test -- metal_sim_input xhci audio nvme esp` green — every one of these depends on an interrupt arriving. Teeth: an IRTE written with the wrong source-id must red the corresponding test |
 | **I4** | **Domains, mapping, invalidation, faults.** `create_domain`/`attach`/`map`/`unmap`/`flush`, the `Unmapped`/`Flushed` pair, IOVA allocator, fault MSI and the kill-on-fault path. No syscall yet; driven by a kernel-feature self-test. | `cargo test -- iommu_selftest`, which maps, reads back through a device, unmaps, and asserts a stale access faults. Teeth: deleting the unmap-side invalidation must red it |
 | **I5** | **The refusal.** Sequenced deliberately after `specs/userspace-drivers-spec.md`'s first driver has moved, because before that a refusal costs every machine and protects nothing. | `cargo test -- iommu_refusal` — three variants (no `intel-iommu`; `intremap=off`; a unit whose `SAGAW` we reject via actuator), each asserting its own message and that userland is never reached |
+
+**I0 and I1 are done**, `82a69a8..9eab2f2`. Every profile in `tests/common/qemu.rs`
+and `src/qemu.rs` carries the unit; `kernel/src/iommu/` inventories it and refuses
+nothing; `cargo test -- iommu_discovery` boots four machines differing only in the
+unit and asserts the guest's decode moves with them. What I1 deliberately left for
+later, so I2 does not have to rediscover it:
+
+- **No `Iova`, `DomainId`, `DmaPerm`, `IommuError` or `trait Iommu`.** Discovery
+  produces none of them, and a type with no constructor and no caller is the dead
+  code §5.2 argues against. `AddressWidth` and `StreamId` are there because
+  discovery produces both.
+- **`AddressWidth` has two variants, not §3's three.** §5.3 takes the widest of 48
+  and 39 and §11.5 rules 57-bit out, so `Bits57` would be matched nowhere.
+- **A device scope whose path runs through a bridge yields no `StreamId`.** The
+  requester id needs each bridge's secondary bus number out of its own config
+  space; guessing would name a different device. Every scope QEMU publishes has a
+  single-element path, and I2 has an ECAM window to do the walk with.
+- **A DRHD register base is checked for 4 KiB alignment and the 52-bit physical
+  ceiling, and not against the memory map.** A base pointing into usable RAM would
+  read plausible garbage as a capability register — a wrong log line at I1, and a
+  register write into somebody's heap at the stage that programs the unit.
 
 I0–I4 are independent of the capability-handles migration. I4's teardown path assumes
 `process::exit` gains an explicit reclaim phase (§7.5); if
