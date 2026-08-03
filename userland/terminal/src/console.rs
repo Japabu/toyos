@@ -783,15 +783,6 @@ impl Console {
         self.selected_text()
     }
 
-    pub fn clear_selection(&mut self) {
-        if self.sel_anchor.is_none() && self.sel_end.is_none() {
-            return;
-        }
-        self.sel_anchor = None;
-        self.sel_end = None;
-        self.flush();
-    }
-
     /// Scroll the view `rows` text rows up, into history.
     pub fn scroll_view_up(&mut self, rows: usize) {
         let want = (self.view_offset + rows).min(self.scrollback.len());
