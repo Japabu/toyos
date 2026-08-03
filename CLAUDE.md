@@ -199,8 +199,10 @@ Read the spec before touching the subsystem it covers.
 
 **`specs/known-issues.md` is the list and the file to update** — ten sections, every open item with its evidence and its reproduction. Read it before touching a subsystem. Nothing is duplicated here.
 
-Four bite an agent who is *not* working on the subsystem:
+Six bite an agent who is *not* working on the subsystem:
 
+- **`Command::output()` returns an empty stderr, always** — the toyos `output` asks `spawn` for the pipe and then drops it. A guest test asserting on a child's refusal message passes vacuously. Use `spawn()` + `wait_with_output()`.
+- **`rename` on `/home` deletes the file from both names and returns `Ok`.** Data loss reachable as `mv /home/a /home/b`, and `cp` onto `/home` cannot land anything. Nothing gated a *successful* rename before this, anywhere.
 - **Gate A can fail a run on `drains` alone**, with no gap and no underrun. A per-run failure should require evidence of harm.
 - **`log_file`'s flush is unbounded and uninterruptible, in `idle_loop` before `pass()`.** Anything added to the idle loop is an audio change, and userland `println!` shares that ring. The pre-`hlt` recheck beside it now has four conditions that only a deferred-callback facility would remove; xHCI's is the one that holds an idle CPU awake for as long as 100 ms.
 - **The fork estate is outside every check the tree runs on itself.** "I enumerated the call sites" is only true if the enumeration covered `~/.cargo/git/checkouts/`.
