@@ -3537,6 +3537,119 @@ mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
 `log_partition_automount` and `log_partition_identity`
 (`tests/common/volumes.rs`).
 
+### OPEN — a full-image metal boot reached a desktop with no `/log` at all, and QEMU will not reproduce it
+
+The owner flashed `target/bootable.img` built at `85020e1` — 716,177,408 bytes,
+the shipping `system.toml` — to the T14 and reached a working compositor
+desktop. The `TOYOS-LOG` partition afterwards held no `kernel.log`, and the
+desktop's own terminal had no `/log` directory either. **So the mount never
+happened**: `/log` is mounted kernel-side in the subsystems phase and userland
+cannot unmount it, which takes `log_file::install` and the whole write path out
+of the tree. The day before, the 73 MB `--console-boot` image at `30993f2` wrote
+the log on the same machine twice, 11,727 and 15,116 bytes.
+
+**Three headless boots of that exact artifact are green**, so nothing in this
+entry is reproducible on this host. All three are metal-sim (`-vga std`, NVMe,
+xHCI, i8042, `intel-iommu,intremap=on,caching-mode=on,aw-bits=48`, `-display
+none`, the stick on `usb-storage`), the image byte-identical to the one that was
+flashed:
+
+1. the image as the whole device;
+2. the image `dd`'d into a **32 GiB** backing file, which is the flashed stick's
+   geometry — device far larger than the image, backup GPT nowhere near the last
+   LBA;
+3. the T14's two-controller shape, boot stick on the **second** xHCI, with a
+   `500_118_192`-sector namespace beside it.
+
+Every one of them printed, within 30 ms of each other:
+
+```
+usb-storage: disk 0 ready on slot 1, 174848 blocks of 512 B (683 MiB), msc_block +0x10000
+usb-storage: 1 device(s)
+gpt: device 16 carries the log partition C677F66E-19BB-43CE-89C8-607C50EFC04E at LBA 1327104+69632, entry 1 of 2
+gpt: device 16 carries the boot partition at LBA 2048+1323424 (512-byte blocks), entry 0 of 2 on disk 0591DD6E-772E-43B4-977B-931537C4AB12
+boot-volume: partition mounted, 677593088 bytes of a 677593088-byte partition at device offset 1048576, 512-byte sectors, 4096-byte clusters, 165104 clusters
+log-volume: partition mounted, 35651584 bytes of a 35651584-byte partition at device offset 679477248, 512-byte sectors, 512-byte clusters, 68552 clusters
+log-file: this boot's kernel log continues in /log/kernel.log, which holds 0 bytes
+```
+
+and left a real `KERNEL.LOG` in the log partition's root directory — 26,915
+bytes after two minutes, read back off the image on the host, and 18,555 bytes
+already there when the third boot appended to it.
+
+**What that exonerates, with numbers rather than by argument.** The ESP at the
+size nothing else has ever mounted — 677,593,088 bytes, 165,104 clusters of
+4096 — mounts. The log volume is not affected by the image growing at all:
+`create_log_volume` formats exactly `FAT32_MIN_BYTES`, so **every** image this
+project builds has the same 35,651,584-byte, 68,552-cluster log partition, and
+the console image that worked and the full image that did not carry byte-for-byte
+the same volume. A device whose capacity is ~48x the image is fine. The
+bootloader's handoff is fine by construction anyway — it refuses a volume with no
+`\toyos\log.guid`, and the machine booted.
+
+**And what the window contains.** `git diff 30993f2..85020e1` touches no file in
+the storage path: not `gpt.rs`, not `fat32_adapter.rs`, not `block.rs`, not
+`toyos-fat32/`, not `toyos-gpt/`, not the xHCI or USB storage drivers. The
+kernel changes are the IOMMU inventory (new, and it issues no MMIO write), a
+`GOP:` line that *reads* the MTRRs, the panic console's claim wait, an ACPI
+refactor, and a test-only `SYS_DEBUG` action.
+
+**The question the machine has to answer is whether `/boot` is missing too**,
+and the code says it splits the tree cleanly:
+
+- **Both missing is one defect, upstream of either mount.** `gpt::probe` calls
+  `locate_log` only inside the `Resolution::Unknown` arm — that is, only after
+  the *boot* partition has matched on that device — so anything that stops the
+  boot match stops the log lookup with it: no USB disk bound,
+  `xhci::storage_geometry` answering `None` (`probe_boot_disks` skips the disk
+  silently and `gpt::probe` never runs on it), a GPT the parser refuses, or the
+  firmware/table extent cross-check disagreeing. That last one is the only
+  mechanism found so far that is *size-dependent and metal-only*: the check is
+  `part.first_lba == firmware.start_lba && part.lba_count() == firmware.blocks`,
+  firmware's half comes from the T14's own `LoadedImage` device path, and the ESP
+  went from 69,632 sectors to 1,323,424 between the image that worked and the one
+  that did not. It prints `gpt: device N puts <GUID> at LBA X+Y but firmware said
+  A+B — not treating it as the boot volume`, and a machine in that state boots
+  perfectly from the initrd with neither mount.
+- **Only `/log` missing is log-partition-specific**: `locate_log` not finding the
+  GUID in the table (it names the GUID it looked for), or the log volume's own
+  `Fat32::probe`/`mount` refusing.
+
+Nothing shared can take one mount down through the other: `VOLUMES` is a
+two-element array indexed by `Role::slot()`, `device_carrying` opens a separate
+handle per role, and `main.rs` mounts the two in two independent `match`
+statements with no `?` between them.
+
+**What to ask the machine, in this order.**
+
+1. **No reflash.** Boot the stick as it is and open a terminal on the desktop:
+   `ls /`, `ls /boot`, `ls /log`. That runs on the failing configuration and
+   splits the tree above. It is the whole round trip if `/boot` is present.
+2. **`target/bootable-diag.img`**, rebuilt at `f2cb291` from a clean tree, for
+   the kernel's own reason line. Its last boot checkpoint carries all of it:
+   decoded glyph-by-glyph off a 1920x1080 screendump of a muted metal-sim boot of
+   that exact image, the final panel is `[page 2/2]` and holds the
+   `usb-storage:`, both `gpt:`, `boot-volume:`, `log-volume:` and `log-file:`
+   lines, ending at `Boot: complete`. A photograph of the panel after boot
+   answers it. **Caveat that has to travel with the request:** the diag image's
+   ESP is `FAT32_MIN_BYTES`, the same 69,632 sectors as the console image that
+   worked — so if the cause is the ESP's size or its extent, this image is
+   expected to come up green and its silence proves nothing.
+
+**The coverage hole this proves, and it is not the obvious one.** "No gate boots
+an image at the full system's real size" is true — every gate builds
+`tests/testcases/system.toml`, whose userland is soundd, the test runner and
+toybox — but it is *not* the hole that let this ship, because booting exactly
+that image at exactly that size is what the three runs above did and they are
+green. The hole with teeth is the other one: **all five `/log` gates read their
+verdict off a 16550, and the machine this feature exists for has none.** The
+kernel said why on the T14 — one of the lines quoted above, in the boot ring —
+and it reached no pixel and no file, because the compositor claimed the
+framebuffer tens of milliseconds after the last checkpoint and the log volume is
+the thing that failed. A working desktop and zero evidence is the designed
+outcome of that arrangement, and it is why this entry costs a round trip to the
+owner instead of a diff.
+
 ### The boot image this project builds is not `fsck_msdos`-clean, and never was
 
 Found by pointing the new gate at the image *before* any guest ran. Twelve
