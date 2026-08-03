@@ -36,14 +36,21 @@ struct Shape {
     /// A USB HID on the xHCI. The T14's keyboard is PS/2 and its touchpad
     /// I2C-HID; it has no USB HID at all.
     usb_hid: bool,
+    /// A vIOMMU, in the configuration `specs/iommu-spec.md` §9 stage I0 names:
+    /// interrupt remapping on, caching mode on, 48-bit addresses. Every
+    /// interactive profile has one, because the machine this project targets
+    /// has one and a development shape without it is a shape where the
+    /// kernel's discovery path never runs. The harness varies the unit's own
+    /// capabilities; here there is nothing to vary against.
+    iommu: bool,
 }
 
 impl Profile {
     fn shape(self) -> Shape {
         match self {
-            Self::Virtio => Shape { virtio_gpu: true, virtio: true, usb_hid: true },
-            Self::Gop => Shape { virtio_gpu: false, virtio: true, usb_hid: true },
-            Self::Metal => Shape { virtio_gpu: false, virtio: false, usb_hid: false },
+            Self::Virtio => Shape { virtio_gpu: true, virtio: true, usb_hid: true, iommu: true },
+            Self::Gop => Shape { virtio_gpu: false, virtio: true, usb_hid: true, iommu: true },
+            Self::Metal => Shape { virtio_gpu: false, virtio: false, usb_hid: false, iommu: true },
         }
     }
 }
@@ -85,7 +92,7 @@ pub fn launch(opts: &Options) {
     }
 
     qemu.arg("-machine")
-        .arg("q35")
+        .arg(if shape.iommu { "q35,kernel-irqchip=split" } else { "q35" })
         .arg("-smp")
         .arg(format!("cores={}", opts.smp))
         .arg("-m")
@@ -93,8 +100,16 @@ pub fn launch(opts: &Options) {
         .arg("-drive")
         .arg("if=pflash,format=raw,unit=0,file=ovmf/OVMF_CODE-pure-efi.fd,readonly=on")
         .arg("-drive")
-        .arg("if=pflash,format=raw,unit=1,file=ovmf/OVMF_VARS-pure-efi.fd,readonly=on")
-        .arg("-device")
+        .arg("if=pflash,format=raw,unit=1,file=ovmf/OVMF_VARS-pure-efi.fd,readonly=on");
+
+    // Before every other `-device`: a PCI function created ahead of the unit
+    // gets QEMU's bypassing address space and is never decoded by it.
+    if shape.iommu {
+        qemu.arg("-device")
+            .arg("intel-iommu,intremap=on,caching-mode=on,aw-bits=48");
+    }
+
+    qemu.arg("-device")
         .arg("nec-usb-xhci,id=xhci")
         .arg("-drive")
         .arg(format!(

@@ -177,7 +177,55 @@ pub enum Profile {
     /// boots, and the HID on the crippled one is refused by name rather than
     /// enumerated and left mute.
     MetalXhciNoIrq,
+    /// metal-sim with no IOMMU at all, so firmware publishes no `DMAR`.
+    ///
+    /// Presence of the unit is the shape dimension, and it is the one QEMU
+    /// gives for free that no real machine gives at all: on hardware, "no
+    /// DMAR" and "VT-d disabled in firmware setup" are the same observation
+    /// (`specs/iommu-spec.md` §2.2). This is the machine where the kernel has
+    /// to say which of the two it cannot tell apart.
+    NoIommu,
+    /// metal-sim whose unit advertises a 39-bit address width instead of 48.
+    ///
+    /// `CAP.SAGAW` is a register the guest decodes into a page-table depth,
+    /// and a suite with one value of it cannot tell a decode from a constant.
+    /// Both widths are real: 39-bit units ship, and the IOVA base every domain
+    /// gets is derived from this number (`specs/iommu-spec.md` §5.3).
+    IommuNarrow,
+    /// metal-sim whose unit cannot remap interrupts.
+    ///
+    /// Two registers move together — the DMAR's own `INTR_REMAP` flag and the
+    /// unit's `ECAP.IR` — and `specs/iommu-spec.md` §2.2 gives them separate
+    /// refusals, because a platform that declares it cannot remap and a unit
+    /// that cannot are different facts a user can act on differently.
+    IommuNoIntremap,
 }
+
+/// The vIOMMU a profile puts on the machine.
+///
+/// A whole machine dimension rather than a flag: the unit is what decodes
+/// every DMA and every interrupt message on the bus. Two fields, because two
+/// are what a guest can tell apart — `aw_bits` moves `CAP.SAGAW`, `intremap`
+/// moves `ECAP.IR` and the DMAR's `INTR_REMAP` flag — and a harness that
+/// stages one value of each cannot distinguish a kernel that reads those
+/// registers from one that prints what it expected to find.
+///
+/// `caching-mode` is deliberately not a field. It is on everywhere: it is the
+/// stricter configuration, it is the only one QEMU can stage, and
+/// `specs/iommu-spec.md` §5.5 refuses to branch on it — so a profile that
+/// turned it off would be staging a machine no code here distinguishes.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Iommu {
+    /// `aw-bits`. QEMU 11.0.2 takes 39 or 48 and nothing else.
+    pub aw_bits: u8,
+    /// Interrupt remapping. Off is a platform declaring it cannot remap.
+    pub intremap: bool,
+}
+
+/// What every profile but the three that vary it declares: the widest address
+/// width QEMU offers and interrupt remapping on, which is
+/// `specs/iommu-spec.md` §9 stage I0's configuration.
+pub const IOMMU_DEFAULT: Iommu = Iommu { aw_bits: 48, intremap: true };
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
 /// registers `MAX(p2, p3)` attachable USB ports over `p2 + p3` port registers —
@@ -222,6 +270,14 @@ const XHCI_NO_IRQ_SECOND: &str = "nec-usb-xhci,id=xhci1,msix=off,msi=off";
 struct Shape {
     /// `-vga` mode. "none" leaves firmware with no GOP to publish.
     vga: &'static str,
+    /// Video memory, which is what decides the panel: OVMF offers every mode
+    /// that fits in it and the bootloader takes the one with the most pixels.
+    /// `None` is QEMU's default 16 MiB, whose largest mode is 2048x2048 --- a
+    /// panel that is a whole number of glyph rows tall, which no real one has
+    /// to be. Declared rather than defaulted because the panel's *size* is a
+    /// shape dimension exactly as a disk's is, and the tests that read pixels
+    /// were all blind to the remainder until one profile had one.
+    vgamem_mb: Option<u32>,
     /// virtio-net, virtio-sound, and the console on virtio-serial.
     virtio: bool,
     /// The `-device` argument for each xHCI controller, port and slot counts
@@ -267,6 +323,10 @@ struct Shape {
     /// bind to the next disk is only observable when the failure is first, and
     /// QEMU assigns ports in device-creation order.
     usb_disk_first: bool,
+    /// The unit that decodes this machine's DMA, or its absence. Stated per
+    /// profile because absence is a shape and because the unit's own
+    /// capabilities are what the kernel reads at boot.
+    iommu: Option<Iommu>,
 }
 
 /// What every profile but [`Profile::MetalDisk`] gives the guest. Large
@@ -304,6 +364,7 @@ impl Profile {
         match self {
             Self::Headless => Shape {
                 vga: "none",
+                vgamem_mb: None,
                 virtio: true,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -314,9 +375,11 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::Gop => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: true,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -327,9 +390,11 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::Diskless => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -342,9 +407,18 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::Metal => Shape {
                 vga: "std",
+                // The T14's panel. 1920x1080x4 is 8,294,400 bytes, so 8 MiB
+                // admits it and excludes every mode with more pixels ---
+                // 1920x1200 and 2048x1536 both need more, and 1600x1200 has
+                // fewer pixels, so this is the one the bootloader picks. It
+                // gives 240x67 cells with 8 pixels left over at the bottom,
+                // which is the geometry the machine actually has and the one
+                // the 2048x2048 default could not express.
+                vgamem_mb: Some(8),
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -355,6 +429,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             // Two keyboards and two pointers, because the collision this
             // stages is between devices of the same HID class; a hub for a
@@ -362,6 +437,7 @@ impl Profile {
             // driver has to walk past it exactly as it walks past the stick.
             Self::MetalUsb => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_WIDE],
                 storage_bus: "xhci.0",
@@ -378,9 +454,11 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::MetalDisk => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -391,9 +469,11 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::NvmeWideSector => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -404,9 +484,11 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDisk => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -417,9 +499,11 @@ impl Profile {
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDisk4k => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -430,9 +514,11 @@ impl Profile {
                 usb_disk_lba_bytes: 4096,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDiskHuge => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -443,9 +529,11 @@ impl Profile {
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDiskRefusedFirst => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -456,9 +544,11 @@ impl Profile {
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: false,
                 usb_disk_first: true,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDiskReadOnly => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -469,6 +559,7 @@ impl Profile {
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: true,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             // The first controller carries nothing at all — not even the boot
             // stick, which is on the second with the HID. That is the laptop
@@ -478,6 +569,7 @@ impl Profile {
             // controller that is not the first, which nothing else stages.
             Self::MetalFullSpeed => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
@@ -488,9 +580,11 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             Self::MetalXhciSecond => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT, XHCI_SECOND],
                 storage_bus: "xhci1.0",
@@ -501,6 +595,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             // A hub ahead of the second controller's HID, so that controller's
             // devices take the same slot ids as the first's: the boot stick is
@@ -510,6 +605,7 @@ impl Profile {
             // single button-merge entry.
             Self::MetalXhciBoth => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT, XHCI_SECOND],
                 storage_bus: "xhci.0",
@@ -526,6 +622,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             // The boot stick's controller is the one with no interrupt
             // mechanism at all, so the driver refuses it and the machine does
@@ -538,6 +635,7 @@ impl Profile {
             // one controller and passed with MSI deliberately left disabled.
             Self::MetalXhciMsi => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_NO_IRQ_FIRST, XHCI_MSI_ONLY],
                 storage_bus: "xhci.0",
@@ -548,12 +646,14 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
             },
             // Boot stick on the good controller, HID on the crippled one. A
             // keyboard is what makes the absence assertion mean something:
             // the driver has a device it would otherwise bind and announce.
             Self::MetalXhciNoIrq => Shape {
                 vga: "std",
+                vgamem_mb: None,
                 virtio: false,
                 xhci: &[XHCI_DEFAULT, XHCI_NO_IRQ_SECOND],
                 storage_bus: "xhci.0",
@@ -564,8 +664,64 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
+            },
+            // The three below are metal-sim with one field of the unit moved,
+            // so what differs between their boot logs and Metal's is the unit
+            // and nothing else on the machine.
+            Self::NoIommu => Shape {
+                vga: "std",
+                vgamem_mb: None,
+                virtio: false,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
+                usb_disk_first: false,
+                iommu: None,
+            },
+            Self::IommuNarrow => Shape {
+                vga: "std",
+                vgamem_mb: None,
+                virtio: false,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
+                usb_disk_first: false,
+                iommu: Some(Iommu { aw_bits: 39, ..IOMMU_DEFAULT }),
+            },
+            Self::IommuNoIntremap => Shape {
+                vga: "std",
+                vgamem_mb: None,
+                virtio: false,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
+                usb_disk_first: false,
+                iommu: Some(Iommu { intremap: false, ..IOMMU_DEFAULT }),
             },
         }
+    }
+
+    /// The unit this profile puts on the machine, or `None`. A test asserting
+    /// on what the guest decoded reads the expectation from here rather than
+    /// restating it, exactly as [`Profile::usb_disk`] does for the data stick.
+    pub fn iommu(self) -> Option<Iommu> {
+        self.shape().iommu
     }
 
     /// The data stick's size and logical block size, or `None` when the
@@ -1353,8 +1509,19 @@ fn qemu_command(
     // is the option that does it, and it leaves i8042/ps2-kbd/ps2-mouse alone.
     qemu.arg("-nodefaults");
 
+    // `kernel-irqchip=split` only when there is a unit: interrupt remapping
+    // needs the userspace half of the irqchip, and a machine with no unit has
+    // no reason to be built differently from the one it has always been.
+    let mut machine = String::from("q35");
+    if !options.i8042 {
+        machine.push_str(",i8042=off");
+    }
+    if shape.iommu.is_some() {
+        machine.push_str(",kernel-irqchip=split");
+    }
+
     qemu.arg("-machine")
-        .arg(if options.i8042 { "q35" } else { "q35,i8042=off" })
+        .arg(&machine)
         .arg("-cpu")
         .arg(if kvm { "host,+rdrand,+smap,+fsgsbase,+x2apic" } else { "qemu64,+rdrand,+smap,+fsgsbase,+x2apic" })
         .arg("-smp")
@@ -1376,6 +1543,19 @@ fn qemu_command(
             "if=none,id=stick,format=raw,file={}",
             boot_image.display()
         ));
+
+    // Ahead of every other `-device`: QEMU gives a PCI function the bypassing
+    // address space unless the unit exists when the function is created, so a
+    // unit emitted after the devices it is meant to decode is a unit that
+    // decodes nothing — the vacuity trap `specs/userspace-drivers-spec.md` §7.2
+    // is built around, in its harness-side form.
+    if let Some(unit) = shape.iommu {
+        qemu.arg("-device").arg(format!(
+            "intel-iommu,intremap={},caching-mode=on,aw-bits={}",
+            if unit.intremap { "on" } else { "off" },
+            unit.aw_bits
+        ));
+    }
 
     for controller in shape.xhci {
         qemu.arg("-device").arg(*controller);
@@ -1415,6 +1595,9 @@ fn qemu_command(
         .arg("-display")
         .arg("none")
         .arg("-no-reboot");
+    if let Some(mb) = shape.vgamem_mb {
+        qemu.arg("-global").arg(format!("VGA.vgamem_mb={mb}"));
+    }
 
     // Controller and namespace as two devices rather than QEMU's implicit
     // one, so the logical block size is something a profile states instead of
