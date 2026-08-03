@@ -389,14 +389,13 @@ fn adopt_shared_sysroot(
 
     assert!(
         claim,
-        "this worktree's {} differ from what the shared sysroot at {} was built \
-         from, so a build here would link its kernel against another checkout's \
-         struct layouts.\n\
+        "this worktree and the shared sysroot at {} disagree about {}, so a build \
+         here would link its kernel against another checkout's struct layouts.\n\
          Merge the change that is already in the sysroot, or pass --claim-sysroot \
          to rebuild the sysroot from this worktree — which makes every other \
          worktree refuse until it merges yours.",
-        differing_trees(recorded.as_deref(), &want),
-        rust_dir.display()
+        rust_dir.display(),
+        differing_trees(recorded.as_deref(), &want)
     );
 
     lock.act_if(

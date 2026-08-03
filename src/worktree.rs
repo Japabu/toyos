@@ -19,10 +19,14 @@ use std::process::Command;
 
 use crate::toolchain;
 
-/// Roughly what a worktree's crate target directories reach once it has built
-/// and tested everything: 23 GiB, measured on the primary checkout with `du`.
-/// Refusing below double that leaves room for the build that fills them.
-const NEEDED_BYTES: u64 = 46 * 1024 * 1024 * 1024;
+/// What a worktree's crate target directories reach: 4.1 GiB after
+/// `--build-only`, and 23 GiB on the primary checkout, which has run everything.
+/// Measured with `du`. The 50 GiB `rust/` is shared and never counted here.
+///
+/// Refusing at the upper figure plus a little, rather than at the lower one: a
+/// build that fills the disk halfway through costs more than a worktree that
+/// was never made.
+const NEEDED_BYTES: u64 = 25 * 1024 * 1024 * 1024;
 
 pub fn dispatch(root: &Path, args: &[String]) {
     let mut rest = args.iter().skip_while(|a| *a != "--worktree").skip(1);
