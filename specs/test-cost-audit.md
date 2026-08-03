@@ -666,6 +666,97 @@ temp dir, so a guest still up when the next test booted took that boot's socket
 and it died before its first line. **That is the first thing §3.3 has to fix**,
 before any two boots can overlap.
 
+## 5.2 The longest test, and where its time actually was
+
+`screen_console_scroll` — §1.2's number one at 103 s, and §3.3's floor past
+N≈5 — is **26 s** as of this section. Same-session A/B on the merged tree,
+arms alternated, four runs: **122.6 / 110.9 s before, 26.0 / 26.4 s after.**
+
+**§3.1 predicted the wrong cause and §5.1 already half-said so.** The whole
+30–50 s estimate rested on host-side glyph decoding; opt-level 2 returned 5 s of
+it. Instrumenting the poll loop says why. Of 116.4 s in one run:
+
+| | seconds |
+|---|---:|
+| boot + image build | 5.1 |
+| host: 408 screendumps (QMP + read + `Ppm::parse`) | 4.5 |
+| host: `console_rows` decode, 408 dumps | 0.7 |
+| host: typing three commands over QMP, pgup/pgdn sleeps | 3.1 |
+| **guest: `Console::write_bytes`** | **101.2** |
+
+The guest number is measured inside the console, not inferred: a timer around
+`write_bytes` and around the stdout mirror beside it, printed when the batch
+carrying `CHURN-DONE` arrived. **The mirror — 469 KB through the kernel log ring,
+the 16550 and `log_file` — cost 0.02 s of the 101.** Splitting `write_bytes`
+further puts ~98% of it in one place: the `draw_char` loop in `flush`, which
+recomposes essentially the whole panel because a scroll of any depth changes
+every row.
+
+So the cost is **one full-panel recompose per console read**, and the console
+reads its pipe 4096 bytes at a time. Across the three rounds that came out at a
+flat **0.213 ms per byte of output** (0.213 / 0.254 / 0.212 for rounds 1–3),
+which is the whole cost model: this test cost what it printed.
+
+**What the workload was resized on.** 1750 lines, 458 KiB. The body width was
+`5 + 37i mod 500` and the three rounds all started at line 0, so rounds 1 and 2
+were strict *prefixes* of round 3 and the run walked 3.5 periods of a
+500-period sequence. It is now a sweep of the panel's width plus a whole number
+of extra panels — `5 + 37i mod cols + cols * WRAPS[i mod 8]` — walked by three
+rounds over **disjoint** stretches of 100/60/100. Two properties replace the
+line count:
+
+- 37 is coprime with the 240-column panel, so any 240 consecutive lines end in
+  every column exactly once. Column coverage is now a property of the
+  construction rather than of how long the run is.
+- `WRAPS = [0,1,0,2,0,1,0,0]` puts a one-row, a two-row and a three-row line in
+  every eight, so a short run cannot lose the soft-wrap path.
+
+**The second one is there because the first attempt lost it.** A plain sweep of
+two panel widths keeps the coprime property, and 260 lines of it measured
+240/240 columns — and **zero** lines wrapping twice, against 126 before. A
+partial period of `37i mod 480` covers a structured subset (its values are
+`37m + k` for `m < 13`), so it never reaches its own top; the lines that occupy
+three rows all live at indices the run does not visit. Checked on the shipped
+parameters before shipping them, not inferred.
+
+The workload that landed is 260 lines and 65.5 KiB, and it is *denser* than what
+it replaces on the thing that matters: **107 lines shorter than the line before
+them, against 128 in 458 KiB** — the transition that leaves cells past the end,
+at six times the events per byte. 7.0× the bytes removed; 4.5× the wall clock,
+because boot and the QMP typing do not shrink with it.
+
+**Teeth, measured rather than argued.** Four deliberate re-breaks of the console,
+each red on the reduced workload, all inside round 1 — i.e. within the first 100
+lines of 260:
+
+| break | red in |
+|---|---:|
+| `damage` span one column short | 9 s |
+| cell recorded painted, never blitted | 9 s |
+| `scroll` leaves the old bottom row | 12 s |
+| the same, confined to the panel's top rows | 10 s |
+
+The fourth exists because the other three corrupt the marker row too, so they
+fire the marker check; confining the break to rows the marker never lands on
+makes the character-for-character comparison itself the thing that fails, and it
+reports `panel row 0 … the row on screen is LONGER than the line that belongs
+there`.
+
+**One structural change came out of watching those breaks.** The poll loop used
+to ask the panel both "is the round over" and "is the panel right" at once, so a
+broken panel could not satisfy it and spent the full 90 s timeout before
+reporting that a marker never arrived. The console writes the glass before it
+mirrors the same bytes to its own stdout, so the console *stream* answers the
+first question and the panel is left to answer only the second: a break now
+reports in 9–12 s with the offending row, and the churn is no longer sampled
+408 times. Nothing observed was lost — those dumps were the loop's exit test and
+were never asserted on.
+
+Two things this found and did not fix are in `specs/known-issues.md` §8: the
+collapsed-scroll paint the workload believed it exercised is unreachable through
+a pipe and is asserted by nothing, and `Console::flush` records the rightmost
+glyph column as painted when the scrollbar clamped the blit away from it.
+
 ## 6. What this audit did not measure
 
 - The split of a machine test's time *above* the 3.7 s floor into guest work

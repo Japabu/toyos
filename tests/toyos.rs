@@ -49,6 +49,12 @@ const RUST_SKIP: &[&str] = &[
     // `locale_detect_unrecognized` and `locale_detect_refuses_a_held_keyboard`
     // drive it.
     "locale_gate",
+    // A workload, not a test: it prints a pattern for `screen_console_scroll`
+    // to assert a panel against, and on its own it has no verdict at all. It
+    // used to sit in the shared boot with defaults for its arguments, where it
+    // printed four hundred lines to a console nothing was reading and passed
+    // on its exit code.
+    "test_screen_churn",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -1657,18 +1663,18 @@ fn run_screen_test(
             // line that replaces a longer one, and a line wider than the panel
             // is the only way one logical line scrolls the screen twice. Batch
             // sizes drift against the row count, and the last round arrives as
-            // one block, which is the shape of the seed the console starts
-            // with.
+            // one block.
             //
-            // The three rounds walk *disjoint* stretches of the line sequence,
-            // and the sequence sweeps two panel widths — so between them they
-            // end a line in every column of the panel, once, which is where
-            // the at-risk cells are. The workload is sized by that property
-            // and not by a line count: what a longer run buys is the same
-            // states again at other alignments, and it is not free. The guest
-            // recomposes the whole panel for every batch the console reads,
-            // measured at 0.21 ms per byte of output under TCG, so the cost of
-            // this test is its byte count and nothing else.
+            // **The workload is sized by what it must cover, not by a line
+            // count.** `test_screen_churn` documents the construction; what
+            // this end of it relies on is that any `cols` consecutive lines
+            // end in every column of the panel once, and that one line in
+            // eight wraps twice — so three rounds walking *disjoint* stretches
+            // of 260 lines between them cover both, and a longer run buys the
+            // same states again at other alignments. That is not free: the
+            // guest recomposes the whole panel for every batch the console
+            // reads, measured at 0.21 ms per byte of output under TCG, so the
+            // cost of this test is its byte count and nothing else.
             let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("console");
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
@@ -1694,19 +1700,13 @@ fn run_screen_test(
             }
             let rows = before.height / screen::GLYPH_H;
             let cols = before.width / screen::GLYPH_W;
-            // Two panel widths. The body sweeps this range in steps of 37,
-            // which is coprime with `cols`, so `cols` consecutive lines end in
-            // every column exactly once and half of them are wider than the
-            // panel. A span that is not a multiple of `cols` still covers
-            // every column eventually — it just takes the whole span to do it,
-            // and every line of it is paid for.
-            let span = 2 * cols;
 
             // The same lines `test_screen_churn` prints. Duplicated
             // deliberately: a reference taken from the guest would agree with
             // the guest about a defect they shared.
+            let wraps = [0usize, 1, 0, 2, 0, 1, 0, 0];
             let churn_line = |i: usize| -> String {
-                let body = 5 + (i * 37) % span;
+                let body = 5 + (i * 37) % cols + cols * wraps[i % wraps.len()];
                 let fill = char::from(b'a' + (i % 26) as u8);
                 let mid: String = std::iter::repeat(fill).take(body).collect();
                 format!("L{i:04} {mid} E{i:04}")
@@ -1722,10 +1722,10 @@ fn run_screen_test(
                 ch.chunks(cols).map(|c| c.iter().collect()).collect()
             };
 
-            // Disjoint stretches covering `span / 2` lines between them, so
-            // every column of the panel is the last column of one of them.
-            // Each round prints more than a panel's worth of rows, so the
-            // screen it is asserted on holds nothing from the round before.
+            // Disjoint stretches tiling one run longer than the panel is wide,
+            // so every column of it is the last column of some line. Each
+            // round prints more than a panel's worth of rows, so the screen it
+            // is asserted on holds nothing from the round before.
             let rounds = [
                 (1usize, 0usize, 100usize, 7usize),
                 (2, 100, 60, 7),
@@ -1757,7 +1757,7 @@ fn run_screen_test(
                 {
                     let mut input = qemu::QmpInput::open(qemu.qmp_socket());
                     input.type_text(&format!(
-                        "test_rs_test_screen_churn {start} {count} {chunk} {span}\n"
+                        "test_rs_test_screen_churn {start} {count} {chunk} {cols}\n"
                     ));
                 }
                 // When the round is over is a different question from whether
