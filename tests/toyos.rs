@@ -41,18 +41,20 @@ enum Sched {
 
 /// The width with no `--jobs`, and where it came from.
 ///
-/// 14 cores and about three host threads a guest says four, and the suite says
-/// eight: measured against one HEAD in one session, the parallel phase came in
-/// at 182.7 s wide four, **91.7 s wide eight** and 126.0 s wide twelve, and on a
-/// quiet host at eight it packs 454.5 s of test time into 58.3 s of wall clock.
-/// Twelve is past the machine and the suite measures that rather than being
-/// argued out of it. `specs/test-cost-audit.md` §5.4.7 carries the table and the
-/// one caveat it has.
+/// 14 cores and about three host threads a guest divides out to four. The suite
+/// says twelve: on one tree in one session, **123.1 s wide eight and 107.3 s
+/// wide twelve**, both green, with the parallel phase at 59.1 s and 43.8 s. A
+/// guest here is mostly *waiting* — for a marker, for a debounce, for a
+/// device — which is why this is a measurement and not a division.
 ///
-/// A guest that is mostly *waiting* — for a marker, for a debounce, for a
-/// device — is what makes eight fit at all, and it is why this number is a
-/// measurement and not a division.
-const DEFAULT_WIDTH: usize = 8;
+/// **Twelve is the number for one suite on this host, and the host has no
+/// budget.** Four agents at twelve is 48 guests on 14 cores; the semaphore
+/// `specs/worktrees.md` §6 asks for does not exist, and until it does the width
+/// is a per-suite number with a machine-wide cost. `specs/test-cost-audit.md`
+/// §5.4.7 carries the tables, including the one that said eight, which was taken
+/// while `drain_serial` was still width-scaled and `metal_sim_pointer_churn`'s
+/// twenty-four paced drains *were* the phase.
+const DEFAULT_WIDTH: usize = 12;
 
 /// The one boot that carries every Rust and C test.
 ///

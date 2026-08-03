@@ -929,32 +929,33 @@ by *what the assertion is* rather than by what the registration said:
 | longest-job-first on a measured profile | parallel phase | see §5.4.5 |
 | inert-actuator folding | image builds | 5 kernel variants → 1 |
 
-**Where it landed.** One suite on a quiet host (`uptime` load 4.90, no other
-worktree building or booting), 238/238 green, width 8:
+**Where it landed.** One suite, 240/240 green, at the default width of 12
+(§5.4.7), on a host whose load was falling from 18.9 to 9.0 with no other guest
+up at the end:
 
 | | seconds |
 |---|---:|
-| parallel phase, 228 tests in 61 tasks | **58.3** |
-| serial tail, 6 tests | **35.0** |
-| gate A, 4 boots | **46.5** |
-| **suite** | **139.7** |
-
-The parallel phase summed to 454.5 s of test time in 58.3 s of wall clock —
-**7.8× on 8 workers**, and its longest single job is 32 s against a 58.3 s wall,
-so the phase is sum-bound and not critical-path bound. That is the number the
-width question (§5.4.7) is asked against.
-
-**Gate A's 46.5 s is 30 s plus two confirmations.** Two of its four configs saw
-a dropout and the fast tier re-booted each once to check it reproduced; neither
-did. A run whose four configs come back clean is 30 s, which puts this suite at
-**123 s**. The audit's honest statement of the target is therefore: *the
-scheduling is done and 120 s is within a few seconds of it, and what stands
-between is gate A's floor* — 30 s of it, alone, by construction, and the owner's
-to move.
+| parallel phase, 234 tests in 63 tasks | **43.8** |
+| serial tail, 6 tests | **33.6** |
+| gate A, 4 boots | **~30** |
+| **suite** | **107.3** |
 
 Against the starting point: **327.5 s at width 4** before this wave and before
 `screen_console_scroll`'s cut, and **433.8 s** measured on this branch's base
-under the same five-worktree load the conversions were later tested under.
+under the five-worktree load the conversions were later tested under.
+
+**Gate A is now 28% of the run**, and it is the one block nothing here touches:
+four boots, alone, because `tests/audio-baseline.toml`'s numbers were recorded
+that way. The serial tail is another 31%. **Two thirds of a green suite is now
+the part that cannot share the host**, which is where the next lever has to
+come from and both halves of it are the owner's.
+
+One earlier run is worth keeping for what it shows about gate A's variance: the
+same suite at width 8 on a quieter host came in at **139.7 s**, of which gate A
+was **46.5 s** — 30 s plus two confirmations, because two of its four configs
+saw a dropout and the fast tier re-booted each once to check it reproduced.
+Neither did. A gate A that has to confirm costs half again as much as one that
+does not, and nothing schedules around that.
 
 **`double_fault_stack` is the shape to look for elsewhere.** A guest the fatal
 path has halted does not *exit*: every CPU is stopped and QEMU stays up, so
@@ -1053,18 +1054,37 @@ same HEAD, other worktrees' suites draining from `uptime` load 32 to 6:
 | 8 | **91.7 s** | 32.1 s | 183.2 s |
 | 12 | 126.0 s | 27.6 s | 187.2 s |
 
-**Eight, and twelve is worse.** The case §5.3 could not make is made here: 14
-cores against ~3 host threads a guest puts 8 at the edge and 12 past it, and the
-suite measures that rather than being argued out of it. On the quiet host the
-default width's phase came in at 58.3 s (above), which is 7.8× on 8 workers —
-there is very little packing left to win, and the remaining cost is the sum.
+**That table says eight, and it is wrong about twelve.** It was taken while
+`drain_serial` was still width-scaled, and at width 12 `metal_sim_pointer_churn`
+— twenty-four paced drains — *was* the phase: 126.0 s of job inside a 126.0 s
+wall. It is 18 s now. Re-run on the fixed tree, after main was merged, 240 tests
+both, both green:
 
-**One caveat this table carries and the quiet run does not.** These three were
-taken before `drain_serial` stopped being width-scaled, and at width 12
-`metal_sim_pointer_churn` — twenty-four paced drains — *was* the phase: 126.0 s
-of job inside a 126.0 s wall. It is 18 s now. So the shape of the 12 column is
-real (more workers than cores) but its size is partly a defect that is fixed;
-if the width is ever raised, raise it against a fresh table.
+| width | parallel | tail | suite | host |
+|---:|---:|---:|---:|---|
+| 8 | 59.1 s | 34.0 s | **123.1 s** | load 7.6 → 8.3, no other guest |
+| 12 | 43.8 s | 33.6 s | **107.3 s** | load 18.9 → 9.0 |
+
+**Twelve, and the more loaded of the two runs is the faster one.** Eight packs
+454.5 s of test time into 58.3 s — 7.8× on 8 workers, with its longest single
+job at 32 s — so the phase is sum-bound rather than critical-path bound, and the
+sum is what more workers divide. The earlier table's own numbers say the same
+thing from the other side: 716 s of test time at width 8 and 713.7 s at width
+12, so twelve workers did not make the work bigger.
+
+**Twelve is the number for one suite, and the host has no budget.** Four agents
+at twelve is 48 guests on 14 cores. The counting semaphore
+`specs/worktrees.md` §6 asks for still does not exist, and until it does this is
+a per-suite number with a machine-wide cost — which is the same warning §4.1
+constraint 3 gave at four and is now three times louder.
+
+**Confidence: one clean run each.** Four more were attempted and none of them is
+a measurement: two died on `this worktree and the shared sysroot disagree about
+toyos-abi/src` when another worktree claimed the sysroot mid-run, one spent 84 s
+queued behind the exclusive phase that followed, and one ran under five
+concurrent suites. That is the honest state of the evidence for 12 over 8; the
+direction is consistent across every pair taken since the `drain_serial` fix,
+and the margin is not.
 
 ### 5.4.6 Ledger 3 — recycling and contamination
 
