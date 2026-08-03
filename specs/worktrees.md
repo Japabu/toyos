@@ -177,6 +177,13 @@ agent reached for Python, and during the first landing's 10-minute gate another
 agent put three commits on main. What caught that was `--ff-only`, exactly as
 above — a check on a lock nobody was holding. Steps 2-4 were redone.
 
+**And the third landing was `--land`'s own, which caught the same thing on its
+first run.** Six commits — the Swiss German keyboard work, `a5c26b6..8e3f76d` —
+went onto main during its 870 s gate, by hand, because on main the command did
+not exist yet. The bypass report named all six and merged nothing; step 2 and
+step 3 were run again against the new main. That is the last landing that can
+happen, since `--land` is on main from that merge onward.
+
 The redo is cheap only when the code delta is provable: `git diff <gated>..HEAD`
 after the second merge showed markdown alone, so the 233-test run carried and
 only the audio family was re-run before the fast-forward, both inside one hold.
