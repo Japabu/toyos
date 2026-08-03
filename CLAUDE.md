@@ -186,7 +186,7 @@ Three layers, built in order; each is useful on its own.
 Read the spec before touching the subsystem it covers.
 
 - `specs/scheduler-core-spec.md` — the ownership-typed scheduler core (`toyos-sched/`), with a deterministic host simulator and interleaving fuzzer. **Stage 7c done**: the kernel drives it, balance on, legacy notification path deleted. Host tests: `cargo test` inside `toyos-sched/`. Five negative gates prove the harnesses have teeth — do not weaken one to make a change pass. State and every defect the cutover found: `specs/scheduler-migration-log.md`.
-- `specs/iommu-spec.md` + `specs/userspace-drivers-spec.md` — `kernel/src/iommu/`, and the userspace drivers it exists to make safe. **Stages I0–I1 done**: every QEMU profile now boots with `-device intel-iommu` on a split irqchip, and discovery is read-only — nothing is programmed and no machine is refused. §8.1 records what the unit actually answers, which contradicts the file in four places.
+- `specs/iommu-spec.md` + `specs/userspace-drivers-spec.md` — `kernel/src/iommu/`, and the userspace drivers it exists to make safe. **Stages I0–I2 done**: every profile boots with its unit *translating*, every enumerated function in one identity-mapped domain, and a DMA fault names the device and address before halting the machine. Nothing is refused yet. §8.1–§8.2 record what QEMU's unit actually answers, including an access it silently drops instead of faulting.
 - `specs/capability-handles-spec.md` — refcounted kernel objects behind typed per-process handles (Fd→Handle). Subsumes the `SharedToken`/io_uring/`Fd` debt.
 - `specs/iouring-blocking-spec.md` — io_uring as the only blocking mechanism; one wait-free completion primitive, one park/recheck site.
 - `specs/metal-boot-plan.md` — first boot on the ThinkPad T14 Gen 2: achieved. `specs/metal-hardware-inventory.md` records the machine; the task list carries what is next.
@@ -201,8 +201,9 @@ Read the spec before touching the subsystem it covers.
 
 **`specs/known-issues.md` is the list and the file to update** — ten sections, every open item with its evidence and its reproduction. Read it before touching a subsystem. Nothing is duplicated here.
 
-Five bite an agent who is *not* working on the subsystem:
+Six bite an agent who is *not* working on the subsystem:
 
+- **A boot that wedges before the idle loop produces no serial output at all** — the log ring's only drains are the timer tick and the idle loop, and neither runs during the boot phases. It looks exactly like a kernel that never started. Known-issues §5 carries the one-line patch that makes one bisectable.
 - **`Command::output()` returns an empty stderr, always** — the toyos `output` asks `spawn` for the pipe and then drops it. A guest test asserting on a child's refusal message passes vacuously. Use `spawn()` + `wait_with_output()`.
 - **Gate A can fail a run on `drains` alone**, with no gap and no underrun. A per-run failure should require evidence of harm.
 - **`log_file`'s flush is unbounded and uninterruptible, in `idle_loop` before `pass()`.** Anything added to the idle loop is an audio change, and userland `println!` shares that ring. The pre-`hlt` recheck beside it now has four conditions that only a deferred-callback facility would remove; xHCI's is the one that holds an idle CPU awake for as long as 100 ms.
