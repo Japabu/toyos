@@ -1147,14 +1147,62 @@ impl toyos_gpt::Sectors for ImageSectors<'_> {
     }
 }
 
-/// The log partition is named, never discovered — proved by moving the name.
+/// A GUID no table this build produces can contain: `create_boot_image` draws
+/// v4 UUIDs, whose version nibble is 4 and whose variant bits are `10`. Written
+/// in GPT entry byte order, which is the order everything from the file to the
+/// comparison uses.
+const FORGED: [u8; 16] = [
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+];
+/// As `Guid`'s Display prints it: three little-endian fields then raw bytes.
+const FORGED_TEXT: &str = "33221100-5544-7766-8899-AABBCCDDEEFF";
+
+/// A stick as the build made it, with one file changed: the sixteen bytes of
+/// `\toyos\log.guid` now name a partition no machine has.
 ///
-/// Everything about the partition stays as it was: still second in the table,
-/// still typed Microsoft Basic Data, still the only other FAT32 on the stick,
-/// still exactly where it was. The only change is the sixteen bytes in
-/// `\toyos\log.guid` on the ESP, which is what the bootloader hands the kernel.
-/// A kernel that found the volume by type, by format or by position would mount
-/// it anyway and this gate would go green on the defect it exists for.
+/// Everything about the log partition stays as it was — still second in the
+/// table, still typed Microsoft Basic Data, still the only other FAT32 on the
+/// stick, still exactly where it was — so a kernel that found the volume by
+/// type, by format or by position would mount it anyway and every gate built on
+/// this would go green on the defect it exists for.
+///
+/// Returns the image's path and its two partition extents.
+pub fn image_with_unnamed_log_partition(
+    name: &str,
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(PathBuf, (usize, usize), (usize, usize)), String> {
+    let image_path = test_dir().join(name);
+    let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, &[]);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+    let esp = esp_extent(&image, &image_path)?;
+    let log = log_extent(&image, &image_path)?;
+
+    {
+        let volume = &mut image[esp.0..esp.0 + esp.1];
+        let fs = fatfs::FileSystem::new(Cursor::new(&mut *volume), FsOptions::new())
+            .map_err(|e| format!("the built ESP does not mount on the host: {e}"))?;
+        let dir = fs
+            .root_dir()
+            .open_dir("toyos")
+            .map_err(|e| format!("the built ESP has no toyos directory: {e}"))?;
+        let mut file = dir
+            .create_file("log.guid")
+            .map_err(|e| format!("opening log.guid on the ESP: {e}"))?;
+        file.truncate().map_err(|e| format!("truncating log.guid: {e}"))?;
+        file.write_all(&FORGED).map_err(|e| format!("writing log.guid: {e}"))?;
+    }
+    std::fs::write(&image_path, &image).map_err(|e| format!("rewrite the boot image: {e}"))?;
+    Ok((image_path, esp, log))
+}
+
+/// What the kernel says on the panel when this boot leaves nothing to read
+/// afterwards. `!!!` is the panic console's alert marker, so the row paints
+/// red; `screen_log_absent` is the gate that it does.
+pub const NO_LOG_ALERT: &str = "!!! log: no /log";
+
+/// The log partition is named, never discovered — proved by moving the name.
 ///
 /// The refusal has three halves and each is separately checkable:
 ///
@@ -1170,38 +1218,12 @@ pub fn log_partition_identity(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    /// A GUID no table this build produces can contain: `create_boot_image`
-    /// draws v4 UUIDs, whose version nibble is 4 and whose variant bits are
-    /// `10`. Written in GPT entry byte order, which is the order everything
-    /// from the file to the comparison uses.
-    const FORGED: [u8; 16] = [
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
-        0xFF,
-    ];
-    // As `Guid`'s Display prints it: three little-endian fields then raw bytes.
-    const FORGED_TEXT: &str = "33221100-5544-7766-8899-AABBCCDDEEFF";
-
-    let image_path = test_dir().join("log-identity-boot.img");
-    let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, &[]);
-    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
-    let (esp_start, esp_len) = esp_extent(&image, &image_path)?;
-    let (log_start, log_len) = log_extent(&image, &image_path)?;
-
-    {
-        let volume = &mut image[esp_start..esp_start + esp_len];
-        let fs = fatfs::FileSystem::new(Cursor::new(&mut *volume), FsOptions::new())
-            .map_err(|e| format!("the built ESP does not mount on the host: {e}"))?;
-        let dir = fs
-            .root_dir()
-            .open_dir("toyos")
-            .map_err(|e| format!("the built ESP has no toyos directory: {e}"))?;
-        let mut file = dir
-            .create_file("log.guid")
-            .map_err(|e| format!("opening log.guid on the ESP: {e}"))?;
-        file.truncate().map_err(|e| format!("truncating log.guid: {e}"))?;
-        file.write_all(&FORGED).map_err(|e| format!("writing log.guid: {e}"))?;
-    }
-    std::fs::write(&image_path, &image).map_err(|e| format!("rewrite the boot image: {e}"))?;
+    let (image_path, _, (log_start, log_len)) = image_with_unnamed_log_partition(
+        "log-identity-boot.img",
+        test_config,
+        c_bins,
+        rust_bins,
+    )?;
 
     let mut qemu = QemuInstance::boot_with_options(
         test_config,
