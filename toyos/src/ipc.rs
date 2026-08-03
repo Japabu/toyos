@@ -126,6 +126,15 @@ impl IpcHeader {
     }
 }
 
+/// The largest typed payload [`try_send`] frames without allocating.
+///
+/// Every `ipc_payload!` struct in the tree is far below this — the largest is
+/// `window::CreateWindowRequest` at 40 bytes. A type past it does not compile,
+/// because the alternative would be a payload split across two writes, and a
+/// non-blocking send that can be half-refused is the thing [`try_send`] exists
+/// to make unrepresentable.
+pub const MAX_TYPED_PAYLOAD: usize = 64;
+
 #[derive(Debug)]
 pub enum IpcError {
     Disconnected,
@@ -135,6 +144,22 @@ pub enum IpcError {
     Malformed,
     /// This endpoint will not frame a payload that large. Distinct from
     /// [`IpcError::Malformed`] because the two blame different sides.
+    TooLarge,
+    Syscall(SyscallError),
+}
+
+/// Why a whole frame could not be handed over without blocking.
+#[derive(Debug)]
+pub enum TrySendError {
+    /// The peer's pipe would not take the whole frame in one write.
+    ///
+    /// **The connection is no longer at a message boundary.** The kernel
+    /// accepts a short write and there is no way to retract the part it took,
+    /// so there is nothing here to retry: the only correct answer is to drop
+    /// the peer. That is not a harsh reading of a busy moment — a peer that
+    /// cannot take one frame has an entire pipe of unread messages behind it.
+    Full,
+    /// This endpoint will not frame a payload that large.
     TooLarge,
     Syscall(SyscallError),
 }
@@ -160,6 +185,18 @@ impl Connection {
 
     pub fn send_bytes(&self, msg_type: u32, data: &[u8]) -> Result<(), IpcError> {
         send_bytes(self.fd(), msg_type, data)
+    }
+
+    pub fn try_send<T: IpcPayload>(&self, msg_type: u32, payload: &T) -> Result<(), TrySendError> {
+        try_send(self.fd(), msg_type, payload)
+    }
+
+    pub fn try_signal(&self, msg_type: u32) -> Result<(), TrySendError> {
+        try_signal(self.fd(), msg_type)
+    }
+
+    pub fn try_send_bytes(&self, msg_type: u32, data: &[u8]) -> Result<(), TrySendError> {
+        try_send_bytes(self.fd(), msg_type, data)
     }
 
     pub fn recv_header(&self) -> Result<IpcHeader, IpcError> {
@@ -209,6 +246,39 @@ pub fn send_bytes(fd: Fd, msg_type: u32, data: &[u8]) -> Result<(), IpcError> {
     Ok(())
 }
 
+/// Send a framed payload without ever blocking, or refuse the whole frame.
+///
+/// A server writing to a client it does not trust to read cannot use [`send`]:
+/// `write_all` parks in the kernel until the peer drains, which is a client
+/// deciding when the server runs again. This is the same frame in one
+/// `write_nonblock`, so the peer's backlog is an answer rather than a wait.
+pub fn try_send<T: IpcPayload>(fd: Fd, msg_type: u32, payload: &T) -> Result<(), TrySendError> {
+    const { assert!(core::mem::size_of::<T>() <= MAX_TYPED_PAYLOAD) };
+    let size = core::mem::size_of::<T>();
+    let mut frame = [0u8; IpcHeader::WIRE_SIZE + MAX_TYPED_PAYLOAD];
+    let header = IpcHeader::frame(msg_type, size).map_err(|_| TrySendError::TooLarge)?;
+    frame[..IpcHeader::WIRE_SIZE].copy_from_slice(&header.to_wire());
+    frame[IpcHeader::WIRE_SIZE..IpcHeader::WIRE_SIZE + size].copy_from_slice(as_bytes(payload));
+    write_whole(fd, &frame[..IpcHeader::WIRE_SIZE + size])
+}
+
+/// [`signal`] without blocking. A bare header always fits in one write.
+pub fn try_signal(fd: Fd, msg_type: u32) -> Result<(), TrySendError> {
+    write_whole(fd, &IpcHeader { msg_type, len: 0 }.to_wire())
+}
+
+/// [`send_bytes`] without blocking.
+///
+/// The frame buffer is [`MAX_FRAME_LEN`] on the stack, so this is for the
+/// occasional large message — a clipboard paste — not for a per-frame path.
+pub fn try_send_bytes(fd: Fd, msg_type: u32, data: &[u8]) -> Result<(), TrySendError> {
+    let mut frame = [0u8; IpcHeader::WIRE_SIZE + MAX_FRAME_LEN as usize];
+    let header = IpcHeader::frame(msg_type, data.len()).map_err(|_| TrySendError::TooLarge)?;
+    frame[..IpcHeader::WIRE_SIZE].copy_from_slice(&header.to_wire());
+    frame[IpcHeader::WIRE_SIZE..IpcHeader::WIRE_SIZE + data.len()].copy_from_slice(data);
+    write_whole(fd, &frame[..IpcHeader::WIRE_SIZE + data.len()])
+}
+
 pub fn recv_header(fd: Fd) -> Result<IpcHeader, IpcError> {
     let mut bytes = [0u8; IpcHeader::WIRE_SIZE];
     read_exact(fd, &mut bytes)?;
@@ -250,6 +320,27 @@ pub fn recv_bytes(fd: Fd, header: &IpcHeader, buf: &mut [u8]) -> Result<usize, I
     Ok(count)
 }
 
+/// The memory twin of [`recv_payload`], for a reader that already holds the
+/// bytes.
+///
+/// Buffering a whole frame before acting on it is what lets a server stay
+/// non-blocking against a peer that stops mid-message, and a buffered payload
+/// has no fd left to read it from.
+pub fn decode_payload<T: IpcPayload>(bytes: &[u8]) -> Result<T, IpcError> {
+    let size = core::mem::size_of::<T>();
+    if bytes.len() < size {
+        return Err(IpcError::Malformed);
+    }
+    let mut val = core::mem::MaybeUninit::<T>::uninit();
+    // SAFETY: the copy fills exactly the `T` being built from a source at
+    // least that long, and `IpcPayload` promises every bit pattern is a valid
+    // `T` — the same contract `recv_payload` reads on.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), val.as_mut_ptr() as *mut u8, size);
+        Ok(val.assume_init())
+    }
+}
+
 fn as_bytes<T: IpcPayload>(val: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>()) }
 }
@@ -274,6 +365,19 @@ fn read_exact(fd: Fd, buf: &mut [u8]) -> Result<(), IpcError> {
         offset += n;
     }
     Ok(())
+}
+
+/// All of `buf` in one non-blocking write, or [`TrySendError::Full`].
+///
+/// A short write is `Full`, not a partial success: the caller asked for a
+/// frame, and half a frame is a stream the peer can no longer parse.
+fn write_whole(fd: Fd, buf: &[u8]) -> Result<(), TrySendError> {
+    match syscall::write_nonblock(fd, buf) {
+        Ok(n) if n == buf.len() => Ok(()),
+        Ok(_) => Err(TrySendError::Full),
+        Err(SyscallError::WouldBlock) => Err(TrySendError::Full),
+        Err(e) => Err(TrySendError::Syscall(e)),
+    }
 }
 
 fn write_all(fd: Fd, buf: &[u8]) -> Result<(), IpcError> {
