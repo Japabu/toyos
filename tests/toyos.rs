@@ -131,6 +131,7 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 const SCREEN_TESTS: &[(&str, Sched)] = &[
     ("screen_decoder", Sched::Parallel),
     ("screen_diag_boot", Sched::Parallel),
+    ("screen_log_absent", Sched::Parallel),
     ("screen_console_shell", Sched::Parallel),
     ("screen_console_clear", Sched::Parallel),
     ("screen_console_scroll", Sched::Parallel),
@@ -1369,13 +1370,23 @@ fn run_screen_test(
             }
             serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
 
-            for want in ["Boot: complete", "i8042:"] {
+            for want in ["Boot: complete", "i8042:", "log: this boot is on the console and in"] {
                 if !text.contains(want) {
                     return Err(format!(
                         "{want:?} is not on screen five seconds after the boot \
                          finished\ndecoded screen:\n{text}"
                     ));
                 }
+            }
+            // `screen_log_absent`'s control. This machine's log partition
+            // mounted, so nothing here may be wearing the alert marker — a
+            // kernel that painted it unconditionally would satisfy that gate
+            // and mean nothing.
+            if let Some(row) = dump.rows().iter().find(|r| r.contains("!!!")) {
+                return Err(format!(
+                    "an alert row on a boot where everything worked: {row:?}\n\
+                     decoded screen:\n{text}"
+                ));
             }
 
             // A log longer than the screen is shown as its tail, and the rule
@@ -1458,6 +1469,81 @@ fn run_screen_test(
                     None => "whole log on one screen, no footer".to_string(),
                 }
             );
+            Ok(())
+        }
+        "screen_log_absent" => {
+            // The machine the log partition exists for, with the log partition
+            // taken away from it: metal-sim has no serial port a person can
+            // read, so a `/log` that did not mount is a fact only the panel can
+            // carry. Before this it was carried the way everything else is —
+            // one white row, in the middle of phase 5, among sixty-seven — and
+            // the owner's report was that nothing said so at all.
+            //
+            // The diag config for the same reason `screen_diag_boot` uses it:
+            // it contains no process that can claim the framebuffer, so the
+            // last boot checkpoint's paint is still up when the screendump is
+            // taken. On the flashed desktop image the compositor takes the
+            // screen about 48 ms after `Boot: complete`, which is what makes
+            // "it is on the panel" a claim about the checkpoint and not about
+            // how fast a person can look.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("diag");
+            let (image_path, _, _) = common::volumes::image_with_unnamed_log_partition(
+                "log-absent-boot.img",
+                &config,
+                &[],
+                &[],
+            )?;
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                boot_image: Some(image_path.clone()),
+                ready_marker: "Boot: complete",
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            let console = qemu.boot_log().to_string();
+            let dump = qemu.screendump_until(common::volumes::NO_LOG_ALERT, Duration::from_secs(30));
+            let text = dump.text();
+            print_screen(name, &text);
+
+            // Non-vacuity, and it is the half that matters: a boot whose log
+            // partition mounted would paint the ordinary line, and a screen
+            // asserted on without this would pass on a kernel that always says
+            // the alarming thing.
+            if !console.contains("log-volume: not mounted") {
+                return Err(format!(
+                    "the kernel mounted a log volume it was never given, so nothing here is \
+                     about a missing /log:\n{console}"
+                ));
+            }
+            if console.contains("log-file: this boot's kernel log continues in") {
+                return Err(format!(
+                    "the sink installed anyway — a fallback is what this must not do:\n{console}"
+                ));
+            }
+
+            if !text.contains(common::volumes::NO_LOG_ALERT) {
+                return Err(format!(
+                    "the panel of a machine with no /log and no console says nothing about \
+                     either\ndecoded screen:\n{text}"
+                ));
+            }
+            // Red, and the rest of the screen white. `text()` throws hue away
+            // by construction, so this is the only place the difference between
+            // "the line is there" and "the line stands out" exists.
+            check_colors(&dump, FILL_BOOT, common::volumes::NO_LOG_ALERT)?;
+            // And it is a boot checkpoint's paint rather than a panic's: the
+            // fill above says so, and the machine is still running.
+            if !text.contains("Boot: complete") {
+                return Err(format!(
+                    "the alert is on a screen that never reached the end of the boot\n\
+                     decoded screen:\n{text}"
+                ));
+            }
+            let _ = std::fs::remove_file(&image_path);
+            let row = dump.row_index(common::volumes::NO_LOG_ALERT).expect("checked above");
+            eprintln!("  [log] on the panel, in alert red: {}", dump.rows()[row]);
             Ok(())
         }
         "screen_console_shell" => {

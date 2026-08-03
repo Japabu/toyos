@@ -248,6 +248,38 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
     gpu::register(driver, info);
 }
 
+/// Say where this boot's log can be read, on the last surface that still shows
+/// it.
+///
+/// The final boot checkpoint paints the tail of the ring, so a line logged
+/// immediately before it is on the panel until userland claims the screen. On
+/// the machine this exists for that panel is the only thing a person can be
+/// told anything on — and what they most need to be told is that there will be
+/// nothing to read afterwards. A `/log` that refused to mount already says so,
+/// once, in the middle of phase 5, in white, among sixty-seven other rows.
+///
+/// `!!!` is the panic console's alert marker (`panic_console::has_alert`),
+/// which paints the row red. It is claimed here for the two states in which
+/// this boot leaves no readable account of itself anywhere.
+///
+/// ASCII throughout, unlike the rest of the kernel's prose: the panel's font is
+/// codepoints 0x20..=0x7E and `draw_glyph` renders everything else as a dot, so
+/// an em dash reaches the one reader this line has as three of them.
+fn report_log_destination() {
+    match (drivers::serial::has_console(), log_file::destination()) {
+        (true, Some(path)) => log!("log: this boot is on the console and in {path}"),
+        (false, Some(path)) => {
+            log!("log: no serial console - this boot is in {path} and on the screen")
+        }
+        (true, None) => {
+            log!("!!! log: no /log - this boot is on the console only, and nothing outlives the power !!!")
+        }
+        (false, None) => {
+            log!("!!! log: no serial console and no /log - this boot is on this screen and nowhere else !!!")
+        }
+    }
+}
+
 unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Copy KernelArgs to the kernel stack — the original lives on the UEFI stack
     // which becomes inaccessible after mm::init drops the identity map.
@@ -511,6 +543,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         log!("spawned {} pid={pid}", args[0]);
     }
 
+    report_log_destination();
     boot_phase!("complete", 0);
 
     // The panic no userland process can produce, by design: nothing is
