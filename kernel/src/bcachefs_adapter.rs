@@ -1,10 +1,10 @@
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
 use bcachefs::{BlockIO, BlockBuf, BlockNum, DeviceError, FsError, Mounted, ReadWrite, ReadOnly, Formatted, SliceBlockIO, Extent};
-use crate::file_backing::{FileBacking, NvmeBacking, InitrdBacking};
+use crate::file_backing::{FileBacking, FileBlocks, NvmeBacking, InitrdBacking};
 use crate::file_cache::{self, FileId};
 use crate::page_cache;
 use toyos_abi::syscall::SyscallError;
@@ -71,7 +71,7 @@ fn no_channel<T>(op: &str, name: &str, result: Result<T, FsError>) -> Option<T> 
 /// Per-open-file cached resolution state.
 struct OpenFileInfo {
     name: String,
-    extents: Vec<Extent>,
+    blocks: Arc<FileBlocks>,
 }
 
 /// VFS adapter for read-write bcachefs on NVMe.
@@ -79,11 +79,52 @@ pub struct BcacheFsAdapter {
     fs: Mounted<PageCacheBlockIO, ReadWrite>,
     open_files: HashMap<FileId, OpenFileInfo>,
     name_to_id: HashMap<String, FileId>,
+    /// The one [`FileBlocks`] every backing for a name shares.
+    ///
+    /// Keyed by name and not by `FileId` because `open_backing` hands out a
+    /// backing without opening a file at all — that is the one a spawned
+    /// program's text lives behind, and it outlives every fd. `Weak` so the
+    /// entry costs nothing once the last backing is dropped.
+    blocks: HashMap<String, Weak<FileBlocks>>,
 }
 
 impl BcacheFsAdapter {
     pub fn new(fs: Mounted<PageCacheBlockIO, ReadWrite>) -> Self {
-        Self { fs, open_files: HashMap::new(), name_to_id: HashMap::new() }
+        Self {
+            fs,
+            open_files: HashMap::new(),
+            name_to_id: HashMap::new(),
+            blocks: HashMap::new(),
+        }
+    }
+
+    /// The cell every backing for `name` reads through, made from `extents` if
+    /// this is the first one.
+    fn blocks_for(&mut self, name: &str, extents: Vec<Extent>) -> Arc<FileBlocks> {
+        // Names whose last backing has gone are swept here rather than on a
+        // timer: the map is only ever grown by this call, so this is the one
+        // place where dropping them costs nothing extra.
+        self.blocks.retain(|_, weak| weak.strong_count() > 0);
+
+        if let Some(live) = self.blocks.get(name).and_then(Weak::upgrade) {
+            return live;
+        }
+        let blocks = FileBlocks::new(extents);
+        self.blocks.insert(String::from(name), Arc::downgrade(&blocks));
+        blocks
+    }
+
+    /// Give up every backing that reads `name`'s blocks.
+    ///
+    /// Called wherever the filesystem hands those blocks back to the
+    /// allocator — an unlink, a truncating create, a rename over an existing
+    /// name. The next file takes them, so a backing that still names them
+    /// reads that file's data: an information disclosure through ordinary
+    /// filesystem operations, with nothing crafted about it.
+    fn revoke(&mut self, name: &str) {
+        if let Some(blocks) = self.blocks.remove(name).as_ref().and_then(Weak::upgrade) {
+            blocks.revoke();
+        }
     }
 }
 
@@ -124,22 +165,25 @@ impl FileSystem for BcacheFsAdapter {
         if let Some(&file_id) = self.name_to_id.get(name) {
             file_cache::open(file_id);
             let info = self.open_files.get(&file_id)?;
-            let backing = Arc::new(NvmeBacking::new(info.extents.clone(), file_cache::size(file_id)));
+            let backing = Arc::new(NvmeBacking::new(
+                Arc::clone(&info.blocks),
+                file_cache::size(file_id),
+            ));
             return Some((file_id, Some(backing)));
         }
 
         let (extents, size) = no_channel("open", name, self.fs.file_extents(name)).flatten()?;
+        let blocks = self.blocks_for(name, extents);
         let file_id = file_cache::create_file(true); // evictable
         file_cache::set_size(file_id, size);
 
         self.name_to_id.insert(String::from(name), file_id);
         self.open_files.insert(file_id, OpenFileInfo {
             name: String::from(name),
-            extents: extents.clone(),
+            blocks: Arc::clone(&blocks),
         });
 
-        let backing = Arc::new(NvmeBacking::new(extents, size));
-        Some((file_id, Some(backing)))
+        Some((file_id, Some(Arc::new(NvmeBacking::new(blocks, size)))))
     }
 
     fn create(&mut self, name: &str, mtime: u64) -> Result<FileId, &'static str> {
@@ -147,6 +191,9 @@ impl FileSystem for BcacheFsAdapter {
             return Ok(file_id);
         }
 
+        // `Mounted::create` frees whatever answered to this name — the blocks
+        // of a program that is running out of it, if that is what it was.
+        self.revoke(name);
         self.fs.create(name, &[], mtime).map_err(|err| {
             log!("bcachefs: create of '{}' failed: {:?}", name, err);
             "create failed"
@@ -154,9 +201,10 @@ impl FileSystem for BcacheFsAdapter {
 
         let file_id = file_cache::create_file(true);
         self.name_to_id.insert(String::from(name), file_id);
+        let blocks = self.blocks_for(name, Vec::new());
         self.open_files.insert(file_id, OpenFileInfo {
             name: String::from(name),
-            extents: Vec::new(),
+            blocks,
         });
         Ok(file_id)
     }
@@ -177,6 +225,7 @@ impl FileSystem for BcacheFsAdapter {
             }
             self.name_to_id.remove(name);
         }
+        self.revoke(name);
         no_channel("delete", name, self.fs.delete(name)).unwrap_or(false)
     }
 
@@ -194,6 +243,15 @@ impl FileSystem for BcacheFsAdapter {
             }
             self.name_to_id.remove(name.as_str());
         }
+        // Not the same set: a backing handed out by `open_backing` never
+        // opened a file, so it is in `blocks` and not in `name_to_id`.
+        let backed: Vec<String> = self.blocks.keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        for name in &backed {
+            self.revoke(name);
+        }
         no_channel("delete_prefix", prefix, self.fs.delete_prefix(prefix));
     }
 
@@ -205,6 +263,9 @@ impl FileSystem for BcacheFsAdapter {
             }
             self.name_to_id.remove(new);
         }
+        // The destination's blocks are freed by the rename; the source's are
+        // carried over to the new name, so only the destination is revoked.
+        self.revoke(new);
 
         self.fs.rename(old, new).map_err(|_| "rename failed")?;
 
@@ -215,13 +276,18 @@ impl FileSystem for BcacheFsAdapter {
                 info.name = String::from(new);
             }
         }
+        if let Some(blocks) = self.blocks.remove(old) {
+            self.blocks.insert(String::from(new), blocks);
+        }
 
         Ok(())
     }
 
     fn write_page(&mut self, file_id: FileId, page_idx: u32, data: &[u8; 4096]) -> Result<(), &'static str> {
-        let info = self.open_files.get_mut(&file_id).ok_or("file not open")?;
-        let block = self.fs.resolve_or_alloc_block(&mut info.extents, page_idx)
+        let blocks = Arc::clone(&self.open_files.get(&file_id).ok_or("file not open")?.blocks);
+        let block = blocks
+            .with(|extents| self.fs.resolve_or_alloc_block(extents, page_idx))
+            .ok_or("the file was deleted")?
             .map_err(|_| "block allocation failed")?;
         page_cache::raw_block_write(block, data).map_err(|_| "block write failed")?;
         Ok(())
@@ -229,11 +295,18 @@ impl FileSystem for BcacheFsAdapter {
 
     fn update_metadata(&mut self, file_id: FileId, size: u64, mtime: u64) -> Result<(), &'static str> {
         let info = self.open_files.get(&file_id).ok_or("file not open")?;
-        self.fs.update_metadata(&info.name, &info.extents, size, mtime)
+        let name = info.name.clone();
+        let extents = Arc::clone(&info.blocks)
+            .with(|extents| extents.clone())
+            .ok_or("the file was deleted")?;
+        self.fs.update_metadata(&name, &extents, size, mtime)
             .map_err(|_| "metadata update failed")
     }
 
     fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str> {
+        // As `create`: the symlink displaces whatever answered to this name
+        // and the displaced entry's blocks go back to the allocator.
+        self.revoke(name);
         self.fs.create_symlink(name, target).map_err(|_| "symlink failed")
     }
 
@@ -246,7 +319,8 @@ impl FileSystem for BcacheFsAdapter {
 
     fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
         let (extents, size) = no_channel("open_backing", name, self.fs.file_extents(name)).flatten()?;
-        Some(Arc::new(NvmeBacking::new(extents, size)))
+        let blocks = self.blocks_for(name, extents);
+        Some(Arc::new(NvmeBacking::new(blocks, size)))
     }
 }
 
