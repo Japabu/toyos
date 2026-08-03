@@ -1,5 +1,7 @@
 use core::fmt;
 
+use crate::fs::FsError;
+
 pub const BLOCK_SIZE: usize = 4096;
 
 /// A block number on disk. Cannot be confused with a byte offset.
@@ -57,15 +59,61 @@ impl Default for BlockBuf {
     }
 }
 
+/// The device did not do the transfer.
+///
+/// Carries nothing: which block it was is the caller's, because the caller is
+/// what named it. [`BlockIOExt`] is where that gets attached, so an error a
+/// filesystem operation returns cannot name a block the operation never asked
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceError;
+
 /// Block-level I/O abstraction.
 ///
 /// `&self` with interior mutability — implementations handle their own
 /// synchronization. `buf` is always exactly BLOCK_SIZE bytes via BlockBuf.
+///
+/// Every method is fallible for the reason every [`BlockDevice`] method is: a
+/// block the device would not give back is not a block of zeros, and an
+/// implementation with nowhere to report that has to invent one. The kernel's
+/// did — it logged and served zeros, so a read error reached the btree as a
+/// block that fails its structural checks rather than as a failure.
+///
+/// [`BlockDevice`]: ../../kernel/src/block.rs
 pub trait BlockIO {
-    fn read_block(&self, block: BlockNum, buf: &mut BlockBuf);
-    fn write_block(&self, block: BlockNum, buf: &BlockBuf);
+    #[must_use = "a refused read left the buffer holding whatever it held before"]
+    fn read_block(&self, block: BlockNum, buf: &mut BlockBuf) -> Result<(), DeviceError>;
+    #[must_use = "a refused write did not reach the device"]
+    fn write_block(&self, block: BlockNum, buf: &BlockBuf) -> Result<(), DeviceError>;
     fn block_count(&self) -> u64;
-    fn sync(&self) {}
+    fn sync(&self) -> Result<(), DeviceError> {
+        Ok(())
+    }
+}
+
+/// The same three operations, reported as [`FsError`] with the block attached.
+///
+/// Every call site inside this crate goes through these rather than through
+/// [`BlockIO`] directly, so the block number in the error is the one the caller
+/// passed in and there is no way for an implementation to name a different one.
+pub(crate) trait BlockIOExt {
+    fn read(&self, block: BlockNum, buf: &mut BlockBuf) -> Result<(), FsError>;
+    fn write(&self, block: BlockNum, buf: &BlockBuf) -> Result<(), FsError>;
+    fn flush(&self) -> Result<(), FsError>;
+}
+
+impl<T: BlockIO + ?Sized> BlockIOExt for T {
+    fn read(&self, block: BlockNum, buf: &mut BlockBuf) -> Result<(), FsError> {
+        self.read_block(block, buf).map_err(|DeviceError| FsError::DeviceRead(block))
+    }
+
+    fn write(&self, block: BlockNum, buf: &BlockBuf) -> Result<(), FsError> {
+        self.write_block(block, buf).map_err(|DeviceError| FsError::DeviceWrite(block))
+    }
+
+    fn flush(&self) -> Result<(), FsError> {
+        self.sync().map_err(|DeviceError| FsError::DeviceSync)
+    }
 }
 
 // --- Host-side implementations ---
@@ -98,16 +146,20 @@ impl VecBlockIO {
 
 #[cfg(feature = "std")]
 impl BlockIO for VecBlockIO {
-    fn read_block(&self, block: BlockNum, buf: &mut BlockBuf) {
+    fn read_block(&self, block: BlockNum, buf: &mut BlockBuf) -> Result<(), DeviceError> {
         let data = self.data.borrow();
         let off = block.raw() as usize * BLOCK_SIZE;
-        buf.0.copy_from_slice(&data[off..off + BLOCK_SIZE]);
+        let end = off.checked_add(BLOCK_SIZE).ok_or(DeviceError)?;
+        buf.0.copy_from_slice(data.get(off..end).ok_or(DeviceError)?);
+        Ok(())
     }
 
-    fn write_block(&self, block: BlockNum, buf: &BlockBuf) {
+    fn write_block(&self, block: BlockNum, buf: &BlockBuf) -> Result<(), DeviceError> {
         let mut data = self.data.borrow_mut();
         let off = block.raw() as usize * BLOCK_SIZE;
-        data[off..off + BLOCK_SIZE].copy_from_slice(&buf.0);
+        let end = off.checked_add(BLOCK_SIZE).ok_or(DeviceError)?;
+        data.get_mut(off..end).ok_or(DeviceError)?.copy_from_slice(&buf.0);
+        Ok(())
     }
 
     fn block_count(&self) -> u64 {
@@ -140,14 +192,20 @@ impl SliceBlockIO {
 }
 
 impl BlockIO for SliceBlockIO {
-    fn read_block(&self, block: BlockNum, buf: &mut BlockBuf) {
+    fn read_block(&self, block: BlockNum, buf: &mut BlockBuf) -> Result<(), DeviceError> {
         let data = self.as_slice();
         let off = block.raw() as usize * BLOCK_SIZE;
-        buf.0.copy_from_slice(&data[off..off + BLOCK_SIZE]);
+        let end = off.checked_add(BLOCK_SIZE).ok_or(DeviceError)?;
+        buf.0.copy_from_slice(data.get(off..end).ok_or(DeviceError)?);
+        Ok(())
     }
 
-    fn write_block(&self, _block: BlockNum, _buf: &BlockBuf) {
-        panic!("SliceBlockIO is read-only");
+    /// A refusal rather than a panic, now that there is somewhere to report it.
+    /// Nothing can reach this — a slice is only ever mounted `ReadOnly`, which
+    /// has no write operations — and a device that will not write is an answer
+    /// either way.
+    fn write_block(&self, _block: BlockNum, _buf: &BlockBuf) -> Result<(), DeviceError> {
+        Err(DeviceError)
     }
 
     fn block_count(&self) -> u64 {
