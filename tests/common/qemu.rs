@@ -33,11 +33,10 @@ pub fn live_instances() -> u32 {
 /// How many guests the phase now running may have up at once.
 ///
 /// The harness's own wall-clock margins are margins on the *host*, and they were
-/// all derived when one guest had it to itself. Four is a different machine —
-/// measured, a boot that takes 4 s alone took past 10 there — so the margin has
-/// to be stated against the regime rather than widened outright, which is what
-/// this multiplies. A serial phase sets it back to 1 and gets the number it
-/// always had.
+/// all derived when one guest had it to itself. Four guests is a different
+/// machine, so such a margin has to be stated against the regime it runs in
+/// rather than widened outright — which is what this multiplies. A serial phase
+/// sets it back to 1 and gets the number it always had.
 static WIDTH: AtomicU32 = AtomicU32::new(1);
 
 pub fn set_width(width: u32) {
