@@ -195,7 +195,8 @@ Still ungated, in rough order of damage:
   **It stops being sound the moment the reachable set is no longer exactly what
   the owner named** — if delegation or re-grant is reintroduced, or when
   `SYS_HANDLE_SEND` makes a grant transferable. Revisit it then, not before.
-- `SYS_SET_KEYBOARD_LAYOUT`.
+- ~~`SYS_SET_KEYBOARD_LAYOUT`~~ — deleted. The kernel has no layout to gate:
+  it delivers key transitions and userland translates.
 
 `a88e4ee` gated the GPU present/cursor path, `SYS_AUDIO_SUBMIT`, the NIC
 RX/TX path and `SYS_SET_RT_PRIORITY` on `device::is_owner`. Each of the above is
@@ -3805,9 +3806,11 @@ Three things it does **not** give, in the order they will bite:
   exercise it is the laptop.
 - **`kernel/src/main.rs:463` asserts a non-empty init list**, so "spawn nothing"
   is not available; a violated assert would paint a panic report instead of a
-  boot log. The list is therefore the shipping list's own first entry,
-  `/bin/toybox locale --load`, which reads a config file that does not exist on a
-  fresh disk and returns.
+  boot log. The list is therefore the least a program in this tree can do,
+  `/bin/toybox pwd`. It used to be the shipping list's own first entry,
+  `locale --load`, which went with the layout syscall — and the shipping list
+  now begins with the compositor, which is the one process this image must not
+  contain.
 - **Every em-dash in a kernel log line is three dots on the panel.** `font8x16`
   holds codepoints 0x20..=0x7E and `draw_glyph` maps everything else to `.`
   (`panic_console/mod.rs:778`), so a 3-byte UTF-8 `—` renders as `...` and costs
