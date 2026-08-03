@@ -5,13 +5,18 @@ under "Known issues" and points here for the detail; keep the two in step. An
 entry leaves this file when the code and `git log` carry the fix — resolved
 narrative belongs in a dated investigation doc, not here.
 
-Verified against `a88e4ee` (2026-07-30); §2's panic-path additions and §8's
-display entry against `883a84d` (2026-07-31); §8's three metal-sim entries
-against M1 (2026-07-31); §1's and §3's allocation-sizing entries against
-`a6935c6` (2026-07-31), from the sweep that followed the T14's first boot;
-§2's allocator-lock entry and §1's two readdir entries against `da433f1`
-and their fixes against `2571b97` (2026-08-01), every figure in them off a
-running guest.
+**Swept entry by entry against `ba612c6` (2026-08-04).** Every remaining entry
+was re-read against the code it names; where a line number had drifted it was
+corrected, and where the defect was gone the entry was deleted with its reason
+in that commit's message. Confirmation was by inspection of the named code plus
+targeted greps — no boot was taken for this sweep, so anything whose evidence is
+a measurement still carries the date it was measured on.
+
+Earlier datings, kept because they say what each figure was taken against:
+`a88e4ee` (2026-07-30); §2's panic-path additions and §8's display entry against
+`883a84d` (2026-07-31); §8's metal-sim entries against M1 (2026-07-31); §1's and
+§3's allocation-sizing entries against `a6935c6` (2026-07-31), from the sweep
+that followed the T14's first boot.
 
 ---
 
@@ -263,41 +268,6 @@ single >2 MiB allocation and `mm/alloc.rs`'s `MAX_HEAP_ALLOC` assert fires. Any
 process may call it. Second-order rather than cheap — building the thread count
 is itself unbounded — which is what puts the tmpfs route above it.
 
-### CLOSED — `SYS_READDIR` silently truncated, the same way `getcwd` did
-
-`sys_readdir` filled the caller's buffer, stopped, and reported the bytes it
-had written, which is indistinguishable from a complete listing. Measured:
-`std::fs::read_dir("/tmp")` returned **4125** entries of **34,816**, as
-success; exact between 2048 and 4096 files, so the ceiling was the buffer and
-nothing about it was visible to the caller. Closed with the bound above — the
-return is the size the listing *needs* and nothing is written unless all of it
-fits, the contract `sys_getcwd` already had.
-
-**Kept because the pair is the lesson, not either half.** A bound plus a silent
-truncation is a quieter version of the same defect: the cap would have turned a
-kernel panic into a listing that was merely wrong, which is worse in the one
-way that matters — it is invisible. Whenever a collection gets a cap, the
-question after "what is the bound" is "what does the caller see when it is
-hit", and the answer has to be an error rather than a smaller answer. Same
-judgement as `std::env::current_dir()`: a refusal is a limitation, a wrong
-answer that looks right is a correctness defect.
-
-Three more places took the return as a length and would have inherited the new
-contract as a *lie* rather than a limitation — std's `readdir` (which sliced
-`buf[..n]`), std's `exists`/`stat`, and libc's `opendir` (which stored it as
-`DIR::len`, past its own buffer). **The audit that matters when a return value
-changes meaning is of its readers, not of its writer.**
-
-The crafted-ELF panics are closed (`679086d`, `ad38148`, `fa1e9d4`, `b362082`):
-`vaddr_to_file_offset` returns `Option` and `checked_add`s, both `align_2m`
-wraps, the `syscall.rs:1435`/`:1446` `.expect`s, the bootloader's ESP-sized
-allocations and its `filesz <= memsz` check, and the NVMe shift/divide. The
-2026-07-28 audit before them closed `sys_mmap(0)`/`sys_alloc_shared(0)`,
-`SYS_NIC_RX_DONE`, `SYS_TLS_ALLOC_BLOCK`, io_uring's CQ-overflow assert,
-`shared_memory`'s three infallible failure modes and `SYS_THREAD_SPAWN`'s stack
-underflow at `a88e4ee`; the ELF `with_capacity` sizing, `load_shared_lib`'s
-unchecked `KernelSlice` offsets and the `PT_TLS` heap overflow at `f49c6b3`.
-
 ### `SYS_DLOPEN` never dedups and `SYS_DLCLOSE` is a no-op
 
 A process can exhaust its virtual address space by repeated loads of the same
@@ -310,96 +280,6 @@ semantic change, not a bounds check: a second `dlopen` of a loaded library would
 return a handle sharing the first module's id and TLS block, and
 `std_tls_dlopen`'s test 10 exercises exactly that case. It needs its own change
 with its own test, not a hardening drive-by.
-
-### CLOSED — `RingHeader` wraps at 4 GiB and silently corrupts every pipe and `TcpStream`
-
-Closed by `af4616d`: the cursors count modulo `2 * capacity`, which `capacity`
-divides, instead of modulo their own `2^32`, which it does not. The counters are
-still `u32` and the layout did not move. Three host tests in `toyos-abi/`, the
-slowest putting 4 GiB through one ring and checking it byte-exact.
-
-Entry left CLOSED rather than deleted because it was still marked ASSIGNED a day
-after the fix landed, and the wrap argument is subtle enough that the next reader
-of `Ring::modulus` should be able to find why it is what it is.
-
-### ASSIGNED — a machine with no NVMe controller panics the boot
-
-`kernel/src/main.rs:344` — `.expect("NVMe: no controller found")`. Same class M1 closed for
-xHCI's zero-HID panic: a machine that simply lacks a device is not a kernel bug, and the metal
-track exists precisely because the target machine's device set is not the one we chose.
-Assigned to the `main.rs` owner.
-
-### CLOSED — a 3 MiB `fs::write` to `/home` panicked the kernel
-
-`bccab15`. `btree.rs:184` is the `Ok(...)` that ends `Node::parse` now, and
-`Node::write_to` returns `FsError::NodeOverfull` before the subtraction that
-underflowed. **This entry outlived its fix by a day**, and a read-only audit had
-to correct it before anyone could tell what in `bcachefs` was still open — which
-is the cost of leaving a closed entry standing.
-
-### CLOSED — a short allocation was read as a complete one, and the write landed on another file
-
-`677efae` — which is an ACPI commit. Another agent's bare `git commit` swept
-these `bcachefs/` hunks out of the index between the `add` and the `commit` that
-were meant to carry them, so the message on that commit describes none of this.
-Fixed forward, per CLAUDE.md; the code is intact.
-
-`fs.rs`'s `resolve_or_alloc_block` asked the allocator for `needed` blocks and
-returned `start + needed - 1`, while `alloc_contiguous` was documented and
-implemented to return *up to* that many. On a volume with no free run longer
-than one block, resolving page 3 of a sparse file recorded
-`Extent { start_block: 3, block_count: 1 }` and returned **block 6** — a live
-block belonging to another file. `write_page` hands that straight to
-`page_cache::raw_block_write`, so the page's data was lost and a foreign file
-was clobbered, and a later read of the same page resolved somewhere else again.
-Reproduced on a 64-block volume filled with one-block files and then punched
-with one-block holes; a freshly formatted `/home` hides it completely, because
-the allocator hands out contiguous runs.
-
-The type carries it now: `alloc_contiguous -> (BlockNum, u32)` is gone, replaced
-by `alloc_up_to -> Run { start, len }` and `alloc_exact`, so the second element
-can no longer be read as "all of it" by a caller that destructures positionally.
-`alloc_block`'s `unreachable!()` went with it. **The lesson is the shape, not the
-arithmetic**: a function that can return less than you asked for and says so only
-in a doc comment is `known-issues` §1's ignored-failure-return with the refusal
-replaced by a partial success — worse, because there is no `no` to notice and the
-wrong answer is a block number that looks exactly like a right one. Two of three
-callers looped; the one that did not was the one on the kernel's write path.
-
-### CLOSED — the `bcachefs` parse path treated the disk as trusted
-
-`677efae`, same sweep as above. Four defects, one edit, because they were one defect: nothing decided what a
-node *was* until each descent site decided for itself.
-
-- **Six sites decoded a child pointer as `value[..8]` with no length check.** A
-  level-1 node whose first entry has a four-byte value panicked the kernel with
-  `range end index 8 out of range for slice of length 4`, inside `vfs::lock()`.
-  Demonstrated: putting the unchecked index back produces exactly that panic.
-- **Tree depth came from the superblock** (`root_level`, a `u16`) and drove three
-  recursions, each of which puts a 4096-byte `BlockBuf` on the stack, against
-  `process::KERNEL_STACK_SIZE` = 128 KiB. One `ls /home` on a crafted disk.
-- **`Node::parse` sized a `Vec` from the on-disk entry count**, a `u16` admitting
-  65535 against the 169 a 4096-byte block can hold.
-- **No superblock field was ever validated against the device.**
-
-`Node` is now an enum — `Leaf(Vec<Entry>)` or `Interior { level, children }` —
-parsed once, with every child decoded to a `BlockNum` and range-checked against
-`io.block_count()` at that single point. The variant is the leaf/interior branch,
-so `root_level` is not read from the superblock at all any more and the field is
-deleted; descent terminates at a `Leaf` and is bounded by a `Depth` budget of 64
-that only `descend` can spend. The entry `Vec` is grown rather than reserved, so
-no allocation is derived from an on-disk number, and a count above the physical
-maximum is refused outright. `Superblock::read` refuses a superblock whose
-`block_count`, `root_node`, `bitmap_start`, `bitmap_blocks`, `journal_start`,
-`free_blocks` or `next_alloc` does not describe the device it was read from.
-
-Gates, all red before and green after, all in `bcachefs/`'s host tests: a
-crafted node whose child pointer is four bytes, is off the device, or is absent
-entirely; a root that names itself; a block declaring 65535 entries; three
-tampered superblocks. The entry-count one measures the **peak allocation**
-through a `#[cfg(test)]` global allocator, because the parse returns the same
-`CorruptedNode` either way — a test that checks only the return value passes with
-the bug in, and did.
 
 ### `bcachefs`: three residual untrusted-input holes and a mount-policy question
 
@@ -469,15 +349,6 @@ comes from two, and the second one wins.
 `set_len(3 MiB)` followed by `metadata().len()` returns the old length. The same
 sequence works on `/tmp`, so this is bcachefs-specific.
 
-### tmpfs has no `open_backing`, so nothing under `/tmp` is loadable
-
-`vfs.rs:62` returns `None`. Combined with the `/home` write panic above,
-**userland currently cannot create a loadable file larger than about 2 MiB
-anywhere** — which is why the two ELF allocation-ceiling tests assert on the
-declared length in the header rather than by reaching the heap assert. Those
-tests are honest about what they cover, but the ceiling itself is unexercised
-end to end.
-
 ### Derived allocations: one route demonstrated, one unbounded-but-unstaged, one bound
 
 `b554798`. The class is allocations the loader *derives* from inputs, as opposed
@@ -518,38 +389,6 @@ to whoever finds it: **removing it is an API change that could not be re-verifie
 on the budget remaining**, and an unverified API change is how the next defect
 arrives. Left deliberately, to be deleted by someone who can re-run the loader
 tests.
-
-### Two allocation guards that do not cover what they claim
-
-`OwnedAlloc::new`'s `size >= PAGE_2M` guard (`process.rs:54`) is short by
-dlmalloc's bookkeeping overhead, so a request just under 2 MiB still trips the
-`mm/alloc.rs:12` assert. Being fixed.
-
-`mm::align_2m` has no checked form, and four callers take their size from a
-device or from userland: `gop.rs`, `xhci/mod.rs`, `shared_memory.rs`,
-`arch/syscall.rs`. Audit in progress.
-
-### VA exhaustion is untestable, and the NVMe sector-size case has no test
-
-The VA arena is ~1015 GB and every mapping costs physical memory at worst 2:1,
-so the PMM refuses long before the address space runs out. Testing it needs a
-test-only actuator on `vma::ALLOC_FLOOR`/`ALLOC_CEILING`.
-
-The NVMe sector-size guard (`fa1e9d4`) reproduces with two QEMU flags but has no
-in-suite test; staging it needs an `nvme_lba_size` field on `Shape`. Being built.
-
-### CLOSED, kept for the lesson: a crafted `p_vaddr` could map into the kernel half
-
-An exe image was rebased with a wrapping add, so a crafted `p_vaddr` could place
-a demand-paged VMA in the kernel half of the address space — where the first user
-touch ORs `PAGE_USER` onto the *shared kernel page tables*. That is exactly the
-mapping `sys_mmap` refuses for a FIXED request; the loader reached the same
-machinery with no such check. Closed by a `check_user_range` call.
-
-The lesson generalises and the class will recur: **a policy enforced at one entry
-point was simply absent at another that reaches the same machinery.** When a
-check is added to a syscall, the question to ask is which *other* paths reach
-what it protects — not whether that syscall is now safe.
 
 ### The bootloader sizes every allocation from a file the ESP handed it
 
@@ -619,11 +458,15 @@ service to abuse — `SYS_LISTEN` is ungated, so it can be its own.** Register a
 name, connect to yourself, never accept. No victim required and nothing to
 guess.
 
-Independent of the missing cap, and cheaper: **`push_connection` already returns
-`bool` (`listener.rs:97`) and `sys_connect` ignores it** (`syscall.rs:1042`).
-The queue can already refuse; nobody listens. An ignored failure return is a
-defect on its own terms — the mechanism exists and the caller throws the answer
-away.
+**The third is closed, and the shape of the close is the reusable part** (read
+against `ba612c6`, 2026-08-04). `listener::push_connection` returns
+`Result<(), PushError>` (`listener.rs:120`) with a queue depth behind it, and
+`sys_connect` (`syscall.rs:1152`) now takes the answer: on `QueueFull` it closes
+the client's own fd and returns `ResourceExhausted`, on `NoListener` it returns
+`NotFound`. That is the pair this class asks for — a bound *and* a caller that
+hears the refusal — and it is why the cap could be added at all. `SYS_LISTEN` is
+still ungated, so the attacker can still be its own service; what it gets now is
+a bounded number of pinned rings and an error.
 
 ### ASSIGNED — the compositor and netd do not bound what they accept
 
@@ -870,48 +713,6 @@ harness to wait on, or a screendump that retries until it decodes something.
 Noticed while verifying #94's suite runs; nothing in the hotplug path can reach
 it, since this boot panics at `main.rs:276` and `xhci::init` is at `main.rs:391`.
 
-### CLOSED — a panic holding the allocator lock wedged the recovered CPU
-
-Fixed at `889d611`. `KernelPageSource::alloc` is total now — a size it cannot
-back is a `null`, not an assert — and the fail-fast moved up to
-`KernelAllocator::alloc`, which checks `mm::MAX_HEAP_ALLOC` *before* taking
-`self.dlmalloc.lock()`. Nothing inside that lock panics, so there is nothing to
-force-release and no window in which dlmalloc's chunk and segment lists are
-abandoned mid-mutation. `heap_ceiling_recovery` is the gate: red on the
-timeout before, green in 5 s after, same actuator and same one-CPU boot.
-
-**Two things this entry got wrong, and they are the reusable part.**
-
-**"It is the same problem as the missing bound" was false, and measured false.**
-This entry said the two were one defect and that bounding the allocation closed
-both. `memalign` pads by the alignment *before* asking for backing, so
-`MAX_HEAP_ALLOC` with a 4096-byte alignment — a request that satisfies any
-entry bound you could write — still asks the page source for 2,162,688 bytes.
-Run against the old code it panicked inside `Dlmalloc::malloc` and the guest
-went silent, exactly as an oversized request did. No bound at the entry could
-ever have closed that one; only a total page source can. The general shape:
-**a check upstream of an allocator does not constrain what the allocator asks
-its backing for**, because the allocator's own padding sits in between.
-
-**"This does not need a test-only actuator" was also wrong, for a reason worth
-keeping.** Ordinary routes past the ceiling do exist — a `read_dir` over 32,769
-files in one tmpfs directory is one, measured — but every one of them is inside
-`vfs::lock()` when it dies, so the panic strands the VFS lock too and the
-machine wedges either way. Reachability was never the question; *isolation*
-was. `test-heap-ceiling`'s three `SYS_DEBUG` actions hold nothing but the
-allocator, which is why the gate can tell the allocator's recovery from the
-filesystem's.
-
-The reporting half was already fixed at `e9f3356`, which is what made the
-before/after readable at all: the crash report reaches serial even when nothing
-on that CPU runs again, so the wedge shows up as a report followed by silence
-rather than as a blank window.
-
-Still open from this: there is no `#[alloc_error_handler]`, so a `null` from
-dlmalloc — now reachable at the alignment corner as well as on real exhaustion
-— lands in `handle_alloc_error`. That panic is outside the lock and the machine
-survives it, but the message is worse than the assert's.
-
 ### A panic while holding `PROCESS_TABLE` hangs the panicking CPU
 
 `try_recover_from_panic` lands in `sched::driver::idle_loop`, whose
@@ -958,31 +759,6 @@ T14 is mute between `Boot: complete` and the moment the compositor's terminal
 exists. That is fine for a first boot and not fine for debugging M2 on the
 machine. It is also the entire cost the mute default was buying, which is why
 the metal-sim profile now keeps its 16550 by default.
-
-### CLOSED — the double-fault path overflowed IST1, by 4x what was estimated
-
-IST1 was 4096 bytes and the report used **9968** — an overrun of **5872**, not
-the ~1.4 KiB this entry estimated for months. Closed by growing IST1 to 16384
-(`arch/percpu.rs:207`) with a fill-pattern red zone that measures the high-water
-mark and reports it straight to the UART, bypassing the ring the overflow may
-have corrupted.
-
-**Keep the reasoning, because it is the reusable part:** after the drain buffers
-were cut, the report still needed **4512** bytes — so cutting buffers alone was
-never sufficient, and the stack had to grow whatever happened to them. Only
-measuring established that. A fix that trimmed the buffers, which is the obvious
-one and which this entry's own last paragraph proposed, would have looked correct
-and shipped broken.
-
-Closed in the same batch: `uart_write_bytes`'s unbounded THRE spin, now bounded
-by `THRE_SPIN_LIMIT` (`drivers/serial.rs:337`). It sat on `panic_flush`'s bypass —
-the path that runs precisely when the backend holder is *already* wedged — so the
-mechanism of last resort could hang the machine. And `main.rs`'s NVMe-absence
-panic, now covered by `Profile::Diskless` (`tests/common/qemu.rs:59`), which makes
-device **presence** a shape dimension alongside size and sector size.
-
-Still open from this entry: `crash_report`'s `try_lock`. The recovered CPU
-wedging on the allocator lock is closed at `889d611`.
 
 ### Nothing distinguishes `panic_console::capture` from a no-op
 
@@ -1062,8 +838,8 @@ honest predicate is a per-CPU "in syscall" depth.
 ### `fatal_exception`'s `recursive` branch never fires for a nested `#PF`
 
 `page_fault_handler` swaps the fault state to `PageFault` *before* dispatching
-(`arch/idt/exceptions.rs:452`), and `fatal_exception`'s `recursive` tests only
-`Fatal | Panic` (`:506`). A `#PF` nested inside a panic — the exact case the
+(`arch/idt/exceptions.rs:468`), and `fatal_exception`'s `recursive` tests only
+`Fatal | Panic` (`:522`). A `#PF` nested inside a panic — the exact case the
 short-circuit exists for — is therefore classified non-recursive and runs the
 full `crash_report` again.
 
@@ -1075,8 +851,8 @@ to include `PageFault`, or stop claiming the branch bounds anything.
 
 ### The panic console's memory-type gate checks only the framebuffer's first byte
 
-`kernel/src/drivers/panic_console/mod.rs:208-211`'s
-`maps.iter().find(|e| phys >= e.start && phys < e.end)` classifies the entry
+`kernel/src/drivers/panic_console/mod.rs:292-294`'s `framebuffer_is_reclaimed_ram`,
+`maps.iter().find(|e| phys >= e.start && phys < e.end)`, classifies the entry
 holding the scanout's first byte and ignores the rest of the range. A firmware
 map whose scanout starts in `MemoryMappedIO` but whose tail falls in a
 `BootServicesData` entry the PMM later hands out passes the gate, and the
@@ -1087,27 +863,13 @@ so fix it before the first metal boot.
 
 ### `capture()` is unlatched, so two simultaneous panics interleave the snapshot
 
-`kernel/src/drivers/panic_console/mod.rs:289-296`. Both panicking CPUs take
+`kernel/src/drivers/panic_console/mod.rs:395-402`. Both panicking CPUs take
 `cli` first (`main.rs:102`), so neither takes the other's halt IPI, and both
 `peek_tail` into the same static. Harmless in itself — same ring, `len` read
 once into a local, so indices stay in bounds — but the design's "exactly one
 painter, ever" is true of `render` and not of the buffer it paints from, and
 the screen can carry two interleaved reports. The `PAINTING` latch shape
 extends to `capture` if this is ever seen.
-
-### `uart_write_bytes` spins unbounded on the LSR
-
-`kernel/src/drivers/serial.rs`, end of file, while `panic_raw_uart`
-(`main.rs`) bounds the same wait at 100 000 iterations. A UART that is
-*present but wedged* therefore hangs every `panic_flush` bypass — the last
-resort of the panic path — where the raw reentry path would have escaped.
-
-Absent hardware is no longer a hazard. The earlier wording here claimed
-`2e52e8e` gated *every* UART access on the loopback probe, which was not true
-of `panic_raw_uart` — it did raw `inb(0x3FD)`/`outb(0x3F8)` with no check.
-That gap is closed now, and `serial::init` logs the probe byte itself, so
-"no SuperIO" (0xFF), "chip answered wrongly" and "right chip, wrong port" are
-distinguishable instead of collapsing into one silent `false`.
 
 ---
 
@@ -1195,74 +957,6 @@ cannot happen under the table lock (it would put `AddressSpace` under
 `ThreadData` after the table check, inside the same lock hold, is the shape that
 fixes it.
 
-### A read of the mouse fd *is* the USB hot-plug engine, with preemption off
-
-**This is the mechanism behind the owner's second T14 desktop freeze** (§1), and
-it is outside every class the compositor's non-blocking rewrite closed — which
-is exactly what that entry's stated decider predicted: a freeze with no
-`compositor: dropping pid` line is a fifth mechanism.
-
-The call chain, verified in the tree rather than reasoned about:
-
-- `kernel/src/fd.rs:376` and `:390` — `fd::try_read` on `Descriptor::Keyboard`
-  and `Descriptor::Mouse` opens with `crate::drivers::xhci::poll_if_pending();`
-  before it looks at the event queue at all.
-- `poll_if_pending` takes `XHCI.lock()` and runs `ctrl.poll()` for every
-  controller — `next_event`/`dispatch_event`, `recover_endpoints`,
-  `service_ports` — which is the whole enumeration and endpoint-recovery
-  engine, executed inline on the calling thread.
-- `USB_TIMEOUT_NS` is `2_000_000_000` (`drivers/xhci/mod.rs:337`), and the
-  waits under it are `spin_loop()`, not parks. One endpoint recovery issues
-  Reset Endpoint, Set TR Dequeue and a `CLEAR_FEATURE(ENDPOINT_HALT)` control
-  transfer — three of those budgets.
-- `Lock::lock` calls `crate::preempt::disable()` (`kernel/src/sync.rs:27`), so
-  all of it runs with preemption disabled, and `sys_read_nonblock` holds the
-  caller's whole `ProcessData` fd-table lock across it.
-
-**So the compositor's `mouse.read_nonblock()` is not a read. It is the USB
-enumeration engine**, and the desktop stops for as long as the driver takes.
-Nothing about it is a bug in the compositor: the call is non-blocking by ABI
-and returns `WouldBlock` honestly, and there is no way for a caller to ask for
-the events without also volunteering to drive the bus.
-
-Why it fits the log the four closed mechanisms could not:
-
-- The heartbeat stops *at* a source binding (53.849 s), not at a client event.
-- No drop line, because no client IPC is involved.
-- `poller.wait`'s `FRAME_INTERVAL` is irrelevant — the compositor is not in the
-  poller. §1's "it was therefore not in `poller.wait`" was right and is now
-  explained rather than merely inferred.
-- The kernel stays alive and keeps counting the owner's keystrokes (i8042 at
-  57.9 s and 69.0 s, 18→22 keys, 338→586 motion): preemption is disabled,
-  interrupts are not.
-- Only cpu0 emits idle scheduler lines afterwards, because the CPU running the
-  driver never idles.
-- The endpoint recovery logged at 62.236 s is 8.4 s after the heartbeat
-  stopped, which is the shape of a multi-second hardware wait, not of a park.
-
-**QEMU cannot stage it, and the gate says so.** `metal_sim_pointer_churn`
-cycles a `usb-mouse` through eight plug/unplug rounds with injected motion in
-each, against a live compositor, and asserts the desktop keeps compositing. It
-is green, and it proves the churn reaches the kernel (eight source bindings,
-and reporting intervals above the taskbar's two frames, so the motion was
-delivered) — so it is an exclusion and an actuator, **not a reproduction**. The
-emulated xHC completes every command immediately, so the 2 s budgets that make
-this bite on real hardware are microseconds there. The missing ingredient is
-hardware latency, which no profile in this tree can synthesise.
-
-The fix is a boundary, not a timeout: a read of an input fd must not run the
-bus. Whatever drives enumeration should be the scheduler pass that already
-calls `poll_if_pending` from `drain_irqs`, with the read path doing nothing but
-read. That deletes the preemption-off hold from every userland input read at
-once, and is why this is recorded rather than patched here — it is the xHCI
-owner's boundary to move, and `kernel/src/drivers/xhci/` had two agents mid-
-refactor in it while this was written.
-
-**What the next boot should capture.** `sync.rs`'s spinlock already narrates:
-`LOCK CONTENTION` and, past 500M spins, `panic!("DEADLOCK at {}")` naming the
-caller. A freeze with `kernel/src/fd.rs:390` in either line is this, confirmed
-from the machine rather than from the code.
-
 ### The decoded input queues are unbounded, so a wedged consumer grows the kernel heap
 
 Found while answering "where do the keystrokes go while the compositor is
@@ -1331,33 +1025,13 @@ which is now belt and braces rather than a workaround.
 
 **The other half, not previously recorded: two of the wait queues are woken by
 nobody's benefit.** `sched::waitqs::MOUSE` and `sched::waitqs::NETWORK` each
-appear at exactly one site in the kernel — their own wake (`mouse.rs:104`,
+appear at exactly one site in the kernel — their own wake (`mouse.rs:154`,
 `net.rs:54`). Nothing ever parks on either. The wakes are real calls on a hot
 path doing nothing, and they are the direct consequence of the asymmetry above:
 because `sys_read` returns `NotFound` on an empty Mouse fd rather than blocking,
 there is never a parked mouse reader to wake. Fixing the asymmetry by making
 Mouse block is what would give `MOUSE` a waiter; deleting the queues is what
 would make the current behaviour honest. Do not do neither.
-
-### CLOSED — `bcachefs::Fs::rename` destroyed the file and reported success
-
-Kept for the coverage lesson. `rename` inserted the entry under `new_name` and then called
-`delete_by_name(new_name)` to reclaim a destination that might already exist — deleting
-the entry it had just written and freeing its extents on the way out. `Ok(())`, both names
-`NotFound`, reachable as `mv /home/a /home/b` and from any `cp` onto `/home`.
-
-**Nothing in the suite covered a *successful* rename.** `fs_large_file` is the only test
-that called `fs::rename` and it asserts the failure direction — a 4096-byte name is
-refused — so a rename that reported success and lost the file was green everywhere, in a
-crate with 37 host integration tests and a machine suite that renames on two other mounts
-(`/tmp` and `/log`) and never on this one. A gate on
-the direction an operation is *supposed* to work in is not implied by gates on its
-refusals.
-
-The ordering that replaced it: capture what `new_name` names **before** the insert, because
-on an equal key the insert *is* the removal of the destination — asking for the displaced
-file by name afterwards answers with the file that was just renamed. Source entry out
-last, blocks not freed, and nothing deleted when the two names share a key.
 
 ### `bcachefs` operations that undo themselves: what the rename fix did not touch
 
@@ -1622,66 +1296,9 @@ of the *derived* bound regardless, and the sweep prints
 quietly become the standard**, which is the failure mode of every temporary
 baseline and the reason most of them end up permanent.
 
-### CLOSED — concurrent configs overwrote each other's kernel and bootloader
-
-Fixed at `9ee156c`. Recorded in full because the symptom was
-*indistinguishable from a regression in the code under test*, and because it was
-being routed around as advice for most of a session rather than filed as a bug.
-
-**The trace.** The init string is not in the image — it is compiled into
-`bootloader.efi`: `bootloader/build.rs` declares
-`rerun-if-env-changed=INIT_PROGRAMS`, `bootloader/src/main.rs:225` is
-`env!("INIT_PROGRAMS")`, and `src/build.rs` passed `config.init.join(";")` into
-the bootloader's `cargo build`. Cargo keys the artifact path on
-(crate, target, profile) **and nothing else**, so every config wrote and read one
-path. The kernel varies the same way, by feature.
-
-**The window was not a moment.** `build_test_image` built the bootloader, then
-ran the entire userland build and initrd assembly, and only then read the `.efi`
-— seconds to minutes, unprotected. `build()` had the identical shape, so
-`cargo test` raced `cargo run --build-only` too.
-
-**Observed:** `init_program_len: 28`, exactly `"/bin/soundd;/bin/test-runner"`,
-in an image whose initrd was metalcase's — compositor and netd both present,
-metalcase's own string being 54 bytes. One image, one config's initrd, another
-config's bootloader. The compositor was never spawned and the test failed with
-`"compositor: ready" never reached the console`.
-
-**Why this one was worse than the kernel-feature variant of the same mechanism:**
-the kernel case turns an actuator off, so a test goes red for a visible reason.
-The bootloader case silently boots a *different init list*, and the failure looks
-like the daemon under test is broken.
-
-**Fix:** an `flock` held across each build→stage pair, artifacts copied to a name
-carrying their build key, readers using the staged name. `flock` because the
-kernel releases it on process exit, so a killed builder cannot strand it.
-Demonstrated rather than reasoned: two bootloader artifacts now coexist, each
-containing exactly one config's init string and not the other's.
-
-**A partial fix would have been worse than none.** A lock in
-`tests/common/qemu.rs` alone covers `cargo test` against `cargo test` but not
-against `cargo run --build-only` — making the flake rarer and therefore harder to
-diagnose. That option was rejected on those grounds.
-
-**Not `04b21b4`'s window.** That one is `rust/build/.../dist/deps` inside the std
-bootstrap. This one is the toyos artifact paths. Together with the
-`rustup toolchain link` race, that is **three distinct concurrency defects in one
-build system** — conflating any two will cost someone an afternoon.
-
-**Eventual shape, not done:** stop baking the init list into the bootloader at
-all and put it in the ESP or initrd. That is the structural answer; it changes
-the boot contract across bootloader, kernel and `KernelArgs`, so it is a separate
-piece of work.
-
-**Not addressed, and worth being honest about:** this does not stop rebuild churn
-when agents alternate configs. Cargo still writes to its own single path, so each
-config still invalidates the other's *cargo* build; the staging protects the read,
-not the build. Killing the churn needs a per-config `--target-dir`, which
-multiplies disk usage and was not attempted here.
-
 ### `src/build.rs` cannot enable `sched-check`, so no CI run exercises it
 
-The kernel check build is reachable now — `kernel/Cargo.toml:63` forwards
+The kernel check build is reachable now — `kernel/Cargo.toml:201` forwards
 `sched-check = ["toyos-sched/check"]`, and `cpu::MAX_PASS_NS` is 200 µs with
 invariant P asserting against it (`cpu.rs:618`, `:1013`). But nothing in `src/`
 mentions `sched-check`, so it can only be turned on by hand and the harness never
@@ -1690,39 +1307,17 @@ does.
 A check build nobody can run from CI is halfway back to being unreachable, which
 is the defect it was built to fix.
 
-### CLOSED — the three uncertifiable scheduler instruments
-
-All three are resolved, and the third is resolved by *subtraction*, which is worth
-recording as a legitimate outcome:
-
-- **I5 exists** and measures service against equal entitlement over a contention
-  window, with `fairness_storm(cpus)` and a CLI form for Stage 9's 1–128. It
-  immediately found the fairness degradation above.
-- **The kernel check build is wired** (`sched-check` → `toyos-sched/check`), with
-  the CI gap filed separately above.
-- **`from-qemu` was deleted, not implemented** (`hw.rs:52-53`). The capability
-  given up is stated precisely, and it is not the subcommand — that was an
-  `unimplemented!()` — but the *promise* that a QEMU anomaly can become a
-  host-side repro. Getting it back needs: a kernel drain path; emitters for
-  `TraceKind::{Block, IdleExit, Irq}`, none of which exist; queue identity in the
-  record; and scenario synthesis. That list is the spec for anyone who wants it.
-
-The I5 bound is deliberately not recorded here: it is being re-derived from first
-principles rather than calibrated against the shipped code's current behaviour,
-with the measured behaviour kept separately as a regression sample in the style of
-`tests/audio-baseline.toml`. The gap between the two becomes its own entry.
-
 ### `sys_read` blocks: two doc comments that describe code that is not there
 
 Neither changes behaviour; both mislead a reader about an invariant.
 
-`kernel/src/fd.rs:142` — `/// Insert at the lowest unused id.` It calls
+`kernel/src/fd.rs:146` — `/// Insert at the lowest unused id.` It calls
 `IdMap::insert`, which is `let id = self.next; self.next += 1` (`id_map.rs:46-51`):
 a monotonic counter that never reuses a closed fd number. Lowest-unused is a
 POSIX guarantee some code may assume; this is not it, and a long-lived process
 leaks fd-number space rather than recycling it.
 
-`kernel/src/process.rs:950` — `/// Must run after `teardown_scheduling`, which is
+`kernel/src/process.rs:958` — `/// Must run after `teardown_scheduling`, which is
 what flushes the child threads' counters into `ProcessData`.` There is no
 `teardown_scheduling` anywhere in the kernel. The ordering requirement it states
 may still be real; the function that was supposed to establish it is gone, so the
@@ -1788,32 +1383,6 @@ The durable fix is iouring-blocking-spec's single `post()`, where a source
 cannot have one half of the pair, and a fan-out cannot be deleted without
 deleting the wake.
 
-### The virtio-console has no line atomicity between writers
-
-Kernel `log!` output and userspace `println!` interleave *mid-word* into each
-other's lines: soundd's stats line was split by a kernel message in 1 of 15 runs
-and by the tone client's own `println!("tone done")` in 2 of 120 config-runs,
-each time pushing the line's tail onto the following line.
-`tests/common/audio.rs` reassembles both cases (strip `[kernel …]` spans; resume
-a field's digits after the next newline), but that is a reader-side workaround
-for a writer-side defect — any tool parsing serial output has the same problem.
-
-**FIXED at `8de0a95`, and not where this entry pointed.** The heading blames the
-virtio-console, i.e. the kernel. It was a **libc** defect: `FILE` had no buffer,
-so a single `printf` became several `write` syscalls and the splice happened
-between them. Giving `FILE` a buffer makes a line one write.
-
-The premise was checked before anything was built, and the measurement is why
-the fix went to the right file: **151,047 lines of existing on-disk logs, 37
-splices, zero of them cutting a kernel line.** One command against logs already
-present. Had the kernel been changed instead, it would have been a wrong change
-*and* a wrong record — the entry would have read "fixed" over an untouched
-defect.
-
-Related class: a "guest hang" that only ever appears on the audio tests is more
-likely to be the shared console than the scheduler. See
-`specs/audio-gate-history.md`.
-
 ### On an idle machine the log ring flushes one line behind
 
 Measured while building M2's i8042 tests. With no userland process doing
@@ -1853,16 +1422,6 @@ lose. `nvme_large_device` had to assert on the disk image host-side instead,
 which is a better assertion anyway but was not a free choice. Fix is the same
 flush-before-parking as the idle case, plus an explicit drain before
 `acpi::shutdown()`.
-
-### The NVMe driver trusts the sector size the namespace reports
-
-`drivers/nvme.rs:209-210` takes `lba_ds` out of the LBA format descriptor and
-computes `1u32 << lba_ds`. The field is 8 bits, so any value ≥ 32 is a shift
-overflow. `:300-301` then computes `4096 / ctrl.sector_size` and divides
-`ns_size` by it, so a reported sector size above 4096 makes `sectors_per_block`
-zero and the next line divides by zero. Both are firmware/device values, not
-userland, but "the device said so" is not a bound — and the metal track is
-exactly where a device we did not write starts answering these queries.
 
 ### A machine that boots off its internal disk gets no `/boot`
 
@@ -1925,35 +1484,19 @@ Spec: `specs/audio-subsystem-spec.md`. Numbered as in the 2026-07-28 audit;
 "wait until clients have filled" condition are fixed (`97723dc`, `9ed8eda`,
 `a88e4ee`, `069d158`).
 
-**RE-FILED — audit item (1) is not an SQ overrun; it is silent completion loss on
-the CQ.** The submission ring self-limits at four separate points: `poll_add_fd`
-flushes at `pending() == sq_size`, `submit_sqes` refuses `count > sq_size`,
-`claim_sqe` errors when `available > sq_size`, and the kernel drains `head` to
-`tail`. Nothing can overrun it.
-
-The real defect is on the completion side, and **the mid-registration flush is the
-cause rather than the protection**: flushing mid-registration makes the kernel
-process those registrations immediately, so fds that are already ready post CQEs
-while the caller is still registering the rest. Past `cq_size` (2 × `sq_size`),
-`post_cqe` increments `dropped` and returns (`kernel/src/io_uring.rs:201`) — and
-**`Poller::wait` never reads `dropped`** (no occurrence anywhere in
-`toyos/src/poller.rs`). The caller then blocks forever on an event that was thrown
-away.
-
-Kept rather than renamed in place, because the mislabel is the finding: an entry
+**CLOSED — audit item (1) was never an SQ overrun; it was silent completion loss
+on the CQ, and all three commits it wanted have landed.** Kept as one paragraph
+rather than deleted, because the *mislabel* is the durable finding: an entry
 filed under the wrong mechanism sends everyone to the wrong ring, and the
-submission ring is exactly where you would look.
-
-**Stale prose, same class as the rest of today's:** the `Poller`'s own doc comment
-says the kernel "asserts rather than overflows" (`toyos/src/poller.rs:27`). That
-stopped being true when `post_cqe` switched to incrementing `dropped` and
-returning. Nobody re-checked the comment, and it is the sentence that would have
-stopped someone looking for the loss.
-
-Fix is three commits: make the loss loud, then make the drop unrepresentable via a
-declared capacity, then keep the tripwire as an unreachable assert. **The second is
-blocked on the compositor/netd bounds** — two callers cannot honestly declare a
-capacity until they bound what they accept.
+submission ring is exactly where you would look. Verified at `ba612c6`
+(2026-08-04, by inspection): the mid-registration flush — the cause, not the
+protection — is gone from `poll_add_fd`, which now asserts against a declared
+`capacity`; the rings are sized from that capacity; and `Poller::wait` reads
+`cq_hdr.dropped` and `assert_eq!`s it to zero as the tripwire
+(`toyos/src/poller.rs:170`), with a comment saying why it is unreachable. The
+stale "asserts rather than overflows" doc comment is gone with it. The
+declared-capacity commit was blocked on the compositor/netd bounds and they
+landed too — `MAX_PENDING_CONNS`/`MAX_WINDOW_SLOTS` and `MAX_PIPED_SLOTS`.
 
 **BLOCKED ON THE CPAL FORK — one missing message, three consequences.** Killing
 wedged clients, suspending on no progress, and resuming from suspend all need the
@@ -2290,50 +1833,6 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
-### CLOSED — two C tests lost their last unterminated line, and the three ways it was read
-
-`1d0d448` and `5d0c5bd`. Three agents recorded a facet of this on 2026-08-02
-and none of the three was the whole of it, so it is written here as one story.
-
-**The defect.** `start_c` in `userland/libc/src/lib.rs` called
-`toyos_abi::syscall::exit` directly, so a C program that returned from `main`
-ran neither the atexit table nor `fflush(NULL)`. C defines returning from
-`main` as calling `exit`; this never did. Harmless until `8de0a95`
-(2026-08-01) gave `FILE` a buffer: stdout on a serial console resolves to
-`IOLBF`, so from then on exactly the final *unterminated* segment was dropped.
-That is the whole selection rule for which tests failed —
-`71_macro_empty_arg` is one bare `printf("%d", ...)` and printed nothing at
-all, `76_dollars_in_identifiers` lost only `$$$=money`, and every other C test
-ends in a newline.
-
-**Why it appeared a day after the commit that caused it, in one that could
-not.** The suite was green at `f8ee2ac` with `8de0a95` already an ancestor,
-and `dbbdcbe`'s only libc change was renaming `VaList::arg` to `next_arg` at
-18 call sites — a misread variadic argument would print wrong digits rather
-than none, and would take every other C test that prints through the same
-`printf` with it. Neither fact needs explaining away.
-
-`tests/common/compile.rs::libc_archive_toyos` built the archive every C test
-links **only if it did not exist**, so a source change never replaced it: the
-C tests had been linking a libc older than `8de0a95` all along. `dbbdcbe`'s
-`src/toolchain.rs` hunk drops `userland/libc/target/x86_64-unknown-toyos` on a
-toolchain rebuild, for the unrelated reason that its rlibs go stale with the
-sysroot. That deleted the archive, the next run rebuilt it, and a day-old
-defect surfaced under a commit that did not contain it. **The generalisation
-worth keeping: a build artifact that is only ever created, never invalidated,
-decouples "when a defect was written" from "when it is seen", and the second
-date is the one that gets blamed.**
-
-**Why the captures looked like soundd's stdout.** With the program's own
-output gone, what remained in `71`'s window was whatever else the shared
-console emitted, which was soundd's two boot lines. That was the symptom, not
-a second defect — but the window *is* porous, and that part is open below.
-
-`128_run_atexit` stays skipped: `exit` runs the atexit table now, but the file
-has no `main` without a per-config `-D`, `on_exit` does not exist in this
-libc, and `start_c` runs neither `.init_array` nor `.fini_array`. Its skip
-reason said "needs atexit" and no longer did.
-
 ### A daemon's boot lines land in whichever test window is open
 
 `run_test` captures every non-kernel console line between `===TEST_START===`
@@ -2358,30 +1857,6 @@ line and the child's are the same bytes on the same fd. Either the child gets
 a capture channel of its own (the in-guest runner piping and framing its
 stdout, which has to keep the line-by-line liveness `run_test_hooked` depends
 on) or console writes gain a writer tag. Both are design calls, not repairs.
-
-### INCIDENT — `677efae` swept six staged `bcachefs/` files that are not mine
-
-2026-08-01. Whoever is working in `bcachefs/` (`alloc_bitmap.rs`, `btree.rs`,
-`fs.rs`, `lib.rs`, `superblock.rs`, `tests/integration.rs`, +1288/−499 across
-the commit): **your staged snapshot is in `677efae`**, whose message is about
-the ACPI parser and says nothing about it. Nothing is lost — your working tree
-was not touched, and `git show 677efae -- bcachefs/` is exactly what you had
-staged. Fix forward; do not undo.
-
-How, so the next agent does not repeat it. `git commit -- <paths>` commits only
-those paths and is the safe form, but it commits the **working tree** version of
-them — which is no good for a change that has to be staged as a partial hunk.
-Mine did: `i8042/mod.rs` also held another agent's in-flight work, so I built a
-patch of my hunk alone and `git apply --cached`ed it, and then had to use a bare
-`git commit` to commit the index. A bare `git commit` takes **everything**
-staged, including six files another agent staged between my check and my call.
-
-I even printed `already staged by others: 6` in the same tool call and committed
-anyway, which is the actual lesson: **the check has to gate the commit, not
-precede it.** `git diff --cached --name-only | grep -v <my paths>` must be
-*empty* before a bare `git commit` runs, in the same shell, with `&&`. There is
-no lock; the window is real either way, but a conditional makes the common case
-safe instead of merely observed.
 
 ### CLOSED for build-system bootstraps — a second toolchain-contention window, distinct from the one `69bca9a` closed
 
@@ -2514,99 +1989,6 @@ Either delete `src/toyos.rs` and let `stub.rs` serve, or drop the toyos gate in
 `rustc_data_structures` (the only two APIs rustc uses, `map_copy_read_only` and
 `map_anon`, are correct in the fork). Exactly one of the two should exist. Three
 real bugs in that module were found and fixed 2026-07-28 — see `forks.toml`.
-
-### CLOSED at the cause — cargo caches a *failed* `rustc -vV` and replays it until the file is deleted
-
-Found 2026-08-02, and it turned a two-minute window into a forty-minute one.
-Two agents ran `x.py build` in `rust/` concurrently; for the seconds during
-which `librustc_driver-*.dylib` was being replaced, loading it failed with
-`code signature ... not valid for use in process: library load disallowed by
-system policy`. Cargo probes the compiler with `rustc -vV` and memoises the
-result in `<target-dir>/.rustc_info.json` — **including that failure** — so
-every later build replayed the same error, with the same `dyld[84171]` pid in
-it, long after `rustc +toyos -vV` succeeded from a shell. The tell is exactly
-that: an unchanging pid in a message that claims to be from this run.
-
-`rm userland/libc/target/.rustc_info.json` cleared it. This is not repairing
-the toolchain — it is a cargo memo in a build target directory — but it looks
-like a toolchain failure and reads like one in the log, which is why it is
-recorded here. `src/toolchain.rs` drops `userland/libc/target/<triple>` on a
-rebuild for a neighbouring reason; `.rustc_info.json` sits one level above that
-and is not covered.
-
-Underneath it: nothing serialised `toolchain::ensure` across agents, so two
-`cargo test` runs in this tree could both decide the toolchain was stale and
-both start `x.py build` in the same directory. That is the window this defect
-needs, and `a8c78ef` closed it — every step of `toolchain::ensure` decides under
-the shared build lock and acts under the exclusive one, and no cargo build runs
-while an exclusive phase does, so nothing can probe a `librustc_driver` that is
-being replaced.
-
-The cargo behaviour itself is not fixed and cannot be from here: a probe that
-fails for *any* reason is still memoised and still replayed until the file is
-deleted. If the signature ever reappears, `rm <target-dir>/.rustc_info.json` is
-still the clearing move, and the unchanging pid is still the tell.
-
-### CLOSED — a clean and a build in one target dir, unserialised — the evidence for #81
-
-2026-08-02, hit by the owner mid-suite. His `cargo test` log, in order:
-
-- `Building toyos-ld...` — the harness rebuilt the linker, because
-  `toyos-ld/src/main.rs` was edited in the tree while the suite ran.
-- `external deps changed: cleaning .../kernel`, `Removed 21703 files, 6.6GiB
-  total` — `ensure_fresh` invalidates on a fingerprint that includes the
-  linker binary's size and mtime (`src/build.rs:103`), so a new toyos-ld
-  cleans kernel, bootloader and userland.
-- the harness's own kernel build then died: `error copying object file ... to
-  incremental directory ...: No such file or directory`, then `failed to
-  create file .../.fingerprint/kernel-.../output-bin-kernel`, then `panicked
-  at src/build.rs:214:9`, reported as `FAIL screen_early_panic`.
-- and its next clean died from the other side: `error: failed to remove file
-  .../userland/target/.../incremental/soundd-.../....o: No such file or
-  directory`.
-
-ENOENT on a file you are removing is the proof: two processes were deleting
-the same tree. A second agent was running `cargo run -- --build-only` in this
-tree over 22:00:14–22:01:44 and 22:02:32–22:04:14, against the harness's last
-write at 22:04:13, and had made the same fingerprint decision and run the same
-cleans.
-
-Cargo's build lock does not cover it. `ensure_fresh` runs `cargo clean`, which
-removes the whole `target/`, and the lock lives inside it at
-`target/<profile>/.cargo-lock` — the clean deletes the file the other
-process's lock is on.
-
-*This* window is not caused or widened by `dbbdcbe`'s build fix, whatever else
-that hunk surfaced — it adds one `remove_dir_all` of
-`userland/libc/target/<triple>` under `if rebuilt`, a directory only
-`src/libc.rs` uses, while the directories here are `kernel/target` and
-`userland/target`, cleaned by `invalidate_stale`/`ensure_fresh`, which
-predates it. What the upgrade work supplied was the trigger — an edit under
-`toyos-ld/src` while a suite runs — and the second racer.
-
-`62876b1` and `a8c78ef` serialise it. `external_fingerprint` and the cleans it
-implies now happen inside one exclusive section of a repo-level lock, so two
-processes cannot both decide "stale" and both clean; and every cargo build the
-build system runs holds that lock in shared mode from the first phase to the
-last artifact it reads back, so a clean cannot land inside a build at all. The
-lock files live in `.build-locks/` precisely because of the paragraph above:
-they must be outside every directory a clean removes.
-
-Reproduced in this tree both ways, 2026-08-03. Without: two bare `cargo clean`s
-launched together in `kernel/target` (11113 files, 3.5 GiB) gave the incident's
-own signature on the first attempt — `error: failed to remove file
-.../kernel/target/.rustc_info.json` / `No such file or directory (os error 2)`,
-exit 101, while the other reported `Removed 11113 files, 3.4GiB total`. With:
-two `cargo run -- --build-only` launched together, both with the kernel stamp
-absent so both decided a clean was needed — exactly one printed `external deps
-changed: cleaning .../kernel`, the other printed `[build-lock] waiting for the
-build lock (exclusive, clean crate targets against changed external deps)`,
-acquired it 39.9 ms later, re-decided, and cleaned nothing. Both exited 0.
-
-`src/buildlock.rs`'s `a_clean_cannot_land_inside_a_build` is the standing gate:
-the same interleaving staged deterministically, run once unlocked (the build's
-next write fails with this ENOENT) and once locked (it succeeds, and the clean
-happens after).
 
 ### A deleted guest test binary keeps running until its build artifact is deleted
 
@@ -2807,115 +2189,6 @@ or persistence moves out of `locale` entirely when the config store lands.
 
 ## 8. Hardware and performance gaps
 
-### `xhci_slow_connect` has a 2 ms margin on a 300 ms host-timed window
-
-Seen red once, in a full suite run sharing the host with other agents:
-
-```
-FAIL xhci_slow_connect: the first port was seen 0.298 s after the controller
-started, inside the 0.3 s the ports are held empty for — the injection did not
-reach the driver
-```
-
-0.298 against 0.300, and 0.299 in a second full run a few hours later. Re-run in
-isolation after each, it has passed six times out of six, so what the full runs
-measured was the host, not the driver: the
-window is held open by the harness on wall clock, and this dev host is a laptop
-that is regularly building three other things.
-
-Not diagnosed further and not touched — the observation is recorded so the next
-person to see this red does not spend the afternoon on the xHCI driver. The
-question for whoever does own it is whether the guest-side event can be timed
-against something the host does not have to hold, since a margin this thin
-cannot survive a shared machine.
-
-**Third miss, and the first that a re-run did not clear: 0.293 s.** Seen in a
-full run and then again on its own, back to back, while five agents were
-building in this tree — `toybox_cp_volume` took 121 s in the same window against
-the ~20 s it takes on a quiet host, and the build lock was contended on every
-attempt. So "re-run it in isolation" is not the discriminator this entry says it
-is: a `cargo test -- xhci_slow_connect` on a loaded host is not an isolated run,
-and 7 ms of margin is inside what the load costs. The margin is the finding.
-
-**Diagnosed, and it is not a margin — the assertion measures a delta against an
-absolute window.** Six runs, both with and without the #116 changes, taken while
-`xhci_slow_connect` was failing on *every* attempt:
-
-| run | `controller started` | first `xHCI: port` | delta |
-|---|---|---|---|
-| sc1 | 0.108 | 0.400 | 0.292 |
-| sc2 | 0.110 | 0.400 | 0.290 |
-| sc3 | 0.107 | 0.400 | 0.293 |
-| sc4 | 0.182 | 0.413 | 0.231 |
-| base1 (no #116) | 0.106 | 0.400 | 0.294 |
-| base2 (no #116) | 0.236 | 0.401 | 0.165 |
-
-**The first port line is at 0.400 every time, and that is exactly right.**
-`SLOW_CONNECT_NS` is applied in `read_portsc` as `nanos_since_boot() < 300 ms`,
-so it is measured from *boot*: the ports become visible at absolute t=300 ms, and
-`await_connect_settle` then needs `PORT_DEBOUNCE_NS` = 100 ms of a held-still
-non-empty mask, which puts the first connect at absolute t≈400 ms. The driver's
-behaviour is invariant across all six runs.
-
-What varies is `controller started`, from 0.106 to 0.236. The test computes
-`first_seen - started` and requires ≥ 0.300, so it is really requiring
-
-```
-400 ms − started ≥ 300 ms   ⟺   started ≤ 100 ms
-```
-
-The "margin" is `PORT_DEBOUNCE_NS − time_to_controller_started`. It was ~3 ms
-when the boot reached `controller started` at 97 ms; it is now negative on every
-run because the boot has permanently crossed 100 ms as the kernel and initrd
-grew. Host load matters only through that one number.
-
-So the fix is arithmetic in the *gate*, not timing: assert on the **absolute**
-timestamp of the first port line (≥ `SLOW_CONNECT_NS`), which is what the
-injection actually claims, or compare against
-`SLOW_CONNECT_NS + PORT_DEBOUNCE_NS − started`. Either is immune to how long the
-boot takes to reach the controller. Left to #92's owner; recorded here because
-the entry above says "the margin is the finding" and the margin is a symptom.
-
-Not caused by #116/#118: base1 and base2 above are the same tree with
-`kernel/src/drivers/xhci/mod.rs` reverted to before those changes, and they fail
-identically.
-
-**And not caused by the IOMMU either, though it moved the number.** Same-session
-A/B at IOMMU stage I2, one run each on the same tree: `controller started` at
-0.103 s with the unit left unprogrammed and 0.107 s with translation on, for
-deltas of 0.297 and 0.293 against the 0.300 required. Programming a unit is ~6 ms
-of one-time boot work in the storage phase — building the identity domain's 3072
-leaves, arming the invalidation queue, and one global invalidation — and it lands
-squarely in the `started ≤ 100 ms` budget above. Both arms fail, so the gate's
-arithmetic is still the finding; what I2 removes is the last 4 ms of the margin
-that used to make an isolated re-run look like a fix.
-
-Bounding that, so it is not read as "permanently red now": with I2 in, on a quiet
-host, it **passes** — a 233/233 full run at `da3d333` has it green in 10 s. The
-6 ms is spent either way and the gate still turns on how loaded the machine is,
-which is the entry's own point. What I2 changes is only how much load it takes.
-
-**Closed in `73d9f0c`**, by the arithmetic this entry asked for. Both instants
-now come off the guest's boot clock, which is the clock `read_portsc` is written
-in, and the one assertion became three: a floor at `SLOW_CONNECT_NS +
-PORT_DEBOUNCE_NS` that a slower boot can only move *later*; a ceiling 150 ms
-above it, for the settle that leaves by `EMPTY_BUS_NS` at ~1.1 s instead of on
-the device appearing; and the non-vacuity guard the old form had by accident and
-never named — the controller must start inside the window, or nothing in the
-boot read a hidden port at all.
-
-What was `started ≤ 100 ms` with the boot at 0.103-0.127 is now `started <
-300 ms`, so the IOMMU's 6 ms buys back none of a margin that no longer exists.
-Measured over six runs, three of them with four concurrent test processes on the
-host: `controller started` 0.104-0.127 s, first port line 0.400-0.402 s against
-a floor of 0.400 and a ceiling of 0.550. Concurrency moved the first line by
-1 ms, which is the point of measuring it on the guest's clock.
-
-The residue, for whoever sees this red next: the guard *is* load-sensitive, with
-~173 ms of headroom rather than the 3 ms the old form had. It fails by naming
-the fix — widen `SLOW_CONNECT_NS`, because the thing that would be too small is
-the injection window and not the gate's margin.
-
 ### `build_toyos_bins` reads a `.so` another build is replacing
 
 `src/build.rs`'s cdylib sweep does `fs::read_dir(&lib_out).unwrap()` and then
@@ -2938,24 +2211,6 @@ build system rather than a one-line `unwrap`.
 It is the fourth member of the "a red build may be the build system, not the
 code" family, and the tell is the same: the same command succeeds on the next
 attempt.
-
-### `git stash` in a shared tree takes everyone's uncommitted work
-
-Observed, not theorised: `stash@{0}: On main: compositor-stats-wip` appeared
-while two agents were editing, and the working tree came back clean — the
-stasher's own edits to `userland/window/` and `userland/compositor/`, and an
-unrelated agent's half-finished test in `tests/toyos.rs`, all went into the
-same stash entry. Nothing was lost, because a stash is recoverable, but the
-other agent's file vanished mid-edit with no indication of where it went.
-
-CLAUDE.md already warns about `git add -A`, `--amend`, and branch creation for
-the same reason. `stash` belongs on that list and is worse in one way: the
-other three leave the work visible, and this one makes it disappear.
-
-If it happens to you: `git stash list` first, then take back only your own
-paths with `git checkout stash@{N} -- <your paths>` — never `git stash pop`,
-which would drop somebody else's work into your tree as though it were yours.
-Better: commit before you stash, since a commit is cheap and this is not.
 
 ### Two framebuffer clients still pay the scanout's price, and the panic console pays it worst
 
@@ -3071,7 +2326,7 @@ issues in §1 are wrong: a claim is supposed to be evidence.
 
 ### Every network client pays a second of boot retry on a machine with no NIC
 
-`NetdConn::connect_blocking` (`toyos/src/net.rs:305`) retries `services::connect`
+`NetdConn::connect_blocking` (`toyos/src/net.rs:271`) retries `services::connect`
 100 times at 10 ms. That is right when netd is merely slow to start and wrong
 when it will never start: under metal-sim sshd sleeps 100 times, exits at
 t=1.69 s on a boot that reached `Boot: complete` at 0.38 s, and its 100
@@ -3217,135 +2472,6 @@ knows and never takes the failure path — so this needs an actuator of its own,
 and `xhci-portsc-rw1c`'s shape (replace what the register reads) is the one that
 fits.
 
-### CLOSED — the kernel initialised one xHCI controller, and the T14 has two
-
-Found on the laptop's own screen, on a real boot. PCI enumeration printed both
-of these, identical in class, subclass and prog_if:
-
-```
-PCI 00:0d.0 [0c03] vendor=8086 device=9a13 prog_if=30
-PCI 00:14.0 [0c03] vendor=8086 device=a0ed prog_if=30
-```
-
-`00:0d.0` is Tiger Lake's Thunderbolt 4 / USB4 xHCI in the TCSS block —
-corroborated by `00:0d.2` (9a1b) and `00:0d.3` (9a1d), the Thunderbolt NHI
-functions, beside it in the same log. `00:14.0` is the PCH USB 3.2 xHCI, where
-a ThinkPad's internal USB devices and its USB-A ports are. The kernel logged
-one `xHCI: found at PCI 00:0d.0`, then `max_slots=64 max_ports=5`, then
-**`xHCI: no HID devices found`** — a true statement about the Thunderbolt
-controller and a false one about the machine.
-
-`PciDevice::find` returned the first match and there was no enumerate-all.
-`pci::enumerate` now walks the bus once for the whole kernel and returns every
-function (bounded at `MAX_DEVICES = 256`); `find`, `find_by_id` and `scan` are
-gone and each driver selects from the list, so whether it takes one device or
-all of them is visible at the call site.
-
-Two things inside the driver were single-controller assumptions rather than
-transfer logic, and both moved per controller: the DMA pool (one static, and
-every offset in `Layout` is relative to a pool base, so two controllers sharing
-one pool would have put both DCBAAs, both command rings and both slot-1 device
-contexts at one address) and the controller itself. Disk indices flatten across
-controllers in `with_disk`, so `usb_storage::open(0)` still names one device.
-
-Gated by `xhci_second_controller` and `xhci_two_controllers`.
-
-**Residual, and the reason a fix here is not the whole answer: see the MSI-X
-entry below.** The same boot reported no MSI-X on the controller it did find,
-and that is not a degradation.
-
-### CLOSED — the button merge was keyed by xHCI slot id, which is per controller
-
-The same root cause one level up, and the reason "two keyboards or two pointers
-compose rather than contradict" needed checking against the code rather than
-quoting. It held for keyboards and not for pointers.
-
-`keyboard::HELD` is keyed by HID usage, so two keyboards on two controllers
-already compose: the modifier mask is the union and nothing in that path names
-a device. `mouse::PointerSource` was `PointerSource::usb(slot_id)`, and its
-doc claimed slot ids were "the whole space a `PointerSource` can name — no
-allocation, no eviction, and no way for two devices to alias". That was true of
-one controller. Slot ids are allocated by the controller, so a machine with two
-has a slot 1 on each: two mice would share one entry in `BUTTONS`, and because
-`handle_motion` publishes the OR and stores each source's byte unconditionally,
-every report from one would republish the other's buttons — a pointer that
-holds a button while the other moves flaps it at the combined polling rate,
-which is the exact defect the per-source table exists to prevent.
-
-Sources are now numbered as devices bind (`PointerSource::claim`, a
-`fetch_update` with `checked_add`, so the 255th pointer gets `None` rather than
-wrapping onto the i8042's entry at 0), and a pointer that cannot be numbered is
-not bound. `HidDevice` carries the source it claimed; `HidType` stayed as the
-parse-time answer and `HidRole` is what a bound device is, which removed the
-Mouse/Tablet distinction from the dispatch path entirely — the two differed
-only in report size, and `mouse::handle_report` already branches on length.
-
-Staged, not argued: `MetalXhciBoth` puts a hub ahead of the second controller's
-HID so both mice land on **slot 3**, and the driver logs
-`xHCI: pointer on slot 3 merges as source N`. With the slot-keyed source
-restored, both lines read `source 3`.
-
-### CLOSED — a controller with no MSI-X was never polled at all, and the log said otherwise
-
-`setup_msix` looked for capability 0x11 and, not finding it, logged
-`xHCI: no MSI-X capability, using polled mode` and returned. There is no polled
-mode. Every call site of `XhciController::poll` is inside `poll_if_pending`,
-which runs only when `irq_ring::take(IrqSource::Xhci)` returns a record, and
-the only producer of that record is the vector-0x21 ISR — delivered only
-through the MSI-X table `setup_msix` had just declined to program. The real
-boot logged that line on the T14's `00:0d.0`.
-
-Two things replaced it, and the second is the one that matters:
-
-- **MSI.** `PciDevice::enable_msi` (capability 0x05) beside `enable_msix`,
-  both in `pci.rs` where a capability write belongs. This is not a fallback to
-  something older and lesser: it is the same LAPIC write with the address and
-  data in config space instead of a BAR table, and Intel PCH xHCI parts
-  commonly offer it and not MSI-X. `arm_interrupt` prefers MSI-X and takes MSI
-  otherwise.
-- **A refusal.** A function offering neither is not initialised at all —
-  refused before the HCRST and before `scan_ports`, so nothing on it can print
-  `USB keyboard ready`. `xHCI: NOT INITIALISED at PCI …` says why in one line.
-  Per controller: on `MetalXhciNoIrq` the good controller still binds the boot
-  stick.
-
-I/O APIC pin delivery was considered and is not implementable here: a PCI
-function's INTx lands on a GSI named by `_PRT`, and this kernel has no AML
-interpreter — `acpi.rs` byte-scans the DSDT for `_S5_` and nothing else. That
-is a stronger objection than "legacy".
-
-Gated by `xhci_msi_only` (input delivered over MSI) and `xhci_no_interrupt`
-(refused by name, nothing announced). Teeth, all four measured: dropping the
-MSI arm reds the first on its log assertion; **programming MSI without setting
-the enable bit reds it on `keys=0 pointer=0` while still logging
-`MSI enabled`**, which is the assertion that matters; restoring the old
-degrade reds the second; and with *every* log assertion deleted from the second
-it still reds on `a device was announced on a controller nothing can read`.
-
-**The finding underneath it, which cost this test two shapes.** The first
-`MetalXhciMsi` put the boot stick and the HID on one controller and **passed
-with MSI deliberately disabled** — 10 key events, the right pointer delta, late
-and reordered but all present. `wait_transfer` and `wait_command` drain the
-*whole* event ring and hand every unmatched TRB to `dispatch_event`, so any
-storage I/O on a controller dispatches that controller's queued HID reports.
-`log_file` writes `/log/kernel.log` from the idle loop, so on a machine
-that boots off a stick there is an accidental polled mode, at the log sink's
-cadence, for every HID device on the same controller. Two consequences:
-
-- A test that wants to prove an interrupt arrived must run on a controller
-  with no storage on it. `MetalXhciMsi` now gives the boot stick to a
-  `msi=off,msix=off` controller the driver refuses, so the guest does no USB
-  storage I/O at all.
-- `poll_if_pending` polls *every* controller off one `irq_ring` record, so a
-  second, healthy controller's interrupts would have drained the ring too. Two
-  independent ways for this test to pass vacuously; only removing storage
-  entirely closes both.
-
-Whether the T14's PCH controller at `00:14.0` has MSI-X is still unknown — the
-kernel had never initialised it, so nothing has read its capability list. It no
-longer decides whether the keyboard works: MSI-X takes it, MSI takes it, and
-only a part with neither is refused, loudly.
-
 ### First-match device selection that remains, and why
 
 `pci::enumerate` returns every function now, so a driver taking the first match
@@ -3362,42 +2488,6 @@ does so visibly. Two do, and both are deliberate:
 
 Neither is a defect today. Both become one the moment a second such device is
 reachable, and the enumerate-all they would need now exists.
-
-### CLOSED — USB hotplug does nothing, and M1 made that reachable
-
-`dispatch_event` handled only `EVENT_TRANSFER`, and only for a slot already in
-`devices`; every other TRB type was advanced past and dropped, Port Status
-Change events included. `scan_ports` had exactly one caller, inside `init`. So
-the set of USB devices was whatever was connected at boot, forever — and
-plugging a keyboard into a machine with no input did nothing at all, with
-`device::try_claim(DEVICE_KEYBOARD)` already granted to the compositor, which
-made the machine indistinguishable from hung.
-
-Closed at `0ed2bc1` (driver) and `ba55b7e` (gate). The event was never wedging
-the ring: `next_event` advances ERDP and clears IP for every TRB it reads,
-whatever the type, so nothing about an unhandled event could starve a transfer
-completion. What was missing was acting on it.
-
-Three things the entry warned about, and what each turned out to need:
-
-- **The enumeration lock.** It already existed. `XHCI` is a `Lock<Vec<…>>` and
-  every runtime path goes through `poll_if_pending`, which holds it; the shared
-  input context and descriptor buffer are per *controller*, and boot enumerates
-  before the vec is published. No second buffer was added.
-- **Debounce and reset are waits that must not be spun on.** `poll_if_pending`
-  is at the top of every scheduler pass, so USB 2.0 §7.1.7.3's 100 ms and the
-  T14's own 55 ms root-port reset would empty the audio pipeline on every plug.
-  `PortWork` is the per-port state machine that steps them instead, and
-  `device.rs` is split into `begin_reset` / `reset_done` / `configure` so the
-  reset is the event it already is. `init_device` composes the three, so the
-  boot path and `xhci-deaf-port` are unchanged.
-- **A change flag that stays set is a change the controller cannot report.**
-  §4.19.2 raises the event on a 0→1 transition and only then, so the boot scan
-  had to start clearing CSC or the first thing unplugged would go unnoticed.
-  `acknowledge_port_change` is the one implementation.
-
-Two residuals, both recorded below rather than here: what the enumeration still
-costs a scheduler pass, and what an idle CPU pays for the debounce.
 
 ### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
 
@@ -3774,37 +2864,6 @@ Three things it does **not** give, in the order they will bite:
 `specs/metal-log-capture.md` is the durable version of the same problem and its
 Phase 2 fixed the *panic* half only.
 
-### An image built from this checkout carries five other agents' uncommitted work
-
-Found while producing the diag image, and it is the sharper form of "the artifact
-the owner actually flashes is booted by nothing in this tree". The first
-`cargo run -- --diag-boot --build-only` produced a 35,753,984-byte image whose
-kernel contained `usb-storage:` log lines — an in-flight USB mass-storage driver
-from another agent, uncommitted, with a 449/254-line delta across
-`xhci/device.rs` and `xhci/mod.rs` and three untracked files. `cargo` builds the
-working tree, and the working tree is shared.
-
-That is not a cosmetic provenance problem: the xHCI probe runs at 0.10 s and the
-i8042 probe at 0.11 s, so unproven USB code sits **upstream** of the exact line
-the flash is meant to read. A hang or panic there and the answer never gets
-logged at all.
-
-The artifact was rebuilt from committed `HEAD` in a detached `git worktree` with
-`rust/` and `toyos-ld/target` symlinked to the main checkout, driven by a
-throwaway bin that calls `build::build` directly. That last part is not
-optional: `build_test_image` and `build_toyos_bins` both call
-`toolchain::ensure`, whose `link_toolchain` compares the *unresolved*
-`root.join("rust/build/…/stage2")` against the rustup symlink — from any other
-root that comparison fails and it re-runs `rustup toolchain link`, which is the
-contention window §6 documents. So **the test harness cannot be run from a
-worktree** without hurting every other agent, and a worktree-built image can be
-verified only by booting QEMU directly.
-
-The general rule, which nothing enforces: **a flashable artifact is built from a
-committed tree, and its provenance is stated with the commit.** Today that is a
-procedure, not a mechanism — `build::build` reads the working tree and says
-nothing about it.
-
 ### The pre-flash gate certified everything except the milestone
 
 `specs/pre-flash-gate.md` §7 records **GO** at `b82fc4a` with a 182/182 guest
@@ -4071,26 +3130,6 @@ into a directory built to collide returns `NoSpace`); `MAX_LFN_CHARS` (255,
 this one *is* the format). A `walk` or `read_dir` past the caller's `limit`
 refuses rather than truncating, for the reason `vfs::MAX_LIST_ENTRIES` gives.
 
-### CLOSED in the adapter — no caching, deliberately, so performance depended on what is underneath
-
-Every FAT entry read is a 4-byte device read; the only buffer in the crate is
-one sector, invalidated by every write, and it exists so a directory scan
-reads one sector per sixteen entries instead of one per entry. That is right
-when the kernel's page cache sits directly under `BlockAccess` — caching twice
-is a coherence hazard for no gain — and wrong for any adapter without one. The
-adapter is where that decision gets made.
-
-It was made, and this entry is why gate A went red. Nothing sat under
-`EspDevice`, so a 4-byte FAT read was a 4 KiB USB transfer and a chain walk
-cost one transfer per cluster — on a volume this project formats with
-**512-byte clusters**. Measured in-guest over one 6.3 s boot: **4,352 device
-reads and 694 writes to append 11 KB of log**, ~192 reads per flush of ~540
-bytes, attributed `Fat32::write` 91, `set_len` 78, `extents` 23. `EspDevice`
-now keeps `RESIDENT_BLOCKS = 8` blocks resident: **4,352 → 25 reads** for the
-whole boot, and mean flush 8.9 ms → 2.8 ms. The crate is unchanged and this
-entry's judgement stands — the decision belongs to the adapter, and the adapter
-had not made it.
-
 ### A handle's fingerprint cannot survive a delete-and-recreate under the same name
 
 `File` identifies its directory entry by the 8.3 field plus the five creation
@@ -4194,124 +3233,6 @@ into the failing block, and reads it twice. Two device reads is the assertion �
 one means the slot stayed bound and the second reader got the previous tenant.
 Roughly 80 lines of kernel and 40 of harness; not built.
 
-### CLOSED — an endpoint address naming endpoint 0 was configured over EP0 or the slot context
-
-Closed at `fdc9cee` + `9dfd044`, gated by `xhci_descriptor_walk`. `parse_config`
-accepted an endpoint descriptor on its direction bit and its transfer type and
-never looked at the endpoint *number*; the completeness gate tested the whole
-address byte. `0x80` and `0x10` are non-zero bytes and resolve to DCI 1, EP0's
-own endpoint context, and DCI 0, the slot context — so `bind` wrote a bulk
-endpoint's max-packet, burst and dequeue pointer over one of them, set A1 in the
-Add Context flags, and relied on the host controller to reject the command,
-which a conformant one does with a line naming Configure Endpoint rather than
-the descriptor. No out-of-bounds write; the largest context index reached is 32
-and `32 * 64 + 16` is inside the 4 KiB input context.
-
-**The residual after the first fix is the interesting part.** Checking the
-resolved DCI still left "this endpoint was not filled in" encoded as a zero
-*address*, so the OUT direction was guarded by design and the IN direction only
-by the accident that a legal OUT address of `0x00` and the sentinel are the same
-byte. `Endpoint` now has one constructor, private to the parser, that refuses
-endpoint 0; `Walk` is the interface while its endpoints are `Option`s and
-`Function` is only ever the complete form. Both completeness guards, eleven
-zero-initialised fields and three `== 0` comparisons went away — the same shape
-`toyos-fat32`'s `Cluster` newtype closed, in a driver reading bytes a device
-chose.
-
-The gate is `legacy.rs`'s selftest applied to the other untrusted byte stream:
-`parse_config` is pure, so `xhci-descriptor-selftest` runs it over nine crafted
-descriptors at init. Deleting `num != 0` from the constructor gives `6/9` with
-`Some((2, 66, 1, 4))`, `Some((2, 66, 3, 0))` and `Some((1, 66, 1, 0))` — DCI 1
-and DCI 0, exactly the two contexts. Six of the nine also cover the walk's own
-bounds, which had been verified by reading only: a descriptor claiming zero
-length, a `wTotalLength` past the buffer, a truncated final descriptor.
-
-### CLOSED — a stick that does not implement SYNCHRONIZE CACHE was a permanent write loop
-
-Closed at `5fde1c5` + `5b8565b`, gated by `usb_flush_optional`. SYNCHRONIZE
-CACHE (0x35) is optional in SBC and a great many USB flash drives answer
-ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE. `msc_flush` read anything
-other than `Scsi::Ok` as a failed flush, and the chain above it closed a loop:
-`FatFs::sync` logged the failure and returned `()`, that line was new pending
-content in the ring `log_file` was draining, `Sink::flush` still returned `Ok`
-so the sink's disable path never ran, and the next idle pass did it again.
-
-Measured on the pre-fix tree under `usb-flush-unimplemented`: **45 flushes in
-the 89 ms** between the first one and the shutdown, three log lines each,
-stopping only because the machine did. On the T14 that is the state the machine
-boots into and never leaves — continuous writes to the stick it booted from,
-and `MAX_LOG_BYTES` rotating the boot log off it while it happens.
-
-Two defects and both were needed. `Scsi` now carries the sense bytes the driver
-already fetched (`Refused { key, asc, ascq }`) apart from a broken transport,
-and `msc_flush` reads 0x05/0x20/0x00 as an answer, reporting the missing
-command once per device. `FileSystem::sync` returns `Result`, `sync_mount`
-returns it, and `Sink::flush` propagates it — so a flush that really fails
-disables the sink once instead of asking for the next one. With only the second
-half in place the same boot loops **1031 times over a 2 s idle run**; with only
-the first, a stick that genuinely cannot flush still loops.
-
-**The general shape, because it will recur.** An error path that logs is an
-error path that produces work for the thing that failed, and on a machine whose
-log lives on the failing device that work is another attempt at the same
-operation. Every `log!` under `Sink::flush` has this hazard. The three that
-remain are bounded by the disable path (`usb-storage: cache flush failed`,
-`usb-storage: SCSI 0x35 failed`, `log-file: … stops at …`), measured at 2 per
-boot; the one that is not a failure at all — the no-write-cache report — is
-latched per device for exactly this reason.
-
-**QEMU cannot stage it.** `scsi-disk` implements 0x35 for every front end that
-reaches it, `usb-storage` and `usb-bot` over `scsi-hd` and `scsi-block` alike,
-with no device or drive property to turn it off; `scsi-generic` would need a
-host SCSI device the harness cannot assume. Hence `usb-flush-unimplemented` and
-`usb-flush-fails`.
-
-### CLOSED — five xHCI bring-up waits had no deadline, which on the T14 is a silent hang
-
-Closed at `5fde1c5`, gated by `xhci_deaf_registers`. `USB_TIMEOUT_NS` covered
-`wait_command` and `wait_transfer`; the port-reset spin in `init_device` and
-four register spins in `init_one` — halt, HCRST clear, CNR clear, and leaving
-Halted after R/S — were bare `spin_loop`s. **Five, not the six the audit's
-heading says**; its own location list has five and its summary sentence
-("the port-reset spin in `init_device`, and four register spins in `init_one`")
-agrees. `legacy.rs`'s handoff wait was already bounded.
-
-Pre-fix, both injected configurations hung and the harness timed out after 10 s
-waiting for `===READY===`. That is the T14's failure exactly: on a machine with
-no serial port a spin here paints `Boot: peripherals ready` and nothing else,
-forever, which is what a dead port, a dead controller and every other wedge all
-look like.
-
-`settles` gives each the transfer budget and every caller turns expiry into a
-refusal — the controller by PCI address through the machinery `arm_interrupt`
-already established, the port by number. Both machines now reach `Boot:
-complete`. The gate brackets each wait against the serial timestamps and
-requires ≥1.5 s of it (measured 2.001 s and 2.000 s), because without that it
-would stay green for a `settles` that gave up on its first read — and so would
-every other test in the suite, since QEMU answers all five registers before the
-deadline is ever consulted.
-
-The `DmaPool` moved after the reset, so a controller refused before it costs no
-physical memory; one refused after it gives the pool back when the `DmaPool` is
-dropped.
-
-### CLOSED — `healthy()` answered a different question from the one it documents
-
-Closed at `5fde1c5`. `UsbBlockDevice::healthy` asked
-`storage_geometry(..).is_some_and(|g| g.blocks > 0)`, and `MscDevice::failed` —
-the flag that says the driver will never speak to this device again — does not
-disturb the geometry, which is what the device reported before it broke. So the
-one question the doc comment says it exists to answer, *after a run of
-failures, is there still something there*, was the one it got wrong, in the
-direction that keeps a caller retrying a disk the driver has written off. It now
-asks `xhci::storage_online`, which publishes the flag. Corroborated
-independently by `specs/type-safety-audit/usb-gate-teeth.md`, which called it a
-tautology.
-
-The recovery path is no longer unexecuted: `usb-transport-break` drives it, and
-`usb_transport_break` asserts `healthy=true` across a break — which is the
-question this method exists to answer.
-
 ### USB mass storage: what is not implemented
 
 The driver serves one logical unit per device and speaks the SCSI commands a
@@ -4336,47 +3257,6 @@ disk needs. Deliberately absent, each with its reason:
 - **Concurrency.** One command at a time per controller, under the xHCI lock,
   with preemption disabled for its duration. Fine at boot; a filesystem doing
   real I/O over USB will want the queue depth the transfer rings already allow.
-
-### CLOSED — recovery issued Reset Endpoint on an endpoint that was not halted
-
-Gated by `usb_transport_break`. **Which recovery command is legal is a property
-of the endpoint's state, not of the error that ended the transfer.** Reset
-Endpoint is defined only for a Halted endpoint (xHCI 1.2 §4.6.8), Stop Endpoint
-only for a Running one (§4.6.9), Set TR Dequeue Pointer only for Stopped or
-Error (§4.6.10) — and `clear_stall` opened with Reset Endpoint whatever had
-happened. On the shapes that leave the endpoint Running, a conformant xHC
-answers Context State Error, recovery reported failure, and `dev.failed` was set
-with nothing in the driver able to clear it.
-
-That is what the first metal boot with a working USB stack did. It mounted
-`/boot` off a stick and then lost it: `transport broke on SCSI 0x2a`, two
-`Reset Endpoint failed, code=19`, `reset recovery failed; disk is offline`, and
-the kernel log on that stick — the only diagnostic channel a T14 has — stopped
-where it stood.
-
-`restart_endpoint` now reads the Endpoint State field of the device's *output*
-context and branches: Halted keeps the three steps, Running issues Stop
-Endpoint first, Stopped goes straight to Set TR Dequeue, and Disabled/Error are
-refused by name. CLEAR_FEATURE(ENDPOINT_HALT) goes out only for a halt, because
-a device that never halted may stall the request for asking. The state it found
-is logged, so a `restart_endpoint` that succeeded and one that was never called
-are no longer indistinguishable.
-
-`Bot::Broken` also stood for four different things and `scsi` logged none of
-them. It is now the error half of `bot`'s `Result`, a `Broke` naming the phase
-and the completion code — which is the line a machine with no serial port has to
-be diagnosed from, and the reason the cause of the T14's own break is still not
-known: the driver threw it away.
-
-**Reproduced on QEMU, both directions.** With the recovery forced back to an
-unconditional Reset Endpoint, `usb_transport_break` prints the T14's log
-verbatim — two `code=19`, disk offline, `wr_err=3 healthy=false`. With the fix,
-`wr_err=1 healthy=true` and every block the guest wrote after the break is
-byte-correct in the backing file on the host.
-
-Detail and the enum this grew out of in `specs/type-safety-audit/usb-storage.md`
-F3, whose `Halted`/`Silent` split is subsumed: the endpoint's own state answers
-the question that enum was inferring.
 
 ### A control transfer that stalls during enumeration leaves EP0 halted for good
 
@@ -4436,168 +3316,6 @@ mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
 `esp_filesystem`, `kernel_log_file`, `log_backing_read_error`,
 `log_partition_automount` and `log_partition_identity`
 (`tests/common/volumes.rs`), and `toybox_cp_volume` (`tests/common/toybox.rs`).
-
-### The ESP's four megabytes of slack are eaten by its own FATs
-
-`create_esp_volume` sizes the partition at `content + 4 MiB` (`src/image.rs:147`), which
-reads as four megabytes of room to write into at runtime. Measured by reading the built
-images back with the `fatfs` crate and asking each volume for its free-cluster count:
-
-| image | partition | cluster | free clusters | free bytes |
-|---|---|---|---|---|
-| `tests/testcases` boot image | 254 MiB | 512 B | 167 | **85,504** |
-| shipping `system.toml` (`target/bootable.img`) | 646 MiB | 4096 B | 695 | 2,846,720 |
-
-At those volume sizes FAT32 picks a small cluster, so the two FATs describing half a
-million of them consume the whole margin. `/boot` is therefore effectively full on
-arrival: `esp_files`' 41,097-byte blob fits and not much more would. `toybox_cp_volume`
-started on the ESP for exactly the reason the margin suggests it should work, failed at
-`create_file` with `No space left on device`, and moved to `/log` — which is 34 MiB with
-33 MiB free and is now shared with `log_file`.
-
-Whether `/boot` is *meant* to be writable at runtime is a design question and not
-obviously "yes". But the size expression says four megabytes and delivers 85 KB, which is
-a number that lies. Either size it from the free space wanted after formatting, or say in
-the comment that the margin is FAT overhead and `/boot` has no working room.
-
-### CLOSED — a metal boot reached a desktop with no `/log`, intermittently, because the boot disk arrived after the port scan
-
-The owner flashed `target/bootable.img` built at `85020e1` — 716,177,408 bytes,
-the shipping `system.toml` — to the T14 and reached a working compositor
-desktop. The `TOYOS-LOG` partition afterwards held no `kernel.log`, and the
-desktop's own terminal had no `/log` directory either. **So the mount never
-happened**: `/log` is mounted kernel-side in the subsystems phase and userland
-cannot unmount it, which takes `log_file::install` and the whole write path out
-of the tree. The day before, the 73 MB `--console-boot` image at `30993f2` wrote
-the log on the same machine twice, 11,727 and 15,116 bytes.
-
-**Three headless boots of that exact artifact are green**, so nothing in this
-entry is reproducible on this host. All three are metal-sim (`-vga std`, NVMe,
-xHCI, i8042, `intel-iommu,intremap=on,caching-mode=on,aw-bits=48`, `-display
-none`, the stick on `usb-storage`), the image byte-identical to the one that was
-flashed:
-
-1. the image as the whole device;
-2. the image `dd`'d into a **32 GiB** backing file, which is the flashed stick's
-   geometry — device far larger than the image, backup GPT nowhere near the last
-   LBA;
-3. the T14's two-controller shape, boot stick on the **second** xHCI, with a
-   `500_118_192`-sector namespace beside it.
-
-Every one of them printed, within 30 ms of each other:
-
-```
-usb-storage: disk 0 ready on slot 1, 174848 blocks of 512 B (683 MiB), msc_block +0x10000
-usb-storage: 1 device(s)
-gpt: device 16 carries the log partition C677F66E-19BB-43CE-89C8-607C50EFC04E at LBA 1327104+69632, entry 1 of 2
-gpt: device 16 carries the boot partition at LBA 2048+1323424 (512-byte blocks), entry 0 of 2 on disk 0591DD6E-772E-43B4-977B-931537C4AB12
-boot-volume: partition mounted, 677593088 bytes of a 677593088-byte partition at device offset 1048576, 512-byte sectors, 4096-byte clusters, 165104 clusters
-log-volume: partition mounted, 35651584 bytes of a 35651584-byte partition at device offset 679477248, 512-byte sectors, 512-byte clusters, 68552 clusters
-log-file: this boot's kernel log continues in /log/kernel.log, which holds 0 bytes
-```
-
-and left a real `KERNEL.LOG` in the log partition's root directory — 26,915
-bytes after two minutes, read back off the image on the host, and 18,555 bytes
-already there when the third boot appended to it.
-
-**What that exonerates, with numbers rather than by argument.** The ESP at the
-size nothing else has ever mounted — 677,593,088 bytes, 165,104 clusters of
-4096 — mounts. The log volume is not affected by the image growing at all:
-`create_log_volume` formats exactly `FAT32_MIN_BYTES`, so **every** image this
-project builds has the same 35,651,584-byte, 68,552-cluster log partition, and
-the console image that worked and the full image that did not carry byte-for-byte
-the same volume. A device whose capacity is ~48x the image is fine. The
-bootloader's handoff is fine by construction anyway — it refuses a volume with no
-`\toyos\log.guid`, and the machine booted.
-
-**And what the window contains.** `git diff 30993f2..85020e1` touches no file in
-the storage path: not `gpt.rs`, not `fat32_adapter.rs`, not `block.rs`, not
-`toyos-fat32/`, not `toyos-gpt/`, not the xHCI or USB storage drivers. The
-kernel changes are the IOMMU inventory (new, and it issues no MMIO write), a
-`GOP:` line that *reads* the MTRRs, the panic console's claim wait, an ACPI
-refactor, and a test-only `SYS_DEBUG` action.
-
-**CLOSED at `9985f82`/`767708f`, gated by `late_storage_connect` (`3efdb46`).**
-The owner booted the same stick, same image, same machine again and both volumes
-mounted with 103 KB of log recovered. **It is intermittent**, which prices out
-everything deterministic — the firmware/table extent cross-check above all, since
-the same firmware reading the same table produces the same numbers every boot.
-
-**The race, and it was in the shape of the probe rather than in any of its
-parts.** `xhci::await_connect_settle` returns as soon as the root hub's connect
-set has held still for `PORT_DEBOUNCE_NS` **and is non-empty**, so a machine
-whose other devices are up settles on *them*, and `device::scan_ports` runs
-against the ports as they read at that instant. The T14 has four internal USB
-devices — camera, Bluetooth, card reader, fingerprint reader — beside the stick
-it boots from, and on its good boot they connect at 1.190, 1.246, 1.301 and 1.526
-with the stick at 1.465 in the middle of them. Nothing holds that ordering. When
-the stick is the one still coming, the scan ends with the bus populated and no
-disk on it, `fat32_adapter::probe_boot_disks` iterates `0..0`, and the machine
-has no `/boot` and no `/log` for the rest of the boot — while booting perfectly,
-because everything userland needs is in the initrd.
-
-**Every part of it was silent.** `probe_boot_disks` was three bare `continue`s
-and a loop that did not execute; nothing logged, nothing refused, nothing named.
-`usb-storage: 0 device(s)` was printed and meant nothing to anyone, because on a
-machine with no USB storage it is also what a correct boot says.
-
-The fix is two things and the second is what the first is for:
-
-- **The probe keeps looking while the machine still has no boot volume.** Not a
-  timer — the condition is `gpt::boot_partition().is_some() &&
-  gpt::boot_volume().is_none()`, so a machine whose boot volume is already
-  resolved leaves after one pass: every QEMU boot, every machine that boots off
-  NVMe, and the T14 on a good boot. Only a machine that would otherwise report no
-  boot volume pays anything, which is the same asymmetry `EMPTY_BUS_NS` is
-  written around and the same `PORT_SETTLE_CEILING_NS` ceiling, because it is the
-  same question about the same root hub. `xhci::recheck_ports` is the new
-  primitive: `poll_if_pending` returns without reading a register unless an
-  interrupt was recorded or `PORT_WORK_AT` is due, and the end of a boot scan
-  stores zero there precisely because nothing was outstanding.
-- **Every skip is named**, and one of the three is now unrepresentable rather
-  than logged: `usb_storage::open` carries the logical block size out with the
-  handle, so the caller asks one question and gets one answer where it used to
-  ask the controller twice for one fact and have two `None`s to swallow.
-
-**The gate, and why it is not `xhci_slow_connect`.** `xhci-slow-storage-connect`
-hides the *first port register* for 300 ms while every other port reads normally
-— the boot stick lands there because it is the only SuperSpeed device the
-profiles attach. `xhci-slow-connect` hides the whole bus, which is the case
-`EMPTY_BUS_NS` already keeps looking through, and it can never reach this
-interleaving because the devices it hides are the ones whose presence ends the
-wait early. Off the gate's own boot on `Profile::MetalUsb`: controller started at
-0.099, the settle ends at 0.200, `xHCI: 1 controller(s), 4 HID device(s)` and
-`usb-storage: 0 device(s)` at 0.202 — a populated bus with no disk, the laptop's
-state — then port 1 connects at 0.401, the disk is ready at 0.404, `gpt:` reads
-the table at 0.406 and both volumes mount at 0.438. The whole wait costs 204 ms,
-on the one boot that needs it. Non-vacuity is checked from both sides: the scan
-must have finished without the disk, *and* the bus must not have been empty.
-Ground truth is `kernel.log` read off the log partition of the image on the host
-afterwards, carrying this boot's own partition GUID. Negative control, with the
-wait removed and the actuator unchanged: `FAIL late_storage_connect: the disk
-arrived after the port scan and "boot-volume: partition mounted" never happened`.
-
-**What is left open, and it is the reason this was expensive.** The machine could
-not say any of this. Every refusal on the path is a `log!` into a ring whose only
-sinks are a 16550 the T14 does not have, the on-screen console the compositor
-claims tens of milliseconds after the last boot checkpoint, and `/log` — the
-thing that had failed. A working desktop and no evidence is the designed outcome
-of that arrangement. That is **task #95**, not closed here; the named-skip lines
-above are its first input.
-
-**The coverage hole, and it is not the obvious one.** "No gate boots an image at
-the full system's real size" is true, and smaller than it sounds: read off a
-suite boot's own `KernelArgs` line, the test image's boot partition is **513,008
-sectors** against the shipping image's **1,323,424** — 262,660,096 bytes against
-677,593,088, a factor of 2.6 rather than the order of magnitude the 73 MB diag
-and console images suggest. It is *not* the hole that let this ship: booting
-exactly that image at exactly that size is what the three runs above did and they
-are green. The hole that let it ship is that **device arrival *order* was a shape
-no profile varied.** Every profile in the suite hands the guest a bus whose
-devices are all present the instant the register is touched — QEMU fills PORTSC
-from the QOM tree — so "the disk is the last thing to arrive" was not a machine
-the harness could build until `xhci-slow-storage-connect` existed. Size was never
-the dimension; time was.
 
 ### The boot image this project builds is not `fsck_msdos`-clean, and never was
 
@@ -4676,8 +3394,7 @@ than the bcachefs adapters do. The read side is unchanged and shares §1's live
 cross-process leak: an `Arc<FatBacking>` already handed to the file cache still
 names byte ranges the allocator is free to reissue.
 
-### The bound is one generation, and after a rotation the newest bytes are in
-### the older-looking file
+### The bound is one generation, and after a rotation the newest bytes are in the older-looking file
 
 `kernel.log` rotates to `kernel.log.1` at 4 MiB and the previous `.1` is
 deleted. A rotation can be the last thing a boot does, which leaves
@@ -4697,32 +3414,6 @@ partition that is gone, and the worst a half-finished write costs is the
 diagnostic itself. The lock argument stands alone. The panic path keeps the
 on-screen console, which takes no lock at all. What the file has after a panic
 is everything up to the last idle pass.
-
-### CLOSED — a healthy machine turned its own kernel log off during a spawn
-
-`log_ring::file_has_pending` is in the idle loop's awake condition, so a CPU
-with nothing to run will not sleep while the sink is owed bytes. `log_file::poll`
-takes the VFS lock with `try_lock` and gave up after `MAX_BLOCKED_POLLS` (1000)
-consecutive failures, which turns the sink off permanently and clears the
-condition.
-
-A count is not a duration, and only a duration was ever meant: the bound exists
-for a thread that *panicked* holding the VFS lock. 1000 polls of a spinning
-idle loop elapse in about **2 ms**, while an ordinary `spawn` holds the VFS
-lock for **13–17 ms** reading an ELF — so the give-up fired on a working
-machine, mid-boot, and the log stopped there for good. Caught on the guest's
-own serial in two unrelated boots: an `audio_tone` boot (`stops at 8417 bytes`,
-during `spawn: /bin/test_rs_audio_tone`) and an `kernel_log_file` boot (`stops at
-0 bytes`, during `spawn: /bin/shutdown`, which is what made the shutdown's last
-line reach no generation). Present at HEAD before the ESP work below, and made
-frequent by it. Now `MAX_BLOCKED_NANOS = 10 s`.
-
-Two lessons worth more than the fix. **A bound whose unit is "iterations of a
-loop somewhere else" silently re-tunes itself whenever that loop gets faster** —
-this one was correct until the ESP path stopped re-reading the FAT. And the
-failure was *silent by construction*: the give-up announces itself into the
-very ring it is switching off, so on a machine with no serial port the one
-place that line could be read is the file it says has stopped.
 
 ### The kernel log's flush is unbounded, uninterruptible, and in front of the scheduler pass
 
