@@ -115,6 +115,7 @@ const MACHINE_TESTS: &[&str] = &[
     "metal_sim_window_caps",
     "metal_sim_ipc_hostile_peer",
     "metal_sim_compositor_stall",
+    "metal_sim_pointer_churn",
     "netd_connection_caps",
     "foreign_disk_untouched",
     "boot_partition_identity",
@@ -153,6 +154,7 @@ const MACHINE_TESTS: &[&str] = &[
     "usb_transport_break",
     "xhci_full_speed_device",
     "xhci_hotplug",
+    "xhci_flap",
     "xhci_hid_break",
     "xhci_descriptor_walk",
     "esp_filesystem",
@@ -165,6 +167,8 @@ const MACHINE_TESTS: &[&str] = &[
     "cache_eviction",
     "va_exhaustion",
     "heap_ceiling_recovery",
+    "iommu_context_absent",
+    "iommu_write_blocked",
     "serial_vocabulary",
 ];
 
@@ -2251,9 +2255,12 @@ fn run_machine_test(
             usb::xhci_full_speed_device(test_config, c_bins, rust_bins)
         }
         "xhci_hotplug" => usb::xhci_hotplug(test_config, c_bins, rust_bins),
+        "xhci_flap" => usb::xhci_flap(test_config, c_bins, rust_bins),
         "xhci_hid_break" => usb::xhci_hid_break(test_config, c_bins, rust_bins),
         // Body in `tests/common/iommu.rs`, same reason.
         "iommu_discovery" => common::iommu::iommu_discovery(test_config, c_bins, rust_bins),
+        "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
+        "iommu_write_blocked" => common::iommu::iommu_write_blocked(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
@@ -4856,6 +4863,124 @@ fn run_machine_test(
             serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
             eprintln!(
                 "  [metal-sim] {CASES} stalls survived, {timed_out} handshakes timed out by name, \
+                 desktop still compositing"
+            );
+            Ok(())
+        }
+        "metal_sim_pointer_churn" => {
+            // The owner froze his desktop twice by plugging a mouse in and
+            // pulling it out again, and the second freeze landed on the fourth
+            // cycle's enumeration. The compositor holds the merged pointer's
+            // fd across all of it, so every cycle is a source binding and
+            // releasing underneath a claim it never made and cannot see.
+            //
+            // The liveness signal is `compositor: frames=`, for the reason it
+            // was built: it comes from a composited frame, so its absence is a
+            // desktop that stopped drawing rather than an instrument that
+            // stopped counting.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            let socket = qemu.qmp_socket().to_path_buf();
+            let mut console = qemu.boot_log().to_string();
+            let frames = |text: &str| text.matches("compositor: frames=").count();
+
+            // A baseline first: churn against a compositor that was never
+            // drawing would be a green run proving nothing.
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline && frames(&console) < 1 {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            if frames(&console) < 1 {
+                return Err(format!("the compositor never composited a frame:\n{console}"));
+            }
+            let before = frames(&console);
+
+            // The owner's cadence: plugged for a second or two, unplugged for
+            // about as long, over and over. His freeze came on the fourth.
+            const CYCLES: usize = 8;
+            const SETTLE: Duration = Duration::from_millis(400);
+            for cycle in 0..CYCLES {
+                let id = format!("churn{cycle}");
+                // One monitor at a time — a `server` socket serves one
+                // connection — so each phase opens, acts and closes.
+                let mut devices = qemu::QmpDevices::open(&socket);
+                devices.add("usb-mouse", "xhci.0", &id, &[]);
+                drop(devices);
+                console.push_str(&qemu.drain_serial(SETTLE));
+                // The pointer has to be *used* between binding and unbinding.
+                // A source that binds and goes is a lifecycle event the
+                // compositor may never look at; a source delivering motion
+                // when it goes is one the compositor is reading from, which
+                // is the state the owner's machine was in every time.
+                let mut input = qemu::QmpInput::open(&socket);
+                for step in 0..16 {
+                    let dir = if step % 2 == 0 { 12 } else { -12 };
+                    input.mouse(dir, dir, None);
+                }
+                drop(input);
+                console.push_str(&qemu.drain_serial(SETTLE));
+                let mut devices = qemu::QmpDevices::open(&socket);
+                devices.del(&id);
+                drop(devices);
+                console.push_str(&qemu.drain_serial(SETTLE));
+            }
+
+            // The churn has to have reached the guest, or this gate is a
+            // twenty-second sleep with an assertion after it.
+            let bound = console.matches("merges as source").count();
+            if bound < CYCLES {
+                return Err(format!(
+                    "{CYCLES} plug/unplug cycles bound {bound} pointer sources — the churn did \
+                     not reach the kernel, so nothing here was tested:\n{console}"
+                ));
+            }
+
+            // And the motion reached the compositor, or the churn was against
+            // a pointer nobody was reading. An idle desktop composites twice
+            // per reporting interval (the taskbar's clock); anything above
+            // that is the cursor being moved.
+            let moved = console
+                .lines()
+                .filter_map(|l| l.split("compositor: frames=").nth(1))
+                .filter_map(|rest| rest.split_whitespace().next())
+                .filter_map(|n| n.parse::<u64>().ok())
+                .any(|frames| frames > 2);
+            if !moved {
+                return Err(format!(
+                    "no reporting interval composited more than the taskbar's two frames — the \
+                     injected motion never reached the compositor, so the churn was against a \
+                     pointer it was not reading:\n{console}"
+                ));
+            }
+
+            // Still painting, counted from here rather than from the boot: the
+            // reporting interval is 2 s, so two of them cannot be satisfied by
+            // frames the compositor produced before the first cycle.
+            let mut after = String::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline && frames(&after) < 2 {
+                after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            if frames(&after) < 2 {
+                return Err(format!(
+                    "the compositor composited {before} frame batches before {CYCLES} pointer \
+                     plug/unplug cycles and {} in the 20 s after them — the desktop stopped:\
+                     \n{console}\n--- after ---\n{after}",
+                    frames(&after)
+                ));
+            }
+
+            let console = format!("{console}\n{after}");
+            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+            eprintln!(
+                "  [metal-sim] {CYCLES} pointer plug/unplug cycles, {bound} source bindings, \
                  desktop still compositing"
             );
             Ok(())

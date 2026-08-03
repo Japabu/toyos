@@ -1195,6 +1195,74 @@ cannot happen under the table lock (it would put `AddressSpace` under
 `ThreadData` after the table check, inside the same lock hold, is the shape that
 fixes it.
 
+### A read of the mouse fd *is* the USB hot-plug engine, with preemption off
+
+**This is the mechanism behind the owner's second T14 desktop freeze** (§1), and
+it is outside every class the compositor's non-blocking rewrite closed — which
+is exactly what that entry's stated decider predicted: a freeze with no
+`compositor: dropping pid` line is a fifth mechanism.
+
+The call chain, verified in the tree rather than reasoned about:
+
+- `kernel/src/fd.rs:376` and `:390` — `fd::try_read` on `Descriptor::Keyboard`
+  and `Descriptor::Mouse` opens with `crate::drivers::xhci::poll_if_pending();`
+  before it looks at the event queue at all.
+- `poll_if_pending` takes `XHCI.lock()` and runs `ctrl.poll()` for every
+  controller — `next_event`/`dispatch_event`, `recover_endpoints`,
+  `service_ports` — which is the whole enumeration and endpoint-recovery
+  engine, executed inline on the calling thread.
+- `USB_TIMEOUT_NS` is `2_000_000_000` (`drivers/xhci/mod.rs:337`), and the
+  waits under it are `spin_loop()`, not parks. One endpoint recovery issues
+  Reset Endpoint, Set TR Dequeue and a `CLEAR_FEATURE(ENDPOINT_HALT)` control
+  transfer — three of those budgets.
+- `Lock::lock` calls `crate::preempt::disable()` (`kernel/src/sync.rs:27`), so
+  all of it runs with preemption disabled, and `sys_read_nonblock` holds the
+  caller's whole `ProcessData` fd-table lock across it.
+
+**So the compositor's `mouse.read_nonblock()` is not a read. It is the USB
+enumeration engine**, and the desktop stops for as long as the driver takes.
+Nothing about it is a bug in the compositor: the call is non-blocking by ABI
+and returns `WouldBlock` honestly, and there is no way for a caller to ask for
+the events without also volunteering to drive the bus.
+
+Why it fits the log the four closed mechanisms could not:
+
+- The heartbeat stops *at* a source binding (53.849 s), not at a client event.
+- No drop line, because no client IPC is involved.
+- `poller.wait`'s `FRAME_INTERVAL` is irrelevant — the compositor is not in the
+  poller. §1's "it was therefore not in `poller.wait`" was right and is now
+  explained rather than merely inferred.
+- The kernel stays alive and keeps counting the owner's keystrokes (i8042 at
+  57.9 s and 69.0 s, 18→22 keys, 338→586 motion): preemption is disabled,
+  interrupts are not.
+- Only cpu0 emits idle scheduler lines afterwards, because the CPU running the
+  driver never idles.
+- The endpoint recovery logged at 62.236 s is 8.4 s after the heartbeat
+  stopped, which is the shape of a multi-second hardware wait, not of a park.
+
+**QEMU cannot stage it, and the gate says so.** `metal_sim_pointer_churn`
+cycles a `usb-mouse` through eight plug/unplug rounds with injected motion in
+each, against a live compositor, and asserts the desktop keeps compositing. It
+is green, and it proves the churn reaches the kernel (eight source bindings,
+and reporting intervals above the taskbar's two frames, so the motion was
+delivered) — so it is an exclusion and an actuator, **not a reproduction**. The
+emulated xHC completes every command immediately, so the 2 s budgets that make
+this bite on real hardware are microseconds there. The missing ingredient is
+hardware latency, which no profile in this tree can synthesise.
+
+The fix is a boundary, not a timeout: a read of an input fd must not run the
+bus. Whatever drives enumeration should be the scheduler pass that already
+calls `poll_if_pending` from `drain_irqs`, with the read path doing nothing but
+read. That deletes the preemption-off hold from every userland input read at
+once, and is why this is recorded rather than patched here — it is the xHCI
+owner's boundary to move, and `kernel/src/drivers/xhci/` had two agents mid-
+refactor in it while this was written.
+
+**What the next boot should capture.** `sync.rs`'s spinlock already narrates:
+`LOCK CONTENTION` and, past 500M spins, `panic!("DEADLOCK at {}")` naming the
+caller. A freeze with `kernel/src/fd.rs:390` in either line is this, confirmed
+from the machine rather than from the code.
+
 ### The decoded input queues are unbounded, so a wedged consumer grows the kernel heap
 
 Found while answering "where do the keystrokes go while the compositor is
