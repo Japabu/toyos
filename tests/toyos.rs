@@ -2566,9 +2566,15 @@ fn metal_sim_argv_check(argv: &[String]) -> Result<(), String> {
 /// The compositor claims a firmware framebuffer and says what it got; netd finds
 /// no NIC and exits rather than panic; soundd finds no audio device and stays up
 /// on a null sink rather than exiting (hardware absence is a routing state — a
-/// no-device machine still serves audio clients, discarding what they play). The
-/// earlier version read the bottom pixel row instead, which says nothing about
-/// soundd or netd and stayed green with their graceful behavior reverted.
+/// no-device machine still serves audio clients, discarding what they play); and
+/// sshd, which has no device of its own, finds no netd to bind through and says
+/// so instead of dumping a tokio backtrace across the boot. The earlier version
+/// read the bottom pixel row instead, which says nothing about any of them and
+/// stayed green with their graceful behavior reverted.
+///
+/// **All four are init's children and nothing supervises them**, so the message
+/// is the entire diagnostic and its absence is the whole defect — which is why
+/// each is asserted by its own text rather than by anything surviving.
 ///
 /// First in its group, and that is the assertion talking: `cursor == frames`
 /// and the stats line are read off a desktop no client has connected to yet.
@@ -2576,10 +2582,11 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
     // init spawns all four programs without waiting, so test-runner's
     // ready marker races the daemons' own lines. Keep draining until
     // every line has been said or the window closes.
-    const WANT: [&str; 3] = [
+    const WANT: [&str; 4] = [
         "compositor: ready",
         "soundd: no audio device, presenting a null sink",
         "netd: no NIC on this machine, exiting",
+        "sshd: no network on this machine, exiting",
     ];
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while std::time::Instant::now() < deadline
