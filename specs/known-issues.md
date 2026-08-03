@@ -1263,7 +1263,32 @@ refactor in it while this was written.
 caller. A freeze with `kernel/src/fd.rs:390` in either line is this, confirmed
 from the machine rather than from the code.
 
-### The decoded input queues are unbounded, so a wedged consumer grows the kernel heap
+### CLOSED — the decoded input queues are unbounded, so a wedged consumer grows the kernel heap
+
+Both halves are closed by the input-architecture rework. `keyboard::MAX_QUEUED_EVENTS`
+and `mouse::MAX_QUEUED_EVENTS` are 512 each, **drop-oldest**: what is worth
+keeping when nobody is reading is what was typed most recently, and a queue
+that refused new events instead would answer the eventual reader with the
+first 512 transitions after it stopped and none of the ones since. Both are
+one `pop_front` in the one queueing function each file has, so there is no
+push site that can miss the bound. `RawKeyEvent` is two bytes now, so the
+keyboard's ceiling is 1 KiB.
+
+The replay half is closed by `device::try_claim`, which calls
+`keyboard::discard_queued`/`mouse::discard_queued` the moment the device
+changes hands: what was typed while nobody held it belongs to nobody, and a
+compositor restarted mid-sentence must not open with the tail of what was
+being typed into the one that died. Discarding at *claim* rather than at
+release also covers a process that died holding it.
+
+What is still true and not fixed: nothing counts the drops. A counter nothing
+reads is dead code, and the diagnostics roadmap's layer 1 is where a real one
+belongs.
+
+---
+
+The original entry, kept because the reasoning about the two stages is still
+the map of this path:
 
 Found while answering "where do the keystrokes go while the compositor is
 wedged", which is the question the T14 freeze (§1) raises and nothing in the
@@ -1301,6 +1326,32 @@ uncounted.** Recorded rather than fixed — the bound is policy (what a queue
 that nobody is draining is *for*), and the second question every bound owes
 is what the producer sees when it is hit, which for an ISR-fed decode path
 is a decision about the drop counter's shape and not a one-liner.
+
+### CLOSED — `io_uring::remove_fd` selected pending polls by *fd number*, across processes
+
+A server that polled its listener and then blocked in `accept` with nothing
+queued, forever. Found in the layout wizard's gate; the compositor has exactly
+the same shape and was one fd number away from the same freeze.
+
+`fd::close` calls `io_uring::remove_fd(fd, &sources)`. The rings it reaches are
+found by walking the *source's* watcher list, which is right and is the whole
+point: a socket's peer is in another process. It then removed pending polls
+whose `fd_num` matched — but `fd_num` is the **closing process's** numbering,
+which means nothing in the ring it was applied to. So a client exiting with its
+connection on fd 3 posted `-NotFound` for whatever the server had on *its* fd 3.
+
+In the gate that was the surface host's listener: the wizard exits, the host's
+listener poll is cancelled with a completion, the host reads that as readiness,
+calls `accept` with an empty queue and never returns. It reproduced every run
+and looked like a hang in the new IPC rather than a five-year-old line in the
+kernel.
+
+Fixed by selecting on the source rather than the fd number: a pending poll is
+cancelled iff it is watching one of the sources that is going away. Distinct
+`Source` variants for the two directions of one pipe mean the peer's
+writability poll is not cancelled by a reader's close, which is what the
+fd-number filter accidentally got right for same-process fds and wrong for
+everything else.
 
 ### A keyboard that resets behind our back is undetectable on the PS/2 wire
 
@@ -2747,37 +2798,33 @@ PMM path a `slice()` method like `OwnedAlloc`'s, sized from the allocation they
 own, then make `from_raw` private to `mm` or delete it. The loader and DmaPool
 stop naming sizes at all.
 
-### Nothing can ask which keyboard layout is active
+### Nothing can ask which layout a *surface* is translating with
 
-`SYS_SET_KEYBOARD_LAYOUT` (23) is write-only, and there is no read counterpart.
-`toybox locale` can therefore list what exists — it reads `toyos_keymap::LAYOUTS`,
-the same table the kernel selects from, so the list cannot drift — but it cannot
-print which one is in force. `specs/introspection-plan.md` §1 reserves `SYS_QUERY`
-for exactly this shape of question and it is not built; adding a one-off read
-syscall for the layout would be the thing that plan exists to prevent. Two things
-sit behind it: `locale` printing "current", and the interactive menu opening on
-the active entry rather than always on the first.
+Half of this closed with the input rework and the half that is left changed
+shape. `SYS_SET_KEYBOARD_LAYOUT` is deleted; the layout is
+`toyos::surface::LAYOUT_CONFIG`, a file, and anything may read it — so `locale`
+could print the configured name today, and the interactive menu could open on
+it. That is a small piece of work nobody has done.
 
-Recorded 2026-08-03 with the de_CH layout work; the ABI was left alone
-deliberately.
+What no file can answer is what each *translator* is actually using. There is
+one per surface and each re-reads the config when its host says so, so a
+terminal that missed the notification disagrees with the file and nothing can
+see it. `specs/introspection-plan.md` §1's `SYS_QUERY` is still the shape that
+answers "what is this process holding", and it is still not built.
 
-### `locale detect` cannot run under the compositor or `/bin/console`
+### CLOSED — `locale detect` cannot run under the compositor or `/bin/console`
 
-The wizard reads `RawKeyEvent::keycode`, the pre-layout HID usage, off the
-keyboard device — the only place a *pre-layout* code exists in userland. That
-needs no new syscall: the field has always crossed the boundary. But the device
-is claimed exclusively (`kernel/src/device.rs`'s `try_claim`), and both the
-compositor and `/bin/console` hold it for their whole run, so under a desktop or
-a console boot the wizard refuses by name and tells the user to pick a layout
-instead. `locale_detect_refuses_a_held_keyboard` gates the refusal.
+Closed by `toyos::surface`, the channel a surface owner serves to its children:
+a child asks for raw transitions, the host grants or refuses, and while the
+grant is held the surface stops translating. The entry's own diagnosis was that
+the terminal is what loses the usages, and that closing it meant "a way for a
+terminal client to ask for raw usages" — which is what this is.
 
-The compositor *does* forward the whole `KeyEvent`, `keycode` included, to the
-focused window (`MSG_KEY_INPUT`), so a windowed client can already see raw
-usages. What loses them is the terminal: `userland/terminal/src/main.rs` writes
-only `event.translated` into the shell's stdin, so anything running in a terminal
-sees the layout's output and never the key. Closing this means either a way for a
-terminal client to ask for raw usages, or a keyboard claim that can be lent for
-the duration of a wizard. Both are protocol decisions, not local fixes.
+`locale_detect` (the wizard under a host that holds the keyboard),
+`console_locale_detect` (under `/bin/console`) and `desktop_locale_detect`
+(under `/bin/terminal`, three processes below the compositor) are the gates.
+The last two also assert that the layout the wizard chose is in force
+afterwards: the key a US board prints `[` on types `ü`.
 
 ### The console font cannot draw most of the Swiss German AltGr layer
 
@@ -2794,14 +2841,16 @@ list, not a code change. `legends_are_renderable` in
 `toyos-keymap/tests/detect.rs` keeps the wizard's own prompts inside the covered
 range, and it is the only thing that does.
 
-### `locale <name>` persists, `locale detect` does not
+### CLOSED — `locale <name>` persists, `locale detect` does not
 
-`set()` writes `/home/root/.config/keyboard_layout`, which `locale --load` replays
-from `system.toml`'s init line. The wizard deliberately does not write it — the
-approved scope for it is runtime-only — so confirming a detected layout and
-rebooting gives the default back, while typing the same name by hand sticks. The
-inconsistency is real and the owner's to settle: either the wizard writes it too,
-or persistence moves out of `locale` entirely when the config store lands.
+Both write `toyos::surface::LAYOUT_CONFIG` now, through one `set()`, and neither
+tells a translator *which* layout to use — each is told the file moved and
+re-reads it, so two surfaces cannot hold different answers to a question the
+user asked once. `locale --load` is gone with the init line that ran it: there
+is nothing to load into, because a translator reads the config when it starts.
+
+The `/home` caveat is unchanged and still true: it is tmpfs on the T14, so the
+choice survives a login and not a reboot.
 
 ---
 
