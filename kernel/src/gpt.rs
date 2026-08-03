@@ -115,6 +115,19 @@ pub fn boot_volume() -> Option<Volume> {
     }
 }
 
+/// Whether looking at another disk could still produce a boot volume.
+///
+/// Three states, two answers, and the distinction is the whole point:
+/// `Unknown` means nothing has carried the partition *yet*, which a disk that
+/// has not finished enumerating can still change; `Ambiguous` means two devices
+/// carry it and nothing on this side can say which, which a third device cannot
+/// repair. A caller that waits for a late disk has to be able to tell them
+/// apart, or it spends its whole ceiling waiting for something that cannot
+/// happen — and `boot_volume()` answers `None` to both.
+pub fn boot_volume_still_possible() -> bool {
+    matches!(*RESOLVED.lock(), Resolution::Unknown)
+}
+
 /// Where the log partition is, on the device that carries the boot partition.
 pub fn log_volume() -> Option<Volume> {
     match *RESOLVED.lock() {
