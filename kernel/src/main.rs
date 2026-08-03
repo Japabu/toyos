@@ -45,6 +45,7 @@ mod loader;
 mod scheduler;
 mod sched;
 mod hw;
+mod iommu;
 mod preempt;
 mod irq_ring;
 mod trace;
@@ -346,6 +347,11 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         .expect("ACPI: failed to find ECAM base address");
     let ecam = mm::paging::kernel().lock().as_mut().unwrap().map_mmio(ecam_base, 256 * 32 * 8 * 4096);
     let pci_devices = pci::enumerate(&ecam);
+    // After ACPI is readable and PCI is enumerable, before any driver `init`:
+    // the unit has to be programmed before the first device is told to do DMA
+    // (`specs/iommu-spec.md` §2.1). Nothing is programmed yet — this stage
+    // inventories the machine and describes it, and refuses nothing.
+    iommu::init(kernel_args.rsdp_addr);
     file_cache::init();
     gpt::init(kernel_args);
 
