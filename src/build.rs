@@ -7,6 +7,7 @@ use std::time::UNIX_EPOCH;
 use serde::Deserialize;
 
 use crate::assets;
+use crate::buildlock;
 use crate::image;
 use crate::toolchain;
 
@@ -107,61 +108,83 @@ fn external_fingerprint(root: &Path) -> String {
     entries.join("\n")
 }
 
-/// Ensure a crate's build artifacts are fresh. If stale, run `cargo clean`.
-fn ensure_fresh(crate_dir: &Path, fingerprint: &str) {
+/// How much of a crate's target directory goes when the external deps change.
+#[derive(Clone, Copy)]
+enum Clean {
+    All,
+    /// Crates with explicit paths (toyos-ld, toyos-cc) also have host builds
+    /// that must survive: the host toyos-ld *is* the cross linker.
+    ToyosOnly,
+}
+
+fn stale(crate_dir: &Path, fingerprint: &str) -> bool {
     let stamp = crate_dir.join("target/.deps-stamp");
-    if stamp.exists() {
-        if let Ok(stored) = fs::read_to_string(&stamp) {
-            if stored == fingerprint {
-                return;
+    fs::read_to_string(&stamp).map_or(true, |stored| stored != fingerprint)
+}
+
+fn clean(crate_dir: &Path, kind: Clean, fingerprint: &str) {
+    match kind {
+        Clean::All => {
+            eprintln!("external deps changed: cleaning {}", crate_dir.display());
+            let _ = Command::new("cargo")
+                .arg("clean")
+                .current_dir(crate_dir)
+                .status();
+        }
+        Clean::ToyosOnly => {
+            let toyos_dir = crate_dir.join("target/x86_64-unknown-toyos");
+            if toyos_dir.exists() {
+                eprintln!("external deps changed: cleaning {}", toyos_dir.display());
+                fs::remove_dir_all(&toyos_dir).ok();
             }
         }
     }
 
-    eprintln!("external deps changed: cleaning {}", crate_dir.display());
-    let _ = Command::new("cargo")
-        .arg("clean")
-        .current_dir(crate_dir)
-        .status();
-
     fs::create_dir_all(crate_dir.join("target")).ok();
-    fs::write(&stamp, fingerprint).ok();
+    fs::write(crate_dir.join("target/.deps-stamp"), fingerprint).ok();
 }
 
-/// Like ensure_fresh but only cleans the ToyOS cross-compilation target,
-/// preserving host builds (e.g. the toyos-ld host binary used as the linker).
-fn ensure_fresh_toyos_only(crate_dir: &Path, fingerprint: &str) {
-    let stamp = crate_dir.join("target/.deps-stamp");
-    if stamp.exists() {
-        if let Ok(stored) = fs::read_to_string(&stamp) {
-            if stored == fingerprint {
-                return;
+/// Drop the target directories the changed external deps invalidated.
+///
+/// Deciding and acting under one exclusive section is the whole point. Each of
+/// these cleans removes a tree another builder may be compiling into, and
+/// cargo's own lock cannot cover it — the lock lives at
+/// `target/<profile>/.cargo-lock`, inside what the clean deletes. Two processes
+/// that each decided before either acted would still both clean, which is the
+/// pair of `cargo clean`s that died with ENOENT on each other's files.
+fn invalidate_stale(root: &Path, lock: &mut buildlock::Held, targets: &[(PathBuf, Clean)]) {
+    lock.act_if(
+        "clean crate targets against changed external deps",
+        || {
+            let fp = external_fingerprint(root);
+            let work: Vec<(PathBuf, Clean)> = targets
+                .iter()
+                .filter(|(dir, _)| stale(dir, &fp))
+                .cloned()
+                .collect();
+            (!work.is_empty()).then_some((fp, work))
+        },
+        |(fp, work)| {
+            for (dir, kind) in work {
+                clean(&dir, kind, &fp);
             }
-        }
-    }
-
-    let toyos_dir = crate_dir.join("target/x86_64-unknown-toyos");
-    if toyos_dir.exists() {
-        eprintln!("external deps changed: cleaning {}", toyos_dir.display());
-        fs::remove_dir_all(&toyos_dir).ok();
-    }
-
-    fs::create_dir_all(crate_dir.join("target")).ok();
-    fs::write(&stamp, fingerprint).ok();
+        },
+    );
 }
 
-/// Invalidate all crates referenced by a config.
-fn invalidate_stale(root: &Path, config: &SystemConfig, fp: &str) {
-    ensure_fresh(&root.join("kernel"), fp);
-    ensure_fresh(&root.join("bootloader"), fp);
-    ensure_fresh(&root.join("userland"), fp);
+/// Every crate a config builds into, and how much of each goes when stale.
+fn config_targets(root: &Path, config: &SystemConfig) -> Vec<(PathBuf, Clean)> {
+    let mut targets = vec![
+        (root.join("kernel"), Clean::All),
+        (root.join("bootloader"), Clean::All),
+        (root.join("userland"), Clean::All),
+    ];
     for (name, cfg) in &config.programs {
         if !cfg.is_workspace_member() {
-            // Crates with explicit paths (e.g. toyos-ld, toyos-cc) may also have
-            // host builds we must preserve. Only clean the ToyOS target.
-            ensure_fresh_toyos_only(&cfg.crate_dir(root, name), fp);
+            targets.push((cfg.crate_dir(root, name), Clean::ToyosOnly));
         }
     }
+    targets
 }
 
 // --- Cargo helpers ---
@@ -231,41 +254,9 @@ fn cargo_build(
 // was never spawned and the test failed as though the daemon under test were
 // broken.
 //
-// So: hold a lock across each build→stage pair, and copy the artifact to a name
-// carrying what it is actually keyed by. Readers use the staged name, which no
-// other config can overwrite.
-
-/// Advisory lock over the shared cargo artifact paths.
-///
-/// `flock` is released by the kernel on process exit, so a killed builder cannot
-/// strand it — which a lock file with a PID in it could.
-struct ArtifactLock {
-    /// Never read: the lock is released when this `File` closes, so holding it
-    /// *is* the lock. Dropping the field would release on acquire.
-    _file: fs::File,
-}
-
-impl ArtifactLock {
-    fn acquire(root: &Path) -> Self {
-        let path = root.join("target/.artifact-lock");
-        fs::create_dir_all(root.join("target")).ok();
-        let file = fs::File::create(&path)
-            .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            unsafe extern "C" {
-                fn flock(fd: i32, operation: i32) -> i32;
-            }
-            const LOCK_EX: i32 = 2;
-            // SAFETY: `file` owns the fd for the duration of this call and the
-            // returned guard.
-            let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
-            assert_eq!(rc, 0, "flock on {} failed", path.display());
-        }
-        Self { _file: file }
-    }
-}
+// So: hold [`buildlock::artifact`] across each build→stage pair, and copy the
+// artifact to a name carrying what it is actually keyed by. Readers use the
+// staged name, which no other config can overwrite.
 
 fn key_hash(parts: &[&str]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -277,8 +268,8 @@ fn key_hash(parts: &[&str]) -> u64 {
 }
 
 /// Copy a just-built artifact to a path carrying its build key, and return that
-/// path. Must be called with [`ArtifactLock`] held, before anything else can
-/// rebuild the same crate.
+/// path. Must be called with [`buildlock::artifact`] held, before anything else
+/// can rebuild the same crate.
 fn stage_artifact(root: &Path, built: &Path, stem: &str, key: u64) -> PathBuf {
     let staged = root.join(format!("target/{stem}-{key:016x}"));
     fs::create_dir_all(root.join("target")).ok();
@@ -437,13 +428,23 @@ impl Boot {
 }
 
 /// Full build: kernel, bootloader, all programs, boot image. Returns the image.
-pub fn build(root: &Path, debug: bool, release: bool, boot: Boot) -> PathBuf {
+pub fn build(
+    root: &Path,
+    debug: bool,
+    release: bool,
+    boot: Boot,
+    rebuild_toolchain: bool,
+) -> PathBuf {
+    // Held until the last staged artifact has been read back, so no other
+    // agent's clean or toolchain rebuild can land inside this build.
+    let mut lock = buildlock::shared(root, "build");
+    toolchain::ensure(root, rebuild_toolchain, &mut lock);
+
     let profile = if release { "release" } else { "debug" };
     let path_env = toolchain::path_with_toyos_ld(root);
     let config = parse_config(&root.join(boot.config()));
-    let fp = external_fingerprint(root);
 
-    invalidate_stale(root, &config, &fp);
+    invalidate_stale(root, &mut lock, &config_targets(root, &config));
 
     let init_programs = config.init.join(";");
     let kernel_features = if debug { "debug-wait" } else { "" };
@@ -451,7 +452,7 @@ pub fn build(root: &Path, debug: bool, release: bool, boot: Boot) -> PathBuf {
     // Same lock-and-stage as `build_test_image`: `cargo run --build-only` and
     // `cargo test` share these paths, so this races the harness too.
     let (kernel_art, bl_art) = {
-        let _lock = ArtifactLock::acquire(root);
+        let _artifact = buildlock::artifact(root);
         let kernel_handle = {
             let root = root.to_path_buf();
             let path_env = path_env.clone();
@@ -584,12 +585,15 @@ pub fn build_test_image(
     quiet: bool,
     extra_files: &[(String, Vec<u8>)],
 ) -> Vec<u8> {
-    crate::toolchain::ensure(root, false);
+    // Held to the end of the function: the staged artifacts below are read
+    // back after the userland build, and a clean landing in between is the
+    // same defect as one landing mid-compile.
+    let mut lock = buildlock::shared(root, "test image");
+    crate::toolchain::ensure(root, false, &mut lock);
     let path_env = toolchain::path_with_toyos_ld(root);
     let config = parse_config(config_path);
-    let fp = external_fingerprint(root);
 
-    invalidate_stale(root, &config, &fp);
+    invalidate_stale(root, &mut lock, &config_targets(root, &config));
 
     let init_programs = config.init.join(";");
     let features = kernel_features.join(",");
@@ -602,7 +606,7 @@ pub fn build_test_image(
     // deliberate: the userland build is long, takes no shared artifact path, and
     // the staged copies below are already immune to another config's rebuild.
     let (kernel_art, bl_art) = {
-        let _lock = ArtifactLock::acquire(root);
+        let _artifact = buildlock::artifact(root);
         cargo_build(
             &root.join("kernel"),
             "x86_64-unknown-none",
@@ -653,17 +657,18 @@ pub fn build_test_image(
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
 /// Also builds any cdylib subcrates and includes their .so files.
 pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(String, Vec<u8>)> {
-    crate::toolchain::ensure(root, false);
+    let mut lock = buildlock::shared(root, "test binaries");
+    crate::toolchain::ensure(root, false, &mut lock);
     let path_env = toolchain::path_with_toyos_ld(root);
-    let fp = external_fingerprint(root);
 
-    ensure_fresh(crate_path, &fp);
+    let mut targets = vec![(crate_path.to_path_buf(), Clean::All)];
     for entry in fs::read_dir(crate_path).into_iter().flatten().flatten() {
         let sub_path = entry.path();
         if sub_path.is_dir() && sub_path.join("Cargo.toml").exists() {
-            ensure_fresh(&sub_path, &fp);
+            targets.push((sub_path, Clean::All));
         }
     }
+    invalidate_stale(root, &mut lock, &targets);
 
     let mut results = Vec::new();
 

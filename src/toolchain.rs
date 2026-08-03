@@ -1,127 +1,167 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
+use crate::buildlock;
 use crate::stamps;
 
-#[allow(dead_code)]
-pub struct ChangeSet {
-    pub std_rebuilt: bool,
-    pub linker_changed: bool,
-    pub compiler_changed: bool,
+/// Which x.py build a stale toolchain needs.
+#[derive(Clone, Copy, PartialEq)]
+enum Bootstrap {
+    /// `invalidate_hosted` separates "the compiler changed" from "the rustup
+    /// link is missing". Only the first makes the ToyOS-hosted rustc stale, and
+    /// rebuilding that one costs minutes.
+    Full { invalidate_hosted: bool },
+    Std,
 }
 
-/// Ensure the toolchain is up to date. Returns a ChangeSet describing what changed.
-pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
+/// Ensure the toolchain is up to date.
+///
+/// Every step decides under the caller's shared lock and acts under the
+/// exclusive one, so the common answer — nothing to do — costs no
+/// serialisation, and two agents cannot both conclude the toolchain is stale
+/// and both start `x.py build` in the same directory. That pair is what left a
+/// half-written `librustc_driver` for cargo to probe, and cargo memoises a
+/// failed probe (known-issues §6).
+///
+/// The steps are ordered, and each invalidates what it makes stale rather than
+/// threading a `rebuilt` flag through: a step that decides for itself still
+/// decides correctly when the process before it was killed halfway.
+pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
     let rust_dir = root.join("rust");
     let stamps_dir = root.join("target/stamps");
     fs::create_dir_all(&stamps_dir).ok();
 
-    let toolchain_exists = Command::new("rustup")
-        .args(["run", "toyos", "rustc", "--version"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // Needed as the cross-linker for bootstrap and for every build.
+    let ld_src = root.join("toyos-ld/src");
+    let ld_stamp = stamps_dir.join("linker.stamp");
+    lock.act_if(
+        "build toyos-ld",
+        || {
+            (stamps::dir_changed(&ld_src, &ld_stamp) || !toyos_ld_binary(root).exists())
+                .then_some(())
+        },
+        |()| {
+            eprintln!("Building toyos-ld...");
+            build_toyos_ld(root);
+            stamps::write_dir_stamp(&ld_src, &ld_stamp);
+        },
+    );
+
+    // Used as a host tool by doom's build.rs.
+    let cc_src = root.join("toyos-cc/src");
+    let cc_inc = root.join("toyos-cc/include");
+    let cc_stamp = stamps_dir.join("toyos-cc.stamp");
+    let cc_inc_stamp = stamps_dir.join("toyos-cc-include.stamp");
+    lock.act_if(
+        "build toyos-cc",
+        || {
+            (stamps::dir_changed(&cc_src, &cc_stamp)
+                || stamps::dir_changed(&cc_inc, &cc_inc_stamp)
+                || !toyos_cc_binary(root).exists())
+            .then_some(())
+        },
+        |()| {
+            eprintln!("Building toyos-cc...");
+            build_toyos_cc(root);
+            stamps::write_dir_stamp(&cc_src, &cc_stamp);
+            stamps::write_dir_stamp(&cc_inc, &cc_inc_stamp);
+        },
+    );
 
     let compiler_stamp = stamps_dir.join("compiler.stamp");
     let std_stamp = stamps_dir.join("std.stamp");
     let abi_stamp = stamps_dir.join("abi.stamp");
     let net_stamp = stamps_dir.join("net.stamp");
-    let linker_stamp = stamps_dir.join("linker.stamp");
-    let compiler_changed = stamps::dir_changed(&rust_dir.join("compiler"), &compiler_stamp);
-    let std_changed = stamps::dir_changed(&rust_dir.join("library"), &std_stamp);
-    // toyos-abi and toyos are dependencies of std — changes require an std rebuild
-    let abi_changed = stamps::dir_changed(&root.join("toyos-abi/src"), &abi_stamp);
-    let net_changed = stamps::dir_changed(&root.join("toyos/src"), &net_stamp);
-    let linker_changed = stamps::dir_changed(&root.join("toyos-ld/src"), &linker_stamp);
-
-    // Ensure toyos-ld is built (needed as cross-linker for bootstrap and all builds)
-    let toyos_ld = toyos_ld_binary(root);
-    if linker_changed || !toyos_ld.exists() {
-        eprintln!("Building toyos-ld...");
-        build_toyos_ld(root);
-        stamps::write_dir_stamp(&root.join("toyos-ld/src"), &linker_stamp);
-    }
-
-    // Ensure toyos-cc is built as a host tool (used by doom's build.rs)
-    let cc_stamp = stamps_dir.join("toyos-cc.stamp");
-    let cc_src_changed = stamps::dir_changed(&root.join("toyos-cc/src"), &cc_stamp);
-    let cc_inc_stamp = stamps_dir.join("toyos-cc-include.stamp");
-    let cc_inc_changed = stamps::dir_changed(&root.join("toyos-cc/include"), &cc_inc_stamp);
-    let toyos_cc = toyos_cc_binary(root);
-    if cc_src_changed || cc_inc_changed || !toyos_cc.exists() {
-        eprintln!("Building toyos-cc...");
-        build_toyos_cc(root);
-        stamps::write_dir_stamp(&root.join("toyos-cc/src"), &cc_stamp);
-        stamps::write_dir_stamp(&root.join("toyos-cc/include"), &cc_inc_stamp);
-    }
-
-    let rebuilt = if !toolchain_exists || compiler_changed || force_rebuild {
-        eprintln!("Building full toolchain (this takes a while on first run)...");
-        full_bootstrap(root, &rust_dir);
-        stamps::write_dir_stamp(&rust_dir.join("compiler"), &compiler_stamp);
-        stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
-        stamps::write_dir_stamp(&root.join("toyos-abi/src"), &abi_stamp);
-        stamps::write_dir_stamp(&root.join("toyos/src"), &net_stamp);
-        true
-    } else if std_changed || abi_changed || net_changed {
-        // Fast path: only rebuild std
-        eprintln!("Rebuilding std (fast path)...");
-        rebuild_std(root, &rust_dir);
-        stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
-        stamps::write_dir_stamp(&root.join("toyos-abi/src"), &abi_stamp);
-        stamps::write_dir_stamp(&root.join("toyos/src"), &net_stamp);
-        true
-    } else {
-        false
-    };
-
-    // Ensure hosted rustc (ToyOS binary) is up to date.
-    // Only invalidate when the compiler changed — std-only changes are picked up
-    // by rebuild_std which updates the sysroot libraries that hosted rustc uses.
     let hosted_stamp = stamps_dir.join("hosted-rustc.stamp");
-    if compiler_changed || force_rebuild {
-        let _ = fs::remove_file(&hosted_stamp);
-    }
+    let libc_stamp = stamps_dir.join("toyos-libc.stamp");
+    // toyos-abi and toyos are dependencies of std — changes require an std rebuild.
+    let abi_src = root.join("toyos-abi/src");
+    let net_src = root.join("toyos/src");
+    lock.act_if(
+        "build the rust toolchain",
+        || {
+            let toolchain_exists = Command::new("rustup")
+                .args(["run", "toyos", "rustc", "--version"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if stamps::dir_changed(&rust_dir.join("compiler"), &compiler_stamp) || force_rebuild {
+                Some(Bootstrap::Full { invalidate_hosted: true })
+            } else if !toolchain_exists {
+                Some(Bootstrap::Full { invalidate_hosted: false })
+            } else if stamps::dir_changed(&rust_dir.join("library"), &std_stamp)
+                || stamps::dir_changed(&abi_src, &abi_stamp)
+                || stamps::dir_changed(&net_src, &net_stamp)
+            {
+                Some(Bootstrap::Std)
+            } else {
+                None
+            }
+        },
+        |kind| {
+            match kind {
+                Bootstrap::Full { .. } => {
+                    eprintln!("Building full toolchain (this takes a while on first run)...");
+                    full_bootstrap(root, &rust_dir);
+                    stamps::write_dir_stamp(&rust_dir.join("compiler"), &compiler_stamp);
+                }
+                Bootstrap::Std => {
+                    eprintln!("Rebuilding std (fast path)...");
+                    rebuild_std(root, &rust_dir);
+                }
+            }
+            stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
+            stamps::write_dir_stamp(&abi_src, &abi_stamp);
+            stamps::write_dir_stamp(&net_src, &net_stamp);
+            if kind == (Bootstrap::Full { invalidate_hosted: true }) {
+                let _ = fs::remove_file(&hosted_stamp);
+            }
+            // The sysroot rlibs were replaced: toyos-libc's archive and its
+            // cross artifacts were compiled against the ones that are gone, and
+            // cargo judges them fresh against source that has not changed.
+            let _ = fs::remove_file(&libc_stamp);
+            let _ = fs::remove_dir_all(root.join("userland/libc/target/x86_64-unknown-toyos"));
+        },
+    );
+
     let hosted_rustc = rust_dir.join("build/x86_64-unknown-toyos/stage2/bin/rustc");
-    if !hosted_stamp.exists() || !hosted_rustc.exists() {
-        let toyos_ld = toyos_ld_binary(root);
-        build_hosted_rustc(&rust_dir, &toyos_ld);
-        assert!(hosted_rustc.exists(), "Failed to build hosted rustc");
-        fs::write(&hosted_stamp, "").unwrap();
-    }
+    lock.act_if(
+        "build the ToyOS-hosted rustc",
+        || (!hosted_stamp.exists() || !hosted_rustc.exists()).then_some(()),
+        |()| {
+            build_hosted_rustc(&rust_dir, &toyos_ld_binary(root));
+            assert!(hosted_rustc.exists(), "Failed to build hosted rustc");
+            fs::write(&hosted_stamp, "").unwrap();
+        },
+    );
 
-    let host = host_triple();
-    let stage2 = rust_dir.join(format!("build/{host}/stage2"));
-    link_toolchain(&stage2);
+    let stage2 = rust_dir.join(format!("build/{}/stage2", host_triple()));
+    lock.act_if(
+        "link the toyos rustup toolchain",
+        || link_stale(&stage2).then_some(()),
+        |()| run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]),
+    );
 
-    // Ensure the ToyOS sysroot has host target libraries so proc-macros can compile.
-    // This must happen before any cargo builds use the toolchain, otherwise cargo
-    // may fingerprint an incomplete sysroot on first run.
-    ensure_host_target_in_sysroot(root);
+    // Before any cargo build uses the toolchain, otherwise cargo may
+    // fingerprint an incomplete sysroot on first run.
+    lock.act_if(
+        "add the host target to the ToyOS sysroot",
+        || host_target_missing(root).then_some(()),
+        |()| link_host_target(root),
+    );
 
-    // Ensure toyos-libc is built and installed in the sysroot.
-    // Invalidate stamp when toolchain was rebuilt (sysroot rlibs replaced).
-    // Its own cross artifacts go too: they were compiled against the sysroot
-    // that was just replaced, and cargo judges them fresh against source that
-    // has not changed.
-    if rebuilt {
-        let _ = fs::remove_file(stamps_dir.join("toyos-libc.stamp"));
-        let _ = fs::remove_dir_all(root.join("userland/libc/target/x86_64-unknown-toyos"));
-    }
-    crate::libc::ensure(root, &rust_dir);
-
-    ChangeSet {
-        std_rebuilt: rebuilt,
-        linker_changed,
-        compiler_changed,
-    }
+    lock.act_if(
+        "build toyos-libc for the sysroot",
+        || crate::libc::stale(root, &rust_dir).then_some(()),
+        |()| crate::libc::build(root, &rust_dir),
+    );
 }
 
-/// Point the `toyos` rustup toolchain at `stage2`, but only if it does not
-/// already.
+/// Whether the `toyos` rustup toolchain points anywhere other than `stage2`.
 ///
 /// `rustup toolchain link` unlinks and recreates the symlink rather than
 /// replacing it atomically, so every call opens a window in which
@@ -138,20 +178,15 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
 ///
 /// A mismatched or absent link still re-links, so a moved tree or a fresh clone
 /// behaves as before; only the no-op case is skipped.
-fn link_toolchain(stage2: &Path) {
+fn link_stale(stage2: &Path) -> bool {
     let rustup_home = std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".rustup")));
 
-    if let Some(home) = rustup_home {
-        if let Ok(current) = fs::read_link(home.join("toolchains/toyos")) {
-            if current == stage2 {
-                return;
-            }
-        }
-    }
-
-    run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]);
+    let Some(home) = rustup_home else {
+        return true;
+    };
+    fs::read_link(home.join("toolchains/toyos")).map_or(true, |current| current != stage2)
 }
 
 fn full_bootstrap(root: &Path, rust_dir: &Path) {
@@ -316,16 +351,25 @@ fn build_toyos_cc(root: &Path) {
     assert!(status.success(), "toyos-cc build failed");
 }
 
+/// The host triple, asked of rustc once per process.
+///
+/// Every path built from it calls this, so an uncached one spent about seven
+/// `rustc --version --verbose` spawns per build call — 0.118 s each, measured —
+/// and they fell inside the windows the build lock now covers.
 pub fn host_triple() -> String {
-    let output = Command::new("rustc")
-        .args(["--version", "--verbose"])
-        .output()
-        .expect("Failed to run rustc");
-    let text = String::from_utf8(output.stdout).unwrap();
-    text.lines()
-        .find(|l| l.starts_with("host:"))
-        .map(|l| l.strip_prefix("host: ").unwrap().to_string())
-        .expect("Could not determine host triple")
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let output = Command::new("rustc")
+            .args(["--version", "--verbose"])
+            .output()
+            .expect("Failed to run rustc");
+        let text = String::from_utf8(output.stdout).unwrap();
+        text.lines()
+            .find(|l| l.starts_with("host:"))
+            .map(|l| l.strip_prefix("host: ").unwrap().to_string())
+            .expect("Could not determine host triple")
+    })
+    .clone()
 }
 
 /// PATH with toyos-ld's build directory prepended, so rustc finds it for linking.
@@ -338,16 +382,17 @@ pub fn path_with_toyos_ld(root: &Path) -> String {
     }
 }
 
-fn ensure_host_target_in_sysroot(root: &Path) {
-    let host = host_triple();
+/// Whether the ToyOS sysroot is missing the host target proc-macros compile against.
+fn host_target_missing(root: &Path) -> bool {
     let toyos_sysroot = root.join("rust/build/x86_64-unknown-toyos/stage2/lib/rustlib");
-    if !toyos_sysroot.exists() {
-        return;
-    }
-    let host_target_dir = toyos_sysroot.join(&host);
-    if host_target_dir.exists() {
-        return;
-    }
+    toyos_sysroot.exists() && !toyos_sysroot.join(host_triple()).exists()
+}
+
+fn link_host_target(root: &Path) {
+    let host = host_triple();
+    let host_target_dir = root
+        .join("rust/build/x86_64-unknown-toyos/stage2/lib/rustlib")
+        .join(&host);
 
     let output = Command::new("rustc")
         .args(["--print", "sysroot"])
@@ -363,7 +408,6 @@ fn ensure_host_target_in_sysroot(root: &Path) {
         source.display()
     );
 
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&source, &host_target_dir).unwrap_or_else(|e| {
         panic!(
             "Failed to symlink {} -> {}: {}",
@@ -372,8 +416,6 @@ fn ensure_host_target_in_sysroot(root: &Path) {
             e
         )
     });
-    #[cfg(not(unix))]
-    panic!("Symlinking host target not supported on this platform");
 }
 
 fn run(cmd: &str, args: &[&str]) {

@@ -6,3 +6,4 @@ assets/timgm6mb.sf2
 .DS_Store
 phosphor-icons
 .cargo/config.toml
+.build-locks/

@@ -32,6 +32,10 @@ fn libc_archive_toyos() -> PathBuf {
             let target_dir = libc_dir.join("target");
             let archive = target_dir.join(format!("{target}/release/libtoyos_libc.a"));
 
+            // The toolchain phase drops this very directory when the sysroot is
+            // replaced, so this build has to be visible to it as a build.
+            let _lock = toyos_build::buildlock::shared(&repo_root(), "toyos-libc archive");
+
             let mut cmd = std::process::Command::new("cargo");
             for (key, _) in env::vars() {
                 if key.starts_with("CARGO") || key == "RUSTC" || key == "RUSTFLAGS" {

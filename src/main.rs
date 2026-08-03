@@ -88,11 +88,9 @@ fn main() {
 
     toyos_build::ensure_submodules(&root);
 
-    // Ensure toolchain is up to date
-    toyos_build::toolchain::ensure(&root, rebuild_toolchain);
-
-    // Build everything
-    let image = toyos_build::build::build(&root, debug, release, boot);
+    // Toolchain included: `build` holds the build lock across both, so no other
+    // agent's clean or bootstrap can land between the two.
+    let image = toyos_build::build::build(&root, debug, release, boot, rebuild_toolchain);
     println!("Build finished.");
     println!("Boot image: {}", image.display());
 

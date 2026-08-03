@@ -1,25 +1,34 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::stamps;
 use crate::toolchain::host_triple;
 
-/// Ensure toyos-libc is built and installed as libtoyos_c.a in the sysroot.
-pub fn ensure(root: &Path, rust_dir: &Path) {
-    let libc_src = root.join("userland/libc/src");
-    let stamp = root.join("target/stamps/toyos-libc.stamp");
+/// The source, the stamp, and the archive in the sysroot.
+fn paths(root: &Path, rust_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let host = host_triple();
-    let sysroot_lib = rust_dir.join(format!(
-        "build/{host}/stage2/lib/rustlib/x86_64-unknown-toyos/lib"
-    ));
-    let dest = sysroot_lib.join("libtoyos_c.a");
+    (
+        root.join("userland/libc/src"),
+        root.join("target/stamps/toyos-libc.stamp"),
+        rust_dir
+            .join(format!("build/{host}/stage2/lib/rustlib/x86_64-unknown-toyos/lib"))
+            .join("libtoyos_c.a"),
+    )
+}
 
-    let source_changed = stamps::dir_changed(&libc_src, &stamp);
+/// Whether the sysroot's `libtoyos_c.a` is missing or older than its source.
+///
+/// Separate from [`build`] because the caller asks this under the shared build
+/// lock and acts under the exclusive one.
+pub fn stale(root: &Path, rust_dir: &Path) -> bool {
+    let (libc_src, stamp, dest) = paths(root, rust_dir);
+    stamps::dir_changed(&libc_src, &stamp) || !dest.exists()
+}
 
-    if !source_changed && dest.exists() {
-        return;
-    }
+/// Build toyos-libc and install it as `libtoyos_c.a` in the sysroot.
+pub fn build(root: &Path, rust_dir: &Path) {
+    let (libc_src, stamp, dest) = paths(root, rust_dir);
 
     eprintln!("Building toyos-libc for sysroot...");
 
