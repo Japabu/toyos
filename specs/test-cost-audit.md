@@ -666,6 +666,101 @@ temp dir, so a guest still up when the next test booted took that boot's socket
 and it died before its first line. **That is the first thing §3.3 has to fix**,
 before any two boots can overlap.
 
+## 5.2 What wave 4 actually bought, and the number it cannot reach
+
+Landed 2026-08-03. The mechanism is §3.3's: per-boot images and per-worker
+scratch (#120), the `build_toyos_bins` race closed (#121), a `Sched` on every
+registration entry, a parallel phase, a serial tail, gate A alone.
+
+**Every figure below is one session against one HEAD**, both arms green, 238
+tests each, on the host §1's numbers were taken on.
+
+| width | suite | vs serial |
+|---:|---:|---:|
+| `--jobs 1` | **569.6 s** | — |
+| `--jobs 4` | **327.5 s** | **1.74×** |
+
+§3.3 modelled N=4 at 173 s and 3.5×. **It is 327.5 s and 1.74×, and the whole of
+the gap is that the model assumed a serial tail of nothing but audio.** The
+measured phases, from the per-test durations each log prints:
+
+| phase | tests | width 1 | width 4 |
+|---|---:|---:|---:|
+| parallel (sum of durations) | 69 | 428.3 s | 449.3 s |
+| parallel (wall) | 69 | 428.3 s | ~190 s |
+| serial tail | 165 | 103.1 s | 107.1 s |
+| gate A | 4 | 30.0 s | 30.0 s |
+
+Three findings, in the order they bite.
+
+**The serial tail is 137 s and no width touches it.** 103 s of tail plus 30 s of
+gate A is the floor of any run, so the two-minute target this wave was given is
+**not reachable by scheduling** — an infinitely wide parallel phase still lands
+near 140 s. What is in that 137 s is now a list rather than a feeling: the shared
+block (~20 s), twelve machine tests with a wall-clock margin (88 s), and gate A's
+four boots (30 s). Both remaining levers are the owner's, because both are
+coverage: gate A's four boots must be alone (§2d), and each tail entry is a test
+whose assertion is a margin. Nothing here should be moved to shorten a suite.
+
+**The parallel phase's floor is one test, exactly as §3.3 said, and it is a
+harder floor than §3.3 thought.** `screen_console_scroll` measured 108 s, 110 s
+and 116 s at widths 1, 4 and 8 — it barely moves, because what it waits on is the
+guest reaching a marker rather than host work. At width 4 the phase's 449 s of
+test time compresses to ~190 s of wall clock, a 2.4× on 4 workers, and the
+missing 1.6× is workers idling behind that one job. Two consequences: the queue
+now dispatches screen tasks first (a 110 s job picked up last leaves every other
+lane idle), and **cutting that test compounds with this wave more than §3.1
+compounded with it**.
+
+**Two classifications in §2d's snapshot were wrong, and the suite said so.**
+
+- `i8042_fadt_denial` is named in §2d for "compares two boots' guest `boot_millis`
+  with a 300 ms margin (`tests/toyos.rs:4535`)". That comparison is
+  `i8042_absent`'s and has been for some time; `i8042_fadt_denial` injects five
+  keys and asserts they arrive. Both are in the tail — the first on its margin,
+  the second because it is host-paced injection — but the *reason* matters for
+  the next person re-deriving the set.
+- **The shared block is timing-sensitive, and only running it wide showed it.**
+  It was declared `Sched::Parallel` on the grounds that its 5 and 10 second
+  ceilings are 50× a median under a tenth of a second. At width 4
+  `allocator_stress` went from 1 s to past its 5 s. A per-test wall-clock ceiling
+  *is* the tail's definition; the reasoning simply had the wrong median in it.
+  It cost 114 red of 238 to learn, because a timeout desynchronises every later
+  test on that boot — known-issues §6, and a defect that predates this work.
+- `xhci_second_controller` joins them on its own evidence: at width 4 its four
+  injected pointer events arrived and **all five keys were lost**, which reads
+  exactly like the defect it exists to catch. Host-paced injection has no flow
+  control, and a lost keystroke is indistinguishable from a driver that dropped
+  one. The other injection tests were green at width 4 and 8 and stay parallel;
+  this is the class to watch as the width rises.
+
+**The harness's own margins are margins on the host, and had to be re-derived.**
+`wait_for_ready`'s ten seconds were set when one guest had the machine; two boots
+exceeded it during this work, one of them in a phase running a *single* guest,
+because the tree runs 15–25 suites a day across several agents (§4). It is now
+ten seconds per guest the phase may have up, never fewer than two guests' worth.
+No test asserts on boot time by that clock — the two that assert on boot time
+read the guest's own stamps and are both in the tail.
+
+**Default width 4, and the honest reason it is not 8.** §4.1 constraint 3 gives
+14 cores against ~3 host threads a guest; 8 wide is 24 threads on 14 cores, and
+the one width-8 run this session that was not invalidated by an unrelated build
+refusal came in at 264.8 s — faster, on a tree whose shared block was still in the
+parallel phase, so not comparable to the 327.5 s above. The measured case for 8
+is therefore not made, and the case *against* is: every failure this work found
+was a wall-clock margin closing under contention, and 8 closes them further. The
+width is a flag; raise it deliberately and read §4.1 constraint 3 first.
+
+**What it does not preclude.** The width is a plain number handed to one work
+queue, so the global slot budget §4.1 constraint 3 asks for — a semaphore across
+worktrees rather than within one suite — has one place to go.
+
+**Ergonomic cost, unpriced by §3.3.** A test's evidence lines (`[i8042] …`,
+`[usb] …`) go straight to stderr, so at width 4 they interleave and lose their
+association with the test that printed them. The PASS/FAIL lines carry their own
+names and are unaffected. `--nocapture` prefixes each serial line with its boot's
+number for the same reason.
+
 ## 6. What this audit did not measure
 
 - The split of a machine test's time *above* the 3.7 s floor into guest work

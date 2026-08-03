@@ -6378,11 +6378,27 @@ fn main() {
     };
 
     // Everything that owns a boot, split by the one question its registration
-    // asks. MACHINE_TESTS keeps the plain-kernel names first and SCREEN_TESTS
-    // puts its three feature-carrying ones last; the queue is FIFO, so that
-    // ordering still keeps the kernel rebuilds at the end of each phase.
+    // asks.
+    //
+    // **The parallel phase takes the screen tests first, and that is the whole
+    // of the scheduling policy.** The longest job in the suite is
+    // `screen_console_scroll`, and its 108-116 s barely move with the width
+    // because what it waits on is the guest reaching a marker — so a worker that
+    // picks it up last leaves every other lane idle behind it. The serial tail
+    // keeps declaration order, where nothing overlaps and order buys nothing.
     let mut parallel: Vec<Task> = Vec::new();
     let mut serial: Vec<Task> = Vec::new();
+    let machine = machine_tasks(&machine_to_run);
+    for (name, sched) in &screen_to_run {
+        if *sched == Sched::Parallel {
+            parallel.push(Task::Screen(name));
+        }
+    }
+    for (sched, names) in &machine {
+        if *sched == Sched::Parallel {
+            parallel.push(Task::Machine(names.clone()));
+        }
+    }
     if !tests_to_run.is_empty() {
         eprintln!(
             "[toyos] The shared boot carries {} C + {} Rust binaries",
@@ -6395,18 +6411,14 @@ fn main() {
             Sched::Serial => serial.push(task),
         }
     }
-    for (sched, names) in machine_tasks(&machine_to_run) {
-        let task = Task::Machine(names);
-        match sched {
-            Sched::Parallel => parallel.push(task),
-            Sched::Serial => serial.push(task),
+    for (sched, names) in &machine {
+        if *sched == Sched::Serial {
+            serial.push(Task::Machine(names.clone()));
         }
     }
     for (name, sched) in &screen_to_run {
-        let task = Task::Screen(name);
-        match sched {
-            Sched::Parallel => parallel.push(task),
-            Sched::Serial => serial.push(task),
+        if *sched == Sched::Serial {
+            serial.push(Task::Screen(name));
         }
     }
 
