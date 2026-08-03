@@ -39,7 +39,9 @@ The name has no meaning. This is not a hobby project. The quality bar is the sam
 
 **Storage** — `block::BlockDevice` is the one device interface, in whole 4 KiB blocks, and **every method is fallible**: a failed read must not be indistinguishable from data. NVMe and USB mass storage implement it, which is how a machine that boots off a stick can read the stick. **A device's own numbers are untrusted** — checked, and the device refused by name, never truncated to fit. **An optional command's refusal is an answer, not a device failure.** And **an error path that logs is an error path that produces work for the thing that failed**, so a log sink's own failures disable it rather than logging. **`FileBacking::read_page` is fallible for the same reason** — a page the device would not give back is not a page of zeros, so the file cache refuses a partial write into one rather than merging and flushing it back over the file.
 
-**Input** — One held-set and one button-merge for the whole machine, so two keyboards or two pointers compose rather than contradict. Sources are numbered where they bind, never by an index a device or controller supplies. USB HID and PS/2 both feed it in HID usage codes; wire decoding is `toyos-ps2/`.
+**Input** — One held-set and one button-merge for the whole machine, so two keyboards or two pointers compose rather than contradict. Sources are numbered where they bind, never by an index a device or controller supplies, and given back when the device is unplugged — `mouse::unbind` is the only thing that frees one and it clears the buttons first. USB HID and PS/2 both feed it in HID usage codes; wire decoding is `toyos-ps2/`.
+
+**USB hotplug** — a device plugged in after boot enumerates and one pulled is torn down, off the Port Status Change Event through a per-port state machine stepped from `poll_if_pending`. **Its debounce and its port reset must never be waited on there**: that is the top of every scheduler pass, and 100 ms of USB 2.0 §7.1.7.3 or a T14 root port's 55 ms would empty the audio pipeline on every plug. Teardown order — input source, Disable Slot, pool block — is not a preference. An unplugged disk keeps its index and loses everything else, because a mount holds its handle for life.
 
 **PCI** — drivers select from an enumerated list, so whether one takes the first match or all of them is visible at the call site. A first-match helper hides that choice, which is how a machine with two identical controllers ends up with one driven.
 
@@ -198,6 +200,6 @@ Read the spec before touching the subsystem it covers.
 Four bite an agent who is *not* working on the subsystem:
 
 - **Gate A can fail a run on `drains` alone**, with no gap and no underrun. A per-run failure should require evidence of harm.
-- **`log_file`'s flush is unbounded and uninterruptible, in `idle_loop` before `pass()`.** Anything added to the idle loop is an audio change, and userland `println!` shares that ring.
+- **`log_file`'s flush is unbounded and uninterruptible, in `idle_loop` before `pass()`.** Anything added to the idle loop is an audio change, and userland `println!` shares that ring. The pre-`hlt` recheck beside it now has four conditions that only a deferred-callback facility would remove; xHCI's is the one that holds an idle CPU awake for as long as 100 ms.
 - **The fork estate is outside every check the tree runs on itself.** "I enumerated the call sites" is only true if the enumeration covered `~/.cargo/git/checkouts/`.
 - **A filtered C-test run can be red for a daemon's line rather than for its own output.** `cargo test -- <name>` opens one capture window, soundd's boot lines land in it, and that family compares whole stdout. Judge it from a full run.
