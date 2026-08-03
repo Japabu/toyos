@@ -2782,6 +2782,50 @@ host, it **passes** — a 233/233 full run at `da3d333` has it green in 10 s. Th
 6 ms is spent either way and the gate still turns on how loaded the machine is,
 which is the entry's own point. What I2 changes is only how much load it takes.
 
+**Closed in `73d9f0c`**, by the arithmetic this entry asked for. Both instants
+now come off the guest's boot clock, which is the clock `read_portsc` is written
+in, and the one assertion became three: a floor at `SLOW_CONNECT_NS +
+PORT_DEBOUNCE_NS` that a slower boot can only move *later*; a ceiling 150 ms
+above it, for the settle that leaves by `EMPTY_BUS_NS` at ~1.1 s instead of on
+the device appearing; and the non-vacuity guard the old form had by accident and
+never named — the controller must start inside the window, or nothing in the
+boot read a hidden port at all.
+
+What was `started ≤ 100 ms` with the boot at 0.103-0.127 is now `started <
+300 ms`, so the IOMMU's 6 ms buys back none of a margin that no longer exists.
+Measured over six runs, three of them with four concurrent test processes on the
+host: `controller started` 0.104-0.127 s, first port line 0.400-0.402 s against
+a floor of 0.400 and a ceiling of 0.550. Concurrency moved the first line by
+1 ms, which is the point of measuring it on the guest's clock.
+
+The residue, for whoever sees this red next: the guard *is* load-sensitive, with
+~173 ms of headroom rather than the 3 ms the old form had. It fails by naming
+the fix — widen `SLOW_CONNECT_NS`, because the thing that would be too small is
+the injection window and not the gate's margin.
+
+### `build_toyos_bins` reads a `.so` another build is replacing
+
+`src/build.rs`'s cdylib sweep does `fs::read_dir(&lib_out).unwrap()` and then
+`fs::read(so_entry.path()).unwrap()` on each entry, and between those two a
+concurrent build in the same tree can replace the file:
+
+```
+thread 'main' panicked at src/build.rs:786:54:
+called `Result::unwrap()` on an `Err` value:
+  Os { code: 2, kind: NotFound, message: "No such file or directory" }
+```
+
+Seen once in four deliberately concurrent `cargo test -- xhci_slow_connect`
+processes — one died, three passed. Not provoked by anything in the suite as it
+runs today, which is why it is recorded rather than fixed: it wants the same
+treatment as the staged kernel and bootloader (read it under
+`buildlock::artifact`, or stage it under a key), and that is a change to the
+build system rather than a one-line `unwrap`.
+
+It is the fourth member of the "a red build may be the build system, not the
+code" family, and the tell is the same: the same command succeeds on the next
+attempt.
+
 ### `git stash` in a shared tree takes everyone's uncommitted work
 
 Observed, not theorised: `stash@{0}: On main: compositor-stats-wip` appeared
