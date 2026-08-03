@@ -1053,9 +1053,10 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
 fn sys_open_device(device_type: u64) -> u64 {
     let pid = process::current_process();
     // NotFound means the machine has no such device and nothing else, because
-    // that is the one answer a daemon is entitled to degrade on. Collapsing
-    // Owned into it made soundd print "no audio device on this machine" and
-    // exit 0 whenever another process held the claim.
+    // that is the one answer a daemon is entitled to degrade on. soundd now
+    // routes NotFound to a null sink, so collapsing Owned into it is worse than
+    // before: soundd would silently discard all audio whenever another process
+    // held the claim, instead of failing loudly on a real conflict.
     let desc = match device::try_claim(device_type, pid) {
         Ok(d) => d,
         Err(device::ClaimError::Absent) => return SyscallError::NotFound.to_u64(),

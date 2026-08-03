@@ -568,6 +568,74 @@ fn mix_client(
     true
 }
 
+/// Signal every client before the wait so priority inheritance can fill their
+/// rings while soundd blocks, and reap the ones that died doing it.
+///
+/// §5.7/§7.3: a broken pipe here is the client's death, caught here rather than
+/// left to the control connection — a client that dies mid-stream would
+/// otherwise stay `is_streaming()` and keep the loop deferring buffers for a
+/// producer that no longer exists. Death is exactly `Err(NotFound)`, the
+/// kernel's broken-pipe error; a full pipe is `Err(WouldBlock)` and means the
+/// client is merely behind on consuming signals, which must leave it untouched
+/// — a §6.4-paused client stops reading its pipe indefinitely and is alive.
+fn signal_clients(streams: &mut [ClientStream], ramp_frames: u32) {
+    for stream in streams.iter_mut() {
+        let died = matches!(
+            syscall::write_nonblock(stream.signal_write_fd, &[1]),
+            Err(syscall::SyscallError::NotFound)
+        );
+        if died && stream.signal_read_fd.is_none() && !stream.pending_removal {
+            eprintln!("soundd: client {} died, ramping down", stream.client_id);
+            stream.gain.set_target(Gain::SILENT, ramp_frames);
+            stream.pending_removal = true;
+        }
+    }
+}
+
+/// Drain the command ring the control thread fills: connects, disconnects, and
+/// volume changes. Shared by both sinks — a client's lifecycle is the same
+/// whether its audio reaches hardware or a discard.
+fn apply_commands(cmd_ring: &CommandRing, streams: &mut Vec<ClientStream>, ramp_frames: u32) {
+    while let Some(cmd) = cmd_ring.pop() {
+        match cmd {
+            MixCommand::AddClient(client) => {
+                eprintln!("soundd: client {} connected (id={})", streams.len(), client.client_id);
+                let _ = syscall::write_nonblock(client.signal_write_fd, &[1]);
+                streams.push(*client);
+            }
+            MixCommand::RemoveClient(id) => {
+                if let Some(s) = streams.iter_mut().find(|s| s.client_id == id) {
+                    s.gain.set_target(Gain::SILENT, ramp_frames);
+                    s.pending_removal = true;
+                }
+            }
+            MixCommand::SetVolume { client_id, target } => {
+                if let Some(s) = streams.iter_mut().find(|s| s.client_id == client_id) {
+                    s.gain.set_target(target, ramp_frames);
+                }
+            }
+        }
+    }
+}
+
+/// Drop clients whose disconnect ramp has finished. Paused clients (§6.4) mix
+/// silence and are never removed here; a disconnecting client leaves only after
+/// its §5.5 ramp-out reaches idle, so its tail plays out first.
+fn retain_active(streams: &mut Vec<ClientStream>) {
+    streams.retain(|s| {
+        if s.pending_removal && s.gain.is_idle() {
+            eprintln!("soundd: client {} removed", s.client_id);
+            syscall::close(s.signal_write_fd);
+            if let Some(fd) = s.signal_read_fd {
+                syscall::close(fd);
+            }
+            false
+        } else {
+            true
+        }
+    });
+}
+
 fn mix_thread(
     audio_dev: AudioDev,
     cmd_ring: &CommandRing,
@@ -672,29 +740,9 @@ fn mix_thread(
     loop {
         let was_streaming = !streams.is_empty();
 
-        // Signal all clients BEFORE the io_uring wait. Priority inheritance
-        // boosts them to RT; they fill their ring slots while soundd is blocked
-        // in the poller wait below.
-        //
-        // §5.7/§7.3: a broken pipe here is the client's death, and it must be
-        // caught here rather than left to the control connection — a client
-        // that dies mid-stream would otherwise stay `is_streaming()` and keep
-        // the mix loop deferring buffers for a producer that no longer exists.
-        // Death is exactly `Err(NotFound)`, the kernel's broken-pipe error; a
-        // full pipe is `Err(WouldBlock)` and means the client is merely behind
-        // on consuming signals, which must leave it untouched — a §6.4-paused
-        // client stops reading its pipe indefinitely and is still alive.
-        for stream in streams.iter_mut() {
-            let died = matches!(
-                syscall::write_nonblock(stream.signal_write_fd, &[1]),
-                Err(syscall::SyscallError::NotFound)
-            );
-            if died && stream.signal_read_fd.is_none() && !stream.pending_removal {
-                eprintln!("soundd: client {} died, ramping down", stream.client_id);
-                stream.gain.set_target(Gain::SILENT, ramp_frames);
-                stream.pending_removal = true;
-            }
-        }
+        // Signal all clients BEFORE the io_uring wait, so priority inheritance
+        // fills their ring slots while soundd is blocked in the poller below.
+        signal_clients(&mut streams, ramp_frames);
 
         // The prediction this wait is armed against, when there is one.
         // Lateness is only defined relative to an instant soundd asked to be
@@ -742,26 +790,7 @@ fn mix_thread(
             let mut drain = [0u8; 64];
             while matches!(syscall::read_nonblock(cmd_pipe_read, &mut drain), Ok(n) if n == drain.len()) {}
         }
-        while let Some(cmd) = cmd_ring.pop() {
-            match cmd {
-                MixCommand::AddClient(client) => {
-                    eprintln!("soundd: client {} connected (id={})", streams.len(), client.client_id);
-                    let _ = syscall::write_nonblock(client.signal_write_fd, &[1]);
-                    streams.push(*client);
-                }
-                MixCommand::RemoveClient(id) => {
-                    if let Some(s) = streams.iter_mut().find(|s| s.client_id == id) {
-                        s.gain.set_target(Gain::SILENT, ramp_frames);
-                        s.pending_removal = true;
-                    }
-                }
-                MixCommand::SetVolume { client_id, target } => {
-                    if let Some(s) = streams.iter_mut().find(|s| s.client_id == client_id) {
-                        s.gain.set_target(target, ramp_frames);
-                    }
-                }
-            }
-        }
+        apply_commands(cmd_ring, &mut streams, ramp_frames);
 
         if !was_streaming && !streams.is_empty() {
             stats = MixStats::default();
@@ -921,20 +950,7 @@ fn mix_thread(
             pipeline_filled_ns = syscall::clock_nanos();
         }
 
-        // Disconnected clients leave only after their ramp-down finishes;
-        // paused clients (§6.4) just mix silence and are never removed here.
-        streams.retain(|s| {
-            if s.pending_removal && s.gain.is_idle() {
-                eprintln!("soundd: client {} removed", s.client_id);
-                syscall::close(s.signal_write_fd);
-                if let Some(fd) = s.signal_read_fd {
-                    syscall::close(fd);
-                }
-                false
-            } else {
-                true
-            }
-        });
+        retain_active(&mut streams);
 
         // §5.8 DRAINING → SUSPENDED, on the completion that frees the last
         // buffer. The stop is immediate: grace between the drain and the PCM
@@ -975,6 +991,174 @@ fn mix_thread(
             stats.report(0);
             stats = MixStats::default();
             next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
+        } else if now_ns >= next_stats_ns {
+            if !streams.is_empty() {
+                stats.report(streams.len());
+                stats = MixStats::default();
+            }
+            next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
+        }
+    }
+}
+
+/// The default output on a machine with no audio hardware. It presents the same
+/// virtual device every client negotiates against and drains each stream at that
+/// real rate off a monotonic software clock, discarding the mix. Hardware
+/// absence is a routing state, never an error: a client's write and backpressure
+/// timing is identical to a real device, so nothing upstream can tell its audio
+/// reaches nowhere.
+///
+/// The null sink *is* the mix loop clocked by a timer instead of a device. It
+/// reuses every per-client mechanism — `mix_client`, the gain ramps, crash
+/// detection, the command ring — and drops only what a device provides: there is
+/// no DMA pipeline, so no DLL, no completion records, no dither, and no submit.
+/// After mixing one period it throws the samples away.
+///
+/// Idle discipline matches §5.8: with no streams it holds no timer and takes no
+/// wakes, blocking on the command pipe alone, so an audience of zero costs
+/// exactly zero CPU. It does not request the RT band — it protects no audible
+/// output, and could not anyway: `SYS_SET_RT_PRIORITY` is gated on the audio
+/// claim there is no device to take.
+fn null_sink_thread(
+    cmd_ring: &CommandRing,
+    cmd_pipe_read: Fd,
+    device_sample_rate: u32,
+    device_channels: u16,
+    device_period_frames: usize,
+    ramp_frames: u32,
+) {
+    let device_period_samples = device_period_frames * device_channels as usize;
+    let period_nanos = (device_period_frames as u64 * 1_000_000_000) / device_sample_rate as u64;
+
+    let mut streams: Vec<ClientStream> = Vec::new();
+    let poller = Poller::new(64);
+    let mut mix_f32 = vec![0.0f32; device_period_samples];
+    // Sized for the highest client rate accepted at stream open, exactly as
+    // mix_thread sizes its scratch, so `mix_client` never allocates.
+    let max_client_frames = (device_period_frames * MAX_CLIENT_RATE as usize)
+        .div_ceil(device_sample_rate as usize);
+    let mut decode_buf = vec![0.0f32; max_client_frames * 2];
+    let mut convert_buf = vec![0.0f32; max_client_frames * 2];
+
+    const TOKEN_CMD: u64 = u64::MAX - 2;
+
+    let mut stats = MixStats::default();
+    let mut next_stats_ns = syscall::clock_nanos() + STATS_INTERVAL_NANOS;
+    // The virtual playout grid: the wall-clock instant the next period is due.
+    // Meaningful only while streaming; re-anchored to now+one period when the
+    // first client of a run connects.
+    let mut next_period_ns = syscall::clock_nanos();
+
+    eprintln!("soundd: null sink idle");
+
+    loop {
+        let was_streaming = !streams.is_empty();
+
+        signal_clients(&mut streams, ramp_frames);
+
+        // Idle discipline (§5.8): no streams → no timer, no wakes. A connect
+        // arrives as a command-pipe byte, the only wake source the null sink
+        // has. While streaming, wake at the next grid point.
+        let timeout = if streams.is_empty() {
+            u64::MAX
+        } else {
+            next_period_ns.saturating_sub(syscall::clock_nanos()).max(1)
+        };
+
+        poller.poll_add_fd(cmd_pipe_read, IORING_POLL_IN, TOKEN_CMD);
+        let mut cmd_ready = false;
+        poller.wait(1, timeout, |token| match token {
+            TOKEN_CMD => cmd_ready = true,
+            other => panic!("soundd: unexpected null-sink poll token {other}"),
+        });
+
+        if was_streaming {
+            stats.wakes += 1;
+        }
+
+        if cmd_ready {
+            let mut drain = [0u8; 64];
+            while matches!(syscall::read_nonblock(cmd_pipe_read, &mut drain), Ok(n) if n == drain.len()) {}
+        }
+        apply_commands(cmd_ring, &mut streams, ramp_frames);
+
+        // Start the grid when the first client of a run connects, and reset the
+        // reporting window so no idle stretch dilutes it.
+        if !was_streaming && !streams.is_empty() {
+            let now = syscall::clock_nanos();
+            next_period_ns = now + period_nanos;
+            stats = MixStats::default();
+            next_stats_ns = now + STATS_INTERVAL_NANOS;
+        }
+
+        // Drain every period the grid says is due, discarding the mix. This is
+        // the whole difference from a real device: exactly one period consumed
+        // per `period_nanos` of wall clock, so a client's ring drains — and its
+        // writes backpressure — at the real audio rate. The batch is capped at
+        // the ring depth: a client can be at most `slot_count` periods ahead, so
+        // a wake that would drain more than that overslept long enough for the
+        // grid to be a dead reference (a loaded CPU, a host suspend). It is
+        // re-anchored to now rather than chasing the lost time, which nothing
+        // heard it play.
+        let mut batch = 0u32;
+        while !streams.is_empty() && batch < NULL_SINK_BUFFERS as u32 {
+            let now = syscall::clock_nanos();
+            if now < next_period_ns {
+                break;
+            }
+            let lateness = now.saturating_sub(next_period_ns);
+            stats.max_wake_lat_ns = stats.max_wake_lat_ns.max(lateness);
+
+            mix_f32.fill(0.0);
+            let mut any_data = false;
+            let mut any_streaming = false;
+            for stream in streams.iter_mut() {
+                let covered = mix_client(
+                    stream,
+                    &mut mix_f32,
+                    &mut decode_buf,
+                    &mut convert_buf,
+                    device_channels as usize,
+                    device_period_frames,
+                );
+                // §5.7: a delivered period proves the client holds its signal
+                // pipe's read end, so soundd releases its own — the next write
+                // then breaks if the client dies. Identical to the device path.
+                if covered && !stream.delivered {
+                    stream.delivered = true;
+                    if let Some(fd) = stream.signal_read_fd.take() {
+                        syscall::close(fd);
+                    }
+                }
+                any_data |= covered;
+                any_streaming |= stream.is_streaming();
+            }
+            // The mix is discarded here — no dither, no DMA buffer, no submit.
+            stats.submitted += 1;
+            stats.completions += 1;
+            if any_streaming && !any_data {
+                stats.underruns += 1;
+            }
+            next_period_ns += period_nanos;
+            batch += 1;
+        }
+        if batch == NULL_SINK_BUFFERS as u32 {
+            next_period_ns = syscall::clock_nanos() + period_nanos;
+        }
+        stats.max_batch = stats.max_batch.max(batch);
+
+        retain_active(&mut streams);
+
+        // Reporting: flush on the last disconnect so a short stream's tail is in
+        // the record, and every STATS_INTERVAL_NANOS while streaming — the same
+        // cadence and format mix_thread uses, so a discarded stream is not
+        // silent about being discarded (#106's status tool reads one shape).
+        let now_ns = syscall::clock_nanos();
+        if was_streaming && streams.is_empty() {
+            stats.report(0);
+            stats = MixStats::default();
+            next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
+            eprintln!("soundd: null sink idle");
         } else if now_ns >= next_stats_ns {
             if !streams.is_empty() {
                 stats.report(streams.len());
@@ -1251,28 +1435,43 @@ fn control_thread(
     }
 }
 
+/// The virtual output soundd presents when the machine has no audio hardware.
+/// These match the one configuration cpal's ToyOS backend advertises
+/// (`src/host/toyos/mod.rs`): 44100 Hz stereo i16, 128 frames per period. A
+/// stream negotiates against them exactly as it would a real device, so a
+/// no-hardware machine is invisible to the client.
+const NULL_SINK_RATE: u32 = 44_100;
+const NULL_SINK_CHANNELS: u16 = 2;
+const NULL_SINK_PERIOD_FRAMES: usize = 128;
+/// Same DMA-pipeline depth as virtio-sound (`TX_INFLIGHT_MAX`): the client ring
+/// is as deep, so a client may fill `NULL_SINK_BUFFERS - 1` periods ahead and
+/// its backpressure is the device's. Power of two — ring indices wrap mod 2^32.
+const NULL_SINK_BUFFERS: usize = 8;
+
 fn main() {
     let listener = services::listen("soundd").expect("soundd already running");
 
-    // A machine with no sound card is a machine, not a bug — metal-sim has
-    // none and neither will the laptop's first boots. Exit and release the
-    // name; a soundd that listened without a device would leave every client
-    // blocked on a connect that can never be served.
+    // A machine with no sound card is a routing state, not a bug: soundd
+    // presents a virtual output and discards what is played to it, so a client
+    // building an audio stream succeeds whether or not hardware is present.
+    // Exiting was the old behavior — it released the name and left every audio
+    // client's connect failing NotFound, which crashed uncontrolled programs
+    // like `tone`. Hardware absence is a route, and the route when there is no
+    // sink is the null sink.
     //
-    // NotFound and nothing else. `services::listen` is not the whole "already
-    // running" check: it releases the name and the audio claim under different
-    // locks, so a soundd restarted the instant the previous one exits can pass
-    // it and still lose the claim. That is a conflict, not a machine with no
-    // sound card, and it has to be loud — silence for the session with a line
-    // saying the hardware is absent is the worst of both.
-    let audio_dev = match AudioDev::open() {
-        Ok(dev) => dev,
-        Err(syscall::SyscallError::NotFound) => {
-            eprintln!("soundd: no audio device on this machine, exiting");
-            return;
-        }
+    // NotFound and nothing else means "no device". `services::listen` is not the
+    // whole "already running" check: it releases the name and the audio claim
+    // under different locks, so a soundd restarted the instant the previous one
+    // exits can pass it and still lose the claim. That is a conflict, not an
+    // absent sound card, and it has to stay loud.
+    match AudioDev::open() {
+        Ok(audio_dev) => run_with_device(listener, audio_dev),
+        Err(syscall::SyscallError::NotFound) => run_null_sink(listener),
         Err(e) => panic!("soundd: cannot claim the audio device: {e}"),
-    };
+    }
+}
+
+fn run_with_device(listener: toyos::Listener, audio_dev: AudioDev) {
     let info: AudioInfo = audio_dev.info().expect("soundd: failed to read audio info");
 
     let num_buffers = info.num_buffers as usize;
@@ -1332,6 +1531,50 @@ fn main() {
         device_sample_rate,
         device_channels,
         device_period_bytes,
+        device_period_frames,
+        ramp_frames,
+    );
+}
+
+fn run_null_sink(listener: toyos::Listener) {
+    let device_sample_rate = NULL_SINK_RATE;
+    let device_channels = NULL_SINK_CHANNELS;
+    let device_period_frames = NULL_SINK_PERIOD_FRAMES;
+    let slot_count = NULL_SINK_BUFFERS as u32;
+
+    // ~5ms connect/disconnect/volume ramp, same as the device path.
+    let ramp_frames = device_sample_rate * 5 / 1000;
+
+    eprintln!(
+        "soundd: no audio device, presenting a null sink ({}Hz {}ch, {} frames/period, streams discarded)",
+        device_sample_rate, device_channels, device_period_frames
+    );
+
+    let cmd_ring = Arc::new(CommandRing::new());
+    let cmd_pipe = syscall::pipe();
+
+    let cmd_ring2 = cmd_ring.clone();
+    std::thread::Builder::new()
+        .name("soundd-ctrl".into())
+        .spawn(move || {
+            control_thread(
+                listener,
+                &cmd_ring2,
+                cmd_pipe.write,
+                device_sample_rate,
+                device_channels,
+                device_period_frames as u32,
+                slot_count,
+                ramp_frames,
+            );
+        })
+        .expect("soundd: failed to spawn control thread");
+
+    null_sink_thread(
+        &cmd_ring,
+        cmd_pipe.read,
+        device_sample_rate,
+        device_channels,
         device_period_frames,
         ramp_frames,
     );
