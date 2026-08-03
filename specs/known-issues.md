@@ -669,21 +669,47 @@ constant — `Poller::MAX_HANDLES` was the first and only.
 
 **Four residuals, and the first is worse than what was fixed.**
 
-1. **The compositor's accept path blocks in `recv_header`.** `main.rs:1351`
-   calls it on a freshly accepted fd, and `read_exact` is a *blocking* `read`.
-   A client that connects and sends four bytes parks the compositor's entire
-   event loop until it disconnects — no window redraws, no input, nothing. The
-   frame bound cannot help: the length has not been read yet. Closing it needs
-   a pending-connection table so a partial header is buffered the way an
-   established window's already is (`win.recv_buf`), which is why the hostile
-   peer test has no case for it: a case the fix does not close is a case that
-   is red on both sides. **This is the reason `ipc_hostile_peer` sends whole
-   headers.**
+1. **CLOSED — the compositor's accept path blocked in `recv_header`, and it
+   was not alone.** It called it on a freshly accepted fd and `read_exact` is
+   a *blocking* `read`, so a client that connected and sent four bytes parked
+   the whole event loop until it disconnected. The survey done to close it
+   found three more of the same defect, all reachable by any client:
+
+   - the dispatch read every payload off the fd (`recv_payload`,
+     `recv_bytes`, and `skip` behind them), so **a whole header followed by
+     silence** did it on an established window as well as on a fresh one;
+   - every compositor→client message went out through blocking `send`, so
+     **a client that stops reading** fills its 2,097,088-byte pipe and the
+     compositor parks in `sys_write` with no deadline. `MSG_GET_RESOLUTION`
+     is eight bytes in and sixteen out, so the client drives it;
+   - the drain loop ended only when nothing was ready, so **a client that
+     always has another frame** kept it from ever reaching `redraw` — a
+     freeze with a different shape and the same result.
+
+   The read side is now one non-blocking state machine (`ClientRx`) used by
+   pending connections and windows alike, with the whole frame in memory
+   before anything acts on it; the write side is `try_send`, whose refusal is
+   a `DropReason`; the drain loop has `DRAIN_BUDGET`. Two new bounds,
+   `MAX_PENDING_CONNS` (32) and `HANDSHAKE_TIMEOUT` (2 s), and every removal
+   prints the pid and why.
+
+   Gated by `metal_sim_compositor_stall`, negative-controlled one revert at a
+   time: the pre-fix compositor reds at "connected and silent", a blocking
+   `fill` reds at "half a header", a blocking reply reds at "window that will
+   not read", and deleting `DRAIN_BUDGET` reds at "composited nothing while
+   one client streamed". Two of those cases were **green against the defect
+   they name** on the first attempt — the flood probed for liveness before the
+   ring was full, and the streamer fed the ring rather than filling it — which
+   is the argument for controlling each revert separately rather than once.
+
+   `ipc_hostile_peer` sends whole headers because this used to be open. It
+   could take the partial cases now; the stall gate has them instead, because
+   it is the one that can also see whether the desktop is still painting.
 2. **`Window::set_clipboard` bounds nothing and the compositor reads 116
    bytes.** `window/src/lib.rs:349` sends `text.as_bytes()` with no check,
    while the free `clipboard_set` (`:213`) switches to shared memory above
-   4096 — and `compositor/src/main.rs:1537` receives `MSG_CLIPBOARD_SET` into
-   `[u8; 116]`. So clipboard text between 117 and 4096 bytes is silently
+   4096 — and the compositor keeps `MAX_KEPT_PAYLOAD` (116) of it and
+   discards the rest. So clipboard text between 117 and 4096 bytes is silently
    truncated to 116 today, and the `MSG_CLIPBOARD_SET_SHM` doc comment
    (`:45`) names 116 as the threshold the sender does not use. Three numbers,
    one protocol. Past `MAX_FRAME_LEN` the send is now refused rather than
@@ -693,10 +719,80 @@ constant — `Poller::MAX_HANDLES` was the first and only.
    `T` with `mem::zeroed` and fills it from a read. Lower stakes than
    `recv_payload` — the bytes come from the kernel, not a peer — but it is the
    same shape, and `IpcPayload` is the bound it wants.
-4. **netd is the same client-kills-the-daemon shape and has no gate.**
-   `recv_request`'s `.ok()` never caught the assert, because `.ok()` does not
-   catch a panic. It is fixed by the same change, but only the compositor has
-   a hostile-peer test; netd's would need `tests/netcase`.
+4. **netd is the same client-kills-the-daemon shape and has no gate**, and
+   with residual 1 closed it is the last daemon carrying it. `main.rs:1226`
+   accepts and `:1228` calls `ipc::recv_header` on the fresh fd — line for
+   line what the compositor had — and its dispatch reads payloads and writes
+   replies with the blocking calls too (`:263`, `:268`, `:274`, `:635`). One
+   client that connects to netd and sends four bytes stops the network stack
+   for everyone. `recv_request`'s `.ok()` never caught the assert either,
+   because `.ok()` does not catch a panic. The SDK now has what closing it
+   needs — `try_send`, `decode_payload` — and the compositor has the shape to
+   copy; the gate would go in `tests/netcase`.
+
+### OPEN — the T14 desktop froze at 64 s: the class is closed, the instance is not
+
+The owner's machine went dead — no typing, no cursor — about 64 s into a
+session, with the kernel log still streaming to the stick for another 9.6 s
+until the power went off. That log is what prompted the work above. What it
+establishes, and what it cannot:
+
+**Established.** The compositor's 2 s report runs unbroken from 4.5 s to the
+batch ending ~64.3 s and then stops, so the compositor stopped compositing
+with ~5 reports missed. It did not panic (no backtrace, no `exit: compositor`
+— the only panic in the log is toybox `tone`'s cpal `NotFound` at 29.5 s,
+which is correct on a machine with no audio driver and 35 s earlier), and it
+did not run out of memory (134 of 15404 MB, and the pool table is flat).
+
+**One elimination the log does support on its own.** Every wait in
+`Poller::wait` carries `FRAME_INTERVAL`, and the taskbar marks itself dirty
+once a second, so a compositor parked in its poller still composites every
+second and still reports every two. **It was therefore not in `poller.wait`.**
+
+**Two more from the code rather than the log.** A blocking `write` to the
+terminal needs its 2,097,088-byte receive ring full, which is 131,072 unread
+messages; a whole session of typing and mouse motion is two orders of
+magnitude short. And a blocking `recv_payload`/`recv_bytes` on the terminal's
+window connection needs a payload-bearing message, while the only two the
+terminal ever sends there — `MSG_PRESENT` and `MSG_DESTROY_WINDOW` — are bare
+headers.
+
+**What is left, and why none of it is proven.**
+
+- `recv_header` on a freshly accepted connection needs something to have
+  connected at ~64.3 s. The only connect the three surviving processes can
+  make is `window::clipboard_set`, which the terminal calls on mouse-up after
+  a selection — and the two batches before the freeze are 43 and 30 frames
+  against a resting 4–6, with `composite_us_min` at 208 µs against a resting
+  32 ms, which is cursor-sized damage: mouse motion over the terminal.
+  Consistent, and not proven — `clipboard_set` writes its header into an empty
+  2 MiB pipe in the next statement, so the compositor should have been woken.
+- `accept` itself, on a listener completion whose queued connection was
+  withdrawn. That needs a connector that dies, and nothing spawned or exited
+  between `ps` at 50.1 s and the freeze.
+- The drain-loop livelock, which needs a client whose fd is permanently
+  ready. No producer for that among the three live processes.
+
+**The measurement that would have decided it, and did not exist in time.** A
+connection is two 2 MiB pipes allocated at `SYS_CONNECT`, and the PMM dump
+counts them: `pipe held=5` at 64.348 s is exactly the compositor↔terminal
+socket plus the shell's three tty pipes, so nothing had connected *yet*. The
+dumps run every 10–13 s, the next was due around 74–77 s, and the log ends at
+73.961. `held=7` would have named the accept path and `held=5` would have
+ruled it out.
+
+**What the next boot should capture.** Nothing new, which is the point: the
+compositor now names every client it drops and why. A recurrence with no
+`compositor: dropping pid` line and no telemetry is a mechanism none of the
+four closed ones covers, and that is itself the finding. If it is worth
+narrowing further before then, the cheap change is a `pipes=` field on the
+compositor's own 2 s report — same cadence as the thing that goes missing,
+where the PMM dump's is not.
+
+Do not read the 9.58 s of no kernel output as evidence. It is the longest gap
+in the log, but an idle desktop in this same session goes 4–6 s between
+kernel lines routinely, and the scheduler lines that produce them come from
+idle CPUs rather than from a heartbeat. 1.6× the normal gap is not a signal.
 
 ### ASSIGNED — two ABI wrappers return an error word as a value, and a fork blocks each
 
@@ -1098,6 +1194,45 @@ cannot happen under the table lock (it would put `AddressSpace` under
 `PROCESS_TABLE`, a lock order this kernel does not otherwise use). Building the
 `ThreadData` after the table check, inside the same lock hold, is the shape that
 fixes it.
+
+### The decoded input queues are unbounded, so a wedged consumer grows the kernel heap
+
+Found while answering "where do the keystrokes go while the compositor is
+wedged", which is the question the T14 freeze (§1) raises and nothing in the
+tree had an answer for.
+
+The input path has two stages and only the first is bounded.
+
+**Stage one is fine.** The i8042 ISR shovels raw wire bytes into a 256-byte
+lock-free ring (`kernel/src/drivers/i8042/mod.rs:382`), drops the newest on
+overflow rather than blocking in interrupt context (`:394-405`), counts the
+drops in `DROPPED` (`:113`), and says so and resynchronises when it drains
+(`:575-586`). It also cannot overflow *because of* a wedged consumer:
+`drain()` runs from `drain_irqs()` at the top of every scheduler pass on
+every CPU, whether or not any process holds the keyboard fd.
+
+**Stage two has no bound at all.** `keyboard.rs:8` is
+`static KEY_BUF: Lock<VecDeque<RawKeyEvent>>`, and its one producer
+(`:115`) is an unconditional `push_back`. Four lines in the tree touch it —
+the declaration, the push, `has_data`, `pop_front` — and none of them is a
+capacity, an eviction, a drop count or a log line. `mouse.rs:8`'s
+`MOUSE_BUF` is the same, with two push sites (`:190`, `:208`); its only
+mitigation is that `handle_motion` coalesces a report that changed nothing
+(`:185-187`), so a still pointer queues nothing and a moving one queues at
+its report rate forever.
+
+So while a consumer is wedged, every keystroke and every pointer report is
+decoded and appended to a kernel-heap `VecDeque` that only ever grows.
+`RawKeyEvent` is 8 bytes and `MouseEvent` 6, so it is slow in absolute
+terms and strictly monotonic. The second half is worse than the growth:
+`device::release` does not flush the buffer, so an entire stall's worth of
+input is replayed into whatever claims the device next.
+
+**The answer to "where do the keystrokes go" is therefore: nowhere, forever,
+uncounted.** Recorded rather than fixed — the bound is policy (what a queue
+that nobody is draining is *for*), and the second question every bound owes
+is what the producer sees when it is hit, which for an ISR-fed decode path
+is a decision about the drop counter's shape and not a one-liner.
 
 ### A keyboard that resets behind our back is undetectable on the PS/2 wire
 
