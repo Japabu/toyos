@@ -13,6 +13,13 @@ distortion is non-uniform — measured 6.5× on address-space switch vs 1.06× o
 ALU loop — so no correction factor exists. Real Tiger Lake silicon scores the
 bar; QEMU cannot.
 
+**What the machine actually contains is `specs/metal-hardware-inventory.md`** —
+all 24 PCI functions, both xHCI controllers' USB topology, the NVMe and the boot
+stick, the i8042's findings and the boot's own timing, transcribed from the first
+two full metal boots and annotated with what ToyOS drives and what it skips. Read
+it before planning any driver. It also answers, for M5, where the touchpad's I2C
+controller is not.
+
 ## Starting position (verified 2026-07-30 — re-verify before acting, this ages)
 
 - **Display is already fine, and as of `06ce633` that is measured rather than
