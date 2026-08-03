@@ -2281,8 +2281,9 @@ started, inside the 0.3 s the ports are held empty for — the injection did not
 reach the driver
 ```
 
-0.298 against 0.300. Re-run in isolation immediately afterwards it passed four
-times out of four, so what the run measured was the host, not the driver: the
+0.298 against 0.300, and 0.299 in a second full run a few hours later. Re-run in
+isolation after each, it has passed six times out of six, so what the full runs
+measured was the host, not the driver: the
 window is held open by the harness on wall clock, and this dev host is a laptop
 that is regularly building three other things.
 
