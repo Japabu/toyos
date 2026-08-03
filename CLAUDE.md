@@ -43,6 +43,8 @@ The name has no meaning. This is not a hobby project. The quality bar is the sam
 
 **PCI** — drivers select from an enumerated list, so whether one takes the first match or all of them is visible at the call site. A first-match helper hides that choice, which is how a machine with two identical controllers ends up with one driven.
 
+**Display** — **nothing composes against the scanout.** Reads from it are uncached under both memory types firmware ever gives it, so a client composes in system RAM and blits damage; `window::Screen` is the mapping with no read path, and `Framebuffer` now means a surface in RAM. The kernel sets no cache attribute anywhere — every mapping is PAT entry 0 (WB), deferring to firmware's MTRR — and logs the type it found at GOP init. QEMU's framebuffer is host RAM, so no test can show any of this.
+
 **Syscall ABI** — Defined in `toyos-abi/`. The ABI is the contract between kernel and userland. Includes struct layouts, syscall numbers, constants, and typed syscall wrappers. Completely unstable — read the code for current state. Never add or change a syscall without discussion. The `toyos/` crate builds on top with typed handles, IPC framing, and service helpers — userland code uses `toyos`, kernel uses `toyos-abi` only.
 
 **Kernel must never crash from userland.** A buggy userland process must not be able to bring down the kernel. But if the kernel itself has a bug, it must crash loudly so we can fix it and harden.
