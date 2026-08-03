@@ -2122,6 +2122,22 @@ fn run_machine_test(
                     return Err(format!("{want:?} never reached the console:\n{console}"));
                 }
             }
+            // The compositor's periodic self-measurement, which is how the
+            // T14 reports what compositing cost it once it is off the serial
+            // port and the log is only a file on the stick. It is emitted from
+            // a composited frame, so its absence is a compositor that stopped
+            // drawing as much as an instrument that never ran.
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline
+                && !console
+                    .lines()
+                    .any(|l| l.contains("compositor: frames=") && l.contains("windows="))
+            {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            // One more drain so the tail of that line cannot still be in
+            // flight when it is parsed.
+            console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
             // The compositor reports the mode it was handed, which is the
             // proof it claimed a real firmware framebuffer rather than
             // starting on nothing.
@@ -2133,11 +2149,51 @@ fn run_machine_test(
                     "the compositor never said what framebuffer it got:\n{console}"
                 ));
             };
+            let Some(stats) = console.lines().find(|l| l.contains("compositor: frames=")) else {
+                return Err(format!(
+                    "the compositor never reported a composited frame:\n{console}"
+                ));
+            };
+            let field = |key: &str| -> Result<u64, String> {
+                let raw = stats
+                    .split_whitespace()
+                    .find_map(|f| f.strip_prefix(key))
+                    .ok_or_else(|| format!("no {key} in the compositor's stats line: {stats}"))?;
+                raw.parse::<u64>()
+                    .map_err(|_| format!("{key}{raw} is not a number: {stats}"))
+            };
+            let frames = field("frames=")?;
+            let min_us = field("composite_us_min=")?;
+            let max_us = field("composite_us_max=")?;
+            let total_us = field("composite_us_total=")?;
+            let cursor = field("cursor=")?;
+            // Read for their presence and their shape; what they measure is
+            // uncached reads, which QEMU's host-RAM framebuffer cannot show.
+            field("scanout_wr_bytes=")?;
+            field("scanout_rd_bytes=")?;
+            field("rd_px=")?;
+            field("rd_bulk=")?;
+            field("windows=")?;
+            if frames == 0 || total_us == 0 {
+                return Err(format!("the compositor reported a dead instrument: {stats}"));
+            }
+            if min_us > max_us || max_us > total_us {
+                return Err(format!("min/max/total do not order: {stats}"));
+            }
+            // GOP hands out no hardware cursor (`flags: 0`), so the compositor
+            // draws one into the scanout on every frame it composites.
+            if cursor != frames {
+                return Err(format!(
+                    "{frames} frames on a shape with no hardware cursor drew {cursor} cursors: \
+                     {stats}"
+                ));
+            }
             // And nothing panicked on the way. A daemon that dies on its
             // absent device fails the positive check above; this catches the
             // rest of the boot dying instead.
             serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
             eprintln!("  [metal-sim] compositor up on {}", mode.trim());
+            eprintln!("  [metal-sim] {}", stats.trim());
             eprintln!("  [metal-sim] soundd and netd both exited on their absent device");
             Ok(())
         }
