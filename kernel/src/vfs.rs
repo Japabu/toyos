@@ -176,6 +176,19 @@ pub const MAX_LIST_ENTRIES: usize = 16_384;
 
 const _: () = assert!(core::mem::size_of::<(String, u64)>() == 32);
 
+/// The absolute path of a directory, from [`Vfs::resolve_path`]'s two halves.
+///
+/// The form `created_dirs` is keyed on, which is [`Vfs::resolve_absolute`]'s.
+/// One construction shared by the writer of that set and both its readers, so
+/// they cannot drift into disagreeing about what a directory is called.
+fn directory(mount: &str, subdir: &str) -> String {
+    if subdir.is_empty() {
+        format!("/{mount}")
+    } else {
+        format!("/{mount}/{subdir}")
+    }
+}
+
 fn normalize(path: &str) -> String {
     // `parts` is the allocation MAX_PATH is derived against — see its comment.
     // Callers guarantee `path` is at most `MAX_PATH + 1 + MAX_USER_STR` bytes.
@@ -270,11 +283,7 @@ impl Vfs {
             return Some(String::from("/"));
         }
 
-        let abs = if subdir.is_empty() {
-            format!("/{}", mount)
-        } else {
-            format!("/{}/{}", mount, subdir)
-        };
+        let abs = directory(&mount, &subdir);
 
         // The one place a process's `cwd` is grown: `sys_chdir` stores whatever
         // this returns. Refused rather than truncated — a shortened path names a
@@ -383,11 +392,18 @@ impl Vfs {
             }
         }
 
-        if !prefix.is_empty() && result.is_empty() {
-            Err(SyscallError::NotFound)
-        } else {
-            Ok(result)
+        // An empty directory and a path no directory could be are different
+        // answers, and this is the only place that can tell them apart. A
+        // directory here exists for one of three reasons — it is a mount, some
+        // file lives under it, or something called `mkdir` — and only the first
+        // two are visible in `result`. Without the third, `mkdir("/tmp/d")`
+        // followed by `read_dir("/tmp/d")` was `NotFound`, and `is_dir` read the
+        // same refusal for an empty `d` as for a `d` that was never there: which
+        // is how `cp x d/` came to write a *file* named `d`.
+        if result.is_empty() && !prefix.is_empty() && !self.created_dirs.contains(&directory(&mount, &subdir)) {
+            return Err(SyscallError::NotFound);
         }
+        Ok(result)
     }
 
     /// Open a file for fd-based I/O.

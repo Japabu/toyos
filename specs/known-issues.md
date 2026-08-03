@@ -141,7 +141,7 @@ flag — unlike the count — is in the page `SYS_PIPE_MAP` maps writable.
 netd still reads them. `bridge_piped` treats `rx_ring.is_reader_closed()` as "the
 client died" and `tx_ring.is_writer_closed()` as "the client stopped writing, so
 close the socket"; `cleanup_dead_listeners` aborts a listener's socket on the
-same bit (`userland/netd/src/main.rs:943`, `:948`, `:982`). Anyone who can map
+same bit (`userland/netd/src/main.rs:1006`, `:1011`, `:1045`). Anyone who can map
 one of those pipes can set the bit and make netd tear the connection down.
 
 Today that is the connection's own client, so it is self-harm — but the bound on
@@ -493,6 +493,17 @@ Fix in progress, with two requirements on its shape: the bound must state what i
 is a function of, and refusing past it must be an error return — not a panic, and
 not a silent drop.
 
+**netd's half is closed, and the two numbers quoted above are both stale.** It
+derives `max_piped_connections` from physical memory, caps it at what one poller
+can watch, and refuses past it with `ERR_RESOURCE_EXHAUSTED` — gated by
+`netd_connection_caps`, which makes the daemon announce the cap and the guest
+measure where the refusals start. The `accept` rework added the second bound the
+entry did not know it needed, `MAX_PENDING_CONNS`, for connections accepted and
+not yet identified; `netd_hostile_peer` measures that one. `Poller::new(64)` is
+now `Poller::new(FIXED_POLL_FDS + MAX_PIPED_SLOTS + MAX_PENDING_CONNS)`
+(`netd/src/main.rs:1228`). The compositor's half is not this agent's to close and
+its numbers here want the same re-reading.
+
 ### No physical memory fairness
 
 Any process can allocate unbounded physical memory until the system runs out.
@@ -563,16 +574,40 @@ constant — `Poller::MAX_HANDLES` was the first and only.
    `T` with `mem::zeroed` and fills it from a read. Lower stakes than
    `recv_payload` — the bytes come from the kernel, not a peer — but it is the
    same shape, and `IpcPayload` is the bound it wants.
-4. **netd is the same client-kills-the-daemon shape and has no gate**, and
-   with residual 1 closed it is the last daemon carrying it. `main.rs:1226`
-   accepts and `:1228` calls `ipc::recv_header` on the fresh fd — line for
-   line what the compositor had — and its dispatch reads payloads and writes
-   replies with the blocking calls too (`:263`, `:268`, `:274`, `:635`). One
-   client that connects to netd and sends four bytes stops the network stack
-   for everyone. `recv_request`'s `.ok()` never caught the assert either,
-   because `.ok()` does not catch a panic. The SDK now has what closing it
-   needs — `try_send`, `decode_payload` — and the compositor has the shape to
-   copy; the gate would go in `tests/netcase`.
+4. **CLOSED — netd was the same client-kills-the-daemon shape, and was the
+   last daemon carrying it.** It accepted and called `ipc::recv_header` on the
+   fresh fd, line for line what the compositor had. The survey done to close
+   it found six blocking sites, not one: that `recv_header`; `recv_payload` in
+   all eleven handlers, so a whole header followed by silence did the same
+   thing one step later; `recv_bytes` for a DNS hostname; `send`/`send_bytes`/
+   `signal` for every reply; a blocking `read` of the client's tx pipe in
+   `handle_udp_send_to`, waiting for a second write a conforming client never
+   makes; and a blocking `write` into the client's rx pipe in the UDP receive
+   path. Every one reachable by any client.
+
+   The read side is `ipc::FrameRx<256>` per pending connection, the write side
+   is `try_send`, and the two pipe operations are non-blocking with the
+   refusal answered rather than waited on. Two new bounds — `MAX_PENDING_CONNS`
+   (32) and `HANDSHAKE_TIMEOUT` (2 s) — and every removal prints the pid and
+   why. `Client` owns the connection, which deleted a `mem::forget` on the
+   accepted fd and eight hand-written `close` calls.
+
+   Gated by `netd_hostile_peer` on `tests/netcase`, negative-controlled three
+   ways: the pre-fix daemon reds at "netd did not answer a request in 2s — it
+   is parked on a client", deleting the pending cap reds at "netd held all 48
+   unidentified connections", deleting the handshake sweep reds at "netd held a
+   silent connection for 10.0s without dropping it".
+
+   **Two residuals, both bounded by netd's per-operation model rather than by
+   anything netd does.** `TrySendError::Full` is unreachable here: a connection
+   carries one reply and is closed, so a client cannot fill its own 2 MiB
+   receive pipe — the branch is right and untestable, unlike the compositor's,
+   where a long-lived window made it reachable. And the pending cap refuses
+   *legitimate* connections while it is full, which is the bound working and is
+   why the gate does not assert liveness there; a client that can open 32
+   connections can therefore delay every other client's request by up to the
+   handshake deadline. That is a fairness question, not a stall, and it wants
+   per-process accounting rather than a bigger number.
 
 ### OPEN — the T14 desktop froze at 64 s: the class is closed, the instance is not
 
@@ -1133,22 +1168,55 @@ rename whose bitmap or node write the device refuses still returns `Ok(())`, and
 kernel's `PageCacheBlockIO` a refused write is a log line and a dropped write. That is the
 `bcachefs::BlockIO` entry in §9, unchanged by any of this.
 
-### An empty directory does not stat as a directory
+### ASSIGNED — an empty directory does not stat as a directory: kernel half landed, std half owed
 
-`sys_readdir` returns 0 both for a directory with nothing in it and for a path that names
-nothing (`vfs::list` hands back `Ok(vec![])` in both cases), and `std`'s
-`sys::fs::toyos::is_dir` reads that 0 as "not a directory" (`is_dir`, `fs/toyos.rs:367`).
-So after `fs::create_dir("/tmp/d")`, `fs::metadata("/tmp/d").is_dir()` is `false` until
-something is written into it, and `fs::read_dir` on a path that does not exist yields an
-empty iterator rather than `NotFound`.
+**The kernel half is done and gated.** `Vfs::list` now consults `created_dirs`, so an
+empty directory answers `Ok(vec![])` and a path no directory could be answers
+`Err(NotFound)` — where both used to be `NotFound` (the entry previously said both were
+`Ok(vec![])`; that was wrong in the detail and right in the conclusion, and the code it
+named had returned `NotFound` for an empty listing since the root commit).
+`empty_dir_stat` is the gate, asserting the distinction at the syscall boundary and
+through `fs::read_dir`, with the non-vacuity check that a directory holding a file still
+lists. Reverting the `created_dirs` lookup reds it at "an empty directory must list as
+empty, not refuse". `fs::read_dir` on an empty directory therefore works now; it used to
+be `NotFound`.
 
-What that costs: every tool whose two-argument form means "into this directory" —
-`cp x d/`, `mv x d/` — silently writes a *file* named `d` when `d` is an empty directory.
-`toybox_file_tools` puts a file in every directory it makes so it can test the rule at all.
+**The std half is one line and is not landed.** `sys::fs::toyos::is_dir`
+(`rust/library/std/src/sys/fs/toyos.rs:367`) reads a zero-length listing as "not a
+directory":
 
-The honest shape is for `readdir` to distinguish the two, which means `vfs::list` returning
-`Err(NotFound)` for a path no directory could be — `created_dirs` already knows which
-names are directories.
+```rust
+match syscall::readdir(path_bytes, &mut buf) {
+    Ok(n) => n > 0,                                 // <- becomes Ok(_) => true
+    Err(SyscallError::ResourceExhausted) => true,
+    Err(_) => false,
+}
+```
+
+With the kernel half landed, `Err(NotFound)` is the only "not a directory" answer, so
+`Ok(_) => true` is both correct and complete — a file answers `NotFound` too
+(`prefix` is `"foo.txt/"` and nothing lives under it). Until it lands,
+`fs::metadata("/tmp/d").is_dir()` is still `false` for an empty `d`, and `cp x d/` still
+writes a *file* named `d`. `toybox_file_tools` still puts a file in every directory it
+makes for that reason.
+
+**Why it was not landed with the kernel half, which is a process constraint and not a
+technical one.** `rust/` is the primary checkout's, and in a linked worktree it is the
+empty stub `git worktree add` leaves (`specs/worktrees.md` §2) — so a worktree agent can
+neither edit nor build it. The sysroot witness covers `toyos-abi`, `toyos` and
+`userland/libc` and *not* std's own sources (§3), so the change would also not be picked
+up without `--claim-sysroot`, which rebuilds the shared sysroot and cleans every other
+worktree's target directories mid-session. This is the same two-half shape as
+`std::env::current_dir()` above and takes the same answer: the kernel half lands first
+and is safe alone — `is_dir` returns `false` for an empty directory before and after it,
+so nothing regresses and the distinction becomes available. Batch the edit with the other
+`rust/` work owed in §1 in one quiet-tree window.
+
+Found in the same file and **not** fixed, for the same reason: `FileAttr::file_type`
+(`fs/toyos.rs:88`) answers `is_dir` with `self.file_type == syscall::FileType::Pipe`, and
+`stat` at `:507` builds a directory's `FileAttr` with `file_type: FileType::Pipe` to
+match. A directory is spelled "pipe" throughout, with a comment excusing it rather than a
+type that could not express it. Same window.
 
 ### `Command::output()` returns an empty stderr, always
 
