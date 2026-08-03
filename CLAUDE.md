@@ -125,7 +125,7 @@ userland/         All userland programs + ecosystem forks
 toyos-abi/        Kernel ABI (types, constants, syscall numbers, syscall wrappers)
 toyos/            Userland SDK (typed handles, IPC, services, surface input, shm, net)
 toyos-keymap/     Layouts, dead-key composition, key translation, layout detection
-toyos-fat32/      FAT32 driver, read + write (the ESP; no format path by design)
+toyos-fat32/      FAT32 driver, read + write (the ESP; no format path by design) — and the writer `src/image.rs` builds the boot image's ESP with, so the fsck-clean claim is about our code; `fatfs` only formats the empty volume
 toyos-gpt/        GPT parser (no_std, no alloc, forbid(unsafe_code))
 toyos-ld/         Custom linker
 toyos-cc/         Custom C compiler
@@ -162,7 +162,7 @@ console/system.toml  The same, for `--console-boot`: /bin/console and a shell
 - If something is blocking, stop and report it. Don't work around it.
 - Never degrade audible or visual quality — even temporarily, even for a big win elsewhere — without the owner's explicit sign-off. Quality tradeoffs are the owner's call.
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce output. If a command produces a lot of output or takes long, run it in the background — background tasks automatically get their output written to a file.
-- Host tests outside the QEMU suite: `cargo test` inside `toyos-sched/`, `toyos-ps2/`, `toyos-gpt/` and `toyos-fat32/` (the last needs macOS `newfs_msdos`/`hdiutil`/`fsck_msdos`; it builds real images in `$TMPDIR`). `cargo test --lib` in the root runs the build lock's own gates.
+- Host tests outside the QEMU suite: `cargo test` inside `toyos-sched/`, `toyos-ps2/`, `toyos-gpt/` and `toyos-fat32/` (the last needs macOS `newfs_msdos`/`hdiutil`/`fsck_msdos`; it builds real images in `$TMPDIR`). `cargo test --lib` in the root runs the build lock's own gates and the image builder's fsck gate — no guest, seconds.
 - **`cargo test` and `cargo run` produce large output** (std rebuild warnings, initrd listing, serial output). Always run them in the background so the Bash tool doesn't silently truncate the output — `... [N characters truncated] ...` in tool output means data was lost. Read the output file afterward. **ToyOS is fast** — full boot is under a second and incremental builds usually finish in seconds, so never assume slowness.
 - **Always be empirical.** Never assume a command succeeded or failed — read the actual output. Never assume code works — run it. Never guess at root causes — investigate. Guessing is unproductive; verify everything.
 - **Any number in a comment, commit message, or spec must come from a command that was actually run.** If a figure is an estimate, or a bound from a datasheet, it says so. A plausible invented number is worse than no number: the next reader has no reason to doubt it, and it survives every review that only checks whether the prose reads sensibly. **Write the message with `git commit -F <file>`, never `-m` with a backtick in it** — a double-quoted `-m` substitutes backticks, so the message silently loses that text *and the shell runs it*. Twice in one day, once invoking `sudo`.
@@ -203,7 +203,9 @@ Read the spec before touching the subsystem it covers.
 
 **`specs/known-issues.md` is the list and the file to update** — ten sections, every open item with its evidence and its reproduction. Read it before touching a subsystem. Nothing is duplicated here.
 
-Five bite an agent who is *not* working on the subsystem:
+Six bite an agent who is *not* working on the subsystem, and the first blocks every landing:
+
+- **Gate A's fast tier is red on `main`.** `audio_tone_load (smp=1)` drops out on both of its boots, reproducibly, measured against `5408cfb` with a same-session A/B. A full-suite landing gate cannot pass until it is fixed. Known-issues §4 has the numbers and the leads.
 
 - **A boot that wedges before the idle loop produces no serial output at all** — the log ring's only drains are the timer tick and the idle loop, and neither runs during the boot phases. It looks exactly like a kernel that never started. Known-issues §5 carries the one-line patch that makes one bisectable.
 - **`Command::output()` returns an empty stderr, always** — the toyos `output` asks `spawn` for the pipe and then drops it. A guest test asserting on a child's refusal message passes vacuously. Use `spawn()` + `wait_with_output()`.

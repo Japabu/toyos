@@ -731,24 +731,25 @@ runner's report path does not touch the VFS. That particular route is bounded
 now (§1), but the class is not: any panic under `vfs::lock()` still strands it,
 and the allocator was only the worst instance because every context allocates.
 
-### The on-screen console shows only what serial has *not* consumed
+### CLOSED — the on-screen console showed only what serial had *not* consumed
 
-The log ring is a queue, not a history: `drain_to_serial` pops, and the idle
-loop and timer tick drain continuously. `peek_tail` therefore returns only the
-bytes no drain has reached yet, which on a running system is the last line or
-two — `screen_fatal_halt`'s screen is exactly one line, the nonce.
+Both halves are closed and the second is worth carrying, because it is the
+shape rather than the instance. The ring is a history as well as a queue:
+`retained` is what is still readable behind `head`, `peek_tail` reads it, and
+no drain shortens it — so a panic screen carries context again.
 
-The panic handler's own reports are unaffected and that is not luck:
-`crash_report` writes the whole report with interrupts already off, and
-`capture()` copies it before `panic_flush` drains. So a panic screen carries
-the report and no context, and a fatal *exception* screen (which never
-captures) carries whatever its `crash_report` just wrote, for the same reason.
+The other half was that a drain into a backend that discards still popped, so
+on a machine with no UART and no virtio-console the ring's serial cursor
+advanced over a consumer that does not exist. `log_ring::SERIAL_SINK` follows
+`serial::has_console()` now, exactly as `FILE_SINK` follows `/log`: a cursor
+whose consumer is absent stands still. The load-bearing half was never the
+wasted pops but `has_pending()`, which the idle loop's pre-halt check declines
+to sleep on — so on the T14 every line logged cost every idle CPU a trip round
+the loop to throw the line away, and no drain could ever make the answer no on
+merit. Nothing in QEMU can observe the difference: every profile but `--mute`
+has a 16550, so the sink is on from phase 1 and the behaviour is byte-identical.
 
-It matters for the machine M0 exists for. A drain into a backend that discards
-— no UART, no virtio-console — still pops, so on the T14 the ring is being
-emptied into nothing all the time and there is no scrollback to fall back on.
-Options, none taken: stop draining when no backend can write; keep a separate
-non-consuming history for the console; or accept it and say so in the design.
+### A machine with no console says nothing between `Boot: complete` and the terminal
 
 **Measured under metal-sim (M1), and worse than "no scrollback".** With
 `--metal-sim --mute` and no virtio-console the guest has no output channel at
@@ -760,6 +761,11 @@ T14 is mute between `Boot: complete` and the moment the compositor's terminal
 exists. That is fine for a first boot and not fine for debugging M2 on the
 machine. It is also the entire cost the mute default was buying, which is why
 the metal-sim profile now keeps its 16550 by default.
+
+Narrowed but not closed: the last checkpoint now paints where this boot's log
+can be read (`main.rs`'s `report_log_destination`), so the panel says whether
+there will be anything to go back to. What it cannot give that machine is a
+line *after* the checkpoint.
 
 ### Nothing distinguishes `panic_console::capture` from a no-op
 
@@ -1739,6 +1745,36 @@ window at all used to be a ceiling breach — which under a harm verdict would h
 passed — so it moved to the instrument-broken set, fatal in both tiers. It was
 also the one breach that could enter the thorough tier's sample as a run of
 all-zero counters, i.e. as the best run ever measured.
+
+### OPEN, BLOCKING — gate A's fast tier is red on `main` at `5408cfb`
+
+`audio_tone_load (smp=1)` fails, and it is the fast tier's own two-boot rule
+that fails it: dropouts on the first boot *and* on the confirming re-boot. Four
+boots across two runs, none clean.
+
+```
+run 1: dropout total 6 [1p×1 3p×1 5p×1 6p×1 11p×1 41p×1],  67 of 1203 periods with no client audio
+       then dropout total 1 [5p×1],                          5 of 1144
+run 2: dropout total 5 [2p×1 3p×1 5p×1 19p×1 40p×1],       210 of 1336
+       then dropout total 1 [5p×1],                          5 of 1163
+```
+
+`audio_tone_load (smp=8)`, `audio_tone` at both widths, `audio_idle_suspend` and
+`metal_sim_null_audio` were green in the same runs.
+
+**Not fix bundle D, and that is measured rather than assumed.** Same session,
+same host, alternating trees: the numbers above are `5408cfb` with the bundle
+stashed; the bundle's own two runs gave 8-then-3 and 3-then-2. Both trees red on
+every run, the totals overlapping, so there is no evidence of a regression and
+clear evidence the red predates the branch. Four samples a side is not a
+distribution — the verdict is what matches, not the counters.
+
+**It blocks every landing**, since a landing's gate is a full suite. Whoever
+takes it: this is the reproducible version of the entry below, which had one
+boot and could not be reproduced, so the two are almost certainly one defect and
+the leads there apply. The host was carrying three other agents' suites
+throughout; under the owner's ruling of 2026-08-04 that is not an excuse and not
+grounds to re-run it away.
 
 ### OPEN — one boot put 142 ms of silence on the wire, and the host was not quiet
 
@@ -3490,39 +3526,6 @@ mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
 `esp_filesystem`, `kernel_log_file`, `log_backing_read_error`,
 `log_partition_automount` and `log_partition_identity`
 (`tests/common/volumes.rs`), and `toybox_cp_volume` (`tests/common/toybox.rs`).
-
-### The boot image this project builds is not `fsck_msdos`-clean, and never was
-
-Found by pointing the new gate at the image *before* any guest ran. Twelve
-complaints, from `fatfs` 0.3.6 as `src/image.rs` drives it, and both causes
-are specification violations rather than style:
-
-- **A long-name entry ahead of each `.` and `..`.** Read straight off a diag
-  image: the first entry of `/EFI` is an `attr=0x0f` LFN whose name field is
-  `A.\0\0\0\xff…`, and the `.` short entry is second. FAT requires `.` and
-  `..` to be the first two entries of a subdirectory, which is why
-  `fsck_msdos` reports the parent's view of it — `Item /EFI does not appear to
-  be a subdirectory`.
-- **`..` carries the root's cluster number.** It is 2, and the specification
-  requires 0 when the parent is the root: `` `..' entry in /toyos has non-zero
-  start cluster ``.
-
-OVMF boots it, `toyos-fat32` reads it, macOS mounts it. What is unknown is
-whether a real UEFI implementation is as tolerant, and the machine that would
-answer that is the one being flashed. The fix is in `fatfs`, so it needs a
-fork; nothing in this repo can fix it locally.
-
-Consequence for the gate: `esp_filesystem` compares the complaint *set* before
-and after the boot and requires the guest to add none, rather than requiring
-silence. That is honest but weaker in one specific way: if the guest ever
-produced one of those twelve for its own reason, the gate would not see it.
-
-The **log partition does not inherit this**, and `kernel_log_file` therefore
-requires silence rather than sameness on it. `create_log_volume` formats an
-empty volume — no subdirectory, so neither cause above can arise — and records
-its free-cluster count, which `format_volume` otherwise leaves unset for
-`fsck_msdos` to complain about. A fresh one is clean; so is one the guest has
-written its log to.
 
 ### Nothing stops userland damaging the stick the machine boots from
 
