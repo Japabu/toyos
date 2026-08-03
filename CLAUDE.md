@@ -182,6 +182,7 @@ Three layers, built in order; each is useful on its own.
 Read the spec before touching the subsystem it covers.
 
 - `specs/scheduler-core-spec.md` — the ownership-typed scheduler core (`toyos-sched/`), with a deterministic host simulator and interleaving fuzzer. **Stage 7c done**: the kernel drives it, balance on, legacy notification path deleted. Host tests: `cargo test` inside `toyos-sched/`. Five negative gates prove the harnesses have teeth — do not weaken one to make a change pass. State and every defect the cutover found: `specs/scheduler-migration-log.md`.
+- `specs/iommu-spec.md` + `specs/userspace-drivers-spec.md` — `kernel/src/iommu/`, and the userspace drivers it exists to make safe. **Stages I0–I1 done**: every QEMU profile now boots with `-device intel-iommu` on a split irqchip, and discovery is read-only — nothing is programmed and no machine is refused. §8.1 records what the unit actually answers, which contradicts the file in four places.
 - `specs/capability-handles-spec.md` — refcounted kernel objects behind typed per-process handles (Fd→Handle). Subsumes the `SharedToken`/io_uring/`Fd` debt.
 - `specs/iouring-blocking-spec.md` — io_uring as the only blocking mechanism; one wait-free completion primitive, one park/recheck site.
 - `specs/metal-boot-plan.md` — first boot on the ThinkPad T14 Gen 2. M0–M2 built; the flash-trigger condition is met.
