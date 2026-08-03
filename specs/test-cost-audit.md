@@ -375,7 +375,9 @@ shared block serial: (derived)
 
 **Past N≈5 the critical path is one test.** `screen_console_scroll` at 103 s
 (75 s after §3.1) becomes the floor, so §3.1 and §3.3 compound — cutting the
-longest test is worth more once the rest is parallel than it is now.
+longest test is worth more once the rest is parallel than it is now. **Since
+done: it is 27 s (§5.2), so the floor past N≈5 is the aggregate again and not
+one name.**
 
 **Host budget.** 14 cores. Each QEMU runs `smp: 2` by default, so ~3 host
 threads. **N=4 ≈ 12 threads is the honest ceiling for one suite on this host**,
@@ -666,7 +668,110 @@ temp dir, so a guest still up when the next test booted took that boot's socket
 and it died before its first line. **That is the first thing §3.3 has to fix**,
 before any two boots can overlap.
 
-## 5.2 What wave 4 actually bought, and the number it cannot reach
+## 5.2 The longest test, and where its time actually was
+
+`screen_console_scroll` — §1.2's number one at 103 s, and §3.3's floor past
+N≈5 — is **27 s** as of this section. Same-session A/B on the tree that landed,
+arms alternated, four runs: **110.5 / 111.4 s before, 27.4 / 27.5 s after** —
+4.05×, and tight enough in both arms to read as one number each.
+
+**§3.1 predicted the wrong cause and §5.1 already half-said so.** The whole
+30–50 s estimate rested on host-side glyph decoding; opt-level 2 returned 5 s of
+it. Instrumenting the poll loop says why. Of 116.4 s in one run:
+
+| | seconds |
+|---|---:|
+| boot + image build | 5.1 |
+| host: 408 screendumps (QMP + read + `Ppm::parse`) | 4.5 |
+| host: `console_rows` decode, 408 dumps | 0.7 |
+| host: typing three commands over QMP, pgup/pgdn sleeps | 3.1 |
+| **guest: `Console::write_bytes`** | **101.2** |
+
+The guest number is measured inside the console, not inferred: a timer around
+`write_bytes` and around the stdout mirror beside it, printed when the batch
+carrying `CHURN-DONE` arrived. **The mirror — 469 KB through the kernel log ring,
+the 16550 and `log_file` — cost 0.02 s of the 101.** Splitting `write_bytes`
+further puts ~98% of it in one place: the `draw_char` loop in `flush`, which
+recomposes essentially the whole panel because a scroll of any depth changes
+every row.
+
+So the cost is **one full-panel recompose per console read**, and the console
+reads its pipe 4096 bytes at a time. Across the three rounds that came out at a
+flat **0.213 ms per byte of output** (0.213 / 0.254 / 0.212 for rounds 1–3),
+which is the whole cost model: this test cost what it printed.
+
+**What the workload was resized on.** 1750 lines, 458 KiB. The body width was
+`5 + 37i mod 500` and the three rounds all started at line 0, so rounds 1 and 2
+were strict *prefixes* of round 3 and the run walked 3.5 periods of a
+500-period sequence. It is now a sweep of the panel's width plus a whole number
+of extra panels — `5 + 37i mod cols + cols * WRAPS[i mod 8]` — walked by three
+rounds over **disjoint** stretches of 100/60/100. Two properties replace the
+line count:
+
+- 37 is coprime with the 240-column panel, so any 240 consecutive lines end in
+  every column exactly once. Column coverage is now a property of the
+  construction rather than of how long the run is.
+- `WRAPS = [0,1,0,2,0,1,0,0]` puts a one-row, a two-row and a three-row line in
+  every eight, so a short run cannot lose the soft-wrap path.
+
+**The second one is there because the first attempt lost it.** A plain sweep of
+two panel widths keeps the coprime property, and 260 lines of it measured
+240/240 columns — and **zero** lines wrapping twice, against 126 before. A
+partial period of `37i mod 480` covers a structured subset (its values are
+`37m + k` for `m < 13`), so it never reaches its own top; the lines that occupy
+three rows all live at indices the run does not visit. Checked on the shipped
+parameters before shipping them, not inferred.
+
+The workload that landed is 260 lines and 65.5 KiB, and it is *denser* than what
+it replaces on the thing that matters: **107 lines shorter than the line before
+them, against 128 in 458 KiB** — the transition that leaves cells past the end,
+at six times the events per byte. 7.0× the bytes removed; 4.5× the wall clock,
+because boot and the QMP typing do not shrink with it.
+
+**Teeth, measured rather than argued.** Deliberate re-breaks of the console, each
+red on the reduced workload, all inside round 1 — within the first 100 lines of
+260, where the old workload's first round was 400:
+
+| break | red in |
+|---|---:|
+| a cell recorded painted that was never blitted | 10.2 s |
+| the same, confined to rows the marker never lands on | 10.8 s |
+| `scroll` leaves the old bottom row in place | 12.4 s |
+
+(A fourth, `damage` returning a span one column short, was red in 9 s against an
+earlier iteration of this workload and was not re-run against the final one.)
+
+The second exists because the others corrupt the marker row too, so they fire the
+marker check rather than the row comparison. Confining the break to rows the
+marker never lands on makes the character-for-character comparison itself the
+thing that fails, and it reports `panel row 0 … the row on screen is LONGER than
+the line that belongs there` — the sentence the test was written to be able to
+say.
+
+**One structural change came out of watching those breaks.** The poll loop used
+to ask the panel both "is the round over" and "is the panel right" at once, so a
+broken panel could not satisfy it and spent the full 90 s timeout before
+reporting that a marker never arrived. The console writes the glass before it
+mirrors the same bytes to its own stdout, so the console *stream* answers the
+first question and the panel is left to answer only the second: a break now
+reports in 9–12 s with the offending row, and the churn is no longer sampled
+408 times. Nothing observed was lost — those dumps were the loop's exit test and
+were never asserted on.
+
+**And one test was passing on nothing.** `test_screen_churn` is a workload with
+no verdict, but it was in the shared boot's Rust registry, where it ran with
+default arguments, printed 400 lines to a console nothing was reading, and
+passed on its exit code. Making its arguments required is what surfaced that; it
+is in `RUST_SKIP` now, beside the other bins that are driven rather than run.
+
+Two things this found and did not fix are in `specs/known-issues.md` §8: the
+collapsed-scroll paint the workload believed it exercised is unreachable through
+a pipe and is asserted by nothing, and `Console::flush` records the rightmost
+glyph column as painted when the scrollbar clamped the blit away from it.
+
+The screen family is 14 tests, green, **72.7 s** with this in it.
+
+## 5.3 What wave 4 actually bought, and the number it cannot reach
 
 Landed 2026-08-03. The mechanism is §3.3's: per-boot images and per-worker
 scratch (#120), the `build_toyos_bins` race closed (#121), a `Sched` on every
@@ -712,18 +817,17 @@ guest reaching a marker rather than host work. At width 4 the phase's 449 s of
 test time compressed to ~190 s of wall clock, a 2.4× on 4 workers, and the
 missing 1.6× is workers idling behind that one job.
 
-**Every number above is of the *pre-cut* `screen_console_scroll`.** That test was
-being rewritten in another worktree in the same window and lands at 27.4 s
-against 110.5 s, measured same-session there. So this wave's parallel-phase floor
-is already gone, the §3.3 claim that "past N≈5 the critical path is one test" no
-longer holds, **and the width question has to be re-asked against the new
-duration profile** — the deficit these numbers attribute to one long job will
-redistribute, and the next longest parallel jobs measured here are machine tests
-(`xhci_deaf_registers` ~48 s and `usb_flush_optional` ~39 s at width 4). Nothing
-in this suite dispatches longest-first: the durations that would order it are not
-in the tree, and adding a hand-maintained list of long tests would be a second
-registration to keep true. That is the next lever and it wants the post-cut
-profile, not this one.
+**Every number above is of the *pre-cut* `screen_console_scroll`.** §5.2 landed
+in the same window and took that test from 110.5 s to 27.4 s. So this wave's
+parallel-phase floor is already gone, the §3.3 claim that "past N≈5 the critical
+path is one test" no longer holds, **and the width question has to be re-asked
+against the new duration profile** — the deficit these numbers attribute to one
+long job will redistribute, and the next longest parallel jobs measured here are
+machine tests (`xhci_deaf_registers` ~48 s and `usb_flush_optional` ~39 s at
+width 4). Nothing in this suite dispatches longest-first: the durations that
+would order it are not in the tree, and adding a hand-maintained list of long
+tests would be a second registration to keep true. That is the next lever and it
+wants the post-cut profile, not this one.
 
 **Two classifications in §2d's snapshot were wrong, and the suite said so.**
 
@@ -760,10 +864,10 @@ read the guest's own stamps and are both in the tail.
 the one width-8 run this session that was not invalidated by an unrelated build
 refusal came in at 264.8 s — faster, but on a tree whose shared block was still
 in the parallel phase, so not comparable to the 327.5 s above. **The measured
-case for 8 is not made**, and it should be made again from scratch once the
-`screen_console_scroll` cut lands, since that is what decides how much of a wide
-phase is real work rather than idle lanes. The case *against* is unchanged by
-either: every failure this work found was a wall-clock margin closing under
+case for 8 is not made**, and it should be made again from scratch against §5.2's
+`screen_console_scroll`, since that is what decides how much of a wide phase is
+real work rather than idle lanes. The case *against* is unchanged by either:
+every failure this work found was a wall-clock margin closing under
 contention, and 8 closes them further. The width is a flag; raise it deliberately
 and read §4.1 constraint 3 first.
 

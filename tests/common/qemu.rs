@@ -1212,14 +1212,11 @@ impl QemuInstance {
         }
     }
 
-    /// Send `command` and wait for `marker` on the console.
+    /// Wait for `marker` on the console, or the timeout.
     ///
-    /// For a guest that will never report `===TEST_END`, which is any guest
-    /// the fatal path has run through: every CPU is halted by the time the
-    /// marker arrives.
-    pub fn command_until(&mut self, command: &str, marker: &str, timeout: Duration) -> bool {
-        writeln!(self.stdin, "{command}").expect("Failed to write to QEMU stdin");
-        self.stdin.flush().expect("Failed to flush QEMU stdin");
+    /// A console is a stream and this consumes it: every line up to and
+    /// including the marker is taken from whatever reads next.
+    pub fn wait_for_console(&mut self, marker: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
@@ -1231,6 +1228,17 @@ impl QemuInstance {
                 Err(_) => return false,
             }
         }
+    }
+
+    /// Send `command` and wait for `marker` on the console.
+    ///
+    /// For a guest that will never report `===TEST_END`, which is any guest
+    /// the fatal path has run through: every CPU is halted by the time the
+    /// marker arrives.
+    pub fn command_until(&mut self, command: &str, marker: &str, timeout: Duration) -> bool {
+        writeln!(self.stdin, "{command}").expect("Failed to write to QEMU stdin");
+        self.stdin.flush().expect("Failed to flush QEMU stdin");
+        self.wait_for_console(marker, timeout)
     }
 
     /// The QMP socket this instance opened. Injection needs it, and it needs

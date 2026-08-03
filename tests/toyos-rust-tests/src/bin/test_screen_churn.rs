@@ -5,54 +5,73 @@
 //! survives from an earlier line is identifiable as such rather than merely
 //! wrong.
 //!
-//! Three dimensions, all of them chosen because they produce cells a scroll
-//! has to clear rather than overwrite:
+//! The cells at risk are the ones past the end of a line that replaces a
+//! longer one, so the workload is built to produce them densely and at every
+//! column rather than to print a great many lines and hope. A line is a sweep
+//! of the panel's width plus a whole number of extra panels:
 //!
-//! - **Length varies**, past the width of the panel as well as under it. The
-//!   cells at risk are the ones past the end of a line that replaces a longer
-//!   one, and a workload of uniform lines never produces any. A line wider
-//!   than the panel also takes the soft-wrap path, which is the only way one
-//!   logical line scrolls the screen more than once.
-//! - **Batch size varies**, and drifts against the row count. A block flushed
-//!   at once is many scrolls collapsed into a single paint — a path that only
-//!   exists since the emulator stopped painting as it parsed — and the seed
-//!   the console starts with is one batch of a thousand lines.
-//! - **The last section is one batch**, which is that seed's shape.
+//! - **[`STRIDE`] is coprime with `cols`**, so any `cols` consecutive lines
+//!   end in every column of the panel exactly once. That is the column
+//!   coverage, and it is a property of the construction rather than of how
+//!   long the run is.
+//! - **[`WRAPS`] carries the extra panels**, so every eight lines hold one
+//!   that fits a row, one that wraps once and one that wraps twice. A short
+//!   run cannot lose the soft-wrap path — which a plain sweep of two panel
+//!   widths does, silently, because a partial period of it never reaches its
+//!   own top.
+//! - **Consecutive lines differ in length**, and 41% of them are shorter than
+//!   the one before: that transition is what leaves cells behind.
+//! - **Batch size varies** and drifts against the row count. A block flushed
+//!   at once is many scrolls collapsed into a single paint.
+//! - **Where the run starts is the caller's**, so several runs against one
+//!   console walk disjoint stretches instead of repeating the opening at a
+//!   different alignment.
 
 use std::io::Write;
 
-/// The body width for line `i`. Coprime stride so a long line lands on every
-/// screen row over a run, and a range that crosses the panel's width so both
-/// the wrapped and unwrapped paths are taken.
-fn body_width(i: usize) -> usize {
-    5 + (i * 37) % 500
+/// Coprime with the column count of every panel this runs on.
+const STRIDE: usize = 37;
+
+/// Extra panel widths per line, cycled. Mean 0.5, so the average line is a
+/// panel and a half — the run is not paid for twice over to reach a case that
+/// one line in eight already reaches.
+const WRAPS: [usize; 8] = [0, 1, 0, 2, 0, 1, 0, 0];
+
+fn body_width(i: usize, cols: usize) -> usize {
+    5 + (i * STRIDE) % cols + cols * WRAPS[i % WRAPS.len()]
 }
 
-fn line(i: usize) -> String {
+fn line(i: usize, cols: usize) -> String {
     let fill = char::from(b'a' + (i % 26) as u8);
-    let mid: String = std::iter::repeat(fill).take(body_width(i)).collect();
+    let mid: String = std::iter::repeat(fill).take(body_width(i, cols)).collect();
     format!("L{i:04} {mid} E{i:04}")
 }
 
-fn main() {
-    let count: usize = std::env::args()
-        .nth(1)
+/// Every argument is required: the caller is a test that knows all four, and a
+/// default here would be a second workload nobody reads.
+fn arg(n: usize) -> usize {
+    std::env::args()
+        .nth(n)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(400);
-    // Lines per flush. Zero means one batch for the whole run, which is the
-    // shape of the seed the console starts with: a thousand lines, most of
-    // them wider than the panel, arriving as a single write.
-    let chunk: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(7);
+        .unwrap_or_else(|| panic!("usage: test_screen_churn <start> <count> <chunk> <cols>"))
+}
+
+fn main() {
+    let start = arg(1);
+    let count = arg(2);
+    // Lines per flush. Zero means one batch for the whole run.
+    let chunk = arg(3);
+    let cols = arg(4);
     let out = std::io::stdout();
     let mut out = std::io::BufWriter::with_capacity(8 * 1024 * 1024, out.lock());
 
-    for i in 0..count {
-        writeln!(out, "{}", line(i)).expect("write");
-        if chunk != 0 && i % chunk == 0 {
+    for i in start..start + count {
+        writeln!(out, "{}", line(i, cols)).expect("write");
+        if chunk != 0 && (i - start) % chunk == 0 {
             out.flush().expect("flush");
         }
     }
     out.flush().expect("flush");
 
-    println!("CHURN-DONE {count}");
+    println!("CHURN-DONE {start} {count}");
 }

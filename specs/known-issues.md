@@ -2394,6 +2394,61 @@ already records against `capture()`.
 
 Belongs to #65 (boot time) rather than to the console work that found it.
 
+### The collapsed-scroll paint is reached only by the boot seed, and nothing asserts the panel after it
+
+`Console::write_bytes` flushes once per call, so a batch carrying more rows than
+the screen has scrolls the cell grid many times and reaches the panel once. That
+path is the reason `Console` composes in RAM at all, and `screen_console_scroll`
+was written believing its last round — a single 1200-line write — exercised it.
+It does not. The console reads its shell's pipe with `let mut buf = [0u8; 4096]`
+and one `read` per poll pass, so the batch it sees is capped there whatever the
+writer does: instrumented on 2026-08-03 at 1781 bytes a batch when the writer
+flushed every 7 lines and **2870** when it wrote all 1200 at once — 112 reads for
+one write. At ~257 bytes a line that is 11 lines, against the 66 rows a collapse
+needs.
+
+The only caller that does reach it is `seed_kernel_log`, which hands the console
+up to 64 KiB in one `write_bytes` at startup — a thousand rows scrolled into a
+single paint. No test asserts the panel after the seed: `screen_console_shell`
+and `screen_console_scroll` both wait for the prompt and then assert on what
+comes *after* it. So the path exists, runs on every console boot, and is checked
+by nothing.
+
+Reaching it from a test needs a writer inside the console's own process, or a
+console read larger than a batch. Not a defect in the console; a hole in what
+the screen family covers, and the workload comment that claimed otherwise is
+corrected as of this entry.
+
+### `Console::flush` records the rightmost column as painted when the scrollbar clamped it away
+
+The blit is clamped to the bar's left edge and the bookkeeping is not:
+
+```rust
+for col in first..=last {
+    ...
+    self.painted[row * self.cols + col] = Some(cell);   // every col
+}
+let w = (span * fw).min(paint_width.saturating_sub(x));  // clamped
+if w > 0 { self.screen.blit(x, row * fh, w, fh, span * fw, &strip); }
+```
+
+With the bar up, `paint_width` is `1920 - 6 = 1914`, so glyph column 239 starts
+at x=1912 and receives 2 of its 8 pixel columns — while `painted[239]` claims
+the whole cell was delivered. That is exactly the class `screen_console_scroll`
+exists to catch, written into the emulator.
+
+It self-heals, which is why no test sees it: `flush` fills `painted[.., 239]`
+with `None` on every transition of `bar != self.painted_scrollbar`, and the bar
+appears and disappears around any paging. The window is between two such
+transitions — successive `scroll_view_up` calls with the bar already up, where
+column 239's content changes and the panel keeps the old glyph. One column, only
+while paging, gone as soon as the view returns to the bottom.
+
+The fix is to clamp the loop rather than the blit, so a cell that was not
+delivered is not recorded as delivered. Left open because it is a one-column
+window under an in-progress gesture, and because the honest test for it has to
+assert the panel *while* the view is off the bottom, which nothing does yet.
+
 ### The UEFI GOP path is off by default, and picks an absurd mode when on
 
 Until `06ce633` no configuration in this tree produced a UEFI GOP at all:

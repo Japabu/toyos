@@ -44,7 +44,7 @@ enum Sched {
 /// 14 cores, `smp: 2` per guest plus QEMU's own I/O thread — about three host
 /// threads each, so four is the honest ceiling for one suite
 /// (`specs/test-cost-audit.md` §4.1 constraint 3) and eight oversubscribes the
-/// machine. Measured both ways against one HEAD in one session; §5.2 records
+/// machine. Measured both ways against one HEAD in one session; §5.3 records
 /// what each gave.
 const DEFAULT_WIDTH: usize = 4;
 
@@ -96,6 +96,12 @@ const RUST_SKIP: &[&str] = &[
     // ever answers it. `swiss_german_layout`, `locale_detect` and
     // `locale_detect_unrecognized` drive it.
     "locale_gate",
+    // A workload, not a test: it prints a pattern for `screen_console_scroll`
+    // to assert a panel against, and on its own it has no verdict at all. It
+    // used to sit in the shared boot with defaults for its arguments, where it
+    // printed four hundred lines to a console nothing was reading and passed
+    // on its exit code.
+    "test_screen_churn",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -1732,9 +1738,19 @@ fn run_screen_test(
             // the cells a scroll must clear are the ones past the end of a
             // line that replaces a longer one, and a line wider than the panel
             // is the only way one logical line scrolls the screen twice. Batch
-            // sizes drift against the row count, and the last third arrives as
-            // one block, which is the shape of the seed the console starts
-            // with.
+            // sizes drift against the row count, and the last round arrives as
+            // one block.
+            //
+            // **The workload is sized by what it must cover, not by a line
+            // count.** `test_screen_churn` documents the construction; what
+            // this end of it relies on is that any `cols` consecutive lines
+            // end in every column of the panel once, and that one line in
+            // eight wraps twice — so three rounds walking *disjoint* stretches
+            // of 260 lines between them cover both, and a longer run buys the
+            // same states again at other alignments. That is not free: the
+            // guest recomposes the whole panel for every batch the console
+            // reads, measured at 0.21 ms per byte of output under TCG, so the
+            // cost of this test is its byte count and nothing else.
             let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("console");
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
@@ -1764,8 +1780,9 @@ fn run_screen_test(
             // The same lines `test_screen_churn` prints. Duplicated
             // deliberately: a reference taken from the guest would agree with
             // the guest about a defect they shared.
+            let wraps = [0usize, 1, 0, 2, 0, 1, 0, 0];
             let churn_line = |i: usize| -> String {
-                let body = 5 + (i * 37) % 500;
+                let body = 5 + (i * 37) % cols + cols * wraps[i % wraps.len()];
                 let fill = char::from(b'a' + (i % 26) as u8);
                 let mid: String = std::iter::repeat(fill).take(body).collect();
                 format!("L{i:04} {mid} E{i:04}")
@@ -1781,7 +1798,22 @@ fn run_screen_test(
                 ch.chunks(cols).map(|c| c.iter().collect()).collect()
             };
 
-            for (round, count, chunk) in [(1usize, 400usize, 7usize), (2, 150, 7), (3, 1200, 0)] {
+            // Disjoint stretches tiling one run longer than the panel is wide,
+            // so every column of it is the last column of some line. Each
+            // round prints more than a panel's worth of rows, so the screen it
+            // is asserted on holds nothing from the round before.
+            let rounds = [
+                (1usize, 0usize, 100usize, 7usize),
+                (2, 100, 60, 7),
+                (3, 160, 100, 0),
+            ];
+            assert!(
+                rounds.windows(2).all(|w| w[0].1 + w[0].2 == w[1].1)
+                    && rounds.iter().map(|r| r.2).sum::<usize>() >= cols,
+                "the rounds must tile one run of at least {cols} lines, or some column of \
+                 the panel is never the end of a line and the cells past it are never at risk"
+            );
+            for (round, start, count, chunk) in rounds {
                 if round == 2 {
                     // Page back into history and return, mixing the scrollback
                     // view into the same session before more live output. The
@@ -1800,16 +1832,31 @@ fn run_screen_test(
                 }
                 {
                     let mut input = qemu::QmpInput::open(qemu.qmp_socket());
-                    input.type_text(&format!("test_rs_test_screen_churn {count} {chunk}\n"));
+                    input.type_text(&format!(
+                        "test_rs_test_screen_churn {start} {count} {chunk} {cols}\n"
+                    ));
                 }
-                let done = format!("CHURN-DONE {count}");
+                // When the round is over is a different question from whether
+                // the panel is right, and asking the panel both at once is how
+                // a broken panel used to spend the whole timeout and then
+                // report that a marker never arrived. The console writes the
+                // glass before it mirrors the same bytes to its own stdout, so
+                // the marker on the console stream means that batch is painted
+                // — whatever it painted. The prompt is not on the stream: the
+                // shell writes it without a newline, so nothing line-oriented
+                // ever sees it, and the bottom row is what says the child has
+                // exited.
+                let done = format!("CHURN-DONE {start} {count}");
+                if !qemu.wait_for_console(&done, Duration::from_secs(45)) {
+                    return Err(format!("round {round}: the guest never printed `{done}`"));
+                }
                 let dump = qemu.screendump_while(
-                    Duration::from_secs(90),
-                    Duration::from_millis(250),
+                    Duration::from_secs(15),
+                    Duration::from_millis(100),
                     |d| {
-                        let r = d.console_rows(&font);
-                        r.iter().any(|l| l.trim() == done)
-                            && r.last().is_some_and(|l| l.trim_end().starts_with(CONSOLE_PROMPT))
+                        d.console_rows(&font)
+                            .last()
+                            .is_some_and(|l| l.trim_end().starts_with(CONSOLE_PROMPT))
                     },
                 );
                 let decoded = dump.console_rows(&font);
@@ -1825,10 +1872,18 @@ fn run_screen_test(
                 // whole round rather than from a guess at how many lines fit,
                 // because a wrapped line makes those different numbers.
                 let mut all: Vec<String> = Vec::new();
-                for i in 0..count {
+                for i in start..start + count {
                     all.extend(display_rows(&churn_line(i)));
                 }
                 all.push(done.clone());
+                if all.len() < rows {
+                    return Err(format!(
+                        "round {round}: {count} lines occupy {} rows, which does not fill a \
+                         {rows}-row panel — what is left on it belongs to the round before, \
+                         and this round would be asserted against rows it never printed",
+                        all.len()
+                    ));
+                }
                 let want: Vec<String> = all[all.len() - (rows - 1)..].to_vec();
 
                 for (r, expect) in want.iter().enumerate() {
@@ -1865,8 +1920,9 @@ fn run_screen_test(
                     ));
                 }
                 eprintln!(
-                    "  [scroll] round {round}: {count} lines at {} per flush, all {} rows match the \
-                     model character for character",
+                    "  [scroll] round {round}: lines {start}..{} at {} per flush, all {} rows \
+                     match the model character for character",
+                    start + count,
                     if chunk == 0 { count } else { chunk },
                     rows - 1
                 );
@@ -6572,7 +6628,7 @@ fn main() {
     //
     // No longest-first heuristic, deliberately: the phase's wall clock is set by
     // its longest job and the durations that would order it are not in the tree
-    // — see `specs/test-cost-audit.md` §5.2, which measures the deficit and says
+    // — see `specs/test-cost-audit.md` §5.3, which measures the deficit and says
     // what it would take to close it.
     let mut parallel: Vec<Task> = Vec::new();
     let mut serial: Vec<Task> = Vec::new();
