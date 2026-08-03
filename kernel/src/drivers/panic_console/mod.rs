@@ -157,8 +157,41 @@ static LIVE: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
 /// this entirely and takes the screen back unconditionally.
 static SCREEN_OWNED_BY_USERLAND: AtomicBool = AtomicBool::new(false);
 
+/// Hand the screen over, and do not return while a checkpoint is still
+/// drawing on it.
+///
+/// Setting the flag stops the *next* checkpoint. It does nothing about the one
+/// already inside `paint`, which took `PAINTING` before the flag was set and
+/// goes on writing glyphs for as long as a full-panel paint takes — and that
+/// is not a short time on the machine this matters on. `paint` writes one
+/// `write_volatile` per pixel into a mapping firmware left uncached, measured
+/// at ~460 ms for 1920x1080 on the T14, against microseconds under QEMU where
+/// the framebuffer is host RAM. So the window is invisible to every test in
+/// the suite and half a second wide on the laptop.
+///
+/// A claimer that returns inside that window maps the scanout and starts
+/// composing against a screen the kernel is still painting, and whatever the
+/// checkpoint writes afterwards stays: a damage-tracked client repaints what
+/// its model says changed, and the model has no idea any of this happened.
+/// That leaves kernel log glyphs sitting in cells the client believes are
+/// blank, for the life of the session.
+///
+/// Waiting is bounded by one paint and happens once per boot. Abandoning the
+/// paint instead would be cheaper and wrong: it leaves the half of the screen
+/// already painted on the glass, which is the same corruption.
 pub fn screen_claimed_by_userland() {
-    SCREEN_OWNED_BY_USERLAND.store(true, Ordering::Relaxed);
+    SCREEN_OWNED_BY_USERLAND.store(true, Ordering::SeqCst);
+    // Bounded because a CPU that died holding the latch must not take the
+    // display down with it; one paint is the honest ceiling and this is twice
+    // the slowest one measured.
+    let deadline = crate::clock::nanos_since_boot() + 2_000_000_000;
+    while PAINTING.load(Ordering::SeqCst) {
+        if crate::clock::nanos_since_boot() > deadline {
+            log!("panic console: claim waited 2s for a checkpoint that never finished");
+            return;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// The descriptor [`arm`] validated, held so [`remap`] and [`rearm`] can
