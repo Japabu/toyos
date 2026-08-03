@@ -30,6 +30,21 @@ pub fn live_instances() -> u32 {
     LIVE.load(Ordering::SeqCst)
 }
 
+/// How many guests the phase now running may have up at once.
+///
+/// The harness's own wall-clock margins are margins on the *host*, and they were
+/// all derived when one guest had it to itself. Four is a different machine —
+/// measured, a boot that takes 4 s alone took past 10 there — so the margin has
+/// to be stated against the regime rather than widened outright, which is what
+/// this multiplies. A serial phase sets it back to 1 and gets the number it
+/// always had.
+static WIDTH: AtomicU32 = AtomicU32::new(1);
+
+pub fn set_width(width: u32) {
+    assert!(width >= 1, "a phase runs at least one guest");
+    WIDTH.store(width, Ordering::SeqCst);
+}
+
 /// The hardware shape QEMU presents to the guest.
 ///
 /// Not a display setting: each variant is a whole machine. `Headless` is the
@@ -1909,7 +1924,18 @@ fn wait_for_ready(
     let no_timeout = options.debug_wait;
     let ready = options.ready_marker;
     let panic_aborts = ready == DEFAULT_READY;
-    let boot_timeout = Duration::from_secs(10);
+    // Ten seconds per guest this phase may have up, and never fewer than two
+    // guests' worth — the tree runs 15-25 suites a day across several agents
+    // (`specs/test-cost-audit.md` §4), so one guest on a quiet host stopped being
+    // the regime some time before this did. Measured on 2026-08-03 with other
+    // agents building: two boots exceeded the flat ten seconds, one of them in a
+    // phase running a single guest.
+    //
+    // A wedge costs that much longer to report and nothing else. No test asserts
+    // on how long a boot took by *this* clock: `i8042_absent` and
+    // `xhci_slow_connect` do assert on boot timing and read the guest's own
+    // stamps, and both are in the serial tail.
+    let boot_timeout = Duration::from_secs(10) * WIDTH.load(Ordering::SeqCst).max(2);
     let start = Instant::now();
     let mut seen = String::new();
     loop {

@@ -2628,6 +2628,64 @@ was; the stale artifacts are still enumerated.
 Fix shape: enumerate from the source directory, or clean the bin directory before
 the build. Neither is done.
 
+### CLOSED — two guests in one test process were handed one boot image
+
+`boot_with_options` wrote every boot's disk to one `test-bootable.img` under the
+pid's temp directory, and every staged scratch file a test makes — `esp-boot.img`,
+`usb-gate-512.img`, the size-keyed NVMe and USB images — sat beside it under the
+same fixed names. With one guest at a time that was invisible. The first attempt
+at sharing a boot between adjacent tests found it the hard way: a guest still up
+when the next one booted had its image rewritten under it, and the new one died
+before its first line (`specs/test-cost-audit.md` §5.1).
+
+The QMP socket, the wav capture, the UART log and the screendump were already
+per-boot; the image was not, and neither was anything a test staged for itself.
+
+Closed two ways, because the two failures are different. **Per boot**: the
+bootable image is now `boot-<seq>.img` and is removed when its `QemuInstance` is
+dropped — per boot rather than per thread, since one test may hold two instances
+at once. **Per worker**: `tests/common/lane.rs` gives each thread that boots
+guests its own subdirectory, and every `test_dir()` in the harness derives from
+it, so a scratch name added *after* this still lands in the right place. Reuse
+within a lane is deliberate and is what the serial suite already did — the NVMe
+scratch is created by the first boot that wants that size and mounted by the ones
+after it.
+
+The one place that duplicated the harness's naming, `cache_eviction`'s removal of
+the stale T14 namespace, now asks `lane::dir()` for it; it was reaching for
+another lane's file otherwise, and its precondition — an *unformatted* namespace
+— would have been silently wrong rather than red.
+
+### One timed-out test on the shared boot fails every test after it
+
+`run_test` writes `run <name>` to the guest and reads until `===TEST_END`. On a
+timeout it returns and the caller moves to the next name — while the guest is
+still producing the *previous* test's output. Every later test on that boot then
+reads a window that opens on output it did not ask for, and the whole block goes
+red on `exit code Some(0)` and `output mismatch`.
+
+Measured 2026-08-03, at the width the wave-4 work was being calibrated at:
+`allocator_stress` (1 s alone) exceeded its 5 s ceiling once, and the run
+reported **114 failures out of 238** — one real, 110 of them the cascade, and
+three unrelated. The tell is a mismatch whose "actual" is verbatim the previous
+test's expected output:
+
+```
+FAIL c::01_comment: output mismatch
+--- expected ---   Hello ×5
+--- actual   ---   4 refusal outcomes decoded, none panicked the client
+```
+
+It is not caused by parallelism and predates it — anything that makes one guest
+test slow enough to time out produces it. What parallelism did was make it
+reachable, which is why the shared block is now `Sched::Serial` (`tests/toyos.rs`)
+and why this is written down rather than left to be rediscovered.
+
+Fix shape: after a timeout, resynchronise before the next `run` — read until the
+timed-out test's own `===TEST_END`, or make the marker carry the test name so a
+window that opens on the wrong one says so. Neither is done. Note the second is
+strictly better: it detects the desync instead of hoping the drain caught up.
+
 ### A QMP-driven test cannot share a boot with another one
 
 The kernel's log ring sits one line behind on an idle machine (§5), so a guest
@@ -2895,11 +2953,11 @@ The residue, for whoever sees this red next: the guard *is* load-sensitive, with
 the fix — widen `SLOW_CONNECT_NS`, because the thing that would be too small is
 the injection window and not the gate's margin.
 
-### `build_toyos_bins` reads a `.so` another build is replacing
+### CLOSED — `build_toyos_bins` read a `.so` another build was replacing
 
-`src/build.rs`'s cdylib sweep does `fs::read_dir(&lib_out).unwrap()` and then
+`src/build.rs`'s cdylib sweep did `fs::read_dir(&lib_out).unwrap()` and then
 `fs::read(so_entry.path()).unwrap()` on each entry, and between those two a
-concurrent build in the same tree can replace the file:
+concurrent build in the same tree could replace the file:
 
 ```
 thread 'main' panicked at src/build.rs:786:54:
@@ -2908,14 +2966,23 @@ called `Result::unwrap()` on an `Err` value:
 ```
 
 Seen once in four deliberately concurrent `cargo test -- xhci_slow_connect`
-processes — one died, three passed. Not provoked by anything in the suite as it
-runs today, which is why it is recorded rather than fixed: it wants the same
-treatment as the staged kernel and bootloader (read it under
-`buildlock::artifact`, or stage it under a key), and that is a change to the
-build system rather than a one-line `unwrap`.
+processes — one died, three passed.
 
-It is the fourth member of the "a red build may be the build system, not the
-code" family, and the tell is the same: the same command succeeds on the next
+Closed by the treatment the staged kernel and bootloader already had:
+`buildlock::artifact` is now held across each build→read pair in
+`build_toyos_bins`, both the cdylib sweep and the test binaries, so no other
+builder in this worktree can land between the `read_dir` and the `read`. The two
+`unwrap`s that produced the message above name their file now — a bare
+`Result::unwrap()` on a `NotFound` naming nothing is what made this hard to read
+in the first place.
+
+**What it does not cover**, and the reason it is worth saying: the lock is
+advisory and per worktree, so a `cargo build` typed by hand in
+`tests/toyos-rust-tests/` still races it. That is the same exemption every other
+`buildlock` user has.
+
+It was the fourth member of the "a red build may be the build system, not the
+code" family, and the tell was the same: the same command succeeded on the next
 attempt.
 
 ### `git stash` in a shared tree takes everyone's uncommitted work

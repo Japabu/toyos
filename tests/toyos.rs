@@ -51,10 +51,19 @@ const DEFAULT_WIDTH: usize = 4;
 /// The one boot that carries every Rust and C test.
 ///
 /// Declared here for the same reason each list entry is: it is a scheduling
-/// answer and it has to be visible. 153 tests sharing one guest, each with a 5
-/// or 10 second timeout against a median under a tenth of a second, and no
-/// assertion in the block reads a clock.
-const SHARED_BLOCK: Sched = Sched::Parallel;
+/// answer and it has to be visible.
+///
+/// **Serial, and it was measured there.** Every test in the block carries a 5 or
+/// 10 second wall-clock ceiling — generous against a median under a tenth of a
+/// second, and not against a guest sharing 14 cores with three others: at width
+/// 4 `allocator_stress` went from 1 s to past its 5 s and `demand_paging_sse`
+/// from 36 ms to past its. A ceiling on the host's clock is the definition of
+/// [`Sched::Serial`] and the reasoning that put this block in the parallel phase
+/// simply had the wrong median in it.
+///
+/// It also costs the least of anything here to run alone: 153 tests, one boot,
+/// about fourteen seconds between them (`specs/test-cost-audit.md` §1.1).
+const SHARED_BLOCK: Sched = Sched::Serial;
 
 // Rust helper binaries that are spawned by tests, not tests themselves.
 const RUST_SKIP: &[&str] = &[
@@ -177,7 +186,11 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("double_fault_stack", Sched::Parallel),
     ("diskless_boot", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
-    ("xhci_second_controller", Sched::Parallel),
+    // Its whole assertion is that a keystroke injected from the host crossed a
+    // USB keyboard on the *second* controller. Measured at width 4: the four
+    // pointer events arrived and all five keys were lost, which reads exactly
+    // like the defect this test exists to catch.
+    ("xhci_second_controller", Sched::Serial),
     ("xhci_two_controllers", Sched::Parallel),
     ("xhci_msi_only", Sched::Parallel),
     ("xhci_no_interrupt", Sched::Parallel),
@@ -6113,6 +6126,7 @@ fn run_phase(tasks: Vec<Task<'_>>, width: usize, bins: &Bins<'_>) -> Vec<Outcome
         return Vec::new();
     }
     let width = width.clamp(1, tasks.len());
+    qemu::set_width(width as u32);
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(tasks));
     let mut all = Vec::new();
     thread::scope(|scope| {
@@ -6417,6 +6431,7 @@ fn main() {
         eprintln!("  --- serial ---");
         record(run_phase(serial, 1, &bins));
     }
+    qemu::set_width(1);
 
     // Gate A, alone. `tests/audio-baseline.toml`'s numbers were recorded with
     // one QEMU on the host and no concurrent agents, so a run beside anything
@@ -6436,8 +6451,12 @@ fn main() {
                 let label = format!("{name} (smp={smp})");
                 let baseline = config_baseline(&audio_baseline, name, smp);
                 let start = std::time::Instant::now();
-                let outcome =
-                    run_audio_test(name, smp, &baseline, &test_config, &c_bins, &rust_bins);
+                // A boot that never reaches its marker panics, and gate A is the
+                // last thing the suite runs: unwrapped, that panic took the
+                // whole run's verdict with it and printed no result line at all.
+                let outcome = catching(|| {
+                    run_audio_test(name, smp, &baseline, &test_config, &c_bins, &rust_bins)
+                });
                 let elapsed = start.elapsed();
                 match outcome {
                     Ok(()) => {
