@@ -139,6 +139,7 @@ const MACHINE_TESTS: &[&str] = &[
     "i8042_fadt_denial",
     "i8042_kbd_echo",
     "i8042_undecoded_bytes",
+    "i8042_health_cadence",
     "xhci_xecp_walk",
     "xhci_slot_exhaustion",
     "usb_storage_gate",
@@ -3887,11 +3888,126 @@ fn run_machine_test(
                     events.last()
                 ));
             }
+            // The T14's line, staged. Its log read
+            //   `6 bytes, 0 keys, 2 motion, no event from
+            //    [aux 0x08, aux 0x06, aux 0x08, aux 0x0e]`
+            // on a pointer that was framing perfectly: two whole packets, and
+            // the four bytes named were their heads and first body bytes. That
+            // sent a field investigation after a desync that had not happened.
+            // Three thousand bytes of healthy packets is the same claim with
+            // three orders of magnitude more of it: a driver that cannot tell a
+            // byte it is holding from a byte it threw away names two thirds of
+            // them here.
+            let named: Vec<&str> =
+                result.serial.lines().filter(|l| l.contains("no event from")).collect();
+            if !named.is_empty() {
+                return Err(format!(
+                    "{BURST} clean packets and the driver still named bytes as undecodable:\n{}",
+                    named.join("\n")
+                ));
+            }
+            // And the count that says so directly. A discard is the byte-level
+            // resync and nothing else, so an intact stream owes zero of them —
+            // which is what makes any non-zero value on the T14's next boot
+            // mean the pointer really did lose the frame.
+            if let Some(counters) = result.serial.lines().find(|l| l.contains("discarded")) {
+                if !counters.contains("0 discarded") {
+                    return Err(format!("an intact pointer stream discarded bytes: {counters}"));
+                }
+                eprintln!("  [i8042] {}", counters.trim());
+            }
             eprintln!(
                 "  [i8042] {} pointer events, last button state {:#04x}",
                 events.len(),
                 events.last().unwrap().buttons
             );
+            Ok(())
+        }
+        "i8042_health_cadence" => {
+            // The T14 lost keyboard, TrackPoint and touchpad — all three behind
+            // this controller — 6.6 s into a session, and the driver's last
+            // word on the subject was printed 15 ms *before* it happened. The
+            // verdict was terminal, so for the remaining 54 s the log cannot
+            // distinguish "the pin stopped asserting" from "bytes kept arriving
+            // and decoded to nothing". Those are opposite defects in opposite
+            // subsystems and the counters that separate them were read once.
+            //
+            // What is under test is not that a line appears. It is that its
+            // *absence* means something: the report fires whenever the pin has
+            // asserted since the last one, so no line means no interrupt. A
+            // report that fired on a timer would satisfy every "is it alive"
+            // search and answer nothing.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    profile: qemu::Profile::Metal,
+                    qmp: true,
+                    kernel_features: &["i8042-fast-health"],
+                    ..Default::default()
+                },
+            );
+            if !qemu.boot_log().contains("i8042: kbd set2+xlat") {
+                return Err(format!("the PS/2 keyboard never came up:\n{}", qemu.boot_log()));
+            }
+            // One key, a silence several periods long, then one more key. The
+            // guest program holds the keyboard fd for 5 s and the period is
+            // 500 ms, so the quiet stretch is nine periods with nothing to say.
+            let result = qemu.run_test_hooked(
+                "test_rs_i8042_keyboard",
+                Duration::from_secs(30),
+                "===I8042_READY===",
+                |socket| {
+                    qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
+                    thread::sleep(Duration::from_millis(3000));
+                    qemu::qmp_send_keys(socket, &[("b", true), ("b", false)]);
+                    thread::sleep(Duration::from_millis(1000));
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            let lines: Vec<&str> =
+                result.serial.lines().filter(|l| l.contains("last byte at")).collect();
+            // Two keystrokes, two lines. Not one — the verdict is not the
+            // report and a driver that only ever spoke at boot would give one.
+            // Not ten — a line per period through the quiet stretch is the
+            // failure that makes silence unreadable, and it is the reason this
+            // test injects a gap at all.
+            if lines.len() != 2 {
+                return Err(format!(
+                    "two keystrokes three seconds apart, {} counter lines — the report is on a \
+                     timer rather than on the pin:\n{}",
+                    lines.len(),
+                    lines.join("\n")
+                ));
+            }
+            let last_byte_ms = |line: &str| -> Option<u64> {
+                line.rsplit_once("last byte at ")?.1.trim_end_matches("ms").parse().ok()
+            };
+            let first = last_byte_ms(lines[0])
+                .ok_or_else(|| format!("unreadable counter line: {}", lines[0]))?;
+            let second = last_byte_ms(lines[1])
+                .ok_or_else(|| format!("unreadable counter line: {}", lines[1]))?;
+            // The second line is about the second keystroke, not a rerun of the
+            // first. This is what dates the freeze on a machine whose log is
+            // read hours later.
+            if second <= first {
+                return Err(format!(
+                    "the second report dates the last byte at {second}ms, not after {first}ms — \
+                     it is repeating a stale reading:\n{}",
+                    lines.join("\n")
+                ));
+            }
+            // A working keyboard owes none of the four fault counters.
+            for want in ["0 discarded", "0 overruns", "0 dropped", "0 lost edges"] {
+                if !lines[1].contains(want) {
+                    return Err(format!("a healthy keyboard reports {want:?} wrong: {}", lines[1]));
+                }
+            }
+            eprintln!("  [i8042] {}", lines[0].trim());
+            eprintln!("  [i8042] {}", lines[1].trim());
             Ok(())
         }
         "i8042_health" => {
