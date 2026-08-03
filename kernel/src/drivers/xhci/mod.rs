@@ -315,12 +315,12 @@ const EMPTY_BUS_NS: u64 = 1_000_000_000;
 /// naming the machine's port state and a scan of whatever is connected at that
 /// moment — a flapping port costs the boot a bounded second and a half, never
 /// the machine.
-const PORT_SETTLE_CEILING_NS: u64 = 1_500_000_000;
+pub const PORT_SETTLE_CEILING_NS: u64 = 1_500_000_000;
 
 /// How often the settle re-reads the port registers. Each pass is one MMIO read
 /// per port, so on the widest controller in reach this is 16 reads per
 /// millisecond of the debounce.
-const PORT_POLL_NS: u64 = 1_000_000;
+pub const PORT_POLL_NS: u64 = 1_000_000;
 
 /// Report an empty root hub for the first [`SLOW_CONNECT_NS`] of the boot.
 ///
@@ -337,8 +337,30 @@ const PORT_POLL_NS: u64 = 1_000_000;
 /// so a driver that believes it gets nothing to enumerate, and the device that
 /// appears afterwards is enumerated by the ordinary path with the ordinary
 /// bytes behind it. Same reason `xhci-one-slot` and `xhci-deaf-port` exist.
-#[cfg(feature = "xhci-slow-connect")]
+///
+/// [`xhci-slow-storage-connect`](SLOW_STORAGE_PORT) uses the same window
+/// against one port instead of all of them, which is a different machine and
+/// not a weaker version of this one.
+#[cfg(any(feature = "xhci-slow-connect", feature = "xhci-slow-storage-connect"))]
 const SLOW_CONNECT_NS: u64 = 300_000_000;
+
+/// Report *one* root-hub port empty for the first [`SLOW_CONNECT_NS`], while
+/// every other port on the machine reads normally.
+///
+/// The machine [`xhci-slow-connect`](SLOW_CONNECT_NS) cannot stage, and the one
+/// the T14 is. [`await_connect_settle`] stops looking as soon as the connect set
+/// has held still for [`PORT_DEBOUNCE_NS`] **and is non-empty**, so a bus whose
+/// other devices have settled settles on them — and the laptop has four internal
+/// USB devices (camera, Bluetooth, card reader, fingerprint reader) that come up
+/// beside the stick it boots from. Hiding the whole bus exercises the
+/// keep-looking path and can never reach this one, because the condition that
+/// ends the wait early is precisely the presence of the devices it hides.
+///
+/// Port index 0 because that is where the boot stick lands: it is the only
+/// SuperSpeed device the profiles attach, so it takes the SuperSpeed view of the
+/// first port register while every HID takes the USB2 view of a later one.
+#[cfg(feature = "xhci-slow-storage-connect")]
+const SLOW_STORAGE_PORT: u8 = 0;
 
 /// One bit per root-hub port. HCSPARAMS1's MaxPorts is a byte, so four words
 /// cover every controller that can exist, and "did the connect state change"
@@ -478,6 +500,35 @@ static PORT_WORK_AT: AtomicU64 = AtomicU64::new(0);
 /// Whether a CPU with nothing to run must stay awake for [`PORT_WORK_AT`].
 pub fn port_work_pending() -> bool {
     PORT_WORK_AT.load(Ordering::Relaxed) != 0
+}
+
+/// Read every root-hub port again now, whatever the driver last recorded, and
+/// step whatever has changed since.
+///
+/// **The boot scan is not a census, and nothing here ever claimed it was.**
+/// [`await_connect_settle`] returns as soon as the connect set has held still
+/// for [`PORT_DEBOUNCE_NS`] and is non-empty, so a machine whose other devices
+/// are up settles on *them* and [`device::scan_ports`] runs without whatever is
+/// still coming. The T14 has four internal USB devices beside the stick it boots
+/// from, which is how that machine reached a working desktop with no `/boot` and
+/// no `/log` on one boot and mounted both on the next.
+///
+/// [`poll_if_pending`] cannot be used for this and the difference is the whole
+/// reason this exists: it returns without looking unless an interrupt was
+/// recorded or [`PORT_WORK_AT`] is due, and the end of a boot scan stores zero
+/// there precisely because nothing was left outstanding. This is for a caller
+/// that has a reason of its own to keep looking —
+/// `fat32_adapter::probe_boot_disks`, which knows firmware named a partition
+/// that nothing on this machine carries yet.
+pub fn recheck_ports() {
+    let mut wake_at: Option<u64> = None;
+    for ctrl in XHCI.lock().iter_mut() {
+        ctrl.ports_dirty = true;
+        if let Some(at) = ctrl.poll() {
+            wake_at = Some(wake_at.map_or(at, |w: u64| w.min(at)));
+        }
+    }
+    PORT_WORK_AT.store(wake_at.unwrap_or(0), Ordering::Relaxed);
 }
 
 const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
@@ -839,6 +890,10 @@ impl XhciController {
         let raw = self.op_base.read_u32(OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE);
         #[cfg(feature = "xhci-slow-connect")]
         if crate::clock::nanos_since_boot() < SLOW_CONNECT_NS {
+            return raw & !(PORTSC_CCS | PORTSC_PED | PORTSC_SPEED);
+        }
+        #[cfg(feature = "xhci-slow-storage-connect")]
+        if port_idx == SLOW_STORAGE_PORT && crate::clock::nanos_since_boot() < SLOW_CONNECT_NS {
             return raw & !(PORTSC_CCS | PORTSC_PED | PORTSC_SPEED);
         }
         #[cfg(feature = "xhci-portsc-rw1c")]

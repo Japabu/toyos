@@ -108,6 +108,17 @@ xhci-deaf-port = []
 # does, and the device that appears afterwards enumerates by the ordinary path.
 # See `xhci/mod.rs`'s `SLOW_CONNECT_NS`.
 xhci-slow-connect = []
+# Report the *first* root-hub port empty for the same window, leaving every
+# other port on the machine reading normally. A different machine from the one
+# above and not a weaker version of it: `await_connect_settle` ends as soon as
+# the connect set has held still and is non-empty, so a bus whose other devices
+# have settled settles on them — which is the T14, with four internal USB
+# devices beside the stick it boots from, and the interleaving that cost it
+# `/boot` and `/log` on one boot and not the next. Hiding the whole bus can
+# never reach it, because the devices it hides are the ones that would end the
+# wait early. The register is replaced, not a verdict.
+# See `xhci/mod.rs`'s `SLOW_STORAGE_PORT`.
+xhci-slow-storage-connect = []
 # Give PORTSC's PED bit (bit 1) the RW1CS meaning xHCI 1.2 §5.4.8 gives it: a
 # port software writes a '1' to goes from Enabled to Disabled (§4.19.1.1.6) and
 # reads PED clear until it is reset again. QEMU's `xhci_port_write` clears only

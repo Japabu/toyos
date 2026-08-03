@@ -32,6 +32,7 @@ pub fn open(index: usize) -> Option<UsbBlockDevice> {
         index,
         id: USB_DEVICE_ID_BASE + index as DeviceId,
         blocks: geometry.blocks,
+        lba_bytes: geometry.logical_block_bytes,
     })
 }
 
@@ -39,9 +40,21 @@ pub struct UsbBlockDevice {
     index: usize,
     id: DeviceId,
     blocks: u64,
+    /// What the device addresses in, kept because the caller that needs it had
+    /// to ask the controller a second time to get it — and a second question
+    /// has a second `None`, which is a skip nobody was going to log. One `open`
+    /// is one answer.
+    lba_bytes: u32,
 }
 
 impl UsbBlockDevice {
+    /// The device's own logical block size, for a caller that has to speak in
+    /// them: a GPT is laid out in these, not in the 4 KiB [`BlockDevice`]
+    /// transfers.
+    pub fn logical_block_bytes(&self) -> u32 {
+        self.lba_bytes
+    }
+
     /// Whether the controller will still speak to the disk under this index.
     ///
     /// Distinct from a failed transfer, which the trait reports: this answers
