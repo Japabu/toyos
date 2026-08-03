@@ -422,20 +422,16 @@ pub struct CounterLimits {
     pub underruns: u32,
 }
 
-/// Gate on soundd's in-guest accounting. Unlike the wav histogram — a
-/// rare-event detector that samples ~1000 periods once per run — these
-/// counters are non-zero on nearly every run, so they can actually resolve a
-/// change in the failure rate.
-pub fn check_counters(
-    counters: &SounddCounters,
-    limits: &CounterLimits,
-) -> Result<(), String> {
-    if counters.windows == 0 {
-        return Err(
-            "soundd printed no stats window with clients — the tone never reached the mixer"
-                .to_string(),
-        );
-    }
+/// Which of this config's per-run ceilings this run sits outside, one message
+/// each. Unlike the wav histogram — a rare-event detector that samples ~1000
+/// periods once per run — these counters are non-zero on nearly every run, so
+/// the *rate* at which they breach can resolve a change the histogram cannot.
+///
+/// A breach is not by itself audible: a pipeline that drained and recovered put
+/// no silence on the wire. So this decides nothing on its own — the thorough
+/// tier counts breaches and compares the rate, and the fast tier prints them
+/// and judges harm.
+pub fn check_counters(counters: &SounddCounters, limits: &CounterLimits) -> Vec<String> {
     let mut problems = Vec::new();
     if counters.max_wake_lat_us > limits.max_wake_lat_us {
         problems.push(format!(
@@ -458,11 +454,7 @@ pub fn check_counters(
             counters.underruns, limits.underruns, counters.submitted
         ));
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("soundd counter regression: {}", problems.join("; ")))
-    }
+    problems
 }
 
 /// Structural §5.8 suspend assertions, per-run and yes/no: the device stream

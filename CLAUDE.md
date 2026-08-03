@@ -107,7 +107,7 @@ The kernel ABI and SDK are Rust-native and capability-shaped. POSIX compatibilit
 
 **Gate A (audio) has two tiers.** `tests/audio-baseline.toml` documents both in full and justifies every number in it.
 
-- **Fast** — part of every `cargo test`. One boot per config. Certifies the per-run counter ceilings, that the instrument is alive, and that audio does not *reproducibly* drop out (a dropout re-boots once; only a second one fails). It certifies nothing about a rate — one run is one sample.
+- **Fast** — part of every `cargo test`. One boot per config. Certifies that the instrument is alive and that this build does not *reproducibly* put silence on the wire. **The verdict is harm** — a mid-tone gap in the capture, or a period soundd submitted with no client audio behind it — and it re-boots once to confirm before failing. The per-run ceilings are measured and printed here and fail nothing: a drain that recovered is not audio anyone heard, and one boot cannot tell you how often it recovers. It certifies nothing about a rate — one run is one sample.
 - **Thorough** — `cargo test --test toyos-build -- --audio-gate N`. N iterations of all four configs; every per-run outcome becomes a rate or a distribution, compared against the recorded sample by Mann-Whitney (counters) and Fisher exact (yes/no outcomes). **A scheduler-migration stage transition gates on this tier.** At N=30 it detects a 25% shift in wake lateness and a 5% drop in soundd's wake count 99.9% of the time, with a 0.25% false-red rate on a clean tree; it does *not* detect a doubling of the dropout rate, and no N a human waits for would.
 
 The gate's four instrument defects and the dropout regression they hid are closed and written up in `specs/audio-gate-history.md`. The reusable lesson: these counters drift between batches on one host with no code change, so only same-session A/B numbers mean anything.
@@ -201,11 +201,10 @@ Read the spec before touching the subsystem it covers.
 
 **`specs/known-issues.md` is the list and the file to update** — ten sections, every open item with its evidence and its reproduction. Read it before touching a subsystem. Nothing is duplicated here.
 
-Six bite an agent who is *not* working on the subsystem:
+Five bite an agent who is *not* working on the subsystem:
 
 - **A boot that wedges before the idle loop produces no serial output at all** — the log ring's only drains are the timer tick and the idle loop, and neither runs during the boot phases. It looks exactly like a kernel that never started. Known-issues §5 carries the one-line patch that makes one bisectable.
 - **`Command::output()` returns an empty stderr, always** — the toyos `output` asks `spawn` for the pipe and then drops it. A guest test asserting on a child's refusal message passes vacuously. Use `spawn()` + `wait_with_output()`.
-- **Gate A can fail a run on `drains` alone**, with no gap and no underrun. A per-run failure should require evidence of harm.
 - **`log_file`'s flush is unbounded and uninterruptible, in `idle_loop` before `pass()`.** Anything added to the idle loop is an audio change, and userland `println!` shares that ring. The pre-`hlt` recheck beside it now has four conditions that only a deferred-callback facility would remove; xHCI's is the one that holds an idle CPU awake for as long as 100 ms.
 - **The fork estate is outside every check the tree runs on itself.** "I enumerated the call sites" is only true if the enumeration covered `~/.cargo/git/checkouts/`.
 - **A filtered C-test run can be red for a daemon's line rather than for its own output.** `cargo test -- <name>` opens one capture window, soundd's boot lines land in it, and that family compares whole stdout. Judge it from a full run.

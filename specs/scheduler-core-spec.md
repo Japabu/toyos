@@ -1048,9 +1048,11 @@ Bernoulli trial against a 0–7% per-config dropout rate: it reds an unmodified 
 invocations and cannot see a doubling of that rate. **No stage may be gated on it.** The gate is
 therefore two-tiered, and only the thorough tier states anything about a rate:
 
-- **Fast tier** (inside every `cargo test`): per-run counter ceilings, instrument-alive checks,
-  and a *confirmed* zero-gap bar — a run that drops audio re-boots once and only a second
-  dropout fails. Certifies that this build is not catastrophically broken. Certifies no rate.
+- **Fast tier** (inside every `cargo test`): instrument-alive checks and a *confirmed* harm bar —
+  a mid-tone gap or a period submitted with no client audio re-boots once, and only a second
+  occurrence fails. The per-run counter ceilings are measured and printed here but decide
+  nothing (owner's ruling, 2026-08-04; `tests/audio-baseline.toml` documents it). Certifies
+  that this build is not catastrophically broken. Certifies no rate.
 - **Thorough tier** (`--audio-gate N`, what **A** means in the table): N iterations of all four
   configs, every per-run outcome converted to a rate or a distribution and compared against the
   recorded 30-run sample in `tests/audio-baseline.toml` — Mann-Whitney for soundd's counters,

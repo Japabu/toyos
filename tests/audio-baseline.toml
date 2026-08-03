@@ -5,7 +5,9 @@
 # Every config must appear here. A missing section is a hard error, not a
 # pass: an ungated config would go green by omission.
 #
-# Two independent instruments per config; both must hold.
+# Two independent instruments per config. What each one is allowed to decide
+# differs by tier, and TWO TIERS below is where that is settled: only silence
+# that reached the device fails a single run.
 #
 #   gaps              Underrun histogram from the captured wav, keyed by gap
 #                     length in whole device periods (2.902ms). An absent
@@ -121,6 +123,10 @@
 # watching. Doubling it puts the per-config false-red rate well under 1% while
 # still failing on a doubling of the tail, which is the magnitude a scheduler
 # regression that broke RT preemption or the audio IRQ path would produce.
+# Since 2026-08-04 what a breach can redden is the thorough tier's pooled
+# `ceiling_runs` rate rather than a `cargo test`, so this is now the false-red
+# argument for the recorded 0/120 that rate is compared against. The derivation
+# is unchanged and so is every number below.
 #
 # The tails were not physics. The previous sample's worst wake lateness on
 # `audio_tone_load.smp1` went 26627us at n=15 to 92989us at n=30 — one more run
@@ -159,14 +165,32 @@
 # ===========================================================================
 #
 # FAST TIER — `cargo test`, one boot per config, every time.
-#   Certifies: this build's counters sit inside the per-run ceilings above,
-#   the instrument is alive (tone present, dither present, no clicks), and the
-#   capture does not *reproducibly* drop audio. A run that drops audio is
-#   re-booted once and only a second dropout fails: the strict zero-gap bar is
-#   unchanged, but one Bernoulli trial against a 0-7% per-config rate is not a
-#   verdict, and the un-confirmed version measured 12.8% red per invocation on
-#   an unmodified tree. The 2-of-2 rule takes that to 0.67%. The first dropout
-#   is still printed and its wav still kept.
+#   Certifies: the instrument is alive (tone present, dither present, no clicks,
+#   a stats window that exists at all), no counter sits on the wrong side of a
+#   physical bound, and this build does not *reproducibly* put silence on the
+#   wire.
+#
+#   THE VERDICT IS HARM, and harm is silence that reached the device: a
+#   mid-tone gap in the capture, or a period soundd submitted with no client
+#   audio behind it (`underruns`). The ceilings above are measured on every run,
+#   printed with the run's counters, and fail nothing here. `drains` past its
+#   ceiling with an empty histogram and zero underruns is a pipeline that
+#   recovered before anyone could hear it, and one boot cannot say whether it
+#   recovers less often than it used to — that is a rate, and the tier below is
+#   the instrument for it. Owner's ruling, 2026-08-04.
+#
+#   Harm is confirmed before it fails: a run showing any is re-booted once and
+#   only a second failure counts. The strict zero-gap bar is unchanged and
+#   applies to both boots — one Bernoulli trial against a 0-7% per-config rate
+#   is not a verdict, and the un-confirmed version measured 12.8% red per
+#   invocation on an unmodified tree. The 2-of-2 rule takes that to 0.67%. The
+#   first occurrence is still printed and its wav still kept.
+#
+#   The direction this moved in is not "looser". `underruns` was previously
+#   judged against the ceiling above (12-70 depending on config), so 40 periods
+#   of silence on the wire passed; it is now judged against zero, which is what
+#   all 120 recorded runs measured. What stopped failing a single run is the
+#   counters that describe timing rather than output.
 #   What it CANNOT certify: any statement about a rate. One run is one sample.
 #
 # THOROUGH TIER — `cargo test --test toyos-build -- --audio-gate 30`, ~17 minutes.

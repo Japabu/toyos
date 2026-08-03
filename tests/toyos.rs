@@ -554,16 +554,40 @@ struct AudioRun {
     gaps: BTreeMap<u32, u32>,
     counters: audio::SounddCounters,
     /// The instrument itself is untrustworthy on this run (no tone, no dither,
-    /// clicks). Never a rare-event judgement — always fatal, in both tiers.
+    /// clicks, no stats window). Never a rare-event judgement — always fatal,
+    /// in both tiers.
     broken: Vec<String>,
-    /// soundd counters past this config's per-run ceilings. Fatal in the fast
-    /// tier; a counted rate in the thorough tier.
+    /// soundd counters past this config's per-run ceilings. A counted rate in
+    /// the thorough tier; printed but not a verdict in the fast tier, which
+    /// judges `harm` instead.
     breaches: Vec<String>,
 }
 
 impl AudioRun {
+    /// The capture's verdict alone. The thorough tier's dropout *rate* is
+    /// defined on this and nothing else, because that is what the recorded
+    /// sample counted.
     fn dropped_audio(&self) -> bool {
         !self.gaps.is_empty()
+    }
+
+    /// Silence that reached the device on this run: a mid-tone gap in the
+    /// capture, or a period soundd put on the wire with no client audio behind
+    /// it. Both are audio someone would have heard drop out, and together they
+    /// are the fast tier's whole verdict — a counter past a ceiling says the
+    /// pipeline came close, and how close is a question for a distribution.
+    fn harm(&self) -> Option<String> {
+        let mut evidence = Vec::new();
+        if self.dropped_audio() {
+            evidence.push(format!("dropout {}", audio::format_histogram(&self.gaps)));
+        }
+        if self.counters.underruns > 0 {
+            evidence.push(format!(
+                "{} of {} periods submitted with no client audio",
+                self.counters.underruns, self.counters.submitted
+            ));
+        }
+        (!evidence.is_empty()).then(|| evidence.join(", "))
     }
 }
 
@@ -653,9 +677,13 @@ fn measure_audio_run(
         counters.windows,
     );
 
-    let mut breaches = Vec::new();
-    if let Err(regression) = audio::check_counters(&counters, &baseline.counters) {
-        breaches.push(regression);
+    let breaches = audio::check_counters(&counters, &baseline.counters);
+    if !breaches.is_empty() {
+        eprintln!(
+            "        {label}{name} smp={smp} over ceiling: {} — recorded; the fast tier's \
+             verdict is harm, the rate of these is the thorough tier's",
+            breaches.join("; ")
+        );
     }
 
     // A counter past a physical bound is the instrument failing, so it belongs
@@ -663,6 +691,15 @@ fn measure_audio_run(
     // must fail loudly in both tiers, and it must never be ranked against the
     // recorded sample or printed into the next baseline.
     let mut problems = audio::check_physical(&counters, run_start.elapsed().as_secs_f64());
+    // soundd counts only while it has clients, so a run with no window reports
+    // zero for every counter — the best numbers this gate can see, from a run
+    // that measured nothing. That is the instrument dead, not a ceiling held.
+    if counters.windows == 0 {
+        problems.push(
+            "soundd printed no stats window with clients — the tone never reached the mixer"
+                .to_string(),
+        );
+    }
     if secs(analysis.active_samples) < TONE_MIN_ACTIVE_SECS {
         problems.push(format!(
             "tone missing: only {:.2}s of active signal (expected >= {TONE_MIN_ACTIVE_SECS}s)",
@@ -757,18 +794,26 @@ fn measure_audio_run(
 
 /// Fast tier — one boot per config, run on every `cargo test`.
 ///
-/// Certifies: this build's soundd counters sit inside their recorded per-run
-/// ceilings, the instrument is alive, and the capture does not *reproducibly*
-/// drop audio. It cannot certify a dropout *rate*; one run is one Bernoulli
-/// trial against a per-config rate measured at 0-7%, which discriminates
-/// nothing. That is what `--audio-gate` is for.
+/// Certifies: the instrument is alive, no counter is on the wrong side of a
+/// physical bound, and this build does not *reproducibly* put silence on the
+/// wire. It cannot certify a *rate*; one run is one Bernoulli trial against a
+/// per-config dropout rate measured at 0-7%, which discriminates nothing. That
+/// is what `--audio-gate` is for.
 ///
-/// The dropout check keeps the strict zero-gap bar and adds a confirmation: a
-/// run that gaps is re-booted once, and only a second gap fails. No limit is
-/// widened by this. Without the confirmation the per-config dropout rate alone
-/// reds one invocation in eight on a clean tree, and a gate developers see
-/// every day cannot cry wolf that often. The first gap is still printed and the
-/// capture still kept.
+/// **The verdict is harm** — a mid-tone gap in the capture, or a period soundd
+/// submitted with no client audio behind it. The per-run ceilings are measured,
+/// printed and kept, and fail nothing here: `drains` past its ceiling with an
+/// empty histogram and zero underruns is a pipeline that recovered before
+/// anyone could hear it, and one boot cannot say whether it recovers less often
+/// than it used to. That question has an instrument with power, and it is the
+/// thorough tier's `ceiling_runs` rate.
+///
+/// Harm is confirmed before it fails: a run that shows any is re-booted once,
+/// and only a second failure counts. No bar is widened by this — the zero-gap
+/// bar is strict on both boots. Without the confirmation the per-config dropout
+/// rate alone reds one invocation in eight on a clean tree, and a gate
+/// developers see every day cannot cry wolf that often. The first occurrence is
+/// still printed and its capture still kept.
 fn run_audio_test(
     name: &str,
     smp: u32,
@@ -779,35 +824,35 @@ fn run_audio_test(
 ) -> Result<(), String> {
     let run = measure_audio_run(name, smp, baseline, test_config, c_bins, rust_bins, "")?;
 
-    let problems = [run.broken.as_slice(), run.breaches.as_slice()].concat();
-    if !problems.is_empty() {
-        return Err(problems.join("\n    "));
+    if !run.broken.is_empty() {
+        return Err(run.broken.join("\n    "));
     }
-    if !run.dropped_audio() {
+    let Some(harm) = run.harm() else {
         return Ok(());
-    }
+    };
 
+    let silent_runs = baseline.sample.underruns.iter().filter(|&&u| u > 0.0).count();
     eprintln!(
-        "        {name} smp={smp} DROPOUT {} — rare on this tree ({} of {} recorded runs); \
-         re-booting once to confirm",
-        audio::format_histogram(&run.gaps),
+        "        {name} smp={smp} HARM {harm} — rare on this tree ({} of {} recorded runs \
+         dropped audio, {silent_runs} of {} submitted a silent period); re-booting once \
+         to confirm",
         baseline.sample.gap_runs,
         baseline.sample.gap_sample,
+        baseline.sample.underruns.len(),
     );
     let again = measure_audio_run(name, smp, baseline, test_config, c_bins, rust_bins, "confirm")?;
-    let problems = [again.broken.as_slice(), again.breaches.as_slice()].concat();
-    if !problems.is_empty() {
-        return Err(problems.join("\n    "));
+    if !again.broken.is_empty() {
+        return Err(again.broken.join("\n    "));
     }
-    if again.dropped_audio() {
-        return Err(format!(
-            "audio dropped out on two consecutive boots: {} then {}",
-            audio::format_histogram(&run.gaps),
-            audio::format_histogram(&again.gaps),
-        ));
+    match again.harm() {
+        Some(again_harm) => Err(format!(
+            "audio dropped out on two consecutive boots: {harm} then {again_harm}"
+        )),
+        None => {
+            eprintln!("        {name} smp={smp} not reproduced on the confirming boot");
+            Ok(())
+        }
     }
-    eprintln!("        {name} smp={smp} not reproduced on the confirming boot");
-    Ok(())
 }
 
 // Thorough tier: `cargo test --test toyos-build -- --audio-gate N`

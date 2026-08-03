@@ -2128,12 +2128,58 @@ target, not `roundss`.** The quantizer calls it once per sample (256/period,
 hardware baseline, so enabling it in the target spec turns this into one
 instruction; whether to widen the target's feature set is a separate decision.
 
-**Gate A can still fail a run on `drains` alone** (`tests/common/audio.rs:441`),
-with an empty gap histogram and zero underruns. The proportional-recovery fix
-(`91a653c`) deliberately decoupled drains from harm, so a per-run failure should
-require evidence of harm — gaps or underruns — with `drains` reported and not
-fatal. The re-record at `dc732e5` set honest ceilings, so this is now a
-robustness question rather than a live false-red.
+**CLOSED — gate A's fast tier could fail a run on `drains` alone**, with an empty
+gap histogram and zero underruns. The proportional-recovery fix (`91a653c`) had
+already decoupled drains from harm; the owner's ruling of 2026-08-04 made the
+fast tier's verdict harm itself — a mid-tone gap in the capture, or a period
+soundd put on the wire with no client audio behind it (`AudioRun::harm`). The
+three per-run ceilings are still measured, printed with every run's counters and
+kept; what they feed is the thorough tier's `ceiling_runs` rate, unchanged.
+
+Two things moved the other way in the same change, and neither is a loosening.
+`underruns` was judged against a ceiling of 12-70 depending on config, so 40
+periods of silence on the wire passed a run; it is now judged against zero, which
+is what all 120 recorded runs measured. And a run where soundd printed no stats
+window at all used to be a ceiling breach — which under a harm verdict would have
+passed — so it moved to the instrument-broken set, fatal in both tiers. It was
+also the one breach that could enter the thorough tier's sample as a run of
+all-zero counters, i.e. as the best run ever measured.
+
+### OPEN — one boot put 142 ms of silence on the wire, and the host was not quiet
+
+Observed 2026-08-03 while negative-controlling the change above, on tree `602d4e1`
+with a harness-only diff — kernel, soundd and the tone client identical to `main`.
+`audio_tone_load` smp=1, one boot of four:
+
+```
+gaps: total 1 [49p×1]   (142.22 ms of mid-tone silence at 0.813 s)
+soundd: wake_lat 46568us (2.01 pipelines)  drains 1  underruns 49  submitted 1203
+```
+
+All three instruments agree, which is what makes it one event rather than an
+artefact: soundd woke 46.6 ms late — two pipeline depths, so every buffer had
+already played out — the pipeline drained once, 49 periods went out with no client
+audio behind them, and the capture shows exactly that silence. The recorded sample
+for this config is 0/30 dropouts, `underruns` 0 on all 30 runs, and a worst wake of
+8250 us; this run is 5.6x that worst wake.
+
+**The host was not quiet.** Another agent's `qemu-system-x86_64` was running in the
+primary checkout (observed one second after the run), 1/5/15-minute load averages
+6.77/10.19/10.15 on 14 cores. Under the owner's ruling of 2026-08-04 that is not an
+excuse and not grounds to re-run it away: the load an audio test puts on this host
+is negligible, so a load-coincident stall is a defect of the pipeline until
+something shows otherwise. Filed here rather than investigated, per the
+one-task-one-agent rule.
+
+Not reproduced in the two other unstaged boots of this config in the same session
+(wake 5817 us and 5280 us, `gaps: none`, `underruns` 0 on both). The capture was
+kept by the harness, in its per-pid scratch directory — which is temporary, so the
+numbers above are the durable record.
+
+The nearest suspect on file is §10's ESP-log flush on the idle path and the
+`log_file` flush in `idle_loop` (§3): unbounded, uninterruptible, and in the one
+place a `--smp 1` machine spends the time between audio periods. That is a
+hypothesis, not a measurement.
 
 ---
 
