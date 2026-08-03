@@ -63,7 +63,7 @@ fn parse_config(path: &Path) -> SystemConfig {
 /// Fingerprint all external build dependencies that cargo cannot track.
 fn external_fingerprint(root: &Path) -> String {
     let host = toolchain::host_triple();
-    let sysroot = root.join(format!("rust/build/{host}/stage2/lib/rustlib"));
+    let sysroot = toolchain::rust_dir(root).join(format!("build/{host}/stage2/lib/rustlib"));
     let mut entries = Vec::new();
 
     for triple in ["x86_64-unknown-toyos", "x86_64-unknown-none", "x86_64-unknown-uefi"] {
@@ -154,6 +154,7 @@ fn clean(crate_dir: &Path, kind: Clean, fingerprint: &str) {
 /// pair of `cargo clean`s that died with ENOENT on each other's files.
 fn invalidate_stale(root: &Path, lock: &mut buildlock::Held, targets: &[(PathBuf, Clean)]) {
     lock.act_if(
+        buildlock::Scope::Worktree,
         "clean crate targets against changed external deps",
         || {
             let fp = external_fingerprint(root);
@@ -434,11 +435,12 @@ pub fn build(
     release: bool,
     boot: Boot,
     rebuild_toolchain: bool,
+    claim_sysroot: bool,
 ) -> PathBuf {
     // Held until the last staged artifact has been read back, so no other
     // agent's clean or toolchain rebuild can land inside this build.
     let mut lock = buildlock::shared(root, "build");
-    toolchain::ensure(root, rebuild_toolchain, &mut lock);
+    toolchain::ensure(root, rebuild_toolchain, claim_sysroot, &mut lock);
 
     let profile = if release { "release" } else { "debug" };
     let path_env = toolchain::path_with_toyos_ld(root);
@@ -589,7 +591,7 @@ pub fn build_test_image(
     // back after the userland build, and a clean landing in between is the
     // same defect as one landing mid-compile.
     let mut lock = buildlock::shared(root, "test image");
-    crate::toolchain::ensure(root, false, &mut lock);
+    crate::toolchain::ensure(root, false, false, &mut lock);
     let path_env = toolchain::path_with_toyos_ld(root);
     let config = parse_config(config_path);
 
@@ -658,7 +660,7 @@ pub fn build_test_image(
 /// Also builds any cdylib subcrates and includes their .so files.
 pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(String, Vec<u8>)> {
     let mut lock = buildlock::shared(root, "test binaries");
-    crate::toolchain::ensure(root, false, &mut lock);
+    crate::toolchain::ensure(root, false, false, &mut lock);
     let path_env = toolchain::path_with_toyos_ld(root);
 
     let mut targets = vec![(crate_path.to_path_buf(), Clean::All)];
@@ -753,7 +755,7 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(Str
 // --- Internal helpers ---
 
 fn collect_hosted_rustc(root: &Path, initrd_files: &mut Vec<(String, Vec<u8>)>) {
-    let sysroot = root.join("rust/build/x86_64-unknown-toyos/stage2");
+    let sysroot = toolchain::rust_dir(root).join("build/x86_64-unknown-toyos/stage2");
     assert!(
         sysroot.exists(),
         "Hosted rustc sysroot missing: {}",
@@ -812,7 +814,7 @@ fn collect_hosted_rustc(root: &Path, initrd_files: &mut Vec<(String, Vec<u8>)>) 
 }
 
 fn find_host_rlibs(root: &Path) -> Option<PathBuf> {
-    let build_dir = root.join("rust/build");
+    let build_dir = toolchain::rust_dir(root).join("build");
     let entries = fs::read_dir(&build_dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();

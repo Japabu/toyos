@@ -51,6 +51,7 @@ fn main() {
     let build_only = args.iter().any(|a| a == "--build-only");
     let dump_audio = args.iter().any(|a| a == "--dump-audio");
     let rebuild_toolchain = args.iter().any(|a| a == "--rebuild-toolchain");
+    let claim_sysroot = args.iter().any(|a| a == "--claim-sysroot");
     let smp = parse_smp(&args);
     let profile = parse_profile(&args);
     let mute = args.iter().any(|a| a == "--mute");
@@ -86,11 +87,22 @@ fn main() {
         return;
     }
 
-    toyos_build::ensure_submodules(&root);
+    if args.iter().any(|a| a == "--worktree") {
+        toyos_build::worktree::dispatch(&root, &args);
+        return;
+    }
+
+    // Only where the submodules belong. In a linked worktree `rust/` is an empty
+    // stub and initialising it clones the whole rust history again, into a git
+    // directory of its own that shares no objects with the one beside it.
+    if matches!(toyos_build::toolchain::owner(&root), toyos_build::toolchain::Owner::Us) {
+        toyos_build::ensure_submodules(&root);
+    }
 
     // Toolchain included: `build` holds the build lock across both, so no other
     // agent's clean or bootstrap can land between the two.
-    let image = toyos_build::build::build(&root, debug, release, boot, rebuild_toolchain);
+    let image =
+        toyos_build::build::build(&root, debug, release, boot, rebuild_toolchain, claim_sysroot);
     println!("Build finished.");
     println!("Boot image: {}", image.display());
 

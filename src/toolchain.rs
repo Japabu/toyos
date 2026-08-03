@@ -1,9 +1,11 @@
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
 use crate::buildlock;
+use crate::buildlock::Scope;
 use crate::stamps;
 
 /// Which x.py build a stale toolchain needs.
@@ -14,6 +16,133 @@ enum Bootstrap {
     /// rebuilding that one costs minutes.
     Full { invalidate_hosted: bool },
     Std,
+}
+
+/// Which checkout holds the `rust/` submodule and the toolchain built from it.
+pub enum Owner {
+    Us,
+    /// The primary checkout, named so a refusal can point at it.
+    Elsewhere(PathBuf),
+}
+
+/// One `rust/` per repository, in the primary checkout, and every worktree
+/// compiles against it.
+///
+/// Not a policy — an affordance. A second checkout of that submodule is a
+/// 913 MiB clone (git gives a linked worktree its own, sharing no objects), and
+/// a second `build/` beside it is 47 GiB. `git worktree add` leaves `rust/` an
+/// empty stub, and leaving it empty is what keeps `git status` clean: git
+/// refuses a symlink where a gitlink belongs, and errors out of every command
+/// rather than just that one.
+pub fn owner(root: &Path) -> Owner {
+    let primary = crate::primary_checkout(root);
+    let same = fs::canonicalize(root).map(|r| r == primary).unwrap_or(false);
+    if same {
+        return Owner::Us;
+    }
+    assert!(
+        primary.join("rust/x.py").exists(),
+        "{} is a linked worktree, so the shared rust checkout should be at {}, \
+         and there is nothing there.\n\
+         A repository laid out with --separate-git-dir cannot be located this way.",
+        root.display(),
+        primary.join("rust").display()
+    );
+    Owner::Elsewhere(primary)
+}
+
+/// The shared rust checkout: source, `build/`, and the sysroot every worktree
+/// compiles against.
+pub fn rust_dir(root: &Path) -> PathBuf {
+    match owner(root) {
+        Owner::Us => root.join("rust"),
+        Owner::Elsewhere(primary) => primary.join("rust"),
+    }
+}
+
+/// The per-worktree sources that end up *inside* the shared sysroot: std links
+/// `toyos-abi` and `toyos`, and `libtoyos_c.a` is `userland/libc`.
+const SYSROOT_SOURCES: [&str; 3] = ["toyos-abi/src", "toyos/src", "userland/libc/src"];
+
+/// Of those, the ones a change to obliges an std rebuild.
+const STD_SOURCES: [&str; 2] = ["toyos-abi/src", "toyos/src"];
+
+/// What the sysroot on disk was built from.
+fn witness_path(rust_dir: &Path) -> PathBuf {
+    rust_dir.join("build/toyos-sysroot-witness")
+}
+
+/// Fingerprint the sources that get compiled into the shared sysroot.
+///
+/// By content and by repository-relative path, where [`stamps`] uses mtime and
+/// absolute path. Two checkouts of one commit agree on the first and on neither
+/// of the second, and the question here is across checkouts: a worktree whose
+/// `toyos-abi` differs from the one the sysroot holds would compile its kernel
+/// against another worktree's struct layouts. Nothing downstream can catch
+/// that — the build succeeds and the guest corrupts memory.
+fn witness(root: &Path) -> String {
+    let mut lines = Vec::new();
+    for tree in SYSROOT_SOURCES {
+        let mut files = Vec::new();
+        collect_sources(&root.join(tree), &mut files);
+        files.sort();
+        for path in files {
+            let data = fs::read(&path)
+                .unwrap_or_else(|e| panic!("witness {}: {e}", path.display()));
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            data.hash(&mut hasher);
+            lines.push(format!("{}:{:016x}", rel.display(), hasher.finish()));
+        }
+    }
+    lines.join("\n")
+}
+
+fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if !name.starts_with('.') && name != "target" {
+                collect_sources(&path, out);
+            }
+        } else if path.extension().is_some_and(|e| e == "rs" || e == "toml" || e == "h") {
+            out.push(path);
+        }
+    }
+}
+
+/// The lines of a witness belonging to `trees`.
+fn witness_subset(text: &str, trees: &[&str]) -> String {
+    text.lines()
+        .filter(|l| trees.iter().any(|t| l.starts_with(t)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Which of [`SYSROOT_SOURCES`] this worktree disagrees with the sysroot about.
+fn differing_trees(recorded: Option<&str>, current: &str) -> String {
+    let Some(recorded) = recorded else {
+        return "nothing recorded what the sysroot was built from".to_string();
+    };
+    let names: Vec<&str> = SYSROOT_SOURCES
+        .iter()
+        .copied()
+        .filter(|t| witness_subset(recorded, &[t]) != witness_subset(current, &[t]))
+        .collect();
+    if names.is_empty() {
+        return "the record is malformed".to_string();
+    }
+    names.join(", ")
+}
+
+/// Where the machine-global `toyos` rustup toolchain currently points.
+fn rustup_link() -> Option<PathBuf> {
+    let home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".rustup")))?;
+    fs::read_link(home.join("toolchains/toyos")).ok()
 }
 
 /// Ensure the toolchain is up to date.
@@ -28,8 +157,17 @@ enum Bootstrap {
 /// The steps are ordered, and each invalidates what it makes stale rather than
 /// threading a `rebuilt` flag through: a step that decides for itself still
 /// decides correctly when the process before it was killed halfway.
-pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
-    let rust_dir = root.join("rust");
+///
+/// Only the primary checkout runs the steps that write the shared tree. A
+/// linked worktree checks that what is there is the sysroot its sources belong
+/// to, and says so by name when it is not.
+pub fn ensure(
+    root: &Path,
+    force_rebuild: bool,
+    claim_sysroot: bool,
+    lock: &mut buildlock::Held,
+) {
+    let rust_dir = rust_dir(root);
     let stamps_dir = root.join("target/stamps");
     fs::create_dir_all(&stamps_dir).ok();
 
@@ -37,6 +175,7 @@ pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
     let ld_src = root.join("toyos-ld/src");
     let ld_stamp = stamps_dir.join("linker.stamp");
     lock.act_if(
+        Scope::Worktree,
         "build toyos-ld",
         || {
             (stamps::dir_changed(&ld_src, &ld_stamp) || !toyos_ld_binary(root).exists())
@@ -55,6 +194,7 @@ pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
     let cc_stamp = stamps_dir.join("toyos-cc.stamp");
     let cc_inc_stamp = stamps_dir.join("toyos-cc-include.stamp");
     lock.act_if(
+        Scope::Worktree,
         "build toyos-cc",
         || {
             (stamps::dir_changed(&cc_src, &cc_stamp)
@@ -70,16 +210,17 @@ pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
         },
     );
 
+    if let Owner::Elsewhere(primary) = owner(root) {
+        adopt_shared_sysroot(root, &rust_dir, &primary, force_rebuild, claim_sysroot, lock);
+        return;
+    }
+
     let compiler_stamp = stamps_dir.join("compiler.stamp");
     let std_stamp = stamps_dir.join("std.stamp");
-    let abi_stamp = stamps_dir.join("abi.stamp");
-    let net_stamp = stamps_dir.join("net.stamp");
     let hosted_stamp = stamps_dir.join("hosted-rustc.stamp");
     let libc_stamp = stamps_dir.join("toyos-libc.stamp");
-    // toyos-abi and toyos are dependencies of std — changes require an std rebuild.
-    let abi_src = root.join("toyos-abi/src");
-    let net_src = root.join("toyos/src");
     lock.act_if(
+        Scope::Global,
         "build the rust toolchain",
         || {
             let toolchain_exists = Command::new("rustup")
@@ -94,8 +235,7 @@ pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
             } else if !toolchain_exists {
                 Some(Bootstrap::Full { invalidate_hosted: false })
             } else if stamps::dir_changed(&rust_dir.join("library"), &std_stamp)
-                || stamps::dir_changed(&abi_src, &abi_stamp)
-                || stamps::dir_changed(&net_src, &net_stamp)
+                || std_sources_stale(root, &rust_dir)
             {
                 Some(Bootstrap::Std)
             } else {
@@ -115,8 +255,6 @@ pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
                 }
             }
             stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
-            stamps::write_dir_stamp(&abi_src, &abi_stamp);
-            stamps::write_dir_stamp(&net_src, &net_stamp);
             if kind == (Bootstrap::Full { invalidate_hosted: true }) {
                 let _ = fs::remove_file(&hosted_stamp);
             }
@@ -130,6 +268,7 @@ pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
 
     let hosted_rustc = rust_dir.join("build/x86_64-unknown-toyos/stage2/bin/rustc");
     lock.act_if(
+        Scope::Global,
         "build the ToyOS-hosted rustc",
         || (!hosted_stamp.exists() || !hosted_rustc.exists()).then_some(()),
         |()| {
@@ -141,6 +280,7 @@ pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
 
     let stage2 = rust_dir.join(format!("build/{}/stage2", host_triple()));
     lock.act_if(
+        Scope::Global,
         "link the toyos rustup toolchain",
         || link_stale(&stage2).then_some(()),
         |()| run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]),
@@ -149,15 +289,130 @@ pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
     // Before any cargo build uses the toolchain, otherwise cargo may
     // fingerprint an incomplete sysroot on first run.
     lock.act_if(
+        Scope::Global,
         "add the host target to the ToyOS sysroot",
-        || host_target_missing(root).then_some(()),
-        |()| link_host_target(root),
+        || host_target_missing(&rust_dir).then_some(()),
+        |()| link_host_target(&rust_dir),
     );
 
     lock.act_if(
+        Scope::Global,
         "build toyos-libc for the sysroot",
         || crate::libc::stale(root, &rust_dir).then_some(()),
         |()| crate::libc::build(root, &rust_dir),
+    );
+
+    // Last, so it describes a sysroot that is finished. Every other checkout
+    // reads this to decide whether the sysroot is one it may compile against.
+    lock.act_if(
+        Scope::Global,
+        "record what the sysroot was built from",
+        || {
+            let want = witness(root);
+            (fs::read_to_string(witness_path(&rust_dir)).ok().as_deref() != Some(want.as_str()))
+                .then_some(want)
+        },
+        |want| {
+            fs::write(witness_path(&rust_dir), &want)
+                .unwrap_or_else(|e| panic!("write {}: {e}", witness_path(&rust_dir).display()));
+        },
+    );
+}
+
+/// Whether the sysroot's std was built from other `toyos-abi`/`toyos` sources
+/// than the ones in this checkout.
+///
+/// Replaces the mtime stamps these two trees used to have. Those could not
+/// answer the question across checkouts — two worktrees of one commit hold
+/// identical bytes at different paths with different mtimes — and answered it
+/// wrongly within one, since `git checkout` rewriting an unchanged file bought
+/// a full std rebuild.
+fn std_sources_stale(root: &Path, rust_dir: &Path) -> bool {
+    let Ok(recorded) = fs::read_to_string(witness_path(rust_dir)) else {
+        // No record is ignorance, not disagreement. The primary checkout is the
+        // only thing that writes this sysroot, so what is on disk is what it
+        // built from the sources beside it; the step below records that, and
+        // every build after this one has an answer to compare against. A linked
+        // worktree reads the same absence as a refusal, because for it the
+        // sysroot is somebody else's artifact and it has no such standing.
+        return false;
+    };
+    witness_subset(&recorded, &STD_SOURCES) != witness_subset(&witness(root), &STD_SOURCES)
+}
+
+/// Use the sysroot the primary checkout built, once it is established that it
+/// is the one this worktree's sources belong to.
+///
+/// The check has teeth because the failure it prevents has none of its own: a
+/// worktree whose `toyos-abi` differs from the sysroot's still compiles, still
+/// links, and still boots — into a guest whose syscall arguments land at the
+/// wrong offsets.
+fn adopt_shared_sysroot(
+    root: &Path,
+    rust_dir: &Path,
+    primary: &Path,
+    force_rebuild: bool,
+    claim: bool,
+    lock: &mut buildlock::Held,
+) {
+    assert!(
+        !force_rebuild,
+        "--rebuild-toolchain would replace the toolchain at {}, which every \
+         worktree of this repository compiles against.\nRun it in {}.",
+        rust_dir.display(),
+        primary.display()
+    );
+
+    let stage2 = rust_dir.join(format!("build/{}/stage2", host_triple()));
+    assert!(
+        stage2.join("bin/rustc").exists(),
+        "there is no toolchain to build against: {} does not exist.\n\
+         The primary checkout builds it — run `cargo run -- --build-only` in {} first.",
+        stage2.display(),
+        primary.display()
+    );
+    let linked = rustup_link();
+    assert!(
+        linked.as_deref() == Some(stage2.as_path()),
+        "the rustup toolchain `toyos` points at {}, not at {}.\n\
+         Only {} links it; something else has taken the name.",
+        linked.map_or_else(|| "nothing".to_string(), |p| p.display().to_string()),
+        stage2.display(),
+        primary.display()
+    );
+
+    let want = witness(root);
+    let recorded = fs::read_to_string(witness_path(rust_dir)).ok();
+    if recorded.as_deref() == Some(want.as_str()) {
+        return;
+    }
+
+    assert!(
+        claim,
+        "this worktree's {} differ from what the shared sysroot at {} was built \
+         from, so a build here would link its kernel against another checkout's \
+         struct layouts.\n\
+         Merge the change that is already in the sysroot, or pass --claim-sysroot \
+         to rebuild the sysroot from this worktree — which makes every other \
+         worktree refuse until it merges yours.",
+        differing_trees(recorded.as_deref(), &want),
+        rust_dir.display()
+    );
+
+    lock.act_if(
+        Scope::Global,
+        "rebuild the shared sysroot from a linked worktree",
+        || {
+            (fs::read_to_string(witness_path(rust_dir)).ok().as_deref() != Some(want.as_str()))
+                .then_some(())
+        },
+        |()| {
+            eprintln!("Rebuilding the shared sysroot from {}...", root.display());
+            rebuild_std(root, rust_dir);
+            crate::libc::build(root, rust_dir);
+            fs::write(witness_path(rust_dir), &want)
+                .unwrap_or_else(|e| panic!("write {}: {e}", witness_path(rust_dir).display()));
+        },
     );
 }
 
@@ -178,15 +433,12 @@ pub fn ensure(root: &Path, force_rebuild: bool, lock: &mut buildlock::Held) {
 ///
 /// A mismatched or absent link still re-links, so a moved tree or a fresh clone
 /// behaves as before; only the no-op case is skipped.
+///
+/// Reached only from the primary checkout, which is what makes the window above
+/// a window of one: a linked worktree that re-linked would point the name at a
+/// stage2 nobody else has.
 fn link_stale(stage2: &Path) -> bool {
-    let rustup_home = std::env::var_os("RUSTUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".rustup")));
-
-    let Some(home) = rustup_home else {
-        return true;
-    };
-    fs::read_link(home.join("toolchains/toyos")).map_or(true, |current| current != stage2)
+    rustup_link().is_none_or(|current| current != stage2)
 }
 
 fn full_bootstrap(root: &Path, rust_dir: &Path) {
@@ -383,15 +635,15 @@ pub fn path_with_toyos_ld(root: &Path) -> String {
 }
 
 /// Whether the ToyOS sysroot is missing the host target proc-macros compile against.
-fn host_target_missing(root: &Path) -> bool {
-    let toyos_sysroot = root.join("rust/build/x86_64-unknown-toyos/stage2/lib/rustlib");
+fn host_target_missing(rust_dir: &Path) -> bool {
+    let toyos_sysroot = rust_dir.join("build/x86_64-unknown-toyos/stage2/lib/rustlib");
     toyos_sysroot.exists() && !toyos_sysroot.join(host_triple()).exists()
 }
 
-fn link_host_target(root: &Path) {
+fn link_host_target(rust_dir: &Path) {
     let host = host_triple();
-    let host_target_dir = root
-        .join("rust/build/x86_64-unknown-toyos/stage2/lib/rustlib")
+    let host_target_dir = rust_dir
+        .join("build/x86_64-unknown-toyos/stage2/lib/rustlib")
         .join(&host);
 
     let output = Command::new("rustc")

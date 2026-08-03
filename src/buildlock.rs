@@ -1,22 +1,28 @@
-//! Serialising the build system's stateful phases across the agents that share
-//! this tree.
+//! Serialising the build system's stateful phases across the builds running
+//! against this repository.
 //!
 //! Cargo's own build lock cannot do this job. `ensure_fresh` runs `cargo clean`,
 //! which removes the whole `target/`, and cargo's lock lives inside it at
 //! `target/<profile>/.cargo-lock` — the clean deletes the file the other
-//! process's lock is on. So these files live in `.build-locks/` at the repo
-//! root, which nothing in the build system removes: a lock on an inode that can
-//! be unlinked and recreated under a waiter is not a lock.
+//! process's lock is on. So these files live outside every directory the build
+//! system removes: a lock on an inode that can be unlinked and recreated under
+//! a waiter is not a lock.
 //!
 //! Two modes, because two plain `cargo build`s of different packages are
 //! cargo's business and serialising those would destroy the parallelism the
-//! agents sharing this tree depend on:
+//! builds depend on:
 //!
 //! - **shared** — "I am building against the toolchain and the crate target
 //!   directories as they stand". Any number at once.
 //! - **exclusive** — "I am replacing shared build state": the rust bootstrap,
 //!   the sysroot writes, the `cargo clean`s. One at a time, and never while a
 //!   build holds the shared mode.
+//!
+//! And two [`Scope`]s, because "shared" stopped meaning one thing once the repo
+//! grew worktrees: a crate target directory is shared by the builds in one
+//! worktree, while the sysroot is shared by every worktree at once. A lock in
+//! the worktree cannot serialise the second, and a lock in the common directory
+//! would serialise the first against worktrees that have nothing to do with it.
 //!
 //! Holder death: `flock` is released by the kernel when the open file
 //! description closes, so a builder that is SIGKILLed mid-phase — routine here
@@ -40,9 +46,28 @@ const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 
 const LOCK_DIR: &str = ".build-locks";
+/// Inside the git common directory: the one place every worktree of this
+/// repository names identically, and one the build system never cleans.
+const GLOBAL_LOCK_DIR: &str = "toyos-build-locks";
 
-fn lock_path(root: &Path, name: &str) -> PathBuf {
-    root.join(LOCK_DIR).join(name)
+fn lock_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(name)
+}
+
+/// Which shared state a phase replaces, and so which lock has to serialise it.
+///
+/// Stated at every call site rather than inferred, because the two are not
+/// interchangeable in either direction: a toolchain phase taken in the worktree
+/// scope serialises nothing across worktrees, and a target-directory clean
+/// taken in the global scope stalls builds it has no business stalling.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Scope {
+    /// State every worktree shares: the `rust/` checkout and its build tree,
+    /// the sysroot, and the machine-global rustup link.
+    Global,
+    /// State this worktree alone owns — its crate target directories. Two
+    /// worktrees cleaning their own have nothing to say to each other.
+    Worktree,
 }
 
 /// A held lock. Releasing it is closing the file.
@@ -62,14 +87,18 @@ impl Drop for Guard {
     }
 }
 
-/// The build lock, held in shared mode for the length of one build.
+/// The build lock, held in shared mode — in **both** scopes — for the length of
+/// one build. A build reads the shared sysroot from beginning to end, so a
+/// bootstrap in another worktree may no more land inside it than a clean in
+/// this one.
 pub struct Held {
-    root: PathBuf,
+    worktree_dir: PathBuf,
+    global_dir: PathBuf,
     what: String,
     /// `None` only for the duration of an [`Held::act_if`] escalation, which is
-    /// the whole reason this is an `Option`: the shared lock has to be put down
-    /// before the exclusive one can be taken.
-    guard: Option<Guard>,
+    /// the whole reason this is an `Option`: the shared locks have to be put
+    /// down before either exclusive one can be taken.
+    guards: Option<(Guard, Guard)>,
 }
 
 /// Take the build lock in shared mode for `what`, and hold it until the
@@ -77,35 +106,63 @@ pub struct Held {
 /// reads back, not merely after the last thing it writes: a clean landing
 /// between a `cargo build` and the read of what it built is the same defect.
 pub fn shared(root: &Path, what: &str) -> Held {
-    Held {
-        root: root.to_path_buf(),
+    let mut held = Held {
+        worktree_dir: root.join(LOCK_DIR),
+        global_dir: crate::git_common_dir(root).join(GLOBAL_LOCK_DIR),
         what: what.to_string(),
-        guard: Some(acquire(root, LOCK_SH, what)),
-    }
+        guards: None,
+    };
+    held.guards = Some(held.take_shared());
+    held
 }
 
 impl Held {
-    /// Ask `decide`, and if it reports work, do that work under the exclusive
-    /// lock.
+    /// Ask `decide`, and if it reports work, do that work under `scope`'s
+    /// exclusive lock.
     ///
-    /// `decide` runs first under the shared lock this value holds, so a phase
+    /// `decide` runs first under the shared locks this value holds, so a phase
     /// with nothing to do costs no serialisation at all. When it does report
-    /// work the shared lock is dropped, the exclusive one taken, and `decide`
+    /// work the shared locks are dropped, the exclusive one taken, and `decide`
     /// asked **again**: whatever it saw a moment ago may have been done by the
     /// process that held the lock in between, and only this second answer is
     /// acted on. Serialising the action alone would still double-clean.
-    pub fn act_if<W>(&mut self, phase: &str, decide: impl Fn() -> Option<W>, act: impl FnOnce(W)) {
+    ///
+    /// Both shared locks go down, never just the one being escalated. Holding
+    /// either while queueing for the other is a deadlock with the process doing
+    /// it the other way round, and two builds in one worktree can be exactly
+    /// that pair.
+    pub fn act_if<W>(
+        &mut self,
+        scope: Scope,
+        phase: &str,
+        decide: impl Fn() -> Option<W>,
+        act: impl FnOnce(W),
+    ) {
         if decide().is_none() {
             return;
         }
-        self.guard = None;
+        self.guards = None;
         {
-            let _exclusive = acquire(&self.root, LOCK_EX, phase);
+            let _exclusive = acquire(self.dir(scope), LOCK_EX, phase);
             if let Some(work) = decide() {
                 act(work);
             }
         }
-        self.guard = Some(acquire(&self.root, LOCK_SH, &self.what));
+        self.guards = Some(self.take_shared());
+    }
+
+    fn dir(&self, scope: Scope) -> &Path {
+        match scope {
+            Scope::Global => &self.global_dir,
+            Scope::Worktree => &self.worktree_dir,
+        }
+    }
+
+    fn take_shared(&self) -> (Guard, Guard) {
+        (
+            acquire(&self.global_dir, LOCK_SH, &self.what),
+            acquire(&self.worktree_dir, LOCK_SH, &self.what),
+        )
     }
 }
 
@@ -117,7 +174,7 @@ impl Held {
 /// build lock proper because every builder needs it and builders hold the build
 /// lock in *shared* mode by design.
 pub fn artifact(root: &Path) -> Guard {
-    let path = lock_path(root, "artifact");
+    let path = lock_path(&root.join(LOCK_DIR), "artifact");
     let file = open_lock_file(&path);
     let start = Instant::now();
     let mut waited = false;
@@ -144,9 +201,9 @@ pub fn artifact(root: &Path) -> Guard {
 /// instead of overtaking it. `intent` is always taken before `state` and
 /// dropped as soon as `state` is held, so nothing ever waits on `intent` while
 /// holding `state`.
-fn acquire(root: &Path, op: i32, what: &str) -> Guard {
-    let intent_path = lock_path(root, "intent");
-    let state_path = lock_path(root, "state");
+fn acquire(dir: &Path, op: i32, what: &str) -> Guard {
+    let intent_path = lock_path(dir, "intent");
+    let state_path = lock_path(dir, "state");
     let intent = open_lock_file(&intent_path);
     let state = open_lock_file(&state_path);
     let label = format!("{}, {what}", if op == LOCK_EX { "exclusive" } else { "shared" });
@@ -303,11 +360,25 @@ mod tests {
     const ROLE: &str = "TOYOS_BUILDLOCK_TEST_ROLE";
     const ROOT: &str = "TOYOS_BUILDLOCK_TEST_ROOT";
 
+    /// A git repository, because the global scope is keyed on the common
+    /// directory and a scratch tree that is not one would exercise a path the
+    /// build system never takes.
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("toyos-buildlock-{name}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        let ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .expect("git init")
+            .success();
+        assert!(ok, "git init in {}", dir.display());
         dir
+    }
+
+    fn worktree_lock_dir(root: &Path) -> PathBuf {
+        root.join(LOCK_DIR)
     }
 
     fn child(root: &Path, role: &str) -> Child {
@@ -334,7 +405,7 @@ mod tests {
     /// A fresh fd per probe: a successful `try_lock` *holds* what it took, and
     /// polling on one fd would itself be the thing keeping the writer out.
     fn intent_is_taken(root: &Path) -> bool {
-        !try_lock(&open_lock_file(&lock_path(root, "intent")), LOCK_SH)
+        !try_lock(&open_lock_file(&lock_path(&worktree_lock_dir(root), "intent")), LOCK_SH)
     }
 
     fn note(root: &Path, line: &str) {
@@ -356,6 +427,7 @@ mod tests {
             "hold-exclusive" => {
                 let mut held = shared(&root, "child");
                 held.act_if(
+                    Scope::Worktree,
                     "child exclusive phase",
                     || (!root.join("release").exists()).then_some(()),
                     |()| {
@@ -367,6 +439,7 @@ mod tests {
             "hold-exclusive-forever" => {
                 let mut held = shared(&root, "child");
                 held.act_if(
+                    Scope::Worktree,
                     "child exclusive phase",
                     || Some(()),
                     |()| {
@@ -377,7 +450,7 @@ mod tests {
             }
             "want-exclusive" => {
                 let mut held = shared(&root, "child");
-                held.act_if("queued exclusive phase", || Some(()), |()| note(&root, "ex"));
+                held.act_if(Scope::Worktree, "queued exclusive phase", || Some(()), |()| note(&root, "ex"));
             }
             "want-shared" => {
                 let _held = shared(&root, "child");
@@ -390,6 +463,7 @@ mod tests {
                 if role == "clean" {
                     let mut held = shared(&root, "child");
                     held.act_if(
+                        Scope::Worktree,
                         "clean the crate target",
                         || target.exists().then_some(()),
                         |()| fs::remove_dir_all(&target).unwrap(),
@@ -409,10 +483,10 @@ mod tests {
         let mut kid = child(&root, "hold-exclusive");
         assert!(appeared(&root.join("held"), Duration::from_secs(20)), "child never acquired");
 
-        let state = open_lock_file(&lock_path(&root, "state"));
+        let state = open_lock_file(&lock_path(&worktree_lock_dir(&root), "state"));
         assert!(!try_lock(&state, LOCK_SH), "a build got in while an exclusive phase ran");
         assert!(!try_lock(&state, LOCK_EX), "two exclusive phases at once");
-        let holder = describe_holder(&lock_path(&root, "state"));
+        let holder = describe_holder(&lock_path(&worktree_lock_dir(&root), "state"));
         assert!(
             holder.starts_with(&format!("held by pid {} ", kid.id())),
             "the waiting side cannot name the holder: {holder}"
@@ -430,7 +504,7 @@ mod tests {
         let mut kid = child(&root, "hold-exclusive-forever");
         assert!(appeared(&root.join("held"), Duration::from_secs(20)), "child never acquired");
 
-        let state = open_lock_file(&lock_path(&root, "state"));
+        let state = open_lock_file(&lock_path(&worktree_lock_dir(&root), "state"));
         assert!(!try_lock(&state, LOCK_EX), "the lock was not actually held");
 
         kid.kill().unwrap();
@@ -440,7 +514,7 @@ mod tests {
         // And the note it left behind names a pid that is gone, so nobody is
         // sent to wait on it.
         assert_eq!(
-            describe_holder(&lock_path(&root, "state")),
+            describe_holder(&lock_path(&worktree_lock_dir(&root), "state")),
             "held by other builds in this tree"
         );
     }
@@ -449,11 +523,77 @@ mod tests {
     fn shared_admits_shared() {
         let root = scratch("shared");
         let _mine = shared(&root, "parent");
-        let second = open_lock_file(&lock_path(&root, "state"));
+        let second = open_lock_file(&lock_path(&worktree_lock_dir(&root), "state"));
         assert!(try_lock(&second, LOCK_SH), "two builds cannot run at once");
         drop(second);
-        let third = open_lock_file(&lock_path(&root, "state"));
+        let third = open_lock_file(&lock_path(&worktree_lock_dir(&root), "state"));
         assert!(!try_lock(&third, LOCK_EX), "a clean got in while a build was running");
+    }
+
+    /// Two worktrees of one repository must name one global lock file and two
+    /// worktree ones.
+    ///
+    /// Getting either half backwards is silent — every build still runs. One
+    /// global file per worktree means the phases that replace the shared sysroot
+    /// stop excluding each other, which is the defect worktrees were introduced
+    /// without; one worktree file for all of them means a clean of a target
+    /// directory stalls builds that cannot see it.
+    #[test]
+    fn worktrees_share_the_global_lock_and_not_the_worktree_one() {
+        let root = scratch("worktrees");
+        fs::write(root.join("f"), b"x").unwrap();
+        git(&root, &["add", "f"]);
+        git(&root, &["commit", "-qm", "init"]);
+        let linked = root.join("wt");
+        git(&root, &["worktree", "add", "-q", linked.to_str().unwrap(), "-b", "wt"]);
+
+        let mine = shared(&root, "primary");
+        let theirs = shared(&linked, "linked");
+        assert_eq!(
+            mine.global_dir, theirs.global_dir,
+            "two worktrees disagree about where the global lock lives"
+        );
+        assert_ne!(
+            mine.worktree_dir, theirs.worktree_dir,
+            "two worktrees share one target-directory lock"
+        );
+        drop(theirs);
+        drop(mine);
+
+        // Naming one path is not yet excluding on it: `flock` conflicts between
+        // open file descriptions, so a second handle on the shared file is the
+        // question a second process would ask.
+        let held = acquire(&root.join(LOCK_DIR), LOCK_SH, "a build in the primary");
+        let global = open_lock_file(&lock_path(&git_common_lock_dir(&linked), "state"));
+        assert!(
+            try_lock(&global, LOCK_EX),
+            "the worktree lock excluded a global phase it knows nothing about"
+        );
+        drop(global);
+        drop(held);
+
+        let building = shared(&linked, "a build in the worktree");
+        let global = open_lock_file(&lock_path(&git_common_lock_dir(&root), "state"));
+        assert!(
+            !try_lock(&global, LOCK_EX),
+            "a bootstrap could land inside a build running in another worktree"
+        );
+        drop(building);
+    }
+
+    fn git_common_lock_dir(root: &Path) -> PathBuf {
+        crate::git_common_dir(root).join(GLOBAL_LOCK_DIR)
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} in {}", dir.display());
     }
 
     /// `flock` alone would let a stream of builds starve the rebuild they are

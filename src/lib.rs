@@ -5,9 +5,48 @@ pub mod image;
 pub mod libc;
 pub mod stamps;
 pub mod toolchain;
+pub mod worktree;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The `.git` directory every worktree of this repository shares.
+///
+/// `git rev-parse --git-common-dir` answers relatively from the primary
+/// checkout and absolutely from a linked worktree, so the answer is resolved
+/// against `root` before it is canonicalised. Two worktrees must arrive at one
+/// byte-identical path or the locks keyed on it serialise nothing.
+pub fn git_common_dir(root: &Path) -> PathBuf {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|e| panic!("git rev-parse in {}: {e}", root.display()));
+    assert!(
+        output.status.success(),
+        "{} is not inside a git repository",
+        root.display()
+    );
+    let raw = String::from_utf8(output.stdout).expect("git printed non-UTF-8");
+    let answer = Path::new(raw.trim());
+    let resolved = if answer.is_absolute() { answer.to_path_buf() } else { root.join(answer) };
+    std::fs::canonicalize(&resolved)
+        .unwrap_or_else(|e| panic!("canonicalise {}: {e}", resolved.display()))
+}
+
+/// The checkout holding the state every worktree shares: the object store, the
+/// `rust/` submodule, and the toolchain built from it.
+///
+/// `git worktree add` puts the common directory inside the primary checkout, so
+/// its parent *is* that checkout and no worktree has to be told where it is.
+/// A pointer file would be one more thing that can disagree with the tree.
+pub fn primary_checkout(root: &Path) -> PathBuf {
+    let common = git_common_dir(root);
+    common
+        .parent()
+        .unwrap_or_else(|| panic!("{} has no parent", common.display()))
+        .to_path_buf()
+}
 
 /// Ensure all git submodules in `repo_dir` are checked out.
 /// Detects corrupted partial checkouts (`.git` exists but no content) and uses
