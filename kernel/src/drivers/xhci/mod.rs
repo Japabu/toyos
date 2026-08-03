@@ -4,8 +4,9 @@ mod legacy;
 mod msc;
 
 use alloc::vec::Vec;
+use core::num::NonZeroU8;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 use crate::mm::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
@@ -41,6 +42,15 @@ const PORTSC_PP:  u32 = 1 << 9;
 const PORTSC_SPEED: u32 = 0xF << 10;
 const PORTSC_CSC: u32 = 1 << 17;
 const PORTSC_PRC: u32 = 1 << 21;
+
+/// Every change flag: CSC, PEC, WRC, OCC, PRC, PLC and CEC, bits 17 to 23.
+///
+/// They are the reason a port event exists at all — xHCI 1.2 §4.19.2 raises a
+/// Port Status Change Event when one of these transitions from '0' to '1', and
+/// **only then**. A flag left set is therefore a change the controller has
+/// already reported and will not report again, so acting on a port means
+/// clearing what was set when it was read.
+const PORTSC_CHANGES: u32 = 0x7F << 17;
 
 /// PORTSC bits a write cannot change: CCS, OCA, the speed field, DR.
 const PORTSC_RO: u32 = PORTSC_CCS | (1 << 3) | PORTSC_SPEED | (1 << 30);
@@ -102,6 +112,7 @@ const TRB_STATUS_STAGE: u32 = trb_type(4);
 const TRB_LINK:         u32 = trb_type(6);
 
 const TRB_ENABLE_SLOT:    u32 = trb_type(9);
+const TRB_DISABLE_SLOT:   u32 = trb_type(10);
 const TRB_ADDRESS_DEVICE: u32 = trb_type(11);
 const TRB_CONFIGURE_EP:   u32 = trb_type(12);
 const TRB_EVALUATE_CONTEXT: u32 = trb_type(13);
@@ -112,6 +123,7 @@ const TRB_SET_TR_DEQUEUE: u32 = trb_type(16);
 // Event TRB types (read from event ring, encoded in bits [15:10])
 const EVENT_TRANSFER:     u32 = 32;
 const EVENT_CMD_COMPLETE: u32 = 33;
+const EVENT_PORT_STATUS_CHANGE: u32 = 34;
 
 // Completion codes worth naming. A transfer that moved less than it asked for
 // reports Short Packet, which is a success with a residue and not an error —
@@ -399,6 +411,75 @@ fn await_connect_settle(controllers: &[XhciController]) {
     }
 }
 
+/// What the driver is doing about one root-hub port, between the register
+/// changing and the driver having acted on it.
+///
+/// Every variant carries the instant it is waiting for, because the whole
+/// point of this type is that **none of these waits may be spun on**: it is
+/// stepped from `poll_if_pending`, which runs at the top of every scheduler
+/// pass, and a pass that stopped for the 100 ms of USB 2.0 §7.1.7.3 or for a
+/// T14 root port's 55 ms reset would empty the audio pipeline every time
+/// somebody plugged in a mouse.
+#[derive(Clone, Copy, PartialEq)]
+enum PortWork {
+    /// The port reads the way the driver last acted on it.
+    Settled,
+    /// Its connect state differs from the one the driver acted on, and has
+    /// since `at`. A port that changes its mind again gets a fresh `at`, which
+    /// is [`PORT_DEBOUNCE_NS`] measured exactly as [`await_connect_settle`]
+    /// measures it — a set that has to hold still, not a sleep.
+    Debouncing { at: u64 },
+    /// PR is set and the driver is waiting for PRC, which arrives as a Port
+    /// Status Change Event as well as a register bit. `until` is the same
+    /// deadline the boot path's `settles` applies, and what it buys is the
+    /// same refusal by name.
+    Resetting { until: u64 },
+}
+
+/// One root-hub port, as the driver believes it.
+#[derive(Clone, Copy)]
+struct Port {
+    /// Whether the driver has a device here — the connect state it last acted
+    /// on, and deliberately not the register's, which is what a change is
+    /// measured against.
+    attached: bool,
+    /// The slot the controller enabled for this port, which the driver owns
+    /// until it issues Disable Slot. `Option<NonZeroU8>` and not a `u8`: slot
+    /// ids are 1-based, so a zero here would be a sentinel where the niche
+    /// makes the option the same byte.
+    slot: Option<NonZeroU8>,
+    work: PortWork,
+}
+
+impl Port {
+    const EMPTY: Self = Self { attached: false, slot: None, work: PortWork::Settled };
+}
+
+/// When some controller's port state machine must be stepped again, or 0 when
+/// no controller has a port outstanding.
+///
+/// Two readers, and neither may take [`XHCI`]: `poll_if_pending` runs on every
+/// CPU at the top of every scheduler pass, and the idle loop's final recheck
+/// runs with interrupts off. 0 as "nothing" is the same encoding `irq_ring`
+/// uses for the same reason — every value written here is
+/// `nanos_since_boot() + PORT_DEBOUNCE_NS` or larger, so the boot instant is
+/// not a deadline this can hold.
+///
+/// **A CPU with nothing else to run must not sleep while this is set**, and
+/// that is what it is for. Nothing else would wake it: the connect edge that
+/// started the debounce was the last interrupt the controller had to give, and
+/// the scheduler arms its one-shot timer for parked *tasks*, of which a
+/// driver's deferred work is not one. The cost is one idle CPU declining to
+/// halt for at most the debounce, or for the reset deadline behind it —
+/// bounded, self-clearing, and paid only by a machine that has just been
+/// plugged into.
+static PORT_WORK_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a CPU with nothing to run must stay awake for [`PORT_WORK_AT`].
+pub fn port_work_pending() -> bool {
+    PORT_WORK_AT.load(Ordering::Relaxed) != 0
+}
+
 const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
 
 /// Event Ring Segment Table entry (16 bytes).
@@ -623,13 +704,13 @@ impl Layout {
         (index < self.dev_blocks).then(|| self.dev_base + index * DEV_STRIDE)
     }
 
-    /// The block for the `index`-th mass-storage device *claimed* this boot.
+    /// The `index`-th mass-storage block.
     ///
     /// Private to [`XhciController::claim_msc_block`], which is the only caller
     /// and the only thing that decides what `index` is. That is deliberate:
     /// `bind` used to pass `storage.len()`, and `storage.len()` goes back down.
-    fn msc(&self, index: usize) -> Option<usize> {
-        (index < MSC_BLOCKS).then(|| self.msc_base + index * MSC_STRIDE)
+    fn msc(&self, index: usize) -> usize {
+        self.msc_base + index * MSC_STRIDE
     }
 }
 
@@ -687,10 +768,15 @@ pub struct XhciController {
     event_phase: bool,
 
     devices: Vec<HidDevice>,
-    storage: Vec<msc::MscDevice>,
 
-    /// Mass-storage pool blocks handed out this boot. Monotone, and
-    /// deliberately not `storage.len()`.
+    /// The machine's disks, by the index everything above `storage_read` holds
+    /// — so an unplugged disk leaves a `None` behind rather than shifting every
+    /// disk after it onto somebody else's blocks. A `FatDevice` holds its
+    /// `UsbBlockDevice` for the life of the mount and that handle is an index.
+    storage: Vec<Option<msc::MscDevice>>,
+
+    /// Which mass-storage pool blocks are spoken for, and deliberately not
+    /// `storage.len()`.
     ///
     /// `bind` issues Configure Endpoint — which puts the device's two bulk
     /// endpoints into the Running state with their transfer rings inside this
@@ -702,11 +788,24 @@ pub struct XhciController {
     /// `MSC_SCRATCH`, which is where READ CAPACITY's block size and last LBA
     /// arrive.
     ///
-    /// So the block is never given back — the same policy the slot behind it
-    /// already has, and for the same reason. A `Drop` guard is not the fix
-    /// here even though the failing path would run one: releasing the block *is*
-    /// the bug.
-    msc_claimed: usize,
+    /// So a *refused* disk never gives its block back. An **unplugged** one
+    /// does, and the difference is not a policy: `teardown_port` disables the
+    /// slot first, and a disabled slot is one whose endpoint contexts no longer
+    /// name that memory and whose outstanding TRBs the controller has already
+    /// abandoned. Without the release two plug cycles exhaust a pool that holds
+    /// [`MSC_BLOCKS`].
+    msc_taken: [bool; MSC_BLOCKS],
+
+    /// This controller's root-hub ports, one entry per port register. Sized
+    /// from HCSPARAMS1 rather than fixed: `max_ports` is a byte, and a fixed
+    /// array would be 255 entries on a controller with five.
+    ports: Vec<Port>,
+
+    /// A Port Status Change Event arrived and the ports have not been read
+    /// since. Set where the event is dequeued — which includes the middle of
+    /// somebody else's enumeration, since `wait_transfer` drains the whole ring
+    /// — and consumed by [`Self::poll`].
+    ports_dirty: bool,
 
     /// Ports this driver has written PED=1 to, which on a real controller are
     /// Disabled and read PED clear until they are reset again.
@@ -791,17 +890,33 @@ impl XhciController {
         mask
     }
 
-    /// Take the next mass-storage pool block, for good.
+    /// Take a free mass-storage pool block.
     ///
     /// The only way to obtain one, so there is no path that gets a block
-    /// without spending it — which is the property [`Self::msc_claimed`]
+    /// without marking it taken — which is the property [`Self::msc_taken`]
     /// exists for, and the one `ctrl.layout.msc(ctrl.storage.len())` did not
     /// have. `None` when the pool is out; nothing is spent then, because
     /// nothing was handed out.
     fn claim_msc_block(&mut self) -> Option<usize> {
-        let block = self.layout.msc(self.msc_claimed)?;
-        self.msc_claimed += 1;
-        Some(block)
+        let index = self.msc_taken.iter().position(|taken| !taken)?;
+        self.msc_taken[index] = true;
+        Some(self.layout.msc(index))
+    }
+
+    /// How many blocks are spoken for, for the line that refuses the disk the
+    /// pool has no room for.
+    fn msc_blocks_taken(&self) -> usize {
+        self.msc_taken.iter().filter(|taken| **taken).count()
+    }
+
+    /// Give a block back, which is legal only once the slot whose endpoint
+    /// contexts named it has been disabled — see [`Self::msc_taken`].
+    fn release_msc_block(&mut self, block: usize) {
+        let index = (block - self.layout.msc_base) / MSC_STRIDE;
+        assert!(
+            core::mem::replace(&mut self.msc_taken[index], false),
+            "xHCI: mass-storage block {block:#x} released twice"
+        );
     }
 
     fn submit_command(&mut self, trb: Trb) {
@@ -835,6 +950,16 @@ impl XhciController {
         let trb_type = (event.control >> 10) & 0x3F;
         let code = (event.status >> 24) & 0xFF;
         let slot = ((event.control >> 24) & 0xFF) as u8;
+        // The port id the event carries is not read. It is the *register* that
+        // says what a port is, and the driver has to look at every port anyway
+        // to tell a connect it has acted on from one it has not — so the event
+        // is a reason to look, exactly as an `irq_ring` record is. Believing
+        // the id instead would make the driver's picture of the bus depend on
+        // an event never being missed.
+        if trb_type == EVENT_PORT_STATUS_CHANGE {
+            self.ports_dirty = true;
+            return;
+        }
         if trb_type != EVENT_TRANSFER || (code != 1 && code != 13) {
             return;
         }
@@ -842,6 +967,192 @@ impl XhciController {
             dev.dispatch_report();
             dev.requeue(&self.db_base);
         }
+    }
+
+    /// Clear whatever change flags one port is holding, so the next change is
+    /// one the controller can report. See [`PORTSC_CHANGES`].
+    fn acknowledge_port_change(&mut self, port_idx: u8) {
+        let portsc = self.read_portsc(port_idx);
+        if portsc & PORTSC_CHANGES != 0 {
+            self.write_portsc(port_idx, portsc_neutral(portsc) | (portsc & PORTSC_CHANGES));
+        }
+    }
+
+    /// The same for every port this controller has.
+    fn acknowledge_port_changes(&mut self) {
+        for p in 0..self.max_ports {
+            self.acknowledge_port_change(p);
+        }
+    }
+
+    /// Record what a port's enumeration left behind. The slot is what
+    /// [`Self::teardown_port`] gives back, and it is recorded even when no
+    /// device came out the far end: an Enable Slot that succeeded is the
+    /// controller's resource whatever happened after it.
+    fn port_bound(&mut self, port_idx: u8, slot: Option<u8>) {
+        let port = &mut self.ports[port_idx as usize];
+        port.attached = true;
+        port.slot = slot.and_then(NonZeroU8::new);
+        port.work = PortWork::Settled;
+    }
+
+    /// Step every port that is not where the driver left it, and say when it
+    /// wants to be looked at again.
+    ///
+    /// One step per call and no wait anywhere in it — see [`PortWork`]. The
+    /// enumeration it eventually runs *is* blocking, and it is the same
+    /// `device::configure` the boot path runs; what this removes from the
+    /// blocking part is the debounce and the port reset, which on the T14 are
+    /// 100 ms and 55 ms against roughly 14 ms for everything else.
+    fn service_ports(&mut self) -> Option<u64> {
+        let now = crate::clock::nanos_since_boot();
+        (0..self.max_ports)
+            .filter_map(|p| self.service_port(p, now))
+            .min()
+    }
+
+    /// One port's step, and when it next wants one.
+    fn service_port(&mut self, port_idx: u8, now: u64) -> Option<u64> {
+        let portsc = self.read_portsc(port_idx);
+        let connected = portsc & PORTSC_CCS != 0;
+        let port = self.ports[port_idx as usize];
+
+        // Before any change flag is cleared, because PRC is the one this state
+        // is waiting for and clearing it is `configure`'s first act.
+        if let PortWork::Resetting { until } = port.work {
+            if device::reset_done(self, port_idx) {
+                let slot = device::configure(self, port_idx);
+                self.port_bound(port_idx, slot);
+                // Whatever the reset and the enumeration behind it raised. The
+                // one that matters is not PRC, which `configure` clears, but
+                // any flag left set on a port that is now quiet: the next thing
+                // to happen here is the device being pulled, and a CSC that is
+                // already '1' is a disconnect the controller cannot report.
+                self.acknowledge_port_change(port_idx);
+                return None;
+            }
+            if now < until {
+                return Some(until);
+            }
+            log!("xHCI: port {} never finished its reset (PORTSC {portsc:#010x}); skipping it",
+                port_idx + 1);
+            // Attached, so the port is not tried again until the device is
+            // pulled — which is what the boot path does with the same failure,
+            // and what stops a port the controller will not reset from being
+            // reset forever.
+            self.ports[port_idx as usize].attached = true;
+            self.ports[port_idx as usize].work = PortWork::Settled;
+            return None;
+        }
+
+        self.acknowledge_port_change(port_idx);
+        let held = match port.work {
+            // A change the driver has not seen before. The debounce is measured
+            // from here rather than from the event, because the event says a
+            // flag was raised and this says what the port now reads.
+            PortWork::Settled => {
+                if connected == port.attached {
+                    return None;
+                }
+                self.ports[port_idx as usize].work = PortWork::Debouncing { at: now };
+                return Some(now + PORT_DEBOUNCE_NS);
+            }
+            // It changed its mind back: there is nothing to act on, and the
+            // next change starts a fresh debounce.
+            PortWork::Debouncing { .. } if connected == port.attached => {
+                self.ports[port_idx as usize].work = PortWork::Settled;
+                return None;
+            }
+            PortWork::Debouncing { at } => now.saturating_sub(at),
+            PortWork::Resetting { .. } => unreachable!("returned above"),
+        };
+        if held < PORT_DEBOUNCE_NS {
+            return Some(now + PORT_DEBOUNCE_NS - held);
+        }
+        if !connected {
+            log!("xHCI: port {} disconnected", port_idx + 1);
+            self.teardown_port(port_idx);
+            return None;
+        }
+        log!("xHCI: port {} connected", port_idx + 1);
+        device::begin_reset(self, port_idx);
+        self.ports[port_idx as usize].work = PortWork::Resetting { until: now + USB_TIMEOUT_NS };
+        Some(now + USB_TIMEOUT_NS)
+    }
+
+    /// Everything a device that is no longer on the bus leaves behind, in the
+    /// order the pieces stop being reachable.
+    ///
+    /// **Input first**, because a keyboard yanked mid-chord holds its keys in
+    /// the machine-wide held set and a pointer holds its button in the merge,
+    /// and both are published by every *other* device from then on. **Then the
+    /// slot**, which is what takes the device's endpoints out of Running and
+    /// abandons whatever TRB was queued on them. **Then the pool block**, which
+    /// is only safe in that order: while the slot lives, its endpoint contexts
+    /// still name that memory.
+    fn teardown_port(&mut self, port_idx: u8) {
+        while let Some(at) = self.devices.iter().position(|d| d.port_idx == port_idx) {
+            let mut dev = self.devices.remove(at);
+            let role = dev.role;
+            dev.unbind();
+            match role {
+                hid::HidRole::Keyboard => log!(
+                    "xHCI: USB keyboard on slot {} unplugged from port {}",
+                    dev.slot_id, port_idx + 1
+                ),
+                // The source is in the line for the reason it is in the bind
+                // line: it is the only place the button merge is visible, and
+                // an entry released and an entry leaked read the same from
+                // every other angle until the machine runs out of them.
+                hid::HidRole::Pointer(source) => log!(
+                    "xHCI: USB pointer on slot {} unplugged from port {}, source {} released",
+                    dev.slot_id, port_idx + 1, source.id()
+                ),
+            }
+        }
+        for index in 0..self.storage.len() {
+            let Some(disk) = self.storage[index] else { continue };
+            if disk.port_idx != port_idx {
+                continue;
+            }
+            // The entry stays and the disk does not: everything above here
+            // holds this index — a mount holds it for its whole life — so
+            // removing it would serve the next disk's blocks under this one's
+            // number. What it becomes is a disk that is not there, which every
+            // caller already has an answer for.
+            self.storage[index] = None;
+            self.release_msc_block(disk.block());
+            log!("usb-storage: disk {} unplugged from port {}; it is offline",
+                self.disk_base + index, port_idx + 1);
+        }
+
+        let port = &mut self.ports[port_idx as usize];
+        port.attached = false;
+        port.work = PortWork::Settled;
+        if let Some(slot) = port.slot.take() {
+            self.disable_slot(slot.get());
+        }
+    }
+
+    /// Give a slot back to the controller and stop naming its device context.
+    ///
+    /// The one thing that takes a slot out of any state (xHCI 1.2 §4.6.4), so
+    /// there is no state a device that has been pulled can be in that makes
+    /// this the wrong command — which is exactly what is not true of Reset
+    /// Endpoint, and why `restart_endpoint` reads the endpoint state first.
+    fn disable_slot(&mut self, slot_id: u8) {
+        let mut disable = Trb::ZERO;
+        disable.control = TRB_DISABLE_SLOT | ((slot_id as u32) << 24);
+        if !self.run_command(disable, "Disable Slot") {
+            return;
+        }
+        // After the command, never before: until it completes the controller
+        // may still be writing this device's output context.
+        unsafe {
+            let dcbaa = self.dma().ptr_at(OFF_DCBAA) as *mut u64;
+            write_volatile(dcbaa.add(slot_id as usize), 0);
+        }
+        log!("xHCI: slot {slot_id} disabled");
     }
 
     /// The completion code and slot id of the command just submitted, or
@@ -1009,10 +1320,31 @@ impl XhciController {
         }
     }
 
-    pub fn poll(&mut self) {
+    /// Drain the event ring and step the ports, and say when this controller
+    /// wants to be polled again.
+    ///
+    /// The ports are read only when something says they might have moved: a
+    /// Port Status Change Event since the last look, or a port the driver has
+    /// not finished acting on. Otherwise this is one read of the event ring's
+    /// next TRB, which is what every pass on every CPU pays.
+    fn poll(&mut self) -> Option<u64> {
         while let Some(event) = self.next_event() {
             self.dispatch_event(event);
         }
+        if !self.ports_dirty && self.ports.iter().all(|p| p.work == PortWork::Settled) {
+            return None;
+        }
+        self.ports_dirty = false;
+        let wake_at = self.service_ports();
+        // An event that landed *during* the enumeration this pass just ran —
+        // `configure`'s control transfers drain the whole ring — is a port
+        // change nothing else will come back for: its interrupt was taken
+        // while this CPU was already inside the poll, so there may be no
+        // record left to bring anyone here again.
+        if self.ports_dirty {
+            return Some(crate::clock::nanos_since_boot());
+        }
+        wake_at
     }
 
     /// One dword of one *device context*, in the input context `ctx_base`
@@ -1040,10 +1372,19 @@ impl XhciController {
 /// driver that kept one controller reported that the T14 had no USB input.
 static XHCI: Lock<Vec<XhciController>> = Lock::new(Vec::new());
 
-/// Process xHCI events only if this CPU has an unserviced interrupt record.
+/// Process xHCI events if this CPU has an unserviced interrupt record, or if a
+/// port's state machine is due to be stepped.
+///
 /// Records live on the CPU that took the interrupt (which its ISR forces
 /// into the scheduler via need_resched), so on every other CPU this is one
 /// uncontended atomic op on its own cache line — callers need no cpu gate.
+///
+/// [`PORT_WORK_AT`] is the second reason and it is global rather than per CPU,
+/// because the wait it represents is wall clock and belongs to no CPU: the
+/// interrupt that started a debounce is the last one the controller has to
+/// give, so *some* CPU has to come back for it. Reading a deadline rather than
+/// a flag is what keeps that from being a lock every CPU takes every pass for
+/// the length of the debounce.
 ///
 /// Every controller is polled, because every controller's message carries the
 /// same vector and `irq_ring` keeps one record per source: the record says
@@ -1054,11 +1395,21 @@ static XHCI: Lock<Vec<XhciController>> = Lock::new(Vec::new());
 /// the keyboard held-set and both event queues; an ISR calling this would spin
 /// on whichever of those the thread it interrupted holds.
 pub fn poll_if_pending() {
-    if crate::irq_ring::take(crate::irq_ring::IrqSource::Xhci).is_some() {
-        for ctrl in XHCI.lock().iter_mut() {
-            ctrl.poll();
+    let interrupted = crate::irq_ring::take(crate::irq_ring::IrqSource::Xhci).is_some();
+    if !interrupted {
+        match PORT_WORK_AT.load(Ordering::Relaxed) {
+            0 => return,
+            at if crate::clock::nanos_since_boot() < at => return,
+            _ => {}
         }
     }
+    let mut wake_at: Option<u64> = None;
+    for ctrl in XHCI.lock().iter_mut() {
+        if let Some(at) = ctrl.poll() {
+            wake_at = Some(wake_at.map_or(at, |w: u64| w.min(at)));
+        }
+    }
+    PORT_WORK_AT.store(wake_at.unwrap_or(0), Ordering::Relaxed);
 }
 
 /// Everything above the controller needs to know about one bound disk.
@@ -1093,13 +1444,20 @@ fn with_disk<R>(index: usize, f: impl FnOnce(&mut XhciController, usize) -> R) -
     None
 }
 
+/// The geometry of the machine's `index`-th disk, and `None` where there is no
+/// such disk — which after an unplug includes an index that used to name one.
+/// That is what stops a fresh `usb_storage::open` handing out a handle to a
+/// device that has been pulled.
 pub fn storage_geometry(index: usize) -> Option<StorageGeometry> {
-    with_disk(index, |ctrl, local| ctrl.storage[local].geometry())
+    with_disk(index, |ctrl, local| Some(ctrl.storage[local]?.geometry())).flatten()
 }
 
-/// Whether the machine's `index`-th disk is still being spoken to.
+/// Whether the machine's `index`-th disk is still being spoken to. `Some(false)`
+/// and not `None` for one that was unplugged: the caller asking is one that
+/// already holds a handle, and "it is gone" is an answer where "there is no
+/// such index" would be a lie.
 pub fn storage_online(index: usize) -> Option<bool> {
-    with_disk(index, |ctrl, local| ctrl.storage[local].online())
+    with_disk(index, |ctrl, local| ctrl.storage[local].is_some_and(|d| d.online()))
 }
 
 /// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
@@ -1187,6 +1545,10 @@ pub fn init(devices: &[PciDevice]) {
         }
         return;
     }
+    // Nothing is outstanding out of a boot scan — every port it looked at it
+    // acted on — so a machine that is never plugged into pays nothing for
+    // hotplug beyond one atomic load per pass.
+    PORT_WORK_AT.store(0, Ordering::Relaxed);
     let hid: usize = controllers.iter().map(|c| c.devices.len()).sum();
     log!("xHCI: {} controller(s), {} HID device(s)", controllers.len(), hid);
     log!("usb-storage: {} device(s)", disks);
@@ -1412,7 +1774,9 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         event_phase: true,
         devices: Vec::new(),
         storage: Vec::new(),
-        msc_claimed: 0,
+        msc_taken: [false; MSC_BLOCKS],
+        ports: alloc::vec![Port::EMPTY; max_ports as usize],
+        ports_dirty: false,
         #[cfg(feature = "xhci-portsc-rw1c")]
         software_disabled: [0u64; 4],
     })

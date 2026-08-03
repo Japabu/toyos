@@ -141,6 +141,37 @@ pub fn run() {
 
     drain();
 
+    // A pointer that is unplugged gives its entry back, and the next one to
+    // bind takes it. A monotone counter is what this was, and it made every
+    // plug cycle cost the machine a source it never got back — 255 of them and
+    // a laptop that has been docked for a week refuses the mouse in its dock.
+    assert!(
+        mouse::handle_motion(usb_mouse, 1, Motion::Relative { dx: 1, dy: 0 }, 0),
+        "input-merge: the pointer about to be unplugged queued nothing"
+    );
+    assert_eq!(last_button_state(), 1, "input-merge: its button did not reach the merge");
+    assert!(
+        mouse::unbind(usb_mouse),
+        "input-merge: unbinding a pointer holding a button published no release"
+    );
+    assert_eq!(
+        last_button_state(),
+        0,
+        "input-merge: an unplugged pointer's button survived it — every other pointer's motion \
+         republishes it, which is a compositor stuck in a drag"
+    );
+    let replug = PointerSource::claim().expect("input-merge: no entry for the pointer plugged back in");
+    assert_eq!(
+        replug, usb_mouse,
+        "input-merge: a pointer plugged back in took a fresh entry rather than the one its \
+         predecessor gave back"
+    );
+    // And the pointer still bound keeps its own: reuse must be of the entry
+    // that was released and never of one somebody is publishing into.
+    assert!(tablet != replug, "input-merge: the entry a live pointer holds was handed out again");
+
+    drain();
+
     // Equal pixels per count on both axes. Relative motion accumulates in a
     // square 0..32767 space that the compositor maps by width and by height, so
     // one shared scalar skews the pointer by the aspect ratio — 1.6x on the

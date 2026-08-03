@@ -1,6 +1,6 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
 use crate::io_uring::RingId;
 use crate::sync::Lock;
 pub use toyos_abi::input::MouseEvent;
@@ -27,24 +27,52 @@ static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PointerSource(u8);
 
-/// The next unclaimed entry in `BUTTONS`. Index 0 belongs to the i8042.
-static NEXT_SOURCE: AtomicU8 = AtomicU8::new(1);
+/// One bit per entry of `BUTTONS`, set while a device holds it. Bit 0 is the
+/// i8042's aux port, which is claimed for as long as the machine exists.
+///
+/// A monotone counter is what this used to be, and a counter cannot be handed
+/// back: a USB pointer that is unplugged and plugged in again took a fresh
+/// entry each time, so after 255 of them `claim` returns `None` and the next
+/// mouse is refused on a machine that has one pointer attached. A dock is that
+/// many plug cycles in a working week.
+static IN_USE: [AtomicU64; 4] = [
+    AtomicU64::new(1),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 impl PointerSource {
     /// The i8042's aux port, of which a machine has at most one.
     pub const PS2: Self = Self(0);
 
     /// An entry in the button table for a pointer that is binding, or `None`
-    /// when the machine has more pointers than the table names.
+    /// when every entry is already held.
     ///
     /// A caller that cannot get one must not bind the device: handing it
     /// somebody else's entry is worse than not having it, because the other
     /// device's buttons then flap on every report.
+    ///
+    /// The lowest free entry, so the numbers a machine uses stay the numbers
+    /// its pointers need — an entry [`unbind`] gave back is the one the next
+    /// pointer takes.
     pub fn claim() -> Option<Self> {
-        NEXT_SOURCE
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .ok()
-            .map(Self)
+        for (word, bits) in IN_USE.iter().enumerate() {
+            let mut seen = bits.load(Ordering::Relaxed);
+            while seen != u64::MAX {
+                let bit = seen.trailing_ones();
+                match bits.compare_exchange_weak(
+                    seen,
+                    seen | (1 << bit),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Some(Self((word as u32 * 64 + bit) as u8)),
+                    Err(now) => seen = now,
+                }
+            }
+        }
+        None
     }
 
     /// Which entry of the button table this source publishes into. For a log
@@ -53,7 +81,6 @@ impl PointerSource {
     pub fn id(self) -> u8 {
         self.0
     }
-
 }
 
 /// One byte per source a `PointerSource` can name, so there is no allocation,
@@ -185,6 +212,29 @@ pub fn release_buttons(source: PointerSource) -> bool {
         abs_y: LAST_Y.load(Ordering::Relaxed),
     });
     true
+}
+
+/// A pointer that is gone: release whatever it was holding and give its entry
+/// back. Returns whether the release changed the merge.
+///
+/// The counterpart to [`PointerSource::claim`] and the only thing that frees an
+/// entry — it clears the buttons first, because an entry handed to the next
+/// device with a byte still set publishes that byte as the new device's
+/// buttons until its first report, which is the aliasing this type exists to
+/// prevent one step removed.
+///
+/// Distinct from [`release_buttons`], which is for a pointer that is still
+/// there and may report again: a quarantined controller keeps its source, an
+/// unplugged device does not.
+pub fn unbind(source: PointerSource) -> bool {
+    assert!(
+        source != PointerSource::PS2,
+        "mouse: the i8042's aux port cannot be unplugged, and freeing entry 0 would let a USB \
+         pointer alias it"
+    );
+    let published = release_buttons(source);
+    IN_USE[source.0 as usize / 64].fetch_and(!(1u64 << (source.0 % 64)), Ordering::Relaxed);
+    published
 }
 
 /// Process a HID mouse/tablet report. Returns the number of events queued.

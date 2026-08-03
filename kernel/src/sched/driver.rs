@@ -541,7 +541,19 @@ fn execute(action: Action<KernelPayload>) {
                 // owed, and the paths on which it cannot (a VFS lock a dead
                 // thread still holds) turn the sink off after a bounded number
                 // of tries, which clears this too.
-                || crate::drivers::log_ring::file_has_pending();
+                || crate::drivers::log_ring::file_has_pending()
+                // A root-hub port whose connect state the driver has not
+                // finished acting on. The connect edge that started it was the
+                // last interrupt that controller has to give — a device sitting
+                // still in a port produces nothing further — so no wake is
+                // coming and the one-shot timer is armed for parked *tasks*,
+                // which a driver's deferred work is not. Bounded and
+                // self-clearing like the three above, but over a longer
+                // interval: USB 2.0 §7.1.7.3's 100 ms of debounce, or the
+                // transfer deadline behind a port that will not reset. It costs
+                // an idle CPU the halt, never a pass — anything runnable is
+                // still picked, because this decides only whether to sleep.
+                || crate::drivers::xhci::port_work_pending();
             if awake {
                 unsafe { asm!("sti", options(nomem, nostack)) };
                 drop(token);

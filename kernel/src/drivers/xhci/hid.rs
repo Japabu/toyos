@@ -26,6 +26,10 @@ pub enum HidRole {
 
 pub struct HidDevice {
     pub slot_id: u8,
+    /// The root-hub port this device is on, which is what a disconnect names.
+    /// The slot id cannot serve: the controller frees it when the slot is
+    /// disabled, and the port is what the register reports about.
+    pub port_idx: u8,
     pub int_ep_dci: u8,
     pub int_ring: TrbRing,
     pub report_phys: u64,
@@ -47,33 +51,53 @@ impl HidDevice {
         // identical to the last one produces no event, and waking watchers
         // for it made readiness disagree with `has_data()` — which froze the
         // compositor for as long as a key was held.
-        match self.role {
+        let queued = match self.role {
+            HidRole::Keyboard => keyboard::handle_report(&mut self.prev_report, &buf[..size]) != 0,
+            HidRole::Pointer(source) => mouse::handle_report(source, &buf[..size]) != 0,
+        };
+        if queued {
+            self.wake();
+        }
+    }
+
+    /// Release everything this device was holding, on its way off the bus.
+    ///
+    /// A zero *report* rather than `keyboard::release_all`: the held set is the
+    /// union across every keyboard on the machine, and this device's own
+    /// `prev_report` is the only record of which of those keys are its. A
+    /// report holding nothing synthesizes exactly those releases, through the
+    /// same merge every other report of this device took — so the keyboard
+    /// beside it keeps the keys it is holding.
+    ///
+    /// The pointer half gives the button-table entry back as well, which is
+    /// what makes a device that is plugged in again cost the machine nothing.
+    pub fn unbind(&mut self) {
+        let queued = match self.role {
+            HidRole::Keyboard => keyboard::handle_report(&mut self.prev_report, &[0u8; 8]) != 0,
+            HidRole::Pointer(source) => mouse::unbind(source),
+        };
+        if queued {
+            self.wake();
+        }
+    }
+
+    /// Wake whoever is waiting on this device's kind of event. Both halves of
+    /// the pair, always: the queue a blocked `sys_read` parks on and the ring
+    /// watchers `process_poll_add` registered, which nothing in the type
+    /// system pairs.
+    fn wake(&self) {
+        let (watchers, source) = match self.role {
             HidRole::Keyboard => {
-                if keyboard::handle_report(&mut self.prev_report, &buf[..size]) == 0 {
-                    return;
-                }
                 keyboard::wake_waiters();
-                let watchers = keyboard::io_uring_watchers();
-                if !watchers.is_empty() {
-                    crate::io_uring::complete_pending_for_event(
-                        &watchers,
-                        crate::io_uring::Source::Keyboard,
-                    );
-                }
+                (keyboard::io_uring_watchers(), crate::io_uring::Source::Keyboard)
             }
-            HidRole::Pointer(source) => {
-                if mouse::handle_report(source, &buf[..size]) == 0 {
-                    return;
-                }
+            HidRole::Pointer(_) => {
                 mouse::wake_waiters();
-                let watchers = mouse::io_uring_watchers();
-                if !watchers.is_empty() {
-                    crate::io_uring::complete_pending_for_event(
-                        &watchers,
-                        crate::io_uring::Source::Mouse,
-                    );
-                }
+                (mouse::io_uring_watchers(), crate::io_uring::Source::Mouse)
             }
+        };
+        if !watchers.is_empty() {
+            crate::io_uring::complete_pending_for_event(&watchers, source);
         }
     }
 

@@ -60,6 +60,8 @@ pub struct MscInterface {
 #[derive(Clone, Copy)]
 pub struct MscDevice {
     slot_id: u8,
+    /// The root-hub port this disk is on, which is what a disconnect names.
+    pub(super) port_idx: u8,
     iface: u8,
     in_ep: u8,
     out_ep: u8,
@@ -100,6 +102,12 @@ impl MscDevice {
     /// "did this disk ever come up", not "is it still there".
     pub fn online(&self) -> bool {
         !self.failed
+    }
+
+    /// The pool block this disk's rings and buffers live in, so its controller
+    /// can give it back once the slot naming that memory is disabled.
+    pub(super) fn block(&self) -> usize {
+        self.block
     }
 
     pub fn geometry(&self) -> StorageGeometry {
@@ -295,15 +303,16 @@ impl Host<'_> {
 
 impl XhciController {
     /// Run `f` against the `index`-th disk, writing the device's state back
-    /// whatever `f` did with it.
+    /// whatever `f` did with it. `None` for an index no disk is behind, which
+    /// after an unplug includes an index a disk used to be behind.
     fn with_storage<R>(
         &mut self,
         index: usize,
         f: impl FnOnce(&mut Self, &mut MscDevice) -> R,
     ) -> Option<R> {
-        let mut dev = *self.storage.get(index)?;
+        let mut dev = (*self.storage.get(index)?)?;
         let out = f(self, &mut dev);
-        self.storage[index] = dev;
+        self.storage[index] = Some(dev);
         Some(out)
     }
 
@@ -781,7 +790,7 @@ pub fn bind(
     // counts the disks that *finished*.
     let Some(block) = ctrl.claim_msc_block() else {
         log!("usb-storage: slot {slot_id} is the {}th disk; this driver serves {}",
-            ctrl.msc_claimed + 1, super::MSC_BLOCKS);
+            ctrl.msc_blocks_taken() + 1, super::MSC_BLOCKS);
         return;
     };
 
@@ -830,6 +839,7 @@ pub fn bind(
 
     let mut dev = MscDevice {
         slot_id,
+        port_idx,
         iface: info.iface_num,
         in_ep: info.in_ep.addr,
         out_ep: info.out_ep.addr,
@@ -865,7 +875,7 @@ pub fn bind(
         dev.blocks * HOST_BLOCK as u64 / (1024 * 1024),
         block
     );
-    ctrl.storage.push(dev);
+    ctrl.storage.push(Some(dev));
 }
 
 /// TEST UNIT READY, INQUIRY and READ CAPACITY: everything between a configured
