@@ -203,9 +203,9 @@ Read the spec before touching the subsystem it covers.
 
 **`specs/known-issues.md` is the list and the file to update** — ten sections, every open item with its evidence and its reproduction. Read it before touching a subsystem. Nothing is duplicated here.
 
-Six bite an agent who is *not* working on the subsystem, and the first blocks every landing:
+Six bite an agent who is *not* working on the subsystem:
 
-- **Gate A's fast tier is red on `main`.** `audio_tone_load (smp=1)` drops out on both of its boots, reproducibly, measured against `5408cfb` with a same-session A/B. A full-suite landing gate cannot pass until it is fixed. Known-issues §4 has the numbers and the leads.
+- **Gate A's fast tier reds intermittently, on `main` as much as on your branch.** `audio_tone_load (smp=1)`: four red runs and three green in one session, with the same tree on both sides of the line. Before believing it is yours, stash and re-run — known-issues §4 has that A/B and the numbers.
 
 - **A boot that wedges before the idle loop produces no serial output at all** — the log ring's only drains are the timer tick and the idle loop, and neither runs during the boot phases. It looks exactly like a kernel that never started. Known-issues §5 carries the one-line patch that makes one bisectable.
 - **`Command::output()` returns an empty stderr, always** — the toyos `output` asks `spawn` for the pipe and then drops it. A guest test asserting on a child's refusal message passes vacuously. Use `spawn()` + `wait_with_output()`.
