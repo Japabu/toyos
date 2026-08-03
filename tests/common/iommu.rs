@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Duration;
 
 use super::qemu::{self, BootOptions, Profile, QemuInstance};
 use super::serial::Serial;
@@ -95,6 +96,18 @@ pub fn iommu_discovery(
         expect(&field("cm")?, "y", "cm", name, line)?;
         expect(&field("sps2m")?, "y", "sps2m", name, line)?;
 
+        // Stage I2, on the guest's own word. It is the weakest of the three
+        // things that certify it and it is here because it costs no boot: the
+        // suite booting green with the unit on is the second, and the two
+        // actuator gates below — a device the unit blocks — are the only ones
+        // that can tell translation from a unit that is merely switched on.
+        let unit_line = log.must_say("translating gsts=")?;
+        let tes = unit_fields(unit_line)
+            .get("tes")
+            .cloned()
+            .ok_or_else(|| format!("{name}: no tes= on {unit_line:?}"))?;
+        expect(&tes, "y", "tes", name, unit_line)?;
+
         // Every scope naming a PCI function must name one this machine has.
         // A decode that read the path bytes at the wrong offset would produce
         // requester ids that look like addresses and match no device.
@@ -147,6 +160,234 @@ pub fn iommu_discovery(
     }
 
     Ok(())
+}
+
+/// The needle that says the unit blocked something, and the marker both gates
+/// below boot to. A boot that never produces it times out, which is what a
+/// unit that is not translating looks like from here.
+const FAULT: &str = "iommu: DMA FAULT";
+
+/// The fault reasons a *second-level page table walk* decides, as against the
+/// ones the root/context walk above it decides.
+///
+/// The set rather than one member, because which of them a unit gives for an
+/// all-zero entry is an implementation's choice: QEMU 11.0.2 answers
+/// `read-permission` — its own line reads `detected sspte permission error
+/// (iova=0x1000000, level=0x4, sspte=0x0, write=0)`, so it reached the entry
+/// and judged it on its permission bits rather than on a separate present bit.
+/// A unit that answered `paging-entry-invalid` instead would be saying the
+/// same thing. What the set excludes is the whole of the root and context
+/// walk, which is the discrimination the gate needs: those are what a
+/// stranded *context* entry produces, and passthrough produces no fault at all.
+const SECOND_LEVEL: &[&str] = &["read-permission", "write-permission", "paging-entry-invalid"];
+
+/// A function whose context entry the kernel deliberately never wrote must
+/// fault on its first transaction, and the fault must name it.
+///
+/// This is `specs/iommu-spec.md` §9's exit criterion for I2 and the isolation
+/// negative control at the same time, because at this stage they are the same
+/// question. Identity mapping means a translated machine and an untranslated
+/// one produce the same result for every device that is *in* the tables, so
+/// the only way to tell the two apart is a device that is not: with the unit
+/// bypassing, or never enabled, or pointed at a context entry naming
+/// passthrough, the controller below would go on working and this test would
+/// wait for a fault that never comes.
+///
+/// [`Profile::Metal`] because it has an NVMe controller and no virtio device.
+/// The distinction matters: QEMU gives a virtio device the bypassing address
+/// space unless it is created with `iommu_platform=on`, so a virtio-only
+/// machine could not tell a translating unit from an absent one however the
+/// tables were written.
+pub fn iommu_context_absent(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let (log, blocked) = fault_boot(test_config, c_bins, rust_bins, &["iommu-context-absent"])?;
+
+    // Which function the actuator left out is decided in the guest by class
+    // code; which function that *is* on this machine is read here from the PCI
+    // walk's own lines. Neither half is told the other's answer, so a fault
+    // naming some other device — or the actuator skipping a device the walk
+    // never saw — is a failure rather than a tautology.
+    let nvme = class_function(&log, "0108").ok_or_else(|| {
+        format!("this machine enumerated no NVMe controller to leave out\n{}", log.text())
+    })?;
+    if blocked.stream != nvme {
+        return Err(format!(
+            "the unit blocked {} but the controller left out of the root table is {nvme}",
+            blocked.stream
+        ));
+    }
+    if blocked.reason != "context-entry-not-present" {
+        return Err(format!(
+            "the unit blocked {nvme} for {:?}, and a function with no context entry should be \
+             blocked for having none",
+            blocked.reason
+        ));
+    }
+    eprintln!(
+        "  [iommu] {nvme} left out of the root table: blocked at {} on a {} for {}",
+        blocked.address, blocked.access, blocked.reason
+    );
+    Ok(())
+}
+
+/// A function whose context entry names a domain with nothing in it must fault
+/// on its first transaction, and the fault must name the *page table* rather
+/// than the entry above it.
+///
+/// The half [`iommu_context_absent`] cannot give. A context entry naming
+/// **passthrough** would fault identically for a function that has no entry at
+/// all — and would then ignore every second-level table this kernel writes,
+/// which is the whole of what I4 will build on. Here the entry is present and
+/// the domain behind it is empty, so a fault can only come from the unit
+/// having walked a table this kernel wrote and found nothing.
+///
+/// It fails on a *read* deliberately. QEMU caches a translation with the
+/// permissions of whichever access populated it and then lets its memory core
+/// drop a later access the cached entry does not allow — silently, with no
+/// fault record — so a control built on narrowing a permission hangs the boot
+/// instead of faulting. Measured, and written up in `specs/iommu-spec.md`
+/// §8.2; the first thing a device does here is fetch a descriptor, which
+/// misses the cache and is answered by the tables.
+pub fn iommu_empty_domain(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let (log, blocked) = fault_boot(test_config, c_bins, rust_bins, &["iommu-empty-domain"])?;
+
+    let nvme = class_function(&log, "0108").ok_or_else(|| {
+        format!("this machine enumerated no NVMe controller to strand\n{}", log.text())
+    })?;
+    if blocked.stream != nvme {
+        return Err(format!(
+            "the unit blocked {} but the controller given an empty domain is {nvme}",
+            blocked.stream
+        ));
+    }
+    if !SECOND_LEVEL.contains(&blocked.reason.as_str()) {
+        return Err(format!(
+            "the unit blocked {nvme} for {:?}, which is not something a second-level page table \
+             walk decides. A present context entry over an empty domain has to be refused by the \
+             walk itself — any other reason means the unit stopped before it, and a context entry \
+             naming passthrough would not have walked at all",
+            blocked.reason
+        ));
+    }
+    // Inside the memory the identity domain covers, because that is where the
+    // driver's descriptors are: a fault somewhere else would be a different
+    // machine's bug wearing this one's clothes.
+    let covered = identity_extent(&log)?;
+    let at = u64::from_str_radix(blocked.address.trim_start_matches("0x"), 16)
+        .map_err(|_| format!("unreadable faulting address {:?}", blocked.address))?;
+    if at == 0 || at >= covered {
+        return Err(format!(
+            "the unit blocked an access to {}, and the driver's descriptors are inside \
+             0x0..{covered:#x}",
+            blocked.address
+        ));
+    }
+    eprintln!(
+        "  [iommu] {nvme} given an empty domain: blocked at {} on a {} for {}",
+        blocked.address, blocked.access, blocked.reason
+    );
+    Ok(())
+}
+
+/// What the unit reported when it blocked a transaction.
+struct Blocked {
+    stream: String,
+    address: String,
+    access: String,
+    reason: String,
+}
+
+/// Boot a deliberately mis-programmed machine and read the first fault off it.
+///
+/// The fault line is the ready marker, so a boot that never produces one fails
+/// as a boot timeout — which is exactly what a unit that is not translating
+/// would do, and is why neither gate can pass vacuously.
+fn fault_boot(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+    features: &'static [&'static str],
+) -> Result<(Serial, Blocked), String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::Metal,
+            kernel_features: features,
+            ready_marker: FAULT,
+            ..Default::default()
+        },
+    );
+    let mut log = Serial::boot(&qemu);
+    // Past the fault, because the claim is that the machine stopped there: the
+    // handler halts every CPU, so anything the boot would have gone on to do
+    // has to be absent from a window that stays open after it.
+    log.push(&qemu.drain_serial(Duration::from_secs(2)));
+    log.must_not_say("Boot: complete")?;
+    log.must_not_say(qemu::DEFAULT_READY)?;
+
+    let line = log.must_say(FAULT)?;
+    let fields = unit_fields(line);
+    let field = |k: &str| -> Result<String, String> {
+        fields.get(k).cloned().ok_or_else(|| format!("the fault line has no {k}=: {line:?}"))
+    };
+    let reason = line
+        .split_whitespace()
+        .last()
+        .ok_or_else(|| format!("the fault line names no reason: {line:?}"))?
+        .to_string();
+    if reason == "unnamed" {
+        return Err(format!(
+            "the unit reported a fault reason this kernel has no name for: {line:?}"
+        ));
+    }
+    let blocked = Blocked {
+        stream: field("stream")?,
+        address: field("addr")?,
+        access: field("access")?,
+        reason,
+    };
+    Ok((log, blocked))
+}
+
+/// How far up the identity domain reaches, off the line that built it.
+fn identity_extent(log: &Serial) -> Result<u64, String> {
+    let line = log.must_say("iommu: identity domain")?;
+    let range = line
+        .split_whitespace()
+        .find(|w| w.starts_with("0x0.."))
+        .ok_or_else(|| format!("no extent on {line:?}"))?;
+    let top = range.trim_start_matches("0x0..0x");
+    u64::from_str_radix(top, 16).map_err(|_| format!("unreadable extent on {line:?}"))
+}
+
+/// The one function `pci::enumerate` printed with this class, or none.
+///
+/// `None` rather than a first match over several: two controllers of one class
+/// would make "the one the actuator skipped" ambiguous, and a gate that picked
+/// either would be asserting against a guess.
+fn class_function(log: &Serial, class: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in log.text().lines() {
+        let Some((bdf, tail)) = line.split("PCI ").nth(1).and_then(|r| r.split_once(' ')) else {
+            continue;
+        };
+        if tail.starts_with(&format!("[{class}]")) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(bdf.to_string());
+        }
+    }
+    found
 }
 
 /// The `key=value` pairs on a unit line. `@0xfed90000` carries no `=` and is
