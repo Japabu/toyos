@@ -1,4 +1,4 @@
-use bcachefs::{Formatted, Mounted, ReadOnly, ReadWrite, VecBlockIO};
+use bcachefs::{Extent, Formatted, FsError, Mounted, ReadOnly, ReadWrite, VecBlockIO};
 
 // --- Basic read-only tests ---
 
@@ -314,12 +314,12 @@ fn mounted_readwrite_delete() {
     mounted.create("b.txt", b"bbb", 0).expect("create b");
     assert_eq!(mounted.list().unwrap().len(), 2);
 
-    assert!(mounted.delete("a.txt"));
+    assert!(mounted.delete("a.txt").expect("delete"));
     assert_eq!(mounted.list().unwrap().len(), 1);
     assert!(mounted.read_file("a.txt").is_err());
     assert_eq!(mounted.read_file("b.txt").unwrap(), b"bbb");
 
-    assert!(!mounted.delete("nonexistent"));
+    assert!(!mounted.delete("nonexistent").expect("delete"));
 }
 
 #[test]
@@ -346,7 +346,7 @@ fn mounted_readwrite_delete_prefix() {
 
     assert_eq!(mounted.list().unwrap().len(), 203);
 
-    mounted.delete_prefix("bin/");
+    mounted.delete_prefix("bin/").expect("delete_prefix");
     let files = mounted.list().unwrap();
     assert_eq!(files.len(), 200, "expected 200 files after deleting bin/, got {}", files.len());
     assert!(mounted.read_file("bin/shell").is_err());
@@ -876,7 +876,7 @@ fn one_block_holes(blocks: u64) -> (Mounted<VecBlockIO, ReadWrite>, Vec<(String,
     assert!(made.len() > 8, "volume too small to fragment: {} files", made.len());
     for (i, name) in made.iter().enumerate() {
         if i % 2 == 0 {
-            assert!(fs.delete(name), "delete {name}");
+            assert!(fs.delete(name).expect("delete"), "delete {name}");
         }
     }
     let survivors = made
@@ -938,4 +938,98 @@ fn every_page_of_a_fragmented_file_owns_a_distinct_block() {
         6,
         "resolving a page that already has a block allocated another: {extents:?}",
     );
+}
+
+// --- Write-path ordering: an operation that fails must not have destroyed
+//     what it was asked to replace, nor kept what it took. ---
+
+/// Blocks a 64-block volume has to give: everything but the superblock, the
+/// bitmap, the root node and the backup superblock.
+const FREE_BLOCKS_64: usize = 60;
+
+fn small_volume() -> Mounted<VecBlockIO, ReadWrite> {
+    Formatted::format(VecBlockIO::new(64)).mount()
+}
+
+/// How many one-block files this volume still has room for.
+fn one_block_files_that_fit(fs: &mut Mounted<VecBlockIO, ReadWrite>) -> usize {
+    let mut fitted = 0;
+    for i in 0..FREE_BLOCKS_64 * 2 {
+        let name = format!("p{:03}", i);
+        if fs.create(&name, b"x", 0).is_err() {
+            break;
+        }
+        fitted += 1;
+    }
+    fitted
+}
+
+#[test]
+fn a_create_that_runs_out_of_space_leaves_the_old_file_where_it_was() {
+    let mut fs = small_volume();
+    let original = vec![0x5Au8; 5 * 4096];
+    fs.create("keep.bin", &original, 7).expect("the first create fits");
+
+    let err = fs
+        .create("keep.bin", &vec![0xA5u8; 400 * 4096], 8)
+        .expect_err("400 blocks do not fit in a 64-block volume");
+
+    assert!(
+        matches!(err, FsError::NoSpace { .. }),
+        "expected NoSpace, got {err:?}",
+    );
+    assert_eq!(
+        fs.read_file("keep.bin").expect("the file that was already here"),
+        original,
+        "the replacement failed and took the original with it",
+    );
+    assert_eq!(fs.file_mtime("keep.bin"), 7, "the old entry's mtime was rewritten");
+}
+
+#[test]
+fn a_write_that_runs_out_of_space_gives_back_what_it_took() {
+    let mut fresh = small_volume();
+    let untouched = one_block_files_that_fit(&mut fresh);
+    assert_eq!(
+        untouched, FREE_BLOCKS_64,
+        "the baseline is wrong, so the comparison below proves nothing",
+    );
+
+    let mut fs = small_volume();
+    fs.create("big.bin", &vec![0u8; 400 * 4096], 0)
+        .expect_err("400 blocks do not fit in a 64-block volume");
+
+    assert_eq!(
+        one_block_files_that_fit(&mut fs),
+        untouched,
+        "a create that failed kept the blocks it had already reserved",
+    );
+}
+
+#[test]
+fn a_metadata_update_that_cannot_be_reinserted_leaves_the_entry_alone() {
+    let mut fs = small_volume();
+    // Every free block spent, and the root leaf filled to within one entry's
+    // growth of a split — so the reinsert has to split and the split has no
+    // block to split into.
+    for i in 0..FREE_BLOCKS_64 {
+        fs.create(&format!("f{:02}", i), b"x", 100 + i as u64).expect("fill");
+    }
+
+    let (extents, _) = fs.file_extents("f00").expect("f00 is on the volume");
+    let grown: Vec<Extent> = (0..16).map(|_| extents[0]).collect();
+
+    let err = fs
+        .update_metadata("f00", &grown, 1, 999)
+        .expect_err("a 16-extent value needs a split this volume cannot pay for");
+    assert!(
+        matches!(err, FsError::NoSpace { .. }),
+        "expected NoSpace, got {err:?}",
+    );
+
+    assert_eq!(
+        fs.read_file("f00").expect("f00 after a metadata update that failed"),
+        b"x",
+    );
+    assert_eq!(fs.file_mtime("f00"), 100, "the failed update left its mtime behind");
 }
