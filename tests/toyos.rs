@@ -41,12 +41,18 @@ enum Sched {
 
 /// The width with no `--jobs`, and where it came from.
 ///
-/// 14 cores, `smp: 2` per guest plus QEMU's own I/O thread — about three host
-/// threads each, so four is the honest ceiling for one suite
-/// (`specs/test-cost-audit.md` §4.1 constraint 3) and eight oversubscribes the
-/// machine. Measured both ways against one HEAD in one session; §5.3 records
-/// what each gave.
-const DEFAULT_WIDTH: usize = 4;
+/// 14 cores and about three host threads a guest says four, and the suite says
+/// eight: measured against one HEAD in one session, the parallel phase came in
+/// at 182.7 s wide four, **91.7 s wide eight** and 126.0 s wide twelve, and on a
+/// quiet host at eight it packs 454.5 s of test time into 58.3 s of wall clock.
+/// Twelve is past the machine and the suite measures that rather than being
+/// argued out of it. `specs/test-cost-audit.md` §5.4.7 carries the table and the
+/// one caveat it has.
+///
+/// A guest that is mostly *waiting* — for a marker, for a debounce, for a
+/// device — is what makes eight fit at all, and it is why this number is a
+/// measurement and not a division.
+const DEFAULT_WIDTH: usize = 8;
 
 /// The one boot that carries every Rust and C test.
 ///

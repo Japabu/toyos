@@ -925,9 +925,36 @@ by *what the assertion is* rather than by what the registration said:
 |---|---|---|
 | `drain_until` instead of `drain_serial(20 s)` | `double_fault_stack` | **32 s → 3 s** |
 | `qemu::budget`, shared block to the phase | tail | −13 s from the tail |
-| eleven conversions | tail | −132 s from the tail |
+| ten conversions | tail | 167.3 s → 35.0 s |
 | longest-job-first on a measured profile | parallel phase | see §5.4.5 |
 | inert-actuator folding | image builds | 5 kernel variants → 1 |
+
+**Where it landed.** One suite on a quiet host (`uptime` load 4.90, no other
+worktree building or booting), 238/238 green, width 8:
+
+| | seconds |
+|---|---:|
+| parallel phase, 228 tests in 61 tasks | **58.3** |
+| serial tail, 6 tests | **35.0** |
+| gate A, 4 boots | **46.5** |
+| **suite** | **139.7** |
+
+The parallel phase summed to 454.5 s of test time in 58.3 s of wall clock —
+**7.8× on 8 workers**, and its longest single job is 32 s against a 58.3 s wall,
+so the phase is sum-bound and not critical-path bound. That is the number the
+width question (§5.4.7) is asked against.
+
+**Gate A's 46.5 s is 30 s plus two confirmations.** Two of its four configs saw
+a dropout and the fast tier re-booted each once to check it reproduced; neither
+did. A run whose four configs come back clean is 30 s, which puts this suite at
+**123 s**. The audit's honest statement of the target is therefore: *the
+scheduling is done and 120 s is within a few seconds of it, and what stands
+between is gate A's floor* — 30 s of it, alone, by construction, and the owner's
+to move.
+
+Against the starting point: **327.5 s at width 4** before this wave and before
+`screen_console_scroll`'s cut, and **433.8 s** measured on this branch's base
+under the same five-worktree load the conversions were later tested under.
 
 **`double_fault_stack` is the shape to look for elsewhere.** A guest the fatal
 path has halted does not *exit*: every CPU is stopped and QEMU stays up, so
@@ -1014,6 +1041,30 @@ not throw away a full one's profile. A hand-maintained list of long tests was
 rejected for the reason §5.3 gives — a second registration to keep true — and a
 name the file has never seen sorts *first*, so a new test is assumed long until
 it has been timed once.
+
+### 5.4.7 The width, re-asked against the post-cut profile
+
+§5.3 left this open and said it had to be re-made from scratch. Same session,
+same HEAD, other worktrees' suites draining from `uptime` load 32 to 6:
+
+| width | parallel | tail | suite |
+|---:|---:|---:|---:|
+| 4 | 182.7 s | 30.5 s | 274.1 s |
+| 8 | **91.7 s** | 32.1 s | 183.2 s |
+| 12 | 126.0 s | 27.6 s | 187.2 s |
+
+**Eight, and twelve is worse.** The case §5.3 could not make is made here: 14
+cores against ~3 host threads a guest puts 8 at the edge and 12 past it, and the
+suite measures that rather than being argued out of it. On the quiet host the
+default width's phase came in at 58.3 s (above), which is 7.8× on 8 workers —
+there is very little packing left to win, and the remaining cost is the sum.
+
+**One caveat this table carries and the quiet run does not.** These three were
+taken before `drain_serial` stopped being width-scaled, and at width 12
+`metal_sim_pointer_churn` — twenty-four paced drains — *was* the phase: 126.0 s
+of job inside a 126.0 s wall. It is 18 s now. So the shape of the 12 column is
+real (more workers than cores) but its size is partly a defect that is fixed;
+if the width is ever raised, raise it against a fresh table.
 
 ### 5.4.6 Ledger 3 — recycling and contamination
 
