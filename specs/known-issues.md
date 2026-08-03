@@ -1960,7 +1960,23 @@ precede it.** `git diff --cached --name-only | grep -v <my paths>` must be
 no lock; the window is real either way, but a conditional makes the common case
 safe instead of merely observed.
 
-### A second toolchain-contention window, distinct from the one `69bca9a` closed
+### CLOSED for build-system bootstraps — a second toolchain-contention window, distinct from the one `69bca9a` closed
+
+`a8c78ef` took the fix this entry asked for and preferred against: the
+bootstrap is now serialised across builders rather than made
+re-entrant. `toolchain::ensure` decides under the shared build lock and runs
+`x.py` under the exclusive one, so two builders' bootstraps cannot overlap and
+neither can remove `stage1-std/<target>/dist/deps` while the other's `rustc` is
+creating a temp file in it. Every observed instance came through the build
+system, so the signature below should be gone.
+
+**What is still reachable**: `./x.py build` typed by hand in `rust/`, which
+takes no lock. If the signature reappears, that is the first thing to ask, and
+the original preference — bootstrap not recreating a directory it already has —
+is still the better fix for it. The record below is kept because recognising it
+is the expensive part.
+
+---
 
 `69bca9a` removed the `rustup toolchain link` window — the symlink being
 unlinked and recreated on every build, so a concurrent `rustc` proxy landing in
@@ -1996,13 +2012,8 @@ Cost so far: two consecutive full-suite runs lost by one agent, plus the seven
 consecutive attempts that left `4fce59c` unverified for a session (§4). A third
 attempt succeeded unchanged, so it is a race, not a broken tree.
 
-Not fixed, and deliberately not worked around. Retrying is what everyone does
-and it usually works, but the failure is expensive because it is diagnosed
-from scratch each time. A fix wants either the bootstrap serialised across
-builders or `dist/deps` created rather than recreated; `69bca9a` preferred
-removing the window to serialising around it, and the same preference should
-apply here if the bootstrap can be made not to recreate a directory it already
-has.
+Retrying is what everyone did and it usually worked, but the failure was
+expensive because it was diagnosed from scratch each time.
 
 ### std leaks a whole thread stack on every `thread::spawn`
 
@@ -2081,7 +2092,7 @@ Either delete `src/toyos.rs` and let `stub.rs` serve, or drop the toyos gate in
 `map_anon`, are correct in the fork). Exactly one of the two should exist. Three
 real bugs in that module were found and fixed 2026-07-28 — see `forks.toml`.
 
-### cargo caches a *failed* `rustc -vV` and replays it until the file is deleted
+### CLOSED at the cause — cargo caches a *failed* `rustc -vV` and replays it until the file is deleted
 
 Found 2026-08-02, and it turned a two-minute window into a forty-minute one.
 Two agents ran `x.py build` in `rust/` concurrently; for the seconds during
@@ -2100,11 +2111,20 @@ recorded here. `src/toolchain.rs` drops `userland/libc/target/<triple>` on a
 rebuild for a neighbouring reason; `.rustc_info.json` sits one level above that
 and is not covered.
 
-Underneath it: nothing serialises `toolchain::ensure` across agents, so two
-`cargo test` runs in this tree can both decide the toolchain is stale and both
-start `x.py build` in the same directory. That is the window this defect needs.
+Underneath it: nothing serialised `toolchain::ensure` across agents, so two
+`cargo test` runs in this tree could both decide the toolchain was stale and
+both start `x.py build` in the same directory. That is the window this defect
+needs, and `a8c78ef` closed it — every step of `toolchain::ensure` decides under
+the shared build lock and acts under the exclusive one, and no cargo build runs
+while an exclusive phase does, so nothing can probe a `librustc_driver` that is
+being replaced.
 
-### A clean and a build in one target dir, unserialised — the evidence for #81
+The cargo behaviour itself is not fixed and cannot be from here: a probe that
+fails for *any* reason is still memoised and still replayed until the file is
+deleted. If the signature ever reappears, `rm <target-dir>/.rustc_info.json` is
+still the clearing move, and the unchanging pid is still the tell.
+
+### CLOSED — a clean and a build in one target dir, unserialised — the evidence for #81
 
 2026-08-02, hit by the owner mid-suite. His `cargo test` log, in order:
 
@@ -2141,8 +2161,29 @@ that hunk surfaced — it adds one `remove_dir_all` of
 predates it. What the upgrade work supplied was the trigger — an edit under
 `toyos-ld/src` while a suite runs — and the second racer.
 
-Task #81 serialises this; the four lines above are what it has to make
-unreachable.
+`62876b1` and `a8c78ef` serialise it. `external_fingerprint` and the cleans it
+implies now happen inside one exclusive section of a repo-level lock, so two
+processes cannot both decide "stale" and both clean; and every cargo build the
+build system runs holds that lock in shared mode from the first phase to the
+last artifact it reads back, so a clean cannot land inside a build at all. The
+lock files live in `.build-locks/` precisely because of the paragraph above:
+they must be outside every directory a clean removes.
+
+Reproduced in this tree both ways, 2026-08-03. Without: two bare `cargo clean`s
+launched together in `kernel/target` (11113 files, 3.5 GiB) gave the incident's
+own signature on the first attempt — `error: failed to remove file
+.../kernel/target/.rustc_info.json` / `No such file or directory (os error 2)`,
+exit 101, while the other reported `Removed 11113 files, 3.4GiB total`. With:
+two `cargo run -- --build-only` launched together, both with the kernel stamp
+absent so both decided a clean was needed — exactly one printed `external deps
+changed: cleaning .../kernel`, the other printed `[build-lock] waiting for the
+build lock (exclusive, clean crate targets against changed external deps)`,
+acquired it 39.9 ms later, re-decided, and cleaned nothing. Both exited 0.
+
+`src/buildlock.rs`'s `a_clean_cannot_land_inside_a_build` is the standing gate:
+the same interleaving staged deterministically, run once unlocked (the build's
+next write fails with this ENOENT) and once locked (it succeeds, and the clean
+happens after).
 
 ### rustup narrates its cargo fallback on every invocation
 
