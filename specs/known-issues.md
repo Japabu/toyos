@@ -2433,7 +2433,21 @@ t=1.69 s on a boot that reached `Boot: complete` at 0.38 s, and its 100
 publish "no NIC" rather than not publishing at all, so the retry has something
 to observe.
 
-### The xHCI driver never gives a slot back
+### PARTLY CLOSED — the xHCI driver never gives a slot back
+
+**A slot is now given back when its device is unplugged, and only then.**
+`0ed2bc1` added Disable Slot and made `device::configure` carry the slot id out
+of *every* path below the successful Enable Slot, including the eleven refusals
+below — so the port remembers the slot whether or not a device came of it, and
+`teardown_port` disables it. `xhci_hotplug` shows the controller handing the
+same slot id straight back to the next device plugged into that controller.
+
+What that closes is the hotplug half, which was the half that grows: without it
+every plug cycle cost a slot and 64 of them exhausted a PCH controller. What it
+does not close is a device that is **still plugged in** after a refused
+enumeration — a hub, a camera, a fingerprint reader, or any of the eleven paths
+— which keeps its slot until it is pulled. That is the entry below, unchanged,
+and the count is still 11.
 
 `init_device` enables a slot for every connected port and issues no Disable
 Slot, on any path: not for the devices it walks past (a hub, camera or
@@ -2703,41 +2717,93 @@ does so visibly. Two do, and both are deliberate:
 Neither is a defect today. Both become one the moment a second such device is
 reachable, and the enumerate-all they would need now exists.
 
-### USB hotplug does nothing, and M1 made that reachable
+### CLOSED — USB hotplug does nothing, and M1 made that reachable
 
-`dispatch_event` handles only `EVENT_TRANSFER`, and only for a slot already in
-`devices`; every other TRB type is advanced past and dropped, Port Status
-Change events included. `scan_ports` has exactly one caller, inside `init`. So
-the set of USB devices is whatever was connected at boot, forever.
+`dispatch_event` handled only `EVENT_TRANSFER`, and only for a slot already in
+`devices`; every other TRB type was advanced past and dropped, Port Status
+Change events included. `scan_ports` had exactly one caller, inside `init`. So
+the set of USB devices was whatever was connected at boot, forever — and
+plugging a keyboard into a machine with no input did nothing at all, with
+`device::try_claim(DEVICE_KEYBOARD)` already granted to the compositor, which
+made the machine indistinguishable from hung.
 
-**Read this before wiring `scan_ports` to Port Status Change events.** The
-driver keeps one input context and one descriptor buffer for all devices, and
-the only thing that makes that safe is that enumeration is serial:
-`init_device` runs once per port, from `init`, on one CPU. The invariant is
-written at `device.rs:scan_ports`, and hotplug is exactly the thing that breaks
-it — enumeration would then run while other devices are live, and two devices
-enumerating at once share the input context. What hotplug needs is an
-enumeration lock, not more buffers.
+Closed at `0ed2bc1` (driver) and `ba55b7e` (gate). The event was never wedging
+the ring: `next_event` advances ERDP and clears IP for every TRB it reads,
+whatever the type, so nothing about an unhandled event could starve a transfer
+completion. What was missing was acting on it.
 
-The EP0 ring used to be on that list and is not any more: mass storage needs
-control transfers *after* enumeration (Clear-Feature(HALT), Bulk-Only Reset),
-which the shared rewound ring could not serve, so every device now has its own
-in its device block. That removes one of hotplug's three obstacles as a side
-effect, and it is the only one it removes.
+Three things the entry warned about, and what each turned out to need:
 
-The other half of the problem, demuxing the event ring so a bound device's
-interrupt completion is not mistaken for the enumerating device's, is already
-done: both waits match the slot id — and, since mass storage put three
-endpoints on one slot, the endpoint id too.
+- **The enumeration lock.** It already existed. `XHCI` is a `Lock<Vec<…>>` and
+  every runtime path goes through `poll_if_pending`, which holds it; the shared
+  input context and descriptor buffer are per *controller*, and boot enumerates
+  before the vec is published. No second buffer was added.
+- **Debounce and reset are waits that must not be spun on.** `poll_if_pending`
+  is at the top of every scheduler pass, so USB 2.0 §7.1.7.3's 100 ms and the
+  T14's own 55 ms root-port reset would empty the audio pipeline on every plug.
+  `PortWork` is the per-port state machine that steps them instead, and
+  `device.rs` is split into `begin_reset` / `reset_done` / `configure` so the
+  reset is the event it already is. `init_device` composes the three, so the
+  boot path and `xhci-deaf-port` are unchanged.
+- **A change flag that stays set is a change the controller cannot report.**
+  §4.19.2 raises the event on a 0→1 transition and only then, so the boot scan
+  had to start clearing CSC or the first thing unplugged would go unnoticed.
+  `acknowledge_port_change` is the one implementation.
 
-This was masked until f76ea04: a machine with no USB HID panicked the boot, so
-"no keyboard, plug one in" could not happen. Now it survives, and plugging a
-keyboard into a machine with no input does nothing at all — no slot enabled, no
-event dispatched, and `device::try_claim(DEVICE_KEYBOARD)` already succeeded for
-the compositor, so nothing reports anything and the machine is indistinguishable
-from hung. That is the natural first thing to try on the T14 in the M1→M2
-window. Reproducible under `--metal-sim` with QMP `device_add usb-kbd,bus=xhci.0`
-after boot.
+Two residuals, both recorded below rather than here: what the enumeration still
+costs a scheduler pass, and what an idle CPU pays for the debounce.
+
+### The hotplug enumeration blocks a scheduler pass, and its debounce keeps a CPU awake
+
+Both are the price of `poll_if_pending` being the only context the driver has,
+and both are bounded and paid only by a machine somebody has just plugged into.
+
+**The enumeration.** `device::configure` runs inline: Enable Slot, Address
+Device, three or four control transfers, Configure Endpoint. Under TCG it is
+microseconds — the whole hotplug sequence in `xhci_hotplug` is inside one
+millisecond of guest time — so nothing in the suite can measure the real cost.
+The one hardware figure there is says the T14's five boot-time devices took
+346 ms including 5×55 ms of port reset, so roughly **14 ms each** for everything
+`configure` does (`specs/metal-hardware-inventory.md`). That is a scheduler pass
+of that length on the CPU that services the plug, with preemption disabled under
+the `XHCI` lock — the same order as `log_file`'s flush, which §10 measures at
+2.0–9.7 ms and calls out for the same reason. The port reset was the dominant
+term and is already out of it; taking the rest out means a state machine over
+the control transfers, which is the whole enumeration path rewritten.
+
+**The debounce.** `PORT_WORK_AT` keeps a CPU with nothing to run out of `hlt`
+until the port's deadline, because nothing else would bring it back: the connect
+edge was the last interrupt the controller had to give, and the scheduler arms
+its one-shot for parked *tasks*. It is a deadline rather than a flag, so the
+`XHCI` lock is taken once when it expires and not by every CPU on every pass for
+the length of it — but every *idle* CPU declines to halt for the interval, which
+is 100 ms for an ordinary plug and up to the 2 s transfer deadline behind a port
+that will not reset. Power, never latency: `Action::Idle` is reached only when
+there is nothing runnable, and this decides whether to sleep and nothing else.
+
+What would remove both is a way for a driver to ask the scheduler for a deferred
+callback at a deadline — which is also what `i8042::verdict_due` and
+`log_ring::file_has_pending` are working around in the same condition. That is a
+scheduler-core addition and wants the owner's sign-off.
+
+### A HID interrupt completion the controller did not like stops that device for good
+
+`dispatch_event` requeues a bound HID device's interrupt TRB only for completion
+codes 1 (Success) and 13 (Short Packet). Every other code — a stall on the
+interrupt endpoint, a transaction error, a babble — is dropped: no requeue, no
+log line, no fault, and that device's ring is empty for the rest of the boot.
+It is the same shape as the defect the function's own doc comment describes for
+an event dropped during a later port's enumeration, one level in.
+
+Found while wiring hotplug and left alone, because the fix is a policy question
+this task had no answer for: a keyboard whose endpoint halted needs Reset
+Endpoint plus Clear-Feature(ENDPOINT_HALT) plus Set TR Dequeue — which is
+`msc::restart_endpoint` for a device that has no `MscDevice` — and a device that
+babbles probably wants to be dropped rather than retried forever.
+
+Not reproducible here: QEMU's HID devices complete every interrupt TRB they are
+given, and there is no device or machine property that makes one fail, so this
+needs an actuator of `usb-transport-break`'s shape.
 
 ### PARTLY CLOSED — the i8042's one diagnostic line could not be read on the machine it is for
 
@@ -3637,12 +3703,15 @@ statements with no `?` between them.
    expected to come up green and its silence proves nothing.
 
 **The coverage hole this proves, and it is not the obvious one.** "No gate boots
-an image at the full system's real size" is true — every gate builds
-`tests/testcases/system.toml`, whose userland is soundd, the test runner and
-toybox — but it is *not* the hole that let this ship, because booting exactly
-that image at exactly that size is what the three runs above did and they are
-green. The hole with teeth is the other one: **all five `/log` gates read their
-verdict off a 16550, and the machine this feature exists for has none.** The
+an image at the full system's real size" is true, and smaller than it sounds:
+read off a suite boot's own `KernelArgs` line, the test image's boot partition is
+**513,008 sectors** against the shipping image's **1,323,424** — 262,660,096
+bytes against 677,593,088, a factor of 2.6 rather than the order of magnitude the
+73 MB diag and console images suggest. It is *not* the hole that let this ship
+either, because booting exactly that image at exactly that size is what the three
+runs above did and they are green. The hole with teeth is the other one: **all
+five `/log` gates read their verdict off a 16550, and the machine this feature
+exists for has none.** The
 kernel said why on the T14 — one of the lines quoted above, in the boot ring —
 and it reached no pixel and no file, because the compositor claimed the
 framebuffer tens of milliseconds after the last checkpoint and the log volume is
