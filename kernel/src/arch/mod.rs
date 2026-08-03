@@ -4,6 +4,7 @@ pub mod cpu;
 pub mod debug;
 pub mod gdt;
 pub mod idt;
+pub mod mtrr;
 pub mod percpu;
 pub mod smp;
 pub mod syscall;

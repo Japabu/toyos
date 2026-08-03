@@ -59,6 +59,13 @@ pub fn init(
     let token1 = shared_memory::register(DirectMap::from_phys(addr), aligned_size);
     log!("GOP: {}x{} stride={} format={} at {:#x} tokens=[{:?}, {:?}]",
         width, height, stride, pixel_format, addr, token0, token1);
+    // Not a property of this driver: nothing here or in `paging` sets a cache
+    // attribute, so the scanout's type is firmware's MTRR and this is the only
+    // place it is ever looked at. It decides what a client's writes cost, and
+    // it differs between machines — QEMU's is host RAM, which is why the answer
+    // has never mattered until there was a laptop.
+    log!("GOP: scanout memory type {} (PAT entry 0, WB, defers to the MTRR)",
+        crate::arch::mtrr::range_type(addr, aligned_size).name());
 
     let cursor_pages = crate::mm::pmm::alloc_contiguous(1, crate::mm::pmm::Category::Framebuffer).expect("GOP: cursor alloc failed");
     let cursor_phys = cursor_pages[0].direct_map().phys();
