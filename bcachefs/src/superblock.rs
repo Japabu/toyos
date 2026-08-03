@@ -1,4 +1,4 @@
-use crate::block_io::{BlockBuf, BlockNum, BlockIO, BLOCK_SIZE};
+use crate::block_io::{BlockBuf, BlockNum, BlockIO, BlockIOExt, BLOCK_SIZE};
 use crate::crc32c::crc32c;
 use crate::fs::FsError;
 
@@ -193,23 +193,26 @@ impl Superblock {
         };
 
         let mut buf = BlockBuf::zeroed();
-        io.read_block(BlockNum::new(0), &mut buf);
+        // A block 0 the device would not read is not a block 0 that failed to
+        // parse: the backup is the answer to a bad *superblock*, not to a bad
+        // device, and reaching for it after a refused read would mount a
+        // volume from a device that is not answering.
+        io.read(BlockNum::new(0), &mut buf)?;
         match checked(&buf) {
             Ok(sb) => Ok(sb),
             Err(primary_err) => {
-                io.read_block(BlockNum::new(device_blocks - 1), &mut buf);
+                io.read(BlockNum::new(device_blocks - 1), &mut buf)?;
                 checked(&buf).map_err(|_| primary_err)
             }
         }
     }
 
     /// Write superblock to both block 0 and the backup at the last block.
-    pub fn write(&self, io: &dyn BlockIO) {
+    pub fn write(&self, io: &dyn BlockIO) -> Result<(), FsError> {
         let mut buf = BlockBuf::zeroed();
         self.write_to(&mut buf);
-        io.write_block(BlockNum::new(0), &buf);
-        let last = BlockNum::new(self.block_count - 1);
-        io.write_block(last, &buf);
+        io.write(BlockNum::new(0), &buf)?;
+        io.write(BlockNum::new(self.block_count - 1), &buf)
     }
 }
 

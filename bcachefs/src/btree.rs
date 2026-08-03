@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use crate::block_io::{BlockBuf, BlockNum, BlockIO, BLOCK_SIZE};
+use crate::block_io::{BlockBuf, BlockNum, BlockIO, BlockIOExt, BLOCK_SIZE};
 use crate::crc32c::crc32c;
 use crate::alloc_bitmap::BitmapAllocator;
 use crate::fs::FsError;
@@ -184,7 +184,7 @@ impl Node {
     pub fn read(io: &dyn BlockIO, block: BlockNum) -> Result<Self, FsError> {
         let device_blocks = io.block_count();
         let mut buf = BlockBuf::zeroed();
-        io.read_block(block, &mut buf);
+        io.read(block, &mut buf)?;
         Self::parse(&buf, block, device_blocks)
     }
 
@@ -323,7 +323,7 @@ impl Node {
     pub fn write(&self, io: &dyn BlockIO, block: BlockNum) -> Result<(), FsError> {
         let mut buf = BlockBuf::zeroed();
         self.write_to(&mut buf)?;
-        io.write_block(block, &buf);
+        io.write(block, &buf)?;
         Ok(())
     }
 }

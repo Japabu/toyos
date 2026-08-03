@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::alloc_bitmap::BitmapAllocator;
-use crate::block_io::{BlockBuf, BlockNum, BlockIO, BLOCK_SIZE};
+use crate::block_io::{BlockBuf, BlockNum, BlockIO, BlockIOExt, BLOCK_SIZE};
 use crate::btree::{self, Entry, Key, KeyType, Node};
 use crate::superblock::Superblock;
 
@@ -59,6 +59,11 @@ pub enum FsError {
     /// A superblock that does not describe the device it was read from. The
     /// CRC only says the bytes are the bytes somebody wrote.
     BadSuperblock { field: &'static str },
+    /// The device refused a transfer. Distinct from every corruption variant
+    /// above: those say the bytes are wrong, these say there are no bytes.
+    DeviceRead(BlockNum),
+    DeviceWrite(BlockNum),
+    DeviceSync,
     NotFound,
     NoSpace { requested: u32, available: u64 },
     NameTooLong { len: usize, max: usize },
@@ -174,9 +179,18 @@ fn make_key(seed: &[u8; 16], name: &str, key_type: KeyType) -> Key {
 
 const MAX_NAME_LEN: usize = 512;
 
+/// A leaf value's type tag *is* its key type, so nothing carries the two
+/// separately. They were written out by hand at three sites as `1` and `2`,
+/// with `if key_type == File { 1 } else { 2 }` twice — one place for them to
+/// drift, and no way to notice.
+const _: () = assert!(
+    KeyType::File as u8 == 1 && KeyType::Symlink as u8 == 2,
+    "decode_leaf_value reads 1 as a file and 2 as a symlink",
+);
+
 /// Encode a file/symlink leaf value.
 fn encode_leaf_value(
-    entry_type: u8,
+    entry_type: KeyType,
     name: &str,
     size: u64,
     mtime: u64,
@@ -189,7 +203,7 @@ fn encode_leaf_value(
     let total = 1 + 2 + 8 + 8 + name_len + extent_bytes;
     let mut val = vec![0u8; total];
 
-    val[0] = entry_type;
+    val[0] = entry_type as u8;
     val[1..3].copy_from_slice(&(name_len as u16).to_le_bytes());
     val[3..11].copy_from_slice(&size.to_le_bytes());
     val[11..19].copy_from_slice(&mtime.to_le_bytes());
@@ -289,8 +303,73 @@ fn decode_leaf_value(value: &[u8]) -> Result<LeafValue, FsError> {
     }
 }
 
+/// Allocate blocks and write `data` into them, returning the extent list.
+///
+/// The allocator answers with a run that may be shorter than the request, so
+/// covering `data` takes a loop — and a run reserved by an earlier turn of that
+/// loop is a block the bitmap calls taken that no entry names, once a later
+/// turn fails. Every run goes back before the error does.
+fn write_data(
+    io: &dyn BlockIO,
+    alloc: &mut BitmapAllocator,
+    data: &[u8],
+) -> Result<Vec<Extent>, FsError> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let blocks_needed = data.len().div_ceil(BLOCK_SIZE) as u32;
+    let mut extents: Vec<Extent> = Vec::new();
+    let mut remaining = blocks_needed;
+    let mut data_offset = 0usize;
+
+    while remaining > 0 {
+        let run = match alloc.alloc_up_to(io, remaining) {
+            Ok(run) => run,
+            Err(err) => return Err(give_back(io, alloc, &extents, err)),
+        };
+        push_extent(&mut extents, run.start.raw(), run.len);
+
+        let mut buf = BlockBuf::zeroed();
+        for i in 0..run.len as u64 {
+            buf.0.fill(0);
+            let chunk_end = (data_offset + BLOCK_SIZE).min(data.len());
+            if data_offset < data.len() {
+                let len = chunk_end - data_offset;
+                buf.0[..len].copy_from_slice(&data[data_offset..chunk_end]);
+            }
+            if let Err(err) = io.write(BlockNum::new(run.start.raw() + i), &buf) {
+                return Err(give_back(io, alloc, &extents, err));
+            }
+            data_offset += BLOCK_SIZE;
+        }
+
+        remaining -= run.len;
+    }
+
+    Ok(extents)
+}
+
+/// Hand back the runs a failed [`write_data`] had already reserved, and return
+/// the failure that stopped it.
+///
+/// Best effort by construction: this runs because something has already gone
+/// wrong, and a bitmap write that also fails has no better answer to give than
+/// the error already in hand.
+fn give_back(
+    io: &dyn BlockIO,
+    alloc: &mut BitmapAllocator,
+    extents: &[Extent],
+    err: FsError,
+) -> FsError {
+    for ext in extents {
+        let _ = alloc.free_range(io, BlockNum::new(ext.start_block), ext.block_count);
+    }
+    err
+}
+
 /// Read file data from a list of extents.
-fn read_extents(io: &dyn BlockIO, extents: &[Extent], size: u64) -> Vec<u8> {
+fn read_extents(io: &dyn BlockIO, extents: &[Extent], size: u64) -> Result<Vec<u8>, FsError> {
     let mut data = vec![0u8; size as usize];
     let mut offset = 0usize;
     let mut buf = BlockBuf::zeroed();
@@ -300,7 +379,7 @@ fn read_extents(io: &dyn BlockIO, extents: &[Extent], size: u64) -> Vec<u8> {
             if offset >= size as usize {
                 break;
             }
-            io.read_block(BlockNum::new(ext.start_block + i), &mut buf);
+            io.read(BlockNum::new(ext.start_block + i), &mut buf)?;
             let remaining = size as usize - offset;
             let to_copy = remaining.min(BLOCK_SIZE);
             data[offset..offset + to_copy].copy_from_slice(&buf.0[..to_copy]);
@@ -308,14 +387,14 @@ fn read_extents(io: &dyn BlockIO, extents: &[Extent], size: u64) -> Vec<u8> {
         }
     }
 
-    data
+    Ok(data)
 }
 
 // --- Formatted (for mkfs / image building) ---
 
 impl<IO: BlockIO> Formatted<IO> {
     /// Format a new filesystem on the given block device.
-    pub fn format(io: IO) -> Self {
+    pub fn format(io: IO) -> Result<Self, FsError> {
         let block_count = io.block_count();
 
         // Layout: [superblock(1)] [bitmap] [journal(reserved, 0 for now)] [data...] [sb_backup(1)]
@@ -337,14 +416,11 @@ impl<IO: BlockIO> Formatted<IO> {
             bitmap_blocks,
             block_count,
             total_metadata,
-        );
+        )?;
 
-        // Write empty root leaf
-        let root = Node::Leaf(Vec::new());
-        // The only infallible node write in the crate: an empty node's entries
-        // occupy zero bytes, so the bound `write_to` checks cannot be crossed.
-        root.write(&io, BlockNum::new(root_block_num))
-            .expect("an empty root node cannot overflow a block");
+        // An empty node's entries occupy zero bytes, so the only failure
+        // `write` has left here is the device's.
+        Node::Leaf(Vec::new()).write(&io, BlockNum::new(root_block_num))?;
 
         // Generate random-ish hash seed from block count (deterministic for reproducible builds)
         let mut hash_seed = [0u8; 16];
@@ -366,9 +442,9 @@ impl<IO: BlockIO> Formatted<IO> {
             hash_seed,
         };
 
-        sb.write(&io);
+        sb.write(&io)?;
 
-        Self { io, sb, alloc }
+        Ok(Self { io, sb, alloc })
     }
 
     /// Create a file on the formatted filesystem (used during mkfs).
@@ -377,8 +453,8 @@ impl<IO: BlockIO> Formatted<IO> {
             return Err(FsError::NameTooLong { len: name.len(), max: MAX_NAME_LEN });
         }
 
-        let extents = self.write_data(data)?;
-        let value = encode_leaf_value(1, name, data.len() as u64, mtime, &extents);
+        let extents = write_data(&self.io, &mut self.alloc, data)?;
+        let value = encode_leaf_value(KeyType::File, name, data.len() as u64, mtime, &extents);
         let key = make_key(&self.sb.hash_seed, name, KeyType::File);
         let entry = Entry { key, value };
 
@@ -394,8 +470,8 @@ impl<IO: BlockIO> Formatted<IO> {
         }
 
         let target_bytes = target.as_bytes();
-        let extents = self.write_data(target_bytes)?;
-        let value = encode_leaf_value(2, name, target_bytes.len() as u64, mtime, &extents);
+        let extents = write_data(&self.io, &mut self.alloc, target_bytes)?;
+        let value = encode_leaf_value(KeyType::Symlink, name, target_bytes.len() as u64, mtime, &extents);
         let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
         let entry = Entry { key, value };
 
@@ -404,48 +480,13 @@ impl<IO: BlockIO> Formatted<IO> {
         Ok(())
     }
 
-    /// Allocate blocks and write data, returning extent list.
-    fn write_data(&mut self, data: &[u8]) -> Result<Vec<Extent>, FsError> {
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let blocks_needed = ((data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
-        let mut extents = Vec::new();
-        let mut remaining = blocks_needed;
-        let mut data_offset = 0usize;
-
-        while remaining > 0 {
-            let run = self.alloc.alloc_up_to(&self.io, remaining)?;
-            push_extent(&mut extents, run.start.raw(), run.len);
-
-            // Write data blocks
-            let mut buf = BlockBuf::zeroed();
-            for i in 0..run.len as u64 {
-                buf.0.fill(0);
-                let chunk_start = data_offset;
-                let chunk_end = (data_offset + BLOCK_SIZE).min(data.len());
-                if chunk_start < data.len() {
-                    let len = chunk_end - chunk_start;
-                    buf.0[..len].copy_from_slice(&data[chunk_start..chunk_end]);
-                }
-                self.io.write_block(BlockNum::new(run.start.raw() + i), &buf);
-                data_offset += BLOCK_SIZE;
-            }
-
-            remaining -= run.len;
-        }
-
-        Ok(extents)
-    }
-
     /// Finalize the filesystem: write superblock with clean flag.
-    pub fn sync(&mut self) {
+    pub fn sync(&mut self) -> Result<(), FsError> {
         self.sb.free_blocks = self.alloc.free_blocks;
         self.sb.next_alloc = self.alloc.next_alloc;
         self.sb.set_clean(true);
-        self.sb.write(&self.io);
-        self.io.sync();
+        self.sb.write(&self.io)?;
+        self.io.flush()
     }
 
     /// Mount this formatted filesystem for read-write access.
@@ -469,9 +510,9 @@ impl<IO: BlockIO> Formatted<IO> {
     }
 
     /// Consume and return the underlying IO (for extracting the image bytes).
-    pub fn into_io(mut self) -> IO {
-        self.sync();
-        self.io
+    pub fn into_io(mut self) -> Result<IO, FsError> {
+        self.sync()?;
+        Ok(self.io)
     }
 }
 
@@ -525,32 +566,34 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
         let leaf = decode_leaf_value(&value)?;
         match leaf {
             LeafValue::File { size, extents, .. } | LeafValue::Symlink { size, extents, .. } => {
-                Ok(read_extents(&self.io, &extents, size))
+                read_extents(&self.io, &extents, size)
             }
         }
     }
 
-    /// Read a symlink's target by name, or None if not a symlink.
-    pub fn read_link(&self, name: &str) -> Option<String> {
-        let (_, value) = self.find_by_name(name).ok()??;
-        let leaf = decode_leaf_value(&value).ok()?;
-        match leaf {
+    /// Read a symlink's target by name. `None` when the name is not a symlink.
+    pub fn read_link(&self, name: &str) -> Result<Option<String>, FsError> {
+        let Some((_, value)) = self.find_by_name(name)? else { return Ok(None) };
+        match decode_leaf_value(&value)? {
             LeafValue::Symlink { size, extents, .. } => {
-                let data = read_extents(&self.io, &extents, size);
-                String::from_utf8(data).ok()
+                let data = read_extents(&self.io, &extents, size)?;
+                Ok(String::from_utf8(data).ok())
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
-    /// Get modification time of a file.
-    pub fn file_mtime(&self, name: &str) -> u64 {
-        self.find_by_name(name)
-            .ok()
-            .flatten()
-            .and_then(|(_, v)| decode_leaf_value(&v).ok())
-            .map(|leaf| leaf.mtime())
-            .unwrap_or(0)
+    /// Modification time of a file. `None` when nothing answers to the name.
+    pub fn file_mtime(&self, name: &str) -> Result<Option<u64>, FsError> {
+        Ok(self.leaf(name)?.map(|leaf| leaf.mtime()))
+    }
+
+    /// The decoded entry `name` answers to, if any.
+    fn leaf(&self, name: &str) -> Result<Option<LeafValue>, FsError> {
+        match self.find_by_name(name)? {
+            Some((_, value)) => Ok(Some(decode_leaf_value(&value)?)),
+            None => Ok(None),
+        }
     }
 
     /// List all files. Returns (name, size) pairs.
@@ -576,165 +619,162 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
 
     /// Return the extents and file size for a file.
     /// Used by the kernel to construct a FileBacking for demand-paged loading.
-    pub fn file_extents(&self, name: &str) -> Option<(Vec<Extent>, u64)> {
-        let (_, value) = self.find_by_name(name).ok()??;
-        let leaf = decode_leaf_value(&value).ok()?;
-        Some((leaf.extents().to_vec(), leaf.size()))
+    pub fn file_extents(&self, name: &str) -> Result<Option<(Vec<Extent>, u64)>, FsError> {
+        Ok(self.leaf(name)?.map(|leaf| (leaf.extents().to_vec(), leaf.size())))
     }
 
     /// Check if a name is a symlink.
-    pub fn is_symlink(&self, name: &str) -> bool {
-        self.find_by_name(name)
-            .ok()
-            .flatten()
-            .map(|(key, _)| key.key_type == KeyType::Symlink)
-            .unwrap_or(false)
+    pub fn is_symlink(&self, name: &str) -> Result<bool, FsError> {
+        Ok(self.find_by_name(name)?.is_some_and(|(key, _)| key.key_type == KeyType::Symlink))
     }
+
     /// Get file size without reading data (metadata only).
-    pub fn file_size_meta(&self, name: &str) -> Option<u64> {
-        let (_, value) = self.find_by_name(name).ok()??;
-        decode_leaf_value(&value).ok().map(|l| l.size())
+    pub fn file_size_meta(&self, name: &str) -> Result<Option<u64>, FsError> {
+        Ok(self.leaf(name)?.map(|leaf| leaf.size()))
     }
 }
 
 // --- ReadWrite-only operations ---
 
 impl<IO: BlockIO> Mounted<IO, ReadWrite> {
-    /// Create a file.
+    /// Create a file, replacing whatever answered to `name`.
     pub fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> Result<(), FsError> {
-        if name.is_empty() || name.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong { len: name.len(), max: MAX_NAME_LEN });
-        }
-
-        // Delete existing entry with same name (if any) to free its blocks
-        self.delete_by_name(name);
-
-        let extents = self.write_data(data)?;
-        let value = encode_leaf_value(1, name, data.len() as u64, mtime, &extents);
-        let key = make_key(&self.sb.hash_seed, name, KeyType::File);
-        let entry = Entry { key, value };
-
-        self.sb.root_node = btree::insert(&self.io, &mut self.alloc, self.sb.root_node, entry)?;
-        Ok(())
+        self.put(name, KeyType::File, data, mtime)
     }
 
-    /// Create a symlink.
+    /// Create a symlink, replacing whatever answered to `name`.
     pub fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), FsError> {
+        self.put(name, KeyType::Symlink, target.as_bytes(), 0)
+    }
+
+    /// Put `name` on the volume, displacing whatever answered to it.
+    ///
+    /// The new entry goes in before the old one comes out, for the reason
+    /// `rename` does it: freeing first is the old file destroyed when
+    /// `write_data` or `btree::insert` then fails, and a full volume is a
+    /// failure any caller can provoke. Measured before it did: on a 64-block
+    /// volume, a 5-block file overwritten by a 400-block one left the volume
+    /// empty and the 5 blocks unreachable.
+    ///
+    /// What that costs is that the replacement's blocks and the original's are
+    /// both allocated at once, so an overwrite on a nearly full volume can now
+    /// fail where it used to succeed. An error is the cheaper half of that
+    /// trade.
+    fn put(
+        &mut self,
+        name: &str,
+        key_type: KeyType,
+        data: &[u8],
+        mtime: u64,
+    ) -> Result<(), FsError> {
         if name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong { len: name.len(), max: MAX_NAME_LEN });
         }
 
-        self.delete_by_name(name);
+        let displaced = match self.find_by_name(name)? {
+            Some((key, value)) => Some((key, decode_leaf_value(&value)?.extents().to_vec())),
+            None => None,
+        };
 
-        let target_bytes = target.as_bytes();
-        let extents = self.write_data(target_bytes)?;
-        let value = encode_leaf_value(2, name, target_bytes.len() as u64, 0, &extents);
-        let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
-        let entry = Entry { key, value };
+        let extents = write_data(&self.io, &mut self.alloc, data)?;
+        let value = encode_leaf_value(key_type, name, data.len() as u64, mtime, &extents);
+        let key = make_key(&self.sb.hash_seed, name, key_type);
+        self.sb.root_node = btree::insert(
+            &self.io, &mut self.alloc,
+            self.sb.root_node,
+            Entry { key, value },
+        )?;
 
-        self.sb.root_node = btree::insert(&self.io, &mut self.alloc, self.sb.root_node, entry)?;
+        self.retire_displaced(displaced, key)
+    }
+
+    /// Remove the entry the insert of `new_key` did not replace, and free the
+    /// blocks of whatever answered to that name before.
+    ///
+    /// The insert replaces the destination only where the two keys agree. A
+    /// file written over a symlink keys differently, and the entry left behind
+    /// would answer to the name forever with blocks nothing could reach.
+    fn retire_displaced(
+        &mut self,
+        displaced: Option<(Key, Vec<Extent>)>,
+        new_key: Key,
+    ) -> Result<(), FsError> {
+        let Some((old_key, old_extents)) = displaced else { return Ok(()) };
+        if old_key != new_key {
+            btree::delete(&self.io, self.sb.root_node, &old_key)?;
+        }
+        for ext in &old_extents {
+            self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count)?;
+        }
         Ok(())
     }
 
     /// Delete a file or symlink by name. Returns true if found and deleted.
-    pub fn delete(&mut self, name: &str) -> bool {
+    pub fn delete(&mut self, name: &str) -> Result<bool, FsError> {
         self.delete_by_name(name)
     }
 
     /// Delete all entries whose name starts with the given prefix.
-    pub fn delete_prefix(&mut self, prefix: &str) {
-        // Collect entries, find matching ones, free their blocks, remove from tree
-        let entries = match btree::collect_all(&self.io, self.sb.root_node) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+    pub fn delete_prefix(&mut self, prefix: &str) -> Result<(), FsError> {
+        let entries = btree::collect_all(&self.io, self.sb.root_node)?;
 
         for entry in &entries {
-            if let Ok(leaf) = decode_leaf_value(&entry.value) {
-                if leaf.name().starts_with(prefix) {
-                    // Free data blocks
-                    for ext in leaf.extents() {
-                        self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
-                    }
-                    // Delete from btree
-                    let _ = btree::delete(&self.io, self.sb.root_node, &entry.key);
-                }
+            // An entry that does not decode cannot be matched against the
+            // prefix, so it is not one of the entries this was asked to remove.
+            let Ok(leaf) = decode_leaf_value(&entry.value) else { continue };
+            if !leaf.name().starts_with(prefix) {
+                continue;
+            }
+            // Remove first, free second, and free nothing when the removal did
+            // not happen: an entry that survives still names its blocks, and
+            // handing them to the next file gives two entries one block.
+            //
+            // `collect_all` visits every child; a descent takes the one path
+            // `find_child` chooses. In a tree whose child keys agree with the
+            // keys beneath them those two find the same entries, so a removal
+            // that comes back empty is the disk contradicting itself.
+            if btree::delete(&self.io, self.sb.root_node, &entry.key)?.is_none() {
+                return Err(FsError::CorruptedNode(self.sb.root_node));
+            }
+            for ext in leaf.extents() {
+                self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count)?;
             }
         }
+        Ok(())
     }
 
     /// Sync filesystem state to disk.
-    pub fn sync(&mut self) {
+    pub fn sync(&mut self) -> Result<(), FsError> {
         self.sb.free_blocks = self.alloc.free_blocks;
         self.sb.next_alloc = self.alloc.next_alloc;
         self.sb.set_clean(true);
-        self.sb.write(&self.io);
-        self.io.sync();
-    }
-
-    /// Allocate blocks and write data, returning extent list.
-    fn write_data(&mut self, data: &[u8]) -> Result<Vec<Extent>, FsError> {
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let blocks_needed = ((data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
-        let mut extents = Vec::new();
-        let mut remaining = blocks_needed;
-        let mut data_offset = 0usize;
-
-        while remaining > 0 {
-            let run = self.alloc.alloc_up_to(&self.io, remaining)?;
-            push_extent(&mut extents, run.start.raw(), run.len);
-
-            let mut buf = BlockBuf::zeroed();
-            for i in 0..run.len as u64 {
-                buf.0.fill(0);
-                let chunk_start = data_offset;
-                let chunk_end = (data_offset + BLOCK_SIZE).min(data.len());
-                if chunk_start < data.len() {
-                    let len = chunk_end - chunk_start;
-                    buf.0[..len].copy_from_slice(&data[chunk_start..chunk_end]);
-                }
-                self.io.write_block(BlockNum::new(run.start.raw() + i), &buf);
-                data_offset += BLOCK_SIZE;
-            }
-
-            remaining -= run.len;
-        }
-
-        Ok(extents)
+        self.sb.write(&self.io)?;
+        self.io.flush()
     }
 
     /// Delete a file/symlink by name, freeing its data blocks. Returns true if found.
-    fn delete_by_name(&mut self, name: &str) -> bool {
-        // Try File key
-        let key = make_key(&self.sb.hash_seed, name, KeyType::File);
-        if let Ok(Some(value)) = btree::delete(&self.io, self.sb.root_node, &key) {
-            if let Ok(leaf) = decode_leaf_value(&value) {
-                if leaf.name() == name {
-                    for ext in leaf.extents() {
-                        self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
-                    }
-                    return true;
-                }
-            }
-        }
+    ///
+    /// `find_by_name` answers the "is this the entry we mean?" question, which
+    /// used to be asked after the removal: `btree::delete` took the entry out
+    /// and *then* the decoded name was compared, so a key collision destroyed
+    /// an unrelated file, leaked its blocks and returned `false` — telling the
+    /// caller nothing had happened. It also answers it once for both key
+    /// types, where the old shape fell through from File to Symlink after a
+    /// non-matching removal and could take two entries out in one call.
+    fn delete_by_name(&mut self, name: &str) -> Result<bool, FsError> {
+        let Some((key, value)) = self.find_by_name(name)? else { return Ok(false) };
+        let extents = decode_leaf_value(&value)?.extents().to_vec();
 
-        // Try Symlink key
-        let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
-        if let Ok(Some(value)) = btree::delete(&self.io, self.sb.root_node, &key) {
-            if let Ok(leaf) = decode_leaf_value(&value) {
-                if leaf.name() == name {
-                    for ext in leaf.extents() {
-                        self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
-                    }
-                    return true;
-                }
-            }
+        // `find_by_name` reached this key by the descent `btree::delete` is
+        // about to repeat, so an empty removal is not "no such file" — it is a
+        // tree that answers two ways.
+        if btree::delete(&self.io, self.sb.root_node, &key)?.is_none() {
+            return Err(FsError::CorruptedNode(self.sb.root_node));
         }
-
-        false
+        for ext in &extents {
+            self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count)?;
+        }
+        Ok(true)
     }
 
     /// Rename a file or symlink.
@@ -767,9 +807,8 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
             None => None,
         };
 
-        let entry_type = if old_key.key_type == KeyType::File { 1 } else { 2 };
         let new_value = encode_leaf_value(
-            entry_type, new_name, leaf.size(), leaf.mtime(), leaf.extents(),
+            old_key.key_type, new_name, leaf.size(), leaf.mtime(), leaf.extents(),
         );
         self.sb.root_node = btree::insert(
             &self.io, &mut self.alloc,
@@ -777,18 +816,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
             Entry { key: new_key, value: new_value },
         )?;
 
-        if let Some((dest_key, dest_extents)) = displaced {
-            // The insert replaced the destination only where the two keys
-            // agree. A file renamed onto a symlink keys differently, and the
-            // entry left behind would answer to `new_name` forever with blocks
-            // nothing could reach.
-            if dest_key != new_key {
-                btree::delete(&self.io, self.sb.root_node, &dest_key)?;
-            }
-            for ext in &dest_extents {
-                self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
-            }
-        }
+        self.retire_displaced(displaced, new_key)?;
 
         // The source's blocks stay allocated: the new entry holds the same
         // extent list. Nothing to delete when the two names share a key — the
@@ -811,21 +839,17 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         let (old_key, old_value) = self.find_by_name(name)?
             .ok_or(FsError::NotFound)?;
         let leaf = decode_leaf_value(&old_value)?;
-        let entry_type = if old_key.key_type == KeyType::File { 1 } else { 2 };
 
         let extents = if new_extents.is_empty() { leaf.extents() } else { new_extents };
-        let new_value = encode_leaf_value(entry_type, leaf.name(), size, mtime, extents);
+        let new_value = encode_leaf_value(old_key.key_type, leaf.name(), size, mtime, extents);
         let new_entry = Entry { key: old_key, value: new_value };
 
-        // Before the delete, not after. This is the one rejection an ordinary
-        // `write` + `fsync` can provoke, and a delete whose insert then fails
-        // is the file disappearing — a worse outcome than the error.
-        btree::check_entry_fits(&new_entry)?;
-
-        // Delete keeps the blocks: the new extents usually reference the same
-        // ones. Blocks the caller drops from the extent list are leaked.
-        btree::delete(&self.io, self.sb.root_node, &old_key)?;
-
+        // No delete first. The key is unchanged and `btree::insert` replaces on
+        // an equal key, so the delete bought nothing and cost the file: a
+        // pre-check for `EntryTooLarge` does not cover `insert`'s other
+        // rejection, a split with no free block to split into, and that one
+        // left the entry deleted and never put back. Blocks the caller drops
+        // from the extent list are still leaked.
         self.sb.root_node = btree::insert(
             &self.io, &mut self.alloc,
             self.sb.root_node,
@@ -894,9 +918,9 @@ mod tests {
     /// for, so the parser accepts all of them as authentic. That is the whole
     /// point: whoever writes the image writes the CRC.
     fn image(blocks: u64) -> Vec<u8> {
-        let mut fs = Formatted::format(VecBlockIO::new(blocks));
+        let mut fs = Formatted::format(VecBlockIO::new(blocks)).expect("format");
         fs.create("victim.txt", b"a file that was already here", 1).expect("create");
-        fs.into_io().into_vec()
+        fs.into_io().expect("sync").into_vec()
     }
 
     fn seal_node(raw: &mut [u8], block: u64) {
@@ -952,6 +976,149 @@ mod tests {
 
     fn mount(raw: Vec<u8>) -> Result<Mounted<VecBlockIO, ReadOnly>, FsError> {
         Mounted::<_, ReadOnly>::open(VecBlockIO::from_vec(raw))
+    }
+
+    fn mount_rw(raw: Vec<u8>) -> Result<Mounted<VecBlockIO, ReadWrite>, FsError> {
+        Mounted::<_, ReadWrite>::open(VecBlockIO::from_vec(raw))
+    }
+
+    fn read_u64_at(raw: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes(raw[off..off + 8].try_into().unwrap())
+    }
+
+    /// A leaf with no entries. Legal, and a descent that reaches it answers
+    /// "not here" for every key there is.
+    fn craft_empty_leaf(raw: &mut [u8], block: u64) {
+        let at = block as usize * BLOCK_SIZE;
+        raw[at..at + BLOCK_SIZE].fill(0);
+        raw[at..at + 4].copy_from_slice(&NODE_MAGIC);
+        seal_node(raw, block);
+    }
+
+    /// An interior node at `block` whose children are `(key, block)` in order.
+    fn craft_children(raw: &mut [u8], block: u64, children: &[(Key, u64)]) {
+        let at = block as usize * BLOCK_SIZE;
+        raw[at..at + BLOCK_SIZE].fill(0);
+        raw[at..at + 4].copy_from_slice(&NODE_MAGIC);
+        raw[at + 8..at + 10].copy_from_slice(&1u16.to_le_bytes());
+        raw[at + 10..at + 12].copy_from_slice(&(children.len() as u16).to_le_bytes());
+        for (i, (key, child)) in children.iter().enumerate() {
+            let entry = at + 32 + i * 32;
+            raw[entry..entry + 8].copy_from_slice(&key.name_hash.to_le_bytes());
+            raw[entry + 8..entry + 16].copy_from_slice(&key.name_hash_hi.to_le_bytes());
+            raw[entry + 16..entry + 18].copy_from_slice(&(key.key_type as u16).to_le_bytes());
+            raw[entry + 18..entry + 22].copy_from_slice(&8u32.to_le_bytes());
+            raw[entry + 24..entry + 32].copy_from_slice(&child.to_le_bytes());
+        }
+        seal_node(raw, block);
+    }
+
+    fn mark_used(raw: &mut [u8], bitmap_block: u64, blocks: &[u64]) {
+        let at = bitmap_block as usize * BLOCK_SIZE;
+        for &b in blocks {
+            raw[at + (b / 8) as usize] |= 1 << (b % 8);
+        }
+    }
+
+    #[test]
+    fn a_delete_of_a_name_that_is_not_here_destroys_nothing() {
+        // The stored entry keeps its value — the name inside it is still
+        // victim.txt — and answers to the key `ghost` hashes to. That is the
+        // 2^-128 collision, staged rather than waited for.
+        let blocks = 128;
+        let mut raw = image(blocks);
+        let mut seed = [0u8; 16];
+        seed.copy_from_slice(&raw[90..106]);
+        let root = read_u64_at(&raw, 24);
+        let (h, hi) = hash_name(&seed, "ghost");
+
+        let entry = root as usize * BLOCK_SIZE + 32;
+        raw[entry..entry + 8].copy_from_slice(&h.to_le_bytes());
+        raw[entry + 8..entry + 16].copy_from_slice(&hi.to_le_bytes());
+        seal_node(&mut raw, root);
+
+        let mut fs = mount_rw(raw).expect("mount");
+        assert!(
+            fs.list().expect("list").iter().any(|(n, _)| n == "victim.txt"),
+            "the craft did not leave victim.txt on the volume",
+        );
+
+        assert!(!fs.delete("ghost").expect("delete"), "nothing on this volume is named ghost");
+
+        assert!(
+            fs.list().expect("list").iter().any(|(n, _)| n == "victim.txt"),
+            "deleting a name that does not exist destroyed the entry it collided with",
+        );
+    }
+
+    #[test]
+    fn a_delete_prefix_that_removed_nothing_frees_nothing() {
+        // The tree's shape is on the disk, so a child key can disagree with
+        // the keys below it. `collect_all` visits every child and finds the
+        // entry; a descent takes one path and does not. The entry survives —
+        // and must keep its blocks, or the allocator hands them to the next
+        // file while something still points at them.
+        let blocks = 128;
+        let raw = image(blocks);
+        let victim: Vec<u64> = mount(raw.clone())
+            .expect("mount")
+            .file_extents("victim.txt")
+            .expect("file_extents")
+            .expect("victim.txt is on the volume")
+            .0
+            .iter()
+            .map(|e| e.start_block)
+            .collect();
+
+        let mut raw = raw;
+        let leaf = read_u64_at(&raw, 24);
+        let (empty_leaf, new_root) = (leaf + 2, leaf + 3);
+        craft_empty_leaf(&mut raw, empty_leaf);
+        craft_children(
+            &mut raw,
+            new_root,
+            &[
+                (Key::ZERO, empty_leaf),
+                (Key { name_hash: u64::MAX, name_hash_hi: u64::MAX, key_type: KeyType::Symlink }, leaf),
+            ],
+        );
+        mark_used(&mut raw, 1, &[empty_leaf, new_root]);
+        let free = read_u64_at(&raw, 44) - 2;
+        patch_superblock(&mut raw, blocks, 44, free);
+        patch_superblock(&mut raw, blocks, 36, new_root + 1);
+        patch_superblock(&mut raw, blocks, 24, new_root);
+
+        let mut fs = mount_rw(raw).expect("mount");
+        assert!(
+            fs.list().expect("list").iter().any(|(n, _)| n == "victim.txt"),
+            "the craft did not leave victim.txt on the volume",
+        );
+        assert!(
+            fs.find_by_name("victim.txt").expect("search").is_none(),
+            "the craft is not the shape under test: a descent still reaches victim.txt",
+        );
+
+        let free_before = fs.alloc.free_blocks;
+        match fs.delete_prefix("victim") {
+            Err(FsError::CorruptedNode(_)) => {}
+            other => panic!("expected CorruptedNode, got {other:?}"),
+        }
+        assert_eq!(
+            fs.alloc.free_blocks, free_before,
+            "delete_prefix freed the blocks of an entry it did not remove",
+        );
+
+        fs.create("other.bin", &[0xAA; BLOCK_SIZE], 0).expect("create");
+        let (other, _) = fs.file_extents("other.bin").expect("file_extents").expect("other.bin");
+        for ext in &other {
+            for i in 0..ext.block_count as u64 {
+                assert!(
+                    !victim.contains(&(ext.start_block + i)),
+                    "other.bin was given block {} — victim.txt still names it",
+                    ext.start_block + i,
+                );
+            }
+        }
     }
 
     #[test]

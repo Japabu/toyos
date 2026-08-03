@@ -1,8 +1,10 @@
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use bcachefs::Extent;
 use crate::block::{BlockError, BlockResult};
 use crate::page_cache;
+use crate::sync::Lock;
 
 const BLOCK_SIZE: usize = 4096;
 const BLOCK_SIZE_U64: u64 = 4096;
@@ -37,29 +39,71 @@ pub trait FileBacking: Send + Sync {
     }
 }
 
+/// Which blocks a `/home` file's data lives in, and whether they are still
+/// that file's.
+///
+/// Every [`NvmeBacking`] for one name reads through the same one of these
+/// rather than a copy taken at open, so unlinking the file is a single store
+/// that every outstanding backing sees — the one in a running process's
+/// address space, the one the file cache re-fetches evicted pages through,
+/// and any handed out since.
+///
+/// It keeps nothing alive. bcachefs's allocator has the blocks back the moment
+/// the entry is gone and the next file takes them, which is exactly why a read
+/// after that has to *fail*: the blocks are still readable and what is in them
+/// belongs to somebody else. Refcounting the blocks — keeping a deleted file's
+/// data alive for as long as something can read it — is the POSIX answer to a
+/// question ToyOS has not been asked, and it would need
+/// `specs/capability-handles-spec.md` to be honest about it.
+pub struct FileBlocks {
+    /// `None` once the filesystem has taken the blocks back.
+    extents: Lock<Option<Vec<Extent>>>,
+}
+
+impl FileBlocks {
+    pub fn new(extents: Vec<Extent>) -> Arc<Self> {
+        Arc::new(Self { extents: Lock::new(Some(extents)) })
+    }
+
+    /// Give the blocks up. Every read through every backing that shares this
+    /// fails from here on.
+    pub fn revoke(&self) {
+        *self.extents.lock() = None;
+    }
+
+    /// Run `f` over the current extent list, or `None` if the file is gone.
+    ///
+    /// The lock is held across `f` on purpose: the write path resolves and
+    /// allocates inside it, and an extent list read between the resolve and
+    /// the record would be one the file does not have yet.
+    pub fn with<R>(&self, f: impl FnOnce(&mut Vec<Extent>) -> R) -> Option<R> {
+        self.extents.lock().as_mut().map(f)
+    }
+}
+
+/// The block holding `file_offset`, if the extents reach that far.
+fn offset_to_block(extents: &[Extent], file_offset: u64) -> Option<u64> {
+    let block_idx = file_offset / BLOCK_SIZE_U64;
+    let mut cursor = 0u64;
+    for ext in extents {
+        let count = ext.block_count as u64;
+        if block_idx < cursor + count {
+            return Some(ext.start_block + (block_idx - cursor));
+        }
+        cursor += count;
+    }
+    None
+}
+
 /// File backed by NVMe blocks via the kernel PageCache.
 pub struct NvmeBacking {
-    extents: Vec<Extent>,
+    blocks: Arc<FileBlocks>,
     size: u64,
 }
 
 impl NvmeBacking {
-    pub fn new(extents: Vec<Extent>, size: u64) -> Self {
-        Self { extents, size }
-    }
-
-    /// Convert a file byte offset to an NVMe block number by walking extents.
-    fn file_offset_to_block(&self, file_offset: u64) -> Option<u64> {
-        let block_idx = file_offset / BLOCK_SIZE_U64;
-        let mut cursor = 0u64;
-        for ext in &self.extents {
-            let count = ext.block_count as u64;
-            if block_idx < cursor + count {
-                return Some(ext.start_block + (block_idx - cursor));
-            }
-            cursor += count;
-        }
-        None
+    pub fn new(blocks: Arc<FileBlocks>, size: u64) -> Self {
+        Self { blocks, size }
     }
 }
 
@@ -69,7 +113,14 @@ impl FileBacking for NvmeBacking {
         if file_offset >= self.size {
             return Ok(());
         }
-        if let Some(block) = self.file_offset_to_block(file_offset) {
+        // A backing whose file has been unlinked names blocks the allocator
+        // has already handed to somebody else. Reading them would serve
+        // another file's contents to whoever still holds this mapping.
+        let Some(block) = self.blocks.with(|extents| offset_to_block(extents, file_offset)) else {
+            log!("file: read through a backing whose file was deleted");
+            return Err(BlockError);
+        };
+        if let Some(block) = block {
             // Direct disk read — bypasses block page cache.
             // File cache is the sole cache for file data.
             let mut raw = [0u8; BLOCK_SIZE];

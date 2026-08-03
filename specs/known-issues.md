@@ -75,34 +75,44 @@ to summarise the last four.**
 > it can look fixed because someone's work-in-progress is on disk. Both cost a
 > wrong conclusion here in one day. Method: `specs/spec-staleness-sweep.md`.
 
-### A `FileBacking` outlives deletion of the file it reads
+### CLOSED for `/home`, open for `/tmp` — a `FileBacking` outlives deletion of the file it reads
 
 Unlink a file while a process is still demand-paging it and the backing keeps
 serving reads.
 
-On `/tmp` this is a correctness wart: `copy_page_out` returns zeros, so the
-process faults in blank pages.
+**`/home` — the information disclosure — is closed.** `NvmeBacking` held
+`extents: Vec<Extent>` captured at open and turned a file offset into an
+absolute block with no re-validation, so unlink returned those blocks to
+bcachefs's `BitmapAllocator`, the next file took them, and the stale backing
+read whatever was there. Reproduced from userland with `open`, `rm` and a
+write: `byte 0 read through the deleted file's descriptor is 0x5c — the
+backing served another file's data`.
 
-On `/home` it is an **information disclosure**. `NvmeBacking` holds
-`extents: Vec<Extent>` captured at open (`file_backing.rs:28-31`) and
-`read_page` turns a file offset into an absolute block and calls
-`page_cache::raw_block_read` with **no re-validation that the block still belongs
-to this file** (`file_backing.rs:53-68`). Unlink returns those blocks to
-bcachefs's `BitmapAllocator`, another file allocates them, and the stale backing
-reads whatever is there now. A process can read another process's file contents
-through ordinary filesystem operations — no crafting, no crafted image, no
-privilege.
+`file_backing::FileBlocks` is now the one extent list every backing for a name
+reads through, and `BcacheFsAdapter` revokes it wherever the filesystem hands
+the blocks back — `delete`, `delete_prefix`, a `rename` over an existing
+destination, and the truncating `create`/`create_symlink`. It is keyed by name
+rather than `FileId` because `open_backing` — the one a running program's text
+lives behind — never opens a file. A read after revocation is `Err`, which the
+fault handler already leaves unhandled and `file_cache::read_page` zero-fills.
 
-Found by the filesystem owner while implementing tmpfs `open_backing`. **Not
-introduced by that work** — the `/home` half predates it.
+**Revocation, not lifetime extension**, and deliberately not the capability
+refcounting this entry used to ask for: keeping a deleted file's blocks alive
+for as long as something can read them is POSIX's answer to a question ToyOS
+has not been asked, and doing it honestly still needs
+`specs/capability-handles-spec.md`. Making the stale read *fail* is the whole of
+what the disclosure needs and it is expressible today.
 
-**This wants capability-handle refcounting, not a local patch.** The backing must
-keep the file's blocks alive for as long as it can read them, and that is exactly
-the refcounted-kernel-object property `specs/capability-handles-spec.md`
-provides. A local fix — re-validating extents on every read, or invalidating
-backings on unlink — reimplements refcounting badly at one call site while every
-other cached reference keeps the same shape. Unassigned deliberately: it should
-be done with that spec, not before it.
+Gate: `home_backing_revoked`, in the shared boot. It asserts the read is
+**zeros**, not merely "not the attacker's byte", so it cannot pass by the blocks
+failing to be reused.
+
+**`/tmp` is still open**, and is a correctness wart rather than a disclosure:
+`TmpfsBacking::read_page` (`tmpfs.rs:25`) reads through `file_cache` by
+`FileId`, and a dropped file's `copy_page_out` fills zeros, so the process
+faults in blank pages instead of being told the file is gone. Nothing is
+disclosed — tmpfs has no allocator handing the storage to anybody else — so it
+wants the same revocation only for honesty, not for safety.
 
 ### A `SYS_PIPE_MAP` mapping outlives the page it names
 
@@ -1091,53 +1101,51 @@ there is never a parked mouse reader to wake. Fixing the asymmetry by making
 Mouse block is what would give `MOUSE` a waiter; deleting the queues is what
 would make the current behaviour honest. Do not do neither.
 
-### `bcachefs` operations that undo themselves: what the rename fix did not touch
+### CLOSED — `bcachefs` operations that undo themselves: what the rename fix did not touch
 
-Found auditing the neighbours of the rename defect above for the same
-act-before-you-know-what-you-are-acting-on shape. All in `bcachefs/src/fs.rs`. None is the
-same defect — rename freed the *wrong* file — but each is an ordering whose failure path
-costs a file or a volume.
+Five orderings in `bcachefs/src/fs.rs`, found auditing the neighbours of the rename defect
+for the same act-before-you-know-what-you-are-acting-on shape. Each is fixed, and each
+fix's gate is the probe recorded here, red on the commit before it.
 
-**`Mounted::create` and `create_symlink` delete before they insert** (`fs.rs:610`, `:627`).
-`delete_by_name` frees the old file's blocks, and if `write_data` or `btree::insert` then
-fails the old file is gone and the new one never landed. This is exactly the shape
-`update_metadata`'s comment says it fixed on its own path. Reproduced on a 64-block volume:
-`create("keep.bin", 5 blocks)` then `create("keep.bin", 400 blocks)` returns
-`Err(NoSpace { requested: 340, available: 0 })` and leaves `read_file("keep.bin")` as
-`NotFound` with an empty volume. Kernel-side the blast radius is small — `BcacheFsAdapter`
-always calls `create(name, &[], mtime)`, so the only post-delete failure it can provoke is
-a `NoSpace` from a node split — but every host caller (the image builder) passes real data.
+**`Mounted::create` and `create_symlink` deleted before they inserted.** Reproduced on a
+64-block volume: `create("keep.bin", 5 blocks)` then `create("keep.bin", 400 blocks)`
+returned `Err(NoSpace { requested: 340, available: 0 })` and left `read_file("keep.bin")` as
+`NotFound` on an empty volume. Both now go through one `Mounted::put`, which reads the
+displaced entry out first, writes, inserts, and frees last — `rename`'s ordering, whose
+`retire_displaced` is now shared with it. What it costs: an overwrite holds both files'
+blocks at once, so one on a nearly full volume can fail where it used to succeed.
+Gate: `a_create_that_runs_out_of_space_leaves_the_old_file_where_it_was`.
 
-**`write_data` leaks every block it allocated when a later `alloc_up_to` fails**
-(`fs.rs:687`, and the identical loop in `Formatted::write_data`, `:419`). The runs are marked
-used in the bitmap and dropped with the `Err`. Measured: after one failed
-`create(400 blocks)` on a 64-block volume, **0** further one-block files fit where an
-untouched volume of the same size takes **60**. `filesystem_full_returns_no_space` passes
-because it never asks whether the space came back.
+**`write_data` leaked every block it had reserved when a later `alloc_up_to` failed.**
+Measured: after one failed `create(400 blocks)` on a 64-block volume, **0** further
+one-block files fit where an untouched volume takes **60**. The two identical copies
+(`Formatted` and `Mounted`) are now one free function that gives the runs back before it
+returns. Gate: `a_write_that_runs_out_of_space_gives_back_what_it_took`, which asserts the
+baseline 60 first so the comparison cannot be vacuous.
 
-**`delete_by_name` deletes before it verifies** (`fs.rs:713`, `:726`). `btree::delete`
-removes the entry and *then* the decoded name is compared; a key collision — both 64-bit
-siphashes and the key type equal, so ~2^-128 — destroys an unrelated file, leaks its
-blocks and returns `false`, telling the caller nothing happened. The File branch also falls
-through to the Symlink branch after a non-matching delete, so one call can remove two
-entries. Not reachable in practice; the fix is one `find_by_name` first, which also deletes
-the duplicated branch.
+**`delete_by_name` deleted before it verified**, so a key collision destroyed an unrelated
+file, leaked its blocks and returned `false`; and the File branch fell through to the
+Symlink branch after a non-matching removal, so one call could take two entries out.
+`find_by_name` now answers both questions before anything is removed, which also deletes
+the duplicated branch. Gate: `a_delete_of_a_name_that_is_not_here_destroys_nothing` — the
+collision is *crafted*, by rewriting a stored entry's key to the one another name hashes
+to, because ~2^-128 is not a state an insert sequence reaches.
 
-**`delete_prefix` frees the blocks before removing the entry, and swallows the delete's
-error** (`fs.rs:657` and `:660`). The dangerous direction: an entry that survives a failed
-`btree::delete` points at blocks the allocator will hand to the next file. `rename` now
-does the opposite — write first, free second — and this is its mirror image.
+**`delete_prefix` freed the blocks before removing the entry and discarded the removal's
+result.** It removes first and frees only what it removed. Gate:
+`a_delete_prefix_that_removed_nothing_frees_nothing`, on a crafted tree whose child key
+disagrees with the keys beneath it — `collect_all` finds the entry and a descent does not.
 
-**`update_metadata`'s pre-check does not cover every failure it orders around**
-(`fs.rs:823`). `check_entry_fits` rules out `EntryTooLarge` before the delete, but
-`btree::insert` also fails with `NoSpace` when a split needs a block, and that path deletes
-the entry and does not put it back.
+**`update_metadata`'s pre-check did not cover every failure it ordered around.**
+`check_entry_fits` ruled out `EntryTooLarge` before the delete but not `btree::insert`'s
+other rejection, a split with no free block, and that path left the entry deleted and never
+put back. The delete is gone entirely: the key is unchanged and `insert` replaces on an
+equal key, so it bought nothing. Gate:
+`a_metadata_update_that_cannot_be_reinserted_leaves_the_entry_alone`.
 
-**Nothing here is fallible at the device.** `btree::insert`/`delete`, `Node::write` and
-`alloc.free_range` all reach `BlockIO::{read_block,write_block}`, which return `()` — so a
-rename whose bitmap or node write the device refuses still returns `Ok(())`, and under the
-kernel's `PageCacheBlockIO` a refused write is a log line and a dropped write. That is the
-`bcachefs::BlockIO` entry in §9, unchanged by any of this.
+A removal that comes back empty for an entry `collect_all` produced is the tree
+contradicting itself, and both delete paths now report `CorruptedNode` rather than "not
+found".
 
 ### An empty directory does not stat as a directory
 
@@ -3424,37 +3432,51 @@ implementation tests the paths you wrote; it says nothing about the states you
 did not think to construct.** Both are needed, and the second is the one a
 green suite hides.
 
-### `bcachefs::BlockIO` is infallible, so the device error channel stops one layer short
+### CLOSED — `bcachefs::BlockIO` is infallible, so the device error channel stops one layer short
 
-`BlockDevice` reports a failed transfer as of this session, and the page cache
-propagates it — but `bcachefs::BlockIO::read_block` returns `()`, so
-`PageCacheBlockIO` has to turn a failure into *something*. It turns it into
-zeros and a log line.
+`BlockIO`'s three operations return `Result<(), DeviceError>` as of this
+session, so `PageCacheBlockIO` no longer has to turn a device failure into
+*something*. It used to turn it into zeros and a log line: fail-closed rather
+than correct, because zeros fail bcachefs's own structural checks and a read
+error therefore reached the btree wearing corruption's clothes.
 
-That is fail-closed rather than correct. Zeros fail bcachefs's own structural
-checks; the alternative the fix replaced — the previous tenant of the cache
-slot — is a **valid** block that parses as the one that was asked for, which is
-why it was worth changing even without the trait. A panic was the third option
-and is not available: a device is untrusted input.
+`DeviceError` carries nothing; the crate-private `BlockIOExt` — which every
+call site inside the crate goes through — attaches the block number, so an
+error a filesystem operation returns names the block that operation asked for
+and no implementation can name a different one. `FsError::{DeviceRead,
+DeviceWrite, DeviceSync}` carry it outward.
 
-Making `BlockIO` fallible is the real fix. Sixteen call sites inside the
-`bcachefs` crate (`superblock.rs`, `btree.rs`, `alloc_bitmap.rs`, `fs.rs`),
-every one in a function that returns something other than a `Result` today, so
-it is a whole-crate change and it collides with whatever else is in that crate
-at the time. Counted with `grep -rn "read_block(\|write_block(" bcachefs/src`.
+Three things the ripple changed beyond signatures, each worth knowing:
 
-**`FileBacking::read_page` is fallible as of `64b89b8`** and is no longer part
-of this entry: it returns `BlockResult`, is `#[must_use]`, and every caller
-carries the error as far as its own signature allows. `vfs::FileSystem`'s write
-path is still the layer with no channel.
+- The allocator's `free_blocks`/`next_alloc` move only after the bitmap block
+  is on the device. A reservation the device would not record is not a
+  reservation.
+- `Superblock::read` no longer falls through to the backup after a *refused*
+  read of block 0 — the backup answers a bad superblock, not a bad device.
+- `read_link`, `file_mtime`, `file_extents`, `file_size_meta` and `is_symlink`
+  return `Result` instead of folding a device failure into "no such file".
 
-What is left of that fix, and it is a real gap: `fd::try_write` has no honest
-error code for "the device did not do it". It stops at the failed page and
-returns the short count, which is what `write` means — but a request whose
-*first* page fails gets `SyscallError::Unknown`, because none of the nine
-variants says this and adding one is an ABI change that needs discussing. This
-is the call site `BlockError`'s own doc comment says does not exist yet; it
-exists now.
+Gates: four host tests driving a `BlockIO` that refuses one chosen block —
+data, btree node, block 0, and a write. Nothing else in the tree can stage a
+device failure (`VecBlockIO` cannot fail, QEMU's NVMe does not fail a read),
+which is the same gap the page-cache entry below records.
+
+**What is left, and both are real gaps:**
+
+`vfs::FileSystem` still has no channel where `bcachefs` now does: `file_size`
+and `read_link` return `Option`, `file_mtime` a bare `u64`, `delete` a `bool`.
+Those sites go through one `no_channel` helper in `bcachefs_adapter.rs` that
+logs and then answers "nothing here" — the sentinel moved one layer up rather
+than removed. The trait is shared with `tmpfs` and `fat32_adapter`, so growing
+it a channel is its own change.
+
+`fd::try_write` has no honest error code for "the device did not do it". It
+stops at the failed page and returns the short count, which is what `write`
+means — but a request whose *first* page fails gets `SyscallError::Unknown`,
+because none of the nine variants says this and adding one is an ABI change that
+needs discussing. `BcacheFsAdapter::list` now returns the same `Unknown` for the
+same reason, rather than an empty listing a caller cannot tell from an empty
+directory.
 
 ### The page cache's un-index on a failed fill has no test that can fail
 
@@ -3541,12 +3563,15 @@ costs, and the *product* is the boot-time figure. `usb-storage.md` F11.
 
 `BlockDevice`'s error is a unit struct in `kernel/src/block.rs`. None of
 `SyscallError`'s nine variants means "the device did not do it", and adding one
-is an ABI change that wanted discussion rather than a unilateral edit. It is
-reachable-but-unwritten rather than wrong: nothing above the trait reports an
-I/O failure to userland today, because the filesystem boundary above it
-swallows the error (previous entry), so the conversion has no call site to be
-written against. When `BlockIO` becomes fallible, that changes and
-`SyscallError::Io` is the thing to add.
+is an ABI change that wanted discussion rather than a unilateral edit.
+
+**The call sites it was waiting for exist now.** `BlockIO` is fallible, so a
+device failure reaches userland rather than being swallowed at the filesystem
+boundary — and there are three places it arrives as the wrong word:
+`fd::try_write` on a request whose first page fails, `BcacheFsAdapter::list`,
+and every `vfs::FileSystem` method whose return type is an `Option` or a `bool`.
+The first two say `SyscallError::Unknown`; the third says "no such file".
+`SyscallError::Io` is the thing to add, and it needs the owner.
 
 ## 10. The stick's two partitions as filesystems, and the log on one of them
 
