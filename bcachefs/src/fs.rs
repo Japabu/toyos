@@ -737,7 +737,15 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         false
     }
 
-    /// Rename a file or symlink. Crash-safe ordering: insert new, then delete old.
+    /// Rename a file or symlink.
+    ///
+    /// The new entry goes in before the old one comes out, so a crash between
+    /// the two leaves the file under both names rather than under neither. What
+    /// that ordering costs is that the insert *is* the removal of whatever
+    /// `new_name` named — same name and same type is the same key, and
+    /// `btree::insert` replaces on an equal key — so the displaced entry has to
+    /// be read out of the tree before the insert. Asking for it afterwards, by
+    /// name, answers with the file that was just renamed and frees its extents.
     pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), FsError> {
         // Every other name-taking entry point bounds its name; this one did
         // not, and `user_ptr::MAX_USER_STR` lets 64 KiB of it through.
@@ -745,29 +753,48 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
             return Err(FsError::NameTooLong { len: new_name.len(), max: MAX_NAME_LEN });
         }
 
-        // 1. Find old entry
         let (old_key, old_value) = self.find_by_name(old_name)?
             .ok_or(FsError::NotFound)?;
         let leaf = decode_leaf_value(&old_value)?;
+        let new_key = make_key(&self.sb.hash_seed, new_name, old_key.key_type);
 
-        // 2. INSERT new entry first (crash-safe: duplicate better than loss)
+        // What `new_name` names now. `find_by_name` matches on the decoded
+        // name, so an entry answering to both names is one entry — a rename
+        // onto itself, with nothing to displace and nothing to free.
+        let displaced = match self.find_by_name(new_name)? {
+            Some((key, _)) if key == old_key => None,
+            Some((key, value)) => Some((key, decode_leaf_value(&value)?.extents().to_vec())),
+            None => None,
+        };
+
         let entry_type = if old_key.key_type == KeyType::File { 1 } else { 2 };
         let new_value = encode_leaf_value(
             entry_type, new_name, leaf.size(), leaf.mtime(), leaf.extents(),
         );
-        let new_key = make_key(&self.sb.hash_seed, new_name, old_key.key_type);
         self.sb.root_node = btree::insert(
             &self.io, &mut self.alloc,
             self.sb.root_node,
             Entry { key: new_key, value: new_value },
         )?;
 
-        // 3. DELETE target's old entry if it existed (frees target's blocks)
-        self.delete_by_name(new_name);
+        if let Some((dest_key, dest_extents)) = displaced {
+            // The insert replaced the destination only where the two keys
+            // agree. A file renamed onto a symlink keys differently, and the
+            // entry left behind would answer to `new_name` forever with blocks
+            // nothing could reach.
+            if dest_key != new_key {
+                btree::delete(&self.io, self.sb.root_node, &dest_key)?;
+            }
+            for ext in &dest_extents {
+                self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
+            }
+        }
 
-        // 4. DELETE source's old entry (without freeing blocks — they're in the new entry)
-        if let Ok(Some(_)) = btree::delete(&self.io, self.sb.root_node, &old_key) {
-            // Blocks are NOT freed — they now belong to the new entry
+        // The source's blocks stay allocated: the new entry holds the same
+        // extent list. Nothing to delete when the two names share a key — the
+        // entry under it is the one the insert just wrote.
+        if new_key != old_key {
+            btree::delete(&self.io, self.sb.root_node, &old_key)?;
         }
 
         Ok(())

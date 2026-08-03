@@ -680,6 +680,162 @@ fn rename_bounds_the_new_name() {
     assert!(fs.file_extents("short.txt").is_some(), "rename lost the source file");
 }
 
+// --- Rename: the destination's blocks are freed, the source's are carried ---
+
+/// The blocks an extent list names, as the pairs a comparison can read.
+fn runs(extents: &[bcachefs::Extent]) -> Vec<(u64, u32)> {
+    extents.iter().map(|e| (e.start_block, e.block_count)).collect()
+}
+
+/// Every name on the volume, sorted.
+fn names(fs: &Mounted<VecBlockIO, ReadWrite>) -> Vec<String> {
+    let mut names: Vec<String> = fs.list().expect("list").into_iter().map(|(n, _)| n).collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_rename_carries_the_file_to_the_new_name() {
+    // Nothing covered a *successful* rename: the only test that called it
+    // asserted the NameTooLong direction, so a rename that reported success
+    // and freed the file's blocks was green everywhere.
+    let mut fs = Formatted::format(VecBlockIO::new(256)).mount();
+    let data: Vec<u8> = (0..3 * 4096 + 17).map(|i: usize| (i.wrapping_mul(31) ^ 0x5A) as u8).collect();
+    fs.create("a.bin", &data, 77).expect("create");
+    let (before, size) = fs.file_extents("a.bin").expect("the source's extents");
+
+    fs.rename("a.bin", "b.bin").expect("rename");
+
+    assert_eq!(names(&fs), ["b.bin"], "the old name outlived the rename");
+    assert!(fs.read_file("a.bin").is_err(), "the old name still resolves");
+    assert_eq!(fs.read_file("b.bin").expect("read the renamed file"), data);
+    assert_eq!(fs.file_mtime("b.bin"), 77, "the rename invented an mtime");
+
+    let (after, size_after) = fs.file_extents("b.bin").expect("the renamed file's extents");
+    assert_eq!(runs(&after), runs(&before), "the rename moved the file's blocks");
+    assert_eq!(size_after, size);
+
+    // And on disk, not just in the tree this process is holding.
+    fs.sync();
+    let raw = fs.into_formatted().into_io().into_vec();
+    let reopened = Mounted::<_, ReadOnly>::open(VecBlockIO::from_vec(raw)).expect("reopen");
+    assert_eq!(reopened.read_file("b.bin").expect("read after reopen"), data);
+    assert!(reopened.read_file("a.bin").is_err(), "the old name came back from disk");
+}
+
+#[test]
+fn a_renamed_file_keeps_every_extent_it_had() {
+    // A file in one run survives a rename that reallocates as readily as one
+    // that carries the extents. Discontiguous runs do not.
+    let (mut fs, _) = one_block_holes(64);
+    let data: Vec<u8> = (0..4 * 4096 + 11).map(|i| (i % 251) as u8).collect();
+    fs.create("frag.bin", &data, 3).expect("create a fragmented file");
+    let (before, _) = fs.file_extents("frag.bin").expect("extents");
+    assert!(before.len() > 1, "the volume is not fragmented, this proves nothing: {before:?}");
+
+    fs.rename("frag.bin", "moved.bin").expect("rename");
+
+    let (after, _) = fs.file_extents("moved.bin").expect("the renamed file's extents");
+    assert_eq!(runs(&after), runs(&before), "the extent list did not survive the re-encode");
+    assert_eq!(fs.read_file("moved.bin").expect("read back"), data);
+}
+
+#[test]
+fn a_rename_onto_an_existing_name_frees_that_file_and_only_it() {
+    let mut fs = Formatted::format(VecBlockIO::new(64)).mount();
+    let source = vec![0xA5u8; 10 * 4096];
+    let doomed = vec![0x5Au8; 10 * 4096];
+    fs.create("keep.bin", &source, 1).expect("create the source");
+    fs.create("doomed.bin", &doomed, 2).expect("create the destination");
+    let (source_blocks, _) = fs.file_extents("keep.bin").expect("the source's extents");
+
+    // Spend the rest, so the only free blocks after the rename are the ones
+    // the displaced file gave back.
+    let mut filler = 0;
+    while fs.create(&format!("filler{filler}"), &vec![0xFF; 4096], 0).is_ok() {
+        filler += 1;
+    }
+
+    fs.rename("keep.bin", "doomed.bin").expect("rename onto an existing name");
+
+    assert_eq!(fs.read_file("doomed.bin").expect("read the destination"), source);
+    assert!(fs.read_file("keep.bin").is_err(), "the source name survived");
+    assert_eq!(
+        names(&fs).iter().filter(|n| n.ends_with(".bin")).count(),
+        1,
+        "the volume holds more than one entry under the two names: {:?}",
+        names(&fs),
+    );
+    let (after, _) = fs.file_extents("doomed.bin").expect("extents");
+    assert_eq!(runs(&after), runs(&source_blocks), "the source's blocks were not carried");
+
+    // Ten blocks were freed by the displaced file and nothing else was, so a
+    // ten-block file fits exactly once. A rename that freed the *source's*
+    // blocks would leave room for two.
+    fs.create("reclaim.bin", &vec![0xCCu8; 10 * 4096], 0).expect("the displaced blocks are free");
+    assert_eq!(fs.read_file("doomed.bin").expect("read after reclaim"), source);
+    assert!(
+        fs.create("again.bin", &vec![0xDDu8; 10 * 4096], 0).is_err(),
+        "twenty blocks came free where one ten-block file was displaced",
+    );
+}
+
+#[test]
+fn a_rename_onto_itself_keeps_the_file() {
+    let mut fs = Formatted::format(VecBlockIO::new(128)).mount();
+    fs.create("same.bin", b"the file that is its own destination", 9).expect("create");
+    let (before, _) = fs.file_extents("same.bin").expect("extents");
+
+    fs.rename("same.bin", "same.bin").expect("rename onto itself");
+
+    assert_eq!(names(&fs), ["same.bin"]);
+    assert_eq!(fs.read_file("same.bin").expect("read"), b"the file that is its own destination");
+    let (after, _) = fs.file_extents("same.bin").expect("extents");
+    assert_eq!(runs(&after), runs(&before));
+}
+
+#[test]
+fn a_rename_of_a_symlink_stays_a_symlink() {
+    let mut fs = Formatted::format(VecBlockIO::new(128)).mount();
+    fs.create_symlink("link", "/home/target").expect("create a symlink");
+
+    fs.rename("link", "moved-link").expect("rename");
+
+    assert!(fs.is_symlink("moved-link"), "the rename turned a symlink into a file");
+    assert_eq!(fs.read_link("moved-link").as_deref(), Some("/home/target"));
+    assert_eq!(fs.read_link("link"), None, "the old name still reads as a symlink");
+    assert_eq!(names(&fs), ["moved-link"]);
+}
+
+#[test]
+fn a_file_renamed_onto_a_symlink_leaves_one_entry() {
+    // The two differ in key type, so the insert does not replace the
+    // destination — nothing but an explicit delete removes it, and what it
+    // leaves behind answers to the same name with blocks no name can reach.
+    let mut fs = Formatted::format(VecBlockIO::new(128)).mount();
+    fs.create_symlink("shadow", "/somewhere").expect("create a symlink");
+    fs.create("file.bin", b"a file, not a symlink", 4).expect("create a file");
+
+    fs.rename("file.bin", "shadow").expect("rename a file onto a symlink");
+
+    assert_eq!(names(&fs), ["shadow"], "the displaced symlink is still on the volume");
+    assert!(!fs.is_symlink("shadow"), "the symlink still shadows the file that replaced it");
+    assert_eq!(fs.read_file("shadow").expect("read"), b"a file, not a symlink");
+}
+
+#[test]
+fn a_rename_with_no_source_touches_nothing() {
+    let mut empty = Formatted::format(VecBlockIO::new(128)).mount();
+    assert!(matches!(empty.rename("a", "b"), Err(bcachefs::FsError::NotFound)));
+    assert!(empty.list().expect("list").is_empty(), "a rename created an entry from nothing");
+
+    let mut fs = Formatted::format(VecBlockIO::new(128)).mount();
+    fs.create("bystander.bin", b"not part of this", 6).expect("create");
+    assert!(matches!(fs.rename("absent", "bystander.bin"), Err(bcachefs::FsError::NotFound)));
+    assert_eq!(fs.read_file("bystander.bin").expect("read"), b"not part of this");
+    assert_eq!(names(&fs), ["bystander.bin"]);
+}
+
 #[test]
 fn entries_of_mixed_size_survive_node_splits() {
     // Keys are hashed, so the order entries land in a leaf is not the order
