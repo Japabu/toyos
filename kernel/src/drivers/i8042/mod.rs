@@ -111,6 +111,16 @@ static KBD_EVENTS: AtomicU32 = AtomicU32::new(0);
 static AUX_EVENTS: AtomicU32 = AtomicU32::new(0);
 static LOST_EDGES: AtomicU32 = AtomicU32::new(0);
 static DROPPED: AtomicU32 = AtomicU32::new(0);
+static DROPPED_TOTAL: AtomicU32 = AtomicU32::new(0);
+/// Pointer bytes the framer threw away at a packet boundary — how far a desync
+/// ran, and the one number that separates a mis-framed pointer from a silent
+/// one. A healthy stream discards nothing at all (`toyos-ps2`'s
+/// `a_healthy_stream_discards_nothing_and_leaves_no_byte_unaccounted`), so any
+/// value here is a real hole in the byte stream and not a resting TrackPoint.
+static DISCARDS: AtomicU32 = AtomicU32::new(0);
+/// Set-1 overrun codes. A keyboard telling us it lost bytes is a different
+/// failure from a keyboard we cannot decode, and neither was counted.
+static OVERRUNS: AtomicU32 = AtomicU32::new(0);
 static KEYBOARD_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 static AUX_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 
@@ -133,6 +143,11 @@ static RX_BYTES: AtomicU32 = AtomicU32::new(0);
 /// it reports. Never written by `handler_poll`: those bytes came from a poll
 /// and no pin asserted for them.
 static FIRST_IRQ_NS: AtomicU64 = AtomicU64::new(0);
+
+/// When the pin last asserted. What makes the periodic line's verdict exact
+/// however coarse its period is: the line says when the last byte arrived, not
+/// when somebody got round to looking.
+static LAST_IRQ_NS: AtomicU64 = AtomicU64::new(0);
 
 /// The CPU the vector is pinned to. Two things are only true there: the ISR is
 /// the sole reader of port 0x60, and an `irq_ring` record for this source can
@@ -180,7 +195,7 @@ const HEALTH_QUIET_DUE: u8 = 2;
 /// The quiet verdict is out. Still watching, because an interrupt that arrives
 /// afterwards — the owner finally pressing a key — is the answer.
 const HEALTH_QUIET_SAID: u8 = 3;
-/// Nothing further to report.
+/// The boot verdict is out; from here the counters speak for themselves.
 const HEALTH_DONE: u8 = 4;
 /// Bytes arrived and decoded to nothing. Said once, and still watching: the
 /// byte that completes a sequence is one interrupt away, and a first line
@@ -191,18 +206,64 @@ const HEALTH_MUTE_SAID: u8 = 5;
 static HEALTH: AtomicU8 = AtomicU8::new(HEALTH_OFF);
 static ARMED_NS: AtomicU64 = AtomicU64::new(0);
 
+// The counters, after the verdict.
+//
+// The verdict was the last word the driver ever said. The ThinkPad T14 lost its
+// keyboard, TrackPoint and touchpad 6.6 s into a session — all three are behind
+// this controller — and the log's final `i8042:` line is the verdict, printed
+// 15 ms before the input died and never revised for the remaining 54 s. What
+// that cost is not a missing line. It is that nothing in the log can separate
+// **the pin stopped asserting** from **bytes kept arriving and decoded to
+// nothing**: opposite defects, in opposite subsystems, and the counters that
+// tell them apart were read once and never again.
+//
+// So the counters repeat. Two properties make that affordable and make the
+// answer unambiguous:
+//
+// - **Only when the pin has asserted since the last line.** A machine nobody is
+//   touching says nothing, forever, for two relaxed loads per scheduler pass.
+// - **Therefore silence is evidence.** Past the first repeat, no line means no
+//   interrupt — not a driver that stopped looking. That is the whole point, and
+//   it is only true because the report cannot be skipped for any other reason.
+//
+// The first repeat is guaranteed rather than gated on a change, because it is
+// the one that dates the last byte: `REPORTED_IRQS` starts at 0 and the verdict
+// deliberately does not seed it.
+//
+// No `to_screen`: a repaint is a screenful of framebuffer writes and the ring
+// is the primary channel. The panel keeps the verdict, which is the line a
+// person standing in front of a dead machine needs.
+//
+// The period is policy. 10 s is the PMM dump's cadence, which is what the log
+// already costs a reader per idle minute, and it bounds the line to one per
+// 10 s of *typing* — an idle machine pays nothing.
+#[cfg(not(feature = "i8042-fast-health"))]
+const HEALTH_PERIOD_NS: u64 = 10_000_000_000;
+#[cfg(feature = "i8042-fast-health")]
+const HEALTH_PERIOD_NS: u64 = 500_000_000;
+static NEXT_REPORT_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+static REPORTED_IRQS: AtomicU32 = AtomicU32::new(0);
+
 /// Bytes the drain did not turn into an event, oldest first.
 ///
 /// `N bytes, 0 keys` is a true statement that names no suspect. 84 of the 256
 /// single byte values decode to nothing under set 1, and `handle_key` drops a
 /// break for a usage that was not held, so the arithmetic alone cannot separate
-/// an extended key's `0xE0` prefix — where nothing is wrong and the rest of the
-/// keystroke is one interrupt behind — from a keyboard that reset behind our
-/// back (`0xAA`, which is left Shift's break under translation), a late ack
-/// (`0xFA`), or a wire carrying raw set 2, where Enter is `0x5A` and Backspace
-/// `0x66` and 23 such codes land on unmapped slots. The byte tells them apart
-/// and nothing else does. The aux flag rides along because a lone pointer byte
-/// frames no packet and is equally invisible in `0 motion`.
+/// a keyboard that reset behind our back (`0xAA`, which is left Shift's break
+/// under translation) from a late ack (`0xFA`), or from a wire carrying raw
+/// set 2, where Enter is `0x5A` and Backspace `0x66` and 23 such codes land on
+/// unmapped slots. The byte tells them apart and nothing else does. The aux
+/// flag rides along because a lone pointer byte frames no packet and is
+/// equally invisible in `0 motion`.
+///
+/// **A byte a decoder is still holding is not one of these**, and the T14 is
+/// why the distinction is written down here rather than left to arithmetic.
+/// It reported `6 bytes, 0 keys, 2 motion, no event from [aux 0x08, aux 0x06,
+/// aux 0x08, aux 0x0e]` while its pointer was framing perfectly: two whole
+/// packets, and the four listed bytes were their heads and first body bytes.
+/// A list that names two thirds of a healthy pointer stream is not a list of
+/// suspects. `Partial` below is what holds a run until the byte that ends it
+/// says whether any of it produced anything.
 ///
 /// Written only from `drain`, which holds `PS2` and is the one place that knows
 /// both the byte and whether anything came of it.
@@ -321,6 +382,9 @@ fn report_health(state: u8) {
             );
         }
         to_screen();
+        // Whichever of the two it was, the counters are now on the record and
+        // the repeat can start measuring from here.
+        arm_repeat();
         return;
     }
     if state == HEALTH_QUIET_DUE && claim_health(HEALTH_QUIET_DUE, HEALTH_QUIET_SAID) {
@@ -333,6 +397,46 @@ fn report_health(state: u8) {
         );
         to_screen();
     }
+}
+
+fn arm_repeat() {
+    NEXT_REPORT_NS.store(crate::clock::nanos_since_boot() + HEALTH_PERIOD_NS, Ordering::Relaxed);
+}
+
+/// Say the counters again, at most once per [`HEALTH_PERIOD_NS`] and only when
+/// the pin has asserted since the last line.
+///
+/// Thread context, from `service`. On a settled machine it is two relaxed loads
+/// and a compare; the compare-exchange is what keeps two CPUs in the same pass
+/// from both reporting, and is reached only when a line is actually owed.
+fn report_counters() {
+    let irqs = IRQS.load(Ordering::Relaxed);
+    if irqs == REPORTED_IRQS.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = crate::clock::nanos_since_boot();
+    let next = NEXT_REPORT_NS.load(Ordering::Relaxed);
+    if now < next
+        || NEXT_REPORT_NS
+            .compare_exchange(next, now + HEALTH_PERIOD_NS, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    REPORTED_IRQS.store(irqs, Ordering::Relaxed);
+    log!(
+        "i8042: {} interrupts, {} bytes, {} keys, {} motion, {} undecoded, {} discarded, {} overruns, {} dropped, {} lost edges — last byte at {}ms",
+        irqs,
+        RX_BYTES.load(Ordering::Relaxed),
+        KBD_EVENTS.load(Ordering::Relaxed),
+        AUX_EVENTS.load(Ordering::Relaxed),
+        UNEXPLAINED_N.load(Ordering::Relaxed),
+        DISCARDS.load(Ordering::Relaxed),
+        OVERRUNS.load(Ordering::Relaxed),
+        DROPPED_TOTAL.load(Ordering::Relaxed),
+        LOST_EDGES.load(Ordering::Relaxed),
+        LAST_IRQ_NS.load(Ordering::Relaxed) / 1_000_000
+    );
 }
 
 /// Put the verdict on the panel as well as in the log ring, and only on a
@@ -444,13 +548,19 @@ pub extern "sysv64" fn handler() {
     if FIRST_IRQ_NS.load(Ordering::Relaxed) == 0 {
         FIRST_IRQ_NS.store(timestamp, Ordering::Relaxed);
     }
+    LAST_IRQ_NS.store(timestamp, Ordering::Relaxed);
     let mut n = 0;
     while n < ISR_BURST {
         let status = inb(STATUS);
         if !buffer_full(status) {
             break;
         }
-        push_isr(inb(DATA), status & AUXB != 0, timestamp);
+        // Read where the byte is read, not once for the burst. The mouse framer
+        // has no start marker and resyncs on the idle gap between *adjacent*
+        // bytes, so one timestamp for a burst is the flattening `mouse.rs` says
+        // must not happen — and a burst is what a delayed ISR takes, which is
+        // the same delay under which bytes get lost and the gap is needed.
+        push_isr(inb(DATA), status & AUXB != 0, crate::clock::nanos_since_boot());
         n += 1;
     }
     if n == ISR_BURST && buffer_full(inb(STATUS)) {
@@ -464,13 +574,67 @@ pub extern "sysv64" fn handler() {
     crate::arch::apic::eoi();
 }
 
+/// A run of bytes a decoder has taken and not yet accounted for.
+///
+/// A packet is three bytes and a Pause is six, spread over as many scheduler
+/// passes as the interrupts fall in, and only the byte that *ends* the run says
+/// whether any of it produced anything. Holding the run is what lets the whole
+/// of an undecodable sequence be named — `0xE1 0x1D 0x45 0xE1 0x9D 0xC5` rather
+/// than its last byte — without naming the identical bytes of one that worked.
+///
+/// One per stream, because the keyboard's and the pointer's interleave in the
+/// ring. Capped at what the report can print; past that the oldest bytes of an
+/// over-long run are the ones worth keeping.
+///
+/// A partial the mouse framer abandons on the idle gap is not reported as
+/// abandoned, so its bytes stay here until the next run ends. That over-names
+/// at most two bytes, in a stream that has already lost one — never in the
+/// healthy case this exists for.
+struct Partial {
+    bytes: [u8; UNEXPLAINED_LEN],
+    len: usize,
+}
+
+impl Partial {
+    const fn new() -> Self {
+        Self { bytes: [0; UNEXPLAINED_LEN], len: 0 }
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.len < UNEXPLAINED_LEN {
+            self.bytes[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    /// The run produced an event, so none of it is a suspect.
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// The run ended on `last` and produced nothing. All of it is.
+    fn blame(&mut self, last: u8, aux: bool) {
+        for i in 0..self.len {
+            record_unexplained(self.bytes[i], aux);
+        }
+        self.len = 0;
+        record_unexplained(last, aux);
+    }
+}
+
 struct Decoders {
     keys: KeyDecoder,
     pointer: MouseDecoder,
+    kbd_partial: Partial,
+    aux_partial: Partial,
 }
 
-static PS2: Lock<Decoders> =
-    Lock::new(Decoders { keys: KeyDecoder::new(), pointer: MouseDecoder::new() });
+static PS2: Lock<Decoders> = Lock::new(Decoders {
+    keys: KeyDecoder::new(),
+    pointer: MouseDecoder::new(),
+    kbd_partial: Partial::new(),
+    aux_partial: Partial::new(),
+});
 
 /// Turn whatever the ISR published into events and wakes. Runs at the top of
 /// every scheduler pass on every CPU, so the idle cost is one atomic load.
@@ -505,6 +669,10 @@ pub fn service() {
     if health != HEALTH_DONE {
         report_health(health);
     }
+    // Not gated on the state: a machine whose bytes all decode to nothing stays
+    // in `HEALTH_MUTE_SAID` forever, and that is the case the repeat is most
+    // needed for.
+    report_counters();
 }
 
 /// Decode what the ISR left in the ring and wake whoever it belongs to.
@@ -573,6 +741,7 @@ fn drain() -> Drained {
     let mut lost = false;
 
     let dropped = DROPPED.swap(0, Ordering::Relaxed);
+    DROPPED_TOTAL.fetch_add(dropped, Ordering::Relaxed);
     if dropped > 0 {
         // Never expected: 256 slots against ~300 B/s, drained at every
         // scheduler pass. It costs a gesture, not the framing, which is what
@@ -584,43 +753,74 @@ fn drain() -> Drained {
         // meaningless now, and the pointer would stay one byte off forever.
         state.keys.reset();
         state.pointer.reset();
+        state.kbd_partial.clear();
+        state.aux_partial.clear();
         lost = true;
     }
 
     while let Some((byte, aux, arrived)) = pop() {
         out.bytes += 1;
-        let produced = out.keys + out.motion;
-        if aux {
+        // Whether the byte's *run* is over, and whether anything came of it.
+        // The whole path, not the decoder's verdict: `handle_key` drops a break
+        // for a usage nothing held, and `handle_motion` drops a packet that
+        // moved the cursor nowhere, and both are bytes that produced no event
+        // just as much as an unmapped code is.
+        let explained = if aux {
             match state.pointer.feed(byte, arrived) {
+                MouseOutcome::Pending => {
+                    state.aux_partial.push(byte);
+                    continue;
+                }
                 MouseOutcome::Packet { buttons, dx, dy } => {
-                    if crate::mouse::handle_motion(
+                    let queued = crate::mouse::handle_motion(
                         crate::mouse::PointerSource::PS2,
                         buttons,
                         crate::mouse::Motion::Relative { dx, dy },
                         0,
-                    ) {
+                    );
+                    if queued {
                         out.motion += 1;
                     }
+                    queued
                 }
-                MouseOutcome::Reset => out.aux_reset = true,
-                MouseOutcome::None => {}
+                MouseOutcome::Reset => {
+                    out.aux_reset = true;
+                    true
+                }
+                MouseOutcome::Discarded => {
+                    DISCARDS.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
             }
         } else {
             match state.keys.feed(byte) {
+                KeyOutcome::Pending => {
+                    state.kbd_partial.push(byte);
+                    continue;
+                }
                 KeyOutcome::Key { usage, pressed } => {
-                    if crate::keyboard::handle_key(usage, pressed) {
+                    let queued = crate::keyboard::handle_key(usage, pressed);
+                    if queued {
                         out.keys += 1;
                     }
+                    queued
                 }
-                KeyOutcome::Lost => lost = true,
-                KeyOutcome::None => {}
+                // The overrun codes explain themselves and are counted rather
+                // than blamed: `0x00`/`0xFF` name the fault outright, which is
+                // more than the byte list could add.
+                KeyOutcome::Lost => {
+                    OVERRUNS.fetch_add(1, Ordering::Relaxed);
+                    lost = true;
+                    true
+                }
+                KeyOutcome::None => false,
             }
-        }
-        // The whole path, not the decoder's verdict: `handle_key` drops a break
-        // for a usage nothing held, which is a byte that produced no event just
-        // as much as an unmapped code is.
-        if out.keys + out.motion == produced {
-            record_unexplained(byte, aux);
+        };
+        let partial = if aux { &mut state.aux_partial } else { &mut state.kbd_partial };
+        if explained {
+            partial.clear();
+        } else {
+            partial.blame(byte, aux);
         }
     }
 
@@ -1336,7 +1536,7 @@ fn handler_poll() {
         if status & OBF == 0 {
             break;
         }
-        push_isr(inb(DATA), status & AUXB != 0, timestamp);
+        push_isr(inb(DATA), status & AUXB != 0, crate::clock::nanos_since_boot());
         n += 1;
     }
     if n > 0 {

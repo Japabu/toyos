@@ -47,6 +47,15 @@ i8042-fadt-denial = []
 # that will not report its set. Only the verdict is replaced; both bytes still
 # go out.
 i8042-kbd-echo = []
+# Shorten the i8042's post-verdict counter report from 10 s to 500 ms. The
+# report is what turns "the log went silent" into a readable fact, and its
+# whole claim is about what happens over tens of seconds: one line after the
+# pin asserts, none while it is quiet, another when it asserts again. No guest
+# test program lives 35 s — the longest is `i8042_mouse` at 10 — and stretching
+# every input test to that length to watch a log cadence is the wrong trade.
+# Only the period moves: the counters, the change gate and the line are the
+# shipped ones, so what the gate certifies is the logic and not the number.
+i8042-fast-health = []
 # Script the input core directly at end of boot. QEMU activates one input
 # handler per device class, so two keyboards or two pointers can never both be
 # live in a guest — the merge has no end-to-end test and this is its only one.
