@@ -37,6 +37,8 @@ const RUST_SKIP: &[&str] = &[
     "window_caps",
     // Same reason, same config: `metal_sim_ipc_hostile_peer` runs it.
     "ipc_hostile_peer",
+    // Same again: `metal_sim_compositor_stall` runs it.
+    "compositor_stall",
     // Needs netd with a NIC. `netd_connection_caps` runs it on tests/netcase.
     "netd_caps",
     // Needs a boot image the harness staged a file into before the machine
@@ -112,6 +114,7 @@ const MACHINE_TESTS: &[&str] = &[
     "metal_sim_input",
     "metal_sim_window_caps",
     "metal_sim_ipc_hostile_peer",
+    "metal_sim_compositor_stall",
     "netd_connection_caps",
     "foreign_disk_untouched",
     "boot_partition_identity",
@@ -4618,6 +4621,122 @@ fn run_machine_test(
                 ));
             }
             eprintln!("  [metal-sim] {refused} malformed frames refused, compositor still serving");
+            Ok(())
+        }
+        "metal_sim_compositor_stall" => {
+            // A client that stops talking, stops listening, or never stops.
+            // The guest carries the "is it still answering" half, because only
+            // it can put a deadline on the answer; the host carries the half
+            // the guest cannot see — whether the desktop is still *painting*,
+            // and whether every client the compositor got rid of was named.
+            //
+            // The two halves are not redundant. A compositor parked on one
+            // client answers nobody, so the guest catches that; a compositor
+            // livelocked on one client answers everybody and draws nothing,
+            // which only the frame counter shows.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            let bins: Vec<(String, Vec<u8>)> = rust_bins
+                .iter()
+                .filter(|(name, _)| name == "compositor_stall")
+                .cloned()
+                .collect();
+            if bins.is_empty() {
+                return Err("compositor_stall was not built".to_string());
+            }
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
+            let result = qemu.run_test("test_rs_compositor_stall", Duration::from_secs(240));
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            if result.exit_code != Some(0) {
+                return Err(format!(
+                    "compositor_stall exited {:?}:\n{}",
+                    result.exit_code, result.stdout
+                ));
+            }
+            // The guest's own case list, restated here so a case deleted on
+            // one side is a red run rather than a quieter test.
+            const CASES: usize = 6;
+            if !result
+                .stdout
+                .contains(&format!("compositor stall: {CASES} stalls survived"))
+            {
+                return Err(format!(
+                    "the guest did not report {CASES} survived stalls:\n{}",
+                    result.stdout
+                ));
+            }
+
+            let frames = |text: &str| text.matches("compositor: frames=").count();
+
+            // Starvation, which is the one shape the guest cannot see. Between
+            // these two markers one window is sending on every pass; a drain
+            // loop that ends only when nothing is ready never gets to `redraw`
+            // and this window holds zero frames.
+            let Some(stream) = result
+                .stdout
+                .split("compositor stall: stream start")
+                .nth(1)
+                .and_then(|rest| rest.split("compositor stall: stream end").next())
+            else {
+                return Err(format!(
+                    "the guest never bracketed its streaming window:\n{}",
+                    result.stdout
+                ));
+            };
+            if frames(stream) == 0 {
+                return Err(format!(
+                    "the compositor composited nothing while one client streamed:\n{stream}"
+                ));
+            }
+
+            // Dropped by name, never silently. Three connections never finish
+            // a first frame, and one window stops reading its mail.
+            const TIMED_OUT: &str = "it never finished its first message";
+            let timed_out = result.stdout.matches(TIMED_OUT).count();
+            if timed_out < 3 {
+                return Err(format!(
+                    "three connections went quiet mid-handshake and {timed_out} were named:\n{}",
+                    result.stdout
+                ));
+            }
+            const NOT_READING: &str = "it is not reading";
+            if !result.stdout.contains(NOT_READING) {
+                return Err(format!(
+                    "a window stopped reading and the compositor never said so:\n{}",
+                    result.stdout
+                ));
+            }
+
+            // And it is still painting once every stall is behind it, on a
+            // capture that starts empty — so this counts frames the compositor
+            // produced *after* the last case, not frames it produced before
+            // the first. Its reporting interval is 2 s.
+            let mut after = String::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline && frames(&after) < 2 {
+                after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            if frames(&after) < 2 {
+                return Err(format!(
+                    "the compositor reported {} frame batches in the 20 s after the last stall:\
+                     \n{after}",
+                    frames(&after)
+                ));
+            }
+
+            let console = format!("{}\n{after}", result.serial);
+            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+            eprintln!(
+                "  [metal-sim] {CASES} stalls survived, {timed_out} handshakes timed out by name, \
+                 desktop still compositing"
+            );
             Ok(())
         }
         "netd_connection_caps" => {
