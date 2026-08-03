@@ -85,6 +85,25 @@ const PARTITION_ALIGN: usize = 1024 * 1024;
 /// the format succeeds and `fsck_msdos` reports 68,551 free clusters.
 const FAT32_MIN_BYTES: usize = 34 * 1024 * 1024;
 
+/// What a guest can write into `/boot` after the three files are on it.
+///
+/// The `64/63` beside this at the one call site is headroom for the
+/// filesystem's own metadata, and it is why this cannot be the flat slack it
+/// used to be. `fatfs` picks the cluster size from the volume size, and at the
+/// 512-byte clusters it gives the smaller ones the two FAT copies cost one
+/// byte of table per 64 bytes of volume — 4.1 MiB of the test image's 257 MiB,
+/// more than the 4 MiB the size used to add. So the slack was entirely
+/// metadata, and what a guest could write was whatever rounding happened to
+/// leave: measured before the change at **48,640 bytes**, against `esp_files`'
+/// own 41,097-byte blob. One more guest test binary in the initrd took it
+/// negative, and the symptom is an fsync that fails while the host-side volume
+/// still reports megabytes free.
+///
+/// `64/63` is the 512-byte-cluster worst case, so where `fatfs` picks larger
+/// clusters it over-provisions rather than under: the same image measures
+/// **7,901,184 bytes** free after the change, on 4096-byte clusters.
+const ESP_FREE_BYTES: usize = 4 * 1024 * 1024;
+
 fn align_up(n: usize, to: usize) -> usize {
     n.div_ceil(to) * to
 }
@@ -144,7 +163,9 @@ fn create_esp_volume(
     log_guid: uuid::Uuid,
 ) -> Vec<u8> {
     let content_size = kernel.len() + bootloader.len() + initrd.len();
-    let total_size = round_up_sectors((content_size + 4 * 1024 * 1024).max(FAT32_MIN_BYTES));
+    let total_size = round_up_sectors(
+        ((content_size + ESP_FREE_BYTES) * 64 / 63).max(FAT32_MIN_BYTES),
+    );
 
     let mut volume = format_fat32(total_size, "TOYOS-BOOT");
 
