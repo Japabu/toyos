@@ -413,7 +413,7 @@ fn scale_wallpaper(
 }
 
 fn draw_icon_centered(
-    screen: &Framebuffer,
+    surface: &Framebuffer,
     icon: &sprite::Sprite,
     area_x: usize,
     area_y: usize,
@@ -422,7 +422,7 @@ fn draw_icon_centered(
 ) {
     let ix = area_x + area_w.saturating_sub(icon.width()) / 2;
     let iy = area_y + area_h.saturating_sub(icon.height()) / 2;
-    icon.draw(screen.ptr(), screen.stride(), screen.width(), screen.height(), screen.pixel_format_raw(), ix, iy);
+    icon.draw(surface.ptr(), surface.stride(), surface.width(), surface.height(), surface.pixel_format_raw(), ix, iy);
 }
 
 fn launcher_rect(windows: &[WindowState], screen_h: i32) -> (i32, i32, i32, i32) {
@@ -862,7 +862,7 @@ fn compose(
 }
 
 fn draw_window(
-    screen: &Framebuffer,
+    surface: &Framebuffer,
     font: &font::Font,
     win: &WindowState,
     focused: bool,
@@ -879,8 +879,8 @@ fn draw_window(
 
     let title_bar = DirtyRect { x: win_x, y: win_y, w: win_w, h: BORDER_WIDTH * 2 + TITLE_BAR_HEIGHT };
     if clip.overlaps(title_bar) {
-        screen.fill_rect(win_x, win_y, win_w, BORDER_WIDTH + TITLE_BAR_HEIGHT, border_color);
-        screen.fill_rect(
+        surface.fill_rect(win_x, win_y, win_w, BORDER_WIDTH + TITLE_BAR_HEIGHT, border_color);
+        surface.fill_rect(
             win_x + BORDER_WIDTH,
             win_y + BORDER_WIDTH,
             win_w - BORDER_WIDTH * 2,
@@ -891,32 +891,32 @@ fn draw_window(
         let title_x = win_x + BORDER_WIDTH + 8;
         let title_y = win_y + BORDER_WIDTH + (TITLE_BAR_HEIGHT - 16) / 2;
         let title = if win.title.is_empty() { "Window" } else { &win.title };
-        font.draw_string(screen, title_x, title_y, title, text_color, title_color);
+        font.draw_string(surface, title_x, title_y, title, text_color, title_color);
 
         let close_x = win_x + win_w - BORDER_WIDTH - BUTTON_WIDTH;
         let close_bg = if focused { CLOSE_BUTTON_BG } else { title_color };
-        screen.fill_rect(close_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, close_bg);
-        draw_icon_centered(screen, &icons.close, close_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT);
+        surface.fill_rect(close_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, close_bg);
+        draw_icon_centered(surface, &icons.close, close_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT);
 
         let max_x = close_x - BUTTON_WIDTH;
-        screen.fill_rect(max_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, title_color);
-        draw_icon_centered(screen, &icons.maximize, max_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT);
+        surface.fill_rect(max_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, title_color);
+        draw_icon_centered(surface, &icons.maximize, max_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT);
 
         let min_x = max_x - BUTTON_WIDTH;
-        screen.fill_rect(min_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, title_color);
-        draw_icon_centered(screen, &icons.minimize, min_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT);
+        surface.fill_rect(min_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, title_color);
+        draw_icon_centered(surface, &icons.minimize, min_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT);
     }
 
     // Draw side/bottom borders only if clip overlaps them
     let content_bottom = win.content_y + win.height;
     if win.content_y < content_bottom {
         // Left border
-        screen.fill_rect(win_x, win.content_y, BORDER_WIDTH, win.height, border_color);
+        surface.fill_rect(win_x, win.content_y, BORDER_WIDTH, win.height, border_color);
         // Right border
-        screen.fill_rect(win.content_x + win.width, win.content_y, BORDER_WIDTH, win.height, border_color);
+        surface.fill_rect(win.content_x + win.width, win.content_y, BORDER_WIDTH, win.height, border_color);
     }
     // Bottom border
-    screen.fill_rect(win_x, content_bottom, win_w, BORDER_WIDTH, border_color);
+    surface.fill_rect(win_x, content_bottom, win_w, BORDER_WIDTH, border_color);
 
     // Clip content blit to dirty region
     let blit_w = win.width.min(win.buf_width);
@@ -930,7 +930,7 @@ fn draw_window(
         let src_y = cy - win.content_y;
         let src_offset = (src_y * win.buf_width + src_x) * 4;
         let buffer_slice = unsafe { std::slice::from_raw_parts(win.shm.as_ptr(), win.shm.len()) };
-        screen.blit(cx, cy, cr - cx, cb - cy, win.buf_width, &buffer_slice[src_offset..]);
+        surface.blit(cx, cy, cr - cx, cb - cy, win.buf_width, &buffer_slice[src_offset..]);
     }
 }
 
@@ -1056,12 +1056,12 @@ fn draw_taskbar(
     }
 }
 
-fn draw_launcher(screen: &Framebuffer, font: &font::Font, x: usize, y: usize, w: usize, h: usize) {
-    screen.fill_rect(x, y, w, h, LAUNCHER_BG);
+fn draw_launcher(surface: &Framebuffer, font: &font::Font, x: usize, y: usize, w: usize, h: usize) {
+    surface.fill_rect(x, y, w, h, LAUNCHER_BG);
     for (i, app) in LAUNCHER_APPS.iter().enumerate() {
         let item_y = y + i * LAUNCHER_ITEM_HEIGHT;
         let text_y = item_y + (LAUNCHER_ITEM_HEIGHT - 16) / 2;
-        font.draw_string(screen, x + 12, text_y, app.name, LAUNCHER_TEXT, LAUNCHER_BG);
+        font.draw_string(surface, x + 12, text_y, app.name, LAUNCHER_TEXT, LAUNCHER_BG);
     }
 }
 
@@ -1095,19 +1095,19 @@ fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite, hw_cursor: bool) 
 ///
 /// It blends, so it reads the pixel under every partly transparent one — which
 /// is why it draws into the back buffer and not the panel.
-fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, cy: i32) {
+fn draw_software_cursor(surface: &Framebuffer, sprite: &sprite::Sprite, cx: i32, cy: i32) {
     let data = sprite.data();
     let sw = sprite.width();
     let sh = sprite.height();
-    let screen_w = screen.width();
-    let screen_h = screen.height();
+    let width = surface.width();
+    let height = surface.height();
 
     for sy in 0..sh {
         let py = cy as usize + sy;
-        if py >= screen_h { break; }
+        if py >= height { break; }
         for sx in 0..sw {
             let px = cx as usize + sx;
-            if px >= screen_w { break; }
+            if px >= width { break; }
             let si = (sy * sw + sx) * 4;
             let alpha = data[si + 3] as u32;
             if alpha == 0 { continue; }
@@ -1115,14 +1115,14 @@ fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, 
             let sg = data[si + 1] as u32;
             let sb = data[si + 2] as u32;
             if alpha == 255 {
-                screen.put_pixel(px, py, Color { r: sr as u8, g: sg as u8, b: sb as u8 });
+                surface.put_pixel(px, py, Color { r: sr as u8, g: sg as u8, b: sb as u8 });
             } else {
-                let bg = screen.get_pixel(px, py);
+                let bg = surface.get_pixel(px, py);
                 let inv = 255 - alpha;
                 let r = ((sr * alpha + bg.r as u32 * inv) / 255) as u8;
                 let g = ((sg * alpha + bg.g as u32 * inv) / 255) as u8;
                 let b = ((sb * alpha + bg.b as u32 * inv) / 255) as u8;
-                screen.put_pixel(px, py, Color { r, g, b });
+                surface.put_pixel(px, py, Color { r, g, b });
             }
         }
     }
