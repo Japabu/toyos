@@ -15,10 +15,22 @@
 
 /// Motion is reported only when neither overflow bit is set; the field is
 /// meaningless when they are, but the buttons in the same byte are not.
+///
+/// `Pending` and `Discarded` were one `None` variant, and collapsing them cost
+/// a field investigation: two of every three bytes of a *healthy* stream are
+/// mid-packet, so a driver reporting "bytes that produced no event" named them,
+/// and a log line reading `no event from [aux 0x08, aux 0x06, …]` is
+/// indistinguishable from a decoder that has lost the frame. Only the byte the
+/// framer actually threw away is evidence of anything.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MouseOutcome {
-    /// Mid-packet, or a byte discarded to resync.
-    None,
+    /// Taken into a packet still being assembled. Whether these bytes produced
+    /// anything is not known until the packet ends.
+    Pending,
+    /// Thrown away at a packet boundary: bit 3 says it cannot be a head. The
+    /// count of these is how far a desync ran, and the fact that it is bounded
+    /// is the whole of the byte-level resync.
+    Discarded,
     /// Buttons in HID boot-mouse order (bit 0 left, 1 right, 2 middle),
     /// which is the PS/2 order unchanged. `dy` is already screen-oriented.
     Packet { buttons: u8, dx: i32, dy: i32 },
@@ -94,32 +106,32 @@ impl MouseDecoder {
             State::Head => {
                 if byte == 0xAA {
                     self.state = State::MaybeReset;
-                    return MouseOutcome::None;
+                    return MouseOutcome::Pending;
                 }
                 // Bit 3 reads 1 in every legal head byte, so a byte without it
                 // cannot be one. It rules bytes out, never in — the gap above
                 // is what rules one in.
                 if byte & ALWAYS_ONE == 0 {
-                    return MouseOutcome::None;
+                    return MouseOutcome::Discarded;
                 }
                 self.state = State::Body { head: byte, count: 0, byte1: 0 };
-                MouseOutcome::None
+                MouseOutcome::Pending
             }
             State::MaybeReset => {
                 self.state = State::Head;
                 if byte == 0x00 {
                     return MouseOutcome::Reset;
                 }
-                // Not a reset after all: 0xAA was a legal head byte (both
-                // overflow bits set, so its motion is dropped anyway) and
-                // this byte is its first body byte.
+                // Not a reset after all: 0xAA is a legal head byte (Y overflow
+                // set, so its motion is dropped and its right button stands)
+                // and this byte is its first body byte.
                 self.state = State::Body { head: 0xAA, count: 1, byte1: byte };
-                MouseOutcome::None
+                MouseOutcome::Pending
             }
             State::Body { head, count, byte1 } => {
                 if count == 0 {
                     self.state = State::Body { head, count: 1, byte1: byte };
-                    return MouseOutcome::None;
+                    return MouseOutcome::Pending;
                 }
                 self.state = State::Head;
                 MouseOutcome::Packet {

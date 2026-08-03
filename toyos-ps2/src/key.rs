@@ -78,8 +78,15 @@ pub const SET1_E0: [u8; 128] = [
 /// What one scancode byte produced.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyOutcome {
-    /// A prefix, a swallowed sequence byte, or a code this keyboard has and
-    /// ToyOS does not.
+    /// A prefix, or a byte of a sequence with more to come. Whether the
+    /// sequence names a key is not known until its last byte.
+    Pending,
+    /// The sequence ended and named no key: a code this keyboard has and ToyOS
+    /// does not, or one ToyOS swallows on purpose. Separate from [`Pending`]
+    /// because a caller reporting bytes that produced nothing must not name the
+    /// `0xE0` of a working arrow key alongside them.
+    ///
+    /// [`Pending`]: KeyOutcome::Pending
     None,
     Key { usage: u8, pressed: bool },
     /// The keyboard lost bytes (`0x00`/`0xFF` are the set-1 overrun and
@@ -131,9 +138,15 @@ impl KeyDecoder {
         match self.state {
             // Pause is `E1 1D 45 E1 9D C5` and means nothing in ToyOS.
             // Swallowing a fixed count is what stops it desyncing the stream.
+            // The last byte closes the sequence and is where the whole of it
+            // becomes a keystroke that named nothing.
             State::Pause(remaining) => {
-                self.state = if remaining <= 1 { State::Base } else { State::Pause(remaining - 1) };
-                KeyOutcome::None
+                if remaining <= 1 {
+                    self.state = State::Base;
+                    return KeyOutcome::None;
+                }
+                self.state = State::Pause(remaining - 1);
+                KeyOutcome::Pending
             }
             State::Extended => {
                 self.state = State::Base;
@@ -142,11 +155,11 @@ impl KeyDecoder {
             State::Base => match byte {
                 0xE0 => {
                     self.state = State::Extended;
-                    KeyOutcome::None
+                    KeyOutcome::Pending
                 }
                 0xE1 => {
                     self.state = State::Pause(5);
-                    KeyOutcome::None
+                    KeyOutcome::Pending
                 }
                 // Neither is a reachable set-1 code: scancode 0 is unused, so
                 // neither its make (0x00) nor 0x7F's break (0xFF) can be a

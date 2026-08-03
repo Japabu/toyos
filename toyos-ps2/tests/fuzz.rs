@@ -56,7 +56,7 @@ fn arbitrary_bytes_never_kill_the_key_decoder() {
         match d.feed(rng.next_byte()) {
             KeyOutcome::Key { .. } => emitted += 1,
             KeyOutcome::Lost => lost += 1,
-            KeyOutcome::None => {}
+            KeyOutcome::Pending | KeyOutcome::None => {}
         }
     }
     // The only two things a random stream can prove: it did not panic, and it
@@ -82,7 +82,7 @@ fn arbitrary_bytes_never_kill_the_mouse_decoder() {
         match d.feed(rng.next_byte(), now) {
             MouseOutcome::Packet { .. } => packets += 1,
             MouseOutcome::Reset => resets += 1,
-            MouseOutcome::None => {}
+            MouseOutcome::Pending | MouseOutcome::Discarded => {}
         }
     }
     assert!(packets > BYTES as u64 / 100, "only {packets} packets from {BYTES} bytes");
@@ -118,6 +118,7 @@ fn a_lost_byte_costs_exactly_the_packet_it_landed_in() {
     let mut d = MouseDecoder::new();
     let mut holes = 0u64;
     let mut decoded = 0u64;
+    let mut discarded = 0u64;
     for p in 0..PACKETS {
         let buttons = rng.next_byte() & 0x07;
         let raw_x = rng.below(512) as i32 - 256;
@@ -149,7 +150,8 @@ fn a_lost_byte_costs_exactly_the_packet_it_landed_in() {
                     hole.is_some(),
                     "packet {p} reported a device reset out of an intact stream"
                 ),
-                MouseOutcome::None => {}
+                MouseOutcome::Discarded => discarded += 1,
+                MouseOutcome::Pending => {}
             }
         }
         match hole {
@@ -162,6 +164,16 @@ fn a_lost_byte_costs_exactly_the_packet_it_landed_in() {
     }
     assert!(holes > 1000, "only {holes} holes in {PACKETS} packets");
     assert_eq!(decoded, PACKETS as u64 - holes, "an intact packet went missing");
+    // The desync is bounded, and by a number: a hole leaves at most the two
+    // remaining bytes of its own packet at a boundary they cannot be a head
+    // of, and the idle gap re-frames the next one. A driver that counts
+    // discards to decide whether its pointer has lost the frame is reading
+    // this bound, so an intact stream costing even one of them would make the
+    // count unreadable.
+    assert!(
+        discarded <= 2 * holes,
+        "{discarded} bytes discarded for {holes} holes — the desync outran the packet"
+    );
 }
 
 /// The longest prefix in set 1 is Pause (`E1 1D 45 E1 9D C5`), so a byte lost

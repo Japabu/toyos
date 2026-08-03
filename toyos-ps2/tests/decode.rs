@@ -130,9 +130,43 @@ fn overrun_codes_report_lost_and_clear_the_prefix_state() {
 
     // A prefix whose second byte was lost must not mis-decode the next one.
     let mut d = KeyDecoder::new();
-    assert_eq!(d.feed(0xE0), KeyOutcome::None);
+    assert_eq!(d.feed(0xE0), KeyOutcome::Pending);
     d.reset();
     assert_eq!(press(&mut d, &[0x4B]), [(0x5C, true)], "reset left the E0 prefix pending");
+}
+
+/// A byte with more of its sequence to come is not a byte that produced
+/// nothing, and a driver reporting the second must not report the first.
+/// `0xE0` leads every arrow key on a working keyboard; listing it beside a
+/// genuinely undecodable byte is what makes such a list unreadable.
+#[test]
+fn a_sequence_is_pending_until_the_byte_that_ends_it() {
+    let mut d = KeyDecoder::new();
+    // Left arrow: the prefix is pending, the second byte names the key.
+    assert_eq!(d.feed(0xE0), KeyOutcome::Pending);
+    assert_eq!(d.feed(0x4B), KeyOutcome::Key { usage: 0x50, pressed: true });
+
+    // Pause names nothing at all, and it is the *last* of its six bytes that
+    // says so — the five before it are still a sequence in progress.
+    let mut d = KeyDecoder::new();
+    let pause = [0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5];
+    let outcomes: Vec<KeyOutcome> = pause.iter().map(|&b| d.feed(b)).collect();
+    assert_eq!(
+        outcomes,
+        [
+            KeyOutcome::Pending,
+            KeyOutcome::Pending,
+            KeyOutcome::Pending,
+            KeyOutcome::Pending,
+            KeyOutcome::Pending,
+            KeyOutcome::None,
+        ]
+    );
+
+    // An extended code ToyOS has no usage for ends its sequence the same way.
+    let mut d = KeyDecoder::new();
+    assert_eq!(d.feed(0xE0), KeyOutcome::Pending);
+    assert_eq!(d.feed(0x18), KeyOutcome::None, "SET1_E0[0x18] is unmapped");
 }
 
 #[test]
@@ -171,7 +205,7 @@ fn feed_all(d: &mut MouseDecoder, bytes: &[u8]) -> Vec<MouseOutcome> {
     bytes
         .iter()
         .map(|&b| d.feed(b, 0))
-        .filter(|o| *o != MouseOutcome::None)
+        .filter(|o| !matches!(o, MouseOutcome::Pending | MouseOutcome::Discarded))
         .collect()
 }
 
@@ -285,15 +319,85 @@ fn a_stream_truncated_at_any_offset_resyncs_within_two_packets() {
 #[test]
 fn a_stale_partial_is_abandoned_rather_than_completed() {
     let mut d = MouseDecoder::new();
-    assert_eq!(d.feed(0x08, 0), MouseOutcome::None);
-    assert_eq!(d.feed(5, BYTE_NS), MouseOutcome::None);
-    // The third byte arrives a second later — that is not one gesture.
-    assert_eq!(d.feed(7, 1_000_000_000), MouseOutcome::None);
+    assert_eq!(d.feed(0x08, 0), MouseOutcome::Pending);
+    assert_eq!(d.feed(5, BYTE_NS), MouseOutcome::Pending);
+    // The third byte arrives a second later — that is not one gesture. It is
+    // read as a head instead, and `7` cannot be one.
+    assert_eq!(d.feed(7, 1_000_000_000), MouseOutcome::Discarded);
     // The next whole packet decodes cleanly rather than one byte off.
     assert_eq!(
         feed_all(&mut d, &packet(0, 5, 7)),
         [MouseOutcome::Packet { buttons: 0, dx: 5, dy: -7 }]
     );
+}
+
+/// The distinction the ThinkPad T14's log could not make.
+///
+/// Its i8042 reported `6 bytes, 0 keys, 2 motion, no event from [aux 0x08,
+/// aux 0x06, aux 0x08, aux 0x0e]` — two whole, correctly framed packets, whose
+/// four non-final bytes the driver listed as suspects because the decoder
+/// called them the same thing it calls a byte it threw away. A healthy stream
+/// must discard nothing at all, and the bytes it consumes on the way to a
+/// packet must not be confusable with the ones it rejects.
+#[test]
+fn a_healthy_stream_discards_nothing_and_leaves_no_byte_unaccounted() {
+    let mut d = MouseDecoder::new();
+    // The T14's own two packets, at the pace they arrived on its wire.
+    for (p, dx) in [6i16, 14].into_iter().enumerate() {
+        let good = packet(0, dx, 0);
+        let mut outcomes = Vec::new();
+        for (i, &b) in good.iter().enumerate() {
+            outcomes.push(d.feed(b, p as u64 * SAMPLE_NS + i as u64 * BYTE_NS));
+        }
+        assert_eq!(
+            outcomes,
+            [
+                MouseOutcome::Pending,
+                MouseOutcome::Pending,
+                MouseOutcome::Packet { buttons: 0, dx: dx as i32, dy: 0 },
+            ],
+            "packet {p} did not account for all three of its bytes"
+        );
+    }
+}
+
+/// `Discarded` is only ever the byte-level resync, and it is bounded by the
+/// number of bytes that cannot be a head. One implausible byte at a boundary
+/// costs one byte and nothing else — not the packet after it, and not the
+/// framing.
+#[test]
+fn an_implausible_byte_at_a_boundary_costs_exactly_itself() {
+    let mut d = MouseDecoder::new();
+    // Bit 3 clear: no legal head byte looks like this.
+    assert_eq!(d.feed(0x06, 0), MouseOutcome::Discarded);
+    assert_eq!(d.feed(0x00, BYTE_NS), MouseOutcome::Discarded);
+    assert_eq!(
+        feed_all(&mut d, &packet(0, 5, 7)),
+        [MouseOutcome::Packet { buttons: 0, dx: 5, dy: -7 }],
+        "the packet after two discarded bytes did not decode"
+    );
+}
+
+/// The other half: a byte the framer *does* accept as a head is never a
+/// `Discarded`, however little sense the packet it starts turns out to make.
+/// A caller counting discards to measure a desync must not be handed one for
+/// every resting sample.
+#[test]
+fn no_legal_head_byte_is_ever_discarded() {
+    for head in 0u8..=0xFF {
+        let mut d = MouseDecoder::new();
+        let first = d.feed(head, 0);
+        if head & 0x08 == 0 {
+            assert_eq!(first, MouseOutcome::Discarded, "{head:#04x} has bit 3 clear");
+            continue;
+        }
+        assert_eq!(first, MouseOutcome::Pending, "{head:#04x} is a legal head byte");
+        // And its body bytes are pending too, whatever they are — except
+        // behind 0xAA, where `0x00` is the reset announcement and an event in
+        // its own right.
+        let body = if head == 0xAA { 0x01 } else { 0x00 };
+        assert_eq!(d.feed(body, BYTE_NS), MouseOutcome::Pending);
+    }
 }
 
 #[test]
