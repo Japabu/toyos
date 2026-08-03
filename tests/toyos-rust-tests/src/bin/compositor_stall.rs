@@ -44,10 +44,18 @@ const UNKNOWN_MSG: u32 = 0x7FFF_0001;
 const STREAM: Duration = Duration::from_secs(5);
 
 /// One `MSG_GET_RESOLUTION` costs the client 8 bytes and the compositor 16, so
-/// this is what it takes to fill a client's 2,097,088-byte receive ring from
-/// the far side. The requests themselves are half that and fit in the client's
-/// own ring, so nothing here can block the *client* instead.
-const REQUESTS: usize = 131_072;
+/// filling a client's 2,097,088-byte receive ring from the far side takes
+/// 131,068 answers. This is that with margin, and the requests themselves are
+/// half the bytes and fit in the client's own ring — nothing here can block
+/// the *client* instead, which would prove the wrong thing.
+const REQUESTS: usize = 140_000;
+
+/// How long the compositor gets to reach the end of that ring and say so.
+///
+/// Measured at roughly a second on the metal-sim boot; this is an order of
+/// magnitude of slack, and it is a bound on the machine rather than on the
+/// answer — the answer is the connection closing.
+const REFUSAL_POLLS: u32 = 1_500;
 
 fn main() {
     // Held to the end of the run: a dropped `Connection` closes the fd, and a
@@ -90,6 +98,7 @@ fn main() {
         requests.extend_from_slice(&header(window::MSG_GET_RESOLUTION, 0));
     }
     write_raw_fd(deaf.fd(), &requests, "window that will not read");
+    await_refusal(&deaf);
     probe("window that will not read");
 
     // A window with something to send on every pass. Nothing here is
@@ -102,9 +111,18 @@ fn main() {
     let streamer = thread::spawn(move || {
         let frame = header(UNKNOWN_MSG, 0);
         let until = Instant::now() + STREAM;
-        while Instant::now() < until {
-            for _ in 0..64 {
-                let _ = syscall::write_nonblock(fd, &frame);
+        loop {
+            // Fill the ring, not merely feed it. The compositor takes one
+            // frame per client per pass, so a client that keeps up with only
+            // that lets the drain run dry and the screen get painted — which
+            // is the thing this case is supposed to prevent.
+            //
+            // Never a torn frame: both ends move this ring in multiples of
+            // eight bytes and its capacity is one too, so a write of a header
+            // either fits whole or finds no room at all.
+            while matches!(syscall::write_nonblock(fd, &frame), Ok(8)) {}
+            if Instant::now() >= until {
+                break;
             }
             syscall::nanosleep(1_000_000);
         }
@@ -142,6 +160,29 @@ fn write_raw_fd(fd: toyos_abi::Fd, bytes: &[u8], what: &str) {
             Err(e) => fail(&format!("[{what}] write failed after {offset} bytes: {e:?}")),
         }
     }
+}
+
+/// Wait for the compositor to hang up on the window that stopped reading.
+///
+/// **Without draining a byte**, which is the whole difficulty: this client's
+/// receive ring has to stay full for the compositor to reach the end of it,
+/// so the answer cannot be read from the ring. An empty `write_nonblock`
+/// writes nothing and still asks the one question that matters — is anything
+/// still holding the read end — so the refusal is observed rather than slept
+/// through. A compositor parked in `write` instead has its fd open and
+/// answers `Ok` here forever.
+fn await_refusal(deaf: &Window) {
+    for _ in 0..REFUSAL_POLLS {
+        if let Err(SyscallError::NotFound) = syscall::write_nonblock(deaf.fd(), &[]) {
+            return;
+        }
+        syscall::nanosleep(PROBE_POLL_NS);
+    }
+    fail(&format!(
+        "[window that will not read] {} bytes of unread answers and the compositor never \
+         dropped the connection — it is waiting for this client to read its mail",
+        REQUESTS * 16,
+    ));
 }
 
 /// Ask the compositor something it always answers, and give it a deadline.
