@@ -2633,6 +2633,14 @@ question for whoever does own it is whether the guest-side event can be timed
 against something the host does not have to hold, since a margin this thin
 cannot survive a shared machine.
 
+**Third miss, and the first that a re-run did not clear: 0.293 s.** Seen in a
+full run and then again on its own, back to back, while five agents were
+building in this tree — `toybox_cp_volume` took 121 s in the same window against
+the ~20 s it takes on a quiet host, and the build lock was contended on every
+attempt. So "re-run it in isolation" is not the discriminator this entry says it
+is: a `cargo test -- xhci_slow_connect` on a loaded host is not an isolated run,
+and 7 ms of margin is inside what the load costs. The margin is the finding.
+
 ### `git stash` in a shared tree takes everyone's uncommitted work
 
 Observed, not theorised: `stash@{0}: On main: compositor-stats-wip` appeared
