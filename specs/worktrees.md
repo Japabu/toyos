@@ -127,9 +127,9 @@ way round, and two builds in one worktree are that pair.
 Agents commit freely on their own branch. Landing is explicit, serialized, and
 never rewrites history.
 
-In the worktree, at task end:
+In the worktree, at task end, `cargo run -- --land`:
 
-1. Take the integration lock — `Scope::Global`, exclusive.
+1. Take the integration lock — exclusive.
 2. `git merge --no-ff main`. Conflicts are resolved *here*, where the agent can
    build and test the merged result. This merge commit is the landing record and
    it names both parents.
@@ -142,21 +142,53 @@ branch, so a non-fast-forward means someone landed in between. Under the lock
 that cannot happen, which makes the flag a check on the lock rather than a
 fallback.
 
-**Step 1 has no tooling, and the first landing found out what that costs.**
-Nothing in the tree takes an integration lock; `buildlock` has no name for one.
-It also cannot be the `state` lock the builds take in `Scope::Global` — step 3's
-gate *is* a build, and it would queue behind its own holder. So the lock has to
-be a distinct file in `<common-dir>/toyos-build-locks/`, taken exclusively for
-steps 2-4 and nothing else. Until a command exists for it, an agent has to hold
-it by hand, and an agent who does not know to is not stopped by anything: during
-the first landing's 10-minute gate another agent put three commits on main, and
-what caught it was `--ff-only`, exactly as the paragraph above says — a check on
-a lock nobody was holding. Steps 2-4 then had to be redone.
+**The command is `src/land.rs`, and it is the whole protocol.** The lock is
+`integration` in `<common-dir>/toyos-build-locks/`, taken exclusively for the
+length of one landing and by nothing else. A distinct file from the `state` that
+builds take in `Scope::Global`, because step 3's gate *is* a build and would
+otherwise queue behind its own holder — `a_landing_and_a_build_do_not_exclude_each_other`
+is the gate on that. No `intent` beside it: writer preference exists to keep a
+stream of shared acquirers from starving an exclusive one, and nothing takes
+this file shared at all.
+
+What it refuses rather than guesses at:
+
+- **A conflict is left in the worktree**, not aborted — the index and the markers
+  git has already written are what the agent resolves against, and an abort
+  deletes exactly those. The lock goes down first. Resolve, `git add`,
+  `git commit`, re-run `--land`; a *next* run that finds `MERGE_HEAD` says so
+  instead of merging over it.
+- **main moving under the lock is reported as a bypass**, by name, listing what
+  arrived, with nothing merged. Only `--land` takes the lock, so a main that
+  moved between step 2 and step 4 means someone landed without it.
+- **An uncommitted tree on either side.** The branch's, because the gate measures
+  the working tree while main gets the commits; the primary's, because step 4
+  moves it.
+
+**The gate is `cargo test`**, the whole suite. `--gate <program> [args...]`
+overrides it and takes the rest of the command line, so it comes last; any
+override is printed before the gate runs and again in the report, because a
+landing that gated less than the default must not be able to look like one that
+did not.
+
+**Both landings before the command paid for its absence.** macOS ships no
+`flock` CLI, so nothing outside this build system can take a lock at all: one
+agent reached for Python, and during the first landing's 10-minute gate another
+agent put three commits on main. What caught that was `--ff-only`, exactly as
+above — a check on a lock nobody was holding. Steps 2-4 were redone.
+
+**And the third landing was `--land`'s own, which caught the same thing on its
+first run.** Six commits — the Swiss German keyboard work, `a5c26b6..8e3f76d` —
+went onto main during its 870 s gate, by hand, because on main the command did
+not exist yet. The bypass report named all six and merged nothing; step 2 and
+step 3 were run again against the new main. That is the last landing that can
+happen, since `--land` is on main from that merge onward.
 
 The redo is cheap only when the code delta is provable: `git diff <gated>..HEAD`
 after the second merge showed markdown alone, so the 233-test run carried and
 only the audio family was re-run before the fast-forward, both inside one hold.
 A merge that moves code has no such shortcut and pays the full gate again.
+`--land` has no such shortcut either — it re-gates in full.
 
 **The gate runs inside the lock.** That queues landings, and the queue is the
 honest cost of a gate that means something: CLAUDE.md's concurrent-measurement

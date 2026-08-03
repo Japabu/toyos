@@ -24,6 +24,10 @@
 //! the worktree cannot serialise the second, and a lock in the common directory
 //! would serialise the first against worktrees that have nothing to do with it.
 //!
+//! [`integration`] is neither: one file of its own, exclusive-only, held for the
+//! length of a landing rather than of a build. It has to be its own file because
+//! a landing's gate is a build and would otherwise queue behind it.
+//!
 //! Holder death: `flock` is released by the kernel when the open file
 //! description closes, so a builder that is SIGKILLed mid-phase — routine here
 //! — strands nothing, which a lock file with a pid in it could not promise.
@@ -174,20 +178,54 @@ impl Held {
 /// build lock proper because every builder needs it and builders hold the build
 /// lock in *shared* mode by design.
 pub fn artifact(root: &Path) -> Guard {
-    let path = lock_path(&root.join(LOCK_DIR), "artifact");
-    let file = open_lock_file(&path);
+    exclusive(&lock_path(&root.join(LOCK_DIR), "artifact"), "artifact lock", "artifact staging")
+}
+
+/// The integration lock, held exclusively for the length of one landing —
+/// `specs/worktrees.md` §5, steps 1 through 5.
+///
+/// Its own file, and that is the whole point: step 3's gate *is* a build, and a
+/// build takes `Scope::Global`'s `state` shared, so a landing that held `state`
+/// would queue its own gate behind itself.
+///
+/// No `intent` beside it either. Writer preference exists because a stream of
+/// shared acquirers can starve an exclusive one out of `state`; nothing takes
+/// this file in shared mode at all, so there is no stream to be starved by, and
+/// an `intent` here would be a file only its own exclusive holders ever touched.
+pub fn integration(root: &Path) -> Guard {
+    exclusive(&integration_path(root), "integration lock", "landing")
+}
+
+fn integration_path(root: &Path) -> PathBuf {
+    lock_path(&crate::git_common_dir(root).join(GLOBAL_LOCK_DIR), "integration")
+}
+
+/// Whether the integration lock could be taken right now.
+///
+/// The landing tests ask this of every refusal `--land` can return: one that
+/// gives up without putting the lock down wedges every worktree at once, and
+/// nothing else in the tree would notice.
+#[cfg(test)]
+pub fn integration_is_free(root: &Path) -> bool {
+    try_lock(&open_lock_file(&integration_path(root)), LOCK_EX)
+}
+
+/// One lock file, taken exclusively and held until the guard drops.
+///
+/// For the locks with no shared mode: every holder writes the note, so a waiter
+/// can always be told who it is waiting for.
+fn exclusive(path: &Path, lock: &str, what: &str) -> Guard {
+    let file = open_lock_file(path);
     let start = Instant::now();
-    let mut waited = false;
     if !try_lock(&file, LOCK_EX) {
-        announce("artifact staging", &describe_holder(&path));
-        waited = true;
-        take_lock(&file, LOCK_EX, &path);
-    }
-    if waited {
-        eprintln!("[build-lock] artifact staging acquired after {:.1?}", start.elapsed());
+        let holder = describe_holder(path)
+            .unwrap_or_else(|| "held, but the holder left no readable note".to_string());
+        announce(lock, what, &holder);
+        take_lock(&file, LOCK_EX, path);
+        eprintln!("[build-lock] {what} acquired after {:.1?}", start.elapsed());
     }
     let mut guard = Guard { file, records_holder: true };
-    write_note(&mut guard.file, &note_text("artifact staging"));
+    write_note(&mut guard.file, &note_text(what));
     guard
 }
 
@@ -212,13 +250,15 @@ fn acquire(dir: &Path, op: i32, what: &str) -> Guard {
     let mut waited = false;
 
     if !try_lock(&intent, op) {
-        announce(&label, "an exclusive phase is queued ahead of it");
+        announce("build lock", &label, "an exclusive phase is queued ahead of it");
         waited = true;
         take_lock(&intent, op, &intent_path);
     }
     if !try_lock(&state, op) {
         if !waited {
-            announce(&label, &describe_holder(&state_path));
+            let holder = describe_holder(&state_path)
+                .unwrap_or_else(|| "held by other builds in this tree".to_string());
+            announce("build lock", &label, &holder);
             waited = true;
         }
         take_lock(&state, op, &state_path);
@@ -240,39 +280,32 @@ fn acquire(dir: &Path, op: i32, what: &str) -> Guard {
 /// An agent staring at silence kills and retries, which is the pathology this
 /// module exists to remove — so a wait says what it is waiting for and, when
 /// that can be established, who has it.
-fn announce(label: &str, holder: &str) {
-    eprintln!("[build-lock] waiting for the build lock ({label}) — {holder}");
+fn announce(lock: &str, label: &str, holder: &str) {
+    eprintln!("[build-lock] waiting for the {lock} ({label}) — {holder}");
 }
 
 /// What the last exclusive holder of `path` recorded, if it is still running.
 ///
 /// A killed holder leaves its note behind, so the pid is checked before it is
 /// named: telling a waiting agent to go look at a dead pid is worse than
-/// telling it nothing.
-fn describe_holder(path: &Path) -> String {
-    let unknown = "held by other builds in this tree".to_string();
-    let Ok(mut file) = fs::File::open(path) else {
-        return unknown;
-    };
+/// telling it nothing. `None` is that "nothing" — what to say instead is the
+/// caller's, because a lock with a shared mode is usually held by holders who
+/// never wrote a note at all, and a lock without one never is.
+fn describe_holder(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
     let mut text = String::new();
-    if file.read_to_string(&mut text).is_err() {
-        return unknown;
-    }
+    file.read_to_string(&mut text).ok()?;
     let mut parts = text.trim().splitn(3, ' ');
-    let (Some(pid), Some(since), Some(what)) = (parts.next(), parts.next(), parts.next()) else {
-        return unknown;
-    };
-    let (Ok(pid), Ok(since)) = (pid.parse::<i32>(), since.parse::<u64>()) else {
-        return unknown;
-    };
+    let (pid, since, what) = (parts.next()?, parts.next()?, parts.next()?);
+    let (pid, since) = (pid.parse::<i32>().ok()?, since.parse::<u64>().ok()?);
     if !alive(pid) {
-        return unknown;
+        return None;
     }
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().saturating_sub(since))
         .unwrap_or(0);
-    format!("held by pid {pid} ({what}), {secs}s so far")
+    Some(format!("held by pid {pid} ({what}), {secs}s so far"))
 }
 
 fn alive(pid: i32) -> bool {
@@ -448,6 +481,16 @@ mod tests {
                     },
                 );
             }
+            "hold-integration" => {
+                let _landing = integration(&root);
+                touch(&root.join("held"));
+                appeared(&root.join("release"), Duration::from_secs(20));
+            }
+            "hold-integration-forever" => {
+                let _landing = integration(&root);
+                touch(&root.join("held"));
+                std::thread::sleep(Duration::from_secs(600));
+            }
             "want-exclusive" => {
                 let mut held = shared(&root, "child");
                 held.act_if(Scope::Worktree, "queued exclusive phase", || Some(()), |()| note(&root, "ex"));
@@ -486,7 +529,8 @@ mod tests {
         let state = open_lock_file(&lock_path(&worktree_lock_dir(&root), "state"));
         assert!(!try_lock(&state, LOCK_SH), "a build got in while an exclusive phase ran");
         assert!(!try_lock(&state, LOCK_EX), "two exclusive phases at once");
-        let holder = describe_holder(&lock_path(&worktree_lock_dir(&root), "state"));
+        let holder = describe_holder(&lock_path(&worktree_lock_dir(&root), "state"))
+            .expect("no holder note");
         assert!(
             holder.starts_with(&format!("held by pid {} ", kid.id())),
             "the waiting side cannot name the holder: {holder}"
@@ -513,10 +557,68 @@ mod tests {
         assert!(try_lock(&state, LOCK_EX), "a SIGKILLed holder stranded the lock");
         // And the note it left behind names a pid that is gone, so nobody is
         // sent to wait on it.
-        assert_eq!(
-            describe_holder(&lock_path(&worktree_lock_dir(&root), "state")),
-            "held by other builds in this tree"
+        assert_eq!(describe_holder(&lock_path(&worktree_lock_dir(&root), "state")), None);
+    }
+
+    /// Two landings at once is the thing `--land` exists to stop: step 4 moves
+    /// the primary's tree and step 3 measures a tree that has to still be the
+    /// one main gets.
+    #[test]
+    fn two_landings_serialise() {
+        let root = scratch("integration");
+        let mut kid = child(&root, "hold-integration");
+        assert!(appeared(&root.join("held"), Duration::from_secs(20)), "child never acquired");
+
+        let mine = open_lock_file(&integration_path(&root));
+        assert!(!try_lock(&mine, LOCK_EX), "two landings held the integration lock at once");
+        let holder = describe_holder(&integration_path(&root)).expect("no holder note");
+        assert!(
+            holder.starts_with(&format!("held by pid {} (landing)", kid.id())),
+            "the queued landing cannot name the one ahead of it: {holder}"
         );
+
+        touch(&root.join("release"));
+        assert!(kid.wait().unwrap().success());
+        drop(mine);
+        let _mine = integration(&root);
+    }
+
+    /// An agent kills a landing that is taking too long at least as readily as
+    /// it kills a build, and a stranded integration lock wedges every worktree
+    /// at once.
+    #[test]
+    fn a_killed_landing_releases_the_integration_lock() {
+        let root = scratch("integration-killed");
+        let mut kid = child(&root, "hold-integration-forever");
+        assert!(appeared(&root.join("held"), Duration::from_secs(20)), "child never acquired");
+
+        let mine = open_lock_file(&integration_path(&root));
+        assert!(!try_lock(&mine, LOCK_EX), "the lock was not actually held");
+
+        kid.kill().unwrap();
+        kid.wait().unwrap();
+
+        assert!(try_lock(&mine, LOCK_EX), "a SIGKILLed landing stranded the integration lock");
+        assert_eq!(describe_holder(&integration_path(&root)), None);
+    }
+
+    /// The property that forced a second file. A landing's gate is a build, and
+    /// a build takes the global `state` shared for its whole length; if the
+    /// landing held that same file the gate would wait on its own holder
+    /// forever, and the failure would be a hang rather than a message.
+    #[test]
+    fn a_landing_and_a_build_do_not_exclude_each_other() {
+        let root = scratch("integration-vs-build");
+
+        let building = shared(&root, "the gate's build");
+        let landing = open_lock_file(&integration_path(&root));
+        assert!(try_lock(&landing, LOCK_EX), "a build in flight kept a landing out");
+        drop(landing);
+        drop(building);
+
+        let _landing = integration(&root);
+        let state = open_lock_file(&lock_path(&git_common_lock_dir(&root), "state"));
+        assert!(try_lock(&state, LOCK_SH), "a landing kept its own gate's build out");
     }
 
     #[test]

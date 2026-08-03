@@ -46,6 +46,19 @@ fn check_prerequisites() {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    check_prerequisites();
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    env::set_current_dir(&root).expect("Failed to cd to project root");
+
+    // Before any other flag is read: `--gate`'s tail is another command's argv,
+    // and nothing here may take a word out of it for itself.
+    if args.iter().any(|a| a == "--land") {
+        toyos_build::land::dispatch(&root, &args);
+        return;
+    }
+
     let debug = args.iter().any(|a| a == "--debug");
     let release = args.iter().any(|a| a == "--release");
     let build_only = args.iter().any(|a| a == "--build-only");
@@ -76,11 +89,6 @@ fn main() {
         !(mute && profile != qemu::Profile::Metal),
         "--mute only means anything under --metal-sim; the others need their console"
     );
-
-    check_prerequisites();
-
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    env::set_current_dir(&root).expect("Failed to cd to project root");
 
     if args.iter().any(|a| a == "--regen-font") {
         toyos_build::assets::regen_panic_font(&root);

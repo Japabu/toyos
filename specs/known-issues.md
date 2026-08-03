@@ -2702,6 +2702,27 @@ keeps draining; and the four layout tests take a boot each rather than a group,
 which costs three boots. The fix is §5's — a drain that does not need the machine
 to be busy.
 
+### A landing's gate is a full suite, and a second suite on the host can time a boot out
+
+`cargo run -- --land` runs `cargo test` inside the integration lock, so a
+landing is a 14-minute suite. Nothing serialises it against a suite in *another*
+worktree — the lock only serialises landings, and worktrees.md §6 is explicit
+that the host is still one host.
+
+Measured 2026-08-03, `--land`'s own landing, with another agent's suite running:
+`screen_fatal_halt` failed with `[qemu] Boot timed out waiting for ===READY===`
+after 11 s, in a run where 237 of 238 passed in 850 s. The same test alone
+passes in 3.3 s, and it had passed in 3 s in the same worktree's previous full
+run when the host was quieter. The tell for the contention is in the run itself:
+`screen_console_panic` took 39 s against 13 s in the quieter run, the same
+binary and the same tree.
+
+So this is the cost §6 predicts, now with an instance. It is left as an
+observation rather than a rule because the fix is the counting semaphore §6
+already describes and nothing yet hands out slots. Until then a landing that
+goes red on a boot timeout is re-run — the isolated re-run is the evidence,
+exactly as CLAUDE.md's re-run-in-isolation rule says.
+
 ### rustup narrates its cargo fallback on every invocation
 
 `info: cargo is unavailable for the active toolchain` followed by `info:
