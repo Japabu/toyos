@@ -2715,6 +2715,16 @@ Not caused by #116/#118: base1 and base2 above are the same tree with
 `kernel/src/drivers/xhci/mod.rs` reverted to before those changes, and they fail
 identically.
 
+**And not caused by the IOMMU either, though it moved the number.** Same-session
+A/B at IOMMU stage I2, one run each on the same tree: `controller started` at
+0.103 s with the unit left unprogrammed and 0.107 s with translation on, for
+deltas of 0.297 and 0.293 against the 0.300 required. Programming a unit is ~6 ms
+of one-time boot work in the storage phase — building the identity domain's 3072
+leaves, arming the invalidation queue, and one global invalidation — and it lands
+squarely in the `started ≤ 100 ms` budget above. Both arms fail, so the gate's
+arithmetic is still the finding; what I2 removes is the last 4 ms of the margin
+that used to make an isolated re-run look like a fix.
+
 ### `git stash` in a shared tree takes everyone's uncommitted work
 
 Observed, not theorised: `stash@{0}: On main: compositor-stats-wip` appeared
