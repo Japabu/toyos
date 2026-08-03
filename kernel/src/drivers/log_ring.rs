@@ -32,6 +32,13 @@
 //! threw the boot log into a backend that discards it. Both are the same bug
 //! from opposite ends, and neither is visible to a host that has the serial
 //! stream anyway.
+//!
+//! **Each consumer collects only while it exists.** Two cursors, two flags:
+//! `SERIAL_SINK` follows whether any backend can carry a byte off the machine,
+//! `FILE_SINK` whether `/log` mounted. A cursor whose consumer is absent stands
+//! still rather than advancing into a writer that discards, so the ring never
+//! reports bytes owed to nobody — which matters because the idle loop declines
+//! to sleep on exactly that.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -58,7 +65,8 @@ struct LogRing {
     buf: [u8; RING_SIZE],
     head: usize,
     /// Where the next drain reads from, and `len` how much it owes. Both are
-    /// serial's bookkeeping alone.
+    /// serial's bookkeeping alone, and both stand still while [`SERIAL_SINK`]
+    /// is clear — the same property the file cursors have, for the same reason.
     tail: usize,
     len: usize,
     /// The same pair for the file sink (`log_file`). Two consumers, two
@@ -82,9 +90,10 @@ impl LogRing {
     fn append(&mut self, data: &[u8]) -> usize {
         let mut dropped = 0;
         let mut file_dropped = 0u64;
+        let to_serial = SERIAL_SINK.load(Ordering::Relaxed);
         let to_file = FILE_SINK.load(Ordering::Relaxed);
         for &b in data {
-            if self.len == RING_SIZE {
+            if to_serial && self.len == RING_SIZE {
                 self.tail = (self.tail + 1) % RING_SIZE;
                 self.len -= 1;
                 dropped += 1;
@@ -96,7 +105,9 @@ impl LogRing {
             }
             self.buf[self.head] = b;
             self.head = (self.head + 1) % RING_SIZE;
-            self.len += 1;
+            if to_serial {
+                self.len += 1;
+            }
             if to_file {
                 self.file_len += 1;
             }
@@ -104,7 +115,9 @@ impl LogRing {
                 self.retained += 1;
             }
         }
-        OWED.store(self.len, Ordering::Relaxed);
+        if to_serial {
+            OWED.store(self.len, Ordering::Relaxed);
+        }
         if to_file {
             FILE_OWED.store(self.file_len, Ordering::Relaxed);
         }
@@ -155,6 +168,51 @@ static OWED: AtomicUsize = AtomicUsize::new(0);
 /// pre-halt check; see [`OWED`].
 pub fn has_pending() -> bool {
     OWED.load(Ordering::Relaxed) != 0
+}
+
+/// Whether anything can carry a byte off this machine — a 16550 that answered
+/// its loopback probe, or a live virtio-console.
+///
+/// False is the T14's shape, and before this existed the ring collected for
+/// serial there anyway: `drain_chunk_to_serial` popped bytes into
+/// `uart_write_bytes`, which returns immediately when no UART answered, so the
+/// idle loop spent its passes moving a cursor over a consumer that does not
+/// exist. It also made [`has_pending`] answer yes on a machine where no drain
+/// could ever make it answer no on merit, and that is the load-bearing half:
+/// the pre-halt check in `sched::driver::execute` declines to sleep on it, so
+/// every line logged cost every idle CPU a trip round the loop to throw the
+/// line away.
+///
+/// The on-screen console was never the victim — it reads `retained`, which no
+/// drain touches. This is about not lying to the idle loop about who is owed.
+static SERIAL_SINK: AtomicBool = AtomicBool::new(false);
+
+/// Point the serial cursor at a backend, or take it away.
+///
+/// Derived from `serial::has_console()` at each of the three places that can
+/// change its answer, never set independently: a flag that could disagree with
+/// the backend would be a worse lie than the one this fixes.
+///
+/// Enabling seeds from `retained`, exactly as [`enable_file_sink`] does and for
+/// the same reason — a console that arrives at phase 6 gets the boot that
+/// happened before it, not just what happens after. On every machine with a
+/// 16550 that seed is empty of consequence: the probe is in phase 1 and nothing
+/// has drained.
+///
+/// Under the ring lock, so an `append` sees the flag and the cursors move
+/// together. `panic_flush`'s bypass is deliberately *not* a caller — it takes
+/// no lock precisely because a holder may be wedged — and it does not need to
+/// be: it disables the virtio-console only after establishing that a UART
+/// answered, so `has_console()` is still true on the other side of it.
+pub fn set_serial_sink(on: bool) {
+    let mut g = RingGuard::lock();
+    if SERIAL_SINK.swap(on, Ordering::Relaxed) == on {
+        return;
+    }
+    let ring = g.ring();
+    ring.len = if on { ring.retained } else { 0 };
+    ring.tail = (ring.head + RING_SIZE - ring.len) % RING_SIZE;
+    OWED.store(ring.len, Ordering::Relaxed);
 }
 
 /// Whether `log_file` is collecting from this ring at all.
