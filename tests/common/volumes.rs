@@ -671,6 +671,118 @@ fn rotation(
     Ok(())
 }
 
+/// The boot disk arrives *after* the port scan, and both mounts still happen.
+///
+/// The machine the T14 was on the boot it lost `/boot` and `/log`, and the one
+/// `xhci_slow_connect` cannot be: that gate hides the whole bus, which is the
+/// case `xhci::EMPTY_BUS_NS` already keeps looking through. Here the bus is
+/// populated and only the disk is late — five HID devices settle,
+/// `await_connect_settle` ends on *them* because its own condition is a connect
+/// set that has held still and is non-empty, and `scan_ports` runs with no disk
+/// on it. Everything downstream then behaves exactly as it did on the laptop:
+/// the machine boots, userland comes up, and there is no `/log` to write to.
+///
+/// Three things have to hold together, and the first is what stops the other two
+/// being vacuous:
+///
+/// - the boot scan really did finish with **no** disk (`usb-storage: 0
+///   device(s)`) while really having found the HIDs, so the interleaving under
+///   test is the one that happened rather than an ordinary boot;
+/// - both volumes mount anyway;
+/// - and `kernel.log` is on the device afterwards carrying *this* boot's
+///   partition GUID, read off the image on the host rather than out of the
+///   guest's own account of itself.
+pub fn late_storage_connect(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURE: &[&str] = &["xhci-slow-storage-connect"];
+    let image_path = test_dir().join("late-connect-boot.img");
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURE);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+    let (start, len) = log_extent(&image, &image_path)?;
+    let guid = esp_guid(&image, &image_path)?;
+    let nonce = format!("gpt: firmware booted us from partition {guid} ");
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            // The one profile with the boot stick on port register 1 *and* other
+            // USB devices behind it. A profile with an empty bus would settle on
+            // `EMPTY_BUS_NS` and never reach this interleaving.
+            profile: qemu::Profile::MetalUsb,
+            boot_image: Some(image_path.clone()),
+            kernel_features: FEATURE,
+            ..Default::default()
+        },
+    );
+    let boot = qemu.boot_log().to_string();
+    serial::Serial::named("boot console", boot.as_str()).must_be_clean()?;
+
+    if !boot.contains("usb-storage: 0 device(s)") {
+        return Err(format!(
+            "the boot scan bound a disk, so the port was not held empty and this gate is \
+             measuring an ordinary boot\n{}",
+            volume_lines(&boot)
+        ));
+    }
+    // The other half of non-vacuity: a bus that is empty as well as diskless is
+    // the machine `xhci_slow_connect` already covers, and it takes a different
+    // path out of the settle.
+    if boot.contains("xHCI: 1 controller(s), 0 HID device(s)") {
+        return Err(format!(
+            "the whole bus read empty, not just the disk's port — this is \
+             xhci_slow_connect's machine and the settle leaves it by the other door\n{}",
+            volume_lines(&boot)
+        ));
+    }
+
+    for want in [
+        "boot-volume: partition mounted",
+        "log-volume: partition mounted",
+        "log-file: this boot's kernel log continues in",
+    ] {
+        if !boot.contains(want) {
+            return Err(format!(
+                "the disk arrived after the port scan and {want:?} never happened — the probe \
+                 stopped looking while the machine still had no boot volume\n{}",
+                volume_lines(&boot)
+            ));
+        }
+    }
+
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    let tail = qemu.drain_serial(Duration::from_secs(20));
+    drop(qemu);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if tail.contains(bad) {
+            return Err(format!("{bad:?} on the way down\n{tail}"));
+        }
+    }
+
+    // Ground truth is the device, not the line the guest printed about it.
+    let log = log_on_device(&image_path, start, len, "kernel.log")?;
+    let text = String::from_utf8_lossy(&log).into_owned();
+    if !text.contains(&nonce) {
+        return Err(format!(
+            "the log on the device does not carry this boot's partition GUID ({nonce:?}); it is \
+             {} bytes",
+            log.len()
+        ));
+    }
+    let _ = std::fs::remove_file(&image_path);
+    eprintln!(
+        "  [log] the disk was invisible to the port scan and both volumes mounted anyway; \
+         {} bytes of kernel.log on the device",
+        log.len()
+    );
+    Ok(())
+}
+
 /// One file read out of a partition inside a disk image on the host.
 pub fn log_on_device(
     image_path: &Path,

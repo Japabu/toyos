@@ -152,6 +152,7 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_descriptor_walk",
     "esp_filesystem",
     "kernel_log_file",
+    "late_storage_connect",
     "log_backing_read_error",
     "log_partition_layout",
     "log_partition_identity",
@@ -2222,6 +2223,7 @@ fn run_machine_test(
         // Body in `tests/common/volumes.rs`, same reason.
         "esp_filesystem" => common::volumes::esp_filesystem(test_config, c_bins, rust_bins),
         "kernel_log_file" => common::volumes::kernel_log_file(test_config, c_bins, rust_bins),
+        "late_storage_connect" => common::volumes::late_storage_connect(test_config, c_bins, rust_bins),
         "log_partition_layout" => {
             common::volumes::log_partition_layout(test_config, c_bins, rust_bins)
         }
