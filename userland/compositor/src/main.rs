@@ -57,16 +57,52 @@ const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
 /// Fds the compositor watches that are not windows: keyboard, mouse, listener.
 const FIXED_POLL_FDS: u32 = 3;
 
+/// Connections accepted but not yet identified by a first frame.
+///
+/// The kernel queues 32 unaccepted connections per listener
+/// (`listener::MAX_PENDING_CONNECTIONS`); this is the same allowance one step
+/// further along, for a client that has been accepted and has not yet said
+/// what it wants. Past it the compositor refuses by name rather than growing,
+/// and [`HANDSHAKE_TIMEOUT`] is what guarantees the table drains.
+const MAX_PENDING_CONNS: u32 = 32;
+
+/// How long a connection may go without completing its first frame.
+///
+/// Policy, and generous: every client in the tree sends its first frame in the
+/// statement after `connect`. What this bounds is the one that never sends it.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Hard ceiling on live windows, from the poller rather than from memory.
 ///
-/// Every window's fd is registered in the same batch as the three fixed ones,
-/// and [`Poller::MAX_HANDLES`] is the widest set one poller can carry. Unlike
-/// [`max_windows`] this does not move when the resolution does, which is why
-/// the poller is sized from it: `MSG_SET_RESOLUTION` can make windows cheaper
-/// mid-run, and a poller sized for the old screen would then be too small.
-/// At any resolution this machine can actually scan out, the memory budget is
-/// far below this and is what binds.
-const MAX_WINDOW_SLOTS: u32 = Poller::MAX_HANDLES - FIXED_POLL_FDS;
+/// Every window's fd is registered in the same batch as the three fixed ones
+/// and the pending connections, and [`Poller::MAX_HANDLES`] is the widest set
+/// one poller can carry. Unlike [`max_windows`] this does not move when the
+/// resolution does, which is why the poller is sized from it:
+/// `MSG_SET_RESOLUTION` can make windows cheaper mid-run, and a poller sized
+/// for the old screen would then be too small. At any resolution this machine
+/// can actually scan out, the memory budget is far below this and is what
+/// binds.
+const MAX_WINDOW_SLOTS: u32 = Poller::MAX_HANDLES - FIXED_POLL_FDS - MAX_PENDING_CONNS;
+
+/// The largest client payload the compositor keeps.
+///
+/// `MSG_CLIPBOARD_SET`'s 116 bytes is the widest of them; every typed payload
+/// it decodes is smaller (`CreateWindowRequest`, 40). A client may declare
+/// anything up to `ipc::MAX_FRAME_LEN` — the excess is counted down and
+/// discarded, never waited for.
+const MAX_KEPT_PAYLOAD: usize = 116;
+
+/// A whole frame is drained before the compositor acts on it, so the longest
+/// the event loop can be held by one client is one pass of the drain loop.
+const IPC_HEADER_LEN: usize = 8;
+
+/// How long one pass may spend draining clients before it must composite.
+///
+/// Without it a client that never stops sending keeps its fd ready forever and
+/// the loop below never reaches `redraw` — a freeze with a different shape and
+/// the same result. The drain loop's promise is "everything pending", and this
+/// is the clause that makes it "or one frame's worth, whichever is sooner".
+const DRAIN_BUDGET: Duration = FRAME_INTERVAL;
 
 /// Share of physical memory the compositor will hold in window buffers.
 ///
@@ -122,6 +158,173 @@ fn total_memory() -> u64 {
     u64::from_le_bytes(buf[0..8].try_into().unwrap())
 }
 
+/// What one [`ClientRx::pump`] found.
+#[derive(Clone, Copy)]
+enum RxStep {
+    /// The fd has nothing more right now.
+    Idle,
+    /// A whole frame is buffered; its payload is [`ClientRx::payload`].
+    Frame { msg_type: u32, payload_len: usize },
+    /// The peer hung up, or its fd is gone.
+    Eof,
+    /// A frame no protocol here can produce. Nothing after it can be located,
+    /// so there is nothing to resynchronise to.
+    Malformed,
+}
+
+/// One client's inbound framing, over non-blocking reads only.
+///
+/// **The compositor never reads a client with a blocking read.** That is the
+/// whole point of this type: `ipc::recv_header` and `ipc::recv_payload` park
+/// the caller until the peer sends the bytes it promised, which hands a client
+/// the decision of when the desktop runs again. Here a peer that stops halfway
+/// through a frame costs a buffer and a deadline instead of the event loop.
+struct ClientRx {
+    buf: [u8; IPC_HEADER_LEN + MAX_KEPT_PAYLOAD],
+    len: usize,
+    state: RxState,
+}
+
+enum RxState {
+    Header,
+    Payload { msg_type: u32, keep: usize, skip: u32 },
+    Skip { msg_type: u32, kept: usize, remaining: u32 },
+}
+
+impl ClientRx {
+    fn new() -> Self {
+        Self { buf: [0; IPC_HEADER_LEN + MAX_KEPT_PAYLOAD], len: 0, state: RxState::Header }
+    }
+
+    /// The payload of the frame the last [`RxStep::Frame`] announced.
+    fn payload(&self, len: usize) -> &[u8] {
+        &self.buf[..len]
+    }
+
+    /// Read what is there, and report the first thing that happened.
+    ///
+    /// At most one frame per call: the caller has other clients to serve and a
+    /// screen to paint, and a client that always has another frame ready must
+    /// not be able to keep either from happening.
+    fn pump(&mut self, conn: &Connection) -> RxStep {
+        loop {
+            match self.state {
+                RxState::Header => {
+                    match fill(conn, &mut self.buf[..IPC_HEADER_LEN], &mut self.len) {
+                        Fill::Idle => return RxStep::Idle,
+                        Fill::Eof => return RxStep::Eof,
+                        Fill::Filled => {}
+                    }
+                    let msg_type = u32::from_ne_bytes(self.buf[0..4].try_into().unwrap());
+                    let wire_len = u32::from_ne_bytes(self.buf[4..8].try_into().unwrap());
+                    // The bound belongs to `IpcHeader`, so it is asked rather
+                    // than restated: a length past `MAX_FRAME_LEN` is a frame
+                    // this endpoint refuses to describe, not a long one.
+                    let Ok(header) = ipc::IpcHeader::from_wire(msg_type, wire_len) else {
+                        return RxStep::Malformed;
+                    };
+                    self.len = 0;
+                    let keep = (header.len() as usize).min(MAX_KEPT_PAYLOAD);
+                    let skip = header.len() - keep as u32;
+                    self.state = RxState::Payload { msg_type, keep, skip };
+                }
+                RxState::Payload { msg_type, keep, skip } => {
+                    if keep > 0 {
+                        match fill(conn, &mut self.buf[..keep], &mut self.len) {
+                            Fill::Idle => return RxStep::Idle,
+                            Fill::Eof => return RxStep::Eof,
+                            Fill::Filled => {}
+                        }
+                    }
+                    self.len = 0;
+                    self.state = RxState::Skip { msg_type, kept: keep, remaining: skip };
+                }
+                RxState::Skip { msg_type, kept, remaining } => {
+                    if remaining > 0 {
+                        let mut sink = [0u8; 128];
+                        let want = (remaining as usize).min(sink.len());
+                        let mut got = 0;
+                        match fill(conn, &mut sink[..want], &mut got) {
+                            Fill::Idle => {
+                                self.state =
+                                    RxState::Skip { msg_type, kept, remaining: remaining - got as u32 };
+                                return RxStep::Idle;
+                            }
+                            Fill::Eof => return RxStep::Eof,
+                            Fill::Filled => {
+                                self.state =
+                                    RxState::Skip { msg_type, kept, remaining: remaining - want as u32 };
+                                continue;
+                            }
+                        }
+                    }
+                    self.state = RxState::Header;
+                    return RxStep::Frame { msg_type, payload_len: kept };
+                }
+            }
+        }
+    }
+}
+
+enum Fill {
+    Filled,
+    Idle,
+    Eof,
+}
+
+/// Fill `buf` from `*len` onwards without blocking, carrying `*len` forward so
+/// the next call resumes where this one stopped.
+fn fill(conn: &Connection, buf: &mut [u8], len: &mut usize) -> Fill {
+    while *len < buf.len() {
+        match conn.read_nonblock(&mut buf[*len..]) {
+            Ok(0) => return Fill::Eof,
+            Ok(n) => *len += n,
+            Err(toyos_abi::syscall::SyscallError::WouldBlock) => return Fill::Idle,
+            // The fd itself is gone, which is the same hang-up seen from the
+            // other side of the same race.
+            Err(_) => return Fill::Eof,
+        }
+    }
+    Fill::Filled
+}
+
+/// A whole client message, off the fd and in memory.
+///
+/// `conn` is `Some` only for the first frame on a freshly accepted connection:
+/// `MSG_CREATE_WINDOW` keeps it, and every other message type answers on it
+/// and lets it close.
+struct ClientFrame {
+    fd: Fd,
+    pid: u32,
+    msg_type: u32,
+    payload: [u8; MAX_KEPT_PAYLOAD],
+    payload_len: usize,
+    conn: Option<Connection>,
+}
+
+impl ClientFrame {
+    fn new(fd: Fd, pid: u32, msg_type: u32) -> Self {
+        Self { fd, pid, msg_type, payload: [0; MAX_KEPT_PAYLOAD], payload_len: 0, conn: None }
+    }
+
+    fn set_payload(&mut self, bytes: &[u8]) {
+        self.payload[..bytes.len()].copy_from_slice(bytes);
+        self.payload_len = bytes.len();
+    }
+}
+
+/// A connection that has been accepted and has not yet said what it is for.
+///
+/// It exists because `accept` and the first frame are two events, and the
+/// compositor used to fuse them with a blocking `recv_header` — so a client
+/// that connected and sent four bytes owned the desktop until it disconnected.
+struct PendingConn {
+    conn: Connection,
+    pid: u32,
+    rx: ClientRx,
+    since: Instant,
+}
+
 struct WindowState {
     fd: Connection,
     pid: u32,
@@ -142,10 +345,7 @@ struct WindowState {
     saved_h: usize,
     presented: bool,
     cursor_style: u8,
-    /// Partial IPC header bytes received so far. Fully non-blocking client I/O:
-    /// if a read returns partial data, buffer it here and finish next iteration.
-    recv_buf: [u8; 8],
-    recv_len: usize,
+    rx: ClientRx,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -203,7 +403,13 @@ fn bring_to_front(windows: &mut Vec<WindowState>, idx: usize) -> usize {
     }
 }
 
-fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format: u32) {
+fn resize_window(
+    win: &mut WindowState,
+    new_w: usize,
+    new_h: usize,
+    pixel_format: u32,
+    dead: &mut Vec<Dead>,
+) {
     let old_token = win.shm.token();
     let buf_size = new_w * new_h * 4;
     let new_shm = SharedMemory::allocate(buf_size);
@@ -215,7 +421,12 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
     win.height = new_h;
     win.buf_width = new_w;
     win.buf_height = new_h;
-    let _ = win.fd.send(
+    // The one message a window cannot afford to miss — the old mapping is
+    // already gone — so a client that will not take it is dropped rather than
+    // left drawing into memory it no longer owns.
+    deliver(
+        dead,
+        win,
         window::MSG_WINDOW_RESIZED,
         &window::ResizeInfo {
             token,
@@ -237,43 +448,61 @@ fn save_if_normal(win: &mut WindowState) {
     }
 }
 
-fn maximize_window(win: &mut WindowState, screen_w: usize, screen_h: usize, pixel_format: u32) {
+fn maximize_window(
+    win: &mut WindowState,
+    screen_w: usize,
+    screen_h: usize,
+    pixel_format: u32,
+    dead: &mut Vec<Dead>,
+) {
     save_if_normal(win);
     win.mode = WindowMode::Maximized;
     win.content_x = BORDER_WIDTH;
     win.content_y = BORDER_WIDTH + TITLE_BAR_HEIGHT;
     let new_w = screen_w - BORDER_WIDTH * 2;
     let new_h = screen_h - TASKBAR_HEIGHT - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
-    resize_window(win, new_w, new_h, pixel_format);
+    resize_window(win, new_w, new_h, pixel_format, dead);
 }
 
-fn snap_left(win: &mut WindowState, screen_w: usize, screen_h: usize, pixel_format: u32) {
+fn snap_left(
+    win: &mut WindowState,
+    screen_w: usize,
+    screen_h: usize,
+    pixel_format: u32,
+    dead: &mut Vec<Dead>,
+) {
     save_if_normal(win);
     win.mode = WindowMode::SnappedLeft;
     win.content_x = BORDER_WIDTH;
     win.content_y = BORDER_WIDTH + TITLE_BAR_HEIGHT;
     let new_w = screen_w / 2 - BORDER_WIDTH * 2;
     let new_h = screen_h - TASKBAR_HEIGHT - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
-    resize_window(win, new_w, new_h, pixel_format);
+    resize_window(win, new_w, new_h, pixel_format, dead);
 }
 
-fn snap_right(win: &mut WindowState, screen_w: usize, screen_h: usize, pixel_format: u32) {
+fn snap_right(
+    win: &mut WindowState,
+    screen_w: usize,
+    screen_h: usize,
+    pixel_format: u32,
+    dead: &mut Vec<Dead>,
+) {
     save_if_normal(win);
     win.mode = WindowMode::SnappedRight;
     win.content_x = screen_w / 2 + BORDER_WIDTH;
     win.content_y = BORDER_WIDTH + TITLE_BAR_HEIGHT;
     let new_w = screen_w / 2 - BORDER_WIDTH * 2;
     let new_h = screen_h - TASKBAR_HEIGHT - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
-    resize_window(win, new_w, new_h, pixel_format);
+    resize_window(win, new_w, new_h, pixel_format, dead);
 }
 
-fn restore_window(win: &mut WindowState, pixel_format: u32) {
+fn restore_window(win: &mut WindowState, pixel_format: u32, dead: &mut Vec<Dead>) {
     win.mode = WindowMode::Normal;
     win.content_x = win.saved_x;
     win.content_y = win.saved_y;
     let w = win.saved_w;
     let h = win.saved_h;
-    resize_window(win, w, h, pixel_format);
+    resize_window(win, w, h, pixel_format, dead);
 }
 
 /// Scale RGB image and convert to native framebuffer pixel format (4 bytes/pixel).
@@ -376,20 +605,71 @@ fn mark_dirty(dirty_rect: &mut Option<DirtyRect>, r: DirtyRect) {
     });
 }
 
-/// Drop a client that sent a frame the protocol cannot describe.
+/// Why a client is going.
 ///
-/// The compositor cannot locate the next message boundary in that stream, so
-/// there is nothing to resynchronise to — and a client is not entitled to end
-/// the compositor by mis-declaring a payload length.
-fn drop_out_of_protocol(
-    windows: &mut Vec<WindowState>,
-    fd: Fd,
-    dirty_rect: &mut Option<DirtyRect>,
-    screen_w: i32,
-    screen_h: i32,
-) {
-    windows.retain(|w| w.fd.fd() != fd);
-    mark_dirty(dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+/// **Every one of these is printed with the pid.** A client is not entitled to
+/// end the compositor, but the compositor is not entitled to make one vanish
+/// without saying so either: the log is the only place the machine this runs
+/// on can be asked what happened.
+#[derive(Clone, Copy)]
+enum DropReason {
+    /// A frame no protocol here can produce. The next message boundary is
+    /// unlocatable, so there is nothing to resynchronise to.
+    OutOfProtocol,
+    /// Its pipe would not take a whole frame — an entire pipe of messages it
+    /// has not read.
+    NotReading,
+    /// The connection is gone.
+    Gone,
+    /// Accepted, and never completed a first frame.
+    HandshakeTimeout,
+}
+
+impl DropReason {
+    fn why(self) -> &'static str {
+        match self {
+            Self::OutOfProtocol => "it sent a frame this protocol cannot describe",
+            Self::NotReading => "its pipe will not take another message and it is not reading",
+            Self::Gone => "its connection is gone",
+            Self::HandshakeTimeout => "it never finished its first message",
+        }
+    }
+}
+
+impl From<ipc::TrySendError> for DropReason {
+    fn from(e: ipc::TrySendError) -> Self {
+        match e {
+            ipc::TrySendError::Full => Self::NotReading,
+            _ => Self::Gone,
+        }
+    }
+}
+
+/// A client the next removal pass will take out.
+type Dead = (Fd, u32, DropReason);
+
+fn mark_dead(dead: &mut Vec<Dead>, fd: Fd, pid: u32, reason: DropReason) {
+    if !dead.iter().any(|(f, _, _)| *f == fd) {
+        dead.push((fd, pid, reason));
+    }
+}
+
+/// Hand a window a typed frame, or mark it for removal.
+///
+/// A failure is never retried and never ignored: `TrySendError::Full` can have
+/// left part of the frame in the pipe, so the peer's stream is past saving —
+/// which is the price of never blocking on it.
+fn deliver<T: ipc::IpcPayload>(dead: &mut Vec<Dead>, win: &WindowState, msg_type: u32, payload: &T) {
+    if let Err(e) = win.fd.try_send(msg_type, payload) {
+        mark_dead(dead, win.fd.fd(), win.pid, e.into());
+    }
+}
+
+/// [`deliver`] for a message that is only its own header.
+fn deliver_signal(dead: &mut Vec<Dead>, win: &WindowState, msg_type: u32) {
+    if let Err(e) = win.fd.try_signal(msg_type) {
+        mark_dead(dead, win.fd.fd(), win.pid, e.into());
+    }
 }
 
 fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_h: i32, launcher_open: bool) -> HitZone {
@@ -902,17 +1182,21 @@ fn main() {
     );
 
     // Sized for the slot ceiling rather than for `max_windows`: the batch
-    // between two `wait` calls is the three fixed fds plus one per live
-    // window, and `MSG_SET_RESOLUTION` can raise `max_windows` mid-run.
-    let poller = Poller::new(FIXED_POLL_FDS + MAX_WINDOW_SLOTS);
+    // between two `wait` calls is the three fixed fds, one per live window and
+    // one per pending connection, and `MSG_SET_RESOLUTION` can raise
+    // `max_windows` mid-run.
+    let poller = Poller::new(FIXED_POLL_FDS + MAX_WINDOW_SLOTS + MAX_PENDING_CONNS);
 
     poller.poll_add(&kb, IORING_POLL_IN, token_kb);
     poller.poll_add(&mouse, IORING_POLL_IN, token_mouse);
     poller.poll_add(&listener, IORING_POLL_IN, token_listener);
 
+    let mut pending: Vec<PendingConn> = Vec::new();
+
     loop {
         // Drain all pending events before compositing
         let mut waited = false;
+        let drain_until = Instant::now() + DRAIN_BUDGET;
         loop {
             let timeout = if waited { Duration::from_nanos(1) } else { FRAME_INTERVAL };
 
@@ -924,12 +1208,28 @@ fn main() {
             let kb_ready = ready_tokens.contains(&token_kb);
             let mouse_ready = ready_tokens.contains(&token_mouse);
             let listener_ready = ready_tokens.contains(&token_listener);
-            let any_client_ready = windows.iter().any(|w| ready_tokens.contains(&(w.fd.fd().0 as u64)));
+            let any_client_ready = windows.iter().any(|w| ready_tokens.contains(&(w.fd.fd().0 as u64)))
+                || pending.iter().any(|p| ready_tokens.contains(&(p.conn.fd().0 as u64)));
+
+            // A handshake that never completes is the reason this deadline
+            // exists, and the sweep has to happen on a pass that found nothing
+            // ready too — otherwise a silent client is only ever timed out by
+            // some *other* client's traffic.
+            let now = Instant::now();
+            for p in pending.iter().filter(|p| now.duration_since(p.since) >= HANDSHAKE_TIMEOUT) {
+                eprintln!(
+                    "compositor: dropping pid {} — {}",
+                    p.pid,
+                    DropReason::HandshakeTimeout.why()
+                );
+            }
+            pending.retain(|p| now.duration_since(p.since) < HANDSHAKE_TIMEOUT);
 
             if !kb_ready && !mouse_ready && !listener_ready && !any_client_ready {
                 break;
             }
             waited = true;
+            let mut dead: Vec<Dead> = Vec::new();
 
         if kb_ready {
             let mut events = [window::KeyEvent::EMPTY; 8];
@@ -968,46 +1268,49 @@ fn main() {
                             0x50 => {
                                 // Super+Left: snap left or restore
                                 if windows[idx].mode == WindowMode::SnappedLeft {
-                                    restore_window(&mut windows[idx], pixel_format);
+                                    restore_window(&mut windows[idx], pixel_format, &mut dead);
                                 } else {
                                     snap_left(
                                         &mut windows[idx],
                                         screen_w as usize,
                                         screen_h as usize,
                                         pixel_format,
+                                        &mut dead,
                                     );
                                 }
                             }
                             0x4F => {
                                 // Super+Right: snap right or restore
                                 if windows[idx].mode == WindowMode::SnappedRight {
-                                    restore_window(&mut windows[idx], pixel_format);
+                                    restore_window(&mut windows[idx], pixel_format, &mut dead);
                                 } else {
                                     snap_right(
                                         &mut windows[idx],
                                         screen_w as usize,
                                         screen_h as usize,
                                         pixel_format,
+                                        &mut dead,
                                     );
                                 }
                             }
                             0x52 => {
                                 // Super+Up: maximize or restore
                                 if windows[idx].mode == WindowMode::Maximized {
-                                    restore_window(&mut windows[idx], pixel_format);
+                                    restore_window(&mut windows[idx], pixel_format, &mut dead);
                                 } else {
                                     maximize_window(
                                         &mut windows[idx],
                                         screen_w as usize,
                                         screen_h as usize,
                                         pixel_format,
+                                        &mut dead,
                                     );
                                 }
                             }
                             0x51 => {
                                 // Super+Down: restore or minimize
                                 if windows[idx].mode != WindowMode::Normal {
-                                    restore_window(&mut windows[idx], pixel_format);
+                                    restore_window(&mut windows[idx], pixel_format, &mut dead);
                                 } else {
                                     windows[idx].minimized = true;
                                 }
@@ -1015,23 +1318,28 @@ fn main() {
                             0x14 => {
                                 // GUI+Q: close focused window
                                 let win = windows.remove(idx);
-                                let _ = win.fd.signal(window::MSG_WINDOW_CLOSE);
+                                let _ = win.fd.try_signal(window::MSG_WINDOW_CLOSE);
                             }
                             0x19 => {
                                 // GUI+V: paste clipboard
                                 if !clipboard.is_empty() {
+                                    let win = &windows[idx];
                                     if clipboard.len() <= 4096 {
-                                        let _ = windows[idx].fd.send_bytes(
+                                        if let Err(e) = win.fd.try_send_bytes(
                                             window::MSG_CLIPBOARD_PASTE,
                                             clipboard.as_bytes(),
-                                        );
+                                        ) {
+                                            mark_dead(&mut dead, win.fd.fd(), win.pid, e.into());
+                                        }
                                     } else {
                                         static PASTE_SHM: std::sync::Mutex<Option<SharedMemory>> =
                                             std::sync::Mutex::new(None);
                                         let mut shm = SharedMemory::allocate(clipboard.len());
                                         shm.as_mut_slice()[..clipboard.len()]
                                             .copy_from_slice(clipboard.as_bytes());
-                                        let _ = windows[idx].fd.send(
+                                        deliver(
+                                            &mut dead,
+                                            win,
                                             window::MSG_CLIPBOARD_PASTE_SHM,
                                             &window::ClipboardShmMsg {
                                                 token: shm.token(),
@@ -1044,10 +1352,7 @@ fn main() {
                             }
                             _ => {
                                 // Forward other GUI combos to focused app
-                                let _ = windows[idx].fd.send(
-                                    window::MSG_KEY_INPUT,
-                                    event,
-                                );
+                                deliver(&mut dead, &windows[idx], window::MSG_KEY_INPUT, event);
                             }
                         }
                         mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
@@ -1057,7 +1362,7 @@ fn main() {
                     Command::new("/bin/terminal").spawn().ok();
                 } else {
                     if let Some(idx) = focused_window_idx(&windows) {
-                        let _ = windows[idx].fd.send(window::MSG_KEY_INPUT, event);
+                        deliver(&mut dead, &windows[idx], window::MSG_KEY_INPUT, event);
                     }
                 }
             }
@@ -1164,7 +1469,7 @@ fn main() {
                     match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
-                            let _ = win.fd.signal(window::MSG_WINDOW_CLOSE);
+                            let _ = win.fd.try_signal(window::MSG_WINDOW_CLOSE);
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::MinimizeButton(idx) => {
@@ -1175,13 +1480,14 @@ fn main() {
                             let new_idx = bring_to_front(&mut windows, idx);
                             let pixel_format = screen.pixel_format_raw();
                             if windows[new_idx].mode != WindowMode::Normal {
-                                restore_window(&mut windows[new_idx], pixel_format);
+                                restore_window(&mut windows[new_idx], pixel_format, &mut dead);
                             } else {
                                 maximize_window(
                                     &mut windows[new_idx],
                                     screen_w as usize,
                                     screen_h as usize,
                                     pixel_format,
+                                    &mut dead,
                                 );
                             }
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
@@ -1197,13 +1503,14 @@ fn main() {
                             {
                                 let pixel_format = screen.pixel_format_raw();
                                 if windows[new_idx].mode != WindowMode::Normal {
-                                    restore_window(&mut windows[new_idx], pixel_format);
+                                    restore_window(&mut windows[new_idx], pixel_format, &mut dead);
                                 } else {
                                     maximize_window(
                                         &mut windows[new_idx],
                                         screen_w as usize,
                                         screen_h as usize,
                                         pixel_format,
+                                        &mut dead,
                                     );
                                 }
                                 last_title_click_fd = None;
@@ -1242,7 +1549,7 @@ fn main() {
                             }
                             let win = &windows[new_idx];
                             let ev = make_mouse_event(win, window::MOUSE_PRESS, 1, 0);
-                            let _ = win.fd.send(window::MSG_MOUSE_INPUT, &ev);
+                            deliver(&mut dead, win, window::MSG_MOUSE_INPUT, &ev);
                         }
                         HitZone::TaskbarItem(idx) => {
                             if idx < windows.len() {
@@ -1279,10 +1586,7 @@ fn main() {
                 if release_happened {
                     if let Some(idx) = focused_window_idx(&windows) {
                         let ev = make_mouse_event(&windows[idx], window::MOUSE_RELEASE, 1, 0);
-                        let _ = windows[idx].fd.send(
-                            window::MSG_MOUSE_INPUT,
-                            &ev,
-                        );
+                        deliver(&mut dead, &windows[idx], window::MSG_MOUSE_INPUT, &ev);
                     }
                     match interaction {
                         Interaction::DragPending { .. } => {
@@ -1297,6 +1601,7 @@ fn main() {
                                     screen_w as usize,
                                     screen_h as usize,
                                     pixel_format,
+                                    &mut dead,
                                 );
                             } else if cursor_x >= screen_w - 3 {
                                 snap_right(
@@ -1304,6 +1609,7 @@ fn main() {
                                     screen_w as usize,
                                     screen_h as usize,
                                     pixel_format,
+                                    &mut dead,
                                 );
                             } else if cursor_y <= 2 {
                                 maximize_window(
@@ -1311,6 +1617,7 @@ fn main() {
                                     screen_w as usize,
                                     screen_h as usize,
                                     pixel_format,
+                                    &mut dead,
                                 );
                             }
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
@@ -1320,7 +1627,7 @@ fn main() {
                             let win = &mut windows[window_idx];
                             let new_w = win.width;
                             let new_h = win.height;
-                            resize_window(win, new_w, new_h, pixel_format);
+                            resize_window(win, new_w, new_h, pixel_format, &mut dead);
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         Interaction::None => {}
@@ -1345,7 +1652,7 @@ fn main() {
                                     let win = &mut windows[window_idx];
                                     // Remember old maximized width for proportional cursor placement
                                     let old_width = win.width + 2 * BORDER_WIDTH;
-                                    restore_window(win, pixel_format);
+                                    restore_window(win, pixel_format, &mut dead);
                                     let win = &mut windows[window_idx];
                                     let new_width = win.width + 2 * BORDER_WIDTH;
                                     // Place cursor proportionally on the restored title bar
@@ -1397,10 +1704,7 @@ fn main() {
                                     0,
                                     0,
                                 );
-                                let _ = windows[idx].fd.send(
-                                    window::MSG_MOUSE_INPUT,
-                                    &ev,
-                                );
+                                deliver(&mut dead, &windows[idx], window::MSG_MOUSE_INPUT, &ev);
                             }
                         }
                     }
@@ -1415,7 +1719,7 @@ fn main() {
                             let clamped_scroll = total_scroll.clamp(-128, 127) as i8;
                             let ev =
                                 make_mouse_event(&windows[idx], window::MOUSE_SCROLL, 0, clamped_scroll);
-                            let _ = windows[idx].fd.send(window::MSG_MOUSE_INPUT, &ev);
+                            deliver(&mut dead, &windows[idx], window::MSG_MOUSE_INPUT, &ev);
                         }
                     }
                 }
@@ -1424,56 +1728,94 @@ fn main() {
             }
         }
 
-        // Collected first to avoid borrowing `windows` while mutating it.
-        let mut client_msgs: Vec<(Fd, u32, ipc::IpcHeader, Option<Connection>)> = Vec::new();
+        // Collected first to avoid borrowing `windows` while mutating it. The
+        // payload comes with the frame rather than being read off the fd
+        // during dispatch: the read side is finished by the time anything acts
+        // on a message, so no branch below can park on a peer.
+        let mut client_msgs: Vec<ClientFrame> = Vec::new();
 
         if listener_ready {
             let result = services::accept(&listener).expect("accept failed");
-            let raw_fd = result.conn.fd();
-            if let Ok(header) = ipc::recv_header(raw_fd) {
-                client_msgs.push((raw_fd, result.client_pid, header, Some(result.conn)));
+            if pending.len() >= MAX_PENDING_CONNS as usize {
+                eprintln!(
+                    "compositor: refusing pid {} — {MAX_PENDING_CONNS} connections are already \
+                     waiting to say what they want",
+                    result.client_pid
+                );
+            } else {
+                poller.poll_add(&result.conn, IORING_POLL_IN, result.conn.fd().0 as u64);
+                pending.push(PendingConn {
+                    conn: result.conn,
+                    pid: result.client_pid,
+                    rx: ClientRx::new(),
+                    since: Instant::now(),
+                });
             }
         }
 
-        let mut dead_fds: Vec<Fd> = Vec::new();
-        for i in 0..windows.len() {
-            if ready_tokens.contains(&(windows[i].fd.fd().0 as u64)) {
-                let win = &mut windows[i];
-                // Non-blocking read into per-client header buffer
-                match win.fd.read_nonblock(&mut win.recv_buf[win.recv_len..]) {
-                    Ok(0) => dead_fds.push(win.fd.fd()),
-                    Ok(n) => {
-                        win.recv_len += n;
-                        if win.recv_len >= 8 {
-                            let header = ipc::IpcHeader::from_wire(
-                                u32::from_ne_bytes([win.recv_buf[0], win.recv_buf[1], win.recv_buf[2], win.recv_buf[3]]),
-                                u32::from_ne_bytes([win.recv_buf[4], win.recv_buf[5], win.recv_buf[6], win.recv_buf[7]]),
-                            );
-                            win.recv_len = 0;
-                            match header {
-                                Ok(header) => client_msgs.push((win.fd.fd(), win.pid, header, None)),
-                                // A frame no protocol here can produce. Nothing
-                                // after it can be located, so the client goes.
-                                Err(_) => dead_fds.push(win.fd.fd()),
-                            }
-                        }
-                        // else: partial header, continue next iteration
-                    }
-                    Err(_) => {} // WouldBlock — no data yet
+        for i in 0..pending.len() {
+            if !ready_tokens.contains(&(pending[i].conn.fd().0 as u64)) {
+                continue;
+            }
+            let step = {
+                let p = &mut pending[i];
+                p.rx.pump(&p.conn)
+            };
+            let fd = pending[i].conn.fd();
+            let pid = pending[i].pid;
+            match step {
+                RxStep::Idle => {}
+                RxStep::Eof => mark_dead(&mut dead, fd, pid, DropReason::Gone),
+                RxStep::Malformed => mark_dead(&mut dead, fd, pid, DropReason::OutOfProtocol),
+                RxStep::Frame { msg_type, payload_len } => {
+                    let mut frame = ClientFrame::new(fd, pid, msg_type);
+                    frame.set_payload(pending[i].rx.payload(payload_len));
+                    // A connection is identified by its first frame and by
+                    // nothing else. `MSG_CREATE_WINDOW` promotes it to a
+                    // window; anything else is a one-shot request, answered
+                    // and closed — which is what a `services::connect` caller
+                    // like `window::clipboard_set` expects.
+                    //
+                    // One promotion per pass keeps `i` meaningful across the
+                    // `remove`; the rest are re-armed below and served next
+                    // pass.
+                    frame.conn = Some(pending.remove(i).conn);
+                    client_msgs.push(frame);
+                    break;
                 }
             }
         }
-        if !dead_fds.is_empty() {
-            windows.retain(|w| !dead_fds.contains(&w.fd.fd()));
-            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+
+        for i in 0..windows.len() {
+            if !ready_tokens.contains(&(windows[i].fd.fd().0 as u64)) {
+                continue;
+            }
+            let win = &mut windows[i];
+            let step = win.rx.pump(&win.fd);
+            match step {
+                RxStep::Idle => {}
+                RxStep::Eof => mark_dead(&mut dead, win.fd.fd(), win.pid, DropReason::Gone),
+                RxStep::Malformed => {
+                    mark_dead(&mut dead, win.fd.fd(), win.pid, DropReason::OutOfProtocol)
+                }
+                RxStep::Frame { msg_type, payload_len } => {
+                    let mut frame = ClientFrame::new(win.fd.fd(), win.pid, msg_type);
+                    frame.set_payload(win.rx.payload(payload_len));
+                    client_msgs.push(frame);
+                }
+            }
         }
 
-        for (client_fd, client_pid, header, new_conn) in client_msgs {
-            match header.msg_type {
+        for frame in client_msgs {
+            let client_fd = frame.fd;
+            let client_pid = frame.pid;
+            let new_conn = frame.conn;
+            let payload = &frame.payload[..frame.payload_len];
+            match frame.msg_type {
                 window::MSG_CREATE_WINDOW => {
                     // `new_conn` is dropped by `continue`, which closes the fd:
                     // there is no window to remove yet.
-                    let Ok(req) = ipc::recv_payload::<window::CreateWindowRequest>(client_fd, &header)
+                    let Ok(req) = ipc::decode_payload::<window::CreateWindowRequest>(payload)
                     else {
                         continue;
                     };
@@ -1509,7 +1851,7 @@ fn main() {
                              ({} live, max {max_windows}), reason {reason}",
                             windows.len()
                         );
-                        let _ = ipc::send(
+                        let _ = ipc::try_send(
                             client_fd,
                             window::MSG_WINDOW_REFUSED,
                             &window::WindowRefused { reason },
@@ -1566,15 +1908,15 @@ fn main() {
                         saved_h: 0,
                         presented: false,
                         cursor_style: window::CURSOR_DEFAULT,
-                        recv_buf: [0; 8],
-                        recv_len: 0,
+                        rx: ClientRx::new(),
                     });
 
                     // Register new client fd in io_uring (token = fd number)
                     poller.poll_add(&windows.last().unwrap().fd, IORING_POLL_IN, client_fd.0 as u64);
 
-                    let _ = ipc::send(
-                        client_fd,
+                    deliver(
+                        &mut dead,
+                        windows.last().unwrap(),
                         window::MSG_WINDOW_CREATED,
                         &window::WindowInfo {
                             token,
@@ -1599,25 +1941,19 @@ fn main() {
                     }
                 }
                 window::MSG_CLIPBOARD_SET => {
-                    let mut buf = [0u8; 116];
-                    let Ok(n) = ipc::recv_bytes(client_fd, &header, &mut buf) else {
-                        drop_out_of_protocol(&mut windows, client_fd, &mut dirty_rect, screen_w, screen_h);
-                        continue;
-                    };
-                    clipboard = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    clipboard = String::from_utf8_lossy(payload).into_owned();
                 }
                 window::MSG_CLIPBOARD_SET_SHM => {
-                    let Ok(info) = ipc::recv_payload::<window::ClipboardShmMsg>(client_fd, &header)
-                    else {
-                        drop_out_of_protocol(&mut windows, client_fd, &mut dirty_rect, screen_w, screen_h);
+                    let Ok(info) = ipc::decode_payload::<window::ClipboardShmMsg>(payload) else {
+                        mark_dead(&mut dead, client_fd, client_pid, DropReason::OutOfProtocol);
                         continue;
                     };
                     let shm = SharedMemory::map(info.token, info.len as usize);
                     clipboard = String::from_utf8_lossy(&shm.as_slice()[..info.len as usize]).into_owned();
                 }
                 window::MSG_SET_CURSOR => {
-                    let Ok(style) = ipc::recv_payload::<u32>(client_fd, &header) else {
-                        drop_out_of_protocol(&mut windows, client_fd, &mut dirty_rect, screen_w, screen_h);
+                    let Ok(style) = ipc::decode_payload::<u32>(payload) else {
+                        mark_dead(&mut dead, client_fd, client_pid, DropReason::OutOfProtocol);
                         continue;
                     };
                     if let Some(win) = windows.iter_mut().find(|w| w.fd.fd() == client_fd) {
@@ -1625,9 +1961,8 @@ fn main() {
                     }
                 }
                 window::MSG_SET_RESOLUTION => {
-                    let Ok(req) = ipc::recv_payload::<window::ResolutionRequest>(client_fd, &header)
-                    else {
-                        drop_out_of_protocol(&mut windows, client_fd, &mut dirty_rect, screen_w, screen_h);
+                    let Ok(req) = ipc::decode_payload::<window::ResolutionRequest>(payload) else {
+                        mark_dead(&mut dead, client_fd, client_pid, DropReason::OutOfProtocol);
                         continue;
                     };
                     let reply = match gpu::set_resolution(req.width, req.height) {
@@ -1667,9 +2002,9 @@ fn main() {
                             let pf = screen.pixel_format_raw();
                             for win in &mut windows {
                                 match win.mode {
-                                    WindowMode::Maximized => maximize_window(win, sw, sh, pf),
-                                    WindowMode::SnappedLeft => snap_left(win, sw, sh, pf),
-                                    WindowMode::SnappedRight => snap_right(win, sw, sh, pf),
+                                    WindowMode::Maximized => maximize_window(win, sw, sh, pf, &mut dead),
+                                    WindowMode::SnappedLeft => snap_left(win, sw, sh, pf, &mut dead),
+                                    WindowMode::SnappedRight => snap_right(win, sw, sh, pf, &mut dead),
                                     WindowMode::Normal => {
                                         let win_w = win.width + BORDER_WIDTH * 2;
                                         let win_h = win.height + BORDER_WIDTH * 2 + TITLE_BAR_HEIGHT;
@@ -1694,18 +2029,39 @@ fn main() {
                             window::ResolutionInfo { width: fb_info.width, height: fb_info.height }
                         }
                     };
-                    let _ = ipc::send(client_fd, window::MSG_RESOLUTION_CHANGED, &reply);
+                    if ipc::try_send(client_fd, window::MSG_RESOLUTION_CHANGED, &reply).is_err() {
+                        mark_dead(&mut dead, client_fd, client_pid, DropReason::NotReading);
+                    }
                 }
                 window::MSG_GET_RESOLUTION => {
                     let reply = window::ResolutionInfo {
                         width: fb_info.width,
                         height: fb_info.height,
                     };
-                    let _ = ipc::send(client_fd, window::MSG_RESOLUTION_CHANGED, &reply);
+                    // The one message a client can ask for faster than it can
+                    // read the answer: eight bytes in, sixteen out. Blocking
+                    // here is a client filling its own pipe and taking the
+                    // desktop with it.
+                    if ipc::try_send(client_fd, window::MSG_RESOLUTION_CHANGED, &reply).is_err() {
+                        mark_dead(&mut dead, client_fd, client_pid, DropReason::NotReading);
+                    }
                 }
                 _ => {}
             }
         }
+
+        for (_, pid, reason) in &dead {
+            eprintln!("compositor: dropping pid {pid} — {}", reason.why());
+        }
+        if !dead.is_empty() {
+            let before = windows.len();
+            windows.retain(|w| !dead.iter().any(|(fd, _, _)| *fd == w.fd.fd()));
+            pending.retain(|p| !dead.iter().any(|(fd, _, _)| *fd == p.conn.fd()));
+            if windows.len() != before {
+                mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+            }
+        }
+
         // Re-arm one-shot POLL_ADDs for fds that fired
         if kb_ready { poller.poll_add(&kb, IORING_POLL_IN, token_kb); }
         if mouse_ready { poller.poll_add(&mouse, IORING_POLL_IN, token_mouse); }
@@ -1715,6 +2071,19 @@ fn main() {
             if ready_tokens.contains(&token) {
                 poller.poll_add(&win.fd, IORING_POLL_IN, token);
             }
+        }
+        for p in pending.iter() {
+            let token = p.conn.fd().0 as u64;
+            if ready_tokens.contains(&token) {
+                poller.poll_add(&p.conn, IORING_POLL_IN, token);
+            }
+        }
+
+        // The clause that keeps one client from owning the loop: a peer with
+        // something to send on every pass keeps its fd ready forever, and a
+        // drain that only ends when nothing is ready would never composite.
+        if Instant::now() >= drain_until {
+            break;
         }
         } // end inner drain loop
 
@@ -1778,11 +2147,19 @@ fn main() {
                     .expect("compositor owns the framebuffer");
 
                 // Send frame callbacks to windows that presented and were composited
+                let mut frame_dead: Vec<Dead> = Vec::new();
                 for win in windows.iter_mut() {
                     if win.presented && !win.minimized && rect.overlaps(window_screen_rect(win)) {
-                        let _ = win.fd.signal(window::MSG_FRAME);
+                        deliver_signal(&mut frame_dead, win, window::MSG_FRAME);
                         win.presented = false;
                     }
+                }
+                for (_, pid, reason) in &frame_dead {
+                    eprintln!("compositor: dropping pid {pid} — {}", reason.why());
+                }
+                if !frame_dead.is_empty() {
+                    windows.retain(|w| !frame_dead.iter().any(|(fd, _, _)| *fd == w.fd.fd()));
+                    mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                 }
 
                 if composited_at >= next_frame_stats {
