@@ -1802,6 +1802,18 @@ static XHCI: Lock<Vec<XhciController>> = Lock::new(Vec::new());
 /// Thread context only. It takes `XHCI` and dispatches HID reports, which take
 /// the keyboard held-set and both event queues; an ISR calling this would spin
 /// on whichever of those the thread it interrupted holds.
+///
+/// **And `drain_irqs` is the only caller there should ever be.** This is not
+/// bookkeeping — it enumerates hot-plugged devices and recovers broken
+/// endpoints, and both spin on deadlines measured in seconds while holding
+/// `XHCI`, which is a ticket spinlock and therefore preemption off for its
+/// whole life. Called from a syscall, it makes that syscall's thread the
+/// driver's engine and stops the CPU rescheduling for as long as the bus takes.
+/// `fd::try_read` called it for `Descriptor::{Keyboard, Mouse}` so a read would
+/// see a report that had just landed; on the T14 that made the compositor's own
+/// mouse read the hot-plug engine and froze the desktop for seconds at a time,
+/// with a live kernel and nothing dropped. A caller that wants fresh input
+/// wants the scheduler pass that is already about to run, not this.
 pub fn poll_if_pending() {
     let interrupted = crate::irq_ring::take(crate::irq_ring::IrqSource::Xhci).is_some();
     if !interrupted {

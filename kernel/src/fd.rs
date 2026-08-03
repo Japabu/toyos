@@ -373,8 +373,22 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
         Descriptor::Socket { rx, .. } => {
             pipe::try_read(rx.id(), buf).map(|n| n as u64)
         }
+        // **A read of an input descriptor reads the queue and drives no
+        // hardware.** Both of these called `xhci::poll_if_pending()` first,
+        // which made whichever thread happened to read the mouse into the
+        // driver's enumeration and recovery engine: it takes `XHCI` — a ticket
+        // spinlock, so preemption off for its whole life — and inside it a
+        // hot-plug enumerates a device and a broken endpoint runs a recovery,
+        // each of which spins on deadlines measured in seconds. On the T14 that
+        // was the compositor's own mouse read, and the desktop froze for
+        // multi-second stretches with a live kernel and nothing dropped.
+        //
+        // Nothing is lost by removing it: `drain_irqs` calls the same function
+        // at the top of every scheduler pass, so a report is dispatched and its
+        // waiters woken before any thread that wants it is picked. What a
+        // reader gives up is at most one pass of latency; what it gains is that
+        // a read cannot become a bus operation.
         Descriptor::Keyboard => {
-            crate::drivers::xhci::poll_if_pending();
             let event_size = core::mem::size_of::<keyboard::RawKeyEvent>();
             let mut count = 0;
             while count + event_size <= buf.len() {
@@ -388,7 +402,6 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             if count > 0 { Some(count as u64) } else { None }
         }
         Descriptor::Mouse => {
-            crate::drivers::xhci::poll_if_pending();
             let event_size = core::mem::size_of::<mouse::MouseEvent>();
             let mut count = 0;
             while count + event_size <= buf.len() {
