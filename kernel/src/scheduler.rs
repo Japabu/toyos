@@ -476,28 +476,67 @@ pub fn flush_current_stats(acct: &mut process::ProcessAccounting) {
     driver::with_current_acct(|a| crate::sched::payload::merge_accounting(a, acct));
 }
 
+/// How often an idle CPU may say what it is holding, and how often the machine
+/// may say what it has allocated.
+///
+/// One number for both because they are one kind of thing: a periodic snapshot
+/// of occupancy, taken from the idle loop, by a machine whose only channel may
+/// be a log file on the stick it booted from. The occupancy of the run queues
+/// and the occupancy of the page pools are read together or not at all.
+const SNAPSHOT_INTERVAL_NS: u64 = 10_000_000_000;
+
+/// When each CPU may next print its own line. Per CPU rather than global: which
+/// CPUs reach idle is most of what the line says, and one global deadline would
+/// let whichever CPU won the race speak for all of them.
+static NEXT_HEALTH: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// A snapshot of this CPU's run queues, at most once per
+/// [`SNAPSHOT_INTERVAL_NS`], plus the machine's page pools on the same cadence.
+///
+/// Called from the idle loop on every trip, and the cadence is a wall clock
+/// because a trip is not a unit of time. It used to be one line per 1000 trips
+/// of a counter shared by every CPU, and a CPU that declines to sleep — the log
+/// ring owes bytes, an xHCI port is inside its debounce — goes round that loop
+/// at memory speed: measured on the USB profiles, bursts of one line every 3–4
+/// ms from each of two CPUs, about 320 lines a second, 292 of them in one run
+/// of the xHCI family. Worse than the volume is the feedback: every line is
+/// bytes the ring owes, and bytes the ring owes is one of the conditions that
+/// stops the CPU sleeping. The line was printing because the machine was awake
+/// and keeping it awake by printing.
+///
+/// The line is kept rather than deleted because `parked` is not readable
+/// anywhere else without a message round trip (`dump_blocked` reaches only the
+/// calling CPU, and only on a keystroke), and on the machine with no serial
+/// port an occasional occupancy line in `kernel.log` is the only account of the
+/// scheduler there is. What it must not be read as is a heartbeat: it comes
+/// from a CPU passing through idle, so a quiet machine prints nothing and a gap
+/// is not evidence.
 pub fn log_health() {
-    let ready = driver::ready_len() + usize::from(percpu::current_tid().is_some());
-    let parked = driver::parked_len();
-    crate::log!(
-        "sched: cpu={} ready={} parked={} current={:?}",
-        percpu::cpu_id(),
-        ready,
-        parked,
-        percpu::current_tid()
-    );
+    let now = crate::hw::now_ns();
+    let cpu = percpu::cpu_id();
+    let Some(next_health) = NEXT_HEALTH.get(cpu as usize) else { return };
+    if now >= next_health.load(Ordering::Relaxed) {
+        next_health.store(now + SNAPSHOT_INTERVAL_NS, Ordering::Relaxed);
+        let ready = driver::ready_len() + usize::from(percpu::current_tid().is_some());
+        let parked = driver::parked_len();
+        crate::log!(
+            "sched: cpu={} ready={} parked={} current={:?}",
+            cpu,
+            ready,
+            parked,
+            percpu::current_tid()
+        );
+    }
 
     static NEXT_PMM_DUMP: AtomicU64 = AtomicU64::new(0);
-    const PMM_DUMP_INTERVAL_NS: u64 = 10_000_000_000;
-    let now = crate::hw::now_ns();
     let next = NEXT_PMM_DUMP.load(Ordering::Relaxed);
     if next == 0 {
-        NEXT_PMM_DUMP.store(now + PMM_DUMP_INTERVAL_NS, Ordering::Relaxed);
+        NEXT_PMM_DUMP.store(now + SNAPSHOT_INTERVAL_NS, Ordering::Relaxed);
     } else if now >= next
         && NEXT_PMM_DUMP
             .compare_exchange(
                 next,
-                now + PMM_DUMP_INTERVAL_NS,
+                now + SNAPSHOT_INTERVAL_NS,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             )

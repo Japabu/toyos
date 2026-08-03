@@ -603,8 +603,6 @@ fn drain_irqs() {
     }
 }
 
-static IDLE_HEALTH_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
 /// Leave the current stack for this CPU's idle stack and never come back.
 /// Boot and AP bring-up enter the scheduler here.
 pub fn enter_idle_loop() -> ! {
@@ -626,9 +624,7 @@ pub fn enter_idle_loop() -> ! {
 
 extern "C" fn idle_loop() -> ! {
     loop {
-        if IDLE_HEALTH_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000 == 999 {
-            crate::scheduler::log_health();
-        }
+        crate::scheduler::log_health();
         crate::scheduler::reap_poisoned();
         drain_serial();
         // After the serial drain and before the pass, for the same reason that
