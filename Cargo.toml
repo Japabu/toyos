@@ -23,6 +23,15 @@ toyos-ld = { path = "toyos-ld" }
 [profile.release]
 opt-level = 2
 
+# The test harness is a compute-bound host program, not a debug build of the
+# thing under test: it decodes a 2.07 M-pixel screendump per poll and formats a
+# 300 MB disk image per boot. Nothing here is cross-compiled — the kernel,
+# bootloader and userland are separate cargo invocations with their own
+# profiles — so this reaches the harness, `toyos_build`, and their host deps and
+# nothing else. `debug` stays on (the dev default), so LLDB still works on it.
+[profile.dev]
+opt-level = 2
+
 [profile.dev.package.toyos-cc]
 opt-level = 3
 
