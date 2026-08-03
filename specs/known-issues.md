@@ -1271,37 +1271,73 @@ there is never a parked mouse reader to wake. Fixing the asymmetry by making
 Mouse block is what would give `MOUSE` a waiter; deleting the queues is what
 would make the current behaviour honest. Do not do neither.
 
-### `bcachefs::Fs::rename` destroys the file and reports success
+### CLOSED — `bcachefs::Fs::rename` destroyed the file and reported success
 
-`fs::rename` on `/home` deletes the file from **both** names and frees its blocks, and
-returns `Ok(())`. Measured in the guest at `647c3c0`, `/home` freshly formatted:
+Kept for the coverage lesson. `rename` inserted the entry under `new_name` and then called
+`delete_by_name(new_name)` to reclaim a destination that might already exist — deleting
+the entry it had just written and freeing its extents on the way out. `Ok(())`, both names
+`NotFound`, reachable as `mv /home/a /home/b` and from any `cp` onto `/home`.
 
-```
-PROBE before: a=Ok(6) b=Err(Kind(NotFound))
-PROBE rename -> Ok(())
-PROBE after:  a=Err(Kind(NotFound)) b=Err(Kind(NotFound))
-PROBE /home holds []
-```
+**Nothing in the suite covered a *successful* rename.** `fs_large_file` is the only test
+that called `fs::rename` and it asserts the failure direction — a 4096-byte name is
+refused — so a rename that reported success and lost the file was green everywhere, in a
+crate with 37 host integration tests and a machine suite that renames on two other mounts
+(`/tmp` and `/log`) and never on this one. A gate on
+the direction an operation is *supposed* to work in is not implied by gates on its
+refusals.
 
-`bcachefs/src/fs.rs:741` does four steps in this order: find the old entry, **insert** an
-entry keyed by `new_name`, `delete_by_name(new_name)`, delete the old key. Step 3 is meant
-to reclaim a destination that already existed, but step 2 has already put the renamed file
-under exactly that key — so step 3 deletes the entry step 2 just wrote, and
-`delete_by_name` frees its extents on the way out (`fs.rs:716`). The comment on step 2
-("crash-safe: duplicate better than loss") describes an ordering that would be right if
-step 3 captured the target *before* the insert; it does not.
+The ordering that replaced it: capture what `new_name` names **before** the insert, because
+on an equal key the insert *is* the removal of the destination — asking for the displaced
+file by name afterwards answers with the file that was just renamed. Source entry out
+last, blocks not freed, and nothing deleted when the two names share a key.
 
-The fix is to look the target up and free its blocks before inserting, or to delete it
-first and accept the crash window the comment is arguing against. Both are one function.
+### `bcachefs` operations that undo themselves: what the rename fix did not touch
 
-**Nothing in the suite covered a successful rename before this.** `fs_large_file` is the
-only test that calls `fs::rename` and it asserts the *failure* direction — a 4096-byte
-name is refused — so a rename that reports success and loses the file passed every gate.
-`toybox_file_tools` renames on `/tmp` only, with a comment saying why; when this is fixed,
-moving its `BIG_SRC`/`BIG_DST` to `/home` is the gate that would have caught it.
+Found auditing the neighbours of the rename defect above for the same
+act-before-you-know-what-you-are-acting-on shape. All in `bcachefs/src/fs.rs`. None is the
+same defect — rename freed the *wrong* file — but each is an ordering whose failure path
+costs a file or a volume.
 
-Reachable from userland as `mv /home/a /home/b`, and from `cp` onto `/home`, which renames
-its working file into place.
+**`Mounted::create` and `create_symlink` delete before they insert** (`fs.rs:610`, `:627`).
+`delete_by_name` frees the old file's blocks, and if `write_data` or `btree::insert` then
+fails the old file is gone and the new one never landed. This is exactly the shape
+`update_metadata`'s comment says it fixed on its own path. Reproduced on a 64-block volume:
+`create("keep.bin", 5 blocks)` then `create("keep.bin", 400 blocks)` returns
+`Err(NoSpace { requested: 340, available: 0 })` and leaves `read_file("keep.bin")` as
+`NotFound` with an empty volume. Kernel-side the blast radius is small — `BcacheFsAdapter`
+always calls `create(name, &[], mtime)`, so the only post-delete failure it can provoke is
+a `NoSpace` from a node split — but every host caller (the image builder) passes real data.
+
+**`write_data` leaks every block it allocated when a later `alloc_up_to` fails**
+(`fs.rs:687`, and the identical loop in `Formatted::write_data`, `:419`). The runs are marked
+used in the bitmap and dropped with the `Err`. Measured: after one failed
+`create(400 blocks)` on a 64-block volume, **0** further one-block files fit where an
+untouched volume of the same size takes **60**. `filesystem_full_returns_no_space` passes
+because it never asks whether the space came back.
+
+**`delete_by_name` deletes before it verifies** (`fs.rs:713`, `:726`). `btree::delete`
+removes the entry and *then* the decoded name is compared; a key collision — both 64-bit
+siphashes and the key type equal, so ~2^-128 — destroys an unrelated file, leaks its
+blocks and returns `false`, telling the caller nothing happened. The File branch also falls
+through to the Symlink branch after a non-matching delete, so one call can remove two
+entries. Not reachable in practice; the fix is one `find_by_name` first, which also deletes
+the duplicated branch.
+
+**`delete_prefix` frees the blocks before removing the entry, and swallows the delete's
+error** (`fs.rs:657` and `:660`). The dangerous direction: an entry that survives a failed
+`btree::delete` points at blocks the allocator will hand to the next file. `rename` now
+does the opposite — write first, free second — and this is its mirror image.
+
+**`update_metadata`'s pre-check does not cover every failure it orders around**
+(`fs.rs:823`). `check_entry_fits` rules out `EntryTooLarge` before the delete, but
+`btree::insert` also fails with `NoSpace` when a split needs a block, and that path deletes
+the entry and does not put it back.
+
+**Nothing here is fallible at the device.** `btree::insert`/`delete`, `Node::write` and
+`alloc.free_range` all reach `BlockIO::{read_block,write_block}`, which return `()` — so a
+rename whose bitmap or node write the device refuses still returns `Ok(())`, and under the
+kernel's `PageCacheBlockIO` a refused write is a log line and a dropped write. That is the
+`bcachefs::BlockIO` entry in §9, unchanged by any of this.
 
 ### An empty directory does not stat as a directory
 
