@@ -94,10 +94,15 @@ patterns to copy and one of them is a live wart:
   comparing header field `@20` against `(ret - 48) / 64` — which nothing
   documents and `ps` does not do. The ABI wrapper then swallows every error as
   `0`.
-- **`sys_query_modules` lies in its doc comment.** `toyos-abi/src/syscall.rs`
-  says it "Returns `Err(InvalidArgument)` with the required buffer size encoded";
-  the handler returns a bare `InvalidArgument` and the caller has no way to size
-  a retry. A doc comment is a claim to verify.
+- **CLOSED — `sys_query_modules` used to lie in its doc comment.** It said it
+  "Returns `Err(InvalidArgument)` with the required buffer size encoded";
+  `SyscallError` is a fixed set of codes and encodes nothing, so a caller had no
+  way to size a retry and no way to learn that was why it failed. It now answers
+  `sys_getcwd`'s contract — the return is the length in bytes either way, and
+  nothing is written unless all of it fits, which makes an empty buffer a size
+  query. A byte length and not a module count, for the reason stated below; the
+  records occupy `buf[..records[0].path_offset]`, which is where the count comes
+  from without a second number in the return. `query_modules_size` is the gate.
 - **`sys_process_stats` is a destructive read** of an exited direct child, once
   (known issues §5).
 

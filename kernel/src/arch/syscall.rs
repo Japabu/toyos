@@ -1298,8 +1298,8 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         return SyscallError::InvalidArgument.to_u64();
     }
     let aligned = crate::mm::align_2m(size as usize);
-    let fixed = flags.0 & MmapFlags::FIXED.0 != 0;
-    let writable = prot.0 & MmapProt::WRITE.0 != 0;
+    let fixed = flags.contains(MmapFlags::FIXED);
+    let writable = prot.contains(MmapProt::WRITE);
 
     // A fixed mapping bypasses `find_gap`, so it has to respect `find_gap`'s
     // range itself: `PageTables::remap` only asserts 2 MiB alignment, so a

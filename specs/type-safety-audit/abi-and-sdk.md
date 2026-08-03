@@ -364,7 +364,28 @@ Doc comment corrected.
 
 ---
 
-## F5 — `MmapProt` is an ABI type the kernel discards
+## F5 — CLOSED, Option A: `MmapProt` is now enforced
+
+**Resolved by implementing it.** `sys_mmap` takes `MmapProt`/`MmapFlags` rather
+than two `u64`s, `contains` exists on both (so the `// MmapFlags::FIXED` comment
+that stood in for the code is gone), and `prot` reaches the PDE: no `WRITE`
+means a read-only mapping, and `MmapProt::NONE` maps nothing at all — the range
+is reserved so nothing else lands in it, no physical memory is pinned behind a
+page whose purpose is to fault, and `process::handle_page_fault` refuses to fill
+a `RegionKind::Mapped` region so the reservation cannot be demand-paged back
+into existence.
+
+`mmap_prot` is the gate: three children, one per refused access (store to
+`PROT_NONE`, load from `PROT_NONE`, store to `PROT_READ`), each of which must
+die, against positive controls that `PROT_READ|PROT_WRITE` still reads back what
+it wrote and `PROT_READ` is readable. Negative-controlled: with `writable` forced
+true and the `NONE` arm disabled, the children print `SURVIVED`.
+
+The reasoning that chose Option A over deleting the type is below, unchanged.
+
+---
+
+## F5 (original) — `MmapProt` is an ABI type the kernel discards
 
 **Location.** `toyos-abi/src/syscall.rs:247-261` (`MmapProt`, 15 lines),
 `:262-276` (`MmapFlags`, 15 lines). Kernel:
