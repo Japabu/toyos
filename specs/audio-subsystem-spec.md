@@ -12,6 +12,7 @@
 - Glitch-free stream transitions via gain ramping on connect and disconnect
 - Client API through cpal
 - Hardware-agnostic: kernel driver abstraction supports VirtIO sound, HDA, USB audio, and future hardware
+- **Hardware absence is a routing state, not an error.** soundd always runs and always accepts streams. A machine with no audio device gets a *null sink* (§5.11): the mix loop clocked by a software timer instead of a device, draining every stream at its real rate and discarding the samples. A client's `build_stream` succeeds and its write/backpressure timing is identical whether or not hardware is present.
 
 ## 2. Architecture
 
@@ -327,6 +328,23 @@ The floor cannot be derived from worst-case wake lateness: the recorded worst ex
 - A mechanism for soundd to request real-time priority (e.g., a syscall or a capability flag)
 - Priority inheritance on pipe wait: when a RT thread signals a pipe, threads blocked on that pipe's read end are temporarily boosted
 
+### 5.11 No Audio Device: the Null Sink
+
+soundd claims the audio device at startup. When there is none (`AudioDev::open()` returns `NotFound`), it does **not** exit — exiting released the service name and left every client's `connect` failing `NotFound`, which crashed uncontrolled programs (cpal's `build_output_stream` surfaced it as `BackendSpecific`, and clients like `tone` panicked in `.expect`). Instead soundd presents a **null sink**.
+
+The null sink is the mix loop clocked by a monotonic software timer instead of a device (`null_sink_thread`, `userland/soundd/src/main.rs`). It reuses every per-client mechanism — `mix_client`, the gain ramps, crash detection, the command ring, the stats windows — and drops only what a device provides:
+
+- **Virtual output.** It presents a fixed configuration — 44100 Hz stereo i16, 128 frames/period, an 8-deep ring — matching the one config cpal's ToyOS backend advertises, so a stream negotiates identically to a real device.
+- **Real-rate drain.** One period is consumed per `period_nanos` of wall clock, off `clock_nanos()`. This is the whole point: the client's ring drains — and its writes backpressure — at exactly the audio rate. Not instant discard (a client that writes then waits for space would spin) and not blocked-forever (the client would stall). A client that writes N seconds of audio takes ~N seconds, host-measured (`audio::null_sink_real_rate`).
+- **No DMA pipeline.** So no DLL (the timer is exact), no completion records, no dither, no submit. After mixing one period the samples are discarded. A wake that overslept more than the ring depth re-anchors the grid rather than chasing a jumped clock (a loaded CPU, a host suspend) — the burst would be silence anyway.
+- **No RT band.** The null sink protects no audible output, and could not take the band regardless: `SYS_SET_RT_PRIORITY` is gated on the audio claim there is no device to hold. Client scheduling on an idle machine needs no boost; under contention the discard just jitters, and a discard has nothing to glitch.
+- **Idle discipline (§5.8).** With no streams the null sink holds no timer and takes no wakes, blocking on the command pipe alone — an audience of zero costs exactly zero CPU.
+- **Not silent about being silenced.** It reports each discarded stream in the same stats windows a real sink emits (`soundd: wakes=… submitted=… clients=…`), which the audio-status tool (#106) reads.
+
+When real hardware is present the device path is unchanged; the null sink is the no-device route, not the device route. An HDA or USB-audio sink (#88) attaches to this same server as a real sink — the null sink is what it replaces when a device exists.
+
+**The routing-state pattern is specific to a discardable output.** Audio is null-routable because a sink can be virtual: a client cannot tell whether its samples are heard, so discarding them is a valid route. A resource whose absence is observable to a peer is *not* — a network bind (netd, sshd/#104) has no null route, because there is no honest way to answer a remote peer with a socket that goes nowhere. Those daemons correctly exit when their device is absent; the lesson is the same (absence is not a panic), the resource is different (it cannot be faked).
+
 ## 6. cpal
 
 cpal is the client-side audio library. Applications link against cpal and provide an audio callback. The ToyOS backend adapts the server-pull protocol to cpal's callback interface.
@@ -479,6 +497,7 @@ Equivalent systems: Linux `PTHREAD_PRIO_INHERIT` on mutexes, Linux PI-futexes, D
 | soundd scheduling jitter | DLL timer + pipeline depth absorbs jitter | Automatic |
 | All DMA buffers drain | soundd resets the DLL and refills from the client rings; silence only for periods no client covers | Audio resumes the same cycle |
 | No clients connected | soundd drains the pipeline and stops the PCM stream (§5.8) — submitting silence is not an option | Zero overhead, zero wakes, device voice closed |
+| No audio device present | soundd presents a null sink (§5.11) rather than exiting: streams are accepted and drained at real rate, then discarded | Clients play to completion, exit 0; zero overhead when idle |
 | Hardware error | Driver reports error to soundd | soundd logs and attempts re-init |
 | Client connects | Gain ramps from 0 to target | No click or pop |
 | Client disconnects | Gain ramps to 0 before removal | No click or pop |

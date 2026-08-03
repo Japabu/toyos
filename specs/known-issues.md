@@ -951,7 +951,7 @@ non-consuming history for the console; or accept it and say so in the design.
 **Measured under metal-sim (M1), and worse than "no scrollback".** With
 `--metal-sim --mute` and no virtio-console the guest has no output channel at
 all once the last boot checkpoint has painted: the failure screen ends at
-`Boot: complete`, and soundd's and netd's exit lines — printed seconds later,
+`Boot: complete`, and soundd's null-sink line and netd's exit line — printed seconds later,
 and read directly off the console by `metal_sim_compositor` on the same machine
 shape with the 16550 on — reach no pixel and no file. A running ToyOS on the
 T14 is mute between `Boot: complete` and the moment the compositor's terminal
