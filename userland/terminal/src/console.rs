@@ -153,6 +153,11 @@ pub struct Console {
     /// Where a damaged span is composed before it is handed over. One text row
     /// wide and tall, or the scrollbar's column, whichever needs more.
     strip: Vec<u8>,
+    /// Whether the strip below the last cell row has been painted. A panel is
+    /// not obliged to be a whole number of glyph rows tall — 1080 is not, and
+    /// 2048 is, which is why every screen test was blind to this — and no cell
+    /// covers what is left over.
+    margin_painted: bool,
 }
 
 impl Console {
@@ -190,6 +195,7 @@ impl Console {
             scrollback: VecDeque::new(),
             view_offset: 0,
             strip,
+            margin_painted: false,
         };
 
         console.flush();
@@ -281,6 +287,24 @@ impl Console {
             }
             self.painted_scrollbar = bar;
         }
+
+        if !self.margin_painted {
+            let covered = self.rows * fh;
+            let margin = self.screen.height() - covered;
+            if margin > 0 {
+                let width = self.screen.width();
+                let surface = Framebuffer::new(
+                    strip.as_mut_ptr(),
+                    width,
+                    margin,
+                    width,
+                    self.screen.pixel_format_raw(),
+                );
+                surface.fill_rect(0, 0, width, margin, DEFAULT_BG);
+                self.screen.blit(0, covered, width, margin, width, &strip);
+            }
+            self.margin_painted = true;
+        }
         self.strip = strip;
     }
 
@@ -364,6 +388,26 @@ impl Console {
         self.wrapped.fill(false);
         self.cursor_col = 0;
         self.cursor_row = 0;
+        self.forget_panel();
+    }
+
+    /// Drop every claim about what is on the panel, so the next flush paints
+    /// all of it.
+    ///
+    /// `ESC[2J` says the panel is blank afterwards. That is not the same
+    /// promise as "reach the state I believe is blank", and the difference is
+    /// the whole of what a damage cache trades away: a cell the cache already
+    /// records as blank is not repainted, so anything on the glass the cache
+    /// cannot account for survives. Two kinds can be there — the strip below
+    /// the last cell row on a panel whose height is not a whole number of
+    /// them, and a paint from outside this process — and a user who has one
+    /// reaches for exactly this command. It is the only sequence in the
+    /// emulator that means "distrust what you think is up there", so it is the
+    /// only one that spends a full repaint on saying so.
+    fn forget_panel(&mut self) {
+        self.painted.fill(None);
+        self.painted_scrollbar = None;
+        self.margin_painted = false;
     }
 
     fn emit_char(&mut self, ch: char) {
@@ -685,6 +729,7 @@ impl Console {
         self.wrapped = new_wrapped;
         self.painted = vec![None; new_cols * new_rows];
         self.painted_scrollbar = None;
+        self.margin_painted = false;
         self.cursor_row = new_cursor_row.min(new_rows.saturating_sub(1));
         self.cursor_col = new_cursor_col.min(new_cols.saturating_sub(1));
         self.saved_screen = None;
