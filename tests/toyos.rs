@@ -1439,20 +1439,43 @@ fn run_screen_test(
                 let mut input = qemu::QmpInput::open(qemu.qmp_socket());
                 input.type_text("test_rs_test_screen_graffiti\n");
             }
+            // Settle on the strip below the last cell row rather than on the
+            // whole panel: the console goes on drawing -- the command echoes,
+            // the shell reprints its prompt -- so most of the glass is being
+            // repainted while this waits, and only the strip no cell covers
+            // holds still.
+            let margin = |d: &screen::Ppm| d.height % screen::GLYPH_H;
+            let margin_is = |d: &screen::Ppm, c: [u8; 3]| {
+                let m = margin(d);
+                m > 0
+                    && d.pixels[(d.height - m) * d.width..].iter().all(|p| *p == c)
+            };
             let painted_over = qemu.screendump_while(
                 Duration::from_secs(30),
                 Duration::from_millis(200),
-                |d| d.pixels.iter().all(|p| *p == GRAFFITI),
+                |d| margin_is(d, GRAFFITI),
             );
-            // Non-vacuity, and the reason this test can fail at all: if the
-            // kernel did not actually reach the panel, everything below would
-            // pass on a screen that was already blank.
-            let stray = painted_over.pixels.iter().filter(|p| **p == GRAFFITI).count();
-            if stray != painted_over.pixels.len() {
+            // Non-vacuity, in the two places it can be lost. A panel that is a
+            // whole number of glyph rows tall has no strip at all, and would
+            // make half of what follows assert nothing -- 2048x2048, the
+            // default this profile used to boot, is exactly that panel.
+            if margin(&painted_over) == 0 {
                 return Err(format!(
-                    "the graffiti actuator did not take the whole panel: {stray} of {} pixels \
-                     are {GRAFFITI:?}, so there is nothing here for `clear` to fail to remove",
-                    painted_over.pixels.len()
+                    "this panel is {}x{}, a whole number of {}px glyph rows, so the strip this \
+                     test is half about does not exist here",
+                    painted_over.width, painted_over.height, screen::GLYPH_H
+                ));
+            }
+            // And if the kernel never reached the glass there is nothing for
+            // `clear` to fail to remove.
+            let green = painted_over.pixels.iter().filter(|p| **p == GRAFFITI).count();
+            if !margin_is(&painted_over, GRAFFITI) || green * 2 < painted_over.pixels.len() {
+                return Err(format!(
+                    "the graffiti actuator did not reach the panel: {green} of {} pixels are \
+                     {GRAFFITI:?} and the {}px strip below the cells is {}",
+                    painted_over.pixels.len(),
+                    margin(&painted_over),
+                    if margin_is(&painted_over, GRAFFITI) { "green" } else { "not" }
                 ));
             }
 
@@ -1478,6 +1501,27 @@ fn run_screen_test(
             );
             let after = dump.console_text(&font);
             print_screen(name, &after);
+
+            // The pixel assertion first, because it is the specific one: a
+            // screen still covered in paint fails the prompt check too, and
+            // that message would send the next reader after the shell.
+            if let Some(i) = dump.pixels.iter().position(|p| *p == GRAFFITI) {
+                let (x, y) = (i % dump.width, i / dump.width);
+                let m = dump.height % screen::GLYPH_H;
+                let where_ = if y >= dump.height - m {
+                    format!("the {m}px strip below the last cell row, which no cell covers")
+                } else {
+                    format!("cell ({}, {})", x / screen::GLYPH_W, y / screen::GLYPH_H)
+                };
+                let left = dump.pixels.iter().filter(|p| **p == GRAFFITI).count();
+                return Err(format!(
+                    "{left} pixels survived `clear`, the first at ({x}, {y}) — {where_}.\n\
+                     ESC[2J promises a blank panel; a repaint that skips every cell whose \
+                     contents already matched what it believed was there does not deliver one, \
+                     and the cells it skips are exactly the ones a user cannot fix any other \
+                     way\ndecoded screen:\n{after}"
+                ));
+            }
 
             let rows = dump.console_rows(&font);
             if !rows.first().is_some_and(|r| r.trim() == CONSOLE_PROMPT) {
@@ -1507,26 +1551,14 @@ fn run_screen_test(
             // last boot checkpoint, stays for the life of the session. Black
             // on black hides it on the machine that found this; a fill that is
             // not black does not.
-            let fh = screen::GLYPH_H;
-            let margin = dump.height % fh;
             eprintln!(
-                "  [clear] {}x{}: {} cell rows and a {margin}px strip below them, all of it \
-                 repainted",
-                dump.width, dump.height, dump.height / fh
+                "  [clear] {}x{}: {} cell rows and a {}px strip below them, none of it left \
+                 painted",
+                dump.width,
+                dump.height,
+                dump.height / screen::GLYPH_H,
+                dump.height % screen::GLYPH_H
             );
-            if let Some(i) = dump.pixels.iter().position(|p| *p == GRAFFITI) {
-                let (x, y) = (i % dump.width, i / dump.width);
-                let where_ = if y >= dump.height - margin {
-                    format!("the {margin}px strip below the last cell row, which no cell covers")
-                } else {
-                    format!("cell ({}, {})", x / screen::GLYPH_W, y / fh)
-                };
-                return Err(format!(
-                    "`clear` left the paint at pixel ({x}, {y}) — {where_}. The panel is not \
-                     blank after ESC[2J, so `clear` promises what it does not do\n\
-                     decoded screen:\n{after}"
-                ));
-            }
             Ok(())
         }
         "screen_console_panic" => {
