@@ -1170,9 +1170,36 @@ impl XhciController {
         // and a device let go there would move every index after its own.
         let mut dev = self.devices.remove(at);
         dev.broke_with = None;
-        dev.failures += 1;
         let kind = dev.kind();
         let ep_addr = dev.ep_addr;
+
+        // **When the disconnect and the transfer error race, the disconnect
+        // wins.** A transfer outstanding on an endpoint whose device is pulled
+        // completes with a transaction error, and that code is the same one a
+        // device with a bad cable gives — the completion cannot tell them
+        // apart, and the port register is the only thing that can. Everything
+        // below is aimed at a device that is still on the bus: it spends a
+        // failure out of the budget, issues Reset Endpoint and a
+        // CLEAR_FEATURE(HALT) control transfer that costs the transfer deadline
+        // to fail, and then tells a human to unplug something they are already
+        // holding in their hand. The T14 did all of that four times over, once
+        // per ordinary unplug.
+        //
+        // CSC as well as CCS, for the reason `service_port` reads it: a device
+        // replugged between two looks reads connected again, and the transfer
+        // that died still died with the old one. Read and not cleared —
+        // acknowledging it is `service_port`'s job, and clearing it here would
+        // steal the evidence that runs the teardown.
+        let portsc = self.read_portsc(dev.port_idx);
+        if portsc & PORTSC_CCS == 0 || portsc & PORTSC_CSC != 0 {
+            log!("xHCI: USB {kind} on slot {slot_id}: interrupt endpoint {ep_addr:#04x} \
+                 completed with {} as its port went away; leaving it to the disconnect",
+                Completion(code));
+            self.devices.push(dev);
+            return;
+        }
+
+        dev.failures += 1;
         log!("xHCI: USB {kind} on slot {slot_id}: interrupt endpoint {ep_addr:#04x} (dci {}) \
              completed with {}; failure {} of {MAX_HID_FAILURES}",
             dev.int_ep_dci, Completion(code), dev.failures);
@@ -1300,17 +1327,29 @@ impl XhciController {
 
     /// Clear whatever change flags one port is holding, so the next change is
     /// one the controller can report. See [`PORTSC_CHANGES`].
-    fn acknowledge_port_change(&mut self, port_idx: u8) {
-        let portsc = self.read_portsc(port_idx);
+    /// Takes the value the caller has already read, rather than reading its
+    /// own: a flag raised between the two reads would be cleared without ever
+    /// having been looked at, and [`Self::service_port`] decides what a port
+    /// means from exactly the word it clears. Only the bits that were set in
+    /// `portsc` are written back, so one raised in between survives to the next
+    /// pass — which is what RW1C is for.
+    fn acknowledge_port_change(&mut self, port_idx: u8, portsc: u32) {
         if portsc & PORTSC_CHANGES != 0 {
             self.write_portsc(port_idx, portsc_neutral(portsc) | (portsc & PORTSC_CHANGES));
         }
     }
 
+    /// Read a port and clear whatever change flags it is holding, for the
+    /// callers that have no reason to look at them.
+    fn acknowledge_port_read(&mut self, port_idx: u8) {
+        let portsc = self.read_portsc(port_idx);
+        self.acknowledge_port_change(port_idx, portsc);
+    }
+
     /// The same for every port this controller has.
     fn acknowledge_port_changes(&mut self) {
         for p in 0..self.max_ports {
-            self.acknowledge_port_change(p);
+            self.acknowledge_port_read(p);
         }
     }
 
@@ -1344,6 +1383,20 @@ impl XhciController {
     fn service_port(&mut self, port_idx: u8, now: u64) -> Option<u64> {
         let portsc = self.read_portsc(port_idx);
         let connected = portsc & PORTSC_CCS != 0;
+        // **CCS is a level and CSC is the edge, and only the edge can report a
+        // gap.** xHCI 1.2 §5.4.8 sets CSC on a '0'→'1' *or* '1'→'0' transition
+        // of CCS, so a port that reads connected with CSC set has been
+        // disconnected and reconnected since the flag was last cleared — a
+        // device pulled and pushed back inside one look, which is what a person
+        // replugging a mouse does and what the driver could not see.
+        //
+        // The evidence exists only because clearing these flags happens at one
+        // place: every clear is a known point in this function, so a set flag
+        // observed here is a change since the last one and never a leftover.
+        // It used to be read and thrown away in the same breath — this function
+        // re-read PORTSC inside the acknowledge and then compared nothing but
+        // CCS against what the driver believed.
+        let replugged = portsc & PORTSC_CSC != 0;
         let port = self.ports[port_idx as usize];
 
         // Before any change flag is cleared, because PRC is the one this state
@@ -1357,7 +1410,7 @@ impl XhciController {
                 // any flag left set on a port that is now quiet: the next thing
                 // to happen here is the device being pulled, and a CSC that is
                 // already '1' is a disconnect the controller cannot report.
-                self.acknowledge_port_change(port_idx);
+                self.acknowledge_port_read(port_idx);
                 return None;
             }
             if now < until {
@@ -1374,7 +1427,29 @@ impl XhciController {
             return None;
         }
 
-        self.acknowledge_port_change(port_idx);
+        self.acknowledge_port_change(port_idx, portsc);
+
+        // **The reap that makes the invisible case an ordinary one.** The port
+        // reads connected and the driver already believed it was, so nothing
+        // below would act — but CSC says it stopped being connected in
+        // between, and whatever is in the port now, the device that was here is
+        // gone. It goes through the ordinary teardown, which is what makes this
+        // one path and not a second: input sources, slot and pool block come
+        // back exactly as they do for an unplug the driver *did* see.
+        //
+        // Here rather than further down because the evidence expires: the
+        // acknowledge above cleared CSC, so a later pass has nothing left to
+        // read. Tearing down now sets `attached` false, which turns the rest of
+        // this function's ordinary "connected and not attached" path into the
+        // fresh-connect it already knows how to run.
+        if connected && replugged && self.ports[port_idx as usize].attached {
+            log!("xHCI: port {} was unplugged and plugged back in between two looks; \
+                 tearing the old device down before enumerating what is there now",
+                port_idx + 1);
+            self.teardown_port(port_idx);
+        }
+
+        let port = self.ports[port_idx as usize];
         let held = match port.work {
             // A change the driver has not seen before. The debounce is measured
             // from here rather than from the event, because the event says a
