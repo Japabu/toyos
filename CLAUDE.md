@@ -187,8 +187,10 @@ Read the spec before touching the subsystem it covers.
 - `specs/iommu-spec.md` + `specs/userspace-drivers-spec.md` — `kernel/src/iommu/`, and the userspace drivers it exists to make safe. **Stages I0–I1 done**: every QEMU profile now boots with `-device intel-iommu` on a split irqchip, and discovery is read-only — nothing is programmed and no machine is refused. §8.1 records what the unit actually answers, which contradicts the file in four places.
 - `specs/capability-handles-spec.md` — refcounted kernel objects behind typed per-process handles (Fd→Handle). Subsumes the `SharedToken`/io_uring/`Fd` debt.
 - `specs/iouring-blocking-spec.md` — io_uring as the only blocking mechanism; one wait-free completion primitive, one park/recheck site.
-- `specs/metal-boot-plan.md` — first boot on the ThinkPad T14 Gen 2. M0–M2 built; the flash-trigger condition is met.
-- `specs/net-gate-plan.md` — gate N, the network analogue of gate A. Scheduled after the first bare-metal attempt.
+- `specs/metal-boot-plan.md` — first boot on the ThinkPad T14 Gen 2: achieved. `specs/metal-hardware-inventory.md` records the machine; the task list carries what is next.
+- `specs/net-gate-plan.md` — gate N, the network analogue of gate A. Its metal arm waits on a NIC: the I219 comes after doom and WLAN's early stages, by the owner's ordering.
+- `specs/wlan-plan.md` — WLAN on the T14's AX210, all scope questions settled: Intel's declarative headers as a tracked C fork, the imperative 75k lines transliterated to Rust, our 802.11/WPA stack, stages W0–W10. Implementation waits behind the doom milestone.
+- `specs/introspection-plan.md` — the read surface (`SYS_QUERY`/`SYS_LOG_READ`), daemon status protocol, toybox diag tools, and disk adopt-by-witness. W7 (format capability) is gated on the owner's review of its §4.
 - `specs/device-test-strategy.md` — ground truth at the hardware boundary, the harness as actuator, device *shape and lifecycle* before protocol depth.
 - `specs/metal-track-history.md` — ~70 defects confirmed in code whose own suites were green. **Teeth are necessary and not sufficient: mutating your implementation tests the paths you wrote, never the states you did not think to construct.** Attack the state space separately — an empty file, a cyclic chain, a crafted entry.
 - `specs/type-safety-audit/` — where each area sits on the unrepresentable > checked > tested ladder, and what a proposed type would delete.
