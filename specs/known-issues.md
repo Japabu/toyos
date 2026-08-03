@@ -2725,6 +2725,11 @@ squarely in the `started ≤ 100 ms` budget above. Both arms fail, so the gate's
 arithmetic is still the finding; what I2 removes is the last 4 ms of the margin
 that used to make an isolated re-run look like a fix.
 
+Bounding that, so it is not read as "permanently red now": with I2 in, on a quiet
+host, it **passes** — a 233/233 full run at `da3d333` has it green in 10 s. The
+6 ms is spent either way and the gate still turns on how loaded the machine is,
+which is the entry's own point. What I2 changes is only how much load it takes.
+
 ### `git stash` in a shared tree takes everyone's uncommitted work
 
 Observed, not theorised: `stash@{0}: On main: compositor-stats-wip` appeared
