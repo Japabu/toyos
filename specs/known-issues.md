@@ -2225,6 +2225,19 @@ already describes and nothing yet hands out slots. Until then a landing that
 goes red on a boot timeout is re-run — the isolated re-run is the evidence,
 exactly as CLAUDE.md's re-run-in-isolation rule says.
 
+**Second instance, 2026-08-04, and it is not a boot timeout — which widens what
+this costs.** `late_storage_connect` failed a landing gate at 20 s with "the
+boot scan bound a disk, so the port was not held empty and this gate is
+measuring an ordinary boot", in a run where 238 of 240 passed in 693 s; alone it
+passes in 5 s. That test stages its disk from the *host* at a moment chosen
+relative to the guest's boot, so contention does not merely slow it — it moves
+the guest past the window and the staging lands in the wrong place. The test
+caught that itself and refused rather than measuring an ordinary boot, which is
+the only reason it reads as a red instead of a vacuous green. **A host-staged
+timing window is the shape to look for when triaging a landing red, alongside
+the boot timeout**, and `Sched::Serial` does not protect it: serial is one guest
+per *test process*, and the contention is between processes.
+
 ### rustup narrates its cargo fallback on every invocation
 
 `info: cargo is unavailable for the active toolchain` followed by `info:

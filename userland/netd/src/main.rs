@@ -36,9 +36,9 @@ impl DmaNic {
     /// `NotFound` when the machine has no NIC — metal-sim has none, and
     /// neither does the target laptop until its own driver exists. Every other
     /// error is a conflict or a resource failure and belongs to the caller, so
-    /// the kind is propagated rather than flattened: `services::listen` is not
-    /// the whole "already running" check, since it releases the name and the
-    /// NIC claim under different locks.
+    /// the kind is propagated rather than flattened: this is what `main` decides
+    /// between exiting quietly and refusing loudly, and it runs *before*
+    /// `services::listen`, so it is also the whole "already running" check.
     fn open() -> Result<Self, toyos_nic::SyscallError> {
         let nic_dev = NicDev::open()?;
         let info = nic_dev.info().expect("netd: failed to read NicInfo");
@@ -1176,8 +1176,24 @@ impl NetDaemon {
 }
 
 fn main() {
-    let listener = services::listen("netd").expect("netd already running");
-
+    // **The device first, and the name only once it is held.** This used to be
+    // the other way round, and the window between the two was real: a client
+    // that connected while netd was still in `DmaNic::open` reached a listener
+    // belonging to a process about to return, and got its request answered by
+    // nobody. sshd is the client that found it — its bind saw a netd that
+    // existed and then died mid-request rather than one that was never there,
+    // so it took its `panic!` arm and put a tokio backtrace across the boot
+    // instead of its one-line refusal. Which arm it took depended on winning a
+    // race with netd's own exit, which is why it survived two green runs.
+    //
+    // Publishing a name is a promise to serve it. Nothing else in this daemon
+    // can be relied on to keep that promise, because the failure is in the gap
+    // before any of it runs.
+    //
+    // The claim is also the better mutual exclusion. `SYS_OPEN_DEVICE` is
+    // first-come, so exactly one netd can hold the NIC, where the name is
+    // merely the first to ask for it — and a second instance now fails naming
+    // the thing it actually lost.
     let mut device = match DmaNic::open() {
         Ok(d) => d,
         Err(toyos_nic::SyscallError::NotFound) => {
@@ -1186,6 +1202,7 @@ fn main() {
         }
         Err(e) => panic!("netd: cannot claim the NIC: {e}"),
     };
+    let listener = services::listen("netd").expect("netd already running");
     let mac = device.mac;
 
     eprintln!(
