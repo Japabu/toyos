@@ -20,6 +20,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+use super::qemu::{self, BootOptions, QemuInstance};
 
 /// Largest magnitude a *silent* mix can reach on the wire, in LSB.
 ///
@@ -653,4 +656,124 @@ fn silent_runs(mono: &[i32], min_len: usize) -> Vec<SilentRun> {
         }
     }
     runs
+}
+
+/// Gate: on a machine with **no audio hardware** (`Profile::Metal`, the T14's
+/// shape and the one the `tone` panic reproduced on), an audio-producing client
+/// runs to completion — exit 0, no panic — and does so at the real audio rate,
+/// neither instantly nor stalled.
+///
+/// This is the whole point of the null sink: hardware absence is a routing
+/// state. Before it, soundd exited on a device-less machine and released its
+/// service name, so cpal's `build_output_stream` failed `NotFound` and `tone`
+/// panicked in `.expect("failed to build audio stream")`. That pre-null tree is
+/// the negative control — reverting soundd's null-sink path reds this test with
+/// the tone panic.
+///
+/// Three host-side assertions, and there is no wav here (this machine has no
+/// device to capture from), so ground truth is the client's exit, the host wall
+/// clock around it, and soundd's own counters:
+///
+/// 1. **No crash.** The client exits 0.
+/// 2. **Real rate.** A 3 s tone takes ~3 s of wall clock. Instant discard would
+///    finish in a fraction of a second (the client fills its ring and races to
+///    the end); a stalled sink would time the run out. soundd's `submitted`
+///    counter — periods it drained — is the in-guest cross-check: ~3 s / 2.9 ms
+///    ≈ 1034.
+/// 3. **Not silent about being silenced.** soundd reports the discarded stream
+///    in its stats windows (clients ≥ 1), the same accounting a real sink emits
+///    and what #106's status tool will read.
+pub fn null_sink_real_rate(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: qemu::Profile::Metal,
+            ..Default::default()
+        },
+    );
+
+    // soundd must present the null sink rather than exit. It starts before the
+    // first test, so the line is in the boot log; drain a little more in case it
+    // races the ready marker.
+    const NULL_LINE: &str = "soundd: no audio device, presenting a null sink";
+    let mut early = qemu.boot_log().to_string();
+    if !early.contains(NULL_LINE) {
+        early.push_str(&qemu.drain_serial(Duration::from_millis(500)));
+    }
+    if !early.contains(NULL_LINE) {
+        return Err(format!(
+            "soundd did not present a null sink on a device-less machine:\n{early}"
+        ));
+    }
+
+    // The tone is DURATION_SECS = 3.0 s of samples (tests/toyos-rust-tests/
+    // src/tone.rs). At the real audio rate it cannot finish before then.
+    let start = Instant::now();
+    let result = qemu.run_test("test_rs_audio_tone", Duration::from_secs(30));
+    let elapsed = start.elapsed().as_secs_f64();
+
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    match result.exit_code {
+        Some(0) => {}
+        Some(code) => {
+            return Err(format!(
+                "tone exited {code} on a device-less machine (a no-device machine must \
+                 still play to completion):\n{}",
+                result.stdout
+            ))
+        }
+        None => return Err(format!("tone produced no exit code:\n{}", result.stdout)),
+    }
+
+    // Real rate, host-measured. The 3 s tone plus its ~0.2 s drain tail and a
+    // little spawn overhead lands near 3.3 s; the bounds catch the two failure
+    // shapes the null sink exists to avoid — instant discard below, a sink
+    // draining slower than the audio rate above.
+    const MIN_SECS: f64 = 2.5;
+    const MAX_SECS: f64 = 8.0;
+    if !(MIN_SECS..=MAX_SECS).contains(&elapsed) {
+        return Err(format!(
+            "null sink drained a 3 s tone in {elapsed:.2} s (expected {MIN_SECS}..={MAX_SECS} s): \
+             a client that writes N seconds of audio must take ~N seconds\nstdout:\n{}",
+            result.stdout
+        ));
+    }
+
+    // soundd's own accounting of the discarded stream: a real-rate cross-check
+    // and the proof it is not silent about the silencing. The final window
+    // races the client's exit, so collect a little more serial first.
+    let serial = result.serial.clone() + &qemu.drain_serial(Duration::from_millis(500));
+    let counters = parse_soundd_counters(&serial)?;
+    if counters.windows == 0 {
+        return Err(format!(
+            "soundd reported no stats window with a client — the tone never reached the null sink:\n{serial}"
+        ));
+    }
+    // ~3 s / 2.902 ms ≈ 1034 periods, plus the disconnect ramp. Wide enough to
+    // absorb the window boundaries, tight enough that instant discard (a handful
+    // of periods) or a half-rate drain (~520) both fail.
+    const MIN_SUBMITTED: u32 = 700;
+    const MAX_SUBMITTED: u32 = 1500;
+    if !(MIN_SUBMITTED..=MAX_SUBMITTED).contains(&counters.submitted) {
+        return Err(format!(
+            "null sink submitted {} periods for a 3 s tone (expected {MIN_SUBMITTED}..={MAX_SUBMITTED}): \
+             the drain rate is not the audio rate\nstdout:\n{}",
+            counters.submitted, result.stdout
+        ));
+    }
+
+    eprintln!(
+        "  [metal-sim] null sink drained a 3 s tone in {elapsed:.2} s, {} periods, \
+         {} stats window(s) — real rate, no device",
+        counters.submitted, counters.windows
+    );
+    Ok(())
 }

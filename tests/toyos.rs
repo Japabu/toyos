@@ -121,6 +121,7 @@ const MACHINE_TESTS: &[&str] = &[
     "metal_sim_ipc_hostile_peer",
     "metal_sim_compositor_stall",
     "metal_sim_pointer_churn",
+    "metal_sim_null_audio",
     "netd_connection_caps",
     "foreign_disk_untouched",
     "boot_partition_identity",
@@ -2389,10 +2390,12 @@ fn metal_sim_argv_check(argv: &[String]) -> Result<(), String> {
 
 /// Which processes survive the T14's device shape, in their own words.
 ///
-/// The compositor claims a firmware framebuffer and says what it got, soundd
-/// and netd find no device and exit rather than panic. The earlier version
-/// read the bottom pixel row instead, which says nothing about soundd or netd
-/// and stayed green with their graceful exit reverted.
+/// The compositor claims a firmware framebuffer and says what it got; netd finds
+/// no NIC and exits rather than panic; soundd finds no audio device and stays up
+/// on a null sink rather than exiting (hardware absence is a routing state — a
+/// no-device machine still serves audio clients, discarding what they play). The
+/// earlier version read the bottom pixel row instead, which says nothing about
+/// soundd or netd and stayed green with their graceful behavior reverted.
 ///
 /// First in its group, and that is the assertion talking: `cursor == frames`
 /// and the stats line are read off a desktop no client has connected to yet.
@@ -2402,7 +2405,7 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
     // every line has been said or the window closes.
     const WANT: [&str; 3] = [
         "compositor: ready",
-        "soundd: no audio device on this machine, exiting",
+        "soundd: no audio device, presenting a null sink",
         "netd: no NIC on this machine, exiting",
     ];
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -2484,13 +2487,13 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
              {stats}"
         ));
     }
-    // And nothing panicked on the way. A daemon that dies on its
+    // And nothing panicked on the way. A daemon mishandling its
     // absent device fails the positive check above; this catches the
     // rest of the boot dying instead.
     serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
     eprintln!("  [metal-sim] compositor up on {}", mode.trim());
     eprintln!("  [metal-sim] {}", stats.trim());
-    eprintln!("  [metal-sim] soundd and netd both exited on their absent device");
+    eprintln!("  [metal-sim] soundd on a null sink, netd exited — both handled their absent device");
     Ok(())
 }
 
@@ -3055,6 +3058,8 @@ fn run_machine_test(
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
+        // Body in `tests/common/audio.rs`, so the hunk here stays one line.
+        "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
             metal_sim_compositor(group_boot(held, METAL_SIM_DESKTOP, || {
                 boot_metal_sim_desktop(rust_bins)
