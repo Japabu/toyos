@@ -185,6 +185,22 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, last_armed_ticks) == 260);
 
 const IDLE_STACK_SIZE: usize = 16384; // 16KB
 
+/// One unmapped 4 KiB page below every idle stack.
+///
+/// The idle stack is ordinary heap, so without this an overflow does not fault
+/// — it rewrites whatever the allocator put underneath, and the damage
+/// surfaces later and elsewhere. That is not hypothetical here: the idle loop
+/// runs `log_file::poll`, a filesystem write reaching a block device, whose
+/// measured high water was 11,505 bytes of the 16,384 with the USB command
+/// path still below the probe.
+///
+/// Unmapped rather than [`IST1_GUARD_SIZE`]'s fill pattern, and the difference
+/// is the stack, not the taste: #PF has no IST, so the fault frame is pushed
+/// onto the stack that just overflowed and the CPU takes a #DF — which *does*
+/// have a stack, and reports. On IST1 there is no such second chance, which is
+/// why that guard detects after the fact instead of trapping.
+const IDLE_GUARD_SIZE: usize = 4096;
+
 /// The double fault stack. Only #DF uses IST1, and what runs on it is the
 /// whole crash report plus `halt_all_cpus` — render, then `panic_flush`.
 ///
@@ -237,11 +253,15 @@ fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     ptr
 }
 
+/// The allocation is never freed — nothing holds the pointer to free it with —
+/// which is what makes [`crate::mm::paging::guard_kernel_page`]'s permanent
+/// split of the enclosing 2 MiB direct-map leaf sound.
 fn alloc_idle_stack(percpu: &mut PerCpu) {
-    let layout = Layout::from_size_align(IDLE_STACK_SIZE, 4096).unwrap();
+    let layout = Layout::from_size_align(IDLE_GUARD_SIZE + IDLE_STACK_SIZE, 4096).unwrap();
     let base = unsafe { alloc_zeroed(layout) };
     assert!(!base.is_null(), "percpu: idle stack alloc failed");
-    percpu.idle_stack_top = base as u64 + IDLE_STACK_SIZE as u64;
+    crate::mm::paging::guard_kernel_page(base as u64);
+    percpu.idle_stack_top = base as u64 + (IDLE_GUARD_SIZE + IDLE_STACK_SIZE) as u64;
     percpu.idle_rsp = percpu.idle_stack_top;
 }
 
@@ -451,6 +471,13 @@ pub fn idle_rsp() -> u64 {
 /// Pointer to the idle_rsp field (for context_switch to save into).
 pub fn idle_rsp_ptr() -> *mut u64 {
     unsafe { &raw mut (*percpu_ptr()).idle_rsp }
+}
+
+/// The byte immediately below this CPU's idle stack — the last byte of its
+/// guard page, and the first thing an overflowing frame reaches.
+#[cfg(feature = "test-idle-guard")]
+pub fn idle_guard_byte() -> u64 {
+    idle_stack_top() - IDLE_STACK_SIZE as u64 - 1
 }
 
 /// Top of this CPU's idle stack.

@@ -86,12 +86,23 @@ impl Drop for PipeWriter {
 
 pub const PIPE_SIZE: usize = PAGE_2M as usize;
 
-struct Pipe {
+/// A pipe's ring page and the cursors over it.
+///
+/// The cursors are kernel memory, because `SYS_PIPE_MAP` maps `page` into the
+/// process writable: anything read back out of that page is a value the
+/// process chose.
+struct Backing {
     page: pmm::PhysPage,
-    /// The ring's cursors and capacity. Kernel memory, because `SYS_PIPE_MAP`
-    /// maps `page` into the process writable: anything read back out of that
-    /// page is a value the process chose.
     ring: Ring,
+}
+
+struct Pipe {
+    /// `None` until the pipe is first used. A pipe costs 2 MiB and a
+    /// connection is two of them, so allocating on `create` charged every
+    /// `SYS_CONNECT` 4 MiB of physical memory before either end had sent a
+    /// byte — for a pending connection, before the server had even agreed to
+    /// the conversation.
+    backing: Option<Backing>,
     /// The process that called `create`. `PipeId`s are dense sequential
     /// integers and userland passes raw ones to `SYS_PIPE_OPEN`, so this is
     /// the only thing that distinguishes "a peer handed me this id" from
@@ -116,14 +127,9 @@ struct Pipe {
 unsafe impl Send for Pipe {}
 
 impl Pipe {
-    fn new(creator: Pid) -> Option<Self> {
-        let page = pmm::alloc_page(pmm::Category::Pipe)?;
-        // SAFETY: a fresh 2 MiB page this `Pipe` owns for as long as the
-        // `Ring` addresses it.
-        let ring = unsafe { Ring::new(page.direct_map().as_mut_ptr(), PIPE_SIZE) };
-        Some(Self {
-            page,
-            ring,
+    fn new(creator: Pid) -> Self {
+        Self {
+            backing: None,
             creator,
             readers: 0,
             writers: 0,
@@ -131,7 +137,44 @@ impl Pipe {
             readers_wq: new_queue(WaitClass::Pipe),
             writers_wq: new_queue(WaitClass::Pipe),
             rt_boost_pending: false,
-        })
+        }
+    }
+
+    /// Allocate the ring page if this is the first use. `None` when physical
+    /// memory is exhausted — which userland drives, so it is an error return
+    /// and not a panic.
+    fn back(&mut self) -> Option<&mut Backing> {
+        if self.backing.is_none() {
+            let page = pmm::alloc_page(pmm::Category::Pipe)?;
+            // SAFETY: a fresh 2 MiB page this `Pipe` owns for as long as the
+            // `Ring` addresses it.
+            let ring = unsafe { Ring::new(page.direct_map().as_mut_ptr(), PIPE_SIZE) };
+            self.backing = Some(Backing { page, ring });
+            self.publish_ends();
+        }
+        self.backing.as_mut()
+    }
+
+    /// Republish "is the other end gone?" into the mapped header.
+    ///
+    /// The kernel never reads those bits back — its own counts decide — so
+    /// this is a publication for netd, and it derives from the counts rather
+    /// than being toggled alongside them. A pipe that is not backed yet has
+    /// nowhere to publish to and picks the bits up when it is.
+    fn publish_ends(&mut self) {
+        let Some(backing) = self.backing.as_mut() else { return };
+        if self.readers == 0 { backing.ring.close_reader() } else { backing.ring.open_reader() }
+        if self.writers == 0 { backing.ring.close_writer() } else { backing.ring.open_writer() }
+    }
+
+    fn available(&self) -> u32 {
+        self.backing.as_ref().map_or(0, |b| b.ring.available())
+    }
+
+    /// A pipe with no page yet has its whole capacity free — the allocation
+    /// that would make that true is deferred, not refused.
+    fn space(&self) -> u32 {
+        self.backing.as_ref().map_or(u32::MAX, |b| b.ring.space())
     }
 }
 
@@ -153,16 +196,16 @@ pub fn init() {
 
 /// Create a new pipe. Returns owned reader + writer references.
 ///
-/// `None` when the 2 MiB ring page cannot be allocated. Both callers are
-/// syscalls acting for userland, and physical memory is a resource userland
-/// drives — `SYS_PIPE` or `SYS_CONNECT` in a loop — so exhaustion is an error
-/// return rather than the `.expect` that used to take the kernel with it.
-pub fn create(creator: Pid) -> Option<(PipeReader, PipeWriter)> {
-    let pipe = Pipe::new(creator)?;
-    let id = with_pipes_mut(|pipes| pipes.insert(pipe));
+/// Infallible: a pipe with no traffic on it owns no physical memory, so there
+/// is nothing here that can be exhausted. The 2 MiB ring page is allocated by
+/// the first `try_write` or `map_page`, and *that* is where userland driving
+/// physical memory — `SYS_PIPE` or `SYS_CONNECT` in a loop — meets an error
+/// return.
+pub fn create(creator: Pid) -> (PipeReader, PipeWriter) {
+    let id = with_pipes_mut(|pipes| pipes.insert(Pipe::new(creator)));
     add_reader(id);
     add_writer(id);
-    Some((PipeReader(id), PipeWriter(id)))
+    (PipeReader(id), PipeWriter(id))
 }
 
 /// The process that created this pipe, or `None` if the id names no pipe.
@@ -187,16 +230,20 @@ pub fn exists(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| pipes.get(pipe_id).is_some())
 }
 
-/// Get the physical address of a pipe's ring buffer (for mapping into userland).
-pub fn phys_addr(pipe_id: PipeId) -> Option<DirectMap> {
-    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.page.direct_map()))
+/// The pipe's ring page, allocating it if this is its first use.
+///
+/// `None` when the id names no pipe or its page cannot be allocated — the
+/// caller holds a descriptor for it, which rules the first out, so what
+/// reaches userland from here is physical memory exhaustion.
+pub fn map_page(pipe_id: PipeId) -> Option<DirectMap> {
+    with_pipes_mut(|pipes| Some(pipes.get_mut(pipe_id)?.back()?.page.direct_map()))
 }
 
 pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
     let (result, boost) = with_pipes_mut(|pipes| {
         let Some(pipe) = pipes.get_mut(pipe_id) else { return (None, false) };
-        if pipe.ring.available() > 0 {
-            let n = pipe.ring.read(buf);
+        if pipe.available() > 0 {
+            let n = pipe.backing.as_mut().expect("available() > 0 implies a ring").ring.read(buf);
             let boost = pipe.rt_boost_pending;
             pipe.rt_boost_pending = false;
             (Some(n), boost)
@@ -217,15 +264,23 @@ pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
 pub enum PipeWrite {
     Wrote(usize),
     BrokenPipe,
+    /// The first write to this pipe, and its ring page could not be
+    /// allocated. Distinct from `None`: there is no amount of waiting that
+    /// makes space appear, so a caller must not park on it.
+    NoMemory,
 }
 
 pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id)?;
         if pipe.readers == 0 {
-            Some(PipeWrite::BrokenPipe)
-        } else if pipe.ring.space() > 0 {
-            Some(PipeWrite::Wrote(pipe.ring.write(buf)))
+            return Some(PipeWrite::BrokenPipe);
+        }
+        let Some(backing) = pipe.back() else {
+            return Some(PipeWrite::NoMemory);
+        };
+        if backing.ring.space() > 0 {
+            Some(PipeWrite::Wrote(backing.ring.write(buf)))
         } else {
             None
         }
@@ -234,13 +289,13 @@ pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
 
 pub fn has_data(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| p.ring.available() > 0 || p.writers == 0)
+        pipes.get(pipe_id).map_or(false, |p| p.available() > 0 || p.writers == 0)
     })
 }
 
 pub fn has_space(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| p.ring.space() > 0 || p.readers == 0)
+        pipes.get(pipe_id).map_or(false, |p| p.space() > 0 || p.readers == 0)
     })
 }
 
@@ -260,7 +315,7 @@ fn add_reader(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("add_reader: pipe not found");
         pipe.readers = pipe.readers.checked_add(1).expect("pipe reader overflow");
-        pipe.ring.open_reader();
+        pipe.publish_ends();
     });
 }
 
@@ -268,7 +323,7 @@ fn add_writer(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("add_writer: pipe not found");
         pipe.writers = pipe.writers.checked_add(1).expect("pipe writer overflow");
-        pipe.ring.open_writer();
+        pipe.publish_ends();
     });
 }
 
@@ -276,9 +331,7 @@ fn close_read(pipe_id: PipeId) {
     let wake_writers = with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_read: pipe not found");
         pipe.readers = pipe.readers.checked_sub(1).expect("pipe reader underflow");
-        if pipe.readers == 0 {
-            pipe.ring.close_reader();
-        }
+        pipe.publish_ends();
         if pipe.readers == 0 && pipe.writers == 0 {
             let pipe = pipes.remove(pipe_id).unwrap();
             free_pipe(pipe);
@@ -304,9 +357,7 @@ fn close_write(pipe_id: PipeId) {
     let wake_readers = with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_write: pipe not found");
         pipe.writers = pipe.writers.checked_sub(1).expect("pipe writer underflow");
-        if pipe.writers == 0 {
-            pipe.ring.close_writer();
-        }
+        pipe.publish_ends();
         if pipe.readers == 0 && pipe.writers == 0 {
             let pipe = pipes.remove(pipe_id).unwrap();
             free_pipe(pipe);

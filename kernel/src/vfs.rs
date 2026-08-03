@@ -104,10 +104,27 @@ pub trait FileSystem: Send {
 }
 
 
+/// Whether userland may modify a mount.
+///
+/// Stated at every `mount` call and defaulted nowhere, so a volume added later
+/// cannot inherit the wrong answer by omission.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UserAccess {
+    ReadWrite,
+    /// The kernel's own volume. Reachable and readable, and every syscall that
+    /// would change it is refused — see [`Vfs::user_may_modify`].
+    KernelOnly,
+}
+
+struct Mount {
+    fs: Box<dyn FileSystem>,
+    access: UserAccess,
+}
+
 /// Virtual filesystem that dispatches to named mount points.
 pub struct Vfs {
     root: Option<Box<dyn FileSystem>>,
-    mounts: HashMap<String, Box<dyn FileSystem>>,
+    mounts: HashMap<String, Mount>,
     created_dirs: hashbrown::HashSet<String>,
 }
 
@@ -211,13 +228,35 @@ impl Vfs {
         self.root.as_deref_mut().expect("no root filesystem")
     }
 
-    pub fn mount(&mut self, name: &str, fs: Box<dyn FileSystem>) {
-        self.mounts.insert(String::from(name), fs);
+    pub fn mount(&mut self, name: &str, fs: Box<dyn FileSystem>, access: UserAccess) {
+        self.mounts.insert(String::from(name), Mount { fs, access });
+    }
+
+    /// May a syscall acting for userland change what is at `path`?
+    ///
+    /// The kernel's own answer is yes everywhere — it does not ask. This is
+    /// the syscall layer's question, and it is asked by every syscall that can
+    /// create, truncate, rename, delete or link, plus `open` for write.
+    ///
+    /// `/boot` is what it exists for. It is the volume firmware and the
+    /// bootloader read the machine out of, and it had no permission model of
+    /// any kind: `fs::write("/boot/toyos/kernel.elf", "TEETH")` from an
+    /// ordinary process truncated the kernel image to five bytes, which is a
+    /// machine that does not boot again. That is not a filesystem bug to fix
+    /// in FAT32 — it is a mount that userland was never meant to be able to
+    /// change.
+    ///
+    /// The root mount answers yes here and refuses in the adapter instead:
+    /// the initrd is `ReadOnlyBcacheFsAdapter`, which has no write path to
+    /// gate.
+    pub fn user_may_modify(&self, path: &str) -> bool {
+        let (mount, _) = self.resolve_path("/", path);
+        self.mounts.get(&mount).map_or(true, |m| m.access == UserAccess::ReadWrite)
     }
 
     fn resolve_fs(&mut self, mount: &str, file: &str) -> Option<(&mut dyn FileSystem, String)> {
-        if let Some(fs) = self.mounts.get_mut(mount) {
-            return Some((fs.as_mut(), String::from(file)));
+        if let Some(mount) = self.mounts.get_mut(mount) {
+            return Some((mount.fs.as_mut(), String::from(file)));
         }
         if let Some(root) = self.root.as_deref_mut() {
             let root_path = if file.is_empty() {
@@ -596,7 +635,7 @@ impl Vfs {
     /// btree write-back and a device flush for a byte that went to the boot
     /// stick.
     pub fn sync_mount(&mut self, name: &str) -> Result<(), &'static str> {
-        self.mounts.get_mut(name).ok_or("no such mount")?.sync()
+        self.mounts.get_mut(name).ok_or("no such mount")?.fs.sync()
     }
 
     /// Every mount, on the way down. Failures are logged here and not returned:
@@ -609,8 +648,8 @@ impl Vfs {
                 log!("vfs: the root filesystem would not sync: {e}");
             }
         }
-        for (name, fs) in self.mounts.iter_mut() {
-            if let Err(e) = fs.sync() {
+        for (name, mount) in self.mounts.iter_mut() {
+            if let Err(e) = mount.fs.sync() {
                 log!("vfs: /{name} would not sync: {e}");
             }
         }
