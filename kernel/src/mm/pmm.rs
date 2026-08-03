@@ -307,6 +307,18 @@ fn free_page(phys: u64) {
     bm.next_hint = bm.next_hint.min(idx);
 }
 
+/// One past the highest physical frame this kernel manages.
+///
+/// The extent the IOMMU's identity domain covers (`specs/iommu-spec.md` §5.7):
+/// every address a driver can hand a device comes out of here, so `[0, top)`
+/// is exactly what a device could reach on a machine with no unit at all.
+/// Taken from the bitmap rather than from the firmware memory map, whose own
+/// buffer is ordinary free RAM by the time anything asks.
+pub fn top() -> u64 {
+    let bm = BITMAP.lock();
+    bm.base + bm.page_count as u64 * PAGE_2M
+}
+
 /// Return (total_bytes, used_bytes).
 pub fn stats() -> (u64, u64) {
     let bm = BITMAP.lock();

@@ -215,6 +215,21 @@ log-rotate-fast = []
 # new bytes into a page of zeros and flushed it back over the kernel's own log.
 # See `fat32_adapter.rs`'s `FAT_BACKING_READS`.
 fat-backing-read-fails = []
+# Mis-program the IOMMU for the NVMe controller and nothing else:
+# `iommu-context-absent` leaves it out of the root table, so it reaches
+# translation with no context entry; `iommu-empty-domain` gives it a present
+# context entry naming a second-level table with no mappings in it. A root
+# table, a context entry and a page table are all the kernel's own memory, so
+# no QEMU device or machine property can reach either state while leaving the
+# rest of the machine correct. Nothing is faked: the transaction really
+# happens, the unit really blocks it, and the fault record the handler reads is
+# the hardware's own. Together they are the negative control on the whole of
+# stage I2 — a unit that were bypassing or never enabled would let both
+# through, and the second alone separates a real second-level walk from a
+# context entry naming passthrough, which would fault identically for the
+# first. See `iommu/vtd/mod.rs`'s `enable`.
+iommu-context-absent = []
+iommu-empty-domain = []
 
 # debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]

@@ -349,9 +349,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let pci_devices = pci::enumerate(&ecam);
     // After ACPI is readable and PCI is enumerable, before any driver `init`:
     // the unit has to be programmed before the first device is told to do DMA
-    // (`specs/iommu-spec.md` §2.1). Nothing is programmed yet — this stage
-    // inventories the machine and describes it, and refuses nothing.
-    iommu::init(kernel_args.rsdp_addr);
+    // (`specs/iommu-spec.md` §2.1), and every function the walk above returned
+    // has to have a context entry before translation comes on. Refuses nothing
+    // — a machine with no usable unit boots exactly as it does without one.
+    iommu::init(kernel_args.rsdp_addr, &pci_devices);
     file_cache::init();
     gpt::init(kernel_args);
 

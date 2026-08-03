@@ -1,36 +1,74 @@
 //! Intel VT-d. Every register layout and every Intel name in this subsystem is
 //! at or below this module (`specs/iommu-spec.md` §3).
 //!
-//! Stage I1: the units are found, their register windows mapped, their
-//! capabilities decoded, and each described on one line. Nothing is written
-//! and nothing is refused. Every observation `specs/iommu-spec.md` §2.2 makes
-//! a refusal of at I5 appears here as a line naming the register value it
-//! decided on, because a refusal that says only "unsupported" is a refusal
-//! nobody can act on, and this is the line that will be read off a laptop
-//! panel with no serial port.
+//! Stage I2: the units are found, their capabilities decoded and described,
+//! every enumerated PCI function given a context entry naming one identity-
+//! mapped domain, and translation turned on. Nothing is *refused*: every
+//! observation §2.2 makes a refusal of at I5 appears here as a line naming the
+//! register value it decided on, and a unit this kernel cannot program is left
+//! switched off rather than made into a halt — which leaves that machine
+//! exactly as it boots today. A refusal that says only "unsupported" is a
+//! refusal nobody can act on, and these are the lines that will be read off a
+//! laptop panel with no serial port.
 //!
 //! Register offsets, and the field positions inside `CAP` and `ECAP`, come
 //! from the VT-d architecture specification's register chapter. What makes
 //! them *checked* rather than cited is the harness: it stages units that
 //! differ in `CAP.SAGAW` and in `ECAP.IR`, and asserts the guest reports the
 //! difference. A decode reading the wrong bits cannot track a register it is
-//! not looking at.
+//! not looking at — and from I2 on, a unit programmed through the wrong offset
+//! does not translate at all, which every profile in the suite now depends on.
 
 pub mod dmar;
+pub mod fault;
+mod queue;
+mod table;
 
 use crate::drivers::acpi::TableError;
-use crate::iommu::AddressWidth;
+use crate::drivers::pci::PciDevice;
+use crate::iommu::{AddressWidth, StreamId};
 use crate::mm::Mmio;
+use crate::sync::Lock;
 
 use dmar::{Dmar, Malformed, Scope, Scopes, Structure};
+use queue::Queue;
+use table::{Table, Tables};
 
-/// A unit's register window. The architecture defines 4 KiB; everything read
-/// here is in the first 32 bytes of it.
+/// A unit's register window. The architecture defines 4 KiB, and this kernel
+/// reads and writes only inside it — including the fault recording registers,
+/// whose declared extent is checked against this rather than assumed to fit.
 const REGISTER_WINDOW: u64 = 4096;
 
 const VER_REG: u64 = 0x00;
 const CAP_REG: u64 = 0x08;
 const ECAP_REG: u64 = 0x10;
+const GCMD_REG: u64 = 0x18;
+const GSTS_REG: u64 = 0x1C;
+const RTADDR_REG: u64 = 0x20;
+const FSTS_REG: u64 = 0x34;
+const FECTL_REG: u64 = 0x38;
+const FEDATA_REG: u64 = 0x3C;
+const FEADDR_REG: u64 = 0x40;
+const FEUADDR_REG: u64 = 0x44;
+const IQT_REG: u64 = 0x88;
+const IQA_REG: u64 = 0x90;
+
+/// `GCMD` bits, and the `GSTS` bit each is confirmed in. The two registers put
+/// the same field at the same position, which is why one constant serves both.
+const TRANSLATION_ENABLE: u32 = 1 << 31;
+const SET_ROOT_TABLE_POINTER: u32 = 1 << 30;
+const QUEUED_INVALIDATION_ENABLE: u32 = 1 << 26;
+/// `GSTS.RTPS` — the root table pointer has been taken. It sits where `GCMD`'s
+/// one-shot `SRTP` does.
+const ROOT_TABLE_SET: u32 = 1 << 30;
+
+/// How long a `GCMD` write is given to appear in `GSTS`.
+///
+/// Not a measurement: it is the bound past which the kernel stops waiting for
+/// hardware that is not answering. Expiry is a panic for the same reason §5.5
+/// gives for an unacknowledged invalidation — a unit half-way through being
+/// enabled is a unit whose reach nothing can state.
+const COMMAND_TIMEOUT_NS: u64 = 1_000_000_000;
 
 /// x86-64's architectural physical-address ceiling is 52 bits, so a register
 /// base at or above this is not an address at all. It is also what stops
@@ -45,9 +83,15 @@ const MAX_PHYS: u64 = 1 << 52;
 /// is not the list's own. This is far above anything a chipset publishes, and
 /// what a machine past it loses is the description of the units past it —
 /// which it is told, rather than left to infer from a short log.
-const MAX_UNITS: usize = 16;
+pub(super) const MAX_UNITS: usize = 16;
 
-pub fn init(rsdp_addr: u64) {
+/// Every remapping table on this machine, in one place because they outlive
+/// the call that built them: the unit walks them for as long as it is on, and
+/// a `Vec<PhysPage>` dropped at the end of `init` would hand the pages the
+/// unit is reading back to the PMM.
+static TABLES: Lock<Tables> = Lock::new(Tables::new());
+
+pub fn init(rsdp_addr: u64, devices: &[PciDevice]) {
     let dmar = match Dmar::open(rsdp_addr) {
         Ok(dmar) => dmar,
         // Firmware omits the table both when the platform has no VT-d silicon
@@ -80,6 +124,12 @@ pub fn init(rsdp_addr: u64) {
 
     let mut units = 0usize;
     let mut regions = 0usize;
+    // One identity domain for the whole machine (§5.1's passthrough domain,
+    // built out of page tables because §8.1 found `ECAP.PT` clear). Its depth
+    // is the unit's, so a machine whose units disagree about `CAP.SAGAW` gets
+    // one set of tables per width rather than one shared set programmed at the
+    // wrong depth.
+    let mut domains: [Option<Table>; 2] = [None, None];
     for structure in dmar.structures() {
         match structure {
             Ok(Structure::Drhd(drhd)) => {
@@ -87,7 +137,9 @@ pub fn init(rsdp_addr: u64) {
                     log!("iommu: more than {MAX_UNITS} units described; the rest are not inventoried");
                     return;
                 }
-                describe_unit(units, &drhd);
+                if let Some(unit) = describe_unit(units, &drhd) {
+                    enable(unit, devices, &mut domains);
+                }
                 units += 1;
             }
             // §7.4: a kernel-owned device is in the passthrough domain and its
@@ -127,21 +179,57 @@ pub fn init(rsdp_addr: u64) {
     }
 }
 
-fn describe_unit(index: usize, drhd: &dmar::Drhd) {
+/// A unit whose window decodes, with the capabilities it advertises and the
+/// state of its global command register.
+struct Unit {
+    index: usize,
+    base: u64,
+    regs: Mmio,
+    caps: Capabilities,
+    /// What has been switched on in `GCMD`. §6.3: the register is not
+    /// read-modify-write safe — a write names every persistent bit that is to
+    /// stay set — so this is the only record of which those are.
+    gcmd: u32,
+}
+
+impl Unit {
+    /// Set one `GCMD` bit and wait for `GSTS` to agree (§6.3, one bit at a
+    /// time).
+    fn command(&mut self, bit: u32, persistent: bool, status: u32, what: &str) {
+        self.regs.write_u32(GCMD_REG, self.gcmd | bit);
+        if persistent {
+            self.gcmd |= bit;
+        }
+        let deadline = crate::clock::nanos_since_boot() + COMMAND_TIMEOUT_NS;
+        loop {
+            let gsts = self.regs.read_u32(GSTS_REG);
+            if gsts & status != 0 {
+                return;
+            }
+            assert!(
+                crate::clock::nanos_since_boot() < deadline,
+                "iommu: unit{} never reported {what}, GSTS={gsts:#010x}",
+                self.index
+            );
+            core::hint::spin_loop();
+        }
+    }
+}
+
+fn describe_unit(index: usize, drhd: &dmar::Drhd) -> Option<Unit> {
     let base = drhd.register_base();
-    // Firmware's number, and the one address in this table the kernel is about
-    // to dereference. A window that is not 4 KiB-aligned, or that is outside
-    // the architectural physical range, is refused by name — never clamped to
-    // fit. Not checked here, and the reason it matters at I2 rather than now:
-    // a base pointing into usable RAM would read plausible garbage as a
-    // capability register, which costs a wrong log line today and a register
-    // write into somebody's heap at the stage that programs the unit.
+    // Firmware's number, and the one address in this table the kernel
+    // dereferences. A window that is not 4 KiB-aligned, or that is outside the
+    // architectural physical range, is refused by name — never clamped to fit.
+    // A base pointing into usable RAM would read plausible garbage as a
+    // capability register, which costs a wrong log line and, from this stage
+    // on, a register write into somebody's heap.
     if base == 0 || base % REGISTER_WINDOW != 0 || base >= MAX_PHYS {
         log!(
             "iommu: unit{index} register base {base:#x} is not a 4 KiB-aligned physical address \
              — not mapped"
         );
-        return;
+        return None;
     }
 
     let regs: Mmio = crate::mm::paging::kernel()
@@ -159,7 +247,7 @@ fn describe_unit(index: usize, drhd: &dmar::Drhd) {
             "iommu: unit{index} @{base:#x}: register window reads ver={version:#010x}, the unit \
              is described but not present"
         );
-        return;
+        return None;
     }
 
     let caps = Capabilities { cap: regs.read_u64(CAP_REG), ecap: regs.read_u64(ECAP_REG) };
@@ -196,6 +284,178 @@ fn describe_unit(index: usize, drhd: &dmar::Drhd) {
     );
 
     describe_scopes("unit", index, drhd.scopes());
+    Some(Unit { index, base, regs, caps, gcmd: 0 })
+}
+
+/// Program this unit and turn translation on.
+///
+/// The order is §6.3's, minus the interrupt-remapping half that is I3's: the
+/// invalidation queue first, then the root table pointer, then a global
+/// invalidation of everything the unit may have cached, and only then `TE`.
+/// Each step is confirmed in `GSTS` before the next is issued.
+///
+/// A capability this kernel needs and the unit does not have leaves it
+/// switched off, with a line naming the register. That is I5's refusal one
+/// stage early in everything but severity: the machine boots exactly as it
+/// does today, because what a unit that is never enabled does to DMA is
+/// nothing.
+fn enable(mut unit: Unit, devices: &[PciDevice], domains: &mut [Option<Table>; 2]) {
+    let index = unit.index;
+    let Some(width) = unit.caps.address_width() else {
+        log!(
+            "iommu: unit{index} supports no address width this kernel implements \
+             (CAP={:#018x}) — not programmed",
+            unit.caps.cap
+        );
+        return;
+    };
+    if !unit.caps.superpage_2m() {
+        log!(
+            "iommu: unit{index} cannot map 2 MiB pages (CAP={:#018x}) — not programmed",
+            unit.caps.cap
+        );
+        return;
+    }
+    if !unit.caps.queued_invalidation() {
+        log!(
+            "iommu: unit{index} has no queued invalidation (ECAP={:#018x}) — not programmed",
+            unit.caps.ecap
+        );
+        return;
+    }
+    if unit.caps.domains() <= table::KERNEL_DOMAIN as u32 {
+        log!(
+            "iommu: unit{index} supports {} domains, too few to name one (CAP={:#018x}) — not \
+             programmed",
+            unit.caps.domains(),
+            unit.caps.cap
+        );
+        return;
+    }
+    let records =
+        fault::Records { offset: unit.caps.fault_recording_offset(), count: unit.caps.fault_recording_registers() };
+    if !records.fit(REGISTER_WINDOW) {
+        log!(
+            "iommu: unit{index} puts {} fault records at {:#x}, past its own {REGISTER_WINDOW}-byte \
+             window (CAP={:#018x}) — not programmed",
+            records.count,
+            records.offset,
+            unit.caps.cap
+        );
+        return;
+    }
+
+    let root = {
+        let mut tables = TABLES.lock();
+        let domain = match domains[domain_slot(width)] {
+            Some(domain) => domain,
+            None => {
+                let top = crate::mm::pmm::top();
+                let (domain, frames) = table::identity_domain(&mut tables, width, top);
+                log!(
+                    "iommu: identity domain aw={} covers 0x0..{top:#x} in {frames} 2 MiB leaves",
+                    width.bits()
+                );
+                domains[domain_slot(width)] = Some(domain);
+                domain
+            }
+        };
+
+        // §5.1: every function `pci::enumerate` returned, before translation is
+        // enabled. Enabling it with a device on the bus that has no context
+        // entry is how a machine bricks its own boot disk — and the corollary
+        // still holds, that a device appearing after boot has none and faults.
+        let root = tables.alloc();
+        for device in devices {
+            let stream = StreamId::pci(device.bus, device.dev, device.func);
+            // The two isolation negative controls, and neither is reachable
+            // from the host side: a root table, a context entry and a
+            // second-level table are the guest's own memory, so no QEMU device
+            // or machine property can take one function's entry away, or point
+            // it at a domain with nothing in it, while leaving the rest of the
+            // machine correct.
+            //
+            // Both sabotage the same function and both are answered on its
+            // first *read*, which is deliberate: QEMU caches a translation
+            // with the permissions of the access that populated it and lets
+            // its memory core drop a later access the entry does not allow,
+            // silently and with no fault (measured — §8.2). A control that
+            // waited for a device's first write would therefore hang the boot
+            // instead of faulting.
+            #[cfg(feature = "iommu-context-absent")]
+            if device.matches_class(NVME_CLASS, NVME_SUBCLASS, None) {
+                log!("iommu: unit{index} leaves {stream} out of the root table (actuator)");
+                continue;
+            }
+            // A present context entry naming a table with no mappings. What it
+            // separates from the control above: a context entry that named
+            // *passthrough* would fault identically for a function with no
+            // entry at all, and would ignore every second-level table this
+            // kernel writes. Only a device whose empty domain is walked can
+            // fault on this.
+            #[cfg(feature = "iommu-empty-domain")]
+            if device.matches_class(NVME_CLASS, NVME_SUBCLASS, None) {
+                let empty = tables.alloc();
+                log!("iommu: unit{index} gives {stream} a domain with no mappings (actuator)");
+                table::bind(&mut tables, root, stream, empty, width);
+                continue;
+            }
+            table::bind(&mut tables, root, stream, domain, width);
+        }
+
+        let mut queue = Queue::new(&mut tables, unit.regs);
+        drop(tables);
+
+        // Before `TE`, so the first transaction this unit blocks is one it can
+        // report rather than one that is merely counted.
+        fault::arm(index, unit.regs, records, crate::arch::idt::DMA_FAULT_VECTOR);
+
+        unit.command(
+            QUEUED_INVALIDATION_ENABLE,
+            true,
+            QUEUED_INVALIDATION_ENABLE,
+            "queued invalidation",
+        );
+        unit.regs.write_u64(RTADDR_REG, root.phys());
+        unit.command(SET_ROOT_TABLE_POINTER, false, ROOT_TABLE_SET, "the root table pointer");
+        queue.invalidate_all(unit.regs);
+        root
+    };
+
+    unit.command(TRANSLATION_ENABLE, true, TRANSLATION_ENABLE, "translation");
+
+    let gsts = unit.regs.read_u32(GSTS_REG);
+    log!(
+        "iommu: unit{index} @{:#x} translating gsts={gsts:#010x} tes={} qies={} root={:#x} \
+         domain={} aw={} streams={}",
+        unit.base,
+        yn(gsts & TRANSLATION_ENABLE != 0),
+        yn(gsts & QUEUED_INVALIDATION_ENABLE != 0),
+        root.phys(),
+        table::KERNEL_DOMAIN,
+        width.bits(),
+        devices.len(),
+    );
+}
+
+/// The class both actuators name their victim by. Chosen rather than a
+/// bus/device/function because which slot QEMU puts a controller in is not
+/// this kernel's business — and because the harness reads the same answer out
+/// of `pci::enumerate`'s own lines, so neither side is told the other's.
+#[cfg(any(feature = "iommu-context-absent", feature = "iommu-empty-domain"))]
+const NVME_CLASS: u8 = 0x01;
+#[cfg(any(feature = "iommu-context-absent", feature = "iommu-empty-domain"))]
+const NVME_SUBCLASS: u8 = 0x08;
+
+/// Which slot of the per-width domain cache a unit's tables live in.
+///
+/// An exhaustive match rather than the discriminant, so a third width added to
+/// `AddressWidth` fails to compile here instead of indexing past the array.
+fn domain_slot(width: AddressWidth) -> usize {
+    match width {
+        AddressWidth::Bits39 => 0,
+        AddressWidth::Bits48 => 1,
+    }
 }
 
 fn describe_scopes(owner: &str, index: usize, scopes: Scopes) {

@@ -19,6 +19,16 @@ impl Mmio {
         Self { base: base.as_mut_ptr(), size }
     }
 
+    /// The window's base as an integer.
+    ///
+    /// For the one reader that cannot hold the handle: the IOMMU's DMA-fault
+    /// interrupt handler may take no lock (`specs/iommu-spec.md` §7.1), so the
+    /// windows it reads live in `AtomicU64`s and are dereferenced there rather
+    /// than through this type. Everything that *can* hold an `Mmio` should.
+    pub fn addr(self) -> u64 {
+        self.base as u64
+    }
+
     pub fn subregion(self, offset: u64, size: u64) -> Mmio {
         assert!(offset + size <= self.size,
             "Mmio subregion OOB: offset={:#x} size={:#x} total={:#x}", offset, size, self.size);

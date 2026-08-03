@@ -1,5 +1,6 @@
 pub(crate) mod exceptions;
 mod device_irq;
+mod dma_fault;
 mod i8042;
 mod timer;
 mod tlb;
@@ -33,6 +34,7 @@ enum Vector {
     VirtioNet = 0x22,
     VirtioSound = 0x23,
     I8042 = 0x24,
+    DmaFault = 0x25,
     HaltAll = 0xFD,
     TlbFlush = 0xFE,
 }
@@ -53,6 +55,10 @@ impl Vector {
 /// The vector both PS/2 lines are routed to. Public because the driver has to
 /// name it when it programs the I/O APIC.
 pub const I8042_VECTOR: u8 = Vector::I8042 as u8;
+
+/// The vector an IOMMU writes into its own `FEDATA`. Public for the same
+/// reason: the unit is told which vector to raise, and only one place knows.
+pub const DMA_FAULT_VECTOR: u8 = Vector::DmaFault as u8;
 
 // Page fault error code bits
 const PF_PRESENT: u64 = 1 << 0;
@@ -324,6 +330,7 @@ pub fn init() {
         idt.entries[Vector::VirtioNet as usize] = IdtEntry::new(virtio_net::virtio_net_entry as *const () as u64);
         idt.entries[Vector::VirtioSound as usize] = IdtEntry::new(virtio_sound::virtio_sound_entry as *const () as u64);
         idt.entries[Vector::I8042 as usize] = IdtEntry::new(i8042::i8042_entry as *const () as u64);
+        idt.entries[Vector::DmaFault as usize] = IdtEntry::new(dma_fault::dma_fault_entry as *const () as u64);
         idt.entries[Vector::HaltAll as usize] = IdtEntry::new(stub_halt_all as *const () as u64);
         idt.entries[Vector::TlbFlush as usize] = IdtEntry::new(tlb::tlb_flush_entry as *const () as u64);
     }
