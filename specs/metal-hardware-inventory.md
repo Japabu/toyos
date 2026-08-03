@@ -493,7 +493,10 @@ the metal roadmap's raw material; sequencing is the owner's.
    The device is not on the PCI bus (above). Needs: a route to the LPSS I2C
    controller's MMIO base that does not go through PCI config space, then an LPSS
    I2C driver, then ACPI GpioInt for the interrupt, then HID multitouch. The first
-   step is a scope change M5 did not plan for.
+   step is a scope change M5 did not plan for. Softened by a field fact the logs
+   could not show: on the 2026-08-03 compositor boot the owner reports the
+   touchpad *working* — the T14 mirrors it over the i8042 aux port beside the
+   TrackPoint, so I2C-HID buys precision multitouch, not first function.
 2. **Ethernet `00:1f.6` `8086:15fc` (I219-V).** Gate N's target on real hardware
    and the only NIC in the machine ToyOS could plausibly drive; the Wi-Fi part is
    not. An e1000e-class driver.
