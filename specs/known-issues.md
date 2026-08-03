@@ -3638,7 +3638,7 @@ mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
 `log_partition_automount` and `log_partition_identity`
 (`tests/common/volumes.rs`).
 
-### OPEN — a full-image metal boot reached a desktop with no `/log` at all, and QEMU will not reproduce it
+### CLOSED — a metal boot reached a desktop with no `/log`, intermittently, because the boot disk arrived after the port scan
 
 The owner flashed `target/bootable.img` built at `85020e1` — 716,177,408 bytes,
 the shipping `system.toml` — to the T14 and reached a working compositor
@@ -3695,64 +3695,87 @@ kernel changes are the IOMMU inventory (new, and it issues no MMIO write), a
 `GOP:` line that *reads* the MTRRs, the panic console's claim wait, an ACPI
 refactor, and a test-only `SYS_DEBUG` action.
 
-**The question the machine has to answer is whether `/boot` is missing too**,
-and the code says it splits the tree cleanly:
+**CLOSED at `9985f82`/`767708f`, gated by `late_storage_connect` (`3efdb46`).**
+The owner booted the same stick, same image, same machine again and both volumes
+mounted with 103 KB of log recovered. **It is intermittent**, which prices out
+everything deterministic — the firmware/table extent cross-check above all, since
+the same firmware reading the same table produces the same numbers every boot.
 
-- **Both missing is one defect, upstream of either mount.** `gpt::probe` calls
-  `locate_log` only inside the `Resolution::Unknown` arm — that is, only after
-  the *boot* partition has matched on that device — so anything that stops the
-  boot match stops the log lookup with it: no USB disk bound,
-  `xhci::storage_geometry` answering `None` (`probe_boot_disks` skips the disk
-  silently and `gpt::probe` never runs on it), a GPT the parser refuses, or the
-  firmware/table extent cross-check disagreeing. That last one is the only
-  mechanism found so far that is *size-dependent and metal-only*: the check is
-  `part.first_lba == firmware.start_lba && part.lba_count() == firmware.blocks`,
-  firmware's half comes from the T14's own `LoadedImage` device path, and the ESP
-  went from 69,632 sectors to 1,323,424 between the image that worked and the one
-  that did not. It prints `gpt: device N puts <GUID> at LBA X+Y but firmware said
-  A+B — not treating it as the boot volume`, and a machine in that state boots
-  perfectly from the initrd with neither mount.
-- **Only `/log` missing is log-partition-specific**: `locate_log` not finding the
-  GUID in the table (it names the GUID it looked for), or the log volume's own
-  `Fat32::probe`/`mount` refusing.
+**The race, and it was in the shape of the probe rather than in any of its
+parts.** `xhci::await_connect_settle` returns as soon as the root hub's connect
+set has held still for `PORT_DEBOUNCE_NS` **and is non-empty**, so a machine
+whose other devices are up settles on *them*, and `device::scan_ports` runs
+against the ports as they read at that instant. The T14 has four internal USB
+devices — camera, Bluetooth, card reader, fingerprint reader — beside the stick
+it boots from, and on its good boot they connect at 1.190, 1.246, 1.301 and 1.526
+with the stick at 1.465 in the middle of them. Nothing holds that ordering. When
+the stick is the one still coming, the scan ends with the bus populated and no
+disk on it, `fat32_adapter::probe_boot_disks` iterates `0..0`, and the machine
+has no `/boot` and no `/log` for the rest of the boot — while booting perfectly,
+because everything userland needs is in the initrd.
 
-Nothing shared can take one mount down through the other: `VOLUMES` is a
-two-element array indexed by `Role::slot()`, `device_carrying` opens a separate
-handle per role, and `main.rs` mounts the two in two independent `match`
-statements with no `?` between them.
+**Every part of it was silent.** `probe_boot_disks` was three bare `continue`s
+and a loop that did not execute; nothing logged, nothing refused, nothing named.
+`usb-storage: 0 device(s)` was printed and meant nothing to anyone, because on a
+machine with no USB storage it is also what a correct boot says.
 
-**What to ask the machine, in this order.**
+The fix is two things and the second is what the first is for:
 
-1. **No reflash.** Boot the stick as it is and open a terminal on the desktop:
-   `ls /`, `ls /boot`, `ls /log`. That runs on the failing configuration and
-   splits the tree above. It is the whole round trip if `/boot` is present.
-2. **`target/bootable-diag.img`**, rebuilt at `f2cb291` from a clean tree, for
-   the kernel's own reason line. Its last boot checkpoint carries all of it:
-   decoded glyph-by-glyph off a 1920x1080 screendump of a muted metal-sim boot of
-   that exact image, the final panel is `[page 2/2]` and holds the
-   `usb-storage:`, both `gpt:`, `boot-volume:`, `log-volume:` and `log-file:`
-   lines, ending at `Boot: complete`. A photograph of the panel after boot
-   answers it. **Caveat that has to travel with the request:** the diag image's
-   ESP is `FAT32_MIN_BYTES`, the same 69,632 sectors as the console image that
-   worked — so if the cause is the ESP's size or its extent, this image is
-   expected to come up green and its silence proves nothing.
+- **The probe keeps looking while the machine still has no boot volume.** Not a
+  timer — the condition is `gpt::boot_partition().is_some() &&
+  gpt::boot_volume().is_none()`, so a machine whose boot volume is already
+  resolved leaves after one pass: every QEMU boot, every machine that boots off
+  NVMe, and the T14 on a good boot. Only a machine that would otherwise report no
+  boot volume pays anything, which is the same asymmetry `EMPTY_BUS_NS` is
+  written around and the same `PORT_SETTLE_CEILING_NS` ceiling, because it is the
+  same question about the same root hub. `xhci::recheck_ports` is the new
+  primitive: `poll_if_pending` returns without reading a register unless an
+  interrupt was recorded or `PORT_WORK_AT` is due, and the end of a boot scan
+  stores zero there precisely because nothing was outstanding.
+- **Every skip is named**, and one of the three is now unrepresentable rather
+  than logged: `usb_storage::open` carries the logical block size out with the
+  handle, so the caller asks one question and gets one answer where it used to
+  ask the controller twice for one fact and have two `None`s to swallow.
 
-**The coverage hole this proves, and it is not the obvious one.** "No gate boots
-an image at the full system's real size" is true, and smaller than it sounds:
-read off a suite boot's own `KernelArgs` line, the test image's boot partition is
-**513,008 sectors** against the shipping image's **1,323,424** — 262,660,096
-bytes against 677,593,088, a factor of 2.6 rather than the order of magnitude the
-73 MB diag and console images suggest. It is *not* the hole that let this ship
-either, because booting exactly that image at exactly that size is what the three
-runs above did and they are green. The hole with teeth is the other one: **all
-five `/log` gates read their verdict off a 16550, and the machine this feature
-exists for has none.** The
-kernel said why on the T14 — one of the lines quoted above, in the boot ring —
-and it reached no pixel and no file, because the compositor claimed the
-framebuffer tens of milliseconds after the last checkpoint and the log volume is
-the thing that failed. A working desktop and zero evidence is the designed
-outcome of that arrangement, and it is why this entry costs a round trip to the
-owner instead of a diff.
+**The gate, and why it is not `xhci_slow_connect`.** `xhci-slow-storage-connect`
+hides the *first port register* for 300 ms while every other port reads normally
+— the boot stick lands there because it is the only SuperSpeed device the
+profiles attach. `xhci-slow-connect` hides the whole bus, which is the case
+`EMPTY_BUS_NS` already keeps looking through, and it can never reach this
+interleaving because the devices it hides are the ones whose presence ends the
+wait early. Off the gate's own boot on `Profile::MetalUsb`: controller started at
+0.099, the settle ends at 0.200, `xHCI: 1 controller(s), 4 HID device(s)` and
+`usb-storage: 0 device(s)` at 0.202 — a populated bus with no disk, the laptop's
+state — then port 1 connects at 0.401, the disk is ready at 0.404, `gpt:` reads
+the table at 0.406 and both volumes mount at 0.438. The whole wait costs 204 ms,
+on the one boot that needs it. Non-vacuity is checked from both sides: the scan
+must have finished without the disk, *and* the bus must not have been empty.
+Ground truth is `kernel.log` read off the log partition of the image on the host
+afterwards, carrying this boot's own partition GUID. Negative control, with the
+wait removed and the actuator unchanged: `FAIL late_storage_connect: the disk
+arrived after the port scan and "boot-volume: partition mounted" never happened`.
+
+**What is left open, and it is the reason this was expensive.** The machine could
+not say any of this. Every refusal on the path is a `log!` into a ring whose only
+sinks are a 16550 the T14 does not have, the on-screen console the compositor
+claims tens of milliseconds after the last boot checkpoint, and `/log` — the
+thing that had failed. A working desktop and no evidence is the designed outcome
+of that arrangement. That is **task #95**, not closed here; the named-skip lines
+above are its first input.
+
+**The coverage hole, and it is not the obvious one.** "No gate boots an image at
+the full system's real size" is true, and smaller than it sounds: read off a
+suite boot's own `KernelArgs` line, the test image's boot partition is **513,008
+sectors** against the shipping image's **1,323,424** — 262,660,096 bytes against
+677,593,088, a factor of 2.6 rather than the order of magnitude the 73 MB diag
+and console images suggest. It is *not* the hole that let this ship: booting
+exactly that image at exactly that size is what the three runs above did and they
+are green. The hole that let it ship is that **device arrival *order* was a shape
+no profile varied.** Every profile in the suite hands the guest a bus whose
+devices are all present the instant the register is touched — QEMU fills PORTSC
+from the QOM tree — so "the disk is the last thing to arrive" was not a machine
+the harness could build until `xhci-slow-storage-connect` existed. Size was never
+the dimension; time was.
 
 ### The boot image this project builds is not `fsck_msdos`-clean, and never was
 
