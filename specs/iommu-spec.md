@@ -11,14 +11,18 @@ in full before the first driver leaves the kernel, and it has a second backend
 (ARM SMMU) planned behind the same seam. A reader changing `kernel/src/iommu/`
 in 2027 should not have to read a migration plan that finished.
 
-**Nothing here is built.** Verified against `97dc6ee`: `grep -rniE
-'iommu|dmar|vt-d|vtd|iova' kernel/ toyos-abi/ toyos/ bootloader/ --include='*.rs'`
-returns four hits, all of them netd's `DmaRxToken`. The kernel has no notion of a
-device-visible address distinct from a physical one — every descriptor any driver
-writes today is a raw `DirectMap::phys_of()` result (`mm/mod.rs:134`), reached
-through `KernelSlice::phys()` (`mm/region.rs:24`). That subtraction is the entire
-address translation on the DMA path, and it is the surface this subsystem has to
-insert itself into.
+**Stages I0–I2 of §9 are built** (`kernel/src/iommu/`): every profile carries a unit,
+the machine's units are inventoried, and translation is *on* — every enumerated PCI
+function has a context entry naming one identity-mapped domain, so what a device can
+reach is unchanged and the mechanism that decides it is now the kernel's. What is not
+built is everything the subsystem exists for: interrupt remapping (I3), per-driver
+domains and the map/unmap/invalidate path (I4), and the refusal (I5).
+
+Where a device address still comes from, until I4: every descriptor any driver writes
+is a raw `DirectMap::phys_of()` result (`mm/mod.rs:134`), reached through
+`KernelSlice::phys()` (`mm/region.rs:24`), and the identity domain is what makes that
+subtraction still the whole of the translation. `Iova::identity` is the one place that
+policy is stated (§5.7).
 
 ---
 
@@ -247,7 +251,7 @@ then never re-read.
 | `ECAP.QI` | queued invalidation | absent → register-based invalidation via `CCMD_REG`/`IOTLB_REG`, which is correct and slower |
 | `ECAP.IR` | interrupt remapping (§6) | clear |
 | `ECAP.EIM` | 32-bit APIC ids in IRTEs | clear on a machine using x2APIC ids above 255 |
-| `ECAP.PT` | passthrough translation type for kernel-owned devices (§5.7) | clear → kernel devices get identity-mapped domains instead, which is more page tables and the same protection |
+| `ECAP.PT` | nothing. Logged only — §5.7 writes an identity-mapped domain on every unit, including one that offers passthrough | never |
 
 ---
 
@@ -259,21 +263,28 @@ then never re-read.
   domain per device shared between processes, and not one domain per process holding
   several devices — a process that claims two devices gets two domains, so that a
   driver bug in one cannot reach the other's buffers through a shared IOVA space.
-- **All kernel-owned devices share one passthrough domain** (§5.7). The kernel is
+- **All kernel-owned devices share one identity-mapped domain** (§5.7, as §8.1
+  leaves it — passthrough is not available on any unit in reach). The kernel is
   trusted; giving its own devices translated domains would cost page tables and buy
   nothing, because a kernel driver bug is already a kernel bug.
 - **Every function `pci::enumerate` returned gets a context entry before translation
-  is enabled**, defaulting to passthrough. A function with no context entry faults on
+  is enabled**, naming the identity domain. A function with no context entry faults on
   its first DMA, and enabling translation with an unenumerated device on the bus is
   how a machine bricks its own boot disk. Consequence, stated because nothing
   enforces it: **a device that appears after boot has no context entry and will
-  fault.** USB hotplug does nothing today (`known-issues.md` §8) and PCIe hotplug is
-  unimplemented, so this is a documented limit rather than a live defect.
+  fault.** PCIe hotplug is unimplemented, so this is a documented limit rather than a
+  live defect. USB hotplug *is* implemented and is not an instance of it: a USB device
+  has no requester id of its own, and the DMA on its behalf is the xHC's, whose entry
+  was written at boot.
 
 Root table: 4096 bytes, 256 entries of 16 bytes indexed by bus. Context table per
-bus: 256 entries of 16 bytes indexed by `(device << 3) | function`. Both are single
-2 MiB PMM allocations under `Category::Dma`; a 256-bus context table array is 1 MiB
-and is allocated lazily per bus that has a device on it.
+bus: 256 entries of 16 bytes indexed by `(device << 3) | function`, allocated lazily
+per bus that has a device on it. Both, and every second-level table, are 4 KiB
+sub-allocations of 2 MiB PMM pages under `Category::Dma`: the PMM's granularity is
+2 MiB and a table is 4 KiB, so a page per table would waste 511 of every 512. On
+QEMU one 2 MiB page holds the lot — a 48-bit identity domain over 6 GiB of address
+space is 3072 leaves in 6 page directories, so root + context + PML4 + PDPT + 6 PDs +
+an invalidation queue and its status page is 12 tables of the 512 a page carves into.
 
 ### 5.2 `ECAP.C`, and why this kernel does not branch on it
 
@@ -424,19 +435,37 @@ matters — a driver process killed by another CPU — never touches an `Unmappe
 victim's stack, because reclaim does not run there. See §7.5 and
 `specs/userspace-drivers-spec.md` §5.
 
-### 5.7 Passthrough for kernel-owned devices
+### 5.7 One domain for kernel-owned devices, identity-mapped
 
-Context entry translation-type = passthrough (`ECAP.PT`), so the kernel's own drivers
-see the address space they see today and enabling the unit changes nothing about the
-boot storage path. This is the single largest de-risking decision in the plan: the
-stage that turns translation on is a stage where **nothing's behaviour changes**, and
-the full test suite is the evidence.
+Kernel devices see the address space they see today and enabling the unit changes
+nothing about the boot storage path. This is the single largest de-risking decision in
+the plan: the stage that turns translation on is a stage where **nothing's behaviour
+changes**, and the full test suite is the evidence.
+
+This section said *passthrough* (`ECAP.PT`) until I2, and called the identity-mapped
+alternative "one extra code path that would be exercised only on such a unit." §8.1
+measured `ECAP.PT` clear on the only unit anyone here can boot, which inverts that
+sentence: identity is the path every machine in reach runs and passthrough is the arm
+nothing executes. **Decision at I2: write an identity-mapped second-level domain
+always, and never a passthrough context entry, even on a unit that offers one.** This
+is §5.2's rule applied to §5.7 — a branch whose false arm no machine in reach takes is
+the defect, not the saving — and it costs one page directory per GiB of address space.
+`ECAP.PT` is read for the log line and for nothing else.
+
+The domain covers `[0, top)`, where `top` is one past the highest frame the PMM
+manages. One rule, and it is what makes "behaviour unchanged" a construction rather
+than a hope: every address a kernel driver can hand a device comes out of the PMM, so
+that range is exactly what the device could already reach on a machine with no unit.
+`top` is taken from the memory manager and not from the firmware memory map, whose
+own buffer is ordinary free RAM by the time this runs.
 
 Honest about what it does not buy: a kernel driver bug still scribbles anywhere. That
 is unchanged from today and the kernel is the trust domain, so it is not a
-regression. If `ECAP.PT` is absent, kernel devices get an identity-mapped translated
-domain instead — same protection, more page tables, one extra code path that would
-be exercised only on such a unit.
+regression. Isolation begins at I4, where an IOVA is *allocated* out of a space above
+the top of RAM (§5.3) rather than inherited from a physical address — which is why
+`Iova` exists at I2 with one constructor named `identity`: the policy has a single
+site, and the stage that stops identity-mapping deletes it and is handed every caller
+that assumed it.
 
 ---
 
@@ -547,17 +576,31 @@ The handler is bounded and does no allocation, no locking and no logging:
 5. Set `need_resched`. The scheduler pass reads the flag, logs **one** line, and kills
    the owning process.
 
-**A fault on a passthrough stream is a kernel bug and panics.** A fault on a
-userspace-driver stream is a driver bug and kills that process. That split is
+**A fault on a kernel-owned stream is a kernel bug and stops the machine.** A fault on
+a userspace-driver stream is a driver bug and kills that process. That split is
 CLAUDE.md's fail-fast/untrusted-input line drawn exactly where it belongs, and it is
 why the fault path needs no policy configuration.
+
+**Built at I2, and the split lands entirely on its first half**, because there are no
+userspace drivers yet and every stream is kernel-owned. So steps 4 and 5, and the
+counter and per-domain flag they need, are I4's; the handler decodes each record, logs
+one line naming the stream, the faulting address, the access and the reason, and then
+halts every CPU through `panic_console::capture` + `apic::halt_all_cpus` — which is
+what puts the reason on the panel of a machine with no serial port. Step 3 is I4's for
+the same reason: with the machine about to stop, a device told to stop is
+indistinguishable from one that has, and the store would be a line no configuration in
+reach can show doing anything.
 
 Fault reasons worth naming in the log rather than printing as a number: the
 root/context-entry-not-present cases, address-beyond-MGAW, the read- and
 write-permission cases, and from the interrupt-remapping band the
-compatibility-format-blocked and source-id-verification-failure cases. The numeric
-codes come off the specification's fault-reason appendix at implementation time; they
-are not reproduced here because a wrong constant in a spec outlives every review.
+compatibility-format-blocked and source-id-verification-failure cases. The raw code is
+printed either way, so a name is a convenience and never the record. The numeric codes
+are not reproduced in this file because a wrong constant in a spec outlives every
+review; in the code they are the ones on which the two independent decoders in reach —
+Linux's `dma_remap_fault_reasons` and QEMU's `VTD_FR_*` — agree, and where those
+disagree (`0x0c`, `0x0d`) the kernel prints the number and no name. Two are not cited
+but observed: the I2 gates assert the unit's own record decodes to `0x02` and `0x06`.
 
 ### 7.2 Mapping a source-id back to a process
 
@@ -735,6 +778,52 @@ later stage was going to make on the strength of it:
 two differences are what `iommu_discovery` asserts on, and they are the only reason
 the decode is known to be reading registers at all.
 
+### 8.2 A permission this unit will not fault on, measured at I2
+
+**QEMU does not report a fault for an access its cached translation already
+forbids.** Its IOTLB records a translation with the permissions of whichever access
+populated the entry, and a later access the entry does not allow is dropped by QEMU's
+*memory core* — the transaction never reaches the code that writes a fault record, so
+no fault event is raised and nothing appears on the host's stderr either.
+
+Measured, and it cost a stage's worth of debugging. I2's second negative control was
+first built as "grant the identity domain no write permission, and assert a device's
+write is blocked". The result was a boot that wedged in `nvme::init` with no fault, no
+kernel output at all, and a ten-second harness timeout: the controller's first access
+to its DMA pool is a descriptor *fetch*, which populated the entry read-only for the
+whole 2 MiB leaf, and every write it then made to the same page — the completion
+queue, the identify buffer — went silently nowhere.
+
+Three things follow, in order of how much they will cost somebody later:
+
+- **A negative control has to fail on a device's first touch of a page**, which is a
+  read. I2's is "a present context entry over an empty domain": the walk finds an
+  all-zero second-level entry and refuses the read. QEMU answers that with fault
+  reason `0x06` (read permission) rather than a separate not-present code — its own
+  line is `detected sspte permission error (iova=0x1000000, level=0x4, sspte=0x0,
+  write=0)` — so the gate asserts the reason is one a *second-level walk* decides
+  rather than naming one code.
+- **I4's permission-narrowing paths are not affected, because §5.5 already forbids
+  the shape that would hit this.** Narrowing is "as unmap": write the entries, flush
+  them, then invalidate — and an invalidation empties the entry that would have
+  masked the fault. A branch that skipped the invalidation would be silently
+  *correct-looking* here, which is one more reason §5.5 refuses to have one.
+- **The boot's own silence is a second instrument defect worth knowing about.** The
+  kernel log ring is drained only by the timer tick and the idle loop, and during boot
+  the timer is not armed and the idle loop has not been entered — so a boot that
+  wedges before either produces *no serial output at all*, including everything it
+  logged before wedging. Only the fatal paths flush (`serial::panic_flush`). Anyone
+  bisecting a boot wedge should put a `serial::flush_final()` in `log!` first; that is
+  how this one was found.
+
+Not measured, and the next stage's to answer: **whether QEMU's virtio devices are
+behind the unit at all.** §5.3 records that they bypass it unless created with
+`iommu_platform=on`, and `iommu_platform=on` needs the guest to negotiate
+`VIRTIO_F_ACCESS_PLATFORM`, which this kernel's virtio drivers do not. Under identity
+mapping a bypassing device and a translated one are indistinguishable, so the suite
+being green says nothing either way. It is why both of I2's gates run on
+[`Profile::Metal`], whose devices are all ordinary emulated PCI functions.
+
 ---
 
 ## 9. Stages
@@ -747,7 +836,7 @@ descriptions.
 |---|---|---|
 | **I0** | **Harness first.** An `iommu` dimension on `Shape` in `tests/common/qemu.rs` and `src/qemu.rs`; every profile passes `-device intel-iommu,intremap=on,caching-mode=on,aw-bits=48` and `-machine q35,kernel-irqchip=split`. No kernel change. Proves OVMF and the current kernel tolerate the device before anything depends on it. | `cargo test` green with the flag on every profile |
 | **I1** | **Discovery, read-only.** `acpi::find_table` made public; `kernel/src/iommu/{mod,vtd/dmar}.rs`; DRHD inventory, register windows mapped, `CAP`/`ECAP`/`VER` decoded, one log line per unit. Refuses nothing. | `cargo test -- iommu_discovery` — asserts the capability line under the flag and the distinct no-DMAR line without it |
-| **I2** | **Translation on, everything passthrough.** Root/context tables for every enumerated function, `SRTP`, `TE`. Behaviour unchanged by construction. | full `cargo test` green with `TES=1` asserted; plus `iommu_context_absent`, a kernel-feature actuator that marks one function's context entry not-present and asserts the boot fails with a DMA fault naming that function |
+| **I2** | **Translation on, one identity domain** (not "everything passthrough" — §8.1). Root/context tables for every enumerated function, second-level tables over `[0, top)`, queued invalidation, the fault-event MSI, `SRTP`, `TE`. Behaviour unchanged by construction. | full `cargo test` green with `TES=1` asserted; plus `iommu_context_absent` and `iommu_empty_domain`, kernel-feature actuators that strand one function above and below the context entry and assert the boot dies with a DMA fault naming it |
 | **I3** | **Interrupt remapping on.** Remappable IOAPIC RTEs and remappable `pci::enable_msi`/`enable_msix`; IRTA, `SIRTP`, `IRE=1`, `CFI=0`; every IRTE `SVT`-verified. | `cargo test -- metal_sim_input xhci audio nvme esp` green — every one of these depends on an interrupt arriving. Teeth: an IRTE written with the wrong source-id must red the corresponding test |
 | **I4** | **Domains, mapping, invalidation, faults.** `create_domain`/`attach`/`map`/`unmap`/`flush`, the `Unmapped`/`Flushed` pair, IOVA allocator, fault MSI and the kill-on-fault path. No syscall yet; driven by a kernel-feature self-test. | `cargo test -- iommu_selftest`, which maps, reads back through a device, unmaps, and asserts a stale access faults. Teeth: deleting the unmap-side invalidation must red it |
 | **I5** | **The refusal.** Sequenced deliberately after `specs/userspace-drivers-spec.md`'s first driver has moved, because before that a refusal costs every machine and protects nothing. | `cargo test -- iommu_refusal` — three variants (no `intel-iommu`; `intremap=off`; a unit whose `SAGAW` we reject via actuator), each asserting its own message and that userland is never reached |
@@ -773,6 +862,47 @@ later, so I2 does not have to rediscover it:
   read plausible garbage as a capability register — a wrong log line at I1, and a
   register write into somebody's heap at the stage that programs the unit.
 
+**I2 is done.** Every profile in the suite boots with its unit translating; the
+`gsts=…c4000000 tes=y qies=y` line is on every machine that has one, and both
+actuator gates are green. What its exit criteria turned out to mean, where the text
+above had said something else:
+
+- **"Everything passthrough" is "everything identity-mapped"**, per §8.1, and I2 goes
+  one step further than that finding: no passthrough context entry is written *ever*,
+  even on a unit that offers one (§5.7). §5.2's argument against an arm no machine in
+  reach executes applies to §5.7 as much as to `ECAP.C`.
+- **The fault-reporting path is part of I2, not I4.** §9 listed the fault MSI under
+  I4, but the I2 exit criterion asks for a boot that "fails with a DMA fault naming
+  that function" — which is a fault handler. `FEDATA`/`FEADDR` are programmed and
+  `FECTL.IM` cleared *before* `TE`, so the first transaction a unit blocks is one it
+  can report. §7.1's split lands entirely on its first half here: every stream on the
+  machine is kernel-owned, so every fault is a kernel bug and the handler logs the
+  record and halts every CPU through `panic_console::capture` + `halt_all_cpus`, which
+  is what puts the reason on the panel of a machine with no serial port.
+- **§7.1's step 3, clearing Bus Master Enable on the offending function, is not
+  implemented.** The next thing this handler does is stop the machine, so a device
+  told to stop and a machine that has stopped are indistinguishable and the store
+  would be a line no configuration in reach can show doing anything. It arrives with
+  I4, when the handler stops halting.
+- **§7.1's latch, counter, per-domain flag and `need_resched` handoff are also I4's.**
+  They exist to bound a storm from a userspace driver and to kill the process that
+  owns it; there is neither at I2.
+- **The register-based invalidation path §4.2 allows is not written.** Every unit in
+  reach has `ECAP.QI`, so `CCMD_REG`/`IOTLB_REG` would be the untested arm again. A
+  unit without it is *not programmed* and says so, which is I5's refusal one stage
+  early in everything but severity — the machine boots exactly as it does today,
+  because a unit that is never enabled does nothing to DMA. The same is true of a unit
+  offering no address width we implement, no 2 MiB superpage, too few domains, or
+  fault recording registers that do not fit its own 4 KiB window.
+- **`Iova` is in the portable seam; `DomainId`, `DmaPerm`, `IommuError` and
+  `trait Iommu` are still not.** `Iova` earns its place because the identity policy
+  needs exactly one site to live at (§5.7). The other four would each have one value
+  or one implementor, which is the dead abstraction I1 argued against.
+- **`ECAP.CM` and `ECAP.C` are still branchless, and now load-bearing.** Every table
+  write goes out of the cache in the same operation that performs it — `Table::write`
+  does the `clflush`+`mfence` and there is no way to call it without one — because
+  §8.1 found `ECAP.C` clear on the machines the suite runs.
+
 I0–I4 are independent of the capability-handles migration. I4's teardown path assumes
 `process::exit` gains an explicit reclaim phase (§7.5); if
 `specs/capability-handles-spec.md` stage B2 has landed, `DeviceClaim`'s
@@ -789,14 +919,16 @@ not negotiable is that the slow half never runs from the deferred queue.
 | No DMAR / no usable unit | Halt with a named reason on serial and on the panel (§2.2) | User enables VT-d in firmware, or the machine is unsupported |
 | Malformed DMAR (bad length, bad checksum, cyclic scope) | Refusal with the raw bytes named; never a panic | Same |
 | Device DMA to an unmapped IOVA | Transaction blocked by hardware; BME cleared in the fault handler; one log line; owning process killed | init respawns the daemon; a fresh claim succeeds |
-| Device DMA fault on a passthrough (kernel) stream | Panic — kernel bug | Fix the kernel |
+| Device DMA fault on a kernel-owned stream | The record is logged with the stream, address and reason; every CPU halts through the panic console. Built at I2, where every stream is one of these | Fix the kernel |
+| A unit lacking a capability this kernel needs | Left unprogrammed, with a line naming the register. I5 turns each into a halt | The machine boots as it does with no unit at all |
+| `GCMD` bit never appears in `GSTS` | Panic — a half-enabled unit has a reach nothing can state | None; hardware or programming fault |
 | Device writes `0xFEE00000` | Compatibility-format interrupt blocked; interrupt-remapping fault; as above | As above |
 | Driver fires its own IRTE in a loop | Counted, not logged; past the ceiling `IRTE.P` is cleared and the process is killed | As above |
 | Driver process killed while its device is mid-DMA | §7.5: BME cleared inline; unmap/flush/release on the exit path | Pages return only after acknowledged invalidation |
 | Invalidation not acknowledged within the bound | Panic — the kernel cannot know what the device can reach | None; this is a hardware or programming fault |
 | IOVA space exhausted | `IovaExhausted` → `ResourceExhausted` to the caller | Driver unmaps; a driver that leaks is buggy |
 | Interrupt remap table full | `ResourceExhausted` at claim time | — |
-| Device appears after boot with no context entry | Faults on first DMA, handled as any fault | Documented limit; hotplug is unimplemented |
+| PCIe device appears after boot with no context entry | Faults on first DMA, handled as any fault | Documented limit; PCIe hotplug is unimplemented. USB hotplug is not an instance: the DMA is the xHC's |
 | Device shares an isolation scope | Refused at claim (`ScopeShared`), stays a kernel device | — |
 | Device carries an RMRR | Refused at claim (`ReservedRegion`) | — |
 
@@ -821,14 +953,21 @@ driver. The only panics are for kernel bugs and for hardware that will not answe
 5. **5-level page tables** (57-bit AGAW). A level nothing needs and nothing tests.
 6. **4 KiB leaf entries.** §5.4.
 7. **A branch on `ECAP.C` or on `CAP.CM`.** §5.2, §5.5 — untestable arms.
-8. **IORT parsing and any ARM code.** The seam admits an SMMU backend; this file
-   writes none.
-9. **AMD-Vi.** Same.
-10. **A no-IOMMU fallback.** §2. This is the decision the rest of the file rests on.
-11. **Per-device IOVA-space randomization.** IOVAs index a domain the owning process
+8. **A passthrough context entry, or a branch on `ECAP.PT`.** §5.7, and the same
+   argument: the only unit in reach has `ECAP.PT` clear, so the passthrough arm would
+   be the one nothing executes. Read for the log line, never for a decision.
+9. **Register-based invalidation** (`CCMD_REG`/`IOTLB_REG`). §4.2 allows it for a unit
+   without `ECAP.QI`; every unit in reach has one, so it would be an untestable arm
+   too. Such a unit is left unprogrammed and named, which is I5's refusal one stage
+   early and leaves that machine exactly as it boots today.
+10. **IORT parsing and any ARM code.** The seam admits an SMMU backend; this file
+    writes none.
+11. **AMD-Vi.** Same.
+12. **A no-IOMMU fallback.** §2. This is the decision the rest of the file rests on.
+13. **Per-device IOVA-space randomization.** IOVAs index a domain the owning process
     already exclusively holds; there is nothing to guess. (The same argument
     `specs/capability-handles-spec.md` §14.9 makes about handle values.)
-12. **Reclaim on a dedicated kernel thread.** The kernel has no in-kernel thread
+14. **Reclaim on a dedicated kernel thread.** The kernel has no in-kernel thread
     mechanism today — `process::spawn_kernel` (`loader.rs:1119`) spawns a *userland*
     process — and adding one is a kernel addition needing its own discussion. §7.5's
     exit-path phase needs none.
@@ -841,6 +980,15 @@ driver. The only panics are for kernel bugs and for hardware that will not answe
   "nothing works", which is the hardest kind to bisect. Mitigated by landing it alone,
   against a suite where every input, storage and audio test already depends on an
   interrupt.
+- **Whether the harness's virtio devices are behind the unit at all is unknown**
+  (§8.2). QEMU hands a virtio device the bypassing address space unless it is created
+  with `iommu_platform=on`, and that option requires the guest to negotiate
+  `VIRTIO_F_ACCESS_PLATFORM`, which this kernel's virtio drivers do not. Under I2's
+  identity mapping the two are indistinguishable, so the whole green suite is evidence
+  for neither. It stops being harmless at I4, where an IOVA is not a physical address:
+  a bypassing virtio device handed one writes to whatever that number happens to be.
+  The `VIRTIO_F_ACCESS_PLATFORM` negotiation is a virtio-driver change and belongs
+  with whichever stage first needs a virtio device translated.
 - **Isolation scopes (§7.3) are modelled, not measured.** The first real answer is the
   T14, and the answer could be that a device this project wants in userspace is not
   isolatable there.
