@@ -2292,6 +2292,24 @@ question for whoever does own it is whether the guest-side event can be timed
 against something the host does not have to hold, since a margin this thin
 cannot survive a shared machine.
 
+### `git stash` in a shared tree takes everyone's uncommitted work
+
+Observed, not theorised: `stash@{0}: On main: compositor-stats-wip` appeared
+while two agents were editing, and the working tree came back clean — the
+stasher's own edits to `userland/window/` and `userland/compositor/`, and an
+unrelated agent's half-finished test in `tests/toyos.rs`, all went into the
+same stash entry. Nothing was lost, because a stash is recoverable, but the
+other agent's file vanished mid-edit with no indication of where it went.
+
+CLAUDE.md already warns about `git add -A`, `--amend`, and branch creation for
+the same reason. `stash` belongs on that list and is worse in one way: the
+other three leave the work visible, and this one makes it disappear.
+
+If it happens to you: `git stash list` first, then take back only your own
+paths with `git checkout stash@{N} -- <your paths>` — never `git stash pop`,
+which would drop somebody else's work into your tree as though it were yours.
+Better: commit before you stash, since a commit is cheap and this is not.
+
 ### Two framebuffer clients still pay the scanout's price, and the panic console pays it worst
 
 Closed for `/bin/console` in `45b5010`: the terminal emulator composed against
