@@ -1271,6 +1271,72 @@ there is never a parked mouse reader to wake. Fixing the asymmetry by making
 Mouse block is what would give `MOUSE` a waiter; deleting the queues is what
 would make the current behaviour honest. Do not do neither.
 
+### `bcachefs::Fs::rename` destroys the file and reports success
+
+`fs::rename` on `/home` deletes the file from **both** names and frees its blocks, and
+returns `Ok(())`. Measured in the guest at `647c3c0`, `/home` freshly formatted:
+
+```
+PROBE before: a=Ok(6) b=Err(Kind(NotFound))
+PROBE rename -> Ok(())
+PROBE after:  a=Err(Kind(NotFound)) b=Err(Kind(NotFound))
+PROBE /home holds []
+```
+
+`bcachefs/src/fs.rs:741` does four steps in this order: find the old entry, **insert** an
+entry keyed by `new_name`, `delete_by_name(new_name)`, delete the old key. Step 3 is meant
+to reclaim a destination that already existed, but step 2 has already put the renamed file
+under exactly that key — so step 3 deletes the entry step 2 just wrote, and
+`delete_by_name` frees its extents on the way out (`fs.rs:716`). The comment on step 2
+("crash-safe: duplicate better than loss") describes an ordering that would be right if
+step 3 captured the target *before* the insert; it does not.
+
+The fix is to look the target up and free its blocks before inserting, or to delete it
+first and accept the crash window the comment is arguing against. Both are one function.
+
+**Nothing in the suite covered a successful rename before this.** `fs_large_file` is the
+only test that calls `fs::rename` and it asserts the *failure* direction — a 4096-byte
+name is refused — so a rename that reports success and loses the file passed every gate.
+`toybox_file_tools` renames on `/tmp` only, with a comment saying why; when this is fixed,
+moving its `BIG_SRC`/`BIG_DST` to `/home` is the gate that would have caught it.
+
+Reachable from userland as `mv /home/a /home/b`, and from `cp` onto `/home`, which renames
+its working file into place.
+
+### An empty directory does not stat as a directory
+
+`sys_readdir` returns 0 both for a directory with nothing in it and for a path that names
+nothing (`vfs::list` hands back `Ok(vec![])` in both cases), and `std`'s
+`sys::fs::toyos::is_dir` reads that 0 as "not a directory" (`is_dir`, `fs/toyos.rs:367`).
+So after `fs::create_dir("/tmp/d")`, `fs::metadata("/tmp/d").is_dir()` is `false` until
+something is written into it, and `fs::read_dir` on a path that does not exist yields an
+empty iterator rather than `NotFound`.
+
+What that costs: every tool whose two-argument form means "into this directory" —
+`cp x d/`, `mv x d/` — silently writes a *file* named `d` when `d` is an empty directory.
+`toybox_file_tools` puts a file in every directory it makes so it can test the rule at all.
+
+The honest shape is for `readdir` to distinguish the two, which means `vfs::list` returning
+`Err(NotFound)` for a path no directory could be — `created_dirs` already knows which
+names are directories.
+
+### `Command::output()` returns an empty stderr, always
+
+`sys::process::toyos::output` (`rust/library/std/src/sys/process/toyos.rs:235`) reads the
+stdout pipe and then returns `Vec::new()` for stderr unconditionally. It has already asked
+`spawn` for a stderr pipe, so the bytes exist and are dropped — and a child that writes
+more than the pipe holds blocks forever against a reader that never comes.
+
+`Output::stderr` is a documented promise this does not keep, which is the sentinel problem
+in another dress: the caller cannot tell "the child said nothing" from "we did not look".
+Measured: `/bin/cp` refusing a missing source issues three `SYS_WRITE`s to fd 2 and
+`output().stderr` comes back empty.
+
+`wait_with_output()` is the cross-platform path and does read the pipe, so the workaround
+is to `spawn()` and call that — which is what `toybox_file_tools` does, one stream at a
+time to stay off the two-pipe `read2` path. The fix is for `output` to read both pipes, or
+to be deleted so the cross-platform default is used.
+
 ### The `bcachefs/` crate does not implement bcachefs — a question for the owner
 
 ToyOS's `bcachefs/` crate implements a ToyOS-native on-disk format written from scratch.
@@ -3923,7 +3989,30 @@ mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
 `kernel/src/log_file.rs` writes the kernel's log to `/log/kernel.log`. Gated by
 `esp_filesystem`, `kernel_log_file`, `log_backing_read_error`,
 `log_partition_automount` and `log_partition_identity`
-(`tests/common/volumes.rs`).
+(`tests/common/volumes.rs`), and `toybox_cp_volume` (`tests/common/toybox.rs`).
+
+### The ESP's four megabytes of slack are eaten by its own FATs
+
+`create_esp_volume` sizes the partition at `content + 4 MiB` (`src/image.rs:147`), which
+reads as four megabytes of room to write into at runtime. Measured by reading the built
+images back with the `fatfs` crate and asking each volume for its free-cluster count:
+
+| image | partition | cluster | free clusters | free bytes |
+|---|---|---|---|---|
+| `tests/testcases` boot image | 254 MiB | 512 B | 167 | **85,504** |
+| shipping `system.toml` (`target/bootable.img`) | 646 MiB | 4096 B | 695 | 2,846,720 |
+
+At those volume sizes FAT32 picks a small cluster, so the two FATs describing half a
+million of them consume the whole margin. `/boot` is therefore effectively full on
+arrival: `esp_files`' 41,097-byte blob fits and not much more would. `toybox_cp_volume`
+started on the ESP for exactly the reason the margin suggests it should work, failed at
+`create_file` with `No space left on device`, and moved to `/log` — which is 34 MiB with
+33 MiB free and is now shared with `log_file`.
+
+Whether `/boot` is *meant* to be writable at runtime is a design question and not
+obviously "yes". But the size expression says four megabytes and delivers 85 KB, which is
+a number that lies. Either size it from the free space wanted after formatting, or say in
+the comment that the margin is FAT overhead and `/boot` has no working room.
 
 ### CLOSED — a metal boot reached a desktop with no `/log`, intermittently, because the boot disk arrived after the port scan
 
