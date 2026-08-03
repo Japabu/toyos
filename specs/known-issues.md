@@ -2641,6 +2641,49 @@ attempt. So "re-run it in isolation" is not the discriminator this entry says it
 is: a `cargo test -- xhci_slow_connect` on a loaded host is not an isolated run,
 and 7 ms of margin is inside what the load costs. The margin is the finding.
 
+**Diagnosed, and it is not a margin — the assertion measures a delta against an
+absolute window.** Six runs, both with and without the #116 changes, taken while
+`xhci_slow_connect` was failing on *every* attempt:
+
+| run | `controller started` | first `xHCI: port` | delta |
+|---|---|---|---|
+| sc1 | 0.108 | 0.400 | 0.292 |
+| sc2 | 0.110 | 0.400 | 0.290 |
+| sc3 | 0.107 | 0.400 | 0.293 |
+| sc4 | 0.182 | 0.413 | 0.231 |
+| base1 (no #116) | 0.106 | 0.400 | 0.294 |
+| base2 (no #116) | 0.236 | 0.401 | 0.165 |
+
+**The first port line is at 0.400 every time, and that is exactly right.**
+`SLOW_CONNECT_NS` is applied in `read_portsc` as `nanos_since_boot() < 300 ms`,
+so it is measured from *boot*: the ports become visible at absolute t=300 ms, and
+`await_connect_settle` then needs `PORT_DEBOUNCE_NS` = 100 ms of a held-still
+non-empty mask, which puts the first connect at absolute t≈400 ms. The driver's
+behaviour is invariant across all six runs.
+
+What varies is `controller started`, from 0.106 to 0.236. The test computes
+`first_seen - started` and requires ≥ 0.300, so it is really requiring
+
+```
+400 ms − started ≥ 300 ms   ⟺   started ≤ 100 ms
+```
+
+The "margin" is `PORT_DEBOUNCE_NS − time_to_controller_started`. It was ~3 ms
+when the boot reached `controller started` at 97 ms; it is now negative on every
+run because the boot has permanently crossed 100 ms as the kernel and initrd
+grew. Host load matters only through that one number.
+
+So the fix is arithmetic in the *gate*, not timing: assert on the **absolute**
+timestamp of the first port line (≥ `SLOW_CONNECT_NS`), which is what the
+injection actually claims, or compare against
+`SLOW_CONNECT_NS + PORT_DEBOUNCE_NS − started`. Either is immune to how long the
+boot takes to reach the controller. Left to #92's owner; recorded here because
+the entry above says "the margin is the finding" and the margin is a symptom.
+
+Not caused by #116/#118: base1 and base2 above are the same tree with
+`kernel/src/drivers/xhci/mod.rs` reverted to before those changes, and they fail
+identically.
+
 ### `git stash` in a shared tree takes everyone's uncommitted work
 
 Observed, not theorised: `stash@{0}: On main: compositor-stats-wip` appeared
@@ -3100,6 +3143,42 @@ Three things the entry warned about, and what each turned out to need:
 
 Two residuals, both recorded below rather than here: what the enumeration still
 costs a scheduler pass, and what an idle CPU pays for the debounce.
+
+### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
+
+`bdf2596` moved the *boundary* — an input read no longer drives the driver — so
+the only thread that runs enumeration and recovery now is the one inside
+`drain_irqs`. That fixes who pays; it does not change what is paid.
+
+Every wait in this driver is a spin against a wall-clock deadline, taken while
+holding `XHCI`, which is a ticket spinlock and therefore preemption off for its
+whole life:
+
+- `settles()` — controller halt, HCRST, CNR, R/S, and the port reset. Bound
+  `USB_TIMEOUT_NS`, 2 s.
+- `wait_command()` and `wait_transfer()` — every command and every transfer.
+  Same bound, and an endpoint recovery issues up to three of them in a row
+  (Reset Endpoint, Set TR Dequeue, CLEAR_FEATURE(HALT)).
+
+So a worst case is a CPU that does not reschedule for **six seconds**, and an
+ordinary hot-plug enumeration on the T14 is ~14 ms of it (the entry below).
+Nothing in the suite can measure the bad case: QEMU answers every one of these
+in microseconds, which is why a driver built entirely out of them passed
+everything here for a season.
+
+**The conversion is the same idiom `PortWork` already uses** — the debounce and
+the port reset were spins until #94 and are now states the poll returns to — so
+the shape is known and the work is mechanical rather than novel. What makes it
+big is its extent: `configure` is a straight line of control transfers and
+`restart_endpoint` a straight line of commands, and each has to become a state
+machine that gives the pass back between steps. That is the whole enumeration
+and recovery path, which is why it is filed rather than folded into #116/#118.
+
+One case is *not* fixed by that and needs its own answer: `storage_read` and
+`storage_write` are called by the page cache on a faulting thread, so a thread
+touching a file on a USB disk drives a SCSI command under the same lock. The
+input poll was gratuitous and could simply be deleted; this one is inherent, and
+the choice is between an I/O thread and making the block layer asynchronous.
 
 ### The hotplug enumeration blocks a scheduler pass, and its debounce keeps a CPU awake
 
