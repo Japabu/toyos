@@ -1,0 +1,638 @@
+# Test cost audit
+
+What the suite costs, where the seconds actually are, and what each way of
+spending less would buy — priced against measurements, with the risk of each
+stated. **This audit optimises the suite's cost and never its coverage.** No
+proposal here removes an assertion, weakens a negative gate, or drops a machine
+shape; where a change could do that by accident, the section says what evidence
+keeps its teeth.
+
+Measured 2026-08-03 on the dev laptop (14 cores, `hw.ncpu` = `hw.physicalcpu` =
+14). Two kinds of number appear and are always labelled:
+
+- **Archived** — mined from nine complete full-run logs written by other agents
+  between 2026-08-01 and 2026-08-03, and from 44 full-suite result lines in this
+  session's transcripts. Other agents were building and booting throughout, so
+  absolute values carry contention noise; *rankings* and *ratios within one run*
+  are sound.
+- **Isolated** — run by this audit, foreground, on a host with no other cargo or
+  QEMU process active (`uptime` load 3.78, one leaked `qemu-system-x86_64` from
+  a `cargo run` two days earlier idling at 1.7%). Still not a quiet host in the
+  `tests/audio-baseline.toml` sense.
+
+Anything derived by arithmetic rather than run is marked **(derived)**.
+
+---
+
+## 1. Where the seconds go
+
+### 1.1 The suite is four blocks, and two of them are the whole cost
+
+`tests/toyos.rs`'s `main` runs four blocks in order: a **shared boot** carrying
+every Rust and C test, then **audio**, then **machine**, then **screen**. Only
+the first shares a QEMU; everything else owns one.
+
+Current census, from `cargo test --test toyos-build -- --list` (isolated,
+2.9 s wall — see §1.3):
+
+| block | tests | boots |
+|---|---:|---:|
+| Rust (shared boot) | 45 | shares 1 |
+| C (shared boot) | 108 | shares 1 |
+| audio | 2 names × 2 SMP = 4 | 4 |
+| screen | 13 | ~14 |
+| machine | 60 | ~57 |
+| **total** | **229** | **~76** |
+
+That census is already stale. `MACHINE_TESTS` held 60 names when this audit
+started at 14:31 and 62 when it finished — `iommu_context_absent` and
+`iommu_empty_domain` were added by another agent while it was being written.
+**The suite grew during the audit of the suite.** That is the discipline working
+as intended and it is why this document prices the cost curve rather than the
+snapshot.
+
+Per-block time, from the most recent archived full run (`full4.log`, 225 tests,
+625.6 s suite):
+
+| block | tests | seconds | share |
+|---|---:|---:|---:|
+| Rust | 44 | 10.9 | 1.7% |
+| C | 109 | 2.6 | 0.4% |
+| audio | 4 | 34.0 | 5.4% |
+| machine | 55 | 407.0 | 65.1% |
+| screen | 13 | 166.0 | 26.5% |
+| inter-test / setup | — | 5.1 | 0.8% |
+
+The same shape holds across all nine archived runs; machine has been 63–79% of
+every one of them.
+
+**The headline: 153 of 229 tests — 67% of the suite — share one boot and cost
+13.5 s between them, 2.2% of the wall clock. The other 76 tests own a boot and
+cost 97%.** Any proposal that touches the shared block is optimising 2% of the
+problem.
+
+### 1.2 Top ten most expensive tests
+
+From the two most recent archived runs, which were launched two minutes apart
+and overlapped almost entirely — so the pair also shows what contention does to
+a number (225 tests both, 625.6 s and 596.0 s):
+
+| # | test | full4 | suite4 |
+|---:|---|---:|---:|
+| 1 | `screen_console_scroll` | **103 s** | **109 s** |
+| 2 | `double_fault_stack` | 25 s | 24 s |
+| 3 | `xhci_deaf_registers` | 16 s | 14 s |
+| 4 | `metal_sim_compositor_stall` | 14 s | 15 s |
+| 5 | `iommu_discovery` | 14 s | 14 s |
+| 6 | `i8042_mouse` | 14 s | 13 s |
+| 7 | `log_backing_read_error` | 14 s | 12 s |
+| 8 | `usb_flush_optional` | 13 s | 11 s |
+| 9 | `i8042_health` | 12 s | 12 s |
+| 10 | `usb_storage_gate` | 12 s | 11 s |
+| — | `audio_tone_load` (smp=1, smp=8) | 10 s each | 10 s each |
+
+`screen_console_scroll` alone is **17% of the entire suite** and four times the
+next test. §3.1 shows most of that is host-side, not guest-side.
+
+### 1.3 The phase split of a single own-boot test
+
+Three isolated filtered runs decompose the fixed cost of owning a boot:
+
+| what was run | what it does | suite time | wall |
+|---|---|---:|---:|
+| `serial_vocabulary` | pure host check, no image, no guest | 0.000083 s | 2.83 s |
+| `log_partition_layout` | builds a boot image, reads its GPT, **never boots** | 1.4 s | 4.31 s |
+| `nvme_wide_sector` | builds an image and boots a guest that dies at 0.068 s | 3.7 s | 6.52 s |
+
+Reading down the column:
+
+- **Prepare phase = 2.83 s.** Compiling 120 C tests and 60 Rust test binaries,
+  warm. Paid once per run, and it sits *outside* `suite_elapsed` — the number
+  printed as `test result: ok. N total (Xs)` does not include it. Negligible.
+- **Image build = 1.4 s.** Paid on **every** boot.
+- **QEMU spawn + OVMF + kernel boot + teardown = 2.3 s** (3.7 − 1.4). This is
+  for a guest that panics 68 ms in, so it is pure emulator and firmware
+  overhead, not guest work.
+
+**The fixed tax for owning a boot is ~3.7 s. At ~76 boots that is ~281 s —
+about 47% of a 600 s run is spent starting machines, not testing them.**
+(derived from the two measured components × the counted boots)
+
+### 1.4 The image build is three no-op cargo invocations
+
+`build_test_image` (`src/build.rs:581`) runs `cargo_build` for the kernel, for
+the bootloader, and for the userland workspace, then assembles the initrd and
+the GPT/FAT32 image. Isolated benchmark of the assembly half, using the same
+`fatfs` and `gpt` crates on a 64 MiB FAT32 volume with three multi-megabyte
+files, in its own target dir so the shared tree was untouched:
+
+```
+opt-level 0: 52.1 ms per image build
+opt-level 2:  4.0 ms per image build
+```
+
+So **assembly is not the 1.4 s** — the 1.4 s is three `cargo` process spawns
+asking whether anything changed. `tests/testcases/system.toml` declares three
+programs, all workspace members, so it really is three invocations.
+
+**And most of those builds are redundant.** The image is a function of
+`(config, kernel_features)` only. Across the 72 boots this audit could attribute
+statically there are just **31 distinct image variants**:
+
+```
+27x testcases/plain          7x testcases/usb-storage-gate
+ 5x metalcase/plain          3x testcases/test-late-panic
+ 3x testcases/i8042-trace    2x console/test-screen-graffiti
+ … 25 more, one boot each
+```
+
+**41 redundant image builds × 1.4 s = 57 s per run.** (derived)
+
+### 1.5 Kernel feature rebuilds explain the 596 → 752 spread
+
+There are **31 distinct kernel feature sets** in the suite (30 named plus
+plain): `test-late-panic`, `i8042-trace`, `xhci-deaf-controller`,
+`usb-storage-gate`, `test-tiny-va`, `test-heap-ceiling`, `fat-backing-read-fails,
+test-small-caches`, and so on. `MACHINE_TESTS` and `SCREEN_TESTS` already sort
+feature-carrying tests last to limit the thrash.
+
+Two isolated A/B pairs measured what a feature set costs the *first* time it is
+built against the current source:
+
+| | first build of that variant | repeat |
+|---|---:|---:|
+| `heap_ceiling_recovery` (`test-heap-ceiling`) | 9.5 s suite / 26.9 s CPU | 4.5 s / 6.7 s |
+| `va_exhaustion` (`test-tiny-va`) | 10.4 s suite / 25.9 s CPU | 6.4 s / 6.2 s |
+
+**A cold kernel variant costs ~4–5 s wall and ~20 s CPU.**
+
+Then a four-iteration alternation between `diskless_boot` (plain) and
+`va_exhaustion` (`test-tiny-va`) showed **no rebuild at all** — 5.6–6.5 s CPU
+every time, no 25 s spike. Cargo keeps every feature variant simultaneously:
+`ls target/kernel-*` shows **36 staged artifacts**, one per feature key, and the
+uplifted binary changes size between runs as cargo swaps the cached variant in.
+
+That gives the model:
+
+- **After any kernel source change**, a full run pays ~31 cold variants ×
+  ~4–5 s ≈ **124–155 s** that a run on an unchanged kernel does not pay.
+  (derived)
+- **On an unchanged kernel**, feature switching is free.
+
+This is the single largest explanation for the spread the owner is seeing across
+otherwise-identical runs (596 s, 609 s, 706 s, 752 s). It is not noise and it is
+not growth — it is whether that run happened to be the first after someone
+touched `kernel/`.
+
+### 1.6 Cost model, checked against the observed total
+
+| component | seconds |
+|---|---:|
+| QEMU + OVMF floor, 76 boots × 2.3 s | 175 |
+| image builds, 76 × 1.4 s | 106 |
+| shared-boot guest work (45 Rust + 108 C) | 14 |
+| audio, 4 boots | 34 |
+| `screen_console_scroll` | 103 |
+| everything else's guest work and host waits | ~170 |
+| **subtotal, unchanged kernel** | **~600** |
+| cold kernel variants, when `kernel/` changed | +124–155 |
+
+Which brackets every archived full run.
+
+### 1.7 What a new test costs — the actual growth rate
+
+Two archived runs 47 hours apart, both full, both green:
+
+| when | tests | suite |
+|---|---:|---:|
+| 2026-08-01 13:25 (`gate/full2.log`) | 202 | 360.0 s |
+| 2026-08-03 12:17 (`full4.log`) | 225 | 625.6 s |
+
+**+23 tests, +265.6 s — 11.5 s per added test.** (derived)
+
+That is three times the 3.7 s per-boot floor, and the gap is the point. New
+tests are not going into the shared boot; every one of the 23 went into
+`MACHINE_TESTS` or `SCREEN_TESTS`, and several brought a new kernel feature with
+them, which adds ~4–5 s of cold rebuild (§1.5) on top of the 3.7 s floor on
+every run after a kernel change. **A gate written the house way currently costs
+~11.5 s of everyone's suite, forever.** §3.1–3.3 do not change that marginal
+rate much; §3.3 divides it by the parallel width, which is the only lever that
+does.
+
+---
+
+## 2. Classification
+
+Every test, by what it actually needs.
+
+### (a) Host-testable logic wearing a QEMU boot — **3 tests, already migrated**
+
+`serial_vocabulary` (67 µs), `screen_decoder` (0 s) and `log_partition_layout`
+(1.4 s, builds an image and never boots) already sit in `MACHINE_TESTS`/
+`SCREEN_TESTS` while needing no guest. They cost nothing and their placement is
+a registration convenience, not a defect.
+
+**This audit found no further candidates.** Every other own-boot test asserts on
+a running guest, on the host side of a device the guest touched, or on pixels a
+guest painted. The 108 C tests and 45 Rust tests test programs *running on
+ToyOS* — a host port would be testing something else. `toyos-sched/`,
+`toyos-ps2/`, `toyos-gpt/` and `toyos-fat32/` already hold the logic that could
+come down the ladder.
+
+**Do not spend a wave here.** It is the option that sounds most attractive and
+has the least in it.
+
+### (b) Needs a boot but could share one — **12 boots, ~44 s**
+
+Grouping all 72 attributable boots by the *full* `BootOptions` key — config,
+profile, `kernel_features`, `i8042`, `mute`, `smp`, `ready_marker`,
+`nvme_image`, `boot_image`, `usb_image` — gives **60 distinct shapes**. Only
+these groups boot the same machine more than once:
+
+| boots | shape | tests |
+|---:|---|---|
+| 4 | `metalcase` / `Metal` / plain | `metal_sim_compositor`, `metal_sim_compositor_stall`, `metal_sim_ipc_hostile_peer`, `metal_sim_window_caps` |
+| 3 | `testcases` / `Metal` / plain, staged `boot_image` | `esp_filesystem`, `kernel_log_file`, `log_partition_identity` |
+| 3 | `testcases` / `Metal` / `i8042-trace` | `i8042_keyboard`, `i8042_mouse`, `i8042_no_spurious_wake` |
+| 2 | `console` / `Metal` / `test-screen-graffiti` | `screen_console_clear`, `screen_console_scroll` |
+| 2 | `testcases` / `Gop` / `test-late-panic` | `screen_late_panic`, `screen_paged_scrollback` |
+| 2 | `testcases` / `MetalHotplug` / plain | `xhci_flap`, `xhci_hotplug` |
+| 2 | `testcases` / `Headless` / plain | `iommu_discovery`, `metal_sim_input` |
+| 2 | `testcases` / `Metal` / plain | `i8042_health`, `i8042_undecoded_bytes` |
+
+**12 boots removable, ~44 s (7%).** Note this is half what a coarser key
+suggests: grouping on `(config, profile, features)` alone shows 23 removable
+boots, and the difference is entirely `i8042: false`, `mute`, staged images and
+`ready_marker` — fields that *are* the shape for the test that sets them.
+Consolidating on the coarse key would silently change what several tests boot.
+
+### (c) Genuinely needs its own machine shape — **~60 boots**
+
+The remainder. `tests/common/qemu.rs` declares **21 `Profile` variants**, each
+with a doc comment naming the defect that shape exists to reach — device size,
+sector size, device presence, device *order*, link speed, two controllers,
+hotplug. Per `specs/device-test-strategy.md` these are the suite's crown jewels
+and none of them is a candidate for anything in this document.
+
+### (d) Timing-sensitive — **~10 boots, and they constrain everything**
+
+| test | what makes it timing-sensitive |
+|---|---|
+| `audio_tone` ×2, `audio_tone_load` ×2 | gate A's fast tier; see below |
+| `i8042_fadt_denial` | compares two boots' guest `boot_millis` with a 300 ms margin (`tests/toyos.rs:4535`) |
+| `metal_sim_pointer_churn` | QMP event pacing, 60–800 ms sleeps, margin sized for "QEMU coalescing rel events it has not been polled for" |
+| `xhci_slow_connect` | mirrors the kernel's `SLOW_CONNECT_NS` as `HELD_EMPTY_S = 0.300` |
+| `late_storage_connect` | same shape, `xhci-slow-storage-connect` |
+| `xhci_flap`, `xhci_hotplug` | debounce windows |
+| `i8042_health_cadence` | `i8042-fast-health` cadence |
+
+**Gate A is the binding constraint, and it is not a margin question.**
+`tests/audio-baseline.toml` records that its numbers were derived on "a quiet
+host: one QEMU at a time, no concurrent agents or builds for the whole session".
+The fast tier's per-run ceilings have headroom (`max_wake_lat_us = 56000` against
+a 7 ms median) but the thorough tier compares *distributions* against that
+recording, and `specs/audio-gate-history.md`'s reusable lesson is that these
+counters drift between batches on one host with no code change. **Gate A cannot
+be certified on a host that is running anything else.** Everything in §4 has to
+answer to that.
+
+---
+
+## 3. Strategy options, priced
+
+Ordered by savings-per-risk. Each states what evidence keeps its teeth.
+
+### 3.1 Build the harness optimised — **~30–50 s, LOW risk** ⭐
+
+`Cargo.toml` raises `opt-level` for `toyos-cc` and `toyos-ld` only. The test
+harness, `toyos_build`, and their deps (`fatfs`, `gpt`, `image`, `bcachefs`)
+build at **opt-level 0**, and two hot host loops live there.
+
+Isolated benchmark of the screendump path — `Ppm::parse` plus `console_rows`
+over a 1920×1080 frame, the exact loops from `tests/common/screen.rs`, compiled
+standalone at both levels:
+
+```
+opt-level 0: 96.3 ms per screendump decode
+opt-level 2:  2.6 ms per screendump decode      37x
+```
+
+Every poll of `screendump_while` parses 2.07 M pixels into a `Vec<[u8;3]>` and
+hashes 16,080 glyph cells of 128 bytes each. `screen_console_scroll` polls at
+250 ms across three rounds over ~99 s — **roughly 250 polls (derived from the
+interval and the test's measured duration), so ~23 s of its 103 s is host-side
+glyph decoding that opt-level 2 would return.** Twelve more screen boots poll
+the same way, and `screendump_until` polls at 100 ms, where a 96 ms decode
+nearly doubles the period.
+
+Image assembly gains too (52 ms → 4 ms, §1.4), though it is small.
+
+- **Saving: ~30–50 s (5–8%).** The range is honest: the decode ratio is
+  measured, the poll count is derived.
+- **Risk: LOW.** No test semantics change. Two things to check: the harness must
+  keep `debug = true` so LLDB still works on it, and the screen family must be
+  re-run green, because faster polling changes the *cadence* at which
+  `screen_console_scroll` samples the panel. More samples is more coverage, not
+  less — but it is a change to the observation, so it gets a green run before it
+  lands.
+- **Teeth:** none touched. Same assertions, same dumps, decoded faster.
+- **Decision: orchestrator.**
+
+### 3.2 Cache the image build per `(config, kernel_features)` — **~57 s, LOW–MEDIUM risk** ⭐
+
+31 distinct image variants serve 72 boots (§1.4). Cache within a run.
+
+- **Saving: 41 × 1.4 s = 57 s (9.5%).** (derived from measured components)
+- **Risk: LOW–MEDIUM, and it has one sharp edge.** `create_boot_image`
+  (`src/image.rs:51`) mints a fresh `Uuid::new_v4()` per call and writes it into
+  both the GPT entry and `\toyos\log.guid`. Caching the *assembled image* would
+  freeze that GUID across boots. **Cache the `(kernel_bytes, bootloader_bytes,
+  initrd_bytes)` triple instead and call `create_boot_image` fresh every boot** —
+  assembly is 52 ms, so there is nothing to save there anyway, and every boot
+  keeps its own GUID.
+- **Teeth:** the cache key must hash everything `build_test_image` consumes —
+  config path, `kernel_features`, and the `extra_files` vector — and live in the
+  test process, never on disk across runs. A stale key would boot the wrong
+  image, which is exactly the class of defect this suite exists to catch, so the
+  key is the review surface. `boot_partition_identity`'s premise (a fresh GUID
+  per boot) is the negative control that would go red if the GUID froze; it
+  stays in the suite unchanged and is the evidence this change kept its teeth.
+- **Decision: orchestrator.**
+
+### 3.3 Parallel boots with a serial timing-sensitive tail — **~600 s → ~175 s, HIGH risk** ⭐
+
+QEMU machines are independent. The boot-dominated share is machine 407 s +
+screen 166 s = 573 s.
+
+Modelled with §3.1 and §3.2 already applied (boot share ≈ 488 s), audio serial,
+shared block serial: (derived)
+
+| width | parallel share | + audio | + shared | total | vs 600 s |
+|---:|---:|---:|---:|---:|---:|
+| N=1 | 488 | 34 | 17 | 539 | 1.1× |
+| N=4 | 122 | 34 | 17 | **173** | **3.5×** |
+| N=8 | 75 (floor) | 34 | 17 | 126 | 4.8× |
+
+**Past N≈5 the critical path is one test.** `screen_console_scroll` at 103 s
+(75 s after §3.1) becomes the floor, so §3.1 and §3.3 compound — cutting the
+longest test is worth more once the rest is parallel than it is now.
+
+**Host budget.** 14 cores. Each QEMU runs `smp: 2` by default, so ~3 host
+threads. **N=4 ≈ 12 threads is the honest ceiling for one suite on this host**,
+and that is before any cargo build.
+
+- **Risk: HIGH, and it is entirely about whether the (d) classification stays
+  trustworthy as tests are added.** The classification in §2 is a snapshot; the
+  house adds gates with every fix, and a timing-sensitive test added next week
+  that inherits "parallel" silently mismeasures. **The only safe shape is a
+  default, not an opt-in: a test is serial-tail unless it declares itself
+  parallel-safe**, so the failure mode of forgetting is a slow suite rather than
+  a wrong one. That is the inverse of the usual ergonomic instinct and it is the
+  whole safety argument.
+- **Risk: gate A cannot run in the parallel phase at all** (§2d). It must run in
+  the serial tail *and* with the parallel phase already drained — not merely
+  "serial", but "alone".
+- **Teeth:** every assertion runs unchanged; only the scheduling changes. The
+  evidence that it kept its teeth is that the (d) set is enforced by the type
+  system or by a default, not by a comment — a `ParallelSafe` marker a new test
+  must opt into, checked at registration.
+- **Decision: orchestrator for the mechanism; owner for the gate A consequence**
+  (see §4).
+
+### 3.4 Boot consolidation — **~44 s, MEDIUM risk**
+
+The eight groups in §2b.
+
+- **Saving: 12 boots × 3.7 s = 44 s (7%).** (derived)
+- **Risk: MEDIUM.** Three specific hazards: the capture race (task #84); a test
+  that panics or halts the guest ends the boot for everything queued behind it
+  (`double_fault_stack`, the panic screen tests, `nvme_wide_sector`,
+  `va_exhaustion`); and cross-test interference, which is already why
+  `readdir_bound` has its own boot — it fills `/tmp` to the VFS listing limit and
+  would refuse every later `read_dir` in that guest.
+- **Recommendation: take only the two groups that are pure observers of one
+  boot's log** — `metalcase/Metal` (4 → 1) and `testcases/Metal/i8042-trace`
+  (3 → 1). Those six tests read different parts of the same boot's output and
+  none of them kills the guest. That is 5 boots, ~19 s, at genuinely low risk.
+  The rest is not worth its risk against §3.1–3.3.
+- **Teeth:** each consolidated test keeps every assertion it has; the review
+  question is whether any of them *writes* state a later one reads. If the
+  answer is not obviously no, it does not get consolidated.
+- **Decision: orchestrator.**
+
+### 3.5 Kernel-variant parallel pre-pass — **rejected, disk-blocked**
+
+Building all 31 kernel variants up front, in parallel, would turn 124–155 s of
+serial cold rebuild into ~45–60 s of wall time on 14 cores. It does not work:
+parallel cargo invocations against one `kernel/target` serialise on cargo's own
+target lock, so it needs 31 separate target dirs, and `kernel/target` measures
+**7.4 GB**. There is 111 GB free. **Not viable.** Recorded so nobody re-derives
+it.
+
+### 3.6 One runtime-actuator kernel instead of 31 feature kernels — **owner's call, not recommended**
+
+Replacing the 31 compile-time feature sets with one kernel carrying every
+actuator behind `SYS_DEBUG` actions would cut the cold-rebuild cost (§1.5) from
+124–155 s to near zero.
+
+**It is a coverage trade, not a cost optimisation, which is why it is the
+owner's.** Today the binary under test is the shipping kernel plus one switch.
+Several of these features do not merely inject a value — `xhci-deaf-controller`,
+`i8042-fadt-denial`, `test-tiny-va`, `test-heap-ceiling`, `usb-flush-fails`
+change which path runs, and some exist precisely to make the shipping path fail.
+A runtime-selected actuator kernel is a *different binary* with dead branches
+the shipping one does not have, and CLAUDE.md's rule that "a feature that merely
+re-states what the code does is not an actuator" cuts against collapsing them.
+
+Presented, priced, **not recommended.**
+
+### 3.7 Selective test running — **owner's call, and the audit's position is no**
+
+The house rule is that every worker runs everything. Changing it trades
+confidence for speed.
+
+**What it would have missed, from this tree's own evidence.**
+`specs/metal-track-history.md` records ~70 defects found in code whose own suites
+were green, and states the reusable form: mutating your implementation tests the
+paths you wrote, never the states you did not think to construct. The failure
+counts mined from this session's transcripts say the same thing from the other
+end — the tests that go red most often are not the ones nearest the change:
+`cache_eviction` 35 times, `i8042_health` 21, `boot_partition_identity` 20,
+`screen_early_panic` 27. A change-proximity heuristic routes around exactly
+those.
+
+**The stronger argument is that it is unnecessary.** §3.1 + §3.2 + §3.3 take
+600 s to ~175 s without touching what runs. Selective running should not be
+spent before those are exhausted, because once adopted it is very hard to
+un-adopt: every later red becomes "was that in scope?".
+
+**Position: do not adopt. Owner's decision to overrule.**
+
+### 3.8 The flake tax — **the largest single lever nobody has priced**
+
+44 distinct full-suite runs appear in this session's transcripts:
+
+| day | runs | suite-hours | median | red |
+|---|---:|---:|---:|---:|
+| 2026-08-01 | 8 | 2.65 | 1010.7 s | 5 |
+| 2026-08-02 | 11 | 1.51 | 456.4 s | 4 |
+| 2026-08-03 | 25 | 3.80 | 561.9 s | 17 |
+| **total** | **44** | **7.96** | **553.3 s** | **26 (59%)** |
+
+**26 of 44 full runs ended red, and 18 of those 26 failed on one or two tests.**
+The most-failing names across every transcript in this session:
+
+```
+42  audio_tone_load (smp=1)      21  i8042_health
+35  cache_eviction               20  boot_partition_identity
+32  audio_tone_load (smp=8)      15  screen_fatal_halt
+27  screen_early_panic           14  metal_sim_input
+24  audio_tone (smp=8)           13  i8042_keyboard
+```
+
+**Audio is 108 of the top-ten failure count.** Known-issues already records that
+gate A can fail a run on `drains` alone, with no gap and no underrun — a per-run
+failure that carries no evidence of harm. **This audit's contribution is the
+measurement: that defect is the single largest source of red full runs in the
+tree, and each one costs an agent a ~600 s re-run to clear.** At ~15–25 runs a
+day and a 59% red rate, that is on the order of an hour a day of re-running for
+verdicts that do not mean anything.
+
+Fixing gate A's per-run verdict is worth more than any scheduling change here.
+It is a coverage question, so it is the **owner's**, and it is already open.
+
+A `--rerun-failed` mode is the tempting mechanical fix and should be treated
+carefully: it shortens *diagnosis* usefully, but if a rerun-only-failures green
+is allowed to count as a green, that is §3.7 by the back door. **Whether it may
+close a claim is the owner's call; building it as a diagnosis aid is not.**
+
+---
+
+## 4. The multiplier: N workers × M runs a day
+
+**Measured, 2026-08-03: 25 full-suite runs, 3.80 hours of suite time in one
+day**, across the agents working in this tree. Aug 1 and Aug 2 were 8 and 11
+runs. Call it 15–25 runs a day and rising with the agent count.
+
+At the 2026-08-03 rate:
+
+| scenario | per run | ×25 runs/day | saved/day |
+|---|---:|---:|---:|
+| today | ~600 s | 4.2 h | — |
+| §3.1 + §3.2 (no scheduling change) | ~515 s | 3.6 h | 0.6 h |
+| + §3.4 (two safe groups) | ~495 s | 3.4 h | 0.8 h |
+| + §3.3 at N=4 | ~175 s | 1.2 h | **3.0 h** |
+| + gate A verdict fixed (§3.8) | ~175 s, 59% → ~20% red | ~0.9 h | **3.3 h** |
+
+Two things this table hides, both important.
+
+**Those hours overlap.** 25 runs did not take 3.8 hours of wall clock — several
+agents ran concurrently, which is why individual runs stretched from 437 s to
+752 s for near-identical test counts. **The saving is not just time, it is the
+contention that inflates everyone else's runs.** Cutting each run by 3.4× cuts
+the window in which any two runs collide by more than 3.4×.
+
+**And the core budget is global, not per-suite.** This is the crux for the
+worktree direction.
+
+### 4.1 Per-worktree parallel suites (task #117) — three hard constraints
+
+Priced as a live scenario, not a hypothetical.
+
+**Constraint 1 — the rustup link is a single global symlink, and worktrees
+would fight over it.** `~/.rustup/toolchains/toyos` is one link:
+
+```
+toyos -> /Users/jan/Dev/jan/toyos/rust/build/aarch64-apple-darwin/stage2
+```
+
+`src/toolchain.rs`'s `relink_needed` returns true whenever that link does not
+point at *the current tree's* stage2, and `ensure` then re-links it. **Two
+worktrees would relink it away from each other on every build**, and a build in
+tree A between B's relink and A's next check either uses B's compiler or fails.
+That failure already has a name in known-issues §6 — `'rustc' is not installed
+for the custom toolchain 'toyos'` — and today it is a within-tree race window.
+Worktrees would make it the steady state. **This is a hard blocker for #117 and
+it must be solved before any worktree runs a build**, not discovered by it.
+
+**Constraint 2 — disk.** Measured:
+
+```
+rust/build              47 G
+kernel/target          7.4 G
+target                 6.5 G
+userland/target        1.6 G
+tests/…/target         366 M
+whole tree              77 G      free: 111 G
+```
+
+**One additional full worktree fits; two do not.** Sharing `rust/build` is the
+only way past that, and it is the same object Constraint 1 is about.
+
+**Constraint 3 — cores.** 14. One suite at N=1 uses ~3 host threads; at N=4,
+~12. **Intra-suite parallelism (§3.3) and inter-worktree parallelism are the
+same lever spent twice.** Four agents each running a 4-wide suite is 16 QEMUs on
+14 cores, which is slower than serial and mismeasures everything. If both
+directions are wanted, the parallel width has to be a **global semaphore** — a
+lock outside any one tree, in the spirit of `src/buildlock.rs` but shared across
+worktrees, that hands out QEMU slots against a fixed budget.
+
+**Constraint 4, and it is the owner's — gate A stops being certifiable.**
+`tests/audio-baseline.toml`'s numbers were recorded with one QEMU at a time and
+no concurrent agents for the whole session. With worktrees that condition is
+never met again. Either:
+
+- gate A's fast tier leaves `cargo test` for a quiet-host job (and every worker
+  stops certifying audio on every run — a real reduction in when the gate
+  fires), or
+- its per-run ceilings are re-derived under load (which widens them, weakening
+  the gate), or
+- the global semaphore reserves the whole host whenever any suite reaches its
+  audio block (which serialises every agent behind every other agent's audio
+  block — priced at 34 s each, ~14 minutes a day at 25 runs).
+
+**All three are worse than today in some direction. This is the owner's
+decision and it should be made before #117 lands, not after.**
+
+---
+
+## 5. Recommendation, ordered by savings-per-risk
+
+| # | change | saving | risk | decision |
+|---:|---|---:|---|---|
+| 1 | §3.1 harness at opt-level 2 | 30–50 s | LOW | orchestrator |
+| 2 | §3.2 cache the build triple per `(config, features)` | 57 s | LOW–MED | orchestrator |
+| 3 | §3.4 consolidate the two observer-only groups | ~19 s | LOW | orchestrator |
+| 4 | §3.3 parallel boots, N=4, serial-by-default | ~320 s | HIGH | orchestrator (mechanism) |
+| 5 | §3.8 gate A's per-run verdict | ~1 h/day of re-runs | coverage | **owner** |
+| 6 | §4.1 worktree blockers 1–3 | enables #117 | HIGH | orchestrator |
+| 7 | §4.1 constraint 4, gate A under load | — | coverage | **owner** |
+| 8 | §3.6 runtime-actuator kernel | 124–155 s on kernel-change runs | coverage | **owner**, not recommended |
+| 9 | §3.7 selective running | large | confidence | **owner**, not recommended |
+
+Waves 1–3 are independent of each other and of everything else, total ~130 s
+(22%), and carry no coverage risk. **They should go first and they do not need
+the classification in §2d to be right.** Wave 4 does, and its safety rests
+entirely on the serial-by-default rule.
+
+Items 5 and 7 are the two the owner has to rule on, and 7 blocks #117.
+
+## 6. What this audit did not measure
+
+- The split of a machine test's time *above* the 3.7 s floor into guest work
+  versus host waiting. Per-test, that needs harness instrumentation.
+- Whether opt-level 2 changes any screen test's outcome. §3.1 says it must be
+  re-run; it was not re-run here.
+- The 41 redundant image builds and the 12 consolidatable boots were attributed
+  by static analysis of `BootOptions` sites. Six tests' shapes could not be
+  resolved statically — `boot_partition_identity`, `readdir_bound`,
+  `usb_flush_optional`, `xhci_hid_break`, and the two IOMMU tests added mid-audit
+  — alongside the three that genuinely never boot. The counts are therefore
+  **lower bounds** on redundancy, and exact on the shapes they name.
+- The current test count. `cargo test -- --list` was re-run to confirm the
+  post-growth census and the tree did not compile at that moment
+  (`src/buildlock.rs`, another agent mid-edit). 229 is the last count this audit
+  measured; ~231 is the source count now.
+- Contention was present for every archived number. Nothing here should be
+  A/B'd against these figures in a later session; re-measure against the same
+  HEAD in one session, per CLAUDE.md.
