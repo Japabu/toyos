@@ -1347,6 +1347,10 @@ fn main() {
             };
             match step {
                 RxStep::Idle => i += 1,
+                // Unlogged, and the only removal here that is: a client may
+                // connect to find out whether netd exists and hang up, which is
+                // its business. The two below are the client getting something
+                // wrong, and those netd names.
                 RxStep::Eof => {
                     pending.remove(i);
                 }
