@@ -771,9 +771,13 @@ pub fn probe_boot_disks() {
     let mut probed = 0;
     loop {
         probed = probe_announced(probed);
-        // Nothing to wait for: either a device carries the partition firmware
-        // named, or firmware named none and there is no question to answer.
-        if gpt::boot_volume().is_some() || gpt::boot_partition().is_none() {
+        // Nothing to wait for. Three ways, and the third is the one worth
+        // stating: firmware named no partition, so there is no question; or a
+        // device carries it; or two devices do, which no further device can
+        // repair — `gpt:` has already named that machine as having no boot
+        // volume, and waiting the ceiling out would be waiting for an event
+        // that cannot occur.
+        if gpt::boot_partition().is_none() || !gpt::boot_volume_still_possible() {
             return;
         }
         if crate::clock::nanos_since_boot() >= deadline {
