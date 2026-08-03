@@ -375,7 +375,9 @@ shared block serial: (derived)
 
 **Past N≈5 the critical path is one test.** `screen_console_scroll` at 103 s
 (75 s after §3.1) becomes the floor, so §3.1 and §3.3 compound — cutting the
-longest test is worth more once the rest is parallel than it is now.
+longest test is worth more once the rest is parallel than it is now. **Since
+done: it is 27 s (§5.2), so the floor past N≈5 is the aggregate again and not
+one name.**
 
 **Host budget.** 14 cores. Each QEMU runs `smp: 2` by default, so ~3 host
 threads. **N=4 ≈ 12 threads is the honest ceiling for one suite on this host**,
@@ -669,8 +671,9 @@ before any two boots can overlap.
 ## 5.2 The longest test, and where its time actually was
 
 `screen_console_scroll` — §1.2's number one at 103 s, and §3.3's floor past
-N≈5 — is **26 s** as of this section. Same-session A/B on the merged tree,
-arms alternated, four runs: **122.6 / 110.9 s before, 26.0 / 26.4 s after.**
+N≈5 — is **27 s** as of this section. Same-session A/B on the tree that landed,
+arms alternated, four runs: **110.5 / 111.4 s before, 27.4 / 27.5 s after** —
+4.05×, and tight enough in both arms to read as one number each.
 
 **§3.1 predicted the wrong cause and §5.1 already half-said so.** The whole
 30–50 s estimate rested on host-side glyph decoding; opt-level 2 returned 5 s of
@@ -725,22 +728,25 @@ them, against 128 in 458 KiB** — the transition that leaves cells past the end
 at six times the events per byte. 7.0× the bytes removed; 4.5× the wall clock,
 because boot and the QMP typing do not shrink with it.
 
-**Teeth, measured rather than argued.** Four deliberate re-breaks of the console,
-each red on the reduced workload, all inside round 1 — i.e. within the first 100
-lines of 260:
+**Teeth, measured rather than argued.** Deliberate re-breaks of the console, each
+red on the reduced workload, all inside round 1 — within the first 100 lines of
+260, where the old workload's first round was 400:
 
 | break | red in |
 |---|---:|
-| `damage` span one column short | 9 s |
-| cell recorded painted, never blitted | 9 s |
-| `scroll` leaves the old bottom row | 12 s |
-| the same, confined to the panel's top rows | 10 s |
+| a cell recorded painted that was never blitted | 10.2 s |
+| the same, confined to rows the marker never lands on | 10.8 s |
+| `scroll` leaves the old bottom row in place | 12.4 s |
 
-The fourth exists because the other three corrupt the marker row too, so they
-fire the marker check; confining the break to rows the marker never lands on
-makes the character-for-character comparison itself the thing that fails, and it
-reports `panel row 0 … the row on screen is LONGER than the line that belongs
-there`.
+(A fourth, `damage` returning a span one column short, was red in 9 s against an
+earlier iteration of this workload and was not re-run against the final one.)
+
+The second exists because the others corrupt the marker row too, so they fire the
+marker check rather than the row comparison. Confining the break to rows the
+marker never lands on makes the character-for-character comparison itself the
+thing that fails, and it reports `panel row 0 … the row on screen is LONGER than
+the line that belongs there` — the sentence the test was written to be able to
+say.
 
 **One structural change came out of watching those breaks.** The poll loop used
 to ask the panel both "is the round over" and "is the panel right" at once, so a
@@ -752,10 +758,18 @@ reports in 9–12 s with the offending row, and the churn is no longer sampled
 408 times. Nothing observed was lost — those dumps were the loop's exit test and
 were never asserted on.
 
+**And one test was passing on nothing.** `test_screen_churn` is a workload with
+no verdict, but it was in the shared boot's Rust registry, where it ran with
+default arguments, printed 400 lines to a console nothing was reading, and
+passed on its exit code. Making its arguments required is what surfaced that; it
+is in `RUST_SKIP` now, beside the other bins that are driven rather than run.
+
 Two things this found and did not fix are in `specs/known-issues.md` §8: the
 collapsed-scroll paint the workload believed it exercised is unreachable through
 a pipe and is asserted by nothing, and `Console::flush` records the rightmost
 glyph column as painted when the scrollbar clamped the blit away from it.
+
+The screen family is 14 tests, green, **72.7 s** with this in it.
 
 ## 6. What this audit did not measure
 
