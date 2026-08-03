@@ -1,8 +1,8 @@
-use fatfs::FsOptions;
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek};
 
 use bcachefs::{Formatted, VecBlockIO};
+use toyos_fat32::{BlockAccess, Fat32, FatTime, IoError};
 
 pub fn create_initrd(
     files: &[(String, Vec<u8>)],
@@ -138,20 +138,104 @@ fn format_fat32(bytes: usize, label: &str) -> Vec<u8> {
     volume
 }
 
-/// Put the volume's free-cluster count in its FSInfo sector.
+/// The volume being built, as [`toyos_fat32`] sees it.
 ///
-/// `format_volume` leaves it 0xFFFFFFFF, which FAT32 defines as "unknown" and
-/// which `fsck_msdos` reports as `Free space in FSInfo block is unset`. Counting
-/// it here is what makes the log volume *born* clean rather than clean apart
-/// from one complaint, and `toyos-fat32` maintains the count from there — it
-/// only tracks a free count it was given one to track (`fat.rs`'s
-/// `free_count.map(...)`).
+/// Byte-addressed with no block size of its own, because there is none: the
+/// volume is a `Vec` in this process. The kernel's adapter is where the
+/// read-modify-write against 4 KiB device blocks lives, and `toyos-fat32`'s own
+/// host suite is where that shape is exercised.
+struct VolumeIo<'a>(&'a mut [u8]);
+
+impl VolumeIo<'_> {
+    fn range(&self, offset: u64, len: usize) -> Result<core::ops::Range<usize>, IoError> {
+        let start = usize::try_from(offset).map_err(|_| IoError)?;
+        let end = start.checked_add(len).ok_or(IoError)?;
+        if end > self.0.len() {
+            return Err(IoError);
+        }
+        Ok(start..end)
+    }
+}
+
+impl BlockAccess for VolumeIo<'_> {
+    fn capacity(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
+        let at = self.range(offset, buf.len())?;
+        buf.copy_from_slice(&self.0[at]);
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), IoError> {
+        let at = self.range(offset, buf.len())?;
+        self.0[at].copy_from_slice(buf);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
+}
+
+/// When the build ran, which is what the files on the stick are dated.
 ///
-/// `stats` marks FSInfo dirty and `FileSystem`'s drop flushes it, so this is
-/// the last thing done to an open volume and nothing reads its return.
-fn record_free_clusters<IO: fatfs::ReadWriteSeek>(fat: &fatfs::FileSystem<IO>, label: &str) {
-    fat.stats()
-        .unwrap_or_else(|e| panic!("failed to count the {label} volume's free clusters: {e}"));
+/// A host with a clock behind 1980 or past 2107 gets FAT's nearest
+/// representable instant rather than a wrapped one; `FatTime` clamps and says
+/// so.
+fn build_time() -> FatTime {
+    FatTime::from_unix_secs(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs()),
+    )
+}
+
+/// Write `files` onto a formatted volume, creating the directories they name,
+/// and leave the free-cluster count recorded.
+///
+/// Written with **our** FAT32 driver rather than with the crate that formatted
+/// the volume, and that is the whole of the fix for a defect every image this
+/// project ever produced carried: `fatfs`'s `create_dir` writes a long-name
+/// entry ahead of each `.` and `..`, which the format requires to be a
+/// subdirectory's first two entries, and gives `..` the root's cluster number
+/// where the format requires zero. Twelve `fsck_msdos` complaints, present
+/// before any guest ran, and neither reachable through that crate's API.
+///
+/// Using `toyos-fat32` is not a way round them. It deletes the second FAT32
+/// writer from the project: this is the one the kernel appends `kernel.log`
+/// with, the one `toyos-fat32`'s host suite runs `fsck_msdos` and a real macOS
+/// mount against on every `cargo test` in that crate, and now the one the claim
+/// "the image we build is clean" is a claim about. `fatfs` keeps the format
+/// call, where it has never had a complaint against it — an empty volume has no
+/// subdirectory for either bug to live in.
+///
+/// The free-cluster count is the third thing `fsck_msdos` used to ask for:
+/// `format_volume` leaves FSInfo's field 0xFFFFFFFF, which FAT32 defines as
+/// "unknown" and `fsck_msdos` reports as `Free space in FSInfo block is unset`.
+/// `free_bytes` counts the FAT when the volume arrived without a hint and
+/// `sync` writes it.
+fn populate(volume: &mut [u8], label: &str, files: &[(&str, &[u8])]) {
+    let time = build_time();
+    let mut fs = Fat32::mount(VolumeIo(volume))
+        .unwrap_or_else(|e| panic!("the freshly formatted {label} volume does not mount: {e}"));
+    for (path, data) in files {
+        if let Some((dir, _)) = path.rsplit_once('/') {
+            fs.create_dir_all(dir, time)
+                .unwrap_or_else(|e| panic!("creating {dir}/ on {label}: {e}"));
+        }
+        let mut file = fs
+            .create(path, time)
+            .unwrap_or_else(|e| panic!("creating {path} on {label}: {e}"));
+        fs.write(&mut file, 0, data)
+            .unwrap_or_else(|e| panic!("writing {} bytes to {path} on {label}: {e}", data.len()));
+        fs.flush_meta(&mut file, time)
+            .unwrap_or_else(|e| panic!("recording {path} on {label}: {e}"));
+    }
+    fs.free_bytes()
+        .unwrap_or_else(|e| panic!("counting the {label} volume's free clusters: {e}"));
+    fs.sync().unwrap_or_else(|e| panic!("syncing the {label} volume: {e}"));
 }
 
 /// The partition firmware boots from: the bootloader, the kernel, the initrd,
@@ -169,47 +253,22 @@ fn create_esp_volume(
 
     let mut volume = format_fat32(total_size, "TOYOS-BOOT");
 
-    {
-        let fat = fatfs::FileSystem::new(Cursor::new(&mut volume), FsOptions::new())
-            .expect("Failed to open FAT filesystem");
-
-        fat.root_dir()
-            .create_dir("EFI")
-            .expect("Failed to create EFI directory")
-            .create_dir("BOOT")
-            .expect("Failed to create BOOT directory")
-            .create_file("BOOTx64.EFI")
-            .expect("Failed to create BOOTx64.EFI")
-            .write_all(bootloader)
-            .expect("Failed to write bootloader");
-
-        let toyos_dir = fat.root_dir()
-            .create_dir("toyos")
-            .expect("Failed to create toyos directory");
-        toyos_dir
-            .create_file("kernel.elf")
-            .expect("Failed to create kernel.elf")
-            .write_all(kernel)
-            .expect("Failed to write kernel");
-        toyos_dir
-            .create_file("initrd.img")
-            .expect("Failed to create initrd.img")
-            .write_all(initrd)
-            .expect("Failed to write initrd");
-        // Mirrored in `bootloader/src/main.rs` as `\toyos\log.guid`, which
-        // reads it beside the two files above and refuses the volume if it is
-        // not there. The sixteen bytes are the GPT entry's own, in the entry's
-        // own order: nothing converts them on the way to the kernel and nothing
-        // converts the table's, so the comparison that decides which partition
-        // holds the log cannot be got backwards.
-        toyos_dir
-            .create_file("log.guid")
-            .expect("Failed to create log.guid")
-            .write_all(&log_guid.to_bytes_le())
-            .expect("Failed to write log.guid");
-
-        record_free_clusters(&fat, "TOYOS-BOOT");
-    }
+    populate(
+        &mut volume,
+        "TOYOS-BOOT",
+        &[
+            ("EFI/BOOT/BOOTx64.EFI", bootloader),
+            ("toyos/kernel.elf", kernel),
+            ("toyos/initrd.img", initrd),
+            // Mirrored in `bootloader/src/main.rs` as `\toyos\log.guid`, which
+            // reads it beside the two files above and refuses the volume if it
+            // is not there. The sixteen bytes are the GPT entry's own, in the
+            // entry's own order: nothing converts them on the way to the kernel
+            // and nothing converts the table's, so the comparison that decides
+            // which partition holds the log cannot be got backwards.
+            ("toyos/log.guid", &log_guid.to_bytes_le()),
+        ],
+    );
 
     volume
 }
@@ -222,12 +281,94 @@ fn create_esp_volume(
 /// there is no smaller FAT32 to cut it down to.
 fn create_log_volume() -> Vec<u8> {
     let mut volume = format_fat32(FAT32_MIN_BYTES, "TOYOS-LOG");
-    {
-        let fat = fatfs::FileSystem::new(Cursor::new(&mut volume), FsOptions::new())
-            .expect("Failed to open the log volume");
-        record_free_clusters(&fat, "TOYOS-LOG");
-    }
+    populate(&mut volume, "TOYOS-LOG", &[]);
     volume
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Everything `fsck_msdos -n` has to say about a volume, minus the one
+    /// summary line a clean run prints.
+    ///
+    /// Never the exit code: `fsck_msdos -n` exits 0 while printing `Fix?` for
+    /// problems it declined to repair, and exits 0 on a volume it has just
+    /// called dirty.
+    fn fsck(volume: &[u8], name: &str) -> Vec<String> {
+        let tool = std::path::Path::new("/sbin/fsck_msdos");
+        assert!(tool.exists(), "no /sbin/fsck_msdos: this gate's outside judge is missing");
+        let path = std::env::temp_dir().join(format!("toyos-image-{}-{name}.vol", std::process::id()));
+        std::fs::write(&path, volume).expect("stage the volume for fsck");
+        let out = Command::new(tool).arg("-n").arg(&path).output().expect("run fsck_msdos");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_file(&path);
+
+        let mut summaries = 0;
+        let mut complaints = Vec::new();
+        for line in text.lines().map(str::trim_end) {
+            if line.is_empty()
+                || line.starts_with("**")
+                || line.starts_with(&path.display().to_string())
+            {
+                continue;
+            }
+            // `Warning: 5 files, 306560 KiB free (76640 clusters)`.
+            let summary = line
+                .strip_prefix("Warning: ")
+                .and_then(|rest| rest.split_once(' '))
+                .is_some_and(|(n, tail)| {
+                    n.chars().all(|c| c.is_ascii_digit()) && tail.starts_with("files,")
+                });
+            if summary {
+                summaries += 1;
+                continue;
+            }
+            complaints.push(line.to_string());
+        }
+        assert_eq!(summaries, 1, "fsck_msdos printed {summaries} summary lines, wanted one:\n{text}");
+        complaints
+    }
+
+    /// The two volumes this build writes are `fsck_msdos`-clean, and the gate
+    /// is silence rather than sameness.
+    ///
+    /// The ESP was not, from the first image this project ever built until
+    /// [`populate`] stopped writing it with `fatfs` — twelve complaints, before
+    /// any guest ran, from two format violations that crate's `create_dir` has.
+    /// The consequence was not only a dirty volume: `esp_filesystem` could only
+    /// ask that the guest add no *new* complaint, so a complaint the guest
+    /// produced for its own reason would have hidden inside the twelve.
+    ///
+    /// Here rather than in the boot suite because it needs no guest, no QEMU
+    /// and no kernel: it is a claim about the writer, and it fails in seconds
+    /// on `cargo test --lib`.
+    #[test]
+    fn the_volumes_this_build_writes_are_fsck_clean() {
+        let esp = create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4());
+        let complaints = fsck(&esp, "esp");
+        assert!(complaints.is_empty(), "fsck_msdos on the ESP:\n{}", complaints.join("\n"));
+
+        let log = create_log_volume();
+        let complaints = fsck(&log, "log");
+        assert!(complaints.is_empty(), "fsck_msdos on the log volume:\n{}", complaints.join("\n"));
+    }
+
+    /// And it is clean because it is right, not because it is empty: a
+    /// `populate` that wrote nothing at all would satisfy the gate above.
+    #[test]
+    fn the_esp_carries_what_the_bootloader_looks_for() {
+        let mut esp = create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4());
+        let mut fs = Fat32::mount(VolumeIo(&mut esp)).expect("mount the ESP we just built");
+        let found: Vec<String> =
+            fs.walk(64).expect("walk the ESP").into_iter().map(|(path, _)| path).collect();
+        for want in ["EFI/BOOT/BOOTx64.EFI", "toyos/kernel.elf", "toyos/initrd.img", "toyos/log.guid"]
+        {
+            assert!(found.iter().any(|p| p.trim_start_matches('/') == want), "{want} is not on the ESP; it holds {found:?}");
+        }
+    }
 }
 
 fn create_gpt_disk(esp_volume: Vec<u8>, log_volume: Vec<u8>, log_guid: uuid::Uuid) -> Vec<u8> {
