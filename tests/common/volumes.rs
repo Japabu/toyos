@@ -167,14 +167,12 @@ fn need(got: Option<Vec<u8>>, path: &str) -> Result<Vec<u8>, String> {
 /// volume, not a disk: pointed at the GPT image it would read the protective
 /// MBR as a boot sector.
 ///
-/// A list rather than a verdict, because **this project's own boot image is
-/// not fsck-clean and never was** — the `fatfs` crate `src/image.rs` builds it
-/// with writes a long-name entry ahead of each `.` and `..`, and gives `..` the
-/// root's cluster number instead of zero. Both violate the specification and
-/// both are there before any guest runs; see known issues. So the gate is that
-/// the guest adds no complaint of its own, which is the question actually being
-/// asked, and it keeps the pre-existing ones visible rather than accepting a
-/// blanket "not clean".
+/// A list rather than a verdict because the callers want to say *which* thing
+/// was said, and because it used to be the only honest shape available: the
+/// boot image was not fsck-clean and never had been, so the strongest gate a
+/// guest could be held to was "adds nothing new". `src/image.rs` writes the ESP
+/// with `toyos-fat32` now, both volumes leave the build silent, and the callers
+/// require silence on both sides of the boot.
 ///
 /// Digits are replaced so a legitimately changed free-cluster count does not
 /// read as a new defect.
@@ -280,7 +278,16 @@ pub fn esp_filesystem(
             return Err(format!("the built image has no {name}"));
         }
     }
+    // Including the file this test just wrote through `fatfs` above: the
+    // fixture is part of what has to leave the volume clean, or the gate below
+    // could only ever be as strong as the untidiest thing on the stick.
     let complaints_before = fsck_complaints(&image[start..start + len], "esp-before")?;
+    if !complaints_before.is_empty() {
+        return Err(format!(
+            "the boot volume is not fsck_msdos-clean before the guest has run:\n{}",
+            complaints_before.join("\n")
+        ));
+    }
 
     // metal-sim, because that is the machine shape that gets flashed and the
     // one whose whole reason for having a log on the stick is that it has no
@@ -337,22 +344,18 @@ pub fn esp_filesystem(
     // The strongest claim first: the volume is still a volume. A driver that
     // wrote the right file into a broken FAT would pass every byte comparison
     // below and leave a stick that cannot boot.
+    // Silence, not sameness. While the image builder left complaints of its own
+    // on every volume it wrote, all this could ask was that the guest add none
+    // — which would have hidden a complaint the guest produced for its own
+    // reason inside the ones it did not.
     let complaints_after = fsck_complaints(volume, "esp-after")?;
-    let fresh: Vec<&String> =
-        complaints_after.iter().filter(|c| !complaints_before.contains(c)).collect();
-    if !fresh.is_empty() {
+    if !complaints_after.is_empty() {
         return Err(format!(
-            "the guest gave fsck_msdos something new to say about the boot volume:\n{}\n\
-             it already said, before the boot:\n{}",
-            fresh.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"),
-            complaints_before.join("\n")
+            "the guest left fsck_msdos something to say about the boot volume:\n{}",
+            complaints_after.join("\n")
         ));
     }
-    eprintln!(
-        "  [esp] fsck_msdos: {} pre-existing complaints before the boot, {} after, none new",
-        complaints_before.len(),
-        complaints_after.len()
-    );
+    eprintln!("  [esp] fsck_msdos: silent on the boot volume before and after the boot");
 
     // Everything the host has to say about the volume, in one mount: what the
     // guest wrote, what it must *not* have left behind, and what it must not
