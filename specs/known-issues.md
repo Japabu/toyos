@@ -1885,6 +1885,32 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
+### Two `Sched::Parallel` tests go red under four other worktrees' suites
+
+Both were caught by the re-run-alone pass (`specs/test-cost-audit.md` §5.4.6) on
+2026-08-04, on a host carrying four concurrent full suites — `uptime` load 58 —
+and both were green the moment they were re-run by themselves in the same
+process. Neither predates nor was introduced by the parallel-width work; both
+have been `Sched::Parallel` since the phase landed, and neither reproduces on a
+host running one suite.
+
+- **`i8042_mouse`** — `an intact pointer stream discarded bytes: … 3056 bytes,
+  24 keys, 1005 motion, 15 undecoded, 1 discarded`. One byte in three thousand.
+  The gate is `0 discarded` and it is the right gate; what is unclear is whether
+  a guest that lost 8× its share of the host can be held to it.
+- **`usb_transport_break`** — `the transport broke 2 times; the injection is
+  armed once per boot, so anything else is a break this test did not stage`.
+  A second break on a boot whose actuator arms once is the interesting half:
+  either the boot ran the injection twice, or something else on that machine
+  produced the same line.
+
+**What to do about a red on either name:** read the `ALONE` line under it before
+anything else. `GREEN` there means the host, not the kernel. What neither of them
+should get is a widened bound — `0 discarded` is what `i8042_mouse` exists to
+say, and a gate that tolerates one lost byte tolerates the defect it was written
+for. If the class needs closing, the answer is a global QEMU-slot semaphore
+across worktrees (`specs/worktrees.md` §6), not a looser assertion.
+
 ### A daemon's boot lines land in whichever test window is open
 
 `run_test` captures every non-kernel console line between `===TEST_START===`

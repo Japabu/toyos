@@ -53,17 +53,20 @@ const DEFAULT_WIDTH: usize = 4;
 /// Declared here for the same reason each list entry is: it is a scheduling
 /// answer and it has to be visible.
 ///
-/// **Serial, and it was measured there.** Every test in the block carries a 5 or
-/// 10 second wall-clock ceiling — generous against a median under a tenth of a
-/// second, and not against a guest sharing 14 cores with three others: at width
-/// 4 `allocator_stress` went from 1 s to past its 5 s and `demand_paging_sse`
-/// from 36 ms to past its. A ceiling on the host's clock is the definition of
-/// [`Sched::Serial`] and the reasoning that put this block in the parallel phase
-/// simply had the wrong median in it.
+/// **Parallel, once its ceilings stopped being host-wide.** It was moved to the
+/// tail because at width 4 `allocator_stress` went from 1 s to past its 5 s and
+/// `demand_paging_sse` past its — but not one of those numbers is an assertion.
+/// They are liveness guards on a guest that might wedge, and the verdict in
+/// every case is the exit code and the expected stdout. [`qemu::budget`] now
+/// pays them out per guest the phase may have up, which is what
+/// `wait_for_ready`'s boot timeout has done since the phase existed, so the
+/// number each author reasoned about is still the number for one guest.
 ///
-/// It also costs the least of anything here to run alone: 153 tests, one boot,
-/// about fourteen seconds between them (`specs/test-cost-audit.md` §1.1).
-const SHARED_BLOCK: Sched = Sched::Serial;
+/// What that leaves is a block of 153 tests on one boot costing about thirteen
+/// seconds between them, which is far too little to be worth a tail slot of its
+/// own: alone it is thirteen seconds nothing overlaps, and in the phase it is
+/// one task among sixty.
+const SHARED_BLOCK: Sched = Sched::Parallel;
 
 // Rust helper binaries that are spawned by tests, not tests themselves.
 const RUST_SKIP: &[&str] = &[
@@ -178,9 +181,12 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("metal_sim_window_caps", Sched::Parallel),
     ("metal_sim_ipc_hostile_peer", Sched::Parallel),
     ("metal_sim_compositor_stall", Sched::Parallel),
-    // A thousand pointer packets paced from the host, with a settle sized for
-    // "QEMU coalescing rel events it has not been polled for".
-    ("metal_sim_pointer_churn", Sched::Serial),
+    // A thousand pointer packets paced from the host, and not one assertion on
+    // when any of them arrived: the settles are 400 ms against a driver that
+    // acts in microseconds, both liveness loops run to 20 s, and the three
+    // verdicts are a count of bound sources, a frame batch above the taskbar's
+    // two, and a desktop still painting afterwards.
+    ("metal_sim_pointer_churn", Sched::Parallel),
     // A host-measured drain rate with an 8 s ceiling on a 3.3 s expectation.
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
@@ -214,31 +220,35 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // nothing to run — so a later member reads a console the previous one is
     // still draining into.
     //
-    // Serial for a second and separate reason: each is a wizard conversation
-    // typed from the host and its assertion is the transcript.
-    // `swiss_german_layout` taps twenty-eight sequences at 25 ms and compares
-    // the decoded string, `locale_detect` decides a layout from two presses,
-    // and the two surface tests carry every transition through a console or a
-    // compositor, a window and a terminal. A dropped keystroke is a different
-    // verdict, and nothing downstream can tell that from the defect each of
-    // them exists to catch.
-    ("swiss_german_layout", Sched::Serial),
-    ("locale_detect", Sched::Serial),
-    ("locale_detect_unrecognized", Sched::Serial),
+    // Each is a wizard conversation typed from the host, and that used to make
+    // them serial on the grounds that a dropped keystroke reads like the defect
+    // they exist to catch. What actually drops a keystroke is the *device*
+    // queue, not the host's clock: QEMU's PS/2 controller holds sixteen bytes
+    // and none of these conversations puts more than a handful in flight before
+    // waiting on what the guest printed back. Every wait here is `serial_until`
+    // against a marker with a twenty-second ceiling, so a slower guest is a
+    // slower test and not a different verdict — which is the same argument
+    // `i8042_kbd_echo` has run on at width 4 since the phase landed.
+    ("swiss_german_layout", Sched::Parallel),
+    ("locale_detect", Sched::Parallel),
+    ("locale_detect_unrecognized", Sched::Parallel),
     // The wizard on the two surfaces the machine actually has, rather than on
     // the stand-in `locale_gate` is. Each costs a boot of a different image.
-    ("console_locale_detect", Sched::Serial),
-    ("desktop_locale_detect", Sched::Serial),
+    ("console_locale_detect", Sched::Parallel),
+    ("desktop_locale_detect", Sched::Parallel),
     // Two boots of one machine compared on the guest's own `Boot: complete`
     // with a 300 ms allowance, which is the whole assertion.
     ("i8042_absent", Sched::Serial),
     ("i8042_quarantine", Sched::Parallel),
     ("i8042_budget_expiry", Sched::Parallel),
-    ("i8042_fadt_denial", Sched::Serial),
+    ("i8042_fadt_denial", Sched::Parallel),
     ("i8042_kbd_echo", Sched::Parallel),
     ("i8042_undecoded_bytes", Sched::Parallel),
-    // Its verdict is a cadence, and its absence is the assertion.
-    ("i8042_health_cadence", Sched::Serial),
+    // Its verdict is a cadence, and its absence is the assertion — both read
+    // off the guest's own `last byte at Nms` stamps. The gap it injects is
+    // 3 s against a 500 ms period, so six periods of margin decide whether the
+    // report is on the pin or on a timer.
+    ("i8042_health_cadence", Sched::Parallel),
     ("xhci_xecp_walk", Sched::Parallel),
     ("xhci_slot_exhaustion", Sched::Parallel),
     ("usb_storage_gate", Sched::Parallel),
@@ -248,21 +258,42 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("usb_flush_optional", Sched::Parallel),
     ("xhci_deaf_registers", Sched::Parallel),
     // Mirrors the kernel's `SLOW_CONNECT_NS` as a constant of its own and
-    // bounds the first port line from *both* sides.
+    // bounds the first port line from *both* sides. Both instants are the
+    // guest's own, and it is still serial: the *injection window* is 300 ms of
+    // guest **boot** time, so a guest that lost its share of the host reaches
+    // its controller after the ports have stopped lying and the gate refuses to
+    // certify — `the controller started at 0.366 s, past the 0.3 s the ports are
+    // held empty for`, measured at width 4 with four other worktrees' suites up.
+    // That is the test declining to measure nothing, which is correct, and a red
+    // all the same. The fix it asks for is the kernel's: anchor the window on
+    // the controller's own reset rather than on boot, which is where a real root
+    // hub's detection delay starts anyway.
     ("xhci_slow_connect", Sched::Serial),
     ("xhci_portsc_rw1c", Sched::Parallel),
     ("usb_transport_break", Sched::Parallel),
     ("xhci_full_speed_device", Sched::Parallel),
-    // The three below stage plug and unplug against debounce windows, from the
-    // host, with fixed waits between the injection and the assertion.
-    ("xhci_hotplug", Sched::Serial),
+    // Two of the three below stage plug and unplug with fixed waits, and both
+    // waits are 600-800 ms against a 100 ms debounce the driver finishes in
+    // microseconds under TCG — a margin, not a race, and every verdict either
+    // makes is a count of what the guest logged.
+    ("xhci_hotplug", Sched::Parallel),
+    // `xhci_flap` is the one that genuinely races the host against the guest:
+    // its two QMP writes have to land inside *one* 100 ms debounce or the state
+    // under test never happens, and it says so — `no replug collapsed inside a
+    // debounce, so this run never staged the race`. A host that delays the
+    // second write past 100 ms turns a green machine red with that sentence,
+    // which is indistinguishable from the driver defect it hunts.
     ("xhci_flap", Sched::Serial),
-    ("xhci_hid_break", Sched::Serial),
+    ("xhci_hid_break", Sched::Parallel),
     ("xhci_descriptor_walk", Sched::Parallel),
     ("esp_filesystem", Sched::Parallel),
     ("toybox_cp_volume", Sched::Parallel),
     ("kernel_log_file", Sched::Parallel),
-    // `xhci_slow_connect`'s shape against the disk's port.
+    // `xhci_slow_connect`'s shape against the disk's port, and serial for the
+    // same reason and not by association: it shares `SLOW_CONNECT_NS`, so a boot
+    // that outgrows the window binds the disk in the port scan and it reports
+    // `the boot scan bound a disk, so the port was not held empty`. Same
+    // measurement, same afternoon.
     ("late_storage_connect", Sched::Serial),
     ("log_backing_read_error", Sched::Parallel),
     ("log_partition_layout", Sched::Parallel),
@@ -6298,6 +6329,42 @@ struct Outcome {
     elapsed: Duration,
 }
 
+/// The task that would run `name` again, by itself.
+///
+/// **Every red from the parallel phase is re-run alone**, and the two possible
+/// answers are both findings. Same verdict: the defect is real and the width had
+/// nothing to do with it. Green: the test is red only when it shares the host,
+/// which makes its [`Sched::Parallel`] wrong — a bug in this file, not in the
+/// kernel, and one the suite has no other way to notice.
+///
+/// **A green retry does not turn the run green.** A rerun-only pass counting as
+/// a pass is `specs/test-cost-audit.md` §3.7 by the back door; the failure line
+/// says which of the two it was and the run stays red until somebody fixes the
+/// classification. That is the whole safety argument for widening the parallel
+/// phase: getting a scheduling answer wrong costs a red run, never a quiet one.
+///
+/// A group member is re-run **as its group**, not on its own, so that the only
+/// thing that changed between the two attempts is how many guests the host had.
+fn retry_task<'a>(name: &str, all_tests: &[&'a TestDef]) -> Option<Task<'a>> {
+    if let Some(def) = all_tests.iter().find(|t| t.name == name) {
+        return Some(Task::Shared(vec![def]));
+    }
+    if SCREEN_TESTS.iter().any(|(n, _)| *n == name) {
+        let (n, _) = SCREEN_TESTS.iter().find(|(n, _)| *n == name)?;
+        return Some(Task::Screen(n));
+    }
+    let (registered, _) = MACHINE_TESTS.iter().find(|(n, _)| *n == name)?;
+    let names = match group_of(registered) {
+        None => vec![*registered],
+        Some(group) => MACHINE_TESTS
+            .iter()
+            .filter(|(n, _)| group_of(n) == Some(group))
+            .map(|(n, _)| *n)
+            .collect(),
+    };
+    Some(Task::Machine(names))
+}
+
 /// The binaries and config every task boots with.
 struct Bins<'a> {
     test_config: &'a Path,
@@ -6356,6 +6423,82 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
             send(name.to_string(), outcome.err(), start.elapsed());
         }
     }
+}
+
+impl Task<'_> {
+    /// Every name this task will report an outcome for.
+    fn names(&self) -> Vec<&str> {
+        match self {
+            Task::Shared(tests) => tests.iter().map(|t| t.name.as_str()).collect(),
+            Task::Machine(names) => names.to_vec(),
+            Task::Screen(name) => vec![name],
+        }
+    }
+}
+
+/// Where the last run in this worktree left what each test cost it.
+///
+/// Under `target/`, so it is per-worktree and never committed: it is a *hint*
+/// about how to order a queue and never an input to a verdict. A wrong number
+/// costs some idle lane time; a missing one costs nothing at all.
+fn durations_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-durations")
+}
+
+fn load_durations() -> BTreeMap<String, Duration> {
+    let mut out = BTreeMap::new();
+    let Ok(text) = fs::read_to_string(durations_path()) else { return out };
+    for line in text.lines() {
+        if let Some((name, ms)) = line.rsplit_once(' ') {
+            if let Ok(ms) = ms.parse::<u64>() {
+                out.insert(name.to_string(), Duration::from_millis(ms));
+            }
+        }
+    }
+    out
+}
+
+/// Merge this run's durations into the recorded profile.
+///
+/// Merged rather than replaced, because a filtered run knows about four tests
+/// and would otherwise throw away what the last full one measured.
+fn save_durations(mut known: BTreeMap<String, Duration>, outcomes: &[Outcome]) {
+    for outcome in outcomes {
+        known.insert(outcome.name.clone(), outcome.elapsed);
+    }
+    let body: String =
+        known.iter().map(|(n, d)| format!("{n} {}\n", d.as_millis())).collect();
+    let path = durations_path();
+    let tmp = path.with_extension("tmp");
+    if fs::create_dir_all(path.parent().expect("target/ has a parent")).is_ok()
+        && fs::write(&tmp, body).is_ok()
+    {
+        let _ = fs::rename(&tmp, &path);
+    }
+}
+
+/// Longest job first, on what the last run measured.
+///
+/// A phase's wall clock is `max(sum / width, longest job)`, and FIFO reaches the
+/// first term only if no long job is dispatched late. Declaration order puts the
+/// feature-carrying tests last — deliberately, to keep the kernel rebuilds
+/// together — which is exactly the worst order for a wide phase: `xhci_hid_break`
+/// and `xhci_deaf_registers` are two of the three longest jobs in the suite and
+/// both sit in the last quarter of `MACHINE_TESTS`.
+///
+/// **The profile is measured, not declared**, because the alternative is a
+/// hand-maintained list of long tests — a second registration to keep true, and
+/// one nothing would notice going stale. A name the file has never seen sorts
+/// first, so a new test is assumed long until it has been timed once: the cost of
+/// being wrong that way is one lane starting a short job early.
+fn longest_first(tasks: &mut [Task<'_>], known: &BTreeMap<String, Duration>) {
+    let cost = |task: &Task<'_>| -> Duration {
+        task.names()
+            .iter()
+            .map(|n| known.get(*n).copied().unwrap_or(Duration::MAX))
+            .fold(Duration::ZERO, |a, b| a.saturating_add(b))
+    };
+    tasks.sort_by_key(|task| std::cmp::Reverse(cost(task)));
 }
 
 /// Run `tasks` on `width` workers, printing each outcome as it lands.
@@ -6672,15 +6815,62 @@ fn main() {
         }
     };
 
+    // Every red the wide phase produced, re-run by itself before anything is
+    // believed about it. See [`retry_task`] for why both answers are findings
+    // and why neither turns the run green.
+    let known = load_durations();
+    let mut timed: Vec<Outcome> = Vec::new();
+    let mut wide_reds: Vec<String> = Vec::new();
     if !parallel.is_empty() {
+        longest_first(&mut parallel, &known);
         eprintln!("  --- parallel, {width} wide ---");
-        record(run_phase(parallel, width, &bins));
+        let started = std::time::Instant::now();
+        let outcomes = run_phase(parallel, width, &bins);
+        eprintln!("  --- parallel done in {:.1?} ---", started.elapsed());
+        wide_reds.extend(
+            outcomes.iter().filter(|o| o.reason.is_some()).map(|o| o.name.clone()),
+        );
+        timed.extend(outcomes.iter().map(|o| Outcome {
+            name: o.name.clone(),
+            reason: None,
+            elapsed: o.elapsed,
+        }));
+        record(outcomes);
     }
     if !serial.is_empty() {
         eprintln!("  --- serial ---");
-        record(run_phase(serial, 1, &bins));
+        let started = std::time::Instant::now();
+        let outcomes = run_phase(serial, 1, &bins);
+        eprintln!("  --- serial done in {:.1?} ---", started.elapsed());
+        timed.extend(outcomes.iter().map(|o| Outcome {
+            name: o.name.clone(),
+            reason: None,
+            elapsed: o.elapsed,
+        }));
+        record(outcomes);
     }
     qemu::set_width(1);
+    save_durations(known, &timed);
+
+    if !wide_reds.is_empty() {
+        eprintln!("  --- re-running {} wide failure(s) alone ---", wide_reds.len());
+        for name in &wide_reds {
+            let Some(task) = retry_task(name, &tests_to_run) else {
+                eprintln!("  ALONE {name}: no way to run it by itself; verdict stands");
+                continue;
+            };
+            let outcomes = run_phase(vec![task], 1, &bins);
+            let verdict = outcomes.iter().find(|o| &o.name == name);
+            match verdict.map(|o| o.reason.is_some()) {
+                Some(false) => eprintln!(
+                    "  ALONE {name}: GREEN — it fails only beside other guests, so its \
+                     Sched::Parallel is wrong. The run stays red on the classification."
+                ),
+                Some(true) => eprintln!("  ALONE {name}: red again — the defect is real."),
+                None => eprintln!("  ALONE {name}: the lone run reported nothing about it"),
+            }
+        }
+    }
 
     // Gate A, alone. `tests/audio-baseline.toml`'s numbers were recorded with
     // one QEMU on the host and no concurrent agents, so a run beside anything

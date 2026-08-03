@@ -43,7 +43,11 @@ pub fn double_fault_stack(
 
     writeln!(qemu.stdin_mut(), "run test_rs_test_panic_child 4").expect("write to QEMU stdin");
     qemu.flush_stdin();
-    let log = qemu.drain_serial(Duration::from_secs(20));
+    // Until the report, not for twenty seconds: the fatal path halts every CPU
+    // without exiting QEMU, so a plain drain has nothing left to disconnect it
+    // and waits out the whole ceiling. The marker is the line every assertion
+    // below reads, and `ist1_report` writes it last.
+    let log = qemu.drain_until(Duration::from_secs(20), |line| line.contains(MARKER));
 
     // The premise. If the CPU never took a #DF then nothing ran on IST1 and
     // every assertion below would be measuring the wrong stack.

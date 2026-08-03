@@ -7,6 +7,20 @@ license = "MIT OR Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+# Every actuator below that a boot cannot reach on its own: each is a `SYS_DEBUG`
+# action arm and nothing else, so a kernel carrying all four boots, schedules,
+# drives its devices and panics exactly as a kernel carrying none does. The
+# harness folds any request for one of them into this, because a feature set is
+# a whole kernel build and four sets that differ only in which unreachable arm
+# they carry are four builds of one kernel. `specs/test-cost-audit.md` §7 is the
+# per-feature ledger this is the "inert" half of; every other feature there
+# changes a path a boot takes and keeps its own build.
+test-actuators = [
+    "test-fatal-halt",
+    "test-screen-graffiti",
+    "test-double-fault",
+    "test-heap-ceiling",
+]
 debug-wait = []
 # Panic between arming the on-screen console and mm::init, so a test can
 # assert the console covers the window where nothing else can report.

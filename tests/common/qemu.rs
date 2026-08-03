@@ -44,6 +44,24 @@ pub fn set_width(width: u32) {
     WIDTH.store(width, Ordering::SeqCst);
 }
 
+/// A liveness ceiling, stated for one guest and paid out for the phase's.
+///
+/// Every timeout a test hands [`QemuInstance::run_test`] and its relatives is a
+/// guard against a wedge, never a verdict: the assertion is what the guest
+/// *said*, and a test whose pass depended on a deadline expiring would be
+/// asserting on the host's clock. So the number in the source stays the number
+/// its author reasoned about — one guest, this host — and the phase multiplies
+/// it, exactly as `wait_for_ready` has multiplied the boot timeout since the
+/// parallel phase landed.
+///
+/// The cost of getting this wrong in the generous direction is that a wedge
+/// takes longer to report. The cost in the other direction is a red run that
+/// says a guest hung when it was only sharing a machine, which is the failure
+/// mode that put the whole shared block in the serial tail.
+pub fn budget(one_guest: Duration) -> Duration {
+    one_guest * WIDTH.load(Ordering::SeqCst)
+}
+
 /// The hardware shape QEMU presents to the guest.
 ///
 /// Not a display setting: each variant is a whole machine. `Headless` is the
@@ -927,10 +945,38 @@ pub fn build_boot_image(
     toyos_build::build::build_test_image(
         &compile::repo_root(),
         &config_path,
-        kernel_features,
+        &fold_inert(kernel_features),
         quiet,
         &extra_files,
     )
+}
+
+/// Actuators that are a `SYS_DEBUG` action arm and nothing else.
+///
+/// A boot cannot reach any of them; only a test that asks for one by number
+/// can. So the four kernels that differ only in which of them they carry are
+/// four builds of the same machine, and [`fold_inert`] makes them one.
+///
+/// **Membership is a claim about the kernel, not about the test that uses it**,
+/// and the claim is checkable: each name below has its `#[cfg]` sites in
+/// `arch/syscall.rs`'s `SYS_DEBUG` match and nowhere on any path a boot runs.
+/// A feature that changes what `init` does, what a driver reads, or what a
+/// ceiling is worth belongs in its own build and is not eligible.
+/// `specs/test-cost-audit.md` §7 classifies every one of them.
+const INERT_ACTUATORS: &[&str] = &[
+    "test-fatal-halt",
+    "test-screen-graffiti",
+    "test-double-fault",
+    "test-heap-ceiling",
+];
+
+/// The feature set to build, with every inert actuator replaced by the union of
+/// them. A test still names the actuator it needs — that is what its assertion
+/// is about — and the build system stops treating the name as a distinct kernel.
+fn fold_inert<'a>(requested: &[&'a str]) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = vec!["test-actuators"];
+    out.extend(requested.iter().copied().filter(|f| !INERT_ACTUATORS.contains(f)));
+    out
 }
 
 /// Build all binaries in a test crate.
@@ -1134,7 +1180,7 @@ impl QemuInstance {
         interval: Duration,
         done: impl Fn(&super::screen::Ppm) -> bool,
     ) -> super::screen::Ppm {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + budget(timeout);
         loop {
             let dump = self.screendump();
             if done(&dump) || Instant::now() >= deadline {
@@ -1194,7 +1240,33 @@ impl QemuInstance {
     /// soundd flushes its final stats window when the last client leaves,
     /// which races the client process's exit — so the line the audio gate
     /// reads lands on either side of `===TEST_END===`.
+    /// **Not scaled by the width**, and it is the one duration in this file that
+    /// is not. Callers use it to *pace* — "let the guest run for 400 ms and tell
+    /// me what it said" — so multiplying it does not buy a slow guest more room,
+    /// it buys the test a longer sleep. `metal_sim_pointer_churn` has
+    /// twenty-four of these; scaled, they made it an 86 s job at width 8 and the
+    /// critical path of the whole phase.
     pub fn drain_serial(&mut self, dur: Duration) -> String {
+        self.drain_for(dur, |_| false)
+    }
+
+    /// Drain until `line` reads true of a line just seen, or until the guest
+    /// goes quiet for the rest of `dur`.
+    ///
+    /// A guest that is *shut down* ends a plain [`Self::drain_serial`] the
+    /// moment QEMU exits and the reader disconnects, so the ceiling there costs
+    /// nothing. A guest the fatal path has halted does not exit — every CPU is
+    /// stopped and the process stays up — so the drain pays the whole ceiling
+    /// waiting for a machine that will never speak again. `double_fault_stack`
+    /// spent twenty seconds of every run that way, which was 80% of it.
+    ///
+    /// Here the duration *is* a liveness ceiling — the marker is what ends
+    /// it — so it scales.
+    pub fn drain_until(&mut self, dur: Duration, line: impl Fn(&str) -> bool) -> String {
+        self.drain_for(budget(dur), line)
+    }
+
+    fn drain_for(&mut self, dur: Duration, line: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + dur;
         let mut out = String::new();
         loop {
@@ -1202,9 +1274,12 @@ impl QemuInstance {
                 return out;
             };
             match self.rx.recv_timeout(remaining) {
-                Ok(line) => {
-                    out.push_str(&line);
+                Ok(seen) => {
+                    out.push_str(&seen);
                     out.push('\n');
+                    if line(&seen) {
+                        return out;
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => return out,
                 Err(RecvTimeoutError::Disconnected) => return out,
@@ -1217,7 +1292,7 @@ impl QemuInstance {
     /// A console is a stream and this consumes it: every line up to and
     /// including the marker is taken from whatever reads next.
     pub fn wait_for_console(&mut self, marker: &str, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + budget(timeout);
         loop {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                 return false;
@@ -1276,6 +1351,7 @@ impl QemuInstance {
             }
         };
 
+        let timeout = budget(timeout);
         let start = Instant::now();
         let mut stdout = String::new();
         let mut serial = String::new();
