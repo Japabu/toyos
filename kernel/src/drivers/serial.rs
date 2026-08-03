@@ -55,6 +55,16 @@ pub fn init() {
         loopback,
         if loopback == 0xAE { "present" } else { "absent or wrong port" }
     );
+    console_changed();
+}
+
+/// Tell the ring whether serial has anywhere to put a byte.
+///
+/// Called from the two places [`has_console`] can change its answer — this
+/// module's probe, and virtio-console coming up in phase 6 — so the ring's flag
+/// is derived from the backend rather than tracked beside it.
+pub fn console_changed() {
+    super::log_ring::set_serial_sink(has_console());
 }
 
 pub fn uart_present() -> bool {

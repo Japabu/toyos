@@ -213,6 +213,7 @@ pub fn init(devices: &[PciDevice]) -> bool {
 
     unsafe { (*CONSOLE.0.get()).write(console); }
     READY.store(true, Ordering::Release);
+    crate::drivers::serial::console_changed();
 
     log!("virtio-console: initialized ({} RX bufs of {} bytes, TX buf {} bytes)",
         RX_BUF_COUNT, RX_BUF_SIZE, TX_BUF_SIZE);
