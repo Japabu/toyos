@@ -1,6 +1,6 @@
 pub mod framebuffer;
 
-pub use framebuffer::{Color, Framebuffer};
+pub use framebuffer::{Color, Framebuffer, Screen};
 
 use toyos::ipc;
 use toyos::poller::{Poller, IORING_POLL_IN};
@@ -372,6 +372,18 @@ impl Window {
 
     pub fn framebuffer(&self) -> Framebuffer {
         Framebuffer::new(
+            self.shm.as_ptr(),
+            self.width as usize,
+            self.height as usize,
+            self.width as usize,
+            self.pixel_format,
+        )
+    }
+
+    /// The same buffer as [`Window::framebuffer`], for a client that composes
+    /// elsewhere and only ever hands finished pixels over.
+    pub fn screen(&self) -> Screen {
+        Screen::new(
             self.shm.as_ptr(),
             self.width as usize,
             self.height as usize,
