@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const GLYPH_W: usize = 8;
-const GLYPH_H: usize = 16;
+pub const GLYPH_W: usize = 8;
+pub const GLYPH_H: usize = 16;
 const FIRST_CH: u8 = 0x20;
 const GLYPHS: usize = 95;
 

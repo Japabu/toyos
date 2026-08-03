@@ -765,6 +765,27 @@ fn row_base(fb: &Fb, y: usize, len: usize) -> Option<*mut u32> {
 /// checkpoint repaints six times and a 2048x2048 panel is 4.2M pixels, so
 /// per-pixel checked arithmetic here is the difference between a repaint
 /// nobody notices and one that doubles boot time.
+/// Paint the whole panel a colour no glyph contains, over whatever is there.
+///
+/// The actuator for "something drew on the glass behind the console's back".
+/// Nothing else in reach can stage it: `DEVICE_FRAMEBUFFER` is claimed
+/// exclusively so no second process can map the scanout, `boot_checkpoint`
+/// returns the moment userland owns the screen, and the one painter that
+/// ignores that claim — `render` — halts the machine on its way out, which
+/// leaves nobody to type the command under test.
+///
+/// It covers the strip below the last glyph row too, which is the half of this
+/// a console composing cell by cell can never reach on its own.
+#[cfg(feature = "test-screen-graffiti")]
+pub fn graffiti() {
+    let Some(fb) = snapshot() else { return };
+    if !mapped(&fb) {
+        return;
+    }
+    log!("SYS_DEBUG: painting over the screen a userland process owns");
+    fill_screen(&fb, rgb(&fb, 0x00, 0xC0, 0x00));
+}
+
 fn fill_screen(fb: &Fb, color: u32) {
     let width = fb.width as usize;
     for y in 0..fb.height as usize {
