@@ -12,6 +12,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::qemu::{self, BootOptions, Profile, QemuInstance};
@@ -1274,6 +1275,289 @@ pub fn xhci_full_speed_device(
         "  [xhci] two full-speed devices enumerated: one EP0 resized to 64 from the reader's \
          own bMaxPacketSize0 and the tablet's 8 left alone, both identities read off the wire"
     );
+    Ok(())
+}
+
+/// Devices plugged in **after** the machine has booted.
+///
+/// The driver enumerated once, from `init`, and `dispatch_event` advanced past
+/// every TRB that was not a transfer completion — Port Status Change Events
+/// included. So the set of USB devices was whatever was connected at boot,
+/// forever, and a keyboard plugged into a machine with no input did nothing at
+/// all: no port line, no slot, no event, and a compositor already holding a
+/// keyboard claim that would never produce anything. That machine is
+/// indistinguishable from hung, and it is the first thing a person tries.
+///
+/// **The actuator is QEMU's own `device_add`, and nothing about the driver is
+/// modified to run this.** A USB device attached at runtime goes through the
+/// same `usb_device_attach` → `xhci_port_update` → `xhci_port_notify` path a
+/// device attached at startup does, so what the guest sees is a real Port
+/// Status Change Event with a real device behind it. That is the whole
+/// difference from `xhci_slow_connect`, which needs a kernel feature because
+/// it has to aim at a window the boot opens and closes in milliseconds; here
+/// the window is the entire life of the machine.
+///
+/// Every claim below is host-side in the sense that matters:
+///
+/// - **the keyboard** is the only one on the machine — `i8042=off`, and the
+///   profile's boot-time HID is a tablet — so a keystroke that reaches
+///   userland can only have crossed a device that was added after the boot;
+/// - **the pointer** is the only *relative* one, so QEMU has no handler for an
+///   injected `rel` event until it is plugged in, and the boot-time tablet
+///   cannot stand in for it;
+/// - **the disk's block count** is the size of a file the harness made, which
+///   the guest can only have learned by running READ CAPACITY over the wire.
+pub fn xhci_hotplug(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    /// The disk that arrives late: 48 GiB, which is no other device in this
+    /// suite and no round number the driver could have printed by accident.
+    /// Sparse, so the host pays for nothing.
+    const HOT_DISK_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+    /// What the boot-time tablet takes, so what a late pointer must not.
+    const BOOT_SOURCE: u32 = 1;
+    const LATE_SOURCE: u32 = 2;
+    const DX: i32 = 40;
+    const DY: i32 = -30;
+
+    let options = BootOptions {
+        profile: Profile::MetalHotplug,
+        qmp: true,
+        // With an i8042 on the machine QEMU would deliver the injected
+        // keystrokes over PS/2 and every assertion below would pass with the
+        // hot-plug path dead.
+        i8042: false,
+        ..Default::default()
+    };
+    // The claim is about what is *not* on the machine at boot, and argv is the
+    // only place absence is visible: no console line distinguishes "the driver
+    // never enumerated a keyboard" from "there was never one to enumerate".
+    let argv = qemu::profile_argv(&options);
+    let usb = crate::usb_argv(&argv);
+    for absent in ["usb-kbd", "usb-mouse"] {
+        if usb.iter().any(|d| d.starts_with(absent)) {
+            return Err(format!("{absent} is on the bus at boot; argv has {usb:?}"));
+        }
+    }
+    if !usb.iter().any(|d| d.starts_with("usb-tablet")) {
+        return Err(format!("this gate needs the boot-time tablet, argv has {usb:?}"));
+    }
+    if !argv.iter().any(|a| a.contains("i8042=off")) {
+        return Err("the i8042 is on; a PS/2 keyboard could deliver instead".to_string());
+    }
+
+    let image = test_dir().join("usb-hotplug.img");
+    drop(sparse(&image, HOT_DISK_BYTES));
+
+    let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+    let boot = qemu.boot_log().to_string();
+
+    // Both controllers came up and exactly one of them found nothing — the
+    // T14's Thunderbolt xHC exactly, and the controller everything below is
+    // plugged into. Without this the test could not tell a device enumerated
+    // late from one enumerated at boot on a port nobody looked at.
+    let found = boot.matches("xHCI: found at PCI ").count();
+    if found != 2 {
+        return Err(format!("{found} controller(s) initialised, want 2:\n{boot}"));
+    }
+    let empty = boot.matches("xHCI: no HID devices on the controller").count();
+    if empty != 1 {
+        return Err(format!(
+            "{empty} controller(s) reported an empty bus at boot, want the second one only:\n{boot}"
+        ));
+    }
+    let at_boot = crate::parse_xhci_binds(&boot);
+    if at_boot.len() != 1 || at_boot[0].kind != "tablet" {
+        return Err(format!("want exactly the tablet bound at boot, got {at_boot:?}\n{boot}"));
+    }
+    let booted: Vec<u32> = crate::parse_pointer_sources(&boot).iter().map(|(_, s)| *s).collect();
+    if booted != vec![BOOT_SOURCE] {
+        return Err(format!(
+            "the boot-time tablet did not take source {BOOT_SOURCE} alone: {booted:?}\n{boot}"
+        ));
+    }
+    let Some((scale_x, scale_y)) = crate::parse_rel_scale(&boot) else {
+        return Err(format!("the kernel never said what pointer scale it used:\n{boot}"));
+    };
+
+    let hot_image = image.clone();
+    let result = qemu.run_test_hooked(
+        "test_rs_input_events",
+        Duration::from_secs(60),
+        "===INPUT_READY===",
+        move |socket| {
+            // One monitor at a time: a `-qmp unix:…,server` socket serves one
+            // connection, so each phase opens, does its work and closes.
+            let mut devices = qemu::QmpDevices::open(socket);
+            devices.blockdev_add("hotdisk", &hot_image);
+            devices.add("usb-mouse", "xhci1.0", "hotmouse", &[]);
+            devices.add("usb-kbd", "xhci1.0", "hotkbd", &[]);
+            devices.add("usb-storage", "xhci1.0", "hotdisk0", &[("drive", "hotdisk")]);
+            drop(devices);
+            // The driver's own debounce is 100 ms and the enumeration behind it
+            // is microseconds under TCG; this is that with room, not a settling
+            // time the assertions depend on.
+            thread::sleep(Duration::from_millis(800));
+
+            let mut input = qemu::QmpInput::open(socket);
+            // Off the origin first: the accumulated position clamps at 0, so a
+            // move up or left from there is invisible.
+            input.mouse(100, 100, None);
+            thread::sleep(Duration::from_millis(100));
+            input.mouse(DX, DY, None);
+            thread::sleep(Duration::from_millis(100));
+            for key in ["h", "e", "l", "l", "o"] {
+                input.keys(&[(key, true), (key, false)]);
+                thread::sleep(Duration::from_millis(20));
+            }
+            drop(input);
+            thread::sleep(Duration::from_millis(200));
+
+            let mut devices = qemu::QmpDevices::open(socket);
+            devices.del("hotmouse");
+            devices.del("hotdisk0");
+            drop(devices);
+            thread::sleep(Duration::from_millis(800));
+
+            // The keyboard is still there, and still the only one.
+            let mut input = qemu::QmpInput::open(socket);
+            for key in ["w", "o", "r", "l", "d"] {
+                input.keys(&[(key, true), (key, false)]);
+                thread::sleep(Duration::from_millis(20));
+            }
+            drop(input);
+
+            // And a pointer plugged in where the last one was unplugged, which
+            // is the only thing that can show the button-table entry came back:
+            // a driver that leaked it binds this one as source 3.
+            let mut devices = qemu::QmpDevices::open(socket);
+            devices.add("usb-mouse", "xhci1.0", "hotmouse2", &[]);
+            drop(devices);
+            thread::sleep(Duration::from_millis(800));
+        },
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}\n{}", result.serial, result.stdout));
+    }
+    let log = format!("{boot}{}", result.serial);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} while devices came and went\n{log}"));
+        }
+    }
+
+    hotplug_bound(&log)?;
+    hotplug_delivered(&result.stdout, "hello", (DX * scale_x, DY * scale_y))?;
+    hotplug_unbound(&log)?;
+    // The keyboard was untouched by the mouse's teardown, and the merge it
+    // shares with the pointer that went away still works. `world` is typed
+    // after the unplug and nothing else in this boot can produce it.
+    let typed: String = crate::parse_key_events(&result.stdout)
+        .iter()
+        .filter(|e| e.modifiers & 0x10 == 0)
+        .map(|e| e.translated.as_str())
+        .collect();
+    if !typed.contains("world") {
+        return Err(format!(
+            "typed {typed:?} — the keyboard beside the unplugged pointer stopped delivering\n{}",
+            result.stdout
+        ));
+    }
+
+    // The replug. Source 2 twice is the assertion: an entry that is leaked and
+    // one that is handed back read the same from every other angle.
+    let sources: Vec<u32> = crate::parse_pointer_sources(&log).iter().map(|(_, s)| *s).collect();
+    if sources != vec![BOOT_SOURCE, LATE_SOURCE, LATE_SOURCE] {
+        return Err(format!(
+            "pointer sources were {sources:?}, want the boot tablet's {BOOT_SOURCE} and then \
+             {LATE_SOURCE} twice — the second late pointer took a fresh entry, so the first \
+             one's was never given back\n{log}"
+        ));
+    }
+
+    let _ = std::fs::remove_file(&image);
+    eprintln!(
+        "  [xhci] after boot: a keyboard, a pointer and a {HOT_DISK_BYTES} B disk enumerated on a \
+         controller that had nothing on it; typed keys and a {:?} pointer delta delivered \
+         host-side; unplug released source {LATE_SOURCE}, disabled the slots and took the disk \
+         offline; the replug took source {LATE_SOURCE} again",
+        (DX * scale_x, DY * scale_y)
+    );
+    Ok(())
+}
+
+/// Everything the guest has to say about three devices that were not there
+/// when it booted.
+fn hotplug_bound(log: &str) -> Result<(), String> {
+    // 48 GiB in the 4 KiB blocks the driver counts in, which is a number that
+    // exists only because the guest asked the device.
+    let geometry = format!("{} blocks of 512 B", 48u64 * 1024 * 1024 * 1024 / 4096);
+    for want in [
+        "xHCI: USB keyboard ready on slot",
+        "xHCI: USB mouse ready on slot",
+        "usb-storage: disk 1 ready on slot",
+        geometry.as_str(),
+    ] {
+        if !log.contains(want) {
+            return Err(format!("nothing enumerated after the boot: no {want:?}\n{log}"));
+        }
+    }
+    Ok(())
+}
+
+/// That the devices which arrived late are the ones delivering.
+fn hotplug_delivered(stdout: &str, word: &str, want: (i32, i32)) -> Result<(), String> {
+    let typed: String = crate::parse_key_events(stdout)
+        .iter()
+        .filter(|e| e.modifiers & 0x10 == 0)
+        .map(|e| e.translated.as_str())
+        .collect();
+    if !typed.contains(word) {
+        return Err(format!(
+            "typed {typed:?}, want it to contain {word:?} — this machine has no keyboard but the \
+             one plugged in after it booted\n{stdout}"
+        ));
+    }
+    let pointer = crate::parse_mouse_events(stdout);
+    let deltas: Vec<(i32, i32)> = pointer
+        .windows(2)
+        .map(|w| (w[1].x as i32 - w[0].x as i32, w[1].y as i32 - w[0].y as i32))
+        .collect();
+    if !deltas.contains(&want) {
+        return Err(format!(
+            "no pointer event moved by {want:?}; deltas seen: {deltas:?} — the boot-time tablet \
+             is absolute, so a relative move can only have come from the mouse that was plugged \
+             in\n{stdout}"
+        ));
+    }
+    Ok(())
+}
+
+/// Everything a device that has been pulled has to leave behind.
+fn hotplug_unbound(log: &str) -> Result<(), String> {
+    for want in [
+        "xHCI: port ",
+        "disconnected",
+        "unplugged from port",
+        "source 2 released",
+        "xHCI: slot ",
+        "disabled",
+        "usb-storage: disk 1 unplugged",
+        "it is offline",
+    ] {
+        if !log.contains(want) {
+            return Err(format!("an unplugged device left {want:?} unsaid\n{log}"));
+        }
+    }
+    // The teardown ran the commands the controller's state permits. Every one
+    // of these lines is `run_command` reporting one it refused.
+    for illegal in ["Disable Slot failed", "Disable Slot timed out"] {
+        if log.contains(illegal) {
+            return Err(format!("{illegal:?} during the teardown\n{log}"));
+        }
+    }
     Ok(())
 }
 

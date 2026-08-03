@@ -177,6 +177,24 @@ pub enum Profile {
     /// boots, and the HID on the crippled one is refused by name rather than
     /// enumerated and left mute.
     MetalXhciNoIrq,
+    /// Two controllers, and every input device arrives *after* the boot.
+    ///
+    /// The T14's shape for the one thing no profile stages: its Thunderbolt
+    /// xHCI at 00:0d.0 has five ports and has never had a device on them
+    /// (`specs/metal-hardware-inventory.md`), so the controller a user plugs
+    /// into is the one that enumerated nothing at boot. Here the second
+    /// controller is that one and the boot stick is on the first.
+    ///
+    /// The boot-time device list is one `usb-tablet`, and every part of that is
+    /// load-bearing. It is a pointer, so a late-bound one has to compose with a
+    /// source that already exists rather than being the first. It is
+    /// *absolute*, so QEMU has no relative handler until a `usb-mouse` is
+    /// plugged in — which makes an injected `rel` event ground truth that the
+    /// late device is the one delivering, not the boot-time one. And it is not
+    /// a keyboard: with `i8042=off` this machine has no keyboard at all until
+    /// one is hot-plugged, so a keystroke that arrives can only have come
+    /// through the device that was added after the boot.
+    MetalHotplug,
     /// metal-sim with no IOMMU at all, so firmware publishes no `DMAR`.
     ///
     /// Presence of the unit is the shape dimension, and it is the one QEMU
@@ -658,6 +676,21 @@ impl Profile {
                 xhci: &[XHCI_DEFAULT, XHCI_NO_IRQ_SECOND],
                 storage_bus: "xhci.0",
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
+                usb_disk_first: false,
+                iommu: Some(IOMMU_DEFAULT),
+            },
+            Self::MetalHotplug => Shape {
+                vga: "std",
+                vgamem_mb: None,
+                virtio: false,
+                xhci: &[XHCI_DEFAULT, XHCI_SECOND],
+                storage_bus: "xhci.0",
+                usb: &["usb-tablet,bus=xhci.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
@@ -1339,6 +1372,15 @@ impl Qmp {
                 self.pending.drain(..pos + want.len());
                 return;
             }
+            // A refused command never produces a `return`, so without this the
+            // wait spends its whole timeout and reports `qmp: read failed` —
+            // which says nothing about the command QEMU declined or why.
+            if let Some(at) = self.pending.windows(7).position(|w| w == b"\"error\"") {
+                panic!(
+                    "qmp: refused while waiting for {want}: {}",
+                    String::from_utf8_lossy(&self.pending[at..])
+                );
+            }
             assert!(
                 start.elapsed() < Duration::from_secs(20),
                 "qmp: no {want} in reply: {}",
@@ -1460,6 +1502,49 @@ fn qcode(ch: char) -> (&'static str, bool) {
 
 pub fn qmp_send_keys(socket: &Path, events: &[(&str, bool)]) {
     QmpInput::open(socket).keys(events);
+}
+
+/// An open QMP connection for attaching and detaching devices while the guest
+/// runs — QEMU's own `device_add`/`device_del`, which is what a person
+/// plugging something in looks like from the host side.
+///
+/// Its own type rather than more methods on [`QmpInput`], and never open at the
+/// same time as one: a `-qmp unix:…,server` socket serves one monitor, so a
+/// caller that needs both alternates. A type called `QmpInput` with
+/// `device_add` on it would also be describing the wrong thing.
+pub struct QmpDevices(Qmp);
+
+impl QmpDevices {
+    pub fn open(socket: &Path) -> Self {
+        Self(Qmp::connect(socket))
+    }
+
+    /// Attach `driver` on `bus` as `id`, with `extra` naming any further
+    /// properties. Every value is a bare JSON string, which is what every
+    /// property these tests set happens to be.
+    pub fn add(&mut self, driver: &str, bus: &str, id: &str, extra: &[(&str, &str)]) {
+        let mut args = format!("\"driver\":\"{driver}\",\"bus\":\"{bus}\",\"id\":\"{id}\"");
+        for (key, value) in extra {
+            args.push_str(&format!(",\"{key}\":\"{value}\""));
+        }
+        self.0.execute(&format!("{{\"execute\":\"device_add\",\"arguments\":{{{args}}}}}"));
+    }
+
+    pub fn del(&mut self, id: &str) {
+        self.0
+            .execute(&format!("{{\"execute\":\"device_del\",\"arguments\":{{\"id\":\"{id}\"}}}}"));
+    }
+
+    /// Give QEMU an image to back a device that is not on the machine yet, so
+    /// a hot-plugged disk needs nothing in argv. A disk declared at boot is a
+    /// disk the guest could have enumerated at boot.
+    pub fn blockdev_add(&mut self, node: &str, image: &Path) {
+        self.0.execute(&format!(
+            "{{\"execute\":\"blockdev-add\",\"arguments\":{{\"node-name\":\"{node}\",\
+             \"driver\":\"raw\",\"file\":{{\"driver\":\"file\",\"filename\":\"{}\"}}}}}}",
+            image.display()
+        ));
+    }
 }
 
 /// The argv `options` would launch QEMU with, built against placeholder

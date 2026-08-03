@@ -148,6 +148,7 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_portsc_rw1c",
     "usb_transport_break",
     "xhci_full_speed_device",
+    "xhci_hotplug",
     "xhci_descriptor_walk",
     "esp_filesystem",
     "kernel_log_file",
@@ -2239,6 +2240,7 @@ fn run_machine_test(
         "xhci_full_speed_device" => {
             usb::xhci_full_speed_device(test_config, c_bins, rust_bins)
         }
+        "xhci_hotplug" => usb::xhci_hotplug(test_config, c_bins, rust_bins),
         // Body in `tests/common/iommu.rs`, same reason.
         "iommu_discovery" => common::iommu::iommu_discovery(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
