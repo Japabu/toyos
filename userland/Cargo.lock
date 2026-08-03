@@ -3578,6 +3578,7 @@ dependencies = [
  "cpal",
  "toyos",
  "toyos-abi",
+ "toyos-keymap",
  "window",
 ]
 
@@ -3590,6 +3591,10 @@ dependencies = [
 
 [[package]]
 name = "toyos-abi"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-keymap"
 version = "0.1.0"
 
 [[package]]

@@ -44,6 +44,11 @@ const RUST_SKIP: &[&str] = &[
     // Needs a boot image the harness staged a file into before the machine
     // started, which only `esp_filesystem` builds.
     "esp_files",
+    // Three modes, each waiting to be typed at through QMP; on its own nothing
+    // ever answers it. `swiss_german_layout`, `locale_detect`,
+    // `locale_detect_unrecognized` and `locale_detect_refuses_a_held_keyboard`
+    // drive it.
+    "locale_gate",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -141,6 +146,15 @@ const MACHINE_TESTS: &[&str] = &[
     "i8042_keyboard",
     "i8042_no_spurious_wake",
     "i8042_mouse",
+    // A boot each, and deliberately not a group: every one of them changes
+    // the machine's layout, which `i8042_keyboard` asserts against, and a
+    // wizard that exits the instant it has its answer leaves the guest with
+    // nothing to run — so a later member reads a console the previous one is
+    // still draining into.
+    "swiss_german_layout",
+    "locale_detect",
+    "locale_detect_unrecognized",
+    "locale_detect_refuses_a_held_keyboard",
     "i8042_absent",
     "i8042_quarantine",
     "i8042_budget_expiry",
@@ -2355,6 +2369,25 @@ fn boot_i8042_trace(
     QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options)
 }
 
+/// The machine the layout and wizard tests run on.
+///
+/// `Profile::Metal` for the same reason `boot_i8042_trace` uses it: QEMU
+/// activates one input handler per device class, so with a USB HID present the
+/// injected keys would not reach the i8042 — and these tests are about which
+/// HID usage a physical key position reports. `tests/testcases` boots neither
+/// the compositor nor `/bin/console`, so the keyboard claim is free, which is
+/// what `locale detect` needs.
+fn boot_locale(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> QemuInstance {
+    let options =
+        BootOptions { profile: qemu::Profile::Metal, qmp: true, ..Default::default() };
+    metal_sim_argv_check(&qemu::profile_argv(&options)).unwrap_or_else(|e| panic!("{e}"));
+    QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options)
+}
+
 /// Every negative claim `Profile::Metal` makes, read off the argv QEMU is
 /// launched with. A claim about which devices do *not* exist is a claim about
 /// this list and nothing else — no console line and no screendump can see a
@@ -2588,6 +2621,202 @@ fn i8042_keyboard(boot: &mut Boot) -> Result<(), String> {
         return Err("no i8042 drain reported a key event".to_string());
     }
     eprintln!("  [i8042] {} events to userland, {drained} from the driver", events.len());
+    Ok(())
+}
+
+/// Swiss German end to end: the real command selects the layout, and the keys
+/// a Swiss keyboard has arrive as the characters a Swiss keyboard prints.
+///
+/// Injection is by *position*: QEMU's qcodes name the US legend of a physical
+/// key, so `y` is the key a Swiss board prints `Z` on and `bracket_left` is
+/// the one it prints `ü` on. That is exactly the substitution the layout
+/// exists to make, so asserting on the characters that come out is asserting
+/// on the table, the modifier levels, the ISO key and the dead-key machine at
+/// once.
+fn swiss_german_layout(qemu: &mut QemuInstance) -> Result<(), String> {
+    let result = qemu.run_test_hooked(
+        "test_rs_locale_gate layout",
+        Duration::from_secs(30),
+        "===SWISS_READY===",
+        |socket| {
+            let mut input = qemu::QmpInput::open(socket);
+            let mut tap = |events: &[(&str, bool)]| {
+                input.keys(events);
+                thread::sleep(Duration::from_millis(25));
+            };
+            let plain = |k: &'static str| vec![(k, true), (k, false)];
+            let shifted =
+                |k: &'static str| vec![("shift", true), (k, true), (k, false), ("shift", false)];
+            let altgr =
+                |k: &'static str| vec![("alt_r", true), (k, true), (k, false), ("alt_r", false)];
+
+            // QWERTZ: the two letters that swap.
+            tap(&plain("y"));
+            tap(&plain("z"));
+            // The three dedicated umlauts, and the accented vowel Shift gives.
+            tap(&plain("bracket_left"));
+            tap(&plain("semicolon"));
+            tap(&plain("apostrophe"));
+            tap(&shifted("apostrophe"));
+            // The AltGr layer.
+            tap(&altgr("2"));
+            tap(&altgr("e"));
+            tap(&altgr("bracket_left"));
+            // The ISO key, all three levels the reference gives it a legend for.
+            tap(&plain("less"));
+            tap(&shifted("less"));
+            tap(&altgr("less"));
+            // Dead keys: compose, compose with Shift, the capital umlaut this
+            // layout has no dedicated key for, the bare form before a space,
+            // an AltGr dead key, and one that composes with nothing.
+            tap(&plain("equal"));
+            tap(&plain("e"));
+            tap(&plain("equal"));
+            tap(&shifted("e"));
+            tap(&plain("bracket_right"));
+            tap(&shifted("u"));
+            tap(&plain("equal"));
+            tap(&plain("spc"));
+            tap(&altgr("minus"));
+            tap(&plain("e"));
+            tap(&plain("equal"));
+            tap(&plain("q"));
+            // And the key the wizard asks about.
+            tap(&plain("grave_accent"));
+        },
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if !result.stdout.contains("locale: Keyboard layout set to 'swiss-german'") {
+        return Err(format!("the real command did not select the layout:\n{}", result.stdout));
+    }
+
+    let events = parse_key_events(&result.stdout);
+    if events.is_empty() {
+        return Err(format!("no key event reached userland:\n{}", result.stdout));
+    }
+    let typed: String = events
+        .iter()
+        .filter(|e| e.modifiers & 0x10 == 0)
+        .map(|e| e.translated.as_str())
+        .collect();
+    // Modifier presses translate to nothing, so the characters are contiguous.
+    let want = "zyüöäà@€[<>\\êÊÜ^é^q§";
+    if !typed.contains(want) {
+        return Err(format!("typed {typed:?}\n  want it to contain {want:?}"));
+    }
+    // The ISO key really was HID 0x64 and not something the profile faked.
+    if !events.iter().any(|e| e.usage == 0x64) {
+        return Err(format!("no event for the ISO key in {events:?}"));
+    }
+    eprintln!("  [swiss-german] {} events, typed {typed:?}", events.len());
+    Ok(())
+}
+
+/// Keys nothing is listening for, after the ones that are.
+///
+/// The wizard exits within milliseconds of its last answer, and on a machine
+/// that then has nothing to do the kernel's log ring sits one line behind — so
+/// the runner's `===TEST_END===` stays in it and the harness waits out its
+/// whole timeout for a test that finished. Escape presses after the wizard has
+/// gone are discarded by the next reader, and each one is an i8042 interrupt
+/// that keeps the ring draining. `i8042_no_spurious_wake` records the same
+/// property from the other side: a guest polling its fd keeps it moving.
+fn keep_the_ring_moving(input: &mut qemu::QmpInput) {
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(150));
+        input.keys(&[("esc", true), ("esc", false)]);
+    }
+}
+
+/// The wizard, answered as a Swiss keyboard's owner would answer it.
+fn locale_detect(qemu: &mut QemuInstance) -> Result<(), String> {
+    let result = qemu.run_test_hooked(
+        "test_rs_locale_gate detect",
+        Duration::from_secs(30),
+        "Press the key labelled",
+        |socket| {
+            let mut input = qemu::QmpInput::open(socket);
+            // The key a Swiss board prints `Z` on, then the one it prints `§`
+            // on, then Enter to confirm.
+            for key in ["y", "grave_accent", "ret"] {
+                input.keys(&[(key, true), (key, false)]);
+                thread::sleep(Duration::from_millis(60));
+            }
+            keep_the_ring_moving(&mut input);
+        },
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    for want in [
+        "detect: Press the key labelled  Z",
+        "detect: Press the key labelled  \u{a7}",
+        "detect: That is 'swiss-german'",
+        "detect: Keyboard layout set to 'swiss-german'",
+    ] {
+        if !result.stdout.contains(want) {
+            return Err(format!("no {want:?} in:\n{}", result.stdout));
+        }
+    }
+    eprintln!("  [locale detect] identified swiss-german in two presses");
+    Ok(())
+}
+
+/// The negative control, in the guest: presses no layout agrees with must end
+/// in a refusal, never in a verdict.
+fn locale_detect_unrecognized(qemu: &mut QemuInstance) -> Result<(), String> {
+    let result = qemu.run_test_hooked(
+        "test_rs_locale_gate detect",
+        Duration::from_secs(30),
+        "Press the key labelled",
+        |socket| {
+            let mut input = qemu::QmpInput::open(socket);
+            // `y` is a QWERTZ answer; `d` is where no layout puts `§`.
+            for key in ["y", "d"] {
+                input.keys(&[(key, true), (key, false)]);
+                thread::sleep(Duration::from_millis(60));
+            }
+            keep_the_ring_moving(&mut input);
+        },
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if !result.stdout.contains("detect: Unrecognized") {
+        return Err(format!("the wizard did not refuse:\n{}", result.stdout));
+    }
+    if result.stdout.contains("Keyboard layout set to") {
+        return Err(format!("the wizard applied a layout it could not identify:\n{}", result.stdout));
+    }
+    Ok(())
+}
+
+/// The wizard needs the keyboard device, which is claimed exclusively — so it
+/// refuses by name rather than reading translated bytes and guessing.
+fn locale_detect_refuses_a_held_keyboard(qemu: &mut QemuInstance) -> Result<(), String> {
+    // Hooked with no marker so it fires on the first line: this test injects
+    // nothing of its own, and without the keys the ring would hold its last
+    // line. The wizard cannot read them — that is the property under test.
+    let result = qemu.run_test_hooked(
+        "test_rs_locale_gate busy",
+        Duration::from_secs(20),
+        "",
+        |socket| keep_the_ring_moving(&mut qemu::QmpInput::open(socket)),
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if !result.stdout.contains("detect-err: locale: cannot read the keyboard directly") {
+        return Err(format!("the wizard did not refuse a held keyboard:\n{}", result.stdout));
+    }
+    if !result.stdout.contains("locale --list") {
+        return Err(format!("the refusal did not say what to do instead:\n{}", result.stdout));
+    }
+    if result.stdout.contains("Press the key labelled") {
+        return Err(format!("the wizard asked for a key it could not read:\n{}", result.stdout));
+    }
     Ok(())
 }
 
@@ -3089,6 +3318,16 @@ fn run_machine_test(
         "i8042_mouse" => i8042_mouse(group_boot(held, I8042_TRACE, || {
             boot_i8042_trace(test_config, c_bins, rust_bins)
         })),
+        "swiss_german_layout" => {
+            swiss_german_layout(&mut boot_locale(test_config, c_bins, rust_bins))
+        }
+        "locale_detect" => locale_detect(&mut boot_locale(test_config, c_bins, rust_bins)),
+        "locale_detect_unrecognized" => {
+            locale_detect_unrecognized(&mut boot_locale(test_config, c_bins, rust_bins))
+        }
+        "locale_detect_refuses_a_held_keyboard" => {
+            locale_detect_refuses_a_held_keyboard(&mut boot_locale(test_config, c_bins, rust_bins))
+        }
         "xhci_many_devices" => {
             // The T14's internal controller carries a camera, Bluetooth and a
             // fingerprint reader next to the boot stick, and every profile in
