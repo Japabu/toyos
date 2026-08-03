@@ -19,7 +19,7 @@ pub fn create_initrd(
     let total_blocks = total_blocks.max(64) as u64;
 
     let io = VecBlockIO::new(total_blocks);
-    let mut fs = Formatted::format(io);
+    let mut fs = Formatted::format(io).expect("format an in-memory image");
 
     for (name, data) in files {
         if !quiet {
@@ -37,7 +37,7 @@ pub fn create_initrd(
             .unwrap_or_else(|e| panic!("initrd: failed to symlink '{}' -> '{}': {:?}", name, target, e));
     }
 
-    fs.into_io().into_vec()
+    fs.into_io().expect("write an in-memory image").into_vec()
 }
 
 /// Takes the artifacts as bytes rather than reading them: the caller stages them

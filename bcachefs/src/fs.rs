@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::alloc_bitmap::BitmapAllocator;
-use crate::block_io::{BlockBuf, BlockNum, BlockIO, BLOCK_SIZE};
+use crate::block_io::{BlockBuf, BlockNum, BlockIO, BlockIOExt, BLOCK_SIZE};
 use crate::btree::{self, Entry, Key, KeyType, Node};
 use crate::superblock::Superblock;
 
@@ -59,6 +59,11 @@ pub enum FsError {
     /// A superblock that does not describe the device it was read from. The
     /// CRC only says the bytes are the bytes somebody wrote.
     BadSuperblock { field: &'static str },
+    /// The device refused a transfer. Distinct from every corruption variant
+    /// above: those say the bytes are wrong, these say there are no bytes.
+    DeviceRead(BlockNum),
+    DeviceWrite(BlockNum),
+    DeviceSync,
     NotFound,
     NoSpace { requested: u32, available: u64 },
     NameTooLong { len: usize, max: usize },
@@ -312,12 +317,7 @@ fn write_data(
     while remaining > 0 {
         let run = match alloc.alloc_up_to(io, remaining) {
             Ok(run) => run,
-            Err(err) => {
-                for ext in &extents {
-                    alloc.free_range(io, BlockNum::new(ext.start_block), ext.block_count);
-                }
-                return Err(err);
-            }
+            Err(err) => return Err(give_back(io, alloc, &extents, err)),
         };
         push_extent(&mut extents, run.start.raw(), run.len);
 
@@ -329,7 +329,9 @@ fn write_data(
                 let len = chunk_end - data_offset;
                 buf.0[..len].copy_from_slice(&data[data_offset..chunk_end]);
             }
-            io.write_block(BlockNum::new(run.start.raw() + i), &buf);
+            if let Err(err) = io.write(BlockNum::new(run.start.raw() + i), &buf) {
+                return Err(give_back(io, alloc, &extents, err));
+            }
             data_offset += BLOCK_SIZE;
         }
 
@@ -339,8 +341,26 @@ fn write_data(
     Ok(extents)
 }
 
+/// Hand back the runs a failed [`write_data`] had already reserved, and return
+/// the failure that stopped it.
+///
+/// Best effort by construction: this runs because something has already gone
+/// wrong, and a bitmap write that also fails has no better answer to give than
+/// the error already in hand.
+fn give_back(
+    io: &dyn BlockIO,
+    alloc: &mut BitmapAllocator,
+    extents: &[Extent],
+    err: FsError,
+) -> FsError {
+    for ext in extents {
+        let _ = alloc.free_range(io, BlockNum::new(ext.start_block), ext.block_count);
+    }
+    err
+}
+
 /// Read file data from a list of extents.
-fn read_extents(io: &dyn BlockIO, extents: &[Extent], size: u64) -> Vec<u8> {
+fn read_extents(io: &dyn BlockIO, extents: &[Extent], size: u64) -> Result<Vec<u8>, FsError> {
     let mut data = vec![0u8; size as usize];
     let mut offset = 0usize;
     let mut buf = BlockBuf::zeroed();
@@ -350,7 +370,7 @@ fn read_extents(io: &dyn BlockIO, extents: &[Extent], size: u64) -> Vec<u8> {
             if offset >= size as usize {
                 break;
             }
-            io.read_block(BlockNum::new(ext.start_block + i), &mut buf);
+            io.read(BlockNum::new(ext.start_block + i), &mut buf)?;
             let remaining = size as usize - offset;
             let to_copy = remaining.min(BLOCK_SIZE);
             data[offset..offset + to_copy].copy_from_slice(&buf.0[..to_copy]);
@@ -358,14 +378,14 @@ fn read_extents(io: &dyn BlockIO, extents: &[Extent], size: u64) -> Vec<u8> {
         }
     }
 
-    data
+    Ok(data)
 }
 
 // --- Formatted (for mkfs / image building) ---
 
 impl<IO: BlockIO> Formatted<IO> {
     /// Format a new filesystem on the given block device.
-    pub fn format(io: IO) -> Self {
+    pub fn format(io: IO) -> Result<Self, FsError> {
         let block_count = io.block_count();
 
         // Layout: [superblock(1)] [bitmap] [journal(reserved, 0 for now)] [data...] [sb_backup(1)]
@@ -387,14 +407,11 @@ impl<IO: BlockIO> Formatted<IO> {
             bitmap_blocks,
             block_count,
             total_metadata,
-        );
+        )?;
 
-        // Write empty root leaf
-        let root = Node::Leaf(Vec::new());
-        // The only infallible node write in the crate: an empty node's entries
-        // occupy zero bytes, so the bound `write_to` checks cannot be crossed.
-        root.write(&io, BlockNum::new(root_block_num))
-            .expect("an empty root node cannot overflow a block");
+        // An empty node's entries occupy zero bytes, so the only failure
+        // `write` has left here is the device's.
+        Node::Leaf(Vec::new()).write(&io, BlockNum::new(root_block_num))?;
 
         // Generate random-ish hash seed from block count (deterministic for reproducible builds)
         let mut hash_seed = [0u8; 16];
@@ -416,9 +433,9 @@ impl<IO: BlockIO> Formatted<IO> {
             hash_seed,
         };
 
-        sb.write(&io);
+        sb.write(&io)?;
 
-        Self { io, sb, alloc }
+        Ok(Self { io, sb, alloc })
     }
 
     /// Create a file on the formatted filesystem (used during mkfs).
@@ -455,12 +472,12 @@ impl<IO: BlockIO> Formatted<IO> {
     }
 
     /// Finalize the filesystem: write superblock with clean flag.
-    pub fn sync(&mut self) {
+    pub fn sync(&mut self) -> Result<(), FsError> {
         self.sb.free_blocks = self.alloc.free_blocks;
         self.sb.next_alloc = self.alloc.next_alloc;
         self.sb.set_clean(true);
-        self.sb.write(&self.io);
-        self.io.sync();
+        self.sb.write(&self.io)?;
+        self.io.flush()
     }
 
     /// Mount this formatted filesystem for read-write access.
@@ -484,9 +501,9 @@ impl<IO: BlockIO> Formatted<IO> {
     }
 
     /// Consume and return the underlying IO (for extracting the image bytes).
-    pub fn into_io(mut self) -> IO {
-        self.sync();
-        self.io
+    pub fn into_io(mut self) -> Result<IO, FsError> {
+        self.sync()?;
+        Ok(self.io)
     }
 }
 
@@ -540,32 +557,34 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
         let leaf = decode_leaf_value(&value)?;
         match leaf {
             LeafValue::File { size, extents, .. } | LeafValue::Symlink { size, extents, .. } => {
-                Ok(read_extents(&self.io, &extents, size))
+                read_extents(&self.io, &extents, size)
             }
         }
     }
 
-    /// Read a symlink's target by name, or None if not a symlink.
-    pub fn read_link(&self, name: &str) -> Option<String> {
-        let (_, value) = self.find_by_name(name).ok()??;
-        let leaf = decode_leaf_value(&value).ok()?;
-        match leaf {
+    /// Read a symlink's target by name. `None` when the name is not a symlink.
+    pub fn read_link(&self, name: &str) -> Result<Option<String>, FsError> {
+        let Some((_, value)) = self.find_by_name(name)? else { return Ok(None) };
+        match decode_leaf_value(&value)? {
             LeafValue::Symlink { size, extents, .. } => {
-                let data = read_extents(&self.io, &extents, size);
-                String::from_utf8(data).ok()
+                let data = read_extents(&self.io, &extents, size)?;
+                Ok(String::from_utf8(data).ok())
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
-    /// Get modification time of a file.
-    pub fn file_mtime(&self, name: &str) -> u64 {
-        self.find_by_name(name)
-            .ok()
-            .flatten()
-            .and_then(|(_, v)| decode_leaf_value(&v).ok())
-            .map(|leaf| leaf.mtime())
-            .unwrap_or(0)
+    /// Modification time of a file. `None` when nothing answers to the name.
+    pub fn file_mtime(&self, name: &str) -> Result<Option<u64>, FsError> {
+        Ok(self.leaf(name)?.map(|leaf| leaf.mtime()))
+    }
+
+    /// The decoded entry `name` answers to, if any.
+    fn leaf(&self, name: &str) -> Result<Option<LeafValue>, FsError> {
+        match self.find_by_name(name)? {
+            Some((_, value)) => Ok(Some(decode_leaf_value(&value)?)),
+            None => Ok(None),
+        }
     }
 
     /// List all files. Returns (name, size) pairs.
@@ -591,24 +610,18 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
 
     /// Return the extents and file size for a file.
     /// Used by the kernel to construct a FileBacking for demand-paged loading.
-    pub fn file_extents(&self, name: &str) -> Option<(Vec<Extent>, u64)> {
-        let (_, value) = self.find_by_name(name).ok()??;
-        let leaf = decode_leaf_value(&value).ok()?;
-        Some((leaf.extents().to_vec(), leaf.size()))
+    pub fn file_extents(&self, name: &str) -> Result<Option<(Vec<Extent>, u64)>, FsError> {
+        Ok(self.leaf(name)?.map(|leaf| (leaf.extents().to_vec(), leaf.size())))
     }
 
     /// Check if a name is a symlink.
-    pub fn is_symlink(&self, name: &str) -> bool {
-        self.find_by_name(name)
-            .ok()
-            .flatten()
-            .map(|(key, _)| key.key_type == KeyType::Symlink)
-            .unwrap_or(false)
+    pub fn is_symlink(&self, name: &str) -> Result<bool, FsError> {
+        Ok(self.find_by_name(name)?.is_some_and(|(key, _)| key.key_type == KeyType::Symlink))
     }
+
     /// Get file size without reading data (metadata only).
-    pub fn file_size_meta(&self, name: &str) -> Option<u64> {
-        let (_, value) = self.find_by_name(name).ok()??;
-        decode_leaf_value(&value).ok().map(|l| l.size())
+    pub fn file_size_meta(&self, name: &str) -> Result<Option<u64>, FsError> {
+        Ok(self.leaf(name)?.map(|leaf| leaf.size()))
     }
 }
 
@@ -683,7 +696,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
             btree::delete(&self.io, self.sb.root_node, &old_key)?;
         }
         for ext in &old_extents {
-            self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
+            self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count)?;
         }
         Ok(())
     }
@@ -716,19 +729,19 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
                 return Err(FsError::CorruptedNode(self.sb.root_node));
             }
             for ext in leaf.extents() {
-                self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
+                self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count)?;
             }
         }
         Ok(())
     }
 
     /// Sync filesystem state to disk.
-    pub fn sync(&mut self) {
+    pub fn sync(&mut self) -> Result<(), FsError> {
         self.sb.free_blocks = self.alloc.free_blocks;
         self.sb.next_alloc = self.alloc.next_alloc;
         self.sb.set_clean(true);
-        self.sb.write(&self.io);
-        self.io.sync();
+        self.sb.write(&self.io)?;
+        self.io.flush()
     }
 
     /// Delete a file/symlink by name, freeing its data blocks. Returns true if found.
@@ -751,7 +764,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
             return Err(FsError::CorruptedNode(self.sb.root_node));
         }
         for ext in &extents {
-            self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
+            self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count)?;
         }
         Ok(true)
     }
@@ -899,9 +912,9 @@ mod tests {
     /// for, so the parser accepts all of them as authentic. That is the whole
     /// point: whoever writes the image writes the CRC.
     fn image(blocks: u64) -> Vec<u8> {
-        let mut fs = Formatted::format(VecBlockIO::new(blocks));
+        let mut fs = Formatted::format(VecBlockIO::new(blocks)).expect("format");
         fs.create("victim.txt", b"a file that was already here", 1).expect("create");
-        fs.into_io().into_vec()
+        fs.into_io().expect("sync").into_vec()
     }
 
     fn seal_node(raw: &mut [u8], block: u64) {
@@ -1044,6 +1057,7 @@ mod tests {
         let victim: Vec<u64> = mount(raw.clone())
             .expect("mount")
             .file_extents("victim.txt")
+            .expect("file_extents")
             .expect("victim.txt is on the volume")
             .0
             .iter()
@@ -1089,7 +1103,7 @@ mod tests {
         );
 
         fs.create("other.bin", &[0xAA; BLOCK_SIZE], 0).expect("create");
-        let (other, _) = fs.file_extents("other.bin").expect("other.bin");
+        let (other, _) = fs.file_extents("other.bin").expect("file_extents").expect("other.bin");
         for ext in &other {
             for i in 0..ext.block_count as u64 {
                 assert!(

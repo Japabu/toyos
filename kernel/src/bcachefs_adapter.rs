@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use bcachefs::{BlockIO, BlockBuf, BlockNum, Mounted, ReadWrite, ReadOnly, Formatted, SliceBlockIO, Extent};
+use bcachefs::{BlockIO, BlockBuf, BlockNum, DeviceError, FsError, Mounted, ReadWrite, ReadOnly, Formatted, SliceBlockIO, Extent};
 use crate::file_backing::{FileBacking, NvmeBacking, InitrdBacking};
 use crate::file_cache::{self, FileId};
 use crate::page_cache;
@@ -14,39 +14,28 @@ use crate::vfs::FileSystem;
 /// BlockIO implementation that wraps the kernel's global PageCache.
 pub struct PageCacheBlockIO;
 
-/// `bcachefs::BlockIO` is infallible, so this is where a device error stops
-/// being propagated and has to become *something*.
+/// The device error channel now runs the whole way: `BlockDevice` reports a
+/// refused transfer, the page cache propagates it, and `bcachefs::BlockIO`
+/// carries it into `FsError`. Nothing here invents a value.
 ///
-/// Zeros, and a log line. Not stale bytes and not a panic: a panic hands a
-/// device the power to kill the kernel, and the previous tenant of a cache
-/// slot is a *valid* block that bcachefs would happily parse as the one it
-/// asked for. An all-zero block fails its structural checks instead, which is
-/// the difference between a mount that refuses and a filesystem that walks
-/// into somebody else's btree node.
-///
-/// Making `BlockIO` fallible is the real fix and it is a whole-crate change —
-/// sixteen call sites inside `bcachefs`, every one of them in a function that
-/// returns something other than a `Result` today. Filed, not done here.
+/// This used to serve zeros and a log line, which was fail-closed rather than
+/// correct — zeros fail bcachefs's structural checks, so a read error reached
+/// the btree looking like corruption and a *write* error looked like a write.
 impl BlockIO for PageCacheBlockIO {
-    fn read_block(&self, block: BlockNum, buf: &mut BlockBuf) {
+    fn read_block(&self, block: BlockNum, buf: &mut BlockBuf) -> Result<(), DeviceError> {
         let mut guard = page_cache::lock();
         let (cache, dev) = guard.cache_and_dev();
-        match cache.read(dev, block.raw()) {
-            Ok(page) => buf.as_bytes_mut().copy_from_slice(page),
-            Err(_) => {
-                log!("bcachefs: read of block {} failed; serving zeros", block.raw());
-                buf.as_bytes_mut().fill(0);
-            }
-        }
+        let page = cache.read(dev, block.raw()).map_err(|_| DeviceError)?;
+        buf.as_bytes_mut().copy_from_slice(page);
+        Ok(())
     }
 
-    fn write_block(&self, block: BlockNum, buf: &BlockBuf) {
+    fn write_block(&self, block: BlockNum, buf: &BlockBuf) -> Result<(), DeviceError> {
         let mut guard = page_cache::lock();
         let (cache, dev) = guard.cache_and_dev();
-        match cache.write_new(dev, block.raw()) {
-            Ok(page) => page.copy_from_slice(buf.as_bytes()),
-            Err(_) => log!("bcachefs: block {} could not be cached; write dropped", block.raw()),
-        }
+        let page = cache.write_new(dev, block.raw()).map_err(|_| DeviceError)?;
+        page.copy_from_slice(buf.as_bytes());
+        Ok(())
     }
 
     fn block_count(&self) -> u64 {
@@ -54,11 +43,27 @@ impl BlockIO for PageCacheBlockIO {
         guard.block_count()
     }
 
-    fn sync(&self) {
+    fn sync(&self) -> Result<(), DeviceError> {
         let mut guard = page_cache::lock();
         let (cache, dev) = guard.cache_and_dev();
-        if cache.sync(dev).is_err() {
-            log!("bcachefs: sync did not reach the device");
+        cache.sync(dev).map_err(|_| DeviceError)
+    }
+}
+
+/// Log an `FsError` the [`FileSystem`] trait has no channel for, and answer
+/// with the trait's "nothing here".
+///
+/// `file_size` and `read_link` return `Option`, `file_mtime` a bare `u64`,
+/// `delete` a `bool`: every one of them reads a device failure as "no such
+/// file". That is the same sentinel `bcachefs::BlockIO` used to be, moved one
+/// layer up rather than removed — the trait is shared with `tmpfs` and
+/// `fat32_adapter` and growing it a channel is its own change. Filed.
+fn no_channel<T>(op: &str, name: &str, result: Result<T, FsError>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) => {
+            log!("bcachefs: {} of '{}' failed: {:?}", op, name, err);
+            None
         }
     }
 }
@@ -89,7 +94,14 @@ impl FileSystem for BcacheFsAdapter {
     /// refusal uniform without making the allocation bounded — that half is
     /// the `bcachefs` crate's, and is filed.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError> {
-        let names = self.fs.list().unwrap_or_default();
+        // `Unknown` because no `SyscallError` variant says "the device did not
+        // answer" — the same gap `fd::try_write` hits, filed as one issue. An
+        // empty listing, which is what this used to return, is a lie a caller
+        // cannot tell from an empty directory.
+        let names = self.fs.list().map_err(|err| {
+            log!("bcachefs: list failed: {:?}", err);
+            SyscallError::Unknown
+        })?;
         if names.len() > limit {
             return Err(SyscallError::ResourceExhausted);
         }
@@ -97,15 +109,15 @@ impl FileSystem for BcacheFsAdapter {
     }
 
     fn file_size(&mut self, name: &str) -> Option<u64> {
-        self.fs.file_size_meta(name)
+        no_channel("file_size", name, self.fs.file_size_meta(name)).flatten()
     }
 
     fn file_mtime(&mut self, name: &str) -> u64 {
-        self.fs.file_mtime(name)
+        no_channel("file_mtime", name, self.fs.file_mtime(name)).flatten().unwrap_or(0)
     }
 
     fn read_link(&mut self, name: &str) -> Option<String> {
-        self.fs.read_link(name)
+        no_channel("read_link", name, self.fs.read_link(name)).flatten()
     }
 
     fn open_file(&mut self, name: &str) -> Option<(FileId, Option<Arc<dyn FileBacking>>)> {
@@ -116,7 +128,7 @@ impl FileSystem for BcacheFsAdapter {
             return Some((file_id, Some(backing)));
         }
 
-        let (extents, size) = self.fs.file_extents(name)?;
+        let (extents, size) = no_channel("open", name, self.fs.file_extents(name)).flatten()?;
         let file_id = file_cache::create_file(true); // evictable
         file_cache::set_size(file_id, size);
 
@@ -135,7 +147,10 @@ impl FileSystem for BcacheFsAdapter {
             return Ok(file_id);
         }
 
-        self.fs.create(name, &[], mtime).map_err(|_| "create failed")?;
+        self.fs.create(name, &[], mtime).map_err(|err| {
+            log!("bcachefs: create of '{}' failed: {:?}", name, err);
+            "create failed"
+        })?;
 
         let file_id = file_cache::create_file(true);
         self.name_to_id.insert(String::from(name), file_id);
@@ -162,7 +177,7 @@ impl FileSystem for BcacheFsAdapter {
             }
             self.name_to_id.remove(name);
         }
-        self.fs.delete(name)
+        no_channel("delete", name, self.fs.delete(name)).unwrap_or(false)
     }
 
     fn delete_prefix(&mut self, prefix: &str) {
@@ -179,7 +194,7 @@ impl FileSystem for BcacheFsAdapter {
             }
             self.name_to_id.remove(name.as_str());
         }
-        self.fs.delete_prefix(prefix);
+        no_channel("delete_prefix", prefix, self.fs.delete_prefix(prefix));
     }
 
     fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
@@ -222,16 +237,15 @@ impl FileSystem for BcacheFsAdapter {
         self.fs.create_symlink(name, target).map_err(|_| "symlink failed")
     }
 
-    /// `Ok` unconditionally, and honestly so: `bcachefs::Mounted::sync` has no
-    /// failure to report, because its own device writes are `()`. That is the
-    /// same defect one layer down and it is already filed as `BlockIO`'s.
     fn sync(&mut self) -> Result<(), &'static str> {
-        self.fs.sync();
-        Ok(())
+        self.fs.sync().map_err(|err| {
+            log!("bcachefs: sync failed: {:?}", err);
+            "sync did not reach the device"
+        })
     }
 
     fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
-        let (extents, size) = self.fs.file_extents(name)?;
+        let (extents, size) = no_channel("open_backing", name, self.fs.file_extents(name)).flatten()?;
         Some(Arc::new(NvmeBacking::new(extents, size)))
     }
 }
@@ -259,7 +273,10 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
     /// refusal uniform without making the allocation bounded — that half is
     /// the `bcachefs` crate's, and is filed.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError> {
-        let names = self.fs.list().unwrap_or_default();
+        let names = self.fs.list().map_err(|err| {
+            log!("initrd: list failed: {:?}", err);
+            SyscallError::Unknown
+        })?;
         if names.len() > limit {
             return Err(SyscallError::ResourceExhausted);
         }
@@ -267,26 +284,25 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
     }
 
     fn file_size(&mut self, name: &str) -> Option<u64> {
-        self.fs.file_size_meta(name)
+        no_channel("file_size", name, self.fs.file_size_meta(name)).flatten()
     }
 
     fn file_mtime(&mut self, name: &str) -> u64 {
-        self.fs.file_mtime(name)
+        no_channel("file_mtime", name, self.fs.file_mtime(name)).flatten().unwrap_or(0)
     }
 
     fn read_link(&mut self, name: &str) -> Option<String> {
-        self.fs.read_link(name)
+        no_channel("read_link", name, self.fs.read_link(name)).flatten()
     }
 
     fn open_file(&mut self, name: &str) -> Option<(FileId, Option<Arc<dyn FileBacking>>)> {
+        let (extents, size) = no_channel("open", name, self.fs.file_extents(name)).flatten()?;
         if let Some(&file_id) = self.name_to_id.get(name) {
             file_cache::open(file_id);
-            let (extents, size) = self.fs.file_extents(name)?;
             let backing = Arc::new(InitrdBacking::new(self.initrd_base, extents, size));
             return Some((file_id, Some(backing)));
         }
 
-        let (extents, size) = self.fs.file_extents(name)?;
         let file_id = file_cache::create_file(true);
         file_cache::set_size(file_id, size);
 
@@ -335,7 +351,8 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
     }
 
     fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
-        let (extents, size) = self.fs.file_extents(name)?;
+        let (extents, size) =
+            no_channel("open_backing", name, self.fs.file_extents(name)).flatten()?;
         Some(Arc::new(InitrdBacking::new(self.initrd_base, extents, size)))
     }
 }
@@ -344,10 +361,18 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
 ///
 /// Destroys everything on the device. [`probe`] is the only caller that is
 /// entitled to reach it, and only on [`Storage::Designated`].
-fn format() -> Mounted<PageCacheBlockIO, ReadWrite> {
-    let io = PageCacheBlockIO;
-    let fs = Formatted::format(io);
-    fs.mount()
+fn format() -> Option<Mounted<PageCacheBlockIO, ReadWrite>> {
+    match Formatted::format(PageCacheBlockIO) {
+        Ok(fs) => Some(fs.mount()),
+        Err(err) => {
+            // The disk said we may destroy what is on it and then would not
+            // take the new volume. `open_home` falls back to a tmpfs `/home`,
+            // the same as for a disk that is not ours: a half-written volume
+            // is not one to mount.
+            log!("storage: formatting the designated device failed: {:?}", err);
+            None
+        }
+    }
 }
 
 /// Try to mount an existing bcachefs filesystem from NVMe.
@@ -450,7 +475,7 @@ fn designated() -> bool {
 pub fn open_home() -> Option<Mounted<PageCacheBlockIO, ReadWrite>> {
     match probe() {
         Storage::Ours(fs) => Some(fs),
-        Storage::Designated => Some(format()),
+        Storage::Designated => format(),
         Storage::Foreign => None,
     }
 }
