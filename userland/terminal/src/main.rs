@@ -21,10 +21,9 @@ fn main() {
         eprintln!("terminal: {e}");
         std::process::exit(1);
     });
-    let fb = window.framebuffer();
     let font_data = std::fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
-    let mut console = Console::new(fb, font);
+    let mut console = Console::new(window.screen(), font);
 
     let mut shell_stdin = child.stdin.take().unwrap();
     let mut shell_stdout = child.stdout.take().unwrap();
@@ -96,11 +95,10 @@ fn main() {
                             window.present();
                         }
                         window::MOUSE_SCROLL => {
-                            let pixels = console.font_height();
                             if ev.scroll < 0 {
-                                console.scroll_view_up(pixels);
+                                console.scroll_view_up(1);
                             } else if ev.scroll > 0 {
-                                console.scroll_view_down(pixels);
+                                console.scroll_view_down(1);
                             }
                             window.present();
                         }
@@ -109,7 +107,7 @@ fn main() {
                 }
                 window::Event::Close => break,
                 window::Event::Resized => {
-                                    console.resize(window.framebuffer());
+                    console.resize(window.screen());
                     window.present();
                 }
                 window::Event::Frame => {}

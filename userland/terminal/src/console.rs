@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use font::Font;
-use window::{Color, Framebuffer};
+use window::{Color, Framebuffer, Screen};
 
 const DEFAULT_FG: Color = Color { r: 255, g: 255, b: 255 };
 const DEFAULT_BG: Color = Color { r: 0, g: 0, b: 0 };
@@ -14,23 +14,6 @@ const SCROLLBAR_WIDTH: usize = 6;
 const SCROLLBAR_TRACK: Color = Color { r: 0x20, g: 0x20, b: 0x20 };
 const SCROLLBAR_THUMB: Color = Color { r: 0x60, g: 0x60, b: 0x60 };
 const SCROLLBAR_THUMB_MIN: usize = 20;
-
-/// Canvas wrapper that applies a signed y-offset and vertical clipping for scroll rendering.
-struct ScrollCanvas<'a> {
-    fb: &'a Framebuffer,
-    y_offset: isize,
-    y_min: usize,
-    y_max: usize,
-}
-
-impl font::Canvas for ScrollCanvas<'_> {
-    fn put_pixel(&self, x: usize, y: usize, color: Color) {
-        let sy = y as isize + self.y_offset;
-        if sy >= self.y_min as isize && (sy as usize) < self.y_max {
-            self.fb.put_pixel(x, sy as usize, color);
-        }
-    }
-}
 
 fn ansi_color(index: usize) -> Color {
     match index {
@@ -93,20 +76,21 @@ struct SavedScreen {
     fg_buf: Vec<Color>,
     bg_buf: Vec<Color>,
     wrapped: Vec<bool>,
-    rendered: Vec<u64>,
     cursor_col: usize,
     cursor_row: usize,
 }
 
-/// Pack codepoint + fg + bg into a u64 for fast equality checks.
-fn cell_key(ch: char, fg: Color, bg: Color) -> u64 {
-    (ch as u64 & 0x1F_FFFF)
-        | ((fg.r as u64 >> 1) << 21)
-        | ((fg.g as u64 >> 1) << 28)
-        | ((fg.b as u64 >> 1) << 35)
-        | ((bg.r as u64 >> 1) << 42)
-        | ((bg.g as u64 >> 1) << 49)
-        | ((bg.b as u64 >> 1) << 56)
+/// A screen cell as the view says it should look.
+///
+/// Compared for equality against what was last put on the panel at that
+/// position, which is the whole of the damage test. It holds the three values
+/// a glyph is drawn from rather than a hash of them, so two cells that differ
+/// cannot compare equal and leave a stale one on screen.
+#[derive(Clone, Copy, PartialEq)]
+struct Painted {
+    ch: char,
+    fg: Color,
+    bg: Color,
 }
 
 struct ScrollbackRow {
@@ -115,8 +99,24 @@ struct ScrollbackRow {
     bg: Vec<Color>,
 }
 
+/// A terminal over a [`Screen`].
+///
+/// Everything is composed in system RAM and the panel only ever receives
+/// finished pixels: the emulator writes cells, and one pass at the end of a
+/// batch blits the cells that no longer match what is on the panel. Two things
+/// follow from that and are the point of it.
+///
+/// The panel is never read. Scrolling used to be a `memmove` inside the
+/// mapping, which reads back every byte it moves — 16.8 MiB per scrolled line
+/// at 2048x2048, measured — and reads are uncached under both of the memory
+/// types a GOP scanout is ever mapped with.
+///
+/// And a batch costs one paint rather than one per line. A thousand lines
+/// arriving together scroll the cell grid a thousand times and reach the panel
+/// once, so what is blitted is the difference between the screen before and the
+/// screen after, not the thousand screens in between.
 pub struct Console {
-    fb: Framebuffer,
+    screen: Screen,
     font: Font,
     cols: usize,
     rows: usize,
@@ -129,12 +129,16 @@ pub struct Console {
     bg_buf: Vec<Color>,
     /// Per-row flag: true if this row soft-wrapped into the next row.
     wrapped: Vec<bool>,
-    rendered: Vec<u64>,
+    /// What is on the panel, per screen cell. `None` where nothing is known to
+    /// be — a fresh console, whose panel still holds whatever drew there last.
+    painted: Vec<Option<Painted>>,
+    /// The scrollbar thumb as last drawn, `None` when there is no bar on
+    /// screen.
+    painted_scrollbar: Option<(usize, usize)>,
     ansi_state: AnsiState,
     ansi_buf: [u8; 16],
     ansi_len: usize,
     reverse_video: bool,
-    cursor_visible: bool,
     cursor_enabled: bool,
     saved_screen: Option<SavedScreen>,
     utf8_buf: [u8; 4],
@@ -143,16 +147,22 @@ pub struct Console {
     sel_anchor: Option<(usize, usize)>,
     sel_end: Option<(usize, usize)>,
     scrollback: VecDeque<ScrollbackRow>,
-    scroll_pixel_offset: usize,
+    /// Rows of [`Console::scrollback`] between the bottom of the view and the
+    /// live screen. Zero is the live screen.
+    view_offset: usize,
+    /// Where a damaged span is composed before it is handed over. One text row
+    /// wide and tall, or the scrollbar's column, whichever needs more.
+    strip: Vec<u8>,
 }
 
 impl Console {
-    pub fn new(fb: Framebuffer, font: Font) -> Self {
-        let cols = fb.width() / font.width();
-        let rows = fb.height() / font.height();
+    pub fn new(screen: Screen, font: Font) -> Self {
+        let cols = screen.width() / font.width();
+        let rows = screen.height() / font.height();
+        let strip = vec![0u8; strip_bytes(screen.width(), screen.height(), font.height())];
 
         let mut console = Self {
-            fb,
+            screen,
             font,
             cols,
             rows,
@@ -164,12 +174,12 @@ impl Console {
             fg_buf: vec![DEFAULT_FG; cols * rows],
             bg_buf: vec![DEFAULT_BG; cols * rows],
             wrapped: vec![false; rows],
-            rendered: vec![cell_key(' ', DEFAULT_FG, DEFAULT_BG); cols * rows],
+            painted: vec![None; cols * rows],
+            painted_scrollbar: None,
             ansi_state: AnsiState::Normal,
             ansi_buf: [0; 16],
             ansi_len: 0,
             reverse_video: false,
-            cursor_visible: false,
             cursor_enabled: true,
             saved_screen: None,
             utf8_buf: [0; 4],
@@ -178,12 +188,129 @@ impl Console {
             sel_anchor: None,
             sel_end: None,
             scrollback: VecDeque::new(),
-            scroll_pixel_offset: 0,
+            view_offset: 0,
+            strip,
         };
 
-        console.fb.clear(DEFAULT_BG);
-        console.draw_cursor();
+        console.flush();
         console
+    }
+
+    /// What the view says belongs at this screen position.
+    fn view_cell(&self, row: usize, col: usize) -> Painted {
+        let history = self.scrollback.len();
+        let abs = history - self.view_offset + row;
+        if abs < history {
+            let sb = &self.scrollback[abs];
+            return match sb.chars.get(col) {
+                Some(&ch) => Painted { ch, fg: sb.fg[col], bg: sb.bg[col] },
+                None => Painted { ch: ' ', fg: DEFAULT_FG, bg: DEFAULT_BG },
+            };
+        }
+        let idx = (abs - history) * self.cols + col;
+        let ch = self.char_buf[idx];
+        if self.is_selected(idx) {
+            return Painted { ch, fg: SEL_FG, bg: SEL_BG };
+        }
+        if self.cursor_enabled
+            && self.view_offset == 0
+            && idx == self.cursor_row * self.cols + self.cursor_col
+        {
+            return Painted { ch, fg: self.bg, bg: self.fg };
+        }
+        Painted { ch, fg: self.fg_buf[idx], bg: self.bg_buf[idx] }
+    }
+
+    /// Put the view on the panel, blitting only what changed.
+    fn flush(&mut self) {
+        let fw = self.font.width();
+        let fh = self.font.height();
+        let bar = self.scrollbar();
+        if bar != self.painted_scrollbar {
+            // The columns the bar sits over change hands in either direction:
+            // to it, or back to the cells it was covering.
+            let first = (self.screen.width() - SCROLLBAR_WIDTH) / fw;
+            for row in 0..self.rows {
+                self.painted[row * self.cols + first..(row + 1) * self.cols].fill(None);
+            }
+        }
+        let paint_width = match bar {
+            Some(_) => self.screen.width() - SCROLLBAR_WIDTH,
+            None => self.screen.width(),
+        };
+
+        let mut strip = core::mem::take(&mut self.strip);
+        for row in 0..self.rows {
+            let Some((first, last)) = self.damage(row) else { continue };
+            let span = last + 1 - first;
+            let surface = Framebuffer::new(
+                strip.as_mut_ptr(),
+                span * fw,
+                fh,
+                span * fw,
+                self.screen.pixel_format_raw(),
+            );
+            for col in first..=last {
+                let cell = self.view_cell(row, col);
+                self.font
+                    .draw_char(&surface, (col - first) * fw, 0, cell.ch, cell.fg, cell.bg);
+                self.painted[row * self.cols + col] = Some(cell);
+            }
+            let x = first * fw;
+            let w = (span * fw).min(paint_width.saturating_sub(x));
+            if w > 0 {
+                self.screen.blit(x, row * fh, w, fh, span * fw, &strip);
+            }
+        }
+
+        if bar != self.painted_scrollbar {
+            if let Some((thumb_top, thumb_height)) = bar {
+                let height = self.rows * fh;
+                let surface = Framebuffer::new(
+                    strip.as_mut_ptr(),
+                    SCROLLBAR_WIDTH,
+                    height,
+                    SCROLLBAR_WIDTH,
+                    self.screen.pixel_format_raw(),
+                );
+                surface.fill_rect(0, 0, SCROLLBAR_WIDTH, height, SCROLLBAR_TRACK);
+                surface.fill_rect(0, thumb_top, SCROLLBAR_WIDTH, thumb_height, SCROLLBAR_THUMB);
+                let x = self.screen.width() - SCROLLBAR_WIDTH;
+                self.screen
+                    .blit(x, 0, SCROLLBAR_WIDTH, height, SCROLLBAR_WIDTH, &strip);
+            }
+            self.painted_scrollbar = bar;
+        }
+        self.strip = strip;
+    }
+
+    /// The columns of `row` that no longer match the panel, as one span.
+    ///
+    /// One span rather than a list of them: the cells a scroll changes are
+    /// contiguous far more often than not, and re-composing an unchanged cell
+    /// inside the span costs system RAM where splitting the blit costs another
+    /// pass over the mapping.
+    fn damage(&self, row: usize) -> Option<(usize, usize)> {
+        let base = row * self.cols;
+        let changed =
+            |col: &usize| self.painted[base + col] != Some(self.view_cell(row, *col));
+        let first = (0..self.cols).find(changed)?;
+        let last = (first..self.cols).rfind(changed).unwrap_or(first);
+        Some((first, last))
+    }
+
+    /// The scrollbar thumb as `(top, height)`, or `None` when the view is at
+    /// the bottom and there is nothing to indicate.
+    fn scrollbar(&self) -> Option<(usize, usize)> {
+        if self.view_offset == 0 {
+            return None;
+        }
+        let fh = self.font.height();
+        let viewport = self.rows * fh;
+        let total = (self.scrollback.len() + self.rows) * fh;
+        let thumb = (viewport * viewport / total).max(SCROLLBAR_THUMB_MIN).min(viewport);
+        let track = viewport - thumb;
+        Some((track - self.view_offset * track / self.scrollback.len(), thumb))
     }
 
     fn put_char(&mut self, col: usize, row: usize, ch: char) {
@@ -196,48 +323,9 @@ impl Console {
         };
         self.fg_buf[idx] = fg;
         self.bg_buf[idx] = bg;
-        let key = cell_key(ch, fg, bg);
-        if self.rendered[idx] == key {
-            return;
-        }
-        self.rendered[idx] = key;
-        let px = col * self.font.width();
-        let py = row * self.font.height();
-        self.font.draw_char(&self.fb, px, py, ch, fg, bg);
-    }
-
-    fn draw_cursor(&mut self) {
-        if !self.cursor_enabled {
-            return;
-        }
-        if self.cursor_col < self.cols && self.cursor_row < self.rows {
-            let idx = self.cursor_row * self.cols + self.cursor_col;
-            let ch = self.char_buf[idx];
-            let px = self.cursor_col * self.font.width();
-            let py = self.cursor_row * self.font.height();
-            self.rendered[idx] = 0;
-            self.font.draw_char(&self.fb, px, py, ch, self.bg, self.fg);
-        }
-        self.cursor_visible = true;
-    }
-
-    fn erase_cursor(&mut self) {
-        if !self.cursor_visible {
-            return;
-        }
-        if self.cursor_col < self.cols && self.cursor_row < self.rows {
-            let idx = self.cursor_row * self.cols + self.cursor_col;
-            let ch = self.char_buf[idx];
-            let px = self.cursor_col * self.font.width();
-            let py = self.cursor_row * self.font.height();
-            self.rendered[idx] = 0;
-            self.font.draw_char(&self.fb, px, py, ch, self.fg, self.bg);
-        }
-        self.cursor_visible = false;
     }
 
     fn scroll(&mut self) {
-        // Save the top row to scrollback
         let row_size = self.cols;
         self.scrollback.push_back(ScrollbackRow {
             chars: self.char_buf[..row_size].to_vec(),
@@ -248,19 +336,14 @@ impl Console {
             self.scrollback.pop_front();
         }
 
-        self.fb.scroll_up(self.font.height(), self.bg);
         self.char_buf.copy_within(row_size.., 0);
         self.fg_buf.copy_within(row_size.., 0);
         self.bg_buf.copy_within(row_size.., 0);
-        self.rendered.copy_within(row_size.., 0);
         self.wrapped.copy_within(1.., 0);
         let last_row = (self.rows - 1) * row_size;
-        for i in last_row..last_row + row_size {
-            self.char_buf[i] = ' ';
-            self.fg_buf[i] = DEFAULT_FG;
-            self.bg_buf[i] = DEFAULT_BG;
-            self.rendered[i] = 0;
-        }
+        self.char_buf[last_row..].fill(' ');
+        self.fg_buf[last_row..].fill(DEFAULT_FG);
+        self.bg_buf[last_row..].fill(DEFAULT_BG);
         self.wrapped[self.rows - 1] = false;
         self.cursor_row = self.rows - 1;
         self.cursor_col = 0;
@@ -275,35 +358,12 @@ impl Console {
     }
 
     fn clear_screen(&mut self) {
-        self.fb.clear(self.bg);
         self.char_buf.fill(' ');
         self.fg_buf.fill(DEFAULT_FG);
-        self.bg_buf.fill(DEFAULT_BG);
+        self.bg_buf.fill(self.bg);
         self.wrapped.fill(false);
-        let blank = cell_key(' ', DEFAULT_FG, DEFAULT_BG);
-        self.rendered.fill(blank);
         self.cursor_col = 0;
         self.cursor_row = 0;
-    }
-
-    fn redraw_all(&mut self) {
-        self.fb.clear(DEFAULT_BG);
-        self.rendered.fill(0);
-        for row in 0..self.rows {
-            for col in 0..self.cols {
-                let idx = row * self.cols + col;
-                let ch = self.char_buf[idx];
-                let fg = self.fg_buf[idx];
-                let bg = self.bg_buf[idx];
-                if ch != ' ' || bg != DEFAULT_BG {
-                    let px = col * self.font.width();
-                    let py = row * self.font.height();
-                    self.rendered[idx] = cell_key(ch, fg, bg);
-                    self.font.draw_char(&self.fb, px, py, ch, fg, bg);
-                }
-            }
-        }
-        self.draw_scrollbar();
     }
 
     fn emit_char(&mut self, ch: char) {
@@ -515,27 +575,21 @@ impl Console {
         let (params, count) = self.parse_params();
         let p1 = if count > 0 { params[0] } else { 0 };
         match (p1, cmd) {
-            (25, b'l') => {
-                self.cursor_enabled = false;
-                self.erase_cursor();
-            }
-            (25, b'h') => {
-                self.cursor_enabled = true;
-            }
+            (25, b'l') => self.cursor_enabled = false,
+            (25, b'h') => self.cursor_enabled = true,
             (1049, b'h') => {
                 let n = self.cols * self.rows;
+                let bg = self.bg;
                 self.saved_screen = Some(SavedScreen {
                     char_buf: core::mem::replace(&mut self.char_buf, vec![' '; n]),
                     fg_buf: core::mem::replace(&mut self.fg_buf, vec![DEFAULT_FG; n]),
-                    bg_buf: core::mem::replace(&mut self.bg_buf, vec![DEFAULT_BG; n]),
+                    bg_buf: core::mem::replace(&mut self.bg_buf, vec![bg; n]),
                     wrapped: core::mem::replace(&mut self.wrapped, vec![false; self.rows]),
-                    rendered: core::mem::replace(&mut self.rendered, vec![0; n]),
                     cursor_col: self.cursor_col,
                     cursor_row: self.cursor_row,
                 });
                 self.cursor_col = 0;
                 self.cursor_row = 0;
-                self.fb.clear(self.bg);
             }
             (1049, b'l') => {
                 if let Some(saved) = self.saved_screen.take() {
@@ -543,19 +597,17 @@ impl Console {
                     self.fg_buf = saved.fg_buf;
                     self.bg_buf = saved.bg_buf;
                     self.wrapped = saved.wrapped;
-                    self.rendered = saved.rendered;
                     self.cursor_col = saved.cursor_col;
                     self.cursor_row = saved.cursor_row;
-                    self.redraw_all();
                 }
             }
             _ => {}
         }
     }
 
-    pub fn resize(&mut self, fb: Framebuffer) {
-        let new_cols = fb.width() / self.font.width();
-        let new_rows = fb.height() / self.font.height();
+    pub fn resize(&mut self, screen: Screen) {
+        let new_cols = screen.width() / self.font.width();
+        let new_rows = screen.height() / self.font.height();
 
         // Find cursor's offset within its logical line
         let mut cursor_line_offset = self.cursor_col;
@@ -623,21 +675,23 @@ impl Console {
             dest_row += 1;
         }
 
-        self.fb = fb;
+        self.strip = vec![0u8; strip_bytes(screen.width(), screen.height(), self.font.height())];
+        self.screen = screen;
         self.cols = new_cols;
         self.rows = new_rows;
         self.char_buf = new_char_buf;
         self.fg_buf = vec![DEFAULT_FG; new_cols * new_rows];
         self.bg_buf = vec![DEFAULT_BG; new_cols * new_rows];
         self.wrapped = new_wrapped;
-        self.rendered = vec![0; new_cols * new_rows];
+        self.painted = vec![None; new_cols * new_rows];
+        self.painted_scrollbar = None;
         self.cursor_row = new_cursor_row.min(new_rows.saturating_sub(1));
         self.cursor_col = new_cursor_col.min(new_cols.saturating_sub(1));
         self.saved_screen = None;
         self.sel_anchor = None;
         self.sel_end = None;
-        self.scroll_pixel_offset = 0;
-        self.redraw_all();
+        self.view_offset = 0;
+        self.flush();
     }
 
     pub fn font_width(&self) -> usize {
@@ -646,6 +700,12 @@ impl Console {
 
     pub fn font_height(&self) -> usize {
         self.font.height()
+    }
+
+    /// Bytes this console has put on the panel, and the blits that carried
+    /// them.
+    pub fn screen_traffic(&self) -> (u64, u64) {
+        self.screen.traffic()
     }
 
     fn selection_range(&self) -> Option<(usize, usize)> {
@@ -663,67 +723,34 @@ impl Console {
         }
     }
 
-    fn redraw_cell(&mut self, col: usize, row: usize) {
-        let idx = row * self.cols + col;
-        let ch = self.char_buf[idx];
-        let (fg, bg) = if self.is_selected(idx) {
-            (SEL_FG, SEL_BG)
-        } else {
-            (self.fg_buf[idx], self.bg_buf[idx])
-        };
-        self.rendered[idx] = 0; // force redraw
-        let px = col * self.font.width();
-        let py = row * self.font.height();
-        self.font.draw_char(&self.fb, px, py, ch, fg, bg);
-    }
-
-    fn redraw_selection_range(&mut self, start: usize, end: usize) {
-        for idx in start..=end.min(self.cols * self.rows - 1) {
-            let col = idx % self.cols;
-            let row = idx / self.cols;
-            self.redraw_cell(col, row);
-        }
-    }
-
     pub fn mouse_down(&mut self, col: usize, row: usize) {
         let col = col.min(self.cols.saturating_sub(1));
         let row = row.min(self.rows.saturating_sub(1));
-        // Clear previous selection
-        if let Some((old_start, old_end)) = self.selection_range() {
-            self.sel_anchor = None;
-            self.sel_end = None;
-            self.redraw_selection_range(old_start, old_end);
-        }
         self.sel_anchor = Some((col, row));
         self.sel_end = Some((col, row));
+        self.flush();
     }
 
     pub fn mouse_drag(&mut self, col: usize, row: usize) {
         if self.sel_anchor.is_none() {
             return;
         }
-        let col = col.min(self.cols.saturating_sub(1));
-        let row = row.min(self.rows.saturating_sub(1));
-        // Only redraw cells between old and new end — those are the ones whose state changed
-        if let Some((oc, or)) = self.sel_end {
-            let old_idx = or * self.cols + oc;
-            let new_idx = row * self.cols + col;
-            self.sel_end = Some((col, row));
-            let start = old_idx.min(new_idx);
-            let end = old_idx.max(new_idx);
-            self.redraw_selection_range(start, end);
-        } else {
-            self.sel_end = Some((col, row));
-        }
+        self.sel_end = Some((
+            col.min(self.cols.saturating_sub(1)),
+            row.min(self.rows.saturating_sub(1)),
+        ));
+        self.flush();
     }
 
     pub fn mouse_up(&mut self, col: usize, row: usize) -> Option<String> {
         if self.sel_anchor.is_none() {
             return None;
         }
-        let col = col.min(self.cols.saturating_sub(1));
-        let row = row.min(self.rows.saturating_sub(1));
-        self.sel_end = Some((col, row));
+        self.sel_end = Some((
+            col.min(self.cols.saturating_sub(1)),
+            row.min(self.rows.saturating_sub(1)),
+        ));
+        self.flush();
         self.selected_text()
     }
 
@@ -757,162 +784,46 @@ impl Console {
     }
 
     pub fn clear_selection(&mut self) {
-        if let Some((start, end)) = self.selection_range() {
-            self.sel_anchor = None;
-            self.sel_end = None;
-            self.redraw_selection_range(start, end);
-        } else {
-            self.sel_anchor = None;
-            self.sel_end = None;
-        }
-    }
-
-    /// Scroll the view up (into history) by `pixels` pixels.
-    pub fn scroll_view_up(&mut self, pixels: usize) {
-        let fh = self.font.height();
-        let max_offset = self.scrollback.len() * fh;
-        let new_offset = (self.scroll_pixel_offset + pixels).min(max_offset);
-        if new_offset == self.scroll_pixel_offset {
+        if self.sel_anchor.is_none() && self.sel_end.is_none() {
             return;
         }
-        let delta = new_offset - self.scroll_pixel_offset;
-        self.scroll_pixel_offset = new_offset;
-
-        let viewport_height = self.rows * fh;
-        if delta >= viewport_height {
-            self.redraw_scrollback_view();
-            return;
-        }
-
-        // Shift framebuffer DOWN — new content appears at top
-        self.fb.scroll_down(delta, DEFAULT_BG);
-        self.render_strip(0, delta);
-        self.draw_scrollbar();
+        self.sel_anchor = None;
+        self.sel_end = None;
+        self.flush();
     }
 
-    /// Scroll the view down (toward present) by `pixels` pixels.
-    pub fn scroll_view_down(&mut self, pixels: usize) {
-        if self.scroll_pixel_offset == 0 {
+    /// Scroll the view `rows` text rows up, into history.
+    pub fn scroll_view_up(&mut self, rows: usize) {
+        let want = (self.view_offset + rows).min(self.scrollback.len());
+        if want == self.view_offset {
             return;
         }
-        let new_offset = self.scroll_pixel_offset.saturating_sub(pixels);
-        let delta = self.scroll_pixel_offset - new_offset;
-        self.scroll_pixel_offset = new_offset;
+        self.view_offset = want;
+        self.flush();
+    }
 
-        if new_offset == 0 {
-            self.redraw_all();
-            self.draw_cursor();
+    /// Scroll the view `rows` text rows down, toward the live screen.
+    pub fn scroll_view_down(&mut self, rows: usize) {
+        let want = self.view_offset.saturating_sub(rows);
+        if want == self.view_offset {
             return;
         }
-
-        let fh = self.font.height();
-        let viewport_height = self.rows * fh;
-        if delta >= viewport_height {
-            self.redraw_scrollback_view();
-            return;
-        }
-
-        // Shift framebuffer UP — new content appears at bottom
-        self.fb.scroll_up(delta, DEFAULT_BG);
-        self.render_strip(viewport_height - delta, viewport_height);
-        self.draw_scrollbar();
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        if self.scroll_pixel_offset > 0 {
-            self.scroll_pixel_offset = 0;
-            self.redraw_all();
-        }
-    }
-
-    /// Render content rows that map to screen y in [screen_y_start, screen_y_end).
-    fn render_strip(&self, screen_y_start: usize, screen_y_end: usize) {
-        let fh = self.font.height();
-        let fw = self.font.width();
-        let sb_len = self.scrollback.len();
-        let viewport_top = sb_len * fh - self.scroll_pixel_offset;
-
-        let canvas = ScrollCanvas {
-            fb: &self.fb,
-            y_offset: -(viewport_top as isize),
-            y_min: screen_y_start,
-            y_max: screen_y_end,
-        };
-
-        let content_y_start = viewport_top + screen_y_start;
-        let content_y_end = viewport_top + screen_y_end;
-        let first_row = content_y_start / fh;
-        let last_row = ((content_y_end + fh - 1) / fh).min(sb_len + self.rows);
-
-        for row_idx in first_row..last_row {
-            let content_y = row_idx * fh;
-            if row_idx < sb_len {
-                let sb_row = &self.scrollback[row_idx];
-                let cols_to_draw = sb_row.chars.len().min(self.cols);
-                for col in 0..cols_to_draw {
-                    let ch = sb_row.chars[col];
-                    let fg = sb_row.fg[col];
-                    let bg = sb_row.bg[col];
-                    if ch != ' ' || bg != DEFAULT_BG {
-                        self.font.draw_char(&canvas, col * fw, content_y, ch, fg, bg);
-                    }
-                }
-            } else {
-                let buf_row = row_idx - sb_len;
-                for col in 0..self.cols {
-                    let idx = buf_row * self.cols + col;
-                    let ch = self.char_buf[idx];
-                    let fg = self.fg_buf[idx];
-                    let bg = self.bg_buf[idx];
-                    if ch != ' ' || bg != DEFAULT_BG {
-                        self.font.draw_char(&canvas, col * fw, content_y, ch, fg, bg);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Full redraw of scrollback view (used for large jumps and initial scroll).
-    fn redraw_scrollback_view(&mut self) {
-        let fh = self.font.height();
-        let viewport_height = self.rows * fh;
-        self.fb.clear(DEFAULT_BG);
-        self.rendered.fill(0);
-        self.render_strip(0, viewport_height);
-        self.draw_scrollbar();
-    }
-
-    fn draw_scrollbar(&self) {
-        if self.scrollback.is_empty() {
-            return;
-        }
-        let fh = self.font.height();
-        let viewport_height = self.rows * fh;
-        let total_content = (self.scrollback.len() + self.rows) * fh;
-        let max_scroll = self.scrollback.len() * fh;
-        let x = self.fb.width() - SCROLLBAR_WIDTH;
-
-        // Track
-        self.fb.fill_rect(x, 0, SCROLLBAR_WIDTH, viewport_height, SCROLLBAR_TRACK);
-
-        // Thumb
-        let thumb_height = (viewport_height * viewport_height / total_content).max(SCROLLBAR_THUMB_MIN);
-        let track_range = viewport_height.saturating_sub(thumb_height);
-        let thumb_top = if max_scroll > 0 {
-            track_range - (self.scroll_pixel_offset * track_range / max_scroll)
-        } else {
-            track_range
-        };
-        self.fb.fill_rect(x, thumb_top, SCROLLBAR_WIDTH, thumb_height, SCROLLBAR_THUMB);
+        self.view_offset = want;
+        self.flush();
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        self.clear_selection();
-        self.scroll_to_bottom();
-        self.erase_cursor();
+        self.sel_anchor = None;
+        self.sel_end = None;
+        self.view_offset = 0;
         for &byte in bytes {
             self.write_byte(byte);
         }
-        self.draw_cursor();
+        self.flush();
     }
+}
+
+/// Room for a full-width text row, or for the scrollbar's full-height column.
+fn strip_bytes(width: usize, height: usize, font_height: usize) -> usize {
+    (width * font_height).max(SCROLLBAR_WIDTH * height) * 4
 }

@@ -18,7 +18,8 @@
 //!   so the report paints over whatever this program drew.
 //!   `screen_console_panic` is the gate.
 //! - **The emulator is `/bin/terminal`'s**, unchanged. `Console::new` always
-//!   took a raw framebuffer; the compositor was never below it.
+//!   took a raw mapping; the compositor was never below it. This is the caller
+//!   whose mapping is the scanout, so it is the one that pays for a read.
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -29,7 +30,7 @@ use terminal::Console;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::shm::SharedMemory;
 use toyos::{gpu, FramebufferDev, Keyboard};
-use window::Framebuffer;
+use window::Screen;
 
 const FONT: &str = "/share/fonts/JetBrainsMono-Regular-8x16.font";
 
@@ -65,7 +66,7 @@ fn main() {
     };
     let info = fb_dev.info().expect("console: framebuffer info");
     let shm = SharedMemory::map(info.token[0], info.stride as usize * info.height as usize * 4);
-    let fb = Framebuffer::new(
+    let screen = Screen::new(
         shm.as_ptr(),
         info.width as usize,
         info.height as usize,
@@ -79,15 +80,22 @@ fn main() {
     let cols = info.width as usize / font.width();
     // One row of overlap, so a paged-back screen still shares a line with the
     // one before it and the reader can tell where he is.
-    let page_pixels = rows.saturating_sub(1) * font.height();
-    let mut console = Console::new(fb, font);
+    let page_rows = rows.saturating_sub(1);
+    let mut console = Console::new(screen, font);
 
     let seeded = seed_kernel_log(&mut console);
     present(info.width, info.height);
 
     let kb = Keyboard::open().expect("console: no keyboard device");
-    eprintln!("console: ready {}x{} ({cols}x{rows} cells), kernel log {seeded} bytes",
-              info.width, info.height);
+    // What the panel cost, on a machine whose only instrument is the panel.
+    // The seed is the heaviest thing this program ever draws — a screenful of
+    // log per scrolled row — so a boot that felt slow says so here.
+    let (panel_bytes, blits) = console.screen_traffic();
+    eprintln!(
+        "console: ready {}x{} ({cols}x{rows} cells), kernel log {seeded} bytes, \
+         panel {panel_bytes} bytes in {blits} blits",
+        info.width, info.height
+    );
 
     // The declared set: the shell's two output pipes and the keyboard.
     let poller = Poller::new(3);
@@ -161,11 +169,11 @@ fn main() {
                     // prompt. A scrollback that needs a chord is one the owner
                     // does not reach for with a laptop in his hands.
                     KEY_PAGE_UP => {
-                        console.scroll_view_up(page_pixels);
+                        console.scroll_view_up(page_rows);
                         painted = true;
                     }
                     KEY_PAGE_DOWN => {
-                        console.scroll_view_down(page_pixels);
+                        console.scroll_view_down(page_rows);
                         painted = true;
                     }
                     _ if event.len > 0 => {
