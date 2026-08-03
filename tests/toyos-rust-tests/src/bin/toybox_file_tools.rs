@@ -16,6 +16,11 @@
 //!   added, this goes red — which is the point: `sys_rename` reports one error
 //!   for every cause, so such a fallback would fire on a broken rename too and
 //!   hide it.
+//! - **A rename that reports success moved the file.** Both `cp` and `mv` run
+//!   on `/home` here, where a rename used to insert the entry under the new
+//!   name and then delete that same entry, freeing the file's blocks on the
+//!   way out. Every claim below is about bytes on the other side of the move,
+//!   because that failure returned `Ok(())` and left both names absent.
 //!
 //! `hexdump`'s expected output is not computed here. It is the byte-for-byte
 //! output of the host's own `xxd` over the same 25 bytes, pasted in, so the
@@ -33,15 +38,19 @@ use std::process::{Command, Stdio};
 
 /// Larger than `cp`'s `FLUSH_BYTES` twice over, and not a page multiple.
 const BIG: usize = 2 * 1024 * 1024 + 137;
-/// `/tmp` and not `/home`, which is where this started. A `rename` on the
-/// bcachefs mount reports success and destroys the file — the entry it inserts
-/// under the new name is the one its own next step deletes, blocks and all —
-/// so `cp`, which renames its working file into place, cannot land anything
-/// there. That is a filesystem defect and it is in known issues; asserting it
-/// here would be encoding it as behaviour. `/log` is the mount this test's
-/// host-verified half uses, and `/tmp` is the one that works in-process.
-const BIG_SRC: &str = "/tmp/toybox_cp_src.bin";
-const BIG_DST: &str = "/tmp/toybox_cp_dst.bin";
+/// `/home`, the bcachefs mount, because `cp` lands its bytes on a sibling and
+/// renames that onto the destination — and a rename here used to insert the
+/// entry under the new name and then delete exactly that entry, blocks and
+/// all, reporting success. A copy that arrives byte-for-byte is that path as a
+/// user reaches it. `/log` is the mount this test's host-verified half uses.
+const BIG_SRC: &str = "/home/toybox_cp_src.bin";
+const BIG_DST: &str = "/home/toybox_cp_dst.bin";
+
+/// The three names the rename round trip walks a file through, on the same
+/// mount so that every step is one `SYS_RENAME`.
+const MV_A: &str = "/home/toybox_mv_home_a.bin";
+const MV_B: &str = "/home/toybox_mv_home_b.bin";
+const MV_ONTO: &str = "/home/toybox_mv_home_onto.bin";
 
 /// The 25 bytes the host's `xxd` was run against.
 const FIXTURE: &[u8] = b"Hello, world! ABCDEFGH\x00\x01\xff";
@@ -130,6 +139,7 @@ fn main() {
     cp_round_trip();
     cp_refusals();
     mv_within_a_mount();
+    mv_on_home();
     mv_across_mounts();
     hexdump_format();
     hexdump_refusals();
@@ -213,6 +223,55 @@ fn mv_within_a_mount() {
 
     fs::remove_file("/tmp/toybox_mv_dir/toybox_mv_b.bin").expect("cleanup");
     fs::remove_file("/tmp/toybox_mv_dir/occupied").expect("cleanup");
+}
+
+/// Whether `/home`'s listing holds a name. Other tests write there in the same
+/// boot, so this asks about one name and not about the whole directory.
+fn home_holds(name: &str) -> bool {
+    fs::read_dir("/home")
+        .expect("read_dir /home")
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy() == name)
+}
+
+/// The rename `/tmp` exercises is not the one that was broken. `/home` keys an
+/// entry by the hash of its name and holds the file's extent list inline in
+/// the value, so a rename re-encodes that value under a new key and has to
+/// remove the old entry *without* freeing what it points at. Byte-exactness
+/// after the move is what carries that claim: a name that resolves proves only
+/// that some entry exists under it.
+fn mv_on_home() {
+    let body: Vec<u8> =
+        (0..3 * 4096 + 29).map(|i: usize| (i.wrapping_mul(37) ^ 0x3C) as u8).collect();
+    fs::write(MV_A, &body).expect("stage a file on /home");
+
+    must_pass("mv", &[MV_A, MV_B]);
+    assert!(fs::read(MV_A).is_err(), "mv left the source behind on /home");
+    assert!(!home_holds("toybox_mv_home_a.bin"), "the old name is still in /home's listing");
+    let moved = fs::read(MV_B).expect("read the moved file");
+    assert_eq!(moved.len(), body.len(), "the moved file is {} bytes", moved.len());
+    let bad = moved.iter().zip(&body).position(|(a, b)| a != b);
+    assert!(bad.is_none(), "the moved file differs from the source at byte {}", bad.unwrap_or(0));
+    println!("  PASS mv on /home moves {} bytes and the old name is gone", body.len());
+
+    // Onto a name that already exists. The entry the rename overwrites is the
+    // one whose blocks are freed; freeing the other one is the same mistake
+    // wearing the destination's name.
+    fs::write(MV_ONTO, b"the file that gets replaced\n").expect("stage the destination");
+    must_pass("mv", &[MV_B, MV_ONTO]);
+    assert!(fs::read(MV_B).is_err(), "mv onto an existing name left the source behind");
+    let over = fs::read(MV_ONTO).expect("read the overwritten destination");
+    let bad = over.iter().zip(&body).position(|(a, b)| a != b);
+    assert!(
+        over.len() == body.len() && bad.is_none(),
+        "the destination holds {} bytes differing at {:?}, not the {} that were moved onto it",
+        over.len(),
+        bad,
+        body.len(),
+    );
+    println!("  PASS mv onto an existing name on /home replaces it byte-for-byte");
+
+    fs::remove_file(MV_ONTO).expect("cleanup");
 }
 
 fn mv_across_mounts() {
