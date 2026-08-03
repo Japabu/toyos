@@ -69,6 +69,7 @@ const SCREEN_TESTS: &[&str] = &[
     "screen_decoder",
     "screen_diag_boot",
     "screen_console_shell",
+    "screen_console_clear",
     "screen_i8042_health",
     "screen_recoverable_untouched",
     "screen_early_panic",
@@ -91,6 +92,11 @@ const CONSOLE_NONCE: &str = "zqjxk";
 /// `"{cwd}> "` — without the trailing space, which the decoder trims off the
 /// end of every row.
 const CONSOLE_PROMPT: &str = "/home/root>";
+
+/// What `SYS_DEBUG` action 8 paints. Green, because the decoder thresholds on
+/// the brightest channel and a colour a glyph could contain would let a
+/// surviving pixel read as text rather than as itself.
+const GRAFFITI: [u8; 3] = [0x00, 0xC0, 0x00];
 
 /// Tests whose machine shape *is* the test: metal-sim, where the PS/2
 /// keyboard is the only input source and no virtio device exists, or a q35
@@ -117,6 +123,7 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_no_interrupt",
     "nvme_large_device",
     "nvme_wide_sector",
+    "iommu_discovery",
     "readdir_bound",
     "i8042_health",
     "i8042_keyboard",
@@ -1383,6 +1390,145 @@ fn run_screen_test(
             );
             Ok(())
         }
+        "screen_console_clear" => {
+            // `clear` is the one command whose entire output is the *absence*
+            // of output, which is why nothing else in the suite covers it:
+            // every other screen assertion looks for something that should be
+            // on the panel, and passes whether or not anything else is up
+            // there with it. This one asserts what must *not* be there, and
+            // the console is the caller that has to get it right — on the
+            // machine it is for there is no scrollbar to drag and no second
+            // window to read from.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("console");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                kernel_features: &["test-screen-graffiti"],
+                ready_marker: "console: ready",
+                ..Default::default()
+            };
+            let mut qemu =
+                QemuInstance::boot_with_options(&config, c_bins, rust_bins, options);
+            let font = screen::ConsoleFont::load();
+
+            let before = qemu.screendump_while(
+                Duration::from_secs(30),
+                Duration::from_millis(200),
+                |d| d.console_text(&font).contains(CONSOLE_PROMPT),
+            );
+            let before_text = before.console_text(&font);
+            if !before_text.contains(CONSOLE_PROMPT) {
+                return Err(format!(
+                    "no prompt to clear\ndecoded screen:\n{before_text}"
+                ));
+            }
+            // The premise. Clearing a screen that was already blank asserts
+            // nothing, and the seeded kernel log is what fills it.
+            let filled = before.console_rows(&font).iter().filter(|r| !r.is_empty()).count();
+            if filled < 10 {
+                return Err(format!(
+                    "only {filled} non-blank rows before `clear`, so there was nothing to \
+                     leave behind\ndecoded screen:\n{before_text}"
+                ));
+            }
+
+            // Draw on the glass behind the console's back, which is the state
+            // `clear` exists to get a user out of and the one a damage-tracked
+            // console can talk itself out of repairing.
+            {
+                let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+                input.type_text("test_rs_test_screen_graffiti\n");
+            }
+            let painted_over = qemu.screendump_while(
+                Duration::from_secs(30),
+                Duration::from_millis(200),
+                |d| d.pixels.iter().all(|p| *p == GRAFFITI),
+            );
+            // Non-vacuity, and the reason this test can fail at all: if the
+            // kernel did not actually reach the panel, everything below would
+            // pass on a screen that was already blank.
+            let stray = painted_over.pixels.iter().filter(|p| **p == GRAFFITI).count();
+            if stray != painted_over.pixels.len() {
+                return Err(format!(
+                    "the graffiti actuator did not take the whole panel: {stray} of {} pixels \
+                     are {GRAFFITI:?}, so there is nothing here for `clear` to fail to remove",
+                    painted_over.pixels.len()
+                ));
+            }
+
+            {
+                let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+                input.type_text("clear\n");
+            }
+
+            // `clear` is `ESC[2J ESC[H`, after which the shell reprints its
+            // prompt at the home position. So the whole panel is one row of
+            // prompt and nothing else -- wait for that, then assert it, so a
+            // slow paint reads as a failure rather than as a pass on a screen
+            // that had not finished.
+            let only_prompt = |d: &screen::Ppm| {
+                let rows = d.console_rows(&font);
+                rows.first().is_some_and(|r| r.trim() == CONSOLE_PROMPT)
+                    && rows[1..].iter().all(|r| r.is_empty())
+            };
+            let dump = qemu.screendump_while(
+                Duration::from_secs(30),
+                Duration::from_millis(200),
+                only_prompt,
+            );
+            let after = dump.console_text(&font);
+            print_screen(name, &after);
+
+            let rows = dump.console_rows(&font);
+            if !rows.first().is_some_and(|r| r.trim() == CONSOLE_PROMPT) {
+                return Err(format!(
+                    "`clear` did not leave the prompt on the home row\n\
+                     decoded screen:\n{after}"
+                ));
+            }
+            let survivors: Vec<String> = rows[1..]
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.is_empty())
+                .map(|(i, r)| format!("    row {}: {r}", i + 1))
+                .collect();
+            if !survivors.is_empty() {
+                return Err(format!(
+                    "{} rows survived `clear`:\n{}\ndecoded screen:\n{after}",
+                    survivors.len(),
+                    survivors.join("\n")
+                ));
+            }
+
+            // Not the cell grid but the pixels outside it. A panel whose
+            // height is not a whole number of glyph rows has a strip along the
+            // bottom that no cell covers, and a console that paints only its
+            // cells never writes there -- so whatever drew last, the kernel's
+            // last boot checkpoint, stays for the life of the session. Black
+            // on black hides it on the machine that found this; a fill that is
+            // not black does not.
+            let fh = screen::GLYPH_H;
+            let margin = dump.height % fh;
+            eprintln!(
+                "  [clear] {}x{}: {} cell rows and a {margin}px strip below them, all of it \
+                 repainted",
+                dump.width, dump.height, dump.height / fh
+            );
+            if let Some(i) = dump.pixels.iter().position(|p| *p == GRAFFITI) {
+                let (x, y) = (i % dump.width, i / dump.width);
+                let where_ = if y >= dump.height - margin {
+                    format!("the {margin}px strip below the last cell row, which no cell covers")
+                } else {
+                    format!("cell ({}, {})", x / screen::GLYPH_W, y / fh)
+                };
+                return Err(format!(
+                    "`clear` left the paint at pixel ({x}, {y}) — {where_}. The panel is not \
+                     blank after ESC[2J, so `clear` promises what it does not do\n\
+                     decoded screen:\n{after}"
+                ));
+            }
+            Ok(())
+        }
         "screen_console_panic" => {
             // Does claiming the framebuffer silence the panic report? Read off
             // the code the answer is no — `render` ignores
@@ -1903,6 +2049,8 @@ fn run_machine_test(
         "xhci_full_speed_device" => {
             usb::xhci_full_speed_device(test_config, c_bins, rust_bins)
         }
+        // Body in `tests/common/iommu.rs`, same reason.
+        "iommu_discovery" => common::iommu::iommu_discovery(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
