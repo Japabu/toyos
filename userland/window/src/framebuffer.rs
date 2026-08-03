@@ -119,6 +119,46 @@ impl Screen {
     }
 }
 
+/// Bytes a [`Framebuffer`] has moved through its surface since it was created.
+///
+/// Cumulative; a caller sampling a window subtracts its previous sample.
+#[derive(Clone, Copy, Default)]
+pub struct Traffic {
+    /// Bytes written by the bulk paths — `blit`, `fill_rect`, `scroll_*`.
+    ///
+    /// `put_pixel` is not counted. It is the per-pixel path — every glyph a
+    /// font draws goes through it one pixel at a time — so a counter there
+    /// would tax every program that draws text to pay for one program's
+    /// instrument.
+    pub written: u64,
+    /// Bytes read back *out of* the surface: `get_pixel`, the row replication
+    /// inside `fill_rect`, `scroll_*`.
+    ///
+    /// Zero for a surface that is only ever drawn into. A caller holding a
+    /// scanout mapping should read this as its bill: a read there misses every
+    /// cache under both memory types firmware gives a framebuffer, so it costs
+    /// a bus transaction that a write does not.
+    pub read: u64,
+    /// Reads of a single pixel (`get_pixel`) — each one a separate round trip.
+    pub pixel_reads: u64,
+    /// Reads of a whole row or region (`fill_rect`, `scroll_*`).
+    pub bulk_reads: u64,
+}
+
+impl Traffic {
+    /// What moved between an earlier sample and this one. Both must come from
+    /// the same surface; a sample from another one underflows rather than
+    /// producing a plausible figure.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            written: self.written - earlier.written,
+            read: self.read - earlier.read,
+            pixel_reads: self.pixel_reads - earlier.pixel_reads,
+            bulk_reads: self.bulk_reads - earlier.bulk_reads,
+        }
+    }
+}
+
 pub struct Framebuffer {
     buf: *mut u8,
     len: usize,
@@ -126,6 +166,10 @@ pub struct Framebuffer {
     height: usize,
     stride: usize,
     pixel_format: PixelFormat,
+    written: Cell<u64>,
+    read: Cell<u64>,
+    pixel_reads: Cell<u64>,
+    bulk_reads: Cell<u64>,
 }
 
 impl Framebuffer {
@@ -140,7 +184,27 @@ impl Framebuffer {
             height,
             stride,
             pixel_format: PixelFormat::from_raw(pixel_format),
+            written: Cell::new(0),
+            read: Cell::new(0),
+            pixel_reads: Cell::new(0),
+            bulk_reads: Cell::new(0),
         }
+    }
+
+    pub fn traffic(&self) -> Traffic {
+        Traffic {
+            written: self.written.get(),
+            read: self.read.get(),
+            pixel_reads: self.pixel_reads.get(),
+            bulk_reads: self.bulk_reads.get(),
+        }
+    }
+
+    /// A copy of the surface into itself: the same bytes read and written.
+    fn record_self_copy(&self, bytes: usize) {
+        self.written.set(self.written.get() + bytes as u64);
+        self.read.set(self.read.get() + bytes as u64);
+        self.bulk_reads.set(self.bulk_reads.get() + 1);
     }
 
     pub fn width(&self) -> usize {
@@ -173,6 +237,8 @@ impl Framebuffer {
         if x < self.width && y < self.height {
             let offset = (y * self.stride + x) * 4;
             debug_assert!(offset + 4 <= self.len);
+            self.read.set(self.read.get() + 4);
+            self.pixel_reads.set(self.pixel_reads.get() + 1);
             let pixel = unsafe { core::slice::from_raw_parts(self.buf.add(offset), 4) };
             match self.pixel_format {
                 PixelFormat::Rgb => Color { r: pixel[0], g: pixel[1], b: pixel[2] },
@@ -196,18 +262,22 @@ impl Framebuffer {
     }
 
     /// Fill a row of pixels with a 4-byte pattern using doubling memcpy.
-    unsafe fn fill_row(dst: *mut u8, pixel: &[u8; 4], count: usize) {
+    /// Returns how many of those copies read back out of the row.
+    unsafe fn fill_row(dst: *mut u8, pixel: &[u8; 4], count: usize) -> u64 {
         if count == 0 {
-            return;
+            return 0;
         }
         ptr::copy_nonoverlapping(pixel.as_ptr(), dst, 4);
         let total_bytes = count * 4;
         let mut filled = 4usize;
+        let mut copies = 0;
         while filled < total_bytes {
             let chunk = filled.min(total_bytes - filled);
             ptr::copy_nonoverlapping(dst, dst.add(filled), chunk);
             filled += chunk;
+            copies += 1;
         }
+        copies
     }
 
     pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, color: Color) {
@@ -217,20 +287,30 @@ impl Framebuffer {
             return;
         }
         let actual_w = x_end - x;
+        let rows = y_end - y;
         let row_bytes = actual_w * 4;
         let pixel = self.encode_pixel(color);
 
-        unsafe {
+        let doubling_copies = unsafe {
             let first_row = self.buf.add((y * self.stride + x) * 4);
             debug_assert!((y * self.stride + x) * 4 + row_bytes <= self.len);
-            Self::fill_row(first_row, &pixel, actual_w);
-            for dy in 1..(y_end - y) {
+            let copies = Self::fill_row(first_row, &pixel, actual_w);
+            for dy in 1..rows {
                 let dst_offset = ((y + dy) * self.stride + x) * 4;
                 debug_assert!(dst_offset + row_bytes <= self.len);
                 let dst = self.buf.add(dst_offset);
                 ptr::copy_nonoverlapping(first_row, dst, row_bytes);
             }
-        }
+            copies
+        };
+
+        // Every row but the first is a copy *of* the first, and the doubling
+        // that built the first read all but its seed pixel back.
+        self.written.set(self.written.get() + (row_bytes * rows) as u64);
+        self.read
+            .set(self.read.get() + (row_bytes - 4 + row_bytes * (rows - 1)) as u64);
+        self.bulk_reads
+            .set(self.bulk_reads.get() + doubling_copies + (rows - 1) as u64);
     }
 
     /// Blit a buffer to a region of the framebuffer (row-by-row memcpy).
@@ -240,15 +320,12 @@ impl Framebuffer {
         if blit_w == 0 {
             return;
         }
+        let rows = h.min(self.height.saturating_sub(y));
         let copy_bytes = blit_w * 4;
         let src_row_bytes = src_stride * 4;
-        for dy in 0..h {
-            let sy = y + dy;
-            if sy >= self.height {
-                break;
-            }
+        for dy in 0..rows {
             let src_offset = dy * src_row_bytes;
-            let dst_offset = (sy * self.stride + x) * 4;
+            let dst_offset = ((y + dy) * self.stride + x) * 4;
             debug_assert!(dst_offset + copy_bytes <= self.len);
             unsafe {
                 ptr::copy_nonoverlapping(
@@ -258,6 +335,7 @@ impl Framebuffer {
                 );
             }
         }
+        self.written.set(self.written.get() + (copy_bytes * rows) as u64);
     }
 
     pub fn clear(&self, color: Color) {
@@ -270,12 +348,13 @@ impl Framebuffer {
             return;
         }
         let row_bytes = self.stride * 4;
+        let count = (self.height - pixel_rows) * row_bytes;
         unsafe {
             let src = self.buf.add(pixel_rows * row_bytes);
             let dst = self.buf;
-            let count = (self.height - pixel_rows) * row_bytes;
             ptr::copy(src, dst, count);
         }
+        self.record_self_copy(count);
         let fill_y = self.height - pixel_rows;
         self.fill_rect(0, fill_y, self.width, pixel_rows, bg);
     }
@@ -286,12 +365,13 @@ impl Framebuffer {
             return;
         }
         let row_bytes = self.stride * 4;
+        let count = (self.height - pixel_rows) * row_bytes;
         unsafe {
             let src = self.buf;
             let dst = self.buf.add(pixel_rows * row_bytes);
-            let count = (self.height - pixel_rows) * row_bytes;
             ptr::copy(src, dst, count);
         }
+        self.record_self_copy(count);
         self.fill_rect(0, 0, self.width, pixel_rows, bg);
     }
 }

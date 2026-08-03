@@ -1,6 +1,6 @@
 pub mod framebuffer;
 
-pub use framebuffer::{Color, Framebuffer, Screen};
+pub use framebuffer::{Color, Framebuffer, Screen, Traffic};
 
 use toyos::ipc;
 use toyos::poller::{Poller, IORING_POLL_IN};
