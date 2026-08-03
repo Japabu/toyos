@@ -63,7 +63,7 @@ use toyos_abi::syscall::SyscallError;
 use toyos_fat32::{BlockAccess, Error, Extent, Fat32, FatTime, IoError};
 
 use crate::block::BlockDevice;
-use crate::drivers::usb_storage;
+use crate::drivers::{usb_storage, xhci};
 use crate::file_backing::FileBacking;
 use crate::file_cache::{self, FileId};
 use crate::gpt;
@@ -732,18 +732,92 @@ impl FileSystem for FatFs {
     }
 }
 
-/// Ask every USB disk whether it carries the partitions this kernel was given.
+/// Ask every USB disk whether it carries the partitions this kernel was given,
+/// and do not stop asking while the machine is still missing the one it was
+/// booted from.
 ///
 /// Read-only, and the missing half of the GPT work: `gpt::probe` ran for NVMe
 /// only, so on a machine that boots off a stick — which is every machine this
 /// project boots — `gpt::boot_volume()` answered `None` and no mount could
-/// ever ask it anything. Runs once, after the controller has bound its disks.
+/// ever ask it anything.
+///
+/// # Why this is a loop and not a pass
+///
+/// It ran once, at a fixed point in the peripheral phase, against a disk set
+/// that is **not final at that point**. `xhci::await_connect_settle` returns as
+/// soon as the root hub's connect set has held still for the USB debounce and is
+/// non-empty, so a machine whose *other* devices are up scans without whatever
+/// is still arriving — and the T14 has four internal USB devices beside the
+/// stick it boots from. That machine reached a working compositor desktop with
+/// neither `/boot` nor `/log` on one boot and mounted both on the next, off the
+/// same stick and the same image, which is a race and not a defect in anything
+/// downstream of here.
+///
+/// The asymmetry is the same one `xhci::EMPTY_BUS_NS` is written around, and it
+/// is what keeps this free: a machine whose boot volume has already been
+/// resolved — every QEMU boot, every machine that boots off NVMe, and the T14 on
+/// a good boot — leaves after one pass, because `gpt::boot_volume()` answers.
+/// Only a machine that would otherwise report no boot volume at all pays
+/// anything, and that is the outcome this exists to prevent.
+///
+/// # Why every refusal here has a line
+///
+/// The end of this function is a machine with no `/boot` and no `/log`, on
+/// hardware whose only other diagnostic channel *is* `/log`. Skipping a disk
+/// silently — which is what a bare `continue` did, three times over — spends the
+/// one chance anybody has to find out why.
 pub fn probe_boot_disks() {
-    for index in 0..usb_storage::count() {
-        let Some(mut disk) = usb_storage::open(index) else { continue };
-        let Some(geometry) = crate::drivers::xhci::storage_geometry(index) else { continue };
-        gpt::probe(&mut disk, geometry.logical_block_bytes);
+    let deadline = crate::clock::nanos_since_boot() + xhci::PORT_SETTLE_CEILING_NS;
+    let mut probed = 0;
+    loop {
+        probed = probe_announced(probed);
+        // Nothing to wait for: either a device carries the partition firmware
+        // named, or firmware named none and there is no question to answer.
+        if gpt::boot_volume().is_some() || gpt::boot_partition().is_none() {
+            return;
+        }
+        if crate::clock::nanos_since_boot() >= deadline {
+            log!(
+                "usb-storage: {probed} disk(s) on this machine and none carries the boot \
+                 partition after {} ms of looking — this boot has no /boot and no /log",
+                xhci::PORT_SETTLE_CEILING_NS / 1_000_000
+            );
+            return;
+        }
+        // Paced rather than spun, at the cadence the connect settle already
+        // reads port registers on: each pass is one MMIO read per port under
+        // the controller lock, and the thing being waited for is physical.
+        let next = crate::clock::nanos_since_boot() + xhci::PORT_POLL_NS;
+        while crate::clock::nanos_since_boot() < next {
+            core::hint::spin_loop();
+        }
+        xhci::recheck_ports();
     }
+}
+
+/// Probe every disk announced since the last call, and return the new count.
+///
+/// Indices are stable and dense — a disk keeps the index it was bound under —
+/// so "since" is a count, and a disk is never probed twice.
+fn probe_announced(mut probed: usize) -> usize {
+    let count = usb_storage::count();
+    while probed < count {
+        let index = probed;
+        probed += 1;
+        // One question with one answer. This used to ask twice — `open` for the
+        // handle and `storage_geometry` for the block size — which is two `None`
+        // branches for one fact, and the disk carried the block size all along.
+        let Some(mut disk) = usb_storage::open(index) else {
+            log!(
+                "usb-storage: disk {index} was announced and was gone again before its partition \
+                 table could be read — not probed"
+            );
+            continue;
+        };
+        let lba_bytes = disk.logical_block_bytes();
+        gpt::probe(&mut disk, lba_bytes);
+    }
+    probed
 }
 
 /// The bound disk carrying `id`, or `None` when no driver here serves it.
