@@ -241,6 +241,7 @@ bcachefs = { path = "../bcachefs", default-features = false }
 toyos-abi = { path = "../toyos-abi" }
 toyos-fat32 = { path = "../toyos-fat32" }
 toyos-gpt = { path = "../toyos-gpt" }
+toyos-keymap = { path = "../toyos-keymap" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
 rustc-demangle = "0.1"

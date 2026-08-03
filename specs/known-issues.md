@@ -2608,6 +2608,42 @@ the same interleaving staged deterministically, run once unlocked (the build's
 next write fails with this ENOENT) and once locked (it succeeds, and the clean
 happens after).
 
+### A deleted guest test binary keeps running until its build artifact is deleted
+
+`discover_rust_tests` enumerates whatever is in
+`tests/toyos-rust-tests/target/x86_64-unknown-toyos/debug/`, and cargo does not
+remove a binary when its `src/bin/*.rs` is deleted. So a renamed or merged guest
+test keeps being compiled into the initrd and keeps appearing in the test list,
+from an artifact nothing in the tree can produce any more.
+
+Cost, 2026-08-03: merging three new guest binaries into one left the three
+originals on disk, which (a) put ~5 MiB of dead binaries into the initrd and
+overflowed the ESP — `Failed to write initrd: No space left on device`, from
+`src/image.rs`, which reads as a host-disk problem and is not — and (b) gave a
+*machine* test the same name as a stale *rust* test, which silently dropped it
+from the run. Both took a while to see because neither error names the artifact.
+The ESP's sizing was fixed in the same session and is no longer the tripwire it
+was; the stale artifacts are still enumerated.
+
+Fix shape: enumerate from the source directory, or clean the bin directory before
+the build. Neither is done.
+
+### A QMP-driven test cannot share a boot with another one
+
+The kernel's log ring sits one line behind on an idle machine (§5), so a guest
+that exits the instant it has its answer leaves its last lines — including the
+runner's `===TEST_END===` — in the ring until something else runs. On a shared
+boot the next member then opens its console window over output the previous one
+is still draining into, and reads the wrong thing: measured 2026-08-03 as the
+first member passing, the second timing out with its own complete and correct
+output visible in the serial, and the third failing instantly on an empty window.
+
+Two workarounds are in the tree, and they are workarounds. `keep_the_ring_moving`
+in `tests/toyos.rs` injects keys nothing is listening for, purely so the ring
+keeps draining; and the four layout tests take a boot each rather than a group,
+which costs three boots. The fix is §5's — a drain that does not need the machine
+to be busy.
+
 ### rustup narrates its cargo fallback on every invocation
 
 `info: cargo is unavailable for the active toolchain` followed by `info:
@@ -2689,6 +2725,62 @@ Fix shape: allocators construct the slice. Give `PageAlloc` and the contiguous
 PMM path a `slice()` method like `OwnedAlloc`'s, sized from the allocation they
 own, then make `from_raw` private to `mm` or delete it. The loader and DmaPool
 stop naming sizes at all.
+
+### Nothing can ask which keyboard layout is active
+
+`SYS_SET_KEYBOARD_LAYOUT` (23) is write-only, and there is no read counterpart.
+`toybox locale` can therefore list what exists — it reads `toyos_keymap::LAYOUTS`,
+the same table the kernel selects from, so the list cannot drift — but it cannot
+print which one is in force. `specs/introspection-plan.md` §1 reserves `SYS_QUERY`
+for exactly this shape of question and it is not built; adding a one-off read
+syscall for the layout would be the thing that plan exists to prevent. Two things
+sit behind it: `locale` printing "current", and the interactive menu opening on
+the active entry rather than always on the first.
+
+Recorded 2026-08-03 with the de_CH layout work; the ABI was left alone
+deliberately.
+
+### `locale detect` cannot run under the compositor or `/bin/console`
+
+The wizard reads `RawKeyEvent::keycode`, the pre-layout HID usage, off the
+keyboard device — the only place a *pre-layout* code exists in userland. That
+needs no new syscall: the field has always crossed the boundary. But the device
+is claimed exclusively (`kernel/src/device.rs`'s `try_claim`), and both the
+compositor and `/bin/console` hold it for their whole run, so under a desktop or
+a console boot the wizard refuses by name and tells the user to pick a layout
+instead. `locale_detect_refuses_a_held_keyboard` gates the refusal.
+
+The compositor *does* forward the whole `KeyEvent`, `keycode` included, to the
+focused window (`MSG_KEY_INPUT`), so a windowed client can already see raw
+usages. What loses them is the terminal: `userland/terminal/src/main.rs` writes
+only `event.translated` into the shell's stdin, so anything running in a terminal
+sees the layout's output and never the key. Closing this means either a way for a
+terminal client to ask for raw usages, or a keyboard claim that can be lent for
+the duration of a wizard. Both are protocol decisions, not local fixes.
+
+### The console font cannot draw most of the Swiss German AltGr layer
+
+`src/assets.rs`'s `console_font` rasterises U+0000..=U+00FF plus box-drawing and
+block elements, and `font::draw_char` substitutes `?` for anything else. The
+`swiss-german` table is faithful to xkeyboard-config's `ch(de)`, which reaches
+well past Latin-1: `€`, `⅛`, `œ`/`Œ`, `ŋ`, `ħ`, `ł`, `ŧ`, `đ`, `ĸ`, `ſ`, `ẞ`,
+`Ω`, the arrows on `i`/`u`, and the typographic quotes on `b`/`n`/`v` all render
+as `?` on the panel. So do most dead-key compositions outside Latin-1 — `ĉ`, `ń`,
+`ẑ`, `Ÿ` and the superscripts — while `â ä à é ç ·` and the rest of Latin-1 are
+fine. The bytes delivered to the application are correct in every case; only the
+glyph is missing. Widening the rasterised set is the fix; it is a build-time
+list, not a code change. `legends_are_renderable` in
+`toyos-keymap/tests/detect.rs` keeps the wizard's own prompts inside the covered
+range, and it is the only thing that does.
+
+### `locale <name>` persists, `locale detect` does not
+
+`set()` writes `/home/root/.config/keyboard_layout`, which `locale --load` replays
+from `system.toml`'s init line. The wizard deliberately does not write it — the
+approved scope for it is runtime-only — so confirming a detected layout and
+rebooting gives the default back, while typing the same name by hand sticks. The
+inconsistency is real and the owner's to settle: either the wizard writes it too,
+or persistence moves out of `locale` entirely when the config store lands.
 
 ---
 

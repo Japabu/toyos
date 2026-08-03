@@ -56,6 +56,7 @@ dependencies = [
  "toyos-abi",
  "toyos-fat32",
  "toyos-gpt",
+ "toyos-keymap",
  "toyos-ps2",
  "toyos-sched",
 ]
@@ -82,6 +83,10 @@ version = "0.1.0"
 
 [[package]]
 name = "toyos-gpt"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-keymap"
 version = "0.1.0"
 
 [[package]]
