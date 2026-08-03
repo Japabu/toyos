@@ -1857,9 +1857,21 @@ pub fn xhci_flap(
     // the easy case and not the one under test.
     let collapsed = log.matches("was unplugged and plugged back in between two looks").count();
     if collapsed == 0 {
+        // The two ways this fires read alike and are not alike, so the counts
+        // that tell them apart are in the message. A driver that saw every
+        // cycle as a distinct disconnect enumerated once per cycle; one that
+        // could not see a collapsed replug at all enumerated **once**, left the
+        // slot bound to the device that had gone, and delivered nothing — which
+        // is what the pre-fix driver does here, and a good deal worse than the
+        // slot march the same defect produces when the replugs are slow enough
+        // to be seen.
         return Err(format!(
-            "no replug collapsed inside a debounce, so this run never staged the race — the \
-             driver saw every cycle as a distinct disconnect\n{log}"
+            "no replug collapsed inside a debounce, so this run never staged the race. The guest \
+             bound {} pointer(s) across {CYCLES} cycles and delivered {} pointer event(s): one \
+             bind and no events is a dead port, one bind per cycle is a run whose replugs were \
+             all seen as distinct.\n{log}",
+            crate::parse_pointer_sources(log).len(),
+            crate::parse_mouse_events(&result.stdout).len(),
         ));
     }
 
