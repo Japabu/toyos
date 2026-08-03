@@ -179,9 +179,18 @@ fn make_key(seed: &[u8; 16], name: &str, key_type: KeyType) -> Key {
 
 const MAX_NAME_LEN: usize = 512;
 
+/// A leaf value's type tag *is* its key type, so nothing carries the two
+/// separately. They were written out by hand at three sites as `1` and `2`,
+/// with `if key_type == File { 1 } else { 2 }` twice — one place for them to
+/// drift, and no way to notice.
+const _: () = assert!(
+    KeyType::File as u8 == 1 && KeyType::Symlink as u8 == 2,
+    "decode_leaf_value reads 1 as a file and 2 as a symlink",
+);
+
 /// Encode a file/symlink leaf value.
 fn encode_leaf_value(
-    entry_type: u8,
+    entry_type: KeyType,
     name: &str,
     size: u64,
     mtime: u64,
@@ -194,7 +203,7 @@ fn encode_leaf_value(
     let total = 1 + 2 + 8 + 8 + name_len + extent_bytes;
     let mut val = vec![0u8; total];
 
-    val[0] = entry_type;
+    val[0] = entry_type as u8;
     val[1..3].copy_from_slice(&(name_len as u16).to_le_bytes());
     val[3..11].copy_from_slice(&size.to_le_bytes());
     val[11..19].copy_from_slice(&mtime.to_le_bytes());
@@ -445,7 +454,7 @@ impl<IO: BlockIO> Formatted<IO> {
         }
 
         let extents = write_data(&self.io, &mut self.alloc, data)?;
-        let value = encode_leaf_value(1, name, data.len() as u64, mtime, &extents);
+        let value = encode_leaf_value(KeyType::File, name, data.len() as u64, mtime, &extents);
         let key = make_key(&self.sb.hash_seed, name, KeyType::File);
         let entry = Entry { key, value };
 
@@ -462,7 +471,7 @@ impl<IO: BlockIO> Formatted<IO> {
 
         let target_bytes = target.as_bytes();
         let extents = write_data(&self.io, &mut self.alloc, target_bytes)?;
-        let value = encode_leaf_value(2, name, target_bytes.len() as u64, mtime, &extents);
+        let value = encode_leaf_value(KeyType::Symlink, name, target_bytes.len() as u64, mtime, &extents);
         let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
         let entry = Entry { key, value };
 
@@ -630,12 +639,12 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
 impl<IO: BlockIO> Mounted<IO, ReadWrite> {
     /// Create a file, replacing whatever answered to `name`.
     pub fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> Result<(), FsError> {
-        self.put(name, KeyType::File, 1, data, mtime)
+        self.put(name, KeyType::File, data, mtime)
     }
 
     /// Create a symlink, replacing whatever answered to `name`.
     pub fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), FsError> {
-        self.put(name, KeyType::Symlink, 2, target.as_bytes(), 0)
+        self.put(name, KeyType::Symlink, target.as_bytes(), 0)
     }
 
     /// Put `name` on the volume, displacing whatever answered to it.
@@ -655,7 +664,6 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         &mut self,
         name: &str,
         key_type: KeyType,
-        entry_type: u8,
         data: &[u8],
         mtime: u64,
     ) -> Result<(), FsError> {
@@ -669,7 +677,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         };
 
         let extents = write_data(&self.io, &mut self.alloc, data)?;
-        let value = encode_leaf_value(entry_type, name, data.len() as u64, mtime, &extents);
+        let value = encode_leaf_value(key_type, name, data.len() as u64, mtime, &extents);
         let key = make_key(&self.sb.hash_seed, name, key_type);
         self.sb.root_node = btree::insert(
             &self.io, &mut self.alloc,
@@ -799,9 +807,8 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
             None => None,
         };
 
-        let entry_type = if old_key.key_type == KeyType::File { 1 } else { 2 };
         let new_value = encode_leaf_value(
-            entry_type, new_name, leaf.size(), leaf.mtime(), leaf.extents(),
+            old_key.key_type, new_name, leaf.size(), leaf.mtime(), leaf.extents(),
         );
         self.sb.root_node = btree::insert(
             &self.io, &mut self.alloc,
@@ -832,10 +839,9 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         let (old_key, old_value) = self.find_by_name(name)?
             .ok_or(FsError::NotFound)?;
         let leaf = decode_leaf_value(&old_value)?;
-        let entry_type = if old_key.key_type == KeyType::File { 1 } else { 2 };
 
         let extents = if new_extents.is_empty() { leaf.extents() } else { new_extents };
-        let new_value = encode_leaf_value(entry_type, leaf.name(), size, mtime, extents);
+        let new_value = encode_leaf_value(old_key.key_type, leaf.name(), size, mtime, extents);
         let new_entry = Entry { key: old_key, value: new_value };
 
         // No delete first. The key is unchanged and `btree::insert` replaces on
