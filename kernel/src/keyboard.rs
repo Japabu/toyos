@@ -1,9 +1,16 @@
+//! The machine's one keyboard, whichever keyboards it has.
+//!
+//! Every driver feeds transitions in here and nothing else comes out: a HID
+//! usage, a direction, and the modifier mask every keyboard in the machine
+//! adds up to. What a key *types* is a layout, a dead-key state and a
+//! terminal's escape vocabulary, none of which the kernel has any business
+//! knowing — `toyos-keymap` is that, in userland, one instance per surface.
+
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::io_uring::RingId;
 use crate::sync::Lock;
-use toyos_keymap::{Composer, Layout};
 pub use toyos_abi::input::{RawKeyEvent, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_GUI, MOD_RELEASED};
 
 static KEY_BUF: Lock<VecDeque<RawKeyEvent>> = Lock::new(VecDeque::new());
@@ -70,10 +77,10 @@ pub fn modifiers() -> u8 {
 /// Queue one key transition. Returns true iff an event was queued.
 ///
 /// The single production path from a keyboard of any kind into `KEY_BUF`. It
-/// owns the held-set (and therefore the modifier mask), the translation to
-/// bytes, and the Ctrl+Alt+D hook — all three of which must be central
-/// rather than per-driver, and the last of which a naive split silently
-/// leaves on whichever path it started on.
+/// owns the held-set (and therefore the modifier mask) and the Ctrl+Alt+D
+/// hook — both of which must be central rather than per-driver, and the
+/// second of which a naive split silently leaves on whichever path it started
+/// on.
 ///
 /// A transition to the state a usage is already in queues nothing: that is
 /// what makes a PS/2 typematic repeat, which is a make with no intervening
@@ -93,27 +100,19 @@ pub fn handle_key(usage: u8, pressed: bool) -> bool {
         modifiers_of(&held)
     };
 
-    let shift = modifiers & MOD_SHIFT != 0;
-    let ctrl = modifiers & MOD_CTRL != 0;
-    let alt = modifiers & MOD_ALT != 0;
-
-    // Ctrl+Alt+D (HID 0x07) → dump blocked threads. Recorded, not run: every
-    // caller of this function holds its driver's guard.
-    if pressed && ctrl && alt && usage == 0x07 {
+    // Ctrl+Alt+D (HID 0x07) → dump blocked threads. On the HID usage and not
+    // on a character, so it is the same three physical keys under every
+    // layout. Recorded, not run: every caller of this function holds its
+    // driver's guard.
+    if pressed && modifiers & MOD_CTRL != 0 && modifiers & MOD_ALT != 0 && usage == 0x07 {
         DUMP_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
         return false;
     }
 
-    let mut event = RawKeyEvent {
+    KEY_BUF.lock().push_back(RawKeyEvent {
         keycode: usage,
         modifiers: if pressed { modifiers } else { modifiers | MOD_RELEASED },
-        len: 0,
-        translated: [0; 5],
-    };
-    if pressed {
-        translate(usage, shift, ctrl, alt, &mut event);
-    }
-    KEY_BUF.lock().push_back(event);
+    });
     true
 }
 
@@ -183,81 +182,10 @@ pub fn handle_report(state: &mut [u8; 8], report: &[u8]) -> usize {
     queued
 }
 
-/// `RawKeyEvent::translated` is the buffer the composer's output has to fit,
-/// and the two are declared in different crates.
-const _: () = {
-    let probe = RawKeyEvent { keycode: 0, modifiers: 0, len: 0, translated: [0; 5] };
-    assert!(probe.translated.len() == toyos_keymap::MAX_EMIT);
-};
-
-fn translate(keycode: u8, shift: bool, ctrl: bool, alt: bool, event: &mut RawKeyEvent) {
-    let escape_seq: Option<&[u8]> = match keycode {
-        0x4F => Some(b"\x1B[C"),  // Right
-        0x50 => Some(b"\x1B[D"),  // Left
-        0x51 => Some(b"\x1B[B"),  // Down
-        0x52 => Some(b"\x1B[A"),  // Up
-        0x4A => Some(b"\x1B[H"),  // Home
-        0x4D => Some(b"\x1B[F"),  // End
-        0x4C => Some(b"\x1B[3~"), // Delete
-        0x4B => Some(b"\x1B[5~"), // Page Up
-        0x4E => Some(b"\x1B[6~"), // Page Down
-        _ => None,
-    };
-
-    if let Some(seq) = escape_seq {
-        let n = seq.len().min(5);
-        event.translated[..n].copy_from_slice(&seq[..n]);
-        event.len = n as u8;
-        return;
-    }
-
-    if ctrl && (0x04..=0x1D).contains(&keycode) {
-        event.translated[0] = keycode - 0x04 + 1;
-        event.len = 1;
-        return;
-    }
-
-    // Both returns above are keys no layout defines, and neither disturbs a
-    // pending diacritic: they are the same class of key as Shift, which has to
-    // be pressable between `^` and `e`.
-    let key = active_layout().lookup(keycode, shift, alt);
-    let emit = COMPOSER.lock().press(key);
-    let bytes = emit.as_bytes();
-    event.translated[..bytes.len()].copy_from_slice(bytes);
-    event.len = bytes.len() as u8;
-}
-
 pub fn has_data() -> bool {
     !KEY_BUF.lock().is_empty()
 }
 
 pub fn try_read_event() -> Option<RawKeyEvent> {
     KEY_BUF.lock().pop_front()
-}
-
-static ACTIVE_LAYOUT: Lock<usize> = Lock::new(toyos_keymap::DEFAULT_LAYOUT);
-
-/// The diacritic a dead key left pending, for the whole machine — the same
-/// argument as `HELD`: the dead key, the Shift and the letter may each come
-/// from a different keyboard.
-static COMPOSER: Lock<Composer> = Lock::new(Composer::new());
-
-fn active_layout() -> &'static Layout {
-    toyos_keymap::LAYOUTS[*ACTIVE_LAYOUT.lock()]
-}
-
-/// Select the layout named `name`. False iff no layout has that name.
-pub fn set_layout(name: &str) -> bool {
-    let Some(index) = toyos_keymap::by_name(name) else {
-        return false;
-    };
-    *ACTIVE_LAYOUT.lock() = index;
-    // A diacritic the old layout left pending would compose against the new
-    // one's table.
-    COMPOSER.lock().reset();
-    true
-}
-
-pub fn layout_name() -> &'static str {
-    active_layout().name
 }

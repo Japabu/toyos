@@ -16,7 +16,8 @@ pub const SYS_DELETE: u64 = 18;
 pub const SYS_SHUTDOWN: u64 = 19;
 pub const SYS_CHDIR: u64 = 20;
 pub const SYS_GETCWD: u64 = 21;
-pub const SYS_SET_KEYBOARD_LAYOUT: u64 = 23;
+// Syscall number 23 unused (formerly SYS_SET_KEYBOARD_LAYOUT: the kernel has
+// no layout to set — it delivers key transitions and userland translates).
 pub const SYS_PIPE: u64 = 24;
 pub const SYS_SPAWN: u64 = 25;
 pub const SYS_WAITPID: u64 = 26;
@@ -568,11 +569,6 @@ pub fn gpu_move_cursor(x: u32, y: u32) -> Result<(), SyscallError> {
 /// `size_of::<FramebufferInfo>()` bytes.
 pub unsafe fn gpu_set_resolution(width: u32, height: u32, info_out: *mut u8) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_GPU_SET_RESOLUTION, width as u64, height as u64, info_out as u64, 0))
-}
-
-/// Set the active keyboard layout by name. Returns `true` on success.
-pub fn set_keyboard_layout(name: &str) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_SET_KEYBOARD_LAYOUT, name.as_ptr() as u64, name.len() as u64, 0, 0))
 }
 
 /// Shut down the machine. Does not return.

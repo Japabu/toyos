@@ -96,7 +96,7 @@ pub struct IpcHeader {
 }
 
 impl IpcHeader {
-    const WIRE_SIZE: usize = 8;
+    pub const WIRE_SIZE: usize = 8;
 
     /// Build a header from a length that has not been trusted yet.
     pub fn from_wire(msg_type: u32, len: u32) -> Result<Self, IpcError> {
@@ -339,6 +339,146 @@ pub fn decode_payload<T: IpcPayload>(bytes: &[u8]) -> Result<T, IpcError> {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), val.as_mut_ptr() as *mut u8, size);
         Ok(val.assume_init())
     }
+}
+
+/// What one [`FrameRx::pump`] found.
+#[derive(Clone, Copy, Debug)]
+pub enum RxStep {
+    /// The fd has nothing more right now.
+    Idle,
+    /// A whole frame is buffered; its payload is [`FrameRx::payload`].
+    Frame { msg_type: u32, payload_len: usize },
+    /// The peer hung up, or its fd is gone.
+    Eof,
+    /// A frame no protocol here can produce. Nothing after it can be located,
+    /// so there is nothing to resynchronise to.
+    Malformed,
+}
+
+/// One peer's inbound framing, over non-blocking reads only.
+///
+/// **A server never reads a client with a blocking read.** That is the whole
+/// point of this type: [`recv_header`] and [`recv_payload`] park the caller
+/// until the peer sends the bytes it promised, which hands a client the
+/// decision of when the server runs again. Here a peer that stops halfway
+/// through a frame costs a buffer instead of the event loop.
+///
+/// `KEEP` is how much of a payload the caller wants kept; anything past it is
+/// read and discarded, so a peer cannot make the server hold what it will not
+/// look at. A protocol whose messages are all bare headers takes `KEEP = 0`.
+pub struct FrameRx<const KEEP: usize> {
+    buf: [u8; IpcHeader::WIRE_SIZE + KEEP],
+    len: usize,
+    state: RxState,
+}
+
+enum RxState {
+    Header,
+    Payload { msg_type: u32, keep: usize, skip: u32 },
+    Skip { msg_type: u32, kept: usize, remaining: u32 },
+}
+
+impl<const KEEP: usize> Default for FrameRx<KEEP> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const KEEP: usize> FrameRx<KEEP> {
+    pub const fn new() -> Self {
+        Self { buf: [0; IpcHeader::WIRE_SIZE + KEEP], len: 0, state: RxState::Header }
+    }
+
+    /// The payload of the frame the last [`RxStep::Frame`] announced.
+    pub fn payload(&self, len: usize) -> &[u8] {
+        &self.buf[..len]
+    }
+
+    /// Read what is there, and report the first thing that happened.
+    ///
+    /// At most one frame per call: the caller has other peers to serve, and a
+    /// peer that always has another frame ready must not be able to keep the
+    /// rest from being served.
+    pub fn pump(&mut self, conn: &Connection) -> RxStep {
+        loop {
+            match self.state {
+                RxState::Header => {
+                    match fill(conn, &mut self.buf[..IpcHeader::WIRE_SIZE], &mut self.len) {
+                        Fill::Idle => return RxStep::Idle,
+                        Fill::Eof => return RxStep::Eof,
+                        Fill::Filled => {}
+                    }
+                    let msg_type = u32::from_ne_bytes(self.buf[0..4].try_into().unwrap());
+                    let wire_len = u32::from_ne_bytes(self.buf[4..8].try_into().unwrap());
+                    // The bound belongs to `IpcHeader`, so it is asked rather
+                    // than restated: a length past `MAX_FRAME_LEN` is a frame
+                    // this endpoint refuses to describe, not a long one.
+                    let Ok(header) = IpcHeader::from_wire(msg_type, wire_len) else {
+                        return RxStep::Malformed;
+                    };
+                    self.len = 0;
+                    let keep = (header.len() as usize).min(KEEP);
+                    let skip = header.len() - keep as u32;
+                    self.state = RxState::Payload { msg_type, keep, skip };
+                }
+                RxState::Payload { msg_type, keep, skip } => {
+                    if keep > 0 {
+                        match fill(conn, &mut self.buf[..keep], &mut self.len) {
+                            Fill::Idle => return RxStep::Idle,
+                            Fill::Eof => return RxStep::Eof,
+                            Fill::Filled => {}
+                        }
+                    }
+                    self.len = 0;
+                    self.state = RxState::Skip { msg_type, kept: keep, remaining: skip };
+                }
+                RxState::Skip { msg_type, kept, remaining } => {
+                    if remaining > 0 {
+                        let mut sink = [0u8; 128];
+                        let want = (remaining as usize).min(sink.len());
+                        let mut got = 0;
+                        match fill(conn, &mut sink[..want], &mut got) {
+                            Fill::Idle => {
+                                self.state =
+                                    RxState::Skip { msg_type, kept, remaining: remaining - got as u32 };
+                                return RxStep::Idle;
+                            }
+                            Fill::Eof => return RxStep::Eof,
+                            Fill::Filled => {
+                                self.state =
+                                    RxState::Skip { msg_type, kept, remaining: remaining - want as u32 };
+                                continue;
+                            }
+                        }
+                    }
+                    self.state = RxState::Header;
+                    return RxStep::Frame { msg_type, payload_len: kept };
+                }
+            }
+        }
+    }
+}
+
+enum Fill {
+    Filled,
+    Idle,
+    Eof,
+}
+
+/// Fill `buf` from `*len` onwards without blocking, carrying `*len` forward so
+/// the next call resumes where this one stopped.
+fn fill(conn: &Connection, buf: &mut [u8], len: &mut usize) -> Fill {
+    while *len < buf.len() {
+        match conn.read_nonblock(&mut buf[*len..]) {
+            Ok(0) => return Fill::Eof,
+            Ok(n) => *len += n,
+            Err(SyscallError::WouldBlock) => return Fill::Idle,
+            // The fd itself is gone, which is the same hang-up seen from the
+            // other side of the same race.
+            Err(_) => return Fill::Eof,
+        }
+    }
+    Fill::Filled
 }
 
 fn as_bytes<T: IpcPayload>(val: &T) -> &[u8] {

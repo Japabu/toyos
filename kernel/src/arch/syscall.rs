@@ -256,10 +256,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
             sys_getcwd(buf)
         }
-        SYS_SET_KEYBOARD_LAYOUT => {
-            let name = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_set_keyboard_layout(name)
-        }
         SYS_PIPE => sys_pipe(),
         SYS_SPAWN => {
             let Some(args) = ctx.user_ref::<SpawnArgs>(UserAddr::new(a1)) else { return bad_addr };
@@ -827,14 +823,6 @@ fn sys_getcwd(buf: &mut [u8]) -> u64 {
         }
         cwd.len() as u64
     })
-}
-
-fn sys_set_keyboard_layout(name: &str) -> u64 {
-    if keyboard::set_layout(name) {
-        0
-    } else {
-        SyscallError::NotFound.to_u64()
-    }
 }
 
 fn fd_result(r: Result<u32, SyscallError>) -> u64 {

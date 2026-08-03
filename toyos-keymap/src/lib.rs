@@ -2,11 +2,14 @@
 //!
 //! A layout maps a HID usage and a modifier level to one of three things: a
 //! string, a dead key, or nothing. [`Composer`] turns that stream into the
-//! bytes a key press delivers, holding a pending diacritic between two presses.
+//! bytes a key press delivers, holding a pending diacritic between two
+//! presses, and [`Translator`] is the whole of what a surface owner does with
+//! a transition — layout, composition, control codes and escape sequences.
 //!
-//! Its own crate so this is testable on the host at millisecond cost. The
-//! kernel is the only caller, but nothing here needs a kernel: the tables are
-//! data and the composition is a two-state machine over them.
+//! Userland only. The kernel delivers the transition and nothing else, so
+//! nothing here needs a kernel: the tables are data and the composition is a
+//! two-state machine over them, which is what makes this testable on the host
+//! at millisecond cost.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -14,9 +17,11 @@
 mod compose;
 pub mod detect;
 mod layouts;
+mod translate;
 
 pub use compose::Dead;
 pub use layouts::{LAYOUTS, DEFAULT_LAYOUT};
+pub use translate::{Mods, Translator};
 
 /// What a layout says one (usage, level) produces.
 ///
@@ -100,10 +105,11 @@ pub fn by_name(name: &str) -> Option<usize> {
 
 /// The most bytes one key press can deliver.
 ///
-/// It is `RawKeyEvent::translated`'s width, and the bound is not slack: a
-/// pending diacritic that does not compose emits itself followed by the
-/// character typed, and `¨` before `€` is exactly five bytes. [`FITS`] is the
-/// compile-time proof that no entry in any table can exceed it.
+/// The bound is not slack: a pending diacritic that does not compose emits
+/// itself followed by the character typed, and `¨` before `€` is exactly five
+/// bytes. The anonymous consts below and in `translate` are the compile-time
+/// proof that no table entry, no composition and no escape sequence exceeds
+/// it.
 pub const MAX_EMIT: usize = 5;
 
 /// The bytes one key press delivers.
@@ -120,6 +126,13 @@ impl Emit {
         &self.bytes[..self.len as usize]
     }
 
+    /// Always succeeds: every producer appends whole `&str`s or one ASCII
+    /// control byte, so the buffer is UTF-8 by construction. The signature
+    /// says so rather than handing back a `Result` no caller can act on.
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(self.as_bytes()).expect("Emit is assembled from UTF-8")
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -127,9 +140,9 @@ impl Emit {
     /// Append `s`.
     ///
     /// The assert is for a table this crate ships, not for anything a keyboard
-    /// can send: [`FITS`] walks every layout and every composition at compile
-    /// time, so an entry that would overflow is a build error rather than a
-    /// key press.
+    /// can send: the compile-time walk covers every layout, every composition
+    /// and every escape sequence, so an entry that would overflow is a build
+    /// error rather than a key press.
     fn push(&mut self, s: &str) {
         let at = self.len as usize;
         assert!(at + s.len() <= MAX_EMIT, "key output exceeds MAX_EMIT");
@@ -137,9 +150,19 @@ impl Emit {
         self.len += s.len() as u8;
     }
 
-    fn of(s: &str) -> Self {
+    pub(crate) fn of(s: &str) -> Self {
         let mut e = Self::EMPTY;
         e.push(s);
+        e
+    }
+
+    /// One ASCII control byte — what Ctrl makes of a letter. Not `of`, which
+    /// takes a `&str` and would need one static per code.
+    pub(crate) fn of_byte(b: u8) -> Self {
+        assert!(b.is_ascii(), "Emit holds UTF-8");
+        let mut e = Self::EMPTY;
+        e.bytes[0] = b;
+        e.len = 1;
         e
     }
 
@@ -162,10 +185,10 @@ impl core::fmt::Debug for Emit {
 
 /// Holds the diacritic a dead key left pending.
 ///
-/// One per machine, not one per keyboard, for the reason the held-set is one
-/// per machine: a dead key pressed on one keyboard and the letter typed on
-/// another must compose, and the Shift that makes it a capital may come from a
-/// third.
+/// One per surface — see [`Translator`]. Not one per keyboard: a dead key
+/// pressed on one keyboard and the letter typed on another must compose, and
+/// the Shift that makes it a capital may come from a third. The surface's host
+/// has already merged those three into one stream.
 #[derive(Clone, Copy, Default)]
 pub struct Composer {
     pending: Option<Dead>,
