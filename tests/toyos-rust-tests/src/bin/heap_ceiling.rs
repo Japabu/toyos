@@ -27,9 +27,66 @@ const RESOURCE_EXHAUSTED: u64 = u64::MAX - 7;
 fn main() {
     at_ceiling_is_servable();
     aligned_at_ceiling_is_refused_not_fatal();
+    sysinfo_refuses_rather_than_allocating_past_the_ceiling();
     over_ceiling_kills_only_the_caller();
     heap_still_works();
     println!("all heap ceiling tests passed");
+}
+
+/// A syscall whose allocation is derived from something userland grows.
+///
+/// `SYS_SYSINFO` collects one 24-byte entry per live thread so it can sort
+/// them, and the caller's buffer bounds what is *written*, not what is built.
+/// Nothing caps the thread count, so ~87,000 threads made an ordinary syscall
+/// ask the heap for more than `MAX_HEAP_ALLOC` and trip the assert three
+/// functions above — from any process, with no privilege.
+///
+/// This kernel carries `MAX_SYSINFO_THREADS = 16` instead of 65,536, because
+/// 65,536 threads is 8 GiB of kernel stacks and no guest can make them. The
+/// count, the comparison and the refusal are the shipped ones.
+fn sysinfo_refuses_rather_than_allocating_past_the_ceiling() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    assert!(sysinfo_answers(), "sysinfo already refuses with no threads of ours");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut parked = Vec::new();
+    let mut refused_at = None;
+    // Past the bound with room, and far short of anything that would matter
+    // to a guest with one CPU.
+    for i in 0..64 {
+        let flag = Arc::clone(&stop);
+        parked.push(std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }));
+        if !sysinfo_answers() {
+            refused_at = Some(i + 1);
+            break;
+        }
+    }
+
+    let at = refused_at.unwrap_or_else(|| {
+        stop.store(true, Ordering::Relaxed);
+        panic!("64 extra threads and sysinfo never refused — its collection is unbounded")
+    });
+
+    stop.store(true, Ordering::Relaxed);
+    for t in parked {
+        t.join().expect("join a parked thread");
+    }
+    // A bound, not a one-way door: with the threads gone it answers again.
+    assert!(sysinfo_answers(), "sysinfo stayed refused after the threads exited");
+    println!("  PASS: sysinfo refused past its bound at {at} extra threads, and recovered");
+}
+
+/// Whether `SYS_SYSINFO` filled its header. The ABI wrapper reports an error
+/// as `0`, and the header is the smallest buffer it accepts.
+fn sysinfo_answers() -> bool {
+    let mut buf = [0u8; 48];
+    toyos_abi::syscall::sysinfo(&mut buf) == buf.len()
 }
 
 /// The documented ceiling is a size the heap actually serves.

@@ -195,10 +195,15 @@ const IDLE_STACK_SIZE: usize = 16384; // 16KB
 /// path still below the probe.
 ///
 /// Unmapped rather than [`IST1_GUARD_SIZE`]'s fill pattern, and the difference
-/// is the stack, not the taste: #PF has no IST, so the fault frame is pushed
-/// onto the stack that just overflowed and the CPU takes a #DF — which *does*
-/// have a stack, and reports. On IST1 there is no such second chance, which is
-/// why that guard detects after the fact instead of trapping.
+/// is the stack, not the taste: #PF has no IST, so a frame pushed past the
+/// bottom faults again on the same stack and the CPU takes a #DF — which
+/// *does* have a stack, and reports. On IST1 there is no such second chance,
+/// which is why that guard detects after the fact instead of trapping.
+///
+/// Either way the machine halts: a fault on a kernel address is a kernel bug
+/// and `fatal_exception` treats it as fatal. The change is that it is reported
+/// at all — an overflow used to land in the heap and be found later, somewhere
+/// else, as a corrupted allocation.
 const IDLE_GUARD_SIZE: usize = 4096;
 
 /// The double fault stack. Only #DF uses IST1, and what runs on it is the

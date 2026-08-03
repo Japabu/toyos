@@ -193,6 +193,9 @@ test-late-panic = []
 # and the allocator's own recovery cannot be told apart from the filesystem's.
 # These three hold nothing but the allocator, which is the property under
 # test. See `mm::MAX_HEAP_ALLOC`.
+# Also drops `MAX_SYSINFO_THREADS` to 16. The same ceiling one layer up: the
+# real bound is a thread count no guest can reach, so the constant is the only
+# actuator, and the refusal it runs is the shipped one.
 test-heap-ceiling = []
 # The on-target half of the scheduler spec's invariants (spec §10.2, §10.5).
 # Turns on `toyos-sched/check`, which asserts container-vs-state-word agreement

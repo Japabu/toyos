@@ -639,10 +639,6 @@ pub struct RelocationIndex {
 }
 
 impl RelocationIndex {
-    pub fn new() -> Self {
-        Self { entries_u64: Vec::new(), entries_i32: Vec::new() }
-    }
-
     /// Reserve exactly for `u64_count` u64 writes and `i32_count` i32 writes,
     /// or `None` if either does not fit one kernel allocation.
     ///

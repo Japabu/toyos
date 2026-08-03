@@ -559,8 +559,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // chunk the idle stack lives in, and the read succeeds.
             #[cfg(feature = "test-idle-guard")]
             9 => {
-                let addr = percpu::idle_guard_byte();
-                log!("SYS_DEBUG: reading the idle stack guard at {addr:#018x}");
+                let addr = super::percpu::idle_guard_byte();
+                log!("SYS_DEBUG: reading the idle stack guard at {addr:#x}");
                 unsafe { core::ptr::read_volatile(addr as *const u8) };
                 0
             }
@@ -1450,6 +1450,35 @@ fn sys_thread_join(tid: u64) -> u64 {
     }
 }
 
+/// The most live threads `SYS_SYSINFO` will describe.
+///
+/// A *derived* collection, in the sense the loader's relocation index is: the
+/// caller's buffer bounds what is written and bounds nothing about what is
+/// built, because the sort needs every entry before the first one can be
+/// chosen. One `(Tid, &ProcessEntry, &ThreadEntry)` is 24 bytes and this is
+/// one allocation, so it has to stay under `mm::MAX_HEAP_ALLOC` (2,093,056) —
+/// which it did not: nothing caps the thread count, and any process may call
+/// this, so ~87,000 threads turned an ordinary syscall into the allocator's
+/// fail-fast assert.
+///
+/// 65,536 leaves the allocation at 1,572,864 bytes, a factor of 1.3 under the
+/// ceiling, and the reservation below is exact so there is no growth-by-
+/// doubling overshoot to absorb. A machine with more live threads than this
+/// gets `ResourceExhausted` from `ps`, which is a refusal rather than a
+/// kernel panic — the bound is policy, the ceiling it is derived from is not.
+#[cfg(not(feature = "test-heap-ceiling"))]
+const MAX_SYSINFO_THREADS: usize = 65_536;
+
+/// Sixteen, so the refusal above has a gate.
+///
+/// The bound is a function of `MAX_HEAP_ALLOC` and nothing in this harness can
+/// make 65,536 threads — each carries a 128 KiB kernel stack, which is 8 GiB
+/// of a guest given 128 MiB. Only the constant can move, and moving it runs
+/// the whole refusal: the count, the comparison and the error return are the
+/// shipped ones.
+#[cfg(feature = "test-heap-ceiling")]
+const MAX_SYSINFO_THREADS: usize = 16;
+
 fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     const HEADER_SIZE: usize = 48;
     const ENTRY_SIZE: usize = 64;
@@ -1467,6 +1496,9 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     let table = guard.as_ref().unwrap();
 
     let entry_count: u32 = table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))).count() as u32;
+    if entry_count as usize > MAX_SYSINFO_THREADS {
+        return SyscallError::ResourceExhausted.to_u64();
+    }
 
     buf[0..8].copy_from_slice(&total_mem.to_le_bytes());
     buf[8..16].copy_from_slice(&used_mem.to_le_bytes());
@@ -1478,9 +1510,12 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
 
     let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
 
-    // Collect and sort by (pid, tid) for stable output
+    // Collect and sort by (pid, tid) for stable output. Reserved exactly from
+    // the count above, so the buffer is `entry_count * 24` and not whatever
+    // the next doubling step would have been.
     let mut entries: Vec<(process::Tid, &process::ProcessEntry, &process::ThreadEntry)> =
-        table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))).collect();
+        Vec::with_capacity(entry_count as usize);
+    entries.extend(table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))));
     entries.sort_by_key(|(tid, proc, _)| (proc.pid(), *tid));
 
     let mut pos = HEADER_SIZE;

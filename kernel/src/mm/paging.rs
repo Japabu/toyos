@@ -576,23 +576,33 @@ impl AddressSpace {
         };
         let pd = unsafe { PageTablePage::from_phys_mut(pd_phys) };
         let pde = pd[pd_idx];
-        assert!(
-            pde & PAGE_PRESENT != 0 && pde & PAGE_SIZE_BIT != 0,
-            "guard_4k: {phys:#x} is not under a 2 MiB direct-map leaf (PDE {pde:#x})"
-        );
+        assert!(pde & PAGE_PRESENT != 0, "guard_4k: {phys:#x} is not in the direct map");
 
-        let base = pde & ADDR_MASK_2M;
-        let flags = pde & !ADDR_MASK_2M & !PAGE_SIZE_BIT;
-        let mut pt = Box::new(PageTablePage([0; 512]));
-        let hole = ((phys - base) / 4096) as usize;
-        for i in 0..512 {
-            if i != hole {
+        // Already split by an earlier guard in the same 2 MiB region — which
+        // is the ordinary case on a wide machine, where several CPUs' idle
+        // stacks come out of one heap segment.
+        if pde & PAGE_SIZE_BIT != 0 {
+            let base = pde & ADDR_MASK_2M;
+            let flags = pde & !ADDR_MASK_2M & !PAGE_SIZE_BIT;
+            let mut pt = Box::new(PageTablePage([0; 512]));
+            for i in 0..512 {
                 pt.set_entry(i, (base + i as u64 * 4096) | flags);
             }
+            let pt_phys = pt.phys();
+            self.children.push(pt);
+            pd.set_entry(pd_idx, pt_phys | PAGE_PRESENT | PAGE_WRITE);
         }
-        let pt_phys = pt.phys();
-        self.children.push(pt);
-        pd.set_entry(pd_idx, pt_phys | PAGE_PRESENT | PAGE_WRITE);
+
+        let pt = unsafe { PageTablePage::from_phys_mut(pd[pd_idx] & ADDR_MASK) };
+        let idx = ((phys >> 12) & 0x1FF) as usize;
+        assert!(pt[idx] & PAGE_PRESENT != 0, "guard_4k: {phys:#x} is already unmapped");
+        pt.set_entry(idx, 0);
+
+        // This CPU only, and that is sufficient rather than lucky: the page is
+        // one CPU's guard, `alloc_idle_stack` runs on the BSP for every CPU,
+        // and an AP's TLB is empty until it starts. The 511 pages around the
+        // hole keep the mapping they had, so a sibling's stale 2 MiB entry
+        // stays correct for all of them.
         flush_tlb_all();
     }
 

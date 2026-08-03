@@ -1297,8 +1297,21 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let (writable, regions) = {
         let as_guard = addr_space.lock();
 
-        if as_guard.find_region(UserAddr::new(fault_addr)).is_none() {
-            return false;
+        match as_guard.find_region(UserAddr::new(fault_addr)) {
+            None => return false,
+            // A `Mapped` region carries its pages from the moment it is
+            // created, so a fault *inside* one is an access the mapping was
+            // created to refuse — a `MmapProt::NONE` reservation, which is
+            // mapped nowhere on purpose. Filling it here would hand back the
+            // writable page the caller asked not to have.
+            //
+            // The test is on the faulting address and not on the overlap set
+            // below, because a `Mapped` region that merely shares a 2 MiB
+            // window with a demand-paged one still contributes zeros to it.
+            Some((_, region)) if matches!(region.kind, crate::vma::RegionKind::Mapped) => {
+                return false;
+            }
+            Some(_) => {}
         }
 
         // If a 2MB page is already mapped at this region (from a previous fault
@@ -1320,12 +1333,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
                         file_size: *file_size,
                     }
                 }
-                // A `Mapped` region carries its pages from the moment it is
-                // created, so a fault inside one is an access the mapping was
-                // created to refuse — a `MmapProt::NONE` reservation, which
-                // is mapped nowhere on purpose. Filling it here would hand
-                // back the writable page the caller asked not to have.
-                crate::vma::RegionKind::Mapped => return false,
+                crate::vma::RegionKind::Mapped => RegionSnapKind::Anonymous, // already mapped eagerly
             };
             snaps.push(RegionSnap {
                 start: start_addr.raw(),
