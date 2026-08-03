@@ -140,7 +140,7 @@ fn esp_guid(image: &[u8], path: &Path) -> Result<String, String> {
 /// `fatfs` wants a writable, seekable device even to read, so the volume is
 /// copied — once per call, which is why the callers ask for everything they
 /// need at once rather than a file at a time.
-fn read_files(volume: &[u8], paths: &[&str]) -> Result<Vec<Option<Vec<u8>>>, String> {
+pub fn read_files(volume: &[u8], paths: &[&str]) -> Result<Vec<Option<Vec<u8>>>, String> {
     let fs = fatfs::FileSystem::new(Cursor::new(volume.to_vec()), FsOptions::new())
         .map_err(|e| format!("the volume does not mount on the host: {e}"))?;
     let root = fs.root_dir();
@@ -180,7 +180,7 @@ fn need(got: Option<Vec<u8>>, path: &str) -> Result<Vec<u8>, String> {
 ///
 /// Digits are replaced so a legitimately changed free-cluster count does not
 /// read as a new defect.
-fn fsck_complaints(volume: &[u8], name: &str) -> Result<Vec<String>, String> {
+pub fn fsck_complaints(volume: &[u8], name: &str) -> Result<Vec<String>, String> {
     let tool = Path::new("/sbin/fsck_msdos");
     if !tool.exists() {
         return Err("no /sbin/fsck_msdos: this gate's outside judge is missing".to_string());
