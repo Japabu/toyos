@@ -2956,24 +2956,107 @@ callback at a deadline — which is also what `i8042::verdict_due` and
 `log_ring::file_has_pending` are working around in the same condition. That is a
 scheduler-core addition and wants the owner's sign-off.
 
-### A HID interrupt completion the controller did not like stops that device for good
+### CLOSED — a HID interrupt completion the controller did not like stopped that device for good
 
-`dispatch_event` requeues a bound HID device's interrupt TRB only for completion
+`dispatch_event` requeued a bound HID device's interrupt TRB only for completion
 codes 1 (Success) and 13 (Short Packet). Every other code — a stall on the
-interrupt endpoint, a transaction error, a babble — is dropped: no requeue, no
-log line, no fault, and that device's ring is empty for the rest of the boot.
-It is the same shape as the defect the function's own doc comment describes for
-an event dropped during a later port's enumeration, one level in.
+interrupt endpoint, a transaction error, a babble — was dropped where it was
+read: no requeue, no log line, no fault, and that endpoint carries exactly one
+TRB, so the device was silent for the rest of the boot with every bind-time line
+reading perfectly.
 
-Found while wiring hotplug and left alone, because the fix is a policy question
-this task had no answer for: a keyboard whose endpoint halted needs Reset
-Endpoint plus Clear-Feature(ENDPOINT_HALT) plus Set TR Dequeue — which is
-`msc::restart_endpoint` for a device that has no `MscDevice` — and a device that
-babbles probably wants to be dropped rather than retried forever.
+**Recorded as a residual while hotplug was wired, and it bit the owner the next
+day.** A Logitech mouse (`vendor=046d product=c077`, `speed=2`, so low speed)
+hot-plugged into the T14 bound flawlessly and delivered nothing:
 
-Not reproducible here: QEMU's HID devices complete every interrupt TRB they are
-given, and there is no device or machine property that makes one fail, so this
-needs an actuator of `usb-transport-break`'s shape.
+```
+[kernel 30.485 cpu0] xHCI: USB mouse ready on slot 6, int_ring +0x5f000
+[kernel 30.485 cpu0] xHCI: pointer on slot 6 merges as source 1
+[kernel 58.659 cpu0] xHCI: port 1 disconnected
+```
+
+28 seconds, no motion, nothing in between. The log cannot name the completion
+code, because the driver threw it away — which is the same defect one level up
+and the reason the named line below is as much of the fix as the recovery is.
+
+An unexpected code is now recorded on the device and acted on by
+`recover_endpoints`, which logs the device, the endpoint and the code (named
+where xHCI 1.2 Table 6-90 names it, at every line in the driver that prints
+one). The recovery is `restart_endpoint`, moved out of `msc.rs` unchanged:
+which command is legal is a property of the Endpoint State in the controller's
+output context and nothing about that is per class.
+
+**Recorded rather than recovered at the point the code is read**, because
+`dispatch_event` runs inside `wait_command` and `wait_transfer`, which are both
+draining the same ring for a caller waiting on one particular event. A recovery
+issued from there submits commands and waits on that ring itself, and the events
+it consumed would include its caller's — a disk's data phase disappearing
+because a mouse stalled. `poll` and the end of the boot scan are the two places
+nobody else is waiting, and the second is not optional: an endpoint holding no
+TRB raises no further interrupt, so a device whose *first* transfer failed
+during the scan would otherwise stay recorded and silent for the whole boot.
+
+Repeated-failure policy: `MAX_HID_FAILURES` is 8 consecutive failures, cleared
+by a delivered report, so a device that glitches once is never let go for it and
+one that fails every transfer is let go on its own service interval rather than
+costing two commands and an event-ring spin per poll inside a scheduler pass.
+What the caller sees is `let_go` — the device named, its keys or its
+button-table entry given back, its slot disabled, and the port left *marked
+attached*, because a port whose `attached` goes false with the device still in
+it reads as a fresh connect and the driver would enumerate the same endpoint
+again every debounce. Unplugging is what clears it, which is what the line says.
+
+**Gate `xhci_hid_break`, both timings, negative-controlled twice.** The actuator
+is a kernel feature (`xhci-hid-break-first`, `xhci-hid-break-late`): QEMU's
+`usb_hid_handle_data` answers an IN token on endpoint 1 with a report or with
+NAK and has no path to `USB_RET_STALL` for it. It replaces the completion code
+*and the report that transfer delivered*, which is what stops the gate being
+vacuous — QEMU really moved a mouse report into the buffer, and a driver that
+dispatched it anyway would publish a delta it never earned.
+
+- Fixed, first-completion boot: no `mev` line precedes the break line at all,
+  `a` never arrives while `b` and `c` do, and `hello` plus a `(2560, -1920)`
+  delta cross both endpoints after the recovery. One of ten pointer moves is
+  lost, exactly as a failed transfer loses it.
+- Negative control 1, `dispatch_event` reverted to the pre-fix drop: `input done
+  keys=0 pointer=0`, zero `mev`, zero `kev`, zero recovery lines. Both devices
+  go silent from their first completion — the T14's picture.
+- Negative control 2, recovery kept but the requeue removed: both endpoints
+  named their code and both were found Running and restarted, and still `input
+  done keys=0 pointer=0` with zero `mev` and zero `kev`. The gate reaches the
+  requeue, not just the log line.
+
+### The T14's mouse may not have been this defect at all, and the next boot is what says
+
+Fixed in passing and **unverifiable in this suite by construction**, so it is
+recorded rather than claimed. The HID endpoint context's dword 4 was a flat `8`
+copied from EP0's, where a control endpoint has no Max ESIT Payload and 8 is a
+setup stage's Average TRB Length. Every periodic endpoint this driver configured
+therefore declared that it moves **zero bytes per service interval** — the term
+xHCI 1.2 §6.2.3.8 defines and §4.14.2 makes the periodic scheduler's input.
+Linux's `xhci_endpoint_init` writes `max_packet` into both halves for a low- or
+full-speed interrupt endpoint; the driver now does the same. QEMU has no
+bandwidth scheduler and never reads the field, so no test here can tell the two
+values apart.
+
+That leaves two candidates for the 28 silent seconds, and they are
+**distinguishable on the next metal boot**, which is why closing the first did
+not close this:
+
+1. the endpoint's first transfer completed with an error — the new line names
+   the device, the endpoint and the code, and the recovery runs;
+2. the endpoint was never scheduled at all — **no line, because no completion
+   event ever arrives**, and the mouse is still silent.
+
+Ruled out already: SET_PROTOCOL is sent to every boot-interface HID and the T14
+log carries no failure line for it, so EP0 was not left halted (see the open
+item on that in this section). The interval encoding is legal —
+`bInterval=10` frames at low speed gives `log2(10 × 8) = 6`, inside Table 6-12's
+3..10. `SET_IDLE` (HID 1.11 §7.2.4) is the one class request the enumeration
+path does **not** send, where Linux's `usbhid_parse` sends it unconditionally
+and ignores the result; its absence leaves the device on its default idle rate,
+which is chattier and not silent, so it is not a candidate for this — but a
+device that expects it is a real class of hardware and nothing here has one.
 
 ### PARTLY CLOSED — the i8042's one diagnostic line could not be read on the machine it is for
 
@@ -3719,7 +3802,8 @@ the question that enum was inferring.
 
 Filed, not fixed, and visible on any boot of `Profile::MetalFullSpeed`:
 QEMU's `usb-wacom-tablet` stalls SET_PROTOCOL, and the driver logs
-`xHCI: SET_PROTOCOL on port 6: status stage completion code 6` and carries on.
+`xHCI: SET_PROTOCOL on port 6: status stage completion code 6 (Stall Error)` and
+carries on.
 A stall halts EP0, and nothing clears it — there is no `restart_endpoint` for a
 control endpoint. Harmless today because enumeration issues no further control
 transfer to that device and the interrupt endpoint is configured afterwards
