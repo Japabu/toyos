@@ -19,6 +19,8 @@ pub mod stats;
 #[allow(dead_code)]
 pub mod storage;
 #[allow(dead_code)]
+pub mod toybox;
+#[allow(dead_code)]
 pub mod usb;
 #[allow(dead_code)]
 pub mod volumes;

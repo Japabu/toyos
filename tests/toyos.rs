@@ -156,6 +156,7 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_hid_break",
     "xhci_descriptor_walk",
     "esp_filesystem",
+    "toybox_cp_volume",
     "kernel_log_file",
     "late_storage_connect",
     "log_backing_read_error",
@@ -2227,6 +2228,8 @@ fn run_machine_test(
         }
         // Body in `tests/common/volumes.rs`, same reason.
         "esp_filesystem" => common::volumes::esp_filesystem(test_config, c_bins, rust_bins),
+        // Body in `tests/common/toybox.rs`, same reason.
+        "toybox_cp_volume" => common::toybox::cp_volume(test_config, c_bins, rust_bins),
         "kernel_log_file" => common::volumes::kernel_log_file(test_config, c_bins, rust_bins),
         "late_storage_connect" => common::volumes::late_storage_connect(test_config, c_bins, rust_bins),
         "log_partition_layout" => {
