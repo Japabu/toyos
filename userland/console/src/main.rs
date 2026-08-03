@@ -29,6 +29,7 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use terminal::Console;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::shm::SharedMemory;
+use toyos::surface::{self, Delivery, Host, Notice};
 use toyos::{gpu, FramebufferDev, Keyboard};
 use window::Screen;
 
@@ -39,8 +40,8 @@ const FONT: &str = "/share/fonts/JetBrainsMono-Regular-8x16.font";
 /// leaves the newest bytes in the older-looking file (known issues §10).
 const KERNEL_LOG: [&str; 2] = ["/log/kernel.log.1", "/log/kernel.log"];
 
-/// HID usage codes. `kernel/src/keyboard.rs` translates both to escape
-/// sequences; this program consumes them instead.
+/// HID usage codes. `toyos_keymap::Translator` turns both into escape
+/// sequences; this program consumes them before it asks.
 const KEY_PAGE_UP: u8 = 0x4B;
 const KEY_PAGE_DOWN: u8 = 0x4E;
 
@@ -50,9 +51,17 @@ const KEY_PAGE_DOWN: u8 = 0x4E;
 const SEED_MAX_BYTES: usize = 64 * 1024;
 
 fn main() {
+    // This console *is* the root of its surface tree — there is no compositor
+    // in this image — so it both owns the translator and serves the channel a
+    // child asks for raw keys on.
+    let mut name = [0u8; surface::MAX_NAME];
+    let name = surface::service_name(std::process::id(), &mut name).to_string();
+    let mut host = Host::listen(&name).expect("console: cannot serve its own surface name");
+    let mut translator = window::configured_translator();
+
     // Spawned first so it initialises while the font loads, as `/bin/terminal`
     // does.
-    let mut shell = Shell::spawn();
+    let mut shell = Shell::spawn(&name);
 
     let fb_dev = match FramebufferDev::open() {
         Ok(dev) => dev,
@@ -97,18 +106,25 @@ fn main() {
         info.width, info.height
     );
 
-    // The declared set: the shell's two output pipes and the keyboard.
-    let poller = Poller::new(3);
+    // The declared set: the shell's two output pipes, the keyboard, and this
+    // console's own surface listener and its clients.
+    let poller = Poller::new(3 + Host::POLL_HANDLES);
     const TOKEN_STDOUT: u64 = 0;
     const TOKEN_STDERR: u64 = 1;
     const TOKEN_KEYBOARD: u64 = 2;
+    const TOKEN_LISTEN: u64 = 3;
+    const TOKEN_CLIENT: u64 = 4;
 
     loop {
         poller.poll_add_fd(toyos::Fd(shell.stdout.as_raw_fd()), IORING_POLL_IN, TOKEN_STDOUT);
         poller.poll_add_fd(toyos::Fd(shell.stderr.as_raw_fd()), IORING_POLL_IN, TOKEN_STDERR);
         poller.poll_add(&kb, IORING_POLL_IN, TOKEN_KEYBOARD);
+        poller.poll_add_fd(host.listener_fd(), IORING_POLL_IN, TOKEN_LISTEN);
+        for fd in host.client_fds() {
+            poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
+        }
 
-        let mut ready = [false; 3];
+        let mut ready = [false; 5];
         poller.wait(1, u64::MAX, |token| {
             if (token as usize) < ready.len() {
                 ready[token as usize] = true;
@@ -125,7 +141,7 @@ fn main() {
                     // needs a reboot to be asked anything, which is the state
                     // this program exists to get out of. `exit` at the prompt
                     // is an ordinary thing to type.
-                    shell.restart();
+                    shell.restart(&name);
                     console.write_bytes(b"\n[console] the shell exited; a new one is running\n");
                     painted = true;
                 }
@@ -147,8 +163,29 @@ fn main() {
             }
         }
 
+        if ready[TOKEN_LISTEN as usize] {
+            host.accept();
+        }
+
+        while let Some(notice) = host.poll() {
+            match notice {
+                // The root of this tree: nothing above to tell, so the re-read
+                // happens here and is passed down to every other client.
+                Notice::LayoutChanged => {
+                    window::load_layout(&mut translator);
+                    host.notify_layout();
+                    eprintln!("console: keyboard layout is now {}", translator.layout());
+                }
+                Notice::Grabbed { pid } => {
+                    eprintln!("console: pid {pid} has the keyboard until it exits")
+                }
+                Notice::Released { pid } => eprintln!("console: pid {pid} gave the keyboard back"),
+                Notice::Dropped { pid, why } => eprintln!("console: dropping pid {pid} — {why}"),
+            }
+        }
+
         if ready[TOKEN_KEYBOARD as usize] {
-            let mut events = [window::KeyEvent::EMPTY; 16];
+            let mut events = [toyos_abi::input::RawKeyEvent { keycode: 0, modifiers: 0 }; 16];
             let buf = unsafe {
                 std::slice::from_raw_parts_mut(
                     events.as_mut_ptr() as *mut u8,
@@ -158,7 +195,12 @@ fn main() {
             // Non-blocking for the reason `Keyboard::read_nonblock` documents:
             // an event loop that can park on an empty queue is a frozen screen.
             let n = kb.read_nonblock(buf).unwrap_or(0);
-            for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
+            for &event in &events[..n / std::mem::size_of::<toyos_abi::input::RawKeyEvent>()] {
+                // A client that asked for the keys gets the transition whole,
+                // releases included, and the translator is left where it is.
+                if host.deliver(event) == Delivery::Sent {
+                    continue;
+                }
                 if !event.pressed() {
                     continue;
                 }
@@ -176,13 +218,12 @@ fn main() {
                         console.scroll_view_down(page_rows);
                         painted = true;
                     }
-                    _ if event.len > 0 => {
-                        shell
-                            .stdin
-                            .write_all(&event.translated[..event.len as usize])
-                            .ok();
+                    usage => {
+                        let text = translator.press(usage, window::KeyEvent::from(event).mods());
+                        if !text.is_empty() {
+                            shell.stdin.write_all(text.as_bytes()).ok();
+                        }
                     }
-                    _ => {}
                 }
             }
         }
@@ -258,8 +299,9 @@ struct Shell {
 }
 
 impl Shell {
-    fn spawn() -> Shell {
+    fn spawn(surface_name: &str) -> Shell {
         let mut child = Command::new("/bin/shell")
+            .env(surface::HOST_ENV, surface_name)
             .stdin(process::tty_piped())
             .stdout(process::tty_piped())
             .stderr(process::tty_piped())
@@ -273,8 +315,8 @@ impl Shell {
         }
     }
 
-    fn restart(&mut self) {
+    fn restart(&mut self, surface_name: &str) {
         self.child.wait().ok();
-        *self = Shell::spawn();
+        *self = Shell::spawn(surface_name);
     }
 }

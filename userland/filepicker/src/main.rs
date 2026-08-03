@@ -4,7 +4,7 @@ use std::fs;
 use toyos::Connection;
 use toyos::services;
 use std::path::{Path, PathBuf};
-use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
+use window::{Color, Event, Framebuffer, KeyPress, MouseEvent, Window};
 
 // --- Colors (matching editor theme) ---
 
@@ -267,7 +267,7 @@ enum PickerResult {
     Cancel,
 }
 
-fn handle_key(picker: &mut Picker, key: &KeyEvent, win_h: usize) -> PickerResult {
+fn handle_key(picker: &mut Picker, key: &KeyPress, win_h: usize) -> PickerResult {
     if !key.pressed() {
         return PickerResult::Continue;
     }
@@ -329,10 +329,8 @@ fn handle_key(picker: &mut Picker, key: &KeyEvent, win_h: usize) -> PickerResult
         }
 
         _ => {
-            if picker.focus_filename && key.len > 0 {
-                let text =
-                    std::str::from_utf8(&key.translated[..key.len as usize]).unwrap_or("");
-                for ch in text.chars() {
+            if picker.focus_filename {
+                for ch in key.text().chars() {
                     if ch >= ' ' && ch != '/' {
                         picker.filename.insert(picker.filename_cursor, ch);
                         picker.filename_cursor += 1;
@@ -430,7 +428,7 @@ fn run_picker(mode: PickerMode, start_dir: &str, client: &Connection) {
                 PickerResult::Continue
             }
 
-            Event::KeyInput(key) => handle_key(&mut picker, &key, fb.height()),
+            Event::KeyInput(key) => handle_key(&mut picker, &window.press(key), fb.height()),
 
             Event::MouseInput(mouse) => handle_mouse(&mut picker, &mouse, fb.height()),
 

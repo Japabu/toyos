@@ -5,8 +5,13 @@ pub use framebuffer::{Color, Framebuffer, Screen, Traffic};
 use toyos::ipc;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::services;
+use toyos::surface;
 use toyos::Connection;
 use toyos::shm::SharedMemory;
+/// Re-exported because [`KeyPress`] is made of them and a client that holds
+/// its own translator — `/bin/console`, a test that stands in for a surface —
+/// should not have to name a second crate to do what this one does.
+pub use toyos_keymap::{Emit, Mods, Translator};
 
 // Window flags
 pub const WINDOW_FLAG_TOPMOST: u8 = 1;
@@ -44,6 +49,14 @@ pub const MSG_WINDOW_REFUSED: u32 = 9;
 // Shared-memory clipboard (for payloads > 116 bytes)
 pub const MSG_CLIPBOARD_SET_SHM: u32 = 10;
 pub const MSG_CLIPBOARD_PASTE_SHM: u32 = 11;
+
+/// Either direction: [`surface::LAYOUT_CONFIG`] changed, re-read it.
+///
+/// The compositor translates nothing, so it does not act on this — it is the
+/// root of the surface tree and its job is to give every window the same
+/// answer. A client sends it after writing the config; the compositor sends it
+/// to every window it holds.
+pub const MSG_LAYOUT_CHANGED: u32 = 12;
 
 /// Wire reasons carried by [`MSG_WINDOW_REFUSED`]. A client that does not know
 /// a reason still knows it was refused, so adding one is backwards compatible
@@ -165,16 +178,69 @@ pub const MOD_GUI: u8 = 8;
 pub const MOD_RELEASED: u8 = 0x10;
 
 toyos::ipc_payload! {
+    /// The kernel's [`toyos_abi::input::RawKeyEvent`], as the compositor
+    /// forwards it.
+    ///
+    /// Byte-identical to it and asserted so below: the compositor reads the
+    /// keyboard device into an array of these and hands whole ones on, which
+    /// is what makes "the compositor translates nothing" a property of the
+    /// wire and not of a convention.
     pub struct KeyEvent {
         pub keycode: u8,
         pub modifiers: u8,
-        pub len: u8,
-        pub translated: [u8; 5],
     }
 }
 
+const _: () = assert!(
+    core::mem::size_of::<KeyEvent>() == core::mem::size_of::<toyos_abi::input::RawKeyEvent>(),
+);
+
 impl KeyEvent {
-    pub const EMPTY: Self = Self { keycode: 0, modifiers: 0, len: 0, translated: [0; 5] };
+    pub const EMPTY: Self = Self { keycode: 0, modifiers: 0 };
+
+    pub fn pressed(&self) -> bool { self.modifiers & MOD_RELEASED == 0 }
+    pub fn released(&self) -> bool { self.modifiers & MOD_RELEASED != 0 }
+    pub fn shift(&self) -> bool { self.modifiers & MOD_SHIFT != 0 }
+    pub fn ctrl(&self) -> bool { self.modifiers & MOD_CTRL != 0 }
+    pub fn alt(&self) -> bool { self.modifiers & MOD_ALT != 0 }
+    pub fn gui(&self) -> bool { self.modifiers & MOD_GUI != 0 }
+
+    pub fn mods(&self) -> Mods {
+        Mods { shift: self.shift(), ctrl: self.ctrl(), alt: self.alt() }
+    }
+}
+
+/// The same two bytes, for a window that hosts surfaces of its own and has to
+/// pass a transition further down.
+impl From<KeyEvent> for toyos_abi::input::RawKeyEvent {
+    fn from(key: KeyEvent) -> Self {
+        Self { keycode: key.keycode, modifiers: key.modifiers }
+    }
+}
+
+impl From<toyos_abi::input::RawKeyEvent> for KeyEvent {
+    fn from(key: toyos_abi::input::RawKeyEvent) -> Self {
+        Self { keycode: key.keycode, modifiers: key.modifiers }
+    }
+}
+
+/// A transition and what it types here, from [`Window::press`].
+///
+/// Separate from [`KeyEvent`] because they are answers to different questions:
+/// [`KeyEvent`] is the wire form, identical on every surface the transition
+/// passes through, and this is one surface's reading of it under one layout.
+pub struct KeyPress {
+    pub keycode: u8,
+    pub modifiers: u8,
+    text: Emit,
+}
+
+impl KeyPress {
+    /// What this press types. Empty for a release, a modifier, and every key
+    /// the layout leaves undefined.
+    pub fn text(&self) -> &str {
+        self.text.as_str()
+    }
 
     pub fn pressed(&self) -> bool { self.modifiers & MOD_RELEASED == 0 }
     pub fn released(&self) -> bool { self.modifiers & MOD_RELEASED != 0 }
@@ -190,7 +256,36 @@ pub enum Event {
     ClipboardPaste(Vec<u8>),
     Resized,
     Close,
+    /// The keyboard layout config changed; this window's translator has
+    /// already been re-read. A client that hosts surfaces of its own passes
+    /// the same message down to them.
+    LayoutChanged,
     Frame,
+}
+
+/// The layout named in [`surface::LAYOUT_CONFIG`], or the built-in default
+/// when there is no config to read.
+///
+/// Every translator in the system starts here and comes back here whenever it
+/// is told the file moved, which is what stops two surfaces disagreeing about
+/// a layout the user only chose once.
+pub fn configured_translator() -> Translator {
+    let mut translator = Translator::new();
+    load_layout(&mut translator);
+    translator
+}
+
+/// Point `translator` at the configured layout. A config naming a layout that
+/// does not exist leaves it where it was — the alternative is silently
+/// falling back to `us` on a machine whose owner asked for something else.
+pub fn load_layout(translator: &mut Translator) {
+    let Ok(config) = std::fs::read_to_string(surface::LAYOUT_CONFIG) else {
+        return;
+    };
+    let name = config.trim();
+    if !name.is_empty() && !translator.set_layout(name) {
+        eprintln!("window: {:?} names no layout this build has", name);
+    }
 }
 
 /// Set the system clipboard contents (standalone, uses a temporary compositor connection).
@@ -217,6 +312,10 @@ pub struct Window {
     width: u32,
     height: u32,
     pixel_format: u32,
+    /// This window's own layout state. One per client process, which is what
+    /// keeps a dead key typed into one window from composing with a letter
+    /// typed into another.
+    translator: Translator,
 }
 
 impl Window {
@@ -280,7 +379,40 @@ impl Window {
         let shm = SharedMemory::map(info.token, buf_size);
 
         let poller = Poller::new(1);
-        Ok(Self { conn, poller, shm, width: info.width, height: info.height, pixel_format: info.pixel_format })
+        Ok(Self {
+            conn,
+            poller,
+            shm,
+            width: info.width,
+            height: info.height,
+            pixel_format: info.pixel_format,
+            translator: configured_translator(),
+        })
+    }
+
+    /// Which layout this window is translating with.
+    pub fn layout(&self) -> &'static str {
+        self.translator.layout()
+    }
+
+    /// `key` with what it types on this window under the layout in force.
+    ///
+    /// **Called once per press by whoever wants the characters, and not at
+    /// all by anyone who does not.** That is not a convenience: it advances
+    /// the dead-key state, so a surface that is lending its keys to a child —
+    /// a terminal while the layout wizard has them — must not call it, or a
+    /// `^` the wizard consumed would still be waiting for a base character
+    /// when the wizard exits.
+    pub fn press(&mut self, key: KeyEvent) -> KeyPress {
+        let text =
+            if key.pressed() { self.translator.press(key.keycode, key.mods()) } else { Emit::EMPTY };
+        KeyPress { keycode: key.keycode, modifiers: key.modifiers, text }
+    }
+
+    /// Tell the compositor that [`surface::LAYOUT_CONFIG`] changed, so every
+    /// other window re-reads it too.
+    pub fn notify_layout_changed(&self) {
+        let _ = self.conn.signal(MSG_LAYOUT_CHANGED);
     }
 
     pub fn recv_event(&mut self) -> Event {
@@ -306,10 +438,14 @@ impl Window {
     /// program, and it has a way to say "the session is over".
     fn decode_event(&mut self, header: &ipc::IpcHeader) -> Event {
         match header.msg_type {
-            MSG_KEY_INPUT => match self.conn.recv_payload(header) {
-                Ok(ev) => Event::KeyInput(ev),
+            MSG_KEY_INPUT => match self.conn.recv_payload::<KeyEvent>(header) {
+                Ok(key) => Event::KeyInput(key),
                 Err(_) => Event::Close,
             },
+            MSG_LAYOUT_CHANGED => {
+                load_layout(&mut self.translator);
+                Event::LayoutChanged
+            }
             MSG_MOUSE_INPUT => match self.conn.recv_payload(header) {
                 Ok(ev) => Event::MouseInput(ev),
                 Err(_) => Event::Close,

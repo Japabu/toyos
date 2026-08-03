@@ -512,7 +512,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     }
 
     boot_phase!("complete", 0);
-    log!("Keyboard layout: {}", crate::keyboard::layout_name());
 
     // The panic no userland process can produce, by design: nothing is
     // current here, so the handler's recovery predicate fails and it runs the

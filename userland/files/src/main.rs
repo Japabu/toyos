@@ -354,6 +354,9 @@ impl FileBrowser {
                     self.window.present();
                 }
                 window::Event::ClipboardPaste(_) => {}
+                // Every key this browser reads is a HID usage — arrows, Enter,
+                // Backspace — so no layout moves any of them.
+                window::Event::LayoutChanged => {}
                 window::Event::Frame => {}
                 window::Event::Close => break,
             }

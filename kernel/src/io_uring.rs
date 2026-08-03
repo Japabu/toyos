@@ -640,9 +640,19 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
     }
 }
 
-/// Remove all pending polls for a given fd from all affected rings.
-/// Called by the fd close path. Uses source watcher lists to find affected rings.
-pub fn remove_fd(fd_num: u32, sources: &[Option<Source>]) {
+/// Cancel every pending poll on a source that is going away, in every ring
+/// that was watching it. Called by the fd close path.
+///
+/// **Selected by source and never by fd number.** The rings this reaches
+/// belong to *other* processes — that is the whole point of walking the
+/// source's watcher list — and an fd number means nothing outside the process
+/// that owns it. Matching on it cancelled a poll the closing process had never
+/// heard of: a client exiting with its connection on fd 3 posted `-NotFound`
+/// for whatever the server had on *its* fd 3, and a server whose listener sat
+/// there then read ready with nothing queued and blocked in `accept` forever.
+/// Found in the layout wizard's gate, where the wizard's fd 3 was the gate's
+/// listener; the compositor is exposed to exactly the same shape.
+pub fn remove_fd(sources: &[Option<Source>]) {
     let mut affected: Vec<RingId> = Vec::new();
     for source in sources.iter().flatten() {
         for &id in source.watchers().iter() {
@@ -654,14 +664,21 @@ pub fn remove_fd(fd_num: u32, sources: &[Option<Source>]) {
 
     if affected.is_empty() { return; }
 
+    let watches_a_closing_source = |pp: &PendingPoll| {
+        sources
+            .iter()
+            .flatten()
+            .any(|&s| pp.read_source == Some(s) || pp.write_source == Some(s))
+    };
+
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     for ring_id in affected {
         if let Some(instance) = map.get_mut(ring_id) {
-            // Remove all pending polls for this fd (WatcherGuard drops → cleans watcher lists)
+            // WatcherGuard drops with the poll → cleans the watcher lists.
             let mut i = 0;
             while i < instance.pending_polls.len() {
-                if instance.pending_polls[i].fd_num == fd_num {
+                if watches_a_closing_source(&instance.pending_polls[i]) {
                     let pp = instance.pending_polls.swap_remove(i);
                     // Post error CQE so userspace knows the poll was cancelled
                     instance.post_cqe(pp.user_data, -(SyscallError::NotFound as i32), 0);

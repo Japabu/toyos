@@ -6,6 +6,14 @@ use crate::sync::Lock;
 pub use toyos_abi::input::MouseEvent;
 
 static MOUSE_BUF: Lock<VecDeque<MouseEvent>> = Lock::new(VecDeque::new());
+
+/// How many pointer updates the kernel holds for a reader that is not reading.
+///
+/// The keyboard's bound and the keyboard's argument
+/// ([`crate::keyboard::MAX_QUEUED_EVENTS`]), and the drop-oldest policy is
+/// even clearer here: every event carries an absolute position, so the newest
+/// is where the pointer *is* and the oldest is where it was.
+pub const MAX_QUEUED_EVENTS: usize = 512;
 static LAST_X: AtomicU16 = AtomicU16::new(0);
 static LAST_Y: AtomicU16 = AtomicU16::new(0);
 static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
@@ -187,8 +195,22 @@ pub fn handle_motion(
     }
     LAST_X.store(abs_x, Ordering::Relaxed);
     LAST_Y.store(abs_y, Ordering::Relaxed);
-    MOUSE_BUF.lock().push_back(MouseEvent { buttons: merged, scroll, abs_x, abs_y });
+    queue(MouseEvent { buttons: merged, scroll, abs_x, abs_y });
     true
+}
+
+fn queue(event: MouseEvent) {
+    let mut buf = MOUSE_BUF.lock();
+    if buf.len() >= MAX_QUEUED_EVENTS {
+        buf.pop_front();
+    }
+    buf.push_back(event);
+}
+
+/// Throw away everything queued, for the reason
+/// [`crate::keyboard::discard_queued`] gives.
+pub fn discard_queued() {
+    MOUSE_BUF.lock().clear();
 }
 
 /// Release everything a source was holding, and publish the result.
@@ -205,7 +227,7 @@ pub fn release_buttons(source: PointerSource) -> bool {
     if before == after {
         return false;
     }
-    MOUSE_BUF.lock().push_back(MouseEvent {
+    queue(MouseEvent {
         buttons: after,
         scroll: 0,
         abs_x: LAST_X.load(Ordering::Relaxed),

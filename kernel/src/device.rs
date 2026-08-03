@@ -1,4 +1,5 @@
 use crate::fd::{Descriptor, FramebufferInfo};
+use crate::{keyboard, mouse};
 use crate::process::Pid;
 use crate::shared_memory;
 use crate::sync::Lock;
@@ -53,6 +54,12 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Result<Descriptor, ClaimError> {
                 return Err(ClaimError::Owned);
             }
             *owner = Some(pid);
+            // Whatever was typed while nobody held the device belongs to
+            // nobody. Delivering it to whoever claims next hands one program
+            // another's keystrokes, and a compositor restarted mid-sentence
+            // would open with the tail of what was being typed into the one
+            // that died.
+            keyboard::discard_queued();
             Ok(Descriptor::Keyboard)
         }
         DEVICE_MOUSE => {
@@ -61,6 +68,7 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Result<Descriptor, ClaimError> {
                 return Err(ClaimError::Owned);
             }
             *owner = Some(pid);
+            mouse::discard_queued();
             Ok(Descriptor::Mouse)
         }
         DEVICE_FRAMEBUFFER => {

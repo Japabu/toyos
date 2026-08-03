@@ -17,6 +17,7 @@ const MOUSE_SIZE: usize = 6;
 fn main() {
     let keyboard = Keyboard::open().expect("input_events: no keyboard device");
     let mouse = Mouse::open().expect("input_events: no mouse device");
+    let mut translator = window::configured_translator();
     println!("===INPUT_READY===");
 
     // Long enough for the host to inject both halves and for the events to
@@ -30,11 +31,17 @@ fn main() {
 
         let n = keyboard.read_nonblock(&mut buf).unwrap_or(0);
         for chunk in buf[..n].chunks_exact(KEY_SIZE) {
-            let len = chunk[2] as usize;
-            let translated = String::from_utf8_lossy(&chunk[3..3 + len.min(5)]).into_owned();
+            let key = window::KeyEvent { keycode: chunk[0], modifiers: chunk[1] };
+            let translated = if key.pressed() {
+                translator.press(key.keycode, key.mods())
+            } else {
+                window::Emit::EMPTY
+            };
             println!(
                 "kev usage=0x{:02x} mods=0x{:02x} tr={:?}",
-                chunk[0], chunk[1], translated
+                key.keycode,
+                key.modifiers,
+                translated.as_str()
             );
             keys += 1;
             idle = false;

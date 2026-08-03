@@ -21,8 +21,10 @@ fn drain() {
 pub fn run() {
     drain();
 
-    // Shift on one keyboard, the letter on another. The capital is the
-    // observable form of "the modifier state is not per-driver".
+    // Shift on one keyboard, the letter on another. The letter's event
+    // carrying MOD_SHIFT is the whole of what the kernel has to say about it —
+    // that it becomes a capital is `toyos-keymap`'s, and `i8042_keyboard`
+    // gates the two together through a real keyboard.
     assert!(keyboard::handle_key(0xE1, true), "input-merge: Shift down queued nothing");
     assert!(keyboard::handle_key(0x04, true), "input-merge: 'a' down queued nothing");
     assert!(keyboard::handle_key(0xE1, false), "input-merge: Shift up queued nothing");
@@ -38,14 +40,10 @@ pub fn run() {
         shift_down.modifiers
     );
     let letter = next_key("'a' down");
-    assert!(
-        letter.modifiers & MOD_SHIFT != 0,
-        "input-merge: the letter did not see the other keyboard's Shift"
-    );
-    assert!(
-        &letter.translated[..letter.len as usize] == b"A",
-        "input-merge: Shift+a translated to {:?}, not a capital",
-        &letter.translated[..letter.len as usize]
+    assert_eq!(
+        (letter.keycode, letter.modifiers),
+        (0x04, MOD_SHIFT),
+        "input-merge: 'a' down should be usage 0x04 with exactly the other keyboard's Shift set"
     );
     let shift_up = next_key("Shift up");
     assert!(
