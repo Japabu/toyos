@@ -2339,10 +2339,13 @@ time. Closing this entry is what takes all three read figures to zero.
 `metal_sim_compositor` requires the line and prints it: three frames at
 1920x1080 read 747,144 bytes back for 9,531,840 written, reproducing
 byte-for-byte between runs while the times do not. They are byte counts and
-never a cost — the cost is the uncached read, which QEMU cannot have. One
-caveat for anyone deriving from them: `put_pixel` is uncounted (it is the
-per-pixel path every glyph goes through) and the title-bar sprites write
-through a raw pointer, so `scanout_wr_bytes` is the bulk paths alone.
+never a cost — the cost is the uncached read, which QEMU cannot have. Both
+figures are lower bounds, and anyone deriving from them needs to know by how
+much: they count what goes through `Framebuffer`, so glyphs (`put_pixel`,
+uncounted by design) and the title-bar icons (handed `screen.ptr()`, and
+alpha-blending through it, so they read the panel as well as write it) are in
+neither. The 1920x1080 figures above have no window on screen and therefore no
+icons; a desktop's do.
 
 **The panic console's repaint is ~460 ms on the T14**, measured from inter-line
 gaps in both boot logs (461 ms and 459 ms) in

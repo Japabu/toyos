@@ -738,6 +738,12 @@ fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, 
 /// row it replicates and a blended cursor pixel reads the pixel under it, and
 /// on hardware — unlike QEMU, where the framebuffer is host RAM — those reads
 /// are uncached. Composing in RAM and blitting damage would hold it at zero.
+///
+/// Both byte figures are lower bounds, and for one reason: they count what
+/// went through `Framebuffer`. Glyphs go through `put_pixel`, which is
+/// uncounted by design, and the title-bar icons are handed `screen.ptr()` and
+/// blend through it — reading the scanout as well as writing it — outside the
+/// counters entirely.
 #[derive(Default)]
 struct FrameStats {
     frames: u32,
