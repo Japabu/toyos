@@ -489,6 +489,7 @@ dependencies = [
  "font",
  "terminal",
  "toyos",
+ "toyos-abi",
  "window",
 ]
 
@@ -887,7 +888,7 @@ dependencies = [
 [[package]]
 name = "dpi"
 version = "0.1.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 
 [[package]]
 name = "ecdsa"
@@ -3913,6 +3914,7 @@ dependencies = [
  "font",
  "toyos",
  "toyos-abi",
+ "toyos-keymap",
 ]
 
 [[package]]
@@ -4176,7 +4178,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "bitflags 2.11.0",
  "cfg_aliases",
@@ -4201,7 +4203,7 @@ dependencies = [
 [[package]]
 name = "winit-android"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "android-activity",
  "bitflags 2.11.0",
@@ -4216,7 +4218,7 @@ dependencies = [
 [[package]]
 name = "winit-appkit"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "bitflags 2.11.0",
  "block2",
@@ -4238,7 +4240,7 @@ dependencies = [
 [[package]]
 name = "winit-common"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "block2",
  "objc2",
@@ -4253,7 +4255,7 @@ dependencies = [
 [[package]]
 name = "winit-core"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "bitflags 2.11.0",
  "cursor-icon",
@@ -4267,7 +4269,7 @@ dependencies = [
 [[package]]
 name = "winit-orbital"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "bitflags 2.11.0",
  "dpi",
@@ -4283,7 +4285,7 @@ dependencies = [
 [[package]]
 name = "winit-toyos"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "bitflags 2.11.0",
  "dpi",
@@ -4297,7 +4299,7 @@ dependencies = [
 [[package]]
 name = "winit-uikit"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "bitflags 2.11.0",
  "block2",
@@ -4317,7 +4319,7 @@ dependencies = [
 [[package]]
 name = "winit-web"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "atomic-waker",
  "bitflags 2.11.0",
@@ -4339,7 +4341,7 @@ dependencies = [
 [[package]]
 name = "winit-win32"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Japabu/winit?branch=toyos#cb8eb2765b70d9a760a2873cfd63625ea22b7fb3"
+source = "git+https://github.com/Japabu/winit?branch=toyos#be9ec72c21db2bcfff620d0437f28d0ed3dd96fb"
 dependencies = [
  "bitflags 2.11.0",
  "cursor-icon",

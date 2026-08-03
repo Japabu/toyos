@@ -1,20 +1,18 @@
 use std::io::{self, Read, Write};
-use toyos::system::set_keyboard_layout;
+use toyos::surface::{self, GrabError, Keys};
 use toyos_keymap::detect::{Detector, Step};
 
-const CONFIG_PATH: &str = "/home/root/.config/keyboard_layout";
-
-/// The names come from the same table the kernel selects on, so this cannot
-/// offer a layout the kernel would refuse or hide one it has. There is no way
-/// to ask which is *currently* active: that needs a read syscall, and the one
-/// the introspection plan reserves for it (`SYS_QUERY`) is not built.
+/// The names come from the same table every translator selects on, so this
+/// cannot offer a layout that would be refused or hide one that exists. There
+/// is still no way to ask which is *currently* active: that needs a read
+/// syscall, and the one `specs/introspection-plan.md` reserves for it
+/// (`SYS_QUERY`) is not built.
 fn layouts() -> impl Iterator<Item = &'static str> {
     toyos_keymap::LAYOUTS.iter().map(|l| l.name)
 }
 
 pub fn main(args: Vec<String>) {
     match args.first().map(|s| s.as_str()) {
-        Some("--load") => load(),
         Some("--list") => {
             for name in layouts() {
                 println!("{name}");
@@ -26,35 +24,37 @@ pub fn main(args: Vec<String>) {
     }
 }
 
-fn load() {
-    let data = match std::fs::read_to_string(CONFIG_PATH) {
-        Ok(data) => data,
-        Err(_) => return,
-    };
-    let name = data.trim();
-    if !name.is_empty() {
-        if let Err(e) = set_keyboard_layout(name) {
-            eprintln!("locale: failed to set layout '{name}': {e}");
-        }
-    }
+/// The surface hosting this program, if there is one.
+///
+/// Absent when nothing above set [`surface::HOST_ENV`] — a program run
+/// straight from init, or a test runner. Writing the config still works; it is
+/// read by every translator that starts afterwards.
+fn host() -> Option<String> {
+    std::env::var(surface::HOST_ENV).ok()
 }
 
+/// Record `name` as the machine's layout.
+///
+/// The file is the layout. Nothing here tells a translator *which* one to use:
+/// it tells them the file moved, and each re-reads it — so two surfaces cannot
+/// end up holding different answers to a question the user asked once.
 fn set(name: &str) {
-    match set_keyboard_layout(name) {
-        Ok(()) => {
-            std::fs::write(CONFIG_PATH, name).unwrap_or_else(|e| {
-                eprintln!("locale: failed to save config: {e}");
-            });
-            println!("Keyboard layout set to '{name}'");
-        }
-        Err(e) => {
-            let available: Vec<&str> = layouts().collect();
-            eprintln!(
-                "locale: failed to set layout '{name}': {e}; available: {}",
-                available.join(", ")
-            );
-        }
+    if toyos_keymap::by_name(name).is_none() {
+        let available: Vec<&str> = layouts().collect();
+        eprintln!("locale: no layout named '{name}'; available: {}", available.join(", "));
+        return;
     }
+    if let Some(dir) = std::path::Path::new(surface::LAYOUT_CONFIG).parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    if let Err(e) = std::fs::write(surface::LAYOUT_CONFIG, name) {
+        eprintln!("locale: failed to save config: {e}");
+        return;
+    }
+    if let Some(host) = host() {
+        surface::notify_layout_changed(&host);
+    }
+    println!("Keyboard layout set to '{name}'");
 }
 
 fn interactive_select() {
@@ -137,25 +137,35 @@ fn clear_menu(rows: usize) {
 const ESC: u8 = 0x29;
 const ENTER: u8 = 0x28;
 
+/// A minute per question, which is a user reading a keycap rather than a
+/// deadline anything depends on.
+const ANSWER_TIMEOUT_NS: u64 = 60 * 1_000_000_000;
+
 /// Ask which layout this keyboard is, by asking its owner to press keys and
 /// reading which HID usage each press reports.
 ///
-/// It reads the keyboard device rather than stdin, because stdin carries what
-/// the *current* layout made of the press and the question is which layout to
-/// use. `RawKeyEvent::keycode` is the pre-layout usage and always has been —
-/// no new syscall — but the device is claimed exclusively, so this runs only
-/// where nothing else holds it. Under the compositor or `/bin/console` it
-/// says so and stops.
+/// The transitions come from the surface hosting this program — the terminal,
+/// the console, whatever it is — and not from the keyboard device, which is
+/// claimed by that same surface. What matters is that a HID usage is what
+/// arrives: stdin would carry what the *current* layout made of the press, and
+/// the question is which layout to use.
 fn detect() {
-    let keyboard = match toyos::device::Keyboard::open() {
-        Ok(keyboard) => keyboard,
+    let Some(host) = host() else {
+        eprintln!(
+            "locale: nothing is hosting this program's keyboard. The wizard reads key \
+             positions, which only a surface — a terminal, /bin/console, a window — can \
+             hand over. Run it from one, or pick a layout by name: locale <name>."
+        );
+        return;
+    };
+    let mut keys = match Keys::grab(&host) {
+        Ok(keys) => keys,
+        Err(e @ GrabError::Busy) => {
+            eprintln!("locale: {e}. Finish with that first, or pick one by name: locale <name>.");
+            return;
+        }
         Err(e) => {
-            eprintln!("locale: cannot read the keyboard directly: {e}");
-            eprintln!(
-                "locale: the keyboard is claimed exclusively, and the compositor and \
-                 /bin/console both hold it while they run. Pick one by name instead: \
-                 locale <name>, or locale --list."
-            );
+            eprintln!("locale: {e}; pick a layout by name instead: locale <name>, or locale --list.");
             return;
         }
     };
@@ -169,7 +179,7 @@ fn detect() {
             Step::Ask(ask) => {
                 println!("Press the key labelled  {}", ask.legend());
                 io::stdout().flush().ok();
-                let Some(usage) = next_press(&keyboard) else {
+                let Some(usage) = next_press(&mut keys) else {
                     println!("cancelled");
                     return;
                 };
@@ -181,13 +191,8 @@ fn detect() {
                 io::stdout().flush().ok();
                 // Enter and Escape are the same usage on every layout here, so
                 // the confirmation does not depend on the answer being right.
-                match next_press(&keyboard) {
-                    // Runtime only: nothing is written to the config store, so a
-                    // reboot is back to the default.
-                    Some(ENTER) => match set_keyboard_layout(name) {
-                        Ok(()) => println!("Keyboard layout set to '{name}'"),
-                        Err(e) => eprintln!("locale: failed to set layout '{name}': {e}"),
-                    },
+                match next_press(&mut keys) {
+                    Some(ENTER) => set(name),
                     _ => println!("cancelled"),
                 }
                 return;
@@ -214,31 +219,17 @@ fn detect() {
 ///
 /// Releases and modifiers are skipped: the user may well hold Shift to reach a
 /// legend, and a release is not a press.
-///
-/// One event per read. The kernel fills as many whole events as the buffer
-/// holds, so a larger one would take the presses queued behind this one and
-/// this function would have to drop them — and a wizard that drops the answer
-/// to its next question is a wizard that hangs on a user who typed ahead.
-fn next_press(keyboard: &toyos::device::Keyboard) -> Option<u8> {
-    const EVENT_SIZE: usize = std::mem::size_of::<toyos_abi::input::RawKeyEvent>();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut buf = [0u8; EVENT_SIZE];
-    while std::time::Instant::now() < deadline {
-        if keyboard.read_nonblock(&mut buf).unwrap_or(0) != EVENT_SIZE {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            continue;
-        }
-        let (usage, modifiers) = (buf[0], buf[1]);
-        if modifiers & toyos_abi::input::MOD_RELEASED != 0 || (0xE0..=0xE7).contains(&usage) {
-            continue;
-        }
-        if usage == ESC {
+fn next_press(keys: &mut Keys) -> Option<u8> {
+    loop {
+        let Some(event) = keys.next(ANSWER_TIMEOUT_NS) else {
+            println!("locale: nothing pressed for 60s");
             return None;
+        };
+        if event.released() || (0xE0..=0xE7).contains(&event.keycode) {
+            continue;
         }
-        return Some(usage);
+        return (event.keycode != ESC).then_some(event.keycode);
     }
-    println!("locale: nothing pressed for 60s");
-    None
 }
 
 fn read_byte() -> Option<u8> {

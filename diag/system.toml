@@ -15,9 +15,11 @@
 #
 # The list cannot be empty — `kernel/src/main.rs` asserts the bootloader handed
 # it one, and a violated assert paints a panic report instead of a boot log — so
-# it is the shipping list's own first entry, which reads a config file that does
-# not exist on a fresh disk and returns.
-init = ["/bin/toybox locale --load"]
+# it is the least a program in this tree can do: print the cwd and exit. It used
+# to be the shipping list's own first entry, `locale --load`, which is gone with
+# the layout syscall; the shipping list now starts with the compositor, which is
+# the one process this image must not contain.
+init = ["/bin/toybox pwd"]
 
 [programs]
 toybox = {}

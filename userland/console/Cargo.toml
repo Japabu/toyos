@@ -8,4 +8,5 @@ license = "MIT OR Apache-2.0"
 font = { path = "../font" }
 terminal = { path = "../terminal" }
 toyos = { path = "../../toyos" }
+toyos-abi = { path = "../../toyos-abi" }
 window = { path = "../window" }

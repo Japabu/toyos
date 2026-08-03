@@ -2,6 +2,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use toyos::shm::SharedMemory;
+use toyos::ipc::RxStep;
 use toyos::{gpu, ipc, services, system, Connection, Keyboard, Mouse, FramebufferDev};
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos_abi::Fd;
@@ -92,10 +93,6 @@ const MAX_WINDOW_SLOTS: u32 = Poller::MAX_HANDLES - FIXED_POLL_FDS - MAX_PENDING
 /// discarded, never waited for.
 const MAX_KEPT_PAYLOAD: usize = 116;
 
-/// A whole frame is drained before the compositor acts on it, so the longest
-/// the event loop can be held by one client is one pass of the drain loop.
-const IPC_HEADER_LEN: usize = 8;
-
 /// How long one pass may spend draining clients before it must composite.
 ///
 /// Without it a client that never stops sending keeps its fd ready forever and
@@ -158,135 +155,15 @@ fn total_memory() -> u64 {
     u64::from_le_bytes(buf[0..8].try_into().unwrap())
 }
 
-/// What one [`ClientRx::pump`] found.
-#[derive(Clone, Copy)]
-enum RxStep {
-    /// The fd has nothing more right now.
-    Idle,
-    /// A whole frame is buffered; its payload is [`ClientRx::payload`].
-    Frame { msg_type: u32, payload_len: usize },
-    /// The peer hung up, or its fd is gone.
-    Eof,
-    /// A frame no protocol here can produce. Nothing after it can be located,
-    /// so there is nothing to resynchronise to.
-    Malformed,
-}
-
-/// One client's inbound framing, over non-blocking reads only.
+/// One client's inbound framing.
 ///
 /// **The compositor never reads a client with a blocking read.** That is the
-/// whole point of this type: `ipc::recv_header` and `ipc::recv_payload` park
-/// the caller until the peer sends the bytes it promised, which hands a client
-/// the decision of when the desktop runs again. Here a peer that stops halfway
-/// through a frame costs a buffer and a deadline instead of the event loop.
-struct ClientRx {
-    buf: [u8; IPC_HEADER_LEN + MAX_KEPT_PAYLOAD],
-    len: usize,
-    state: RxState,
-}
-
-enum RxState {
-    Header,
-    Payload { msg_type: u32, keep: usize, skip: u32 },
-    Skip { msg_type: u32, kept: usize, remaining: u32 },
-}
-
-impl ClientRx {
-    fn new() -> Self {
-        Self { buf: [0; IPC_HEADER_LEN + MAX_KEPT_PAYLOAD], len: 0, state: RxState::Header }
-    }
-
-    /// The payload of the frame the last [`RxStep::Frame`] announced.
-    fn payload(&self, len: usize) -> &[u8] {
-        &self.buf[..len]
-    }
-
-    /// Read what is there, and report the first thing that happened.
-    ///
-    /// At most one frame per call: the caller has other clients to serve and a
-    /// screen to paint, and a client that always has another frame ready must
-    /// not be able to keep either from happening.
-    fn pump(&mut self, conn: &Connection) -> RxStep {
-        loop {
-            match self.state {
-                RxState::Header => {
-                    match fill(conn, &mut self.buf[..IPC_HEADER_LEN], &mut self.len) {
-                        Fill::Idle => return RxStep::Idle,
-                        Fill::Eof => return RxStep::Eof,
-                        Fill::Filled => {}
-                    }
-                    let msg_type = u32::from_ne_bytes(self.buf[0..4].try_into().unwrap());
-                    let wire_len = u32::from_ne_bytes(self.buf[4..8].try_into().unwrap());
-                    // The bound belongs to `IpcHeader`, so it is asked rather
-                    // than restated: a length past `MAX_FRAME_LEN` is a frame
-                    // this endpoint refuses to describe, not a long one.
-                    let Ok(header) = ipc::IpcHeader::from_wire(msg_type, wire_len) else {
-                        return RxStep::Malformed;
-                    };
-                    self.len = 0;
-                    let keep = (header.len() as usize).min(MAX_KEPT_PAYLOAD);
-                    let skip = header.len() - keep as u32;
-                    self.state = RxState::Payload { msg_type, keep, skip };
-                }
-                RxState::Payload { msg_type, keep, skip } => {
-                    if keep > 0 {
-                        match fill(conn, &mut self.buf[..keep], &mut self.len) {
-                            Fill::Idle => return RxStep::Idle,
-                            Fill::Eof => return RxStep::Eof,
-                            Fill::Filled => {}
-                        }
-                    }
-                    self.len = 0;
-                    self.state = RxState::Skip { msg_type, kept: keep, remaining: skip };
-                }
-                RxState::Skip { msg_type, kept, remaining } => {
-                    if remaining > 0 {
-                        let mut sink = [0u8; 128];
-                        let want = (remaining as usize).min(sink.len());
-                        let mut got = 0;
-                        match fill(conn, &mut sink[..want], &mut got) {
-                            Fill::Idle => {
-                                self.state =
-                                    RxState::Skip { msg_type, kept, remaining: remaining - got as u32 };
-                                return RxStep::Idle;
-                            }
-                            Fill::Eof => return RxStep::Eof,
-                            Fill::Filled => {
-                                self.state =
-                                    RxState::Skip { msg_type, kept, remaining: remaining - want as u32 };
-                                continue;
-                            }
-                        }
-                    }
-                    self.state = RxState::Header;
-                    return RxStep::Frame { msg_type, payload_len: kept };
-                }
-            }
-        }
-    }
-}
-
-enum Fill {
-    Filled,
-    Idle,
-    Eof,
-}
-
-/// Fill `buf` from `*len` onwards without blocking, carrying `*len` forward so
-/// the next call resumes where this one stopped.
-fn fill(conn: &Connection, buf: &mut [u8], len: &mut usize) -> Fill {
-    while *len < buf.len() {
-        match conn.read_nonblock(&mut buf[*len..]) {
-            Ok(0) => return Fill::Eof,
-            Ok(n) => *len += n,
-            Err(toyos_abi::syscall::SyscallError::WouldBlock) => return Fill::Idle,
-            // The fd itself is gone, which is the same hang-up seen from the
-            // other side of the same race.
-            Err(_) => return Fill::Eof,
-        }
-    }
-    Fill::Filled
-}
+/// whole point of [`ipc::FrameRx`]: `ipc::recv_header` and `ipc::recv_payload`
+/// park the caller until the peer sends the bytes it promised, which hands a
+/// client the decision of when the desktop runs again. Here a peer that stops
+/// halfway through a frame costs a buffer and a deadline instead of the event
+/// loop.
+type ClientRx = ipc::FrameRx<MAX_KEPT_PAYLOAD>;
 
 /// A whole client message, off the fd and in memory.
 ///
@@ -1942,6 +1819,20 @@ fn main() {
                 }
                 window::MSG_CLIPBOARD_SET => {
                     clipboard = String::from_utf8_lossy(payload).into_owned();
+                }
+                window::MSG_LAYOUT_CHANGED => {
+                    // The compositor is the root of the surface tree and
+                    // translates nothing, so it has no layout of its own to
+                    // update — it exists here only so that every window gets
+                    // the same answer to a question one of them changed.
+                    // Delivered to the sender too: the config is the layout,
+                    // and re-reading a file one has just written is cheaper
+                    // than a rule about who is exempt.
+                    for win in &windows {
+                        if let Err(e) = win.fd.try_signal(window::MSG_LAYOUT_CHANGED) {
+                            mark_dead(&mut dead, win.fd.fd(), win.pid, e.into());
+                        }
+                    }
                 }
                 window::MSG_CLIPBOARD_SET_SHM => {
                     let Ok(info) = ipc::decode_payload::<window::ClipboardShmMsg>(payload) else {

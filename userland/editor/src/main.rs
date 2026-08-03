@@ -3,7 +3,7 @@ use font::Font;
 use std::env;
 use std::fs;
 use std::time::Instant;
-use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
+use window::{Color, Event, Framebuffer, KeyPress, MouseEvent, Window};
 
 // --- Colors (Catppuccin Mocha-inspired) ---
 
@@ -1508,6 +1508,7 @@ fn main() {
             }
 
             Some(Event::KeyInput(key)) => {
+                let key = window.press(key);
                 if key.pressed() {
                     handle_key(&mut editor, &key, &mut fb);
                     reset_blink(&mut cursor_visible, &mut last_blink);
@@ -1545,7 +1546,7 @@ fn reset_blink(visible: &mut bool, last: &mut Instant) {
     *last = Instant::now();
 }
 
-fn handle_key(editor: &mut Editor, key: &KeyEvent, fb: &mut Framebuffer) {
+fn handle_key(editor: &mut Editor, key: &KeyPress, fb: &mut Framebuffer) {
     if editor.goto_line.active {
         handle_goto_line_key(editor, key);
         return;
@@ -1559,13 +1560,9 @@ fn handle_key(editor: &mut Editor, key: &KeyEvent, fb: &mut Framebuffer) {
     let cmd = key.gui();
     let shift = key.shift();
 
-    // Get the translated character (lowercase) for layout-independent matching
-    let ch = if key.len > 0 {
-        let s = std::str::from_utf8(&key.translated[..key.len as usize]).unwrap_or("");
-        s.chars().next().map(|c| c.to_ascii_lowercase())
-    } else {
-        None
-    };
+    // Match the shortcut on what the key types, not on where it sits: Cmd+S
+    // is the key that prints `S` under whatever layout is in force.
+    let ch = key.text().chars().next().map(|c| c.to_ascii_lowercase());
 
     if cmd {
         match ch {
@@ -1696,19 +1693,16 @@ fn handle_key(editor: &mut Editor, key: &KeyEvent, fb: &mut Framebuffer) {
         }
         _ => {
             // Printable character
-            if key.len > 0 {
-                let text = std::str::from_utf8(&key.translated[..key.len as usize]).unwrap_or("");
-                for ch in text.chars() {
-                    if ch >= ' ' || ch == '\t' {
-                        editor.insert_char(ch);
-                    }
+            for ch in key.text().chars() {
+                if ch >= ' ' || ch == '\t' {
+                    editor.insert_char(ch);
                 }
             }
         }
     }
 }
 
-fn handle_find_key(editor: &mut Editor, key: &KeyEvent) {
+fn handle_find_key(editor: &mut Editor, key: &KeyPress) {
     let ctrl = key.gui();
     let shift = key.shift();
 
@@ -1776,20 +1770,16 @@ fn handle_find_key(editor: &mut Editor, key: &KeyEvent) {
             }
         }
         _ => {
-            if key.len > 0 {
-                let text =
-                    std::str::from_utf8(&key.translated[..key.len as usize]).unwrap_or("");
-                for ch in text.chars() {
-                    if ch >= ' ' {
-                        if editor.finder.editing_replace {
-                            editor.finder.replace.insert(editor.finder.replace_cursor, ch);
-                            editor.finder.replace_cursor += 1;
-                        } else {
-                            editor.finder.query.insert(editor.finder.query_cursor, ch);
-                            editor.finder.query_cursor += 1;
-                            editor.finder.search(&editor.buffer.lines);
-                            editor.finder.find_nearest(editor.cursor_row, editor.cursor_col);
-                        }
+            for ch in key.text().chars() {
+                if ch >= ' ' {
+                    if editor.finder.editing_replace {
+                        editor.finder.replace.insert(editor.finder.replace_cursor, ch);
+                        editor.finder.replace_cursor += 1;
+                    } else {
+                        editor.finder.query.insert(editor.finder.query_cursor, ch);
+                        editor.finder.query_cursor += 1;
+                        editor.finder.search(&editor.buffer.lines);
+                        editor.finder.find_nearest(editor.cursor_row, editor.cursor_col);
                     }
                 }
             }
@@ -1797,7 +1787,7 @@ fn handle_find_key(editor: &mut Editor, key: &KeyEvent) {
     }
 }
 
-fn handle_goto_line_key(editor: &mut Editor, key: &KeyEvent) {
+fn handle_goto_line_key(editor: &mut Editor, key: &KeyPress) {
     match key.keycode {
         KEY_ESCAPE => {
             editor.goto_line.active = false;
@@ -1816,13 +1806,9 @@ fn handle_goto_line_key(editor: &mut Editor, key: &KeyEvent) {
             editor.goto_line.input.pop();
         }
         _ => {
-            if key.len > 0 {
-                let text =
-                    std::str::from_utf8(&key.translated[..key.len as usize]).unwrap_or("");
-                for ch in text.chars() {
-                    if ch.is_ascii_digit() {
-                        editor.goto_line.input.push(ch);
-                    }
+            for ch in key.text().chars() {
+                if ch.is_ascii_digit() {
+                    editor.goto_line.input.push(ch);
                 }
             }
         }

@@ -1,0 +1,23 @@
+# A desktop with a shell in it: the surface tree at its deepest.
+#
+# `tests/metalcase` is the desktop the compositor's own tests run on and has
+# no shell; this one exists because a key typed here travels the whole tree —
+# i8042, kernel, compositor, the terminal's window, the terminal's translator,
+# the shell's stdin — and `desktop_locale_detect` is about the branch of that
+# path where a child asks the terminal for the transitions instead.
+#
+# The terminal is in `init` rather than launched with the compositor's Ctrl+N,
+# so it is the only window and therefore the focused one from the first frame.
+init = ["/bin/compositor", "/bin/terminal"]
+
+assets = ["assets"]
+
+[programs]
+compositor = {}
+terminal = {}
+shell = {}
+toybox = {}
+
+[symlinks]
+"bin/echo" = "/bin/toybox"
+"bin/locale" = "/bin/toybox"

@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod net;
 pub mod pipe;
 pub mod services;
+pub mod surface;
 pub mod shm;
 pub mod system;
 

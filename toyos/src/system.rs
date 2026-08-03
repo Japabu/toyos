@@ -1,7 +1,7 @@
 //! System information and control.
 
 pub use toyos_abi::syscall::RealTime;
-use toyos_abi::syscall::{self, SyscallError};
+use toyos_abi::syscall;
 
 pub const SYSINFO_HEADER_SIZE: usize = 48;
 pub const SYSINFO_ENTRY_SIZE: usize = 64;
@@ -22,6 +22,3 @@ pub fn shutdown() -> ! {
     syscall::shutdown()
 }
 
-pub fn set_keyboard_layout(name: &str) -> Result<(), SyscallError> {
-    syscall::set_keyboard_layout(name)
-}
