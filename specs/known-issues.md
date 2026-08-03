@@ -2171,10 +2171,16 @@ is negligible, so a load-coincident stall is a defect of the pipeline until
 something shows otherwise. Filed here rather than investigated, per the
 one-task-one-agent rule.
 
-Not reproduced in the two other unstaged boots of this config in the same session
-(wake 5817 us and 5280 us, `gaps: none`, `underruns` 0 on both). The capture was
-kept by the harness, in its per-pid scratch directory — which is temporary, so the
-numbers above are the durable record.
+Not reproduced in the three other unstaged boots of this config in the same
+session (wake 5817, 5280 and 6038 us; `gaps: none`, `underruns` 0 on all three).
+The capture was kept by the harness, in its per-pid scratch directory — which is
+temporary, so the numbers above are the durable record.
+
+The same session's landing gate carries a smaller instance of the same shape and
+no harm at all: `audio_tone` smp=8 at `wake_lat 17050us`, 0.73 pipeline depths and
+2.1x the worst wake in that config's recorded 30-run sample, with `gaps: none`,
+`underruns` 0 and `drains` 0. Under the verdict above it passes and is printed,
+which is the intended reading — one boot, one sample, no audio lost.
 
 The nearest suspect on file is §10's ESP-log flush on the idle path and the
 `log_file` flush in `idle_loop` (§3): unbounded, uninterruptible, and in the one
