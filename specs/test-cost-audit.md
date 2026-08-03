@@ -673,7 +673,10 @@ scratch (#120), the `build_toyos_bins` race closed (#121), a `Sched` on every
 registration entry, a parallel phase, a serial tail, gate A alone.
 
 **Every figure below is one session against one HEAD**, both arms green, 238
-tests each, on the host §1's numbers were taken on.
+tests each, on the host §1's numbers were taken on. They were taken before
+2026-08-03 20:22, which is when another worktree claimed the shared sysroot for
+an unlanded ABI delta; every arm attempted after that is a build refusal rather
+than a measurement and none is reported here.
 
 | width | suite | vs serial |
 |---:|---:|---:|
@@ -702,15 +705,25 @@ four boots (30 s). Both remaining levers are the owner's, because both are
 coverage: gate A's four boots must be alone (§2d), and each tail entry is a test
 whose assertion is a margin. Nothing here should be moved to shorten a suite.
 
-**The parallel phase's floor is one test, exactly as §3.3 said, and it is a
+**The parallel phase's floor was one test, exactly as §3.3 said, and it was a
 harder floor than §3.3 thought.** `screen_console_scroll` measured 108 s, 110 s
-and 116 s at widths 1, 4 and 8 — it barely moves, because what it waits on is the
+and 116 s at widths 1, 4 and 8 — it barely moved, because what it waits on is the
 guest reaching a marker rather than host work. At width 4 the phase's 449 s of
-test time compresses to ~190 s of wall clock, a 2.4× on 4 workers, and the
-missing 1.6× is workers idling behind that one job. Two consequences: the queue
-now dispatches screen tasks first (a 110 s job picked up last leaves every other
-lane idle), and **cutting that test compounds with this wave more than §3.1
-compounded with it**.
+test time compressed to ~190 s of wall clock, a 2.4× on 4 workers, and the
+missing 1.6× is workers idling behind that one job.
+
+**Every number above is of the *pre-cut* `screen_console_scroll`.** That test was
+being rewritten in another worktree in the same window and lands at 27.4 s
+against 110.5 s, measured same-session there. So this wave's parallel-phase floor
+is already gone, the §3.3 claim that "past N≈5 the critical path is one test" no
+longer holds, **and the width question has to be re-asked against the new
+duration profile** — the deficit these numbers attribute to one long job will
+redistribute, and the next longest parallel jobs measured here are machine tests
+(`xhci_deaf_registers` ~48 s and `usb_flush_optional` ~39 s at width 4). Nothing
+in this suite dispatches longest-first: the durations that would order it are not
+in the tree, and adding a hand-maintained list of long tests would be a second
+registration to keep true. That is the next lever and it wants the post-cut
+profile, not this one.
 
 **Two classifications in §2d's snapshot were wrong, and the suite said so.**
 
@@ -745,11 +758,14 @@ read the guest's own stamps and are both in the tail.
 **Default width 4, and the honest reason it is not 8.** §4.1 constraint 3 gives
 14 cores against ~3 host threads a guest; 8 wide is 24 threads on 14 cores, and
 the one width-8 run this session that was not invalidated by an unrelated build
-refusal came in at 264.8 s — faster, on a tree whose shared block was still in the
-parallel phase, so not comparable to the 327.5 s above. The measured case for 8
-is therefore not made, and the case *against* is: every failure this work found
-was a wall-clock margin closing under contention, and 8 closes them further. The
-width is a flag; raise it deliberately and read §4.1 constraint 3 first.
+refusal came in at 264.8 s — faster, but on a tree whose shared block was still
+in the parallel phase, so not comparable to the 327.5 s above. **The measured
+case for 8 is not made**, and it should be made again from scratch once the
+`screen_console_scroll` cut lands, since that is what decides how much of a wide
+phase is real work rather than idle lanes. The case *against* is unchanged by
+either: every failure this work found was a wall-clock margin closing under
+contention, and 8 closes them further. The width is a flag; raise it deliberately
+and read §4.1 constraint 3 first.
 
 **What it does not preclude.** The width is a plain number handed to one work
 queue, so the global slot budget §4.1 constraint 3 asks for — a semaphore across
