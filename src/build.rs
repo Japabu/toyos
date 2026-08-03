@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use serde::Deserialize;
@@ -578,8 +579,77 @@ pub fn designate_for_format(path: &Path, len: u64) {
         .unwrap_or_else(|e| panic!("stamp {}: {e}", path.display()));
 }
 
+/// One part of a boot image, built once per key for the life of this process.
+///
+/// A `cargo test` run boots ~76 machines, and 41 of those boots ask for an image
+/// some earlier boot already built; the three `cargo` invocations then take
+/// ~1.4 s between them to answer "nothing changed" (`specs/test-cost-audit.md`
+/// §1.4). In memory and never on disk, so a run gets one answer for the tree it
+/// started against and the next run asks cargo again.
+///
+/// Per part rather than per image, because a part is what a key can be true of:
+/// the kernel is its feature set, the bootloader is its init list, the initrd is
+/// its config and the caller's extra files. That is the same split
+/// [`stage_artifact`] already writes into the artifact names, and it is what
+/// makes this affordable — the 31 kernel feature sets a full run builds share a
+/// handful of initrds, and an initrd is hundreds of megabytes.
+///
+/// What it does not see is a source edit that lands mid-run. A run is a
+/// measurement of one tree, so that is the behaviour wanted either way; a run
+/// that *starts* after a kernel edit still rebuilds every variant it uses.
+struct Memo(std::sync::Mutex<BTreeMap<u64, Arc<Vec<u8>>>>);
+
+impl Memo {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(BTreeMap::new()))
+    }
+
+    fn get(&self, key: u64) -> Option<Arc<Vec<u8>>> {
+        self.0.lock().expect("a build panicked holding the artifact memo").get(&key).cloned()
+    }
+
+    /// The lock is deliberately not held across `make`: a build that panics
+    /// under it would poison the memo, and every later boot would then fail on
+    /// the poison instead of on whatever went wrong with it.
+    fn get_or_build(&self, key: u64, make: impl FnOnce() -> Vec<u8>) -> Arc<Vec<u8>> {
+        if let Some(hit) = self.get(key) {
+            return hit;
+        }
+        let made = Arc::new(make());
+        self.0
+            .lock()
+            .expect("a build panicked holding the artifact memo")
+            .insert(key, Arc::clone(&made));
+        made
+    }
+}
+
+static KERNEL: Memo = Memo::new();
+static BOOTLOADER: Memo = Memo::new();
+static INITRD: Memo = Memo::new();
+
+/// What an initrd is a function of: the config naming the programs, and the
+/// files the caller adds to it. Hashed whole — the test binaries in
+/// `extra_files` are the bulk of the image, and a key over their names and
+/// lengths would call two different builds of one binary the same image.
+fn initrd_key(config_path: &Path, extra_files: &[(String, Vec<u8>)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    config_path.hash(&mut h);
+    for (name, data) in extra_files {
+        name.hash(&mut h);
+        data.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Build a test image from a system.toml config. Returns the raw disk image bytes.
 /// The caller writes these to a temp file for QEMU.
+///
+/// The image itself is never memoized, only the three parts it is made of:
+/// [`image::create_boot_image`] mints a fresh partition GUID per call and writes
+/// it into both the GPT and the ESP, and a boot that did not get its own is a
+/// boot `log_partition_identity` is entitled to catch.
 pub fn build_test_image(
     root: &Path,
     config_path: &Path,
@@ -587,71 +657,80 @@ pub fn build_test_image(
     quiet: bool,
     extra_files: &[(String, Vec<u8>)],
 ) -> Vec<u8> {
+    let config = parse_config(config_path);
+    let init_programs = config.init.join(";");
+    let features = kernel_features.join(",");
+    let kernel_key = key_hash(&["debug", &features]);
+    let bl_key = key_hash(&["debug", &init_programs]);
+    let initrd_key = initrd_key(config_path, extra_files);
+
+    // Nothing left to build, so nothing for the lock, the toolchain check or the
+    // staleness sweep to protect.
+    if let (Some(kernel), Some(bl), Some(initrd)) =
+        (KERNEL.get(kernel_key), BOOTLOADER.get(bl_key), INITRD.get(initrd_key))
+    {
+        return image::create_boot_image(&kernel, &bl, &initrd);
+    }
+
     // Held to the end of the function: the staged artifacts below are read
     // back after the userland build, and a clean landing in between is the
     // same defect as one landing mid-compile.
     let mut lock = buildlock::shared(root, "test image");
     crate::toolchain::ensure(root, false, false, &mut lock);
     let path_env = toolchain::path_with_toyos_ld(root);
-    let config = parse_config(config_path);
 
     invalidate_stale(root, &mut lock, &config_targets(root, &config));
 
-    let init_programs = config.init.join(";");
-    let features = kernel_features.join(",");
-    let mut kernel_extra: Vec<&str> = Vec::new();
-    if !features.is_empty() {
-        kernel_extra.push("--features");
-        kernel_extra.push(&features);
-    }
     // Build and stage under one lock. Releasing before `build_and_assemble` is
     // deliberate: the userland build is long, takes no shared artifact path, and
     // the staged copies below are already immune to another config's rebuild.
-    let (kernel_art, bl_art) = {
+    let (kernel_bytes, bl_bytes) = {
         let _artifact = buildlock::artifact(root);
-        cargo_build(
-            &root.join("kernel"),
-            "x86_64-unknown-none",
-            &kernel_extra,
-            &path_env,
-            &[],
-            quiet,
-        );
-        cargo_build(
-            &root.join("bootloader"),
-            "x86_64-unknown-uefi",
-            &[],
-            &path_env,
-            &[("INIT_PROGRAMS", init_programs.as_str())],
-            quiet,
-        );
-        (
-            stage_artifact(
+        let kernel = KERNEL.get_or_build(kernel_key, || {
+            let mut kernel_extra: Vec<&str> = Vec::new();
+            if !features.is_empty() {
+                kernel_extra.push("--features");
+                kernel_extra.push(&features);
+            }
+            cargo_build(
+                &root.join("kernel"),
+                "x86_64-unknown-none",
+                &kernel_extra,
+                &path_env,
+                &[],
+                quiet,
+            );
+            let staged = stage_artifact(
                 root,
                 &root.join("kernel/target/x86_64-unknown-none/debug/kernel"),
                 "kernel",
-                key_hash(&["debug", &features]),
-            ),
-            stage_artifact(
+                kernel_key,
+            );
+            fs::read(&staged).expect("Failed to read staged kernel")
+        });
+        let bl = BOOTLOADER.get_or_build(bl_key, || {
+            cargo_build(
+                &root.join("bootloader"),
+                "x86_64-unknown-uefi",
+                &[],
+                &path_env,
+                &[("INIT_PROGRAMS", init_programs.as_str())],
+                quiet,
+            );
+            let staged = stage_artifact(
                 root,
                 &root.join("bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi"),
                 "bootloader.efi",
-                key_hash(&["debug", &init_programs]),
-            ),
-        )
+                bl_key,
+            );
+            fs::read(&staged).expect("Failed to read staged bootloader")
+        });
+        (kernel, bl)
     };
 
-    let initrd_bytes = build_and_assemble(
-        root,
-        &config,
-        "debug",
-        &path_env,
-        extra_files,
-        quiet,
-    );
-
-    let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
-    let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
+    let initrd_bytes = INITRD.get_or_build(initrd_key, || {
+        build_and_assemble(root, &config, "debug", &path_env, extra_files, quiet)
+    });
 
     image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes)
 }
