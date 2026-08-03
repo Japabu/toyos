@@ -1,3 +1,9 @@
+//! The `/home` filesystem, named for its destination rather than its present
+//! contents: ToyOS will implement bcachefs and be compatible with its on-disk
+//! format, and this crate is where that lands. What it holds today is an
+//! interim ToyOS-designed format sharing nothing with bcachefs but the
+//! ambition.
+
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(dead_code)]
 
