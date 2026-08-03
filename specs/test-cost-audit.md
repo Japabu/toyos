@@ -617,12 +617,61 @@ entirely on the serial-by-default rule.
 
 Items 5 and 7 are the two the owner has to rule on, and 7 blocks #117.
 
+## 5.1 What waves 1–3 actually bought
+
+Landed 2026-08-03 as `2a3b40b`, `da3d333` and `9801149`. Full suite green after,
+233/233 in 605.7 s. Every figure below is a same-session A/B on one family, the
+two arms alternated against an otherwise identical tree, because the two
+full-run numbers either side of this work were taken in different contention
+regimes and the difference between them is not attributable to it.
+
+| wave | projected | measured | where |
+|---|---:|---:|---|
+| §3.1 opt-level 2 | 30–50 s | **−24.5 s** | screen family, 181.3 → 156.8 s |
+| §3.2 memoize the parts | 57 s | **−3.2 s quiet, −31.3 s loaded** | i8042 family, 11–13 boots |
+| §3.4 two groups | ~19 s | **−17.7 s** | i8042 family, 104.7 → 87.0 s |
+
+**§3.1 landed inside its range and for a different reason than §3.1 gives.**
+The decoder itself is 10× faster — `screen_decoder`, which is the decode alone
+against a bitmap it renders, goes 41 ms → 4 ms. But `screen_console_scroll`, on
+which the whole 30–50 s estimate rests, gains 5 s of its 110 rather than the
+~23 s derived there: its poll loop ends on a marker the guest has to reach, so a
+faster decode buys *samples*, not seconds. The saving is real and it is spread
+across the other twelve screen tests, one to three seconds each, where
+`screendump_until` polls at 100 ms and a 96 ms decode nearly doubled the period.
+
+**§3.2's saving is a function of host load, and its 57 s is the loaded
+regime.** What a hit removes is three `cargo` process spawns and an initrd
+assembly. Under contention — the conditions every archived number in this
+document was taken under — that is 2.4 s a boot, and one A/B/A measured
+133.3 / 104.7 / 138.7 s on twelve tests. On a quiet warm host the same three
+spawns are nearly free, and three consecutive A/B pairs measured 85.1/82.2,
+86.8/83.5, 84.9/81.5 — 0.29 s a boot. Both are true. Since the tree runs 15–25
+suites a day across several agents, the loaded regime is the usual one, but
+§3.2's 57 s should be read as an upper figure rather than a constant.
+
+Its memory cost, which §3.2 does not price: +48 MB of peak RSS on the i8042
+family (2.199 → 2.247 GB), because a family shares one initrd and the memo holds
+one copy of what each boot was building transiently anyway. Whole-image caching
+would have held one ~200 MB initrd per kernel feature set; per-part keying is
+what avoids that.
+
+**§3.4's two groups are not "pure observers of one boot's log", and running
+them found two things this document could not have.** A console is a stream and
+`drain_serial` consumes it, so the first member to wait for a line the
+compositor prints once takes it from every later member; the group now holds the
+console. And **only one QEMU may be up at a time in this process** — every
+instance shares one QMP socket path and one `test-bootable.img` under the pid's
+temp dir, so a guest still up when the next test booted took that boot's socket
+and it died before its first line. **That is the first thing §3.3 has to fix**,
+before any two boots can overlap.
+
 ## 6. What this audit did not measure
 
 - The split of a machine test's time *above* the 3.7 s floor into guest work
   versus host waiting. Per-test, that needs harness instrumentation.
 - Whether opt-level 2 changes any screen test's outcome. §3.1 says it must be
-  re-run; it was not re-run here.
+  re-run; it was not re-run here. Since done: all 15 pass at both levels (§5.1).
 - The 41 redundant image builds and the 12 consolidatable boots were attributed
   by static analysis of `BootOptions` sites. Six tests' shapes could not be
   resolved statically — `boot_partition_identity`, `readdir_bound`,
