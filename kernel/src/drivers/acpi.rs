@@ -259,8 +259,13 @@ static SLP_TYPA: AtomicU16 = AtomicU16::new(0);
 /// [`Table::field`] is the only way to read out of one. Together they are why
 /// no arithmetic here can underflow and no read can leave the table: the
 /// length is validated once, at the only place it enters the module.
+/// Public because the DMAR walk lives in `crate::iommu::vtd`, one table format
+/// per module, and it has to read its bytes the same way everything here does.
+/// What stays private is [`Table::open`] — so a table can still only be
+/// obtained from [`find_table`], with its length and checksum already
+/// validated, which is the invariant the module doc rests on.
 #[derive(Clone, Copy)]
-struct Table {
+pub struct Table {
     base: DirectMap,
     len: usize,
 }
@@ -293,6 +298,12 @@ impl Table {
         Ok(Table { base, len })
     }
 
+    /// The declared length, already bounded by [`Table::open`]. What a walk
+    /// over variable-length entries measures its own progress against.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     /// A copy of the `T` at `offset`, or `None` when the table is not that
     /// long. Unaligned by construction — ACPI tables are byte-packed and the
     /// direct map does not align them.
@@ -300,7 +311,7 @@ impl Table {
     /// The read is a copy rather than a reference on purpose: a `&T` into a
     /// table asserts that all of `T` is valid memory, which for a struct whose
     /// tail runs past the declared length is exactly the claim being checked.
-    fn field<T: Copy>(&self, offset: usize) -> Option<T> {
+    pub fn field<T: Copy>(&self, offset: usize) -> Option<T> {
         let end = offset.checked_add(size_of::<T>())?;
         if end > self.len {
             return None;
@@ -378,7 +389,7 @@ fn xsdt(rsdp_addr: u64) -> Result<Table, TableError> {
 /// defect in the one firmware pointed at first is the whole point, and a
 /// silent second choice is how a machine ends up running on a table nobody
 /// looked at.
-fn find_table(rsdp_addr: u64, signature: &[u8; 4], needed: usize) -> Result<Table, TableError> {
+pub fn find_table(rsdp_addr: u64, signature: &[u8; 4], needed: usize) -> Result<Table, TableError> {
     let xsdt = xsdt(rsdp_addr)?;
     // `Table::open` guarantees `len >= size_of::<SdtHeader>()`, which is what
     // makes this subtraction total. It is the underflow that was here.
