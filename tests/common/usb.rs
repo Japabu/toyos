@@ -1278,6 +1278,222 @@ pub fn xhci_full_speed_device(
     Ok(())
 }
 
+/// A HID interrupt endpoint whose transfer completes with a code the driver did
+/// not expect.
+///
+/// `dispatch_event` requeued a bound device's interrupt TRB only for Success and
+/// Short Packet. **Every other code was dropped where it was read** — no log
+/// line, no requeue, no fault — and that endpoint carries exactly one TRB, so
+/// the device went silent for the rest of the boot with every bind-time line
+/// reading perfectly. A Logitech mouse hot-plugged into the T14 did exactly
+/// that: `HID mouse ready on slot 6 … merges as source 1` at 30.485 s and not
+/// one motion event until it was unplugged at 58.659 s.
+///
+/// Both timings, because they are different states of the driver and neither is
+/// a weaker version of the other: the **fourth** completion is a device that has
+/// been delivering and stops, and the **first** is a freshly configured endpoint
+/// that never delivered at all — which is the shape the T14 showed and the one
+/// whose recovery has to work before any report has ever arrived.
+///
+/// The actuator is a kernel feature and `xhci/hid.rs`'s `stage_break` says why
+/// nothing on the host side can reach it. What it replaces is the completion
+/// code **and the report that transfer delivered**: QEMU really moved a mouse
+/// report into the buffer, so a driver that dispatched it despite the error
+/// would publish a delta it never earned and this gate would pass against the
+/// defect it names. Everything the recovery reads is the controller's own — the
+/// Endpoint State out of the output device context, and three commands the
+/// controller really answers.
+///
+/// Ground truth is host-side: the keys and the pointer delta injected **after**
+/// the staged failure arrive in the guest's own event stream, on a machine
+/// (`i8042=off`, boot-time HID absolute-only) where no other device can produce
+/// either.
+pub fn xhci_hid_break(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    for (features, which) in [
+        (
+            &["xhci-hid-break-first"][..],
+            "the very first completion, before the device ever delivered",
+        ),
+        (
+            &["xhci-hid-break-late"][..],
+            "the fourth completion, after the device had been delivering",
+        ),
+    ] {
+        hid_break_boot(test_config, c_bins, rust_bins, features, which)?;
+    }
+    Ok(())
+}
+
+/// One boot of [`xhci_hid_break`], with the break staged at whichever
+/// completion `feature` names.
+fn hid_break_boot(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+    features: &'static [&'static str],
+    which: &str,
+) -> Result<(), String> {
+    /// The delta the assertion is about, injected after the break is spent.
+    /// Neither component is a number any other move in this boot produces.
+    const DX: i32 = 40;
+    const DY: i32 = -30;
+    /// Typed after the break is spent, and nowhere else in the boot.
+    const WORD: [&str; 5] = ["h", "e", "l", "l", "o"];
+    /// Both QEMU HID devices carry one IN interrupt endpoint at address 1, so
+    /// this is the device's own number for it and the controller's, and a line
+    /// naming either wrongly stops matching.
+    const ENDPOINT: &str = "interrupt endpoint 0x81 (dci 3)";
+
+    let options = BootOptions {
+        profile: Profile::MetalHotplug,
+        qmp: true,
+        // The only keyboard on the machine has to be the one plugged in, or
+        // QEMU delivers the keystrokes over PS/2 and every assertion below
+        // passes with the interrupt endpoint dead.
+        i8042: false,
+        kernel_features: features,
+        ..Default::default()
+    };
+    let argv = qemu::profile_argv(&options);
+    let usb = crate::usb_argv(&argv);
+    for absent in ["usb-kbd", "usb-mouse"] {
+        if usb.iter().any(|d| d.starts_with(absent)) {
+            return Err(format!("{absent} is on the bus at boot; argv has {usb:?}"));
+        }
+    }
+    if !argv.iter().any(|a| a.contains("i8042=off")) {
+        return Err("the i8042 is on; a PS/2 keyboard could deliver instead".to_string());
+    }
+
+    let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+    let boot = qemu.boot_log().to_string();
+    let Some((scale_x, scale_y)) = crate::parse_rel_scale(&boot) else {
+        return Err(format!("the kernel never said what pointer scale it used:\n{boot}"));
+    };
+
+    let result = qemu.run_test_hooked(
+        "test_rs_input_events",
+        Duration::from_secs(60),
+        "===INPUT_READY===",
+        move |socket| {
+            let mut devices = qemu::QmpDevices::open(socket);
+            devices.add("usb-mouse", "xhci1.0", "hidmouse", &[]);
+            devices.add("usb-kbd", "xhci1.0", "hidkbd", &[]);
+            drop(devices);
+            thread::sleep(Duration::from_millis(800));
+
+            // Spend the break. Ten pointer completions and six keyboard ones,
+            // against an injection that strikes the first or the fourth: the
+            // margin is for QEMU coalescing rel events it has not been polled
+            // for, which can only make the count smaller.
+            let mut input = qemu::QmpInput::open(socket);
+            for _ in 0..10 {
+                input.mouse(4, 4, None);
+                thread::sleep(Duration::from_millis(60));
+            }
+            for key in ["a", "b", "c"] {
+                input.keys(&[(key, true), (key, false)]);
+                thread::sleep(Duration::from_millis(60));
+            }
+            drop(input);
+            thread::sleep(Duration::from_millis(300));
+
+            // And the measured phase, every event of which is after the break.
+            let mut input = qemu::QmpInput::open(socket);
+            // The accumulated position clamps at 0, so a move up or left from
+            // the origin is invisible — and with the first completion eaten the
+            // pointer may still be sitting there.
+            input.mouse(200, 200, None);
+            thread::sleep(Duration::from_millis(150));
+            input.mouse(DX, DY, None);
+            thread::sleep(Duration::from_millis(150));
+            for key in WORD {
+                input.keys(&[(key, true), (key, false)]);
+                thread::sleep(Duration::from_millis(30));
+            }
+            drop(input);
+            thread::sleep(Duration::from_millis(200));
+        },
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}\n{}", result.serial, result.stdout));
+    }
+    let log = format!("{boot}{}", result.serial);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} with the break staged at {which}\n{log}"));
+        }
+    }
+
+    // **Delivery first**, because it is what the gate is about and what the
+    // pre-fix driver cannot do: an endpoint whose completion was dropped holds
+    // no TRB and nothing ever puts one back, so everything injected after the
+    // break stays on the host side of the wire.
+    let word: String = WORD.concat();
+    hotplug_delivered(&result.stdout, &word, (DX * scale_x, DY * scale_y)).map_err(|e| {
+        format!("with the break staged at {which}, input never came back: {e}\n{log}")
+    })?;
+
+    // Then that a break was staged at all, and that the line names the device,
+    // the endpoint and the code. Without this the boot above is one where
+    // nothing failed — and the line itself is the instrument: the T14's log
+    // cannot name the code its mouse died of, because the driver discarded it.
+    let named: Vec<&str> = log.lines().filter(|l| l.contains(ENDPOINT)).collect();
+    let want = format!("{ENDPOINT} completed with code 6 (Stall Error); failure 1 of 8");
+    let staged = log.matches(want.as_str()).count();
+    if staged != 2 {
+        return Err(format!(
+            "{staged} endpoint(s) reported a broken completion, want the mouse and the \
+             keyboard: {named:?}\n{log}"
+        ));
+    }
+    for kind in ["xHCI: USB pointer on slot", "xHCI: USB keyboard on slot"] {
+        if !named.iter().any(|l| l.contains(kind)) {
+            return Err(format!("no {kind:?} line among {named:?}\n{log}"));
+        }
+    }
+
+    // The endpoint state the recovery had to be chosen for, read out of the
+    // controller's own output device context. The transfer really completed, so
+    // the endpoint really is Running — `Halted` here would mean the injection
+    // staged a shape this boot cannot produce and everything above proves
+    // something else.
+    let running = log.matches("endpoint 3 is Running, recovering").count();
+    if running != 2 {
+        let states: Vec<&str> = log.lines().filter(|l| l.contains(", recovering")).collect();
+        return Err(format!(
+            "{running} endpoint(s) were found Running after the break, want 2: {states:?}\n{log}"
+        ));
+    }
+
+    // `run_command` logs only refusals, so each of these is the controller
+    // declining a command the endpoint's state did not permit.
+    for illegal in [
+        "Reset Endpoint failed",
+        "Stop Endpoint failed",
+        "Set TR Dequeue failed",
+        "would not clear the halt",
+        "is being let go",
+    ] {
+        if log.contains(illegal) {
+            return Err(format!("{illegal:?} after a single staged failure\n{log}"));
+        }
+    }
+    serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+
+    eprintln!(
+        "  [xhci] a HID interrupt endpoint broken at {which}: both devices named the code, were \
+         found Running and restarted, and {word:?} plus a {:?} pointer delta crossed them \
+         afterwards",
+        (DX * scale_x, DY * scale_y)
+    );
+    Ok(())
+}
+
 /// Devices plugged in **after** the machine has booted.
 ///
 /// The driver enumerated once, from `init`, and `dispatch_event` advanced past
