@@ -832,10 +832,31 @@ pub fn xhci_slow_connect(
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     const FEATURES: &[&str] = &["usb-storage-gate", "xhci-slow-connect"];
-    /// Mirrors `xhci/mod.rs`'s `SLOW_CONNECT_NS`. The two are one wire format
-    /// in the same sense the gate's stamp is: a change to either without the
-    /// other shows up as a failed assertion, not as a silent pass.
+    /// Mirrors `xhci/mod.rs`'s `SLOW_CONNECT_NS` and `PORT_DEBOUNCE_NS`. These
+    /// are one wire format with the kernel's in the same sense the gate's stamp
+    /// is: a change to either without the other shows up as a failed assertion,
+    /// not as a silent pass.
     const HELD_EMPTY_S: f64 = 0.300;
+    const DEBOUNCE_S: f64 = 0.100;
+    /// The earliest instant the driver can name a port. The register reads empty
+    /// until `SLOW_CONNECT_NS` of *boot*, and `await_connect_settle` then wants
+    /// `PORT_DEBOUNCE_NS` of a connect set that has held still and is non-empty.
+    const FIRST_CONNECT_S: f64 = HELD_EMPTY_S + DEBOUNCE_S;
+    /// How much later than that the first port line may be.
+    ///
+    /// The shape it exists to catch is a settle that leaves by `EMPTY_BUS_NS`
+    /// instead of on the device appearing — one second after port power, so
+    /// ~1.1 s of boot — which would enumerate the same two sticks and leave
+    /// every other assertion here green.
+    ///
+    /// 150 ms because the connect becomes visible at a fixed instant on the
+    /// guest's own clock and the settle re-reads it every `PORT_POLL_NS`, so the
+    /// spread is a millisecond of polling and not a share of the host. Six runs
+    /// here — three sequential, three with four concurrent test processes on the
+    /// machine — put the first port line at 0.400-0.402 s, and known-issues
+    /// records one at 0.413 under five-agent load. 13 ms of worst observed
+    /// excursion against 150 of slack, and 700 of clearance to the shape above.
+    const SETTLE_SLACK_S: f64 = 0.150;
 
     let (bytes, lba) = Profile::UsbDisk.usb_disk().expect("UsbDisk declares a disk");
     let image = test_dir().join("usb-slow-connect.img");
@@ -856,18 +877,48 @@ pub fn xhci_slow_connect(
     // The driver looked at an empty bus and kept looking. Without this the test
     // would be green on a driver that never waits and a QEMU that answers
     // instantly, which is exactly the pair that shipped.
+    //
+    // Both instants below are read on the guest's own boot clock, because that
+    // is the clock the injection is written in — `read_portsc` hides the
+    // register while `nanos_since_boot() < SLOW_CONNECT_NS`. Timing the wait as
+    // a delta from `controller started` instead compared a delta against an
+    // absolute window, which silently required the boot to reach its controller
+    // within `PORT_DEBOUNCE_NS`: a budget it has since grown out of, and four
+    // red runs and an afternoon in the driver (known-issues).
     let started = stamp_of(&log, "xHCI: controller started")?;
     // The first line this driver prints about any port at all. Every other
     // per-port line is preceded by that port's connect line, so the first match
     // is the first connect whichever port register it lands on — which the
     // profile does not fix, since a SuperSpeed stick appears on a high one.
     let first_seen = stamp_of(&log, "xHCI: port ")?;
-    let waited = first_seen - started;
-    if waited < HELD_EMPTY_S {
+
+    // Non-vacuity, and it comes first because the floor below rests on it: a
+    // driver that only reached its ports after the window closed read a
+    // populated bus on its first look, and the wait it then did was the ordinary
+    // debounce every boot does.
+    if started >= HELD_EMPTY_S {
         return Err(format!(
-            "the first port was seen {waited:.3} s after the controller started, inside the \
-             {HELD_EMPTY_S} s the ports are held empty for — the injection did not reach the \
-             driver\n{log}"
+            "the controller started at {started:.3} s, past the {HELD_EMPTY_S} s the ports are \
+             held empty for, so nothing in this boot read a hidden port. The boot has outgrown \
+             the injection window: widen SLOW_CONNECT_NS, not this gate\n{log}"
+        ));
+    }
+    // The floor. Nothing can name a port before the register stops lying and the
+    // debounce behind it has elapsed, so an earlier line is a driver that did
+    // not wait or an injection that did not land.
+    if first_seen < FIRST_CONNECT_S {
+        return Err(format!(
+            "the first port was named at {first_seen:.3} s, before the {FIRST_CONNECT_S} s the \
+             held-empty window and the debounce behind it come to — the injection did not reach \
+             the driver\n{log}"
+        ));
+    }
+    // The ceiling.
+    if first_seen > FIRST_CONNECT_S + SETTLE_SLACK_S {
+        return Err(format!(
+            "the first port was named at {first_seen:.3} s, {:.3} s after the connect became \
+             visible — the settle did not end on the device appearing\n{log}",
+            first_seen - FIRST_CONNECT_S
         ));
     }
 
@@ -888,8 +939,9 @@ pub fn xhci_slow_connect(
     let _ = std::fs::remove_file(&image);
 
     eprintln!(
-        "  [usb] ports empty for {HELD_EMPTY_S} s after `controller started`: first connect seen \
-         at +{waited:.3} s, both sticks bound, host bytes verified host-side"
+        "  [usb] controller started at {started:.3} s and the ports read empty to \
+         {HELD_EMPTY_S} s; first port named at {first_seen:.3} s, both sticks bound, host bytes \
+         verified host-side"
     );
     Ok(())
 }
