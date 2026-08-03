@@ -2331,6 +2331,19 @@ where the framebuffer is host RAM. The fix shape is the console's: compose in
 system RAM, hand `Screen` finished pixels. It is a larger job there because the
 compositor's damage model is per-window rather than per-cell.
 
+The compositor now says what those paths move, from inside. Every ~2 s, from a
+composited frame, `FrameStats::report` prints `scanout_rd_bytes` — split into
+`rd_px`, the cursor's `get_pixel` calls, and `rd_bulk`, `fill_rect`'s row
+copies — beside `scanout_wr_bytes`, the frame count and min/max/total composite
+time. Closing this entry is what takes all three read figures to zero.
+`metal_sim_compositor` requires the line and prints it: three frames at
+1920x1080 read 747,144 bytes back for 9,531,840 written, reproducing
+byte-for-byte between runs while the times do not. They are byte counts and
+never a cost — the cost is the uncached read, which QEMU cannot have. One
+caveat for anyone deriving from them: `put_pixel` is uncounted (it is the
+per-pixel path every glyph goes through) and the title-bar sprites write
+through a raw pointer, so `scanout_wr_bytes` is the bulk paths alone.
+
 **The panic console's repaint is ~460 ms on the T14**, measured from inter-line
 gaps in both boot logs (461 ms and 459 ms) in
 `specs/metal-hardware-inventory.md`; five of the six `boot_checkpoint`
