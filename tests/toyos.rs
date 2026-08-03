@@ -168,7 +168,7 @@ const MACHINE_TESTS: &[&str] = &[
     "va_exhaustion",
     "heap_ceiling_recovery",
     "iommu_context_absent",
-    "iommu_write_blocked",
+    "iommu_empty_domain",
     "serial_vocabulary",
 ];
 
@@ -2260,7 +2260,7 @@ fn run_machine_test(
         // Body in `tests/common/iommu.rs`, same reason.
         "iommu_discovery" => common::iommu::iommu_discovery(test_config, c_bins, rust_bins),
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
-        "iommu_write_blocked" => common::iommu::iommu_write_blocked(test_config, c_bins, rust_bins),
+        "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {

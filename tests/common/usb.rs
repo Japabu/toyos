@@ -1751,6 +1751,227 @@ fn hotplug_delivered(stdout: &str, word: &str, want: (i32, i32)) -> Result<(), S
     Ok(())
 }
 
+/// A device pulled and pushed back before the driver has looked at the port
+/// twice — which is what a person replugging a mouse does.
+///
+/// **`PORTSC.CCS` is a level and `PORTSC.CSC` is the edge, and only the edge can
+/// report a gap.** The driver debounces a disconnect for 100 ms before acting on
+/// it, so a device back in the port inside that window reads connected again at
+/// the next look, matching what the driver already believed. Comparing CCS
+/// against that belief therefore sees nothing at all: the old slot stays bound
+/// to a device that is gone, the new one is never enumerated, and the port is
+/// dead until something else disturbs it. xHCI 1.2 §5.4.8 sets CSC on a
+/// '0'→'1' *or* a '1'→'0' transition, so a connected port with CSC set is the
+/// only evidence that the connection was broken in between.
+///
+/// The T14 showed the other half of the same race: the transfers outstanding
+/// when the mouse was pulled completed with a transaction error, and that code
+/// is indistinguishable from a bad cable's. The driver spent a failure out of
+/// the budget, ran Reset Endpoint and a CLEAR_FEATURE(HALT) control transfer
+/// against a device the owner was holding, and then printed advice to unplug it.
+/// Four times, once per ordinary unplug.
+///
+/// The actuator is QEMU's own `device_del`/`device_add` with no wait between
+/// them, which lands both edges inside one debounce. No kernel feature: the
+/// window is 100 ms wide and two QMP commands on a unix socket cross it easily.
+pub fn xhci_flap(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    /// Enough cycles that a driver leaking one slot per cycle is unmistakable,
+    /// and few enough that the guest's input window covers them.
+    const CYCLES: usize = 4;
+    const DX: i32 = 40;
+    const DY: i32 = -30;
+    /// **The device has to come back to the port it left.** Without this QEMU
+    /// hands each `device_add` the next free root-hub port, so a del/add pair is
+    /// a clean disconnect on one port and a clean connect on another — two
+    /// ordinary events, and never the state under test. Measured: the first
+    /// shape of this gate walked ports 5, 6, 7, 8 and staged nothing.
+    const PORT: &str = "1";
+
+    let options = BootOptions {
+        profile: Profile::MetalHotplug,
+        qmp: true,
+        i8042: false,
+        ..Default::default()
+    };
+    let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+    let boot = qemu.boot_log().to_string();
+    let Some((scale_x, scale_y)) = crate::parse_rel_scale(&boot) else {
+        return Err(format!("the kernel never said what pointer scale it used:\n{boot}"));
+    };
+
+    let result = qemu.run_test_hooked(
+        "test_rs_input_events",
+        Duration::from_secs(60),
+        "===INPUT_READY===",
+        move |socket| {
+            let mut devices = qemu::QmpDevices::open(socket);
+            devices.add("usb-mouse", "xhci1.0", "flap0", &[("port", PORT)]);
+            drop(devices);
+            thread::sleep(Duration::from_millis(600));
+
+            for cycle in 0..CYCLES {
+                let mut devices = qemu::QmpDevices::open(socket);
+                // No sleep between the two: both edges have to land inside one
+                // 100 ms debounce, which is the whole point. A fresh id each
+                // cycle because `device_del` releases the old one
+                // asynchronously and a reused one races with that.
+                devices.del(&format!("flap{cycle}"));
+                devices.add(
+                    "usb-mouse",
+                    "xhci1.0",
+                    &format!("flap{}", cycle + 1),
+                    &[("port", PORT)],
+                );
+                drop(devices);
+                // Long enough for the driver to finish acting on the cycle
+                // before the next one starts, so what the log shows is
+                // CYCLES collapsed replugs and not one long blur.
+                thread::sleep(Duration::from_millis(600));
+            }
+
+            // The pointer that is in the port now has to work. Off the origin
+            // first: the accumulated position clamps at 0.
+            let mut input = qemu::QmpInput::open(socket);
+            input.mouse(100, 100, None);
+            thread::sleep(Duration::from_millis(100));
+            input.mouse(DX, DY, None);
+            thread::sleep(Duration::from_millis(200));
+        },
+    );
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}\n{}", result.serial, result.stdout));
+    }
+    let log = &result.serial;
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} while the port was flapped\n{log}"));
+        }
+    }
+
+    // The race was actually staged. Without this the gate would pass on a run
+    // where every replug happened to be seen as two distinct states, which is
+    // the easy case and not the one under test.
+    let collapsed = log.matches("was unplugged and plugged back in between two looks").count();
+    if collapsed == 0 {
+        return Err(format!(
+            "no replug collapsed inside a debounce, so this run never staged the race — the \
+             driver saw every cycle as a distinct disconnect\n{log}"
+        ));
+    }
+
+    // **Bounded slots.** Each cycle's device must give its slot back before the
+    // next takes one. A driver that enumerates on top of the old slot marches
+    // through fresh ids — 6, 7, 8, 9 on the T14 — and leaves every one enabled.
+    let enabled = slot_ids(log, "enabled");
+    let disabled = slot_ids(log, "disabled");
+    let live: Vec<u8> = {
+        let mut left = disabled.clone();
+        enabled.iter().copied().filter(|id| !take_one(&mut left, *id)).collect()
+    };
+    if live.len() != 1 {
+        return Err(format!(
+            "{} slot(s) enabled and never disabled ({live:?}) after {CYCLES} replugs; exactly \
+             the one in the port now should be live\nenabled {enabled:?}\ndisabled \
+             {disabled:?}\n{log}",
+            live.len()
+        ));
+    }
+    let mut distinct = enabled.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() > 2 {
+        return Err(format!(
+            "the driver used {} distinct slot ids across {CYCLES} replugs ({distinct:?}) — a slot \
+             is not being reaped before the next enumeration takes one\n{log}",
+            distinct.len()
+        ));
+    }
+
+    // **Sources reclaimed.** One pointer is in the port at a time, so every
+    // bind must print the same button-table entry. A leak marches 2, 3, 4, 5.
+    let sources: Vec<u32> = crate::parse_pointer_sources(log).iter().map(|(_, s)| *s).collect();
+    if sources.is_empty() {
+        return Err(format!("no pointer bound during the flap at all\n{log}"));
+    }
+    if sources.iter().any(|s| *s != sources[0]) {
+        return Err(format!(
+            "pointer sources were {sources:?} — a replugged pointer took a fresh button-table \
+             entry, so the one its predecessor held was never given back\n{log}"
+        ));
+    }
+
+    // **No recovery against a device that is not there.** Every one of these is
+    // the driver treating an unplug as a broken cable: a failure out of the
+    // budget, a control transfer that spends the deadline failing, and advice
+    // to unplug something already in the owner's hand.
+    for wrong in [
+        "is being let go",
+        "could not be restarted",
+        "endpoint 3 is Halted, recovering",
+    ] {
+        if let Some(line) = log.lines().find(|l| l.contains(wrong)) {
+            return Err(format!(
+                "the driver ran recovery against a device that had been unplugged: {line:?}\n{log}"
+            ));
+        }
+    }
+    // And the line that says it declined to, which is the positive half: the
+    // errors really did arrive and really were attributed to the disconnect.
+    let superseded = log.matches("as its port went away; leaving it to the disconnect").count();
+
+    // The device in the port now delivers. This is what stops every assertion
+    // above from passing on a driver that reaped everything and enumerated
+    // nothing.
+    let pointer = crate::parse_mouse_events(&result.stdout);
+    let want = (DX * scale_x, DY * scale_y);
+    let deltas: Vec<(i32, i32)> = pointer
+        .windows(2)
+        .map(|w| (w[1].x as i32 - w[0].x as i32, w[1].y as i32 - w[0].y as i32))
+        .collect();
+    if !deltas.contains(&want) {
+        return Err(format!(
+            "no pointer event moved by {want:?} after {CYCLES} replugs; deltas seen: {deltas:?} — \
+             the port is bound to a device that is no longer in it\n{}",
+            result.stdout
+        ));
+    }
+
+    eprintln!(
+        "  [xhci] {CYCLES} replugs collapsed inside the debounce ({collapsed} seen as such): \
+         {} slot(s) enabled and all but one reaped, one button-table entry reused throughout, \
+         {superseded} transfer error(s) attributed to the disconnect instead of recovery, and \
+         the pointer in the port still delivers",
+        enabled.len()
+    );
+    Ok(())
+}
+
+/// Every slot id in an `xHCI: slot 3 enabled …` or `… disabled` line, in order.
+fn slot_ids(log: &str, verb: &str) -> Vec<u8> {
+    log.lines()
+        .filter_map(|line| {
+            let rest = line.split("xHCI: slot ").nth(1)?;
+            let (id, tail) = rest.split_once(' ')?;
+            tail.starts_with(verb).then(|| id.parse().ok())?
+        })
+        .collect()
+}
+
+/// Remove one occurrence of `id`, and say whether there was one.
+fn take_one(pool: &mut Vec<u8>, id: u8) -> bool {
+    match pool.iter().position(|x| *x == id) {
+        Some(at) => {
+            pool.remove(at);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Everything a device that has been pulled has to leave behind.
 fn hotplug_unbound(log: &str) -> Result<(), String> {
     for want in [
