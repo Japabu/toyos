@@ -142,6 +142,22 @@ branch, so a non-fast-forward means someone landed in between. Under the lock
 that cannot happen, which makes the flag a check on the lock rather than a
 fallback.
 
+**Step 1 has no tooling, and the first landing found out what that costs.**
+Nothing in the tree takes an integration lock; `buildlock` has no name for one.
+It also cannot be the `state` lock the builds take in `Scope::Global` — step 3's
+gate *is* a build, and it would queue behind its own holder. So the lock has to
+be a distinct file in `<common-dir>/toyos-build-locks/`, taken exclusively for
+steps 2-4 and nothing else. Until a command exists for it, an agent has to hold
+it by hand, and an agent who does not know to is not stopped by anything: during
+the first landing's 10-minute gate another agent put three commits on main, and
+what caught it was `--ff-only`, exactly as the paragraph above says — a check on
+a lock nobody was holding. Steps 2-4 then had to be redone.
+
+The redo is cheap only when the code delta is provable: `git diff <gated>..HEAD`
+after the second merge showed markdown alone, so the 233-test run carried and
+only the audio family was re-run before the fast-forward, both inside one hold.
+A merge that moves code has no such shortcut and pays the full gate again.
+
 **The gate runs inside the lock.** That queues landings, and the queue is the
 honest cost of a gate that means something: CLAUDE.md's concurrent-measurement
 rule says a suite perturbed by five other agents' QEMU boots is not evidence.
