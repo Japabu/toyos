@@ -48,8 +48,7 @@ pub fn boot_partition_identity(
 ) -> Result<(), String> {
     let repo = super::compile::repo_root();
     let config = repo.join("tests/metalcase/system.toml");
-    let dir = std::env::temp_dir().join(format!("toyos-tests-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create the test directory: {e}"))?;
+    let dir = super::lane::dir();
 
     // Built here rather than by `boot_with_options`, because the crafted NVMe
     // table below has to carry this image's partition GUID and the image does

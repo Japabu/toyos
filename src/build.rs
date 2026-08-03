@@ -753,6 +753,14 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(Str
 
     let mut results = Vec::new();
 
+    // Every build→read pair below is under one hold, for the reason the
+    // "Artifact staging" section above gives: cargo keys an artifact path on
+    // (crate, target, profile), so a second `cargo test` in this tree writes the
+    // very `.so` and test binaries this one reads back. Between the `read_dir`
+    // and the `read` that was enough to kill a run outright — four concurrent
+    // suites, one dead on `Result::unwrap()` on a `NotFound` naming no file.
+    let _artifact = buildlock::artifact(root);
+
     // Build cdylib subcrates first
     let mut lib_search_dirs = Vec::new();
     for entry in fs::read_dir(crate_path).unwrap() {
@@ -783,7 +791,9 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(Str
             let so_entry = so_entry.unwrap();
             let name = so_entry.file_name().to_str().unwrap().to_string();
             if name.ends_with(".so") {
-                let data = fs::read(so_entry.path()).unwrap();
+                let path = so_entry.path();
+                let data = fs::read(&path)
+                    .unwrap_or_else(|e| panic!("read the cdylib {}: {e}", path.display()));
                 results.push((name, data));
             }
         }
@@ -822,7 +832,8 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(Str
                 .to_string();
             let binary = bin_dir.join(&name);
             if binary.exists() {
-                let data = fs::read(&binary).unwrap();
+                let data = fs::read(&binary)
+                    .unwrap_or_else(|e| panic!("read the test binary {}: {e}", binary.display()));
                 results.push((name, data));
             }
         }

@@ -4,15 +4,31 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::{fs, thread};
 
 use super::compile;
 
 /// When true, serial output is printed to stderr as it arrives.
 pub static VERBOSE: AtomicBool = AtomicBool::new(false);
 
-/// Distinguishes the wav capture of each QEMU boot within one test process.
+/// Distinguishes every file one QEMU boot owns from every other boot's within
+/// one test process — the wav capture, the UART log, the QMP socket, the
+/// screendump, and the bootable image itself.
 static BOOT_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Guests that have been booted and not yet dropped.
+///
+/// Gate A's numbers were recorded with one QEMU on the host and nothing else
+/// (`tests/audio-baseline.toml`), so "the parallel phase has drained" is a
+/// precondition of the audio block rather than a property of where it sits in
+/// `main`. This is what lets it be asserted instead of arranged — see
+/// [`live_instances`].
+static LIVE: AtomicU32 = AtomicU32::new(0);
+
+/// How many guests are up right now, across every thread.
+pub fn live_instances() -> u32 {
+    LIVE.load(Ordering::SeqCst)
+}
 
 /// The hardware shape QEMU presents to the guest.
 ///
@@ -854,6 +870,10 @@ pub struct QemuInstance {
     usb_image: PathBuf,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
+    /// The image this boot built for itself, which is the only one it may
+    /// delete: a [`BootOptions::boot_image`] belongs to the test that staged it
+    /// and is often read back after the guest is gone.
+    own_boot_image: Option<PathBuf>,
     boot_log: String,
 }
 
@@ -942,21 +962,27 @@ impl QemuInstance {
         }
         let disk = build_boot_image(test_crate, c_tests, rust_tests, &features);
 
-        let pid = std::process::id();
-        let test_dir = env::temp_dir().join(format!("toyos-tests-{pid}"));
-        fs::create_dir_all(&test_dir).ok();
+        let test_dir = super::lane::dir();
+        let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
 
+        // Named for the boot rather than for the process. Two guests handed one
+        // image file is not a slow test, it is a guest reading bytes another
+        // boot is in the middle of writing — and the lane directory alone would
+        // not settle it, since one test may hold two instances at once.
         let boot_image = match &options.boot_image {
-            Some(path) => path.clone(),
+            Some(staged) => staged.clone(),
             None => {
-                let path = test_dir.join("test-bootable.img");
+                let path = test_dir.join(format!("boot-{seq}.img"));
                 fs::write(&path, &disk).expect("Failed to write test boot image");
                 path
             }
         };
+        let own_boot_image = options.boot_image.is_none().then(|| boot_image.clone());
 
         // Named by size, so two profiles that disagree about the device do
-        // not hand each other a filesystem formatted for the wrong one.
+        // not hand each other a filesystem formatted for the wrong one. Reused
+        // across the boots of one lane and shared with no other — which is what
+        // `super::lane` is for, and why this is not a per-boot name.
         let nvme_bytes = options.profile.shape().nvme_bytes;
         let nvme_image = match &options.nvme_image {
             Some(path) => path.clone(),
@@ -991,7 +1017,6 @@ impl QemuInstance {
             }
         };
 
-        let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
         let audio_wav = test_dir.join(format!("audio-{seq}.wav"));
         let _ = fs::remove_file(&audio_wav);
 
@@ -1017,7 +1042,18 @@ impl QemuInstance {
             &options,
         );
         spawn_and_wait_ready(
-            qemu, &options, audio_wav, uart_log, nvme_image, usb_image, qmp_socket, screendump,
+            qemu,
+            &options,
+            Files {
+                seq,
+                audio_wav,
+                uart_log,
+                nvme_image,
+                usb_image,
+                qmp_socket,
+                screendump,
+                own_boot_image,
+            },
         )
     }
 
@@ -1319,6 +1355,12 @@ impl Drop for QemuInstance {
         if let Some(socket) = &self.qmp_socket {
             let _ = fs::remove_file(socket);
         }
+        // A per-boot image is hundreds of megabytes and a full run makes ~76 of
+        // them; the shared name used to make that one file.
+        if let Some(image) = &self.own_boot_image {
+            let _ = fs::remove_file(image);
+        }
+        LIVE.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1767,22 +1809,37 @@ fn qemu_command(
     qemu
 }
 
-fn spawn_and_wait_ready(
-    mut qemu: Command,
-    options: &BootOptions,
+/// Every file one boot owns, so that adding another does not lengthen a
+/// parameter list eight paths long.
+struct Files {
+    seq: u32,
     audio_wav: PathBuf,
     uart_log: PathBuf,
     nvme_image: PathBuf,
     usb_image: PathBuf,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
-) -> QemuInstance {
+    own_boot_image: Option<PathBuf>,
+}
+
+fn spawn_and_wait_ready(mut qemu: Command, options: &BootOptions, files: Files) -> QemuInstance {
+    let Files {
+        seq,
+        audio_wav,
+        uart_log,
+        nvme_image,
+        usb_image,
+        qmp_socket,
+        screendump,
+        own_boot_image,
+    } = files;
+
     qemu.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
     if VERBOSE.load(Ordering::Relaxed) {
-        eprintln!("[qemu] Launching QEMU...");
+        eprintln!("[qemu {seq}] Launching QEMU...");
     }
     let mut child = qemu.spawn().expect("Failed to launch QEMU");
 
@@ -1799,7 +1856,10 @@ fn spawn_and_wait_ready(
                     full_log.push_str(&line);
                     full_log.push('\n');
                     if VERBOSE.load(Ordering::Relaxed) {
-                        eprintln!("[serial] {line}");
+                        // The boot's own number, because `--nocapture` on a
+                        // wide run is several guests talking into one terminal
+                        // and an unattributed line is worse than no line.
+                        eprintln!("[serial {seq}] {line}");
                     }
                     if tx.send(line).is_err() {
                         break;
@@ -1819,6 +1879,10 @@ fn spawn_and_wait_ready(
         wait_for_ready(&mut child, &rx, options, &uart_log)
     };
 
+    // Counted from here rather than from the spawn: every panic inside
+    // `wait_for_ready` kills the child on its way out and never builds a value
+    // to drop, so a guest that failed to come up must not be left on the books.
+    LIVE.fetch_add(1, Ordering::SeqCst);
     QemuInstance {
         child,
         stdin,
@@ -1830,6 +1894,7 @@ fn spawn_and_wait_ready(
         usb_image,
         qmp_socket,
         screendump,
+        own_boot_image,
         boot_log,
     }
 }

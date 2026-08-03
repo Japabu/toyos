@@ -52,9 +52,7 @@ fn block_of(blocks: u64, index: i64) -> u64 {
 }
 
 fn test_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("toyos-tests-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create the test directory");
-    dir
+    super::lane::dir()
 }
 
 fn sparse(path: &Path, bytes: u64) -> std::fs::File {

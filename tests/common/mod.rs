@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 pub mod audio;
 #[allow(dead_code)]
+pub mod lane;
+#[allow(dead_code)]
 pub mod compile;
 #[allow(dead_code)]
 pub mod faults;

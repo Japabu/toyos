@@ -66,9 +66,7 @@ fn blob() -> Vec<u8> {
 const UNTOUCHED: [&str; 3] = ["EFI/BOOT/BOOTx64.EFI", "toyos/kernel.elf", "toyos/initrd.img"];
 
 fn test_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("toyos-tests-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create the test directory");
-    dir
+    super::lane::dir()
 }
 
 /// Where a partition sits inside a GPT disk image, in bytes, and the unique

@@ -31,10 +31,9 @@ pub fn foreign_disk_untouched(
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     const BYTES: u64 = 128 * 1024 * 1024;
-    // The same directory `boot_with_options` uses, created here because this
+    // The same directory `boot_with_options` uses, named here because this
     // image has to exist before the boot that must not touch it.
-    let dir = std::env::temp_dir().join(format!("toyos-tests-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create the test directory");
+    let dir = super::lane::dir();
     let image = dir.join("foreign-disk.img");
     foreign_disk_image(&image, BYTES);
     let before = write_fingerprint(&image, BYTES);

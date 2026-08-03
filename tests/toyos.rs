@@ -17,6 +17,45 @@ struct TestDef {
     check: fn(&TestResult) -> bool,
 }
 
+/// Whether a test may run while other guests are up.
+///
+/// Every entry of [`MACHINE_TESTS`] and [`SCREEN_TESTS`] answers this or does
+/// not compile. That is `specs/test-cost-audit.md` §3.3's serial-by-default rule
+/// in its stronger form: the rule's whole safety argument is that *forgetting*
+/// must cost a slow suite rather than a wrong measurement, and a name that
+/// cannot be added without an answer cannot be forgotten at all.
+///
+/// **Where the answer is not known it is [`Sched::Serial`].** A wrong `Parallel`
+/// is a test measuring a machine it does not have to itself, and neither the
+/// suite nor the agent reading its red can tell that from a real defect.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sched {
+    /// May run beside other guests. Its assertions hold on a host running as
+    /// many QEMUs as the width allows.
+    Parallel,
+    /// Runs in the serial tail: one guest on the host, after the parallel phase
+    /// has drained. Everything with a wall-clock margin on either clock, a
+    /// debounce window staged from the host, or a rate.
+    Serial,
+}
+
+/// The width with no `--jobs`, and where it came from.
+///
+/// 14 cores, `smp: 2` per guest plus QEMU's own I/O thread — about three host
+/// threads each, so four is the honest ceiling for one suite
+/// (`specs/test-cost-audit.md` §4.1 constraint 3) and eight oversubscribes the
+/// machine. Measured both ways against one HEAD in one session; §5.2 records
+/// what each gave.
+const DEFAULT_WIDTH: usize = 4;
+
+/// The one boot that carries every Rust and C test.
+///
+/// Declared here for the same reason each list entry is: it is a scheduling
+/// answer and it has to be visible. 153 tests sharing one guest, each with a 5
+/// or 10 second timeout against a median under a tenth of a second, and no
+/// assertion in the block reads a clock.
+const SHARED_BLOCK: Sched = Sched::Parallel;
+
 // Rust helper binaries that are spawned by tests, not tests themselves.
 const RUST_SKIP: &[&str] = &[
     "segfault_child",
@@ -67,20 +106,20 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 /// Feature-carrying tests last: each distinct kernel feature set is one more
 /// kernel rebuild, and ending on one leaves the plain-kernel tests above it
 /// untouched by the thrash.
-const SCREEN_TESTS: &[&str] = &[
-    "screen_decoder",
-    "screen_diag_boot",
-    "screen_console_shell",
-    "screen_console_clear",
-    "screen_console_scroll",
-    "screen_i8042_health",
-    "screen_recoverable_untouched",
-    "screen_early_panic",
-    "screen_late_panic",
-    "screen_paged_scrollback",
-    "screen_panic_muted",
-    "screen_console_panic",
-    "screen_fatal_halt",
+const SCREEN_TESTS: &[(&str, Sched)] = &[
+    ("screen_decoder", Sched::Parallel),
+    ("screen_diag_boot", Sched::Parallel),
+    ("screen_console_shell", Sched::Parallel),
+    ("screen_console_clear", Sched::Parallel),
+    ("screen_console_scroll", Sched::Parallel),
+    ("screen_i8042_health", Sched::Parallel),
+    ("screen_recoverable_untouched", Sched::Parallel),
+    ("screen_early_panic", Sched::Parallel),
+    ("screen_late_panic", Sched::Parallel),
+    ("screen_paged_scrollback", Sched::Parallel),
+    ("screen_panic_muted", Sched::Parallel),
+    ("screen_console_panic", Sched::Parallel),
+    ("screen_fatal_halt", Sched::Parallel),
 ];
 
 /// What `screen_console_shell` types, and what it then looks for on its own.
@@ -111,72 +150,85 @@ const GRAFFITI: [u8; 3] = [0x00, 0xC0, 0x00];
 /// A few adjacent runs of names share *one* boot between them — see
 /// [`group_boot`], which is what makes adjacency here load-bearing rather than
 /// tidy.
-const MACHINE_TESTS: &[&str] = &[
-    "ioapic_topology",
-    "input_merge",
-    "metal_sim_input",
+const MACHINE_TESTS: &[(&str, Sched)] = &[
+    ("ioapic_topology", Sched::Parallel),
+    ("input_merge", Sched::Parallel),
+    ("metal_sim_input", Sched::Parallel),
     // One boot from here to `metal_sim_compositor_stall` (`METAL_SIM_DESKTOP`).
-    "metal_sim_compositor",
-    "metal_sim_window_caps",
-    "metal_sim_ipc_hostile_peer",
-    "metal_sim_compositor_stall",
-    "metal_sim_pointer_churn",
-    "metal_sim_null_audio",
-    "netd_connection_caps",
-    "foreign_disk_untouched",
-    "boot_partition_identity",
-    "double_fault_stack",
-    "diskless_boot",
-    "xhci_many_devices",
-    "xhci_second_controller",
-    "xhci_two_controllers",
-    "xhci_msi_only",
-    "xhci_no_interrupt",
-    "nvme_large_device",
-    "nvme_wide_sector",
-    "iommu_discovery",
-    "readdir_bound",
-    "i8042_health",
+    ("metal_sim_compositor", Sched::Parallel),
+    ("metal_sim_window_caps", Sched::Parallel),
+    ("metal_sim_ipc_hostile_peer", Sched::Parallel),
+    ("metal_sim_compositor_stall", Sched::Parallel),
+    // A thousand pointer packets paced from the host, with a settle sized for
+    // "QEMU coalescing rel events it has not been polled for".
+    ("metal_sim_pointer_churn", Sched::Serial),
+    // A host-measured drain rate with an 8 s ceiling on a 3.3 s expectation.
+    // Not gate A, but the same instrument: what it measures is how fast a
+    // client's audio leaves the machine.
+    ("metal_sim_null_audio", Sched::Serial),
+    ("netd_connection_caps", Sched::Parallel),
+    ("foreign_disk_untouched", Sched::Parallel),
+    ("boot_partition_identity", Sched::Parallel),
+    ("double_fault_stack", Sched::Parallel),
+    ("diskless_boot", Sched::Parallel),
+    ("xhci_many_devices", Sched::Parallel),
+    ("xhci_second_controller", Sched::Parallel),
+    ("xhci_two_controllers", Sched::Parallel),
+    ("xhci_msi_only", Sched::Parallel),
+    ("xhci_no_interrupt", Sched::Parallel),
+    ("nvme_large_device", Sched::Parallel),
+    ("nvme_wide_sector", Sched::Parallel),
+    ("iommu_discovery", Sched::Parallel),
+    ("readdir_bound", Sched::Parallel),
+    ("i8042_health", Sched::Parallel),
     // And one from here to `i8042_mouse` (`I8042_TRACE`).
-    "i8042_keyboard",
-    "i8042_no_spurious_wake",
-    "i8042_mouse",
-    "i8042_absent",
-    "i8042_quarantine",
-    "i8042_budget_expiry",
-    "i8042_fadt_denial",
-    "i8042_kbd_echo",
-    "i8042_undecoded_bytes",
-    "i8042_health_cadence",
-    "xhci_xecp_walk",
-    "xhci_slot_exhaustion",
-    "usb_storage_gate",
-    "usb_storage_shapes",
-    "usb_refused_disk_first",
-    "usb_storage_write_error",
-    "usb_flush_optional",
-    "xhci_deaf_registers",
-    "xhci_slow_connect",
-    "xhci_portsc_rw1c",
-    "usb_transport_break",
-    "xhci_full_speed_device",
-    "xhci_hotplug",
-    "xhci_flap",
-    "xhci_hid_break",
-    "xhci_descriptor_walk",
-    "esp_filesystem",
-    "toybox_cp_volume",
-    "kernel_log_file",
-    "late_storage_connect",
-    "log_backing_read_error",
-    "log_partition_layout",
-    "log_partition_identity",
-    "cache_eviction",
-    "va_exhaustion",
-    "heap_ceiling_recovery",
-    "iommu_context_absent",
-    "iommu_empty_domain",
-    "serial_vocabulary",
+    ("i8042_keyboard", Sched::Parallel),
+    ("i8042_no_spurious_wake", Sched::Parallel),
+    ("i8042_mouse", Sched::Parallel),
+    // Two boots of one machine compared on the guest's own `Boot: complete`
+    // with a 300 ms allowance, which is the whole assertion.
+    ("i8042_absent", Sched::Serial),
+    ("i8042_quarantine", Sched::Parallel),
+    ("i8042_budget_expiry", Sched::Parallel),
+    ("i8042_fadt_denial", Sched::Serial),
+    ("i8042_kbd_echo", Sched::Parallel),
+    ("i8042_undecoded_bytes", Sched::Parallel),
+    // Its verdict is a cadence, and its absence is the assertion.
+    ("i8042_health_cadence", Sched::Serial),
+    ("xhci_xecp_walk", Sched::Parallel),
+    ("xhci_slot_exhaustion", Sched::Parallel),
+    ("usb_storage_gate", Sched::Parallel),
+    ("usb_storage_shapes", Sched::Parallel),
+    ("usb_refused_disk_first", Sched::Parallel),
+    ("usb_storage_write_error", Sched::Parallel),
+    ("usb_flush_optional", Sched::Parallel),
+    ("xhci_deaf_registers", Sched::Parallel),
+    // Mirrors the kernel's `SLOW_CONNECT_NS` as a constant of its own and
+    // bounds the first port line from *both* sides.
+    ("xhci_slow_connect", Sched::Serial),
+    ("xhci_portsc_rw1c", Sched::Parallel),
+    ("usb_transport_break", Sched::Parallel),
+    ("xhci_full_speed_device", Sched::Parallel),
+    // The three below stage plug and unplug against debounce windows, from the
+    // host, with fixed waits between the injection and the assertion.
+    ("xhci_hotplug", Sched::Serial),
+    ("xhci_flap", Sched::Serial),
+    ("xhci_hid_break", Sched::Serial),
+    ("xhci_descriptor_walk", Sched::Parallel),
+    ("esp_filesystem", Sched::Parallel),
+    ("toybox_cp_volume", Sched::Parallel),
+    ("kernel_log_file", Sched::Parallel),
+    // `xhci_slow_connect`'s shape against the disk's port.
+    ("late_storage_connect", Sched::Serial),
+    ("log_backing_read_error", Sched::Parallel),
+    ("log_partition_layout", Sched::Parallel),
+    ("log_partition_identity", Sched::Parallel),
+    ("cache_eviction", Sched::Parallel),
+    ("va_exhaustion", Sched::Parallel),
+    ("heap_ceiling_recovery", Sched::Parallel),
+    ("iommu_context_absent", Sched::Parallel),
+    ("iommu_empty_domain", Sched::Parallel),
+    ("serial_vocabulary", Sched::Parallel),
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -4040,16 +4092,16 @@ fn run_machine_test(
             //
             // And it has to be an *unformatted* namespace, which is not what a
             // full run leaves behind: the image is named by device size and
-            // reused, so `nvme_large_device` formats it earlier in
-            // MACHINE_TESTS and this boot then only mounts — a handful of
-            // metadata blocks and no eviction at all. Measured exactly that
+            // reused within a lane, so a `nvme_large_device` that ran in this
+            // one formatted it and this boot would then only mount — a handful
+            // of metadata blocks and no eviction at all. Measured exactly that
             // way: green alone, red in the suite. Removing it restores the
-            // precondition, and duplicating the harness's naming here is safe
-            // in the only direction that matters: if that name ever drifts,
-            // the boot mounts instead of formatting and the turnover
-            // assertion below goes red rather than vacuously green.
-            let stale = std::env::temp_dir()
-                .join(format!("toyos-tests-{}", std::process::id()))
+            // precondition whichever lane this landed in, and duplicating the
+            // harness's naming here is safe in the only direction that matters:
+            // if that name ever drifts, the boot mounts instead of formatting
+            // and the turnover assertion below goes red rather than vacuously
+            // green.
+            let stale = common::lane::dir()
                 .join(format!("test-nvme-{}.img", qemu::NVME_T14_BYTES));
             let _ = fs::remove_file(&stale);
 
@@ -5729,6 +5781,183 @@ fn run_debug_mode(c_tests: &[(String, Vec<u8>)], rust_bins: &[(String, Vec<u8>)]
     eprintln!("[debug] Shutting down QEMU...");
 }
 
+/// What one worker takes off the queue.
+///
+/// A boot, or the run of adjacent boots that share one guest — never a bare
+/// test name, because [`group_boot`] makes adjacency in [`MACHINE_TESTS`]
+/// load-bearing and a group split across two workers would boot two machines
+/// and drain one console between them.
+enum Task<'a> {
+    /// Every Rust and C test, on the one guest they share.
+    Shared(Vec<&'a TestDef>),
+    Machine(Vec<&'static str>),
+    Screen(&'static str),
+}
+
+/// What the suite has to say about one test once it has finished.
+struct Outcome {
+    name: String,
+    /// `None` is a pass.
+    reason: Option<String>,
+    elapsed: Duration,
+}
+
+/// The binaries and config every task boots with.
+struct Bins<'a> {
+    test_config: &'a Path,
+    c_bins: &'a [(String, Vec<u8>)],
+    rust_bins: &'a [(String, Vec<u8>)],
+}
+
+fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Outcome>) {
+    let send = |name: String, reason: Option<String>, elapsed: Duration| {
+        let _ = report.send(Outcome { name, reason, elapsed });
+    };
+    match task {
+        Task::Shared(tests) => {
+            // The boot itself can fail, and it used to take the run with it.
+            // Reporting the block's tests against its reason keeps the count
+            // honest and says which one it died on.
+            let mut done = 0usize;
+            let outcome = catching(|| {
+                let mut qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
+                for test in &tests {
+                    let start = Instant::now();
+                    let result = qemu.run_test(&test.qemu_name, test.timeout);
+                    let reason = (!(test.check)(&result)).then(|| {
+                        result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("exit code {:?}", result.exit_code))
+                    });
+                    done += 1;
+                    send(test.name.clone(), reason, start.elapsed());
+                }
+                Ok(())
+            });
+            if let Err(reason) = outcome {
+                for test in &tests[done..] {
+                    send(test.name.clone(), Some(reason.clone()), Duration::ZERO);
+                }
+            }
+        }
+        Task::Machine(names) => {
+            // Dropped with the task, so no group's guest outlives the worker
+            // that booted it.
+            let mut held: Grouped = None;
+            for name in names {
+                let start = Instant::now();
+                let outcome = catching(|| {
+                    run_machine_test(name, bins.test_config, bins.c_bins, bins.rust_bins, &mut held)
+                });
+                send(name.to_string(), outcome.err(), start.elapsed());
+            }
+        }
+        Task::Screen(name) => {
+            let start = Instant::now();
+            let outcome =
+                catching(|| run_screen_test(name, bins.test_config, bins.c_bins, bins.rust_bins));
+            send(name.to_string(), outcome.err(), start.elapsed());
+        }
+    }
+}
+
+/// Run `tasks` on `width` workers, printing each outcome as it lands.
+///
+/// One implementation for both phases: **the serial tail is this at width 1**,
+/// so "serial" is a number rather than a second code path that could drift from
+/// this one. It returns only once every worker has joined, which is what makes
+/// "the parallel phase has drained" a fact about the call and not about where
+/// it sits in `main`.
+fn run_phase(tasks: Vec<Task<'_>>, width: usize, bins: &Bins<'_>) -> Vec<Outcome> {
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+    let width = width.clamp(1, tasks.len());
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(tasks));
+    let mut all = Vec::new();
+    thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel::<Outcome>();
+        for lane in 0..width {
+            let tx = tx.clone();
+            let queue = &queue;
+            scope.spawn(move || {
+                common::lane::enter(lane);
+                loop {
+                    let next =
+                        queue.lock().expect("a worker panicked holding the queue").pop_front();
+                    let Some(task) = next else { return };
+                    run_task(task, bins, &tx);
+                }
+            });
+        }
+        drop(tx);
+        for outcome in rx {
+            match &outcome.reason {
+                None => eprintln!("  PASS  {}  ({:.0?})", outcome.name, outcome.elapsed),
+                Some(reason) => {
+                    eprintln!("FAIL {}: {reason}", outcome.name);
+                    eprintln!("  FAIL  {}  ({:.0?})", outcome.name, outcome.elapsed);
+                }
+            }
+            all.push(outcome);
+        }
+    });
+    all
+}
+
+/// The selected machine tests as boots: a run of adjacent names of one group is
+/// one task.
+fn machine_tasks(selected: &[(&'static str, Sched)]) -> Vec<(Sched, Vec<&'static str>)> {
+    let mut out: Vec<(Sched, Vec<&'static str>)> = Vec::new();
+    for &(name, sched) in selected {
+        let joins = group_of(name).is_some()
+            && out.last().is_some_and(|(_, names)| {
+                group_of(names[names.len() - 1]) == group_of(name)
+            });
+        match out.last_mut() {
+            Some((_, names)) if joins => names.push(name),
+            _ => out.push((sched, vec![name])),
+        }
+    }
+    out
+}
+
+/// Every claim the two registration lists make about themselves, before
+/// anything boots.
+///
+/// A group whose members drifted apart still passes — each one boots its own
+/// machine and reads its own console — so nothing downstream would notice, and
+/// a group split across the two phases could not share a guest at all.
+fn check_registration() {
+    let mut seen: BTreeMap<&str, ()> = BTreeMap::new();
+    for (name, _) in MACHINE_TESTS.iter().chain(SCREEN_TESTS) {
+        assert!(seen.insert(name, ()).is_none(), "{name} is registered twice");
+    }
+    for name in AUDIO_TESTS {
+        assert!(!seen.contains_key(name), "{name} is registered twice");
+    }
+
+    let mut groups: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
+    for (i, (name, _)) in MACHINE_TESTS.iter().enumerate() {
+        let Some(group) = group_of(name) else { continue };
+        let span = groups.entry(group).or_insert((i, i, 0));
+        span.1 = i;
+        span.2 += 1;
+    }
+    for (group, (first, last, count)) in groups {
+        assert_eq!(
+            last - first + 1,
+            count,
+            "{group}'s members are not adjacent in MACHINE_TESTS, so they cannot share a boot"
+        );
+        assert!(
+            MACHINE_TESTS[first..=last].windows(2).all(|w| w[0].1 == w[1].1),
+            "{group} shares one boot, so its members must share one scheduling answer"
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -5761,6 +5990,28 @@ fn main() {
         audio_gate = Some(n);
     }
 
+    // How many guests the parallel phase runs at once. The serial tail and gate
+    // A ignore it — that is what they are.
+    let mut width = DEFAULT_WIDTH;
+    for (i, a) in args.iter().enumerate() {
+        let n = if let Some(v) = a.strip_prefix("--jobs=") {
+            consumed.push(i);
+            v
+        } else if a == "--jobs" || a == "-j" {
+            consumed.push(i);
+            consumed.push(i + 1);
+            args.get(i + 1)
+                .map(|s| s.as_str())
+                .unwrap_or_else(|| panic!("--jobs needs a width, e.g. --jobs 4"))
+        } else {
+            continue;
+        };
+        width = n.parse().unwrap_or_else(|_| panic!("--jobs: {n:?} is not a width"));
+        assert!(width >= 1, "--jobs needs at least one worker");
+    }
+
+    check_registration();
+
     if nocapture || debug_mode {
         common::qemu::VERBOSE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -5790,10 +6041,10 @@ fn main() {
         for name in AUDIO_TESTS {
             println!("{name}");
         }
-        for name in SCREEN_TESTS {
+        for (name, _) in SCREEN_TESTS {
             println!("{name}");
         }
-        for name in MACHINE_TESTS {
+        for (name, _) in MACHINE_TESTS {
             println!("{name}");
         }
         return;
@@ -5836,15 +6087,15 @@ fn main() {
         .copied()
         .filter(|n| filter.map_or(true, |f| n.contains(f)))
         .collect();
-    let screen_to_run: Vec<&str> = SCREEN_TESTS
+    let screen_to_run: Vec<(&str, Sched)> = SCREEN_TESTS
         .iter()
         .copied()
-        .filter(|n| filter.map_or(true, |f| n.contains(f)))
+        .filter(|(n, _)| filter.map_or(true, |f| n.contains(f)))
         .collect();
-    let machine_to_run: Vec<&str> = MACHINE_TESTS
+    let machine_to_run: Vec<(&str, Sched)> = MACHINE_TESTS
         .iter()
         .copied()
-        .filter(|n| filter.map_or(true, |f| n.contains(f)))
+        .filter(|(n, _)| filter.map_or(true, |f| n.contains(f)))
         .collect();
 
     if tests_to_run.is_empty()
@@ -5867,49 +6118,78 @@ fn main() {
     let mut failures: Vec<(String, String)> = Vec::new();
     let suite_start = std::time::Instant::now();
 
-    // Shared boot: everything except audio tests runs in one QEMU.
+    let bins = Bins {
+        test_config: &test_config,
+        c_bins: &c_bins,
+        rust_bins: &rust_bins,
+    };
+
+    // Everything that owns a boot, split by the one question its registration
+    // asks. MACHINE_TESTS keeps the plain-kernel names first and SCREEN_TESTS
+    // puts its three feature-carrying ones last; the queue is FIFO, so that
+    // ordering still keeps the kernel rebuilds at the end of each phase.
+    let mut parallel: Vec<Task> = Vec::new();
+    let mut serial: Vec<Task> = Vec::new();
     if !tests_to_run.is_empty() {
         eprintln!(
-            "[toyos] Booting QEMU with {} C + {} Rust binaries...",
+            "[toyos] The shared boot carries {} C + {} Rust binaries",
             c_bins.len(),
             rust_bins.len()
         );
-        let mut qemu = QemuInstance::boot(&test_config, &c_bins, &rust_bins);
-        let mut last_prefix = "";
-
-        for test in &tests_to_run {
-            let prefix = if test.qemu_name.starts_with("test_rs_") {
-                "rust"
-            } else {
-                "c"
-            };
-            if prefix != last_prefix {
-                eprintln!("  --- {prefix} ---");
-                last_prefix = prefix;
-            }
-
-            let start = std::time::Instant::now();
-            let result = qemu.run_test(&test.qemu_name, test.timeout);
-            let elapsed = start.elapsed();
-            let ok = (test.check)(&result);
-            if ok {
-                passed += 1;
-                eprintln!("  PASS  {}  ({:.0?})", test.name, elapsed);
-            } else {
-                failed += 1;
-                let reason = result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| format!("exit code {:?}", result.exit_code));
-                failures.push((test.name.clone(), reason));
-                eprintln!("  FAIL  {}  ({:.0?})", test.name, elapsed);
-            }
+        let task = Task::Shared(tests_to_run.clone());
+        match SHARED_BLOCK {
+            Sched::Parallel => parallel.push(task),
+            Sched::Serial => serial.push(task),
+        }
+    }
+    for (sched, names) in machine_tasks(&machine_to_run) {
+        let task = Task::Machine(names);
+        match sched {
+            Sched::Parallel => parallel.push(task),
+            Sched::Serial => serial.push(task),
+        }
+    }
+    for (name, sched) in &screen_to_run {
+        let task = Task::Screen(name);
+        match sched {
+            Sched::Parallel => parallel.push(task),
+            Sched::Serial => serial.push(task),
         }
     }
 
-    // Audio tests: one dedicated boot per (test, smp) config, wav glitch
-    // analysis gated on the recorded baseline.
+    let mut record = |outcomes: Vec<Outcome>| {
+        for outcome in outcomes {
+            match outcome.reason {
+                None => passed += 1,
+                Some(reason) => {
+                    failed += 1;
+                    let summary = reason.lines().next().unwrap_or("check failed");
+                    failures.push((outcome.name, summary.to_string()));
+                }
+            }
+        }
+    };
+
+    if !parallel.is_empty() {
+        eprintln!("  --- parallel, {width} wide ---");
+        record(run_phase(parallel, width, &bins));
+    }
+    if !serial.is_empty() {
+        eprintln!("  --- serial ---");
+        record(run_phase(serial, 1, &bins));
+    }
+
+    // Gate A, alone. `tests/audio-baseline.toml`'s numbers were recorded with
+    // one QEMU on the host and no concurrent agents, so a run beside anything
+    // else is not the instrument they describe — which makes this a
+    // precondition rather than an ordering convention, and worth asserting.
+    // `run_phase` joins its workers before it returns, and this is what says so.
     if !audio_to_run.is_empty() {
+        assert_eq!(
+            qemu::live_instances(),
+            0,
+            "gate A ran with another guest still up; its baseline is a quiet host"
+        );
         let audio_baseline = load_audio_baseline();
         eprintln!("  --- audio ---");
         for name in &audio_to_run {
@@ -5932,62 +6212,6 @@ fn main() {
                         let summary = reason.lines().next().unwrap_or("audio check failed");
                         failures.push((label, summary.to_string()));
                     }
-                }
-            }
-        }
-    }
-
-    // These own their QEMU because their machine shape is the test.
-    // MACHINE_TESTS keeps the plain-kernel ones first for the same reason
-    // SCREEN_TESTS does.
-    if !machine_to_run.is_empty() {
-        eprintln!("  --- machine ---");
-        // Dropped with this block, so no group's guest outlives the machine
-        // tests into the screen ones.
-        let mut held: Grouped = None;
-        for name in &machine_to_run {
-            let start = std::time::Instant::now();
-            let outcome =
-                catching(|| run_machine_test(name, &test_config, &c_bins, &rust_bins, &mut held));
-            let elapsed = start.elapsed();
-            match outcome {
-                Ok(()) => {
-                    passed += 1;
-                    eprintln!("  PASS  {name}  ({:.0?})", elapsed);
-                }
-                Err(reason) => {
-                    failed += 1;
-                    eprintln!("FAIL {name}: {reason}");
-                    eprintln!("  FAIL  {name}  ({:.0?})", elapsed);
-                    let summary = reason.lines().next().unwrap_or("machine check failed");
-                    failures.push((name.to_string(), summary.to_string()));
-                }
-            }
-        }
-    }
-
-    // Last, because they are the only tests that build a kernel with features
-    // on. Three of them do, one feature each, so the block costs three kernel
-    // rebuilds; running it here keeps every plain-kernel test above it out of
-    // the thrash, and SCREEN_TESTS puts the three at the end for the same
-    // reason.
-    if !screen_to_run.is_empty() {
-        eprintln!("  --- screen ---");
-        for name in &screen_to_run {
-            let start = std::time::Instant::now();
-            let outcome = catching(|| run_screen_test(name, &test_config, &c_bins, &rust_bins));
-            let elapsed = start.elapsed();
-            match outcome {
-                Ok(()) => {
-                    passed += 1;
-                    eprintln!("  PASS  {name}  ({:.0?})", elapsed);
-                }
-                Err(reason) => {
-                    failed += 1;
-                    eprintln!("FAIL {name}: {reason}");
-                    eprintln!("  FAIL  {name}  ({:.0?})", elapsed);
-                    let summary = reason.lines().next().unwrap_or("screen check failed");
-                    failures.push((name.to_string(), summary.to_string()));
                 }
             }
         }
