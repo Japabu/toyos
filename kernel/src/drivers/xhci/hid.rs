@@ -30,8 +30,21 @@ pub struct HidDevice {
     /// The slot id cannot serve: the controller frees it when the slot is
     /// disabled, and the port is what the register reports about.
     pub port_idx: u8,
+    /// This device's block in the DMA pool: where its interrupt ring and its
+    /// EP0 ring live, and where the controller writes the output context whose
+    /// Endpoint State field a recovery has to read.
+    pub block: usize,
     pub int_ep_dci: u8,
+    /// The endpoint address out of the device's own configuration descriptor.
+    /// The DCI beside it is the *controller's* number for the same endpoint and
+    /// means nothing to the device, so it is the address that goes in a
+    /// CLEAR_FEATURE(ENDPOINT_HALT).
+    pub ep_addr: u8,
     pub int_ring: TrbRing,
+    /// The device's control ring, kept past enumeration for the same reason a
+    /// mass-storage device keeps its: clearing a halt is a control transfer, so
+    /// a bound HID is something the driver may still have to talk to.
+    pub ep0_ring: TrbRing,
     pub report_phys: u64,
     pub report_ptr: *mut u8,
     pub report_size: u32,
@@ -40,9 +53,38 @@ pub struct HidDevice {
     /// of one keyboard and diffing it against another's synthesizes releases
     /// for keys that are still physically down.
     pub prev_report: [u8; 8],
+    /// The completion code this device's interrupt endpoint broke with, until
+    /// something has restarted it. Read and cleared by
+    /// [`XhciController::recover_endpoints`], never by the code that sets it —
+    /// see that function for why the two cannot be the same place.
+    ///
+    /// [`XhciController::recover_endpoints`]: super::XhciController::recover_endpoints
+    pub broke_with: Option<u32>,
+    /// Transfers this endpoint has failed *in a row*. A delivered report
+    /// clears it, so a device that glitches once an hour is never let go for
+    /// it, and one that fails every transfer is let go on its own service
+    /// interval — see [`super::MAX_HID_FAILURES`].
+    pub failures: u8,
+    /// Completions this endpoint has produced, which nothing but the injection
+    /// below counts.
+    #[cfg(any(feature = "xhci-hid-break-first", feature = "xhci-hid-break-late"))]
+    pub completions: u32,
 }
 
 impl HidDevice {
+    /// What this device is called in every line about it.
+    ///
+    /// Two names and not the descriptor's three: a mouse and a tablet bind
+    /// identically and `mouse::handle_report` tells them apart by report
+    /// length, so a line saying "tablet" would be naming what the descriptor
+    /// claimed rather than what the driver has.
+    pub fn kind(&self) -> &'static str {
+        match self.role {
+            HidRole::Keyboard => "keyboard",
+            HidRole::Pointer(_) => "pointer",
+        }
+    }
+
     pub fn dispatch_report(&mut self) {
         let mut buf = [0u8; 8];
         let size = self.report_size as usize;
@@ -109,5 +151,48 @@ impl HidDevice {
         self.int_ring.enqueue(trb);
         fence(Ordering::Release);
         db_base.write_u32(self.slot_id as u64 * 4, self.int_ep_dci as u32);
+    }
+}
+
+/// Take one completion away from the device that earned it and hand the driver
+/// a stall in its place, once per HID interrupt endpoint.
+///
+/// **A kernel feature because nothing on the host side can stage it.** QEMU's
+/// `usb-hid` completes every interrupt TRB it is given: `usb_hid_handle_data`
+/// answers an IN token on endpoint 1 with a report or with NAK and has no path
+/// to `USB_RET_STALL` for it, and no device, machine or `-device` property adds
+/// one. `device_add`/`device_del` cannot reach it either — an unplug is a
+/// disconnect, which is a different event with a different recovery.
+///
+/// What is real is everything the recovery reads and everything it does: the
+/// TRB was on the ring, the controller ran it, the transfer event is the
+/// controller's own, the ring is left holding no TRB, the Endpoint State the
+/// recovery branches on is read out of the controller's output context, and
+/// every command it issues is really answered.
+///
+/// What is replaced is the completion code **and the report that transfer
+/// delivered**, which is the half that keeps the gate from being vacuous: a
+/// staged failure carries a real mouse movement into the report buffer, so a
+/// driver that dispatched it anyway would publish a delta it never earned and
+/// the gate would pass against the defect it is aimed at. Taking the bytes away
+/// leaves what a failed transfer leaves — nothing delivered — so the motion the
+/// gate measures can only have crossed an endpoint that was restarted. Same
+/// reason `usb-transport-break` skips a wait rather than forging a CSW.
+#[cfg(any(feature = "xhci-hid-break-first", feature = "xhci-hid-break-late"))]
+impl HidDevice {
+    /// Which completion is taken. The first is the shape the T14 showed — a
+    /// freshly configured endpoint whose very first transfer fails, before the
+    /// device has ever delivered — and the fourth is the mid-stream shape,
+    /// where a device that has been working stops. They are different states
+    /// of the driver and neither is a weaker version of the other.
+    const BREAK_AT: u32 = if cfg!(feature = "xhci-hid-break-first") { 1 } else { 4 };
+
+    pub fn stage_break(&mut self, code: u32) -> u32 {
+        self.completions += 1;
+        if self.completions != Self::BREAK_AT {
+            return code;
+        }
+        unsafe { core::ptr::write_bytes(self.report_ptr, 0, self.report_size as usize); }
+        super::CC_STALL
     }
 }

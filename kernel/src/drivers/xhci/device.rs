@@ -577,7 +577,17 @@ pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
     let int_dequeue = int_ring.dequeue();
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 2, int_dequeue as u32);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 3, (int_dequeue >> 32) as u32);
-    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 4, 8);
+    // Max ESIT Payload in the high half, Average TRB Length in the low. The
+    // first is what an xHC allocates periodic bandwidth from — xHCI 1.2 §6.2.3.8
+    // defines it as the bytes this endpoint moves per service interval, and
+    // §4.14.2 makes it the term the scheduler uses — and this dword used to be a
+    // flat 8 copied from EP0's, where a control endpoint has no Max ESIT Payload
+    // and 8 is the Average TRB Length of a setup stage. So a periodic endpoint
+    // was declaring that it moves nothing. For a low- or full-speed interrupt
+    // endpoint there is one burst of one packet, so both halves are the max
+    // packet size, which is what Linux's `xhci_endpoint_init` writes.
+    let esit = info.ep.max_packet as u32;
+    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 4, (esit << 16) | esit);
 
     let mut config_ep = Trb::ZERO;
     config_ep.param = input_ctx_phys;
@@ -609,13 +619,20 @@ pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
     let mut dev = HidDevice {
         slot_id,
         port_idx,
+        block,
         int_ep_dci,
+        ep_addr: info.ep.addr,
         int_ring,
+        ep0_ring,
         report_phys,
         report_ptr,
         report_size,
         role,
         prev_report: [0; 8],
+        broke_with: None,
+        failures: 0,
+        #[cfg(any(feature = "xhci-hid-break-first", feature = "xhci-hid-break-late"))]
+        completions: 0,
     };
 
     dev.requeue(&ctrl.db_base);
@@ -662,6 +679,13 @@ pub fn scan_ports(ctrl: &mut XhciController) {
     // disconnect the controller has no way to report, and the first thing
     // unplugged after boot would go unnoticed.
     ctrl.acknowledge_port_changes();
+    // A device bound on an earlier port is armed and delivering while a later
+    // one enumerates, so its completions arrive inside `configure`'s own
+    // `wait_transfer` — and a broken one is recorded there rather than acted on.
+    // Nothing else would come back for it: an endpoint holding no TRB raises no
+    // further interrupt, so without this a device whose *first* transfer failed
+    // during the boot scan would stay recorded and silent for the whole boot.
+    ctrl.recover_endpoints();
     #[cfg(feature = "xhci-portsc-rw1c")]
     log!("xHCI: PED as RW1C, {} port(s) disabled by a driver write",
         ctrl.software_disabled_ports());

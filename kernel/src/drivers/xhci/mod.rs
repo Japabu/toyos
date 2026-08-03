@@ -133,6 +133,62 @@ const CC_SUCCESS: u32 = 1;
 const CC_STALL: u32 = 6;
 const CC_SHORT_PACKET: u32 = 13;
 
+/// A completion code, named where xHCI 1.2 Table 6-90 names it.
+///
+/// The bare number is what every line in this driver used to print, and the
+/// device those lines are about is one that has stopped working on a machine
+/// with no debugger and often no serial port: `code 6` and `code 6 (Stall
+/// Error)` are the difference between reaching for the specification and
+/// reading the answer. The number is always there, because a controller can
+/// report one the table does not define and that is the case worth carrying
+/// verbatim.
+#[derive(Clone, Copy)]
+struct Completion(u32);
+
+impl core::fmt::Display for Completion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let named = match self.0 {
+            1 => "Success",
+            2 => "Data Buffer Error",
+            3 => "Babble Detected",
+            4 => "USB Transaction Error",
+            5 => "TRB Error",
+            6 => "Stall Error",
+            7 => "Resource Error",
+            8 => "Bandwidth Error",
+            9 => "No Slot Available",
+            10 => "Invalid Stream Type",
+            11 => "Slot Not Enabled",
+            12 => "Endpoint Not Enabled",
+            13 => "Short Packet",
+            14 => "Ring Underrun",
+            15 => "Ring Overrun",
+            16 => "VF Event Ring Full",
+            17 => "Parameter Error",
+            18 => "Bandwidth Overrun",
+            19 => "Context State Error",
+            20 => "No Ping Response",
+            21 => "Event Ring Full",
+            22 => "Incompatible Device",
+            23 => "Missed Service Error",
+            24 => "Command Ring Stopped",
+            25 => "Command Aborted",
+            26 => "Stopped",
+            27 => "Stopped - Length Invalid",
+            28 => "Stopped - Short Packet",
+            29 => "Max Exit Latency Too Large",
+            31 => "Isoch Buffer Overrun",
+            32 => "Event Lost",
+            33 => "Undefined Error",
+            34 => "Invalid Stream ID",
+            35 => "Secondary Bandwidth Error",
+            36 => "Split Transaction Error",
+            _ => return write!(f, "code {}", self.0),
+        };
+        write!(f, "code {} ({named})", self.0)
+    }
+}
+
 /// How one control transfer ended.
 ///
 /// `Done` carries the bytes the device actually moved, because the completion
@@ -175,7 +231,7 @@ impl core::fmt::Display for Control {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Done { delivered } => write!(f, "{delivered} B delivered"),
-            Self::Failed { stage, code } => write!(f, "{stage} stage completion code {code}"),
+            Self::Failed { stage, code } => write!(f, "{stage} stage completion {}", Completion(*code)),
             Self::Silent { stage } => write!(
                 f,
                 "no answer to the {stage} stage in {} ms",
@@ -228,6 +284,48 @@ impl core::fmt::Display for EndpointState {
         }
     }
 }
+
+/// One endpoint, as [`XhciController::restart_endpoint`] needs to see it.
+///
+/// A struct because the two callers hold their endpoints in different shapes —
+/// a disk's bulk pair live in a mass-storage pool block and a HID's interrupt
+/// endpoint in a device block — and the recovery needs both the block the
+/// controller writes the *output context* into and the place the ring's memory
+/// is. Passing them positionally is six numbers whose order is the whole
+/// contract.
+struct Restart<'a> {
+    slot_id: u8,
+    /// The device block whose output context carries this endpoint's state.
+    ctx_block: usize,
+    dci: u8,
+    /// The address the *device* knows this endpoint by, which is what a
+    /// CLEAR_FEATURE names.
+    ep_addr: u8,
+    /// Where in the pool the transfer ring lives, because recovery rebuilds it
+    /// rather than resuming a ring the controller has a stale dequeue pointer
+    /// into.
+    ring_at: usize,
+    ring: &'a mut TrbRing,
+    ep0_ring: &'a mut TrbRing,
+}
+
+/// How many transfers one HID interrupt endpoint may fail in a row before the
+/// device it belongs to is let go.
+///
+/// Policy, not physics. The count is *consecutive* and a delivered report
+/// clears it, so a device that glitches once is never let go for it; and a
+/// device that fails every transfer is let go on its own service interval
+/// rather than costing a recovery per poll for the life of the boot. That cost
+/// is not abstract: each recovery is two commands and a spin on the event ring,
+/// taken inside `poll_if_pending` at the top of a scheduler pass, which is the
+/// path the audio pipeline runs on.
+///
+/// What the caller sees when it is hit is [`XhciController::let_go`]: the
+/// device is named, its keys or its button-table entry are given back, its slot
+/// is disabled, and the line says to unplug it — because a port left marked
+/// attached is the one thing that stops the driver enumerating the same
+/// endpoint again every debounce.
+const MAX_HID_FAILURES: u8 = 8;
 
 /// How long the driver waits on any one command or transfer.
 ///
@@ -1001,6 +1099,13 @@ impl XhciController {
     /// as one dequeued during a later port's enumeration used to be — leaves
     /// that device with an empty ring for the life of the boot: no log line, no
     /// fault, a keyboard that simply stops.
+    ///
+    /// **A completion code other than Success or Short Packet is the same
+    /// defect wearing a different hat**, and it is the one a Logitech mouse
+    /// hot-plugged into the T14 hit: every bind-time line read perfectly and
+    /// the device delivered nothing for the 28 seconds it stayed in the port.
+    /// So a code this driver did not expect is *recorded* here rather than
+    /// dropped, and [`Self::recover_endpoints`] acts on it.
     fn dispatch_event(&mut self, event: Trb) {
         let trb_type = (event.control >> 10) & 0x3F;
         let code = (event.status >> 24) & 0xFF;
@@ -1015,13 +1120,182 @@ impl XhciController {
             self.ports_dirty = true;
             return;
         }
-        if trb_type != EVENT_TRANSFER || (code != 1 && code != 13) {
+        if trb_type != EVENT_TRANSFER {
             return;
         }
-        if let Some(dev) = self.devices.iter_mut().find(|d| d.slot_id == slot) {
+        let Some(at) = self.devices.iter().position(|d| d.slot_id == slot) else {
+            return;
+        };
+        #[cfg(any(feature = "xhci-hid-break-first", feature = "xhci-hid-break-late"))]
+        let code = self.devices[at].stage_break(code);
+        let dev = &mut self.devices[at];
+        if code == CC_SUCCESS || code == CC_SHORT_PACKET {
+            dev.failures = 0;
             dev.dispatch_report();
             dev.requeue(&self.db_base);
+            return;
         }
+        dev.broke_with = Some(code);
+    }
+
+    /// Restart every bound HID interrupt endpoint a completion code broke,
+    /// until none is outstanding.
+    ///
+    /// **Separate from the code that reads the code, and that is the whole
+    /// reason it exists.** `dispatch_event` runs inside `wait_command` and
+    /// `wait_transfer`, which are draining this same event ring on behalf of a
+    /// caller waiting for one particular event. A recovery issued from there
+    /// submits commands and waits on the ring itself, and the events it
+    /// consumed would include the one its caller was waiting for — a disk's
+    /// data phase disappearing because a mouse stalled.
+    ///
+    /// The loop terminates because an endpoint with no TRB queued produces no
+    /// completion: a device can only re-enter this after a requeue, and
+    /// [`MAX_HID_FAILURES`] bounds how many times that is done for it.
+    fn recover_endpoints(&mut self) {
+        while let Some((slot_id, code)) =
+            self.devices.iter().find_map(|d| Some((d.slot_id, d.broke_with?)))
+        {
+            self.recover_hid(slot_id, code);
+        }
+    }
+
+    /// One HID device's interrupt endpoint, back to delivering — or off the bus.
+    fn recover_hid(&mut self, slot_id: u8, code: u32) {
+        let Some(at) = self.devices.iter().position(|d| d.slot_id == slot_id) else {
+            return;
+        };
+        // Off the list for the duration. The recovery below drains the event
+        // ring, so another device's completion is dispatched from inside it,
+        // and a device let go there would move every index after its own.
+        let mut dev = self.devices.remove(at);
+        dev.broke_with = None;
+        dev.failures += 1;
+        let kind = dev.kind();
+        let ep_addr = dev.ep_addr;
+        log!("xHCI: USB {kind} on slot {slot_id}: interrupt endpoint {ep_addr:#04x} (dci {}) \
+             completed with {}; failure {} of {MAX_HID_FAILURES}",
+            dev.int_ep_dci, Completion(code), dev.failures);
+
+        if dev.failures >= MAX_HID_FAILURES {
+            self.let_go(dev, format_args!(
+                "it has failed {MAX_HID_FAILURES} transfers in a row"
+            ));
+            return;
+        }
+        let restarted = self.restart_endpoint(Restart {
+            slot_id,
+            ctx_block: dev.block,
+            dci: dev.int_ep_dci,
+            ep_addr,
+            ring_at: dev.block + DEV_INT_RING,
+            ring: &mut dev.int_ring,
+            ep0_ring: &mut dev.ep0_ring,
+        });
+        if !restarted {
+            self.let_go(dev, format_args!("endpoint {ep_addr:#04x} could not be restarted"));
+            return;
+        }
+        dev.requeue(&self.db_base);
+        self.devices.push(dev);
+    }
+
+    /// Everything a HID device the driver has given up on leaves behind.
+    ///
+    /// The order [`Self::teardown_port`] uses and for its reasons — input
+    /// first, so a keyboard's held keys and a pointer's button-table entry go
+    /// back before anything else, then the slot — with one deliberate
+    /// difference: **the port stays marked attached**. A port whose `attached`
+    /// went false with the device still physically in it reads as a fresh
+    /// connect on the next pass, and the driver would enumerate the same
+    /// endpoint again every debounce for as long as it stayed plugged in.
+    /// Unplugging is what clears it, which is what the line says to do.
+    ///
+    /// The port's slot is this device's: one root-hub port carries one device
+    /// here, and `parse_config` gives that device one function.
+    fn let_go(&mut self, mut dev: HidDevice, why: core::fmt::Arguments) {
+        log!("xHCI: USB {} on slot {} is being let go — {why}. Unplug it and plug it in again.",
+            dev.kind(), dev.slot_id);
+        dev.unbind();
+        if let Some(slot) = self.ports[dev.port_idx as usize].slot.take() {
+            self.disable_slot(slot.get());
+        }
+    }
+
+    /// Take one endpoint back to a state that runs TRBs, by the route its
+    /// current state permits.
+    ///
+    /// **Which command is legal is a property of the endpoint's state, not of
+    /// whatever ended the transfer.** Reset Endpoint is defined only for a
+    /// Halted endpoint (xHCI 1.2 §4.6.8), Stop Endpoint only for a Running one
+    /// (§4.6.9), and Set TR Dequeue Pointer for an endpoint already in Stopped
+    /// or Error (§4.6.10). A recovery that opens with Reset Endpoint every time
+    /// gets Context State Error whenever the break was not a halt — which the
+    /// T14 answered twice before calling its own boot disk offline.
+    ///
+    /// The ring is rebuilt whichever route was taken, because the TRBs behind
+    /// the one that broke belong to a transfer nobody is waiting for and Set TR
+    /// Dequeue is what tells the controller so. CLEAR_FEATURE(ENDPOINT_HALT)
+    /// goes out only for a halt: it clears the condition at the *device*, and a
+    /// device that never halted has nothing to clear and may stall the request
+    /// for asking.
+    ///
+    /// Shared by the two kinds of endpoint that can break after they are bound,
+    /// which is every kind this driver has: a disk's bulk pair and a HID's
+    /// interrupt endpoint. Nothing in it is per class — the state, the three
+    /// commands and the ring are all xHCI's, which is also why the line it logs
+    /// says `xHCI` whichever caller asked.
+    fn restart_endpoint(&mut self, ep: Restart<'_>) -> bool {
+        let slot = ep.slot_id as u32;
+        let state = self.endpoint_state(ep.ctx_block, ep.dci);
+        log!("xHCI: slot {} endpoint {} is {state}, recovering", ep.slot_id, ep.dci);
+
+        match state {
+            EndpointState::Halted => {
+                let mut reset = Trb::ZERO;
+                reset.control = TRB_RESET_ENDPOINT | (slot << 24) | ((ep.dci as u32) << 16);
+                if !self.run_command(reset, "Reset Endpoint") {
+                    return false;
+                }
+            }
+            EndpointState::Running => {
+                let mut stop = Trb::ZERO;
+                stop.control = TRB_STOP_ENDPOINT | (slot << 24) | ((ep.dci as u32) << 16);
+                if !self.run_command(stop, "Stop Endpoint") {
+                    return false;
+                }
+            }
+            EndpointState::Stopped => {}
+            EndpointState::Disabled | EndpointState::Unusable(_) => {
+                log!("xHCI: slot {} endpoint {} is {state}; nothing short of Configure Endpoint \
+                     takes an endpoint out of that, and this driver does not re-configure a bound \
+                     device", ep.slot_id, ep.dci);
+                return false;
+            }
+        }
+
+        let fresh = TrbRing::init(self.dma().subslice(ep.ring_at, PAGE));
+        let dequeue = fresh.dequeue();
+        *ep.ring = fresh;
+
+        let mut set_dq = Trb::ZERO;
+        set_dq.param = dequeue;
+        set_dq.control = TRB_SET_TR_DEQUEUE | (slot << 24) | ((ep.dci as u32) << 16);
+        if !self.run_command(set_dq, "Set TR Dequeue") {
+            return false;
+        }
+
+        if state != EndpointState::Halted {
+            return true;
+        }
+        let cleared = self.control_transfer(
+            ep.slot_id, ep.ep0_ring, 0x02, 0x01, 0, ep.ep_addr as u16, None, 0,
+        );
+        if !cleared.done() {
+            log!("xHCI: slot {} would not clear the halt on endpoint {:#04x}: {cleared}",
+                ep.slot_id, ep.ep_addr);
+        }
+        cleared.done()
     }
 
     /// Clear whatever change flags one port is holding, so the next change is
@@ -1241,7 +1515,7 @@ impl XhciController {
         match self.wait_command() {
             Some((CC_SUCCESS, _)) => true,
             Some((code, _)) => {
-                log!("xHCI: {what} failed, code={code}");
+                log!("xHCI: {what} failed: {}", Completion(code));
                 false
             }
             None => {
@@ -1386,6 +1660,10 @@ impl XhciController {
         while let Some(event) = self.next_event() {
             self.dispatch_event(event);
         }
+        // After the drain and not inside it: an endpoint the drain recorded a
+        // broken completion for is restarted where nobody else is waiting on
+        // this ring.
+        self.recover_endpoints();
         if !self.ports_dirty && self.ports.iter().all(|p| p.work == PortWork::Settled) {
             return None;
         }

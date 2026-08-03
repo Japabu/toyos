@@ -128,6 +128,22 @@ xhci-slow-storage-connect = []
 # not a verdict: the port reads exactly what the T14's five ports read.
 # See `XhciController::software_disabled`.
 xhci-portsc-rw1c = []
+# Take one completion away from each bound HID device and hand the driver a
+# stall in its place: `xhci-hid-break-first` the device's very first, which is
+# the shape a Logitech mouse hot-plugged into the T14 showed, and
+# `xhci-hid-break-late` its fourth, where a device that has been delivering
+# stops. QEMU's `usb-hid` completes every interrupt TRB it is given —
+# `usb_hid_handle_data` answers an IN token on endpoint 1 with a report or with
+# NAK and has no path to `USB_RET_STALL` for it — and no device or machine
+# property adds one. What is replaced is the code *and the report that transfer
+# delivered*: a staged failure carries a real movement into the report buffer,
+# so without taking the bytes away a driver that dispatched it anyway would
+# publish a delta it never earned and the gate would pass against the defect it
+# names. Everything the recovery reads is real: the TRB was on the ring, the
+# controller ran it, the ring is left empty, and the Endpoint State it branches
+# on is the controller's own. See `xhci/hid.rs`'s `stage_break`.
+xhci-hid-break-first = []
+xhci-hid-break-late = []
 # Run `parse_config` over nine crafted configuration descriptors at init. The
 # bytes come from a device and every device QEMU can attach describes itself
 # correctly, so without this the parser's refusals — an endpoint address naming

@@ -11,9 +11,8 @@ use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
 use super::device::Endpoint;
-use super::{EndpointState, Trb, TrbRing, XhciController, StorageGeometry, PAGE};
-use super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, TRB_CONFIGURE_EP};
-use super::{TRB_RESET_ENDPOINT, TRB_STOP_ENDPOINT, TRB_SET_TR_DEQUEUE, OFF_INPUT_CTX};
+use super::{Restart, Trb, TrbRing, XhciController, StorageGeometry, PAGE};
+use super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, TRB_CONFIGURE_EP, OFF_INPUT_CTX};
 use super::USB_TIMEOUT_NS;
 use super::{MSC_IN_RING, MSC_OUT_RING, MSC_CBW, MSC_CSW, MSC_SCRATCH, MSC_SCRATCH_LEN};
 use super::{MSC_DATA, MSC_DATA_LEN, MSC_MAX_BLOCKS};
@@ -587,7 +586,7 @@ impl XhciController {
                 // arrives once the endpoint is unhalted. Recovering and then
                 // reading the status is what turns it into a clean refusal.
                 Some((CC_STALL, _)) => {
-                    if !self.restart_endpoint(dev, data_in) {
+                    if !self.restart_bulk(dev, data_in) {
                         return Err(Broke::Stall { phase: "data" });
                     }
                 }
@@ -602,7 +601,7 @@ impl XhciController {
         if let Err(Broke::Code { code: CC_STALL, .. }) = got {
             // The spec's one legal retry: the device may stall the status
             // phase once, and a second stall means it has lost the plot.
-            if !self.restart_endpoint(dev, true) {
+            if !self.restart_bulk(dev, true) {
                 return Err(Broke::Stall { phase: "status" });
             }
             unsafe { write_bytes(dma.ptr_at(dev.block + MSC_CSW), 0, CSW_LEN as usize); }
@@ -668,84 +667,26 @@ impl XhciController {
         self.wait_transfer(slot, dci)
     }
 
-    /// Take one bulk endpoint back to a state that runs TRBs, by the route its
-    /// current state permits.
+    /// One of this disk's bulk endpoints, back to a state that runs TRBs.
     ///
-    /// **Which command is legal is a property of the endpoint's state, not of
-    /// whatever ended the transfer.** Reset Endpoint is defined only for a
-    /// Halted endpoint (xHCI 1.2 §4.6.8), Stop Endpoint only for a Running one
-    /// (§4.6.9), and Set TR Dequeue Pointer for an endpoint already in Stopped
-    /// or Error (§4.6.10). A recovery that opens with Reset Endpoint every time
-    /// gets Context State Error whenever the break was not a halt — which is
-    /// silence, a phase error and a mistagged CSW, three of the shapes [`Broke`]
-    /// enumerates — and this driver read that answer as "the disk is gone".
-    ///
-    /// The ring is rewound whichever route was taken, because the TRBs behind
-    /// the one that broke belong to a transfer nobody is waiting for and Set TR
-    /// Dequeue is what tells the controller so. CLEAR_FEATURE(ENDPOINT_HALT)
-    /// goes out only for a halt: it clears the condition at the *device*, and a
-    /// device that never halted has nothing to clear and may stall the request
-    /// for asking.
-    fn restart_endpoint(&mut self, dev: &mut MscDevice, in_dir: bool) -> bool {
+    /// The route is [`XhciController::restart_endpoint`]'s to choose, because
+    /// which command is legal is a property of the endpoint's state and nothing
+    /// about that is per class. All this decides is which of the pair is meant.
+    fn restart_bulk(&mut self, dev: &mut MscDevice, in_dir: bool) -> bool {
         let (dci, ep_addr, ring_off) = if in_dir {
             (dev.in_dci, dev.in_ep, MSC_IN_RING)
         } else {
             (dev.out_dci, dev.out_ep, MSC_OUT_RING)
         };
-        let slot = dev.slot_id as u32;
-        let state = self.endpoint_state(dev.dev_block, dci);
-        log!("usb-storage: slot {} endpoint {dci} is {state}, recovering", dev.slot_id);
-
-        match state {
-            EndpointState::Halted => {
-                let mut reset = Trb::ZERO;
-                reset.control = TRB_RESET_ENDPOINT | (slot << 24) | ((dci as u32) << 16);
-                if !self.run_command(reset, "Reset Endpoint") {
-                    return false;
-                }
-            }
-            EndpointState::Running => {
-                let mut stop = Trb::ZERO;
-                stop.control = TRB_STOP_ENDPOINT | (slot << 24) | ((dci as u32) << 16);
-                if !self.run_command(stop, "Stop Endpoint") {
-                    return false;
-                }
-            }
-            EndpointState::Stopped => {}
-            EndpointState::Disabled | EndpointState::Unusable(_) => {
-                log!("usb-storage: slot {} endpoint {dci} is {state}; nothing short of Configure \
-                     Endpoint takes an endpoint out of that, and this driver does not \
-                     re-configure a bound disk", dev.slot_id);
-                return false;
-            }
-        }
-
-        let fresh = TrbRing::init(self.dma().subslice(dev.block + ring_off, PAGE));
-        let dequeue = fresh.dequeue();
-        if in_dir {
-            dev.in_ring = fresh;
-        } else {
-            dev.out_ring = fresh;
-        }
-
-        let mut set_dq = Trb::ZERO;
-        set_dq.param = dequeue;
-        set_dq.control = TRB_SET_TR_DEQUEUE | (slot << 24) | ((dci as u32) << 16);
-        if !self.run_command(set_dq, "Set TR Dequeue") {
-            return false;
-        }
-
-        if state != EndpointState::Halted {
-            return true;
-        }
-        let slot_id = dev.slot_id;
-        let cleared =
-            self.control_transfer(slot_id, &mut dev.ep0_ring, 0x02, 0x01, 0, ep_addr as u16, None, 0);
-        if !cleared.done() {
-            log!("usb-storage: slot {slot_id} would not clear the halt on endpoint {ep_addr:#04x}: \
-                 {cleared}");
-        }
-        cleared.done()
+        self.restart_endpoint(Restart {
+            slot_id: dev.slot_id,
+            ctx_block: dev.dev_block,
+            dci,
+            ep_addr,
+            ring_at: dev.block + ring_off,
+            ring: if in_dir { &mut dev.in_ring } else { &mut dev.out_ring },
+            ep0_ring: &mut dev.ep0_ring,
+        })
     }
 
     /// Bulk-Only Mass Storage Reset plus whatever each endpoint needs: what the
@@ -762,8 +703,8 @@ impl XhciController {
         // the endpoints are what the next command touches, and leaving one
         // stopped because the other step failed turns a recoverable device into
         // a permanently offline one.
-        let restarted_in = self.restart_endpoint(dev, true);
-        let restarted_out = self.restart_endpoint(dev, false);
+        let restarted_in = self.restart_bulk(dev, true);
+        let restarted_out = self.restart_bulk(dev, false);
         reset.done() && restarted_in && restarted_out
     }
 }
