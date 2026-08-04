@@ -114,33 +114,22 @@ faults in blank pages instead of being told the file is gone. Nothing is
 disclosed — tmpfs has no allocator handing the storage to anybody else — so it
 wants the same revocation only for honesty, not for safety.
 
-### A `SYS_PIPE_MAP` mapping outlives the page it names
+### CLOSED — a `SYS_PIPE_MAP` mapping outlived the page it named
 
-Read off the code while fixing the ring header, **not reproduced** — the
-reproduction is three syscalls and is written out below so the next agent stages
-it rather than believing this entry.
+Reproduced, then closed. `SYS_PIPE`, `SYS_PIPE_MAP`, close both fds: the last
+`PipeReader`/`PipeWriter` drop freed the 2 MiB ring page back to the PMM with
+the caller's writable mapping of it still live, and the next write went into
+whatever the PMM had handed that page to. `abuse_pipe_map` is the exploit —
+its child maps, closes, writes, and has to die.
 
-`SYS_PIPE`, `SYS_PIPE_MAP` on either fd, then close both fds. The last
-`PipeReader`/`PipeWriter` drop takes the refcount to zero, `close_read` calls
-`free_pipe`, the `PhysPage` drops, and the PMM has the 2 MiB page back — while
-the caller's mapping of it is still live and still writable. Nothing on the
-fd-close path unmaps it and nothing records the mapping against the pipe:
-`sys_pipe_map` calls `process::vma_map` and returns the address
-(`arch/syscall.rs:918-940`). Whatever the PMM hands that page to next — another
-process's pipe, a kernel heap region, a DMA buffer — is then readable and
-writable by a process that owns nothing.
-
-Same class as the `FileBacking` entry above, and the same resolution:
-`specs/capability-handles-spec.md`'s refcounted objects, where a mapping is a
-reference that keeps its page alive. A local unmap-on-close reimplements
-refcounting at one call site while every other cached reference keeps the shape
-it has.
-
-Worth stating next to it, because it bounds how much this costs: the *whole*
-purpose of `SYS_PIPE_MAP` today is netd polling two bits of `flags`. Nothing else
-in the tree maps a pipe, and since the ring-header fix nothing reads the mapped
-page's cursors either. A writable 2 MiB kernel page is a large answer to that
-question.
+The window is now recorded against the pipe (`process::PipeMap`) and `fd::close`
+takes it back when the process's last descriptor for that pipe goes; a second
+`SYS_PIPE_MAP` for a pipe returns the window the first one made, which is what
+bounds the record by the descriptor table. Kept as a note rather than deleted
+because the *shape* is still the local one this entry argued against:
+`specs/capability-handles-spec.md`'s refcounted objects would make the mapping
+itself keep the page alive, and every other cached reference in the kernel still
+has the old shape.
 
 ### The ring's closed flags are userland's to forge, and netd believes them
 
@@ -273,11 +262,19 @@ their allocation is not bounded. `/home` is writable by userland, so this is a
 live path — still open for the `bcachefs` owner. `Node::parse` no longer reserves
 from an on-disk count, but `collect_all` still materialises the whole tree.
 
-`SYS_SYSINFO` collects one 24-byte entry per live thread into a `Vec`
-(`syscall.rs:1273`) and thread count is uncapped, so ~87,000 threads makes it a
-single >2 MiB allocation and `mm/alloc.rs`'s `MAX_HEAP_ALLOC` assert fires. Any
-process may call it. Second-order rather than cheap — building the thread count
-is itself unbounded — which is what puts the tmpfs route above it.
+CLOSED: **`SYS_SYSINFO`'s per-thread `Vec`** was the same shape one syscall
+over — one 24-byte entry per live thread, sorted, so the caller's buffer bounded
+what was *written* and nothing bounded what was built. `MAX_SYSINFO_THREADS`
+(65,536, derived against `MAX_HEAP_ALLOC`) refuses with `ResourceExhausted`, and
+the vector is reserved exactly from the count that decides the refusal, so there
+is no growth-by-doubling overshoot left to absorb. The residual is that the
+thread count itself is still uncapped: this bounds the syscall, not the machine.
+
+**The gate is the actuator's, not the bound's.** 65,536 threads is 8 GiB of
+kernel stacks and no guest can make them, so `test-heap-ceiling` drops the
+constant to 16 and `heap_ceiling` spawns threads until the refusal comes (13, on
+that boot) and then joins them and checks it recovers. What runs is the shipped
+count, comparison and error return; the number is the only thing replaced.
 
 ### `SYS_DLOPEN` never dedups and `SYS_DLCLOSE` is a no-op
 
@@ -388,18 +385,12 @@ re-derive later. The only explicit ceiling check left is where two
 separately-bounded inputs feed one collection, which is exactly the place a bound
 on either input cannot help.
 
-### `RelocationIndex::new()` outlived its callers and should be deleted
+### CLOSED — `RelocationIndex::new()` outlived its callers and is deleted
 
-`elf.rs:642`, alongside `with_capacity` at `:654`. **It has no caller in the
-loader path** — verified, zero hits for `RelocationIndex::new()` in `kernel/`.
-
-It is the unbounded constructor: the shape that permitted the growth Route A
-tripped over. Deleting it so it cannot come back is the right end state, and the
-reason it is still here is worth recording so this does not read as an oversight
-to whoever finds it: **removing it is an API change that could not be re-verified
-on the budget remaining**, and an unverified API change is how the next defect
-arrives. Left deliberately, to be deleted by someone who can re-run the loader
-tests.
+The unbounded constructor, the shape Route A tripped over, with no caller in the
+loader path. Deleted; `with_capacity` is the only way to build one, and it takes
+the ceiling check with it. The API change the previous entry could not re-verify
+was re-verified by a full suite.
 
 ### The bootloader sizes every allocation from a file the ESP handed it
 
@@ -477,7 +468,16 @@ the client's own fd and returns `ResourceExhausted`, on `NoListener` it returns
 `NotFound`. That is the pair this class asks for — a bound *and* a caller that
 hears the refusal — and it is why the cap could be added at all. `SYS_LISTEN` is
 still ungated, so the attacker can still be its own service; what it gets now is
-a bounded number of pinned rings and an error.
+a bounded number of queued connections and an error.
+
+**And the 4 MiB is gone with it.** A pipe now allocates its 2 MiB ring page on
+first use — `pipe::create` is infallible because a pipe with no traffic owns no
+physical memory, and `try_write`/`map_page` are where exhaustion is met and
+answered. Measured in `abuse_connect_flood`: 32 unaccepted connections cost
+**0 KiB**, against the 128 MiB the eager allocation charged for the same
+allowance, and the first byte written on one buys **2048 KiB**. So the depth is
+now a bound on the queue and not on memory, which is what the entry it guards
+was about; `MAX_PENDING_CONNECTIONS` says so in its own comment.
 
 ### ASSIGNED — the compositor and netd do not bound what they accept
 
@@ -3658,16 +3658,34 @@ mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
 `log_partition_automount` and `log_partition_identity`
 (`tests/common/volumes.rs`), and `toybox_cp_volume` (`tests/common/toybox.rs`).
 
-### Nothing stops userland damaging the stick the machine boots from
+### CLOSED for `/boot`, open for `/log` — userland writing the stick it booted from
 
-`/boot` has no permission model of any kind — the mount is in the VFS and every
-process can write it. Proved rather than reasoned: a guest test binary running
-`fs::write("/boot/toyos/kernel.elf", "TEETH")` truncated the kernel image to
-five bytes, which the host-side check caught (that run was a deliberate
-breakage to prove the check has teeth, and it does; the property it revealed is
-this one). The same applies to `BOOTx64.EFI`. Same class as `SYS_OPEN_DEVICE`
-being first-come: the capability work in `specs/capability-handles-spec.md` is
-where a "the kernel's own volume is not userland's to write" rule would live.
+`/boot` had no permission model of any kind. Proved rather than reasoned: a
+guest test binary running `fs::write("/boot/toyos/kernel.elf", "TEETH")`
+truncated the kernel image to five bytes.
+
+A mount now states whether userland may change it (`vfs::UserAccess`, given at
+every `mount` call and defaulted nowhere) and `/boot` says no. The six syscalls
+that can change a volume — `open` for write/create/truncate/append, `unlink`,
+`rename`, `mkdir`, `rmdir`, `symlink` — ask `Vfs::user_may_modify` and answer
+`PermissionDenied`; reads are untouched. `esp_files` runs the original attack
+and each of the other five, and the host half of `esp_filesystem` reads the
+build artifacts back out of the image the device received and requires them
+byte-identical.
+
+**Three residuals, in order of how much they cost.**
+
+1. **`/log` is `ReadWrite`, `kernel.log` included.** A process can truncate the
+   kernel's own log, or fill the volume. It is deliberate — `toybox`'s file
+   tools write there, and the worst loss is the diagnostic rather than a
+   machine that will not boot — but "the kernel's own volume is not userland's
+   to write" is only half done while it holds.
+2. **It is a mount-level policy, not a capability.** There is no way to say
+   "this process may write `/boot`", so a future installer has nothing to ask
+   for. `specs/capability-handles-spec.md` is where that lives.
+3. **The FAT32 write path's guest-side coverage moved to `/log`** — same
+   adapter, same driver, so nothing is lost, but `esp_files` no longer proves
+   anything about writes reaching *the ESP*, because it may not make any.
 
 ### The mount is not certain, and one failure is unexplained
 
@@ -3793,11 +3811,20 @@ symbolized `rip` against the boot's `Kernel memory located at` line yet, and
 that is the first thing to do.
 
 **Measured since, and one contributing cause closed at `5bb1193`.** The
-per-CPU idle stack is 16 KiB of ordinary heap with **no guard page**, so an
-overflow there does not fault — it rewrites whatever the allocator put
+per-CPU idle stack was 16 KiB of ordinary heap with **no guard page**, so an
+overflow there did not fault — it rewrote whatever the allocator put
 underneath, and a `BTreeMap` node with an out-of-range index (seen: `slice::
 get_unchecked` in `CpuSched::drain`) or a write to `0x4` is what that looks
-like from the scheduler's parked map. Instrumented at the block layer, with the
+like from the scheduler's parked map. **It has one now**: `alloc_idle_stack`
+takes a 4 KiB page out of the direct map below every idle stack
+(`paging::guard_4k`, which splits the 2 MiB leaf that covers it), so an
+overflow faults where it happens and is reported instead of being found later
+somewhere else. `idle_stack_guard` is the gate — the guard page is the one
+page in the kernel deliberately absent from the direct map, and absence is
+invisible to every log line, so `test-idle-guard` supplies the one read that
+touches it. Note what it does *not* change: a fault on a kernel address is
+fatal by policy either way, so the machine still halts; what is new is that it
+halts with a report naming the address. Instrumented at the block layer, with the
 USB command path still below the probe, the sink's path used **11,505 bytes of
 the 16,384**. Three 4 KiB page buffers accounted for most of it —
 `Vfs::flush_file`'s, and `file_cache`'s two miss buffers, which were

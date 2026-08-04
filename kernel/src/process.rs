@@ -489,6 +489,8 @@ pub struct ProcessData {
     pub elf: ElfInfo,
 
     pub mmap_regions: Vec<MmapRegion>,
+    /// Live `SYS_PIPE_MAP` windows. See [`PipeMap`].
+    pub pipe_maps: Vec<PipeMap>,
     /// 2MB allocations for demand-paged pages. Freed on process exit.
     pub demand_pages: Vec<PageAlloc>,
     /// Ring buffer of recent page faults for crash diagnostics.
@@ -543,10 +545,52 @@ pub struct ThreadData {
     pub syscall_total_ns: u64,
 }
 
+/// One process's window onto a pipe's ring page, from `SYS_PIPE_MAP`.
+///
+/// Recorded so it can be taken away. The page belongs to the pipe, and the
+/// pipe is freed the moment its last reader and writer reference drop — so a
+/// mapping that outlives the process's descriptors is a writable window onto
+/// memory the PMM has already handed to something else. Nothing on the
+/// fd-close path used to touch it.
+///
+/// One entry per *pipe*, not per call: `sys_pipe_map` returns the window it
+/// already made. That is what bounds this vector — every entry needs a live
+/// descriptor naming its pipe, and distinct pipes need distinct descriptors,
+/// so it can never hold more than `fd::MAX_FDS` entries.
+pub struct PipeMap {
+    pub pipe: pipe::PipeId,
+    pub addr: UserAddr,
+}
+
+/// Take back every window onto `pipe` that `maps` holds.
+///
+/// Called when the process's last descriptor for the pipe goes: from there on
+/// nothing keeps the ring page alive, so the mapping has to stop before the
+/// page can be reissued.
+pub fn revoke_pipe_maps(maps: &mut Vec<PipeMap>, pt: &PageTables, pipe: pipe::PipeId) {
+    if !maps.iter().any(|m| m.pipe == pipe) {
+        return;
+    }
+    {
+        let mut addr_space = pt.lock();
+        maps.retain(|m| {
+            if m.pipe != pipe {
+                return true;
+            }
+            addr_space.free_and_unmap(m.addr);
+            false
+        });
+    }
+    crate::arch::apic::tlb_shootdown();
+}
+
 pub struct MmapRegion {
     pub addr: UserAddr,
     pub size: usize,
-    pub _pages: PageAlloc,
+    /// `None` for a `MmapProt::NONE` mapping: the range is reserved so nothing
+    /// else is placed in it, and no physical memory backs a page whose whole
+    /// purpose is to fault.
+    pub _pages: Option<PageAlloc>,
     /// True if this is a MAP_FIXED mapping (virt addr != phys addr).
     pub fixed: bool,
 }
@@ -901,6 +945,7 @@ fn teardown_resources(
     data.elf.elf_alloc.take();
     data.elf.loaded_libs.clear();
     data.mmap_regions.clear();
+    data.pipe_maps.clear();
     data.demand_pages.clear();
     data.elf.reloc_index = None;
 
@@ -1252,8 +1297,21 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let (writable, regions) = {
         let as_guard = addr_space.lock();
 
-        if as_guard.find_region(UserAddr::new(fault_addr)).is_none() {
-            return false;
+        match as_guard.find_region(UserAddr::new(fault_addr)) {
+            None => return false,
+            // A `Mapped` region carries its pages from the moment it is
+            // created, so a fault *inside* one is an access the mapping was
+            // created to refuse — a `MmapProt::NONE` reservation, which is
+            // mapped nowhere on purpose. Filling it here would hand back the
+            // writable page the caller asked not to have.
+            //
+            // The test is on the faulting address and not on the overlap set
+            // below, because a `Mapped` region that merely shares a 2 MiB
+            // window with a demand-paged one still contributes zeros to it.
+            Some((_, region)) if matches!(region.kind, crate::vma::RegionKind::Mapped) => {
+                return false;
+            }
+            Some(_) => {}
         }
 
         // If a 2MB page is already mapped at this region (from a previous fault

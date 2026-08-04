@@ -197,6 +197,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("foreign_disk_untouched", Sched::Parallel),
     ("boot_partition_identity", Sched::Parallel),
     ("double_fault_stack", Sched::Parallel),
+    // Its own boot, its own feature, and it drives the guest only through
+    // stdin — nothing it touches is shared with another test.
+    ("idle_stack_guard", Sched::Parallel),
     ("diskless_boot", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
     // Its whole assertion is that a keystroke injected from the host crossed a
@@ -3696,6 +3699,7 @@ fn run_machine_test(
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
+        "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),

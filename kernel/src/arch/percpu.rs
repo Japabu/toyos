@@ -185,6 +185,27 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, last_armed_ticks) == 260);
 
 const IDLE_STACK_SIZE: usize = 16384; // 16KB
 
+/// One unmapped 4 KiB page below every idle stack.
+///
+/// The idle stack is ordinary heap, so without this an overflow does not fault
+/// — it rewrites whatever the allocator put underneath, and the damage
+/// surfaces later and elsewhere. That is not hypothetical here: the idle loop
+/// runs `log_file::poll`, a filesystem write reaching a block device, whose
+/// measured high water was 11,505 bytes of the 16,384 with the USB command
+/// path still below the probe.
+///
+/// Unmapped rather than [`IST1_GUARD_SIZE`]'s fill pattern, and the difference
+/// is the stack, not the taste: #PF has no IST, so a frame pushed past the
+/// bottom faults again on the same stack and the CPU takes a #DF — which
+/// *does* have a stack, and reports. On IST1 there is no such second chance,
+/// which is why that guard detects after the fact instead of trapping.
+///
+/// Either way the machine halts: a fault on a kernel address is a kernel bug
+/// and `fatal_exception` treats it as fatal. The change is that it is reported
+/// at all — an overflow used to land in the heap and be found later, somewhere
+/// else, as a corrupted allocation.
+const IDLE_GUARD_SIZE: usize = 4096;
+
 /// The double fault stack. Only #DF uses IST1, and what runs on it is the
 /// whole crash report plus `halt_all_cpus` — render, then `panic_flush`.
 ///
@@ -237,11 +258,51 @@ fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     ptr
 }
 
+/// One idle stack and the guard page under it.
+const IDLE_SLOT: usize = IDLE_GUARD_SIZE + IDLE_STACK_SIZE;
+
+/// Idle stacks come out of 2 MiB pages of their own, not the kernel heap.
+///
+/// The guard is a hole in the direct map, and punching one costs the whole
+/// 2 MiB leaf its large page. From the heap that leaf also held hot kernel
+/// structures, and they went from one TLB entry to 512 — measured against the
+/// same tree with the guard as the only difference, `i8042_mouse` fell from
+/// 1006 pointer events to 27 under the full suite, three runs to one. An arena
+/// the stacks alone share keeps that cost where it belongs: 102 of them per
+/// leaf, and nothing else in it.
+///
+/// Never freed, which is what makes the permanent split sound — a leaf handed
+/// back to the PMM would be reissued with a hole in its direct map.
+static IDLE_STACKS: crate::sync::Lock<IdleArena> =
+    crate::sync::Lock::new(IdleArena { pages: alloc::vec::Vec::new(), next: 0, left: 0 });
+
+struct IdleArena {
+    pages: alloc::vec::Vec<crate::mm::pmm::PhysPage>,
+    /// Direct-map address of the next free slot.
+    next: u64,
+    left: usize,
+}
+
+/// A zeroed, 4 KiB-aligned `IDLE_SLOT` from the arena.
+fn alloc_idle_slot() -> u64 {
+    let mut arena = IDLE_STACKS.lock();
+    if arena.left < IDLE_SLOT {
+        let page = crate::mm::pmm::alloc_page(crate::mm::pmm::Category::KernelHeap)
+            .expect("percpu: no physical page for an idle stack");
+        arena.next = page.direct_map().as_mut_ptr::<u8>() as u64;
+        arena.left = crate::mm::PAGE_2M as usize;
+        arena.pages.push(page);
+    }
+    let base = arena.next;
+    arena.next += IDLE_SLOT as u64;
+    arena.left -= IDLE_SLOT;
+    base
+}
+
 fn alloc_idle_stack(percpu: &mut PerCpu) {
-    let layout = Layout::from_size_align(IDLE_STACK_SIZE, 4096).unwrap();
-    let base = unsafe { alloc_zeroed(layout) };
-    assert!(!base.is_null(), "percpu: idle stack alloc failed");
-    percpu.idle_stack_top = base as u64 + IDLE_STACK_SIZE as u64;
+    let base = alloc_idle_slot();
+    crate::mm::paging::guard_kernel_page(base);
+    percpu.idle_stack_top = base + IDLE_SLOT as u64;
     percpu.idle_rsp = percpu.idle_stack_top;
 }
 
@@ -451,6 +512,13 @@ pub fn idle_rsp() -> u64 {
 /// Pointer to the idle_rsp field (for context_switch to save into).
 pub fn idle_rsp_ptr() -> *mut u64 {
     unsafe { &raw mut (*percpu_ptr()).idle_rsp }
+}
+
+/// The byte immediately below this CPU's idle stack — the last byte of its
+/// guard page, and the first thing an overflowing frame reaches.
+#[cfg(feature = "test-idle-guard")]
+pub fn idle_guard_byte() -> u64 {
+    idle_stack_top() - IDLE_STACK_SIZE as u64 - 1
 }
 
 /// Top of this CPU's idle stack.

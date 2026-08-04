@@ -14,6 +14,12 @@ test-early-panic = []
 # SYS_DEBUG action 3: halt every CPU on demand. A test needs a fatal path it
 # can trigger from userland; a shipped kernel must not have one.
 test-fatal-halt = []
+# SYS_DEBUG action 9: read the byte below this CPU's idle stack. The idle stack
+# is heap, so its guard page is the one page in the kernel deliberately absent
+# from the direct map -- and absence is invisible to every log line and every
+# screendump. Nothing else in the kernel addresses that page, which is the
+# whole point of it, so a test cannot reach it any other way.
+test-idle-guard = []
 # SYS_DEBUG action 8: paint the whole panel a colour no glyph contains, over a
 # screen a userland process owns and is still drawing on. Nothing else can put
 # a pixel on the glass behind a running console's back -- the framebuffer is
@@ -187,6 +193,9 @@ test-late-panic = []
 # and the allocator's own recovery cannot be told apart from the filesystem's.
 # These three hold nothing but the allocator, which is the property under
 # test. See `mm::MAX_HEAP_ALLOC`.
+# Also drops `MAX_SYSINFO_THREADS` to 16. The same ceiling one layer up: the
+# real bound is a thread count no guest can reach, so the constant is the only
+# actuator, and the refusal it runs is the shipped one.
 test-heap-ceiling = []
 # The on-target half of the scheduler spec's invariants (spec §10.2, §10.5).
 # Turns on `toyos-sched/check`, which asserts container-vs-state-word agreement

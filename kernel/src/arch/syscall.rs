@@ -366,7 +366,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             if ctx.user_ref::<u32>(UserAddr::new(a1)).is_none() { return bad_addr; }
             process::futex_wake(a1, a2)
         }
-        SYS_MMAP => sys_mmap(a1, a2, a3, a4),
+        SYS_MMAP => sys_mmap(a1, a2, MmapProt(a3), MmapFlags(a4)),
         SYS_MUNMAP => sys_munmap(a1, a2),
         SYS_KILL => process::kill_process(process::Pid::from_raw(a1 as u32)),
         SYS_READ_NONBLOCK => {
@@ -552,6 +552,18 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                 crate::drivers::panic_console::graffiti();
                 0
             }
+            // A read, not a write: the property under test is that the page is
+            // absent, and a read establishes it without the feature also
+            // handing userland a kernel store. Returning 0 is the failure —
+            // without a guard page that byte is dlmalloc's bookkeeping for the
+            // chunk the idle stack lives in, and the read succeeds.
+            #[cfg(feature = "test-idle-guard")]
+            9 => {
+                let addr = super::percpu::idle_guard_byte();
+                log!("SYS_DEBUG: reading the idle stack guard at {addr:#x}");
+                unsafe { core::ptr::read_volatile(addr as *const u8) };
+                0
+            }
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => {
@@ -687,9 +699,25 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
     }
 }
 
+/// Whether `flags` ask for anything that can change what is on the volume.
+///
+/// `WRITE` alone is not the question: `CREATE` makes a file, `TRUNCATE`
+/// destroys one's contents, and `APPEND` is a write position. A read-only open
+/// of a `KernelOnly` mount is fine and stays fine — the fd it hands back has
+/// `writable` false, so nothing downstream needs a second check.
+fn open_modifies(flags: OpenFlags) -> bool {
+    flags.contains(OpenFlags::WRITE)
+        || flags.contains(OpenFlags::CREATE)
+        || flags.contains(OpenFlags::TRUNCATE)
+        || flags.contains(OpenFlags::APPEND)
+}
+
 fn sys_open(path: &str, flags: OpenFlags) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
+    if open_modifies(flags) && !vfs::lock().user_may_modify(&resolved) {
+        return SyscallError::PermissionDenied.to_u64();
+    }
     process::with_fd_owner_data(|data| fd::open(&mut data.fds, &mut *vfs::lock(), &resolved, flags))
 }
 
@@ -699,7 +727,7 @@ fn sys_close(fd_num: u32) -> u64 {
         // Grab pipe IDs before close drops the descriptor
         let wake_r = data.fds.get(fd_num).and_then(|d| d.pipe_id_write()); // writer closed → wake readers
         let wake_w = data.fds.get(fd_num).and_then(|d| d.pipe_id_read());  // reader closed → wake writers
-        let r = fd::close(&mut data.fds, &mut *vfs::lock(), fd_num, pid);
+        let r = fd::close(&mut data.fds, &mut *vfs::lock(), fd_num, pid, &mut data.pipe_maps);
         (r, wake_r, wake_w)
     });
     if let Some(id) = wake_readers { process::wake_pipe_readers(id); }
@@ -778,6 +806,9 @@ fn sys_delete(path: &str) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
+    if !vfs.user_may_modify(&resolved) {
+        return SyscallError::PermissionDenied.to_u64();
+    }
     if vfs.delete(&resolved) { 0 } else { SyscallError::NotFound.to_u64() }
 }
 
@@ -833,15 +864,13 @@ fn fd_result(r: Result<u32, SyscallError>) -> u64 {
 }
 
 fn sys_pipe() -> u64 {
-    let Some((reader, writer)) = pipe::create(process::current_process()) else {
-        return SyscallError::ResourceExhausted.to_u64();
-    };
+    let (reader, writer) = pipe::create(process::current_process());
     process::with_fd_owner_data(|data| {
         let Ok(read_fd) = data.fds.insert(fd::Descriptor::PipeRead(reader)) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
         let Ok(write_fd) = data.fds.insert(fd::Descriptor::PipeWrite(writer)) else {
-            fd::close(&mut data.fds, &mut *vfs::lock(), read_fd, process::current_process());
+            fd::close(&mut data.fds, &mut *vfs::lock(), read_fd, process::current_process(), &mut data.pipe_maps);
             return SyscallError::ResourceExhausted.to_u64();
         };
         ((read_fd as u64) << 32) | write_fd as u64
@@ -915,6 +944,19 @@ fn sys_pipe_id(fd_num: u32) -> u64 {
     })
 }
 
+/// Map a pipe's ring page into the caller.
+///
+/// The window is recorded against the pipe (`process::PipeMap`) so that
+/// closing the last descriptor for it takes the mapping away. It used to be
+/// recorded nowhere: `SYS_PIPE`, `SYS_PIPE_MAP`, close both fds freed the ring
+/// page back to the PMM with the caller's writable mapping of it still live,
+/// and whatever the PMM handed that page to next — another process's pipe, a
+/// kernel heap region, a DMA buffer — was readable and writable by a process
+/// that owned nothing.
+///
+/// A second call for the same pipe returns the window the first one made,
+/// rather than a second window onto the same page. That is what keeps
+/// `pipe_maps` bounded by the descriptor table.
 fn sys_pipe_map(fd_num: u32) -> u64 {
     process::with_fd_owner_data(|data| {
         let pipe_id = match data.fds.get(fd_num) {
@@ -926,14 +968,18 @@ fn sys_pipe_map(fd_num: u32) -> u64 {
         let Some(pipe_id) = pipe_id else {
             return SyscallError::InvalidArgument.to_u64();
         };
-        let Some(phys) = pipe::phys_addr(pipe_id) else {
-            return SyscallError::NotFound.to_u64();
+        if let Some(existing) = data.pipe_maps.iter().find(|m| m.pipe == pipe_id) {
+            return existing.addr.raw();
+        }
+        let Some(phys) = pipe::map_page(pipe_id) else {
+            return SyscallError::ResourceExhausted.to_u64();
         };
         let pt = crate::scheduler::current_address_space()
             .expect("sys_pipe_map: no address space");
         let Some((vaddr, _aligned)) = process::vma_map(&pt, phys.phys(), pipe::PIPE_SIZE as u64) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
+        data.pipe_maps.push(process::PipeMap { pipe: pipe_id, addr: vaddr });
 
         vaddr.raw()
     })
@@ -1112,12 +1158,8 @@ fn sys_connect(name: &str) -> u64 {
     };
 
     let client_pid = process::current_process();
-    let Some((cs_reader, cs_writer)) = pipe::create(client_pid) else { // client → server
-        return SyscallError::ResourceExhausted.to_u64();
-    };
-    let Some((sc_reader, sc_writer)) = pipe::create(client_pid) else { // server → client
-        return SyscallError::ResourceExhausted.to_u64();
-    };
+    let (cs_reader, cs_writer) = pipe::create(client_pid); // client → server
+    let (sc_reader, sc_writer) = pipe::create(client_pid); // server → client
 
     // The client's own end first. Installing it can fail on a full fd table,
     // and a connection queued for a server whose client never got a
@@ -1135,8 +1177,7 @@ fn sys_connect(name: &str) -> u64 {
 
     // Queue the server's end. PipeReader/PipeWriter in the queue keep pipes
     // alive even if the client disconnects before accept — which is also why
-    // the queue needs a depth: each entry pins two 2 MiB rings until the
-    // server accepts, and this return value used to be discarded.
+    // the queue needs a depth, and this return value used to be discarded.
     let queued = crate::listener::push_connection(name, listener::PendingConnection {
         rx: cs_reader,   // server reads from client→server
         tx: sc_writer,   // server writes to server→client
@@ -1144,7 +1185,7 @@ fn sys_connect(name: &str) -> u64 {
     });
     if let Err(e) = queued {
         process::with_fd_owner_data(|data| {
-            fd::close(&mut data.fds, &mut *vfs::lock(), fd, client_pid);
+            fd::close(&mut data.fds, &mut *vfs::lock(), fd, client_pid, &mut data.pipe_maps);
         });
         return match e {
             listener::PushError::NoListener => SyscallError::NotFound.to_u64(),
@@ -1233,7 +1274,20 @@ fn sys_release_shared(token: u64) -> u64 {
     }
 }
 
-fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
+/// Map anonymous memory, honouring `prot`.
+///
+/// `prot` used to be `_prot`: every mapping was readable and writable whatever
+/// the caller asked for, so `userland/libc`'s translation of POSIX
+/// `PROT_NONE` produced a writable guard page and the stack-overflow detection
+/// built on it silently did not exist.
+///
+/// With 2 MiB pages and no `mprotect`, protection is decided once, here. A
+/// mapping without `WRITE` gets a read-only PDE, and `MmapProt::NONE` gets no
+/// PDE at all: the range is reserved so nothing else lands in it, no physical
+/// memory is pinned behind a page whose purpose is to fault, and
+/// `process::handle_page_fault` refuses to fill a `RegionKind::Mapped` region
+/// so the reservation cannot be demand-paged back into existence.
+fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
     // `size` crossed the trust boundary. Zero is a request for nothing and a
     // size whose 2 MiB rounding does not fit cannot be expressed at all;
     // neither is an allocation failure, so neither is ResourceExhausted. The
@@ -1244,7 +1298,8 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
         return SyscallError::InvalidArgument.to_u64();
     }
     let aligned = crate::mm::align_2m(size as usize);
-    let fixed = flags & 4 != 0; // MmapFlags::FIXED
+    let fixed = flags.contains(MmapFlags::FIXED);
+    let writable = prot.contains(MmapProt::WRITE);
 
     // A fixed mapping bypasses `find_gap`, so it has to respect `find_gap`'s
     // range itself: `PageTables::remap` only asserts 2 MiB alignment, so a
@@ -1277,18 +1332,28 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
 
     // Allocate only once the request is known to be satisfiable, so a refused
     // fixed mapping does not leak its pages.
-    let Some(pages) = process::PageAlloc::new(aligned, crate::mm::pmm::Category::Mmap) else {
-        return SyscallError::ResourceExhausted.to_u64();
+    let pages = if prot == MmapProt::NONE {
+        None
+    } else {
+        match process::PageAlloc::new(aligned, crate::mm::pmm::Category::Mmap) {
+            Some(pages) => Some(pages),
+            None => return SyscallError::ResourceExhausted.to_u64(),
+        }
     };
 
     if let Some(start) = fixed_start {
-        let phys = pages.phys();
         let pt = process::current_address_space();
         let end = start + aligned as u64;
         let mut cur = start;
         let mut offset = 0u64;
         while cur < end {
-            pt.lock().remap(UserAddr::new(cur), phys + offset, true);
+            match &pages {
+                Some(pages) => pt.lock().remap(UserAddr::new(cur), pages.phys() + offset, writable),
+                // A fixed request over a range that already carries a mapping
+                // must take it away, or the caller gets an accessible page
+                // exactly where it asked for a fault.
+                None => pt.lock().unmap(UserAddr::new(cur)),
+            }
             cur += crate::mm::PAGE_2M;
             offset += crate::mm::PAGE_2M;
         }
@@ -1304,12 +1369,13 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
         });
         req_addr
     } else {
-        let phys = pages.phys();
         let pt = process::current_address_space();
         let vaddr = process::with_fd_owner_data(|data| {
-            let Some((vaddr, _)) = process::vma_map(&pt, phys, aligned as u64) else {
-                return Err(());
+            let placed = match &pages {
+                Some(pages) => pt.lock().alloc_and_map(pages.phys(), aligned as u64, writable).map(|(v, _)| v),
+                None => pt.lock().alloc_region(aligned as u64, crate::vma::RegionKind::Mapped, false),
             };
+            let Some(vaddr) = placed else { return Err(()) };
             data.mmap_regions.push(process::MmapRegion {
                 addr: vaddr, size: aligned, _pages: pages, fixed: false,
             });
@@ -1384,6 +1450,35 @@ fn sys_thread_join(tid: u64) -> u64 {
     }
 }
 
+/// The most live threads `SYS_SYSINFO` will describe.
+///
+/// A *derived* collection, in the sense the loader's relocation index is: the
+/// caller's buffer bounds what is written and bounds nothing about what is
+/// built, because the sort needs every entry before the first one can be
+/// chosen. One `(Tid, &ProcessEntry, &ThreadEntry)` is 24 bytes and this is
+/// one allocation, so it has to stay under `mm::MAX_HEAP_ALLOC` (2,093,056) —
+/// which it did not: nothing caps the thread count, and any process may call
+/// this, so ~87,000 threads turned an ordinary syscall into the allocator's
+/// fail-fast assert.
+///
+/// 65,536 leaves the allocation at 1,572,864 bytes, a factor of 1.3 under the
+/// ceiling, and the reservation below is exact so there is no growth-by-
+/// doubling overshoot to absorb. A machine with more live threads than this
+/// gets `ResourceExhausted` from `ps`, which is a refusal rather than a
+/// kernel panic — the bound is policy, the ceiling it is derived from is not.
+#[cfg(not(feature = "test-heap-ceiling"))]
+const MAX_SYSINFO_THREADS: usize = 65_536;
+
+/// Sixteen, so the refusal above has a gate.
+///
+/// The bound is a function of `MAX_HEAP_ALLOC` and nothing in this harness can
+/// make 65,536 threads — each carries a 128 KiB kernel stack, which is 8 GiB
+/// of a guest given 128 MiB. Only the constant can move, and moving it runs
+/// the whole refusal: the count, the comparison and the error return are the
+/// shipped ones.
+#[cfg(feature = "test-heap-ceiling")]
+const MAX_SYSINFO_THREADS: usize = 16;
+
 fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     const HEADER_SIZE: usize = 48;
     const ENTRY_SIZE: usize = 64;
@@ -1401,6 +1496,9 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     let table = guard.as_ref().unwrap();
 
     let entry_count: u32 = table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))).count() as u32;
+    if entry_count as usize > MAX_SYSINFO_THREADS {
+        return SyscallError::ResourceExhausted.to_u64();
+    }
 
     buf[0..8].copy_from_slice(&total_mem.to_le_bytes());
     buf[8..16].copy_from_slice(&used_mem.to_le_bytes());
@@ -1412,9 +1510,12 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
 
     let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
 
-    // Collect and sort by (pid, tid) for stable output
+    // Collect and sort by (pid, tid) for stable output. Reserved exactly from
+    // the count above, so the buffer is `entry_count * 24` and not whatever
+    // the next doubling step would have been.
     let mut entries: Vec<(process::Tid, &process::ProcessEntry, &process::ThreadEntry)> =
-        table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))).collect();
+        Vec::with_capacity(entry_count as usize);
+    entries.extend(table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))));
     entries.sort_by_key(|(tid, proc, _)| (proc.pid(), *tid));
 
     let mut pos = HEADER_SIZE;
@@ -1433,7 +1534,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
 
         let memory = if let Some(data) = proc.process_data().try_lock() {
             let demand = data.demand_pages.iter().map(|p| p.size() as u64).sum::<u64>();
-            let mmap = data.mmap_regions.iter().map(|r| r._pages.size() as u64).sum::<u64>();
+            let mmap = data.mmap_regions.iter().filter_map(|r| r._pages.as_ref()).map(|p| p.size() as u64).sum::<u64>();
             let tls = data.elf.dynamic_tls_blocks.values().map(|p| p.size() as u64).sum::<u64>();
             let libs: u64 = data.elf.loaded_libs.iter().map(|l| match &l.memory {
                 crate::elf::LibMemory::Owned(alloc) => alloc.size() as u64,
@@ -1498,7 +1599,7 @@ fn sys_dup2(old_fd: u32, new_fd: u32) -> u64 {
             wake_read = existing.pipe_id_read();
             wake_write = existing.pipe_id_write();
             let mut vfs = vfs::lock();
-            fd::close(&mut data.fds, &mut vfs, new_fd, process::current_process());
+            fd::close(&mut data.fds, &mut vfs, new_fd, process::current_process(), &mut data.pipe_maps);
         }
         match data.fds.insert_at(new_fd, desc) {
             Ok(()) => new_fd as u64,
@@ -1515,6 +1616,9 @@ fn sys_rename(old: &str, new: &str) -> u64 {
     let mut vfs = vfs::lock();
     let old_abs = vfs.resolve_absolute(&cwd, old);
     let new_abs = vfs.resolve_absolute(&cwd, new);
+    if !vfs.user_may_modify(&old_abs) || !vfs.user_may_modify(&new_abs) {
+        return SyscallError::PermissionDenied.to_u64();
+    }
     match vfs.rename(&old_abs, &new_abs) {
         Ok(()) => 0,
         Err(_) => SyscallError::NotFound.to_u64(),
@@ -1525,6 +1629,9 @@ fn sys_mkdir(path: &str) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
+    if !vfs.user_may_modify(&resolved) {
+        return SyscallError::PermissionDenied.to_u64();
+    }
     match vfs.create_dir(&resolved) {
         Ok(()) => 0,
         Err(e) => e.to_u64(),
@@ -1535,6 +1642,9 @@ fn sys_rmdir(path: &str) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
+    if !vfs.user_may_modify(&resolved) {
+        return SyscallError::PermissionDenied.to_u64();
+    }
     vfs.remove_dir(&resolved);
     0
 }
@@ -1543,6 +1653,9 @@ fn sys_symlink(target: &str, link: &str) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, link);
+    if !vfs.user_may_modify(&resolved) {
+        return SyscallError::PermissionDenied.to_u64();
+    }
     match vfs.create_symlink(&resolved, target) {
         Ok(()) => 0,
         Err(e) => {
@@ -1857,6 +1970,25 @@ fn sys_process_stats(child_pid: process::Pid, out: &mut toyos_abi::syscall::Proc
     }
 }
 
+/// Describe every loaded module into `buf`; return the length it *needs*.
+///
+/// Same contract as `sys_getcwd` and `sys_readdir`, and for the same reason.
+/// This used to answer a too-small buffer with a bare `InvalidArgument` while
+/// the ABI wrapper's doc comment claimed the required size was "encoded" in it
+/// — a claim `SyscallError` cannot carry, so a caller had no way to size a
+/// retry and no way to learn that was why it failed.
+///
+/// The answer is a byte length and never a module count: the records carry
+/// packed path strings, so a count cannot size the buffer. Nothing is written
+/// unless all of it fits, which makes an empty buffer a size query.
+///
+/// The record array is `buf[..records[0].path_offset]` — every module writes
+/// its path after the last record, so the first module's `path_offset` is
+/// where the array ends.
+///
+/// Every module holds address space for as long as it is loaded, so the count
+/// is bounded by the process's own arena and the required length stays far
+/// below the range `SyscallError` encodes — it can never be misread as one.
 fn sys_query_modules(buf: &mut [u8]) -> u64 {
     use toyos_abi::syscall::ModuleInfo;
     let info_size = core::mem::size_of::<ModuleInfo>();
@@ -1870,7 +2002,7 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
 
         let required = module_count * info_size + total_path_bytes;
         if buf.len() < required {
-            return SyscallError::InvalidArgument.to_u64();
+            return required as u64;
         }
 
         let mut path_offset = (module_count * info_size) as u32;
@@ -1916,7 +2048,7 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
             path_offset += lib_path_bytes.len() as u32;
         }
 
-        module_count as u64
+        required as u64
     })
 }
 

@@ -277,10 +277,36 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
 }
 
 /// Close an fd. Flushes modified files, handles pipe refcounts.
-pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
+/// Release one descriptor.
+///
+/// `pipe_maps` is the process's live `SYS_PIPE_MAP` windows, and it is a
+/// parameter because this is the one place every descriptor release passes
+/// through. A window's warrant is the descriptor: past the last one naming a
+/// pipe, nothing holds the ring page and the PMM may hand it to anything, so
+/// the mapping has to go with the descriptor rather than with the process.
+///
+/// [`close_all`] takes no such argument on purpose — the only caller is
+/// process teardown, which destroys the address space the windows are in.
+pub fn close(
+    table: &mut FdTable,
+    vfs: &mut Vfs,
+    fd: u32,
+    pid: Pid,
+    pipe_maps: &mut alloc::vec::Vec<crate::process::PipeMap>,
+) -> u64 {
     let Some(desc) = table.remove(fd) else {
         return SyscallError::NotFound.to_u64();
     };
+    for id in [desc.pipe_id_read(), desc.pipe_id_write()].into_iter().flatten() {
+        let still_held = table
+            .iter()
+            .any(|(_, d)| d.pipe_id_read() == Some(id) || d.pipe_id_write() == Some(id));
+        if !still_held {
+            if let Some(pt) = crate::scheduler::current_address_space() {
+                crate::process::revoke_pipe_maps(pipe_maps, &pt, id);
+            }
+        }
+    }
     let sources = [desc.read_source(), desc.write_source()];
     if sources.iter().any(|s| s.is_some()) {
         crate::io_uring::remove_fd(&sources);
@@ -513,6 +539,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
         Descriptor::PipeWrite(w) | Descriptor::TtyWrite(w) => {
             match pipe::try_write(w.id(), buf) {
                 Some(pipe::PipeWrite::BrokenPipe) => Some(SyscallError::NotFound.to_u64()),
+                Some(pipe::PipeWrite::NoMemory) => Some(SyscallError::ResourceExhausted.to_u64()),
                 Some(pipe::PipeWrite::Wrote(n)) => Some(n as u64),
                 None => None,
             }
@@ -520,6 +547,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
         Descriptor::Socket { tx, .. } => {
             match pipe::try_write(tx.id(), buf) {
                 Some(pipe::PipeWrite::BrokenPipe) => Some(SyscallError::NotFound.to_u64()),
+                Some(pipe::PipeWrite::NoMemory) => Some(SyscallError::ResourceExhausted.to_u64()),
                 Some(pipe::PipeWrite::Wrote(n)) => Some(n as u64),
                 None => None,
             }

@@ -582,7 +582,7 @@ fn process_close(ring_id: RingId, sqe: &IoUringSqe) {
     let pid = process::current_process();
 
     let result = process::with_fd_owner_data(|data| {
-        fd::close(&mut data.fds, &mut *crate::vfs::lock(), fd_num, pid)
+        fd::close(&mut data.fds, &mut *crate::vfs::lock(), fd_num, pid, &mut data.pipe_maps)
     });
 
     post_cqe_locked(ring_id, user_data, result as i32, 0);

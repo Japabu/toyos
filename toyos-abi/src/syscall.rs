@@ -247,6 +247,12 @@ impl core::ops::BitOrAssign for OpenFlags {
 }
 
 /// Memory protection flags for [`mmap`].
+///
+/// The kernel maps 2 MiB pages and has no `mprotect`, so what a mapping is
+/// created with is what it stays. `NONE` reserves the address range and maps
+/// nothing at all: any access to it faults, which is the guard page a libc
+/// asks for. Anything without `WRITE` is mapped read-only, and a store to it
+/// is a protection violation that kills the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MmapProt(pub u64);
 
@@ -254,6 +260,8 @@ impl MmapProt {
     pub const NONE: Self = Self(0);
     pub const READ: Self = Self(1);
     pub const WRITE: Self = Self(2);
+
+    pub const fn contains(self, flag: Self) -> bool { self.0 & flag.0 != 0 }
 }
 
 impl core::ops::BitOr for MmapProt {
@@ -269,6 +277,8 @@ impl MmapFlags {
     pub const ANONYMOUS: Self = Self(1);
     pub const PRIVATE: Self = Self(2);
     pub const FIXED: Self = Self(4);
+
+    pub const fn contains(self, flag: Self) -> bool { self.0 & flag.0 != 0 }
 }
 
 impl core::ops::BitOr for MmapFlags {
@@ -963,10 +973,15 @@ pub struct ModuleInfo {
 
 /// Query all loaded modules (exe + dlopen'd libs) in the current process.
 ///
-/// Writes an array of `ModuleInfo` followed by path strings into `buf`.
-/// Returns the number of modules on success.
-/// Returns `Err(InvalidArgument)` with the required buffer size encoded
-/// if `buf` is too small.
+/// Returns the number of **bytes** the description needs, which is a count
+/// only of bytes: the records carry packed path strings, so a module count
+/// cannot size a retry. `n <= buf.len()` means the description is in the
+/// buffer; `n > buf.len()` means nothing was written and `n` is what to
+/// allocate. An empty buffer is therefore a size query.
+///
+/// The records occupy `buf[..records[0].path_offset]` — each module's path is
+/// written after the last record, so the first one's `path_offset` is where
+/// the array ends.
 pub fn query_modules(buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_QUERY_MODULES, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0)).map(|n| n as usize)
 }
