@@ -2405,6 +2405,25 @@ against.
 nothing at all — `compile::testcases_dir()` returns only `tests/testcases/tinycc`
 and no other Rust file mentions `pp_tcc`.
 
+### `toyos-cc` is not reproducible: the same source gives a different object
+
+Measured 2026-08-05. One binary, one source file, three runs:
+`d_event.c` from doomgeneric produced three objects that differ from each other
+at byte 345. The sizes are identical and the code is identical; what moves is
+where each BSS symbol lands — `eventhead`, `events` and `eventtail` swap
+between offsets 0, 4 and 0x500 from run to run. A `HashMap` iteration order
+somewhere in `codegen` is the obvious suspect and was not chased.
+
+Across doomgeneric's 82 sources, comparing one binary against *itself* on two
+runs, 14 objects differ by disassembly. So a byte-for-byte object diff is not
+available as evidence that a compiler change was inert, and anyone who tries
+one will find 40-odd differences and no change behind them. What does work is
+diffing preprocessed output, which is stable — that comparison was byte
+identical on all 82 across the `__attribute__` change.
+
+Consequences beyond that: no build cache anywhere can trust an object hash, and
+a miscompilation that depends on symbol placement would not reproduce.
+
 ### `toyos-cc` does not implement packed bitfield layout, and says so
 
 `__attribute__((packed))` on a struct with a bitfield member is refused —
