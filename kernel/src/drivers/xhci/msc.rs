@@ -11,7 +11,7 @@ use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
 use super::device::Endpoint;
-use super::{Restart, Trb, TrbRing, XhciController, StorageGeometry, PAGE};
+use super::{Disk, Restart, Trb, TrbRing, XhciController, StorageGeometry, PAGE};
 use super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, TRB_CONFIGURE_EP, OFF_INPUT_CTX};
 use super::USB_TIMEOUT_NS;
 use super::{MSC_IN_RING, MSC_OUT_RING, MSC_CBW, MSC_CSW, MSC_SCRATCH, MSC_SCRATCH_LEN};
@@ -59,8 +59,6 @@ pub struct MscInterface {
 #[derive(Clone, Copy)]
 pub struct MscDevice {
     slot_id: u8,
-    /// The root-hub port this disk is on, which is what a disconnect names.
-    pub(super) port_idx: u8,
     iface: u8,
     in_ep: u8,
     out_ep: u8,
@@ -103,12 +101,6 @@ impl MscDevice {
         !self.failed
     }
 
-    /// The pool block this disk's rings and buffers live in, so its controller
-    /// can give it back once the slot naming that memory is disabled.
-    pub(super) fn block(&self) -> usize {
-        self.block
-    }
-
     pub fn geometry(&self) -> StorageGeometry {
         StorageGeometry {
             logical_block_bytes: self.logical_block_bytes,
@@ -129,9 +121,15 @@ impl MscDevice {
 /// transfer it describes because the check that bounds it now runs before this
 /// value exists.
 enum Bot {
-    /// CSW status 0. `residue` is what the device did not move, which for a
-    /// READ or WRITE means the command did less than it was asked.
-    Done { residue: u32 },
+    /// CSW status 0, with the bytes of the data phase that are really there.
+    ///
+    /// **Two things count that number and the smaller one is the answer.** The
+    /// controller reports what it moved into the buffer; the device reports in
+    /// the CSW what it did not move. Keeping only the device's account — which
+    /// is what this variant used to carry — means a device that under-delivers
+    /// a READ(10) and then claims a residue of zero hands the caller whatever
+    /// the last transfer left in the data window, from whatever LBA that was.
+    Done { delivered: u32 },
     /// CSW status 1: the device understood and refused. Sense data says why.
     Failed,
 }
@@ -222,6 +220,81 @@ mod transport_break {
     }
 }
 
+/// Make the controller's account of one READ(10) data phase and the device's
+/// own account of it disagree, once, where the harness asks for it.
+///
+/// **A kernel feature because nothing on the host side can stage it.** QEMU's
+/// `usb-storage` derives the CSW residue from the same transfer the xHC
+/// completed, so the two accounts of how many bytes moved are one number there
+/// and can never contradict each other — no device, drive or machine property
+/// makes them, and `rerror` fails the whole command rather than under-filling
+/// one buffer. On real hardware they are two: a device that ends its data
+/// phase early and then reports `dCSWDataResidue` as zero is a firmware bug
+/// that ships, and it is the one this driver used to believe.
+///
+/// **What is replaced is the transfer, not the verdict.** The completion code
+/// is the controller's own, the CSW is the device's own, and the bytes put back
+/// into the tail of the window are the ones the *previous* transfer left there
+/// — read off that window rather than invented, so what a caller is handed on
+/// the unfixed path is another LBA's data exactly as it would be on the wire.
+/// Only the residue is the injection's, and it names bytes that really are not
+/// this transfer's. Same reason `usb-transport-break` and `xhci-one-slot`
+/// exist.
+#[cfg(feature = "usb-short-read")]
+pub(super) mod short_read {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::mm::KernelSlice;
+
+    /// How many bytes at the end of the buffer the controller is made not to
+    /// have moved. One 512-byte sector out of the 4096 a block read asks for:
+    /// a device stopping one sector short is the shape firmware bugs take, and
+    /// it leaves the rest of the block correct so that what fails the caller's
+    /// comparison is unambiguously the held tail.
+    pub const SHORT_BY: u32 = 512;
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    pub fn arm() {
+        ARMED.store(true, Ordering::Relaxed);
+    }
+
+    /// The tail of a data buffer, held out of the way of the transfer about to
+    /// run over it.
+    pub struct Held {
+        at: usize,
+        bytes: [u8; SHORT_BY as usize],
+    }
+
+    /// Copy the last [`SHORT_BY`] bytes of the buffer at `at` out, if this is
+    /// the transfer that was asked for.
+    pub fn hold(dma: &KernelSlice, at: usize, len: u32, eligible: bool) -> Option<Held> {
+        if !eligible || len < SHORT_BY || !ARMED.swap(false, Ordering::Relaxed) {
+            return None;
+        }
+        let at = at + (len - SHORT_BY) as usize;
+        let mut bytes = [0u8; SHORT_BY as usize];
+        unsafe {
+            core::ptr::copy_nonoverlapping(dma.ptr_at(at) as *const u8, bytes.as_mut_ptr(), bytes.len());
+        }
+        Some(Held { at, bytes })
+    }
+
+    /// Put it back, and add the bytes it covers to the controller's residue.
+    pub fn release(
+        dma: &KernelSlice,
+        held: Option<Held>,
+        completion: Option<(u32, u32)>,
+    ) -> Option<(u32, u32)> {
+        let Some(held) = held else { return completion };
+        let (code, residue) = completion?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(held.bytes.as_ptr(), dma.ptr_at(held.at), held.bytes.len());
+        }
+        Some((code, residue + SHORT_BY))
+    }
+}
+
 /// The completion of one SCSI command, after the transport's own recovery.
 enum Scsi {
     Ok { delivered: u32 },
@@ -301,37 +374,39 @@ impl Host<'_> {
 }
 
 impl XhciController {
-    /// Run `f` against the `index`-th disk, writing the device's state back
-    /// whatever `f` did with it. `None` for an index no disk is behind, which
-    /// after an unplug includes an index a disk used to be behind.
+    /// Run `f` against the disk in this controller's `at`-th pool block,
+    /// writing the device's state back whatever `f` did with it. `None` for a
+    /// block with no disk behind it, which after an unplug includes one a disk
+    /// used to be behind.
     fn with_storage<R>(
         &mut self,
-        index: usize,
-        f: impl FnOnce(&mut Self, &mut MscDevice) -> R,
+        at: usize,
+        f: impl FnOnce(&mut Self, &mut Disk) -> R,
     ) -> Option<R> {
-        let mut dev = (*self.storage.get(index)?)?;
-        let out = f(self, &mut dev);
-        self.storage[index] = Some(dev);
+        let mut disk = self.msc.get(at)?.disk?;
+        let out = f(self, &mut disk);
+        self.msc[at].disk = Some(disk);
         Some(out)
     }
 
-    pub(super) fn msc_read(&mut self, index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
-        self.with_storage(index, |ctrl, dev| {
-            ctrl.transfer_blocks(dev, lba, count, Host::Into(buf))
+    pub(super) fn msc_read(&mut self, at: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+        self.with_storage(at, |ctrl, disk| {
+            ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::Into(buf))
         })
         .unwrap_or(false)
     }
 
-    pub(super) fn msc_write(&mut self, index: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
-        self.with_storage(index, |ctrl, dev| {
-            ctrl.transfer_blocks(dev, lba, count, Host::From(buf))
+    pub(super) fn msc_write(&mut self, at: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
+        self.with_storage(at, |ctrl, disk| {
+            ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::From(buf))
         })
         .unwrap_or(false)
     }
 
-    pub(super) fn msc_flush(&mut self, index: usize) -> bool {
-        let disk = self.disk_base + index;
-        self.with_storage(index, |ctrl, dev| {
+    pub(super) fn msc_flush(&mut self, at: usize) -> bool {
+        self.with_storage(at, |ctrl, disk| {
+            let number = disk.index;
+            let dev = &mut disk.dev;
             if dev.failed {
                 return false;
             }
@@ -352,7 +427,7 @@ impl XhciController {
             if outcome.unimplemented() {
                 if !dev.no_write_cache {
                     dev.no_write_cache = true;
-                    log!("usb-storage: disk {disk} does not implement SYNCHRONIZE CACHE \
+                    log!("usb-storage: disk {number} does not implement SYNCHRONIZE CACHE \
                          (sense 0x05/0x20/0x00); its writes are durable once they complete");
                 }
                 return true;
@@ -475,7 +550,7 @@ impl XhciController {
         data_in: bool,
     ) -> Scsi {
         match self.bot(dev, cdb, cdb_len, data_phys, data_len, data_in) {
-            Ok(Bot::Done { residue }) => Scsi::Ok { delivered: data_len - residue },
+            Ok(Bot::Done { delivered }) => Scsi::Ok { delivered },
             Ok(Bot::Failed) => {
                 let (key, asc, ascq) = self.request_sense(dev);
                 Scsi::Refused { key, asc, ascq }
@@ -504,8 +579,12 @@ impl XhciController {
         let cdb = [0x03u8, 0, 0, 0, 18, 0];
         // Recursion is not possible: a failing REQUEST SENSE goes through
         // `bot` directly, so it cannot ask for sense data about itself.
+        // ASCQ is byte 13 of the fixed-format sense data, so fourteen bytes is
+        // what makes all three readable. Short of that they are whatever the
+        // zeroing above left, and zero ASC/ASCQ is exactly the value
+        // [`Scsi::unimplemented`] tests for.
         match self.bot(dev, &cdb, 6, phys, 18, true) {
-            Ok(Bot::Done { residue }) if residue <= 5 => {
+            Ok(Bot::Done { delivered }) if delivered >= 14 => {
                 let mut resp = [0u8; 18];
                 unsafe {
                     copy_nonoverlapping(
@@ -532,7 +611,12 @@ impl XhciController {
         what: &'static str,
     ) -> Result<(), Broke> {
         match self.bulk(dev, in_dir, phys, len) {
-            Some((CC_SUCCESS, 0)) => Ok(()),
+            // Short Packet is how an xHC reports a transfer that ended on a
+            // packet smaller than the endpoint's maximum, which a 13-byte CSW
+            // on a 512-byte endpoint is. With no residue behind it the whole
+            // block arrived, and reading the code alone made a complete status
+            // phase an error.
+            Some((CC_SUCCESS | CC_SHORT_PACKET, 0)) => Ok(()),
             Some((CC_SUCCESS | CC_SHORT_PACKET, residue)) => Err(Broke::Short {
                 phase: what,
                 moved: len.saturating_sub(residue),
@@ -574,21 +658,37 @@ impl XhciController {
         let cbw_phys = dma.phys() + (dev.block + MSC_CBW) as u64;
         self.framed_phase(dev, false, cbw_phys, CBW_LEN, "command")?;
 
+        // What the *controller* says reached the buffer, which is the account
+        // the CSW's residue is checked against below.
+        let mut moved = 0u32;
         if data_len > 0 {
             #[cfg(feature = "usb-transport-break")]
             if cdb.first() == Some(&0x2A) {
                 transport_break::arm();
             }
-            match self.bulk(dev, data_in, data_phys, data_len) {
-                Some((CC_SUCCESS | CC_SHORT_PACKET, _)) => {}
+            #[cfg(feature = "usb-short-read")]
+            let held = short_read::hold(
+                &dma,
+                (data_phys - dma.phys()) as usize,
+                data_len,
+                data_in && cdb.first() == Some(&0x28),
+            );
+            let completion = self.bulk(dev, data_in, data_phys, data_len);
+            #[cfg(feature = "usb-short-read")]
+            let completion = short_read::release(&dma, held, completion);
+            match completion {
+                Some((CC_SUCCESS | CC_SHORT_PACKET, unmoved)) => {
+                    moved = data_len.saturating_sub(unmoved);
+                }
                 // A stalled data phase is ordinary — an unsupported command
                 // or a read past the end stalls here — and the CSW still
                 // arrives once the endpoint is unhalted. Recovering and then
                 // reading the status is what turns it into a clean refusal.
-                Some((CC_STALL, _)) => {
+                Some((CC_STALL, unmoved)) => {
                     if !self.restart_bulk(dev, data_in) {
                         return Err(Broke::Stall { phase: "data" });
                     }
+                    moved = data_len.saturating_sub(unmoved);
                 }
                 Some((code, _)) => return Err(Broke::Code { phase: "data", code }),
                 None => return Err(Broke::Silence { phase: "data" }),
@@ -632,7 +732,10 @@ impl XhciController {
             return Err(Broke::Residue { unmoved: residue, of: data_len });
         }
         match status {
-            0 => Ok(Bot::Done { residue }),
+            // The device's account of the transfer and the controller's, and
+            // the driver keeps neither on trust: what a caller may read is what
+            // both of them say arrived.
+            0 => Ok(Bot::Done { delivered: moved.min(data_len - residue) }),
             1 => Ok(Bot::Failed),
             _ => Err(Broke::PhaseError),
         }
@@ -725,11 +828,11 @@ pub fn bind(
     port_idx: u8,
     info: &MscInterface,
 ) {
-    // Claimed before the endpoints are configured and never released, so the
-    // block cannot be reissued while the previous holder's contexts still name
-    // it. `storage.len()` was the old answer and is a different question: it
-    // counts the disks that *finished*.
-    let Some(block) = ctrl.claim_msc_block() else {
+    // Claimed before the endpoints are configured and released only by the
+    // teardown that disables this slot, so the block cannot be reissued while
+    // the previous holder's contexts still name it. `storage.len()` was the old
+    // answer and is a different question: it counts the disks that *finished*.
+    let Some((at, block)) = ctrl.claim_msc_block(port_idx) else {
         log!("usb-storage: slot {slot_id} is the {}th disk; this driver serves {}",
             ctrl.msc_blocks_taken() + 1, super::MSC_BLOCKS);
         return;
@@ -780,7 +883,6 @@ pub fn bind(
 
     let mut dev = MscDevice {
         slot_id,
-        port_idx,
         iface: info.iface_num,
         in_ep: info.in_ep.addr,
         out_ep: info.out_ep.addr,
@@ -802,21 +904,20 @@ pub fn bind(
     if !bring_up(ctrl, &mut dev) {
         return;
     }
-    // The machine-wide number, which is what `usb_storage::open` indexes by:
-    // this controller's disks start at `disk_base`, so on a two-controller
-    // machine printing the local index would call two different disks "disk 0".
-    // It is `storage.len()` and no longer the pool-block selector as well —
-    // those are two different questions and the block is claimed above.
+    // The machine-wide number, taken here because here is where there is a disk
+    // to give one to: it is what `usb_storage::open` indexes by and what a mount
+    // holds for its whole life, so it must not move when some other controller
+    // binds or loses a disk — see [`super::DISKS_BOUND`].
+    let index = super::DISKS_BOUND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     log!(
-        "usb-storage: disk {} ready on slot {slot_id}, {} blocks of {} B \
+        "usb-storage: disk {index} ready on slot {slot_id}, {} blocks of {} B \
          ({} MiB), msc_block +{:#x}",
-        ctrl.disk_base + ctrl.storage.len(),
         dev.blocks,
         dev.logical_block_bytes,
         dev.blocks * HOST_BLOCK as u64 / (1024 * 1024),
         block
     );
-    ctrl.storage.push(Some(dev));
+    ctrl.msc[at].disk = Some(Disk { index, dev });
 }
 
 /// TEST UNIT READY, INQUIRY and READ CAPACITY: everything between a configured
