@@ -3497,6 +3497,12 @@ fn desktop_typing_damage() -> Result<(), String> {
 
     // Eight lines, each typed a character at a time — the shell's echo of each
     // keystroke is a present of its own, which is the thing being measured.
+    //
+    // Eight and not more because the terminal must not scroll while this runs.
+    // A scroll changes every cell and is honestly a whole-window repaint, so it
+    // would fail this gate for the one reason that is not a defect. The window
+    // is 58 text rows on this screen, `shell_answers` leaves under ten of them
+    // used, and eight commands echoed and answered are twenty-four.
     const NONCE: &str = "typing-damage-gate";
     {
         let mut input = qemu::QmpInput::open(qemu.qmp_socket());
