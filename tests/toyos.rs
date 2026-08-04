@@ -120,6 +120,10 @@ const RUST_SKIP: &[&str] = &[
     // printed four hundred lines to a console nothing was reading and passed
     // on its exit code.
     "test_screen_churn",
+    // Spawns `/bin/doom`, which `tests/testcases` does not carry — doom is
+    // 4 MiB and every other test boots that config. `doom_sound_flood` runs it
+    // on `tests/doomcase`.
+    "doom_sound_flood",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and

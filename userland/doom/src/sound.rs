@@ -223,10 +223,17 @@ impl Mixer {
             let gen = state >> 1;
             if gen != ch.gen {
                 let sound = CHANNEL_SOUND[i].load(Ordering::Acquire);
+                if CHANNEL_STATE[i].load(Ordering::Acquire) != state {
+                    // A start landed inside this read, so the pointer belongs
+                    // to a generation this one does not name. Take the record
+                    // whole next period instead — a sound started twice from
+                    // the beginning is 2.9 ms of its onset played twice.
+                    continue;
+                }
                 // SAFETY: `toyos_start_sound` publishes the pointer before the
-                // generation that names it, so a generation this callback has
-                // not seen has a `CachedSound` behind it — leaked at cache
-                // time and never freed.
+                // generation that names it, and the re-read above establishes
+                // that this pointer is the one that generation published. A
+                // `CachedSound` is leaked at cache time and never freed.
                 ch.sound = Some(unsafe { &*sound });
                 ch.pos = 0;
                 ch.gen = gen;
