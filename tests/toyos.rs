@@ -355,6 +355,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("heap_ceiling_recovery", Sched::Parallel),
     ("iommu_context_absent", Sched::Parallel),
     ("iommu_empty_domain", Sched::Parallel),
+    // Two boots, one kernel build each: the probe's own, and the plain kernel
+    // on the same machine to show it stays out of an ordinary boot.
+    ("hda_probe", Sched::Parallel),
     ("serial_vocabulary", Sched::Parallel),
 ];
 
@@ -4320,6 +4323,8 @@ fn run_machine_test(
         "iommu_discovery" => common::iommu::iommu_discovery(test_config, c_bins, rust_bins),
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
+        // Body in `tests/common/hda.rs`, same reason.
+        "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
