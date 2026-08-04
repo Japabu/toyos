@@ -929,16 +929,19 @@ by *what the assertion is* rather than by what the registration said:
 | longest-job-first on a measured profile | parallel phase | see §5.4.5 |
 | inert-actuator folding | image builds | 5 kernel variants → 1 |
 
-**Where it landed.** One suite, 240/240 green, at the default width of 12
-(§5.4.7), on a host whose load was falling from 18.9 to 9.0 with no other guest
-up at the end:
+**Where it landed.** 240/240 green at the default width of 12 (§5.4.7), twice,
+on a host with other worktrees building and booting throughout — `uptime` load
+18.9 and 18.0 at the two starts:
 
-| | seconds |
-|---|---:|
-| parallel phase, 234 tests in 63 tasks | **43.8** |
-| serial tail, 6 tests | **33.6** |
-| gate A, 4 boots | **~30** |
-| **suite** | **107.3** |
+| | run 1 | run 2 |
+|---|---:|---:|
+| parallel phase, 234 tests in 63 tasks | 43.8 | 53.5 |
+| serial tail, 6 tests | 33.6 | 34.7 |
+| gate A, 4 boots | ~30 | ~30 |
+| **suite** | **107.3** | **118.2** |
+
+Neither was taken on a quiet host, which is the honest way round: **the target
+is met under the load the tree actually runs at.**
 
 Against the starting point: **327.5 s at width 4** before this wave and before
 `screen_console_scroll`'s cut, and **433.8 s** measured on this branch's base
@@ -1078,13 +1081,15 @@ at twelve is 48 guests on 14 cores. The counting semaphore
 a per-suite number with a machine-wide cost — which is the same warning §4.1
 constraint 3 gave at four and is now three times louder.
 
-**Confidence: one clean run each.** Four more were attempted and none of them is
-a measurement: two died on `this worktree and the shared sysroot disagree about
-toyos-abi/src` when another worktree claimed the sysroot mid-run, one spent 84 s
-queued behind the exclusive phase that followed, and one ran under five
-concurrent suites. That is the honest state of the evidence for 12 over 8; the
-direction is consistent across every pair taken since the `drain_serial` fix,
-and the margin is not.
+**Confidence: two clean runs at 12, one at 8.** Width 12 came in at 107.3 s and
+118.2 s; width 8 at 123.1 s on a *quieter* host than either, and at 351.2 s on a
+much busier one. Nine further attempts are not measurements and none is reported:
+seven died on `this worktree and the shared sysroot disagree about toyos-abi/src`
+when another worktree claimed the sysroot mid-run — the signature is a dozen or
+more identical refusals, one per test that tried to build after the claim — one
+spent 84 s queued behind the exclusive phase that followed, and one ran under
+five concurrent suites. The direction has been consistent in every pair taken
+since the `drain_serial` fix; the margin has one sample.
 
 ### 5.4.6 Ledger 3 — recycling and contamination
 

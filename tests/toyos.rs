@@ -42,9 +42,10 @@ enum Sched {
 /// The width with no `--jobs`, and where it came from.
 ///
 /// 14 cores and about three host threads a guest divides out to four. The suite
-/// says twelve: on one tree in one session, **123.1 s wide eight and 107.3 s
-/// wide twelve**, both green, with the parallel phase at 59.1 s and 43.8 s. A
-/// guest here is mostly *waiting* — for a marker, for a debounce, for a
+/// says twelve: on one tree in one session, **123.1 s wide eight and 107.3 s /
+/// 118.2 s wide twelve**, all green, with the parallel phase at 59.1 s against
+/// 43.8 s and 53.5 s — and the eight was measured on the quieter host of the
+/// three. A guest here is mostly *waiting* — for a marker, for a debounce, for a
 /// device — which is why this is a measurement and not a division.
 ///
 /// **Twelve is the number for one suite on this host, and the host has no
