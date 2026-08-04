@@ -610,6 +610,109 @@ and adopt-by-witness — which is gated on the owner's review of its §4. H9 wai
 on that, and until then master volume resets to its default on every boot on the
 T14. In the harness it persists, because the harness has a disk.
 
+### 6.3 H0 is built. How to run it, and how to read what comes back
+
+**Built**, behind the kernel feature `hda-probe`
+(`kernel/src/drivers/hda_probe.rs`, ~640 lines). It runs last in the peripheral
+phase, over **every** class-0403 function the PCI walk returned rather than the
+first, does no DMA at all — the verbs go through the immediate-command
+registers — and bounds every wait. Deleted at H9 with the feature.
+
+The harness arm is `cargo test -- hda_probe` on `Profile::MetalHda`, a machine
+built so one boot runs both arms of each question below (§5.1 lists what that
+does and does not certify). It also boots the same machine with a plain kernel
+and requires no `hda:` line at all, which is the only assertion that binds
+"nothing in the ordinary boot path takes that controller out of reset".
+
+#### Running it on the T14
+
+```
+cargo run -- --diag-boot --build-only          # target/bootable-diag.img
+```
+
+**The one thing that is not wired**: `src/build.rs` hands the kernel no
+features on the `--diag-boot` path, and that file was another agent's ground
+for the whole of H0's implementation. Until one line there adds `hda-probe` to
+`Boot::Diag`, the flashed image carries the feature only if the kernel is built
+with it by hand. This is the sole item between H0 and the T14 and it is
+recorded in `specs/known-issues.md`.
+
+Flash, boot, and — **before pressing any other key** — press Mute, then Volume
+Down, then Volume Up. Then read `/log/kernel.log` off the stick on the Mac.
+Everything the probe says is a line beginning `hda:`, and the four verdict
+lines are `hda: (a)`, `(b)`, `(c)`, `(d)`.
+
+#### (a) Handoff — what each answer means
+
+| Line | What it means for the plan |
+|---|---|
+| `(a) scope members=1 … a singleton` | `iommu-spec.md` §7.3 permits handoff on this count. Unblocked. |
+| `(a) scope members=N … not a singleton` | **The expected answer on this machine**, since `00:1f.3` is one of five functions. §7.3 refuses the device *as the rule is written*, and it refuses `00:1f.6` — gate N's metal target — with it. This does **not** end the track; it moves the decision into `iommu-spec.md`, because the rule was written for peer-to-peer behind a switch and a root-complex-integrated function is not that. `hda: scope upstream-bridge none` on the same boot is the evidence: there is no switch, so there is no port whose ACS could be checked, and what two functions of one root-complex device can do to each other is not reported by any register on the bus. **Owner's call**, and it is `iommu-spec.md` §7.3's to restate — not this file's. Until it is restated, both audio and networking on the T14 are blocked behind it, and that is the single most consequential thing H0 can return. |
+| `(a) rmrr none` | Nothing to resolve. |
+| `(a) rmrr <range>` | §7.4 refuses the device for userspace handoff outright, and unlike the scope rule this one has a hard reason: identity-mapping firmware's range into an untrusted driver's domain hands that driver memory it was never given. **This one really does end §1's answer for this device** — either HDA stays kernel-resident (which §8 item 2 forbids) or the T14 has no audio. Escalate rather than work around. |
+| `(a) msi vectors=N msix=none` | The expected and the *preferred* answer (§4.2 item 2): the capability is in config space, so there is no MSI-X table inside a BAR to carve out. |
+| `(a) msi=none msix=none` | `userspace-drivers-spec.md` §4.5 makes the function ineligible. No known real part is built this way; if the T14 says it, suspect the probe before the silicon. |
+| `(a) bar0 … movable=y 2m-page-neighbours=0` | `userspace-drivers-spec.md` stage 3's 2 MiB re-assignment has somewhere to go. |
+| `(a) bar0 … 2m-page-neighbours=N` (N>0) | The BAR shares its 2 MiB page with the named functions' registers, so it cannot be handed over as it sits. Stage 3's relocation is then load-bearing rather than tidy, and `movable=y` is what says it is possible at all. |
+| `(a) unit=N … ecap.sc=y` | §4.4 item 4's general answer holds: snoop-force in every mapping, no config-space write path, and the vendor no-snoop control is moot. |
+| `(a) … ecap.sc=n` | Risk 6 realised. The named-offset config write comes back as a specific proposal, and §4.4 item 4 is the record of why it was refused first. |
+
+#### (b) Is a codec on the link — the answer that can end the track
+
+| Line | What it means |
+|---|---|
+| `(b) statests=0x…` non-zero | The legacy link carries a codec. H1 through H10 proceed. |
+| `(b) statests=0x0000 — NO CODEC ON THE LEGACY LINK` | **The track is over on this machine and no driver work changes it.** Tiger Lake ships in configurations where the codec is on SoundWire, or reachable only through the Smart Sound DSP with vendor firmware — §8 item 4 puts both out of scope, and §2.5's last row said the risk out loud. What replaces this plan is a SoundWire or SOF-shaped effort an order of magnitude larger, and that is the owner's decision, not a next stage. |
+| `hda: (b) GCAP reads all ones` | The register window answers nothing: the function is powered down past what the probe's D0 transition reached, or hidden by firmware. Not a verdict about codecs — go back to firmware setup before concluding anything. |
+| `hda: codecN the controller did not answer an immediate command` | `STATESTS` named a codec and the controller has no working immediate-command interface. H0's dump needs CORB/RIRB on this part; nothing above the verb layer is invalidated. |
+
+**This generalises past this laptop.** `STATESTS` reading zero on a controller
+that resets cleanly is the signature of the whole 2019-onward Intel line where
+audio moved behind the DSP. Any future ToyOS machine of that vintage gets the
+same answer, so the codec-presence read belongs in whatever eventually replaces
+this probe rather than being treated as a T14 quirk.
+
+#### (c) The widget dump, and its second life
+
+Everything between `hda: codecN vendor=` and the next controller's banner is the
+fixture. Each line is `key=value` after an `hda:` prefix, carries the codec's
+own raw word beside every decoded name, and describes exactly one node — so a
+host-side reader is a line split and nothing more. §5.2 makes this the fixture
+`toyos-hda`'s `find_output_path` is tested against, which is the only way the
+least-covered code in the plan gets verified against a real machine.
+
+`hda: (c) pins reporting a speaker default device: 0` is the interesting
+failure: the codec answered, the graph is there, and no pin claims a speaker.
+§2.3 then has nothing to choose and the correct behaviour is a refusal naming
+every codec found — never a fallback to line-out, which is how a laptop ends up
+playing through a header nobody soldered.
+
+#### (d) How many codecs
+
+`hda: (d) codecs=1` is one machine's answer and licenses nothing: §2.3's rule is
+*enumerate all, choose by capability, refuse by name*, and it does not relax
+because this laptop happens to have one. `codecs=2` or more is the Iris Xe's
+display audio sitting beside the analogue codec, and the probe prints the
+first-match warning with it.
+
+#### The volume keys
+
+No new mechanism: the i8042 driver already names every byte run that decoded to
+nothing, and under `hda-probe` its list holds 24 bytes instead of 8 so three
+keys' make and break fit in one boot. Read the `i8042:` lines:
+
+- `no event from [0xe0, 0x20, …]` — the keys reach the i8042 and decode to
+  nothing, and those bytes are exactly what H8's three `toyos-ps2` entries are
+  written against.
+- `keys` in the counter line went up by three and nothing was listed — the EC's
+  codes already map to something, which means today they *type* rather than
+  change the volume, and H8 is a change to what the surface owner does with
+  three usages it already receives.
+- The `bytes` counter did not move at all — **the volume keys are not on the
+  i8042**, they are an ACPI or WMI event, and H8's "three table entries and no
+  ABI at all" premise is wrong. That is a finding for §4.4's rejected list, not
+  a small fix.
+
 ---
 
 ## 7. Open risks
