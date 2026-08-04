@@ -28,6 +28,11 @@
 //! length of a landing rather than of a build. It has to be its own file because
 //! a landing's gate is a build and would otherwise queue behind it.
 //!
+//! [`guest_slot`] is not a mode of anything — it is a count. The host's cores
+//! are spent by intra-suite width and by inter-worktree suites alike, and
+//! nothing was handing them out (`specs/test-cost-audit.md` §4.1 constraint 3),
+//! so a second suite on the machine timed the first one's boots out.
+//!
 //! Holder death: `flock` is released by the kernel when the open file
 //! description closes, so a builder that is SIGKILLed mid-phase — routine here
 //! — strands nothing, which a lock file with a pid in it could not promise.
@@ -38,7 +43,7 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
@@ -56,6 +61,11 @@ const GLOBAL_LOCK_DIR: &str = "toyos-build-locks";
 
 fn lock_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(name)
+}
+
+/// The one directory every worktree of this repository names identically.
+fn git_lock_dir(root: &Path) -> PathBuf {
+    crate::git_common_dir(root).join(GLOBAL_LOCK_DIR)
 }
 
 /// Which shared state a phase replaces, and so which lock has to serialise it.
@@ -112,7 +122,7 @@ pub struct Held {
 pub fn shared(root: &Path, what: &str) -> Held {
     let mut held = Held {
         worktree_dir: root.join(LOCK_DIR),
-        global_dir: crate::git_common_dir(root).join(GLOBAL_LOCK_DIR),
+        global_dir: git_lock_dir(root),
         what: what.to_string(),
         guards: None,
     };
@@ -197,7 +207,7 @@ pub fn integration(root: &Path) -> Guard {
 }
 
 fn integration_path(root: &Path) -> PathBuf {
-    lock_path(&crate::git_common_dir(root).join(GLOBAL_LOCK_DIR), "integration")
+    lock_path(&git_lock_dir(root), "integration")
 }
 
 /// Whether the integration lock could be taken right now.
@@ -208,6 +218,111 @@ fn integration_path(root: &Path) -> PathBuf {
 #[cfg(test)]
 pub fn integration_is_free(root: &Path) -> bool {
     try_lock(&open_lock_file(&integration_path(root)), LOCK_EX)
+}
+
+/// How many guests may be up on this host at once, across every worktree.
+///
+/// The suite's own width is twelve, measured on this host against eight in one
+/// session (`specs/test-cost-audit.md` §5.4.7), so one suite alone gets exactly
+/// the machine it was measured on and N suites divide it. Without this the two
+/// parallelisms spend the same 14 cores twice over: four agents at twelve is 48
+/// guests, which is slower than serial and mismeasures everything (§4.1
+/// constraint 3).
+///
+/// It is a count of *guests*, not of cores, because that is what the width is a
+/// count of and what the measurement was taken in.
+pub const HOST_GUESTS: usize = 12;
+
+/// One of the host's guest slots, held until the guard drops.
+///
+/// A counting semaphore over `budget` lock files, because there is nothing here
+/// to count with: `flock`'s shared mode admits any number of holders and reports
+/// no number at all. So a slot is a file, and taking one is finding a file
+/// nobody holds — which inherits the property the rest of this module rests on,
+/// that a slot a SIGKILLed holder had is free the moment the process dies, with
+/// no reaper, no pid file and no staleness.
+///
+/// **A caller holds at most one slot and never waits for a second while holding
+/// one.** That is what makes the semaphore deadlock-free rather than merely
+/// deadlock-free-so-far, and it is a constraint on callers: a task that needs
+/// two guests takes one slot for both, because two half-served tasks are a
+/// cycle.
+///
+/// The scan polls. `flock` cannot wait on "the first of these N files to be
+/// released", and the alternatives — a designated file each waiter blocks on, a
+/// waiter queue in a file — either starve or need a reaper. A round is `budget`
+/// non-blocking syscalls against tasks that run for seconds.
+///
+/// `budget` is a parameter so a run can be told to use fewer, and so the gates
+/// below can fill a host of two. Every process must name the same number or the
+/// bound is the largest of them: the files are per-index, and a process
+/// scanning a prefix cannot see that a longer one is full.
+pub fn guest_slot(root: &Path, budget: usize, what: &str) -> Guard {
+    slot(&git_lock_dir(root).join(SLOT_DIR), budget, what)
+}
+
+/// Its own directory under the global one: the files are named by index and
+/// nothing else in there is.
+const SLOT_DIR: &str = "slots";
+
+fn slot_path(dir: &Path, index: usize) -> PathBuf {
+    lock_path(dir, &format!("slot-{index}"))
+}
+
+fn slot(dir: &Path, budget: usize, what: &str) -> Guard {
+    assert!(budget >= 1, "a host with no guest slots can run no guests");
+    let mut files: Vec<fs::File> =
+        (0..budget).map(|i| open_lock_file(&slot_path(dir, i))).collect();
+
+    // Where this process starts its scan, so N waiting runs do not all try slot
+    // 0 first and hand the same one back and forth.
+    let start = std::process::id() as usize % budget;
+    let began = Instant::now();
+    let mut said: Option<Instant> = None;
+
+    loop {
+        for offset in 0..budget {
+            let index = (start + offset) % budget;
+            if try_lock(&files[index], LOCK_EX) {
+                if said.is_some() {
+                    eprintln!(
+                        "[host-slots] {what} got a guest slot after {:.1?}",
+                        began.elapsed()
+                    );
+                }
+                let mut guard = Guard { file: files.remove(index), records_holder: true };
+                write_note(&mut guard.file, &note_text(what));
+                return guard;
+            }
+        }
+        // Once when the wait starts and every half minute it lasts: an agent
+        // staring at silence kills and retries, and a wait that is working
+        // looks exactly like a wedge until it says so.
+        if said.is_none_or(|last| last.elapsed() >= Duration::from_secs(30)) {
+            announce_slots(dir, budget, what, began.elapsed());
+            said = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn announce_slots(dir: &Path, budget: usize, what: &str, waited: Duration) {
+    let mut runs: Vec<(i32, String)> = Vec::new();
+    for index in 0..budget {
+        if let Some((pid, holder, _)) = read_note(&slot_path(dir, index)) {
+            if !runs.iter().any(|(other, _)| *other == pid) {
+                runs.push((pid, holder));
+            }
+        }
+    }
+    let who = if runs.is_empty() {
+        "the holders left no readable note".to_string()
+    } else {
+        let named: Vec<String> =
+            runs.iter().map(|(pid, holder)| format!("pid {pid} ({holder})")).collect();
+        format!("all {budget} held by {} run(s): {}", runs.len(), named.join(", "))
+    };
+    eprintln!("[host-slots] waiting for a guest slot ({what}), {waited:.0?} so far — {who}");
 }
 
 /// One lock file, taken exclusively and held until the guard drops.
@@ -292,6 +407,13 @@ fn announce(lock: &str, label: &str, holder: &str) {
 /// caller's, because a lock with a shared mode is usually held by holders who
 /// never wrote a note at all, and a lock without one never is.
 fn describe_holder(path: &Path) -> Option<String> {
+    let (pid, what, secs) = read_note(path)?;
+    Some(format!("held by pid {pid} ({what}), {secs}s so far"))
+}
+
+/// The note a live holder of `path` left: its pid, what it said it was doing,
+/// and how long ago it said so.
+fn read_note(path: &Path) -> Option<(i32, String, u64)> {
     let mut file = fs::File::open(path).ok()?;
     let mut text = String::new();
     file.read_to_string(&mut text).ok()?;
@@ -305,7 +427,7 @@ fn describe_holder(path: &Path) -> Option<String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().saturating_sub(since))
         .unwrap_or(0);
-    Some(format!("held by pid {pid} ({what}), {secs}s so far"))
+    Some((pid, what.to_string(), secs))
 }
 
 fn alive(pid: i32) -> bool {
@@ -414,6 +536,21 @@ mod tests {
         root.join(LOCK_DIR)
     }
 
+    /// A host of two, so filling it costs two processes rather than twelve.
+    const TEST_SLOTS: usize = 2;
+
+    fn slot_dir(root: &Path) -> PathBuf {
+        git_lock_dir(root).join(SLOT_DIR)
+    }
+
+    /// How many of the host's slots are held right now, asked with a fresh fd
+    /// per slot for the reason [`intent_is_taken`] gives.
+    fn slots_held(root: &Path) -> usize {
+        (0..TEST_SLOTS)
+            .filter(|i| !try_lock(&open_lock_file(&slot_path(&slot_dir(root), *i)), LOCK_EX))
+            .count()
+    }
+
     fn child(root: &Path, role: &str) -> Child {
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "buildlock::tests::child_role", "--include-ignored", "--nocapture"])
@@ -498,6 +635,20 @@ mod tests {
             "want-shared" => {
                 let _held = shared(&root, "child");
                 note(&root, "sh");
+            }
+            "hold-slot" => {
+                let _slot = slot(&slot_dir(&root), TEST_SLOTS, "a child's task");
+                touch(&root.join(format!("held-{}", std::process::id())));
+                appeared(&root.join("release"), Duration::from_secs(20));
+            }
+            "hold-slot-forever" => {
+                let _slot = slot(&slot_dir(&root), TEST_SLOTS, "a child's task");
+                touch(&root.join(format!("held-{}", std::process::id())));
+                std::thread::sleep(Duration::from_secs(600));
+            }
+            "want-slot" => {
+                let _slot = slot(&slot_dir(&root), TEST_SLOTS, "the queued run");
+                note(&root, "got a slot");
             }
             "clean" | "clean-unlocked" => {
                 touch(&root.join("cleaner-ready"));
@@ -723,6 +874,68 @@ mod tests {
         assert!(writer.wait().unwrap().success());
         assert!(reader.wait().unwrap().success());
         assert_eq!(fs::read_to_string(root.join("order.log")).unwrap(), "ex\nsh\n");
+    }
+
+    /// The whole point of a counting semaphore: the run past the budget waits.
+    ///
+    /// Two suites on one host was not slower, it was wrong — `screen_fatal_halt`
+    /// red at 11 s against 3.3 s alone, and an hour spent chasing it as a
+    /// regression.
+    #[test]
+    fn a_full_host_makes_the_next_run_wait() {
+        let root = scratch("slots-full");
+        let mut holders: Vec<Child> = (0..TEST_SLOTS).map(|_| child(&root, "hold-slot")).collect();
+        for kid in &holders {
+            assert!(
+                appeared(&root.join(format!("held-{}", kid.id())), Duration::from_secs(20)),
+                "a child never took its slot"
+            );
+        }
+        assert_eq!(slots_held(&root), TEST_SLOTS, "the host is not full");
+
+        let mut queued = child(&root, "want-slot");
+        assert!(
+            !appeared(&root.join("order.log"), Duration::from_millis(400)),
+            "a {TEST_SLOTS}-slot host admitted a {}th guest", TEST_SLOTS + 1
+        );
+
+        touch(&root.join("release"));
+        for kid in &mut holders {
+            assert!(kid.wait().unwrap().success());
+        }
+        assert!(queued.wait().unwrap().success());
+        assert_eq!(fs::read_to_string(root.join("order.log")).unwrap(), "got a slot\n");
+    }
+
+    /// An agent kills a suite that is taking too long, and the host is one host:
+    /// a slot its guest never gave back would shrink the machine for everybody
+    /// else until the next reboot, with nothing in the tree able to notice.
+    #[test]
+    fn a_killed_run_gives_its_slot_back() {
+        let root = scratch("slots-killed");
+        let mut holders: Vec<Child> =
+            (0..TEST_SLOTS).map(|_| child(&root, "hold-slot-forever")).collect();
+        for kid in &holders {
+            assert!(
+                appeared(&root.join(format!("held-{}", kid.id())), Duration::from_secs(20)),
+                "a child never took its slot"
+            );
+        }
+        assert_eq!(slots_held(&root), TEST_SLOTS, "the host is not full");
+
+        holders[0].kill().unwrap();
+        holders[0].wait().unwrap();
+        assert_eq!(slots_held(&root), TEST_SLOTS - 1, "the dead run's slot is still held");
+
+        let start = Instant::now();
+        let mine = slot(&slot_dir(&root), TEST_SLOTS, "the parent");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a SIGKILLed run stranded its guest slot"
+        );
+        drop(mine);
+        holders[1].kill().unwrap();
+        holders[1].wait().unwrap();
     }
 
     /// The defect this module exists for, staged so that it is not itself a

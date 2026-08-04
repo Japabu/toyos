@@ -49,14 +49,46 @@ enum Sched {
 /// *waiting* — for a marker, for a debounce, for a device — which is why this is
 /// a measurement and not a division.
 ///
-/// **Twelve is the number for one suite on this host, and the host has no
-/// budget.** Four agents at twelve is 48 guests on 14 cores; the semaphore
-/// `specs/worktrees.md` §6 asks for does not exist, and until it does the width
-/// is a per-suite number with a machine-wide cost. `specs/test-cost-audit.md`
-/// §5.4.7 carries the tables, including the one that said eight, which was taken
-/// while `drain_serial` was still width-scaled and `metal_sim_pointer_churn`'s
-/// twenty-four paced drains *were* the phase.
+/// **Twelve is the number for one suite on this host**, and [`HostSlots`] is
+/// what stops four agents at twelve being 48 guests on 14 cores.
+/// `specs/test-cost-audit.md` §5.4.7 carries the tables, including the one that
+/// said eight, which was taken while `drain_serial` was still width-scaled and
+/// `metal_sim_pointer_churn`'s twenty-four paced drains *were* the phase.
 const DEFAULT_WIDTH: usize = 12;
+
+/// This run's claim on the host's guest budget.
+///
+/// [`DEFAULT_WIDTH`] is a number for *one* suite, and nothing was handing out
+/// the cores that two suites both spend (`specs/test-cost-audit.md` §4.1
+/// constraint 3). A second suite on this machine is not a slower first suite, it
+/// is a wrong one: `screen_fatal_halt` red at 11 s against 3.3 s alone, and an
+/// agent's hour spent chasing that as a regression.
+///
+/// **One slot per task, never per boot.** A worker holds at most one and never
+/// waits for a second while holding one, which is what makes the semaphore
+/// deadlock-free rather than lucky: several tests hold two guests at once, and a
+/// slot each would let twelve workers each hold one and each wait for another.
+///
+/// The wait sits outside the task, so it lands in the phase's wall clock and in
+/// no test's duration — a `PASS` time, and the profile [`longest_first`] orders
+/// on, both stay measurements of the test rather than of the queue.
+struct HostSlots {
+    root: std::path::PathBuf,
+    /// The name this run answers to in another run's waiting message. A pid
+    /// alone is not enough to act on: an agent needs to know which worktree.
+    label: String,
+    /// Zero is the semaphore off. It is the only way to measure a suite against
+    /// one that has it, which is what `--host-slots 0` is for.
+    budget: usize,
+}
+
+impl HostSlots {
+    fn take(&self, what: &str) -> Option<toyos_build::buildlock::Guard> {
+        let budget = self.budget;
+        (budget > 0)
+            .then(|| toyos_build::buildlock::guest_slot(&self.root, budget, &format!("{}: {what}", self.label)))
+    }
+}
 
 /// The one boot that carries every Rust and C test.
 ///
@@ -7342,7 +7374,12 @@ fn longest_first(tasks: &mut [Task<'_>], known: &BTreeMap<String, Duration>) {
 /// this one. It returns only once every worker has joined, which is what makes
 /// "the parallel phase has drained" a fact about the call and not about where
 /// it sits in `main`.
-fn run_phase(tasks: Vec<Task<'_>>, width: usize, bins: &Bins<'_>) -> Vec<Outcome> {
+fn run_phase(
+    tasks: Vec<Task<'_>>,
+    width: usize,
+    bins: &Bins<'_>,
+    slots: &HostSlots,
+) -> Vec<Outcome> {
     if tasks.is_empty() {
         return Vec::new();
     }
@@ -7361,6 +7398,7 @@ fn run_phase(tasks: Vec<Task<'_>>, width: usize, bins: &Bins<'_>) -> Vec<Outcome
                     let next =
                         queue.lock().expect("a worker panicked holding the queue").pop_front();
                     let Some(task) = next else { return };
+                    let _slot = slots.take(&task.names().join(" "));
                     run_task(task, bins, &tx);
                 }
             });
@@ -7484,6 +7522,35 @@ fn main() {
         assert!(width >= 1, "--jobs needs at least one worker");
     }
 
+    // How many guests may be up on the *host* at once, across every worktree.
+    // `--jobs` is this run's demand; this is what the machine will supply, and
+    // zero turns it off.
+    let mut host_budget = toyos_build::buildlock::HOST_GUESTS;
+    for (i, a) in args.iter().enumerate() {
+        let n = if let Some(v) = a.strip_prefix("--host-slots=") {
+            consumed.push(i);
+            v
+        } else if a == "--host-slots" {
+            consumed.push(i);
+            consumed.push(i + 1);
+            args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
+                panic!("--host-slots needs a budget, e.g. --host-slots 12 (0 turns it off)")
+            })
+        } else {
+            continue;
+        };
+        host_budget =
+            n.parse().unwrap_or_else(|_| panic!("--host-slots: {n:?} is not a budget"));
+    }
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+    let slots = HostSlots {
+        label: repo_root
+            .file_name()
+            .map_or_else(|| "this worktree".to_string(), |n| n.to_string_lossy().into_owned()),
+        root: repo_root,
+        budget: host_budget,
+    };
+
     check_registration();
 
     if nocapture || debug_mode {
@@ -7537,6 +7604,12 @@ fn main() {
             .collect();
         assert!(!audio_to_run.is_empty(), "no audio test matches filter {filter:?}");
         let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
+        // One slot for the whole tier: it boots one guest at a time for the
+        // length of it, so one slot is what it occupies. The owner has ruled
+        // that gate A does not get a quiet host (CLAUDE.md, 2026-08-04), so it
+        // takes its share of the machine like everything else and does not
+        // reserve it.
+        let _slot = slots.take("gate A, thorough");
         let ok = run_audio_gate(
             iterations,
             &load_audio_baseline(),
@@ -7659,7 +7732,7 @@ fn main() {
         longest_first(&mut parallel, &known);
         eprintln!("  --- parallel, {width} wide ---");
         let started = std::time::Instant::now();
-        let outcomes = run_phase(parallel, width, &bins);
+        let outcomes = run_phase(parallel, width, &bins, &slots);
         eprintln!("  --- parallel done in {:.1?} ---", started.elapsed());
         wide_reds.extend(
             outcomes.iter().filter(|o| o.reason.is_some()).map(|o| o.name.clone()),
@@ -7670,7 +7743,7 @@ fn main() {
     if !serial.is_empty() {
         eprintln!("  --- serial ---");
         let started = std::time::Instant::now();
-        let outcomes = run_phase(serial, 1, &bins);
+        let outcomes = run_phase(serial, 1, &bins, &slots);
         eprintln!("  --- serial done in {:.1?} ---", started.elapsed());
         timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
         record(outcomes);
@@ -7685,7 +7758,7 @@ fn main() {
                 eprintln!("  ALONE {name}: no way to run it by itself; verdict stands");
                 continue;
             };
-            let outcomes = run_phase(vec![task], 1, &bins);
+            let outcomes = run_phase(vec![task], 1, &bins, &slots);
             let verdict = outcomes.iter().find(|o| &o.name == name);
             match verdict.map(|o| o.reason.is_some()) {
                 Some(false) => eprintln!(
@@ -7715,6 +7788,7 @@ fn main() {
             for &smp in AUDIO_SMP {
                 let label = format!("{name} (smp={smp})");
                 let baseline = config_baseline(&audio_baseline, name, smp);
+                let _slot = slots.take(&label);
                 let start = std::time::Instant::now();
                 // A boot that never reaches its marker panics, and gate A is the
                 // last thing the suite runs: unwrapped, that panic took the
