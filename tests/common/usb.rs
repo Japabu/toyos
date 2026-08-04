@@ -257,7 +257,7 @@ pub fn usb_storage_gate(
         BootOptions {
             profile: Profile::UsbDisk,
             kernel_features: GATE,
-            usb_image: Some(image.clone()),
+            usb_images: vec![image.clone()],
             ..Default::default()
         },
     )?;
@@ -284,7 +284,7 @@ pub fn usb_storage_gate(
         BootOptions {
             profile: Profile::UsbDisk,
             kernel_features: GATE,
-            usb_image: Some(foreign.clone()),
+            usb_images: vec![foreign.clone()],
             ..Default::default()
         },
     )?;
@@ -348,7 +348,7 @@ pub fn usb_storage_shapes(
         BootOptions {
             profile: Profile::UsbDisk4k,
             kernel_features: GATE,
-            usb_image: Some(image.clone()),
+            usb_images: vec![image.clone()],
             ..Default::default()
         },
     )?;
@@ -415,7 +415,7 @@ pub fn usb_storage_write_error(
     let options = BootOptions {
         profile: Profile::UsbDiskReadOnly,
         kernel_features: GATE,
-        usb_image: Some(image.clone()),
+        usb_images: vec![image.clone()],
         ..Default::default()
     };
     // The claim is about how QEMU opened the file, and argv is the only place
@@ -867,7 +867,7 @@ pub fn xhci_slow_connect(
         BootOptions {
             profile: Profile::UsbDisk,
             kernel_features: FEATURES,
-            usb_image: Some(image.clone()),
+            usb_images: vec![image.clone()],
             ..Default::default()
         },
     )?;
@@ -1120,7 +1120,7 @@ pub fn usb_transport_break(
         BootOptions {
             profile: Profile::UsbDisk,
             kernel_features: FEATURES,
-            usb_image: Some(image.clone()),
+            usb_images: vec![image.clone()],
             ..Default::default()
         },
     )?;
