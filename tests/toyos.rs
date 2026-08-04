@@ -6798,6 +6798,18 @@ enum Poke {
     Tap(&'static str),
 }
 
+/// What tells the `input_events` client its host has finished.
+///
+/// The right button, which no sequence driving that client produces for any
+/// other reason, and the release rather than the press so the pointer is left
+/// with nothing held. Every caller owes it one: without it the client waits out
+/// its liveness ceiling, and `xhci_hid_break`, `xhci_hotplug` and `xhci_flap`
+/// each paid 30 s for the omission.
+pub(crate) fn input_events_end(input: &mut qemu::QmpInput) {
+    input.mouse(0, 0, Some(("right", true)));
+    input.mouse(0, 0, Some(("right", false)));
+}
+
 /// The `input_events` sequence: land off the origin, move by a named delta,
 /// click, type `hello`, and finish on the right button the client exits on.
 ///
@@ -6821,6 +6833,8 @@ fn input_events_run(
         Poke::Tap("l"),
         Poke::Tap("l"),
         Poke::Tap("o"),
+        // `input_events_end`, spelled out because the script paces every step
+        // against an arrival and cannot hand two of them to someone else.
         Poke::Button("right", true),
         Poke::Button("right", false),
     ];
