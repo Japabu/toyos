@@ -232,10 +232,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("diskless_boot", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
     // Its whole assertion is that a keystroke injected from the host crossed a
-    // USB keyboard on the *second* controller. Measured at width 4: the four
-    // pointer events arrived and all five keys were lost, which reads exactly
-    // like the defect this test exists to catch.
-    ("xhci_second_controller", Sched::Serial),
+    // USB keyboard on the *second* controller, and `input_events_run` sends
+    // each one only after the guest has printed the last — so a key the host
+    // never got to send is a stall it names, and never a key the driver lost.
+    ("xhci_second_controller", Sched::Parallel),
     ("xhci_two_controllers", Sched::Parallel),
     ("xhci_msi_only", Sched::Parallel),
     ("xhci_no_interrupt", Sched::Parallel),
@@ -2652,13 +2652,10 @@ fn boot_i8042_trace(
     // absent USB HID is what makes these tests measure anything: QEMU routes
     // injected input to one handler per device class, and with a usb-kbd
     // present that handler is not the PS/2 one.
-    // `i8042-fast-health` because a member reads the driver's counters and
-    // waits for the line carrying them, and their default cadence is one per
-    // 10 s of typing.
     let options = BootOptions {
         profile: qemu::Profile::Metal,
         qmp: true,
-        kernel_features: &["i8042-trace", "i8042-fast-health"],
+        kernel_features: &["i8042-trace"],
         ..Default::default()
     };
     metal_sim_argv_check(&qemu::profile_argv(&options)).unwrap_or_else(|e| panic!("{e}"));
@@ -2998,9 +2995,10 @@ fn metal_sim_window_drag(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> 
             };
             // Everything is relative to a pointer at the origin, and the
             // kernel clamps its accumulator there, so driving into the corner
-            // is a way to know where it is without being told.
+            // is a way to know where it is without being told. One screen is
+            // the distance: the cursor is on it, so that reaches both edges.
             let home = |input: &mut qemu::QmpInput| {
-                travel(input, -counts(screen_w as f64 * 2.0), -counts(screen_h as f64 * 2.0));
+                travel(input, -counts(screen_w as f64), -counts(screen_h as f64));
             };
             let click = |input: &mut qemu::QmpInput| {
                 input.mouse(0, 0, Some(("left", true)));
@@ -4505,32 +4503,13 @@ fn run_machine_test(
             };
             const DX: i32 = 40;
             const DY: i32 = -30;
-            let result = qemu.run_test_hooked(
-                "test_rs_input_events",
-                Duration::from_secs(30),
-                "===INPUT_READY===",
-                |socket| {
-                    let mut input = qemu::QmpInput::open(socket);
-                    // Off the origin first: the accumulated position clamps at
-                    // 0, so a move up or left from there is invisible. A boot
-                    // mouse reports each axis as an i8, so this arrives clamped
-                    // and its exact value is not something to assert on.
-                    input.mouse(100, 100, None);
-                    thread::sleep(Duration::from_millis(100));
-                    input.mouse(DX, DY, None);
-                    thread::sleep(Duration::from_millis(100));
-                    input.mouse(0, 0, Some(("left", true)));
-                    thread::sleep(Duration::from_millis(50));
-                    input.mouse(0, 0, Some(("left", false)));
-                    thread::sleep(Duration::from_millis(100));
-                    for key in ["h", "e", "l", "l", "o"] {
-                        input.keys(&[(key, true), (key, false)]);
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                },
-            );
+            // Off the origin first: the accumulated position clamps at 0, so a
+            // move up or left from there is invisible. A boot mouse reports each
+            // axis as an i8, so this arrives clamped and its exact value is not
+            // something to assert on.
+            let (result, sent) = input_events_run(&mut qemu, (100, 100), (DX, DY));
             if let Some(err) = &result.error {
-                return Err(format!("{err}\n{}", result.stdout));
+                return Err(format!("{err} after {sent} of the sequence\n{}", result.stdout));
             }
 
             let keys = parse_key_events(&result.stdout);
@@ -6549,34 +6528,12 @@ fn run_machine_test(
             };
             const DX: i32 = 40;
             const DY: i32 = -30;
-            let result = qemu.run_test_hooked(
-                "test_rs_input_events",
-                Duration::from_secs(30),
-                "===INPUT_READY===",
-                |socket| {
-                    // One connection for both halves: QEMU serves one QMP
-                    // client at a time.
-                    let mut input = qemu::QmpInput::open(socket);
-                    // Off the origin first — the accumulated position clamps
-                    // at 0, so a move up or left from there is invisible.
-                    // Under 256 counts, or the packet's overflow bit is set
-                    // and the motion is dropped by design.
-                    input.mouse(200, 200, None);
-                    thread::sleep(Duration::from_millis(100));
-                    input.mouse(DX, DY, None);
-                    thread::sleep(Duration::from_millis(100));
-                    input.mouse(0, 0, Some(("left", true)));
-                    thread::sleep(Duration::from_millis(50));
-                    input.mouse(0, 0, Some(("left", false)));
-                    thread::sleep(Duration::from_millis(100));
-                    for key in ["h", "e", "l", "l", "o"] {
-                        input.keys(&[(key, true), (key, false)]);
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                },
-            );
+            // Off the origin first — the accumulated position clamps at 0, so a
+            // move up or left from there is invisible. Under 256 counts, or the
+            // packet's overflow bit is set and the motion is dropped by design.
+            let (result, sent) = input_events_run(&mut qemu, (200, 200), (DX, DY));
             if let Some(err) = &result.error {
-                return Err(format!("{err}\n{}", result.stdout));
+                return Err(format!("{err} after {sent} of the sequence\n{}", result.stdout));
             }
 
             let keys = parse_key_events(&result.stdout);
@@ -6831,6 +6788,78 @@ fn parse_xhci_slots(log: &str) -> Vec<u32> {
         .filter_map(|line| line.split("xHCI: slot ").nth(1)?.split_once(" enabled"))
         .filter_map(|(slot, _)| slot.parse().ok())
         .collect()
+}
+
+/// One step of the `input_events` sequence, and how many lines the guest owes
+/// for it.
+enum Poke {
+    Move(i32, i32),
+    Button(&'static str, bool),
+    Tap(&'static str),
+}
+
+/// The `input_events` sequence: land off the origin, move by a named delta,
+/// click, type `hello`, and finish on the right button the client exits on.
+///
+/// Every step waits for the guest to print what the step before it produced, so
+/// the host never has more than one packet in flight and a device queue cannot
+/// swallow one. `xhci_second_controller` measured the alternative at width 4:
+/// four pointer events arrived and all five keys were lost, which reads exactly
+/// like the defect it exists to catch.
+fn input_events_run(
+    qemu: &mut QemuInstance,
+    home: (i32, i32),
+    delta: (i32, i32),
+) -> (TestResult, usize) {
+    let script = [
+        Poke::Move(home.0, home.1),
+        Poke::Move(delta.0, delta.1),
+        Poke::Button("left", true),
+        Poke::Button("left", false),
+        Poke::Tap("h"),
+        Poke::Tap("e"),
+        Poke::Tap("l"),
+        Poke::Tap("l"),
+        Poke::Tap("o"),
+        Poke::Button("right", true),
+        Poke::Button("right", false),
+    ];
+    let sent = std::cell::Cell::new(0usize);
+    let result = {
+        let mut input: Option<qemu::QmpInput> = None;
+        let (mut mev, mut kev) = (0usize, 0usize);
+        let (mut want_mev, mut want_kev) = (0usize, 0usize);
+        qemu.run_test_paced("test_rs_input_events", Duration::from_secs(60), |socket, line| {
+            if line.contains("===INPUT_READY===") {
+                input = Some(qemu::QmpInput::open(
+                    socket.expect("input_events needs BootOptions { qmp: true }"),
+                ));
+            }
+            mev += usize::from(line.contains("mev buttons="));
+            kev += usize::from(line.contains("kev usage="));
+            let Some(input) = input.as_mut() else { return };
+            if mev < want_mev || kev < want_kev {
+                return;
+            }
+            let Some(poke) = script.get(sent.get()) else { return };
+            match poke {
+                Poke::Move(dx, dy) => {
+                    input.mouse(*dx, *dy, None);
+                    want_mev += 1;
+                }
+                Poke::Button(name, down) => {
+                    input.mouse(0, 0, Some((name, *down)));
+                    want_mev += 1;
+                }
+                Poke::Tap(key) => {
+                    input.keys(&[(key, true), (key, false)]);
+                    want_kev += 2;
+                }
+            }
+            sent.set(sent.get() + 1);
+        })
+    };
+    (result, sent.get())
 }
 
 /// The per-axis relative-pointer scale out of `mouse: rel scale x=64 y=64`.

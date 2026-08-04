@@ -1,11 +1,11 @@
 //! Claims both input devices and prints every event either one produces.
 //!
-//! Driven by the `metal_sim_input` host test, which boots the machine shape
-//! that gets flashed — no virtio device, no USB HID, a plain kernel — and
-//! injects through QMP once the ready line appears. The line formats are the
-//! ones `i8042_keyboard` and `i8042_mouse` already print, so the host parses
-//! them with the same two functions. Not a standalone test: on its own it
-//! would report nothing, which is why it is in RUST_SKIP.
+//! Driven by `metal_sim_input` and `xhci_second_controller`, which inject
+//! through QMP one step at a time and wait for these lines between steps — so
+//! the host never has more in flight than the guest has taken. The line formats
+//! are the ones `i8042_keyboard` and `i8042_mouse` already print, so the host
+//! parses them with the same two functions. Not a standalone test: on its own
+//! it would report nothing, which is why it is in RUST_SKIP.
 
 use std::time::{Duration, Instant};
 use toyos::device::{Keyboard, Mouse};
@@ -14,19 +14,25 @@ use toyos_abi::input::RawKeyEvent;
 const KEY_SIZE: usize = std::mem::size_of::<RawKeyEvent>();
 const MOUSE_SIZE: usize = 6;
 
+/// The host's end-of-run marker, and the only right button in its sequence.
+/// PS/2 bit 1 is right and so is HID boot-mouse bit 1.
+const RIGHT: u8 = 0x02;
+
 fn main() {
     let keyboard = Keyboard::open().expect("input_events: no keyboard device");
     let mouse = Mouse::open().expect("input_events: no mouse device");
     let mut translator = window::configured_translator();
     println!("===INPUT_READY===");
 
-    // Long enough for the host to inject both halves and for the events to
-    // land; short enough that a path that delivers nothing fails rather than
-    // hangs.
-    let deadline = Instant::now() + Duration::from_secs(6);
+    // A liveness ceiling, not a duration: the host's sequence ends on the
+    // release of the right button, which nothing else in it produces, so a
+    // path that delivers nothing fails rather than hangs.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut buf = [0u8; 1024];
     let (mut keys, mut pointer) = (0, 0);
-    while Instant::now() < deadline {
+    let mut right_down = false;
+    let mut ended = false;
+    while !ended && Instant::now() < deadline {
         let mut idle = true;
 
         let n = keyboard.read_nonblock(&mut buf).unwrap_or(0);
@@ -57,6 +63,14 @@ fn main() {
             );
             pointer += 1;
             idle = false;
+            // The release ends the run, not the press: the host reads the
+            // button state after the last click, and a marker that swallowed
+            // its own release would leave one held.
+            if chunk[0] & RIGHT != 0 {
+                right_down = true;
+            } else if right_down {
+                ended = true;
+            }
         }
 
         if idle {
