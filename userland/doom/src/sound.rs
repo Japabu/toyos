@@ -922,6 +922,11 @@ const TONE_AMPLITUDE: f64 = 16000.0;
 /// still has the ring aborts here rather than merely getting close.
 const BURST: u32 = 4096;
 const FULL_VOLUME: i32 = 127;
+/// The volume every superseded update carries. Far enough below `FULL_VOLUME`
+/// that the capture separates them: at `TONE_AMPLITUDE` this mixes to 251 LSB
+/// and full volume to 7968, so a capture in which any update but the last one
+/// won has no signal in it at all.
+const QUIET_VOLUME: i32 = 4;
 /// Centred: `pack_volume` gives both channels `vol` at this separation.
 const CENTRE: i32 = 127;
 
@@ -1050,13 +1055,15 @@ pub fn sound_stress() -> i32 {
     }
 
     // The state every one of those calls was superseded by, still with nothing
-    // consuming: one sound, at a volume named by the last of 128 updates.
+    // consuming: one sound on one channel, at the volume named by the last of
+    // another ring's worth of updates. The capture is the verdict on that last
+    // one — every update before it is inaudible by construction.
     for channel in 0..NUM_SFX_CHANNELS as i32 {
         unsafe { toyos_stop_sound(channel) };
     }
-    unsafe { toyos_start_sound(&mut tone, TONE_CHANNEL, 0, CENTRE) };
-    for vol in 0..FULL_VOLUME {
-        unsafe { toyos_update_sound_params(TONE_CHANNEL, vol, CENTRE) };
+    unsafe { toyos_start_sound(&mut tone, TONE_CHANNEL, QUIET_VOLUME, CENTRE) };
+    for _ in 0..BURST {
+        unsafe { toyos_update_sound_params(TONE_CHANNEL, QUIET_VOLUME, CENTRE) };
     }
     unsafe { toyos_update_sound_params(TONE_CHANNEL, FULL_VOLUME, CENTRE) };
 
