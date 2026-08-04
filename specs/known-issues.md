@@ -2494,6 +2494,37 @@ choice survives a login and not a reboot.
 
 ## 8. Hardware and performance gaps
 
+### `i8042_mouse`'s pacing argument covers its count and not its `0 lost edges`
+
+Red in the wide phase, green alone, on a tree whose only kernel change was the
+scanout's memory type:
+
+```
+FAIL i8042_mouse: 1008 packets, none of them sent before the one before it
+arrived, and the driver does not report `0 lost edges`:
+  i8042: 1942 interrupts, 3056 bytes, 24 keys, 1006 motion, 12 undecoded,
+         0 discarded, 0 overruns, 0 dropped, 1 lost edges
+```
+
+Alone, the same guest: 2014 interrupts, the same 1006 motion events, `0 lost
+edges`. `main` at 91796eb ran it green in the wide phase with 1995 interrupts —
+so it is marginal rather than broken, and it is not the scanout change, which
+touches no port I/O.
+
+The `Sched::Parallel` beside it argues that "none of the three measures a rate"
+because each packet is sent only after the guest prints the one before it. That
+is correct about the *count*, and all 1006 arrived in both runs. It does not
+reach the other assertion: `lost edges` is not a delivery figure but the
+driver's own count of a counter line repeating without an interrupt having
+arrived — an edge the pin asserted and nothing delivered. Twelve guests on
+fourteen cores can produce one of those without any packet being lost, which is
+exactly the shape seen.
+
+Two ways to close it, and the choice belongs with the suite work rather than
+here: move `i8042_mouse` back to `Sched::Serial`, or split the verdict so the
+paced count stays parallel and the lost-edge claim runs where the host is not
+oversubscribed.
+
 ### Device registers still take firmware's word for being uncacheable
 
 Every `map_mmio` outside the scanout passes `CachePolicy::DeferToMtrr`, which is
