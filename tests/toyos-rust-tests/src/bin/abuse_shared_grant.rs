@@ -90,7 +90,7 @@ fn middleman() {
     assert!(attacker.wait().expect("wait attacker").success(), "attacker exited nonzero");
 
     // A region of our own, to test the target rather than the caller.
-    let own = syscall::alloc_shared(REGION);
+    let own = syscall::alloc_shared(REGION).expect("a region of our own");
 
     // `Pid`s come from a monotonic `IdMap` and are never reused, so this one
     // has never named a process and never will before this test ends.
@@ -119,7 +119,7 @@ fn middleman() {
 }
 
 fn owner(middleman_pid: u32) {
-    let token = syscall::alloc_shared(REGION);
+    let token = syscall::alloc_shared(REGION).expect("a region of our own");
     let ptr = unsafe { syscall::try_map_shared(token) }.expect("owner: map its own region");
     unsafe { core::ptr::copy_nonoverlapping(SECRET.as_ptr(), ptr, SECRET.len()) };
 

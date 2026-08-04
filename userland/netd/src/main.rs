@@ -44,7 +44,8 @@ impl DmaNic {
         let info = nic_dev.info().expect("netd: failed to read NicInfo");
 
         let rx_buf_size = info.rx_buf_size as usize;
-        let dma_region = shm::SharedMemory::map(info.dma_token, 2 * 1024 * 1024);
+        let dma_region = shm::SharedMemory::map(info.dma_token, 2 * 1024 * 1024)
+            .expect("the DMA token the NIC just reported");
         let dma_base = dma_region.as_ptr() as *const u8;
         let rx_base = unsafe { dma_base.add(info.rx_buf_offset as usize) };
         let tx_ptr = unsafe { dma_base.add(info.tx_buf_offset as usize) as *mut u8 };

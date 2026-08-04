@@ -637,10 +637,13 @@ pub fn connect(name: &str) -> Result<Fd, SyscallError> {
 }
 
 /// Allocate a 2MB-aligned shared memory region. Returns an opaque token.
-pub fn alloc_shared(size: usize) -> u32 {
-    let token = syscall(SYS_ALLOC_SHARED, size as u64, 0, 0, 0);
-    assert!(SyscallError::from_u64(token).is_none(), "alloc_shared failed");
-    token as u32
+///
+/// Fallible: a size the kernel cannot express in whole 2 MiB pages is
+/// `InvalidArgument` and memory it does not have is `ResourceExhausted`. A
+/// daemon reaches both through a client's request, so neither may be an
+/// assertion here.
+pub fn alloc_shared(size: usize) -> Result<u32, SyscallError> {
+    check(syscall(SYS_ALLOC_SHARED, size as u64, 0, 0, 0)).map(|token| token as u32)
 }
 
 /// Grant another process permission to map a shared memory region.
