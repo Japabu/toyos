@@ -12,8 +12,8 @@ license = "MIT OR Apache-2.0"
 # drives its devices and panics exactly as a kernel carrying none does. The
 # harness folds any request for one of them into this, because a feature set is
 # a whole kernel build and four sets that differ only in which unreachable arm
-# they carry are four builds of one kernel. `specs/test-cost-audit.md` §7 is the
-# per-feature ledger this is the "inert" half of; every other feature there
+# they carry are four builds of one kernel. `specs/test-cost-audit.md` §5.4.3 is
+# the per-feature ledger this is the "inert" half of; every other feature there
 # changes a path a boot takes and keeps its own build.
 test-actuators = [
     "test-fatal-halt",

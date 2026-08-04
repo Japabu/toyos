@@ -962,7 +962,7 @@ pub fn build_boot_image(
 /// `arch/syscall.rs`'s `SYS_DEBUG` match and nowhere on any path a boot runs.
 /// A feature that changes what `init` does, what a driver reads, or what a
 /// ceiling is worth belongs in its own build and is not eligible.
-/// `specs/test-cost-audit.md` §7 classifies every one of them.
+/// `specs/test-cost-audit.md` §5.4.3 classifies every one of them.
 const INERT_ACTUATORS: &[&str] = &[
     "test-fatal-halt",
     "test-screen-graffiti",

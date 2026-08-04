@@ -6443,9 +6443,8 @@ fn retry_task<'a>(name: &str, all_tests: &[&'a TestDef]) -> Option<Task<'a>> {
     if let Some(def) = all_tests.iter().find(|t| t.name == name) {
         return Some(Task::Shared(vec![def]));
     }
-    if SCREEN_TESTS.iter().any(|(n, _)| *n == name) {
-        let (n, _) = SCREEN_TESTS.iter().find(|(n, _)| *n == name)?;
-        return Some(Task::Screen(n));
+    if let Some((registered, _)) = SCREEN_TESTS.iter().find(|(n, _)| *n == name) {
+        return Some(Task::Screen(registered));
     }
     let (registered, _) = MACHINE_TESTS.iter().find(|(n, _)| *n == name)?;
     let names = match group_of(registered) {
@@ -6556,9 +6555,9 @@ fn load_durations() -> BTreeMap<String, Duration> {
 ///
 /// Merged rather than replaced, because a filtered run knows about four tests
 /// and would otherwise throw away what the last full one measured.
-fn save_durations(mut known: BTreeMap<String, Duration>, outcomes: &[Outcome]) {
-    for outcome in outcomes {
-        known.insert(outcome.name.clone(), outcome.elapsed);
+fn save_durations(mut known: BTreeMap<String, Duration>, timed: &[(String, Duration)]) {
+    for (name, elapsed) in timed {
+        known.insert(name.clone(), *elapsed);
     }
     let body: String =
         known.iter().map(|(n, d)| format!("{n} {}\n", d.as_millis())).collect();
@@ -6913,7 +6912,7 @@ fn main() {
     // believed about it. See [`retry_task`] for why both answers are findings
     // and why neither turns the run green.
     let known = load_durations();
-    let mut timed: Vec<Outcome> = Vec::new();
+    let mut timed: Vec<(String, Duration)> = Vec::new();
     let mut wide_reds: Vec<String> = Vec::new();
     if !parallel.is_empty() {
         longest_first(&mut parallel, &known);
@@ -6924,11 +6923,7 @@ fn main() {
         wide_reds.extend(
             outcomes.iter().filter(|o| o.reason.is_some()).map(|o| o.name.clone()),
         );
-        timed.extend(outcomes.iter().map(|o| Outcome {
-            name: o.name.clone(),
-            reason: None,
-            elapsed: o.elapsed,
-        }));
+        timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
         record(outcomes);
     }
     if !serial.is_empty() {
@@ -6936,11 +6931,7 @@ fn main() {
         let started = std::time::Instant::now();
         let outcomes = run_phase(serial, 1, &bins);
         eprintln!("  --- serial done in {:.1?} ---", started.elapsed());
-        timed.extend(outcomes.iter().map(|o| Outcome {
-            name: o.name.clone(),
-            reason: None,
-            elapsed: o.elapsed,
-        }));
+        timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
         record(outcomes);
     }
     qemu::set_width(1);
