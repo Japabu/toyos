@@ -45,6 +45,7 @@ fn main() -> ExitCode {
             }
             println!("old_steal_port          (negative gate: must fail)");
             println!("old_commit_before_pass  (negative gate: must fail)");
+            println!("old_migrate_kept_the_corpse (negative gate: must fail)");
             println!("old_preemptible_window  (negative gate: must abort)");
             println!("fair_share_per_thread   (negative gate: must fail)");
             println!("fair_double_charge      (negative gate: must fail)");
@@ -109,6 +110,7 @@ fn main() -> ExitCode {
                 for negative in [
                     scenarios::old_steal_port(),
                     scenarios::old_commit_before_pass(),
+                    scenarios::old_migrate_kept_the_corpse(),
                     scenarios::fair_share_per_thread(),
                     scenarios::fair_double_charge(),
                     scenarios::fair_identity_within_share(),
