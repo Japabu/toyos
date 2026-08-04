@@ -29,16 +29,15 @@ use window::{Color, Event, Window, MOUSE_PRESS};
 const WIDTH: u32 = 400;
 const HEIGHT: u32 = 160;
 
-/// The host's sequence puts exactly two presses inside this content — one
-/// naming the pixel under the middle of the screen, one naming it again after
-/// the drag. The press that starts the drag is on the title bar and the
-/// compositor keeps it, so the second press *is* the end of the sequence and
-/// there is nothing to wait for after it.
+/// The host's sequence puts two presses inside this content: one naming the
+/// pixel under the middle of the screen, one naming it again after the drag.
+/// The press that starts the drag is on the title bar and the compositor keeps
+/// it, so the second is the end of the sequence.
 const PRESSES: usize = 2;
 
 /// A liveness ceiling, not a duration: it costs nothing when the presses
 /// arrive, and bounds a run where the injected pointer never reached this
-/// window at all — which the press count below reports by name.
+/// window at all.
 const RUN_CEILING: Duration = Duration::from_secs(30);
 
 fn main() {

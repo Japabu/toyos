@@ -247,15 +247,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
     //
-    // That answer was `Serial` for one run of the suite: `i8042_mouse` fired a
-    // thousand `input-send-event` commands back to back and required five
-    // hundred pointer events to come out of the guest, which is a drain *rate*
-    // — at width 12 it delivered 127 and then 209 of the thousand and failed,
-    // alone 1006 and green. It no longer measures one. The host now sends each
-    // packet only once the packet before it has been printed by the guest, so
-    // every one of the thousand arrives or the run says how far it got, and
-    // the twelve keystrokes above it put fewer bytes in flight than QEMU's
-    // controller holds.
+    // None of the three measures a rate. `i8042_mouse` sends each pointer
+    // packet only once the guest has printed the one before it, so a guest with
+    // less of the host is a longer run and not a smaller count; the keystrokes
+    // above it put fewer bytes in flight than QEMU's controller holds.
     ("i8042_keyboard", Sched::Parallel),
     ("i8042_no_spurious_wake", Sched::Parallel),
     ("i8042_mouse", Sched::Parallel),
@@ -2657,9 +2652,9 @@ fn boot_i8042_trace(
     // absent USB HID is what makes these tests measure anything: QEMU routes
     // injected input to one handler per device class, and with a usb-kbd
     // present that handler is not the PS/2 one.
-    // `i8042-fast-health` for the counters, whose default cadence is one line
-    // per 10 s of typing: a member that reads them off the driver waits for one
-    // it is owed, and the wait is the period.
+    // `i8042-fast-health` because a member reads the driver's counters and
+    // waits for the line carrying them, and their default cadence is one per
+    // 10 s of typing.
     let options = BootOptions {
         profile: qemu::Profile::Metal,
         qmp: true,
@@ -3048,10 +3043,9 @@ fn metal_sim_window_drag(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> 
         ));
     }
 
-    // The client ends on the host's second press, so the interval the drag
-    // happened in is still open when it exits. Waiting for the line that closes
-    // it — rather than keeping the client alive for an interval it cannot see —
-    // is what makes a slower guest a longer run instead of a different verdict.
+    // The client ends on the host's second press, so the interval the drag is
+    // in is still open when it exits. Waiting for the line that closes it keeps
+    // a slower guest a longer run rather than a different verdict.
     let mut text = result.serial.clone();
     text.push_str(
         &qemu.drain_until(Duration::from_secs(10), |l| l.contains("compositor: frames=")),
@@ -3781,25 +3775,22 @@ fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
 
 /// How far the host may run ahead of the guest while it feeds the framer.
 ///
-/// Ninety-six bytes: a third of QEMU's PS/2 buffer and a third of the kernel's
-/// ring, so neither can fill however little of the host the guest is getting.
-/// That is what puts `0 dropped` on the driver's own counters under this test's
-/// control rather than under the scheduler's — an overflow here is a hole in a
-/// stream nothing was outrunning.
+/// Ninety-six bytes, against a 256-byte ring in the kernel and QEMU's PS/2
+/// buffer above it: neither can fill however little of the host the guest is
+/// getting, which is what makes `0 dropped` on the driver's counters a
+/// statement about the driver.
 const MOUSE_LEAD: usize = 32;
 
 /// The TrackPoint path, and a thousand packets through the framer after it,
-/// each one injected only once the one before it has come out of the guest.
+/// each sent only once the one before it has come out of the guest.
 ///
-/// This used to fire the whole burst as fast as the host could and require half
-/// of it to arrive. What that measured was a *drain rate*: QEMU's PS/2 buffer
-/// drops a packet it has no room for, so a guest holding a twelfth of a core
-/// was handed 127 of the thousand and failed on a number that says nothing
-/// about the driver. Pacing the injection against the guest's own report of
-/// each packet makes the loss impossible instead of tolerated — every packet
-/// injected is a packet that arrived, or the run stalls and says how far it
-/// got — and turns the driver's `dropped`/`discarded` counters from things a
-/// starved guest could explain into things only a defect can.
+/// The pacing is the design. QEMU's PS/2 buffer silently drops a packet it has
+/// no room for, so a host injecting at its own speed measures how fast the
+/// guest drains and reads the shortfall as a driver defect. Staying behind the
+/// guest's own report leaves no loss to tolerate: every packet injected is a
+/// packet that arrived, or the run stalls and says how far it got. It is also
+/// what makes the driver's `discarded`/`dropped` counters mean something a
+/// slow guest cannot account for.
 fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
     let qemu = &mut boot.qemu;
     let boot = qemu.boot_log().to_string();
@@ -3839,8 +3830,8 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
             }
             // One command per packet, because QEMU syncs input once per
             // command: `BURST` commands is `BURST` packets and three times that
-            // many bytes through the framer, and the window refilling on every
-            // arrival is what keeps the stream continuous.
+            // many bytes through the framer. Refilling the window on every
+            // arrival is what keeps the stream continuous under the pacing.
             while burst < BURST && injected.get() < arrived.get() + MOUSE_LEAD {
                 input.mouse(if burst % 2 == 0 { 1 } else { -1 }, 0, None);
                 burst += 1;
@@ -3856,9 +3847,9 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
                 clicked = true;
                 return;
             }
-            // The driver's counters are emitted from a scheduler pass, and a
-            // client polling its fd is what keeps passes running — so the line
-            // has to be on the console before the client is told to stop.
+            // The driver reports its counters from a scheduler pass, and the
+            // client polling its fd is what keeps passes running: the line has
+            // to arrive before the client is told to stop.
             if !counted {
                 return;
             }
@@ -3881,9 +3872,8 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
     }
 
     let events = parse_mouse_events(&result.stdout);
-    // Every packet, not half of them. The host never sent one until the packet
-    // before it had arrived, so nothing here can be explained by a host that
-    // outran the guest, and any shortfall is a packet the machine lost.
+    // The host sent none of these until the one before it had arrived, so a
+    // shortfall is a packet the machine lost and never a host that outran it.
     if events.len() != injected {
         return Err(format!(
             "{} pointer events reached userland out of {injected} packets injected, each one \
@@ -3945,10 +3935,9 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
     // discard is the byte-level resync and nothing else, so an intact stream
     // owes zero of them — which is what makes any non-zero value on the T14's
     // next boot mean the pointer really did lose the frame. `dropped` is the
-    // ring overflowing and `lost edges` an interrupt that never reached the
-    // pass that owed it; both are zero here because [`MOUSE_LEAD`] keeps the
-    // stream inside every queue on the way, so neither can be blamed on a
-    // guest that was slow.
+    // ring overflowing and `lost edges` an interrupt no pass ever accounted
+    // for; [`MOUSE_LEAD`] is what leaves a slow guest unable to produce
+    // either.
     let counters = result
         .serial
         .lines()

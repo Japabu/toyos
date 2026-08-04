@@ -1,9 +1,9 @@
 //! Claims the mouse fd and prints every pointer event that arrives.
 //!
 //! Driven by the `i8042_mouse` host test, which paces its injection against
-//! these lines: one packet is sent for each one printed here, so what this
-//! prints is the host's clock as well as its evidence. Not a standalone test —
-//! in RUST_SKIP for that reason.
+//! these lines: a packet goes out for each one printed here, so this is the
+//! host's clock as well as its evidence. Not a standalone test — in RUST_SKIP
+//! for that reason.
 
 use std::time::{Duration, Instant};
 use toyos::device::Mouse;
@@ -41,7 +41,7 @@ fn main() {
                 u16::from_le_bytes([chunk[4], chunk[5]]),
             );
             seen += 1;
-            // Printed before the check, both halves: the host's framing
+            // The release ends the run, not the press: the host's framing
             // assertion reads the button state after the last click, and a
             // marker that swallowed its own release would leave one held.
             if chunk[0] & RIGHT != 0 {

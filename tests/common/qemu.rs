@@ -1351,15 +1351,12 @@ impl QemuInstance {
 
     /// `run_test`, with `step` run on every console line the guest prints.
     ///
-    /// [`Self::run_test_hooked`] injects a whole sequence in one call, so the
-    /// host runs at its own speed and what reaches the guest is whatever
-    /// survived the queues in between. That makes a guest which was never given
-    /// a packet indistinguishable from one that lost it, and the difference is
-    /// the entire verdict of a driver test.
-    ///
-    /// Driving the injection from what the guest has printed removes the
-    /// question: the host cannot get more than its own window ahead of the
-    /// guest, so a guest that is slow costs wall-clock and not a verdict.
+    /// [`Self::run_test_hooked`] injects a whole sequence in one call and holds
+    /// the reader while it does, so the host runs at its own speed and what
+    /// reaches the guest is whatever survived the queues in between — a packet
+    /// the guest was never given reads exactly like one it lost. A step driven
+    /// by the guest's own output can stay behind it, which is how an injection
+    /// test costs a slow guest wall-clock instead of a verdict.
     pub fn run_test_paced(
         &mut self,
         name: &str,
