@@ -315,13 +315,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // hub's detection delay starts anyway.
     ("xhci_slow_connect", Sched::Serial),
     ("xhci_portsc_rw1c", Sched::Parallel),
-    // One staged break and no other, which makes the driver's recovery finishing
-    // on its first try part of the verdict: beside eleven other guests the
-    // retried command reaches an endpoint still halted from the staged break and
-    // the log carries a second `transport broke on SCSI 0x2a`, this one
-    // `command phase completion code 6`. Recovery still succeeds — the test is
-    // green alone on the same tree — so what the second line reports is how much
-    // of the host the guest had, which is [`Sched::Serial`] by definition.
+    // One staged break and no other, which puts the driver's recovery finishing
+    // on its first try in the verdict: a retried command that reaches an
+    // endpoint still halted from the staged break logs a second `transport
+    // broke`, and how many tries it takes is how much of the host the guest had.
     ("usb_transport_break", Sched::Serial),
     ("xhci_full_speed_device", Sched::Parallel),
     // Two of the three below stage plug and unplug with fixed waits, and both
@@ -3467,9 +3464,7 @@ fn shell_answers(qemu: &mut QemuInstance, log: &mut String) -> bool {
     // Retyping rather than waiting longer, because until the terminal has a
     // shell behind it there is nothing to swallow the line and an attempt that
     // lands early leaves no trace. The ceiling on the retries is the phase's:
-    // how long a desktop takes to come up is not a verdict, and ten flat
-    // attempts is twenty seconds — which a boot sharing the host with eleven
-    // others outgrew.
+    // how long a desktop takes to come up is not a verdict.
     let deadline = Instant::now() + qemu::budget(Duration::from_secs(20));
     while Instant::now() < deadline {
         {
