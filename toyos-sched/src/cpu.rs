@@ -415,21 +415,14 @@ impl<X: SchedPayload> CpuSched<X> {
     /// already settled the share refcount: a task taken out of this queue must
     /// leave it, a task that never entered must not.
     ///
-    /// A killed task is reaped here instead, and that is the whole of §7.6's
-    /// promptness guarantee for the balance path. `InTransit` is the one state
-    /// whose reap is not backed by an interrupt: the retire that carries
-    /// `Urgency::Preempt` is consumed and dropped by the destination when it
-    /// arrives ahead of the adopt (`handle_retire`'s home-is-me arm), and the
-    /// adopt behind it carries `Urgency::Normal`, which by design sends no IPI
-    /// to a busy CPU. Sending a corpse there hands the retire's latency to a
-    /// second CPU's next voluntary pass, in exchange for a thief that asked for
-    /// work and got a dead task. Reaping is also strictly less work: the task
-    /// dies here, in this pass, instead of after a round trip.
-    ///
-    /// What survives is the case no protocol can remove — a kill that lands
-    /// after the adopt was posted — and that one always has a `Msg::Retire`
-    /// aimed at the same CPU, so it keeps the interrupt-backed bound every
-    /// other state has.
+    /// A killed task is reaped here instead. `InTransit` is the one state whose
+    /// reap is not backed by an interrupt: the retire that carries
+    /// `Urgency::Preempt` is consumed and dropped by a destination that gets it
+    /// ahead of the adopt (`handle_retire`'s home-is-me arm), and the adopt
+    /// behind it is `Urgency::Normal`, which by design kicks nobody. Reading the
+    /// kill bit here is what stops a CPU putting a task it knows is dead into
+    /// that state; what remains is a kill that lands *after* the adopt was
+    /// posted, and that case always has a `Msg::Retire` aimed at the same CPU.
     fn hand_off<H: Hw<Payload = X>, P: PreemptGuard>(
         &mut self,
         task: ReadyTask<X>,
@@ -443,9 +436,8 @@ impl<X: SchedPayload> CpuSched<X> {
         let migrate_anyway = self.migrate_keeps_the_corpse;
         if task.shared().kill_pending() && !migrate_anyway {
             let key = task.key();
-            // No `leave_runnable`: the caller settled the share before calling,
-            // exactly as `handle_adopt`'s killed arm relies on the migrating
-            // CPU having settled it before the task entered transit.
+            // No `leave_runnable`: settling the share is the caller's, stated
+            // above, and it has already happened.
             let dead = task.reap(self.id, now);
             self.trace(env, now, TraceKind::Retire { task: key });
             self.dispose_dead(dead, env);
