@@ -244,10 +244,19 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("iommu_discovery", Sched::Parallel),
     ("readdir_bound", Sched::Parallel),
     ("i8042_health", Sched::Parallel),
-    // And one from here to `i8042_mouse` (`I8042_TRACE`).
-    ("i8042_keyboard", Sched::Parallel),
-    ("i8042_no_spurious_wake", Sched::Parallel),
-    ("i8042_mouse", Sched::Parallel),
+    // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
+    // three carry the answer the last of them needs.
+    //
+    // `i8042_mouse` fires a thousand `input-send-event` commands back to back
+    // and requires five hundred pointer events to come out of the guest. That
+    // is a drain *rate* with a fixed floor: the kernel's pointer queue is
+    // bounded and drops the oldest, so a guest that is not scheduled often
+    // enough loses packets that were never the driver's to lose. At width 12
+    // it delivered 127 and then 209 of the thousand and failed; alone, on the
+    // same tree, 1006 and green. Green alone names the classification.
+    ("i8042_keyboard", Sched::Serial),
+    ("i8042_no_spurious_wake", Sched::Serial),
+    ("i8042_mouse", Sched::Serial),
     // A boot each, and deliberately not a group: every one of them changes
     // the machine's layout, which `i8042_keyboard` asserts against, and a
     // wizard that exits the instant it has its answer leaves the guest with
