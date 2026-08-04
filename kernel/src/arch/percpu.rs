@@ -258,15 +258,51 @@ fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     ptr
 }
 
-/// The allocation is never freed — nothing holds the pointer to free it with —
-/// which is what makes [`crate::mm::paging::guard_kernel_page`]'s permanent
-/// split of the enclosing 2 MiB direct-map leaf sound.
+/// One idle stack and the guard page under it.
+const IDLE_SLOT: usize = IDLE_GUARD_SIZE + IDLE_STACK_SIZE;
+
+/// Idle stacks come out of 2 MiB pages of their own, not the kernel heap.
+///
+/// The guard is a hole in the direct map, and punching one costs the whole
+/// 2 MiB leaf its large page. From the heap that leaf also held hot kernel
+/// structures, and they went from one TLB entry to 512 — measured against the
+/// same tree with the guard as the only difference, `i8042_mouse` fell from
+/// 1006 pointer events to 27 under the full suite, three runs to one. An arena
+/// the stacks alone share keeps that cost where it belongs: 102 of them per
+/// leaf, and nothing else in it.
+///
+/// Never freed, which is what makes the permanent split sound — a leaf handed
+/// back to the PMM would be reissued with a hole in its direct map.
+static IDLE_STACKS: crate::sync::Lock<IdleArena> =
+    crate::sync::Lock::new(IdleArena { pages: alloc::vec::Vec::new(), next: 0, left: 0 });
+
+struct IdleArena {
+    pages: alloc::vec::Vec<crate::mm::pmm::PhysPage>,
+    /// Direct-map address of the next free slot.
+    next: u64,
+    left: usize,
+}
+
+/// A zeroed, 4 KiB-aligned `IDLE_SLOT` from the arena.
+fn alloc_idle_slot() -> u64 {
+    let mut arena = IDLE_STACKS.lock();
+    if arena.left < IDLE_SLOT {
+        let page = crate::mm::pmm::alloc_page(crate::mm::pmm::Category::KernelHeap)
+            .expect("percpu: no physical page for an idle stack");
+        arena.next = page.direct_map().as_mut_ptr::<u8>() as u64;
+        arena.left = crate::mm::PAGE_2M as usize;
+        arena.pages.push(page);
+    }
+    let base = arena.next;
+    arena.next += IDLE_SLOT as u64;
+    arena.left -= IDLE_SLOT;
+    base
+}
+
 fn alloc_idle_stack(percpu: &mut PerCpu) {
-    let layout = Layout::from_size_align(IDLE_GUARD_SIZE + IDLE_STACK_SIZE, 4096).unwrap();
-    let base = unsafe { alloc_zeroed(layout) };
-    assert!(!base.is_null(), "percpu: idle stack alloc failed");
-    crate::mm::paging::guard_kernel_page(base as u64);
-    percpu.idle_stack_top = base as u64 + (IDLE_GUARD_SIZE + IDLE_STACK_SIZE) as u64;
+    let base = alloc_idle_slot();
+    crate::mm::paging::guard_kernel_page(base);
+    percpu.idle_stack_top = base + IDLE_SLOT as u64;
     percpu.idle_rsp = percpu.idle_stack_top;
 }
 
