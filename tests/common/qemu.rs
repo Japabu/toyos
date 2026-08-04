@@ -1338,18 +1338,39 @@ impl QemuInstance {
         ready_line: &str,
         action: impl FnOnce(&Path),
     ) -> TestResult {
-        writeln!(self.stdin, "run {name}").expect("Failed to write to QEMU stdin");
-        self.stdin.flush().expect("Failed to flush QEMU stdin");
-
         let mut action = Some(action);
-        let mut fire = |line: &str, socket: Option<&PathBuf>| {
+        self.run_test_paced(name, timeout, |socket, line| {
             if ready_line.is_empty() || !line.contains(ready_line) {
                 return;
             }
             if let Some(action) = action.take() {
                 action(socket.expect("run_test_hooked needs BootOptions { qmp: true }"));
             }
-        };
+        })
+    }
+
+    /// `run_test`, with `step` run on every console line the guest prints.
+    ///
+    /// [`Self::run_test_hooked`] injects a whole sequence in one call, so the
+    /// host runs at its own speed and what reaches the guest is whatever
+    /// survived the queues in between. That makes a guest which was never given
+    /// a packet indistinguishable from one that lost it, and the difference is
+    /// the entire verdict of a driver test.
+    ///
+    /// Driving the injection from what the guest has printed removes the
+    /// question: the host cannot get more than its own window ahead of the
+    /// guest, so a guest that is slow costs wall-clock and not a verdict.
+    pub fn run_test_paced(
+        &mut self,
+        name: &str,
+        timeout: Duration,
+        mut step: impl FnMut(Option<&Path>, &str),
+    ) -> TestResult {
+        writeln!(self.stdin, "run {name}").expect("Failed to write to QEMU stdin");
+        self.stdin.flush().expect("Failed to flush QEMU stdin");
+
+        let mut fire =
+            |line: &str, socket: Option<&PathBuf>| step(socket.map(PathBuf::as_path), line);
 
         let timeout = budget(timeout);
         let start = Instant::now();

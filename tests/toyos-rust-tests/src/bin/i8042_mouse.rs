@@ -1,21 +1,33 @@
 //! Claims the mouse fd and prints every pointer event that arrives.
 //!
-//! Driven by the `i8042_mouse` host test, which injects through QMP once the
-//! ready line appears. Not a standalone test — in RUST_SKIP for that reason.
+//! Driven by the `i8042_mouse` host test, which paces its injection against
+//! these lines: one packet is sent for each one printed here, so what this
+//! prints is the host's clock as well as its evidence. Not a standalone test —
+//! in RUST_SKIP for that reason.
 
 use std::time::{Duration, Instant};
 use toyos::device::Mouse;
 
 const EVENT_SIZE: usize = 6;
 
+/// The host's end-of-run marker, and the only right button in its sequence.
+/// PS/2 bit 1 is right and so is HID boot-mouse bit 1.
+const RIGHT: u8 = 0x02;
+
+/// A liveness ceiling, not a duration: the run ends on the marker's release,
+/// so this only bounds a machine that lost it.
+const RUN_CEILING: Duration = Duration::from_secs(60);
+
 fn main() {
     let mouse = Mouse::open().expect("i8042_mouse: no mouse device");
     println!("===I8042_MOUSE_READY===");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + RUN_CEILING;
     let mut buf = [0u8; 1024];
     let mut seen = 0;
-    while Instant::now() < deadline {
+    let mut right_down = false;
+    let mut ended = false;
+    while !ended && Instant::now() < deadline {
         let n = mouse.read_nonblock(&mut buf).unwrap_or(0);
         if n == 0 {
             std::thread::sleep(Duration::from_millis(2));
@@ -29,6 +41,14 @@ fn main() {
                 u16::from_le_bytes([chunk[4], chunk[5]]),
             );
             seen += 1;
+            // Printed before the check, both halves: the host's framing
+            // assertion reads the button state after the last click, and a
+            // marker that swallowed its own release would leave one held.
+            if chunk[0] & RIGHT != 0 {
+                right_down = true;
+            } else if right_down {
+                ended = true;
+            }
         }
     }
     println!("mev done seen={seen}");
