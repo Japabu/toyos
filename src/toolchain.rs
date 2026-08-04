@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::buildlock;
 use crate::buildlock::Scope;
@@ -70,6 +71,49 @@ const STD_SOURCES: [&str; 2] = ["toyos-abi/src", "toyos/src"];
 /// What the sysroot on disk was built from.
 fn witness_path(rust_dir: &Path) -> PathBuf {
     rust_dir.join("build/toyos-sysroot-witness")
+}
+
+/// *Who* built it, and when.
+///
+/// The witness says a refused worktree disagrees; it cannot say with whom, and
+/// "merge the change that is already in the sysroot" is not an instruction
+/// anyone can follow without that. Written by every process that writes the
+/// witness, so it never names a worktree that is no longer the answer.
+fn claimant_path(rust_dir: &Path) -> PathBuf {
+    rust_dir.join("build/toyos-sysroot-claimant")
+}
+
+/// Record this checkout as the one the sysroot was built from.
+fn record_claimant(root: &Path, rust_dir: &Path) {
+    let branch = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map_or_else(|| "an unknown branch".to_string(), |b| b.trim().to_string());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // Advisory, like every holder note in `buildlock`: it improves a message and
+    // decides nothing, so failing to write it must not fail a build.
+    let _ = fs::write(
+        claimant_path(rust_dir),
+        format!("{now} {} {branch}\n", root.display()),
+    );
+}
+
+/// What [`record_claimant`] last wrote, as a sentence.
+fn claimant(rust_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(claimant_path(rust_dir)).ok()?;
+    let mut parts = text.trim().splitn(3, ' ');
+    let (when, where_, branch) = (parts.next()?, parts.next()?, parts.next()?);
+    let when: u64 = when.parse().ok()?;
+    let ago = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().saturating_sub(when));
+    Some(format!("{where_} (branch {branch}), {} minutes ago", ago / 60))
 }
 
 /// Fingerprint the sources that get compiled into the shared sysroot.
@@ -315,6 +359,7 @@ pub fn ensure(
         |want| {
             fs::write(witness_path(&rust_dir), &want)
                 .unwrap_or_else(|e| panic!("write {}: {e}", witness_path(&rust_dir).display()));
+            record_claimant(root, &rust_dir);
         },
     );
 }
@@ -391,11 +436,23 @@ fn adopt_shared_sysroot(
         claim,
         "this worktree and the shared sysroot at {} disagree about {}, so a build \
          here would link its kernel against another checkout's struct layouts.\n\
+         It was built from {}.\n\
          Merge the change that is already in the sysroot, or pass --claim-sysroot \
          to rebuild the sysroot from this worktree — which makes every other \
          worktree refuse until it merges yours.",
         rust_dir.display(),
-        differing_trees(recorded.as_deref(), &want)
+        differing_trees(recorded.as_deref(), &want),
+        claimant(rust_dir).unwrap_or_else(|| "a checkout that left no record".to_string()),
+    );
+
+    // Said before the work rather than after, because the work is minutes long
+    // and what it does to every other worktree is not reversible by waiting.
+    eprintln!(
+        "Claiming the shared sysroot for {}.\n\
+         It currently belongs to {}, and every other worktree will refuse to build \
+         until it merges this change.",
+        root.display(),
+        claimant(rust_dir).unwrap_or_else(|| "a checkout that left no record".to_string()),
     );
 
     lock.act_if(
@@ -411,6 +468,7 @@ fn adopt_shared_sysroot(
             crate::libc::build(root, rust_dir);
             fs::write(witness_path(rust_dir), &want)
                 .unwrap_or_else(|e| panic!("write {}: {e}", witness_path(rust_dir).display()));
+            record_claimant(root, rust_dir);
         },
     );
 }

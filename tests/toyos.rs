@@ -7543,6 +7543,15 @@ fn main() {
             n.parse().unwrap_or_else(|_| panic!("--host-slots: {n:?} is not a budget"));
     }
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+
+    // For the whole run, and outermost: a `--claim-sysroot` in another worktree
+    // rebuilds the sysroot this run's every later build reads, and the run's
+    // answer to that used to be a hundred identical refusals and a dead gate.
+    // Taken once, before any build lock, so the order is always sysroot →
+    // global — a second acquisition here would be a cycle with the claim's
+    // writer preference.
+    let _sysroot = toyos_build::buildlock::run_against_sysroot(&repo_root, "cargo test");
+
     let slots = HostSlots {
         label: repo_root
             .file_name()

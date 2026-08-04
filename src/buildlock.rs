@@ -157,7 +157,7 @@ impl Held {
         }
         self.guards = None;
         {
-            let _exclusive = acquire(self.dir(scope), LOCK_EX, phase);
+            let _exclusive = acquire(self.dir(scope), LOCK_EX, phase, BUILD);
             if let Some(work) = decide() {
                 act(work);
             }
@@ -174,8 +174,8 @@ impl Held {
 
     fn take_shared(&self) -> (Guard, Guard) {
         (
-            acquire(&self.global_dir, LOCK_SH, &self.what),
-            acquire(&self.worktree_dir, LOCK_SH, &self.what),
+            acquire(&self.global_dir, LOCK_SH, &self.what, BUILD),
+            acquire(&self.worktree_dir, LOCK_SH, &self.what, BUILD),
         )
     }
 }
@@ -265,6 +265,42 @@ pub fn guest_slot(root: &Path, budget: usize, what: &str) -> Guard {
 /// nothing else in there is.
 const SLOT_DIR: &str = "slots";
 
+/// The shared sysroot stays what it is for the length of a *run*.
+///
+/// [`Scope::Global`]'s `state` already says "nothing replaces the sysroot while
+/// I build", and it is the wrong length. A suite is a hundred builds over two
+/// minutes and every one of them reads the sysroot the first one agreed with; a
+/// claim landing between two of those builds corrupts nothing and makes every
+/// later build refuse, which is what 156 identical refusals and a dead gate
+/// looked like on 2026-08-04.
+///
+/// **A run holds this and nothing else holds it**, which is the whole of the
+/// deadlock argument: it is taken once, outermost, before any build lock, so the
+/// order is always sysroot → global and never the reverse. A landing does *not*
+/// take it — its gate is a separate process that does, and a landing holding it
+/// while its gate queued behind a claim's writer preference would be a cycle
+/// with itself. What the landing leaves unprotected is the merge and the
+/// fast-forward, neither of which reads a sysroot.
+pub fn run_against_sysroot(root: &Path, what: &str) -> Guard {
+    acquire(&git_lock_dir(root).join(SYSROOT_DIR), LOCK_SH, what, SYSROOT)
+}
+
+/// Replace the shared sysroot from this worktree.
+///
+/// Exclusive against every run now in flight, and — through `acquire`'s writer
+/// preference — against every run that starts while this one waits. The refusal
+/// this makes possible is right and stays: a worktree whose `toyos-abi` differs
+/// from the sysroot's still compiles, still links and still boots, into a guest
+/// whose syscall arguments land at the wrong offsets. What was missing was
+/// arbitration, so two worktrees that both legitimately needed it took it from
+/// each other four times in 38 minutes, each rewrite killing whatever gate was
+/// running elsewhere.
+pub fn claim_sysroot(root: &Path, what: &str) -> Guard {
+    acquire(&git_lock_dir(root).join(SYSROOT_DIR), LOCK_EX, what, SYSROOT)
+}
+
+const SYSROOT_DIR: &str = "sysroot";
+
 fn slot_path(dir: &Path, index: usize) -> PathBuf {
     lock_path(dir, &format!("slot-{index}"))
 }
@@ -344,7 +380,32 @@ fn exclusive(path: &Path, lock: &str, what: &str) -> Guard {
     guard
 }
 
-/// Acquire one mode of the build lock.
+/// One lock with a shared and an exclusive mode, in the two words a waiting
+/// agent needs.
+///
+/// The second field exists because the shared mode cannot leave a note: one
+/// `state` file carries one, and shared holders come several at a time. So what
+/// to say about them is a property of the lock rather than something
+/// [`describe_holder`] could work out.
+#[derive(Clone, Copy)]
+struct Lock {
+    name: &'static str,
+    shared_holders: &'static str,
+    queued_ahead: &'static str,
+}
+
+const BUILD: Lock = Lock {
+    name: "build lock",
+    shared_holders: "held by other builds in this tree",
+    queued_ahead: "an exclusive phase is queued ahead of it",
+};
+const SYSROOT: Lock = Lock {
+    name: "sysroot lock",
+    shared_holders: "held by suite runs, here or in another worktree",
+    queued_ahead: "a --claim-sysroot is queued ahead of it",
+};
+
+/// Acquire one mode of a two-file lock.
 ///
 /// Two files, not one. `flock` has no writer preference — measured on this
 /// host, four shared churners kept an exclusive waiter out for the whole 5.5 s
@@ -354,7 +415,7 @@ fn exclusive(path: &Path, lock: &str, what: &str) -> Guard {
 /// instead of overtaking it. `intent` is always taken before `state` and
 /// dropped as soon as `state` is held, so nothing ever waits on `intent` while
 /// holding `state`.
-fn acquire(dir: &Path, op: i32, what: &str) -> Guard {
+fn acquire(dir: &Path, op: i32, what: &str, lock: Lock) -> Guard {
     let intent_path = lock_path(dir, "intent");
     let state_path = lock_path(dir, "state");
     let intent = open_lock_file(&intent_path);
@@ -365,15 +426,15 @@ fn acquire(dir: &Path, op: i32, what: &str) -> Guard {
     let mut waited = false;
 
     if !try_lock(&intent, op) {
-        announce("build lock", &label, "an exclusive phase is queued ahead of it");
+        announce(lock.name, &label, lock.queued_ahead);
         waited = true;
         take_lock(&intent, op, &intent_path);
     }
     if !try_lock(&state, op) {
         if !waited {
             let holder = describe_holder(&state_path)
-                .unwrap_or_else(|| "held by other builds in this tree".to_string());
-            announce("build lock", &label, &holder);
+                .unwrap_or_else(|| lock.shared_holders.to_string());
+            announce(lock.name, &label, &holder);
             waited = true;
         }
         take_lock(&state, op, &state_path);
@@ -536,6 +597,10 @@ mod tests {
         root.join(LOCK_DIR)
     }
 
+    fn sysroot_lock_dir(root: &Path) -> PathBuf {
+        git_lock_dir(root).join(SYSROOT_DIR)
+    }
+
     /// A host of two, so filling it costs two processes rather than twelve.
     const TEST_SLOTS: usize = 2;
 
@@ -645,6 +710,24 @@ mod tests {
                 let _slot = slot(&slot_dir(&root), TEST_SLOTS, "a child's task");
                 touch(&root.join(format!("held-{}", std::process::id())));
                 std::thread::sleep(Duration::from_secs(600));
+            }
+            "hold-run" => {
+                let _run = run_against_sysroot(&root, "a child's suite run");
+                touch(&root.join("held"));
+                appeared(&root.join("release"), Duration::from_secs(20));
+            }
+            "hold-run-forever" => {
+                let _run = run_against_sysroot(&root, "a child's suite run");
+                touch(&root.join("held"));
+                std::thread::sleep(Duration::from_secs(600));
+            }
+            "want-claim" => {
+                let _claim = claim_sysroot(&root, "a child's --claim-sysroot");
+                note(&root, "claim");
+            }
+            "want-run" => {
+                let _run = run_against_sysroot(&root, "a child's suite run");
+                note(&root, "run");
             }
             "want-slot" => {
                 let _slot = slot(&slot_dir(&root), TEST_SLOTS, "the queued run");
@@ -816,7 +899,7 @@ mod tests {
         // Naming one path is not yet excluding on it: `flock` conflicts between
         // open file descriptions, so a second handle on the shared file is the
         // question a second process would ask.
-        let held = acquire(&root.join(LOCK_DIR), LOCK_SH, "a build in the primary");
+        let held = acquire(&root.join(LOCK_DIR), LOCK_SH, "a build in the primary", BUILD);
         let global = open_lock_file(&lock_path(&git_common_lock_dir(&linked), "state"));
         assert!(
             try_lock(&global, LOCK_EX),
@@ -874,6 +957,86 @@ mod tests {
         assert!(writer.wait().unwrap().success());
         assert!(reader.wait().unwrap().success());
         assert_eq!(fs::read_to_string(root.join("order.log")).unwrap(), "ex\nsh\n");
+    }
+
+    /// **The decision `--claim-sysroot` did not have: a claim may not land
+    /// inside another worktree's running gate.**
+    ///
+    /// It could, and on 2026-08-04 it did four times in 38 minutes — 23:03,
+    /// 23:15, 23:27, 23:41 — each rewrite turning some other worktree's every
+    /// later build into a refusal. One gate died with 156 of them. The refusal
+    /// itself is right and stays; what it lacked was somewhere to queue.
+    #[test]
+    fn a_claim_waits_for_a_run_in_flight() {
+        let root = scratch("sysroot-run");
+        let mut kid = child(&root, "hold-run");
+        assert!(appeared(&root.join("held"), Duration::from_secs(20)), "child never acquired");
+
+        let state = lock_path(&sysroot_lock_dir(&root), "state");
+        assert!(
+            !try_lock(&open_lock_file(&state), LOCK_EX),
+            "a claim could land inside a run in flight"
+        );
+        assert!(
+            try_lock(&open_lock_file(&state), LOCK_SH),
+            "two suite runs excluded each other; only a claim may"
+        );
+
+        touch(&root.join("release"));
+        assert!(kid.wait().unwrap().success());
+        let _mine = claim_sysroot(&root, "the parent's claim");
+    }
+
+    /// A run that starts while a claim is queued goes second.
+    ///
+    /// Without this the claim is what starves: `flock` has no writer preference,
+    /// and a tree that runs 15-25 suites a day never has a moment with none in
+    /// flight. The intent file is the same mechanism
+    /// [`a_queued_exclusive_phase_goes_first`] gates for the build lock.
+    #[test]
+    fn a_run_queues_behind_a_waiting_claim() {
+        let root = scratch("sysroot-preference");
+        let mine = run_against_sysroot(&root, "the parent's run");
+
+        let mut claimer = child(&root, "want-claim");
+        let intent = lock_path(&sysroot_lock_dir(&root), "intent");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while try_lock(&open_lock_file(&intent), LOCK_SH) {
+            assert!(Instant::now() < deadline, "the claiming child never queued");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut runner = child(&root, "want-run");
+        assert!(
+            !appeared(&root.join("order.log"), Duration::from_millis(300)),
+            "a suite run overtook a queued claim"
+        );
+
+        drop(mine);
+        assert!(claimer.wait().unwrap().success());
+        assert!(runner.wait().unwrap().success());
+        assert_eq!(fs::read_to_string(root.join("order.log")).unwrap(), "claim\nrun\n");
+    }
+
+    /// A suite is exactly the thing an agent kills, and a stranded run lock
+    /// would leave the sysroot unclaimable by anyone, in every worktree, until
+    /// the machine rebooted.
+    #[test]
+    fn a_killed_run_does_not_wedge_the_claim() {
+        let root = scratch("sysroot-killed");
+        let mut kid = child(&root, "hold-run-forever");
+        assert!(appeared(&root.join("held"), Duration::from_secs(20)), "child never acquired");
+
+        let state = lock_path(&sysroot_lock_dir(&root), "state");
+        assert!(!try_lock(&open_lock_file(&state), LOCK_EX), "the lock was not actually held");
+
+        kid.kill().unwrap();
+        kid.wait().unwrap();
+
+        assert!(
+            try_lock(&open_lock_file(&state), LOCK_EX),
+            "a SIGKILLed suite run stranded the sysroot lock"
+        );
     }
 
     /// The whole point of a counting semaphore: the run past the budget waits.

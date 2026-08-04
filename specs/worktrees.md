@@ -78,8 +78,11 @@ an unchanged `toyos-abi` file used to buy a full std rebuild.
 
 - **Match** — build.
 - **Mismatch, linked worktree** — refuse, naming which of the three trees
-  differs and what to do. Merging the change already in the sysroot is the
-  ordinary answer.
+  differs, **who built the sysroot and how long ago**, and what to do. Merging
+  the change already in the sysroot is the ordinary answer, and
+  `rust/build/toyos-sysroot-claimant` is what makes "merge it" an instruction
+  somebody can follow: every process that writes the witness writes that beside
+  it.
 - **Mismatch, `--claim-sysroot`** — rebuild the shared sysroot from this
   worktree, under the global exclusive lock. Every other worktree then refuses
   until it merges. That is not a side effect to be sorry about: they genuinely
@@ -100,6 +103,59 @@ path — but running it once would have rebuilt the shared sysroot and, through
 `external_fingerprint`, cleaned every other agent's target directories mid
 session. The unexercised code is the `act_if` around those two calls. Worth
 watching the first time it is used in anger.
+
+### 3.1 A claim is an acquisition, not a rewrite
+
+**A claim may not land inside another worktree's running gate**, and that is the
+one decision `--claim-sysroot` shipped without. It could, and on 2026-08-04 it
+did: the witness was rewritten at 23:03, 23:15, 23:27 and 23:41 — a ~13-minute
+cadence — one agent's ABI change and another's claim ping-ponging through six
+landing attempts at ~88 s each, a third agent's gate dying mid-run with 156
+sysroot refusals, and a fourth parked for hours, able to land only once every
+other agent had stopped. The refusal itself is right and stays. What it lacked
+was somewhere to queue.
+
+So the claim goes through the lock machinery. `buildlock::claim_sysroot` takes
+the **sysroot lock** exclusively; every suite run takes it shared for its whole
+length (`buildlock::run_against_sysroot`, once, at the top of `tests/toyos.rs`'s
+`main`). A claim therefore waits for every run in flight, and `acquire`'s intent
+file — the same writer preference the build lock has, and for the same measured
+reason — makes every run that starts while it waits queue behind it, so a tree
+running 15-25 suites a day cannot starve it.
+
+Three things follow, and all three are constraints rather than preferences:
+
+- **The sysroot lock is always outermost.** Sysroot → global, never the reverse,
+  at every acquirer of both. `build()` takes the claim before
+  `buildlock::shared`, and the harness takes the run lock before it compiles
+  anything.
+- **It is taken once per process.** A second acquisition where the process
+  already holds it shared is a cycle with a queued claim's intent.
+- **`--land` does not take it; its gate does**, because the gate is a separate
+  `cargo test` process and a landing holding the lock while its own gate queued
+  behind a claim would be exactly that cycle. What the landing leaves
+  unprotected is the merge and the fast-forward, neither of which reads a
+  sysroot.
+
+Why not the `Scope::Global` lock a build already takes? Because it is the wrong
+*length*. It says "nothing replaces the sysroot while I build", and a suite is a
+hundred builds over two minutes, every one of them reading the sysroot the first
+one agreed with. Holding it for the run instead would deadlock the run against
+itself the moment one of its own builds escalated to the exclusive mode of a
+file the process already held shared — the same argument that gave `integration`
+its own file.
+
+Two worktrees that both legitimately need the sysroot still take turns; that is
+inherent to one shared sysroot and two incompatible ABIs, and only unsharing it
+removes it. What changed is that a turn is now complete and announced: no gate
+dies mid-run, a claim says before it starts whose sysroot it is taking, and a
+suite that starts during one waits with a message naming the holder instead of
+failing a hundred times.
+
+Gates in `src/buildlock.rs`: `a_claim_waits_for_a_run_in_flight`,
+`a_run_queues_behind_a_waiting_claim`, `a_killed_run_does_not_wedge_the_claim`.
+All three are red when the run lock is taken on a directory the claim does not
+name — which is the tree as it stood.
 
 ## 4. Two lock scopes
 
@@ -218,19 +274,19 @@ as they were shared by every agent.
 
 - **Cores: 14.** Intra-suite parallelism and inter-worktree parallelism spend
   the same budget (`specs/test-cost-audit.md` §4.1 constraint 3). Four agents
-  each running a 4-wide suite is 16 QEMUs on 14 cores — slower than serial and
-  mismeasuring everything. If both directions are wanted, the width has to
-  become a counting semaphore in the global lock directory. That is where it
-  belongs; it is not built, because nothing yet hands out slots.
+  each running a 12-wide suite is 48 QEMUs on 14 cores — slower than serial and
+  mismeasuring everything. **Built:** `buildlock::guest_slot` is that counting
+  semaphore, `HOST_GUESTS` = 12 lock files in the global lock directory, one
+  slot per task and never per boot. `specs/test-cost-audit.md` §5.6 has the
+  mechanism and the four measured numbers.
 - **Gate A.** `tests/audio-baseline.toml`'s numbers were recorded with one QEMU
   at a time and no concurrent agents. Worktrees make that condition rarer, not
   differently rare — six agents in one tree already broke it. The options and
-  their costs are `specs/test-cost-audit.md` §4.1 constraint 4, **and the choice
-  is the owner's.** Until it is made: an audio number measured while another
-  worktree is busy is not comparable to the baseline, same as before.
-- The convention when it is made is the one everything else here uses: a `host`
-  lock in `<common-dir>/toyos-build-locks/`, taken shared by anything that
-  merely runs and exclusively by a measurement that needs a quiet host.
+  their costs are `specs/test-cost-audit.md` §4.1 constraint 4. **The owner
+  ruled on 2026-08-04: no measurement locks and no quiet-host scheduling**, so
+  gate A takes one slot like everything else and reserves nothing. Its fast
+  tier's verdict is harm — a gap, an underrun, a dropout — and a load-coincident
+  failure is investigated as a real defect rather than re-run away.
 - **Fixed `/tmp` paths** — `/tmp/toyos-qmp.sock`, `/tmp/toyos-audio.wav`,
   `/tmp/toyos-qemu-debug.log`, `/tmp/toyos-debug-*` — collide across worktrees.
   All of them are on the `cargo run` and interactive-debug paths, which agents
