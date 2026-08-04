@@ -29,11 +29,16 @@ use window::{Color, Event, Window, MOUSE_PRESS};
 const WIDTH: u32 = 400;
 const HEIGHT: u32 = 160;
 
-/// Long enough for the host to home the pointer, calibrate, drag and check,
-/// with the pauses the i8042 needs between packets. It ends on its own because
-/// nothing in the protocol lets the host say "done" to a client it is only
-/// poking through a mouse.
-const RUN_FOR: Duration = Duration::from_secs(30);
+/// The host's sequence puts two presses inside this content: one naming the
+/// pixel under the middle of the screen, one naming it again after the drag.
+/// The press that starts the drag is on the title bar and the compositor keeps
+/// it, so the second is the end of the sequence.
+const PRESSES: usize = 2;
+
+/// A liveness ceiling, not a duration: it costs nothing when the presses
+/// arrive, and bounds a run where the injected pointer never reached this
+/// window at all.
+const RUN_CEILING: Duration = Duration::from_secs(30);
 
 fn main() {
     let mut window = Window::create_with_title(WIDTH, HEIGHT, "drag")
@@ -46,9 +51,9 @@ fn main() {
     println!("drag probe: {WIDTH}x{HEIGHT} window up");
     println!("===DRAG_READY===");
 
-    let deadline = Instant::now() + RUN_FOR;
+    let deadline = Instant::now() + RUN_CEILING;
     let mut presses = 0;
-    while Instant::now() < deadline {
+    while presses < PRESSES && Instant::now() < deadline {
         match window.poll_event(Duration::from_millis(200).as_nanos() as u64) {
             Some(Event::MouseInput(ev)) if ev.event_type == MOUSE_PRESS && ev.changed == 1 => {
                 presses += 1;

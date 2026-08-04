@@ -1465,6 +1465,7 @@ fn hid_break_boot(
                 input.keys(&[(key, true), (key, false)]);
                 thread::sleep(Duration::from_millis(30));
             }
+            crate::input_events_end(&mut input);
             drop(input);
             thread::sleep(Duration::from_millis(200));
         },
@@ -1702,6 +1703,7 @@ pub fn xhci_hotplug(
             devices.add("usb-mouse", "xhci1.0", "hotmouse2", &[]);
             drop(devices);
             thread::sleep(Duration::from_millis(800));
+            crate::input_events_end(&mut qemu::QmpInput::open(socket));
         },
     );
     if let Some(err) = &result.error {
@@ -1890,6 +1892,7 @@ pub fn xhci_flap(
             thread::sleep(Duration::from_millis(100));
             input.mouse(DX, DY, None);
             thread::sleep(Duration::from_millis(200));
+            crate::input_events_end(&mut input);
         },
     );
     if let Some(err) = &result.error {

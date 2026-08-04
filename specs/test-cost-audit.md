@@ -1136,6 +1136,142 @@ The last two are in `specs/known-issues.md`. Neither was introduced here and
 neither reproduces on a host running one suite; both are exactly what the
 mechanism exists to surface.
 
+## 5.5 Wave 6: the regression, and pacing as the general fix
+
+§5.4 certified 109.1 s at 246 tests. Two landings later the suite measured
+**168.8 s at 248** — parallel 44.3 s (unchanged), gate A 29.7 s (unchanged),
+serial tail **94.8 s against 37.4 s**. Both causes came in with the compositor
+work at `c29859a` and both were individually defensible.
+
+1. **`metal_sim_window_drag`, 35 s**, the single most expensive test in the
+   suite. A good gate — a window drag must damage a bounded area — whose client
+   ran a fixed 30 s. The host's whole sequence takes about 2.5 s of that.
+2. **The `I8042_TRACE` group moved `Parallel` → `Serial`**, taking 22 s of tail
+   with it. `i8042_mouse` fired 1000 `input-send-event` commands back to back
+   and required 500 pointer events out of the guest, which is a drain rate.
+   Group members share one `Sched`, so all three went.
+
+### 5.5.1 What a fixed client deadline costs, and what replaces it
+
+Five guest programs ended their run on a wall-clock duration because nothing in
+the protocol let the host say "done" to a client it pokes through a mouse. Each
+one is a test that pays the whole duration on every green run:
+
+| client | was | ends on | test, before → after |
+|---|---|---|---|
+| `window_drag` | 30 s fixed | the host's second press | `metal_sim_window_drag` 35 s → 8 s |
+| `i8042_mouse` | 10 s fixed | a right-button release | `i8042_mouse` 10 s → 0.55 s |
+| `input_events` | 6 s fixed | a right-button release | `metal_sim_input` 3 s, `xhci_second_controller` 8 s → 3 s, `xhci_hid_break` 21 s → 10 s, `xhci_hotplug` 9 s → 6 s, `xhci_flap` 8 s → 6 s |
+
+The marker is the right button, which no sequence driving any of these produces
+for any other reason, and the run ends on its *release* so the pointer is left
+with nothing held. Raising `input_events`'s deadline to a liveness ceiling
+without giving its other three callers the marker cost 32 s, 36 s and 69 s on
+one run — the failure mode of this design is loud and immediate.
+
+`window_drag` has no marker: it ends on the press its host's sequence ends with,
+and the host then waits for the compositor interval that closes after the client
+has gone (`drain_until`, not a sleep).
+
+### 5.5.2 Pacing: the general form of "this verdict is a rate"
+
+`QemuInstance::run_test_hooked` injects a whole sequence in one call and holds
+the serial reader while it does. The host therefore runs at its own speed, and
+what reaches the guest is whatever survived the queues in between — so a packet
+the guest was never given is indistinguishable from one it lost. That is the
+whole defect behind two `Serial` registrations:
+
+- `i8042_mouse` at width 12 delivered 127 and then 209 of its thousand. QEMU's
+  PS/2 buffer silently drops a packet it has no room for.
+- `xhci_second_controller` at width 4 delivered its four pointer events and lost
+  all five keys.
+
+`run_test_paced` is the same loop with the hook called on **every** console
+line, so an injection can be driven by what the guest has printed.
+`run_test_hooked` is written in terms of it. Two users:
+
+- `i8042_mouse` keeps at most `MOUSE_LEAD` = 32 packets (96 bytes, against a
+  256-byte ring in the kernel and QEMU's buffer above it) ahead of confirmed
+  arrivals. The verdict moved from *at least half of the thousand arrived* to
+  **all 1008 injected packets arrived**, plus `0 discarded`, `0 overruns`,
+  `0 dropped`, `0 lost edges` off the driver's own line — counters that a
+  starved guest could previously have explained and now cannot.
+- `input_events_run` is the shared sequence of `metal_sim_input` and
+  `xhci_second_controller` as a script whose every step waits for the guest to
+  print what the step before it produced.
+
+Both moved back to `Parallel`. A guest with less of the host is now a longer run
+and never a smaller count.
+
+`i8042_mouse` also reads the driver's periodic counter line, whose default
+cadence is one per 10 s of typing — longer than the paced burst now takes. The
+trace kernel gets `i8042-fast-health`, carried in `kernel/Cargo.toml` as an
+implication of `i8042-trace` rather than asked for at the boot site: a kernel
+build is keyed on the feature *set*, and asking for the pair took the parallel
+phase from 44.3 s to 53.4 s for one extra kernel.
+
+### 5.5.3 Ledger — coverage
+
+**Nothing was dropped**, keeping §5.4.4's count at zero. Two assertions moved
+and both got stronger:
+
+| assertion | was | is |
+|---|---|---|
+| `i8042_mouse` delivery | `events.len() >= BURST / 2` | `events.len() == injected`, with every packet paced against an arrival |
+| `i8042_mouse` counters | `0 discarded`, and only if a line happened to appear | `0 discarded`, `0 overruns`, `0 dropped`, `0 lost edges`, and the line is required |
+
+One diagnosis changed shape. `metal_sim_window_drag` used to catch a title-bar
+probe that landed in the content as a *third* press; the client now stops at
+the second, so the same miss fails on the displacement instead. Staged: the
+message is `carried it 0,41 — the press missed the title bar`.
+
+Teeth, each observed red on the shortened tests and reverted:
+
+| what was broken | what reported it |
+|---|---|
+| `TITLE_PROBE_PX` = −40, so the drag's press lands in the content | `the drag was supposed to carry the window 120,60 px and carried it 0,41` |
+| `MSG_PRESENT` damaging the whole screen | `repainted 2073600 of 2073600 pixels in one frame` |
+| `window_drag` counting no presses | `pressed inside its content 0 times, not twice` |
+| `kernel/src/mouse.rs` dropping 1 pointer event in 400 | `timed out after 60s — 1002 of the 1004 packets injected came back out` |
+| `DISCARDS` seeded to 1 | `the driver does not report `0 discarded`` |
+| `kernel/src/keyboard.rs` dropping 1 key event in 3 | `typed "h", want it to contain "hello"` |
+
+The fourth is the one that matters most: two lost packets in a thousand is a
+green run under the old verdict and a named red under the new one.
+
+### 5.5.4 The number
+
+**108.0 s, 248 tests, all green** — parallel 43.8 s, serial tail 34.5 s, gate A
+29.7 s. Same session, same host, against **168.8 s** measured on `c29859a`
+before the change. The tail's seven remaining entries are the six §5.4 left
+plus the drag test:
+
+    metal_sim_window_drag 8s   metal_sim_null_audio 6s   netd_hostile_peer 4s
+    i8042_absent 4s   xhci_slow_connect 3s   xhci_flap 6s
+    late_storage_connect 3s
+
+Confirmed at 112.5 s on a later run. Everything measured after that first pair
+was taken on a host that turned out to be carrying **three other full suites and
+a `toyos-sched-sim measure`** — `ps aux -r` and three `toyos-tests-<pid>`
+directories in `$TMPDIR`, load 10.5 against the 1.2 the baseline was taken at.
+Under that the same tree ran its parallel phase in 245.2 s. Two things came out
+of it anyway, both fixes on their own terms and neither a response to the load:
+
+- `shell_answers` typed ten times with a flat two seconds between, a
+  twenty-second ceiling on a desktop coming up that does not scale with the
+  phase. Now `qemu::budget(20 s)`.
+- `usb_transport_break` is `Sched::Serial`. Its second `transport broke` line is
+  the driver's recovery retrying against an endpoint still halted from the
+  staged break, so "the recovery finished on its first try" was part of its
+  verdict. Costs 3 s of tail.
+
+One caution recorded rather than resolved: a run under that contention wedged in
+the metal-sim desktop group — one vCPU at 100% for twenty minutes, no output,
+killed rather than waited out (`metal_sim_compositor_stall`'s ceiling is
+`budget(240 s)`, 48 minutes at width 12). That group is green three times out of
+three in isolation on the same tree and green in every full run that completed.
+Both are filed in `specs/known-issues.md`.
+
 ## 6. What this audit did not measure
 
 - The split of a machine test's time *above* the 3.7 s floor into guest work

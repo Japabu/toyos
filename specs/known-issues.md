@@ -2001,31 +2001,52 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
-### Two `Sched::Parallel` tests go red under four other worktrees' suites
+### `Sched::Parallel` tests that go red under other worktrees' suites
 
-Both were caught by the re-run-alone pass (`specs/test-cost-audit.md` §5.4.6) on
-2026-08-04, on a host carrying four concurrent full suites — `uptime` load 58 —
-and both were green the moment they were re-run by themselves in the same
-process. Neither predates nor was introduced by the parallel-width work; both
-have been `Sched::Parallel` since the phase landed, and neither reproduces on a
-host running one suite.
+Caught by the re-run-alone pass (`specs/test-cost-audit.md` §5.4.6) on
+2026-08-04, on a host carrying three to four concurrent full suites, and green
+the moment each was re-run by itself in the same process. None predates or was
+introduced by the parallel-width work; all have been `Sched::Parallel` since the
+phase landed, and none reproduces on a host running one suite.
 
-- **`i8042_mouse`** — `an intact pointer stream discarded bytes: … 3056 bytes,
-  24 keys, 1005 motion, 15 undecoded, 1 discarded`. One byte in three thousand.
-  The gate is `0 discarded` and it is the right gate; what is unclear is whether
-  a guest that lost 8× its share of the host can be held to it.
-- **`usb_transport_break`** — `the transport broke 2 times; the injection is
-  armed once per boot, so anything else is a break this test did not stage`.
-  A second break on a boot whose actuator arms once is the interesting half:
-  either the boot ran the injection twice, or something else on that machine
-  produced the same line.
+- **`i8042_mouse`** — CLOSED. The verdict was a drain rate (`at least half of a
+  thousand injected packets arrived`) and it is now the full count with the
+  injection paced against the guest's own report of each packet, so nothing the
+  host does can outrun the guest. `0 discarded` is unchanged and joined by
+  `0 overruns`, `0 dropped`, `0 lost edges`. `specs/test-cost-audit.md` §5.5.2.
+- **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
+  second line is not a second staged break but the driver's *recovery* retrying,
+  `transport broke on SCSI 0x2a: command phase completion code 6` against an
+  endpoint still halted from the injected one. Recovery still succeeds. So one
+  staged break and no other makes "the recovery finished on its first try" part
+  of the verdict, and how many tries it takes is how much of the host the guest
+  had.
+- **`desktop_typing_damage`** — `nothing typed at the terminal window reached a
+  shell`. `shell_answers` typed ten times with a flat two seconds between, which
+  is a twenty-second ceiling on a desktop coming up; the retry window is now
+  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`.
+- **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
+  suites *and* a `toyos-sched-sim` run. Not investigated. Still
+  `Sched::Parallel`.
 
-**What to do about a red on either name:** read the `ALONE` line under it before
-anything else. `GREEN` there means the host, not the kernel. What neither of them
-should get is a widened bound — `0 discarded` is what `i8042_mouse` exists to
-say, and a gate that tolerates one lost byte tolerates the defect it was written
-for. If the class needs closing, the answer is a global QEMU-slot semaphore
-across worktrees (`specs/worktrees.md` §6), not a looser assertion.
+**What to do about a red on any of these names:** read the `ALONE` line under it
+before anything else. `GREEN` there means the host, not the kernel. What none of
+them should get is a widened bound — a gate that tolerates one lost byte
+tolerates the defect it was written for. The two fixes above are the two shapes
+that are legitimate: make the verdict independent of the rate, or scale a
+liveness ceiling with the phase. If the class needs closing beyond that, the
+answer is a global QEMU-slot semaphore across worktrees
+(`specs/worktrees.md` §6), not a looser assertion.
+
+### A whole parallel phase can be starved by another agent's build
+
+Measured 2026-08-04: the same tree that runs the phase in 44.8 s ran it in
+245.2 s with three other `cargo test` processes and a `toyos-sched-sim measure`
+on the host. Nothing in the suite reports this — the phase is simply slow, and
+whichever load-sensitive `Sched::Parallel` test loses its margin first is what
+goes red. `uptime` before and after a suspicious run, and `ps aux -r | head`,
+are what separate it from a regression; a `toyos-tests-<pid>` directory per live
+suite in `$TMPDIR` names how many are up.
 
 ### A daemon's boot lines land in whichever test window is open
 
