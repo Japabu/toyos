@@ -700,10 +700,12 @@ impl AddressSpace {
     ///
     /// Replacing and not skipping, because the boot map blankets every physical
     /// address the memory map reaches and an MMIO window inside that span is
-    /// already mapped by the time its driver asks for it. Only a policy the
-    /// boot map did not choose may be overwritten that way: two windows in one
-    /// 2 MiB page asking for different memory types would be decided by call
-    /// order, and the loser would write through a type it did not ask for.
+    /// already mapped by the time its driver asks for it. Only the boot map's
+    /// own 2 MiB leaf may be overwritten that way. Two windows in one page
+    /// asking for different memory types would be decided by call order, and
+    /// the loser would write through a type it did not ask for; an entry
+    /// `guard_4k` has split into a page table would lose the guard and leak the
+    /// table.
     fn map_2m(&mut self, phys: u64, flags: u64) {
         let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
         let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
@@ -713,7 +715,8 @@ impl AddressSpace {
         assert!(
             existing & PAGE_PRESENT == 0
                 || existing & !(PAGE_ACCESSED | PAGE_DIRTY) == entry
-                || CachePolicy::from_pde(existing) == CachePolicy::DeferToMtrr,
+                || (existing & PAGE_SIZE_BIT != 0
+                    && CachePolicy::from_pde(existing) == CachePolicy::DeferToMtrr),
             "map_2m: {phys:#x} is mapped {existing:#x} and cannot also be {entry:#x}"
         );
         pd.set_entry(pd_idx, entry);
@@ -729,6 +732,11 @@ impl AddressSpace {
         }
     }
 
+    /// Everything an upper-level entry may carry besides the address of the
+    /// table below it. A leaf's remaining flags are address bits here — bit 12
+    /// of a PML4E or PDPTE is part of the next table's physical address, not
+    /// the PAT bit it is in a 2 MiB PDE — so both branches below mask, and a
+    /// caller passing leaf flags cannot move a page table 4 KiB.
     fn ensure_table(
         &mut self,
         pml4_idx: usize,
@@ -736,24 +744,25 @@ impl AddressSpace {
         pdpt_idx: usize,
         pdpt_flags: u64,
     ) -> &mut PageTablePage {
+        const TABLE_FLAGS: u64 = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
         if self.root[pml4_idx] & PAGE_PRESENT == 0 {
             let child = Box::new(PageTablePage([0; 512]));
-            self.root.set_entry(pml4_idx, child.phys() | pml4_flags);
+            self.root.set_entry(pml4_idx, child.phys() | (pml4_flags & TABLE_FLAGS));
             self.children.push(child);
         } else {
             // x86-64: upper-level entries must be at least as permissive as any
             // leaf entry below them. Widen only (OR), never narrow.
-            self.root.or_flags(pml4_idx, pml4_flags & (PAGE_PRESENT | PAGE_WRITE | PAGE_USER));
+            self.root.or_flags(pml4_idx, pml4_flags & TABLE_FLAGS);
         }
 
         let pdpt = unsafe { PageTablePage::from_phys_mut(self.root[pml4_idx] & ADDR_MASK) };
 
         if pdpt[pdpt_idx] & PAGE_PRESENT == 0 {
             let child = Box::new(PageTablePage([0; 512]));
-            pdpt.set_entry(pdpt_idx, child.phys() | pdpt_flags);
+            pdpt.set_entry(pdpt_idx, child.phys() | (pdpt_flags & TABLE_FLAGS));
             self.children.push(child);
         } else {
-            pdpt.or_flags(pdpt_idx, pdpt_flags & (PAGE_PRESENT | PAGE_WRITE | PAGE_USER));
+            pdpt.or_flags(pdpt_idx, pdpt_flags & TABLE_FLAGS);
         }
 
         unsafe { PageTablePage::from_phys_mut(pdpt[pdpt_idx] & ADDR_MASK) }
