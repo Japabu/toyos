@@ -161,6 +161,16 @@ pub enum Profile {
     /// is the assertion. QEMU assigns ports in device-creation order, measured
     /// against the kernel's own `port N connected` lines.
     UsbDiskRefusedFirst,
+    /// More USB disks on one controller than its DMA pool has blocks for.
+    ///
+    /// `MSC_BLOCKS` is 2 and the boot stick takes one of them, so three data
+    /// disks put two past the ceiling. Every other profile declares one disk,
+    /// which is why nothing could ask what a caller sees when the bound is hit
+    /// — and the bound is policy, so the answer is the whole question. Both
+    /// staged disks are stamped: the one that binds is written and the one the
+    /// pool had no room for has to come back byte-identical, which is the claim
+    /// a log line cannot make.
+    UsbDiskCrowd,
     /// metal-sim with a device that attaches at **full speed**.
     ///
     /// Speed is a shape dimension and it was one no profile varied: every USB
@@ -629,6 +639,18 @@ impl Profile {
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disks: &[UsbDisk { readonly: true, ..UsbDisk::DATA }],
+                iommu: Some(IOMMU_DEFAULT),
+            },
+            Self::UsbDiskCrowd => Shape {
+                vga: "std",
+                vgamem_mb: None,
+                virtio: false,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disks: &[UsbDisk::DATA, UsbDisk::DATA, UsbDisk::DATA],
                 iommu: Some(IOMMU_DEFAULT),
             },
             // The first controller carries nothing at all — not even the boot
