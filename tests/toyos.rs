@@ -42,11 +42,12 @@ enum Sched {
 /// The width with no `--jobs`, and where it came from.
 ///
 /// 14 cores and about three host threads a guest divides out to four. The suite
-/// says twelve: on one tree in one session, **123.1 s wide eight and 107.3 s /
-/// 118.2 s wide twelve**, all green, with the parallel phase at 59.1 s against
-/// 43.8 s and 53.5 s — and the eight was measured on the quieter host of the
-/// three. A guest here is mostly *waiting* — for a marker, for a debounce, for a
-/// device — which is why this is a measurement and not a division.
+/// says twelve. Alternated in one session on a quiet host, 246 tests, both
+/// green: **125.6 s wide eight against 109.1 s wide twelve**, with the parallel
+/// phase at 58.3 s against 42.1 s — the same 16 s and the same direction as the
+/// pair taken on the tree six commits earlier. A guest here is mostly
+/// *waiting* — for a marker, for a debounce, for a device — which is why this is
+/// a measurement and not a division.
 ///
 /// **Twelve is the number for one suite on this host, and the host has no
 /// budget.** Four agents at twelve is 48 guests on 14 cores; the semaphore

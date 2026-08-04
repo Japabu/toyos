@@ -925,40 +925,42 @@ by *what the assertion is* rather than by what the registration said:
 |---|---|---|
 | `drain_until` instead of `drain_serial(20 s)` | `double_fault_stack` | **32 s → 3 s** |
 | `qemu::budget`, shared block to the phase | tail | −13 s from the tail |
-| ten conversions | tail | 167.3 s → 35.0 s |
+| ten conversions | tail | 167.3 s → 37.4 s, and six tests to seven |
 | longest-job-first on a measured profile | parallel phase | see §5.4.5 |
 | inert-actuator folding | image builds | 5 kernel variants → 1 |
 
-**Where it landed.** 240/240 green at the default width of 12 (§5.4.7), twice,
-on a host with other worktrees building and booting throughout — `uptime` load
-18.9 and 18.0 at the two starts:
+**Where it landed. 246/246 green in 109.1 s**, at the default width of 12
+(§5.4.7), on a quiet host — `uptime` load 5.10 falling to 3.44, no other
+worktree building or booting:
 
-| | run 1 | run 2 |
-|---|---:|---:|
-| parallel phase, 234 tests in 63 tasks | 43.8 | 53.5 |
-| serial tail, 6 tests | 33.6 | 34.7 |
-| gate A, 4 boots | ~30 | ~30 |
-| **suite** | **107.3** | **118.2** |
+| | seconds |
+|---|---:|
+| parallel phase, 239 tests in 65 tasks | **42.1** |
+| serial tail, 7 tests | **37.4** |
+| gate A, 4 boots | **~30** |
+| **suite** | **109.1** |
 
-Neither was taken on a quiet host, which is the honest way round: **the target
-is met under the load the tree actually runs at.**
+Same session, same tree, alternated: **125.6 s at width 8**, and 318.4 s at
+width 12 on the *first* run after main's kernel changes arrived — §1.5's cold
+variant tax, about 180 s of it, paid once by whoever runs first and by nothing
+in this document. Two earlier runs of the 240-test tree came in at **107.3 s and
+118.2 s** with other worktrees busy throughout, so the figure survives the load
+the tree actually runs at as well as the absence of it.
 
 Against the starting point: **327.5 s at width 4** before this wave and before
 `screen_console_scroll`'s cut, and **433.8 s** measured on this branch's base
-under the five-worktree load the conversions were later tested under.
+under five concurrent suites.
 
-**Gate A is now 28% of the run**, and it is the one block nothing here touches:
-four boots, alone, because `tests/audio-baseline.toml`'s numbers were recorded
-that way. The serial tail is another 31%. **Two thirds of a green suite is now
-the part that cannot share the host**, which is where the next lever has to
-come from and both halves of it are the owner's.
+**Gate A is 28% of a green run and the serial tail is another 34%.** Two thirds
+of the suite is now the part that cannot share the host, which is where the next
+lever has to come from and both halves of it are the owner's.
 
 One earlier run is worth keeping for what it shows about gate A's variance: the
-same suite at width 8 on a quieter host came in at **139.7 s**, of which gate A
-was **46.5 s** — 30 s plus two confirmations, because two of its four configs
-saw a dropout and the fast tier re-booted each once to check it reproduced.
-Neither did. A gate A that has to confirm costs half again as much as one that
-does not, and nothing schedules around that.
+same suite came in at **139.7 s** with gate A at **46.5 s** — 30 s plus two
+confirmations, because two of its four configs saw a dropout and the fast tier
+re-booted each once to check it reproduced. Neither did. A gate A that has to
+confirm costs half again as much as one that does not, and nothing schedules
+around that.
 
 **`double_fault_stack` is the shape to look for elsewhere.** A guest the fatal
 path has halted does not *exit*: every CPU is stopped and QEMU stays up, so
@@ -1081,15 +1083,19 @@ at twelve is 48 guests on 14 cores. The counting semaphore
 a per-suite number with a machine-wide cost — which is the same warning §4.1
 constraint 3 gave at four and is now three times louder.
 
-**Confidence: two clean runs at 12, one at 8.** Width 12 came in at 107.3 s and
-118.2 s; width 8 at 123.1 s on a *quieter* host than either, and at 351.2 s on a
-much busier one. Nine further attempts are not measurements and none is reported:
-seven died on `this worktree and the shared sysroot disagree about toyos-abi/src`
-when another worktree claimed the sysroot mid-run — the signature is a dozen or
-more identical refusals, one per test that tried to build after the claim — one
-spent 84 s queued behind the exclusive phase that followed, and one ran under
-five concurrent suites. The direction has been consistent in every pair taken
-since the `drain_serial` fix; the margin has one sample.
+Re-run once more after main's four landings, 246 tests, quiet host, alternated
+in one session: **125.6 s at width 8 and 109.1 s at width 12**, both green, with
+the parallel phase at 58.3 s and 42.1 s. That is the same 16 s and the same
+direction as the pair above, on a tree six commits later and with six more
+tests in it.
+
+**Confidence: three clean runs at 12, two at 8**, across two trees. Nine further
+attempts are not measurements and none is reported: seven died on `this worktree
+and the shared sysroot disagree about toyos-abi/src` when another worktree
+claimed the sysroot mid-run — the signature is a dozen or more identical
+refusals, one per test that tried to build after the claim — one spent 84 s
+queued behind the exclusive phase that followed, and one ran under five
+concurrent suites.
 
 ### 5.4.6 Ledger 3 — recycling and contamination
 
