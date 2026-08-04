@@ -2034,9 +2034,11 @@ before anything else. `GREEN` there means the host, not the kernel. What none of
 them should get is a widened bound — a gate that tolerates one lost byte
 tolerates the defect it was written for. The two fixes above are the two shapes
 that are legitimate: make the verdict independent of the rate, or scale a
-liveness ceiling with the phase. If the class needs closing beyond that, the
-answer is a global QEMU-slot semaphore across worktrees
-(`specs/worktrees.md` §6), not a looser assertion.
+liveness ceiling with the phase. The global QEMU-slot semaphore this section
+used to name as the closing move now exists (`buildlock::guest_slot`,
+`specs/test-cost-audit.md` §5.6): the host admits twelve guests across every
+worktree, so the four-suite regime these were observed in cannot recur. A looser
+assertion is still not the answer.
 
 ### A whole parallel phase can be starved by another agent's build
 
@@ -2047,6 +2049,37 @@ whichever load-sensitive `Sched::Parallel` test loses its margin first is what
 goes red. `uptime` before and after a suspicious run, and `ps aux -r | head`,
 are what separate it from a regression; a `toyos-tests-<pid>` directory per live
 suite in `$TMPDIR` names how many are up.
+
+`buildlock::guest_slot` bounds the *guests* to twelve across all worktrees, and
+that is the part of this the semaphore closes. It bounds nothing else: a
+`toyos-sched-sim measure`, a `cargo build` and the primary's bootstrap all take
+cores and no slot, so a phase can still be starved by work that boots nothing.
+A slot's wait is announced (`[host-slots] waiting …`), which is what separates a
+slow phase from a starved one without `ps`.
+
+### The primary checkout reclaims the shared sysroot silently
+
+Found 2026-08-05 while giving `--claim-sysroot` its arbitration; not fixed.
+
+A linked worktree whose `toyos-abi` differs from the sysroot's must pass
+`--claim-sysroot`, which now announces itself and queues behind every run in
+flight (`specs/worktrees.md` §3.1). **The primary checkout does the same thing
+on any ordinary build and says nothing.** `toolchain::ensure` reaches
+`std_sources_stale` for `Owner::Us`, which compares the witness against the
+primary's own sources; a worktree's claim makes that comparison stale, so the
+next `cargo run -- --build-only` in the primary rebuilds std from main's
+sources, rewrites the witness, and the claiming worktree refuses from then on.
+No flag, no announcement, and no sysroot lock — `build()` takes it only when
+`--claim-sysroot` is passed.
+
+It is the same defect the flag now has arbitration for, on the path used far
+more often. It is not fixed here because the two shapes conflict: a suite run
+holds the sysroot lock shared for its whole length, and the primary rebuilds std
+from inside `build_test_image`, which the harness calls under that hold — so
+taking the exclusive lock there would deadlock a suite run in the primary
+against itself. The honest fix is that a stale sysroot *inside a run* is a
+refusal rather than a rebuild, which changes the primary's daily path and wants
+its own gate.
 
 ### A daemon's boot lines land in whichever test window is open
 

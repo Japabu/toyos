@@ -1272,6 +1272,100 @@ killed rather than waited out (`metal_sim_compositor_stall`'s ceiling is
 three in isolation on the same tree and green in every full run that completed.
 Both are filed in `specs/known-issues.md`.
 
+## 5.6 The host's guest budget, and a run that knows it was invalid
+
+Two things §4.1 and §5.4.7 left open, both landed 2026-08-05.
+
+### 5.6.1 The counting semaphore §4.1 constraint 3 asked for
+
+The width is a number for **one** suite. Nothing handed out the cores that two
+suites both spend, and §5.4.7's own warning — "four agents at twelve is 48
+guests on 14 cores" — was being paid daily. What it cost, from other agents'
+2026-08-04 sessions: `screen_fatal_halt` red at 11 s under a second suite
+against 3.3 s alone, `screen_console_panic` 39 s against 13 s, and about an hour
+spent chasing a phantom regression that was three other `cargo test` processes
+and a scheduler simulation at load 30.
+
+`buildlock::guest_slot` is that semaphore. Twelve lock files in
+`<common-dir>/toyos-build-locks/slots/`, and taking one is finding a file nobody
+holds — `flock` rather than a pid file, so a slot a SIGKILLed suite had is free
+the moment the process dies. Four properties are load-bearing:
+
+- **The budget is 12**, the same number and the same measurement as the suite's
+  own width (§5.4.7). One suite alone therefore gets exactly the machine it was
+  measured on, and N suites divide it.
+- **One slot per task, never per boot.** A worker holds at most one and never
+  waits for a second while holding one, which is what makes it deadlock-free
+  rather than lucky: several tests hold two guests at once, and a slot each
+  would let twelve workers each hold one and each wait for another.
+- **The wait is outside the task.** It lands in the phase's wall clock and in no
+  test's duration, so a `PASS` time — and the profile `longest_first` orders
+  on — stays a measurement of the test rather than of the queue.
+- **It announces.** `[host-slots] waiting for a guest slot (…) — all 12 held by
+  2 run(s): pid …` on the first failed scan and every 30 s after. An agent
+  staring at silence kills and retries, which is the pathology `src/buildlock.rs`
+  exists to remove.
+
+`--host-slots N` overrides the budget and `0` turns it off, which is the only
+way to measure a suite against one that has it.
+
+Gate A takes one slot like everything else and reserves nothing. §4.1
+constraint 4 offered a quiet-host reservation as one of three options; **the
+owner ruled on 2026-08-04 that there are no measurement locks and no quiet-host
+scheduling**, and the fast tier's verdict is harm rather than a ceiling, so the
+question is closed and the mechanism is deliberately not built.
+
+### 5.6.2 A run that spans a host suspend reports itself invalid
+
+The dev machine is a laptop and the owner closes the lid; on 2026-08-04 that
+killed three agents mid-run. CLAUDE.md already documented the signature —
+bimodal timing, a tight cluster plus enormous outliers — and documented it as
+something a *human* has to notice before recording a finding, which is to say
+the harness never could.
+
+It can, from the two clocks it already reads. `Instant` is `CLOCK_UPTIME_RAW`
+here and `CLOCK_MONOTONIC` on Linux, neither of which advances while the machine
+is asleep; `SystemTime` does. So `wall − monotonic` across an interval **is** the
+suspended time, and no new source of truth is needed. It also explains why a
+suspended run does not simply time out: every deadline in the harness is on the
+monotonic clock, which stopped with the host, so the run comes back and reports
+whatever the guest, QEMU's virtual clock and the guest's own millisecond stamps
+made of the gap.
+
+Every outcome carries the suspend that overlapped it, and one that crossed two
+seconds or more is **neither a pass nor a fail**. `INVL` in the run's output, its
+own list in the summary, and:
+
+| exit | meaning |
+|---:|---|
+| 0 | every verdict was established |
+| 1 | a real red — including a run that also had invalidated tests, because a red that survives is still a red |
+| 2 | the run established nothing; the host stopped in the middle of it |
+
+**Why 2 and not 0 or 1.** `--land`'s gate consumes this number, and 0 is a claim
+that the tree passed — which a run measured across a stopped host did not
+establish. Exiting 1 is no better: it sends an agent hunting a defect that is
+not in the tree, which is the exact hour this exists to stop being spent. Cargo
+propagates a test binary's own exit code (measured on this host with a
+`harness = false` probe: `exit(2)` out of the binary is `cargo test` exit 2), so
+`src/land.rs` reads it and says the gate did not finish a measurement, main was
+untouched, and nothing is wrong with the branch.
+
+The actuator is the clock source. A test cannot suspend the host it runs on —
+the lid is what produces it and there is no API that asks for it — so
+`clock::stage_suspend` moves the wall clock alone, which is precisely and only
+what a suspend does to this pair; a staged reading is indistinguishable from a
+real one for every consumer downstream, verdict and message alike. Two gates,
+both host-side and booting nothing: `suspend_detector` for the detector, and
+`suspend_invalidates_a_verdict` for what the suite does with it — a pass and a
+fail across the jump are both `Invalid`, a pass and a fail across ordinary clock
+jitter are unchanged, and those two rows are one line apart because **a suspend
+that silently passes is as bad as one that silently fails**.
+
+What it does not do: a suspend that lands *between* two tests invalidates
+nothing, and is right not to. It is reported as a note, and the suite time
+printed beside it is monotonic and already excludes it.
+
 ## 6. What this audit did not measure
 
 - The split of a machine test's time *above* the 3.7 s floor into guest work
