@@ -257,6 +257,15 @@ fat-backing-read-fails = []
 # first. See `iommu/vtd/mod.rs`'s `enable`.
 iommu-context-absent = []
 iommu-empty-domain = []
+# Stage H0 of `specs/hda-driver-plan.md`: take every class-0403 function out of
+# reset once, at the end of the peripheral phase, and report what is behind it.
+# Nothing else can reach those questions — a codec is not on the PCI bus, and
+# the capability that would let a userland process touch one is
+# `specs/userspace-drivers-spec.md` stage 4, unbuilt, and whether it should ever
+# be given this device is exactly what H0 asks. Off in every ordinary boot: no
+# shipped path takes an audio controller out of reset, and the whole feature is
+# deleted at H9. See `kernel/src/drivers/hda_probe.rs`.
+hda-probe = []
 
 # debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]

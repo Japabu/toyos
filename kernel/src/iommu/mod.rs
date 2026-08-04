@@ -28,6 +28,9 @@
 
 pub mod vtd;
 
+#[cfg(feature = "hda-probe")]
+use alloc::vec::Vec;
+
 /// The address width a device's translations cover.
 ///
 /// A closed enum rather than a number, so `39` cannot be passed where a page
@@ -136,6 +139,46 @@ impl core::fmt::Display for StreamId {
 /// this line will become is the seam, not the code.
 pub fn init(rsdp_addr: u64, devices: &[crate::drivers::pci::PciDevice]) {
     vtd::init(rsdp_addr, devices);
+}
+
+/// What this machine's remapping hardware says about one device.
+///
+/// `specs/hda-driver-plan.md` H0's handoff half, and the only reader: I2 keeps
+/// no inventory of units, so this re-reads firmware's table rather than making
+/// it keep one for a diagnostic. Deleted with H0's probe.
+#[cfg(feature = "hda-probe")]
+pub struct DeviceFacts {
+    /// The unit whose scope claims this device, and how it claims it.
+    pub unit: Option<UnitFacts>,
+    /// Every range firmware requires stay identity-mapped for this device.
+    /// `specs/iommu-spec.md` §7.4 refuses a device carrying one for userspace
+    /// handoff.
+    pub reserved: Vec<ReservedRegion>,
+}
+
+#[cfg(feature = "hda-probe")]
+pub struct UnitFacts {
+    /// Numbered as the boot's own `iommu: unitN` lines number it.
+    pub index: usize,
+    /// A device scope names this device, rather than the unit being the
+    /// catch-all for everything on its segment.
+    pub explicit: bool,
+    /// `ECAP.SC`: the unit can force a device's DMA to snoop the CPU cache,
+    /// whatever the device itself asked for. `specs/hda-driver-plan.md` §4.4
+    /// item 4 spends this to avoid a config-space write path.
+    pub snoop_control: bool,
+}
+
+#[cfg(feature = "hda-probe")]
+pub struct ReservedRegion {
+    pub base: u64,
+    /// Inclusive, as firmware states it.
+    pub limit: u64,
+}
+
+#[cfg(feature = "hda-probe")]
+pub fn describe_device(rsdp_addr: u64, bus: u8, dev: u8, func: u8) -> DeviceFacts {
+    vtd::describe_device(rsdp_addr, StreamId::pci(bus, dev, func))
 }
 
 /// The unit blocked a transaction and raised its fault event.
