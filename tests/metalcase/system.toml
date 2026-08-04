@@ -1,13 +1,19 @@
 # The metal-sim boot: what `Profile::Metal` puts in front of userland.
 #
-# soundd and netd are here for exactly the reason they have no device: their
-# graceful exit is half of what this config certifies, and with a console
+# soundd, netd and sshd are here for exactly the reason they have no device:
+# their graceful exit is half of what this config certifies, and with a console
 # `metal_sim_compositor` reads their exit lines rather than assuming them.
+# sshd is the one whose absence *is* the device absence — it has no device of
+# its own and reaches the machine's shape only through netd — and it was the
+# one this config left out, so nothing anywhere ran the branch where it finds
+# no network. It costs the boot the second `NetdConn::connect_blocking` spends
+# retrying a netd that will never come (known-issues §3), which is the price of
+# certifying the line at all.
 # test-runner makes the boot announce itself, so the harness waits for a
 # marker instead of guessing from pixels — and it is what lets an in-guest
 # binary run on the machine shape that gets flashed. Under `mute` it simply
 # parks on a console that never produces a byte.
-init = ["/bin/compositor", "/bin/soundd", "/bin/netd", "/bin/test-runner"]
+init = ["/bin/compositor", "/bin/soundd", "/bin/netd", "/bin/sshd", "/bin/test-runner"]
 
 assets = ["assets"]
 
@@ -15,4 +21,5 @@ assets = ["assets"]
 compositor = {}
 soundd = {}
 netd = {}
+sshd = {}
 test-runner = {}

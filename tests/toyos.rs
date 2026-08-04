@@ -101,6 +101,8 @@ const RUST_SKIP: &[&str] = &[
     "compositor_stall",
     // Needs netd with a NIC. `netd_connection_caps` runs it on tests/netcase.
     "netd_caps",
+    // Same reason, same config: `netd_hostile_peer` runs it there.
+    "netd_hostile_peer",
     // Needs a boot image the harness staged a file into before the machine
     // started, which only `esp_filesystem` builds.
     "esp_files",
@@ -202,9 +204,17 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // client's audio leaves the machine.
     ("metal_sim_null_audio", Sched::Serial),
     ("netd_connection_caps", Sched::Parallel),
+    // Serial: it measures netd's 2 s handshake deadline against the host's
+    // clock, and counts how many connections survived a 48 ms paced burst
+    // before that deadline could expire any of them. Both are wall-clock
+    // margins, which is the definition of [`Sched::Serial`].
+    ("netd_hostile_peer", Sched::Serial),
     ("foreign_disk_untouched", Sched::Parallel),
     ("boot_partition_identity", Sched::Parallel),
     ("double_fault_stack", Sched::Parallel),
+    // Its own boot, its own feature, and it drives the guest only through
+    // stdin — nothing it touches is shared with another test.
+    ("idle_stack_guard", Sched::Parallel),
     ("diskless_boot", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
     // Its whole assertion is that a keystroke injected from the host crossed a
@@ -2685,9 +2695,15 @@ fn metal_sim_argv_check(argv: &[String]) -> Result<(), String> {
 /// The compositor claims a firmware framebuffer and says what it got; netd finds
 /// no NIC and exits rather than panic; soundd finds no audio device and stays up
 /// on a null sink rather than exiting (hardware absence is a routing state — a
-/// no-device machine still serves audio clients, discarding what they play). The
-/// earlier version read the bottom pixel row instead, which says nothing about
-/// soundd or netd and stayed green with their graceful behavior reverted.
+/// no-device machine still serves audio clients, discarding what they play); and
+/// sshd, which has no device of its own, finds no netd to bind through and says
+/// so instead of dumping a tokio backtrace across the boot. The earlier version
+/// read the bottom pixel row instead, which says nothing about any of them and
+/// stayed green with their graceful behavior reverted.
+///
+/// **All four are init's children and nothing supervises them**, so the message
+/// is the entire diagnostic and its absence is the whole defect — which is why
+/// each is asserted by its own text rather than by anything surviving.
 ///
 /// First in its group, and that is the assertion talking: `cursor == frames`
 /// and the stats line are read off a desktop no client has connected to yet.
@@ -2695,10 +2711,11 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
     // init spawns all four programs without waiting, so test-runner's
     // ready marker races the daemons' own lines. Keep draining until
     // every line has been said or the window closes.
-    const WANT: [&str; 3] = [
+    const WANT: [&str; 4] = [
         "compositor: ready",
         "soundd: no audio device, presenting a null sink",
         "netd: no NIC on this machine, exiting",
+        "sshd: no network on this machine, exiting",
     ];
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while std::time::Instant::now() < deadline
@@ -3722,6 +3739,7 @@ fn run_machine_test(
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
+        "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
@@ -5896,6 +5914,94 @@ fn run_machine_test(
                 ));
             }
             eprintln!("  [netcase] netd cap {declared} piped connections, {granted} accepted then refused");
+            Ok(())
+        }
+        "netd_hostile_peer" => {
+            // The netcase boot again, and for the same reason: netd's `main`
+            // returns on a machine with no NIC, so this is the only config
+            // where there is a daemon to be hostile to.
+            //
+            // The guest carries every verdict that needs a deadline on it —
+            // only it can tell a netd that answered from a netd that never
+            // did. The host carries the half the guest cannot see: whether
+            // netd *named* what it got rid of. A daemon that drops clients
+            // silently is one this machine cannot be asked about afterwards,
+            // which is the whole argument for the log lines.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/netcase");
+            let bins: Vec<(String, Vec<u8>)> = rust_bins
+                .iter()
+                .filter(|(name, _)| name == "netd_hostile_peer")
+                .cloned()
+                .collect();
+            if bins.is_empty() {
+                return Err("netd_hostile_peer was not built".to_string());
+            }
+            let options = BootOptions {
+                profile: qemu::Profile::Headless,
+                ..Default::default()
+            };
+            if !qemu::profile_argv(&options).iter().any(|a| a.contains("virtio-net")) {
+                return Err("this test needs a NIC and the profile has none".to_string());
+            }
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
+            let mut console = qemu.boot_log().to_string();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline && !console.contains("netd: ready, at most ") {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            if !console.contains("netd: ready, at most ") {
+                return Err(format!("netd never came up on a machine with a NIC:\n{console}"));
+            }
+
+            let result = qemu.run_test("test_rs_netd_hostile_peer", Duration::from_secs(120));
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            if result.exit_code != Some(0) {
+                return Err(format!(
+                    "netd_hostile_peer exited {:?}:\n{}",
+                    result.exit_code, result.stdout
+                ));
+            }
+
+            // The guest's own case list, restated here so a case deleted on
+            // one side is a red run rather than a quieter test.
+            const CASES: usize = 6;
+            let Some(refused) = result
+                .stdout
+                .split("hostile peer: ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return Err(format!(
+                    "netd_hostile_peer printed no count:\n{}",
+                    result.stdout
+                ));
+            };
+            if refused != CASES {
+                return Err(format!(
+                    "netd refused {refused} malformed frames, not {CASES}:\n{}",
+                    result.stdout
+                ));
+            }
+
+            // `TestResult::serial` is everything the console carried while the
+            // guest ran, netd's own lines included — the daemon and the test
+            // share one window (known-issues §6), which here is what makes the
+            // daemon's side of the story readable at all.
+            console.push_str(&result.serial);
+            for named in ["netd: dropping pid", "netd: refusing pid"] {
+                if !console.contains(named) {
+                    return Err(format!(
+                        "netd got rid of clients without a `{named}` line — a daemon that \
+                         drops peers silently cannot be asked what happened:\n{console}"
+                    ));
+                }
+            }
+            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+            eprintln!("  [netcase] {refused} hostile frames refused, netd named every peer it dropped");
             Ok(())
         }
         "metal_sim_input" => {

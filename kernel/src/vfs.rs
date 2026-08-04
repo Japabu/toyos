@@ -104,10 +104,27 @@ pub trait FileSystem: Send {
 }
 
 
+/// Whether userland may modify a mount.
+///
+/// Stated at every `mount` call and defaulted nowhere, so a volume added later
+/// cannot inherit the wrong answer by omission.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UserAccess {
+    ReadWrite,
+    /// The kernel's own volume. Reachable and readable, and every syscall that
+    /// would change it is refused — see [`Vfs::user_may_modify`].
+    KernelOnly,
+}
+
+struct Mount {
+    fs: Box<dyn FileSystem>,
+    access: UserAccess,
+}
+
 /// Virtual filesystem that dispatches to named mount points.
 pub struct Vfs {
     root: Option<Box<dyn FileSystem>>,
-    mounts: HashMap<String, Box<dyn FileSystem>>,
+    mounts: HashMap<String, Mount>,
     created_dirs: hashbrown::HashSet<String>,
 }
 
@@ -176,6 +193,19 @@ pub const MAX_LIST_ENTRIES: usize = 16_384;
 
 const _: () = assert!(core::mem::size_of::<(String, u64)>() == 32);
 
+/// The absolute path of a directory, from [`Vfs::resolve_path`]'s two halves.
+///
+/// The form `created_dirs` is keyed on, which is [`Vfs::resolve_absolute`]'s.
+/// One construction shared by the writer of that set and both its readers, so
+/// they cannot drift into disagreeing about what a directory is called.
+fn directory(mount: &str, subdir: &str) -> String {
+    if subdir.is_empty() {
+        format!("/{mount}")
+    } else {
+        format!("/{mount}/{subdir}")
+    }
+}
+
 fn normalize(path: &str) -> String {
     // `parts` is the allocation MAX_PATH is derived against — see its comment.
     // Callers guarantee `path` is at most `MAX_PATH + 1 + MAX_USER_STR` bytes.
@@ -211,13 +241,35 @@ impl Vfs {
         self.root.as_deref_mut().expect("no root filesystem")
     }
 
-    pub fn mount(&mut self, name: &str, fs: Box<dyn FileSystem>) {
-        self.mounts.insert(String::from(name), fs);
+    pub fn mount(&mut self, name: &str, fs: Box<dyn FileSystem>, access: UserAccess) {
+        self.mounts.insert(String::from(name), Mount { fs, access });
+    }
+
+    /// May a syscall acting for userland change what is at `path`?
+    ///
+    /// The kernel's own answer is yes everywhere — it does not ask. This is
+    /// the syscall layer's question, and it is asked by every syscall that can
+    /// create, truncate, rename, delete or link, plus `open` for write.
+    ///
+    /// `/boot` is what it exists for. It is the volume firmware and the
+    /// bootloader read the machine out of, and it had no permission model of
+    /// any kind: `fs::write("/boot/toyos/kernel.elf", "TEETH")` from an
+    /// ordinary process truncated the kernel image to five bytes, which is a
+    /// machine that does not boot again. That is not a filesystem bug to fix
+    /// in FAT32 — it is a mount that userland was never meant to be able to
+    /// change.
+    ///
+    /// The root mount answers yes here and refuses in the adapter instead:
+    /// the initrd is `ReadOnlyBcacheFsAdapter`, which has no write path to
+    /// gate.
+    pub fn user_may_modify(&self, path: &str) -> bool {
+        let (mount, _) = self.resolve_path("/", path);
+        self.mounts.get(&mount).map_or(true, |m| m.access == UserAccess::ReadWrite)
     }
 
     fn resolve_fs(&mut self, mount: &str, file: &str) -> Option<(&mut dyn FileSystem, String)> {
-        if let Some(fs) = self.mounts.get_mut(mount) {
-            return Some((fs.as_mut(), String::from(file)));
+        if let Some(mount) = self.mounts.get_mut(mount) {
+            return Some((mount.fs.as_mut(), String::from(file)));
         }
         if let Some(root) = self.root.as_deref_mut() {
             let root_path = if file.is_empty() {
@@ -270,11 +322,7 @@ impl Vfs {
             return Some(String::from("/"));
         }
 
-        let abs = if subdir.is_empty() {
-            format!("/{}", mount)
-        } else {
-            format!("/{}/{}", mount, subdir)
-        };
+        let abs = directory(&mount, &subdir);
 
         // The one place a process's `cwd` is grown: `sys_chdir` stores whatever
         // this returns. Refused rather than truncated — a shortened path names a
@@ -383,11 +431,18 @@ impl Vfs {
             }
         }
 
-        if !prefix.is_empty() && result.is_empty() {
-            Err(SyscallError::NotFound)
-        } else {
-            Ok(result)
+        // An empty directory and a path no directory could be are different
+        // answers, and this is the only place that can tell them apart. A
+        // directory here exists for one of three reasons — it is a mount, some
+        // file lives under it, or something called `mkdir` — and only the first
+        // two are visible in `result`. Without the third, `mkdir("/tmp/d")`
+        // followed by `read_dir("/tmp/d")` was `NotFound`, and `is_dir` read the
+        // same refusal for an empty `d` as for a `d` that was never there: which
+        // is how `cp x d/` came to write a *file* named `d`.
+        if result.is_empty() && !prefix.is_empty() && !self.created_dirs.contains(&directory(&mount, &subdir)) {
+            return Err(SyscallError::NotFound);
         }
+        Ok(result)
     }
 
     /// Open a file for fd-based I/O.
@@ -596,7 +651,7 @@ impl Vfs {
     /// btree write-back and a device flush for a byte that went to the boot
     /// stick.
     pub fn sync_mount(&mut self, name: &str) -> Result<(), &'static str> {
-        self.mounts.get_mut(name).ok_or("no such mount")?.sync()
+        self.mounts.get_mut(name).ok_or("no such mount")?.fs.sync()
     }
 
     /// Every mount, on the way down. Failures are logged here and not returned:
@@ -609,8 +664,8 @@ impl Vfs {
                 log!("vfs: the root filesystem would not sync: {e}");
             }
         }
-        for (name, fs) in self.mounts.iter_mut() {
-            if let Err(e) = fs.sync() {
+        for (name, mount) in self.mounts.iter_mut() {
+            if let Err(e) = mount.fs.sync() {
                 log!("vfs: /{name} would not sync: {e}");
             }
         }

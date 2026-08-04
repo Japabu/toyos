@@ -87,6 +87,84 @@ pub fn double_fault_stack(
     Ok(())
 }
 
+/// The guard page under every per-CPU idle stack.
+///
+/// That stack is 16 KiB of ordinary heap, so an overflow off its bottom did
+/// not fault — it rewrote whatever the allocator had put underneath, and the
+/// damage surfaced somewhere else entirely (a `BTreeMap` node with an
+/// out-of-range index, a write to `0x4`). The idle loop runs `log_file::poll`,
+/// a filesystem write reaching a block device, whose measured high water was
+/// 11,505 bytes of the 16,384 with the USB command path still below the probe.
+///
+/// Absence is invisible to every log line and every screendump, so the only
+/// way to ask whether the page is really gone is to touch it — which nothing
+/// in the kernel does, that being the point of a guard page. `test-idle-guard`
+/// supplies the one read.
+pub fn idle_stack_guard(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            kernel_features: &["test-idle-guard"],
+            ..Default::default()
+        },
+    );
+
+    writeln!(qemu.stdin_mut(), "run test_rs_test_panic_child 9").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    let log = qemu.drain_serial(Duration::from_secs(20));
+
+    // The premise: which address the kernel went for. Without it every
+    // assertion below could be satisfied by a fault somewhere else.
+    let addr = log
+        .lines()
+        .find_map(|l| l.split("reading the idle stack guard at ").nth(1))
+        .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+        .ok_or_else(|| {
+            format!("the kernel never reached the guard read — is `test-idle-guard` on?\n{log}")
+        })?;
+
+    // The tell of a guard that is not there: `SYS_DEBUG` returned, so the read
+    // landed on dlmalloc's bookkeeping for the chunk the idle stack lives in
+    // and the child walked away.
+    if log.contains("debug syscall returned") {
+        return Err(format!(
+            "the read at {addr} succeeded — the page below the idle stack is still mapped, \
+             so an overflow writes into the heap instead of faulting"
+        ));
+    }
+    for want in [
+        format!("#PF UNHANDLED: cr2={addr}"),
+        format!("KERNEL PANIC: read unmapped address at {addr}"),
+    ] {
+        if !log.contains(&want) {
+            return Err(format!("no {want:?}; the kernel said:\n{log}"));
+        }
+    }
+    // The page walk is the ground truth, and it is in the report: a PDE that
+    // is a page table rather than a 2 MiB leaf, and a PTE of zero under it.
+    // Without the split the direct map would still show `PS=1` here.
+    if !log.contains("PS=0") || !log.contains("PTE:   0x0000000000000000") {
+        return Err(format!(
+            "the crash report's page walk does not show a split leaf with an empty entry:\n{log}"
+        ));
+    }
+    eprintln!("  [guard] a read at {addr} faulted, one page below the idle stack");
+
+    // And the machine halts, which is the intended end. An overflow off the
+    // bottom of the idle stack is a kernel bug, not untrusted input, and
+    // `fatal_exception` treats a fault on a *kernel* address as fatal by
+    // policy. The whole change is that it is now reported at all: without the
+    // guard the same overflow writes into the heap and the machine carries on
+    // with a `BTreeMap` node the allocator no longer agrees about.
+    Ok(())
+}
+
 /// A machine with no NVMe controller must boot.
 ///
 /// `.expect("NVMe: no controller found")` killed it at 0.08 s — before

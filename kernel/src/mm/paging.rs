@@ -551,6 +551,61 @@ impl AddressSpace {
         crate::arch::apic::tlb_shootdown();
     }
 
+    /// Take one 4 KiB page of the direct map away, splitting the 2 MiB leaf
+    /// that covers it into 4 KiB entries first.
+    ///
+    /// The direct map is the kernel's only view of physical memory, so this is
+    /// the only way to make a kernel address fault. It exists for stack guard
+    /// pages: a kernel stack that runs off its bottom otherwise writes into
+    /// whatever the allocator put underneath and the damage surfaces
+    /// somewhere else entirely.
+    ///
+    /// The split is permanent — the replacement entries are never coalesced
+    /// back — so the caller must own `phys` for the life of the machine.
+    /// Handing the enclosing 2 MiB page back to the PMM would reissue memory
+    /// with a hole in its direct map.
+    pub fn guard_4k(&mut self, phys: u64) {
+        assert!(phys & 0xFFF == 0, "guard_4k: phys {phys:#x} not 4 KiB-aligned");
+        let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
+        let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
+        let pd_phys = {
+            let pdpt = self.root.child(pml4_idx).expect("guard_4k: no PDPT over the direct map");
+            let entry = pdpt[pdpt_idx];
+            assert!(entry & PAGE_PRESENT != 0, "guard_4k: no PD over the direct map");
+            entry & ADDR_MASK
+        };
+        let pd = unsafe { PageTablePage::from_phys_mut(pd_phys) };
+        let pde = pd[pd_idx];
+        assert!(pde & PAGE_PRESENT != 0, "guard_4k: {phys:#x} is not in the direct map");
+
+        // Already split by an earlier guard in the same 2 MiB region — which
+        // is the ordinary case on a wide machine, where several CPUs' idle
+        // stacks come out of one heap segment.
+        if pde & PAGE_SIZE_BIT != 0 {
+            let base = pde & ADDR_MASK_2M;
+            let flags = pde & !ADDR_MASK_2M & !PAGE_SIZE_BIT;
+            let mut pt = Box::new(PageTablePage([0; 512]));
+            for i in 0..512 {
+                pt.set_entry(i, (base + i as u64 * 4096) | flags);
+            }
+            let pt_phys = pt.phys();
+            self.children.push(pt);
+            pd.set_entry(pd_idx, pt_phys | PAGE_PRESENT | PAGE_WRITE);
+        }
+
+        let pt = unsafe { PageTablePage::from_phys_mut(pd[pd_idx] & ADDR_MASK) };
+        let idx = ((phys >> 12) & 0x1FF) as usize;
+        assert!(pt[idx] & PAGE_PRESENT != 0, "guard_4k: {phys:#x} is already unmapped");
+        pt.set_entry(idx, 0);
+
+        // This CPU only, and that is sufficient rather than lucky: the page is
+        // one CPU's guard, `alloc_idle_stack` runs on the BSP for every CPU,
+        // and an AP's TLB is empty until it starts. The 511 pages around the
+        // hole keep the mapping they had, so a sibling's stale 2 MiB entry
+        // stays correct for all of them.
+        flush_tlb_all();
+    }
+
     fn map_2m(&mut self, phys: u64, flags: u64) {
         let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
         let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
@@ -616,6 +671,15 @@ pub fn kernel() -> &'static Lock<Option<AddressSpace>> {
 /// Kernel CR3. Lock-free — safe to call from panic context.
 pub fn kernel_cr3() -> Cr3 {
     Cr3(KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// Take the 4 KiB page holding `addr` out of the kernel's direct map.
+///
+/// `addr` must be a direct-map address whose page the caller owns forever —
+/// see [`AddressSpace::guard_4k`].
+pub fn guard_kernel_page(addr: u64) {
+    assert!(super::is_kernel_addr(addr), "guard_kernel_page: {addr:#x} is not a kernel address");
+    kernel().lock().as_mut().expect("paging not initialized").guard_4k(super::DirectMap::phys_of(addr as *const u8));
 }
 
 /// Build kernel page tables: map all physical memory in the high half using 2MB large pages.

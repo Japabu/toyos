@@ -106,15 +106,19 @@ pub enum PushError {
 
 /// Connections one listener may hold unaccepted.
 ///
-/// Each pins two 2 MiB rings until the server accepts, so this number times
-/// 4 MiB — 128 MiB — is what a listener that never accepts can pin. It is a
-/// burst allowance rather than a backlog: every server in the tree accepts
+/// A burst allowance rather than a backlog: every server in the tree accepts
 /// from its event loop, and the largest real burst is one connection per app
-/// launch. Policy, like `MAX_FDS`, and the number that rises once a pending
-/// connection stops costing two eagerly-allocated pages.
+/// launch. Policy, like `MAX_FDS`.
+///
+/// It used to be the whole bound on the memory a connection flood could pin,
+/// because each entry allocated two 2 MiB rings at `SYS_CONNECT`. It is not
+/// that any more — a pipe allocates its page on first use, so an unaccepted
+/// connection whose client has not written costs a `PendingConnection` and
+/// nothing else. What this still bounds is the queue itself, which is the
+/// unbounded collection the entry existed for.
 ///
 /// It bounds one listener, not the machine: nothing caps how many listeners
-/// exist, so the reachable total is still `listeners * 32 * 4 MiB`.
+/// exist.
 pub const MAX_PENDING_CONNECTIONS: usize = 32;
 
 pub fn push_connection(name: &str, conn: PendingConnection) -> Result<(), PushError> {

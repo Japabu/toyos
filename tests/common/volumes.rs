@@ -50,6 +50,8 @@ use super::serial;
 /// fixture; a change to either alone fails loudly rather than passing quietly.
 const HOST_NOTE: &str = "host-note.txt";
 const HOST_TEXT: &str = "written by the host before this machine started\n";
+/// On the *log* volume, not the ESP: `/boot` is read-only toward userland, so
+/// the guest's own writes go where it is allowed to put them.
 const GUEST_NOTE: &str = "guest-note.txt";
 const GUEST_TEXT: &str = "written by ToyOS through the VFS\n";
 const GUEST_BLOB: &str = "guest-blob.bin";
@@ -357,15 +359,15 @@ pub fn esp_filesystem(
     }
     eprintln!("  [esp] fsck_msdos: silent on the boot volume before and after the boot");
 
-    // Everything the host has to say about the volume, in one mount: what the
-    // guest wrote, what it must *not* have left behind, and what it must not
-    // have touched.
+    // Everything the host has to say about the boot volume, in one mount: what
+    // the guest must not have left behind, and what it must not have touched.
+    // Nothing on this volume is the guest's to write — that is what the mount
+    // policy says and what `esp_files` attacked from inside.
     let wanted: Vec<String> = [
-        format!("toyos/{GUEST_NOTE}"),
-        format!("toyos/{GUEST_BLOB}"),
-        "toyos/doomed.txt".to_string(),
-        "toyos/link".to_string(),
         format!("toyos/{HOST_NOTE}"),
+        "toyos/new-file.txt".to_string(),
+        "toyos/moved.txt".to_string(),
+        "toyos/link".to_string(),
     ]
     .into_iter()
     .chain(UNTOUCHED.iter().map(|s| s.to_string()))
@@ -373,10 +375,45 @@ pub fn esp_filesystem(
     let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
     let mut found = read_files(volume, &refs)?.into_iter();
 
+    // The host's note, unchanged. A refusal that deleted the file first would
+    // still satisfy the absences below.
+    let got = need(found.next().flatten(), HOST_NOTE)?;
+    if got != HOST_TEXT.as_bytes() {
+        return Err("the guest changed the host's note".to_string());
+    }
+    for absent in ["toyos/new-file.txt", "toyos/moved.txt", "toyos/link"] {
+        if found.next().flatten().is_some() {
+            return Err(format!("{absent} reached the boot volume; a refusal wrote to it"));
+        }
+    }
+
+    // The assertion this test exists for. A guest test once wrote five bytes
+    // over `kernel.elf` through the VFS; `esp_files` tries exactly that, and
+    // this is where the answer comes from — the image the device received,
+    // not the guest's opinion of what it did.
+    for (name, want) in UNTOUCHED.iter().zip(&before) {
+        let got = need(found.next().flatten(), name)?;
+        if Some(&got) != want.as_ref() {
+            return Err(format!(
+                "{name} is {} bytes on the volume and was {} — the boot stick has been damaged",
+                got.len(),
+                want.as_ref().map_or(0, Vec::len)
+            ));
+        }
+    }
+    eprintln!("  [esp] {} build artifacts byte-identical after the guest's attempts", UNTOUCHED.len());
+
+    // The write direction, on the volume the guest is allowed to have. Same
+    // adapter and same driver, so the refusals above cost the FAT32 write path
+    // no coverage.
+    let (log_start, log_len) = log_extent(&after, &image_path)?;
+    let log = &after[log_start..log_start + log_len];
+    let mut found = read_files(log, &[GUEST_NOTE, GUEST_BLOB, "doomed.txt", "link"])?.into_iter();
+
     let got = need(found.next().flatten(), GUEST_NOTE)?;
     if got != GUEST_TEXT.as_bytes() {
         return Err(format!(
-            "{GUEST_NOTE} on the volume is {:?}, not what the guest wrote",
+            "{GUEST_NOTE} on the log volume is {:?}, not what the guest wrote",
             String::from_utf8_lossy(&got)
         ));
     }
@@ -390,34 +427,14 @@ pub fn esp_filesystem(
 
     // A deleted file, and the symlink FAT32 cannot hold. Both are the half a
     // read-back-what-you-wrote test cannot see.
-    for absent in ["toyos/doomed.txt", "toyos/link"] {
+    for absent in ["doomed.txt", "link"] {
         if found.next().flatten().is_some() {
-            return Err(format!("{absent} is still on the volume"));
-        }
-    }
-
-    // The host's note, unchanged: a guest that rewrote the directory wholesale
-    // would still pass everything above.
-    let got = need(found.next().flatten(), HOST_NOTE)?;
-    if got != HOST_TEXT.as_bytes() {
-        return Err("the guest changed the host's note".to_string());
-    }
-    for (name, want) in UNTOUCHED.iter().zip(&before) {
-        let got = need(found.next().flatten(), name)?;
-        if Some(&got) != want.as_ref() {
-            return Err(format!(
-                "{name} is {} bytes on the volume and was {} — the boot stick has been damaged",
-                got.len(),
-                want.as_ref().map_or(0, Vec::len)
-            ));
+            return Err(format!("{absent} is still on the log volume"));
         }
     }
 
     let _ = std::fs::remove_file(&image_path);
-    eprintln!(
-        "  [esp] {BLOB_LEN} bytes and two files verified host-side, {} build artifacts intact",
-        UNTOUCHED.len()
-    );
+    eprintln!("  [esp] {BLOB_LEN} bytes and two files verified host-side on the log volume");
     Ok(())
 }
 
