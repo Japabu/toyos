@@ -36,7 +36,8 @@ use crate::payload::{
     MockAddressSpace, SimCtx, SimPayload, SimPreempt, SimShareLock, SimWaitList, StdLock,
 };
 use crate::workload::{
-    BlockShape, ChargeShape, Op, ParkShape, Protocol, Scenario, Script, ShareShape, WindowShape,
+    BlockShape, ChargeShape, MigrateShape, Op, ParkShape, Protocol, Scenario, Script, ShareShape,
+    WindowShape,
 };
 
 /// How finely a `Run(ns)` op is chopped. Small enough that a 10 ms quantum
@@ -234,6 +235,23 @@ pub struct Vm<'q> {
     /// `pre_park_claims`: this driver has no kill check of its own any more, so
     /// a clean run is only evidence about the core's if the case occurred.
     pub killed_at_park: u64,
+    /// Tasks whose retire has been claimed, and the virtual instant it was
+    /// claimed at. Invariant I14 reads both halves: which tasks a migration may
+    /// no longer carry, and how long each one's reap has taken.
+    ///
+    /// A step is atomic and belongs to one actor, so a task cannot be killed
+    /// and migrated in the same step — which is what makes membership here an
+    /// exact statement about the kill bit *at the instant of the migration*
+    /// rather than a sticky bit read afterwards.
+    pub killed: BTreeMap<TaskKey, Nanos>,
+    /// How far into `SimHwState::trace` invariant I14 has read.
+    pub trace_cursor: usize,
+    /// I14's measurement: the longest a retire has taken to reach `release`,
+    /// and the bound in force when that happened. A number as well as a
+    /// verdict, because the kernel's own guard is a wall clock and the honest
+    /// question is how much of its budget the protocol actually spends.
+    pub retire_latency: u64,
+    pub retire_bound: u64,
     /// Invariant I9's accumulator: per task, the lend counter it was last seen
     /// with and the running time charged to it since, while boosted. Reset when
     /// the counter moves, which is the only way to tell a fresh lend from
@@ -333,6 +351,7 @@ impl<'q> Vm<'q> {
             handles.push(CpuHandle::new(CpuId(i as u32), tx));
             let mut cpu = CpuSched::new(CpuId(i as u32), rx, SimCtx::default());
             cpu.set_park_keeps_lapsed_lend(scenario.park == ParkShape::KeepLapsedLend);
+            cpu.set_migrate_keeps_the_corpse(scenario.migrate == MigrateShape::KeepTheCorpse);
             cpu.set_fair_order(scenario.order);
             cpus.push(cpu);
         }
@@ -400,6 +419,10 @@ impl<'q> Vm<'q> {
             steps: 0,
             pre_park_claims: 0,
             killed_at_park: 0,
+            killed: BTreeMap::new(),
+            trace_cursor: 0,
+            retire_latency: 0,
+            retire_bound: 0,
             scenario,
         };
         for (index, spec) in vm.scenario.procs.clone().iter().enumerate() {
@@ -1214,6 +1237,7 @@ impl<'q> Vm<'q> {
                 for key in siblings {
                     let shared = self.shared[&key].clone();
                     let before = self.hw.with(|s| s.kicks);
+                    self.killed.insert(key, self.clock);
                     retire::begin(&shared).post(&self.handles, &self.hw, &SimPreempt);
                     self.note_kicks(before);
                 }
@@ -1231,6 +1255,7 @@ impl<'q> Vm<'q> {
         let mut absent = Vec::new();
         for key in siblings {
             let shared = self.shared[&key].clone();
+            self.killed.insert(key, self.clock);
             shared.mark_kill();
             if self.scan_containers(key) {
                 let before = self.hw.with(|s| s.kicks);

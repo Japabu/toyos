@@ -158,6 +158,9 @@ pub struct CpuSched<X: SchedPayload> {
     /// Negative-gate escape hatch only; see [`CpuSched::set_park_keeps_lapsed_lend`].
     #[cfg(feature = "protocol-port")]
     park_keeps_lapsed_lend: bool,
+    /// Negative-gate escape hatch only; see [`CpuSched::set_migrate_keeps_the_corpse`].
+    #[cfg(feature = "protocol-port")]
+    migrate_keeps_the_corpse: bool,
     _not_sync: PhantomData<*mut ()>,
 }
 
@@ -185,6 +188,8 @@ impl<X: SchedPayload> CpuSched<X> {
             armed: None,
             #[cfg(feature = "protocol-port")]
             park_keeps_lapsed_lend: false,
+            #[cfg(feature = "protocol-port")]
+            migrate_keeps_the_corpse: false,
             _not_sync: PhantomData,
         }
     }
@@ -296,6 +301,17 @@ impl<X: SchedPayload> CpuSched<X> {
         self.park_keeps_lapsed_lend = keep;
     }
 
+    /// Hand a killed ready task to another CPU instead of reaping it where it
+    /// is — the balance path before [`CpuSched::hand_off`] checked the kill
+    /// bit. It puts the task in `InTransit`, whose reap rides an
+    /// `Urgency::Normal` adopt and therefore waits for the destination's next
+    /// voluntary pass; the retirer's own bound is wall clock. Invariant I14
+    /// must catch it; `scenarios::old_migrate_kept_the_corpse` is the gate that
+    /// proves it does.
+    pub fn set_migrate_keeps_the_corpse(&mut self, keep: bool) {
+        self.migrate_keeps_the_corpse = keep;
+    }
+
     /// Order the fair band by something other than spec §9.2's insertion
     /// sequence. Invariant I13 must catch what that does to a share's threads;
     /// `scenarios::sibling_storm`'s two gates are what prove it does.
@@ -398,6 +414,22 @@ impl<X: SchedPayload> CpuSched<X> {
     /// Transfer a ready task to `dst` as an unconsumed `Adopt`. The caller has
     /// already settled the share refcount: a task taken out of this queue must
     /// leave it, a task that never entered must not.
+    ///
+    /// A killed task is reaped here instead, and that is the whole of §7.6's
+    /// promptness guarantee for the balance path. `InTransit` is the one state
+    /// whose reap is not backed by an interrupt: the retire that carries
+    /// `Urgency::Preempt` is consumed and dropped by the destination when it
+    /// arrives ahead of the adopt (`handle_retire`'s home-is-me arm), and the
+    /// adopt behind it carries `Urgency::Normal`, which by design sends no IPI
+    /// to a busy CPU. Sending a corpse there hands the retire's latency to a
+    /// second CPU's next voluntary pass, in exchange for a thief that asked for
+    /// work and got a dead task. Reaping is also strictly less work: the task
+    /// dies here, in this pass, instead of after a round trip.
+    ///
+    /// What survives is the case no protocol can remove — a kill that lands
+    /// after the adopt was posted — and that one always has a `Msg::Retire`
+    /// aimed at the same CPU, so it keeps the interrupt-backed bound every
+    /// other state has.
     fn hand_off<H: Hw<Payload = X>, P: PreemptGuard>(
         &mut self,
         task: ReadyTask<X>,
@@ -405,6 +437,20 @@ impl<X: SchedPayload> CpuSched<X> {
         env: Env<'_, H, P>,
         now: Nanos,
     ) {
+        #[cfg(not(feature = "protocol-port"))]
+        let migrate_anyway = false;
+        #[cfg(feature = "protocol-port")]
+        let migrate_anyway = self.migrate_keeps_the_corpse;
+        if task.shared().kill_pending() && !migrate_anyway {
+            let key = task.key();
+            // No `leave_runnable`: the caller settled the share before calling,
+            // exactly as `handle_adopt`'s killed arm relies on the migrating
+            // CPU having settled it before the task entered transit.
+            let dead = task.reap(self.id, now);
+            self.trace(env, now, TraceKind::Retire { task: key });
+            self.dispose_dead(dead, env);
+            return;
+        }
         let key = task.key();
         let urgency = if task.is_rt() {
             Urgency::Preempt
