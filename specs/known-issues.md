@@ -2384,6 +2384,64 @@ Recorded rather than fixed, because each way out costs more than the noise:
 
 Not by redirecting the shim's stderr: rustup reports real errors on it.
 
+### A C test whose compilation fails is skipped, not red
+
+`compile_c_tests` (`tests/toyos.rs`) wraps each compile in `catch_unwind` and
+drops the ones that panic, printing a line to stderr and nothing else. Eleven of
+the 121 discovered tests are in that state on 2026-08-05 — `78_vla_label`,
+`79_vla_continue`, `83_utf8_in_identifiers`, `85_asm_outside_function`,
+`89_nocode_wanted`, `94_generic`, `95_bitfields`, `95_bitfields_ms`,
+`96_nodata_wanted`, `98_al_ax_extend`, `99_fastcall` — and none of them is in
+`C_SKIP`, so nothing in the tree records that they are meant to be failing.
+
+The consequence for anyone changing the compiler: a change that breaks a C test
+*at compile time* moves it into this list rather than turning the suite red.
+`82_attribs_position` did exactly that during the `__attribute__` work and only
+the stderr line caught it. The check that works is to diff the skipped list
+across the change; the fix would be to make the list a fixture the suite asserts
+against.
+
+`tests/testcases/pp_tcc/` (25 preprocessor cases with `.expect` files) is read by
+nothing at all — `compile::testcases_dir()` returns only `tests/testcases/tinycc`
+and no other Rust file mentions `pp_tcc`.
+
+### `toyos-cc` does not implement packed bitfield layout, and says so
+
+`__attribute__((packed))` on a struct with a bitfield member is refused —
+`resolve_struct` in `toyos-cc/src/codegen/resolve.rs`, covered by
+`toyos-cc/tests/attributes.rs`. Packed and unpacked bitfields are different
+algorithms rather than one algorithm with a flag: gcc allocates a packed
+bitfield's bits contiguously from the current bit position and lets a field
+straddle what would have been a storage-unit boundary, where
+`walk_struct_layout` picks a storage unit of the member's own type and starts a
+new one whenever the next field would not fit. `codegen/bitfield.rs` loads and
+stores through `clif_type(storage_ty)` at the field's byte offset, which a
+straddling field has no single unit for.
+
+`specs/wlan-plan.md` §10 counts 635 `__packed` uses in the AX210 subset. However
+many of those carry bitfields is how much of this W6 needs.
+
+### `toyos-cc` does not define `__GNUC__`, so doomgeneric compiles unpacked
+
+`PACKEDATTR` in `userland/doom/include/doomtype.h` and in doomgeneric's own
+`doomtype.h` is `__attribute__((packed))` under `#ifdef __GNUC__` and empty
+otherwise, and toyos-cc seeds neither `__GNUC__` nor `__GNUC_MINOR__`. Measured:
+preprocessing `w_wad.c` through toyos-cc yields zero occurrences of either
+`PACKEDATTR` or `__attribute__`, and `} PACKEDATTR wadinfo_t;` arrives at the
+parser as `} wadinfo_t;`.
+
+This is inert today and was checked rather than assumed. Compiling doomgeneric's
+fourteen `PACKEDATTR` structs with clang twice, once with the macro empty and
+once with it expanded, moves **no field offset at all** and changes one size:
+`pcx_t` is 130 unpacked and 129 packed. `WritePCXfile` never takes
+`sizeof(pcx_t)` — it writes the header field by field and derives the length
+from its own pack pointer, and `offsetof(pcx_t, data)` is 128 either way. The
+remaining thirteen differ only in alignment, and every one of them is read
+through a pointer into a WAD buffer.
+
+Defining `__GNUC__` would be a much larger change than it looks: it turns on
+every `#ifdef __GNUC__` block in doomgeneric and in any header that has one.
+
 ---
 
 ## 7. Design debt
