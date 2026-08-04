@@ -49,6 +49,10 @@ fn no_effect_reason(name: &str) -> Option<&'static str> {
             "promises control never comes back, which buys a caller an \
              unreachable epilogue and no change in behaviour",
         ),
+        "format" => Some(
+            "asks for a printf-style format string to be checked against its \
+             arguments, and toyos-cc emits no diagnostics to check it with",
+        ),
         "stdcall" | "fastcall" | "cdecl" => Some(
             "names an x86-32 calling convention; x86-64 and aarch64 have only \
              one, and gcc and clang ignore it on both",
@@ -122,8 +126,8 @@ impl Parser {
                     None => panic!(
                         "{loc}: __attribute__(({spelling})) is not implemented by toyos-cc. \
                          Attributes it implements: packed, aligned. Attributes it accepts \
-                         and ignores: unused, maybe_unused, noinline, noreturn, stdcall, \
-                         fastcall, cdecl."
+                         and ignores: unused, maybe_unused, noinline, noreturn, format, \
+                         stdcall, fastcall, cdecl."
                     ),
                 }
             }

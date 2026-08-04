@@ -85,6 +85,7 @@ fn attributes_with_no_effect_here_are_accepted() {
     accepts("__attribute__((maybe_unused)) static int a;");
     accepts("__attribute__((noinline)) int f(void) { return 0; }");
     accepts("__attribute__((__noreturn__)) void f(void);");
+    accepts("extern int f(const char *, ...) __attribute__((format(printf, 1, 2)));");
     accepts("extern void f(void) __attribute__((stdcall));");
     accepts("extern void f(void) __attribute__((fastcall));");
     accepts("extern void f(void) __attribute__((cdecl));");

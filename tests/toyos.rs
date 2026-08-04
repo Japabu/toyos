@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -422,6 +422,23 @@ const C_SKIP: &[&str] = &[
     "136_atomic_gcc_style",   // needs stdatomic.h (calls process::exit, not catchable)
 ];
 
+/// C tests that are discovered, compiled and then thrown away because they do
+/// not build. Unlike [`C_SKIP`] these are not a decision, they are the current
+/// state of the toolchain — the reason each gives is printed by every run.
+const C_DOES_NOT_BUILD: &[(&str, &str)] = &[
+    ("78_vla_label", "cranelift verifier rejects the VLA's stack address across blocks"),
+    ("79_vla_continue", "same VLA defect, reached through `continue`"),
+    ("83_utf8_in_identifiers", "the lexer rejects a non-ASCII byte in an identifier"),
+    ("85_asm_outside_function", "file-scope asm is parsed and not emitted, so `vide` is undefined"),
+    ("89_nocode_wanted", "expr_type cannot type an identifier under `sizeof` in dead code"),
+    ("94_generic", "_Generic type dispatch is not implemented"),
+    ("95_bitfields", "aligned(16) on a bitfield member, which toyos-cc refuses"),
+    ("95_bitfields_ms", "the same file again, through 95_bitfields.c"),
+    ("96_nodata_wanted", "every branch wants a -D the harness does not pass, so no `main`"),
+    ("98_al_ax_extend", "file-scope asm again: `_us`, `_ss`, `_uc`, `_sc` are declared in it"),
+    ("99_fastcall", "typeof of an `&function` expression is not implemented"),
+];
+
 /// Discover C tests by scanning tests/testcases/tinycc/*.c.
 /// Skips companion files (contain '+') and tests in C_SKIP.
 fn discover_c_tests() -> Vec<String> {
@@ -469,28 +486,60 @@ fn compile_c_tests(names: &[String]) -> Vec<(String, Vec<u8>)> {
     std::panic::set_hook(Box::new(|_| {}));
 
     let mut bins = Vec::new();
-    let mut skipped = Vec::new();
+    let mut broken: Vec<(&str, String)> = Vec::new();
     for name in names {
         match std::panic::catch_unwind(|| {
             let (obj, extras) = compile::compile_c(name);
             compile::link_toyos(&obj, &extras, name)
         }) {
             Ok(linked) => bins.push((name.clone(), linked)),
-            Err(_) => skipped.push(name.as_str()),
+            Err(e) => broken.push((name.as_str(), panic_message(&e))),
         }
     }
 
     std::panic::set_hook(prev_hook);
 
-    if !skipped.is_empty() {
-        eprintln!(
-            "[toyos] {} C tests skipped (compilation failed): {}",
-            skipped.len(),
-            skipped.join(", ")
-        );
+    for (name, why) in &broken {
+        eprintln!("[toyos] c::{name} does not build: {why}");
     }
+    check_c_build_fixture(&broken.iter().map(|(n, _)| *n).collect::<Vec<_>>());
 
     bins
+}
+
+fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
+    let full = e
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "<non-string panic>".to_string());
+    full.lines().next().unwrap_or_default().chars().take(160).collect()
+}
+
+/// The suite runs a C test by booting the binary, so one that does not build is
+/// not run — and until this fixture, not reported either. The set is asserted
+/// in both directions: a case that stops building is a regression, and one that
+/// starts building is a fix whose entry has to go.
+fn check_c_build_fixture(broken: &[&str]) {
+    let expected: BTreeSet<&str> = C_DOES_NOT_BUILD.iter().map(|(n, _)| *n).collect();
+    let actual: BTreeSet<&str> = broken.iter().copied().collect();
+    if actual == expected {
+        return;
+    }
+    let new: Vec<&str> = actual.difference(&expected).copied().collect();
+    let fixed: Vec<&str> = expected.difference(&actual).copied().collect();
+    let mut msg = String::from("C_DOES_NOT_BUILD is out of date.\n");
+    if !new.is_empty() {
+        msg += &format!(
+            "  stopped building, and so stopped being run at all: {}\n  \
+             (the reason for each is printed above)\n",
+            new.join(", ")
+        );
+    }
+    if !fixed.is_empty() {
+        msg += &format!("  builds now — delete from C_DOES_NOT_BUILD: {}\n", fixed.join(", "));
+    }
+    panic!("{msg}");
 }
 
 fn check_c_result(result: &TestResult) -> bool {
