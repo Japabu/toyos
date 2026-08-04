@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use crate::elf;
+use crate::mm::paging::CachePolicy;
 use crate::fd::{Descriptor, FdTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
@@ -854,7 +855,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let user_stack = UserStack::new(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
     {
         let mut pt = child_pt.lock();
-        pt.map_range(stack_vaddr, stack_pages.phys(), USER_STACK_SIZE as u64, true);
+        pt.map_range(stack_vaddr, stack_pages.phys(), USER_STACK_SIZE as u64, true, CachePolicy::DeferToMtrr);
         pt.insert_region(stack_vaddr, crate::vma::Region {
             size: USER_STACK_SIZE as u64,
             writable: true,

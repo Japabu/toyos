@@ -247,6 +247,10 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
 }
 
 extern "C" fn ap_entry() -> ! {
+    // First, and before this CPU can reach a page that selects the entry it
+    // writes: the framebuffer is already mapped write-combining by now.
+    crate::arch::pat::init();
+
     // Switch from boot PML4 (identity + high-half) to kernel PML4 (high-half only).
     // We're already executing at a high-half address, so this is safe.
     unsafe { crate::mm::paging::kernel_cr3().load_flush(); }

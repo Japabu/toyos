@@ -28,13 +28,12 @@ impl PixelFormat {
 /// The scanout, which may only be written to.
 ///
 /// [`Framebuffer`] reads as freely as it writes, which is what a pixel surface
-/// in system RAM should be. A GOP scanout is not one. The kernel programs
-/// neither MTRRs nor PAT, so every mapping of it is PAT entry 0 and defers to
-/// firmware's MTRR for the range — WC on most UEFI machines, UC on some — and
-/// under either of those a *read* is uncached while a write is a posted store.
-/// Composing against the panel therefore costs a bus transaction per byte read
-/// back out of it. QEMU's framebuffer is host RAM, where none of that exists,
-/// so no test can show it.
+/// in system RAM should be. A GOP scanout is not one: the kernel maps it
+/// write-combining, so a write is a posted store that merges with its
+/// neighbours on the way out, while a *read* misses every cache and costs a
+/// bus transaction. Composing against the panel therefore pays that per byte
+/// read back. QEMU's framebuffer is host RAM, where none of it exists, so no
+/// test can show it.
 ///
 /// The property is that nothing reads the panel, and this type is how it is
 /// held rather than promised: `Screen` hands out no pointer and returns no
@@ -134,6 +133,13 @@ impl Screen {
                 );
             }
         }
+        // A scanout is write-combining, so the tail of the last row can sit in
+        // a partly filled WC buffer until something unrelated evicts it — a
+        // sliver of the previous frame left on the panel for as long as its
+        // owner has nothing else to draw. SFENCE is what drains one (SDM
+        // Vol. 3A §11.3.1), and this is the call that says the pixels are the
+        // surface's now.
+        unsafe { core::arch::x86_64::_mm_sfence() };
         self.written.set(self.written.get() + (row_bytes * h) as u64);
         self.blits.set(self.blits.get() + 1);
         let painted = Rect { x: x as u32, y: y as u32, w: w as u32, h: h as u32 };
@@ -160,9 +166,9 @@ pub struct Traffic {
     /// inside `fill_rect`, `scroll_*`.
     ///
     /// Zero for a surface that is only ever drawn into. A caller holding a
-    /// scanout mapping should read this as its bill: a read there misses every
-    /// cache under both memory types firmware gives a framebuffer, so it costs
-    /// a bus transaction that a write does not.
+    /// scanout mapping should read this as its bill: a read of write-combining
+    /// memory misses every cache, so it costs a bus transaction that a write —
+    /// which merges with its neighbours — does not.
     pub read: u64,
     /// Reads of a single pixel (`get_pixel`) — each one a separate round trip.
     pub pixel_reads: u64,

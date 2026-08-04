@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use crate::arch::percpu;
+use crate::mm::paging::CachePolicy;
 use crate::mm::PAGE_2M;
 use crate::fd::{self, FdTable};
 use crate::sync::Lock;
@@ -32,7 +33,7 @@ pub fn vma_map(
     phys: u64,
     size: u64,
 ) -> Option<(UserAddr, u64)> {
-    pt.lock().alloc_and_map(phys, size, true)
+    pt.lock().alloc_and_map(phys, size, true, CachePolicy::DeferToMtrr)
 }
 
 // OwnedAlloc — RAII heap allocation (for kernel-only buffers < 2MB)

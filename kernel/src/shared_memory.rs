@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::mm::paging::CachePolicy;
 use crate::mm::{PAGE_2M, align_2m};
 use crate::process::{PageTables, Pid};
 use crate::sync::Lock;
@@ -43,6 +44,11 @@ struct SharedRegion {
     phys: DirectMap,
     size: u64,
     ownership: Ownership,
+    /// The memory type every mapping of this region carries, in every process
+    /// and in the kernel's own view. One per region and not one per mapping:
+    /// SDM Vol. 3A §11.12.4 rules out one physical page held under two memory
+    /// types.
+    cache: CachePolicy,
     allowed: Vec<Pid>,
     /// Per-process mappings: each process gets its own virtual address.
     mapped_in: Vec<(Pid, PageTables, UserAddr)>,
@@ -55,7 +61,16 @@ impl SharedRegion {
         if let Some((_, _, vaddr)) = self.mapped_in.iter().find(|(p, _, _)| *p == pid) {
             return Some(*vaddr);
         }
-        let (addr, _) = pt.lock().alloc_and_map(self.phys.phys(), self.size, true)?;
+        let (addr, _) = pt.lock().alloc_and_map(self.phys.phys(), self.size, true, self.cache)?;
+        // A region whose memory type is not RAM's gets a line naming the
+        // process, because that process is the one paying the difference and
+        // nothing else in the machine says which one it is. Read back out of
+        // its page tables, so the line is about the mapping and not the
+        // request.
+        if self.cache != CachePolicy::DeferToMtrr {
+            let installed = pt.lock().user_policy(addr).expect("shm: just mapped");
+            crate::log!("shm: {:#x} mapped {:?} into pid {}", self.phys.phys(), installed, pid);
+        }
         self.mapped_in.push((pid, Arc::clone(pt), addr));
         Some(addr)
     }
@@ -119,6 +134,7 @@ pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> Result<Share
             phys,
             size: aligned_size as u64,
             ownership: Ownership::Process { pid: owner_pid, _pages: pages },
+            cache: CachePolicy::DeferToMtrr,
             allowed: alloc::vec![owner_pid],
             mapped_in: Vec::new(),
         };
@@ -133,7 +149,7 @@ pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> Result<Share
 /// Register an existing kernel-owned allocation as a shared region.
 /// Permanent: never auto-removed. Used for GPU framebuffers and DMA buffers.
 #[must_use]
-pub fn register(phys: DirectMap, size: u64) -> SharedToken {
+pub fn register(phys: DirectMap, size: u64, cache: CachePolicy) -> SharedToken {
     assert!(phys.phys() & (PAGE_2M - 1) == 0,
         "shared_memory::register: phys {:#x} not 2MB-aligned", phys.phys());
     let token = next_token();
@@ -142,6 +158,7 @@ pub fn register(phys: DirectMap, size: u64) -> SharedToken {
             phys,
             size,
             ownership: Ownership::Kernel,
+            cache,
             allowed: Vec::new(),
             mapped_in: Vec::new(),
         }));

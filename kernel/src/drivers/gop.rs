@@ -91,9 +91,12 @@ pub fn init(
 
     let cursor_pages = crate::mm::pmm::alloc_contiguous(1, crate::mm::pmm::Category::Framebuffer).expect("GOP: cursor alloc failed");
     let cursor_phys = cursor_pages[0].direct_map().phys();
+    // System RAM the compositor composes the cursor in rather than part of
+    // the scanout, so it keeps RAM's write-back type.
     let cursor_token = shared_memory::register(
         DirectMap::from_phys(cursor_phys),
         PAGE_2M,
+        CachePolicy::DeferToMtrr,
     );
     core::mem::forget(cursor_pages); // lives forever (GPU is never torn down)
 

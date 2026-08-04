@@ -194,6 +194,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("metal_sim_input", Sched::Parallel),
     // One boot from here to `metal_sim_compositor_stall` (`METAL_SIM_DESKTOP`).
     ("metal_sim_compositor", Sched::Parallel),
+    // Reads the boot log this group already has, after the member above has
+    // drained it. Text only, no clock in the verdict.
+    ("metal_sim_scanout_wc", Sched::Parallel),
     ("metal_sim_window_caps", Sched::Parallel),
     ("metal_sim_ipc_hostile_peer", Sched::Parallel),
     ("metal_sim_compositor_stall", Sched::Parallel),
@@ -2590,6 +2593,7 @@ impl Boot {
 fn group_of(name: &str) -> Option<&'static str> {
     match name {
         "metal_sim_compositor"
+        | "metal_sim_scanout_wc"
         | "metal_sim_window_caps"
         | "metal_sim_ipc_hostile_peer"
         | "metal_sim_compositor_stall" => Some(METAL_SIM_DESKTOP),
@@ -2900,6 +2904,73 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
         idle.trim()
     );
     eprintln!("  [metal-sim] soundd on a null sink, netd exited — both handled their absent device");
+    Ok(())
+}
+
+/// The scanout's memory type, from the MSR to the mapping the compositor
+/// writes through.
+///
+/// **The speed this exists for is not measurable here and no line below tries
+/// to be.** QEMU's framebuffer is host RAM, where a store costs the same under
+/// every memory type; what a guest can be held to is the *decision*, and it has
+/// three parts that fail independently. `IA32_PAT` must hold WC in the entry
+/// the page tables select, which is per-CPU MSR state no page table records.
+/// The kernel must combine that entry with the MTRR it read and reach WC — SDM
+/// Vol. 3A Table 11-7 gives WC for a WC PAT entry under every MTRR type, so a
+/// UC range register has no veto and a boot reporting UC here is one where the
+/// entry never landed. And the process holding the scanout must have been given
+/// the same type the kernel gave itself, which is the part that decides what a
+/// frame costs: the compositor writes through its own page tables.
+fn metal_sim_scanout_wc(boot: &mut Boot) -> Result<(), String> {
+    const PAT: &str = "PAT: IA32_PAT=";
+    const SCANOUT: &str = "GOP: scanout memory type ";
+    const MAPPED: &str = "mapped WriteCombining into pid ";
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline
+        && ![PAT, SCANOUT, MAPPED].iter().all(|w| boot.console.contains(w))
+    {
+        boot.drain(Duration::from_millis(250));
+    }
+    let console = &boot.console;
+
+    let Some(pat) = console.lines().find(|l| l.contains(PAT)) else {
+        return Err(format!("no boot programmed IA32_PAT:\n{console}"));
+    };
+    let Some(entry) = pat.split(" = ").nth(1) else {
+        return Err(format!("{pat:?} names no type for the entry it wrote"));
+    };
+    if entry.trim() != "WC" {
+        return Err(format!(
+            "the entry the scanout's pages select reads back {entry:?}, not WC: {pat}"
+        ));
+    }
+
+    let Some(scanout) = console.lines().find_map(|l| l.split(SCANOUT).nth(1)) else {
+        return Err(format!("GOP never reported the scanout's memory type:\n{console}"));
+    };
+    // Firmware's, and deliberately not asserted: under test is that whatever
+    // the range registers say combines to WC, never what OVMF chose.
+    let Some(mtrr) = scanout.split("(MTRR ").nth(1).and_then(|s| s.split(',').next()) else {
+        return Err(format!("{scanout:?} does not say what the MTRR held"));
+    };
+    let effective = scanout.split(' ').next().unwrap_or("");
+    if effective != "WC" {
+        return Err(format!(
+            "the scanout came out {effective} over an MTRR that says {mtrr}: {scanout}"
+        ));
+    }
+
+    let Some(handed) = console.lines().find(|l| l.contains(MAPPED)) else {
+        return Err(format!(
+            "no process was handed a write-combining mapping, so whatever the kernel gave \
+             itself, the compositor is still writing through the default:\n{console}"
+        ));
+    };
+
+    eprintln!("  [metal-sim] {}", pat.trim());
+    eprintln!("  [metal-sim] scanout {effective} over an MTRR that says {mtrr}");
+    eprintln!("  [metal-sim] {}", handed.trim());
     Ok(())
 }
 
@@ -4256,6 +4327,11 @@ fn run_machine_test(
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
             metal_sim_compositor(group_boot(held, METAL_SIM_DESKTOP, || {
+                boot_metal_sim_desktop(rust_bins)
+            }))
+        }
+        "metal_sim_scanout_wc" => {
+            metal_sim_scanout_wc(group_boot(held, METAL_SIM_DESKTOP, || {
                 boot_metal_sim_desktop(rust_bins)
             }))
         }

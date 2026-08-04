@@ -56,6 +56,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
 use crate::log;
+use crate::mm::paging::CachePolicy;
 use crate::mm::{self, DirectMap, align_2m};
 
 /// 1 bpp 8x16, codepoints 0x20..=0x7E, one byte per row, bit 7 leftmost.
@@ -360,7 +361,7 @@ pub fn remap() {
         .lock()
         .as_mut()
         .unwrap()
-        .map_mmio(phys, align_2m(size as usize) as u64);
+        .map_mmio(phys, align_2m(size as usize) as u64, CachePolicy::WriteCombining);
     rearm();
 }
 
@@ -672,13 +673,17 @@ fn paint(fill: Fill, text: &[u8], page: Page) {
         draw_footer(&fb, cols, grid_rows - 1, shown, pages, white);
     }
 
-    // The scanout is mapped write-back over a region firmware typically marks
-    // WC or UC. QEMU does not care; a real panel does, and "the text is in L2
-    // and never reached the screen" is a bug that would only ever appear on
-    // metal -- so it is not optional for a boot checkpoint either, even though
-    // that path leaves the machine running and pays a full cache-hierarchy
-    // flush per phase boundary for it. Six on a GOP boot, none on any other.
-    unsafe { core::arch::asm!("wbinvd", options(nostack, preserves_flags)) };
+    flush_stores();
+}
+
+/// Put every store this module has made on the bus.
+///
+/// The scanout is write-combining, so a paint's last stores can sit in a
+/// partly filled WC buffer with nothing to evict them. SFENCE is what drains
+/// one (SDM Vol. 3A §11.3.1), and a fatal panic halts without ever giving the
+/// buffer another reason to.
+fn flush_stores() {
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
 }
 
 /// `[page 2/4]` on the bottom row, and the module's only formatting.
@@ -817,6 +822,7 @@ pub fn graffiti() {
     }
     log!("SYS_DEBUG: painting over the screen a userland process owns");
     fill_screen(&fb, rgb(&fb, 0x00, 0xC0, 0x00));
+    flush_stores();
 }
 
 fn fill_screen(fb: &Fb, color: u32) {

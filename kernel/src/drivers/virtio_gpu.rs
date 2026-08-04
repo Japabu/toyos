@@ -9,6 +9,7 @@ use toyos_abi::syscall::SyscallError;
 use crate::mm::{PAGE_2M, KernelSlice};
 use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
 use crate::log;
+use crate::mm::paging::CachePolicy;
 use crate::shared_memory::{self, SharedToken};
 use crate::sync::Lock;
 
@@ -472,7 +473,7 @@ impl GpuController {
             ptrs[i] = ptr;
             phys_addrs[i] = phys_addr;
             let fb_aligned = fb_pages * PAGE_2M as usize;
-            tokens[i] = shared_memory::register(crate::DirectMap::from_phys(phys_addr), fb_aligned as u64);
+            tokens[i] = shared_memory::register(crate::DirectMap::from_phys(phys_addr), fb_aligned as u64, CachePolicy::DeferToMtrr);
             log!("VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes) token={:?}", i, ptr, phys_addrs[i], fb_size, tokens[i]);
         }
         Some(FbAlloc { tokens, phys_addrs, ptrs, _pages: all_pages })
@@ -667,7 +668,7 @@ pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let cursor_pages = crate::mm::pmm::alloc_contiguous(1, crate::mm::pmm::Category::Framebuffer).expect("VirtIO GPU: cursor alloc failed");
     let cursor_ptr = cursor_pages[0].direct_map().as_mut_ptr::<u8>();
     let cursor_phys = cursor_pages[0].direct_map().phys();
-    gpu.cursor_token = shared_memory::register(crate::DirectMap::from_phys(cursor_phys), PAGE_2M);
+    gpu.cursor_token = shared_memory::register(crate::DirectMap::from_phys(cursor_phys), PAGE_2M, CachePolicy::DeferToMtrr);
     gpu._cursor_pages = cursor_pages;
     gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
     gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_phys, cursor_bytes as u32);

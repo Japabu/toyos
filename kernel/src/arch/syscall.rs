@@ -3,6 +3,7 @@ use core::arch::naked_asm;
 use alloc::vec::Vec;
 use super::{apic, cpu, gdt};
 use crate::drivers::acpi;
+use crate::mm::paging::CachePolicy;
 use crate::user_ptr::SyscallContext;
 use crate::{device, fd, listener, log, pipe, process, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
@@ -1372,7 +1373,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         let pt = process::current_address_space();
         let vaddr = process::with_fd_owner_data(|data| {
             let placed = match &pages {
-                Some(pages) => pt.lock().alloc_and_map(pages.phys(), aligned as u64, writable).map(|(v, _)| v),
+                Some(pages) => pt.lock().alloc_and_map(pages.phys(), aligned as u64, writable, CachePolicy::DeferToMtrr).map(|(v, _)| v),
                 None => pt.lock().alloc_region(aligned as u64, crate::vma::RegionKind::Mapped, false),
             };
             let Some(vaddr) = placed else { return Err(()) };

@@ -20,6 +20,10 @@ const PAGE_WRITE: u64 = 1 << 1;
 const PAGE_USER: u64 = 1 << 2;
 const PAGE_WRITE_THROUGH: u64 = 1 << 3;
 const PAGE_CACHE_DISABLE: u64 = 1 << 4;
+/// Set by the CPU on any access and on any write, so a mapping that has been
+/// used no longer equals the entry its mapper wrote.
+const PAGE_ACCESSED: u64 = 1 << 5;
+const PAGE_DIRTY: u64 = 1 << 6;
 const PAGE_SIZE_BIT: u64 = 1 << 7;
 /// The PAT bit of a 2 MiB PDE. In a 4 KiB PTE the same bit is bit 7, so a PDE's
 /// flags cannot be carried across a split without moving it.
@@ -601,16 +605,23 @@ impl AddressSpace {
         super::Mmio::new(super::DirectMap::from_phys(phys), size)
     }
 
-    /// The policy the direct map's 2 MiB entry for `phys` carries, or `None`
-    /// where nothing is mapped.
+    /// The policy the 2 MiB entry covering `virt` carries, or `None` where
+    /// nothing is mapped.
     ///
     /// Read out of the page table rather than remembered, so a caller that
     /// reports a mapping's memory type reports the installed one.
-    pub fn direct_map_policy(&self, phys: u64) -> Option<CachePolicy> {
-        let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
+    fn policy_at(&self, virt: u64) -> Option<CachePolicy> {
         let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
         let pde = self.root.child(pml4_idx)?.child(pdpt_idx)?[pd_idx];
         (pde & PAGE_PRESENT != 0).then(|| CachePolicy::from_pde(pde))
+    }
+
+    pub fn direct_map_policy(&self, phys: u64) -> Option<CachePolicy> {
+        self.policy_at(super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64)
+    }
+
+    pub fn user_policy(&self, addr: UserAddr) -> Option<CachePolicy> {
+        self.policy_at(addr.raw())
     }
 
     /// Unmap a physical region from the direct map.
@@ -701,7 +712,7 @@ impl AddressSpace {
         let existing = pd[pd_idx];
         assert!(
             existing & PAGE_PRESENT == 0
-                || existing == entry
+                || existing & !(PAGE_ACCESSED | PAGE_DIRTY) == entry
                 || CachePolicy::from_pde(existing) == CachePolicy::DeferToMtrr,
             "map_2m: {phys:#x} is mapped {existing:#x} and cannot also be {entry:#x}"
         );

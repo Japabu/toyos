@@ -88,7 +88,7 @@ mod late_panic {
 use crate::mm::paging::CachePolicy;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use arch::{apic, cpu, idt, percpu, smp, syscall};
+use arch::{apic, cpu, idt, pat, percpu, smp, syscall};
 use drivers::{acpi, gop, i8042, ioapic, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
@@ -299,6 +299,12 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     drivers::panic_console::arm(&kernel_args, maps);
 
     serial::init();
+
+    // Before `panic_console::remap` and `mm::init`, which are the first things
+    // to map a page selecting the entry it writes.
+    pat::init();
+    log!("PAT: IA32_PAT={:#018x}, entry {} = {}",
+        pat::msr(), pat::WC_ENTRY, pat::entry_name(pat::WC_ENTRY));
 
     // The window this exists to cover: percpu is not up, no allocator, no
     // paging of our own, so the early-panic branch is the whole reporting

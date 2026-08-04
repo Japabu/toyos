@@ -559,7 +559,7 @@ pub fn init(devices: &[PciDevice]) -> Option<(SoundController, AudioInfo)> {
 
     // DmaPool allocations are whole 2MB pages, so the shared slice base IS
     // the page soundd maps; buf_offsets are relative to it.
-    let dma_token = shared_memory::register(crate::DirectMap::from_phys(shared.phys()), crate::mm::PAGE_2M);
+    let dma_token = shared_memory::register(crate::DirectMap::from_phys(shared.phys()), crate::mm::PAGE_2M, CachePolicy::DeferToMtrr);
     let mut tx_data_phys = [0u64; TX_INFLIGHT_MAX];
     let mut buf_offsets = [0u32; TX_INFLIGHT_MAX];
     for i in 0..TX_INFLIGHT_MAX {

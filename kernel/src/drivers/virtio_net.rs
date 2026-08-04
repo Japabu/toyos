@@ -223,7 +223,7 @@ pub fn init(devices: &[PciDevice]) {
     let tx_ptr = dma.ptr_at(OFF_TX_BUF);
 
     let dma_base_phys = dma.phys() & !(crate::mm::PAGE_2M - 1);
-    let dma_token = shared_memory::register(crate::DirectMap::from_phys(dma_base_phys), crate::mm::PAGE_2M);
+    let dma_token = shared_memory::register(crate::DirectMap::from_phys(dma_base_phys), crate::mm::PAGE_2M, CachePolicy::DeferToMtrr);
 
     crate::net::set_nic_info(NicInfo {
         dma_token: dma_token.raw(),
