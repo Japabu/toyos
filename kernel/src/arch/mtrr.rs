@@ -1,20 +1,15 @@
-//! What memory type a physical range actually has.
+//! What memory type firmware gave a physical range.
 //!
-//! Read-only, and it exists because the kernel does not decide this. Every
-//! mapping the kernel makes — `map_mmio` for its own view, `map_range` for a
-//! process's — carries `PAGE_PRESENT | PAGE_WRITE`(`| PAGE_USER`) and none of
-//! PWT, PCD or the PAT bit, so every page selects PAT entry 0, and nothing here
-//! ever writes `IA32_PAT`, which leaves entry 0 at its reset value of WB. A WB
-//! PAT entry defers to the MTRR for the range (SDM Vol. 3A, "Effective Memory
-//! Type" — WB is the entry that takes whatever the MTRR says), so firmware's
-//! MTRRs are the whole of the answer.
+//! Read-only: these registers are firmware's, and the kernel programs none of
+//! them. It reads them because they are half of the answer to what a mapping
+//! costs. The other half is the PAT entry the page selects
+//! ([`crate::arch::pat`]), and every mapping made with
+//! [`CachePolicy::DeferToMtrr`](crate::mm::paging::CachePolicy) selects entry
+//! 0 — WB, the entry that takes whatever the MTRR says (SDM Vol. 3A
+//! Table 11-7). For those pages what is here is the whole of the answer.
 //!
-//! That matters for one range in particular. A GOP scanout under WC combines
-//! writes and is fast for long sequential blits and slow for scattered ones;
-//! under UC every store is its own bus transaction. *Reads* are uncached under
-//! both, which is why no client should ever compose against the panel — but
-//! which of the two the writes get is a property of the machine, and until this
-//! is logged it is a property nobody has looked at.
+//! The exception is the one range that asks for [`effective_under_wc`], where
+//! the MTRR is *outvoted* rather than consulted.
 
 use crate::arch::cpu;
 
@@ -96,6 +91,29 @@ impl Effective {
     }
 }
 
+/// The memory type of a page whose PAT entry holds WC, over a range whose MTRR
+/// state is `mtrr`.
+///
+/// SDM Vol. 3A Table 11-7, "Effective Page-Level Memory Types for Pentium III
+/// and More Recent Processor Families": every row whose PAT entry value is WC
+/// gives WC, under all five MTRR types. The row this kernel stands on is
+/// `UC | WC | WC` — an MTRR's UC does **not** win over a PAT entry's WC, which
+/// is the one cell where the folk rule "strong UC beats every PAT type" is
+/// wrong, and is why the scanout needs no range register of its own.
+///
+/// [`Effective::MtrrsDisabled`] answers through that same row: §11.11.2.1 makes
+/// UC the type of all of physical memory when `MTRRdefType.E` is clear, and UC
+/// is one of the five the table indexes.
+///
+/// `None` where [`range_type`] has no single answer, because a range with no
+/// MTRR type has no row and so no effective type either.
+pub fn effective_under_wc(mtrr: &Effective) -> Option<MemoryType> {
+    match mtrr {
+        Effective::Known(_) | Effective::MtrrsDisabled => Some(MemoryType::WriteCombining),
+        Effective::Unknown(_) => None,
+    }
+}
+
 /// The architecture's rule for two MTRRs over the same address: UC beats
 /// anything, WT beats WB, and every other disagreement is undefined.
 fn combine(a: MemoryType, b: MemoryType) -> Option<MemoryType> {
@@ -108,8 +126,7 @@ fn combine(a: MemoryType, b: MemoryType) -> Option<MemoryType> {
     }
 }
 
-/// The memory type firmware gave `[base, base + size)`, and so — because every
-/// mapping here selects a WB PAT entry — the type those pages actually have.
+/// The memory type firmware gave `[base, base + size)`.
 ///
 /// Fixed MTRRs are not consulted: they describe the first 1 MiB only, and no
 /// caller of this is asking about that.

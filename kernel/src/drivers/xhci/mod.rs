@@ -10,6 +10,7 @@ use core::sync::atomic::{fence, AtomicU64, Ordering};
 use crate::mm::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
+use crate::mm::paging::CachePolicy;
 use crate::log;
 use crate::mm::KernelSlice;
 use crate::sync::Lock;
@@ -1998,7 +1999,7 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     };
     log!("xHCI: {irq} enabled (vector {XHCI_VECTOR:#x})");
 
-    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x10000);
+    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x10000, CachePolicy::DeferToMtrr);
 
     let cap_length = bar.read_u8(CAP_CAPLENGTH) as u64;
     let hcsparams1 = bar.read_u32(CAP_HCSPARAMS1);

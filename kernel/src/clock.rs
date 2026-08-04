@@ -2,6 +2,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+use crate::mm::paging::CachePolicy;
 use crate::arch::cpu;
 
 // HPET register offsets
@@ -13,7 +14,7 @@ static TSC_BOOT: AtomicU64 = AtomicU64::new(0);
 static TSC_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init(hpet_base: u64) {
-    let hpet = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(hpet_base, 0x1000);
+    let hpet = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(hpet_base, 0x1000, CachePolicy::DeferToMtrr);
 
     let cap = hpet.read_u64(HPET_CAP);
     let hpet_period_fs = cap >> 32;

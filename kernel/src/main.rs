@@ -85,6 +85,7 @@ mod late_panic {
     }
 }
 
+use crate::mm::paging::CachePolicy;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arch::{apic, cpu, idt, percpu, smp, syscall};
@@ -377,7 +378,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
         .expect("ACPI: failed to find ECAM base address");
-    let ecam = mm::paging::kernel().lock().as_mut().unwrap().map_mmio(ecam_base, 256 * 32 * 8 * 4096);
+    let ecam = mm::paging::kernel().lock().as_mut().unwrap().map_mmio(ecam_base, 256 * 32 * 8 * 4096, CachePolicy::DeferToMtrr);
     let pci_devices = pci::enumerate(&ecam);
     // After ACPI is readable and PCI is enumerable, before any driver `init`:
     // the unit has to be programmed before the first device is told to do DMA

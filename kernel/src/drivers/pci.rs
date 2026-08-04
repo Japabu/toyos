@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
 use crate::mm::Mmio;
+use crate::mm::paging::CachePolicy;
 use crate::log;
 
 const VENDOR_ID: u64 = 0x00;
@@ -148,7 +149,7 @@ impl PciDevice {
             .lock()
             .as_mut()
             .unwrap()
-            .map_mmio(table_addr, 0x1000);
+            .map_mmio(table_addr, 0x1000, CachePolicy::DeferToMtrr);
 
         table.write_u32(0x00, MSG_ADDR);
         table.write_u32(0x04, 0);

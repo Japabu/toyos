@@ -4,6 +4,7 @@ use crate::mm::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
 use crate::block::{BlockDevice, BlockError, BlockResult, DeviceId};
+use crate::mm::paging::CachePolicy;
 use crate::log;
 use crate::mm::KernelSlice;
 use crate::sync::Lock;
@@ -423,7 +424,7 @@ pub fn init(devices: &[PciDevice]) -> Option<NvmeBlockDevice> {
     pci_dev.enable_bus_master();
     log!("NVMe: BAR0={:#x}", bar_addr);
 
-    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x4000);
+    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x4000, CachePolicy::DeferToMtrr);
 
     let cap = bar.read_u64(REG_CAP);
     let stride = ((cap >> 32) & 0xF) as u32;

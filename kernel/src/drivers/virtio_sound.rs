@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, UsedRingConsumer, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1, COMMON_MSIX_CONFIG, COMMON_QUEUE_SELECT, COMMON_QUEUE_MSIX};
 use super::DmaPool;
+use crate::mm::paging::CachePolicy;
 use crate::log;
 use crate::shared_memory;
 use toyos_abi::audio::AudioInfo;
@@ -478,7 +479,7 @@ fn setup_msix(pci_dev: &PciDevice, device: &VirtioDevice) {
     let table_bar = pci_dev.read_bar_64(table_bir);
     let table_addr = table_bar + table_offset;
 
-    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000);
+    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000, CachePolicy::DeferToMtrr);
 
     table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base
     table.write_u32(0x04, 0);            // msg_addr_hi

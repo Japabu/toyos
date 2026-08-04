@@ -27,6 +27,7 @@ mod table;
 use crate::drivers::acpi::TableError;
 use crate::drivers::pci::PciDevice;
 use crate::iommu::{AddressWidth, StreamId};
+use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
 use crate::sync::Lock;
 
@@ -236,7 +237,7 @@ fn describe_unit(index: usize, drhd: &dmar::Drhd) -> Option<Unit> {
         .lock()
         .as_mut()
         .unwrap()
-        .map_mmio(base, REGISTER_WINDOW);
+        .map_mmio(base, REGISTER_WINDOW, CachePolicy::DeferToMtrr);
 
     let version = regs.read_u32(VER_REG);
     // §2.2 row 2, and the one case here that is distinguishable from "no unit

@@ -2,6 +2,8 @@ use alloc::boxed::Box;
 
 use toyos_abi::syscall::SyscallError;
 
+use crate::arch::{mtrr, pat};
+use crate::mm::paging::CachePolicy;
 use crate::mm::{PAGE_2M, align_2m_checked, DirectMap};
 use crate::gpu::{Gpu, GpuInfo};
 use crate::log;
@@ -53,19 +55,39 @@ pub fn init(
     );
     let aligned_size = align_2m_checked(size as usize)
         .unwrap_or_else(|| panic!("GOP: firmware reports a {size}-byte framebuffer")) as u64;
-    crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(addr, aligned_size);
+    // The kernel's own view and the clients' carry the same policy: SDM
+    // Vol. 3A §11.12.4 rules out one physical page held under two memory
+    // types, and the panic console writes through the direct map while a
+    // compositor holds a token.
+    crate::mm::paging::kernel()
+        .lock()
+        .as_mut()
+        .unwrap()
+        .map_mmio(addr, aligned_size, CachePolicy::WriteCombining);
 
-    let token0 = shared_memory::register(DirectMap::from_phys(addr), aligned_size);
-    let token1 = shared_memory::register(DirectMap::from_phys(addr), aligned_size);
+    let fb = DirectMap::from_phys(addr);
+    let token0 = shared_memory::register(fb, aligned_size, CachePolicy::WriteCombining);
+    let token1 = shared_memory::register(fb, aligned_size, CachePolicy::WriteCombining);
     log!("GOP: {}x{} stride={} format={} at {:#x} tokens=[{:?}, {:?}]",
         width, height, stride, pixel_format, addr, token0, token1);
-    // Not a property of this driver: nothing here or in `paging` sets a cache
-    // attribute, so the scanout's type is firmware's MTRR and this is the only
-    // place it is ever looked at. It decides what a client's writes cost, and
-    // it differs between machines — QEMU's is host RAM, which is why the answer
-    // has never mattered until there was a laptop.
-    log!("GOP: scanout memory type {} (PAT entry 0, WB, defers to the MTRR)",
-        crate::arch::mtrr::range_type(addr, aligned_size).name());
+
+    // What a framebuffer client's writes cost, read off the mapping that was
+    // installed rather than the one that was asked for.
+    let mtrr = mtrr::range_type(addr, aligned_size);
+    let installed = crate::mm::paging::kernel()
+        .lock()
+        .as_ref()
+        .unwrap()
+        .direct_map_policy(addr)
+        .expect("GOP: the scanout is mapped");
+    assert!(
+        installed == CachePolicy::WriteCombining,
+        "GOP: the scanout is mapped {installed:?}"
+    );
+    log!("GOP: scanout memory type {} (MTRR {}, PAT entry {})",
+        mtrr::effective_under_wc(&mtrr).map_or("unknown", |t| t.name()),
+        mtrr.name(),
+        pat::WC_ENTRY);
 
     let cursor_pages = crate::mm::pmm::alloc_contiguous(1, crate::mm::pmm::Category::Framebuffer).expect("GOP: cursor alloc failed");
     let cursor_phys = cursor_pages[0].direct_map().phys();

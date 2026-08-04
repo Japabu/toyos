@@ -3,6 +3,7 @@ use core::sync::atomic::{fence, Ordering};
 
 use crate::mm::Mmio;
 use super::pci::PciDevice;
+use crate::mm::paging::CachePolicy;
 use crate::log;
 
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
@@ -82,7 +83,7 @@ impl VirtioPciConfig {
             if bar_idx < 6 && mapped_bars[bar_idx].is_none() {
                 let bar_addr = pci_dev.read_bar_64(bar_idx as u8);
                 if bar_addr != 0 {
-                    mapped_bars[bar_idx] = Some(crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x4000));
+                    mapped_bars[bar_idx] = Some(crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x4000, CachePolicy::DeferToMtrr));
                 }
             }
         }

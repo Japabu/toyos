@@ -4,6 +4,7 @@ use core::ptr::write_bytes;
 use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtqueueRegions, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
+use crate::mm::paging::CachePolicy;
 use crate::log;
 use crate::mm::KernelSlice;
 use crate::net::NicInfo;
@@ -138,7 +139,7 @@ fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
     let table_bar = pci_dev.read_bar_64(table_bir);
     let table_addr = table_bar + table_offset;
 
-    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000);
+    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000, CachePolicy::DeferToMtrr);
 
     // Configure MSI-X table entry 0: route to LAPIC with our vector
     table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base

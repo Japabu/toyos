@@ -18,9 +18,59 @@ use crate::MemoryMapEntry;
 const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_WRITE: u64 = 1 << 1;
 const PAGE_USER: u64 = 1 << 2;
+const PAGE_WRITE_THROUGH: u64 = 1 << 3;
+const PAGE_CACHE_DISABLE: u64 = 1 << 4;
 const PAGE_SIZE_BIT: u64 = 1 << 7;
+/// The PAT bit of a 2 MiB PDE. In a 4 KiB PTE the same bit is bit 7, so a PDE's
+/// flags cannot be carried across a split without moving it.
+const PAGE_PAT_2M: u64 = 1 << 12;
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const ADDR_MASK_2M: u64 = 0x000F_FFFF_FFE0_0000;
+
+/// Which PAT entry a 2 MiB mapping selects, and so what memory type its pages
+/// have.
+///
+/// Every mapping states one. PAT, PCD and PWT together choose the entry; this
+/// kernel leaves PCD and PWT clear everywhere, so the PAT bit alone decides and
+/// only two of the eight entries are ever reachable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CachePolicy {
+    /// PAT entry 0, which is WB and never rewritten. A WB entry takes the
+    /// MTRR's type for the physical range (SDM Vol. 3A Table 11-7), so these
+    /// pages are whatever firmware decided they are —
+    /// [`mtrr::range_type`](crate::arch::mtrr::range_type) is the answer.
+    DeferToMtrr,
+    /// PAT entry [`pat::WC_ENTRY`](crate::arch::pat::WC_ENTRY), which
+    /// [`pat::init`](crate::arch::pat::init) programs to WC on every CPU.
+    WriteCombining,
+}
+
+impl CachePolicy {
+    fn pde_bits(self) -> u64 {
+        match self {
+            Self::DeferToMtrr => 0,
+            Self::WriteCombining => PAGE_PAT_2M,
+        }
+    }
+
+    /// The policy a 2 MiB PDE carries.
+    ///
+    /// PCD or PWT set means an entry this kernel did not write, and its memory
+    /// type is not one of the two named here.
+    fn from_pde(pde: u64) -> Self {
+        assert!(
+            pde & (PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH) == 0,
+            "CachePolicy::from_pde: {pde:#x} selects a PAT entry outside 0 and {}",
+            crate::arch::pat::WC_ENTRY
+        );
+        if pde & PAGE_PAT_2M != 0 { Self::WriteCombining } else { Self::DeferToMtrr }
+    }
+}
+
+const _: () = assert!(
+    crate::arch::pat::WC_ENTRY == 4,
+    "WriteCombining sets the PAT bit and leaves PCD and PWT clear, which is entry 4",
+);
 
 /// A 4KB-aligned page of 512 entries, matching the hardware page table format.
 #[repr(C, align(4096))]
@@ -256,7 +306,14 @@ impl AddressSpace {
 
     /// Map a contiguous physical region into user space as 2MB pages.
     /// Asserts: vaddr and phys are 2MB-aligned, all PDE slots are empty.
-    pub fn map_range(&mut self, vaddr: UserAddr, phys: u64, size: u64, writable: bool) {
+    pub fn map_range(
+        &mut self,
+        vaddr: UserAddr,
+        phys: u64,
+        size: u64,
+        writable: bool,
+        cache: CachePolicy,
+    ) {
         assert!(
             vaddr.raw() & (PAGE_2M - 1) == 0,
             "map_range: vaddr not 2MB-aligned"
@@ -269,7 +326,7 @@ impl AddressSpace {
         while offset < size {
             let va = vaddr.raw() + offset;
             let pa = phys + offset;
-            let mut flags = PAGE_PRESENT | PAGE_USER;
+            let mut flags = PAGE_PRESENT | PAGE_USER | cache.pde_bits();
             if writable {
                 flags |= PAGE_WRITE;
             }
@@ -453,7 +510,13 @@ impl AddressSpace {
     }
 
     /// Allocate a region and map physical memory into it.
-    pub fn alloc_and_map(&mut self, phys: u64, size: u64, writable: bool) -> Option<(UserAddr, u64)> {
+    pub fn alloc_and_map(
+        &mut self,
+        phys: u64,
+        size: u64,
+        writable: bool,
+        cache: CachePolicy,
+    ) -> Option<(UserAddr, u64)> {
         let aligned = align_up_2m(size);
         assert!(
             phys & (PAGE_2M - 1) == 0,
@@ -468,7 +531,7 @@ impl AddressSpace {
                 kind: RegionKind::Mapped,
             },
         );
-        self.map_range(addr, phys, aligned, writable);
+        self.map_range(addr, phys, aligned, writable, cache);
         Some((addr, aligned))
     }
 
@@ -525,17 +588,29 @@ impl AddressSpace {
 
     /// Map a physical region into the direct map using 2MB pages.
     /// Returns an Mmio handle for bounds-checked register access.
-    pub fn map_mmio(&mut self, phys: u64, size: u64) -> super::Mmio {
+    pub fn map_mmio(&mut self, phys: u64, size: u64, cache: CachePolicy) -> super::Mmio {
         let start = phys & !(PAGE_2M - 1);
         let end = (phys + size + PAGE_2M - 1) & !(PAGE_2M - 1);
         let mut cur = start;
         while cur < end {
-            self.map_2m(cur, PAGE_PRESENT | PAGE_WRITE);
+            self.map_2m(cur, PAGE_PRESENT | PAGE_WRITE | cache.pde_bits());
             cur += PAGE_2M;
         }
         flush_tlb_all();
         crate::arch::apic::tlb_shootdown();
         super::Mmio::new(super::DirectMap::from_phys(phys), size)
+    }
+
+    /// The policy the direct map's 2 MiB entry for `phys` carries, or `None`
+    /// where nothing is mapped.
+    ///
+    /// Read out of the page table rather than remembered, so a caller that
+    /// reports a mapping's memory type reports the installed one.
+    pub fn direct_map_policy(&self, phys: u64) -> Option<CachePolicy> {
+        let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
+        let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
+        let pde = self.root.child(pml4_idx)?.child(pdpt_idx)?[pd_idx];
+        (pde & PAGE_PRESENT != 0).then(|| CachePolicy::from_pde(pde))
     }
 
     /// Unmap a physical region from the direct map.
@@ -584,6 +659,10 @@ impl AddressSpace {
         if pde & PAGE_SIZE_BIT != 0 {
             let base = pde & ADDR_MASK_2M;
             let flags = pde & !ADDR_MASK_2M & !PAGE_SIZE_BIT;
+            assert!(
+                flags & PAGE_PAT_2M == 0,
+                "guard_4k: {phys:#x} carries a PAT bit that is an address bit in a 4 KiB PTE"
+            );
             let mut pt = Box::new(PageTablePage([0; 512]));
             for i in 0..512 {
                 pt.set_entry(i, (base + i as u64 * 4096) | flags);
@@ -606,13 +685,27 @@ impl AddressSpace {
         flush_tlb_all();
     }
 
+    /// Map one 2 MiB page of the direct map, replacing whatever was there.
+    ///
+    /// Replacing and not skipping, because the boot map blankets every physical
+    /// address the memory map reaches and an MMIO window inside that span is
+    /// already mapped by the time its driver asks for it. Only a policy the
+    /// boot map did not choose may be overwritten that way: two windows in one
+    /// 2 MiB page asking for different memory types would be decided by call
+    /// order, and the loser would write through a type it did not ask for.
     fn map_2m(&mut self, phys: u64, flags: u64) {
         let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
         let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
         let pd = self.ensure_table(pml4_idx, flags, pdpt_idx, flags);
-        if pd[pd_idx] & PAGE_PRESENT == 0 {
-            pd.set_entry(pd_idx, phys | flags | PAGE_SIZE_BIT);
-        }
+        let entry = phys | flags | PAGE_SIZE_BIT;
+        let existing = pd[pd_idx];
+        assert!(
+            existing & PAGE_PRESENT == 0
+                || existing == entry
+                || CachePolicy::from_pde(existing) == CachePolicy::DeferToMtrr,
+            "map_2m: {phys:#x} is mapped {existing:#x} and cannot also be {entry:#x}"
+        );
+        pd.set_entry(pd_idx, entry);
     }
 
     fn unmap_2m(&mut self, phys: u64) {
