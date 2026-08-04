@@ -46,6 +46,8 @@ const fn packed(entries: [u8; 8]) -> u64 {
     value
 }
 
+const PAT_VALUE: u64 = packed(ENTRIES);
+
 const _: () = assert!(ENTRIES[WC_ENTRY] == WC);
 
 /// Put [`ENTRIES`] in this CPU's `IA32_PAT`. Every CPU must run it, because
@@ -77,7 +79,7 @@ pub fn init() {
         core::arch::asm!("wbinvd", options(nostack, preserves_flags));
         flush_tlb(cr4);
 
-        cpu::wrmsr(IA32_PAT, packed(ENTRIES));
+        cpu::wrmsr(IA32_PAT, PAT_VALUE);
 
         flush_tlb(cr4);
         core::arch::asm!("wbinvd", options(nostack, preserves_flags));
@@ -88,14 +90,12 @@ pub fn init() {
         cpu::enable_interrupts();
     }
 
-    // A CPU that took the write but reports something else has broken the one
-    // claim every WC mapping in the machine rests on, and it is cheaper to say
-    // so here than to have a panel explain it later.
+    // Every write-combining mapping in the machine rests on this entry holding
+    // what was written to it, and nothing downstream can tell that it does not.
     let read_back = cpu::rdmsr(IA32_PAT);
     assert!(
-        read_back == packed(ENTRIES),
-        "PAT: wrote {:#018x}, IA32_PAT reads {read_back:#018x}",
-        packed(ENTRIES)
+        read_back == PAT_VALUE,
+        "PAT: wrote {PAT_VALUE:#018x}, IA32_PAT reads {read_back:#018x}"
     );
 }
 
@@ -117,7 +117,7 @@ unsafe fn flush_tlb(cr4: u64) {
     }
 }
 
-/// The live `IA32_PAT`, for the one line that reports what this CPU has.
+/// This CPU's live `IA32_PAT`.
 pub fn msr() -> u64 {
     cpu::rdmsr(IA32_PAT)
 }

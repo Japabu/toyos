@@ -2494,6 +2494,50 @@ choice survives a login and not a reboot.
 
 ## 8. Hardware and performance gaps
 
+### Device registers still take firmware's word for being uncacheable
+
+Every `map_mmio` outside the scanout passes `CachePolicy::DeferToMtrr`, which is
+PAT entry 0 — WB, the entry that takes whatever the MTRR says for the range.
+That is correct only while firmware covers the PCI hole with a UC range
+register. Nothing checks that it does. A BAR in a range no MTRR covers, under a
+`MTRRdefType` of WB, is a set of device registers the CPU is free to cache and
+to reorder, and no symptom names the cause.
+
+It survived review for years because there was no alternative: with the reset
+PAT there is no way to *say* UC without PCD or PWT, and the kernel wrote no PAT
+at all. That is no longer true — `arch::pat` owns the table, and a third
+`CachePolicy` selecting a UC entry would make every BAR uncacheable whatever
+firmware did, at no cost, since Table 11-7 gives UC for a UC PAT entry under
+every MTRR type. It is not in this change because nothing has been observed to
+be wrong: `mtrr::range_type` can answer per BAR and no boot has been asked.
+
+The measurement that decides it: log `range_type` for each BAR `map_mmio` is
+given, on the T14 and on QEMU, and see whether any comes back other than UC.
+`specs/userspace-drivers-spec.md` §"It works because firmware's MTRRs make the
+PCI hole uncacheable" and `specs/iommu-spec.md` both record the same
+dependency; this is the entry that says the machinery to remove it now exists.
+
+### A BAR sharing the scanout's last 2 MiB page is a boot panic
+
+`map_2m` refuses to put two different non-default memory types in one 2 MiB
+page: whichever call ran last would decide, and the other would write through a
+type it did not ask for — which for a device BAR means combined, reordered
+register writes. The refusal is a panic naming both entries.
+
+That is the right failure and it is reachable from firmware's BAR layout rather
+than from any kernel bug. The scanout is mapped write-combining by
+`panic_console::remap`, which runs before every driver's `map_mmio`, so a BAR
+placed inside `[fb, fb + align_2m(fb_size))` panics the boot. The layout that
+would do it is a small BAR immediately after the framebuffer's, close enough to
+land in the same 2 MiB page — which BAR alignment rules make unlikely, since a
+framebuffer BAR is large and the next one starts on its own size boundary, but
+does not forbid.
+
+Not staged on either machine: QEMU's stdvga puts nothing there, and the T14 has
+not been asked. If a T14 boot ever panics in `map_2m` naming `0x4000000000`,
+this is what happened, and the fix is to give that page `DeferToMtrr` and take
+the framebuffer's last page back to UC rather than to widen the check.
+
 ### CLOSED — `build_toyos_bins` read a `.so` another build was replacing
 
 `src/build.rs`'s cdylib sweep did `fs::read_dir(&lib_out).unwrap()` and then
@@ -2573,21 +2617,22 @@ time, in `fill_screen` (`:769`) and per glyph bit (`:791`). 1920x1080 is
 2,073,600 of those per full repaint, which at 460 ms is 222 ns each: the cost
 of a store to an uncached mapping.
 
-**Which is why the memory type has to be read before anything is done about
-it.** `d406a54` logs it at GOP init, and QEMU with OVMF says UC. If the T14
-says UC too, then batching those stores into a scratch and blitting changes
-nothing — UC forbids combining, so a wide copy decomposes into the same bus
-transactions — and the only thing that helps is making the mapping WC. That
-means programming `IA32_PAT` on every CPU, because the reset PAT has no WC
-entry at all (WB/WT/UC-/UC twice over), which is a real SMP-wide change and not
-one to make on a guess. If the T14 says WC, the mapping is already as good as
-it gets and the painter's granularity is the whole story.
+**The mapping is write-combining now, which changes what is left of this.** The
+kernel programs `IA32_PAT` entry 4 to WC on every CPU and maps the scanout
+through it — its own direct map and every process holding a token — so a store
+to the panel merges with its neighbours instead of being its own bus
+transaction. `fill_screen` writes a row of `u32`s in address order and is what
+gains most; `draw_glyph` writes one `u32` per set bit across sixteen rows and
+gains least, because scattered stores are what WC cannot merge. Neither figure
+exists: QEMU's framebuffer is host RAM and can show neither, so what is open
+here is the measurement off the T14 rather than the mechanism.
 
-Sequencing, therefore: read the type off the owner's next boot log, then decide.
-Note the constraint that rules out the obvious scratch buffer on the panic path:
-it takes no lock of any kind and paints from contexts where nothing may be
-waited on, so a shared static strip would add exactly the multi-CPU race §2
-already records against `capture()`.
+That makes the painter's granularity the live question again — a glyph
+assembled in a scratch row and blitted as one run would merge where the per-bit
+writes do not. Note the constraint that rules out the obvious scratch buffer on
+the panic path: it takes no lock of any kind and paints from contexts where
+nothing may be waited on, so a shared static strip would add exactly the
+multi-CPU race §2 already records against `capture()`.
 
 Belongs to #65 (boot time) rather than to the console work that found it.
 
