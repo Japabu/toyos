@@ -1058,6 +1058,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             lib_paths,
         },
         mmap_regions: Vec::new(),
+        pipe_maps: Vec::new(),
         demand_pages: Vec::new(),
         fault_trace: PageFaultTrace::new(),
         peak_memory: 0,

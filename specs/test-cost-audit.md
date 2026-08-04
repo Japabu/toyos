@@ -881,6 +881,261 @@ association with the test that printed them. The PASS/FAIL lines carry their own
 names and are unaffected. `--nocapture` prefixes each serial line with its boot's
 number for the same reason.
 
+## 5.4 Wave 5: the two-minute suite
+
+The target was the owner's: the steady-state suite under 120 s. §5.3 had said it
+was **not reachable by scheduling**, because 103 s of serial tail plus 30 s of
+gate A is a floor no width touches. That was true of the tail as it stood and
+false about the tail: **twelve of its sixteen entries were there for a reason
+that does not survive being read.** What follows is what each lever bought, then
+the three ledgers.
+
+### 5.4.1 Where the tail actually came from
+
+The tail was 167.3 s: the shared block plus sixteen machine tests. Sorting them
+by *what the assertion is* rather than by what the registration said:
+
+- **Four are host-clock claims and stay.** `xhci_flap`'s two QMP writes have to
+  land inside one 100 ms debounce or the state under test never happens;
+  `i8042_absent` compares two boots' `Boot: complete` with a 300 ms allowance;
+  `metal_sim_null_audio` puts an 8 s ceiling on a 3.3 s host-measured drain;
+  `xhci_second_controller` lost all five of its keys at width 4 when the phase
+  first landed (§5.3).
+- **The shared block was never a host-clock claim at all.** Its 5 and 10 second
+  ceilings are `run_test` timeouts — liveness guards on a guest that might
+  wedge — and the verdict in every one of its 153 tests is an exit code and an
+  expected stdout. [`qemu::budget`] now multiplies every such ceiling by the
+  phase's width, which is what `wait_for_ready` has done to the boot timeout
+  since the phase existed.
+- **Eleven inherited the tail from a neighbour or from a sentence about
+  keystrokes.** `late_storage_connect` is "`xhci_slow_connect`'s shape against
+  the disk's port" and makes no claim about when anything happened;
+  `xhci_slow_connect` itself reads *both* its instants off the guest's boot
+  clock and its own comment records six runs, three of them with four concurrent
+  test processes on the machine, at 13 ms of worst excursion against 150 of
+  slack. The five locale tests and `i8042_fadt_denial` type at the guest and
+  wait on `serial_until` against a marker: what drops a keystroke there is the
+  PS/2 controller's sixteen-byte queue, not the host's load, and none of them
+  puts more than a handful in flight before waiting on what came back —
+  `i8042_kbd_echo` has run that shape at width 4 since the phase landed.
+
+### 5.4.2 What each lever bought
+
+| lever | where | effect |
+|---|---|---|
+| `drain_until` instead of `drain_serial(20 s)` | `double_fault_stack` | **32 s → 3 s** |
+| `qemu::budget`, shared block to the phase | tail | −13 s from the tail |
+| ten conversions | tail | 167.3 s → 37.4 s, and six tests to seven |
+| longest-job-first on a measured profile | parallel phase | see §5.4.5 |
+| inert-actuator folding | image builds | 5 kernel variants → 1 |
+
+**Where it landed. 246/246 green in 109.1 s**, at the default width of 12
+(§5.4.7), on a quiet host — `uptime` load 5.10 falling to 3.44, no other
+worktree building or booting:
+
+| | seconds |
+|---|---:|
+| parallel phase, 239 tests in 65 tasks | **42.1** |
+| serial tail, 7 tests | **37.4** |
+| gate A, 4 boots | **~30** |
+| **suite** | **109.1** |
+
+Same session, same tree, alternated: **125.6 s at width 8**, and 318.4 s at
+width 12 on the *first* run after main's kernel changes arrived — §1.5's cold
+variant tax, about 180 s of it, paid once by whoever runs first and by nothing
+in this document. Two earlier runs of the 240-test tree came in at **107.3 s and
+118.2 s** with other worktrees busy throughout, so the figure survives the load
+the tree actually runs at as well as the absence of it.
+
+Against the starting point: **327.5 s at width 4** before this wave and before
+`screen_console_scroll`'s cut, and **433.8 s** measured on this branch's base
+under five concurrent suites.
+
+**Gate A is 28% of a green run and the serial tail is another 34%.** Two thirds
+of the suite is now the part that cannot share the host, which is where the next
+lever has to come from and both halves of it are the owner's.
+
+One earlier run is worth keeping for what it shows about gate A's variance: the
+same suite came in at **139.7 s** with gate A at **46.5 s** — 30 s plus two
+confirmations, because two of its four configs saw a dropout and the fast tier
+re-booted each once to check it reproduced. Neither did. A gate A that has to
+confirm costs half again as much as one that does not, and nothing schedules
+around that.
+
+**`double_fault_stack` is the shape to look for elsewhere.** A guest the fatal
+path has halted does not *exit*: every CPU is stopped and QEMU stays up, so
+`drain_serial`'s ceiling has nothing to disconnect it and the drain waits the
+whole twenty seconds for a machine that will never speak again. Every other
+20 s drain in the harness follows `run shutdown`, where QEMU quits and the
+reader disconnects, and costs nothing. One test in thirteen had the halting
+shape and it was the suite's second-most expensive.
+
+### 5.4.3 Ledger 1 — kernel feature inertness
+
+The question is not what a feature is *for*; it is whether a kernel carrying it
+boots, schedules, drives its devices and panics identically to one that does
+not. **Inert** means every `#[cfg]` site is inside a `SYS_DEBUG` action arm that
+nothing but a test can reach. Everything else keeps its own build.
+
+| feature | class | why |
+|---|---|---|
+| `test-fatal-halt` | **inert** | one `SYS_DEBUG` arm + one const |
+| `test-screen-graffiti` | **inert** | one arm + `panic_console::graffiti`, called from it alone |
+| `test-double-fault` | **inert** | one arm |
+| `test-heap-ceiling` | **inert** | three arms + `debug_heap_alloc`, called from them alone |
+| `debug-wait` | inert in practice | a boot-time spin the harness only sets under `--debug`; never in the suite |
+| `test-early-panic`, `test-late-panic` | perturbing | the boot panics |
+| `test-input-merge` | perturbing | scripts the input core at end of boot |
+| `test-tiny-va` | perturbing | moves `vma`'s arena |
+| `test-small-caches` | perturbing | moves both disk-cache ceilings |
+| `log-rotate-fast` | perturbing | moves `MAX_LOG_BYTES` |
+| `i8042-trace` | perturbing | a log line per drain |
+| `i8042-fault`, `i8042-budget-expired`, `i8042-fadt-denial`, `i8042-kbd-echo`, `i8042-fast-health` | perturbing | each changes what the probe or the ISR does on every boot |
+| `xhci-one-slot`, `xhci-deaf-controller`, `xhci-deaf-port`, `xhci-slow-connect`, `xhci-slow-storage-connect`, `xhci-portsc-rw1c`, `xhci-hid-break-*` | perturbing | each replaces a register or a completion on the live path |
+| `xhci-xecp-selftest`, `xhci-descriptor-selftest` | perturbing | run a walk at init |
+| `usb-storage-gate` | **conditionally inert** | acts only on a disk carrying the stamp, but scans the bus and logs on every boot, so a boot with it is not a boot without it |
+| `usb-flush-unimplemented`, `usb-flush-fails`, `usb-transport-break` | perturbing | replace a verdict or abandon a transfer |
+| `fat-backing-read-fails` | perturbing | every FAT page re-read fails |
+| `iommu-context-absent`, `iommu-empty-domain` | perturbing | mis-program the unit at init |
+| `sched-check` | perturbing | extra work in every scheduler pass. **No test uses it** |
+
+**Four of thirty-one are inert**, and `kernel/Cargo.toml`'s `test-actuators`
+unions them: five distinct kernel builds (plain plus four) become one. A test
+still names the actuator it wants — that is what its assertion is about — and
+`qemu::fold_inert` is the single place the name stops being a separate kernel.
+
+**The owner's "collapse toward a handful" needs §3.6, and this is not it.** The
+other twenty-seven each change a path a boot takes; unioning any two of them
+gives a kernel where both subsystems are broken, and every one of these tests
+boots a whole machine. Making them runtime-selected is §3.6 — a different binary
+with dead branches the shipping one does not have — and stays the owner's call
+and not recommended.
+
+### 5.4.4 Ledger 2 — coverage
+
+**Nothing was dropped.** Every assertion in the suite is the assertion it was,
+and the test count did not move. What changed is who runs beside whom, and one
+number:
+
+| change | what it could have guarded | why it is acceptable |
+|---|---|---|
+| `run_test`/`wait_for_console`/`screendump_while` ceilings × width | a guest that wedges is reported later | none of them is a verdict: every test whose pass depends on a deadline is in the tail and reads the *guest's* clock. A generous liveness guard costs diagnosis time; a tight one under load costs a false red, which is the failure this suite has most of |
+| `drain_until` on `double_fault_stack` | a line printed after `[ist1] used` | the kernel writes that line last, from `halt_all_cpus` after `panic_flush`; `DOUBLE FAULT` and the whole report precede it, and all four assertions read them |
+| eleven Serial → Parallel | a test mismeasuring a machine it does not have to itself | each is justified in its registration comment, and the re-run-alone pass (§5.4.6) turns a wrong answer into a named red rather than a quiet pass |
+| `test-actuators` folded into every test kernel | a test kernel carrying `SYS_DEBUG` arms it does not use | the arms are unreachable without the syscall; no test asserts that an unknown action is refused; and the shipping build (`cargo run`, `--diag-boot`) does not go through `fold_inert` at all |
+
+Two things this wave found and left alone, both **needing the owner** and
+neither landed:
+
+- **Gate A's 30 s is 25% of the target and cannot be touched without him.**
+  Four boots, alone, is the floor of any run that certifies audio.
+- **`xhci_flap` is the one test whose red is genuinely ambiguous under load**,
+  and its own message says so. It stays serial.
+
+### 5.4.5 Longest job first
+
+A phase's wall clock is `max(sum / width, longest job)`, and FIFO reaches the
+first term only when no long job is dispatched late. Declaration order puts the
+feature-carrying tests last — deliberately, to keep the kernel rebuilds
+together — which is the worst order for a wide phase: `xhci_hid_break` and
+`xhci_deaf_registers` are two of the three longest jobs in the suite and both
+sit in the last quarter of `MACHINE_TESTS`.
+
+The order is taken from **what the last run in this worktree measured**,
+recorded under `target/` and merged rather than replaced so a filtered run does
+not throw away a full one's profile. A hand-maintained list of long tests was
+rejected for the reason §5.3 gives — a second registration to keep true — and a
+name the file has never seen sorts *first*, so a new test is assumed long until
+it has been timed once.
+
+### 5.4.7 The width, re-asked against the post-cut profile
+
+§5.3 left this open and said it had to be re-made from scratch. Same session,
+same HEAD, other worktrees' suites draining from `uptime` load 32 to 6:
+
+| width | parallel | tail | suite |
+|---:|---:|---:|---:|
+| 4 | 182.7 s | 30.5 s | 274.1 s |
+| 8 | **91.7 s** | 32.1 s | 183.2 s |
+| 12 | 126.0 s | 27.6 s | 187.2 s |
+
+**That table says eight, and it is wrong about twelve.** It was taken while
+`drain_serial` was still width-scaled, and at width 12 `metal_sim_pointer_churn`
+— twenty-four paced drains — *was* the phase: 126.0 s of job inside a 126.0 s
+wall. It is 18 s now. Re-run on the fixed tree, after main was merged, 240 tests
+both, both green:
+
+| width | parallel | tail | suite | host |
+|---:|---:|---:|---:|---|
+| 8 | 59.1 s | 34.0 s | **123.1 s** | load 7.6 → 8.3, no other guest |
+| 12 | 43.8 s | 33.6 s | **107.3 s** | load 18.9 → 9.0 |
+
+**Twelve, and the more loaded of the two runs is the faster one.** Eight packs
+454.5 s of test time into 58.3 s — 7.8× on 8 workers, with its longest single
+job at 32 s — so the phase is sum-bound rather than critical-path bound, and the
+sum is what more workers divide. The earlier table's own numbers say the same
+thing from the other side: 716 s of test time at width 8 and 713.7 s at width
+12, so twelve workers did not make the work bigger.
+
+**Twelve is the number for one suite, and the host has no budget.** Four agents
+at twelve is 48 guests on 14 cores. The counting semaphore
+`specs/worktrees.md` §6 asks for still does not exist, and until it does this is
+a per-suite number with a machine-wide cost — which is the same warning §4.1
+constraint 3 gave at four and is now three times louder.
+
+Re-run once more after main's four landings, 246 tests, quiet host, alternated
+in one session: **125.6 s at width 8 and 109.1 s at width 12**, both green, with
+the parallel phase at 58.3 s and 42.1 s. That is the same 16 s and the same
+direction as the pair above, on a tree six commits later and with six more
+tests in it.
+
+**Confidence: three clean runs at 12, two at 8**, across two trees. Nine further
+attempts are not measurements and none is reported: seven died on `this worktree
+and the shared sysroot disagree about toyos-abi/src` when another worktree
+claimed the sysroot mid-run — the signature is a dozen or more identical
+refusals, one per test that tried to build after the claim — one spent 84 s
+queued behind the exclusive phase that followed, and one ran under five
+concurrent suites.
+
+### 5.4.6 Ledger 3 — recycling and contamination
+
+**Every red the wide phase produces is re-run by itself**, after the phase has
+drained, and both answers are findings:
+
+- **red again** — the defect is real and the width had nothing to do with it.
+- **green alone** — the test is red only when it shares the host, which makes
+  its `Sched::Parallel` wrong. A bug in `tests/toyos.rs`, not in the kernel, and
+  one nothing else in the suite can notice.
+
+**A green retry does not turn the run green.** A rerun-only pass counting as a
+pass is §3.7 by the back door; the failure line says which of the two it was and
+the run stays red until the classification is fixed. That is the whole safety
+argument for widening the phase: getting a scheduling answer wrong costs a red
+run, never a quiet one.
+
+A group member is re-run **as its group**, so the only thing that differs
+between the two attempts is how many guests the host had.
+
+**It found three things on its first three runs**, all under four other
+worktrees' suites:
+
+- **`ioapic_topology`: `Failed to read binary for toybox`, green alone.** Not a
+  margin — a real race in the build system. `build_and_assemble` read
+  `userland/target/x86_64-unknown-toyos/debug/<program>` straight out of cargo's
+  output directory with nothing held, while another worker's config was
+  relinking the same path. Cargo's own lock orders the two *builds* and says
+  nothing about a read between them. Fixed by putting the build and the read
+  under one `buildlock::artifact` hold, which is the fix `build_toyos_bins`
+  already carries and for the same stated reason.
+- **`i8042_mouse`: one discarded byte, green alone.** A pre-existing
+  `Sched::Parallel`, red only under five concurrent suites.
+- **`usb_transport_break`: "the transport broke 2 times; the injection is armed
+  once per boot", green alone.** Also pre-existing, also five-suite load.
+
+The last two are in `specs/known-issues.md`. Neither was introduced here and
+neither reproduces on a host running one suite; both are exactly what the
+mechanism exists to surface.
+
 ## 6. What this audit did not measure
 
 - The split of a machine test's time *above* the 3.7 s floor into guest work

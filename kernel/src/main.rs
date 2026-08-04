@@ -455,14 +455,15 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // so a machine we may not write to still boots to a working system. The
     // difference is persistence and nothing else, which is what keeps the
     // refusal from turning into a second failure mode further up.
+    use vfs::UserAccess;
     match home_volume {
-        Some(fs) => vfs::lock().mount("home", Box::new(bcachefs_adapter::BcacheFsAdapter::new(fs))),
+        Some(fs) => vfs::lock().mount("home", Box::new(bcachefs_adapter::BcacheFsAdapter::new(fs)), UserAccess::ReadWrite),
         None => {
             log!("storage: /home is a tmpfs — it will not survive a reboot");
-            vfs::lock().mount("home", Box::new(crate::tmpfs::TmpFs::new()))
+            vfs::lock().mount("home", Box::new(crate::tmpfs::TmpFs::new()), UserAccess::ReadWrite)
         }
     }
-    vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()));
+    vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()), UserAccess::ReadWrite);
 
     // The two partitions the handoff named, each under the name of its role
     // rather than of its type: `/esp` would say what the format is, and
@@ -471,13 +472,19 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // being FAT32. A machine that cannot identify one of them simply does not
     // have that mount, and boots exactly as it did before.
     use fat32_adapter::Role;
+    //
+    // The boot volume is `KernelOnly`: firmware and the bootloader read the
+    // machine out of it, so a process that can write it can make the machine
+    // unbootable. The log volume is not — it is a diagnostic partition whose
+    // worst loss is the diagnostic, and `toybox` writes to it. That the log
+    // file itself is unprotected is the residual; see known issues.
     match fat32_adapter::mount(Role::Boot) {
-        Some(fs) => vfs::lock().mount(Role::Boot.mount(), Box::new(fs)),
+        Some(fs) => vfs::lock().mount(Role::Boot.mount(), Box::new(fs), UserAccess::KernelOnly),
         None => log!("boot-volume: not mounted; the kernel has no /boot this boot"),
     }
     match fat32_adapter::mount(Role::Log) {
         Some(fs) => {
-            vfs::lock().mount(Role::Log.mount(), Box::new(fs));
+            vfs::lock().mount(Role::Log.mount(), Box::new(fs), UserAccess::ReadWrite);
             // Immediately after the mount and before anything else can fail:
             // what a machine with no serial port most needs in the file is the
             // boot that did not finish.

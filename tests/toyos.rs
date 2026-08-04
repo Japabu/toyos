@@ -41,29 +41,42 @@ enum Sched {
 
 /// The width with no `--jobs`, and where it came from.
 ///
-/// 14 cores, `smp: 2` per guest plus QEMU's own I/O thread — about three host
-/// threads each, so four is the honest ceiling for one suite
-/// (`specs/test-cost-audit.md` §4.1 constraint 3) and eight oversubscribes the
-/// machine. Measured both ways against one HEAD in one session; §5.3 records
-/// what each gave.
-const DEFAULT_WIDTH: usize = 4;
+/// 14 cores and about three host threads a guest divides out to four. The suite
+/// says twelve. Alternated in one session on a quiet host, 246 tests, both
+/// green: **125.6 s wide eight against 109.1 s wide twelve**, with the parallel
+/// phase at 58.3 s against 42.1 s — the same 16 s and the same direction as the
+/// pair taken on the tree six commits earlier. A guest here is mostly
+/// *waiting* — for a marker, for a debounce, for a device — which is why this is
+/// a measurement and not a division.
+///
+/// **Twelve is the number for one suite on this host, and the host has no
+/// budget.** Four agents at twelve is 48 guests on 14 cores; the semaphore
+/// `specs/worktrees.md` §6 asks for does not exist, and until it does the width
+/// is a per-suite number with a machine-wide cost. `specs/test-cost-audit.md`
+/// §5.4.7 carries the tables, including the one that said eight, which was taken
+/// while `drain_serial` was still width-scaled and `metal_sim_pointer_churn`'s
+/// twenty-four paced drains *were* the phase.
+const DEFAULT_WIDTH: usize = 12;
 
 /// The one boot that carries every Rust and C test.
 ///
 /// Declared here for the same reason each list entry is: it is a scheduling
 /// answer and it has to be visible.
 ///
-/// **Serial, and it was measured there.** Every test in the block carries a 5 or
-/// 10 second wall-clock ceiling — generous against a median under a tenth of a
-/// second, and not against a guest sharing 14 cores with three others: at width
-/// 4 `allocator_stress` went from 1 s to past its 5 s and `demand_paging_sse`
-/// from 36 ms to past its. A ceiling on the host's clock is the definition of
-/// [`Sched::Serial`] and the reasoning that put this block in the parallel phase
-/// simply had the wrong median in it.
+/// **Parallel, once its ceilings stopped being host-wide.** It was moved to the
+/// tail because at width 4 `allocator_stress` went from 1 s to past its 5 s and
+/// `demand_paging_sse` past its — but not one of those numbers is an assertion.
+/// They are liveness guards on a guest that might wedge, and the verdict in
+/// every case is the exit code and the expected stdout. [`qemu::budget`] now
+/// pays them out per guest the phase may have up, which is what
+/// `wait_for_ready`'s boot timeout has done since the phase existed, so the
+/// number each author reasoned about is still the number for one guest.
 ///
-/// It also costs the least of anything here to run alone: 153 tests, one boot,
-/// about fourteen seconds between them (`specs/test-cost-audit.md` §1.1).
-const SHARED_BLOCK: Sched = Sched::Serial;
+/// What that leaves is a block of 153 tests on one boot costing about thirteen
+/// seconds between them, which is far too little to be worth a tail slot of its
+/// own: alone it is thirteen seconds nothing overlaps, and in the phase it is
+/// one task among sixty.
+const SHARED_BLOCK: Sched = Sched::Parallel;
 
 // Rust helper binaries that are spawned by tests, not tests themselves.
 const RUST_SKIP: &[&str] = &[
@@ -92,6 +105,8 @@ const RUST_SKIP: &[&str] = &[
     "window_drag",
     // Needs netd with a NIC. `netd_connection_caps` runs it on tests/netcase.
     "netd_caps",
+    // Same reason, same config: `netd_hostile_peer` runs it there.
+    "netd_hostile_peer",
     // Needs a boot image the harness staged a file into before the machine
     // started, which only `esp_filesystem` builds.
     "esp_files",
@@ -182,22 +197,38 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("metal_sim_window_caps", Sched::Parallel),
     ("metal_sim_ipc_hostile_peer", Sched::Parallel),
     ("metal_sim_compositor_stall", Sched::Parallel),
-    // A thousand pointer packets paced from the host, with a settle sized for
-    // "QEMU coalescing rel events it has not been polled for".
-    ("metal_sim_pointer_churn", Sched::Serial),
-    // A window dragged by injected pointer packets. Its own boot rather than
-    // the desktop group's: it leaves the pointer somewhere else and a window
-    // in a different place than it found them, and it is a conversation typed
-    // from the host, which is what makes every other one of those serial.
+    // A thousand pointer packets paced from the host, and not one assertion on
+    // when any of them arrived: the settles are 400 ms against a driver that
+    // acts in microseconds, both liveness loops run to 20 s, and the three
+    // verdicts are a count of bound sources, a frame batch above the taskbar's
+    // two, and a desktop still painting afterwards.
+    ("metal_sim_pointer_churn", Sched::Parallel),
+    // A window dragged by injected pointer packets, and the exact opposite of
+    // the churn above on the one question that decides this: here each packet's
+    // effect has to be on screen before the next is sent. The press that starts
+    // the drag must land on a title bar the previous motion put under the
+    // cursor, and the drag's displacement is read back as a coordinate — so a
+    // guest one batch behind aims at the content instead, which is a different
+    // verdict rather than a slower one. Watched to happen, on a compositor made
+    // slow on purpose. Its own boot too: it leaves the pointer somewhere else
+    // and the window in a different place than it found them.
     ("metal_sim_window_drag", Sched::Serial),
     // A host-measured drain rate with an 8 s ceiling on a 3.3 s expectation.
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
     ("metal_sim_null_audio", Sched::Serial),
     ("netd_connection_caps", Sched::Parallel),
+    // Serial: it measures netd's 2 s handshake deadline against the host's
+    // clock, and counts how many connections survived a 48 ms paced burst
+    // before that deadline could expire any of them. Both are wall-clock
+    // margins, which is the definition of [`Sched::Serial`].
+    ("netd_hostile_peer", Sched::Serial),
     ("foreign_disk_untouched", Sched::Parallel),
     ("boot_partition_identity", Sched::Parallel),
     ("double_fault_stack", Sched::Parallel),
+    // Its own boot, its own feature, and it drives the guest only through
+    // stdin — nothing it touches is shared with another test.
+    ("idle_stack_guard", Sched::Parallel),
     ("diskless_boot", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
     // Its whole assertion is that a keystroke injected from the host crossed a
@@ -223,34 +254,40 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // nothing to run — so a later member reads a console the previous one is
     // still draining into.
     //
-    // Serial for a second and separate reason: each is a wizard conversation
-    // typed from the host and its assertion is the transcript.
-    // `swiss_german_layout` taps twenty-eight sequences at 25 ms and compares
-    // the decoded string, `locale_detect` decides a layout from two presses,
-    // and the two surface tests carry every transition through a console or a
-    // compositor, a window and a terminal. A dropped keystroke is a different
-    // verdict, and nothing downstream can tell that from the defect each of
-    // them exists to catch.
-    ("swiss_german_layout", Sched::Serial),
-    ("locale_detect", Sched::Serial),
-    ("locale_detect_unrecognized", Sched::Serial),
+    // Each is a wizard conversation typed from the host, and that used to make
+    // them serial on the grounds that a dropped keystroke reads like the defect
+    // they exist to catch. What actually drops a keystroke is the *device*
+    // queue, not the host's clock: QEMU's PS/2 controller holds sixteen bytes
+    // and none of these conversations puts more than a handful in flight before
+    // waiting on what the guest printed back. Every wait here is `serial_until`
+    // against a marker with a twenty-second ceiling, so a slower guest is a
+    // slower test and not a different verdict — which is the same argument
+    // `i8042_kbd_echo` has run on at width 4 since the phase landed.
+    ("swiss_german_layout", Sched::Parallel),
+    ("locale_detect", Sched::Parallel),
+    ("locale_detect_unrecognized", Sched::Parallel),
     // The wizard on the two surfaces the machine actually has, rather than on
     // the stand-in `locale_gate` is. Each costs a boot of a different image.
-    ("console_locale_detect", Sched::Serial),
-    ("desktop_locale_detect", Sched::Serial),
-    // A conversation typed from the host, like the four above, and it reads a
-    // counter the compositor only prints from a composited frame.
-    ("desktop_typing_damage", Sched::Serial),
+    ("console_locale_detect", Sched::Parallel),
+    ("desktop_locale_detect", Sched::Parallel),
+    // Typing at the same desktop, measured rather than transcribed: it waits
+    // for its eight echoes instead of asserting how many arrived in a window,
+    // so a guest that is slow costs seconds and not a verdict, and the verdict
+    // itself is a fraction of the screen that no amount of load moves.
+    ("desktop_typing_damage", Sched::Parallel),
     // Two boots of one machine compared on the guest's own `Boot: complete`
     // with a 300 ms allowance, which is the whole assertion.
     ("i8042_absent", Sched::Serial),
     ("i8042_quarantine", Sched::Parallel),
     ("i8042_budget_expiry", Sched::Parallel),
-    ("i8042_fadt_denial", Sched::Serial),
+    ("i8042_fadt_denial", Sched::Parallel),
     ("i8042_kbd_echo", Sched::Parallel),
     ("i8042_undecoded_bytes", Sched::Parallel),
-    // Its verdict is a cadence, and its absence is the assertion.
-    ("i8042_health_cadence", Sched::Serial),
+    // Its verdict is a cadence, and its absence is the assertion — both read
+    // off the guest's own `last byte at Nms` stamps. The gap it injects is
+    // 3 s against a 500 ms period, so six periods of margin decide whether the
+    // report is on the pin or on a timer.
+    ("i8042_health_cadence", Sched::Parallel),
     ("xhci_xecp_walk", Sched::Parallel),
     ("xhci_slot_exhaustion", Sched::Parallel),
     ("usb_storage_gate", Sched::Parallel),
@@ -260,21 +297,42 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("usb_flush_optional", Sched::Parallel),
     ("xhci_deaf_registers", Sched::Parallel),
     // Mirrors the kernel's `SLOW_CONNECT_NS` as a constant of its own and
-    // bounds the first port line from *both* sides.
+    // bounds the first port line from *both* sides. Both instants are the
+    // guest's own, and it is still serial: the *injection window* is 300 ms of
+    // guest **boot** time, so a guest that lost its share of the host reaches
+    // its controller after the ports have stopped lying and the gate refuses to
+    // certify — `the controller started at 0.366 s, past the 0.3 s the ports are
+    // held empty for`, measured at width 4 with four other worktrees' suites up.
+    // That is the test declining to measure nothing, which is correct, and a red
+    // all the same. The fix it asks for is the kernel's: anchor the window on
+    // the controller's own reset rather than on boot, which is where a real root
+    // hub's detection delay starts anyway.
     ("xhci_slow_connect", Sched::Serial),
     ("xhci_portsc_rw1c", Sched::Parallel),
     ("usb_transport_break", Sched::Parallel),
     ("xhci_full_speed_device", Sched::Parallel),
-    // The three below stage plug and unplug against debounce windows, from the
-    // host, with fixed waits between the injection and the assertion.
-    ("xhci_hotplug", Sched::Serial),
+    // Two of the three below stage plug and unplug with fixed waits, and both
+    // waits are 600-800 ms against a 100 ms debounce the driver finishes in
+    // microseconds under TCG — a margin, not a race, and every verdict either
+    // makes is a count of what the guest logged.
+    ("xhci_hotplug", Sched::Parallel),
+    // `xhci_flap` is the one that genuinely races the host against the guest:
+    // its two QMP writes have to land inside *one* 100 ms debounce or the state
+    // under test never happens, and it says so — `no replug collapsed inside a
+    // debounce, so this run never staged the race`. A host that delays the
+    // second write past 100 ms turns a green machine red with that sentence,
+    // which is indistinguishable from the driver defect it hunts.
     ("xhci_flap", Sched::Serial),
-    ("xhci_hid_break", Sched::Serial),
+    ("xhci_hid_break", Sched::Parallel),
     ("xhci_descriptor_walk", Sched::Parallel),
     ("esp_filesystem", Sched::Parallel),
     ("toybox_cp_volume", Sched::Parallel),
     ("kernel_log_file", Sched::Parallel),
-    // `xhci_slow_connect`'s shape against the disk's port.
+    // `xhci_slow_connect`'s shape against the disk's port, and serial for the
+    // same reason and not by association: it shares `SLOW_CONNECT_NS`, so a boot
+    // that outgrows the window binds the disk in the port scan and it reports
+    // `the boot scan bound a disk, so the port was not held empty`. Same
+    // measurement, same afternoon.
     ("late_storage_connect", Sched::Serial),
     ("log_backing_read_error", Sched::Parallel),
     ("log_partition_layout", Sched::Parallel),
@@ -2679,9 +2737,15 @@ fn compositor_screen_px(console: &str) -> Result<u64, String> {
 /// The compositor claims a firmware framebuffer and says what it got; netd finds
 /// no NIC and exits rather than panic; soundd finds no audio device and stays up
 /// on a null sink rather than exiting (hardware absence is a routing state — a
-/// no-device machine still serves audio clients, discarding what they play). The
-/// earlier version read the bottom pixel row instead, which says nothing about
-/// soundd or netd and stayed green with their graceful behavior reverted.
+/// no-device machine still serves audio clients, discarding what they play); and
+/// sshd, which has no device of its own, finds no netd to bind through and says
+/// so instead of dumping a tokio backtrace across the boot. The earlier version
+/// read the bottom pixel row instead, which says nothing about any of them and
+/// stayed green with their graceful behavior reverted.
+///
+/// **All four are init's children and nothing supervises them**, so the message
+/// is the entire diagnostic and its absence is the whole defect — which is why
+/// each is asserted by its own text rather than by anything surviving.
 ///
 /// First in its group, and that is the assertion talking: `cursor == frames`
 /// and the stats line are read off a desktop no client has connected to yet.
@@ -2689,10 +2753,11 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
     // init spawns all four programs without waiting, so test-runner's
     // ready marker races the daemons' own lines. Keep draining until
     // every line has been said or the window closes.
-    const WANT: [&str; 3] = [
+    const WANT: [&str; 4] = [
         "compositor: ready",
         "soundd: no audio device, presenting a null sink",
         "netd: no NIC on this machine, exiting",
+        "sshd: no network on this machine, exiting",
     ];
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while std::time::Instant::now() < deadline
@@ -3440,17 +3505,25 @@ fn desktop_typing_damage() -> Result<(), String> {
             thread::sleep(Duration::from_millis(250));
         }
     }
-    if !serial_until(&mut qemu, &mut log, NONCE, Duration::from_secs(10)) {
-        return Err(format!("the typed line never came back out of the shell:\n{log}"));
+    // Wait for the eight echoes rather than count how many arrived inside a
+    // window. A guest that is slow has typed the same eight characters and
+    // damaged the same cells; only the wall clock differs, and a verdict that
+    // read the clock here would be a verdict about the host's load.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && log[before..].matches(NONCE).count() < 16 {
+        log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
     }
     log.push_str(&qemu.drain_serial(Duration::from_secs(3)));
 
     let typed = &log[before..];
+    // Sixteen: the shell echoes the command as it is typed and again as its
+    // output, so eight lines are sixteen appearances. Counting the echo alone
+    // would pass on a terminal that painted the keystrokes and never ran them.
     let echoes = typed.matches(NONCE).count();
-    if echoes < 8 {
+    if echoes < 16 {
         return Err(format!(
-            "{echoes} of the eight typed lines reached the shell, so most of what this measures \
-             never happened:\n{typed}"
+            "{echoes} of the sixteen appearances the eight typed lines owe reached the console, \
+             so most of what this measures never happened:\n{typed}"
         ));
     }
     let mut biggest = 0;
@@ -3469,8 +3542,8 @@ fn desktop_typing_damage() -> Result<(), String> {
         ));
     }
     eprintln!(
-        "  [desktop] {echoes} lines typed; biggest frame {biggest} of {screen_px} px over \
-         {intervals} intervals"
+        "  [desktop] eight lines typed, {echoes} appearances; biggest frame {biggest} of \
+         {screen_px} px over {intervals} intervals"
     );
     Ok(())
 }
@@ -4077,6 +4150,7 @@ fn run_machine_test(
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
+        "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
@@ -6255,6 +6329,94 @@ fn run_machine_test(
             eprintln!("  [netcase] netd cap {declared} piped connections, {granted} accepted then refused");
             Ok(())
         }
+        "netd_hostile_peer" => {
+            // The netcase boot again, and for the same reason: netd's `main`
+            // returns on a machine with no NIC, so this is the only config
+            // where there is a daemon to be hostile to.
+            //
+            // The guest carries every verdict that needs a deadline on it —
+            // only it can tell a netd that answered from a netd that never
+            // did. The host carries the half the guest cannot see: whether
+            // netd *named* what it got rid of. A daemon that drops clients
+            // silently is one this machine cannot be asked about afterwards,
+            // which is the whole argument for the log lines.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/netcase");
+            let bins: Vec<(String, Vec<u8>)> = rust_bins
+                .iter()
+                .filter(|(name, _)| name == "netd_hostile_peer")
+                .cloned()
+                .collect();
+            if bins.is_empty() {
+                return Err("netd_hostile_peer was not built".to_string());
+            }
+            let options = BootOptions {
+                profile: qemu::Profile::Headless,
+                ..Default::default()
+            };
+            if !qemu::profile_argv(&options).iter().any(|a| a.contains("virtio-net")) {
+                return Err("this test needs a NIC and the profile has none".to_string());
+            }
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
+            let mut console = qemu.boot_log().to_string();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline && !console.contains("netd: ready, at most ") {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            if !console.contains("netd: ready, at most ") {
+                return Err(format!("netd never came up on a machine with a NIC:\n{console}"));
+            }
+
+            let result = qemu.run_test("test_rs_netd_hostile_peer", Duration::from_secs(120));
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            if result.exit_code != Some(0) {
+                return Err(format!(
+                    "netd_hostile_peer exited {:?}:\n{}",
+                    result.exit_code, result.stdout
+                ));
+            }
+
+            // The guest's own case list, restated here so a case deleted on
+            // one side is a red run rather than a quieter test.
+            const CASES: usize = 6;
+            let Some(refused) = result
+                .stdout
+                .split("hostile peer: ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return Err(format!(
+                    "netd_hostile_peer printed no count:\n{}",
+                    result.stdout
+                ));
+            };
+            if refused != CASES {
+                return Err(format!(
+                    "netd refused {refused} malformed frames, not {CASES}:\n{}",
+                    result.stdout
+                ));
+            }
+
+            // `TestResult::serial` is everything the console carried while the
+            // guest ran, netd's own lines included — the daemon and the test
+            // share one window (known-issues §6), which here is what makes the
+            // daemon's side of the story readable at all.
+            console.push_str(&result.serial);
+            for named in ["netd: dropping pid", "netd: refusing pid"] {
+                if !console.contains(named) {
+                    return Err(format!(
+                        "netd got rid of clients without a `{named}` line — a daemon that \
+                         drops peers silently cannot be asked what happened:\n{console}"
+                    ));
+                }
+            }
+            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+            eprintln!("  [netcase] {refused} hostile frames refused, netd named every peer it dropped");
+            Ok(())
+        }
         "metal_sim_input" => {
             // M2's exit criterion, on the machine shape and the kernel that
             // get flashed: no virtio device, no USB HID — so the i8042 is the
@@ -6781,6 +6943,41 @@ struct Outcome {
     elapsed: Duration,
 }
 
+/// The task that would run `name` again, by itself.
+///
+/// **Every red from the parallel phase is re-run alone**, and the two possible
+/// answers are both findings. Same verdict: the defect is real and the width had
+/// nothing to do with it. Green: the test is red only when it shares the host,
+/// which makes its [`Sched::Parallel`] wrong — a bug in this file, not in the
+/// kernel, and one the suite has no other way to notice.
+///
+/// **A green retry does not turn the run green.** A rerun-only pass counting as
+/// a pass is `specs/test-cost-audit.md` §3.7 by the back door; the failure line
+/// says which of the two it was and the run stays red until somebody fixes the
+/// classification. That is the whole safety argument for widening the parallel
+/// phase: getting a scheduling answer wrong costs a red run, never a quiet one.
+///
+/// A group member is re-run **as its group**, not on its own, so that the only
+/// thing that changed between the two attempts is how many guests the host had.
+fn retry_task<'a>(name: &str, all_tests: &[&'a TestDef]) -> Option<Task<'a>> {
+    if let Some(def) = all_tests.iter().find(|t| t.name == name) {
+        return Some(Task::Shared(vec![def]));
+    }
+    if let Some((registered, _)) = SCREEN_TESTS.iter().find(|(n, _)| *n == name) {
+        return Some(Task::Screen(registered));
+    }
+    let (registered, _) = MACHINE_TESTS.iter().find(|(n, _)| *n == name)?;
+    let names = match group_of(registered) {
+        None => vec![*registered],
+        Some(group) => MACHINE_TESTS
+            .iter()
+            .filter(|(n, _)| group_of(n) == Some(group))
+            .map(|(n, _)| *n)
+            .collect(),
+    };
+    Some(Task::Machine(names))
+}
+
 /// The binaries and config every task boots with.
 struct Bins<'a> {
     test_config: &'a Path,
@@ -6839,6 +7036,82 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
             send(name.to_string(), outcome.err(), start.elapsed());
         }
     }
+}
+
+impl Task<'_> {
+    /// Every name this task will report an outcome for.
+    fn names(&self) -> Vec<&str> {
+        match self {
+            Task::Shared(tests) => tests.iter().map(|t| t.name.as_str()).collect(),
+            Task::Machine(names) => names.to_vec(),
+            Task::Screen(name) => vec![name],
+        }
+    }
+}
+
+/// Where the last run in this worktree left what each test cost it.
+///
+/// Under `target/`, so it is per-worktree and never committed: it is a *hint*
+/// about how to order a queue and never an input to a verdict. A wrong number
+/// costs some idle lane time; a missing one costs nothing at all.
+fn durations_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-durations")
+}
+
+fn load_durations() -> BTreeMap<String, Duration> {
+    let mut out = BTreeMap::new();
+    let Ok(text) = fs::read_to_string(durations_path()) else { return out };
+    for line in text.lines() {
+        if let Some((name, ms)) = line.rsplit_once(' ') {
+            if let Ok(ms) = ms.parse::<u64>() {
+                out.insert(name.to_string(), Duration::from_millis(ms));
+            }
+        }
+    }
+    out
+}
+
+/// Merge this run's durations into the recorded profile.
+///
+/// Merged rather than replaced, because a filtered run knows about four tests
+/// and would otherwise throw away what the last full one measured.
+fn save_durations(mut known: BTreeMap<String, Duration>, timed: &[(String, Duration)]) {
+    for (name, elapsed) in timed {
+        known.insert(name.clone(), *elapsed);
+    }
+    let body: String =
+        known.iter().map(|(n, d)| format!("{n} {}\n", d.as_millis())).collect();
+    let path = durations_path();
+    let tmp = path.with_extension("tmp");
+    if fs::create_dir_all(path.parent().expect("target/ has a parent")).is_ok()
+        && fs::write(&tmp, body).is_ok()
+    {
+        let _ = fs::rename(&tmp, &path);
+    }
+}
+
+/// Longest job first, on what the last run measured.
+///
+/// A phase's wall clock is `max(sum / width, longest job)`, and FIFO reaches the
+/// first term only if no long job is dispatched late. Declaration order puts the
+/// feature-carrying tests last — deliberately, to keep the kernel rebuilds
+/// together — which is exactly the worst order for a wide phase: `xhci_hid_break`
+/// and `xhci_deaf_registers` are two of the three longest jobs in the suite and
+/// both sit in the last quarter of `MACHINE_TESTS`.
+///
+/// **The profile is measured, not declared**, because the alternative is a
+/// hand-maintained list of long tests — a second registration to keep true, and
+/// one nothing would notice going stale. A name the file has never seen sorts
+/// first, so a new test is assumed long until it has been timed once: the cost of
+/// being wrong that way is one lane starting a short job early.
+fn longest_first(tasks: &mut [Task<'_>], known: &BTreeMap<String, Duration>) {
+    let cost = |task: &Task<'_>| -> Duration {
+        task.names()
+            .iter()
+            .map(|n| known.get(*n).copied().unwrap_or(Duration::MAX))
+            .fold(Duration::ZERO, |a, b| a.saturating_add(b))
+    };
+    tasks.sort_by_key(|task| std::cmp::Reverse(cost(task)));
 }
 
 /// Run `tasks` on `width` workers, printing each outcome as it lands.
@@ -7155,15 +7428,54 @@ fn main() {
         }
     };
 
+    // Every red the wide phase produced, re-run by itself before anything is
+    // believed about it. See [`retry_task`] for why both answers are findings
+    // and why neither turns the run green.
+    let known = load_durations();
+    let mut timed: Vec<(String, Duration)> = Vec::new();
+    let mut wide_reds: Vec<String> = Vec::new();
     if !parallel.is_empty() {
+        longest_first(&mut parallel, &known);
         eprintln!("  --- parallel, {width} wide ---");
-        record(run_phase(parallel, width, &bins));
+        let started = std::time::Instant::now();
+        let outcomes = run_phase(parallel, width, &bins);
+        eprintln!("  --- parallel done in {:.1?} ---", started.elapsed());
+        wide_reds.extend(
+            outcomes.iter().filter(|o| o.reason.is_some()).map(|o| o.name.clone()),
+        );
+        timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
+        record(outcomes);
     }
     if !serial.is_empty() {
         eprintln!("  --- serial ---");
-        record(run_phase(serial, 1, &bins));
+        let started = std::time::Instant::now();
+        let outcomes = run_phase(serial, 1, &bins);
+        eprintln!("  --- serial done in {:.1?} ---", started.elapsed());
+        timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
+        record(outcomes);
     }
     qemu::set_width(1);
+    save_durations(known, &timed);
+
+    if !wide_reds.is_empty() {
+        eprintln!("  --- re-running {} wide failure(s) alone ---", wide_reds.len());
+        for name in &wide_reds {
+            let Some(task) = retry_task(name, &tests_to_run) else {
+                eprintln!("  ALONE {name}: no way to run it by itself; verdict stands");
+                continue;
+            };
+            let outcomes = run_phase(vec![task], 1, &bins);
+            let verdict = outcomes.iter().find(|o| &o.name == name);
+            match verdict.map(|o| o.reason.is_some()) {
+                Some(false) => eprintln!(
+                    "  ALONE {name}: GREEN — it fails only beside other guests, so its \
+                     Sched::Parallel is wrong. The run stays red on the classification."
+                ),
+                Some(true) => eprintln!("  ALONE {name}: red again — the defect is real."),
+                None => eprintln!("  ALONE {name}: the lone run reported nothing about it"),
+            }
+        }
+    }
 
     // Gate A, alone. `tests/audio-baseline.toml`'s numbers were recorded with
     // one QEMU on the host and no concurrent agents, so a run beside anything

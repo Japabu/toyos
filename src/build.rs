@@ -310,61 +310,71 @@ fn build_and_assemble(
         }
     }
 
-    if !workspace_packages.is_empty() {
-        let mut extra: Vec<&str> = Vec::new();
-        if profile == "release" {
-            extra.push("--release");
-        }
-        for pkg in &workspace_packages {
-            extra.push("-p");
-            extra.push(pkg);
-        }
-        cargo_build(
-            &userland_dir,
-            "x86_64-unknown-toyos",
-            &extra,
-            path_env,
-            &[],
-            quiet,
-        );
-    }
-
-    for (name, cfg) in &standalone {
-        let crate_dir = cfg.crate_dir(root, name);
-        let mut extra: Vec<&str> = Vec::new();
-        if profile == "release" {
-            extra.push("--release");
-        }
-        if cfg.no_default_features {
-            extra.push("--no-default-features");
-        }
-        cargo_build(
-            &crate_dir,
-            "x86_64-unknown-toyos",
-            &extra,
-            path_env,
-            &[],
-            quiet,
-        );
-    }
-
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
     let ws_target = userland_dir.join(format!("target/x86_64-unknown-toyos/{profile}"));
 
-    for (name, cfg) in &config.programs {
-        let binary = if cfg.is_workspace_member() {
-            ws_target.join(name)
-        } else {
-            let crate_dir = cfg.crate_dir(root, name);
-            crate_dir.join(format!("target/x86_64-unknown-toyos/{profile}/{name}"))
-        };
-        let data =
-            fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));
-        initrd_files.push((format!("bin/{name}"), data));
-    }
+    // Build and read under one hold, exactly as `build_toyos_bins` does and for
+    // the same reason: a program's path is keyed on (crate, target, profile)
+    // alone, so every config in this run writes and reads the same
+    // `userland/target/.../toybox`. Cargo's own lock orders the two *builds* and
+    // says nothing about a read between them — `ioapic_topology` died on
+    // `Failed to read binary for toybox` while another worker's config was
+    // relinking it, and was green the moment it was re-run alone.
+    {
+        let _artifact = buildlock::artifact(root);
+        if !workspace_packages.is_empty() {
+            let mut extra: Vec<&str> = Vec::new();
+            if profile == "release" {
+                extra.push("--release");
+            }
+            for pkg in &workspace_packages {
+                extra.push("-p");
+                extra.push(pkg);
+            }
+            cargo_build(
+                &userland_dir,
+                "x86_64-unknown-toyos",
+                &extra,
+                path_env,
+                &[],
+                quiet,
+            );
+        }
 
-    if config.hosted_rustc {
-        collect_hosted_rustc(root, &mut initrd_files);
+        for (name, cfg) in &standalone {
+            let crate_dir = cfg.crate_dir(root, name);
+            let mut extra: Vec<&str> = Vec::new();
+            if profile == "release" {
+                extra.push("--release");
+            }
+            if cfg.no_default_features {
+                extra.push("--no-default-features");
+            }
+            cargo_build(
+                &crate_dir,
+                "x86_64-unknown-toyos",
+                &extra,
+                path_env,
+                &[],
+                quiet,
+            );
+        }
+
+        for (name, cfg) in &config.programs {
+            let binary = if cfg.is_workspace_member() {
+                ws_target.join(name)
+            } else {
+                let crate_dir = cfg.crate_dir(root, name);
+                crate_dir.join(format!("target/x86_64-unknown-toyos/{profile}/{name}"))
+            };
+            let data =
+                fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));
+            initrd_files.push((format!("bin/{name}"), data));
+        }
+
+        if config.hosted_rustc {
+            collect_hosted_rustc(root, &mut initrd_files);
+        }
     }
 
     if !config.assets.is_empty() {
