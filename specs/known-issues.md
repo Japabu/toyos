@@ -941,11 +941,12 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
-### OPEN — a spawned child sometimes never starts, and every stuck terminal in the T14 session is downstream of one
+### OPEN, ASSIGNED (#142) — a spawned process sometimes never starts, and every stuck terminal in the T14 session is downstream of one
 
-Owner-reported (task #141) and read off his 950 s session log. **It is one
+Owner-reported (task #141) and read off two T14 session logs. **It is one
 defect, not the two it looked like from the symptoms**, plus a second
-independent one in a fork (below).
+independent one in a fork (below). The investigation is the scheduler agent's;
+what is here is the evidence and the eliminations, so it is not re-derived.
 
 **What the log establishes.** `/bin/ls` was spawned twelve times. Ten exited
 `code=0` in 12–59 ms. Two — pid 10 at 692.459 s and pid 26 at 904.327 s —
@@ -988,28 +989,34 @@ draining it, a shell role whose stdio is those pipes, spawning `/bin/ls /bin`
 with `Stdio::inherit()` and waiting with a 2 s per-child ceiling — ran **120
 children in the shared boot (smp=2) and 120 more on a dedicated smp=8 boot,
 and every one of them started and exited.** The T14 has eight CPUs, so the
-CPU count was the first fidelity gap closed and it was not enough. What is
-still untried is the same chain *under a live compositor and a real
-`/bin/terminal`*, which `tests/metalcase` cannot boot today — its initrd
-carries no terminal, shell or toybox.
+CPU count was the first fidelity gap closed and it was not enough. The chain
+*under a live compositor and a real `/bin/terminal`* was the next fidelity step
+and was **not** taken: `tests/metalcase`'s initrd carries no terminal, shell or
+toybox, and five other tests share that boot.
 
-**The measurement that would decide it, and it costs the owner one command.**
-Run `ps` from a working terminal while an `ls` is hung. The state column
-separates the three live hypotheses outright:
+**The measurement meant to decide it was `ps` — and `ps` is a victim.** The
+plan was to read the hung child's state column (`userland/toybox/src/ps.rs:72`)
+and split three ways: `R` with no CPU is a task nothing ever picked up, `S`
+with no CPU is one that blocked before its first user instruction, and any CPU
+at all moves the fault into userland startup. The owner ran it on the T14
+during boot 10 of `boot5-doom-wedge.log` and **`ps` pid 17 printed nothing and
+never exited**, and neither did `/bin/shutdown` pid 25 or three `doom`s. In
+that whole boot the only processes that ever exited were `netd` and one
+`locale`.
 
-- `R` with CPU `0.000` — the task is runnable and has never been picked up: a
-  scheduler enqueue or kick defect, which is the one the eight idle cores make
-  plausible.
-- `S` with CPU `0.000` — it blocked before executing any user instruction:
-  something on the kernel-side startup path (demand paging its text, TLS).
-- CPU above zero — it ran and then blocked, so the hang is in userland startup
-  and the fault is `std`'s or toybox's.
+That is an answer rather than a lost measurement, and it is worth more than the
+column would have been: **it strikes a fresh process before it can write a
+byte, whatever the program is** — `ls`, `rustc`, `ps`, `shutdown`, `doom` — so
+nothing about `ls`'s own I/O path is involved. Meanwhile the per-CPU `parked`
+counters climb 1 → 2 → 3 as victims accumulate, `ready` is 0 on every report,
+and the kernel logs to the end.
 
-`ps` reports exactly these (`userland/toybox/src/ps.rs:72`), and the hung
-process persists for the rest of the session, so there is no race to catch.
-Ctrl+Alt+D is the weaker second-best: `dump_blocked` lists parked threads on
-the calling CPU only (`kernel/src/scheduler.rs:559`), so it can confirm a park
-but cannot rule one out.
+Investigation is the scheduler agent's (#142); the shapes are consistent with
+one defect. Ctrl+Alt+D remains available and is weaker: `dump_blocked` lists
+parked threads on the calling CPU only (`kernel/src/scheduler.rs:559`), so it
+can confirm a park but not rule one out — though with `parked` rising on
+several CPUs at once it may now be worth taking on whichever CPU services the
+i8042.
 
 ### OPEN — a `winit` app spins forever when its window is closed, and never exits
 
