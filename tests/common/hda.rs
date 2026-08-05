@@ -64,7 +64,15 @@ pub fn hda_probe(
     // QEMU publishes no RMRR at all (`iommu-spec.md` §8), so this arm is the
     // *absence* and the T14 is the first machine that can produce the other.
     must_say(&multifunction, "hda: (a) rmrr none", MULTIFUNCTION)?;
-    must_say(&multifunction, "hda: (a) unit=", MULTIFUNCTION)?;
+    // `scoped-by=device-scope` rather than the catch-all, and this one has
+    // ground truth beside it: QEMU's DMAR really does publish a `pci-endpoint`
+    // scope per function, which the *other* decoder of the same table prints as
+    // `iommu: unit0 scope pci-endpoint 00:10.0`. Two independent readers
+    // agreeing on one firmware table is what makes the walk checked rather than
+    // cited — and it is what would catch a claim that fell through to
+    // `include-pci-all` because the path decode was wrong.
+    must_say(&multifunction, "hda: (a) unit=0 scoped-by=device-scope", MULTIFUNCTION)?;
+    log.must_say(&format!("iommu: unit0 scope pci-endpoint {MULTIFUNCTION}"))?;
 
     // `intel-hda` offers `msi=<OnOffAuto>` and no MSI-X option, measured with
     // `-device intel-hda,help` on this host. So the eligible-by-MSI arm is the
@@ -75,6 +83,23 @@ pub fn hda_probe(
 
     must_say(&multifunction, BAR0_BYTES, MULTIFUNCTION)?;
     must_say(&multifunction, "64bit=n prefetch=n movable=y", MULTIFUNCTION)?;
+    // The neighbour scan is the part of (a) that decides whether
+    // `userspace-drivers-spec.md` stage 3's relocation is load-bearing, and on
+    // this machine firmware packs every small register window into one 2 MiB
+    // page — so a zero here means the scan found nothing rather than that
+    // nothing is there, and the assertion would be vacuous without it.
+    let neighbours = lines(&multifunction, "hda: bar0 shares its 2 MiB page with ");
+    if neighbours.is_empty() {
+        return Err(format!(
+            "nothing shares {MULTIFUNCTION}'s 2 MiB page, on a machine whose BARs are all packed \
+             into one — the scan found nothing:\n{multifunction}"
+        ));
+    }
+    must_say(
+        &multifunction,
+        &format!("2m-page-neighbours={}", neighbours.len()),
+        MULTIFUNCTION,
+    )?;
 
     // `ECAP.SC` on the unit, which §4.4 item 4 spends to avoid a config-space
     // write path. QEMU's `snoop-control` is off unless asked for and no profile
@@ -113,7 +138,7 @@ pub fn hda_probe(
     // codec's own answer.
     for want in [
         "hda: codec0 fg=",
-        "type=audio",
+        "(audio)",
         "hda: codec0 node=",
         "(audio-out)",
         "(pin)",
@@ -132,6 +157,19 @@ pub fn hda_probe(
         }
     }
     eprintln!("  [hda] {} pin complexes dumped on {MULTIFUNCTION}", pins.len());
+
+    // **QEMU cannot stage a speaker pin.** `hda-output` and `hda-duplex` fix
+    // their configuration defaults in the device model — there is no property
+    // for it — and both report line-out. So the arm this harness runs is §2.3's
+    // *refusal*, and the arm where a traversal has a candidate is the T14's to
+    // produce. Asserting the refusal is what keeps that honest: a probe that
+    // called a line-out pin a speaker would go green on the sentence below.
+    must_say(&multifunction, "hda: (c) pins reporting a speaker default device: 0", MULTIFUNCTION)?;
+    must_say(&multifunction, "would refuse this machine", MULTIFUNCTION)?;
+
+    // Every class-0403 function, not the first — the defect `pci.rs` records
+    // one layer down and §2.3 records one layer up.
+    log.must_say("hda: 3 class 0403 functions on this machine")?;
 
     // The probe finished. On a machine with no serial port a probe that hung
     // is a black screen, so this is the assertion the whole design is for —
