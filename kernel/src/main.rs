@@ -374,6 +374,18 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let hpet_base = acpi::find_hpet_base(kernel_args.rsdp_addr)
         .expect("ACPI: HPET not found");
     clock::init(hpet_base);
+    // Straight after the monotonic clock it is anchored to, and before anything
+    // that stamps a file or serves a clock syscall. Two questions the RTC's own
+    // registers cannot answer come from elsewhere: the FADT says where the
+    // century digit is, and firmware said what zone the thing keeps.
+    let century_reg = match acpi::rtc_century_register(kernel_args.rsdp_addr) {
+        Ok(reg) => reg,
+        Err(e) => {
+            log!("ACPI: the FADT is unreadable ({e:?}), so where the RTC keeps its century is unknown too");
+            None
+        }
+    };
+    clock::init_wall(century_reg, kernel_args.rtc_utc_offset());
     trace::enable();
     apic::init_timer();
 
