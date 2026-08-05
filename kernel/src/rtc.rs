@@ -154,9 +154,21 @@ fn read_registers(century_reg: Option<u8>) -> Result<Registers, RtcFault> {
         day: cmos_read(DAY),
         month: cmos_read(MONTH),
         year: cmos_read(YEAR),
-        century: century_reg.map(cmos_read),
+        century: century_reg.map(century_read),
         status_b: cmos_read(STATUS_B),
     })
+}
+
+/// The century register the FADT named, at the index it named.
+///
+/// The actuator here answers the *next* century instead of what the register
+/// holds, which is the only way to see the register's contents reach the year.
+/// QEMU maintains the clock registers from `-rtc base=` and leaves CMOS 0x32
+/// alone at whatever firmware last wrote — measured: a guest booted at 2101
+/// reads century 20 and year 01, and reports 2001 — so the host can set every
+/// digit of the date except this one.
+fn century_read(reg: u8) -> u8 {
+    if cfg!(feature = "rtc-century-next") { 0x21 } else { cmos_read(reg) }
 }
 
 fn wait_for_update() -> Result<(), RtcFault> {
