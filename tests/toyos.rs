@@ -4360,15 +4360,16 @@ fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
         ));
     }
 
-    // Non-vacuity, and the case that motivated the whole run: at least one of
-    // the eight creators has to have been reaped before the compositor served
-    // its window, or nothing here exercised the grant that killed the desktop.
+    // Non-vacuity, and the case that motivated the whole run: the compositor
+    // has to have met a request from a pid the kernel no longer knows, or
+    // nothing here exercised the grant that killed the desktop. The guest
+    // orders that by construction — reap, then release the process holding the
+    // socket — so a run without this line is a defect and never a lost race.
     const VANISHED: &str = "the process behind it has exited";
-    let vanished = result.stdout.matches(VANISHED).count();
-    if vanished == 0 {
+    if !result.stdout.contains(VANISHED) {
         return Err(format!(
-            "eight clients asked for a window and died, and the compositor served every one of \
-             them before it noticed — this run proves nothing about the grant:\n{}",
+            "the compositor never met a request from a reaped creator, so this run says \
+             nothing about the grant:\n{}",
             result.stdout
         ));
     }
@@ -4393,15 +4394,11 @@ fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
     let console = format!("{}\n{after}", result.serial);
     serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
     eprintln!(
-        "  [metal-sim] {CASES} client deaths survived, {vanished} of {VANISHERS} creators \
-         vanished before their window, desktop still compositing"
+        "  [metal-sim] {CASES} client deaths survived, a reaped creator's request refused by \
+         name, desktop still compositing"
     );
     Ok(())
 }
-
-/// How many clients `compositor_client_death` kills mid-request. Restated from
-/// the guest so the report can say how many of them the compositor met dead.
-const VANISHERS: usize = 8;
 
 /// Run one machine-shape test. Like `run_screen_test`, each of these owns its
 /// QEMU — the machine shape *is* the test — except for the runs of adjacent
