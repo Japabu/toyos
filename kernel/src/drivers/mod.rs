@@ -14,6 +14,8 @@ pub mod virtio_net;
 pub mod virtio_sound;
 pub mod gop;
 pub mod panic_console;
+#[cfg(feature = "hda-probe")]
+pub mod hda_probe;
 
 use alloc::vec::Vec;
 use crate::mm::pmm::PhysPage;

@@ -180,6 +180,67 @@ pub fn init(rsdp_addr: u64, devices: &[PciDevice]) {
     }
 }
 
+/// [`crate::iommu::describe_device`]'s backend: which unit's scope claims a
+/// stream, and every reserved region naming it.
+///
+/// The claim rule is the specification's. A `DRHD` whose device scope names
+/// the stream owns it; failing that, the segment's `INCLUDE_PCI_ALL` unit is
+/// the catch-all. Answering "the last unit" or "unit 0" instead would be a
+/// number this file made up, and the whole value of this call is that it is
+/// firmware's answer.
+#[cfg(feature = "hda-probe")]
+pub(super) fn describe_device(rsdp_addr: u64, stream: StreamId) -> crate::iommu::DeviceFacts {
+    use crate::iommu::{DeviceFacts, ReservedRegion, UnitFacts};
+
+    let mut facts = DeviceFacts { unit: None, reserved: alloc::vec::Vec::new() };
+    let Ok(dmar) = Dmar::open(rsdp_addr) else { return facts };
+
+    let mut index = 0usize;
+    // The two candidates, each carried as the index the boot's own `iommu:
+    // unitN` lines use *and* the base its capabilities are read from — so the
+    // walk keeps two pairs rather than every unit's base for one lookup at the
+    // end. First of each wins: the specification requires the catch-all last,
+    // so a second unit claiming one stream is firmware contradicting itself.
+    let mut explicit: Option<(usize, u64)> = None;
+    let mut catch_all: Option<(usize, u64)> = None;
+    for structure in dmar.structures() {
+        match structure {
+            Ok(Structure::Drhd(drhd)) => {
+                if index == MAX_UNITS {
+                    break;
+                }
+                if names(drhd.scopes(), stream) {
+                    explicit = explicit.or(Some((index, drhd.register_base())));
+                } else if drhd.include_pci_all() {
+                    catch_all = catch_all.or(Some((index, drhd.register_base())));
+                }
+                index += 1;
+            }
+            // A reserved region binds only the devices its own scope names,
+            // and a machine's other RMRRs are not this device's problem.
+            Ok(Structure::Rmrr(rmrr)) if names(rmrr.scopes(), stream) => {
+                facts.reserved.push(ReservedRegion { base: rmrr.base(), limit: rmrr.limit() });
+            }
+            _ => {}
+        }
+    }
+
+    facts.unit = explicit.or(catch_all).and_then(|(index, base)| {
+        let regs = window(base)?;
+        let caps = Capabilities { cap: regs.read_u64(CAP_REG), ecap: regs.read_u64(ECAP_REG) };
+        Some(UnitFacts { index, explicit: explicit.is_some(), snoop_control: caps.snoop_control() })
+    });
+    facts
+}
+
+/// Whether any scope in this list names `stream` directly. A scope reached
+/// through a bridge carries no requester id (`Scope::stream_id`), so it cannot
+/// answer yes or no here and does not pretend to.
+#[cfg(feature = "hda-probe")]
+fn names(scopes: Scopes, stream: StreamId) -> bool {
+    scopes.flatten().any(|scope| scope.stream_id() == Some(stream))
+}
+
 /// A unit whose window decodes, with the capabilities it advertises and the
 /// state of its global command register.
 struct Unit {
@@ -217,27 +278,35 @@ impl Unit {
     }
 }
 
+/// Firmware's register base, mapped only if it is one.
+///
+/// The one address in the `DMAR` the kernel dereferences. A window that is not
+/// 4 KiB-aligned, or that is outside the architectural physical range, is not
+/// an address at all — never clamped to fit. A base pointing into usable RAM
+/// would read plausible garbage as a capability register, which costs a wrong
+/// log line and, from I2 on, a register write into somebody's heap.
+fn window(base: u64) -> Option<Mmio> {
+    if base == 0 || base % REGISTER_WINDOW != 0 || base >= MAX_PHYS {
+        return None;
+    }
+    Some(
+        crate::mm::paging::kernel()
+            .lock()
+            .as_mut()
+            .unwrap()
+            .map_mmio(base, REGISTER_WINDOW, CachePolicy::DeferToMtrr),
+    )
+}
+
 fn describe_unit(index: usize, drhd: &dmar::Drhd) -> Option<Unit> {
     let base = drhd.register_base();
-    // Firmware's number, and the one address in this table the kernel
-    // dereferences. A window that is not 4 KiB-aligned, or that is outside the
-    // architectural physical range, is refused by name — never clamped to fit.
-    // A base pointing into usable RAM would read plausible garbage as a
-    // capability register, which costs a wrong log line and, from this stage
-    // on, a register write into somebody's heap.
-    if base == 0 || base % REGISTER_WINDOW != 0 || base >= MAX_PHYS {
+    let Some(regs) = window(base) else {
         log!(
             "iommu: unit{index} register base {base:#x} is not a 4 KiB-aligned physical address \
              — not mapped"
         );
         return None;
-    }
-
-    let regs: Mmio = crate::mm::paging::kernel()
-        .lock()
-        .as_mut()
-        .unwrap()
-        .map_mmio(base, REGISTER_WINDOW, CachePolicy::DeferToMtrr);
+    };
 
     let version = regs.read_u32(VER_REG);
     // §2.2 row 2, and the one case here that is distinguishable from "no unit
@@ -255,7 +324,7 @@ fn describe_unit(index: usize, drhd: &dmar::Drhd) -> Option<Unit> {
     log!(
         "iommu: unit{index} @{base:#x} seg={} pci_all={} ver={}.{} cap={:#018x} ecap={:#018x} \
          aw={} sagaw={:#04x} mgaw={} nd={} sps2m={} cm={} psi={} nfr={} fro={:#x} qi={} ir={} \
-         eim={} pt={} coherent={}",
+         eim={} pt={} coherent={} sc={}",
         drhd.segment(),
         yn(drhd.include_pci_all()),
         (version >> 4) & 0xF,
@@ -282,6 +351,7 @@ fn describe_unit(index: usize, drhd: &dmar::Drhd) -> Option<Unit> {
         yn(caps.extended_interrupt_mode()),
         yn(caps.passthrough()),
         yn(caps.coherent()),
+        yn(caps.snoop_control()),
     );
 
     describe_scopes("unit", index, drhd.scopes());
@@ -594,6 +664,16 @@ impl Capabilities {
     /// `ECAP.EIM`: 32-bit APIC ids in interrupt remap table entries.
     fn extended_interrupt_mode(&self) -> bool {
         self.ecap & (1 << 4) != 0
+    }
+
+    /// `ECAP.SC`: a second-level page-table entry may carry the snoop-force
+    /// bit, which makes a device's DMA snoop the CPU cache whatever the device
+    /// itself requested. `specs/hda-driver-plan.md` §4.4 item 4 is why it is
+    /// read: an Intel HDA controller carries a vendor no-snoop control in its
+    /// config space, and setting this bit in every mapping makes that control
+    /// irrelevant — one layer down, with no config-write syscall.
+    fn snoop_control(&self) -> bool {
+        self.ecap & (1 << 7) != 0
     }
 
     /// `ECAP.PT`: a context entry may name passthrough translation, which is
