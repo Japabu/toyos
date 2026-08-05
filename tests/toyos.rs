@@ -100,6 +100,9 @@ const RUST_SKIP: &[&str] = &[
     "ipc_hostile_peer",
     // Same again: `metal_sim_compositor_stall` runs it.
     "compositor_stall",
+    // Same again, and it spawns copies of itself as clients that die:
+    // `metal_sim_client_death` runs it.
+    "compositor_client_death",
     // Same again, and it also needs a host injecting pointer packets:
     // `metal_sim_window_drag` runs it.
     "window_drag",
@@ -200,6 +203,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("metal_sim_window_caps", Sched::Parallel),
     ("metal_sim_ipc_hostile_peer", Sched::Parallel),
     ("metal_sim_compositor_stall", Sched::Parallel),
+    // Last of the group: it drops clients on purpose and its verdict is that
+    // the desktop outlived every one of them.
+    ("metal_sim_client_death", Sched::Parallel),
     // A thousand pointer packets paced from the host, and not one assertion on
     // when any of them arrived: the settles are 400 ms against a driver that
     // acts in microseconds, both liveness loops run to 20 s, and the three
@@ -2603,7 +2609,8 @@ fn group_of(name: &str) -> Option<&'static str> {
         | "metal_sim_scanout_wc"
         | "metal_sim_window_caps"
         | "metal_sim_ipc_hostile_peer"
-        | "metal_sim_compositor_stall" => Some(METAL_SIM_DESKTOP),
+        | "metal_sim_compositor_stall"
+        | "metal_sim_client_death" => Some(METAL_SIM_DESKTOP),
         "i8042_keyboard" | "i8042_no_spurious_wake" | "i8042_mouse" => Some(I8042_TRACE),
         _ => None,
     }
@@ -2627,13 +2634,14 @@ fn group_boot<'a>(
 }
 
 /// `tests/metalcase` on [`qemu::Profile::Metal`]: the T14's device shape with a
-/// compositor on the firmware framebuffer, carrying the three client binaries
-/// its members run.
+/// compositor on the firmware framebuffer, carrying the client binaries its
+/// members run.
 ///
-/// Those three and not the whole rust set — metalcase's initrd is four programs
-/// and the rest would add tens of megabytes to a boot that needs three of them.
+/// Those and not the whole rust set — metalcase's initrd is four programs and
+/// the rest would add tens of megabytes to a boot that needs these.
 fn boot_metal_sim_desktop(rust_bins: &[(String, Vec<u8>)]) -> QemuInstance {
-    const CLIENTS: [&str; 3] = ["window_caps", "ipc_hostile_peer", "compositor_stall"];
+    const CLIENTS: [&str; 4] =
+        ["window_caps", "ipc_hostile_peer", "compositor_stall", "compositor_client_death"];
     let missing: Vec<&str> = CLIENTS
         .iter()
         .copied()
@@ -4264,6 +4272,82 @@ fn metal_sim_compositor_stall(boot: &mut Boot) -> Result<(), String> {
     Ok(())
 }
 
+/// A client that dies, or asks for something the kernel refuses on its behalf,
+/// must cost the compositor that client and nothing else.
+///
+/// The guest half runs the cases and probes after each; this half asserts what
+/// the guest cannot see — that the desktop is still painting, and that the
+/// clients dropped along the way were named. A compositor that panics fails
+/// this at the probe, at the frame count and at the console check, which is
+/// what it should do.
+fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
+    let qemu = &mut boot.qemu;
+    let result = qemu.run_test("test_rs_compositor_client_death", Duration::from_secs(240));
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if result.exit_code != Some(0) {
+        return Err(format!(
+            "compositor_client_death exited {:?}:\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+    // The guest's own case list, restated here so a case deleted on one side
+    // is a red run rather than a quieter test.
+    const CASES: usize = 4;
+    if !result
+        .stdout
+        .contains(&format!("compositor client death: {CASES} deaths survived"))
+    {
+        return Err(format!(
+            "the guest did not report {CASES} survived deaths:\n{}",
+            result.stdout
+        ));
+    }
+
+    // Non-vacuity, and the case that motivated the whole run: at least one of
+    // the eight creators has to have been reaped before the compositor served
+    // its window, or nothing here exercised the grant that killed the desktop.
+    const VANISHED: &str = "the process behind it has exited";
+    let vanished = result.stdout.matches(VANISHED).count();
+    if vanished == 0 {
+        return Err(format!(
+            "eight clients asked for a window and died, and the compositor served every one of \
+             them before it noticed — this run proves nothing about the grant:\n{}",
+            result.stdout
+        ));
+    }
+
+    // Still painting once every case is behind it, on a capture that starts
+    // empty — so this counts frames produced *after* the last case. The
+    // compositor's reporting interval is 2 s.
+    let frames = |text: &str| text.matches("compositor: frames=").count();
+    let mut after = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && frames(&after) < 2 {
+        after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    if frames(&after) < 2 {
+        return Err(format!(
+            "the compositor reported {} frame batches in the 20 s after the last client died:\
+             \n{after}",
+            frames(&after)
+        ));
+    }
+
+    let console = format!("{}\n{after}", result.serial);
+    serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+    eprintln!(
+        "  [metal-sim] {CASES} client deaths survived, {vanished} of {VANISHERS} creators \
+         vanished before their window, desktop still compositing"
+    );
+    Ok(())
+}
+
+/// How many clients `compositor_client_death` kills mid-request. Restated from
+/// the guest so the report can say how many of them the compositor met dead.
+const VANISHERS: usize = 8;
+
 /// Run one machine-shape test. Like `run_screen_test`, each of these owns its
 /// QEMU — the machine shape *is* the test — except for the runs of adjacent
 /// names that share one through `held` (see [`group_boot`]).
@@ -4357,6 +4441,11 @@ fn run_machine_test(
         }
         "metal_sim_compositor_stall" => {
             metal_sim_compositor_stall(group_boot(held, METAL_SIM_DESKTOP, || {
+                boot_metal_sim_desktop(rust_bins)
+            }))
+        }
+        "metal_sim_client_death" => {
+            metal_sim_client_death(group_boot(held, METAL_SIM_DESKTOP, || {
                 boot_metal_sim_desktop(rust_bins)
             }))
         }

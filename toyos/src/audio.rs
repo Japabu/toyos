@@ -207,7 +207,10 @@ impl AudioStream {
 
         let slot_count = resp.slot_count as u32;
         let shm_size = AudioSlotHeader::SIZE + slot_count as usize * resp.client_period_bytes as usize;
-        let shm = SharedMemory::map(resp.shm_token, shm_size);
+        // The ring soundd says it granted. A token this process may not map is
+        // a daemon that did not open the stream it just said it opened.
+        let shm = SharedMemory::map(resp.shm_token, shm_size)
+            .map_err(|e| AudioError::Ipc(IpcError::Syscall(e)))?;
         let slot_writer = AudioSlotWriter::new(shm, resp.client_period_bytes, slot_count);
 
         let signal_fd = syscall::pipe_open(resp.signal_pipe_id, 0)
