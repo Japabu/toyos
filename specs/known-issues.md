@@ -988,6 +988,17 @@ the port reset were already moved off this path for exactly this reason (CLAUDE.
 USB hotplug); the control transfers inside `configure` and `recover_endpoints`
 were not. Until then, `retire_task`'s bound is measuring the USB bus.
 
+**And the budget cannot see it, twice over.** `cpu::MAX_PASS_NS` is asserted by
+`check_pass_duration`, which measures from `SchedPass::begin`'s `now` to the end
+of `finish()` — and `drain_irqs()` runs *before* `SchedPass::begin`. The
+prologue is outside the window the budget covers, so invariant P would report a
+200 µs pass while the CPU had been in the driver for two seconds. Separately,
+the assertion is behind `feature = "check"`, whose kernel switch is
+`sched-check` (`kernel/Cargo.toml:228`) — and **nothing in `src/` or `tests/`
+ever turns it on**, so invariant P has never executed against the kernel in any
+image or any test run. Both halves want fixing together: the measured window has
+to start where the scheduler entry starts, and the gate has to run somewhere.
+
 ### A spawned thread that never runs is invisible: `spawn:` does not record where it was placed
 
 From the T14 field log `boot5-doom-wedge.log` boot 10 (17:41, pre-fix image).
