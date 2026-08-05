@@ -657,9 +657,12 @@ identical and answer nothing.
 and a checkout usually holds somebody's uncommitted work.
 
 Flash, boot, and — **before pressing any other key** — press Mute, then Volume
-Down, then Volume Up. Then read `/log/kernel.log` off the stick on the Mac.
-Everything the probe says is a line beginning `hda:`, and the four verdict
-lines are `hda: (a)`, `(b)`, `(c)`, `(d)`.
+Down, then Volume Up. Then mount the stick's `TOYOS-LOG` partition on the Mac
+and read **this boot's own log file**: `/log` now holds one file per boot named
+for the wall clock (`2033-03-07-091426.log`), so take the newest, and a machine
+whose RTC would not answer writes `unknown-NN.log` instead. Everything the probe
+says is a line beginning `hda:`, and the four verdict lines are `hda: (a)`,
+`(b)`, `(c)`, `(d)`.
 
 #### (a) Handoff — what each answer means
 

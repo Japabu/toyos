@@ -61,6 +61,45 @@ pub struct KernelArgs {
     /// Naming the partition is all this does. Whether one with that GUID is on
     /// the disk is the kernel's question, and its answer there may well be no.
     pub log_partition_guid: [u8; 16],
+    /// Minutes to add to the CMOS RTC's own reading to get UTC, as firmware
+    /// reported it in `EFI_TIME::TimeZone`.
+    ///
+    /// The RTC's registers carry a wall clock and no zone, and no two operating
+    /// systems agree on which zone that is: a machine that has ever run Windows
+    /// keeps local time there, one that has only run Linux keeps UTC. Firmware
+    /// is the one party that both knows and can be asked, and `GetTime` is the
+    /// call — a *runtime* service, so it is asked here rather than in the
+    /// kernel, which never maps the runtime.
+    ///
+    /// UEFI's relation is `Localtime = UTC - TimeZone`, so a machine keeping
+    /// local time in UTC+2 reports -120 and the kernel adds -120 minutes to what
+    /// it reads off the CMOS.
+    pub rtc_utc_offset_minutes: i32,
+    /// Whether firmware answered the question above at all.
+    ///
+    /// Zero when `GetTime` failed, or reported `EFI_UNSPECIFIED_TIMEZONE`, or
+    /// named an offset outside the range its own spec gives the field. The
+    /// middle one is the ordinary state of a machine nothing has ever told its
+    /// zone to, and it is what OVMF ships. The kernel then treats the RTC as UTC
+    /// and says so, because with the one party that knows declining to answer
+    /// there is nothing else left to assume.
+    ///
+    /// A flag rather than a sentinel in the field above, for the same reason
+    /// [`Self::boot_partition_present`] is one: `0x7FF` is a value the *wire*
+    /// format defines, and carrying it inward would make every reader of this
+    /// struct know that.
+    pub rtc_utc_offset_known: u32,
+}
+
+impl KernelArgs {
+    /// Firmware's answer about the zone the RTC keeps, as one value.
+    ///
+    /// The two fields exist because this struct is a C layout shared by two
+    /// binaries; this is where they become the option they describe, and no
+    /// caller inward of here handles the pair.
+    pub fn rtc_utc_offset(&self) -> Option<i32> {
+        (self.rtc_utc_offset_known != 0).then_some(self.rtc_utc_offset_minutes)
+    }
 }
 
 /// The kernel's `_start` reads three of these fields out of `rdi` by hardcoded
@@ -83,7 +122,9 @@ const _: () = {
     assert!(offset_of!(KernelArgs, boot_partition_guid) == 160);
     assert!(offset_of!(KernelArgs, boot_partition_present) == 176);
     assert!(offset_of!(KernelArgs, log_partition_guid) == 180);
-    assert!(size_of::<KernelArgs>() == 200);
+    assert!(offset_of!(KernelArgs, rtc_utc_offset_minutes) == 196);
+    assert!(offset_of!(KernelArgs, rtc_utc_offset_known) == 200);
+    assert!(size_of::<KernelArgs>() == 208);
     assert!(align_of::<KernelArgs>() == 8);
 };
 

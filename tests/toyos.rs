@@ -389,6 +389,13 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("esp_filesystem", Sched::Parallel),
     ("toybox_cp_volume", Sched::Parallel),
     ("kernel_log_file", Sched::Parallel),
+    // Both own their images and their lanes, and neither verdict is a
+    // wall-clock margin: the guest's clock starts from an instant the host set
+    // and the only duration either measures is how long a boot takes to reach
+    // its log sink, against a bound five minutes wide. A host so loaded that
+    // this failed would have failed every timed test in the phase first.
+    ("wall_clock_file", Sched::Parallel),
+    ("wall_clock_refusals", Sched::Parallel),
     // `xhci_slow_connect`'s shape against the disk's port, and serial for the
     // same reason and not by association: it shares `SLOW_CONNECT_NS`, so a boot
     // that outgrows the window binds the disk in the port scan and it reports
@@ -1693,7 +1700,7 @@ fn run_screen_test(
                      about a missing /log:\n{console}"
                 ));
             }
-            if console.contains("log-file: this boot's kernel log continues in") {
+            if console.contains("log-file: this boot's kernel log is") {
                 return Err(format!(
                     "the sink installed anyway — a fallback is what this must not do:\n{console}"
                 ));
@@ -4477,6 +4484,11 @@ fn run_machine_test(
         // Body in `tests/common/toybox.rs`, same reason.
         "toybox_cp_volume" => common::toybox::cp_volume(test_config, c_bins, rust_bins),
         "kernel_log_file" => common::volumes::kernel_log_file(test_config, c_bins, rust_bins),
+        // Body in `tests/common/wallclock.rs`, same reason.
+        "wall_clock_file" => common::wallclock::wall_clock_file(test_config, c_bins, rust_bins),
+        "wall_clock_refusals" => {
+            common::wallclock::wall_clock_refusals(test_config, c_bins, rust_bins)
+        }
         "late_storage_connect" => common::volumes::late_storage_connect(test_config, c_bins, rust_bins),
         "log_partition_layout" => {
             common::volumes::log_partition_layout(test_config, c_bins, rust_bins)
