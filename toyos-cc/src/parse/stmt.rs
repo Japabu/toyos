@@ -58,6 +58,7 @@ impl Parser {
             TokenKind::Ident(_) if matches!(self.peek2(), TokenKind::Colon) => {
                 let label = self.ident();
                 self.advance(); // :
+                self.discard_attributes("a label");
                 let body = self.stmt();
                 Statement::Label(label, Box::new(body))
             }
@@ -116,7 +117,7 @@ impl Parser {
                 let d = self.declarator();
                 let init = if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None };
                 declarators.push(InitDeclarator { declarator: d, initializer: init });
-                self.skip_asm_label();
+                self.skip_declarator_suffix();
                 if !self.eat(&TokenKind::Comma) { break; }
             }
         }

@@ -777,3 +777,154 @@ pub fn null_sink_real_rate(
     );
     Ok(())
 }
+
+/// Gate: doom's sound producer outruns its audio callback and the game lives.
+///
+/// The T14 report this exists for: about five seconds into playing doom the
+/// machine froze, and the first thing to go was doom itself —
+/// `sound command ring overflow: audio callback stalled` inside
+/// `I_UpdateSoundParams`, an `extern "C"` frame with no unwind path, so the
+/// panic became `abort`. The kernel then panicked retiring the task and the
+/// compositor died granting shared memory to a pid that was no longer there.
+/// This is the first domino.
+///
+/// Nothing in the flood is timed. The actuator parks the audio callback with
+/// `cpal::Stream::pause` and requires the callback's own period counter to
+/// stand still across the burst, so "the producer outran the consumer" is a
+/// fact about the two of them rather than about how busy this host was — a
+/// distinction the harness owes the suspended-laptop case, where a wall-clock
+/// burst is satisfied by stopping both sides at once.
+///
+/// Four assertions, three of them in-guest facts the host reads back and one
+/// on the wire:
+///
+/// 1. **The game lives.** `/bin/doom --sound-stress` exits 0. On the tree this
+///    replaced the same burst aborts on its 65th command.
+/// 2. **The burst was real.** `stalled_burst` commands were issued with the
+///    callback's period count unchanged — 4096 of them, 64x the retired ring.
+/// 3. **The callback converged, and did so at the audio rate.** The sound the
+///    last command started plays to completion, and the periods that took
+///    match its length: a mixer that lost the command never finishes, and one
+///    that restarted it takes longer.
+/// 4. **The last command is what reached the device.** Every superseded update
+///    in the burst carries `QUIET_VOLUME`, which mixes to 251 LSB — under
+///    `SIGNAL_THRESHOLD`, so it is not signal. The final one carries full
+///    volume, 16000 * 127/255 = 7968. A capture with signal in it is a capture
+///    in which the last write won.
+pub fn doom_sound_flood(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/doomcase");
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], rust_bins, BootOptions::default());
+
+    let result = qemu.run_test("test_rs_doom_sound_flood", Duration::from_secs(60));
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if result.exit_code != Some(0) {
+        return Err(format!(
+            "doom did not survive its own sound producer (exit {:?}):\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+
+    let counters = parse_stress_line(&result.stdout)?;
+
+    // The retired ring held 64 commands and asserted on the 65th.
+    const RETIRED_RING_CAP: u64 = 64;
+    if counters.stalled_burst <= RETIRED_RING_CAP {
+        return Err(format!(
+            "the flood was {} commands against a callback that had stopped, which the \
+             retired 64-entry ring would have swallowed — the actuator proved nothing",
+            counters.stalled_burst
+        ));
+    }
+
+    // A period is 128 frames, so a sound of N frames occupies ceil(N/128) of
+    // them. The ceiling is loose on purpose: it is a liveness bound on the game
+    // thread noticing the sound ended, and the verdict is the floor — a mixer
+    // that restarted or skipped the sound cannot land on its exact length.
+    check_playback("tone", counters.tone_periods, counters.tone_frames)?;
+    check_playback("probe", counters.probe_periods, counters.probe_frames)?;
+
+    // Let the tail of the capture reach the file before reading it.
+    let _ = qemu.drain_serial(Duration::from_millis(500));
+    let wav = parse_wav(qemu.audio_wav_path())?;
+    let analysis = analyze(&wav);
+
+    // 16000 * 127/255 = 7968 at full volume against 251 for every superseded
+    // update, so the band excludes the second outcome by a factor of eight and
+    // is wide enough that soundd's mix path is not being measured here.
+    const MIN_PEAK: i32 = 4000;
+    const MAX_PEAK: i32 = 12000;
+    if !(MIN_PEAK..=MAX_PEAK).contains(&analysis.peak) {
+        return Err(format!(
+            "the device played a peak of {} (expected {MIN_PEAK}..={MAX_PEAK}): the volume \
+             the last command named is not the volume that reached the wire",
+            analysis.peak
+        ));
+    }
+    // The tone is TONE_FRAMES long and 96% of a sine at this amplitude clears
+    // SIGNAL_THRESHOLD; a third of it is a floor no partial application meets.
+    let min_active = counters.tone_frames as usize / 3;
+    if analysis.active_samples < min_active {
+        return Err(format!(
+            "only {} samples of signal reached the device for a {}-frame tone (expected \
+             at least {min_active})",
+            analysis.active_samples, counters.tone_frames
+        ));
+    }
+
+    eprintln!(
+        "  [doomcase] {} commands issued with the callback parked, tone converged in {} \
+         periods for {} frames, {} concurrent commands, {} samples of signal at peak {}",
+        counters.stalled_burst,
+        counters.tone_periods,
+        counters.tone_frames,
+        counters.concurrent_cmds,
+        analysis.active_samples,
+        analysis.peak,
+    );
+    Ok(())
+}
+
+struct StressCounters {
+    stalled_burst: u64,
+    tone_periods: u64,
+    tone_frames: u64,
+    concurrent_cmds: u64,
+    probe_periods: u64,
+    probe_frames: u64,
+}
+
+fn parse_stress_line(stdout: &str) -> Result<StressCounters, String> {
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("[sound-stress] stalled_burst="))
+        .ok_or_else(|| format!("doom printed no [sound-stress] line:\n{stdout}"))?;
+    let field = |name: &str| -> Result<u64, String> {
+        let prefix = format!("{name}=");
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix(&prefix)?.parse().ok())
+            .ok_or_else(|| format!("no {name} in {line:?}"))
+    };
+    Ok(StressCounters {
+        stalled_burst: field("stalled_burst")?,
+        tone_periods: field("tone_periods")?,
+        tone_frames: field("tone_frames")?,
+        concurrent_cmds: field("concurrent_cmds")?,
+        probe_periods: field("probe_periods")?,
+        probe_frames: field("probe_frames")?,
+    })
+}
+
+fn check_playback(what: &str, periods: u64, frames: u64) -> Result<(), String> {
+    const PERIOD_FRAMES: u64 = 128;
+    let exact = frames.div_ceil(PERIOD_FRAMES);
+    if !(exact..=exact * 4).contains(&periods) {
+        return Err(format!(
+            "the {what} took {periods} periods to play {frames} frames (expected \
+             {exact}..={}): the mixer did not apply the last command as written",
+            exact * 4
+        ));
+    }
+    Ok(())
+}

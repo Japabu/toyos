@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 pub mod audio;
 #[allow(dead_code)]
+pub mod clock;
+#[allow(dead_code)]
 pub mod lane;
 #[allow(dead_code)]
 pub mod compile;
@@ -8,6 +10,8 @@ pub mod compile;
 pub mod faults;
 #[allow(dead_code)]
 pub mod gpt;
+#[allow(dead_code)]
+pub mod hda;
 #[allow(dead_code)]
 pub mod iommu;
 #[allow(dead_code)]

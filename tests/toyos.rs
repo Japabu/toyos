@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -49,14 +49,46 @@ enum Sched {
 /// *waiting* — for a marker, for a debounce, for a device — which is why this is
 /// a measurement and not a division.
 ///
-/// **Twelve is the number for one suite on this host, and the host has no
-/// budget.** Four agents at twelve is 48 guests on 14 cores; the semaphore
-/// `specs/worktrees.md` §6 asks for does not exist, and until it does the width
-/// is a per-suite number with a machine-wide cost. `specs/test-cost-audit.md`
-/// §5.4.7 carries the tables, including the one that said eight, which was taken
-/// while `drain_serial` was still width-scaled and `metal_sim_pointer_churn`'s
-/// twenty-four paced drains *were* the phase.
+/// **Twelve is the number for one suite on this host**, and [`HostSlots`] is
+/// what stops four agents at twelve being 48 guests on 14 cores.
+/// `specs/test-cost-audit.md` §5.4.7 carries the tables, including the one that
+/// said eight, which was taken while `drain_serial` was still width-scaled and
+/// `metal_sim_pointer_churn`'s twenty-four paced drains *were* the phase.
 const DEFAULT_WIDTH: usize = 12;
+
+/// This run's claim on the host's guest budget.
+///
+/// [`DEFAULT_WIDTH`] is a number for *one* suite, and nothing was handing out
+/// the cores that two suites both spend (`specs/test-cost-audit.md` §4.1
+/// constraint 3). A second suite on this machine is not a slower first suite, it
+/// is a wrong one: `screen_fatal_halt` red at 11 s against 3.3 s alone, and an
+/// agent's hour spent chasing that as a regression.
+///
+/// **One slot per task, never per boot.** A worker holds at most one and never
+/// waits for a second while holding one, which is what makes the semaphore
+/// deadlock-free rather than lucky: several tests hold two guests at once, and a
+/// slot each would let twelve workers each hold one and each wait for another.
+///
+/// The wait sits outside the task, so it lands in the phase's wall clock and in
+/// no test's duration — a `PASS` time, and the profile [`longest_first`] orders
+/// on, both stay measurements of the test rather than of the queue.
+struct HostSlots {
+    root: std::path::PathBuf,
+    /// The name this run answers to in another run's waiting message. A pid
+    /// alone is not enough to act on: an agent needs to know which worktree.
+    label: String,
+    /// Zero is the semaphore off. It is the only way to measure a suite against
+    /// one that has it, which is what `--host-slots 0` is for.
+    budget: usize,
+}
+
+impl HostSlots {
+    fn take(&self, what: &str) -> Option<toyos_build::buildlock::Guard> {
+        let budget = self.budget;
+        (budget > 0)
+            .then(|| toyos_build::buildlock::guest_slot(&self.root, budget, &format!("{}: {what}", self.label)))
+    }
+}
 
 /// The one boot that carries every Rust and C test.
 ///
@@ -123,6 +155,10 @@ const RUST_SKIP: &[&str] = &[
     // printed four hundred lines to a console nothing was reading and passed
     // on its exit code.
     "test_screen_churn",
+    // Spawns `/bin/doom`, which `tests/testcases` does not carry — doom is
+    // 4 MiB and every other test boots that config. `doom_sound_flood` runs it
+    // on `tests/doomcase`.
+    "doom_sound_flood",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -226,6 +262,12 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
     ("metal_sim_null_audio", Sched::Serial),
+    // Parallel, and this one is argued rather than assumed: not a verdict in it
+    // is a wall-clock margin. The flood's size is asserted against the audio
+    // callback's own period counter standing still, both playback checks are
+    // counted in periods, and the capture is read for amplitude and never for
+    // timing. Its own boot, its own config, and the only client its soundd has.
+    ("doom_sound_flood", Sched::Parallel),
     ("netd_connection_caps", Sched::Parallel),
     // Serial: it measures netd's 2 s handshake deadline against the host's
     // clock, and counts how many connections survived a 48 ms paced burst
@@ -361,7 +403,15 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("heap_ceiling_recovery", Sched::Parallel),
     ("iommu_context_absent", Sched::Parallel),
     ("iommu_empty_domain", Sched::Parallel),
+    // Two boots, one kernel build each: the probe's own, and the plain kernel
+    // on the same machine to show it stays out of an ordinary boot.
+    ("hda_probe", Sched::Parallel),
     ("serial_vocabulary", Sched::Parallel),
+    // Host-side, no guest: the harness asking whether it can still tell a
+    // suspended machine from a slow one, and whether it reports one as a
+    // verdict it does not have.
+    ("suspend_detector", Sched::Parallel),
+    ("suspend_invalidates_a_verdict", Sched::Parallel),
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -428,6 +478,23 @@ const C_SKIP: &[&str] = &[
     "136_atomic_gcc_style",   // needs stdatomic.h (calls process::exit, not catchable)
 ];
 
+/// C tests that are discovered, compiled and then thrown away because they do
+/// not build. Unlike [`C_SKIP`] these are not a decision, they are the current
+/// state of the toolchain — the reason each gives is printed by every run.
+const C_DOES_NOT_BUILD: &[(&str, &str)] = &[
+    ("78_vla_label", "cranelift verifier rejects the VLA's stack address across blocks"),
+    ("79_vla_continue", "same VLA defect, reached through `continue`"),
+    ("83_utf8_in_identifiers", "the lexer rejects a non-ASCII byte in an identifier"),
+    ("85_asm_outside_function", "file-scope asm is parsed and not emitted, so `vide` is undefined"),
+    ("89_nocode_wanted", "expr_type cannot type an identifier under `sizeof` in dead code"),
+    ("94_generic", "_Generic type dispatch is not implemented"),
+    ("95_bitfields", "aligned(16) on a bitfield member, which toyos-cc refuses"),
+    ("95_bitfields_ms", "the same file again, through 95_bitfields.c"),
+    ("96_nodata_wanted", "every branch wants a -D the harness does not pass, so no `main`"),
+    ("98_al_ax_extend", "file-scope asm again: `_us`, `_ss`, `_uc`, `_sc` are declared in it"),
+    ("99_fastcall", "typeof of an `&function` expression is not implemented"),
+];
+
 /// Discover C tests by scanning tests/testcases/tinycc/*.c.
 /// Skips companion files (contain '+') and tests in C_SKIP.
 fn discover_c_tests() -> Vec<String> {
@@ -475,28 +542,60 @@ fn compile_c_tests(names: &[String]) -> Vec<(String, Vec<u8>)> {
     std::panic::set_hook(Box::new(|_| {}));
 
     let mut bins = Vec::new();
-    let mut skipped = Vec::new();
+    let mut broken: Vec<(&str, String)> = Vec::new();
     for name in names {
         match std::panic::catch_unwind(|| {
             let (obj, extras) = compile::compile_c(name);
             compile::link_toyos(&obj, &extras, name)
         }) {
             Ok(linked) => bins.push((name.clone(), linked)),
-            Err(_) => skipped.push(name.as_str()),
+            Err(e) => broken.push((name.as_str(), panic_message(&e))),
         }
     }
 
     std::panic::set_hook(prev_hook);
 
-    if !skipped.is_empty() {
-        eprintln!(
-            "[toyos] {} C tests skipped (compilation failed): {}",
-            skipped.len(),
-            skipped.join(", ")
-        );
+    for (name, why) in &broken {
+        eprintln!("[toyos] c::{name} does not build: {why}");
     }
+    check_c_build_fixture(&broken.iter().map(|(n, _)| *n).collect::<Vec<_>>());
 
     bins
+}
+
+fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
+    let full = e
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "<non-string panic>".to_string());
+    full.lines().next().unwrap_or_default().chars().take(160).collect()
+}
+
+/// The suite runs a C test by booting the binary, so one that does not build is
+/// not run — and until this fixture, not reported either. The set is asserted
+/// in both directions: a case that stops building is a regression, and one that
+/// starts building is a fix whose entry has to go.
+fn check_c_build_fixture(broken: &[&str]) {
+    let expected: BTreeSet<&str> = C_DOES_NOT_BUILD.iter().map(|(n, _)| *n).collect();
+    let actual: BTreeSet<&str> = broken.iter().copied().collect();
+    if actual == expected {
+        return;
+    }
+    let new: Vec<&str> = actual.difference(&expected).copied().collect();
+    let fixed: Vec<&str> = expected.difference(&actual).copied().collect();
+    let mut msg = String::from("C_DOES_NOT_BUILD is out of date.\n");
+    if !new.is_empty() {
+        msg += &format!(
+            "  stopped building, and so stopped being run at all: {}\n  \
+             (the reason for each is printed above)\n",
+            new.join(", ")
+        );
+    }
+    if !fixed.is_empty() {
+        msg += &format!("  builds now — delete from C_DOES_NOT_BUILD: {}\n", fixed.join(", "));
+    }
+    panic!("{msg}");
 }
 
 fn check_c_result(result: &TestResult) -> bool {
@@ -1061,7 +1160,7 @@ struct GateSamples {
 }
 
 /// A rejected statistic, ready to print.
-struct Verdict {
+struct Rejection {
     config: String,
     statistic: String,
     detail: String,
@@ -1073,7 +1172,7 @@ fn mwu_verdict(
     base: &[f64],
     fresh: &[f64],
     worse_is_lower: bool,
-) -> Option<Verdict> {
+) -> Option<Rejection> {
     let z = stats::mann_whitney_z(base, fresh);
     let z = if worse_is_lower { -z } else { z };
     let med = |v: &[f64]| {
@@ -1081,7 +1180,7 @@ fn mwu_verdict(
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
-    (z > stats::Z_CRIT).then(|| Verdict {
+    (z > stats::Z_CRIT).then(|| Rejection {
         config: config.to_string(),
         statistic: statistic.to_string(),
         detail: format!(
@@ -1100,9 +1199,9 @@ fn rate_verdict(
     n1: u32,
     k0: u32,
     n0: u32,
-) -> Option<Verdict> {
+) -> Option<Rejection> {
     let p = stats::fisher_greater(k1, n1, k0, n0);
-    (p <= stats::ALPHA).then(|| Verdict {
+    (p <= stats::ALPHA).then(|| Rejection {
         config: config.to_string(),
         statistic: statistic.to_string(),
         detail: format!(
@@ -1195,7 +1294,7 @@ fn run_audio_gate(
         }
     }
 
-    let mut rejected: Vec<Verdict> = Vec::new();
+    let mut rejected: Vec<Rejection> = Vec::new();
     let (mut pooled_gap_k, mut pooled_gap_n) = (0, 0);
     let (mut pooled_ceil_k, mut pooled_ceil_n) = (0, 0);
     let (mut base_gap_k, mut base_gap_n) = (0, 0);
@@ -1251,7 +1350,7 @@ fn curtail(
     audio_baseline: &AudioBaseline,
     configs: &[(&str, u32)],
     iterations: u32,
-) -> Option<Verdict> {
+) -> Option<Rejection> {
     let mut pooled_gap = 0;
     let mut pooled_ceil = 0;
     let (mut base_gap_k, mut base_gap_n) = (0, 0);
@@ -4404,11 +4503,14 @@ fn run_machine_test(
         "iommu_discovery" => common::iommu::iommu_discovery(test_config, c_bins, rust_bins),
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
+        // Body in `tests/common/hda.rs`, same reason.
+        "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
+        "doom_sound_flood" => audio::doom_sound_flood(rust_bins),
         "metal_sim_compositor" => {
             metal_sim_compositor(group_boot(held, METAL_SIM_DESKTOP, || {
                 boot_metal_sim_desktop(rust_bins)
@@ -5199,6 +5301,8 @@ fn run_machine_test(
         // No guest: the instrument itself, in both directions. `screen_decoder`
         // is the same idea for the framebuffer decoder.
         "serial_vocabulary" => serial::self_check(),
+        "suspend_detector" => common::clock::self_check(),
+        "suspend_invalidates_a_verdict" => suspend_invalidates_a_verdict(),
         "nvme_wide_sector" => {
             // The other half of "a device's size is a shape dimension": not how
             // many sectors, but how big one is. `lba_ds` is an 8-bit
@@ -7248,9 +7352,71 @@ enum Task<'a> {
 /// What the suite has to say about one test once it has finished.
 struct Outcome {
     name: String,
-    /// `None` is a pass.
+    /// `None` is a pass — but only [`Outcome::verdict`] may read it as one.
     reason: Option<String>,
     elapsed: Duration,
+    /// How long the host was suspended while this test ran. A verdict taken
+    /// across that is not a verdict, whichever way it came out.
+    suspended: Duration,
+}
+
+/// What the suite may conclude from one outcome.
+#[derive(PartialEq, Debug)]
+enum Verdict {
+    Pass,
+    Fail,
+    /// The host stopped in the middle of it. Neither a pass nor a fail: the
+    /// guest, QEMU's virtual clock and every wall-clock margin the test's
+    /// assertion rests on all jumped by however long the lid was closed, so the
+    /// run measured something and it was not this tree.
+    Invalid,
+}
+
+impl Outcome {
+    fn verdict(&self) -> Verdict {
+        if self.suspended >= common::clock::SUSPENDED_AT_LEAST {
+            return Verdict::Invalid;
+        }
+        match self.reason {
+            None => Verdict::Pass,
+            Some(_) => Verdict::Fail,
+        }
+    }
+}
+
+/// What a suspend is worth to a verdict, staged rather than reasoned about.
+///
+/// `common::clock::self_check` gates the detector; this gates what the suite
+/// does with what it detects. Both halves are needed and neither implies the
+/// other: **a suspend that silently passes is as bad as one that silently
+/// fails**, and here the two are one line apart.
+fn suspend_invalidates_a_verdict() -> Result<(), String> {
+    let slept = common::clock::SUSPENDED_AT_LEAST + Duration::from_secs(120);
+    let awake = Duration::ZERO;
+    // Under the threshold on purpose: two clock reads jitter against each other
+    // by microseconds, and a run must not be thrown away for that.
+    let jitter = common::clock::SUSPENDED_AT_LEAST - Duration::from_millis(1);
+    let cases: [(&str, Option<&str>, Duration, Verdict); 6] = [
+        ("a pass on a host that stayed up", None, awake, Verdict::Pass),
+        ("a fail on a host that stayed up", Some("the guest said no"), awake, Verdict::Fail),
+        ("a pass across a suspend", None, slept, Verdict::Invalid),
+        ("a fail across a suspend", Some("timed out"), slept, Verdict::Invalid),
+        ("a pass across clock jitter", None, jitter, Verdict::Pass),
+        ("a fail across clock jitter", Some("the guest said no"), jitter, Verdict::Fail),
+    ];
+    for (what, reason, suspended, want) in cases {
+        let outcome = Outcome {
+            name: what.to_string(),
+            reason: reason.map(str::to_string),
+            elapsed: Duration::from_secs(3),
+            suspended,
+        };
+        let got = outcome.verdict();
+        if got != want {
+            return Err(format!("{what} is {got:?}, and it has to be {want:?}"));
+        }
+    }
+    Ok(())
 }
 
 /// The task that would run `name` again, by itself.
@@ -7296,8 +7462,16 @@ struct Bins<'a> {
 }
 
 fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Outcome>) {
-    let send = |name: String, reason: Option<String>, elapsed: Duration| {
-        let _ = report.send(Outcome { name, reason, elapsed });
+    // Both clocks, at every test, because what the host did *between* two of
+    // them is a different question from what it did during one: a lid closed
+    // while nothing was running invalidates nothing.
+    let send = |name: String, reason: Option<String>, start: common::clock::Mark| {
+        let _ = report.send(Outcome {
+            name,
+            reason,
+            elapsed: start.elapsed(),
+            suspended: start.suspended(),
+        });
     };
     match task {
         Task::Shared(tests) => {
@@ -7308,7 +7482,7 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
             let outcome = catching(|| {
                 let mut qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
                 for test in &tests {
-                    let start = Instant::now();
+                    let start = common::clock::mark();
                     let result = qemu.run_test(&test.qemu_name, test.timeout);
                     let reason = (!(test.check)(&result)).then(|| {
                         result
@@ -7317,13 +7491,13 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                             .unwrap_or_else(|| format!("exit code {:?}", result.exit_code))
                     });
                     done += 1;
-                    send(test.name.clone(), reason, start.elapsed());
+                    send(test.name.clone(), reason, start);
                 }
                 Ok(())
             });
             if let Err(reason) = outcome {
                 for test in &tests[done..] {
-                    send(test.name.clone(), Some(reason.clone()), Duration::ZERO);
+                    send(test.name.clone(), Some(reason.clone()), common::clock::mark());
                 }
             }
         }
@@ -7332,18 +7506,18 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
             // that booted it.
             let mut held: Grouped = None;
             for name in names {
-                let start = Instant::now();
+                let start = common::clock::mark();
                 let outcome = catching(|| {
                     run_machine_test(name, bins.test_config, bins.c_bins, bins.rust_bins, &mut held)
                 });
-                send(name.to_string(), outcome.err(), start.elapsed());
+                send(name.to_string(), outcome.err(), start);
             }
         }
         Task::Screen(name) => {
-            let start = Instant::now();
+            let start = common::clock::mark();
             let outcome =
                 catching(|| run_screen_test(name, bins.test_config, bins.c_bins, bins.rust_bins));
-            send(name.to_string(), outcome.err(), start.elapsed());
+            send(name.to_string(), outcome.err(), start);
         }
     }
 }
@@ -7424,6 +7598,24 @@ fn longest_first(tasks: &mut [Task<'_>], known: &BTreeMap<String, Duration>) {
     tasks.sort_by_key(|task| std::cmp::Reverse(cost(task)));
 }
 
+/// One outcome, as the run prints it. Gate A goes through here too, so a
+/// suspended audio boot cannot report itself differently from a suspended
+/// machine test.
+fn report_line(outcome: &Outcome) {
+    match outcome.verdict() {
+        Verdict::Pass => eprintln!("  PASS  {}  ({:.0?})", outcome.name, outcome.elapsed),
+        Verdict::Fail => {
+            let reason = outcome.reason.as_deref().unwrap_or("check failed");
+            eprintln!("FAIL {}: {reason}", outcome.name);
+            eprintln!("  FAIL  {}  ({:.0?})", outcome.name, outcome.elapsed);
+        }
+        Verdict::Invalid => eprintln!(
+            "  INVL  {}  ({:.0?}) — the host was suspended for {:.0?} while it ran",
+            outcome.name, outcome.elapsed, outcome.suspended
+        ),
+    }
+}
+
 /// Run `tasks` on `width` workers, printing each outcome as it lands.
 ///
 /// One implementation for both phases: **the serial tail is this at width 1**,
@@ -7431,7 +7623,12 @@ fn longest_first(tasks: &mut [Task<'_>], known: &BTreeMap<String, Duration>) {
 /// this one. It returns only once every worker has joined, which is what makes
 /// "the parallel phase has drained" a fact about the call and not about where
 /// it sits in `main`.
-fn run_phase(tasks: Vec<Task<'_>>, width: usize, bins: &Bins<'_>) -> Vec<Outcome> {
+fn run_phase(
+    tasks: Vec<Task<'_>>,
+    width: usize,
+    bins: &Bins<'_>,
+    slots: &HostSlots,
+) -> Vec<Outcome> {
     if tasks.is_empty() {
         return Vec::new();
     }
@@ -7450,19 +7647,14 @@ fn run_phase(tasks: Vec<Task<'_>>, width: usize, bins: &Bins<'_>) -> Vec<Outcome
                     let next =
                         queue.lock().expect("a worker panicked holding the queue").pop_front();
                     let Some(task) = next else { return };
+                    let _slot = slots.take(&task.names().join(" "));
                     run_task(task, bins, &tx);
                 }
             });
         }
         drop(tx);
         for outcome in rx {
-            match &outcome.reason {
-                None => eprintln!("  PASS  {}  ({:.0?})", outcome.name, outcome.elapsed),
-                Some(reason) => {
-                    eprintln!("FAIL {}: {reason}", outcome.name);
-                    eprintln!("  FAIL  {}  ({:.0?})", outcome.name, outcome.elapsed);
-                }
-            }
+            report_line(&outcome);
             all.push(outcome);
         }
     });
@@ -7573,6 +7765,44 @@ fn main() {
         assert!(width >= 1, "--jobs needs at least one worker");
     }
 
+    // How many guests may be up on the *host* at once, across every worktree.
+    // `--jobs` is this run's demand; this is what the machine will supply, and
+    // zero turns it off.
+    let mut host_budget = toyos_build::buildlock::HOST_GUESTS;
+    for (i, a) in args.iter().enumerate() {
+        let n = if let Some(v) = a.strip_prefix("--host-slots=") {
+            consumed.push(i);
+            v
+        } else if a == "--host-slots" {
+            consumed.push(i);
+            consumed.push(i + 1);
+            args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
+                panic!("--host-slots needs a budget, e.g. --host-slots 12 (0 turns it off)")
+            })
+        } else {
+            continue;
+        };
+        host_budget =
+            n.parse().unwrap_or_else(|_| panic!("--host-slots: {n:?} is not a budget"));
+    }
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+
+    // For the whole run, and outermost: a `--claim-sysroot` in another worktree
+    // rebuilds the sysroot this run's every later build reads, and the run's
+    // answer to that used to be a hundred identical refusals and a dead gate.
+    // Taken once, before any build lock, so the order is always sysroot →
+    // global — a second acquisition here would be a cycle with the claim's
+    // writer preference.
+    let _sysroot = toyos_build::buildlock::run_against_sysroot(&repo_root, "cargo test");
+
+    let slots = HostSlots {
+        label: repo_root
+            .file_name()
+            .map_or_else(|| "this worktree".to_string(), |n| n.to_string_lossy().into_owned()),
+        root: repo_root,
+        budget: host_budget,
+    };
+
     check_registration();
 
     if nocapture || debug_mode {
@@ -7626,6 +7856,12 @@ fn main() {
             .collect();
         assert!(!audio_to_run.is_empty(), "no audio test matches filter {filter:?}");
         let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
+        // One slot for the whole tier: it boots one guest at a time for the
+        // length of it, so one slot is what it occupies. The owner has ruled
+        // that gate A does not get a quiet host (CLAUDE.md, 2026-08-04), so it
+        // takes its share of the machine like everything else and does not
+        // reserve it.
+        let _slot = slots.take("gate A, thorough");
         let ok = run_audio_gate(
             iterations,
             &load_audio_baseline(),
@@ -7679,7 +7915,8 @@ fn main() {
     let mut passed = 0;
     let mut failed = 0;
     let mut failures: Vec<(String, String)> = Vec::new();
-    let suite_start = std::time::Instant::now();
+    let mut invalid: Vec<(String, Duration)> = Vec::new();
+    let suite_start = common::clock::mark();
 
     let bins = Bins {
         test_config: &test_config,
@@ -7727,13 +7964,15 @@ fn main() {
 
     let mut record = |outcomes: Vec<Outcome>| {
         for outcome in outcomes {
-            match outcome.reason {
-                None => passed += 1,
-                Some(reason) => {
+            match outcome.verdict() {
+                Verdict::Pass => passed += 1,
+                Verdict::Fail => {
                     failed += 1;
+                    let reason = outcome.reason.unwrap_or_else(|| "check failed".to_string());
                     let summary = reason.lines().next().unwrap_or("check failed");
                     failures.push((outcome.name, summary.to_string()));
                 }
+                Verdict::Invalid => invalid.push((outcome.name, outcome.suspended)),
             }
         }
     };
@@ -7748,10 +7987,15 @@ fn main() {
         longest_first(&mut parallel, &known);
         eprintln!("  --- parallel, {width} wide ---");
         let started = std::time::Instant::now();
-        let outcomes = run_phase(parallel, width, &bins);
+        let outcomes = run_phase(parallel, width, &bins, &slots);
         eprintln!("  --- parallel done in {:.1?} ---", started.elapsed());
+        // Reds only. A test the host slept through has no verdict to confirm,
+        // and re-running it would put a second guess beside the first.
         wide_reds.extend(
-            outcomes.iter().filter(|o| o.reason.is_some()).map(|o| o.name.clone()),
+            outcomes
+                .iter()
+                .filter(|o| o.verdict() == Verdict::Fail)
+                .map(|o| o.name.clone()),
         );
         timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
         record(outcomes);
@@ -7759,7 +8003,7 @@ fn main() {
     if !serial.is_empty() {
         eprintln!("  --- serial ---");
         let started = std::time::Instant::now();
-        let outcomes = run_phase(serial, 1, &bins);
+        let outcomes = run_phase(serial, 1, &bins, &slots);
         eprintln!("  --- serial done in {:.1?} ---", started.elapsed());
         timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
         record(outcomes);
@@ -7774,14 +8018,16 @@ fn main() {
                 eprintln!("  ALONE {name}: no way to run it by itself; verdict stands");
                 continue;
             };
-            let outcomes = run_phase(vec![task], 1, &bins);
-            let verdict = outcomes.iter().find(|o| &o.name == name);
-            match verdict.map(|o| o.reason.is_some()) {
-                Some(false) => eprintln!(
+            let outcomes = run_phase(vec![task], 1, &bins, &slots);
+            match outcomes.iter().find(|o| &o.name == name).map(Outcome::verdict) {
+                Some(Verdict::Pass) => eprintln!(
                     "  ALONE {name}: GREEN — it fails only beside other guests, so its \
                      Sched::Parallel is wrong. The run stays red on the classification."
                 ),
-                Some(true) => eprintln!("  ALONE {name}: red again — the defect is real."),
+                Some(Verdict::Fail) => eprintln!("  ALONE {name}: red again — the defect is real."),
+                Some(Verdict::Invalid) => {
+                    eprintln!("  ALONE {name}: the host was suspended during the retry too")
+                }
                 None => eprintln!("  ALONE {name}: the lone run reported nothing about it"),
             }
         }
@@ -7804,49 +8050,94 @@ fn main() {
             for &smp in AUDIO_SMP {
                 let label = format!("{name} (smp={smp})");
                 let baseline = config_baseline(&audio_baseline, name, smp);
-                let start = std::time::Instant::now();
+                let _slot = slots.take(&label);
+                let start = common::clock::mark();
                 // A boot that never reaches its marker panics, and gate A is the
                 // last thing the suite runs: unwrapped, that panic took the
                 // whole run's verdict with it and printed no result line at all.
                 let outcome = catching(|| {
                     run_audio_test(name, smp, &baseline, &test_config, &c_bins, &rust_bins)
                 });
-                let elapsed = start.elapsed();
-                match outcome {
-                    Ok(()) => {
-                        passed += 1;
-                        eprintln!("  PASS  {label}  ({:.0?})", elapsed);
-                    }
-                    Err(reason) => {
-                        failed += 1;
-                        eprintln!("FAIL rs::{label}: {reason}");
-                        eprintln!("  FAIL  {label}  ({:.0?})", elapsed);
-                        let summary = reason.lines().next().unwrap_or("audio check failed");
-                        failures.push((label, summary.to_string()));
-                    }
-                }
+                // Gate A's every number comes off a clock — wake lateness, a
+                // period's worth of samples, the position of a gap in the
+                // capture. A host that stopped in the middle of one moved all of
+                // them, so this outcome is not a reading of anything.
+                let outcome = Outcome {
+                    name: label,
+                    reason: outcome.err(),
+                    elapsed: start.elapsed(),
+                    suspended: start.suspended(),
+                };
+                report_line(&outcome);
+                record(vec![outcome]);
             }
         }
     }
 
     let suite_elapsed = suite_start.elapsed();
+    let suite_suspended = suite_start.suspended();
 
     eprintln!();
-    if failures.is_empty() {
+    if suite_suspended >= common::clock::SUSPENDED_AT_LEAST {
+        // The elapsed figure above is monotonic and therefore already excludes
+        // it, which is worth saying: the two numbers do not add up unless a
+        // reader knows that.
         eprintln!(
-            "test result: ok. {passed} passed, {total} total ({:.1?})",
-            suite_elapsed
+            "note: the host was suspended for {suite_suspended:.0?} during this run. \
+             The suite time below excludes it."
         );
-    } else {
+    }
+    if !failures.is_empty() {
         eprintln!("failures:");
         for (name, reason) in &failures {
             eprintln!("    {name}: {reason}");
         }
         eprintln!();
+    }
+    if !invalid.is_empty() {
+        eprintln!("invalidated by host suspend:");
+        for (name, slept) in &invalid {
+            eprintln!("    {name}: the host was stopped for {slept:.0?} while it ran");
+        }
+        eprintln!();
+    }
+
+    // Three exit statuses, because there are three things a run can establish.
+    //
+    // A green run is a claim that this tree passed, and `--land`'s gate consumes
+    // exactly this number. A run that spanned a suspend did not establish that:
+    // its timing verdicts were taken across a stopped host and its liveness
+    // ceilings were measured on a clock that stopped with it, so exit 0 would be
+    // a claim it cannot support.
+    //
+    // Nor may it be 1. A red sends an agent hunting a defect, and the defect is
+    // not there — the lid was closed. CLAUDE.md already documents the signature
+    // and documents it as something a *human* must notice before recording a
+    // finding, which is exactly the judgement a status code should carry
+    // instead. So: 2, with a headline that names it and says re-run.
+    //
+    // A run with both real failures and invalidated tests exits 1: a red that
+    // survives is still a red, and re-running the suspended ones does not make
+    // it green.
+    if !failures.is_empty() {
         eprintln!(
-            "test result: FAILED. {passed} passed, {failed} failed, {total} total ({:.1?})",
-            suite_elapsed
+            "test result: FAILED. {passed} passed, {failed} failed, {} invalidated, \
+             {total} total ({suite_elapsed:.1?})",
+            invalid.len()
         );
         std::process::exit(1);
     }
+    if !invalid.is_empty() {
+        eprintln!(
+            "test result: INVALID. {passed} passed, {} invalidated by a host suspend of \
+             {suite_suspended:.0?}, {total} total ({suite_elapsed:.1?})",
+            invalid.len()
+        );
+        eprintln!(
+            "This is not a red. The machine stopped mid-run, so those verdicts are of \
+             nothing; re-run the suite."
+        );
+        std::process::exit(2);
+    }
+    eprintln!("test result: ok. {passed} passed, {total} total ({suite_elapsed:.1?})");
 }

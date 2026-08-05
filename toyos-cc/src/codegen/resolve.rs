@@ -381,7 +381,12 @@ impl Codegen {
                 }
             }
             // Unknown forward declaration — return empty struct
-            let def = StructDef { name: st.name.clone(), fields: Vec::new() };
+            let def = StructDef {
+                name: st.name.clone(),
+                fields: Vec::new(),
+                packed: false,
+                align: None,
+            };
             return if is_union { CType::Union(def) } else { CType::Struct(def) };
         }
 
@@ -403,7 +408,19 @@ impl Codegen {
             }
         }
 
-        let def = StructDef { name: st.name.clone(), fields };
+        assert!(
+            !(st.attrs.packed && fields.iter().any(|f: &FieldDef| f.bit_width.is_some())),
+            "packed bitfield layout is not implemented by toyos-cc: {} {}",
+            if is_union { "union" } else { "struct" },
+            st.name.as_deref().unwrap_or("<anonymous>"),
+        );
+
+        let def = StructDef {
+            name: st.name.clone(),
+            fields,
+            packed: st.attrs.packed,
+            align: st.attrs.align,
+        };
         let ty = if is_union { CType::Union(def) } else { CType::Struct(def) };
 
         // Register named struct/union tag
