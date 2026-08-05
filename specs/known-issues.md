@@ -2092,11 +2092,27 @@ the moment each was re-run by itself in the same process. None predates or was
 introduced by the parallel-width work; all have been `Sched::Parallel` since the
 phase landed, and none reproduces on a host running one suite.
 
-- **`i8042_mouse`** — CLOSED. The verdict was a drain rate (`at least half of a
-  thousand injected packets arrived`) and it is now the full count with the
-  injection paced against the guest's own report of each packet, so nothing the
-  host does can outrun the guest. `0 discarded` is unchanged and joined by
-  `0 overruns`, `0 dropped`, `0 lost edges`. `specs/test-cost-audit.md` §5.5.2.
+- **`i8042_mouse`** — REOPENED 2026-08-05, and the closing argument is the thing
+  that is wrong. It read: the injection is paced against the guest's own report
+  of each packet, "so nothing the host does can outrun the guest". Outrunning is
+  not the failure mode left. The host now *stalls* — it waits for a packet the
+  guest never delivers and the test times out at 60 s:
+
+      FAIL i8042_mouse: timed out after 60s — 271 of the 303 packets injected
+      came back out, so the host stalled on one the machine never delivered
+
+  Pacing converted a lost packet from a miscount into a deadlock, so the verdict
+  is now a wall-clock timeout wearing a count's clothes. Measured on a loaded
+  host (four worktrees), alternating one checkout against the other in one
+  session, six runs: **main FAIL(271/303), PASS(3s), PASS(3s); a branch that
+  touches no input code FAIL(976/1004), FAIL(813/845), PASS(3s), PASS(4s)**. It
+  reds on `main` as readily as anywhere else, so it is not attributable to
+  whatever branch happens to be under it, and a green run costs 3 s against a
+  red one's 60 s. The prior text also predates §3's finding below, which says
+  the pacing argument never covered `0 lost edges` either.
+
+  Anyone whose suite reds here: re-run it alone before believing it, and if it
+  goes green the classification is the bug rather than your change.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
