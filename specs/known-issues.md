@@ -2124,6 +2124,12 @@ phase landed, and none reproduces on a host running one suite.
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
   `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`.
+- **`desktop_locale_detect`** — added 2026-08-05. Same `nothing typed at the
+  terminal window reached a shell`, same `ALONE … GREEN`, in the same run as the
+  entry above and on a branch that touches neither the compositor nor the
+  terminal. It reaches a shell through `shell_answers` exactly as
+  `desktop_typing_damage` does, so it inherits that retry window and evidently
+  not enough of it. Still `Sched::Parallel`.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
