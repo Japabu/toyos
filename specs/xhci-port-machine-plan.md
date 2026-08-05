@@ -222,19 +222,18 @@ Price: no new code beyond X2 — it is X2's proof obligation. One guest gate tha
 measures the pass duration across a plug, plus the `sched-check` pass-budget
 assertion known-issues records as never enabled.
 
-### X4 — #100, if it falls out
+### #100 rides X2; there is no fourth stage
 
-My reading, offered for correction because I do not hold the task text: #100 is
-the idle-wake condition — `PORT_WORK_AT` stops an idle CPU halting for as long
-as the debounce or the reset deadline, one of four conditions CLAUDE.md says
-only a deferred-callback facility would remove. X2 does not remove it: the
-machine still has a deadline and something still has to come back for it.
+#100 is the ~14 ms a hot-plug enumeration blocks a scheduler pass, which is
+audio-relevant and is exactly what X2 removes. It is measured in X2's gate-A
+A/B and claimed there if the pass-block is gone.
 
-It *does* shrink: with X1, an SS port that needs no reset has no 2 s deadline
-to keep a CPU awake for, and the remaining wait is the 100 ms debounce. Whether
-that is enough to close #100 is the coordinator's call, and the facility itself
-is scheduler work I do not own. **Not planned as part of this wave**; I will
-report the measured change in idle-wake duration rather than claim the fix.
+It is **not** the idle-wake condition — `PORT_WORK_AT` stopping an idle CPU
+halting through a debounce or a reset deadline. That is CLAUDE.md's separate
+pre-`hlt` item, it needs the deferred-callback facility, it is scheduler
+territory and it is not in this wave. X1 shrinks it as a side effect, since an
+SS port that needs no reset has no 2 s deadline to keep a CPU awake for; the
+measured change is reported and never claimed as the fix.
 
 ## 4. Risks
 
