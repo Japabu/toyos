@@ -189,19 +189,20 @@ pub fn init(rsdp_addr: u64, devices: &[PciDevice]) {
 /// number this file made up, and the whole value of this call is that it is
 /// firmware's answer.
 #[cfg(feature = "hda-probe")]
-pub(super) fn describe_device(
-    rsdp_addr: u64,
-    stream: StreamId,
-) -> crate::iommu::DeviceFacts {
+pub(super) fn describe_device(rsdp_addr: u64, stream: StreamId) -> crate::iommu::DeviceFacts {
     use crate::iommu::{DeviceFacts, ReservedRegion, UnitFacts};
 
     let mut facts = DeviceFacts { unit: None, reserved: alloc::vec::Vec::new() };
     let Ok(dmar) = Dmar::open(rsdp_addr) else { return facts };
 
     let mut index = 0usize;
-    let mut catch_all: Option<usize> = None;
-    let mut explicit: Option<usize> = None;
-    let mut bases: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    // The two candidates, each carried as the index the boot's own `iommu:
+    // unitN` lines use *and* the base its capabilities are read from — so the
+    // walk keeps two pairs rather than every unit's base for one lookup at the
+    // end. First of each wins: the specification requires the catch-all last,
+    // so a second unit claiming one stream is firmware contradicting itself.
+    let mut explicit: Option<(usize, u64)> = None;
+    let mut catch_all: Option<(usize, u64)> = None;
     for structure in dmar.structures() {
         match structure {
             Ok(Structure::Drhd(drhd)) => {
@@ -209,11 +210,10 @@ pub(super) fn describe_device(
                     break;
                 }
                 if names(drhd.scopes(), stream) {
-                    explicit = explicit.or(Some(index));
+                    explicit = explicit.or(Some((index, drhd.register_base())));
                 } else if drhd.include_pci_all() {
-                    catch_all = catch_all.or(Some(index));
+                    catch_all = catch_all.or(Some((index, drhd.register_base())));
                 }
-                bases.push(drhd.register_base());
                 index += 1;
             }
             // A reserved region binds only the devices its own scope names,
@@ -225,15 +225,10 @@ pub(super) fn describe_device(
         }
     }
 
-    let claim = explicit.or(catch_all);
-    facts.unit = claim.and_then(|index| {
-        let regs = window(*bases.get(index)?)?;
+    facts.unit = explicit.or(catch_all).and_then(|(index, base)| {
+        let regs = window(base)?;
         let caps = Capabilities { cap: regs.read_u64(CAP_REG), ecap: regs.read_u64(ECAP_REG) };
-        Some(UnitFacts {
-            index,
-            explicit: explicit == Some(index),
-            snoop_control: caps.snoop_control(),
-        })
+        Some(UnitFacts { index, explicit: explicit.is_some(), snoop_control: caps.snoop_control() })
     });
     facts
 }
