@@ -2663,6 +2663,27 @@ here: move `i8042_mouse` back to `Sched::Serial`, or split the verdict so the
 paced count stays parallel and the lost-edge claim runs where the host is not
 oversubscribed.
 
+**2026-08-05: the *count* now fails too, which the second option above would not
+have caught.** On the `hda-probe` branch, with eight worktrees live on the host:
+
+```
+FAIL i8042_mouse: 996 pointer events reached userland out of 1004 packets
+injected, each one paced against the arrival of the last
+  FAIL  i8042_mouse  (60s)
+  …
+  [i8042] 1008 packets injected, 1008 out, last button state 0x00
+  PASS  i8042_mouse  (570ms)
+  ALONE i8042_mouse: GREEN
+```
+
+Sixty seconds in the wide phase against 570 ms alone, and eight of 1004 packets
+missing rather than an edge miscounted. So the pacing argument does not hold for
+the count either under this much contention — the guest is slow enough that
+something upstream of the count gives up before the packet arrives. Splitting
+the verdict therefore fixes only half of it, and `Sched::Serial` is the option
+that closes both. The branch that saw it changes no port I/O and no input path:
+its only ungated change anywhere is one extra field on the `iommu: unitN` line.
+
 ### Device registers still take firmware's word for being uncacheable
 
 Every `map_mmio` outside the scanout passes `CachePolicy::DeferToMtrr`, which is
