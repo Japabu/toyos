@@ -139,8 +139,11 @@ pub static DG_music_module: MusicModule = MusicModule {
 
 // ── SFX mixer ──
 //
-// The audio callback runs on a kernel-boosted RT thread with a ~2.9ms deadline.
-// It must never block: no locks, no allocation, no syscalls.
+// The audio callback has a ~2.9ms deadline and must never block: no locks, no
+// allocation, no syscalls. Its RT standing is lent rather than held — soundd
+// holds the band with the device claim and every wake it sends passes a window
+// along — so on a machine with no audio device the callback is an ordinary
+// thread and the deadline is met only by whatever the scheduler decides.
 
 // doomgeneric's snd_channels — the engine never allocates more.
 const NUM_SFX_CHANNELS: usize = 8;
