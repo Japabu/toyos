@@ -1,0 +1,10 @@
+Plain   0 4 8 10 / 12
+Packed  0 1 5 6 / 8
+Wide    0 1 9 17 / 25
+Trail   0 1 / 5
+Outer   0 1 8 / 12
+Union   4
+Al      16
+PackAl  0 1 5 / 8
+read    11 55443322 66 8877
+stride  5 5 6

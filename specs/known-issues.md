@@ -2176,11 +2176,27 @@ the moment each was re-run by itself in the same process. None predates or was
 introduced by the parallel-width work; all have been `Sched::Parallel` since the
 phase landed, and none reproduces on a host running one suite.
 
-- **`i8042_mouse`** — CLOSED. The verdict was a drain rate (`at least half of a
-  thousand injected packets arrived`) and it is now the full count with the
-  injection paced against the guest's own report of each packet, so nothing the
-  host does can outrun the guest. `0 discarded` is unchanged and joined by
-  `0 overruns`, `0 dropped`, `0 lost edges`. `specs/test-cost-audit.md` §5.5.2.
+- **`i8042_mouse`** — REOPENED 2026-08-05, and the closing argument is the thing
+  that is wrong. It read: the injection is paced against the guest's own report
+  of each packet, "so nothing the host does can outrun the guest". Outrunning is
+  not the failure mode left. The host now *stalls* — it waits for a packet the
+  guest never delivers and the test times out at 60 s:
+
+      FAIL i8042_mouse: timed out after 60s — 271 of the 303 packets injected
+      came back out, so the host stalled on one the machine never delivered
+
+  Pacing converted a lost packet from a miscount into a deadlock, so the verdict
+  is now a wall-clock timeout wearing a count's clothes. Measured on a loaded
+  host (four worktrees), alternating one checkout against the other in one
+  session, six runs: **main FAIL(271/303), PASS(3s), PASS(3s); a branch that
+  touches no input code FAIL(976/1004), FAIL(813/845), PASS(3s), PASS(4s)**. It
+  reds on `main` as readily as anywhere else, so it is not attributable to
+  whatever branch happens to be under it, and a green run costs 3 s against a
+  red one's 60 s. The prior text also predates §3's finding below, which says
+  the pacing argument never covered `0 lost edges` either.
+
+  Anyone whose suite reds here: re-run it alone before believing it, and if it
+  goes green the classification is the bug rather than your change.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
@@ -2192,6 +2208,12 @@ phase landed, and none reproduces on a host running one suite.
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
   `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`.
+- **`desktop_locale_detect`** — added 2026-08-05. Same `nothing typed at the
+  terminal window reached a shell`, same `ALONE … GREEN`, in the same run as the
+  entry above and on a branch that touches neither the compositor nor the
+  terminal. It reaches a shell through `shell_answers` exactly as
+  `desktop_typing_damage` does, so it inherits that retry window and evidently
+  not enough of it. Still `Sched::Parallel`.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
@@ -2201,9 +2223,11 @@ before anything else. `GREEN` there means the host, not the kernel. What none of
 them should get is a widened bound — a gate that tolerates one lost byte
 tolerates the defect it was written for. The two fixes above are the two shapes
 that are legitimate: make the verdict independent of the rate, or scale a
-liveness ceiling with the phase. If the class needs closing beyond that, the
-answer is a global QEMU-slot semaphore across worktrees
-(`specs/worktrees.md` §6), not a looser assertion.
+liveness ceiling with the phase. The global QEMU-slot semaphore this section
+used to name as the closing move now exists (`buildlock::guest_slot`,
+`specs/test-cost-audit.md` §5.6): the host admits twelve guests across every
+worktree, so the four-suite regime these were observed in cannot recur. A looser
+assertion is still not the answer.
 
 ### A whole parallel phase can be starved by another agent's build
 
@@ -2214,6 +2238,37 @@ whichever load-sensitive `Sched::Parallel` test loses its margin first is what
 goes red. `uptime` before and after a suspicious run, and `ps aux -r | head`,
 are what separate it from a regression; a `toyos-tests-<pid>` directory per live
 suite in `$TMPDIR` names how many are up.
+
+`buildlock::guest_slot` bounds the *guests* to twelve across all worktrees, and
+that is the part of this the semaphore closes. It bounds nothing else: a
+`toyos-sched-sim measure`, a `cargo build` and the primary's bootstrap all take
+cores and no slot, so a phase can still be starved by work that boots nothing.
+A slot's wait is announced (`[host-slots] waiting …`), which is what separates a
+slow phase from a starved one without `ps`.
+
+### The primary checkout reclaims the shared sysroot silently
+
+Found 2026-08-05 while giving `--claim-sysroot` its arbitration; not fixed.
+
+A linked worktree whose `toyos-abi` differs from the sysroot's must pass
+`--claim-sysroot`, which now announces itself and queues behind every run in
+flight (`specs/worktrees.md` §3.1). **The primary checkout does the same thing
+on any ordinary build and says nothing.** `toolchain::ensure` reaches
+`std_sources_stale` for `Owner::Us`, which compares the witness against the
+primary's own sources; a worktree's claim makes that comparison stale, so the
+next `cargo run -- --build-only` in the primary rebuilds std from main's
+sources, rewrites the witness, and the claiming worktree refuses from then on.
+No flag, no announcement, and no sysroot lock — `build()` takes it only when
+`--claim-sysroot` is passed.
+
+It is the same defect the flag now has arbitration for, on the path used far
+more often. It is not fixed here because the two shapes conflict: a suite run
+holds the sysroot lock shared for its whole length, and the primary rebuilds std
+from inside `build_test_image`, which the harness calls under that hold — so
+taking the exclusive lock there would deadlock a suite run in the primary
+against itself. The honest fix is that a stale sysroot *inside a run* is a
+refusal rather than a rebuild, which changes the primary's daily path and wants
+its own gate.
 
 ### A daemon's boot lines land in whichever test window is open
 
@@ -2550,6 +2605,83 @@ Recorded rather than fixed, because each way out costs more than the noise:
   its own.
 
 Not by redirecting the shim's stderr: rustup reports real errors on it.
+
+### A C test whose compilation fails is skipped, not red
+
+`compile_c_tests` (`tests/toyos.rs`) wraps each compile in `catch_unwind` and
+drops the ones that panic, printing a line to stderr and nothing else. Eleven of
+the 121 discovered tests are in that state on 2026-08-05 — `78_vla_label`,
+`79_vla_continue`, `83_utf8_in_identifiers`, `85_asm_outside_function`,
+`89_nocode_wanted`, `94_generic`, `95_bitfields`, `95_bitfields_ms`,
+`96_nodata_wanted`, `98_al_ax_extend`, `99_fastcall` — and none of them is in
+`C_SKIP`, so nothing in the tree records that they are meant to be failing.
+
+The consequence for anyone changing the compiler: a change that breaks a C test
+*at compile time* moves it into this list rather than turning the suite red.
+`82_attribs_position` did exactly that during the `__attribute__` work and only
+the stderr line caught it. The check that works is to diff the skipped list
+across the change; the fix would be to make the list a fixture the suite asserts
+against.
+
+`tests/testcases/pp_tcc/` (25 preprocessor cases with `.expect` files) is read by
+nothing at all — `compile::testcases_dir()` returns only `tests/testcases/tinycc`
+and no other Rust file mentions `pp_tcc`.
+
+### `toyos-cc` is not reproducible: the same source gives a different object
+
+Measured 2026-08-05. One binary, one source file, three runs:
+`d_event.c` from doomgeneric produced three objects that differ from each other
+at byte 345. The sizes are identical and the code is identical; what moves is
+where each BSS symbol lands — `eventhead`, `events` and `eventtail` swap
+between offsets 0, 4 and 0x500 from run to run. A `HashMap` iteration order
+somewhere in `codegen` is the obvious suspect and was not chased.
+
+Across doomgeneric's 82 sources, comparing one binary against *itself* on two
+runs, 14 objects differ by disassembly. So a byte-for-byte object diff is not
+available as evidence that a compiler change was inert, and anyone who tries
+one will find 40-odd differences and no change behind them. What does work is
+diffing preprocessed output, which is stable — that comparison was byte
+identical on all 82 across the `__attribute__` change.
+
+Consequences beyond that: no build cache anywhere can trust an object hash, and
+a miscompilation that depends on symbol placement would not reproduce.
+
+### `toyos-cc` does not implement packed bitfield layout, and says so
+
+`__attribute__((packed))` on a struct with a bitfield member is refused —
+`resolve_struct` in `toyos-cc/src/codegen/resolve.rs`, covered by
+`toyos-cc/tests/attributes.rs`. Packed and unpacked bitfields are different
+algorithms rather than one algorithm with a flag: gcc allocates a packed
+bitfield's bits contiguously from the current bit position and lets a field
+straddle what would have been a storage-unit boundary, where
+`walk_struct_layout` picks a storage unit of the member's own type and starts a
+new one whenever the next field would not fit. `codegen/bitfield.rs` loads and
+stores through `clif_type(storage_ty)` at the field's byte offset, which a
+straddling field has no single unit for.
+
+`specs/wlan-plan.md` §10 counts 635 `__packed` uses in the AX210 subset. However
+many of those carry bitfields is how much of this W6 needs.
+
+### `toyos-cc` does not define `__GNUC__`, so doomgeneric compiles unpacked
+
+`PACKEDATTR` in `userland/doom/include/doomtype.h` and in doomgeneric's own
+`doomtype.h` is `__attribute__((packed))` under `#ifdef __GNUC__` and empty
+otherwise, and toyos-cc seeds neither `__GNUC__` nor `__GNUC_MINOR__`. Measured:
+preprocessing `w_wad.c` through toyos-cc yields zero occurrences of either
+`PACKEDATTR` or `__attribute__`, and `} PACKEDATTR wadinfo_t;` arrives at the
+parser as `} wadinfo_t;`.
+
+This is inert today and was checked rather than assumed. Compiling doomgeneric's
+fourteen `PACKEDATTR` structs with clang twice, once with the macro empty and
+once with it expanded, moves **no field offset at all** and changes one size:
+`pcx_t` is 130 unpacked and 129 packed. `WritePCXfile` never takes
+`sizeof(pcx_t)` — it writes the header field by field and derives the length
+from its own pack pointer, and `offsetof(pcx_t, data)` is 128 either way. The
+remaining thirteen differ only in alignment, and every one of them is read
+through a pointer into a WAD buffer.
+
+Defining `__GNUC__` would be a much larger change than it looks: it turns on
+every `#ifdef __GNUC__` block in doomgeneric and in any header that has one.
 
 ---
 
