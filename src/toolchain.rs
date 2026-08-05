@@ -510,31 +510,32 @@ fn adopt_shared_sysroot(
     // claim refuses the only checkout that cannot merge its way out, and the
     // holder claims back: six landing attempts, four witness rewrites in 38
     // minutes, one gate dead with 156 refusals.
-    assert_ne!(
-        standing(root),
-        Standing::MatchesMain,
-        "this worktree and the shared sysroot at {} disagree about {}, so a build here \
-         would link its kernel against another checkout's struct layouts.\n\
-         Your toyos-abi and toyos are byte-identical to main's, so there is nothing here \
-         to claim with: the sysroot belongs to {}, for a change that is not on main yet.\n\
-         **Wait for it to land and merge main.** This refusal then ends by itself.\n\
-         Do not pass --claim-sysroot. It would rebuild the sysroot from main's sources, \
-         which is what every other worktree already has, and refuse the one checkout that \
-         cannot merge its way out.",
-        rust_dir.display(),
-        differs,
-        holder(rust_dir),
-    );
-    assert_ne!(
-        standing(root),
-        Standing::Unknown,
-        "this worktree and the shared sysroot at {} disagree about {}, and git cannot say \
-         whether this checkout differs from main — so whether it has any standing to claim \
-         is unknown, and a claim is destructive. Check `git diff main -- {}`.",
-        rust_dir.display(),
-        differs,
-        SYSROOT_SOURCES.join(" "),
-    );
+    // `panic!` and not `assert_ne!`, because the message is the whole product of
+    // this branch and `left: MatchesMain / right: MatchesMain` under it is
+    // noise an agent has to read past.
+    match standing(root) {
+        Standing::MatchesMain => panic!(
+            "this worktree and the shared sysroot at {} disagree about {differs}, so a build \
+             here would link its kernel against another checkout's struct layouts.\n\
+             Your toyos-abi and toyos are byte-identical to main's, so there is nothing here \
+             to claim with: the sysroot belongs to {}, for a change that is not on main yet.\n\
+             **Wait for it to land and merge main.** This refusal then ends by itself.\n\
+             Do not pass --claim-sysroot. It would rebuild the sysroot from main's sources, \
+             which is what every other worktree already has, and refuse the one checkout \
+             that cannot merge its way out.",
+            rust_dir.display(),
+            holder(rust_dir),
+        ),
+        Standing::Unknown => panic!(
+            "this worktree and the shared sysroot at {} disagree about {differs}, and git \
+             cannot say whether this checkout differs from main — so whether it has any \
+             standing to claim is unknown, and a claim is destructive.\n\
+             Check `git diff main -- {}`.",
+            rust_dir.display(),
+            SYSROOT_SOURCES.join(" "),
+        ),
+        Standing::Diverged => {}
+    }
 
     assert!(
         claim,
