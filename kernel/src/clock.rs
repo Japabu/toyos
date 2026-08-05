@@ -94,6 +94,16 @@ static WALL_KNOWN: AtomicBool = AtomicBool::new(false);
 /// clock syscall. A machine whose RTC will not answer logs why and boots with
 /// no wall clock, which is a state and not a failure.
 pub fn init_wall(century_reg: Option<u8>, utc_offset_minutes: Option<i32>) {
+    // A machine whose firmware names a zone. OVMF ships
+    // `EFI_UNSPECIFIED_TIMEZONE` and nothing in QEMU sets the UEFI variable
+    // that would change it, so every emulated boot takes the "assume UTC"
+    // branch and the arithmetic that separates local time from UTC is
+    // otherwise never run. Two hours east, which is the owner's own zone and
+    // the sign that matters: UEFI's relation is `Localtime = UTC - TimeZone`,
+    // so UTC+2 reports -120 and UTC is *behind* what the RTC reads.
+    let utc_offset_minutes =
+        if cfg!(feature = "rtc-zone-east") { Some(-120) } else { utc_offset_minutes };
+
     let civil = match crate::rtc::read(century_reg) {
         Ok(civil) => civil,
         Err(fault) => {

@@ -278,6 +278,11 @@ rtc-dead = []
 rtc-unstable = []
 rtc-no-century = []
 rtc-century-next = []
+# A machine whose firmware names its zone. OVMF ships EFI_UNSPECIFIED_TIMEZONE
+# and nothing in QEMU sets the UEFI variable that would change it, so without
+# this every emulated boot assumes UTC and the arithmetic between local time and
+# UTC never runs. See `clock::init_wall`.
+rtc-zone-east = []
 
 # debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]

@@ -92,6 +92,13 @@ fn names(entries: &[&Entry]) -> String {
 }
 
 /// The clock lines from a boot log, for a failure message that says why.
+/// What `wall_clock_now` printed for `SYS_CLOCK_EPOCH`.
+fn probed_epoch(log: &str) -> Option<i64> {
+    let line = log.lines().find(|l| l.contains("wall-clock: epoch="))?;
+    let rest = line.split("epoch=").nth(1)?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
 fn clock_lines(log: &str) -> String {
     let lines: Vec<&str> = log
         .lines()
@@ -145,6 +152,10 @@ fn boot_and_read(
     );
     let mut log = qemu.boot_log().to_string();
     serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+    // What the two clock syscalls answer, which nothing on the volume can show:
+    // the file name is local time and `SYS_CLOCK_EPOCH` serves UTC.
+    let probe = qemu.run_test("test_rs_wall_clock_now", Duration::from_secs(30));
+    log.push_str(&probe.stdout);
     writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
     qemu.flush_stdin();
     log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
@@ -233,9 +244,30 @@ pub fn wall_clock_file(
     if mine.len == 0 {
         return Err(format!("{} is on the volume and empty", mine.name));
     }
+
+    // The other end of the same instant. Firmware named no zone on this
+    // machine — OVMF ships `EFI_UNSPECIFIED_TIMEZONE` — so the kernel takes the
+    // RTC as UTC and the epoch syscall must answer the staged instant itself.
+    // A kernel serving 1970, or serving local time shifted by a zone it
+    // invented, lands outside this window.
+    let Some(epoch) = probed_epoch(&log) else {
+        return Err(format!(
+            "the guest never printed what `SYS_CLOCK_EPOCH` answered\n{}",
+            clock_lines(&log)
+        ));
+    };
+    let epoch_drift = epoch - RTC_BASE_SECS;
+    if !(0..=MAX_BOOT_DRIFT_SECS).contains(&epoch_drift) {
+        return Err(format!(
+            "`SYS_CLOCK_EPOCH` answered {epoch}, {epoch_drift}s from the {RTC_BASE} the host set \
+             and outside 0..={MAX_BOOT_DRIFT_SECS}\n{}",
+            clock_lines(&log)
+        ));
+    }
+
     eprintln!(
-        "  [clock] {} carries {} bytes, stamped {drift}s after the {RTC_BASE} the host set; \
-         {} deleted for the {MAX_LOG_FILES}-log bound",
+        "  [clock] {} carries {} bytes, stamped {drift}s after the {RTC_BASE} the host set, epoch \
+         {epoch_drift}s after it; {} deleted for the {MAX_LOG_FILES}-log bound",
         mine.name, mine.len, oldest
     );
     Ok(())
@@ -268,7 +300,73 @@ pub fn wall_clock_refusals(
         "no two of 4 reads agreed",
     )?;
     no_century(test_config, c_bins, rust_bins)?;
-    century_from_the_register(test_config, c_bins, rust_bins)
+    century_from_the_register(test_config, c_bins, rust_bins)?;
+    zone_from_firmware(test_config, c_bins, rust_bins)
+}
+
+/// A firmware-named zone separates local time from UTC, in the direction UEFI
+/// defines.
+///
+/// The clock the RTC reads is local by firmware's account, so the file name and
+/// every FAT stamp stay on the staged instant; only `SYS_CLOCK_EPOCH` moves.
+/// UEFI's relation is `Localtime = UTC - TimeZone`, so the two hours east this
+/// stages report -120 and UTC comes out *behind* the RTC — the sign that a
+/// reader of the field gets backwards, and the one that would put a dual-booted
+/// laptop four hours out rather than two.
+fn zone_from_firmware(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURES: &[&str] = &["rtc-zone-east"];
+    /// What `clock::init_wall` stages, in seconds: two hours east of UTC.
+    const OFFSET_SECS: i64 = -120 * 60;
+
+    let (entries, log) =
+        boot_and_read(test_config, c_bins, rust_bins, "wall-clock-zone.img", FEATURES, &[])?;
+    let logs = logs(&entries);
+
+    let [only] = logs.as_slice() else {
+        return Err(format!("the volume holds {} logs, wanted one: {}", logs.len(), names(&logs)));
+    };
+    // Unmoved: FAT stores local time by specification, and so does the name.
+    if !only.name.starts_with(RTC_BASE_DATE) {
+        return Err(format!(
+            "a zone moved this boot's *local* time: the log is {} and the host staged \
+             {RTC_BASE}\n{}",
+            only.name,
+            clock_lines(&log)
+        ));
+    }
+    let stamp_drift = only.modified - RTC_BASE_SECS;
+    if !(0..=MAX_BOOT_DRIFT_SECS).contains(&stamp_drift) {
+        return Err(format!(
+            "a zone moved this boot's FAT timestamp by {stamp_drift}s, and FAT stores local time"
+        ));
+    }
+
+    let Some(epoch) = probed_epoch(&log) else {
+        return Err(format!(
+            "the guest never printed what `SYS_CLOCK_EPOCH` answered\n{}",
+            clock_lines(&log)
+        ));
+    };
+    let drift = epoch - (RTC_BASE_SECS + OFFSET_SECS);
+    if !(0..=MAX_BOOT_DRIFT_SECS).contains(&drift) {
+        let unshifted = epoch - RTC_BASE_SECS;
+        return Err(format!(
+            "with firmware naming -120 minutes, `SYS_CLOCK_EPOCH` answered {epoch}: {drift}s from \
+             the UTC that implies, and {unshifted}s from the RTC's own reading. Zero for the \
+             second means the offset was dropped; {}s means its sign is inverted\n{}",
+            -OFFSET_SECS * 2,
+            clock_lines(&log)
+        ));
+    }
+    eprintln!(
+        "  [clock] firmware naming -120 minutes: {} keeps local time, epoch is {}s behind it",
+        only.name, -OFFSET_SECS
+    );
+    Ok(())
 }
 
 /// A machine whose clock will not answer still boots, still logs, and says so
@@ -308,6 +406,16 @@ fn undated(
     if !log.contains("Boot: complete") {
         return Err(format!("with {features:?} the boot never completed\n{log}"));
     }
+    // Userland is told the same thing the kernel knows. A syscall answering
+    // 1970 here is the defect this whole shape exists to make impossible: the
+    // caller cannot tell it from a machine that really is at the epoch.
+    if !log.contains("wall-clock: no epoch") {
+        return Err(format!(
+            "with {features:?} the clock syscalls did not refuse a process the way the kernel \
+             refused itself\n{}",
+            clock_lines(&log)
+        ));
+    }
     if only.len == 0 {
         return Err(format!("with {features:?} {} is on the volume and empty", only.name));
     }
@@ -330,7 +438,13 @@ fn no_century(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["rtc-no-century"];
+    // Both, and the second is what gives this teeth. With the register left as
+    // the machine has it, honouring the FADT's "none" and ignoring it produce
+    // the same year — 2000 plus two digits, and a register holding 20 — so a
+    // kernel that read a hardcoded 0x32 would pass. Staging the register at the
+    // *next* century separates them: honouring the table gives 2033 and
+    // ignoring it gives 2133.
+    const FEATURES: &[&str] = &["rtc-no-century", "rtc-century-next"];
     let (entries, log) =
         boot_and_read(test_config, c_bins, rust_bins, "wall-clock-no-century.img", FEATURES, &[])?;
     let logs = logs(&entries);
@@ -346,13 +460,17 @@ fn no_century(
     };
     if !only.name.starts_with(RTC_BASE_DATE) {
         return Err(format!(
-            "with no century register this boot's log is {}, and two digits plus 2000 is still \
-             {RTC_BASE_DATE}\n{}",
+            "with no century register this boot's log is {}, and two digits plus 2000 is \
+             {RTC_BASE_DATE} — a name in 2133 means the register was read anyway\n{}",
             only.name,
             clock_lines(&log)
         ));
     }
-    eprintln!("  [clock] no century register: {}, from two digits and 2000", only.name);
+    eprintln!(
+        "  [clock] no century register: {}, from two digits and 2000, with the register itself \
+         staged a century away",
+        only.name
+    );
     Ok(())
 }
 
