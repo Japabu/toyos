@@ -11,6 +11,8 @@ pub mod faults;
 #[allow(dead_code)]
 pub mod gpt;
 #[allow(dead_code)]
+pub mod hda;
+#[allow(dead_code)]
 pub mod iommu;
 #[allow(dead_code)]
 pub mod qemu;

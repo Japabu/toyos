@@ -42,6 +42,25 @@ pub struct ParamType {
 pub struct StructDef {
     pub name: Option<String>,
     pub fields: Vec<FieldDef>,
+    /// `__attribute__((packed))`: every member sits at the next free byte.
+    pub packed: bool,
+    /// `__attribute__((aligned(n)))`, which raises alignment and never lowers it.
+    pub align: Option<usize>,
+}
+
+impl StructDef {
+    fn field_align(&self, field: &FieldDef) -> usize {
+        if self.packed { 1 } else { field.ty.align() }
+    }
+
+    fn alignment(&self) -> usize {
+        let natural = if self.packed {
+            1
+        } else {
+            self.fields.iter().map(|f| f.ty.align()).max().unwrap_or(1)
+        };
+        natural.max(self.align.unwrap_or(1))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,8 +114,7 @@ impl CType {
             CType::LongDouble | CType::Int128(_) => 16,
             CType::Array(elem, _) => elem.align(),
             CType::Function(..) => 8,
-            CType::Struct(def) => def.fields.iter().map(|f| f.ty.align()).max().unwrap_or(1),
-            CType::Union(def) => def.fields.iter().map(|f| f.ty.align()).max().unwrap_or(1),
+            CType::Struct(def) | CType::Union(def) => def.alignment(),
         }
     }
 
@@ -144,6 +162,7 @@ impl CType {
         let mut bit_unit_size = 0usize;
         for field in &def.fields {
             if let Some(bw) = field.bit_width {
+                assert!(!def.packed, "packed bitfield layout is not implemented by toyos-cc");
                 let unit_size = field.ty.size();
                 let unit_bits = (unit_size * 8) as u32;
                 let align = field.ty.align();
@@ -182,7 +201,7 @@ impl CType {
                 }
                 continue;
             }
-            let align = field.ty.align();
+            let align = def.field_align(field);
             offset = (offset + align - 1) & !(align - 1);
             if let Some(r) = visitor(offset, 0, field) {
                 return (offset, Some(r));

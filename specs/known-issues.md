@@ -1958,9 +1958,93 @@ The nearest suspect on file is §10's ESP-log flush on the idle path and the
 place a `--smp 1` machine spends the time between audio periods. That is a
 hypothesis, not a measurement.
 
+### OPEN — nothing explains why doom's audio callback stalled on the T14
+
+doom's sound producer can no longer kill the game when its callback stops
+consuming — `doom_sound_flood` stages exactly that and the game lives — and
+that is the whole of what is now known. **Why the callback stopped on the
+owner's machine, about five seconds into play, is not.** The evidence is one
+abort message, because the process that would have carried the answer is the
+one that died.
+
+An audio client's RT standing is *lent*, not held: soundd claims the audio
+device, takes the RT band with it (`main.rs:705`), and every pipe write it
+makes lends the woken reader a one-quantum window (`wake_pipe_readers`, spec
+§8.5). **On a machine with no audio device none of that happens.** The null
+sink deliberately does not request the band — it protects no audible output —
+so `driver::current_is_rt()` is false at its `signal_clients` write and the
+client's callback thread is woken as an ordinary thread. The T14 has no audio
+device. So the one thing that keeps a 2.9 ms deadline met was absent there and
+is present in every config the suite runs.
+
+That is a mechanism, not a measurement, and two others are equally live: §1's
+`drain_irqs` entry, where any syscall on that thread can become the USB
+driver's engine for as long as a second; and plain scheduling pressure from a
+game thread and a compositor that never yield to it.
+
+What would decide it is the callback's own period count against wall clock, on
+that machine. doom now keeps that counter (`MIXED_PERIODS`) and now survives
+the stall, so the next T14 session can be asked the question instead of losing
+the process that would have answered it.
+
 ---
 
 ## 5. Diagnostics
+
+### OPEN — QEMU 11.0.3 sets `ECAP.PT`, so `Iova::identity`'s comment gives a false reason for correct behaviour
+
+Measured 2026-08-05 off the `hda_probe` boot, in the unit configuration
+`specs/iommu-spec.md` §8.1 recorded on 11.0.2:
+
+```
+§8.1, QEMU 11.0.2:  cap=0x80d2008c222f06c6 ecap=0x0000000000f00f0a … pt=n
+this host, 11.0.3:  cap=0x80d2008c222f0686 ecap=0x0000000000f00f4a … pt=y
+```
+
+`ECAP` bit 6 is now set and the kernel's own decode prints `pt=y`. `CAP` moved
+too (`…06c6` → `…0686`); which bit that is has not been decoded here, and the
+raw words are recorded so the next reader need not take a name for it.
+
+**No behaviour is affected.** §5.7 already writes an identity-mapped domain
+"always, and never a passthrough context entry, even on a unit that offers
+one", and §8's item 8 carries the argument. What is now false is the *reason*
+attached to it: `kernel/src/iommu/mod.rs`'s `Iova::identity` says "§8.1 measured
+`ECAP.PT` clear on the only unit anyone here can boot, **so** §5.7's passthrough
+context type is unavailable" — a premise this host contradicts, which leaves a
+correct decision resting on a reason that has stopped being true. §5.7's own
+argument does not depend on it and is the one to keep.
+
+### OPEN — `--diag-boot` cannot carry a kernel feature, so H0's probe is not in the flashed image
+
+`specs/hda-driver-plan.md` H0 is built and behind the kernel feature
+`hda-probe` (`kernel/src/drivers/hda_probe.rs`), which is how "nothing in the
+ordinary boot path takes that controller out of reset" is enforced —
+`cargo test -- hda_probe` boots the diag config with the feature, asserts every
+verdict, then boots the same machine with a plain kernel and requires no `hda:`
+line at all. What is missing is one line: `src/build.rs:463` sets
+`kernel_features` from `debug` alone, so `Boot::Diag` builds the same kernel as
+`Boot::Normal` and the image the owner flashes carries no probe.
+
+The obstacle is not the size of the change, it is where it lands. `Boot::Diag`'s
+own doc says the diagnostic image's kernel is byte-identical to the ordinary
+one's and that "a `#[cfg]` could not have given us that" — so making the diag
+image a different kernel build changes a stated guarantee of that mode, and it
+belongs to whoever owns `src/`. H0's author held `kernel/` and the harness and
+was told not to touch `src/`, where another agent was working.
+
+Two shapes, and the owner should pick rather than the next agent guessing:
+
+1. **`Boot::Diag` gets a feature list of its own.** Smallest diff, and it makes
+   the diag kernel a second build — visibly, since the artifact key already
+   hashes the feature set. The guarantee in the doc becomes "same sources,
+   stated feature difference".
+2. **A `--kernel-feature <name>` flag on `cargo run`**, orthogonal to the boot
+   mode. Keeps `Boot::Diag` byte-identical by default and makes taking hardware
+   out of reset an explicit act, which is the honest shape for this. Costs one
+   more thing to remember at flash time.
+
+Until one of them lands, the T14's answer to `hda-driver-plan.md` §6.3 is
+unreachable — and that answer decides the whole audio track (§6.3's (b) block).
 
 ### OPEN — a boot that wedges before the idle loop says nothing at all
 
@@ -2092,11 +2176,27 @@ the moment each was re-run by itself in the same process. None predates or was
 introduced by the parallel-width work; all have been `Sched::Parallel` since the
 phase landed, and none reproduces on a host running one suite.
 
-- **`i8042_mouse`** — CLOSED. The verdict was a drain rate (`at least half of a
-  thousand injected packets arrived`) and it is now the full count with the
-  injection paced against the guest's own report of each packet, so nothing the
-  host does can outrun the guest. `0 discarded` is unchanged and joined by
-  `0 overruns`, `0 dropped`, `0 lost edges`. `specs/test-cost-audit.md` §5.5.2.
+- **`i8042_mouse`** — REOPENED 2026-08-05, and the closing argument is the thing
+  that is wrong. It read: the injection is paced against the guest's own report
+  of each packet, "so nothing the host does can outrun the guest". Outrunning is
+  not the failure mode left. The host now *stalls* — it waits for a packet the
+  guest never delivers and the test times out at 60 s:
+
+      FAIL i8042_mouse: timed out after 60s — 271 of the 303 packets injected
+      came back out, so the host stalled on one the machine never delivered
+
+  Pacing converted a lost packet from a miscount into a deadlock, so the verdict
+  is now a wall-clock timeout wearing a count's clothes. Measured on a loaded
+  host (four worktrees), alternating one checkout against the other in one
+  session, six runs: **main FAIL(271/303), PASS(3s), PASS(3s); a branch that
+  touches no input code FAIL(976/1004), FAIL(813/845), PASS(3s), PASS(4s)**. It
+  reds on `main` as readily as anywhere else, so it is not attributable to
+  whatever branch happens to be under it, and a green run costs 3 s against a
+  red one's 60 s. The prior text also predates §3's finding below, which says
+  the pacing argument never covered `0 lost edges` either.
+
+  Anyone whose suite reds here: re-run it alone before believing it, and if it
+  goes green the classification is the bug rather than your change.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
@@ -2108,6 +2208,12 @@ phase landed, and none reproduces on a host running one suite.
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
   `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`.
+- **`desktop_locale_detect`** — added 2026-08-05. Same `nothing typed at the
+  terminal window reached a shell`, same `ALONE … GREEN`, in the same run as the
+  entry above and on a branch that touches neither the compositor nor the
+  terminal. It reaches a shell through `shell_answers` exactly as
+  `desktop_typing_damage` does, so it inherits that retry window and evidently
+  not enough of it. Still `Sched::Parallel`.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
@@ -2500,6 +2606,83 @@ Recorded rather than fixed, because each way out costs more than the noise:
 
 Not by redirecting the shim's stderr: rustup reports real errors on it.
 
+### A C test whose compilation fails is skipped, not red
+
+`compile_c_tests` (`tests/toyos.rs`) wraps each compile in `catch_unwind` and
+drops the ones that panic, printing a line to stderr and nothing else. Eleven of
+the 121 discovered tests are in that state on 2026-08-05 — `78_vla_label`,
+`79_vla_continue`, `83_utf8_in_identifiers`, `85_asm_outside_function`,
+`89_nocode_wanted`, `94_generic`, `95_bitfields`, `95_bitfields_ms`,
+`96_nodata_wanted`, `98_al_ax_extend`, `99_fastcall` — and none of them is in
+`C_SKIP`, so nothing in the tree records that they are meant to be failing.
+
+The consequence for anyone changing the compiler: a change that breaks a C test
+*at compile time* moves it into this list rather than turning the suite red.
+`82_attribs_position` did exactly that during the `__attribute__` work and only
+the stderr line caught it. The check that works is to diff the skipped list
+across the change; the fix would be to make the list a fixture the suite asserts
+against.
+
+`tests/testcases/pp_tcc/` (25 preprocessor cases with `.expect` files) is read by
+nothing at all — `compile::testcases_dir()` returns only `tests/testcases/tinycc`
+and no other Rust file mentions `pp_tcc`.
+
+### `toyos-cc` is not reproducible: the same source gives a different object
+
+Measured 2026-08-05. One binary, one source file, three runs:
+`d_event.c` from doomgeneric produced three objects that differ from each other
+at byte 345. The sizes are identical and the code is identical; what moves is
+where each BSS symbol lands — `eventhead`, `events` and `eventtail` swap
+between offsets 0, 4 and 0x500 from run to run. A `HashMap` iteration order
+somewhere in `codegen` is the obvious suspect and was not chased.
+
+Across doomgeneric's 82 sources, comparing one binary against *itself* on two
+runs, 14 objects differ by disassembly. So a byte-for-byte object diff is not
+available as evidence that a compiler change was inert, and anyone who tries
+one will find 40-odd differences and no change behind them. What does work is
+diffing preprocessed output, which is stable — that comparison was byte
+identical on all 82 across the `__attribute__` change.
+
+Consequences beyond that: no build cache anywhere can trust an object hash, and
+a miscompilation that depends on symbol placement would not reproduce.
+
+### `toyos-cc` does not implement packed bitfield layout, and says so
+
+`__attribute__((packed))` on a struct with a bitfield member is refused —
+`resolve_struct` in `toyos-cc/src/codegen/resolve.rs`, covered by
+`toyos-cc/tests/attributes.rs`. Packed and unpacked bitfields are different
+algorithms rather than one algorithm with a flag: gcc allocates a packed
+bitfield's bits contiguously from the current bit position and lets a field
+straddle what would have been a storage-unit boundary, where
+`walk_struct_layout` picks a storage unit of the member's own type and starts a
+new one whenever the next field would not fit. `codegen/bitfield.rs` loads and
+stores through `clif_type(storage_ty)` at the field's byte offset, which a
+straddling field has no single unit for.
+
+`specs/wlan-plan.md` §10 counts 635 `__packed` uses in the AX210 subset. However
+many of those carry bitfields is how much of this W6 needs.
+
+### `toyos-cc` does not define `__GNUC__`, so doomgeneric compiles unpacked
+
+`PACKEDATTR` in `userland/doom/include/doomtype.h` and in doomgeneric's own
+`doomtype.h` is `__attribute__((packed))` under `#ifdef __GNUC__` and empty
+otherwise, and toyos-cc seeds neither `__GNUC__` nor `__GNUC_MINOR__`. Measured:
+preprocessing `w_wad.c` through toyos-cc yields zero occurrences of either
+`PACKEDATTR` or `__attribute__`, and `} PACKEDATTR wadinfo_t;` arrives at the
+parser as `} wadinfo_t;`.
+
+This is inert today and was checked rather than assumed. Compiling doomgeneric's
+fourteen `PACKEDATTR` structs with clang twice, once with the macro empty and
+once with it expanded, moves **no field offset at all** and changes one size:
+`pcx_t` is 130 unpacked and 129 packed. `WritePCXfile` never takes
+`sizeof(pcx_t)` — it writes the header field by field and derives the length
+from its own pack pointer, and `offsetof(pcx_t, data)` is 128 either way. The
+remaining thirteen differ only in alignment, and every one of them is read
+through a pointer into a WAD buffer.
+
+Defining `__GNUC__` would be a much larger change than it looks: it turns on
+every `#ifdef __GNUC__` block in doomgeneric and in any header that has one.
+
 ---
 
 ## 7. Design debt
@@ -2640,6 +2823,27 @@ Two ways to close it, and the choice belongs with the suite work rather than
 here: move `i8042_mouse` back to `Sched::Serial`, or split the verdict so the
 paced count stays parallel and the lost-edge claim runs where the host is not
 oversubscribed.
+
+**2026-08-05: the *count* now fails too, which the second option above would not
+have caught.** On the `hda-probe` branch, with eight worktrees live on the host:
+
+```
+FAIL i8042_mouse: 996 pointer events reached userland out of 1004 packets
+injected, each one paced against the arrival of the last
+  FAIL  i8042_mouse  (60s)
+  …
+  [i8042] 1008 packets injected, 1008 out, last button state 0x00
+  PASS  i8042_mouse  (570ms)
+  ALONE i8042_mouse: GREEN
+```
+
+Sixty seconds in the wide phase against 570 ms alone, and eight of 1004 packets
+missing rather than an edge miscounted. So the pacing argument does not hold for
+the count either under this much contention — the guest is slow enough that
+something upstream of the count gives up before the packet arrives. Splitting
+the verdict therefore fixes only half of it, and `Sched::Serial` is the option
+that closes both. The branch that saw it changes no port I/O and no input path:
+its only ungated change anywhere is one extra field on the `iommu: unitN` line.
 
 ### Device registers still take firmware's word for being uncacheable
 

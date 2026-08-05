@@ -219,6 +219,18 @@ every run after a kernel change. **A gate written the house way currently costs
 rate much; §3.3 divides it by the parallel width, which is the only lever that
 does.
 
+**One post-wave-5 instance, and it says the marginal rate is now a different
+question.** `doom_sound_flood` (2026-08-05) is a `Sched::Parallel` machine test
+on a config of its own — `tests/doomcase`, doom beside soundd: **28 s of one
+worker's time inside a 602.6 s wide phase**, which is ~2.3 s of suite wall at
+width 12 and nowhere near the phase's longest job. Its own initrd and doom's
+cold C build are paid once per tree, not per run. So what a new test costs is
+no longer a per-test constant but the question of whether it lands on the
+critical path, and for a wide phase that is the single longest job in it. Three
+other worktrees' suites were on the host throughout that run, so its 602.6 s is
+not comparable to any quiet-host figure here — the 28 s is, because nothing in
+the test waits on a wall clock.
+
 ---
 
 ## 2. Classification

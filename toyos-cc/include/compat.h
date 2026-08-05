@@ -54,11 +54,6 @@
 #define __INTMAX_TYPE__     long int
 #define __UINTMAX_TYPE__    long unsigned int
 
-/* Compiler attributes — not supported, strip them */
-#define __attribute__(x)
-#define __attribute(x)
-#define __declspec(x)
-
 /* Feature predicates — C99 only, we support nothing */
 #define __has_builtin(x) 0
 #define __has_feature(x) 0
