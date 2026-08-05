@@ -2367,6 +2367,12 @@ phase landed, and none reproduces on a host running one suite.
   terminal. It reaches a shell through `shell_answers` exactly as
   `desktop_typing_damage` does, so it inherits that retry window and evidently
   not enough of it. Still `Sched::Parallel`.
+- **`netd_connection_caps`** — added 2026-08-05. Red at 50 s inside a landing
+  gate that was otherwise 257/259 with 0 invalidated, green in 7 s alone on the
+  same tree moments later, on a branch that touches neither netd nor the
+  network stack. The 50 s against a 7 s solo run is the shape of a boot that
+  never got enough of the host, not of a cap that was announced wrong. Still
+  `Sched::Parallel`.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
