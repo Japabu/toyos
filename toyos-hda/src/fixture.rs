@@ -19,6 +19,13 @@ pub fn t14() -> Vec<Codec> {
     parse(include_str!("../fixtures/alc257-t14.txt"))
 }
 
+/// QEMU's `intel-hda` with an `hda-output` and an `hda-duplex` behind it, as
+/// the same probe read them. The harness's own machine, so what the suite
+/// exercises is a graph and not a hand-written expectation of one.
+pub fn qemu() -> Vec<Codec> {
+    parse(include_str!("../fixtures/qemu-intel-hda.txt"))
+}
+
 fn hex(text: &str) -> Option<u32> {
     u32::from_str_radix(text.strip_prefix("0x").unwrap_or(text), 16).ok()
 }

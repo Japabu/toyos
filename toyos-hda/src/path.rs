@@ -293,6 +293,36 @@ mod tests {
     }
 
     #[test]
+    fn qemu_offers_no_speaker_pin_and_is_refused_by_name() {
+        // **A finding, not a defect here.** Both of QEMU's codec models fix
+        // their configuration default at line-out and no device property
+        // changes it, so §2.3's speaker rule refuses the harness's own
+        // machine. H4's QEMU arm therefore cannot bind an output with this
+        // rule as written; the choice between widening it to line-out and
+        // testing only the refusal belongs to that stage.
+        match find_output_path(&fixture::qemu()) {
+            Err(PathError::NoSpeakerPin { codecs }) => {
+                assert_eq!(codecs, [Address::new(0).unwrap(), Address::new(1).unwrap()]);
+            }
+            other => panic!("QEMU has no speaker pin to find, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qemu_s_line_out_pin_traces_to_a_converter_all_the_same() {
+        // So the refusal above is about what the pin is *for* and not about a
+        // graph this crate cannot walk — which is the difference between a
+        // policy H4 may widen and a bug it would inherit.
+        let codecs = fixture::qemu();
+        let group = &codecs[0].groups[0];
+        let line_out: Vec<Node> = outputs(group, DefaultDevice::LineOut).collect();
+        assert_eq!(line_out, [Node(0x03)]);
+        let (converter, route) = trace(group, Node(0x03)).unwrap();
+        assert_eq!(converter, Node(0x02));
+        assert!(route.is_empty());
+    }
+
+    #[test]
     fn a_cycle_is_a_refusal_and_not_a_hang() {
         let codecs = fixture::synthetic_cycle();
         match find_output_path(&codecs) {
