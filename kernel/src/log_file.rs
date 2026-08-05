@@ -8,6 +8,22 @@
 //! This gives it a channel that survives the power being cut: the stick it
 //! booted from.
 //!
+//! # One file per boot
+//!
+//! Named for the wall clock at the moment the sink installed, so the directory
+//! sorts into the order the boots happened in and the owner can say which file
+//! is the boot he is asking about. A boot whose clock never answered is named
+//! [`UNDATED_STEM`] and an index instead, because a file that claims a time it
+//! does not have is worse than one that says it has none.
+//!
+//! What this replaced was a single `kernel.log` appended across boots with one
+//! `kernel.log.1` beside it. Two boots' output in one file with nothing marking
+//! the seam is exactly the diagnostic the owner could not use, and the
+//! generation number said only "older", never *when*.
+//!
+//! [`MAX_LOG_FILES`] is what keeps that from growing without end, and it
+//! deletes oldest-first by the same order the names sort in.
+//!
 //! # Why not the ESP
 //!
 //! Because the log has to be *read*, and it is read on another machine. macOS
@@ -60,66 +76,85 @@
 //! machine. It did while the log shared the ESP with `BOOTx64.EFI` and
 //! `kernel.elf`, where a write interrupted between allocating a cluster and
 //! recording it leaves a volume that may not boot. On its own partition the
-//! worst a half-finished write can cost is this file and the one generation
-//! beside it, which is a diagnostic and not the stick. The deadlock is what
-//! keeps the panic path out, and it is enough on its own.
+//! worst a half-finished write can cost is one boot's file, which is a
+//! diagnostic and not the stick. The deadlock is what keeps the panic path out,
+//! and it is enough on its own.
 //!
 //! The panic path keeps the on-screen console, which takes no lock of any kind.
 //! What the file gives a panic is everything up to the last idle pass — on any
 //! machine that reached the idle loop, everything but the panic itself, and the
 //! panic is on the screen.
 
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+use crate::clock::{self, Civil};
 use crate::drivers::log_ring;
 use crate::file_cache::{self, FileId};
 use crate::sync::Lock;
 use crate::vfs::{self, Vfs};
 
-/// Where the log goes.
+/// Where the logs go.
 ///
 /// The root of the log partition, so that plugging the stick into another
-/// machine puts `kernel.log` at the top of the window that opens. Nothing else
-/// is on this volume and nothing else is meant to be.
-const PATH: &str = "/log/kernel.log";
-/// What the previous [`PATH`] becomes when it fills.
-const PREVIOUS: &str = "/log/kernel.log.1";
+/// machine puts them at the top of the window that opens. Nothing else is on
+/// this volume and nothing else is meant to be — but userland may write here,
+/// so [`classify`] is strict about which names are this module's to delete.
+const DIR: &str = "/log";
 
-/// The mount [`PATH`] is on, for the per-mount sync each flush ends with.
+/// The mount [`DIR`] is on, for the per-mount sync each flush ends with.
 const MOUNT: &str = "log";
 
-/// How large [`PATH`] may get before it is rotated.
+/// The name a boot gets when the machine would not say what time it is.
 ///
-/// Derived from the partition, not picked. `create_log_volume` makes the
-/// smallest volume there is a FAT32 for, and `fsck_msdos` reports 68,551 free
-/// clusters of 512 bytes on a fresh one — 35,098,112 bytes. Two generations at
-/// this bound are 8 MiB, under a quarter of that, so a boot that rotates
-/// repeatedly cannot fill the volume and there is room left for anything a
-/// later diagnostic wants to drop beside it.
+/// A word and not a zero date: `0000-00-00-000000.log` sorts correctly and
+/// reads as a real timestamp that happens to be absurd, and the difference
+/// matters to whoever finds it on a stick six months from now.
+const UNDATED_STEM: &str = "unknown";
+
+/// How many of this module's files the volume keeps, including the one this
+/// boot is writing.
 ///
-/// The other end of the bound is that both generations are *read* in full:
-/// `/bin/console` seeds its scrollback from them at every framebuffer boot,
-/// off USB, before it paints anything. That is what stops this being the
-/// quarter-of-the-volume 8 MiB the space alone would allow.
+/// Sixteen boots of history, which is the number that makes "it broke after the
+/// firmware update" answerable by looking. Against the volume: `create_log_volume`
+/// makes the smallest volume there is a FAT32 for and `fsck_msdos` reports
+/// 35,098,112 free bytes on a fresh one, so sixteen files at [`MAX_LOG_BYTES`]
+/// is 16 MiB — under half, with the rest left for anything a later diagnostic
+/// wants to drop beside them. In practice a whole metal-sim boot's log measured
+/// 7,910 bytes, so sixteen of them are about 128 KiB.
 ///
-/// For scale rather than as a limit: a metal-sim boot's whole log to
-/// `Shutting down.` measured 7,910 bytes, so 4 MiB is several hundred boots of
-/// history in the current generation alone.
+/// When it is hit, the oldest file by [`classify`]'s order is deleted and a line
+/// naming it goes in the new file.
+const MAX_LOG_FILES: usize = 16;
+
+/// How many continuation files one boot may produce before the sink gives up.
+///
+/// A boot that fills [`MAX_LOG_BYTES`] carries on in `<stem>_0002.log` rather
+/// than dropping either end of its own log, and [`MAX_LOG_FILES`] deletes this
+/// boot's earlier parts as it goes. The bound exists because the part number is
+/// four digits wide and a fifth would sort before the fourth, putting retention
+/// in the wrong order; what a caller sees when it is hit is the sink disabling
+/// itself with a line saying so. At the shipped bound that is 10 GiB from one
+/// boot, so nothing but a log loop reaches it.
+const MAX_LOG_PARTS: u32 = 9999;
+
+/// How large one file may get before the next part starts.
+///
+/// One mebibyte: a boot that logs a hundred times more than any real one has
+/// still fits, and sixteen of them fit the volume with room to spare. It also
+/// bounds what `/bin/console` reads off USB before it paints anything, which is
+/// the other end of this number — it seeds its scrollback from the newest file
+/// at every framebuffer boot.
 ///
 /// The rotate-fast value exists for the same reason `test-small-caches` does:
 /// filling megabytes by logging would take a boot far longer than a test should
-/// wait, and the rotation code it drives is the shipped code — only the bound
-/// moves.
-///
-/// 256 rather than something rounder, and the number is measured. Of such a
-/// boot, 7,052 bytes are already in the ring when the sink installs and go out
-/// in one flush. At 1 KiB that is a *single* rotation — the remaining 858 bytes
-/// never fill a second file — and a single rotation never renames over an
-/// existing `kernel.log.1`, which is the half of the path that has to delete
-/// first. 256 rotates three or four times on the same boot depending on how the
-/// flushes fall, and `kernel_log_file` requires at least two.
+/// wait, and the code it drives is the shipped code — only the bound moves. 256
+/// bytes, so that one boot's own log crosses it many times over and drives both
+/// the continuation and the retention path.
 const MAX_LOG_BYTES: u64 = if cfg!(feature = "log-rotate-fast") {
     256
 } else {
-    4 * 1024 * 1024
+    1024 * 1024
 };
 
 /// Bytes moved per pass of the drain loop, and the size of the stack buffer it
@@ -154,9 +189,15 @@ const MAX_BLOCKED_NANOS: u64 = 10_000_000_000;
 
 struct Sink {
     file_id: FileId,
-    /// Bytes in [`PATH`] so far, which is what decides the next page index.
-    /// Kept here rather than read back from the file cache so a disagreement
-    /// shows up as a wrong offset rather than being silently corrected.
+    /// What every file this boot writes is named for: a timestamp, or
+    /// [`UNDATED_STEM`] and an index.
+    stem: String,
+    /// Which continuation this is. One is the file the boot started in.
+    part: u32,
+    /// Bytes in the current part so far, which is what decides the next page
+    /// index. Kept here rather than read back from the file cache so a
+    /// disagreement shows up as a wrong offset rather than being silently
+    /// corrected.
     size: u64,
     /// When the current run of polls that found the VFS lock held began.
     blocked_since: Option<u64>,
@@ -166,35 +207,55 @@ static SINK: Lock<Option<Sink>> = Lock::new(None);
 
 /// Start writing the kernel's log to the log volume. Call once, after `/log`
 /// is mounted.
-///
-/// Appends across boots rather than truncating: a machine that failed on its
-/// second boot is diagnosed by having the first one to compare against, and
-/// [`MAX_LOG_BYTES`] is what stops that growing without end.
 pub fn install() {
-    let mtime = crate::clock::nanos_since_boot();
-    let opened = {
-        let mut vfs = vfs::lock();
-        match vfs.open_file(PATH) {
-            Some(file_id) => Ok((file_id, file_cache::size(file_id))),
-            None => vfs.create_file(PATH, mtime).map(|file_id| (file_id, 0)),
-        }
+    let mut vfs = vfs::lock();
+
+    let existing = ours(&mut vfs);
+    // One below the bound, because this boot's own file is about to become the
+    // sixteenth. Reported into the ring, so the lines land in the file that
+    // replaced them.
+    let kept = sweep(&mut vfs, existing, MAX_LOG_FILES - 1);
+
+    let stem = match clock::local_secs() {
+        Some(secs) => stamp(secs),
+        None => match undated_stem(&kept) {
+            Some(stem) => stem,
+            None => {
+                log!("log-file: no free {UNDATED_STEM} name on {DIR}; this boot's log stays in memory");
+                return;
+            }
+        },
     };
-    let (file_id, size) = match opened {
-        Ok(pair) => pair,
+    // The first part number this boot's name does not already have on the
+    // volume. Two boots inside one second is a machine nobody has, but a test
+    // that stages the wall clock has it every run, and a colliding name would
+    // silently write over the older boot.
+    let Some(part) = (1..=MAX_LOG_PARTS).find(|p| !kept.contains(&path(&stem, *p))) else {
+        log!("log-file: {DIR} already holds every part of {stem}; this boot's log stays in memory");
+        return;
+    };
+
+    let path = path(&stem, part);
+    let file_id = match vfs.create_file(&path, clock::nanos_since_boot()) {
+        Ok(file_id) => file_id,
         Err(e) => {
-            log!("log-file: cannot open {PATH}: {e}");
+            log!("log-file: cannot create {path}: {e}");
             return;
         }
     };
-    *SINK.lock() = Some(Sink { file_id, size, blocked_since: None });
+    drop(vfs);
+
+    *SINK.lock() = Some(Sink { file_id, stem, part, size: 0, blocked_since: None });
     log_ring::enable_file_sink();
-    log!("log-file: this boot's kernel log continues in {PATH}, which holds {size} bytes");
+    log!("log-file: this boot's kernel log is {path}");
 }
 
 /// Where this boot's log can be read, or `None` when no sink installed — no
 /// `/log`, or a volume that would not give back the file.
-pub fn destination() -> Option<&'static str> {
-    SINK.lock().is_some().then_some(PATH)
+pub fn destination() -> Option<String> {
+    let guard = SINK.lock();
+    let sink = guard.as_ref()?;
+    Some(path(&sink.stem, sink.part))
 }
 
 /// Move whatever the ring owes into the file. Called from the idle loop.
@@ -208,17 +269,17 @@ pub fn poll() {
     let Some(sink) = guard.as_mut() else { return };
 
     let Some(mut vfs) = vfs::try_lock() else {
-        let now = crate::clock::nanos_since_boot();
+        let now = clock::nanos_since_boot();
         let since = *sink.blocked_since.get_or_insert(now);
         if now.saturating_sub(since) < MAX_BLOCKED_NANOS {
             return;
         }
-        let size = sink.size;
+        let stopped = sink.stopped_at();
         *guard = None;
         drop(guard);
         log_ring::disable_file_sink();
         log!(
-            "log-file: the VFS lock has been held for {}s — {PATH} stops at {size} bytes",
+            "log-file: the VFS lock has been held for {}s — {stopped}",
             MAX_BLOCKED_NANOS / 1_000_000_000
         );
         return;
@@ -227,11 +288,11 @@ pub fn poll() {
     let outcome = sink.flush(&mut vfs);
     drop(vfs);
     if let Err(e) = outcome {
-        let size = sink.size;
+        let stopped = sink.stopped_at();
         *guard = None;
         drop(guard);
         log_ring::disable_file_sink();
-        log!("log-file: {e} — {PATH} stops at {size} bytes");
+        log!("log-file: {e} — {stopped}");
     }
 }
 
@@ -259,7 +320,7 @@ impl Sink {
         if lost > 0 {
             // Into the ring, so this line is itself in the batch below and the
             // hole is described in the file it is a hole in.
-            log!("log-file: {lost} bytes were overwritten in the ring before they reached {PATH}");
+            log!("log-file: {lost} bytes were overwritten in the ring before they reached the file");
         }
 
         let mut buf = [0u8; CHUNK];
@@ -276,7 +337,8 @@ impl Sink {
             return Ok(());
         }
 
-        vfs.flush_file(PATH, self.file_id, crate::clock::nanos_since_boot())?;
+        let path = path(&self.stem, self.part);
+        vfs.flush_file(&path, self.file_id, clock::nanos_since_boot())?;
         // The FAT and the directory entry have reached the device; the device's
         // own write cache has not. A log that survives a wedge has to survive
         // the power being cut with it, which is the whole point, so the flush
@@ -284,7 +346,7 @@ impl Sink {
         vfs.sync_mount(MOUNT)?;
 
         if self.size >= MAX_LOG_BYTES {
-            self.rotate(vfs)?;
+            self.continue_in_next_part(vfs)?;
         }
         Ok(())
     }
@@ -313,23 +375,154 @@ impl Sink {
         Ok(())
     }
 
-    /// Make room by moving the full file aside, keeping one generation.
+    /// Carry on in the next file of this boot's sequence.
     ///
-    /// One and not more: two files is the difference between "the log ends
-    /// where it filled up" and "there is a log", while every further generation
-    /// costs another [`MAX_LOG_BYTES`] of the volume, and another read of it
-    /// every time `/bin/console` seeds a screen, for a boot they are less
-    /// likely to care about.
-    fn rotate(&mut self, vfs: &mut Vfs) -> Result<(), &'static str> {
-        let full = self.file_id;
+    /// Neither end of a long boot's log is dropped: the earlier parts stay
+    /// until [`MAX_LOG_FILES`] reaches them, and by then they are the oldest
+    /// files on the volume by the same rule that governs every other boot's.
+    fn continue_in_next_part(&mut self, vfs: &mut Vfs) -> Result<(), &'static str> {
+        let full = path(&self.stem, self.part);
         let bytes = self.size;
-        vfs.rename(PATH, PREVIOUS)?;
-        if file_cache::release(full) {
-            vfs.close_file(PREVIOUS, full);
+        if file_cache::release(self.file_id) {
+            vfs.close_file(&full, self.file_id);
         }
-        self.file_id = vfs.create_file(PATH, crate::clock::nanos_since_boot())?;
+        if self.part >= MAX_LOG_PARTS {
+            return Err("this boot has filled every part its name can hold");
+        }
+
+        let existing = ours(vfs);
+        sweep(vfs, existing, MAX_LOG_FILES - 1);
+
+        self.part += 1;
         self.size = 0;
-        log!("log-file: {PATH} reached {bytes} bytes and became {PREVIOUS}");
+        let next = path(&self.stem, self.part);
+        self.file_id = vfs.create_file(&next, clock::nanos_since_boot())?;
+        log!("log-file: {full} reached {bytes} bytes and this boot continues in {next}");
         Ok(())
     }
+
+    fn stopped_at(&self) -> String {
+        let path = path(&self.stem, self.part);
+        alloc::format!("{path} stops at {} bytes", self.size)
+    }
+}
+
+/// The name of one file in this boot's sequence.
+///
+/// The first part carries the bare stem, because that is what nearly every boot
+/// ever writes and a `_0001` on it would be noise on every stick. A
+/// continuation takes `_` rather than any other separator for one reason: it is
+/// the only legal character that sorts *after* `.`, so `<stem>.log` still comes
+/// before `<stem>_0002.log` and retention deletes a boot's parts in the order
+/// they were written.
+fn path(stem: &str, part: u32) -> String {
+    match part {
+        1 => alloc::format!("{DIR}/{stem}.log"),
+        n => alloc::format!("{DIR}/{stem}_{n:04}.log"),
+    }
+}
+
+fn stamp(secs: u64) -> String {
+    let t = Civil::from_unix_secs(secs);
+    alloc::format!(
+        "{:04}-{:02}-{:02}-{:02}{:02}{:02}",
+        t.year, t.month, t.day, t.hour, t.min, t.sec
+    )
+}
+
+/// Where a file sits in the order retention deletes in: lower goes first.
+///
+/// Undated boots go before dated ones because they cannot be ordered against
+/// them — there is no clock to compare — and of the two kinds, the one that can
+/// be placed in time is the one worth keeping. Within a kind the name is the
+/// order, which is what the timestamp format is for.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Class {
+    Undated,
+    Dated,
+}
+
+/// Whether `name` is one of this module's files, and which kind.
+///
+/// Strict on purpose. `/log` is writable by userland and `toybox` writes there,
+/// so anything this does not recognise exactly is somebody else's file and is
+/// never deleted to make room.
+fn classify(name: &str) -> Option<Class> {
+    let stem = name.strip_suffix(".log")?;
+    let stem = match stem.split_once('_') {
+        Some((head, part)) => {
+            if part.len() != 4 || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            head
+        }
+        None => stem,
+    };
+
+    if let Some(index) = stem.strip_prefix(UNDATED_STEM).and_then(|s| s.strip_prefix('-')) {
+        let ours = index.len() == 2 && index.bytes().all(|b| b.is_ascii_digit());
+        return ours.then_some(Class::Undated);
+    }
+
+    // What `stamp` produces and nothing else: `2101-06-05-040302`.
+    let shape = b"dddd-dd-dd-dddddd";
+    if stem.len() != shape.len() {
+        return None;
+    }
+    let matches = stem.bytes().zip(shape).all(|(b, want)| match want {
+        b'd' => b.is_ascii_digit(),
+        c => b == *c,
+    });
+    matches.then_some(Class::Dated)
+}
+
+/// Every file on `/log` that this module wrote, oldest first.
+fn ours(vfs: &mut Vfs) -> Vec<String> {
+    let entries = match vfs.list("/", DIR) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log!("log-file: cannot list {DIR} ({e:?}), so nothing old can be cleared out");
+            return Vec::new();
+        }
+    };
+    let mut ours: Vec<(Class, String)> = entries
+        .into_iter()
+        .filter_map(|(name, _size)| Some((classify(&name)?, name)))
+        .collect();
+    ours.sort();
+    ours.into_iter().map(|(_, name)| alloc::format!("{DIR}/{name}")).collect()
+}
+
+/// Delete this module's oldest files until at most `keep` remain, and return
+/// what is left.
+fn sweep(vfs: &mut Vfs, existing: Vec<String>, keep: usize) -> Vec<String> {
+    let over = existing.len().saturating_sub(keep);
+    let mut kept = Vec::with_capacity(existing.len() - over);
+    for (i, path) in existing.into_iter().enumerate() {
+        if i >= over {
+            kept.push(path);
+            continue;
+        }
+        // Named, because a file disappearing off the owner's stick with nothing
+        // saying why is indistinguishable from a bug in this module.
+        if vfs.delete_file(&path) {
+            log!("log-file: {DIR} holds more than {MAX_LOG_FILES} logs, so {path} was deleted");
+        } else {
+            log!("log-file: {path} is past the {MAX_LOG_FILES}-log bound and would not delete");
+            kept.push(path);
+        }
+    }
+    kept
+}
+
+/// The lowest index no undated log on the volume is using.
+///
+/// `None` cannot happen after a sweep — it leaves fewer files than there are
+/// indices — but it is the return type rather than an `expect` because the
+/// caller has somewhere to put the answer and this module does not panic.
+fn undated_stem(kept: &[String]) -> Option<String> {
+    (0..MAX_LOG_FILES)
+        .map(|i| alloc::format!("{UNDATED_STEM}-{i:02}"))
+        .find(|stem| !kept.iter().any(|path| path.starts_with(&alloc::format!("{DIR}/{stem}"))))
+        .map(|stem| stem.to_string())
 }

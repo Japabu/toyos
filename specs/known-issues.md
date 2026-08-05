@@ -2145,6 +2145,48 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
+### An std change that depends on an unlanded ABI change cannot be built at all, from anywhere
+
+`library/std` names its ToyOS dependencies by relative path —
+`toyos-abi = { path = "../../../toyos-abi" }` in `rust/library/std/Cargo.toml`
+— and `rust/` is the primary checkout's. So std always compiles against
+`/Users/jan/Dev/jan/toyos/toyos-abi`, which is main's, no matter which worktree
+runs the build and no matter who holds the sysroot. `--claim-sysroot` does not
+change it: a claim decides *whose witness is recorded*, not which sources
+`x build library` reads. There is no copy step.
+
+The consequence is an ordering nobody is told about: **a change to
+`toyos-abi`/`toyos` and a change to std that uses it cannot land in one series.**
+The ABI half must reach main first; only then does the primary's tree carry it
+and the std half compile. Found on 2026-08-05 by task #140, whose
+`clock_epoch() -> Option<u64>` and the `SystemTime::now` that consumes it are
+exactly that pair — the std half fails with `no method named unwrap_or found for
+type u64`, which reads like a broken checkout and is not one.
+
+The second half of that task's fix, to be applied *after* the ABI is on main.
+`rust/library/std/src/sys/time/toyos.rs`, replacing the body of
+`SystemTime::now`:
+
+```rust
+    pub fn now() -> SystemTime {
+        // `UNIX_EPOCH` on a machine that has no wall clock: this signature
+        // cannot express the absence, and the kernel reads its clock once at
+        // boot, so the answer is the same for the life of the process.
+        SystemTime(Duration::from_secs(toyos_abi::syscall::clock_epoch().unwrap_or(0)))
+    }
+```
+
+Until it is applied `SystemTime::now()` returns `UNIX_EPOCH` on every ToyOS
+machine — which is what it did before task #140, so nothing regressed by
+leaving it out; it is the improvement that is deferred, not a defect that is
+introduced.
+
+**`rust/` is shared, so an uncommitted edit there is everyone's.** That patch
+sat in the primary's submodule for about an hour on 2026-08-05 and failed three
+other worktrees' landings at `--land`'s step 4, which requires the submodule
+clean. `rust/` takes the fork-estate discipline in CLAUDE.md: explicit paths, no
+`stash`, and nothing left dirty across a task boundary.
+
 ### `--claim-sysroot` livelocks against a second claimant, and the loser cannot build at all
 
 Measured on 2026-08-05 with eight worktrees on the machine. A worktree holding
@@ -4129,10 +4171,33 @@ The first two say `SyscallError::Unknown`; the third says "no such file".
 
 `/boot` and `/log` are both `kernel/src/fat32_adapter.rs` over `toyos-fat32`,
 mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
-`kernel/src/log_file.rs` writes the kernel's log to `/log/kernel.log`. Gated by
-`esp_filesystem`, `kernel_log_file`, `log_backing_read_error`,
-`log_partition_automount` and `log_partition_identity`
-(`tests/common/volumes.rs`), and `toybox_cp_volume` (`tests/common/toybox.rs`).
+`kernel/src/log_file.rs` writes one file per boot to `/log`, named for the wall
+clock. Gated by `esp_filesystem`, `kernel_log_file`, `log_backing_read_error`,
+`log_partition_automount`, `log_partition_identity` and `wall_clock_file`
+(`tests/common/volumes.rs`, `tests/common/wallclock.rs`), and `toybox_cp_volume`
+(`tests/common/toybox.rs`).
+
+### `Sink::append`'s error return is correct and no longer reachable from a boot
+
+Task #140 replaced the single appended `kernel.log` with one file per boot. The
+sink therefore always *creates*, and within a boot its own pages stay resident —
+every append sets the CLOCK reference bit on the page it is appending to, so it
+is the last page eviction would take. The partial write into a page that has to
+come off the stick, which is what `file_cache::write_page` re-reads for, is
+consequently something the sink no longer does.
+
+What that costs is one link of a chain, not the hazard: `write_page`'s
+merge-into-a-failed-read is unchanged and is reached by anything appending to a
+file that already has bytes on the volume, which is what
+`log_backing_read_error` now stages — the host writes the file, a process
+appends inside it, and the refusal has to reach that process. The claim that
+went untested with the trigger is the propagation through `Sink::append` →
+`Sink::flush` → `poll` and the sink disabling itself. That code is still there
+and still correct by inspection; nothing exercises it.
+
+Reaching it again needs the sink to append to a file with bytes already on the
+device, which no shipped path now produces. Worth revisiting if `log_file` ever
+grows a resume-an-existing-file case; not worth contriving one for.
 
 ### CLOSED for `/boot`, open for `/log` — userland writing the stick it booted from
 

@@ -538,19 +538,28 @@ pub fn clock_nanos() -> u64 {
     syscall(SYS_CLOCK, 0, 0, 0, 0)
 }
 
-/// Read wall-clock time from RTC.
-pub fn clock_realtime() -> RealTime {
-    let raw = syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0);
-    RealTime {
+/// The time of day in the zone the machine keeps its clock in.
+///
+/// `None` is a machine that never said what time it is — an RTC that is absent,
+/// wedged, or answering with something that is not a date. It is `None` for the
+/// whole of such a boot rather than intermittently, because the kernel reads
+/// the clock once.
+pub fn clock_realtime() -> Option<RealTime> {
+    let raw = check(syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0)).ok()?;
+    Some(RealTime {
         hours: ((raw >> 16) & 0xFF) as u8,
         minutes: ((raw >> 8) & 0xFF) as u8,
         seconds: (raw & 0xFF) as u8,
-    }
+    })
 }
 
-/// Seconds since Unix epoch (1970-01-01 00:00:00 UTC), read from CMOS RTC.
-pub fn clock_epoch() -> u64 {
-    syscall(SYS_CLOCK_EPOCH, 0, 0, 0, 0)
+/// Seconds since the Unix epoch (1970-01-01 00:00:00 UTC).
+///
+/// `None` on the same machine and for the same reason as [`clock_realtime`].
+/// Cheap: the kernel serves it from an anchor it took at boot plus the
+/// monotonic clock, so this is a syscall and not a device access.
+pub fn clock_epoch() -> Option<u64> {
+    check(syscall(SYS_CLOCK_EPOCH, 0, 0, 0, 0)).ok()
 }
 
 /// Transfer a region of the framebuffer to the GPU and flush it.

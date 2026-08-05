@@ -42,8 +42,11 @@ pub struct Timezone {
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
 
+/// POSIX's own answer for a machine that cannot tell the time: `time()` returns
+/// `(time_t)-1`, and every caller of this already treats a negative second
+/// count as one.
 fn epoch_secs() -> i64 {
-    toyos_abi::syscall::clock_epoch() as i64
+    toyos_abi::syscall::clock_epoch().map_or(-1, |secs| secs as i64)
 }
 
 fn mono_nanos() -> u64 {

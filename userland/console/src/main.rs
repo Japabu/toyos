@@ -35,10 +35,18 @@ use window::Screen;
 
 const FONT: &str = "/share/fonts/JetBrainsMono-Regular-8x16.font";
 
-/// `log_file`'s two generations, oldest first: `kernel.log` rotates *to*
-/// `kernel.log.1`, and a rotation can be the last thing a boot does — which
-/// leaves the newest bytes in the older-looking file (known issues §10).
-const KERNEL_LOG: [&str; 2] = ["/log/kernel.log.1", "/log/kernel.log"];
+/// Where `log_file` puts one file per boot, each named for the wall clock at
+/// the moment that boot's sink installed.
+const KERNEL_LOG_DIR: &str = "/log";
+
+/// How many of those files seed the screen, oldest first.
+///
+/// Two, and both halves of that are deliberate. The newest is this boot's,
+/// which is what the owner is asking about. The one before it is either the
+/// previous boot — what a machine that has just come back from a wedge needs on
+/// the panel — or, when this boot filled a file and continued in `_0002`, the
+/// earlier half of this boot's own log.
+const SEED_FILES: usize = 2;
 
 /// HID usage codes. `toyos_keymap::Translator` turns both into escape
 /// sequences; this program consumes them before it asks.
@@ -235,17 +243,40 @@ fn main() {
     }
 }
 
+/// The newest [`SEED_FILES`] kernel logs on `/log`, oldest first.
+///
+/// By name, which is by time: `log_file` names each boot's file for the wall
+/// clock in a form that sorts chronologically, and a boot's continuation parts
+/// sort directly after the file they continue.
+///
+/// The one machine this orders wrongly is one whose RTC never answered, where
+/// every boot is `unknown-NN` and `NN` is the lowest free index rather than an
+/// increasing one — after sixteen such boots the indices wrap and the newest
+/// name is no longer the newest boot. Naming the file the kernel is actually
+/// writing would need a syscall to ask it, which is `SYS_QUERY`'s job and not
+/// this program's to invent.
+fn newest_kernel_logs() -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(KERNEL_LOG_DIR) else { return Vec::new() };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "log"))
+        .collect();
+    paths.sort();
+    paths.split_off(paths.len().saturating_sub(SEED_FILES))
+}
+
 /// Push this boot's kernel log into the scrollback; returns the bytes written.
 ///
 /// Reading a file rather than the ring itself is not a workaround: `log_file`
 /// seeds the sink from the ring's *retained* window, so the file opens at this
 /// boot's first line and carries everything up to the last idle pass. What it
 /// cannot carry is anything logged after this program read it — for that the
-/// owner has a shell and `cat /log/kernel.log`, which is the whole point.
+/// owner has a shell and `cat` on the file this names, which is the whole point.
 fn seed_kernel_log(console: &mut Console) -> usize {
     let mut log = Vec::new();
-    for path in KERNEL_LOG {
-        if let Ok(bytes) = std::fs::read(path) {
+    for path in newest_kernel_logs() {
+        if let Ok(bytes) = std::fs::read(&path) {
             log.extend_from_slice(&bytes);
         }
     }
@@ -253,8 +284,8 @@ fn seed_kernel_log(console: &mut Console) -> usize {
         // Never silently: a blank screen where the boot log used to be is the
         // one outcome that would make this program a downgrade.
         console.write_bytes(
-            b"[console] no kernel log at /log/kernel.log - this machine has no /log,\n\
-              [console] so the screen starts here rather than at the first boot line.\n\n",
+            b"[console] no kernel log on /log - this machine has no /log, so the\n\
+              [console] screen starts here rather than at the first boot line.\n\n",
         );
         return 0;
     }
