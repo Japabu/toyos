@@ -199,6 +199,24 @@ fn gate_restarting_the_debounce_never_enumerates() {
     assert_eq!(driver.enumerations(), 0, "the flaw did not change the outcome");
 }
 
+/// A caller that asks the machine what to do from *inside* an effect it is
+/// having performed. Reachable rather than hypothetical: an enumeration drains
+/// the event ring, and what the driver does with a port event is step this
+/// machine. Nothing here is a flaw — this is a sound machine and a re-entrant
+/// caller, which is exactly what the old copy-out/write-back shape allowed
+/// silently.
+#[test]
+fn gate_stepping_from_inside_an_effect_is_caught() {
+    let mut port = FakePort::occupied(QUICK);
+    let mut driver = Driver::new().reentrant();
+    let outcome = driver.run_to(&mut port, 0, 8 * DEBOUNCE_NS, PASS);
+    assert!(
+        matches!(outcome, Err(Stuck::Broke(_))),
+        "a re-entrant step was not caught: {outcome:?} after {:?}",
+        driver.did
+    );
+}
+
 /// Without the deadline a port that never resets is waited on forever, and the
 /// machine makes no progress rather than refusing the port by name.
 #[test]

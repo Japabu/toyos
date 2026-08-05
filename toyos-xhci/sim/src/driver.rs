@@ -38,13 +38,24 @@ pub struct Driver {
     /// What the enumeration answers, so a scenario can stage a device the
     /// controller has no slot for.
     slot: Option<u8>,
+    /// Ask the machine what to do from *inside* an effect it is having
+    /// performed, which is what a driver that polled its own ports from within
+    /// an enumeration would do. The enumeration drains the event ring, so this
+    /// is reachable rather than hypothetical.
+    reenter: bool,
     pub did: Vec<Did>,
     pub wake_at: Option<Nanos>,
 }
 
 impl Driver {
     pub fn new() -> Self {
-        Self { state: PortState::EMPTY, slot: Some(1), did: Vec::new(), wake_at: None }
+        Self {
+            state: PortState::EMPTY,
+            slot: Some(1),
+            reenter: false,
+            did: Vec::new(),
+            wake_at: None,
+        }
     }
 
     pub fn with_flaw(flaw: Flaw) -> Self {
@@ -54,6 +65,12 @@ impl Driver {
     /// Stage an enumeration that produces no slot.
     pub fn without_slot(mut self) -> Self {
         self.slot = None;
+        self
+    }
+
+    /// Stage a caller that re-enters the machine from inside an effect.
+    pub fn reentrant(mut self) -> Self {
+        self.reenter = true;
         self
     }
 
@@ -90,14 +107,36 @@ impl Driver {
                     self.wake_at = None;
                     return Ok(());
                 }
-                Step::Write(write) => port.write(write.raw(), now),
+                Step::Write(write) | Step::Reset(write) => port.write(write.raw(), now),
                 Step::Teardown(why, pending) => {
+                    pending.running();
+                    // Between here and the report, the port is inside an
+                    // effect. A step taken now is the re-entrancy the
+                    // invariant names, and the simulator stages exactly that
+                    // below.
+                    if self.reenter {
+                        let read = port.read();
+                        let before = self.state;
+                        let step = self.state.step(read, now);
+                        if let Some(bad) = invariants::check(&before, &step, read, now) {
+                            return Err(Stuck::Broke(bad));
+                        }
+                    }
                     self.did.push(Did::ToreDown(why));
-                    pending.torn_down();
+                    self.state.torn_down();
                 }
                 Step::Enumerate(pending) => {
+                    pending.running();
+                    if self.reenter {
+                        let read = port.read();
+                        let before = self.state;
+                        let step = self.state.step(read, now);
+                        if let Some(bad) = invariants::check(&before, &step, read, now) {
+                            return Err(Stuck::Broke(bad));
+                        }
+                    }
                     self.did.push(Did::Enumerated { slot: self.slot });
-                    pending.bound(self.slot.and_then(core::num::NonZeroU8::new));
+                    self.state.enumerated(self.slot.and_then(core::num::NonZeroU8::new));
                 }
             }
             port.tick(now);

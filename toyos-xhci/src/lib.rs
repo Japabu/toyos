@@ -14,5 +14,5 @@ pub mod invariants;
 pub mod port;
 pub mod portsc;
 
-pub use port::{Gone, Nanos, PortState, Step};
+pub use port::{Effect, Gone, Nanos, PortState, Step};
 pub use portsc::Portsc;

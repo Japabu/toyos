@@ -54,6 +54,10 @@ pub enum Step<'a> {
     Wait(Nanos),
     /// Write this to PORTSC.
     Write(portsc::Write),
+    /// Reset the port by writing this. Separate from an ordinary write because
+    /// it is the one the caller announces, and because which reset a port needs
+    /// is the decision this machine exists to make.
+    Reset(portsc::Write),
     /// Take down whatever this port had.
     Teardown(Gone, Pending<'a>),
     /// Bring up whatever is in this port.
@@ -62,34 +66,38 @@ pub enum Step<'a> {
     GaveUp(GaveUp),
 }
 
-/// An effect the caller has been given and has not finished.
+/// An effect the caller was told to perform and has not yet begun.
 ///
-/// It borrows the machine, so the machine cannot be stepped again until the
-/// effect is reported. That is the whole reason it exists: re-entering a port's
-/// decision from inside its own enumeration — which is reachable, because
-/// enumeration drains the event ring — used to be prevented by an invariant
-/// nothing stated.
+/// It borrows the machine, so nothing can be decided about this port until the
+/// caller has said the effect is under way. **The effect itself needs the
+/// controller, which is what the machine's own owner is inside** — so the
+/// borrow ends at [`Pending::running`] and the outstanding effect becomes
+/// [`Work::Working`], which is a state a re-entrant step can be caught by.
+/// Re-entering a port's decision from inside its own enumeration is reachable,
+/// because enumeration drains the event ring, and it used to be prevented only
+/// by an invariant nothing stated.
 #[derive(Debug)]
 pub struct Pending<'a>(&'a mut PortState);
 
 impl Pending<'_> {
-    /// The enumeration finished and the controller enabled `slot`, or it did
-    /// not. Recorded either way: an Enable Slot that succeeded is the
-    /// controller's resource whatever happened after it.
-    pub fn bound(self, slot: Option<NonZeroU8>) {
-        self.0.attached = true;
-        self.0.slot = slot;
-        self.0.work = Work::Settled;
+    /// The effect has begun. Nothing is decided about this port again until it
+    /// is reported through [`PortState::enumerated`] or
+    /// [`PortState::torn_down`].
+    pub fn running(self) -> Effect {
+        let effect = match self.0.work {
+            Work::Resetting { .. } => Effect::Enumerating,
+            _ => Effect::TearingDown,
+        };
+        self.0.work = Work::Working(effect);
+        effect
     }
+}
 
-    /// The teardown finished. The port is empty as far as the driver is
-    /// concerned, whatever the register says, so the next look runs the
-    /// ordinary fresh-connect path.
-    pub fn torn_down(self) {
-        self.0.attached = false;
-        self.0.slot = None;
-        self.0.work = Work::Settled;
-    }
+/// An effect that has begun and has not been reported.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Effect {
+    Enumerating,
+    TearingDown,
 }
 
 /// What the driver is part-way through doing about this port.
@@ -102,6 +110,8 @@ enum Work {
     Debouncing { at: Nanos },
     /// PR is written and PRC has not arrived.
     Resetting { until: Nanos },
+    /// The caller is inside an effect and has not reported it.
+    Working(Effect),
 }
 
 /// A deliberate defect, compiled only for the negative gates.
@@ -161,6 +171,17 @@ impl PortState {
         self.slot
     }
 
+    /// Take the slot, for a caller that is about to disable it.
+    ///
+    /// The port stays attached, which is deliberate and not an oversight: a
+    /// port whose belief goes empty with the device still physically in it
+    /// reads as a fresh connect on the next pass, and the driver would
+    /// enumerate the same endpoint again every debounce for as long as it
+    /// stayed plugged in.
+    pub fn take_slot(&mut self) -> Option<NonZeroU8> {
+        self.slot.take()
+    }
+
     /// The connect state the driver has acted on.
     pub fn attached(&self) -> bool {
         self.attached
@@ -169,6 +190,31 @@ impl PortState {
     /// Whether this port is waiting on something rather than at rest.
     pub fn outstanding(&self) -> bool {
         self.work != Work::Settled
+    }
+
+    /// The effect the caller began and has not reported, if any. A step taken
+    /// while this is `Some` is a re-entrant one.
+    pub fn working(&self) -> Option<Effect> {
+        match self.work {
+            Work::Working(effect) => Some(effect),
+            _ => None,
+        }
+    }
+
+    /// The enumeration finished and the controller enabled `slot`, or it did
+    /// not. Recorded either way: an Enable Slot that succeeded is the
+    /// controller's resource whatever happened after it.
+    pub fn enumerated(&mut self, slot: Option<NonZeroU8>) {
+        self.adopt(slot);
+    }
+
+    /// The teardown finished. The port is empty as far as the driver is
+    /// concerned, whatever the register says, so the next look runs the
+    /// ordinary fresh-connect path.
+    pub fn torn_down(&mut self) {
+        self.attached = false;
+        self.slot = None;
+        self.work = Work::Settled;
     }
 
     /// Adopt a port the boot scan enumerated, so the hot-plug machine starts
@@ -200,6 +246,13 @@ impl PortState {
     pub fn step(&mut self, portsc: Portsc, now: Nanos) -> Step<'_> {
         let connected = portsc.connected();
         let replugged = portsc.connect_changed() && !self.flawed(Flaw::IgnoreConnectChange);
+
+        // A step taken from inside an effect this port is already having done
+        // to it. Nothing to decide — the caller has not finished the last
+        // decision — and `invariants::check` is what calls it what it is.
+        if matches!(self.work, Work::Working(_)) {
+            return Step::Idle;
+        }
 
         // Before any change flag is cleared, because PRC is the one this state
         // is waiting for.
@@ -234,11 +287,14 @@ impl PortState {
         }
 
         if portsc.any_change() {
+            #[cfg(feature = "flaws")]
             let write = if self.flawed(Flaw::WriteBackWhatWasRead) {
                 portsc::Write::whole_word(portsc)
             } else {
                 portsc.neutral().acknowledging(portsc)
             };
+            #[cfg(not(feature = "flaws"))]
+            let write = portsc.neutral().acknowledging(portsc);
             return Step::Write(write);
         }
 
@@ -261,7 +317,7 @@ impl PortState {
                 0
             }
             Work::Debouncing { at } => now.saturating_sub(at),
-            Work::Resetting { .. } => unreachable!("returned above"),
+            Work::Resetting { .. } | Work::Working(_) => unreachable!("returned above"),
         };
         if held < DEBOUNCE_NS {
             return Step::Wait(now + DEBOUNCE_NS - held);
@@ -270,6 +326,6 @@ impl PortState {
             return Step::Teardown(Gone::Disconnected, Pending(self));
         }
         self.work = Work::Resetting { until: now + RESET_DEADLINE_NS };
-        Step::Write(portsc.neutral().resetting())
+        Step::Reset(portsc.neutral().resetting())
     }
 }

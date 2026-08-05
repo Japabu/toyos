@@ -133,9 +133,28 @@ impl Write {
         Self(self.0 | (seen.0 & CHANGES))
     }
 
+    /// Clear the reset-finished flag and **only** that one.
+    ///
+    /// What the enumeration acknowledges, because it is the flag it consumed. A
+    /// connect change set while the reset ran means the device was replugged
+    /// during it, and that has to survive to be acted on — so an enumeration
+    /// that acknowledged everything would swallow the evidence that what it
+    /// just brought up is already gone.
+    pub const fn acknowledging_reset(self) -> Self {
+        Self(self.0 | PRC)
+    }
+
     /// Reset the port, which for a USB2 port is how a device is enabled at all.
     pub const fn resetting(self) -> Self {
         Self(self.0 | PR)
+    }
+
+    /// Power the port. HCRST returns every root-hub port to the state it has
+    /// with nothing attached, and on a controller with Port Power Control that
+    /// state is unpowered — a port with no power reports no device, for the
+    /// life of the boot.
+    pub const fn powered(self) -> Self {
+        Self(self.0 | PP)
     }
 
     pub const fn raw(self) -> u32 {

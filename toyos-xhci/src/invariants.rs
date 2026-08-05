@@ -26,13 +26,20 @@ pub enum Violation {
     /// A wait was issued for an instant that has already passed, so the caller
     /// is asked to come back at once and the machine makes no progress.
     WaitIsNotInTheFuture,
+    /// The port was stepped from inside an effect it had already been told to
+    /// perform — the re-entrancy the old copy-and-write-back shape allowed
+    /// silently.
+    SteppedWhileWorking,
 }
 
 /// Check one step against the word that produced it and the clock that timed
 /// it. `None` when the step is sound.
 pub fn check(before: &PortState, step: &Step<'_>, read: Portsc, now: u64) -> Option<Violation> {
+    if before.working().is_some() {
+        return Some(Violation::SteppedWhileWorking);
+    }
     match step {
-        Step::Write(write) => write_is_sound(*write, read),
+        Step::Write(write) | Step::Reset(write) => write_is_sound(*write, read),
         Step::Enumerate(_) => {
             // The port is being brought up because its reset finished, so the
             // register is the authority on whether there is anything there.
