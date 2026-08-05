@@ -957,29 +957,36 @@ pub fn log_on_device(
     need(found.pop().flatten(), name)
 }
 
-/// A page of `/log/kernel.log` that the device will not give back, and the
-/// partial write that used to merge into the hole and persist it.
+/// A page of a `/log` file that the device will not give back, and the partial
+/// write that used to merge into the hole and persist it.
 ///
-/// `log_file::Sink::append` writes at `size % 4096`, so an append is almost
-/// always a *partial* page write. `file_cache::write_page` re-reads such a page
-/// through the file's backing before merging, and once the page has been
-/// evicted that read goes to the stick. `FatBacking::read_page` returned `()`,
-/// so a failed read was indistinguishable from a page of zeros: the new bytes
-/// were merged into those zeros and `flush_file` wrote the result back over the
-/// kernel's own log — from the idle loop, with no line saying so, on the volume
-/// whose entire purpose is to be the diagnostic for a machine with no serial
-/// port.
+/// `file_cache::write_page` re-reads a page it is about to partially overwrite,
+/// through the file's backing, and merges the new bytes into what comes back.
+/// `FatBacking::read_page` returned `()`, so a failed read was indistinguishable
+/// from a page of zeros: the new bytes went into those zeros and `flush_file`
+/// wrote the result back over data that was already on the stick.
 ///
 /// Three separate claims, and none of them is the others:
 ///
 /// - the failure is **reported** (`serving zeros`, the marker triage greps for,
 ///   which this path could not emit at all);
-/// - the failure **propagates** — `FatBacking` → `file_cache::write_page` →
-///   `Sink::append` → `Sink::flush` → `poll`, which disables the sink. Every
-///   one of those five returned `()` or swallowed on some link of the chain;
-/// - the file on the device is **not corrupted**, checked on the host. This is
-///   the claim the other two exist to serve, and it is the one that stays
-///   meaningful if the log lines are ever reworded.
+/// - the failure **propagates** to the caller — `FatBacking` →
+///   `file_cache::write_page` → `fd::write` → the process, every one of which
+///   returned `()` or swallowed on some link of the chain;
+/// - the file on the device is **not corrupted**, checked on the host against
+///   the bytes the host itself wrote. This is the claim the other two exist to
+///   serve, and the one that stays meaningful if the log lines are reworded.
+///
+/// **The trigger moved with task #140 and the coverage narrowed with it.** The
+/// kernel's log sink used to reach this path on its own: a boot reopened the
+/// `kernel.log` the boot before it left, and the first append was a partial
+/// write into a page that had to come off the stick. One file per boot ended
+/// that — the sink always creates now, and its own pages stay resident for the
+/// whole boot because every append sets the CLOCK reference bit on the page it
+/// is appending to. So `Sink::append`'s error return is still correct and is no
+/// longer reachable from a boot; what is exercised here is the same
+/// `write_page` hazard through the path that *can* still reach it, which is any
+/// process appending to a file that already has bytes on the volume.
 pub fn log_backing_read_error(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -989,69 +996,58 @@ pub fn log_backing_read_error(
     // shipped ceiling the log's few pages stay resident for the whole boot and
     // the re-read the injection targets never happens. The eviction code is the
     // shipped code; only the bound moves.
-    const FEATURES: &[&str] = &["fat-backing-read-fails", "test-small-caches"];
+    const FEATURES: &[&str] = &["fat-backing-read-fails"];
     const SERVING_ZEROS: &str = "failed; serving zeros";
-    // Up to the path and no further: the file is named for this boot's wall
-    // clock, so the rest of the line differs every run.
-    const GAVE_UP: &str = "log-file: the log volume would not give back the page being appended \
-                           to — /log/";
+    /// Mirrored in `tests/toyos-rust-tests/src/bin/log_volume_reread.rs`.
+    const STAGED: &str = "staged-reread.txt";
+    /// Printable and longer than the offset the guest writes at, so the page is
+    /// fetched rather than extended, and so a merge into zeros shows up as a
+    /// run of NULs in a file that is otherwise entirely text.
+    const STAGED_TEXT: &[u8] = b"written by the host onto the log volume before this machine \
+                                 started, and not to be changed by it\n";
 
     let image_path = test_dir().join("fat-backing-read-fails.img");
-    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURES);
+    let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURES);
+    // Written before the extent is asked for: `log_extent` parses the GPT off
+    // the file, not the buffer.
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
     let (start, len) = log_extent(&image, &image_path)?;
+    // The host's half of the fixture, on the device before there is a guest.
+    // This is what makes the trigger deterministic rather than a matter of
+    // whether some page happened to be evicted: none of this file's pages can
+    // be resident, because the machine has never seen it.
+    stage_files(
+        &mut image[start..start + len],
+        &[(STAGED.to_string(), STAGED_TEXT.to_vec())],
+    )?;
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
 
-    let boot_once = |what: &str| -> Result<String, String> {
-        let mut qemu = QemuInstance::boot_with_options(
-            test_config,
-            c_bins,
-            rust_bins,
-            BootOptions {
-                profile: qemu::Profile::Metal,
-                boot_image: Some(image_path.clone()),
-                kernel_features: FEATURES,
-                ..Default::default()
-            },
-        );
-        let boot = qemu.boot_log().to_string();
-        // Long enough for the idle loop to go round thousands of times, so a
-        // sink that kept trying would have written many pages by now.
-        std::thread::sleep(Duration::from_secs(2));
-        writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
-        qemu.flush_stdin();
-        let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
-        drop(qemu);
-        for bad in ["!!! PANIC !!!", "panicked at"] {
-            if log.contains(bad) {
-                return Err(format!("{bad:?} on the {what} boot\n{log}"));
-            }
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: qemu::Profile::Metal,
+            boot_image: Some(image_path.clone()),
+            kernel_features: FEATURES,
+            ..Default::default()
+        },
+    );
+    let mut log = qemu.boot_log().to_string();
+    let attempt = qemu.run_test("test_rs_log_volume_reread", Duration::from_secs(30));
+    // Both streams: the kernel's own line about the refused read is on the
+    // serial console, and the process's account of what it was told is on
+    // stdout. The claims below need one of each.
+    log.push_str(&attempt.stdout);
+    log.push_str(&attempt.serial);
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
+    drop(qemu);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} on the boot\n{log}"));
         }
-        Ok(log)
-    };
-
-    // The first boot exists to leave a `kernel.log` behind, and that is the
-    // whole reason there are two. Within one boot the sink's own pages never
-    // leave the cache — every append sets the CLOCK reference bit, so the page
-    // it is appending to is the last one eviction would ever take, and the
-    // re-read this injection targets simply does not happen. It happens on the
-    // boot *after*: `log_file::install` reopens a file that already has bytes,
-    // `FatFs::open_file` hands the cache a backing for it, nothing is resident,
-    // and the first append is a partial write into a page that has to come off
-    // the stick. Appending across boots is a documented property of the sink,
-    // not a contrivance for this test.
-    let first = boot_once("seeding")?;
-    if !first.contains("log-file: this boot's kernel log is") {
-        return Err(format!("the sink never installed on the seeding boot\n{first}"));
-    }
-    let seeded = newest_log(&image_path, start, len)?.1;
-    if seeded.is_empty() {
-        return Err("the seeding boot left no log file, so the second boot re-reads \
-                    nothing".to_string());
-    }
-
-    let log = boot_once("re-reading")?;
-    if !log.contains("log-file: this boot's kernel log is") {
-        return Err(format!("the sink never installed on the second boot\n{log}"));
     }
 
     // 1. The injection reached the code, and the code said so. Before this
@@ -1065,58 +1061,47 @@ pub fn log_backing_read_error(
         ));
     }
 
+    // 2. It propagated the whole way, to the one caller that can be asked. A
+    //    write reported as succeeding is the defect: the process has no way to
+    //    know its bytes went into a page invented out of a failed read.
+    if !log.contains("reread: the write failed") {
+        return Err(format!(
+            "the process was not told: a refused page has to reach `fd::write` as an error \
+             instead of being merged into zeros\n{log}"
+        ));
+    }
+
     // 3. And the machine is fine. A refusal that costs the boot is not a fix.
     if !log.contains("Boot: complete") {
-        return Err(format!("the boot did not finish with its log sink disabled\n{log}"));
+        return Err(format!("the boot did not finish\n{log}"));
     }
     if !log.contains("Shutting down.") {
         return Err(format!("the guest did not shut down cleanly\n{log}"));
     }
 
-    // 4. Ground truth: the file on the device. A page merged into a failed
-    //    re-fetch is `within` zero bytes followed by the appended text, so the
-    //    corruption is a run of NULs inside a file that is otherwise entirely
-    //    printable. Checked here rather than trusted from the console, because
-    //    the console is exactly what the guest would be wrong about.
-    let on_device = newest_log(&image_path, start, len)?.1;
-    if let Some(at) = on_device.iter().position(|&b| b == 0) {
-        let run = on_device[at..].iter().take_while(|&&b| b == 0).count();
+    // 4. Ground truth: the file on the device, against the bytes the host put
+    //    there. A page merged into a failed re-fetch is zeros where the text
+    //    was, so this catches the corruption whether or not anything was said
+    //    about it — the console being exactly what the guest would be wrong
+    //    about.
+    let after = std::fs::read(&image_path).map_err(|e| format!("read the image back: {e}"))?;
+    let on_device = need(read_files(&after[start..start + len], &[STAGED])?.pop().flatten(), STAGED)?;
+    if on_device != STAGED_TEXT {
+        let at = on_device.iter().zip(STAGED_TEXT).position(|(a, b)| a != b);
         return Err(format!(
-            "{run} NUL bytes at offset {at} of the {} the log holds on the device: a partial \
-             write was merged into a page the device would not give back, and flushed",
+            "the guest changed {STAGED} on the device: {} bytes became {}, first differing at \
+             {at:?} — a partial write was merged into a page the device would not give back, and \
+             flushed",
+            STAGED_TEXT.len(),
             on_device.len()
-        ));
-    }
-    // And the seeding boot's own bytes are still there. This is the sharper
-    // half: the page the second boot could not re-read is the page the first
-    // boot's last lines are *in*, so merging into zeros does not append a hole,
-    // it replaces text that was already on the stick.
-    if !on_device.starts_with(&seeded) {
-        let at = on_device.iter().zip(&seeded).position(|(a, b)| a != b);
-        return Err(format!(
-            "the second boot rewrote the first boot's log: {} bytes became {}, first differing \
-             at {at:?}",
-            seeded.len(),
-            on_device.len()
-        ));
-    }
-
-    // 2. It propagated the whole way. `poll` is five call frames above the
-    //    device and only prints this if `write_page` refused rather than
-    //    merging — which is the fix.
-    let gave_up = log.matches(GAVE_UP).count();
-    if gave_up != 1 {
-        return Err(format!(
-            "the sink gave up {gave_up} times, wanted exactly one: a refused page has to reach \
-             `Sink::flush` as an error instead of being merged into zeros\n{log}"
         ));
     }
 
     let _ = std::fs::remove_file(&image_path);
     eprintln!(
-        "  [log] {reported} page re-read(s) refused by the device: reported, propagated to \
-         the sink once, and the {} bytes the previous boot left in kernel.log are intact",
-        seeded.len()
+        "  [log] {reported} page re-read(s) refused by the device: reported, propagated to the \
+         process that asked, and the {} bytes the host staged are intact",
+        STAGED_TEXT.len()
     );
     Ok(())
 }
