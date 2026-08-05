@@ -941,51 +941,116 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
-### OPEN — a shell under a terminal stops prompting after its child exits, and a window client that is closed never exits
+### OPEN, ASSIGNED (#142) — a spawned process sometimes never starts, and every stuck terminal in the T14 session is downstream of one
 
-Owner-reported from a 950 s session on the T14 (task #141). Two symptoms, and
-what follows is what reading the code settles and what it does not — **no
-reproduction yet, and the kernel log itself has not been read by anyone but the
-owner.**
+Owner-reported (task #141) and read off two T14 session logs. **It is one
+defect, not the two it looked like from the symptoms**, plus a second
+independent one in a fork (below). The investigation is the scheduler agent's;
+what is here is the evidence and the eliminations, so it is not re-derived.
 
-- `exit: ls pid=29 code=0 cpu=18ms`, 45 syscalls, no panic, and the shell that
-  spawned it (pid 28) made 95 syscalls in its whole life. Repeated: ls pids 13,
-  14, 15, 21, 22, 29, all `code=0`.
-- `snake` was spawned at 883.662 s and there is **no `exit:` line for it
-  anywhere in the session**. Closing its window did not end it.
+**What the log establishes.** `/bin/ls` was spawned twelve times. Ten exited
+`code=0` in 12–59 ms. Two — pid 10 at 692.459 s and pid 26 at 904.327 s —
+**produced no output at all and never exited**, and neither did `/bin/rustc`
+pid 18 at 826.991 s. Nothing distinguishes their `spawn:` lines from the
+healthy ones: same binary, same `ELF: 3740 relocations indexed`, same
+`layout=0ms relocs=0ms deps=0ms tls=1ms total=1ms`. The kernel-side spawn
+finished and said so; the process then did nothing, forever.
 
-**Refuted by reading, and it was the first hypothesis because it is a same-day
-change** (#129, `85a8433`): a child that takes a surface grab and dies without
-releasing it does *not* leave the terminal mute. `surface::Host::poll` clears
-the grab on `RxStep::Eof` (`toyos/src/surface.rs:218-224`, `close` at `:322`),
-and the terminal polls every client fd every pass
-(`userland/terminal/src/main.rs:73-75`, `:107`). It also cannot explain the `ls`
-symptom at all: **the only program in the tree that grabs is `locale detect`**
-(`userland/toybox/src/locale.rs:161`), and neither `ls` nor `snake` does.
+**Every other symptom is a consequence of that one.** A shell blocked in
+`waitpid` on a child that never dies is behaving correctly, and so is a
+terminal blocked in `child.wait()` on that shell
+(`userland/terminal/src/main.rs:186`). Pairing them off:
 
-**Narrowed, not settled, for the shell.** A simple command goes through
-`Command::status()` (`userland/shell/src/main.rs:674`), which is spawn plus
-`waitpid`, and `sys_waitpid` registers on the park lot *before* it reads the
-table (`kernel/src/arch/syscall.rs:1067`), so the classic check-then-block
-window is closed. The exit side wakes the parent's main tid after the table
-lock drops (`kernel/src/process.rs:1116-1128`). `std_process` spawns and waits
-in the shared boot and is green, so nothing about `waitpid` is broken in
-general — which is why the reproduction has to be a shell **under a terminal**,
-with `tty_piped` stdio and an inherited fd map, rather than a bare spawn.
+| terminal | shell | child it is waiting on |
+|---|---|---|
+| 5 | 6 | `ls` 10, hung |
+| 11 | 12 | `rustc` 18, hung |
+| 19 | 20 | `snake` 23, see below |
+| 24 | 25 | `ls` 26, hung |
+| 27 | 28 | none — **and it is the only pair that exited** |
 
-**Unexplained for snake, and it is a separate mechanism.** snake is a `winit`
-app: its close path is the fork's ToyOS backend
-(`winit-toyos/src/event_loop.rs:525`, `:637`, `:707`), which does map
-`toyos_window::Event::Close` to `CloseRequested`. But the compositor died at
-952.8 s in the same session, and *every* window client should have left on the
-EOF that produced — snake did not, so it was parked somewhere that does not
-read its window fd. That is fork territory, outside every check this tree runs
-on itself.
+Shell 28 is the healthy control the same log offers: 95 syscalls, `spawn 3`
+paired with `waitpid 3`, and it went on from `ls /bin` to `free` and then
+`doom`. So neither a lost exit notification nor a missed wakeup is involved,
+and `sys_waitpid` registering on the park lot before it reads the table
+(`kernel/src/arch/syscall.rs:1067`) is doing its job.
 
-**What is needed before this can be fixed:** the session's `kernel.log`, which
-would say what pid 28's 95 syscalls were (the per-number breakdown is in the
-`syscalls:` line the kernel prints at exit) and whether snake ever entered the
-compositor's window list.
+**Refuted, and it was the first hypothesis because it was a same-day change**
+(#129, `85a8433`): a child that takes a surface grab and dies without releasing
+it does *not* leave the terminal mute. `surface::Host::poll` clears the grab on
+`RxStep::Eof` (`toyos/src/surface.rs:218-224`, `close` at `:322`), the terminal
+polls every client fd every pass (`userland/terminal/src/main.rs:73-75`,
+`:107`), and **the only program in the tree that grabs is `locale detect`**
+(`userland/toybox/src/locale.rs:161`) — neither `ls` nor `snake` does.
+
+**Not reproduced, and here is exactly what was tried** so nobody repeats it. A
+guest binary modelled on the chain — a parent owning `tty_piped` stdio and
+draining it, a shell role whose stdio is those pipes, spawning `/bin/ls /bin`
+with `Stdio::inherit()` and waiting with a 2 s per-child ceiling — ran **120
+children in the shared boot (smp=2) and 120 more on a dedicated smp=8 boot,
+and every one of them started and exited.** The T14 has eight CPUs, so the
+CPU count was the first fidelity gap closed and it was not enough. The chain
+*under a live compositor and a real `/bin/terminal`* was the next fidelity step
+and was **not** taken: `tests/metalcase`'s initrd carries no terminal, shell or
+toybox, and five other tests share that boot.
+
+**The measurement meant to decide it was `ps` — and `ps` is a victim.** The
+plan was to read the hung child's state column (`userland/toybox/src/ps.rs:72`)
+and split three ways: `R` with no CPU is a task nothing ever picked up, `S`
+with no CPU is one that blocked before its first user instruction, and any CPU
+at all moves the fault into userland startup. The owner ran it on the T14
+during boot 10 of `boot5-doom-wedge.log` and **`ps` pid 17 printed nothing and
+never exited**, and neither did `/bin/shutdown` pid 25 or three `doom`s. In
+that whole boot the only processes that ever exited were `netd` and one
+`locale`.
+
+That is an answer rather than a lost measurement, and it is worth more than the
+column would have been: **it strikes a fresh process before it can write a
+byte, whatever the program is** — `ls`, `rustc`, `ps`, `shutdown`, `doom` — so
+nothing about `ls`'s own I/O path is involved. Meanwhile the per-CPU `parked`
+counters climb 1 → 2 → 3 as victims accumulate, `ready` is 0 on every report,
+and the kernel logs to the end.
+
+Investigation is the scheduler agent's (#142); the shapes are consistent with
+one defect. Ctrl+Alt+D remains available and is weaker: `dump_blocked` lists
+parked threads on the calling CPU only (`kernel/src/scheduler.rs:559`), so it
+can confirm a park but not rule one out — though with `parked` rising on
+several CPUs at once it may now be worth taking on whichever CPU services the
+i8042.
+
+### OPEN — a `winit` app spins forever when its window is closed, and never exits
+
+Separate from the above, in the fork rather than the tree, and **decided by
+reading rather than by a reproduction.** `snake` (pid 23) had a real window —
+the compositor reports `windows=2` and 86 frames per 2 s batch from 883.7 s —
+which went away at ~896 s, leaving `windows=1`. The process never exited, and
+it did not exit when the compositor itself died at 952.8 s either.
+
+`winit-toyos/src/event_loop.rs:483-547` polls the window in an inner loop whose
+**only exit is `None`**:
+
+```
+loop {
+    match win.poll_event(0) {
+        Some(Event::Close) => app.window_event(.., CloseRequested),
+        ...
+        None => break,
+    }
+}
+```
+
+Once the compositor drops the connection the fd is permanently read-ready at
+EOF, so `Window::poll_event` reports ready, `recv_event`'s `recv_header` fails,
+and it returns `Some(Event::Close)` — **every call, forever**
+(`userland/window/src/lib.rs:449-458`, `:443-447`). The loop never yields
+`None`, so it never reaches the `exiting()` check at `:570` that `exit()`
+inside `CloseRequested` was supposed to trip. The app spins on a core instead
+of leaving, which is also why nothing in the log marks the moment.
+
+The fix belongs in the fork (`Japabu/winit`, branch `toyos`): break out of the
+poll loop on `Close`, or test `exiting()` inside it. Both other arms of the
+same function — the `ControlFlow::Wait` and `WaitUntil` blocking paths at
+`:637` and `:707` — decode `Close` the same way and want the same look.
 
 ### A syscall runs with interrupts masked, and only incidentally with preemption disabled
 
