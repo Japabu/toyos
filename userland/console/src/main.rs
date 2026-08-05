@@ -74,7 +74,8 @@ fn main() {
         }
     };
     let info = fb_dev.info().expect("console: framebuffer info");
-    let shm = SharedMemory::map(info.token[0], info.stride as usize * info.height as usize * 4);
+    let shm = SharedMemory::map(info.token[0], info.stride as usize * info.height as usize * 4)
+        .expect("console: the scanout token the framebuffer device just reported");
     let screen = Screen::new(
         shm.as_ptr(),
         info.width as usize,
