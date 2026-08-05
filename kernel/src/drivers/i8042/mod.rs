@@ -267,7 +267,20 @@ static REPORTED_IRQS: AtomicU32 = AtomicU32::new(0);
 ///
 /// Written only from `drain`, which holds `PS2` and is the one place that knows
 /// both the byte and whether anything came of it.
+#[cfg(not(feature = "hda-probe"))]
 const UNEXPLAINED_LEN: usize = 8;
+/// The other half of `specs/hda-driver-plan.md` H0: the owner presses Mute,
+/// Volume Down and Volume Up on a diagnostic boot and reads off what the EC
+/// sent, because H8 adds `toyos-ps2` entries for exactly those three and
+/// nothing in this repository knows whether they reach the i8042 at all. Three
+/// keys are twelve bytes of make and break under set 1 and the shipped report
+/// holds eight, so the whole answer would not fit in one boot — and H0 is the
+/// boot that is meant to answer everything.
+///
+/// Only the bound moves: the list, the run-blaming and the line are the
+/// shipped ones, exactly as `log-rotate-fast` moves a size and nothing else.
+#[cfg(feature = "hda-probe")]
+const UNEXPLAINED_LEN: usize = 24;
 static UNEXPLAINED: [AtomicU16; UNEXPLAINED_LEN] = [const { AtomicU16::new(0) }; UNEXPLAINED_LEN];
 static UNEXPLAINED_N: AtomicU32 = AtomicU32::new(0);
 const UNEXPLAINED_AUX: u16 = 1 << 8;

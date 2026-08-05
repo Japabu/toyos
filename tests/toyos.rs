@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -100,6 +100,9 @@ const RUST_SKIP: &[&str] = &[
     "ipc_hostile_peer",
     // Same again: `metal_sim_compositor_stall` runs it.
     "compositor_stall",
+    // Same again, and it spawns copies of itself as clients that die:
+    // `metal_sim_client_death` runs it.
+    "compositor_client_death",
     // Same again, and it also needs a host injecting pointer packets:
     // `metal_sim_window_drag` runs it.
     "window_drag",
@@ -120,6 +123,10 @@ const RUST_SKIP: &[&str] = &[
     // printed four hundred lines to a console nothing was reading and passed
     // on its exit code.
     "test_screen_churn",
+    // Spawns `/bin/doom`, which `tests/testcases` does not carry — doom is
+    // 4 MiB and every other test boots that config. `doom_sound_flood` runs it
+    // on `tests/doomcase`.
+    "doom_sound_flood",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -200,6 +207,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("metal_sim_window_caps", Sched::Parallel),
     ("metal_sim_ipc_hostile_peer", Sched::Parallel),
     ("metal_sim_compositor_stall", Sched::Parallel),
+    // Last of the group: it drops clients on purpose and its verdict is that
+    // the desktop outlived every one of them.
+    ("metal_sim_client_death", Sched::Parallel),
     // A thousand pointer packets paced from the host, and not one assertion on
     // when any of them arrived: the settles are 400 ms against a driver that
     // acts in microseconds, both liveness loops run to 20 s, and the three
@@ -220,6 +230,12 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
     ("metal_sim_null_audio", Sched::Serial),
+    // Parallel, and this one is argued rather than assumed: not a verdict in it
+    // is a wall-clock margin. The flood's size is asserted against the audio
+    // callback's own period counter standing still, both playback checks are
+    // counted in periods, and the capture is read for amplitude and never for
+    // timing. Its own boot, its own config, and the only client its soundd has.
+    ("doom_sound_flood", Sched::Parallel),
     ("netd_connection_caps", Sched::Parallel),
     // Serial: it measures netd's 2 s handshake deadline against the host's
     // clock, and counts how many connections survived a 48 ms paced burst
@@ -355,6 +371,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("heap_ceiling_recovery", Sched::Parallel),
     ("iommu_context_absent", Sched::Parallel),
     ("iommu_empty_domain", Sched::Parallel),
+    // Two boots, one kernel build each: the probe's own, and the plain kernel
+    // on the same machine to show it stays out of an ordinary boot.
+    ("hda_probe", Sched::Parallel),
     ("serial_vocabulary", Sched::Parallel),
 ];
 
@@ -422,6 +441,23 @@ const C_SKIP: &[&str] = &[
     "136_atomic_gcc_style",   // needs stdatomic.h (calls process::exit, not catchable)
 ];
 
+/// C tests that are discovered, compiled and then thrown away because they do
+/// not build. Unlike [`C_SKIP`] these are not a decision, they are the current
+/// state of the toolchain — the reason each gives is printed by every run.
+const C_DOES_NOT_BUILD: &[(&str, &str)] = &[
+    ("78_vla_label", "cranelift verifier rejects the VLA's stack address across blocks"),
+    ("79_vla_continue", "same VLA defect, reached through `continue`"),
+    ("83_utf8_in_identifiers", "the lexer rejects a non-ASCII byte in an identifier"),
+    ("85_asm_outside_function", "file-scope asm is parsed and not emitted, so `vide` is undefined"),
+    ("89_nocode_wanted", "expr_type cannot type an identifier under `sizeof` in dead code"),
+    ("94_generic", "_Generic type dispatch is not implemented"),
+    ("95_bitfields", "aligned(16) on a bitfield member, which toyos-cc refuses"),
+    ("95_bitfields_ms", "the same file again, through 95_bitfields.c"),
+    ("96_nodata_wanted", "every branch wants a -D the harness does not pass, so no `main`"),
+    ("98_al_ax_extend", "file-scope asm again: `_us`, `_ss`, `_uc`, `_sc` are declared in it"),
+    ("99_fastcall", "typeof of an `&function` expression is not implemented"),
+];
+
 /// Discover C tests by scanning tests/testcases/tinycc/*.c.
 /// Skips companion files (contain '+') and tests in C_SKIP.
 fn discover_c_tests() -> Vec<String> {
@@ -469,28 +505,60 @@ fn compile_c_tests(names: &[String]) -> Vec<(String, Vec<u8>)> {
     std::panic::set_hook(Box::new(|_| {}));
 
     let mut bins = Vec::new();
-    let mut skipped = Vec::new();
+    let mut broken: Vec<(&str, String)> = Vec::new();
     for name in names {
         match std::panic::catch_unwind(|| {
             let (obj, extras) = compile::compile_c(name);
             compile::link_toyos(&obj, &extras, name)
         }) {
             Ok(linked) => bins.push((name.clone(), linked)),
-            Err(_) => skipped.push(name.as_str()),
+            Err(e) => broken.push((name.as_str(), panic_message(&e))),
         }
     }
 
     std::panic::set_hook(prev_hook);
 
-    if !skipped.is_empty() {
-        eprintln!(
-            "[toyos] {} C tests skipped (compilation failed): {}",
-            skipped.len(),
-            skipped.join(", ")
-        );
+    for (name, why) in &broken {
+        eprintln!("[toyos] c::{name} does not build: {why}");
     }
+    check_c_build_fixture(&broken.iter().map(|(n, _)| *n).collect::<Vec<_>>());
 
     bins
+}
+
+fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
+    let full = e
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "<non-string panic>".to_string());
+    full.lines().next().unwrap_or_default().chars().take(160).collect()
+}
+
+/// The suite runs a C test by booting the binary, so one that does not build is
+/// not run — and until this fixture, not reported either. The set is asserted
+/// in both directions: a case that stops building is a regression, and one that
+/// starts building is a fix whose entry has to go.
+fn check_c_build_fixture(broken: &[&str]) {
+    let expected: BTreeSet<&str> = C_DOES_NOT_BUILD.iter().map(|(n, _)| *n).collect();
+    let actual: BTreeSet<&str> = broken.iter().copied().collect();
+    if actual == expected {
+        return;
+    }
+    let new: Vec<&str> = actual.difference(&expected).copied().collect();
+    let fixed: Vec<&str> = expected.difference(&actual).copied().collect();
+    let mut msg = String::from("C_DOES_NOT_BUILD is out of date.\n");
+    if !new.is_empty() {
+        msg += &format!(
+            "  stopped building, and so stopped being run at all: {}\n  \
+             (the reason for each is printed above)\n",
+            new.join(", ")
+        );
+    }
+    if !fixed.is_empty() {
+        msg += &format!("  builds now — delete from C_DOES_NOT_BUILD: {}\n", fixed.join(", "));
+    }
+    panic!("{msg}");
 }
 
 fn check_c_result(result: &TestResult) -> bool {
@@ -2596,7 +2664,8 @@ fn group_of(name: &str) -> Option<&'static str> {
         | "metal_sim_scanout_wc"
         | "metal_sim_window_caps"
         | "metal_sim_ipc_hostile_peer"
-        | "metal_sim_compositor_stall" => Some(METAL_SIM_DESKTOP),
+        | "metal_sim_compositor_stall"
+        | "metal_sim_client_death" => Some(METAL_SIM_DESKTOP),
         "i8042_keyboard" | "i8042_no_spurious_wake" | "i8042_mouse" => Some(I8042_TRACE),
         _ => None,
     }
@@ -2620,13 +2689,14 @@ fn group_boot<'a>(
 }
 
 /// `tests/metalcase` on [`qemu::Profile::Metal`]: the T14's device shape with a
-/// compositor on the firmware framebuffer, carrying the three client binaries
-/// its members run.
+/// compositor on the firmware framebuffer, carrying the client binaries its
+/// members run.
 ///
-/// Those three and not the whole rust set — metalcase's initrd is four programs
-/// and the rest would add tens of megabytes to a boot that needs three of them.
+/// Those and not the whole rust set — metalcase's initrd is four programs and
+/// the rest would add tens of megabytes to a boot that needs these.
 fn boot_metal_sim_desktop(rust_bins: &[(String, Vec<u8>)]) -> QemuInstance {
-    const CLIENTS: [&str; 3] = ["window_caps", "ipc_hostile_peer", "compositor_stall"];
+    const CLIENTS: [&str; 4] =
+        ["window_caps", "ipc_hostile_peer", "compositor_stall", "compositor_client_death"];
     let missing: Vec<&str> = CLIENTS
         .iter()
         .copied()
@@ -4257,6 +4327,82 @@ fn metal_sim_compositor_stall(boot: &mut Boot) -> Result<(), String> {
     Ok(())
 }
 
+/// A client that dies, or asks for something the kernel refuses on its behalf,
+/// must cost the compositor that client and nothing else.
+///
+/// The guest half runs the cases and probes after each; this half asserts what
+/// the guest cannot see — that the desktop is still painting, and that the
+/// clients dropped along the way were named. A compositor that panics fails
+/// this at the probe, at the frame count and at the console check, which is
+/// what it should do.
+fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
+    let qemu = &mut boot.qemu;
+    let result = qemu.run_test("test_rs_compositor_client_death", Duration::from_secs(240));
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if result.exit_code != Some(0) {
+        return Err(format!(
+            "compositor_client_death exited {:?}:\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+    // The guest's own case list, restated here so a case deleted on one side
+    // is a red run rather than a quieter test.
+    const CASES: usize = 4;
+    if !result
+        .stdout
+        .contains(&format!("compositor client death: {CASES} deaths survived"))
+    {
+        return Err(format!(
+            "the guest did not report {CASES} survived deaths:\n{}",
+            result.stdout
+        ));
+    }
+
+    // Non-vacuity, and the case that motivated the whole run: at least one of
+    // the eight creators has to have been reaped before the compositor served
+    // its window, or nothing here exercised the grant that killed the desktop.
+    const VANISHED: &str = "the process behind it has exited";
+    let vanished = result.stdout.matches(VANISHED).count();
+    if vanished == 0 {
+        return Err(format!(
+            "eight clients asked for a window and died, and the compositor served every one of \
+             them before it noticed — this run proves nothing about the grant:\n{}",
+            result.stdout
+        ));
+    }
+
+    // Still painting once every case is behind it, on a capture that starts
+    // empty — so this counts frames produced *after* the last case. The
+    // compositor's reporting interval is 2 s.
+    let frames = |text: &str| text.matches("compositor: frames=").count();
+    let mut after = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && frames(&after) < 2 {
+        after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    if frames(&after) < 2 {
+        return Err(format!(
+            "the compositor reported {} frame batches in the 20 s after the last client died:\
+             \n{after}",
+            frames(&after)
+        ));
+    }
+
+    let console = format!("{}\n{after}", result.serial);
+    serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+    eprintln!(
+        "  [metal-sim] {CASES} client deaths survived, {vanished} of {VANISHERS} creators \
+         vanished before their window, desktop still compositing"
+    );
+    Ok(())
+}
+
+/// How many clients `compositor_client_death` kills mid-request. Restated from
+/// the guest so the report can say how many of them the compositor met dead.
+const VANISHERS: usize = 8;
+
 /// Run one machine-shape test. Like `run_screen_test`, each of these owns its
 /// QEMU — the machine shape *is* the test — except for the runs of adjacent
 /// names that share one through `held` (see [`group_boot`]).
@@ -4320,11 +4466,14 @@ fn run_machine_test(
         "iommu_discovery" => common::iommu::iommu_discovery(test_config, c_bins, rust_bins),
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
+        // Body in `tests/common/hda.rs`, same reason.
+        "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
+        "doom_sound_flood" => audio::doom_sound_flood(rust_bins),
         "metal_sim_compositor" => {
             metal_sim_compositor(group_boot(held, METAL_SIM_DESKTOP, || {
                 boot_metal_sim_desktop(rust_bins)
@@ -4347,6 +4496,11 @@ fn run_machine_test(
         }
         "metal_sim_compositor_stall" => {
             metal_sim_compositor_stall(group_boot(held, METAL_SIM_DESKTOP, || {
+                boot_metal_sim_desktop(rust_bins)
+            }))
+        }
+        "metal_sim_client_death" => {
+            metal_sim_client_death(group_boot(held, METAL_SIM_DESKTOP, || {
                 boot_metal_sim_desktop(rust_bins)
             }))
         }

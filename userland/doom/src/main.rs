@@ -1,6 +1,8 @@
+mod ffi;
 mod input;
 mod sound;
 
+use ffi::boundary;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -152,7 +154,9 @@ impl DoomApp {
 
 #[no_mangle]
 pub extern "C" fn DG_Init() {
-    START_TIME.set(Instant::now()).expect("DG_Init called twice");
+    boundary("DG_Init", (), || {
+        START_TIME.set(Instant::now()).expect("DG_Init called twice");
+    })
 }
 
 #[no_mangle]
@@ -160,17 +164,21 @@ pub extern "C" fn DG_DrawFrame() {}
 
 #[no_mangle]
 pub extern "C" fn DG_SleepMs(ms: u32) {
-    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    boundary("DG_SleepMs", (), || {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn DG_GetTicksMs() -> u32 {
-    START_TIME.get().expect("DG_Init not called").elapsed().as_millis() as u32
+    boundary("DG_GetTicksMs", 0, || {
+        START_TIME.get().expect("DG_Init not called").elapsed().as_millis() as u32
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn DG_GetKey(pressed: *mut i32, doom_key: *mut u8) -> i32 {
-    unsafe {
+    boundary("DG_GetKey", 0, || unsafe {
         let mut p = 0;
         let mut k = 0;
         if input::dequeue_key(&mut p, &mut k) {
@@ -180,7 +188,7 @@ pub extern "C" fn DG_GetKey(pressed: *mut i32, doom_key: *mut u8) -> i32 {
         } else {
             0
         }
-    }
+    })
 }
 
 #[no_mangle]
@@ -190,6 +198,14 @@ pub extern "C" fn DG_SetWindowTitle(_title: *const u8) {}
 pub extern "C" fn DG_AudioWrite(_buf: *const u8, _len: u32) {}
 
 fn main() {
+    // The producer that overflowed is doom's own game thread inside
+    // `S_UpdateSounds`, so nothing outside this process can drive it; the
+    // actuator lives in the binary that owns it. Driven by
+    // `tests/toyos-rust-tests/src/bin/doom_sound_flood.rs`.
+    if std::env::args().any(|arg| arg == "--sound-stress") {
+        std::process::exit(sound::sound_stress());
+    }
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let app = DoomApp {
         window: None,
