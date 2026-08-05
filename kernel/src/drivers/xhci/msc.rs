@@ -117,9 +117,9 @@ impl MscDevice {
 /// How one Bulk-Only round trip ended, when it ended at all.
 ///
 /// Two variants and not three: everything that used to be `Broken` is the error
-/// half of [`XhciController::bot`]'s `Result`, and `residue` is bounded by the
-/// transfer it describes because the check that bounds it now runs before this
-/// value exists.
+/// half of [`XhciController::bot`]'s `Result`, and `delivered` cannot exceed the
+/// transfer it describes because both of the checks that bound it run before
+/// this value exists.
 enum Bot {
     /// CSW status 0, with the bytes of the data phase that are really there.
     ///
