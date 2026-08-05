@@ -522,6 +522,55 @@ pub fn iapc_boot_arch(rsdp_addr: u64) -> Result<(u8, u16), TableError> {
     Ok((revision, flags))
 }
 
+/// Which CMOS register holds the RTC's century, as the FADT names it.
+///
+/// `Ok(None)` is firmware saying this machine has no century register, which
+/// the field expresses as zero. It is a real answer and the RTC decoder acts on
+/// it — a two-digit year and nothing to widen it with — rather than reading
+/// some register anyway. Reading 0x32 regardless is what this replaces, on the
+/// strength of a comment saying most hardware puts it there.
+///
+/// The bound is the CMOS index space and not a policy: port 0x70's bit 7 masks
+/// NMI, so an index at or above 0x80 is a register selection *and* a change to
+/// how the machine handles hardware failures. Below 0x0E is the RTC's own clock
+/// and status registers, none of which is a century. Firmware naming either is
+/// refused by name and treated as no century register, because an index that
+/// cannot be a century register is not evidence that there is one.
+///
+/// The error is not an absence, and a caller must not report it as one. Both
+/// end in the same two-digit year, so the log line is the only thing that tells
+/// the owner whether firmware said "no century register" or whether the table
+/// carrying that answer could not be read at all.
+pub fn rtc_century_register(rsdp_addr: u64) -> Result<Option<u8>, TableError> {
+    /// The battery-backed CMOS RAM, which is where a century register can be.
+    const CMOS_RAM: core::ops::RangeInclusive<u8> = 0x0E..=0x7F;
+
+    const NEEDED: usize = offset_of!(Fadt, century) + size_of::<u8>();
+    let fadt = find_table(rsdp_addr, b"FACP", NEEDED)?;
+    let index = fadt
+        .field::<u8>(offset_of!(Fadt, century))
+        .ok_or(TableError::Length { declared: fadt.len as u32, needed: NEEDED })?;
+    // Firmware that leaves the field zero, which is the ACPI encoding for "this
+    // machine has no century register". QEMU generates the FADT a guest sees
+    // and always names 0x32, so the machine this branch exists for cannot be
+    // built from the host.
+    #[cfg(feature = "rtc-no-century")]
+    let index = 0;
+    if index == 0 {
+        log!("ACPI: the FADT names no RTC century register");
+        return Ok(None);
+    }
+    if !CMOS_RAM.contains(&index) {
+        log!(
+            "ACPI: the FADT puts the RTC century register at CMOS {index:#04x}, outside {:#04x}..={:#04x} — ignoring it",
+            CMOS_RAM.start(),
+            CMOS_RAM.end()
+        );
+        return Ok(None);
+    }
+    Ok(Some(index))
+}
+
 /// Trigger ACPI S5 (soft-off) shutdown.
 pub fn shutdown() -> ! {
     // Last chance: nothing drains the log ring after this point.

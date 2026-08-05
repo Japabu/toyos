@@ -1,6 +1,25 @@
-// Monotonic clock: calibrates TSC against HPET at boot, then uses TSC for fast reads.
+//! The machine's clocks: monotonic since boot, and the wall clock anchored to
+//! it once.
+//!
+//! The monotonic half calibrates the TSC against the HPET at boot and reads the
+//! TSC afterwards. The wall-clock half reads the CMOS RTC **exactly once**, in
+//! [`init_wall`], and answers every later question as that reading plus
+//! [`nanos_since_boot`].
+//!
+//! Once and not per call, for two reasons that were both live. `SYS_CLOCK_REALTIME`
+//! went to the CMOS on every call, so a process asking the time in a loop drove
+//! a port-I/O handshake per iteration and could block on the update flag for as
+//! long as a second. And each FAT volume read the RTC privately when it mounted,
+//! so a machine with two of them had two answers to what time it was and no
+//! rule about which won.
+//!
+//! Once also means the answer can be *absent*: an RTC that never replies is a
+//! boot with no wall clock, [`local_secs`] and [`utc_secs`] say so in their
+//! return type, and every consumer decides what to do about it. Nothing here
+//! invents 1970.
 
-use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 
 use crate::mm::paging::CachePolicy;
 use crate::arch::cpu;
@@ -58,4 +77,157 @@ pub fn nanos_since_boot() -> u64 {
     let delta = cpu::rdtsc() - TSC_BOOT.load(Relaxed);
     let period_fs = TSC_PERIOD_FS.load(Relaxed);
     ((delta as u128 * period_fs as u128) / 1_000_000) as u64
+}
+
+/// Unix seconds, in the machine's own zone, at `nanos_since_boot() == 0`.
+static BOOT_LOCAL_SECS: AtomicU64 = AtomicU64::new(0);
+/// Seconds to add to the machine's own zone to get UTC — firmware's
+/// `EFI_TIME::TimeZone`, whose relation is `Localtime = UTC - TimeZone`.
+static UTC_OFFSET_SECS: AtomicI64 = AtomicI64::new(0);
+/// Whether the two above mean anything. Not a sentinel in either: zero is a
+/// real instant and a real offset.
+static WALL_KNOWN: AtomicBool = AtomicBool::new(false);
+
+/// Read the RTC, once, and anchor the wall clock to the monotonic one.
+///
+/// Call after [`init`] and before anything that stamps a file or serves a
+/// clock syscall. A machine whose RTC will not answer logs why and boots with
+/// no wall clock, which is a state and not a failure.
+pub fn init_wall(century_reg: Option<u8>, utc_offset_minutes: Option<i32>) {
+    let civil = match crate::rtc::read(century_reg) {
+        Ok(civil) => civil,
+        Err(fault) => {
+            log!("clock: this machine will not say what time it is — {fault}");
+            return;
+        }
+    };
+
+    let local = civil.to_unix_secs();
+    let offset_secs = utc_offset_minutes.unwrap_or(0) as i64 * 60;
+    BOOT_LOCAL_SECS.store(local.saturating_sub(nanos_since_boot() / 1_000_000_000), Relaxed);
+    UTC_OFFSET_SECS.store(offset_secs, Relaxed);
+    WALL_KNOWN.store(true, Release);
+
+    match utc_offset_minutes {
+        Some(minutes) => log!("clock: the RTC reads {civil}, {minutes} minutes from UTC by firmware"),
+        None => log!("clock: the RTC reads {civil}; firmware named no zone, so it is taken as UTC"),
+    }
+}
+
+/// What time it is in the zone the machine keeps its clock in — what FAT
+/// entries are stamped with, since FAT stores local time by specification, and
+/// what this boot's log file is named for.
+///
+/// `None` is a machine that never said what time it is.
+pub fn local_secs() -> Option<u64> {
+    WALL_KNOWN
+        .load(Acquire)
+        .then(|| BOOT_LOCAL_SECS.load(Relaxed) + nanos_since_boot() / 1_000_000_000)
+}
+
+/// The same instant as seconds since the Unix epoch, which is UTC by
+/// definition. What `SYS_CLOCK_EPOCH` serves and what `SystemTime` is built on.
+pub fn utc_secs() -> Option<u64> {
+    let local = local_secs()?;
+    Some(local.saturating_add_signed(UTC_OFFSET_SECS.load(Relaxed)))
+}
+
+/// A wall-clock instant in the fields a human reads.
+///
+/// The kernel's one calendar. The RTC decodes its registers into this, the log
+/// file is named from it, and `SYS_CLOCK_REALTIME` answers out of it — so there
+/// is one conversion between seconds and dates in the kernel rather than one
+/// per caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Civil {
+    pub year: u64,
+    pub month: u64,
+    pub day: u64,
+    pub hour: u64,
+    pub min: u64,
+    pub sec: u64,
+}
+
+impl fmt::Display for Civil {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            self.year, self.month, self.day, self.hour, self.min, self.sec
+        )
+    }
+}
+
+impl Civil {
+    /// Whether these fields name a day that exists, at a time that exists.
+    ///
+    /// The Unix epoch is the floor because everything downstream counts
+    /// unsigned seconds from it. A leap second lands on 60 and is rejected: the
+    /// RTC does not report one, and a clock that does is not one this kernel
+    /// understands.
+    pub fn is_valid(&self) -> bool {
+        (1970..=9999).contains(&self.year)
+            && (1..=12).contains(&self.month)
+            && (1..=days_in_month(self.year, self.month)).contains(&self.day)
+            && self.hour < 24
+            && self.min < 60
+            && self.sec < 60
+    }
+
+    /// Seconds from the Unix epoch to this instant, reading it in the same zone
+    /// the epoch is in.
+    ///
+    /// Saturating on an invalid instant rather than refusing, because the one
+    /// caller that can produce one is [`Self::is_valid`]'s own check.
+    pub fn to_unix_secs(&self) -> u64 {
+        days_from_civil(self.year, self.month, self.day) * 86_400
+            + self.hour * 3_600
+            + self.min * 60
+            + self.sec
+    }
+
+    pub fn from_unix_secs(secs: u64) -> Civil {
+        let (year, month, day) = civil_from_days(secs / 86_400);
+        let rem = secs % 86_400;
+        Civil { year, month, day, hour: rem / 3_600, min: rem % 3_600 / 60, sec: rem % 60 }
+    }
+}
+
+fn is_leap(year: u64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: u64, month: u64) -> u64 {
+    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    match month {
+        2 if is_leap(year) => 29,
+        1..=12 => LENGTHS[month as usize - 1],
+        _ => 0,
+    }
+}
+
+/// Days from 1970-01-01 to this date. Hinnant's algorithm, restricted to the
+/// non-negative half — the epoch is [`Civil::is_valid`]'s floor.
+fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
+    let y = if month <= 2 { year.saturating_sub(1) } else { year };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day.saturating_sub(1);
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe).saturating_sub(719_468)
+}
+
+/// The inverse.
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }

@@ -181,6 +181,53 @@ fn log_partition_guid(handle: Handle, system_table: &SystemTable<Boot>) -> [u8; 
     })
 }
 
+/// What firmware says the machine's time zone is, in minutes to add to the
+/// CMOS RTC's own reading to get UTC.
+///
+/// Asked here because `GetTime` is a runtime service and the kernel never maps
+/// the runtime, and asked at all because the RTC's registers carry no zone: the
+/// same registers read 14:00 on a machine that keeps UTC and on one two hours
+/// east of it that keeps local time, and only firmware can tell those apart.
+/// `EFI_TIME::TimeZone` is the field, and its spec relation is
+/// `Localtime = UTC - TimeZone`.
+///
+/// `None` is a machine and not a failure — the same as [`boot_partition`] — so
+/// this does not panic where the rest of this file does. Firmware that declines
+/// to say (`EFI_UNSPECIFIED_TIMEZONE`, which is what OVMF ships) and firmware
+/// that cannot be asked are one answer to the kernel: it treats the RTC as UTC
+/// and logs that it is doing so.
+///
+/// The range check is on untrusted input in the strict sense — the field is
+/// whatever a vendor's NVRAM holds — and out of range is refused rather than
+/// clamped, because an offset that is not a zone is not evidence about which
+/// zone the machine is in.
+fn rtc_utc_offset(system_table: &SystemTable<Boot>) -> Option<i32> {
+    /// The field's own bounds, from the UEFI spec: a day either side of UTC.
+    const MAX_OFFSET_MINUTES: i32 = 1440;
+
+    let time = match system_table.runtime_services().get_time() {
+        Ok(time) => time,
+        Err(e) => {
+            println!("RTC zone: firmware's GetTime failed ({e:?}) — the kernel will assume UTC");
+            return None;
+        }
+    };
+    let Some(zone) = time.time_zone() else {
+        println!("RTC zone: firmware names none ({time:?}) — the kernel will assume UTC");
+        return None;
+    };
+    let zone = zone as i32;
+    if !(-MAX_OFFSET_MINUTES..=MAX_OFFSET_MINUTES).contains(&zone) {
+        println!(
+            "RTC zone: firmware names {zone} minutes, outside +/-{MAX_OFFSET_MINUTES} — ignoring \
+             it, the kernel will assume UTC"
+        );
+        return None;
+    }
+    println!("RTC zone: {zone} minutes to add to the RTC for UTC ({time:?})");
+    Some(zone)
+}
+
 /// Kernel virtual base: all physical memory is mapped here in the kernel's address space.
 const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
@@ -408,7 +455,7 @@ unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
     pml4 as u64
 }
 
-fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, boot_part: Option<BootPartition>, log_partition_guid: [u8; 16], system_table: SystemTable<Boot>) -> ! {
+fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, boot_part: Option<BootPartition>, log_partition_guid: [u8; 16], rtc_utc_offset: Option<i32>, system_table: SystemTable<Boot>) -> ! {
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
     let mut memory_map = vec::Vec::<MemoryMapEntry>::with_capacity(memory_map_entry_count);
@@ -471,6 +518,8 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         boot_partition_guid,
         boot_partition_present,
         log_partition_guid,
+        rtc_utc_offset_minutes: rtc_utc_offset.unwrap_or(0),
+        rtc_utc_offset_known: rtc_utc_offset.is_some() as u32,
     };
 
     // Build boot page tables: identity map + high-half map for first 4GB.
@@ -531,6 +580,10 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // Query UEFI GOP before exiting boot services
     let gop = query_gop(&system_table);
 
+    // Last of the firmware questions and for the same reason as the GOP: both
+    // answers die with Boot Services.
+    let rtc_offset = rtc_utc_offset(&system_table);
+
     println!("Starting kernel...");
-    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, gop, boot_part, log_guid, system_table);
+    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, gop, boot_part, log_guid, rtc_offset, system_table);
 }

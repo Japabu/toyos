@@ -6,7 +6,8 @@ use toyos_abi::syscall;
 pub const SYSINFO_HEADER_SIZE: usize = 48;
 pub const SYSINFO_ENTRY_SIZE: usize = 64;
 
-pub fn clock_realtime() -> RealTime {
+/// The time of day, or `None` on a machine whose clock never answered.
+pub fn clock_realtime() -> Option<RealTime> {
     syscall::clock_realtime()
 }
 
