@@ -480,7 +480,7 @@ impl Window {
             return None;
         }
         let event = self.recv_event();
-        self.closed = matches!(event, Event::Close);
+        self.closed = matches!(&event, Event::Close);
         Some(event)
     }
 
