@@ -915,14 +915,13 @@ unsafe extern "C" fn toyos_music_is_playing() -> bool {
 
 // ── The stalled-consumer actuator ──
 
-/// Channels the actuator uses for its two audible/silent probes. Any two
-/// distinct ones do; these are named so the printed line can be read.
 const TONE_CHANNEL: i32 = 3;
 const PROBE_CHANNEL: i32 = 5;
-/// 0.5 s of 440 Hz, the only thing this run puts on the wire.
+/// 0.5 s, played at full volume: the only signal this run puts on the wire.
 const TONE_FRAMES: usize = OUTPUT_RATE as usize / 2;
-/// A short silent sound: playing it to completion is how the game thread
-/// observes that the callback picked up a command.
+/// 0.1 s, played at volume 0. Reaching its end is how the game thread observes
+/// that the callback picked a command up, without adding a second signal region
+/// to a capture that must contain exactly one.
 const PROBE_FRAMES: usize = OUTPUT_RATE as usize / 10;
 const TONE_HZ: f64 = 440.0;
 /// Loud enough that the capture cannot mistake it for the dither floor, with
@@ -988,8 +987,6 @@ fn periods_until_silent(channel: i32) -> Result<u32, String> {
     ))
 }
 
-/// Churns every kind of call the sound module takes, at `vol`, across every
-/// channel.
 fn churn(sfx: &mut SfxInfo, count: u32, vol: i32) {
     for i in 0..count {
         let channel = (i % NUM_SFX_CHANNELS as u32) as i32;
@@ -1066,8 +1063,8 @@ pub fn sound_stress() -> i32 {
 
     // The state every one of those calls was superseded by, still with nothing
     // consuming: one sound on one channel, at the volume named by the last of
-    // another ring's worth of updates. The capture is the verdict on that last
-    // one — every update before it is inaudible by construction.
+    // another `BURST` of updates. The capture is the verdict on that last one —
+    // every update before it is inaudible by construction.
     for channel in 0..NUM_SFX_CHANNELS as i32 {
         unsafe { toyos_stop_sound(channel) };
     }
