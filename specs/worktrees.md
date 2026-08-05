@@ -157,6 +157,65 @@ Gates in `src/buildlock.rs`: `a_claim_waits_for_a_run_in_flight`,
 All three are red when the run lock is taken on a directory the claim does not
 name — which is the tree as it stood.
 
+### 3.2 Who may claim: standing, and the fight that has no winner
+
+Arbitration decides *when* a claim happens. It does not stop the wrong checkout
+from making one, and on 2026-08-04 that was the whole event.
+
+**Five of the six refused worktrees were byte-identical to main** in
+`toyos-abi/src` and `toyos/src`. The sixth — the compositor agent's — held a
+real change to the SDK's `SharedMemory` signature, fixing a bug that kills the
+owner's desktop, and was the sole rightful holder. Every one of the five read
+the refusal's own last sentence, "pass `--claim-sysroot`", as the way out. A
+claim from a checkout that matches main rebuilds the sysroot **from main's
+sources** — which is what all five already had — and refuses the one checkout
+that cannot merge its way out. So the holder claims back. That is not a race to
+be arbitrated; it is a fight whose winner is whoever ran most recently, and it
+cost six landing attempts, four witness rewrites in 38 minutes, a gate dead with
+156 refusals, and an agent parked for hours.
+
+**So a claim now requires standing: this checkout's witnessed trees must
+actually differ from main's**, committed and uncommitted alike (`git diff main`
+over `SYSROOT_SOURCES`, which is also how the holder was identified that day).
+Three answers, all three stated:
+
+- **Diverged** — the checkout that cannot merge its way out. It may claim, and
+  it is told to land as soon as it can, because nobody else can end the refusal
+  from their end.
+- **Matches main** — refused, with the holder named and **no `--claim-sysroot`
+  in the message**. What it is told instead is the fact that makes waiting
+  correct: when the holder lands, main carries what the sysroot holds and the
+  refusal ends by itself, with nobody acting.
+- **Unknown** — git could not answer. Refused, because a claim is destructive
+  and an unanswered question is not permission.
+
+**The primary's ordinary build was the same act, silently.** `std_sources_stale`
+is true for the toolchain's owner in exactly two situations: its own sources
+changed, or a worktree claimed the sysroot for something not on main yet. The
+second is a lease, and rebuilding over it takes the sysroot from the one
+checkout that cannot merge its way out. Watched live on 2026-08-05 — the witness
+rewritten at 00:23, 00:26 and 00:47 while a worktree with a real SDK change and
+a build in the primary took it from each other, poisoning two full suite runs
+into 500.9 s and 427.5 s of nothing but refusals. The primary now refuses too,
+telling the two cases apart by who wrote the witness, and `--claim-sysroot`
+still takes it back — deliberately, and out loud.
+
+**What none of this removes is the sharing.** One sysroot serves N worktrees, so
+a checkout with a real ABI change still takes a turn during which the others
+wait. Two things would remove it and neither was taken today:
+
+- **A private sysroot for the diverged checkout.** Everything in stage2 except
+  `lib/rustlib/x86_64-unknown-toyos` is ABI-independent, so a worktree that
+  diverges could hold its own copy of that one directory with a
+  `rustup toolchain link toyos-<worktree>` beside it, leaving the shared sysroot
+  permanently main's. Nobody would ever be refused and nobody would ever claim.
+  The cost is that `+toyos` is named at every cargo invocation in `src/` and in
+  `tests/common/`, and that x.py writes into `rust/build` and would have to be
+  copied out of it — a change that cannot be validated without a working
+  toolchain, which is exactly what an agent in this situation does not have.
+- **Landing the ABI change first**, which is cheaper and which the standing rule
+  now points every refused checkout at.
+
 ## 4. Two lock scopes
 
 `buildlock::Scope` is named at every `act_if`, because the two are not
