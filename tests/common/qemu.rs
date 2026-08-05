@@ -265,6 +265,30 @@ pub enum Profile {
     /// refusals, because a platform that declares it cannot remap and a unit
     /// that cannot are different facts a user can act on differently.
     IommuNoIntremap,
+    /// metal-sim with three Intel HDA controllers, shaped so that one boot
+    /// runs both arms of every question `specs/hda-driver-plan.md` H0 asks.
+    ///
+    /// A machine nobody ships, and deliberately so: H0's probe is a diagnostic
+    /// aimed at one laptop, and the only thing the harness can certify is that
+    /// each branch of it produces a sensible answer when the hardware takes
+    /// that shape. Which branch a real machine runs is the T14's to say.
+    ///
+    /// - `hda0` is function 0 of a multifunction slot with two codecs behind
+    ///   it. Its isolation scope is *not* a singleton, which is `iommu-spec.md`
+    ///   §7.3's refusal and the T14's own shape (function 3 of five); its two
+    ///   codecs are §2.3's first-match trap, where a driver taking the first
+    ///   answer binds display audio and plays silence out of the speakers.
+    /// - `hda1` is function 1 of that slot with **no codec at all**. That is
+    ///   question (b)'s dead answer — `STATESTS` reads zero — and on a real
+    ///   Tiger Lake it means the audio path is behind the vendor DSP or on
+    ///   SoundWire, and the plan is over on that machine.
+    /// - `hda2` has a slot to itself and one codec: the singleton scope §7.3
+    ///   permits, and the ordinary alive case.
+    ///
+    /// Slots 16 and 17 because q35 leaves them free and because a fixed
+    /// address is the only way to state "these two are functions of one
+    /// device" — which is the whole of the first bullet.
+    MetalHda,
 }
 
 /// The vIOMMU a profile puts on the machine.
@@ -329,6 +353,22 @@ const XHCI_MSI_ONLY: &str = "nec-usb-xhci,id=xhci1,msix=off";
 const XHCI_NO_IRQ_FIRST: &str = "nec-usb-xhci,id=xhci,msix=off,msi=off";
 const XHCI_NO_IRQ_SECOND: &str = "nec-usb-xhci,id=xhci1,msix=off,msi=off";
 
+/// [`Profile::MetalHda`]'s three controllers, in the order QEMU creates them.
+///
+/// The slot numbers are the whole shape: `10.0` and `10.1` are two functions of
+/// one device, which is `iommu-spec.md` §7.3's non-singleton scope and the
+/// T14's own arrangement, and `11.0` has a slot to itself, which is the
+/// singleton the same rule permits. `cad=` places each codec at a chosen link
+/// address, so "two codecs answered" is staged rather than hoped for.
+const HDA_THREE: &[&str] = &[
+    "intel-hda,id=hda0,addr=10.0,multifunction=on",
+    "hda-output,bus=hda0.0,cad=0,audiodev=hdaaud",
+    "hda-duplex,bus=hda0.0,cad=1,audiodev=hdaaud",
+    "intel-hda,id=hda1,addr=10.1",
+    "intel-hda,id=hda2,addr=11.0",
+    "hda-output,bus=hda2.0,cad=0,audiodev=hdaaud",
+];
+
 /// Everything a profile decides about the machine, in one table. A new
 /// variant answers every question here or does not compile — which `self !=
 /// Profile::Metal` did the opposite of: it handed anything that was not
@@ -389,6 +429,17 @@ struct Shape {
     /// bind to the next disk is only observable when the failure is first, and
     /// QEMU assigns ports in device-creation order.
     usb_disk_first: bool,
+    /// Every Intel HDA controller on the machine and the codecs behind each,
+    /// as `-device` arguments in the order QEMU is to create them. Empty is
+    /// what every profile but [`Profile::MetalHda`] declares, and it is the
+    /// machine this kernel has always booted: audio through virtio-sound or
+    /// through nothing at all.
+    ///
+    /// Presence of a class-0403 *function* is the shape dimension, and it is
+    /// separate from whether anything answers on the link behind it — which is
+    /// `specs/hda-driver-plan.md` H0's question (b), and what the codec
+    /// arguments in this list decide per controller.
+    hda: &'static [&'static str],
     /// The unit that decodes this machine's DMA, or its absence. Stated per
     /// profile because absence is a shape and because the unit's own
     /// capabilities are what the kernel reads at boot.
@@ -441,6 +492,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::Gop => Shape {
@@ -456,6 +508,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::Diskless => Shape {
@@ -473,6 +526,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::Metal => Shape {
@@ -495,6 +549,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             // Two keyboards and two pointers, because the collision this
@@ -520,6 +575,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::MetalDisk => Shape {
@@ -535,6 +591,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::NvmeWideSector => Shape {
@@ -550,6 +607,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDisk => Shape {
@@ -565,6 +623,7 @@ impl Profile {
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDisk4k => Shape {
@@ -580,6 +639,7 @@ impl Profile {
                 usb_disk_lba_bytes: 4096,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDiskHuge => Shape {
@@ -595,6 +655,7 @@ impl Profile {
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDiskRefusedFirst => Shape {
@@ -610,6 +671,7 @@ impl Profile {
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: false,
                 usb_disk_first: true,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::UsbDiskReadOnly => Shape {
@@ -625,6 +687,7 @@ impl Profile {
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: true,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             // The first controller carries nothing at all — not even the boot
@@ -646,6 +709,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::MetalXhciSecond => Shape {
@@ -661,6 +725,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             // A hub ahead of the second controller's HID, so that controller's
@@ -688,6 +753,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             // The boot stick's controller is the one with no interrupt
@@ -712,6 +778,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             // Boot stick on the good controller, HID on the crippled one. A
@@ -730,6 +797,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             Self::MetalHotplug => Shape {
@@ -745,6 +813,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
             // The three below are metal-sim with one field of the unit moved,
@@ -763,6 +832,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: None,
             },
             Self::IommuNarrow => Shape {
@@ -778,6 +848,7 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(Iommu { aw_bits: 39, ..IOMMU_DEFAULT }),
             },
             Self::IommuNoIntremap => Shape {
@@ -793,7 +864,24 @@ impl Profile {
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_readonly: false,
                 usb_disk_first: false,
+                hda: &[],
                 iommu: Some(Iommu { intremap: false, ..IOMMU_DEFAULT }),
+            },
+            Self::MetalHda => Shape {
+                vga: "std",
+                vgamem_mb: Some(8),
+                virtio: false,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
+                usb_disk_first: false,
+                hda: HDA_THREE,
+                iommu: Some(IOMMU_DEFAULT),
             },
         }
     }
@@ -1873,6 +1961,17 @@ fn qemu_command(
 
     for dev in shape.usb {
         qemu.arg("-device").arg(*dev);
+    }
+
+    if !shape.hda.is_empty() {
+        // The codecs open a backend even though nothing plays, and `none` is
+        // the one that needs no file and no host device. H0 moves no sample:
+        // gate A's wav capture arrives with H4, the arm that has something to
+        // record.
+        qemu.arg("-audiodev").arg("none,id=hdaaud");
+        for dev in shape.hda {
+            qemu.arg("-device").arg(*dev);
+        }
     }
 
     if shape.virtio {

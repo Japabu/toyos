@@ -1991,6 +1991,61 @@ the process that would have answered it.
 
 ## 5. Diagnostics
 
+### OPEN — QEMU 11.0.3 sets `ECAP.PT`, so `Iova::identity`'s comment gives a false reason for correct behaviour
+
+Measured 2026-08-05 off the `hda_probe` boot, in the unit configuration
+`specs/iommu-spec.md` §8.1 recorded on 11.0.2:
+
+```
+§8.1, QEMU 11.0.2:  cap=0x80d2008c222f06c6 ecap=0x0000000000f00f0a … pt=n
+this host, 11.0.3:  cap=0x80d2008c222f0686 ecap=0x0000000000f00f4a … pt=y
+```
+
+`ECAP` bit 6 is now set and the kernel's own decode prints `pt=y`. `CAP` moved
+too (`…06c6` → `…0686`); which bit that is has not been decoded here, and the
+raw words are recorded so the next reader need not take a name for it.
+
+**No behaviour is affected.** §5.7 already writes an identity-mapped domain
+"always, and never a passthrough context entry, even on a unit that offers
+one", and §8's item 8 carries the argument. What is now false is the *reason*
+attached to it: `kernel/src/iommu/mod.rs`'s `Iova::identity` says "§8.1 measured
+`ECAP.PT` clear on the only unit anyone here can boot, **so** §5.7's passthrough
+context type is unavailable" — a premise this host contradicts, which leaves a
+correct decision resting on a reason that has stopped being true. §5.7's own
+argument does not depend on it and is the one to keep.
+
+### OPEN — `--diag-boot` cannot carry a kernel feature, so H0's probe is not in the flashed image
+
+`specs/hda-driver-plan.md` H0 is built and behind the kernel feature
+`hda-probe` (`kernel/src/drivers/hda_probe.rs`), which is how "nothing in the
+ordinary boot path takes that controller out of reset" is enforced —
+`cargo test -- hda_probe` boots the diag config with the feature, asserts every
+verdict, then boots the same machine with a plain kernel and requires no `hda:`
+line at all. What is missing is one line: `src/build.rs:463` sets
+`kernel_features` from `debug` alone, so `Boot::Diag` builds the same kernel as
+`Boot::Normal` and the image the owner flashes carries no probe.
+
+The obstacle is not the size of the change, it is where it lands. `Boot::Diag`'s
+own doc says the diagnostic image's kernel is byte-identical to the ordinary
+one's and that "a `#[cfg]` could not have given us that" — so making the diag
+image a different kernel build changes a stated guarantee of that mode, and it
+belongs to whoever owns `src/`. H0's author held `kernel/` and the harness and
+was told not to touch `src/`, where another agent was working.
+
+Two shapes, and the owner should pick rather than the next agent guessing:
+
+1. **`Boot::Diag` gets a feature list of its own.** Smallest diff, and it makes
+   the diag kernel a second build — visibly, since the artifact key already
+   hashes the feature set. The guarantee in the doc becomes "same sources,
+   stated feature difference".
+2. **A `--kernel-feature <name>` flag on `cargo run`**, orthogonal to the boot
+   mode. Keeps `Boot::Diag` byte-identical by default and makes taking hardware
+   out of reset an explicit act, which is the honest shape for this. Costs one
+   more thing to remember at flash time.
+
+Until one of them lands, the T14's answer to `hda-driver-plan.md` §6.3 is
+unreachable — and that answer decides the whole audio track (§6.3's (b) block).
+
 ### OPEN — a boot that wedges before the idle loop says nothing at all
 
 Not "says less": **nothing**, including everything it logged before it wedged. The
@@ -2636,6 +2691,27 @@ Two ways to close it, and the choice belongs with the suite work rather than
 here: move `i8042_mouse` back to `Sched::Serial`, or split the verdict so the
 paced count stays parallel and the lost-edge claim runs where the host is not
 oversubscribed.
+
+**2026-08-05: the *count* now fails too, which the second option above would not
+have caught.** On the `hda-probe` branch, with eight worktrees live on the host:
+
+```
+FAIL i8042_mouse: 996 pointer events reached userland out of 1004 packets
+injected, each one paced against the arrival of the last
+  FAIL  i8042_mouse  (60s)
+  …
+  [i8042] 1008 packets injected, 1008 out, last button state 0x00
+  PASS  i8042_mouse  (570ms)
+  ALONE i8042_mouse: GREEN
+```
+
+Sixty seconds in the wide phase against 570 ms alone, and eight of 1004 packets
+missing rather than an edge miscounted. So the pacing argument does not hold for
+the count either under this much contention — the guest is slow enough that
+something upstream of the count gives up before the packet arrives. Splitting
+the verdict therefore fixes only half of it, and `Sched::Serial` is the option
+that closes both. The branch that saw it changes no port I/O and no input path:
+its only ungated change anywhere is one extra field on the `iommu: unitN` line.
 
 ### Device registers still take firmware's word for being uncacheable
 
