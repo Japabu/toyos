@@ -73,13 +73,9 @@ impl Parser {
         self.attributes(AttrSite::Elsewhere(site));
     }
 
-    pub(super) fn at_attribute(&self) -> bool {
-        matches!(self.peek(), TokenKind::Attribute)
-    }
-
     fn attributes(&mut self, site: AttrSite) -> TypeAttrs {
         let mut attrs = TypeAttrs::default();
-        while self.at_attribute() {
+        while matches!(self.peek(), TokenKind::Attribute) {
             self.advance();
             self.expect(&TokenKind::LParen);
             self.expect(&TokenKind::LParen);

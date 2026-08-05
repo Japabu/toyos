@@ -60,8 +60,9 @@ fn a_layout_attribute_outside_a_struct_definition_is_refused() {
     refuses("enum __attribute__((packed)) E { X };", "an enum");
     refuses(
         "struct S { char a; int b; }; struct __attribute__((packed)) S s;",
-        "belongs on the definition",
+        "`struct S`",
     );
+    refuses("union U { char a; int b; }; union __attribute__((packed)) U u;", "`union U`");
 }
 
 #[test]

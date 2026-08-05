@@ -191,8 +191,8 @@ impl Parser {
                 TokenKind::Int128 => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Int128)); has_base_type = true; }
 
                 // Struct/union/enum
-                TokenKind::Struct => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Struct(self.struct_or_union_type()))); has_base_type = true; }
-                TokenKind::Union => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Union(self.struct_or_union_type()))); has_base_type = true; }
+                TokenKind::Struct => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Struct(self.struct_or_union_type("struct")))); has_base_type = true; }
+                TokenKind::Union => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Union(self.struct_or_union_type("union")))); has_base_type = true; }
                 TokenKind::Enum => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Enum(self.enum_type()))); has_base_type = true; }
 
                 // Typeof
@@ -239,7 +239,7 @@ impl Parser {
         specs
     }
 
-    fn struct_or_union_type(&mut self) -> StructType {
+    fn struct_or_union_type(&mut self, keyword: &str) -> StructType {
         let leading = self.type_attributes();
         let name = if let TokenKind::Ident(s) = self.peek() {
             let s = s.clone();
@@ -291,7 +291,7 @@ impl Parser {
             None => {
                 assert!(
                     leading.is_empty(),
-                    "{}: a layout attribute belongs on the definition of `struct {}`, not on a use of it",
+                    "{}: a layout attribute belongs on the definition of `{keyword} {}`, not on a use of it",
                     self.loc(),
                     name.as_deref().unwrap_or("<anonymous>"),
                 );
