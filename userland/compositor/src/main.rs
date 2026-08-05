@@ -93,6 +93,17 @@ const MAX_WINDOW_SLOTS: u32 = Poller::MAX_HANDLES - FIXED_POLL_FDS - MAX_PENDING
 /// discarded, never waited for.
 const MAX_KEPT_PAYLOAD: usize = 116;
 
+/// The largest clipboard the compositor will hold for a client.
+///
+/// Two things meet here. `MSG_CLIPBOARD_SET_SHM` carries a length the client
+/// chooses and the compositor reads that many bytes out of a region the client
+/// granted, so an unbounded length is a read past the mapping — and the kernel
+/// rounds every shared region up to one 2 MiB page (`shared_memory::alloc`),
+/// which makes a page the largest length that cannot leave the smallest region
+/// anybody can grant. It is also policy: a clipboard is text somebody selected,
+/// and a megabyte of it is already generous.
+const MAX_CLIPBOARD_BYTES: usize = 2 * 1024 * 1024;
+
 /// How long one pass may spend draining clients before it must composite.
 ///
 /// Without it a client that never stops sending keeps its fd ready forever and
@@ -280,6 +291,15 @@ fn bring_to_front(windows: &mut Vec<WindowState>, idx: usize) -> usize {
     }
 }
 
+/// Give `win` a buffer of `new_w`×`new_h`, or leave it with the one it has.
+///
+/// **Neither refusal is fatal, and one of them is how the desktop died.** The
+/// grant names a process, and a client whose window is being maximized may
+/// have exited since the compositor decided to: `grant_shared` answers
+/// `InvalidArgument` for a pid the process table no longer knows, and an
+/// infallible `SharedMemory::grant` over that took every other window with it.
+/// The allocation is the compositor's own memory rather than the client's
+/// doing, so a refusal there keeps the window at a size it can afford.
 fn resize_window(
     win: &mut WindowState,
     new_w: usize,
@@ -289,8 +309,20 @@ fn resize_window(
 ) {
     let old_token = win.shm.token();
     let buf_size = new_w * new_h * 4;
-    let new_shm = SharedMemory::allocate(buf_size);
-    new_shm.grant(win.pid);
+    let new_shm = match SharedMemory::allocate(buf_size) {
+        Ok(shm) => shm,
+        Err(e) => {
+            eprintln!(
+                "compositor: pid {} keeps its {}x{} buffer — no memory for {new_w}x{new_h} ({e:?})",
+                win.pid, win.width, win.height
+            );
+            return;
+        }
+    };
+    if new_shm.grant(win.pid).is_err() {
+        mark_dead(dead, win.fd.fd(), win.pid, DropReason::Vanished);
+        return;
+    }
     let token = new_shm.token();
     // Replace the old SharedMemory (drops it, releasing the old mapping)
     win.shm = new_shm;
@@ -665,6 +697,11 @@ enum DropReason {
     Gone,
     /// Accepted, and never completed a first frame.
     HandshakeTimeout,
+    /// The kernel refused to give it memory because it no longer names a
+    /// process. Distinct from [`Gone`](Self::Gone): the connection is still
+    /// open and readable, and the compositor learns of the death only by
+    /// trying to hand the client something.
+    Vanished,
 }
 
 impl DropReason {
@@ -674,6 +711,7 @@ impl DropReason {
             Self::NotReading => "its pipe will not take another message and it is not reading",
             Self::Gone => "its connection is gone",
             Self::HandshakeTimeout => "it never finished its first message",
+            Self::Vanished => "the process behind it has exited",
         }
     }
 }
@@ -1209,7 +1247,11 @@ fn main() {
 
     let mut fb_info = fb_dev.info().expect("failed to read framebuffer info");
     let fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
-    let mut fb_shm = SharedMemory::map(fb_info.token[0], fb_size);
+    // The framebuffer's tokens come from the device this process has just
+    // claimed, so a refusal here is the kernel contradicting itself and not a
+    // client doing anything.
+    let mut fb_shm = SharedMemory::map(fb_info.token[0], fb_size)
+        .expect("the scanout token the framebuffer device just reported");
     let mut screen = Screen::new(
         fb_shm.as_ptr(),
         fb_info.width as usize,
@@ -1221,7 +1263,8 @@ fn main() {
 
     // Set up cursor
     let hw_cursor = fb_info.flags & FLAG_HARDWARE_CURSOR != 0;
-    let cursor_shm = SharedMemory::map(fb_info.cursor_token, 64 * 64 * 4);
+    let cursor_shm = SharedMemory::map(fb_info.cursor_token, 64 * 64 * 4)
+        .expect("the cursor token the framebuffer device just reported");
     let cursor_buf = cursor_shm.as_ptr();
     let cursor_svg = std::fs::read("/share/icons/cursor-bold.svg").expect("failed to read cursor");
     let cursor_default = sprite::Sprite::from_svg_colored(&cursor_svg, 20, [255, 255, 255]);
@@ -1474,19 +1517,39 @@ fn main() {
                                     } else {
                                         static PASTE_SHM: std::sync::Mutex<Option<SharedMemory>> =
                                             std::sync::Mutex::new(None);
-                                        let mut shm = SharedMemory::allocate(clipboard.len());
-                                        shm.as_mut_slice()[..clipboard.len()]
-                                            .copy_from_slice(clipboard.as_bytes());
-                                        deliver(
-                                            &mut dead,
-                                            win,
-                                            window::MSG_CLIPBOARD_PASTE_SHM,
-                                            &window::ClipboardShmMsg {
-                                                token: shm.token(),
-                                                len: clipboard.len() as u32,
-                                            },
-                                        );
-                                        *PASTE_SHM.lock().unwrap() = Some(shm);
+                                        // The grant is what makes the token
+                                        // mean anything to the window: without
+                                        // it the client's own `map_shared` is
+                                        // refused, and this path sent one for
+                                        // every paste over 4096 bytes.
+                                        match SharedMemory::allocate(clipboard.len()) {
+                                            Ok(mut shm) if shm.grant(win.pid).is_ok() => {
+                                                shm.as_mut_slice()[..clipboard.len()]
+                                                    .copy_from_slice(clipboard.as_bytes());
+                                                deliver(
+                                                    &mut dead,
+                                                    win,
+                                                    window::MSG_CLIPBOARD_PASTE_SHM,
+                                                    &window::ClipboardShmMsg {
+                                                        token: shm.token(),
+                                                        len: clipboard.len() as u32,
+                                                    },
+                                                );
+                                                *PASTE_SHM.lock().unwrap() = Some(shm);
+                                            }
+                                            Ok(_) => mark_dead(
+                                                &mut dead,
+                                                win.fd.fd(),
+                                                win.pid,
+                                                DropReason::Vanished,
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "compositor: pid {} gets no paste — no memory \
+                                                 for {} bytes ({e:?})",
+                                                win.pid,
+                                                clipboard.len()
+                                            ),
+                                        }
                                     }
                                 }
                             }
@@ -1893,21 +1956,28 @@ fn main() {
         let mut client_msgs: Vec<ClientFrame> = Vec::new();
 
         if listener_ready {
-            let result = services::accept(&listener).expect("accept failed");
-            if pending.len() >= MAX_PENDING_CONNS as usize {
-                eprintln!(
-                    "compositor: refusing pid {} — {MAX_PENDING_CONNS} connections are already \
-                     waiting to say what they want",
-                    result.client_pid
-                );
-            } else {
-                poller.poll_add(&result.conn, IORING_POLL_IN, result.conn.fd().0 as u64);
-                pending.push(PendingConn {
-                    conn: result.conn,
-                    pid: result.client_pid,
-                    rx: ClientRx::new(),
-                    since: Instant::now(),
-                });
+            // `accept` installs a descriptor, so it answers `ResourceExhausted`
+            // on a full fd table — and clients drive that table, one fd per
+            // connection. The connection is lost either way; the desktop is
+            // not.
+            match services::accept(&listener) {
+                Err(e) => eprintln!("compositor: a connection could not be accepted ({e:?})"),
+                Ok(result) if pending.len() >= MAX_PENDING_CONNS as usize => {
+                    eprintln!(
+                        "compositor: refusing pid {} — {MAX_PENDING_CONNS} connections are already \
+                         waiting to say what they want",
+                        result.client_pid
+                    );
+                }
+                Ok(result) => {
+                    poller.poll_add(&result.conn, IORING_POLL_IN, result.conn.fd().0 as u64);
+                    pending.push(PendingConn {
+                        conn: result.conn,
+                        pid: result.client_pid,
+                        rx: ClientRx::new(),
+                        since: Instant::now(),
+                    });
+                }
             }
         }
 
@@ -1990,12 +2060,19 @@ fn main() {
                     let req_w = req.width as usize;
                     let req_h = req.height as usize;
 
-                    // Both refusals are answers to untrusted input, so neither
-                    // is a panic and neither is a silent shrink of what was
-                    // asked for. Without the size check `req` reaches
-                    // `SharedMemory::allocate` unbounded, where `alloc_shared`
-                    // asserts on a token the kernel refused — one message from
-                    // any client, and the compositor is gone.
+                    // A window *is* a connection its first frame promoted, so a
+                    // second `MSG_CREATE_WINDOW` comes with nothing to promote.
+                    // `new_conn` is `None` for every frame off an established
+                    // window, and reading that as a bug rather than as a
+                    // protocol error made one message from any client fatal.
+                    let Some(conn) = new_conn else {
+                        mark_dead(&mut dead, client_fd, client_pid, DropReason::OutOfProtocol);
+                        continue;
+                    };
+
+                    // Every refusal below is an answer to untrusted input, so
+                    // none of them is a panic and none is a silent shrink of
+                    // what was asked for.
                     let refusal = if windows.len() >= max_windows {
                         Some(window::REFUSED_AT_CAPACITY)
                     } else if req_w > screen_w || req_h > screen_h {
@@ -2039,13 +2116,36 @@ fn main() {
                     let content_h = win_h - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
 
                     let buf_size = content_w * content_h * 4;
-                    let shm = SharedMemory::allocate(buf_size);
-                    shm.grant(client_pid);
+                    let shm = match SharedMemory::allocate(buf_size) {
+                        Ok(shm) => shm,
+                        Err(e) => {
+                            eprintln!(
+                                "compositor: refusing {content_w}x{content_h} window from pid \
+                                 {client_pid} — there is no memory for it ({e:?})"
+                            );
+                            let _ = ipc::try_send(
+                                client_fd,
+                                window::MSG_WINDOW_REFUSED,
+                                &window::WindowRefused { reason: window::REFUSED_NO_MEMORY },
+                            );
+                            continue;
+                        }
+                    };
+                    // The client can be gone before its first frame is served:
+                    // `accept` names the process that connected, and the frame
+                    // it left in the pipe outlives it. Dropping `conn` here is
+                    // the whole cleanup — there is no window yet.
+                    if shm.grant(client_pid).is_err() {
+                        eprintln!(
+                            "compositor: dropping pid {client_pid} — {}",
+                            DropReason::Vanished.why()
+                        );
+                        continue;
+                    }
                     let token = shm.token();
                     let pixel_format = screen.pixel_format_raw();
 
                     let topmost = req.flags & window::WINDOW_FLAG_TOPMOST != 0;
-                    let conn = new_conn.expect("MSG_CREATE_WINDOW without Connection");
                     windows.push(WindowState {
                         fd: conn,
                         pid: client_pid,
@@ -2141,8 +2241,26 @@ fn main() {
                         mark_dead(&mut dead, client_fd, client_pid, DropReason::OutOfProtocol);
                         continue;
                     };
-                    let shm = SharedMemory::map(info.token, info.len as usize);
-                    clipboard = String::from_utf8_lossy(&shm.as_slice()[..info.len as usize]).into_owned();
+                    // Two numbers off the wire, and both decide what this
+                    // process reads. The token names a region the client says
+                    // it granted — a token it never granted, or never
+                    // allocated, is a refusal the compositor has to survive —
+                    // and the length is its claim about how much of it is
+                    // text, which past the region is a read of somebody
+                    // else's memory rather than a clipboard.
+                    if info.len as usize > MAX_CLIPBOARD_BYTES {
+                        eprintln!(
+                            "compositor: refusing {} bytes of clipboard from pid {client_pid}, \
+                             max {MAX_CLIPBOARD_BYTES}",
+                            info.len
+                        );
+                        continue;
+                    }
+                    let Ok(shm) = SharedMemory::map(info.token, info.len as usize) else {
+                        mark_dead(&mut dead, client_fd, client_pid, DropReason::OutOfProtocol);
+                        continue;
+                    };
+                    clipboard = String::from_utf8_lossy(shm.as_slice()).into_owned();
                 }
                 window::MSG_SET_CURSOR => {
                     let Ok(style) = ipc::decode_payload::<u32>(payload) else {
@@ -2162,7 +2280,8 @@ fn main() {
                         Ok(new_fb_info) => {
                             fb_info = new_fb_info;
                             let new_fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
-                            fb_shm = SharedMemory::map(fb_info.token[0], new_fb_size);
+                            fb_shm = SharedMemory::map(fb_info.token[0], new_fb_size)
+                                .expect("the scanout token the mode set just returned");
                             screen = Screen::new(
                                 fb_shm.as_ptr(),
                                 fb_info.width as usize,
