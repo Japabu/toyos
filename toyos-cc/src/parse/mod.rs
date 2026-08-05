@@ -1,6 +1,9 @@
+mod attr;
 mod decl;
 mod expr;
 mod stmt;
+
+pub use attr::TypeAttrs;
 
 use crate::ast::*;
 use crate::lex::{Token, TokenKind};
@@ -48,6 +51,13 @@ impl Parser {
 
     fn at_eof(&self) -> bool {
         matches!(self.peek(), TokenKind::Eof)
+    }
+
+    fn loc(&self) -> String {
+        match self.tokens.get(self.pos) {
+            Some(t) => format!("{}:{}:{}", t.loc.file, t.loc.line, t.loc.col),
+            None => "<eof>".to_string(),
+        }
     }
 
     fn ident(&mut self) -> String {

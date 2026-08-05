@@ -239,6 +239,7 @@ impl Parser {
             match &self.tokens[i].kind {
                 t if self.is_type_keyword(t) => {}
                 TokenKind::Ident(name) if self.type_env.is_typedef(name) => {}
+                TokenKind::Attribute => {}
                 _ => return false,
             }
         } else {

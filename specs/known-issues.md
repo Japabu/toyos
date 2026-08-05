@@ -2016,6 +2016,35 @@ The nearest suspect on file is §10's ESP-log flush on the idle path and the
 place a `--smp 1` machine spends the time between audio periods. That is a
 hypothesis, not a measurement.
 
+### OPEN — nothing explains why doom's audio callback stalled on the T14
+
+doom's sound producer can no longer kill the game when its callback stops
+consuming — `doom_sound_flood` stages exactly that and the game lives — and
+that is the whole of what is now known. **Why the callback stopped on the
+owner's machine, about five seconds into play, is not.** The evidence is one
+abort message, because the process that would have carried the answer is the
+one that died.
+
+An audio client's RT standing is *lent*, not held: soundd claims the audio
+device, takes the RT band with it (`main.rs:705`), and every pipe write it
+makes lends the woken reader a one-quantum window (`wake_pipe_readers`, spec
+§8.5). **On a machine with no audio device none of that happens.** The null
+sink deliberately does not request the band — it protects no audible output —
+so `driver::current_is_rt()` is false at its `signal_clients` write and the
+client's callback thread is woken as an ordinary thread. The T14 has no audio
+device. So the one thing that keeps a 2.9 ms deadline met was absent there and
+is present in every config the suite runs.
+
+That is a mechanism, not a measurement, and two others are equally live: §1's
+`drain_irqs` entry, where any syscall on that thread can become the USB
+driver's engine for as long as a second; and plain scheduling pressure from a
+game thread and a compositor that never yield to it.
+
+What would decide it is the callback's own period count against wall clock, on
+that machine. doom now keeps that counter (`MIXED_PERIODS`) and now survives
+the stall, so the next T14 session can be asked the question instead of losing
+the process that would have answered it.
+
 ---
 
 ## 5. Diagnostics
@@ -2205,11 +2234,27 @@ the moment each was re-run by itself in the same process. None predates or was
 introduced by the parallel-width work; all have been `Sched::Parallel` since the
 phase landed, and none reproduces on a host running one suite.
 
-- **`i8042_mouse`** — CLOSED. The verdict was a drain rate (`at least half of a
-  thousand injected packets arrived`) and it is now the full count with the
-  injection paced against the guest's own report of each packet, so nothing the
-  host does can outrun the guest. `0 discarded` is unchanged and joined by
-  `0 overruns`, `0 dropped`, `0 lost edges`. `specs/test-cost-audit.md` §5.5.2.
+- **`i8042_mouse`** — REOPENED 2026-08-05, and the closing argument is the thing
+  that is wrong. It read: the injection is paced against the guest's own report
+  of each packet, "so nothing the host does can outrun the guest". Outrunning is
+  not the failure mode left. The host now *stalls* — it waits for a packet the
+  guest never delivers and the test times out at 60 s:
+
+      FAIL i8042_mouse: timed out after 60s — 271 of the 303 packets injected
+      came back out, so the host stalled on one the machine never delivered
+
+  Pacing converted a lost packet from a miscount into a deadlock, so the verdict
+  is now a wall-clock timeout wearing a count's clothes. Measured on a loaded
+  host (four worktrees), alternating one checkout against the other in one
+  session, six runs: **main FAIL(271/303), PASS(3s), PASS(3s); a branch that
+  touches no input code FAIL(976/1004), FAIL(813/845), PASS(3s), PASS(4s)**. It
+  reds on `main` as readily as anywhere else, so it is not attributable to
+  whatever branch happens to be under it, and a green run costs 3 s against a
+  red one's 60 s. The prior text also predates §3's finding below, which says
+  the pacing argument never covered `0 lost edges` either.
+
+  Anyone whose suite reds here: re-run it alone before believing it, and if it
+  goes green the classification is the bug rather than your change.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
@@ -2221,6 +2266,12 @@ phase landed, and none reproduces on a host running one suite.
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
   `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`.
+- **`desktop_locale_detect`** — added 2026-08-05. Same `nothing typed at the
+  terminal window reached a shell`, same `ALONE … GREEN`, in the same run as the
+  entry above and on a branch that touches neither the compositor nor the
+  terminal. It reaches a shell through `shell_answers` exactly as
+  `desktop_typing_damage` does, so it inherits that retry window and evidently
+  not enough of it. Still `Sched::Parallel`.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
@@ -2579,6 +2630,83 @@ Recorded rather than fixed, because each way out costs more than the noise:
   its own.
 
 Not by redirecting the shim's stderr: rustup reports real errors on it.
+
+### A C test whose compilation fails is skipped, not red
+
+`compile_c_tests` (`tests/toyos.rs`) wraps each compile in `catch_unwind` and
+drops the ones that panic, printing a line to stderr and nothing else. Eleven of
+the 121 discovered tests are in that state on 2026-08-05 — `78_vla_label`,
+`79_vla_continue`, `83_utf8_in_identifiers`, `85_asm_outside_function`,
+`89_nocode_wanted`, `94_generic`, `95_bitfields`, `95_bitfields_ms`,
+`96_nodata_wanted`, `98_al_ax_extend`, `99_fastcall` — and none of them is in
+`C_SKIP`, so nothing in the tree records that they are meant to be failing.
+
+The consequence for anyone changing the compiler: a change that breaks a C test
+*at compile time* moves it into this list rather than turning the suite red.
+`82_attribs_position` did exactly that during the `__attribute__` work and only
+the stderr line caught it. The check that works is to diff the skipped list
+across the change; the fix would be to make the list a fixture the suite asserts
+against.
+
+`tests/testcases/pp_tcc/` (25 preprocessor cases with `.expect` files) is read by
+nothing at all — `compile::testcases_dir()` returns only `tests/testcases/tinycc`
+and no other Rust file mentions `pp_tcc`.
+
+### `toyos-cc` is not reproducible: the same source gives a different object
+
+Measured 2026-08-05. One binary, one source file, three runs:
+`d_event.c` from doomgeneric produced three objects that differ from each other
+at byte 345. The sizes are identical and the code is identical; what moves is
+where each BSS symbol lands — `eventhead`, `events` and `eventtail` swap
+between offsets 0, 4 and 0x500 from run to run. A `HashMap` iteration order
+somewhere in `codegen` is the obvious suspect and was not chased.
+
+Across doomgeneric's 82 sources, comparing one binary against *itself* on two
+runs, 14 objects differ by disassembly. So a byte-for-byte object diff is not
+available as evidence that a compiler change was inert, and anyone who tries
+one will find 40-odd differences and no change behind them. What does work is
+diffing preprocessed output, which is stable — that comparison was byte
+identical on all 82 across the `__attribute__` change.
+
+Consequences beyond that: no build cache anywhere can trust an object hash, and
+a miscompilation that depends on symbol placement would not reproduce.
+
+### `toyos-cc` does not implement packed bitfield layout, and says so
+
+`__attribute__((packed))` on a struct with a bitfield member is refused —
+`resolve_struct` in `toyos-cc/src/codegen/resolve.rs`, covered by
+`toyos-cc/tests/attributes.rs`. Packed and unpacked bitfields are different
+algorithms rather than one algorithm with a flag: gcc allocates a packed
+bitfield's bits contiguously from the current bit position and lets a field
+straddle what would have been a storage-unit boundary, where
+`walk_struct_layout` picks a storage unit of the member's own type and starts a
+new one whenever the next field would not fit. `codegen/bitfield.rs` loads and
+stores through `clif_type(storage_ty)` at the field's byte offset, which a
+straddling field has no single unit for.
+
+`specs/wlan-plan.md` §10 counts 635 `__packed` uses in the AX210 subset. However
+many of those carry bitfields is how much of this W6 needs.
+
+### `toyos-cc` does not define `__GNUC__`, so doomgeneric compiles unpacked
+
+`PACKEDATTR` in `userland/doom/include/doomtype.h` and in doomgeneric's own
+`doomtype.h` is `__attribute__((packed))` under `#ifdef __GNUC__` and empty
+otherwise, and toyos-cc seeds neither `__GNUC__` nor `__GNUC_MINOR__`. Measured:
+preprocessing `w_wad.c` through toyos-cc yields zero occurrences of either
+`PACKEDATTR` or `__attribute__`, and `} PACKEDATTR wadinfo_t;` arrives at the
+parser as `} wadinfo_t;`.
+
+This is inert today and was checked rather than assumed. Compiling doomgeneric's
+fourteen `PACKEDATTR` structs with clang twice, once with the macro empty and
+once with it expanded, moves **no field offset at all** and changes one size:
+`pcx_t` is 130 unpacked and 129 packed. `WritePCXfile` never takes
+`sizeof(pcx_t)` — it writes the header field by field and derives the length
+from its own pack pointer, and `offsetof(pcx_t, data)` is 128 either way. The
+remaining thirteen differ only in alignment, and every one of them is read
+through a pointer into a WAD buffer.
+
+Defining `__GNUC__` would be a much larger change than it looks: it turns on
+every `#ifdef __GNUC__` block in doomgeneric and in any header that has one.
 
 ---
 
