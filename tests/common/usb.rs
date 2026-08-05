@@ -544,13 +544,14 @@ pub fn usb_disk_index_stable(
     }
 
     // **And the log kept reaching the stick.** Read off the boot image's own
-    // `/log` partition, so this is the device's view and not the guest's.
-    let on_device = super::volumes::log_on_device(&image_path, start, len, "kernel.log")?;
+    // `/log` partition, so this is the device's view and not the guest's. The
+    // sink names one file per boot, so the newest on the volume is this one's.
+    let (name, on_device) = super::volumes::newest_log(&image_path, start, len)?;
     let on_device = String::from_utf8_lossy(&on_device).into_owned();
     if !on_device.contains(LATE_READY) {
         return Err(format!(
-            "/log/kernel.log stops at {} bytes and never carries {LATE_READY:?} — the appends \
-             after the plug went somewhere else\n{log}",
+            "/log/{name} stops at {} bytes and never carries {LATE_READY:?} — the appends after \
+             the plug went somewhere else\n{log}",
             on_device.len()
         ));
     }
@@ -559,7 +560,7 @@ pub fn usb_disk_index_stable(
 
     eprintln!(
         "  [usb] a {LATE_BYTES} B disk plugged into the empty first controller: it comes back \
-         byte-identical, and {} bytes of kernel.log on the boot stick carry the lines printed \
+         byte-identical, and {} bytes of /log/{name} on the boot stick carry the lines printed \
          after it",
         on_device.len()
     );
