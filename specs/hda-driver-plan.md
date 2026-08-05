@@ -269,7 +269,12 @@ its appendix (line 572):
   in which the codec hangs off SoundWire and the legacy HDA link enumerates
   nothing. If that is this machine, `STATESTS` reads zero, the plan is dead on
   it, and no amount of driver work changes that. **This is the cheapest thing to
-  learn and it is H0's first line.**
+  learn and it is H0's first line.** It is also the *only* thing that decides
+  whether the T14 gets audio cheaply: the machine's four internal USB devices
+  are the fingerprint reader, the camera, the smartcard reader and the boot
+  stick (`metal-hardware-inventory.md:223`, `:484`) — **no USB audio device** —
+  and the headphone jack is a pin on whatever answers rather than a second path.
+  §6.3's (b) block prices both outcomes.
 - **MSI.** `specs/userspace-drivers-spec.md` §4.5 makes a function offering
   neither MSI-X nor MSI ineligible for userspace. QEMU's `intel-hda` offers
   `msi=<OnOffAuto>` and no MSI-X option, measured today with `-device
@@ -610,6 +615,184 @@ and adopt-by-witness — which is gated on the owner's review of its §4. H9 wai
 on that, and until then master volume resets to its default on every boot on the
 T14. In the harness it persists, because the harness has a disk.
 
+### 6.3 H0 is built. How to run it, and how to read what comes back
+
+**Read the (b) block first, and read it before estimating anything in §6.** The
+owner has decided the T14 gets real sound out of its internal speakers. That
+makes question (b) not one of four but *the* question: it decides whether this
+plan is the answer to that decision or whether the answer is a project of a
+different order, and no schedule for H1–H10 means anything until one real boot
+has answered it.
+
+**Built**, behind the kernel feature `hda-probe`
+(`kernel/src/drivers/hda_probe.rs`, ~640 lines). It runs last in the peripheral
+phase, over **every** class-0403 function the PCI walk returned rather than the
+first, does no DMA at all — the verbs go through the immediate-command
+registers — and bounds every wait. Deleted at H9 with the feature.
+
+The harness arm is `cargo test -- hda_probe` on `Profile::MetalHda`, a machine
+built so one boot runs both arms of each question below (§5.1 lists what that
+does and does not certify). It also boots the same machine with a plain kernel
+and requires no `hda:` line at all, which is the only assertion that binds
+"nothing in the ordinary boot path takes that controller out of reset".
+
+#### Running it on the T14
+
+```
+cargo run -- --diag-boot --build-only          # target/bootable-diag.img
+```
+
+**The one thing that is not wired**: `src/build.rs` hands the kernel no
+features on the `--diag-boot` path, and that file was another agent's ground
+for the whole of H0's implementation. Until one line there adds `hda-probe` to
+`Boot::Diag`, the flashed image carries the feature only if the kernel is built
+with it by hand. This is the sole item between H0 and the T14 and it is
+recorded in `specs/known-issues.md`.
+
+Flash, boot, and — **before pressing any other key** — press Mute, then Volume
+Down, then Volume Up. Then read `/log/kernel.log` off the stick on the Mac.
+Everything the probe says is a line beginning `hda:`, and the four verdict
+lines are `hda: (a)`, `(b)`, `(c)`, `(d)`.
+
+#### (a) Handoff — what each answer means
+
+| Line | What it means for the plan |
+|---|---|
+| `(a) scope members=1 … a singleton` | `iommu-spec.md` §7.3 permits handoff on this count. Unblocked. |
+| `(a) scope members=N … not a singleton` | **The expected answer on this machine**, since `00:1f.3` is one of five functions. §7.3 refuses the device *as the rule is written*, and it refuses `00:1f.6` — gate N's metal target — with it. This does **not** end the track; it moves the decision into `iommu-spec.md`, because the rule was written for peer-to-peer behind a switch and a root-complex-integrated function is not that. `hda: scope upstream-bridge none` on the same boot is the evidence: there is no switch, so there is no port whose ACS could be checked, and what two functions of one root-complex device can do to each other is not reported by any register on the bus. **Owner's call**, and it is `iommu-spec.md` §7.3's to restate — not this file's. Until it is restated, both audio and networking on the T14 are blocked behind it, and that is the single most consequential thing H0 can return. |
+| `(a) rmrr none` | Nothing to resolve. |
+| `(a) rmrr <range>` | §7.4 refuses the device for userspace handoff outright, and unlike the scope rule this one has a hard reason: identity-mapping firmware's range into an untrusted driver's domain hands that driver memory it was never given. **This one really does end §1's answer for this device** — either HDA stays kernel-resident (which §8 item 2 forbids) or the T14 has no audio. Escalate rather than work around. |
+| `(a) msi vectors=N msix=none` | The expected and the *preferred* answer (§4.2 item 2): the capability is in config space, so there is no MSI-X table inside a BAR to carve out. |
+| `(a) msi=none msix=none` | `userspace-drivers-spec.md` §4.5 makes the function ineligible. No known real part is built this way; if the T14 says it, suspect the probe before the silicon. |
+| `(a) bar0 … movable=y 2m-page-neighbours=0` | `userspace-drivers-spec.md` stage 3's 2 MiB re-assignment has somewhere to go. |
+| `(a) bar0 … 2m-page-neighbours=N` (N>0) | The BAR shares its 2 MiB page with the named functions' registers, so it cannot be handed over as it sits. Stage 3's relocation is then load-bearing rather than tidy, and `movable=y` is what says it is possible at all. |
+| `(a) unit=N … ecap.sc=y` | §4.4 item 4's general answer holds: snoop-force in every mapping, no config-space write path, and the vendor no-snoop control is moot. |
+| `(a) … ecap.sc=n` | Risk 6 realised. The named-offset config write comes back as a specific proposal, and §4.4 item 4 is the record of why it was refused first. |
+
+#### (b) Is a codec on the link — the question the whole track turns on
+
+**There is no second way to reach those speakers.** The T14's USB bus carries
+exactly four internal devices — the fingerprint reader `06cb:00bd`, the camera
+`13d3:5406`, the smartcard reader `058f:9540` and the owner's boot stick
+(`specs/metal-hardware-inventory.md:223`, `:484`) — and **none of them is an
+audio device**. `00:1f.3` is the only audio hardware on the machine. The
+headphone jack is not a second path either: on this design the jack is a *pin*
+on whatever answers, so it is behind exactly the same silicon as the speakers.
+So "no USB DAC, no jack workaround, no third option" is not rhetoric; it is
+what the inventory says.
+
+That is why the line below decides the track rather than informing it.
+
+**`statests` non-zero — a codec answers.**
+
+This plan is the answer, and it is the cheap one. Everything needed is in this
+file: §6's H1 through H10, whose sizes are **estimates and are labelled as such
+throughout** — roughly 4,550 lines of Rust across the stages, plus §4.2's
+prerequisite chain, which is shared with `specs/wlan-plan.md` W5 and is not
+audio's to pay alone. No vendor firmware, no blob, no second bus. Self-hosting
+(CLAUDE.md's north star) is untouched, because every line of it is ours.
+
+**`statests=0x0000` — nothing on the legacy link. Do not soften this.**
+
+The audio track stops being this plan and becomes a project of a different
+order, and the owner has to be told that before anyone offers a date.
+
+What it means concretely. The analogue path is behind the vendor DSP (Intel
+Smart Sound), or on SoundWire, or both — §8 item 4 puts all of it out of scope
+today and §2.5's last row named the risk before H0 was written. Reaching the
+speakers then requires, at minimum: loading **signed vendor firmware** onto the
+DSP; an IPC protocol with that firmware; a **topology** description telling it
+what the machine's audio graph is; and, if the codec is on SoundWire, a link
+controller and an enumeration protocol nothing in this repository has any part
+of. `specs/wlan-plan.md` is the shape that effort takes here — a vendor's
+declarative headers as a tracked C fork, the imperative half transliterated to
+Rust — and it is the right comparison because it is the only one this project
+has actually costed. **No line count for SOF appears in this file and none
+should be invented**: nobody here has counted it, and a plausible number in a
+spec outlives every review.
+
+Three consequences worth stating separately, because they are not the same
+statement:
+
+1. **Nothing in §6 survives.** H1's graph traversal, H4's stream engine and H0's
+   own dump are all about a codec that is not there. What survives is soundd's
+   mixer, gate A, and §4.2's prerequisite chain — none of which is HDA work.
+2. **It collides with self-hosting in a way this plan does not.** A signed
+   firmware blob is a binary ToyOS cannot build from source and never will, so
+   the machine's audio would depend on an artefact outside the tree. That is a
+   policy question for the owner and not an engineering detail.
+3. **The doom milestone loses its last piece.** Audio on the T14 stops being a
+   finishing task and becomes a track of its own, sequenced against WLAN and
+   the I219 rather than after them.
+
+**`statests` non-zero but (c) reports no speaker pin — the case that looks like
+success.** A machine can carry an HDMI/DisplayPort audio codec on the legacy
+link while its analogue path lives on SoundWire, and that reads as a healthy
+`STATESTS`, a valid widget graph and a working output path that no human can
+hear. `(c) pins reporting a speaker default device: 0` is the tell, and (d)'s
+codec list is what identifies which codec answered. Treat this as the
+`statests=0x0000` outcome for planning purposes: the speakers are not on this
+link.
+
+**Two readings that are not verdicts about codecs at all**, and must not be
+reported as one:
+
+| Line | What it means |
+|---|---|
+| `hda: (b) GCAP reads all ones` | The register window answers nothing: the function is powered down past what the probe's D0 transition reached, or hidden by firmware. Go back to firmware setup before concluding anything about codecs. |
+| `hda: codecN the controller did not answer an immediate command` | `STATESTS` named a codec and the controller has no working immediate-command interface. The dump needs CORB/RIRB on this part; the codec is there and nothing above the verb layer is invalidated. |
+
+**This generalises past this laptop.** `STATESTS` reading zero on a controller
+that resets cleanly is the signature of the whole 2019-onward Intel line, where
+the analogue path moved behind the DSP and the legacy link was left decoding
+nothing. Any future ToyOS machine of that vintage answers the same way, so the
+codec-presence read is a *platform* question and belongs in whatever eventually
+replaces this probe — not filed as a T14 quirk. It is also why the industry's
+direction of travel is SOF and SoundWire, and why a `statests=0x0000` on this
+machine should be read as "we are early to a problem everyone else has already
+had" rather than as bad luck.
+
+#### (c) The widget dump, and its second life
+
+Everything between `hda: codecN vendor=` and the next controller's banner is the
+fixture. Each line is `key=value` after an `hda:` prefix, carries the codec's
+own raw word beside every decoded name, and describes exactly one node — so a
+host-side reader is a line split and nothing more. §5.2 makes this the fixture
+`toyos-hda`'s `find_output_path` is tested against, which is the only way the
+least-covered code in the plan gets verified against a real machine.
+
+`hda: (c) pins reporting a speaker default device: 0` is the interesting
+failure: the codec answered, the graph is there, and no pin claims a speaker.
+§2.3 then has nothing to choose and the correct behaviour is a refusal naming
+every codec found — never a fallback to line-out, which is how a laptop ends up
+playing through a header nobody soldered.
+
+#### (d) How many codecs
+
+`hda: (d) codecs=1` is one machine's answer and licenses nothing: §2.3's rule is
+*enumerate all, choose by capability, refuse by name*, and it does not relax
+because this laptop happens to have one. `codecs=2` or more is the Iris Xe's
+display audio sitting beside the analogue codec, and the probe prints the
+first-match warning with it.
+
+#### The volume keys
+
+No new mechanism: the i8042 driver already names every byte run that decoded to
+nothing, and under `hda-probe` its list holds 24 bytes instead of 8 so three
+keys' make and break fit in one boot. Read the `i8042:` lines:
+
+- `no event from [0xe0, 0x20, …]` — the keys reach the i8042 and decode to
+  nothing, and those bytes are exactly what H8's three `toyos-ps2` entries are
+  written against.
+- `keys` in the counter line went up by three and nothing was listed — the EC's
+  codes already map to something, which means today they *type* rather than
+  change the volume, and H8 is a change to what the surface owner does with
+  three usages it already receives.
+- The `bytes` counter did not move at all — **the volume keys are not on the
+  i8042**, they are an ACPI or WMI event, and H8's "three table entries and no
+  ABI at all" premise is wrong. That is a finding for §4.4's rejected list, not
+  a small fix.
+
 ---
 
 ## 7. Open risks
@@ -627,9 +810,14 @@ Each with what settles it, and how early.
    The rule would then need restating in terms of what a root-complex-integrated
    function can actually reach, which is a decision about the IOMMU spec and not
    about this one. **Settled by H0 on one boot**, and it is the reason H0 exists.
-2. **The codec may not be on the HDA link.** §3. `STATESTS` reading zero ends
-   this plan on this machine and no driver work changes it. **Settled by H0's
-   second line.**
+2. **The codec may not be on the HDA link, and this is now the whole track's
+   risk rather than one of ten.** §3, and §6.3's (b) block for what each answer
+   costs. The owner has decided the T14 gets real internal-speaker audio, and
+   the machine has no USB audio device and no jack that is not a pin on the
+   same silicon — so `STATESTS` reading zero does not merely end this plan, it
+   converts the audio track into an SOF/SoundWire project with vendor firmware
+   in it. **Settled by H0's second line, and nothing in §6 should be estimated
+   before it is read.**
 3. **The userspace-driver boundary may cost more than audio can pay.**
    `userspace-drivers-spec.md` §9 already predicts stage 7 is the one most
    likely to be reverted, and gate A's thorough tier at N=30 does not detect a
