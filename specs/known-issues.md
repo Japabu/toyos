@@ -580,6 +580,20 @@ constant — `Poller::MAX_HANDLES` was the first and only.
    one protocol. Past `MAX_FRAME_LEN` the send is now refused rather than
    truncated, which is a different silence, not a fix — `set_clipboard` should
    route through shm like its free-function twin.
+
+   **And the shm route it would move to cannot work in that direction at
+   all.** `clipboard_set` allocates the region and sends the token, but never
+   grants it: `shared_memory::map` requires membership in `allowed`
+   (`kernel/src/shared_memory.rs:227`) and only the owner may add to it
+   (`grant`), so the compositor's map of a client's clipboard region is
+   `PermissionDenied` by construction. The client cannot fix it either — a
+   grant needs the compositor's pid and no syscall tells a client who its
+   peer is. So every `window::clipboard_set` above 4096 bytes was a
+   *compositor kill* until the map became fallible, and is now a dropped
+   client. Both halves of the protocol want the same decision: either the
+   receiver allocates and grants (which is what the paste direction does, and
+   what its own missing grant has just been fixed to do), or a socket learns
+   its peer's pid.
 3. **`device::read_info<T: Copy>`** (`toyos/src/device.rs:10`) still builds a
    `T` with `mem::zeroed` and fills it from a read. Lower stakes than
    `recv_payload` — the bytes come from the kernel, not a peer — but it is the
@@ -973,6 +987,52 @@ dispatch HID reports, note that a port or an endpoint owes work. The debounce an
 the port reset were already moved off this path for exactly this reason (CLAUDE.md,
 USB hotplug); the control transfers inside `configure` and `recover_endpoints`
 were not. Until then, `retire_task`'s bound is measuring the USB bus.
+
+### OPEN — a shell under a terminal stops prompting after its child exits, and a window client that is closed never exits
+
+Owner-reported from a 950 s session on the T14 (task #141). Two symptoms, and
+what follows is what reading the code settles and what it does not — **no
+reproduction yet, and the kernel log itself has not been read by anyone but the
+owner.**
+
+- `exit: ls pid=29 code=0 cpu=18ms`, 45 syscalls, no panic, and the shell that
+  spawned it (pid 28) made 95 syscalls in its whole life. Repeated: ls pids 13,
+  14, 15, 21, 22, 29, all `code=0`.
+- `snake` was spawned at 883.662 s and there is **no `exit:` line for it
+  anywhere in the session**. Closing its window did not end it.
+
+**Refuted by reading, and it was the first hypothesis because it is a same-day
+change** (#129, `85a8433`): a child that takes a surface grab and dies without
+releasing it does *not* leave the terminal mute. `surface::Host::poll` clears
+the grab on `RxStep::Eof` (`toyos/src/surface.rs:218-224`, `close` at `:322`),
+and the terminal polls every client fd every pass
+(`userland/terminal/src/main.rs:73-75`, `:107`). It also cannot explain the `ls`
+symptom at all: **the only program in the tree that grabs is `locale detect`**
+(`userland/toybox/src/locale.rs:161`), and neither `ls` nor `snake` does.
+
+**Narrowed, not settled, for the shell.** A simple command goes through
+`Command::status()` (`userland/shell/src/main.rs:674`), which is spawn plus
+`waitpid`, and `sys_waitpid` registers on the park lot *before* it reads the
+table (`kernel/src/arch/syscall.rs:1067`), so the classic check-then-block
+window is closed. The exit side wakes the parent's main tid after the table
+lock drops (`kernel/src/process.rs:1116-1128`). `std_process` spawns and waits
+in the shared boot and is green, so nothing about `waitpid` is broken in
+general — which is why the reproduction has to be a shell **under a terminal**,
+with `tty_piped` stdio and an inherited fd map, rather than a bare spawn.
+
+**Unexplained for snake, and it is a separate mechanism.** snake is a `winit`
+app: its close path is the fork's ToyOS backend
+(`winit-toyos/src/event_loop.rs:525`, `:637`, `:707`), which does map
+`toyos_window::Event::Close` to `CloseRequested`. But the compositor died at
+952.8 s in the same session, and *every* window client should have left on the
+EOF that produced — snake did not, so it was parked somewhere that does not
+read its window fd. That is fork territory, outside every check this tree runs
+on itself.
+
+**What is needed before this can be fixed:** the session's `kernel.log`, which
+would say what pid 28's 95 syscalls were (the per-number breakdown is in the
+`syscalls:` line the kernel prints at exit) and whether snake ever entered the
+compositor's window list.
 
 ### A syscall runs with interrupts masked, and only incidentally with preemption disabled
 
@@ -2047,6 +2107,29 @@ CLAUDE.md's diagnostics roadmap.
 ---
 
 ## 6. Build and toolchain
+
+### `--claim-sysroot` livelocks against a second claimant, and the loser cannot build at all
+
+Measured on 2026-08-05 with eight worktrees on the machine. A worktree holding
+an edit to `toyos/src` must claim the shared sysroot to build; the claim writes
+the witness *inside* the toolchain phase and then the build runs for another
+four to six minutes. Anything that claims during that tail leaves the first
+claimant refused again — and its next attempt pays a full `rebuild_std` to take
+it back.
+
+Observed directly: `--claim-sysroot` returned 0 at 00:39:01 and the very next
+command, one second later, refused with "disagree about toyos-abi/src,
+toyos/src". Four consecutive claim-then-test attempts lost the witness the same
+way. Two earlier attempts in the same session won it, so the outcome is who
+finishes last and nothing else.
+
+The cost is not the rebuild, it is that **neither party can run a test between
+losing and re-claiming**, so a gate that takes one minute cannot be reached
+inside a six-minute cycle that another agent restarts. This is task #134's "no
+arbitration" with a measurement on it. The fix wants the same shape as the rest
+of the lock directory: the claim and the build that follows it are one hold, or
+the witness is checked once and carried through the build rather than re-read
+at each phase.
 
 ### `Sched::Parallel` tests that go red under other worktrees' suites
 

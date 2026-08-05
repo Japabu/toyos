@@ -43,7 +43,7 @@ fn main() {
 
     let mut tokens = Vec::new();
     for _ in 0..ROUNDS {
-        let token = syscall::alloc_shared(REGION);
+        let token = syscall::alloc_shared(REGION).expect("a region of our own");
         let ptr = unsafe { syscall::try_map_shared(token) }.expect("map own region");
         unsafe { ptr.write_volatile(0xA5) };
         tokens.push(token);
@@ -103,7 +103,7 @@ fn main() {
 }
 
 fn donor(target: u32) {
-    let token = syscall::alloc_shared(REGION);
+    let token = syscall::alloc_shared(REGION).expect("a region of our own");
     let ptr = unsafe { syscall::try_map_shared(token) }.expect("donor: map own region");
     unsafe { core::ptr::copy_nonoverlapping(PAYLOAD.as_ptr(), ptr, PAYLOAD.len()) };
     syscall::grant_shared(token, Pid(target)).expect("donor: grant");
