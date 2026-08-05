@@ -439,6 +439,56 @@ impl Boot {
     }
 }
 
+/// The cargo feature list this build's kernel is compiled with, as one comma-
+/// separated argument.
+///
+/// **Every name the caller asked for is checked against `kernel/Cargo.toml`,
+/// and an unknown one stops the build by name.** Read from the manifest rather
+/// than listed here, so the check cannot drift from what cargo would accept —
+/// and, more to the point, so that deleting a feature takes its own command
+/// lines down with it. That is what a temporary feature needs: when
+/// `hda-probe` goes at `specs/hda-driver-plan.md` H9, an invocation still
+/// asking for it fails saying so instead of quietly producing a kernel with no
+/// probe in it, which is the same image and a different machine.
+///
+/// Cargo would refuse an unknown feature too — after the build lock, the
+/// toolchain check and the userland build, and with `kernel` in the message
+/// rather than the flag the user typed. This runs before any of them.
+fn kernel_features(root: &Path, debug: bool, requested: &[String]) -> String {
+    let mut features: Vec<&str> = Vec::new();
+    if debug {
+        features.push("debug-wait");
+    }
+    if !requested.is_empty() {
+        let declared = declared_kernel_features(root);
+        for name in requested {
+            assert!(
+                declared.contains(name),
+                "--kernel-feature {name}: the kernel declares no such feature.\n\
+                 Features it declares: {}.",
+                declared.join(", ")
+            );
+            features.push(name);
+        }
+    }
+    features.join(",")
+}
+
+#[derive(Deserialize)]
+struct KernelManifest {
+    #[serde(default)]
+    features: BTreeMap<String, Vec<String>>,
+}
+
+fn declared_kernel_features(root: &Path) -> Vec<String> {
+    let path = root.join("kernel/Cargo.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+    let manifest: KernelManifest = toml::from_str(&text)
+        .unwrap_or_else(|e| panic!("Failed to parse {}: {e}", path.display()));
+    manifest.features.into_keys().collect()
+}
+
 /// Full build: kernel, bootloader, all programs, boot image. Returns the image.
 pub fn build(
     root: &Path,
@@ -447,7 +497,13 @@ pub fn build(
     boot: Boot,
     rebuild_toolchain: bool,
     claim_sysroot: bool,
+    kernel_feature: &[String],
 ) -> PathBuf {
+    // Before the locks: a misspelled feature is the user's own command line and
+    // has to come back now, not after this build has waited out every other
+    // worktree's hold on the sysroot.
+    let kernel_features = kernel_features(root, debug, kernel_feature);
+
     // Outermost, before any build lock, and that order is the whole deadlock
     // argument: every acquirer of both takes the sysroot lock first. It waits
     // for every suite run in flight — replacing the sysroot under one turns its
@@ -467,7 +523,6 @@ pub fn build(
     invalidate_stale(root, &mut lock, &config_targets(root, &config));
 
     let init_programs = config.init.join(";");
-    let kernel_features = if debug { "debug-wait" } else { "" };
 
     // Same lock-and-stage as `build_test_image`: `cargo run --build-only` and
     // `cargo test` share these paths, so this races the harness too.
@@ -476,14 +531,15 @@ pub fn build(
         let kernel_handle = {
             let root = root.to_path_buf();
             let path_env = path_env.clone();
+            let features = kernel_features.clone();
             std::thread::spawn(move || {
                 let mut extra = Vec::new();
                 if release {
                     extra.push("--release");
                 }
-                if debug {
+                if !features.is_empty() {
                     extra.push("--features");
-                    extra.push("debug-wait");
+                    extra.push(&features);
                 }
                 cargo_build(
                     &root.join("kernel"),
@@ -515,7 +571,7 @@ pub fn build(
                 root,
                 &root.join(format!("kernel/target/x86_64-unknown-none/{profile}/kernel")),
                 "kernel",
-                key_hash(&[profile, kernel_features]),
+                key_hash(&[profile, &kernel_features]),
             ),
             stage_artifact(
                 root,
