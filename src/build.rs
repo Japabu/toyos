@@ -448,6 +448,13 @@ pub fn build(
     rebuild_toolchain: bool,
     claim_sysroot: bool,
 ) -> PathBuf {
+    // Outermost, before any build lock, and that order is the whole deadlock
+    // argument: every acquirer of both takes the sysroot lock first. It waits
+    // for every suite run in flight — replacing the sysroot under one turns its
+    // every later build into a refusal, which is what a dead gate and 156
+    // identical refusals looked like on 2026-08-04.
+    let _claim = claim_sysroot.then(|| buildlock::claim_sysroot(root, "--claim-sysroot"));
+
     // Held until the last staged artifact has been read back, so no other
     // agent's clean or toolchain rebuild can land inside this build.
     let mut lock = buildlock::shared(root, "build");

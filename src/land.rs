@@ -207,6 +207,17 @@ fn run_gate(root: &Path, gate: &[String]) -> Result<std::time::Duration, String>
         .status()
         .map_err(|e| format!("[land] cannot run the gate {:?}: {e}", gate[0]))?;
     let took = started.elapsed();
+    // 2 is the suite's "this run established nothing" — the host was suspended
+    // in the middle of it (`tests/toyos.rs`, and cargo propagates a test
+    // binary's own code, measured). It is not a red, and telling an agent to
+    // "fix it here" would send it hunting a defect that is not in the tree.
+    if status.code() == Some(2) {
+        return Err(format!(
+            "[land] the gate did not finish a measurement after {took:.1?} — the host was \
+             suspended while it ran, so its verdicts are of nothing. main was not touched \
+             and nothing is wrong with this branch; re-run `cargo run -- --land`."
+        ));
+    }
     if !status.success() {
         return Err(format!(
             "[land] the gate failed ({status}) after {took:.1?}. main was not touched; the merge \
