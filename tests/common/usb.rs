@@ -583,23 +583,21 @@ pub fn usb_pool_exhausted(
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     let disks = Profile::UsbDiskCrowd.usb_disks();
-    if disks.len() != 3 {
+    if disks.len() != 2 {
         return Err(format!(
-            "this gate needs three data disks, the profile declares {}",
+            "this gate needs two data disks beside the boot stick, the profile declares {}",
             disks.len()
         ));
     }
     let bytes = disks[0].bytes;
 
-    // Two staged images: the one that binds and the one that must not be
-    // touched. The third is blank — a disk past the ceiling with no stamp,
-    // which is what a machine would ordinarily have.
+    // Both stamped, so what decides which one is written is the pool and not
+    // the harness: the disk the driver refuses is whichever the controller
+    // enumerated second, and it is the one the gate never designates.
     let bound = test_dir().join("usb-crowd-bound.img");
     let refused = test_dir().join("usb-crowd-refused.img");
-    let spare = test_dir().join("usb-crowd-spare.img");
     let nonce = stage(&bound, bytes);
     stage(&refused, bytes);
-    drop(sparse(&spare, bytes));
     let refused_before = fingerprint(&refused, bytes);
 
     let log = boot_and_shutdown(
@@ -609,33 +607,33 @@ pub fn usb_pool_exhausted(
         BootOptions {
             profile: Profile::UsbDiskCrowd,
             kernel_features: GATE,
-            usb_images: vec![bound.clone(), refused.clone(), spare.clone()],
+            usb_images: vec![bound.clone(), refused.clone()],
             ..Default::default()
         },
     )?;
 
-    // Two blocks, two disks, and the two past them refused by name with the
-    // count in the line. The pool runs out inside `bind`, so this refusal is
-    // the driver's own and not a device's.
+    // Two blocks, two disks, and the third refused by name with the pool's size
+    // in the line. The pool runs out inside `bind`, so this refusal is the
+    // driver's own and not a device's.
     if !log.contains("usb-storage: 2 device(s)") {
         return Err(format!("the driver did not bind exactly the pool's two blocks\n{log}"));
     }
     let over = log.matches("this driver serves 2").count();
-    if over != 2 {
+    if over != 1 {
         return Err(format!(
-            "{over} disk(s) were refused for want of a pool block, want the two past the \
+            "{over} disk(s) were refused for want of a pool block, want the one past the \
              ceiling\n{log}"
         ));
     }
     gate_ran(&log, 2)?;
 
     // The disk that bound was written, so the ceiling did not cost the machine
-    // the disks it does have room for.
+    // the disk it does have room for.
     verify(&bound, bytes, nonce)?;
 
     // **And the disk it had no room for was not touched.** A driver that served
-    // the third disk out of the second's block would write these bytes under
-    // the second disk's number, and every line in the log would still read
+    // the refused disk out of somebody else's block would write these bytes
+    // under that disk's number, and every line in the log would still read
     // correctly.
     if fingerprint(&refused, bytes) != refused_before {
         return Err("a disk the pool had no block for was written to".to_string());
@@ -644,13 +642,13 @@ pub fn usb_pool_exhausted(
         return Err(format!("the boot did not finish past a crowded bus\n{log}"));
     }
     serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
-    for path in [&bound, &refused, &spare] {
+    for path in [&bound, &refused] {
         let _ = std::fs::remove_file(path);
     }
 
     eprintln!(
-        "  [usb] four disks on a bus whose pool holds two: two bound and written, {over} refused \
-         by name, and the stamped disk past the ceiling byte-identical host-side"
+        "  [usb] three disks on a bus whose pool holds two: two bound and the staged one written, \
+         {over} refused by name, and the stamped disk past the ceiling byte-identical host-side"
     );
     Ok(())
 }

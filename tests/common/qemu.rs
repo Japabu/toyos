@@ -163,13 +163,21 @@ pub enum Profile {
     UsbDiskRefusedFirst,
     /// More USB disks on one controller than its DMA pool has blocks for.
     ///
-    /// `MSC_BLOCKS` is 2 and the boot stick takes one of them, so three data
-    /// disks put two past the ceiling. Every other profile declares one disk,
-    /// which is why nothing could ask what a caller sees when the bound is hit
-    /// — and the bound is policy, so the answer is the whole question. Both
-    /// staged disks are stamped: the one that binds is written and the one the
-    /// pool had no room for has to come back byte-identical, which is the claim
-    /// a log line cannot make.
+    /// `MSC_BLOCKS` is 2 and the boot stick takes one of them, so the second
+    /// data disk here is the first one past the ceiling. Every other profile
+    /// declares one disk, which is why nothing could ask what a caller sees when
+    /// the bound is hit — and the bound is policy, so that answer is the whole
+    /// question. Both disks are stamped: the one that binds is written, and the
+    /// one the pool had no room for has to come back byte-identical, which is
+    /// the claim a log line cannot make.
+    ///
+    /// Two and not three, though the pool would refuse either way.
+    /// `nec-usb-xhci` offers four SuperSpeed ports and QEMU puts the fifth
+    /// device behind an auto-created hub, which this driver walks past — so a
+    /// third data disk is not one the guest refuses, it is one the guest never
+    /// sees, and a count that included it would be measuring QEMU's port
+    /// allocation. Measured: `class=0x9 vendor=0409 product=55aa` on port 8 at
+    /// full speed, with `no HID boot interface found, skipping`.
     UsbDiskCrowd,
     /// metal-sim with a device that attaches at **full speed**.
     ///
@@ -650,7 +658,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disks: &[UsbDisk::DATA, UsbDisk::DATA, UsbDisk::DATA],
+                usb_disks: &[UsbDisk::DATA, UsbDisk::DATA],
                 iommu: Some(IOMMU_DEFAULT),
             },
             // The first controller carries nothing at all — not even the boot
