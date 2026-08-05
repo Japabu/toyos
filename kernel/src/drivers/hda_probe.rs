@@ -136,8 +136,16 @@ pub fn run(rsdp_addr: u64, devices: &[PciDevice]) {
             controller.vendor_id(),
             controller.device_id()
         );
-        handoff(rsdp_addr, devices, controller);
-        codecs(controller);
+        // Sized once and handed to both halves: sizing takes the function's
+        // memory decode down, and doing that twice around a controller that is
+        // about to be taken out of reset is two windows where it is dark for
+        // no reason.
+        let bar = size_bar0(controller);
+        handoff(rsdp_addr, devices, controller, bar.as_ref());
+        match &bar {
+            Some(bar) => codecs(controller, bar),
+            None => log!("hda: (b) bar0 is not a memory BAR — the controller cannot be reached"),
+        }
     }
 
     if controllers.len() > 1 {
@@ -157,11 +165,14 @@ pub fn run(rsdp_addr: u64, devices: &[PciDevice]) {
 /// Not one of these is audio's alone. The T14's HDA is function 3 of a
 /// five-function device whose function 6 is the I219-V, so an isolation scope
 /// that refuses this device refuses gate N's metal target with it.
-fn handoff(rsdp_addr: u64, devices: &[PciDevice], hda: &PciDevice) {
+fn handoff(rsdp_addr: u64, devices: &[PciDevice], hda: &PciDevice, bar: Option<&Bar>) {
     scope(devices, hda);
     reserved_regions(rsdp_addr, hda);
     interrupts(hda);
-    bar0(devices, hda);
+    match bar {
+        Some(bar) => bar0(devices, hda, bar),
+        None => log!("hda: (a) bar0 is not a memory BAR — this function decodes nothing to map"),
+    }
 }
 
 /// Who else is inside this device's isolation scope.
@@ -357,43 +368,50 @@ fn interrupts(hda: &PciDevice) {
 /// page with another function's registers is a BAR that cannot be handed over
 /// without handing that function's registers over too.
 ///
-/// Sizing writes all ones and puts the original back, with memory decode off
-/// across the pair: a BAR briefly holding `0xFFFFFFFF` is a BAR briefly
-/// claiming an address range that belongs to something else. Nothing in this
-/// kernel drives this function, so nothing can be mid-transaction while it is
-/// dark.
-fn bar0(devices: &[PciDevice], hda: &PciDevice) {
-    let Some(bar) = size_bar0(hda) else {
-        log!("hda: (a) bar0 is not a memory BAR — this function decodes nothing to map");
-        return;
-    };
-
+/// **The neighbours are found by base and never by sizing them.** Sizing a BAR
+/// means taking its function's memory decode down and leaving `0xFFFFFFFF` in
+/// the register across two config writes, and every other function on this
+/// machine includes the NVMe controller and the xHC this kernel is running
+/// from. Base alone is enough and is not an approximation: firmware does not
+/// overlap BARs, so a window whose base is outside our 2 MiB page cannot reach
+/// into it.
+fn bar0(devices: &[PciDevice], hda: &PciDevice, bar: &Bar) {
     let page = crate::mm::PAGE_2M;
     let mut neighbours = 0usize;
     for other in devices {
         if other.bus == hda.bus && other.dev == hda.dev && other.func == hda.func {
             continue;
         }
-        for index in 0..6u8 {
-            let Some(theirs) = size_bar(other, index) else { continue };
-            if theirs.base == 0 || theirs.size == 0 {
+        let mut index = 0u8;
+        while index < 6 {
+            let raw = other.read_config_u32(HEADER_BAR0 + index as u64 * 4);
+            // An I/O BAR decodes a different space entirely and never shares a
+            // page with anything.
+            if raw & 1 != 0 {
+                index += 1;
                 continue;
             }
-            // Their BAR's own extent against the 2 MiB page ours sits in.
-            if theirs.base / page == bar.base / page
-                || (theirs.base + theirs.size - 1) / page == bar.base / page
-            {
-                neighbours += 1;
-                log!(
-                    "hda: bar0 shares its 2 MiB page with {:02x}:{:02x}.{} bar{index} \
-                     {:#x}+{:#x}",
-                    other.bus,
-                    other.dev,
-                    other.func,
-                    theirs.base,
-                    theirs.size
-                );
+            let wide = (raw >> 1) & 0x3 == 2;
+            let base = if wide {
+                let high = other.read_config_u32(HEADER_BAR0 + (index as u64 + 1) * 4);
+                ((high as u64) << 32) | (raw as u64 & !0xF)
+            } else {
+                raw as u64 & !0xF
+            };
+            // The upper half of a 64-bit BAR is not a BAR, and reading it as
+            // one would name an address no function decodes.
+            index += if wide { 2 } else { 1 };
+            if base == 0 || base / page != bar.base / page {
+                continue;
             }
+            neighbours += 1;
+            log!(
+                "hda: bar0 shares its 2 MiB page with {:02x}:{:02x}.{} bar{} at {base:#x}",
+                other.bus,
+                other.dev,
+                other.func,
+                index - if wide { 2 } else { 1 },
+            );
         }
     }
 
@@ -418,35 +436,36 @@ struct Bar {
     movable: bool,
 }
 
-fn size_bar0(pci: &PciDevice) -> Option<Bar> {
-    size_bar(pci, 0)
-}
-
-/// One BAR, by the mechanism the PCI specification defines: all ones written
+/// BAR0, sized by the mechanism the PCI specification defines: all ones written
 /// back, the low bits the function leaves clear naming its span.
-fn size_bar(pci: &PciDevice, index: u8) -> Option<Bar> {
-    let offset = HEADER_BAR0 + index as u64 * 4;
-    let low = pci.read_config_u32(offset);
+///
+/// Memory decode is off across the write, because a BAR briefly holding
+/// `0xFFFFFFFF` is a BAR briefly claiming an address range that belongs to
+/// something else. **Only ever called on a class-0403 function**, which no
+/// driver in this kernel binds, so nothing can be mid-transaction while it is
+/// dark.
+fn size_bar0(pci: &PciDevice) -> Option<Bar> {
+    let low = pci.read_config_u32(HEADER_BAR0);
     if low & 1 != 0 {
         return None;
     }
     let wide = (low >> 1) & 0x3 == 2;
-    let high = if wide { pci.read_config_u32(offset + 4) } else { 0 };
+    let high = if wide { pci.read_config_u32(HEADER_BAR0 + 4) } else { 0 };
     let base = ((high as u64) << 32) | (low as u64 & !0xF);
 
     let command = pci.read_config_u16(HEADER_COMMAND);
     pci.write_config_u16(HEADER_COMMAND, command & !COMMAND_MEMORY_SPACE);
-    pci.write_config_u32(offset, u32::MAX);
-    let probed_low = pci.read_config_u32(offset);
+    pci.write_config_u32(HEADER_BAR0, u32::MAX);
+    let probed_low = pci.read_config_u32(HEADER_BAR0);
     let probed_high = if wide {
-        pci.write_config_u32(offset + 4, u32::MAX);
-        let probed = pci.read_config_u32(offset + 4);
-        pci.write_config_u32(offset + 4, high);
+        pci.write_config_u32(HEADER_BAR0 + 4, u32::MAX);
+        let probed = pci.read_config_u32(HEADER_BAR0 + 4);
+        pci.write_config_u32(HEADER_BAR0 + 4, high);
         probed
     } else {
         u32::MAX
     };
-    pci.write_config_u32(offset, low);
+    pci.write_config_u32(HEADER_BAR0, low);
     pci.write_config_u16(HEADER_COMMAND, command);
 
     let mask = (((probed_high as u64) << 32) | (probed_low as u64 & !0xF)) & !0xF;
@@ -468,11 +487,7 @@ fn size_bar(pci: &PciDevice, index: u8) -> Option<Bar> {
 /// it. Tiger Lake designs ship in which the codec hangs off SoundWire and the
 /// legacy HDA link enumerates nothing at all — that machine reads zero here,
 /// and no amount of driver work changes it.
-fn codecs(hda: &PciDevice) {
-    let Some(bar) = size_bar0(hda) else {
-        log!("hda: (b) bar0 is not a memory BAR — the controller cannot be reached");
-        return;
-    };
+fn codecs(hda: &PciDevice, bar: &Bar) {
     if bar.base == 0 {
         log!("hda: (b) bar0 is unassigned — firmware gave this function no register window");
         return;
@@ -624,7 +639,10 @@ fn reset(regs: Mmio) -> bool {
 /// codec answering all ones — the caller separates them, because a controller
 /// with no immediate-command implementation and a codec that has stopped look
 /// identical to anything that folds them together.
-fn verb(regs: Mmio, codec: u8, node: u8, verb: u32, payload: u32) -> Option<u32> {
+fn get(regs: Mmio, codec: u8, node: u8, verb: u32, payload: u32) -> Option<u32> {
+    // A 12-bit verb in bits 19:8 with an 8-bit payload under it, which is every
+    // verb this probe sends. The 4-bit form with a 16-bit payload exists and is
+    // for setting things, which a question does not do.
     let command = ((codec as u32) << 28) | ((node as u32) << 20) | (verb << 8) | payload;
 
     if !settles(|| regs.read_u16(IMMEDIATE_STATUS) & IMMEDIATE_BUSY == 0) {
@@ -644,11 +662,6 @@ fn verb(regs: Mmio, codec: u8, node: u8, verb: u32, payload: u32) -> Option<u32>
     let response = regs.read_u32(IMMEDIATE_RESPONSE);
     regs.write_u16(IMMEDIATE_STATUS, IMMEDIATE_RESULT_VALID);
     Some(response)
-}
-
-/// A 12-bit verb with an 8-bit payload, which is every verb this probe sends.
-fn get(regs: Mmio, codec: u8, node: u8, cmd: u32, payload: u32) -> Option<u32> {
-    verb(regs, codec, node, cmd, payload)
 }
 
 const VERB_GET_PARAMETER: u32 = 0xF00;
@@ -742,10 +755,20 @@ fn dump_codec(regs: Mmio, codec: u8) -> usize {
     };
 
     let mut speakers = 0usize;
-    for group in first..first.saturating_add(groups) {
+    for group in nodes(first, groups) {
         speakers += dump_function_group(regs, codec, group);
     }
     speakers
+}
+
+/// `count` node ids from `first`, counted in `u16` and narrowed per element.
+///
+/// A `u8` range cannot express one ending at node 255 — `first + count` is 256
+/// there — and `saturating_add` would quietly drop that last node rather than
+/// say so. [`subordinates`] has already refused anything past 256, so this
+/// narrowing cannot truncate.
+fn nodes(first: u8, count: u8) -> impl Iterator<Item = u8> {
+    (first as u16..first as u16 + count as u16).map(|node| node as u8)
 }
 
 fn dump_function_group(regs: Mmio, codec: u8, group: u8) -> usize {
@@ -769,10 +792,13 @@ fn dump_function_group(regs: Mmio, codec: u8, group: u8) -> usize {
         log!("hda: codec{codec} fg={group:#04x} declares no widget");
         return 0;
     };
-    log!("hda: codec{codec} fg={group:#04x} widgets={first:#04x}..{:#04x}", first + widgets - 1);
+    log!(
+        "hda: codec{codec} fg={group:#04x} widgets={first:#04x}..{:#04x}",
+        first as u16 + widgets as u16 - 1
+    );
 
     let mut speakers = 0usize;
-    for node in first..first.saturating_add(widgets) {
+    for node in nodes(first, widgets) {
         speakers += dump_widget(regs, codec, node);
     }
     speakers
@@ -820,7 +846,7 @@ fn dump_widget(regs: Mmio, codec: u8, node: u8) -> usize {
     let channels = (((caps >> 13) & 0x7) << 1 | (caps & 1)) + 1;
     log!(
         "hda: codec{codec} node={node:#04x} type={kind:#x} ({}) caps={caps:#010x} channels={channels} \
-         amp-in={} amp-out={} power={} digital={} conn-override={}",
+         amp-in={} amp-out={} power={} digital={} conn-list={}",
         widget_type_name(kind),
         yn(caps & (1 << 1) != 0),
         yn(caps & (1 << 2) != 0),
@@ -982,14 +1008,25 @@ fn pin_connectivity_name(connectivity: u32) -> &'static str {
 
 fn pin(regs: Mmio, codec: u8, node: u8) -> usize {
     let config = get(regs, codec, node, VERB_GET_CONFIG_DEFAULT, 0).unwrap_or(NO_RESPONSE);
-    let connectivity = (config >> 30) & 0x3;
-    let device = (config >> 20) & 0xF;
     log!(
         "hda: codec{codec} node={node:#04x} pin-caps={:#010x} pin-ctl={:#010x} eapd={:#010x}",
         param(regs, codec, node, PARAM_PIN_CAPS).unwrap_or(NO_RESPONSE),
         get(regs, codec, node, VERB_GET_PIN_CONTROL, 0).unwrap_or(NO_RESPONSE),
         get(regs, codec, node, VERB_GET_EAPD, 0).unwrap_or(NO_RESPONSE),
     );
+    // All ones decodes to a perfectly plausible pin — "jack+fixed", device
+    // "other" — which is a name for a read that did not happen. §2.3 chooses a
+    // pin off exactly these fields, so a fixture carrying one of these would
+    // put a speaker in a graph the codec never described.
+    if config == NO_RESPONSE {
+        log!(
+            "hda: codec{codec} node={node:#04x} cfgdef=0xffffffff — no answer, not decoded and \
+             not a candidate"
+        );
+        return 0;
+    }
+    let connectivity = (config >> 30) & 0x3;
+    let device = (config >> 20) & 0xF;
     log!(
         "hda: codec{codec} node={node:#04x} cfgdef={config:#010x} conn={} device={} location={:#04x} \
          type={:#x} colour={:#x} assoc={} sequence={}",
