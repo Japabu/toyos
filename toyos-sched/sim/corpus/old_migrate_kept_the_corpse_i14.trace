@@ -1,0 +1,8 @@
+# scenario: old_migrate_kept_the_corpse
+# expect: fail
+# note: the T14's panic, minimized — retire_task: task not released after 1s:
+# note: InTransit(CpuId(1)). soundd boost-wakes a client thread whose process
+# note: has just been torn down, on the CPU soundd itself is running, with a
+# note: sibling asleep: place() forwards the corpse instead of reaping it.
+1 2 2 0 1 1 1 1 2 0 0 1 1 1 1 1 0 0 2 1 2 1 2 1 0 1 0 0 2 2 1 2
+0 1 3 1 1 1 0 3 
