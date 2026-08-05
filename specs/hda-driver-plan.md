@@ -639,15 +639,22 @@ and requires no `hda:` line at all, which is the only assertion that binds
 #### Running it on the T14
 
 ```
-cargo run -- --diag-boot --build-only          # target/bootable-diag.img
+cargo run -- --diag-boot --kernel-feature hda-probe --build-only
 ```
 
-**The one thing that is not wired**: `src/build.rs` hands the kernel no
-features on the `--diag-boot` path, and that file was another agent's ground
-for the whole of H0's implementation. Until one line there adds `hda-probe` to
-`Boot::Diag`, the flashed image carries the feature only if the kernel is built
-with it by hand. This is the sole item between H0 and the T14 and it is
-recorded in `specs/known-issues.md`.
+→ `target/bootable-diag.img`. **`--kernel-feature` is orthogonal to the boot
+mode on purpose.** Attaching a feature list to `Boot::Diag` was the other way to
+reach this image, and it would have made the diagnostic kernel permanently a
+different build from the shipping one — which is the guarantee that mode exists
+to make — and left a line in `src/build.rs` to take out again at H9. Here the
+probe is a word on one command line and there is nothing to clean up. An
+undeclared feature name is refused by name against `kernel/Cargo.toml` before
+any lock, so when H9 deletes `hda-probe` this command stops working loudly
+rather than quietly producing an image with no probe in it, which would look
+identical and answer nothing.
+
+**Build it from a committed tree** (CLAUDE.md): `cargo` builds the working tree,
+and a checkout usually holds somebody's uncommitted work.
 
 Flash, boot, and — **before pressing any other key** — press Mute, then Volume
 Down, then Volume Up. Then read `/log/kernel.log` off the stick on the Mac.
