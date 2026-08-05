@@ -350,6 +350,13 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("usb_storage_gate", Sched::Parallel),
     ("usb_storage_shapes", Sched::Parallel),
     ("usb_refused_disk_first", Sched::Parallel),
+    ("usb_pool_exhausted", Sched::Parallel),
+    ("usb_short_read", Sched::Parallel),
+    // A plug over QMP and two host-side verdicts, neither of them a duration:
+    // the disk that arrives comes back byte-identical, and the log on the boot
+    // stick carries a line printed after it. The 1.2 s wait is against a 100 ms
+    // debounce the driver finishes in microseconds under TCG.
+    ("usb_disk_index_stable", Sched::Parallel),
     ("usb_storage_write_error", Sched::Parallel),
     ("usb_flush_optional", Sched::Parallel),
     ("xhci_deaf_registers", Sched::Parallel),
@@ -4476,6 +4483,9 @@ fn run_machine_test(
         "usb_refused_disk_first" => {
             usb::usb_refused_disk_first(test_config, c_bins, rust_bins)
         }
+        "usb_pool_exhausted" => usb::usb_pool_exhausted(test_config, c_bins, rust_bins),
+        "usb_short_read" => usb::usb_short_read(test_config, c_bins, rust_bins),
+        "usb_disk_index_stable" => usb::usb_disk_index_stable(test_config, c_bins, rust_bins),
         // Body in `tests/common/volumes.rs`, same reason.
         "esp_filesystem" => common::volumes::esp_filesystem(test_config, c_bins, rust_bins),
         // Body in `tests/common/toybox.rs`, same reason.

@@ -121,6 +121,16 @@ usb-flush-fails = []
 # conformant xHC answers Reset Endpoint with Context State Error for. See
 # `xhci/msc.rs`'s `transport_break`.
 usb-transport-break = []
+# Under-deliver one READ(10) data phase where the gate asks for it, so that the
+# controller's count of the bytes it moved and the device's own CSW residue
+# disagree. QEMU derives both from one transfer, so they can never contradict
+# each other there; on real hardware a device that ends its data phase early and
+# reports `dCSWDataResidue` as zero is a firmware bug that ships. Nothing is
+# faked: the bytes left in the tail of the window are the previous transfer's,
+# read off that window rather than invented, which is exactly what a caller is
+# handed when the controller's number is discarded. See `xhci/msc.rs`'s
+# `short_read`.
+usb-short-read = ["usb-storage-gate"]
 # Starve one of the xHCI bring-up register waits on a controller that is
 # otherwise answering: `xhci-deaf-controller` the four in `init_one`,
 # `xhci-deaf-port` the port-reset wait in `init_device`. QEMU's xHC halts,

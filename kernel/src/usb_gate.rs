@@ -137,6 +137,23 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     let past_end = disk.read_blocks(blocks, 1, &mut buf).is_err();
     log!("usb-gate: read past the last block refused={past_end}");
 
+    // A read the controller cut short while the device's own CSW claims it
+    // moved everything. Armed here rather than by a boot-wide count so the
+    // transfer it lands on is a known one, and issued against a block the host
+    // staged — so `matched` is a comparison with the host's bytes and not with
+    // the guest's idea of them. The block read into that window immediately
+    // before this one is a different LBA, which is what a caller is handed when
+    // the two accounts disagree and only the device's is kept.
+    #[cfg(feature = "usb-short-read")]
+    {
+        let block = at(blocks, HOST_BLOCKS[0]);
+        buf.fill(0);
+        crate::drivers::xhci::arm_short_read();
+        let refused = disk.read_blocks(block, 1, &mut buf).is_err();
+        let matched = !refused && first_bad(&buf, nonce, block).is_none();
+        log!("usb-gate: short read of block {block} refused={refused} matched={matched}");
+    }
+
     // The guest's own bytes are keyed on the inverted nonce, so the host can
     // tell what the guest wrote from what it wrote itself — and a driver that
     // returned the wrong block cannot pass by returning a block that happens to
