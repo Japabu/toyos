@@ -1902,6 +1902,38 @@ hypothesis, not a measurement.
 
 ## 5. Diagnostics
 
+### OPEN — `--diag-boot` cannot carry a kernel feature, so H0's probe is not in the flashed image
+
+`specs/hda-driver-plan.md` H0 is built and behind the kernel feature
+`hda-probe` (`kernel/src/drivers/hda_probe.rs`), which is how "nothing in the
+ordinary boot path takes that controller out of reset" is enforced —
+`cargo test -- hda_probe` boots the diag config with the feature, asserts every
+verdict, then boots the same machine with a plain kernel and requires no `hda:`
+line at all. What is missing is one line: `src/build.rs:463` sets
+`kernel_features` from `debug` alone, so `Boot::Diag` builds the same kernel as
+`Boot::Normal` and the image the owner flashes carries no probe.
+
+The obstacle is not the size of the change, it is where it lands. `Boot::Diag`'s
+own doc says the diagnostic image's kernel is byte-identical to the ordinary
+one's and that "a `#[cfg]` could not have given us that" — so making the diag
+image a different kernel build changes a stated guarantee of that mode, and it
+belongs to whoever owns `src/`. H0's author held `kernel/` and the harness and
+was told not to touch `src/`, where another agent was working.
+
+Two shapes, and the owner should pick rather than the next agent guessing:
+
+1. **`Boot::Diag` gets a feature list of its own.** Smallest diff, and it makes
+   the diag kernel a second build — visibly, since the artifact key already
+   hashes the feature set. The guarantee in the doc becomes "same sources,
+   stated feature difference".
+2. **A `--kernel-feature <name>` flag on `cargo run`**, orthogonal to the boot
+   mode. Keeps `Boot::Diag` byte-identical by default and makes taking hardware
+   out of reset an explicit act, which is the honest shape for this. Costs one
+   more thing to remember at flash time.
+
+Until one of them lands, the T14's answer to `hda-driver-plan.md` §6.3 is
+unreachable — and that answer decides the whole audio track (§6.3's (b) block).
+
 ### OPEN — a boot that wedges before the idle loop says nothing at all
 
 Not "says less": **nothing**, including everything it logged before it wedged. The
