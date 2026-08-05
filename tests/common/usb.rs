@@ -882,7 +882,7 @@ fn optional_flush_keeps_the_log(
     let mut on_device;
     loop {
         on_device = String::from_utf8_lossy(
-            &super::volumes::log_on_device(&image_path, start, len, "kernel.log")?,
+            &super::volumes::newest_log(&image_path, start, len)?.1,
         )
         .into_owned();
         if on_device.contains("Boot: complete") || std::time::Instant::now() >= deadline {
@@ -929,7 +929,7 @@ fn optional_flush_keeps_the_log(
         ));
     }
 
-    let after = super::volumes::log_on_device(&image_path, start, len, "kernel.log")?;
+    let after = super::volumes::newest_log(&image_path, start, len)?.1;
     let after = String::from_utf8_lossy(&after).into_owned();
     if !after.contains("Shutting down.") {
         return Err(format!(
@@ -988,8 +988,7 @@ fn failed_flush_stops_once(
         return Err(format!("the injected flush failure never reached the driver\n{log}"));
     }
     let gave_up = log
-        .matches("log-file: the volume's device refused the sync — /log/kernel.log \
-                  stops at")
+        .matches("log-file: the volume's device refused the sync — /log/")
         .count();
     if gave_up != 1 {
         return Err(format!(

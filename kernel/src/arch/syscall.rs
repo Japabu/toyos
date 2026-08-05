@@ -312,8 +312,28 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_RELEASE_SHARED => sys_release_shared(a1),
         SYS_THREAD_SPAWN => sys_thread_spawn(a1, a2, a3, a4),
         SYS_THREAD_JOIN => sys_thread_join(a1),
-        SYS_CLOCK_REALTIME => crate::rtc::read_time(),
-        SYS_CLOCK_EPOCH => crate::rtc::read_epoch_secs(),
+        // Both answer out of the anchor `clock` took at boot, so neither
+        // touches the CMOS: this used to be a port handshake per call that
+        // could block on the update flag for as long as a second, which made
+        // `SystemTime::now()` in a loop pathological. `NotSupported` is a
+        // machine that never said what time it is — for the life of this boot
+        // it does not support being asked, and the alternative is serving a
+        // number from 1970 that a caller cannot tell from a real one.
+        //
+        // Local time in the first and UTC in the second, which is what each
+        // has always claimed to be: the wall clock on a screen wants the
+        // machine's own zone, and seconds since the epoch are UTC by
+        // definition.
+        SYS_CLOCK_REALTIME => crate::clock::local_secs().map_or(
+            SyscallError::NotSupported.to_u64(),
+            |secs| {
+                let now = crate::clock::Civil::from_unix_secs(secs);
+                (now.hour << 16) | (now.min << 8) | now.sec
+            },
+        ),
+        SYS_CLOCK_EPOCH => {
+            crate::clock::utc_secs().map_or(SyscallError::NotSupported.to_u64(), |secs| secs)
+        }
         SYS_SYSINFO => {
             let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
             sys_sysinfo(buf)

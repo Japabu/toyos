@@ -957,6 +957,17 @@ pub struct BootOptions {
     /// than discover it. Short lists are allowed: the disks past the end get
     /// the blank image their size would have given them anyway.
     pub usb_images: Vec<PathBuf>,
+    /// What the emulated RTC reads when the machine starts, as
+    /// `YYYY-MM-DDTHH:MM:SS`.
+    ///
+    /// The wall clock is a device the host can set, which is what makes the
+    /// kernel's reading of it checkable from outside the guest: with this
+    /// given, the name and the timestamp of the file the guest writes are both
+    /// predictable before the machine exists. `None` leaves QEMU's default,
+    /// which is the host's own clock in UTC — and leaves the argument off the
+    /// command line entirely, so every existing profile assertion sees the argv
+    /// it always saw.
+    pub rtc_base: Option<&'static str>,
 }
 
 /// The in-guest test runner's startup marker.
@@ -977,6 +988,7 @@ impl Default for BootOptions {
             nvme_image: None,
             boot_image: None,
             usb_images: Vec::new(),
+            rtc_base: None,
         }
     }
 }
@@ -1865,6 +1877,10 @@ fn qemu_command(
     }
     if shape.iommu.is_some() {
         machine.push_str(",kernel-irqchip=split");
+    }
+
+    if let Some(base) = options.rtc_base {
+        qemu.arg("-rtc").arg(format!("base={base}"));
     }
 
     qemu.arg("-machine")
