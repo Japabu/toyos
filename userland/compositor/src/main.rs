@@ -1079,10 +1079,15 @@ fn draw_taskbar(
     }
 
     if clip.overlaps(status) {
-        let time = system::clock_realtime();
+        // Dashes and not 00:00 on a machine whose clock never answered: a
+        // reader cannot tell a plausible midnight from a missing clock.
+        let clock = match system::clock_realtime() {
+            Some(time) => format!("{:02}:{:02}", time.hours, time.minutes),
+            None => String::from("--:--"),
+        };
         let status_str: String = format!(
-            "{}M/{}M  CPU {}%  {:02}:{:02}",
-            stats.used_mb, stats.total_mb, stats.cpu_pct, time.hours, time.minutes
+            "{}M/{}M  CPU {}%  {clock}",
+            stats.used_mb, stats.total_mb, stats.cpu_pct
         )
         .chars()
         .take(MAX_STATUS_CHARS)

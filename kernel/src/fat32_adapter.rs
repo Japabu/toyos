@@ -465,34 +465,26 @@ pub struct FatFs {
     fs: Fat32<FatVolume>,
     open: HashMap<FileId, OpenFile>,
     by_name: HashMap<String, FileId>,
-    /// Unix seconds at `nanos_since_boot() == 0`.
-    ///
-    /// FAT stores wall-clock time and the VFS's `mtime` is nanoseconds since
-    /// boot, so the number the trait hands this adapter is not a time of day
-    /// and cannot be stamped on an entry. The RTC is read once here rather
-    /// than per write: `rtc::read_epoch_secs` spins on the CMOS
-    /// update-in-progress flag for up to a second, and a metadata flush is on
-    /// the log sink's path.
-    boot_unix_secs: u64,
+}
+
+/// What to stamp on an entry this adapter is writing.
+///
+/// FAT stores wall-clock time and the VFS's `mtime` is nanoseconds since boot,
+/// so the number the trait hands this adapter is not a time of day and cannot
+/// go on an entry. It comes from `clock` instead, which read the RTC once for
+/// the whole machine — this used to be a per-volume reading, so a machine with
+/// both volumes mounted had two answers to what time it booted.
+///
+/// Local and not UTC: FAT stores local time by specification. A machine with no
+/// wall clock stamps [`FatTime::EPOCH`], which is what the format itself uses
+/// for an entry nobody dated.
+fn now() -> FatTime {
+    crate::clock::local_secs().map_or(FatTime::EPOCH, FatTime::from_unix_secs)
 }
 
 impl FatFs {
     fn new(role: Role, fs: Fat32<FatVolume>) -> Self {
-        let now = crate::rtc::read_epoch_secs();
-        let up = crate::clock::nanos_since_boot() / 1_000_000_000;
-        Self {
-            role,
-            fs,
-            open: HashMap::new(),
-            by_name: HashMap::new(),
-            boot_unix_secs: now.saturating_sub(up),
-        }
-    }
-
-    fn now(&self) -> FatTime {
-        FatTime::from_unix_secs(
-            self.boot_unix_secs + crate::clock::nanos_since_boot() / 1_000_000_000,
-        )
+        Self { role, fs, open: HashMap::new(), by_name: HashMap::new() }
     }
 
     fn backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
@@ -573,7 +565,7 @@ impl FileSystem for FatFs {
         if let Some(&file_id) = self.by_name.get(name) {
             return Ok(file_id);
         }
-        let time = self.now();
+        let time = now();
         self.ensure_parent(name, time).map_err(|e| e.as_str())?;
         let file = match self.fs.create(name, time) {
             Ok(file) => file,
@@ -690,7 +682,7 @@ impl FileSystem for FatFs {
         size: u64,
         _mtime: u64,
     ) -> Result<(), &'static str> {
-        let time = self.now();
+        let time = now();
         let name = {
             let Self { fs, open, .. } = self;
             let info = open.get_mut(&file_id).ok_or("file not open")?;
