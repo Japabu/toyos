@@ -34,18 +34,18 @@ use super::volumes::{self, Entry};
 
 /// What the host sets the emulated RTC to, and the same instant in seconds.
 ///
-/// Past the year 2100 for the reason in the module docs. Inside FAT's range,
-/// whose last representable day is 2107-12-31 — the file this boot writes has
-/// to carry this instant as its own timestamp, and a clamp would hide the
-/// difference between "the kernel read the century" and "the format could not
-/// say".
-const RTC_BASE: &str = "2101-06-05T04:03:02";
-const RTC_BASE_SECS: i64 = 4_147_387_382;
+/// A date this century, so the machine is self-consistent: QEMU sets the clock
+/// registers and leaves the century register alone at the 20 firmware wrote, and
+/// those two agree only for the 2000s. Well inside FAT's range, whose last
+/// representable day is 2107-12-31, because the file this boot writes has to
+/// carry the instant as its own timestamp and a clamp would hide a wrong one.
+const RTC_BASE: &str = "2033-03-07T09:14:25";
+const RTC_BASE_SECS: i64 = 1_993_799_665;
 /// What a file named for that instant begins with. The date and not the time,
 /// because the seconds move on while the machine boots and
 /// [`MAX_BOOT_DRIFT_SECS`] is what bounds that — the timestamp inside the entry
 /// is where this is checked to the second.
-const RTC_BASE_DATE: &str = "2101-06-05-";
+const RTC_BASE_DATE: &str = "2033-03-07-";
 
 /// How far past [`RTC_BASE`] the guest may have got by the time it names its
 /// log file.
@@ -68,14 +68,14 @@ pub const MAX_LOG_FILES: usize = 16;
 ///
 /// Sixteen staged files, so the volume is exactly at the bound before the guest
 /// starts and this boot's own file is the one that puts it over. They are dated
-/// 2098, before [`RTC_BASE`], so the one that has to go is unambiguous — and
-/// they are *not* consecutive, so an implementation deleting "the first one it
-/// listed" or "the lowest index" rather than the oldest lands on a different
+/// well before [`RTC_BASE`], so the one that has to go is unambiguous — and
+/// they are *not* consecutive days, so an implementation deleting "the first one
+/// it listed" or "the lowest index" rather than the oldest lands on a different
 /// file than the one asserted.
 fn staged_logs() -> Vec<(String, Vec<u8>)> {
     (0..MAX_LOG_FILES)
         .map(|i| {
-            let name = format!("2098-01-{:02}-120000.log", 1 + i * 2);
+            let name = format!("2019-11-{:02}-120000.log", 1 + i * 2);
             let body = format!("staged by the host as boot {i}\n").into_bytes();
             (name, body)
         })
@@ -267,7 +267,8 @@ pub fn wall_clock_refusals(
         &["rtc-unstable"],
         "no two of 4 reads agreed",
     )?;
-    no_century(test_config, c_bins, rust_bins)
+    no_century(test_config, c_bins, rust_bins)?;
+    century_from_the_register(test_config, c_bins, rust_bins)
 }
 
 /// A machine whose clock will not answer still boots, still logs, and says so
@@ -317,8 +318,13 @@ fn undated(
     Ok(())
 }
 
-/// A FADT that names no century register: the year comes from two digits, and
-/// the file name is what says so.
+/// A FADT that names no century register: the machine still has a clock, and
+/// the year comes from two digits and the stated assumption.
+///
+/// The old code could not express this state at all — it read CMOS 0x32
+/// whatever the FADT said and took anything non-zero as a century — so the
+/// assertion is that the *table's* answer is what decides, and that answering
+/// "none" costs the machine its century rather than its clock.
 fn no_century(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -330,23 +336,55 @@ fn no_century(
     let logs = logs(&entries);
 
     if !log.contains("ACPI: the FADT names no RTC century register") {
-        return Err(format!("the kernel never said the FADT named no century register\n{}", clock_lines(&log)));
+        return Err(format!(
+            "the kernel never said the FADT named no century register\n{}",
+            clock_lines(&log)
+        ));
     }
     let [only] = logs.as_slice() else {
         return Err(format!("the volume holds {} logs, wanted one: {}", logs.len(), names(&logs)));
     };
-    // 2001 and not 2101: the same registers, minus the century, are a hundred
-    // years earlier. This is the assertion that fails if the kernel reads 0x32
-    // whatever the FADT says, and it is the one `wall_clock_file`'s 2101 cannot
-    // make on its own.
-    if !only.name.starts_with("2001-06-05-0403") {
+    if !only.name.starts_with(RTC_BASE_DATE) {
         return Err(format!(
-            "with no century register this boot's log is {}, and the two-digit year makes it \
-             2001-06-05\n{}",
+            "with no century register this boot's log is {}, and two digits plus 2000 is still \
+             {RTC_BASE_DATE}\n{}",
             only.name,
             clock_lines(&log)
         ));
     }
-    eprintln!("  [clock] no century register: {} , the two-digit year", only.name);
+    eprintln!("  [clock] no century register: {}, from two digits and 2000", only.name);
+    Ok(())
+}
+
+/// The century register's *contents* are what widen the year.
+///
+/// The one thing `-rtc base=` cannot stage, so the register answers 0x21 and
+/// nothing else changes: same clock registers, same FADT, same decoder. A
+/// kernel that ignored the register — or read a fixed 2000 — puts this boot in
+/// 2033 like every other one here, and the file name is where that shows.
+fn century_from_the_register(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURES: &[&str] = &["rtc-century-next"];
+    let (entries, log) =
+        boot_and_read(test_config, c_bins, rust_bins, "wall-clock-century.img", FEATURES, &[])?;
+    let logs = logs(&entries);
+
+    let [only] = logs.as_slice() else {
+        return Err(format!("the volume holds {} logs, wanted one: {}", logs.len(), names(&logs)));
+    };
+    // 2133 and not 2033: the same two year digits under the next century. The
+    // day and time are the host's, so only the century moved.
+    if !only.name.starts_with("2133-03-07-") {
+        return Err(format!(
+            "with the century register answering 0x21 this boot's log is {}, and the year the \
+             registers describe is 2133-03-07\n{}",
+            only.name,
+            clock_lines(&log)
+        ));
+    }
+    eprintln!("  [clock] century register 0x21: {}, a century past the staged clock", only.name);
     Ok(())
 }

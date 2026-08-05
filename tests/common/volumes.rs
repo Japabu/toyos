@@ -776,10 +776,12 @@ fn rotation(
     let image = std::fs::read(&image_path).map_err(|e| format!("read the image back: {e}"))?;
     let entries = root_entries(&image[start..start + len])?;
     let logs: Vec<&Entry> = entries.iter().filter(|e| e.name.ends_with(".log")).collect();
-    // Retention, inside one boot: at 256 bytes a metal-sim boot writes more
-    // parts than the bound allows, so the volume has to end up at the bound and
-    // not above it. This is the same rule that bounds a stick across boots,
-    // reached without needing to boot seventeen times.
+    // A part is a flush batch that crossed the bound rather than 256 bytes of
+    // log — the sink drains everything pending before it looks at the size —
+    // so a metal-sim boot makes a handful, measured at four. That is under the
+    // retention bound, which is why this only requires the count to stay inside
+    // it; deleting the oldest is `wall_clock_file`'s claim, staged with a full
+    // volume rather than hoped for here.
     if logs.len() < 2 || logs.len() > super::wallclock::MAX_LOG_FILES {
         return Err(format!(
             "the volume holds {} log files, wanted 2..={}: {}",
