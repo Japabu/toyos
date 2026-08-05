@@ -709,7 +709,7 @@ pub fn kernel_log_file(
 /// boot in `_0002` and up, both of which sort after everything older — so the
 /// last name is this boot's most recent file. Read off the device, like
 /// everything else here.
-fn newest_log(image_path: &Path, start: usize, len: usize) -> Result<(String, Vec<u8>), String> {
+pub fn newest_log(image_path: &Path, start: usize, len: usize) -> Result<(String, Vec<u8>), String> {
     let image = std::fs::read(image_path).map_err(|e| format!("read the image: {e}"))?;
     if start + len > image.len() {
         return Err(format!("the image shrank to {} bytes", image.len()));
@@ -924,7 +924,7 @@ pub fn late_storage_connect(
     }
 
     // Ground truth is the device, not the line the guest printed about it.
-    let log = log_on_device(&image_path, start, len, "kernel.log")?;
+    let log = newest_log(&image_path, start, len)?.1;
     let text = String::from_utf8_lossy(&log).into_owned();
     if !text.contains(&nonce) {
         return Err(format!(
@@ -991,8 +991,10 @@ pub fn log_backing_read_error(
     // shipped code; only the bound moves.
     const FEATURES: &[&str] = &["fat-backing-read-fails", "test-small-caches"];
     const SERVING_ZEROS: &str = "failed; serving zeros";
+    // Up to the path and no further: the file is named for this boot's wall
+    // clock, so the rest of the line differs every run.
     const GAVE_UP: &str = "log-file: the log volume would not give back the page being appended \
-                           to — /log/kernel.log stops at";
+                           to — /log/";
 
     let image_path = test_dir().join("fat-backing-read-fails.img");
     let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURES);
@@ -1041,9 +1043,9 @@ pub fn log_backing_read_error(
     if !first.contains("log-file: this boot's kernel log is") {
         return Err(format!("the sink never installed on the seeding boot\n{first}"));
     }
-    let seeded = log_on_device(&image_path, start, len, "kernel.log")?;
+    let seeded = newest_log(&image_path, start, len)?.1;
     if seeded.is_empty() {
-        return Err("the seeding boot left no kernel.log, so the second boot re-reads \
+        return Err("the seeding boot left no log file, so the second boot re-reads \
                     nothing".to_string());
     }
 
@@ -1076,7 +1078,7 @@ pub fn log_backing_read_error(
     //    corruption is a run of NULs inside a file that is otherwise entirely
     //    printable. Checked here rather than trusted from the console, because
     //    the console is exactly what the guest would be wrong about.
-    let on_device = log_on_device(&image_path, start, len, "kernel.log")?;
+    let on_device = newest_log(&image_path, start, len)?.1;
     if let Some(at) = on_device.iter().position(|&b| b == 0) {
         let run = on_device[at..].iter().take_while(|&&b| b == 0).count();
         return Err(format!(
@@ -1449,11 +1451,14 @@ pub fn log_partition_identity(
     // the kernel wrote nothing to it.
     let after = std::fs::read(&image_path).map_err(|e| format!("read the image back: {e}"))?;
     let volume = &after[log_start..log_start + log_len];
-    let found = read_files(volume, &["kernel.log", "kernel.log.1"])?;
-    if found.iter().any(Option::is_some) {
-        return Err(
-            "the kernel wrote to a partition it had just refused to identify".to_string()
-        );
+    // Any log at all, rather than two names: the kernel picks this boot's from
+    // the wall clock, so what has to be absent is the whole family.
+    let found = log_names(volume)?;
+    if !found.is_empty() {
+        return Err(format!(
+            "the kernel wrote to a partition it had just refused to identify: {}",
+            found.join(", ")
+        ));
     }
     let complaints = fsck_complaints(volume, "log-identity")?;
     if !complaints.is_empty() {
