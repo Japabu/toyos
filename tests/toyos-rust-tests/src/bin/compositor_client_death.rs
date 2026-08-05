@@ -7,32 +7,38 @@
 //! longer has, `SharedMemory::grant` was infallible over that, and every other
 //! window went with it. `exit: compositor code=101`.
 //!
-//! Four cases, and the first is that one. The rest are the same shape found by
-//! reading for it: places where a message from any client reached a syscall
-//! whose refusal the compositor was not prepared to hear.
+//! Five cases. The first is that one; the next three are the same shape found
+//! by reading for it — places where a message from any client reached a
+//! syscall whose refusal the compositor was not prepared to hear.
+//!
+//! The fifth is the other side of the same event, and it is the client's:
+//! **a window whose connection has gone must let its owner leave.** Nothing
+//! else here is about the client's own fate, and that is why it belongs beside
+//! them rather than in a test of its own — a window ending has two halves, and
+//! each one used to take a process with it.
 //!
 //! Each case leaves its damage standing and then asks the compositor a
 //! question **with a deadline**, exactly as `compositor_stall` does — the host
 //! asserts the other half, that the desktop is still painting and that every
 //! client dropped on the way was named with its pid.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader};
+use std::os::toyos::process::CommandExt;
 use std::process::{exit, Command, Stdio};
 
 use toyos::{ipc, services, Connection};
 use toyos_abi::syscall::{self, SyscallError};
+use toyos_abi::Fd;
 use window::Window;
 
 const SELF_PATH: &str = "/bin/test_rs_compositor_client_death";
 
-/// How many clients ask for a window and are gone before they can be given
-/// one.
-///
-/// One is a race — the compositor may serve a connection before its creator
-/// has finished exiting — and this is not: the compositor promotes at most one
-/// pending connection per pass and composites between passes, so the last of
-/// these is dispatched several frames after every one of them was reaped.
-const VANISHERS: usize = 8;
+/// The compositor connection, in the process that finishes the request its
+/// creator did not live to send.
+const RELAY_SOCKET: Fd = Fd(3);
+/// The other end of the root's pipe, which closes when the creator has been
+/// reaped. Nothing is ever read off it but the hang-up.
+const RELAY_GO: Fd = Fd(4);
 
 /// `MSG_GET_RESOLUTION` is answered from the compositor's dispatch, so a reply
 /// proves the event loop reached the end of a pass rather than merely that the
@@ -40,38 +46,57 @@ const VANISHERS: usize = 8;
 const PROBE_POLLS: u32 = 500;
 const PROBE_POLL_NS: u64 = 10_000_000;
 
+/// How many events a closed window is asked for.
+///
+/// Two would do — `Close`, then `None` — and this is a handful more so the
+/// failure prints a stream rather than a single wrong answer. Each poll past
+/// the close costs nothing: the fd is ready, so none of them waits.
+const POLLS_AFTER_CLOSE: usize = 8;
+/// Long enough that a compositor still on its way to closing the connection is
+/// waited for rather than raced.
+const POLL_TIMEOUT_NS: u64 = 2_000_000_000;
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
-        Some("vanish") => vanish(),
+        Some("connect") => connect_and_go(),
+        Some("finish") => finish(),
         Some(other) => panic!("unknown role {other:?}"),
         None => run(),
     }
 }
 
 fn run() {
-    // A creator that is gone before its window is made. `accept` names the
-    // process that connected and the frame it left in the pipe outlives it, so
-    // what the compositor grants to here is a pid the kernel has forgotten.
-    let mut kids = Vec::new();
-    for _ in 0..VANISHERS {
-        kids.push(
-            Command::new(SELF_PATH)
-                .arg("vanish")
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap_or_else(|e| fail(&format!("[vanishing creators] spawn failed: {e}"))),
-        );
+    // **A creator that is gone before its window is asked for, with no race in
+    // it.** `accept` names the process that called `connect`, and a connection
+    // outlives that process — so the pid the compositor grants to here is one
+    // the kernel has already forgotten.
+    //
+    // Racing a dying creator against the compositor's own dispatch is what
+    // this used to do, and under a loaded host the compositor won all eight
+    // heats and the run proved nothing. Instead the request is *completed by a
+    // third process*: the creator hands its socket to a grandchild and exits,
+    // this process reaps it — which is what takes the pid out of the process
+    // table — and only then closes the pipe that releases the grandchild to
+    // send the frame. Every step waits on the one before it.
+    let mut creator = Command::new(SELF_PATH)
+        .arg("connect")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| fail(&format!("[a reaped creator] spawn failed: {e}")));
+    let go = creator.stdin.take().expect("the creator's stdin");
+    let mut said = String::new();
+    BufReader::new(creator.stdout.take().expect("the creator's stdout"))
+        .read_line(&mut said)
+        .unwrap_or_else(|e| fail(&format!("[a reaped creator] it never connected: {e}")));
+    if !said.starts_with("connected") {
+        fail(&format!("[a reaped creator] the creator said {said:?}"));
     }
-    // Released together, so the compositor meets them as a queue rather than
-    // one at a time.
-    for kid in &mut kids {
-        let mut go = kid.stdin.take().expect("the child's stdin");
-        writeln!(go, "go").expect("release the child");
-    }
-    for mut kid in kids {
-        kid.wait().expect("wait for the child");
-    }
-    probe("creators that vanished");
+    creator.wait().expect("reap the creator");
+    // The reap is what makes the pid unknown; this is what tells the grandchild
+    // the reap has happened.
+    drop(go);
+    probe("a creator reaped before its window");
 
     // A window is a connection promoted by its first frame, so a second
     // `MSG_CREATE_WINDOW` on one arrives with nothing to promote. The
@@ -93,18 +118,78 @@ fn run() {
     clipboard_shm(token, u32::MAX, "a clipboard longer than any region");
     probe("a clipboard longer than any region");
 
-    println!("compositor client death: 4 deaths survived, compositor still serving");
+    // The other side of a window ending: the client has to be able to leave.
+    // `MSG_DESTROY_WINDOW` makes the compositor drop the connection, after
+    // which the fd is permanently read-ready at EOF — so a `poll_event` that
+    // did not latch answered `Close` for as long as anybody kept asking, and a
+    // client draining until `None` never got out. Two calls decide it.
+    let mut ending = Window::create(64, 64).expect("a window to close from the inside");
+    ipc::signal(ending.fd(), window::MSG_DESTROY_WINDOW)
+        .expect("ask the compositor to destroy this window");
+    // Named rather than kept, because `Event` is not `Debug` and a failure
+    // here has to print the whole sequence it saw.
+    let mut seen: Vec<&'static str> = Vec::new();
+    for _ in 0..POLLS_AFTER_CLOSE {
+        let name = match ending.poll_event(POLL_TIMEOUT_NS) {
+            None => "none",
+            Some(window::Event::Close) => "close",
+            // A frame the compositor had already sent can arrive first. It is
+            // not what this case is about, and skipping it is not a weakening:
+            // what follows still has to be close and then nothing.
+            Some(_) => "other",
+        };
+        seen.push(name);
+        if name == "none" {
+            break;
+        }
+    }
+    let sequence = seen.join(",");
+    let Some(closed_at) = seen.iter().position(|n| *n == "close") else {
+        fail(&format!(
+            "[a window closed from the inside] the connection went and the window never said \
+             so: {sequence}"
+        ));
+    };
+    if seen.get(closed_at + 1) != Some(&"none") {
+        fail(&format!(
+            "[a window closed from the inside] the poll after Close answered again: {sequence} \
+             — a client that drains until None cannot leave"
+        ));
+    }
+    probe("a window closed from the inside");
+
+    println!("compositor client death: 5 deaths survived, compositor still serving");
 }
 
-/// The child: connect, ask for a window, and be gone before the answer.
-fn vanish() {
+/// The creator: connect, hand the connection to a process that will outlive
+/// this one, and go.
+///
+/// Nothing is sent here. The compositor's record of who this connection
+/// belongs to is made at `connect`, and that is the only thing this role has
+/// to establish before dying.
+fn connect_and_go() {
     let conn = services::connect("compositor").expect("the compositor is not serving");
-    // Held back until the parent has every one of these standing, and written
-    // in one call so the compositor never sees half a frame — a partial frame
-    // is `compositor_stall`'s case, not this one.
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).expect("wait for the parent");
-    write_raw_fd(conn.fd(), &create_frame(), "vanish");
+    // The kernel clones the descriptor into the child's table
+    // (`loader::build_child_fds`), so the socket — and the pipes under it —
+    // outlive this process.
+    Command::new(SELF_PATH)
+        .arg("finish")
+        .inherit_fd(RELAY_SOCKET.0 as u32, conn.fd().0 as u32)
+        .inherit_fd(RELAY_GO.0 as u32, 0)
+        .spawn()
+        .expect("spawn the process that finishes the request");
+    println!("connected");
+}
+
+/// The grandchild: send the request its creator never sent, once that creator
+/// has been reaped.
+fn finish() {
+    let mut byte = [0u8; 1];
+    // The hang-up is the signal and the only signal: the root closes its end
+    // after `wait` returns, and `wait` returning is the pid leaving the
+    // process table.
+    while let Ok(1) = syscall::read(RELAY_GO, &mut byte) {}
+    write_raw_fd(RELAY_SOCKET, &create_frame(), "finish");
 }
 
 /// A whole `MSG_CREATE_WINDOW` for a 64x64 window, header and payload.
