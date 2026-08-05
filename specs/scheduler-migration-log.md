@@ -387,3 +387,59 @@ outside observer cannot tell a fresh grant from a re-arm.
 Same-session A/B of the whole boost-work delta against `1486473`, 64 first-boot
 config-runs per side: 14/56 vs 18/64, Fisher p=0.84 — no rate change, as
 expected, since neither commit was ever the dropout.
+
+### The balance path handed on a task it knew was dead
+
+The owner's T14 panicked at 949.792 s of uptime, doom exiting, eight logical
+CPUs under load:
+
+```
+retire_task: task not released after 1s: InTransit(CpuId(1))
+```
+
+§7.6's chase is correct about *ownership* — the home CPU in the state word is
+the proof, and whoever ends up holding the task reaps it — and says nothing
+about *promptness*. The two diverge in exactly one state. A `Msg::Retire`
+carries `Urgency::Preempt` and always kicks; a running target's `need_resched`
+is a kick. `InTransit` has no interrupt of its own: the reap rides the `Adopt`
+that carries the task, and an `Adopt` of a non-RT task is `Urgency::Normal`,
+whose entire purpose is that a busy destination is not interrupted. The retire
+that *did* carry the urgency is consumed and dropped when it arrives ahead of
+the adopt — `handle_retire`'s home-is-me arm.
+
+Both callers of `hand_off` could create that state for a task the CPU holding
+it already knew was dead. `answer_steal_requests` exports from the *back* of
+the fair band, which is precisely the end `pick` will not look at for a long
+time; `place` forwards a boosted wake to a sleeping sibling. Neither read the
+kill bit. So a task the owning CPU would have reaped at its own next pick was
+instead posted to a second CPU, and the retirer's 1 s wall clock started
+counting against *that* CPU's next voluntary pass.
+
+`hand_off` now reaps. It is strictly less work than migrating and it makes the
+weak state unreachable by decision rather than unlikely: no CPU can put a task
+it knows is dead into transit. The residue is a kill that lands after the adopt
+was posted, which no protocol removes, and that case always has a `Retire`
+aimed at the same CPU, so it keeps the bound every other state has.
+
+Gated by invariant **I14** (a killed task is never migrated; a retire reaches
+`Hw::release` within `QUANTUM + IPI_LATENCY + max KernelSection + 2×RUN_CHUNK`),
+its scenario `retire_under_balance` — the audio pipeline's RT daemon and its
+boost-woken clients, with the client process tearing down while its workers are
+parked on the queue soundd lends to — and the negative gate
+`old_migrate_kept_the_corpse` behind `protocol-port`. Measured on this tree,
+200 seeds × 2 drivers at widths 2..=6: the gate is caught 11, 8, 14, 11 and
+0 times out of 400; the fixed scenario is clean in 3000 runs with a worst retire
+latency of 2.0 ms against the 12.2 ms bound.
+
+**What this fix does not cover, and what the 1 s bound is really measuring.**
+Every state's reap — `InTransit` included, after the fix — is bounded by the
+*owning CPU's pass latency*, and nothing in the core can shorten that. The
+kernel driver currently admits passes far longer than the second `retire_task`
+allows: `sched::driver::drain_irqs` runs `xhci::poll_if_pending` at the top of
+every `pass`/`pass_block`, **before** the mailbox drain, and that call
+enumerates hot-plugged devices and recovers broken endpoints on a 2 s deadline
+(`xhci::USB_TIMEOUT_NS`) while holding a ticket spinlock — the driver's own
+doc-comment says so. `MAX_PASS_NS` is 200 µs. A CPU inside that recovery holds
+every message addressed to it, and `retire_task`'s deadline is the only thing in
+the tree that notices. Recorded in `specs/known-issues.md`; not fixed here,
+because closing it means making xHCI enumeration asynchronous.

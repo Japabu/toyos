@@ -29,11 +29,27 @@ fn rt_latency_bound(max_kernel_section: u64) -> u64 {
     IPI_LATENCY_NS + max_kernel_section + 2 * RUN_CHUNK_NS
 }
 
+/// How long a retire may take to reach `Hw::release` (invariant I14).
+///
+/// One quantum is what a *running* target is allowed before its next safe
+/// point — spec §7.6's "bounded by the quantum" — and the other three terms
+/// are I4's: the kick's delivery bound, the preempt-off section the target may
+/// be inside, and the granularity of an execution step. Everything else the
+/// protocol does is a message the target consumes at the start of that pass.
+///
+/// Derived, not recorded, and deliberately *not* the kernel's 1 s wall clock:
+/// `retire_task`'s deadline is a hundred times this, so a scenario that holds
+/// this bound says the wall clock had two orders of magnitude of headroom.
+fn retire_latency_bound(max_kernel_section: u64) -> u64 {
+    QUANTUM_NS + IPI_LATENCY_NS + max_kernel_section + 2 * RUN_CHUNK_NS
+}
+
 pub fn check_all(vm: &mut Vm<'_>) {
     check_single_ownership(vm);
     check_sleeping_cpus(vm);
     check_timers(vm);
     check_rt_latency(vm);
+    check_retires(vm);
     let rt_present = note_rt_service(vm);
     check_fairness(vm, rt_present);
     check_share_refcounts(vm);
@@ -178,6 +194,70 @@ fn check_sleeping_cpus(vm: &mut Vm<'_>) {
             ));
         }
     }
+    for problem in problems {
+        vm.violate(problem);
+    }
+}
+
+/// I14: a retire is prompt, and the balance path does not undo that.
+///
+/// Two halves of one property, because the protocol's promptness rests on two
+/// different things. **A killed task is never migrated**: `InTransit` is the
+/// one state whose reap is not backed by an interrupt — the destination's
+/// adopt carries `Urgency::Normal`, which by design sends no IPI to a busy CPU
+/// — so a CPU that hands on a task it knows is dead trades a reap it could do
+/// in this pass for a wait on another CPU's next voluntary one. **And a retire
+/// completes within [`retire_latency_bound`]**, which is the statement the
+/// kernel's `retire_task` makes with a wall clock and a panic.
+///
+/// The first half is what `scenarios::old_migrate_kept_the_corpse` proves has
+/// teeth; the second is a bound in the shape of I4's, and it is what a future
+/// change that lengthens the retire path would go red on.
+fn check_retires(vm: &mut Vm<'_>) {
+    let mut problems = Vec::new();
+
+    let migrated: Vec<(TaskKey, u32)> = vm.hw.with(|s| {
+        let fresh = s.trace[vm.trace_cursor..]
+            .iter()
+            .filter_map(|ev| match ev.kind {
+                toyos_sched::hw::TraceKind::Migrate { task, to } => Some((task, to.0)),
+                _ => None,
+            })
+            .collect();
+        vm.trace_cursor = s.trace.len();
+        fresh
+    });
+    for (key, to) in migrated {
+        if vm.killed.contains_key(&key) {
+            problems.push(format!(
+                "I14: {key:?} was killed and then migrated to cpu{to} — a task in transit is \
+                 reaped only by the adopt that carries it, and that adopt kicks nobody",
+            ));
+        }
+    }
+
+    let bound = retire_latency_bound(vm.max_kernel_section());
+    vm.retire_bound = bound;
+    let mut done = Vec::new();
+    for (&key, &at) in &vm.killed {
+        if vm.live.contains(&key) {
+            let elapsed = vm.clock.since(at);
+            vm.retire_latency = vm.retire_latency.max(elapsed);
+            if elapsed > bound {
+                problems.push(format!(
+                    "I14: {key:?} was retired {elapsed} ns ago and is still {:?} (bound {bound} ns)",
+                    vm.shared[&key].state(),
+                ));
+            }
+        } else {
+            done.push(key);
+        }
+    }
+    for key in done {
+        let at = vm.killed.remove(&key).expect("came from the map");
+        vm.retire_latency = vm.retire_latency.max(vm.clock.since(at));
+    }
+
     for problem in problems {
         vm.violate(problem);
     }

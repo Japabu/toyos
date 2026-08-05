@@ -575,6 +575,20 @@ environment's finalize sink instead, which runs once per task and after the payl
    `crash_md_exit_race` replays the crash.md shape and asserts single ownership + mock-Arc
    refcount sanity every step.
 
+4. **A killed task is never handed on.** Step 2's correctness argument is about ownership and says
+   nothing about promptness, and the two diverge in exactly one state. Every other state's reap
+   has an interrupt behind it: the `Retire` is `Urgency::Preempt` and always kicks, and a *running*
+   target's `need_resched` is a kick. `InTransit` has none — it is reaped by the `Adopt` that
+   carries it, and an `Adopt` of a non-RT task is `Urgency::Normal`, whose whole purpose is that a
+   busy destination is *not* interrupted. So both callers of `hand_off` — `answer_steal_requests`,
+   which exports from the *back* of the fair band, and `place`, which forwards a boosted wake to a
+   sleeping sibling — read the kill bit and reap where they stand. That is strictly less work than
+   migrating, and it makes the weak state unreachable by decision: no CPU puts a task it knows is
+   dead into transit. What remains is a kill that lands after the `Adopt` was posted, which no
+   protocol removes, and that case always has a `Retire` aimed at the same CPU. Invariant I14 is
+   the check; `old_migrate_kept_the_corpse` is the negative gate. Evidence: a live panic on the
+   T14, `retire_task: task not released after 1s: InTransit(CpuId(1))`.
+
 Deleted wholesale: `KILLED[16]`, `mark_killed`'s 16-concurrent-retire panic, `WAKE_TRANSITS`,
 `TransitGuard`, `scan_remove`, poison-set rescheduling filters.
 
@@ -1025,13 +1039,14 @@ checkers.
 | I11 | No migrate/finalize of a task whose `ctx_saved` shadow is false | sim |
 | I12 | ≤1 `Wake` and ≤1 `Retire` node in flight per task; steal node free ⇔ unlinked | sim + loom |
 | I13 | Fairness, inside a share: threads of one share get equal service over I5's window, narrowed to intervals where every CPU carries the same number of each member's runnable threads | sim (+ negative gate `fair_identity_within_share`, control `fair_identity_tiebreak`) |
+| I14 | Retire promptness: a killed task is never migrated, and a retire reaches `Hw::release` within `QUANTUM + IPI_LATENCY + max KernelSection + 2×RUN_CHUNK`. The first half is what keeps the second reachable — §7.6 | sim (+ negative gate `old_migrate_kept_the_corpse`) |
 
 ### 10.6 Loom scope (honest division of labor)
 
 Loom owns the primitives the sim's step granularity assumes correct: mailbox push/drain (IRQ torn
 push; the forbidden preempted-producer strand), doorbell edge/IPI accounting, ticket CAS protocol
 (wake/commit/cancel/timeout), kill-bit vs wake ordering, retire-node re-post, sleep handshake.
-The simulator proves that the protocol above linearizable primitives keeps I1–I13 across
+The simulator proves that the protocol above linearizable primitives keeps I1–I14 across
 schedules. Neither overpromises: loom does not scale to the whole scheduler; the sim does not
 model weak memory.
 

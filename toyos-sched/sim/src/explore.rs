@@ -43,6 +43,13 @@ pub struct Outcome {
     /// Blocks that ended in `Commit::Killed` — a retire that landed inside the
     /// registration window (spec §6.3, §7.6). Reported for the same reason.
     pub killed_at_park: u64,
+    /// Invariant I14's measurement: the longest a retire went unfinalized, and
+    /// the bound in force. A number as well as a verdict, because the kernel's
+    /// `retire_task` states the same property with a wall clock and a panic, and
+    /// how much of that budget the protocol spends is what says whether the wall
+    /// clock is a backstop or a coin flip.
+    pub retire_latency: u64,
+    pub retire_bound: u64,
     /// Invariant I5's measurement: the widest service spread seen over one
     /// contention window, and the bound in force when it was seen. A number
     /// rather than a verdict, because spec §11 Stage 9 compares a per-CPU
@@ -73,7 +80,7 @@ impl Outcome {
         if self.passed() {
             return format!(
                 "{}: ok ({} steps, {} ns, {} switches, {} kicks, I5 spread {}/{} ns, \
-                 I13 spread {}/{} ns)",
+                 I13 spread {}/{} ns, I14 retire {}/{} ns)",
                 self.scenario,
                 self.steps,
                 self.elapsed,
@@ -83,6 +90,8 @@ impl Outcome {
                 self.fair_bound,
                 self.thread_spread,
                 self.thread_bound,
+                self.retire_latency,
+                self.retire_bound,
             );
         }
         format!(
@@ -189,6 +198,8 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         kicks,
         pre_park_claims: vm.pre_park_claims,
         killed_at_park: vm.killed_at_park,
+        retire_latency: vm.retire_latency,
+        retire_bound: vm.retire_bound,
         fair_spread: vm.fair_spread,
         fair_bound: vm.fair_bound,
         fair_over_bound: vm.fair_over_bound,

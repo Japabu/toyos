@@ -941,6 +941,117 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
+### A scheduler pass may spend two seconds in xHCI before it drains its mailbox
+
+`sched::driver::pass` and `pass_block` both open with `drain_irqs()`, and
+`drain_irqs` calls `xhci::poll_if_pending()` — **before** `with_cpu(...)`, and
+therefore before the CPU's mailbox drain, its deadline fires and its pick. That
+call is not bookkeeping. Its own doc-comment says so:
+
+> it enumerates hot-plugged devices and recovers broken endpoints, and both spin
+> on deadlines measured in seconds while holding `XHCI`, which is a ticket
+> spinlock and therefore preemption off for its whole life.
+
+The deadline is `xhci::USB_TIMEOUT_NS` = 2 s. `cpu::MAX_PASS_NS`, the budget the
+scheduler core asserts against in `feature = "check"` builds, is 200 µs. The two
+numbers disagree by four orders of magnitude, and the driver's prologue sits on
+the wrong side of the boundary the budget describes.
+
+What a CPU inside that recovery holds is *every message addressed to it*: an
+`Adopt` carrying a task, a `Wake` for a parked thread, a `Retire`. Nothing in the
+scheduler can shorten it — every reap and every wake is bounded by the owning
+CPU's pass latency by design, which is exactly why the design is sound. The one
+thing in the tree that notices is `scheduler::retire_task`'s 1 s guard, and it
+notices by panicking:
+
+```
+retire_task: task not released after 1s: InTransit(CpuId(1))
+```
+
+That panic fired on the owner's T14 at 949.792 s of uptime with doom exiting. The
+*balance*-path half of it is fixed (spec §7.6.4: `hand_off` reaps a killed task
+rather than handing it on, gated by simulator invariant I14). This half is not,
+and it would produce the same panic with `Blocked(CpuId(n))` in the message
+instead — the guard cannot tell a lost message from a busy CPU, which is what it
+is written as if it could.
+
+The second instance of the same shape is the idle loop, which runs
+`log_file::poll()` — already recorded in CLAUDE.md as "unbounded and
+uninterruptible" — before its `pass()`. On a machine whose log partition is on
+the USB stick it booted from, that flush is USB mass-storage I/O on the same 2 s
+transfer deadline, and a task adopted onto an idle CPU waits behind it.
+
+Closing this means making xHCI enumeration and endpoint recovery asynchronous, so
+that `drain_irqs` only ever does work it can finish: drain the event ring,
+dispatch HID reports, note that a port or an endpoint owes work. The debounce and
+the port reset were already moved off this path for exactly this reason (CLAUDE.md,
+USB hotplug); the control transfers inside `configure` and `recover_endpoints`
+were not. Until then, `retire_task`'s bound is measuring the USB bus.
+
+**And the budget cannot see it, twice over.** `cpu::MAX_PASS_NS` is asserted by
+`check_pass_duration`, which measures from `SchedPass::begin`'s `now` to the end
+of `finish()` — and `drain_irqs()` runs *before* `SchedPass::begin`. The
+prologue is outside the window the budget covers, so invariant P would report a
+200 µs pass while the CPU had been in the driver for two seconds. Separately,
+the assertion is behind `feature = "check"`, whose kernel switch is
+`sched-check` (`kernel/Cargo.toml:228`) — and **nothing in `src/` or `tests/`
+ever turns it on**, so invariant P has never executed against the kernel in any
+image or any test run. Both halves want fixing together: the measured window has
+to start where the scheduler entry starts, and the gate has to run somewhere.
+
+### A spawned thread that never runs is invisible: `spawn:` does not record where it was placed
+
+From the T14 field log `boot5-doom-wedge.log` boot 10 (17:41, pre-fix image).
+Spawned processes intermittently never execute a first instruction, worsening
+over the session: `/bin/ps` pid=17 (69.4 s), `/bin/doom` pid=20 (79.8 s, not
+even its banner), `/bin/shutdown` pid=25 (104.7 s). Two earlier dooms
+initialized fully, drew their title screen and went silent at exactly `ST_Init`
+— where doom starts its further threads — with soundd printing `opening stream`
+for pid=11 and never `client 1 connected`. The kernel stayed alive to 114.6 s.
+
+**The `sched:` counters do not indict the scheduler, and cannot.** Two facts
+about where that line comes from:
+
+* `parked` is `cpu.parked().count()`, and the only way into `CpuSched.parked`
+  is `SchedPass::dispose_block`, which consumes `cpu.running`. **A thread that
+  never executed cannot be counted there.** The victims are not in that number.
+  What it does count is ordinary long-lived blocked threads — compositor,
+  soundd, filepicker, and one per live terminal/shell — so 1 → 2 → 3 as three
+  terminal/shell pairs accumulate is the expected reading, not a leak.
+* `ready=0 current=None` on every sample is a tautology of the print site:
+  `log_health` is called from `idle_loop`, so the CPU printing it is idle by
+  construction. CLAUDE.md already says this line is not a heartbeat.
+
+**What the log does isolate is `spawn`.** `driver::spawn` posts its `Msg::Adopt`
+with `Urgency::Normal` to `placement()`, and `placement()` picks the CPU with
+the lowest *published* load — which on a mostly-idle machine is a **halted**
+one. So a spawn is the most delivery-dependent operation in the system: unlike a
+wake, which goes to a task's home CPU where other work usually is, a spawn
+routinely aims its only reap-or-run event at a CPU that must be interrupted to
+see it, and then must complete a whole pass before the thread's first
+instruction runs. Everything in §3's first entry — `drain_irqs`'s xHCI recovery
+ahead of the mailbox drain, `log_file::poll()` ahead of the idle loop's `pass()`
+— sits between that IPI and that first instruction. This machine boots off the
+stick it logs to (`usb-storage: disk 0 ready on slot 3, SanDisk Ultra`, and
+`9266 bytes of kernel log still on the stick` at the end), so both of those are
+USB transfers on `USB_TIMEOUT_NS`.
+
+**It is not the balance-path defect (#142) wearing userland clothes.**
+`hand_off`'s kill check fires only for a task whose retire is already claimed; a
+freshly spawned thread has no kill bit, so that fix cannot reach this. What the
+two share is the *state*: `InTransit` is reachable only by the adopt that
+carries it, #142 removed one producer of stuck ones, and `spawn` is the other
+producer and is untouched.
+
+**The instrument that is missing.** `loader.rs:1111`'s `spawn:` line records
+pid, tid, base, entry, cr3 and five timings, and **not the CPU the task was
+placed on**. So no reader of this log can say which CPU owed pid=17 its first
+dispatch, and therefore cannot correlate a never-ran spawn against that CPU's
+`sched:` lines — which is the one correlation that would separate "the adopt was
+never delivered" from "the destination never completed a pass". Fold `dst` into
+that line rather than adding a second one; the log ring is itself one of the
+conditions that keeps a CPU awake.
+
 ### OPEN, ASSIGNED (#142) — a spawned process sometimes never starts, and every stuck terminal in the T14 session is downstream of one
 
 Owner-reported (task #141) and read off two T14 session logs. **It is one
@@ -1007,9 +1118,14 @@ that whole boot the only processes that ever exited were `netd` and one
 That is an answer rather than a lost measurement, and it is worth more than the
 column would have been: **it strikes a fresh process before it can write a
 byte, whatever the program is** — `ls`, `rustc`, `ps`, `shutdown`, `doom` — so
-nothing about `ls`'s own I/O path is involved. Meanwhile the per-CPU `parked`
-counters climb 1 → 2 → 3 as victims accumulate, `ready` is 0 on every report,
-and the kernel logs to the end.
+nothing about `ls`'s own I/O path is involved. The kernel logs to the end.
+
+The per-CPU `parked` counters climbing 1 → 2 → 3 is **not** the victims
+accumulating, and `ready = 0` on every report is not evidence of anything: a
+thread that never ran cannot be in `parked`, and the line is printed from the
+idle loop. Both numbers are fixed by where they are printed. The entry above
+carries that elimination, and the one instrument that would settle the split
+the `ps` column was going to.
 
 Investigation is the scheduler agent's (#142); the shapes are consistent with
 one defect. Ctrl+Alt+D remains available and is weaker: `dump_blocked` lists
@@ -2289,6 +2405,12 @@ phase landed, and none reproduces on a host running one suite.
   terminal. It reaches a shell through `shell_answers` exactly as
   `desktop_typing_damage` does, so it inherits that retry window and evidently
   not enough of it. Still `Sched::Parallel`.
+- **`netd_connection_caps`** — added 2026-08-05. Red at 50 s inside a landing
+  gate that was otherwise 257/259 with 0 invalidated, green in 7 s alone on the
+  same tree moments later, on a branch that touches neither netd nor the
+  network stack. The 50 s against a 7 s solo run is the shape of a boot that
+  never got enough of the host, not of a cap that was announced wrong. Still
+  `Sched::Parallel`.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
@@ -2919,6 +3041,28 @@ something upstream of the count gives up before the packet arrives. Splitting
 the verdict therefore fixes only half of it, and `Sched::Serial` is the option
 that closes both. The branch that saw it changes no port I/O and no input path:
 its only ungated change anywhere is one extra field on the `iommu: unitN` line.
+
+**And on the same afternoon, on the USB mass-storage branch, the isolated run
+was red as well** — which takes contention away as the remaining explanation.
+Same host, a branch whose kernel delta is `drivers/xhci/` plus a gate-only
+feature:
+
+```
+wide phase (253 tests, 235.5 s, other agents building):
+  FAIL i8042_mouse: 1002 pointer events reached userland out of 1004 packets
+  injected, each one paced against the arrival of the last
+re-run alone:
+  FAIL i8042_mouse: timed out after 60s — 986 of the 1004 packets injected
+  came back out, so the host stalled on one the machine never delivered
+its own retry, in that same process:
+  PASS i8042_mouse (552ms)
+```
+
+Eighteen packets short with the host to itself, then green 552 ms later. So
+`Sched::Serial` would not have closed it either. What the two sightings share is
+the shape — the budget spent waiting for one arrival that never comes — so the
+thing to find is what drops a packet on a guest nobody is contending with,
+rather than which phase the test runs in.
 
 ### Device registers still take firmware's word for being uncacheable
 
@@ -4185,6 +4329,77 @@ against a 500 ms budget, times however many such devices are on the bus.
 `Profile::MetalUsb` puts six on one controller. The honest statement is that
 `READY_BUDGET_NS` bounds the retries and `USB_TIMEOUT_NS` times what each
 costs, and the *product* is the boot-time figure. `usb-storage.md` F11.
+
+### CLOSED — three of a second USB audit's findings, and what fixing them turned up
+
+An independent audit of the mass-storage stack — a second pass over the same
+files after `specs/type-safety-audit/usb-storage.md`'s findings landed —
+produced eleven more. The three serious ones are **fixed**, each with a gate
+that was red against the code before it.
+
+- **F-A. The controller's byte count was discarded, so a lying device served
+  stale DMA as file data.** `bulk` returns the residue the xHC reports — the
+  bytes it did not move into the buffer — and `bot`'s data phase threw it away
+  with `_`, so `delivered` came from the CSW's `dCSWDataResidue` alone. Two
+  accounts of one number exist and the driver kept the untrusted one. The
+  `MSC_DATA` window is never cleared between transfers (`MSC_SCRATCH` is, which
+  is why the capacity read was protected and the bulk data path was not), so a
+  device that under-delivers a READ(10) and reports a residue of zero handed the
+  caller the previous transfer's bytes for the part that never arrived — a
+  different LBA's data under this LBA's number, with no error anywhere.
+  `Bot::Done` now carries `delivered`, the smaller of the two accounts. Gate:
+  `usb_short_read`, whose actuator is the `usb-short-read` kernel feature.
+
+- **F-B. A plug on an earlier controller renumbered every disk, and mounts hold
+  their number for life.** The machine-wide index was `storage.len()`
+  accumulated across controllers, and that vector grows on every bind including
+  hot-plug. Indices were stable against *unplug* by design and never against a
+  plug on an earlier controller. The T14 has two xHCIs — Thunderbolt at 00:0d.0
+  first, PCH at 00:14.0 second — and boots off a stick in a PCH port, so
+  plugging any USB storage into the USB-C side made the new drive disk 0 and the
+  boot stick disk 1: every later `/log` append into the middle of that drive,
+  every `/boot` read serving its bytes as the ESP's. The number now comes from
+  `DISKS_BOUND`, a machine-wide counter, and lives beside the disk rather than
+  being derived from a position. `disk_base` is gone with it — the same defect's
+  second face, fixed at boot, so two disks logged under one number the moment
+  anything hot-plugged. Gate: `usb_disk_index_stable`.
+
+- **F-C. A refused disk's pool block was never returned, even after it was
+  unplugged.** `bind` claims a block before Configure Endpoint and keeps it
+  through every refusal, which is right while the device is on the bus;
+  `teardown_port` released one only for entries in the disk list, and a refused
+  disk is not in it. `MSC_BLOCKS` is 2, so one unsupported stick plugged and
+  pulled beside the boot stick left the pool with nothing for any later disk for
+  the life of the boot — on a machine whose only diagnostic channel is the
+  `/log` it can then not mount. `msc_taken` and `storage` are now one
+  `[MscBlock; MSC_BLOCKS]` keyed by the port that claimed the block. Gate: the
+  second half of `usb_refused_disk_first`.
+
+  The audit noted that `msc_taken`'s doc comment asserted the opposite in prose
+  — "a refused disk never gives its block back. An unplugged one does, and the
+  difference is not a policy" — which was false for a disk that was both.
+
+Two one-line findings from the same audit, also fixed:
+
+- **F-G.** `framed_phase` accepted only `(CC_SUCCESS, 0)`, so a status phase
+  completing with Short Packet and no residue — every byte of the CSW arrived —
+  was an error. It is `Some((CC_SUCCESS | CC_SHORT_PACKET, 0)) => Ok(())`.
+- **F-H.** `request_sense` accepted a residue of 5, which leaves ASCQ at byte 13
+  unread and reading as the zero `Scsi::unimplemented` tests for. Stated now as
+  `delivered >= 14`, which is the fact rather than its complement.
+
+**Found while fixing, not by the audit: the teardown released the pool block
+before it disabled the slot.** `teardown_port`'s own doc comment states the
+order — input source, then slot, then pool block — and says why the last step is
+only safe there: while the slot lives, its endpoint contexts still name that
+memory. The code did the block first. Nothing claims a block between those two
+statements today, so it was latent; it is now in the stated order.
+
+**Not recorded: F-D, F-F, F-I and F-K.** They are in task #145's description
+with their file and line and were not carried into the agent's prompt; writing
+them from memory would be inventing them. Whoever holds that task should paste
+them in. F-E is the EP0 recovery path, which has an entry above; F-J is the
+file-cache error channel, which is its own task.
 
 ### `BlockError` is a marker type because `SyscallError` has no I/O variant
 

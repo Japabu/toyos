@@ -9,8 +9,8 @@ use toyos_sched::queue::FairOrder;
 use toyos_sched::task::WaitClass;
 
 use crate::workload::{
-    BlockShape, ChargeShape, IrqSpec, Op, ParkShape, ProcSpec, Protocol, QueueSpec, Scenario,
-    Script, ShareShape, WindowShape,
+    BlockShape, ChargeShape, IrqSpec, MigrateShape, Op, ParkShape, ProcSpec, Protocol, QueueSpec,
+    Scenario, Script, ShareShape, WindowShape,
 };
 
 const MS: u64 = 1_000_000;
@@ -35,6 +35,7 @@ fn scenario(
         block: BlockShape::CommitInPass,
         window: WindowShape::PreemptOff,
         park: ParkShape::ReleaseLend,
+        migrate: MigrateShape::ReapTheCorpse,
         share: ShareShape::PerProcess,
         charge: ChargeShape::Honest,
         order: FairOrder::InsertSequence,
@@ -117,6 +118,103 @@ pub fn crash_md_exit_race() -> Scenario {
             ],
         )],
     )
+}
+
+/// A teardown that races the *balance* path rather than the wake path — the
+/// shape the owner's T14 died in, at 949 s of uptime with doom exiting:
+/// `retire_task: task not released after 1s: InTransit(CpuId(1))`.
+///
+/// Wide enough that CPUs go idle and probe while the teardown runs, and enough
+/// workers that a victim can be surplus (`fair_len() > 1`) on the CPU the probe
+/// reaches. That is the whole recipe: the thief asks, the victim CPU answers
+/// from the *back* of its fair band — the end `pick` will not look at for a
+/// long time — and the task it hands over is the one process teardown has just
+/// killed.
+///
+/// Invariant I14 is what this exists to feed, and
+/// [`old_migrate_kept_the_corpse`] is the gate that proves I14 has teeth.
+pub fn retire_under_balance() -> Scenario {
+    let mut scenario = scenario(
+        "retire_under_balance",
+        3,
+        vec![queue(WaitClass::Io), queue(WaitClass::Pipe)],
+        vec![
+            // The audio daemon, verbatim from `audio_pipeline`: RT, driven by
+            // the device, and it lends its clients a window when it signals
+            // them. The lend is what reaches `CpuSched::place`'s forwarding
+            // arm, which is the second caller of `hand_off` and the one that
+            // needs no surplus to fire.
+            ProcSpec {
+                name: "soundd",
+                initial: vec![0],
+                templates: vec![Script::looping(
+                    vec![
+                        Op::Block {
+                            queue: 0,
+                            deadline: Some(6 * MS),
+                        },
+                        Op::Run(MS / 2),
+                        Op::Wake {
+                            queue: 1,
+                            all: true,
+                            boost: Some(3 * MS),
+                        },
+                    ],
+                    6,
+                )],
+                rt: true,
+            },
+            // The client, and the process that dies: a main thread that tears
+            // down while its workers are parked on the queue soundd boosts.
+            process(
+                "client",
+                vec![0, 1, 1, 1, 1],
+                vec![
+                    Script::new(vec![
+                        Op::Run(MS),
+                        Op::Yield,
+                        Op::Run(4 * MS),
+                        Op::Yield,
+                        Op::Run(4 * MS),
+                        Op::Teardown,
+                    ]),
+                    Script::looping(
+                        vec![
+                            Op::Block {
+                                queue: 1,
+                                deadline: Some(12 * MS),
+                            },
+                            Op::Run(MS),
+                        ],
+                        6,
+                    ),
+                ],
+            ),
+        ],
+    );
+    scenario.irqs.push(IrqSpec {
+        period_ns: 3 * MS,
+        queue: 0,
+        boost_ns: None,
+    });
+    scenario
+}
+
+/// The fourth harness self-validation gate, and the one this file was extended
+/// for: [`retire_under_balance`] with the balance path allowed to hand on a
+/// task whose kill bit is already set.
+///
+/// It **must fail** invariant I14. `answer_steal_requests` pops from the back
+/// of the fair band and migrates without reading the kill bit, so a task the
+/// victim CPU would have reaped at its own next `pick` becomes an
+/// `Urgency::Normal` adopt aimed at a CPU that owes it nothing until its next
+/// voluntary pass. Every other state a killed task can be in has an interrupt
+/// behind its reap; `InTransit` has none, and this is the code that put tasks
+/// there on purpose.
+pub fn old_migrate_kept_the_corpse() -> Scenario {
+    let mut scenario = retire_under_balance().with_migrate(MigrateShape::KeepTheCorpse);
+    scenario.name = "old_migrate_kept_the_corpse";
+    scenario
 }
 
 /// The same workload driven with the OLD steal-and-scan algorithm. This is the
@@ -853,6 +951,7 @@ pub fn overlong_pass() -> Scenario {
 pub fn all() -> Vec<Scenario> {
     vec![
         crash_md_exit_race(),
+        retire_under_balance(),
         lost_wake_pipe(),
         lost_wake_futex(),
         lost_wake_iouring(),
@@ -880,6 +979,7 @@ pub fn by_name(name: &str) -> Option<Scenario> {
     }
     match name {
         "old_steal_port" => Some(old_steal_port()),
+        "old_migrate_kept_the_corpse" => Some(old_migrate_kept_the_corpse()),
         "fair_share_per_thread" => Some(fair_share_per_thread()),
         "fair_double_charge" => Some(fair_double_charge()),
         "fair_identity_tiebreak" => Some(fair_identity_tiebreak()),

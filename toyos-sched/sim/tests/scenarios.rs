@@ -175,6 +175,89 @@ fn old_commit_before_pass_is_caught() {
     );
 }
 
+/// The fourth self-validation gate: the balance path allowed to hand on a task
+/// whose kill bit is already set.
+///
+/// This is the shape of the panic the owner's T14 took at 949 s of uptime, with
+/// doom exiting — `retire_task: task not released after 1s: InTransit(CpuId(1))`
+/// — and the reason `CpuSched::hand_off` now reads the kill bit. `InTransit` is
+/// the one state whose reap is carried by an adopt rather than by the retire:
+/// the retire is `Urgency::Preempt` and always kicks, the adopt of a non-RT task
+/// is `Urgency::Normal` and by design kicks nobody, and a destination that is
+/// running owes the task nothing until its next voluntary pass. Handing a corpse
+/// there buys the thief a dead task and pays for it with the retirer's deadline.
+///
+/// It must be caught by **I14** specifically. The failure rate is a rate and not
+/// a certainty — the migration needs a boosted wake to land on the RT daemon's
+/// CPU in the window between the teardown and that CPU's drain — so this asserts
+/// a floor over the sweep rather than every seed.
+#[test]
+fn old_migrate_keeping_the_corpse_is_caught() {
+    let scenario = scenarios::old_migrate_kept_the_corpse();
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    let mut caught = 0;
+    for seed in 0..SEEDS {
+        let mut choices = if seed % 2 == 0 {
+            ChoiceStream::from_seed(seed)
+        } else {
+            ChoiceStream::pct(seed, scenario.cpus, 3)
+        };
+        let outcome = run(scenario.clone(), &mut choices);
+        if outcome.passed() {
+            continue;
+        }
+        caught += 1;
+        for violation in &outcome.violations {
+            let id = violation.split(':').next().unwrap_or("?").to_string();
+            *kinds.entry(id).or_default() += 1;
+        }
+    }
+    assert!(
+        caught > 0,
+        "migrating a task that is already dead went undetected in {SEEDS} \
+         schedules — I14 says nothing about the balance path it was written for",
+    );
+    assert!(
+        kinds.contains_key("I14"),
+        "expected a retire-promptness violation; got {kinds:?}",
+    );
+}
+
+/// The positive half of the same pair: with the kill bit read, no schedule of
+/// that workload puts a corpse in transit, and every retire completes well
+/// inside the derived bound.
+///
+/// The measurement is the point. `retire_task`'s guard is a wall clock two
+/// orders of magnitude wider than [`toyos_sched_sim::explore::Outcome::retire_bound`],
+/// so what this reports is how much of that budget the protocol actually spends
+/// — and a change that starts spending it shows up here as a number long before
+/// it shows up on the owner's laptop as a panic.
+#[test]
+fn a_retire_completes_inside_its_derived_bound() {
+    let scenario = scenarios::retire_under_balance();
+    let mut worst = 0;
+    let mut bound = 0;
+    for seed in 0..SEEDS {
+        let mut choices = if seed % 2 == 0 {
+            ChoiceStream::from_seed(seed)
+        } else {
+            ChoiceStream::pct(seed, scenario.cpus, 3)
+        };
+        let outcome = run(scenario.clone(), &mut choices);
+        assert!(outcome.passed(), "{}", outcome.report());
+        if outcome.retire_latency > worst {
+            worst = outcome.retire_latency;
+            bound = outcome.retire_bound;
+        }
+    }
+    assert!(
+        worst > 0,
+        "in {SEEDS} schedules no retire ever outlived the instant it was posted \
+         in, so I14's latency half never measured anything",
+    );
+    println!("I14: worst retire {worst} ns against a {bound} ns bound");
+}
+
 /// A `Retire` that lands inside the registration window, and the fact that the
 /// workload driver no longer has a check of its own for it.
 ///

@@ -16,11 +16,19 @@ use super::xhci;
 /// other's blocks.
 const USB_DEVICE_ID_BASE: DeviceId = 16;
 
-/// Disks the controller bound this boot, in enumeration order — which is port
-/// order, so on a machine that boots off USB the stick it booted from is
-/// normally index 0. *Normally* is not a guarantee: which device is the boot
-/// device is a question about the firmware's boot entry, not about port order,
-/// and answering it is not this driver's job.
+/// Disk numbers issued this boot, so `0..count()` names every disk this machine
+/// has bound.
+///
+/// Numbers go out in bind order, which at boot is port order — so on a machine
+/// that boots off USB the stick it booted from is normally 0. *Normally* is not
+/// a guarantee: which device is the boot device is a question about the
+/// firmware's boot entry, not about port order, and answering it is not this
+/// driver's job.
+///
+/// A number never moves and is never reissued, which is what everything above
+/// here depends on: [`open`] hands out a handle keyed on one and a mount holds
+/// that handle for its whole life. An unplugged disk leaves its number behind
+/// naming nothing, rather than passing it to whatever is plugged in next.
 pub fn count() -> usize {
     xhci::storage_count()
 }

@@ -6,7 +6,7 @@ mod msc;
 use alloc::vec::Vec;
 use core::num::NonZeroU8;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use crate::mm::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
@@ -864,6 +864,62 @@ impl Layout {
     }
 }
 
+/// One mass-storage pool block, and whatever is holding it.
+///
+/// One array and not two. "This block is spoken for" and "there is a disk
+/// behind it" were separate state, and a device refused between Configure
+/// Endpoint and READ CAPACITY sits in the gap: the block was taken, and
+/// nothing anywhere named the port it was taken for. The teardown that gives
+/// blocks back walked the disks, so a refused stick that was then *unplugged*
+/// kept its block for the life of the boot — two of those and the pool is out
+/// for good, boot stick included, on a machine whose only diagnostic channel
+/// is the `/log` it can then no longer mount.
+#[derive(Clone, Copy)]
+struct MscBlock {
+    /// The root-hub port whose device claimed this block, and `None` while it
+    /// is free. Claimed before Configure Endpoint puts the device's two bulk
+    /// endpoints into Running with their transfer rings inside this memory,
+    /// and given back only by the teardown that disabled the slot naming it.
+    port: Option<u8>,
+    /// The disk, once `bring_up` produced one. A block whose device was
+    /// refused after its endpoints were configured keeps this `None` and stays
+    /// claimed, which is the whole reason `port` is the thing that says taken.
+    disk: Option<Disk>,
+}
+
+impl MscBlock {
+    const FREE: Self = Self { port: None, disk: None };
+}
+
+/// A disk this controller brought up, and the number the machine knows it by.
+///
+/// The number lives beside the device rather than inside it because it exists
+/// exactly when the disk does: a device still being interrogated has not been
+/// given one, and a field that had to hold something in the meantime would be
+/// a sentinel.
+#[derive(Clone, Copy)]
+struct Disk {
+    index: usize,
+    dev: msc::MscDevice,
+}
+
+/// How many disks this machine has bound since it booted, and so the number
+/// the next bind hands out.
+///
+/// A counter and not a position. The number a disk is bound under is what
+/// `usb_storage::open` indexes by and what a mount holds for its whole life,
+/// so it has to be a fact about *that disk* — and a position in any list is a
+/// fact about every other disk's history instead. Summing `storage.len()`
+/// across controllers made a stick plugged into the T14's Thunderbolt xHC
+/// renumber the PCH's boot stick underneath the mount holding it: `/log`
+/// appended into the middle of the new drive and `/boot` served its bytes as
+/// the ESP's.
+///
+/// Never reused, for the reason the numbers are stable at all: a replugged
+/// stick that took its predecessor's number would be read through the handle
+/// the predecessor's mount is still holding.
+static DISKS_BOUND: AtomicUsize = AtomicUsize::new(0);
+
 fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, w_length: u16) -> u64 {
     (bm_request_type as u64)
         | ((b_request as u64) << 8)
@@ -905,12 +961,6 @@ pub struct XhciController {
     /// rings and both their slot 1 device contexts at the same address.
     pool: DmaPool,
 
-    /// The machine-wide number of this controller's first disk. Blocks in the
-    /// pool are indexed per controller and everything above `storage_read` is
-    /// indexed per machine, so this is what keeps a log line from calling two
-    /// different disks "disk 0".
-    disk_base: usize,
-
     cmd_ring: TrbRing,
 
     event_ring: *const Trb,
@@ -919,32 +969,23 @@ pub struct XhciController {
 
     devices: Vec<HidDevice>,
 
-    /// The machine's disks, by the index everything above `storage_read` holds
-    /// — so an unplugged disk leaves a `None` behind rather than shifting every
-    /// disk after it onto somebody else's blocks. A `FatDevice` holds its
-    /// `UsbBlockDevice` for the life of the mount and that handle is an index.
-    storage: Vec<Option<msc::MscDevice>>,
-
-    /// Which mass-storage pool blocks are spoken for, and deliberately not
-    /// `storage.len()`.
+    /// This controller's mass-storage pool blocks and their disks.
     ///
-    /// `bind` issues Configure Endpoint — which puts the device's two bulk
-    /// endpoints into the Running state with their transfer rings inside this
-    /// block — and only *then* asks the disk what it is. A disk refused after
-    /// that point never joins `storage`, so keying off `storage.len()` handed
-    /// the next disk a block whose memory a live endpoint context still names,
-    /// with whatever transfer `wait_transfer` abandoned on its 2 s deadline
-    /// still outstanding on it. That completion lands in the next disk's
-    /// `MSC_SCRATCH`, which is where READ CAPACITY's block size and last LBA
-    /// arrive.
+    /// A block is claimed before Configure Endpoint — which puts the device's
+    /// two bulk endpoints into the Running state with their transfer rings
+    /// inside it — and only *then* is the disk asked what it is. Keying the
+    /// block off a count of *bound* disks handed the next disk a block whose
+    /// memory a live endpoint context still named, with whatever transfer
+    /// `wait_transfer` abandoned on its 2 s deadline still outstanding on it;
+    /// that completion lands in the next disk's `MSC_SCRATCH`, which is where
+    /// READ CAPACITY's block size and last LBA arrive.
     ///
-    /// So a *refused* disk never gives its block back. An **unplugged** one
-    /// does, and the difference is not a policy: `teardown_port` disables the
-    /// slot first, and a disabled slot is one whose endpoint contexts no longer
-    /// name that memory and whose outstanding TRBs the controller has already
-    /// abandoned. Without the release two plug cycles exhaust a pool that holds
-    /// [`MSC_BLOCKS`].
-    msc_taken: [bool; MSC_BLOCKS],
+    /// So a *refused* disk keeps its block for as long as it is on the bus.
+    /// **Unplugging is what gives one back**, whether or not it ever became a
+    /// disk, and only after `teardown_port` has disabled the slot: a disabled
+    /// slot is one whose endpoint contexts no longer name that memory and whose
+    /// outstanding TRBs the controller has already abandoned.
+    msc: [MscBlock; MSC_BLOCKS],
 
     /// This controller's root-hub ports, one entry per port register. Sized
     /// from HCSPARAMS1 rather than fixed: `max_ports` is a byte, and a fixed
@@ -1044,33 +1085,24 @@ impl XhciController {
         mask
     }
 
-    /// Take a free mass-storage pool block.
+    /// Take a free mass-storage pool block for the device on `port_idx`, as
+    /// its index in [`Self::msc`] and its byte offset in the pool.
     ///
     /// The only way to obtain one, so there is no path that gets a block
-    /// without marking it taken — which is the property [`Self::msc_taken`]
+    /// without recording who holds it — which is the property [`Self::msc`]
     /// exists for, and the one `ctrl.layout.msc(ctrl.storage.len())` did not
     /// have. `None` when the pool is out; nothing is spent then, because
     /// nothing was handed out.
-    fn claim_msc_block(&mut self) -> Option<usize> {
-        let index = self.msc_taken.iter().position(|taken| !taken)?;
-        self.msc_taken[index] = true;
-        Some(self.layout.msc(index))
+    fn claim_msc_block(&mut self, port_idx: u8) -> Option<(usize, usize)> {
+        let index = self.msc.iter().position(|block| block.port.is_none())?;
+        self.msc[index].port = Some(port_idx);
+        Some((index, self.layout.msc(index)))
     }
 
     /// How many blocks are spoken for, for the line that refuses the disk the
     /// pool has no room for.
     fn msc_blocks_taken(&self) -> usize {
-        self.msc_taken.iter().filter(|taken| **taken).count()
-    }
-
-    /// Give a block back, which is legal only once the slot whose endpoint
-    /// contexts named it has been disabled — see [`Self::msc_taken`].
-    fn release_msc_block(&mut self, block: usize) {
-        let index = (block - self.layout.msc_base) / MSC_STRIDE;
-        assert!(
-            core::mem::replace(&mut self.msc_taken[index], false),
-            "xHCI: mass-storage block {block:#x} released twice"
-        );
+        self.msc.iter().filter(|block| block.port.is_some()).count()
     }
 
     fn submit_command(&mut self, trb: Trb) {
@@ -1515,27 +1547,32 @@ impl XhciController {
                 ),
             }
         }
-        for index in 0..self.storage.len() {
-            let Some(disk) = self.storage[index] else { continue };
-            if disk.port_idx != port_idx {
-                continue;
-            }
-            // The entry stays and the disk does not: everything above here
-            // holds this index — a mount holds it for its whole life — so
-            // removing it would serve the next disk's blocks under this one's
-            // number. What it becomes is a disk that is not there, which every
-            // caller already has an answer for.
-            self.storage[index] = None;
-            self.release_msc_block(disk.block());
-            log!("usb-storage: disk {} unplugged from port {}; it is offline",
-                self.disk_base + index, port_idx + 1);
-        }
-
         let port = &mut self.ports[port_idx as usize];
         port.attached = false;
         port.work = PortWork::Settled;
         if let Some(slot) = port.slot.take() {
             self.disable_slot(slot.get());
+        }
+
+        // **Last**, and after the slot and not before it: while the slot lives,
+        // its endpoint contexts still name this memory. Every block this port
+        // claimed and not only the ones a disk came out of — `bind` claims
+        // before Configure Endpoint, so a device refused after that point holds
+        // one with no disk behind it, and the pool holds [`MSC_BLOCKS`] of them.
+        for at in 0..MSC_BLOCKS {
+            if self.msc[at].port != Some(port_idx) {
+                continue;
+            }
+            // The disk goes and its number does not come back: everything above
+            // here holds that number — a mount holds it for its whole life —
+            // and what it now names is a disk that is not there, which every
+            // caller already has an answer for.
+            match core::mem::replace(&mut self.msc[at], MscBlock::FREE).disk {
+                Some(disk) => log!("usb-storage: disk {} unplugged from port {}; it is offline",
+                    disk.index, port_idx + 1),
+                None => log!("usb-storage: the device this driver refused on port {} is gone; \
+                    its pool block is free again", port_idx + 1),
+            }
         }
     }
 
@@ -1842,25 +1879,28 @@ pub struct StorageGeometry {
     pub blocks: u64,
 }
 
+/// How many disk numbers this machine has issued, so every value below it
+/// names a disk that was bound at some point in this boot.
 pub fn storage_count() -> usize {
-    XHCI.lock().iter().map(|c| c.storage.len()).sum()
+    DISKS_BOUND.load(Ordering::Relaxed)
 }
 
-/// Run `f` against the machine's `index`-th disk.
+/// Run `f` against the machine's `index`-th disk, wherever it is.
 ///
-/// Disks are numbered across the whole machine, in controller order: the index
-/// the block layer holds names a device, and which controller bound it is not
-/// something anything above here should have to know. A per-controller index
-/// would make disk 0 mean two different disks on a two-controller machine.
+/// A search and not arithmetic. Which controller a disk is on and which of its
+/// pool blocks it took are both fixed for the disk's life, but neither is
+/// derivable from a number handed out machine-wide — and the number is what the
+/// block layer holds.
 fn with_disk<R>(index: usize, f: impl FnOnce(&mut XhciController, usize) -> R) -> Option<R> {
     let mut guard = XHCI.lock();
-    let mut first = 0;
     for ctrl in guard.iter_mut() {
-        let count = ctrl.storage.len();
-        if index < first + count {
-            return Some(f(ctrl, index - first));
+        if let Some(at) = ctrl
+            .msc
+            .iter()
+            .position(|block| block.disk.is_some_and(|d| d.index == index))
+        {
+            return Some(f(ctrl, at));
         }
-        first += count;
     }
     None
 }
@@ -1870,7 +1910,7 @@ fn with_disk<R>(index: usize, f: impl FnOnce(&mut XhciController, usize) -> R) -
 /// That is what stops a fresh `usb_storage::open` handing out a handle to a
 /// device that has been pulled.
 pub fn storage_geometry(index: usize) -> Option<StorageGeometry> {
-    with_disk(index, |ctrl, local| Some(ctrl.storage[local]?.geometry())).flatten()
+    with_disk(index, |ctrl, at| Some(ctrl.msc[at].disk?.dev.geometry())).flatten()
 }
 
 /// Whether the machine's `index`-th disk is still being spoken to. `Some(false)`
@@ -1878,7 +1918,18 @@ pub fn storage_geometry(index: usize) -> Option<StorageGeometry> {
 /// already holds a handle, and "it is gone" is an answer where "there is no
 /// such index" would be a lie.
 pub fn storage_online(index: usize) -> Option<bool> {
-    with_disk(index, |ctrl, local| ctrl.storage[local].is_some_and(|d| d.online()))
+    (index < storage_count()).then(|| {
+        with_disk(index, |ctrl, at| ctrl.msc[at].disk.is_some_and(|d| d.dev.online()))
+            .unwrap_or(false)
+    })
+}
+
+/// Under-deliver the next READ(10) on the disk the gate is driving. Armed by
+/// `usb_gate`, so which transfer it lands on is a known one — see
+/// [`msc::short_read`].
+#[cfg(feature = "usb-short-read")]
+pub fn arm_short_read() {
+    msc::short_read::arm();
 }
 
 /// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
@@ -1942,13 +1993,8 @@ pub fn init(devices: &[PciDevice]) {
 
     await_connect_settle(&controllers);
 
-    let mut disks = 0;
     for ctrl in controllers.iter_mut() {
-        // Disks are numbered across the machine, so this controller's first one
-        // follows everything the controllers before it bound.
-        ctrl.disk_base = disks;
         device::scan_ports(ctrl);
-        disks += ctrl.storage.len();
         if ctrl.devices.is_empty() {
             log!("xHCI: no HID devices on the controller at {:02x}:{:02x}.{}",
                 ctrl.pci.bus, ctrl.pci.dev, ctrl.pci.func);
@@ -1972,7 +2018,7 @@ pub fn init(devices: &[PciDevice]) {
     PORT_WORK_AT.store(0, Ordering::Relaxed);
     let hid: usize = controllers.iter().map(|c| c.devices.len()).sum();
     log!("xHCI: {} controller(s), {} HID device(s)", controllers.len(), hid);
-    log!("usb-storage: {} device(s)", disks);
+    log!("usb-storage: {} device(s)", storage_count());
     *XHCI.lock() = controllers;
 }
 
@@ -2188,14 +2234,12 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         context_size,
         layout,
         pool,
-        disk_base: 0,
         cmd_ring,
         event_ring: evt_ring_buf.base() as *const Trb,
         event_head: 0,
         event_phase: true,
         devices: Vec::new(),
-        storage: Vec::new(),
-        msc_taken: [false; MSC_BLOCKS],
+        msc: [MscBlock::FREE; MSC_BLOCKS],
         ports: alloc::vec![Port::EMPTY; max_ports as usize],
         ports_dirty: false,
         #[cfg(feature = "xhci-portsc-rw1c")]
