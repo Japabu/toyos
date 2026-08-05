@@ -3791,6 +3791,77 @@ against a 500 ms budget, times however many such devices are on the bus.
 `READY_BUDGET_NS` bounds the retries and `USB_TIMEOUT_NS` times what each
 costs, and the *product* is the boot-time figure. `usb-storage.md` F11.
 
+### CLOSED — three of a second USB audit's findings, and what fixing them turned up
+
+An independent audit of the mass-storage stack — a second pass over the same
+files after `specs/type-safety-audit/usb-storage.md`'s findings landed —
+produced eleven more. The three serious ones are **fixed**, each with a gate
+that was red against the code before it.
+
+- **F-A. The controller's byte count was discarded, so a lying device served
+  stale DMA as file data.** `bulk` returns the residue the xHC reports — the
+  bytes it did not move into the buffer — and `bot`'s data phase threw it away
+  with `_`, so `delivered` came from the CSW's `dCSWDataResidue` alone. Two
+  accounts of one number exist and the driver kept the untrusted one. The
+  `MSC_DATA` window is never cleared between transfers (`MSC_SCRATCH` is, which
+  is why the capacity read was protected and the bulk data path was not), so a
+  device that under-delivers a READ(10) and reports a residue of zero handed the
+  caller the previous transfer's bytes for the part that never arrived — a
+  different LBA's data under this LBA's number, with no error anywhere.
+  `Bot::Done` now carries `delivered`, the smaller of the two accounts. Gate:
+  `usb_short_read`, whose actuator is the `usb-short-read` kernel feature.
+
+- **F-B. A plug on an earlier controller renumbered every disk, and mounts hold
+  their number for life.** The machine-wide index was `storage.len()`
+  accumulated across controllers, and that vector grows on every bind including
+  hot-plug. Indices were stable against *unplug* by design and never against a
+  plug on an earlier controller. The T14 has two xHCIs — Thunderbolt at 00:0d.0
+  first, PCH at 00:14.0 second — and boots off a stick in a PCH port, so
+  plugging any USB storage into the USB-C side made the new drive disk 0 and the
+  boot stick disk 1: every later `/log` append into the middle of that drive,
+  every `/boot` read serving its bytes as the ESP's. The number now comes from
+  `DISKS_BOUND`, a machine-wide counter, and lives beside the disk rather than
+  being derived from a position. `disk_base` is gone with it — the same defect's
+  second face, fixed at boot, so two disks logged under one number the moment
+  anything hot-plugged. Gate: `usb_disk_index_stable`.
+
+- **F-C. A refused disk's pool block was never returned, even after it was
+  unplugged.** `bind` claims a block before Configure Endpoint and keeps it
+  through every refusal, which is right while the device is on the bus;
+  `teardown_port` released one only for entries in the disk list, and a refused
+  disk is not in it. `MSC_BLOCKS` is 2, so one unsupported stick plugged and
+  pulled beside the boot stick left the pool with nothing for any later disk for
+  the life of the boot — on a machine whose only diagnostic channel is the
+  `/log` it can then not mount. `msc_taken` and `storage` are now one
+  `[MscBlock; MSC_BLOCKS]` keyed by the port that claimed the block. Gate: the
+  second half of `usb_refused_disk_first`.
+
+  The audit noted that `msc_taken`'s doc comment asserted the opposite in prose
+  — "a refused disk never gives its block back. An unplugged one does, and the
+  difference is not a policy" — which was false for a disk that was both.
+
+Two one-line findings from the same audit, also fixed:
+
+- **F-G.** `framed_phase` accepted only `(CC_SUCCESS, 0)`, so a status phase
+  completing with Short Packet and no residue — every byte of the CSW arrived —
+  was an error. It is `Some((CC_SUCCESS | CC_SHORT_PACKET, 0)) => Ok(())`.
+- **F-H.** `request_sense` accepted a residue of 5, which leaves ASCQ at byte 13
+  unread and reading as the zero `Scsi::unimplemented` tests for. Stated now as
+  `delivered >= 14`, which is the fact rather than its complement.
+
+**Found while fixing, not by the audit: the teardown released the pool block
+before it disabled the slot.** `teardown_port`'s own doc comment states the
+order — input source, then slot, then pool block — and says why the last step is
+only safe there: while the slot lives, its endpoint contexts still name that
+memory. The code did the block first. Nothing claims a block between those two
+statements today, so it was latent; it is now in the stated order.
+
+**Not recorded: F-D, F-F, F-I and F-K.** They are in task #145's description
+with their file and line and were not carried into the agent's prompt; writing
+them from memory would be inventing them. Whoever holds that task should paste
+them in. F-E is the EP0 recovery path, which has an entry above; F-J is the
+file-cache error channel, which is its own task.
+
 ### `BlockError` is a marker type because `SyscallError` has no I/O variant
 
 `BlockDevice`'s error is a unit struct in `kernel/src/block.rs`. None of
