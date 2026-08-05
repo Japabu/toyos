@@ -123,6 +123,10 @@ const RUST_SKIP: &[&str] = &[
     // printed four hundred lines to a console nothing was reading and passed
     // on its exit code.
     "test_screen_churn",
+    // Spawns `/bin/doom`, which `tests/testcases` does not carry — doom is
+    // 4 MiB and every other test boots that config. `doom_sound_flood` runs it
+    // on `tests/doomcase`.
+    "doom_sound_flood",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -226,6 +230,12 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
     ("metal_sim_null_audio", Sched::Serial),
+    // Parallel, and this one is argued rather than assumed: not a verdict in it
+    // is a wall-clock margin. The flood's size is asserted against the audio
+    // callback's own period counter standing still, both playback checks are
+    // counted in periods, and the capture is read for amplitude and never for
+    // timing. Its own boot, its own config, and the only client its soundd has.
+    ("doom_sound_flood", Sched::Parallel),
     ("netd_connection_caps", Sched::Parallel),
     // Serial: it measures netd's 2 s handshake deadline against the host's
     // clock, and counts how many connections survived a 48 ms paced burst
@@ -361,6 +371,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("heap_ceiling_recovery", Sched::Parallel),
     ("iommu_context_absent", Sched::Parallel),
     ("iommu_empty_domain", Sched::Parallel),
+    // Two boots, one kernel build each: the probe's own, and the plain kernel
+    // on the same machine to show it stays out of an ordinary boot.
+    ("hda_probe", Sched::Parallel),
     ("serial_vocabulary", Sched::Parallel),
 ];
 
@@ -4453,11 +4466,14 @@ fn run_machine_test(
         "iommu_discovery" => common::iommu::iommu_discovery(test_config, c_bins, rust_bins),
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
+        // Body in `tests/common/hda.rs`, same reason.
+        "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
+        "doom_sound_flood" => audio::doom_sound_flood(rust_bins),
         "metal_sim_compositor" => {
             metal_sim_compositor(group_boot(held, METAL_SIM_DESKTOP, || {
                 boot_metal_sim_desktop(rust_bins)

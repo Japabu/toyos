@@ -1,12 +1,13 @@
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use rustysynth::{MidiFile, MidiFileSequencer, SoundFont, Synthesizer, SynthesizerSettings};
+
+use crate::ffi::boundary;
 
 // WAD / zone memory C interface
 extern "C" {
@@ -138,8 +139,11 @@ pub static DG_music_module: MusicModule = MusicModule {
 
 // ── SFX mixer ──
 //
-// The audio callback runs on a kernel-boosted RT thread with a ~2.9ms deadline.
-// It must never block: no locks, no allocation, no syscalls.
+// The audio callback has a ~2.9ms deadline and must never block: no locks, no
+// allocation, no syscalls. Its RT standing is lent rather than held — soundd
+// holds the band with the device claim and every wake it sends passes a window
+// along — so on a machine with no audio device the callback is an ordinary
+// thread and the deadline is met only by whatever the scheduler decides.
 
 // doomgeneric's snd_channels — the engine never allocates more.
 const NUM_SFX_CHANNELS: usize = 8;
@@ -149,77 +153,43 @@ struct CachedSound {
     samples: Vec<i16>,
 }
 
-#[derive(Clone, Copy)]
-enum SoundCmd {
-    Start {
-        channel: usize,
-        gen: u32,
-        sound: &'static CachedSound,
-        vol_left: i32,
-        vol_right: i32,
-    },
-    Stop {
-        channel: usize,
-    },
-    SetParams {
-        channel: usize,
-        vol_left: i32,
-        vol_right: i32,
-    },
-}
+// What the game thread has to say about a channel, published for the audio
+// callback to read once per period. There is no queue between them, because
+// the sound module's interface has no events in it: every call names a channel
+// and supersedes every earlier call about that channel. `start_sound` replaces
+// the channel outright, `stop_sound` silences whatever it held, and
+// `update_sound_params` overwrites a volume that was only ever the current
+// value of a state variable. So the whole of what a callback that stopped
+// consuming has to catch up on is eight records, and a record is overwritten
+// in place: the producer cannot outrun the consumer because there is nothing
+// to fill.
 
-// Doom issues at most ~16 commands per 35Hz tick while the callback drains
-// every ~2.9ms; 64 entries cannot fill unless the audio thread is dead.
-const CMD_RING_CAP: usize = 64;
-
-struct CmdRing {
-    buf: [UnsafeCell<MaybeUninit<SoundCmd>>; CMD_RING_CAP],
-    read: AtomicU32,
-    write: AtomicU32,
-}
-
-// SAFETY: SPSC — only the game thread pushes (writes slot then Release-stores
-// `write`), only the audio callback pops (Acquire-loads `write` before reading
-// the slot). A slot is never accessed by both sides at once.
-unsafe impl Sync for CmdRing {}
-
-static CMD_RING: CmdRing = CmdRing {
-    buf: [const { UnsafeCell::new(MaybeUninit::uninit()) }; CMD_RING_CAP],
-    read: AtomicU32::new(0),
-    write: AtomicU32::new(0),
-};
-
-impl CmdRing {
-    fn push(&self, cmd: SoundCmd) {
-        let w = self.write.load(Ordering::Relaxed);
-        let r = self.read.load(Ordering::Acquire);
-        assert!(
-            w.wrapping_sub(r) < CMD_RING_CAP as u32,
-            "sound command ring overflow: audio callback stalled"
-        );
-        unsafe { (*self.buf[w as usize % CMD_RING_CAP].get()).write(cmd) };
-        self.write.store(w.wrapping_add(1), Ordering::Release);
-    }
-
-    fn pop(&self) -> Option<SoundCmd> {
-        let r = self.read.load(Ordering::Relaxed);
-        if r == self.write.load(Ordering::Acquire) {
-            return None;
-        }
-        let cmd = unsafe { (*self.buf[r as usize % CMD_RING_CAP].get()).assume_init() };
-        self.read.store(r.wrapping_add(1), Ordering::Release);
-        Some(cmd)
-    }
-}
-
-// Per-channel playing state: bit 0 = playing, bits 1.. = start generation.
-// The game thread sets the bit (with a fresh generation) on start and clears it
-// on stop; the callback clears it via CAS keyed on the generation when a sound
-// finishes. The generation prevents a finish of an OLD sound — racing with a
-// new start whose command is still in the ring — from clearing the new sound's
-// playing bit.
+// Bit 0 is `playing`; the rest is the start generation, bumped by every
+// `start_sound`. The generation is what makes a start a state rather than an
+// event — a callback that has not seen this one plays the sound from the
+// beginning — and it keeps the finish of an old sound from clearing the
+// playing bit of a new one that replaced it.
 static CHANNEL_STATE: [AtomicU32; NUM_SFX_CHANNELS] =
     [const { AtomicU32::new(0) }; NUM_SFX_CHANNELS];
+
+// `vol_left | vol_right << 16`, each 0..=255. Its own word, so a volume
+// update never fails the callback's finish CAS on `CHANNEL_STATE`.
+static CHANNEL_VOLUME: [AtomicU32; NUM_SFX_CHANNELS] =
+    [const { AtomicU32::new(0) }; NUM_SFX_CHANNELS];
+
+// The sound the current generation names, published before the generation is.
+static CHANNEL_SOUND: [AtomicPtr<CachedSound>; NUM_SFX_CHANNELS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_SFX_CHANNELS];
+
+/// Periods the callback has mixed: the consumer's own progress, and the only
+/// clock a producer's rate means anything against.
+static MIXED_PERIODS: AtomicU32 = AtomicU32::new(0);
+
+fn pack_volume(vol: i32, sep: i32) -> u32 {
+    let left = ((254 - sep) * vol / 127).clamp(0, 255) as u32;
+    let right = (sep * vol / 127).clamp(0, 255) as u32;
+    left | right << 16
+}
 
 struct Channel {
     sound: Option<&'static CachedSound>,
@@ -246,21 +216,34 @@ impl Mixer {
         }
     }
 
-    fn apply_commands(&mut self) {
-        while let Some(cmd) = CMD_RING.pop() {
-            match cmd {
-                SoundCmd::Start { channel, gen, sound, vol_left, vol_right } => {
-                    self.channels[channel] = Channel { sound: Some(sound), pos: 0, gen, vol_left, vol_right };
-                }
-                SoundCmd::Stop { channel } => {
-                    self.channels[channel].sound = None;
-                }
-                SoundCmd::SetParams { channel, vol_left, vol_right } => {
-                    let c = &mut self.channels[channel];
-                    c.vol_left = vol_left;
-                    c.vol_right = vol_right;
-                }
+    fn sync_channels(&mut self) {
+        for (i, ch) in self.channels.iter_mut().enumerate() {
+            let state = CHANNEL_STATE[i].load(Ordering::Acquire);
+            if state & 1 == 0 {
+                ch.sound = None;
+                continue;
             }
+            let gen = state >> 1;
+            if gen != ch.gen {
+                let sound = CHANNEL_SOUND[i].load(Ordering::Acquire);
+                if CHANNEL_STATE[i].load(Ordering::Acquire) != state {
+                    // A start landed inside this read, so the pointer belongs
+                    // to a generation this one does not name. Take the record
+                    // whole next period instead — a sound started twice from
+                    // the beginning is 2.9 ms of its onset played twice.
+                    continue;
+                }
+                // SAFETY: `toyos_start_sound` publishes the pointer before the
+                // generation that names it, and the re-read above establishes
+                // that this pointer is the one that generation published. A
+                // `CachedSound` is leaked at cache time and never freed.
+                ch.sound = Some(unsafe { &*sound });
+                ch.pos = 0;
+                ch.gen = gen;
+            }
+            let volume = CHANNEL_VOLUME[i].load(Ordering::Relaxed);
+            ch.vol_left = (volume & 0xffff) as i32;
+            ch.vol_right = (volume >> 16) as i32;
         }
     }
 
@@ -365,78 +348,104 @@ unsafe fn cache_sfx(sfxinfo: *mut SfxInfo) -> Option<&'static CachedSound> {
 }
 
 unsafe extern "C" fn toyos_init_sound(use_sfx_prefix: bool) -> bool {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    boundary("I_InitSound", false, || {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-    SND_USE_SFX_PREFIX.store(use_sfx_prefix, Ordering::Relaxed);
+        SND_USE_SFX_PREFIX.store(use_sfx_prefix, Ordering::Relaxed);
 
-    let mut mixer = Mixer::new();
+        let mut mixer = Mixer::new();
 
-    let host = cpal::default_host();
-    let device = host.default_output_device().expect("no audio output device");
-    let config = device.default_output_config().expect("no audio config");
-    let stream = device
-        .build_output_stream(
+        let host = cpal::default_host();
+        let Some(device) = host.default_output_device() else {
+            eprintln!("[doom-sound] no audio output device; playing silent");
+            return false;
+        };
+        let config = match device.default_output_config() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("[doom-sound] no audio config: {e}; playing silent");
+                return false;
+            }
+        };
+        let stream = match device.build_output_stream(
             config.into(),
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                mixer.apply_commands();
+                mixer.sync_channels();
                 mixer.fill(data);
+                MIXED_PERIODS.fetch_add(1, Ordering::Relaxed);
             },
             |err| {
                 eprintln!("[doom-sound] audio stream error: {err}");
-                // The audio thread exits after this callback, so nothing
-                // drains CMD_RING anymore — stop the producers, or their
-                // pushes trip the ring's overflow assert and abort the game.
+                // The audio thread exits after this callback, so nothing will
+                // clear a channel's playing bit again. Without this the engine
+                // holds every channel it ever started and stops asking for new
+                // ones; with it, `sound_is_playing` answers false and the
+                // channels come back.
                 SND_INITIALIZED.store(false, Ordering::Relaxed);
             },
             None,
-        )
-        .expect("failed to build audio stream");
-    stream.play().expect("failed to start audio stream");
-    *AUDIO_STREAM.lock().unwrap() = Some(stream);
+        ) {
+            Ok(stream) => stream,
+            Err(e) => {
+                eprintln!("[doom-sound] failed to build audio stream: {e}; playing silent");
+                return false;
+            }
+        };
+        if let Err(e) = stream.play() {
+            eprintln!("[doom-sound] failed to start audio stream: {e}; playing silent");
+            return false;
+        }
+        *AUDIO_STREAM.lock().unwrap() = Some(stream);
 
-    SND_INITIALIZED.store(true, Ordering::Relaxed);
-    true
+        SND_INITIALIZED.store(true, Ordering::Relaxed);
+        true
+    })
 }
 
 unsafe extern "C" fn toyos_shutdown_sound() {
-    SND_INITIALIZED.store(false, Ordering::Relaxed);
-    drop(AUDIO_STREAM.lock().unwrap().take());
+    boundary("I_ShutdownSound", (), || {
+        SND_INITIALIZED.store(false, Ordering::Relaxed);
+        drop(AUDIO_STREAM.lock().unwrap().take());
+    })
 }
 
 unsafe extern "C" fn toyos_get_sfx_lump_num(sfx: *mut SfxInfo) -> i32 {
-    let sfx = if (*sfx).link.is_null() { sfx } else { (*sfx).link };
-    let mut namebuf = [0u8; 10];
+    boundary("I_GetSfxLumpNum", -1, || {
+        let sfx = if (*sfx).link.is_null() { sfx } else { (*sfx).link };
+        let mut namebuf = [0u8; 10];
 
-    if SND_USE_SFX_PREFIX.load(Ordering::Relaxed) {
-        namebuf[0] = b'd';
-        namebuf[1] = b's';
-        let mut i = 0;
-        while i < 7 && (*sfx).name[i] != 0 {
-            namebuf[i + 2] = (*sfx).name[i];
-            i += 1;
+        if SND_USE_SFX_PREFIX.load(Ordering::Relaxed) {
+            namebuf[0] = b'd';
+            namebuf[1] = b's';
+            let mut i = 0;
+            while i < 7 && (*sfx).name[i] != 0 {
+                namebuf[i + 2] = (*sfx).name[i];
+                i += 1;
+            }
+        } else {
+            let mut i = 0;
+            while i < 9 && (*sfx).name[i] != 0 {
+                namebuf[i] = (*sfx).name[i];
+                i += 1;
+            }
         }
-    } else {
-        let mut i = 0;
-        while i < 9 && (*sfx).name[i] != 0 {
-            namebuf[i] = (*sfx).name[i];
-            i += 1;
-        }
-    }
 
-    W_GetNumForName(namebuf.as_ptr())
+        W_GetNumForName(namebuf.as_ptr())
+    })
 }
 
 unsafe extern "C" fn toyos_update_sound() {}
 
 unsafe extern "C" fn toyos_update_sound_params(handle: i32, vol: i32, sep: i32) {
-    if !SND_INITIALIZED.load(Ordering::Relaxed) || handle < 0 || handle >= NUM_SFX_CHANNELS as i32 {
-        return;
-    }
-    CMD_RING.push(SoundCmd::SetParams {
-        channel: handle as usize,
-        vol_left: ((254 - sep) * vol / 127).clamp(0, 255),
-        vol_right: (sep * vol / 127).clamp(0, 255),
-    });
+    boundary("I_UpdateSoundParams", (), || {
+        if !SND_INITIALIZED.load(Ordering::Relaxed)
+            || handle < 0
+            || handle >= NUM_SFX_CHANNELS as i32
+        {
+            return;
+        }
+        CHANNEL_VOLUME[handle as usize].store(pack_volume(vol, sep), Ordering::Relaxed);
+    })
 }
 
 unsafe extern "C" fn toyos_start_sound(
@@ -445,43 +454,53 @@ unsafe extern "C" fn toyos_start_sound(
     vol: i32,
     sep: i32,
 ) -> i32 {
-    if !SND_INITIALIZED.load(Ordering::Relaxed) || channel < 0 || channel >= NUM_SFX_CHANNELS as i32 {
-        return -1;
-    }
+    boundary("I_StartSound", -1, || {
+        if !SND_INITIALIZED.load(Ordering::Relaxed)
+            || channel < 0
+            || channel >= NUM_SFX_CHANNELS as i32
+        {
+            return -1;
+        }
 
-    let Some(sound) = cache_sfx(sfxinfo) else {
-        return -1;
-    };
+        let Some(sound) = cache_sfx(sfxinfo) else {
+            return -1;
+        };
 
-    let ch = channel as usize;
-    let state = &CHANNEL_STATE[ch];
-    let gen = (state.load(Ordering::Relaxed) >> 1).wrapping_add(1);
-    state.store(gen << 1 | 1, Ordering::Relaxed);
-    CMD_RING.push(SoundCmd::Start {
-        channel: ch,
-        gen,
-        sound,
-        vol_left: ((254 - sep) * vol / 127).clamp(0, 255),
-        vol_right: (sep * vol / 127).clamp(0, 255),
-    });
+        let ch = channel as usize;
+        CHANNEL_SOUND[ch].store(sound as *const CachedSound as *mut CachedSound, Ordering::Relaxed);
+        CHANNEL_VOLUME[ch].store(pack_volume(vol, sep), Ordering::Relaxed);
+        // Release: the callback reads the pointer and the volume only after an
+        // Acquire load of this word tells it the generation changed.
+        let state = &CHANNEL_STATE[ch];
+        let gen = (state.load(Ordering::Relaxed) >> 1).wrapping_add(1);
+        state.store(gen << 1 | 1, Ordering::Release);
 
-    channel
+        channel
+    })
 }
 
 unsafe extern "C" fn toyos_stop_sound(handle: i32) {
-    if !SND_INITIALIZED.load(Ordering::Relaxed) || handle < 0 || handle >= NUM_SFX_CHANNELS as i32 {
-        return;
-    }
-    let state = &CHANNEL_STATE[handle as usize];
-    state.store(state.load(Ordering::Relaxed) & !1, Ordering::Relaxed);
-    CMD_RING.push(SoundCmd::Stop { channel: handle as usize });
+    boundary("I_StopSound", (), || {
+        if !SND_INITIALIZED.load(Ordering::Relaxed)
+            || handle < 0
+            || handle >= NUM_SFX_CHANNELS as i32
+        {
+            return;
+        }
+        CHANNEL_STATE[handle as usize].fetch_and(!1, Ordering::Relaxed);
+    })
 }
 
 unsafe extern "C" fn toyos_sound_is_playing(handle: i32) -> bool {
-    if !SND_INITIALIZED.load(Ordering::Relaxed) || handle < 0 || handle >= NUM_SFX_CHANNELS as i32 {
-        return false;
-    }
-    CHANNEL_STATE[handle as usize].load(Ordering::Relaxed) & 1 != 0
+    boundary("I_SoundIsPlaying", false, || {
+        if !SND_INITIALIZED.load(Ordering::Relaxed)
+            || handle < 0
+            || handle >= NUM_SFX_CHANNELS as i32
+        {
+            return false;
+        }
+        CHANNEL_STATE[handle as usize].load(Ordering::Relaxed) & 1 != 0
+    })
 }
 
 // ── Music ──
@@ -727,128 +746,378 @@ fn music_thread(ring: Arc<MusicRing>, rx: mpsc::Receiver<MusicCmd>, sf: Arc<Soun
 }
 
 unsafe extern "C" fn toyos_music_init() -> bool {
-    let sf2 = std::fs::read(SOUNDFONT_PATH)
-        .unwrap_or_else(|e| panic!("failed to read {SOUNDFONT_PATH}: {e}"));
-    let sf = Arc::new(
-        SoundFont::new(&mut std::io::Cursor::new(sf2))
-            .unwrap_or_else(|e| panic!("failed to parse {SOUNDFONT_PATH}: {e:?}")),
-    );
+    boundary("I_InitMusic", false, || {
+        let sf2 = match std::fs::read(SOUNDFONT_PATH) {
+            Ok(sf2) => sf2,
+            Err(e) => {
+                eprintln!("[doom-sound] {SOUNDFONT_PATH}: {e}; playing without music");
+                return false;
+            }
+        };
+        let sf = match SoundFont::new(&mut std::io::Cursor::new(sf2)) {
+            Ok(sf) => Arc::new(sf),
+            Err(e) => {
+                eprintln!("[doom-sound] {SOUNDFONT_PATH}: {e:?}; playing without music");
+                return false;
+            }
+        };
 
-    let ring = Arc::new(MusicRing::new());
-    MUSIC_RING.set(ring.clone()).unwrap_or_else(|_| panic!("music initialized twice"));
+        let ring = Arc::new(MusicRing::new());
+        MUSIC_RING.set(ring.clone()).unwrap_or_else(|_| panic!("music initialized twice"));
 
-    let (tx, rx) = mpsc::channel();
-    *MUSIC_TX.lock().unwrap() = Some(tx);
+        let (tx, rx) = mpsc::channel();
+        *MUSIC_TX.lock().unwrap() = Some(tx);
 
-    let handle = std::thread::Builder::new()
-        .name("midi-synth".into())
-        .spawn(move || music_thread(ring, rx, sf))
-        .expect("failed to spawn music thread");
-    *MUSIC_THREAD.lock().unwrap() = Some(handle);
+        let handle = match std::thread::Builder::new()
+            .name("midi-synth".into())
+            .spawn(move || music_thread(ring, rx, sf))
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                eprintln!("[doom-sound] failed to spawn music thread: {e}; playing without music");
+                *MUSIC_TX.lock().unwrap() = None;
+                return false;
+            }
+        };
+        *MUSIC_THREAD.lock().unwrap() = Some(handle);
 
-    true
+        true
+    })
 }
 
 unsafe extern "C" fn toyos_music_shutdown() {
-    // Dropping the sender disconnects the channel; the thread exits on Disconnected.
-    drop(MUSIC_TX.lock().unwrap().take());
-    if let Some(handle) = MUSIC_THREAD.lock().unwrap().take() {
-        handle.join().expect("music thread panicked");
-    }
-    if let Some(ring) = MUSIC_RING.get() {
-        ring.playing.store(false, Ordering::Relaxed);
-    }
+    boundary("I_ShutdownMusic", (), || {
+        // Dropping the sender disconnects the channel; the thread exits on Disconnected.
+        drop(MUSIC_TX.lock().unwrap().take());
+        if let Some(handle) = MUSIC_THREAD.lock().unwrap().take() {
+            if handle.join().is_err() {
+                eprintln!("[doom-sound] music thread panicked");
+            }
+        }
+        if let Some(ring) = MUSIC_RING.get() {
+            ring.playing.store(false, Ordering::Relaxed);
+        }
+    })
 }
 
 unsafe extern "C" fn toyos_set_music_volume(volume: i32) {
-    // DOOM music volume is 0–15
-    let vol = volume.clamp(0, 15) as u32 * 256 / 15;
-    if let Some(ring) = MUSIC_RING.get() {
-        ring.volume.store(vol, Ordering::Relaxed);
-    }
+    boundary("I_SetMusicVolume", (), || {
+        // DOOM music volume is 0–15
+        let vol = volume.clamp(0, 15) as u32 * 256 / 15;
+        if let Some(ring) = MUSIC_RING.get() {
+            ring.volume.store(vol, Ordering::Relaxed);
+        }
+    })
 }
 
 unsafe extern "C" fn toyos_pause_music() {
-    if let Some(ring) = MUSIC_RING.get() {
-        ring.paused.store(true, Ordering::Relaxed);
-    }
+    boundary("I_PauseSong", (), || {
+        if let Some(ring) = MUSIC_RING.get() {
+            ring.paused.store(true, Ordering::Relaxed);
+        }
+    })
 }
 
 unsafe extern "C" fn toyos_resume_music() {
-    if let Some(ring) = MUSIC_RING.get() {
-        ring.paused.store(false, Ordering::Relaxed);
-    }
+    boundary("I_ResumeSong", (), || {
+        if let Some(ring) = MUSIC_RING.get() {
+            ring.paused.store(false, Ordering::Relaxed);
+        }
+    })
 }
 
 unsafe extern "C" fn toyos_register_song(data: *mut c_void, len: i32) -> *mut c_void {
-    if data.is_null() || len < 4 {
-        return core::ptr::null_mut();
-    }
-
-    let raw = core::slice::from_raw_parts(data as *const u8, len as usize);
-
-    // MUS format starts with "MUS\x1A", MIDI starts with "MThd"
-    let midi_data = if raw.starts_with(b"MUS\x1a") {
-        let input = mem_fopen_read(data as *const u8, len as usize);
-        let output = mem_fopen_write();
-        mus2mid(input, output);
-
-        let mut buf: *mut u8 = core::ptr::null_mut();
-        let mut buflen: usize = 0;
-        mem_get_buf(output, &mut buf, &mut buflen);
-
-        let midi = if !buf.is_null() && buflen > 0 {
-            core::slice::from_raw_parts(buf, buflen).to_vec()
-        } else {
-            mem_fclose(input);
-            mem_fclose(output);
-            return core::ptr::null_mut();
-        };
-
-        mem_fclose(input);
-        mem_fclose(output);
-        midi
-    } else {
-        raw.to_vec()
-    };
-
-    let midi_file = match MidiFile::new(&mut std::io::Cursor::new(&midi_data)) {
-        Ok(mf) => mf,
-        Err(e) => {
-            eprintln!("failed to parse MIDI: {e:?}");
+    boundary("I_RegisterSong", core::ptr::null_mut(), || {
+        if data.is_null() || len < 4 {
             return core::ptr::null_mut();
         }
-    };
 
-    Box::into_raw(Box::new(Arc::new(midi_file))) as *mut c_void
+        let raw = core::slice::from_raw_parts(data as *const u8, len as usize);
+
+        // MUS format starts with "MUS\x1A", MIDI starts with "MThd"
+        let midi_data = if raw.starts_with(b"MUS\x1a") {
+            let input = mem_fopen_read(data as *const u8, len as usize);
+            let output = mem_fopen_write();
+            mus2mid(input, output);
+
+            let mut buf: *mut u8 = core::ptr::null_mut();
+            let mut buflen: usize = 0;
+            mem_get_buf(output, &mut buf, &mut buflen);
+
+            let midi = if !buf.is_null() && buflen > 0 {
+                core::slice::from_raw_parts(buf, buflen).to_vec()
+            } else {
+                mem_fclose(input);
+                mem_fclose(output);
+                return core::ptr::null_mut();
+            };
+
+            mem_fclose(input);
+            mem_fclose(output);
+            midi
+        } else {
+            raw.to_vec()
+        };
+
+        let midi_file = match MidiFile::new(&mut std::io::Cursor::new(&midi_data)) {
+            Ok(mf) => mf,
+            Err(e) => {
+                eprintln!("failed to parse MIDI: {e:?}");
+                return core::ptr::null_mut();
+            }
+        };
+
+        Box::into_raw(Box::new(Arc::new(midi_file))) as *mut c_void
+    })
 }
 
 unsafe extern "C" fn toyos_unregister_song(handle: *mut c_void) {
-    if !handle.is_null() {
-        drop(Box::from_raw(handle as *mut Arc<MidiFile>));
-    }
+    boundary("I_UnRegisterSong", (), || {
+        if !handle.is_null() {
+            drop(Box::from_raw(handle as *mut Arc<MidiFile>));
+        }
+    })
 }
 
 unsafe extern "C" fn toyos_play_song(handle: *mut c_void, looping: bool) {
-    if handle.is_null() {
-        return;
-    }
-    let midi_file = &*(handle as *const Arc<MidiFile>);
-    if let Some(tx) = MUSIC_TX.lock().unwrap().as_ref() {
-        tx.send(MusicCmd::Play(midi_file.clone(), looping)).expect("music thread gone");
-    }
+    boundary("I_PlaySong", (), || {
+        if handle.is_null() {
+            return;
+        }
+        let midi_file = &*(handle as *const Arc<MidiFile>);
+        if let Some(tx) = MUSIC_TX.lock().unwrap().as_ref() {
+            if tx.send(MusicCmd::Play(midi_file.clone(), looping)).is_err() {
+                eprintln!("[doom-sound] music thread gone; playing without music");
+            }
+        }
+    })
 }
 
 unsafe extern "C" fn toyos_stop_song() {
-    if let Some(tx) = MUSIC_TX.lock().unwrap().as_ref() {
-        tx.send(MusicCmd::Stop).expect("music thread gone");
-    }
+    boundary("I_StopSong", (), || {
+        if let Some(tx) = MUSIC_TX.lock().unwrap().as_ref() {
+            if tx.send(MusicCmd::Stop).is_err() {
+                eprintln!("[doom-sound] music thread gone; playing without music");
+            }
+        }
+    })
 }
 
 unsafe extern "C" fn toyos_music_is_playing() -> bool {
-    if let Some(ring) = MUSIC_RING.get() {
-        ring.playing.load(Ordering::Relaxed) && !ring.paused.load(Ordering::Relaxed)
-    } else {
-        false
+    boundary("I_MusicIsPlaying", false, || {
+        if let Some(ring) = MUSIC_RING.get() {
+            ring.playing.load(Ordering::Relaxed) && !ring.paused.load(Ordering::Relaxed)
+        } else {
+            false
+        }
+    })
+}
+
+// ── The stalled-consumer actuator ──
+
+const TONE_CHANNEL: i32 = 3;
+const PROBE_CHANNEL: i32 = 5;
+/// 0.5 s, played at full volume: the only signal this run puts on the wire.
+const TONE_FRAMES: usize = OUTPUT_RATE as usize / 2;
+/// 0.1 s, played at volume 0. Reaching its end is how the game thread observes
+/// that the callback picked a command up, without adding a second signal region
+/// to a capture that must contain exactly one.
+const PROBE_FRAMES: usize = OUTPUT_RATE as usize / 10;
+const TONE_HZ: f64 = 440.0;
+/// Loud enough that the capture cannot mistake it for the dither floor, with
+/// headroom left so soundd's mix cannot clip.
+const TONE_AMPLITUDE: f64 = 16000.0;
+/// Sixty-four times the capacity of the ring this replaced, so a tree that
+/// still has the ring aborts here rather than merely getting close.
+const BURST: u32 = 4096;
+const FULL_VOLUME: i32 = 127;
+/// The volume every superseded update carries. Far enough below `FULL_VOLUME`
+/// that the capture separates them: at `TONE_AMPLITUDE` this mixes to 251 LSB
+/// and full volume to 7968, so a capture in which any update but the last one
+/// won has no signal in it at all.
+const QUIET_VOLUME: i32 = 4;
+/// Centred: `pack_volume` gives both channels `vol` at this separation.
+const CENTRE: i32 = 127;
+
+fn sine(frames: usize, amplitude: f64) -> &'static CachedSound {
+    let samples = (0..frames)
+        .map(|i| {
+            let phase = 2.0 * std::f64::consts::PI * TONE_HZ * i as f64 / OUTPUT_RATE as f64;
+            (amplitude * phase.sin()) as i16
+        })
+        .collect();
+    Box::leak(Box::new(CachedSound { samples }))
+}
+
+/// A synthetic sound with no WAD behind it: `cache_sfx` hands `driver_data`
+/// straight back when it is already set.
+fn synthetic_sfx(sound: &'static CachedSound) -> SfxInfo {
+    SfxInfo {
+        tagname: core::ptr::null_mut(),
+        name: [0; 9],
+        priority: 0,
+        link: core::ptr::null_mut(),
+        pitch: 0,
+        volume: 0,
+        usefulness: 0,
+        lumpnum: -1,
+        numchannels: 0,
+        driver_data: sound as *const CachedSound as *mut c_void,
     }
+}
+
+/// Blocks until `channel` stops playing, and answers how many periods the
+/// callback mixed in the meantime.
+///
+/// `Err` is a callback that never picked the sound up — the failure a lost or
+/// dropped `start_sound` produces, and the reason the wait is bounded by its
+/// own iteration count as well as by periods: a callback that died stops the
+/// period clock too.
+fn periods_until_silent(channel: i32) -> Result<u32, String> {
+    let start = MIXED_PERIODS.load(Ordering::Relaxed);
+    for _ in 0..10_000 {
+        if !unsafe { toyos_sound_is_playing(channel) } {
+            return Ok(MIXED_PERIODS.load(Ordering::Relaxed).wrapping_sub(start));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Err(format!(
+        "channel {channel} never finished: {} periods mixed while it was playing",
+        MIXED_PERIODS.load(Ordering::Relaxed).wrapping_sub(start)
+    ))
+}
+
+fn churn(sfx: &mut SfxInfo, count: u32, vol: i32) {
+    for i in 0..count {
+        let channel = (i % NUM_SFX_CHANNELS as u32) as i32;
+        match i % 3 {
+            0 => {
+                unsafe { toyos_start_sound(sfx, channel, vol, (i % 255) as i32) };
+            }
+            1 => unsafe { toyos_update_sound_params(channel, vol, (i % 255) as i32) },
+            _ => unsafe { toyos_stop_sound(channel) },
+        }
+    }
+}
+
+/// Floods the sound module while the audio callback is provably not draining,
+/// then requires the callback to converge on the last thing the game said.
+///
+/// The producer is the game thread inside `S_UpdateSounds`, which nothing
+/// outside this process can drive — hence an actuator in the binary that owns
+/// it. What killed the game on the T14 was not a rate but a callback that
+/// stopped consuming, and `cpal::Stream::pause` stages that exactly: the audio
+/// thread parks on its futex, so the burst below is asserted against the
+/// callback's own period counter standing still. A wall-clock burst would
+/// instead be satisfied by any host that stopped both sides at once.
+pub fn sound_stress() -> i32 {
+    use cpal::traits::StreamTrait;
+
+    if !unsafe { toyos_init_sound(false) } {
+        eprintln!("[sound-stress] no audio output; there is no consumer to outrun");
+        return 1;
+    }
+
+    let mut tone = synthetic_sfx(sine(TONE_FRAMES, TONE_AMPLITUDE));
+    let mut probe = synthetic_sfx(sine(PROBE_FRAMES, TONE_AMPLITUDE));
+
+    let running = MIXED_PERIODS.load(Ordering::Relaxed) + 4;
+    for _ in 0..5_000 {
+        if MIXED_PERIODS.load(Ordering::Relaxed) >= running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    if MIXED_PERIODS.load(Ordering::Relaxed) < running {
+        eprintln!("[sound-stress] the audio callback never started mixing");
+        return 1;
+    }
+
+    // The stall, staged: the audio thread parks and drains nothing until it is
+    // played again.
+    {
+        let stream = AUDIO_STREAM.lock().unwrap();
+        if let Err(e) = stream.as_ref().expect("stream built").pause() {
+            eprintln!("[sound-stress] could not pause the audio callback: {e}");
+            return 1;
+        }
+    }
+
+    // Retried because the callback may still have had a period in flight when
+    // it was told to pause; the burst only means something if it is entirely
+    // inside a stretch the callback did not advance through.
+    let mut stalled_burst = 0;
+    for _ in 0..8 {
+        let before = MIXED_PERIODS.load(Ordering::Relaxed);
+        churn(&mut probe, BURST, FULL_VOLUME);
+        if MIXED_PERIODS.load(Ordering::Relaxed) == before {
+            stalled_burst = BURST;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if stalled_burst == 0 {
+        eprintln!("[sound-stress] the callback kept mixing through a paused stream");
+        return 1;
+    }
+
+    // The state every one of those calls was superseded by, still with nothing
+    // consuming: one sound on one channel, at the volume named by the last of
+    // another `BURST` of updates. The capture is the verdict on that last one —
+    // every update before it is inaudible by construction.
+    for channel in 0..NUM_SFX_CHANNELS as i32 {
+        unsafe { toyos_stop_sound(channel) };
+    }
+    unsafe { toyos_start_sound(&mut tone, TONE_CHANNEL, QUIET_VOLUME, CENTRE) };
+    for _ in 0..BURST {
+        unsafe { toyos_update_sound_params(TONE_CHANNEL, QUIET_VOLUME, CENTRE) };
+    }
+    unsafe { toyos_update_sound_params(TONE_CHANNEL, FULL_VOLUME, CENTRE) };
+
+    {
+        let stream = AUDIO_STREAM.lock().unwrap();
+        if let Err(e) = stream.as_ref().expect("stream built").play() {
+            eprintln!("[sound-stress] could not resume the audio callback: {e}");
+            return 1;
+        }
+    }
+
+    let tone_periods = match periods_until_silent(TONE_CHANNEL) {
+        Ok(periods) => periods,
+        Err(e) => {
+            eprintln!("[sound-stress] {e}");
+            return 1;
+        }
+    };
+
+    // The same flood against a callback that is running — the concurrent case,
+    // where a record is overwritten while the callback is reading it. Silent:
+    // every call is at volume 0, so nothing here reaches the capture and the
+    // tone above stays the only signal in it.
+    let concurrent_start = MIXED_PERIODS.load(Ordering::Relaxed);
+    let mut concurrent = 0u32;
+    while MIXED_PERIODS.load(Ordering::Relaxed).wrapping_sub(concurrent_start) < 32 {
+        churn(&mut probe, 256, 0);
+        concurrent += 256;
+    }
+    for channel in 0..NUM_SFX_CHANNELS as i32 {
+        unsafe { toyos_stop_sound(channel) };
+    }
+    unsafe { toyos_start_sound(&mut probe, PROBE_CHANNEL, 0, CENTRE) };
+    let probe_periods = match periods_until_silent(PROBE_CHANNEL) {
+        Ok(periods) => periods,
+        Err(e) => {
+            eprintln!("[sound-stress] {e}");
+            return 1;
+        }
+    };
+
+    unsafe { toyos_shutdown_sound() };
+
+    println!(
+        "[sound-stress] stalled_burst={stalled_burst} tone_periods={tone_periods} \
+         tone_frames={TONE_FRAMES} concurrent_cmds={concurrent} probe_periods={probe_periods} \
+         probe_frames={PROBE_FRAMES}"
+    );
+    0
 }
