@@ -401,7 +401,7 @@ fn open_stream(
     device_period_frames: u32,
     slot_count: u32,
     ramp_frames: u32,
-) -> ClientStream {
+) -> Option<ClientStream> {
     let client_period_frames = if req.sample_rate != device_sample_rate {
         ((device_period_frames as u64 * req.sample_rate as u64 + device_sample_rate as u64 - 1)
             / device_sample_rate as u64) as u32
@@ -414,8 +414,21 @@ fn open_stream(
     let client_period_bytes = client_period_frames * client_frame_size;
 
     let shm_size = AudioSlotHeader::SIZE as u32 + slot_count * client_period_bytes;
-    let shm = SharedMemory::allocate(shm_size as usize);
-    shm.grant(client_pid);
+    // The ring is this client's and no stream exists without it, so both
+    // refusals end the open rather than the daemon: a client that exited
+    // between asking and being served cannot be granted memory, and neither
+    // can one that asked while the machine had none.
+    let shm = match SharedMemory::allocate(shm_size as usize) {
+        Ok(shm) => shm,
+        Err(e) => {
+            eprintln!("soundd: no {shm_size}-byte ring for client {client_id} ({e:?})");
+            return None;
+        }
+    };
+    if shm.grant(client_pid).is_err() {
+        eprintln!("soundd: client {client_id} (pid {client_pid}) is gone; no stream opened");
+        return None;
+    }
     let shm_token = shm.token();
 
     unsafe {
@@ -474,7 +487,7 @@ fn open_stream(
     let mut gain = GainRamp::new(Gain::SILENT);
     gain.set_target(Gain::UNITY, ramp_frames);
 
-    ClientStream {
+    Some(ClientStream {
         client_id,
         slot_reader,
         signal_write_fd: pipe_fds.write,
@@ -485,7 +498,7 @@ fn open_stream(
         resampler,
         delivered: false,
         pending_removal: false,
-    }
+    })
 }
 
 /// Mix one period of `stream` into the bus. Returns false when the client's
@@ -1376,7 +1389,7 @@ fn control_thread(
                             req.sample_rate, req.channels, req.format);
                         let idx = next_idx;
                         next_idx += 1;
-                        let client = open_stream(
+                        let Some(client) = open_stream(
                             idx,
                             client_pids[i],
                             &req,
@@ -1386,7 +1399,12 @@ fn control_thread(
                             device_period_frames,
                             slot_count,
                             ramp_frames,
-                        );
+                        ) else {
+                            let _ = clients[i].conn.signal(MSG_STREAM_ERROR);
+                            dead.push(i);
+                            disconnected = true;
+                            break 'msgs;
+                        };
                         submit(cmd_ring, cmd_pipe_write, MixCommand::AddClient(Box::new(client)), period_nanos);
                         clients[i].stream_idx = Some(idx);
                     }
@@ -1489,7 +1507,8 @@ fn run_with_device(listener: toyos::Listener, audio_dev: AudioDev) {
     // at most num_buffers periods, so a full client ring always covers it.
     let slot_count = num_buffers as u32;
 
-    let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024);
+    let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024)
+        .expect("the DMA token the audio device just reported");
     let dma_base = dma_page.as_ptr();
     let mut dma_ptrs: Vec<*mut u8> = Vec::with_capacity(num_buffers);
     for i in 0..num_buffers {

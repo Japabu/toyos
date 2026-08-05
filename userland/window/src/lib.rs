@@ -63,6 +63,10 @@ pub const MSG_LAYOUT_CHANGED: u32 = 12;
 /// with an older client — [`CreateError::Refused`] carries the raw value.
 pub const REFUSED_AT_CAPACITY: u32 = 1;
 pub const REFUSED_TOO_LARGE: u32 = 2;
+/// The compositor could not get the memory for the buffer. Distinct from
+/// [`REFUSED_AT_CAPACITY`], which is the compositor's own budget saying no
+/// while the machine still has memory.
+pub const REFUSED_NO_MEMORY: u32 = 3;
 
 toyos::ipc_payload! {
     pub struct WindowRefused {
@@ -80,6 +84,8 @@ pub enum CreateError {
     AtCapacity,
     /// The requested size is bigger than the screen it would be drawn on.
     TooLarge,
+    /// The machine has no memory for a buffer this size.
+    NoMemory,
     /// Refused for a reason this build of the client does not know.
     Refused(u32),
     /// The compositor answered `MSG_CREATE_WINDOW` with a message that is
@@ -93,6 +99,7 @@ impl std::fmt::Display for CreateError {
             Self::NoCompositor => write!(f, "no compositor is running"),
             Self::AtCapacity => write!(f, "the compositor is at its window limit"),
             Self::TooLarge => write!(f, "the window is larger than the screen"),
+            Self::NoMemory => write!(f, "there is no memory for a window that size"),
             Self::Refused(reason) => write!(f, "the compositor refused (reason {reason})"),
             Self::Protocol(msg_type) => {
                 write!(f, "the compositor answered with message type {msg_type}")
@@ -108,6 +115,7 @@ impl CreateError {
         match reason {
             REFUSED_AT_CAPACITY => Self::AtCapacity,
             REFUSED_TOO_LARGE => Self::TooLarge,
+            REFUSED_NO_MEMORY => Self::NoMemory,
             other => Self::Refused(other),
         }
     }
@@ -321,8 +329,7 @@ pub fn clipboard_set(text: &str) {
     let bytes = text.as_bytes();
     if bytes.len() <= 4096 {
         let _ = conn.send_bytes(MSG_CLIPBOARD_SET, bytes);
-    } else {
-        let mut shm = SharedMemory::allocate(bytes.len());
+    } else if let Ok(mut shm) = SharedMemory::allocate(bytes.len()) {
         shm.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
         let _ = conn.send(MSG_CLIPBOARD_SET_SHM, &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 });
         *CLIPBOARD_SHM.lock().unwrap() = Some(shm);
@@ -400,7 +407,9 @@ impl Window {
             .map_err(|_| CreateError::NoCompositor)?;
 
         let buf_size = info.stride as usize * info.height as usize * 4;
-        let shm = SharedMemory::map(info.token, buf_size);
+        // A token the compositor named and did not grant is a compositor that
+        // is not serving this client, whatever else it is doing.
+        let shm = SharedMemory::map(info.token, buf_size).map_err(|_| CreateError::NoCompositor)?;
 
         let poller = Poller::new(1);
         Ok(Self {
@@ -479,7 +488,13 @@ impl Window {
                     return Event::Close;
                 };
                 let buf_size = info.stride as usize * info.height as usize * 4;
-                self.shm = SharedMemory::map(info.token, buf_size);
+                // The old buffer is already gone on the compositor's side, so
+                // a window that cannot map the new one has nothing to draw
+                // into and its session is over.
+                let Ok(shm) = SharedMemory::map(info.token, buf_size) else {
+                    return Event::Close;
+                };
+                self.shm = shm;
                 self.width = info.width;
                 self.height = info.height;
                 self.pixel_format = info.pixel_format;
@@ -496,9 +511,10 @@ impl Window {
                 let Ok(info) = self.conn.recv_payload::<ClipboardShmMsg>(header) else {
                     return Event::Close;
                 };
-                let shm = SharedMemory::map(info.token, info.len as usize);
-                let data = shm.as_slice()[..info.len as usize].to_vec();
-                Event::ClipboardPaste(data)
+                let Ok(shm) = SharedMemory::map(info.token, info.len as usize) else {
+                    return Event::ClipboardPaste(Vec::new());
+                };
+                Event::ClipboardPaste(shm.as_slice().to_vec())
             }
             MSG_WINDOW_CLOSE => Event::Close,
             MSG_FRAME => Event::Frame,
