@@ -75,7 +75,7 @@ pub const MAX_LOG_FILES: usize = 16;
 fn staged_logs() -> Vec<(String, Vec<u8>)> {
     (0..MAX_LOG_FILES)
         .map(|i| {
-            let name = format!("2019-11-{:02}-120000.log", 1 + i * 2);
+            let name = format!("2019-12-{:02}-120000.log", 1 + i * 2);
             let body = format!("staged by the host as boot {i}\n").into_bytes();
             (name, body)
         })
