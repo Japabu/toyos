@@ -7,9 +7,15 @@
 //! longer has, `SharedMemory::grant` was infallible over that, and every other
 //! window went with it. `exit: compositor code=101`.
 //!
-//! Four cases, and the first is that one. The rest are the same shape found by
-//! reading for it: places where a message from any client reached a syscall
-//! whose refusal the compositor was not prepared to hear.
+//! Five cases. The first is that one; the next three are the same shape found
+//! by reading for it — places where a message from any client reached a
+//! syscall whose refusal the compositor was not prepared to hear.
+//!
+//! The fifth is the other side of the same event, and it is the client's:
+//! **a window whose connection has gone must let its owner leave.** Nothing
+//! else here is about the client's own fate, and that is why it belongs beside
+//! them rather than in a test of its own — a window ending has two halves, and
+//! each one used to take a process with it.
 //!
 //! Each case leaves its damage standing and then asks the compositor a
 //! question **with a deadline**, exactly as `compositor_stall` does — the host
@@ -39,6 +45,16 @@ const RELAY_GO: Fd = Fd(4);
 /// process still exists.
 const PROBE_POLLS: u32 = 500;
 const PROBE_POLL_NS: u64 = 10_000_000;
+
+/// How many events a closed window is asked for.
+///
+/// Two would do — `Close`, then `None` — and this is a handful more so the
+/// failure prints a stream rather than a single wrong answer. Each poll past
+/// the close costs nothing: the fd is ready, so none of them waits.
+const POLLS_AFTER_CLOSE: usize = 8;
+/// Long enough that a compositor still on its way to closing the connection is
+/// waited for rather than raced.
+const POLL_TIMEOUT_NS: u64 = 2_000_000_000;
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -102,7 +118,37 @@ fn run() {
     clipboard_shm(token, u32::MAX, "a clipboard longer than any region");
     probe("a clipboard longer than any region");
 
-    println!("compositor client death: 4 deaths survived, compositor still serving");
+    // The other side of a window ending: the client has to be able to leave.
+    // `MSG_DESTROY_WINDOW` makes the compositor drop the connection, after
+    // which the fd is permanently read-ready at EOF — so a `poll_event` that
+    // did not latch answered `Close` for as long as anybody kept asking, and a
+    // client draining until `None` never got out. Two calls decide it.
+    let mut ending = Window::create(64, 64).expect("a window to close from the inside");
+    ipc::signal(ending.fd(), window::MSG_DESTROY_WINDOW)
+        .expect("ask the compositor to destroy this window");
+    let mut seen = Vec::new();
+    for _ in 0..POLLS_AFTER_CLOSE {
+        seen.push(ending.poll_event(POLL_TIMEOUT_NS));
+        if matches!(seen.last(), Some(None)) {
+            break;
+        }
+    }
+    if !matches!(seen.first(), Some(Some(window::Event::Close))) {
+        fail(&format!(
+            "[a window closed from the inside] the first event after the connection went was \
+             {:?}, not Close",
+            seen.first()
+        ));
+    }
+    if !matches!(seen.last(), Some(None)) {
+        fail(&format!(
+            "[a window closed from the inside] {POLLS_AFTER_CLOSE} polls after Close and every \
+             one of them answered — a client that drains until None cannot leave"
+        ));
+    }
+    probe("a window closed from the inside");
+
+    println!("compositor client death: 5 deaths survived, compositor still serving");
 }
 
 /// The creator: connect, hand the connection to a process that will outlive

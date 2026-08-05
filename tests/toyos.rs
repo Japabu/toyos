@@ -4386,7 +4386,7 @@ fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
     }
     // The guest's own case list, restated here so a case deleted on one side
     // is a red run rather than a quieter test.
-    const CASES: usize = 4;
+    const CASES: usize = 5;
     if !result
         .stdout
         .contains(&format!("compositor client death: {CASES} deaths survived"))

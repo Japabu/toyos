@@ -347,6 +347,8 @@ pub struct Window {
     /// keeps a dead key typed into one window from composing with a letter
     /// typed into another.
     translator: Translator,
+    /// Whether [`Event::Close`] has been handed out. See [`Window::poll_event`].
+    closed: bool,
 }
 
 impl Window {
@@ -420,6 +422,7 @@ impl Window {
             height: info.height,
             pixel_format: info.pixel_format,
             translator: configured_translator(),
+            closed: false,
         })
     }
 
@@ -455,15 +458,30 @@ impl Window {
         self.decode_event(&header)
     }
 
+    /// The next event, or `None` when `timeout_nanos` passes — and `None`
+    /// forever once [`Event::Close`] has been handed out.
+    ///
+    /// **`Close` is the last element of this stream, and it is delivered
+    /// exactly once.** Without the latch a closed window is an infinite source
+    /// of it: the compositor drops the connection, the fd is then permanently
+    /// read-ready at EOF, and every call returns `Some(Event::Close)` again.
+    /// A caller that drains until `None` — which is the ordinary shape, and is
+    /// what `winit`'s ToyOS backend does — never leaves that loop, so closing
+    /// the window spun the client on a core instead of ending it (snake, on
+    /// the T14, `specs/known-issues.md` §3).
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
+        if self.closed {
+            return None;
+        }
         self.poller.poll_add(&self.conn, IORING_POLL_IN, 0);
         let mut ready = false;
         self.poller.wait(1, timeout_nanos, |_| ready = true);
-        if ready {
-            Some(self.recv_event())
-        } else {
-            None
+        if !ready {
+            return None;
         }
+        let event = self.recv_event();
+        self.closed = matches!(event, Event::Close);
+        Some(event)
     }
 
     /// A message the compositor cannot have meant closes the window rather
