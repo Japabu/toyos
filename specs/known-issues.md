@@ -2608,6 +2608,29 @@ here: move `i8042_mouse` back to `Sched::Serial`, or split the verdict so the
 paced count stays parallel and the lost-edge claim runs where the host is not
 oversubscribed.
 
+**Update, 2026-08-05: the paced *count* is reachable too, so the second option
+above would not close it.** Seen on the USB mass-storage branch, whose kernel
+delta is `drivers/xhci/` plus a gate-only feature and touches no port-I/O path:
+
+```
+wide phase (253 tests, 235.5 s, other agents building):
+  FAIL i8042_mouse: 1002 pointer events reached userland out of 1004 packets
+  injected, each one paced against the arrival of the last
+re-run alone:
+  FAIL i8042_mouse: timed out after 60s — 986 of the 1004 packets injected
+  came back out, so the host stalled on one the machine never delivered
+its own retry, same process:
+  PASS i8042_mouse (552ms)
+```
+
+Two packets short in the wide phase, eighteen short alone, then green in half a
+second. The pacing argument is that a packet is sent only after the guest prints
+the one before it, so none can be sent into a guest that is not ready — and that
+holds. What it does not bound is the *last* one: the host waits for an arrival
+that never comes and the 60 s budget runs out with the count short, which is
+what the isolated run shows. So this is a delivery gap rather than an artefact
+of the wide phase, and `Sched::Serial` would not have caught it.
+
 ### Device registers still take firmware's word for being uncacheable
 
 Every `map_mmio` outside the scanout passes `CachePolicy::DeferToMtrr`, which is
