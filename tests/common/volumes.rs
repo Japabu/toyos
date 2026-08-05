@@ -163,6 +163,81 @@ fn need(got: Option<Vec<u8>>, path: &str) -> Result<Vec<u8>, String> {
     got.ok_or_else(|| format!("{path} is not on the volume"))
 }
 
+/// One directory entry, as the host's own FAT implementation reads it.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub name: String,
+    pub len: u64,
+    /// The entry's modification time in seconds from the Unix epoch, read out
+    /// of the directory entry rather than from anything the guest said about
+    /// it. FAT stores local time by specification, so this is in whatever zone
+    /// the machine that wrote it keeps.
+    pub modified: i64,
+}
+
+/// Every file in the root of a FAT volume, sorted by name.
+///
+/// The ground truth for what a guest put on a volume and what it took off one:
+/// the guest's own account of its directory is exactly what is in question when
+/// the claim is about retention.
+pub fn root_entries(volume: &[u8]) -> Result<Vec<Entry>, String> {
+    let fs = fatfs::FileSystem::new(Cursor::new(volume.to_vec()), FsOptions::new())
+        .map_err(|e| format!("the volume does not mount on the host: {e}"))?;
+    let mut entries = Vec::new();
+    for entry in fs.root_dir().iter() {
+        let entry = entry.map_err(|e| format!("reading the root directory: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let t = entry.modified();
+        entries.push(Entry {
+            name: entry.file_name(),
+            len: entry.len(),
+            modified: unix_secs(
+                t.date.year as i64,
+                t.date.month as i64,
+                t.date.day as i64,
+                t.time.hour as i64,
+                t.time.min as i64,
+                t.time.sec as i64,
+            ),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+/// Write files into the root of a FAT volume in place, before the machine that
+/// will read them exists.
+///
+/// The host-writes-guest-reads direction, which has no other staging point: a
+/// file the guest created itself would prove nothing about a guest that deletes
+/// the wrong one.
+pub fn stage_files(volume: &mut [u8], files: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let fs = fatfs::FileSystem::new(Cursor::new(volume), FsOptions::new())
+        .map_err(|e| format!("the volume does not mount on the host: {e}"))?;
+    let root = fs.root_dir();
+    for (name, bytes) in files {
+        let mut file =
+            root.create_file(name).map_err(|e| format!("creating {name} on the volume: {e}"))?;
+        file.write_all(bytes).map_err(|e| format!("writing {name}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Seconds from the Unix epoch, for comparing a directory entry against the
+/// instant the host set the guest's clock to. Hinnant's algorithm.
+fn unix_secs(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    days * 86_400 + hour * 3_600 + min * 60 + sec
+}
+
 /// Everything `fsck_msdos -n` complains about, with counts normalised away.
 ///
 /// The partition is copied out of the disk image because `fsck_msdos` wants a
@@ -524,7 +599,7 @@ pub fn kernel_log_file(
     );
     let boot = qemu.boot_log().to_string();
     serial::Serial::named("boot console", boot.as_str()).must_be_clean()?;
-    if !boot.contains("log-file: this boot's kernel log continues in") {
+    if !boot.contains("log-file: this boot's kernel log is") {
         return Err(format!("the sink never installed:\n{}", volume_lines(&boot)));
     }
 
@@ -541,8 +616,9 @@ pub fn kernel_log_file(
     let began = std::time::Instant::now();
     let mut running;
     let mut running_text;
+    let mut running_name;
     loop {
-        running = log_on_device(&image_path, start, len, "kernel.log")?;
+        (running_name, running) = newest_log(&image_path, start, len)?;
         running_text = String::from_utf8_lossy(&running).into_owned();
         if running_text.contains("Boot: complete") || std::time::Instant::now() >= deadline {
             break;
@@ -569,8 +645,8 @@ pub fn kernel_log_file(
         return Err("the guest shut down before the mid-run read".to_string());
     }
     eprintln!(
-        "  [log] {} bytes on the device {} ms after the ready marker, with the machine still \
-         running and through `Boot: complete`",
+        "  [log] {running_name}: {} bytes on the device {} ms after the ready marker, with the \
+         machine still running and through `Boot: complete`",
         running.len(),
         took.as_millis()
     );
@@ -586,7 +662,13 @@ pub fn kernel_log_file(
     }
 
     let after = std::fs::read(&image_path).map_err(|e| format!("read the image back: {e}"))?;
-    let final_log = log_on_device(&image_path, start, len, "kernel.log")?;
+    let (final_name, final_log) = newest_log(&image_path, start, len)?;
+    if final_name != running_name {
+        return Err(format!(
+            "the shutdown moved this boot's log from {running_name} to {final_name}, which at the \
+             shipped bound means it wrote a megabyte on the way down"
+        ));
+    }
     let final_text = String::from_utf8_lossy(&final_log).into_owned();
     if !final_text.contains("Shutting down.") {
         return Err(format!(
@@ -612,7 +694,8 @@ pub fn kernel_log_file(
         ));
     }
     eprintln!(
-        "  [log] {} bytes after the shutdown, carrying its last line; fsck still silent",
+        "  [log] {final_name}: {} bytes after the shutdown, carrying its last line; fsck still \
+         silent",
         final_log.len()
     );
     let _ = std::fs::remove_file(&image_path);
@@ -620,9 +703,36 @@ pub fn kernel_log_file(
     rotation(test_config, c_bins, rust_bins)
 }
 
-/// The bound. `log-rotate-fast` moves it from four megabytes to 256 bytes, which
-/// one boot's own log crosses several times over, so the rotation path runs on
-/// the shipped code.
+/// The newest of the kernel's log files on the volume, with its name.
+///
+/// `log_file` names one file per boot for the wall clock and continues a long
+/// boot in `_0002` and up, both of which sort after everything older — so the
+/// last name is this boot's most recent file. Read off the device, like
+/// everything else here.
+fn newest_log(image_path: &Path, start: usize, len: usize) -> Result<(String, Vec<u8>), String> {
+    let image = std::fs::read(image_path).map_err(|e| format!("read the image: {e}"))?;
+    if start + len > image.len() {
+        return Err(format!("the image shrank to {} bytes", image.len()));
+    }
+    let volume = &image[start..start + len];
+    let logs = log_names(volume)?;
+    let newest = logs.last().ok_or("the log volume holds no .log file at all")?;
+    let mut found = read_files(volume, &[newest.as_str()])?;
+    Ok((newest.clone(), need(found.pop().flatten(), newest)?))
+}
+
+/// Every `.log` file on the volume, in the order their names sort.
+fn log_names(volume: &[u8]) -> Result<Vec<String>, String> {
+    Ok(root_entries(volume)?
+        .into_iter()
+        .filter(|e| e.name.ends_with(".log"))
+        .map(|e| e.name)
+        .collect())
+}
+
+/// The bound. `log-rotate-fast` moves it from a megabyte to 256 bytes, which
+/// one boot's own log crosses many times over, so both the continuation path
+/// and the retention path run on the shipped code.
 fn rotation(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -651,40 +761,69 @@ fn rotation(
     log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
 
-    // At least twice, not at least once: the second rotation is the one that
-    // renames over an existing `kernel.log.1`, and FAT has no atomic
-    // replacement — so the adapter has to delete the destination first, and a
-    // single rotation would never run that half.
-    let rotations = log.matches("became /log/kernel.log.1").count();
-    if rotations < 2 {
-        return Err(format!("the log rotated {rotations} times, wanted at least two:\n{}", volume_lines(&log)));
-    }
-    let current = log_on_device(&image_path, start, len, "kernel.log")?;
-    let previous = log_on_device(&image_path, start, len, "kernel.log.1")?;
-    // The generation that filled must be at least the bound; the current one
-    // must be shorter than it, or nothing was actually moved aside.
-    if previous.len() < 256 {
-        return Err(format!("kernel.log.1 is {} bytes, under the 256-byte bound", previous.len()));
-    }
-    // The newest line is in whichever of the two the last flush landed in: a
-    // rotation can be the last thing that happens, which leaves `kernel.log`
-    // empty and the tail in `kernel.log.1`. What must not happen is the tail
-    // being in neither.
-    let tail_in = |b: &[u8]| String::from_utf8_lossy(b).contains("Shutting down.");
-    if !tail_in(&current) && !tail_in(&previous) {
+    // At least twice, not at least once. One continuation proves only that the
+    // bound is noticed; the second is the one that runs with an earlier part of
+    // the same boot already on the volume, which is what the name has to stay
+    // clear of.
+    let continuations = log.matches("and this boot continues in").count();
+    if continuations < 2 {
         return Err(format!(
-            "the shutdown's last line is in neither generation: kernel.log is {} bytes and \
-             kernel.log.1 is {}",
-            current.len(),
-            previous.len()
+            "the log continued into a new file {continuations} times, wanted at least two:\n{}",
+            volume_lines(&log)
+        ));
+    }
+
+    let image = std::fs::read(&image_path).map_err(|e| format!("read the image back: {e}"))?;
+    let entries = root_entries(&image[start..start + len])?;
+    let logs: Vec<&Entry> = entries.iter().filter(|e| e.name.ends_with(".log")).collect();
+    // Retention, inside one boot: at 256 bytes a metal-sim boot writes more
+    // parts than the bound allows, so the volume has to end up at the bound and
+    // not above it. This is the same rule that bounds a stick across boots,
+    // reached without needing to boot seventeen times.
+    if logs.len() < 2 || logs.len() > super::wallclock::MAX_LOG_FILES {
+        return Err(format!(
+            "the volume holds {} log files, wanted 2..={}: {}",
+            logs.len(),
+            super::wallclock::MAX_LOG_FILES,
+            logs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    // Every part but the newest is one that *filled*, which is the only reason
+    // a newer one exists. A part under the bound means something else started a
+    // file.
+    for entry in &logs[..logs.len() - 1] {
+        if entry.len < 256 {
+            return Err(format!(
+                "{} is {} bytes and is not the newest part, so it did not fill before the next \
+                 one started",
+                entry.name, entry.len
+            ));
+        }
+    }
+    // The last line is in whichever part the final flush landed in: a
+    // continuation can be the last thing that happens, which leaves the newest
+    // part empty and the tail in the one before it. What must not happen is the
+    // tail being in neither.
+    let names: Vec<&str> = logs.iter().rev().take(2).map(|e| e.name.as_str()).collect();
+    let tail_in = read_files(&image[start..start + len], &names)?
+        .into_iter()
+        .flatten()
+        .any(|bytes| String::from_utf8_lossy(&bytes).contains("Shutting down."));
+    if !tail_in {
+        return Err(format!(
+            "the shutdown's last line is in neither of the two newest parts ({}) of {} on the \
+             volume",
+            names.join(", "),
+            logs.len()
         ));
     }
     let _ = std::fs::remove_file(&image_path);
     eprintln!(
-        "  [log] rotated {rotations} times at the 256-byte bound: {} bytes in kernel.log.1, \
-         {} in kernel.log",
-        previous.len(),
-        current.len()
+        "  [log] continued {continuations} times at the 256-byte bound, leaving {} parts at the \
+         {}-file bound, newest {}",
+        logs.len(),
+        super::wallclock::MAX_LOG_FILES,
+        logs.last().map_or("none", |e| e.name.as_str())
     );
     Ok(())
 }
@@ -761,7 +900,7 @@ pub fn late_storage_connect(
     for want in [
         "boot-volume: partition mounted",
         "log-volume: partition mounted",
-        "log-file: this boot's kernel log continues in",
+        "log-file: this boot's kernel log is",
     ] {
         if !boot.contains(want) {
             return Err(format!(
@@ -897,7 +1036,7 @@ pub fn log_backing_read_error(
     // the stick. Appending across boots is a documented property of the sink,
     // not a contrivance for this test.
     let first = boot_once("seeding")?;
-    if !first.contains("log-file: this boot's kernel log continues in") {
+    if !first.contains("log-file: this boot's kernel log is") {
         return Err(format!("the sink never installed on the seeding boot\n{first}"));
     }
     let seeded = log_on_device(&image_path, start, len, "kernel.log")?;
@@ -907,7 +1046,7 @@ pub fn log_backing_read_error(
     }
 
     let log = boot_once("re-reading")?;
-    if !log.contains("log-file: this boot's kernel log continues in") {
+    if !log.contains("log-file: this boot's kernel log is") {
         return Err(format!("the sink never installed on the second boot\n{log}"));
     }
 
@@ -1287,7 +1426,7 @@ pub fn log_partition_identity(
     if !log.contains("log-volume: not mounted") {
         return Err(format!("the kernel mounted a log volume it was never given:\n{}", volume_lines(&log)));
     }
-    if log.contains("log-file: this boot's kernel log continues in") {
+    if log.contains("log-file: this boot's kernel log is") {
         return Err(format!(
             "the sink installed with no log partition — a fallback is exactly what this must not \
              do:\n{}",

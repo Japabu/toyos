@@ -28,3 +28,5 @@ pub mod toybox;
 pub mod usb;
 #[allow(dead_code)]
 pub mod volumes;
+#[allow(dead_code)]
+pub mod wallclock;
