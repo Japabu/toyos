@@ -40,13 +40,13 @@ impl Parser {
         }
 
         let init = if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None };
-        self.skip_asm_label();
+        self.skip_declarator_suffix();
         let mut declarators = vec![InitDeclarator { declarator, initializer: init }];
 
         while self.eat(&TokenKind::Comma) {
             let d = self.declarator();
             let init = if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None };
-            self.skip_asm_label();
+            self.skip_declarator_suffix();
             declarators.push(InitDeclarator { declarator: d, initializer: init });
         }
         self.expect(&TokenKind::Semi);
@@ -191,8 +191,8 @@ impl Parser {
                 TokenKind::Int128 => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Int128)); has_base_type = true; }
 
                 // Struct/union/enum
-                TokenKind::Struct => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Struct(self.struct_or_union_type()))); has_base_type = true; }
-                TokenKind::Union => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Union(self.struct_or_union_type()))); has_base_type = true; }
+                TokenKind::Struct => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Struct(self.struct_or_union_type("struct")))); has_base_type = true; }
+                TokenKind::Union => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Union(self.struct_or_union_type("union")))); has_base_type = true; }
                 TokenKind::Enum => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Enum(self.enum_type()))); has_base_type = true; }
 
                 // Typeof
@@ -213,6 +213,8 @@ impl Parser {
 
                 // __extension__
                 TokenKind::Extension => { self.advance(); }
+
+                TokenKind::Attribute => self.discard_attributes("a declaration specifier"),
 
                 // Typedef name — only if no base type has been established yet.
                 // Once a base type is known, this identifier must be a declarator name.
@@ -237,7 +239,8 @@ impl Parser {
         specs
     }
 
-    fn struct_or_union_type(&mut self) -> StructType {
+    fn struct_or_union_type(&mut self, keyword: &str) -> StructType {
+        let leading = self.type_attributes();
         let name = if let TokenKind::Ident(s) = self.peek() {
             let s = s.clone();
             self.advance();
@@ -283,10 +286,24 @@ impl Parser {
             None
         };
 
-        StructType { name, fields }
+        let attrs = match &fields {
+            Some(_) => leading.merge(self.type_attributes()),
+            None => {
+                assert!(
+                    leading.is_empty(),
+                    "{}: a layout attribute belongs on the definition of `{keyword} {}`, not on a use of it",
+                    self.loc(),
+                    name.as_deref().unwrap_or("<anonymous>"),
+                );
+                leading
+            }
+        };
+
+        StructType { name, fields, attrs }
     }
 
     fn enum_type(&mut self) -> EnumType {
+        self.discard_attributes("an enum");
         let name = if let TokenKind::Ident(s) = self.peek() {
             let s = s.clone();
             self.advance();
@@ -316,6 +333,7 @@ impl Parser {
                 if !self.eat(&TokenKind::Comma) { break; }
             }
             self.expect(&TokenKind::RBrace);
+            self.discard_attributes("an enum");
             Some(variants)
         } else {
             None
@@ -324,7 +342,7 @@ impl Parser {
         EnumType { name, variants }
     }
 
-    fn skip_balanced_parens(&mut self) {
+    pub(super) fn skip_balanced_parens(&mut self) {
         assert_eq!(self.peek(), &TokenKind::LParen);
         self.advance();
         let mut depth = 1u32;
@@ -337,15 +355,24 @@ impl Parser {
         }
     }
 
-    pub(super) fn skip_asm_label(&mut self) {
-        if matches!(self.peek(), TokenKind::Asm) {
-            self.advance();
-            self.skip_balanced_parens();
+    /// `asm("name")` and `__attribute__((...))` may follow a declarator in
+    /// either order and repeat.
+    pub(super) fn skip_declarator_suffix(&mut self) {
+        loop {
+            match self.peek() {
+                TokenKind::Asm => {
+                    self.advance();
+                    self.skip_balanced_parens();
+                }
+                TokenKind::Attribute => self.discard_attributes("a declarator"),
+                _ => break,
+            }
         }
     }
 
     fn parse_pointer(&mut self) -> Vec<Pointer> {
         let mut pointer = Vec::new();
+        self.discard_attributes("a declarator");
         while self.peek() == &TokenKind::Star {
             self.advance();
             let mut quals = Vec::new();
@@ -354,6 +381,7 @@ impl Parser {
                     TokenKind::Const => { self.advance(); quals.push(TypeQual::Const); }
                     TokenKind::Volatile => { self.advance(); quals.push(TypeQual::Volatile); }
                     TokenKind::Restrict => { self.advance(); quals.push(TypeQual::Restrict); }
+                    TokenKind::Attribute => self.discard_attributes("a pointer"),
                     _ => break,
                 }
             }
@@ -416,14 +444,14 @@ impl Parser {
             }
         }
 
-        self.skip_asm_label();
+        self.skip_declarator_suffix();
 
         dd
     }
 
     fn is_declarator_start_after_paren(&self) -> bool {
         match self.peek2() {
-            TokenKind::Star | TokenKind::LParen => true,
+            TokenKind::Star | TokenKind::LParen | TokenKind::Attribute => true,
             TokenKind::Ident(name) => !self.type_env.is_typedef(name) && !self.is_type_keyword(self.peek2()),
             _ => false,
         }
@@ -536,7 +564,7 @@ impl Parser {
     }
 
     fn is_abstract_paren(&self) -> bool {
-        matches!(self.peek2(), TokenKind::Star | TokenKind::LBracket)
+        matches!(self.peek2(), TokenKind::Star | TokenKind::LBracket | TokenKind::Attribute)
     }
 
     fn is_param_list_start(&self) -> bool {

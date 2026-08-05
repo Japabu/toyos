@@ -90,6 +90,7 @@ pub enum TypeSpec {
 pub struct StructType {
     pub name: Option<String>,
     pub fields: Option<Vec<StructField>>,
+    pub attrs: crate::parse::TypeAttrs,
 }
 
 #[derive(Debug, Clone)]

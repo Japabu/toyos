@@ -1,0 +1,16 @@
+# doom beside soundd, and nothing else that makes noise.
+#
+# `doom_sound_flood` drives `/bin/doom --sound-stress`, whose producer is the
+# game's own sound module — the only thing that can reach it is the binary that
+# owns it, so the binary has to be in the image. It is in this config rather
+# than in `tests/testcases` because doom is 4 MiB and every other test boots
+# that one.
+#
+# No `assets`: the actuator synthesises its own sound and never opens the WAD
+# or the soundfont, so neither belongs in this initrd either.
+init = ["/bin/soundd", "/bin/test-runner"]
+
+[programs]
+soundd = {}
+test-runner = {}
+doom = {}
