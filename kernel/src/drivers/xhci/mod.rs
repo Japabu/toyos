@@ -1574,7 +1574,7 @@ impl XhciController {
             // controller's answer to the *last* thing it was given — a
             // teardown's Disable Slot and an enumeration's Enable Slot — defer
             // on it; a register write, an acknowledge and a reset do not.
-            let busy = self.outstanding.busy().then(|| self.outstanding.wake_at()).flatten();
+            let busy = self.outstanding.wake_at();
             match self.ports[port_idx as usize].step(portsc, now) {
                 Step::Idle => return None,
                 Step::Wait(at) => return Some(at),

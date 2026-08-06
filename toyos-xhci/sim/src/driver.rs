@@ -297,9 +297,7 @@ impl Driver {
                 self.wake_at = self.outstanding.wake_at();
                 return Ok(());
             }
-            let busy = (self.outstanding.busy() && !self.never_defers)
-                .then(|| self.outstanding.wake_at())
-                .flatten();
+            let busy = if self.never_defers { None } else { self.outstanding.wake_at() };
             let before = self.state;
             let step = self.state.step(read, now);
             if let Some(bad) = invariants::check(&before, &step, read, now) {
