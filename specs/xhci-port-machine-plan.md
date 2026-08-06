@@ -334,6 +334,70 @@ change no outcome, which is the same standard X0 was held to. **No new guest
 gate**, because the window is 100 ms wide and a `device_del` cannot be aimed
 inside it — see the note below, which is the answer and not an omission.
 
+#### X2b's design, written before the code
+
+**The plan under-counted `configure`'s reach, and the count is what decides
+whether the split can hold.** The table above stops at `configure`; but
+`configure` ends by calling `msc::bind`, which issues its own Configure Endpoint
+and then `bring_up` — TEST UNIT READY on a 500 ms budget, INQUIRY, READ
+CAPACITY, each a Bulk-Only round trip of three transfers with stall recovery
+inside it. That is the BOT/SCSI transport §2 excludes by name, and it runs
+**inside a scheduler pass** on every hot-plugged disk. `usb_refused_disk_first`
+is the gate that proves it runs there: it `device_add`s a stick after boot and
+requires `disk 1 ready on slot` in the log with no userland asking, so a pass
+that declined to bring a disk up would go red.
+
+So X2b converts everything up to the class bind, and the split holds for all of
+it. What is left is one call, named below.
+
+**The mechanism, reusing X2a's and inventing nothing.** `toyos_xhci::enumerate`
+is the sequence — which request comes next, and the two places it branches — on
+`recovery.rs`'s shape: `begin` answers with the first act, `completed` with the
+next. The kernel holds the data (slot id, speed, EP0 ring, the parsed function)
+in `What::Enumerating` and performs the acts. Two drivers of the one sequence:
+`settle_outstanding` for the boot scan, where blocking is correct because there
+is no scheduler to give a pass back to, and `advance_outstanding` for the pass.
+`configure`'s straight-line body becomes those acts and nothing else moves.
+
+**A control transfer with a data stage is two completions, and the job has to
+own that.** The data stage carries ISP and IOC so the driver can learn how many
+bytes actually arrived, so the status stage's event is a second one on the same
+(slot, dci). A job that finished on the first would leave the second to be
+matched by whatever asked next — the transfer-side form of the defect
+`submit_command`'s TRB matching closed on the command ring, and reachable
+because `poll` drains the whole ring before it advances anything. So
+`Outstanding::submit` takes `Stages`, and `Outcome::Answered` carries the
+residue as well as the code: the residue is the data stage's, the code is the
+last one seen, and a code that is neither Success nor Short Packet ends the
+operation because the halted endpoint will never run the status TRB.
+
+**An enumeration outstanding for a port that has gone is cancelled**, for the
+reason a recovery is: a transfer error on a port that has gone belongs to the
+disconnect, and without it the teardown waits a whole deadline behind a device
+that will never answer.
+
+**The split, and the one door.** `Stepper` wraps `&mut XhciController` in a
+field private to its own module, so no sibling of that module — `device`,
+`msc`, `hid` — can reach the controller through it, and `poll` holds nothing
+else. `wait_command`, `wait_transfer`, `settles`, `run_command` and
+`control_transfer` are then unreachable from a pass by construction rather than
+by convention. The exception is `msc`'s bring-up, which `Stepper` offers as one
+named method, because the alternative is a hot-plugged disk that never binds.
+**That door is X2c's to remove** — the BOT/SCSI machine — and until it does,
+"`drain_irqs` cannot spend the transfer budget in xHCI" is true of everything
+except a disk arriving after boot.
+
+### X2c — the BOT/SCSI machine, which closes the last door
+
+The bring-up conversation expressed the way `recovery` and `enumerate` are: the
+round trip (command block out, data, status in, with the one legal stall retry)
+and the bring-up above it (TEST UNIT READY on a budget, sense, INQUIRY, READ
+CAPACITY 10 then 16). Two drivers again — the blocking one for
+`storage_read`/`storage_write`, which run on the thread that faulted and spend
+their own time, and a stepped one for the bind. Not folded into X2b because it
+is a second machine of its own size and would make the landing unreviewable;
+§2's exclusion stands, and this is where it is paid off.
+
 Delta from the task's fix-shape: the task offers "bounded work per pass or a
 dedicated context". **This plan takes neither literally.** Bounded work per
 pass does not help while one unit of work can block for 2 s. A dedicated
