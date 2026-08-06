@@ -1016,6 +1016,18 @@ impl XhciController {
         self.software_disabled.iter().map(|w| w.count_ones()).sum()
     }
 
+    /// The root-hub port a slot's device is on, or `None` for a slot no port
+    /// has been recorded against yet — which is every slot mid-enumeration,
+    /// since the port takes its slot only once `configure` has returned. A
+    /// device pulled during its own enumeration therefore still costs the full
+    /// budget; it costs it once, and nothing above it is holding a mount.
+    fn port_of_slot(&self, slot: u8) -> Option<u8> {
+        self.ports
+            .iter()
+            .position(|p| p.slot().map(NonZeroU8::get) == Some(slot))
+            .map(|at| at as u8)
+    }
+
     fn connected_ports(&self) -> PortMask {
         let mut mask = [0u64; 4];
         for p in 0..self.max_ports {
@@ -1604,9 +1616,21 @@ impl XhciController {
     /// endpoints and a stalled one still completes.
     fn wait_transfer(&mut self, slot: u8, dci: u8) -> Option<(u32, u32)> {
         let deadline = deadline();
+        let port = self.port_of_slot(slot);
         loop {
             let Some(event) = self.next_event() else {
                 if crate::clock::nanos_since_boot() >= deadline {
+                    return None;
+                }
+                // **A device that has been unplugged is not a device that is
+                // slow.** The budget exists for one that might still answer; a
+                // port that reads disconnected has nothing behind it, and every
+                // nanosecond spent proving that is spent holding `XHCI` with
+                // preemption disabled — on the path a filesystem sync, a
+                // page-cache fill and every scheduler pass all take. Pulling
+                // the stick a machine logs to aims all three at a dead device
+                // on the same event.
+                if port.is_some_and(|p| !self.read_portsc(p).connected()) {
                     return None;
                 }
                 core::hint::spin_loop();
