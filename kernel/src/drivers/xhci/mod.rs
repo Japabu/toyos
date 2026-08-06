@@ -1562,6 +1562,13 @@ impl XhciController {
             if !portsc.connected() || portsc.connect_changed() {
                 self.cancel_recovery_on(port_idx);
             }
+            // A port inside an effect a previous pass began — a teardown
+            // waiting on Disable Slot — is not decided about at all until the
+            // controller has answered for it. The machine says so itself, and
+            // asking it costs a register read to be told nothing.
+            if self.ports[port_idx as usize].working().is_some() {
+                return self.outstanding.wake_at();
+            }
             // Read before the machine is asked, because by then its own borrow
             // of this port is live. The two effects below that need the
             // controller's answer to the *last* thing it was given — a
