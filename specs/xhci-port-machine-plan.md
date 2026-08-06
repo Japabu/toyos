@@ -257,6 +257,57 @@ the metal proof is the owner's and it is the one that counts.
   report as the answer, not as an omission. Do not ship one that passes for the
   wrong reason.
 
+#### X2a and X2b — the split, and why teardown goes first
+
+X2 lands twice. **X2a is teardown and recovery; X2b is enumeration.** The
+owner's live defect is a machine that freezes when the boot stick is pulled and
+answers no Ctrl+Alt+D afterwards, and neither of the two paths that run on an
+unplug is enumeration. Breadth of what enumerates does not touch it.
+
+**The mechanism, once, for both halves.** Every blocking step becomes
+submit-and-return against one outstanding operation per controller:
+
+- `submit_command` answers with the Command TRB's *physical address*, and
+  `wait_command` matches the Command Completion Event's `param` against it
+  (§6.4.2.2). It used to take the first completion of any command, so a command
+  that ran out its deadline and answered afterwards handed its code to whatever
+  was waiting next — latent today and unavoidable the moment two commands are in
+  flight from different callers.
+- `dispatch_event` offers every event to the outstanding operation before doing
+  anything else with it, and **records the code rather than acting on it** —
+  the same reason `broke_with` is recorded rather than recovered where it is
+  read: the drain runs inside `wait_command` and `wait_transfer` on behalf of a
+  caller waiting for one particular event.
+- `toyos_xhci::job::Outstanding<W>` is that slot, pure: what ends the wait
+  (`Await::{Command,Transfer}`), the deadline, the answer, and the cancellation.
+  **One slot and not a queue** — the driver ran these strictly serially before,
+  the command ring is one queue, and a second slot would buy concurrency the
+  hardware does not have at the price of the cancellation rules' only simple
+  form.
+- `toyos_xhci::recovery` is the endpoint recovery as a sequence: `Recovery::begin`
+  reads the Endpoint State out of the controller's output context and answers
+  with the first command, `Recovery::completed` with the next. Two drivers of
+  the one sequence — a blocking loop for `msc`'s bulk pair, which runs on a
+  faulting thread and not in a pass, and a stepped one for HID.
+
+**Two hazards that are not obvious and are handled.**
+
+- A `Step::Enumerate` taken while a Disable Slot is outstanding can be handed
+  back the same slot id: the controller processes the ring in order, so it will
+  not, but the *driver* would then zero the DCBAA entry the new device's context
+  now occupies. Enumeration and teardown both defer while an operation is
+  outstanding; a register write, an acknowledge and a reset do not.
+- A recovery outstanding for a device on a port that has just gone is cancelled
+  rather than waited out, because **a transfer error on a port that has gone
+  belongs to the disconnect**. Without it the teardown waits the deadline behind
+  a job whose device will never answer.
+
+**What X2a does not deliver, stated so a green suite does not imply it.** The
+type split above is X2b's. A `Stepper` that still has to hand `poll` a way to
+reach `device::configure` is a signature promising a check it does not perform,
+and privacy would not enforce it either: a child module of `xhci` can name its
+parent's private methods, so the view has to be the *only* handle by then.
+
 Delta from the task's fix-shape: the task offers "bounded work per pass or a
 dedicated context". **This plan takes neither literally.** Bounded work per
 pass does not help while one unit of work can block for 2 s. A dedicated
