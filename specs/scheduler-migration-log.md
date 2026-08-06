@@ -557,3 +557,22 @@ ordering that could be constructed by reading it. `desktop_window_child` stays
 an expected red and is not evidence either way (known-issues §3). And nothing
 here says anything about the T14, where 3 of 8 CPUs missed a kick and this
 machine's 8 answered.
+
+### The freeze now carries its own capture (2026-08-06)
+
+`desktop_window_child` failing was, until now, a message and a log; every
+reading of #156 needed a human to be at the socket while the guest sat frozen.
+The test's probes moved into `window_child_probes` and every failure of it now
+returns through `freeze_report`, which asks the guest two questions in the one
+order that survives being asked: `info registers -a` over the human monitor
+first, then Ctrl+Alt+D and the blocked-task dump. A keystroke revives a halted
+CPU, so the other order answers about the repaired machine — which is exactly
+the caveat the 2026-08-06 capture had to carry.
+
+`qemu::QmpMonitor` is the human monitor; `Qmp::execute_capturing` keeps the
+reply that `execute` discards, since only `human-monitor-command` answers with
+anything.
+
+Verified by forcing the failure: 8 CPUs of registers and a whole dump reached
+the message, and the harness reported the forced reason as **not** one the
+`EXPECTED_FAILURES` entry covers, so the `says` list still has its teeth.
