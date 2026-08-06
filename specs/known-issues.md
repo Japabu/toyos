@@ -1354,6 +1354,44 @@ beside it. The teardown is not a regression from the deadline fix (`add6aeb`,
 18:05): the paragraph above it was written at 17:32 describing the same three
 exits, and is not a descendant of it.
 
+**CLOSED, and it was the harness closing the desktop twice (2026-08-06).** The
+teardown in the three paragraphs above is not a guest defect at all.
+`close_focused_window` looped on `log[new..]` but waited with `serial_until`,
+which scans the whole capture, so the *previous* probe's `windows=1` answered
+the wait instantly and it re-sent GUI+Q at the speed of a QMP round trip. The
+second one closed the window under the one it meant. The compositor now says so
+itself and the two closes are one line each:
+
+```
+compositor: window closed pid=5 by GUI+Q, 1 left
+exit: test_rs_window_child pid=5 code=0
+compositor: window closed pid=1 by GUI+Q, 0 left     <- the terminal
+exit: shell pid=2 code=60
+exit: terminal pid=1 code=0
+```
+
+Everything after the second close is correct: the terminal breaks on
+`Event::Close`, drops `shell_stdin`, the shell's stdin reaches genuine EOF
+(`60` is `UnexpectedEof`, encoded into the exit status because a diagnostic
+through that pipe is lost with it), the shell leaves and the terminal reaps it.
+So the shell-exit reading below — "the failure is the read after the prompt" —
+was right about the mechanism and wrong about the cause: nothing was wrong with
+the read, its writer had been told to go.
+
+The fix is `note_closed` in the compositor plus a harness that waits on that
+event instead of sampling `windows=N` every two seconds
+(`scheduler-migration-log.md`). **`desktop_window_child` now passes end to end,
+alone and in the 12-wide phase** — both windowed-child probes and all three
+snake rounds, snake leaving `code=0` each time.
+
+**What this does *not* settle is the freeze**, and the entry stays. It stays
+`Sched::Parallel` for the same reason as before, `EXPECTED_FAILURES` keeps its
+declaration to its review date, and a green run still proves nothing — the
+signature at the top of this entry is a guest that goes *silent*, and none of
+the eleven boots in this session produced one. What has changed is that the
+test can now reach the snake rounds where the freeze was seen, which it could
+not before. Judge the next occurrence by the signature, never by a run.
+
 **Landing while it is red** needs nothing special: `desktop_window_child` is
 declared in `EXPECTED_FAILURES` (`tests/toyos.rs`) and `cargo run -- --land`
 runs the ordinary gate. The declaration reports it by name on every run, is red
@@ -1419,6 +1457,32 @@ scheduler passes during a session and threads placed on them never run (§3,
 promptly, with `code=0`. This entry must not be closed by it — though the
 freeze the test now reproduces is very likely that defect, which is the whole
 reason the test is worth keeping red.
+
+### OPEN — the desktop chain reads every stdio error as end-of-input, and says nothing
+
+Found while tracing #156's teardown, where both of these had to be worked
+around before the cause could be read at all.
+
+`userland/shell/src/main.rs`'s `read_byte` is `read_exact(&mut buf).ok()?`, so
+a device error, a revoked fd and a genuine EOF are one value: `None`. `readline`
+turns that into `break`, `main` returns, and the shell exits **0**. A shell that
+died because its terminal vanished and a shell whose stdin failed are
+indistinguishable from outside, and both look like a clean exit.
+`userland/terminal/src/main.rs` has the same shape twice —
+`shell_stdout.read(&mut buf).unwrap_or(0)` for stdout and stderr, where `0` is
+its own signal to leave.
+
+Neither says anything on the way out, and the channel that would carry it is
+the one that failed: the terminal breaks on stdout EOF **before** it drains
+stderr, so the shell's last stderr line is dropped with it. What established
+the cause was encoding `io::ErrorKind` into the shell's exit status, because
+the kernel's `exit: name pid=N code=C` line is the one record neither end can
+swallow.
+
+No reproduction of a non-EOF error here; the one traced was a real
+`UnexpectedEof`. The defect is that there could be, and nobody would know.
+A fix is a message naming the fd and the kind, and a stderr drain before the
+terminal leaves.
 
 ### OPEN — the compositor holds a window *index* across passes, and every removal invalidates it
 

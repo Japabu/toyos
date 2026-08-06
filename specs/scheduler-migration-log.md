@@ -671,3 +671,34 @@ owner's report, which was the X button and one click. And the structural defect
 underneath is real and not test-only: **a destructive command with no
 acknowledgement, whose only observable is a 2 s sample of a counter.** That is
 why there is a retry loop at all.
+
+### The fix, and where it leaves #156
+
+Two halves, and only one of them is the test.
+
+**The compositor now announces a close.** A client that *dies* was already
+announced — `dropping pid N — why` — and a window somebody *closed* was not, so
+the desktop's only record of one was the `windows=N` field of a statistics line
+emitted every two seconds. That is a sample of a level: two closes inside one
+interval are indistinguishable from one, and from none if a window opened in
+between. `note_closed` fires at the three deliberate sites — GUI+Q, the close
+button, and the client's own `MSG_DESTROY_WINDOW` — naming the pid, what closed
+it, and how many are left. Every report the owner has made about this desktop
+begins "I closed a window and then", and until now the log could not say which
+window went.
+
+**`close_focused_window` waits on that event.** It no longer samples a counter,
+so a re-send happens only when the close genuinely did not land, and its
+failure message — "GUI+Q never reached the compositor" — is true when it fires.
+
+`desktop_window_child` then passes end to end for the first time: alone in
+19 s, and in the 12-wide phase with a second worktree's suite holding half the
+host's guest slots and running the same test.
+
+**#156 is not closed by this and the entry stays.** The freeze's signature is a
+guest that goes silent, and none of the eleven boots in this session produced
+one. What changed is that the test now *reaches* the snake rounds where the
+freeze was seen. The predecessor's QMP capture — eight vCPUs `HLT=1` with `IF`
+set, one thread left, Ctrl+Alt+D reviving the machine — remains unexplained,
+and note that a machine whose desktop has been closed out from under it looks
+similar in the census and *not* in the serial log, which keeps flowing.
