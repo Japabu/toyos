@@ -7,6 +7,11 @@ license = "MIT OR Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+# Declared, never enabled here: `kernel-loom` compiles `src/sync.rs` into its own
+# crate with this on, so the file's atomics and its cell resolve to loom's.
+# A kernel build cannot enable it — the kernel does not depend on loom — and it
+# is declared only so `cfg` checking knows the name.
+loom = []
 # Every actuator below that a boot cannot reach on its own: each is a `SYS_DEBUG`
 # action arm and nothing else, so a kernel carrying all four boots, schedules,
 # drives its devices and panics exactly as a kernel carrying none does. The
