@@ -35,7 +35,7 @@ fn main() {
         print!("{}> ", cwd);
         io::stdout().flush().ok();
 
-        let Some(input) = readline(&mut history) else { std::process::exit(42) };
+        let Some(input) = readline(&mut history) else { break };
         let input = input.trim().to_string();
         if input.is_empty() {
             continue;
@@ -778,22 +778,8 @@ fn save_history(history: &[String]) {
 
 fn read_byte() -> Option<u8> {
     let mut buf = [0u8; 1];
-    match io::stdin().lock().read_exact(&mut buf) {
-        Ok(()) => Some(buf[0]),
-        Err(e) => {
-            std::process::exit(match e.kind() {
-                io::ErrorKind::UnexpectedEof => 60,
-                io::ErrorKind::BrokenPipe => 61,
-                io::ErrorKind::NotFound => 62,
-                io::ErrorKind::PermissionDenied => 63,
-                io::ErrorKind::InvalidInput => 64,
-                io::ErrorKind::Interrupted => 65,
-                io::ErrorKind::WouldBlock => 66,
-                io::ErrorKind::InvalidData => 67,
-                _ => 69,
-            })
-        }
-    }
+    io::stdin().lock().read_exact(&mut buf).ok()?;
+    Some(buf[0])
 }
 
 fn read_char() -> Option<char> {

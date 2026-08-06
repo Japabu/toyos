@@ -83,7 +83,6 @@ fn main() {
             let mut buf = [0u8; 4096];
             let n = shell_stdout.read(&mut buf).unwrap_or(0);
             if n == 0 {
-                println!("terminal: DIAG shell stdout EOF");
                 break;
             }
             console.write_bytes(&buf[..n]);
@@ -171,7 +170,7 @@ fn main() {
                         _ => {}
                     }
                 }
-                window::Event::Close => { println!("terminal: DIAG got window Close"); break }
+                window::Event::Close => break,
                 window::Event::Resized => {
                     console.resize(window.screen());
                     present(&console, &window);

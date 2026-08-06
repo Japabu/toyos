@@ -4086,22 +4086,28 @@ fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> bool 
 /// Close the focused window with GUI+Q, retrying until the compositor says a
 /// window went.
 ///
-/// **Never blind.** A keystroke injected while the guest is busy is lost, so
-/// one attempt is not enough on a loaded host; but a second GUI+Q *after* one
-/// worked closes the next window down, which here is the terminal. So the
-/// compositor's own count is what decides whether to try again: it drops to
-/// one when the window under test goes, and `new` is where in the log to start
-/// looking so an earlier interval's count cannot answer for this one.
+/// **Never blind, and what it waits for is the close itself.** A keystroke
+/// injected while the guest is busy is lost, so one attempt is not enough on a
+/// loaded host; but a second GUI+Q *after* one worked closes the next window
+/// down, which here is the terminal, and that takes the shell and the whole
+/// desktop with it. The compositor emits `window closed` from the close, so
+/// this waits on the event it caused. Waiting on the `windows=N` count instead
+/// is what made this re-send: that count is a sample taken every two seconds,
+/// so it answers about an interval rather than about this injection — and the
+/// wait was `serial_until`, which scans the whole capture, so the *previous*
+/// probe's `windows=1` returned it immediately and the loop hammered GUI+Q at
+/// the speed of a QMP round trip.
 fn close_focused_window(qemu: &mut QemuInstance, log: &mut String, new: usize) -> bool {
+    const CLOSED: &str = "compositor: window closed";
     let deadline = Instant::now() + qemu::budget(Duration::from_secs(20));
-    while Instant::now() < deadline && !log[new..].contains("windows=1") {
+    while Instant::now() < deadline && !log[new..].contains(CLOSED) {
         {
             let mut input = qemu::QmpInput::open(qemu.qmp_socket());
             input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);
         }
-        serial_until(qemu, log, "windows=1", Duration::from_secs(4));
+        serial_until_new(qemu, log, CLOSED, new, Duration::from_secs(4));
     }
-    log[new..].contains("windows=1")
+    log[new..].contains(CLOSED)
 }
 
 /// How many times snake is opened and closed. One green round says very little
