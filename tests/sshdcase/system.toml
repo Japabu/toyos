@@ -1,0 +1,17 @@
+# The one boot that runs sshd with a network under it.
+#
+# sshd binds before it reads anything of its own, so on every other config it
+# leaves at the bind: metal-sim has no NIC by design, and no other test image
+# builds it at all. Between them nothing in the suite ever reached a line of
+# the daemon past that bind — not the host key it mints, not the file it
+# authenticates against.
+#
+# Its own config rather than a fourth program in `tests/netcase`, because
+# netcase's test measures how many connections netd will hold and sshd's bind
+# would spend one of them.
+init = ["/bin/netd", "/bin/sshd", "/bin/test-runner"]
+
+[programs]
+netd = {}
+sshd = {}
+test-runner = {}

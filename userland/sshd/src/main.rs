@@ -1,10 +1,115 @@
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use russh::keys::PublicKey;
+use russh::keys::ssh_key::authorized_keys::AuthorizedKeys;
+use russh::keys::ssh_key::LineEnding;
+use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, Msg, Server, Session};
-use russh::{Channel, ChannelId};
+use russh::{Channel, ChannelId, MethodKind, MethodSet};
+
+/// Where this machine keeps its SSH identity and the keys it trusts.
+///
+/// `/home` is the only mount that is both persistent and writable by userland:
+/// `/boot` is `KernelOnly` because a process that can write it can make the
+/// machine unbootable, `/tmp` is a tmpfs, and `/log` is the diagnostic
+/// partition — it is FAT32 by design so that it can be read on another
+/// machine, which is the last place a private key should be. On a machine
+/// whose disk the kernel would not adopt, `/home` is itself a tmpfs and the
+/// identity lasts one boot; the fingerprint is printed every start so that is
+/// visible rather than silent.
+///
+/// There is no user model and no file permissions, so the host key is readable
+/// by every process on the machine. That is a property of the system, not of
+/// this daemon — see `specs/known-issues.md`.
+const SSH_DIR: &str = "/home/root/.ssh";
+const HOST_KEY: &str = "/home/root/.ssh/host_ed25519";
+const AUTHORIZED_KEYS: &str = "/home/root/.ssh/authorized_keys";
+
+/// The machine's identity, minted once and kept.
+///
+/// A file that exists but does not parse is refused, never replaced. Minting
+/// over it would change the identity every client has pinned without anyone
+/// asking, which is the one event a host key exists to make noisy.
+fn host_key() -> Result<PrivateKey, String> {
+    match fs::read(HOST_KEY) {
+        Ok(pem) => PrivateKey::from_openssh(&pem).map_err(|e| {
+            format!(
+                "{HOST_KEY} is not an OpenSSH private key ({e}); refusing to \
+                 replace it — move it aside to mint a new identity"
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => mint_host_key(),
+        Err(e) => Err(format!("cannot read {HOST_KEY}: {e}")),
+    }
+}
+
+fn mint_host_key() -> Result<PrivateKey, String> {
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+        .map_err(|e| format!("cannot generate a host key: {e}"))?;
+    let pem = key
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| format!("cannot encode the host key: {e}"))?;
+    fs::create_dir_all(SSH_DIR).map_err(|e| format!("cannot create {SSH_DIR}: {e}"))?;
+    fs::write(HOST_KEY, pem.as_bytes()).map_err(|e| format!("cannot write {HOST_KEY}: {e}"))?;
+    println!("sshd: minted a new host identity at {HOST_KEY}");
+    Ok(key)
+}
+
+/// Does `text` — the contents of an `authorized_keys` file — name `offered`?
+///
+/// Keys are compared as key *data*, so a differing comment is still the same
+/// key and an unusual-but-valid encoding still matches; the parse is
+/// `ssh-key`'s, which is also what verified the signature.
+///
+/// **An entry carrying config options authorizes nothing.** Options restrict
+/// what a key may do (`command="…"`, `from="…"`, `restrict`), none of them are
+/// implemented here, and honouring the key while dropping its restrictions
+/// would grant strictly more than the file says.
+fn authorizes(text: &str, offered: &PublicKey) -> bool {
+    AuthorizedKeys::new(text)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.config_opts().is_empty())
+        .any(|entry| entry.public_key().key_data() == offered.key_data())
+}
+
+/// Read fresh on every attempt, so a key added to the file takes effect
+/// without a restart — there is nothing here to send a reload signal to.
+/// An unreadable file names nobody, so every failure answers "not authorized".
+fn is_authorized(key: &PublicKey) -> bool {
+    fs::read_to_string(AUTHORIZED_KEYS).is_ok_and(|text| authorizes(&text, key))
+}
+
+/// What the file names, said once at startup so a key that will never work is
+/// visible before somebody tries it. `Err` means nobody can authenticate.
+fn authorized_key_count() -> Result<usize, String> {
+    let text = fs::read_to_string(AUTHORIZED_KEYS).map_err(|e| {
+        format!("cannot read {AUTHORIZED_KEYS} ({e}); put a public key there and start again")
+    })?;
+
+    let (mut usable, mut restricted, mut unreadable) = (0, 0, 0);
+    for entry in AuthorizedKeys::new(&text) {
+        match entry {
+            Ok(entry) if entry.config_opts().is_empty() => usable += 1,
+            Ok(_) => restricted += 1,
+            Err(_) => unreadable += 1,
+        }
+    }
+    if restricted > 0 {
+        println!(
+            "sshd: {restricted} entr(ies) in {AUTHORIZED_KEYS} carry options, which are not \
+             implemented — those keys authorize nothing"
+        );
+    }
+    if unreadable > 0 {
+        println!("sshd: {unreadable} line(s) in {AUTHORIZED_KEYS} are not public keys, ignored");
+    }
+    if usable == 0 {
+        return Err(format!("{AUTHORIZED_KEYS} names no usable key"));
+    }
+    Ok(usable)
+}
 
 struct SshServer;
 
@@ -140,20 +245,39 @@ impl russh::server::Handler for SshSession {
         Ok(true)
     }
 
-    async fn auth_password(
+    /// The offer, before the client has proved it holds the key. Refusing here
+    /// is what stops a client signing for a key that could never be accepted,
+    /// and it is where an unauthorized key gets named — a client that takes
+    /// this answer never reaches `auth_publickey`.
+    ///
+    /// `russh`'s default for this one is `Accept`; every other auth callback it
+    /// defaults to `Reject`, which is why `auth_password` is simply absent.
+    async fn auth_publickey_offered(
         &mut self,
-        _user: &str,
-        _password: &str,
+        user: &str,
+        key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        Ok(Auth::Accept)
+        if is_authorized(key) {
+            return Ok(Auth::Accept);
+        }
+        println!(
+            "sshd: refused {user}: {} is not in {AUTHORIZED_KEYS}",
+            key.fingerprint(HashAlg::Sha256)
+        );
+        Ok(Auth::reject())
     }
 
-    async fn auth_publickey(
-        &mut self,
-        _user: &str,
-        _key: &PublicKey,
-    ) -> Result<Auth, Self::Error> {
-        Ok(Auth::Accept)
+    /// After russh has verified the signature. Checked again rather than
+    /// trusting the offer above to have filtered: a client is free to sign
+    /// without asking first, and that path must reach the same file.
+    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+        let fingerprint = key.fingerprint(HashAlg::Sha256);
+        if is_authorized(key) {
+            println!("sshd: {user} authenticated with {fingerprint}");
+            return Ok(Auth::Accept);
+        }
+        println!("sshd: refused {user}: {fingerprint} is not in {AUTHORIZED_KEYS}");
+        Ok(Auth::reject())
     }
 
     async fn data(
@@ -215,17 +339,6 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
     rt.block_on(async {
-        let config = russh::server::Config {
-            auth_rejection_time: std::time::Duration::from_secs(1),
-            nodelay: true,
-            keys: vec![
-                russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
-                    .unwrap(),
-            ],
-            ..Default::default()
-        };
-        let config = Arc::new(config);
-
         // Every bind goes through netd, which exits on a machine with no NIC.
         // sshd has nothing to offer without one, so it says so and leaves
         // instead of dumping a tokio backtrace across the boot.
@@ -245,6 +358,42 @@ fn main() {
             }
             Err(e) => panic!("sshd: cannot bind 0.0.0.0:22: {e}"),
         };
+
+        // Identity and trust are settled after the bind, so that a machine with
+        // no NIC still reports the network as the reason it is leaving rather
+        // than minting a key it will never present.
+        let host_key = match host_key() {
+            Ok(key) => key,
+            Err(why) => {
+                println!("sshd: {why}, exiting");
+                return;
+            }
+        };
+        println!(
+            "sshd: host identity {}",
+            host_key.public_key().fingerprint(HashAlg::Sha256)
+        );
+
+        // A daemon that can authenticate nobody is an open port, not a service.
+        match authorized_key_count() {
+            Ok(count) => println!("sshd: {count} key(s) authorized by {AUTHORIZED_KEYS}"),
+            Err(why) => {
+                println!("sshd: {why}, exiting");
+                return;
+            }
+        }
+
+        let config = Arc::new(russh::server::Config {
+            // Public keys and nothing else: password and keyboard-interactive
+            // are never offered, so there is no credential for a client to
+            // guess. `russh`'s default is every method it implements.
+            methods: MethodSet::from(&[MethodKind::PublicKey][..]),
+            auth_rejection_time: std::time::Duration::from_secs(1),
+            nodelay: true,
+            keys: vec![host_key],
+            ..Default::default()
+        });
+
         println!("sshd: listening on port 22");
         loop {
             match listener.accept().await {
@@ -271,4 +420,96 @@ fn main() {
             }
         }
     });
+}
+
+/// Which keys a file authorizes. Host tests — `cargo test --target "$(rustc
+/// -vV | sed -n 's/^host: //p')"` from this directory; `userland/.cargo/config.toml`
+/// cross-compiles to ToyOS otherwise. Real keys, and `ssh-key`'s own parser,
+/// so what is under test is the decision and not a re-encoding of it.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> PrivateKey {
+        PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap()
+    }
+
+    /// One `authorized_keys` line for a key, as `ssh-keygen` would write it.
+    fn line(key: &PrivateKey) -> String {
+        key.public_key().to_openssh().unwrap()
+    }
+
+    #[test]
+    fn a_listed_key_is_authorized() {
+        let mine = key();
+        assert!(authorizes(&line(&mine), mine.public_key()));
+    }
+
+    #[test]
+    fn an_unlisted_key_is_not_authorized() {
+        let (mine, stranger) = (key(), key());
+        assert!(!authorizes(&line(&mine), stranger.public_key()));
+    }
+
+    #[test]
+    fn a_file_that_names_nobody_authorizes_nobody() {
+        let stranger = key();
+        for text in ["", "\n", "   \n\t\n", "# just a comment\n", "garbage\n"] {
+            assert!(
+                !authorizes(text, stranger.public_key()),
+                "{text:?} authorized a key",
+            );
+        }
+    }
+
+    /// The load-bearing refusal: the key is listed, but under restrictions this
+    /// daemon does not implement. Granting it would grant more than the file
+    /// says, so it is granted nothing.
+    #[test]
+    fn a_key_listed_with_options_authorizes_nothing() {
+        let mine = key();
+        for options in [
+            "command=\"/bin/shell -c ls\"",
+            "no-pty",
+            "restrict",
+            "from=\"10.0.0.1\",no-agent-forwarding",
+        ] {
+            let text = format!("{options} {}\n", line(&mine));
+            assert!(
+                !authorizes(&text, mine.public_key()),
+                "{options:?} let the key through unrestricted",
+            );
+        }
+    }
+
+    /// Keys are compared as key data, so the comment is not part of identity.
+    #[test]
+    fn the_comment_is_not_part_of_the_key() {
+        let mine = key();
+        let text = format!("{} jan@some-other-laptop\n", line(&mine));
+        assert!(authorizes(&text, mine.public_key()));
+    }
+
+    #[test]
+    fn a_key_is_found_among_several_and_blank_lines() {
+        let (first, mine, last) = (key(), key(), key());
+        let text = format!(
+            "# my keys\n{}\n\n{}\n   \n{}\n",
+            line(&first),
+            line(&mine),
+            line(&last),
+        );
+        for k in [&first, &mine, &last] {
+            assert!(authorizes(&text, k.public_key()), "a listed key was missed");
+        }
+        assert!(!authorizes(&text, key().public_key()));
+    }
+
+    /// A line that is not a key must not disarm the keys around it.
+    #[test]
+    fn an_unparseable_line_does_not_disarm_the_rest() {
+        let mine = key();
+        let text = format!("not-a-key at all\n{}\n", line(&mine));
+        assert!(authorizes(&text, mine.public_key()));
+    }
 }

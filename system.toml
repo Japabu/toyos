@@ -1,9 +1,13 @@
 # Init programs (run at boot, in order)
+#
+# sshd is deliberately not here. It is built into the image and started by hand
+# (`/bin/sshd &`) on a machine that wants remote access: it listens on every
+# interface, so carrying it in every boot is a listening port nobody asked for.
+# `src/build.rs`'s `no_shipped_boot_config_starts_sshd` is the gate.
 init = [
     "/bin/compositor",
     "/bin/soundd",
     "/bin/netd",
-    "/bin/sshd",
 ]
 
 hosted-rustc = true

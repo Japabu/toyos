@@ -1,0 +1,18 @@
+[workspace]
+members = [".", "sim"]
+default-members = [".", "sim"]
+
+[package]
+name = "toyos-xhci"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+# Host-side additions for the simulator and its tests. Never enabled by the
+# kernel.
+std = []
+# Compiles the deliberate defects the negative gates need, and the field that
+# selects one. The kernel does not enable it, so no production path can reach a
+# flawed decision — the field does not exist there.
+flaws = []

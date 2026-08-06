@@ -58,6 +58,7 @@ dependencies = [
  "toyos-gpt",
  "toyos-ps2",
  "toyos-sched",
+ "toyos-xhci",
 ]
 
 [[package]]
@@ -90,6 +91,10 @@ version = "0.1.0"
 
 [[package]]
 name = "toyos-sched"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-xhci"
 version = "0.1.0"
 
 [[package]]

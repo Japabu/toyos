@@ -14,6 +14,8 @@ use crate::mm::paging::CachePolicy;
 use crate::log;
 use crate::mm::KernelSlice;
 use crate::sync::Lock;
+use toyos_xhci::port::{self as portmachine, GaveUp, Gone, PortState, Step};
+use toyos_xhci::Portsc;
 
 use hid::HidDevice;
 
@@ -35,43 +37,15 @@ const OP_CONFIG:   u64 = 0x38;
 const OP_PORT_BASE: u64 = 0x400;
 const PORT_REG_SIZE: u64 = 0x10;
 
-// PORTSC bits
+// The raw bits, for the two paths that work on a word rather than on a decoded
+// register: the feature-gated injections in `read_portsc`, which hide bits a
+// controller reported, and `init_one`'s port power, which runs before this
+// controller exists. Every decision goes through `Portsc`.
 const PORTSC_CCS: u32 = 1 << 0;
 const PORTSC_PED: u32 = 1 << 1;
 const PORTSC_PR:  u32 = 1 << 4;
 const PORTSC_PP:  u32 = 1 << 9;
 const PORTSC_SPEED: u32 = 0xF << 10;
-const PORTSC_CSC: u32 = 1 << 17;
-const PORTSC_PRC: u32 = 1 << 21;
-
-/// Every change flag: CSC, PEC, WRC, OCC, PRC, PLC and CEC, bits 17 to 23.
-///
-/// They are the reason a port event exists at all — xHCI 1.2 §4.19.2 raises a
-/// Port Status Change Event when one of these transitions from '0' to '1', and
-/// **only then**. A flag left set is therefore a change the controller has
-/// already reported and will not report again, so acting on a port means
-/// clearing what was set when it was read.
-const PORTSC_CHANGES: u32 = 0x7F << 17;
-
-/// PORTSC bits a write cannot change: CCS, OCA, the speed field, DR.
-const PORTSC_RO: u32 = PORTSC_CCS | (1 << 3) | PORTSC_SPEED | (1 << 30);
-/// PORTSC bits where writing back what was read reproduces the port's state:
-/// PLS, PP, PIC, and the three wake enables.
-const PORTSC_RWS: u32 = (0xF << 5) | PORTSC_PP | (0x3 << 14) | (0x7 << 25);
-
-/// The value to build a PORTSC write on top of, so that setting one bit sets
-/// exactly that bit.
-///
-/// Everything outside [`PORTSC_RO`] and [`PORTSC_RWS`] *acts* on a written '1':
-/// PR and WPR are RW1S, and PED and the seven change flags are RW1C. Writing
-/// back what was read therefore does something, and for PED — bit 1, RW1CS,
-/// "A port may be disabled by software writing a '1' to this flag", xHCI 1.2
-/// §5.4.8 Table 5-27 — what it does is take the port from Enabled to Disabled
-/// (§4.19.1.1.6). Linux calls this `xhci_port_state_to_neutral` and its
-/// `XHCI_PORT_RW1CS` is `(1<<1) | (0x7f<<17)`, PED included.
-fn portsc_neutral(portsc: u32) -> u32 {
-    portsc & (PORTSC_RO | PORTSC_RWS)
-}
 
 /// HCCPARAMS1 bit 3: the controller has Port Power Control, which is also what
 /// decides whether PORTSC's PP comes out of a reset clear or set.
@@ -378,13 +352,9 @@ fn settles(ready: impl Fn() -> bool) -> bool {
 const CONTROLLER_ANSWERS: bool = !cfg!(feature = "xhci-deaf-controller");
 const PORT_ANSWERS: bool = !cfg!(feature = "xhci-deaf-port");
 
-/// How long a root hub's connect state must hold still before the driver acts
-/// on it.
-///
-/// USB 2.0 §7.1.7.3 requires 100 ms of debounce between an attach being
-/// detected and the port reset that follows it — TATTDB, the interval Linux's
-/// `hub_port_debounce` calls `HUB_DEBOUNCE_STABLE`.
-const PORT_DEBOUNCE_NS: u64 = 100_000_000;
+/// The boot-time connect settle measures the same interval the per-port machine
+/// does, so it reads it from the same place.
+use portmachine::DEBOUNCE_NS as PORT_DEBOUNCE_NS;
 
 /// How long a machine on which *nothing at all* has connected keeps looking.
 ///
@@ -530,50 +500,6 @@ fn await_connect_settle(controllers: &[XhciController]) {
             }
         }
     }
-}
-
-/// What the driver is doing about one root-hub port, between the register
-/// changing and the driver having acted on it.
-///
-/// Every variant carries the instant it is waiting for, because the whole
-/// point of this type is that **none of these waits may be spun on**: it is
-/// stepped from `poll_if_pending`, which runs at the top of every scheduler
-/// pass, and a pass that stopped for the 100 ms of USB 2.0 §7.1.7.3 or for a
-/// T14 root port's 55 ms reset would empty the audio pipeline every time
-/// somebody plugged in a mouse.
-#[derive(Clone, Copy, PartialEq)]
-enum PortWork {
-    /// The port reads the way the driver last acted on it.
-    Settled,
-    /// Its connect state differs from the one the driver acted on, and has
-    /// since `at`. A port that changes its mind again gets a fresh `at`, which
-    /// is [`PORT_DEBOUNCE_NS`] measured exactly as [`await_connect_settle`]
-    /// measures it — a set that has to hold still, not a sleep.
-    Debouncing { at: u64 },
-    /// PR is set and the driver is waiting for PRC, which arrives as a Port
-    /// Status Change Event as well as a register bit. `until` is the same
-    /// deadline the boot path's `settles` applies, and what it buys is the
-    /// same refusal by name.
-    Resetting { until: u64 },
-}
-
-/// One root-hub port, as the driver believes it.
-#[derive(Clone, Copy)]
-struct Port {
-    /// Whether the driver has a device here — the connect state it last acted
-    /// on, and deliberately not the register's, which is what a change is
-    /// measured against.
-    attached: bool,
-    /// The slot the controller enabled for this port, which the driver owns
-    /// until it issues Disable Slot. `Option<NonZeroU8>` and not a `u8`: slot
-    /// ids are 1-based, so a zero here would be a sentinel where the niche
-    /// makes the option the same byte.
-    slot: Option<NonZeroU8>,
-    work: PortWork,
-}
-
-impl Port {
-    const EMPTY: Self = Self { attached: false, slot: None, work: PortWork::Settled };
 }
 
 /// When some controller's port state machine must be stepped again, or 0 when
@@ -990,7 +916,7 @@ pub struct XhciController {
     /// This controller's root-hub ports, one entry per port register. Sized
     /// from HCSPARAMS1 rather than fixed: `max_ports` is a byte, and a fixed
     /// array would be 255 entries on a controller with five.
-    ports: Vec<Port>,
+    ports: Vec<PortState>,
 
     /// A Port Status Change Event arrived and the ports have not been read
     /// since. Set where the event is dequeued — which includes the middle of
@@ -1026,7 +952,11 @@ impl XhciController {
 
     /// Every read of a port register in this driver, so that what the connect
     /// settle sees and what `init_device` acts on cannot disagree.
-    fn read_portsc(&self, port_idx: u8) -> u32 {
+    fn read_portsc(&self, port_idx: u8) -> Portsc {
+        Portsc::from_raw(self.read_portsc_raw(port_idx))
+    }
+
+    fn read_portsc_raw(&self, port_idx: u8) -> u32 {
         let raw = self.op_base.read_u32(OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE);
         #[cfg(feature = "xhci-slow-connect")]
         if crate::clock::nanos_since_boot() < SLOW_CONNECT_NS {
@@ -1043,15 +973,14 @@ impl XhciController {
         raw
     }
 
-    /// Every write of a port register, for the same reason — and because the
-    /// bits that must not be written back are only maskable at one place.
-    fn write_portsc(&mut self, port_idx: u8, value: u32) {
-        // xHCI 1.2 §5.4.8 note 82: "The PED and PR flags are mutually exclusive.
-        // Writing the PORTSC register with PED and PR set to '1' shall result in
-        // undefined behavior." Unreachable from [`portsc_neutral`], which clears
-        // both, so this guards the next edit rather than this one.
-        assert!(value & (PORTSC_PED | PORTSC_PR) != PORTSC_PED | PORTSC_PR,
-            "xHCI: PORTSC write {value:#010x} sets PED and PR together on port {}", port_idx + 1);
+    /// Every write of a port register, so the emulation below sees all of them.
+    ///
+    /// It takes a [`toyos_xhci::portsc::Write`] and not a word: a value of that
+    /// type can only be built from a neutral base and offers no way to set PED,
+    /// so the two writes that disable a port the driver was enabling are
+    /// unreachable rather than asserted against.
+    fn write_portsc(&mut self, port_idx: u8, write: toyos_xhci::portsc::Write) {
+        let value = write.raw();
         #[cfg(feature = "xhci-portsc-rw1c")]
         {
             let word = port_idx as usize / 64;
@@ -1078,7 +1007,7 @@ impl XhciController {
     fn connected_ports(&self) -> PortMask {
         let mut mask = [0u64; 4];
         for p in 0..self.max_ports {
-            if self.read_portsc(p) & PORTSC_CCS != 0 {
+            if self.read_portsc(p).connected() {
                 mask[p as usize / 64] |= 1 << (p % 64);
             }
         }
@@ -1224,7 +1153,7 @@ impl XhciController {
         // acknowledging it is `service_port`'s job, and clearing it here would
         // steal the evidence that runs the teardown.
         let portsc = self.read_portsc(dev.port_idx);
-        if portsc & PORTSC_CCS == 0 || portsc & PORTSC_CSC != 0 {
+        if !portsc.connected() || portsc.connect_changed() {
             log!("xHCI: USB {kind} on slot {slot_id}: interrupt endpoint {ep_addr:#04x} \
                  completed with {} as its port went away; leaving it to the disconnect",
                 Completion(code));
@@ -1277,7 +1206,7 @@ impl XhciController {
         log!("xHCI: USB {} on slot {} is being let go — {why}. Unplug it and plug it in again.",
             dev.kind(), dev.slot_id);
         dev.unbind();
-        if let Some(slot) = self.ports[dev.port_idx as usize].slot.take() {
+        if let Some(slot) = self.ports[dev.port_idx as usize].take_slot() {
             self.disable_slot(slot.get());
         }
     }
@@ -1359,16 +1288,15 @@ impl XhciController {
     }
 
     /// Clear whatever change flags one port is holding, so the next change is
-    /// one the controller can report. See [`PORTSC_CHANGES`].
+    /// one the controller can report.
+    ///
     /// Takes the value the caller has already read, rather than reading its
     /// own: a flag raised between the two reads would be cleared without ever
-    /// having been looked at, and [`Self::service_port`] decides what a port
-    /// means from exactly the word it clears. Only the bits that were set in
-    /// `portsc` are written back, so one raised in between survives to the next
-    /// pass — which is what RW1C is for.
-    fn acknowledge_port_change(&mut self, port_idx: u8, portsc: u32) {
-        if portsc & PORTSC_CHANGES != 0 {
-            self.write_portsc(port_idx, portsc_neutral(portsc) | (portsc & PORTSC_CHANGES));
+    /// having been looked at, and the machine decides what a port means from
+    /// exactly the word this clears.
+    fn acknowledge_port_change(&mut self, port_idx: u8, portsc: Portsc) {
+        if portsc.any_change() {
+            self.write_portsc(port_idx, portsc.neutral().acknowledging(portsc));
         }
     }
 
@@ -1386,15 +1314,13 @@ impl XhciController {
         }
     }
 
-    /// Record what a port's enumeration left behind. The slot is what
+    /// Record what the boot scan's enumeration left behind, so the hot-plug
+    /// machine starts from what that path already did. The slot is what
     /// [`Self::teardown_port`] gives back, and it is recorded even when no
     /// device came out the far end: an Enable Slot that succeeded is the
     /// controller's resource whatever happened after it.
     fn port_bound(&mut self, port_idx: u8, slot: Option<u8>) {
-        let port = &mut self.ports[port_idx as usize];
-        port.attached = true;
-        port.slot = slot.and_then(NonZeroU8::new);
-        port.work = PortWork::Settled;
+        self.ports[port_idx as usize].adopt(slot.and_then(NonZeroU8::new));
     }
 
     /// Step every port that is not where the driver left it, and say when it
@@ -1413,108 +1339,65 @@ impl XhciController {
     }
 
     /// One port's step, and when it next wants one.
+    ///
+    /// **The decision is [`PortState::step`]'s and every line here is an
+    /// effect.** The loop is what the machine's contract asks for: do the one
+    /// thing it said, read the register again, ask again — because an effect
+    /// changes the register, and a decision taken from a word that predates the
+    /// last write is a decision about a port that no longer exists.
+    ///
+    /// The bound is not a timeout. The machine issues one effect per state it
+    /// leaves and the longest legitimate run is teardown, acknowledge,
+    /// debounce; exceeding it means looping, and looping here is a scheduler
+    /// pass that never ends.
     fn service_port(&mut self, port_idx: u8, now: u64) -> Option<u64> {
-        let portsc = self.read_portsc(port_idx);
-        let connected = portsc & PORTSC_CCS != 0;
-        // **CCS is a level and CSC is the edge, and only the edge can report a
-        // gap.** xHCI 1.2 §5.4.8 sets CSC on a '0'→'1' *or* '1'→'0' transition
-        // of CCS, so a port that reads connected with CSC set has been
-        // disconnected and reconnected since the flag was last cleared — a
-        // device pulled and pushed back inside one look, which is what a person
-        // replugging a mouse does and what the driver could not see.
-        //
-        // The evidence exists only because clearing these flags happens at one
-        // place: every clear is a known point in this function, so a set flag
-        // observed here is a change since the last one and never a leftover.
-        // It used to be read and thrown away in the same breath — this function
-        // re-read PORTSC inside the acknowledge and then compared nothing but
-        // CCS against what the driver believed.
-        let replugged = portsc & PORTSC_CSC != 0;
-        let port = self.ports[port_idx as usize];
-
-        // Before any change flag is cleared, because PRC is the one this state
-        // is waiting for and clearing it is `configure`'s first act.
-        if let PortWork::Resetting { until } = port.work {
-            if device::reset_done(self, port_idx) {
-                let slot = device::configure(self, port_idx);
-                self.port_bound(port_idx, slot);
-                // Whatever the reset and the enumeration behind it raised. The
-                // one that matters is not PRC, which `configure` clears, but
-                // any flag left set on a port that is now quiet: the next thing
-                // to happen here is the device being pulled, and a CSC that is
-                // already '1' is a disconnect the controller cannot report.
-                self.acknowledge_port_read(port_idx);
-                return None;
-            }
-            if now < until {
-                return Some(until);
-            }
-            log!("xHCI: port {} never finished its reset (PORTSC {portsc:#010x}); skipping it",
-                port_idx + 1);
-            // Attached, so the port is not tried again until the device is
-            // pulled — which is what the boot path does with the same failure,
-            // and what stops a port the controller will not reset from being
-            // reset forever.
-            self.ports[port_idx as usize].attached = true;
-            self.ports[port_idx as usize].work = PortWork::Settled;
-            return None;
-        }
-
-        self.acknowledge_port_change(port_idx, portsc);
-
-        // **The reap that makes the invisible case an ordinary one.** The port
-        // reads connected and the driver already believed it was, so nothing
-        // below would act — but CSC says it stopped being connected in
-        // between, and whatever is in the port now, the device that was here is
-        // gone. It goes through the ordinary teardown, which is what makes this
-        // one path and not a second: input sources, slot and pool block come
-        // back exactly as they do for an unplug the driver *did* see.
-        //
-        // Here rather than further down because the evidence expires: the
-        // acknowledge above cleared CSC, so a later pass has nothing left to
-        // read. Tearing down now sets `attached` false, which turns the rest of
-        // this function's ordinary "connected and not attached" path into the
-        // fresh-connect it already knows how to run.
-        if connected && replugged && self.ports[port_idx as usize].attached {
-            log!("xHCI: port {} was unplugged and plugged back in between two looks; \
-                 tearing the old device down before enumerating what is there now",
-                port_idx + 1);
-            self.teardown_port(port_idx);
-        }
-
-        let port = self.ports[port_idx as usize];
-        let held = match port.work {
-            // A change the driver has not seen before. The debounce is measured
-            // from here rather than from the event, because the event says a
-            // flag was raised and this says what the port now reads.
-            PortWork::Settled => {
-                if connected == port.attached {
+        const MAX_EFFECTS: usize = 16;
+        for _ in 0..MAX_EFFECTS {
+            let portsc = self.read_portsc(port_idx);
+            match self.ports[port_idx as usize].step(portsc, now) {
+                Step::Idle => return None,
+                Step::Wait(at) => return Some(at),
+                Step::GaveUp(GaveUp::ResetNeverFinished) => {
+                    log!("xHCI: port {} never finished its reset (PORTSC {:#010x}); skipping it",
+                        port_idx + 1, portsc.raw());
                     return None;
                 }
-                self.ports[port_idx as usize].work = PortWork::Debouncing { at: now };
-                return Some(now + PORT_DEBOUNCE_NS);
+                Step::Write(write) => self.write_portsc(port_idx, write),
+                Step::Reset(write) => {
+                    log!("xHCI: port {} connected", port_idx + 1);
+                    self.write_portsc(port_idx, write);
+                }
+                Step::Teardown(why, pending) => {
+                    pending.running();
+                    match why {
+                        Gone::Disconnected => log!("xHCI: port {} disconnected", port_idx + 1),
+                        Gone::Replugged => log!(
+                            "xHCI: port {} was unplugged and plugged back in between two looks; \
+                             tearing the old device down before enumerating what is there now",
+                            port_idx + 1
+                        ),
+                    }
+                    self.teardown_port(port_idx);
+                    self.ports[port_idx as usize].torn_down();
+                }
+                Step::Enumerate(pending) => {
+                    pending.running();
+                    let slot = device::configure(self, port_idx);
+                    self.ports[port_idx as usize].enumerated(slot.and_then(NonZeroU8::new));
+                    // Whatever the reset and the enumeration behind it raised.
+                    // The one that matters is not PRC, which `configure`
+                    // clears, but any flag left set on a port that is now
+                    // quiet: the next thing to happen here is the device being
+                    // pulled, and a CSC that is already '1' is a disconnect the
+                    // controller cannot report.
+                    self.acknowledge_port_read(port_idx);
+                    return None;
+                }
             }
-            // It changed its mind back: there is nothing to act on, and the
-            // next change starts a fresh debounce.
-            PortWork::Debouncing { .. } if connected == port.attached => {
-                self.ports[port_idx as usize].work = PortWork::Settled;
-                return None;
-            }
-            PortWork::Debouncing { at } => now.saturating_sub(at),
-            PortWork::Resetting { .. } => unreachable!("returned above"),
-        };
-        if held < PORT_DEBOUNCE_NS {
-            return Some(now + PORT_DEBOUNCE_NS - held);
         }
-        if !connected {
-            log!("xHCI: port {} disconnected", port_idx + 1);
-            self.teardown_port(port_idx);
-            return None;
-        }
-        log!("xHCI: port {} connected", port_idx + 1);
-        device::begin_reset(self, port_idx);
-        self.ports[port_idx as usize].work = PortWork::Resetting { until: now + USB_TIMEOUT_NS };
-        Some(now + USB_TIMEOUT_NS)
+        log!("xHCI: port {} produced {MAX_EFFECTS} effects without settling; leaving it",
+            port_idx + 1);
+        None
     }
 
     /// Everything a device that is no longer on the bus leaves behind, in the
@@ -1547,10 +1430,7 @@ impl XhciController {
                 ),
             }
         }
-        let port = &mut self.ports[port_idx as usize];
-        port.attached = false;
-        port.work = PortWork::Settled;
-        if let Some(slot) = port.slot.take() {
+        if let Some(slot) = self.ports[port_idx as usize].take_slot() {
             self.disable_slot(slot.get());
         }
 
@@ -1777,7 +1657,7 @@ impl XhciController {
         // broken completion for is restarted where nobody else is waiting on
         // this ring.
         self.recover_endpoints();
-        if !self.ports_dirty && self.ports.iter().all(|p| p.work == PortWork::Settled) {
+        if !self.ports_dirty && !self.ports.iter().any(PortState::outstanding) {
             return None;
         }
         self.ports_dirty = false;
@@ -2208,7 +2088,7 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         let off = OP_PORT_BASE + p as u64 * PORT_REG_SIZE;
         let portsc = op_base.read_u32(off);
         if portsc & PORTSC_PP == 0 {
-            op_base.write_u32(off, portsc_neutral(portsc) | PORTSC_PP);
+            op_base.write_u32(off, Portsc::from_raw(portsc).neutral().powered().raw());
         }
         if op_base.read_u32(off) & PORTSC_PP != 0 {
             powered += 1;
@@ -2240,7 +2120,7 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         event_phase: true,
         devices: Vec::new(),
         msc: [MscBlock::FREE; MSC_BLOCKS],
-        ports: alloc::vec![Port::EMPTY; max_ports as usize],
+        ports: alloc::vec![PortState::EMPTY; max_ports as usize],
         ports_dirty: false,
         #[cfg(feature = "xhci-portsc-rw1c")]
         software_disabled: [0u64; 4],

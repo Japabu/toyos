@@ -270,6 +270,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // timing. Its own boot, its own config, and the only client its soundd has.
     ("doom_sound_flood", Sched::Parallel),
     ("netd_connection_caps", Sched::Parallel),
+    // Its own boot with a NIC under it, because sshd leaves at the bind on
+    // every other config. Every verdict is a line of text; no clock in any.
+    ("sshd_fail_closed", Sched::Parallel),
     // Serial: it measures netd's 2 s handshake deadline against the host's
     // clock, and counts how many connections survived a 48 ms paced burst
     // before that deadline could expire any of them. Both are wall-clock
@@ -6744,6 +6747,55 @@ fn run_machine_test(
             eprintln!(
                 "  [metal-sim] {CYCLES} pointer plug/unplug cycles, {bound} source bindings, \
                  desktop still compositing"
+            );
+            Ok(())
+        }
+        "sshd_fail_closed" => {
+            // sshd with a network under it — the only boot that gets past its
+            // bind. What that reaches for the first time is the daemon's own
+            // state on disk: the identity it mints under `/home`, and the file
+            // it authenticates against.
+            //
+            // The verdict is that it authenticates nobody and says which file
+            // left it that way. A daemon that cannot accept any key must not
+            // be holding port 22, so "never listened" is asserted too — that
+            // is the half a missing-file check would still pass without.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sshdcase");
+            let options = BootOptions {
+                profile: qemu::Profile::Headless,
+                ..Default::default()
+            };
+            if !qemu::profile_argv(&options).iter().any(|a| a.contains("virtio-net")) {
+                return Err("this test needs a NIC and the profile has none".to_string());
+            }
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            let mut console = qemu.boot_log().to_string();
+
+            // Minting proves `/home/root/.ssh` is creatable and writable from
+            // userland; the fingerprint proves the key it wrote reads back.
+            const WANT: [&str; 3] = [
+                "sshd: minted a new host identity at /home/root/.ssh/host_ed25519",
+                "sshd: host identity SHA256:",
+                "sshd: cannot read /home/root/.ssh/authorized_keys",
+            ];
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline && !WANT.iter().all(|w| console.contains(w)) {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            for want in WANT {
+                if !console.contains(want) {
+                    return Err(format!("{want:?} never reached the console:\n{console}"));
+                }
+            }
+            if console.contains("sshd: listening on port 22") {
+                return Err(format!(
+                    "sshd listened on port 22 with no key it could ever accept:\n{console}"
+                ));
+            }
+            eprintln!(
+                "  [sshd] host identity minted under /home, and no authorized_keys file \
+                 left it refusing to listen at all"
             );
             Ok(())
         }

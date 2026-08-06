@@ -22,6 +22,45 @@ that followed the T14's first boot.
 
 ## 1. Isolation and untrusted input
 
+### sshd's keys are as protected as any other file, which is not at all
+
+`/home/root/.ssh/host_ed25519` is the machine's SSH private key and
+`/home/root/.ssh/authorized_keys` is the list of who may log in. There is no
+user model and no file permissions, so **any process on the machine can read
+the first and rewrite the second** — the second being the one that matters:
+appending a line to it is a remote login, and nothing stops a process doing it.
+
+This is not an sshd defect and cannot be fixed inside sshd. It is the absence
+of the thing `specs/capability-handles-spec.md` is about — an owner for a
+kernel object, and a process that holds fewer rights than the machine.
+Deliberately not worked around here: a daemon-private hiding place would be
+obfuscation, and inventing a user model to serve one daemon is the wrong shape
+for the decision. Until there is one, **sshd's trust boundary is the machine,
+not the account** — anyone who can run code on it can already be anyone.
+
+The daemon does what it can from where it stands: it is not in any boot config,
+it offers public keys only, an `authorized_keys` entry carrying options
+authorizes nothing (the options are the restrictions, and honouring the key
+without them grants more than the file says), and a host key that exists but
+does not parse is refused rather than replaced, because minting over it would
+change the identity every client has pinned.
+
+### Nothing connects to sshd, so its accept path is read-verified
+
+`tests/sshdcase` boots sshd with a NIC and certifies the half that needs a
+machine: that it mints an identity under `/home`, that it names the file it
+authenticates against, and that with no usable key it exits instead of holding
+port 22. The decision itself — this key yes, that key no, an options line
+never — is host-tested in `userland/sshd`'s own `#[cfg(test)]` module against
+real Ed25519 keys and `ssh-key`'s parser.
+
+What neither reaches is a client. No test completes an SSH handshake, so the
+wiring between russh's auth callbacks and that decision — `auth_publickey`,
+`auth_publickey_offered`, and the `MethodSet` that stops password auth being
+offered at all — is certified by reading. Closing it needs an SSH client on the
+host talking to the guest through `hostfwd`, which is
+`specs/daemon-testability.md` §131's step and belongs with gate N.
+
 ### THE CLASS: an id or a name treated as a capability
 
 Three separate defects in this file are one defect. A `PipeId`, a service name
@@ -2438,6 +2477,38 @@ used to name as the closing move now exists (`buildlock::guest_slot`,
 `specs/test-cost-audit.md` §5.6): the host admits twelve guests across every
 worktree, so the four-suite regime these were observed in cannot recur. A looser
 assertion is still not the answer.
+
+**But `ALONE … red again — the defect is real` is not evidence, and the protocol
+above leans on it.** The re-run happens inside the same process, moments after
+twelve guests have been torn down and while another worktree's suite may still
+own the host — so it is alone in the suite's bookkeeping and not on the machine.
+Measured 2026-08-06 on the xHCI port-machine branch, whose kernel delta is
+`drivers/xhci/` and touches no PS/2 and no compositor path:
+
+```
+full suite, run 1 (483.7 s for 262 tests):
+  FAIL i8042_mouse — 975 of 1004;  ALONE: GREEN
+  FAIL screen_early_panic;         ALONE: GREEN
+full suite, run 2, the landing gate (512.1 s):
+  FAIL i8042_mouse — 560 of 592;   ALONE: red again — the defect is real
+  FAIL desktop_locale_detect;      ALONE: red again — the defect is real
+then, genuinely alone, same session, minutes later:
+  main         a051a67:  i8042_mouse PASS 10.4 s   desktop_locale_detect PASS 11.4 s
+  the branch   38431c7:  i8042_mouse PASS  4.1 s   desktop_locale_detect PASS  5.6 s
+```
+
+Both trees green on both tests with the host to themselves, and the same suite
+that took 120.4 s at the last quiet landing took 484 and 512 s in these two — so
+the host was carrying roughly four times its own load throughout, the `ALONE`
+re-run included. A verdict that flips between "GREEN, it is the host" and "red
+again, the defect is real" for one test on one tree twenty minutes apart is
+measuring the host in both directions.
+
+Consequence for the protocol: `ALONE: GREEN` still means what it says, because a
+green cannot be produced by load. `ALONE: red again` means nothing on its own
+and must be confirmed against `main` in the same session before it is believed —
+which is the A/B the audio rules already require and which this line currently
+invites an agent to skip.
 
 ### A whole parallel phase can be starved by another agent's build
 
