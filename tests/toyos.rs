@@ -138,6 +138,9 @@ const RUST_SKIP: &[&str] = &[
     // Same again, and it also needs a host injecting pointer packets:
     // `metal_sim_window_drag` runs it.
     "window_drag",
+    // Needs a compositor, a terminal and a shell: `desktop_window_child`
+    // launches it from that shell.
+    "window_child",
     // Needs netd with a NIC. `netd_connection_caps` runs it on tests/netcase.
     "netd_caps",
     // Same reason, same config: `netd_hostile_peer` runs it there.
@@ -341,6 +344,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // so a guest that is slow costs seconds and not a verdict, and the verdict
     // itself is a fraction of the screen that no amount of load moves.
     ("desktop_typing_damage", Sched::Parallel),
+    ("desktop_window_child", Sched::Parallel),
     // The same desktop with soundd behind it: an audio client spawned by a
     // shell, which is the only place all three of its descriptors are pipes to
     // a surface. Parallel — every verdict is a marker with its own ceiling, and
@@ -3844,7 +3848,16 @@ fn type_line(input: &mut qemu::QmpInput, line: &str) {
 /// it is retried because the first keystrokes can land before the shell has
 /// its stdin.
 fn shell_answers(qemu: &mut QemuInstance, log: &mut String) -> bool {
-    const NONCE: &str = "surface-up-zqjxk";
+    shell_echoes(qemu, log, "surface-up-zqjxk")
+}
+
+/// [`shell_answers`] with the nonce named, for a caller that asks more than
+/// once.
+///
+/// The nonce must differ between asks. `serial_until` scans everything
+/// captured so far, so a later question with an earlier answer still in the
+/// log is answered by that one whatever the shell is doing.
+fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> bool {
     // Retyping rather than waiting longer, because until the terminal has a
     // shell behind it there is nothing to swallow the line and an attempt that
     // lands early leaves no trace. The ceiling on the retries is the phase's:
@@ -3853,13 +3866,165 @@ fn shell_answers(qemu: &mut QemuInstance, log: &mut String) -> bool {
     while Instant::now() < deadline {
         {
             let mut input = qemu::QmpInput::open(qemu.qmp_socket());
-            type_line(&mut input, &format!("echo {NONCE}"));
+            type_line(&mut input, &format!("echo {nonce}"));
         }
-        if serial_until(qemu, log, NONCE, Duration::from_secs(2)) {
+        if serial_until(qemu, log, nonce, Duration::from_secs(2)) {
             return true;
         }
     }
     false
+}
+
+/// A shell must get its prompt back when a windowed child's window goes.
+///
+/// The owner opened snake, closed its window with the X button, and never saw
+/// a prompt again. Both readings of his log are testable here and the two
+/// probes separate them: the first ends the child by *its own* exit, the
+/// second by the compositor taking its window away while it is alive —
+/// GUI+Q, which is the same `windows.remove` + `MSG_WINDOW_CLOSE` + drop the
+/// X button runs and is a keystroke rather than a guess at where the button
+/// is.
+///
+/// The client is a bare `window::Window`, so a reproduction here is about the
+/// shell, the terminal and the window protocol, and a clean run narrows the
+/// defect to what winit does that this does not.
+/// How many times snake is opened and closed. One green round says very little
+/// about a report that arrived once.
+const SNAKE_ROUNDS: usize = 3;
+/// Turns played in the last round, at four keys each, so that round's snake is
+/// a program that has been running and drawing rather than one a second old.
+const SNAKE_TURNS: usize = 8;
+
+fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let bins: Vec<(String, Vec<u8>)> =
+        rust_bins.iter().filter(|(name, _)| name == "window_child").cloned().collect();
+    if bins.is_empty() {
+        return Err("the window_child client was not built".to_string());
+    }
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopcase");
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        qmp: true,
+        ready_marker: "compositor: ready",
+        // The T14's core count. A desktop's teardown is four processes handing
+        // pipes back to each other, and on two cores most of that is ordered
+        // by having nowhere else to run.
+        smp: 8,
+        ..Default::default()
+    };
+    metal_sim_argv_check(&qemu::profile_argv(&options))?;
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
+    let mut log = qemu.boot_log().to_string();
+    if !shell_answers(&mut qemu, &mut log) {
+        return Err(format!("nothing typed at the terminal window reached a shell:\n{log}"));
+    }
+
+    // A windowed child that leaves on its own. The shell is in `waitpid` and
+    // the compositor never touches its connection, so this is the plain case
+    // and it has to work before the second probe means anything.
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "test_rs_window_child exit");
+    }
+    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-GONE", Duration::from_secs(20)) {
+        return Err(format!("the windowed child never reported leaving:\n{log}"));
+    }
+    if !shell_echoes(&mut qemu, &mut log, "after-own-exit-zqjxk") {
+        return Err(format!(
+            "a windowed child exited by itself and the shell never answered again:\n{log}"
+        ));
+    }
+
+    // The owner's case: the process is alive and the compositor takes its
+    // window away underneath it.
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "test_rs_window_child");
+    }
+    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-UP", Duration::from_secs(20)) {
+        return Err(format!("the windowed child never got a window:\n{log}"));
+    }
+    {
+        // GUI+Q closes the focused window, and a window the compositor has
+        // just created is the focused one.
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);
+    }
+    let before = log.len();
+    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-GONE", Duration::from_secs(20))
+        || !log[before..].contains("WINDOW-CHILD-GONE")
+    {
+        return Err(format!(
+            "the compositor closed the window and the client did not leave:\n{}",
+            &log[before.min(log.len())..]
+        ));
+    }
+    if log[before..].contains("WINDOW-CHILD-TIMEOUT") {
+        return Err(format!(
+            "the client left on its own deadline, so it never saw the close:\n{}",
+            &log[before..]
+        ));
+    }
+    if !shell_echoes(&mut qemu, &mut log, "after-window-closed-zqjxk") {
+        return Err(format!(
+            "the compositor closed a child's window and the shell never answered again — \
+             this is the owner's snake report, reproduced:\n{log}"
+        ));
+    }
+    // And the program he actually ran. Everything above is a `window::Window`
+    // and nothing else; snake is that under winit and softbuffer, which is the
+    // only difference left between this test and his session.
+    //
+    // Three rounds, and the last one is played first: his snake had run 39 s
+    // and spent 22.4 s of CPU when he closed it, and a window closed one
+    // second after it opened exercises a quieter program than that. One green
+    // round would say very little about a report that arrived once.
+    for round in 0..SNAKE_ROUNDS {
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            type_line(&mut input, "snake");
+        }
+        // snake prints nothing of its own, so the compositor's second window
+        // is what says it is up — and a window it has just created is the
+        // focused one, which is what GUI+Q then closes.
+        if !serial_until(&mut qemu, &mut log, "windows=2", Duration::from_secs(20)) {
+            return Err(format!("snake never got a window in round {round}:\n{log}"));
+        }
+        if round + 1 == SNAKE_ROUNDS {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            for _ in 0..SNAKE_TURNS {
+                for key in ["left", "down", "right", "up"] {
+                    input.keys(&[(key, true), (key, false)]);
+                    thread::sleep(Duration::from_millis(120));
+                }
+            }
+        }
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);
+        }
+        let before = log.len();
+        if !serial_until(&mut qemu, &mut log, "exit: snake", Duration::from_secs(20))
+            || !log[before..].contains("exit: snake")
+        {
+            return Err(format!(
+                "snake did not leave when its window was closed in round {round}:\n{}",
+                &log[before.min(log.len())..]
+            ));
+        }
+        if !shell_echoes(&mut qemu, &mut log, &format!("after-snake-{round}-zqjxk")) {
+            return Err(format!(
+                "snake's window was closed, snake left, and the shell never answered again \
+                 (round {round}) — the owner's report, reproduced:\n{log}"
+            ));
+        }
+    }
+
+    eprintln!(
+        "  [desktop] a windowed child and {SNAKE_ROUNDS} snakes each left both ways and the \
+         shell kept its prompt"
+    );
+    Ok(())
 }
 
 /// What a typed character costs the desktop.
@@ -5110,6 +5275,7 @@ fn run_machine_test(
         "console_locale_detect" => console_locale_detect(),
         "desktop_locale_detect" => desktop_locale_detect(),
         "desktop_typing_damage" => desktop_typing_damage(),
+        "desktop_window_child" => desktop_window_child(rust_bins),
         "desktop_audio_client" => desktop_audio_client(),
         "blocked_dump" => blocked_dump(),
         "xhci_many_devices" => {
