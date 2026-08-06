@@ -272,6 +272,10 @@ these groups boot the same machine more than once:
 | 2 | `testcases` / `Headless` / plain | `iommu_discovery`, `metal_sim_input` |
 | 2 | `testcases` / `Metal` / plain | `i8042_health`, `i8042_undecoded_bytes` |
 
+Counts here are the measurement's, not a running total: `screen_pager_keys`
+(`testcases` / `Metal` / `test-late-panic`) has been added since and is a shape
+of its own, so it joins no group above and removes nothing.
+
 **12 boots removable, ~44 s (7%).** Note this is half what a coarser key
 suggests: grouping on `(config, profile, features)` alone shows 23 removable
 boots, and the difference is entirely `i8042: false`, `mute`, staged images and

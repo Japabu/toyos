@@ -197,6 +197,7 @@ const SCREEN_TESTS: &[(&str, Sched)] = &[
     ("screen_panic_muted", Sched::Parallel),
     ("screen_console_panic", Sched::Parallel),
     ("screen_fatal_halt", Sched::Parallel),
+    ("screen_pager_keys", Sched::Serial),
 ];
 
 /// What `screen_console_shell` types, and what it then looks for on its own.
@@ -2528,6 +2529,96 @@ fn run_screen_test(
             if pages.len() < 2 {
                 return Err(format!(
                     "only one page footer ever appeared ({seen}); the pager is not cycling"
+                ));
+            }
+            Ok(())
+        }
+        "screen_pager_keys" => {
+            // The halted pager takes PageUp/PageDown off the i8042 with every
+            // CPU stopped, and this is the only place that claim can be made:
+            // the decode is `toyos-ps2`'s and host-tested, but that a keystroke
+            // reaches a machine which has stopped scheduling is a fact about
+            // the controller and the poll, not about the table.
+            //
+            // `Profile::Metal` because QEMU routes injected keys to one handler
+            // per device class: every profile with a `usb-kbd` sends them there
+            // instead, and this is the only GOP machine without one.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    profile: qemu::Profile::Metal,
+                    qmp: true,
+                    kernel_features: &["test-late-panic"],
+                    ready_marker: "!!! PANIC !!!",
+                    ..Default::default()
+                },
+            );
+            let socket = qemu.qmp_socket().to_path_buf();
+
+            // The footer only exists once the report overflows the screen, so
+            // waiting for one is waiting for the pager to be the thing on
+            // screen. `page_forever` returns without looping below two pages.
+            // Retried, because a dump taken while the pager is repainting
+            // catches a half-written bottom row and no footer at all.
+            let footer = |q: &mut QemuInstance| {
+                for _ in 0..4 {
+                    let text = q.screendump().text();
+                    if let Some(f) = text.lines().rev().find(|l| l.starts_with("[page ")) {
+                        return Some(f.to_string());
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                None
+            };
+            let deadline = Instant::now() + qemu::budget(Duration::from_secs(30));
+            let mut last = loop {
+                if let Some(f) = footer(&mut qemu) {
+                    break f;
+                }
+                if Instant::now() >= deadline {
+                    return Err("no `[page n/m]` footer ever appeared; nothing was paging".into());
+                }
+            };
+
+            // One keystroke per sample. Every one of them should move the page,
+            // where the 3 s deadline that stands in for a dead keyboard could
+            // not have moved it more than once per 3 s of the elapsed run.
+            const SAMPLES: usize = 30;
+            let started = Instant::now();
+            let mut moved = 0usize;
+            for _ in 0..SAMPLES {
+                qemu::qmp_send_keys(&socket, &[("pgdn", true), ("pgdn", false)]);
+                let Some(now) = footer(&mut qemu) else {
+                    return Err(format!("the footer vanished mid-run after {moved} moves"));
+                };
+                if now != last {
+                    moved += 1;
+                }
+                last = now;
+            }
+            let elapsed = started.elapsed();
+
+            // What the deadline alone could have contributed, plus the one it
+            // may have been part-way through when the window opened. The
+            // verdict is a rate against the guest's own clock, which is why
+            // this test is `Sched::Serial`.
+            let unattended = elapsed.as_secs_f64() / 3.0 + 1.0;
+            print_screen(
+                name,
+                &format!(
+                    "{moved} of {SAMPLES} keystrokes moved the page in {:.1}s; the 3s deadline \
+                     could account for {unattended:.1}",
+                    elapsed.as_secs_f64()
+                ),
+            );
+            if (moved as f64) < unattended * 3.0 {
+                return Err(format!(
+                    "{moved} page moves over {SAMPLES} keystrokes in {:.1}s — the unattended \
+                     deadline alone could have produced {unattended:.1} of them, so nothing \
+                     here says a keystroke reached the halted pager",
+                    elapsed.as_secs_f64()
                 ));
             }
             Ok(())
