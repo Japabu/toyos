@@ -994,3 +994,28 @@ fn find_host_rlibs(root: &Path) -> Option<PathBuf> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No image this repository ships starts sshd.
+    ///
+    /// It listens on every interface and authenticates against a file that is
+    /// absent on a fresh install, so on a default boot it would be a port that
+    /// accepts connections and refuses all of them. Whoever wants it runs
+    /// `/bin/sshd` themselves. It stays in `[programs]` — the gate is on the
+    /// init list, not on the binary being present.
+    #[test]
+    fn no_shipped_boot_config_starts_sshd() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for boot in [Boot::Normal, Boot::Diag, Boot::Console] {
+            let config = boot.config();
+            let init = parse_config(&root.join(config)).init;
+            assert!(
+                !init.iter().any(|p| p.ends_with("/sshd")),
+                "{config} starts sshd from init: {init:?}",
+            );
+        }
+    }
+}

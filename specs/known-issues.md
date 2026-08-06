@@ -22,6 +22,45 @@ that followed the T14's first boot.
 
 ## 1. Isolation and untrusted input
 
+### sshd's keys are as protected as any other file, which is not at all
+
+`/home/root/.ssh/host_ed25519` is the machine's SSH private key and
+`/home/root/.ssh/authorized_keys` is the list of who may log in. There is no
+user model and no file permissions, so **any process on the machine can read
+the first and rewrite the second** — the second being the one that matters:
+appending a line to it is a remote login, and nothing stops a process doing it.
+
+This is not an sshd defect and cannot be fixed inside sshd. It is the absence
+of the thing `specs/capability-handles-spec.md` is about — an owner for a
+kernel object, and a process that holds fewer rights than the machine.
+Deliberately not worked around here: a daemon-private hiding place would be
+obfuscation, and inventing a user model to serve one daemon is the wrong shape
+for the decision. Until there is one, **sshd's trust boundary is the machine,
+not the account** — anyone who can run code on it can already be anyone.
+
+The daemon does what it can from where it stands: it is not in any boot config,
+it offers public keys only, an `authorized_keys` entry carrying options
+authorizes nothing (the options are the restrictions, and honouring the key
+without them grants more than the file says), and a host key that exists but
+does not parse is refused rather than replaced, because minting over it would
+change the identity every client has pinned.
+
+### Nothing connects to sshd, so its accept path is read-verified
+
+`tests/sshdcase` boots sshd with a NIC and certifies the half that needs a
+machine: that it mints an identity under `/home`, that it names the file it
+authenticates against, and that with no usable key it exits instead of holding
+port 22. The decision itself — this key yes, that key no, an options line
+never — is host-tested in `userland/sshd`'s own `#[cfg(test)]` module against
+real Ed25519 keys and `ssh-key`'s parser.
+
+What neither reaches is a client. No test completes an SSH handshake, so the
+wiring between russh's auth callbacks and that decision — `auth_publickey`,
+`auth_publickey_offered`, and the `MethodSet` that stops password auth being
+offered at all — is certified by reading. Closing it needs an SSH client on the
+host talking to the guest through `hostfwd`, which is
+`specs/daemon-testability.md` §131's step and belongs with gate N.
+
 ### THE CLASS: an id or a name treated as a capability
 
 Three separate defects in this file are one defect. A `PipeId`, a service name
