@@ -1400,16 +1400,23 @@ if the test *passes* where the entry says a pass is proof, and is red on
 date rather than a green run. The `--skip` flag that used to be the answer is
 deleted: an exclusion nobody reviews cannot expire, and this one has to.
 
-**A stale `--skip` command line is worse than a refused one, measured
-2026-08-06.** The flag is gone but the words still parse, and `--land --gate
+**CLOSED — a stale `--skip` command line was worse than a refused one, measured
+2026-08-06.** The flag was gone but the words still parsed, and `--land --gate
 cargo test -- --skip desktop_window_child` — the form CLAUDE.md and every
-handover carried until this week — now reaches the harness as two *filters*.
+handover carried until that week — reached the harness as a *filter*.
 It ran exactly one test, `desktop_window_child`, declared it expected, and
 landed on that. `--land` does print `the gate was NOT the default cargo test`,
-which is the only thing that saved it; the run itself looks like a pass. Use
-the ordinary gate. A stale feature name is refused against `kernel/Cargo.toml`
-before any lock and a stale gate flag is not, which is the asymmetry to close
-if this bites twice.
+which is the only thing that saved it; the run itself looks like a pass.
+
+The asymmetry that entry named — a stale feature name refused against
+`kernel/Cargo.toml` before any lock, a stale gate flag not refused at all — is
+closed. `toyos_build::testargs::parse` holds one table of the flags the suite
+has, refuses anything else by name and by consequence, and returns the filter
+out of the same pass, so no word can be a flag's value to one reader and the
+filter to another. It is the first thing `main` does, before the sysroot lock
+and before anything is compiled. A flag added to the harness and not to that
+table is refused the first time it is typed, which is the direction of drift
+that says so rather than the one that narrows a gate.
 
 **What the declaration will and will not absorb.** Its `says` list covers the
 six of this test's messages whose failure is *the desktop ceasing to answer
