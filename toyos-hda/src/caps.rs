@@ -39,6 +39,37 @@ impl WidgetKind {
             other => Self::Reserved(other),
         }
     }
+
+    /// The nibble the codec answered, so a report can carry it beside the name.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::AudioOutput => 0x0,
+            Self::AudioInput => 0x1,
+            Self::Mixer => 0x2,
+            Self::Selector => 0x3,
+            Self::PinComplex => 0x4,
+            Self::Power => 0x5,
+            Self::VolumeKnob => 0x6,
+            Self::BeepGenerator => 0x7,
+            Self::VendorDefined => 0xF,
+            Self::Reserved(code) => code,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AudioOutput => "audio-out",
+            Self::AudioInput => "audio-in",
+            Self::Mixer => "mixer",
+            Self::Selector => "selector",
+            Self::PinComplex => "pin",
+            Self::Power => "power",
+            Self::VolumeKnob => "volume-knob",
+            Self::BeepGenerator => "beep",
+            Self::VendorDefined => "vendor-defined",
+            Self::Reserved(_) => "reserved",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,6 +88,9 @@ pub struct WidgetCaps {
     pub digital: bool,
     pub power_control: bool,
     pub unsolicited: bool,
+    /// The widget carries processing coefficients of its own, which is what
+    /// makes [`crate::verb::PARAM_PROCESSING_CAPS`] a question worth asking it.
+    pub proc_widget: bool,
 }
 
 impl WidgetCaps {
@@ -73,6 +107,7 @@ impl WidgetCaps {
             digital: raw & (1 << 9) != 0,
             power_control: raw & (1 << 10) != 0,
             unsolicited: raw & (1 << 7) != 0,
+            proc_widget: raw & (1 << 6) != 0,
         }
     }
 }
@@ -159,6 +194,17 @@ pub enum Connectivity {
     JackAndFixed,
 }
 
+impl Connectivity {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Jack => "jack",
+            Self::NoPhysicalConnection => "none",
+            Self::FixedFunction => "fixed",
+            Self::JackAndFixed => "jack+fixed",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DefaultDevice {
     LineOut,
@@ -200,6 +246,27 @@ impl DefaultDevice {
             other => Self::Reserved(other),
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LineOut => "line-out",
+            Self::Speaker => "speaker",
+            Self::HeadphoneOut => "hp-out",
+            Self::Cd => "cd",
+            Self::SpdifOut => "spdif-out",
+            Self::DigitalOtherOut => "digital-other-out",
+            Self::ModemLine => "modem-line",
+            Self::ModemHandset => "modem-handset",
+            Self::LineIn => "line-in",
+            Self::Aux => "aux",
+            Self::MicIn => "mic-in",
+            Self::Telephony => "telephony",
+            Self::SpdifIn => "spdif-in",
+            Self::DigitalOtherIn => "digital-other-in",
+            Self::Other => "other",
+            Self::Reserved(_) => "reserved",
+        }
+    }
 }
 
 /// What firmware said this pin is wired to.
@@ -215,6 +282,11 @@ pub struct ConfigDefault {
     pub sequence: u8,
     pub location: u8,
     pub colour: u8,
+    /// Which physical connector firmware named. Nothing here decides on it —
+    /// a jack is a jack whether it is 1/8" or optical — but it is part of what
+    /// firmware said and a report that dropped it would be reporting less than
+    /// the codec answered.
+    pub connection_type: u8,
 }
 
 impl ConfigDefault {
@@ -232,6 +304,7 @@ impl ConfigDefault {
             sequence: (raw & 0xF) as u8,
             location: ((raw >> 24) & 0x3F) as u8,
             colour: ((raw >> 12) & 0xF) as u8,
+            connection_type: ((raw >> 16) & 0xF) as u8,
         }
     }
 
@@ -299,6 +372,25 @@ mod tests {
     }
 
     #[test]
+    fn a_widget_type_keeps_the_nibble_it_was_decoded_from() {
+        for nibble in 0..=0xFu32 {
+            assert_eq!(WidgetCaps::decode(response(nibble << 20)).kind.code(), nibble as u8);
+        }
+        assert_eq!(WidgetKind::AudioOutput.name(), "audio-out");
+        assert_eq!(WidgetKind::PinComplex.name(), "pin");
+        assert_eq!(WidgetKind::BeepGenerator.name(), "beep");
+        assert_eq!(WidgetKind::Reserved(0xE).name(), "reserved");
+    }
+
+    #[test]
+    fn the_t14_s_vendor_widget_is_the_one_with_processing_coefficients() {
+        // node 0x20, the only widget on that codec whose Proc Widget bit is
+        // set, and the only one the probe asks for processing caps.
+        assert!(WidgetCaps::decode(response(0x00f0_0040)).proc_widget);
+        assert!(!WidgetCaps::decode(response(0x0040_058d)).proc_widget);
+    }
+
+    #[test]
     fn eight_channel_display_audio_decodes_its_channel_count() {
         // The T14's display codec, node 0x03: `channels=8`.
         assert_eq!(WidgetCaps::decode(response(0x0000_6611)).channels, 8);
@@ -339,16 +431,26 @@ mod tests {
     fn the_internal_speaker_is_fixed_and_the_jack_is_a_jack() {
         let speaker = ConfigDefault::decode(response(0x9017_0110));
         assert_eq!(speaker.connectivity, Connectivity::FixedFunction);
+        assert_eq!(speaker.connectivity.name(), "fixed");
         assert_eq!(speaker.device, DefaultDevice::Speaker);
+        assert_eq!(speaker.device.name(), "speaker");
         assert_eq!(speaker.association, 1);
         assert_eq!(speaker.sequence, 0);
+        assert_eq!(speaker.location, 0x10);
+        assert_eq!(speaker.connection_type, 0x7);
+        assert_eq!(speaker.colour, 0x0);
         assert!(speaker.is_physical());
 
         let headphone = ConfigDefault::decode(response(0x0421_101f));
         assert_eq!(headphone.connectivity, Connectivity::Jack);
+        assert_eq!(headphone.connectivity.name(), "jack");
         assert_eq!(headphone.device, DefaultDevice::HeadphoneOut);
+        assert_eq!(headphone.device.name(), "hp-out");
         assert_eq!(headphone.association, 1);
         assert_eq!(headphone.sequence, 15);
+        assert_eq!(headphone.location, 0x04);
+        assert_eq!(headphone.connection_type, 0x1);
+        assert_eq!(headphone.colour, 0x1);
     }
 
     #[test]
