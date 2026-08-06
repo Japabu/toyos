@@ -593,7 +593,32 @@ impl Day {
 /// that carries it is not a clean run and says so in its last line. See
 /// [`ExpectedFailure`] for what an entry has to be able to say, and
 /// [`Tally::summary`] for what a run does with one.
-const EXPECTED_FAILURES: &[ExpectedFailure] = &[];
+const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
+    test: "desktop_window_child",
+    task: 156,
+    spec: "specs/known-issues.md §3, \"EXPECTED RED, pending #156\"",
+    // The rule that decides this list, so that the next fragment added to it has
+    // one to be judged against: **a message belongs here when its failure is the
+    // desktop ceasing to answer after a window closed.** That is what both open
+    // defects under this test produce — the freeze, and the shell exiting
+    // instead of prompting. Five of the test's messages are deliberately absent
+    // because each names something else happening: the client binary missing,
+    // the desktop never coming up at all, a window never being created, and the
+    // client leaving on its own deadline. Any of those reds the run.
+    says: &[
+        "the windowed child never reported leaving",
+        "a windowed child exited by itself and the shell never answered again",
+        "GUI+Q never reached the compositor",
+        "the compositor closed the window and the client did not leave",
+        "snake did not leave when its window was closed in round",
+        "snake's window was closed, snake left, and the shell never answered again",
+    ],
+    // Intermittent — it has been red alone and red wide, at a different point
+    // each time — so a green is one sample of a rate and may not red the run.
+    // A month: long enough that a fix already in flight lands first, short
+    // enough that nobody inherits this silently.
+    stale: Stale::OnThisDate("2026-09-06"),
+}];
 
 /// The renderer's two text colours, as the screendump reports them.
 const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];

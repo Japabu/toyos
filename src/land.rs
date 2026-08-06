@@ -51,6 +51,17 @@ fn parse_gate(args: &[String]) -> Vec<String> {
     };
     let rest = args[pos + 1..].to_vec();
     assert!(!rest.is_empty(), "--gate needs a command: --land --gate <program> [args...]");
+    // Refused by name, because the failure otherwise arrives as `No such file or
+    // directory` naming the whole command line — which reads as a broken
+    // toolchain rather than as a quoting mistake. Two agents were given the
+    // quoted form in writing on one day.
+    assert!(
+        !rest[0].contains(char::is_whitespace),
+        "--gate takes a command and its arguments unquoted, not one quoted string: \
+         `--gate cargo test -- foo`, never `--gate \"cargo test -- foo\"`. \
+         Splitting {:?} would mean reimplementing a shell's quoting rules.",
+        rest[0]
+    );
     rest
 }
 
@@ -463,5 +474,21 @@ mod tests {
         let report = run(&wt, &pass()).unwrap();
         assert!(report.contains("NOT the default"), "an override went unreported: {report}");
         assert!(buildlock::integration_is_free(&primary), "the lock was left held");
+    }
+
+    /// The unquoted form is the whole contract of `--gate`, and the quoted one
+    /// used to fail as `No such file or directory` naming the entire command.
+    #[test]
+    fn a_quoted_gate_is_refused_by_name() {
+        let unquoted = ["--land", "--gate", "cargo", "test", "--", "foo"];
+        assert_eq!(
+            parse_gate(&unquoted.map(ToString::to_string)),
+            ["cargo", "test", "--", "foo"],
+        );
+        let quoted = ["--land".to_string(), "--gate".to_string(), "cargo test -- foo".to_string()];
+        let refusal = std::panic::catch_unwind(|| parse_gate(&quoted))
+            .expect_err("one quoted string is not a command");
+        let refusal = refusal.downcast_ref::<String>().expect("an assert's message");
+        assert!(refusal.contains("unquoted"), "{refusal}");
     }
 }

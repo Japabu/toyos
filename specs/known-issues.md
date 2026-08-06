@@ -1275,10 +1275,35 @@ is not trustworthy in general — the xHCI work established that `ALONE: red
 again` can measure the host rather than the tree — but in this direction, on
 this test, green-alone is real.)
 
-**Landing while it is red** uses `--land --gate cargo test -- --skip
-desktop_window_child`, which prints the override in the report and cannot be
-mistaken for an ordinary landing. `--skip` exists for this and should not grow
-other users.
+**A third manifestation, 2026-08-06**, on the mechanism branch, twice in one
+session — once in the 12-wide phase and once in the re-run alone, at 3.5 s into
+both boots. The message is `GUI+Q never reached the compositor`, **and it names
+the wrong thing**: the close did reach the compositor. The log under it is the
+teardown, one probe earlier than the snake rounds — `exit: test_rs_window_child
+pid=5 code=0`, then `exit: shell pid=2 code=0`, then `exit: terminal pid=1
+code=0`, then `windows=0`. `close_focused_window` waits for `windows=1` and the
+desktop went straight to none, so the harness reports the injection it did
+deliver as one that never arrived. Serial kept flowing for the whole drain —
+compositor stats every ~2 s, kernel stats every 10 s — so by this entry's own
+discriminator it is **not** the freeze; it is the shell-exit defect three
+paragraphs down, reached at the first windowed child rather than during a snake
+round. Whoever fixes that message should make it say what the log says.
+
+**Landing while it is red** needs nothing special: `desktop_window_child` is
+declared in `EXPECTED_FAILURES` (`tests/toyos.rs`) and `cargo run -- --land`
+runs the ordinary gate. The declaration reports it by name on every run, is red
+if the test *passes* where the entry says a pass is proof, and is red on
+`2026-09-06` regardless — this entry is intermittent, so its own expiry is a
+date rather than a green run. The `--skip` flag that used to be the answer is
+deleted: an exclusion nobody reviews cannot expire, and this one has to.
+
+**What the declaration will and will not absorb.** Its `says` list covers the
+six of this test's messages whose failure is *the desktop ceasing to answer
+after a window closed*. The other five red the run — the client binary missing,
+the desktop never coming up, a window never being created, and the client
+leaving on its own deadline. That pins which assertion failed and not why, so
+the log-tail discriminator above is still a human's to apply; the run prints the
+pointer to this section beside every `XFAIL` line for exactly that reason.
 
 **What the test was built to chase is still open underneath it**, and is not
 the same thing: on `boot8-snake.log` the owner closed snake's window and got
