@@ -482,16 +482,36 @@ is not on the list at all because it is a store into DMA memory soundd owns.
   findings were committed; the whole `(a)` block — scope members, RMRR, MSI
   vectors, BAR0 size/width/movability, `2m-page-neighbours`, `ECAP.SC` — is
   **not in this repository**. §6.5 records that and what to do about it.
-- **A read-only mapping is not an uncacheable one.** `CachePolicy` has two
-  variants and neither is UC (`kernel/src/mm/paging.rs:41-51`);
-  `DeferToMtrr` is PAT entry 0, which is WB and takes the MTRR's type. Every
-  MMIO mapping in this kernel already relies on that and the xHCI and NVMe
-  drivers work on the T14, so firmware's MTRRs do say UC for this range — but
-  that is inference from working drivers and not a read of
-  `mtrr::range_type` for BAR0. §4.4 item 2's third variant is **more**
+- **A read-only mapping is not an uncacheable one, and UC is not currently
+  speakable.** `CachePolicy` has two variants and neither is UC
+  (`kernel/src/mm/paging.rs:41-51`); `DeferToMtrr` is PAT entry 0, which is WB
+  and takes the MTRR's type. Every MMIO mapping in this kernel already relies on
+  that and the xHCI and NVMe drivers work on the T14, so firmware's MTRRs do say
+  UC for this range — but that is inference from working drivers and not a read
+  of `mtrr::range_type` for BAR0. §4.4 item 2's third variant is **more**
   load-bearing under the stub than it was under a full handoff: `SDnLPIB` read
   out of a write-back mapping returns a stale position, and the symptom is a
   completion mask that looks like a scheduling defect.
+
+  **And adding it is not the one-line change it looks like.** `pat::init` writes
+  the architectural reset table with entry 4 alone changed to WC —
+  `ENTRIES = [WB, WT, UC-, UC, WC, WT, UC-, UC]` (`kernel/src/arch/pat.rs:37`).
+  A 2 MiB PDE names its entry with `PAT<<2 | PCD<<1 | PWT`, so with PCD and PWT
+  clear **only indices 0 and 4 are reachable, and both are already taken**.
+  Strong UC is at 3 and 7 and needs both bits; UC- is at 2 and 6 and needs PCD.
+  So an `Uncacheable` variant must set PCD and PWT, which contradicts
+  `paging.rs:36-38`'s stated invariant that this kernel leaves them clear
+  everywhere, *and* `from_pde`'s assert (`paging.rs:64-71`) panics on exactly
+  the PDE it would install — on the very mapping the stub creates, through
+  `user_policy` at `shared_memory.rs:70-73`. Reprogramming a spare slot does not
+  help: every spare needs one of the two bits to be named at all.
+
+  **Take entry 3, strong UC, not entry 2.** UC- yields WC where the MTRR says
+  WC, which is the stale-position failure above rather than a defence against
+  it. What the change costs: the variant, `pde_bits`, a rewritten `from_pde`
+  that decodes all three bits and still refuses the four indices this kernel
+  does not use, and `pat.rs:29-33`'s claim about leaving "the two bits that mean
+  uncacheable to older software untouched", which stops being true.
 - **`shared_memory` cannot map read-only today.** `SharedRegion::map_into`
   passes `writable: true` literally (`kernel/src/shared_memory.rs:64`) and the
   region carries no such field. One field and one argument; named because it is
@@ -1227,10 +1247,12 @@ Each with what settles it, and how early.
     review is the other half. The one thing that would make it unrepresentable —
     a generated table from a register description — is not proposed here,
     because there are eight entries.
-13. **NEW — `Uncacheable` is not in `CachePolicy` yet**, so a BAR mapped today
-    would be write-back and `SDnLPIB` would read stale. §4.1.4. It is a build
-    step and not a research question, but it is the failure that looks most like
-    a scheduler bug.
+13. **NEW — `Uncacheable` is not in `CachePolicy` and cannot be added without
+    breaking the kernel's PCD/PWT invariant.** §4.1.4 has the arithmetic. A BAR
+    mapped today would be write-back and `SDnLPIB` would read stale, which is
+    the failure that looks most like a scheduler bug. Not a research question,
+    but larger than one variant, and it touches an assert that fires on the
+    stub's own mapping.
 
 ---
 
