@@ -255,6 +255,84 @@ fn probe_silent(asked: &[bool; MAX_CPUS], cpus: usize) {
     }
 }
 
+/// Stage the one machine state this report exists to describe and that QEMU
+/// cannot produce: a CPU that ignores a kick.
+///
+/// Nothing on the host side can make a guest CPU deaf. QEMU delivers every IPI
+/// it is given, and a guest that stops scheduling stops for reasons — a spin
+/// with `IF` clear, a lock nobody releases — that are properties of the code
+/// under test rather than of the machine, so there is no `-device` and no
+/// monitor command that stages one. A kernel feature is the only actuator, and
+/// it replaces the *state* rather than the verdict: the victim really does
+/// disable interrupts and really does spin, so the kick really is unanswered
+/// and the NMI really is what reaches it.
+///
+/// Bounded and self-healing on purpose. The window is longer than
+/// [`ANSWER_BUDGET_NS`] so the CPU is named silent, and short enough that it
+/// rejoins and the guest shuts down cleanly — which is itself part of the
+/// assertion, since a CPU the NMI merely interrupted must come back.
+#[cfg(feature = "dump-deaf-cpu")]
+pub(super) fn deaf_window() {
+    /// Late enough that the machine is up and every CPU has joined.
+    const ARM_AT_NS: u64 = 3_000_000_000;
+    /// Comfortably past [`ANSWER_BUDGET_NS`], so "silent" is not a race — and
+    /// bounded, so the CPU rejoins and the guest still shuts down.
+    const DEAF_NS: u64 = 400_000_000;
+    /// How long cpu0 waits for the victim to reach its idle loop and go deaf.
+    const ACK_BUDGET_NS: u64 = 100_000_000;
+
+    const IDLE: u64 = 0;
+    const ASKED: u64 = 1;
+    const DEAF: u64 = 2;
+
+    static STAGE: AtomicU64 = AtomicU64::new(IDLE);
+    static FIRED: AtomicBool = AtomicBool::new(false);
+
+    let cpus = online_cpus();
+    if cpus < 2 {
+        return;
+    }
+    let me = percpu::cpu_id() as usize;
+    let victim = cpus - 1;
+
+    if me == victim {
+        if STAGE
+            .compare_exchange(ASKED, DEAF, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let until = crate::clock::nanos_since_boot() + DEAF_NS;
+            // SAFETY: the actuator's whole content. Interrupts come back on
+            // below and the loop is bounded by the clock.
+            unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+            while crate::clock::nanos_since_boot() < until {
+                core::hint::spin_loop();
+            }
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        }
+        return;
+    }
+    if me != 0 || crate::clock::nanos_since_boot() < ARM_AT_NS {
+        return;
+    }
+    if FIRED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // Drive the whole sequence from here rather than across idle-loop
+    // iterations: cpu0 may halt between two of them, and the window it has to
+    // ask inside is only as long as the victim stays deaf.
+    STAGE.store(ASKED, Ordering::Release);
+    apic::kick_cpu(victim as u32);
+    let deadline = crate::clock::nanos_since_boot().saturating_add(ACK_BUDGET_NS);
+    while STAGE.load(Ordering::Acquire) != DEAF {
+        if crate::clock::nanos_since_boot() >= deadline {
+            log!("dump-deaf-cpu: cpu{victim} never reached its idle loop to be deafened");
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    request();
+}
+
 /// The NMI handler's whole contribution: where this CPU was. Called from
 /// `arch/idt/nmi.rs` and from nowhere else.
 ///
