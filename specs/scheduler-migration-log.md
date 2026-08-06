@@ -627,3 +627,78 @@ after 1224 ms of CPU, where #141 is a winit app that spins forever instead.
 Nor is it a regression from the deadline fix: `11a88f4` wrote those same three
 exits into known-issues at 17:32, and `add6aeb` landed at 18:05 and is not an
 ancestor of it.
+
+### The desktop was told to close twice, and the second GUI+Q took the terminal
+
+The teardown above is not a guest defect. Instrumenting the compositor's GUI+Q
+arm and the terminal's two exits says so in one line each:
+
+```
+compositor: DIAG GUI+Q closes idx=1 pid=5, 1 left
+exit: test_rs_window_child pid=5 code=0
+WINDOW-CHILD-GONE
+compositor: DIAG GUI+Q closes idx=0 pid=1, 0 left
+terminal: DIAG got window Close
+exit: shell pid=2 code=60
+exit: terminal pid=1 code=0
+```
+
+Two closes, ~200 ms apart, the second naming pid 1 — the terminal. Everything
+after it is correct: the terminal breaks on `Event::Close`, drops
+`shell_stdin`, the shell's stdin reaches genuine EOF (code 60 is
+`UnexpectedEof`, encoded into the exit code because a diagnostic through that
+pipe is lost with it), the shell leaves, and the terminal's `child.wait()`
+returns.
+
+**The second GUI+Q is the harness's.** `close_focused_window` loops
+`while !log[new..].contains("windows=1")` and waits with `serial_until`, which
+scans the *whole* capture — so `windows=1` from the previous probe answers the
+wait instantly, the loop condition then correctly finds nothing new, and it
+injects again. It hammers GUI+Q at the speed of a QMP round trip until a fresh
+`windows=1` appears. Its own doc comment says a second GUI+Q "would close the
+terminal's window instead"; that is exactly what happened, and it is the defect
+`serial_until_new` exists to prevent, one layer up.
+
+Established by exit code rather than by output, twice: the shell's
+`read_byte` swallowed the distinction between EOF and error into `None`, and
+its `println!` never reached serial because the terminal breaks out of its loop
+on stdout EOF without draining stderr — so the only channel that survives the
+event being diagnosed is the kernel's own `exit:` line.
+
+**What this changes.** The shell-exit teardown recorded under #156 is, in this
+manifestation, a test that says "close" twice. It is not evidence about the
+owner's report, which was the X button and one click. And the structural defect
+underneath is real and not test-only: **a destructive command with no
+acknowledgement, whose only observable is a 2 s sample of a counter.** That is
+why there is a retry loop at all.
+
+### The fix, and where it leaves #156
+
+Two halves, and only one of them is the test.
+
+**The compositor now announces a close.** A client that *dies* was already
+announced — `dropping pid N — why` — and a window somebody *closed* was not, so
+the desktop's only record of one was the `windows=N` field of a statistics line
+emitted every two seconds. That is a sample of a level: two closes inside one
+interval are indistinguishable from one, and from none if a window opened in
+between. `note_closed` fires at the three deliberate sites — GUI+Q, the close
+button, and the client's own `MSG_DESTROY_WINDOW` — naming the pid, what closed
+it, and how many are left. Every report the owner has made about this desktop
+begins "I closed a window and then", and until now the log could not say which
+window went.
+
+**`close_focused_window` waits on that event.** It no longer samples a counter,
+so a re-send happens only when the close genuinely did not land, and its
+failure message — "GUI+Q never reached the compositor" — is true when it fires.
+
+`desktop_window_child` then passes end to end for the first time: alone in
+19 s, and in the 12-wide phase with a second worktree's suite holding half the
+host's guest slots and running the same test.
+
+**#156 is not closed by this and the entry stays.** The freeze's signature is a
+guest that goes silent, and none of the eleven boots in this session produced
+one. What changed is that the test now *reaches* the snake rounds where the
+freeze was seen. The predecessor's QMP capture — eight vCPUs `HLT=1` with `IF`
+set, one thread left, Ctrl+Alt+D reviving the machine — remains unexplained,
+and note that a machine whose desktop has been closed out from under it looks
+similar in the census and *not* in the serial log, which keeps flowing.

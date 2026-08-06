@@ -195,8 +195,8 @@ the one most likely to need a second landing.
 
 #### Working state, so this stage survives its agent
 
-X0 and X1 are on main (`6bfeed9`); X2 is not started. Everything below is
-established and should not be re-derived.
+X0 and X1 are on main (`6bfeed9`); **X2a is built** and X2b is not started.
+Everything below is established and should not be re-derived.
 
 **The three call sites that must lose the ability to wait.** `poll_if_pending`
 reaches exactly four things — `next_event`/`dispatch_event` (a drain, no wait),
@@ -256,6 +256,83 @@ the metal proof is the owner's and it is the one that counts.
   `device_del` cannot be landed inside it. That is the answer and belongs in a
   report as the answer, not as an omission. Do not ship one that passes for the
   wrong reason.
+
+#### X2a and X2b — the split, and why teardown goes first
+
+X2 lands twice. **X2a is teardown and recovery, and is built; X2b is
+enumeration.** The
+owner's live defect is a machine that freezes when the boot stick is pulled and
+answers no Ctrl+Alt+D afterwards, and neither of the two paths that run on an
+unplug is enumeration. Breadth of what enumerates does not touch it.
+
+**The mechanism, once, for both halves.** Every blocking step becomes
+submit-and-return against one outstanding operation per controller:
+
+- `submit_command` answers with the Command TRB's *physical address*, and
+  `wait_command` matches the Command Completion Event's `param` against it
+  (§6.4.2.2). It used to take the first completion of any command, so a command
+  that ran out its deadline and answered afterwards handed its code to whatever
+  was waiting next — latent today and unavoidable the moment two commands are in
+  flight from different callers.
+- `dispatch_event` offers every event to the outstanding operation before doing
+  anything else with it, and **records the code rather than acting on it** —
+  the same reason `broke_with` is recorded rather than recovered where it is
+  read: the drain runs inside `wait_command` and `wait_transfer` on behalf of a
+  caller waiting for one particular event.
+- `toyos_xhci::job::Outstanding<W>` is that slot, pure: what ends the wait
+  (`Await::{Command,Transfer}`), the deadline, the answer, and the cancellation.
+  **One slot and not a queue** — the driver ran these strictly serially before,
+  the command ring is one queue, and a second slot would buy concurrency the
+  hardware does not have at the price of the cancellation rules' only simple
+  form.
+- `toyos_xhci::recovery` is the endpoint recovery as a sequence: `Recovery::begin`
+  reads the Endpoint State out of the controller's output context and answers
+  with the first command, `Recovery::completed` with the next. Two drivers of
+  the one sequence — a blocking loop for `msc`'s bulk pair, which runs on a
+  faulting thread and not in a pass, and a stepped one for HID.
+
+**Two hazards that are not obvious and are handled.**
+
+- A `Step::Enumerate` taken while a Disable Slot is outstanding can be handed
+  back the same slot id: the controller processes the ring in order, so it will
+  not, but the *driver* would then zero the DCBAA entry the new device's context
+  now occupies. Enumeration and teardown both defer while an operation is
+  outstanding; a register write, an acknowledge and a reset do not.
+- A recovery outstanding for a device on a port that has just gone is cancelled
+  rather than waited out, because **a transfer error on a port that has gone
+  belongs to the disconnect**. Without it the teardown waits the deadline behind
+  a job whose device will never answer.
+
+**One thing the conversion needed that was not foreseen.** `SteppedWhileWorking`
+went red the moment a teardown spanned two passes: the effect used to begin and
+end inside one `service_port` call, so a step taken while `Work::Working` could
+only be re-entrant, and now the ordinary poll finds a port mid-teardown every
+pass. The fix is the loop and not the invariant — **a port inside an effect is
+not looked at at all**, which also saves the register read it was taken to be
+told nothing by. The re-entrancy gate is unchanged and still red on demand.
+
+**What X2a does not deliver, stated so a green suite does not imply it.** The
+type split above is X2b's. A `Stepper` that still has to hand `poll` a way to
+reach `device::configure` is a signature promising a check it does not perform,
+and privacy would not enforce it either: a child module of `xhci` can name its
+parent's private methods, so the view has to be the *only* handle by then.
+
+Nor does it change the *seconds*: `c4ba7d5` already ended a transfer on the
+register when the port reads disconnected, so what X2a removes is the pass, not
+the budget. And two costs move rather than going away — `PORT_WORK_AT` now
+carries the outstanding operation's deadline, so an idle CPU declines to halt
+across a teardown exactly as it already does across a debounce; and a teardown
+takes one further scheduler pass, which is what "submitted and left" means.
+
+**What gates X2a.** `toyos-xhci/sim/tests/teardown.rs`, nine tests, three of
+them negative — a recovery left running against a device that has gone costs a
+second whole deadline, a teardown taken while the controller still owes an
+answer is caught, a pool block given back before its slot is answered for is
+caught. Plus `job.rs` and `recovery.rs`'s own unit tests. In the guest: the
+sixteen `xhci_*` gates and the nine `usb_*` ones are the regression suite and
+change no outcome, which is the same standard X0 was held to. **No new guest
+gate**, because the window is 100 ms wide and a `device_del` cannot be aimed
+inside it — see the note below, which is the answer and not an omission.
 
 Delta from the task's fix-shape: the task offers "bounded work per pass or a
 dedicated context". **This plan takes neither literally.** Bounded work per
