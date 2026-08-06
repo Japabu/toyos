@@ -1403,6 +1403,54 @@ writability poll is not cancelled by a reader's close, which is what the
 fd-number filter accidentally got right for same-process fds and wrong for
 everything else.
 
+### CLOSED — `io_uring::remove_fd` cancelled polls and woke nobody
+
+The other half of the entry above, found while working #172 and independent of
+it. `remove_fd` posts `-NotFound` for every pending poll on a source that is
+going away, so the caller knows the registration is over — and it posted them
+into the ring without waking the ring's waiters. **Nothing else could end that
+wait**: the poll is gone from `pending_polls`, so its `WatcherGuard` has
+already taken the ring off the source's watcher list, and the close path that
+runs immediately afterwards (`close_read`/`close_write` → `wake_pipe_readers`)
+then finds no watchers and skips `complete_pending_for_event`. A thread in
+`io_uring_enter` with `timeout_nanos == u64::MAX` — which is every server in
+the tree, and `/bin/console`, `/bin/terminal` and soundd's control thread by
+name — never returns.
+
+`fd::close` calls `remove_fd` *before* the descriptor drops, which is what puts
+the watcher removal in front of the wake path that would otherwise have covered
+it. Two descriptors on one pipe is all it takes, so an ordinary `dup`/`dup2` of
+stdio reaches it.
+
+Gate: `io_uring_cancel_wakes` (`tests/toyos-rust-tests/src/bin/`). A thread
+registers a `POLL_ADD` on a pipe read fd, proves the registration reached the
+kernel with a zero-timeout enter, then parks with `u64::MAX`; the main thread
+closes a `dup` of the same fd. Negative control run with the wake removed: the
+waiter was still parked 10 s later and the test says so in its own words.
+
+Every other posting path was audited in the same pass and two more were
+silent — `post_cqe_locked` (a sibling thread of the submitting process can be
+parked on the same ring) and `process_poll_add`'s `MAX_PENDING_POLLS` refusal.
+Both wake now. The durable fix remains iouring-blocking-spec's single `post()`,
+where posting and waking cannot be separated.
+
+### CLOSED — a dropped completion could only be reported after the call that never returned
+
+`Poller::wait` reads `cq_hdr.dropped` and asserts it is zero, with a comment
+saying the assertion should be unreachable. It is read *after* `submit`, and
+`submit` is the call that blocks — so in the one failure the counter exists to
+explain, a completion dropped while the caller is parked, the assertion is
+never reached at all. A tripwire that can only fire after the hang it is about
+reports nothing.
+
+`enter` now refuses to park a ring whose `dropped` is nonzero and returns
+short, which puts the counter in front of the caller. It is cumulative and
+never cleared, so this cannot loop: `Poller::wait` asserts on the very next
+look. No test, and it would be dishonest to add one — the state is unreachable
+from a conforming caller for exactly the reasons `poller_capacity` gates, and a
+kernel feature that manufactured it would be replacing the verdict rather than
+the failure.
+
 ### A keyboard that resets behind our back is undetectable on the PS/2 wire
 
 The i8042 driver runs the keyboard in set 2 with the controller translating to
@@ -2230,6 +2278,70 @@ What would decide it is the callback's own period count against wall clock, on
 that machine. doom now keeps that counter (`MIXED_PERIODS`) and now survives
 the stall, so the next T14 session can be asked the question instead of losing
 the process that would have answered it.
+
+### OPEN (#172) — the null sink's mix loop applies exactly one connect and then stops, on the T14 only
+
+Read off two T14 boots (`boot7-usba-doom.log`, `boot5-doom-wedge.log`). The
+shape is the same in both and it is narrow:
+
+- soundd finds no device and presents the null sink; `null sink idle` prints.
+- The first client connects. The control thread prints `opening stream`, the
+  **mix loop** prints `client 0 connected (id=0)` — so it woke, drained the
+  command pipe and applied the command.
+- Nothing from the mix loop ever again. `stats.report` fires every 2 s while a
+  client is present and the connect resets that window, so a single missing
+  stats line is proof the loop stopped; boot7's client was a 2 s tone and no
+  line follows it.
+- Every later client is stranded: the control thread keeps running (it printed
+  `opening stream` for doom 14 s later) and `open_stream` answers, but no
+  `client N connected` follows, so the mixer never signals it and it blocks
+  reading its signal pipe forever. That is `tone` never exiting and doom
+  wedging with a black window before its render loop.
+
+**Not reproduced in QEMU.** `tests/desktopaudiocase` was built for this: the
+T14's shape, with the client's three descriptors as pipes to a terminal that is
+a compositor surface — the fidelity gap `metal_sim_null_audio` and
+`null_sink_shipped_client` both have, since both spawn the client from a test
+binary whose stdio is the console. Green at `smp=2` and at `smp=8` (the T14's
+count), with one client, with two overlapping clients under two terminals, and
+with a terminal opened afterwards.
+
+**Eliminated, each with a run behind it.** CPU count. The cpal client path
+(`null_sink_shipped_client`, adopted from `wt/toyos-hdaprobe` `fa47241`, two
+`/bin/tone` in series at 1.16 s and 1.15 s). soundd blocking on a client
+(`signal_clients` uses `write_nonblock`; there is no blocking write in the mix
+loop). The accept path being held by a stuck client (accept and mix are
+separate threads and the control thread ran for 14 s afterwards). A CQ overflow
+(`Poller::wait`'s `dropped` assertion would have killed soundd, and soundd is
+alive). A panic anywhere in soundd, for the same reason.
+
+**Eliminated by reading, and recorded so it is not re-derived.** The mix loop
+holds no lock across its wait, and neither `PIPES` nor `IO_URINGS` was held on
+the T14 at 47 s — the control thread took both to accept doom's connection and
+open its stream. The mixer's timeout while streaming is finite (one device
+period), so a park with that deadline is the only way to stop, and the timer
+that ends it is the same one the compositor's frame interval rides. The
+`remove_fd` lost wake closed above is *not* this: the mix loop's only
+registration is on the command pipe, which soundd owns both ends of and nobody
+closes.
+
+**What would settle it on the next T14 boot**, in preference order, because a
+question the owner can answer beats a fix nobody can verify:
+
+1. Ctrl+Alt+D on the wedged machine, taken on several CPUs. Today
+   `dump_blocked` lists only the calling CPU's parked threads
+   (`kernel/src/scheduler.rs:559`, §5) and prints a task key, a wait class and
+   a deadline — enough to split the three cases that remain: parked on the
+   ring's queue with a sane deadline (the timer did not fire), parked with an
+   absurd one (the timeout was computed wrong), or not parked at all (never
+   picked, which would make this #142's family rather than audio's).
+2. Making that dump machine-wide and naming the process is the one instrument
+   worth building first; it is the same gap §5 files against `ps` and `stats`.
+
+Until one of those exists, the three gates this task landed are what stands
+between the milestone and a silent recurrence: a client through the null sink
+must exit, a second must be taken up while the first streams, and the desktop
+must still answer afterwards.
 
 ---
 

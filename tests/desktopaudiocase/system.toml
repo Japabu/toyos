@@ -1,0 +1,21 @@
+# A desktop with a shell and soundd: the T14's shape when #172 wedged it.
+#
+# `tests/desktopcase` has no daemon behind the shell and `tests/testcases` has
+# no desktop in front of it, so the machine where a *shell-spawned* audio client
+# meets a null sink existed in neither. That machine is this one: the client's
+# stdio are pipes to a terminal, the terminal is a compositor surface, and
+# soundd has no device.
+init = ["/bin/compositor", "/bin/soundd", "/bin/terminal"]
+
+assets = ["assets"]
+
+[programs]
+compositor = {}
+soundd = {}
+terminal = {}
+shell = {}
+toybox = {}
+
+[symlinks]
+"bin/echo" = "/bin/toybox"
+"bin/tone" = "/bin/toybox"

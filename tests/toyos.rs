@@ -337,6 +337,11 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // so a guest that is slow costs seconds and not a verdict, and the verdict
     // itself is a fraction of the screen that no amount of load moves.
     ("desktop_typing_damage", Sched::Parallel),
+    // The same desktop with soundd behind it: an audio client spawned by a
+    // shell, which is the only place all three of its descriptors are pipes to
+    // a surface. Parallel — every verdict is a marker with its own ceiling, and
+    // none of them reads a clock.
+    ("desktop_audio_client", Sched::Parallel),
     // Two boots of one machine compared on the guest's own `Boot: complete`
     // with a 300 ms allowance, which is the whole assertion.
     ("i8042_absent", Sched::Serial),
@@ -4000,6 +4005,163 @@ fn desktop_locale_detect() -> Result<(), String> {
     Ok(())
 }
 
+/// A shell-spawned audio client on a device-less desktop, and the desktop
+/// afterwards.
+///
+/// The machine `metal_sim_null_audio` and `null_sink_shipped_client` both miss:
+/// they spawn the client from a test binary whose stdio is the console, and the
+/// T14 spawns it from a shell inside a terminal inside the compositor, so every
+/// one of the client's three descriptors is a pipe to a surface. Three verdicts
+/// on one boot, in the order the T14 lost them:
+///
+/// 1. **A client finishes.** `tone` writes a second of audio to the null sink
+///    and prints its own completion line.
+/// 2. **A second client connects while the first is streaming.** The T14's log
+///    shows soundd's control thread printing `opening stream` for the second
+///    with no `client N connected` behind it, so the connect is what has to be
+///    observed, not just the exit.
+/// 3. **The desktop survives them.** A terminal opened afterwards reaches a
+///    shell that answers — the verdict the owner's machine failed while the
+///    compositor was still painting, which is why nothing that reads pixels or
+///    counts frames would have caught it.
+fn desktop_audio_client() -> Result<(), String> {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopaudiocase");
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        // The T14's core count: the suite's default of two serialises threads
+        // this shape is about the wakes between.
+        smp: 8,
+        qmp: true,
+        ready_marker: "compositor: ready",
+        ..Default::default()
+    };
+    metal_sim_argv_check(&qemu::profile_argv(&options))?;
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let mut log = qemu.boot_log().to_string();
+
+    const NULL_LINE: &str = "soundd: no audio device, presenting a null sink";
+    if !serial_until(&mut qemu, &mut log, NULL_LINE, Duration::from_secs(10)) {
+        return Err(format!("soundd did not present a null sink:\n{log}"));
+    }
+    if !shell_answers(&mut qemu, &mut log) {
+        return Err(format!("nothing typed at the terminal window reached a shell:\n{log}"));
+    }
+
+    // One client, start to finish. `tone: done` is the client's own last line,
+    // so it is the client saying it got its callbacks and left — not the shell
+    // saying it launched something.
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "tone 440 1");
+    }
+    if !serial_until(&mut qemu, &mut log, "tone: done", Duration::from_secs(30)) {
+        return Err(format!(
+            "a shell-spawned tone never finished on a device-less desktop:\n{log}"
+        ));
+    }
+
+    // Two clients overlapping, each under its own shell in its own terminal.
+    // The shell has no job control, so the long tone holds its terminal and the
+    // second one has to be typed somewhere else — which is exactly how the T14
+    // reached two live clients, and why the second terminal is part of the
+    // stimulus rather than only part of the verdict.
+    let before_second = log.len();
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "tone 660 8");
+    }
+    if !serial_until(&mut qemu, &mut log, "tone: 660Hz", Duration::from_secs(30)) {
+        return Err(format!("the long tone never started:\n{}", &log[before_second..]));
+    }
+    open_terminal(&mut qemu, &mut log, "overlap-terminal-jc4t")?;
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "tone 440 1");
+    }
+    let deadline = Instant::now() + qemu::budget(Duration::from_secs(60));
+    while Instant::now() < deadline && connects_since(&log, before_second) < 2 {
+        log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    let connects = connects_since(&log, before_second);
+    if connects < 2 {
+        return Err(format!(
+            "soundd applied {connects} of the two connects — a client that opened a stream \
+             was never taken up by the mixer:\n{}",
+            &log[before_second..]
+        ));
+    }
+    // Both of them out again, counted in the same window. Waiting for `null
+    // sink idle` would not do: that line is already in the log from the first
+    // client, and a marker an earlier phase produced is not a verdict about
+    // this one.
+    let deadline = Instant::now() + qemu::budget(Duration::from_secs(60));
+    while Instant::now() < deadline && removals_since(&log, before_second) < 2 {
+        log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    let removals = removals_since(&log, before_second);
+    if removals < 2 {
+        return Err(format!(
+            "{removals} of the two overlapping clients left the mixer — the other one is \
+             still streaming to a sink that stopped draining it:\n{}",
+            &log[before_second..]
+        ));
+    }
+
+    // The desktop afterwards: a process created after every one of the clients
+    // above, focused the moment it maps its window. This is the verdict the
+    // owner's machine failed while the compositor was still painting, which is
+    // why nothing that reads pixels or counts frames would have caught it.
+    open_terminal(&mut qemu, &mut log, "post-audio-desktop-vqmz")?;
+    eprintln!("  [desktop] three shell-spawned audio clients ran and the desktop still answers");
+    Ok(())
+}
+
+/// Ctrl+N at the compositor, and a shell in the window it opens that answers.
+///
+/// The nonce is per call because the verdict is that *this* terminal answered:
+/// a marker an earlier one already produced would pass on a window that never
+/// came up.
+fn open_terminal(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Result<(), String> {
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        input.keys(&[("ctrl", true), ("n", true), ("n", false), ("ctrl", false)]);
+    }
+    let before = log.len();
+    let deadline = Instant::now() + qemu::budget(Duration::from_secs(30));
+    while Instant::now() < deadline {
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            type_line(&mut input, &format!("echo {nonce}"));
+        }
+        if serial_until(qemu, log, nonce, Duration::from_secs(2)) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "a terminal opened with Ctrl+N never reached a shell that answers:\n{}",
+        &log[before..]
+    ))
+}
+
+/// Connects the mixer has *applied* since `from`, which is a different event
+/// from the control thread's `opening stream` — the T14 log carries the second
+/// without the first.
+fn connects_since(log: &str, from: usize) -> usize {
+    soundd_clients_since(log, from, " connected")
+}
+
+/// Clients the mixer has ramped out and dropped since `from`.
+fn removals_since(log: &str, from: usize) -> usize {
+    soundd_clients_since(log, from, " removed")
+}
+
+fn soundd_clients_since(log: &str, from: usize, verb: &str) -> usize {
+    log[from..]
+        .lines()
+        .filter(|l| l.contains("soundd: client ") && l.contains(verb))
+        .count()
+}
+
 /// The direct regression for the readiness defect: a stimulus that produces
 /// bytes and no events must produce no wake. Pause is that stimulus — six
 /// bytes, deliberately swallowed.
@@ -4720,6 +4882,7 @@ fn run_machine_test(
         "console_locale_detect" => console_locale_detect(),
         "desktop_locale_detect" => desktop_locale_detect(),
         "desktop_typing_damage" => desktop_typing_damage(),
+        "desktop_audio_client" => desktop_audio_client(),
         "xhci_many_devices" => {
             // The T14's internal controller carries a camera, Bluetooth and a
             // fingerprint reader next to the boot stick, and every profile in
@@ -7436,6 +7599,10 @@ fn build_test_registry(
     for name in discover_rust_tests(rust_bins) {
         let timeout = match name.as_str() {
             "panic_recovery" => Duration::from_secs(10),
+            // Its verdict is that a parked waiter woke, so the failing run is
+            // the slow one: it spends its own patience before reporting, and
+            // the report is worth more than the harness's timeout message.
+            "io_uring_cancel_wakes" => Duration::from_secs(30),
             _ => Duration::from_secs(5),
         };
         tests.push(TestDef {
