@@ -382,11 +382,15 @@ returned an error.
   (`loader.rs:418,431`). The change is not plumbing it further; it is stopping
   the OR from discarding it. Saying so keeps the diff honest about where the
   bug is.
-- **Added to the stated shape:** turning `+smep` on in the harness. It is one
-  argument (`tests/common/qemu.rs:1889`), measured to work under TCG, and it
-  closes a gap where the metal enforces something no test does. Called out
-  because it may red unrelated tests — any such red is a finding, not a
-  regression, and gets recorded rather than worked around.
+- **Added to the stated shape, and deliberately not landed with M2:** turning
+  `+smep` on in the harness. It is one argument (`tests/common/qemu.rs:1889`),
+  measured to work under TCG, and it closes a gap where the metal enforces
+  something no test does — the gap itself is filed as **#167**. It does not
+  ride M2, for a scheduling reason rather than a technical one: a global
+  harness change that reds unrelated tests would block every in-flight agent's
+  landing behind defects that are not theirs. The sequence is a **discovery
+  run** on this branch, reported, and then a scheduled flip. §8 records what
+  that run found.
 
 **Gates, each with its negative control.**
 
@@ -525,10 +529,36 @@ attribute a failure until M3 is correct.
 
 Named so the gaps are decisions rather than oversights:
 
-- **Kernel-side W^X and an NX direct map.** The kernel executes out of the
-  direct map (§2.1); separating its text needs linker-visible section bounds
-  and is its own task. M2 leaves the machinery (`Protection`, NXE) in place for
-  it.
+- **Kernel-side W^X and an NX direct map — task #166.** The kernel executes out
+  of the direct map (§2.1); separating its text needs linker-visible section
+  bounds and is its own task. What M2 leaves for it, so #166 need not
+  re-derive any of it:
+
+  - **`Protection`, with no default**, already threaded through every user
+    mapping entry point. #166 adds the direct map's callers, and the compiler
+    names them rather than a grep: `map_2m`/`unmap_2m` (`paging.rs:709,725`)
+    and `map_mmio`/`unmap_mmio` are the whole set.
+  - **`EFER.NXE` already set on every CPU**, so bit 63 is expressible at all.
+    Without it a mapping asking for NX faults as a reserved-bit violation, and
+    that is the trap #166 would otherwise fall into first.
+  - **The 2 MiB → 4 KiB split**, generalised out of `guard_4k`
+    (`paging.rs:653-697`) into a reusable operation. The kernel's text will not
+    be 2 MiB-aligned either, so #166 needs exactly this and it will exist.
+
+  What #166 still has to establish, and M2 deliberately does not:
+
+  - **The kernel's own text extent.** The direct map is built by one blanket
+    loop over all physical memory (`paging.rs:816-820`), so nothing in the
+    kernel currently knows where its own text ends. This needs symbols from
+    `toyos-ld` and a decision about whether the bootloader or the kernel
+    applies the split — the kernel is already executing out of that mapping
+    when it would change it, which is the interesting part.
+  - **The direct map as a supervisor alias of every user page.** SMEP does not
+    cover it: SMEP stops ring 0 executing a *user* (U=1) page, and the direct
+    map's alias of the same physical page is a supervisor mapping. So
+    "userland writes a page and the kernel is induced to execute it" is closed
+    by an NX direct map and by nothing else in the tree. That is the security
+    argument for #166 and it is not visible from the finding text.
 - **Refcounted pages / pinning.** `specs/capability-handles-spec.md`'s work.
   M1's volatile accessors are chosen precisely so this stage does not depend
   on it.
@@ -579,3 +609,31 @@ this document are the ELF layout table (§2.1), the CPU feature answers (§2.1,
   primitive when it is touched.
 - **`user_ref` used as a validity probe** (`syscall.rs:383,387`), discarding the
   reference. Doctrine §1.5 / "code must not lie about itself".
+
+## 8. The `+smep` discovery run
+
+Run on this branch at `f6e48db` with the single argument added to
+`tests/common/qemu.rs:1889`, to answer whether the flip can be scheduled
+without landing defects into five in-flight agents' gates (#167).
+
+**It reds nothing. 262 passed, 262 total, 0 failed, 0 INVL, 466.3 s.**
+
+The wall clock is roughly four times the 109 s CLAUDE.md records, because five
+other worktrees were spending the same twelve guest slots; it is contention, not
+a finding.
+
+The run is only worth anything if SMEP was actually on, so that was checked
+rather than assumed — the kernel reports its own answer at boot:
+
+```
+[kernel 0.000 cpu0] percpu: BSP cpu_id=0 lapic_id=0 smep=on smap=on pcid=off
+```
+
+That line is also the direct confirmation of §2.2: `pcid=off` in the guest, from
+the kernel rather than only from the QMP model query. The two independent
+measurements agree.
+
+Conclusion: the flip is free. It is held as its own commit on this branch so it
+can land the moment it is scheduled, rather than riding M2 — a green discovery
+run removes the risk that motivated the hold, but not the coordinator's call on
+when a shared resource changes under five agents.
