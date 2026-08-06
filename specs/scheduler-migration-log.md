@@ -443,3 +443,63 @@ doc-comment says so. `MAX_PASS_NS` is 200 µs. A CPU inside that recovery holds
 every message addressed to it, and `retire_task`'s deadline is the only thing in
 the tree that notices. Recorded in `specs/known-issues.md`; not fixed here,
 because closing it means making xHCI enumeration asynchronous.
+
+### The deadline was stored twice and only one copy armed anything (2026-08-06)
+
+`ParkedEntry.deadline` and `DeadlineHeap` each held the same value, and each
+module's doc comment claimed to be its single home — `timer.rs`: "every deadline
+lives in exactly one place: the home CPU's heap"; `cpu.rs`: "the deadline lives
+*here* and nowhere else". `apply_timer` armed from the heap. `sched::dump`,
+invariant T and `earliest_event` read the entry.
+
+They diverge in one arm. `fire_deadlines` called `DeadlineHeap::pop_due`, which
+**removes** the entry before the claim is attempted; a `Claim::Lost` then
+`continue`d and the heap entry was gone while `ParkedEntry.deadline` kept its
+copy. Such a CPU arms `TimerPlan::Stop` and reports `1 pending, 0 OVERDUE` — the
+corruption is not merely consistent with health, it is indistinguishable from it
+by construction, which is why #156's capture could not be read.
+
+**Why nothing had ever caught it, which is not what the checkpoint guessed.**
+Invariant T's teeth were never the problem: `check_timer`'s `(None, Some(due))`
+arm is exactly this state, and it fires on the very pass where the divergence
+happens in any `check` build. What was missing is a *scenario*.
+`SchedPass::begin` runs `drain` and `fire_deadlines` back to back with no step
+boundary between them, so the explorer cannot place a remote claim there and
+`Claim::Lost` is unreachable in every run the simulator has ever made — the same
+shape as the `8508b37` window and as `pre_park_claims`, an interleaving that is
+not in the step relation at all. On hardware the window is two instructions of a
+remote CPU: `TaskShared::claim_wake`, then the `Msg::Wake` post in
+`waitq::deliver_wake`. `sim/tests/deadline_claim_race.rs` is that pair with a
+whole pass scripted in between. Written and run **before** the fix; its verdict
+on the unfixed tree is
+
+```
+invariant T: cpu CpuId(0) has an event at Nanos(5000000) and no timer armed
+```
+
+**The fix deletes the second copy** rather than keeping the two in step: the
+deadline lives in `ParkedEntry` and nowhere else, `DeadlineHeap` and
+`DeadlineOracle` are gone with the lazy-deletion rule they existed for, and
+`apply_timer` reads the field invariant T reads. With one copy, the lost claim
+has exactly one thing it can do and it is also the correct thing — clear the
+deadline. A remote waker owns the wake, so no later claim can succeed and that
+timeout can never fire; an entry that went on reporting it was reporting
+something that would not happen. Clearing it is also what advances the loop,
+which is the property worth having: the deadline that will not be honoured and
+the deadline that is not reported are one field.
+
+Cost: `earliest_deadline` and `next_due` scan `parked` where the heap was
+O(log n) amortized, and both sit on the pass path. What that buys is the
+deletion of the oracle, the staleness rule, and a two-statement mutation whose
+second statement is the one that went missing. The number that would reverse the
+decision is hundreds of threads blocked on one CPU.
+
+**What this does not settle.** It closes a representation defect and a report
+that lied; it is *not* established that this is what froze the guest. The
+claim's `Msg::Wake` follows it within two instructions, cpu0 cannot halt with a
+non-empty mailbox (`SleepArm::confirm`), and a post to a CPU that has published
+SLEEPING returns `Kick::Send` — so the protocol still has an answer for every
+ordering that could be constructed by reading it. `desktop_window_child` stays
+an expected red and is not evidence either way (known-issues §3). And nothing
+here says anything about the T14, where 3 of 8 CPUs missed a kick and this
+machine's 8 answered.
