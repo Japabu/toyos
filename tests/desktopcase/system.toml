@@ -17,6 +17,9 @@ compositor = {}
 terminal = {}
 shell = {}
 toybox = {}
+# The winit app the owner closed the window of. `desktop_window_child`
+# launches it from the shell; nothing else in this config uses it.
+snake = {}
 
 [symlinks]
 "bin/echo" = "/bin/toybox"
