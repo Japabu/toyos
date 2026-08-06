@@ -2798,11 +2798,20 @@ equal and the phase runs in declaration order, which happens to separate them:
 | 2 | written by run 1 | 243 s | FAIL, `ALONE: GREEN` in 16 s |
 | 3 | " | 255 s | FAIL, `ALONE: GREEN` in 16 s |
 | 4 | " | 246 s | FAIL, `ALONE: GREEN` in 16 s |
+| 5 | deleted before this run | 17 s | PASS |
+| 6 | written by run 5 | 22 s | PASS |
 
-**And it latches.** What run 2 recorded for `desktop_typing_damage` is 246 s of
-mostly *waiting for the host*, and that number is what pins it beside the other
-desktop on every later run. A duration profile whose entries include contention
-cannot order its way out of the contention it measured.
+**It is a feedback loop and it is bistable, not a one-way latch.** What run 2
+recorded for `desktop_typing_damage` is 243 s of mostly *waiting for the host*,
+and that number is what put it back beside the other desktop in runs 3 and 4: a
+duration profile whose entries include contention cannot order its way out of
+the contention it measured. But it releases the same way it engaged — run 5 had
+no profile, measured 17 s, and run 6 read that and left the two apart. So the
+state to expect is *either*, and a worktree stuck in the red one is unstuck by
+deleting `target/test-durations`. **That is a diagnosis and not a fix**: nothing
+stops the next run that happens to pair them from re-engaging it, and a green
+run bought by deleting a file is a green run about the ordering rather than
+about the tree.
 
 Three things are tangled here and only the first is scheduling:
 
