@@ -247,10 +247,10 @@ the metal proof is the owner's and it is the one that counts.
 - **`desktop_window_child` is intermittent, not parallel-phase-only.** It has
   failed under a one-test filter with nothing else on the host, in a different
   round each time. **If X2 makes it pass that is not evidence of anything** — as
-  likely the race landing the other way. Keep skipping it until its own defect
-  closes: `--gate cargo test -- --skip desktop_window_child`, **unquoted**,
-  because `--gate` takes everything after it as raw argv and a quoted string
-  becomes the program name.
+  likely the race landing the other way, which is exactly why its
+  `EXPECTED_FAILURES` entry expires on a date rather than on a green run.
+  Nothing to do: `cargo run -- --land` takes a run it fired in, and does not
+  take one where it failed some other way.
 - **There is no gate for the unplug window and it cannot be aimed.** The hazard
   is the 100 ms between the device going and the teardown running, and a QEMU
   `device_del` cannot be landed inside it. That is the answer and belongs in a
