@@ -193,6 +193,10 @@ const SCREEN_TESTS: &[(&str, Sched)] = &[
     ("screen_console_clear", Sched::Parallel),
     ("screen_console_scroll", Sched::Parallel),
     ("screen_i8042_health", Sched::Parallel),
+    // Ctrl+Alt+D with no console at all: the panel is the whole channel, and a
+    // compositor is holding it. Parallel — screendumps against markers, no
+    // clock in the verdict.
+    ("screen_blocked_dump", Sched::Parallel),
     ("screen_recoverable_untouched", Sched::Parallel),
     ("screen_early_panic", Sched::Parallel),
     ("screen_late_panic", Sched::Parallel),
@@ -200,6 +204,7 @@ const SCREEN_TESTS: &[(&str, Sched)] = &[
     ("screen_panic_muted", Sched::Parallel),
     ("screen_console_panic", Sched::Parallel),
     ("screen_fatal_halt", Sched::Parallel),
+    ("screen_pager_keys", Sched::Serial),
 ];
 
 /// What `screen_console_shell` types, and what it then looks for on its own.
@@ -265,6 +270,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
     ("metal_sim_null_audio", Sched::Serial),
+    ("null_sink_shipped_client", Sched::Serial),
     // Parallel, and this one is argued rather than assumed: not a verdict in it
     // is a wall-clock margin. The flood's size is asserted against the audio
     // callback's own period counter standing still, both playback checks are
@@ -272,6 +278,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // timing. Its own boot, its own config, and the only client its soundd has.
     ("doom_sound_flood", Sched::Parallel),
     ("netd_connection_caps", Sched::Parallel),
+    // Its own boot with a NIC under it, because sshd leaves at the bind on
+    // every other config. Every verdict is a line of text; no clock in any.
+    ("sshd_fail_closed", Sched::Parallel),
     // Serial: it measures netd's 2 s handshake deadline against the host's
     // clock, and counts how many connections survived a 48 ms paced burst
     // before that deadline could expire any of them. Both are wall-clock
@@ -301,10 +310,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
     //
-    // None of the three measures a rate. `i8042_mouse` sends each pointer
-    // packet only once the guest has printed the one before it, so a guest with
-    // less of the host is a longer run and not a smaller count; the keystrokes
-    // above it put fewer bytes in flight than QEMU's controller holds.
+    // None of the three measures a rate. All three keep fewer bytes in flight
+    // than QEMU's PS/2 device holds — `i8042_mouse` by pacing against the
+    // guest's own report, within [`MOUSE_LEAD`] — so a guest with less of the
+    // host is a longer run and not a smaller count.
     ("i8042_keyboard", Sched::Parallel),
     ("i8042_no_spurious_wake", Sched::Parallel),
     ("i8042_mouse", Sched::Parallel),
@@ -336,6 +345,16 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // itself is a fraction of the screen that no amount of load moves.
     ("desktop_typing_damage", Sched::Parallel),
     ("desktop_window_child", Sched::Parallel),
+    // The same desktop with soundd behind it: an audio client spawned by a
+    // shell, which is the only place all three of its descriptors are pipes to
+    // a surface. Parallel — every verdict is a marker with its own ceiling, and
+    // none of them reads a clock.
+    ("desktop_audio_client", Sched::Parallel),
+    // Ctrl+Alt+D on the same machine. Parallel: it waits for a marker and its
+    // verdicts are counts the report has to agree with itself about, not a
+    // wall-clock margin — the one duration in it is the dump's own 250 ms
+    // ceiling, which the guest spends and the host never measures.
+    ("blocked_dump", Sched::Parallel),
     // Two boots of one machine compared on the guest's own `Boot: complete`
     // with a 300 ms allowance, which is the whole assertion.
     ("i8042_absent", Sched::Serial),
@@ -354,6 +373,13 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("usb_storage_gate", Sched::Parallel),
     ("usb_storage_shapes", Sched::Parallel),
     ("usb_refused_disk_first", Sched::Parallel),
+    ("usb_pool_exhausted", Sched::Parallel),
+    ("usb_short_read", Sched::Parallel),
+    // A plug over QMP and two host-side verdicts, neither of them a duration:
+    // the disk that arrives comes back byte-identical, and the log on the boot
+    // stick carries a line printed after it. The 1.2 s wait is against a 100 ms
+    // debounce the driver finishes in microseconds under TCG.
+    ("usb_disk_index_stable", Sched::Parallel),
     ("usb_storage_write_error", Sched::Parallel),
     ("usb_flush_optional", Sched::Parallel),
     ("xhci_deaf_registers", Sched::Parallel),
@@ -376,6 +402,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // broke`, and how many tries it takes is how much of the host the guest had.
     ("usb_transport_break", Sched::Serial),
     ("xhci_full_speed_device", Sched::Parallel),
+    ("xhci_superspeed_ports", Sched::Parallel),
     // Two of the three below stage plug and unplug with fixed waits, and both
     // waits are 600-800 ms against a 100 ms debounce the driver finishes in
     // microseconds under TCG — a margin, not a race, and every verdict either
@@ -2529,6 +2556,96 @@ fn run_screen_test(
             }
             Ok(())
         }
+        "screen_pager_keys" => {
+            // The halted pager takes PageUp/PageDown off the i8042 with every
+            // CPU stopped, and this is the only place that claim can be made:
+            // the decode is `toyos-ps2`'s and host-tested, but that a keystroke
+            // reaches a machine which has stopped scheduling is a fact about
+            // the controller and the poll, not about the table.
+            //
+            // `Profile::Metal` because QEMU routes injected keys to one handler
+            // per device class: every profile with a `usb-kbd` sends them there
+            // instead, and this is the only GOP machine without one.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    profile: qemu::Profile::Metal,
+                    qmp: true,
+                    kernel_features: &["test-late-panic"],
+                    ready_marker: "!!! PANIC !!!",
+                    ..Default::default()
+                },
+            );
+            let socket = qemu.qmp_socket().to_path_buf();
+
+            // The footer only exists once the report overflows the screen, so
+            // waiting for one is waiting for the pager to be the thing on
+            // screen. `page_forever` returns without looping below two pages.
+            // Retried, because a dump taken while the pager is repainting
+            // catches a half-written bottom row and no footer at all.
+            let footer = |q: &mut QemuInstance| {
+                for _ in 0..4 {
+                    let text = q.screendump().text();
+                    if let Some(f) = text.lines().rev().find(|l| l.starts_with("[page ")) {
+                        return Some(f.to_string());
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                None
+            };
+            let deadline = Instant::now() + qemu::budget(Duration::from_secs(30));
+            let mut last = loop {
+                if let Some(f) = footer(&mut qemu) {
+                    break f;
+                }
+                if Instant::now() >= deadline {
+                    return Err("no `[page n/m]` footer ever appeared; nothing was paging".into());
+                }
+            };
+
+            // One keystroke per sample. Every one of them should move the page,
+            // where the 3 s deadline that stands in for a dead keyboard could
+            // not have moved it more than once per 3 s of the elapsed run.
+            const SAMPLES: usize = 30;
+            let started = Instant::now();
+            let mut moved = 0usize;
+            for _ in 0..SAMPLES {
+                qemu::qmp_send_keys(&socket, &[("pgdn", true), ("pgdn", false)]);
+                let Some(now) = footer(&mut qemu) else {
+                    return Err(format!("the footer vanished mid-run after {moved} moves"));
+                };
+                if now != last {
+                    moved += 1;
+                }
+                last = now;
+            }
+            let elapsed = started.elapsed();
+
+            // What the deadline alone could have contributed, plus the one it
+            // may have been part-way through when the window opened. The
+            // verdict is a rate against the guest's own clock, which is why
+            // this test is `Sched::Serial`.
+            let unattended = elapsed.as_secs_f64() / 3.0 + 1.0;
+            print_screen(
+                name,
+                &format!(
+                    "{moved} of {SAMPLES} keystrokes moved the page in {:.1}s; the 3s deadline \
+                     could account for {unattended:.1}",
+                    elapsed.as_secs_f64()
+                ),
+            );
+            if (moved as f64) < unattended * 3.0 {
+                return Err(format!(
+                    "{moved} page moves over {SAMPLES} keystrokes in {:.1}s — the unattended \
+                     deadline alone could have produced {unattended:.1} of them, so nothing \
+                     here says a keystroke reached the halted pager",
+                    elapsed.as_secs_f64()
+                ));
+            }
+            Ok(())
+        }
         "screen_fatal_halt" => {
             // The steady-state fatal path: userland is up, the display is
             // idle, and SYS_DEBUG action 3 runs halt_all_cpus for real.
@@ -2590,6 +2707,88 @@ fn run_screen_test(
             if dump.fill() != FILL_FATAL {
                 return Err(format!("fatal fill is {:?}, want {FILL_FATAL:?}", dump.fill()));
             }
+            Ok(())
+        }
+        "screen_blocked_dump" => {
+            // Ctrl+Alt+D on the machine it exists for: metal-sim with the
+            // 16550 taken away, a compositor holding the screen, and therefore
+            // no channel out of the guest at all except the panel. The report
+            // has to take the screen back — declining because userland owns it,
+            // which is what a boot checkpoint does, would answer the owner's
+            // question into a log file nothing is left running to flush.
+            //
+            // The verdict is asserted on the *panel* and nowhere else, and it
+            // is the summary rather than any one thread: the summary is printed
+            // last, the console paints the newest page, so the screenful a
+            // phone camera catches is the one that carries the discriminator.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopaudiocase");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                smp: 8,
+                qmp: true,
+                mute: true,
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            // The compositor's wallpaper first. Every kernel paint fills the
+            // panel with `FILL_BOOT`, so a fill that is anything else is
+            // userland holding the screen and nothing else — which is the
+            // precondition, and asserting on the fill rather than on the
+            // absence of boot text is what stops a merely-blank screen passing
+            // for a desktop.
+            let up = qemu.screendump_while(Duration::from_secs(30), Duration::from_millis(200), |d| {
+                d.fill() != FILL_BOOT
+            });
+            if up.fill() == FILL_BOOT {
+                return Err(
+                    "the compositor never took the screen, so this would have tested a \
+                     checkpoint rather than a report that seizes the panel"
+                        .to_string(),
+                );
+            }
+
+            // Retried, like every other typed handshake in this file: a
+            // keystroke that lands while a desktop is still settling reaches a
+            // machine that repaints over the answer, and the retry is cheaper
+            // than a rule about when a desktop is finished.
+            let deadline = Instant::now() + qemu::budget(Duration::from_secs(40));
+            let mut dump = up;
+            while Instant::now() < deadline && !dump.text().contains("== VERDICT:") {
+                {
+                    let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+                    input.keys(&[
+                        ("ctrl", true),
+                        ("alt", true),
+                        ("d", true),
+                        ("d", false),
+                        ("alt", false),
+                        ("ctrl", false),
+                    ]);
+                }
+                dump = qemu.screendump_until("== VERDICT:", Duration::from_secs(4));
+            }
+            let text = dump.text();
+            print_screen(name, &text);
+            for want in ["== VERDICT:", "cpu(s) answered", "== deadlines:"] {
+                if !text.contains(want) {
+                    return Err(format!(
+                        "the panel does not carry {want:?}, so a photograph of this machine \
+                         answers nothing\ndecoded screen:\n{text}"
+                    ));
+                }
+            }
+            // The report took the screen back from the compositor, which is the
+            // half of this that `boot_checkpoint` deliberately will not do.
+            if dump.fill() != FILL_BOOT {
+                return Err(format!(
+                    "the verdict is on the panel but the fill is {:?} — this is a client's \
+                     screen with kernel text on it, not the report taking the panel",
+                    dump.fill()
+                ));
+            }
+            let row = dump.row_index("== VERDICT:").expect("checked above");
+            eprintln!("  [dump] on the panel of a guest with no console: {}", dump.rows()[row].trim());
             Ok(())
         }
         "screen_recoverable_untouched" => {
@@ -4062,6 +4261,300 @@ fn desktop_locale_detect() -> Result<(), String> {
     Ok(())
 }
 
+/// A shell-spawned audio client on a device-less desktop, and the desktop
+/// afterwards.
+///
+/// The machine `metal_sim_null_audio` and `null_sink_shipped_client` both miss:
+/// they spawn the client from a test binary whose stdio is the console, and the
+/// T14 spawns it from a shell inside a terminal inside the compositor, so every
+/// one of the client's three descriptors is a pipe to a surface. Three verdicts
+/// on one boot, in the order the T14 lost them:
+///
+/// 1. **A client finishes.** `tone` writes a second of audio to the null sink
+///    and prints its own completion line.
+/// 2. **A second client connects while the first is streaming.** The T14's log
+///    shows soundd's control thread printing `opening stream` for the second
+///    with no `client N connected` behind it, so the connect is what has to be
+///    observed, not just the exit.
+/// 3. **The desktop survives them.** A terminal opened afterwards reaches a
+///    shell that answers — the verdict the owner's machine failed while the
+///    compositor was still painting, which is why nothing that reads pixels or
+///    counts frames would have caught it.
+fn desktop_audio_client() -> Result<(), String> {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopaudiocase");
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        // The T14's core count: the suite's default of two serialises threads
+        // this shape is about the wakes between.
+        smp: 8,
+        qmp: true,
+        ready_marker: "compositor: ready",
+        ..Default::default()
+    };
+    metal_sim_argv_check(&qemu::profile_argv(&options))?;
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let mut log = qemu.boot_log().to_string();
+
+    const NULL_LINE: &str = "soundd: no audio device, presenting a null sink";
+    if !serial_until(&mut qemu, &mut log, NULL_LINE, Duration::from_secs(10)) {
+        return Err(format!("soundd did not present a null sink:\n{log}"));
+    }
+    if !shell_answers(&mut qemu, &mut log) {
+        return Err(format!("nothing typed at the terminal window reached a shell:\n{log}"));
+    }
+
+    // One client, start to finish. `tone: done` is the client's own last line,
+    // so it is the client saying it got its callbacks and left — not the shell
+    // saying it launched something.
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "tone 440 1");
+    }
+    if !serial_until(&mut qemu, &mut log, "tone: done", Duration::from_secs(30)) {
+        return Err(format!(
+            "a shell-spawned tone never finished on a device-less desktop:\n{log}"
+        ));
+    }
+
+    // Two clients overlapping, each under its own shell in its own terminal.
+    // The shell has no job control, so the long tone holds its terminal and the
+    // second one has to be typed somewhere else — which is exactly how the T14
+    // reached two live clients, and why the second terminal is part of the
+    // stimulus rather than only part of the verdict.
+    let before_second = log.len();
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "tone 660 8");
+    }
+    if !serial_until(&mut qemu, &mut log, "tone: 660Hz", Duration::from_secs(30)) {
+        return Err(format!("the long tone never started:\n{}", &log[before_second..]));
+    }
+    open_terminal(&mut qemu, &mut log, "overlap-terminal-jc4t")?;
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        type_line(&mut input, "tone 440 1");
+    }
+    let deadline = Instant::now() + qemu::budget(Duration::from_secs(60));
+    while Instant::now() < deadline && connects_since(&log, before_second) < 2 {
+        log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    let connects = connects_since(&log, before_second);
+    if connects < 2 {
+        return Err(format!(
+            "soundd applied {connects} of the two connects — a client that opened a stream \
+             was never taken up by the mixer:\n{}",
+            &log[before_second..]
+        ));
+    }
+    // Both of them out again, counted in the same window. Waiting for `null
+    // sink idle` would not do: that line is already in the log from the first
+    // client, and a marker an earlier phase produced is not a verdict about
+    // this one.
+    let deadline = Instant::now() + qemu::budget(Duration::from_secs(60));
+    while Instant::now() < deadline && removals_since(&log, before_second) < 2 {
+        log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    let removals = removals_since(&log, before_second);
+    if removals < 2 {
+        return Err(format!(
+            "{removals} of the two overlapping clients left the mixer — the other one is \
+             still streaming to a sink that stopped draining it:\n{}",
+            &log[before_second..]
+        ));
+    }
+
+    // The desktop afterwards: a process created after every one of the clients
+    // above, focused the moment it maps its window. This is the verdict the
+    // owner's machine failed while the compositor was still painting, which is
+    // why nothing that reads pixels or counts frames would have caught it.
+    open_terminal(&mut qemu, &mut log, "post-audio-desktop-vqmz")?;
+    eprintln!("  [desktop] three shell-spawned audio clients ran and the desktop still answers");
+    Ok(())
+}
+
+/// Ctrl+N at the compositor, and a shell in the window it opens that answers.
+///
+/// The nonce is per call because the verdict is that *this* terminal answered:
+/// a marker an earlier one already produced would pass on a window that never
+/// came up.
+fn open_terminal(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Result<(), String> {
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        input.keys(&[("ctrl", true), ("n", true), ("n", false), ("ctrl", false)]);
+    }
+    let before = log.len();
+    let deadline = Instant::now() + qemu::budget(Duration::from_secs(30));
+    while Instant::now() < deadline {
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            type_line(&mut input, &format!("echo {nonce}"));
+        }
+        if serial_until(qemu, log, nonce, Duration::from_secs(2)) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "a terminal opened with Ctrl+N never reached a shell that answers:\n{}",
+        &log[before..]
+    ))
+}
+
+/// Ctrl+Alt+D at a live desktop: every CPU answers, and the two halves of the
+/// report agree.
+///
+/// The instrument known-issues §5 files against, built because QEMU cannot
+/// stage the T14's audio wedge and a question the owner can answer beats a fix
+/// nobody can verify. Until this landed the dump listed the *calling* CPU's
+/// parked threads and named them by scheduler key, so it could confirm a park
+/// and never rule one out — and the three states that look identical from
+/// outside (parked on a deadline that did not fire, parked on a deadline
+/// nothing could reach, held by no CPU at all) were not distinguishable at all.
+///
+/// Eight CPUs, because "machine-wide" is not testable at the suite's default of
+/// two: one CPU short of the whole machine is what the old dump already did.
+///
+/// **The verdict is the instrument, not the guest's health.** A deadline that
+/// has passed and whose pass has not yet run is a legitimate microsecond-wide
+/// state, so asserting zero of them would be asserting a race. What is asserted
+/// is that the report is complete and that its halves cannot disagree: every
+/// CPU is present, the deadline classes sum to the parked count, and the
+/// process table knows at least as many threads as the schedulers hold.
+fn blocked_dump() -> Result<(), String> {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopaudiocase");
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        smp: 8,
+        qmp: true,
+        ready_marker: "compositor: ready",
+        ..Default::default()
+    };
+    metal_sim_argv_check(&qemu::profile_argv(&options))?;
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let mut log = qemu.boot_log().to_string();
+    if !shell_answers(&mut qemu, &mut log) {
+        return Err(format!("nothing typed at the terminal window reached a shell:\n{log}"));
+    }
+
+    let before = log.len();
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        input.keys(&[
+            ("ctrl", true),
+            ("alt", true),
+            ("d", true),
+            ("d", false),
+            ("alt", false),
+            ("ctrl", false),
+        ]);
+    }
+    if !serial_until(&mut qemu, &mut log, "=== end of dump ===", Duration::from_secs(30)) {
+        return Err(format!("Ctrl+Alt+D produced no complete report:\n{}", &log[before..]));
+    }
+    let report = log[before..].to_string();
+
+    // Every CPU printed its own line. This is the whole of "machine-wide": the
+    // count in the summary is derived, these are the CPUs actually answering.
+    let missing: Vec<usize> =
+        (0..8).filter(|c| !report.contains(&format!("cpu{c} running"))).collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "cpu(s) {missing:?} never reported — the dump reached {} of 8:\n{report}",
+            8 - missing.len()
+        ));
+    }
+    if !report.contains("8/8 cpu(s) answered") {
+        return Err(format!("the report does not claim a whole machine:\n{report}"));
+    }
+    // On a settled desktop the table is free, so the half of the verdict that
+    // only the census can produce must be there. A report that answered two of
+    // three questions is worth having on the owner's panel and is not worth
+    // accepting from a gate.
+    if !report.contains(" unheld, ") || !report.contains(" never ran") {
+        return Err(format!(
+            "the verdict lost its census half on a settled machine:\n{report}"
+        ));
+    }
+
+    // A parked line names a process, not a scheduler key.
+    let named = report
+        .lines()
+        .filter(|l| l.contains("pid=") && l.contains("tid=") && l.contains(" parked "))
+        .count();
+    if named == 0 {
+        return Err(format!("no parked task was named by pid and tid:\n{report}"));
+    }
+
+    // The two halves must agree, which is what makes the verdict mean anything:
+    // every parked task falls into exactly one deadline class, and every task a
+    // scheduler holds is a thread the process table knows.
+    let parked = dump_field(&report, "== sched:", "parked")?;
+    let classes = dump_field(&report, "== deadlines:", "event-only,")?
+        + dump_field(&report, "== deadlines:", "pending,")?
+        + dump_field(&report, "== deadlines:", "OVERDUE,")?
+        + dump_field(&report, "== deadlines:", "ABSURD")?;
+    if parked != classes {
+        return Err(format!(
+            "{parked} parked task(s) but {classes} classified — the report contradicts \
+             itself:\n{report}"
+        ));
+    }
+    let threads = dump_field(&report, "== census:", "thread(s)")?;
+    if threads < parked {
+        return Err(format!(
+            "the schedulers hold {parked} task(s) and the process table knows {threads} \
+             thread(s) — the census cannot see what the CPUs do:\n{report}"
+        ));
+    }
+
+    let verdict = report
+        .lines()
+        .find(|l| l.contains("== VERDICT:"))
+        .ok_or_else(|| format!("no verdict line:\n{report}"))?;
+    eprintln!(
+        "  [dump] {threads} threads, {parked} parked, all 8 cpus answered;{}",
+        verdict.split("VERDICT:").nth(1).unwrap_or("").trim_end()
+    );
+    Ok(())
+}
+
+/// The number the report writes immediately before `word`, on the line that
+/// carries `marker`. Read from the word a person sees rather than from a
+/// column, so a reordered line does not silently read the wrong field.
+fn dump_field(report: &str, marker: &str, word: &str) -> Result<u32, String> {
+    let line = report
+        .lines()
+        .find(|l| l.contains(marker))
+        .ok_or_else(|| format!("no {marker:?} line in the report:\n{report}"))?;
+    let head = line
+        .split(word)
+        .next()
+        .filter(|h| h.len() < line.len())
+        .ok_or_else(|| format!("no {word:?} on {line:?}"))?;
+    head.split_whitespace()
+        .next_back()
+        .and_then(|w| w.parse().ok())
+        .ok_or_else(|| format!("no number before {word:?} on {line:?}"))
+}
+
+/// Connects the mixer has *applied* since `from`, which is a different event
+/// from the control thread's `opening stream` — the T14 log carries the second
+/// without the first.
+fn connects_since(log: &str, from: usize) -> usize {
+    soundd_clients_since(log, from, " connected")
+}
+
+/// Clients the mixer has ramped out and dropped since `from`.
+fn removals_since(log: &str, from: usize) -> usize {
+    soundd_clients_since(log, from, " removed")
+}
+
+fn soundd_clients_since(log: &str, from: usize, verb: &str) -> usize {
+    log[from..]
+        .lines()
+        .filter(|l| l.contains("soundd: client ") && l.contains(verb))
+        .count()
+}
+
 /// The direct regression for the readiness defect: a stimulus that produces
 /// bytes and no events must produce no wake. Pause is that stimulus — six
 /// bytes, deliberately swallowed.
@@ -4130,24 +4623,43 @@ fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
     Ok(())
 }
 
+/// QEMU's `PS2_QUEUE_SIZE` (`hw/input/ps2.c`) — what the device will hold. Not
+/// the 256-byte `PS2_BUFFER_SIZE` array behind it, which is a migration format
+/// and not a capacity.
+const QEMU_PS2_QUEUE: usize = 16;
+
+/// A PS/2 pointer packet. Three bytes, because the driver's aux init sends no
+/// IntelliMouse knock and QEMU therefore frames a plain mouse.
+const MOUSE_PACKET: usize = 3;
+
 /// How far the host may run ahead of the guest while it feeds the framer.
 ///
-/// Ninety-six bytes, against a 256-byte ring in the kernel and QEMU's PS/2
-/// buffer above it: neither can fill however little of the host the guest is
-/// getting, which is what makes `0 dropped` on the driver's counters a
-/// statement about the driver.
-const MOUSE_LEAD: usize = 32;
+/// A packet the guest has reported is a packet whose bytes have left the
+/// device's queue, so the lead bounds that queue's occupancy — which is the
+/// only thing that makes an injected command a packet. Past the bound QEMU
+/// stops queueing motion and starts *accumulating* it, and the merged deltas
+/// come back as one packet or, if they cancel, as none at all.
+const MOUSE_LEAD: usize = 4;
+
+const _: () = assert!(
+    MOUSE_PACKET * MOUSE_LEAD <= QEMU_PS2_QUEUE,
+    "the lead outruns QEMU's PS/2 queue, which merges the motion it cannot hold"
+);
+
+/// Moves the staged merge puts in one command: more than one, and few enough
+/// that their sum stays inside the packet's signed byte.
+const MERGE_MOTIONS: usize = 4;
 
 /// The TrackPoint path, and a thousand packets through the framer after it,
 /// each sent only once the one before it has come out of the guest.
 ///
-/// The pacing is the design. QEMU's PS/2 buffer silently drops a packet it has
-/// no room for, so a host injecting at its own speed measures how fast the
-/// guest drains and reads the shortfall as a driver defect. Staying behind the
-/// guest's own report leaves no loss to tolerate: every packet injected is a
-/// packet that arrived, or the run stalls and says how far it got. It is also
-/// what makes the driver's `discarded`/`dropped` counters mean something a
-/// slow guest cannot account for.
+/// The pacing is the design, and [`MOUSE_LEAD`] is what makes it one: a host
+/// injecting at its own speed measures how fast the guest drains and reads the
+/// shortfall as a driver defect. Staying inside what the device holds leaves no
+/// loss to tolerate: every packet injected is a packet that arrived, or the run
+/// stalls and says how far it got. It is also what makes the driver's
+/// `discarded`/`dropped` counters mean something a slow guest cannot account
+/// for.
 fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
     let qemu = &mut boot.qemu;
     let boot = qemu.boot_log().to_string();
@@ -4162,6 +4674,7 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
         let mut input: Option<qemu::QmpInput> = None;
         let mut burst = 0usize;
         let mut clicked = false;
+        let mut merged = false;
         let mut counted = false;
         let mut ended = false;
         qemu.run_test_paced("test_rs_i8042_mouse", Duration::from_secs(60), |socket, line| {
@@ -4204,6 +4717,15 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
                 clicked = true;
                 return;
             }
+            // What [`MOUSE_LEAD`] exists to stay clear of, staged where it can
+            // do no harm: the queue is empty here, so the merge is the device's
+            // one-sync-per-command rule and nothing else.
+            if !merged {
+                input.mouse_merged(1, MERGE_MOTIONS);
+                injected.set(injected.get() + 1);
+                merged = true;
+                return;
+            }
             // The driver reports its counters from a scheduler pass, and the
             // client polling its fd is what keeps passes running: the line has
             // to arrive before the client is told to stop.
@@ -4229,13 +4751,27 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
     }
 
     let events = parse_mouse_events(&result.stdout);
-    // The host sent none of these until the one before it had arrived, so a
-    // shortfall is a packet the machine lost and never a host that outran it.
+    // The host never had more outstanding than the device holds, so a shortfall
+    // is a packet the machine lost and never a host that outran it.
     if events.len() != injected {
         return Err(format!(
-            "{} pointer events reached userland out of {injected} packets injected, each one \
-             paced against the arrival of the last",
-            events.len()
+            "{} pointer events reached userland out of {injected} packets injected, never more \
+             than {MOUSE_LEAD} of them ({} bytes) outstanding against a {QEMU_PS2_QUEUE}-byte \
+             device queue",
+            events.len(),
+            MOUSE_LEAD * MOUSE_PACKET,
+        ));
+    }
+    // The step one packet moves the pointer, off the first two of the burst.
+    let step = (events[5].x as i32 - events[4].x as i32).abs();
+    // Third from last: the staged merge, then the right button's two halves.
+    let merge = events.len() - 3;
+    let jump = (events[merge].x as i32 - events[merge - 1].x as i32).abs();
+    if step == 0 || jump != step * MERGE_MOTIONS as i32 {
+        return Err(format!(
+            "{MERGE_MOTIONS} moves in one command moved the pointer {jump} against a one-move \
+             step of {step}: QEMU no longer sums motion between syncs, and `MOUSE_LEAD` is \
+             derived from the fact that it does"
         ));
     }
     // A sign error in dy is invisible to any test that only checks
@@ -4641,6 +5177,9 @@ fn run_machine_test(
         "usb_refused_disk_first" => {
             usb::usb_refused_disk_first(test_config, c_bins, rust_bins)
         }
+        "usb_pool_exhausted" => usb::usb_pool_exhausted(test_config, c_bins, rust_bins),
+        "usb_short_read" => usb::usb_short_read(test_config, c_bins, rust_bins),
+        "usb_disk_index_stable" => usb::usb_disk_index_stable(test_config, c_bins, rust_bins),
         // Body in `tests/common/volumes.rs`, same reason.
         "esp_filesystem" => common::volumes::esp_filesystem(test_config, c_bins, rust_bins),
         // Body in `tests/common/toybox.rs`, same reason.
@@ -4670,6 +5209,7 @@ fn run_machine_test(
         "xhci_full_speed_device" => {
             usb::xhci_full_speed_device(test_config, c_bins, rust_bins)
         }
+        "xhci_superspeed_ports" => usb::xhci_superspeed_ports(test_config, c_bins, rust_bins),
         "xhci_hotplug" => usb::xhci_hotplug(test_config, c_bins, rust_bins),
         "xhci_flap" => usb::xhci_flap(test_config, c_bins, rust_bins),
         "xhci_hid_break" => usb::xhci_hid_break(test_config, c_bins, rust_bins),
@@ -4684,6 +5224,7 @@ fn run_machine_test(
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
+        "null_sink_shipped_client" => audio::null_sink_shipped_client(test_config, c_bins, rust_bins),
         "doom_sound_flood" => audio::doom_sound_flood(rust_bins),
         "metal_sim_compositor" => {
             metal_sim_compositor(group_boot(held, METAL_SIM_DESKTOP, || {
@@ -4735,6 +5276,8 @@ fn run_machine_test(
         "desktop_locale_detect" => desktop_locale_detect(),
         "desktop_typing_damage" => desktop_typing_damage(),
         "desktop_window_child" => desktop_window_child(rust_bins),
+        "desktop_audio_client" => desktop_audio_client(),
+        "blocked_dump" => blocked_dump(),
         "xhci_many_devices" => {
             // The T14's internal controller carries a camera, Bluetooth and a
             // fingerprint reader next to the boot stick, and every profile in
@@ -6769,6 +7312,55 @@ fn run_machine_test(
             );
             Ok(())
         }
+        "sshd_fail_closed" => {
+            // sshd with a network under it — the only boot that gets past its
+            // bind. What that reaches for the first time is the daemon's own
+            // state on disk: the identity it mints under `/home`, and the file
+            // it authenticates against.
+            //
+            // The verdict is that it authenticates nobody and says which file
+            // left it that way. A daemon that cannot accept any key must not
+            // be holding port 22, so "never listened" is asserted too — that
+            // is the half a missing-file check would still pass without.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sshdcase");
+            let options = BootOptions {
+                profile: qemu::Profile::Headless,
+                ..Default::default()
+            };
+            if !qemu::profile_argv(&options).iter().any(|a| a.contains("virtio-net")) {
+                return Err("this test needs a NIC and the profile has none".to_string());
+            }
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            let mut console = qemu.boot_log().to_string();
+
+            // Minting proves `/home/root/.ssh` is creatable and writable from
+            // userland; the fingerprint proves the key it wrote reads back.
+            const WANT: [&str; 3] = [
+                "sshd: minted a new host identity at /home/root/.ssh/host_ed25519",
+                "sshd: host identity SHA256:",
+                "sshd: cannot read /home/root/.ssh/authorized_keys",
+            ];
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline && !WANT.iter().all(|w| console.contains(w)) {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            for want in WANT {
+                if !console.contains(want) {
+                    return Err(format!("{want:?} never reached the console:\n{console}"));
+                }
+            }
+            if console.contains("sshd: listening on port 22") {
+                return Err(format!(
+                    "sshd listened on port 22 with no key it could ever accept:\n{console}"
+                ));
+            }
+            eprintln!(
+                "  [sshd] host identity minted under /home, and no authorized_keys file \
+                 left it refusing to listen at all"
+            );
+            Ok(())
+        }
         "netd_connection_caps" => {
             // The only boot that runs netd at all. Its `main` opens the NIC
             // first and returns on `NotFound`, so metal-sim never reaches a
@@ -7402,6 +7994,10 @@ fn build_test_registry(
     for name in discover_rust_tests(rust_bins) {
         let timeout = match name.as_str() {
             "panic_recovery" => Duration::from_secs(10),
+            // Its verdict is that a parked waiter woke, so the failing run is
+            // the slow one: it spends its own patience before reporting, and
+            // the report is worth more than the harness's timeout message.
+            "io_uring_cancel_wakes" => Duration::from_secs(30),
             _ => Duration::from_secs(5),
         };
         tests.push(TestDef {

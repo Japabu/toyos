@@ -5,11 +5,13 @@
 //! * [`driver`] — percpu `CpuSched` slot, pass entry, asm switch, idle loop,
 //!   trampoline. Decides nothing.
 //! * [`waitqs`] — where the kernel's wait queues live.
+//! * [`dump`] — Ctrl+Alt+D, the machine-wide blocked-task report.
 //!
 //! The kernel-facing API — everything the rest of the kernel calls — is
 //! `crate::scheduler`.
 
 pub mod driver;
+pub mod dump;
 pub mod payload;
 pub mod waitqs;
 

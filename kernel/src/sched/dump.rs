@@ -1,0 +1,429 @@
+//! Ctrl+Alt+D: what every CPU is holding, and what nothing is holding at all.
+//!
+//! The one instrument for a machine that has stopped without panicking. It
+//! answers three questions that look identical from outside and have different
+//! causes — a thread parked on a deadline that never fired, a thread parked on
+//! a deadline nobody could ever reach, and a thread no CPU has at all — and it
+//! is designed to be read off a photograph of a panel, so the verdict is the
+//! last thing printed and the report takes the screen.
+//!
+//! **No CPU may read another's scheduler state.** `CpuSched` is `!Sync` by
+//! design, so this is a request rather than a walk: the asking CPU marks every
+//! sibling, kicks it, and each one prints its own tasks from `drain_irqs` at
+//! the top of its next pass. A CPU that does not reach a pass inside the
+//! budget is named, and *that is a finding* — it is the only way this report
+//! can say "cpu 3 is not scheduling at all".
+//!
+//! Nothing here allocates, nothing waits on a lock it could find held, and
+//! every list is bounded. See `specs/known-issues.md` §5 for what it was built
+//! to settle.
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::arch::{apic, percpu, smp};
+use crate::sched::payload::{SCHED_BLOCKED, SCHED_READY, SCHED_RUNNING};
+
+use super::driver;
+use super::MAX_CPUS;
+
+/// A deadline further out than this is not a wait, it is arithmetic that got
+/// away: no kernel site parks for an hour, and a `saturating_add` that
+/// overflowed lands at `u64::MAX` nanoseconds, which is 584 years.
+const ABSURD_HORIZON_NS: u64 = 3_600_000_000_000;
+
+/// How long the asking CPU waits for its siblings before naming the silent
+/// ones. It spends this with preemption off, which is what any bounded wait in
+/// `drain_irqs` costs; a quarter second is far past a scheduler pass and far
+/// short of anything a person notices after pressing a key.
+const ANSWER_BUDGET_NS: u64 = 250_000_000;
+
+/// Ordinary parked lines one CPU may print. A line the verdict depends on —
+/// overdue, absurd — is never counted against this, so truncation cannot hide
+/// the thing being looked for.
+const LINES_PER_CPU: u32 = 16;
+
+/// Census lines, which carry only the threads the parked lists do not.
+const CENSUS_LINES: u32 = 16;
+
+/// How long the census retries the process table. Whoever holds it in the
+/// ordinary case — a spawn, an exit — is finished inside microseconds, and
+/// giving up on the first refusal costs the owner the half of the report that
+/// names a thread no CPU has. Whoever holds it in the case this facility is
+/// for is not going to finish, which is what the ceiling is for.
+const TABLE_BUDGET_NS: u64 = 20_000_000;
+
+static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static OWES: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// What the CPUs report, summed as each one answers. Reset by `request`
+/// before any CPU is asked.
+mod tally {
+    use core::sync::atomic::AtomicU32;
+
+    pub static PARKED: AtomicU32 = AtomicU32::new(0);
+    pub static READY: AtomicU32 = AtomicU32::new(0);
+    pub static RUNNING: AtomicU32 = AtomicU32::new(0);
+    pub static NO_DEADLINE: AtomicU32 = AtomicU32::new(0);
+    pub static PENDING: AtomicU32 = AtomicU32::new(0);
+    pub static OVERDUE: AtomicU32 = AtomicU32::new(0);
+    pub static ABSURD: AtomicU32 = AtomicU32::new(0);
+    pub static UNPRINTED: AtomicU32 = AtomicU32::new(0);
+
+    pub const ALL: [&AtomicU32; 8] = [
+        &PARKED,
+        &READY,
+        &RUNNING,
+        &NO_DEADLINE,
+        &PENDING,
+        &OVERDUE,
+        &ABSURD,
+        &UNPRINTED,
+    ];
+}
+
+/// What a parked task's deadline says about it. The three-way split this whole
+/// facility exists to make legible.
+#[derive(Clone, Copy, PartialEq)]
+enum Verdict {
+    /// No deadline: only an event ends this wait, which is what a server does.
+    Event,
+    /// A deadline still in the future.
+    Pending,
+    /// A deadline that has passed. The timer that should have ended this wait
+    /// did not fire.
+    Overdue,
+    /// A deadline no wait could have meant.
+    Absurd,
+}
+
+impl Verdict {
+    fn of(deadline: Option<u64>, now: u64) -> Self {
+        match deadline {
+            None => Self::Event,
+            Some(at) if at <= now => Self::Overdue,
+            Some(at) if at - now > ABSURD_HORIZON_NS => Self::Absurd,
+            Some(_) => Self::Pending,
+        }
+    }
+
+    /// Whether this line must survive truncation.
+    fn is_anomaly(self) -> bool {
+        matches!(self, Self::Overdue | Self::Absurd)
+    }
+
+    fn count(self) {
+        match self {
+            Self::Event => &tally::NO_DEADLINE,
+            Self::Pending => &tally::PENDING,
+            Self::Overdue => &tally::OVERDUE,
+            Self::Absurd => &tally::ABSURD,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn online_cpus() -> usize {
+    (smp::cpu_count() as usize).min(MAX_CPUS)
+}
+
+/// Ctrl+Alt+D. Called from `drain_irqs` on whichever CPU decoded the key, and
+/// from nowhere else.
+pub fn request() {
+    // `pass` owns the one level; a `Lock` guard would add another. The whole
+    // design below — `try_lock`, bounded waits, no allocation — assumes this
+    // runs holding nothing, and this is what keeps that true as `drain_irqs`
+    // grows.
+    let depth = crate::preempt::count();
+    assert!(depth <= 1, "the blocked-task dump ran under a lock: preempt depth {depth}");
+    if IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    for counter in tally::ALL {
+        counter.store(0, Ordering::Relaxed);
+    }
+
+    let cpus = online_cpus();
+    let me = percpu::cpu_id() as usize;
+    log!("=== blocked-task dump: {cpus} cpu(s), and this report takes the screen ===");
+
+    for cpu in 0..cpus {
+        if cpu != me {
+            OWES[cpu].store(true, Ordering::Release);
+        }
+    }
+    // Kick after every flag is set, so a CPU that answers instantly cannot
+    // find its own flag still unwritten and go back to sleep.
+    for cpu in 0..cpus {
+        if cpu != me {
+            apic::kick_cpu(cpu as u32);
+        }
+    }
+
+    report_this_cpu();
+
+    // A pass reached by preemption cannot be holding a `Lock` — taking one
+    // raises the preempt count — so spinning here cannot be blocking a sibling
+    // on a lock this CPU's interrupted context owns.
+    let deadline = crate::clock::nanos_since_boot().saturating_add(ANSWER_BUDGET_NS);
+    let mut silent = 0;
+    loop {
+        if (0..cpus).all(|cpu| !OWES[cpu].load(Ordering::Acquire)) {
+            break;
+        }
+        if crate::clock::nanos_since_boot() >= deadline {
+            for cpu in 0..cpus {
+                if OWES[cpu].swap(false, Ordering::AcqRel) {
+                    silent += 1;
+                    log!("  cpu{cpu} !! no answer: it did not reach a scheduler pass");
+                }
+            }
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    let census = census();
+    summary(cpus, silent, census);
+    crate::drivers::panic_console::paint_report();
+    IN_PROGRESS.store(false, Ordering::Release);
+}
+
+/// Print this CPU's own tasks if it was asked to. Called from `drain_irqs` on
+/// every CPU, every pass.
+pub fn serve_if_owed() {
+    let me = percpu::cpu_id() as usize;
+    if me >= MAX_CPUS || !OWES[me].load(Ordering::Acquire) {
+        return;
+    }
+    report_this_cpu();
+    OWES[me].store(false, Ordering::Release);
+}
+
+fn report_this_cpu() {
+    let cpu = percpu::cpu_id();
+    let now = crate::clock::nanos_since_boot();
+
+    match driver::running_id() {
+        Some(id) => {
+            tally::RUNNING.fetch_add(1, Ordering::Relaxed);
+            log!("  cpu{cpu} running pid={} tid={}", id.0.raw(), id.1.raw());
+        }
+        None => log!("  cpu{cpu} running nothing"),
+    }
+    let ready = driver::ready_len() as u32;
+    tally::READY.fetch_add(ready, Ordering::Relaxed);
+
+    let mut ordinary = 0u32;
+    let read = driver::for_each_parked(|task| {
+        tally::PARKED.fetch_add(1, Ordering::Relaxed);
+        let verdict = Verdict::of(task.deadline, now);
+        verdict.count();
+        if !verdict.is_anomaly() {
+            ordinary += 1;
+            if ordinary > LINES_PER_CPU {
+                tally::UNPRINTED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        log!(
+            "  cpu{cpu} {}pid={} tid={} {} parked {} {}{}",
+            if verdict.is_anomaly() { "!! " } else { "" },
+            task.id.0.raw(),
+            task.id.1.raw(),
+            task.class.name(),
+            Ms(now.saturating_sub(task.since)),
+            Deadline { verdict, deadline: task.deadline, now },
+            if task.rt { " rt" } else { "" },
+        );
+    });
+    if !read {
+        log!("  cpu{cpu} !! a pass owns its scheduler state; nothing read from it");
+    }
+    if ready > 0 {
+        log!("  cpu{cpu} {ready} task(s) queued and not running");
+    }
+}
+
+/// What the census found, for the summary to compare against the CPUs.
+#[derive(Default, Clone, Copy)]
+struct Census {
+    read: bool,
+    threads: u32,
+    running: u32,
+    ready: u32,
+    blocked: u32,
+    zombie: u32,
+    unscheduled: u32,
+    never_ran: u32,
+}
+
+/// Every thread the process table knows, and one line for each that the CPUs'
+/// parked lists do not already carry.
+///
+/// A thread whose state word says Ready is either about to run or has never
+/// run at all, and `cpu_ns == 0` is the difference. That is the whole reason
+/// this half exists: a task no CPU ever picked up appears in nobody's parked
+/// list, so a report built from the schedulers alone cannot see it.
+fn census() -> Census {
+    let mut c = Census::default();
+    let mut printed = 0u32;
+    let deadline = crate::clock::nanos_since_boot().saturating_add(TABLE_BUDGET_NS);
+    c.read = walk_threads(deadline, |thread| {
+        c.threads += 1;
+        if thread.zombie.is_some() {
+            c.zombie += 1;
+            return;
+        }
+        let (bucket, tag) = match thread.sched {
+            Some(SCHED_RUNNING) => (&mut c.running, None),
+            Some(SCHED_BLOCKED) => (&mut c.blocked, None),
+            Some(SCHED_READY) if thread.cpu_ns == 0 => {
+                c.never_ran += 1;
+                (&mut c.ready, Some("!! ready and has never run"))
+            }
+            Some(SCHED_READY) => (&mut c.ready, Some("ready")),
+            _ => (&mut c.unscheduled, Some("!! no scheduler record")),
+        };
+        *bucket += 1;
+        // Blocked and running threads are the CPUs' lines; printing them again
+        // would push the ones only this half can see off the page.
+        let Some(tag) = tag else { return };
+        printed += 1;
+        if printed > CENSUS_LINES {
+            return;
+        }
+        log!(
+            "  {tag}: pid={} tid={} {} cpu={}",
+            thread.pid.raw(),
+            thread.tid.raw(),
+            Named { process: thread.process, thread: thread.thread },
+            Ms(thread.cpu_ns),
+        );
+    });
+    c
+}
+
+/// `process::try_for_each_thread` until `deadline`. Separated so the retry is
+/// one loop rather than a condition tangled into the walk.
+fn walk_threads(deadline: u64, mut f: impl FnMut(crate::process::ThreadCensus<'_>)) -> bool {
+    loop {
+        if crate::process::try_for_each_thread(&mut f) {
+            return true;
+        }
+        if crate::clock::nanos_since_boot() >= deadline {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// The verdict, printed last because it is the only part that needs every CPU
+/// to have answered — and because the panel shows the newest page, so last is
+/// what a photograph catches.
+fn summary(cpus: usize, silent: u32, c: Census) {
+    let answered = cpus - silent as usize;
+    // Every count in the summary is written before the word it counts, so a
+    // reader — and the gate — takes the field from the word rather than from a
+    // position in the line.
+    if !c.read {
+        log!("== census: the process table is held; no thread census this dump");
+    } else {
+        log!(
+            "== census: {} thread(s) — {} running, {} ready, {} blocked, {} zombie, {} unscheduled",
+            c.threads, c.running, c.ready, c.blocked, c.zombie, c.unscheduled,
+        );
+    }
+    log!(
+        "== sched: {answered}/{cpus} cpu(s) answered — {} running, {} queued, {} parked",
+        tally::RUNNING.load(Ordering::Relaxed),
+        tally::READY.load(Ordering::Relaxed),
+        tally::PARKED.load(Ordering::Relaxed),
+    );
+    log!(
+        "== deadlines: {} event-only, {} pending, {} OVERDUE, {} ABSURD",
+        tally::NO_DEADLINE.load(Ordering::Relaxed),
+        tally::PENDING.load(Ordering::Relaxed),
+        tally::OVERDUE.load(Ordering::Relaxed),
+        tally::ABSURD.load(Ordering::Relaxed),
+    );
+    // The three-way split, said in one line, and degraded field by field
+    // rather than withdrawn: a report that answers two of three questions is
+    // worth having, and a photograph of "incomplete" is worth nothing.
+    //
+    // `unheld` compares what the state words claim against what the CPUs
+    // actually hold. A thread the words call blocked or ready that no CPU has
+    // is one nothing will ever run, and it is the whole reason the census is
+    // here — the schedulers alone cannot see a task none of them was given.
+    let overdue = tally::OVERDUE.load(Ordering::Relaxed);
+    let absurd = tally::ABSURD.load(Ordering::Relaxed);
+    if c.read {
+        let scheduled = tally::PARKED.load(Ordering::Relaxed)
+            + tally::READY.load(Ordering::Relaxed)
+            + tally::RUNNING.load(Ordering::Relaxed);
+        let claimed = c.running + c.ready + c.blocked;
+        log!(
+            "== VERDICT: {overdue} overdue, {absurd} absurd, {} unheld, {} never ran{}",
+            claimed.saturating_sub(scheduled),
+            c.never_ran,
+            if answered == cpus { "" } else { " (of the cpus that answered)" },
+        );
+    } else {
+        log!(
+            "== VERDICT: {overdue} overdue, {absurd} absurd — the process table would not \
+             open, so nothing here can say what no cpu holds",
+        );
+    }
+    let unprinted = tally::UNPRINTED.load(Ordering::Relaxed);
+    if unprinted > 0 {
+        log!("== {unprinted} ordinary parked task(s) not listed; every anomaly is");
+    }
+    log!("=== end of dump ===");
+}
+
+/// A thread by the two names it has. Most threads never take a name of their
+/// own, and `soundd/` reads as a truncation rather than as an absence.
+struct Named<'a> {
+    process: &'a str,
+    thread: &'a str,
+}
+
+impl core::fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.thread.is_empty() {
+            true => write!(f, "{}", self.process),
+            false => write!(f, "{}:{}", self.process, self.thread),
+        }
+    }
+}
+
+/// Milliseconds, because every duration in this report is one and a bare
+/// nanosecond count is unreadable on a photograph.
+struct Ms(u64);
+
+impl core::fmt::Display for Ms {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}ms", self.0 / 1_000_000)
+    }
+}
+
+struct Deadline {
+    verdict: Verdict,
+    deadline: Option<u64>,
+    now: u64,
+}
+
+impl core::fmt::Display for Deadline {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match (self.verdict, self.deadline) {
+            (Verdict::Event, _) => write!(f, "no deadline"),
+            (Verdict::Pending, Some(at)) => write!(f, "due in {}", Ms(at - self.now)),
+            (Verdict::Overdue, Some(at)) => {
+                write!(f, "OVERDUE by {}", Ms(self.now.saturating_sub(at)))
+            }
+            (Verdict::Absurd, Some(at)) => write!(f, "ABSURD, due in {}", Ms(at - self.now)),
+            // `Verdict::of` reads the same `Option` this does, so a verdict
+            // that names a deadline cannot come with none.
+            (_, None) => write!(f, "no deadline"),
+        }
+    }
+}

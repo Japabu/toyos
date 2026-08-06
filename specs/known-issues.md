@@ -22,6 +22,45 @@ that followed the T14's first boot.
 
 ## 1. Isolation and untrusted input
 
+### sshd's keys are as protected as any other file, which is not at all
+
+`/home/root/.ssh/host_ed25519` is the machine's SSH private key and
+`/home/root/.ssh/authorized_keys` is the list of who may log in. There is no
+user model and no file permissions, so **any process on the machine can read
+the first and rewrite the second** — the second being the one that matters:
+appending a line to it is a remote login, and nothing stops a process doing it.
+
+This is not an sshd defect and cannot be fixed inside sshd. It is the absence
+of the thing `specs/capability-handles-spec.md` is about — an owner for a
+kernel object, and a process that holds fewer rights than the machine.
+Deliberately not worked around here: a daemon-private hiding place would be
+obfuscation, and inventing a user model to serve one daemon is the wrong shape
+for the decision. Until there is one, **sshd's trust boundary is the machine,
+not the account** — anyone who can run code on it can already be anyone.
+
+The daemon does what it can from where it stands: it is not in any boot config,
+it offers public keys only, an `authorized_keys` entry carrying options
+authorizes nothing (the options are the restrictions, and honouring the key
+without them grants more than the file says), and a host key that exists but
+does not parse is refused rather than replaced, because minting over it would
+change the identity every client has pinned.
+
+### Nothing connects to sshd, so its accept path is read-verified
+
+`tests/sshdcase` boots sshd with a NIC and certifies the half that needs a
+machine: that it mints an identity under `/home`, that it names the file it
+authenticates against, and that with no usable key it exits instead of holding
+port 22. The decision itself — this key yes, that key no, an options line
+never — is host-tested in `userland/sshd`'s own `#[cfg(test)]` module against
+real Ed25519 keys and `ssh-key`'s parser.
+
+What neither reaches is a client. No test completes an SSH handshake, so the
+wiring between russh's auth callbacks and that decision — `auth_publickey`,
+`auth_publickey_offered`, and the `MethodSet` that stops password auth being
+offered at all — is certified by reading. Closing it needs an SSH client on the
+host talking to the guest through `hostfwd`, which is
+`specs/daemon-testability.md` §131's step and belongs with gate N.
+
 ### THE CLASS: an id or a name treated as a capability
 
 Three separate defects in this file are one defect. A `PipeId`, a service name
@@ -941,6 +980,141 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
+### `Lock::lock`'s spin is the half of the ticket lock loom cannot reach
+
+`kernel-loom` compiles `kernel/src/sync.rs` a second time against loom's
+atomics, so the models drive the real primitive rather than a transliteration.
+They drive `try_lock` and `LockGuard::drop`. They do not drive `lock()`: loom
+explores a spin as an unbounded branch and gives up — `Model exceeded maximum
+number of branches`, which is what the first draft of
+`try_lock_observes_the_previous_owners_writes` produced — and the
+`loom::thread::yield_now()` that would bound it belongs to loom, not to a kernel
+that really does spin.
+
+What that leaves unmodelled is contention on `lock()` itself: the ticket
+ordering, and the FIFO fairness the ticket exists to buy. The *release* edge is
+shared — both acquire paths end at the guard's `now.fetch_add(1, Release)` — so
+the models do exercise the publication side; the waiting side is still certified
+by reading.
+
+Nothing in the guest suite can substitute. x86's TSO gives every load acquire
+and every store release semantics, so a missing acquire edge in this primitive is
+invisible on the only architecture ToyOS currently boots, and becomes observable
+on ARM64, which is planned and not built. That is why `try_lock`'s acquire edge
+sat on the wrong atomic through every green suite run until a model checker was
+pointed at it.
+
+### A scheduler pass may spend two seconds in xHCI before it drains its mailbox
+
+`sched::driver::pass` and `pass_block` both open with `drain_irqs()`, and
+`drain_irqs` calls `xhci::poll_if_pending()` — **before** `with_cpu(...)`, and
+therefore before the CPU's mailbox drain, its deadline fires and its pick. That
+call is not bookkeeping. Its own doc-comment says so:
+
+> it enumerates hot-plugged devices and recovers broken endpoints, and both spin
+> on deadlines measured in seconds while holding `XHCI`, which is a ticket
+> spinlock and therefore preemption off for its whole life.
+
+The deadline is `xhci::USB_TIMEOUT_NS` = 2 s. `cpu::MAX_PASS_NS`, the budget the
+scheduler core asserts against in `feature = "check"` builds, is 200 µs. The two
+numbers disagree by four orders of magnitude, and the driver's prologue sits on
+the wrong side of the boundary the budget describes.
+
+What a CPU inside that recovery holds is *every message addressed to it*: an
+`Adopt` carrying a task, a `Wake` for a parked thread, a `Retire`. Nothing in the
+scheduler can shorten it — every reap and every wake is bounded by the owning
+CPU's pass latency by design, which is exactly why the design is sound. The one
+thing in the tree that notices is `scheduler::retire_task`'s 1 s guard, and it
+notices by panicking:
+
+```
+retire_task: task not released after 1s: InTransit(CpuId(1))
+```
+
+That panic fired on the owner's T14 at 949.792 s of uptime with doom exiting. The
+*balance*-path half of it is fixed (spec §7.6.4: `hand_off` reaps a killed task
+rather than handing it on, gated by simulator invariant I14). This half is not,
+and it would produce the same panic with `Blocked(CpuId(n))` in the message
+instead — the guard cannot tell a lost message from a busy CPU, which is what it
+is written as if it could.
+
+The second instance of the same shape is the idle loop, which runs
+`log_file::poll()` — already recorded in CLAUDE.md as "unbounded and
+uninterruptible" — before its `pass()`. On a machine whose log partition is on
+the USB stick it booted from, that flush is USB mass-storage I/O on the same 2 s
+transfer deadline, and a task adopted onto an idle CPU waits behind it.
+
+Closing this means making xHCI enumeration and endpoint recovery asynchronous, so
+that `drain_irqs` only ever does work it can finish: drain the event ring,
+dispatch HID reports, note that a port or an endpoint owes work. The debounce and
+the port reset were already moved off this path for exactly this reason (CLAUDE.md,
+USB hotplug); the control transfers inside `configure` and `recover_endpoints`
+were not. Until then, `retire_task`'s bound is measuring the USB bus.
+
+**And the budget cannot see it, twice over.** `cpu::MAX_PASS_NS` is asserted by
+`check_pass_duration`, which measures from `SchedPass::begin`'s `now` to the end
+of `finish()` — and `drain_irqs()` runs *before* `SchedPass::begin`. The
+prologue is outside the window the budget covers, so invariant P would report a
+200 µs pass while the CPU had been in the driver for two seconds. Separately,
+the assertion is behind `feature = "check"`, whose kernel switch is
+`sched-check` (`kernel/Cargo.toml:228`) — and **nothing in `src/` or `tests/`
+ever turns it on**, so invariant P has never executed against the kernel in any
+image or any test run. Both halves want fixing together: the measured window has
+to start where the scheduler entry starts, and the gate has to run somewhere.
+
+### A spawned thread that never runs is invisible: `spawn:` does not record where it was placed
+
+From the T14 field log `boot5-doom-wedge.log` boot 10 (17:41, pre-fix image).
+Spawned processes intermittently never execute a first instruction, worsening
+over the session: `/bin/ps` pid=17 (69.4 s), `/bin/doom` pid=20 (79.8 s, not
+even its banner), `/bin/shutdown` pid=25 (104.7 s). Two earlier dooms
+initialized fully, drew their title screen and went silent at exactly `ST_Init`
+— where doom starts its further threads — with soundd printing `opening stream`
+for pid=11 and never `client 1 connected`. The kernel stayed alive to 114.6 s.
+
+**The `sched:` counters do not indict the scheduler, and cannot.** Two facts
+about where that line comes from:
+
+* `parked` is `cpu.parked().count()`, and the only way into `CpuSched.parked`
+  is `SchedPass::dispose_block`, which consumes `cpu.running`. **A thread that
+  never executed cannot be counted there.** The victims are not in that number.
+  What it does count is ordinary long-lived blocked threads — compositor,
+  soundd, filepicker, and one per live terminal/shell — so 1 → 2 → 3 as three
+  terminal/shell pairs accumulate is the expected reading, not a leak.
+* `ready=0 current=None` on every sample is a tautology of the print site:
+  `log_health` is called from `idle_loop`, so the CPU printing it is idle by
+  construction. CLAUDE.md already says this line is not a heartbeat.
+
+**What the log does isolate is `spawn`.** `driver::spawn` posts its `Msg::Adopt`
+with `Urgency::Normal` to `placement()`, and `placement()` picks the CPU with
+the lowest *published* load — which on a mostly-idle machine is a **halted**
+one. So a spawn is the most delivery-dependent operation in the system: unlike a
+wake, which goes to a task's home CPU where other work usually is, a spawn
+routinely aims its only reap-or-run event at a CPU that must be interrupted to
+see it, and then must complete a whole pass before the thread's first
+instruction runs. Everything in §3's first entry — `drain_irqs`'s xHCI recovery
+ahead of the mailbox drain, `log_file::poll()` ahead of the idle loop's `pass()`
+— sits between that IPI and that first instruction. This machine boots off the
+stick it logs to (`usb-storage: disk 0 ready on slot 3, SanDisk Ultra`, and
+`9266 bytes of kernel log still on the stick` at the end), so both of those are
+USB transfers on `USB_TIMEOUT_NS`.
+
+**It is not the balance-path defect (#142) wearing userland clothes.**
+`hand_off`'s kill check fires only for a task whose retire is already claimed; a
+freshly spawned thread has no kill bit, so that fix cannot reach this. What the
+two share is the *state*: `InTransit` is reachable only by the adopt that
+carries it, #142 removed one producer of stuck ones, and `spawn` is the other
+producer and is untouched.
+
+**The instrument that is missing.** `loader.rs:1111`'s `spawn:` line records
+pid, tid, base, entry, cr3 and five timings, and **not the CPU the task was
+placed on**. So no reader of this log can say which CPU owed pid=17 its first
+dispatch, and therefore cannot correlate a never-ran spawn against that CPU's
+`sched:` lines — which is the one correlation that would separate "the adopt was
+never delivered" from "the destination never completed a pass". Fold `dst` into
+that line rather than adding a second one; the log ring is itself one of the
+conditions that keeps a CPU awake.
+
 ### OPEN, ASSIGNED (#142) — a spawned process sometimes never starts, and every stuck terminal in the T14 session is downstream of one
 
 Owner-reported (task #141) and read off two T14 session logs. **It is one
@@ -1007,9 +1181,14 @@ that whole boot the only processes that ever exited were `netd` and one
 That is an answer rather than a lost measurement, and it is worth more than the
 column would have been: **it strikes a fresh process before it can write a
 byte, whatever the program is** — `ls`, `rustc`, `ps`, `shutdown`, `doom` — so
-nothing about `ls`'s own I/O path is involved. Meanwhile the per-CPU `parked`
-counters climb 1 → 2 → 3 as victims accumulate, `ready` is 0 on every report,
-and the kernel logs to the end.
+nothing about `ls`'s own I/O path is involved. The kernel logs to the end.
+
+The per-CPU `parked` counters climbing 1 → 2 → 3 is **not** the victims
+accumulating, and `ready = 0` on every report is not evidence of anything: a
+thread that never ran cannot be in `parked`, and the line is printed from the
+idle loop. Both numbers are fixed by where they are printed. The entry above
+carries that elimination, and the one instrument that would settle the split
+the `ps` column was going to.
 
 Investigation is the scheduler agent's (#142); the shapes are consistent with
 one defect. Ctrl+Alt+D remains available and is weaker: `dump_blocked` lists
@@ -1223,6 +1402,54 @@ cancelled iff it is watching one of the sources that is going away. Distinct
 writability poll is not cancelled by a reader's close, which is what the
 fd-number filter accidentally got right for same-process fds and wrong for
 everything else.
+
+### CLOSED — `io_uring::remove_fd` cancelled polls and woke nobody
+
+The other half of the entry above, found while working #172 and independent of
+it. `remove_fd` posts `-NotFound` for every pending poll on a source that is
+going away, so the caller knows the registration is over — and it posted them
+into the ring without waking the ring's waiters. **Nothing else could end that
+wait**: the poll is gone from `pending_polls`, so its `WatcherGuard` has
+already taken the ring off the source's watcher list, and the close path that
+runs immediately afterwards (`close_read`/`close_write` → `wake_pipe_readers`)
+then finds no watchers and skips `complete_pending_for_event`. A thread in
+`io_uring_enter` with `timeout_nanos == u64::MAX` — which is every server in
+the tree, and `/bin/console`, `/bin/terminal` and soundd's control thread by
+name — never returns.
+
+`fd::close` calls `remove_fd` *before* the descriptor drops, which is what puts
+the watcher removal in front of the wake path that would otherwise have covered
+it. Two descriptors on one pipe is all it takes, so an ordinary `dup`/`dup2` of
+stdio reaches it.
+
+Gate: `io_uring_cancel_wakes` (`tests/toyos-rust-tests/src/bin/`). A thread
+registers a `POLL_ADD` on a pipe read fd, proves the registration reached the
+kernel with a zero-timeout enter, then parks with `u64::MAX`; the main thread
+closes a `dup` of the same fd. Negative control run with the wake removed: the
+waiter was still parked 10 s later and the test says so in its own words.
+
+Every other posting path was audited in the same pass and two more were
+silent — `post_cqe_locked` (a sibling thread of the submitting process can be
+parked on the same ring) and `process_poll_add`'s `MAX_PENDING_POLLS` refusal.
+Both wake now. The durable fix remains iouring-blocking-spec's single `post()`,
+where posting and waking cannot be separated.
+
+### CLOSED — a dropped completion could only be reported after the call that never returned
+
+`Poller::wait` reads `cq_hdr.dropped` and asserts it is zero, with a comment
+saying the assertion should be unreachable. It is read *after* `submit`, and
+`submit` is the call that blocks — so in the one failure the counter exists to
+explain, a completion dropped while the caller is parked, the assertion is
+never reached at all. A tripwire that can only fire after the hang it is about
+reports nothing.
+
+`enter` now refuses to park a ring whose `dropped` is nonzero and returns
+short, which puts the counter in front of the caller. It is cumulative and
+never cleared, so this cannot loop: `Poller::wait` asserts on the very next
+look. No test, and it would be dishonest to add one — the state is unreachable
+from a conforming caller for exactly the reasons `poller_capacity` gates, and a
+kernel feature that manufactured it would be replacing the verdict rather than
+the failure.
 
 ### A keyboard that resets behind our back is undetectable on the PS/2 wire
 
@@ -2052,6 +2279,65 @@ that machine. doom now keeps that counter (`MIXED_PERIODS`) and now survives
 the stall, so the next T14 session can be asked the question instead of losing
 the process that would have answered it.
 
+### OPEN (#172) — the null sink's mix loop applies exactly one connect and then stops, on the T14 only
+
+Read off two T14 boots (`boot7-usba-doom.log`, `boot5-doom-wedge.log`). The
+shape is the same in both and it is narrow:
+
+- soundd finds no device and presents the null sink; `null sink idle` prints.
+- The first client connects. The control thread prints `opening stream`, the
+  **mix loop** prints `client 0 connected (id=0)` — so it woke, drained the
+  command pipe and applied the command.
+- Nothing from the mix loop ever again. `stats.report` fires every 2 s while a
+  client is present and the connect resets that window, so a single missing
+  stats line is proof the loop stopped; boot7's client was a 2 s tone and no
+  line follows it.
+- Every later client is stranded: the control thread keeps running (it printed
+  `opening stream` for doom 14 s later) and `open_stream` answers, but no
+  `client N connected` follows, so the mixer never signals it and it blocks
+  reading its signal pipe forever. That is `tone` never exiting and doom
+  wedging with a black window before its render loop.
+
+**Not reproduced in QEMU.** `tests/desktopaudiocase` was built for this: the
+T14's shape, with the client's three descriptors as pipes to a terminal that is
+a compositor surface — the fidelity gap `metal_sim_null_audio` and
+`null_sink_shipped_client` both have, since both spawn the client from a test
+binary whose stdio is the console. Green at `smp=2` and at `smp=8` (the T14's
+count), with one client, with two overlapping clients under two terminals, and
+with a terminal opened afterwards.
+
+**Eliminated, each with a run behind it.** CPU count. The cpal client path
+(`null_sink_shipped_client`, adopted from `wt/toyos-hdaprobe` `fa47241`, two
+`/bin/tone` in series at 1.16 s and 1.15 s). soundd blocking on a client
+(`signal_clients` uses `write_nonblock`; there is no blocking write in the mix
+loop). The accept path being held by a stuck client (accept and mix are
+separate threads and the control thread ran for 14 s afterwards). A CQ overflow
+(`Poller::wait`'s `dropped` assertion would have killed soundd, and soundd is
+alive). A panic anywhere in soundd, for the same reason.
+
+**Eliminated by reading, and recorded so it is not re-derived.** The mix loop
+holds no lock across its wait, and neither `PIPES` nor `IO_URINGS` was held on
+the T14 at 47 s — the control thread took both to accept doom's connection and
+open its stream. The mixer's timeout while streaming is finite (one device
+period), so a park with that deadline is the only way to stop, and the timer
+that ends it is the same one the compositor's frame interval rides. The
+`remove_fd` lost wake closed above is *not* this: the mix loop's only
+registration is on the command pipe, which soundd owns both ends of and nobody
+closes.
+
+**What settles it on the next T14 boot: Ctrl+Alt+D on the wedged machine.** The
+dump is machine-wide and process-named now (§5), so one press answers the split
+directly. soundd's mix thread parked with a sane deadline says the timer did
+not fire; parked with an absurd one says the timeout was computed wrong; absent
+from every parked list says nothing ever held it, which would move this into
+#142's family rather than audio's. The report paints the panel, so the machine
+with no serial port answers on glass and a photograph is enough.
+
+Until that press happens, the three gates this task landed are what stands
+between the milestone and a silent recurrence: a client through the null sink
+must exit, a second must be taken up while the first streams, and the desktop
+must still answer afterwards.
+
 ---
 
 ## 5. Diagnostics
@@ -2078,38 +2364,6 @@ attached to it: `kernel/src/iommu/mod.rs`'s `Iova::identity` says "§8.1 measure
 context type is unavailable" — a premise this host contradicts, which leaves a
 correct decision resting on a reason that has stopped being true. §5.7's own
 argument does not depend on it and is the one to keep.
-
-### OPEN — `--diag-boot` cannot carry a kernel feature, so H0's probe is not in the flashed image
-
-`specs/hda-driver-plan.md` H0 is built and behind the kernel feature
-`hda-probe` (`kernel/src/drivers/hda_probe.rs`), which is how "nothing in the
-ordinary boot path takes that controller out of reset" is enforced —
-`cargo test -- hda_probe` boots the diag config with the feature, asserts every
-verdict, then boots the same machine with a plain kernel and requires no `hda:`
-line at all. What is missing is one line: `src/build.rs:463` sets
-`kernel_features` from `debug` alone, so `Boot::Diag` builds the same kernel as
-`Boot::Normal` and the image the owner flashes carries no probe.
-
-The obstacle is not the size of the change, it is where it lands. `Boot::Diag`'s
-own doc says the diagnostic image's kernel is byte-identical to the ordinary
-one's and that "a `#[cfg]` could not have given us that" — so making the diag
-image a different kernel build changes a stated guarantee of that mode, and it
-belongs to whoever owns `src/`. H0's author held `kernel/` and the harness and
-was told not to touch `src/`, where another agent was working.
-
-Two shapes, and the owner should pick rather than the next agent guessing:
-
-1. **`Boot::Diag` gets a feature list of its own.** Smallest diff, and it makes
-   the diag kernel a second build — visibly, since the artifact key already
-   hashes the feature set. The guarantee in the doc becomes "same sources,
-   stated feature difference".
-2. **A `--kernel-feature <name>` flag on `cargo run`**, orthogonal to the boot
-   mode. Keeps `Boot::Diag` byte-identical by default and makes taking hardware
-   out of reset an explicit act, which is the honest shape for this. Costs one
-   more thing to remember at flash time.
-
-Until one of them lands, the T14's answer to `hda-driver-plan.md` §6.3 is
-unreachable — and that answer decides the whole audio track (§6.3's (b) block).
 
 ### OPEN — a boot that wedges before the idle loop says nothing at all
 
@@ -2142,18 +2396,56 @@ scheduler exists, and the on-screen console already answers the *phase* question
 for a machine with a panel (`boot_checkpoint`). Recorded rather than fixed
 because the choice belongs with whoever owns the log ring.
 
-### `ps`, `stats` and `dump_blocked` lost their cross-CPU view at Stage 7a
+### CLOSED for the dump — Ctrl+Alt+D reads the whole machine and names processes
 
 A `CpuSched` is `!Sync` and reachable only from its own CPU, so walking a
-sibling's queues is now unwritable rather than racy. `task_cpu_ns` and
+sibling's queues is unwritable rather than racy. `task_cpu_ns` and
 `task_sched_state` were rebuilt on values the owning CPU *publishes* —
 `TaskHandle`'s counters, republished at each end of a pass, plus the core's
 rendezvous word — so they are accurate and lock-free, which also closes the old
-`try_lock`-and-skip misreport. `dump_blocked` has no such substitute: it prints
-only the calling CPU's parked map, by `TaskKey` and `WaitClass`, with no process
-name and no per-source detail, because the pool it used to walk does not exist. A
-cross-CPU view costs a message round trip; whether the diagnostic is worth
-building is a diagnostics question, not a scheduler one.
+`try_lock`-and-skip misreport. `dump_blocked` had no such substitute: it printed
+the calling CPU's parked map alone, by `TaskKey` and `WaitClass`, with no
+process name, so it could confirm a park and never rule one out.
+
+`kernel/src/sched/dump.rs` replaces it, built for #172 and for #142's family.
+It walks nothing remote: the asking CPU marks every sibling, kicks it, and each
+prints its own tasks from `drain_irqs` at the top of its next pass. **A CPU that
+does not reach a pass inside 250 ms is named, and that is a finding** — it is
+the only way this report can say a CPU is not scheduling at all.
+
+Two halves, because neither sees what the other does. The CPUs give the
+deadline, the wait class and how long the park has lasted; the process table
+gives every thread's name and its published state, which is the only place a
+task **no CPU was ever given** appears at all. `Ready` with `cpu_ns == 0` is
+#142's signature, and the summary's `unheld` count is what the state words claim
+minus what the CPUs hold.
+
+The three failure modes degrade rather than stop the report: a silent CPU is
+named and the verdict says its counts are of what answered; the process table is
+retried for 20 ms and then reported as held, with the deadline half of the
+verdict still printed; and a CPU inside a pass says so. Nothing allocates,
+nothing waits on a lock it could find held, and truncation takes only ordinary
+lines — an overdue or absurd deadline is never dropped.
+
+It ends by painting the panel (`panic_console::paint_report`), taking the screen
+from whoever holds it, because the machine it is for has no serial port and a
+wedged one may never flush its log file. The verdict is the last line printed
+and the console paints the newest page, so the screenful a phone camera catches
+is the one carrying it.
+
+Gates: `blocked_dump` (eight CPUs, every one present, and the two halves' counts
+must agree) and `screen_blocked_dump` (muted metal-sim, a compositor holding the
+screen, the verdict read back off the decoded panel). Negative controls run:
+without the per-CPU answer the report reaches 1 of 8, and with the userland
+check restored on the paint the panel carries nothing.
+
+**A deadline that has passed and whose pass has not yet run is a real,
+microsecond-wide state** — `blocked_dump` has seen `1 OVERDUE` on a healthy
+guest. The count is evidence, not a verdict; what condemns a machine is one that
+stays.
+
+What is left of this entry: `ps` and `stats` still have no cross-CPU view of
+anything the handles do not publish.
 
 ### CPU attribution: the recorded "half the CPU is unattributed" claim was wrong
 
@@ -2283,27 +2575,16 @@ the moment each was re-run by itself in the same process. None predates or was
 introduced by the parallel-width work; all have been `Sched::Parallel` since the
 phase landed, and none reproduces on a host running one suite.
 
-- **`i8042_mouse`** — REOPENED 2026-08-05, and the closing argument is the thing
-  that is wrong. It read: the injection is paced against the guest's own report
-  of each packet, "so nothing the host does can outrun the guest". Outrunning is
-  not the failure mode left. The host now *stalls* — it waits for a packet the
-  guest never delivers and the test times out at 60 s:
-
-      FAIL i8042_mouse: timed out after 60s — 271 of the 303 packets injected
-      came back out, so the host stalled on one the machine never delivered
-
-  Pacing converted a lost packet from a miscount into a deadlock, so the verdict
-  is now a wall-clock timeout wearing a count's clothes. Measured on a loaded
-  host (four worktrees), alternating one checkout against the other in one
-  session, six runs: **main FAIL(271/303), PASS(3s), PASS(3s); a branch that
-  touches no input code FAIL(976/1004), FAIL(813/845), PASS(3s), PASS(4s)**. It
-  reds on `main` as readily as anywhere else, so it is not attributable to
-  whatever branch happens to be under it, and a green run costs 3 s against a
-  red one's 60 s. The prior text also predates §3's finding below, which says
-  the pacing argument never covered `0 lost edges` either.
-
-  Anyone whose suite reds here: re-run it alone before believing it, and if it
-  goes green the classification is the bug rather than your change.
+- **`i8042_mouse`** — CLOSED 2026-08-06. Both red modes were the harness and
+  neither was ever the driver losing a packet; §8's entry carries the mechanism,
+  the measurements and the two gates that now hold each half. The short version:
+  the pacing lead was 32 packets — 96 bytes — against QEMU's 16-byte
+  `PS2_QUEUE_SIZE`, so a host that got ahead of the guest made QEMU *sum* the
+  motion it had no room to queue, and a summed pair that cancels reaches
+  userland as nothing at all. The lead is now 4 packets with a `const` assert
+  against the device's queue, and the lost-edge counter no longer fires on a
+  pass that read the `irq_ring` record a few instructions before the ISR
+  published it.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
@@ -2321,6 +2602,12 @@ phase landed, and none reproduces on a host running one suite.
   terminal. It reaches a shell through `shell_answers` exactly as
   `desktop_typing_damage` does, so it inherits that retry window and evidently
   not enough of it. Still `Sched::Parallel`.
+- **`netd_connection_caps`** — added 2026-08-05. Red at 50 s inside a landing
+  gate that was otherwise 257/259 with 0 invalidated, green in 7 s alone on the
+  same tree moments later, on a branch that touches neither netd nor the
+  network stack. The 50 s against a 7 s solo run is the shape of a boot that
+  never got enough of the host, not of a cap that was announced wrong. Still
+  `Sched::Parallel`.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
@@ -2335,6 +2622,38 @@ used to name as the closing move now exists (`buildlock::guest_slot`,
 `specs/test-cost-audit.md` §5.6): the host admits twelve guests across every
 worktree, so the four-suite regime these were observed in cannot recur. A looser
 assertion is still not the answer.
+
+**But `ALONE … red again — the defect is real` is not evidence, and the protocol
+above leans on it.** The re-run happens inside the same process, moments after
+twelve guests have been torn down and while another worktree's suite may still
+own the host — so it is alone in the suite's bookkeeping and not on the machine.
+Measured 2026-08-06 on the xHCI port-machine branch, whose kernel delta is
+`drivers/xhci/` and touches no PS/2 and no compositor path:
+
+```
+full suite, run 1 (483.7 s for 262 tests):
+  FAIL i8042_mouse — 975 of 1004;  ALONE: GREEN
+  FAIL screen_early_panic;         ALONE: GREEN
+full suite, run 2, the landing gate (512.1 s):
+  FAIL i8042_mouse — 560 of 592;   ALONE: red again — the defect is real
+  FAIL desktop_locale_detect;      ALONE: red again — the defect is real
+then, genuinely alone, same session, minutes later:
+  main         a051a67:  i8042_mouse PASS 10.4 s   desktop_locale_detect PASS 11.4 s
+  the branch   38431c7:  i8042_mouse PASS  4.1 s   desktop_locale_detect PASS  5.6 s
+```
+
+Both trees green on both tests with the host to themselves, and the same suite
+that took 120.4 s at the last quiet landing took 484 and 512 s in these two — so
+the host was carrying roughly four times its own load throughout, the `ALONE`
+re-run included. A verdict that flips between "GREEN, it is the host" and "red
+again, the defect is real" for one test on one tree twenty minutes apart is
+measuring the host in both directions.
+
+Consequence for the protocol: `ALONE: GREEN` still means what it says, because a
+green cannot be produced by load. `ALONE: red again` means nothing on its own
+and must be confirmed against `main` in the same session before it is believed —
+which is the A/B the audio rules already require and which this line currently
+invites an agent to skip.
 
 ### A whole parallel phase can be starved by another agent's build
 
@@ -2900,57 +3219,67 @@ choice survives a login and not a reboot.
 
 ## 8. Hardware and performance gaps
 
-### `i8042_mouse`'s pacing argument covers its count and not its `0 lost edges`
+### `i8042_mouse`: closed — the host outran QEMU's PS/2 queue, twice over
 
-Red in the wide phase, green alone, on a tree whose only kernel change was the
-scanout's memory type:
+Both red modes are fixed and both were the harness. Neither was ever a packet
+the driver lost.
 
-```
-FAIL i8042_mouse: 1008 packets, none of them sent before the one before it
-arrived, and the driver does not report `0 lost edges`:
-  i8042: 1942 interrupts, 3056 bytes, 24 keys, 1006 motion, 12 undecoded,
-         0 discarded, 0 overruns, 0 dropped, 1 lost edges
-```
+**The count.** `MOUSE_LEAD` let the host hold 32 packets — 96 bytes — injected
+but unreported, and justified it against "a 256-byte ring in the kernel and
+QEMU's PS/2 buffer above it". That 256 is `PS2_BUFFER_SIZE`, the migration
+array; the enforced capacity is `PS2_QUEUE_SIZE`, **16 bytes**
+(`hw/input/ps2.c`, checked against QEMU v11.0.0, the version this host runs).
+`ps2_mouse_send_packet` emits only while `PS2_QUEUE_SIZE - count >= 3` and
+returns 0 otherwise, and `ps2_mouse_event` keeps accumulating `mouse_dx` while
+it does — so a host past the queue does not lose a packet, it makes QEMU **sum**
+several into one. The burst alternates +1/-1, so a summed pair is a packet with
+`dx == 0`, and `mouse::handle_motion` queues nothing for a report that moves the
+pointer nowhere with no button change. **Two injected, none delivered** — which
+is why every observed shortfall was even (996/1004, 1002/1004) and why the
+stalls sat at a deficit of exactly 32: losses accumulate until the lead is full
+and the host never injects again.
 
-Alone, the same guest: 2014 interrupts, the same 1006 motion events, `0 lost
-edges`. `main` at 91796eb ran it green in the wide phase with 1995 interrupts —
-so it is marginal rather than broken, and it is not the scanout change, which
-touches no port I/O.
+Reproduced by pipelining QMP commands without awaiting their replies, which is
+what an oversubscribed host does to the vCPU thread by accident. Floods of
+4/8/16/32/64/128/256 back-to-back packets, two sweeps in one boot:
 
-The `Sched::Parallel` beside it argues that "none of the three measures a rate"
-because each packet is sent only after the guest prints the one before it. That
-is correct about the *count*, and all 1006 arrived in both runs. It does not
-reach the other assertion: `lost edges` is not a delivery figure but the
-driver's own count of a counter line repeating without an interrupt having
-arrived — an edge the pin asserted and nothing delivered. Twelve guests on
-fourteen cores can produce one of those without any packet being lost, which is
-exactly the shape seen.
+    [4, 8, 16, 32, 62, 128, 256, 4, 8, 16, 32, 64, 126, 256]
+    [4, 8, 16, 32, 62, 128, 256, 4, 8, 16, 32, 64, 100, 256]
 
-Two ways to close it, and the choice belongs with the suite work rather than
-here: move `i8042_mouse` back to `Sched::Serial`, or split the verdict so the
-paced count stays parallel and the lost-edge claim runs where the host is not
-oversubscribed.
+and in an earlier boot a 32 that delivered 18. Paced injection on a quiet host
+never merged at any lead, including no pacing at all — which is exactly why this
+only ever reddened under contention, and why a branch's kernel had nothing to do
+with it. The last sighting before the fix was a landing gate on a branch whose
+only diff was a crate nothing compiles and two documents: a byte-identical
+kernel, red when re-run **alone**.
 
-**2026-08-05: the *count* now fails too, which the second option above would not
-have caught.** On the `hda-probe` branch, with eight worktrees live on the host:
+The fix is `MOUSE_LEAD = 4`, with the device's queue named in code and a `const`
+assert that `MOUSE_PACKET * MOUSE_LEAD <= QEMU_PS2_QUEUE`. Raising it to 6 stops
+the harness compiling, with that sentence as the message. The premise it rests
+on — that QEMU sums motion between syncs rather than dropping it — is staged in
+the run itself: `MERGE_MOTIONS` moves in one `input-send-event` must come back
+as one packet of that many steps. Making `mouse_merged` send one command per
+move instead reds it (1012 events for 1009 packets), so the stage has teeth.
+Cost: the injection takes about 2× the guest time it did (578 ms → 1313 ms
+measured alone), against a 60 s failure mode removed.
 
-```
-FAIL i8042_mouse: 996 pointer events reached userland out of 1004 packets
-injected, each one paced against the arrival of the last
-  FAIL  i8042_mouse  (60s)
-  …
-  [i8042] 1008 packets injected, 1008 out, last button state 0x00
-  PASS  i8042_mouse  (570ms)
-  ALONE i8042_mouse: GREEN
-```
+**The lost edge.** `service` reads the source's `irq_ring` record, then reads
+the byte ring. The ISR fills the byte ring *before* it publishes its record, so
+an interrupt landing between those two reads leaves the pass holding bytes it
+has been told nothing about — and it counts a lost edge that never happened. The
+record it left standing is taken by the next pass, which finds nothing to drain,
+so nothing ever corrects the count. `service` now asks again once the bytes are
+in hand.
 
-Sixty seconds in the wide phase against 570 ms alone, and eight of 1004 packets
-missing rather than an edge miscounted. So the pacing argument does not hold for
-the count either under this much contention — the guest is slow enough that
-something upstream of the count gives up before the packet arrives. Splitting
-the verdict therefore fixes only half of it, and `Sched::Serial` is the option
-that closes both. The branch that saw it changes no port I/O and no input path:
-its only ungated change anywhere is one extra field on the `iommu: unitN` line.
+Unwidened the window is a handful of instructions on one CPU, so nothing outside
+the kernel reaches it — hence the `i8042-edge-race` actuator, which holds the
+pass between the two reads. With it on and the fix reverted the counter reports
+**116 and 127** false lost edges on one run of `i8042_mouse` and the test reds;
+with the fix, 0 across every i8042 test. It is bundled into `i8042-trace`, so
+the group that reads those counters is the group that runs it.
+
+Both `Sched::Parallel` classifications stand: neither verdict is a rate, now for
+a reason that is checked rather than argued.
 
 ### Device registers still take firmware's word for being uncacheable
 
@@ -3555,7 +3884,7 @@ Closed, therefore: the decoder did not desync, and no fix for a desync was
 needed. What was wrong is the instrument, and it is now fixed (`647c3c0`,
 `toyos-ps2`) — `MouseOutcome` could not distinguish a byte held inside a packet
 from a byte thrown away at a boundary, so two of every three bytes of a healthy
-pointer stream were reported as suspects. `i8042_mouse` now runs 3018 bytes of
+pointer stream were reported as suspects. `i8042_mouse` now runs three thousand bytes of
 clean packets and requires the driver to name none of them; reverting the split
 reds it with the T14's own line shape.
 
@@ -4217,6 +4546,77 @@ against a 500 ms budget, times however many such devices are on the bus.
 `Profile::MetalUsb` puts six on one controller. The honest statement is that
 `READY_BUDGET_NS` bounds the retries and `USB_TIMEOUT_NS` times what each
 costs, and the *product* is the boot-time figure. `usb-storage.md` F11.
+
+### CLOSED — three of a second USB audit's findings, and what fixing them turned up
+
+An independent audit of the mass-storage stack — a second pass over the same
+files after `specs/type-safety-audit/usb-storage.md`'s findings landed —
+produced eleven more. The three serious ones are **fixed**, each with a gate
+that was red against the code before it.
+
+- **F-A. The controller's byte count was discarded, so a lying device served
+  stale DMA as file data.** `bulk` returns the residue the xHC reports — the
+  bytes it did not move into the buffer — and `bot`'s data phase threw it away
+  with `_`, so `delivered` came from the CSW's `dCSWDataResidue` alone. Two
+  accounts of one number exist and the driver kept the untrusted one. The
+  `MSC_DATA` window is never cleared between transfers (`MSC_SCRATCH` is, which
+  is why the capacity read was protected and the bulk data path was not), so a
+  device that under-delivers a READ(10) and reports a residue of zero handed the
+  caller the previous transfer's bytes for the part that never arrived — a
+  different LBA's data under this LBA's number, with no error anywhere.
+  `Bot::Done` now carries `delivered`, the smaller of the two accounts. Gate:
+  `usb_short_read`, whose actuator is the `usb-short-read` kernel feature.
+
+- **F-B. A plug on an earlier controller renumbered every disk, and mounts hold
+  their number for life.** The machine-wide index was `storage.len()`
+  accumulated across controllers, and that vector grows on every bind including
+  hot-plug. Indices were stable against *unplug* by design and never against a
+  plug on an earlier controller. The T14 has two xHCIs — Thunderbolt at 00:0d.0
+  first, PCH at 00:14.0 second — and boots off a stick in a PCH port, so
+  plugging any USB storage into the USB-C side made the new drive disk 0 and the
+  boot stick disk 1: every later `/log` append into the middle of that drive,
+  every `/boot` read serving its bytes as the ESP's. The number now comes from
+  `DISKS_BOUND`, a machine-wide counter, and lives beside the disk rather than
+  being derived from a position. `disk_base` is gone with it — the same defect's
+  second face, fixed at boot, so two disks logged under one number the moment
+  anything hot-plugged. Gate: `usb_disk_index_stable`.
+
+- **F-C. A refused disk's pool block was never returned, even after it was
+  unplugged.** `bind` claims a block before Configure Endpoint and keeps it
+  through every refusal, which is right while the device is on the bus;
+  `teardown_port` released one only for entries in the disk list, and a refused
+  disk is not in it. `MSC_BLOCKS` is 2, so one unsupported stick plugged and
+  pulled beside the boot stick left the pool with nothing for any later disk for
+  the life of the boot — on a machine whose only diagnostic channel is the
+  `/log` it can then not mount. `msc_taken` and `storage` are now one
+  `[MscBlock; MSC_BLOCKS]` keyed by the port that claimed the block. Gate: the
+  second half of `usb_refused_disk_first`.
+
+  The audit noted that `msc_taken`'s doc comment asserted the opposite in prose
+  — "a refused disk never gives its block back. An unplugged one does, and the
+  difference is not a policy" — which was false for a disk that was both.
+
+Two one-line findings from the same audit, also fixed:
+
+- **F-G.** `framed_phase` accepted only `(CC_SUCCESS, 0)`, so a status phase
+  completing with Short Packet and no residue — every byte of the CSW arrived —
+  was an error. It is `Some((CC_SUCCESS | CC_SHORT_PACKET, 0)) => Ok(())`.
+- **F-H.** `request_sense` accepted a residue of 5, which leaves ASCQ at byte 13
+  unread and reading as the zero `Scsi::unimplemented` tests for. Stated now as
+  `delivered >= 14`, which is the fact rather than its complement.
+
+**Found while fixing, not by the audit: the teardown released the pool block
+before it disabled the slot.** `teardown_port`'s own doc comment states the
+order — input source, then slot, then pool block — and says why the last step is
+only safe there: while the slot lives, its endpoint contexts still name that
+memory. The code did the block first. Nothing claims a block between those two
+statements today, so it was latent; it is now in the stated order.
+
+**Not recorded: F-D, F-F, F-I and F-K.** They are in task #145's description
+with their file and line and were not carried into the agent's prompt; writing
+them from memory would be inventing them. Whoever holds that task should paste
+them in. F-E is the EP0 recovery path, which has an entry above; F-J is the
+file-cache error channel, which is its own task.
 
 ### `BlockError` is a marker type because `SyscallError` has no I/O variant
 

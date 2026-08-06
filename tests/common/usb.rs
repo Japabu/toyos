@@ -257,7 +257,7 @@ pub fn usb_storage_gate(
         BootOptions {
             profile: Profile::UsbDisk,
             kernel_features: GATE,
-            usb_image: Some(image.clone()),
+            usb_images: vec![image.clone()],
             ..Default::default()
         },
     )?;
@@ -284,7 +284,7 @@ pub fn usb_storage_gate(
         BootOptions {
             profile: Profile::UsbDisk,
             kernel_features: GATE,
-            usb_image: Some(foreign.clone()),
+            usb_images: vec![foreign.clone()],
             ..Default::default()
         },
     )?;
@@ -327,6 +327,333 @@ pub fn usb_storage_gate(
     Ok(())
 }
 
+/// A data phase the **controller** cut short while the device's own CSW claims
+/// it moved everything.
+///
+/// One number, counted twice. `bulk` returns the residue the xHC reports —
+/// bytes it did not move into the buffer — and `bot` threw it away, so
+/// `delivered` came from the CSW's `dCSWDataResidue` alone: the device's own
+/// account of its own transfer. The `MSC_DATA` window is never cleared between
+/// transfers, so a device that under-delivers a READ(10) and reports a residue
+/// of zero handed the caller the *previous* transfer's bytes for the part that
+/// never arrived — a different LBA's data, under this LBA's number, with no
+/// error anywhere.
+///
+/// **The actuator is a kernel feature and it corrupts the transfer, not the
+/// verdict.** QEMU derives the CSW residue from the same transfer the xHC
+/// completed, so the two accounts are one number there and can never
+/// contradict each other; `rerror` fails the whole command instead. The
+/// injection puts the tail of the window back to what it held *before* the
+/// transfer — the previous read's bytes, read off that window rather than
+/// invented — and adds those bytes to the controller's residue. The completion
+/// code is the controller's, the CSW is the device's, and what a driver
+/// discarding the controller's number is handed is byte-for-byte what a real
+/// short data phase would have left.
+///
+/// The bytes compared against are the host's: `stage` wrote them before the
+/// boot. What the guest reports is which of the two things happened to them —
+/// a refusal, or another block's data delivered as this one's.
+pub fn usb_short_read(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURES: &[&str] = &["usb-storage-gate", "usb-short-read"];
+    /// Mirrors `short_read::SHORT_BY`. One wire format with the kernel's, in
+    /// the same sense the stamp is: a change to either without the other stops
+    /// the line below matching rather than passing silently.
+    const SHORT_BY: u64 = 512;
+
+    let (bytes, lba) = Profile::UsbDisk.usb_disk().expect("UsbDisk declares a disk");
+    let image = test_dir().join("usb-short-read.img");
+    let nonce = stage(&image, bytes);
+
+    let log = boot_and_shutdown(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::UsbDisk,
+            kernel_features: FEATURES,
+            usb_images: vec![image.clone()],
+            ..Default::default()
+        },
+    )?;
+    gate_ran(&log, 2)?;
+    check_geometry(&log, bytes, lba)?;
+
+    // The injection landed on the block the harness staged. Without this the
+    // assertions below are about a boot in which nothing was injected.
+    let block = block_of(bytes / BLOCK, HOST_BLOCKS[0]);
+    let staged = format!("usb-gate: short read of block {block} ");
+    let Some(verdict) = log.lines().find(|l| l.contains(&staged)) else {
+        return Err(format!("the guest never attempted the short read ({staged:?})\n{log}"));
+    };
+
+    // **The finding.** `refused=false` is the defect: the caller was handed
+    // bytes for a transfer the controller says did not finish, and `matched`
+    // says whether they were this block's. They are not — the window's tail
+    // still holds the block read into it before this one.
+    if !verdict.contains("refused=true") {
+        return Err(format!(
+            "{verdict:?} — a data phase the controller cut short reached the caller as data. \
+             The bytes past {} of {BLOCK} are the previous read's, from a different LBA\n{log}",
+            BLOCK - SHORT_BY
+        ));
+    }
+
+    // And the driver said so by name, with both numbers in it: a refusal with
+    // no line is a disk that stops working for no stated reason, which is what
+    // the machine this is for has no second channel to diagnose.
+    let named = format!("usb-storage: {} of {BLOCK} B at block {block}", BLOCK - SHORT_BY);
+    let shorts = log.matches(named.as_str()).count();
+    if shorts != 1 {
+        return Err(format!(
+            "the driver named {shorts} short transfers ({named:?}); the injection is armed once, \
+             so anything else is a transfer this test did not stage\n{log}"
+        ));
+    }
+
+    // One refused read and nothing else disturbed: the rest of the sweep still
+    // passed and everything the guest wrote is where the host expects it.
+    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true wr_err=0 healthy=true") {
+        return Err(format!("one short read cost the disk the rest of its sweep\n{log}"));
+    }
+    verify(&image, bytes, nonce)?;
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish\n{log}"));
+    }
+    let _ = std::fs::remove_file(&image);
+
+    eprintln!(
+        "  [usb] a data phase {SHORT_BY} B short with a CSW claiming none: refused by name, and \
+         the {BLOCK}-byte window's stale tail never reached the caller"
+    );
+    Ok(())
+}
+
+/// A disk plugged into a **different controller** must not renumber the one a
+/// mount is holding.
+///
+/// The machine-wide disk index was `storage.len()` summed across controllers,
+/// and that vector grows on every bind — hot-plug included. The T14 has two
+/// xHCIs, the Thunderbolt block's at 00:0d.0 ahead of the PCH's at 00:14.0, and
+/// it boots off a stick in a PCH port: with nothing on the first controller the
+/// boot stick is disk 0, and plugging any USB storage into the USB-C side made
+/// the *new* drive disk 0 and the boot stick disk 1. `FatDevice` holds its
+/// `UsbBlockDevice` for the life of the mount and that handle is an index, so
+/// every later `/log` append went into the middle of the new drive and every
+/// `/boot` read served its bytes as the ESP's.
+///
+/// **The actuator is QEMU's own `device_add` and nothing about the driver is
+/// modified.** Both verdicts are host-side and neither is a log line: the disk
+/// that arrives late is a file the harness staged as zeros and must find as
+/// zeros, and `/log/kernel.log` is read out of the boot image's own partition
+/// and must carry a line the guest printed *after* the plug.
+pub fn usb_disk_index_stable(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    /// The disk that arrives late: 48 GiB, sparse, and no size any other
+    /// device in this suite reports.
+    const LATE_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+    /// The line the guest prints once the late disk is up, which is therefore a
+    /// line `/log` can only carry if it was still reaching the boot stick after
+    /// the plug.
+    const LATE_READY: &str = "usb-storage: disk 1 ready on slot";
+
+    // The boot stick is on the second controller and the first carries
+    // nothing, which is the laptop exactly — and the arrangement in which the
+    // boot stick is disk 0 with a free controller ahead of it.
+    let options = BootOptions {
+        profile: Profile::MetalXhciSecond,
+        qmp: true,
+        ..Default::default()
+    };
+    let argv = qemu::profile_argv(&options);
+    if !argv.iter().any(|a| a.contains("usb-storage,bus=xhci1.0")) {
+        return Err(format!("the boot stick is not on the second controller: {argv:?}"));
+    }
+    if argv.iter().any(|a| a.starts_with("usb-storage,bus=xhci.0")) {
+        return Err(format!("the first controller already carries storage: {argv:?}"));
+    }
+
+    // Built here rather than by the boot, because `/log` has to be read off the
+    // partition afterwards and the image gets a fresh GUID every time it is
+    // built.
+    let image_path = test_dir().join("usb-index-stable.img");
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, &[]);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+    let (start, len) = super::volumes::log_extent(&image, &image_path)?;
+
+    let late = test_dir().join("usb-index-late.img");
+    drop(sparse(&late, LATE_BYTES));
+    let before = fingerprint(&late, LATE_BYTES);
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            boot_image: Some(image_path.clone()),
+            ..options
+        },
+    );
+    let boot = qemu.boot_log().to_string();
+    if !boot.contains("usb-storage: disk 0 ready on slot") {
+        return Err(format!("the boot stick did not come up as disk 0\n{boot}"));
+    }
+
+    let mut devices = qemu::QmpDevices::open(qemu.qmp_socket());
+    devices.blockdev_add("latedisk", &late);
+    devices.add("usb-storage", "xhci.0", "latedisk0", &[("drive", "latedisk")]);
+    drop(devices);
+    // The driver's debounce is 100 ms and the enumeration behind it is
+    // microseconds under TCG; this is that with room.
+    thread::sleep(Duration::from_millis(1200));
+
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
+    drop(qemu);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} after a disk arrived on the other controller\n{log}"));
+        }
+    }
+
+    // The plug happened at all. Without this both host-side claims below hold
+    // trivially on a boot where nothing was added.
+    if !log.contains(LATE_READY) {
+        return Err(format!(
+            "nothing enumerated on the first controller; there is no renumbering to survive\n{log}"
+        ));
+    }
+
+    // **The disk that arrived is not the disk anything was mounted on.** The
+    // harness made this file and the guest was never told it was writable, so
+    // a single changed byte is `/boot` or `/log` writing through a handle that
+    // now names the wrong device.
+    if fingerprint(&late, LATE_BYTES) != before {
+        return Err(
+            "the guest wrote to the disk plugged into the other controller — the index a mount \
+             was holding moved onto it"
+                .to_string(),
+        );
+    }
+
+    // **And the log kept reaching the stick.** Read off the boot image's own
+    // `/log` partition, so this is the device's view and not the guest's. The
+    // sink names one file per boot, so the newest on the volume is this one's.
+    let (name, on_device) = super::volumes::newest_log(&image_path, start, len)?;
+    let on_device = String::from_utf8_lossy(&on_device).into_owned();
+    if !on_device.contains(LATE_READY) {
+        return Err(format!(
+            "/log/{name} stops at {} bytes and never carries {LATE_READY:?} — the appends after \
+             the plug went somewhere else\n{log}",
+            on_device.len()
+        ));
+    }
+    let _ = std::fs::remove_file(&late);
+    let _ = std::fs::remove_file(&image_path);
+
+    eprintln!(
+        "  [usb] a {LATE_BYTES} B disk plugged into the empty first controller: it comes back \
+         byte-identical, and {} bytes of /log/{name} on the boot stick carry the lines printed \
+         after it",
+        on_device.len()
+    );
+    Ok(())
+}
+
+/// More disks on one controller than its DMA pool has blocks for.
+///
+/// `MSC_BLOCKS` is 2 and the boot stick takes one, so the second data disk on
+/// this bus is the first one past the ceiling. The bound is policy, which makes
+/// what the caller sees when it is hit the whole question: the disk has to be
+/// refused **by name** and left alone, never served out of somebody else's
+/// block.
+///
+/// Ground truth is host-side and it is what a log line cannot say: both staged
+/// disks are stamped and writable as far as the guest is concerned, and the one
+/// the pool had no room for comes back byte-for-byte as the harness left it.
+pub fn usb_pool_exhausted(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let disks = Profile::UsbDiskCrowd.usb_disks();
+    if disks.len() != 2 {
+        return Err(format!(
+            "this gate needs two data disks beside the boot stick, the profile declares {}",
+            disks.len()
+        ));
+    }
+    let bytes = disks[0].bytes;
+
+    // Both stamped, so what decides which one is written is the pool and not
+    // the harness: the disk the driver refuses is whichever the controller
+    // enumerated second, and it is the one the gate never designates.
+    let bound = test_dir().join("usb-crowd-bound.img");
+    let refused = test_dir().join("usb-crowd-refused.img");
+    let nonce = stage(&bound, bytes);
+    stage(&refused, bytes);
+    let refused_before = fingerprint(&refused, bytes);
+
+    let log = boot_and_shutdown(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::UsbDiskCrowd,
+            kernel_features: GATE,
+            usb_images: vec![bound.clone(), refused.clone()],
+            ..Default::default()
+        },
+    )?;
+
+    // Two blocks, two disks, and the third refused by name with the pool's size
+    // in the line. The pool runs out inside `bind`, so this refusal is the
+    // driver's own and not a device's.
+    if !log.contains("usb-storage: 2 device(s)") {
+        return Err(format!("the driver did not bind exactly the pool's two blocks\n{log}"));
+    }
+    let over = log.matches("this driver serves 2").count();
+    if over != 1 {
+        return Err(format!(
+            "{over} disk(s) were refused for want of a pool block, want the one past the \
+             ceiling\n{log}"
+        ));
+    }
+    gate_ran(&log, 2)?;
+
+    // The disk that bound was written, so the ceiling did not cost the machine
+    // the disk it does have room for.
+    verify(&bound, bytes, nonce)?;
+
+    // **And the disk it had no room for was not touched.** A driver that served
+    // the refused disk out of somebody else's block would write these bytes
+    // under that disk's number, and every line in the log would still read
+    // correctly.
+    if fingerprint(&refused, bytes) != refused_before {
+        return Err("a disk the pool had no block for was written to".to_string());
+    }
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish past a crowded bus\n{log}"));
+    }
+    serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+    for path in [&bound, &refused] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    eprintln!(
+        "  [usb] three disks on a bus whose pool holds two: two bound and the staged one written, \
+         {over} refused by name, and the stamped disk past the ceiling byte-identical host-side"
+    );
+    Ok(())
+}
+
 /// The two device shapes that are not a 512-byte-sector stick: a 4 KiB-sector
 /// one, which the whole stack above the sector layer has to divide by, and one
 /// too large for the command this driver addresses it with.
@@ -348,7 +675,7 @@ pub fn usb_storage_shapes(
         BootOptions {
             profile: Profile::UsbDisk4k,
             kernel_features: GATE,
-            usb_image: Some(image.clone()),
+            usb_images: vec![image.clone()],
             ..Default::default()
         },
     )?;
@@ -415,7 +742,7 @@ pub fn usb_storage_write_error(
     let options = BootOptions {
         profile: Profile::UsbDiskReadOnly,
         kernel_features: GATE,
-        usb_image: Some(image.clone()),
+        usb_images: vec![image.clone()],
         ..Default::default()
     };
     // The claim is about how QEMU opened the file, and argv is the only place
@@ -866,7 +1193,7 @@ pub fn xhci_slow_connect(
         BootOptions {
             profile: Profile::UsbDisk,
             kernel_features: FEATURES,
-            usb_image: Some(image.clone()),
+            usb_images: vec![image.clone()],
             ..Default::default()
         },
     )?;
@@ -1015,7 +1342,7 @@ pub fn xhci_portsc_rw1c(
         if rest.contains("connected") {
             connected += 1;
         }
-        if rest.contains("reset, speed=") {
+        if rest.contains("enabled, speed=") {
             enabled += 1;
         }
         if rest.contains("not enabled") || rest.contains("never finished its reset") {
@@ -1119,7 +1446,7 @@ pub fn usb_transport_break(
         BootOptions {
             profile: Profile::UsbDisk,
             kernel_features: FEATURES,
-            usb_image: Some(image.clone()),
+            usb_images: vec![image.clone()],
             ..Default::default()
         },
     )?;
@@ -1196,6 +1523,84 @@ pub fn usb_transport_break(
     Ok(())
 }
 
+/// A SuperSpeed port is not reset into existence, and the driver knows which
+/// ports are which because it read the controller's own description of itself.
+///
+/// The Supported Protocol capability (§7.2) was never parsed, so every port
+/// register looked alike and every one got the USB2 treatment: write PR, wait
+/// for PRC. A USB3 link trains itself and reaches Enabled with nothing done to
+/// it (§4.19.1.2), so that write is a *hot reset of a working link* — and a
+/// link that cannot take one lands Inactive, which only a warm reset this
+/// driver did not have would have left. On the T14 that is a USB-A socket that
+/// mounts nothing, two boots out of two, while the same stick through a Type-C
+/// adapter mounts every time: the adapter lands it on the connector's USB2
+/// pins, and a USB2 port is the one shape the old driver knew.
+///
+/// **What this gate can and cannot say.** QEMU's xHC publishes real Supported
+/// Protocol capabilities, so the decode and the branch are certified here
+/// against a controller's own bytes. It has no link training and no Inactive
+/// state, so the warm-reset recovery is unreachable and is certified by the
+/// host model instead (`toyos-xhci/sim/tests/superspeed.rs`). This says: the
+/// driver read the split correctly and stopped resetting the ports that did not
+/// need it. It says nothing about what happens when a link falls over.
+pub fn xhci_superspeed_ports(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let options = BootOptions { profile: Profile::MetalUsb, ..Default::default() };
+    let devices = crate::usb_argv(&qemu::profile_argv(&options)).len();
+    let log = boot_and_shutdown(test_config, c_bins, rust_bins, options)?;
+
+    // The controller described itself and the driver read it. `nec-usb-xhci`
+    // with `p2=8` is four SuperSpeed registers and eight USB2 ones, and the
+    // driver has to name that split without being told it.
+    const SPLIT: &str = "xHCI: 8 USB2 and 4 USB3 port register(s) of 12 named, \
+                         0 capability(ies) refused";
+    if !log.contains(SPLIT) {
+        let got = log.lines().find(|l| l.contains("port register(s) of"));
+        return Err(format!(
+            "the driver did not read the controller's protocol split; got {got:?}\n{log}"
+        ));
+    }
+
+    // The boot stick is the only SuperSpeed device this profile attaches, so it
+    // takes a USB3 register and every HID takes a USB2 one. Exactly one port
+    // must therefore have been brought up with no reset at all.
+    let trained: Vec<&str> = log.lines().filter(|l| l.contains("link already trained")).collect();
+    if trained.len() != 1 {
+        return Err(format!(
+            "{} port(s) came up on an already-trained link, want the SuperSpeed stick alone: \
+             {trained:?}\n{log}",
+            trained.len()
+        ));
+    }
+
+    // And every device still reached Enabled, so not resetting cost nothing.
+    let enabled = log.matches("enabled, speed=").count();
+    if enabled != devices {
+        return Err(format!(
+            "{enabled} port(s) reached Enabled, {devices} devices on the bus\n{log}"
+        ));
+    }
+    for wrong in ["never finished its reset", "would not train", "warm reset"] {
+        if let Some(line) = log.lines().find(|l| l.contains(wrong)) {
+            return Err(format!("{line:?} on a bus where every link is healthy\n{log}"));
+        }
+    }
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish\n{log}"));
+    }
+    serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+
+    eprintln!(
+        "  [xhci] the controller's own capability names 8 USB2 and 4 USB3 registers; the \
+         SuperSpeed stick is enumerated on a link that was already trained, and {enabled} \
+         port(s) reached Enabled"
+    );
+    Ok(())
+}
+
 /// A device that attaches at **full speed**, where EP0's max packet size is a
 /// thing only the device knows.
 ///
@@ -1254,7 +1659,7 @@ pub fn xhci_full_speed_device(
     // the specification and nothing below here has anything to measure.
     let full_speed: Vec<&str> = log
         .lines()
-        .filter(|l| l.contains("xHCI: port ") && l.contains("reset, speed=1"))
+        .filter(|l| l.contains("xHCI: port ") && l.contains("enabled, speed=1"))
         .collect();
     if full_speed.len() != 2 {
         return Err(format!(
@@ -2085,11 +2490,24 @@ fn hotplug_unbound(log: &str) -> Result<(), String> {
 /// The assertion is the *block offset in the log line*, because that is the
 /// only place the reuse is visible from outside: both boots bind one disk,
 /// both print `1 device(s)`, and both reach the shell.
+///
+/// **The second half of the same finding is what happens when that disk is
+/// pulled.** Keeping the block is right for as long as the device is on the
+/// bus; `teardown_port` gave one back only for entries in the disk list, and a
+/// refused disk is not in it. `MSC_BLOCKS` is 2, so one unsupported stick
+/// plugged and pulled beside the boot stick left the pool with nothing for any
+/// later disk, for the life of the boot. The actuator for that half is QEMU's
+/// own `device_del`, and the verdict is that the disk plugged in afterwards
+/// binds — at the block the refused one had.
 pub fn usb_refused_disk_first(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
+    /// The disk that arrives after the refused one is pulled: 48 GiB, sparse,
+    /// and a size no other device in this suite reports.
+    const REPLACEMENT_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+
     let (huge, _) = Profile::UsbDiskRefusedFirst.usb_disk().expect("the profile declares a disk");
 
     // The claim is about which device QEMU creates first, and argv is the only
@@ -2099,6 +2517,7 @@ pub fn usb_refused_disk_first(
     let options = BootOptions {
         profile: Profile::UsbDiskRefusedFirst,
         kernel_features: GATE,
+        qmp: true,
         ..Default::default()
     };
     let argv = qemu::profile_argv(&options);
@@ -2115,7 +2534,34 @@ pub fn usb_refused_disk_first(
         }
     }
 
-    let log = boot_and_shutdown(test_config, c_bins, rust_bins, options)?;
+    let replacement = test_dir().join("usb-refused-replacement.img");
+    drop(sparse(&replacement, REPLACEMENT_BYTES));
+
+    let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+    let boot = qemu.boot_log().to_string();
+
+    // Pull the disk the driver refused, and put a disk it can use where it was.
+    // Nothing else on this machine can free that pool block, so the bind below
+    // is the whole assertion.
+    let mut devices = qemu::QmpDevices::open(qemu.qmp_socket());
+    devices.del(&qemu::usb_device_id(0));
+    drop(devices);
+    thread::sleep(Duration::from_millis(1200));
+    let mut devices = qemu::QmpDevices::open(qemu.qmp_socket());
+    devices.blockdev_add("replacement", &replacement);
+    devices.add("usb-storage", "xhci.0", "replacement0", &[("drive", "replacement")]);
+    drop(devices);
+    thread::sleep(Duration::from_millis(1200));
+
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
+    drop(qemu);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} during the USB gate boot\n{log}"));
+        }
+    }
 
     // The refusal happened, and it happened on slot 1 — the first device the
     // controller enumerated. Without this the test would pass on a boot where
@@ -2135,8 +2581,8 @@ pub fn usb_refused_disk_first(
     // block the refused disk's endpoint contexts still name and `+0x20000` is
     // the next one. This is the whole finding: before the fix the line below
     // reads `+0x10000`.
-    if !log.contains("msc_block +0x20000") {
-        let got = log
+    if !boot.contains("msc_block +0x20000") {
+        let got = boot
             .lines()
             .find(|l| l.contains("msc_block +"))
             .unwrap_or("<no disk bound at all>");
@@ -2144,24 +2590,50 @@ pub fn usb_refused_disk_first(
             "the disk after the refused one was given the refused one's pool block: {got:?}"
         ));
     }
-    if log.matches("msc_block +").count() != 1 {
-        return Err(format!("want exactly one disk bound on this machine\n{log}"));
+    if boot.matches("msc_block +").count() != 1 {
+        return Err(format!("want exactly one disk bound at boot\n{log}"));
     }
 
     // Refused, not fatal: the stick still binds, still carries /boot, and the
     // machine still comes up. A fix that leaked the whole pool would fail here.
-    if !log.contains("usb-storage: 1 device(s)") {
+    if !boot.contains("usb-storage: 1 device(s)") {
         return Err(format!("the boot stick did not bind behind the refused disk\n{log}"));
     }
-    gate_ran(&log, 1)?;
+    gate_ran(&boot, 1)?;
+
+    // **Then the block came back.** The refused disk was unplugged, so its slot
+    // is disabled and the memory its endpoint contexts named is nobody's — and
+    // the disk plugged in afterwards binds, at that block. Before the fix this
+    // pool is out for the life of the boot: the line is the refusal below
+    // instead, and `MSC_BLOCKS` is 2, so it takes exactly one unsupported stick
+    // to cost a machine every disk it is given from then on.
+    if !log.contains("usb-storage: disk 1 ready on slot") {
+        return Err(format!(
+            "the disk plugged in after the refused one was pulled never bound; the pool block a \
+             refused device holds is not given back when it leaves\n{log}"
+        ));
+    }
+    if !log.contains("msc_block +0x10000") {
+        let blocks: Vec<&str> = log.lines().filter(|l| l.contains("msc_block +")).collect();
+        return Err(format!(
+            "the replacement disk did not take the refused disk's block: {blocks:?}\n{log}"
+        ));
+    }
+    if log.contains("this driver serves 2") {
+        return Err(format!(
+            "the pool refused a disk on a machine with two blocks and one disk on it\n{log}"
+        ));
+    }
     if !log.contains("Boot: complete") {
         return Err(format!("the boot did not finish\n{log}"));
     }
     serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+    let _ = std::fs::remove_file(&replacement);
 
     eprintln!(
         "  [usb] a {huge} B disk refused on slot 1, enumerated first: the boot stick behind it \
-         binds at msc_block +0x20000, not the refused disk's block"
+         binds at msc_block +0x20000, not the refused disk's block — and once the refused disk \
+         is unplugged a {REPLACEMENT_BYTES} B one binds at +0x10000, which is that block back"
     );
     Ok(())
 }

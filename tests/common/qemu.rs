@@ -161,6 +161,24 @@ pub enum Profile {
     /// is the assertion. QEMU assigns ports in device-creation order, measured
     /// against the kernel's own `port N connected` lines.
     UsbDiskRefusedFirst,
+    /// More USB disks on one controller than its DMA pool has blocks for.
+    ///
+    /// `MSC_BLOCKS` is 2 and the boot stick takes one of them, so the second
+    /// data disk here is the first one past the ceiling. Every other profile
+    /// declares one disk, which is why nothing could ask what a caller sees when
+    /// the bound is hit — and the bound is policy, so that answer is the whole
+    /// question. Both disks are stamped: the one that binds is written, and the
+    /// one the pool had no room for has to come back byte-identical, which is
+    /// the claim a log line cannot make.
+    ///
+    /// Two and not three, though the pool would refuse either way.
+    /// `nec-usb-xhci` offers four SuperSpeed ports and QEMU puts the fifth
+    /// device behind an auto-created hub, which this driver walks past — so a
+    /// third data disk is not one the guest refuses, it is one the guest never
+    /// sees, and a count that included it would be measuring QEMU's port
+    /// allocation. Measured: `class=0x9 vendor=0409 product=55aa` on port 8 at
+    /// full speed, with `no HID boot interface found, skipping`.
+    UsbDiskCrowd,
     /// metal-sim with a device that attaches at **full speed**.
     ///
     /// Speed is a shape dimension and it was one no profile varied: every USB
@@ -410,25 +428,17 @@ struct Shape {
     /// turns it into a shift and a divisor, and QEMU's implicit namespace only
     /// ever produced one value of it.
     nvme_lba_bytes: u32,
-    /// A second `usb-storage` beside the boot stick, in bytes; zero is no such
-    /// device, which is what every profile but the USB ones declares. Its size
-    /// has to be stated for the same reason the namespace's does — the driver
-    /// turns it into an LBA, and whether that LBA fits the command it is sent
-    /// in is a property of this number.
-    usb_disk_bytes: u64,
-    /// Its logical block size. `usb-storage` takes any power of two from 512 B
-    /// up, so unlike the boot stick this is something a profile can choose.
-    usb_disk_lba_bytes: u32,
-    /// Open its backing read-only, so the guest's writes are refused by the
-    /// device rather than by the driver. Nothing else in this suite can make a
-    /// real device say no to an I/O the driver was right to issue.
-    usb_disk_readonly: bool,
-    /// Attach it *ahead* of the boot stick, so the controller enumerates it
-    /// first. Which disk comes first is a shape dimension the moment one of
-    /// them can be refused: a driver that hands the pool block of a failed
-    /// bind to the next disk is only observable when the failure is first, and
-    /// QEMU assigns ports in device-creation order.
-    usb_disk_first: bool,
+    /// Every `usb-storage` device besides the boot stick, in the order QEMU
+    /// creates them.
+    ///
+    /// A list and not one device's dimensions. **How many disks are on the bus
+    /// is a shape dimension in its own right**: the driver's DMA pool holds
+    /// `MSC_BLOCKS` of them and refuses the rest by name, and every profile
+    /// that could have asked what happens at that ceiling declared exactly one.
+    /// The order is the second half of the same field — QEMU hands out
+    /// root-hub ports in device-creation order, so where the boot stick falls
+    /// in this list is what decides which disk the controller enumerates first.
+    usb_disks: &'static [UsbDisk],
     /// Every Intel HDA controller on the machine and the codecs behind each,
     /// as `-device` arguments in the order QEMU is to create them. Empty is
     /// what every profile but [`Profile::MetalHda`] declares, and it is the
@@ -444,6 +454,54 @@ struct Shape {
     /// profile because absence is a shape and because the unit's own
     /// capabilities are what the kernel reads at boot.
     iommu: Option<Iommu>,
+}
+
+/// One `usb-storage` device beside the boot stick.
+#[derive(Clone, Copy)]
+pub struct UsbDisk {
+    /// Its size. Stated for the same reason the namespace's is — the driver
+    /// turns it into an LBA, and whether that LBA fits the command it is sent
+    /// in is a property of this number. The backing is sparse, so a realistic
+    /// one is nearly free.
+    pub bytes: u64,
+    /// Its logical block size. `usb-storage` takes any power of two from 512 B
+    /// up, so unlike the boot stick this is something a profile can choose.
+    pub lba_bytes: u32,
+    /// Open its backing read-only, so the guest's writes are refused by the
+    /// device rather than by the driver. Nothing else in this suite can make a
+    /// real device say no to an I/O the driver was right to issue.
+    readonly: bool,
+    /// Attach it *ahead* of the boot stick. Which disk comes first is a shape
+    /// dimension the moment one of them can be refused: a driver that hands the
+    /// pool block of a failed bind to the next disk is only observable when the
+    /// failure is first.
+    before_boot_stick: bool,
+}
+
+impl UsbDisk {
+    /// The nominal 32 GiB stick this suite's storage tests are staged on, and
+    /// what a profile carries when it just needs a disk it may write to.
+    const DATA: Self = Self {
+        bytes: USB_STICK_BYTES,
+        lba_bytes: 512,
+        readonly: false,
+        before_boot_stick: false,
+    };
+    /// A 3 TB external disk, which this driver has to refuse by name rather
+    /// than serve the first 2 TiB of.
+    const HUGE: Self = Self { bytes: USB_HUGE_BYTES, ..Self::DATA };
+}
+
+/// QEMU's name for the `i`-th data disk's backing, and for the device in front
+/// of it. Derived from the position rather than declared, so a profile cannot
+/// give two disks one name.
+fn usb_drive_id(i: usize) -> String {
+    format!("usbdisk{i}")
+}
+
+/// The device id, which is what `device_del` names.
+pub fn usb_device_id(i: usize) -> String {
+    format!("usbdev{i}")
 }
 
 /// What every profile but [`Profile::MetalDisk`] gives the guest. Large
@@ -488,10 +546,7 @@ impl Profile {
                 usb: &["usb-kbd,bus=xhci.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -504,10 +559,7 @@ impl Profile {
                 usb: &["usb-kbd,bus=xhci.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -522,10 +574,7 @@ impl Profile {
                 // emits no controller, no namespace and no backing file.
                 nvme_bytes: 0,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -545,10 +594,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -571,10 +617,7 @@ impl Profile {
                 ],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -587,10 +630,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_T14_BYTES,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -603,10 +643,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: 8192,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -619,10 +656,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: USB_STICK_BYTES,
-                usb_disk_lba_bytes: 512,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[UsbDisk::DATA],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -635,10 +669,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: USB_STICK_BYTES,
-                usb_disk_lba_bytes: 4096,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[UsbDisk { lba_bytes: 4096, ..UsbDisk::DATA }],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -651,10 +682,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: USB_HUGE_BYTES,
-                usb_disk_lba_bytes: 512,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[UsbDisk::HUGE],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -667,10 +695,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: USB_HUGE_BYTES,
-                usb_disk_lba_bytes: 512,
-                usb_disk_readonly: false,
-                usb_disk_first: true,
+                usb_disks: &[UsbDisk { before_boot_stick: true, ..UsbDisk::HUGE }],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -683,10 +708,20 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: USB_STICK_BYTES,
-                usb_disk_lba_bytes: 512,
-                usb_disk_readonly: true,
-                usb_disk_first: false,
+                usb_disks: &[UsbDisk { readonly: true, ..UsbDisk::DATA }],
+                hda: &[],
+                iommu: Some(IOMMU_DEFAULT),
+            },
+            Self::UsbDiskCrowd => Shape {
+                vga: "std",
+                vgamem_mb: None,
+                virtio: false,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disks: &[UsbDisk::DATA, UsbDisk::DATA],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -705,10 +740,7 @@ impl Profile {
                 usb: &["usb-wacom-tablet,bus=xhci.0", "usb-ccid,bus=xhci.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -721,10 +753,7 @@ impl Profile {
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -749,10 +778,7 @@ impl Profile {
                 ],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -774,10 +800,7 @@ impl Profile {
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -793,10 +816,7 @@ impl Profile {
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -809,10 +829,7 @@ impl Profile {
                 usb: &["usb-tablet,bus=xhci.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -828,10 +845,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: None,
             },
@@ -844,10 +858,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(Iommu { aw_bits: 39, ..IOMMU_DEFAULT }),
             },
@@ -860,10 +871,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: &[],
                 iommu: Some(Iommu { intremap: false, ..IOMMU_DEFAULT }),
             },
@@ -876,10 +884,7 @@ impl Profile {
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_bytes: 0,
-                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disk_readonly: false,
-                usb_disk_first: false,
+                usb_disks: &[],
                 hda: HDA_THREE,
                 iommu: Some(IOMMU_DEFAULT),
             },
@@ -893,12 +898,16 @@ impl Profile {
         self.shape().iommu
     }
 
-    /// The data stick's size and logical block size, or `None` when the
-    /// profile puts no second disk on the bus. A test asserting on either has
-    /// to read them from here rather than restate them.
+    /// Every `usb-storage` device this profile puts on the bus besides the
+    /// boot stick, in creation order. A test asserting on a size or a sector
+    /// size has to read it from here rather than restate it.
+    pub fn usb_disks(self) -> &'static [UsbDisk] {
+        self.shape().usb_disks
+    }
+
+    /// The first of them, for the tests that stage exactly one.
     pub fn usb_disk(self) -> Option<(u64, u32)> {
-        let shape = self.shape();
-        (shape.usb_disk_bytes != 0).then_some((shape.usb_disk_bytes, shape.usb_disk_lba_bytes))
+        self.usb_disks().first().map(|d| (d.bytes, d.lba_bytes))
     }
 }
 
@@ -941,11 +950,13 @@ pub struct BootOptions {
     /// on the partition table firmware read is exactly that. Such a test
     /// builds the image itself, reads it, and hands it over here.
     pub boot_image: Option<PathBuf>,
-    /// Back the profile's second USB disk with this file instead of a blank
-    /// one. The USB gate stages the file *before* the boot -- the bytes the
-    /// guest is meant to find are written here -- and reads it afterwards, so
-    /// it has to name the file rather than discover it.
-    pub usb_image: Option<PathBuf>,
+    /// Back the profile's data disks with these files instead of blank ones,
+    /// in the order the profile declares them. The USB gate stages a file
+    /// *before* the boot -- the bytes the guest is meant to find are written
+    /// there -- and reads it afterwards, so it has to name the file rather
+    /// than discover it. Short lists are allowed: the disks past the end get
+    /// the blank image their size would have given them anyway.
+    pub usb_images: Vec<PathBuf>,
     /// What the emulated RTC reads when the machine starts, as
     /// `YYYY-MM-DDTHH:MM:SS`.
     ///
@@ -976,7 +987,7 @@ impl Default for BootOptions {
             ready_marker: DEFAULT_READY,
             nvme_image: None,
             boot_image: None,
-            usb_image: None,
+            usb_images: Vec::new(),
             rtc_base: None,
         }
     }
@@ -999,7 +1010,7 @@ pub struct QemuInstance {
     audio_wav: PathBuf,
     uart_log: PathBuf,
     nvme_image: PathBuf,
-    usb_image: PathBuf,
+    usb_images: Vec<PathBuf>,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
     /// The image this boot built for itself, which is the only one it may
@@ -1162,20 +1173,24 @@ impl QemuInstance {
         // a stamped image is stamped for one geometry, and handing it to a
         // profile that declares another is the mistake the stamp exists to
         // catch rather than one to make here.
-        let usb_shape = options.profile.shape();
-        let (usb_bytes, usb_lba) = (usb_shape.usb_disk_bytes, usb_shape.usb_disk_lba_bytes);
-        let usb_image = match &options.usb_image {
-            Some(path) => path.clone(),
-            None if usb_bytes == 0 => test_dir.join("no-usb-disk"),
-            None => {
-                let path = test_dir.join(format!("test-usb-{usb_bytes}-{usb_lba}.img"));
-                if !path.exists() {
-                    let file = fs::File::create(&path).expect("create the USB disk image");
-                    file.set_len(usb_bytes).expect("size the USB disk image");
+        let usb_images: Vec<PathBuf> = options
+            .profile
+            .usb_disks()
+            .iter()
+            .enumerate()
+            .map(|(i, disk)| match options.usb_images.get(i) {
+                Some(path) => path.clone(),
+                None => {
+                    let path =
+                        test_dir.join(format!("test-usb-{}-{}.img", disk.bytes, disk.lba_bytes));
+                    if !path.exists() {
+                        let file = fs::File::create(&path).expect("create the USB disk image");
+                        file.set_len(disk.bytes).expect("size the USB disk image");
+                    }
+                    path
                 }
-                path
-            }
-        };
+            })
+            .collect();
 
         let audio_wav = test_dir.join(format!("audio-{seq}.wav"));
         let _ = fs::remove_file(&audio_wav);
@@ -1195,7 +1210,7 @@ impl QemuInstance {
         let qemu = qemu_command(
             &boot_image,
             &nvme_image,
-            &usb_image,
+            &usb_images,
             &audio_wav,
             &uart_log,
             qmp_socket.as_deref(),
@@ -1209,7 +1224,7 @@ impl QemuInstance {
                 audio_wav,
                 uart_log,
                 nvme_image,
-                usb_image,
+                usb_images,
                 qmp_socket,
                 screendump,
                 own_boot_image,
@@ -1321,11 +1336,11 @@ impl QemuInstance {
         &self.nvme_image
     }
 
-    /// The second USB disk's backing file, which is what the *device*
-    /// received. The guest's own account of a write it made is the thing under
-    /// test, so it cannot also be the evidence.
-    pub fn usb_image(&self) -> &Path {
-        &self.usb_image
+    /// The data disks' backing files, which is what the *devices* received.
+    /// The guest's own account of a write it made is the thing under test, so
+    /// it cannot also be the evidence.
+    pub fn usb_images(&self) -> &[PathBuf] {
+        &self.usb_images
     }
 
     pub fn stdin_mut(&mut self) -> &mut BufWriter<ChildStdin> {
@@ -1713,6 +1728,19 @@ impl QmpInput {
         }
     }
 
+    /// `times` relative moves of `dx`, all in one command.
+    ///
+    /// QEMU syncs its input once per command and its PS/2 device *accumulates*
+    /// motion between syncs, so this is one packet carrying the sum however
+    /// many moves it names — the deterministic form of what a host holding more
+    /// packets outstanding than that device's queue meets by accident.
+    pub fn mouse_merged(&mut self, dx: i32, times: usize) {
+        let body: Vec<String> = (0..times)
+            .map(|_| format!("{{\"type\":\"rel\",\"data\":{{\"axis\":\"x\",\"value\":{dx}}}}}"))
+            .collect();
+        self.send(&body);
+    }
+
     /// One pointer packet: relative motion and/or a button transition.
     pub fn mouse(&mut self, dx: i32, dy: i32, button: Option<(&str, bool)>) {
         let mut body: Vec<String> = Vec::new();
@@ -1754,6 +1782,7 @@ fn qcode(ch: char) -> (&'static str, bool) {
         '_' => ("minus", true),
         '.' => ("dot", false),
         '/' => ("slash", false),
+        '&' => ("7", true),
         _ => panic!("no qcode for {ch:?}; add it rather than typing something else"),
     }
 }
@@ -1811,7 +1840,8 @@ impl QmpDevices {
 /// unused — so this is what a profile assertion has to read.
 pub fn profile_argv(options: &BootOptions) -> Vec<String> {
     let p = Path::new("/nonexistent");
-    qemu_command(p, p, p, p, p, None, options)
+    let usb: Vec<PathBuf> = options.profile.usb_disks().iter().map(|_| p.to_path_buf()).collect();
+    qemu_command(p, p, &usb, p, p, None, options)
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
         .collect()
@@ -1820,7 +1850,7 @@ pub fn profile_argv(options: &BootOptions) -> Vec<String> {
 fn qemu_command(
     boot_image: &Path,
     nvme_image: &Path,
-    usb_image: &Path,
+    usb_images: &[PathBuf],
     audio_wav: &Path,
     uart_log: &Path,
     qmp_socket: Option<&Path>,
@@ -1908,28 +1938,40 @@ fn qemu_command(
         qemu.arg("-device").arg(*controller);
     }
 
-    // The data stick's own arguments, emitted either side of the boot stick's
+    // The data disks' own arguments, emitted either side of the boot stick's
     // `-device`. QEMU hands out ports in the order devices are created, so this
     // is the only thing that decides which disk the guest enumerates first.
-    let data_stick: Vec<String> = if shape.usb_disk_bytes != 0 {
-        vec![
-            "-drive".to_string(),
-            format!(
-                "if=none,id=usbdisk,format=raw,file={}{}",
-                usb_image.display(),
-                if shape.usb_disk_readonly { ",readonly=on" } else { "" }
-            ),
-            "-device".to_string(),
-            format!(
-                "usb-storage,bus={1},drive=usbdisk,logical_block_size={0},physical_block_size={0}",
-                shape.usb_disk_lba_bytes, shape.storage_bus
-            ),
-        ]
-    } else {
-        Vec::new()
-    };
-    if shape.usb_disk_first {
-        qemu.args(&data_stick);
+    // Each carries a device id as well as a drive id, because a test that
+    // unplugs one over QMP has to be able to name it.
+    let data_sticks: Vec<Vec<String>> = shape
+        .usb_disks
+        .iter()
+        .enumerate()
+        .map(|(i, disk)| {
+            vec![
+                "-drive".to_string(),
+                format!(
+                    "if=none,id={},format=raw,file={}{}",
+                    usb_drive_id(i),
+                    usb_images[i].display(),
+                    if disk.readonly { ",readonly=on" } else { "" }
+                ),
+                "-device".to_string(),
+                format!(
+                    "usb-storage,bus={1},drive={2},id={3},logical_block_size={0},\
+                     physical_block_size={0}",
+                    disk.lba_bytes,
+                    shape.storage_bus,
+                    usb_drive_id(i),
+                    usb_device_id(i),
+                ),
+            ]
+        })
+        .collect();
+    for (disk, args) in shape.usb_disks.iter().zip(&data_sticks) {
+        if disk.before_boot_stick {
+            qemu.args(args);
+        }
     }
 
     qemu.arg("-device")
@@ -1967,12 +2009,14 @@ fn qemu_command(
             ));
     }
 
-    // A second mass-storage device, and the only one a test may write to:
-    // the boot stick is on the same bus and carries the image the guest is
-    // running from. Its logical block size is stated rather than left to the
-    // default for the same reason the namespace's is.
-    if !shape.usb_disk_first {
-        qemu.args(&data_stick);
+    // The mass-storage devices beside the boot stick, and the only ones a test
+    // may write to: the boot stick is on the same bus and carries the image the
+    // guest is running from. Their logical block sizes are stated rather than
+    // left to the default for the same reason the namespace's is.
+    for (disk, args) in shape.usb_disks.iter().zip(&data_sticks) {
+        if !disk.before_boot_stick {
+            qemu.args(args);
+        }
     }
 
     for dev in shape.usb {
@@ -2047,7 +2091,7 @@ struct Files {
     audio_wav: PathBuf,
     uart_log: PathBuf,
     nvme_image: PathBuf,
-    usb_image: PathBuf,
+    usb_images: Vec<PathBuf>,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
     own_boot_image: Option<PathBuf>,
@@ -2059,7 +2103,7 @@ fn spawn_and_wait_ready(mut qemu: Command, options: &BootOptions, files: Files) 
         audio_wav,
         uart_log,
         nvme_image,
-        usb_image,
+        usb_images,
         qmp_socket,
         screendump,
         own_boot_image,
@@ -2122,7 +2166,7 @@ fn spawn_and_wait_ready(mut qemu: Command, options: &BootOptions, files: Files) 
         audio_wav,
         uart_log,
         nvme_image,
-        usb_image,
+        usb_images,
         qmp_socket,
         screendump,
         own_boot_image,

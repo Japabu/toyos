@@ -120,6 +120,46 @@ pub struct ParkedEntry<X: SchedPayload> {
     class: WaitClass,
 }
 
+/// One parked task as an outside reader sees it. The invariants want the key
+/// and the deadline; a blocked-task dump wants the payload and how long the
+/// park has lasted, and it is the only thing that can read them — a `CpuSched`
+/// is reachable from its own CPU alone.
+pub struct ParkedView<'a, X: SchedPayload> {
+    key: TaskKey,
+    entry: &'a ParkedEntry<X>,
+}
+
+impl<X: SchedPayload> ParkedView<'_, X> {
+    pub fn key(&self) -> TaskKey {
+        self.key
+    }
+
+    pub fn deadline(&self) -> Option<Nanos> {
+        self.entry.deadline
+    }
+
+    pub fn class(&self) -> WaitClass {
+        self.entry.class
+    }
+
+    /// When this park began.
+    pub fn since(&self) -> Nanos {
+        self.entry.task.since()
+    }
+
+    pub fn ext(&self) -> &X {
+        self.entry.task.ext()
+    }
+
+    pub fn is_rt(&self) -> bool {
+        self.entry.task.rt().is_rt()
+    }
+
+    pub fn shared_state(&self) -> TaskState {
+        self.entry.task.shared().state()
+    }
+}
+
 /// What context this CPU currently has loaded — the save target of the next
 /// switch. Distinct from `running`, which is `None` between a park and the
 /// switch that leaves the parked task's stack.
@@ -158,6 +198,9 @@ pub struct CpuSched<X: SchedPayload> {
     /// Negative-gate escape hatch only; see [`CpuSched::set_park_keeps_lapsed_lend`].
     #[cfg(feature = "protocol-port")]
     park_keeps_lapsed_lend: bool,
+    /// Negative-gate escape hatch only; see [`CpuSched::set_migrate_keeps_the_corpse`].
+    #[cfg(feature = "protocol-port")]
+    migrate_keeps_the_corpse: bool,
     _not_sync: PhantomData<*mut ()>,
 }
 
@@ -185,6 +228,8 @@ impl<X: SchedPayload> CpuSched<X> {
             armed: None,
             #[cfg(feature = "protocol-port")]
             park_keeps_lapsed_lend: false,
+            #[cfg(feature = "protocol-port")]
+            migrate_keeps_the_corpse: false,
             _not_sync: PhantomData,
         }
     }
@@ -209,10 +254,8 @@ impl<X: SchedPayload> CpuSched<X> {
         &self.rq
     }
 
-    pub fn parked(&self) -> impl Iterator<Item = (TaskKey, Option<Nanos>, WaitClass)> + '_ {
-        self.parked
-            .iter()
-            .map(|(key, entry)| (*key, entry.deadline, entry.class))
+    pub fn parked(&self) -> impl Iterator<Item = ParkedView<'_, X>> + '_ {
+        self.parked.iter().map(|(key, entry)| ParkedView { key: *key, entry })
     }
 
     pub fn parked_task(&self, key: TaskKey) -> Option<&BlockedTask<X>> {
@@ -294,6 +337,17 @@ impl<X: SchedPayload> CpuSched<X> {
     /// `scenarios::old_park_kept_the_lend` is the gate that proves it does.
     pub fn set_park_keeps_lapsed_lend(&mut self, keep: bool) {
         self.park_keeps_lapsed_lend = keep;
+    }
+
+    /// Hand a killed ready task to another CPU instead of reaping it where it
+    /// is — the balance path before [`CpuSched::hand_off`] checked the kill
+    /// bit. It puts the task in `InTransit`, whose reap rides an
+    /// `Urgency::Normal` adopt and therefore waits for the destination's next
+    /// voluntary pass; the retirer's own bound is wall clock. Invariant I14
+    /// must catch it; `scenarios::old_migrate_kept_the_corpse` is the gate that
+    /// proves it does.
+    pub fn set_migrate_keeps_the_corpse(&mut self, keep: bool) {
+        self.migrate_keeps_the_corpse = keep;
     }
 
     /// Order the fair band by something other than spec §9.2's insertion
@@ -398,6 +452,15 @@ impl<X: SchedPayload> CpuSched<X> {
     /// Transfer a ready task to `dst` as an unconsumed `Adopt`. The caller has
     /// already settled the share refcount: a task taken out of this queue must
     /// leave it, a task that never entered must not.
+    ///
+    /// A killed task is reaped here instead. `InTransit` is the one state whose
+    /// reap is not backed by an interrupt: the retire that carries
+    /// `Urgency::Preempt` is consumed and dropped by a destination that gets it
+    /// ahead of the adopt (`handle_retire`'s home-is-me arm), and the adopt
+    /// behind it is `Urgency::Normal`, which by design kicks nobody. Reading the
+    /// kill bit here is what stops a CPU putting a task it knows is dead into
+    /// that state; what remains is a kill that lands *after* the adopt was
+    /// posted, and that case always has a `Msg::Retire` aimed at the same CPU.
     fn hand_off<H: Hw<Payload = X>, P: PreemptGuard>(
         &mut self,
         task: ReadyTask<X>,
@@ -405,6 +468,19 @@ impl<X: SchedPayload> CpuSched<X> {
         env: Env<'_, H, P>,
         now: Nanos,
     ) {
+        #[cfg(not(feature = "protocol-port"))]
+        let migrate_anyway = false;
+        #[cfg(feature = "protocol-port")]
+        let migrate_anyway = self.migrate_keeps_the_corpse;
+        if task.shared().kill_pending() && !migrate_anyway {
+            let key = task.key();
+            // No `leave_runnable`: settling the share is the caller's, stated
+            // above, and it has already happened.
+            let dead = task.reap(self.id, now);
+            self.trace(env, now, TraceKind::Retire { task: key });
+            self.dispose_dead(dead, env);
+            return;
+        }
         let key = task.key();
         let urgency = if task.is_rt() {
             Urgency::Preempt

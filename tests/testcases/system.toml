@@ -19,3 +19,7 @@ toybox = {}
 "bin/pwd" = "/bin/toybox"
 "bin/rm" = "/bin/toybox"
 "bin/shutdown" = "/bin/toybox"
+# The shipped audio client, and the one the T14 hangs on. The raw-API tone in
+# `toyos-rust-tests` drains the same sink perfectly, so a suite that ran only
+# that one certified a path no user takes.
+"bin/tone" = "/bin/toybox"

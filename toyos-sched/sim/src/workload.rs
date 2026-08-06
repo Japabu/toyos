@@ -157,6 +157,24 @@ pub enum ParkShape {
     KeepLapsedLend,
 }
 
+/// What the balance path does with a ready task whose kill bit is already set.
+///
+/// A scenario dimension rather than a constant for the same reason
+/// [`BlockShape`] and [`ParkShape`] are: the kernel has had both answers, and
+/// the difference between them was a live panic on the owner's T14 —
+/// `retire_task: task not released after 1s: InTransit(CpuId(1))`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MigrateShape {
+    /// Spec §7.6's promptness carried into the balance path: a killed task is
+    /// reaped by the CPU that holds it, and never handed on.
+    ReapTheCorpse,
+    /// The balance path before it read the kill bit: a killed ready task is
+    /// migrated like any other, and its reap then rides an `Urgency::Normal`
+    /// adopt to a CPU that owes it nothing sooner than its next voluntary pass.
+    /// See `scenarios::old_migrate_kept_the_corpse`.
+    KeepTheCorpse,
+}
+
 /// What a fair share is a share *of* — spec §9.1's "all threads of one process
 /// share a vruntime".
 ///
@@ -216,6 +234,7 @@ pub struct Scenario {
     pub block: BlockShape,
     pub window: WindowShape,
     pub park: ParkShape,
+    pub migrate: MigrateShape,
     pub share: ShareShape,
     pub charge: ChargeShape,
     /// How the fair band picks between two ready threads of one share. A
@@ -287,6 +306,11 @@ impl Scenario {
 
     pub fn with_park(mut self, park: ParkShape) -> Self {
         self.park = park;
+        self
+    }
+
+    pub fn with_migrate(mut self, migrate: MigrateShape) -> Self {
+        self.migrate = migrate;
         self
     }
 
