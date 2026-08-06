@@ -488,20 +488,9 @@ on a deadline that did not fire.*
 machine.** The keystroke that produced the report is what woke cpu0 and made it
 re-arm, so every deadline field postdates the repair.
 
-**Two candidates, both in `toyos-sched`, both expressible against invariant
-I3/T.** The first is the stronger on this evidence because it predicts exactly
-the observed end state — parked task, no deadline, `TimerPlan::Stop`, halted
-forever:
-
-1. `CpuSched::fire_deadlines`' `Claim::Lost` arm **pops the heap entry and
-   discards it**, on the argument that whoever won the claim has a `Msg::Wake`
-   in flight to this CPU. If that wake is not in flight, or is consumed without
-   waking, the task is left parked with *no* deadline: the next `apply_timer`
-   finds `min_valid` empty, computes `TimerPlan::Stop`, and the CPU halts with a
-   parked thread and no way back.
-2. `driver::execute`'s `awake` early-return drops the `SleepToken` and returns
-   without re-arming, relying on the next `pass()` to do it. Worth proving every
-   route to a halt arms first.
+**Why the report could not be read at all** is the next section: the deadline
+was stored twice and the report read the copy that armed nothing. That is fixed;
+the freeze is not thereby settled, and this entry stays open.
 
 **Do not unify this with the T14 (#142/#156).** There, three CPUs failed to
 answer a 250 ms *kick* while five did; here 8/8 answer. Different observations,
@@ -509,23 +498,62 @@ possibly different defects, and the T14 cannot be attached to — which is what
 the NMI probe in `arch/idt/nmi.rs` is for and why it stays even though the
 debugger settled this case without it.
 
-**And the dump cannot tell that state from health, because it reads the wrong
-copy.** `dump.rs`'s deadline census comes from `for_each_parked`, i.e. from
-`ParkedEntry.deadline` — the *container's* copy. The timer is armed from
-`DeadlineHeap::min_valid` — the *heap*. Candidate 1 is exactly the case where
-those two disagree: `pop_due` removes the heap entry before the claim is
-attempted, so a `Claim::Lost` discards it, while `ParkedEntry.deadline` keeps
-its old value. Such a task prints `parked 14ms due in 1ms` and counts as
-`1 pending, 0 OVERDUE` while `min_valid` returns `None` and `apply_timer`
-computes `TimerPlan::Stop`. The observed report is not merely consistent with
-the corruption — it is indistinguishable from health by construction.
+### The deadline was stored twice and only one copy armed anything (2026-08-06)
 
-That makes the fix a *representation* question rather than a patch: the deadline
-is stored twice and only one copy arms anything. Either the heap entry is
-restored when the claim is lost (a backstop that survives a wake that never
-arrives), or `ParkedEntry.deadline` is cleared with it (consistent, and the
-report stops lying), or — the version worth trying first — the container stops
-carrying a second copy at all, so the two cannot disagree. Whichever is chosen
-belongs behind a simulator gate over invariant I3/T, and I3 must be taught to
-compare the two copies, since today it validates the heap *against* the
-container and therefore cannot see them diverge.
+`ParkedEntry.deadline` and `DeadlineHeap` each held the same value, and each
+module's doc comment claimed to be its single home — `timer.rs`: "every deadline
+lives in exactly one place: the home CPU's heap"; `cpu.rs`: "the deadline lives
+*here* and nowhere else". `apply_timer` armed from the heap. `sched::dump`,
+invariant T and `earliest_event` read the entry.
+
+They diverge in one arm. `fire_deadlines` called `DeadlineHeap::pop_due`, which
+**removes** the entry before the claim is attempted; a `Claim::Lost` then
+`continue`d and the heap entry was gone while `ParkedEntry.deadline` kept its
+copy. Such a CPU arms `TimerPlan::Stop` and reports `1 pending, 0 OVERDUE` — the
+corruption is not merely consistent with health, it is indistinguishable from it
+by construction, which is why #156's capture could not be read.
+
+**Why nothing had ever caught it, which is not what the checkpoint guessed.**
+Invariant T's teeth were never the problem: `check_timer`'s `(None, Some(due))`
+arm is exactly this state, and it fires on the very pass where the divergence
+happens in any `check` build. What was missing is a *scenario*.
+`SchedPass::begin` runs `drain` and `fire_deadlines` back to back with no step
+boundary between them, so the explorer cannot place a remote claim there and
+`Claim::Lost` is unreachable in every run the simulator has ever made — the same
+shape as the `8508b37` window and as `pre_park_claims`, an interleaving that is
+not in the step relation at all. On hardware the window is two instructions of a
+remote CPU: `TaskShared::claim_wake`, then the `Msg::Wake` post in
+`waitq::deliver_wake`. `sim/tests/deadline_claim_race.rs` is that pair with a
+whole pass scripted in between. Written and run **before** the fix; its verdict
+on the unfixed tree is
+
+```
+invariant T: cpu CpuId(0) has an event at Nanos(5000000) and no timer armed
+```
+
+**The fix deletes the second copy** rather than keeping the two in step: the
+deadline lives in `ParkedEntry` and nowhere else, `DeadlineHeap` and
+`DeadlineOracle` are gone with the lazy-deletion rule they existed for, and
+`apply_timer` reads the field invariant T reads. With one copy, the lost claim
+has exactly one thing it can do and it is also the correct thing — clear the
+deadline. A remote waker owns the wake, so no later claim can succeed and that
+timeout can never fire; an entry that went on reporting it was reporting
+something that would not happen. Clearing it is also what advances the loop,
+which is the property worth having: the deadline that will not be honoured and
+the deadline that is not reported are one field.
+
+Cost: `earliest_deadline` and `next_due` scan `parked` where the heap was
+O(log n) amortized, and both sit on the pass path. What that buys is the
+deletion of the oracle, the staleness rule, and a two-statement mutation whose
+second statement is the one that went missing. The number that would reverse the
+decision is hundreds of threads blocked on one CPU.
+
+**What this does not settle.** It closes a representation defect and a report
+that lied; it is *not* established that this is what froze the guest. The
+claim's `Msg::Wake` follows it within two instructions, cpu0 cannot halt with a
+non-empty mailbox (`SleepArm::confirm`), and a post to a CPU that has published
+SLEEPING returns `Kick::Send` — so the protocol still has an answer for every
+ordering that could be constructed by reading it. `desktop_window_child` stays
+an expected red and is not evidence either way (known-issues §3). And nothing
+here says anything about the T14, where 3 of 8 CPUs missed a kick and this
+machine's 8 answered.
