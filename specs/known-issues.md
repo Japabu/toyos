@@ -1226,10 +1226,86 @@ and it returns `Some(Event::Close)` — **every call, forever**
 inside `CloseRequested` was supposed to trip. The app spins on a core instead
 of leaving, which is also why nothing in the log marks the moment.
 
-The fix belongs in the fork (`Japabu/winit`, branch `toyos`): break out of the
-poll loop on `Close`, or test `exiting()` inside it. Both other arms of the
-same function — the `ControlFlow::Wait` and `WaitUntil` blocking paths at
-`:637` and `:707` — decode `Close` the same way and want the same look.
+**CLOSED in the tree, and the fix is the SDK's rather than the fork's.**
+`Window::poll_event` latches: `Close` is the last element of the stream and is
+delivered exactly once, so a caller that drains until `None` gets out. That
+makes the fork's loop correct as written, and it fixes every other client that
+drains the same way rather than winit alone. `desktop_window_child` and the
+fifth case of `compositor_client_death` gate it from the client side. A break
+on `Close` in the fork's poll loop is prepared but unpushed (owner task #150);
+it is now belt-and-braces rather than the fix.
+
+**The T14 confirms it.** In `boot8-snake.log` the owner closed snake's window
+with the X button and snake exited `code=0` — where before the latch it never
+exited at all. The `ControlFlow::Wait` and `WaitUntil` arms at `:637` and
+`:707` are the ones snake actually runs (`userland/snake/src/main.rs:351`,
+`:359`), and they are now tested rather than read: snake leaves on a close both
+on his machine and in `desktop_window_child`, three rounds, one of them played.
+
+**What that session leaves open is not snake.** 34 ms after snake exited the
+shell exited too, and 13 ms after that the terminal — so the owner got no
+prompt back. That is the next entry.
+
+### OPEN — the shell went with the windowed child it was waiting for, and the harness will not reproduce it
+
+From `boot8-snake.log`: `exit: snake pid=10 code=0` at 121.659, `exit: shell
+pid=5 code=0` at 121.693, `exit: terminal pid=4 code=0` at 121.706. A shell
+that has reaped its foreground child prints a prompt; it does not exit.
+
+**Not reproducible here, and the attempts are the finding.**
+`desktop_window_child` runs the whole chain — compositor, terminal, shell — and
+ends a windowed child four ways: a bare `window::Window` that exits by itself,
+the same client with the compositor taking its window away while it is alive,
+and snake three times, the last after eight turns of play. At smp=2 and at the
+T14's smp=8. **The shell answers again every time.** So neither "a windowed
+child exited" nor "the compositor closed a child's window" is sufficient on its
+own, and the trigger is something his session had that this does not.
+
+**The evidence favours the terminal breaking first, not the shell deciding to
+go.** The terminal mirrors everything the shell writes to the serial log, and
+between snake's exit and the shell's there is **no prompt on serial** — the
+last one is `/home/root> n snake` before it and the next is from the
+replacement terminal a second later. A shell that reached its prompt would have
+written it, and a terminal still in its loop would have mirrored it. What fits
+the silence is the terminal already being out of its loop: it drops
+`shell_stdin`, the shell's next read is EOF, `readline` returns `None`, and the
+shell breaks and exits — with its prompt written into a pipe nobody was
+reading. The terminal's own `exit:` comes last in both readings because
+`child.wait()` is the statement after the loop.
+
+That leaves the terminal's two exits from that loop, and neither is explained:
+`shell_stdout` reading 0 needs the shell's stdout to lose its last writer while
+the shell still holds it, and `window::Event::Close` needs the compositor to
+have closed *the terminal's* connection when only one window was removed.
+`decode_event`'s `_ => Event::Close` (`userland/window/src/lib.rs`) turns any
+message type the terminal does not know into a close, which is the cheapest way
+for the second to happen by accident.
+
+**A live confound, and it is not this.** Three of the owner's eight CPUs stop
+taking scheduler passes during a session and threads placed on them never run
+(§3, #142). That produces processes which *hang*; all three of these *exited*,
+promptly and with `code=0`. It cannot be read as the explanation here, and this
+entry should not be closed by it.
+
+### OPEN — the compositor holds a window *index* across passes, and every removal invalidates it
+
+Found while reading the close path, not reproduced. `Interaction`
+(`userland/compositor/src/main.rs:825`) carries `window_idx: usize` in its
+`DragPending`, `Dragging` and `Resizing` variants, it survives between event
+loop passes, and the drag and resize arms index `windows[window_idx]` with no
+revalidation (`:1901`, `:1912`). Every path that shortens or reorders `windows`
+invalidates it: `remove` for the close button, GUI+Q and `MSG_DESTROY_WINDOW`,
+`retain` for the dead-client sweep, and `bring_to_front`'s remove-and-insert.
+
+Two consequences and a client can drive both, which is what makes it the same
+class as the grant that killed the desktop: a window removed *below* the
+dragged one moves the wrong window, and a window removed *at or above* the last
+index makes `windows[window_idx]` an out-of-bounds panic. A client that exits
+while the user is dragging is the whole of the reproduction.
+
+The fix is the one the same file already uses one line away —
+`last_title_click_fd: Option<Fd>` identifies a window by its `Fd` rather than
+its position — and it wants a gate that drops a window mid-drag.
 
 ### A syscall runs with interrupts masked, and only incidentally with preemption disabled
 
