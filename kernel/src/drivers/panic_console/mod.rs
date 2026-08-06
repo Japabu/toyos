@@ -32,12 +32,14 @@
 //!
 //! The screen is smaller than the report. A 1080p panel is 67 rows and a boot
 //! log is ~85 display rows before a backtrace is added, so a single paint is a
-//! window over the *newest* end and everything above it is unreachable -- on a
-//! machine whose input is dead there is no key to press for the rest. So the
-//! text is paginated, and [`page_forever`] advances the page on a deadline
-//! after the machine has halted: a phone camera left running collects the
-//! whole thing. Paging happens only when the text does not fit, and the
-//! `[page n/m]` footer is what tells a photograph which slice it caught.
+//! window over the *newest* end and everything above it would be unreachable.
+//! So the text is paginated, and [`page_forever`] cycles it after the machine
+//! has halted: a phone camera left running collects the whole thing. PageUp and
+//! PageDown steer it, polled off the i8042 with every CPU already halted, and
+//! the deadline is what a machine whose keyboard is dead, disabled or absent
+//! still gets -- so the reader chooses between them and neither is owed. Paging
+//! happens only when the text does not fit, and the `[page n/m]` footer is what
+//! tells a photograph which slice it caught.
 //!
 //! That the halted machine spins rather than `hlt`s is the cost, and it is
 //! paid knowingly: nothing would wake it, and re-arming the LAPIC timer would
@@ -54,6 +56,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
+use toyos_ps2::{KeyDecoder, KeyOutcome};
 
 use crate::log;
 use crate::mm::paging::CachePolicy;
@@ -484,24 +487,59 @@ pub fn page_forever() {
     if pages < 2 {
         return;
     }
-    let mut page = 0;
+    // `None` is the screenful [`render`] left up, which is `Page::Last` and so
+    // not one of the numbered pages: the deadline's first turn starts the cycle
+    // at the top, and a key from there reaches either end of it.
+    let mut shown: Option<usize> = None;
+    let mut keys = KeyDecoder::new();
     loop {
-        hold(PAGE_HOLD_NS);
-        paint(Fill::Fatal, text, Page::Nth(page));
-        page += 1;
-        if page == pages {
-            page = 0;
-        }
+        let step = hold(PAGE_HOLD_NS, &mut keys);
+        let next = match (shown, step) {
+            (None, PageKey::Down) => 0,
+            (None, PageKey::Up) => pages - 1,
+            (Some(page), PageKey::Down) => (page + 1) % pages,
+            (Some(page), PageKey::Up) => (page + pages - 1) % pages,
+        };
+        paint(Fill::Fatal, text, Page::Nth(next));
+        shown = Some(next);
     }
 }
 
-/// Busy-wait `nanos`. `nanos_since_boot` is an `rdtsc` and two relaxed loads --
-/// no lock, no MMIO, nothing the panic path is forbidden to touch.
-fn hold(nanos: u64) {
+/// Which way the next paint moves.
+#[derive(Clone, Copy)]
+enum PageKey {
+    Up,
+    Down,
+}
+
+/// HID usages, because that is what the wire decoder emits and this module has
+/// no business knowing a scancode.
+const HID_PAGE_UP: u8 = 0x4B;
+const HID_PAGE_DOWN: u8 = 0x4E;
+
+/// Busy-wait `nanos`, and answer which way the page moves.
+///
+/// `nanos_since_boot` is an `rdtsc` and two relaxed loads and [`i8042::poll_byte`]
+/// is an `inb` of the status port -- no lock, no MMIO, nothing the panic path is
+/// forbidden to touch, and no wait a controller could extend. The deadline is
+/// what a machine with no keyboard gets, and it only ever goes forward.
+///
+/// [`i8042::poll_byte`]: crate::drivers::i8042::poll_byte
+fn hold(nanos: u64, keys: &mut KeyDecoder) -> PageKey {
     let target = crate::clock::nanos_since_boot().saturating_add(nanos);
     while crate::clock::nanos_since_boot() < target {
+        // The pointer shares the port, and its packet bytes are scancodes to
+        // anything that does not skip them.
+        if let Some((byte, false)) = crate::drivers::i8042::poll_byte() {
+            match keys.feed(byte) {
+                KeyOutcome::Key { usage: HID_PAGE_UP, pressed: true } => return PageKey::Up,
+                KeyOutcome::Key { usage: HID_PAGE_DOWN, pressed: true } => return PageKey::Down,
+                _ => {}
+            }
+        }
         core::hint::spin_loop();
     }
+    PageKey::Down
 }
 
 /// Repaint at a boot phase boundary, so a machine that wedges later still

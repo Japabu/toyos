@@ -1555,6 +1555,23 @@ pub fn init(rsdp_addr: u64) {
     }
 }
 
+/// One byte from the controller if it has one, and whether the aux port sent
+/// it. Never waits: a machine whose keyboard is dead, disabled or absent costs
+/// the caller one `inb` and answers `None` forever.
+///
+/// **Only legal once every CPU is halted.** It reads port 0x60, which this
+/// module's whole design makes the ISR the sole reader of, and the halt is what
+/// stands in for that: there is no ISR left to race. It exists for the panic
+/// console's pager, which may take no lock and so cannot reach [`PS2`]'s
+/// decoders — it feeds a [`KeyDecoder`] of its own instead.
+pub fn poll_byte() -> Option<(u8, bool)> {
+    let status = inb(STATUS);
+    if status & OBF == 0 {
+        return None;
+    }
+    Some((inb(DATA), status & AUXB != 0))
+}
+
 /// The handler's drain loop, without the EOI. Runs with interrupts off on the
 /// CPU the vector is pinned to, which is what keeps `push_isr`'s single
 /// producer single.
