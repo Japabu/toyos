@@ -213,32 +213,6 @@ impl<'a> SyscallContext<'a> {
         Ok(())
     }
 
-    /// Validate a user pointer to a typed struct (immutable).
-    pub fn user_ref<T: UserSafe>(&self, ptr: UserAddr) -> Option<&'a T> {
-        let size = core::mem::size_of::<T>() as u64;
-        if size == 0 || !crate::mm::user_span::in_user_half(ptr.raw(), size) {
-            return None;
-        }
-        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
-            return None;
-        }
-        let kptr = translate(ptr.raw())?;
-        Some(unsafe { &*(kptr as *const T) })
-    }
-
-    /// Validate a user pointer to a typed struct (mutable).
-    pub fn user_mut<T: UserSafe>(&self, ptr: UserAddr) -> Option<&'a mut T> {
-        let size = core::mem::size_of::<T>() as u64;
-        if size == 0 || !crate::mm::user_span::in_user_half(ptr.raw(), size) {
-            return None;
-        }
-        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
-            return None;
-        }
-        let kptr = translate(ptr.raw())?;
-        Some(unsafe { &mut *(kptr as *mut T) })
-    }
-
     /// Validate a user pointer to a slice of typed structs.
     pub fn user_slice_of<T: UserSafe>(&self, ptr: UserAddr, count: usize) -> Option<&'a [T]> {
         if count == 0 {
@@ -272,42 +246,5 @@ impl<'a> SyscallContext<'a> {
             }
         }
         Some(unsafe { core::slice::from_raw_parts(kptr as *const T, count) })
-    }
-
-    /// Validate a user pointer to a mutable slice of typed structs.
-    /// Same contiguity constraints as user_slice_of.
-    #[allow(dead_code)]
-    pub fn user_slice_of_mut<T: UserSafe>(&self, ptr: UserAddr, count: usize) -> Option<&'a mut [T]> {
-        if count == 0 {
-            return Some(&mut []);
-        }
-        let byte_len = count.checked_mul(core::mem::size_of::<T>())?;
-        if !crate::mm::user_span::in_user_half(ptr.raw(), byte_len as u64) {
-            return None;
-        }
-        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
-            return None;
-        }
-        let kptr = translate(ptr.raw())?;
-        // Verify contiguity at every 2MB page boundary crossing.
-        let start = ptr.raw();
-        let end = start + byte_len as u64;
-        let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
-        while boundary < end {
-            let k = translate(boundary)?;
-            let expected = unsafe { kptr.add((boundary - start) as usize) };
-            if k != expected {
-                return None;
-            }
-            boundary += crate::mm::PAGE_2M;
-        }
-        if byte_len > 1 {
-            let end_kptr = translate(end - 1)?;
-            let expected_end = unsafe { kptr.add(byte_len - 1) };
-            if end_kptr != expected_end {
-                return None;
-            }
-        }
-        Some(unsafe { core::slice::from_raw_parts_mut(kptr as *mut T, count) })
     }
 }

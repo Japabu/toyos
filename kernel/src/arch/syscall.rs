@@ -255,8 +255,14 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             process::with_fd_owner_data(|data| fd::seek(&mut data.fds, a1 as u32, pos))
         }
         SYS_FSTAT => {
-            let Some(stat) = ctx.user_mut::<fd::Stat>(UserAddr::new(a2)) else { return bad_addr };
-            if process::with_fd_owner_data(|data| fd::fstat(&data.fds, a1 as u32, stat)) { 0 } else { SyscallError::NotFound.to_u64() }
+            let mut stat = fd::Stat { file_type: 0, size: 0, mtime: 0 };
+            if !process::with_fd_owner_data(|data| fd::fstat(&data.fds, a1 as u32, &mut stat)) {
+                return SyscallError::NotFound.to_u64();
+            }
+            match ctx.copy_out(UserAddr::new(a2), &stat) {
+                Ok(()) => 0,
+                Err(e) => e.to_u64(),
+            }
         }
         SYS_FSYNC => process::with_fd_owner_data(|data| fd::fsync(&mut data.fds, &mut *vfs::lock(), a1 as u32)),
         SYS_READDIR => {
@@ -288,7 +294,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_PIPE => sys_pipe(),
         SYS_SPAWN => {
-            let Some(args) = ctx.user_ref::<SpawnArgs>(UserAddr::new(a1)) else { return bad_addr };
+            let Ok(args) = ctx.copy_in::<SpawnArgs>(UserAddr::new(a1)) else { return bad_addr };
             let text = match ctx.user_str(UserAddr::new(args.argv_ptr), args.argv_len) { Ok(s) => s, Err(e) => return e.to_u64() };
             let fd_count = args.fd_map_count as usize;
             let fds = if fd_count > 0 {
@@ -405,17 +411,18 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_DLCLOSE => 0,
         SYS_FTRUNCATE => process::with_fd_owner_data(|data| fd::ftruncate(&mut data.fds, a1 as u32, a2)),
         SYS_STACK_INFO => {
-            let Some(base_out) = ctx.user_mut::<u64>(UserAddr::new(a1)) else { return bad_addr };
-            let Some(size_out) = ctx.user_mut::<u64>(UserAddr::new(a2)) else { return bad_addr };
-            process::with_current_data(|data| {
-                if data.user_stack_base.raw() > 0 {
-                    *base_out = data.user_stack_base.raw();
-                    *size_out = data.user_stack_size;
-                    0
-                } else {
-                    SyscallError::NotFound.to_u64()
-                }
-            })
+            let stack = process::with_current_data(|data| {
+                (data.user_stack_base.raw() > 0)
+                    .then_some((data.user_stack_base.raw(), data.user_stack_size))
+            });
+            let Some((base, size)) = stack else { return SyscallError::NotFound.to_u64() };
+            match ctx
+                .copy_out(UserAddr::new(a1), &base)
+                .and_then(|()| ctx.copy_out(UserAddr::new(a2), &size))
+            {
+                Ok(()) => 0,
+                Err(e) => e.to_u64(),
+            }
         }
         SYS_CPU_COUNT => super::smp::cpu_count() as u64,
         SYS_FUTEX_WAIT => match UserAddr::checked(a1) {

@@ -1130,18 +1130,20 @@ proves the entry exists. One argument and one panic.
 pub unsafe trait UserSafe: Copy {}
 ```
 
-Six impls: `u32`, `u64`, `[u32; 2]`, `fd::Stat`, `SpawnArgs`, `RawKeyEvent`,
-`MouseEvent`.
+Impls: `u32`, `u64`, `[u32; 2]`, `[u64; 2]`, `fd::Stat`, `SpawnArgs`,
+`RawKeyEvent`, `MouseEvent`.
 
-**The bug it permits.** `user_mut::<T>` and `user_slice_of_mut::<T>` hand a
-`&mut T` pointing at user memory, so a `T` with padding written wholesale
-publishes uninitialised kernel stack. Not hypothetical: known-issues §4 records
+**The bug it permits.** `copy_out::<T>` writes a kernel-side `T` into user
+memory wholesale, so a `T` with padding publishes uninitialised kernel stack.
+(When this was written it was `user_mut::<T>` and `user_slice_of_mut::<T>`
+handing out a `&mut T`; the copy makes the write more direct, not less.) Not
+hypothetical: known-issues §4 records
 `AudioInfo::as_bytes` doing exactly that, fixed at `4fce59c` by *spelling the
 padding out as named fields with a `const _` size assert*, so omitting one is an
 E0063.
 
-I checked all six impls and found **no live instance** — `fd::Stat` is three
-`u64`s, the primitives and `[u32; 2]` are trivially padding-free, and the ABI
+I checked every impl and found **no live instance** — `fd::Stat` is three
+`u64`s, the primitives and the arrays are trivially padding-free, and the ABI
 structs carry explicit `_pad` fields. The finding is that the trait's third
 obligation is the only one nothing mechanises, in a codebase already bitten by it
 in a sibling path.
