@@ -1728,6 +1728,19 @@ impl QmpInput {
         }
     }
 
+    /// `times` relative moves of `dx`, all in one command.
+    ///
+    /// QEMU syncs its input once per command and its PS/2 device *accumulates*
+    /// motion between syncs, so this is one packet carrying the sum however
+    /// many moves it names — the deterministic form of what a host holding more
+    /// packets outstanding than that device's queue meets by accident.
+    pub fn mouse_merged(&mut self, dx: i32, times: usize) {
+        let body: Vec<String> = (0..times)
+            .map(|_| format!("{{\"type\":\"rel\",\"data\":{{\"axis\":\"x\",\"value\":{dx}}}}}"))
+            .collect();
+        self.send(&body);
+    }
+
     /// One pointer packet: relative motion and/or a button transition.
     pub fn mouse(&mut self, dx: i32, dy: i32, button: Option<(&str, bool)>) {
         let mut body: Vec<String> = Vec::new();
@@ -1769,6 +1782,7 @@ fn qcode(ch: char) -> (&'static str, bool) {
         '_' => ("minus", true),
         '.' => ("dot", false),
         '/' => ("slash", false),
+        '&' => ("7", true),
         _ => panic!("no qcode for {ch:?}; add it rather than typing something else"),
     }
 }

@@ -1,0 +1,34 @@
+[package]
+name = "kernel-loom"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# This package exists only to run the loom model checker over `kernel/src/sync.rs`,
+# the ticket spinlock the whole kernel rests on. It compiles that one file into
+# its own crate with `feature = "loom"` on, so its atomics and its cell become
+# loom-instrumented ones and the model explores the real primitive rather than a
+# transliteration of it — a transliteration is exactly the divergence risk a
+# model checker is meant to remove.
+#
+# A separate package with its own lockfile, so `loom` and its transitive host
+# crates stay out of `kernel/Cargo.lock` — the same arrangement, and the same
+# reason, as `toyos-sched/loom`. It sits beside `kernel/` rather than inside it
+# because `kernel/.cargo/config.toml` cross-compiles everything below it to
+# `x86_64-unknown-none`, and cargo refuses to merge an inherited `build.target`
+# away.
+[workspace]
+
+[features]
+default = ["loom"]
+loom = []
+
+[dependencies]
+loom = "0.7"
+
+[lib]
+path = "src/lib.rs"
+# The models are the test targets; loom atomics outside a `loom::model` panic,
+# so this crate exposes no unit tests of its own.
+test = false

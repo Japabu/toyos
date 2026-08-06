@@ -87,6 +87,20 @@ fn make_and_break_and_the_e0_prefix() {
     assert_eq!(press(&mut d, &[0x4B]), [(0x5C, true)]);
 }
 
+/// The panic console's pager reads these two straight off a halted controller
+/// with its own decoder, and its whole input vocabulary is what this asserts.
+#[test]
+fn the_pager_keys_decode_to_their_hid_usages() {
+    let mut d = KeyDecoder::new();
+    assert_eq!(press(&mut d, &[0xE0, 0x49]), [(0x4B, true)], "PageUp make");
+    assert_eq!(press(&mut d, &[0xE0, 0xC9]), [(0x4B, false)], "PageUp break");
+    assert_eq!(press(&mut d, &[0xE0, 0x51]), [(0x4E, true)], "PageDown make");
+    assert_eq!(press(&mut d, &[0xE0, 0xD1]), [(0x4E, false)], "PageDown break");
+    // Unprefixed they are the keypad's 9 and 3, which a pager must not answer.
+    assert_eq!(press(&mut d, &[0x49]), [(0x61, true)]);
+    assert_eq!(press(&mut d, &[0x51]), [(0x5B, true)]);
+}
+
 #[test]
 fn printscreen_emits_one_usage_and_no_phantom_shift() {
     let mut d = KeyDecoder::new();

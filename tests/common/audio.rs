@@ -928,3 +928,43 @@ fn check_playback(what: &str, periods: u64, frames: u64) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The shipped audio client must finish and exit on a machine with no device.
+///
+/// `metal_sim_null_audio` already asserts a client drains at the real rate, and
+/// it passed on every boot while the T14 hung — because it runs this crate's
+/// own tone, which reaches soundd through the SDK, and the program a user runs
+/// reaches it through `cpal`. Same sink, same period grid, different client.
+///
+/// Two clients in series, because the T14 log shows the *second* connect never
+/// being applied: the control thread accepts and prints `opening stream`, and
+/// no `client N connected` follows it.
+pub fn null_sink_shipped_client(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions { profile: qemu::Profile::Metal, ..Default::default() },
+    );
+
+    let result = qemu.run_test("test_rs_null_sink_client_exits", Duration::from_secs(60));
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\nstdout:\n{}\nserial:\n{}", result.stdout, result.serial));
+    }
+    match result.exit_code {
+        Some(0) => {}
+        Some(code) => {
+            return Err(format!(
+                "the shipped tone exited {code} on a device-less machine:\n{}",
+                result.stdout
+            ))
+        }
+        None => return Err(format!("no exit code:\n{}", result.stdout)),
+    }
+    eprintln!("  [null-sink] {}", result.stdout.trim());
+    Ok(())
+}

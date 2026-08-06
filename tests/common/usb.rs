@@ -1342,7 +1342,7 @@ pub fn xhci_portsc_rw1c(
         if rest.contains("connected") {
             connected += 1;
         }
-        if rest.contains("reset, speed=") {
+        if rest.contains("enabled, speed=") {
             enabled += 1;
         }
         if rest.contains("not enabled") || rest.contains("never finished its reset") {
@@ -1523,6 +1523,84 @@ pub fn usb_transport_break(
     Ok(())
 }
 
+/// A SuperSpeed port is not reset into existence, and the driver knows which
+/// ports are which because it read the controller's own description of itself.
+///
+/// The Supported Protocol capability (§7.2) was never parsed, so every port
+/// register looked alike and every one got the USB2 treatment: write PR, wait
+/// for PRC. A USB3 link trains itself and reaches Enabled with nothing done to
+/// it (§4.19.1.2), so that write is a *hot reset of a working link* — and a
+/// link that cannot take one lands Inactive, which only a warm reset this
+/// driver did not have would have left. On the T14 that is a USB-A socket that
+/// mounts nothing, two boots out of two, while the same stick through a Type-C
+/// adapter mounts every time: the adapter lands it on the connector's USB2
+/// pins, and a USB2 port is the one shape the old driver knew.
+///
+/// **What this gate can and cannot say.** QEMU's xHC publishes real Supported
+/// Protocol capabilities, so the decode and the branch are certified here
+/// against a controller's own bytes. It has no link training and no Inactive
+/// state, so the warm-reset recovery is unreachable and is certified by the
+/// host model instead (`toyos-xhci/sim/tests/superspeed.rs`). This says: the
+/// driver read the split correctly and stopped resetting the ports that did not
+/// need it. It says nothing about what happens when a link falls over.
+pub fn xhci_superspeed_ports(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let options = BootOptions { profile: Profile::MetalUsb, ..Default::default() };
+    let devices = crate::usb_argv(&qemu::profile_argv(&options)).len();
+    let log = boot_and_shutdown(test_config, c_bins, rust_bins, options)?;
+
+    // The controller described itself and the driver read it. `nec-usb-xhci`
+    // with `p2=8` is four SuperSpeed registers and eight USB2 ones, and the
+    // driver has to name that split without being told it.
+    const SPLIT: &str = "xHCI: 8 USB2 and 4 USB3 port register(s) of 12 named, \
+                         0 capability(ies) refused";
+    if !log.contains(SPLIT) {
+        let got = log.lines().find(|l| l.contains("port register(s) of"));
+        return Err(format!(
+            "the driver did not read the controller's protocol split; got {got:?}\n{log}"
+        ));
+    }
+
+    // The boot stick is the only SuperSpeed device this profile attaches, so it
+    // takes a USB3 register and every HID takes a USB2 one. Exactly one port
+    // must therefore have been brought up with no reset at all.
+    let trained: Vec<&str> = log.lines().filter(|l| l.contains("link already trained")).collect();
+    if trained.len() != 1 {
+        return Err(format!(
+            "{} port(s) came up on an already-trained link, want the SuperSpeed stick alone: \
+             {trained:?}\n{log}",
+            trained.len()
+        ));
+    }
+
+    // And every device still reached Enabled, so not resetting cost nothing.
+    let enabled = log.matches("enabled, speed=").count();
+    if enabled != devices {
+        return Err(format!(
+            "{enabled} port(s) reached Enabled, {devices} devices on the bus\n{log}"
+        ));
+    }
+    for wrong in ["never finished its reset", "would not train", "warm reset"] {
+        if let Some(line) = log.lines().find(|l| l.contains(wrong)) {
+            return Err(format!("{line:?} on a bus where every link is healthy\n{log}"));
+        }
+    }
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish\n{log}"));
+    }
+    serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+
+    eprintln!(
+        "  [xhci] the controller's own capability names 8 USB2 and 4 USB3 registers; the \
+         SuperSpeed stick is enumerated on a link that was already trained, and {enabled} \
+         port(s) reached Enabled"
+    );
+    Ok(())
+}
+
 /// A device that attaches at **full speed**, where EP0's max packet size is a
 /// thing only the device knows.
 ///
@@ -1581,7 +1659,7 @@ pub fn xhci_full_speed_device(
     // the specification and nothing below here has anything to measure.
     let full_speed: Vec<&str> = log
         .lines()
-        .filter(|l| l.contains("xHCI: port ") && l.contains("reset, speed=1"))
+        .filter(|l| l.contains("xHCI: port ") && l.contains("enabled, speed=1"))
         .collect();
     if full_speed.len() != 2 {
         return Err(format!(

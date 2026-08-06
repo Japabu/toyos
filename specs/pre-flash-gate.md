@@ -222,7 +222,7 @@ outranks the rest of this section.
 
 | | |
 |---|---|
-| **Run** | On a quiet tree: `cargo run -- --build-only`. Then search `target/bootable.img` for the root `system.toml` init string (`/bin/compositor;/bin/soundd;/bin/netd;/bin/sshd` — `locale --load` led it until the layout syscall was deleted) **and** for `/bin/test-runner`. Confirm `target/kernel-*` and `target/bootloader.efi-*` staged copies exist. |
+| **Run** | On a quiet tree: `cargo run -- --build-only`. Then search `target/bootable.img` for the root `system.toml` init string (`/bin/compositor;/bin/soundd;/bin/netd` — `locale --load` led it until the layout syscall was deleted, and `/bin/sshd` trailed it until it was taken out of the default boot) **and** for `/bin/test-runner`. Confirm `target/kernel-*` and `target/bootloader.efi-*` staged copies exist. |
 | **Expect** | The root init list present, `test-runner` absent, staged copies present. |
 | **False pass** | The init list is **compiled into `bootloader.efi`** (`bootloader/build.rs` declares `rerun-if-env-changed=INIT_PROGRAMS`), and cargo keyed the artifact path on `(crate, target, profile)` and nothing else — so before this commit an image built while a `cargo test` ran got *another config's bootloader* with a plausible initrd. That failure is invisible to a size check, to `fdisk -l`, and to §2 entirely: the image is well-formed, it just boots the wrong init list. Two consequences. First, checking only that the right string is *present* passes on an image that also contains the wrong one — assert `test-runner`'s **absence** too. Second, **build on a quiet tree**: a concurrent harness run is the precise condition this commit fixes, so building under contention tests the fix rather than the artifact. |
 
@@ -406,12 +406,14 @@ more than 32 KiB through the ring between the panic and the paint. Unlikely,
 unstaged, and bounded. §4.1 therefore passes for *rendering*, which is what the
 item claims, with capture explicitly out of scope.
 
-**`sshd` is in the root init list and in no test config.** `tests/metalcase`
-boots compositor, soundd, netd, test-runner; `tests/testcases` boots soundd,
-test-runner. So one of the four programs the flashed machine runs at boot has
-never been spawned at boot by anything in this tree. It is read-verified safe —
-sshd's `NotConnected` arm prints and returns cleanly
-(`userland/sshd/src/main.rs:243`) — but read-verified is all it is.
+**CLOSED — `sshd` was in the root init list and in no test config.** It is in
+neither now. The default boot does not start it, and `src/build.rs`'s
+`no_shipped_boot_config_starts_sshd` is the gate on that; `tests/sshdcase` is a
+boot that runs it with a NIC under it, the only config where it reaches a line
+past its bind. What made the gap urgent rather than untidy was what the daemon
+did once reached — it accepted every password and every public key it was
+offered — which is fixed separately. The flashed machine now starts three
+programs at boot and every one of them is spawned at boot by this tree.
 
 `locale --load` used to be the second such program and is gone: the layout is a
 config file every translator reads for itself, so there is nothing to load into
@@ -425,8 +427,7 @@ and nothing to run at boot.
 2. **§1.4.** The owner's answer. It is the only item that makes a §1 failure
    survivable rather than merely unlikely, so it should be answered before the
    boot even though its absence is not a fail.
-3. **`sshd` at boot**, per above.
-4. **A muted, idle machine** — the T14's steady state. The only console-less
+3. **A muted, idle machine** — the T14's steady state. The only console-less
    profile panics rather than idles, and every idling profile has a console
    draining for it. §5A.2 is read-verified for this reason.
 

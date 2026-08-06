@@ -217,6 +217,11 @@ impl IoUringInstance {
         let head = self.cq_header().head.load(Ordering::Acquire);
         self.cq_tail.get().wrapping_sub(head)
     }
+
+    /// Completions this ring has thrown away. Cumulative, never cleared.
+    fn dropped(&self) -> u32 {
+        self.cq_header().dropped.load(Ordering::Relaxed)
+    }
 }
 
 static IO_URINGS: Lock<Option<IdMap<RingId, IoUringInstance>>> = Lock::new(None);
@@ -297,6 +302,12 @@ fn cq_count(ring_id: RingId) -> Result<u32, SyscallError> {
     with_instance(ring_id, |inst| inst.cq_count())
 }
 
+/// What `enter` sees of a ring before deciding to park: how many completions
+/// are readable, and whether any have been thrown away.
+fn cq_state(ring_id: RingId) -> Result<(u32, u32), SyscallError> {
+    with_instance(ring_id, |inst| (inst.cq_count(), inst.dropped()))
+}
+
 /// Process SQEs and wait for completions. Called from the syscall handler.
 /// Returns the number of CQEs available after processing.
 pub fn enter(
@@ -321,13 +332,21 @@ pub fn enter(
     // registration can borrow it across the park without holding the table.
     let queue = waiters_of(ring_id)?;
     loop {
-        let count = cq_count(ring_id)?;
+        let (count, dropped) = cq_state(ring_id)?;
 
         if count >= min_complete || min_complete == 0 {
             return Ok(count);
         }
 
         if deadline == 1 {
+            return Ok(count);
+        }
+
+        // A ring that has thrown a completion away must not be slept on: the
+        // one this thread waits for may be the one discarded. Returning short
+        // puts the counter in front of `Poller::wait`'s assertion, which is
+        // otherwise read only after the call that blocks.
+        if dropped > 0 {
             return Ok(count);
         }
 
@@ -501,6 +520,9 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
             instance.pending_polls.push(new_pp);
         } else {
             instance.post_cqe(user_data, -(SyscallError::ResourceExhausted as i32), 0);
+            let queue = instance.waiters.clone();
+            drop(guard);
+            wake_all(&queue);
             return;
         }
 
@@ -588,12 +610,21 @@ fn process_close(ring_id: RingId, sqe: &IoUringSqe) {
     post_cqe_locked(ring_id, user_data, result as i32, 0);
 }
 
-/// Post a CQE, acquiring the IO_URINGS lock.
+/// Post a CQE and wake this ring's waiters.
+///
+/// The wake is not optional although every caller is the submitting thread: a
+/// ring is a process-wide object, and a sibling thread parked in `enter` on it
+/// never sees a completion nobody announced.
 fn post_cqe_locked(ring_id: RingId, user_data: u64, result: i32, flags: u32) {
     let guard = IO_URINGS.lock();
     let map = guard.as_ref().expect("io_uring not initialized");
-    if let Some(instance) = map.get(ring_id) {
+    let woken = map.get(ring_id).map(|instance| {
         instance.post_cqe(user_data, result, flags);
+        instance.waiters.clone()
+    });
+    drop(guard);
+    if let Some(queue) = woken {
+        wake_all(&queue);
     }
 }
 
@@ -652,6 +683,11 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
 /// there then read ready with nothing queued and blocked in `accept` forever.
 /// Found in the layout wizard's gate, where the wizard's fd 3 was the gate's
 /// listener; the compositor is exposed to exactly the same shape.
+///
+/// **Every cancellation is woken.** The ring belongs to a thread parked in
+/// `enter` on it — that is what a pending `POLL_ADD` means — and nothing else
+/// can end that park: the poll is gone, so the source's own close-path wake
+/// finds no watcher for it, and a `u64::MAX` wait never returns.
 pub fn remove_fd(sources: &[Option<Source>]) {
     let mut affected: Vec<RingId> = Vec::new();
     for source in sources.iter().flatten() {
@@ -671,22 +707,32 @@ pub fn remove_fd(sources: &[Option<Source>]) {
             .any(|&s| pp.read_source == Some(s) || pp.write_source == Some(s))
     };
 
+    let mut to_wake: Vec<Arc<KWaitQueue>> = Vec::new();
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     for ring_id in affected {
         if let Some(instance) = map.get_mut(ring_id) {
             // WatcherGuard drops with the poll → cleans the watcher lists.
             let mut i = 0;
+            let mut cancelled = false;
             while i < instance.pending_polls.len() {
                 if watches_a_closing_source(&instance.pending_polls[i]) {
                     let pp = instance.pending_polls.swap_remove(i);
                     // Post error CQE so userspace knows the poll was cancelled
                     instance.post_cqe(pp.user_data, -(SyscallError::NotFound as i32), 0);
+                    cancelled = true;
                 } else {
                     i += 1;
                 }
             }
+            if cancelled {
+                to_wake.push(instance.waiters.clone());
+            }
         }
+    }
+    drop(guard);
+    for queue in to_wake {
+        wake_all(&queue);
     }
 }
 

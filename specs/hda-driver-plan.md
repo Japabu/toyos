@@ -843,16 +843,31 @@ file had only argued:
    A's existing constants serve both backends.
 6. **Association is the codec's own statement** that the speaker and the jack
    are one output: both association 1, the jack last by sequence.
-7. **QEMU has no speaker pin, and that is H4's problem rather than H1's.**
+7. **QEMU has no speaker pin, so §2.3's rule is widened. Decided 2026-08-06.**
    Both `hda-output` and `hda-duplex` fix their configuration default at
-   line-out and no device property changes it, so §2.3's speaker rule refuses
-   the harness's own machine. `toyos-hda` asserts that refusal by name rather
-   than papering over it. H4 must choose: widen the rule to prefer speaker,
-   then headphone, then line-out — which changes nothing on the T14, where the
-   speaker is present and preferred, and is defensible as "an output that
-   reaches a human" — or let the QEMU arm test only the refusal and carry no
-   audio at all. **The first is recommended, and it is a policy change no stage
-   should make silently.**
+   line-out and no device property changes it, so a speaker-only rule refuses
+   the harness's own machine.
+
+   **The driver prefers speaker, then headphone-out, then line-out.** What
+   that states is *an output that reaches a human*, and a machine with no
+   speaker pin is a real configuration rather than a device to refuse — QEMU's
+   is one, a box with nothing but a jack on the back is another. It changes
+   nothing on the T14, where the speaker is present and comes first.
+
+   Two conditions on it, both met by `toyos-hda`:
+
+   - The order is **one named policy constant**, `path::OUTPUT_PREFERENCE`,
+     rather than a fallback chain through the traversal. Reversing it reds
+     three tests.
+   - **The refusal-by-name arm stays**, as the test of the *no output at all*
+     case. Display audio's pin is `DigitalOtherOut`, deliberately absent from
+     the preference, so a codec offering only that is still refused with every
+     codec address named.
+
+   What it changed in the crate beyond the constant: `OutputPath.speaker`
+   became `.output` with a `.device` beside it. A field named `speaker`
+   holding a line-out is the lie the comment rule is about, and a driver that
+   bound one has to be able to say so in its log.
 
 ---
 

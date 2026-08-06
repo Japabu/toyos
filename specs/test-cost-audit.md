@@ -272,6 +272,10 @@ these groups boot the same machine more than once:
 | 2 | `testcases` / `Headless` / plain | `iommu_discovery`, `metal_sim_input` |
 | 2 | `testcases` / `Metal` / plain | `i8042_health`, `i8042_undecoded_bytes` |
 
+Counts here are the measurement's, not a running total: `screen_pager_keys`
+(`testcases` / `Metal` / `test-late-panic`) has been added since and is a shape
+of its own, so it joins no group above and removes nothing.
+
 **12 boots removable, ~44 s (7%).** Note this is half what a coarser key
 suggests: grouping on `(config, profile, features)` alone shows 23 removable
 boots, and the difference is entirely `i8042: false`, `mute`, staged images and
@@ -1002,6 +1006,7 @@ nothing but a test can reach. Everything else keeps its own build.
 | `test-small-caches` | perturbing | moves both disk-cache ceilings |
 | `log-rotate-fast` | perturbing | moves `MAX_LOG_BYTES` |
 | `i8042-trace` | perturbing | a log line per drain |
+| `i8042-edge-race` | perturbing | widens one window in every scheduler pass |
 | `i8042-fault`, `i8042-budget-expired`, `i8042-fadt-denial`, `i8042-kbd-echo`, `i8042-fast-health` | perturbing | each changes what the probe or the ISR does on every boot |
 | `xhci-one-slot`, `xhci-deaf-controller`, `xhci-deaf-port`, `xhci-slow-connect`, `xhci-slow-storage-connect`, `xhci-portsc-rw1c`, `xhci-hid-break-*` | perturbing | each replaces a register or a completion on the live path |
 | `xhci-xecp-selftest`, `xhci-descriptor-selftest` | perturbing | run a walk at init |
@@ -1194,7 +1199,8 @@ the guest was never given is indistinguishable from one it lost. That is the
 whole defect behind two `Serial` registrations:
 
 - `i8042_mouse` at width 12 delivered 127 and then 209 of its thousand. QEMU's
-  PS/2 buffer silently drops a packet it has no room for.
+  PS/2 device sums the motion it has no room to queue rather than queueing it,
+  so the packets the host counted were never on the wire.
 - `xhci_second_controller` at width 4 delivered its four pointer events and lost
   all five keys.
 
@@ -1202,12 +1208,13 @@ whole defect behind two `Serial` registrations:
 line, so an injection can be driven by what the guest has printed.
 `run_test_hooked` is written in terms of it. Two users:
 
-- `i8042_mouse` keeps at most `MOUSE_LEAD` = 32 packets (96 bytes, against a
-  256-byte ring in the kernel and QEMU's buffer above it) ahead of confirmed
+- `i8042_mouse` keeps at most `MOUSE_LEAD` = 4 packets (12 bytes, inside QEMU's
+  16-byte `PS2_QUEUE_SIZE`, with a `const` assert saying so) ahead of confirmed
   arrivals. The verdict moved from *at least half of the thousand arrived* to
-  **all 1008 injected packets arrived**, plus `0 discarded`, `0 overruns`,
+  **every injected packet arrived**, plus `0 discarded`, `0 overruns`,
   `0 dropped`, `0 lost edges` off the driver's own line — counters that a
-  starved guest could previously have explained and now cannot.
+  starved guest could previously have explained and now cannot. The lead was 32
+  for its first year and that is what made the test flaky: known-issues §8.
 - `input_events_run` is the shared sequence of `metal_sim_input` and
   `xhci_second_controller` as a script whose every step waits for the guest to
   print what the step before it produced.

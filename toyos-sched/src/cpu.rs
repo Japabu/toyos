@@ -120,6 +120,46 @@ pub struct ParkedEntry<X: SchedPayload> {
     class: WaitClass,
 }
 
+/// One parked task as an outside reader sees it. The invariants want the key
+/// and the deadline; a blocked-task dump wants the payload and how long the
+/// park has lasted, and it is the only thing that can read them — a `CpuSched`
+/// is reachable from its own CPU alone.
+pub struct ParkedView<'a, X: SchedPayload> {
+    key: TaskKey,
+    entry: &'a ParkedEntry<X>,
+}
+
+impl<X: SchedPayload> ParkedView<'_, X> {
+    pub fn key(&self) -> TaskKey {
+        self.key
+    }
+
+    pub fn deadline(&self) -> Option<Nanos> {
+        self.entry.deadline
+    }
+
+    pub fn class(&self) -> WaitClass {
+        self.entry.class
+    }
+
+    /// When this park began.
+    pub fn since(&self) -> Nanos {
+        self.entry.task.since()
+    }
+
+    pub fn ext(&self) -> &X {
+        self.entry.task.ext()
+    }
+
+    pub fn is_rt(&self) -> bool {
+        self.entry.task.rt().is_rt()
+    }
+
+    pub fn shared_state(&self) -> TaskState {
+        self.entry.task.shared().state()
+    }
+}
+
 /// What context this CPU currently has loaded — the save target of the next
 /// switch. Distinct from `running`, which is `None` between a park and the
 /// switch that leaves the parked task's stack.
@@ -214,10 +254,8 @@ impl<X: SchedPayload> CpuSched<X> {
         &self.rq
     }
 
-    pub fn parked(&self) -> impl Iterator<Item = (TaskKey, Option<Nanos>, WaitClass)> + '_ {
-        self.parked
-            .iter()
-            .map(|(key, entry)| (*key, entry.deadline, entry.class))
+    pub fn parked(&self) -> impl Iterator<Item = ParkedView<'_, X>> + '_ {
+        self.parked.iter().map(|(key, entry)| ParkedView { key: *key, entry })
     }
 
     pub fn parked_task(&self, key: TaskKey) -> Option<&BlockedTask<X>> {

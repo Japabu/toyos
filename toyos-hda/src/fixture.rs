@@ -220,6 +220,17 @@ pub fn synthetic_unwired_first() -> Vec<Codec> {
     codec(vec![widget(0x10, 0x0000_041d, &[]), unwired, speaker_pin(0x21, &[0x10])])
 }
 
+/// A wired line-out at a *lower* node than a wired speaker, both traceable —
+/// the only arrangement in which walking `OUTPUT_PREFERENCE` differs from
+/// taking the first wired output.
+pub fn synthetic_line_out_first() -> Vec<Codec> {
+    let mut line_out = speaker_pin(0x20, &[0x10]);
+    // Jack, line-out, wired.
+    line_out.pin.as_mut().unwrap().config =
+        ConfigDefault::decode(Response::new(0x0101_1010).unwrap());
+    codec(vec![widget(0x10, 0x0000_041d, &[]), line_out, speaker_pin(0x21, &[0x10])])
+}
+
 /// A wired speaker pin whose connection list leads only to a mixer with
 /// nothing behind it.
 pub fn synthetic_dead_end() -> Vec<Codec> {

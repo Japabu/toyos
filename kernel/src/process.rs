@@ -311,6 +311,9 @@ impl ThreadEntry {
     pub fn sched(&self) -> Option<&ThreadSched> { self.sched.as_ref() }
     pub fn state(&self) -> ThreadLocation { self.state }
     pub fn name(&self) -> &[u8; 28] { &self.name }
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name).unwrap_or("?").trim_end_matches('\0')
+    }
     pub fn set_name(&mut self, name: &[u8]) {
         self.name = [0u8; 28];
         let len = name.len().min(28);
@@ -621,6 +624,55 @@ pub static PROCESS_TABLE: Lock<Option<ProcessTable>> = Lock::new(None);
 
 pub fn init() {
     *PROCESS_TABLE.lock() = Some(ProcessTable::new());
+}
+
+/// One thread as a diagnostic sees it: who it is, and what the scheduler's
+/// cross-CPU-readable face says about it.
+pub struct ThreadCensus<'a> {
+    pub pid: Pid,
+    pub tid: Tid,
+    pub process: &'a str,
+    pub thread: &'a str,
+    pub zombie: Option<i32>,
+    /// One of `sched::payload`'s `SCHED_*`. `None` is the window between the
+    /// table insert that allocates the tid and the `sched::spawn` that mints
+    /// the task — a thread that has no scheduler record cannot be scheduled,
+    /// which is a state worth naming rather than eliding.
+    pub sched: Option<u8>,
+    /// Zero means the thread has never executed a user instruction.
+    pub cpu_ns: u64,
+}
+
+/// Walk every thread in the table, or answer `false` because the table is
+/// held.
+///
+/// `try_lock` and not `lock`: the one time anybody asks is when the machine is
+/// stuck, and whatever holds this lock is a candidate for what is stuck.
+pub fn try_for_each_thread(mut f: impl FnMut(ThreadCensus<'_>)) -> bool {
+    let Some(guard) = PROCESS_TABLE.try_lock() else {
+        return false;
+    };
+    let Some(table) = guard.as_ref() else {
+        return false;
+    };
+    for (pid, proc) in table.iter() {
+        for (tid, thread) in proc.threads().iter() {
+            let sched = thread.sched();
+            f(ThreadCensus {
+                pid,
+                tid,
+                process: proc.name_str(),
+                thread: thread.name_str(),
+                zombie: match thread.state() {
+                    ThreadLocation::Zombie(code) => Some(code),
+                    ThreadLocation::Scheduled => None,
+                },
+                sched: sched.map(|s| s.sched_state()),
+                cpu_ns: sched.map_or(0, |s| s.handle.cpu_ns()),
+            });
+        }
+    }
+    true
 }
 
 /// Waitpid: collect a zombie child process. Removes process and ALL its threads.
