@@ -1226,10 +1226,105 @@ and it returns `Some(Event::Close)` — **every call, forever**
 inside `CloseRequested` was supposed to trip. The app spins on a core instead
 of leaving, which is also why nothing in the log marks the moment.
 
-The fix belongs in the fork (`Japabu/winit`, branch `toyos`): break out of the
-poll loop on `Close`, or test `exiting()` inside it. Both other arms of the
-same function — the `ControlFlow::Wait` and `WaitUntil` blocking paths at
-`:637` and `:707` — decode `Close` the same way and want the same look.
+**CLOSED in the tree, and the fix is the SDK's rather than the fork's.**
+`Window::poll_event` latches: `Close` is the last element of the stream and is
+delivered exactly once, so a caller that drains until `None` gets out. That
+makes the fork's loop correct as written, and it fixes every other client that
+drains the same way rather than winit alone. `desktop_window_child` and the
+fifth case of `compositor_client_death` gate it from the client side. A break
+on `Close` in the fork's poll loop is prepared but unpushed (owner task #150);
+it is now belt-and-braces rather than the fix.
+
+**The T14 confirms it.** In `boot8-snake.log` the owner closed snake's window
+with the X button and snake exited `code=0` — where before the latch it never
+exited at all. The `ControlFlow::Wait` and `WaitUntil` arms at `:637` and
+`:707` are the ones snake actually runs (`userland/snake/src/main.rs:351`,
+`:359`), and they are now tested rather than read: snake leaves on a close both
+on his machine and in `desktop_window_child`, three rounds, one of them played.
+
+**What that session leaves open is not snake.** 34 ms after snake exited the
+shell exited too, and 13 ms after that the terminal — so the owner got no
+prompt back. That is the next entry.
+
+### EXPECTED RED, pending #156 — `desktop_window_child` reproduces the machine freeze, and must stay `Sched::Parallel`
+
+**Read this before touching that test.** It is red on `main` today, on purpose,
+and the two obvious ways to make it green both destroy the only QEMU
+reproduction anybody has of #156.
+
+**The signature, precisely, because there are two different reds it can give.**
+The one that means #156 is a **total freeze of the guest**: a round opens
+snake, the shell echoes its prompt, and from that instant the guest emits
+*nothing at all* — not `exit: snake`, not a shell line, and **not the
+compositor's `compositor: frames=…` stats line, which had been arriving every
+~2 s until then**. The harness drains its full ceiling and appends nothing. The
+missing periodic line is the discriminator: any other failure of this test
+leaves output flowing and fails an assertion with the log still filling. If you
+see the test fail *with* serial output continuing, that is a different defect
+and this entry does not cover it.
+
+Independently hit 10/10 across four invocations by an agent trying to land
+unrelated documentation, in the 12-wide parallel phase, with the harness's
+re-run-alone pass reporting GREEN each time.
+
+**It stays `Sched::Parallel`, and `ALONE: GREEN` here is information rather
+than a misclassification.** The freeze needs contention to appear, so the
+classification that looks wrong is the one that reproduces it. `Sched::Serial`
+would make the suite green and take the reproduction with it. (The classifier
+is not trustworthy in general — the xHCI work established that `ALONE: red
+again` can measure the host rather than the tree — but in this direction, on
+this test, green-alone is real.)
+
+**Landing while it is red** uses `--land --gate cargo test -- --skip
+desktop_window_child`, which prints the override in the report and cannot be
+mistaken for an ordinary landing. `--skip` exists for this and should not grow
+other users.
+
+**What the test was built to chase is still open underneath it**, and is not
+the same thing: on `boot8-snake.log` the owner closed snake's window and got
+`exit: snake pid=10 code=0` at 121.659, `exit: shell pid=5 code=0` at 121.693,
+`exit: terminal pid=4 code=0` at 121.706. A shell that has reaped its
+foreground child prints a prompt; it does not exit. The harness has now shown
+the same three-process teardown after a window close — child `code=0`, then the
+shell, then the terminal — with a bare `window::Window` client and no winit
+anywhere, so it is not snake's and not the fork's.
+
+**Which of the two readings the evidence supports.** In the harness run the
+shell's prompt *is* on the serial log, between the child's exit and its own,
+mirrored by a terminal still inside its loop. So the shell reached its prompt
+and then went: the failure is the read *after* the prompt, not the prompt. That
+is "the shell exits instead of prompting" rather than "the chain is torn down
+child-first" — and it points at the shell's stdin, whose only writer is a
+terminal that was demonstrably still running. On the T14 the same window shows
+no prompt at all, which is the weaker evidence of the two and may simply be a
+line that never got flushed.
+
+**A confound that is not this.** Three of the owner's eight CPUs stop taking
+scheduler passes during a session and threads placed on them never run (§3,
+#142/#156). That produces processes which *hang*; the three here *exited*,
+promptly, with `code=0`. This entry must not be closed by it — though the
+freeze the test now reproduces is very likely that defect, which is the whole
+reason the test is worth keeping red.
+
+### OPEN — the compositor holds a window *index* across passes, and every removal invalidates it
+
+Found while reading the close path, not reproduced. `Interaction`
+(`userland/compositor/src/main.rs:825`) carries `window_idx: usize` in its
+`DragPending`, `Dragging` and `Resizing` variants, it survives between event
+loop passes, and the drag and resize arms index `windows[window_idx]` with no
+revalidation (`:1901`, `:1912`). Every path that shortens or reorders `windows`
+invalidates it: `remove` for the close button, GUI+Q and `MSG_DESTROY_WINDOW`,
+`retain` for the dead-client sweep, and `bring_to_front`'s remove-and-insert.
+
+Two consequences and a client can drive both, which is what makes it the same
+class as the grant that killed the desktop: a window removed *below* the
+dragged one moves the wrong window, and a window removed *at or above* the last
+index makes `windows[window_idx]` an out-of-bounds panic. A client that exits
+while the user is dragging is the whole of the reproduction.
+
+The fix is the one the same file already uses one line away —
+`last_title_click_fd: Option<Fd>` identifies a window by its `Fd` rather than
+its position — and it wants a gate that drops a window mid-drag.
 
 ### A syscall runs with interrupts masked, and only incidentally with preemption disabled
 
