@@ -263,6 +263,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
     ("metal_sim_null_audio", Sched::Serial),
+    ("null_sink_shipped_client", Sched::Serial),
     // Parallel, and this one is argued rather than assumed: not a verdict in it
     // is a wall-clock margin. The flood's size is asserted against the audio
     // callback's own period counter standing still, both playback checks are
@@ -4668,6 +4669,7 @@ fn run_machine_test(
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
+        "null_sink_shipped_client" => audio::null_sink_shipped_client(test_config, c_bins, rust_bins),
         "doom_sound_flood" => audio::doom_sound_flood(rust_bins),
         "metal_sim_compositor" => {
             metal_sim_compositor(group_boot(held, METAL_SIM_DESKTOP, || {
