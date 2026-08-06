@@ -112,6 +112,16 @@ impl WaitClass {
             Self::Other => 4,
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::Futex => "futex",
+            Self::Pipe => "pipe",
+            Self::Ipc => "ipc",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// Distinguishes one `prepare_wait` from the next on the same task, so a
@@ -601,6 +611,13 @@ impl<X: SchedPayload> Task<X> {
         &self.0.acct
     }
 
+    /// When the current residency began. For a blocked task that is the
+    /// instant it parked — the one number that says whether a wait is a
+    /// moment old or the whole boot.
+    pub fn since(&self) -> Nanos {
+        self.0.since
+    }
+
     /// The stable address of the saved context, for [`crate::cpu::RunToken`]:
     /// the record is boxed, so it outlives every container move the task makes.
     pub(crate) fn ctx_ptr(&mut self) -> *mut X::Ctx {
@@ -672,6 +689,10 @@ macro_rules! linear_state {
 
             pub fn acct(&self) -> &TaskAccounting {
                 self.0.acct()
+            }
+
+            pub fn since(&self) -> Nanos {
+                self.0.since()
             }
         }
     };

@@ -79,20 +79,53 @@ pub fn find(
     xecp_dwords: u32,
     id: u8,
 ) -> Result<Option<u64>, WalkError> {
+    let mut found = None;
+    walk(read, xecp_dwords, id, &mut |at| {
+        found = Some(at);
+        false
+    })?;
+    Ok(found)
+}
+
+/// Every capability with this id, in list order.
+///
+/// One id can legitimately appear more than once: a controller publishes one
+/// Supported Protocol capability per protocol, so taking the first is taking
+/// half the machine's description of itself.
+pub fn for_each(
+    read: &dyn Fn(u64) -> Option<u32>,
+    xecp_dwords: u32,
+    id: u8,
+    visit: &mut dyn FnMut(u64),
+) -> Result<(), WalkError> {
+    walk(read, xecp_dwords, id, &mut |at| {
+        visit(at);
+        true
+    })
+}
+
+/// The walk. `visit` says whether to keep going, so a caller that wants the
+/// first match stops the list exactly where it used to.
+fn walk(
+    read: &dyn Fn(u64) -> Option<u32>,
+    xecp_dwords: u32,
+    id: u8,
+    visit: &mut dyn FnMut(u64) -> bool,
+) -> Result<(), WalkError> {
     if xecp_dwords == 0 {
-        return Ok(None);
+        return Ok(());
     }
     let mut offset = xecp_dwords as u64 * 4;
     for _ in 0..MAX_CAPS {
         let Some(header) = read(offset) else {
             return Err(WalkError::OutOfWindow(offset));
         };
-        if header as u8 == id {
-            return Ok(Some(offset));
+        if header as u8 == id && !visit(offset) {
+            return Ok(());
         }
         let next = (header >> 8) & 0xFF;
         if next == 0 {
-            return Ok(None);
+            return Ok(());
         }
         // At least one dword forward, at most 255 — so the offset strictly
         // increases and cannot wrap, and the window check above is what ends
@@ -101,6 +134,9 @@ pub fn find(
     }
     Err(WalkError::TooMany)
 }
+
+/// Capability ID 2 — Supported Protocol (spec §7.2).
+pub const CAP_ID_PROTOCOL: u8 = 2;
 
 /// Ask firmware for the controller, and disable its SMIs whatever it answers.
 ///

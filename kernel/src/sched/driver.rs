@@ -578,8 +578,11 @@ fn drain_irqs() {
     // whichever driver's guard produced it: this walks the scheduler and logs
     // a line per parked thread, and both drivers are done above.
     if crate::keyboard::take_dump_request() {
-        crate::scheduler::dump_blocked();
+        super::dump::request();
     }
+    // A CPU cannot read a sibling's `CpuSched`, so the dump reaches every CPU
+    // by asking, and this is where each one answers.
+    super::dump::serve_if_owed();
 
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Net).is_some() {
         crate::net::wake_waiters();
@@ -696,14 +699,40 @@ pub fn parked_len() -> usize {
     try_with_cpu(|cpu| cpu.parked().count()).unwrap_or(0)
 }
 
-pub fn for_each_parked(
-    mut f: impl FnMut(TaskKey, Option<Nanos>, toyos_sched::task::WaitClass),
-) {
+/// The thread this CPU has loaded, if any.
+pub fn running_id() -> Option<TaskId> {
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().id)).flatten()
+}
+
+/// One parked task, flattened for a reader outside the scheduler.
+///
+/// Flattened here because a `ParkedView` borrows the `CpuSched`, and nothing
+/// outside this file may hold that borrow — that a CPU's state is reachable
+/// only from that CPU is the property the whole core is built on.
+pub struct ParkedInfo {
+    pub id: TaskId,
+    pub class: toyos_sched::task::WaitClass,
+    pub deadline: Option<u64>,
+    /// When the park began.
+    pub since: u64,
+    pub rt: bool,
+}
+
+/// Walk this CPU's parked tasks. `false` means a pass owns the state right
+/// now, and a diagnostic does not wait for one.
+pub fn for_each_parked(mut f: impl FnMut(ParkedInfo)) -> bool {
     try_with_cpu(|cpu| {
-        for (key, deadline, class) in cpu.parked() {
-            f(key, deadline, class);
+        for parked in cpu.parked() {
+            f(ParkedInfo {
+                id: parked.ext().id,
+                class: parked.class(),
+                deadline: parked.deadline().map(|n| n.0),
+                since: parked.since().0,
+                rt: parked.is_rt(),
+            });
         }
-    });
+    })
+    .is_some()
 }
 
 /// Tail of the first switch into a fresh task, called by

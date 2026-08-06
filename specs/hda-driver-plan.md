@@ -567,7 +567,7 @@ throughout.
 | Stage | Content | Size (est.) | Gate |
 |---|---|---|---|
 | **H0** | **Feasibility, on metal. No driver.** A kernel diagnostic behind a feature flag, present only in the diagnostic image, deleted at H9. It carries the comment `specs/device-test-strategy.md` requires of a kernel-feature actuator, and the reason nothing else can reach it is exact: **there is no way for a userland process to touch a codec before the capability of §4 exists, and the questions it answers are the ones that decide whether that capability will ever be given this device.** Two halves on one boot. **(a) Handoff**, for `00:1f.3`: its DMAR device scope, whether its isolation scope is a singleton given four sibling functions (§7 risk 1), whether it carries an RMRR, whether it offers MSI or MSI-X and how many vectors, BAR0's size/width/prefetchability and whether a 2 MiB relocation target exists, and the unit's `ECAP.SC` (§4.4 item 4). **(b) Codec**, using the immediate-command registers so it needs no DMA and no capability: release `GCTL.CRST`, read `GCAP`/`VMIN`/`VMAJ` and `STATESTS`, and for every codec present dump vendor and device id, every function group, every widget's capabilities and every pin's configuration default. Plus: log every i8042 scancode sequence that decodes to no key, and press the three volume keys. | ~120 + ~250 lines kernel | The log carries a named line per item, read off the panel and off `/log/kernel.log`. **If the isolation scope or an RMRR refuses the device, or `STATESTS` reads zero, this track stops here and is re-decided.** |
-| **H1** | **`toyos-hda`, the host-tested core.** Verb encode/decode, the graph model, `find_output_path`, `SDnFMT` encoding, BDL construction. No I/O. | ~1,500 lines Rust | `cargo test` in-crate, against three fixtures including **H0's dump of the T14's own codec**. §5.2's state-space attacks, each with teeth: deleting the cycle check must red the cyclic fixture, and deleting the speaker-pin preference must red the two-codec one. |
+| **H1** | **DONE — `toyos-hda`, the host-tested core.** Verb encode/decode, the graph model, `find_output_path`, `SDnFMT` encoding, BDL construction. No I/O. | ~1,500 lines Rust | `cargo test` in-crate, against three fixtures including **H0's dump of the T14's own codec**. §5.2's state-space attacks, each with teeth: deleting the cycle check must red the cyclic fixture, and deleting the speaker-pin preference must red the two-codec one. |
 | **H2** | **Prerequisites land.** Not HDA work: `iommu-spec.md` I3 and I4, `userspace-drivers-spec.md` stages 3 and 4. Shared with `wlan-plan.md` W5. **Proposes that stage 4's capability be staged against a second `intel-hda` rather than a second `virtio-net-pci`** (§4.2). | — | Those specs' own exit criteria |
 | **H3** | **The userspace audio backend seam, with virtio-sound as its first implementation.** soundd grows a backend trait and drives virtio-sound *from userland* through §4.4's capability. Deleted: `virtio_sound.rs`, `audio.rs`, `SYS_AUDIO_SUBMIT`, `SYS_AUDIO_POLL`, `DEVICE_AUDIO`, `AudioInfo`, `AudioCompletionRecord`, vector `0x23`. Closes `userspace-drivers-spec.md` stage 7. | ~1,200 lines Rust moved, **807 lines of kernel deleted** | **Gate A's thorough tier, `cargo test --test toyos-build -- --audio-gate 30`, same-session A/B against the pre-stage tree.** Same rule as a scheduler-migration transition and for the same reason. **This is the stage that can revert the direction, and it is deliberately before HDA exists.** |
 | **H4** | **HDA behind the same seam, in QEMU.** Reset, CORB/RIRB, enumeration, path selection from H1, stream + cyclic BDL, `SDnLPIB`-derived masks, zero-on-complete. New profiles: one HDA machine, one with two controllers, one whose codec has no speaker pin, one with a controller and no codec. | ~2,000 lines Rust | New gate-A arms (§5.3) with their own four baseline sections; `cargo test -- hda` for the shape configs. Teeth: removing the zero-on-complete write must red the phase-continuity check. |
@@ -802,6 +802,72 @@ keys' make and break fit in one boot. Read the `i8042:` lines:
   i8042**, they are an ACPI or WMI event, and H8's "three table entries and no
   ABI at all" premise is wrong. That is a finding for §4.4's rejected list, not
   a small fix.
+
+### 6.4 What H0's boot changed in H1, and the one thing it changed in H4
+
+H0 ran on the T14 on 2026-08-05. `STATESTS=0x0005`: an ALC257 at codec 0 and
+Intel display audio at codec 2. **§7 risk 2 is closed on this machine and
+§6.3's SOF/SoundWire branch does not fire.** The graph:
+
+```
+DAC 0x02 ──┬──> pin 0x14  fixed, speaker,  assoc 1 seq 0    ← internal speaker
+           └──> pin 0x21  jack,  hp-out,   assoc 1 seq 15   ← headphone
+DAC 0x03 ──────┘ (index 1 of 0x21 only)
+```
+
+`toyos-hda/` is built against it. Seven things the machine settled that this
+file had only argued:
+
+1. **EAPD is missing from §2.3 step 6 and is not optional.** Both output pins
+   report EAPD-capable and read the bit back clear at boot, so a path
+   configured exactly as step 6 describes makes no sound. `PinSetup::eapd`
+   carries the obligation.
+2. **Mute lives at the pin and gain at the converter, and they do not swap.**
+   The converter's amplifier has 88 steps of 0.75 dB and **bit 31 clear** — no
+   mute at all — while both pin amplifiers are mute-only with one step.
+   `AmpCaps::gain` is an `Option`, so there is no 0 dB index to write where
+   none exists.
+3. **The trap on this machine is pin 0x1b, not the display codec.** Four pins
+   call themselves speakers with no physical connection; 0x1b has a valid
+   connection list, an output amplifier, and traces to a converter perfectly.
+   Only port connectivity separates it from the real speaker. The display codec
+   sits at the *higher* address, so a first-match driver gets the right codec
+   here by luck — the rule stands, and this machine does not enforce it.
+4. **The traversal has no metal coverage.** Both output paths are depth 1, so
+   the cycle check, the depth bound and selector handling are exercised by
+   synthetic graphs and by nothing else. §5.2's fixtures are not a supplement;
+   they are the only coverage the general algorithm has.
+5. **Risk 8 is closed on both arms.** The T14's converter offers 44.1 kHz and
+   48 kHz at 16/20/24-bit; QEMU's offers 16 k–96 k at 16-bit. Both do 44.1 kHz
+   S16, so **§5.3 item 2's per-config physical scale is not needed** and gate
+   A's existing constants serve both backends.
+6. **Association is the codec's own statement** that the speaker and the jack
+   are one output: both association 1, the jack last by sequence.
+7. **QEMU has no speaker pin, so §2.3's rule is widened. Decided 2026-08-06.**
+   Both `hda-output` and `hda-duplex` fix their configuration default at
+   line-out and no device property changes it, so a speaker-only rule refuses
+   the harness's own machine.
+
+   **The driver prefers speaker, then headphone-out, then line-out.** What
+   that states is *an output that reaches a human*, and a machine with no
+   speaker pin is a real configuration rather than a device to refuse — QEMU's
+   is one, a box with nothing but a jack on the back is another. It changes
+   nothing on the T14, where the speaker is present and comes first.
+
+   Two conditions on it, both met by `toyos-hda`:
+
+   - The order is **one named policy constant**, `path::OUTPUT_PREFERENCE`,
+     rather than a fallback chain through the traversal. Reversing it reds
+     three tests.
+   - **The refusal-by-name arm stays**, as the test of the *no output at all*
+     case. Display audio's pin is `DigitalOtherOut`, deliberately absent from
+     the preference, so a codec offering only that is still refused with every
+     codec address named.
+
+   What it changed in the crate beyond the constant: `OutputPath.speaker`
+   became `.output` with a `.device` beside it. A field named `speaker`
+   holding a line-out is the lie the comment rule is about, and a driver that
+   bound one has to be able to say so in its log.
 
 ---
 

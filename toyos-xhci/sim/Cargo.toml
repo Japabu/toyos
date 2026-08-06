@@ -1,0 +1,15 @@
+[package]
+name = "toyos-xhci-sim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# `flaws` compiles the deliberate defects the negative gates need. The kernel
+# does not enable it, so no production path can reach one.
+toyos-xhci = { path = "..", features = ["std", "flaws"] }
+rand = { version = "0.9", features = ["small_rng"] }
+
+[lib]
+name = "toyos_xhci_sim"
+path = "src/lib.rs"
