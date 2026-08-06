@@ -5,6 +5,7 @@ pub mod image;
 pub mod land;
 pub mod libc;
 pub mod stamps;
+pub mod testargs;
 pub mod toolchain;
 pub mod worktree;
 
