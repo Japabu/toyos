@@ -557,3 +557,73 @@ ordering that could be constructed by reading it. `desktop_window_child` stays
 an expected red and is not evidence either way (known-issues §3). And nothing
 here says anything about the T14, where 3 of 8 CPUs missed a kick and this
 machine's 8 answered.
+
+### The freeze now carries its own capture (2026-08-06)
+
+`desktop_window_child` failing was, until now, a message and a log; every
+reading of #156 needed a human to be at the socket while the guest sat frozen.
+The test's probes moved into `window_child_probes` and every failure of it now
+returns through `freeze_report`, which asks the guest two questions in the one
+order that survives being asked: `info registers -a` over the human monitor
+first, then Ctrl+Alt+D and the blocked-task dump. A keystroke revives a halted
+CPU, so the other order answers about the repaired machine — which is exactly
+the caveat the 2026-08-06 capture had to carry.
+
+`qemu::QmpMonitor` is the human monitor; `Qmp::execute_capturing` keeps the
+reply that `execute` discards, since only `human-monitor-command` answers with
+anything.
+
+Verified by forcing the failure: 8 CPUs of registers and a whole dump reached
+the message, and the harness reported the forced reason as **not** one the
+`EXPECTED_FAILURES` entry covers, so the `says` list still has its teeth.
+
+### Eight boots on the fixed tree: no freeze, and one defect in front of it
+
+`desktop_window_child`, on `add6aeb`'s tree with the report above attached:
+two full-suite runs in the 12-wide phase and six runs alone. **Red every
+time, and not once the freeze.** Every capture shows the guest alive for the
+whole drain — `compositor: frames=…` every ~2 s, the kernel's stats every
+10 s, and the i8042 counter climbing to 4818 keys as the harness re-injected
+GUI+Q — where #156's signature is a guest that emits nothing at all. All eight
+vCPUs were `HLT=1 RFL=0x246` at the capture, which on a settled desktop is
+simply an idle machine.
+
+What every one of the eight shows instead is one shape:
+
+```
+[kernel 3.665] exit: test_rs_window_child pid=5 code=0 cpu=30ms
+WINDOW-CHILD-GONE
+[kernel 3.870] exit: shell pid=2 code=0 cpu=76ms
+/home/root> [kernel 3.876] exit: terminal pid=1 code=0 cpu=1786ms
+compositor: … windows=0
+```
+
+GUI+Q reaches the compositor, the window goes, the client leaves with `code=0`
+— and then the shell exits, and the terminal after it, so the desktop goes
+from two windows to none inside one 2 s stats interval. `close_focused_window`
+waits for `windows=1`, never sees it, and reports "GUI+Q never reached the
+compositor", which is the message known-issues §3 already says names the wrong
+thing. It is the shell-exit defect that entry describes, and it now fires at
+the *second* probe — the owner's case, a live client whose window is taken
+away — rather than only at the first.
+
+Six of the eight stop there. One of the alone runs got through
+to snake round 0 and produced the same shape with `exit: snake pid=7 code=0
+cpu=1224ms` in place of the client's line. So where the test stops varies with
+load; what happens does not.
+
+**This is what now blocks #156's QEMU reproduction.** The freeze was seen in a
+snake round; the desktop is torn down one or two probes earlier, so the test
+cannot reach the venue. The entry's `ALONE: GREEN` no longer holds either — 6
+of 6 alone are red.
+
+Not caused by the winit lock bump (`faf99eb7`, "stop draining a window that has
+closed"). Same-session A/B, alone: 3 runs at `be9ec72c` against 3 at
+`faf99eb7`, red on both sides with the same message and the same three exits
+inside 0.25 s of the client's. What the bump did change is visible in that one
+boot that got further — snake now *leaves* when its window is closed, `code=0`
+after 1224 ms of CPU, where #141 is a winit app that spins forever instead.
+
+Nor is it a regression from the deadline fix: `11a88f4` wrote those same three
+exits into known-issues at 17:32, and `add6aeb` landed at 18:05 and is not an
+ancestor of it.
