@@ -976,6 +976,12 @@ impl XhciController {
         if port_bit(&self.software_disabled, port_idx) {
             return raw & !PORTSC_PED;
         }
+        // A port that never finishes a reset does not read Enabled either — and
+        // on QEMU a SuperSpeed port reads Enabled the instant the register is
+        // touched. Without this the deaf port is one the driver correctly
+        // declines to reset, so the actuator stages nothing at all.
+        #[cfg(feature = "xhci-deaf-port")]
+        let raw = raw & !PORTSC_PED;
         raw
     }
 
