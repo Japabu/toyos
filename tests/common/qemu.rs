@@ -504,6 +504,14 @@ pub fn usb_device_id(i: usize) -> String {
     format!("usbdev{i}")
 }
 
+/// The boot stick's device id.
+///
+/// The data disks have carried one since a test first had to unplug one; the
+/// stick the machine booted from had none, so the one device whose removal
+/// takes `/boot` and `/log` with it was the one the host could not name — which
+/// is the removal the owner's machine dies on.
+pub const BOOT_STICK_ID: &str = "bootstick";
+
 /// What every profile but [`Profile::MetalDisk`] gives the guest. Large
 /// enough for a filesystem, small enough that a boot formats it quickly.
 const NVME_SMALL: u64 = 128 * 1024 * 1024;
@@ -2033,7 +2041,7 @@ fn qemu_command(
 
     qemu.arg("-device")
         .arg(format!(
-            "usb-storage,bus={},drive=stick,bootindex=0",
+            "usb-storage,bus={},drive=stick,id={BOOT_STICK_ID},bootindex=0",
             shape.storage_bus
         ))
         .arg("-vga")
