@@ -210,7 +210,9 @@ Read the spec before touching the subsystem it covers.
 
 **`specs/known-issues.md` is the list and the file to update** — ten sections, every open item with its evidence and its reproduction. Read it before touching a subsystem. Nothing is duplicated here.
 
-Six bite an agent who is *not* working on the subsystem:
+Seven bite an agent who is *not* working on the subsystem:
+
+- **`desktop_window_child` is red on `main` on purpose, pending #156.** It is the only QEMU reproduction of the machine freeze, it needs the parallel phase's contention to fire, and `ALONE: GREEN` under it is information rather than a misclassification. Do not reclassify it, do not delete it: land past it with `--land --gate cargo test -- --skip desktop_window_child`. The freeze's signature — the guest emits *nothing further at all*, including the compositor's ~2 s stats line — is what tells it from any other red in that test; known-issues §3 has both.
 
 - **Gate A's fast tier reds intermittently, on `main` as much as on your branch.** `audio_tone_load (smp=1)`: four red runs and three green in one session, with the same tree on both sides of the line. Before believing it is yours, stash and re-run — known-issues §4 has that A/B and the numbers.
 
