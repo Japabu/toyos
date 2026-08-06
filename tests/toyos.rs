@@ -8612,6 +8612,34 @@ fn main() {
         host_budget =
             n.parse().unwrap_or_else(|_| panic!("--host-slots: {n:?} is not a budget"));
     }
+    // Tests this run must not attempt, by exact name.
+    //
+    // **For a red that is expected and understood, and for nothing else.** It
+    // exists because the alternative was worse: `desktop_window_child`
+    // reproduces #156, a freeze that needs contention to appear, and the ways
+    // to make a landing green without it are to reclassify the test —
+    // destroying the reproduction — or to delete it. Naming it here leaves the
+    // test running for everyone who is not landing, and makes the exclusion a
+    // string somebody has to type and justify rather than a property of the
+    // test. `--land --gate` prints whatever it was given, so a landing that
+    // used this cannot look like one that did not.
+    let mut skip: Vec<String> = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let n = if let Some(v) = a.strip_prefix("--skip=") {
+            consumed.push(i);
+            v
+        } else if a == "--skip" {
+            consumed.push(i);
+            consumed.push(i + 1);
+            args.get(i + 1)
+                .map(|s| s.as_str())
+                .unwrap_or_else(|| panic!("--skip needs a test name, e.g. --skip audio_tone"))
+        } else {
+            continue;
+        };
+        skip.push(n.to_string());
+    }
+
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
 
     // For the whole run, and outermost: a `--claim-sysroot` in another worktree
@@ -8704,33 +8732,30 @@ fn main() {
     }
 
     let all_tests = build_test_registry(&rust_bins, &c_compiled);
-    let tests_to_run: Vec<&TestDef> = match filter {
-        Some(f) => all_tests.iter().filter(|t| t.name.contains(f)).collect(),
-        None => all_tests.iter().collect(),
+    let keep = |name: &str| {
+        filter.map_or(true, |f| name.contains(f)) && !skip.iter().any(|s| s == name)
     };
-    let audio_to_run: Vec<&str> = AUDIO_TESTS
-        .iter()
-        .copied()
-        .filter(|n| filter.map_or(true, |f| n.contains(f)))
-        .collect();
-    let screen_to_run: Vec<(&str, Sched)> = SCREEN_TESTS
-        .iter()
-        .copied()
-        .filter(|(n, _)| filter.map_or(true, |f| n.contains(f)))
-        .collect();
-    let machine_to_run: Vec<(&str, Sched)> = MACHINE_TESTS
-        .iter()
-        .copied()
-        .filter(|(n, _)| filter.map_or(true, |f| n.contains(f)))
-        .collect();
+    let tests_to_run: Vec<&TestDef> =
+        all_tests.iter().filter(|t| keep(t.name.as_str())).collect();
+    let audio_to_run: Vec<&str> =
+        AUDIO_TESTS.iter().copied().filter(|n| keep(n)).collect();
+    let screen_to_run: Vec<(&str, Sched)> =
+        SCREEN_TESTS.iter().copied().filter(|(n, _)| keep(n)).collect();
+    let machine_to_run: Vec<(&str, Sched)> =
+        MACHINE_TESTS.iter().copied().filter(|(n, _)| keep(n)).collect();
 
     if tests_to_run.is_empty()
         && audio_to_run.is_empty()
         && screen_to_run.is_empty()
         && machine_to_run.is_empty()
     {
-        eprintln!("No tests match filter {:?}", filter);
+        eprintln!("No tests match filter {filter:?} (skipping {skip:?})");
         std::process::exit(1);
+    }
+    if !skip.is_empty() {
+        // Loud, and on every run that uses it: a suite that quietly declined
+        // to run something is a suite that reports on less than it says.
+        eprintln!("[toyos] NOT RUN, by --skip: {}", skip.join(", "));
     }
 
     let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");

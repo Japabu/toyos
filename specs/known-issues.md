@@ -1246,46 +1246,65 @@ on his machine and in `desktop_window_child`, three rounds, one of them played.
 shell exited too, and 13 ms after that the terminal — so the owner got no
 prompt back. That is the next entry.
 
-### OPEN — the shell went with the windowed child it was waiting for, and the harness will not reproduce it
+### EXPECTED RED, pending #156 — `desktop_window_child` reproduces the machine freeze, and must stay `Sched::Parallel`
 
-From `boot8-snake.log`: `exit: snake pid=10 code=0` at 121.659, `exit: shell
-pid=5 code=0` at 121.693, `exit: terminal pid=4 code=0` at 121.706. A shell
-that has reaped its foreground child prints a prompt; it does not exit.
+**Read this before touching that test.** It is red on `main` today, on purpose,
+and the two obvious ways to make it green both destroy the only QEMU
+reproduction anybody has of #156.
 
-**Not reproducible here, and the attempts are the finding.**
-`desktop_window_child` runs the whole chain — compositor, terminal, shell — and
-ends a windowed child four ways: a bare `window::Window` that exits by itself,
-the same client with the compositor taking its window away while it is alive,
-and snake three times, the last after eight turns of play. At smp=2 and at the
-T14's smp=8. **The shell answers again every time.** So neither "a windowed
-child exited" nor "the compositor closed a child's window" is sufficient on its
-own, and the trigger is something his session had that this does not.
+**The signature, precisely, because there are two different reds it can give.**
+The one that means #156 is a **total freeze of the guest**: a round opens
+snake, the shell echoes its prompt, and from that instant the guest emits
+*nothing at all* — not `exit: snake`, not a shell line, and **not the
+compositor's `compositor: frames=…` stats line, which had been arriving every
+~2 s until then**. The harness drains its full ceiling and appends nothing. The
+missing periodic line is the discriminator: any other failure of this test
+leaves output flowing and fails an assertion with the log still filling. If you
+see the test fail *with* serial output continuing, that is a different defect
+and this entry does not cover it.
 
-**The evidence favours the terminal breaking first, not the shell deciding to
-go.** The terminal mirrors everything the shell writes to the serial log, and
-between snake's exit and the shell's there is **no prompt on serial** — the
-last one is `/home/root> n snake` before it and the next is from the
-replacement terminal a second later. A shell that reached its prompt would have
-written it, and a terminal still in its loop would have mirrored it. What fits
-the silence is the terminal already being out of its loop: it drops
-`shell_stdin`, the shell's next read is EOF, `readline` returns `None`, and the
-shell breaks and exits — with its prompt written into a pipe nobody was
-reading. The terminal's own `exit:` comes last in both readings because
-`child.wait()` is the statement after the loop.
+Independently hit 10/10 across four invocations by an agent trying to land
+unrelated documentation, in the 12-wide parallel phase, with the harness's
+re-run-alone pass reporting GREEN each time.
 
-That leaves the terminal's two exits from that loop, and neither is explained:
-`shell_stdout` reading 0 needs the shell's stdout to lose its last writer while
-the shell still holds it, and `window::Event::Close` needs the compositor to
-have closed *the terminal's* connection when only one window was removed.
-`decode_event`'s `_ => Event::Close` (`userland/window/src/lib.rs`) turns any
-message type the terminal does not know into a close, which is the cheapest way
-for the second to happen by accident.
+**It stays `Sched::Parallel`, and `ALONE: GREEN` here is information rather
+than a misclassification.** The freeze needs contention to appear, so the
+classification that looks wrong is the one that reproduces it. `Sched::Serial`
+would make the suite green and take the reproduction with it. (The classifier
+is not trustworthy in general — the xHCI work established that `ALONE: red
+again` can measure the host rather than the tree — but in this direction, on
+this test, green-alone is real.)
 
-**A live confound, and it is not this.** Three of the owner's eight CPUs stop
-taking scheduler passes during a session and threads placed on them never run
-(§3, #142). That produces processes which *hang*; all three of these *exited*,
-promptly and with `code=0`. It cannot be read as the explanation here, and this
-entry should not be closed by it.
+**Landing while it is red** uses `--land --gate cargo test -- --skip
+desktop_window_child`, which prints the override in the report and cannot be
+mistaken for an ordinary landing. `--skip` exists for this and should not grow
+other users.
+
+**What the test was built to chase is still open underneath it**, and is not
+the same thing: on `boot8-snake.log` the owner closed snake's window and got
+`exit: snake pid=10 code=0` at 121.659, `exit: shell pid=5 code=0` at 121.693,
+`exit: terminal pid=4 code=0` at 121.706. A shell that has reaped its
+foreground child prints a prompt; it does not exit. The harness has now shown
+the same three-process teardown after a window close — child `code=0`, then the
+shell, then the terminal — with a bare `window::Window` client and no winit
+anywhere, so it is not snake's and not the fork's.
+
+**Which of the two readings the evidence supports.** In the harness run the
+shell's prompt *is* on the serial log, between the child's exit and its own,
+mirrored by a terminal still inside its loop. So the shell reached its prompt
+and then went: the failure is the read *after* the prompt, not the prompt. That
+is "the shell exits instead of prompting" rather than "the chain is torn down
+child-first" — and it points at the shell's stdin, whose only writer is a
+terminal that was demonstrably still running. On the T14 the same window shows
+no prompt at all, which is the weaker evidence of the two and may simply be a
+line that never got flushed.
+
+**A confound that is not this.** Three of the owner's eight CPUs stop taking
+scheduler passes during a session and threads placed on them never run (§3,
+#142/#156). That produces processes which *hang*; the three here *exited*,
+promptly, with `code=0`. This entry must not be closed by it — though the
+freeze the test now reproduces is very likely that defect, which is the whole
+reason the test is worth keeping red.
 
 ### OPEN — the compositor holds a window *index* across passes, and every removal invalidates it
 
