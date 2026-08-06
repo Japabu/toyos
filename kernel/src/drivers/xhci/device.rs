@@ -6,7 +6,7 @@ use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
 use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, TRB_EVALUATE_CONTEXT};
 use super::CC_SUCCESS;
-use super::{PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC};
+
 use super::hid::{HidType, HidRole, HidDevice};
 use super::msc::MscInterface;
 
@@ -317,12 +317,12 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
 /// the whole reason the runtime path must not hold a scheduler pass across it.
 pub fn begin_reset(ctrl: &mut XhciController, port_idx: u8) {
     let portsc = ctrl.read_portsc(port_idx);
-    ctrl.write_portsc(port_idx, super::portsc_neutral(portsc) | PORTSC_PR);
+    ctrl.write_portsc(port_idx, portsc.neutral().resetting());
 }
 
 /// Whether the port has finished the reset it was asked for.
 pub fn reset_done(ctrl: &XhciController, port_idx: u8) -> bool {
-    super::PORT_ANSWERS && ctrl.read_portsc(port_idx) & PORTSC_PRC != 0
+    super::PORT_ANSWERS && ctrl.read_portsc(port_idx).reset_changed()
 }
 
 /// Initialize and configure one USB device on a port. `Some(slot)` is a slot
@@ -337,7 +337,7 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
     // logged.
     if !super::settles(|| reset_done(ctrl, port_idx)) {
         log!("xHCI: port {} never finished its reset (PORTSC {:#010x}); skipping it",
-            port_idx + 1, ctrl.read_portsc(port_idx));
+            port_idx + 1, ctrl.read_portsc(port_idx).raw());
         return None;
     }
     configure(ctrl, port_idx)
@@ -352,15 +352,15 @@ pub fn init_device(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
 /// told about one it would otherwise have no name for.
 pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
     let portsc = ctrl.read_portsc(port_idx);
-    ctrl.write_portsc(port_idx, super::portsc_neutral(portsc) | PORTSC_PRC);
+    ctrl.write_portsc(port_idx, portsc.neutral().acknowledging_reset());
 
     let portsc = ctrl.read_portsc(port_idx);
-    if portsc & PORTSC_PED == 0 {
-        log!("xHCI: port {} reset but not enabled (PORTSC {portsc:#010x}); skipping it",
-            port_idx + 1);
+    if !portsc.enabled() {
+        log!("xHCI: port {} reset but not enabled (PORTSC {:#010x}); skipping it",
+            port_idx + 1, portsc.raw());
         return None;
     }
-    let speed = ((portsc >> 10) & 0xF) as u8;
+    let speed = portsc.speed();
     log!("xHCI: port {} reset, speed={}", port_idx + 1, speed);
     let Some(initial_packet) = initial_ep0_packet(speed) else {
         log!("xHCI: port {} came up at speed {speed}, which is not a speed this driver has a \
@@ -667,7 +667,7 @@ pub fn scan_ports(ctrl: &mut XhciController) {
         // from a '1' to a '0'". QEMU fills it in from the QOM tree before any
         // reset, so a line printing it here reads as fact on QEMU and as noise
         // on hardware. The `port N reset, speed=` line below is the valid one.
-        if ctrl.read_portsc(p) & PORTSC_CCS != 0 {
+        if ctrl.read_portsc(p).connected() {
             log!("xHCI: port {} connected", p + 1);
             let slot = init_device(ctrl, p);
             ctrl.port_bound(p, slot);

@@ -301,10 +301,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
     //
-    // None of the three measures a rate. `i8042_mouse` sends each pointer
-    // packet only once the guest has printed the one before it, so a guest with
-    // less of the host is a longer run and not a smaller count; the keystrokes
-    // above it put fewer bytes in flight than QEMU's controller holds.
+    // None of the three measures a rate. All three keep fewer bytes in flight
+    // than QEMU's PS/2 device holds — `i8042_mouse` by pacing against the
+    // guest's own report, within [`MOUSE_LEAD`] — so a guest with less of the
+    // host is a longer run and not a smaller count.
     ("i8042_keyboard", Sched::Parallel),
     ("i8042_no_spurious_wake", Sched::Parallel),
     ("i8042_mouse", Sched::Parallel),
@@ -3975,24 +3975,43 @@ fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
     Ok(())
 }
 
+/// QEMU's `PS2_QUEUE_SIZE` (`hw/input/ps2.c`) — what the device will hold. Not
+/// the 256-byte `PS2_BUFFER_SIZE` array behind it, which is a migration format
+/// and not a capacity.
+const QEMU_PS2_QUEUE: usize = 16;
+
+/// A PS/2 pointer packet. Three bytes, because the driver's aux init sends no
+/// IntelliMouse knock and QEMU therefore frames a plain mouse.
+const MOUSE_PACKET: usize = 3;
+
 /// How far the host may run ahead of the guest while it feeds the framer.
 ///
-/// Ninety-six bytes, against a 256-byte ring in the kernel and QEMU's PS/2
-/// buffer above it: neither can fill however little of the host the guest is
-/// getting, which is what makes `0 dropped` on the driver's counters a
-/// statement about the driver.
-const MOUSE_LEAD: usize = 32;
+/// A packet the guest has reported is a packet whose bytes have left the
+/// device's queue, so the lead bounds that queue's occupancy — which is the
+/// only thing that makes an injected command a packet. Past the bound QEMU
+/// stops queueing motion and starts *accumulating* it, and the merged deltas
+/// come back as one packet or, if they cancel, as none at all.
+const MOUSE_LEAD: usize = 4;
+
+const _: () = assert!(
+    MOUSE_PACKET * MOUSE_LEAD <= QEMU_PS2_QUEUE,
+    "the lead outruns QEMU's PS/2 queue, which merges the motion it cannot hold"
+);
+
+/// Moves the staged merge puts in one command: more than one, and few enough
+/// that their sum stays inside the packet's signed byte.
+const MERGE_MOTIONS: usize = 4;
 
 /// The TrackPoint path, and a thousand packets through the framer after it,
 /// each sent only once the one before it has come out of the guest.
 ///
-/// The pacing is the design. QEMU's PS/2 buffer silently drops a packet it has
-/// no room for, so a host injecting at its own speed measures how fast the
-/// guest drains and reads the shortfall as a driver defect. Staying behind the
-/// guest's own report leaves no loss to tolerate: every packet injected is a
-/// packet that arrived, or the run stalls and says how far it got. It is also
-/// what makes the driver's `discarded`/`dropped` counters mean something a
-/// slow guest cannot account for.
+/// The pacing is the design, and [`MOUSE_LEAD`] is what makes it one: a host
+/// injecting at its own speed measures how fast the guest drains and reads the
+/// shortfall as a driver defect. Staying inside what the device holds leaves no
+/// loss to tolerate: every packet injected is a packet that arrived, or the run
+/// stalls and says how far it got. It is also what makes the driver's
+/// `discarded`/`dropped` counters mean something a slow guest cannot account
+/// for.
 fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
     let qemu = &mut boot.qemu;
     let boot = qemu.boot_log().to_string();
@@ -4007,6 +4026,7 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
         let mut input: Option<qemu::QmpInput> = None;
         let mut burst = 0usize;
         let mut clicked = false;
+        let mut merged = false;
         let mut counted = false;
         let mut ended = false;
         qemu.run_test_paced("test_rs_i8042_mouse", Duration::from_secs(60), |socket, line| {
@@ -4049,6 +4069,15 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
                 clicked = true;
                 return;
             }
+            // What [`MOUSE_LEAD`] exists to stay clear of, staged where it can
+            // do no harm: the queue is empty here, so the merge is the device's
+            // one-sync-per-command rule and nothing else.
+            if !merged {
+                input.mouse_merged(1, MERGE_MOTIONS);
+                injected.set(injected.get() + 1);
+                merged = true;
+                return;
+            }
             // The driver reports its counters from a scheduler pass, and the
             // client polling its fd is what keeps passes running: the line has
             // to arrive before the client is told to stop.
@@ -4074,13 +4103,27 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
     }
 
     let events = parse_mouse_events(&result.stdout);
-    // The host sent none of these until the one before it had arrived, so a
-    // shortfall is a packet the machine lost and never a host that outran it.
+    // The host never had more outstanding than the device holds, so a shortfall
+    // is a packet the machine lost and never a host that outran it.
     if events.len() != injected {
         return Err(format!(
-            "{} pointer events reached userland out of {injected} packets injected, each one \
-             paced against the arrival of the last",
-            events.len()
+            "{} pointer events reached userland out of {injected} packets injected, never more \
+             than {MOUSE_LEAD} of them ({} bytes) outstanding against a {QEMU_PS2_QUEUE}-byte \
+             device queue",
+            events.len(),
+            MOUSE_LEAD * MOUSE_PACKET,
+        ));
+    }
+    // The step one packet moves the pointer, off the first two of the burst.
+    let step = (events[5].x as i32 - events[4].x as i32).abs();
+    // Third from last: the staged merge, then the right button's two halves.
+    let merge = events.len() - 3;
+    let jump = (events[merge].x as i32 - events[merge - 1].x as i32).abs();
+    if step == 0 || jump != step * MERGE_MOTIONS as i32 {
+        return Err(format!(
+            "{MERGE_MOTIONS} moves in one command moved the pointer {jump} against a one-move \
+             step of {step}: QEMU no longer sums motion between syncs, and `MOUSE_LEAD` is \
+             derived from the fact that it does"
         ));
     }
     // A sign error in dy is invisible to any test that only checks

@@ -51,7 +51,15 @@ test-screen-graffiti = []
 # a counter line every 10 s, and a member of the trace group reads those
 # counters. Bundled rather than asked for at the call site because a kernel
 # build is keyed on the feature set, and a second set is a second kernel.
-i8042-trace = ["i8042-fast-health"]
+i8042-trace = ["i8042-fast-health", "i8042-edge-race"]
+# Hold a scheduler pass between reading the source's `irq_ring` record and
+# reading its byte ring, so an interrupt lands in between and the pass sees
+# bytes it has been told nothing about. Unwidened that window is a handful of
+# instructions on one CPU: no injection the harness can time and no load it can
+# stage reaches it. Bundled into `i8042-trace` for that feature's own reason —
+# the trace group is the only boot that counts interrupts against bytes, and a
+# second feature set is a second kernel build.
+i8042-edge-race = []
 # Make the ISR's output-buffer check lie, so its 16-byte bound trips and the
 # quarantine path runs. A controller that chatters forever is the one case the
 # bound alone still lets livelock a CPU, and nothing else can stage it.
@@ -311,6 +319,7 @@ toyos-fat32 = { path = "../toyos-fat32" }
 toyos-gpt = { path = "../toyos-gpt" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
+toyos-xhci = { path = "../toyos-xhci" }
 rustc-demangle = "0.1"
 elf = { version = "0.8", default-features = false }
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }

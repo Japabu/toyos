@@ -2430,27 +2430,16 @@ the moment each was re-run by itself in the same process. None predates or was
 introduced by the parallel-width work; all have been `Sched::Parallel` since the
 phase landed, and none reproduces on a host running one suite.
 
-- **`i8042_mouse`** — REOPENED 2026-08-05, and the closing argument is the thing
-  that is wrong. It read: the injection is paced against the guest's own report
-  of each packet, "so nothing the host does can outrun the guest". Outrunning is
-  not the failure mode left. The host now *stalls* — it waits for a packet the
-  guest never delivers and the test times out at 60 s:
-
-      FAIL i8042_mouse: timed out after 60s — 271 of the 303 packets injected
-      came back out, so the host stalled on one the machine never delivered
-
-  Pacing converted a lost packet from a miscount into a deadlock, so the verdict
-  is now a wall-clock timeout wearing a count's clothes. Measured on a loaded
-  host (four worktrees), alternating one checkout against the other in one
-  session, six runs: **main FAIL(271/303), PASS(3s), PASS(3s); a branch that
-  touches no input code FAIL(976/1004), FAIL(813/845), PASS(3s), PASS(4s)**. It
-  reds on `main` as readily as anywhere else, so it is not attributable to
-  whatever branch happens to be under it, and a green run costs 3 s against a
-  red one's 60 s. The prior text also predates §3's finding below, which says
-  the pacing argument never covered `0 lost edges` either.
-
-  Anyone whose suite reds here: re-run it alone before believing it, and if it
-  goes green the classification is the bug rather than your change.
+- **`i8042_mouse`** — CLOSED 2026-08-06. Both red modes were the harness and
+  neither was ever the driver losing a packet; §8's entry carries the mechanism,
+  the measurements and the two gates that now hold each half. The short version:
+  the pacing lead was 32 packets — 96 bytes — against QEMU's 16-byte
+  `PS2_QUEUE_SIZE`, so a host that got ahead of the guest made QEMU *sum* the
+  motion it had no room to queue, and a summed pair that cancels reaches
+  userland as nothing at all. The lead is now 4 packets with a `const` assert
+  against the device's queue, and the lost-edge counter no longer fires on a
+  pass that read the `irq_ring` record a few instructions before the ISR
+  published it.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
@@ -2488,6 +2477,38 @@ used to name as the closing move now exists (`buildlock::guest_slot`,
 `specs/test-cost-audit.md` §5.6): the host admits twelve guests across every
 worktree, so the four-suite regime these were observed in cannot recur. A looser
 assertion is still not the answer.
+
+**But `ALONE … red again — the defect is real` is not evidence, and the protocol
+above leans on it.** The re-run happens inside the same process, moments after
+twelve guests have been torn down and while another worktree's suite may still
+own the host — so it is alone in the suite's bookkeeping and not on the machine.
+Measured 2026-08-06 on the xHCI port-machine branch, whose kernel delta is
+`drivers/xhci/` and touches no PS/2 and no compositor path:
+
+```
+full suite, run 1 (483.7 s for 262 tests):
+  FAIL i8042_mouse — 975 of 1004;  ALONE: GREEN
+  FAIL screen_early_panic;         ALONE: GREEN
+full suite, run 2, the landing gate (512.1 s):
+  FAIL i8042_mouse — 560 of 592;   ALONE: red again — the defect is real
+  FAIL desktop_locale_detect;      ALONE: red again — the defect is real
+then, genuinely alone, same session, minutes later:
+  main         a051a67:  i8042_mouse PASS 10.4 s   desktop_locale_detect PASS 11.4 s
+  the branch   38431c7:  i8042_mouse PASS  4.1 s   desktop_locale_detect PASS  5.6 s
+```
+
+Both trees green on both tests with the host to themselves, and the same suite
+that took 120.4 s at the last quiet landing took 484 and 512 s in these two — so
+the host was carrying roughly four times its own load throughout, the `ALONE`
+re-run included. A verdict that flips between "GREEN, it is the host" and "red
+again, the defect is real" for one test on one tree twenty minutes apart is
+measuring the host in both directions.
+
+Consequence for the protocol: `ALONE: GREEN` still means what it says, because a
+green cannot be produced by load. `ALONE: red again` means nothing on its own
+and must be confirmed against `main` in the same session before it is believed —
+which is the A/B the audio rules already require and which this line currently
+invites an agent to skip.
 
 ### A whole parallel phase can be starved by another agent's build
 
@@ -3053,79 +3074,67 @@ choice survives a login and not a reboot.
 
 ## 8. Hardware and performance gaps
 
-### `i8042_mouse`'s pacing argument covers its count and not its `0 lost edges`
+### `i8042_mouse`: closed — the host outran QEMU's PS/2 queue, twice over
 
-Red in the wide phase, green alone, on a tree whose only kernel change was the
-scanout's memory type:
+Both red modes are fixed and both were the harness. Neither was ever a packet
+the driver lost.
 
-```
-FAIL i8042_mouse: 1008 packets, none of them sent before the one before it
-arrived, and the driver does not report `0 lost edges`:
-  i8042: 1942 interrupts, 3056 bytes, 24 keys, 1006 motion, 12 undecoded,
-         0 discarded, 0 overruns, 0 dropped, 1 lost edges
-```
+**The count.** `MOUSE_LEAD` let the host hold 32 packets — 96 bytes — injected
+but unreported, and justified it against "a 256-byte ring in the kernel and
+QEMU's PS/2 buffer above it". That 256 is `PS2_BUFFER_SIZE`, the migration
+array; the enforced capacity is `PS2_QUEUE_SIZE`, **16 bytes**
+(`hw/input/ps2.c`, checked against QEMU v11.0.0, the version this host runs).
+`ps2_mouse_send_packet` emits only while `PS2_QUEUE_SIZE - count >= 3` and
+returns 0 otherwise, and `ps2_mouse_event` keeps accumulating `mouse_dx` while
+it does — so a host past the queue does not lose a packet, it makes QEMU **sum**
+several into one. The burst alternates +1/-1, so a summed pair is a packet with
+`dx == 0`, and `mouse::handle_motion` queues nothing for a report that moves the
+pointer nowhere with no button change. **Two injected, none delivered** — which
+is why every observed shortfall was even (996/1004, 1002/1004) and why the
+stalls sat at a deficit of exactly 32: losses accumulate until the lead is full
+and the host never injects again.
 
-Alone, the same guest: 2014 interrupts, the same 1006 motion events, `0 lost
-edges`. `main` at 91796eb ran it green in the wide phase with 1995 interrupts —
-so it is marginal rather than broken, and it is not the scanout change, which
-touches no port I/O.
+Reproduced by pipelining QMP commands without awaiting their replies, which is
+what an oversubscribed host does to the vCPU thread by accident. Floods of
+4/8/16/32/64/128/256 back-to-back packets, two sweeps in one boot:
 
-The `Sched::Parallel` beside it argues that "none of the three measures a rate"
-because each packet is sent only after the guest prints the one before it. That
-is correct about the *count*, and all 1006 arrived in both runs. It does not
-reach the other assertion: `lost edges` is not a delivery figure but the
-driver's own count of a counter line repeating without an interrupt having
-arrived — an edge the pin asserted and nothing delivered. Twelve guests on
-fourteen cores can produce one of those without any packet being lost, which is
-exactly the shape seen.
+    [4, 8, 16, 32, 62, 128, 256, 4, 8, 16, 32, 64, 126, 256]
+    [4, 8, 16, 32, 62, 128, 256, 4, 8, 16, 32, 64, 100, 256]
 
-Two ways to close it, and the choice belongs with the suite work rather than
-here: move `i8042_mouse` back to `Sched::Serial`, or split the verdict so the
-paced count stays parallel and the lost-edge claim runs where the host is not
-oversubscribed.
+and in an earlier boot a 32 that delivered 18. Paced injection on a quiet host
+never merged at any lead, including no pacing at all — which is exactly why this
+only ever reddened under contention, and why a branch's kernel had nothing to do
+with it. The last sighting before the fix was a landing gate on a branch whose
+only diff was a crate nothing compiles and two documents: a byte-identical
+kernel, red when re-run **alone**.
 
-**2026-08-05: the *count* now fails too, which the second option above would not
-have caught.** On the `hda-probe` branch, with eight worktrees live on the host:
+The fix is `MOUSE_LEAD = 4`, with the device's queue named in code and a `const`
+assert that `MOUSE_PACKET * MOUSE_LEAD <= QEMU_PS2_QUEUE`. Raising it to 6 stops
+the harness compiling, with that sentence as the message. The premise it rests
+on — that QEMU sums motion between syncs rather than dropping it — is staged in
+the run itself: `MERGE_MOTIONS` moves in one `input-send-event` must come back
+as one packet of that many steps. Making `mouse_merged` send one command per
+move instead reds it (1012 events for 1009 packets), so the stage has teeth.
+Cost: the injection takes about 2× the guest time it did (578 ms → 1313 ms
+measured alone), against a 60 s failure mode removed.
 
-```
-FAIL i8042_mouse: 996 pointer events reached userland out of 1004 packets
-injected, each one paced against the arrival of the last
-  FAIL  i8042_mouse  (60s)
-  …
-  [i8042] 1008 packets injected, 1008 out, last button state 0x00
-  PASS  i8042_mouse  (570ms)
-  ALONE i8042_mouse: GREEN
-```
+**The lost edge.** `service` reads the source's `irq_ring` record, then reads
+the byte ring. The ISR fills the byte ring *before* it publishes its record, so
+an interrupt landing between those two reads leaves the pass holding bytes it
+has been told nothing about — and it counts a lost edge that never happened. The
+record it left standing is taken by the next pass, which finds nothing to drain,
+so nothing ever corrects the count. `service` now asks again once the bytes are
+in hand.
 
-Sixty seconds in the wide phase against 570 ms alone, and eight of 1004 packets
-missing rather than an edge miscounted. So the pacing argument does not hold for
-the count either under this much contention — the guest is slow enough that
-something upstream of the count gives up before the packet arrives. Splitting
-the verdict therefore fixes only half of it, and `Sched::Serial` is the option
-that closes both. The branch that saw it changes no port I/O and no input path:
-its only ungated change anywhere is one extra field on the `iommu: unitN` line.
+Unwidened the window is a handful of instructions on one CPU, so nothing outside
+the kernel reaches it — hence the `i8042-edge-race` actuator, which holds the
+pass between the two reads. With it on and the fix reverted the counter reports
+**116 and 127** false lost edges on one run of `i8042_mouse` and the test reds;
+with the fix, 0 across every i8042 test. It is bundled into `i8042-trace`, so
+the group that reads those counters is the group that runs it.
 
-**And on the same afternoon, on the USB mass-storage branch, the isolated run
-was red as well** — which takes contention away as the remaining explanation.
-Same host, a branch whose kernel delta is `drivers/xhci/` plus a gate-only
-feature:
-
-```
-wide phase (253 tests, 235.5 s, other agents building):
-  FAIL i8042_mouse: 1002 pointer events reached userland out of 1004 packets
-  injected, each one paced against the arrival of the last
-re-run alone:
-  FAIL i8042_mouse: timed out after 60s — 986 of the 1004 packets injected
-  came back out, so the host stalled on one the machine never delivered
-its own retry, in that same process:
-  PASS i8042_mouse (552ms)
-```
-
-Eighteen packets short with the host to itself, then green 552 ms later. So
-`Sched::Serial` would not have closed it either. What the two sightings share is
-the shape — the budget spent waiting for one arrival that never comes — so the
-thing to find is what drops a packet on a guest nobody is contending with,
-rather than which phase the test runs in.
+Both `Sched::Parallel` classifications stand: neither verdict is a rate, now for
+a reason that is checked rather than argued.
 
 ### Device registers still take firmware's word for being uncacheable
 
@@ -3730,7 +3739,7 @@ Closed, therefore: the decoder did not desync, and no fix for a desync was
 needed. What was wrong is the instrument, and it is now fixed (`647c3c0`,
 `toyos-ps2`) — `MouseOutcome` could not distinguish a byte held inside a packet
 from a byte thrown away at a boundary, so two of every three bytes of a healthy
-pointer stream were reported as suspects. `i8042_mouse` now runs 3018 bytes of
+pointer stream were reported as suspects. `i8042_mouse` now runs three thousand bytes of
 clean packets and requires the driver to name none of them; reverting the split
 reds it with the T14's own line shape.
 
