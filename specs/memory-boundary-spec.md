@@ -638,7 +638,17 @@ measurements agree.
 hold.** It ran on `a051a67`, and `desktop_window_child` was added to main four
 commits later (`d49883e`) — so "reds nothing" was a statement about a tree that
 did not contain the test most likely to be disturbed by a CPU-feature change.
-Three other new tests were missing from it too. Re-run after merging main:
+Three other new tests were missing from it too.
+
+**Nothing in the harness would have said so.** The run reported 262 of 262 and
+exited 0; a suite reports on the tests it has, and a test absent from the tree
+cannot be counted as missing. It surfaced only because a message named a test
+whose string appeared nowhere in the log. The general lesson for anyone reading
+a green suite as evidence: the number of tests that passed is not a coverage
+claim, and a discovery run is dated by the base it ran on, not by the day it was
+run.
+
+Re-run after merging main:
 
 **256 passed, 1 failed. The one red is `desktop_window_child`.**
 
