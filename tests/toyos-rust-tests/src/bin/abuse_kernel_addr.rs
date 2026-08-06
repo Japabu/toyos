@@ -1,10 +1,15 @@
-//! `SYS_DLOPEN`'s third argument is an address the caller chose and the kernel
-//! writes two `u64` through. It was the one address of the three the syscall
-//! layer never validated: the path went through `user_str`, and this went
-//! straight to `AddressSpace::translate`, which walked any PML4 index — and a
-//! user address space shallow-copies the kernel's half, so a kernel address
-//! resolves to a present, writable 2 MiB leaf of the direct map. Sixteen bytes
-//! of arbitrary kernel memory, from any process that can call `dlopen`.
+//! Two syscalls take an address from userland and hand it to
+//! `AddressSpace::translate`, which walked any PML4 index. A user address space
+//! shallow-copies the kernel's PML4 half, so a kernel address resolved to a
+//! present, writable 2 MiB leaf of the direct map.
+//!
+//! `SYS_DLOPEN`'s third argument was the one the syscall layer never validated
+//! at all — sixteen bytes of arbitrary kernel memory, written by any process
+//! that can call `dlopen`. `SYS_FUTEX_WAIT`'s word is the other: it was
+//! guarded, but by an expression at the dispatch arm whose value was thrown
+//! away, in a different file from the `pub fn` it protected. Both bounds now
+//! live where they cannot be forgotten — in `translate` itself, and in
+//! `futex_wait`'s signature.
 //!
 //! **The verdict is not the assertion.** A kernel that still made that write
 //! would return the same error to a userland that cannot read a byte of the
@@ -115,7 +120,41 @@ fn main() {
         "dlopen returned a handle and wrote nothing to init_out: {info:#x?}",
     );
 
+    // 5. The futex word, which the *scheduler* dereferences on every wake check
+    //    long after the syscall returned. A kernel address here is a read
+    //    oracle: `futex_wait` blocks when the word equals `expected` and returns
+    //    at once when it does not, so a caller that may name kernel memory can
+    //    ask whether a kernel word holds a value — one bit per call, from
+    //    timing alone. Neither answer is what an address it may not name gets.
+    for &expected in &[0u32, 0x0F17_1E55, 0x1A55] {
+        let ret = unsafe {
+            syscall::futex_wait(canary as *const u32, expected, Some(50_000_000))
+        };
+        assert_eq!(
+            err(ret),
+            Some(SyscallError::BadAddress),
+            "futex_wait answered {ret:#x} for a kernel address and expected={expected:#x}",
+        );
+    }
+    let ret = unsafe { syscall::futex_wake(canary as *const u32, 1) };
+    assert_eq!(err(ret), Some(SyscallError::BadAddress), "futex_wake took a kernel address");
+
+    // The word must be one the scheduler can keep reading, so it is refused for
+    // its alignment too — an unaligned one reads its tail out of the next
+    // physical page.
+    let word = base as *mut u32;
+    unsafe { word.write_volatile(1) };
+    let ret = unsafe { syscall::futex_wait((base + 2) as *const u32, 1, Some(0)) };
+    assert_eq!(err(ret), Some(SyscallError::BadAddress), "futex_wait took an unaligned word");
+
+    // And an honest futex still answers: the value does not match, so the call
+    // returns rather than blocking.
+    let ret = unsafe { syscall::futex_wait(word, 2, Some(50_000_000)) };
+    assert!(err(ret).is_none(), "futex_wait refused a word of this process's own: {ret:#x}");
+    let ret = unsafe { syscall::futex_wake(word, 1) };
+    assert!(err(ret).is_none(), "futex_wake refused a word of this process's own: {ret:#x}");
+
     unsafe { syscall::munmap(region, 2 * PAGE_2M as usize) }.expect("munmap");
     assert!(canary_intact(), "the canary changed during the run");
-    println!("dlopen refuses an init_out it cannot write, and kernel memory is untouched");
+    println!("dlopen and futex refuse an address they may not reach, and kernel memory is untouched");
 }

@@ -418,14 +418,14 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             })
         }
         SYS_CPU_COUNT => super::smp::cpu_count() as u64,
-        SYS_FUTEX_WAIT => {
-            if ctx.user_ref::<u32>(UserAddr::new(a1)).is_none() { return bad_addr; }
-            process::futex_wait(a1, a2 as u32, a3)
-        }
-        SYS_FUTEX_WAKE => {
-            if ctx.user_ref::<u32>(UserAddr::new(a1)).is_none() { return bad_addr; }
-            process::futex_wake(a1, a2)
-        }
+        SYS_FUTEX_WAIT => match UserAddr::checked(a1) {
+            Some(addr) => process::futex_wait(addr, a2 as u32, a3),
+            None => bad_addr,
+        },
+        SYS_FUTEX_WAKE => match UserAddr::checked(a1) {
+            Some(addr) => process::futex_wake(addr, a2),
+            None => bad_addr,
+        },
         SYS_MMAP => sys_mmap(a1, a2, MmapProt(a3), MmapFlags(a4)),
         SYS_MUNMAP => sys_munmap(a1, a2),
         SYS_KILL => process::kill_process(process::Pid::from_raw(a1 as u32)),
