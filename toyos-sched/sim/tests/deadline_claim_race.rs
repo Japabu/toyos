@@ -126,6 +126,18 @@ fn boot() -> (Machine1, CpuSched<SimPayload>, Arc<TaskShared<SimMsg>>) {
     (m, cpu, shared)
 }
 
+/// A task is a linear value: it has to leave through the protocol, or dropping
+/// the CPU that holds it sets off its drop bomb over whatever the verdict was.
+/// Two passes, because the first cannot free the context it is standing on.
+fn teardown(m: &Machine1, cpu: &mut CpuSched<SimPayload>, now: Nanos) {
+    if cpu.running().is_some() {
+        m.hw.enter_pass(CPU0, now);
+        drop_action(SchedPass::begin(cpu, m.env(), now).dispose_exit().finish());
+        m.hw.leave_pass();
+    }
+    pass(m, cpu, now.after(1_000));
+}
+
 /// The second half of `waitq::deliver_wake`, on its own. Splitting it from the
 /// claim is what lets a pass run between the two.
 fn deliver(m: &Machine1, shared: &Arc<TaskShared<SimMsg>>, cause: WakeCause) {
@@ -186,11 +198,17 @@ fn a_claim_between_the_drain_and_the_fire_leaves_the_timer_armed_for_what_is_par
     pass(&m, &mut cpu, after.after(1_000));
     let ran_again = cpu.running().map(|t| t.key());
     registration.finish();
+    teardown(&m, &mut cpu, after.after(2_000));
 
     assert_eq!(
         armed, owed,
         "cpu0 holds a task parked on a deadline of {owed:?} with its timer at {armed:?}: \
          nothing will fire it, and nothing that reads the CPU can tell that from health",
+    );
+    assert_eq!(
+        owed, None,
+        "the timeout is superseded — no later claim can succeed — so the CPU must stop \
+         reporting it as pending",
     );
     assert_eq!(
         ran_again,
