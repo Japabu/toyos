@@ -379,6 +379,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // broke`, and how many tries it takes is how much of the host the guest had.
     ("usb_transport_break", Sched::Serial),
     ("xhci_full_speed_device", Sched::Parallel),
+    ("xhci_superspeed_ports", Sched::Parallel),
     // Two of the three below stage plug and unplug with fixed waits, and both
     // waits are 600-800 ms against a 100 ms debounce the driver finishes in
     // microseconds under TCG — a margin, not a race, and every verdict either
@@ -4558,6 +4559,7 @@ fn run_machine_test(
         "xhci_full_speed_device" => {
             usb::xhci_full_speed_device(test_config, c_bins, rust_bins)
         }
+        "xhci_superspeed_ports" => usb::xhci_superspeed_ports(test_config, c_bins, rust_bins),
         "xhci_hotplug" => usb::xhci_hotplug(test_config, c_bins, rust_bins),
         "xhci_flap" => usb::xhci_flap(test_config, c_bins, rust_bins),
         "xhci_hid_break" => usb::xhci_hid_break(test_config, c_bins, rust_bins),

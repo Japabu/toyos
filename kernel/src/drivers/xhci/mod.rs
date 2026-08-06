@@ -919,6 +919,11 @@ pub struct XhciController {
     /// array would be 255 entries on a controller with five.
     ports: Vec<PortState>,
 
+    /// What each port register speaks, out of the controller.s own Supported
+    /// Protocol capabilities. The boot scan reads it directly; the hot-plug
+    /// machine was given its port.s copy at bring-up.
+    protocols: Protocols,
+
     /// A Port Status Change Event arrived and the ports have not been read
     /// since. Set where the event is dequeued — which includes the middle of
     /// somebody else's enumeration, since `wait_transfer` drains the whole ring
@@ -2206,6 +2211,7 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         context_size,
         layout,
         pool,
+        protocols,
         cmd_ring,
         event_ring: evt_ring_buf.base() as *const Trb,
         event_head: 0,

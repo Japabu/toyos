@@ -29,6 +29,39 @@ pub const DEBOUNCE_NS: Nanos = 100_000_000;
 /// cannot drive.
 pub const RESET_DEADLINE_NS: Nanos = 2_000_000_000;
 
+/// Which reset a connected port needs before anything can be enumerated on it,
+/// or `None` when its link is already up and there is nothing to do.
+///
+/// **The one place that question is answered**, because the boot scan and the
+/// hot-plug machine must answer it the same way: the T14's stick is in the port
+/// when the machine boots, so a fix that only reached the hot-plug path would
+/// not reach the machine it is for.
+pub fn reset_needed(protocol: Option<Protocol>, portsc: Portsc) -> Option<Reset> {
+    if protocol != Some(Protocol::Usb3) {
+        // USB2, or a port the controller did not describe. A reset is how a
+        // device gets enabled there at all.
+        return Some(Reset::Hot);
+    }
+    // A USB3 link trains itself: §4.19.1.2 has the port reach Enabled on its
+    // own, so a port that reads Enabled has a working link and nothing to
+    // reset. Resetting it anyway is a hot reset of a trained link, and a link
+    // that cannot take one lands Inactive.
+    if portsc.enabled() {
+        return None;
+    }
+    // Inactive is the state only a warm reset leaves (§4.19.1.2.4), so go
+    // straight to it rather than spending a deadline proving a hot one fails.
+    Some(if portsc.link_state() == LinkState::Inactive { Reset::Warm } else { Reset::Hot })
+}
+
+/// The PORTSC write that performs `reset`.
+pub fn reset_write(reset: Reset, portsc: Portsc) -> portsc::Write {
+    match reset {
+        Reset::Hot => portsc.neutral().resetting(),
+        Reset::Warm => portsc.neutral().warm_resetting(),
+    }
+}
+
 /// Why a port stopped being worked on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GaveUp {
@@ -304,7 +337,7 @@ impl PortState {
             // stops here, which is a USB-A port that never mounts anything.
             if kind == Reset::Hot && self.protocol == Some(Protocol::Usb3) && connected {
                 self.work = Work::Resetting { until: now + RESET_DEADLINE_NS, kind: Reset::Warm };
-                return Step::Reset(Reset::Warm, portsc.neutral().warm_resetting());
+                return Step::Reset(Reset::Warm, reset_write(Reset::Warm, portsc));
             }
             // Attached, so the port is not tried again until its device is
             // pulled — which is what stops a port the controller will not reset
@@ -372,28 +405,10 @@ impl PortState {
             return Step::Teardown(Gone::Disconnected, Pending(self));
         }
 
-        // **Which reset this port needs, as one question.** A USB3 link trains
-        // itself: §4.19.1.2 has the port reach Enabled on its own, and a port
-        // that reads Enabled is a port with a working link and nothing to
-        // reset. Resetting it anyway is a hot reset of a trained link, and a
-        // link that cannot take one lands Inactive — which is where the driver
-        // that treated every port as USB2 lost every USB-A port it had.
-        let usb3 = self.protocol == Some(Protocol::Usb3);
-        if usb3 && portsc.enabled() {
+        let Some(kind) = reset_needed(self.protocol, portsc) else {
             return Step::Enumerate { trained: true, pending: Pending(self) };
-        }
-        // Inactive is the state only a warm reset leaves, so go straight to it
-        // rather than spending the deadline proving a hot one does not work.
-        let kind = if usb3 && portsc.link_state() == LinkState::Inactive {
-            Reset::Warm
-        } else {
-            Reset::Hot
         };
         self.work = Work::Resetting { until: now + RESET_DEADLINE_NS, kind };
-        let write = match kind {
-            Reset::Hot => portsc.neutral().resetting(),
-            Reset::Warm => portsc.neutral().warm_resetting(),
-        };
-        Step::Reset(kind, write)
+        Step::Reset(kind, reset_write(kind, portsc))
     }
 }

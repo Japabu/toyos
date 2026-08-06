@@ -1,6 +1,8 @@
 use core::ptr::{write_volatile, write_bytes};
 
 use crate::log;
+use toyos_xhci::port::{self, Reset};
+use toyos_xhci::Protocol;
 use super::{Control, Trb, TrbRing, XhciController, PAGE};
 use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
 use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
@@ -315,9 +317,9 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
 /// and neither is a second implementation of the other. The T14's own root
 /// ports take 55 ms over this (`specs/metal-hardware-inventory.md`), which is
 /// the whole reason the runtime path must not hold a scheduler pass across it.
-pub fn begin_reset(ctrl: &mut XhciController, port_idx: u8) {
+pub fn reset_port(ctrl: &mut XhciController, port_idx: u8, kind: Reset) {
     let portsc = ctrl.read_portsc(port_idx);
-    ctrl.write_portsc(port_idx, portsc.neutral().resetting());
+    ctrl.write_portsc(port_idx, port::reset_write(kind, portsc));
 }
 
 /// Whether the port has finished the reset it was asked for.
@@ -327,20 +329,44 @@ pub fn reset_done(ctrl: &XhciController, port_idx: u8) -> bool {
 
 /// Initialize and configure one USB device on a port. `Some(slot)` is a slot
 /// the controller enabled and the driver now owns — see [`configure`].
-pub fn init_device(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
-    begin_reset(ctrl, port_idx);
+/// **Which reset this port needs is [`port::reset_needed`]'s answer and never a
+/// second opinion.** A machine that boots off a USB stick has that stick in the
+/// port before the scheduler exists, so a SuperSpeed fix reaching only the
+/// hot-plug path would not reach the machine it was written for.
+pub fn init_device(
+    ctrl: &mut XhciController,
+    port_idx: u8,
+    protocol: Option<Protocol>,
+) -> Option<u8> {
+    let Some(kind) = port::reset_needed(protocol, ctrl.read_portsc(port_idx)) else {
+        log!("xHCI: port {} link already trained, no reset needed", port_idx + 1);
+        return configure(ctrl, port_idx);
+    };
+    reset_port(ctrl, port_idx, kind);
 
-    // A port that asserts CCS and then never asserts PRC — a device pulled
-    // between the scan and the reset, a marginal cable, a reset the controller
-    // will not run — costs that port and not the boot. This spin had no
-    // deadline, on the boot CPU, before the scheduler exists and with nothing
-    // logged.
-    if !super::settles(|| reset_done(ctrl, port_idx)) {
-        log!("xHCI: port {} never finished its reset (PORTSC {:#010x}); skipping it",
-            port_idx + 1, ctrl.read_portsc(port_idx).raw());
-        return None;
+    // A port that asserts CCS and then never finishes — a device pulled between
+    // the scan and the reset, a marginal cable, a reset the controller will not
+    // run — costs that port and not the boot. This spin had no deadline, on the
+    // boot CPU, before the scheduler exists and with nothing logged.
+    if super::settles(|| reset_done(ctrl, port_idx)) {
+        return configure(ctrl, port_idx);
     }
-    configure(ctrl, port_idx)
+
+    // A hot reset a SuperSpeed link could not take leaves it Inactive, and
+    // §4.19.1.2.4 has exactly one way out of that. Without this the port is
+    // lost for the boot, which on the T14 is a USB-A socket that mounts
+    // nothing, two boots out of two.
+    if kind == Reset::Hot && protocol == Some(Protocol::Usb3) {
+        log!("xHCI: port {} did not take a hot reset (link {:?}); warm resetting it",
+            port_idx + 1, ctrl.read_portsc(port_idx).link_state());
+        reset_port(ctrl, port_idx, Reset::Warm);
+        if super::settles(|| reset_done(ctrl, port_idx)) {
+            return configure(ctrl, port_idx);
+        }
+    }
+    log!("xHCI: port {} never finished its reset (PORTSC {:#010x}); skipping it",
+        port_idx + 1, ctrl.read_portsc(port_idx).raw());
+    None
 }
 
 /// Everything between a port that has just finished its reset and a device the
@@ -361,7 +387,7 @@ pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
         return None;
     }
     let speed = portsc.speed();
-    log!("xHCI: port {} reset, speed={}", port_idx + 1, speed);
+    log!("xHCI: port {} enabled, speed={}", port_idx + 1, speed);
     let Some(initial_packet) = initial_ep0_packet(speed) else {
         log!("xHCI: port {} came up at speed {speed}, which is not a speed this driver has a \
              control-endpoint packet size for; skipping it", port_idx + 1);
@@ -666,10 +692,12 @@ pub fn scan_ports(ctrl: &mut XhciController) {
         // not be considered valid by software until after the PR bit transitions
         // from a '1' to a '0'". QEMU fills it in from the QOM tree before any
         // reset, so a line printing it here reads as fact on QEMU and as noise
-        // on hardware. The `port N reset, speed=` line below is the valid one.
+        // on hardware. The `port N enabled, speed=` line below is the valid one, and it says
+        // enabled rather than reset because a SuperSpeed port reaches this
+        // without one.
         if ctrl.read_portsc(p).connected() {
             log!("xHCI: port {} connected", p + 1);
-            let slot = init_device(ctrl, p);
+            let slot = init_device(ctrl, p, ctrl.protocols.of(p));
             ctrl.port_bound(p, slot);
         }
     }
