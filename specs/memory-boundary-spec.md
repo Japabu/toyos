@@ -706,9 +706,9 @@ can land whenever it is scheduled rather than riding M2 — a green discovery ru
 removes the risk that motivated the hold, but not the call on when a shared
 resource changes under five agents.
 
-**Landing this wave's stages while #156 is open** uses
-`cargo run -- --land --gate "cargo test -- --skip desktop_window_child"`.
-`--skip` is exact-match and repeatable (`tests/toyos.rs:8626-8641`) and prints
-`[toyos] NOT RUN, by --skip: …` on every run. That name is the only one this
-wave may skip; any other red belongs to the change and is explained, never
-excluded.
+**Landing this wave's stages while #156 is open** needs nothing special:
+`cargo run -- --land`. `desktop_window_child` is declared in
+`EXPECTED_FAILURES` (`tests/toyos.rs`), so it still runs, it is named with its
+task in every run's report, and it does not red the gate. Any other red belongs
+to the change and is explained, never excluded — and the declaration cannot
+absorb one, because an entry covers named failure messages and nothing else.

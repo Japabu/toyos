@@ -1671,6 +1671,62 @@ impl Qmp {
         self.stream.write_all(b"\n").unwrap();
         self.await_reply("\"return\"");
     }
+
+    /// `execute`, keeping what the command answered with. Only the human
+    /// monitor answers with anything; every other command here returns `{}`.
+    fn execute_capturing(&mut self, command: &str) -> String {
+        use std::io::Read;
+        self.stream.write_all(command.as_bytes()).unwrap();
+        self.stream.write_all(b"\n").unwrap();
+        self.await_reply("\"return\"");
+        let rest = loop {
+            if let Some(at) = self.pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=at).collect();
+                break String::from_utf8_lossy(&line).into_owned();
+            }
+            let mut buf = [0u8; 4096];
+            let n = self.stream.read(&mut buf).expect("qmp: read failed");
+            assert!(n > 0, "qmp: socket closed mid-reply");
+            self.pending.extend_from_slice(&buf[..n]);
+        };
+        let Some(body) = rest.split_once('"').map(|(_, tail)| tail) else {
+            return String::new();
+        };
+        let body = body.rsplit_once('"').map_or(body, |(head, _)| head);
+        let mut out = String::with_capacity(body.len());
+        let mut chars = body.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                out.push(ch);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => {}
+                Some(escaped) => out.push(escaped),
+                None => break,
+            }
+        }
+        out
+    }
+}
+
+/// An open QMP connection to QEMU's human monitor, for the questions QMP has
+/// no command of its own for.
+pub struct QmpMonitor(Qmp);
+
+impl QmpMonitor {
+    pub fn open(socket: &Path) -> Self {
+        Self(Qmp::connect(socket))
+    }
+
+    /// Run `command` in the human monitor and return what it printed.
+    pub fn human(&mut self, command: &str) -> String {
+        self.0.execute_capturing(&format!(
+            "{{\"execute\":\"human-monitor-command\",\"arguments\":\
+             {{\"command-line\":\"{command}\"}}}}"
+        ))
+    }
 }
 
 /// An open QMP connection for injecting input.

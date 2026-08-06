@@ -396,8 +396,8 @@ pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
 
     let mut enable_slot = Trb::ZERO;
     enable_slot.control = TRB_ENABLE_SLOT;
-    ctrl.submit_command(enable_slot);
-    let slot_id = match ctrl.wait_command() {
+    let at = ctrl.submit_command(enable_slot);
+    let slot_id = match ctrl.wait_command(at) {
         Some((CC_SUCCESS, slot_id)) => slot_id as u8,
         Some((code, _)) => {
             log!("xHCI: Enable Slot failed, code={}", code);
@@ -713,7 +713,7 @@ pub fn scan_ports(ctrl: &mut XhciController) {
     // Nothing else would come back for it: an endpoint holding no TRB raises no
     // further interrupt, so without this a device whose *first* transfer failed
     // during the boot scan would stay recorded and silent for the whole boot.
-    ctrl.recover_endpoints();
+    ctrl.settle_recoveries();
     #[cfg(feature = "xhci-portsc-rw1c")]
     log!("xHCI: PED as RW1C, {} port(s) disabled by a driver write",
         ctrl.software_disabled_ports());

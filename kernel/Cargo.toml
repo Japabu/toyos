@@ -153,6 +153,14 @@ usb-short-read = ["usb-storage-gate"]
 # See `xhci/mod.rs`'s `settles`.
 xhci-deaf-controller = []
 xhci-deaf-port = []
+# Make one CPU ignore a kick — the one machine state the blocked-task dump
+# exists to describe, and the one nothing on the host can stage: QEMU delivers
+# every IPI it is given, so a guest CPU stops answering only for reasons that
+# are properties of this code. The victim really clears IF and really spins,
+# for longer than the dump's kick budget and then no longer, so the kick is
+# genuinely unanswered, the NMI is genuinely what reaches it, and the CPU
+# genuinely comes back. See `sched/dump.rs`'s `deaf_window`.
+dump-deaf-cpu = []
 # Report an empty root hub for the first 300 ms of the boot, so the port scan
 # runs against a controller that has not finished detecting its devices yet.
 # That is what every physical root hub does after HCRST and what QEMU's cannot:

@@ -89,6 +89,22 @@ pub fn kick_cpu(cpu_id: u32) {
     cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4000 | TIMER_VECTOR as u64);
 }
 
+/// Send an NMI to one CPU. Same targeted write as [`kick_cpu`] with delivery
+/// mode NMI (0x400) instead of a vector, and it exists for the one question
+/// [`kick_cpu`] cannot answer: a CPU that spins with interrupts disabled never
+/// takes a kick, so a kick that goes unanswered does not distinguish "wedged"
+/// from "not listening". An NMI is not maskable by `IF`, so it does.
+///
+/// Diagnostic only — `sched::dump` sends it to a CPU that has already failed to
+/// answer a kick. Nothing on a working path may use it: an NMI can land between
+/// any two instructions, including inside a critical section this kernel has no
+/// way to make NMI-safe.
+pub fn send_nmi(cpu_id: u32) {
+    if !X2APIC_ENABLED.load(Ordering::Relaxed) { return; }
+    let apic_id = crate::arch::smp::apic_id_for(cpu_id);
+    cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4400);
+}
+
 /// Halt all CPUs. Sends halt IPI to all other CPUs, then flushes any
 /// pending log output to the serial backend, then halts self.
 ///
