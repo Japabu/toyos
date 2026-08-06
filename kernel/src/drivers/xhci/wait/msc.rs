@@ -10,12 +10,13 @@
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
-use super::device::Endpoint;
-use super::{Disk, Restart, Trb, TrbRing, XhciController, StorageGeometry, PAGE};
-use super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, OFF_INPUT_CTX};
-use super::USB_TIMEOUT_NS;
-use super::{MSC_IN_RING, MSC_OUT_RING, MSC_CBW, MSC_CSW, MSC_SCRATCH, MSC_SCRATCH_LEN};
-use super::{MSC_DATA, MSC_DATA_LEN, MSC_MAX_BLOCKS};
+use super::super::device::Endpoint;
+use super::Restart;
+use super::super::{with_disk, Disk, StorageGeometry, Trb, TrbRing, XhciController, PAGE};
+use super::super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, OFF_INPUT_CTX};
+use super::super::USB_TIMEOUT_NS;
+use super::super::{MSC_IN_RING, MSC_OUT_RING, MSC_CBW, MSC_CSW, MSC_SCRATCH, MSC_SCRATCH_LEN};
+use super::super::{MSC_DATA, MSC_DATA_LEN, MSC_MAX_BLOCKS};
 
 /// The block size the layer above this one is written in. A device that
 /// addresses in anything this does not divide by is unimplemented, not
@@ -242,7 +243,7 @@ mod transport_break {
 /// this transfer's. Same reason `usb-transport-break` and `xhci-one-slot`
 /// exist.
 #[cfg(feature = "usb-short-read")]
-pub(super) mod short_read {
+pub(in crate::drivers::xhci) mod short_read {
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use crate::mm::KernelSlice;
@@ -820,8 +821,8 @@ impl XhciController {
 /// rebuilt there: `TrbRing::init` zeroes, and by then the memory is the
 /// controller's to read.
 #[derive(Clone, Copy)]
-pub(super) struct MscRings {
-    /// Which of [`super::MSC_BLOCKS`] this is, which is what the teardown gives
+pub(in crate::drivers::xhci) struct MscRings {
+    /// Which of [`super::super::MSC_BLOCKS`] this is, which is what the teardown gives
     /// back.
     at: usize,
     block: usize,
@@ -839,7 +840,7 @@ pub(super) struct MscRings {
 ///
 /// `None` when the pool is out, which is a refusal and not a failure — nothing
 /// is spent, because nothing was handed out.
-pub(super) fn prepare(
+pub(in crate::drivers::xhci) fn prepare(
     ctrl: &mut XhciController,
     slot_id: u8,
     speed: u8,
@@ -848,7 +849,7 @@ pub(super) fn prepare(
 ) -> Option<MscRings> {
     let Some((at, block)) = ctrl.claim_msc_block(port_idx) else {
         log!("usb-storage: slot {slot_id} is the {}th disk; this driver serves {}",
-            ctrl.msc_blocks_taken() + 1, super::MSC_BLOCKS);
+            ctrl.msc_blocks_taken() + 1, super::super::MSC_BLOCKS);
         return None;
     };
 
@@ -905,7 +906,7 @@ pub(super) fn prepare(
 /// `bool` this used to produce that the one caller wanted — and it discarded it
 /// in statement position, silently, because Rust does not warn about a dropped
 /// `bool`.
-pub(super) fn bind(
+pub(in crate::drivers::xhci) fn bind(
     ctrl: &mut XhciController,
     ep0_ring: TrbRing,
     slot_id: u8,
@@ -940,8 +941,8 @@ pub(super) fn bind(
     // The machine-wide number, taken here because here is where there is a disk
     // to give one to: it is what `usb_storage::open` indexes by and what a mount
     // holds for its whole life, so it must not move when some other controller
-    // binds or loses a disk — see [`super::DISKS_BOUND`].
-    let index = super::DISKS_BOUND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // binds or loses a disk — see [`super::super::DISKS_BOUND`].
+    let index = super::super::DISKS_BOUND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     log!(
         "usb-storage: disk {index} ready on slot {slot_id}, {} blocks of {} B \
          ({} MiB), msc_block +{:#x}",
@@ -1108,3 +1109,17 @@ impl core::fmt::Display for Printable<'_> {
         f.write_str("\"")
     }
 }
+/// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
+/// `buf` holds nothing the caller may believe.
+pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+    with_disk(index, |ctrl, local| ctrl.msc_read(local, lba, count, buf)).unwrap_or(false)
+}
+
+pub fn storage_write(index: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
+    with_disk(index, |ctrl, local| ctrl.msc_write(local, lba, count, buf)).unwrap_or(false)
+}
+
+pub fn storage_flush(index: usize) -> bool {
+    with_disk(index, |ctrl, local| ctrl.msc_flush(local)).unwrap_or(false)
+}
+

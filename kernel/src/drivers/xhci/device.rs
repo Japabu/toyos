@@ -7,7 +7,6 @@ use toyos_xhci::enumerate::{
 };
 use toyos_xhci::job::{Await, Outcome, Stages};
 use toyos_xhci::port::{self, Reset};
-use toyos_xhci::Protocol;
 use super::{deadline, Answer, Trb, TrbRing, What, XhciController, PAGE};
 use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
 use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
@@ -309,47 +308,6 @@ pub fn reset_done(ctrl: &XhciController, port_idx: u8) -> bool {
     super::PORT_ANSWERS && ctrl.read_portsc(port_idx).reset_changed()
 }
 
-/// Initialize and configure one USB device on a port, waiting for each step.
-///
-/// **Which reset this port needs is [`port::reset_needed`]'s answer and never a
-/// second opinion.** A machine that boots off a USB stick has that stick in the
-/// port before the scheduler exists, so a SuperSpeed fix reaching only the
-/// hot-plug path would not reach the machine it was written for.
-///
-/// The port records what came of it, here as on the hot-plug path: `finish` is
-/// the one place a slot the controller enabled becomes the port's.
-pub fn init_device(ctrl: &mut XhciController, port_idx: u8, protocol: Option<Protocol>) {
-    let Some(kind) = port::reset_needed(protocol, ctrl.read_portsc(port_idx)) else {
-        log!("xHCI: port {} link already trained, no reset needed", port_idx + 1);
-        return configure(ctrl, port_idx);
-    };
-    reset_port(ctrl, port_idx, kind);
-
-    // A port that asserts CCS and then never finishes — a device pulled between
-    // the scan and the reset, a marginal cable, a reset the controller will not
-    // run — costs that port and not the boot. This spin had no deadline, on the
-    // boot CPU, before the scheduler exists and with nothing logged.
-    if super::settles(|| reset_done(ctrl, port_idx)) {
-        return configure(ctrl, port_idx);
-    }
-
-    // A hot reset a SuperSpeed link could not take leaves it Inactive, and
-    // §4.19.1.2.4 has exactly one way out of that. Without this the port is
-    // lost for the boot, which on the T14 is a USB-A socket that mounts
-    // nothing, two boots out of two.
-    if kind == Reset::Hot && protocol == Some(Protocol::Usb3) {
-        log!("xHCI: port {} did not take a hot reset (link {:?}); warm resetting it",
-            port_idx + 1, ctrl.read_portsc(port_idx).link_state());
-        reset_port(ctrl, port_idx, Reset::Warm);
-        if super::settles(|| reset_done(ctrl, port_idx)) {
-            return configure(ctrl, port_idx);
-        }
-    }
-    log!("xHCI: port {} never finished its reset (PORTSC {:#010x}); skipping it",
-        port_idx + 1, ctrl.read_portsc(port_idx).raw());
-    ctrl.port_bound(port_idx, None);
-}
-
 /// One device's enumeration, as everything the acts still owed will need.
 ///
 /// The state travels with the wait because the pass that submitted an act gave
@@ -385,16 +343,6 @@ enum Rings {
     Msc(MscRings),
 }
 
-/// Everything between a port that has just finished its reset and a device the
-/// driver can use, run to the end in place.
-///
-/// The boot scan's driver of [`Enumeration`], and the only difference between
-/// it and the hot-plug one is where the waiting happens: here there is no
-/// scheduler to give a pass back to, so the acts run one after another.
-pub fn configure(ctrl: &mut XhciController, port_idx: u8) {
-    begin(ctrl, port_idx);
-    ctrl.settle_outstanding();
-}
 
 /// Acknowledge the reset, read what the port came up as, and ask for a slot.
 ///
@@ -945,47 +893,6 @@ pub(super) fn cancel_on(ctrl: &mut XhciController, port_idx: u8) {
     // change flag that brought the caller here, and the teardown behind this
     // decides what a port means from exactly that word.
     ctrl.ports[port_idx as usize].enumerated(NonZeroU8::new(slot_id));
-}
-
-/// Scan all ports on the controller and initialize connected devices.
-/// Enumeration is serial by construction, which is what lets the input
-/// context, the EP0 ring and the descriptor buffer be one each. Serial does not
-/// mean quiet: a device bound on an earlier port is armed and delivering while
-/// a later port enumerates, so the event ring carries its completions too and
-/// both waits demux by slot id rather than by TRB type alone.
-///
-/// The root hubs must have settled first — [`super::await_connect_settle`] is
-/// what makes `PORTSC.CCS` a question with an answer.
-pub fn scan_ports(ctrl: &mut XhciController) {
-    for p in 0..ctrl.max_ports {
-        // No speed here, deliberately: §4.19.5 says the Port Speed field "shall
-        // not be considered valid by software until after the PR bit transitions
-        // from a '1' to a '0'". QEMU fills it in from the QOM tree before any
-        // reset, so a line printing it here reads as fact on QEMU and as noise
-        // on hardware. The `port N enabled, speed=` line below is the valid one, and it says
-        // enabled rather than reset because a SuperSpeed port reaches this
-        // without one.
-        if ctrl.read_portsc(p).connected() {
-            log!("xHCI: port {} connected", p + 1);
-            init_device(ctrl, p, ctrl.protocols.of(p));
-        }
-    }
-    // Every change bit the scan left set, on every port. A change flag is what
-    // *raises* a Port Status Change Event, and it raises one only as it goes
-    // from 0 to 1 — so a CSC still set from the boot-time attach is a
-    // disconnect the controller has no way to report, and the first thing
-    // unplugged after boot would go unnoticed.
-    ctrl.acknowledge_port_changes();
-    // A device bound on an earlier port is armed and delivering while a later
-    // one enumerates, so its completions arrive inside `configure`'s own
-    // `wait_transfer` — and a broken one is recorded there rather than acted on.
-    // Nothing else would come back for it: an endpoint holding no TRB raises no
-    // further interrupt, so without this a device whose *first* transfer failed
-    // during the boot scan would stay recorded and silent for the whole boot.
-    ctrl.settle_outstanding();
-    #[cfg(feature = "xhci-portsc-rw1c")]
-    log!("xHCI: PED as RW1C, {} port(s) disabled by a driver write",
-        ctrl.software_disabled_ports());
 }
 
 /// Configuration descriptors no device in reach will hand us.
