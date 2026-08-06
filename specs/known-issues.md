@@ -1331,6 +1331,29 @@ discriminator it is **not** the freeze; it is the shell-exit defect three
 paragraphs down, reached at the first windowed child rather than during a snake
 round. Whoever fixes that message should make it say what the log says.
 
+**And that third manifestation is now the only one this test produces, which
+means the reproduction is masked (2026-08-06, eight boots).** Two full-suite
+runs in the 12-wide phase and six alone — three with the winit lock at
+`be9ec72c`, three at `faf99eb7` — are red every time and **not once the
+freeze**. Every capture has the guest alive for the whole drain: compositor
+stats every ~2 s, kernel stats every 10 s, the i8042 counter climbing to 4818
+keys as the harness re-injected GUI+Q, and all eight vCPUs `HLT=1 RFL=0x246`,
+which on a settled desktop is an idle machine and not #156. What all eight show
+is the teardown above, now at the **second** probe — the owner's case, a live
+client whose window is taken away — with the client leaving `code=0` before the
+shell does. One of the eight got through to snake round 0 and produced the same
+shape with `exit: snake pid=7 code=0 cpu=1224ms` in its place, so where the test
+stops varies with load and what happens does not.
+
+Two consequences for whoever picks this up. **`ALONE: GREEN` no longer holds** —
+6 of 6 alone are red — so the paragraph above it is a record of what the test
+used to do, not a prediction. And **the freeze's venue is unreachable**: it was
+seen in a snake round, and the desktop is torn down one or two probes before
+that. Fixing the shell-exit defect is now on #156's critical path rather than
+beside it. The teardown is not a regression from the deadline fix (`add6aeb`,
+18:05): the paragraph above it was written at 17:32 describing the same three
+exits, and is not a descendant of it.
+
 **Landing while it is red** needs nothing special: `desktop_window_child` is
 declared in `EXPECTED_FAILURES` (`tests/toyos.rs`) and `cargo run -- --land`
 runs the ordinary gate. The declaration reports it by name on every run, is red

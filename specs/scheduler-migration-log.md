@@ -577,10 +577,10 @@ Verified by forcing the failure: 8 CPUs of registers and a whole dump reached
 the message, and the harness reported the forced reason as **not** one the
 `EXPECTED_FAILURES` entry covers, so the `says` list still has its teeth.
 
-### Five boots on the fixed tree: no freeze, and one defect in front of it
+### Eight boots on the fixed tree: no freeze, and one defect in front of it
 
 `desktop_window_child`, on `add6aeb`'s tree with the report above attached:
-two full-suite runs in the 12-wide phase and three runs alone. **Red every
+two full-suite runs in the 12-wide phase and six runs alone. **Red every
 time, and not once the freeze.** Every capture shows the guest alive for the
 whole drain — `compositor: frames=…` every ~2 s, the kernel's stats every
 10 s, and the i8042 counter climbing to 4818 keys as the harness re-injected
@@ -588,7 +588,7 @@ GUI+Q — where #156's signature is a guest that emits nothing at all. All eight
 vCPUs were `HLT=1 RFL=0x246` at the capture, which on a settled desktop is
 simply an idle machine.
 
-What every one of the five shows instead is one shape:
+What every one of the eight shows instead is one shape:
 
 ```
 [kernel 3.665] exit: test_rs_window_child pid=5 code=0 cpu=30ms
@@ -607,18 +607,23 @@ thing. It is the shell-exit defect that entry describes, and it now fires at
 the *second* probe — the owner's case, a live client whose window is taken
 away — rather than only at the first.
 
-Four of the five stop there. The fifth (alone, the first of three) got through
+Six of the eight stop there. One of the alone runs got through
 to snake round 0 and produced the same shape with `exit: snake pid=7 code=0
 cpu=1224ms` in place of the client's line. So where the test stops varies with
 load; what happens does not.
 
 **This is what now blocks #156's QEMU reproduction.** The freeze was seen in a
 snake round; the desktop is torn down one or two probes earlier, so the test
-cannot reach the venue. The entry's `ALONE: GREEN` no longer holds either — 3
-of 3 alone are red.
+cannot reach the venue. The entry's `ALONE: GREEN` no longer holds either — 6
+of 6 alone are red.
 
 Not caused by the winit lock bump (`faf99eb7`, "stop draining a window that has
-closed"): the first wide run predates it in this session and is identical. What
-the bump did change is visible in that fifth boot — snake now *leaves* when its
-window is closed, `code=0` after 1224 ms of CPU, where #141 is a winit app that
-spins forever instead.
+closed"). Same-session A/B, alone: 3 runs at `be9ec72c` against 3 at
+`faf99eb7`, red on both sides with the same message and the same three exits
+inside 0.25 s of the client's. What the bump did change is visible in that one
+boot that got further — snake now *leaves* when its window is closed, `code=0`
+after 1224 ms of CPU, where #141 is a winit app that spins forever instead.
+
+Nor is it a regression from the deadline fix: `11a88f4` wrote those same three
+exits into known-issues at 17:32, and `add6aeb` landed at 18:05 and is not an
+ancestor of it.
