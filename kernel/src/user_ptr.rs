@@ -36,6 +36,7 @@ pub unsafe trait UserSafe: Copy {}
 unsafe impl UserSafe for u32 {}
 unsafe impl UserSafe for u64 {}
 unsafe impl UserSafe for [u32; 2] {}
+unsafe impl UserSafe for [u64; 2] {}
 
 // Kernel types.
 unsafe impl UserSafe for crate::fd::Stat {}
@@ -46,30 +47,43 @@ unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
 
-/// Check that [ptr..ptr+size) is in the user half of the address space.
+/// Translate a user virtual address to its direct-map address, demand-paging
+/// it in if it is not mapped yet.
 ///
-/// Also used by `sys_mmap`, which installs mappings rather than dereferencing
-/// them: the hardware user/kernel split is the same bound either way, and a
-/// second copy of the constant is a second thing to get wrong.
-pub(crate) fn check_user_range(ptr: UserAddr, size: u64) -> bool {
-    if size == 0 { return true; }
-    let raw = ptr.raw();
-    let Some(end) = raw.checked_add(size) else { return false };
-    end <= 0x0000_8000_0000_0000
-}
-
-/// Translate a user virtual address to a kernel-accessible pointer via
-/// page table walk + direct map. Triggers demand paging if needed.
-fn translate(user_addr: u64) -> Option<*mut u8> {
+/// `pub(crate)` for the futex, whose word the *scheduler* dereferences long
+/// after the syscall that named it has returned — the one user address the
+/// kernel keeps rather than reads.
+pub(crate) fn translate_user(addr: UserAddr) -> Option<crate::mm::DirectMap> {
     let pt = crate::process::current_address_space();
-    if let Some(dm) = pt.lock().translate(UserAddr::new(user_addr)) {
-        return Some(dm.as_mut_ptr());
+    if let Some(dm) = pt.lock().translate(addr) {
+        return Some(dm);
     }
-    if !crate::process::handle_page_fault(user_addr, 0) {
+    if !crate::process::handle_page_fault(addr.raw(), 0) {
         return None;
     }
-    let result = pt.lock().translate(UserAddr::new(user_addr)).map(|dm| dm.as_mut_ptr());
+    let result = pt.lock().translate(addr);
     result
+}
+
+fn translate(user_addr: u64) -> Option<*mut u8> {
+    translate_user(UserAddr::new(user_addr)).map(|dm| dm.as_mut_ptr())
+}
+
+/// The direct-map address of a `T` the kernel may read or write at `ptr`.
+///
+/// One translation answers for one 2 MiB page, so [`user_span::is_user_object`]
+/// is what stands between a value near a page boundary and a copy that walks
+/// off the end of a *physical* page into whatever the PMM handed out next.
+fn object<T: UserSafe>(ptr: UserAddr) -> Result<*mut u8, SyscallError> {
+    let ok = crate::mm::user_span::is_user_object(
+        ptr.raw(),
+        core::mem::size_of::<T>() as u64,
+        core::mem::align_of::<T>() as u64,
+    );
+    if !ok {
+        return Err(SyscallError::BadAddress);
+    }
+    translate(ptr.raw()).ok_or(SyscallError::BadAddress)
 }
 
 
@@ -105,7 +119,7 @@ impl<'a> SyscallContext<'a> {
         if len == 0 {
             return Some(&[]);
         }
-        if !check_user_range(ptr, len as u64) {
+        if !crate::mm::user_span::in_user_half(ptr.raw(), len as u64) {
             return None;
         }
         let kptr = translate(ptr.raw())?;
@@ -139,7 +153,7 @@ impl<'a> SyscallContext<'a> {
         if len == 0 {
             return Some(&mut []);
         }
-        if !check_user_range(ptr, len as u64) {
+        if !crate::mm::user_span::in_user_half(ptr.raw(), len as u64) {
             return None;
         }
         let kptr = translate(ptr.raw())?;
@@ -180,10 +194,29 @@ impl<'a> SyscallContext<'a> {
         core::str::from_utf8(slice).map_err(|_| SyscallError::InvalidArgument)
     }
 
+    /// Read a typed value out of user memory.
+    ///
+    /// A copy rather than a borrow: a `&T` over a page userland can still write
+    /// is a claim the compiler enforces and the hardware does not, and the
+    /// kernel would be reading a value that can change between two of its own
+    /// reads. Every `UserSafe` type is at most 48 bytes, so the copy costs less
+    /// than the second lock-and-translate the borrow already paid.
+    pub fn copy_in<T: UserSafe>(&self, ptr: UserAddr) -> Result<T, SyscallError> {
+        let kptr = object::<T>(ptr)?;
+        Ok(unsafe { (kptr as *const T).read_volatile() })
+    }
+
+    /// Write a typed value into user memory.
+    pub fn copy_out<T: UserSafe>(&self, ptr: UserAddr, value: &T) -> Result<(), SyscallError> {
+        let kptr = object::<T>(ptr)?;
+        unsafe { (kptr as *mut T).write_volatile(*value) };
+        Ok(())
+    }
+
     /// Validate a user pointer to a typed struct (immutable).
     pub fn user_ref<T: UserSafe>(&self, ptr: UserAddr) -> Option<&'a T> {
         let size = core::mem::size_of::<T>() as u64;
-        if size == 0 || !check_user_range(ptr, size) {
+        if size == 0 || !crate::mm::user_span::in_user_half(ptr.raw(), size) {
             return None;
         }
         if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
@@ -196,7 +229,7 @@ impl<'a> SyscallContext<'a> {
     /// Validate a user pointer to a typed struct (mutable).
     pub fn user_mut<T: UserSafe>(&self, ptr: UserAddr) -> Option<&'a mut T> {
         let size = core::mem::size_of::<T>() as u64;
-        if size == 0 || !check_user_range(ptr, size) {
+        if size == 0 || !crate::mm::user_span::in_user_half(ptr.raw(), size) {
             return None;
         }
         if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
@@ -212,7 +245,7 @@ impl<'a> SyscallContext<'a> {
             return Some(&[]);
         }
         let byte_len = count.checked_mul(core::mem::size_of::<T>())?;
-        if !check_user_range(ptr, byte_len as u64) {
+        if !crate::mm::user_span::in_user_half(ptr.raw(), byte_len as u64) {
             return None;
         }
         if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
@@ -249,7 +282,7 @@ impl<'a> SyscallContext<'a> {
             return Some(&mut []);
         }
         let byte_len = count.checked_mul(core::mem::size_of::<T>())?;
-        if !check_user_range(ptr, byte_len as u64) {
+        if !crate::mm::user_span::in_user_half(ptr.raw(), byte_len as u64) {
             return None;
         }
         if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {

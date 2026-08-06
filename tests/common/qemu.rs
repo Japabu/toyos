@@ -1065,8 +1065,8 @@ pub fn build_boot_image(
 /// Actuators that are a `SYS_DEBUG` action arm and nothing else.
 ///
 /// A boot cannot reach any of them; only a test that asks for one by number
-/// can. So the four kernels that differ only in which of them they carry are
-/// four builds of the same machine, and [`fold_inert`] makes them one.
+/// can. So the kernels that differ only in which of them they carry are
+/// several builds of the same machine, and [`fold_inert`] makes them one.
 ///
 /// **Membership is a claim about the kernel, not about the test that uses it**,
 /// and the claim is checkable: each name below has its `#[cfg]` sites in
@@ -1079,6 +1079,7 @@ const INERT_ACTUATORS: &[&str] = &[
     "test-screen-graffiti",
     "test-double-fault",
     "test-heap-ceiling",
+    "test-kernel-canary",
 ];
 
 /// The feature set to build, with every inert actuator replaced by the union of
