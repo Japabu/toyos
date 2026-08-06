@@ -2777,60 +2777,68 @@ and must be confirmed against `main` in the same session before it is believed �
 which is the A/B the audio rules already require and which this line currently
 invites an agent to skip.
 
-### OPEN — longest-job-first puts the two 8-CPU desktops side by side, and the profile that did it is self-reinforcing
+### OPEN — `desktop_window_child` holds a lane for four minutes, and whichever other desktop lands beside it loses its typing window
 
-Measured 2026-08-06 in one worktree, four full runs, on a host at roughly three
+Measured 2026-08-06 in one worktree, seven full runs, on a host at roughly three
 times its own load.
 
-`longest_first` orders the parallel phase on `target/test-durations`, what the
-last run in that worktree measured. The two longest jobs in the suite are now
-`desktop_window_child` (248 s) and `desktop_typing_damage` (246 s) — **the top
-two by a factor of six over the third** — and both boot `tests/desktopcase` at
-`smp: 8`. Longest-first therefore dispatches two eight-CPU desktop guests into
-the same instant, at the head of a twelve-wide phase, on a fourteen-core host.
+Three tests boot `tests/desktopcase` at `smp: 8` — `desktop_typing_damage`,
+`desktop_audio_client`, `desktop_window_child` — and each reaches its shell
+through `shell_answers`, whose retry window is `qemu::budget(20 s)`.
+`desktop_window_child` is an expected failure (§3) that runs its
+`close_focused_window` retry loop out to that same budget, so it occupies one
+lane for **~250 s of every run**. `longest_first` orders the parallel phase on
+`target/test-durations` and therefore dispatches it first; whichever of the
+other two the profile ranks next goes in beside it, waits behind two eight-CPU
+guests on a fourteen-core host, and reports `nothing typed at the terminal
+window reached a shell`.
 
-The first run in a fresh worktree has no profile at all, so every task sorts
-equal and the phase runs in declaration order, which happens to separate them:
+| run | profile | victim | wide | alone |
+|---:|---|---|---:|---:|
+| 1 | none (fresh worktree) | — | — | — |
+| 2 | written by run 1 | `desktop_typing_damage` | 243 s FAIL | 16 s GREEN |
+| 3 | " | `desktop_typing_damage` | 255 s FAIL | 16 s GREEN |
+| 4 | " | `desktop_typing_damage` | 246 s FAIL | 16 s GREEN |
+| 5 | deleted before this run | — | — | — |
+| 6 | written by run 5 | — | — | — |
+| 7 | written by run 6 | `desktop_audio_client` | 248 s FAIL | 14 s GREEN |
 
-| run | profile | `desktop_typing_damage` | verdict |
-|---|---|---:|---|
-| 1 | none (fresh worktree) | 48 s | PASS |
-| 2 | written by run 1 | 243 s | FAIL, `ALONE: GREEN` in 16 s |
-| 3 | " | 255 s | FAIL, `ALONE: GREEN` in 16 s |
-| 4 | " | 246 s | FAIL, `ALONE: GREEN` in 16 s |
-| 5 | deleted before this run | 17 s | PASS |
-| 6 | written by run 5 | 22 s | PASS |
+**The profile is a feedback loop, and it is bistable rather than a one-way
+latch.** What run 2 recorded for `desktop_typing_damage` is 243 s of mostly
+*waiting for the host*, and that number is what put it back beside
+`desktop_window_child` in runs 3 and 4: a duration profile whose entries include
+contention cannot order its way out of the contention it measured. It releases
+the same way it engages — run 5 had no profile at all, measured 17 s, and run 6
+read that and left the two apart. Run 7 then promoted the *other* desktop into
+the same slot, which is what says the victim is positional and not a property of
+any one test.
 
-**It is a feedback loop and it is bistable, not a one-way latch.** What run 2
-recorded for `desktop_typing_damage` is 243 s of mostly *waiting for the host*,
-and that number is what put it back beside the other desktop in runs 3 and 4: a
-duration profile whose entries include contention cannot order its way out of
-the contention it measured. But it releases the same way it engaged — run 5 had
-no profile, measured 17 s, and run 6 read that and left the two apart. So the
-state to expect is *either*, and a worktree stuck in the red one is unstuck by
-deleting `target/test-durations`. **That is a diagnosis and not a fix**: nothing
-stops the next run that happens to pair them from re-engaging it, and a green
-run bought by deleting a file is a green run about the ordering rather than
-about the tree.
+Deleting `target/test-durations` unsticks a worktree that is in the red state.
+**That is a diagnosis, not a fix**: it does not stop the next run promoting
+another desktop into the slot, and a green bought that way is a green about the
+ordering rather than about the tree.
 
-Three things are tangled here and only the first is scheduling:
+Consequences worth stating separately:
 
-- The ordering, above.
-- **`desktop_window_child` costs a lane four minutes on every run**, and always
-  did: `close_focused_window` retries until `qemu::budget(20 s)`, which at width
-  12 is 240 s. It is an expected failure (§3), so the four minutes buy a red
-  nobody acts on. A ceiling that scales with the width is right for a liveness
-  guard on a healthy test and wrong for one that is known to run out.
-- `desktop_typing_damage`'s verdict is still a typing window, which is what
-  `Sched::Parallel` is not for. Its bullet above says the budget was "evidently
-  not enough of it"; this says why.
+- **The four minutes buy a red nobody acts on.** `qemu::budget`'s width scaling
+  is right for a liveness guard on a healthy test and wrong for one that is
+  known to run out: `desktop_window_child` will spend the whole ceiling on every
+  run until #156 closes.
+- **Two of the three desktops' verdicts are typing windows**, which is what
+  `Sched::Parallel` is not for. The bullet above says the budget was "evidently
+  not enough of it"; this says what it is not enough *against*.
+- **`desktop_audio_client` is not a second #156.** It fails with
+  `desktop_typing_damage`'s message and `ALONE: GREEN`, which is this entry and
+  not the freeze, so it does not belong in `EXPECTED_FAILURES`.
 
 Not fixed here, and the fix is not obviously "reclassify": `Sched::Serial` for
-both desktops moves ~8 minutes into the serial tail, which
+all three desktops moves ~5 minutes into the serial tail, which
 `specs/test-cost-audit.md` §5.4 spent a wave getting out of. Candidates worth
 pricing: cap what a lane will spend on an `EXPECTED_FAILURES` test, exclude a
 test's contention wait from what the profile records, or give the profile a
 notion of how much host a task wants so two eight-CPU guests do not pair.
+**Whichever it is, a landing is currently a coin toss** — three of seven runs in
+one session were red on this and nothing else.
 
 ### A whole parallel phase can be starved by another agent's build
 
