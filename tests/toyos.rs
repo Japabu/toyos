@@ -522,17 +522,16 @@ struct ExpectedFailure {
     /// silence is not a substring — it lives in [`ExpectedFailure::spec`] and a
     /// human applies it. The `XFAIL` line prints the pointer for that reason.
     says: &'static [&'static str],
-    /// What ends this entry. See [`Stale`]; it is not a formality.
+    /// What ends this entry. See [`Stale`].
     stale: Stale,
 }
 
 impl ExpectedFailure {
-    /// Whether the entry has outlived what it claims, given a test that passed
-    /// and the day the run is happening on.
+    /// Whether the entry has outlived its own claim on the calendar.
     ///
-    /// Both halves are answered here so that neither can be answered by
-    /// forgetting: a [`Stale::OnThisDate`] entry is checked on every run,
-    /// whether or not its test ran at all.
+    /// The [`Stale::OnAPass`] half is decided in [`Outcome::verdict_against`],
+    /// where the pass is; this half is decided against the run itself, because a
+    /// date arrives whether or not the test ran at all.
     fn expired(&self, today: Day) -> Option<String> {
         match self.stale {
             Stale::OnAPass => None,
@@ -562,7 +561,8 @@ impl Day {
     fn today() -> Day {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+            .expect("a host clock before 1970 is a host to fix, not a date to guess at")
+            .as_secs() as i64;
         Day(secs.div_euclid(86_400))
     }
 
@@ -601,10 +601,11 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
     // one to be judged against: **a message belongs here when its failure is the
     // desktop ceasing to answer after a window closed.** That is what both open
     // defects under this test produce — the freeze, and the shell exiting
-    // instead of prompting. Five of the test's messages are deliberately absent
-    // because each names something else happening: the client binary missing,
-    // the desktop never coming up at all, a window never being created, and the
-    // client leaving on its own deadline. Any of those reds the run.
+    // instead of prompting. The test's other five messages are deliberately
+    // absent because each names something else happening: the client binary
+    // missing, the desktop never coming up at all, a window never being created
+    // (twice — the child's and snake's), and the client leaving on its own
+    // deadline. Any of those reds the run.
     says: &[
         "the windowed child never reported leaving",
         "a windowed child exited by itself and the shell never answered again",
