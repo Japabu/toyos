@@ -2426,6 +2426,38 @@ used to name as the closing move now exists (`buildlock::guest_slot`,
 worktree, so the four-suite regime these were observed in cannot recur. A looser
 assertion is still not the answer.
 
+**But `ALONE … red again — the defect is real` is not evidence, and the protocol
+above leans on it.** The re-run happens inside the same process, moments after
+twelve guests have been torn down and while another worktree's suite may still
+own the host — so it is alone in the suite's bookkeeping and not on the machine.
+Measured 2026-08-06 on the xHCI port-machine branch, whose kernel delta is
+`drivers/xhci/` and touches no PS/2 and no compositor path:
+
+```
+full suite, run 1 (483.7 s for 262 tests):
+  FAIL i8042_mouse — 975 of 1004;  ALONE: GREEN
+  FAIL screen_early_panic;         ALONE: GREEN
+full suite, run 2, the landing gate (512.1 s):
+  FAIL i8042_mouse — 560 of 592;   ALONE: red again — the defect is real
+  FAIL desktop_locale_detect;      ALONE: red again — the defect is real
+then, genuinely alone, same session, minutes later:
+  main         a051a67:  i8042_mouse PASS 10.4 s   desktop_locale_detect PASS 11.4 s
+  the branch   38431c7:  i8042_mouse PASS  4.1 s   desktop_locale_detect PASS  5.6 s
+```
+
+Both trees green on both tests with the host to themselves, and the same suite
+that took 120.4 s at the last quiet landing took 484 and 512 s in these two — so
+the host was carrying roughly four times its own load throughout, the `ALONE`
+re-run included. A verdict that flips between "GREEN, it is the host" and "red
+again, the defect is real" for one test on one tree twenty minutes apart is
+measuring the host in both directions.
+
+Consequence for the protocol: `ALONE: GREEN` still means what it says, because a
+green cannot be produced by load. `ALONE: red again` means nothing on its own
+and must be confirmed against `main` in the same session before it is believed —
+which is the A/B the audio rules already require and which this line currently
+invites an agent to skip.
+
 ### A whole parallel phase can be starved by another agent's build
 
 Measured 2026-08-04: the same tree that runs the phase in 44.8 s ran it in
