@@ -2669,10 +2669,29 @@ pub fn usb_boot_stick_pulled(
     _rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     let _ = test_config;
+    /// Probes sent before the pull, and after it. The drumbeat is the liveness
+    /// signal as well as the load: each one is a userland `println!` into the
+    /// ring the log sink drains to the stick, and a VFS walk for a binary that
+    /// is not there.
+    const BEFORE: usize = 12;
+    const AFTER: usize = 40;
+    /// How many of the probes after the pull have to come back. Not all of
+    /// them: a machine that pauses while the driver tears the port down and
+    /// then carries on has survived, and this gate's subject is a machine that
+    /// never carries on.
+    const ANSWERED: usize = 8;
+
     let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
     let options = BootOptions {
         profile: Profile::Metal,
         qmp: true,
+        // Rotation at 256 bytes rather than a mebibyte, so the sink is not just
+        // appending when the device goes: every few probes it creates a file,
+        // sweeps the volume, deletes the oldest and syncs the mount. That is
+        // FAT allocation and directory writes in flight at the moment of the
+        // pull, which is the state the owner's machine is in and the one a
+        // quiet idle desktop never reaches.
+        kernel_features: &["log-rotate-fast"],
         // The T14's core count. How many CPUs are in the idle loop when the
         // device goes is the whole question on one hypothesis.
         smp: 8,
@@ -2709,45 +2728,74 @@ pub fn usb_boot_stick_pulled(
         ));
     }
 
+    let mut probe = |qemu: &mut QemuInstance, console: &mut String, i: usize| {
+        let _ = writeln!(qemu.stdin_mut(), "run pull-probe-{i}");
+        qemu.flush_stdin();
+        console.push_str(&qemu.drain_serial(Duration::from_millis(120)));
+    };
+
+    for i in 0..BEFORE {
+        probe(&mut qemu, &mut console, i);
+    }
+    let answered_before = console.matches("===TEST_END pull-probe-").count();
+    if answered_before < BEFORE / 2 {
+        return Err(format!(
+            "only {answered_before} of {BEFORE} probes came back *before* the pull, so the \
+             drumbeat this gate measures does not work on a healthy machine:\n{console}"
+        ));
+    }
+    // The rotation actually ran, so "the sink was busy" is a fact rather than a
+    // feature flag that might have been dropped.
+    if !console.contains("log-file: /log/") || !console.contains("and this boot continues in") {
+        return Err(format!(
+            "the log sink never rotated, so the pull below lands on a sink that is only \
+             appending:\n{console}"
+        ));
+    }
+
+    let pulled_at = console.len();
     let mut devices = qemu::QmpDevices::open(&socket);
     devices.del(qemu::BOOT_STICK_ID);
     drop(devices);
 
-    // Counted from here, so the verdict cannot be satisfied by frames drawn
-    // before the pull. Two reporting intervals of 2 s each, inside 20 s.
-    let mut after = String::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while std::time::Instant::now() < deadline && frames(&after) < 2 {
-        after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    for i in BEFORE..BEFORE + AFTER {
+        probe(&mut qemu, &mut console, i);
     }
-    if frames(&after) < 2 {
-        console.push_str(&after);
+    let after = &console[pulled_at.min(console.len())..];
+    let answered = after.matches("===TEST_END pull-probe-").count();
+    let drawn = frames(after);
+    if answered < ANSWERED || drawn < 2 {
         return Err(format!(
-            "the desktop composited {} frame batches in the 20 s after the boot stick was \
-             pulled — it stopped drawing:\n{console}\n{}",
-            frames(&after),
+            "the boot stick was pulled and the machine answered {answered} of {AFTER} console \
+             probes and composited {drawn} frame batches after it (want {ANSWERED} and 2) — it \
+             stopped:\n{console}\n{}",
             crate::freeze_report(&mut qemu, &mut console)
         ));
     }
-    console.push_str(&after);
 
-    // Userland still answers the console. A different path from the frame
-    // counter: the byte arrives on the 16550, test-runner is scheduled, it
-    // prints, and then it asks the VFS for a binary — which is the lock the log
-    // sink holds while it writes to the device that just left.
-    let probe = "stick-gone-zqjxk";
-    let start = console.len();
-    writeln!(qemu.stdin_mut(), "run {probe}").map_err(|e| format!("write to QEMU stdin: {e}"))?;
-    qemu.flush_stdin();
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let marker = format!("===TEST_END {probe}");
-    while std::time::Instant::now() < deadline && !console[start..].contains(&marker) {
-        console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    // And the same stick put back. The owner reports the freeze from a replug
+    // as well as from a pull, and the two are different states: a replug binds
+    // a new disk under mounts that still name the old one.
+    let replug = test_dir().join("usb-replug.img");
+    drop(sparse(&replug, 512 * 1024 * 1024));
+    let replugged_at = console.len();
+    let mut devices = qemu::QmpDevices::open(&socket);
+    devices.blockdev_add("replug", &replug);
+    devices.add("usb-storage", "xhci.0", "replug0", &[("drive", "replug")]);
+    drop(devices);
+
+    for i in BEFORE + AFTER..BEFORE + 2 * AFTER {
+        probe(&mut qemu, &mut console, i);
     }
-    if !console[start..].contains(&marker) {
+    let after_replug = &console[replugged_at.min(console.len())..];
+    let answered_replug = after_replug.matches("===TEST_END pull-probe-").count();
+    let drawn_replug = frames(after_replug);
+    if answered_replug < ANSWERED || drawn_replug < 2 {
         return Err(format!(
-            "the console was still drawing but `run {probe}` never came back through the VFS \
-             after the boot stick was pulled:\n{console}\n{}",
+            "a stick was plugged back into the port the boot stick was pulled from and the \
+             machine answered {answered_replug} of {AFTER} console probes and composited \
+             {drawn_replug} frame batches after it (want {ANSWERED} and 2) — it stopped:\
+             \n{console}\n{}",
             crate::freeze_report(&mut qemu, &mut console)
         ));
     }
@@ -2757,11 +2805,12 @@ pub fn usb_boot_stick_pulled(
             return Err(format!("{bad:?} after the boot stick was pulled\n{console}"));
         }
     }
+    let _ = std::fs::remove_file(&replug);
 
     eprintln!(
-        "  [usb] the boot stick was pulled out from under a running desktop: {} frame batches \
-         after it, and `run` still reached userland and came back through the VFS",
-        frames(&after)
+        "  [usb] the boot stick was pulled out from under a running desktop with the log sink \
+         rotating: {answered}/{AFTER} console probes answered and {drawn} frame batches after \
+         the pull, {answered_replug}/{AFTER} and {drawn_replug} after a stick went back in"
     );
     Ok(())
 }
