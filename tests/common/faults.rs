@@ -243,8 +243,10 @@ pub fn dump_nmi_probe(
             ..Default::default()
         },
     );
-    // The actuator arms at 3 s and is deaf for 400 ms; the dump spends 250 ms
-    // on the kick before it reaches for the NMI.
+    // 3 s is the actuator's earliest arming, not its schedule: cpu0 only looks
+    // once per idle-loop iteration, and on a settled guest the next thing that
+    // wakes it is the 10 s health tick. Add 400 ms of deafness and the dump's
+    // 250 ms kick budget, and 20 s is the first round number that clears it.
     let log = qemu.drain_serial(Duration::from_secs(20));
 
     if !log.contains("=== blocked-task dump:") {
@@ -279,9 +281,16 @@ pub fn dump_nmi_probe(
             rip_line.trim(),
         ));
     }
-    // And it comes back: an NMI interrupts, it does not kill.
-    if !log.contains("Boot: complete") {
-        return Err(format!("the deafened CPU did not rejoin and the boot never finished\n{log}"));
+    // And it comes back: an NMI interrupts, it does not kill. The witness has
+    // to be the victim's own line, printed after it re-enables interrupts.
+    // `Boot: complete` was the first attempt and is no witness at all — it is
+    // printed at 225 ms, ten seconds before this window opens, and by cpu0 into
+    // the boot log this drain does not even contain.
+    if !log.contains("rejoined after") {
+        return Err(format!(
+            "the deafened CPU never said it was back — an NMI must interrupt a CPU, not kill \
+             it\n{log}"
+        ));
     }
     Ok(())
 }

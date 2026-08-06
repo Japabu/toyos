@@ -1339,6 +1339,17 @@ if the test *passes* where the entry says a pass is proof, and is red on
 date rather than a green run. The `--skip` flag that used to be the answer is
 deleted: an exclusion nobody reviews cannot expire, and this one has to.
 
+**A stale `--skip` command line is worse than a refused one, measured
+2026-08-06.** The flag is gone but the words still parse, and `--land --gate
+cargo test -- --skip desktop_window_child` — the form CLAUDE.md and every
+handover carried until this week — now reaches the harness as two *filters*.
+It ran exactly one test, `desktop_window_child`, declared it expected, and
+landed on that. `--land` does print `the gate was NOT the default cargo test`,
+which is the only thing that saved it; the run itself looks like a pass. Use
+the ordinary gate. A stale feature name is refused against `kernel/Cargo.toml`
+before any lock and a stale gate flag is not, which is the asymmetry to close
+if this bites twice.
+
 **What the declaration will and will not absorb.** Its `says` list covers the
 six of this test's messages whose failure is *the desktop ceasing to answer
 after a window closed*. The other five red the run — the client binary missing,

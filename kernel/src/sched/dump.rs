@@ -320,7 +320,8 @@ pub(super) fn deaf_window() {
             .compare_exchange(ASKED, DEAF, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            let until = crate::clock::nanos_since_boot() + DEAF_NS;
+            let began = crate::clock::nanos_since_boot();
+            let until = began + DEAF_NS;
             // SAFETY: the actuator's whole content. Interrupts come back on
             // below and the loop is bounded by the clock.
             unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
@@ -328,6 +329,11 @@ pub(super) fn deaf_window() {
                 core::hint::spin_loop();
             }
             unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+            // The victim is the only thing that can witness its own return, and
+            // half of what the probe claims is that an NMI interrupts a CPU
+            // rather than killing it.
+            let deaf_ms = (crate::clock::nanos_since_boot() - began) / 1_000_000;
+            log!("dump-deaf-cpu: cpu{me} rejoined after {deaf_ms}ms deaf");
         }
         return;
     }
