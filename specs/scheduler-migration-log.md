@@ -443,3 +443,117 @@ doc-comment says so. `MAX_PASS_NS` is 200 µs. A CPU inside that recovery holds
 every message addressed to it, and `retire_task`'s deadline is the only thing in
 the tree that notices. Recorded in `specs/known-issues.md`; not fixed here,
 because closing it means making xHCI enumeration asynchronous.
+
+### The desktop freeze is a halted machine, not a wedged one (open, #156)
+
+`desktop_window_child` reproduces a freeze in QEMU at roughly 2 in 5 runs. The
+guest stops emitting anything at all — including the compositor's ~2 s stats
+line — and the test fails on whatever assertion it was waiting for.
+
+**The evidence that settled what it is, taken before anything touched the
+guest.** All eight vCPUs, read over QMP while the test sat in its 20 s wait:
+
+```
+CPU#0..7   RIP=ffff80007cecf5c1  RFL=00000246 [---Z-P-] CPL=0  HLT=1
+```
+
+`HLT=1` on every core and `RFL=0x246` has **IF set**. The CPUs are halted with
+interrupts *enabled*, waiting for an interrupt that never arrives. That is not
+a wedge, and it disproves four hypotheses at once: no CPU is spinning with
+interrupts off (`BackendGuard::lock` and the serial-drain livelock), none is
+holding a lock (a `hlt` holds nothing), none is stuck below the interrupt layer,
+and "no CPU reaches a scheduler pass" has the causality backwards — every CPU
+*can* schedule and there is nothing to schedule.
+
+Injecting Ctrl+Alt+D over the same QMP socket takes the halted count from 8 to
+0 and the machine resumes, compositor line and all. One keystroke revives it.
+
+**What the dump then reports, in three independent captures that agree:**
+
+```
+ready: pid=0 tid=0 compositor cpu=662ms
+cpu0 pid=0 tid=0 io parked 14ms due in 1ms
+== census: 1 thread(s) — 0 running, 1 ready, 0 blocked, 0 zombie, 0 unscheduled
+== sched: 8/8 cpu(s) answered — 0 running, 0 queued, 1 parked
+== deadlines: 0 event-only, 1 pending, 0 OVERDUE, 0 ABSURD
+```
+
+One thread exists in the whole system. The shell, the terminal and the child
+have all exited; the survivor is the compositor, parked on cpu0 **on a timer
+deadline**, and it is the only thing that could ever have restarted the machine.
+So the freeze is: *cpu0 halted with the last runnable-in-principle thread parked
+on a deadline that did not fire.*
+
+**Read `0 OVERDUE` there with the caveat below in hand: it describes the revived
+machine.** The keystroke that produced the report is what woke cpu0 and made it
+re-arm, so every deadline field postdates the repair.
+
+**Why the report could not be read at all** is the next section: the deadline
+was stored twice and the report read the copy that armed nothing. That is fixed;
+the freeze is not thereby settled, and this entry stays open.
+
+**Do not unify this with the T14 (#142/#156).** There, three CPUs failed to
+answer a 250 ms *kick* while five did; here 8/8 answer. Different observations,
+possibly different defects, and the T14 cannot be attached to — which is what
+the NMI probe in `arch/idt/nmi.rs` is for and why it stays even though the
+debugger settled this case without it.
+
+### The deadline was stored twice and only one copy armed anything (2026-08-06)
+
+`ParkedEntry.deadline` and `DeadlineHeap` each held the same value, and each
+module's doc comment claimed to be its single home — `timer.rs`: "every deadline
+lives in exactly one place: the home CPU's heap"; `cpu.rs`: "the deadline lives
+*here* and nowhere else". `apply_timer` armed from the heap. `sched::dump`,
+invariant T and `earliest_event` read the entry.
+
+They diverge in one arm. `fire_deadlines` called `DeadlineHeap::pop_due`, which
+**removes** the entry before the claim is attempted; a `Claim::Lost` then
+`continue`d and the heap entry was gone while `ParkedEntry.deadline` kept its
+copy. Such a CPU arms `TimerPlan::Stop` and reports `1 pending, 0 OVERDUE` — the
+corruption is not merely consistent with health, it is indistinguishable from it
+by construction, which is why #156's capture could not be read.
+
+**Why nothing had ever caught it, which is not what the checkpoint guessed.**
+Invariant T's teeth were never the problem: `check_timer`'s `(None, Some(due))`
+arm is exactly this state, and it fires on the very pass where the divergence
+happens in any `check` build. What was missing is a *scenario*.
+`SchedPass::begin` runs `drain` and `fire_deadlines` back to back with no step
+boundary between them, so the explorer cannot place a remote claim there and
+`Claim::Lost` is unreachable in every run the simulator has ever made — the same
+shape as the `8508b37` window and as `pre_park_claims`, an interleaving that is
+not in the step relation at all. On hardware the window is two instructions of a
+remote CPU: `TaskShared::claim_wake`, then the `Msg::Wake` post in
+`waitq::deliver_wake`. `sim/tests/deadline_claim_race.rs` is that pair with a
+whole pass scripted in between. Written and run **before** the fix; its verdict
+on the unfixed tree is
+
+```
+invariant T: cpu CpuId(0) has an event at Nanos(5000000) and no timer armed
+```
+
+**The fix deletes the second copy** rather than keeping the two in step: the
+deadline lives in `ParkedEntry` and nowhere else, `DeadlineHeap` and
+`DeadlineOracle` are gone with the lazy-deletion rule they existed for, and
+`apply_timer` reads the field invariant T reads. With one copy, the lost claim
+has exactly one thing it can do and it is also the correct thing — clear the
+deadline. A remote waker owns the wake, so no later claim can succeed and that
+timeout can never fire; an entry that went on reporting it was reporting
+something that would not happen. Clearing it is also what advances the loop,
+which is the property worth having: the deadline that will not be honoured and
+the deadline that is not reported are one field.
+
+Cost: `earliest_deadline` and `next_due` scan `parked` where the heap was
+O(log n) amortized, and both sit on the pass path. What that buys is the
+deletion of the oracle, the staleness rule, and a two-statement mutation whose
+second statement is the one that went missing. The number that would reverse the
+decision is hundreds of threads blocked on one CPU.
+
+**What this does not settle.** It closes a representation defect and a report
+that lied; it is *not* established that this is what froze the guest. The
+claim's `Msg::Wake` follows it within two instructions, cpu0 cannot halt with a
+non-empty mailbox (`SleepArm::confirm`), and a post to a CPU that has published
+SLEEPING returns `Kick::Send` — so the protocol still has an answer for every
+ordering that could be constructed by reading it. `desktop_window_child` stays
+an expected red and is not evidence either way (known-issues §3). And nothing
+here says anything about the T14, where 3 of 8 CPUs missed a kick and this
+machine's 8 answered.

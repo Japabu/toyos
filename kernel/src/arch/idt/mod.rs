@@ -2,6 +2,7 @@ pub(crate) mod exceptions;
 mod device_irq;
 mod dma_fault;
 mod i8042;
+mod nmi;
 mod timer;
 mod tlb;
 mod virtio_net;
@@ -25,6 +26,8 @@ const PIC2_DATA: u16 = 0xA1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Vector {
     Debug = 0x01,
+    /// Diagnostic only, and sent by `sched::dump` alone — see `idt/nmi.rs`.
+    Nmi = 0x02,
     InvalidOpcode = 0x06,
     DoubleFault = 0x08,
     GeneralProtection = 0x0D,
@@ -321,6 +324,7 @@ pub fn init() {
     {
         let mut idt = IDT.lock();
         idt.entries[Vector::Debug as usize] = IdtEntry::new(stub_db as *const () as u64);
+        idt.entries[Vector::Nmi as usize] = IdtEntry::new(nmi::nmi_entry as *const () as u64);
         idt.entries[Vector::InvalidOpcode as usize] = IdtEntry::new(stub_ud as *const () as u64);
         idt.entries[Vector::DoubleFault as usize] = IdtEntry::new(stub_df as *const () as u64).with_ist(1);
         idt.entries[Vector::GeneralProtection as usize] = IdtEntry::new(stub_gpf as *const () as u64);

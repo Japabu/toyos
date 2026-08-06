@@ -1004,6 +1004,48 @@ on ARM64, which is planned and not built. That is why `try_lock`'s acquire edge
 sat on the wrong atomic through every green suite run until a model checker was
 pointed at it.
 
+### A CPU that stops scheduling keeps publishing load 0, and `placement()` therefore prefers it
+
+The T14's Ctrl+Alt+D dump (`boot9-dump.log`, 35.181 s) reports `5/8 cpu(s)
+answered`. cpu1, cpu4 and cpu7 each failed to reach a scheduler pass inside the
+dump's 250 ms budget. Their last lines in that whole 63 s boot are the idle
+loop's own:
+
+| CPU | last line, and it is the last thing it ever said |
+|---|---|
+| cpu1 | 1.152 s — `sched: cpu=1 ready=0 parked=0 current=None` |
+| cpu7 | 11.231 s — `sched: cpu=7 ready=0 parked=1 current=None` |
+| cpu4 | 26.110 s — `sched: cpu=4 ready=0 parked=1 current=None` |
+
+**Whatever stops them is a separate defect. This entry is about what the
+scheduler then does about it, which is the opposite of the right thing.**
+`CpuHandle::publish_load` is written by a CPU at the end of each of its own
+passes, so a CPU that takes no more passes publishes its last value forever —
+and its last value is the one it wrote on the way into idle, which is **zero**.
+`driver::placement` picks `min_by_key(load)`. A dead CPU is therefore not merely
+a CPU that never runs anything again; it is the CPU the scheduler *prefers* for
+every subsequent spawn.
+
+That is the difference between losing a core and the machine getting
+progressively worse, which is what the owner reports and what the log shows:
+three cores shed over 26 s, and by the end the dump finds `pid=10 terminal`,
+`pid=6 tid=2 doom` and `pid=12 shell` all `ready and has never run`, plus
+`soundd` ready with 2 ms of CPU. doom's black window is its sound-init thread
+placed on a shed core; the missing shell prompt is `shell pid=12` on another.
+
+A load figure is a claim about the present, and a stopped CPU's is a lie the
+scheduler believes. The fix is independent of the root cause and worth having
+either way: placement must not be able to choose a CPU that has not completed a
+pass in some number of intervals. The counter to compare against already exists
+per CPU (`publish_load`'s call site is the end of every pass, so a monotonic
+pass count published beside the load costs one relaxed store), and the same
+staleness test would let `idle_sibling` and `post_steal_probe` stop aiming at
+dead cores too.
+
+Not fixed here: the instrument that names *why* a CPU stops (NMI probe,
+`arch/idt/nmi.rs`) landed first, because a placement filter over an unknown
+cause would hide the cause.
+
 ### A scheduler pass may spend two seconds in xHCI before it drains its mailbox
 
 `sched::driver::pass` and `pass_block` both open with `drain_irqs()`, and
@@ -1275,10 +1317,59 @@ is not trustworthy in general — the xHCI work established that `ALONE: red
 again` can measure the host rather than the tree — but in this direction, on
 this test, green-alone is real.)
 
-**Landing while it is red** uses `--land --gate cargo test -- --skip
-desktop_window_child`, which prints the override in the report and cannot be
-mistaken for an ordinary landing. `--skip` exists for this and should not grow
-other users.
+**A third manifestation, 2026-08-06**, on the mechanism branch, twice in one
+session — once in the 12-wide phase and once in the re-run alone, at 3.5 s into
+both boots. The message is `GUI+Q never reached the compositor`, **and it names
+the wrong thing**: the close did reach the compositor. The log under it is the
+teardown, one probe earlier than the snake rounds — `exit: test_rs_window_child
+pid=5 code=0`, then `exit: shell pid=2 code=0`, then `exit: terminal pid=1
+code=0`, then `windows=0`. `close_focused_window` waits for `windows=1` and the
+desktop went straight to none, so the harness reports the injection it did
+deliver as one that never arrived. Serial kept flowing for the whole drain —
+compositor stats every ~2 s, kernel stats every 10 s — so by this entry's own
+discriminator it is **not** the freeze; it is the shell-exit defect three
+paragraphs down, reached at the first windowed child rather than during a snake
+round. Whoever fixes that message should make it say what the log says.
+
+**Landing while it is red** needs nothing special: `desktop_window_child` is
+declared in `EXPECTED_FAILURES` (`tests/toyos.rs`) and `cargo run -- --land`
+runs the ordinary gate. The declaration reports it by name on every run, is red
+if the test *passes* where the entry says a pass is proof, and is red on
+`2026-09-06` regardless — this entry is intermittent, so its own expiry is a
+date rather than a green run. The `--skip` flag that used to be the answer is
+deleted: an exclusion nobody reviews cannot expire, and this one has to.
+
+**A stale `--skip` command line is worse than a refused one, measured
+2026-08-06.** The flag is gone but the words still parse, and `--land --gate
+cargo test -- --skip desktop_window_child` — the form CLAUDE.md and every
+handover carried until this week — now reaches the harness as two *filters*.
+It ran exactly one test, `desktop_window_child`, declared it expected, and
+landed on that. `--land` does print `the gate was NOT the default cargo test`,
+which is the only thing that saved it; the run itself looks like a pass. Use
+the ordinary gate. A stale feature name is refused against `kernel/Cargo.toml`
+before any lock and a stale gate flag is not, which is the asymmetry to close
+if this bites twice.
+
+**What the declaration will and will not absorb.** Its `says` list covers the
+six of this test's messages whose failure is *the desktop ceasing to answer
+after a window closed*. The other five red the run — the client binary missing,
+the desktop never coming up, a window never being created, and the client
+leaving on its own deadline. That pins which assertion failed and not why, so
+the log-tail discriminator above is still a human's to apply; the run prints the
+pointer to this section beside every `XFAIL` line for exactly that reason.
+
+**One thing #156's capture leaned on is closed, and it is not this.** The
+deadline was stored twice — `ParkedEntry.deadline` and `DeadlineHeap` — and
+`fire_deadlines`' lost claim discarded one copy, so a CPU could halt with
+`TimerPlan::Stop` while its report said `1 pending, 0 OVERDUE`. That is why the
+dump taken off the frozen guest could not be read, and it is fixed
+(`scheduler-migration-log.md`, 2026-08-06): a deadline lives in one place and
+invariant T reads what arms the timer. **This entry stays open.** Nothing
+established that the divergence is what froze the guest — the claim's
+`Msg::Wake` follows it within two instructions and `SleepArm::confirm` refuses
+to halt on a non-empty mailbox — and a green run of this test after that change
+is the race landing the other way rather than evidence. Judge it by the
+signature above, never by one run.
 
 **What the test was built to chase is still open underneath it**, and is not
 the same thing: on `boot8-snake.log` the owner closed snake's window and got
@@ -2690,7 +2781,9 @@ phase landed, and none reproduces on a host running one suite.
 - **`desktop_typing_damage`** — `nothing typed at the terminal window reached a
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
-  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`.
+  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`. **See the entry
+  below: as of 2026-08-06 this is no longer occasional but reproducible, and the
+  mechanism is the duration profile.**
 - **`desktop_locale_detect`** — added 2026-08-05. Same `nothing typed at the
   terminal window reached a shell`, same `ALONE … GREEN`, in the same run as the
   entry above and on a branch that touches neither the compositor nor the
@@ -2749,6 +2842,69 @@ green cannot be produced by load. `ALONE: red again` means nothing on its own
 and must be confirmed against `main` in the same session before it is believed —
 which is the A/B the audio rules already require and which this line currently
 invites an agent to skip.
+
+### OPEN — `desktop_window_child` holds a lane for four minutes, and whichever other desktop lands beside it loses its typing window
+
+Measured 2026-08-06 in one worktree, seven full runs, on a host at roughly three
+times its own load.
+
+Three tests boot `tests/desktopcase` at `smp: 8` — `desktop_typing_damage`,
+`desktop_audio_client`, `desktop_window_child` — and each reaches its shell
+through `shell_answers`, whose retry window is `qemu::budget(20 s)`.
+`desktop_window_child` is an expected failure (§3) that runs its
+`close_focused_window` retry loop out to that same budget, so it occupies one
+lane for **~250 s of every run**. `longest_first` orders the parallel phase on
+`target/test-durations` and therefore dispatches it first; whichever of the
+other two the profile ranks next goes in beside it, waits behind two eight-CPU
+guests on a fourteen-core host, and reports `nothing typed at the terminal
+window reached a shell`.
+
+| run | profile | victim | wide | alone |
+|---:|---|---|---:|---:|
+| 1 | none (fresh worktree) | — | — | — |
+| 2 | written by run 1 | `desktop_typing_damage` | 243 s FAIL | 16 s GREEN |
+| 3 | " | `desktop_typing_damage` | 255 s FAIL | 16 s GREEN |
+| 4 | " | `desktop_typing_damage` | 246 s FAIL | 16 s GREEN |
+| 5 | deleted before this run | — | — | — |
+| 6 | written by run 5 | — | — | — |
+| 7 | written by run 6 | `desktop_audio_client` | 248 s FAIL | 14 s GREEN |
+
+**The profile is a feedback loop, and it is bistable rather than a one-way
+latch.** What run 2 recorded for `desktop_typing_damage` is 243 s of mostly
+*waiting for the host*, and that number is what put it back beside
+`desktop_window_child` in runs 3 and 4: a duration profile whose entries include
+contention cannot order its way out of the contention it measured. It releases
+the same way it engages — run 5 had no profile at all, measured 17 s, and run 6
+read that and left the two apart. Run 7 then promoted the *other* desktop into
+the same slot, which is what says the victim is positional and not a property of
+any one test.
+
+Deleting `target/test-durations` unsticks a worktree that is in the red state.
+**That is a diagnosis, not a fix**: it does not stop the next run promoting
+another desktop into the slot, and a green bought that way is a green about the
+ordering rather than about the tree.
+
+Consequences worth stating separately:
+
+- **The four minutes buy a red nobody acts on.** `qemu::budget`'s width scaling
+  is right for a liveness guard on a healthy test and wrong for one that is
+  known to run out: `desktop_window_child` will spend the whole ceiling on every
+  run until #156 closes.
+- **Two of the three desktops' verdicts are typing windows**, which is what
+  `Sched::Parallel` is not for. The bullet above says the budget was "evidently
+  not enough of it"; this says what it is not enough *against*.
+- **`desktop_audio_client` is not a second #156.** It fails with
+  `desktop_typing_damage`'s message and `ALONE: GREEN`, which is this entry and
+  not the freeze, so it does not belong in `EXPECTED_FAILURES`.
+
+Not fixed here, and the fix is not obviously "reclassify": `Sched::Serial` for
+all three desktops moves ~5 minutes into the serial tail, which
+`specs/test-cost-audit.md` §5.4 spent a wave getting out of. Candidates worth
+pricing: cap what a lane will spend on an `EXPECTED_FAILURES` test, exclude a
+test's contention wait from what the profile records, or give the profile a
+notion of how much host a task wants so two eight-CPU guests do not pair.
+**Whichever it is, a landing is currently a coin toss** — three of seven runs in
+one session were red on this and nothing else.
 
 ### A whole parallel phase can be starved by another agent's build
 
