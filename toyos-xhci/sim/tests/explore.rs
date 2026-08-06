@@ -63,6 +63,8 @@ fn explore(seed: u64) -> Result<(), String> {
     for did in &driver.did {
         held += match did {
             Did::Enumerated { .. } | Did::GaveUp(_) => 1,
+            // A reset is a step on the way in, not a claim on the port.
+            Did::Reset(_) => 0,
             Did::ToreDown(_) => -1,
         };
         if !(0..=1).contains(&held) {

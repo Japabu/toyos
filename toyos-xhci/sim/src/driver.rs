@@ -5,14 +5,16 @@
 //! whose loop differs from the driver's tests a driver nobody ships.
 
 use toyos_xhci::invariants::{self, Violation};
-use toyos_xhci::port::{Flaw, GaveUp, Gone, Nanos, PortState, Step};
+use toyos_xhci::port::{Flaw, GaveUp, Gone, Nanos, PortState, Reset, Step};
+use toyos_xhci::Protocol;
 
 use crate::hub::FakePort;
 
 /// An effect the driver performed, in the order it performed them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Did {
-    Enumerated { slot: Option<u8> },
+    Enumerated { slot: Option<u8>, trained: bool },
+    Reset(Reset),
     ToreDown(Gone),
     GaveUp(GaveUp),
 }
@@ -62,6 +64,25 @@ impl Driver {
         Self { state: PortState::with_flaw(flaw), ..Self::new() }
     }
 
+    /// A driver that read the controller's Supported Protocol capability and so
+    /// knows what this port speaks.
+    pub fn speaking(mut self, protocol: Protocol) -> Self {
+        self.state.speaks(Some(protocol));
+        self
+    }
+
+    /// Every reset the driver issued, in order — the assertion for a port that
+    /// should have needed none.
+    pub fn resets(&self) -> Vec<Reset> {
+        self.did
+            .iter()
+            .filter_map(|d| match d {
+                Did::Reset(kind) => Some(*kind),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Stage an enumeration that produces no slot.
     pub fn without_slot(mut self) -> Self {
         self.slot = None;
@@ -107,7 +128,11 @@ impl Driver {
                     self.wake_at = None;
                     return Ok(());
                 }
-                Step::Write(write) | Step::Reset(write) => port.write(write.raw(), now),
+                Step::Write(write) => port.write(write.raw(), now),
+                Step::Reset(kind, write) => {
+                    self.did.push(Did::Reset(kind));
+                    port.write(write.raw(), now);
+                }
                 Step::Teardown(why, pending) => {
                     pending.running();
                     // Between here and the report, the port is inside an
@@ -125,7 +150,7 @@ impl Driver {
                     self.did.push(Did::ToreDown(why));
                     self.state.torn_down();
                 }
-                Step::Enumerate(pending) => {
+                Step::Enumerate { trained, pending } => {
                     pending.running();
                     if self.reenter {
                         let read = port.read();
@@ -135,7 +160,7 @@ impl Driver {
                             return Err(Stuck::Broke(bad));
                         }
                     }
-                    self.did.push(Did::Enumerated { slot: self.slot });
+                    self.did.push(Did::Enumerated { slot: self.slot, trained });
                     self.state.enumerated(self.slot.and_then(core::num::NonZeroU8::new));
                 }
             }

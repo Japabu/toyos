@@ -6,6 +6,39 @@
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Portsc(u32);
 
+/// What a port's link is doing (§5.4.8 Table 5-28).
+///
+/// Only the states this driver decides on are named. The rest are carried
+/// verbatim, because a controller reporting one is a machine to describe rather
+/// than to guess about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkState {
+    /// U0 — the link is up and the port is usable.
+    Active,
+    /// The link failed and **only a warm reset gets it back** (§4.19.1.2.4). A
+    /// USB3 port answering a hot reset it could not take lands here, which is
+    /// where a driver with no warm reset stops having a port.
+    Inactive,
+    /// RxDetect: nothing is there yet, or the far end has not answered.
+    RxDetect,
+    /// Polling: the link is training. Neither up nor failed, so neither reset
+    /// applies — waiting is what this state asks for.
+    Polling,
+    Other(u8),
+}
+
+impl LinkState {
+    const fn decode(raw: u8) -> Self {
+        match raw {
+            0 => Self::Active,
+            5 => Self::RxDetect,
+            6 => Self::Inactive,
+            7 => Self::Polling,
+            other => Self::Other(other),
+        }
+    }
+}
+
 /// CCS — a device is attached. Read-only.
 const CCS: u32 = 1 << 0;
 /// PED — the port is enabled. RW1CS, which is why nothing here can set it.
@@ -16,6 +49,11 @@ const OCA: u32 = 1 << 3;
 const PR: u32 = 1 << 4;
 /// PLS — the link state. RWS, written only through LWS, which this never sets.
 const PLS: u32 = 0xF << 5;
+/// WRC — a warm reset finished. RW1CS, and USB3 ports only.
+const WRC: u32 = 1 << 19;
+/// WPR — warm port reset. RW1S, USB3 ports only, and the only way out of
+/// Inactive (§4.19.1.2.4).
+const WPR: u32 = 1 << 31;
 /// PP — port power. RWS.
 const PP: u32 = 1 << 9;
 /// The speed the port trained at. Read-only, and §4.19.5 says it is not valid
@@ -72,8 +110,17 @@ impl Portsc {
         self.0 & CSC != 0
     }
 
+    /// Whether a reset of either kind has finished. A warm reset sets WRC and a
+    /// conformant controller sets PRC with it; one flag is enough to act on and
+    /// both are cleared together.
     pub const fn reset_changed(self) -> bool {
-        self.0 & PRC != 0
+        self.0 & (PRC | WRC) != 0
+    }
+
+    /// What the link is doing, which on a USB3 port is what decides whether a
+    /// reset is needed at all and which kind.
+    pub const fn link_state(self) -> LinkState {
+        LinkState::decode(((self.0 & PLS) >> 5) as u8)
     }
 
     pub const fn any_change(self) -> bool {
@@ -141,12 +188,20 @@ impl Write {
     /// that acknowledged everything would swallow the evidence that what it
     /// just brought up is already gone.
     pub const fn acknowledging_reset(self) -> Self {
-        Self(self.0 | PRC)
+        Self(self.0 | PRC | WRC)
     }
 
     /// Reset the port, which for a USB2 port is how a device is enabled at all.
+    /// On a USB3 port this is a *hot* reset of a link that is already trained.
     pub const fn resetting(self) -> Self {
         Self(self.0 | PR)
+    }
+
+    /// Warm-reset the port: a full re-training of the link, and the only way
+    /// out of [`LinkState::Inactive`]. USB3 ports only — a USB2 port has no
+    /// such bit and writing it does nothing.
+    pub const fn warm_resetting(self) -> Self {
+        Self(self.0 | WPR)
     }
 
     /// Power the port. HCRST returns every root-hub port to the state it has

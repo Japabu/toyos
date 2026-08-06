@@ -9,7 +9,8 @@
 
 use core::num::NonZeroU8;
 
-use crate::portsc::{self, Portsc};
+use crate::portsc::{self, LinkState, Portsc};
+use crate::protocol::Protocol;
 
 /// Nanoseconds since boot, as the caller counts them.
 pub type Nanos = u64;
@@ -31,8 +32,24 @@ pub const RESET_DEADLINE_NS: Nanos = 2_000_000_000;
 /// Why a port stopped being worked on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GaveUp {
-    /// PR was written and PRC never came.
-    ResetNeverFinished,
+    /// A reset was written and no completion came.
+    ResetNeverFinished(Reset),
+    /// A USB3 link was warm-reset as well and still did not come up.
+    /// §4.19.1.2 has nothing beyond a warm reset, so this is the end of the
+    /// road for the port rather than one step short of it.
+    LinkNeverTrained,
+}
+
+/// Which reset a port is being given.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reset {
+    /// PR. What enables a USB2 port at all, and on a USB3 port a *hot* reset of
+    /// a link that has already trained.
+    Hot,
+    /// WPR. A full re-training of the link, USB3 only, and the only way out of
+    /// [`crate::LinkState::Inactive`] — the state a USB3 port lands in when it
+    /// cannot take the hot reset a USB2-shaped driver gives it.
+    Warm,
 }
 
 /// Why a port's device is being taken down.
@@ -55,13 +72,16 @@ pub enum Step<'a> {
     /// Write this to PORTSC.
     Write(portsc::Write),
     /// Reset the port by writing this. Separate from an ordinary write because
-    /// it is the one the caller announces, and because which reset a port needs
-    /// is the decision this machine exists to make.
-    Reset(portsc::Write),
+    /// **which reset a port needs is the decision this machine exists to
+    /// make** — a function of what the port speaks and what its link is doing,
+    /// not three fixes bolted onto one another.
+    Reset(Reset, portsc::Write),
     /// Take down whatever this port had.
     Teardown(Gone, Pending<'a>),
-    /// Bring up whatever is in this port.
-    Enumerate(Pending<'a>),
+    /// Bring up whatever is in this port. `trained` is true when the link was
+    /// already up and no reset was issued, which is the ordinary way a USB3
+    /// port arrives and the thing the driver used to reset out of existence.
+    Enumerate { trained: bool, pending: Pending<'a> },
     /// Say this and leave the port alone until its device is pulled.
     GaveUp(GaveUp),
 }
@@ -108,8 +128,11 @@ enum Work {
     /// Its connect state differs from the one the driver acted on, and has
     /// since `at`. A port that changes its mind again gets a fresh `at`.
     Debouncing { at: Nanos },
-    /// PR is written and PRC has not arrived.
-    Resetting { until: Nanos },
+    /// A reset is written and no completion has arrived. `kind` is which one,
+    /// because it decides what happens when the deadline passes: a hot reset a
+    /// USB3 port did not take is what a warm reset is *for*, and a warm one
+    /// that failed is the end.
+    Resetting { until: Nanos, kind: Reset },
     /// The caller is inside an effect and has not reported it.
     Working(Effect),
 }
@@ -147,6 +170,10 @@ pub struct PortState {
     /// the same byte.
     slot: Option<NonZeroU8>,
     work: Work,
+    /// What this port speaks, or `None` where the controller did not say.
+    /// Unknown is driven the USB2 way, which is what every port got before the
+    /// Supported Protocol capability was read at all.
+    protocol: Option<Protocol>,
     #[cfg(feature = "flaws")]
     flaw: Flaw,
 }
@@ -162,6 +189,7 @@ impl PortState {
         attached: false,
         slot: None,
         work: Work::Settled,
+        protocol: None,
         #[cfg(feature = "flaws")]
         flaw: Flaw::None,
     };
@@ -219,6 +247,13 @@ impl PortState {
 
     /// Adopt a port the boot scan enumerated, so the hot-plug machine starts
     /// from what the boot path already did rather than re-deciding it.
+    /// What the controller's Supported Protocol capability said this port
+    /// speaks. Set once, at bring-up, from firmware's own description of the
+    /// machine.
+    pub fn speaks(&mut self, protocol: Option<Protocol>) {
+        self.protocol = protocol;
+    }
+
     pub fn adopt(&mut self, slot: Option<NonZeroU8>) {
         self.attached = true;
         self.slot = slot;
@@ -256,19 +291,30 @@ impl PortState {
 
         // Before any change flag is cleared, because PRC is the one this state
         // is waiting for.
-        if let Work::Resetting { until } = self.work {
+        if let Work::Resetting { until, kind } = self.work {
             if portsc.reset_changed() {
-                return Step::Enumerate(Pending(self));
+                return Step::Enumerate { trained: false, pending: Pending(self) };
             }
             if now < until || self.flawed(Flaw::NoResetDeadline) {
                 return Step::Wait(until);
+            }
+            // **A hot reset a USB3 port would not take is what a warm reset
+            // exists for.** The link is Inactive or never left Polling, and
+            // §4.19.1.2.4 has exactly one way out of that. A driver without it
+            // stops here, which is a USB-A port that never mounts anything.
+            if kind == Reset::Hot && self.protocol == Some(Protocol::Usb3) && connected {
+                self.work = Work::Resetting { until: now + RESET_DEADLINE_NS, kind: Reset::Warm };
+                return Step::Reset(Reset::Warm, portsc.neutral().warm_resetting());
             }
             // Attached, so the port is not tried again until its device is
             // pulled — which is what stops a port the controller will not reset
             // from being reset forever.
             self.attached = true;
             self.work = Work::Settled;
-            return Step::GaveUp(GaveUp::ResetNeverFinished);
+            return Step::GaveUp(match kind {
+                Reset::Warm => GaveUp::LinkNeverTrained,
+                Reset::Hot => GaveUp::ResetNeverFinished(Reset::Hot),
+            });
         }
 
         if self.flawed(Flaw::AcknowledgeBeforeDeciding) && portsc.any_change() {
@@ -325,7 +371,29 @@ impl PortState {
         if !connected {
             return Step::Teardown(Gone::Disconnected, Pending(self));
         }
-        self.work = Work::Resetting { until: now + RESET_DEADLINE_NS };
-        Step::Reset(portsc.neutral().resetting())
+
+        // **Which reset this port needs, as one question.** A USB3 link trains
+        // itself: §4.19.1.2 has the port reach Enabled on its own, and a port
+        // that reads Enabled is a port with a working link and nothing to
+        // reset. Resetting it anyway is a hot reset of a trained link, and a
+        // link that cannot take one lands Inactive — which is where the driver
+        // that treated every port as USB2 lost every USB-A port it had.
+        let usb3 = self.protocol == Some(Protocol::Usb3);
+        if usb3 && portsc.enabled() {
+            return Step::Enumerate { trained: true, pending: Pending(self) };
+        }
+        // Inactive is the state only a warm reset leaves, so go straight to it
+        // rather than spending the deadline proving a hot one does not work.
+        let kind = if usb3 && portsc.link_state() == LinkState::Inactive {
+            Reset::Warm
+        } else {
+            Reset::Hot
+        };
+        self.work = Work::Resetting { until: now + RESET_DEADLINE_NS, kind };
+        let write = match kind {
+            Reset::Hot => portsc.neutral().resetting(),
+            Reset::Warm => portsc.neutral().warm_resetting(),
+        };
+        Step::Reset(kind, write)
     }
 }

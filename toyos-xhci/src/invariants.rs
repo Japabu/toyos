@@ -39,10 +39,10 @@ pub fn check(before: &PortState, step: &Step<'_>, read: Portsc, now: u64) -> Opt
         return Some(Violation::SteppedWhileWorking);
     }
     match step {
-        Step::Write(write) | Step::Reset(write) => write_is_sound(*write, read),
-        Step::Enumerate(_) => {
-            // The port is being brought up because its reset finished, so the
-            // register is the authority on whether there is anything there.
+        Step::Write(write) | Step::Reset(_, write) => write_is_sound(*write, read),
+        Step::Enumerate { .. } => {
+            // The register is the authority on whether there is anything there,
+            // whether the port was reset into working or arrived that way.
             (!read.connected()).then_some(Violation::EnumeratedNothing)
         }
         Step::Teardown(..) => (!before.attached() && before.slot().is_none())

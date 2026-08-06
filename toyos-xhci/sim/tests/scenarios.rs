@@ -4,7 +4,7 @@
 //! that hard-codes 100 ms is a test that stops meaning anything the day the
 //! debounce moves.
 
-use toyos_xhci::port::{Flaw, GaveUp, Gone, DEBOUNCE_NS, RESET_DEADLINE_NS};
+use toyos_xhci::port::{Flaw, GaveUp, Gone, Reset, DEBOUNCE_NS, RESET_DEADLINE_NS};
 use toyos_xhci_sim::driver::{Did, Driver, Stuck};
 use toyos_xhci_sim::hub::{FakePort, ResetBehaviour};
 
@@ -94,7 +94,7 @@ fn a_port_that_never_finishes_its_reset_is_given_up_on_and_left_alone() {
     driver
         .run_to(&mut port, 0, DEBOUNCE_NS + RESET_DEADLINE_NS + PASS, PASS)
         .unwrap();
-    assert_eq!(driver.did, [Did::GaveUp(GaveUp::ResetNeverFinished)], "{:?}", driver.did);
+    assert_eq!(driver.did, [Did::Reset(Reset::Hot), Did::GaveUp(GaveUp::ResetNeverFinished(Reset::Hot))], "{:?}", driver.did);
 
     // And it stays given up on: a port retried every pass is a port that costs
     // the machine a reset per pass for as long as the device stays in it.
@@ -225,11 +225,10 @@ fn gate_dropping_the_reset_deadline_wedges_the_port() {
     let mut driver = Driver::with_flaw(Flaw::NoResetDeadline);
     port.attach();
     let outcome = driver.run_to(&mut port, 0, 8 * RESET_DEADLINE_NS, PASS);
+    assert!(outcome.is_err(), "the flaw did not change the outcome: {:?}", driver.did);
     assert!(
-        outcome == Err(Stuck::NoProgress) || driver.did.is_empty(),
-        "the flaw did not change the outcome: {:?} {:?}",
-        outcome,
+        !driver.did.iter().any(|d| matches!(d, Did::GaveUp(_))),
+        "a flawed machine still refused the port by name: {:?}",
         driver.did
     );
-    assert_eq!(driver.did, [], "a flawed machine still refused the port");
 }

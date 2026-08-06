@@ -22,14 +22,25 @@ const CHANGES: u32 = 0x7F << 17;
 const READ_ONLY: u32 = CCS | (1 << 3) | (0xF << SPEED_SHIFT) | (1 << 30);
 const READ_WRITE_SAME: u32 = (0xF << 5) | PP | (0x3 << 14) | (0x7 << 25);
 
+const PLS_SHIFT: u32 = 5;
+const PLS_U0: u32 = 0;
+const PLS_RX_DETECT: u32 = 5;
+const PLS_INACTIVE: u32 = 6;
+const WRC: u32 = 1 << 19;
+const WPR: u32 = 1 << 31;
+
 /// What a port does when it is asked to reset.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResetBehaviour {
     /// Completes after this long, sets PRC and enables the port.
     Completes { after: Nanos },
-    /// Never finishes. A marginal cable, a controller that refuses, or a
-    /// SuperSpeed port answering a hot reset it cannot take.
+    /// Never finishes. A marginal cable, or a controller that refuses.
     Never,
+    /// **A SuperSpeed port given a hot reset it cannot take.** PR is accepted
+    /// and the link falls over: no PRC ever comes, and the link state goes
+    /// Inactive, which §4.19.1.2.4 says only a warm reset leaves. This is what
+    /// the T14's USB-A ports do and the state QEMU has no way to produce.
+    HotResetKillsTheLink { warm_works: bool },
 }
 
 pub struct FakePort {
@@ -37,6 +48,11 @@ pub struct FakePort {
     speed: u8,
     behaviour: ResetBehaviour,
     resetting_since: Option<Nanos>,
+    /// Whether the reset in flight is a warm one.
+    warm: bool,
+    /// A SuperSpeed port: it trains its own link and reads Enabled when it is
+    /// up, with no reset from the driver at all.
+    superspeed: bool,
     /// Every write the driver made, for the assertions that are about what it
     /// did rather than about where it ended up.
     pub writes: Vec<u32>,
@@ -44,7 +60,15 @@ pub struct FakePort {
 
 impl FakePort {
     pub fn empty(behaviour: ResetBehaviour) -> Self {
-        Self { raw: PP, speed: 3, behaviour, resetting_since: None, writes: Vec::new() }
+        Self {
+            raw: PP | (PLS_RX_DETECT << PLS_SHIFT),
+            speed: 3,
+            behaviour,
+            resetting_since: None,
+            warm: false,
+            superspeed: false,
+            writes: Vec::new(),
+        }
     }
 
     /// A port with a device already in it and its connect flag already raised,
@@ -64,9 +88,20 @@ impl FakePort {
         self.raw
     }
 
+    /// A SuperSpeed port. Its link trains itself: a device appearing brings the
+    /// port to Enabled with the link at U0 and no reset from anybody, which is
+    /// §4.19.1.2's own sequence and the thing a USB2-shaped driver resets away.
+    pub fn superspeed(behaviour: ResetBehaviour) -> Self {
+        Self { superspeed: true, ..Self::empty(behaviour) }
+    }
+
     pub fn attach(&mut self) {
         if self.raw & CCS == 0 {
             self.raw |= CCS | CSC;
+            if self.superspeed {
+                self.raw |= PED | ((self.speed as u32) << SPEED_SHIFT);
+                self.set_link(PLS_U0);
+            }
         }
     }
 
@@ -95,8 +130,12 @@ impl FakePort {
         if self.raw & PED != 0 && value & PED == 0 {
             next |= PED;
         }
-        // PR is RW1S: the controller clears it, never the driver.
-        if value & PR != 0 && self.raw & CCS != 0 {
+        // PR and WPR are both RW1S and the controller clears them, never the
+        // driver. A warm reset drives PR too, so what tells them apart is which
+        // bit the driver wrote.
+        let hot = value & PR != 0 && self.raw & CCS != 0;
+        let warm = value & WPR != 0 && self.raw & CCS != 0;
+        if hot || warm {
             next = (next | PR) & !PED;
         } else {
             next |= self.raw & PR;
@@ -104,6 +143,7 @@ impl FakePort {
         let started = next & PR != 0 && self.raw & PR == 0;
         self.raw = next;
         if started {
+            self.warm = warm;
             self.resetting_since = Some(now);
         }
     }
@@ -112,15 +152,41 @@ impl FakePort {
     /// one thing a port does on its own clock.
     pub fn tick(&mut self, now: Nanos) {
         let Some(since) = self.resetting_since else { return };
-        let ResetBehaviour::Completes { after } = self.behaviour else { return };
+        let after = match self.behaviour {
+            ResetBehaviour::Completes { after } => after,
+            ResetBehaviour::Never => return,
+            ResetBehaviour::HotResetKillsTheLink { warm_works } => {
+                if !self.warm {
+                    // The link went down when the hot reset hit it, and it is
+                    // not coming back on its own.
+                    self.set_link(PLS_INACTIVE);
+                    self.raw &= !(PR | PED);
+                    self.resetting_since = None;
+                    return;
+                }
+                if !warm_works {
+                    return;
+                }
+                1_000_000
+            }
+        };
         if now.saturating_sub(since) < after {
             return;
         }
         self.resetting_since = None;
-        self.raw &= !PR;
+        let warm = self.warm;
+        self.raw &= !(PR | WPR);
         self.raw |= PRC;
+        if warm {
+            self.raw |= WRC;
+        }
         if self.raw & CCS != 0 {
             self.raw |= PED | ((self.speed as u32) << SPEED_SHIFT);
+            self.set_link(PLS_U0);
         }
+    }
+
+    fn set_link(&mut self, pls: u32) {
+        self.raw = (self.raw & !(0xF << PLS_SHIFT)) | (pls << PLS_SHIFT);
     }
 }
