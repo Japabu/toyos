@@ -2715,7 +2715,9 @@ phase landed, and none reproduces on a host running one suite.
 - **`desktop_typing_damage`** — `nothing typed at the terminal window reached a
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
-  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`.
+  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`. **See the entry
+  below: as of 2026-08-06 this is no longer occasional but reproducible, and the
+  mechanism is the duration profile.**
 - **`desktop_locale_detect`** — added 2026-08-05. Same `nothing typed at the
   terminal window reached a shell`, same `ALONE … GREEN`, in the same run as the
   entry above and on a branch that touches neither the compositor nor the
@@ -2774,6 +2776,52 @@ green cannot be produced by load. `ALONE: red again` means nothing on its own
 and must be confirmed against `main` in the same session before it is believed —
 which is the A/B the audio rules already require and which this line currently
 invites an agent to skip.
+
+### OPEN — longest-job-first puts the two 8-CPU desktops side by side, and the profile that did it is self-reinforcing
+
+Measured 2026-08-06 in one worktree, four full runs, on a host at roughly three
+times its own load.
+
+`longest_first` orders the parallel phase on `target/test-durations`, what the
+last run in that worktree measured. The two longest jobs in the suite are now
+`desktop_window_child` (248 s) and `desktop_typing_damage` (246 s) — **the top
+two by a factor of six over the third** — and both boot `tests/desktopcase` at
+`smp: 8`. Longest-first therefore dispatches two eight-CPU desktop guests into
+the same instant, at the head of a twelve-wide phase, on a fourteen-core host.
+
+The first run in a fresh worktree has no profile at all, so every task sorts
+equal and the phase runs in declaration order, which happens to separate them:
+
+| run | profile | `desktop_typing_damage` | verdict |
+|---|---|---:|---|
+| 1 | none (fresh worktree) | 48 s | PASS |
+| 2 | written by run 1 | 243 s | FAIL, `ALONE: GREEN` in 16 s |
+| 3 | " | 255 s | FAIL, `ALONE: GREEN` in 16 s |
+| 4 | " | 246 s | FAIL, `ALONE: GREEN` in 16 s |
+
+**And it latches.** What run 2 recorded for `desktop_typing_damage` is 246 s of
+mostly *waiting for the host*, and that number is what pins it beside the other
+desktop on every later run. A duration profile whose entries include contention
+cannot order its way out of the contention it measured.
+
+Three things are tangled here and only the first is scheduling:
+
+- The ordering, above.
+- **`desktop_window_child` costs a lane four minutes on every run**, and always
+  did: `close_focused_window` retries until `qemu::budget(20 s)`, which at width
+  12 is 240 s. It is an expected failure (§3), so the four minutes buy a red
+  nobody acts on. A ceiling that scales with the width is right for a liveness
+  guard on a healthy test and wrong for one that is known to run out.
+- `desktop_typing_damage`'s verdict is still a typing window, which is what
+  `Sched::Parallel` is not for. Its bullet above says the budget was "evidently
+  not enough of it"; this says why.
+
+Not fixed here, and the fix is not obviously "reclassify": `Sched::Serial` for
+both desktops moves ~8 minutes into the serial tail, which
+`specs/test-cost-audit.md` §5.4 spent a wave getting out of. Candidates worth
+pricing: cap what a lane will spend on an `EXPECTED_FAILURES` test, exclude a
+test's contention wait from what the profile records, or give the profile a
+notion of how much host a task wants so two eight-CPU guests do not pair.
 
 ### A whole parallel phase can be starved by another agent's build
 
