@@ -670,9 +670,15 @@ pub fn service() {
     if AUX_RESET_PENDING.load(Ordering::Relaxed) && is_irq_cpu() {
         aux_reenable();
     }
+    widen_edge_window();
     // Unconditional, not gated on `recorded`: this is what detects a lost
     // edge and what heals it in the same pass.
     if has_bytes() {
+        // The ISR fills the ring before it publishes its record, so bytes this
+        // pass finds may belong to an interrupt that arrived after the record
+        // was read absent. Asking again with the bytes in hand is what tells
+        // that apart from an edge nothing ever delivered.
+        let recorded = recorded || crate::irq_ring::take(IrqSource::I8042).is_some();
         service_bytes(recorded);
     }
     // Last, so the line it may print counts the bytes this pass just decoded.
@@ -687,6 +693,21 @@ pub fn service() {
     // needed for.
     report_counters();
 }
+
+/// Under `i8042-edge-race`, hold the pass between reading the record and
+/// reading the ring for long enough that an interrupt lands in between.
+///
+/// Unwidened that window is a handful of instructions on one CPU, which no
+/// injection the harness can time and no load it can stage reaches.
+#[cfg(feature = "i8042-edge-race")]
+fn widen_edge_window() {
+    for _ in 0..200 {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(not(feature = "i8042-edge-race"))]
+fn widen_edge_window() {}
 
 /// Decode what the ISR left in the ring and wake whoever it belongs to.
 /// `recorded` is whether this pass found an `irq_ring` record for the source.
