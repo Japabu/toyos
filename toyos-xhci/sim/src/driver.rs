@@ -13,7 +13,7 @@
 use core::num::NonZeroU8;
 
 use toyos_xhci::invariants::{self, Violation};
-use toyos_xhci::job::{Await, Outcome, Outstanding};
+use toyos_xhci::job::{Await, Outstanding, Stages, CC_SUCCESS};
 use toyos_xhci::port::{Flaw, GaveUp, Gone, Nanos, PortState, Reset, Step};
 use toyos_xhci::recovery::{Act, EndpointState, NeedsConfigure, Recovery};
 use toyos_xhci::Protocol;
@@ -75,8 +75,6 @@ pub enum Answers {
     Refuses(u32),
 }
 
-/// xHCI 1.2 Table 6-90's Success.
-const SUCCESS: u32 = 1;
 
 /// How long the simulated driver waits for an answer before calling the
 /// controller silent. It stands for the kernel's own transfer budget and is not
@@ -406,14 +404,14 @@ impl Driver {
         let trb = self.next_trb;
         self.next_trb += 16;
         let answer = match self.answers {
-            Answers::After(delay) => Some((SUCCESS, now + delay)),
+            Answers::After(delay) => Some((CC_SUCCESS, now + delay)),
             Answers::Refuses(code) => Some((code, now)),
             Answers::Never => None,
         };
         if let Some((code, at)) = answer {
             self.owed.push((trb, code, at));
         }
-        self.outstanding.submit(what, Await::Command { trb }, now + ANSWER_DEADLINE_NS);
+        self.outstanding.submit(what, Await::Command { trb }, Stages::One, now + ANSWER_DEADLINE_NS);
     }
 
     /// Hand the controller's answers to whatever is waiting for them.
@@ -424,7 +422,7 @@ impl Driver {
                 still_owed.push((trb, code, at));
                 continue;
             }
-            self.outstanding.answered(Await::Command { trb }, code);
+            self.outstanding.answered(Await::Command { trb }, code, 0);
         }
         self.owed = still_owed;
     }
@@ -434,7 +432,7 @@ impl Driver {
         while let Some((what, outcome)) = self.outstanding.finished(now) {
             match what {
                 What::SlotGone => {
-                    if outcome == Outcome::Answered(SUCCESS) {
+                    if outcome.succeeded() {
                         self.disabled += 1;
                     }
                     // The block goes back whatever the controller said: a port
@@ -445,12 +443,12 @@ impl Driver {
                     self.state.torn_down();
                 }
                 What::LetGo => {
-                    if outcome == Outcome::Answered(SUCCESS) {
+                    if outcome.succeeded() {
                         self.disabled += 1;
                     }
                 }
                 What::Recovering(mut seq) => {
-                    if outcome != Outcome::Answered(SUCCESS) {
+                    if !outcome.succeeded() {
                         self.give_up(now);
                         continue;
                     }
