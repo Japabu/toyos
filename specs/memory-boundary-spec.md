@@ -587,7 +587,8 @@ this document are the ELF layout table (§2.1), the CPU feature answers (§2.1,
    from `sync.rs:42` is the symptom and it is loud.
 2. **TLB pressure from the 4 KiB split (M2)** is unmeasurable on this host.
    Carried as an open question for the T14 rather than guessed at.
-3. **`+smep` reds unrelated tests (M2).** Treated as findings.
+3. **`+smep` reds unrelated tests (M2).** Measured against current main and it
+   does not (§8). Treated as findings if it ever does.
 4. **Merge pressure on `syscall.rs`** with the scheduled decomposition. M1b
    exists to bound it.
 5. **Gate A's known intermittent red** (`audio_tone_load smp=1`,
@@ -633,7 +634,38 @@ That line is also the direct confirmation of §2.2: `pcid=off` in the guest, fro
 the kernel rather than only from the QMP model query. The two independent
 measurements agree.
 
-Conclusion: the flip is free. It is held as its own commit on this branch so it
-can land the moment it is scheduled, rather than riding M2 — a green discovery
-run removes the risk that motivated the hold, but not the coordinator's call on
-when a shared resource changes under five agents.
+**That first run was against a stale base, and its coverage claim did not
+hold.** It ran on `a051a67`, and `desktop_window_child` was added to main four
+commits later (`d49883e`) — so "reds nothing" was a statement about a tree that
+did not contain the test most likely to be disturbed by a CPU-feature change.
+Three other new tests were missing from it too. Re-run after merging main:
+
+**256 passed, 1 failed. The one red is `desktop_window_child`.**
+
+That test is documented on main as `EXPECTED RED, pending #156`
+(known-issues §3) and was verified red on main *without* `+smep`, so the flip is
+not its cause. Two things were checked rather than assumed before accepting
+that:
+
+- **The signature matches.** The assertion interpolates the guest's serial
+  output since the keystroke (`tests/toyos.rs:4011-4012`), and the dump is
+  empty — the guest emitted nothing for 20 s. That is #156's freeze, not an
+  assertion failing with output present, which would have been a different
+  defect wearing the same test's name.
+- **It is intermittent, not positional.** Under a one-test filter it still
+  failed the wide phase and then passed the harness's own re-run-alone, and it
+  failed in round 1 in the full suite and round 2 alone. The round moving is
+  itself evidence of a race rather than a deterministic failure.
+
+Conclusion: the flip is free, now measured against a tree that contains the test
+that could have contradicted it. It is held as its own commit (`5d53aa0`) so it
+can land whenever it is scheduled rather than riding M2 — a green discovery run
+removes the risk that motivated the hold, but not the call on when a shared
+resource changes under five agents.
+
+**Landing this wave's stages while #156 is open** uses
+`cargo run -- --land --gate "cargo test -- --skip desktop_window_child"`.
+`--skip` is exact-match and repeatable (`tests/toyos.rs:8626-8641`) and prints
+`[toyos] NOT RUN, by --skip: …` on every run. That name is the only one this
+wave may skip; any other red belongs to the change and is explained, never
+excluded.
