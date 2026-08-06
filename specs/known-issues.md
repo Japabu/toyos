@@ -4070,9 +4070,21 @@ aims all of them at a dead device on one event.
 
 **What it does not close, stated so a green suite does not imply otherwise:**
 
-- `poll_if_pending` can still express waiting. The view that cannot — #152's
-  type split, `specs/xhci-port-machine-plan.md` X2 — is not built. Teardown and
-  `recover_endpoints` still block a pass, just no longer for seconds.
+- ~~Teardown and `recover_endpoints` still block a pass~~ — **closed by X2a**
+  (`specs/xhci-port-machine-plan.md`). Both are submit-and-return against one
+  outstanding operation per controller: the pass that starts one gives itself
+  back, and the completion arrives through the event ring the poll already
+  drains. What is left on that path is `device::configure`, which is X2b; the
+  type split that would make a wait there a compile error belongs with it,
+  because a view that still has to hand `poll` a route to `configure` is a
+  signature promising a check it does not perform. Two costs moved rather than
+  going away, and neither is a defect: `PORT_WORK_AT` carries the outstanding
+  operation's deadline, so an idle CPU declines to halt across a teardown
+  exactly as it already does across a debounce, and a teardown now takes one
+  further scheduler pass.
+- **The metal claim is still the owner's to make.** Everything above is the
+  guest-side proxy — no pass blocks — and the acceptance test is a stick pulled
+  out of a running T14 with Ctrl+Alt+D still answering.
 - `log_file`'s flush still holds `SINK` and the VFS across device I/O. The doc's
   "unbounded and uninterruptible" is half right, and the precise reading is
   **bounded in acquisition, unbounded in work**: `poll` is `try_lock` on both and
@@ -4103,8 +4115,16 @@ whole life:
 - `settles()` — controller halt, HCRST, CNR, R/S, and the port reset. Bound
   `USB_TIMEOUT_NS`, 2 s.
 - `wait_command()` and `wait_transfer()` — every command and every transfer.
-  Same bound, and an endpoint recovery issues up to three of them in a row
-  (Reset Endpoint, Set TR Dequeue, CLEAR_FEATURE(HALT)).
+  Same bound.
+
+**X2a took the two that ran inside a scheduler pass out of that list.** A
+teardown's Disable Slot and an endpoint recovery's three-in-a-row (Reset or
+Stop Endpoint, Set TR Dequeue, CLEAR_FEATURE(HALT)) are submit-and-return now,
+so the six seconds above are reachable only from the boot path and from
+`storage_read`/`storage_write` — the first has no scheduler to give a pass back
+to, and the second is the case named below that this conversion does not fix.
+`device::configure` is the one blocking caller `poll_if_pending` still reaches
+and it is X2b's.
 
 So a worst case is a CPU that does not reschedule for **six seconds**, and an
 ordinary hot-plug enumeration on the T14 is ~14 ms of it (the entry below).
@@ -4115,10 +4135,13 @@ everything here for a season.
 **The conversion is the same idiom `PortWork` already uses** — the debounce and
 the port reset were spins until #94 and are now states the poll returns to — so
 the shape is known and the work is mechanical rather than novel. What makes it
-big is its extent: `configure` is a straight line of control transfers and
-`restart_endpoint` a straight line of commands, and each has to become a state
-machine that gives the pass back between steps. That is the whole enumeration
-and recovery path, which is why it is filed rather than folded into #116/#118.
+big is its extent: `configure` is a straight line of control transfers, and it
+has to become a state machine that gives the pass back between steps.
+`restart_endpoint`'s half of that is done: the route is
+`toyos_xhci::recovery`'s, driven twice — a blocking loop for a disk's bulk pair,
+which runs on the thread that faulted, and a stepped one for HID. **The sequence
+is shared and only the drive loop is not**, which is the shape `configure`
+should take too.
 
 One case is *not* fixed by that and needs its own answer: `storage_read` and
 `storage_write` are called by the page cache on a faulting thread, so a thread
