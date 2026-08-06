@@ -4131,7 +4131,48 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
     metal_sim_argv_check(&qemu::profile_argv(&options))?;
     let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
     let mut log = qemu.boot_log().to_string();
-    if !shell_answers(&mut qemu, &mut log) {
+    match window_child_probes(&mut qemu, &mut log) {
+        Ok(()) => Ok(()),
+        Err(message) => Err(format!("{message}\n{}", freeze_report(&mut qemu, &mut log))),
+    }
+}
+
+/// What a desktop that stopped answering is asked, in the order that survives
+/// being asked.
+///
+/// Every vCPU's registers first. `HLT=1` with `IF` set in `RFL` is a machine
+/// with nothing to run rather than one wedged below the interrupt layer, and
+/// that is the question #156 turns on — but Ctrl+Alt+D revives a halted CPU,
+/// so the dump destroys the evidence it is taken to explain. Asked in the
+/// other order, both halves describe the repaired machine.
+fn freeze_report(qemu: &mut QemuInstance, log: &mut String) -> String {
+    let registers = {
+        let mut monitor = qemu::QmpMonitor::open(qemu.qmp_socket());
+        monitor.human("info registers -a")
+    };
+    let before = log.len();
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        input.keys(&[
+            ("ctrl", true),
+            ("alt", true),
+            ("d", true),
+            ("d", false),
+            ("alt", false),
+            ("ctrl", false),
+        ]);
+    }
+    let whole = serial_until(qemu, log, "=== end of dump ===", Duration::from_secs(30));
+    format!(
+        "--- info registers -a, taken before this report injected anything ---\n{registers}\n\
+         --- Ctrl+Alt+D{} ---\n{}",
+        if whole { "" } else { ", which produced no complete report" },
+        &log[before.min(log.len())..]
+    )
+}
+
+fn window_child_probes(qemu: &mut QemuInstance, log: &mut String) -> Result<(), String> {
+    if !shell_answers(qemu, log) {
         return Err(format!("nothing typed at the terminal window reached a shell:\n{log}"));
     }
 
@@ -4142,10 +4183,10 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
         let mut input = qemu::QmpInput::open(qemu.qmp_socket());
         type_line(&mut input, "test_rs_window_child exit");
     }
-    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-GONE", qemu::budget(Duration::from_secs(20))) {
+    if !serial_until(qemu, log, "WINDOW-CHILD-GONE", qemu::budget(Duration::from_secs(20))) {
         return Err(format!("the windowed child never reported leaving:\n{log}"));
     }
-    if !shell_echoes(&mut qemu, &mut log, "after-own-exit-zqjxk") {
+    if !shell_echoes(qemu, log, "after-own-exit-zqjxk") {
         return Err(format!(
             "a windowed child exited by itself and the shell never answered again:\n{log}"
         ));
@@ -4160,8 +4201,8 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
     }
     // Its own marker, not the one the probe above already printed.
     if !serial_until_new(
-        &mut qemu,
-        &mut log,
+        qemu,
+        log,
         "WINDOW-CHILD-UP",
         started,
         qemu::budget(Duration::from_secs(20)),
@@ -4174,13 +4215,13 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
     // and never blind, because a second GUI+Q after one worked would close the
     // terminal's window instead.
     let before = log.len();
-    if !close_focused_window(&mut qemu, &mut log, before) {
+    if !close_focused_window(qemu, log, before) {
         return Err(format!(
             "GUI+Q never reached the compositor:\n{}",
             &log[before.min(log.len())..]
         ));
     }
-    if !serial_until_new(&mut qemu, &mut log, "WINDOW-CHILD-GONE", before, qemu::budget(Duration::from_secs(20))) {
+    if !serial_until_new(qemu, log, "WINDOW-CHILD-GONE", before, qemu::budget(Duration::from_secs(20))) {
         return Err(format!(
             "the compositor closed the window and the client did not leave:\n{}",
             &log[before.min(log.len())..]
@@ -4192,7 +4233,7 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
             &log[before..]
         ));
     }
-    if !shell_echoes(&mut qemu, &mut log, "after-window-closed-zqjxk") {
+    if !shell_echoes(qemu, log, "after-window-closed-zqjxk") {
         return Err(format!(
             "the compositor closed a child's window and the shell never answered again — \
              this is the owner's snake report, reproduced:\n{log}"
@@ -4215,7 +4256,7 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
         // is what says it is up — and a window it has just created is the
         // focused one, which is what GUI+Q then closes.
         let opened = log.len();
-        if !serial_until_new(&mut qemu, &mut log, "windows=2", opened, qemu::budget(Duration::from_secs(20))) {
+        if !serial_until_new(qemu, log, "windows=2", opened, qemu::budget(Duration::from_secs(20))) {
             return Err(format!("snake never got a window in round {round}:\n{log}"));
         }
         if round + 1 == SNAKE_ROUNDS {
@@ -4228,19 +4269,19 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
             }
         }
         let before = log.len();
-        if !close_focused_window(&mut qemu, &mut log, before) {
+        if !close_focused_window(qemu, log, before) {
             return Err(format!(
                 "GUI+Q never reached the compositor in round {round}:\n{}",
                 &log[before.min(log.len())..]
             ));
         }
-        if !serial_until_new(&mut qemu, &mut log, "exit: snake", before, qemu::budget(Duration::from_secs(20))) {
+        if !serial_until_new(qemu, log, "exit: snake", before, qemu::budget(Duration::from_secs(20))) {
             return Err(format!(
                 "snake did not leave when its window was closed in round {round}:\n{}",
                 &log[before.min(log.len())..]
             ));
         }
-        if !shell_echoes(&mut qemu, &mut log, &format!("after-snake-{round}-zqjxk")) {
+        if !shell_echoes(qemu, log, &format!("after-snake-{round}-zqjxk")) {
             return Err(format!(
                 "snake's window was closed, snake left, and the shell never answered again \
                  (round {round}) — the owner's report, reproduced:\n{log}"
