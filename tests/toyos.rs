@@ -3829,6 +3829,29 @@ fn serial_until(
     false
 }
 
+/// [`serial_until`] over what arrives *after* `from`.
+///
+/// For a marker a test asks for more than once. `serial_until` scans the whole
+/// capture, so the second ask is answered by the first ask's line and the test
+/// carries on against a guest that has not done the thing yet — which is the
+/// same defect as reusing a nonce, one layer down.
+fn serial_until_new(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    marker: &str,
+    from: usize,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        log.push_str(&qemu.drain_serial(Duration::from_millis(200)));
+        if log[from.min(log.len())..].contains(marker) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The wizard's two answers, as a Swiss keyboard's owner gives them: the key
 /// that prints `Z`, the key that prints `§`, then Enter to confirm.
 const SWISS_ANSWERS: [&str; 3] = ["y", "grave_accent", "ret"];
@@ -3888,6 +3911,27 @@ fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> bool 
 /// The client is a bare `window::Window`, so a reproduction here is about the
 /// shell, the terminal and the window protocol, and a clean run narrows the
 /// defect to what winit does that this does not.
+/// Close the focused window with GUI+Q, retrying until the compositor says a
+/// window went.
+///
+/// **Never blind.** A keystroke injected while the guest is busy is lost, so
+/// one attempt is not enough on a loaded host; but a second GUI+Q *after* one
+/// worked closes the next window down, which here is the terminal. So the
+/// compositor's own count is what decides whether to try again: it drops to
+/// one when the window under test goes, and `new` is where in the log to start
+/// looking so an earlier interval's count cannot answer for this one.
+fn close_focused_window(qemu: &mut QemuInstance, log: &mut String, new: usize) -> bool {
+    let deadline = Instant::now() + qemu::budget(Duration::from_secs(20));
+    while Instant::now() < deadline && !log[new..].contains("windows=1") {
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);
+        }
+        serial_until(qemu, log, "windows=1", Duration::from_secs(4));
+    }
+    log[new..].contains("windows=1")
+}
+
 /// How many times snake is opened and closed. One green round says very little
 /// about a report that arrived once.
 const SNAKE_ROUNDS: usize = 3;
@@ -3926,7 +3970,7 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
         let mut input = qemu::QmpInput::open(qemu.qmp_socket());
         type_line(&mut input, "test_rs_window_child exit");
     }
-    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-GONE", Duration::from_secs(20)) {
+    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-GONE", qemu::budget(Duration::from_secs(20))) {
         return Err(format!("the windowed child never reported leaving:\n{log}"));
     }
     if !shell_echoes(&mut qemu, &mut log, "after-own-exit-zqjxk") {
@@ -3937,23 +3981,34 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
 
     // The owner's case: the process is alive and the compositor takes its
     // window away underneath it.
+    let started = log.len();
     {
         let mut input = qemu::QmpInput::open(qemu.qmp_socket());
         type_line(&mut input, "test_rs_window_child");
     }
-    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-UP", Duration::from_secs(20)) {
+    // Its own marker, not the one the probe above already printed.
+    if !serial_until_new(
+        &mut qemu,
+        &mut log,
+        "WINDOW-CHILD-UP",
+        started,
+        qemu::budget(Duration::from_secs(20)),
+    ) {
         return Err(format!("the windowed child never got a window:\n{log}"));
     }
-    {
-        // GUI+Q closes the focused window, and a window the compositor has
-        // just created is the focused one.
-        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
-        input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);
-    }
+    // GUI+Q closes the focused window, and a window the compositor has just
+    // created is the focused one. Re-injected until the compositor says the
+    // window went — a keystroke that lands while the guest is busy is lost —
+    // and never blind, because a second GUI+Q after one worked would close the
+    // terminal's window instead.
     let before = log.len();
-    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-GONE", Duration::from_secs(20))
-        || !log[before..].contains("WINDOW-CHILD-GONE")
-    {
+    if !close_focused_window(&mut qemu, &mut log, before) {
+        return Err(format!(
+            "GUI+Q never reached the compositor:\n{}",
+            &log[before.min(log.len())..]
+        ));
+    }
+    if !serial_until_new(&mut qemu, &mut log, "WINDOW-CHILD-GONE", before, qemu::budget(Duration::from_secs(20))) {
         return Err(format!(
             "the compositor closed the window and the client did not leave:\n{}",
             &log[before.min(log.len())..]
@@ -3987,7 +4042,8 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
         // snake prints nothing of its own, so the compositor's second window
         // is what says it is up — and a window it has just created is the
         // focused one, which is what GUI+Q then closes.
-        if !serial_until(&mut qemu, &mut log, "windows=2", Duration::from_secs(20)) {
+        let opened = log.len();
+        if !serial_until_new(&mut qemu, &mut log, "windows=2", opened, qemu::budget(Duration::from_secs(20))) {
             return Err(format!("snake never got a window in round {round}:\n{log}"));
         }
         if round + 1 == SNAKE_ROUNDS {
@@ -3999,14 +4055,14 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
                 }
             }
         }
-        {
-            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
-            input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);
-        }
         let before = log.len();
-        if !serial_until(&mut qemu, &mut log, "exit: snake", Duration::from_secs(20))
-            || !log[before..].contains("exit: snake")
-        {
+        if !close_focused_window(&mut qemu, &mut log, before) {
+            return Err(format!(
+                "GUI+Q never reached the compositor in round {round}:\n{}",
+                &log[before.min(log.len())..]
+            ));
+        }
+        if !serial_until_new(&mut qemu, &mut log, "exit: snake", before, qemu::budget(Duration::from_secs(20))) {
             return Err(format!(
                 "snake did not leave when its window was closed in round {round}:\n{}",
                 &log[before.min(log.len())..]
