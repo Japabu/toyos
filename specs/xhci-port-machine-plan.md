@@ -193,6 +193,70 @@ more across recovery and teardown, and the descriptor walk becomes a resumable
 sequence rather than straight-line code. Estimate: two to three sessions, and
 the one most likely to need a second landing.
 
+#### Working state, so this stage survives its agent
+
+X0 and X1 are on main (`6bfeed9`); X2 is not started. Everything below is
+established and should not be re-derived.
+
+**The three call sites that must lose the ability to wait.** `poll_if_pending`
+reaches exactly four things — `next_event`/`dispatch_event` (a drain, no wait),
+`recover_endpoints` and `service_ports` — and the last two reach:
+
+| path | what blocks | how many |
+|---|---|---|
+| `service_port` → `device::configure` | Enable Slot, Address Device, two `GET_DESCRIPTOR(Device)`, Evaluate Context, `GET_DESCRIPTOR(Config)`, SET_CONFIGURATION, Configure Endpoint | eight, `USB_TIMEOUT_NS` each |
+| `recover_endpoints` → `recover_hid` → `restart_endpoint` | Reset/Stop Endpoint, Set TR Dequeue, CLEAR_FEATURE(HALT) | three commands and a control transfer |
+| `service_port` → `teardown_port` → `disable_slot` | Disable Slot | one |
+
+`teardown_port` is the owner's trigger, which is why recovery and teardown are
+in this stage rather than deferred behind enumeration.
+
+**The type split, concretely.** `poll` takes a view — `Stepper` — exposing
+`next_event`, `dispatch_event`, the doorbell, ring enqueue and PORTSC access,
+and **not** `wait_command`, `wait_transfer`, `settles`, `run_command` or
+`control_transfer`. Those stay on `XhciController` for the boot path, where
+blocking is correct because there is no scheduler yet. "`drain_irqs` cannot
+spend the transfer budget in xHCI" then fails to compile rather than failing a
+test.
+
+**What "done" is, against the owner's acceptance test.** Pull the stick while
+the desktop is up: the machine keeps running and Ctrl+Alt+D still answers. Not
+"recovers eventually". The guest-side proxy is that no scheduler pass blocks;
+the metal proof is the owner's and it is the one that counts.
+
+#### Exclusions already established — do not re-litigate
+
+- **The ticket lock is not the freeze as first diagnosed.** `sync::Lock::lock`
+  warns `LOCK CONTENTION` at 50M spins and panics `DEADLOCK` at 500M; a CPU
+  behind one 2 s hold passes the warning and one behind two approaches the
+  panic. The owner reports a freeze with neither, and the scheduler track
+  excluded the same lock independently for the wedge. What the code still
+  supports is *one* CPU holding `XHCI` for the budget per command — not a
+  spinning fleet.
+- **The log flush is bounded in acquisition, unbounded in work.**
+  `log_file::poll` is `try_lock` on `SINK` and the VFS and disables the sink
+  after `MAX_BLOCKED_NANOS`; `Sink::flush` then holds both across
+  `flush_file`/`sync_mount` → `msc_write`/`msc_flush` → `XHCI`. X2 does not
+  close this and it is not this agent's.
+- **`c4ba7d5` already removed the per-transfer amplifier**: a transfer to a port
+  that reads disconnected fails at once. X2 is about the *pass*, not about the
+  seconds — those are gone.
+
+#### Two things that will mislead the next agent
+
+- **`desktop_window_child` is intermittent, not parallel-phase-only.** It has
+  failed under a one-test filter with nothing else on the host, in a different
+  round each time. **If X2 makes it pass that is not evidence of anything** — as
+  likely the race landing the other way. Keep skipping it until its own defect
+  closes: `--gate cargo test -- --skip desktop_window_child`, **unquoted**,
+  because `--gate` takes everything after it as raw argv and a quoted string
+  becomes the program name.
+- **There is no gate for the unplug window and it cannot be aimed.** The hazard
+  is the 100 ms between the device going and the teardown running, and a QEMU
+  `device_del` cannot be landed inside it. That is the answer and belongs in a
+  report as the answer, not as an omission. Do not ship one that passes for the
+  wrong reason.
+
 Delta from the task's fix-shape: the task offers "bounded work per pass or a
 dedicated context". **This plan takes neither literally.** Bounded work per
 pass does not help while one unit of work can block for 2 s. A dedicated
