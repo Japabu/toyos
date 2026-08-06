@@ -1,0 +1,13 @@
+# Its own workspace, like toyos-gpt, toyos-ps2 and toyos-sched: `cargo test`
+# runs here on the host with no target-triple juggling, and soundd depends on
+# it by path. A codec's answers are bytes a device wrote, so the decoders have
+# to be exercised against hostile ones far more often than a QEMU boot allows
+# — and the one machine that matters cannot be booted by a test at all, so its
+# graph is a committed fixture instead.
+[workspace]
+
+[package]
+name = "toyos-hda"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"

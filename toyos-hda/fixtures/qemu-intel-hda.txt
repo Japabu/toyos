@@ -1,0 +1,31 @@
+hda: gcap=0x4401 vmaj=1 vmin=0 oss=4 iss=4 bss=0 nsdo=0 addr64=y
+hda: statests=0x0003 (first read 0x0003)
+hda: codec0 vendor=1af4 device=0012 revision=0x00100101
+hda: codec0 fg=0x01 type=0x01 (audio) caps=0x00000808 power=0x00000000 gpio=0x00000000
+hda: codec0 fg=0x01 widgets=0x02..0x03
+hda: codec0 node=0x02 type=0x0 (audio-out) caps=0x0000001d channels=2 amp-in=n amp-out=y power=n digital=n conn-list=n
+hda: codec0 node=0x02 amp-out-caps=0x80034a4a
+hda: codec0 node=0x02 pcm=0x000201fc formats=0x00000001
+hda: codec0 node=0x03 type=0x4 (pin) caps=0x00400101 channels=2 amp-in=n amp-out=n power=n digital=n conn-list=y
+hda: codec0 node=0x03 conn-len=0x00000001 long=n count=1 list=[2]
+hda: codec0 node=0x03 pin-caps=0x00000010 pin-ctl=0x00000040 eapd=0x00000000
+hda: codec0 node=0x03 cfgdef=0x00004010 conn=jack device=line-out location=0x00 type=0x0 colour=0x4 assoc=1 sequence=0
+hda: codec1 vendor=1af4 device=0022 revision=0x00100101
+hda: codec1 fg=0x01 type=0x01 (audio) caps=0x00000808 power=0x00000000 gpio=0x00000000
+hda: codec1 fg=0x01 widgets=0x02..0x05
+hda: codec1 node=0x02 type=0x0 (audio-out) caps=0x0000001d channels=2 amp-in=n amp-out=y power=n digital=n conn-list=n
+hda: codec1 node=0x02 amp-out-caps=0x80034a4a
+hda: codec1 node=0x02 pcm=0x000201fc formats=0x00000001
+hda: codec1 node=0x03 type=0x4 (pin) caps=0x00400101 channels=2 amp-in=n amp-out=n power=n digital=n conn-list=y
+hda: codec1 node=0x03 conn-len=0x00000001 long=n count=1 list=[2]
+hda: codec1 node=0x03 pin-caps=0x00000010 pin-ctl=0x00000040 eapd=0x00000000
+hda: codec1 node=0x03 cfgdef=0x00004010 conn=jack device=line-out location=0x00 type=0x0 colour=0x4 assoc=1 sequence=0
+hda: codec1 node=0x04 type=0x1 (audio-in) caps=0x0010011b channels=2 amp-in=y amp-out=n power=n digital=n conn-list=y
+hda: codec1 node=0x04 amp-in-caps=0x80034a4a
+hda: codec1 node=0x04 pcm=0x000201fc formats=0x00000001
+hda: codec1 node=0x04 conn-len=0x00000001 long=n count=1 list=[5]
+hda: codec1 node=0x05 type=0x4 (pin) caps=0x00400001 channels=2 amp-in=n amp-out=n power=n digital=n conn-list=n
+hda: codec1 node=0x05 pin-caps=0x00000020 pin-ctl=0x00000020 eapd=0x00000000
+hda: codec1 node=0x05 cfgdef=0x00805020 conn=jack device=line-in location=0x00 type=0x0 colour=0x5 assoc=2 sequence=0
+hda: (b) statests=0x0003 — a codec answers on the legacy link; the plan is alive on this machine
+hda: (d) codecs=2 — every one is dumped above. More than one: a driver taking the first match can bind display audio and produce silence from the speakers (hda-driver-plan.md §2.3).
