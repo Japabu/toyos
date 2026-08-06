@@ -508,3 +508,24 @@ answer a 250 ms *kick* while five did; here 8/8 answer. Different observations,
 possibly different defects, and the T14 cannot be attached to — which is what
 the NMI probe in `arch/idt/nmi.rs` is for and why it stays even though the
 debugger settled this case without it.
+
+**And the dump cannot tell that state from health, because it reads the wrong
+copy.** `dump.rs`'s deadline census comes from `for_each_parked`, i.e. from
+`ParkedEntry.deadline` — the *container's* copy. The timer is armed from
+`DeadlineHeap::min_valid` — the *heap*. Candidate 1 is exactly the case where
+those two disagree: `pop_due` removes the heap entry before the claim is
+attempted, so a `Claim::Lost` discards it, while `ParkedEntry.deadline` keeps
+its old value. Such a task prints `parked 14ms due in 1ms` and counts as
+`1 pending, 0 OVERDUE` while `min_valid` returns `None` and `apply_timer`
+computes `TimerPlan::Stop`. The observed report is not merely consistent with
+the corruption — it is indistinguishable from health by construction.
+
+That makes the fix a *representation* question rather than a patch: the deadline
+is stored twice and only one copy arms anything. Either the heap entry is
+restored when the claim is lost (a backstop that survives a wake that never
+arrives), or `ParkedEntry.deadline` is cleared with it (consistent, and the
+report stops lying), or — the version worth trying first — the container stops
+carrying a second copy at all, so the two cannot disagree. Whichever is chosen
+belongs behind a simulator gate over invariant I3/T, and I3 must be taught to
+compare the two copies, since today it validates the heap *against* the
+container and therefore cannot see them diverge.
