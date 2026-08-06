@@ -1,6 +1,14 @@
-use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
+
+#[cfg(not(feature = "loom"))]
+use core::cell::UnsafeCell;
+#[cfg(not(feature = "loom"))]
 use core::sync::atomic::{AtomicU32, Ordering};
+
+#[cfg(feature = "loom")]
+use crate::cell::UnsafeCell;
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicU32, Ordering};
 
 /// Ticket spinlock. Provides mutual exclusion via `lock() -> LockGuard`.
 pub struct Lock<T> {
@@ -14,7 +22,19 @@ pub struct Lock<T> {
 unsafe impl<T: Send> Sync for Lock<T> {}
 
 impl<T> Lock<T> {
+    /// Every `Lock` in the kernel is a `static`, so this must stay `const`.
+    /// Loom's atomics have no const constructor, hence the second arm.
+    #[cfg(not(feature = "loom"))]
     pub const fn new(val: T) -> Self {
+        Self {
+            ticket: AtomicU32::new(0),
+            now: AtomicU32::new(0),
+            data: UnsafeCell::new(val),
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    pub fn new(val: T) -> Self {
         Self {
             ticket: AtomicU32::new(0),
             now: AtomicU32::new(0),
@@ -48,8 +68,8 @@ impl<T> Lock<T> {
 
     pub fn try_lock(&self) -> Option<LockGuard<'_, T>> {
         crate::preempt::disable();
-        let current = self.now.load(Ordering::Relaxed);
-        match self.ticket.compare_exchange(current, current + 1, Ordering::Acquire, Ordering::Relaxed) {
+        let current = self.now.load(Ordering::Acquire);
+        match self.ticket.compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => Some(LockGuard { lock: self }),
             Err(_) => {
                 crate::preempt::enable();
