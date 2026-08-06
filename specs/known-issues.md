@@ -1305,6 +1305,19 @@ leaving on its own deadline. That pins which assertion failed and not why, so
 the log-tail discriminator above is still a human's to apply; the run prints the
 pointer to this section beside every `XFAIL` line for exactly that reason.
 
+**One thing #156's capture leaned on is closed, and it is not this.** The
+deadline was stored twice — `ParkedEntry.deadline` and `DeadlineHeap` — and
+`fire_deadlines`' lost claim discarded one copy, so a CPU could halt with
+`TimerPlan::Stop` while its report said `1 pending, 0 OVERDUE`. That is why the
+dump taken off the frozen guest could not be read, and it is fixed
+(`scheduler-migration-log.md`, 2026-08-06): a deadline lives in one place and
+invariant T reads what arms the timer. **This entry stays open.** Nothing
+established that the divergence is what froze the guest — the claim's
+`Msg::Wake` follows it within two instructions and `SleepArm::confirm` refuses
+to halt on a non-empty mailbox — and a green run of this test after that change
+is the race landing the other way rather than evidence. Judge it by the
+signature above, never by one run.
+
 **What the test was built to chase is still open underneath it**, and is not
 the same thing: on `boot8-snake.log` the owner closed snake's window and got
 `exit: snake pid=10 code=0` at 121.659, `exit: shell pid=5 code=0` at 121.693,

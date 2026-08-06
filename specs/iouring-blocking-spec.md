@@ -394,9 +394,9 @@ Already dead: `EventSource`, `scheduler::block`, `wake_by_event`, `event_ready()
 (dead ABI) deleted.
 
 Deadlines: `Deadline::FOREVER` (`u64::MAX`) inserts no entry in the deadline structure;
-finite deadlines insert `(t, id)`. The per-CPU deadline heap already keeps a parked
-deadline covered by its home CPU's LAPIC one-shot (`TimerPlan` → `Hw::set_timer`), so the
-block-handoff timer hole stays closed.
+finite deadlines insert `(t, id)`. A parked deadline is already covered by its home CPU's
+LAPIC one-shot — it lives in the `ParkedEntry` that `TimerPlan` → `Hw::set_timer` arms from,
+and in nothing else (scheduler-core §8.3) — so the block-handoff timer hole stays closed.
 
 ### 6.3 Kill/retire protocol (deletes the directed-wake class)
 
