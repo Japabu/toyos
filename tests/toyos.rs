@@ -376,6 +376,12 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("usb_storage_gate", Sched::Parallel),
     ("usb_storage_shapes", Sched::Parallel),
     ("usb_refused_disk_first", Sched::Parallel),
+    // The owner's freeze, staged: `device_del` on the stick carrying `/boot`
+    // and `/log` while the desktop draws. Serial because both verdicts are
+    // liveness ceilings — two 2 s compositor reporting intervals inside 20 s,
+    // and a console round trip inside 20 s — and a guest sharing the host with
+    // eleven others answers those late for reasons that are not the defect.
+    ("usb_boot_stick_pulled", Sched::Serial),
     ("usb_pool_exhausted", Sched::Parallel),
     ("usb_short_read", Sched::Parallel),
     // A plug over QMP and two host-side verdicts, neither of them a duration:
@@ -5449,6 +5455,7 @@ fn run_machine_test(
         // Bodies in `tests/common/usb.rs`, for the same reason.
         "usb_storage_gate" => usb::usb_storage_gate(test_config, c_bins, rust_bins),
         "usb_storage_shapes" => usb::usb_storage_shapes(test_config, c_bins, rust_bins),
+        "usb_boot_stick_pulled" => usb::usb_boot_stick_pulled(test_config, c_bins, rust_bins),
         "usb_refused_disk_first" => {
             usb::usb_refused_disk_first(test_config, c_bins, rust_bins)
         }

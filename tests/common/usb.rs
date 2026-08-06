@@ -2637,3 +2637,131 @@ pub fn usb_refused_disk_first(
     );
     Ok(())
 }
+
+/// The stick the machine booted from, pulled while the desktop is up.
+///
+/// **The instrument for #152, and the reason it exists is that the failure has
+/// no other witness.** `/log` is on the stick, so the recording of the event
+/// dies with the event; the machine has no serial port; it is not a panic, so
+/// the on-screen console never paints; and Ctrl+Alt+D answers nothing. Three
+/// investigations ran on the owner's description alone.
+///
+/// The pull is `device_del` on the boot stick, which had no device id until
+/// this gate needed one — every earlier unplug test names a *data* disk, and a
+/// data disk carries neither `/boot` nor `/log` nor the mount the log sink
+/// writes through. That difference is the whole scenario.
+///
+/// The liveness signal is `compositor: frames=`, for the reason
+/// `metal_sim_pointer_churn` picked it: it comes from a composited frame, so
+/// its absence is a desktop that stopped drawing rather than an instrument that
+/// stopped counting — which is exactly what the owner reports, a clock that
+/// stops advancing. The second probe is the serial console, which reaches
+/// userland through a different path: `run` makes test-runner print a line and
+/// then walk the VFS looking for a binary.
+///
+/// **A green run does not certify the machine survives an unplug.** It
+/// certifies that this shape of unplug, on this emulated controller, leaves the
+/// guest drawing and answering. What it *is* good for is red: a red here is the
+/// first reproduction of the owner's freeze anywhere but his desk.
+pub fn usb_boot_stick_pulled(
+    test_config: &Path,
+    _c_bins: &[(String, Vec<u8>)],
+    _rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let _ = test_config;
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+    let options = BootOptions {
+        profile: Profile::Metal,
+        qmp: true,
+        // The T14's core count. How many CPUs are in the idle loop when the
+        // device goes is the whole question on one hypothesis.
+        smp: 8,
+        ..Default::default()
+    };
+    let argv = qemu::profile_argv(&options);
+    if !argv.iter().any(|a| a.contains(&format!("id={}", qemu::BOOT_STICK_ID))) {
+        return Err(format!("the boot stick has no device id, so it cannot be pulled: {argv:?}"));
+    }
+
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let socket = qemu.qmp_socket().to_path_buf();
+    let mut console = qemu.boot_log().to_string();
+    let frames = |text: &str| text.matches("compositor: frames=").count();
+
+    // The machine has to be drawing before it is asked to survive anything, or
+    // a green run is a boot that never started.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && frames(&console) < 1 {
+        console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    if frames(&console) < 1 {
+        return Err(format!("the compositor never composited a frame:\n{console}"));
+    }
+
+    // And it has to be writing to the stick, or the pull is a disconnect with
+    // nothing in flight — which is not the state the owner's machine is in.
+    // The sink names the file it installed on `/log`, and that volume is on the
+    // device this test is about to take away.
+    if !console.contains("log-file: this boot's kernel log is /log/") {
+        return Err(format!(
+            "no log sink installed on /log, so the stick is not being written to and this gate \
+             stages nothing:\n{console}"
+        ));
+    }
+
+    let mut devices = qemu::QmpDevices::open(&socket);
+    devices.del(qemu::BOOT_STICK_ID);
+    drop(devices);
+
+    // Counted from here, so the verdict cannot be satisfied by frames drawn
+    // before the pull. Two reporting intervals of 2 s each, inside 20 s.
+    let mut after = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && frames(&after) < 2 {
+        after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    if frames(&after) < 2 {
+        console.push_str(&after);
+        return Err(format!(
+            "the desktop composited {} frame batches in the 20 s after the boot stick was \
+             pulled — it stopped drawing:\n{console}\n{}",
+            frames(&after),
+            crate::freeze_report(&mut qemu, &mut console)
+        ));
+    }
+    console.push_str(&after);
+
+    // Userland still answers the console. A different path from the frame
+    // counter: the byte arrives on the 16550, test-runner is scheduled, it
+    // prints, and then it asks the VFS for a binary — which is the lock the log
+    // sink holds while it writes to the device that just left.
+    let probe = "stick-gone-zqjxk";
+    let start = console.len();
+    writeln!(qemu.stdin_mut(), "run {probe}").map_err(|e| format!("write to QEMU stdin: {e}"))?;
+    qemu.flush_stdin();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let marker = format!("===TEST_END {probe}");
+    while std::time::Instant::now() < deadline && !console[start..].contains(&marker) {
+        console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    if !console[start..].contains(&marker) {
+        return Err(format!(
+            "the console was still drawing but `run {probe}` never came back through the VFS \
+             after the boot stick was pulled:\n{console}\n{}",
+            crate::freeze_report(&mut qemu, &mut console)
+        ));
+    }
+
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if console.contains(bad) {
+            return Err(format!("{bad:?} after the boot stick was pulled\n{console}"));
+        }
+    }
+
+    eprintln!(
+        "  [usb] the boot stick was pulled out from under a running desktop: {} frame batches \
+         after it, and `run` still reached userland and came back through the VFS",
+        frames(&after)
+    );
+    Ok(())
+}
