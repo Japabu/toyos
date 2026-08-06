@@ -14,7 +14,8 @@ use crate::mm::paging::CachePolicy;
 use crate::log;
 use crate::mm::KernelSlice;
 use crate::sync::Lock;
-use toyos_xhci::port::{self as portmachine, GaveUp, Gone, PortState, Step};
+use toyos_xhci::port::{self as portmachine, GaveUp, Gone, PortState, Reset, Step};
+use toyos_xhci::Protocols;
 use toyos_xhci::Portsc;
 
 use hid::HidDevice;
@@ -1357,14 +1358,43 @@ impl XhciController {
             match self.ports[port_idx as usize].step(portsc, now) {
                 Step::Idle => return None,
                 Step::Wait(at) => return Some(at),
-                Step::GaveUp(GaveUp::ResetNeverFinished) => {
-                    log!("xHCI: port {} never finished its reset (PORTSC {:#010x}); skipping it",
-                        port_idx + 1, portsc.raw());
+                Step::GaveUp(why) => {
+                    match why {
+                        GaveUp::ResetNeverFinished(kind) => log!(
+                            "xHCI: port {} never finished its {} reset (PORTSC {:#010x}); \
+                             skipping it",
+                            port_idx + 1,
+                            match kind {
+                                Reset::Hot => "hot",
+                                Reset::Warm => "warm",
+                            },
+                            portsc.raw()
+                        ),
+                        // A USB3 link that would not train even warm. §4.19.1.2
+                        // has nothing further, so this is the port's end and
+                        // not one step short of it.
+                        GaveUp::LinkNeverTrained => log!(
+                            "xHCI: port {} is SuperSpeed and its link would not train, warm reset \
+                             included (PORTSC {:#010x}, link {:?}); skipping it",
+                            port_idx + 1,
+                            portsc.raw(),
+                            portsc.link_state()
+                        ),
+                    }
                     return None;
                 }
                 Step::Write(write) => self.write_portsc(port_idx, write),
-                Step::Reset(write) => {
-                    log!("xHCI: port {} connected", port_idx + 1);
+                Step::Reset(kind, write) => {
+                    match kind {
+                        Reset::Hot => log!("xHCI: port {} connected", port_idx + 1),
+                        // The line the T14 could not produce, because the
+                        // driver had no such command.
+                        Reset::Warm => log!(
+                            "xHCI: port {} warm reset, link was {:?}",
+                            port_idx + 1,
+                            portsc.link_state()
+                        ),
+                    }
                     self.write_portsc(port_idx, write);
                 }
                 Step::Teardown(why, pending) => {
@@ -1380,8 +1410,15 @@ impl XhciController {
                     self.teardown_port(port_idx);
                     self.ports[port_idx as usize].torn_down();
                 }
-                Step::Enumerate(pending) => {
+                Step::Enumerate { trained, pending } => {
                     pending.running();
+                    if trained {
+                        // No reset was issued and none was needed: a SuperSpeed
+                        // link trains itself and this port was already Enabled.
+                        // The driver that did not know that reset the port into
+                        // Inactive and then had no way back.
+                        log!("xHCI: port {} connected, link already trained", port_idx + 1);
+                    }
                     let slot = device::configure(self, port_idx);
                     self.ports[port_idx as usize].enumerated(slot.and_then(NonZeroU8::new));
                     // Whatever the reset and the enumeration behind it raised.
@@ -1902,6 +1939,60 @@ pub fn init(devices: &[PciDevice]) {
     *XHCI.lock() = controllers;
 }
 
+/// What each of this controller's port registers speaks, out of its own
+/// Supported Protocol capabilities (§7.2).
+///
+/// **A controller that says nothing leaves every port unknown**, and unknown is
+/// driven the USB2 way — which is what every port got before this was read at
+/// all, so a controller this cannot describe is no worse off than it was.
+fn read_protocols(
+    bar: &Mmio,
+    bar_size: u64,
+    hccparams1: u32,
+    max_ports: u8,
+    pci_dev: &PciDevice,
+) -> Protocols {
+    let read = |offset: u64| -> Option<u32> {
+        (offset.checked_add(4)? <= bar_size).then(|| bar.read_u32(offset))
+    };
+    let mut protocols = Protocols::UNKNOWN;
+    let mut refused = 0;
+    let walked = legacy::for_each(
+        &read,
+        hccparams1 >> 16,
+        legacy::CAP_ID_PROTOCOL,
+        &mut |at| {
+            let dwords = (read(at), read(at + 4), read(at + 8));
+            let (Some(dw0), Some(dw1), Some(dw2)) = dwords else {
+                refused += 1;
+                return;
+            };
+            match toyos_xhci::protocol::SupportedProtocol::decode(dw0, dw1, dw2, max_ports) {
+                Ok(found) => {
+                    log!("xHCI: USB {}.{:x} on ports {}..={}", found.major, found.minor >> 4,
+                        found.first_port + 1, found.first_port + found.port_count);
+                    protocols.record(&found);
+                }
+                Err(why) => {
+                    refused += 1;
+                    log!("xHCI: a Supported Protocol capability at {at:#x} is unusable: {why:?}");
+                }
+            }
+        },
+    );
+    if let Err(why) = walked {
+        log!("xHCI: the capability list at PCI {:02x}:{:02x}.{} does not walk: {why:?}",
+            pci_dev.bus, pci_dev.dev, pci_dev.func);
+    }
+    let (usb2, usb3) = protocols.counts(max_ports);
+    // The line that says whether this machine's SuperSpeed ports are known to
+    // be SuperSpeed. A zero here on a controller that has them is the T14's
+    // failure waiting to happen, and it used to be invisible.
+    log!("xHCI: {usb2} USB2 and {usb3} USB3 port register(s) of {max_ports} named, \
+         {refused} capability(ies) refused");
+    protocols
+}
+
 fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
@@ -1998,6 +2089,7 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     // own it for legacy keyboard emulation, and resetting a controller SMM is
     // driving is a fight with no diagnostic.
     legacy::take_ownership(&bar, bar_size, hccparams1);
+    let protocols = read_protocols(&bar, bar_size, hccparams1, max_ports, pci_dev);
 
     let usbcmd = op_base.read_u32(OP_USBCMD);
     if usbcmd & 1 != 0 {
@@ -2120,7 +2212,13 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         event_phase: true,
         devices: Vec::new(),
         msc: [MscBlock::FREE; MSC_BLOCKS],
-        ports: alloc::vec![PortState::EMPTY; max_ports as usize],
+        ports: (0..max_ports)
+            .map(|p| {
+                let mut port = PortState::EMPTY;
+                port.speaks(protocols.of(p));
+                port
+            })
+            .collect(),
         ports_dirty: false,
         #[cfg(feature = "xhci-portsc-rw1c")]
         software_disabled: [0u64; 4],
