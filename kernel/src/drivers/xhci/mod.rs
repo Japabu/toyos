@@ -1566,8 +1566,16 @@ impl XhciController {
             // waiting on Disable Slot — is not decided about at all until the
             // controller has answered for it. The machine says so itself, and
             // asking it costs a register read to be told nothing.
+            //
+            // The `expect` is a driver bug and not a device one: the only
+            // effect that outlives a pass is the one that filled the slot, so
+            // a port left working with nothing outstanding is a port no pass
+            // will ever come back for — #151's shape, and silent.
             if self.ports[port_idx as usize].working().is_some() {
-                return self.outstanding.wake_at();
+                let at = self.outstanding.wake_at().expect(
+                    "a port is inside an effect the controller was never asked to perform",
+                );
+                return Some(at);
             }
             // Read before the machine is asked, because by then its own borrow
             // of this port is live. The two effects below that need the
