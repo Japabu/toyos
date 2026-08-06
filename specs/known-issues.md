@@ -1275,10 +1275,35 @@ is not trustworthy in general — the xHCI work established that `ALONE: red
 again` can measure the host rather than the tree — but in this direction, on
 this test, green-alone is real.)
 
-**Landing while it is red** uses `--land --gate cargo test -- --skip
-desktop_window_child`, which prints the override in the report and cannot be
-mistaken for an ordinary landing. `--skip` exists for this and should not grow
-other users.
+**A third manifestation, 2026-08-06**, on the mechanism branch, twice in one
+session — once in the 12-wide phase and once in the re-run alone, at 3.5 s into
+both boots. The message is `GUI+Q never reached the compositor`, **and it names
+the wrong thing**: the close did reach the compositor. The log under it is the
+teardown, one probe earlier than the snake rounds — `exit: test_rs_window_child
+pid=5 code=0`, then `exit: shell pid=2 code=0`, then `exit: terminal pid=1
+code=0`, then `windows=0`. `close_focused_window` waits for `windows=1` and the
+desktop went straight to none, so the harness reports the injection it did
+deliver as one that never arrived. Serial kept flowing for the whole drain —
+compositor stats every ~2 s, kernel stats every 10 s — so by this entry's own
+discriminator it is **not** the freeze; it is the shell-exit defect three
+paragraphs down, reached at the first windowed child rather than during a snake
+round. Whoever fixes that message should make it say what the log says.
+
+**Landing while it is red** needs nothing special: `desktop_window_child` is
+declared in `EXPECTED_FAILURES` (`tests/toyos.rs`) and `cargo run -- --land`
+runs the ordinary gate. The declaration reports it by name on every run, is red
+if the test *passes* where the entry says a pass is proof, and is red on
+`2026-09-06` regardless — this entry is intermittent, so its own expiry is a
+date rather than a green run. The `--skip` flag that used to be the answer is
+deleted: an exclusion nobody reviews cannot expire, and this one has to.
+
+**What the declaration will and will not absorb.** Its `says` list covers the
+six of this test's messages whose failure is *the desktop ceasing to answer
+after a window closed*. The other five red the run — the client binary missing,
+the desktop never coming up, a window never being created, and the client
+leaving on its own deadline. That pins which assertion failed and not why, so
+the log-tail discriminator above is still a human's to apply; the run prints the
+pointer to this section beside every `XFAIL` line for exactly that reason.
 
 **One thing #156's capture leaned on is closed, and it is not this.** The
 deadline was stored twice — `ParkedEntry.deadline` and `DeadlineHeap` — and
@@ -2703,7 +2728,9 @@ phase landed, and none reproduces on a host running one suite.
 - **`desktop_typing_damage`** — `nothing typed at the terminal window reached a
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
-  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`.
+  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`. **See the entry
+  below: as of 2026-08-06 this is no longer occasional but reproducible, and the
+  mechanism is the duration profile.**
 - **`desktop_locale_detect`** — added 2026-08-05. Same `nothing typed at the
   terminal window reached a shell`, same `ALONE … GREEN`, in the same run as the
   entry above and on a branch that touches neither the compositor nor the
@@ -2762,6 +2789,52 @@ green cannot be produced by load. `ALONE: red again` means nothing on its own
 and must be confirmed against `main` in the same session before it is believed —
 which is the A/B the audio rules already require and which this line currently
 invites an agent to skip.
+
+### OPEN — longest-job-first puts the two 8-CPU desktops side by side, and the profile that did it is self-reinforcing
+
+Measured 2026-08-06 in one worktree, four full runs, on a host at roughly three
+times its own load.
+
+`longest_first` orders the parallel phase on `target/test-durations`, what the
+last run in that worktree measured. The two longest jobs in the suite are now
+`desktop_window_child` (248 s) and `desktop_typing_damage` (246 s) — **the top
+two by a factor of six over the third** — and both boot `tests/desktopcase` at
+`smp: 8`. Longest-first therefore dispatches two eight-CPU desktop guests into
+the same instant, at the head of a twelve-wide phase, on a fourteen-core host.
+
+The first run in a fresh worktree has no profile at all, so every task sorts
+equal and the phase runs in declaration order, which happens to separate them:
+
+| run | profile | `desktop_typing_damage` | verdict |
+|---|---|---:|---|
+| 1 | none (fresh worktree) | 48 s | PASS |
+| 2 | written by run 1 | 243 s | FAIL, `ALONE: GREEN` in 16 s |
+| 3 | " | 255 s | FAIL, `ALONE: GREEN` in 16 s |
+| 4 | " | 246 s | FAIL, `ALONE: GREEN` in 16 s |
+
+**And it latches.** What run 2 recorded for `desktop_typing_damage` is 246 s of
+mostly *waiting for the host*, and that number is what pins it beside the other
+desktop on every later run. A duration profile whose entries include contention
+cannot order its way out of the contention it measured.
+
+Three things are tangled here and only the first is scheduling:
+
+- The ordering, above.
+- **`desktop_window_child` costs a lane four minutes on every run**, and always
+  did: `close_focused_window` retries until `qemu::budget(20 s)`, which at width
+  12 is 240 s. It is an expected failure (§3), so the four minutes buy a red
+  nobody acts on. A ceiling that scales with the width is right for a liveness
+  guard on a healthy test and wrong for one that is known to run out.
+- `desktop_typing_damage`'s verdict is still a typing window, which is what
+  `Sched::Parallel` is not for. Its bullet above says the budget was "evidently
+  not enough of it"; this says why.
+
+Not fixed here, and the fix is not obviously "reclassify": `Sched::Serial` for
+both desktops moves ~8 minutes into the serial tail, which
+`specs/test-cost-audit.md` §5.4 spent a wave getting out of. Candidates worth
+pricing: cap what a lane will spend on an `EXPECTED_FAILURES` test, exclude a
+test's contention wait from what the profile records, or give the profile a
+notion of how much host a task wants so two eight-CPU guests do not pair.
 
 ### A whole parallel phase can be starved by another agent's build
 
