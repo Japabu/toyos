@@ -32,9 +32,9 @@ pub const MAX_QUEUED_EVENTS: usize = 512;
 
 /// Ctrl+Alt+D is recorded here, not acted on. `handle_key` runs under whichever
 /// driver's guard produced the transition — `PS2` on the i8042 path, `XHCI` on
-/// the USB one — and `dump_blocked` walks the scheduler and logs a line per
-/// parked thread. The scheduler pass consumes this after every device service,
-/// with no driver lock held.
+/// the USB one — and `sched::dump` asks every CPU for its parked tasks and
+/// waits for them. The scheduler pass consumes this after every device
+/// service, with no driver lock held.
 static DUMP_REQUESTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

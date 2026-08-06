@@ -561,6 +561,26 @@ pub fn boot_checkpoint() {
     PAINTING.store(false, Ordering::SeqCst);
 }
 
+/// Put the tail of the log on the panel because somebody asked for it.
+///
+/// [`boot_checkpoint`] without the userland check, and that is the whole
+/// difference. The caller is Ctrl+Alt+D, pressed on a machine its owner
+/// believes has stopped, and the machine this exists for has no serial port —
+/// so declining because a compositor holds the screen would answer the
+/// question into a log file nothing is left running to flush. The keystroke is
+/// the consent.
+///
+/// It costs the desktop what a checkpoint costs it: the glyphs stay in cells
+/// the compositor's damage model believes are blank until something repaints
+/// them.
+pub fn paint_report() {
+    if PAINTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    paint(Fill::Boot, live_tail(), Page::Last);
+    PAINTING.store(false, Ordering::SeqCst);
+}
+
 /// Which slice of the text a paint shows.
 #[derive(Clone, Copy)]
 enum Page {

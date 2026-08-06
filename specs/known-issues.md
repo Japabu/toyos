@@ -2325,20 +2325,15 @@ that ends it is the same one the compositor's frame interval rides. The
 registration is on the command pipe, which soundd owns both ends of and nobody
 closes.
 
-**What would settle it on the next T14 boot**, in preference order, because a
-question the owner can answer beats a fix nobody can verify:
+**What settles it on the next T14 boot: Ctrl+Alt+D on the wedged machine.** The
+dump is machine-wide and process-named now (§5), so one press answers the split
+directly. soundd's mix thread parked with a sane deadline says the timer did
+not fire; parked with an absurd one says the timeout was computed wrong; absent
+from every parked list says nothing ever held it, which would move this into
+#142's family rather than audio's. The report paints the panel, so the machine
+with no serial port answers on glass and a photograph is enough.
 
-1. Ctrl+Alt+D on the wedged machine, taken on several CPUs. Today
-   `dump_blocked` lists only the calling CPU's parked threads
-   (`kernel/src/scheduler.rs:559`, §5) and prints a task key, a wait class and
-   a deadline — enough to split the three cases that remain: parked on the
-   ring's queue with a sane deadline (the timer did not fire), parked with an
-   absurd one (the timeout was computed wrong), or not parked at all (never
-   picked, which would make this #142's family rather than audio's).
-2. Making that dump machine-wide and naming the process is the one instrument
-   worth building first; it is the same gap §5 files against `ps` and `stats`.
-
-Until one of those exists, the three gates this task landed are what stands
+Until that press happens, the three gates this task landed are what stands
 between the milestone and a silent recurrence: a client through the null sink
 must exit, a second must be taken up while the first streams, and the desktop
 must still answer afterwards.
@@ -2401,18 +2396,56 @@ scheduler exists, and the on-screen console already answers the *phase* question
 for a machine with a panel (`boot_checkpoint`). Recorded rather than fixed
 because the choice belongs with whoever owns the log ring.
 
-### `ps`, `stats` and `dump_blocked` lost their cross-CPU view at Stage 7a
+### CLOSED for the dump — Ctrl+Alt+D reads the whole machine and names processes
 
 A `CpuSched` is `!Sync` and reachable only from its own CPU, so walking a
-sibling's queues is now unwritable rather than racy. `task_cpu_ns` and
+sibling's queues is unwritable rather than racy. `task_cpu_ns` and
 `task_sched_state` were rebuilt on values the owning CPU *publishes* —
 `TaskHandle`'s counters, republished at each end of a pass, plus the core's
 rendezvous word — so they are accurate and lock-free, which also closes the old
-`try_lock`-and-skip misreport. `dump_blocked` has no such substitute: it prints
-only the calling CPU's parked map, by `TaskKey` and `WaitClass`, with no process
-name and no per-source detail, because the pool it used to walk does not exist. A
-cross-CPU view costs a message round trip; whether the diagnostic is worth
-building is a diagnostics question, not a scheduler one.
+`try_lock`-and-skip misreport. `dump_blocked` had no such substitute: it printed
+the calling CPU's parked map alone, by `TaskKey` and `WaitClass`, with no
+process name, so it could confirm a park and never rule one out.
+
+`kernel/src/sched/dump.rs` replaces it, built for #172 and for #142's family.
+It walks nothing remote: the asking CPU marks every sibling, kicks it, and each
+prints its own tasks from `drain_irqs` at the top of its next pass. **A CPU that
+does not reach a pass inside 250 ms is named, and that is a finding** — it is
+the only way this report can say a CPU is not scheduling at all.
+
+Two halves, because neither sees what the other does. The CPUs give the
+deadline, the wait class and how long the park has lasted; the process table
+gives every thread's name and its published state, which is the only place a
+task **no CPU was ever given** appears at all. `Ready` with `cpu_ns == 0` is
+#142's signature, and the summary's `unheld` count is what the state words claim
+minus what the CPUs hold.
+
+The three failure modes degrade rather than stop the report: a silent CPU is
+named and the verdict says its counts are of what answered; the process table is
+retried for 20 ms and then reported as held, with the deadline half of the
+verdict still printed; and a CPU inside a pass says so. Nothing allocates,
+nothing waits on a lock it could find held, and truncation takes only ordinary
+lines — an overdue or absurd deadline is never dropped.
+
+It ends by painting the panel (`panic_console::paint_report`), taking the screen
+from whoever holds it, because the machine it is for has no serial port and a
+wedged one may never flush its log file. The verdict is the last line printed
+and the console paints the newest page, so the screenful a phone camera catches
+is the one carrying it.
+
+Gates: `blocked_dump` (eight CPUs, every one present, and the two halves' counts
+must agree) and `screen_blocked_dump` (muted metal-sim, a compositor holding the
+screen, the verdict read back off the decoded panel). Negative controls run:
+without the per-CPU answer the report reaches 1 of 8, and with the userland
+check restored on the paint the panel carries nothing.
+
+**A deadline that has passed and whose pass has not yet run is a real,
+microsecond-wide state** — `blocked_dump` has seen `1 OVERDUE` on a healthy
+guest. The count is evidence, not a verdict; what condemns a machine is one that
+stays.
+
+What is left of this entry: `ps` and `stats` still have no cross-CPU view of
+anything the handles do not publish.
 
 ### CPU attribution: the recorded "half the CPU is unattributed" claim was wrong
 

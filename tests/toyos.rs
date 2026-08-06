@@ -190,6 +190,10 @@ const SCREEN_TESTS: &[(&str, Sched)] = &[
     ("screen_console_clear", Sched::Parallel),
     ("screen_console_scroll", Sched::Parallel),
     ("screen_i8042_health", Sched::Parallel),
+    // Ctrl+Alt+D with no console at all: the panel is the whole channel, and a
+    // compositor is holding it. Parallel — screendumps against markers, no
+    // clock in the verdict.
+    ("screen_blocked_dump", Sched::Parallel),
     ("screen_recoverable_untouched", Sched::Parallel),
     ("screen_early_panic", Sched::Parallel),
     ("screen_late_panic", Sched::Parallel),
@@ -342,6 +346,11 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // a surface. Parallel — every verdict is a marker with its own ceiling, and
     // none of them reads a clock.
     ("desktop_audio_client", Sched::Parallel),
+    // Ctrl+Alt+D on the same machine. Parallel: it waits for a marker and its
+    // verdicts are counts the report has to agree with itself about, not a
+    // wall-clock margin — the one duration in it is the dump's own 250 ms
+    // ceiling, which the guest spends and the host never measures.
+    ("blocked_dump", Sched::Parallel),
     // Two boots of one machine compared on the guest's own `Boot: complete`
     // with a 300 ms allowance, which is the whole assertion.
     ("i8042_absent", Sched::Serial),
@@ -2696,6 +2705,88 @@ fn run_screen_test(
             }
             Ok(())
         }
+        "screen_blocked_dump" => {
+            // Ctrl+Alt+D on the machine it exists for: metal-sim with the
+            // 16550 taken away, a compositor holding the screen, and therefore
+            // no channel out of the guest at all except the panel. The report
+            // has to take the screen back — declining because userland owns it,
+            // which is what a boot checkpoint does, would answer the owner's
+            // question into a log file nothing is left running to flush.
+            //
+            // The verdict is asserted on the *panel* and nowhere else, and it
+            // is the summary rather than any one thread: the summary is printed
+            // last, the console paints the newest page, so the screenful a
+            // phone camera catches is the one that carries the discriminator.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopaudiocase");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                smp: 8,
+                qmp: true,
+                mute: true,
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            // The compositor's wallpaper first. Every kernel paint fills the
+            // panel with `FILL_BOOT`, so a fill that is anything else is
+            // userland holding the screen and nothing else — which is the
+            // precondition, and asserting on the fill rather than on the
+            // absence of boot text is what stops a merely-blank screen passing
+            // for a desktop.
+            let up = qemu.screendump_while(Duration::from_secs(30), Duration::from_millis(200), |d| {
+                d.fill() != FILL_BOOT
+            });
+            if up.fill() == FILL_BOOT {
+                return Err(
+                    "the compositor never took the screen, so this would have tested a \
+                     checkpoint rather than a report that seizes the panel"
+                        .to_string(),
+                );
+            }
+
+            // Retried, like every other typed handshake in this file: a
+            // keystroke that lands while a desktop is still settling reaches a
+            // machine that repaints over the answer, and the retry is cheaper
+            // than a rule about when a desktop is finished.
+            let deadline = Instant::now() + qemu::budget(Duration::from_secs(40));
+            let mut dump = up;
+            while Instant::now() < deadline && !dump.text().contains("== VERDICT:") {
+                {
+                    let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+                    input.keys(&[
+                        ("ctrl", true),
+                        ("alt", true),
+                        ("d", true),
+                        ("d", false),
+                        ("alt", false),
+                        ("ctrl", false),
+                    ]);
+                }
+                dump = qemu.screendump_until("== VERDICT:", Duration::from_secs(4));
+            }
+            let text = dump.text();
+            print_screen(name, &text);
+            for want in ["== VERDICT:", "cpu(s) answered", "== deadlines:"] {
+                if !text.contains(want) {
+                    return Err(format!(
+                        "the panel does not carry {want:?}, so a photograph of this machine \
+                         answers nothing\ndecoded screen:\n{text}"
+                    ));
+                }
+            }
+            // The report took the screen back from the compositor, which is the
+            // half of this that `boot_checkpoint` deliberately will not do.
+            if dump.fill() != FILL_BOOT {
+                return Err(format!(
+                    "the verdict is on the panel but the fill is {:?} — this is a client's \
+                     screen with kernel text on it, not the report taking the panel",
+                    dump.fill()
+                ));
+            }
+            let row = dump.row_index("== VERDICT:").expect("checked above");
+            eprintln!("  [dump] on the panel of a guest with no console: {}", dump.rows()[row].trim());
+            Ok(())
+        }
         "screen_recoverable_untouched" => {
             // The negative of screen_fatal_halt, and the property that makes
             // the capture/render split worth having: a panic the kernel
@@ -4143,6 +4234,143 @@ fn open_terminal(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Resu
     ))
 }
 
+/// Ctrl+Alt+D at a live desktop: every CPU answers, and the two halves of the
+/// report agree.
+///
+/// The instrument known-issues §5 files against, built because QEMU cannot
+/// stage the T14's audio wedge and a question the owner can answer beats a fix
+/// nobody can verify. Until this landed the dump listed the *calling* CPU's
+/// parked threads and named them by scheduler key, so it could confirm a park
+/// and never rule one out — and the three states that look identical from
+/// outside (parked on a deadline that did not fire, parked on a deadline
+/// nothing could reach, held by no CPU at all) were not distinguishable at all.
+///
+/// Eight CPUs, because "machine-wide" is not testable at the suite's default of
+/// two: one CPU short of the whole machine is what the old dump already did.
+///
+/// **The verdict is the instrument, not the guest's health.** A deadline that
+/// has passed and whose pass has not yet run is a legitimate microsecond-wide
+/// state, so asserting zero of them would be asserting a race. What is asserted
+/// is that the report is complete and that its halves cannot disagree: every
+/// CPU is present, the deadline classes sum to the parked count, and the
+/// process table knows at least as many threads as the schedulers hold.
+fn blocked_dump() -> Result<(), String> {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopaudiocase");
+    let options = BootOptions {
+        profile: qemu::Profile::Metal,
+        smp: 8,
+        qmp: true,
+        ready_marker: "compositor: ready",
+        ..Default::default()
+    };
+    metal_sim_argv_check(&qemu::profile_argv(&options))?;
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let mut log = qemu.boot_log().to_string();
+    if !shell_answers(&mut qemu, &mut log) {
+        return Err(format!("nothing typed at the terminal window reached a shell:\n{log}"));
+    }
+
+    let before = log.len();
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        input.keys(&[
+            ("ctrl", true),
+            ("alt", true),
+            ("d", true),
+            ("d", false),
+            ("alt", false),
+            ("ctrl", false),
+        ]);
+    }
+    if !serial_until(&mut qemu, &mut log, "=== end of dump ===", Duration::from_secs(30)) {
+        return Err(format!("Ctrl+Alt+D produced no complete report:\n{}", &log[before..]));
+    }
+    let report = log[before..].to_string();
+
+    // Every CPU printed its own line. This is the whole of "machine-wide": the
+    // count in the summary is derived, these are the CPUs actually answering.
+    let missing: Vec<usize> =
+        (0..8).filter(|c| !report.contains(&format!("cpu{c} running"))).collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "cpu(s) {missing:?} never reported — the dump reached {} of 8:\n{report}",
+            8 - missing.len()
+        ));
+    }
+    if !report.contains("8/8 cpu(s) answered") {
+        return Err(format!("the report does not claim a whole machine:\n{report}"));
+    }
+    // On a settled desktop the table is free, so the half of the verdict that
+    // only the census can produce must be there. A report that answered two of
+    // three questions is worth having on the owner's panel and is not worth
+    // accepting from a gate.
+    if !report.contains(" unheld, ") || !report.contains(" never ran") {
+        return Err(format!(
+            "the verdict lost its census half on a settled machine:\n{report}"
+        ));
+    }
+
+    // A parked line names a process, not a scheduler key.
+    let named = report
+        .lines()
+        .filter(|l| l.contains("pid=") && l.contains("tid=") && l.contains(" parked "))
+        .count();
+    if named == 0 {
+        return Err(format!("no parked task was named by pid and tid:\n{report}"));
+    }
+
+    // The two halves must agree, which is what makes the verdict mean anything:
+    // every parked task falls into exactly one deadline class, and every task a
+    // scheduler holds is a thread the process table knows.
+    let parked = dump_field(&report, "== sched:", "parked")?;
+    let classes = dump_field(&report, "== deadlines:", "event-only,")?
+        + dump_field(&report, "== deadlines:", "pending,")?
+        + dump_field(&report, "== deadlines:", "OVERDUE,")?
+        + dump_field(&report, "== deadlines:", "ABSURD")?;
+    if parked != classes {
+        return Err(format!(
+            "{parked} parked task(s) but {classes} classified — the report contradicts \
+             itself:\n{report}"
+        ));
+    }
+    let threads = dump_field(&report, "== census:", "thread(s)")?;
+    if threads < parked {
+        return Err(format!(
+            "the schedulers hold {parked} task(s) and the process table knows {threads} \
+             thread(s) — the census cannot see what the CPUs do:\n{report}"
+        ));
+    }
+
+    let verdict = report
+        .lines()
+        .find(|l| l.contains("== VERDICT:"))
+        .ok_or_else(|| format!("no verdict line:\n{report}"))?;
+    eprintln!(
+        "  [dump] {threads} threads, {parked} parked, all 8 cpus answered;{}",
+        verdict.split("VERDICT:").nth(1).unwrap_or("").trim_end()
+    );
+    Ok(())
+}
+
+/// The number the report writes immediately before `word`, on the line that
+/// carries `marker`. Read from the word a person sees rather than from a
+/// column, so a reordered line does not silently read the wrong field.
+fn dump_field(report: &str, marker: &str, word: &str) -> Result<u32, String> {
+    let line = report
+        .lines()
+        .find(|l| l.contains(marker))
+        .ok_or_else(|| format!("no {marker:?} line in the report:\n{report}"))?;
+    let head = line
+        .split(word)
+        .next()
+        .filter(|h| h.len() < line.len())
+        .ok_or_else(|| format!("no {word:?} on {line:?}"))?;
+    head.split_whitespace()
+        .next_back()
+        .and_then(|w| w.parse().ok())
+        .ok_or_else(|| format!("no number before {word:?} on {line:?}"))
+}
+
 /// Connects the mixer has *applied* since `from`, which is a different event
 /// from the control thread's `opening stream` — the T14 log carries the second
 /// without the first.
@@ -4883,6 +5111,7 @@ fn run_machine_test(
         "desktop_locale_detect" => desktop_locale_detect(),
         "desktop_typing_damage" => desktop_typing_damage(),
         "desktop_audio_client" => desktop_audio_client(),
+        "blocked_dump" => blocked_dump(),
         "xhci_many_devices" => {
             // The T14's internal controller carries a camera, Bluetooth and a
             // fingerprint reader next to the boot stick, and every profile in
