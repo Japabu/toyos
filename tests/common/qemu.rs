@@ -1782,6 +1782,7 @@ fn qcode(ch: char) -> (&'static str, bool) {
         '_' => ("minus", true),
         '.' => ("dot", false),
         '/' => ("slash", false),
+        '&' => ("7", true),
         _ => panic!("no qcode for {ch:?}; add it rather than typing something else"),
     }
 }
