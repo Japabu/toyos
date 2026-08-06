@@ -2444,6 +2444,52 @@ microsecond-wide state** — `blocked_dump` has seen `1 OVERDUE` on a healthy
 guest. The count is evidence, not a verdict; what condemns a machine is one that
 stays.
 
+**KNOWN BLIND SPOT: the dump cannot fire when no CPU reaches a scheduler pass.**
+It is dispatched from `drain_irqs` at the top of a pass, so a *partial* wedge
+answers and a *total* freeze is silent — the owner pressed it after pulling the
+USB stick and got nothing, which is itself weak evidence that no CPU was
+passing. Whether an interrupt-dispatched variant can close that is the
+scheduler agent's (the NMI-on-timeout proposal); what follows is what the
+author of this facility established while building it, so nobody rediscovers it
+or removes it by accident.
+
+- **`Lock::lock` disables preemption, not interrupts** (`sync.rs`) — a ticket
+  spin after `preempt::disable()`, no `cli`.
+- **That fact is load-bearing for the 250 ms sibling wait.** Spinning there is
+  safe *because a preempt-driven pass provably holds no `Lock`*: taking one
+  raises the preempt count, so a pass cannot be entered while one is held.
+  **The argument does not survive being moved to an interrupt**, which can land
+  on a CPU that *is* holding a lock — the waiter would then block the sibling
+  it is waiting for. `request`'s `assert!(depth <= 1)` encodes exactly this
+  entry condition and is not decoration.
+- **`log!` takes the serial lock.** It is the single reason the report is not
+  ISR-safe today: an interrupt landing on a CPU that holds it deadlocks on the
+  first line. The panic console's paint is the lock-free counter-example and is
+  ISR-tolerable; `paint_report`'s `PAINTING` is a swap latch that self-releases,
+  not a `Lock`.
+- **The per-CPU half is already reentrancy-safe by construction.** The
+  schedulers are not behind a `Lock` at all: `SCHEDS[cpu]` is guarded by the
+  `IN_PASS[cpu]` flag, mutation happens only inside `with_cpu` which sets it,
+  and `try_with_cpu` refuses when it is set. An interrupt that lands mid-pass
+  therefore reads nothing rather than reading a torn map.
+- **The process table is `try_lock` retried to a 20 ms ceiling, and the retry
+  is not belt-and-braces.** Bare `try_lock` was the first version and
+  `screen_blocked_dump` caught it losing the whole census to a *transient*
+  holder — a spawn in flight 0.75 s into boot. The ceiling separates "someone
+  is mid-spawn" (microseconds) from "the holder is what is wedged" (never).
+- **Truncation may never hide what the report is for.** `LINES_PER_CPU` bounds
+  ordinary parked lines; a line whose verdict is `Overdue` or `Absurd` is not
+  counted against the budget, and `UNPRINTED` says how many ordinary ones went.
+- **The summary is last for a causal reason, not a cosmetic one**: it is the
+  only part that needs every CPU to have answered, and the console paints the
+  *newest* page, so last is what a photograph catches. Any variant that
+  reprints must keep that order.
+- **The deadline arithmetic is guarded by its own classification.**
+  `Verdict::of` matches `at <= now` before it ever evaluates `at - now`, and
+  `Deadline`'s `Display` only subtracts in the arms that verdict produced.
+  Overflow checks are on in the kernel, so reordering those arms turns a
+  diagnostic into a panic.
+
 What is left of this entry: `ps` and `stats` still have no cross-CPU view of
 anything the handles do not publish.
 
