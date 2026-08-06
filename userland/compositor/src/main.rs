@@ -1506,6 +1506,11 @@ fn main() {
                             0x14 => {
                                 // GUI+Q: close focused window
                                 let win = windows.remove(idx);
+                                eprintln!(
+                                    "compositor: DIAG GUI+Q closes idx={idx} pid={}, {} left",
+                                    win.pid,
+                                    windows.len()
+                                );
                                 let _ = win.fd.try_signal(window::MSG_WINDOW_CLOSE);
                             }
                             0x19 => {
