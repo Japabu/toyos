@@ -235,6 +235,64 @@ cargo test                 # boot the OS and run the integration suite
 The first run initializes submodules and bootstraps the custom Rust toolchain.
 Later runs rebuild only what changed; a `std`-only change is a few seconds.
 
+## Running it on real hardware
+
+Every build produces a bootable disk image — GPT-partitioned, UEFI, ready to
+write to a USB stick and boot on a physical machine.
+
+```
+cargo run -- --build-only                 # target/bootable.img
+cargo run -- --diag-boot --build-only     # target/bootable-diag.img
+cargo run -- --console-boot --build-only  # target/bootable-console.img
+```
+
+Three images rather than one, because a machine that misbehaves needs to be
+asked different questions. Same kernel and same bootloader in all three; only
+the boot configuration differs.
+
+| Image | What it is |
+|---|---|
+| `bootable.img` | The whole system — compositor, daemons, desktop. What `cargo run` boots under QEMU, and the same bytes you flash. |
+| `bootable-diag.img` | Nothing in it *can* claim the framebuffer, so the kernel's log and its panics stay readable on the panel. The only way to read a machine that wedges before userland, and on a laptop with no serial port the only way at all. |
+| `bootable-console.img` | A shell on the raw framebuffer, no compositor. For asking the machine questions instead of reflashing it. |
+
+### Writing it to a USB stick
+
+The image is a whole disk, not a filesystem — write it to the device, not to a
+partition on it. **Check the device name twice.** This destroys whatever is
+already there.
+
+macOS:
+
+```
+diskutil list                              # find the stick
+diskutil unmountDisk /dev/diskN
+sudo dd if=target/bootable.img of=/dev/rdiskN bs=4m
+diskutil eject /dev/diskN
+```
+
+Linux:
+
+```
+lsblk                                      # find the stick
+sudo dd if=target/bootable.img of=/dev/sdX bs=4M status=progress conv=fsync
+sync
+```
+
+Then boot the machine from it. Secure Boot has to be off — ToyOS's bootloader
+is signed by nobody.
+
+The image carries two partitions: the EFI system partition the firmware boots
+from, and a FAT32 one labelled `TOYOS-LOG`, where the kernel writes a log file
+per boot named for the wall clock. It has its own partition for a mundane
+reason — macOS will not auto-mount an EFI-typed one, so a log written there was
+unreadable on the machine that needed to read it. Pull the stick after a boot
+and the log is sitting there on any computer.
+
+**Build a flashable image from a committed tree.** `cargo` builds your working
+directory, and a checkout usually holds work in progress. An image flashed from
+one is not a version of anything.
+
 ## Design
 
 Read `CLAUDE.md` for the principles the codebase is held to, and `specs/` for
