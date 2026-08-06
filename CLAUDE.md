@@ -158,6 +158,8 @@ console/system.toml  The same, for `--console-boot`: /bin/console and a shell
 - `python3 .claude/qmp.py --raw n --ctrl` — Ctrl+N
 - `python3 .claude/qmp.py --screenshot /tmp/toyos-screen.png` — capture screen
 
+**Reading a frozen guest, without `cargo run`.** Any harness test with `BootOptions { qmp: true }` leaves a socket at `$TMPDIR/toyos-tests-<pid>/lane-<n>/qmp-*.sock` for as long as the guest lives, so a background loop can interrogate a hung boot while the test sits in its own wait. `human-monitor-command` with `info registers -a` gives every vCPU's `RIP`, `RFL` and `HLT` — which is how #156 was settled: eight cores at `HLT=1` with `RFL=0x246` (IF **set**) proved the machine was halted awaiting an interrupt rather than wedged, and disproved four hypotheses in one capture. **Take that capture before injecting anything.** A keystroke revives a halted CPU, so Ctrl+Alt+D over the same socket both confirms the diagnosis and destroys the evidence for it — the blocked-task dump's own deadline columns describe the machine *after* the repair (`sched/dump.rs`).
+
 ## Workflow
 
 **One agent, one worktree, one branch.** `cargo run -- --worktree add <path>` makes one in about a second and 23 MiB; `specs/worktrees.md` is the model, the evidence, and the landing protocol. Never `git worktree add` by hand — the naive path clones 913 MiB of rust history and starts a second toolchain that takes the machine-global `toyos` rustup name away from every other checkout. **The primary checkout is not a workspace**: it owns `rust/` (50 GiB), the rustup link, and `main`, and landings move its tree.

@@ -443,3 +443,68 @@ doc-comment says so. `MAX_PASS_NS` is 200 µs. A CPU inside that recovery holds
 every message addressed to it, and `retire_task`'s deadline is the only thing in
 the tree that notices. Recorded in `specs/known-issues.md`; not fixed here,
 because closing it means making xHCI enumeration asynchronous.
+
+### The desktop freeze is a halted machine, not a wedged one (open, #156)
+
+`desktop_window_child` reproduces a freeze in QEMU at roughly 2 in 5 runs. The
+guest stops emitting anything at all — including the compositor's ~2 s stats
+line — and the test fails on whatever assertion it was waiting for.
+
+**The evidence that settled what it is, taken before anything touched the
+guest.** All eight vCPUs, read over QMP while the test sat in its 20 s wait:
+
+```
+CPU#0..7   RIP=ffff80007cecf5c1  RFL=00000246 [---Z-P-] CPL=0  HLT=1
+```
+
+`HLT=1` on every core and `RFL=0x246` has **IF set**. The CPUs are halted with
+interrupts *enabled*, waiting for an interrupt that never arrives. That is not
+a wedge, and it disproves four hypotheses at once: no CPU is spinning with
+interrupts off (`BackendGuard::lock` and the serial-drain livelock), none is
+holding a lock (a `hlt` holds nothing), none is stuck below the interrupt layer,
+and "no CPU reaches a scheduler pass" has the causality backwards — every CPU
+*can* schedule and there is nothing to schedule.
+
+Injecting Ctrl+Alt+D over the same QMP socket takes the halted count from 8 to
+0 and the machine resumes, compositor line and all. One keystroke revives it.
+
+**What the dump then reports, in three independent captures that agree:**
+
+```
+ready: pid=0 tid=0 compositor cpu=662ms
+cpu0 pid=0 tid=0 io parked 14ms due in 1ms
+== census: 1 thread(s) — 0 running, 1 ready, 0 blocked, 0 zombie, 0 unscheduled
+== sched: 8/8 cpu(s) answered — 0 running, 0 queued, 1 parked
+== deadlines: 0 event-only, 1 pending, 0 OVERDUE, 0 ABSURD
+```
+
+One thread exists in the whole system. The shell, the terminal and the child
+have all exited; the survivor is the compositor, parked on cpu0 **on a timer
+deadline**, and it is the only thing that could ever have restarted the machine.
+So the freeze is: *cpu0 halted with the last runnable-in-principle thread parked
+on a deadline that did not fire.*
+
+**Read `0 OVERDUE` there with the caveat below in hand: it describes the revived
+machine.** The keystroke that produced the report is what woke cpu0 and made it
+re-arm, so every deadline field postdates the repair.
+
+**Two candidates, both in `toyos-sched`, both expressible against invariant
+I3/T.** The first is the stronger on this evidence because it predicts exactly
+the observed end state — parked task, no deadline, `TimerPlan::Stop`, halted
+forever:
+
+1. `CpuSched::fire_deadlines`' `Claim::Lost` arm **pops the heap entry and
+   discards it**, on the argument that whoever won the claim has a `Msg::Wake`
+   in flight to this CPU. If that wake is not in flight, or is consumed without
+   waking, the task is left parked with *no* deadline: the next `apply_timer`
+   finds `min_valid` empty, computes `TimerPlan::Stop`, and the CPU halts with a
+   parked thread and no way back.
+2. `driver::execute`'s `awake` early-return drops the `SleepToken` and returns
+   without re-arming, relying on the next `pass()` to do it. Worth proving every
+   route to a halt arms first.
+
+**Do not unify this with the T14 (#142/#156).** There, three CPUs failed to
+answer a 250 ms *kick* while five did; here 8/8 answer. Different observations,
+possibly different defects, and the T14 cannot be attached to — which is what
+the NMI probe in `arch/idt/nmi.rs` is for and why it stays even though the
+debugger settled this case without it.

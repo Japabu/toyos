@@ -17,6 +17,26 @@
 //! Nothing here allocates, nothing waits on a lock it could find held, and
 //! every list is bounded. See `specs/known-issues.md` §5 for what it was built
 //! to settle.
+//!
+//! **This report cannot describe the state it is summoned to describe, and the
+//! deadline columns are where that bites.** Asking is a keystroke, a keystroke
+//! is an interrupt, and an interrupt is exactly what a halted CPU was waiting
+//! for — so by the time any CPU prints a line it has already taken a pass,
+//! re-armed its timer and fired whatever was due. A machine frozen on an
+//! unfired deadline therefore reports `0 OVERDUE`: not because its deadlines
+//! were healthy, but because summoning the report repaired them. Everything
+//! under `== deadlines:` postdates the repair.
+//!
+//! What survives is identity and place — which threads exist, which CPU holds
+//! each, which never ran, which CPUs did not answer — because waking a CPU does
+//! not move a task between containers. To learn what the *frozen* machine
+//! looked like, capture it before touching it: `info registers -a` over QMP
+//! gives every vCPU's `RIP` and `HLT` with nothing woken (`CLAUDE.md`,
+//! Debugging). That capture settled #156 and this report's deadline columns
+//! would have said the opposite.
+//!
+//! It is also what the NMI probe below buys and a kick does not: an answer that
+//! does not require the CPU to schedule in order to give it.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
