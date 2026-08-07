@@ -213,10 +213,16 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
 
     if truncate && create {
         let mtime = crate::clock::nanos_since_boot();
-        vfs.delete(path);
+        // A name that was not there is the ordinary case and not a failure of
+        // this open. Anything else is, and truncating past it would be creating
+        // a file over one the mount could not tell us about.
+        match vfs.delete(path) {
+            Ok(()) | Err(SyscallError::NotFound) => {}
+            Err(e) => return e.to_u64(),
+        }
         let file_id = match vfs.create_file(path, mtime) {
             Ok(id) => id,
-            Err(_) => return SyscallError::Unknown.to_u64(),
+            Err(e) => return e.to_u64(),
         };
         let file = OpenFile {
             path: String::from(path),
@@ -232,47 +238,52 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
         };
     }
 
-    match vfs.open_file(path) {
-        Some(file_id) => {
-            let mtime = vfs.file_mtime(path);
-            let size = file_cache::size(file_id);
-            let position = if append { size as usize } else { 0 };
+    // **`CREATE` acts on `NotFound` and on nothing else.** This used to be the
+    // `None` arm of an `Option`, so a mount that would not answer took the same
+    // branch as a name that was not there: a device refusing one transfer had a
+    // fresh empty file created over a file that exists, and the next write and
+    // flush made that permanent.
+    let file_id = match vfs.open_file(path) {
+        Ok(file_id) => file_id,
+        Err(SyscallError::NotFound) if create => {
+            let mtime = crate::clock::nanos_since_boot();
+            let file_id = match vfs.create_file(path, mtime) {
+                Ok(id) => id,
+                Err(e) => return e.to_u64(),
+            };
             let file = OpenFile {
                 path: String::from(path),
                 file_id,
-                position,
+                position: 0,
                 writable,
                 modified: false,
                 mtime,
             };
-            match table.insert(Descriptor::File(file)) {
+            return match table.insert(Descriptor::File(file)) {
                 Ok(fd) => fd as u64,
                 Err(e) => e.to_u64(),
-            }
+            };
         }
-        None => {
-            if create {
-                let mtime = crate::clock::nanos_since_boot();
-                let file_id = match vfs.create_file(path, mtime) {
-                    Ok(id) => id,
-                    Err(_) => return SyscallError::Unknown.to_u64(),
-                };
-                let file = OpenFile {
-                    path: String::from(path),
-                    file_id,
-                    position: 0,
-                    writable,
-                    modified: false,
-                    mtime,
-                };
-                match table.insert(Descriptor::File(file)) {
-                    Ok(fd) => fd as u64,
-                    Err(e) => e.to_u64(),
-                }
-            } else {
-                SyscallError::NotFound.to_u64()
-            }
-        }
+        Err(e) => return e.to_u64(),
+    };
+
+    let mtime = match vfs.file_mtime(path) {
+        Ok(mtime) => mtime,
+        Err(e) => return e.to_u64(),
+    };
+    let size = file_cache::size(file_id);
+    let position = if append { size as usize } else { 0 };
+    let file = OpenFile {
+        path: String::from(path),
+        file_id,
+        position,
+        writable,
+        modified: false,
+        mtime,
+    };
+    match table.insert(Descriptor::File(file)) {
+        Ok(fd) => fd as u64,
+        Err(e) => e.to_u64(),
     }
 }
 
@@ -297,6 +308,12 @@ pub fn close(
     let Some(desc) = table.remove(fd) else {
         return SyscallError::NotFound.to_u64();
     };
+    // A flush that failed still closes the fd — the descriptor is gone above
+    // and everything below runs — and is still *reported*, which is what POSIX
+    // means by `close` returning `EIO`. It used to be `let _ =`: the last write
+    // of a file never reached the device and the process that made it was told
+    // the close worked.
+    let mut result = 0;
     for id in [desc.pipe_id_read(), desc.pipe_id_write()].into_iter().flatten() {
         let still_held = table
             .iter()
@@ -314,7 +331,10 @@ pub fn close(
     match &desc {
         Descriptor::File(file) => {
             if file.modified {
-                let _ = vfs.flush_file(&file.path, file.file_id, file.mtime);
+                if let Err(e) = vfs.flush_file(&file.path, file.file_id, file.mtime) {
+                    crate::log!("close({}): the flush failed: {e}", file.path);
+                    result = e.to_u64();
+                }
             }
             let last_ref = file_cache::release(file.file_id);
             if last_ref {
@@ -332,7 +352,7 @@ pub fn close(
         }
         _ => {}
     }
-    0
+    result
 }
 
 pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
@@ -376,22 +396,36 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
                 return Some(0);
             }
             let mut read = 0;
+            let mut refused = false;
             while read < count {
                 let abs_pos = file.position + read;
                 let page_idx = (abs_pos / 4096) as u32;
                 let offset_in_page = abs_pos % 4096;
                 let remaining_in_page = 4096 - offset_in_page;
                 let to_read = remaining_in_page.min(count - read);
-                file_cache::read_page(
+                // A page the device would not give back is not a page of
+                // zeros. This stops short of it rather than handing the caller
+                // a hole under a success; short counts are what `read` means,
+                // and before this the return was the full count with the
+                // zeroed pages in the buffer.
+                if file_cache::read_page(
                     file.file_id,
                     page_idx,
                     offset_in_page,
                     &mut buf[read..read + to_read],
-                );
+                )
+                .is_err()
+                {
+                    refused = true;
+                    break;
+                }
                 read += to_read;
             }
-            file.position += count;
-            Some(count as u64)
+            if read == 0 && refused {
+                return Some(SyscallError::Io.to_u64());
+            }
+            file.position += read;
+            Some(read as u64)
         }
         Descriptor::PipeRead(r) | Descriptor::TtyRead(r) => {
             pipe::try_read(r.id(), buf).map(|n| n as u64)
@@ -524,12 +558,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
                 written += to_write;
             }
             if written == 0 && refused {
-                // The honest code does not exist: none of `SyscallError`'s nine
-                // variants means "the device did not do it", and adding one is
-                // an ABI change that needs discussing. `Unknown` is the only
-                // one that does not claim something false. Known issues carries
-                // the conversion; this is its first call site.
-                return Some(SyscallError::Unknown.to_u64());
+                return Some(SyscallError::Io.to_u64());
             }
             file.position += written;
             file.modified = true;
@@ -623,8 +652,8 @@ pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u32) -> u64 {
         return SyscallError::NotFound.to_u64();
     };
     if file.modified {
-        if let Err(_) = vfs.flush_file(&file.path, file.file_id, file.mtime) {
-            return SyscallError::Unknown.to_u64();
+        if let Err(e) = vfs.flush_file(&file.path, file.file_id, file.mtime) {
+            return e.to_u64();
         }
         file.modified = false;
     }

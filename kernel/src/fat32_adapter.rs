@@ -482,20 +482,64 @@ fn now() -> FatTime {
     crate::clock::local_secs().map_or(FatTime::EPOCH, FatTime::from_unix_secs)
 }
 
+/// What one of `toyos-fat32`'s errors means to the [`FileSystem`] trait's
+/// caller.
+///
+/// Exhaustive because [`Error`] is documented as being exhaustive for exactly
+/// this: an adapter mapping it should stop compiling when a variant appears
+/// rather than sweeping it into a catch-all.
+///
+/// Every structural variant answers [`SyscallError::Io`] and not `NotFound`. A
+/// cyclic cluster chain is a volume that cannot say what is in the file, which
+/// to a caller is the same thing as a device that refused the transfer and the
+/// opposite of a name that is not there — and the FAT32 the machine boots from
+/// is the one filesystem where "the file is gone" and "the stick is unhappy"
+/// have very different answers.
+fn as_syscall_error(e: Error) -> SyscallError {
+    match e {
+        Error::NotFound => SyscallError::NotFound,
+        Error::AlreadyExists => SyscallError::AlreadyExists,
+        Error::Io
+        | Error::NotFat32
+        | Error::Truncated
+        | Error::CorruptChain
+        | Error::CorruptDirectory => SyscallError::Io,
+        // The last component of the path is not the thing the operation is
+        // defined for. Not `NotFound`: the name does resolve.
+        Error::NotADirectory | Error::IsADirectory | Error::DirectoryNotEmpty => {
+            SyscallError::InvalidArgument
+        }
+        Error::InvalidName => SyscallError::InvalidArgument,
+        // `TooLarge` is FAT32's 4 GiB size field rather than a full volume, but
+        // both are the volume having no room for what was asked.
+        Error::NoSpace | Error::TooLarge => SyscallError::ResourceExhausted,
+        Error::LimitExceeded => SyscallError::ResourceExhausted,
+    }
+}
+
+/// Log what the volume said, and hand the caller the code for it.
+///
+/// The variant is in the line and not in the return: `SyscallError` has no room
+/// for one, and a triage that wants to know whether the chain was cyclic or the
+/// stick unplugged reads the log.
+fn refused(role: Role, op: &str, name: &str, e: Error) -> SyscallError {
+    log!("{role}-volume: {op} of {name}: {e}");
+    as_syscall_error(e)
+}
+
 impl FatFs {
     fn new(role: Role, fs: Fat32<FatVolume>) -> Self {
         Self { role, fs, open: HashMap::new(), by_name: HashMap::new() }
     }
 
-    fn backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
-        let size = self.fs.metadata(name).ok()?.len;
-        match self.fs.extents(name, MAX_EXTENTS) {
-            Ok(extents) => Some(Arc::new(FatBacking { role: self.role, extents, size })),
-            Err(e) => {
-                log!("{}-volume: {name} has no readable extent list: {e}", self.role);
-                None
-            }
-        }
+    fn backing(&mut self, name: &str) -> Result<Arc<dyn FileBacking>, SyscallError> {
+        let role = self.role;
+        let size = self.fs.metadata(name).map_err(|e| refused(role, "metadata", name, e))?.len;
+        let extents = self
+            .fs
+            .extents(name, MAX_EXTENTS)
+            .map_err(|e| refused(role, "extents", name, e))?;
+        Ok(Arc::new(FatBacking { role, extents, size }))
     }
 
     /// Make sure every directory on the way to `name` exists.
@@ -504,9 +548,10 @@ impl FatFs {
     /// its own set and tells no filesystem — so a `create` of `a/b/c.txt` is
     /// the only notice this mount ever gets that `a/b` was wanted. Every other
     /// mount is a flat namespace where the question does not arise.
-    fn ensure_parent(&mut self, name: &str, time: FatTime) -> Result<(), Error> {
+    fn ensure_parent(&mut self, name: &str, time: FatTime) -> Result<(), SyscallError> {
         let Some((parent, _)) = name.rsplit_once('/') else { return Ok(()) };
-        self.fs.create_dir_all(parent, time)
+        let role = self.role;
+        self.fs.create_dir_all(parent, time).map_err(|e| refused(role, "mkdir -p", parent, e))
     }
 }
 
@@ -519,38 +564,32 @@ impl FileSystem for FatFs {
     /// trait that can meet its stated contract; the two bcachefs adapters
     /// still cannot.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError> {
-        match self.fs.walk(limit) {
-            Ok(names) => Ok(names),
-            Err(Error::LimitExceeded) => Err(SyscallError::ResourceExhausted),
-            Err(e) => {
-                log!("{}-volume: cannot list it: {e}", self.role);
-                Err(SyscallError::NotFound)
-            }
-        }
+        let role = self.role;
+        self.fs.walk(limit).map_err(|e| refused(role, "list", "/", e))
     }
 
-    fn file_size(&mut self, name: &str) -> Option<u64> {
-        let meta = self.fs.metadata(name).ok()?;
-        (!meta.is_dir).then_some(meta.len)
+    fn file_mtime(&mut self, name: &str) -> Result<u64, SyscallError> {
+        let role = self.role;
+        self.fs
+            .metadata(name)
+            .map(|m| m.modified_unix)
+            .map_err(|e| refused(role, "metadata", name, e))
     }
 
-    fn file_mtime(&mut self, name: &str) -> u64 {
-        self.fs.metadata(name).map_or(0, |m| m.modified_unix)
-    }
-
-    /// Always `None`. FAT32 has no representation for a symbolic link, and
+    /// Always `Ok(None)`. FAT32 has no representation for a symbolic link, and
     /// answering anything else would hand the caller a regular file it
-    /// believes is a link.
-    fn read_link(&mut self, _name: &str) -> Option<String> {
-        None
+    /// believes is a link. Infallible because nothing is asked of the volume.
+    fn read_link(&mut self, _name: &str) -> Result<Option<String>, SyscallError> {
+        Ok(None)
     }
 
-    fn open_file(&mut self, name: &str) -> Option<(FileId, Option<Arc<dyn FileBacking>>)> {
+    fn open_file(&mut self, name: &str) -> Result<(FileId, Option<Arc<dyn FileBacking>>), SyscallError> {
         if let Some(&file_id) = self.by_name.get(name) {
             file_cache::open(file_id);
-            return Some((file_id, self.backing(name)));
+            return Ok((file_id, Some(self.backing(name)?)));
         }
-        let file = self.fs.open(name).ok()?;
+        let role = self.role;
+        let file = self.fs.open(name).map_err(|e| refused(role, "open", name, e))?;
         let size = file.len();
         let backing = self.backing(name)?;
 
@@ -558,15 +597,16 @@ impl FileSystem for FatFs {
         file_cache::set_size(file_id, size);
         self.by_name.insert(String::from(name), file_id);
         self.open.insert(file_id, OpenFile { name: String::from(name), file });
-        Some((file_id, Some(backing)))
+        Ok((file_id, Some(backing)))
     }
 
-    fn create(&mut self, name: &str, _mtime: u64) -> Result<FileId, &'static str> {
+    fn create(&mut self, name: &str, _mtime: u64) -> Result<FileId, SyscallError> {
         if let Some(&file_id) = self.by_name.get(name) {
             return Ok(file_id);
         }
+        let role = self.role;
         let time = now();
-        self.ensure_parent(name, time).map_err(|e| e.as_str())?;
+        self.ensure_parent(name, time)?;
         let file = match self.fs.create(name, time) {
             Ok(file) => file,
             // `vfs::create_file` is also how an existing file is reopened for
@@ -574,8 +614,10 @@ impl FileSystem for FatFs {
             // the crate, deliberately, because a create that silently opened
             // somebody else's file is how a caller comes to believe it owns
             // bytes it does not.
-            Err(Error::AlreadyExists) => self.fs.open(name).map_err(|e| e.as_str())?,
-            Err(e) => return Err(e.as_str()),
+            Err(Error::AlreadyExists) => {
+                self.fs.open(name).map_err(|e| refused(role, "open", name, e))?
+            }
+            Err(e) => return Err(refused(role, "create", name, e)),
         };
         let file_id = file_cache::create_file(true);
         file_cache::set_size(file_id, file.len());
@@ -600,39 +642,21 @@ impl FileSystem for FatFs {
     /// `toyos_fat32::File` now names clusters the allocator is free to hand to
     /// the next file — and a later `write_page` through it would put one
     /// process's bytes inside another's. Dropping it turns that into
-    /// `"file not open"` from `write_page`, which `fd::close` discards, so an
-    /// fd held across an unlink can no longer write the file back. That is the
-    /// right answer: the file it would write back does not exist.
+    /// `NotFound` from `write_page`, which `fd::close` discards, so an fd held
+    /// across an unlink can no longer write the file back. That is the right
+    /// answer: the file it would write back does not exist.
     ///
     /// The read side is not closed here — the `FatBacking` an open fd already
     /// holds still names those byte ranges, which is the same live
     /// cross-process leak known issues records for `/home`. This closes the
     /// destructive half only.
-    fn delete(&mut self, name: &str) -> bool {
+    fn delete(&mut self, name: &str) -> Result<(), SyscallError> {
         if let Some(file_id) = self.by_name.remove(name) {
             file_cache::mark_deleted(file_id);
             self.open.remove(&file_id);
         }
-        match self.fs.remove(name) {
-            Ok(()) => true,
-            Err(Error::NotFound) => false,
-            Err(e) => {
-                log!("{}-volume: cannot delete {name}: {e}", self.role);
-                false
-            }
-        }
-    }
-
-    fn delete_prefix(&mut self, prefix: &str) {
-        let Ok(names) = self.fs.walk(crate::vfs::MAX_LIST_ENTRIES) else {
-            log!("{}-volume: cannot enumerate {prefix} to delete it", self.role);
-            return;
-        };
-        let doomed: Vec<String> =
-            names.into_iter().map(|(n, _)| n).filter(|n| n.starts_with(prefix)).collect();
-        for name in doomed {
-            self.delete(&name);
-        }
+        let role = self.role;
+        self.fs.remove(name).map_err(|e| refused(role, "delete", name, e))
     }
 
     /// Rename, deleting the destination first when one exists.
@@ -642,11 +666,12 @@ impl FileSystem for FatFs {
     /// resolves. The VFS's callers want POSIX overwrite, so the window is
     /// opened here, where it is visible: between the delete and the rename
     /// below, neither name names the old file's data.
-    fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
-        if self.fs.exists(new).map_err(|e| e.as_str())? {
-            self.delete(new);
+    fn rename(&mut self, old: &str, new: &str) -> Result<(), SyscallError> {
+        let role = self.role;
+        if self.fs.exists(new).map_err(|e| refused(role, "exists", new, e))? {
+            self.delete(new)?;
         }
-        self.fs.rename(old, new).map_err(|e| e.as_str())?;
+        self.fs.rename(old, new).map_err(|e| refused(role, "rename", old, e))?;
         if let Some(file_id) = self.by_name.remove(old) {
             self.by_name.insert(String::from(new), file_id);
             if let Some(info) = self.open.get_mut(&file_id) {
@@ -661,10 +686,14 @@ impl FileSystem for FatFs {
         file_id: FileId,
         page_idx: u32,
         data: &[u8; 4096],
-    ) -> Result<(), &'static str> {
-        let Self { fs, open, .. } = self;
-        let info = open.get_mut(&file_id).ok_or("file not open")?;
-        fs.write(&mut info.file, page_idx as u64 * 4096, data).map_err(|e| e.as_str())
+    ) -> Result<(), SyscallError> {
+        let Self { role, fs, open, .. } = self;
+        let role = *role;
+        let info = open.get_mut(&file_id).ok_or(SyscallError::NotFound)?;
+        match fs.write(&mut info.file, page_idx as u64 * 4096, data) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(refused(role, "write", &info.name, e)),
+        }
     }
 
     /// Record the file's real length and stamp it, then re-derive its backing.
@@ -681,27 +710,35 @@ impl FileSystem for FatFs {
         file_id: FileId,
         size: u64,
         _mtime: u64,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), SyscallError> {
+        let role = self.role;
         let time = now();
         let name = {
             let Self { fs, open, .. } = self;
-            let info = open.get_mut(&file_id).ok_or("file not open")?;
+            let info = open.get_mut(&file_id).ok_or(SyscallError::NotFound)?;
             if info.file.len() != size {
-                fs.set_len(&mut info.file, size).map_err(|e| e.as_str())?;
+                fs.set_len(&mut info.file, size)
+                    .map_err(|e| refused(role, "set_len", &info.name, e))?;
             }
-            fs.flush_meta(&mut info.file, time).map_err(|e| e.as_str())?;
+            fs.flush_meta(&mut info.file, time)
+                .map_err(|e| refused(role, "flush_meta", &info.name, e))?;
             info.name.clone()
         };
-        if let Some(backing) = self.backing(&name) {
-            file_cache::set_backing(file_id, backing);
+        // The bytes and the entry are both on the volume by here, so a volume
+        // that will not re-derive the extent list has not lost the write. What
+        // it costs is this file's evictability, which is reported and not
+        // returned — the caller has nothing to do about it.
+        match self.backing(&name) {
+            Ok(backing) => file_cache::set_backing(file_id, backing),
+            Err(_) => log!("{role}-volume: {name} was written but has no re-readable extent list"),
         }
         Ok(())
     }
 
     /// Always an error. See [`FileSystem::read_link`] above and the crate's
     /// own documentation: there is deliberately nothing here to call.
-    fn create_symlink(&mut self, _name: &str, _target: &str) -> Result<(), &'static str> {
-        Err("FAT32 has no symlinks")
+    fn create_symlink(&mut self, _name: &str, _target: &str) -> Result<(), SyscallError> {
+        Err(SyscallError::NotSupported)
     }
 
     /// The error is returned rather than logged, and that is the whole point of
@@ -710,16 +747,12 @@ impl FileSystem for FatFs {
     /// which is the next sync. Swallowing it made a device that declines to
     /// flush into a permanent write loop from the idle loop.
     ///
-    /// A `&'static str` and so not role-tagged: the caller names the file it was
-    /// syncing, which says which volume it was on.
-    fn sync(&mut self) -> Result<(), &'static str> {
-        self.fs.sync().map_err(|e| match e {
-            Error::Io => "the volume's device refused the sync",
-            _ => "the volume would not sync",
-        })
+    /// [`refused`] is not used, for that same reason — it logs.
+    fn sync(&mut self) -> Result<(), SyscallError> {
+        self.fs.sync().map_err(as_syscall_error)
     }
 
-    fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
+    fn open_backing(&mut self, name: &str) -> Result<Arc<dyn FileBacking>, SyscallError> {
         self.backing(name)
     }
 }

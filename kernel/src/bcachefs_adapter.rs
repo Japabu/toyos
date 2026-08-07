@@ -50,22 +50,48 @@ impl BlockIO for PageCacheBlockIO {
     }
 }
 
-/// Log an `FsError` the [`FileSystem`] trait has no channel for, and answer
-/// with the trait's "nothing here".
+/// What an `FsError` means to the [`FileSystem`] trait's caller.
 ///
-/// `file_size` and `read_link` return `Option`, `file_mtime` a bare `u64`,
-/// `delete` a `bool`: every one of them reads a device failure as "no such
-/// file". That is the same sentinel `bcachefs::BlockIO` used to be, moved one
-/// layer up rather than removed — the trait is shared with `tmpfs` and
-/// `fat32_adapter` and growing it a channel is its own change. Filed.
-fn no_channel<T>(op: &str, name: &str, result: Result<T, FsError>) -> Option<T> {
-    match result {
-        Ok(value) => Some(value),
-        Err(err) => {
-            log!("bcachefs: {} of '{}' failed: {:?}", op, name, err);
-            None
-        }
+/// Exhaustive, so a variant added to `bcachefs` stops this compiling rather
+/// than joining a catch-all. Every corruption variant is [`SyscallError::Io`]
+/// and not `NotFound`: a btree node that does not decode is a volume that
+/// cannot answer the question, which is the same thing to a caller as a device
+/// that refused the transfer, and the opposite of a name that is not there.
+fn as_syscall_error(err: &FsError) -> SyscallError {
+    match err {
+        FsError::NotFound => SyscallError::NotFound,
+        FsError::NoSpace { .. } | FsError::EntryTooLarge { .. } => SyscallError::ResourceExhausted,
+        FsError::NameTooLong { .. } => SyscallError::InvalidArgument,
+        FsError::DeviceRead(_) | FsError::DeviceWrite(_) | FsError::DeviceSync => SyscallError::Io,
+        FsError::BadMagic { .. }
+        | FsError::UnsupportedVersion(_)
+        | FsError::ChecksumMismatch { .. }
+        | FsError::CorruptedKey(_)
+        | FsError::CorruptedNode(_)
+        | FsError::BlockOffDevice { .. }
+        | FsError::TreeTooDeep(_)
+        | FsError::BadSuperblock { .. }
+        | FsError::NodeOverfull { .. } => SyscallError::Io,
     }
+}
+
+/// Log what went wrong and hand the caller the code for it.
+///
+/// The `FsError` carries a block number and a field name; `SyscallError` has
+/// room for neither, and a triage reads the log. This used to answer `None`
+/// instead, which put the sentinel `bcachefs::BlockIO` had just shed one layer
+/// further up: a device that would not read looked to every caller exactly like
+/// a file that was not there.
+fn mapped<T>(op: &str, name: &str, result: Result<T, FsError>) -> Result<T, SyscallError> {
+    result.map_err(|err| {
+        log!("bcachefs: {} of '{}' failed: {:?}", op, name, err);
+        as_syscall_error(&err)
+    })
+}
+
+/// The same, for a `bcachefs` call whose `Ok(None)` means the name is absent.
+fn present<T>(op: &str, name: &str, result: Result<Option<T>, FsError>) -> Result<T, SyscallError> {
+    mapped(op, name, result)?.ok_or(SyscallError::NotFound)
 }
 
 /// Per-open-file cached resolution state.
@@ -135,44 +161,35 @@ impl FileSystem for BcacheFsAdapter {
     /// refusal uniform without making the allocation bounded — that half is
     /// the `bcachefs` crate's, and is filed.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError> {
-        // `Unknown` because no `SyscallError` variant says "the device did not
-        // answer" — the same gap `fd::try_write` hits, filed as one issue. An
-        // empty listing, which is what this used to return, is a lie a caller
-        // cannot tell from an empty directory.
-        let names = self.fs.list().map_err(|err| {
-            log!("bcachefs: list failed: {:?}", err);
-            SyscallError::Unknown
-        })?;
+        // An empty listing, which is what this used to return, is a lie a
+        // caller cannot tell from an empty directory.
+        let names = mapped("list", "/", self.fs.list())?;
         if names.len() > limit {
             return Err(SyscallError::ResourceExhausted);
         }
         Ok(names)
     }
 
-    fn file_size(&mut self, name: &str) -> Option<u64> {
-        no_channel("file_size", name, self.fs.file_size_meta(name)).flatten()
+    fn file_mtime(&mut self, name: &str) -> Result<u64, SyscallError> {
+        present("file_mtime", name, self.fs.file_mtime(name))
     }
 
-    fn file_mtime(&mut self, name: &str) -> u64 {
-        no_channel("file_mtime", name, self.fs.file_mtime(name)).flatten().unwrap_or(0)
+    fn read_link(&mut self, name: &str) -> Result<Option<String>, SyscallError> {
+        mapped("read_link", name, self.fs.read_link(name))
     }
 
-    fn read_link(&mut self, name: &str) -> Option<String> {
-        no_channel("read_link", name, self.fs.read_link(name)).flatten()
-    }
-
-    fn open_file(&mut self, name: &str) -> Option<(FileId, Option<Arc<dyn FileBacking>>)> {
+    fn open_file(&mut self, name: &str) -> Result<(FileId, Option<Arc<dyn FileBacking>>), SyscallError> {
         if let Some(&file_id) = self.name_to_id.get(name) {
             file_cache::open(file_id);
-            let info = self.open_files.get(&file_id)?;
+            let info = self.open_files.get(&file_id).ok_or(SyscallError::NotFound)?;
             let backing = Arc::new(NvmeBacking::new(
                 Arc::clone(&info.blocks),
                 file_cache::size(file_id),
             ));
-            return Some((file_id, Some(backing)));
+            return Ok((file_id, Some(backing)));
         }
 
-        let (extents, size) = no_channel("open", name, self.fs.file_extents(name)).flatten()?;
+        let (extents, size) = present("open", name, self.fs.file_extents(name))?;
         let blocks = self.blocks_for(name, extents);
         let file_id = file_cache::create_file(true); // evictable
         file_cache::set_size(file_id, size);
@@ -183,10 +200,10 @@ impl FileSystem for BcacheFsAdapter {
             blocks: Arc::clone(&blocks),
         });
 
-        Some((file_id, Some(Arc::new(NvmeBacking::new(blocks, size)))))
+        Ok((file_id, Some(Arc::new(NvmeBacking::new(blocks, size)))))
     }
 
-    fn create(&mut self, name: &str, mtime: u64) -> Result<FileId, &'static str> {
+    fn create(&mut self, name: &str, mtime: u64) -> Result<FileId, SyscallError> {
         if let Some(&file_id) = self.name_to_id.get(name) {
             return Ok(file_id);
         }
@@ -194,10 +211,7 @@ impl FileSystem for BcacheFsAdapter {
         // `Mounted::create` frees whatever answered to this name — the blocks
         // of a program that is running out of it, if that is what it was.
         self.revoke(name);
-        self.fs.create(name, &[], mtime).map_err(|err| {
-            log!("bcachefs: create of '{}' failed: {:?}", name, err);
-            "create failed"
-        })?;
+        mapped("create", name, self.fs.create(name, &[], mtime))?;
 
         let file_id = file_cache::create_file(true);
         self.name_to_id.insert(String::from(name), file_id);
@@ -217,7 +231,7 @@ impl FileSystem for BcacheFsAdapter {
         }
     }
 
-    fn delete(&mut self, name: &str) -> bool {
+    fn delete(&mut self, name: &str) -> Result<(), SyscallError> {
         if let Some(&file_id) = self.name_to_id.get(name) {
             file_cache::mark_deleted(file_id);
             if file_cache::ref_count(file_id) == 0 {
@@ -226,36 +240,14 @@ impl FileSystem for BcacheFsAdapter {
             self.name_to_id.remove(name);
         }
         self.revoke(name);
-        no_channel("delete", name, self.fs.delete(name)).unwrap_or(false)
+        if mapped("delete", name, self.fs.delete(name))? {
+            Ok(())
+        } else {
+            Err(SyscallError::NotFound)
+        }
     }
 
-    fn delete_prefix(&mut self, prefix: &str) {
-        let to_delete: Vec<String> = self.name_to_id.keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        for name in &to_delete {
-            if let Some(&file_id) = self.name_to_id.get(name.as_str()) {
-                file_cache::mark_deleted(file_id);
-                if file_cache::ref_count(file_id) == 0 {
-                    self.open_files.remove(&file_id);
-                }
-            }
-            self.name_to_id.remove(name.as_str());
-        }
-        // Not the same set: a backing handed out by `open_backing` never
-        // opened a file, so it is in `blocks` and not in `name_to_id`.
-        let backed: Vec<String> = self.blocks.keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        for name in &backed {
-            self.revoke(name);
-        }
-        no_channel("delete_prefix", prefix, self.fs.delete_prefix(prefix));
-    }
-
-    fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
+    fn rename(&mut self, old: &str, new: &str) -> Result<(), SyscallError> {
         if let Some(&target_id) = self.name_to_id.get(new) {
             file_cache::mark_deleted(target_id);
             if file_cache::ref_count(target_id) == 0 {
@@ -267,7 +259,7 @@ impl FileSystem for BcacheFsAdapter {
         // carried over to the new name, so only the destination is revoked.
         self.revoke(new);
 
-        self.fs.rename(old, new).map_err(|_| "rename failed")?;
+        mapped("rename", old, self.fs.rename(old, new))?;
 
         // Update name_to_id: source's FileId now lives under new name
         if let Some(file_id) = self.name_to_id.remove(old) {
@@ -283,44 +275,44 @@ impl FileSystem for BcacheFsAdapter {
         Ok(())
     }
 
-    fn write_page(&mut self, file_id: FileId, page_idx: u32, data: &[u8; 4096]) -> Result<(), &'static str> {
-        let blocks = Arc::clone(&self.open_files.get(&file_id).ok_or("file not open")?.blocks);
+    fn write_page(&mut self, file_id: FileId, page_idx: u32, data: &[u8; 4096]) -> Result<(), SyscallError> {
+        let info = self.open_files.get(&file_id).ok_or(SyscallError::NotFound)?;
+        let name = info.name.clone();
+        let blocks = Arc::clone(&info.blocks);
         let block = blocks
             .with(|extents| self.fs.resolve_or_alloc_block(extents, page_idx))
-            .ok_or("the file was deleted")?
-            .map_err(|_| "block allocation failed")?;
-        page_cache::raw_block_write(block, data).map_err(|_| "block write failed")?;
-        Ok(())
-    }
-
-    fn update_metadata(&mut self, file_id: FileId, size: u64, mtime: u64) -> Result<(), &'static str> {
-        let info = self.open_files.get(&file_id).ok_or("file not open")?;
-        let name = info.name.clone();
-        let extents = Arc::clone(&info.blocks)
-            .with(|extents| extents.clone())
-            .ok_or("the file was deleted")?;
-        self.fs.update_metadata(&name, &extents, size, mtime)
-            .map_err(|_| "metadata update failed")
-    }
-
-    fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str> {
-        // As `create`: the symlink displaces whatever answered to this name
-        // and the displaced entry's blocks go back to the allocator.
-        self.revoke(name);
-        self.fs.create_symlink(name, target).map_err(|_| "symlink failed")
-    }
-
-    fn sync(&mut self) -> Result<(), &'static str> {
-        self.fs.sync().map_err(|err| {
-            log!("bcachefs: sync failed: {:?}", err);
-            "sync did not reach the device"
+            .ok_or(SyscallError::NotFound)?;
+        let block = mapped("block allocation", &name, block)?;
+        page_cache::raw_block_write(block, data).map_err(|_| {
+            log!("bcachefs: write of block {block} for '{name}' failed");
+            SyscallError::Io
         })
     }
 
-    fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
-        let (extents, size) = no_channel("open_backing", name, self.fs.file_extents(name)).flatten()?;
+    fn update_metadata(&mut self, file_id: FileId, size: u64, mtime: u64) -> Result<(), SyscallError> {
+        let info = self.open_files.get(&file_id).ok_or(SyscallError::NotFound)?;
+        let name = info.name.clone();
+        let extents = Arc::clone(&info.blocks)
+            .with(|extents| extents.clone())
+            .ok_or(SyscallError::NotFound)?;
+        mapped("update_metadata", &name, self.fs.update_metadata(&name, &extents, size, mtime))
+    }
+
+    fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), SyscallError> {
+        // As `create`: the symlink displaces whatever answered to this name
+        // and the displaced entry's blocks go back to the allocator.
+        self.revoke(name);
+        mapped("create_symlink", name, self.fs.create_symlink(name, target))
+    }
+
+    fn sync(&mut self) -> Result<(), SyscallError> {
+        mapped("sync", "/", self.fs.sync())
+    }
+
+    fn open_backing(&mut self, name: &str) -> Result<Arc<dyn FileBacking>, SyscallError> {
+        let (extents, size) = present("open_backing", name, self.fs.file_extents(name))?;
         let blocks = self.blocks_for(name, extents);
-        Some(Arc::new(NvmeBacking::new(blocks, size)))
+        Ok(Arc::new(NvmeBacking::new(blocks, size)))
     }
 }
 
@@ -347,34 +339,27 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
     /// refusal uniform without making the allocation bounded — that half is
     /// the `bcachefs` crate's, and is filed.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError> {
-        let names = self.fs.list().map_err(|err| {
-            log!("initrd: list failed: {:?}", err);
-            SyscallError::Unknown
-        })?;
+        let names = mapped("list", "/", self.fs.list())?;
         if names.len() > limit {
             return Err(SyscallError::ResourceExhausted);
         }
         Ok(names)
     }
 
-    fn file_size(&mut self, name: &str) -> Option<u64> {
-        no_channel("file_size", name, self.fs.file_size_meta(name)).flatten()
+    fn file_mtime(&mut self, name: &str) -> Result<u64, SyscallError> {
+        present("file_mtime", name, self.fs.file_mtime(name))
     }
 
-    fn file_mtime(&mut self, name: &str) -> u64 {
-        no_channel("file_mtime", name, self.fs.file_mtime(name)).flatten().unwrap_or(0)
+    fn read_link(&mut self, name: &str) -> Result<Option<String>, SyscallError> {
+        mapped("read_link", name, self.fs.read_link(name))
     }
 
-    fn read_link(&mut self, name: &str) -> Option<String> {
-        no_channel("read_link", name, self.fs.read_link(name)).flatten()
-    }
-
-    fn open_file(&mut self, name: &str) -> Option<(FileId, Option<Arc<dyn FileBacking>>)> {
-        let (extents, size) = no_channel("open", name, self.fs.file_extents(name)).flatten()?;
+    fn open_file(&mut self, name: &str) -> Result<(FileId, Option<Arc<dyn FileBacking>>), SyscallError> {
+        let (extents, size) = present("open", name, self.fs.file_extents(name))?;
         if let Some(&file_id) = self.name_to_id.get(name) {
             file_cache::open(file_id);
             let backing = Arc::new(InitrdBacking::new(self.initrd_base, extents, size));
-            return Some((file_id, Some(backing)));
+            return Ok((file_id, Some(backing)));
         }
 
         let file_id = file_cache::create_file(true);
@@ -383,11 +368,11 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
         self.name_to_id.insert(String::from(name), file_id);
 
         let backing = Arc::new(InitrdBacking::new(self.initrd_base, extents, size));
-        Some((file_id, Some(backing)))
+        Ok((file_id, Some(backing)))
     }
 
-    fn create(&mut self, _name: &str, _mtime: u64) -> Result<FileId, &'static str> {
-        Err("read-only filesystem")
+    fn create(&mut self, _name: &str, _mtime: u64) -> Result<FileId, SyscallError> {
+        Err(SyscallError::PermissionDenied)
     }
 
     fn close_file(&mut self, file_id: FileId) {
@@ -401,33 +386,37 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
         }
     }
 
-    fn delete(&mut self, _name: &str) -> bool { false }
-    fn delete_prefix(&mut self, _prefix: &str) {}
-
-    fn rename(&mut self, _old: &str, _new: &str) -> Result<(), &'static str> {
-        Err("read-only filesystem")
+    /// Every write path answers `PermissionDenied`, which is what the mount
+    /// *is* — the initrd is a read-only image and nothing on it can change.
+    /// Distinct from `Io` on purpose: a caller retrying a refused write is
+    /// right about a device and wrong about this.
+    fn delete(&mut self, _name: &str) -> Result<(), SyscallError> {
+        Err(SyscallError::PermissionDenied)
     }
 
-    fn write_page(&mut self, _file_id: FileId, _page_idx: u32, _data: &[u8; 4096]) -> Result<(), &'static str> {
-        Err("read-only filesystem")
+    fn rename(&mut self, _old: &str, _new: &str) -> Result<(), SyscallError> {
+        Err(SyscallError::PermissionDenied)
     }
 
-    fn update_metadata(&mut self, _file_id: FileId, _size: u64, _mtime: u64) -> Result<(), &'static str> {
-        Err("read-only filesystem")
+    fn write_page(&mut self, _file_id: FileId, _page_idx: u32, _data: &[u8; 4096]) -> Result<(), SyscallError> {
+        Err(SyscallError::PermissionDenied)
     }
 
-    fn create_symlink(&mut self, _name: &str, _target: &str) -> Result<(), &'static str> {
-        Err("read-only filesystem")
+    fn update_metadata(&mut self, _file_id: FileId, _size: u64, _mtime: u64) -> Result<(), SyscallError> {
+        Err(SyscallError::PermissionDenied)
     }
 
-    fn sync(&mut self) -> Result<(), &'static str> {
+    fn create_symlink(&mut self, _name: &str, _target: &str) -> Result<(), SyscallError> {
+        Err(SyscallError::PermissionDenied)
+    }
+
+    fn sync(&mut self) -> Result<(), SyscallError> {
         Ok(())
     }
 
-    fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
-        let (extents, size) =
-            no_channel("open_backing", name, self.fs.file_extents(name)).flatten()?;
-        Some(Arc::new(InitrdBacking::new(self.initrd_base, extents, size)))
+    fn open_backing(&mut self, name: &str) -> Result<Arc<dyn FileBacking>, SyscallError> {
+        let (extents, size) = present("open_backing", name, self.fs.file_extents(name))?;
+        Ok(Arc::new(InitrdBacking::new(self.initrd_base, extents, size)))
     }
 }
 

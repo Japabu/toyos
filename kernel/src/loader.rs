@@ -518,10 +518,10 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     // 1. Open file backing from VFS (follows symlinks)
     let backing: Arc<dyn crate::file_backing::FileBacking> = match vfs::lock().open_backing(path) {
-        Some(b) => b,
-        None => {
-            log!("spawn: {}: not found", path);
-            return Err(SyscallError::NotFound);
+        Ok(b) => b,
+        Err(e) => {
+            log!("spawn: {}: {e}", path);
+            return Err(e);
         }
     };
 
@@ -654,19 +654,27 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                 continue;
             }
 
+            // The fallback answers a library that is not where the binary said
+            // it was, and nothing else: a mount that refused the first lookup
+            // would refuse the second, and trying it again turns one device
+            // failure into two log lines and the wrong verdict.
             let so_backing = {
                 let b = vfs::lock().open_backing(&lib_path);
                 match b {
-                    Some(b) => b,
-                    None => {
+                    Ok(b) => b,
+                    Err(SyscallError::NotFound) => {
                         let fallback = alloc::format!("/lib/{}", lib_name);
                         match vfs::lock().open_backing(&fallback) {
-                            Some(b) => b,
-                            None => {
-                                log!("spawn: {}: failed to load {}: not found", path, lib_name);
-                                return Err(SyscallError::NotFound);
+                            Ok(b) => b,
+                            Err(e) => {
+                                log!("spawn: {}: failed to load {}: {e}", path, lib_name);
+                                return Err(e);
                             }
                         }
+                    }
+                    Err(e) => {
+                        log!("spawn: {}: failed to load {}: {e}", path, lib_name);
+                        return Err(e);
                     }
                 }
             };
