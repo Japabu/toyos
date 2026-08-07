@@ -71,7 +71,7 @@ impl Codegen {
     }
 
     /// Collect variable names whose address is taken (&var) anywhere in the body.
-    pub(crate) fn collect_addr_taken(stmt: &Statement, out: &mut HashSet<String>) {
+    pub(crate) fn collect_addr_taken(stmt: &Statement, out: &mut BTreeSet<String>) {
         match stmt {
             Statement::Compound(items) => {
                 for item in items {
@@ -131,7 +131,7 @@ impl Codegen {
         }
     }
 
-    fn collect_addr_taken_expr(expr: &Expr, out: &mut HashSet<String>) {
+    fn collect_addr_taken_expr(expr: &Expr, out: &mut BTreeSet<String>) {
         match expr {
             Expr::Unary(UnaryOp::AddrOf, e) => {
                 if let Expr::Ident(name) = e.as_ref() {
