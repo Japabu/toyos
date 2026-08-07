@@ -271,16 +271,21 @@ fn apply_write(file: &mut CachedFile, page_idx: u32, offset: usize, data: &[u8])
     }
 }
 
-/// Copy a full page out for flushing. Lock held only for the copy.
-pub fn copy_page_out(file_id: FileId, page_idx: u32, buf: &mut [u8; PAGE_SIZE]) {
+/// Copy a resident page out. `false`, and `buf` untouched, when the page is not
+/// resident.
+///
+/// The answer is a return value and not a zero-filled buffer because the two
+/// callers want opposite things from an absent page: a tmpfs read is looking at
+/// a hole, and a flush is looking at a page a truncate took away between
+/// `clone_dirty` and here. Zeros would be a page of data to both of them, and
+/// the flush would put them on the device.
+#[must_use]
+pub fn copy_page_out(file_id: FileId, page_idx: u32, buf: &mut [u8; PAGE_SIZE]) -> bool {
     let cache = FILE_CACHE.lock();
-    if let Some(file) = cache.files.get(&file_id) {
-        if let Some(page) = file.pages.get(&page_idx) {
-            *buf = *page.data;
-            return;
-        }
-    }
-    buf.fill(0);
+    let Some(file) = cache.files.get(&file_id) else { return false };
+    let Some(page) = file.pages.get(&page_idx) else { return false };
+    *buf = *page.data;
+    true
 }
 
 /// Clone the dirty set (non-destructive). Used by fsync to iterate.
@@ -336,19 +341,31 @@ pub fn set_size(file_id: FileId, new_size: u64) {
     cache.cached_pages -= dropped;
 }
 
-/// Mark a file as deleted (unlink). If no fds hold it, free immediately.
-pub fn mark_deleted(file_id: FileId) {
-    let mut cache = FILE_CACHE.lock();
-    let Some(file) = cache.files.get_mut(&file_id) else { return };
-    file.deleted = true;
-    if file.ref_count == 0 {
-        drop_file(&mut cache, file_id);
-    }
+/// What the cache holds for a file after an operation that may have freed it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Residency {
+    /// Open fds still hold it, so its pages and its id are still live.
+    Held,
+    /// The cache holds nothing for this id, and a filesystem may drop whatever
+    /// it keeps alongside.
+    Gone,
 }
 
-/// Get the ref_count for a file (used by filesystem adapters on close_file).
-pub fn ref_count(file_id: FileId) -> u32 {
-    FILE_CACHE.lock().files.get(&file_id).map_or(0, |f| f.ref_count)
+/// Mark a file as deleted (unlink). If no fds hold it, free immediately.
+///
+/// The verdict is returned rather than left to be re-derived from a refcount,
+/// because a refcount read after the unlock is a different question asked at a
+/// different moment: every caller wants to know what *this* unlink did.
+#[must_use]
+pub fn mark_deleted(file_id: FileId) -> Residency {
+    let mut cache = FILE_CACHE.lock();
+    let Some(file) = cache.files.get_mut(&file_id) else { return Residency::Gone };
+    file.deleted = true;
+    if file.ref_count > 0 {
+        return Residency::Held;
+    }
+    drop_file(&mut cache, file_id);
+    Residency::Gone
 }
 
 impl CachedPage {
