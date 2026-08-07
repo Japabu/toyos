@@ -451,11 +451,11 @@ fn insert_elf_regions(
 /// The image occupies `[USER_VM_BASE, USER_VM_BASE + vaddr_max - vaddr_min)`
 /// because `vaddr_min` is the smallest `p_vaddr` and `vaddr_max` the largest
 /// `p_vaddr + p_memsz`, so one range check covers every segment. The bound is
-/// `check_user_range`'s, i.e. the hardware's user/kernel split, not a policy
-/// number.
+/// `user_span::in_user_half`'s, i.e. the hardware's user/kernel
+/// split, not a policy number.
 fn image_fits_user_half(layout: &elf::ElfLayout) -> bool {
     let span = layout.vaddr_max - layout.vaddr_min;
-    crate::user_ptr::check_user_range(UserAddr::new(USER_VM_BASE), span)
+    crate::mm::user_span::in_user_half(USER_VM_BASE, span)
 }
 
 /// Build TLS module layout from loaded shared libraries and the exe's TLS segment.

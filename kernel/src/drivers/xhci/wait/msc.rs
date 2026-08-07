@@ -10,12 +10,13 @@
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
-use super::device::Endpoint;
-use super::{Disk, Restart, Trb, TrbRing, XhciController, StorageGeometry, PAGE};
-use super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, TRB_CONFIGURE_EP, OFF_INPUT_CTX};
-use super::USB_TIMEOUT_NS;
-use super::{MSC_IN_RING, MSC_OUT_RING, MSC_CBW, MSC_CSW, MSC_SCRATCH, MSC_SCRATCH_LEN};
-use super::{MSC_DATA, MSC_DATA_LEN, MSC_MAX_BLOCKS};
+use super::super::device::Endpoint;
+use super::Restart;
+use super::super::{with_disk, Disk, StorageGeometry, Trb, TrbRing, XhciController, PAGE};
+use super::super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, OFF_INPUT_CTX};
+use super::super::USB_TIMEOUT_NS;
+use super::super::{MSC_IN_RING, MSC_OUT_RING, MSC_CBW, MSC_CSW, MSC_SCRATCH, MSC_SCRATCH_LEN};
+use super::super::{MSC_DATA, MSC_DATA_LEN, MSC_MAX_BLOCKS};
 
 /// The block size the layer above this one is written in. A device that
 /// addresses in anything this does not divide by is unimplemented, not
@@ -46,6 +47,7 @@ const CSW_LEN: u32 = 13;
 /// nothing left to check. The private *field* is what buys that; a private
 /// constructor beside public fields would leave `bind`'s own struct literal
 /// able to name any `dci` at all.
+#[derive(Clone, Copy)]
 pub struct MscInterface {
     pub iface_num: u8,
     pub in_ep: Endpoint,
@@ -241,7 +243,7 @@ mod transport_break {
 /// this transfer's. Same reason `usb-transport-break` and `xhci-one-slot`
 /// exist.
 #[cfg(feature = "usb-short-read")]
-pub(super) mod short_read {
+pub(in crate::drivers::xhci) mod short_read {
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use crate::mm::KernelSlice;
@@ -812,30 +814,43 @@ impl XhciController {
     }
 }
 
-/// Configure the two bulk endpoints and bring the disk up. `dev_block` is the
-/// device's own block, which is where its EP0 ring already lives.
+/// One mass-storage device's pool block and the two bulk rings its endpoint
+/// contexts name, as [`prepare`] left them.
 ///
-/// No return value: every failure path below logs, so there was nothing in the
-/// `bool` this used to produce that the one caller wanted — and it discarded it
-/// in statement position, silently, because Rust does not warn about a dropped
-/// `bool`.
-pub fn bind(
+/// Carried from the Configure Endpoint act to the bind behind it rather than
+/// rebuilt there: `TrbRing::init` zeroes, and by then the memory is the
+/// controller's to read.
+#[derive(Clone, Copy)]
+pub(in crate::drivers::xhci) struct MscRings {
+    /// Which of [`super::super::MSC_BLOCKS`] this is, which is what the teardown gives
+    /// back.
+    at: usize,
+    block: usize,
+    in_ring: TrbRing,
+    out_ring: TrbRing,
+}
+
+/// Claim a pool block for this device and write its two bulk endpoints into the
+/// input context, ready for the Configure Endpoint the sequence issues.
+///
+/// **Claimed before the endpoints are configured** and released only by the
+/// teardown that disables this slot, so the block cannot be reissued while the
+/// previous holder's contexts still name it. `storage.len()` was the old answer
+/// and is a different question: it counts the disks that *finished*.
+///
+/// `None` when the pool is out, which is a refusal and not a failure — nothing
+/// is spent, because nothing was handed out.
+pub(in crate::drivers::xhci) fn prepare(
     ctrl: &mut XhciController,
-    ep0_ring: TrbRing,
     slot_id: u8,
-    dev_block: usize,
     speed: u8,
     port_idx: u8,
     info: &MscInterface,
-) {
-    // Claimed before the endpoints are configured and released only by the
-    // teardown that disables this slot, so the block cannot be reissued while
-    // the previous holder's contexts still name it. `storage.len()` was the old
-    // answer and is a different question: it counts the disks that *finished*.
+) -> Option<MscRings> {
     let Some((at, block)) = ctrl.claim_msc_block(port_idx) else {
         log!("usb-storage: slot {slot_id} is the {}th disk; this driver serves {}",
-            ctrl.msc_blocks_taken() + 1, super::MSC_BLOCKS);
-        return;
+            ctrl.msc_blocks_taken() + 1, super::super::MSC_BLOCKS);
+        return None;
     };
 
     let (in_dci, out_dci) = (info.in_ep.dci(), info.out_ep.dci());
@@ -873,21 +888,40 @@ pub fn bind(
         ctrl.write_ctx32(input_ctx_ptr, ctx, 3, (dequeue >> 32) as u32);
         ctrl.write_ctx32(input_ctx_ptr, ctx, 4, mps as u32);
     }
+    Some(MscRings { at, block, in_ring, out_ring })
+}
 
-    let mut configure = Trb::ZERO;
-    configure.param = input_ctx.phys();
-    configure.control = TRB_CONFIGURE_EP | ((slot_id as u32) << 24);
-    if !ctrl.run_command(configure, "Configure Endpoint (bulk)") {
-        return;
-    }
-
+/// Ask the disk what it is, and register it if the answer is one this driver
+/// serves. `dev_block` is the device's own block, which is where its EP0 ring
+/// already lives.
+///
+/// **The last blocking path a scheduler pass can reach**, and the one door in
+/// the split X2b builds: everything below is Bulk-Only Transport, which is a
+/// machine of its own and `specs/xhci-port-machine-plan.md` X2c is where it
+/// gets one. A hot-plugged disk has to be brought up by *some*body and there is
+/// no other context that may block, so until then this runs where it always
+/// did.
+///
+/// No return value: every failure path below logs, so there was nothing in the
+/// `bool` this used to produce that the one caller wanted — and it discarded it
+/// in statement position, silently, because Rust does not warn about a dropped
+/// `bool`.
+pub(in crate::drivers::xhci) fn bind(
+    ctrl: &mut XhciController,
+    ep0_ring: TrbRing,
+    slot_id: u8,
+    dev_block: usize,
+    rings: MscRings,
+    info: &MscInterface,
+) {
+    let MscRings { at, block, in_ring, out_ring } = rings;
     let mut dev = MscDevice {
         slot_id,
         iface: info.iface_num,
         in_ep: info.in_ep.addr,
         out_ep: info.out_ep.addr,
-        in_dci,
-        out_dci,
+        in_dci: info.in_ep.dci(),
+        out_dci: info.out_ep.dci(),
         block,
         dev_block,
         ep0_ring,
@@ -907,8 +941,8 @@ pub fn bind(
     // The machine-wide number, taken here because here is where there is a disk
     // to give one to: it is what `usb_storage::open` indexes by and what a mount
     // holds for its whole life, so it must not move when some other controller
-    // binds or loses a disk — see [`super::DISKS_BOUND`].
-    let index = super::DISKS_BOUND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // binds or loses a disk — see [`super::super::DISKS_BOUND`].
+    let index = super::super::DISKS_BOUND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     log!(
         "usb-storage: disk {index} ready on slot {slot_id}, {} blocks of {} B \
          ({} MiB), msc_block +{:#x}",
@@ -1075,3 +1109,17 @@ impl core::fmt::Display for Printable<'_> {
         f.write_str("\"")
     }
 }
+/// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
+/// `buf` holds nothing the caller may believe.
+pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+    with_disk(index, |ctrl, local| ctrl.msc_read(local, lba, count, buf)).unwrap_or(false)
+}
+
+pub fn storage_write(index: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
+    with_disk(index, |ctrl, local| ctrl.msc_write(local, lba, count, buf)).unwrap_or(false)
+}
+
+pub fn storage_flush(index: usize) -> bool {
+    with_disk(index, |ctrl, local| ctrl.msc_flush(local)).unwrap_or(false)
+}
+

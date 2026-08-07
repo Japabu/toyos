@@ -1233,11 +1233,45 @@ carries that elimination, and the one instrument that would settle the split
 the `ps` column was going to.
 
 Investigation is the scheduler agent's (#142); the shapes are consistent with
-one defect. Ctrl+Alt+D remains available and is weaker: `dump_blocked` lists
-parked threads on the calling CPU only (`kernel/src/scheduler.rs:559`), so it
-can confirm a park but not rule one out — though with `parked` rising on
-several CPUs at once it may now be worth taking on whichever CPU services the
-i8042.
+one defect. Ctrl+Alt+D is now machine-wide and process-named (§5), and on the
+owner's laptop one press named three CPUs not reaching a scheduler pass and
+three threads ready-and-never-run.
+
+### OPEN, UNASSIGNED — the total freeze now reproduces in QEMU, in about seven seconds
+
+**This is the first reproduction of the freeze class.** Everything above was
+read off T14 logs because nothing in the suite could stage it; `desktop_window_child`
+(landed 2026-08-06 by the compositor track, for a different property) stages it
+by accident and reliably.
+
+`cargo test -- desktop_window_child`. `tests/desktopcase`, `Profile::Metal`,
+`smp: 8`. Round 0 is clean: `/bin/snake` spawns, GUI+Q closes its window,
+`exit: snake pid=7 code=0` and the shell answers `after-snake-0-zqjxk`. The next
+round spawns `snake pid=9`, the shell echoes `/home/root> snake`, **and the
+guest emits nothing further at all** — not the exit, not the shell, and not the
+compositor's stats line, which had been arriving every ~2 s until that instant.
+The harness drains every 200 ms for 20 s and appends nothing, which is why the
+assertion's message body is empty: the emptiness *is* the evidence.
+
+Ten attempts, ten reds, across four separate invocations; the round it dies in
+alternates between 1 and 2, so what varies is the timing and not whether it
+happens. The same tree was green once, on the landing gate that put the test in
+(verified by ancestry: `ce3e09d` and `7a9e5c1` are both ancestors of that
+branch's merge), so the single green is the outlier rather than the reds.
+
+Why it matters beyond one red test: **the owner's unrecoverable freeze on
+pulling the USB stick, where Ctrl+Alt+D produces nothing, is the same
+signature** — no CPU reaching a scheduler pass. That one is only reachable on
+his laptop and only through a photograph. This one is reachable under LLDB
+(`gdb-remote 1234`, every CPU's state inspectable, `--debug` parks the guest),
+which is a different order of cost. **Two cheap experiments nobody has run yet:**
+press Ctrl+Alt+D at the frozen guest over QMP — that answers directly whether a
+pass-dispatched dump can fire on a total freeze, which is the open design
+question against the NMI proposal — and if it says nothing, attach and read the
+eight RIPs.
+
+It also blocks every landing until it is fixed, because it is on main and it is
+not flaky.
 
 ### OPEN — a `winit` app spins forever when its window is closed, and never exits
 
@@ -2753,6 +2787,52 @@ check restored on the paint the panel carries nothing.
 microsecond-wide state** — `blocked_dump` has seen `1 OVERDUE` on a healthy
 guest. The count is evidence, not a verdict; what condemns a machine is one that
 stays.
+
+**KNOWN BLIND SPOT: the dump cannot fire when no CPU reaches a scheduler pass.**
+It is dispatched from `drain_irqs` at the top of a pass, so a *partial* wedge
+answers and a *total* freeze is silent — the owner pressed it after pulling the
+USB stick and got nothing, which is itself weak evidence that no CPU was
+passing. Whether an interrupt-dispatched variant can close that is the
+scheduler agent's (the NMI-on-timeout proposal); what follows is what the
+author of this facility established while building it, so nobody rediscovers it
+or removes it by accident.
+
+- **`Lock::lock` disables preemption, not interrupts** (`sync.rs`) — a ticket
+  spin after `preempt::disable()`, no `cli`.
+- **That fact is load-bearing for the 250 ms sibling wait.** Spinning there is
+  safe *because a preempt-driven pass provably holds no `Lock`*: taking one
+  raises the preempt count, so a pass cannot be entered while one is held.
+  **The argument does not survive being moved to an interrupt**, which can land
+  on a CPU that *is* holding a lock — the waiter would then block the sibling
+  it is waiting for. `request`'s `assert!(depth <= 1)` encodes exactly this
+  entry condition and is not decoration.
+- **`log!` takes the serial lock.** It is the single reason the report is not
+  ISR-safe today: an interrupt landing on a CPU that holds it deadlocks on the
+  first line. The panic console's paint is the lock-free counter-example and is
+  ISR-tolerable; `paint_report`'s `PAINTING` is a swap latch that self-releases,
+  not a `Lock`.
+- **The per-CPU half is already reentrancy-safe by construction.** The
+  schedulers are not behind a `Lock` at all: `SCHEDS[cpu]` is guarded by the
+  `IN_PASS[cpu]` flag, mutation happens only inside `with_cpu` which sets it,
+  and `try_with_cpu` refuses when it is set. An interrupt that lands mid-pass
+  therefore reads nothing rather than reading a torn map.
+- **The process table is `try_lock` retried to a 20 ms ceiling, and the retry
+  is not belt-and-braces.** Bare `try_lock` was the first version and
+  `screen_blocked_dump` caught it losing the whole census to a *transient*
+  holder — a spawn in flight 0.75 s into boot. The ceiling separates "someone
+  is mid-spawn" (microseconds) from "the holder is what is wedged" (never).
+- **Truncation may never hide what the report is for.** `LINES_PER_CPU` bounds
+  ordinary parked lines; a line whose verdict is `Overdue` or `Absurd` is not
+  counted against the budget, and `UNPRINTED` says how many ordinary ones went.
+- **The summary is last for a causal reason, not a cosmetic one**: it is the
+  only part that needs every CPU to have answered, and the console paints the
+  *newest* page, so last is what a photograph catches. Any variant that
+  reprints must keep that order.
+- **The deadline arithmetic is guarded by its own classification.**
+  `Verdict::of` matches `at <= now` before it ever evaluates `at - now`, and
+  `Deadline`'s `Display` only subtracts in the arms that verdict produced.
+  Overflow checks are on in the kernel, so reordering those arms turns a
+  diagnostic into a panic.
 
 What is left of this entry: `ps` and `stats` still have no cross-CPU view of
 anything the handles do not publish.

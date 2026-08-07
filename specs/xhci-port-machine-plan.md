@@ -334,6 +334,107 @@ change no outcome, which is the same standard X0 was held to. **No new guest
 gate**, because the window is 100 ms wide and a `device_del` cannot be aimed
 inside it — see the note below, which is the answer and not an omission.
 
+#### X2b is built. What it delivers, and the one thing it does not
+
+`configure`'s eight blocking points are `toyos_xhci::enumerate`'s acts, each
+submitted with the outstanding slot recording what ends it. One implementation
+and two drivers, as the recovery already had. The split is a **module** and not
+a view — `xhci::wait`, with the poll outside it — and a pass that tries to wait
+does not compile: checked by writing each of the six calls and reading the
+error. Its three descendants are the three contexts where waiting is correct,
+and the third of them is the door: `msc::bind`, one call site named in
+`device::bind`, which X2c removes.
+
+Measured on `xhci_hotplug`: a mouse plugged in after boot is connected,
+addressed, configured and delivering inside **one millisecond**, across as many
+scheduler passes as it has acts. The 16 `xhci_*` and 9 `usb_*` gates change no
+outcome, which is the standard X0 and X2a were held to, and there is **no new
+guest gate** — for the reason recorded below, which is the answer and not an
+omission.
+
+Two things the conversion made dead went with it: `poll` advanced the
+outstanding operation a second time after `service_ports` and re-tested
+`ports_dirty`, both because enumeration used to drain the event ring from
+inside the pass.
+
+**What gates X2b.** `toyos-xhci/sim/tests/enumerate.rs`, six tests, one of them
+negative: an enumeration left running against a device that has gone makes the
+unplug wait out its deadline as well as the teardown's, and the same measurement
+with the cancellation on lands on the other side of one deadline. Plus
+`enumerate.rs`'s own unit tests — which is where the two EP0 packet-size tables
+finally got any, having had none while carrying the defect that addressed every
+SuperSpeedPlus port at a 64-fold undersized control endpoint.
+
+#### X2b's design, written before the code
+
+**The plan under-counted `configure`'s reach, and the count is what decides
+whether the split can hold.** The table above stops at `configure`; but
+`configure` ends by calling `msc::bind`, which issues its own Configure Endpoint
+and then `bring_up` — TEST UNIT READY on a 500 ms budget, INQUIRY, READ
+CAPACITY, each a Bulk-Only round trip of three transfers with stall recovery
+inside it. That is the BOT/SCSI transport §2 excludes by name, and it runs
+**inside a scheduler pass** on every hot-plugged disk. `usb_refused_disk_first`
+is the gate that proves it runs there: it `device_add`s a stick after boot and
+requires `disk 1 ready on slot` in the log with no userland asking, so a pass
+that declined to bring a disk up would go red.
+
+So X2b converts everything up to the class bind, and the split holds for all of
+it. What is left is one call, named below.
+
+**The mechanism, reusing X2a's and inventing nothing.** `toyos_xhci::enumerate`
+is the sequence — which request comes next, and the two places it branches — on
+`recovery.rs`'s shape: `begin` answers with the first act, `completed` with the
+next. The kernel holds the data (slot id, speed, EP0 ring, the parsed function)
+in `What::Enumerating` and performs the acts. Two drivers of the one sequence:
+`settle_outstanding` for the boot scan, where blocking is correct because there
+is no scheduler to give a pass back to, and `advance_outstanding` for the pass.
+`configure`'s straight-line body becomes those acts and nothing else moves.
+
+**A control transfer with a data stage is two completions, and the job has to
+own that.** The data stage carries ISP and IOC so the driver can learn how many
+bytes actually arrived, so the status stage's event is a second one on the same
+(slot, dci). A job that finished on the first would leave the second to be
+matched by whatever asked next — the transfer-side form of the defect
+`submit_command`'s TRB matching closed on the command ring, and reachable
+because `poll` drains the whole ring before it advances anything. So
+`Outstanding::submit` takes `Stages`, and `Outcome::Answered` carries the
+residue as well as the code: the residue is the data stage's, the code is the
+last one seen, and a code that is neither Success nor Short Packet ends the
+operation because the halted endpoint will never run the status TRB.
+
+**An enumeration outstanding for a port that has gone is cancelled**, for the
+reason a recovery is: a transfer error on a port that has gone belongs to the
+disconnect, and without it the teardown waits a whole deadline behind a device
+that will never answer.
+
+**The split is a module, not a view, and that is what makes it hold.** A view
+handed to `poll` would have enforced nothing: Rust makes a module's private
+items visible to its *descendants*, so `xhci::device` and `xhci::hid` can name
+whatever `xhci` keeps private, a view's own field included. So the primitives
+went **below** the poll instead of beside it. `wait_command`, `wait_transfer`,
+`settles`, `run_command`, `control_transfer`, `restart_endpoint` and
+`settle_outstanding` are private to `xhci::wait`, and `xhci`, `xhci::device` and
+`xhci::hid` are not inside it.
+
+`wait`'s three descendants are the three contexts where waiting is correct:
+`wait::boot`, the scan, which has no pass to give back; `wait::msc`, a disk read
+or written from the thread that faulted; and **the one door**, `msc::bind`,
+because a disk plugged in after boot has to be brought up by somebody. **That
+door is X2c's to remove**, and until it does, "`drain_irqs` cannot spend the
+transfer budget in xHCI" is true of everything except a disk arriving after
+boot.
+
+### X2c — the BOT/SCSI machine, which closes the last door
+
+The bring-up conversation expressed the way `recovery` and `enumerate` are: the
+round trip (command block out, data, status in, with the one legal stall retry)
+and the bring-up above it (TEST UNIT READY on a budget, sense, INQUIRY, READ
+CAPACITY 10 then 16). Two drivers again — the blocking one for
+`storage_read`/`storage_write`, which run on the thread that faulted and spend
+their own time, and a stepped one for the bind. Not folded into X2b because it
+is a second machine of its own size and would make the landing unreviewable;
+§2's exclusion stands, and this is where it is paid off.
+
 Delta from the task's fix-shape: the task offers "bounded work per pass or a
 dedicated context". **This plan takes neither literally.** Bounded work per
 pass does not help while one unit of work can block for 2 s. A dedicated
@@ -346,14 +447,16 @@ none of that and is what the extraction produces anyway.
 
 ### X3 — the verdict on #156's prologue, stated as a gate
 
-**Does X2 deliver it? Yes, and only because X2 covers recovery and teardown as
-well as enumeration.** Enumeration alone would not: `recover_endpoints` runs on
-the same path and blocks the same way. With the type-level split above,
-"`drain_irqs` cannot spend 2 s in xHCI" stops being a claim and becomes a
-compile error, which is the strongest form available and the one the doctrine
-asks for.
+**Does X2 deliver it? Not yet, and the gap is one call.** X2a and X2b together
+make "`drain_irqs` cannot spend 2 s in xHCI" a compile error for teardown,
+recovery and enumeration — the strongest form available and the one the doctrine
+asks for. What is left is `msc::bind`, reached from `device::bind` when a *disk*
+is plugged in after boot, and it is the whole of X2c. Until then this stage is
+open, and a report that closed it would be claiming a property one greppable
+call site contradicts.
 
-What X2 does **not** fix, stated so the task is not closed on a half-answer:
+What X2 does **not** fix even then, stated so the task is not closed on a
+half-answer:
 `storage_read`/`storage_write` still run SCSI commands under the same lock from
 whatever thread faulted, and known-issues already says that is not fixable by
 this conversion. That path does not run inside `drain_irqs`, so #156's prologue
