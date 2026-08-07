@@ -242,7 +242,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_CLOCK => crate::clock::nanos_since_boot(),
         SYS_OPEN => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_open(path, OpenFlags(a3))
+            sys_open(&path, OpenFlags(a3))
         }
         SYS_CLOSE => sys_close(a1 as u32),
         SYS_SEEK => {
@@ -268,11 +268,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_READDIR => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
             let Some(buf) = ctx.user_slice_mut(UserAddr::new(a3), a4) else { return bad_addr };
-            sys_readdir(path, buf)
+            sys_readdir(&path, buf)
         }
         SYS_DELETE => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_delete(path)
+            sys_delete(&path)
         }
         SYS_SHUTDOWN => {
             log!("Syncing filesystems...");
@@ -286,7 +286,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_CHDIR => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_chdir(path)
+            sys_chdir(&path)
         }
         SYS_GETCWD => {
             let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
@@ -298,28 +298,39 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let text = match ctx.user_str(UserAddr::new(args.argv_ptr), args.argv_len) { Ok(s) => s, Err(e) => return e.to_u64() };
             let fd_count = args.fd_map_count as usize;
             let fds = if fd_count > 0 {
-                let Some(pairs) = ctx.user_slice_of::<[u32; 2]>(UserAddr::new(args.fd_map_ptr), fd_count) else { return bad_addr };
-                match process::build_child_fds(pairs) {
+                // One pair read out of the window at a time rather than the map
+                // copied wholesale: `fd_map_count` is userland's, and a copy
+                // would put it on the allocator for a loop that reads each pair
+                // exactly once.
+                let Some(bytes) = fd_count
+                    .checked_mul(crate::loader::FD_PAIR_LEN)
+                    .and_then(|len| ctx.user_bytes(UserAddr::new(args.fd_map_ptr), len as u64))
+                else {
+                    return bad_addr;
+                };
+                match process::build_child_fds(&bytes) {
                     Ok(fds) => fds,
                     Err(e) => return e.to_u64(),
                 }
             } else {
                 fd::FdTable::new()
             };
-            // The env blob is copied onto the kernel heap and kept for the
-            // child's whole life, so it needs the bound `user_slice` does not
-            // carry. Same constant as argv: both are userland text the kernel
-            // owns a copy of.
+            // The env blob is kept for the child's whole life, so it needs a
+            // bound of its own — `user_vec` is the one accessor that puts a
+            // userland-chosen size on the allocator. Same constant as argv:
+            // both are userland text the kernel owns a copy of.
             let env = if args.env_len > 0 {
                 if args.env_len > crate::user_ptr::MAX_USER_STR {
                     return SyscallError::InvalidArgument.to_u64();
                 }
-                let Some(env_bytes) = ctx.user_slice(UserAddr::new(args.env_ptr), args.env_len) else { return bad_addr };
-                env_bytes.to_vec()
+                match ctx.user_vec(UserAddr::new(args.env_ptr), args.env_len) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return e.to_u64(),
+                }
             } else {
                 alloc::vec::Vec::new()
             };
-            sys_spawn(text, fds, env)
+            sys_spawn(&text, fds, env)
         }
         SYS_WAITPID => sys_waitpid(a1, a2),
 
@@ -380,15 +391,15 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_RENAME => {
             let old = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
             let new = match ctx.user_str(UserAddr::new(a3), a4) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_rename(old, new)
+            sys_rename(&old, &new)
         }
         SYS_MKDIR => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_mkdir(path)
+            sys_mkdir(&path)
         }
         SYS_RMDIR => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_rmdir(path)
+            sys_rmdir(&path)
         }
         SYS_DLOPEN => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
@@ -402,11 +413,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                     None => return bad_addr,
                 },
             };
-            sys_dlopen(&ctx, path, init_out)
+            sys_dlopen(&ctx, &path, init_out)
         }
         SYS_DLSYM => {
             let name = match ctx.user_str(UserAddr::new(a2), a3) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_dlsym(a1, name)
+            sys_dlsym(a1, &name)
         }
         SYS_DLCLOSE => 0,
         SYS_FTRUNCATE => process::with_fd_owner_data(|data| fd::ftruncate(&mut data.fds, a1 as u32, a2)),
@@ -501,12 +512,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_SYMLINK => {
             let target = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
             let link = match ctx.user_str(UserAddr::new(a3), a4) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_symlink(target, link)
+            sys_symlink(&target, &link)
         }
         SYS_READLINK => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
             let Some(buf) = ctx.user_slice_mut(UserAddr::new(a3), a4) else { return bad_addr };
-            sys_readlink(path, buf)
+            sys_readlink(&path, buf)
         }
         SYS_GPU_SET_RESOLUTION => {
             // Checked before the driver, so a non-claimant never gets its two
@@ -545,12 +556,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_LISTEN => {
             let name = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_listen(name)
+            sys_listen(&name)
         }
         SYS_ACCEPT => sys_accept(a1 as u32),
         SYS_CONNECT => {
             let name = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_connect(name)
+            sys_connect(&name)
         }
         SYS_TLS_ALLOC_BLOCK => sys_tls_alloc_block(a1),
         SYS_IO_URING_SETUP => sys_io_uring_setup(a1 as u32),

@@ -290,8 +290,51 @@ exposure. It lands first.*
 
 **M1a is built.** Three commits: dlopen's `init_out` and the copy accessors,
 the bound in `translate` with futex's signature, and the typed call sites with
-`user_ref`/`user_mut`/`user_slice_of_mut` deleted. M1b — the 33 bulk-buffer
-sites onto `UserBytes` — is not.
+`user_ref`/`user_mut`/`user_slice_of_mut` deleted.
+
+**M1b is split in two, and the seam is `fd::try_read`/`fd::try_write`.**
+
+- **M1b-1, built**: the `UserBytes` type, the 16 `user_str` sites, spawn's fd
+  map and its env blob. Eighteen of the thirty-three.
+- **M1b-2, not built**: the fifteen remaining `user_slice`/`user_slice_mut`
+  sites. Eleven are shallow — the kernel builds a small answer (`getcwd`,
+  `readdir`, `sysinfo`, `readlink`, `sched_info`, `process_stats`, `random`, a
+  device name) and copies it once, so each is a `buf.write_at(0, &answer)` and a
+  signature. Four are the read and write path (`SYS_READ`, `SYS_WRITE` and their
+  non-blocking twins), which reach `fd::try_read`/`try_write` and from there a
+  leaf per descriptor kind: the page cache, a pipe's ring, the serial port, the
+  input queues.
+
+**The leaf is where M1b-2's decision is, so it is recorded here rather than
+rediscovered.** Do *not* bounce through a kernel buffer at the syscall
+boundary: a bounded chunk loop breaks the atomicity a pipe write has today, and
+an unbounded copy puts a userland-chosen length on the allocator, which is what
+`MAX_HEAP_ALLOC` exists to refuse. Thread the window down instead. Every leaf
+already holds the *kernel* side of its copy — a page-cache page, the ring's
+shared memory — so `buf[a..b].copy_from_slice(&page[..])` becomes
+`user.write_at(a, &page[..])`: one copy, the same one, with the reference on the
+kernel side where it is true.
+
+**Delta from the plan: `read_at`/`write_at` are a raw `copy_nonoverlapping`,
+not per-byte volatile.** What this stage exists to remove is the *reference*.
+`&[u8]`/`&mut [u8]` carry `noalias` and `dereferenceable` into LLVM, and that is
+what entitles the compiler to hoist a read, fold two into one, or reorder a
+check past the use it guards — which is what makes "copy it once into kernel
+memory and validate the copy" unenforceable while the borrow exists. A `memcpy`
+from a raw pointer carries none of that: what comes back is a snapshot as of the
+moment the kernel looked, exactly as a device read is. Volatile would buy no
+formal guarantee either — a data race is a data race under both — while costing
+the read and write path several times its throughput, because there is no
+volatile `memcpy` and a word-at-a-time loop is what it degrades to. So the type
+hands out no reference, and the copy stays a copy.
+
+**M1b-1 has no new guest gate, and that is a claim about the change rather than
+an omission.** Copying a path changes nothing a process can observe: the same
+bytes, the same errors, the same refusals. What it changes is what is
+*representable* — `user_str` can no longer return a borrow of a page userland
+can rewrite while the VFS walks it. The suite is the regression gate for the
+copy being right (every path syscall runs in it many times over), and the type
+is the gate for the property.
 
 Four things a reader of the plan below needs, because the built shape differs
 from it or settles something it left open:
