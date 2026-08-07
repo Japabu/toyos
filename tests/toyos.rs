@@ -2924,6 +2924,15 @@ fn run_screen_test(
                 profile: qemu::Profile::Metal,
                 smp: 8,
                 qmp: true,
+                // The T14's literal shape, and load-bearing rather than
+                // decoration: `halt_all_cpus` waits for the log sink only when
+                // there is no console, because a machine with serial already
+                // has the report off the box and the wait would delay the paint
+                // to buy a duplicate. Muted is therefore the only configuration
+                // in which this gate's second half — the report reaching
+                // `/log` — tests anything at all. The probe is time-based, so
+                // it needs no console to drive it.
+                mute: true,
                 kernel_features: &["metal-panic-probe"],
                 ..Default::default()
             };

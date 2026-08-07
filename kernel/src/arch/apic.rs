@@ -155,6 +155,21 @@ fn owed() -> bool {
 /// Placed before the halt IPI rather than after, because after it there is
 /// nobody left to do the writing.
 fn wait_for_log_file() {
+    // **Only where the panel is the only channel.** This exists because a T14
+    // has no serial port, so the file is the sole copy of a fatal report. A
+    // machine with a working console has already got that report off the box
+    // through `panic_flush`, and making it wait here buys a duplicate at the
+    // price of delaying every step below it — `render`, the drain, and
+    // `page_forever`.
+    //
+    // The price is measured, not assumed: without this guard `screen_pager_keys`
+    // failed alone and reproducibly with `0 page moves over 30 keystrokes`,
+    // because the pager had not started by the time the host began injecting.
+    // A diagnostic that perturbs the path it is diagnosing is worth less than
+    // the delay it costs, and on a machine with serial it is worth nothing.
+    if crate::drivers::serial::has_console() {
+        return;
+    }
     if !owed() {
         return;
     }
