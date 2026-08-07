@@ -22,6 +22,27 @@ that followed the T14's first boot.
 
 ## 1. Isolation and untrusted input
 
+### Most CPU exception vectors have no IDT gate, so a userland fault halts the machine
+
+`arch::idt::init` installs six exception vectors — #DB (1), #NMI (2), #UD (6),
+#DF (8), #GP (13), #PF (14) — and leaves the rest of the table
+`IdtEntry::EMPTY`, which is `P = 0`. Delivering a fault whose gate is not
+present is itself a fault, and the two are contributory, so the CPU escalates
+to #DF: `double_fault_handler` prints and calls `halt_all_cpus`.
+
+**A divide by zero in any user process therefore stops the whole machine**,
+which is exactly what "the kernel must never crash from userland" forbids. #DE
+(0) is the cheapest instance and not the only one: #BR (5), #NM (7), #TS (10),
+#NP (11), #SS (12), #MF (16), #AC (17), #MC (18) and #XM (19) are all absent,
+and #SS is the vector the AMD `SYSRET` residue in §3 would arrive on.
+
+Not reproduced, and worth reproducing before it is fixed: no test in the guest
+suite divides by zero. The shape of the fix is `exception_handler`'s — the
+vectors that can only come from userland kill the process, the ones that mean
+the kernel is broken keep halting. `trap_dispatch`'s `panic!("unhandled
+exception vector")` arm is the honest default for anything left out, and is
+currently unreachable because no vector it does not know is ever installed.
+
 ### sshd's keys are as protected as any other file, which is not at all
 
 `/home/root/.ssh/host_ed25519` is the machine's SSH private key and
