@@ -312,8 +312,9 @@ impl UserBytesMut<'_> {
 ///
 /// Exists for one caller: `file_cache::write_page` is reached both by a syscall
 /// carrying a [`UserBytes`] window and by `log_file`, whose bytes are the
-/// kernel's own. A slice cannot express the first and this type cannot express
-/// the second, so the page cache names the capability it actually needs.
+/// kernel's own. A slice cannot express the first and a `UserBytes` cannot
+/// express the second, so the page cache names the capability it needs instead
+/// of one of the two representations.
 pub trait ByteSource {
     fn len(&self) -> usize;
     fn read_at(&self, off: usize, dst: &mut [u8]);
