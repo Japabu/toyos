@@ -3089,6 +3089,16 @@ phase landed, and none reproduces on a host running one suite.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
+- **`dump_nmi_probe`** — added 2026-08-07, and the odd one out: it is already
+  `Sched::Serial`, so it failed in the *serial tail* rather than the wide phase
+  and the harness therefore never re-ran it alone. Run alone on the same tree
+  moments later it passes in 23 s. `the NMI went unanswered too` is its
+  wall-clock verdict expiring on a host carrying three other worktrees' suites —
+  the `[host-slots]` lines in that run name all three. `4ad8875` made it serial
+  for exactly this reason, which shows what serialising buys and what it does
+  not: within one run the phase is quiet, across runs nothing but
+  `buildlock::guest_slot` spans worktrees and twelve slots is not one guest.
+  Nothing here should widen its millisecond.
 
 **What to do about a red on any of these names:** read the `ALONE` line under it
 before anything else. `GREEN` there means the host, not the kernel. What none of
