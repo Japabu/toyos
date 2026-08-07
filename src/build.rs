@@ -549,6 +549,11 @@ pub fn build(
     // identical refusals looked like on 2026-08-04.
     let _claim = claim_sysroot.then(|| buildlock::claim_sysroot(root, "--claim-sysroot"));
 
+    // After the sysroot lock and before every build lock, which is the order
+    // the module header fixes. What it bounds is the host: ten agents' builds
+    // spend the same fourteen cores, and nothing was counting them.
+    let _slot = buildlock::build_slot(root, "cargo run");
+
     // Held until the last staged artifact has been read back, so no other
     // agent's clean or toolchain rebuild can land inside this build.
     let mut lock = buildlock::shared(root, "build");
@@ -776,6 +781,14 @@ pub fn build_test_image(
         return image::create_boot_image(&kernel, &bl, &initrd);
     }
 
+    // **Below the memo's early return, so a boot that builds nothing queues for
+    // nothing.** Above every build lock, per the module header. This is the
+    // acquisition the eight-landing day was about: twelve suite workers each
+    // hold a guest slot and the first thing each does is compile its kernel
+    // variant, so the semaphore that bounds guests was bounding the phase that
+    // was not scarce.
+    let _slot = buildlock::build_slot(root, "a test image");
+
     // Held to the end of the function: the staged artifacts below are read
     // back after the userland build, and a clean landing in between is the
     // same defect as one landing mid-compile.
@@ -846,6 +859,7 @@ pub fn build_test_image(
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
 /// Also builds any cdylib subcrates and includes their .so files.
 pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(String, Vec<u8>)> {
+    let _slot = buildlock::build_slot(root, "the test binaries");
     let mut lock = buildlock::shared(root, "test binaries");
     crate::toolchain::ensure(root, false, false, &mut lock);
     let path_env = toolchain::path_with_toyos_ld(root);

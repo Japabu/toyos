@@ -675,6 +675,170 @@ the scheduler crosses. Fast tier A/B in one session against one HEAD; **thorough
 tier at N=30 both sides** before the stage lands, per CLAUDE.md's rule for
 scheduler-adjacent transitions.
 
+#### 3.3.1 What M3 built, and where it differs from the plan above
+
+**The protocol.** `kernel/src/shootdown.rs` holds it and names nothing through
+`crate::`, so `kernel-loom` compiles it a second time against loom's atomics the
+way it compiles `sync.rs`. One machine-wide generation counter and one
+publication per CPU:
+
+- `issue()` — `fetch_add(AcqRel)`. The release half publishes the page-table
+  write the caller made before it; the acquire half stops the wait's first look
+  at an acknowledgement being hoisted above it.
+- `serve(cpu, flush)` — load the counter `Acquire`, **then** flush, **then**
+  publish what was loaded `Release`. The read is before the flush and that is
+  the protocol: a target that read after flushing could publish a generation
+  whose page-table write its own flush had not seen.
+- `served(cpu, g)` — `Acquire`, `>= g`.
+- `owes(cpu)` — a `Relaxed` hint, for the poll below.
+
+`arch/tlb.rs` is the hardware half: the local flush, the ICR write
+(`apic::tlb_ipi`, now `pub(super)` so nothing outside can send an unacknowledged
+one), the wait, and a deadline.
+
+**The wrong-PCID half is fixed by flushing everything locally, not by naming the
+tag.** The plan proposed `INVPCID` type 1 against the target address space. What
+is built instead makes the initiator's own flush the whole TLB — correct under
+every PCID configuration, the same thing the targets already do, and no payload
+to pass with the IPI. A per-PCID, per-address shootdown is a real optimisation
+and is not this stage; nothing has measured a need for one, and TCG cannot
+(§2.2).
+
+**The deadlock rule changed shape, and this is the substantive delta.** The plan
+said: enumerate the `IF=0` windows and keep the initiator out of them. That
+enumeration does not close. Every IDT gate clears `IF`, so *every lock any
+handler takes* is one a target can be spinning on uninterruptibly — the
+page-fault handler's address-space and process-data locks among them — and the
+set would have to be re-derived whenever anybody added a lock to a handler. The
+audit also found three free paths that run under a caller's lock by construction
+(`teardown_bookkeeping` under the process table, `release_thread_mappings` under
+process data, `free_framebuffer` inside `&mut self` on the GPU), so an
+initiator-side rule meant threading the obligation through unrelated signatures.
+
+So **the target answers instead of the initiator abstaining**: `Lock::lock`'s
+spin calls `arch::tlb::poll` on every turn, which serves any outstanding
+shootdown. A flush takes no lock, allocates nothing and is safe from anywhere, so
+a CPU waiting for a lock with interrupts disabled acknowledges as promptly as one
+that took the interrupt. That closes the class structurally, for locks nobody has
+written yet as much as for today's.
+
+Two things it does not close, both recorded rather than papered over:
+
+- **An `IF=0` spin that is not a `Lock`.** A driver waiting on a device register
+  inside a handler cannot poll. That is latency and not deadlock, because each
+  carries its own deadline — but xHCI's is 2 s and it runs from `drain_irqs`
+  (known-issues §3), so `ACK_TIMEOUT_NS` is 5 s and a CPU past it is named in a
+  **panic** rather than waited for forever. This makes that existing defect cost
+  something visible on the mapping path, which is an argument for closing it and
+  not a reason to lower this bound.
+- **Bring-up.** An AP counted by `CPU_COUNT` spins on `SMP_READY` with `IF`
+  clear until the idle loop, and that spin is not a `Lock` either. So the wait is
+  off until `smp::set_ready`, and each AP calls `arch::tlb::join` — one `serve` —
+  on the far side of that spin. The acquire on `SMP_READY` makes every
+  page-table write the BSP made visible first, so the join settles retroactively
+  every shootdown issued while that AP was deaf.
+
+**`mm::Unmapped<T>` is the type the plan asked for.** `Drop` shoots down and then
+drops the value; `reclaim` shoots down and hands it back; there is no third way
+to the value. So the obligation is discharged by the type rather than by
+`MappedPages::unmap_from`'s doc comment, which is where it was. CLAUDE.md's
+caveat about `Drop` guards passes here on its own terms: the value lives on the
+stack of the CPU that did the unmap, on an ordinary path, and that CPU reaches
+its own drop.
+
+**Call sites, all fifteen.** Six were unacknowledged; five freed with no
+shootdown at all; four more are consequences of the audit.
+
+| site | was | is |
+|---|---|---|
+| `MappedPages::release` | unacked | `Unmapped<PageAlloc>` |
+| `release_thread_mappings` | unacked | returns `Vec<Unmapped<PageAlloc>>`, dropped outside the process-data lock |
+| `revoke_pipe_maps` | unacked | acked, outside the address-space lock |
+| `sys_mmap` (`MAP_FIXED`) | unacked | acked |
+| `sys_dlopen` (shared image) | unacked | acked |
+| `alloc_pcid` (wrap) | unacked, **under `NEXT_PCID`** | acked, outside the lock |
+| `sys_munmap` | **nothing** | `Unmapped<MmapRegion>`, dropped outside the fd-owner lock |
+| `shared_memory::release` | **nothing** | `Unmapped`, dropped outside `REGIONS` |
+| `shared_memory::destroy` | **nothing** | as above |
+| `shared_memory::cleanup_process` | **nothing** | returns `Unmapped<Retired>`; `teardown_bookkeeping` hands it to both callers, who drop it outside the process table |
+| `shared_memory::unregister` | **nothing** | returns `Option<Unmapped<Retired>>` |
+| `virtio_gpu::free_framebuffer` | **nothing** | unregister, drop the wrappers, *then* drop `FbAlloc` — the order was inverted |
+| `virtio_gpu::set_resolution` | — | its only free path is the row above |
+| `paging::map_mmio` | unacked, **under the kernel address-space lock** | a free function: lock, map, drop the guard, shoot down |
+| `AddressSpace::unmap_mmio` | unacked | **deleted** — it had no callers |
+
+`map_mmio` earns its own paragraph. `map_2m` may replace the boot map's own
+leaf, so a window inside a range the memory map covers *changes memory type*
+there — write-combining for the framebuffer above all. That is §2.3's alias, on
+the direct map, on a path every driver takes; eleven callers wrote the
+lock-and-map incantation by hand and not one of them could have got the second
+half right.
+
+**Gates, and every control was watched red before it was watched green.**
+
+| gate | asserts | negative control, and what it said |
+|---|---|---|
+| loom | an acknowledged flush postdates the page-table write | `serve` reads the generation *after* flushing → red, "cpu 1 acknowledged the shootdown while still holding a translation for the page the initiator is about to free" |
+| loom | as above | the acknowledgement published `Relaxed` → red, same message |
+| loom | as above | `served` reads `Relaxed` → red, same message |
+| loom | as above | `issue` publishes `Relaxed` → red, same message |
+| loom | one serve answers two concurrent shootdowns, which is what makes the vector's single pending bit sufficient | each of the four above → red on the first or the second initiator |
+| loom | the models are not vacuous | a `served` that never answers → red, "no interleaving completed the wait, so the assertion never ran" |
+| guest | a shootdown with the last CPU answering 20 ms late costs the kernel ≥ 10 ms | delete the wait → the number collapses to one ICR write |
+| guest | `munmap` and a fixed `mmap` each cost ≥ 10 ms under the same arming | remove either site's shootdown → it returns in microseconds |
+| guest | disarmed, the same `munmap` is back under 10 ms | — this control is *inside* the test, so the three rows above cannot pass on a kernel that is merely slow |
+
+Loom needs a preemption bound of 2. Unbounded, neither model finishes — over
+seven minutes with no verdict, the same wall the lock models hit — and at two
+both run in about ten seconds and still catch all five controls, which is the
+check that matters.
+
+**What is deliberately not gated, and why.** The plan asked for SMP guest tests
+observing the harm: a sibling reading through a stale translation into memory the
+PMM had reissued. That is not constructible under TCG in this kernel, for three
+independent reasons, and a test that passed for the wrong reason would be worse
+than none:
+
+1. the **correct** outcome is a fault, which kills the process doing the
+   observing — the pass condition would be "the child died", indistinguishable
+   from any other crash;
+2. a context switch writes CR3, which flushes the whole TLB (no PCID under TCG,
+   and no `PAGE_GLOBAL` anywhere in the tree), and a spinning sibling is
+   preempted within milliseconds — so a stale entry evaporates on its own;
+3. even the *unacknowledged* IPI this stage replaced landed within microseconds,
+   so the window the defect leaves open is far below anything a guest can
+   schedule into.
+
+What is gated instead is the property that closes the window — the free happens
+after the flush — measured where it is observable, which is the duration of the
+syscall while a target answers late. The harm stays real on hardware for exactly
+the reason it is unobservable here: a real TLB, a real memory type, and no CR3
+write between the free and the sibling's next access.
+
+**Gate A, measured in one session on 2026-08-07.** Fast tier: **7 of 7 green**
+with the wait and 7 of 7 with it deleted, and *both* arms needed one confirm
+re-boot on one config — so the transient gap is not the wait. The comparable
+counters move less than the arms differ from each other: `audio_tone_load smp=1`
+wake lateness 5507 µs with the wait against 6301 µs without.
+
+The **thorough tier is red, and it is red on `main` too** — 7 dropout runs of 28
+there against 5 of 12 on this branch and 5 of 40 with the wait deleted, all three
+failing the same `0 of 120` recorded sample. That is a finding about the estate
+rather than about M3, it is written up in known-issues §4 with the numbers, and
+it is why this stage's thorough tier is an A/B rather than a pass/fail: a gate
+that is red on `main` cannot say anything about a branch by being red on it.
+
+**Is the memory-type alias now impossible?** On the paths the kernel controls,
+yes: every mapping change that alters a memory type — `map_mmio`'s re-type of a
+boot-map leaf, `shared_memory`'s write-combining framebuffer grant, and every
+unmap that lets a physical page be reissued under a different policy — returns
+only after every online CPU has flushed. What is left is *unlikely rather than
+impossible*: a CPU inside an `IF=0` device spin that is not a `Lock` delays its
+acknowledgement rather than skipping it, so the window closes late rather than
+not at all; and `AddressSpace`'s own drop at process teardown still frees page
+tables with no shootdown, which is sound today only because no PCID means every
+context switch flushes, and which M4 must revisit when tags become owned.
+
 ### 3.4 Stage M4 — the PCID as an owned resource (#162a)
 
 **Fix shape.**

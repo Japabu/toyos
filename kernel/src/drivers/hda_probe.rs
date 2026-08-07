@@ -503,7 +503,7 @@ fn codecs(hda: &PciDevice, bar: &Bar) {
     let command = hda.read_config_u16(HEADER_COMMAND);
     hda.write_config_u16(HEADER_COMMAND, command | COMMAND_MEMORY_SPACE);
 
-    let regs = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(
+    let regs = crate::mm::paging::map_mmio(
         bar.base,
         bar.size.min(MIN_BAR_BYTES * 4),
         CachePolicy::DeferToMtrr,

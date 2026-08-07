@@ -1,16 +1,21 @@
-//! Loom harness for `kernel/src/sync.rs`.
+//! Loom harness for the kernel's two memory-ordering primitives.
 //!
-//! The kernel file is compiled into this crate with `feature = "loom"` on, so
-//! `Lock`'s atomics and its cell resolve to loom's instrumented ones. What the
-//! kernel file names through `crate::` is supplied below: the lock takes a
-//! preempt count and a log macro from its environment, and neither is what the
-//! models are about.
+//! `kernel/src/sync.rs` and `kernel/src/shootdown.rs` are compiled into this
+//! crate with `feature = "loom"` on, so their atomics and cells resolve to
+//! loom's instrumented ones and the models drive the real primitives rather than
+//! transliterations of them — a transliteration is exactly the divergence risk a
+//! model checker is meant to remove. What the kernel files name through
+//! `crate::` is supplied below: the lock takes a preempt count and a log macro
+//! from its environment, and neither is what the models are about;
+//! `shootdown.rs` names nothing at all, which is why it has no shim here.
 //!
-//! Scope, stated because it is narrower than the file: the models drive
-//! `try_lock` and `LockGuard::drop`. `lock()`'s spin cannot be modelled —
+//! Scope for the lock, stated because it is narrower than the file: the models
+//! drive `try_lock` and `LockGuard::drop`. `lock()`'s spin cannot be modelled —
 //! loom explores a spin as an unbounded branch and gives up ("Model exceeded
 //! maximum number of branches"), and the `yield_now` that would fix it belongs
-//! to loom rather than to a kernel that really does spin.
+//! to loom rather than to a kernel that really does spin. The shootdown's spins
+//! *are* modelled, because they live in the caller — `arch::tlb` — and the model
+//! writes its own.
 
 /// Loom's cell with the `get(&self) -> *mut T` shape `Lock` uses.
 ///
@@ -38,6 +43,15 @@ pub mod preempt {
     pub fn enable() {}
 }
 
+/// `Lock::lock`'s spin serves TLB shootdowns for a CPU that is not taking
+/// interrupts. Empty here: the models do not drive that spin at all (see the
+/// scope note above), and the protocol it would call has its own models.
+pub mod arch {
+    pub mod tlb {
+        pub fn poll() {}
+    }
+}
+
 /// The contention and deadlock reports are unreachable in these models — the
 /// spin they fire from is what loom cannot explore — but the arguments are
 /// consumed so the kernel file's bindings are still live code here.
@@ -48,3 +62,6 @@ macro_rules! log {
 
 #[path = "../../kernel/src/sync.rs"]
 pub mod sync;
+
+#[path = "../../kernel/src/shootdown.rs"]
+pub mod shootdown;

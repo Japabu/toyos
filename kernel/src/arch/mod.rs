@@ -9,4 +9,5 @@ pub mod pat;
 pub mod percpu;
 pub mod smp;
 pub mod syscall;
+pub mod tlb;
 

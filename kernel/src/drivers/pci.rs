@@ -182,11 +182,7 @@ impl PciDevice {
         };
 
         let entry = address + MSIX_ENTRY as u64 * msix::ENTRY_BYTES;
-        let table = crate::mm::paging::kernel()
-            .lock()
-            .as_mut()
-            .unwrap()
-            .map_mmio(entry, 0x1000, CachePolicy::DeferToMtrr);
+        let table = crate::mm::paging::map_mmio(entry, 0x1000, CachePolicy::DeferToMtrr);
 
         table.write_u32(msix::ENTRY_ADDRESS_LO, MSG_ADDR);
         table.write_u32(msix::ENTRY_ADDRESS_HI, 0);
