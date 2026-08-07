@@ -10212,7 +10212,16 @@ fn main() {
         outcomes.into_iter().for_each(|o| tally.record(o));
     }
     qemu::set_width(1);
-    save_durations(known, &timed);
+    // **A sharded run may not write the profile it partitioned on.** The
+    // partition is a function of the durations file, so shards that disagree
+    // about that file disagree about who owns what — and a shard that saves
+    // moves it under its siblings. Run three shards of `nvme_` in one worktree
+    // and two of them ran `nvme_home_roundtrip` while `nvme_large_device` ran
+    // nowhere: three runs, three profiles, three different partitions. It is
+    // also a third of a measurement, which is not what this file is for.
+    if shard.is_none() {
+        save_durations(known, &timed);
+    }
 
     if !wide_reds.is_empty() {
         eprintln!("  --- re-running {} wide failure(s) alone ---", wide_reds.len());
