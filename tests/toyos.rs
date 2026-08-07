@@ -308,6 +308,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // §3.3 — a verdict that is a duration does not go in the parallel phase.
     ("dump_nmi_probe", Sched::Serial),
     ("diskless_boot", Sched::Parallel),
+    // Every verdict is a line of text or a device property, and no clock is in
+    // any of them.
+    ("virtio_net_no_msix", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
     // Its whole assertion is that a keystroke injected from the host crossed a
     // USB keyboard on the *second* controller, and `input_events_run` sends
@@ -5589,6 +5592,7 @@ fn run_machine_test(
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "dump_nmi_probe" => faults::dump_nmi_probe(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
+        "virtio_net_no_msix" => faults::virtio_net_no_msix(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
         "null_sink_shipped_client" => audio::null_sink_shipped_client(test_config, c_bins, rust_bins),
