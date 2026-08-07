@@ -4400,9 +4400,196 @@ success path `gpu::set_resolution` calls `panic_console::detach()` and never
 console for the rest of the boot. Unreachable today — GOP always refuses and
 virtio-gpu is disabled outright — and one new GPU driver away from being live.
 
-#### What the owner should run, and what each outcome means
+#### 2026-08-07, second metal round: the probe painted, and the convoy is retired
 
-**One reflash, and it answers the question this branch could not.**
+**The probe fired and painted on the T14**, over a compositor that was actively
+drawing — the two lines above it on the panel are `compositor: frames=3` and
+`frames=2`. Two backtrace frames, chain terminated, no cascade, no
+`PANIC REENTRY`. The seven-page cascade is gone on the machine the fix was
+written for, and the fatal path is now *proven* to reach that panel.
+
+**That turns the minute of silence into positive evidence, and it retires the
+chain above.** A fatal panic on that machine paints. The stick pull produced no
+paint in sixty seconds. Therefore **no CPU panicked**, therefore none spun 500M
+times on a ticket, therefore the convoy did not happen and neither did the
+stranded ticket. The chain is eliminated as *this* bug; both defects it named
+stay open on their own reading, because they are real and they are not this.
+
+**What is left is a machine whose CPUs never panic, never schedule and never
+answer an interrupt**, and there is exactly one state in this kernel that is all
+three: halted with `IF` clear. The audit, all read from the code today:
+
+- **`stub_halt_all` is `cli; 2: hlt; jmp 2b`** (`arch/idt/mod.rs`) — the only
+  permanent interrupt-deaf halt in the tree, reached only by the `0xFD` IPI,
+  which only `apic::halt_all_cpus` sends.
+- **`halt_all_cpus` sends that IPI *before* it renders.** Every sibling is
+  halted `IF`-clear at statement one; the paint is statement two. An initiating
+  CPU that does not complete `render()` leaves seven CPUs deaf forever, nothing
+  on the panel and no panic anywhere — the owner's report exactly.
+- **`paint` is latched on `PAINTING`**, so a CPU that finds another mid-paint
+  returns having painted nothing. `screen_claimed_by_userland` waits up to 2 s
+  on that same latch.
+- **Three of `halt_all_cpus`'s callers are not panics**:
+  `iommu::vtd::fault::service` — *any* DMA remapping fault stops the machine —
+  `scheduler::schedule_no_return`'s panicked-inside-a-pass arm, and `SYS_DEBUG`
+  action 3. The first is where to look first: the T14 boots with its unit
+  translating, and a device pulled mid-DMA is a way to raise a fault.
+- **Checked, and not reproducible here.** `Profile::Metal` declares
+  `IOMMU_DEFAULT`, so `usb_boot_stick_pulled` has been pulling the boot stick
+  with the unit *translating* all along and no fault fires. That makes it a
+  metal-only candidate rather than an untested one.
+- **The two `IF`-clear spinlocks have no deadlock detection at all.**
+  `log_ring::RingGuard::lock` and `serial::BackendGuard::lock` are `cli` plus an
+  unbounded CAS spin: no bound, no contention warning, no panic. `sync::Lock`,
+  which keeps interrupts *on* and is therefore survivable, has all three. **The
+  machine can detect the deadlock it could live through and cannot detect either
+  of the ones it cannot** — and a panic taken while holding `RING_LOCKED`
+  deadlocks the panic handler's own first `log!` on that CPU, `IF` already
+  clear, before it reaches `capture` or `render`.
+
+#### Boot 1, same image, 79 seconds earlier: possibly #156 on metal
+
+The compositor never came up. `spawned /bin/compositor pid=0`, soundd, netd,
+`Boot: complete (1144ms)`, every CPU joining the scheduler — and then the boot
+log, sitting there. **No probe panic fired, and by construction that means
+nothing ever claimed the framebuffer**, since `CLAIMED_AT` is written only by
+`screen_claimed_by_userland`.
+
+**What the photograph cannot say**: the panel carries the boot-complete
+checkpoint paint from ~1.15 s, so any userland output after that instant is
+absent from it either way. It cannot separate "the compositor wedged before its
+first instruction" from "the compositor exited at 1.2 s".
+
+**What the log on the stick decides, and it is one line.** Boot 1 is
+`/log/2026-08-07-114354.log`, boot 2 `/log/2026-08-07-114513.log`. Is there an
+`exit: compositor` line? If yes it left, and that is an exit to explain. If the
+process never appears again at all, that is **#156 on metal, in a boot rather
+than after minutes of desktop use** — a process spawned and never given a first
+instruction, the shape §3 has been describing from T14 logs and that nothing has
+been able to stage. Far cheaper to chase than anything else in this section.
+
+**Two readings off the same photographs that are not defects.** `i8042: armed at
+1002ms, idle at 1153ms, 0 interrupts … the pin has never asserted` appears on
+both boots: 150 ms after arming with nobody typing, that is the health line
+doing its job, and it becomes a finding only if a *later* line in a log still
+says zero. And the disk refusal works as designed — `gpt: device 1 has 4
+partitions and none of them is ours`, `this disk is not ours and nothing will be
+written to it`.
+
+#### 2026-08-07, the logs: the freeze is a *boot*, and USB is not the subject
+
+Both logs came off the stick. **The freeze reproduces at boot, with nothing
+unplugged, about one boot in two.** The two boots are 79 seconds apart on one
+image, and with timestamps stripped they differ only in the RTC reading, one
+millisecond in two phase timings, the SMP interleaving of the `CPU N: joining
+scheduler` lines, and the whole divergence: boot 2 has two `compositor: frames=`
+reports and boot 1 has none.
+
+Line-for-line identical through the framebuffer claim and past it:
+
+```
+shm: 0x4000000000 mapped WriteCombining into pid 0      1.162 s
+compositor: wallpaper 1920x1080, scaling to 1920x1080
+compositor: ready
+spawn: /bin/filepicker pid=3 … cr3=0x1a55000            1.348 s
+compositor: at most 221 windows (8 MiB each of 15402 MiB total)
+```
+
+Boot 2 continues with `frames=3 … scanout_blits=3`. **Boot 1 emits nothing
+further, ever.**
+
+**The probe's absence is what makes this the machine and not the compositor.**
+`0x4000000000` is the GOP framebuffer out of `KernelArgs`, so that `shm` line is
+the claim, and the claim is the only writer of `CLAIMED_AT`. Probe due at claim
++ 5 s ≈ 6.162 s; boot 2 panicked at **6.164 s**, confirming the mechanism to the
+millisecond. Boot 1 shows no panic on the panel or in the log, so **no CPU
+reached `probe_due()` in the idle loop after 6.16 s**. A wedged compositor with a
+live kernel would have panicked. Every CPU is spinning or halted with `IF`
+clear — the audit above, now with evidence.
+
+**Two honesty constraints on reading these logs.** A log file ends at the last
+successful flush and not at the moment of death — boot 2's own panic is absent
+from its log for exactly that reason — so boot 1's true last event may be later
+than its last line. And a *healthy* idle machine would also stop producing lines
+here, since the i8042 health line only repeats once the pin has asserted. **It is
+the missing probe panic that carries the conclusion, not the missing log lines.**
+
+**Consequences for the rest of this section.** The reproduction is a boot rather
+than ten minutes of desktop use, and **the unplug freeze may not be a USB defect
+at all** — the same machine state, with nothing pulled out. Treat "pull the
+stick" as one trigger of a general defect rather than as the subject. Everything
+above about xHCI stands as correct work and none of it is the cause.
+
+**The window is 1.35 s to about 3.35 s**, and three things happen in it: the
+compositor has just had the scanout mapped write-combining, `/bin/filepicker`
+was spawned one line earlier and is starting up, and the compositor enters its
+main loop and blits a full screen — `scanout_wr_bytes=8370176`, 8 MiB into a WC
+MMIO mapping on real hardware. Every desktop test in the suite runs that
+sequence in QEMU without freezing, so what differs is timing and the memory
+type, neither of which TCG models.
+
+#### The defect that is in that window: a TLB shootdown nobody waits for
+
+`apic::tlb_shootdown()` writes the ICR with vector `0xFE` **and returns**. There
+is no acknowledgement anywhere: `tlb::tlb_flush_entry` flushes, EOIs and
+`iretq`s, and nothing counts completions. So every caller continues on the
+assumption that its siblings have flushed, when a sibling may not do so for an
+unbounded time — a CPU inside any `cli` region takes that IPI only when it
+re-enables interrupts, and a CPU halted with `IF` clear never takes it at all.
+
+Its eight callers are exactly the operations in the window:
+`process.rs:161`, `:196` and `:588` — address-space teardown, which **frees the
+physical pages** — `syscall.rs:1443` and `:1825`, and `paging.rs:256`, `:613`,
+`:646`, which include the mapping whose *memory type* is being set. The log
+shows all three shapes inside two seconds: `exit: netd pid=2` at 1.307 tears an
+address space down, the scanout's memory type is set at 1.162, and
+`spawn: /bin/filepicker` builds one at 1.348.
+
+Two consequences, and the first is a defect on its own reading whatever the
+freeze turns out to be:
+
+- **Unmap-then-free is unsound.** A sibling holding a stale translation writes
+  into a page that has already been handed to somebody else. Nothing bounds how
+  long that window is.
+- **A page is left mapped WC on one CPU and WB in another CPU's stale TLB.**
+  That is a memory-type alias on one physical page, which Intel SDM Vol. 3A
+  §11.12.4 does not permit and for which it specifies no behaviour. It is
+  invisible to TCG, which models no memory types at all, and it is the one thing
+  in this window that can stop a machine below the software layer — no panic, no
+  schedule, no interrupt.
+
+**Eliminated on the way**: the kernel's *two* mappings of the framebuffer are
+not an alias — `gop.rs:66` and `panic_console/mod.rs:391` both map it
+`CachePolicy::WriteCombining`, so the panic console and the scanout agree.
+
+**This is a candidate and not a diagnosis.** What makes it worth ranking first
+is that it is the only mechanism found so far that is present in the window, is
+absent from QEMU by construction, and can produce the observed state without
+reaching any software error path.
+
+#### What a ninth boot should carry
+
+Not another probe — this one is a fix-shaped A/B, and it is the cheapest
+decisive experiment available. **Make the shootdown synchronous**: a per-CPU
+acknowledgement counter, the sender spinning until every online sibling has
+flushed, bounded, with a loud named failure when the bound is hit. Then eight
+boots with it against the eight without that the owner is already collecting.
+A rate that goes from about a half to zero is the answer; a rate that does not
+move eliminates the strongest candidate in one round and costs one flash.
+
+The bounded failure is half the value: a sibling that does not acknowledge
+inside the bound is a CPU that is already `IF`-clear and unreachable, and saying
+so *by name* turns the freeze's own precondition into a printed line — on a
+machine where, as of the probe, a fatal report reaches the panel.
+
+That change is not made here. It is a kernel change on the hottest correctness
+path in the tree, it wants its own gates, and this task's subject was the
+instrument.
+
+#### What the owner should run — settled
+
+**Already answered: the probe painted.** Kept as the record of what it settled.
+No further reflash for that question.
 `cargo run -- --console-boot --kernel-feature metal-panic-probe --build-only`
 (or `--diag-boot`, or the ordinary image — the probe is orthogonal to the boot
 mode). Flash it, boot to the desktop, and wait. Five seconds after a process
