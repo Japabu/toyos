@@ -4396,6 +4396,16 @@ phase landed, and none reproduces on a host running one suite.
   could be the cause: the second is symmetric and lists what *main* changed since
   the branch last merged, which reads as the branch's own work and is not.
 
+- **`xhci_hid_break`** — added 2026-08-07, in a landing gate on a branch whose
+  delta since its own previous green gate was one documentation commit. `input
+  never came back: no pointer event moved by (2560, -1920); deltas seen:
+  [(256, 256), (256, 256)]`, `ALONE … GREEN`. The two deltas it did see are the
+  boot-time absolute tablet, so what went missing is the relative mouse's event
+  after the staged break — a wall-clock margin on the recovery path, not a
+  recovery that failed. It is one of the three longest jobs in the suite by
+  `longest_first`'s own profile, so it is dispatched early and runs beside
+  everything. Still `Sched::Parallel`.
+
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
 twelve guests across every worktree. It recurred on 2026-08-07: **eight
