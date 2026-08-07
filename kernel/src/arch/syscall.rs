@@ -104,7 +104,7 @@ pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
 
-    let star = (0x10u64 << 48) | ((gdt::KERNEL_CS as u64) << 32);
+    let star = ((gdt::STAR_SYSRET_BASE as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
     cpu::wrmsr(MSR_STAR, star);
     cpu::wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
     cpu::wrmsr(MSR_FMASK, 0x40200); // mask IF (bit 9) + AC (bit 18) on SYSCALL entry

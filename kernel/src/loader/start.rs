@@ -50,13 +50,15 @@ pub(crate) extern "C" fn process_start() {
         "call {unlock}",
         "pop r13",
         "pop r12",
-        "push 0x1B",        // SS: user_data | RPL=3
+        "push {user_ss}",
         "push r13",         // RSP: user stack
         "push 0x202",       // RFLAGS: IF=1
-        "push 0x23",        // CS: user_code | RPL=3
+        "push {user_cs}",
         "push r12",         // RIP: entry point
         "iretq",
         unlock = sym crate::sched::driver::trampoline_entry,
+        user_ss = const crate::arch::gdt::USER_DS,
+        user_cs = const crate::arch::gdt::USER_CS,
     );
 }
 
@@ -73,13 +75,15 @@ pub(crate) extern "C" fn thread_start() {
         "pop r12",
         "mov rdi, r14",
         "sub r13, 8",       // ABI: RSP must be 16n+8 at function entry
-        "push 0x1B",
+        "push {user_ss}",
         "push r13",
         "push 0x202",
-        "push 0x23",
+        "push {user_cs}",
         "push r12",
         "iretq",
         unlock = sym crate::sched::driver::trampoline_entry,
+        user_ss = const crate::arch::gdt::USER_DS,
+        user_cs = const crate::arch::gdt::USER_CS,
     );
 }
 

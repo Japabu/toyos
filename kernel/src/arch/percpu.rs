@@ -12,7 +12,25 @@ const MSR_GS_BASE: u32 = 0xC000_0101;
 // GDT selectors (must match entry order)
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
+/// The two selectors a thread runs userland with. RPL 3 is part of the value.
+pub const USER_DS: u16 = 0x1B;
+pub const USER_CS: u16 = 0x23;
 const TSS_SEL: u16 = 0x28;
+
+/// `STAR[63:48]`, which `SYSRET` derives both user selectors from: SS is this
+/// plus 8 and CS is this plus 16.
+///
+/// **RPL 3 belongs in this value rather than to the CPU, because the two
+/// vendors disagree about who supplies it.** Intel's SDM forces it into both —
+/// SYSRET's operation reads `SS.Selector := (IA32_STAR[63:48]+8) OR 3` — while
+/// AMD's APM forces it into CS alone and takes SS's straight from this field.
+/// So a bare [`KERNEL_DS`] here runs every user thread on an AMD machine with
+/// `SS = 0x18`, and the first interrupt taken from one dies on the handler's
+/// `iretq`: a return to an outer privilege level requires `SS.RPL == CS.RPL`,
+/// and 0 is not 3. `#GP(0x18)`, naming the selector.
+pub const STAR_SYSRET_BASE: u16 = USER_DS - 8;
+const _: () = assert!(STAR_SYSRET_BASE + 8 == USER_DS);
+const _: () = assert!(STAR_SYSRET_BASE + 16 == USER_CS);
 
 /// 64-bit TSS (104 bytes).
 #[repr(C, packed)]

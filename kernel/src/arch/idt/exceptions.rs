@@ -205,6 +205,10 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     log!("    r10={:#018x}  r11={:#018x}", ctx.frame.r10, ctx.frame.r11);
     log!("    r12={:#018x}  r13={:#018x}", ctx.frame.r12, ctx.frame.r13);
     log!("    r14={:#018x}  r15={:#018x}", ctx.frame.r14, ctx.frame.r15);
+    // A #GP error code is a selector or it is nothing, and a selector says
+    // nothing without the segments the faulting context was running with.
+    log!("    cs={:#06x}  ss={:#06x}  rflags={:#018x}",
+        ctx.frame.cs, ctx.frame.ss, ctx.frame.rflags);
 
     log!("  Backtrace:");
     if is_user {
@@ -408,12 +412,13 @@ pub(super) fn double_fault_handler(frame: &TrapFrame) -> ! {
         let Some(maybe_rflags) = safe_read_kernel(addr + 16) else { break };
         let Some(maybe_rsp) = safe_read_kernel(addr + 24) else { break };
 
-        let valid_cs = maybe_cs == 0x08 || maybe_cs == 0x23;
+        let valid_cs =
+            maybe_cs == u64::from(percpu::KERNEL_CS) || maybe_cs == u64::from(percpu::USER_CS);
         let valid_rflags = maybe_rflags & 2 != 0 && maybe_rflags & !0x3F_FFFF == 0;
         let valid_rip = maybe_rip > 0x1000;
 
         if valid_cs && valid_rflags && valid_rip {
-            let is_user = maybe_cs == 0x23;
+            let is_user = maybe_cs == u64::from(percpu::USER_CS);
             log!("  Found interrupt frame at stack offset +{:#x}:", addr - kernel_rsp);
             log!("    rip={:#018x}  cs={:#x}  rflags={:#x}", maybe_rip, maybe_cs, maybe_rflags);
             log!("    rsp={:#018x}", maybe_rsp);
