@@ -5234,8 +5234,13 @@ the log off `/log` afterwards. **Nothing needs to be touched for the log to be
 readable**, which is the whole change:
 
 - **Heartbeats continue at ~250 ms with `alive=8/8` to the end of the file** →
-  the machine was alive when the power went off. Previously indistinguishable
-  from death.
+  the machine was still scheduling when the power went off. Previously
+  indistinguishable from death. **If the owner saw it frozen and the heartbeat
+  is still printing, that is the decisive reading**: the scheduler and the
+  interrupt layer are alive and the failure is above them — a lost wakeup, or
+  userland wedged — and every hypothesis below the software layer is out,
+  including the shootdown. That case is the one the `tone` boot below makes
+  live, and it is the whole reason the next flash is worth making.
 - **Heartbeats stop dead** → the machine stopped, at the timestamp of the last
   line ± 250 ms. That is the freeze, with a time on it for the first time.
 - **`alive=` falls one CPU at a time over several lines**, each named by a
@@ -5248,6 +5253,94 @@ readable**, which is the whole change:
 - **A `gap=` far larger than 0.250s on a line that is otherwise healthy** → the
   machine went quiet and came back rather than dying. On the eight boots above
   this was the whole file; it should now never happen.
+
+#### The `tone` boot — 86.9 s healthy, and what the heartbeat would and would not have caught
+
+`2026-08-07-174543.log`, 366 lines, ordinary desktop image with **no** heartbeat
+feature. The owner typed `tone` into a terminal, deleted a character, let it sit,
+and the machine froze; Ctrl+Alt+D did nothing afterwards. His words: *"it felt
+like it died idling."* This is the first freeze with a long healthy run, a
+precise last event, and a working control in the same capture.
+
+**Observed.** Shell at 5.08 s, compositor reporting `frames=2` every ~2 s
+throughout (a blinking cursor), PMM flat at 168/15402 MB across every 10 s
+report, every allocator tag steady. Keys counted 4 @13.4 s, 5 @28.6 s, 12
+@38.6 s (`last byte at 29115ms`), 13 @86.859 s. The log ends on three lines —
+the i8042 counter from cpu0, then `sched: cpu=5` and `sched: cpu=6`, each
+`ready=0 parked=1 current=None`. No dump lines at all, so Ctrl+Alt+D never
+began.
+
+**The control is real and it matters.** At 28.645 s a key produced the *identical
+three lines*, and the machine carried on — the compositor's next window went
+`frames=2 → 6` as the character echoed. So the last three lines of this log are
+byte-shaped like a healthy keystroke, and nothing in them is a symptom.
+
+**Correction to "died idling": the evidence says it did not.** The compositor's
+2 s reports run unbroken to the end — three of them between the 81.229 s PMM
+dump and the 86.859 s counter line, at ~1.9 s apart, exactly its healthy
+cadence. A machine that died during the 57 s of idle would have stopped
+producing those, and the log would show the gap. **It stopped at the 13th
+keystroke**, within the flush window of 86.859 s. The owner's impression is
+explained without contradicting him: he had stopped typing 57 s earlier, so from
+his side the machine had been idle, and the key he pressed to check was the one
+that coincided with the stop.
+
+**Second correction, smaller:** `ready_len`/`parked_len` are `try_with_cpu`, so
+`parked=1` is *this CPU's* count. cpu5 and cpu6 each had one parked task, and
+cpu0 reported `parked=1` at 81.229 s too — three parked tasks, not one.
+
+**Would the heartbeat have caught it? Total stoppage yes, a lost wakeup no —
+and that is the honest answer.**
+
+- If the machine stopped scheduling or stopped taking interrupts, the heartbeat
+  ends at 86.859 ± 250 ms and the mask says whether the CPUs went together or
+  one at a time. Caught, with a time on it.
+- If the failure is a **lost wakeup** — timers still firing, CPUs still taking
+  passes, a parked task never woken — every CPU still reaches the idle loop and
+  the line reads `alive=8/8` for as long as the machine sits there dead. Not
+  caught. Worse than not caught: the instrument would assert health through the
+  freeze.
+
+**But this log already argues against a lost wakeup confined to the input path.**
+The compositor wakes on its own timer to blink a cursor; it does not depend on
+the keyboard. A lost keyboard wake leaves it blinking and leaves its 2 s report
+coming. Both stopped at the same instant, so whatever failed took the compositor
+with it. That does not eliminate a *global* wake failure — every wake lost while
+timers still fire would look exactly like this and would still print `alive=8/8`
+— but it does eliminate the narrow reading.
+
+**What `diag-tick` buys this investigation anyway, and it is not small.** In this
+log cpu5 and cpu6 published their scheduler census **twice in 87 seconds** —
+at 28.645 s and 86.859 s — because `log_health` runs from the idle loop and those
+CPUs reached it only when a keystroke happened to wake them. Every other CPU's
+state across 87 s of a freeze investigation is simply absent. With the tick, all
+eight publish `ready`/`parked`/`current` every 10 s regardless of quiescence, so
+the next capture carries a whole-machine census right up to the last flush
+rather than a two-CPU sample taken at the two moments a key arrived.
+
+**The instrument's own risk, stated because it is on the suspect path.** The tick
+makes all eight CPUs run the idle loop ~10×/s where they previously halted, and
+every iteration takes `drain_serial`'s `BackendGuard::lock` — `save_and_cli`
+then an unbounded spin with no deadline and no panic (`serial.rs:97`), the one
+lock §10 calls out for exactly that. On the T14 there is no serial device so each
+hold is an empty drain, but the *acquisition rate with `IF` clear* goes from
+near-zero on an idle machine to ~80/s machine-wide. If the next boot behaves
+differently from these, that is the first thing to suspect, and it is why the
+build carrying this must not be confused with the shipping one.
+
+**What would actually detect a lost wakeup, and its price.** The signal is "a
+wake was posted and nothing consumed it", which needs the per-CPU census the
+heartbeat cannot take: `ready_len`/`parked_len` are `try_with_cpu`, a `CpuSched`
+is `!Sync`, and one CPU cannot read a sibling's queue — which is why Ctrl+Alt+D
+marks and kicks every sibling instead. The cheap shape is each CPU recording its
+own `(ready, parked, current)` beside its `TICKED` stamp in `note_pass`, and the
+heartbeat printing the collected snapshot; that turns the 10 s census into a
+250 ms one. **Not built**, and deliberately: `note_pass` runs at the top of
+`drain_irqs`, inside a pass that may already be borrowing the `CpuSched`, so
+this is a borrow question rather than a formatting one, and getting it wrong
+perturbs the machine being measured. It is worth doing *after* the next flash
+says whether the heartbeat stops, because that answer decides whether a lost
+wakeup is still a live hypothesis at all.
 
 ### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
 
