@@ -1511,6 +1511,19 @@ Gates in `src/buildlock.rs`, each watched red before and green after:
 `a_killed_build_gives_its_slot_back` (the guard handed an fd that never locked),
 `guests_and_builds_are_counted_separately` (one directory for both).
 
+**What the first bounded run showed, and what it cannot show.** 287 tests,
+700.3 s (456.3 s parallel, 212.9 s serial), on a host that was also carrying
+another worktree's suite — one running `main`, and therefore *unbounded*. Peak
+load 80.05. The bound bit: 146 `[host-builds]` lines, the longest single wait
+49.3 s, and the message names its own process (`all 4 held by 1 holder(s): pid
+10913`) because four workers of one suite is what filled it. So the mechanism
+does what it says, and **the run establishes nothing about whether four is the
+right number**: an A/B against `--host-builds 0` in that session would have
+compared a bounded suite against an unbounded peer either way. The clean
+measurement — one suite alone, four against off — is not taken here and wants a
+quiet host. Until it is, the number is the policy above and the flag is how to
+change it.
+
 ### 5.7.3 A queue is not silence
 
 `flock` gives no progress and the exclusive holds here are minutes long. Eight

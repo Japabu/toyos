@@ -3354,6 +3354,17 @@ phase landed, and none reproduces on a host running one suite.
   `desktop_typing_damage` and `desktop_locale_detect`: its verdict is the dump's
   content, but *reaching* the dump crosses a compositor, a terminal and a shell,
   and that step is a wall-clock margin. Still `Sched::Parallel`.
+- **`hda_tone`** — added 2026-08-07, hours after the test itself landed. In a
+  full run on a host carrying another worktree's suite: `2 mid-tone silences in
+  the capture: total 2 [3p×1 4p×1]`, `dither 3.3%`, `phase-breaks 92`. Alone on
+  the same tree eight minutes later: `gaps none`, `phase-breaks 16` — the
+  declared #88 failure and nothing else. It is `Sched::Serial`, so like
+  `dump_nmi_probe` the harness never re-runs it alone and the run simply reds.
+  Its `EXPECTED_FAILURES` entry covers the phase-break message alone, which is
+  why a *dropout* under load reaches the verdict, and that is correct: **do not
+  widen it.** A silence and a phase break are two different defects and an entry
+  that covered both would stop saying anything. The tree it was seen on differed
+  from main only in `src/`, so the guest image was byte-identical to main's.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
