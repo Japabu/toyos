@@ -2953,6 +2953,28 @@ The tone phase is 88 windows, none below 18116 us, against a recorded sample
 whose *worst of 30* is 10090. The two distributions are disjoint. 106654 us is
 past the `audio_tone_load.smp8` ceiling of 80000 (this guest is `--smp 8`).
 
+**Whose lateness it is, is not the same question in the two phases, and the
+`deferred` column separates them.** `deferred` counts a mix cycle declining to
+submit because a streaming client's ring was empty and there was still playout
+margin (`main.rs:894-901`) — soundd's restraint, waiting for a producer:
+
+```
+doom phase   173 deferrals across 14 of 31 windows
+tone phase     1 deferral  across  1 of 88 windows
+```
+
+Same soundd, same device, same kernel. So the doom-phase underruns are **doom
+failing to fill its ring**, held off by soundd until the floor and then paid in
+silence — not the audio path being late. The 92175 us window sits beside a
+compositor window of `frames=23` where the steady state is 65-70, so doom
+stopped presenting at the same moment it stopped producing; both recovered
+within one window. `tone` is a trivial producer and never does this.
+
+That leaves the tone phase as the clean signal, and it has `deferred` 1,
+`drains` 3 and `underruns` 0 across 88 windows — nothing wrong with the audio
+at all, and a wake-lateness figure 2-4x the recorded sample anyway. Which is
+why the measurement itself is the first thing to rule out.
+
 **Two things make this different from the three entries above**, which are all
 gate A reddening on its own configuration:
 
