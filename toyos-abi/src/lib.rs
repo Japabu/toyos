@@ -11,6 +11,7 @@ pub mod io_uring;
 pub mod net;
 pub mod ring;
 pub mod syscall;
+pub mod virtio_sound;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fd(pub i32);

@@ -21,8 +21,8 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use toyos_abi::audio::AudioCompletionRecord;
-use toyos_abi::hda::{HdaInfo, RegWidth};
-use toyos_abi::syscall::SyscallError;
+use toyos_abi::hda::HdaInfo;
+use toyos_abi::syscall::{RegWidth, SyscallError};
 use toyos_hda::stream;
 
 use super::pci::PciDevice;
