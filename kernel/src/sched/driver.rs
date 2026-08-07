@@ -599,13 +599,17 @@ fn drain_irqs() {
         }
     }
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Audio).is_some() {
+        // One wait queue for both backends: an over-wake costs a recheck, and a
+        // second queue would have to be chosen by whichever driver bound —
+        // which is a fact the parking side does not have.
         crate::audio::wake_waiters();
-        let watchers = crate::audio::io_uring_watchers();
-        if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
-                &watchers,
-                crate::io_uring::Source::Audio,
-            );
+        for (watchers, source) in [
+            (crate::audio::io_uring_watchers(), crate::io_uring::Source::Audio),
+            (crate::drivers::hda::io_uring_watchers(), crate::io_uring::Source::Hda),
+        ] {
+            if !watchers.is_empty() {
+                crate::io_uring::complete_pending_for_event(&watchers, source);
+            }
         }
     }
 }

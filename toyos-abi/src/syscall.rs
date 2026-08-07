@@ -93,6 +93,10 @@ pub const SYS_SCHED_INFO: u64 = 93;
 pub const SYS_PROCESS_STATS: u64 = 94;
 pub const SYS_SET_THREAD_NAME: u64 = 95;
 pub const SYS_SET_RT_PRIORITY: u64 = 96;
+/// Read one register of a claimed device. See [`device_reg_read`].
+pub const SYS_DEVICE_REG_READ: u64 = 97;
+/// Write one register of a claimed device. See [`device_reg_write`].
+pub const SYS_DEVICE_REG_WRITE: u64 = 98;
 
 pub const WNOHANG: u64 = 1;
 
@@ -621,11 +625,54 @@ pub enum DeviceType {
     Framebuffer = 2,
     Nic = 3,
     Audio = 4,
+    /// An Intel HDA controller the kernel has brought up but drives no policy
+    /// on. Distinct from [`DeviceType::Audio`], which is a sound card the
+    /// kernel drives on the claimant's behalf: these are two capabilities, and
+    /// a process that can drive a codec is not the same as one that can submit
+    /// a period.
+    HdaAudio = 5,
 }
 
 /// Claim exclusive access to a device.
 pub fn open_device(device: DeviceType) -> Result<Fd, SyscallError> {
     check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| Fd(v as i32))
+}
+
+/// Read one register of the device `fd` claims.
+///
+/// `offset` is a byte offset inside that device's register window. The kernel
+/// checks it against the device's read allow-list and refuses anything else by
+/// name; there is no way to name an address here and no way to reach a
+/// register the list does not carry.
+pub fn device_reg_read(
+    fd: Fd,
+    offset: u32,
+    width: crate::hda::RegWidth,
+) -> Result<u32, SyscallError> {
+    check(syscall(SYS_DEVICE_REG_READ, fd.0 as u64, offset as u64, width.bytes(), 0))
+        .map(|v| v as u32)
+}
+
+/// Write one register of the device `fd` claims.
+///
+/// The allow-list is positive and per-device: an entry is on it because its
+/// value is not an address and indexes nothing the kernel allocated. A missing
+/// entry costs a driver that cannot bring its stream up and says so, which is
+/// the failure mode a refusal list does not have.
+pub fn device_reg_write(
+    fd: Fd,
+    offset: u32,
+    width: crate::hda::RegWidth,
+    value: u32,
+) -> Result<(), SyscallError> {
+    check(syscall(
+        SYS_DEVICE_REG_WRITE,
+        fd.0 as u64,
+        offset as u64,
+        width.bytes(),
+        value as u64,
+    ))
+    .map(|_| ())
 }
 
 // Service IPC (listen / accept / connect)

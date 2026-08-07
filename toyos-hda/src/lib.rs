@@ -17,8 +17,10 @@
 extern crate alloc;
 
 pub mod caps;
+pub mod config;
 pub mod graph;
 pub mod path;
+pub mod probe;
 pub mod stream;
 pub mod verb;
 
@@ -28,4 +30,5 @@ mod fixture;
 pub use caps::{AmpCaps, ConfigDefault, GainRange, PinCaps, WidgetCaps, WidgetKind};
 pub use graph::{Codec, FunctionGroup, Widget};
 pub use path::{find_output_path, Hop, OutputPath, PathError, PinSetup};
+pub use probe::{enumerate, CodecFault, Verbs};
 pub use verb::{Address, Node, Response, Verb};

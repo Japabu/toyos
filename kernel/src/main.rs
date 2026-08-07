@@ -539,6 +539,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     if let Some((sound, audio_info)) = virtio_sound::init(&pci_devices) {
         crate::audio::register(sound, audio_info);
     }
+    drivers::hda::init(&pci_devices);
 
     if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(&pci_devices) {
         log!("GPU: using VirtIO");
