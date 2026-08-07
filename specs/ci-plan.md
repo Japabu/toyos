@@ -27,7 +27,7 @@ audio boot in this tree uses. It is out.
 **Disk is not the constraint the plan assumed.** 88 GB free on a standard
 runner against the 14 GB the brief expected, and a full bootstrap leaves 82 GB.
 
-## 2. KVM: available, and the tree cannot use it yet
+## 2. KVM: available after one chmod
 
 **The first probe read as a flat no and was not.** `/dev/kvm` exists on every
 x86_64 Ubuntu runner as `crw-rw---- root:kvm`, and the `runner` user is not in
@@ -322,21 +322,26 @@ x86 is far enough below a 14-core M4 Pro that ceilings written for the latter do
 not hold. §6 and §6.1 are 36 of the failures; every other one is the clock.
 
 So **TCG on a standard runner is not a working configuration for this suite**,
-and the shards as landed are red. Three directions, none taken here and the
-first two only worth doing if the third fails:
+and the shards as landed are red on it. Three directions, none taken here:
 
+- **Run the shards on KVM.** A native guest is fast enough that none of these
+  ceilings is marginal, and §7 — the reason they were on TCG at all — closed
+  while this was being measured. §2 argues the other way, that TCG keeps the
+  shards comparable with the dev host's numbers; that argument was written
+  before this measurement existed, and the two now have to be weighed against
+  each other. **This is the open decision**, and it is the one that decides
+  whether the guest suite can be green at all.
 - `--jobs 1` or `2` — fewer guests contending for four cores, at the cost of
   wall clock a shard already does not have.
 - Scale the ceilings by a measured host speed rather than by width, which is a
   change to `qemu::budget` and to what every ceiling in the tree means.
-- **Fix §7 and run KVM**, where a guest runs at near-native speed and the
-  ceilings are comfortable by a wide margin. This is the real answer: CI's
-  viable configuration was always the one the dev host cannot offer, and the
-  `#GP` is the whole of what stands in the way.
+
+Whichever wins, the comparison §2 wants is still available: one shard on each
+accelerator costs one extra runner and nothing else.
 
 ## 8. What CI buys that the dev host cannot
 
-- **A machine that can run these guests natively**, once §7 is closed. The dev
+- **A machine that can run these guests natively.** The dev
   host is arm64 and every guest on it is cross-arch TCG, whose distortion
   CLAUDE.md records at 1.06×–6.5× and non-uniform; the "every component within
   2× of a production OS" bar is unmeasurable there.
@@ -398,7 +403,7 @@ looks stale.
   be TCG on an arm64 host, which is what the dev host already is.
 - **`fsck.vfat`**, §6.
 - **A green guest suite.** §7.1 — the shards are red today, on timeouts rather
-  than on assertions, and the fix that matters is §7.
+  than on assertions, and the open decision is the accelerator they run on.
 - **Larger runners** were not tried. They are a billed feature even on public
   repos, so trying one is the owner's call — and §7.1 makes core count the first
   thing worth trying if KVM stays out of reach.
