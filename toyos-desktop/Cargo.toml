@@ -1,0 +1,18 @@
+# Its own workspace, like toyos-hda, toyos-keymap and toyos-ps2: `cargo test`
+# runs here on the host with no target-triple juggling, and the compositor
+# depends on it by path. Everything the desktop *decides* — where a window is,
+# what changed, what the pointer hit, who has the focus, what a key means — is
+# a pure function of state, and a QEMU boot is a poor way to ask any of them.
+[workspace]
+
+[package]
+name = "toyos-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+toyos-abi = { path = "../toyos-abi" }
+
+[lints.rust]
+warnings = "deny"
