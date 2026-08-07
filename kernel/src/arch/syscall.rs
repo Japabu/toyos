@@ -457,17 +457,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_PIPE_OPEN => sys_pipe_open(a1, a2),
         SYS_PIPE_ID => sys_pipe_id(a1 as u32),
-        SYS_AUDIO_SUBMIT => {
-            // Addressed by ambient authority, so without this any process
-            // could put whatever soundd is mid-fill on the wire and drain
-            // `tx_free_slots` out from under it. Checked here rather than in
-            // `audio::submit_buffer`, which init paths reach with no current
-            // process.
-            if !device::is_owner(device::DeviceType::Audio, process::current_process()) {
-                return SyscallError::PermissionDenied.to_u64();
-            }
-            if crate::audio::submit_buffer(a1 as usize, a2 as u32) { 0 } else { SyscallError::InvalidArgument.to_u64() }
-        }
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_GET_ENV => {
             let env = process::with_fd_owner_data(|d| d.env.clone());
@@ -692,7 +681,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // is first-come and ungated, so whoever wins the race gets the RT
             // band with it. Spec §9.4 wants a privilege; a claim is not one.
             let me = process::current_process();
-            if !device::is_owner(device::DeviceType::Audio, me)
+            if !device::is_owner(device::DeviceType::VirtioSound, me)
                 && !device::is_owner(device::DeviceType::HdaAudio, me)
             {
                 return SyscallError::PermissionDenied.to_u64();
@@ -744,34 +733,56 @@ fn sys_write(fd_num: u32, buf: &UserBytes) -> u64 {
 /// the condition is re-read, which is what closes the check-then-block window.
 enum ReadBlock {
     Pipe(alloc::sync::Arc<crate::sched::payload::KWaitQueue>, pipe::PipeId),
-    Audio,
+    VirtioSound,
     Hda,
     Keyboard(u64),
+}
+
+/// Which stub a claimed fd names, and nothing about what it drives.
+enum RegTarget {
+    Hda,
+    VirtioSound,
 }
 
 /// One register of a claimed device, read or written.
 ///
 /// The fd is the authorization and the device behind it owns the allow-list, so
-/// this function knows nothing about codecs — which is the test
+/// this function knows nothing about codecs or virtqueues — which is the test
 /// `specs/hda-driver-plan.md` §4.4 sets for it being a device-register call
-/// rather than a device protocol back in the syscall table.
+/// rather than a device protocol back in the syscall table. Two stubs answer it
+/// now, which is the first evidence for that claim rather than a restatement of
+/// it.
 fn sys_device_reg(fd_num: u32, offset: u64, width: u64, value: Option<u64>) -> u64 {
-    let Some(width) = toyos_abi::hda::RegWidth::from_raw(width) else {
+    let Some(width) = toyos_abi::syscall::RegWidth::from_raw(width) else {
         return SyscallError::InvalidArgument.to_u64();
     };
-    let claimed = process::with_fd_owner_data(|data| {
-        matches!(data.fds.get(fd_num), Some(fd::Descriptor::Hda { .. }))
+    let target = process::with_fd_owner_data(|data| match data.fds.get(fd_num) {
+        Some(fd::Descriptor::Hda { .. }) => Some(RegTarget::Hda),
+        Some(fd::Descriptor::VirtioSound { .. }) => Some(RegTarget::VirtioSound),
+        _ => None,
     });
-    if !claimed {
+    let Some(target) = target else {
         return SyscallError::NotFound.to_u64();
-    }
+    };
     match value {
-        None => match crate::drivers::hda::reg_read(offset, width) {
-            Ok(v) => v as u64,
-            Err(e) => e.to_u64(),
-        },
+        None => {
+            let read = match target {
+                RegTarget::Hda => crate::drivers::hda::reg_read(offset, width),
+                RegTarget::VirtioSound => crate::drivers::virtio_sound::reg_read(offset, width),
+            };
+            match read {
+                Ok(v) => v as u64,
+                Err(e) => e.to_u64(),
+            }
+        }
         Some(value) if value <= u32::MAX as u64 => {
-            match crate::drivers::hda::reg_write(offset, width, value as u32) {
+            let written = match target {
+                RegTarget::Hda => crate::drivers::hda::reg_write(offset, width, value as u32),
+                RegTarget::VirtioSound => {
+                    crate::drivers::virtio_sound::reg_write(offset, width, value as u32)
+                }
+            };
+            match written {
                 Ok(()) => 0,
                 Err(e) => e.to_u64(),
             }
@@ -792,8 +803,11 @@ fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
                     let desc = data.fds.get(fd_num);
                     if matches!(desc, Some(fd::Descriptor::Keyboard(_))) {
                         Err(Some(ReadBlock::Keyboard(0)))
-                    } else if matches!(desc, Some(fd::Descriptor::Audio { info_read: true, .. })) {
-                        Err(Some(ReadBlock::Audio))
+                    } else if matches!(
+                        desc,
+                        Some(fd::Descriptor::VirtioSound { info_read: true, .. })
+                    ) {
+                        Err(Some(ReadBlock::VirtioSound))
                     } else if matches!(desc, Some(fd::Descriptor::Hda { info_read: true, .. })) {
                         Err(Some(ReadBlock::Hda))
                     } else if let Some(id) = desc.and_then(|d| d.pipe_id_read()) {
@@ -815,10 +829,10 @@ fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
             Err(Some(ReadBlock::Pipe(queue, id))) => {
                 crate::scheduler::wait_until(&queue, 0, || pipe::has_data(id))
             }
-            Err(Some(ReadBlock::Audio)) => crate::scheduler::wait_until(
+            Err(Some(ReadBlock::VirtioSound)) => crate::scheduler::wait_until(
                 &crate::sched::waitqs::AUDIO,
                 0,
-                crate::audio::has_pending,
+                crate::drivers::virtio_sound::has_pending,
             ),
             Err(Some(ReadBlock::Hda)) => crate::scheduler::wait_until(
                 &crate::sched::waitqs::AUDIO,

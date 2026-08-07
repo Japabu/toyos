@@ -1,5 +1,10 @@
 use std::sync::{Arc, Condvar, Mutex};
 
+/// The amplitude a `tone` with no volume argument plays at, and the level gate
+/// A's peak window is centred on — it is not full scale, so asking for 1.0 is
+/// louder than the default rather than equal to it.
+const REFERENCE_AMPLITUDE: f32 = 16000.0;
+
 pub fn main(args: Vec<String>) {
     let freq: f32 = args.first()
         .and_then(|s| s.parse().ok())
@@ -9,7 +14,21 @@ pub fn main(args: Vec<String>) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2.0);
 
-    eprintln!("tone: {freq}Hz for {duration_secs}s");
+    let amplitude = match args.get(2) {
+        None => REFERENCE_AMPLITUDE,
+        Some(arg) => match arg.parse::<f32>() {
+            Ok(v) if (0.0..=1.0).contains(&v) => v * f32::from(i16::MAX),
+            _ => {
+                eprintln!("tone: volume must be 0.0 to 1.0, got {arg:?}");
+                std::process::exit(1);
+            }
+        },
+    };
+
+    eprintln!(
+        "tone: {freq}Hz for {duration_secs}s at amplitude {}",
+        amplitude as i32
+    );
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -40,7 +59,7 @@ pub fn main(args: Vec<String>) {
                             data[frame * channels + ch] = 0;
                         }
                     } else {
-                        let value = (phase.sin() * 16000.0) as i16;
+                        let value = (phase.sin() * amplitude) as i16;
                         for ch in 0..channels {
                             data[frame * channels + ch] = value;
                         }

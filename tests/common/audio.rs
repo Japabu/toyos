@@ -57,9 +57,10 @@ const SIGNAL_THRESHOLD: i32 = 500;
 /// band-limited far below this.
 const CLICK_DELTA: i32 = 8000;
 /// Device period: 512 period_bytes at 44.1kHz stereo 16-bit = 128 frames
-/// = 2.902ms (kernel/src/drivers/virtio_sound.rs PERIOD_BYTES). Underruns
-/// are period-quantized — the device plays silence one period at a time —
-/// so gap lengths are reported in whole periods.
+/// = 2.902ms (`toyos_abi::virtio_sound::PERIOD_BYTES`, and the HDA stub's is the
+/// same number for the same reason). Underruns are period-quantized — the device
+/// plays silence one period at a time — so gap lengths are reported in whole
+/// periods.
 pub const PERIOD_SECS: f64 = 128.0 / 44100.0;
 
 pub struct Wav {
@@ -506,13 +507,14 @@ pub fn check_counters(counters: &SounddCounters, limits: &CounterLimits) -> Vec<
 /// categorical, never a rare event to be averaged.
 ///
 /// Positions are byte offsets in the RAW serial. That is sound because every
-/// pattern below lands as one atomic chunk on the shared console: a kernel
-/// `log!` line is buffered whole and spilled once (`SerialWriter`), and each
-/// userspace pattern sits inside a single format piece of its `eprintln!`, so
-/// one `write` syscall carries it. Writers interleave BETWEEN chunks — whole
-/// foreign lines can land inside a soundd line — but never inside these
-/// patterns, and chunk order is emission order for soundd's mix thread, which
-/// emits every marker here (the kernel ones from inside its own syscalls).
+/// pattern below lands as one atomic chunk on the shared console: each pattern
+/// sits inside a single format piece of its `eprintln!`, so one `write` syscall
+/// carries it. Writers interleave BETWEEN chunks — whole foreign lines can land
+/// inside a soundd line — but never inside these patterns, and chunk order is
+/// emission order for soundd's mix thread, which emits every marker here. All
+/// four are soundd's own since H3 moved the driver into it; the two stream
+/// markers used to come from the kernel, from inside the submit syscall, and
+/// the order they appear in is unchanged.
 ///
 /// What this does NOT see is boot. The harness starts collecting at
 /// ===TEST_START and never joins the reader thread's full log

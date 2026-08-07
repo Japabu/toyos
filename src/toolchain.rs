@@ -76,7 +76,7 @@ pub fn rust_dir(root: &Path) -> PathBuf {
 
 /// The per-worktree sources that end up *inside* the shared sysroot: std links
 /// `toyos-abi` and `toyos`, and `libtoyos_c.a` is `userland/libc`.
-const SYSROOT_SOURCES: [&str; 3] = ["toyos-abi/src", "toyos/src", "userland/libc/src"];
+pub const SYSROOT_SOURCES: [&str; 3] = ["toyos-abi/src", "toyos/src", "userland/libc/src"];
 
 /// Of those, the ones a change to obliges an std rebuild.
 const STD_SOURCES: [&str; 2] = ["toyos-abi/src", "toyos/src"];
@@ -197,17 +197,36 @@ fn standing(root: &Path) -> Standing {
     let committed =
         Command::new("git").args(&ahead).current_dir(root).status().ok().and_then(|s| s.code());
 
+    if committed == Some(1) {
+        return Standing::Diverged;
+    }
+    // **A merge in progress is not this branch's statement about itself.**
+    // `--land` runs its gate against a staged, uncommitted merge of main, so
+    // every file main changed reads as local work — and a build inside that gate
+    // would be told it had standing to claim a sysroot it has no delta for.
+    // What the branch has of its own is the committed question above.
+    if merging(root) {
+        return if committed == Some(0) { Standing::MatchesMain } else { Standing::Unknown };
+    }
+
     let mut local = vec!["status", "--porcelain", "--"];
     local.extend(SYSROOT_SOURCES);
     let uncommitted = Command::new("git").args(&local).current_dir(root).output().ok();
 
     match (committed, uncommitted) {
-        (Some(1), _) => Standing::Diverged,
         (Some(0), Some(out)) if out.status.success() => {
             if out.stdout.is_empty() { Standing::MatchesMain } else { Standing::Diverged }
         }
         _ => Standing::Unknown,
     }
+}
+
+fn merging(root: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// Fingerprint the sources that get compiled into the shared sysroot.
@@ -1034,6 +1053,30 @@ mod tests {
             standing(&root),
             Standing::MatchesMain,
             "a worktree that has not merged main is not diverged from it"
+        );
+    }
+
+    /// **A landing's own merge must not look like standing.** `--land` gates a
+    /// staged, uncommitted merge of main, so every file main changed is local
+    /// work as far as `git status` is concerned — and a build inside that gate
+    /// would be told it could claim a sysroot it has no delta for.
+    #[test]
+    fn a_landing_s_uncommitted_merge_is_not_standing() {
+        let root = scratch("mid-landing");
+        git(&root, &["checkout", "-qb", "wt/idle"]);
+        fs::write(root.join("kernel/src/main.rs"), b"fn main() { loop {} }\n").unwrap();
+        git(&root, &["commit", "-qam", "work of its own, outside the witnessed trees"]);
+
+        git(&root, &["checkout", "-q", "main"]);
+        fs::write(root.join("toyos-abi/src/lib.rs"), b"pub struct A(pub u64);\n").unwrap();
+        git(&root, &["commit", "-qam", "somebody else's ABI change, landed"]);
+
+        git(&root, &["checkout", "-q", "wt/idle"]);
+        git(&root, &["merge", "--no-ff", "--no-commit", "main"]);
+        assert_eq!(
+            standing(&root),
+            Standing::MatchesMain,
+            "a landing gating its own merge of main was told it could claim"
         );
     }
 

@@ -1328,6 +1328,15 @@ the moment the process dies. Four properties are load-bearing:
 `--host-slots N` overrides the budget and `0` turns it off, which is the only
 way to measure a suite against one that has it.
 
+**It has to be `cargo test --test toyos-build -- --host-slots N`.** A bare
+`cargo test --` hands the flag to every test binary in the package, the `--lib`
+unit tests among them, and libtest refuses an unknown flag by name: `error:
+Unrecognized option: 'host-slots'`, exit 101, before the suite has started. The
+form this section and CLAUDE.md carried was the bare one, and it never worked;
+found 2026-08-07 by an A/B that failed in one second. `src/testargs.rs` cannot
+catch it — that table governs the flags the *suite* reads, and this one never
+reaches the suite.
+
 Gate A takes one slot like everything else and reserves nothing. §4.1
 constraint 4 offered a quiet-host reservation as one of three options; **the
 owner ruled on 2026-08-04 that there are no measurement locks and no quiet-host

@@ -1135,6 +1135,67 @@ emulates the segmentation and `syscall`/`sysret` paths rather than running them.
 `ci.yml`'s guest shards therefore run under TCG with a KVM canary beside them,
 so the day this is fixed is visible. `specs/ci-plan.md` §7.
 
+### CLOSED — two CPUs shooting down at once wait for each other and both panic
+
+**Closed 2026-08-07 by `wt/toyos-tlbfix`: `arch::tlb::shootdown` waited without
+ever answering, and every path that reaches it has `IF` clear.**
+`arch::syscall`'s `MSR_FMASK` masks `IF` on the `SYSCALL` gate and nothing sets
+it again before `sysretq`, so a CPU inside the wait could not take vector 0xFE
+and had no other way to acknowledge. M3 closed that class for `Lock::lock`,
+whose spin calls `arch::tlb::poll` on every turn, and enumerated the `IF=0`
+spins it thought were left; the wait itself was not on the list and is one.
+`Shootdown::wait_turn` is one turn of the wait and it answers before it asks —
+asking first lets a CPU leave on the answer it just received without ever
+publishing the generation its sibling is waiting on. Gate:
+`an_initiator_answers_while_it_waits` in `kernel-loom`, which is this entry's
+schedule written out, red on the old shape.
+
+Everything below is the evidence as it was recorded, and it is what made the
+diagnosis: two backtraces, read together, are the whole defect.
+
+Observed 2026-08-07 on `wt/toyos-h3`, whose only kernel delta from `main` is the
+audio one; the shootdown code is `c4173f0` and `318ec10`, landed the same
+afternoon. Reproduced twice inside gate A's thorough tier and once more in a
+twelve-run hunt of `cargo test -- audio_tone` — roughly one boot in five of that
+family. **The machine goes down**, so it is a double kernel panic, not a test
+failure.
+
+```
+[kernel 8.597 cpu4 tid=1] !!! PANIC !!!: panicked at src/arch/tlb.rs:133:42:
+  tlb: cpu 0 has not flushed for generation Generation(2) in 5000000000ns — it is not taking interrupts
+    kernel::arch::tlb::shootdown+0x1dc
+    drop_glue::<Vec<kernel::mm::unmapped::Unmapped<kernel::process::PageAlloc>>>
+    kernel::process::thread_exit+0x61b
+  Running: pid=2 test_rs_audio_tone, syscall num=5 (SYS_THREAD_EXIT)
+
+[kernel 8.599 cpu0 tid=0] !!! PANIC !!!: panicked at src/arch/tlb.rs:133:42:
+  tlb: cpu 4 has not flushed for generation Generation(3) in 5000000000ns — it is not taking interrupts
+    kernel::arch::tlb::shootdown+0x1dc
+    kernel::arch::syscall::sys_release_shared+0x9a
+  Running: pid=0 soundd, syscall num=39 (SYS_RELEASE_SHARED)
+```
+
+**Read the two together: cpu4 is waiting for cpu0 and cpu0 is waiting for cpu4.**
+Each is inside `shootdown`'s `wait_for`, each spinning on the other's flush
+acknowledgement, and each times out at the 5 s deadline. Neither is serving the
+other's IPI while it waits. The generations differ by one, which is the two
+initiators having taken `SHOOTDOWN`'s sequence in opposite order.
+
+The workload is ordinary and is not audio's: a thread exiting and freeing its
+unmapped pages on one CPU, while another process releases a shared-memory region
+on another. soundd's client stream ring is the region here only because that is
+what the audio tests run.
+
+**Attribution, and its limit.** No frame in either backtrace is in code the audio
+branch touched, and gate A's A arm — 60 audio boots of `80fe031`, which predates
+both shootdown commits — never produced it. That is strong and it is not a
+bisect; whoever takes this should confirm against `5ef66f0` (main immediately
+before the audio landing, with the shootdown work and without it).
+
+**What it costs right now**: gate A's thorough tier cannot complete a run on any
+tree carrying it, because a panicked guest is scored as an instrument failure and
+the tier stops. That blocked H3's own A/B (§4).
+
 ### `Lock::lock`'s spin is the half of the ticket lock loom cannot reach
 
 `kernel-loom` compiles `kernel/src/sync.rs` a second time against loom's
@@ -2524,6 +2585,112 @@ keeping up.
 
 ## 4. Audio and soundd
 
+### OPEN, UNASSIGNED — `hda_tone` is red on `main` for a reason `#88`'s exemption does not cover
+
+`cargo test -- hda_tone` on `main` at `6d11938`, alone, 2026-08-07 18:5x:
+
+```
+FAIL hda_tone: 1 mid-tone silences in the capture: total 1 [1p×1]
+  FAIL  hda_tone  (15s)  — listed against #88, and this is not that failure:
+        the entry covers ["the captured tone is not one sine"]
+```
+
+The `EXPECTED_FAILURES` entry does what it is supposed to: it pins the assertion
+rather than the test, so a *second* defect in the same test still reds the run
+and says which. What is red is the mid-tone-silence assertion — a gap in the
+capture, which is gate A's harm verdict — and not #88's spectral one. So any
+landing whose gate is `cargo test` is currently red on `main` for this, and an
+agent will read it as theirs.
+
+Found while landing task #98/#12: the same test failed identically inside that
+landing's gate, and the A/B against `main` in the same session is what
+identified it as `main`'s. Assigning it needs whoever owns H3 —
+`5fdfeb7`/`a022811` ("wip: H3, the virtio-sound stub and its userland driver")
+landed hours before this measurement.
+
+### CLOSED as to its cause, OPEN as to the landing — the wide phase reds on a five-second TLB stall
+
+**The signature's cause is closed: §3, two CPUs shooting down at once.** It was a
+mutual wait and not a bound, so no deadline value was ever going to fix it; the
+wait now answers before it asks. What that does *not* do is make `cargo test`
+reliably green, and this section stays open for the part it does not reach.
+
+**The wide phase still reds, on a different class, and this signature did not
+reproduce here at all.** Measured 2026-08-07 on `wt/toyos-tlbfix`, four full
+suites and 96 guest boots of the audio family, **zero `tlb:` lines in any of
+them** — including 50 boots on a kernel with the fix reverted, where the H3
+agent's twelve-run hunt had found it in roughly one boot in five. So the rate
+this defect ran at earlier in the day is not the rate it runs at now, and no
+measurement taken here can be read as the fix having lowered it. The fix rests
+on §3's two backtraces and on `an_initiator_answers_while_it_waits`, which is
+red without it.
+
+| run | wall | verdict |
+|---|---|---|
+| before the fix | 576.3 s | 4 red: `metal_sim_compositor_stall`, `metal_sim_client_death`, `screen_blocked_dump` (all `ALONE: GREEN`), `audio_tone (smp=8)` |
+| after, 1 | 559.3 s | 2 red: `i8042_mouse`, `desktop_audio_client` — 385 s wide against 13 s alone — both `ALONE: GREEN` |
+| after, 2 | 182.7 s | **clean, 289/289**, on a host that was briefly quiet |
+| after, 3 | 704.7 s | 1 red: `screen_blocked_dump`, `ALONE: red again` |
+
+Every one of those reds is the parallel-red list in §7, not this entry: the two
+that name a duration are the contention class, and the one clean run is the one
+whose host was idle. **A landing is still a coin toss and the reason is now
+squarely §7**, whose own last paragraph says a verdict that flips with the host
+is measuring the host. `audio_tone (smp=8)`'s `suspend structure: no
+'soundd: suspended' after the last client removal` fired 2 of 12 on the reverted
+kernel and 0 of 12 on the fixed one, which at n=12 is not a difference and has
+no mechanism behind it — recorded so the next person does not read it as one.
+
+What follows is the evidence as it was recorded on `wt/toyos-boot`, and it is
+what pointed at §3.
+
+Measured 2026-08-07 across two `--land` gates on `wt/toyos-boot` (289 tests
+each) and five A/B runs against `main` at `6d11938`, all in one session.
+
+Seven distinct tests failed between the two gates —
+`null_sink_shipped_client`, `metal_sim_window_caps`,
+`metal_sim_ipc_hostile_peer`, `metal_sim_compositor_stall`,
+`metal_sim_client_death`, `desktop_window_child`, and an `hda_tone` that is the
+entry above. **Every one of their captures carries the same two lines**, with
+different generation numbers:
+
+```
+tlb: cpu 1 has not flushed for generation Generation(69) in 5000000000ns
+     — it is not taking interrupts
+tlb: cpu 0 has not flushed for generation Generation(68) in 5000000000ns
+     — it is not taking interrupts
+```
+
+And every one of them **passes alone, on both trees**:
+
+| test | in the wide phase | alone on the branch | alone on `main` |
+|---|---|---|---|
+| `null_sink_shipped_client` | FAIL, 10 s | PASS, 4 s | PASS, 5 s |
+| `metal_sim_window_caps` | FAIL, 5 s (three times) | PASS, 3 s | PASS, 36 s |
+
+`metal_sim_window_caps` is the clearest: its own work *completes* —
+`window caps: oversized refused, 62 windows granted then refused` — and the
+process then exits `-1` after two CPUs have each stalled five seconds. 62
+windows created and destroyed is 62 rounds of unmapping, which is exactly what
+`arch::tlb::shootdown` is on the path of. `null_sink_shipped_client`'s round 1
+took 6.14 s for a 3 s tone and its round 2 then panicked in
+`toybox/src/tone.rs:85` on `failed to open audio stream: NotFound`.
+
+So the branch is not the variable. The shootdown wait landed on `main` the same
+day (`318ec10`, `c4173f0`) and **its own diagnostic is what named the stall**, so
+the instrument is already in the tree.
+
+The reading that "the load is the variable" was the wrong half of it, and worth
+keeping as the mistake it was: load is what made two unmaps overlap, and the
+overlap was fatal by construction. The generations here differ by one — `68` and
+`69` on two CPUs of a two-CPU guest — which is the same pair of initiators §3's
+backtraces name.
+
+**Not to be re-run away**: the owner's 2026-08-04 ruling is that a
+load-coincident failure is a real defect, and this one reproduced across two
+full runs with seven different victims. That ruling is what produced this entry
+instead of seven re-runs, and it is what the fix came out of.
+
 ### OPEN, UNASSIGNED — gate A's thorough tier is red on `main`, and the recorded dropout sample is what it disagrees with
 
 Measured 2026-08-07 on `main` at `c0365ea`, in one session, three arms:
@@ -2824,6 +2991,54 @@ window at all used to be a ceiling breach — which under a harm verdict would h
 passed — so it moved to the instrument-broken set, fatal in both tiers. It was
 also the one breach that could enter the thorough tier's sample as a run of
 all-zero counters, i.e. as the best run ever measured.
+
+### OPEN — gate A's *thorough* tier reds on an unmodified `main`, and that is the rate the entry below asked for
+
+The entry below says "whoever takes it should get the rate first — the thorough
+tier (`--audio-gate N`) is the instrument". H3's session got it, and the
+instrument reds on the tree it is supposed to certify.
+
+`cargo test --test toyos-build -- --audio-gate 30` on `80fe031` — **main's tip,
+no delta at all**, run as H3's A arm before that branch existed:
+
+```
+[gate A] FAILED after 15 of 30 iterations (the remaining runs cannot change this):
+    pooled dropout rate: 10 of 120 vs recorded 0 of 120 (Fisher p=8.03e-4 <= 1e-3)
+```
+
+The ten, by config and iteration: `audio_tone_load smp=1` at 4, 9, 13, 15;
+`audio_tone_load smp=8` at 9, 13, 14; `audio_tone smp=8` at 8, 9;
+`audio_tone smp=1` at 13. So **`audio_tone` at both widths reds too**, which the
+entry below had only established for `audio_tone_load`.
+
+**The load correlation is the wrong way round, and that is the finding.** The
+1-minute average across the run spanned 7.2 to 19.1 on 14 cores, with one to
+five other guests and six other `toyos-build` processes throughout. The clean
+early iterations ran at 19.1 and 16.8; the three worst — 13, 14 and 15 — ran at
+11.4, 10.6 and 11.9. Every dropout carried a wake latency of 33-117 ms against
+5-17 ms on the clean runs, which is the same "soundd was not scheduled"
+signature as the two entries below.
+
+What this changes for anyone reading them: the intermittency is not a property
+of one config, and it is **large enough to fail the thorough tier's own pooled
+test on a clean tree**. A stage transition that gates on this tier
+(`specs/scheduler-core-spec.md` §11, and H3 itself) cannot presently tell its
+own change from this. H3 therefore compared its two arms against *each other*
+rather than against the recorded sample, and said so.
+
+The recorded sample in `tests/audio-baseline.toml` is 0/120 and was taken in a
+session this host no longer resembles. **Re-recording it is not licensed by this
+entry** — a baseline widened to accept the defect is the defect made permanent.
+What is needed is the cause.
+
+**The B arm was never obtainable, and the reason is §3's shootdown deadlock.**
+Two attempts on the audio branch stopped at iterations 2 and 4, both on
+`audio_tone.smp8`, both with the tier's "instrument broken" verdict — which is
+what a guest whose kernel double-panicked looks like from here. Those commits
+landed between the two arms and `--land` merged them in, so the arms differ by
+more than the change under test and no comparison between them means anything.
+What H3 has instead: a full suite green at 289/289 with all four audio configs
+clean, and ten standalone runs of the audio family. None of that is a rate.
 
 ### OPEN — `audio_tone_load (smp=1)` fails gate A's fast tier intermittently, on both trees
 
@@ -3261,6 +3476,87 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
+### The page cache owns one device, and `usb_storage.rs` says it does not
+
+`page_cache.rs:11-12` holds exactly one
+`BLOCK_DEV: Lock<Option<Box<dyn BlockDevice>>>`, `page_cache::init` takes
+ownership of the NVMe device, and `PageCache::_device_id` is written at
+construction and read nowhere. So `usb_storage.rs:14-17`'s comment — *"NVMe
+takes 1; the page cache keys itself on this, so two devices sharing a number
+would serve each other's blocks"* — describes a mechanism that does not exist.
+The numbers are right and the keying is not.
+
+`fat32_adapter.rs:911-915` states the live consequence and does not work around
+it: a machine that boots off an **internal** disk gets neither `/boot` nor
+`/log`, "because the NVMe device is owned by the page cache from the moment
+storage comes up and there is no second handle to it". `/boot` and `/log` work
+on the T14 and in QEMU only because the boot medium is USB, and
+`usb_storage::open` mints a fresh handle per call.
+
+This is the real cost of `specs/boot-image-split.md` stage 2: a bcachefs root on
+the boot medium needs a `BlockIO` over an arbitrary `BlockDevice` at a partition
+offset with a cache of its own, where `PageCacheBlockIO` *is* the NVMe device by
+construction. Found 2026-08-07 while pricing that stage — the 2026-07-29 version
+of that document listed this as one of eight items a USB storage driver would
+have to bring, and it is the one that did not arrive with it.
+
+### Nothing gates doom's music, and one commit removed the SoundFont for a cycle
+
+`assets/timgm6mb.sf2` is 5,994,284 bytes, `.gitignore` line 3 excludes it on
+purpose, and `userland/doom/src/sound.rs:511` opens it as
+`/share/timgm6mb.sf2`. `b34a69c` filtered the asset sweep to what git tracks and
+took it out of every image; the full suite was green with it and without it,
+`doom_sound_flood` included — that actuator "synthesises its own sound and never
+opens the WAD or the soundfont". The only evidence anywhere was one
+`assets: skipping` line in the build output.
+
+`fdcaa0b` restored it and made a declared-but-absent asset a hard error, so the
+*file* is gated now. What is still ungated is the **music**: nothing asserts
+doom's synthesiser produced anything, so a defect between the SoundFont and the
+sink is invisible to `cargo test`. Gate A measures the test tone and doom's
+sound-stress actuator; neither is the music path.
+
+### No test boots the config the project ships
+
+`system.toml` is what `cargo run` builds and what a stick is flashed with, and
+the harness boots none of it: `tests/testcases`, `desktopcase`,
+`desktopaudiocase`, `doomcase` and `metalcase` are each their own config, and
+`screen_diag_boot` / `screen_console_shell` boot `diag/` and `console/`. So the
+shipping image's init list, its `hosted-rustc` setting and its program list are
+exercised only by the owner running `cargo run`, which agents are told not to
+do. The one gate on that file is `no_shipped_boot_config_starts_sshd`, which
+reads it rather than booting it.
+
+Noticed 2026-08-07 while landing `hosted-rustc = false`: that change alters only
+`system.toml`, so no suite test could go red for it in either direction.
+
+### `debug = true` produces no debug info, because the linker drops it
+
+`toyos-ld` matches `SectionKind::Debug | DebugString | Linker | Note | Metadata`
+and `continue`s (`collect.rs:410-416`), so **no binary this project produces has
+a `.debug_*` section**. Verified with `readelf -S` on the kernel, the compositor
+and toybox: the sections are `.text .strtab .symtab .rela.dyn .data
+.eh_frame_hdr .dynamic .shstrtab` and nothing else.
+
+`[profile.toyos]` states `debug = true` in every crate root, so rustc emits
+DWARF into every object file and the linker throws all of it away. The cost is
+compile time and has not been measured. The consequence for diagnostics is that
+a backtrace can carry a **name** and never a line number or an inlined frame, on
+any path — `.symtab`/`.strtab` is the whole of what survives, and it is 32.2% of
+the 92,138,384 bytes of ELF this tree ships. Keeping `.debug_line` in `toyos-ld`
+is what would change that, and it is not planned.
+
+### `userland/libc` is the one guest artifact built without overflow checks
+
+`src/libc.rs` passes `--release`, so the C runtime std links into every userland
+binary has `overflow-checks` and `debug-assertions` off while everything around
+it has them on. Deliberate on two grounds — CLAUDE.md gives the POSIX
+compatibility layer explicitly relaxed rules, and `libc::build` is gated on
+`stamps::dir_changed` over the *source* directory, so changing the flag alone
+would not rebuild the installed archive and the manifest would then claim
+something the artifact does not have. Recorded so that "one profile, applied
+consistently" is not read as covering it.
+
 ### CLOSED — `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
 
 `toolchain::standing` asks `git diff --quiet main -- toyos-abi/src toyos/src
@@ -3440,6 +3736,12 @@ phase landed, and none reproduces on a host running one suite.
   `desktop_typing_damage` and `desktop_locale_detect`: its verdict is the dump's
   content, but *reaching* the dump crosses a compositor, a terminal and a shell,
   and that step is a wall-clock margin. Still `Sched::Parallel`.
+- **`screen_console_scroll`** — added 2026-08-07. `round 1: the guest never
+  printed CHURN-DONE 0 100`, **598 s** in the wide phase, `ALONE … GREEN`. The
+  landing gate it killed ran 778.9 s with four other `--land` processes on the
+  host, on a branch whose whole delta was two documentation lines. 598 s against
+  a phase that is ~45 s on a quiet host is the finding; the message is not.
+  Still `Sched::Parallel`.
 - **`hda_tone`** — added 2026-08-07, hours after the test itself landed. In a
   full run on a host carrying another worktree's suite: `2 mid-tone silences in
   the capture: total 2 [3p×1 4p×1]`, `dither 3.3%`, `phase-breaks 92`. Alone on
@@ -3451,6 +3753,13 @@ phase landed, and none reproduces on a host running one suite.
   widen it.** A silence and a phase break are two different defects and an entry
   that covered both would stop saying anything. The tree it was seen on differed
   from main only in `src/`, so the guest image was byte-identical to main's.
+  **Three times the same day**, all three in landing gates of that one
+  build-system branch and all three confirmed alone within ten minutes: `2
+  mid-tone silences`, then `1 mid-tone silence`, `gaps none` alone every time,
+  with three to five other `--land` processes on the host. Ask
+  `git diff main...HEAD` and never `git diff main` when checking whether a tree
+  could be the cause: the second is symmetric and lists what *main* changed since
+  the branch last merged, which reads as the branch's own work and is not.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
@@ -3610,6 +3919,16 @@ entry deliberately covers only "the desktop ceased to answer after a window
 closed", and this message names a shell that never answered in the first place,
 so the run reds on the very test the exemption exists for and for a reason the
 exemption is right to exclude.
+
+**And it is what is left after the TLB deadlock closed.** Four full suites on
+`wt/toyos-tlbfix` on 2026-08-07, one before that fix and three after: the reds
+were `metal_sim_compositor_stall`, `metal_sim_client_death`,
+`screen_blocked_dump`, `i8042_mouse`, `desktop_audio_client` (385 s wide against
+13 s alone) and `screen_blocked_dump` again — six of the seven `ALONE: GREEN`,
+every one of them this entry. The one clean 289/289 run is the one whose suite
+took **182.7 s**; the three red ones took 559, 576 and 705. That is the whole
+correlation, and it says the remaining landing blocker is this section rather
+than anything in the kernel.
 
 ### A whole parallel phase can be starved by another agent's build
 

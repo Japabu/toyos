@@ -422,10 +422,18 @@ rtc-century-next = []
 # UTC never runs. See `clock::init_wall`.
 rtc-zone-east = []
 
-# debug-assertions and overflow-checks stay on: fail-fast beats speed here.
-[profile.dev]
+# The one profile every guest binary is built with — `specs/boot-image-split.md`
+# §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
+# debug-assertions and overflow-checks on, because fail-fast beats speed here
+# and both crafted-ELF kernel panics in `specs/known-issues.md` were *found* by
+# an overflow check. `--release` would turn the last two off silently, so this
+# build system no longer has the flag.
+[profile.toyos]
+inherits = "dev"
 opt-level = 2
 debug = true
+debug-assertions = true
+overflow-checks = true
 
 [dependencies]
 bcachefs = { path = "../bcachefs", default-features = false }

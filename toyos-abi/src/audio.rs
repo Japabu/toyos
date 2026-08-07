@@ -1,53 +1,18 @@
-//! Audio device info and shared memory protocol types.
+//! What a completion is, and the shared memory protocol soundd serves clients.
 
 use core::sync::atomic::AtomicU32;
 
-/// Audio device info returned when claiming the audio device.
-///
-/// The padding is spelled out because `as_bytes` hands this whole struct to
-/// userland. `repr(C)` puts three bytes after each `u8` to realign the `u32`
-/// that follows, and a struct literal never writes them — so six bytes of
-/// whatever the kernel stack held at that moment crossed the boundary on every
-/// read. Naming them makes them ordinary fields that the initializer has to
-/// fill, and the assertion below is what keeps a future field from
-/// reintroducing a gap.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct AudioInfo {
-    pub dma_token: u32,
-    pub buf_offsets: [u32; 8],
-    pub num_buffers: u8,
-    pub _pad0: [u8; 3],
-    pub sample_rate: u32,
-    pub channels: u8,
-    pub _pad1: [u8; 3],
-    pub period_bytes: u32,
-}
-
-/// Every byte of `AudioInfo` belongs to a field. If the sum below stops
-/// matching `size_of`, the compiler has inserted padding again and `as_bytes`
-/// is publishing uninitialised memory.
-const _: () = {
-    let named = 4 + 32 + 1 + 3 + 4 + 1 + 3 + 4;
-    assert!(core::mem::size_of::<AudioInfo>() == named);
-};
-
-impl AudioInfo {
-    pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            core::slice::from_raw_parts(self as *const Self as *const u8, core::mem::size_of::<Self>())
-        }
-    }
-}
-
 /// One batch of DMA buffer completions, recorded at interrupt time.
 ///
-/// Reads on the audio fd (after the initial `AudioInfo` read) return an
-/// array of these: the kernel writes as many pending records as fit in the
-/// caller's buffer and returns the byte count. Each record is one completion
-/// interrupt: `mask` bit N set means DMA buffer N finished playback, and
-/// `timestamp_nanos` is `nanos_since_boot` captured in the interrupt handler
-/// — the clock source for soundd's DLL. Records are returned oldest-first.
+/// Reads on a sound device's fd (after the initial info read) return an array
+/// of these: the kernel writes as many pending records as fit in the caller's
+/// buffer and returns the byte count. `mask` bit N set means period N finished
+/// playing, and `timestamp_nanos` is `nanos_since_boot` captured in the
+/// interrupt handler — the clock source for soundd's DLL, and the reason the
+/// mask is derived there rather than by the driver at wake time. Records are
+/// returned oldest-first.
+///
+/// Both stubs produce it, so the two backends differ in nothing a mixer sees.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AudioCompletionRecord {
@@ -60,8 +25,8 @@ impl AudioCompletionRecord {
     pub const SIZE: usize = core::mem::size_of::<Self>();
 }
 
-/// Same rule as `AudioInfo`: this one crosses the boundary too, and its `_pad`
-/// is the reason it has no gap today.
+/// Every byte belongs to a field. This crosses the boundary, and `_pad` is why
+/// there is no gap for whatever the kernel stack held to travel in.
 const _: () = assert!(AudioCompletionRecord::SIZE == 4 + 4 + 8);
 
 /// Shared memory header for the client↔soundd slot-ring protocol.
