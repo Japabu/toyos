@@ -1,20 +1,29 @@
 mod device;
 mod hid;
 mod legacy;
-mod msc;
+mod wait;
+
+use wait::msc;
+
+/// The driver's whole surface to the rest of the kernel. Everything that waits
+/// lives under [`wait`] — see its own documentation for why that is a module
+/// boundary and not a type.
+pub use wait::boot::{init, PORT_POLL_NS, PORT_SETTLE_CEILING_NS};
+pub use wait::msc::{storage_flush, storage_read, storage_write};
 
 use alloc::vec::Vec;
 use core::num::NonZeroU8;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use crate::mm::Mmio;
+use crate::mm::KernelSlice;
+use crate::log;
 use super::pci::PciDevice;
 use super::DmaPool;
-use crate::mm::paging::CachePolicy;
-use crate::log;
-use crate::mm::KernelSlice;
 use crate::sync::Lock;
+use toyos_xhci::job::{Await, Outcome, Outstanding, Stages};
 use toyos_xhci::port::{self as portmachine, GaveUp, Gone, PortState, Reset, Step};
+use toyos_xhci::recovery::{self, Act, EndpointState, NeedsConfigure, Recovery};
 use toyos_xhci::Protocols;
 use toyos_xhci::Portsc;
 
@@ -165,124 +174,121 @@ impl core::fmt::Display for Completion {
     }
 }
 
-/// How one control transfer ended.
+/// What the controller's answer to the one outstanding operation is *for*.
 ///
-/// `Done` carries the bytes the device actually moved, because the completion
-/// code cannot say: the Status Stage reports Success whether the Data Stage
-/// filled the buffer or left it untouched. A `GET_DESCRIPTOR` that returned
-/// nothing and one that returned all 18 bytes were the same value here, and the
-/// caller printed the buffer either way — which is how a T14 port that answered
-/// no descriptor at all was logged as `class=0x0 vendor=0000 product=0000`.
-///
-/// Three variants and no `Option`: the old `Option<u32>` had no code to carry
-/// on the one path where the device never answered, so every failure line read
-/// `code=Some(4)` and the reader had to know that `None` meant a timeout.
-#[derive(Clone, Copy)]
-enum Control {
-    /// Both stages completed. `delivered` is what the device moved in the data
-    /// stage, and zero for a transfer that has none.
-    Done { delivered: u16 },
-    /// The controller reported `code` for the named stage.
-    Failed { stage: &'static str, code: u32 },
-    /// The named stage never completed inside [`USB_TIMEOUT_NS`].
-    Silent { stage: &'static str },
+/// Every variant is work the driver used to do by spinning inside a scheduler
+/// pass, which is what pulling the boot stick out of a T14 runs.
+enum What {
+    /// Disable Slot, and what stops being reachable once it has completed.
+    SlotGone { slot: u8, then: AfterSlot },
+    /// One step of a HID interrupt endpoint's way back to Running. The
+    /// sequence travels with the wait because the step after this one is a
+    /// function of where it started, and nothing else holds that; `issued`
+    /// travels with it because a failure has to name the command, and by the
+    /// time one is read the pass that sent it has long returned.
+    Recovering { slot_id: u8, seq: Recovery, issued: &'static str },
+    /// Enable Slot for a port that has finished its reset. Its own variant
+    /// because until the controller answers there is no device: no slot id, no
+    /// pool block and no EP0 ring, and every act after this one carries all
+    /// three.
+    SlotWanted { port_idx: u8, speed: u8, packet: u16, seq: toyos_xhci::enumerate::Enumeration },
+    /// One act of a device's enumeration.
+    Enumerating(device::Enumerating),
 }
 
-impl Control {
-    /// Whether the device both finished the transfer and moved everything that
-    /// was asked of it. The two halves are one question for a descriptor read
-    /// and the caller has no use for them apart.
-    fn moved(self, wanted: u16) -> bool {
-        matches!(self, Self::Done { delivered } if delivered >= wanted)
-    }
+/// What the controller said about one outstanding operation, for the line a
+/// refusal produces. Every failure in this driver reads the same way whether
+/// the controller answered badly or not at all, and the difference is what a
+/// person reaching for the specification needs first.
+struct Answer(Outcome);
 
-    /// Whether the transfer completed, for the requests that carry no data
-    /// stage and so have no byte count to check.
-    fn done(self) -> bool {
-        matches!(self, Self::Done { .. })
-    }
-}
-
-impl core::fmt::Display for Control {
+impl core::fmt::Display for Answer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Done { delivered } => write!(f, "{delivered} B delivered"),
-            Self::Failed { stage, code } => write!(f, "{stage} stage completion {}", Completion(*code)),
-            Self::Silent { stage } => write!(
-                f,
-                "no answer to the {stage} stage in {} ms",
-                USB_TIMEOUT_NS / 1_000_000
-            ),
+        match self.0 {
+            Outcome::Command { code, .. } | Outcome::Transfer { code, .. } => {
+                write!(f, "{}", Completion(code))
+            }
+            Outcome::Silent => {
+                write!(f, "no answer in {} ms", USB_TIMEOUT_NS / 1_000_000)
+            }
         }
     }
 }
 
-/// What the controller believes about one endpoint, out of the Endpoint State
-/// field of its *output* context (xHCI 1.2 Table 6-8, dword 0 bits 2:0).
+/// Why a slot was given back, which is what decides what goes with it.
+enum AfterSlot {
+    /// A port's device has left the bus. Its pool blocks belong to the next
+    /// device the moment the slot does, and the port becomes one the machine
+    /// may enumerate again.
+    Teardown(u8),
+    /// A device this driver gave up on while it is still in its port, so the
+    /// port stays marked attached — see [`XhciController::let_go`].
+    LetGo,
+}
+
+/// The earlier of two instants something wants to be looked at again.
+fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (at, None) | (None, at) => at,
+    }
+}
+
+/// Put one control transfer's TRBs on an EP0 ring, and say whether it carries
+/// a data stage — which is what decides how many completions it produces and
+/// therefore what a caller has to wait for.
 ///
-/// Read rather than inferred from whatever ended the transfer, because the two
-/// disagree exactly where it matters: a transfer the driver abandoned on its
-/// deadline leaves no completion code at all and an endpoint that is still
-/// Running, and a Reset Endpoint aimed at one of those is the Context State
-/// Error a T14 answered twice before calling its own boot disk offline.
-#[derive(Clone, Copy, PartialEq)]
-enum EndpointState {
-    Disabled,
-    Running,
-    Halted,
-    Stopped,
-    /// 4 is Error, 5-7 are reserved and no xHC should report one. Neither has a
-    /// way back that does not re-run Configure Endpoint, so they are one case
-    /// here — and the number is carried because it is what the refusal names.
-    Unusable(u8),
-}
+/// Separate from the wait because the two ends have different callers: an
+/// endpoint recovery stepped across scheduler passes submits here and comes
+/// back for the completion, and every other control transfer in this driver
+/// waits for it in place.
+fn enqueue_control(
+    ring: &mut TrbRing,
+    bm_request_type: u8,
+    b_request: u8,
+    w_value: u16,
+    w_index: u16,
+    data_buf: Option<u64>,
+    data_len: u16,
+) -> bool {
+    let is_in = (bm_request_type & 0x80) != 0;
+    let has_data = data_len > 0 && data_buf.is_some();
+    let trt = if !has_data { 0u32 } else if is_in { 3 } else { 2 };
 
-impl EndpointState {
-    fn decode(raw: u32) -> Self {
-        match raw & 0x7 {
-            0 => Self::Disabled,
-            1 => Self::Running,
-            2 => Self::Halted,
-            3 => Self::Stopped,
-            other => Self::Unusable(other as u8),
-        }
+    let mut setup = Trb::ZERO;
+    setup.param = setup_packet(bm_request_type, b_request, w_value, w_index, data_len);
+    setup.status = 8;
+    setup.control = TRB_SETUP_STAGE | (1 << 6) | (trt << 16);
+    ring.enqueue(setup);
+
+    if let Some(buf) = data_buf.filter(|_| has_data) {
+        let mut data = Trb::ZERO;
+        data.param = buf;
+        data.status = data_len as u32;
+        let dir = if is_in { 1u32 << 16 } else { 0 };
+        // ISP and IOC, which this TRB carried neither of. Without IOC the data
+        // stage produces no event at all and the only thing the driver ever
+        // sees is the status stage's Success; without ISP a device that answers
+        // short is not required to say so. Between them the two are the whole
+        // of "how many bytes are actually in that buffer", and a descriptor
+        // read has no other way to ask.
+        data.control = TRB_DATA_STAGE | dir | (1 << 2) | (1 << 5);
+        ring.enqueue(data);
     }
+
+    let mut status = Trb::ZERO;
+    let status_dir = if has_data && is_in { 0 } else { 1u32 << 16 };
+    status.control = TRB_STATUS_STAGE | (1 << 5) | status_dir;
+    ring.enqueue(status);
+    has_data
 }
 
-impl core::fmt::Display for EndpointState {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Disabled => f.write_str("Disabled"),
-            Self::Running => f.write_str("Running"),
-            Self::Halted => f.write_str("Halted"),
-            Self::Stopped => f.write_str("Stopped"),
-            Self::Unusable(n) => write!(f, "endpoint state {n}"),
-        }
-    }
-}
-
-/// One endpoint, as [`XhciController::restart_endpoint`] needs to see it.
-///
-/// A struct because the two callers hold their endpoints in different shapes —
-/// a disk's bulk pair live in a mass-storage pool block and a HID's interrupt
-/// endpoint in a device block — and the recovery needs both the block the
-/// controller writes the *output context* into and the place the ring's memory
-/// is. Passing them positionally is six numbers whose order is the whole
-/// contract.
-struct Restart<'a> {
-    slot_id: u8,
-    /// The device block whose output context carries this endpoint's state.
-    ctx_block: usize,
-    dci: u8,
-    /// The address the *device* knows this endpoint by, which is what a
-    /// CLEAR_FEATURE names.
-    ep_addr: u8,
-    /// Where in the pool the transfer ring lives, because recovery rebuilds it
-    /// rather than resuming a ring the controller has a stale dequeue pointer
-    /// into.
-    ring_at: usize,
-    ring: &'a mut TrbRing,
-    ep0_ring: &'a mut TrbRing,
+/// The line for an endpoint no sequence of commands takes back to Running.
+/// Two callers — the recovery that waits and the one that is stepped — and the
+/// same endpoint whichever asked.
+fn log_unrecoverable(slot_id: u8, dci: u8, state: EndpointState) {
+    log!("xHCI: slot {slot_id} endpoint {dci} is {state}; nothing short of Configure Endpoint \
+         takes an endpoint out of that, and this driver does not re-configure a bound device");
 }
 
 /// How many transfers one HID interrupt endpoint may fail in a row before the
@@ -320,25 +326,6 @@ fn deadline() -> u64 {
     crate::clock::nanos_since_boot() + USB_TIMEOUT_NS
 }
 
-/// Spin until `ready`, and say whether that happened inside [`USB_TIMEOUT_NS`].
-///
-/// The register bits this covers are ones the controller sets in microseconds;
-/// one that never sets belongs to a controller or a port this driver cannot
-/// drive, and every caller turns `false` into a refusal that names it. Before
-/// this existed the five of them were bare `spin_loop`s, which on a machine
-/// with no serial port is the same picture as every other way a boot can stop:
-/// `Boot: peripherals ready` painted on the panel, forever.
-fn settles(ready: impl Fn() -> bool) -> bool {
-    let deadline = deadline();
-    while !ready() {
-        if crate::clock::nanos_since_boot() >= deadline {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-    true
-}
-
 /// Let a test starve one of those waits on a controller that is otherwise
 /// answering perfectly.
 ///
@@ -357,40 +344,6 @@ const PORT_ANSWERS: bool = !cfg!(feature = "xhci-deaf-port");
 /// does, so it reads it from the same place.
 use portmachine::DEBOUNCE_NS as PORT_DEBOUNCE_NS;
 
-/// How long a machine on which *nothing at all* has connected keeps looking.
-///
-/// The debounce above cannot answer this on its own, and that is not a detail:
-/// an empty port set has been "stable" since the instant power was applied, so
-/// a settle written only as "wait for the set to hold still" returns
-/// immediately on exactly the machine this code exists for. A device that is
-/// slow to appear and a bus with nothing on it are the same reading until one
-/// of them changes, so the only way to tell them apart without hotplug is to
-/// keep looking.
-///
-/// The asymmetry is deliberate: this is paid **only** by a machine that would
-/// otherwise report an empty bus, which is the outcome that cost the T14 its
-/// `/boot`. Any machine with one USB device anywhere settles on the debounce.
-///
-/// One second is policy, not physics. It covers the longest detection path a
-/// spec puts a number on — a SuperSpeed link that fails to train spends
-/// `tPollingLFPSTimeout` (360 ms, USB 3.2 §7.5.4.3) before it falls back, and
-/// the USB2 connect and debounce behind that add ~100 ms — and it sits under
-/// Linux's `HUB_DEBOUNCE_TIMEOUT`, which is 2000 ms in `drivers/usb/core/hub.c`.
-const EMPTY_BUS_NS: u64 = 1_000_000_000;
-
-/// When the driver stops waiting for a root hub that keeps changing its mind.
-///
-/// Policy, and under Linux's `HUB_DEBOUNCE_TIMEOUT`, which is 2000 ms in
-/// `drivers/usb/core/hub.c`. What the caller sees when it is hit is a line
-/// naming the machine's port state and a scan of whatever is connected at that
-/// moment — a flapping port costs the boot a bounded second and a half, never
-/// the machine.
-pub const PORT_SETTLE_CEILING_NS: u64 = 1_500_000_000;
-
-/// How often the settle re-reads the port registers. Each pass is one MMIO read
-/// per port, so on the widest controller in reach this is 16 reads per
-/// millisecond of the debounce.
-pub const PORT_POLL_NS: u64 = 1_000_000;
 
 /// Report an empty root hub for the first [`SLOW_CONNECT_NS`] of the boot.
 ///
@@ -439,68 +392,6 @@ type PortMask = [u64; 4];
 
 fn port_bit(mask: &PortMask, port_idx: u8) -> bool {
     mask[port_idx as usize / 64] & (1 << (port_idx % 64)) != 0
-}
-
-/// Wait for every root hub on the machine to stop changing its mind.
-///
-/// **`PORTSC.CCS` is not a question that can be asked at an instant.** HCRST
-/// returns every port to the state it has with nothing attached (spec §4.19.1.1
-/// for USB2, §4.19.1.2 for USB3), so a device firmware had already enumerated
-/// has to be detected all over again — and detection is a physical process:
-/// port power settling, a USB2 pull-up being debounced, a USB3 link running
-/// receiver detection and training. A scan issued in the same microsecond as
-/// `USBCMD.R/S` reports an empty bus on any machine whose ports are real. That
-/// is what the T14 did on both of its controllers while booting off a stick
-/// plugged into one of them: `controller started` and `no HID devices` share a
-/// millisecond in its log and no `port N connected` line sits between them.
-///
-/// QEMU's controller has no port state machine and no timer. `xhci_reset()`
-/// calls `xhci_port_update()` for every port, which assigns PORTSC from the QOM
-/// tree — CCS, CSC, PP, the speed, and PED for a SuperSpeed device — so the
-/// register is in its terminal state before the guest's first MMIO access. That
-/// is the whole reason a driver that never waited here passed every test in
-/// this suite.
-///
-/// Machine-wide rather than per controller because the wait is wall-clock: a
-/// laptop with two xHCs would otherwise pay for an interval both of them were
-/// already inside. On the T14 that is the difference between one debounce and
-/// two.
-fn await_connect_settle(controllers: &[XhciController]) {
-    let Some(powered_at) = controllers.iter().map(|c| c.powered_at).max() else { return };
-    let mut seen: Vec<(PortMask, u64)> = controllers
-        .iter()
-        .map(|c| (c.connected_ports(), c.powered_at))
-        .collect();
-
-    loop {
-        let now = crate::clock::nanos_since_boot();
-        let empty = seen.iter().all(|(mask, _)| *mask == [0u64; 4]);
-        let debounced = seen
-            .iter()
-            .all(|(_, at)| now.saturating_sub(*at) >= PORT_DEBOUNCE_NS);
-        let looked_long_enough = !empty || now.saturating_sub(powered_at) >= EMPTY_BUS_NS;
-        if debounced && looked_long_enough {
-            return;
-        }
-        if now.saturating_sub(powered_at) >= PORT_SETTLE_CEILING_NS {
-            log!("xHCI: no root hub on this machine held one connect state for {} ms within \
-                 {} ms; enumerating whatever is connected now",
-                PORT_DEBOUNCE_NS / 1_000_000, PORT_SETTLE_CEILING_NS / 1_000_000);
-            return;
-        }
-
-        let next = now + PORT_POLL_NS;
-        while crate::clock::nanos_since_boot() < next {
-            core::hint::spin_loop();
-        }
-        for (ctrl, (mask, changed_at)) in controllers.iter().zip(seen.iter_mut()) {
-            let now_mask = ctrl.connected_ports();
-            if now_mask != *mask {
-                *mask = now_mask;
-                *changed_at = crate::clock::nanos_since_boot();
-            }
-        }
-    }
 }
 
 /// When some controller's port state machine must be stepped again, or 0 when
@@ -603,12 +494,18 @@ impl TrbRing {
         self.base_phys + (self.tail as u64) * 16 | (self.cycle as u64)
     }
 
-    fn enqueue(&mut self, mut trb: Trb) {
+    /// Put `trb` on the ring and answer with **where it landed**, which for the
+    /// command ring is the only name a Command Completion Event gives it
+    /// (xHCI 1.2 §6.4.2.2). A caller matching on anything coarser than that —
+    /// "the next completion of any command" — takes the answer belonging to a
+    /// command that ran out its deadline and replied afterwards.
+    fn enqueue(&mut self, mut trb: Trb) -> u64 {
         if self.cycle {
             trb.control |= TRB_CYCLE;
         } else {
             trb.control &= !TRB_CYCLE;
         }
+        let at = self.base_phys + (self.tail as u64) * 16;
         unsafe { write_volatile(self.base.add(self.tail as usize), trb); }
         self.tail += 1;
 
@@ -621,6 +518,7 @@ impl TrbRing {
             self.tail = 0;
             self.cycle = !self.cycle;
         }
+        at
     }
 }
 
@@ -930,6 +828,20 @@ pub struct XhciController {
     /// — and consumed by [`Self::poll`].
     ports_dirty: bool,
 
+    /// The one operation this controller has been given and has not answered.
+    ///
+    /// **`poll_if_pending` runs at the top of every scheduler pass**, so what
+    /// starts there is submitted and left: the completion arrives through the
+    /// event ring the poll already drains, and a later pass acts on it. The two
+    /// paths this covers — a teardown's Disable Slot and a HID endpoint's
+    /// recovery — are exactly what pulling a device out of a running machine
+    /// runs, and each used to spin to [`USB_TIMEOUT_NS`] against a device that
+    /// by then had nothing to answer with.
+    ///
+    /// The boot path keeps its waits, because blocking is correct where there
+    /// is no scheduler to give a pass back to.
+    outstanding: Outstanding<What>,
+
     /// Ports this driver has written PED=1 to, which on a real controller are
     /// Disabled and read PED clear until they are reset again.
     ///
@@ -1016,6 +928,19 @@ impl XhciController {
         self.software_disabled.iter().map(|w| w.count_ones()).sum()
     }
 
+    /// The root-hub port a slot's device is on, or `None` for a slot no port
+    /// has been recorded against yet — which is every slot mid-enumeration,
+    /// since `device::finish` is what gives a port its slot. The one caller
+    /// that reads this is `wait_transfer`, deciding whether a port that has
+    /// gone means the transfer cannot be answered; a disk still inside its
+    /// bring-up therefore does not get that shortcut and spends the budget.
+    fn port_of_slot(&self, slot: u8) -> Option<u8> {
+        self.ports
+            .iter()
+            .position(|p| p.slot().map(NonZeroU8::get) == Some(slot))
+            .map(|at| at as u8)
+    }
+
     fn connected_ports(&self) -> PortMask {
         let mut mask = [0u64; 4];
         for p in 0..self.max_ports {
@@ -1046,10 +971,13 @@ impl XhciController {
         self.msc.iter().filter(|block| block.port.is_some()).count()
     }
 
-    fn submit_command(&mut self, trb: Trb) {
-        self.cmd_ring.enqueue(trb);
+    /// Put a command on the ring and ring the command doorbell, answering with
+    /// the address the completion will name it by.
+    fn submit_command(&mut self, trb: Trb) -> u64 {
+        let at = self.cmd_ring.enqueue(trb);
         fence(Ordering::Release);
         self.db_base.write_u32(0, 0);
+        at
     }
 
     /// One event, or `None` while the controller has not published the next.
@@ -1084,6 +1012,24 @@ impl XhciController {
         let trb_type = (event.control >> 10) & 0x3F;
         let code = (event.status >> 24) & 0xFF;
         let slot = ((event.control >> 24) & 0xFF) as u8;
+
+        // **The outstanding operation first, and recorded rather than acted
+        // on.** The Command TRB pointer's low four bits are reserved in the
+        // event, so the address is masked out of it rather than compared whole.
+        // The second number each event kind carries goes with it: a Command
+        // Completion Event's Slot ID, which is the controller's answer to
+        // Enable Slot, and a Transfer Event's residue.
+        let answers = match trb_type {
+            EVENT_CMD_COMPLETE => Some((Await::Command { trb: event.param & !0xF }, slot as u32)),
+            EVENT_TRANSFER => Some((
+                Await::Transfer { slot, dci: ((event.control >> 16) & 0x1F) as u8 },
+                event.status & 0x00FF_FFFF,
+            )),
+            _ => None,
+        };
+        if answers.is_some_and(|(on, param)| self.outstanding.answered(on, code, param)) {
+            return;
+        }
         // The port id the event carries is not read. It is the *register* that
         // says what a port is, and the driver has to look at every port anyway
         // to tell a connect it has acted on from one it has not — so the event
@@ -1095,6 +1041,14 @@ impl XhciController {
             return;
         }
         if trb_type != EVENT_TRANSFER {
+            return;
+        }
+        // A device whose endpoint is mid-recovery has exactly one transfer
+        // outstanding — the one that broke — and its ring is about to be
+        // rebuilt under it. Requeueing on that ring puts a TRB where the
+        // controller's dequeue pointer is not.
+        if matches!(self.outstanding.what(), Some(What::Recovering { slot_id, .. }) if *slot_id == slot)
+        {
             return;
         }
         let Some(at) = self.devices.iter().position(|d| d.slot_id == slot) else {
@@ -1112,40 +1066,49 @@ impl XhciController {
         dev.broke_with = Some(code);
     }
 
-    /// Restart every bound HID interrupt endpoint a completion code broke,
-    /// until none is outstanding.
+    /// Start the recovery of one bound HID interrupt endpoint a completion code
+    /// broke, if one is owed and the controller is not already answering
+    /// something else.
     ///
     /// **Separate from the code that reads the code, and that is the whole
     /// reason it exists.** `dispatch_event` runs inside `wait_command` and
     /// `wait_transfer`, which are draining this same event ring on behalf of a
     /// caller waiting for one particular event. A recovery issued from there
-    /// submits commands and waits on the ring itself, and the events it
-    /// consumed would include the one its caller was waiting for — a disk's
+    /// submits commands whose completions that caller would consume — a disk's
     /// data phase disappearing because a mouse stalled.
     ///
-    /// The loop terminates because an endpoint with no TRB queued produces no
-    /// completion: a device can only re-enter this after a requeue, and
-    /// [`MAX_HID_FAILURES`] bounds how many times that is done for it.
+    /// One at a time, and never more: [`Self::outstanding`] is one slot, and a
+    /// second device's recovery is owed until the first is answered. That is
+    /// the serialization the submit-and-wait pairs this replaces had by
+    /// construction.
     fn recover_endpoints(&mut self) {
-        while let Some((slot_id, code)) =
-            self.devices.iter().find_map(|d| Some((d.slot_id, d.broke_with?)))
-        {
-            self.recover_hid(slot_id, code);
+        if self.outstanding.busy() {
+            return;
         }
+        let Some((slot_id, code)) =
+            self.devices.iter().find_map(|d| Some((d.slot_id, d.broke_with?)))
+        else {
+            return;
+        };
+        self.recover_hid(slot_id, code);
     }
 
-    /// One HID device's interrupt endpoint, back to delivering — or off the bus.
+    /// One HID device's interrupt endpoint, on its way back to delivering — or
+    /// off the bus.
     fn recover_hid(&mut self, slot_id: u8, code: u32) {
         let Some(at) = self.devices.iter().position(|d| d.slot_id == slot_id) else {
             return;
         };
-        // Off the list for the duration. The recovery below drains the event
-        // ring, so another device's completion is dispatched from inside it,
-        // and a device let go there would move every index after its own.
-        let mut dev = self.devices.remove(at);
+        // The device stays on the list. It used to be taken off for the
+        // duration, because the recovery drained the event ring and a device
+        // let go from inside that would move every index after its own; the
+        // recovery no longer drains anything, and a device that is not on the
+        // list is one a teardown of its port cannot find.
+        let dev = &mut self.devices[at];
         dev.broke_with = None;
         let kind = dev.kind();
-        let ep_addr = dev.ep_addr;
+        let (ep_addr, dci, port_idx, block) =
+            (dev.ep_addr, dev.int_ep_dci, dev.port_idx, dev.block);
 
         // **When the disconnect and the transfer error race, the disconnect
         // wins.** A transfer outstanding on an endpoint whose device is pulled
@@ -1154,51 +1117,124 @@ impl XhciController {
         // apart, and the port register is the only thing that can. Everything
         // below is aimed at a device that is still on the bus: it spends a
         // failure out of the budget, issues Reset Endpoint and a
-        // CLEAR_FEATURE(HALT) control transfer that costs the transfer deadline
-        // to fail, and then tells a human to unplug something they are already
-        // holding in their hand. The T14 did all of that four times over, once
-        // per ordinary unplug.
+        // CLEAR_FEATURE(HALT) control transfer against a device the owner is
+        // holding in their hand, and then tells them to unplug it. The T14 did
+        // all of that four times over, once per ordinary unplug.
         //
         // CSC as well as CCS, for the reason `service_port` reads it: a device
         // replugged between two looks reads connected again, and the transfer
         // that died still died with the old one. Read and not cleared —
         // acknowledging it is `service_port`'s job, and clearing it here would
         // steal the evidence that runs the teardown.
-        let portsc = self.read_portsc(dev.port_idx);
+        let portsc = self.read_portsc(port_idx);
         if !portsc.connected() || portsc.connect_changed() {
             log!("xHCI: USB {kind} on slot {slot_id}: interrupt endpoint {ep_addr:#04x} \
                  completed with {} as its port went away; leaving it to the disconnect",
                 Completion(code));
-            self.devices.push(dev);
             return;
         }
 
+        let dev = &mut self.devices[at];
         dev.failures += 1;
-        log!("xHCI: USB {kind} on slot {slot_id}: interrupt endpoint {ep_addr:#04x} (dci {}) \
-             completed with {}; failure {} of {MAX_HID_FAILURES}",
-            dev.int_ep_dci, Completion(code), dev.failures);
+        let failures = dev.failures;
+        log!("xHCI: USB {kind} on slot {slot_id}: interrupt endpoint {ep_addr:#04x} (dci {dci}) \
+             completed with {}; failure {failures} of {MAX_HID_FAILURES}",
+            Completion(code));
 
-        if dev.failures >= MAX_HID_FAILURES {
-            self.let_go(dev, format_args!(
-                "it has failed {MAX_HID_FAILURES} transfers in a row"
-            ));
+        if failures >= MAX_HID_FAILURES {
+            self.let_go(at, format_args!("it has failed {MAX_HID_FAILURES} transfers in a row"));
             return;
         }
-        let restarted = self.restart_endpoint(Restart {
-            slot_id,
-            ctx_block: dev.block,
-            dci: dev.int_ep_dci,
-            ep_addr,
-            ring_at: dev.block + DEV_INT_RING,
-            ring: &mut dev.int_ring,
-            ep0_ring: &mut dev.ep0_ring,
-        });
-        if !restarted {
-            self.let_go(dev, format_args!("endpoint {ep_addr:#04x} could not be restarted"));
+        let state = self.endpoint_state(block, dci);
+        log!("xHCI: slot {slot_id} endpoint {dci} is {state}, recovering");
+        match Recovery::begin(state) {
+            Ok((seq, act)) => self.step_recovery(slot_id, seq, act),
+            Err(NeedsConfigure(state)) => {
+                log_unrecoverable(slot_id, dci, state);
+                self.let_go(at, format_args!("endpoint {ep_addr:#04x} could not be restarted"));
+            }
+        }
+    }
+
+    /// Perform one act of a HID endpoint's recovery and record what ends it.
+    ///
+    /// Nothing here waits: the completion arrives through the event ring the
+    /// poll already drains, and [`Self::advance_outstanding`] asks the sequence
+    /// what is owed next.
+    fn step_recovery(&mut self, slot_id: u8, seq: Recovery, act: Act) {
+        let Some(at) = self.devices.iter().position(|d| d.slot_id == slot_id) else {
+            return;
+        };
+        let dev = &mut self.devices[at];
+        let (dci, ep_addr, ring_at) = (dev.int_ep_dci, dev.ep_addr, dev.block + DEV_INT_RING);
+        match act {
+            Act::Running => {
+                dev.requeue(&self.db_base);
+                log!("xHCI: slot {slot_id} endpoint {dci} is delivering again");
+            }
+            Act::Command(cmd) => {
+                // Copied out and written back rather than borrowed across the
+                // call: `recovery_trb` reads the pool through `self` and this
+                // is the whole of the window, with nothing in it that could
+                // re-enter and find a ring that is neither the old one nor the
+                // new one.
+                let mut ring = dev.int_ring;
+                let trb = self.recovery_trb(cmd, slot_id, dci, &mut ring, ring_at);
+                self.devices[at].int_ring = ring;
+                let on = Await::Command { trb: self.submit_command(trb) };
+                let what = What::Recovering { slot_id, seq, issued: cmd.name() };
+                self.outstanding.submit(what, on, Stages::One, deadline());
+            }
+            Act::ClearHalt => {
+                enqueue_control(
+                    &mut self.devices[at].ep0_ring, 0x02, 0x01, 0, ep_addr as u16, None, 0,
+                );
+                self.ring_doorbell(slot_id, 1);
+                let on = Await::Transfer { slot: slot_id, dci: 1 };
+                let what =
+                    What::Recovering { slot_id, seq, issued: "CLEAR_FEATURE(ENDPOINT_HALT)" };
+                self.outstanding.submit(what, on, Stages::One, deadline());
+            }
+        }
+    }
+
+    /// The controller answered a recovery step. Ask the sequence what is owed
+    /// next, or let the device go.
+    fn recovery_stepped(
+        &mut self,
+        slot_id: u8,
+        mut seq: Recovery,
+        issued: &str,
+        outcome: Outcome,
+    ) {
+        if outcome.succeeded() {
+            let act = seq.completed();
+            self.step_recovery(slot_id, seq, act);
             return;
         }
-        dev.requeue(&self.db_base);
-        self.devices.push(dev);
+        log!("xHCI: slot {slot_id}: {issued} failed: {}", Answer(outcome));
+        if let Some(at) = self.devices.iter().position(|d| d.slot_id == slot_id) {
+            self.let_go(at, format_args!("its interrupt endpoint could not be restarted"));
+        }
+    }
+
+    /// Drop a recovery outstanding for a device on a port whose device has
+    /// gone, because **a transfer error on a port that has gone belongs to the
+    /// disconnect**. The command it is waiting for will not be answered by
+    /// anything still on the bus, and the teardown behind it would spend the
+    /// whole deadline finding that out. A completion that arrives afterwards is
+    /// an event addressed to nobody, which is what every abandoned wait in this
+    /// driver already produced.
+    fn cancel_recovery_on(&mut self, port_idx: u8) {
+        let Some(What::Recovering { slot_id, .. }) = self.outstanding.what() else {
+            return;
+        };
+        let slot_id = *slot_id;
+        if !self.devices.iter().any(|d| d.slot_id == slot_id && d.port_idx == port_idx) {
+            return;
+        }
+        self.outstanding.cancel();
+        log!("xHCI: slot {slot_id}'s endpoint recovery is abandoned; its port has gone");
     }
 
     /// Everything a HID device the driver has given up on leaves behind.
@@ -1214,89 +1250,43 @@ impl XhciController {
     ///
     /// The port's slot is this device's: one root-hub port carries one device
     /// here, and `parse_config` gives that device one function.
-    fn let_go(&mut self, mut dev: HidDevice, why: core::fmt::Arguments) {
+    fn let_go(&mut self, at: usize, why: core::fmt::Arguments) {
+        let mut dev = self.devices.remove(at);
         log!("xHCI: USB {} on slot {} is being let go — {why}. Unplug it and plug it in again.",
             dev.kind(), dev.slot_id);
         dev.unbind();
         if let Some(slot) = self.ports[dev.port_idx as usize].take_slot() {
-            self.disable_slot(slot.get());
+            self.submit_disable_slot(slot.get(), AfterSlot::LetGo);
         }
     }
 
-    /// Take one endpoint back to a state that runs TRBs, by the route its
-    /// current state permits.
+    /// The command `cmd` names against (`slot_id`, `dci`), with the ring
+    /// rebuilt where the command is the one that hands the controller a fresh
+    /// dequeue pointer.
     ///
-    /// **Which command is legal is a property of the endpoint's state, not of
-    /// whatever ended the transfer.** Reset Endpoint is defined only for a
-    /// Halted endpoint (xHCI 1.2 §4.6.8), Stop Endpoint only for a Running one
-    /// (§4.6.9), and Set TR Dequeue Pointer for an endpoint already in Stopped
-    /// or Error (§4.6.10). A recovery that opens with Reset Endpoint every time
-    /// gets Context State Error whenever the break was not a halt — which the
-    /// T14 answered twice before calling its own boot disk offline.
-    ///
-    /// The ring is rebuilt whichever route was taken, because the TRBs behind
-    /// the one that broke belong to a transfer nobody is waiting for and Set TR
-    /// Dequeue is what tells the controller so. CLEAR_FEATURE(ENDPOINT_HALT)
-    /// goes out only for a halt: it clears the condition at the *device*, and a
-    /// device that never halted has nothing to clear and may stall the request
-    /// for asking.
-    ///
-    /// Shared by the two kinds of endpoint that can break after they are bound,
-    /// which is every kind this driver has: a disk's bulk pair and a HID's
-    /// interrupt endpoint. Nothing in it is per class — the state, the three
-    /// commands and the ring are all xHCI's, which is also why the line it logs
-    /// says `xHCI` whichever caller asked.
-    fn restart_endpoint(&mut self, ep: Restart<'_>) -> bool {
-        let slot = ep.slot_id as u32;
-        let state = self.endpoint_state(ep.ctx_block, ep.dci);
-        log!("xHCI: slot {} endpoint {} is {state}, recovering", ep.slot_id, ep.dci);
-
-        match state {
-            EndpointState::Halted => {
-                let mut reset = Trb::ZERO;
-                reset.control = TRB_RESET_ENDPOINT | (slot << 24) | ((ep.dci as u32) << 16);
-                if !self.run_command(reset, "Reset Endpoint") {
-                    return false;
-                }
+    /// The two have to happen together or they disagree: the TRBs behind the
+    /// transfer that broke belong to nobody, and Set TR Dequeue is the only
+    /// thing that tells the controller so.
+    fn recovery_trb(
+        &self,
+        cmd: recovery::Command,
+        slot_id: u8,
+        dci: u8,
+        ring: &mut TrbRing,
+        ring_at: usize,
+    ) -> Trb {
+        let mut trb = Trb::ZERO;
+        let kind = match cmd {
+            recovery::Command::ResetEndpoint => TRB_RESET_ENDPOINT,
+            recovery::Command::StopEndpoint => TRB_STOP_ENDPOINT,
+            recovery::Command::SetDequeue => {
+                *ring = TrbRing::init(self.dma().subslice(ring_at, PAGE));
+                trb.param = ring.dequeue();
+                TRB_SET_TR_DEQUEUE
             }
-            EndpointState::Running => {
-                let mut stop = Trb::ZERO;
-                stop.control = TRB_STOP_ENDPOINT | (slot << 24) | ((ep.dci as u32) << 16);
-                if !self.run_command(stop, "Stop Endpoint") {
-                    return false;
-                }
-            }
-            EndpointState::Stopped => {}
-            EndpointState::Disabled | EndpointState::Unusable(_) => {
-                log!("xHCI: slot {} endpoint {} is {state}; nothing short of Configure Endpoint \
-                     takes an endpoint out of that, and this driver does not re-configure a bound \
-                     device", ep.slot_id, ep.dci);
-                return false;
-            }
-        }
-
-        let fresh = TrbRing::init(self.dma().subslice(ep.ring_at, PAGE));
-        let dequeue = fresh.dequeue();
-        *ep.ring = fresh;
-
-        let mut set_dq = Trb::ZERO;
-        set_dq.param = dequeue;
-        set_dq.control = TRB_SET_TR_DEQUEUE | (slot << 24) | ((ep.dci as u32) << 16);
-        if !self.run_command(set_dq, "Set TR Dequeue") {
-            return false;
-        }
-
-        if state != EndpointState::Halted {
-            return true;
-        }
-        let cleared = self.control_transfer(
-            ep.slot_id, ep.ep0_ring, 0x02, 0x01, 0, ep.ep_addr as u16, None, 0,
-        );
-        if !cleared.done() {
-            log!("xHCI: slot {} would not clear the halt on endpoint {:#04x}: {cleared}",
-                ep.slot_id, ep.ep_addr);
-        }
-        cleared.done()
+        };
+        trb.control = kind | ((slot_id as u32) << 24) | ((dci as u32) << 16);
+        trb
     }
 
     /// Clear whatever change flags one port is holding, so the next change is
@@ -1366,6 +1356,34 @@ impl XhciController {
         const MAX_EFFECTS: usize = 16;
         for _ in 0..MAX_EFFECTS {
             let portsc = self.read_portsc(port_idx);
+            // CCS *or* CSC, for the reason the machine reads both: a device
+            // replugged between two looks reads connected again and the one
+            // that was here has still gone.
+            if !portsc.connected() || portsc.connect_changed() {
+                self.cancel_recovery_on(port_idx);
+                device::cancel_on(self, port_idx);
+            }
+            // A port inside an effect a previous pass began — a teardown
+            // waiting on Disable Slot — is not decided about at all until the
+            // controller has answered for it. The machine says so itself, and
+            // asking it costs a register read to be told nothing.
+            //
+            // The `expect` is a driver bug and not a device one: the only
+            // effect that outlives a pass is the one that filled the slot, so
+            // a port left working with nothing outstanding is a port no pass
+            // will ever come back for — #151's shape, and silent.
+            if self.ports[port_idx as usize].working().is_some() {
+                let at = self.outstanding.wake_at().expect(
+                    "a port is inside an effect the controller was never asked to perform",
+                );
+                return Some(at);
+            }
+            // Read before the machine is asked, because by then its own borrow
+            // of this port is live. The two effects below that need the
+            // controller's answer to the *last* thing it was given — a
+            // teardown's Disable Slot and an enumeration's Enable Slot — defer
+            // on it; a register write, an acknowledge and a reset do not.
+            let busy = self.outstanding.wake_at();
             match self.ports[port_idx as usize].step(portsc, now) {
                 Step::Idle => return None,
                 Step::Wait(at) => return Some(at),
@@ -1409,6 +1427,9 @@ impl XhciController {
                     self.write_portsc(port_idx, write);
                 }
                 Step::Teardown(why, pending) => {
+                    if busy.is_some() {
+                        return busy;
+                    }
                     pending.running();
                     match why {
                         Gone::Disconnected => log!("xHCI: port {} disconnected", port_idx + 1),
@@ -1418,10 +1439,22 @@ impl XhciController {
                             port_idx + 1
                         ),
                     }
-                    self.teardown_port(port_idx);
-                    self.ports[port_idx as usize].torn_down();
+                    if self.teardown_port(port_idx) {
+                        self.ports[port_idx as usize].torn_down();
+                    } else {
+                        // The slot is outstanding, so this port is inside an
+                        // effect until the controller answers for it.
+                        return self.outstanding.wake_at();
+                    }
                 }
                 Step::Enumerate { trained, pending } => {
+                    // A slot the controller has been asked to disable is one it
+                    // may hand straight back to the Enable Slot below, and this
+                    // driver would then zero the DCBAA entry the new device's
+                    // context sits in.
+                    if busy.is_some() {
+                        return busy;
+                    }
                     pending.running();
                     if trained {
                         // No reset was issued and none was needed: a SuperSpeed
@@ -1430,16 +1463,11 @@ impl XhciController {
                         // Inactive and then had no way back.
                         log!("xHCI: port {} connected, link already trained", port_idx + 1);
                     }
-                    let slot = device::configure(self, port_idx);
-                    self.ports[port_idx as usize].enumerated(slot.and_then(NonZeroU8::new));
-                    // Whatever the reset and the enumeration behind it raised.
-                    // The one that matters is not PRC, which `configure`
-                    // clears, but any flag left set on a port that is now
-                    // quiet: the next thing to happen here is the device being
-                    // pulled, and a CSC that is already '1' is a disconnect the
-                    // controller cannot report.
-                    self.acknowledge_port_read(port_idx);
-                    return None;
+                    device::begin(self, port_idx);
+                    // Either the enumeration is under way and the port is
+                    // inside an effect until it answers, or it refused before
+                    // spending a command and the port is already reported.
+                    return self.outstanding.wake_at();
                 }
             }
         }
@@ -1458,7 +1486,11 @@ impl XhciController {
     /// abandons whatever TRB was queued on them. **Then the pool block**, which
     /// is only safe in that order: while the slot lives, its endpoint contexts
     /// still name that memory.
-    fn teardown_port(&mut self, port_idx: u8) {
+    /// **`true` when the port is already empty**, and `false` when the
+    /// controller still has to answer for the slot — in which case
+    /// [`Self::slot_gone`] finishes it, and until then the port is inside an
+    /// effect and nothing decides anything else about it.
+    fn teardown_port(&mut self, port_idx: u8) -> bool {
         while let Some(at) = self.devices.iter().position(|d| d.port_idx == port_idx) {
             let mut dev = self.devices.remove(at);
             let role = dev.role;
@@ -1478,15 +1510,22 @@ impl XhciController {
                 ),
             }
         }
-        if let Some(slot) = self.ports[port_idx as usize].take_slot() {
-            self.disable_slot(slot.get());
-        }
+        let Some(slot) = self.ports[port_idx as usize].take_slot() else {
+            self.release_blocks(port_idx);
+            return true;
+        };
+        self.submit_disable_slot(slot.get(), AfterSlot::Teardown(port_idx));
+        false
+    }
 
-        // **Last**, and after the slot and not before it: while the slot lives,
-        // its endpoint contexts still name this memory. Every block this port
-        // claimed and not only the ones a disk came out of — `bind` claims
-        // before Configure Endpoint, so a device refused after that point holds
-        // one with no disk behind it, and the pool holds [`MSC_BLOCKS`] of them.
+    /// The pool blocks a port's device held, back in the pool.
+    ///
+    /// **After the slot and never before it**: while the slot lives, its
+    /// endpoint contexts still name this memory. Every block this port claimed
+    /// and not only the ones a disk came out of — `bind` claims before
+    /// Configure Endpoint, so a device refused after that point holds one with
+    /// no disk behind it, and the pool holds [`MSC_BLOCKS`] of them.
+    fn release_blocks(&mut self, port_idx: u8) {
         for at in 0..MSC_BLOCKS {
             if self.msc[at].port != Some(port_idx) {
                 continue;
@@ -1504,66 +1543,114 @@ impl XhciController {
         }
     }
 
-    /// Give a slot back to the controller and stop naming its device context.
+    /// Ask the controller for a slot back, and record what its answer is owed.
     ///
-    /// The one thing that takes a slot out of any state (xHCI 1.2 §4.6.4), so
+    /// The one command that takes a slot out of any state (xHCI 1.2 §4.6.4), so
     /// there is no state a device that has been pulled can be in that makes
-    /// this the wrong command — which is exactly what is not true of Reset
+    /// this the wrong one — which is exactly what is not true of Reset
     /// Endpoint, and why `restart_endpoint` reads the endpoint state first.
-    fn disable_slot(&mut self, slot_id: u8) {
+    fn submit_disable_slot(&mut self, slot_id: u8, then: AfterSlot) {
         let mut disable = Trb::ZERO;
         disable.control = TRB_DISABLE_SLOT | ((slot_id as u32) << 24);
-        if !self.run_command(disable, "Disable Slot") {
-            return;
-        }
-        // After the command, never before: until it completes the controller
-        // may still be writing this device's output context.
-        unsafe {
-            let dcbaa = self.dma().ptr_at(OFF_DCBAA) as *mut u64;
-            write_volatile(dcbaa.add(slot_id as usize), 0);
-        }
-        log!("xHCI: slot {slot_id} disabled");
+        let on = Await::Command { trb: self.submit_command(disable) };
+        self.outstanding.submit(What::SlotGone { slot: slot_id, then }, on, Stages::One, deadline());
     }
 
-    /// The completion code and slot id of the command just submitted, or
-    /// `None` if the controller never answered.
-    fn wait_command(&mut self) -> Option<(u32, u32)> {
-        let deadline = deadline();
-        loop {
-            let Some(event) = self.next_event() else {
-                if crate::clock::nanos_since_boot() >= deadline {
-                    return None;
-                }
-                core::hint::spin_loop();
-                continue;
-            };
-            if (event.control >> 10) & 0x3F == EVENT_CMD_COMPLETE {
-                return Some(((event.status >> 24) & 0xFF, (event.control >> 24) & 0xFF));
+    /// The slot is the controller's again, or it is not and this driver has no
+    /// second question to ask about it.
+    fn slot_gone(&mut self, slot: u8, then: AfterSlot, outcome: Outcome) {
+        if outcome.succeeded() {
+            // After the command, never before: until it completes the
+            // controller may still be writing this device's output context.
+            unsafe {
+                let dcbaa = self.dma().ptr_at(OFF_DCBAA) as *mut u64;
+                write_volatile(dcbaa.add(slot as usize), 0);
             }
+            log!("xHCI: slot {slot} disabled");
+        } else {
+            log!("xHCI: Disable Slot failed: {}", Answer(outcome));
+        }
+        // The blocks go back whatever the controller said, because the
+        // alternative is a port whose device has left holding one for the life
+        // of the boot — and two of those is a machine with no disks at all,
+        // boot stick included. A controller that will not disable a slot is
+        // already past what this driver can repair.
+        if let AfterSlot::Teardown(port_idx) = then {
+            self.release_blocks(port_idx);
+            self.ports[port_idx as usize].torn_down();
+        }
+    }
+
+    /// Act on whatever the controller has answered, and issue whatever that
+    /// answer owes next.
+    ///
+    /// **Never from inside a wait.** The drain that records an answer runs on
+    /// behalf of a caller after one particular event, and everything below
+    /// submits commands and frees memory.
+    ///
+    /// The loop ends because each turn either leaves the slot empty or fills it
+    /// with an operation that has no answer yet and a deadline in the future.
+    fn advance_outstanding(&mut self) {
+        let now = crate::clock::nanos_since_boot();
+        while let Some((what, outcome)) = self.outstanding.finished(now) {
+            match what {
+                What::SlotGone { slot, then } => self.slot_gone(slot, then, outcome),
+                What::Recovering { slot_id, seq, issued } => {
+                    self.recovery_stepped(slot_id, seq, issued, outcome)
+                }
+                What::SlotWanted { port_idx, speed, packet, seq } => {
+                    device::slot_answered(self, port_idx, speed, packet, seq, outcome)
+                }
+                What::Enumerating(state) => device::stepped(self, state, outcome),
+            }
+        }
+    }
+
+    /// Drain the event ring and step the ports, and say when this controller
+    /// wants to be polled again.
+    ///
+    /// The ports are read only when something says they might have moved: a
+    /// Port Status Change Event since the last look, or a port the driver has
+    /// not finished acting on. Otherwise this is one read of the event ring's
+    /// next TRB, which is what every pass on every CPU pays.
+    fn poll(&mut self) -> Option<u64> {
+        while let Some(event) = self.next_event() {
             self.dispatch_event(event);
         }
+        // After the drain and not inside it: an answer the drain recorded owes
+        // commands and frees memory, and it is issued where nobody else is
+        // waiting on this ring.
+        self.advance_outstanding();
+        self.recover_endpoints();
+
+        // Nothing below reads the event ring, which is what makes one advance
+        // enough: every step `service_ports` takes is a submit, so no answer can
+        // arrive inside it and none can be left behind it. The last thing that
+        // drained on its own behalf was the enumeration, and the only one left
+        // is the disk bring-up behind `msc::bind` — which runs above, so a port
+        // change it consumed is already in `ports_dirty` when this reads it.
+        let mut wake_at = None;
+        if self.ports_dirty || self.ports.iter().any(PortState::outstanding) {
+            self.ports_dirty = false;
+            wake_at = self.service_ports();
+        }
+        earliest(wake_at, self.outstanding.wake_at())
     }
 
-    /// Submit `trb` and say whether the controller accepted it, logging
-    /// anything it did not. `what` names the command in that line, because a
-    /// bare code is unreadable at 3am.
+    /// One dword of one *device context*, in the input context `ctx_base`
+    /// points at: index 0 is the input control context, 1 the slot context,
+    /// and `dci + 1` an endpoint's. The old name for this parameter was
+    /// `slot_index`, which named the one thing no caller ever passes.
     ///
-    /// A `bool` and not the `Option<u32>` it was: the only `Some` that value
-    /// ever held was `CC_SUCCESS`, so every caller's `is_none()` was asking a
-    /// question the type pretended was open.
-    fn run_command(&mut self, trb: Trb, what: &str) -> bool {
-        self.submit_command(trb);
-        match self.wait_command() {
-            Some((CC_SUCCESS, _)) => true,
-            Some((code, _)) => {
-                log!("xHCI: {what} failed: {}", Completion(code));
-                false
-            }
-            None => {
-                log!("xHCI: {what} timed out");
-                false
-            }
-        }
+    /// No bound, and it needs none: `Endpoint::dci` is 2..=31 by construction
+    /// and its field is private, so the largest index any of the 23 call sites
+    /// can reach is 32, and `32 * 64 + 4 * 4` is 2064 bytes into the 4096 the
+    /// input context is. That sentence is what `Endpoint`'s private field is
+    /// for; before it, a struct literal under `xhci` could put this write
+    /// 12,880 bytes in.
+    fn write_ctx32(&self, ctx_base: *mut u8, ctx_index: usize, dword: usize, val: u32) {
+        let offset = (ctx_index * self.context_size) + (dword * 4);
+        unsafe { write_volatile(ctx_base.add(offset) as *mut u32, val); }
     }
 
     /// The Endpoint State the controller published for (`dev_block`'s device,
@@ -1593,149 +1680,6 @@ impl XhciController {
         self.db_base.write_u32(slot as u64 * 4, dci as u32);
     }
 
-    /// The completion of the transfer just queued on (`slot`, `dci`), as a
-    /// completion code and the number of bytes the controller did *not* move.
-    ///
-    /// The event ring is one queue for the whole controller, so anything that
-    /// arrives here and is not ours belongs to a bound device delivering a
-    /// report — handing it to `dispatch_event` rather than dropping it is what
-    /// keeps that device's interrupt ring fed. Matching on the endpoint as
-    /// well as the slot matters for mass storage, where one slot carries three
-    /// endpoints and a stalled one still completes.
-    fn wait_transfer(&mut self, slot: u8, dci: u8) -> Option<(u32, u32)> {
-        let deadline = deadline();
-        loop {
-            let Some(event) = self.next_event() else {
-                if crate::clock::nanos_since_boot() >= deadline {
-                    return None;
-                }
-                core::hint::spin_loop();
-                continue;
-            };
-            let trb_type = (event.control >> 10) & 0x3F;
-            let ev_slot = ((event.control >> 24) & 0xFF) as u8;
-            let ev_dci = ((event.control >> 16) & 0x1F) as u8;
-            if trb_type == EVENT_TRANSFER && ev_slot == slot && ev_dci == dci {
-                return Some(((event.status >> 24) & 0xFF, event.status & 0x00FF_FFFF));
-            }
-            self.dispatch_event(event);
-        }
-    }
-
-    /// One control transfer on `ring`, which must be the EP0 ring named by
-    /// `slot`'s device context.
-    fn control_transfer(
-        &mut self,
-        slot: u8,
-        ring: &mut TrbRing,
-        bm_request_type: u8,
-        b_request: u8,
-        w_value: u16,
-        w_index: u16,
-        data_buf: Option<u64>,
-        data_len: u16,
-    ) -> Control {
-        let is_in = (bm_request_type & 0x80) != 0;
-        let has_data = data_len > 0 && data_buf.is_some();
-        let trt = if !has_data { 0u32 } else if is_in { 3 } else { 2 };
-
-        let mut setup = Trb::ZERO;
-        setup.param = setup_packet(bm_request_type, b_request, w_value, w_index, data_len);
-        setup.status = 8;
-        setup.control = TRB_SETUP_STAGE | (1 << 6) | (trt << 16);
-        ring.enqueue(setup);
-
-        if has_data {
-            let mut data = Trb::ZERO;
-            data.param = data_buf.unwrap();
-            data.status = data_len as u32;
-            let dir = if is_in { 1u32 << 16 } else { 0 };
-            // ISP and IOC, which this TRB carried neither of. Without IOC the
-            // data stage produces no event at all and the only thing the driver
-            // ever sees is the status stage's Success; without ISP a device that
-            // answers short is not required to say so. Between them the two are
-            // the whole of "how many bytes are actually in that buffer", and a
-            // descriptor read has no other way to ask.
-            data.control = TRB_DATA_STAGE | dir | (1 << 2) | (1 << 5);
-            ring.enqueue(data);
-        }
-
-        let mut status = Trb::ZERO;
-        let status_dir = if has_data && is_in { 0 } else { 1u32 << 16 };
-        status.control = TRB_STATUS_STAGE | (1 << 5) | status_dir;
-        ring.enqueue(status);
-
-        self.ring_doorbell(slot, 1);
-
-        let mut delivered = 0u16;
-        if has_data {
-            match self.wait_transfer(slot, 1) {
-                Some((CC_SUCCESS | CC_SHORT_PACKET, residue)) => {
-                    // A residue past the length asked for is a controller
-                    // contradicting itself; believing it would report more bytes
-                    // delivered than the buffer holds.
-                    delivered = data_len.saturating_sub(residue.min(u16::MAX as u32) as u16);
-                }
-                // The status stage is deliberately not waited for. An errored
-                // data stage halts EP0, so the TRB behind it never runs, and
-                // waiting would spend the whole transfer budget learning that.
-                Some((code, _)) => return Control::Failed { stage: "data", code },
-                None => return Control::Silent { stage: "data" },
-            }
-        }
-        match self.wait_transfer(slot, 1) {
-            Some((CC_SUCCESS, _)) => Control::Done { delivered },
-            Some((code, _)) => Control::Failed { stage: "status", code },
-            None => Control::Silent { stage: "status" },
-        }
-    }
-
-    /// Drain the event ring and step the ports, and say when this controller
-    /// wants to be polled again.
-    ///
-    /// The ports are read only when something says they might have moved: a
-    /// Port Status Change Event since the last look, or a port the driver has
-    /// not finished acting on. Otherwise this is one read of the event ring's
-    /// next TRB, which is what every pass on every CPU pays.
-    fn poll(&mut self) -> Option<u64> {
-        while let Some(event) = self.next_event() {
-            self.dispatch_event(event);
-        }
-        // After the drain and not inside it: an endpoint the drain recorded a
-        // broken completion for is restarted where nobody else is waiting on
-        // this ring.
-        self.recover_endpoints();
-        if !self.ports_dirty && !self.ports.iter().any(PortState::outstanding) {
-            return None;
-        }
-        self.ports_dirty = false;
-        let wake_at = self.service_ports();
-        // An event that landed *during* the enumeration this pass just ran —
-        // `configure`'s control transfers drain the whole ring — is a port
-        // change nothing else will come back for: its interrupt was taken
-        // while this CPU was already inside the poll, so there may be no
-        // record left to bring anyone here again.
-        if self.ports_dirty {
-            return Some(crate::clock::nanos_since_boot());
-        }
-        wake_at
-    }
-
-    /// One dword of one *device context*, in the input context `ctx_base`
-    /// points at: index 0 is the input control context, 1 the slot context,
-    /// and `dci + 1` an endpoint's. The old name for this parameter was
-    /// `slot_index`, which named the one thing no caller ever passes.
-    ///
-    /// No bound, and it needs none: `Endpoint::dci` is 2..=31 by construction
-    /// and its field is private, so the largest index any of the 23 call sites
-    /// can reach is 32, and `32 * 64 + 4 * 4` is 2064 bytes into the 4096 the
-    /// input context is. That sentence is what `Endpoint`'s private field is
-    /// for; before it, a struct literal under `xhci` could put this write
-    /// 12,880 bytes in.
-    fn write_ctx32(&self, ctx_base: *mut u8, ctx_index: usize, dword: usize, val: u32) {
-        let offset = (ctx_index * self.context_size) + (dword * 4);
-        unsafe { write_volatile(ctx_base.add(offset) as *mut u32, val); }
-    }
 }
 
 /// Every xHCI controller on the machine, in PCI enumeration order.
@@ -1860,379 +1804,3 @@ pub fn arm_short_read() {
     msc::short_read::arm();
 }
 
-/// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
-/// `buf` holds nothing the caller may believe.
-pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
-    with_disk(index, |ctrl, local| ctrl.msc_read(local, lba, count, buf)).unwrap_or(false)
-}
-
-pub fn storage_write(index: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
-    with_disk(index, |ctrl, local| ctrl.msc_write(local, lba, count, buf)).unwrap_or(false)
-}
-
-pub fn storage_flush(index: usize) -> bool {
-    with_disk(index, |ctrl, local| ctrl.msc_flush(local)).unwrap_or(false)
-}
-
-/// Point this controller's interrupts at [`XHCI_VECTOR`] and name the
-/// mechanism that took them, or `None` when the function offers neither.
-///
-/// `None` has to be a refusal and not a degradation, and that is the whole
-/// shape of this function. Every read of an event ring in this driver is
-/// `poll_if_pending`, which runs only behind an `irq_ring` record that
-/// nothing but vector 0x21's ISR publishes — so a controller whose messages
-/// cannot reach a CPU is one whose ring is never read again. This used to log
-/// "no MSI-X capability, using polled mode" and carry on: there is no polled
-/// mode, and every device on such a controller enumerated, logged itself
-/// ready, and delivered nothing for the life of the boot.
-fn arm_interrupt(pci_dev: &PciDevice) -> Option<&'static str> {
-    if pci_dev.enable_msix(XHCI_VECTOR) {
-        return Some("MSI-X");
-    }
-    pci_dev.enable_msi(XHCI_VECTOR).then_some("MSI")
-}
-
-/// Bring up every xHCI controller on the machine.
-///
-/// Every one, not the first: a Tiger Lake laptop has two — the Thunderbolt
-/// block's at 00:0d.0 and the PCH's at 00:14.0, identical in class, subclass
-/// and prog_if — and its keyboard and USB-A ports are on the second. Taking
-/// the first match reported that the T14 had no USB HID at all, which was true
-/// of that controller and false of the machine.
-pub fn init(devices: &[PciDevice]) {
-    // Once for the machine, not once per controller: it reads no register and
-    // touches no device, so a second run would say the same thing twice.
-    #[cfg(feature = "xhci-descriptor-selftest")]
-    device::selftest();
-
-    // Every controller is brought up and its ports powered before any of them
-    // is scanned, because the scan cannot start until the root hub has settled
-    // and that wait is wall-clock. Interleaving bring-up with enumeration would
-    // make a machine with two controllers pay `PORT_DEBOUNCE_NS` twice for a
-    // interval both of them were already inside.
-    let mut controllers = Vec::new();
-    let mut present = 0;
-    for pci_dev in devices.iter().filter(|d| d.matches_class(0x0C, 0x03, Some(0x30))) {
-        present += 1;
-        if let Some(ctrl) = init_one(pci_dev) {
-            controllers.push(ctrl);
-        }
-    }
-
-    await_connect_settle(&controllers);
-
-    for ctrl in controllers.iter_mut() {
-        device::scan_ports(ctrl);
-        if ctrl.devices.is_empty() {
-            log!("xHCI: no HID devices on the controller at {:02x}:{:02x}.{}",
-                ctrl.pci.bus, ctrl.pci.dev, ctrl.pci.func);
-        }
-    }
-
-    if controllers.is_empty() {
-        // A machine with no xHC and a machine whose xHCs this driver refused
-        // are different machines, and the second used to print the first's
-        // line. The per-controller refusal above says why; this says that
-        // nothing was left.
-        match present {
-            0 => log!("xHCI: no controller on this machine, USB input unavailable"),
-            n => log!("xHCI: {n} controller(s) present, none of them usable, USB unavailable"),
-        }
-        return;
-    }
-    // Nothing is outstanding out of a boot scan — every port it looked at it
-    // acted on — so a machine that is never plugged into pays nothing for
-    // hotplug beyond one atomic load per pass.
-    PORT_WORK_AT.store(0, Ordering::Relaxed);
-    let hid: usize = controllers.iter().map(|c| c.devices.len()).sum();
-    log!("xHCI: {} controller(s), {} HID device(s)", controllers.len(), hid);
-    log!("usb-storage: {} device(s)", storage_count());
-    *XHCI.lock() = controllers;
-}
-
-/// What each of this controller's port registers speaks, out of its own
-/// Supported Protocol capabilities (§7.2).
-///
-/// **A controller that says nothing leaves every port unknown**, and unknown is
-/// driven the USB2 way — which is what every port got before this was read at
-/// all, so a controller this cannot describe is no worse off than it was.
-fn read_protocols(
-    bar: &Mmio,
-    bar_size: u64,
-    hccparams1: u32,
-    max_ports: u8,
-    pci_dev: &PciDevice,
-) -> Protocols {
-    let read = |offset: u64| -> Option<u32> {
-        (offset.checked_add(4)? <= bar_size).then(|| bar.read_u32(offset))
-    };
-    let mut protocols = Protocols::UNKNOWN;
-    let mut refused = 0;
-    let walked = legacy::for_each(
-        &read,
-        hccparams1 >> 16,
-        legacy::CAP_ID_PROTOCOL,
-        &mut |at| {
-            let dwords = (read(at), read(at + 4), read(at + 8));
-            let (Some(dw0), Some(dw1), Some(dw2)) = dwords else {
-                refused += 1;
-                return;
-            };
-            match toyos_xhci::protocol::SupportedProtocol::decode(dw0, dw1, dw2, max_ports) {
-                Ok(found) => {
-                    log!("xHCI: USB {}.{:x} on ports {}..={}", found.major, found.minor >> 4,
-                        found.first_port + 1, found.first_port + found.port_count);
-                    protocols.record(&found);
-                }
-                Err(why) => {
-                    refused += 1;
-                    log!("xHCI: a Supported Protocol capability at {at:#x} is unusable: {why:?}");
-                }
-            }
-        },
-    );
-    if let Err(why) = walked {
-        log!("xHCI: the capability list at PCI {:02x}:{:02x}.{} does not walk: {why:?}",
-            pci_dev.bus, pci_dev.dev, pci_dev.func);
-    }
-    let (usb2, usb3) = protocols.counts(max_ports);
-    // The line that says whether this machine's SuperSpeed ports are known to
-    // be SuperSpeed. A zero here on a controller that has them is the T14's
-    // failure waiting to happen, and it used to be invisible.
-    log!("xHCI: {usb2} USB2 and {usb3} USB3 port register(s) of {max_ports} named, \
-         {refused} capability(ies) refused");
-    protocols
-}
-
-fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
-    log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-
-    let bar_addr = pci_dev.read_bar_64(0);
-    pci_dev.enable_bus_master();
-    log!("xHCI: BAR0={:#x}", bar_addr);
-
-    // Ahead of the reset and ahead of the port scan, because a controller
-    // whose interrupts cannot be delivered must not reach either: the reset
-    // is what makes it ours, and the port scan is what prints
-    // `USB keyboard ready`. Refusing here leaves the controller exactly as
-    // firmware left it, with nothing enumerated on it to claim otherwise.
-    let Some(irq) = arm_interrupt(pci_dev) else {
-        log!(
-            "xHCI: NOT INITIALISED at PCI {:02x}:{:02x}.{} — the controller offers neither \
-             MSI-X nor MSI, and this driver has no other way to be told it has anything to \
-             say. No USB device on it can be used.",
-            pci_dev.bus, pci_dev.dev, pci_dev.func
-        );
-        return None;
-    };
-    log!("xHCI: {irq} enabled (vector {XHCI_VECTOR:#x})");
-
-    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x10000, CachePolicy::DeferToMtrr);
-
-    let cap_length = bar.read_u8(CAP_CAPLENGTH) as u64;
-    let hcsparams1 = bar.read_u32(CAP_HCSPARAMS1);
-    let hcsparams2 = bar.read_u32(CAP_HCSPARAMS2);
-    let hccparams1 = bar.read_u32(CAP_HCCPARAMS1);
-    let db_offset = (bar.read_u32(CAP_DBOFF) & !0x3) as u64;
-    let rts_offset = (bar.read_u32(CAP_RTSOFF) & !0x1F) as u64;
-
-    let max_slots = (hcsparams1 & 0xFF) as u8;
-    let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
-    let csz = ((hccparams1 >> 2) & 1) != 0;
-    let context_size: usize = if csz { 64 } else { 32 };
-
-    // Everything below refuses this controller by name rather than taking the
-    // machine with it. Two controllers is the target laptop's shape, and a
-    // property of the empty Thunderbolt one is no reason the PCH's ports should
-    // not come up.
-    let refuse = |why: core::fmt::Arguments| {
-        log!("xHCI: NOT INITIALISED at PCI {:02x}:{:02x}.{} — {why}. No USB device on it can \
-             be used.", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    };
-
-    // The BAR is mapped at a fixed 64 KiB and both offsets are the controller's
-    // own 32-bit numbers, so this is where a controller that puts its doorbells
-    // or its runtime registers outside the window has to be refused: the
-    // subtraction below it underflows, and with overflow checks off it wraps
-    // back to exactly `bar_size`, which `Mmio::subregion`'s own assertion then
-    // accepts — an `Mmio` based outside the mapping, faulting on the first
-    // doorbell write.
-    let bar_size = 0x10000u64;
-    let (Some(db_len), Some(rt_len)) =
-        (bar_size.checked_sub(db_offset), bar_size.checked_sub(rts_offset))
-    else {
-        refuse(format_args!(
-            "DBOFF={db_offset:#x} RTSOFF={rts_offset:#x} put its registers outside the \
-             {bar_size:#x} window this driver maps"
-        ));
-        return None;
-    };
-    let op_base = bar.subregion(cap_length, bar_size - cap_length);
-    let db_base = bar.subregion(db_offset, db_len);
-    let rt_base = bar.subregion(rts_offset, rt_len);
-
-    let pagesize = op_base.read_u32(OP_PAGESIZE) & 0xFFFF;
-    log!("xHCI: max_slots={} max_ports={} ctx_size={} pagesize={:#x}",
-        max_slots, max_ports, context_size, pagesize);
-    // Bit 0 is 4 KiB, and it is the only bit this driver can use — the register
-    // is a mask of the page sizes the controller supports, so the test is that
-    // the bit is set and not that it is alone. The scratchpad is the whole
-    // exposure: its entries are one PAGE apart, so a controller placing them at
-    // 8 KiB writes each buffer over the next and the last one past `dev_base`
-    // into block 0's interrupt ring — memory corruption with no diagnostic.
-    // Every other consequence runs the safe way, since a larger page size only
-    // relaxes the rule that the DCBAA and the contexts must not cross one.
-    if pagesize & 1 == 0 {
-        refuse(format_args!(
-            "PAGESIZE={pagesize:#x} does not include 4 KiB, and every ring, context and \
-             scratchpad buffer here is placed at 4 KiB"
-        ));
-        return None;
-    }
-
-    let max_sp_hi = ((hcsparams2 >> 21) & 0x1F) as usize;
-    let max_sp_lo = ((hcsparams2 >> 27) & 0x1F) as usize;
-    let layout = Layout::new((max_sp_hi << 5) | max_sp_lo, max_slots);
-    log!("xHCI: dma {} KiB: scratchpad={} device blocks={} of {} B (max_slots={})",
-        layout.pool_size / 1024, layout.scratch_count, layout.dev_blocks, DEV_STRIDE, max_slots);
-
-    // Before the controller is touched at all: on a PC the firmware may still
-    // own it for legacy keyboard emulation, and resetting a controller SMM is
-    // driving is a fight with no diagnostic.
-    legacy::take_ownership(&bar, bar_size, hccparams1);
-    let protocols = read_protocols(&bar, bar_size, hccparams1, max_ports, pci_dev);
-
-    let usbcmd = op_base.read_u32(OP_USBCMD);
-    if usbcmd & 1 != 0 {
-        op_base.write_u32(OP_USBCMD, usbcmd & !1);
-    }
-    let deadline_ms = USB_TIMEOUT_NS / 1_000_000;
-    if !settles(|| CONTROLLER_ANSWERS && op_base.read_u32(OP_USBSTS) & 1 != 0) {
-        refuse(format_args!("it never halted, within {deadline_ms} ms of being asked to"));
-        return None;
-    }
-
-    op_base.write_u32(OP_USBCMD, 1 << 1);
-    if !settles(|| CONTROLLER_ANSWERS && op_base.read_u32(OP_USBCMD) & (1 << 1) == 0) {
-        refuse(format_args!("it held HCRST for {deadline_ms} ms"));
-        return None;
-    }
-    if !settles(|| CONTROLLER_ANSWERS && op_base.read_u32(OP_USBSTS) & (1 << 11) == 0) {
-        refuse(format_args!("it stayed Controller Not Ready for {deadline_ms} ms after its reset"));
-        return None;
-    }
-    log!("xHCI: controller reset");
-
-    // After the reset, so a controller refused above costs no physical memory
-    // at all — and the pool is freed with the `DmaPool` on every refusal below,
-    // since `PhysPage` gives its page back when dropped.
-    let pool = DmaPool::alloc(layout.pool_size);
-
-    // MaxSlotsEn is what the driver can track, not what the controller can
-    // offer: a conformant xHC then refuses Enable Slot past it rather than
-    // handing back an id with nowhere to put its context.
-    op_base.write_u32(OP_CONFIG, layout.dev_blocks as u32);
-
-    let dma = pool.slice();
-    unsafe { dma.zero(); }
-
-    if layout.scratch_count > 0 {
-        let array = dma.ptr_at(layout.scratch_array) as *mut u64;
-        for i in 0..layout.scratch_count {
-            let buf = dma.phys() + (layout.scratch_buffers + i * PAGE) as u64;
-            unsafe { write_volatile(array.add(i), buf); }
-        }
-        unsafe {
-            write_volatile(
-                dma.ptr_at(OFF_DCBAA) as *mut u64,
-                dma.phys() + layout.scratch_array as u64,
-            );
-        }
-        log!("xHCI: {} scratchpad buffers configured", layout.scratch_count);
-    }
-
-    op_base.write_u64(OP_DCBAAP, dma.phys() + OFF_DCBAA as u64);
-
-    let cmd_ring = TrbRing::init(dma.subslice(OFF_CMD_RING, PAGE));
-    op_base.write_u64(OP_CRCR, dma.phys() + OFF_CMD_RING as u64 | 1);
-
-    let evt_ring_buf = dma.subslice(OFF_EVT_RING, PAGE);
-    let erst = dma.ptr_at(OFF_ERST) as *mut ErstEntry;
-    unsafe {
-        write_volatile(erst, ErstEntry {
-            ring_base: evt_ring_buf.phys(),
-            ring_size: RING_SIZE as u32,
-            _reserved: 0,
-        });
-    }
-    rt_base.write_u32(IR0_ERSTSZ, 1);
-    rt_base.write_u64(IR0_ERDP, evt_ring_buf.phys());
-    rt_base.write_u64(IR0_ERSTBA, dma.phys() + OFF_ERST as u64);
-
-    // Enable interrupter 0
-    rt_base.write_u32(IR0_IMOD, 0);
-    rt_base.write_u32(IR0_IMAN, 3);
-
-    // Start controller (R/S + INTE for interrupt delivery)
-    op_base.write_u32(OP_USBCMD, 1 | (1 << 2));
-    if !settles(|| CONTROLLER_ANSWERS && op_base.read_u32(OP_USBSTS) & 1 == 0) {
-        refuse(format_args!("it stayed halted for {deadline_ms} ms after R/S"));
-        return None;
-    }
-    log!("xHCI: controller started");
-
-    // HCRST returns every root-hub port to the state it has with nothing
-    // attached, and on a controller with Port Power Control that state is
-    // unpowered — a port with no power reports no device, for the life of the
-    // boot. PP is RW there and reads back set on a controller without PPC, so
-    // the write is unconditional and the count is what says which happened.
-    let mut powered = 0;
-    for p in 0..max_ports {
-        let off = OP_PORT_BASE + p as u64 * PORT_REG_SIZE;
-        let portsc = op_base.read_u32(off);
-        if portsc & PORTSC_PP == 0 {
-            op_base.write_u32(off, Portsc::from_raw(portsc).neutral().powered().raw());
-        }
-        if op_base.read_u32(off) & PORTSC_PP != 0 {
-            powered += 1;
-        }
-    }
-    let powered_at = crate::clock::nanos_since_boot();
-    log!("xHCI: {powered}/{max_ports} root-hub ports powered (PPC={})",
-        u8::from(hccparams1 & HCC_PPC != 0));
-
-    // A controller with no HID on it is still a controller, and keeping it is
-    // not a formality: it has been reset, started and armed, so dropping it
-    // leaves a live interrupter with nothing draining its event ring. It is
-    // also the ordinary state of the target laptop, whose keyboard is PS/2 and
-    // whose touchpad is I2C-HID — under metal-sim a `None` here reached
-    // `kernel_main`'s `.expect` and panicked the boot.
-    Some(XhciController {
-        pci: *pci_dev,
-        op_base,
-        db_base,
-        rt_base,
-        max_ports,
-        powered_at,
-        context_size,
-        layout,
-        pool,
-        protocols,
-        cmd_ring,
-        event_ring: evt_ring_buf.base() as *const Trb,
-        event_head: 0,
-        event_phase: true,
-        devices: Vec::new(),
-        msc: [MscBlock::FREE; MSC_BLOCKS],
-        ports: (0..max_ports)
-            .map(|p| {
-                let mut port = PortState::EMPTY;
-                port.speaks(protocols.of(p));
-                port
-            })
-            .collect(),
-        ports_dirty: false,
-        #[cfg(feature = "xhci-portsc-rw1c")]
-        software_disabled: [0u64; 4],
-    })
-}

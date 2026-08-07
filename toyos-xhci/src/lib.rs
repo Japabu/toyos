@@ -10,11 +10,16 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod enumerate;
 pub mod invariants;
+pub mod job;
 pub mod port;
 pub mod protocol;
 pub mod portsc;
+pub mod recovery;
 
+pub use job::{Await, Outcome, Outstanding};
 pub use port::{Effect, Gone, Nanos, PortState, Step};
 pub use portsc::{LinkState, Portsc};
 pub use protocol::{Protocol, Protocols};
+pub use recovery::{EndpointState, Recovery};

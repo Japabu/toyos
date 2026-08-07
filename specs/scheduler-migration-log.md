@@ -443,3 +443,262 @@ doc-comment says so. `MAX_PASS_NS` is 200 µs. A CPU inside that recovery holds
 every message addressed to it, and `retire_task`'s deadline is the only thing in
 the tree that notices. Recorded in `specs/known-issues.md`; not fixed here,
 because closing it means making xHCI enumeration asynchronous.
+
+### The desktop freeze is a halted machine, not a wedged one (open, #156)
+
+`desktop_window_child` reproduces a freeze in QEMU at roughly 2 in 5 runs. The
+guest stops emitting anything at all — including the compositor's ~2 s stats
+line — and the test fails on whatever assertion it was waiting for.
+
+**The evidence that settled what it is, taken before anything touched the
+guest.** All eight vCPUs, read over QMP while the test sat in its 20 s wait:
+
+```
+CPU#0..7   RIP=ffff80007cecf5c1  RFL=00000246 [---Z-P-] CPL=0  HLT=1
+```
+
+`HLT=1` on every core and `RFL=0x246` has **IF set**. The CPUs are halted with
+interrupts *enabled*, waiting for an interrupt that never arrives. That is not
+a wedge, and it disproves four hypotheses at once: no CPU is spinning with
+interrupts off (`BackendGuard::lock` and the serial-drain livelock), none is
+holding a lock (a `hlt` holds nothing), none is stuck below the interrupt layer,
+and "no CPU reaches a scheduler pass" has the causality backwards — every CPU
+*can* schedule and there is nothing to schedule.
+
+Injecting Ctrl+Alt+D over the same QMP socket takes the halted count from 8 to
+0 and the machine resumes, compositor line and all. One keystroke revives it.
+
+**What the dump then reports, in three independent captures that agree:**
+
+```
+ready: pid=0 tid=0 compositor cpu=662ms
+cpu0 pid=0 tid=0 io parked 14ms due in 1ms
+== census: 1 thread(s) — 0 running, 1 ready, 0 blocked, 0 zombie, 0 unscheduled
+== sched: 8/8 cpu(s) answered — 0 running, 0 queued, 1 parked
+== deadlines: 0 event-only, 1 pending, 0 OVERDUE, 0 ABSURD
+```
+
+One thread exists in the whole system. The shell, the terminal and the child
+have all exited; the survivor is the compositor, parked on cpu0 **on a timer
+deadline**, and it is the only thing that could ever have restarted the machine.
+So the freeze is: *cpu0 halted with the last runnable-in-principle thread parked
+on a deadline that did not fire.*
+
+**Read `0 OVERDUE` there with the caveat below in hand: it describes the revived
+machine.** The keystroke that produced the report is what woke cpu0 and made it
+re-arm, so every deadline field postdates the repair.
+
+**Why the report could not be read at all** is the next section: the deadline
+was stored twice and the report read the copy that armed nothing. That is fixed;
+the freeze is not thereby settled, and this entry stays open.
+
+**Do not unify this with the T14 (#142/#156).** There, three CPUs failed to
+answer a 250 ms *kick* while five did; here 8/8 answer. Different observations,
+possibly different defects, and the T14 cannot be attached to — which is what
+the NMI probe in `arch/idt/nmi.rs` is for and why it stays even though the
+debugger settled this case without it.
+
+### The deadline was stored twice and only one copy armed anything (2026-08-06)
+
+`ParkedEntry.deadline` and `DeadlineHeap` each held the same value, and each
+module's doc comment claimed to be its single home — `timer.rs`: "every deadline
+lives in exactly one place: the home CPU's heap"; `cpu.rs`: "the deadline lives
+*here* and nowhere else". `apply_timer` armed from the heap. `sched::dump`,
+invariant T and `earliest_event` read the entry.
+
+They diverge in one arm. `fire_deadlines` called `DeadlineHeap::pop_due`, which
+**removes** the entry before the claim is attempted; a `Claim::Lost` then
+`continue`d and the heap entry was gone while `ParkedEntry.deadline` kept its
+copy. Such a CPU arms `TimerPlan::Stop` and reports `1 pending, 0 OVERDUE` — the
+corruption is not merely consistent with health, it is indistinguishable from it
+by construction, which is why #156's capture could not be read.
+
+**Why nothing had ever caught it, which is not what the checkpoint guessed.**
+Invariant T's teeth were never the problem: `check_timer`'s `(None, Some(due))`
+arm is exactly this state, and it fires on the very pass where the divergence
+happens in any `check` build. What was missing is a *scenario*.
+`SchedPass::begin` runs `drain` and `fire_deadlines` back to back with no step
+boundary between them, so the explorer cannot place a remote claim there and
+`Claim::Lost` is unreachable in every run the simulator has ever made — the same
+shape as the `8508b37` window and as `pre_park_claims`, an interleaving that is
+not in the step relation at all. On hardware the window is two instructions of a
+remote CPU: `TaskShared::claim_wake`, then the `Msg::Wake` post in
+`waitq::deliver_wake`. `sim/tests/deadline_claim_race.rs` is that pair with a
+whole pass scripted in between. Written and run **before** the fix; its verdict
+on the unfixed tree is
+
+```
+invariant T: cpu CpuId(0) has an event at Nanos(5000000) and no timer armed
+```
+
+**The fix deletes the second copy** rather than keeping the two in step: the
+deadline lives in `ParkedEntry` and nowhere else, `DeadlineHeap` and
+`DeadlineOracle` are gone with the lazy-deletion rule they existed for, and
+`apply_timer` reads the field invariant T reads. With one copy, the lost claim
+has exactly one thing it can do and it is also the correct thing — clear the
+deadline. A remote waker owns the wake, so no later claim can succeed and that
+timeout can never fire; an entry that went on reporting it was reporting
+something that would not happen. Clearing it is also what advances the loop,
+which is the property worth having: the deadline that will not be honoured and
+the deadline that is not reported are one field.
+
+Cost: `earliest_deadline` and `next_due` scan `parked` where the heap was
+O(log n) amortized, and both sit on the pass path. What that buys is the
+deletion of the oracle, the staleness rule, and a two-statement mutation whose
+second statement is the one that went missing. The number that would reverse the
+decision is hundreds of threads blocked on one CPU.
+
+**What this does not settle.** It closes a representation defect and a report
+that lied; it is *not* established that this is what froze the guest. The
+claim's `Msg::Wake` follows it within two instructions, cpu0 cannot halt with a
+non-empty mailbox (`SleepArm::confirm`), and a post to a CPU that has published
+SLEEPING returns `Kick::Send` — so the protocol still has an answer for every
+ordering that could be constructed by reading it. `desktop_window_child` stays
+an expected red and is not evidence either way (known-issues §3). And nothing
+here says anything about the T14, where 3 of 8 CPUs missed a kick and this
+machine's 8 answered.
+
+### The freeze now carries its own capture (2026-08-06)
+
+`desktop_window_child` failing was, until now, a message and a log; every
+reading of #156 needed a human to be at the socket while the guest sat frozen.
+The test's probes moved into `window_child_probes` and every failure of it now
+returns through `freeze_report`, which asks the guest two questions in the one
+order that survives being asked: `info registers -a` over the human monitor
+first, then Ctrl+Alt+D and the blocked-task dump. A keystroke revives a halted
+CPU, so the other order answers about the repaired machine — which is exactly
+the caveat the 2026-08-06 capture had to carry.
+
+`qemu::QmpMonitor` is the human monitor; `Qmp::execute_capturing` keeps the
+reply that `execute` discards, since only `human-monitor-command` answers with
+anything.
+
+Verified by forcing the failure: 8 CPUs of registers and a whole dump reached
+the message, and the harness reported the forced reason as **not** one the
+`EXPECTED_FAILURES` entry covers, so the `says` list still has its teeth.
+
+### Eight boots on the fixed tree: no freeze, and one defect in front of it
+
+`desktop_window_child`, on `add6aeb`'s tree with the report above attached:
+two full-suite runs in the 12-wide phase and six runs alone. **Red every
+time, and not once the freeze.** Every capture shows the guest alive for the
+whole drain — `compositor: frames=…` every ~2 s, the kernel's stats every
+10 s, and the i8042 counter climbing to 4818 keys as the harness re-injected
+GUI+Q — where #156's signature is a guest that emits nothing at all. All eight
+vCPUs were `HLT=1 RFL=0x246` at the capture, which on a settled desktop is
+simply an idle machine.
+
+What every one of the eight shows instead is one shape:
+
+```
+[kernel 3.665] exit: test_rs_window_child pid=5 code=0 cpu=30ms
+WINDOW-CHILD-GONE
+[kernel 3.870] exit: shell pid=2 code=0 cpu=76ms
+/home/root> [kernel 3.876] exit: terminal pid=1 code=0 cpu=1786ms
+compositor: … windows=0
+```
+
+GUI+Q reaches the compositor, the window goes, the client leaves with `code=0`
+— and then the shell exits, and the terminal after it, so the desktop goes
+from two windows to none inside one 2 s stats interval. `close_focused_window`
+waits for `windows=1`, never sees it, and reports "GUI+Q never reached the
+compositor", which is the message known-issues §3 already says names the wrong
+thing. It is the shell-exit defect that entry describes, and it now fires at
+the *second* probe — the owner's case, a live client whose window is taken
+away — rather than only at the first.
+
+Six of the eight stop there. One of the alone runs got through
+to snake round 0 and produced the same shape with `exit: snake pid=7 code=0
+cpu=1224ms` in place of the client's line. So where the test stops varies with
+load; what happens does not.
+
+**This is what now blocks #156's QEMU reproduction.** The freeze was seen in a
+snake round; the desktop is torn down one or two probes earlier, so the test
+cannot reach the venue. The entry's `ALONE: GREEN` no longer holds either — 6
+of 6 alone are red.
+
+Not caused by the winit lock bump (`faf99eb7`, "stop draining a window that has
+closed"). Same-session A/B, alone: 3 runs at `be9ec72c` against 3 at
+`faf99eb7`, red on both sides with the same message and the same three exits
+inside 0.25 s of the client's. What the bump did change is visible in that one
+boot that got further — snake now *leaves* when its window is closed, `code=0`
+after 1224 ms of CPU, where #141 is a winit app that spins forever instead.
+
+Nor is it a regression from the deadline fix: `11a88f4` wrote those same three
+exits into known-issues at 17:32, and `add6aeb` landed at 18:05 and is not an
+ancestor of it.
+
+### The desktop was told to close twice, and the second GUI+Q took the terminal
+
+The teardown above is not a guest defect. Instrumenting the compositor's GUI+Q
+arm and the terminal's two exits says so in one line each:
+
+```
+compositor: DIAG GUI+Q closes idx=1 pid=5, 1 left
+exit: test_rs_window_child pid=5 code=0
+WINDOW-CHILD-GONE
+compositor: DIAG GUI+Q closes idx=0 pid=1, 0 left
+terminal: DIAG got window Close
+exit: shell pid=2 code=60
+exit: terminal pid=1 code=0
+```
+
+Two closes, ~200 ms apart, the second naming pid 1 — the terminal. Everything
+after it is correct: the terminal breaks on `Event::Close`, drops
+`shell_stdin`, the shell's stdin reaches genuine EOF (code 60 is
+`UnexpectedEof`, encoded into the exit code because a diagnostic through that
+pipe is lost with it), the shell leaves, and the terminal's `child.wait()`
+returns.
+
+**The second GUI+Q is the harness's.** `close_focused_window` loops
+`while !log[new..].contains("windows=1")` and waits with `serial_until`, which
+scans the *whole* capture — so `windows=1` from the previous probe answers the
+wait instantly, the loop condition then correctly finds nothing new, and it
+injects again. It hammers GUI+Q at the speed of a QMP round trip until a fresh
+`windows=1` appears. Its own doc comment says a second GUI+Q "would close the
+terminal's window instead"; that is exactly what happened, and it is the defect
+`serial_until_new` exists to prevent, one layer up.
+
+Established by exit code rather than by output, twice: the shell's
+`read_byte` swallowed the distinction between EOF and error into `None`, and
+its `println!` never reached serial because the terminal breaks out of its loop
+on stdout EOF without draining stderr — so the only channel that survives the
+event being diagnosed is the kernel's own `exit:` line.
+
+**What this changes.** The shell-exit teardown recorded under #156 is, in this
+manifestation, a test that says "close" twice. It is not evidence about the
+owner's report, which was the X button and one click. And the structural defect
+underneath is real and not test-only: **a destructive command with no
+acknowledgement, whose only observable is a 2 s sample of a counter.** That is
+why there is a retry loop at all.
+
+### The fix, and where it leaves #156
+
+Two halves, and only one of them is the test.
+
+**The compositor now announces a close.** A client that *dies* was already
+announced — `dropping pid N — why` — and a window somebody *closed* was not, so
+the desktop's only record of one was the `windows=N` field of a statistics line
+emitted every two seconds. That is a sample of a level: two closes inside one
+interval are indistinguishable from one, and from none if a window opened in
+between. `note_closed` fires at the three deliberate sites — GUI+Q, the close
+button, and the client's own `MSG_DESTROY_WINDOW` — naming the pid, what closed
+it, and how many are left. Every report the owner has made about this desktop
+begins "I closed a window and then", and until now the log could not say which
+window went.
+
+**`close_focused_window` waits on that event.** It no longer samples a counter,
+so a re-send happens only when the close genuinely did not land, and its
+failure message — "GUI+Q never reached the compositor" — is true when it fires.
+
+`desktop_window_child` then passes end to end for the first time: alone in
+19 s, and in the 12-wide phase with a second worktree's suite holding half the
+host's guest slots and running the same test.
+
+**#156 is not closed by this and the entry stays.** The freeze's signature is a
+guest that goes silent, and none of the eleven boots in this session produced
+one. What changed is that the test now *reaches* the snake rounds where the
+freeze was seen. The predecessor's QMP capture — eight vCPUs `HLT=1` with `IF`
+set, one thread left, Ctrl+Alt+D reviving the machine — remains unexplained,
+and note that a machine whose desktop has been closed out from under it looks
+similar in the census and *not* in the serial log, which keeps flowing.

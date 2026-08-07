@@ -734,6 +734,21 @@ fn mark_dead(dead: &mut Vec<Dead>, fd: Fd, pid: u32, reason: DropReason) {
     }
 }
 
+/// Say that a window was deliberately closed, and by what.
+///
+/// A client that *dies* is already announced — `dropping pid N — why` — and a
+/// window somebody closed was not, so the desktop's only record of one was the
+/// `windows=N` count in the statistics line. That is a sample of a level taken
+/// every two seconds: two closes inside one interval are indistinguishable
+/// from one, and from none if a window opened in between. Every report the
+/// owner has made about this desktop begins "I closed a window and then", so
+/// which window went, why, and how many are left is the first thing anyone
+/// asks of the log — and a caller that re-sends a close because it could not
+/// tell whether the first one landed closes the next window down.
+fn note_closed(by: &str, pid: u32, remaining: usize) {
+    eprintln!("compositor: window closed pid={pid} by {by}, {remaining} left");
+}
+
 /// Hand a window a typed frame, or mark it for removal.
 ///
 /// A failure is never retried and never ignored: `TrySendError::Full` can have
@@ -1506,6 +1521,7 @@ fn main() {
                             0x14 => {
                                 // GUI+Q: close focused window
                                 let win = windows.remove(idx);
+                                note_closed("GUI+Q", win.pid, windows.len());
                                 let _ = win.fd.try_signal(window::MSG_WINDOW_CLOSE);
                             }
                             0x19 => {
@@ -1685,6 +1701,7 @@ fn main() {
                     match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
+                            note_closed("its close button", win.pid, windows.len());
                             damage.add(window_screen_rect(&win));
                             let _ = win.fd.try_signal(window::MSG_WINDOW_CLOSE);
                             damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
@@ -2220,6 +2237,7 @@ fn main() {
                 window::MSG_DESTROY_WINDOW => {
                     if let Some(idx) = windows.iter().position(|w| w.fd.fd() == client_fd) {
                         let gone = windows.remove(idx);
+                        note_closed("the client itself", gone.pid, windows.len());
                         damage.add(window_screen_rect(&gone));
                         damage_windows(&mut damage, &windows, screen_w as usize, screen_h as usize);
                     }

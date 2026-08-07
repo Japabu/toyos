@@ -25,25 +25,36 @@ is stated where the number appears. Estimates say so in the same sentence.
 Four questions, answered in §4, §5, §6 and §7. One is answered here because
 everything else is downstream of it.
 
-**Does HDA go in the kernel or in userland?** Userland, inside soundd, behind
-the IOMMU. `specs/userspace-drivers-spec.md` §3.1's criterion — *a driver stays
-in the kernel only if the kernel needs it while userspace is dead* — does not
-keep audio under any reading, and §2 forbids a driver crossing the boundary
-before the IOMMU is complete. `specs/wlan-plan.md` §3.1 already applied the
-stronger form to a device *entering* userland rather than leaving it: no
-kernel-resident interim driver at any point. The same rule binds here.
+**Does HDA go in the kernel or in userland?** Userland, inside soundd — and the
+boundary between them is **who writes an address**. soundd maps the whole BAR
+**read-only**, reads it directly, and reaches every register *write* through the
+kernel; the kernel never accepts a physical address from soundd, only a handle
+to a buffer it allocated itself. That is the **kernel stub**, decided by the
+owner on 2026-08-06 against both a fully-mapped userspace driver and a kernel
+driver, and §4.1 is its whole statement.
 
-**The cost of that answer is the whole of §4.2**, and it is large: interrupt
-remapping (I3), domains and mapping (I4), BAR sizing and relocation
-(`userspace-drivers-spec.md` stage 3) and the capability itself (stage 4) all
-land before the first HDA register is read. I3 is the step
+`specs/userspace-drivers-spec.md` §3.1's criterion — *a driver stays in the
+kernel only if the kernel needs it while userspace is dead* — does not keep
+audio under any reading, and the stub does not violate it: the codec
+enumeration, the widget-graph traversal, the path choice, the format, the amps
+and the mixer are all soundd's, and what is left in the kernel writes no policy
+down. `specs/wlan-plan.md` §3.1's rule against a kernel-resident interim driver
+binds here and is met — §4.3 is the argument, and §8 item 2 still forbids the
+thing it names.
+
+**What that answer costs is now small, and this is the point of it.** The first
+draft of this file put interrupt remapping (I3), domains and mapping (I4), BAR
+sizing and relocation (`userspace-drivers-spec.md` stage 3) and the capability
+itself (stage 4) ahead of the first HDA register — I3 being the step
 `specs/iommu-spec.md` §12 calls the one that "can black-screen the machine".
+**The stub needs none of them for containment**, because containment no longer
+rests on translating a driver's DMA: the device is only ever programmed with
+addresses the kernel chose. §4.2 is the re-derived chain and it is four rows
+shorter.
 
-**What this spec cannot settle** is whether the owner wants the last piece of
-the doom milestone behind that chain. §4.3 prices the alternative — a
-kernel-resident HDA driver behind a `trait Audio`, deleted later — honestly
-enough that the owner can overrule §1's answer with data rather than with a
-feeling. It does not propose it.
+**What this spec cannot settle** is the residual the stub does not close: soundd
+reads a 2 MiB page it does not fully own (§4.1's read-side residual), and
+nothing here measures HDA against CLAUDE.md's 2× bar (§5.1).
 
 ---
 
@@ -181,7 +192,26 @@ period:
 **There is no submit in steady state.** `SDnLVI` is set once to the last index
 and the DMA engine runs the ring forever. That is a materially cheaper path than
 virtio's per-period descriptor submit — and it changes the underrun semantics in
-a way that matters more than the saving:
+a way that matters more than the saving.
+
+**Counted, because §4.1's kernel stub is priced on it: a period costs zero
+register writes from the driver's own logic, and at most one from the ISR.**
+The engine cycles the BDL unaided; `toyos-hda`'s `stream.rs` builds that ring
+once. What the driver does per period is an `SDnLPIB` **read**, 512 bytes of
+zeroing stores and 512 bytes of PCM stores — no register write of any kind. The
+one write is `SDnSTS`'s write-1-to-clear interrupt acknowledgement, and it is
+**fewer than one per period** because an interrupt covers one or more buffers.
+It is also unambiguously the kernel's: an interrupt acknowledged from userland
+is an interrupt left asserted across a scheduling round trip. Every BDL entry
+this crate builds sets `interrupt_on_completion` (`toyos-hda/src/stream.rs:87`),
+so at rest that is one ISR write per period and under batching fewer.
+
+**Under the stub that is the whole answer**: the per-period syscall count is
+zero, because the only per-period write is on the side of the boundary that
+owns the IDT already. §4.1 states what the reads cost and what the writes that
+are *not* per-period cost.
+
+The underrun semantics:
 
 > **A late soundd does not produce silence on HDA. It produces a *repeat* of
 > whatever bytes are still in the buffer.** virtio-sound's device runs dry and
@@ -294,7 +324,7 @@ persistence is blocked on something outside this track.
 
 ## 4. Where the driver lives, and what the kernel must provide
 
-### 4.1 One process, and it is soundd
+### 4.1 One process, and the line through it is who writes an address
 
 **The HDA driver is a library crate linked into soundd, not a separate daemon.**
 
@@ -303,38 +333,252 @@ Each claims a device from the kernel, maps hardware buffers into its own memory,
 and serves clients over IPC." soundd claiming `00:1f.3` rather than
 `DEVICE_AUDIO` is that sentence working, not an exception to it.
 
-The argument that decides it is the period budget. Today one period costs soundd
-a wake plus two syscalls (`SYS_AUDIO_POLL`'s read of completion records,
-`SYS_AUDIO_SUBMIT`). With the driver in soundd it costs **a wake and no
-syscalls**: the completion mask comes from an MMIO read of `SDnLPIB` in soundd's
-own address space, and there is no submit at all (§2.4). A *separate* driver
-daemon would put an IPC round trip inside a 2.902 ms period, which is the shape
-`specs/userspace-drivers-spec.md` §9 predicts will get stage 7 reverted.
+The argument that decides *that* is the period budget. Today one period costs
+soundd a wake plus **2k + 7 syscalls per wake**, where k is the periods refilled
+in the cycle — one `SYS_IO_URING_ENTER`, one `SYS_READ_NONBLOCK` of the
+completion records, one `SYS_WRITE_NONBLOCK` per client, four `SYS_CLOCK`, and
+then one `SYS_CLOCK` and one `SYS_AUDIO_SUBMIT` per period. `SYS_AUDIO_POLL` is
+not among them; it has no dispatch arm and no caller, and
+`capability-handles-spec.md:759` already calls it dead ABI (§10 item 7). With
+the driver in soundd, the completion mask comes from an `SDnLPIB` read in
+soundd's own address space and there is no submit at all (§2.4). A *separate*
+driver daemon would put an IPC round trip inside a 2.902 ms period, which is the
+shape `specs/userspace-drivers-spec.md` §9 predicts will get stage 7 reverted.
 
 So the boundary move makes the audio path **shorter**, not longer. That is worth
-stating plainly because the opposite is the intuition.
+stating plainly because the opposite is the intuition, and §4.1.2 is where the
+stub is checked against it rather than assumed to preserve it.
 
-What would reopen it, recorded now so the decision is falsifiable later
-(`wlan-plan.md` §3.2, same discipline): a second audio device; a capture path
-whose lifetime differs from playback's; or a measurement showing the MMIO reads
-from a user address space cost more than the syscalls they replaced.
+#### 4.1.1 The stub
 
-### 4.2 The prerequisite chain
+Decided by the owner on 2026-08-06, against a fully-mapped userspace driver and
+against a kernel driver. **The line is who writes an address.**
+
+1. **soundd maps the whole BAR read-only.** ToyOS enforces `mmap` prot — no
+   `WRITE` is a read-only PDE — and the same is true one layer down:
+   `AddressSpace::map_range` sets `PAGE_WRITE` only when its `writable`
+   argument is true (`kernel/src/mm/paging.rs:333-336`). The BAR cannot be split
+   by paging in any case: `SDnLPIB` and `SDnBDPL` are 20 bytes apart and this
+   kernel maps 2 MiB pages.
+2. **Reads stay direct.** §2.4's per-period `SDnLPIB` read is one MMIO read in
+   soundd's own address space and costs no syscall. That is the whole of §4.1's
+   argument and the stub keeps it.
+3. **Every write goes through the kernel** — not only the address-bearing ones,
+   because the BAR cannot be split. The kernel never accepts a physical address;
+   it accepts a handle to a buffer it allocated and programs the register
+   itself.
+4. **Zero copies.** The PCM buffer is kernel-allocated, mapped **writable** into
+   soundd, and the BDL points at it. soundd writes samples straight into the
+   buffer the hardware reads — the arrangement `virtio_sound.rs:562` already has
+   with `shared_memory::register`.
+5. **Interrupts are the kernel's by construction** (it owns the IDT and MSI), so
+   §2.4's `SDnSTS` acknowledgement is kernel-side already and is not a new cost.
+
+**Why the read-only mapping is the load-bearing decision and not the register
+allow-list.** A boundary built on enumerating the dangerous registers fails
+silently the day the enumeration is wrong — a vendor register nobody read the
+datasheet for, a second BAR nobody knew about. A boundary built on *no writes at
+all* does not: it is closed by construction and the enumeration becomes a
+convenience rather than a proof. That is the reason to take this shape over
+"map it writable and police the address registers", and it is the answer to
+§4.1.3's list too.
+
+**So the kernel's write surface is a positive list, never a refusal list.** The
+kernel stub carries the offsets soundd may ask it to write; anything else is
+refused **by name**. The polarity is the point — an allow-list that is missing
+an entry costs a driver that cannot bring a stream up and says so, and a
+refusal-list that is missing an entry costs a device pointed at kernel memory.
+Every entry on the list is justified by the same one-line property: *its value
+is not an address*. §4.1.3 is that list and its complement.
+
+**What is not on it, because the kernel writes it unasked.** Controller reset,
+CORB/RIRB ring setup, interrupt enables, the stream descriptor's address
+registers and the BDL's contents are bring-up mechanism with no policy in them,
+and the kernel performs the sequence when soundd claims the device and hands it
+buffer handles. What stays in soundd is every *decision*: which codecs answered,
+which function groups, the widget-graph traversal, the pin, the converter, the
+amps, EAPD, the format, and the whole mixer. That is `toyos-hda/`, unchanged by
+this decision, and it is why the stub is not §4.3's kernel-resident driver
+wearing a different name.
+
+#### 4.1.2 What it costs, and what remains unmeasured
+
+**Per period: zero syscalls.** §2.4 counts the register writes and finds none on
+the driver's side; the only per-period write is the ISR's `SDnSTS`
+acknowledgement, on the side of the boundary that owns the interrupt already.
+The stub therefore costs nothing at all in the audio path, and §4.1's "a wake
+and no syscalls" survives intact — which was the condition the owner set on it.
+
+**Per verb: one syscall, and verbs are not in the audio path.** Through
+CORB/RIRB a verb is a 32-bit store into a ring soundd may map writable — a codec
+verb has no bus-mastering and cannot name memory — plus **one** `CORBWP` bump.
+N verbs queued before the bump are one syscall. The immediate-command path costs
+four register writes per verb (`kernel/src/drivers/hda_probe.rs:648-663`) and is
+H0's, kept for a controller whose CORB is not up yet.
+
+**At bring-up, once.** Replaying `hda_probe.rs`'s own conditional verb structure
+against the committed T14 fixture gives **215 verbs** for the probe's full dump
+and **115** for a driver-minimal enumeration that reads only the fields
+`toyos-hda::graph::Codec` carries; QEMU's two codecs give 52 and 32. Path
+configuration is 14 verbs (17 if amps are written per channel). Batched behind
+one `CORBWP` bump per dependency level that is tens of syscalls, once, at claim
+time — against 344.53 periods per second thereafter.
+
+**Per jack poll: at most one syscall every 2 s** (§2.5's two verbs, one bump).
+**Per volume change: zero** — the master volume is a digital gain on soundd's
+mix bus and touches no codec amplifier (§8 item 12, §9).
+
+**Unmeasured, and named so it is not read as measured.** Every figure above is a
+count of syscalls, not a cost. What an MMIO read from a user address space costs
+against the syscall it replaces is TCG-immeasurable (§5.1) and is H3's and H5's
+to answer on real silicon in one session. The 2k+7 figure is read out of the
+tree; **k̄ ≈ 1.20 is derived** from `tests/audio-baseline.toml:286`'s recorded
+wake median of 918.5 over a 3.0 s tone's ~1102 periods, so completions barely
+batch today and the loop pays nearly the full per-wake price on every period.
+
+#### 4.1.3 The address surfaces, re-derived
+
+Asked because the owner's count was six and the plan excludes one of them. What
+the driver programs, from §2.1 and §2.2:
+
+| Surface | Register(s) | Who writes it under the stub |
+|---|---|---|
+| CORB base | `CORBLBASE`, `CORBUBASE` | kernel, from a buffer handle |
+| RIRB base | `RIRBLBASE`, `RIRBUBASE` | kernel, from a buffer handle |
+| BDL base | `SDnBDPL`, `SDnBDPU` | kernel, from a buffer handle |
+| the addresses *inside* BDL entries | not registers — stores into the list | kernel; `toyos-hda::stream` computes the layout, the kernel resolves handle → address |
+| MSI address and data | PCI **config** space | kernel; `userspace-drivers-spec.md` §4.2 makes config space unwritable from userland and soundd never touches it |
+| DMA position buffer base | `DPLBASE`, `DPUBASE` | **nobody** — §2.1's not-touched list and §8 item 8 exclude it, and the read-only mapping means soundd could not reach it if it wanted to |
+
+**Six surfaces, three address-bearing register pairs, and the sixth is one the
+plan declines to use** — so the owner's count is right and its last member is a
+surface the hardware exposes rather than one the driver programs. The stub's
+guarantee does not depend on this table being complete, which is exactly why it
+was chosen; the table is here so a reader can see what a *writable* mapping
+would have had to police.
+
+**The complement — what soundd may ask the kernel to write — is short and every
+entry carries a value that is not an address:** `CORBWP` (publish queued verbs),
+`SDnCTL` (stream reset, run/stop, IOC enable, stream number), `SDnFMT` (the
+16-bit format word `toyos-hda::stream` encodes), `SDnCBL` (a byte count),
+`SDnLVI` (an index), and `GCTL.CRST` if a re-init is ever wanted. Verb *content*
+is not on the list at all because it is a store into DMA memory soundd owns.
+
+#### 4.1.4 What the stub does not close
+
+- **A read-only mapping is still a 2 MiB mapping.** `alloc_and_map` asserts its
+  physical base is 2 MiB-aligned (`kernel/src/mm/paging.rs:525-528`) and a
+  16 KiB BAR is not, so the mapping starts at the containing boundary and
+  carries whatever else lands in that page. On the T14 the candidates are the
+  four sibling functions — eSPI, SMBus, **the SPI flash controller** and the
+  Ethernet NIC (§3) — and a register with a read side effect among them is a
+  real exposure that no amount of write-blocking removes. **The fix is a
+  claim-time precondition, not a relocation**: the kernel computes the 2 MiB
+  page's other occupants exactly as H0's `2m-page-neighbours` scan does and
+  refuses the claim by name if there are any. That fails closed, needs no free
+  MMIO space, and turns `userspace-drivers-spec.md` stage 3 from a blocker into
+  the remedy for a machine that says no.
+- **The T14 has never answered that scan.** H0 ran, but only §6.4's codec
+  findings were committed; the whole `(a)` block — scope members, RMRR, MSI
+  vectors, BAR0 size/width/movability, `2m-page-neighbours`, `ECAP.SC` — is
+  **not in this repository**. §6.5 records that and what to do about it.
+- **A read-only mapping is not an uncacheable one, and UC is not currently
+  speakable.** `CachePolicy` has two variants and neither is UC
+  (`kernel/src/mm/paging.rs:41-51`); `DeferToMtrr` is PAT entry 0, which is WB
+  and takes the MTRR's type. Every MMIO mapping in this kernel already relies on
+  that and the xHCI and NVMe drivers work on the T14, so firmware's MTRRs do say
+  UC for this range — but that is inference from working drivers and not a read
+  of `mtrr::range_type` for BAR0. §4.4 item 2's third variant is **more**
+  load-bearing under the stub than it was under a full handoff: `SDnLPIB` read
+  out of a write-back mapping returns a stale position, and the symptom is a
+  completion mask that looks like a scheduling defect.
+
+  **And adding it is not the one-line change it looks like.** `pat::init` writes
+  the architectural reset table with entry 4 alone changed to WC —
+  `ENTRIES = [WB, WT, UC-, UC, WC, WT, UC-, UC]` (`kernel/src/arch/pat.rs:37`).
+  A 2 MiB PDE names its entry with `PAT<<2 | PCD<<1 | PWT`, so with PCD and PWT
+  clear **only indices 0 and 4 are reachable, and both are already taken**.
+  Strong UC is at 3 and 7 and needs both bits; UC- is at 2 and 6 and needs PCD.
+  So an `Uncacheable` variant must set PCD and PWT, which contradicts
+  `paging.rs:36-38`'s stated invariant that this kernel leaves them clear
+  everywhere, *and* `from_pde`'s assert (`paging.rs:64-71`) panics on exactly
+  the PDE it would install — on the very mapping the stub creates, through
+  `user_policy` at `shared_memory.rs:70-73`. Reprogramming a spare slot does not
+  help: every spare needs one of the two bits to be named at all.
+
+  **Take entry 3, strong UC, not entry 2.** UC- yields WC where the MTRR says
+  WC, which is the stale-position failure above rather than a defence against
+  it. What the change costs: the variant, `pde_bits`, a rewritten `from_pde`
+  that decodes all three bits and still refuses the four indices this kernel
+  does not use, and `pat.rs:29-33`'s claim about leaving "the two bits that mean
+  uncacheable to older software untouched", which stops being true.
+- **`shared_memory` cannot map read-only today.** `SharedRegion::map_into`
+  passes `writable: true` literally (`kernel/src/shared_memory.rs:64`) and the
+  region carries no such field. One field and one argument; named because it is
+  the one line of existing code the stub contradicts, and because a stub whose
+  BAR mapping came out writable would look exactly like a stub that worked.
+
+#### 4.1.5 What would reopen it
+
+Recorded so the decision is falsifiable later (`wlan-plan.md` §3.2, same
+discipline). Three of these were already here for the userland/kernel question
+and still bind; the rest are the stub's own.
+
+- A second audio device, or a capture path whose lifetime differs from
+  playback's.
+- **A measurement showing the MMIO reads from a user address space cost more
+  than the syscalls they replaced.** Unchanged, and still unmeasured.
+- **A per-period register write turning up in H4** that §2.4's count missed.
+  The stub then costs one syscall per period at 344.53/s, and gate A is the
+  instrument that prices it — same session, A/B, thorough tier.
+- **The allow-list growing to the point where it is no longer readable as a
+  list of non-addresses.** The polarity is the guarantee; a list nobody can
+  check entry by entry has stopped being one.
+- **A claim-time neighbour refusal on the T14** (§4.1.4). That does not reopen
+  the stub — it makes `userspace-drivers-spec.md` stage 3 a prerequisite again,
+  for this machine only, and §4.2 says so.
+- **The kernel's bring-up sequence acquiring a decision.** Today it writes no
+  policy down. The day it needs to know which codec or which pin, the line has
+  moved and this section is wrong.
+
+### 4.2 The prerequisite chain, re-derived under the stub
 
 Not this track's work, and named so the dependency is visible. Shared with
-`specs/wlan-plan.md` W5 — neither track pays for it alone.
+`specs/wlan-plan.md` W5 — neither track pays for it alone. **Four rows shorter
+than the first draft**, and the deletions are the point of §4.1's decision.
 
-| Prerequisite | State | What HDA needs from it |
+| Prerequisite | State | What HDA needs from it, under the stub |
 |---|---|---|
-| `iommu-spec.md` **I0–I2** | **done** | every function has a context entry and translation is on |
-| `iommu-spec.md` **I3** — interrupt remapping | not built | HDA's MSI must be deliverable to a userland driver at all |
-| `iommu-spec.md` **I4** — domains, map/unmap/invalidate, faults | not built | the CORB, RIRB, BDL and audio buffers are IOVAs |
-| `userspace-drivers-spec.md` **stage 3** — BAR sizing and 2 MiB re-assignment | not built | `read_bar_64` never sizes a BAR (`pci.rs:108`), and 16 KiB of registers must be mapped without their neighbours |
-| `userspace-drivers-spec.md` **stage 4** — the capability | not built | §4.4 |
+| `iommu-spec.md` **I0–I2** | **done** | every function has a context entry and translation is on. HDA is in the identity-mapped domain like every other kernel device, and stays there. |
+| `iommu-spec.md` **I3** — interrupt remapping | not built | **not a prerequisite.** The MSI is delivered to the kernel's own IDT vector, which is where it goes today; there is no userland driver for a vector to reach. |
+| `iommu-spec.md` **I4** — domains, map/unmap/invalidate | not built | **not a prerequisite.** The CORB, RIRB, BDL and audio buffers are kernel-allocated and the kernel programs their addresses. There is no untrusted IOVA to translate, because there is no address soundd can put on the bus. |
+| `userspace-drivers-spec.md` **stage 3** — BAR sizing and 2 MiB re-assignment | not built | **not a prerequisite; a remedy.** A read-only mapping of a shared 2 MiB page cannot be used to write a neighbour, so relocation stops being a safety condition. It becomes what a machine failing §4.1.4's claim-time neighbour check needs in order to proceed — and the T14 has not been asked. |
+| `userspace-drivers-spec.md` **stage 4** — the capability | not built | **needed, and smaller.** Claim the function, map its BAR read-only and uncacheable, hand back a PCM buffer handle, deliver IRQ records, and take allow-listed register writes. Four of §4.4's eight syscalls, not eight. |
 
-**HDA is a better vehicle for stage 4's gates than the second `virtio-net-pci`
-that spec proposes**, on three independent counts, and the spec's own §7.2 is
-the reason for two of them:
+**The IOMMU is not deleted from this picture and must not be read as optional.**
+It is defence in depth against a controller that misbehaves or a kernel bug in
+the stub, which is what I0–I2 already give every device. What changed is that it
+is no longer the *trust boundary*: under a fully-mapped handoff the unit was the
+only thing standing between soundd and physical memory, and under the stub
+nothing soundd can do reaches the bus at all. That is why I3 and I4 stop gating
+audio, and it is the whole reason §1's cost sentence is short now.
+
+**Two risks close with them.** §7 risk 1 — the isolation scope's five members —
+refused the handoff *as the rule is written*, and the stub does not perform a
+handoff, so `iommu-spec.md` §7.3 has nothing to say about this device. §7 risk 4
+— an RMRR on `00:1f.3` — refused the handoff for a hard reason, and it too has
+no handoff to refuse. Both remain open questions about the machine and neither
+is on audio's path any more. **The owner's research is what settled that this
+was the right shape rather than a way around a rule**: refusing a device to
+userspace the way Linux and VFIO do is the minority position — Fuchsia deleted
+its VT-d driver in March 2026, seL4 states that DMA-capable drivers must be
+trusted, and macOS merges the T14's exact PCI shape into one group — and the
+stub is proven twice in the literature, by Nexus RVM/DSS (OSDI'08) against an
+i810 audio controller and by Windows WDDM's `DxgkDdiPatch` and WaveRT.
+
+**HDA is still a better vehicle for stage 4's gates than the second
+`virtio-net-pci`** that spec proposes, on three independent counts, and the
+spec's own §7.2 is the reason for two of them:
 
 1. **It is behind the vIOMMU with no guest-side negotiation.** §7.2's first
    vacuity trap is that QEMU hands a virtio device the bypassing address space
@@ -383,34 +627,56 @@ smaller deliverable because the owner is blocked. So this plan builds the right
 thing and states the cost. **The trade is the owner's and it is a sequencing
 trade, not a design one** — the end state is identical either way.
 
+**The stub is not this, and the difference is what each half decides.** The
+kernel-resident driver above owns the codec enumeration, the widget-graph
+traversal, the path choice, the format and the amplifiers — every decision in
+§2.3, the part §5.1 calls the least-covered and highest-risk code in the plan —
+and it is written to be deleted. The stub owns a fixed bring-up sequence and a
+list of offsets, decides nothing, and is not written to be deleted: it is where
+this device's register writes live permanently. §8 item 2 forbids the first and
+is unchanged by the second. The test to apply if that distinction ever blurs is
+§4.1.5's last bullet: **the day the kernel half needs to know which codec or
+which pin, it has become the thing this section declines.**
+
 ### 4.4 The ABI, item by item
 
-`userspace-drivers-spec.md` §4.6 proposes eight syscalls. **HDA is the first
-caller of all eight and needs no change to the shape of any of them.** What it
-adds is five things, four of which add no ABI at all — which is the interesting
-result.
+`userspace-drivers-spec.md` §4.6 proposes eight syscalls. **Under the stub HDA
+needs four of them and one that spec does not have**, and it needs no change to
+the shape of any of the four. What it adds is six things, four of which add no
+ABI at all.
 
 | # | What | General or HDA-specific | Verdict |
 |---|---|---|---|
-| 1 | `SYS_PCI_LIST`, `SYS_DEVICE_CLAIM`, `SYS_DEVICE_CONFIG`, `SYS_DEVICE_BAR`, `SYS_DEVICE_BAR_MAP`, `SYS_DMA_MAP`, `SYS_DMA_UNMAP`, `SYS_DEVICE_IRQ` | **general** | unchanged; HDA is their first consumer |
-| 2 | **A BAR mapping must be uncacheable** | **general** | `paging::CachePolicy` (`mm/paging.rs:41`) has two variants today, `DeferToMtrr` and `WriteCombining`, and `map_mmio` (`:595`) takes one. Neither is right for a *user* mapping of device registers: `DeferToMtrr` is PAT entry 0, which is WB and inherits whatever firmware's MTRRs decided (`iommu-spec.md` §12, task #139). **Adds no ABI**: a third `Uncacheable` variant, and `SYS_DEVICE_BAR_MAP` uses it unconditionally, because there is no BAR a driver should be allowed to map write-back. A parameter here would be a signature promising a choice that has one correct answer. |
+| 1 | `SYS_PCI_LIST`, `SYS_DEVICE_CLAIM`, `SYS_DEVICE_BAR_MAP`, `SYS_DEVICE_IRQ` | **general** | unchanged; HDA is their first consumer. `SYS_DEVICE_CONFIG` is not needed — soundd never reads or writes config space under the stub — and `SYS_DMA_MAP`/`SYS_DMA_UNMAP` are not either, because a driver that cannot program an address has nothing to map. `SYS_DEVICE_BAR` folds into the claim. |
+| 1b | **`SYS_DEVICE_REG_WRITE(handle, offset, width, value)`** — the stub's own | **general in shape, per-device in policy** | The kernel resolves `handle` to a claimed function, checks `offset` against that device's **allow-list** and refuses anything else **by name** (§4.1.1). It is general because every stubbed device wants it; the list is the driver's. It is not `SYS_HDA_VERB`, and the rejected list below says why the distinction is real: this call names an offset and a value and knows nothing about codecs. **`width` is not a convenience** — HDA registers are 8, 16 and 32 bits and a 32-bit write to a 16-bit register is a write to its neighbour. |
+| 2 | **A BAR mapping must be uncacheable, and it must be read-only** | **general** | `paging::CachePolicy` (`mm/paging.rs:41-51`) has two variants today, `DeferToMtrr` and `WriteCombining`. Neither is right for a user mapping of device registers: `DeferToMtrr` is PAT entry 0, which is WB and inherits whatever firmware's MTRRs decided (`iommu-spec.md` §12, task #139). **Adds no ABI**: a third `Uncacheable` variant, used unconditionally, because there is no BAR a driver should map write-back. A parameter here would be a signature promising a choice that has one correct answer — and the same argument applies to writability: **there is no BAR a driver should map writable under the stub**, so that is not a parameter either. What *does* need adding is the ability to express it at all: `SharedRegion::map_into` passes `writable: true` literally (`shared_memory.rs:64`) and the region carries no such field, while `AddressSpace::map_range` beneath it already honours the flag (`paging.rs:333-336`). One field, one argument, no ABI. |
 | 3 | **The IRQ handle's records carry the interrupt-time timestamp and a count** | **general** | soundd's DLL exists to separate the device's period grid from scheduling latency, and it does that by timestamping *in the ISR* (`AudioCompletionRecord.timestamp_nanos`). A userland driver that timestamps at wake time folds the two back together and the DLL becomes a jitter amplifier. So a read on the IRQ handle returns `IrqRecord { count: u32, _pad: u32, timestamp_nanos: u64 }` — `AudioCompletionRecord` with `mask` replaced by `count`. **That is the completion record splitting along the trust boundary: the timestamp is the kernel's and the mask is the device's.** The mechanism to promote is `kernel/src/audio.rs`'s SPSC `RecordRing` made device-independent, **not `irq_ring`**: `irq_ring::isr_publish` coalesces a second IRQ into the existing record and **keeps the earlier timestamp** (`irq_ring.rs:57-70`), which is the right answer to "when was work first available" and the wrong one for a DLL, whose `update` measures against the *last* grid point of a batch (`soundd/src/main.rs:376`). So the 158 lines of `audio.rs` are not all deleted — its ring survives as the general mechanism. |
-| 4 | **DMA mappings must be snooped** | **general**, and the HDA-specific alternative is the wrong answer | Intel HDA controllers carry a vendor-specific no-snoop control in PCI config space; a driver that leaves it as firmware set it may be doing DMA the CPU cache does not see. **The premise is read from in-tree driver behaviour and is not verified here against a datasheet — it is the risk, not the answer.** `userspace-drivers-spec.md` §4.2 has no config-write path and says a real need gets "a specific syscall with the offset named in the kernel", so HDA is the first concrete candidate for that escape hatch — **and it should be refused**, because the general answer is one layer down: VT-d's second-level PTE has a snoop-force bit gated by `ECAP.SC`, which QEMU's unit exposes as `snoop-control` (`iommu-spec.md` §8). Setting it in every mapping makes the device's own request irrelevant and makes the premise moot. **Adds no ABI.** `ECAP.SC` on the T14's unit is unread and is H0's. If it is clear there, the named-offset syscall comes back and this row is the record of why. |
+| 4 | **DMA must be snooped** | **the stub answers it, and the general answer becomes optional** | Intel HDA controllers carry a vendor-specific no-snoop control in PCI config space; a controller left as firmware set it may do DMA the CPU cache does not see. **The premise is read from in-tree driver behaviour and is not verified here against a datasheet — it is the risk, not the answer.** The first draft refused a config-space escape hatch and reached for VT-d's `ECAP.SC` snoop-force bit instead. **Under the stub the question dissolves**: the kernel owns config space outright, so if the bit needs clearing the kernel clears it during bring-up, beside the bus-master enable it already has to write. No escape hatch is needed because there is no wall. `ECAP.SC` stays worth having as defence in depth and stops gating this device; the T14's value is unread (§6.5). |
 | 5 | **`SYS_SET_RT_PRIORITY`'s gate moves** | **general** | It is gated at the dispatch site on the `DEVICE_AUDIO` claim, which is deleted here. It becomes a right on the device-claim handle, per `capability-handles-spec.md` §6.7 — the process init gave the audio device to may enter the RT band. **No new syscall; a changed check**, and one the code already says is too weak: "That is not yet spec §9.4's privilege gate: `SYS_OPEN_DEVICE` is first-come and ungated, so whoever wins the claim race gets the RT band with it" (`scheduler.rs:308-311`). |
 | 6 | **Master volume and mute** | **not kernel ABI at all** | Three messages on soundd's existing control connection: `MSG_SET_MASTER_VOLUME { gain: f32 }`, `MSG_SET_MASTER_MUTE { on: bool }`, `MSG_GET_MASTER` → `MSG_MASTER_STATE { gain, muted }`. The tempting wrong answer is a syscall; volume is a mixer's business and the mixer is a userland process. |
 
 **Deleted by this track**, once §6's H3 lands: `SYS_AUDIO_SUBMIT` (**71**),
-`SYS_AUDIO_POLL` (**84**), `DEVICE_AUDIO` and its owner lock, `Descriptor::Audio`,
-`AudioInfo`, `AudioCompletionRecord`, IDT vector `0x23`, `kernel/src/audio.rs`
-(158 lines) and `kernel/src/drivers/virtio_sound.rs` (649 lines). **71 and 84
-are retired, never reused** (CLAUDE.md). That deletion closes
-`userspace-drivers-spec.md` stage 7 and is a third of its `virtio` grep.
+`SYS_AUDIO_POLL` (**84**, already dead — §10 item 7), `DEVICE_AUDIO` and its
+owner lock, `Descriptor::Audio`, `AudioInfo`, `AudioCompletionRecord`, IDT
+vector `0x23`, `kernel/src/audio.rs` (158 lines) and
+`kernel/src/drivers/virtio_sound.rs` (649 lines). **71 and 84 are retired, never
+reused** (CLAUDE.md). That deletion closes `userspace-drivers-spec.md` stage 7
+and is a third of its `virtio` grep.
 
 **Rejected, named so the judgement is checkable:**
 
-- `SYS_HDA_VERB` — a verb is a store to a ring the driver owns. A syscall for it
-  would put a device protocol back in the syscall table, which is the defect
-  `userspace-drivers-spec.md` §7.5 check 3 exists to catch.
+- `SYS_HDA_VERB` — a verb is a store to a ring the driver owns, published by one
+  allow-listed `CORBWP` write. A syscall for the *verb* would put a device
+  protocol back in the syscall table, which is the defect
+  `userspace-drivers-spec.md` §7.5 check 3 exists to catch. Item 1b is not that
+  and the test is exact: `SYS_DEVICE_REG_WRITE` can be implemented by a kernel
+  that has never heard of a codec.
+- **A refusal list of dangerous registers, instead of an allow-list.** §4.1.1.
+  Same call, opposite polarity, and the failure mode of a missing entry is a
+  device pointed at kernel memory rather than a stream that will not start.
+- **Letting soundd write the address registers "because the IOMMU will catch
+  it".** That is the fully-mapped design under another name, and it reinstates
+  every row §4.2 just deleted.
 - A kernel-side codec parser or widget-graph type. Same reason, one layer up.
 - `SYS_AUDIO_SET_VOLUME`. §6 of the table.
 - Keeping `DEVICE_AUDIO` as a device class "for compatibility". There is no
@@ -461,6 +727,10 @@ does for virtio-sound**, so gate A's ground truth — the capture of what the
   permanently present; unmeasured).
 - The vendor no-snoop bit, `ECAP.SC` on a real unit, BAR relocation on a packed
   real bus, and whether `00:1f.3` offers MSI.
+- **Whether the T14's BAR0 shares its 2 MiB page with a sibling function's
+  registers** (§4.1.4). QEMU's q35 lays out a bus this machine does not have, so
+  a green neighbour check in the harness is evidence about the *check* and none
+  at all about the machine. §6.5.
 - Whether the T14's speakers are reachable over the HDA link at all (§3).
 - **Anything about cost.** TCG's distortion is non-uniform (CLAUDE.md records
   1.06×–6.5× by operation), so CLAUDE.md's 2× bar is answerable only on the T14
@@ -505,13 +775,13 @@ batching and possibly a different rate. Concretely:
    `.smp8`, `audio_tone_hda_load.smp1`, `.smp8` — recorded on their own
    30-invocation session by that file's own protocol. **The existing four are
    not touched**, and re-recording them is not licensed by this track.
-2. **The instrument's physical scale becomes per-config.** `PERIOD_SECS =
-   128.0/44100.0` (`tests/common/audio.rs:63`) and `PIPELINE_DEPTH_US = 8 ×
-   PERIOD_SECS` (`:293`) are global constants today. If QEMU's HDA codec does
-   not offer 44,100 Hz — unmeasured — the HDA arm runs at another rate and every
-   ceiling derived from those constants is computed against the wrong scale.
-   This is exactly the shape of the four instrument defects
-   `specs/audio-gate-history.md` records, so it is named before it is built.
+2. ~~**The instrument's physical scale becomes per-config.**~~ **Withdrawn by
+   §6.4 item 5.** `PERIOD_SECS = 128.0/44100.0` (`tests/common/audio.rs:63`) and
+   `PIPELINE_DEPTH_US = 8 × PERIOD_SECS` (`:293`) stay global: QEMU's codec
+   offers 16 k–96 k at 16-bit and the T14's converter offers 44.1 k and 48 k at
+   16/20/24, so both arms run 44.1 kHz S16 and share a scale. The concern was
+   the right shape — it is one of the four instrument defects
+   `specs/audio-gate-history.md` records — and the machine answered it.
 3. **`check_suspend_structure` keeps working, and one of its neighbours rots.**
    The `soundd: suspended` marker is backend-independent. The comment in
    soundd's mix loop ordering `soundd: resumed` before "the kernel's own
@@ -568,9 +838,9 @@ throughout.
 |---|---|---|---|
 | **H0** | **Feasibility, on metal. No driver.** A kernel diagnostic behind a feature flag, present only in the diagnostic image, deleted at H9. It carries the comment `specs/device-test-strategy.md` requires of a kernel-feature actuator, and the reason nothing else can reach it is exact: **there is no way for a userland process to touch a codec before the capability of §4 exists, and the questions it answers are the ones that decide whether that capability will ever be given this device.** Two halves on one boot. **(a) Handoff**, for `00:1f.3`: its DMAR device scope, whether its isolation scope is a singleton given four sibling functions (§7 risk 1), whether it carries an RMRR, whether it offers MSI or MSI-X and how many vectors, BAR0's size/width/prefetchability and whether a 2 MiB relocation target exists, and the unit's `ECAP.SC` (§4.4 item 4). **(b) Codec**, using the immediate-command registers so it needs no DMA and no capability: release `GCTL.CRST`, read `GCAP`/`VMIN`/`VMAJ` and `STATESTS`, and for every codec present dump vendor and device id, every function group, every widget's capabilities and every pin's configuration default. Plus: log every i8042 scancode sequence that decodes to no key, and press the three volume keys. | ~120 + ~250 lines kernel | The log carries a named line per item, read off the panel and off `/log/kernel.log`. **If the isolation scope or an RMRR refuses the device, or `STATESTS` reads zero, this track stops here and is re-decided.** |
 | **H1** | **DONE — `toyos-hda`, the host-tested core.** Verb encode/decode, the graph model, `find_output_path`, `SDnFMT` encoding, BDL construction. No I/O. | ~1,500 lines Rust | `cargo test` in-crate, against three fixtures including **H0's dump of the T14's own codec**. §5.2's state-space attacks, each with teeth: deleting the cycle check must red the cyclic fixture, and deleting the speaker-pin preference must red the two-codec one. |
-| **H2** | **Prerequisites land.** Not HDA work: `iommu-spec.md` I3 and I4, `userspace-drivers-spec.md` stages 3 and 4. Shared with `wlan-plan.md` W5. **Proposes that stage 4's capability be staged against a second `intel-hda` rather than a second `virtio-net-pci`** (§4.2). | — | Those specs' own exit criteria |
+| **H2** | **The stub's capability.** Rewritten under §4.1's decision: I3 and I4 are **not** in it and `userspace-drivers-spec.md` stage 3 is not either (§4.2). What lands is the four syscalls of §4.4 item 1 plus `SYS_DEVICE_REG_WRITE` (item 1b), `CachePolicy::Uncacheable`, a `writable` field on `SharedRegion`, and the claim-time 2 MiB-neighbour refusal of §4.1.4. **Proposes that the capability be staged against a second `intel-hda` rather than a second `virtio-net-pci`** (§4.2). | ~600 lines kernel (est.) | The refusals, each by name: a write off the allow-list, a write of an address register, a claim whose BAR shares its page. Teeth: deleting the allow-list check must red the first two. |
 | **H3** | **The userspace audio backend seam, with virtio-sound as its first implementation.** soundd grows a backend trait and drives virtio-sound *from userland* through §4.4's capability. Deleted: `virtio_sound.rs`, `audio.rs`, `SYS_AUDIO_SUBMIT`, `SYS_AUDIO_POLL`, `DEVICE_AUDIO`, `AudioInfo`, `AudioCompletionRecord`, vector `0x23`. Closes `userspace-drivers-spec.md` stage 7. | ~1,200 lines Rust moved, **807 lines of kernel deleted** | **Gate A's thorough tier, `cargo test --test toyos-build -- --audio-gate 30`, same-session A/B against the pre-stage tree.** Same rule as a scheduler-migration transition and for the same reason. **This is the stage that can revert the direction, and it is deliberately before HDA exists.** |
-| **H4** | **HDA behind the same seam, in QEMU.** Reset, CORB/RIRB, enumeration, path selection from H1, stream + cyclic BDL, `SDnLPIB`-derived masks, zero-on-complete. New profiles: one HDA machine, one with two controllers, one whose codec has no speaker pin, one with a controller and no codec. | ~2,000 lines Rust | New gate-A arms (§5.3) with their own four baseline sections; `cargo test -- hda` for the shape configs. Teeth: removing the zero-on-complete write must red the phase-continuity check. |
+| **H4** | **HDA behind the same seam, in QEMU.** Split by §4.1's line: **kernel stub** — reset, CORB/RIRB ring setup, interrupt enables, stream descriptor address registers, the BDL's contents, the `SDnSTS` ISR, and the allow-list. **soundd** — enumeration, path selection from H1, `SDnFMT`, the amps and EAPD, `SDnLPIB`-derived masks, zero-on-complete, the mixer. New profiles: one HDA machine, one with two controllers, one whose codec has no speaker pin, one with a controller and no codec. | ~500 kernel + ~1,500 userland (est.) | New gate-A arms (§5.3) with their own four baseline sections; `cargo test -- hda` for the shape configs. Teeth: removing the zero-on-complete write must red the phase-continuity check. **§2.3's output-preference rule stands unrelaxed** — §6.4 item 7 widened it to speaker → headphone → line-out as a policy constant before H4, and the refusal-by-name arm is what QEMU's `hda-micro` still exercises. |
 | **H5** | **The T14: first note.** Flash, boot, listen. The enumeration trace lands in `/log/kernel.log`; the codec dump becomes an H1 fixture. | — | **L4, metal only.** The owner hears the 440 Hz tone from the speakers. The run's soundd counters are recorded as the T14's own first baseline. |
 | **H6** | **Jack detection and output routing.** Polled pin sense on soundd's existing 2 s cadence; route between the speaker and headphone pins; ramp master gain to zero across the switch so it does not click. | ~300 lines Rust | Metal: headphones in, sound follows within one poll interval, and back out again. Harness if QEMU's codec models pin sense; if it does not, the switch logic is host-tested in `toyos-hda` and the *transition* is asserted in QEMU by driving it from a test hook. |
 | **H7** | **Master volume and mute.** A gain on soundd's mix bus, §4.4 item 6's three messages, the existing ramp machinery, and `toybox audio` to read and set it. | ~400 lines Rust | **Harness, with real teeth**: a guest test sets master to 0.5 and the wav capture's amplitude halves; sets mute and the capture goes silent; neither transition fires the click detector. |
@@ -697,9 +967,11 @@ That is why the line below decides the track rather than informing it.
 
 This plan is the answer, and it is the cheap one. Everything needed is in this
 file: §6's H1 through H10, whose sizes are **estimates and are labelled as such
-throughout** — roughly 4,550 lines of Rust across the stages, plus §4.2's
-prerequisite chain, which is shared with `specs/wlan-plan.md` W5 and is not
-audio's to pay alone. No vendor firmware, no blob, no second bus. Self-hosting
+throughout** — roughly 4,550 lines of Rust across the stages. **The prerequisite
+chain this paragraph used to add to that is four rows shorter under §4.1's
+stub** (§4.2): what is left is the capability itself, and `wlan-plan.md` W5 no
+longer shares any of it, so audio's number is now audio's alone and smaller than
+when they were pooled. No vendor firmware, no blob, no second bus. Self-hosting
 (CLAUDE.md's north star) is untouched, because every line of it is ours.
 
 **`statests=0x0000` — nothing on the legacy link. Do not soften this.**
@@ -869,23 +1141,59 @@ file had only argued:
    holding a line-out is the lie the comment rule is about, and a driver that
    bound one has to be able to say so in its log.
 
+### 6.5 What H0's boot did *not* leave behind
+
+**H0's `(a)` block is not in this repository.** §6.4 records seven findings and
+every one of them is from the codec dump; nothing about the handoff half was
+committed. So the following are unread as far as this tree is concerned, and a
+reader must not take §6.3's answer table for a record of what the machine said:
+
+| Unrecorded | Who wants it now |
+|---|---|
+| DMAR device scope members for `00:1f.3` | nobody on this track any more (§4.2). The owner read five members off the boot; `iommu-spec.md` §7.3 is where that belongs, and `wlan-plan.md` still wants it for the I219. |
+| RMRR presence | same |
+| MSI vector count, MSI-X presence | H2 — the stub still needs one vector, and `msi=none msix=none` would be the one answer that stops it |
+| BAR0 size, width, prefetchability, movability | H2 |
+| **`2m-page-neighbours`** | **H2, and it is the only one the stub genuinely turns on** (§4.1.4). A nonzero count is a claim-time refusal on the T14 and makes `userspace-drivers-spec.md` stage 3 a prerequisite for that machine. |
+| `ECAP.SC` | defence in depth only (§4.4 item 4) |
+
+**And one question H0 could not have answered, because the probe never asks it.**
+`size_bar0` reads exactly one BAR (`kernel/src/drivers/hda_probe.rs:448-453`),
+and the only loop over BAR indices skips the HDA function itself
+(`:382-384`). Nothing else in the boot path prints a BAR for `00:1f.3`. So
+**whether `00:1f.3` exposes a second BAR — the Audio DSP window Intel parts of
+this generation carry — is unanswered here**, and no amount of re-reading the
+existing log will answer it.
+
+That matters for §8 item 4's exclusion, and the stub is what makes it survivable
+rather than urgent: **soundd maps what it is given and it is given BAR0
+read-only.** A second BAR it never maps is a surface it cannot reach, and a
+second BAR it *were* given would still be unwritable. The exclusion therefore
+holds under the stub for a stronger reason than it held before — it used to
+depend on the DSP being absent, and now it depends only on the kernel not
+mapping it. The enumeration is still worth having, because a driver ought to be
+able to say what its device exposes: **one loop over BAR indices 0–5 of the
+probed function**, on the next diagnostic boot, and the log line already has a
+shape to follow.
+
 ---
 
 ## 7. Open risks
 
 Each with what settles it, and how early.
 
-1. **`00:1f.3` may not be handoff-able at all, and the same question refuses the
-   I219.** `iommu-spec.md` §7.3 hands a device to userspace only if its
-   isolation scope is a singleton, and names multi-function devices as one of
-   the two ways that fails. The T14's HDA is **function 3 of a five-function
-   device** whose other members are the eSPI bridge, SMBus, the SPI flash
-   controller and the Ethernet NIC (§3). If ToyOS's scope computation refuses
-   it, it refuses `00:1f.6` too — **which is gate N's metal target
-   (`wlan-plan.md` §7)** — and both tracks lose their device on that machine.
-   The rule would then need restating in terms of what a root-complex-integrated
-   function can actually reach, which is a decision about the IOMMU spec and not
-   about this one. **Settled by H0 on one boot**, and it is the reason H0 exists.
+1. **CLOSED FOR AUDIO by §4.1's stub — still open for the I219.**
+   `iommu-spec.md` §7.3 hands a device to userspace only if its isolation scope
+   is a singleton, and names multi-function devices as one of the two ways that
+   fails. The T14's HDA is **function 3 of a five-function device** whose other
+   members are the eSPI bridge, SMBus, the SPI flash controller and the Ethernet
+   NIC (§3), and the owner read **five scope members** off H0's boot — a number
+   this repository does not otherwise record (§6.5). §7.3 refuses that device as
+   the rule is written. **The stub performs no handoff, so the rule has nothing
+   to refuse**: `00:1f.3` stays a kernel device with a read-only window into
+   userland. The rule still refuses `00:1f.6` — **gate N's metal target
+   (`wlan-plan.md` §7)** — and restating it remains `iommu-spec.md`'s decision.
+   What changed is that audio no longer waits on it.
 2. **The codec may not be on the HDA link, and this is now the whole track's
    risk rather than one of ten.** §3, and §6.3's (b) block for what each answer
    costs. The owner has decided the T14 gets real internal-speaker audio, and
@@ -900,24 +1208,51 @@ Each with what settles it, and how early.
    doubling of the dropout rate. §4.1 argues the path gets *shorter*, not
    longer, and that argument is unmeasured. **Settled by H3, deliberately before
    HDA exists**, and the honest failure mode is that H3 goes green while
-   something got worse below its resolution.
-4. **An RMRR on `00:1f.3`.** `iommu-spec.md` §7.4 refuses a device carrying one,
-   QEMU publishes none, and the T14 is the first machine that can answer. H0.
-5. **MSI, and BAR relocatability.** §4.2 and `userspace-drivers-spec.md` §4.3
-   both assume answers nobody has read. H0.
-6. **`ECAP.SC` may be clear on the T14's unit**, in which case §4.4 item 4's
-   general answer is unavailable and the HDA-specific config write comes back.
-   H0.
+   something got worse below its resolution. The stub does not reduce this risk;
+   §4.1.2 shows only that it adds nothing per period.
+4. **CLOSED FOR AUDIO — an RMRR on `00:1f.3`.** `iommu-spec.md` §7.4 refuses a
+   device carrying one **for userspace handoff**, and there is no handoff. A
+   kernel device's RMRRs are satisfied for free by the identity-mapped domain it
+   is already in (§7.4's own first rule). Still unread (§6.5) and still the
+   I219's problem.
+5. **MSI presence.** The stub needs one vector like every kernel driver, so
+   `msi=none msix=none` is the only answer that bites — and no real part is
+   built that way (§6.3). BAR *relocatability* is now only the remedy for risk
+   11. Unread (§6.5).
+6. **DOWNGRADED — `ECAP.SC` may be clear on the T14's unit.** §4.4 item 4's
+   answer under the stub is a config-space write the kernel performs itself, so
+   snoop-force is defence in depth rather than the mechanism. Unread (§6.5).
 7. **Gate A's instrument cannot see a repeated period.** §2.4's zero-on-complete
    rule is what keeps the existing gap detector valid across both backends, and
    it is a design promise rather than a measurement. If it is wrong, the gate
    goes green on audible harm. §5.3 item 5 is the second guard; build it.
-8. **QEMU's codec may not offer 44,100 Hz.** Unmeasured. It changes the HDA
-   arm's physical scale and every ceiling derived from it (§5.3 item 2).
+8. **CLOSED — QEMU's codec may not offer 44,100 Hz.** It does, at 16-bit, and so
+   does the T14's converter (§6.4 item 5). Gate A's existing constants serve
+   both backends and §5.3 item 2's per-config scale is not needed.
 9. **The graph traversal is the least-covered code in the plan**, and its
    fixture coverage is one real machine's codec. A second machine would answer a
    different question; there is not one.
 10. **Nothing here is measurable against CLAUDE.md's 2× bar.** §5.1.
+11. **NEW — BAR0 may share its 2 MiB page with a sibling function.** §4.1.4: the
+    read-only mapping stops it being a *write* surface and does not stop it
+    being a read one, and one of the candidates is the SPI flash controller. The
+    claim-time refusal fails closed, so the failure mode is "no audio on the
+    T14 until stage 3 lands" rather than "audio and an exposure". **Unread**
+    (§6.5), and it is the one H0 question the stub genuinely turns on.
+12. **NEW — the allow-list is a human-checked property.** Every entry is on it
+    because its value is not an address, and nothing compiles that claim.
+    `SDnFMT` and `SDnCBL` are neighbours of `SDnBDPL` in the same descriptor;
+    a wrong offset or a wrong width in the table is a hole with no test that
+    fails. §4.4 item 1b's `width` argument is half the mitigation and a per-entry
+    review is the other half. The one thing that would make it unrepresentable —
+    a generated table from a register description — is not proposed here,
+    because there are eight entries.
+13. **NEW — `Uncacheable` is not in `CachePolicy` and cannot be added without
+    breaking the kernel's PCD/PWT invariant.** §4.1.4 has the arithmetic. A BAR
+    mapped today would be write-back and `SDnLPIB` would read stale, which is
+    the failure that looks most like a scheduler bug. Not a research question,
+    but larger than one variant, and it touches an assert that fires on the
+    stub's own mapping.
 
 ---
 
@@ -926,10 +1261,15 @@ Each with what settles it, and how early.
 1. **Capture.** No microphone, no ADC path, no input pins. It also removes the
    only route to a self-verifying metal boot (§5.4), and that is the cost.
 2. **A kernel-resident HDA driver**, at any point, even temporarily. §4.3 prices
-   it for the owner and declines it.
+   it for the owner and declines it. **The stub is not it** — the test is
+   whether the kernel half decides anything, and §4.3's last paragraph is where
+   that is argued and §4.1.5's last bullet is what would falsify it.
 3. **A separate HDA daemon.** §4.1: the driver is a library in soundd.
 4. **The DSP / Smart Sound block**, vendor topologies, and firmware loading for
-   any of it.
+   any of it. **The exclusion survives the stub and is stronger under it**: it
+   used to rest on the DSP being absent, and now it rests on the kernel not
+   mapping the window it would live in. Whether `00:1f.3` even exposes a second
+   BAR is unread and unreadable from the existing log (§6.5).
 5. **HDMI/DisplayPort audio**, and any codec that is not the one with a speaker
    pin. The others are enumerated and named, never silently skipped.
 6. **Unsolicited responses.** §2.5 — polling replaces them and costs latency,
@@ -950,12 +1290,40 @@ Each with what settles it, and how early.
     `SYS_OPEN_DEVICE`'s first-come claim already has (`known-issues.md` §1).
     Closing it is `capability-handles-spec.md`'s work.
 12. **A codec amplifier as the master volume control.** §9.
+13. **Mapping any BAR writable into userland**, on this device or any other.
+    §4.1.1. Named as an exclusion and not only as a design, because it is the
+    one line that — relaxed once, for convenience, on some later device —
+    restores every prerequisite §4.2 deleted and does so silently. The
+    unrepresentable form is available and should be taken: the BAR-mapping call
+    has no writability parameter (§4.4 item 2).
+14. **A refusal list of address-bearing registers.** §4.4's rejected list. The
+    allow-list is the same table with the opposite polarity and a bounded
+    failure mode.
 
 ---
 
 ## 9. Where I think this is wrong
 
 A plan that cannot say no is not a plan.
+
+- **The stub puts a fixed HDA bring-up sequence in the kernel and calls it
+  mechanism.** That is a judgement, not a fact. CORB/RIRB ring setup and stream
+  descriptor programming are HDA-specific code in `kernel/`, and the defence —
+  that it decides nothing — is a property somebody has to keep true. §4.1.5's
+  last bullet is the tripwire and it has no test behind it. **The honest reading
+  is that §8 item 2's line moved, and the argument for where it moved to is
+  §4.3's last paragraph rather than a rule.**
+- **"The kernel never accepts an address" is only as good as the allow-list.**
+  Risk 12. Eight entries, human-checked, and a wrong offset is a hole nothing
+  reds.
+- **The read-side residual is real and is being deferred to a check nobody has
+  run.** §4.1.4: a read-only mapping of a 2 MiB page containing the SPI flash
+  controller's registers is not nothing, and the claim-time refusal that closes
+  it has never been asked of the machine it is for (§6.5).
+- **The stub was not measured against the alternative it replaced**, because
+  neither exists. §4.1.2 counts syscalls and stops there; that the audio path is
+  unchanged per period is an accounting result, and whether an MMIO read from a
+  user address space beats the syscall it replaces is still unmeasured (risk 3).
 
 - **H3 re-orders another spec's stages, and this spec is not entitled to.**
   `userspace-drivers-spec.md` §6 runs net → gpu → sound; this plan puts sound
@@ -1009,10 +1377,11 @@ Recorded, not fixed, per this task's scope.
    QEMU 11.0.2, measured 2026-08-02.** This host now reports **11.0.3**
    (`qemu-system-x86_64 --version`, 2026-08-04). No measurement in either file
    is known to have changed; the version in them is simply no longer this host's.
-4. **`tests/common/audio.rs`'s `PERIOD_SECS` and `PIPELINE_DEPTH_US` are global
-   constants** derived from one backend's 128-frame period at 44,100 Hz and
-   8-buffer pipeline. A second backend makes them per-config, and until they are,
-   any HDA arm's ceilings are computed against the wrong scale (§5.3 item 2).
+4. ~~**`tests/common/audio.rs`'s `PERIOD_SECS` and `PIPELINE_DEPTH_US` are global
+   constants** derived from one backend's 128-frame period at 44,100 Hz.~~
+   **Withdrawn by §6.4 item 5**: both codecs offer 44.1 kHz S16, so the two
+   backends share a physical scale and the constants stay global. §5.3 item 2
+   and risk 8 are the same withdrawal.
 5. **soundd's mix loop carries a comment ordering `soundd: resumed` before "the
    kernel's own `virtio-sound: stream 0 started` line".** H3 deletes that kernel
    line, and the comment with it.
@@ -1022,3 +1391,21 @@ Recorded, not fixed, per this task's scope.
    power down the codec or its amplifiers, so a pop is not expected — but that
    is a hardware property, it is H5's to listen for, and `AudioInfo` is deleted
    at H3, so the hook that comment names has to move with the backend trait.
+7. **`SYS_AUDIO_POLL` (84) is dead ABI and this file used to cite it as a live
+   cost.** It is declared at `toyos-abi/src/syscall.rs:65` and appears nowhere
+   else in the tree — no dispatch arm, no wrapper, no caller — so a call lands
+   on `arch/syscall.rs`'s `_ => InvalidArgument`.
+   `capability-handles-spec.md:759` already lists it as dead. soundd reads
+   completion records with `SYS_READ_NONBLOCK` (66) on the audio device fd.
+   §4.1 and §4.4's deletion list are corrected.
+8. **§4.1's "a period costs a wake plus two syscalls" understated it by a
+   factor of about four.** Counted off the mix loop: **2k + 7 per wake**, k the
+   periods refilled — one `SYS_IO_URING_ENTER`, one `SYS_READ_NONBLOCK`, one
+   `SYS_WRITE_NONBLOCK` per client, four `SYS_CLOCK`, plus one `SYS_CLOCK` and
+   one `SYS_AUDIO_SUBMIT` per period. Three of the four fixed clock reads exist
+   for statistics and pipeline bookkeeping. **k̄ ≈ 1.20**, derived from
+   `tests/audio-baseline.toml:286`'s recorded wake median of 918.5 against the
+   ~1102 periods of a 3.0 s tone — so ~7.8 syscalls per period today, and the
+   batch factor rather than the syscall count is the lever. Nothing in §4.1's
+   *conclusion* changes; the number it rested on was wrong in the direction that
+   flatters the conclusion, which is the direction worth correcting.

@@ -1361,6 +1361,9 @@ own list in the summary, and:
 | 1 | a real red — including a run that also had invalidated tests, because a red that survives is still a red |
 | 2 | the run established nothing; the host stopped in the middle of it |
 
+§5.6.3 adds no fourth status and deliberately: a declared red is not a red, and a
+declaration the run found stale is one.
+
 **Why 2 and not 0 or 1.** `--land`'s gate consumes this number, and 0 is a claim
 that the tree passed — which a run measured across a stopped host did not
 establish. Exiting 1 is no better: it sends an agent hunting a defect that is
@@ -1384,6 +1387,65 @@ that silently passes is as bad as one that silently fails**.
 What it does not do: a suspend that lands *between* two tests invalidates
 nothing, and is right not to. It is reported as a note, and the suite time
 printed beside it is monotonic and already excludes it.
+
+### 5.6.3 A known red is declared, not skipped
+
+The blockage this closes: `--land`'s gate is the whole suite and refuses a
+non-zero exit, so one test that is red for a reason everybody already knows
+blocks every landing in the tree. The two ways out before this were both wrong.
+Reclassifying `desktop_window_child` to `Sched::Serial` would have made the suite
+green by destroying the only QEMU reproduction of #156. `--land --gate cargo
+test -- --skip <name>` ran everything else, which was honest about *this*
+landing and silent forever after: an exclusion typed on a command line cannot
+notice that its defect is fixed, and lives in muscle memory rather than in the
+tree. `--skip` is deleted; `EXPECTED_FAILURES` in `tests/toyos.rs` replaces it.
+
+An entry names the test, the task, where the defect is written up, and the
+failure messages the exemption covers. The verdict table gains two rows, and
+`Verdict::Pass`/`Fail` each gain the entry that was consulted and *did not
+apply* — so no arm can treat a case as covered by forgetting to look one up.
+Exit status is unchanged: an expected failure is not a failure and never reaches
+`Tally::exit_code`, so a run whose only reds were declared is exit 0 and
+`src/land.rs` needs no change at all. The result line says `ok, NOT clean` and
+names every entry that fired, because the whole hazard of the mechanism is a run
+that reads as green to somebody who did not scroll up.
+
+**The design question is what makes an entry stale, and it has two answers
+rather than one.** The brief's requirement — *a listed test that passes is a red
+run* — is what stops the list outliving the defect, and it is exact for a
+failure that fires every time. It is wrong for one that does not:
+`desktop_window_child` is intermittent (red alone and red wide, at a different
+assertion each time), so a single green is one sample of a rate, and
+`specs/audio-gate-history.md`'s standing lesson is that a verdict taken from one
+sample is a verdict about nothing. Redding the run on it would fire on a healthy
+tree and teach everybody to re-run until it went away — which is the exact habit
+this mechanism exists to make unnecessary. So `Stale::OnAPass` is the strong
+form and stays the default to reach for; `Stale::OnThisDate` is the honest
+weaker one, and it does not claim to detect a fix. It claims that on a stated
+day the entry reds and somebody looks. Both halves are the anti-rot property:
+neither kind of entry can go quiet.
+
+**What the message matcher does and does not buy.** `says` is a list of
+alternatives quoted from the test's own messages, and a failure matching none of
+them reds with a line saying the entry did not cover it. That pins *which*
+assertion failed, not why, so a second defect reaching the same assertion is
+absorbed — and where the real discriminator is a property of the log rather than
+of the message, as #156's is (the guest stops emitting anything, the ~2 s
+compositor stats line included), no cheap matcher reaches it. That one stays a
+human's, which is why every `XFAIL` line prints the pointer to where it is
+written up. Quotation rather than prose is deliberate: a restatement drifts
+silently from what the test says, and a quotation reds the day somebody rewords
+the assertion.
+
+Three host-side gates, no guest, ~0.2 ms between them:
+`expected_failure_verdicts` (the table, both directions),
+`expected_failure_exit_status` (through `Tally`, to the exit code and the report
+text), `expected_failure_entries` (the declaration's own shape, and the calendar
+under `OnThisDate`). Eight deliberate breaks of the implementation, each red,
+against the unbroken tree green — a listed pass filed as an ordinary pass, the
+matcher absorbing everything, a stale or expired entry not redding, a review date
+that never arrives, an expected failure filed as a pass, and the three
+declaration checks each defeated in turn.
 
 ## 6. What this audit did not measure
 

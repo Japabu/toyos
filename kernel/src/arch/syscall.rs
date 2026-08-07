@@ -71,6 +71,35 @@ fn debug_heap_alloc(bytes: usize, align: usize) -> u64 {
     0
 }
 
+/// Sixteen bytes of kernel memory a test can name, and ask about afterwards.
+///
+/// A guest cannot read the kernel's address space, so a write that lands there
+/// is invisible to every assertion a test can make from userland — which is
+/// exactly the write `SYS_DLOPEN`'s `init_out` used to allow, and a gate that
+/// could only check the syscall's *verdict* would pass against a kernel that
+/// still made it. Nothing here is faked: the address is this static's own, the
+/// write a broken kernel makes is a real one, and what is read back is the
+/// memory itself.
+#[cfg(feature = "test-kernel-canary")]
+mod canary {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    const VALUE: [u64; 2] = [0x_C0DE_1A55_0F17_1E55, 0x_5EE7_A11_0F_17_00];
+
+    static WORDS: [AtomicU64; 2] =
+        [AtomicU64::new(VALUE[0]), AtomicU64::new(VALUE[1])];
+
+    /// The direct map is where the kernel's own statics live, so this is an
+    /// address in it — the half `AddressSpace::translate` must refuse.
+    pub fn address() -> u64 {
+        WORDS.as_ptr() as u64
+    }
+
+    pub fn changed() -> bool {
+        [WORDS[0].load(Ordering::Relaxed), WORDS[1].load(Ordering::Relaxed)] != VALUE
+    }
+}
+
 pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
@@ -226,8 +255,14 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             process::with_fd_owner_data(|data| fd::seek(&mut data.fds, a1 as u32, pos))
         }
         SYS_FSTAT => {
-            let Some(stat) = ctx.user_mut::<fd::Stat>(UserAddr::new(a2)) else { return bad_addr };
-            if process::with_fd_owner_data(|data| fd::fstat(&data.fds, a1 as u32, stat)) { 0 } else { SyscallError::NotFound.to_u64() }
+            let mut stat = fd::Stat { file_type: 0, size: 0, mtime: 0 };
+            if !process::with_fd_owner_data(|data| fd::fstat(&data.fds, a1 as u32, &mut stat)) {
+                return SyscallError::NotFound.to_u64();
+            }
+            match ctx.copy_out(UserAddr::new(a2), &stat) {
+                Ok(()) => 0,
+                Err(e) => e.to_u64(),
+            }
         }
         SYS_FSYNC => process::with_fd_owner_data(|data| fd::fsync(&mut data.fds, &mut *vfs::lock(), a1 as u32)),
         SYS_READDIR => {
@@ -259,7 +294,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_PIPE => sys_pipe(),
         SYS_SPAWN => {
-            let Some(args) = ctx.user_ref::<SpawnArgs>(UserAddr::new(a1)) else { return bad_addr };
+            let Ok(args) = ctx.copy_in::<SpawnArgs>(UserAddr::new(a1)) else { return bad_addr };
             let text = match ctx.user_str(UserAddr::new(args.argv_ptr), args.argv_len) { Ok(s) => s, Err(e) => return e.to_u64() };
             let fd_count = args.fd_map_count as usize;
             let fds = if fd_count > 0 {
@@ -357,7 +392,17 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_DLOPEN => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_dlopen(path, a3)
+            // Refused here rather than at the write, so a process that named an
+            // address the kernel will not write to is not left holding a
+            // library it was never told about.
+            let init_out = match a3 {
+                0 => None,
+                raw => match UserAddr::checked(raw) {
+                    Some(addr) => Some(addr),
+                    None => return bad_addr,
+                },
+            };
+            sys_dlopen(&ctx, path, init_out)
         }
         SYS_DLSYM => {
             let name = match ctx.user_str(UserAddr::new(a2), a3) { Ok(s) => s, Err(e) => return e.to_u64() };
@@ -366,27 +411,28 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_DLCLOSE => 0,
         SYS_FTRUNCATE => process::with_fd_owner_data(|data| fd::ftruncate(&mut data.fds, a1 as u32, a2)),
         SYS_STACK_INFO => {
-            let Some(base_out) = ctx.user_mut::<u64>(UserAddr::new(a1)) else { return bad_addr };
-            let Some(size_out) = ctx.user_mut::<u64>(UserAddr::new(a2)) else { return bad_addr };
-            process::with_current_data(|data| {
-                if data.user_stack_base.raw() > 0 {
-                    *base_out = data.user_stack_base.raw();
-                    *size_out = data.user_stack_size;
-                    0
-                } else {
-                    SyscallError::NotFound.to_u64()
-                }
-            })
+            let stack = process::with_current_data(|data| {
+                (data.user_stack_base.raw() > 0)
+                    .then_some((data.user_stack_base.raw(), data.user_stack_size))
+            });
+            let Some((base, size)) = stack else { return SyscallError::NotFound.to_u64() };
+            match ctx
+                .copy_out(UserAddr::new(a1), &base)
+                .and_then(|()| ctx.copy_out(UserAddr::new(a2), &size))
+            {
+                Ok(()) => 0,
+                Err(e) => e.to_u64(),
+            }
         }
         SYS_CPU_COUNT => super::smp::cpu_count() as u64,
-        SYS_FUTEX_WAIT => {
-            if ctx.user_ref::<u32>(UserAddr::new(a1)).is_none() { return bad_addr; }
-            process::futex_wait(a1, a2 as u32, a3)
-        }
-        SYS_FUTEX_WAKE => {
-            if ctx.user_ref::<u32>(UserAddr::new(a1)).is_none() { return bad_addr; }
-            process::futex_wake(a1, a2)
-        }
+        SYS_FUTEX_WAIT => match UserAddr::checked(a1) {
+            Some(addr) => process::futex_wait(addr, a2 as u32, a3),
+            None => bad_addr,
+        },
+        SYS_FUTEX_WAKE => match UserAddr::checked(a1) {
+            Some(addr) => process::futex_wake(addr, a2),
+            None => bad_addr,
+        },
         SYS_MMAP => sys_mmap(a1, a2, MmapProt(a3), MmapFlags(a4)),
         SYS_MUNMAP => sys_munmap(a1, a2),
         SYS_KILL => process::kill_process(process::Pid::from_raw(a1 as u32)),
@@ -585,6 +631,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                 unsafe { core::ptr::read_volatile(addr as *const u8) };
                 0
             }
+            #[cfg(feature = "test-kernel-canary")]
+            10 => canary::address(),
+            #[cfg(feature = "test-kernel-canary")]
+            11 => canary::changed() as u64,
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => {
@@ -1342,7 +1392,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         if req_addr & (crate::mm::PAGE_2M - 1) != 0
             || req_addr < crate::vma::ALLOC_FLOOR
             || end > crate::vma::ALLOC_CEILING
-            || !crate::user_ptr::check_user_range(UserAddr::new(req_addr), aligned as u64)
+            || !crate::mm::user_span::in_user_half(req_addr, aligned as u64)
         {
             return SyscallError::InvalidArgument.to_u64();
         }
@@ -1701,7 +1751,7 @@ fn sys_readlink(path: &str, buf: &mut [u8]) -> u64 {
     }
 }
 
-fn sys_dlopen(path: &str, init_out: u64) -> u64 {
+fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Option<UserAddr>) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
@@ -1814,29 +1864,29 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
         }
     }
 
-    // Write init_array info to user-provided buffer if requested.
-    // Format: [init_array_vaddr: u64, init_array_count: u64]
-    // The vaddr is rebased to the library's user_base.
-    if init_out != 0 {
-        let init_vaddr = if lib.init_array_vaddr != 0 {
-            lib.user_base.raw() + lib.init_array_vaddr
-        } else {
-            0
-        };
-        let init_count = lib.init_array_size / 8;
-        if let Some(phys) = process::current_address_space().lock().translate(UserAddr::new(init_out)) {
-            let ptr = phys.as_mut_ptr::<u64>();
-            unsafe {
-                core::ptr::write(ptr, init_vaddr);
-                core::ptr::write(ptr.add(1), init_count);
-            }
+    // Format: [init_array_vaddr: u64, init_array_count: u64], the vaddr rebased
+    // to the library's user_base.
+    let init_info = [
+        if lib.init_array_vaddr != 0 { lib.user_base.raw() + lib.init_array_vaddr } else { 0 },
+        lib.init_array_size / 8,
+    ];
+
+    let idx = {
+        let mut data = data_arc.lock();
+        let idx = data.elf.loaded_libs.len();
+        data.elf.lib_paths.push(resolved);
+        data.elf.loaded_libs.push(lib);
+        idx
+    };
+
+    // After the library is registered, because it is mapped either way: a
+    // failure here is the caller losing its handle, not the address space
+    // losing track of a mapping.
+    if let Some(out) = init_out {
+        if ctx.copy_out(out, &init_info).is_err() {
+            return SyscallError::BadAddress.to_u64();
         }
     }
-
-    let mut data = data_arc.lock();
-    let idx = data.elf.loaded_libs.len();
-    data.elf.lib_paths.push(resolved);
-    data.elf.loaded_libs.push(lib);
     idx as u64
 }
 

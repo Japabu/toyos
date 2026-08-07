@@ -17,8 +17,28 @@
 //! Nothing here allocates, nothing waits on a lock it could find held, and
 //! every list is bounded. See `specs/known-issues.md` §5 for what it was built
 //! to settle.
+//!
+//! **This report cannot describe the state it is summoned to describe, and the
+//! deadline columns are where that bites.** Asking is a keystroke, a keystroke
+//! is an interrupt, and an interrupt is exactly what a halted CPU was waiting
+//! for — so by the time any CPU prints a line it has already taken a pass,
+//! re-armed its timer and fired whatever was due. A machine frozen on an
+//! unfired deadline therefore reports `0 OVERDUE`: not because its deadlines
+//! were healthy, but because summoning the report repaired them. Everything
+//! under `== deadlines:` postdates the repair.
+//!
+//! What survives is identity and place — which threads exist, which CPU holds
+//! each, which never ran, which CPUs did not answer — because waking a CPU does
+//! not move a task between containers. To learn what the *frozen* machine
+//! looked like, capture it before touching it: `info registers -a` over QMP
+//! gives every vCPU's `RIP` and `HLT` with nothing woken (`CLAUDE.md`,
+//! Debugging). That capture settled #156 and this report's deadline columns
+//! would have said the opposite.
+//!
+//! It is also what the NMI probe below buys and a kick does not: an answer that
+//! does not require the CPU to schedule in order to give it.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::{apic, percpu, smp};
 use crate::sched::payload::{SCHED_BLOCKED, SCHED_READY, SCHED_RUNNING};
@@ -52,8 +72,20 @@ const CENSUS_LINES: u32 = 16;
 /// for is not going to finish, which is what the ceiling is for.
 const TABLE_BUDGET_NS: u64 = 20_000_000;
 
+/// How long a silent CPU gets to answer the NMI. Two orders of magnitude below
+/// the kick's budget because an NMI needs nothing of the target but the
+/// interrupt itself: no pass, no lock, no scheduler state. A CPU that has not
+/// answered in a millisecond is not going to.
+const NMI_BUDGET_NS: u64 = 1_000_000;
+
 static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static OWES: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// The NMI handshake, in two arrays because the handler may not allocate, may
+/// not log and may not take a lock (`arch/idt/nmi.rs`): it stores and clears,
+/// and the CPU that asked does the rest.
+static NMI_OWES: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+static NMI_RIP: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// What the CPUs report, summed as each one answers. Reset by `request`
 /// before any CPU is asked.
@@ -171,12 +203,15 @@ pub fn request() {
             break;
         }
         if crate::clock::nanos_since_boot() >= deadline {
+            let mut asked = [false; MAX_CPUS];
             for cpu in 0..cpus {
                 if OWES[cpu].swap(false, Ordering::AcqRel) {
                     silent += 1;
+                    asked[cpu] = true;
                     log!("  cpu{cpu} !! no answer: it did not reach a scheduler pass");
                 }
             }
+            probe_silent(&asked, cpus);
             break;
         }
         core::hint::spin_loop();
@@ -186,6 +221,158 @@ pub fn request() {
     summary(cpus, silent, census);
     crate::drivers::panic_console::paint_report();
     IN_PROGRESS.store(false, Ordering::Release);
+}
+
+/// Ask each CPU that ignored its kick where it is, with the one interrupt it
+/// cannot mask.
+///
+/// A kick that goes unanswered has three causes and the report cannot act on
+/// any of them, because they look identical from here: the CPU is spinning with
+/// `IF` clear, it is halted and its kick was never delivered, or it is wedged
+/// below the interrupt layer entirely. An NMI separates all three in one round
+/// — a `rip` in a spin loop, a `rip` at the `hlt`, or no answer at all — and
+/// that is the whole reason this exists.
+///
+/// Bounded and lock-free on both sides. The handler stores one word; this
+/// symbolizes it afterwards, from a context that may take the ring lock.
+fn probe_silent(asked: &[bool; MAX_CPUS], cpus: usize) {
+    let any = (0..cpus).any(|cpu| asked[cpu]);
+    if !any {
+        return;
+    }
+    for cpu in 0..cpus {
+        if asked[cpu] {
+            NMI_RIP[cpu].store(0, Ordering::Relaxed);
+            NMI_OWES[cpu].store(true, Ordering::Release);
+        }
+    }
+    // Every flag set before any NMI goes out, for the same reason the kicks are
+    // batched above: an instant answer must not find its own flag unwritten.
+    for cpu in 0..cpus {
+        if asked[cpu] {
+            apic::send_nmi(cpu as u32);
+        }
+    }
+
+    let deadline = crate::clock::nanos_since_boot().saturating_add(NMI_BUDGET_NS);
+    while (0..cpus).any(|cpu| asked[cpu] && NMI_OWES[cpu].load(Ordering::Acquire)) {
+        if crate::clock::nanos_since_boot() >= deadline {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    for cpu in 0..cpus {
+        if !asked[cpu] {
+            continue;
+        }
+        if NMI_OWES[cpu].swap(false, Ordering::AcqRel) {
+            log!("  cpu{cpu} !! no NMI answer either: wedged below the interrupt layer");
+        } else {
+            log!("  cpu{cpu} NMI answered, it is here:");
+            crate::symbols::resolve_kernel(NMI_RIP[cpu].load(Ordering::Acquire));
+        }
+    }
+}
+
+/// Stage the one machine state this report exists to describe and that QEMU
+/// cannot produce: a CPU that ignores a kick.
+///
+/// Nothing on the host side can make a guest CPU deaf. QEMU delivers every IPI
+/// it is given, and a guest that stops scheduling stops for reasons — a spin
+/// with `IF` clear, a lock nobody releases — that are properties of the code
+/// under test rather than of the machine, so there is no `-device` and no
+/// monitor command that stages one. A kernel feature is the only actuator, and
+/// it replaces the *state* rather than the verdict: the victim really does
+/// disable interrupts and really does spin, so the kick really is unanswered
+/// and the NMI really is what reaches it.
+///
+/// Bounded and self-healing on purpose. The window is longer than
+/// [`ANSWER_BUDGET_NS`] so the CPU is named silent, and short enough that it
+/// rejoins and the guest shuts down cleanly — which is itself part of the
+/// assertion, since a CPU the NMI merely interrupted must come back.
+#[cfg(feature = "dump-deaf-cpu")]
+pub(super) fn deaf_window() {
+    /// Late enough that the machine is up and every CPU has joined.
+    const ARM_AT_NS: u64 = 3_000_000_000;
+    /// Comfortably past [`ANSWER_BUDGET_NS`], so "silent" is not a race — and
+    /// bounded, so the CPU rejoins and the guest still shuts down.
+    const DEAF_NS: u64 = 400_000_000;
+    /// How long cpu0 waits for the victim to reach its idle loop and go deaf.
+    const ACK_BUDGET_NS: u64 = 100_000_000;
+
+    const IDLE: u64 = 0;
+    const ASKED: u64 = 1;
+    const DEAF: u64 = 2;
+
+    static STAGE: AtomicU64 = AtomicU64::new(IDLE);
+    static FIRED: AtomicBool = AtomicBool::new(false);
+
+    let cpus = online_cpus();
+    if cpus < 2 {
+        return;
+    }
+    let me = percpu::cpu_id() as usize;
+    let victim = cpus - 1;
+
+    if me == victim {
+        if STAGE
+            .compare_exchange(ASKED, DEAF, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let began = crate::clock::nanos_since_boot();
+            let until = began + DEAF_NS;
+            // SAFETY: the actuator's whole content. Interrupts come back on
+            // below and the loop is bounded by the clock.
+            unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+            while crate::clock::nanos_since_boot() < until {
+                core::hint::spin_loop();
+            }
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+            // The victim is the only thing that can witness its own return, and
+            // half of what the probe claims is that an NMI interrupts a CPU
+            // rather than killing it.
+            let deaf_ms = (crate::clock::nanos_since_boot() - began) / 1_000_000;
+            log!("dump-deaf-cpu: cpu{me} rejoined after {deaf_ms}ms deaf");
+        }
+        return;
+    }
+    if me != 0 || crate::clock::nanos_since_boot() < ARM_AT_NS {
+        return;
+    }
+    if FIRED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // Drive the whole sequence from here rather than across idle-loop
+    // iterations: cpu0 may halt between two of them, and the window it has to
+    // ask inside is only as long as the victim stays deaf.
+    STAGE.store(ASKED, Ordering::Release);
+    apic::kick_cpu(victim as u32);
+    let deadline = crate::clock::nanos_since_boot().saturating_add(ACK_BUDGET_NS);
+    while STAGE.load(Ordering::Acquire) != DEAF {
+        if crate::clock::nanos_since_boot() >= deadline {
+            log!("dump-deaf-cpu: cpu{victim} never reached its idle loop to be deafened");
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    request();
+}
+
+/// The NMI handler's whole contribution: where this CPU was. Called from
+/// `arch/idt/nmi.rs` and from nowhere else.
+///
+/// Stores unconditionally rather than only when owed. An NMI this kernel did
+/// not send is a fact worth keeping too, and the alternative — reading the flag
+/// first — is a branch on state the sender owns, from a context that cannot
+/// afford to be wrong about it.
+pub fn note_nmi(rip: u64) {
+    let me = percpu::cpu_id() as usize;
+    if me >= MAX_CPUS {
+        return;
+    }
+    NMI_RIP[me].store(rip, Ordering::Release);
+    NMI_OWES[me].store(false, Ordering::Release);
 }
 
 /// Print this CPU's own tasks if it was asked to. Called from `drain_irqs` on

@@ -56,6 +56,7 @@ dependencies = [
  "toyos-abi",
  "toyos-fat32",
  "toyos-gpt",
+ "toyos-hda",
  "toyos-ps2",
  "toyos-sched",
  "toyos-xhci",
@@ -83,6 +84,10 @@ version = "0.1.0"
 
 [[package]]
 name = "toyos-gpt"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-hda"
 version = "0.1.0"
 
 [[package]]

@@ -627,6 +627,10 @@ pub fn enter_idle_loop() -> ! {
 
 extern "C" fn idle_loop() -> ! {
     loop {
+        // The idle loop and not a pass: the state it stages is a CPU that never
+        // reaches one.
+        #[cfg(feature = "dump-deaf-cpu")]
+        super::dump::deaf_window();
         crate::scheduler::log_health();
         crate::scheduler::reap_poisoned();
         drain_serial();

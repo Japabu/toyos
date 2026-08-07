@@ -2,7 +2,7 @@
 //!
 //! Real and shared with the kernel: task types, state word, transitions, run
 //! queue, fairness math, mailbox, doorbell, sleep handshake, ticket protocol,
-//! retire chase, deadline heap, pass logic. Mocked here: time, timer, IPI,
+//! retire chase, deadlines, pass logic. Mocked here: time, timer, IPI,
 //! halt, switch. Nothing above the line is reimplemented, which is the whole
 //! point — a simulator that models the scheduler instead of *being* it proves
 //! nothing about the code that ships.

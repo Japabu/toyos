@@ -504,6 +504,14 @@ pub fn usb_device_id(i: usize) -> String {
     format!("usbdev{i}")
 }
 
+/// The boot stick's device id.
+///
+/// The data disks have carried one since a test first had to unplug one; the
+/// stick the machine booted from had none, so the one device whose removal
+/// takes `/boot` and `/log` with it was the one the host could not name — which
+/// is the removal the owner's machine dies on.
+pub const BOOT_STICK_ID: &str = "bootstick";
+
 /// What every profile but [`Profile::MetalDisk`] gives the guest. Large
 /// enough for a filesystem, small enough that a boot formats it quickly.
 const NVME_SMALL: u64 = 128 * 1024 * 1024;
@@ -1065,8 +1073,8 @@ pub fn build_boot_image(
 /// Actuators that are a `SYS_DEBUG` action arm and nothing else.
 ///
 /// A boot cannot reach any of them; only a test that asks for one by number
-/// can. So the four kernels that differ only in which of them they carry are
-/// four builds of the same machine, and [`fold_inert`] makes them one.
+/// can. So the kernels that differ only in which of them they carry are
+/// several builds of the same machine, and [`fold_inert`] makes them one.
 ///
 /// **Membership is a claim about the kernel, not about the test that uses it**,
 /// and the claim is checkable: each name below has its `#[cfg]` sites in
@@ -1079,6 +1087,7 @@ const INERT_ACTUATORS: &[&str] = &[
     "test-screen-graffiti",
     "test-double-fault",
     "test-heap-ceiling",
+    "test-kernel-canary",
 ];
 
 /// The feature set to build, with every inert actuator replaced by the union of
@@ -1671,6 +1680,62 @@ impl Qmp {
         self.stream.write_all(b"\n").unwrap();
         self.await_reply("\"return\"");
     }
+
+    /// `execute`, keeping what the command answered with. Only the human
+    /// monitor answers with anything; every other command here returns `{}`.
+    fn execute_capturing(&mut self, command: &str) -> String {
+        use std::io::Read;
+        self.stream.write_all(command.as_bytes()).unwrap();
+        self.stream.write_all(b"\n").unwrap();
+        self.await_reply("\"return\"");
+        let rest = loop {
+            if let Some(at) = self.pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=at).collect();
+                break String::from_utf8_lossy(&line).into_owned();
+            }
+            let mut buf = [0u8; 4096];
+            let n = self.stream.read(&mut buf).expect("qmp: read failed");
+            assert!(n > 0, "qmp: socket closed mid-reply");
+            self.pending.extend_from_slice(&buf[..n]);
+        };
+        let Some(body) = rest.split_once('"').map(|(_, tail)| tail) else {
+            return String::new();
+        };
+        let body = body.rsplit_once('"').map_or(body, |(head, _)| head);
+        let mut out = String::with_capacity(body.len());
+        let mut chars = body.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                out.push(ch);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => {}
+                Some(escaped) => out.push(escaped),
+                None => break,
+            }
+        }
+        out
+    }
+}
+
+/// An open QMP connection to QEMU's human monitor, for the questions QMP has
+/// no command of its own for.
+pub struct QmpMonitor(Qmp);
+
+impl QmpMonitor {
+    pub fn open(socket: &Path) -> Self {
+        Self(Qmp::connect(socket))
+    }
+
+    /// Run `command` in the human monitor and return what it printed.
+    pub fn human(&mut self, command: &str) -> String {
+        self.0.execute_capturing(&format!(
+            "{{\"execute\":\"human-monitor-command\",\"arguments\":\
+             {{\"command-line\":\"{command}\"}}}}"
+        ))
+    }
 }
 
 /// An open QMP connection for injecting input.
@@ -1900,7 +1965,7 @@ fn qemu_command(
     qemu.arg("-machine")
         .arg(&machine)
         .arg("-cpu")
-        .arg(if kvm { "host,+rdrand,+smap,+fsgsbase,+x2apic" } else { "qemu64,+rdrand,+smap,+fsgsbase,+x2apic" })
+        .arg(if kvm { "host,+rdrand,+smap,+fsgsbase,+x2apic,+smep" } else { "qemu64,+rdrand,+smap,+fsgsbase,+x2apic,+smep" })
         .arg("-smp")
         .arg(options.smp.to_string())
         .arg("-m")
@@ -1976,7 +2041,7 @@ fn qemu_command(
 
     qemu.arg("-device")
         .arg(format!(
-            "usb-storage,bus={},drive=stick,bootindex=0",
+            "usb-storage,bus={},drive=stick,id={BOOT_STICK_ID},bootindex=0",
             shape.storage_bus
         ))
         .arg("-vga")

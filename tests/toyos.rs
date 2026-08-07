@@ -292,6 +292,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Its own boot, its own feature, and it drives the guest only through
     // stdin — nothing it touches is shared with another test.
     ("idle_stack_guard", Sched::Parallel),
+    // Its own boot and its own feature; it deafens one CPU for 400 ms and
+    // nothing it touches is shared.
+    ("dump_nmi_probe", Sched::Parallel),
     ("diskless_boot", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
     // Its whole assertion is that a keystroke injected from the host crossed a
@@ -373,6 +376,12 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("usb_storage_gate", Sched::Parallel),
     ("usb_storage_shapes", Sched::Parallel),
     ("usb_refused_disk_first", Sched::Parallel),
+    // The owner's freeze, staged: `device_del` on the stick carrying `/boot`
+    // and `/log` while the desktop draws. Serial because both verdicts are
+    // liveness ceilings — two 2 s compositor reporting intervals inside 20 s,
+    // and a console round trip inside 20 s — and a guest sharing the host with
+    // eleven others answers those late for reasons that are not the defect.
+    ("usb_boot_stick_pulled", Sched::Serial),
     ("usb_pool_exhausted", Sched::Parallel),
     ("usb_short_read", Sched::Parallel),
     // A plug over QMP and two host-side verdicts, neither of them a duration:
@@ -450,7 +459,176 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // verdict it does not have.
     ("suspend_detector", Sched::Parallel),
     ("suspend_invalidates_a_verdict", Sched::Parallel),
+    // Same: the expected-failure declaration asking whether it still refuses the
+    // things it exists to refuse.
+    ("expected_failure_verdicts", Sched::Parallel),
+    ("expected_failure_exit_status", Sched::Parallel),
+    ("expected_failure_entries", Sched::Parallel),
 ];
+
+/// What makes an entry stale, which is the whole safety argument for having a
+/// declaration at all: **an entry must not be able to outlive its defect
+/// quietly.** The two answers are not interchangeable and choosing the wrong one
+/// breaks the mechanism in opposite directions.
+#[derive(PartialEq, Debug)]
+enum Stale {
+    /// **The test passing.** For a failure that fires on every run: the day it
+    /// goes green, either the defect is gone or the entry was always wrong, and
+    /// both want a human. The strong form — it detects the fix itself, on the
+    /// run that contains it — and the one to use wherever it is true.
+    OnAPass,
+    /// **A date, because a pass proves nothing.** For a failure that does not
+    /// fire every run. One green of an intermittent test is one sample of a
+    /// rate, and `specs/audio-gate-history.md` is the standing evidence that a
+    /// verdict taken from one sample is a verdict about nothing — so
+    /// [`Stale::OnAPass`] here would red a tree with nothing wrong with it, on
+    /// the first lucky run, and teach everybody to re-run until it went away.
+    ///
+    /// This does not claim to detect the fix. It claims something weaker and
+    /// honest: on this date the entry reds, and somebody fixes it, deletes it,
+    /// or re-justifies it in a commit that a reviewer sees. **`YYYY-MM-DD`**,
+    /// refused at startup if it does not parse — a date nothing can read is an
+    /// entry that never expires.
+    OnThisDate(&'static str),
+}
+
+/// One test that is expected to fail, and the open defect it fails on.
+///
+/// **The property that makes this safe to have at all: an entry has to be able
+/// to fail the build by itself**, so that the list cannot silently outlive the
+/// defect. [`Stale`] is that property and it is the field to think hardest
+/// about.
+#[derive(PartialEq, Debug)]
+struct ExpectedFailure {
+    /// The registered test name, exactly. [`check_expected_failures`] refuses a
+    /// name no list carries, so a renamed or deleted test takes its entry with
+    /// it rather than leaving an exemption behind for whatever gets that name
+    /// next.
+    test: &'static str,
+    /// The task the failure is pending on. There is no entry without one: an
+    /// expected failure nobody is assigned to is a disabled test.
+    task: u32,
+    /// Where the defect is written up, in full, with its reproduction and the
+    /// evidence. **The entry never restates it** — two descriptions of one
+    /// defect are two things that drift apart, and this one is the copy nobody
+    /// reads while investigating.
+    spec: &'static str,
+    /// The failure this entry covers, quoted from the test's own message: the
+    /// reason must contain **one** of these or the exemption does not apply and
+    /// the run is red on it. Alternatives rather than conjuncts because one
+    /// defect can surface at more than one of a test's assertions; every
+    /// fragment here is a distinct place the same defect has been seen to land.
+    ///
+    /// Quotation rather than prose, deliberately. A restatement drifts silently
+    /// from what the test says; a quotation cannot — the day somebody rewords
+    /// the assertion, the entry stops matching and the run goes red asking
+    /// about it.
+    ///
+    /// **Residual risk, which no cheap matcher closes:** this pins *which*
+    /// assertion failed and not *why*. A second defect that reaches the same
+    /// assertion is absorbed. Where the discriminator is a property of the log
+    /// rather than of the message — `desktop_window_child`'s is *silence*, and
+    /// silence is not a substring — it lives in [`ExpectedFailure::spec`] and a
+    /// human applies it. The `XFAIL` line prints the pointer for that reason.
+    says: &'static [&'static str],
+    /// What ends this entry. See [`Stale`].
+    stale: Stale,
+}
+
+impl ExpectedFailure {
+    /// Whether the entry has outlived its own claim on the calendar.
+    ///
+    /// The [`Stale::OnAPass`] half is decided in [`Outcome::verdict_against`],
+    /// where the pass is; this half is decided against the run itself, because a
+    /// date arrives whether or not the test ran at all.
+    fn expired(&self, today: Day) -> Option<String> {
+        match self.stale {
+            Stale::OnAPass => None,
+            Stale::OnThisDate(date) => {
+                let due = Day::parse(date).expect("check_expected_failures parsed this already");
+                (today >= due).then(|| {
+                    format!(
+                        "its review date {date} has arrived. It says nothing about whether \
+                         #{} is fixed — it says nobody has looked since it was written",
+                        self.task
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// A civil date, as days since 1970-01-01.
+///
+/// Days rather than seconds because that is the resolution of the only question
+/// asked of it, and because a comparison against a wall clock at second
+/// resolution would flip mid-run.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+struct Day(i64);
+
+impl Day {
+    fn today() -> Day {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a host clock before 1970 is a host to fix, not a date to guess at")
+            .as_secs() as i64;
+        Day(secs.div_euclid(86_400))
+    }
+
+    /// `YYYY-MM-DD`, or `None`. Hinnant's `days_from_civil`, which is exact for
+    /// every date the proleptic Gregorian calendar has.
+    fn parse(text: &str) -> Option<Day> {
+        let (y, rest) = text.split_once('-')?;
+        let (m, d) = rest.split_once('-')?;
+        if (y.len(), m.len(), d.len()) != (4, 2, 2) {
+            return None;
+        }
+        let (y, m, d) = (y.parse::<i64>().ok()?, m.parse::<i64>().ok()?, d.parse::<i64>().ok()?);
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+            return None;
+        }
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        Some(Day(era * 146_097 + doe - 719_468))
+    }
+}
+
+/// Tests this tree expects to fail, and what each is pending on.
+///
+/// **Empty is the normal state**, and an entry is a claim with a cost: the run
+/// that carries it is not a clean run and says so in its last line. See
+/// [`ExpectedFailure`] for what an entry has to be able to say, and
+/// [`Tally::summary`] for what a run does with one.
+const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
+    test: "desktop_window_child",
+    task: 156,
+    spec: "specs/known-issues.md §3, \"EXPECTED RED, pending #156\"",
+    // The rule that decides this list, so that the next fragment added to it has
+    // one to be judged against: **a message belongs here when its failure is the
+    // desktop ceasing to answer after a window closed.** That is what both open
+    // defects under this test produce — the freeze, and the shell exiting
+    // instead of prompting. The test's other five messages are deliberately
+    // absent because each names something else happening: the client binary
+    // missing, the desktop never coming up at all, a window never being created
+    // (twice — the child's and snake's), and the client leaving on its own
+    // deadline. Any of those reds the run.
+    says: &[
+        "the windowed child never reported leaving",
+        "a windowed child exited by itself and the shell never answered again",
+        "GUI+Q never reached the compositor",
+        "the compositor closed the window and the client did not leave",
+        "snake did not leave when its window was closed in round",
+        "snake's window was closed, snake left, and the shell never answered again",
+    ],
+    // Intermittent — it has been red alone and red wide, at a different point
+    // each time — so a green is one sample of a rate and may not red the run.
+    // A month: long enough that a fix already in flight lands first, short
+    // enough that nobody inherits this silently.
+    stale: Stale::OnThisDate("2026-09-06"),
+}];
 
 /// The renderer's two text colours, as the screendump reports them.
 const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
@@ -3829,6 +4007,29 @@ fn serial_until(
     false
 }
 
+/// [`serial_until`] over what arrives *after* `from`.
+///
+/// For a marker a test asks for more than once. `serial_until` scans the whole
+/// capture, so the second ask is answered by the first ask's line and the test
+/// carries on against a guest that has not done the thing yet — which is the
+/// same defect as reusing a nonce, one layer down.
+fn serial_until_new(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    marker: &str,
+    from: usize,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        log.push_str(&qemu.drain_serial(Duration::from_millis(200)));
+        if log[from.min(log.len())..].contains(marker) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The wizard's two answers, as a Swiss keyboard's owner gives them: the key
 /// that prints `Z`, the key that prints `§`, then Enter to confirm.
 const SWISS_ANSWERS: [&str; 3] = ["y", "grave_accent", "ret"];
@@ -3888,6 +4089,33 @@ fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> bool 
 /// The client is a bare `window::Window`, so a reproduction here is about the
 /// shell, the terminal and the window protocol, and a clean run narrows the
 /// defect to what winit does that this does not.
+/// Close the focused window with GUI+Q, retrying until the compositor says a
+/// window went.
+///
+/// **Never blind, and what it waits for is the close itself.** A keystroke
+/// injected while the guest is busy is lost, so one attempt is not enough on a
+/// loaded host; but a second GUI+Q *after* one worked closes the next window
+/// down, which here is the terminal, and that takes the shell and the whole
+/// desktop with it. The compositor emits `window closed` from the close, so
+/// this waits on the event it caused. Waiting on the `windows=N` count instead
+/// is what made this re-send: that count is a sample taken every two seconds,
+/// so it answers about an interval rather than about this injection — and the
+/// wait was `serial_until`, which scans the whole capture, so the *previous*
+/// probe's `windows=1` returned it immediately and the loop hammered GUI+Q at
+/// the speed of a QMP round trip.
+fn close_focused_window(qemu: &mut QemuInstance, log: &mut String, new: usize) -> bool {
+    const CLOSED: &str = "compositor: window closed";
+    let deadline = Instant::now() + qemu::budget(Duration::from_secs(20));
+    while Instant::now() < deadline && !log[new..].contains(CLOSED) {
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);
+        }
+        serial_until_new(qemu, log, CLOSED, new, Duration::from_secs(4));
+    }
+    log[new..].contains(CLOSED)
+}
+
 /// How many times snake is opened and closed. One green round says very little
 /// about a report that arrived once.
 const SNAKE_ROUNDS: usize = 3;
@@ -3915,7 +4143,48 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
     metal_sim_argv_check(&qemu::profile_argv(&options))?;
     let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
     let mut log = qemu.boot_log().to_string();
-    if !shell_answers(&mut qemu, &mut log) {
+    match window_child_probes(&mut qemu, &mut log) {
+        Ok(()) => Ok(()),
+        Err(message) => Err(format!("{message}\n{}", freeze_report(&mut qemu, &mut log))),
+    }
+}
+
+/// What a desktop that stopped answering is asked, in the order that survives
+/// being asked.
+///
+/// Every vCPU's registers first. `HLT=1` with `IF` set in `RFL` is a machine
+/// with nothing to run rather than one wedged below the interrupt layer, and
+/// that is the question #156 turns on — but Ctrl+Alt+D revives a halted CPU,
+/// so the dump destroys the evidence it is taken to explain. Asked in the
+/// other order, both halves describe the repaired machine.
+fn freeze_report(qemu: &mut QemuInstance, log: &mut String) -> String {
+    let registers = {
+        let mut monitor = qemu::QmpMonitor::open(qemu.qmp_socket());
+        monitor.human("info registers -a")
+    };
+    let before = log.len();
+    {
+        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+        input.keys(&[
+            ("ctrl", true),
+            ("alt", true),
+            ("d", true),
+            ("d", false),
+            ("alt", false),
+            ("ctrl", false),
+        ]);
+    }
+    let whole = serial_until(qemu, log, "=== end of dump ===", Duration::from_secs(30));
+    format!(
+        "--- info registers -a, taken before this report injected anything ---\n{registers}\n\
+         --- Ctrl+Alt+D{} ---\n{}",
+        if whole { "" } else { ", which produced no complete report" },
+        &log[before.min(log.len())..]
+    )
+}
+
+fn window_child_probes(qemu: &mut QemuInstance, log: &mut String) -> Result<(), String> {
+    if !shell_answers(qemu, log) {
         return Err(format!("nothing typed at the terminal window reached a shell:\n{log}"));
     }
 
@@ -3926,10 +4195,10 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
         let mut input = qemu::QmpInput::open(qemu.qmp_socket());
         type_line(&mut input, "test_rs_window_child exit");
     }
-    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-GONE", Duration::from_secs(20)) {
+    if !serial_until(qemu, log, "WINDOW-CHILD-GONE", qemu::budget(Duration::from_secs(20))) {
         return Err(format!("the windowed child never reported leaving:\n{log}"));
     }
-    if !shell_echoes(&mut qemu, &mut log, "after-own-exit-zqjxk") {
+    if !shell_echoes(qemu, log, "after-own-exit-zqjxk") {
         return Err(format!(
             "a windowed child exited by itself and the shell never answered again:\n{log}"
         ));
@@ -3937,23 +4206,34 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
 
     // The owner's case: the process is alive and the compositor takes its
     // window away underneath it.
+    let started = log.len();
     {
         let mut input = qemu::QmpInput::open(qemu.qmp_socket());
         type_line(&mut input, "test_rs_window_child");
     }
-    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-UP", Duration::from_secs(20)) {
+    // Its own marker, not the one the probe above already printed.
+    if !serial_until_new(
+        qemu,
+        log,
+        "WINDOW-CHILD-UP",
+        started,
+        qemu::budget(Duration::from_secs(20)),
+    ) {
         return Err(format!("the windowed child never got a window:\n{log}"));
     }
-    {
-        // GUI+Q closes the focused window, and a window the compositor has
-        // just created is the focused one.
-        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
-        input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);
-    }
+    // GUI+Q closes the focused window, and a window the compositor has just
+    // created is the focused one. Re-injected until the compositor says the
+    // window went — a keystroke that lands while the guest is busy is lost —
+    // and never blind, because a second GUI+Q after one worked would close the
+    // terminal's window instead.
     let before = log.len();
-    if !serial_until(&mut qemu, &mut log, "WINDOW-CHILD-GONE", Duration::from_secs(20))
-        || !log[before..].contains("WINDOW-CHILD-GONE")
-    {
+    if !close_focused_window(qemu, log, before) {
+        return Err(format!(
+            "GUI+Q never reached the compositor:\n{}",
+            &log[before.min(log.len())..]
+        ));
+    }
+    if !serial_until_new(qemu, log, "WINDOW-CHILD-GONE", before, qemu::budget(Duration::from_secs(20))) {
         return Err(format!(
             "the compositor closed the window and the client did not leave:\n{}",
             &log[before.min(log.len())..]
@@ -3965,7 +4245,7 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
             &log[before..]
         ));
     }
-    if !shell_echoes(&mut qemu, &mut log, "after-window-closed-zqjxk") {
+    if !shell_echoes(qemu, log, "after-window-closed-zqjxk") {
         return Err(format!(
             "the compositor closed a child's window and the shell never answered again — \
              this is the owner's snake report, reproduced:\n{log}"
@@ -3987,7 +4267,8 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
         // snake prints nothing of its own, so the compositor's second window
         // is what says it is up — and a window it has just created is the
         // focused one, which is what GUI+Q then closes.
-        if !serial_until(&mut qemu, &mut log, "windows=2", Duration::from_secs(20)) {
+        let opened = log.len();
+        if !serial_until_new(qemu, log, "windows=2", opened, qemu::budget(Duration::from_secs(20))) {
             return Err(format!("snake never got a window in round {round}:\n{log}"));
         }
         if round + 1 == SNAKE_ROUNDS {
@@ -3999,20 +4280,20 @@ fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
                 }
             }
         }
-        {
-            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
-            input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);
-        }
         let before = log.len();
-        if !serial_until(&mut qemu, &mut log, "exit: snake", Duration::from_secs(20))
-            || !log[before..].contains("exit: snake")
-        {
+        if !close_focused_window(qemu, log, before) {
+            return Err(format!(
+                "GUI+Q never reached the compositor in round {round}:\n{}",
+                &log[before.min(log.len())..]
+            ));
+        }
+        if !serial_until_new(qemu, log, "exit: snake", before, qemu::budget(Duration::from_secs(20))) {
             return Err(format!(
                 "snake did not leave when its window was closed in round {round}:\n{}",
                 &log[before.min(log.len())..]
             ));
         }
-        if !shell_echoes(&mut qemu, &mut log, &format!("after-snake-{round}-zqjxk")) {
+        if !shell_echoes(qemu, log, &format!("after-snake-{round}-zqjxk")) {
             return Err(format!(
                 "snake's window was closed, snake left, and the shell never answered again \
                  (round {round}) — the owner's report, reproduced:\n{log}"
@@ -5174,6 +5455,7 @@ fn run_machine_test(
         // Bodies in `tests/common/usb.rs`, for the same reason.
         "usb_storage_gate" => usb::usb_storage_gate(test_config, c_bins, rust_bins),
         "usb_storage_shapes" => usb::usb_storage_shapes(test_config, c_bins, rust_bins),
+        "usb_boot_stick_pulled" => usb::usb_boot_stick_pulled(test_config, c_bins, rust_bins),
         "usb_refused_disk_first" => {
             usb::usb_refused_disk_first(test_config, c_bins, rust_bins)
         }
@@ -5221,6 +5503,7 @@ fn run_machine_test(
         "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
+        "dump_nmi_probe" => faults::dump_nmi_probe(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
@@ -6021,6 +6304,9 @@ fn run_machine_test(
         "serial_vocabulary" => serial::self_check(),
         "suspend_detector" => common::clock::self_check(),
         "suspend_invalidates_a_verdict" => suspend_invalidates_a_verdict(),
+        "expected_failure_verdicts" => expected_failure_verdicts(),
+        "expected_failure_exit_status" => expected_failure_exit_status(),
+        "expected_failure_entries" => expected_failure_entries(),
         "nvme_wide_sector" => {
             // The other half of "a device's size is a shape dimension": not how
             // many sectors, but how big one is. `lba_ds` is an 8-bit
@@ -8132,25 +8418,62 @@ struct Outcome {
 }
 
 /// What the suite may conclude from one outcome.
+///
+/// `Pass` and `Fail` carry the entry that was consulted and **did not apply** —
+/// the two ways an [`EXPECTED_FAILURES`] entry can be present and still leave
+/// the ordinary verdict standing. Carried in the type so that no arm can treat
+/// one as accounted for by forgetting to look it up.
 #[derive(PartialEq, Debug)]
 enum Verdict {
-    Pass,
-    Fail,
+    /// `Some` when the name is listed and the entry's [`Stale`] says a pass
+    /// proves nothing about it. Still a pass — and still worth a line, because
+    /// a green run of a known-red test is not evidence that anything is fixed.
+    Pass(Option<&'static ExpectedFailure>),
+    /// Red. `Some` when the name *is* listed and the failure is not the one that
+    /// entry covers — the case an exemption must not absorb, and the one the
+    /// report has to explain rather than print as an ordinary red.
+    Fail(Option<&'static ExpectedFailure>),
     /// The host stopped in the middle of it. Neither a pass nor a fail: the
     /// guest, QEMU's virtual clock and every wall-clock margin the test's
     /// assertion rests on all jumped by however long the lid was closed, so the
     /// run measured something and it was not this tree.
     Invalid,
+    /// Listed, and failed the way its entry says. Not red — and reported by
+    /// name, with its task, on every run.
+    Expected(&'static ExpectedFailure),
+    /// Listed with [`Stale::OnAPass`], and passed. **Red**: the entry claimed
+    /// this test fails every run and it did not, so the entry is out of date
+    /// about this tree.
+    Stale(&'static ExpectedFailure),
 }
 
 impl Outcome {
     fn verdict(&self) -> Verdict {
+        self.verdict_against(EXPECTED_FAILURES)
+    }
+
+    /// The table is a parameter so the gates can state a case rather than
+    /// depend on what the tree happens to be expecting today — which is the
+    /// empty list whenever the tree is healthy, and therefore no case at all.
+    fn verdict_against(&self, expected: &'static [ExpectedFailure]) -> Verdict {
         if self.suspended >= common::clock::SUSPENDED_AT_LEAST {
             return Verdict::Invalid;
         }
-        match self.reason {
-            None => Verdict::Pass,
-            Some(_) => Verdict::Fail,
+        let listed = expected.iter().find(|e| e.test == self.name);
+        match (&self.reason, listed) {
+            (None, None) => Verdict::Pass(None),
+            (None, Some(entry)) => match entry.stale {
+                Stale::OnAPass => Verdict::Stale(entry),
+                Stale::OnThisDate(_) => Verdict::Pass(Some(entry)),
+            },
+            (Some(_), None) => Verdict::Fail(None),
+            (Some(reason), Some(entry)) => {
+                if entry.says.iter().any(|fragment| reason.contains(fragment)) {
+                    Verdict::Expected(entry)
+                } else {
+                    Verdict::Fail(Some(entry))
+                }
+            }
         }
     }
 }
@@ -8168,12 +8491,12 @@ fn suspend_invalidates_a_verdict() -> Result<(), String> {
     // by microseconds, and a run must not be thrown away for that.
     let jitter = common::clock::SUSPENDED_AT_LEAST - Duration::from_millis(1);
     let cases: [(&str, Option<&str>, Duration, Verdict); 6] = [
-        ("a pass on a host that stayed up", None, awake, Verdict::Pass),
-        ("a fail on a host that stayed up", Some("the guest said no"), awake, Verdict::Fail),
+        ("a pass on a host that stayed up", None, awake, Verdict::Pass(None)),
+        ("a fail on a host that stayed up", Some("the guest said no"), awake, Verdict::Fail(None)),
         ("a pass across a suspend", None, slept, Verdict::Invalid),
         ("a fail across a suspend", Some("timed out"), slept, Verdict::Invalid),
-        ("a pass across clock jitter", None, jitter, Verdict::Pass),
-        ("a fail across clock jitter", Some("the guest said no"), jitter, Verdict::Fail),
+        ("a pass across clock jitter", None, jitter, Verdict::Pass(None)),
+        ("a fail across clock jitter", Some("the guest said no"), jitter, Verdict::Fail(None)),
     ];
     for (what, reason, suspended, want) in cases {
         let outcome = Outcome {
@@ -8185,6 +8508,591 @@ fn suspend_invalidates_a_verdict() -> Result<(), String> {
         let got = outcome.verdict();
         if got != want {
             return Err(format!("{what} is {got:?}, and it has to be {want:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// What a run has established, as it establishes it.
+///
+/// One place rather than five counters in `main`, because the interesting part
+/// is not any one of them but the arithmetic between them — which reds, which
+/// only reports, and what the process exits with. [`Tally::exit_code`] and
+/// [`Tally::summary`] are that arithmetic, and both are gated.
+struct Tally {
+    expected: &'static [ExpectedFailure],
+    passed: usize,
+    failures: Vec<(String, String)>,
+    /// A listed test that failed. Reported, never red.
+    fired: Vec<(String, &'static ExpectedFailure)>,
+    /// A listed test that passed where its entry says a pass is the proof. Red.
+    stale: Vec<&'static ExpectedFailure>,
+    /// A listed test that passed where its entry says a pass proves nothing.
+    /// Not red, and reported: a green of a known-red test is not a fix.
+    quiet: Vec<(String, &'static ExpectedFailure)>,
+    /// An entry whose own review date has arrived. Red, and independent of what
+    /// ran: the declaration expired whether or not this run touched the test.
+    expired: Vec<(&'static ExpectedFailure, String)>,
+    invalid: Vec<(String, Duration)>,
+}
+
+impl Tally {
+    fn new(expected: &'static [ExpectedFailure], today: Day) -> Self {
+        Tally {
+            expected,
+            passed: 0,
+            failures: Vec::new(),
+            fired: Vec::new(),
+            stale: Vec::new(),
+            quiet: Vec::new(),
+            expired: expected
+                .iter()
+                .filter_map(|e| e.expired(today).map(|why| (e, why)))
+                .collect(),
+            invalid: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, outcome: Outcome) {
+        let verdict = outcome.verdict_against(self.expected);
+        let summary = || {
+            let reason = outcome.reason.as_deref().unwrap_or("check failed");
+            reason.lines().next().unwrap_or("check failed").to_string()
+        };
+        match verdict {
+            Verdict::Pass(None) => self.passed += 1,
+            Verdict::Pass(Some(entry)) => {
+                self.passed += 1;
+                self.quiet.push((outcome.name.clone(), entry));
+            }
+            Verdict::Fail(None) => self.failures.push((outcome.name.clone(), summary())),
+            Verdict::Fail(Some(entry)) => self.failures.push((
+                outcome.name.clone(),
+                format!(
+                    "{} — and this is NOT #{}'s failure, so the entry does not cover it",
+                    summary(),
+                    entry.task
+                ),
+            )),
+            Verdict::Expected(entry) => self.fired.push((outcome.name.clone(), entry)),
+            Verdict::Stale(entry) => self.stale.push(entry),
+            Verdict::Invalid => self.invalid.push((outcome.name.clone(), outcome.suspended)),
+        }
+    }
+
+    /// **Three statuses, and an expected failure is none of them.**
+    ///
+    /// It never reaches this function, which is the statement: a run whose only
+    /// reds were declared, reviewed and pending on a task has established that
+    /// this tree is what the declaration says it is, and that is exit 0. What a
+    /// stale entry establishes is the opposite — the declaration is wrong about
+    /// this tree — so it is exit 1 beside any other red.
+    ///
+    /// 2 keeps its existing meaning untouched: the run established nothing,
+    /// because the host stopped in the middle of it.
+    fn exit_code(&self) -> i32 {
+        if !self.failures.is_empty() || !self.stale.is_empty() || !self.expired.is_empty() {
+            return 1;
+        }
+        if !self.invalid.is_empty() {
+            return 2;
+        }
+        0
+    }
+
+    /// Everything the run has to say, as one block, ending in the result line.
+    ///
+    /// A string rather than a pile of `eprintln!`s so that the gate can read
+    /// what an agent reads. **The result line names every expected failure that
+    /// fired**: the whole hazard of this mechanism is a run that looks clean
+    /// because nobody scrolled up.
+    fn summary(&self, total: usize, elapsed: Duration, suspended: Duration) -> String {
+        let mut out = String::new();
+        let mut say = |line: String| {
+            out.push_str(&line);
+            out.push('\n');
+        };
+        say(String::new());
+        if suspended >= common::clock::SUSPENDED_AT_LEAST {
+            // The elapsed figure below is monotonic and therefore already
+            // excludes it, which is worth saying: the two numbers do not add up
+            // unless a reader knows that.
+            say(format!(
+                "note: the host was suspended for {suspended:.0?} during this run. \
+                 The suite time below excludes it."
+            ));
+        }
+        if !self.failures.is_empty() {
+            say("failures:".to_string());
+            for (name, reason) in &self.failures {
+                say(format!("    {name}: {reason}"));
+            }
+            say(String::new());
+        }
+        if !self.fired.is_empty() {
+            say("expected failures — open defects this run reproduced:".to_string());
+            for (name, entry) in &self.fired {
+                say(format!("    {name}  #{}  {}", entry.task, entry.spec));
+            }
+            say(
+                "    The exemption pins which assertion failed, not why. Read the \
+                 pointer above before treating one as accounted for."
+                    .to_string(),
+            );
+            say(String::new());
+        }
+        if !self.quiet.is_empty() {
+            say("expected failures that did not fire — this proves nothing:".to_string());
+            for (name, entry) in &self.quiet {
+                say(format!("    {name}  #{}  {}", entry.task, entry.spec));
+            }
+            say(
+                "    Each is intermittent by its own entry, so one green run is one \
+                 sample. Do not close anything on it."
+                    .to_string(),
+            );
+            say(String::new());
+        }
+        if !self.stale.is_empty() {
+            say("stale expected-failure entries — these tests PASSED:".to_string());
+            for entry in &self.stale {
+                say(format!("    {}  #{}  {}", entry.test, entry.task, entry.spec));
+            }
+            say(
+                "    Delete the entry if the defect is fixed. If it is not fixed and \
+                 this test passes anyway, the failure was never reproducible and the \
+                 entry should have said so."
+                    .to_string(),
+            );
+            say(String::new());
+        }
+        if !self.expired.is_empty() {
+            say("expected-failure entries past their review date:".to_string());
+            for (entry, why) in &self.expired {
+                say(format!("    {}  #{}  {why}", entry.test, entry.task));
+                say(format!("        {}", entry.spec));
+            }
+            say(String::new());
+        }
+        if !self.invalid.is_empty() {
+            say("invalidated by host suspend:".to_string());
+            for (name, slept) in &self.invalid {
+                say(format!("    {name}: the host was stopped for {slept:.0?} while it ran"));
+            }
+            say(String::new());
+        }
+
+        let expected_note = if self.fired.is_empty() {
+            String::new()
+        } else {
+            let named: Vec<String> =
+                self.fired.iter().map(|(n, e)| format!("{n} (#{})", e.task)).collect();
+            format!(", {} expected: {}", self.fired.len(), named.join(", "))
+        };
+        match self.exit_code() {
+            1 => say(format!(
+                "test result: FAILED. {} passed, {} failed, {} stale or expired \
+                 expected-failure entries{expected_note}, {} invalidated, {total} total \
+                 ({elapsed:.1?})",
+                self.passed,
+                self.failures.len(),
+                self.stale.len() + self.expired.len(),
+                self.invalid.len(),
+            )),
+            2 => {
+                say(format!(
+                    "test result: INVALID. {} passed{expected_note}, {} invalidated by a \
+                     host suspend of {suspended:.0?}, {total} total ({elapsed:.1?})",
+                    self.passed,
+                    self.invalid.len(),
+                ));
+                say(
+                    "This is not a red. The machine stopped mid-run, so those verdicts \
+                     are of nothing; re-run the suite."
+                        .to_string(),
+                );
+            }
+            _ if !self.fired.is_empty() => say(format!(
+                "test result: ok, NOT clean. {} passed{expected_note}, {total} total \
+                 ({elapsed:.1?})",
+                self.passed,
+            )),
+            _ => say(format!(
+                "test result: ok. {} passed, {total} total ({elapsed:.1?})",
+                self.passed
+            )),
+        }
+        out
+    }
+}
+
+/// Every claim [`EXPECTED_FAILURES`] makes about itself, against the names this
+/// run can actually produce a verdict for.
+///
+/// `runnable` is the whole registry rather than the two const lists, because the
+/// shared boot's C and Rust tests are discovered and a name that only exists
+/// there must still be listable.
+fn check_expected_failures(
+    expected: &'static [ExpectedFailure],
+    runnable: &BTreeSet<&str>,
+) -> Result<(), String> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for entry in expected {
+        if !seen.insert(entry.test) {
+            return Err(format!("{} has two expected-failure entries", entry.test));
+        }
+        if !runnable.contains(entry.test) {
+            return Err(format!(
+                "{} is expected to fail and no list registers it — a renamed or deleted \
+                 test must take its entry with it, or the exemption is waiting for \
+                 whatever gets that name next",
+                entry.test
+            ));
+        }
+        if entry.says.is_empty() {
+            return Err(format!(
+                "{}'s entry names no failure, so it would absorb every red that test \
+                 can produce",
+                entry.test
+            ));
+        }
+        if let Stale::OnThisDate(date) = entry.stale {
+            if Day::parse(date).is_none() {
+                return Err(format!(
+                    "{}'s review date {date:?} is not a YYYY-MM-DD date, so the entry \
+                     would never expire",
+                    entry.test
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What the declaration decides about one outcome, in both directions.
+///
+/// The anti-rot property is the third case and it is the reason the mechanism is
+/// safe: **a listed test that passes is a red run.** The rest are its negative
+/// controls — an unlisted failure is still an ordinary red, and a listed test
+/// failing some *other* way is too.
+fn expected_failure_verdicts() -> Result<(), String> {
+    static LISTED: &[ExpectedFailure] = &[
+        ExpectedFailure {
+            test: "fails_every_run",
+            task: 4242,
+            spec: "specs/nowhere.md",
+            says: &["the guest never answered", "the shell never answered again"],
+            stale: Stale::OnAPass,
+        },
+        ExpectedFailure {
+            test: "fails_sometimes",
+            task: 4243,
+            spec: "specs/nowhere.md",
+            says: &["the shell never answered again"],
+            stale: Stale::OnThisDate("2999-01-01"),
+        },
+    ];
+    let awake = Duration::ZERO;
+    let slept = common::clock::SUSPENDED_AT_LEAST + Duration::from_secs(120);
+    let (every, sometimes) = (&LISTED[0], &LISTED[1]);
+    let cases: [(&str, &str, Option<&str>, Duration, Verdict); 9] = [
+        (
+            "a listed test failing the way its entry says",
+            "fails_every_run",
+            Some("round 2: the shell never answered again:\n<log>"),
+            awake,
+            Verdict::Expected(every),
+        ),
+        (
+            "the entry's second alternative",
+            "fails_every_run",
+            Some("the guest never answered"),
+            awake,
+            Verdict::Expected(every),
+        ),
+        // The anti-rot property, at the verdict where it is decided.
+        (
+            "a test whose entry says a pass is the proof, passing",
+            "fails_every_run",
+            None,
+            awake,
+            Verdict::Stale(every),
+        ),
+        // And the reason the property is not unconditional: one green of an
+        // intermittent test is one sample, so it may not red the run.
+        (
+            "a test whose entry says a pass proves nothing, passing",
+            "fails_sometimes",
+            None,
+            awake,
+            Verdict::Pass(Some(sometimes)),
+        ),
+        (
+            "that same test failing the way its entry says",
+            "fails_sometimes",
+            Some("the shell never answered again"),
+            awake,
+            Verdict::Expected(sometimes),
+        ),
+        (
+            "a listed test failing some other way",
+            "fails_every_run",
+            Some("the client binary was not built"),
+            awake,
+            Verdict::Fail(Some(every)),
+        ),
+        (
+            "an unlisted test failing the same way",
+            "some_other_test",
+            Some("the shell never answered again"),
+            awake,
+            Verdict::Fail(None),
+        ),
+        ("an unlisted test passing", "some_other_test", None, awake, Verdict::Pass(None)),
+        (
+            "a listed test across a host suspend",
+            "fails_every_run",
+            Some("the shell never answered again"),
+            slept,
+            Verdict::Invalid,
+        ),
+    ];
+    for (what, name, reason, suspended, want) in cases {
+        let outcome = Outcome {
+            name: name.to_string(),
+            reason: reason.map(str::to_string),
+            elapsed: Duration::from_secs(3),
+            suspended,
+        };
+        let got = outcome.verdict_against(LISTED);
+        if got != want {
+            return Err(format!("{what} is {got:?}, and it has to be {want:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// What a whole run exits with, and what its last line says.
+///
+/// Driven through [`Tally`] rather than asserted about it: the property that
+/// matters is what `--land`'s gate reads off the process, and that is the exit
+/// code after `record` has seen every outcome.
+fn expected_failure_exit_status() -> Result<(), String> {
+    static LISTED: &[ExpectedFailure] = &[ExpectedFailure {
+        test: "a_test_pending_on_a_defect",
+        task: 4242,
+        spec: "specs/nowhere.md §9",
+        says: &["the shell never answered again"],
+        stale: Stale::OnAPass,
+    }];
+    static EXPIRED: &[ExpectedFailure] = &[ExpectedFailure {
+        test: "a_test_pending_on_a_defect",
+        task: 4242,
+        spec: "specs/nowhere.md §9",
+        says: &["the shell never answered again"],
+        stale: Stale::OnThisDate("2020-02-29"),
+    }];
+    let today = Day::parse("2026-08-06").expect("a date this file wrote");
+    let outcome = |name: &str, reason: Option<&str>| Outcome {
+        name: name.to_string(),
+        reason: reason.map(str::to_string),
+        elapsed: Duration::from_secs(3),
+        suspended: Duration::ZERO,
+    };
+    let expected_fired = || outcome("a_test_pending_on_a_defect", Some("the shell never answered again:\n<log>"));
+
+    let mut only_expected = Tally::new(LISTED, today);
+    only_expected.record(outcome("something_else", None));
+    only_expected.record(expected_fired());
+    let text = only_expected.summary(2, Duration::from_secs(9), Duration::ZERO);
+    if only_expected.exit_code() != 0 {
+        return Err(format!(
+            "a run whose only red was declared exits {}, and it has to be 0:\n{text}",
+            only_expected.exit_code()
+        ));
+    }
+    // The whole hazard is a run that reads as clean. The result line is the one
+    // line every reader and every log-scraper looks at, so it is the line that
+    // has to carry it.
+    let result = text.lines().last().unwrap_or_default();
+    for wanted in ["a_test_pending_on_a_defect", "#4242", "NOT clean"] {
+        if !result.contains(wanted) {
+            return Err(format!("the result line does not say {wanted:?}: {result}"));
+        }
+    }
+    if !text.contains("specs/nowhere.md §9") {
+        return Err(format!("the report never points at where the defect is written up:\n{text}"));
+    }
+
+    // The anti-rot property, end to end: nothing failed, and the run is red.
+    let mut nothing_failed = Tally::new(LISTED, today);
+    nothing_failed.record(outcome("something_else", None));
+    nothing_failed.record(outcome("a_test_pending_on_a_defect", None));
+    let text = nothing_failed.summary(2, Duration::from_secs(9), Duration::ZERO);
+    if nothing_failed.exit_code() != 1 {
+        return Err(format!(
+            "a run where the expected failure PASSED exits {}, and it has to be 1:\n{text}",
+            nothing_failed.exit_code()
+        ));
+    }
+    for wanted in ["a_test_pending_on_a_defect", "#4242", "stale"] {
+        if !text.contains(wanted) {
+            return Err(format!("a stale entry is not reported as {wanted:?}:\n{text}"));
+        }
+    }
+
+    // Negative control for both: an undeclared red is still an ordinary red,
+    // and a declared one beside it does not soften the status.
+    let mut real_red = Tally::new(LISTED, today);
+    real_red.record(outcome("something_else", Some("the disk came back short")));
+    real_red.record(expected_fired());
+    if real_red.exit_code() != 1 {
+        return Err(format!(
+            "a run with an undeclared red exits {}, and it has to be 1",
+            real_red.exit_code()
+        ));
+    }
+
+    // And a listed test failing some other way: the exemption must not reach it.
+    let mut wrong_failure = Tally::new(LISTED, today);
+    wrong_failure.record(outcome("a_test_pending_on_a_defect", Some("the client was not built")));
+    let text = wrong_failure.summary(1, Duration::from_secs(9), Duration::ZERO);
+    if wrong_failure.exit_code() != 1 {
+        return Err(format!(
+            "a listed test failing another way exits {}, and it has to be 1:\n{text}",
+            wrong_failure.exit_code()
+        ));
+    }
+    if !text.contains("NOT #4242's failure") {
+        return Err(format!("the report does not say why the entry did not cover it:\n{text}"));
+    }
+
+    // Exit 2 keeps its meaning: a suspended run establishes nothing, and a
+    // declared red inside it is not an answer either.
+    let mut suspended = Tally::new(LISTED, today);
+    suspended.record(Outcome {
+        name: "something_else".to_string(),
+        reason: None,
+        elapsed: Duration::from_secs(3),
+        suspended: common::clock::SUSPENDED_AT_LEAST + Duration::from_secs(120),
+    });
+    if suspended.exit_code() != 2 {
+        return Err(format!(
+            "a suspended run exits {}, and it has to be 2",
+            suspended.exit_code()
+        ));
+    }
+
+    // The clean case, so that none of the above is passing because everything
+    // reds.
+    let mut clean = Tally::new(LISTED, today);
+    clean.record(outcome("something_else", None));
+    let text = clean.summary(1, Duration::from_secs(9), Duration::ZERO);
+    if clean.exit_code() != 0 {
+        return Err(format!("a clean run exits {}, and it has to be 0", clean.exit_code()));
+    }
+    if !text.lines().last().unwrap_or_default().starts_with("test result: ok.") {
+        return Err(format!("a clean run does not say so plainly:\n{text}"));
+    }
+
+    // The anti-rot property for the entries a pass cannot judge: the review date
+    // arrives, and it reds whether or not the test ran at all.
+    let mut past_review = Tally::new(EXPIRED, today);
+    past_review.record(outcome("something_else", None));
+    let text = past_review.summary(1, Duration::from_secs(9), Duration::ZERO);
+    if past_review.exit_code() != 1 {
+        return Err(format!(
+            "an entry past its review date exits {}, and it has to be 1:\n{text}",
+            past_review.exit_code()
+        ));
+    }
+    if !text.contains("2020-02-29") || !text.contains("review date") {
+        return Err(format!("an expired entry is not reported as one:\n{text}"));
+    }
+    // Negative control: the same entry with a date ahead of the run is silent.
+    let before_review = Tally::new(EXPIRED, Day::parse("2020-02-28").expect("a date this file wrote"));
+    if before_review.exit_code() != 0 {
+        return Err("an entry whose review date has not arrived reds anyway".to_string());
+    }
+    Ok(())
+}
+
+/// What the declaration itself has to be, before any of it means anything.
+fn expected_failure_entries() -> Result<(), String> {
+    static NAMED_NOTHING: &[ExpectedFailure] = &[ExpectedFailure {
+        test: "a_test_that_was_renamed",
+        task: 1,
+        spec: "specs/nowhere.md",
+        says: &["something"],
+        stale: Stale::OnAPass,
+    }];
+    static ABSORBS_EVERYTHING: &[ExpectedFailure] = &[ExpectedFailure {
+        test: "a_real_test",
+        task: 1,
+        spec: "specs/nowhere.md",
+        says: &[],
+        stale: Stale::OnAPass,
+    }];
+    static TWICE: &[ExpectedFailure] = &[
+        ExpectedFailure { test: "a_real_test", task: 1, spec: "s", says: &["x"], stale: Stale::OnAPass },
+        ExpectedFailure { test: "a_real_test", task: 2, spec: "s", says: &["y"], stale: Stale::OnAPass },
+    ];
+    static NEVER_EXPIRES: &[ExpectedFailure] = &[ExpectedFailure {
+        test: "a_real_test",
+        task: 1,
+        spec: "specs/nowhere.md",
+        says: &["x"],
+        stale: Stale::OnThisDate("next month"),
+    }];
+    static GOOD: &[ExpectedFailure] = &[ExpectedFailure {
+        test: "a_real_test",
+        task: 1,
+        spec: "specs/nowhere.md",
+        says: &["x"],
+        stale: Stale::OnThisDate("2026-09-06"),
+    }];
+    let runnable: BTreeSet<&str> = ["a_real_test", "another_real_test"].into_iter().collect();
+    let refused: [(&str, &'static [ExpectedFailure], &str); 4] = [
+        ("an entry for a test that no longer exists", NAMED_NOTHING, "no list registers it"),
+        ("an entry that names no failure", ABSORBS_EVERYTHING, "names no failure"),
+        ("two entries for one test", TWICE, "two expected-failure entries"),
+        ("a review date nothing can read", NEVER_EXPIRES, "would never expire"),
+    ];
+    for (what, table, expect) in refused {
+        match check_expected_failures(table, &runnable) {
+            Ok(()) => return Err(format!("{what} was accepted")),
+            Err(refusal) if !refusal.contains(expect) => {
+                return Err(format!("{what} was refused, but for {refusal:?}"))
+            }
+            Err(_) => {}
+        }
+    }
+    // The negative control: the check is refusing those three and not refusing
+    // everything put in front of it.
+    check_expected_failures(GOOD, &runnable)
+        .map_err(|e| format!("a well-formed entry was refused: {e}"))?;
+    check_expected_failures(&[], &runnable)
+        .map_err(|e| format!("an empty declaration was refused: {e}"))?;
+
+    // The calendar the whole `OnThisDate` half rests on. An entry that expires
+    // on the wrong day is an entry that expires never or immediately, and
+    // neither announces itself.
+    let day = |s: &str| Day::parse(s).ok_or_else(|| format!("{s} did not parse"));
+    if day("1970-01-01")? != Day(0) {
+        return Err("the epoch is not day zero".to_string());
+    }
+    // A leap day, a century that is not a leap year, and one that is.
+    for (date, want) in [("2024-02-29", 19782), ("1900-03-01", -25508), ("2000-03-01", 11017)] {
+        if day(date)? != Day(want) {
+            return Err(format!("{date} is {:?}, and it has to be Day({want})", day(date)?));
+        }
+    }
+    if !(day("2026-08-06")? < day("2026-08-07")? && day("2026-12-31")? < day("2027-01-01")?) {
+        return Err("dates do not order".to_string());
+    }
+    for bad in ["2026-8-06", "2026-08-6", "26-08-06", "2026/08/06", "2026-13-01", "2026-08-00", ""] {
+        if Day::parse(bad).is_some() {
+            return Err(format!("{bad:?} parsed as a date"));
         }
     }
     Ok(())
@@ -8373,13 +9281,39 @@ fn longest_first(tasks: &mut [Task<'_>], known: &BTreeMap<String, Duration>) {
 /// suspended audio boot cannot report itself differently from a suspended
 /// machine test.
 fn report_line(outcome: &Outcome) {
+    let reason = || outcome.reason.as_deref().unwrap_or("check failed");
     match outcome.verdict() {
-        Verdict::Pass => eprintln!("  PASS  {}  ({:.0?})", outcome.name, outcome.elapsed),
-        Verdict::Fail => {
-            let reason = outcome.reason.as_deref().unwrap_or("check failed");
-            eprintln!("FAIL {}: {reason}", outcome.name);
+        Verdict::Pass(None) => eprintln!("  PASS  {}  ({:.0?})", outcome.name, outcome.elapsed),
+        Verdict::Pass(Some(entry)) => eprintln!(
+            "  PASS  {}  ({:.0?})  — #{} did not fire this run, which proves nothing",
+            outcome.name, outcome.elapsed, entry.task
+        ),
+        Verdict::Fail(None) => {
+            eprintln!("FAIL {}: {}", outcome.name, reason());
             eprintln!("  FAIL  {}  ({:.0?})", outcome.name, outcome.elapsed);
         }
+        Verdict::Fail(Some(entry)) => {
+            eprintln!("FAIL {}: {}", outcome.name, reason());
+            eprintln!(
+                "  FAIL  {}  ({:.0?})  — listed against #{}, and this is not that failure: \
+                 the entry covers {:?}",
+                outcome.name, outcome.elapsed, entry.task, entry.says
+            );
+        }
+        Verdict::Expected(entry) => {
+            // The reason in full, exactly as a red would print it. An expected
+            // failure is still a defect reproducing, and the run that reproduced
+            // it is the only place its evidence exists.
+            eprintln!("XFAIL {}: {}", outcome.name, reason());
+            eprintln!(
+                "  XFAIL {}  ({:.0?})  — expected, #{}, {}",
+                outcome.name, outcome.elapsed, entry.task, entry.spec
+            );
+        }
+        Verdict::Stale(entry) => eprintln!(
+            "  STALE {}  ({:.0?})  — #{} says this test fails, and it passed",
+            outcome.name, outcome.elapsed, entry.task
+        ),
         Verdict::Invalid => eprintln!(
             "  INVL  {}  ({:.0?}) — the host was suspended for {:.0?} while it ran",
             outcome.name, outcome.elapsed, outcome.suspended
@@ -8487,6 +9421,17 @@ fn check_registration() {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // First, before any lock and before anything is compiled: a flag this suite
+    // does not have would otherwise cost nothing and hand its value to the
+    // filter below.
+    let filter = match toyos_build::testargs::parse(&args) {
+        Ok(filter) => filter,
+        Err(refusal) => {
+            eprintln!("[toyos] {refusal}");
+            std::process::exit(1);
+        }
+    };
+
     let debug_mode = args.iter().any(|a| a == "--debug");
     let list_mode = args.iter().any(|a| a == "--list");
     let nocapture = args.iter().any(|a| a == "--nocapture" || a == "--show-output");
@@ -8495,14 +9440,10 @@ fn main() {
     // is invisible in the command line and easy to leave set, and a test name
     // would drag ~17 minutes into every plain `cargo test`.
     let mut audio_gate: Option<u32> = None;
-    let mut consumed: Vec<usize> = Vec::new();
     for (i, a) in args.iter().enumerate() {
         let n = if let Some(v) = a.strip_prefix("--audio-gate=") {
-            consumed.push(i);
             v
         } else if a == "--audio-gate" {
-            consumed.push(i);
-            consumed.push(i + 1);
             args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
                 panic!("--audio-gate needs an iteration count, e.g. --audio-gate 30")
             })
@@ -8521,11 +9462,8 @@ fn main() {
     let mut width = DEFAULT_WIDTH;
     for (i, a) in args.iter().enumerate() {
         let n = if let Some(v) = a.strip_prefix("--jobs=") {
-            consumed.push(i);
             v
         } else if a == "--jobs" || a == "-j" {
-            consumed.push(i);
-            consumed.push(i + 1);
             args.get(i + 1)
                 .map(|s| s.as_str())
                 .unwrap_or_else(|| panic!("--jobs needs a width, e.g. --jobs 4"))
@@ -8542,11 +9480,8 @@ fn main() {
     let mut host_budget = toyos_build::buildlock::HOST_GUESTS;
     for (i, a) in args.iter().enumerate() {
         let n = if let Some(v) = a.strip_prefix("--host-slots=") {
-            consumed.push(i);
             v
         } else if a == "--host-slots" {
-            consumed.push(i);
-            consumed.push(i + 1);
             args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
                 panic!("--host-slots needs a budget, e.g. --host-slots 12 (0 turns it off)")
             })
@@ -8579,13 +9514,6 @@ fn main() {
     if nocapture || debug_mode {
         common::qemu::VERBOSE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-
-    // Filter: first positional arg that isn't a flag
-    let filter: Option<&str> = args
-        .iter()
-        .enumerate()
-        .find(|(i, a)| !a.starts_with('-') && !consumed.contains(i))
-        .map(|(_, s)| s.as_str());
 
     let c_names = discover_c_tests();
     eprintln!("[toyos] Compiling {} C tests...", c_names.len());
@@ -8648,33 +9576,46 @@ fn main() {
     }
 
     let all_tests = build_test_registry(&rust_bins, &c_compiled);
-    let tests_to_run: Vec<&TestDef> = match filter {
-        Some(f) => all_tests.iter().filter(|t| t.name.contains(f)).collect(),
-        None => all_tests.iter().collect(),
-    };
-    let audio_to_run: Vec<&str> = AUDIO_TESTS
+    // Every name this process could produce a verdict for, which is what an
+    // EXPECTED_FAILURES entry has to be one of. Taken before the filter, so a
+    // filtered run cannot make a stale entry look well-formed.
+    let runnable: BTreeSet<&str> = all_tests
         .iter()
-        .copied()
-        .filter(|n| filter.map_or(true, |f| n.contains(f)))
+        .map(|t| t.name.as_str())
+        .chain(AUDIO_TESTS.iter().copied())
+        .chain(SCREEN_TESTS.iter().map(|(n, _)| *n))
+        .chain(MACHINE_TESTS.iter().map(|(n, _)| *n))
         .collect();
-    let screen_to_run: Vec<(&str, Sched)> = SCREEN_TESTS
-        .iter()
-        .copied()
-        .filter(|(n, _)| filter.map_or(true, |f| n.contains(f)))
-        .collect();
-    let machine_to_run: Vec<(&str, Sched)> = MACHINE_TESTS
-        .iter()
-        .copied()
-        .filter(|(n, _)| filter.map_or(true, |f| n.contains(f)))
-        .collect();
+    if let Err(refusal) = check_expected_failures(EXPECTED_FAILURES, &runnable) {
+        eprintln!("[toyos] EXPECTED_FAILURES: {refusal}");
+        std::process::exit(1);
+    }
+
+    let keep = |name: &str| filter.map_or(true, |f| name.contains(f));
+    let tests_to_run: Vec<&TestDef> =
+        all_tests.iter().filter(|t| keep(t.name.as_str())).collect();
+    let audio_to_run: Vec<&str> =
+        AUDIO_TESTS.iter().copied().filter(|n| keep(n)).collect();
+    let screen_to_run: Vec<(&str, Sched)> =
+        SCREEN_TESTS.iter().copied().filter(|(n, _)| keep(n)).collect();
+    let machine_to_run: Vec<(&str, Sched)> =
+        MACHINE_TESTS.iter().copied().filter(|(n, _)| keep(n)).collect();
 
     if tests_to_run.is_empty()
         && audio_to_run.is_empty()
         && screen_to_run.is_empty()
         && machine_to_run.is_empty()
     {
-        eprintln!("No tests match filter {:?}", filter);
+        eprintln!("No tests match filter {filter:?}");
         std::process::exit(1);
+    }
+    for entry in EXPECTED_FAILURES {
+        // Before anything boots, so that the run reads as what it is from its
+        // first line: a suite carrying declared reds is not a clean suite.
+        eprintln!(
+            "[toyos] expected to fail: {} — #{}, {}",
+            entry.test, entry.task, entry.spec
+        );
     }
 
     let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
@@ -8683,10 +9624,7 @@ fn main() {
         + screen_to_run.len()
         + machine_to_run.len();
     eprintln!("\nrunning {total} tests\n");
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut failures: Vec<(String, String)> = Vec::new();
-    let mut invalid: Vec<(String, Duration)> = Vec::new();
+    let mut tally = Tally::new(EXPECTED_FAILURES, Day::today());
     let suite_start = common::clock::mark();
 
     let bins = Bins {
@@ -8733,21 +9671,6 @@ fn main() {
         }
     }
 
-    let mut record = |outcomes: Vec<Outcome>| {
-        for outcome in outcomes {
-            match outcome.verdict() {
-                Verdict::Pass => passed += 1,
-                Verdict::Fail => {
-                    failed += 1;
-                    let reason = outcome.reason.unwrap_or_else(|| "check failed".to_string());
-                    let summary = reason.lines().next().unwrap_or("check failed");
-                    failures.push((outcome.name, summary.to_string()));
-                }
-                Verdict::Invalid => invalid.push((outcome.name, outcome.suspended)),
-            }
-        }
-    };
-
     // Every red the wide phase produced, re-run by itself before anything is
     // believed about it. See [`retry_task`] for why both answers are findings
     // and why neither turns the run green.
@@ -8761,15 +9684,18 @@ fn main() {
         let outcomes = run_phase(parallel, width, &bins, &slots);
         eprintln!("  --- parallel done in {:.1?} ---", started.elapsed());
         // Reds only. A test the host slept through has no verdict to confirm,
-        // and re-running it would put a second guess beside the first.
+        // and re-running it would put a second guess beside the first — and an
+        // expected failure has already been answered by its entry, which names
+        // the task rather than asking which of the two the retry's two answers
+        // it was.
         wide_reds.extend(
             outcomes
                 .iter()
-                .filter(|o| o.verdict() == Verdict::Fail)
+                .filter(|o| matches!(o.verdict(), Verdict::Fail(_)))
                 .map(|o| o.name.clone()),
         );
         timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
-        record(outcomes);
+        outcomes.into_iter().for_each(|o| tally.record(o));
     }
     if !serial.is_empty() {
         eprintln!("  --- serial ---");
@@ -8777,7 +9703,7 @@ fn main() {
         let outcomes = run_phase(serial, 1, &bins, &slots);
         eprintln!("  --- serial done in {:.1?} ---", started.elapsed());
         timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
-        record(outcomes);
+        outcomes.into_iter().for_each(|o| tally.record(o));
     }
     qemu::set_width(1);
     save_durations(known, &timed);
@@ -8791,11 +9717,13 @@ fn main() {
             };
             let outcomes = run_phase(vec![task], 1, &bins, &slots);
             match outcomes.iter().find(|o| &o.name == name).map(Outcome::verdict) {
-                Some(Verdict::Pass) => eprintln!(
+                Some(Verdict::Pass(_) | Verdict::Stale(_)) => eprintln!(
                     "  ALONE {name}: GREEN — it fails only beside other guests, so its \
                      Sched::Parallel is wrong. The run stays red on the classification."
                 ),
-                Some(Verdict::Fail) => eprintln!("  ALONE {name}: red again — the defect is real."),
+                Some(Verdict::Fail(_) | Verdict::Expected(_)) => {
+                    eprintln!("  ALONE {name}: red again — the defect is real.")
+                }
                 Some(Verdict::Invalid) => {
                     eprintln!("  ALONE {name}: the host was suspended during the retry too")
                 }
@@ -8840,40 +9768,14 @@ fn main() {
                     suspended: start.suspended(),
                 };
                 report_line(&outcome);
-                record(vec![outcome]);
+                tally.record(outcome);
             }
         }
     }
 
-    let suite_elapsed = suite_start.elapsed();
-    let suite_suspended = suite_start.suspended();
-
-    eprintln!();
-    if suite_suspended >= common::clock::SUSPENDED_AT_LEAST {
-        // The elapsed figure above is monotonic and therefore already excludes
-        // it, which is worth saying: the two numbers do not add up unless a
-        // reader knows that.
-        eprintln!(
-            "note: the host was suspended for {suite_suspended:.0?} during this run. \
-             The suite time below excludes it."
-        );
-    }
-    if !failures.is_empty() {
-        eprintln!("failures:");
-        for (name, reason) in &failures {
-            eprintln!("    {name}: {reason}");
-        }
-        eprintln!();
-    }
-    if !invalid.is_empty() {
-        eprintln!("invalidated by host suspend:");
-        for (name, slept) in &invalid {
-            eprintln!("    {name}: the host was stopped for {slept:.0?} while it ran");
-        }
-        eprintln!();
-    }
-
-    // Three exit statuses, because there are three things a run can establish.
+    // Three exit statuses, because there are three things a run can establish,
+    // and an expected failure is deliberately none of them — see
+    // [`Tally::exit_code`], which is where the whole decision now lives.
     //
     // A green run is a claim that this tree passed, and `--land`'s gate consumes
     // exactly this number. A run that spanned a suspend did not establish that:
@@ -8890,25 +9792,6 @@ fn main() {
     // A run with both real failures and invalidated tests exits 1: a red that
     // survives is still a red, and re-running the suspended ones does not make
     // it green.
-    if !failures.is_empty() {
-        eprintln!(
-            "test result: FAILED. {passed} passed, {failed} failed, {} invalidated, \
-             {total} total ({suite_elapsed:.1?})",
-            invalid.len()
-        );
-        std::process::exit(1);
-    }
-    if !invalid.is_empty() {
-        eprintln!(
-            "test result: INVALID. {passed} passed, {} invalidated by a host suspend of \
-             {suite_suspended:.0?}, {total} total ({suite_elapsed:.1?})",
-            invalid.len()
-        );
-        eprintln!(
-            "This is not a red. The machine stopped mid-run, so those verdicts are of \
-             nothing; re-run the suite."
-        );
-        std::process::exit(2);
-    }
-    eprintln!("test result: ok. {passed} passed, {total} total ({suite_elapsed:.1?})");
+    eprint!("{}", tally.summary(total, suite_start.elapsed(), suite_start.suspended()));
+    std::process::exit(tally.exit_code());
 }

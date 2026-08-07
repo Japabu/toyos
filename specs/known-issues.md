@@ -1004,6 +1004,48 @@ on ARM64, which is planned and not built. That is why `try_lock`'s acquire edge
 sat on the wrong atomic through every green suite run until a model checker was
 pointed at it.
 
+### A CPU that stops scheduling keeps publishing load 0, and `placement()` therefore prefers it
+
+The T14's Ctrl+Alt+D dump (`boot9-dump.log`, 35.181 s) reports `5/8 cpu(s)
+answered`. cpu1, cpu4 and cpu7 each failed to reach a scheduler pass inside the
+dump's 250 ms budget. Their last lines in that whole 63 s boot are the idle
+loop's own:
+
+| CPU | last line, and it is the last thing it ever said |
+|---|---|
+| cpu1 | 1.152 s — `sched: cpu=1 ready=0 parked=0 current=None` |
+| cpu7 | 11.231 s — `sched: cpu=7 ready=0 parked=1 current=None` |
+| cpu4 | 26.110 s — `sched: cpu=4 ready=0 parked=1 current=None` |
+
+**Whatever stops them is a separate defect. This entry is about what the
+scheduler then does about it, which is the opposite of the right thing.**
+`CpuHandle::publish_load` is written by a CPU at the end of each of its own
+passes, so a CPU that takes no more passes publishes its last value forever —
+and its last value is the one it wrote on the way into idle, which is **zero**.
+`driver::placement` picks `min_by_key(load)`. A dead CPU is therefore not merely
+a CPU that never runs anything again; it is the CPU the scheduler *prefers* for
+every subsequent spawn.
+
+That is the difference between losing a core and the machine getting
+progressively worse, which is what the owner reports and what the log shows:
+three cores shed over 26 s, and by the end the dump finds `pid=10 terminal`,
+`pid=6 tid=2 doom` and `pid=12 shell` all `ready and has never run`, plus
+`soundd` ready with 2 ms of CPU. doom's black window is its sound-init thread
+placed on a shed core; the missing shell prompt is `shell pid=12` on another.
+
+A load figure is a claim about the present, and a stopped CPU's is a lie the
+scheduler believes. The fix is independent of the root cause and worth having
+either way: placement must not be able to choose a CPU that has not completed a
+pass in some number of intervals. The counter to compare against already exists
+per CPU (`publish_load`'s call site is the end of every pass, so a monotonic
+pass count published beside the load costs one relaxed store), and the same
+staleness test would let `idle_sibling` and `post_steal_probe` stop aiming at
+dead cores too.
+
+Not fixed here: the instrument that names *why* a CPU stops (NMI probe,
+`arch/idt/nmi.rs`) landed first, because a placement filter over an unknown
+cause would hide the cause.
+
 ### A scheduler pass may spend two seconds in xHCI before it drains its mailbox
 
 `sched::driver::pass` and `pass_block` both open with `drain_irqs()`, and
@@ -1260,10 +1302,278 @@ and it returns `Some(Event::Close)` — **every call, forever**
 inside `CloseRequested` was supposed to trip. The app spins on a core instead
 of leaving, which is also why nothing in the log marks the moment.
 
-The fix belongs in the fork (`Japabu/winit`, branch `toyos`): break out of the
-poll loop on `Close`, or test `exiting()` inside it. Both other arms of the
-same function — the `ControlFlow::Wait` and `WaitUntil` blocking paths at
-`:637` and `:707` — decode `Close` the same way and want the same look.
+**CLOSED in the tree, and the fix is the SDK's rather than the fork's.**
+`Window::poll_event` latches: `Close` is the last element of the stream and is
+delivered exactly once, so a caller that drains until `None` gets out. That
+makes the fork's loop correct as written, and it fixes every other client that
+drains the same way rather than winit alone. `desktop_window_child` and the
+fifth case of `compositor_client_death` gate it from the client side. A break
+on `Close` in the fork's poll loop is prepared but unpushed (owner task #150);
+it is now belt-and-braces rather than the fix.
+
+**The T14 confirms it.** In `boot8-snake.log` the owner closed snake's window
+with the X button and snake exited `code=0` — where before the latch it never
+exited at all. The `ControlFlow::Wait` and `WaitUntil` arms at `:637` and
+`:707` are the ones snake actually runs (`userland/snake/src/main.rs:351`,
+`:359`), and they are now tested rather than read: snake leaves on a close both
+on his machine and in `desktop_window_child`, three rounds, one of them played.
+
+**What that session leaves open is not snake.** 34 ms after snake exited the
+shell exited too, and 13 ms after that the terminal — so the owner got no
+prompt back. That is the next entry.
+
+### EXPECTED RED, pending #156 — `desktop_window_child` reproduces the machine freeze, and must stay `Sched::Parallel`
+
+**Read this before touching that test.** It is red on `main` today, on purpose,
+and the two obvious ways to make it green both destroy the only QEMU
+reproduction anybody has of #156.
+
+**The signature, precisely, because there are two different reds it can give.**
+The one that means #156 is a **total freeze of the guest**: a round opens
+snake, the shell echoes its prompt, and from that instant the guest emits
+*nothing at all* — not `exit: snake`, not a shell line, and **not the
+compositor's `compositor: frames=…` stats line, which had been arriving every
+~2 s until then**. The harness drains its full ceiling and appends nothing. The
+missing periodic line is the discriminator: any other failure of this test
+leaves output flowing and fails an assertion with the log still filling. If you
+see the test fail *with* serial output continuing, that is a different defect
+and this entry does not cover it.
+
+Independently hit 10/10 across four invocations by an agent trying to land
+unrelated documentation, in the 12-wide parallel phase, with the harness's
+re-run-alone pass reporting GREEN each time.
+
+**It stays `Sched::Parallel`, and `ALONE: GREEN` here is information rather
+than a misclassification.** The freeze needs contention to appear, so the
+classification that looks wrong is the one that reproduces it. `Sched::Serial`
+would make the suite green and take the reproduction with it. (The classifier
+is not trustworthy in general — the xHCI work established that `ALONE: red
+again` can measure the host rather than the tree — but in this direction, on
+this test, green-alone is real.)
+
+**A third manifestation, 2026-08-06**, on the mechanism branch, twice in one
+session — once in the 12-wide phase and once in the re-run alone, at 3.5 s into
+both boots. The message is `GUI+Q never reached the compositor`, **and it names
+the wrong thing**: the close did reach the compositor. The log under it is the
+teardown, one probe earlier than the snake rounds — `exit: test_rs_window_child
+pid=5 code=0`, then `exit: shell pid=2 code=0`, then `exit: terminal pid=1
+code=0`, then `windows=0`. `close_focused_window` waits for `windows=1` and the
+desktop went straight to none, so the harness reports the injection it did
+deliver as one that never arrived. Serial kept flowing for the whole drain —
+compositor stats every ~2 s, kernel stats every 10 s — so by this entry's own
+discriminator it is **not** the freeze; it is the shell-exit defect three
+paragraphs down, reached at the first windowed child rather than during a snake
+round. Whoever fixes that message should make it say what the log says.
+
+**And that third manifestation is now the only one this test produces, which
+means the reproduction is masked (2026-08-06, eight boots).** Two full-suite
+runs in the 12-wide phase and six alone — three with the winit lock at
+`be9ec72c`, three at `faf99eb7` — are red every time and **not once the
+freeze**. Every capture has the guest alive for the whole drain: compositor
+stats every ~2 s, kernel stats every 10 s, the i8042 counter climbing to 4818
+keys as the harness re-injected GUI+Q, and all eight vCPUs `HLT=1 RFL=0x246`,
+which on a settled desktop is an idle machine and not #156. What all eight show
+is the teardown above, now at the **second** probe — the owner's case, a live
+client whose window is taken away — with the client leaving `code=0` before the
+shell does. One of the eight got through to snake round 0 and produced the same
+shape with `exit: snake pid=7 code=0 cpu=1224ms` in its place, so where the test
+stops varies with load and what happens does not.
+
+Two consequences for whoever picks this up. **`ALONE: GREEN` no longer holds** —
+6 of 6 alone are red — so the paragraph above it is a record of what the test
+used to do, not a prediction. And **the freeze's venue is unreachable**: it was
+seen in a snake round, and the desktop is torn down one or two probes before
+that. Fixing the shell-exit defect is now on #156's critical path rather than
+beside it. The teardown is not a regression from the deadline fix (`add6aeb`,
+18:05): the paragraph above it was written at 17:32 describing the same three
+exits, and is not a descendant of it.
+
+**CLOSED, and it was the harness closing the desktop twice (2026-08-06).** The
+teardown in the three paragraphs above is not a guest defect at all.
+`close_focused_window` looped on `log[new..]` but waited with `serial_until`,
+which scans the whole capture, so the *previous* probe's `windows=1` answered
+the wait instantly and it re-sent GUI+Q at the speed of a QMP round trip. The
+second one closed the window under the one it meant. The compositor now says so
+itself and the two closes are one line each:
+
+```
+compositor: window closed pid=5 by GUI+Q, 1 left
+exit: test_rs_window_child pid=5 code=0
+compositor: window closed pid=1 by GUI+Q, 0 left     <- the terminal
+exit: shell pid=2 code=60
+exit: terminal pid=1 code=0
+```
+
+Everything after the second close is correct: the terminal breaks on
+`Event::Close`, drops `shell_stdin`, the shell's stdin reaches genuine EOF
+(`60` is `UnexpectedEof`, encoded into the exit status because a diagnostic
+through that pipe is lost with it), the shell leaves and the terminal reaps it.
+So the shell-exit reading below — "the failure is the read after the prompt" —
+was right about the mechanism and wrong about the cause: nothing was wrong with
+the read, its writer had been told to go.
+
+The fix is `note_closed` in the compositor plus a harness that waits on that
+event instead of sampling `windows=N` every two seconds
+(`scheduler-migration-log.md`). **`desktop_window_child` now passes end to end,
+alone and in the 12-wide phase** — both windowed-child probes and all three
+snake rounds, snake leaving `code=0` each time.
+
+**What this does *not* settle is the freeze**, and the entry stays. It stays
+`Sched::Parallel` for the same reason as before, `EXPECTED_FAILURES` keeps its
+declaration to its review date, and a green run still proves nothing — the
+signature at the top of this entry is a guest that goes *silent*, and none of
+the eleven boots in this session produced one. What has changed is that the
+test can now reach the snake rounds where the freeze was seen, which it could
+not before. Judge the next occurrence by the signature, never by a run.
+
+**Landing while it is red** needs nothing special: `desktop_window_child` is
+declared in `EXPECTED_FAILURES` (`tests/toyos.rs`) and `cargo run -- --land`
+runs the ordinary gate. The declaration reports it by name on every run, is red
+if the test *passes* where the entry says a pass is proof, and is red on
+`2026-09-06` regardless — this entry is intermittent, so its own expiry is a
+date rather than a green run. The `--skip` flag that used to be the answer is
+deleted: an exclusion nobody reviews cannot expire, and this one has to.
+
+**CLOSED — a stale `--skip` command line was worse than a refused one, measured
+2026-08-06.** The flag was gone but the words still parsed, and `--land --gate
+cargo test -- --skip desktop_window_child` — the form CLAUDE.md and every
+handover carried until that week — reached the harness as a *filter*.
+It ran exactly one test, `desktop_window_child`, declared it expected, and
+landed on that. `--land` does print `the gate was NOT the default cargo test`,
+which is the only thing that saved it; the run itself looks like a pass.
+
+The asymmetry that entry named — a stale feature name refused against
+`kernel/Cargo.toml` before any lock, a stale gate flag not refused at all — is
+closed. `toyos_build::testargs::parse` holds one table of the flags the suite
+has, refuses anything else by name and by consequence, and returns the filter
+out of the same pass, so no word can be a flag's value to one reader and the
+filter to another. It is the first thing `main` does, before the sysroot lock
+and before anything is compiled. A flag added to the harness and not to that
+table is refused the first time it is typed, which is the direction of drift
+that says so rather than the one that narrows a gate.
+
+**What the declaration will and will not absorb.** Its `says` list covers the
+six of this test's messages whose failure is *the desktop ceasing to answer
+after a window closed*. The other five red the run — the client binary missing,
+the desktop never coming up, a window never being created, and the client
+leaving on its own deadline. That pins which assertion failed and not why, so
+the log-tail discriminator above is still a human's to apply; the run prints the
+pointer to this section beside every `XFAIL` line for exactly that reason.
+
+**One thing #156's capture leaned on is closed, and it is not this.** The
+deadline was stored twice — `ParkedEntry.deadline` and `DeadlineHeap` — and
+`fire_deadlines`' lost claim discarded one copy, so a CPU could halt with
+`TimerPlan::Stop` while its report said `1 pending, 0 OVERDUE`. That is why the
+dump taken off the frozen guest could not be read, and it is fixed
+(`scheduler-migration-log.md`, 2026-08-06): a deadline lives in one place and
+invariant T reads what arms the timer. **This entry stays open.** Nothing
+established that the divergence is what froze the guest — the claim's
+`Msg::Wake` follows it within two instructions and `SleepArm::confirm` refuses
+to halt on a non-empty mailbox — and a green run of this test after that change
+is the race landing the other way rather than evidence. Judge it by the
+signature above, never by one run.
+
+**What the test was built to chase is still open underneath it**, and is not
+the same thing: on `boot8-snake.log` the owner closed snake's window and got
+`exit: snake pid=10 code=0` at 121.659, `exit: shell pid=5 code=0` at 121.693,
+`exit: terminal pid=4 code=0` at 121.706. A shell that has reaped its
+foreground child prints a prompt; it does not exit. The harness has now shown
+the same three-process teardown after a window close — child `code=0`, then the
+shell, then the terminal — with a bare `window::Window` client and no winit
+anywhere, so it is not snake's and not the fork's.
+
+**Which of the two readings the evidence supports.** In the harness run the
+shell's prompt *is* on the serial log, between the child's exit and its own,
+mirrored by a terminal still inside its loop. So the shell reached its prompt
+and then went: the failure is the read *after* the prompt, not the prompt. That
+is "the shell exits instead of prompting" rather than "the chain is torn down
+child-first" — and it points at the shell's stdin, whose only writer is a
+terminal that was demonstrably still running. On the T14 the same window shows
+no prompt at all, which is the weaker evidence of the two and may simply be a
+line that never got flushed.
+
+**A confound that is not this.** Three of the owner's eight CPUs stop taking
+scheduler passes during a session and threads placed on them never run (§3,
+#142/#156). That produces processes which *hang*; the three here *exited*,
+promptly, with `code=0`. This entry must not be closed by it — though the
+freeze the test now reproduces is very likely that defect, which is the whole
+reason the test is worth keeping red.
+
+### OPEN — `/bin/terminal` races the compositor at boot and exits, and the ready marker hides it
+
+`init = ["/bin/compositor", "/bin/terminal"]` (`tests/desktopcase/system.toml`,
+and every other desktop config). The kernel spawns both back to back and
+`/bin/terminal` calls `Window::create_with_title` at once; if the compositor
+has not reached its `listen` yet, `services::connect` refuses, the terminal
+prints `terminal: no compositor is running` and exits 1, and the shell it has
+already spawned exits behind it. The desktop then comes up with **no window at
+all**.
+
+Nothing notices, because `BootOptions::ready_marker` is `compositor: ready` and
+the compositor is fine — it prints that line a few tens of milliseconds after
+the terminal has gone. Every later assertion is then made against a desktop
+with no terminal in it, and the message is whatever that test says about
+typing: `nothing typed at the terminal window reached a shell`.
+
+Twice in one session on a busy host, in different tests — `desktop_locale_detect`
+in a 12-wide phase, and `desktop_window_child` in a landing gate whose suite
+took 372 s against a quiet run's 135 s. The margin is small: terminal gone at
+0.633 s, `compositor: ready` at ~0.7 s. A strong candidate for the
+`desktop_locale_detect` half of §6's `Sched::Parallel` red list.
+
+Not fixed here, because *where* the wait belongs is a design question:
+`window::Window::create` retrying would make every client wait for a
+compositor that may legitimately be absent (`/bin/console` boots with none);
+the terminal retrying puts the policy in one client; and sequencing `init` on a
+service registration is kernel policy. What is not in doubt is that a client
+which starts before its service is listening must not read that as "there is
+no desktop".
+
+### OPEN — the desktop chain reads every stdio error as end-of-input, and says nothing
+
+Found while tracing #156's teardown, where both of these had to be worked
+around before the cause could be read at all.
+
+`userland/shell/src/main.rs`'s `read_byte` is `read_exact(&mut buf).ok()?`, so
+a device error, a revoked fd and a genuine EOF are one value: `None`. `readline`
+turns that into `break`, `main` returns, and the shell exits **0**. A shell that
+died because its terminal vanished and a shell whose stdin failed are
+indistinguishable from outside, and both look like a clean exit.
+`userland/terminal/src/main.rs` has the same shape twice —
+`shell_stdout.read(&mut buf).unwrap_or(0)` for stdout and stderr, where `0` is
+its own signal to leave.
+
+Neither says anything on the way out, and the channel that would carry it is
+the one that failed: the terminal breaks on stdout EOF **before** it drains
+stderr, so the shell's last stderr line is dropped with it. What established
+the cause was encoding `io::ErrorKind` into the shell's exit status, because
+the kernel's `exit: name pid=N code=C` line is the one record neither end can
+swallow.
+
+No reproduction of a non-EOF error here; the one traced was a real
+`UnexpectedEof`. The defect is that there could be, and nobody would know.
+A fix is a message naming the fd and the kind, and a stderr drain before the
+terminal leaves.
+
+### OPEN — the compositor holds a window *index* across passes, and every removal invalidates it
+
+Found while reading the close path, not reproduced. `Interaction`
+(`userland/compositor/src/main.rs:825`) carries `window_idx: usize` in its
+`DragPending`, `Dragging` and `Resizing` variants, it survives between event
+loop passes, and the drag and resize arms index `windows[window_idx]` with no
+revalidation (`:1901`, `:1912`). Every path that shortens or reorders `windows`
+invalidates it: `remove` for the close button, GUI+Q and `MSG_DESTROY_WINDOW`,
+`retain` for the dead-client sweep, and `bring_to_front`'s remove-and-insert.
+
+Two consequences and a client can drive both, which is what makes it the same
+class as the grant that killed the desktop: a window removed *below* the
+dragged one moves the wrong window, and a window removed *at or above* the last
+index makes `windows[window_idx]` an out-of-bounds panic. A client that exits
+while the user is dragging is the whole of the reproduction.
+
+The fix is the one the same file already uses one line away —
+`last_title_click_fd: Option<Fd>` identifies a window by its `Fd` rather than
+its position — and it wants a gate that drops a window mid-drag.
 
 ### A syscall runs with interrupts masked, and only incidentally with preemption disabled
 
@@ -2675,7 +2985,9 @@ phase landed, and none reproduces on a host running one suite.
 - **`desktop_typing_damage`** — `nothing typed at the terminal window reached a
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
-  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`.
+  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`. **See the entry
+  below: as of 2026-08-06 this is no longer occasional but reproducible, and the
+  mechanism is the duration profile.**
 - **`desktop_locale_detect`** — added 2026-08-05. Same `nothing typed at the
   terminal window reached a shell`, same `ALONE … GREEN`, in the same run as the
   entry above and on a branch that touches neither the compositor nor the
@@ -2734,6 +3046,69 @@ green cannot be produced by load. `ALONE: red again` means nothing on its own
 and must be confirmed against `main` in the same session before it is believed —
 which is the A/B the audio rules already require and which this line currently
 invites an agent to skip.
+
+### OPEN — `desktop_window_child` holds a lane for four minutes, and whichever other desktop lands beside it loses its typing window
+
+Measured 2026-08-06 in one worktree, seven full runs, on a host at roughly three
+times its own load.
+
+Three tests boot `tests/desktopcase` at `smp: 8` — `desktop_typing_damage`,
+`desktop_audio_client`, `desktop_window_child` — and each reaches its shell
+through `shell_answers`, whose retry window is `qemu::budget(20 s)`.
+`desktop_window_child` is an expected failure (§3) that runs its
+`close_focused_window` retry loop out to that same budget, so it occupies one
+lane for **~250 s of every run**. `longest_first` orders the parallel phase on
+`target/test-durations` and therefore dispatches it first; whichever of the
+other two the profile ranks next goes in beside it, waits behind two eight-CPU
+guests on a fourteen-core host, and reports `nothing typed at the terminal
+window reached a shell`.
+
+| run | profile | victim | wide | alone |
+|---:|---|---|---:|---:|
+| 1 | none (fresh worktree) | — | — | — |
+| 2 | written by run 1 | `desktop_typing_damage` | 243 s FAIL | 16 s GREEN |
+| 3 | " | `desktop_typing_damage` | 255 s FAIL | 16 s GREEN |
+| 4 | " | `desktop_typing_damage` | 246 s FAIL | 16 s GREEN |
+| 5 | deleted before this run | — | — | — |
+| 6 | written by run 5 | — | — | — |
+| 7 | written by run 6 | `desktop_audio_client` | 248 s FAIL | 14 s GREEN |
+
+**The profile is a feedback loop, and it is bistable rather than a one-way
+latch.** What run 2 recorded for `desktop_typing_damage` is 243 s of mostly
+*waiting for the host*, and that number is what put it back beside
+`desktop_window_child` in runs 3 and 4: a duration profile whose entries include
+contention cannot order its way out of the contention it measured. It releases
+the same way it engages — run 5 had no profile at all, measured 17 s, and run 6
+read that and left the two apart. Run 7 then promoted the *other* desktop into
+the same slot, which is what says the victim is positional and not a property of
+any one test.
+
+Deleting `target/test-durations` unsticks a worktree that is in the red state.
+**That is a diagnosis, not a fix**: it does not stop the next run promoting
+another desktop into the slot, and a green bought that way is a green about the
+ordering rather than about the tree.
+
+Consequences worth stating separately:
+
+- **The four minutes buy a red nobody acts on.** `qemu::budget`'s width scaling
+  is right for a liveness guard on a healthy test and wrong for one that is
+  known to run out: `desktop_window_child` will spend the whole ceiling on every
+  run until #156 closes.
+- **Two of the three desktops' verdicts are typing windows**, which is what
+  `Sched::Parallel` is not for. The bullet above says the budget was "evidently
+  not enough of it"; this says what it is not enough *against*.
+- **`desktop_audio_client` is not a second #156.** It fails with
+  `desktop_typing_damage`'s message and `ALONE: GREEN`, which is this entry and
+  not the freeze, so it does not belong in `EXPECTED_FAILURES`.
+
+Not fixed here, and the fix is not obviously "reclassify": `Sched::Serial` for
+all three desktops moves ~5 minutes into the serial tail, which
+`specs/test-cost-audit.md` §5.4 spent a wave getting out of. Candidates worth
+pricing: cap what a lane will spend on an `EXPECTED_FAILURES` test, exclude a
+test's contention wait from what the profile records, or give the profile a
+notion of how much host a task wants so two eight-CPU guests do not pair.
+**Whichever it is, a landing is currently a coin toss** — three of seven runs in
+one session were red on this and nothing else.
 
 ### A whole parallel phase can be starved by another agent's build
 
@@ -3770,6 +4145,190 @@ does so visibly. Two do, and both are deliberate:
 Neither is a defect today. Both become one the moment a second such device is
 reachable, and the enumerate-all they would need now exists.
 
+### OPEN — pulling the boot stick freezes the T14, and the diagnosis that was wrong
+
+**The report.** Pulling the USB stick while the desktop is up freezes the whole
+machine unrecoverably, from a USB-A or a USB-C port alike, and **Ctrl+Alt+D does
+not answer afterwards**. That last clause is the strongest signal available: the
+blocked-task dump is dispatched from `drain_irqs` at the top of a scheduler
+pass, so no CPU is reaching a pass — not three of eight as in the wedge, all of
+them.
+
+**A diagnosis to withdraw, recorded because it read well.** The mechanism first
+proposed was: every CPU entering a pass takes `XHCI`, one holds it across a full
+blocking teardown with 2 s waits against a device that cannot answer, and the
+rest spin. **It does not survive its own prediction.** `sync::Lock::lock` logs
+`LOCK CONTENTION: {N}M spins` at 50M and panics `DEADLOCK` at 500M
+(`kernel/src/sync.rs`); a `pause` iteration is tens of cycles, so a CPU waiting
+behind one 2 s hold passes the warning and one behind two approaches the panic.
+The owner reports a freeze with neither a contention line nor a panic screen. So
+"every CPU spins on the ticket for seconds" is not what happened.
+
+What the code still supports, and all it supports: **one CPU holding `XHCI` for
+the transfer budget per SCSI command against a device that has gone.** Whether
+anything else was spinning behind it is not settled by any evidence in hand.
+
+**The residual that makes this hard, as a category.** The evidence channel is
+the thing that fails. `/log` is on the stick being pulled, so the event that
+would be diagnosed destroys its own record — a contention line goes into a ring
+drained to a file on a device that is no longer there, and the T14 has no serial
+port. **A defect whose evidence channel is the failing component cannot be
+investigated by reading the log afterwards**, and this will not be the last one:
+any device carrying `/log` has the same shape. What would break it is a channel
+that does not depend on the storage stack — the on-screen panic console covers a
+panic, and this is not one.
+
+**What `c4ba7d5` closes.** The amplifier every candidate path shares.
+`wait_transfer` ended on the clock; it now ends on the register when the slot's
+port reads disconnected, because a device that has been unplugged is not a
+device that is slow. A filesystem sync, a page-cache fill, a teardown and a
+scheduler pass all reach that function, and pulling the stick a machine logs to
+aims all of them at a dead device on one event.
+
+**What it does not close, stated so a green suite does not imply otherwise:**
+
+- ~~Teardown and `recover_endpoints` still block a pass~~ — **closed by X2a**
+  (`specs/xhci-port-machine-plan.md`). Both are submit-and-return against one
+  outstanding operation per controller: the pass that starts one gives itself
+  back, and the completion arrives through the event ring the poll already
+  drains. What is left on that path is `device::configure`, which is X2b; the
+  type split that would make a wait there a compile error belongs with it,
+  because a view that still has to hand `poll` a route to `configure` is a
+  signature promising a check it does not perform. Two costs moved rather than
+  going away, and neither is a defect: `PORT_WORK_AT` carries the outstanding
+  operation's deadline, so an idle CPU declines to halt across a teardown
+  exactly as it already does across a debounce, and a teardown now takes one
+  further scheduler pass.
+- **The metal claim is still the owner's to make.** Everything above is the
+  guest-side proxy — no pass blocks — and the acceptance test is a stick pulled
+  out of a running T14 with Ctrl+Alt+D still answering.
+- `log_file`'s flush still holds `SINK` and the VFS across device I/O. The doc's
+  "unbounded and uninterruptible" is half right, and the precise reading is
+  **bounded in acquisition, unbounded in work**: `poll` is `try_lock` on both and
+  disables the sink after `MAX_BLOCKED_NANOS`, so it never waits for a lock — but
+  `Sink::flush` then calls `vfs.flush_file` and `vfs.sync_mount`, which reach
+  `msc_write`/`msc_flush`, which take `XHCI` and spend the transfer budget per
+  command.
+- ~~There is no gate for the dangerous window~~ — there is now a gate for the
+  *pull*, `usb_boot_stick_pulled`, and what it certifies is below. It is still
+  not a gate for the 100 ms debounce and still cannot be aimed inside it.
+
+**A negative result worth keeping.** The change did not make
+`desktop_window_child` green; it stayed red across two landing gates. That is
+evidence *against* the desktop freeze and the unplug freeze sharing the xHCI
+path, and it agrees with the scheduler track's independent exclusion of the
+ticket lock — two tracks reaching the same exclusion from different directions.
+
+#### The instrument, and what it showed
+
+`usb_boot_stick_pulled` (`tests/common/usb.rs`) is the first reproduction
+attempt anywhere but the owner's desk. The boot stick had no QEMU device id —
+every earlier unplug test names a *data* disk, which carries neither `/boot` nor
+`/log` — so `qemu::BOOT_STICK_ID` is new and the pull is `device_del` on it. It
+boots metalcase on `Profile::Metal` at eight cores with `log-rotate-fast`, so the
+sink creates, sweeps, deletes and syncs rather than only appending; it drives a
+drumbeat of `run` lines through test-runner, each a userland `println!` into the
+ring the sink drains to the stick and a VFS walk for a binary that is not there;
+it pulls the stick mid-drumbeat; and then it plugs one back in. The verdicts are
+two liveness ceilings on paths that share no mechanism — the compositor's 2 s
+frame report, which is the owner's clock that stops advancing, and a console
+round trip that comes back through the VFS. A red prints `freeze_report`:
+`info registers -a` first, Ctrl+Alt+D second.
+
+**It is green, and the hazard was staged rather than missed.** The pull landed
+with a write outstanding — `transport broke on SCSI 0x2a: no answer in the
+command phase`, then `slot 1 would not take a Bulk-Only Reset`, then
+`reset recovery failed; disk is offline`, all 89 ms *before* `xHCI: port 1
+disconnected` — which is the device-gone-teardown-not-yet-run window the entry
+above says cannot be aimed at. It was hit by accident and survived: 40/40 console
+probes answered and the desktop kept drawing, and 40/40 again after the replug.
+
+So the finding is that **QEMU does not reproduce it**, and the reason is
+visible: `c4ba7d5` ends a transfer when the slot's port reads disconnected, and
+`device_del` drops CCS at once, so nothing here ever spends the 2 s budget. What
+follows is therefore read out of the code rather than watched.
+
+#### One hypothesis killed by the code, on the machine that matters
+
+**`drain_serial`'s `BackendGuard::lock` cannot be the T14's freeze.** That
+machine has no 16550 and no virtio-console, so `serial::has_console()` is false
+for the whole boot and `log_ring::set_serial_sink(false)` pins `LogRing::len` at
+zero. `drain_chunk_to_serial` therefore returns 0 on its first call,
+`drain_serial` leaves its loop, and the backend guard is held for one memcpy of
+nothing. What makes that lock dangerous — unbounded work with interrupts off —
+needs a backend, and that machine has none.
+
+#### The mechanism the code does support, end to end
+
+A chain, each link with the line that carries it. Nothing here has been watched;
+every link is checkable by reading.
+
+1. **One `XHCI` ticket lock serves every controller**
+   (`drivers/xhci/mod.rs`, `static XHCI: Lock<Vec<XhciController>>`), and
+   `storage_write`/`storage_flush` take it from whatever thread is writing — the
+   idle loop's `log_file::poll`, a page-cache fill, a syscall.
+2. **`poll_if_pending` takes the same lock at the top of every scheduler pass.**
+   X2a made the *work* behind it submit-and-return; the *acquisition* is still a
+   blocking spin against whoever holds it. A stick that has gone leaves port work
+   pending, so every CPU entering `drain_irqs` reaches that `XHCI.lock()`.
+3. **`Lock::lock` spins with interrupts enabled.** `preempt::disable()` is a
+   per-CPU counter and touches nothing in `RFLAGS`. A convoy on this lock
+   therefore reads `HLT=0` with `IF` **set** — neither of the two answers the
+   #156 capture taught us to look for.
+4. **At 500M spins it panics `DEADLOCK`.** On a CPU running a userland thread
+   inside a syscall, `main.rs`'s `#[panic_handler]` takes the branch
+   `percpu::syscall_rip() != 0 && percpu::current_tid().is_some()`, which calls
+   `discard_capture()` and then `try_recover_from_panic()`. **A recovering panic
+   never paints**, and on a machine with no console `panic_flush` has already
+   returned early on `!has_console()`. The report exists in the ring and is
+   discarded by the code that decided the panic was survivable.
+5. **And the ticket is stranded.** `Lock::lock` does `ticket.fetch_add(1)` before
+   it spins, and `now` is advanced only by `LockGuard::drop` — a thread that
+   panics inside the spin never constructs a guard. Poisoning it leaves `now`
+   permanently one short of every ticket behind it, so **every later acquirer of
+   that lock waits forever, machine-wide, for the rest of the boot.**
+
+The chain ends where the owner's machine does: nothing scheduled because no CPU
+completes a pass, the clock stopped, the keyboard dead because a scancode is
+decoded by `i8042::service` inside `drain_irqs`, Ctrl+Alt+D silent because
+`keyboard::take_dump_request` is read from the same place, no panic screen, and
+no log anywhere.
+
+**This also repairs the argument that withdrew the ticket-lock diagnosis.** That
+withdrawal rested on the owner seeing no `LOCK CONTENTION` line. On the T14 that
+line is unobservable by construction — it goes to the log ring, whose serial sink
+does not exist and whose file sink is on the stick that was just pulled — and the
+absence of a line that cannot be printed is not evidence. What the withdrawal got
+right is the missing *panic screen*, and step 4 accounts for that too.
+
+**Two defects, either worth fixing on its own.**
+
+- **A deadlock panic is classified recoverable because a syscall happens to be in
+  progress.** The predicate asks whether a userland thread is current, not
+  whether the kernel can continue. For `Lock::lock`'s own deadlock it
+  demonstrably cannot, and the handler's response is to throw away the on-screen
+  report and make the deadlock permanent.
+- **A ticket lock cannot survive an abandoned waiter.** The queue form of the
+  "locks a dead thread can strand" class in §2, and worse than the held-guard
+  form: the abandoning thread never held the lock, so nothing in the code reads
+  as if it owned anything to release.
+
+#### What the owner should run, and what each outcome means
+
+The one change that would make his machine legible is small and is not made:
+give `Lock::lock`'s deadlock panic the fatal path, so it reaches
+`halt_all_cpus` and the panic console paints the lock's name and its call site.
+A stick pulled out of a T14 would then answer the question by itself, on the
+panel, in a photograph. Without it the machine is dark by design at step 4.
+
+Until then the discriminator costs one boot and no reflash: pull the stick and
+**wait a full minute without touching the machine**, watching the panel. `pause`
+is documented at about 140 cycles on Skylake and later, so 500M spins is on the
+order of half a minute on this laptop — an estimate from the datasheet, not a
+measurement. A panic screen inside that window is the convoy, named. A minute of
+nothing is what step 4 predicts, and is the reason the change above is worth
+making before he is asked for anything else.
+
 ### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
 
 `bdf2596` moved the *boundary* — an input read no longer drives the driver — so
@@ -3783,8 +4342,16 @@ whole life:
 - `settles()` — controller halt, HCRST, CNR, R/S, and the port reset. Bound
   `USB_TIMEOUT_NS`, 2 s.
 - `wait_command()` and `wait_transfer()` — every command and every transfer.
-  Same bound, and an endpoint recovery issues up to three of them in a row
-  (Reset Endpoint, Set TR Dequeue, CLEAR_FEATURE(HALT)).
+  Same bound.
+
+**X2a took the two that ran inside a scheduler pass out of that list.** A
+teardown's Disable Slot and an endpoint recovery's three-in-a-row (Reset or
+Stop Endpoint, Set TR Dequeue, CLEAR_FEATURE(HALT)) are submit-and-return now,
+so the six seconds above are reachable only from the boot path and from
+`storage_read`/`storage_write` — the first has no scheduler to give a pass back
+to, and the second is the case named below that this conversion does not fix.
+`device::configure` is the one blocking caller `poll_if_pending` still reaches
+and it is X2b's.
 
 So a worst case is a CPU that does not reschedule for **six seconds**, and an
 ordinary hot-plug enumeration on the T14 is ~14 ms of it (the entry below).
@@ -3795,10 +4362,13 @@ everything here for a season.
 **The conversion is the same idiom `PortWork` already uses** — the debounce and
 the port reset were spins until #94 and are now states the poll returns to — so
 the shape is known and the work is mechanical rather than novel. What makes it
-big is its extent: `configure` is a straight line of control transfers and
-`restart_endpoint` a straight line of commands, and each has to become a state
-machine that gives the pass back between steps. That is the whole enumeration
-and recovery path, which is why it is filed rather than folded into #116/#118.
+big is its extent: `configure` is a straight line of control transfers, and it
+has to become a state machine that gives the pass back between steps.
+`restart_endpoint`'s half of that is done: the route is
+`toyos_xhci::recovery`'s, driven twice — a blocking loop for a disk's bulk pair,
+which runs on the thread that faulted, and a stepped one for HID. **The sequence
+is shared and only the drive loop is not**, which is the shape `configure`
+should take too.
 
 One case is *not* fixed by that and needs its own answer: `storage_read` and
 `storage_write` are called by the page cache on a faulting thread, so a thread
