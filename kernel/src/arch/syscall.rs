@@ -981,38 +981,53 @@ fn sys_pipe() -> u64 {
 /// clients' pipes. Narrowing that needs a right attached to the id itself,
 /// which is what `specs/capability-handles-spec.md` replaces this syscall
 /// with entirely. Stopgap until then.
-fn may_open_pipe(caller: process::Pid, creator: process::Pid, id: pipe::PipeId) -> bool {
+///
+/// Takes the caller's table rather than locking it: this runs inside the
+/// `open_reader`/`open_writer` acquisition of `PIPES`, and both callers already
+/// hold the table across that.
+fn may_open_pipe(
+    caller: process::Pid,
+    creator: process::Pid,
+    id: pipe::PipeId,
+    fds: &fd::FdTable,
+) -> bool {
     if caller == creator {
         return true;
     }
-    process::with_fd_owner_data(|data| {
-        data.fds.iter().any(|(_, d)| {
-            d.pipe_id_read() == Some(id)
-                || d.pipe_id_write() == Some(id)
-                || matches!(d, fd::Descriptor::Socket { peer, .. } if *peer == creator)
-        })
+    fds.iter().any(|(_, d)| {
+        d.pipe_id_read() == Some(id)
+            || d.pipe_id_write() == Some(id)
+            || matches!(d, fd::Descriptor::Socket { peer, .. } if *peer == creator)
     })
+}
+
+fn not_opened(e: pipe::NotOpened) -> u64 {
+    match e {
+        pipe::NotOpened::NoSuchPipe => SyscallError::NotFound.to_u64(),
+        pipe::NotOpened::NotPermitted => SyscallError::PermissionDenied.to_u64(),
+    }
 }
 
 fn sys_pipe_open(pipe_id: u64, mode: u64) -> u64 {
     let id = pipe::PipeId::from_raw(pipe_id as usize);
-    let Some(creator) = pipe::creator(id) else {
-        return SyscallError::NotFound.to_u64();
-    };
-    if !may_open_pipe(process::current_process(), creator, id) {
-        return SyscallError::PermissionDenied.to_u64();
+    let caller = process::current_process();
+    if mode > 1 {
+        return SyscallError::InvalidArgument.to_u64();
     }
-    match mode {
-        0 => {
-            let Some(reader) = pipe::open_reader(id) else { return SyscallError::NotFound.to_u64() };
-            process::with_fd_owner_data(|data| fd_result(data.fds.insert(fd::Descriptor::PipeRead(reader))))
+    // The whole syscall under one acquisition of the caller's table, so the
+    // descriptors `may_open_pipe` weighs are the descriptors the new one joins.
+    process::with_fd_owner_data(|data| {
+        let permitted = |creator| may_open_pipe(caller, creator, id, &data.fds);
+        let descriptor = if mode == 0 {
+            pipe::open_reader(id, permitted).map(fd::Descriptor::PipeRead)
+        } else {
+            pipe::open_writer(id, permitted).map(fd::Descriptor::PipeWrite)
+        };
+        match descriptor {
+            Ok(d) => fd_result(data.fds.insert(d)),
+            Err(e) => not_opened(e),
         }
-        1 => {
-            let Some(writer) = pipe::open_writer(id) else { return SyscallError::NotFound.to_u64() };
-            process::with_fd_owner_data(|data| fd_result(data.fds.insert(fd::Descriptor::PipeWrite(writer))))
-        }
-        _ => SyscallError::InvalidArgument.to_u64(),
-    }
+    })
 }
 
 fn sys_pipe_id(fd_num: u32) -> u64 {
@@ -1076,22 +1091,24 @@ fn sys_pipe_map(fd_num: u32) -> u64 {
 fn sys_socket_create(rx_pipe_id_raw: u64, tx_pipe_id_raw: u64) -> u64 {
     let rx_id = pipe::PipeId::from_raw(rx_pipe_id_raw as usize);
     let tx_id = pipe::PipeId::from_raw(tx_pipe_id_raw as usize);
-    let holds_both = process::with_fd_owner_data(|data| {
-        let mut has_rx = false;
-        let mut has_tx = false;
-        for (_, d) in data.fds.iter() {
-            has_rx |= d.pipe_id_read() == Some(rx_id);
-            has_tx |= d.pipe_id_write() == Some(tx_id);
-        }
-        has_rx && has_tx
-    });
-    if !holds_both {
-        return SyscallError::PermissionDenied.to_u64();
-    }
-    let Some(rx) = pipe::open_reader(rx_id) else { return SyscallError::NotFound.to_u64() };
-    let Some(tx) = pipe::open_writer(tx_id) else { return SyscallError::NotFound.to_u64() };
     let peer = process::current_process();
     process::with_fd_owner_data(|data| {
+        let rx = pipe::open_reader(rx_id, |_| {
+            data.fds.iter().any(|(_, d)| d.pipe_id_read() == Some(rx_id))
+        });
+        let rx = match rx {
+            Ok(rx) => rx,
+            Err(e) => return not_opened(e),
+        };
+        // A refusal here drops `rx`, which gives its count straight back. That
+        // is the whole reason the two ends need not be taken together.
+        let tx = pipe::open_writer(tx_id, |_| {
+            data.fds.iter().any(|(_, d)| d.pipe_id_write() == Some(tx_id))
+        });
+        let tx = match tx {
+            Ok(tx) => tx,
+            Err(e) => return not_opened(e),
+        };
         fd_result(data.fds.insert(fd::Descriptor::Socket { rx, tx, peer }))
     })
 }

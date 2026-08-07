@@ -585,10 +585,8 @@ impl FileSystem for FatFs {
     }
 
     fn close_file(&mut self, file_id: FileId) {
-        if file_cache::ref_count(file_id) == 0 {
-            if let Some(info) = self.open.remove(&file_id) {
-                self.by_name.remove(&info.name);
-            }
+        if let Some(info) = self.open.remove(&file_id) {
+            self.by_name.remove(&info.name);
         }
     }
 
@@ -611,7 +609,7 @@ impl FileSystem for FatFs {
     /// destructive half only.
     fn delete(&mut self, name: &str) -> bool {
         if let Some(file_id) = self.by_name.remove(name) {
-            file_cache::mark_deleted(file_id);
+            let _ = file_cache::mark_deleted(file_id);
             self.open.remove(&file_id);
         }
         match self.fs.remove(name) {

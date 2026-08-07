@@ -5,12 +5,12 @@ use object::read::elf::ElfFile64;
 use object::read::{self, Object, ObjectSection, ObjectSymbol};
 use object::RelocationFlags;
 use crate::LinkError;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
 /// Newtype for indices into `LinkState::sections`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SectionIdx(pub usize);
 
 impl std::ops::Index<SectionIdx> for Vec<InputSection> {
@@ -23,13 +23,16 @@ impl std::ops::IndexMut<SectionIdx> for Vec<InputSection> {
 }
 
 /// Newtype for indices into the input objects slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ObjIdx(pub usize);
 
 /// Type-safe symbol reference that distinguishes global from local symbols.
 /// Local symbols carry their originating object index, ensuring they are never
 /// confused with same-named locals from other objects (e.g. `.str.63`).
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+///
+/// `Ord` is over the input position and the name, both of which a byte-identical
+/// set of inputs fixes, so it is a key an ordered container may hold.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub(crate) enum SymbolRef {
     Global(String),
     Local(ObjIdx, String),
@@ -198,8 +201,13 @@ pub(crate) enum SymbolDef {
 pub(crate) struct LinkState {
     pub(crate) sections: Vec<InputSection>,
     pub(crate) relocs: Vec<InputReloc>,
-    pub(crate) globals: HashMap<String, SymbolDef>,
-    pub(crate) locals: HashMap<(ObjIdx, String), SymbolDef>,
+    /// Ordered because the symbol table and the string table naming it *are*
+    /// this iteration. The rule the crate follows: a container iterated into the
+    /// output carries its own total order, and one that is only asked whether it
+    /// contains a name — `dynamic_imports`, `merge_set`, `relaxed_calls` — stays
+    /// a hash container.
+    pub(crate) globals: BTreeMap<String, SymbolDef>,
+    pub(crate) locals: BTreeMap<(ObjIdx, String), SymbolDef>,
     pub(crate) tls_sections: Vec<SectionIdx>,
     /// Non-loadable metadata sections (e.g. .rustc) preserved in shared library output.
     pub(crate) metadata: Vec<(String, Vec<u8>)>,
@@ -294,8 +302,8 @@ pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkEr
     let mut state = LinkState {
         sections: Vec::new(),
         relocs: Vec::new(),
-        globals: HashMap::new(),
-        locals: HashMap::new(),
+        globals: BTreeMap::new(),
+        locals: BTreeMap::new(),
         tls_sections: Vec::new(),
         metadata: Vec::new(),
         dynamic_imports: HashSet::new(),
@@ -735,7 +743,7 @@ fn remap_sym_ref_and_register(
     sym: LocalSymbolRef,
     obj_idx: ObjIdx,
     remap: &dyn Fn(LocalSectionIdx) -> SectionIdx,
-    locals: &mut HashMap<(ObjIdx, String), SymbolDef>,
+    locals: &mut BTreeMap<(ObjIdx, String), SymbolDef>,
 ) -> SymbolRef {
     match sym {
         LocalSymbolRef::Global(name) => SymbolRef::Global(name),
@@ -959,9 +967,9 @@ pub(crate) fn find_lib(name: &str, paths: &[PathBuf]) -> Option<(String, Vec<u8>
 
 /// Quickly scan an object file for its defined and referenced (undefined) symbols.
 /// Used for selective archive member extraction.
-pub(crate) fn scan_symbols(data: &[u8]) -> (HashSet<String>, HashSet<String>) {
-    let mut defined = HashSet::new();
-    let mut referenced = HashSet::new();
+pub(crate) fn scan_symbols(data: &[u8]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut defined = BTreeSet::new();
+    let mut referenced = BTreeSet::new();
 
     let obj = match read::File::parse(data) {
         Ok(o) => o,
@@ -1232,7 +1240,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     if merge_indices.is_empty() { return; }
 
     // Group by section name
-    let mut groups: HashMap<String, Vec<SectionIdx>> = HashMap::new();
+    let mut groups: BTreeMap<String, Vec<SectionIdx>> = BTreeMap::new();
     for &idx in &merge_indices {
         groups.entry(state.sections[idx].name.clone()).or_default().push(idx);
     }
