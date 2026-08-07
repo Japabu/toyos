@@ -328,24 +328,24 @@ impl SerialWriter {
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         let mut csi = Csi::Text;
-        csi.feed(self, bytes);
+        for &b in bytes {
+            csi.feed(self, b);
+        }
         csi.finish(self);
     }
 
     /// The same, for bytes that live in user memory and so cannot be a slice.
     ///
-    /// Read in chunks, with the filter's state carried across them: a CSI
-    /// sequence straddling a chunk boundary must come out the same as one that
-    /// does not, and a fresh filter per chunk would emit its head.
+    /// A byte at a time rather than through a staging buffer, so there is no
+    /// chunk boundary for a CSI sequence to straddle and no carried state to
+    /// get wrong. The path below is already per-byte and ends at a UART, so
+    /// what this costs is not measurable where it lands.
     pub fn write_user(&mut self, src: &crate::user_ptr::UserBytes) {
-        let mut chunk = [0u8; 256];
         let mut csi = Csi::Text;
-        let mut off = 0;
-        while off < src.len() {
-            let n = chunk.len().min(src.len() - off);
-            src.read_at(off, &mut chunk[..n]);
-            csi.feed(self, &chunk[..n]);
-            off += n;
+        let mut byte = [0u8; 1];
+        for off in 0..src.len() {
+            src.read_at(off, &mut byte);
+            csi.feed(self, byte[0]);
         }
         csi.finish(self);
     }
@@ -354,10 +354,10 @@ impl SerialWriter {
 /// Strips ANSI CSI sequences, so the ring never holds bytes the backend would
 /// drop.
 ///
-/// A state machine rather than an index walk because the bytes arrive in two
-/// shapes — a kernel slice from `log!`, and 256 bytes at a time out of a user
-/// window — and only a machine that survives the gap between two chunks gives
-/// both the same answer.
+/// A state machine rather than an index walk because the bytes now arrive in
+/// two shapes — a kernel slice from `log!`, and one at a time out of a user
+/// window — and duplicating the walk for the second is how the two come to
+/// disagree.
 enum Csi {
     Text,
     /// An ESC held back: it is only the start of a sequence if `[` follows, and
@@ -367,20 +367,22 @@ enum Csi {
 }
 
 impl Csi {
-    fn feed(&mut self, out: &mut SerialWriter, bytes: &[u8]) {
-        for &b in bytes {
-            match self {
-                Self::Text if b == 0x1B => *self = Self::Esc,
-                Self::Text => out.push_byte(b),
-                Self::Esc if b == b'[' => *self = Self::Body,
-                Self::Esc => {
-                    out.push_byte(0x1B);
+    fn feed(&mut self, out: &mut SerialWriter, b: u8) {
+        match self {
+            Self::Text if b == 0x1B => *self = Self::Esc,
+            Self::Text => out.push_byte(b),
+            Self::Esc if b == b'[' => *self = Self::Body,
+            Self::Esc => {
+                out.push_byte(0x1B);
+                if b == 0x1B {
+                    *self = Self::Esc;
+                } else {
                     *self = Self::Text;
-                    if b == 0x1B { *self = Self::Esc } else { out.push_byte(b) }
+                    out.push_byte(b);
                 }
-                Self::Body if (0x40..=0x7E).contains(&b) => *self = Self::Text,
-                Self::Body => {}
             }
+            Self::Body if (0x40..=0x7E).contains(&b) => *self = Self::Text,
+            Self::Body => {}
         }
     }
 
