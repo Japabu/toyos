@@ -9729,6 +9729,7 @@ fn longest_first(tasks: &mut [Task<'_>], known: &BTreeMap<String, Duration>) {
     tasks.sort_by_key(|task| std::cmp::Reverse(cost(task)));
 }
 
+
 /// One outcome, as the run prints it. Gate A goes through here too, so a
 /// suspended audio boot cannot report itself differently from a suspended
 /// machine test.
@@ -9926,6 +9927,15 @@ fn main() {
         assert!(width >= 1, "--jobs needs at least one worker");
     }
 
+    // Which slice of the suite this machine runs. Absent is the whole of it.
+    let shard = match toyos_build::testargs::parse_shard(&args) {
+        Ok(shard) => shard,
+        Err(refusal) => {
+            eprintln!("[toyos] {refusal}");
+            std::process::exit(1);
+        }
+    };
+
     // How many guests may be up on the *host* at once, across every worktree.
     // `--jobs` is this run's demand; this is what the machine will supply, and
     // zero turns it off.
@@ -10019,12 +10029,26 @@ fn main() {
     }
 
     if let Some(iterations) = audio_gate {
-        let audio_to_run: Vec<&str> = AUDIO_TESTS
+        let mut audio_to_run: Vec<&str> = AUDIO_TESTS
             .iter()
             .copied()
             .filter(|n| filter.map_or(true, |f| n.contains(f)))
             .collect();
         assert!(!audio_to_run.is_empty(), "no audio test matches filter {filter:?}");
+        // Sharded too, and this is the tier it buys the most for: the thorough
+        // tier is N boots per config taken one at a time by construction, so
+        // splitting it is the only thing that shortens it. A filter cannot do
+        // the same job — `audio_tone` is a substring of `audio_tone_load`.
+        if let Some(shard) = shard {
+            shard.keep(&mut audio_to_run, |_| None);
+            assert!(
+                !audio_to_run.is_empty(),
+                "shard {}/{} owns no audio config, and a gate that ran nothing would \
+                 report itself green",
+                shard.index,
+                shard.count,
+            );
+        }
         let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
         // One slot for the whole tier: it boots one guest at a time for the
         // length of it, so one slot is what it occupies. The owner has ruled
@@ -10065,7 +10089,7 @@ fn main() {
     let keep = |name: &str| filter.map_or(true, |f| name.contains(f));
     let tests_to_run: Vec<&TestDef> =
         all_tests.iter().filter(|t| keep(t.name.as_str())).collect();
-    let audio_to_run: Vec<&str> =
+    let mut audio_to_run: Vec<&str> =
         AUDIO_TESTS.iter().copied().filter(|n| keep(n)).collect();
     let screen_to_run: Vec<(&str, Sched)> =
         SCREEN_TESTS.iter().copied().filter(|(n, _)| keep(n)).collect();
@@ -10090,11 +10114,6 @@ fn main() {
     }
 
     let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
-    let total = tests_to_run.len()
-        + audio_to_run.len() * AUDIO_SMP.len()
-        + screen_to_run.len()
-        + machine_to_run.len();
-    eprintln!("\nrunning {total} tests\n");
     let mut tally = Tally::new(EXPECTED_FAILURES, Day::today());
     let suite_start = common::clock::mark();
 
@@ -10146,6 +10165,43 @@ fn main() {
     // believed about it. See [`retry_task`] for why both answers are findings
     // and why neither turns the run green.
     let known = load_durations();
+    // After the phases are decided and before either is ordered: what a shard
+    // divides is the work, and a task's answer to `Sched` is a property of the
+    // test rather than of how many machines are running it.
+    if let Some(shard) = shard {
+        // A task whose every name has been timed costs their sum; one carrying
+        // a name the profile has never seen is unmeasured, which is the same
+        // all-or-nothing rule [`longest_first`] states with `Duration::MAX`.
+        let cost = |task: &Task<'_>| -> Option<Duration> {
+            task.names()
+                .iter()
+                .try_fold(Duration::ZERO, |a, n| Some(a + *known.get(*n)?))
+        };
+        longest_first(&mut parallel, &known);
+        longest_first(&mut serial, &known);
+        shard.keep(&mut parallel, cost);
+        shard.keep(&mut serial, cost);
+        shard.keep(&mut audio_to_run, |name| {
+            AUDIO_SMP.iter().try_fold(Duration::ZERO, |a, smp| {
+                Some(a + *known.get(&format!("{name} (smp={smp})"))?)
+            })
+        });
+        eprintln!(
+            "[toyos] shard {}/{}: {} parallel task(s), {} serial, {} audio config(s)",
+            shard.index,
+            shard.count,
+            parallel.len(),
+            serial.len(),
+            audio_to_run.len() * AUDIO_SMP.len(),
+        );
+    }
+
+    // Counted from the task lists rather than from the filtered ones, because a
+    // shard's own total is what its summary has to add up against.
+    let total = parallel.iter().chain(serial.iter()).map(|t| t.names().len()).sum::<usize>()
+        + audio_to_run.len() * AUDIO_SMP.len();
+    eprintln!("\nrunning {total} tests\n");
+
     let mut timed: Vec<(String, Duration)> = Vec::new();
     let mut wide_reds: Vec<String> = Vec::new();
     if !parallel.is_empty() {
@@ -10177,7 +10233,16 @@ fn main() {
         outcomes.into_iter().for_each(|o| tally.record(o));
     }
     qemu::set_width(1);
-    save_durations(known, &timed);
+    // **A sharded run may not write the profile it partitioned on.** The
+    // partition is a function of the durations file, so shards that disagree
+    // about that file disagree about who owns what — and a shard that saves
+    // moves it under its siblings. Run three shards of `nvme_` in one worktree
+    // and two of them ran `nvme_home_roundtrip` while `nvme_large_device` ran
+    // nowhere: three runs, three profiles, three different partitions. It is
+    // also a third of a measurement, which is not what this file is for.
+    if shard.is_none() {
+        save_durations(known, &timed);
+    }
 
     if !wide_reds.is_empty() {
         eprintln!("  --- re-running {} wide failure(s) alone ---", wide_reds.len());

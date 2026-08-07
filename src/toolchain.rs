@@ -24,6 +24,15 @@ pub enum Owner {
     Us,
     /// The primary checkout, named so a refusal can point at it.
     Elsewhere(PathBuf),
+    /// Nobody in this repository: `rust/build` holds a toolchain that arrived
+    /// as an artifact, and there is no `rust/` source to have built it from.
+    ///
+    /// Read off the disk rather than declared, because a checkout with a
+    /// toolchain and no compiler source has exactly one thing it can do with
+    /// it, and a flag or an env var saying so could disagree with what is
+    /// there. This is how a CI runner gets a sysroot: `x.py` on four cores is
+    /// an hour, and the product is 1.1 GB.
+    Installed,
 }
 
 /// One `rust/` per repository, in the primary checkout, and every worktree
@@ -39,7 +48,11 @@ pub fn owner(root: &Path) -> Owner {
     let primary = crate::primary_checkout(root);
     let same = fs::canonicalize(root).map(|r| r == primary).unwrap_or(false);
     if same {
-        return Owner::Us;
+        let installed = !root.join("rust/x.py").exists()
+            && root
+                .join(format!("rust/build/{}/stage2/bin/rustc", host_triple()))
+                .exists();
+        return if installed { Owner::Installed } else { Owner::Us };
     }
     assert!(
         primary.join("rust/x.py").exists(),
@@ -56,7 +69,7 @@ pub fn owner(root: &Path) -> Owner {
 /// compiles against.
 pub fn rust_dir(root: &Path) -> PathBuf {
     match owner(root) {
-        Owner::Us => root.join("rust"),
+        Owner::Us | Owner::Installed => root.join("rust"),
         Owner::Elsewhere(primary) => primary.join("rust"),
     }
 }
@@ -354,9 +367,16 @@ pub fn ensure(
         },
     );
 
-    if let Owner::Elsewhere(primary) = owner(root) {
-        adopt_shared_sysroot(root, &rust_dir, &primary, force_rebuild, claim_sysroot, lock);
-        return;
+    match owner(root) {
+        Owner::Elsewhere(primary) => {
+            adopt_shared_sysroot(root, &rust_dir, &primary, force_rebuild, claim_sysroot, lock);
+            return;
+        }
+        Owner::Installed => {
+            check_installed_toolchain(root, &rust_dir, force_rebuild, claim_sysroot);
+            return;
+        }
+        Owner::Us => {}
     }
 
     // **The primary's ordinary build is a claim too, and it used to be a silent
@@ -485,6 +505,52 @@ pub fn ensure(
                 .unwrap_or_else(|e| panic!("write {}: {e}", witness_path(&rust_dir).display()));
             record_claimant(root, &rust_dir);
         },
+    );
+}
+
+/// Everything a checkout may do with a toolchain it did not build: check that
+/// it is the one this tree needs, and say what to do when it is not.
+///
+/// The same three questions [`adopt_shared_sysroot`] asks, minus the claim: no
+/// amount of source here can rebuild a sysroot without `rust/`, so there is
+/// nothing to arbitrate and the answer is always to publish a toolchain built
+/// from these sources.
+fn check_installed_toolchain(root: &Path, rust_dir: &Path, force_rebuild: bool, claim: bool) {
+    let stage2 = rust_dir.join(format!("build/{}/stage2", host_triple()));
+    assert!(
+        !force_rebuild && !claim,
+        "there is no `rust/` source in {}, so neither --rebuild-toolchain nor \
+         --claim-sysroot has anything to build from.\n\
+         The toolchain at {} arrived as an artifact; rebuild it where it is published.",
+        root.display(),
+        stage2.display(),
+    );
+
+    let linked = rustup_link();
+    assert!(
+        linked.as_deref() == Some(stage2.as_path()),
+        "the rustup toolchain `toyos` points at {}, not at the installed toolchain at {}.\n\
+         Link it: rustup toolchain link toyos {}",
+        linked.map_or_else(|| "nothing".to_string(), |p| p.display().to_string()),
+        stage2.display(),
+        stage2.display(),
+    );
+
+    // Recreated rather than shipped: it points into whatever stable toolchain
+    // this machine has, which is not a path any artifact can know.
+    if host_target_missing(rust_dir) {
+        link_host_target(rust_dir);
+    }
+
+    let want = witness(root);
+    let recorded = fs::read_to_string(witness_path(rust_dir)).ok();
+    assert!(
+        recorded.as_deref() == Some(want.as_str()),
+        "this checkout and the installed toolchain at {} disagree about {}, so a build \
+         here would link its kernel against another tree's struct layouts.\n\
+         Publish a toolchain built from these sources and install that one instead.",
+        stage2.display(),
+        differing_trees(recorded.as_deref(), &want),
     );
 }
 

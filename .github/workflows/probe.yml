@@ -1,0 +1,98 @@
+name: runner-probe
+
+on:
+  push:
+    branches: ['ci/probe-runner']
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: identity
+        run: |
+          echo "== runner label: ${{ matrix.runner }}"
+          uname -a
+          id
+          echo "== cpu"
+          if [ -r /proc/cpuinfo ]; then
+            grep -m1 'model name' /proc/cpuinfo || true
+            echo "cores: $(nproc)"
+            grep -c -w -E 'vmx|svm' /proc/cpuinfo || echo "no vmx/svm lines"
+            grep -m1 flags /proc/cpuinfo || true
+          else
+            sysctl -n machdep.cpu.brand_string || true
+            sysctl -n hw.ncpu || true
+          fi
+          echo "== memory"
+          free -h 2>/dev/null || (sysctl -n hw.memsize)
+          echo "== disk"
+          df -h
+
+      - name: kvm
+        run: |
+          echo "== /dev/kvm"
+          ls -l /dev/kvm 2>&1 || echo "ABSENT"
+          echo "== groups"
+          groups || true
+          echo "== can we open it read-write?"
+          if [ -e /dev/kvm ]; then
+            if exec 3<>/dev/kvm; then echo "OPEN-RW: yes"; exec 3<&-; else echo "OPEN-RW: no"; fi
+          fi
+          echo "== kvm modules"
+          lsmod 2>/dev/null | grep -i kvm || echo "no kvm modules listed"
+          echo "== hvf (macos)"
+          sysctl -n kern.hv_support 2>/dev/null || echo "no kern.hv_support"
+
+      - name: qemu availability
+        run: |
+          which qemu-system-x86_64 qemu-system-aarch64 2>&1 || echo "no qemu preinstalled"
+          qemu-system-x86_64 --version 2>&1 | head -3 || true
+
+      - name: install qemu
+        run: |
+          set -x
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            t0=$(date +%s)
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 qemu-system-arm ovmf
+            t1=$(date +%s)
+            echo "APT-INSTALL-SECONDS: $((t1-t0))"
+          else
+            t0=$(date +%s)
+            brew install qemu || true
+            t1=$(date +%s)
+            echo "BREW-INSTALL-SECONDS: $((t1-t0))"
+          fi
+          qemu-system-x86_64 --version | head -1
+
+      - name: accelerator list
+        run: |
+          echo "== -accel help"
+          qemu-system-x86_64 -accel help 2>&1 || true
+          set +e
+          echo "== does kvm actually start a machine?"
+          out=$(echo quit | qemu-system-x86_64 -accel kvm -machine q35 -m 256 \
+            -display none -nodefaults -monitor stdio 2>&1)
+          echo "KVM-START-EXIT: $?"
+          echo "$out"
+          echo "== tcg control"
+          out=$(echo quit | qemu-system-x86_64 -accel tcg -machine q35 -m 256 \
+            -display none -nodefaults -monitor stdio 2>&1)
+          echo "TCG-START-EXIT: $?"
+          echo "$out"
+          echo "== hvf (macos)"
+          out=$(echo quit | qemu-system-aarch64 -accel hvf -machine virt -cpu host -m 256 \
+            -display none -nodefaults -monitor stdio 2>&1)
+          echo "HVF-START-EXIT: $?"
+          echo "$out"
+
+      - name: rust toolchain present
+        run: |
+          rustc -vV || echo "no rustc"
+          cargo -V || echo "no cargo"
+          ls ~/.rustup/toolchains 2>/dev/null || echo "no rustup toolchains"
