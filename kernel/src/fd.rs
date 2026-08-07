@@ -182,7 +182,8 @@ impl FdTable {
         Self { map: IdMap::new() }
     }
 
-    /// Insert at the lowest unused id.
+    /// Insert at the next id. `IdMap`'s counter is monotonic, so it is never
+    /// the lowest unused one and a closed fd number is never handed out again.
     pub fn insert(&mut self, desc: Descriptor) -> Result<u32, SyscallError> {
         self.check_room(None)?;
         Ok(self.map.insert(desc))

@@ -84,8 +84,26 @@ as authority, guessing or outliving the designation was the entire attack:
   Not closed by `be604ef`, which this file briefly claimed: `Listener(String)`
   is an unchanged *context* line in that commit's own `fd.rs` hunk. See the
   postscript at the end of this section.
+
+  **The setup is gone too** (tasks #61/#170): a listener is refcounted by the
+  descriptors naming it (`listener::ListenerRef`), so the `close(fd)` in that
+  three-call attack unregisters nothing and the real compositor's `listen` is
+  *refused*. What is left is a squat, which is the "no namespace" bullet in the
+  next entry and a different defect. `abuse_listener_hijack.rs` now asserts that
+  refusal; the `ListenerId` half is the second line and is no longer reachable
+  from userland at all, because nothing can produce a descriptor whose listener
+  is gone.
 - **`SharedToken`** — a bare `u32` with no RAII and no ownership, still open
   (§7).
+- **A device claim** — same shape, closed by the same tasks. `dup` cloned
+  `Descriptor::Keyboard`/`Framebuffer`/… as a plain value while `close` released
+  the class unconditionally, so `open_device(d); dup(fd); close(fd)` freed the
+  device for anyone to take *and* left the caller a working descriptor: two
+  processes composing to one scanout, or one reading another's keystrokes.
+  `device::Claim` is now a non-`Clone` token whose `Drop` releases the class, so
+  `Descriptor` cannot be `Clone` either and `Descriptor::duplicate` cannot
+  answer `Some` for those five variants — `dup`, `dup2` and a spawn `fd_map` all
+  say `PermissionDenied`. `device_claim_lifetime.rs` is the exploit test.
 
 The adjacent failure, same root: **a reference that outlives the object it
 names.** `FileBacking` after an unlink is the live instance (below) — the
@@ -252,8 +270,12 @@ this is a class, not an instance.
 Those gates are exactly as strong as the claim and no stronger. `SYS_OPEN_DEVICE`
 is itself first-come and ungated, so a process that beats the daemon to a device,
 or claims it after the daemon dies, holds everything the claim unlocks — for
-`DEVICE_AUDIO` that includes the RT band, which audio spec §9.4 wants to be a
-privilege. "Gated" here does not mean "privileged".
+`DeviceType::Audio` that includes the RT band, which audio spec §9.4 wants to be
+a privilege. "Gated" here does not mean "privileged".
+
+What is no longer *also* true is that the claim leaks: a claim admits exactly one
+descriptor now (`device::Claim`, `Descriptor::duplicate`), so racing the daemon
+is the whole remaining attack rather than the cheap half of it.
 
 ### `SYS_DEBUG` is ungated, and two of its actions are a diagnostic-channel DoS
 
@@ -3989,12 +4011,12 @@ and it is not measurable here.
 
 ### A device claim succeeds on a machine that has no such device
 
-`device::try_claim` gates `DEVICE_FRAMEBUFFER`, `DEVICE_NIC` and `DEVICE_AUDIO`
+`device::try_claim` gates `DeviceType::{Framebuffer, Nic, Audio}`
 on an info struct the driver registered, so those three return
 `ClaimError::Absent` when the hardware is absent — which is what makes soundd
 and netd able to exit cleanly.
-`DEVICE_KEYBOARD` and `DEVICE_MOUSE` are gated on nothing at all: they hand out
-a `Descriptor` whether or not any driver will ever produce an event. Under
+`DeviceType::Keyboard` and `DeviceType::Mouse` are gated on nothing at all: they
+hand out a `Descriptor` whether or not any driver will ever produce an event. Under
 metal-sim the compositor holds both claims on a machine with no HID of any kind
 and polls them forever. Harmless today, wrong in the same way the isolation
 issues in §1 are wrong: a claim is supposed to be evidence.
@@ -4687,7 +4709,7 @@ uninterpretable.
 
 `panic_console::boot_checkpoint` returns immediately once
 `SCREEN_OWNED_BY_USERLAND` is set (`panic_console/mod.rs:478`), and
-`device::try_claim(DEVICE_FRAMEBUFFER)` sets it (`device.rs:83`) as the
+`device::try_claim(DeviceType::Framebuffer)` sets it as the
 compositor's third statement (`compositor/src/main.rs:719`). So the last
 kernel screenful ever painted is the one at `Boot: complete`, and the compositor
 overwrites it with the desktop a few tens of milliseconds later. Measured on

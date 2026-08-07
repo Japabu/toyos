@@ -1,14 +1,22 @@
-//! A listener descriptor must name the listener it was made for, not a string
-//! that a later process can bind.
+//! The real service is never handed a name somebody still holds a live fd on.
 //!
-//! `Descriptor::Listener` carried the service *name*, and accept, close and
-//! poll all re-resolved that string through the global registry. So the whole
-//! attack is `listen(name)`, `dup`, `close(original)`: the close unregisters
-//! the name and leaves the dup naming nothing. When the real service then
-//! claims the freed name its own `listen` succeeds — its "already running"
-//! check passes — and from that moment the stale fd resolves to *its*
-//! listener. `accept` on it takes connections meant for the service, and
-//! `close` on it unregisters the service.
+//! The original defect: `Descriptor::Listener` carried the service *name*, and
+//! accept, close and poll all re-resolved that string through the global
+//! registry. The attack was `listen(name)`, `dup`, `close(original)` — the
+//! close unregistered the name and left the dup naming nothing, so when the
+//! real service claimed the freed name its own `listen` succeeded, and from
+//! that moment the stale fd resolved to *its* listener: `accept` on it took
+//! the service's connections and `close` on it unregistered the service.
+//! `e42532f` gave the descriptor a `ListenerId` instead — never reused, so a
+//! stale fd names nothing forever.
+//!
+//! **The attack's setup no longer exists**, and that is what this file now
+//! certifies. A listener is refcounted by the descriptors naming it, so
+//! `close` on one of two unregisters nothing and the real service's `listen`
+//! is refused: the squat is loud instead of silent, and the service knows the
+//! name is taken rather than being handed a name under a stranger's fd. The
+//! `ListenerId` remains the second line and is no longer reachable to test —
+//! nothing can now produce a descriptor whose listener is gone.
 //!
 //! Run as `... server` this binary is the service; as `... client <secret>` it
 //! is one of its clients.
@@ -34,12 +42,50 @@ fn main() {
 }
 
 fn attacker() {
-    // Squat the name, then hand the registry back while keeping a descriptor.
+    // Squat the name, then try to hand the registry back while keeping a
+    // descriptor. The close is what used to unregister it.
     let listener = syscall::listen(NAME).expect("listen on an unclaimed name");
     let stale = syscall::dup(listener).expect("dup the listener fd");
     syscall::close(listener);
 
-    // The real service claims what looks like a free name.
+    // The real service must be told the name is taken. A kernel that lets this
+    // succeed has handed it a name a stranger holds a live descriptor on, and
+    // every assertion after this one is about the damage that does.
+    let mut server = Command::new(SELF_PATH)
+        .arg("server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    let mut out = BufReader::new(server.stdout.take().expect("server stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("server first line");
+    assert_eq!(
+        line.trim(),
+        "taken",
+        "the service claimed a name the attacker still holds a descriptor on: {line:?}"
+    );
+    drop(server.stdin.take());
+    assert!(server.wait().expect("wait server").success(), "server exited nonzero");
+
+    // The attacker's own descriptor is what holds the name, so it serves —
+    // this is a squat, which `SYS_LISTEN` has no namespace to prevent (known
+    // issues §1), and not a hijack of somebody else's listener.
+    let status = Command::new(SELF_PATH)
+        .arg("client")
+        .arg(SECRET_1)
+        .status()
+        .expect("spawn first client");
+    assert!(status.success(), "first client exited {status:?}");
+    let accepted = syscall::accept(stale).expect("the surviving descriptor must still serve");
+    let mut buf = [0u8; 128];
+    let n = syscall::read(accepted.fd, &mut buf).expect("read the client's message");
+    assert_eq!(String::from_utf8_lossy(&buf[..n]).trim(), SECRET_1);
+    syscall::close(accepted.fd);
+
+    // The last descriptor releases the name, and only then.
+    syscall::close(stale);
+
     let mut server = Command::new(SELF_PATH)
         .arg("server")
         .stdin(Stdio::piped())
@@ -49,61 +95,29 @@ fn attacker() {
     let mut out = BufReader::new(server.stdout.take().expect("server stdout"));
     let mut line = String::new();
     out.read_line(&mut line).expect("server ready line");
-    assert_eq!(line.trim(), "ready", "the service did not come up: {line:?}");
+    assert_eq!(
+        line.trim(),
+        "ready",
+        "the name was still bound after its last descriptor closed: {line:?}"
+    );
 
-    // A client connects to the service by name and leaves a message queued.
-    let status = Command::new(SELF_PATH)
-        .arg("client")
-        .arg(SECRET_1)
-        .status()
-        .expect("spawn first client");
-    assert!(status.success(), "first client exited {status:?}");
-
-    // The stale descriptor must not resolve to the service's listener. There
-    // is a queued connection, so an unfixed kernel returns it immediately —
-    // this cannot pass by blocking.
-    match syscall::accept(stale) {
-        Ok(accepted) => {
-            let mut buf = [0u8; 128];
-            let n = syscall::read(accepted.fd, &mut buf).unwrap_or(0);
-            panic!(
-                "hijacked the service's listener: accepted a connection from pid {} carrying {:?}",
-                accepted.client_pid,
-                String::from_utf8_lossy(&buf[..n]).trim(),
-            );
-        }
-        Err(SyscallError::NotFound) => {}
-        Err(e) => panic!("accept on a stale listener fd: expected NotFound, got {e:?}"),
-    }
-
-    // Closing the stale descriptor must not unregister the live service.
-    syscall::close(stale);
-
-    let mut stdin = server.stdin.take().expect("server stdin");
-    let got = ask_server(&mut stdin, &mut out, "accept");
-    assert_eq!(got, format!("got {SECRET_1}"), "the service lost its first client");
-
-    // …and the name still resolves, for a client that connects after the
-    // close. A client whose `connect` fails exits non-zero.
     let status = Command::new(SELF_PATH)
         .arg("client")
         .arg(SECRET_2)
         .status()
         .expect("spawn second client");
-    assert!(
-        status.success(),
-        "second client exited {status:?} — closing the stale fd unregistered the service"
-    );
+    assert!(status.success(), "second client exited {status:?}");
 
+    let mut stdin = server.stdin.take().expect("server stdin");
     let got = ask_server(&mut stdin, &mut out, "accept");
-    assert_eq!(got, format!("got {SECRET_2}"), "the service lost its second client");
+    assert_eq!(got, format!("got {SECRET_2}"), "the service lost its client");
 
     writeln!(stdin, "quit").expect("tell the server to quit");
     drop(stdin);
     let status = server.wait().expect("wait server");
     assert!(status.success(), "server exited {status:?}");
 
-    println!("stale listener fd refused; the service kept its name and both clients");
+    println!("the squatted name stayed the squatter's while it held an fd, and freed on the last close");
 }
 
 fn ask_server(
@@ -118,8 +132,18 @@ fn ask_server(
     line.trim().to_string()
 }
 
+/// Reports what `listen` said and then serves, so the attacker can assert on
+/// the answer rather than on the service dying.
 fn server() {
-    let listener = syscall::listen(NAME).expect("service: the name must be free");
+    let listener = match syscall::listen(NAME) {
+        Ok(fd) => fd,
+        Err(SyscallError::AlreadyExists) => {
+            println!("taken");
+            std::io::stdout().flush().expect("flush taken");
+            return;
+        }
+        Err(e) => panic!("service: listen said {e:?}"),
+    };
     println!("ready");
     std::io::stdout().flush().expect("flush ready");
 

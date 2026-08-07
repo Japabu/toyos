@@ -112,7 +112,7 @@ const OFF_EVENT_BUFS: usize = 0x5000;
 const KERNEL_DMA_SIZE: usize = 0x6000;
 
 // Shared DMA page: PCM data only, granted to whichever process claims
-// DEVICE_AUDIO. AudioInfo.buf_offsets are relative to this page.
+// DeviceType::Audio. AudioInfo.buf_offsets are relative to this page.
 const SHARED_DMA_SIZE: usize = TX_INFLIGHT_MAX * PERIOD_BYTES;
 
 const REQ_OFFSET: usize = 0x000;
