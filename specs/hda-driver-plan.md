@@ -256,6 +256,26 @@ ToyOS's audio contract is `{mask, timestamp}` and not a sample position. That
 deletes the whole of the `position_fix` family from scope, and it is worth
 stating as a design property rather than an accident.
 
+**What zero-on-complete does not buy, found on the T14 (known-issues §4).** It
+makes an unfilled period *sound* the same on both backends. It does not make one
+*mean* the same, and soundd's free list was written for the meaning virtio has:
+a period soundd has not submitted is a period the device does not have. Here the
+engine owns every period for as long as it runs, so a period soundd holds back
+is played anyway **and completed a second time** — which is the assertion above
+firing, and it is right to. Three rules of the mix loop rested on the queue
+meaning: §5.10's deferral (bounded by unplayed audio, not by the engine's
+return), §5.8's drain-by-not-submitting (exactly one lap, no margin), and taking
+the lowest free index first (the engine plays the ring's order, so a batch that
+wraps is filled backwards — a splice with no silence in it for the gap detector
+to see). `Backend::pipeline` names the difference and those three sites ask it;
+`stream::decode` reads the driver's position back off every mask rather than
+having it stepped and hoped for — a mask read late is the OR of several
+`completed` calls, so it can name a whole lap, and the driver is told that in
+those words rather than handed a position the mask does not carry. Gate:
+`hda_client_stall`, whose two arms must answer differently — the ring reporting
+underruns and holding nothing, the queue deferring — so that neither deleting
+the deferral nor letting the ring hold a period goes green.
+
 ### 2.5 What is deferred, and what breaks if it is deferred wrongly
 
 | Deferred | What it costs | What breaks if deferred *wrongly* |
@@ -1419,10 +1439,14 @@ Each with what settles it, and how early.
 6. **DOWNGRADED — `ECAP.SC` may be clear on the T14's unit.** §4.4 item 4's
    answer under the stub is a config-space write the kernel performs itself, so
    snoop-force is defence in depth rather than the mechanism. Unread (§6.5).
-7. **Gate A's instrument cannot see a repeated period.** §2.4's zero-on-complete
-   rule is what keeps the existing gap detector valid across both backends, and
-   it is a design promise rather than a measurement. If it is wrong, the gate
-   goes green on audible harm. §5.3 item 5 is the second guard; build it.
+7. **PARTLY REALISED — Gate A's instrument cannot see a repeated period.**
+   §2.4's zero-on-complete rule keeps the gap detector valid across both
+   backends and remains a design promise. What it does not cover is the free
+   list's *meaning*, and that is where the T14 killed soundd: three mix-loop
+   rules assumed a period soundd holds is one the device does not have
+   (known-issues §4). Gate A saw none of it — its clients keep their rings full
+   — so the gate is `hda_client_stall`, whose actuator is a client that stops.
+   §5.3 item 5's phase check is built and is separately red (#88).
 8. **CLOSED — QEMU's codec may not offer 44,100 Hz.** It does, at 16-bit, and so
    does the T14's converter (§6.4 item 5). Gate A's existing constants serve
    both backends and §5.3 item 2's per-config scale is not needed.

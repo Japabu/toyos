@@ -1481,6 +1481,175 @@ one defect. Ctrl+Alt+D is now machine-wide and process-named (§5), and on the
 owner's laptop one press named three CPUs not reaching a scheduler pass and
 three threads ready-and-never-run.
 
+### OPEN (#156) — seven T14 boots in seven minutes, and the signature everyone has read as a wedge is what a healthy idle machine writes
+
+**The evidence is committed**: `specs/metal-logs/2026-08-07-freeze/`, seven
+consecutive boots of one image off the owner's stick, 22:26–22:33 on
+2026-08-07, five of them frozen with Ctrl+Alt+D producing nothing on every one.
+Its `README.md` has the table. This entry is what the seven establish, what they
+eliminate, and what they cannot reach.
+
+**Nothing in a frozen boot's log distinguishes it from a healthy one.** Diffed
+with timestamps, addresses, CPU ids and TSC jitter normalised, a frozen boot and
+the healthy one are identical up to the moment the frozen one stops — the only
+differences are SMP join ordering and where one `shm: mapped WriteCombining`
+line falls. Four of the five end at the same line, `spawn: /bin/filepicker
+pid=3`, between 0.945 s and 1.462 s.
+
+**That ending is not evidence of a wedge, and reading it as one is what has cost
+this investigation its last three rounds.** It is what a healthy, fully
+quiescent T14 writes, and three separate facts force it:
+
+1. the log ring's only drains are the idle loop and the timer tick;
+2. a CPU whose pass finds no work and no deadline stops its LAPIC timer and
+   halts (`TimerPlan::Stop`), so on a machine with nothing to run there is no
+   idle loop and no tick either;
+3. the pre-halt check in `sched::driver::execute` refuses to sleep while
+   `log_ring::file_has_pending()`, so the last CPU to go down flushes everything
+   first. **The file is therefore complete as of the moment the machine went
+   quiet, and silent about everything after it.**
+
+In the healthy boot `223244` the very next line after `spawn: /bin/filepicker`
+is the owner's first keystroke, 445 ms later. In `223152` it is 1.958 s later.
+The log has no other reason to say anything.
+
+**One of the five freezes is closed outright, and it is the control the other
+three needed.** In `222741` the firmware left the controller at `cfg=0x30` —
+translate **off**, where every other boot in the set reads `0x77` — the set
+query answered `0xEE` as it always does on this EC, and `init` took its
+fail-closed branch:
+
+```
+i8042: ok selftest=0x55 cfg=0x30->0x60 port1=ok port2=ok
+i8042: kbd DISABLED - the set query answered 0xee and firmware's cfg 0x30 has
+       translate off, so nothing says what the wire carries
+```
+
+It returns before the aux port, so that boot had **no keyboard and no
+TrackPoint**, by the driver's own correct decision. Ctrl+Alt+D could not have
+worked on it whatever the scheduler was doing. And its file is the same shape as
+the other three — same ending, and earlier only because the refusal returns
+before the keyboard and aux stages: `Boot: peripherals ready (448ms)` against
+`(841ms)` on every other boot in the set. A boot with provably no input path is
+indistinguishable from the ones being investigated.
+
+**`223152` is the fifth, and it is the sharpest.** Input worked exactly once —
+`the pin asserts — 1 interrupts, 1 bytes, 1 keys` at 3.397 s — the filepicker
+acted on it, `/bin/terminal` and `/bin/shell` spawned at 3.494 and 3.539, and
+then nothing ever again. That is the same shape as "the T14 lost every
+integrated input at 6.6 s" in §8, on a different boot and a different image.
+
+**Eliminated, by reading and not by a run.** `drain_serial`'s `BackendGuard::lock`
+was the named suspect and it cannot be this. `SERIAL_SINK` is false for the
+whole boot on a machine with no 16550 and no virtio-console, so `append` never
+advances `LogRing::len`, `OWED` stays 0, `drain_into` returns 0 on the first
+call and `drain_serial` leaves its loop having held the guard across one memcpy
+of nothing. §8 reached the same conclusion by the same route in a different
+week; it is restated here because the hypothesis keeps coming back.
+
+**What is left, and none of it is decidable from these logs.** Three hypotheses
+that all produce exactly the file above:
+
+- **A.** The machine is alive and quiescent, and the i8042 has stopped
+  delivering. Three sub-causes, opposite in where the fault lies: the controller
+  holding a byte no ISR will read (delivery is edge-triggered, so it never
+  asserts again), a redirection entry that got masked or re-pointed, or an EC
+  that simply stopped sending.
+- **B.** CPU 0 is deaf — spinning with `IF` clear, or wedged — and the machine is
+  otherwise alive. **On this kernel that is indistinguishable from a total
+  freeze from outside**, because `pci::MSG_ADDR` targets APIC 0 for every
+  device's MSI and `init` routes GSI 1 and GSI 12 to APIC 0 as well: every
+  interrupt source the machine has lands on one CPU.
+- **C.** The machine stopped.
+
+#### What to do at the machine, in order
+
+**Zeroth, and it costs a glance: what is on the panel?** Nobody has recorded it,
+and the compositor's own source makes it a real split rather than a curiosity.
+`Session::new` ends:
+
+```rust
+let mut damage = Damage::default();
+damage.add(desk.screen);
+eprintln!("compositor: ready");
+Command::new("/bin/filepicker").spawn().ok();     // <- the last line in four of the five logs
+```
+
+Nothing has been painted at that point: the wallpaper was rescaled into RAM, the
+whole screen was *staged* as damage, and the first composite happens in the
+caller's loop, **strictly after the `spawn:` line the frozen logs end on**. The
+panel therefore answers a question the log cannot:
+
+- **wallpaper** (with or without the filepicker's window) → the compositor
+  returned from that syscall and completed its first frame. The machine got past
+  the last line in its own log, and the three hypotheses below are the live ones.
+- **the kernel's boot log, 8x16, still from `boot_checkpoint`** → it did not.
+  `screen_claimed_by_userland` fires at the *claim*, several lines earlier, so
+  the checkpoint had already stopped repainting and what is on the glass is the
+  last thing the kernel put there. That puts the failure between the compositor's
+  `spawn()` and its first blit — one syscall wide, on the process that had been
+  running fine a millisecond earlier — and it is #142's shape, not a scheduler
+  that stopped.
+
+`223152` is the one boot where this is already known: it ends at `spawn:
+/bin/shell pid=5`, two composites and one keystroke past that boundary.
+
+**First, and it needs no reflash: plug a USB keyboard into the frozen T14.**
+This is the input-independent source the dump has always needed and it already
+exists — `keyboard::handle_key` is the single production path for every keyboard
+in the machine, the Ctrl+Alt+D hook is inside it, and `xhci::hid` reaches it
+through `keyboard::handle_report`. A hotplug raises a Port Status Change Event,
+whose MSI wakes a halted CPU, and `poll_if_pending` enumerates from `drain_irqs`.
+So:
+
+- `xHCI: port N connected` appears in `/log` and the keyboard types → **A**, and
+  the machine was alive the whole time.
+- Ctrl+Alt+D on it paints the dump → **A**, with the full scheduler state as a
+  bonus.
+- Nothing at all → **B or C**, which the build below then separates.
+
+**Then the one reflash: `cargo run -- --build-only --kernel-feature heartbeat`,
+and flash `target/bootable.img`.** The *ordinary* image and not `--diag-boot`:
+the freeze happens with the desktop up, and the diagnostic image has no
+compositor, so it is a different workload and would not be a re-run of these
+seven. *The heartbeat was never compiled into the image that produced them* — no
+`alive=` line appears in any of the seven — and it is the instrument built for
+exactly this question. It brings
+`diag-tick`, so no CPU sleeps longer than 100 ms and the idle loop keeps running
+on a machine that has gone quiet. Reading it:
+
+| what the log does | which hypothesis |
+|---|---|
+| `alive=8/8 … ran=0` continues through the freeze | **A** — and the `i8042: line` beside it says which sub-cause |
+| `alive=7/8 mask=0xfe` and `heartbeat: cpu0 last reached one N.NNNs ago` | **B**, dated |
+| heartbeats stop at T | **C**, dated |
+
+The `i8042: line` beside every heartbeat is new (this task) and is what makes
+**A** actionable rather than merely named: `status` with bit 0 set on sample
+after sample is the controller holding a byte, bit 16 of an `rte=` is the mask,
+and a clean reading with `irqs=` flat puts the fault at the EC and takes this
+driver out of it. `kernel_heartbeat` gates it against the vector `init` says it
+programmed.
+
+**Two things about that build, said out loud.** It is an *active* instrument:
+`diag-tick` holds the machine out of full quiescence, so a freeze that needs
+deep idle may not happen at all under it — which is itself a finding, and worth
+recording rather than re-running away. And four heartbeats a second each carry a
+`sync_mount` of the stick, so it is a diagnostic budget and not a shipping one.
+
+#### What was deliberately not built
+
+**A heartbeat that summons the dump by itself** when a CPU has been missing from
+the mask for several periods. It is the obvious next step for **B** — it would
+turn `cpu0 last reached one 4.2s ago` into a symbolised `rip` through
+`dump::probe_silent`'s NMI, with no keystroke needed — and `dump::request` is
+reachable from the idle loop as written (preempt count 0, holds nothing). It was
+not built because it needs an actuator of its own to be gated: `dump-deaf-cpu`
+stages a 400 ms window and calls `request()` itself, so it can neither reach a
+multi-period threshold nor let a test attribute the dump. **The owner reflashes
+once**, and an ungated path in that image is worth less than the resolution it
+would add. Whoever picks it up should build the actuator first.
+
 ### OPEN, UNASSIGNED — the total freeze now reproduces in QEMU, in about seven seconds
 
 **This is the first reproduction of the freeze class.** Everything above was
@@ -2786,6 +2955,70 @@ host anyway, which is what makes them comparable to each other.
 serve as a pass/fail gate. M3 used it as an A/B instead, which is what it could
 still answer, and landed on the fast tier plus the full suite.
 
+### CLOSED 2026-08-07 — soundd panicked on the T14: `repeated completion for free buffer`
+
+The metal boot at `2026-08-07-222910.log`, `/bin/tone` through the T14's
+`00:1f.3` (ALC257, converter 0x02 → pin 0x14, 8 periods of 512 B, stream 7).
+soundd died 0.5 s into a 2 s tone on `assert_eq!(free_mask & rec.mask, 0)` with
+bit 3; the owner heard the tone as "more like a triangle or sawtooth wave"
+before it stopped.
+
+**The mix loop's free list is a queue model, and HDA is a ring.** On
+virtio-sound a period soundd has not submitted is a period the device does not
+have. HDA's engine owns every period for as long as `RUN` is set: it returns to
+buffer *i* exactly `num_buffers` periods after completing it and plays whatever
+is there. Three of the free list's rules were the queue model showing:
+
+1. **§5.10's deferral.** `refill_floor_nanos` bounds *unplayed audio* (5 of 8
+   periods), not the engine's return, and the selection took the lowest free
+   index — so the deferred set pinned at the top three free buffers and the same
+   ones were held cycle after cycle while lower ones were refilled. Each played
+   the silence `released` left in it, and after one lap the engine completed one
+   soundd still held. Deterministic within ~14 wakes of a client stalling. The
+   three-in-eight silence is the buzz the owner heard.
+2. **§5.8's drain.** With the last client gone the free list filled over one lap
+   with no margin: a wake landing more than `num_buffers` periods after the
+   first completion sees the lap folded into one mask and trips the same
+   assertion.
+3. **A completion posted between soundd's read and the stop landing**, which
+   arrives on the idle poll against a full free list.
+
+None of the three is reachable on virtio-sound, which is why gate A never saw
+any of them, and none of them is reachable in `hda_tone` either: its client
+keeps its ring full, so `deferred=0` on every run measured.
+
+Fixed by `Backend::pipeline` naming the difference and the three sites asking
+it. A ring gives up a period it cannot fill rather than holding it, fills in the
+engine's order off a cursor that follows the engine through a drain and a stop,
+and never defers. `unplayed` replaces `free_mask.count_ones() == num_buffers` at
+the two drain sites — the same number on a queue and the only correct one on a
+ring. `stream::decode` reads the engine's position back off every mask.
+
+**The first version stepped that cursor itself and asserted the next mask
+matched it, and the 12-wide phase killed it in one run.** `ISR.mask` accumulates
+across interrupts, so what a late driver reads is the OR of several `completed`
+calls — and at `max_wake_lat_us` in the tens of milliseconds that is `0xff`, a
+whole lap, which places the engine nowhere. A stepped cursor would have to be
+right about how many laps went by; a derived one cannot drift. `Completed::Lapped`
+is that answer said in words, and it is the drain §5.9 already counts. The wide
+phase constructed a state five deliberate `hda_client_stall` runs did not.
+
+Gate: `hda_client_stall`, a client that stops producing for 60 ms (two and a
+half laps) and then plays a second stream so a resume is under test too, on both
+machines. Both arms are asserted and must differ — the ring must report
+underruns and hold nothing, the queue must defer — so neither of the two wrong
+fixes goes green. Unfixed on this tree: the ring arm panics and the run times
+out at 120 s. Fixed: ring `underruns=128 deferred=0`, queue `deferred=539`.
+
+**Not verified on the T14.** QEMU's `intel-hda` and the laptop's controller are
+different devices and only the owner can boot the second. What the next metal
+boot should show: `tone` playing to completion with soundd alive, and soundd's
+stats line reporting `deferred=0` with `underruns` nonzero if the client ever
+stalls. A `the engine completed 0x.., which is no walk of an 8-period ring`
+panic would be new, and would mean the T14's `SDnLPIB` moves in a way
+`stream::completed` cannot walk — the first evidence that this design's one
+position source is the wrong one there (§2.4's `position_fix` paragraph).
+
 **EXPECTED RED, pending #88 — HDA: the captured tone is not one sine.**
 `hda_tone` plays the same 3.0 s 440 Hz tone the virtio arm plays, out of an
 `intel-hda` controller soundd drives itself, and the capture comes back with
@@ -2827,10 +3060,36 @@ Evidence, and why it does not yet name a cause:
   overrun; both are host-side and neither is established.
 
 Where to start: QEMU's `hw/audio/hda-codec.c` output ring against soundd's
-eight-period pipeline, and then `kernel/src/drivers/hda.rs`'s `isr_complete` —
-whose `SDnLPIB`-derived mask is the one thing on the guest side that could hand
-soundd a buffer the engine has not finished with. **Do not weaken the check to
-make it green**; the virtio zero is what says it has teeth.
+eight-period pipeline. **Do not weaken the check to make it green**; the virtio
+zero is what says it has teeth.
+
+**2026-08-07: one guest-side cause found and fixed, and it is not the whole of
+it.** soundd filled a completion batch lowest-index-first, so a batch that
+wrapped the ring — `{6,7,0,1}` — was filled 0, 1, 6, 7 and played 6, 7, 0, 1.
+That is a splice with no silence in it, which is this signature exactly. Six
+`hda_tone` runs in one session, instrumented with a counter of fills that were
+not in the engine's order, separated cleanly: **one run at `out_of_order=2`,
+`max_batch=7`, 9 phase breaks; five at `out_of_order=0`, `max_batch=4`, 0
+breaks.** It is fixed (see the entry below) and the fill order is now the
+engine's by construction.
+
+**The breaks survive it.** Two runs on the fixed tree gave 8 and 6, with
+`deferred=0` and an ordering that can no longer be wrong. So the ordering was a
+contributor and not the cause, and the remaining one is still unnamed. What the
+new numbers add:
+
+- The break count tracks **soundd's own wake lateness**, which on this host is
+  the host descheduling QEMU: 0 breaks at `max_wake_lat_us` 8626–8752 (five
+  runs), 8 at 22525, 9 at 16730, 6 at 50837. Nothing in the guest changed
+  between them.
+- soundd put **1127 periods = 144,256 frames** on the wire and the capture holds
+  **131,061** — 9.1% of what was submitted is not in the file, with `gaps none`
+  and `underruns 0`. On the run at 6 breaks it is 10.8%. A capture missing a
+  tenth of its samples has phase breaks whatever the guest did.
+
+So the next step is the host side. `isr_complete` is a weaker candidate than it
+was: `stream::decode` now refuses any mask that is not a walk of the ring, and
+soundd fills in the order that walk names rather than in index order.
 
 Spec: `specs/audio-subsystem-spec.md`. Numbered as in the 2026-07-28 audit;
 (1) — see the re-filing below; it was never an SQ overrun — (2) `CommandRing::push` assert, (3) ungated
@@ -3431,6 +3690,30 @@ Cosmetic today. It stops being cosmetic the moment anything gates on it.
 
 ## 5. Diagnostics
 
+### OPEN — `screen_blocked_dump` is `Sched::Parallel` and reds in the wide phase
+
+```
+FAIL screen_blocked_dump: the panel does not carry "cpu(s) answered", so a
+     photograph of this machine answers nothing
+  FAIL  screen_blocked_dump  (3s)
+  ALONE screen_blocked_dump: GREEN — it fails only beside other guests, so its
+        Sched::Parallel is wrong. The run stays red on the classification.
+```
+
+Twice on 2026-08-07 on a quiet host — once in a plain `cargo test` and once in a
+226.5 s `--land` gate — both times green on the lone re-run, and green in a
+third gate on the same tree. So it is intermittent rather than reproducible, and
+the harness's own rule is the finding: a test that fails only beside other
+guests is misclassified, not flaky.
+
+What it asserts is a *count*, that every CPU answered the blocked-task dump
+inside the 250 ms budget before the NMI path takes over. That is a wall-clock
+margin, and `specs/test-cost-audit.md` §3.3 puts those in the serial tail. The
+one-word fix is `Sched::Serial` (`tests/toyos.rs` line 206); it is not taken
+here because it costs a tail slot, because it belongs to whoever owns
+`sched/dump.rs`, and because two samples of an intermittent test are two
+samples.
+
 ### OPEN — QEMU 11.0.3 sets `ECAP.PT`, so `Iova::identity`'s comment gives a false reason for correct behaviour
 
 Measured 2026-08-05 off the `hda_probe` boot, in the unit configuration
@@ -3581,6 +3864,33 @@ or removes it by accident.
 
 What is left of this entry: `ps` and `stats` still have no cross-CPU view of
 anything the handles do not publish.
+
+#### OPEN — `screen_blocked_dump` is intermittent *alone*, and the reason is the report's own design
+
+Measured 2026-08-07 in one session, five runs a side, the same host: **three
+green and two red on `main` at `48147c2`, three green and two red on
+`wt/toyos-wedge`.** So it is not a parallel-phase flake — it reds with the host
+to itself and at the same rate on an untouched tree. `ALONE: red again` on this
+test therefore means nothing on its own, and the harness's own re-run cannot
+classify it.
+
+The failing assertion is always `cpu(s) answered`, never `== VERDICT:` or `==
+deadlines:` — the *first* of the three summary lines, i.e. the one furthest from
+the bottom. That is the mechanism: `paint_report` shows `Page::Last` of the log
+**ring**, not of the dump, so anything logged while the dump is being assembled
+— a compositor stats line, soundd — lifts the top of the summary off the
+screenful a photograph would catch. The dump is machine-wide and the machine is
+still running, so there is always something else writing.
+
+Two consequences, neither fixed here:
+
+- **The instrument's own contract is weaker than the entry above claims.** "The
+  summary is last, so last is what a photograph catches" is true of the summary's
+  last *line* and not of the summary. On the owner's T14 that is the difference
+  between a photograph that says how many CPUs answered and one that does not.
+- **The test asserts on a screenful whose contents it does not control.** A fix
+  that made the summary one line, or had `paint_report` show the dump's own tail
+  rather than the ring's, would close both halves at once.
 
 ### CPU attribution: the recorded "half the CPU is unattributed" claim was wrong
 
@@ -4420,6 +4730,113 @@ lands in `git log <base>..toyos` and would put ToyOS lint policy into every
 upstream PR the estate sends. Plan, procedure and the standing-mechanism
 question: `specs/fork-lint-audit-plan.md`. It needs a quiet tree, because
 path-overriding the forks changes what every build in the repo resolves.
+
+### A fork pin is a moving branch frozen per workspace, and nothing re-reads it
+
+`[patch]` names a *branch*; a lockfile records the rev that branch pointed at
+when that workspace was last resolved. Six workspaces in the tree resolve fork
+branches independently — the root, `toyos-cc/`, `userland/`,
+`tests/toyos-rust-tests/`, `tests/toyos-rust-tests/tls-cranelift/`, and the
+`rust/` submodule (which has two of its own). Push to a fork and every one of
+them keeps the old rev until somebody happens to run `cargo update` in it. There
+is no mechanism that notices, and no build that fails.
+
+Measured 2026-08-07, before the fix in this branch: six pins were behind their
+branch head, and two crates were pinned at *two different revs at once*.
+
+- `libloading` — `fa0abe77` in `rust/Cargo.lock`, `2ca5f54b` in both
+  `userland/Cargo.lock` and `tests/toyos-rust-tests/Cargo.lock`.
+- `target-lexicon` — `45832ce6` in
+  `rust/compiler/rustc_codegen_cranelift/Cargo.lock`, `50da81b3` in `Cargo.lock`,
+  `toyos-cc/Cargo.lock` and `tests/toyos-rust-tests/tls-cranelift/Cargo.lock`.
+  Two commits, and the one in the gap is semantic: `9aeabf5` adds
+  `OperatingSystem::Toyos` to the SysV arm, so `Triple::default_calling_convention()`
+  answered `Err(())` for ToyOS in `toyos-cc` and `SystemV` in cranelift. It was
+  latent only because `CallConv::triple_default` folds `Err(())` into `SystemV`
+  anyway (`cranelift-codegen-0.128.4/src/isa/call_conv.rs`) — a consumer that
+  treated the error as an error would have diverged outright.
+- `mio`, `socket2`, `tokio` — one `.gitignore` commit behind in
+  `userland/Cargo.lock`; hygiene only.
+- `raw-window-handle` — `76c4971c` where the branch head was `c39042b5`. This
+  one had teeth: `forks.toml` claims the `toyos` branch is byte-identical to the
+  head of PR #223, and that claim is about the *branch*, so the pinned tree was
+  the pre-alignment one. The suite was validating code we had not sent and not
+  validating code we had.
+
+The `rust/` submodule's own eight pins were all at branch head, so this is a
+monorepo-side drift, not an estate-wide one.
+
+**The check that would catch it does not exist, and its shape is a decision for
+the owner.** Compare each lockfile's `git+…#rev` against `git ls-remote <url>
+<branch>` and fail on a mismatch. That catches all six. It also puts GitHub on
+the path of whatever runs it, so it must not be a `cargo test` member or part of
+the landing gate — an on-demand `cargo run -- --check-forks`, run when the estate
+is touched, is the shape that costs nothing when the network is down. The purely
+offline alternative — assert every lockfile agrees with every other about a
+`(repo, branch)` pair — needs no network but is vacuous in a worktree, where
+`rust/` is not checked out: it would have caught neither `libloading` nor
+`target-lexicon` from where an agent actually works, and nothing at all for the
+four crates that appear in exactly one lockfile. Not worth building.
+
+### Two winit clones exist, and the canonical one is the stale one
+
+`/Users/jan/Dev/jan/forks/winit` is at `be9ec72c`; `/Users/jan/Dev/jan/winit` is
+at `faf99eb7`, which is `origin/toyos` and the rev every lockfile pins. Both are
+clean and on `toyos`. `.cargo/config.toml.example` documents `../forks/<name>` as
+the path-override convention, so `forks/winit` is the one an agent told to edit
+"the winit fork" will find and path-override — and it is a commit behind, which a
+path override silently substitutes for the pinned tree.
+
+Outside the repo, so no commit fixes it: the owner should delete
+`/Users/jan/Dev/jan/winit` (nothing is unpushed in it) or fast-forward
+`forks/winit` and delete the stray. No other fork has a duplicate — checked
+across all 13 clones under `forks/`.
+
+### Every fork clone still carries its pre-rebase history, on no remote
+
+`git rev-list <branch> --not --remotes` over the 13 clones finds **66 commits
+reachable from no remote ref at all**, every one of them on a local `master` or
+`main`: cpal 9, mio 11, socket2 8, libloading 8, stacker 6, getrandom 5,
+target-lexicon 4, memmap2 4, ctrlc 3, tokio 3, russh 2, raw-window-handle 1,
+softbuffer 1, winit 1. They are the original ToyOS work committed straight onto
+each fork's `master` before the 2026-07-28 re-basing built the clean `toyos`
+branches on pinned upstream bases — the commit titles are the tell (`Add brief
+README for ToyOS fork orientation`, `Add .DS_Store to gitignore`, target-lexicon's
+`hack: silence warnings`), and that cruft is exactly what `forks.toml`'s header
+says was reverted.
+
+**Nothing is lost, checked rather than assumed.** For every fork, `origin/toyos`
+is identical to `master` on the ToyOS-specific paths or ahead of it: socket2,
+mio, winit, softbuffer, stacker, libloading, ctrlc byte-identical; cpal's
+`src/host/toyos/mod.rs` differs +108/-61 with `toyos` holding the newer futex
+state machine and `PERIOD_FRAMES` that master's `AtomicBool`/`BUFFER_FRAMES`
+predate; raw-window-handle's +44/-5 is the PR-alignment commit; memmap2's
+`src/toyos.rs` exists only on `toyos`; getrandom's `toyos-0.2` carries it at the
+0.2-era path `src/toyos.rs` rather than `src/backends/`.
+
+So this is dead history, not work. But it is genuinely unpushed, which is the
+honest answer to whether the estate is clean and pushed, and it is what makes
+`git log --all` in any of those clones misleading. Deleting the local `master`
+branches is the obvious close — outside the repo and the owner's call, and
+explicitly not something an agent should do on its own, since a fork's history
+is what an upstream PR is made of.
+
+### A `toyos` branch mostly has no upstream, so `git status` cannot say if it is pushed
+
+13 of the 16 consumed and PR branches across `forks/` have no tracking ref:
+`git for-each-ref --format='%(refname:short)|%(upstream:short)' refs/heads` gives
+`NO UPSTREAM` for cpal, ctrlc, getrandom (all three), mio, raw-window-handle,
+socket2, softbuffer, stacker, target-lexicon, tokio and winit. Only libloading,
+memmap2 and russh track `origin/toyos`, and target-lexicon's `add-toyos-os`
+tracks `upstream/main` — which is why it reads `ahead 1` rather than in sync.
+
+The consequence is that `git status` on a fork's `toyos` branch prints `## toyos`
+and nothing else: the ordinary way to ask "have I pushed this?" is silently
+unanswerable in the clones where the answer matters. Every one of them happened
+to be in sync on 2026-08-07, established by comparing `rev-parse HEAD` against
+`rev-parse origin/<branch>` rather than by reading `git status`. One
+`git branch -u origin/<branch> <branch>` per clone fixes it; outside the repo,
+so the owner's hands.
 
 ### The `memmap2` fork is 165 lines of unreachable code
 
@@ -6600,6 +7017,47 @@ Two things the QEMU gates do *not* cover, both structural:
   runs immediately before `i8042::init` and clears the controller's SMI enables,
   which is the reason to expect the trap to be disarmed by then — argued, never
   observed.
+
+### OPEN — the T14's firmware hands over an *uninitialised* 8042 about one boot in seven, and the fallback has nothing to stand on there
+
+Found in `specs/metal-logs/2026-08-07-freeze/`, seven consecutive boots of one
+image. Six read `cfg=0x77->0x64`. `222741` reads `cfg=0x30->0x60`, and the
+driver disabled the keyboard by name:
+
+```
+i8042: kbd DISABLED - the set query answered 0xee and firmware's cfg 0x30 has
+       translate off, so nothing says what the wire carries
+```
+
+**Subtract our own two commands and the number says more than the message
+does.** `before` is read *after* `CMD_DISABLE_PORT1` and `CMD_DISABLE_AUX`, so
+bits 4 and 5 of it are always ours. Firmware's byte was therefore `0x47` on the
+six — kbd IRQ, aux IRQ, system flag, translate — and **`0x00` on the seventh**.
+Bit 2 is the system flag POST sets to say it has initialised the controller. So
+that boot was handed an 8042 in its power-on default: firmware had not touched
+it at all.
+
+The refusal is correct as written and this is not a request to weaken it. What
+the entry records is that **the evidence the fallback rests on is not always
+there**, on this machine, at a rate of roughly one boot in seven — and the cost
+when it is absent is the whole of the machine's integrated input, because the
+refusal returns before the aux port too. The owner sees a desktop with a dead
+keyboard and a dead TrackPoint, and the one line saying why is in a log he can
+only read after rebooting. In the 2026-08-07 set that boot is one of the five
+"freezes", and it is not one.
+
+Two smaller things fall out and neither is fixed:
+
+- **The message calls `0x30` "firmware's own cfg" and two of its bits are
+  ours.** The inference is untouched — bit 6 is firmware's — but the label
+  overclaims, and the value a reader is asked to reason about is not the value
+  the sentence names.
+- **What a correct answer would even be is a policy question, not a bug.** The
+  controller is put into translating mode by `wanted` regardless of what
+  firmware left, so the open question is only what the *device* emits, and on
+  this EC neither `0xF0 0x00` nor `0xF2` may be asked (see the entry below).
+  Guessing is the outcome the read-back exists to prevent; refusing costs the
+  keyboard. It is the owner's call which way this machine should fail.
 
 ### The T14's keyboard will not report its scancode set, and one byte reached no event
 

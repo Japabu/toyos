@@ -93,8 +93,25 @@
 //! `log_file::poll`, so the line it appends is flushed by the very next
 //! statement through the path that already exists — and the pre-halt recheck's
 //! `file_has_pending` keeps this CPU awake until it is. No second flush
-//! mechanism, and nothing here takes a lock: a heartbeat that could block would
-//! be a diagnostic that stops for the reason it exists to report.
+//! mechanism, and nothing here waits on a lock: a heartbeat that could block
+//! would be a diagnostic that stops for the reason it exists to report. The one
+//! lock in reach is the I/O APIC topology, behind `i8042::report_line`'s
+//! `try_lock`, which prints `rte=busy` rather than waiting.
+//!
+//! # The line beside it
+//!
+//! `alive=` and `ran=` answer *is the machine running* and *is it running
+//! anything*. On the T14 they leave one question they cannot reach: a desktop
+//! that is alive, has nothing to do and never will again, because the one
+//! channel that could give it something has stopped. Four boots of 2026-08-07
+//! end at the same `spawn:` line with every CPU quiescent, and a fifth had no
+//! keyboard at all by the driver's own fail-closed decision — the same file
+//! either way. So [`crate::drivers::i8042::report_line`] prints the state of
+//! the pin beside every heartbeat: the controller's status byte and both
+//! redirection entries, raw. `alive=8/8 ran=0` above `status=0x15` is a
+//! controller holding a byte nobody will ever read; above a masked entry it is
+//! a line that got switched off; above a clean one with the counters flat it is
+//! a machine whose EC has stopped talking, and this kernel is out of it.
 //!
 //! # Cost
 //!
@@ -212,6 +229,13 @@ pub fn poll() {
         "heartbeat: t={ts}.{tms:03}s alive={alive}/{cpus} mask={mask:#04x} ran={ran} \
          gap={gs}.{gms:03}s"
     );
+
+    // Beside the heartbeat rather than on a cadence of its own, so a reader can
+    // pair the two by eye. `alive=8/8 ran=0` says the machine is running and
+    // running nothing; whether that is a machine with nothing to do or a machine
+    // whose input died is what the next line answers, and on the T14 there is no
+    // third channel to ask it on.
+    crate::drivers::i8042::report_line();
 
     // A CPU that is missing gets a line naming it, because the summary says
     // only how many. Bounded by the CPU count, and silent on a healthy machine.
