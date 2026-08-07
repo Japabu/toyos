@@ -10005,12 +10005,26 @@ fn main() {
     }
 
     if let Some(iterations) = audio_gate {
-        let audio_to_run: Vec<&str> = AUDIO_TESTS
+        let mut audio_to_run: Vec<&str> = AUDIO_TESTS
             .iter()
             .copied()
             .filter(|n| filter.map_or(true, |f| n.contains(f)))
             .collect();
         assert!(!audio_to_run.is_empty(), "no audio test matches filter {filter:?}");
+        // Sharded too, and this is the tier it buys the most for: the thorough
+        // tier is N boots per config taken one at a time by construction, so
+        // splitting it is the only thing that shortens it. A filter cannot do
+        // the same job — `audio_tone` is a substring of `audio_tone_load`.
+        if let Some(shard) = shard {
+            shard.keep(&mut audio_to_run, 0u32, |_| 1);
+            assert!(
+                !audio_to_run.is_empty(),
+                "shard {}/{} owns no audio config, and a gate that ran nothing would \
+                 report itself green",
+                shard.index,
+                shard.count,
+            );
+        }
         let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
         // One slot for the whole tier: it boots one guest at a time for the
         // length of it, so one slot is what it occupies. The owner has ruled

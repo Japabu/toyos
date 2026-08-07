@@ -1,0 +1,77 @@
+name: gate A, thorough
+
+# `tests/audio-baseline.toml`'s thorough tier, one audio test per job.
+#
+# The tier is N boots per config taken strictly one at a time, so it is the one
+# thing in this tree that a second machine shortens rather than perturbs — and
+# each job's guest has a runner to itself, which is the quiet host the recorded
+# sample was attested on and the dev host can no longer offer.
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: iterations per config
+        required: true
+        default: '30'
+      ref:
+        description: branch to run against
+        required: false
+
+concurrency:
+  group: gate-a-${{ github.ref }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: unlock kvm
+        run: sudo chmod 666 /dev/kvm
+
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            qemu-system-x86 ovmf zstd
+
+      - id: key
+        run: |
+          sum=$(git rev-parse HEAD:rust HEAD:toyos-abi/src HEAD:toyos/src \
+                              HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          echo "tag=toolchain-linux-x86_64-$sum" >> "$GITHUB_OUTPUT"
+
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ steps.key.outputs.tag }}" \
+            -p 'toyos-toolchain.tar.zst' -O /tmp/toolchain.tar.zst
+          mkdir -p rust/build
+          zstd -dc /tmp/toolchain.tar.zst | tar -C rust/build -x
+          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+
+      # The host conditions line every run prints is the point of running it
+      # here, so nothing is captured away from it.
+      - name: gate
+        run: |
+          cargo test --test toyos-build -- \
+            --audio-gate ${{ inputs.iterations }} \
+            --shard ${{ matrix.shard }}/2 --host-slots 0 2>&1 | tee /tmp/gate-a.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: the sample, whatever the verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-a-shard-${{ matrix.shard }}
+          path: /tmp/gate-a.log
+          retention-days: 30
