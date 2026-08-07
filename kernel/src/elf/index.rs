@@ -36,7 +36,8 @@ pub fn parse_rela_entries(rela_data: &[u8], jmprel_data: &[u8]) -> Option<Parsed
     // conservative ceiling has to assume, since any one group can be the whole
     // table.
     let widest = core::mem::size_of::<(u64, u32, i64)>();
-    if counts.max().checked_mul(widest).is_none_or(|b| b > MAX_HEAP_ALLOC) {
+    let kept = [RelocKind::Relative, RelocKind::GlobDat, RelocKind::Tpoff64, RelocKind::Tpoff32];
+    if counts.max_of(&kept).checked_mul(widest).is_none_or(|b| b > MAX_HEAP_ALLOC) {
         log!("ELF: {:?} will not fit one allocation", counts);
         return None;
     }

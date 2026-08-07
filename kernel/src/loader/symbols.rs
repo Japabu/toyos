@@ -16,12 +16,29 @@ use toyos_elf::section::{SectionTable, SHT_SYMTAB};
 use toyos_elf::sym::SymTab;
 use toyos_elf::Layout;
 
-/// Every defined, named symbol in a table, at its runtime address.
-pub fn map_from<'a>(symbols: &SymTab<'a>, base: UserAddr) -> HashMap<&'a str, UserAddr> {
+/// Every defined, named symbol in `.dynsym`, at its runtime address.
+///
+/// No binding filter: `.dynsym` is the table of symbols the linker meant to
+/// expose, so being in it and defined is the export.
+pub fn dynamic_map<'a>(symbols: &SymTab<'a>, base: UserAddr) -> HashMap<&'a str, UserAddr> {
+    map(symbols, base, |_| true)
+}
+
+/// The same over `.symtab`, which holds every symbol the binary has —
+/// including its locals, which no other module may bind to.
+pub fn static_map<'a>(symbols: &SymTab<'a>, base: UserAddr) -> HashMap<&'a str, UserAddr> {
+    map(symbols, base, |s: &toyos_elf::Sym| s.is_exported())
+}
+
+fn map<'a>(
+    symbols: &SymTab<'a>,
+    base: UserAddr,
+    keep: impl Fn(&toyos_elf::Sym) -> bool,
+) -> HashMap<&'a str, UserAddr> {
     let mut map = HashMap::with_capacity(symbols.count());
     for (i, sym) in symbols.defined() {
         let name = symbols.name(i);
-        if !name.is_empty() {
+        if !name.is_empty() && keep(&sym) {
             map.insert(name, base + sym.value);
         }
     }

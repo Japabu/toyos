@@ -160,7 +160,12 @@ fn counts_are_per_kind_over_every_table() {
         counts,
         RelaCounts { relative: 1, bind: 2, tpoff64: 1, tpoff32: 1, dtpmod64: 0, dtpoff64: 0 },
     );
-    assert_eq!(counts.max(), 2);
+    // The ceiling is over the kinds a caller reserves for, never over every
+    // kind: a bound on one nothing stores refuses a file for a collection that
+    // does not exist.
+    assert_eq!(counts.max_of(&[RelocKind::GlobDat, RelocKind::Tpoff32]), 2);
+    assert_eq!(counts.max_of(&[RelocKind::DtpMod64]), 0);
+    assert_eq!(counts.max_of(&[]), 0);
 }
 
 // ── Symbol tables ───────────────────────────────────────────────────────

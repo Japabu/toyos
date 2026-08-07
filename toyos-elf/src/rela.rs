@@ -164,20 +164,27 @@ impl RelaCounts {
         counts
     }
 
-    /// The largest single count. Every one of them is reserved at the widest
-    /// record's size, so this is what a per-collection ceiling has to hold.
-    pub fn max(&self) -> usize {
-        [
-            self.relative,
-            self.bind,
-            self.tpoff64,
-            self.tpoff32,
-            self.dtpmod64,
-            self.dtpoff64,
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(0)
+    /// The largest of the counts a caller actually reserves for.
+    ///
+    /// Deliberately not "the largest count": a ceiling on a kind nothing
+    /// stores refuses a file over a collection that does not exist, and a
+    /// library is about 99.5 % `RELATIVE` — so a cache that bounded itself on
+    /// `relative`, which it keeps none of, would refuse to cache every real
+    /// library in the tree.
+    pub fn max_of(&self, kinds: &[RelocKind]) -> usize {
+        kinds.iter().map(|&k| self.count_of(k)).max().unwrap_or(0)
+    }
+
+    pub fn count_of(&self, kind: RelocKind) -> usize {
+        match kind {
+            RelocKind::Relative => self.relative,
+            RelocKind::GlobDat | RelocKind::JumpSlot => self.bind,
+            RelocKind::Tpoff64 => self.tpoff64,
+            RelocKind::Tpoff32 => self.tpoff32,
+            RelocKind::DtpMod64 => self.dtpmod64,
+            RelocKind::DtpOff64 => self.dtpoff64,
+            RelocKind::Other(_) => 0,
+        }
     }
 }
 

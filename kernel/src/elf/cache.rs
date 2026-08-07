@@ -47,7 +47,12 @@ pub struct CachedRelocs {
 fn prescan_relocs(lib: &LoadedLib) -> Option<CachedRelocs> {
     let counts = RelaCounts::of(lib.relocations());
     let widest = core::mem::size_of::<(u64, u32, i64)>();
-    if counts.max().checked_mul(widest).is_none_or(|b| b > MAX_HEAP_ALLOC) {
+    // Only the kinds this keeps. `relative` is 99.5 % of a real library and
+    // none of them are stored, so bounding on it would refuse to cache
+    // every library in the tree.
+    let kept = [RelocKind::GlobDat, RelocKind::Tpoff64, RelocKind::Tpoff32,
+        RelocKind::DtpMod64, RelocKind::DtpOff64];
+    if counts.max_of(&kept).checked_mul(widest).is_none_or(|b| b > MAX_HEAP_ALLOC) {
         log!("dlopen: prescan {:?} will not fit one allocation, not caching", counts);
         return None;
     }

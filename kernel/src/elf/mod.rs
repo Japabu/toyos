@@ -123,10 +123,18 @@ impl LoadedLib {
     /// replaces was an `expect("no dynsym")` that four separate callers each
     /// happened to guard with a different check.
     pub fn symbols(&self) -> SymTab<'_> {
-        match (&self.dynsym, &self.dynstr) {
-            (Some(syms), Some(strs)) => unsafe { SymTab::new(syms.as_slice(), strs.as_slice()) },
-            _ => SymTab::empty(),
-        }
+        let Some(syms) = &self.dynsym else {
+            return SymTab::empty();
+        };
+        // A module with `DT_SYMTAB` and no `DT_STRTAB` still has that many
+        // symbols; it just cannot name any of them, and an unnamed symbol
+        // matches nothing. Losing the *count* would instead make every
+        // relocation naming one look out of range.
+        let strs: &[u8] = match &self.dynstr {
+            Some(strs) => unsafe { strs.as_slice() },
+            None => &[],
+        };
+        unsafe { SymTab::new(syms.as_slice(), strs) }
     }
 
     pub fn sym_count(&self) -> usize {

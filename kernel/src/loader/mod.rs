@@ -454,11 +454,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             .is_none()
             .then(|| symbols::read_symtab(backing.as_ref(), &layout))
             .flatten();
-        let symbols = match &fallback {
-            Some((syms, strs)) => SymTab::new(syms, strs),
-            None => exe.symbols(),
+        let exe_sym_map = match &fallback {
+            Some((syms, strs)) => {
+                symbols::static_map(&SymTab::new(syms, strs), UserAddr::new(base))
+            }
+            None => symbols::dynamic_map(&exe.symbols(), UserAddr::new(base)),
         };
-        let exe_sym_map = symbols::map_from(&symbols, UserAddr::new(base));
         log!("dynamic: {} exe symbols available to libraries", exe_sym_map.len());
         for lib in &loaded_libs.libs {
             elf::resolve_lib_bind_relocs(lib, &exe_sym_map, &loaded_libs.libs);
