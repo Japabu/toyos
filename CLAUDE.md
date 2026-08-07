@@ -92,6 +92,7 @@ The kernel ABI and SDK are Rust-native and capability-shaped. POSIX compatibilit
 
 - `cargo run` builds everything (toolchain, kernel, bootloader, userland, initrd) and launches QEMU.
 - `cargo run -- --build-only` builds everything without launching QEMU.
+- **Every guest binary is built with `[profile.toyos]`** — opt-level 2, debug info, debug-assertions and overflow-checks **on** — declared by each crate root the image is made of and passed by `build::cargo_build`, the one place cargo is invoked for a guest target. There is no `--release` flag: it bundles four knobs and turns two of them off silently, and both crafted-ELF kernel panics in known-issues were *found* by an overflow check. `build::assert_overflow_checked` refuses to write an image whose kernel does not reference `attempt to add with overflow`, so this is checked per build rather than per test. `userland/libc` is the one exception and says so where it is.
 - `cargo test` runs integration tests (boots QEMU headless, runs test harness inside ToyOS).
 - `cargo test -- --nocapture` same but with serial output visible.
 - `cargo test -- process_stats` runs only tests matching "process_stats" (substring filter).
@@ -146,6 +147,8 @@ console/system.toml  The same, for `--console-boot`: /bin/console and a shell
 ```
 
 ## Debugging
+
+**A backtrace is named from the binary's own file.** `loader::symbols::read_backtrace_table` reads `.symtab` and `.strtab` off whatever backs the executable into contiguous 2 MiB pages the process owns, so a program run from a disk gets the same report as one run from the initrd — `FileBacking::memory_ptr` is gone, and with it the one thing the initrd was load-bearing for. `SymbolTable` still resolves by raw-pointer scan with no allocation and no lock, because the fault handler and the panic handler call it. `MAX_SYMBOL_BYTES` is 16 MiB and a binary past it gets bare addresses and a log line, never a failed spawn. **There is no DWARF anywhere** — `toyos-ld` drops every debug section — so a frame can carry a name and never a line number. Gate: `disk_backtrace`.
 
 **LLDB via QEMU** — All binaries are PIE, addresses change every boot. Parse serial output for `Kernel memory located at: 0x...` to load symbols with `--slide`. For userland, serial logs pid and base address at `spawn:`. Use `breakpoint set -r <pattern>` for Rust symbols (not `-n`, which doesn't work with `::` paths).
 
@@ -225,6 +228,8 @@ Eight bite an agent who is *not* working on the subsystem:
 - **A landing gate red on a test that is green alone is the host, and it is what currently makes `--land` a coin toss.** Four suites in one session on one branch: the only clean 289/289 took **182.7 s**, the three red ones 559, 576 and 705 s, and every red was a `Sched::Parallel` test whose verdict is a wall-clock margin — `desktop_audio_client` at 385 s wide against 13 s alone. `ALONE: GREEN` means what it says; `ALONE: red again` means nothing on a loaded host and needs an A/B against `main` in the same session. Known-issues §7 has the class and what closing it would cost. This is not a licence to re-run an audio harm verdict away — that ruling is unchanged.
 
 - **Gate A's fast tier reds intermittently, on `main` as much as on your branch.** `audio_tone_load (smp=1)`: four red runs and three green in one session, with the same tree on both sides of the line. Before believing it is yours, stash and re-run — known-issues §4 has that A/B and the numbers.
+
+- **The suite reds under load on a five-second TLB stall, and the load is the variable.** Same 289 tests, one session: 12-wide reds 2 and then 5; 4-wide on a quiet host passes all 289 in half the wall clock; 4-wide against a second worktree's suite reds 4, three of them the same victims. Every victim's capture carries `tlb: cpu N has not flushed … it is not taking interrupts`, and every one passes alone on `main` too. `--land --gate cargo test --test toyos-build -- --jobs 4` gets through on an idle host and fixes nothing. Known-issues §4 has the four-row table.
 
 - **A boot that wedges before the idle loop produces no serial output at all** — the log ring's only drains are the timer tick and the idle loop, and neither runs during the boot phases. It looks exactly like a kernel that never started. Known-issues §5 carries the one-line patch that makes one bisectable.
 - **`Command::output()` returns an empty stderr, always** — the toyos `output` asks `spawn` for the pipe and then drops it. A guest test asserting on a child's refusal message passes vacuously. Use `spawn()` + `wait_with_output()`.
