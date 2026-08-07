@@ -10,8 +10,14 @@ init = [
     "/bin/netd",
 ]
 
-hosted-rustc = true
+hosted-rustc = false
 assets = ["assets"]
+
+# In the directory and not in git, on purpose: 5.99 MB of SoundFont that doom
+# synthesises its music from. A sweep cannot tell it from a .DS_Store, so it is
+# named here, and a build that cannot find it stops rather than shipping a doom
+# with no music.
+untracked-assets = ["timgm6mb.sf2"]
 
 [programs]
 shell = {}

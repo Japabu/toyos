@@ -60,7 +60,6 @@ fn main() {
     }
 
     let debug = args.iter().any(|a| a == "--debug");
-    let release = args.iter().any(|a| a == "--release");
     let build_only = args.iter().any(|a| a == "--build-only");
     let dump_audio = args.iter().any(|a| a == "--dump-audio");
     let rebuild_toolchain = args.iter().any(|a| a == "--rebuild-toolchain");
@@ -121,7 +120,6 @@ fn main() {
     let image = toyos_build::build::build(
         &root,
         debug,
-        release,
         boot,
         rebuild_toolchain,
         claim_sysroot,
