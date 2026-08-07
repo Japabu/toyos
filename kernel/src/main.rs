@@ -60,7 +60,6 @@ mod listener;
 mod device;
 mod net;
 mod gpu;
-mod audio;
 mod shared_memory;
 mod user_ptr;
 mod vma;
@@ -536,9 +535,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     virtio_console::init(&pci_devices);
     virtio_net::init(&pci_devices);
 
-    if let Some((sound, audio_info)) = virtio_sound::init(&pci_devices) {
-        crate::audio::register(sound, audio_info);
-    }
+    virtio_sound::init(&pci_devices);
     drivers::hda::init(&pci_devices);
 
     if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(&pci_devices) {

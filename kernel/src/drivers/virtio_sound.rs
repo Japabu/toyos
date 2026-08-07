@@ -1,638 +1,539 @@
+//! The virtio-sound stub: bring-up, the virtqueues, and the allow-list.
+//!
+//! `specs/hda-driver-plan.md` §4.1 is the design and this device is the second
+//! to take that shape. **The line is who writes an address**, and a split
+//! virtqueue puts every address a virtio driver ever programs in one place: the
+//! descriptor table. So the three tables here live in a page no process maps,
+//! their chains are built once at bind out of offsets into a region the kernel
+//! allocated, and what the driver gets is the avail rings that select a chain by
+//! index, the used rings that say one came back, and one register write to ring
+//! the doorbell.
+//!
+//! Nothing here decides. Which stream, at what rate, in what format, when a
+//! period is published and when the stream runs are soundd's, and every one of
+//! them is a message the driver writes into a buffer of its own.
+//!
+//! Structure layouts and command codes come from the VirtIO 1.2 specification
+//! §5.14; the ones the kernel needs are the transfer header's size and nothing
+//! else, because the kernel never reads a response.
+
 use core::cell::UnsafeCell;
-use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use toyos_abi::audio::AudioCompletionRecord;
+use toyos_abi::syscall::{RegWidth, SyscallError};
+use toyos_abi::virtio_sound as abi;
 
 use super::pci::{PciDevice, MSIX_ENTRY};
-use super::virtio::{BufDir, DescSlot, UsedRingConsumer, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
+use super::virtio::{BufDir, UsedRingConsumer, VirtioDevice, Virtqueue, VirtqueueRegions,
+                    VIRTIO_F_VERSION_1};
 use super::DmaPool;
-use crate::mm::paging::CachePolicy;
 use crate::log;
+use crate::mm::paging::CachePolicy;
+use crate::mm::{KernelSlice, Mmio};
 use crate::shared_memory;
-use toyos_abi::audio::AudioInfo;
+use crate::sync::Lock;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const VIRTIO_SND_DEVICE: u16 = 0x1059; // 0x1040 + device_id 25
 
-const VIRTIO_SND_R_PCM_INFO: u32 = 0x0100;
-const VIRTIO_SND_R_PCM_SET_PARAMS: u32 = 0x0101;
-const VIRTIO_SND_R_PCM_PREPARE: u32 = 0x0102;
-const VIRTIO_SND_R_PCM_START: u32 = 0x0104;
-const VIRTIO_SND_R_PCM_STOP: u32 = 0x0105;
+/// The transfer header that leads every TX chain: one `le32` stream id, written
+/// by the driver into a buffer of its own. The kernel needs its *size* to build
+/// the chain and never its contents — QEMU derives the PCM byte count from the
+/// chain's total readable length minus this.
+const XFER_HEADER_BYTES: u32 = 4;
+/// The per-period status the device writes back: status and latency, two `le32`.
+const STATUS_BYTES: u32 = 8;
+/// One event: a code and its data.
+const EVENT_BYTES: u32 = 8;
 
-// Event codes (VirtIO 1.2 spec §5.14.6.1)
-const VIRTIO_SND_EVT_JACK_CONNECTED: u32 = 0x1000;
-const VIRTIO_SND_EVT_JACK_DISCONNECTED: u32 = 0x1001;
-const VIRTIO_SND_EVT_PCM_PERIOD_ELAPSED: u32 = 0x1100;
-const VIRTIO_SND_EVT_PCM_XRUN: u32 = 0x1101;
+/// The kernel-only DMA page: the three descriptor tables, and the TX used ring
+/// that only the interrupt handler consumes.
+const OFF_CTRL_DESC: usize = 0x0000;
+const OFF_EVENT_DESC: usize = 0x0400;
+const OFF_TX_DESC: usize = 0x0800;
+const OFF_TX_USED: usize = 0x0C00;
+const KERNEL_DMA_BYTES: usize = 0x1000;
 
-const VIRTIO_SND_S_OK: u32 = 0x8000;
+const _: () = {
+    use super::virtio::DESC_BYTES;
+    assert!(abi::CONTROL_QUEUE_SIZE as usize * DESC_BYTES <= OFF_EVENT_DESC - OFF_CTRL_DESC);
+    assert!(abi::EVENT_QUEUE_SIZE as usize * DESC_BYTES <= OFF_TX_DESC - OFF_EVENT_DESC);
+    assert!(abi::TX_QUEUE_SIZE as usize * DESC_BYTES <= OFF_TX_USED - OFF_TX_DESC);
+    assert!(abi::used_bytes(abi::TX_QUEUE_SIZE) <= KERNEL_DMA_BYTES - OFF_TX_USED);
+};
 
-// PCM formats (VirtIO 1.2 spec §5.14.6.6)
-const VIRTIO_SND_PCM_FMT_S16: u8 = 5;
+/// How many refused register accesses are named before the driver is told to
+/// stop asking. Policy, and the same one the HDA stub carries: a refusal is a
+/// driver bug worth reading, and an unbounded one is a userland process choosing
+/// how much log the machine spends.
+const MAX_NAMED_REFUSALS: usize = 16;
 
-// PCM rates (VirtIO 1.2 spec §5.14.6.7)
-const VIRTIO_SND_PCM_RATE_44100: u8 = 6;
-const VIRTIO_SND_PCM_RATE_48000: u8 = 7;
+// --- the interrupt handler ---
 
-/// The rates this driver can encode, best first. 44100 leads because it is
-/// what the mixer, the resampler and the gate's recorded counters are sized
-/// against; 48000 is the one every other device offers.
-const SUPPORTED_RATES: [(u32, u8); 2] = [
-    (44100, VIRTIO_SND_PCM_RATE_44100),
-    (48000, VIRTIO_SND_PCM_RATE_48000),
-];
-
-fn rate_code(hz: u32) -> Option<u8> {
-    let mut i = 0;
-    while i < SUPPORTED_RATES.len() {
-        if SUPPORTED_RATES[i].0 == hz {
-            return Some(SUPPORTED_RATES[i].1);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Pick a rate and channel count the device actually advertises.
+/// The handler's whole view of the device.
 ///
-/// The caps were queried, logged, and then ignored: `configure(44100, 2)` ran
-/// unconditionally. `None` means the device offers nothing this driver
-/// implements — audio is optional, so the machine boots without it rather than
-/// dying over a peripheral, but the log has to name the missing capability or
-/// the next person is decoding a bitmap by hand on a laptop with no serial.
-fn choose_params(info: &VirtioSndPcmInfo) -> Option<(u32, u8)> {
-    if info.formats & (1 << VIRTIO_SND_PCM_FMT_S16) == 0 {
-        log!("virtio-sound: no usable format — device offers {:#x}, driver needs S16 (bit {})",
-            info.formats, VIRTIO_SND_PCM_FMT_S16);
-        return None;
-    }
-
-    let mut rate = None;
-    let mut i = 0;
-    while i < SUPPORTED_RATES.len() {
-        let (hz, code) = SUPPORTED_RATES[i];
-        if info.rates & (1 << code) != 0 {
-            rate = Some(hz);
-            break;
-        }
-        i += 1;
-    }
-    let Some(rate) = rate else {
-        log!("virtio-sound: no usable rate — device offers {:#x}, driver needs 44100 (bit {}) or 48000 (bit {})",
-            info.rates, VIRTIO_SND_PCM_RATE_44100, VIRTIO_SND_PCM_RATE_48000);
-        return None;
-    };
-
-    // Stereo if the device takes it; soundd converts either way, so the only
-    // unusable case is a device whose minimum is more channels than we mix.
-    if info.channels_min > 2 {
-        log!("virtio-sound: no usable channel count — device needs at least {}, driver mixes at most 2",
-            info.channels_min);
-        return None;
-    }
-    let channels = if info.channels_max >= 2 { 2 } else { info.channels_max };
-    if channels == 0 {
-        log!("virtio-sound: device advertises a maximum of zero channels");
-        return None;
-    }
-
-    Some((rate, channels))
-}
-
-// Virtqueue indices, fixed by the virtio sound device specification.
-const CONTROL_QUEUE: u16 = 0;
-const EVENT_QUEUE: u16 = 1;
-const TX_QUEUE: u16 = 2;
-
-// Kernel-only DMA page layout (byte offsets). Virtqueue rings, control
-// buffers and xfer/status metadata must never be reachable from userspace —
-// a process that can rewrite descriptors can point the device at arbitrary
-// physical memory.
-const OFF_CONTROLQ: usize   = 0x0000;
-const OFF_EVENTQ: usize     = 0x1000;
-const OFF_TXQ: usize        = 0x2000;
-const OFF_CTRL_BUFS: usize  = 0x3000;
-const OFF_TX_META: usize    = 0x4000;
-const OFF_EVENT_BUFS: usize = 0x5000;
-const KERNEL_DMA_SIZE: usize = 0x6000;
-
-// Shared DMA page: PCM data only, granted to whichever process claims
-// DeviceType::Audio. AudioInfo.buf_offsets are relative to this page.
-const SHARED_DMA_SIZE: usize = TX_INFLIGHT_MAX * PERIOD_BYTES;
-
-const REQ_OFFSET: usize = 0x000;
-const RESP_OFFSET: usize = 0x800;
-
-const PERIOD_BYTES: usize = 512;
-
-// VirtIO sound structs (per VirtIO 1.2 spec, section 5.14)
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioSndHdr {
-    code: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioSndQueryInfo {
-    hdr: VirtioSndHdr,
-    start_id: u32,
-    count: u32,
-    size: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioSndPcmInfo {
-    hdr: u32, // info header: hda_fn_nid
-    features: u32,
-    formats: u64,
-    rates: u64,
-    direction: u8,
-    channels_min: u8,
-    channels_max: u8,
-    _padding: [u8; 5],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioSndPcmSetParams {
-    hdr: VirtioSndHdr,
-    stream_id: u32,
-    buffer_bytes: u32,
-    period_bytes: u32,
-    features: u32,
-    channels: u8,
-    format: u8,
-    rate: u8,
-    _padding: u8,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioSndPcmHdr {
-    hdr: VirtioSndHdr,
-    stream_id: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioSndPcmXfer {
-    stream_id: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioSndPcmStatus {
-    status: u32,
-    latency_bytes: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioSndEvent {
-    hdr: VirtioSndHdr,
-    data: u32,
-}
-
-const TXQ_SIZE: usize = 32;
-
-/// State the MSI-X ISR needs to drain txq completions without locks: the
-/// used-ring consumer plus the desc-id → buffer-index map. `consumer` is
-/// touched only by the ISR after init (the MSI-X vector targets a single
-/// CPU and the handler runs with IF=0, so it is never re-entered);
-/// `desc_to_buf` is additionally written by the submit path under the
-/// AUDIO lock.
+/// Written once, before the vector is armed, and read with no lock afterwards:
+/// the handler may interrupt a CPU holding [`CONTROLLER`].
 struct TxIsr {
     consumer: UnsafeCell<Option<UsedRingConsumer>>,
-    desc_to_buf: [AtomicU8; TXQ_SIZE],
+    /// Used-ring entries naming a descriptor that heads no chain. Counted here
+    /// and named once from the drain path — the avail ring is the driver's, so
+    /// this is a userland bug and a handler that logs is a handler that produces
+    /// work for the thing that failed.
+    stray: AtomicU32,
+    named_stray: AtomicBool,
 }
 
-// SAFETY: `consumer` is single-threaded by construction (written once at
-// init before the MSI-X vector can fire, then ISR-only); `desc_to_buf` is
-// atomic.
+// SAFETY: `consumer` is written once at init before the vector can fire and is
+// read only by the handler afterwards; every other field is atomic.
 unsafe impl Sync for TxIsr {}
 
 static TX_ISR: TxIsr = TxIsr {
     consumer: UnsafeCell::new(None),
-    desc_to_buf: [const { AtomicU8::new(0) }; TXQ_SIZE],
+    stray: AtomicU32::new(0),
+    named_stray: AtomicBool::new(false),
 };
 
-/// Drain the txq used ring from the MSI-X ISR. Returns the bitmask of
-/// completed buffer indices. Lock-free: descriptor recycling and
-/// inflight-mask clearing need the AUDIO lock, so they happen later on the
-/// syscall side (`SoundController::recycle`), driven by the records the
-/// ISR pushes.
-pub fn isr_drain_tx() -> u32 {
-    // SAFETY: sole accessor after init — see TxIsr.
+/// Drain the TX used ring and return the periods it completed.
+///
+/// A used entry names the head descriptor the driver published, and the driver
+/// publishes an index — so a head that is not a chain's is untrusted input, not
+/// a device fault, and is counted rather than asserted on.
+fn drain_tx() -> u32 {
+    // SAFETY: sole accessor after init — see `TxIsr`.
     let consumer = unsafe { &mut *TX_ISR.consumer.get() };
-    // A config-change interrupt can arrive on this vector before init has
-    // installed the consumer — nothing to drain yet.
+    // A configuration-change interrupt shares this vector and can arrive before
+    // init has installed the consumer.
     let Some(consumer) = consumer.as_mut() else { return 0 };
     let mut mask = 0u32;
-    while let Some(desc_id) = consumer.poll() {
-        assert!((desc_id as usize) < TXQ_SIZE, "virtio-sound: bogus used desc id {desc_id}");
-        // Relaxed suffices: the submit path stores the mapping before the
-        // avail-ring publish (Release fence in Virtqueue::submit), and the
-        // device writes the used entry only after consuming the avail entry;
-        // UsedRingConsumer::poll's Acquire fence completes the chain.
-        let buf = TX_ISR.desc_to_buf[desc_id as usize].load(Ordering::Relaxed) as u32;
-        mask |= 1 << buf;
+    while let Some(head) = consumer.poll() {
+        let idx = head as usize / abi::TX_CHAIN as usize;
+        if idx >= abi::PERIODS || head % abi::TX_CHAIN != 0 {
+            TX_ISR.stray.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        mask |= 1 << idx;
     }
     mask
 }
 
-pub(crate) const TX_INFLIGHT_MAX: usize = 8;
+/// Rust half of the MSI-X handler, called from the IDT entry.
+pub fn isr_complete() {
+    // Timestamp first — this is the hardware-completion time the DLL feeds on.
+    let timestamp = crate::clock::nanos_since_boot();
+    let mask = drain_tx();
+    if mask == 0 {
+        return;
+    }
+    isr_push_completion(mask, timestamp);
+    crate::irq_ring::isr_publish(crate::irq_ring::IrqSource::Audio, timestamp);
+    // Force a scheduler entry on IRQ return so drain_irqs converts the record
+    // into wakes now, not at the next 10ms quantum tick.
+    crate::preempt::set_need_resched();
+}
 
-/// Stride between xfer headers within the TX meta region (aligned to 16 bytes)
-const XFER_STRIDE: u64 = 16;
-/// Offset where status structs start within the TX meta region
-const STATUS_OFFSET: u64 = XFER_STRIDE * TX_INFLIGHT_MAX as u64;
-/// Stride between status structs
-const STATUS_STRIDE: u64 = core::mem::size_of::<VirtioSndPcmStatus>() as u64;
+// --- the completion record ring ---
 
-/// Number of event buffers kept posted on the eventq.
-const EVENT_BUFS: usize = 8;
-/// Stride between event buffers (event struct is 8 bytes, padded to 16).
-const EVENT_BUF_STRIDE: usize = 16;
+const RECORD_RING_CAP: u32 = 16;
 
-pub struct SoundController {
-    device: VirtioDevice,
-    controlq: Virtqueue,
-    eventq: Virtqueue,
-    txq: Virtqueue,
-    /// Physical addresses for virtqueue descriptors.
-    req_phys: u64,
-    resp_phys: u64,
-    /// Virtual pointers for kernel read/write.
-    req_ptr: *mut u8,
-    resp_ptr: *mut u8,
-    /// Physical base of the TX meta region (for descriptor addresses).
-    meta_phys: u64,
-    /// Virtual base of the TX meta region (for kernel write_volatile).
-    meta_ptr: *mut u8,
-    /// Physical addresses of the 8 PCM data buffers in the shared page.
-    tx_data_phys: [u64; TX_INFLIGHT_MAX],
-    /// Bitmask of buffers currently in-flight (submitted, completion record
-    /// not yet returned to userspace).
-    inflight_mask: u32,
-    /// Descriptor chain head currently carrying each buffer — recycled from
-    /// completion-record masks (the ISR owns the used ring, so DescSlots
-    /// never come back through poll_used).
-    buf_desc: [u8; TX_INFLIGHT_MAX],
-    started: bool,
-    control_slot: Option<DescSlot>,
-    /// Available TX descriptor slots (returned by recycle, consumed by submit)
-    tx_free_slots: alloc::vec::Vec<DescSlot>,
-    /// Event buffer region (kernel page) for eventq reposting.
-    event_buf_phys: u64,
-    event_buf_ptr: *mut u8,
-    /// DMA backing — kernel-only page (rings + metadata) and the page shared
-    /// with soundd (PCM data only).
+/// SPSC ring of completion records. Producer is the MSI-X handler (single CPU,
+/// IF=0 — never concurrent with itself); consumer is whoever holds
+/// [`CONTROLLER`] in [`drain_completed`]. Indices are free-running u32s.
+///
+/// One record per interrupt, and not one accumulating mask: soundd's DLL
+/// measures a batch against its own grid point, so folding two interrupts into
+/// one record would hand it a lateness it never saw. The HDA stub accumulates
+/// because its position read makes a second interrupt carry nothing a later one
+/// does not; a used ring is not that.
+///
+/// Occupancy is bounded by the period count while the driver behaves: pending
+/// records carry pairwise-disjoint masks, because a period's bit re-enters one
+/// only after its chain has been republished, and the driver republishes only
+/// what a record it has read told it was free. **But the driver is the one
+/// publishing**, so that bound is userland's to keep and this used to be an
+/// assertion a process could ask the kernel to fail. What a full ring costs
+/// instead is [`SPILL`] — exactly what the HDA stub costs always.
+struct RecordRing {
+    slots: [UnsafeCell<AudioCompletionRecord>; RECORD_RING_CAP as usize],
+    head: AtomicU32,
+    tail: AtomicU32,
+}
+
+const _: () = assert!(
+    RECORD_RING_CAP as usize >= abi::PERIODS,
+    "record ring must hold one record per period"
+);
+
+// SAFETY: slot access is arbitrated by the head/tail protocol above.
+unsafe impl Sync for RecordRing {}
+
+static RECORDS: RecordRing = RecordRing {
+    slots: [const {
+        UnsafeCell::new(AudioCompletionRecord { mask: 0, _pad: 0, timestamp_nanos: 0 })
+    }; RECORD_RING_CAP as usize],
+    head: AtomicU32::new(0),
+    tail: AtomicU32::new(0),
+};
+
+/// Where a completion goes when the ring is full: one mask and the newest
+/// timestamp, emitted after everything already queued.
+///
+/// It cannot be lost and it cannot grow — a mask is eight bits and OR is
+/// idempotent — so a driver that stops reading its completions costs itself
+/// timestamp granularity and nothing else costs anything.
+struct Spill {
+    mask: AtomicU32,
+    timestamp: AtomicU64,
+}
+
+static SPILL: Spill = Spill { mask: AtomicU32::new(0), timestamp: AtomicU64::new(0) };
+
+fn isr_push_completion(mask: u32, timestamp_nanos: u64) {
+    let ring = &RECORDS;
+    let head = ring.head.load(Ordering::Relaxed); // sole writer of head
+    let tail = ring.tail.load(Ordering::Acquire);
+    if head.wrapping_sub(tail) >= RECORD_RING_CAP {
+        SPILL.timestamp.store(timestamp_nanos, Ordering::Relaxed);
+        SPILL.mask.fetch_or(mask, Ordering::Release);
+        return;
+    }
+    let slot = (head % RECORD_RING_CAP) as usize;
+    // SAFETY: slot is outside [tail, head) — not visible to the consumer.
+    unsafe {
+        *ring.slots[slot].get() = AudioCompletionRecord { mask, _pad: 0, timestamp_nanos };
+    }
+    // Release: publish the record contents before the consumer can observe the
+    // new head.
+    ring.head.store(head.wrapping_add(1), Ordering::Release);
+}
+
+/// Pop the oldest pending record. Called under [`CONTROLLER`], which serializes
+/// consumers — the tail store needs no CAS.
+///
+/// The spill comes last because it is the newest: it exists only for interrupts
+/// that arrived after everything the ring holds.
+fn pop_completion() -> Option<AudioCompletionRecord> {
+    let ring = &RECORDS;
+    let tail = ring.tail.load(Ordering::Relaxed); // sole writer of tail
+    // Acquire pairs with the producer's Release head store: the record contents
+    // are visible before head covers them.
+    let head = ring.head.load(Ordering::Acquire);
+    if head == tail {
+        let mask = SPILL.mask.swap(0, Ordering::AcqRel);
+        if mask == 0 {
+            return None;
+        }
+        return Some(AudioCompletionRecord {
+            mask,
+            _pad: 0,
+            timestamp_nanos: SPILL.timestamp.load(Ordering::Relaxed),
+        });
+    }
+    let rec = unsafe { *ring.slots[(tail % RECORD_RING_CAP) as usize].get() };
+    ring.tail.store(tail.wrapping_add(1), Ordering::Release);
+    Some(rec)
+}
+
+/// Readiness: are completion records pending? Lock-free — fd readiness,
+/// io_uring poll and the scheduler's park-time recheck all ask this.
+pub fn has_pending() -> bool {
+    RECORDS.head.load(Ordering::Acquire) != RECORDS.tail.load(Ordering::Acquire)
+        || SPILL.mask.load(Ordering::Acquire) != 0
+}
+
+/// Copy up to `buf.len() / 16` pending records into `buf`, oldest first, and
+/// name a stray completion the first time one has been counted.
+pub fn drain_completed(buf: &mut crate::user_ptr::UserBytesMut) -> usize {
+    let stray = TX_ISR.stray.load(Ordering::Relaxed);
+    if stray != 0 && !TX_ISR.named_stray.swap(true, Ordering::Relaxed) {
+        log!(
+            "virtio-sound: the device completed a chain this driver never built ({stray} so far) \
+             — its avail ring names a descriptor that heads none"
+        );
+    }
+    let max = buf.len() / AudioCompletionRecord::SIZE;
+    let _guard = CONTROLLER.lock();
+    let mut written = 0;
+    for _ in 0..max {
+        let Some(rec) = pop_completion() else { break };
+        // Field-wise serialization — never expose struct padding.
+        let mut record = [0u8; AudioCompletionRecord::SIZE];
+        record[0..4].copy_from_slice(&rec.mask.to_le_bytes());
+        record[8..16].copy_from_slice(&rec.timestamp_nanos.to_le_bytes());
+        buf.write_at(written, &record);
+        written += AudioCompletionRecord::SIZE;
+    }
+    written
+}
+
+static IO_URING_WATCHERS: Lock<alloc::vec::Vec<crate::io_uring::RingId>> =
+    Lock::new(alloc::vec::Vec::new());
+
+pub fn add_io_uring_watcher(id: crate::io_uring::RingId) {
+    let mut watchers = IO_URING_WATCHERS.lock();
+    if !watchers.contains(&id) {
+        watchers.push(id);
+    }
+}
+
+pub fn remove_io_uring_watcher(id: crate::io_uring::RingId) {
+    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+}
+
+pub fn io_uring_watchers() -> alloc::vec::Vec<crate::io_uring::RingId> {
+    IO_URING_WATCHERS.lock().clone()
+}
+
+// --- the controller ---
+
+/// What the bring-up leaves behind: the notification region the driver's three
+/// doorbells are in, and the pages every descriptor points into.
+///
+/// The virtqueues are not here because after [`build_chains`] there is nothing
+/// left to do with one — their descriptors are written, their addresses are in
+/// the device, and their used rings are consumed by the handler and by the
+/// driver.
+struct Bound {
+    notify: Mmio,
     _dma_kernel: DmaPool,
     _dma_shared: DmaPool,
 }
 
-unsafe impl Send for SoundController {}
+static CONTROLLER: Lock<Option<Bound>> = Lock::new(None);
+static INFO: Lock<Option<abi::VirtioSoundInfo>> = Lock::new(None);
+static REFUSALS: AtomicU32 = AtomicU32::new(0);
 
-impl SoundController {
-    fn ctrl_command<T: Copy>(&mut self, req: &T, resp_size: u32) -> u32 {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(req as *const T as *const u8, core::mem::size_of::<T>())
-        };
-        unsafe {
-            copy_nonoverlapping(bytes.as_ptr(), self.req_ptr, bytes.len());
-        }
-
-        let slot = self.control_slot.take().expect("sound: no control slot");
-        self.control_slot = Some(self.controlq.submit_and_wait(
-            slot,
-            &[
-                (self.req_phys, bytes.len() as u32, BufDir::Readable),
-                (self.resp_phys, resp_size, BufDir::Writable),
-            ],
-            self.device.notify_mmio(),
-            self.device.notify_off_multiplier(),
-            CONTROL_QUEUE,
-        ));
-
-        unsafe { read_volatile(self.resp_ptr as *const u32) }
-    }
-
-    fn simple_ctrl(&mut self, code: u32, stream_id: u32) -> u32 {
-        let cmd = VirtioSndPcmHdr {
-            hdr: VirtioSndHdr { code },
-            stream_id,
-        };
-        self.ctrl_command(&cmd, core::mem::size_of::<VirtioSndHdr>() as u32)
-    }
-
-    pub fn configure(&mut self, sample_rate: u32, channels: u8) {
-        // `expect`, not a fallback: `choose_params` has already checked this
-        // rate against the device's own bitmap, so an unencodable one here
-        // means the two disagree — a driver bug, not a device we cannot drive.
-        // The old `_ => RATE_44100` arm turned that into telling a device to
-        // play at a rate it never offered.
-        let rate = rate_code(sample_rate)
-            .expect("virtio-sound: configure() given a rate the driver cannot encode");
-
-        let cmd = VirtioSndPcmSetParams {
-            hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_SET_PARAMS },
-            stream_id: 0,
-            buffer_bytes: (PERIOD_BYTES * TX_INFLIGHT_MAX) as u32,
-            period_bytes: PERIOD_BYTES as u32,
-            features: 0,
-            channels,
-            format: VIRTIO_SND_PCM_FMT_S16,
-            rate,
-            _padding: 0,
-        };
-        let status = self.ctrl_command(&cmd, core::mem::size_of::<VirtioSndHdr>() as u32);
-        assert!(status == VIRTIO_SND_S_OK, "virtio-sound: SET_PARAMS failed: {:#x}", status);
-
-        let status = self.simple_ctrl(VIRTIO_SND_R_PCM_PREPARE, 0);
-        assert!(status == VIRTIO_SND_S_OK, "virtio-sound: PREPARE failed: {:#x}", status);
-
-        log!("virtio-sound: configured stream 0: {}Hz {}ch s16le", sample_rate, channels);
-    }
-
-    pub fn start(&mut self) {
-        if self.started { return; }
-        let status = self.simple_ctrl(VIRTIO_SND_R_PCM_START, 0);
-        assert!(status == VIRTIO_SND_S_OK, "virtio-sound: START failed: {:#x}", status);
-        self.started = true;
-        log!("virtio-sound: stream 0 started");
-    }
-
-    pub fn stop(&mut self) {
-        if !self.started { return; }
-        let status = self.simple_ctrl(VIRTIO_SND_R_PCM_STOP, 0);
-        assert!(status == VIRTIO_SND_S_OK, "virtio-sound: STOP failed: {:#x}", status);
-        self.started = false;
-        log!("virtio-sound: stream 0 stopped");
-    }
-
-    /// Submit a TX data buffer to the VirtIO device.
-    /// `idx`: buffer index (0..TX_INFLIGHT_MAX), `len`: bytes of PCM data.
-    /// The data buffer must already be filled by soundd via shared memory.
-    /// Returns false on bad arguments, an in-flight buffer, or a full queue.
-    pub fn submit_buffer(&mut self, idx: usize, len: u32) -> bool {
-        if idx >= TX_INFLIGHT_MAX { return false; }
-        if len == 0 || len as usize > PERIOD_BYTES { return false; }
-        if self.inflight_mask & (1 << idx) != 0 { return false; }
-        let Some(slot) = self.tx_free_slots.pop() else { return false };
-        if !self.started {
-            self.start();
-        }
-
-        let first_desc = slot.id();
-        // The ISR maps used-ring desc ids to buffer indices; the mapping
-        // must be published before the avail-ring store makes the chain
-        // visible to the device (Release fence inside Virtqueue::submit).
-        TX_ISR.desc_to_buf[first_desc as usize].store(idx as u8, Ordering::Relaxed);
-
-        let hdr_phys = self.meta_phys + idx as u64 * XFER_STRIDE;
-        let data_phys = self.tx_data_phys[idx];
-        let status_phys = self.meta_phys + STATUS_OFFSET + idx as u64 * STATUS_STRIDE;
-
-        // Write xfer header via virtual pointer (kernel-owned page, not shared)
-        let hdr_ptr = unsafe { self.meta_ptr.add(idx * XFER_STRIDE as usize) };
-        let xfer = VirtioSndPcmXfer { stream_id: 0 };
-        unsafe { write_volatile(hdr_ptr as *mut VirtioSndPcmXfer, xfer); }
-
-        let hdr_size = core::mem::size_of::<VirtioSndPcmXfer>() as u32;
-        let status_size = core::mem::size_of::<VirtioSndPcmStatus>() as u32;
-
-        let submitted = self.txq.submit(
-            slot,
-            &[
-                (hdr_phys, hdr_size, BufDir::Readable),
-                (data_phys, len, BufDir::Readable),
-                (status_phys, status_size, BufDir::Writable),
-            ],
-            self.device.notify_mmio(),
-            self.device.notify_off_multiplier(),
-            TX_QUEUE,
-        );
-        assert!(submitted == first_desc, "virtio-sound: submit used unexpected descriptor");
-        self.buf_desc[idx] = first_desc as u8;
-        self.inflight_mask |= 1 << idx;
-        true
-    }
-
-    /// Return the descriptors of completed buffers to the free pool. `mask`
-    /// comes from the completion records being handed to userspace — this
-    /// is the AUDIO-lock half of completion handling that the lock-free ISR
-    /// cannot do.
-    pub fn recycle(&mut self, mask: u32) {
-        let mut m = mask;
-        while m != 0 {
-            let idx = m.trailing_zeros() as usize;
-            m &= m - 1;
-            assert!(
-                self.inflight_mask & (1 << idx) != 0,
-                "virtio-sound: completion for idle buffer {idx}"
-            );
-            self.inflight_mask &= !(1 << idx);
-            self.tx_free_slots.push(DescSlot::reclaim(self.buf_desc[idx] as u16));
-        }
-    }
-
-    /// Service the eventq: log device-side exceptions (XRUN etc.) and
-    /// repost the buffers. Called from the completion-drain path.
-    pub fn poll_events(&mut self) {
-        while let Some((slot, _len)) = self.eventq.poll_used() {
-            let id = slot.id() as usize;
-            assert!(id < EVENT_BUFS, "virtio-sound: bogus event desc id {id}");
-            let event = unsafe {
-                read_volatile(self.event_buf_ptr.add(id * EVENT_BUF_STRIDE) as *const VirtioSndEvent)
-            };
-            let name = match event.hdr.code {
-                VIRTIO_SND_EVT_JACK_CONNECTED => " (jack connected)",
-                VIRTIO_SND_EVT_JACK_DISCONNECTED => " (jack disconnected)",
-                VIRTIO_SND_EVT_PCM_PERIOD_ELAPSED => " (period elapsed)",
-                VIRTIO_SND_EVT_PCM_XRUN => " (PCM XRUN)",
-                _ => "",
-            };
-            log!("virtio-sound: device event {:#x}{} data={}", event.hdr.code, name, event.data);
-            self.eventq.submit(
-                slot,
-                &[(self.event_buf_phys + (id * EVENT_BUF_STRIDE) as u64,
-                   core::mem::size_of::<VirtioSndEvent>() as u32,
-                   BufDir::Writable)],
-                self.device.notify_mmio(),
-                self.device.notify_off_multiplier(),
-                EVENT_QUEUE,
-            );
-        }
-    }
+pub fn info() -> Option<abi::VirtioSoundInfo> {
+    *INFO.lock()
 }
 
-const VIRTIO_SOUND_VECTOR: u8 = 0x23;
+// --- the allow-list ---
 
-/// Arm this device's txq completion interrupt, or say why the machine has no
-/// audio.
+/// The driver's whole write surface: three doorbells, one per queue.
 ///
-/// A refusal rather than a panic, for `virtio_net::arm_interrupt`'s reason and
-/// one of its own: `TX_ISR` is the only consumer of the txq used ring, so a
-/// device that cannot deliver its completions is one whose every period stays
-/// in flight forever. `None` here leaves `audio::register` uncalled, so soundd
-/// finds no device and exits — a machine that boots and plays nothing rather
-/// than a machine that dies.
-fn arm_interrupt(pci_dev: &PciDevice, device: &VirtioDevice) -> bool {
-    if !pci_dev.enable_msix(VIRTIO_SOUND_VECTOR) {
-        log!("virtio-sound: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its MSI-X could not be \
-             armed and this driver has no other way to be told a period completed",
-            pci_dev.bus, pci_dev.dev, pci_dev.func);
-        return false;
-    }
-    if let Err(refused) = device.bind_msix(TX_QUEUE) {
-        log!("virtio-sound: NOT INITIALISED at PCI {:02x}:{:02x}.{} — the device refused a \
-             vector for {}", pci_dev.bus, pci_dev.dev, pci_dev.func, refused);
-        return false;
-    }
-    log!("virtio-sound: MSI-X vector {:#x} on table entry {}", VIRTIO_SOUND_VECTOR, MSIX_ENTRY);
-    true
+/// Every entry carries the same property the HDA stub's do — **its value is not
+/// an address, and it indexes nothing the kernel allocated.** A doorbell takes a
+/// queue index, and which queue is already decided by which of the three offsets
+/// was named, so the value cannot reach anything the offset did not.
+///
+/// The polarity is the guarantee. A missing entry costs a driver that cannot
+/// notify a queue and says so; a refusal list missing an entry costs a device
+/// pointed at kernel memory.
+fn write_permit(info: &abi::VirtioSoundInfo, offset: u64, width: RegWidth) -> bool {
+    let Ok(offset) = u32::try_from(offset) else { return false };
+    width == RegWidth::U16
+        && [info.notify_control, info.notify_event, info.notify_tx].contains(&offset)
 }
 
-/// Initialize the VirtIO sound device. Returns the controller and AudioInfo on success.
-pub fn init(devices: &[PciDevice]) -> Option<(SoundController, AudioInfo)> {
-    let pci_dev = *devices.iter().find(|d| d.is_id(VIRTIO_VENDOR, VIRTIO_SND_DEVICE))?;
-    log!("virtio-sound: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    let dma_kernel = DmaPool::alloc(KERNEL_DMA_SIZE);
-    let dma_shared = DmaPool::alloc(SHARED_DMA_SIZE);
-    let dma = dma_kernel.slice();
-    let shared = dma_shared.slice();
+fn refuse(what: &str, offset: u64, width: RegWidth) -> SyscallError {
+    if REFUSALS.fetch_add(1, Ordering::Relaxed) < MAX_NAMED_REFUSALS as u32 {
+        log!(
+            "virtio-sound: refused a {width:?} {what} of {offset:#x} — not on the allow-list \
+             (hda-driver-plan.md §4.1.3)"
+        );
+    }
+    SyscallError::PermissionDenied
+}
 
-    let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
+/// **This driver reads no register at all**, so the read list is empty and every
+/// call is a refusal. The device's answers reach it through memory: the used
+/// rings it polls and the completion records the handler pushes.
+pub fn reg_read(offset: u64, width: RegWidth) -> Result<u32, SyscallError> {
+    Err(refuse("read", offset, width))
+}
+
+pub fn reg_write(offset: u64, width: RegWidth, value: u32) -> Result<(), SyscallError> {
+    let info = info().ok_or(SyscallError::NotFound)?;
+    if !write_permit(&info, offset, width) {
+        return Err(refuse("write", offset, width));
+    }
+    if value > width.max_value() {
+        return Err(SyscallError::InvalidArgument);
+    }
+    let guard = CONTROLLER.lock();
+    let controller = guard.as_ref().ok_or(SyscallError::NotFound)?;
+    controller.notify.write_u16(offset, value as u16);
+    Ok(())
+}
+
+// --- bring-up ---
+
+/// Bring up the machine's virtio-sound device, or leave it unclaimed and say
+/// why.
+///
+/// A refusal rather than a panic throughout: audio is optional, so a machine
+/// that boots and plays nothing is better than one that dies over a peripheral.
+/// [`info`] then answers `None`, the claim is `Absent`, and soundd falls back to
+/// the null sink.
+pub fn init(devices: &[PciDevice]) {
+    let Some(pci) = devices.iter().find(|d| d.is_id(VIRTIO_VENDOR, VIRTIO_SND_DEVICE)) else {
+        return;
+    };
+    log!("virtio-sound: found at PCI {:02x}:{:02x}.{}", pci.bus, pci.dev, pci.func);
+
+    let dma_kernel = DmaPool::alloc(KERNEL_DMA_BYTES);
+    let dma_shared = DmaPool::alloc(abi::SHARED_BYTES);
+    let kernel_mem = dma_kernel.slice();
+    let shared = dma_shared.slice();
+    unsafe { shared.zero() };
+
+    let device = VirtioDevice::init(pci, VIRTIO_F_VERSION_1);
 
     let cfg = device.device_config();
-    let jacks = cfg.read_u32(0);
-    let streams = cfg.read_u32(4);
-    let chmaps = cfg.read_u32(8);
-    log!("virtio-sound: {} jacks, {} streams, {} chmaps", jacks, streams, chmaps);
-
-    assert!(streams > 0, "virtio-sound: no PCM streams available");
-
-    let mut controlq = Virtqueue::new(dma.subslice(OFF_CONTROLQ, 0x1000), 16);
-    let mut eventq = Virtqueue::new(dma.subslice(OFF_EVENTQ, 0x1000), 16);
-    let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000), TXQ_SIZE as u16);
-
-    // The ISR is the only txq used-ring consumer. Install it before
-    // arm_interrupt so no interrupt on this vector can observe a half-written
-    // Option (config-change interrupts share the vector).
-    // SAFETY: MSI-X is not enabled yet — nothing races this store.
-    unsafe { *TX_ISR.consumer.get() = Some(txq.split_used_consumer()); }
-
-    device.setup_queue(CONTROL_QUEUE, &mut controlq);
-    device.setup_queue(EVENT_QUEUE, &mut eventq);
-    device.setup_queue(TX_QUEUE, &mut txq);
-    if !arm_interrupt(&pci_dev, &device) {
-        return None;
+    let (jacks, streams, chmaps) = (cfg.read_u32(0), cfg.read_u32(4), cfg.read_u32(8));
+    log!("virtio-sound: {jacks} jacks, {streams} streams, {chmaps} chmaps");
+    if streams == 0 {
+        log!("virtio-sound: NOT INITIALISED — the device offers no PCM stream to play into");
+        return;
     }
-    device.enable_queue(CONTROL_QUEUE);
-    device.enable_queue(EVENT_QUEUE);
-    device.enable_queue(TX_QUEUE);
+
+    let mut controlq = queue(
+        kernel_mem.subslice(OFF_CTRL_DESC, OFF_EVENT_DESC - OFF_CTRL_DESC),
+        shared.subslice(abi::OFF_CTRL_AVAIL, abi::avail_bytes(abi::CONTROL_QUEUE_SIZE)),
+        shared.subslice(abi::OFF_CTRL_USED, abi::used_bytes(abi::CONTROL_QUEUE_SIZE)),
+        abi::CONTROL_QUEUE_SIZE,
+    );
+    let mut eventq = queue(
+        kernel_mem.subslice(OFF_EVENT_DESC, OFF_TX_DESC - OFF_EVENT_DESC),
+        shared.subslice(abi::OFF_EVENT_AVAIL, abi::avail_bytes(abi::EVENT_QUEUE_SIZE)),
+        shared.subslice(abi::OFF_EVENT_USED, abi::used_bytes(abi::EVENT_QUEUE_SIZE)),
+        abi::EVENT_QUEUE_SIZE,
+    );
+    // The one used ring the driver never sees: the handler is its only consumer,
+    // and a mask derived from a ring userland can rewrite would be a completion
+    // for a period that never played.
+    let mut txq = queue(
+        kernel_mem.subslice(OFF_TX_DESC, OFF_TX_USED - OFF_TX_DESC),
+        shared.subslice(abi::OFF_TX_AVAIL, abi::avail_bytes(abi::TX_QUEUE_SIZE)),
+        kernel_mem.subslice(OFF_TX_USED, abi::used_bytes(abi::TX_QUEUE_SIZE)),
+        abi::TX_QUEUE_SIZE,
+    );
+
+    build_chains(&controlq, &eventq, &txq, shared.phys());
+
+    // Install the used-ring consumer before the vector can fire, so no interrupt
+    // observes a half-written Option — configuration-change interrupts share it.
+    // SAFETY: MSI-X is not enabled yet.
+    unsafe { *TX_ISR.consumer.get() = Some(txq.split_used_consumer()) };
+
+    device.setup_queue(abi::CONTROL_QUEUE, &mut controlq);
+    device.setup_queue(abi::EVENT_QUEUE, &mut eventq);
+    device.setup_queue(abi::TX_QUEUE, &mut txq);
+    if !arm_interrupt(pci, &device) {
+        return;
+    }
+    device.enable_queue(abi::CONTROL_QUEUE);
+    device.enable_queue(abi::EVENT_QUEUE);
+    device.enable_queue(abi::TX_QUEUE);
     device.activate();
 
-    let ctrl_bufs = dma.subslice(OFF_CTRL_BUFS, 0x1000);
-    let meta = dma.subslice(OFF_TX_META, 0x1000);
-    let event_bufs = dma.subslice(OFF_EVENT_BUFS, 0x1000);
-    let req_phys = ctrl_bufs.phys() + REQ_OFFSET as u64;
-    let resp_phys = ctrl_bufs.phys() + RESP_OFFSET as u64;
-    let req_ptr = ctrl_bufs.ptr_at(REQ_OFFSET);
-    let resp_ptr = ctrl_bufs.ptr_at(RESP_OFFSET);
-    let meta_phys = meta.phys();
-    let meta_ptr = meta.base();
-
-    // DmaPool allocations are whole 2MB pages, so the shared slice base IS
-    // the page soundd maps; buf_offsets are relative to it.
-    let dma_token = shared_memory::register(crate::DirectMap::from_phys(shared.phys()), crate::mm::PAGE_2M, CachePolicy::DeferToMtrr);
-    let mut tx_data_phys = [0u64; TX_INFLIGHT_MAX];
-    let mut buf_offsets = [0u32; TX_INFLIGHT_MAX];
-    for i in 0..TX_INFLIGHT_MAX {
-        tx_data_phys[i] = shared.phys() + (i * PERIOD_BYTES) as u64;
-        buf_offsets[i] = (i * PERIOD_BYTES) as u32;
-    }
-
-    let mut control_slots = controlq.initial_slots();
-    let control_slot = control_slots.pop().expect("sound: no control slots");
-    drop(control_slots);
-    let tx_free_slots = txq.initial_slots_strided(3);
-
-    let mut ctrl = SoundController {
-        device,
-        controlq,
-        eventq,
-        txq,
-        req_phys,
-        resp_phys,
-        req_ptr,
-        resp_ptr,
-        meta_phys,
-        meta_ptr,
-        tx_data_phys,
-        inflight_mask: 0,
-        buf_desc: [0; TX_INFLIGHT_MAX],
-        started: false,
-        control_slot: Some(control_slot),
-        tx_free_slots,
-        event_buf_phys: event_bufs.phys(),
-        event_buf_ptr: event_bufs.base(),
-        _dma_kernel: dma_kernel,
-        _dma_shared: dma_shared,
+    // `DmaPool` allocations are whole 2 MiB pages, so the slice base is the page
+    // the driver maps and the ABI's offsets are relative to it.
+    let token = shared_memory::register(
+        crate::DirectMap::from_phys(shared.phys()),
+        crate::mm::PAGE_2M,
+        CachePolicy::DeferToMtrr,
+    );
+    let multiplier = device.notify_off_multiplier();
+    let info = abi::VirtioSoundInfo {
+        dma_token: token.raw(),
+        notify_control: controlq.notify_bytes(multiplier) as u32,
+        notify_event: eventq.notify_bytes(multiplier) as u32,
+        notify_tx: txq.notify_bytes(multiplier) as u32,
+        jacks,
+        streams,
+        chmaps,
     };
 
-    // Post event buffers so the device can report XRUN/jack events. Slot ids
-    // double as buffer indices — single-descriptor chains, reposted 1:1.
-    let mut event_slots = ctrl.eventq.initial_slots();
-    event_slots.truncate(EVENT_BUFS);
-    for slot in event_slots {
-        let id = slot.id() as usize;
-        ctrl.eventq.submit(
-            slot,
-            &[(ctrl.event_buf_phys + (id * EVENT_BUF_STRIDE) as u64,
-               core::mem::size_of::<VirtioSndEvent>() as u32,
-               BufDir::Writable)],
-            ctrl.device.notify_mmio(),
-            ctrl.device.notify_off_multiplier(),
-            EVENT_QUEUE,
+    *CONTROLLER.lock() = Some(Bound {
+        notify: device.notify_mmio(),
+        _dma_kernel: dma_kernel,
+        _dma_shared: dma_shared,
+    });
+    *INFO.lock() = Some(info);
+
+    log!(
+        "virtio-sound: bound, {} periods of {} bytes, doorbells at {:#x}/{:#x}/{:#x}",
+        abi::PERIODS,
+        abi::PERIOD_BYTES,
+        info.notify_control,
+        info.notify_event,
+        info.notify_tx
+    );
+}
+
+fn queue(desc: KernelSlice, avail: KernelSlice, used: KernelSlice, size: u16) -> Virtqueue {
+    Virtqueue::from_regions(&VirtqueueRegions::from_separate(desc, avail, used, size), size)
+}
+
+/// Every chain the driver will ever publish, built once out of offsets into the
+/// shared region.
+///
+/// This is where the boundary is: after this runs there is no descriptor left to
+/// write, so the driver's whole vocabulary is an index into an avail ring and a
+/// doorbell. One control chain serves every command because the device reads the
+/// header first and takes only what that command defines.
+fn build_chains(controlq: &Virtqueue, eventq: &Virtqueue, txq: &Virtqueue, base: u64) {
+    let at = |offset: usize| base + offset as u64;
+
+    controlq.write_chain(
+        0,
+        &[
+            (at(abi::OFF_CTRL_REQ), abi::CTRL_BUF_BYTES as u32, BufDir::Readable),
+            (at(abi::OFF_CTRL_RESP), abi::CTRL_BUF_BYTES as u32, BufDir::Writable),
+        ],
+    );
+
+    // One descriptor per buffer, so a buffer index and a descriptor index are
+    // the same number and the driver reposts by index.
+    for i in 0..abi::EVENT_BUFS {
+        eventq.write_chain(
+            i as u16,
+            &[(at(abi::OFF_EVENT_BUFS + i * abi::EVENT_BUF_STRIDE), EVENT_BYTES, BufDir::Writable)],
         );
     }
 
-    let query = VirtioSndQueryInfo {
-        hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_INFO },
-        start_id: 0,
-        count: 1,
-        size: core::mem::size_of::<VirtioSndPcmInfo>() as u32,
-    };
-    let resp_size = core::mem::size_of::<VirtioSndHdr>() as u32
-        + core::mem::size_of::<VirtioSndPcmInfo>() as u32;
-    let status = ctrl.ctrl_command(&query, resp_size);
-    assert!(status == VIRTIO_SND_S_OK, "virtio-sound: PCM_INFO failed: {:#x}", status);
+    for i in 0..abi::PERIODS {
+        txq.write_chain(
+            abi::tx_chain_head(i),
+            &[
+                (at(abi::OFF_TX_XFER + i * abi::XFER_STRIDE), XFER_HEADER_BYTES, BufDir::Readable),
+                (at(abi::OFF_PCM + i * abi::PERIOD_BYTES), abi::PERIOD_BYTES as u32, BufDir::Readable),
+                (at(abi::OFF_TX_STATUS + i * abi::STATUS_STRIDE), STATUS_BYTES, BufDir::Writable),
+            ],
+        );
+    }
+}
 
-    let pcm_info = unsafe {
-        core::ptr::read_unaligned(ctrl.resp_ptr.add(core::mem::size_of::<VirtioSndHdr>()) as *const VirtioSndPcmInfo)
-    };
-    log!("virtio-sound: stream 0: dir={} ch={}-{} fmts={:#x} rates={:#x}",
-        pcm_info.direction, pcm_info.channels_min, pcm_info.channels_max,
-        pcm_info.formats, pcm_info.rates);
-
-    let (sample_rate, channels) = choose_params(&pcm_info)?;
-    ctrl.configure(sample_rate, channels);
-
-    let info = AudioInfo {
-        dma_token: dma_token.raw(),
-        buf_offsets,
-        num_buffers: TX_INFLIGHT_MAX as u8,
-        _pad0: [0; 3],
-        sample_rate,
-        channels,
-        _pad1: [0; 3],
-        period_bytes: PERIOD_BYTES as u32,
-    };
-
-    log!("virtio-sound: initialized ({} DMA buffers, playback starts on first submit)", TX_INFLIGHT_MAX);
-    Some((ctrl, info))
+/// Arm this device's TX completion interrupt, or say why the machine has no
+/// audio.
+///
+/// A refusal rather than a panic, and one of the reasons is its own: the handler
+/// is the only consumer of the TX used ring, so a device that cannot deliver its
+/// completions is one whose every period stays in flight forever.
+fn arm_interrupt(pci: &PciDevice, device: &VirtioDevice) -> bool {
+    let vector = crate::arch::idt::VIRTIO_SOUND_VECTOR;
+    if !pci.enable_msix(vector) {
+        log!(
+            "virtio-sound: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its MSI-X could not be \
+             armed and this driver has no other way to be told a period completed",
+            pci.bus,
+            pci.dev,
+            pci.func
+        );
+        return false;
+    }
+    if let Err(refused) = device.bind_msix(abi::TX_QUEUE) {
+        log!(
+            "virtio-sound: NOT INITIALISED at PCI {:02x}:{:02x}.{} — the device refused a vector \
+             for {refused}",
+            pci.bus,
+            pci.dev,
+            pci.func
+        );
+        return false;
+    }
+    log!("virtio-sound: MSI-X vector {vector:#x} on table entry {MSIX_ENTRY}");
+    true
 }

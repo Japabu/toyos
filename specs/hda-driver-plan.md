@@ -735,13 +735,12 @@ ABI at all.
 | 5 | **`SYS_SET_RT_PRIORITY`'s gate moves** | **general** | It is gated at the dispatch site on the `DEVICE_AUDIO` claim, which is deleted here. It becomes a right on the device-claim handle, per `capability-handles-spec.md` §6.7 — the process init gave the audio device to may enter the RT band. **No new syscall; a changed check**, and one the code already says is too weak: "That is not yet spec §9.4's privilege gate: `SYS_OPEN_DEVICE` is first-come and ungated, so whoever wins the claim race gets the RT band with it" (`scheduler.rs:308-311`). |
 | 6 | **Master volume and mute** | **not kernel ABI at all** | Three messages on soundd's existing control connection: `MSG_SET_MASTER_VOLUME { gain: f32 }`, `MSG_SET_MASTER_MUTE { on: bool }`, `MSG_GET_MASTER` → `MSG_MASTER_STATE { gain, muted }`. The tempting wrong answer is a syscall; volume is a mixer's business and the mixer is a userland process. |
 
-**Deleted by this track**, once §6's H3 lands: `SYS_AUDIO_SUBMIT` (**71**),
-`SYS_AUDIO_POLL` (**84**, already dead — §10 item 7), `DEVICE_AUDIO` and its
-owner lock, `Descriptor::Audio`, `AudioInfo`, `AudioCompletionRecord`, IDT
-vector `0x23`, `kernel/src/audio.rs` (158 lines) and
-`kernel/src/drivers/virtio_sound.rs` (649 lines). **71 and 84 are retired, never
-reused** (CLAUDE.md). That deletion closes `userspace-drivers-spec.md` stage 7
-and is a third of its `virtio` grep.
+**Deleted by H3, as it landed**: `SYS_AUDIO_SUBMIT` (**71**), `SYS_AUDIO_POLL`
+(**84**, already dead — §10 item 7), `DEVICE_AUDIO` (**4**) and its owner lock,
+`Descriptor::Audio`, `AudioInfo`, and `kernel/src/audio.rs`. **All three numbers
+are retired, never reused** (CLAUDE.md). `AudioCompletionRecord`, IDT vector
+`0x23` and `virtio_sound.rs` itself survive, and §6.7 is why each. That deletion
+closes `userspace-drivers-spec.md` stage 7.
 
 **Rejected, named so the judgement is checkable:**
 
@@ -919,7 +918,7 @@ throughout.
 | **H0** | **Feasibility, on metal. No driver.** A kernel diagnostic behind a feature flag, present only in the diagnostic image, deleted at H9. It carries the comment `specs/device-test-strategy.md` requires of a kernel-feature actuator, and the reason nothing else can reach it is exact: **there is no way for a userland process to touch a codec before the capability of §4 exists, and the questions it answers are the ones that decide whether that capability will ever be given this device.** Two halves on one boot. **(a) Handoff**, for `00:1f.3`: its DMAR device scope, whether its isolation scope is a singleton given four sibling functions (§7 risk 1), whether it carries an RMRR, whether it offers MSI or MSI-X and how many vectors, BAR0's size/width/prefetchability and whether a 2 MiB relocation target exists, and the unit's `ECAP.SC` (§4.4 item 4). **(b) Codec**, using the immediate-command registers so it needs no DMA and no capability: release `GCTL.CRST`, read `GCAP`/`VMIN`/`VMAJ` and `STATESTS`, and for every codec present dump vendor and device id, every function group, every widget's capabilities and every pin's configuration default. Plus: log every i8042 scancode sequence that decodes to no key, and press the three volume keys. | ~120 + ~250 lines kernel | The log carries a named line per item, read off the panel and off `/log/kernel.log`. **If the isolation scope or an RMRR refuses the device, or `STATESTS` reads zero, this track stops here and is re-decided.** |
 | **H1** | **DONE — `toyos-hda`, the host-tested core.** Verb encode/decode, the graph model, `find_output_path`, `SDnFMT` encoding, BDL construction. No I/O. | ~1,500 lines Rust | `cargo test` in-crate, against three fixtures including **H0's dump of the T14's own codec**. §5.2's state-space attacks, each with teeth: deleting the cycle check must red the cyclic fixture, and deleting the speaker-pin preference must red the two-codec one. |
 | **H2** | **The stub's capability.** Rewritten under §4.1's decision: I3 and I4 are **not** in it and `userspace-drivers-spec.md` stage 3 is not either (§4.2). What lands is the four syscalls of §4.4 item 1 plus `SYS_DEVICE_REG_WRITE` (item 1b), `CachePolicy::Uncacheable`, a `writable` field on `SharedRegion`, and the claim-time 2 MiB-neighbour refusal of §4.1.4. **Proposes that the capability be staged against a second `intel-hda` rather than a second `virtio-net-pci`** (§4.2). | ~600 lines kernel (est.) | The refusals, each by name: a write off the allow-list, a write of an address register, a claim whose BAR shares its page. Teeth: deleting the allow-list check must red the first two. |
-| **H3** | **The userspace audio backend seam, with virtio-sound as its first implementation.** soundd grows a backend trait and drives virtio-sound *from userland* through §4.4's capability. Deleted: `virtio_sound.rs`, `audio.rs`, `SYS_AUDIO_SUBMIT`, `SYS_AUDIO_POLL`, `DEVICE_AUDIO`, `AudioInfo`, `AudioCompletionRecord`, vector `0x23`. Closes `userspace-drivers-spec.md` stage 7. | ~1,200 lines Rust moved, **807 lines of kernel deleted** | **Gate A's thorough tier, `cargo test --test toyos-build -- --audio-gate 30`, same-session A/B against the pre-stage tree.** Same rule as a scheduler-migration transition and for the same reason. **This is the stage that can revert the direction, and it is deliberately before HDA exists.** |
+| **H3** | **DONE, and §6.7 is what it actually built.** soundd drives virtio-sound from userland through the same stub HDA got: descriptor tables kernel-only, avail rings and every buffer in the region the driver maps. Deleted: `audio.rs`, `SYS_AUDIO_SUBMIT`, `SYS_AUDIO_POLL`, `DEVICE_AUDIO`, `AudioInfo`. **Not** deleted, and §6.7 says why each: `virtio_sound.rs` (it is the stub now), `AudioCompletionRecord`, vector `0x23`. Closes `userspace-drivers-spec.md` stage 7. | ~1,000 lines Rust moved, 285 lines of kernel deleted | **Gate A's thorough tier, `cargo test --test toyos-build -- --audio-gate 30`, same-session A/B against the pre-stage tree.** Same rule as a scheduler-migration transition and for the same reason. ~~This is the stage that can revert the direction, and it is deliberately before HDA exists.~~ **Spent** — H4 landed first (§6.7). |
 | **H4** | **HDA behind the same seam, in QEMU.** Split by §4.1's line: **kernel stub** — reset, CORB/RIRB ring setup, interrupt enables, stream descriptor address registers, the BDL's contents, the `SDnSTS` ISR, and the allow-list. **soundd** — enumeration, path selection from H1, `SDnFMT`, the amps and EAPD, `SDnLPIB`-derived masks, zero-on-complete, the mixer. New profiles: one HDA machine, one with two controllers, one whose codec has no speaker pin, one with a controller and no codec. | ~500 kernel + ~1,500 userland (est.) | New gate-A arms (§5.3) with their own four baseline sections; `cargo test -- hda` for the shape configs. Teeth: removing the zero-on-complete write must red the phase-continuity check. **§2.3's output-preference rule stands unrelaxed** — §6.4 item 7 widened it to speaker → headphone → line-out as a policy constant before H4, and the refusal-by-name arm is what QEMU's `hda-micro` still exercises. |
 | **H5** | **The T14: first note.** Flash, boot, listen. The enumeration trace lands in `/log/kernel.log`; the codec dump becomes an H1 fixture. | — | **L4, metal only.** The owner hears the 440 Hz tone from the speakers. The run's soundd counters are recorded as the T14's own first baseline. |
 | **H6** | **Jack detection and output routing.** Polled pin sense on soundd's existing 2 s cadence; route between the speaker and headphone pins; ramp master gain to zero across the switch so it does not click. | ~300 lines Rust | Metal: headphones in, sound follows within one poll interval, and back out again. Harness if QEMU's codec models pin sense; if it does not, the switch logic is host-tested in `toyos-hda` and the *transition* is asserted in QEMU by driving it from a test hook. |
@@ -1255,6 +1254,79 @@ asserts *harm* (a tone at full amplitude, no mid-tone silence, and soundd's
 counters) and claims no distribution. A thorough tier for the HDA arm needs
 those sections first.
 
+### 6.7 What H3 built, and the two things §6's row got wrong
+
+Built on 2026-08-07, after H2 and H4. Two of the row's claims do not survive
+§4.1.1's decision and one of its properties was already spent; the rest holds.
+
+> **virtio-sound did not leave the kernel, because under the stub no driver
+> does.** `kernel/src/drivers/virtio_sound.rs` is not deleted and cannot be: the
+> stub is the shape where a device keeps a kernel bring-up half permanently
+> (§4.3's last paragraph). It went from 638 lines to 512, and what left it is
+> every *decision*.
+
+**The line, on this device.** A split virtqueue names memory in exactly one
+place — its descriptor table — so that is what stays kernel-only, and virtio
+1.0's three separate address registers are what make the split expressible at all
+(`VirtqueueRegions::from_separate`, which `virtio_net`'s RX queue already used).
+The kernel allocates two regions: a page nobody maps, holding the three
+descriptor tables and the TX used ring; and the region the driver maps writable,
+holding the PCM periods, the three avail rings, the control and event used rings,
+and every request, response, transfer header, status and event buffer. Every
+chain is built once at bind out of offsets into the second region
+(`build_chains`), so after bring-up **there is no descriptor left to write** and
+the driver's whole vocabulary is an index into an avail ring and a doorbell.
+
+The TX used ring is the one the driver never sees, and that is not tidiness: the
+handler derives the completion mask from it and timestamps it, which is §4.4 item
+3's requirement, and a mask derived from a ring userland could rewrite is a
+completion for a period that never played. A used entry naming a descriptor that
+heads no chain is therefore untrusted input — counted, and named once from the
+drain path, never asserted on.
+
+**The allow-list is three entries and they are the three doorbells.** Each
+carries the same property HDA's entries do: its value is a queue index, which
+names no memory, and *which* queue is already decided by which offset was named.
+The read list is **empty** — this driver reads no register at all, because the
+device's answers reach it through memory it maps.
+
+**What a period costs is unchanged.** `SYS_AUDIO_SUBMIT` is gone and one
+`SYS_DEVICE_REG_WRITE` of a doorbell replaces it: the same one syscall, moved
+from a call naming a buffer index to one naming a register offset. The avail-ring
+store that used to happen inside it is now a store in soundd's own address space.
+§4.1.2's 2k+7 per wake is 2k+7 still, so H3 measures the boundary rather than
+paying for it.
+
+**Deleted:** `kernel/src/audio.rs` (159 lines), `SYS_AUDIO_SUBMIT` (**71**),
+`SYS_AUDIO_POLL` (**84** — dead ABI already, so this saves nothing and is
+recorded because the number is now spoken for), `DeviceType::Audio` (**4**,
+retired rather than reused for the stub that replaced it: the new claim
+authorizes register writes and answers no submit, so a caller naming 4 has to be
+refused rather than handed a capability of a different shape), `AudioInfo`,
+`Descriptor::Audio` and the byte written to its fd to start and stop a stream,
+`AudioDev`, `DescSlot::reclaim` and `Virtqueue::initial_slots_strided`.
+
+**Not deleted, against the row:**
+
+- **`AudioCompletionRecord`.** Both stubs produce it, and H4 already had HDA
+  producing it. It is *the* record, not virtio's.
+- **IDT vector `0x23`.** The stub still owns the interrupt — that is the half of
+  the boundary that owns the IDT. Retiring it would mean a new number for the
+  same device's MSI-X.
+- **`kernel/src/drivers/virtio_sound.rs`.** Above.
+
+**`RegWidth` moved from `toyos_abi::hda` to `toyos_abi::syscall`**, beside the
+two calls whose argument it is. Two device families answer them now, which is the
+first evidence for §4.4 item 1b's claim that `SYS_DEVICE_REG_WRITE` is general in
+shape rather than HDA's syscall wearing a general name.
+
+**The property H3 was designed to have is spent, and this file should not imply
+otherwise.** §6's row calls it "the stage that can revert the direction, and it
+is deliberately before HDA exists". HDA exists and is landed (§6.6), so a red
+here can no longer un-decide the userspace-driver direction — it can only say
+this move made guest audio worse. Risk 3 is still what the gate prices; what is
+gone is the cheap exit.
+
 ### 6.5 What H0's boot did *not* leave behind
 
 **H0's `(a)` block is not in this repository.** §6.4 records seven findings and
@@ -1320,10 +1392,11 @@ Each with what settles it, and how early.
    `userspace-drivers-spec.md` §9 already predicts stage 7 is the one most
    likely to be reverted, and gate A's thorough tier at N=30 does not detect a
    doubling of the dropout rate. §4.1 argues the path gets *shorter*, not
-   longer, and that argument is unmeasured. **Settled by H3, deliberately before
-   HDA exists**, and the honest failure mode is that H3 goes green while
-   something got worse below its resolution. The stub does not reduce this risk;
-   §4.1.2 shows only that it adds nothing per period.
+   longer, and that argument is unmeasured. **Priced by H3**, whose accounting
+   says the virtio period costs the same one syscall it always did (§6.7), and
+   whose honest failure mode is that the gate goes green while something got
+   worse below its resolution. ~~Deliberately before HDA exists~~ — H4 landed
+   first, so a red here names a regression and no longer reverts a direction.
 4. **CLOSED FOR AUDIO — an RMRR on `00:1f.3`.** `iommu-spec.md` §7.4 refuses a
    device carrying one **for userspace handoff**, and there is no handoff. A
    kernel device's RMRRs are satisfied for free by the identity-mapped domain it
@@ -1496,15 +1569,15 @@ Recorded, not fixed, per this task's scope.
    **Withdrawn by §6.4 item 5**: both codecs offer 44.1 kHz S16, so the two
    backends share a physical scale and the constants stay global. §5.3 item 2
    and risk 8 are the same withdrawal.
-5. **soundd's mix loop carries a comment ordering `soundd: resumed` before "the
-   kernel's own `virtio-sound: stream 0 started` line".** H3 deletes that kernel
-   line, and the comment with it.
-6. **soundd's suspend block anticipates exactly this device**: "The one event
-   that makes grace nonzero is a hardware backend that pops on stop, advertised
-   per-backend through `AudioInfo`." HDA stopping a stream descriptor does not
-   power down the codec or its amplifiers, so a pop is not expected — but that
-   is a hardware property, it is H5's to listen for, and `AudioInfo` is deleted
-   at H3, so the hook that comment names has to move with the backend trait.
+5. ~~**soundd's mix loop carries a comment ordering `soundd: resumed` before "the
+   kernel's own `virtio-sound: stream 0 started` line".**~~ **Done at H3.** The
+   line is soundd's own now; it and `stream 0 stopped` keep their exact text,
+   because `check_suspend_structure` and `audio_idle_suspend` are written against
+   both and the events they name did not move.
+6. ~~**soundd's suspend block anticipates exactly this device**: "advertised
+   per-backend through `AudioInfo`."~~ **Done at H3**: `AudioInfo` is deleted and
+   the comment names the backend trait. Whether HDA pops on stop is still a
+   hardware property and still H5's to listen for.
 7. **`SYS_AUDIO_POLL` (84) is dead ABI and this file used to cite it as a live
    cost.** It is declared at `toyos-abi/src/syscall.rs:65` and appears nowhere
    else in the tree — no dispatch arm, no wrapper, no caller — so a call lands
