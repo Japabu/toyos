@@ -389,7 +389,11 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
     let t0 = crate::clock::nanos_since_boot();
 
-    let backing: Arc<dyn crate::file_backing::FileBacking> = match vfs::lock().open_backing(path) {
+    // The guard is scoped rather than held across the match: every `return`
+    // past this point drops `fds`, and releasing a file descriptor takes the
+    // VFS lock (`fd::OpenFile::drop`).
+    let opened = vfs::lock().open_backing(path);
+    let backing: Arc<dyn crate::file_backing::FileBacking> = match opened {
         Some(b) => b,
         None => {
             log!("spawn: {}: not found", path);

@@ -54,6 +54,48 @@ impl IdKey for RingId {
     const ONE: Self = RingId(1);
 }
 
+/// An owned reference to a ring. Creation and `Clone` bump the ring's
+/// reference count, `Drop` tears it down at zero — the `PipeReader` shape.
+/// Held by `Descriptor::IoUring`, so a `dup`ped ring fd stays usable after the
+/// original is closed instead of naming a destroyed instance.
+pub struct RingRef(RingId);
+
+impl RingRef {
+    pub fn id(&self) -> RingId { self.0 }
+}
+
+impl Clone for RingRef {
+    fn clone(&self) -> Self {
+        let mut guard = IO_URINGS.lock();
+        let map = guard.as_mut().expect("io_uring not initialized");
+        // A live `RingRef` whose instance is gone is a refcount bug: the
+        // instance is removed only when the last one drops.
+        map.get_mut(self.0).expect("RingRef outlived its ring").refs += 1;
+        Self(self.0)
+    }
+}
+
+impl Drop for RingRef {
+    fn drop(&mut self) {
+        let instance = {
+            let mut guard = IO_URINGS.lock();
+            let map = guard.as_mut().expect("io_uring not initialized");
+            let instance = map.get_mut(self.0).expect("RingRef outlived its ring");
+            instance.refs -= 1;
+            if instance.refs > 0 {
+                return;
+            }
+            map.remove(self.0)
+        };
+        if let Some(mut instance) = instance {
+            // The polls' `WatcherGuard`s clean the per-source watcher lists.
+            instance.pending_polls.clear();
+            // Unmaps from every process and frees the backing pages.
+            let _ = shared_memory::destroy(instance.shm_token, instance.owner_pid);
+        }
+    }
+}
+
 // IoUringOp — type-safe op code, converted from raw u8 at boundary
 
 #[derive(Clone, Copy)]
@@ -155,6 +197,8 @@ const MAX_PENDING_POLLS: usize = 1024;
 struct IoUringInstance {
     shm_phys: DirectMap,
     shm_token: SharedToken,
+    /// Live `RingRef`s. Never zero while this entry is in the map.
+    refs: u32,
     sq_size: u32,
     cq_size: u32,
     pending_polls: Vec<PendingPoll>,
@@ -234,8 +278,8 @@ pub fn init() {
 /// `submit_sqes` that a process can influence.
 const MAX_SQ_DEPTH: u32 = 256;
 
-/// Create an io_uring instance. Returns (ring_id, shared_memory_token).
-pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
+/// Create an io_uring instance. Returns (ring reference, shared_memory_token).
+pub fn create(depth: u32) -> Result<(RingRef, SharedToken), SyscallError> {
     if depth == 0 || depth > MAX_SQ_DEPTH || !depth.is_power_of_two() {
         return Err(SyscallError::InvalidArgument);
     }
@@ -284,6 +328,7 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
         map.insert(IoUringInstance {
             shm_phys,
             shm_token,
+            refs: 1,
             sq_size,
             cq_size,
             pending_polls: Vec::new(),
@@ -293,7 +338,7 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
         })
     };
 
-    Ok((ring_id, shm_token))
+    Ok((RingRef(ring_id), shm_token))
 }
 
 // Enter — submit SQEs and/or wait for CQEs
@@ -568,7 +613,7 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
 
     let listener_id = process::with_fd_owner_data(|data| {
         match data.fds.get(fd_num) {
-            Some(fd::Descriptor::Listener(id)) => Some(*id),
+            Some(fd::Descriptor::Listener(l)) => Some(l.id()),
             _ => None,
         }
     });
@@ -601,10 +646,9 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
 fn process_close(ring_id: RingId, sqe: &IoUringSqe) {
     let fd_num = sqe.fd as u32;
     let user_data = sqe.user_data;
-    let pid = process::current_process();
 
     let result = process::with_fd_owner_data(|data| {
-        fd::close(&mut data.fds, &mut *crate::vfs::lock(), fd_num, pid, &mut data.pipe_maps)
+        fd::close(&mut data.fds, fd_num, &mut data.pipe_maps)
     });
 
     post_cqe_locked(ring_id, user_data, result as i32, 0);
@@ -737,20 +781,6 @@ pub fn remove_fd(sources: &[Option<Source>]) {
 }
 
 /// Destroy an io_uring instance. Called when the ring fd is closed.
-pub fn destroy(ring_id: RingId) {
-    let instance = {
-        let mut guard = IO_URINGS.lock();
-        let map = guard.as_mut().expect("io_uring not initialized");
-        map.remove(ring_id)
-    };
-
-    if let Some(mut instance) = instance {
-        // Drop all pending polls (WatcherGuards clean up watcher lists)
-        instance.pending_polls.clear();
-        // Destroy shared memory region — unmaps from all processes, frees backing pages
-        let _ = shared_memory::destroy(instance.shm_token, instance.owner_pid);
-    }
-}
 
 // Watcher list operations — dispatch to the source object
 

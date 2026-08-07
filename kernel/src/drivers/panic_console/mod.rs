@@ -156,7 +156,7 @@ static SNAPSHOT_LEN: AtomicUsize = AtomicUsize::new(0);
 /// already captured and not yet painted.
 static LIVE: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
 
-/// Set the first time a process claims `DEVICE_FRAMEBUFFER`. Boot checkpoints
+/// Set the first time a process claims `DeviceType::Framebuffer`. Boot checkpoints
 /// stop repainting once something owns the screen; a *fatal* panic ignores
 /// this entirely and takes the screen back unconditionally.
 static SCREEN_OWNED_BY_USERLAND: AtomicBool = AtomicBool::new(false);
@@ -888,7 +888,7 @@ fn row_base(fb: &Fb, y: usize, len: usize) -> Option<*mut u32> {
 /// Paint the whole panel a colour no glyph contains, over whatever is there.
 ///
 /// The actuator for "something drew on the glass behind the console's back".
-/// Nothing else in reach can stage it: `DEVICE_FRAMEBUFFER` is claimed
+/// Nothing else in reach can stage it: `DeviceType::Framebuffer` is claimed
 /// exclusively so no second process can map the scanout, `boot_checkpoint`
 /// returns the moment userland owns the screen, and the one painter that
 /// ignores that claim — `render` — halts the machine on its way out, which

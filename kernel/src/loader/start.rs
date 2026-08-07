@@ -107,7 +107,13 @@ pub fn build_child_fds(pairs: &crate::user_ptr::UserBytes) -> Result<FdTable, Sy
         let child_fd = u32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
         let parent_fd = u32::from_ne_bytes([pair[4], pair[5], pair[6], pair[7]]);
         if let Some(desc) = data.fds.get(parent_fd) {
-            fds.insert_at(child_fd, desc.clone())?;
+            // A device claim admits one descriptor, so it cannot be given to a
+            // child: that would be a transfer, and there is no transfer
+            // operation — `capability-handles-spec.md` §6.5 scopes spawn-time
+            // device grants out of v1. Refused by name rather than skipped,
+            // which would start the child without an fd it asked for.
+            let child_desc = desc.duplicate().ok_or(SyscallError::PermissionDenied)?;
+            fds.insert_at(child_fd, child_desc)?;
         }
     }
     Ok(fds)

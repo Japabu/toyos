@@ -41,10 +41,57 @@ pub struct PendingConnection {
     pub client_pid: Pid,
 }
 
+/// An owned reference to a registered service.
+///
+/// Creation and `Clone` bump the listener's reference count, `Drop` decrements
+/// it and unbinds the name at zero — the `PipeReader`/`PipeWriter` shape. Held
+/// by `Descriptor::Listener`, so the name is bound exactly as long as some
+/// descriptor names it. `listen("x"); dup(fd); close(fd)` used to unbind it
+/// while leaving the dup live.
+pub struct ListenerRef(ListenerId);
+
+impl ListenerRef {
+    pub fn id(&self) -> ListenerId { self.0 }
+}
+
+/// A live `ListenerRef` whose entry is gone is a refcount bug and nothing else:
+/// the entry is removed only when the last one drops. Answering `None` here
+/// would turn that into a leaked name.
+fn entry(reg: &mut ListenerRegistry, id: ListenerId) -> &mut Listener {
+    reg.by_id.get_mut(id).expect("ListenerRef outlived its listener")
+}
+
+impl Clone for ListenerRef {
+    fn clone(&self) -> Self {
+        let mut guard = LISTENERS.lock();
+        entry(guard.as_mut().unwrap(), self.0).refs += 1;
+        Self(self.0)
+    }
+}
+
+impl Drop for ListenerRef {
+    fn drop(&mut self) {
+        let mut guard = LISTENERS.lock();
+        let reg = guard.as_mut().unwrap();
+        let listener = entry(reg, self.0);
+        listener.refs -= 1;
+        if listener.refs > 0 {
+            return;
+        }
+        // Unaccepted connections go with it: each `PendingConnection`'s
+        // PipeReader/PipeWriter drop frees its pipe.
+        if let Some(listener) = reg.by_id.remove(self.0) {
+            reg.by_name.remove(&listener.name);
+        }
+    }
+}
+
 struct Listener {
-    /// The name this listener was registered under, so `remove` can unbind it
-    /// while being addressed by id.
+    /// The name this listener was registered under, so the last `ListenerRef`
+    /// can unbind it while being addressed by id.
     name: String,
+    /// Live `ListenerRef`s. Never zero while this entry is in the map.
+    refs: u32,
     /// The process that registered the name. A client's `connect` learns the
     /// server's pid from here — without it a client knows only a service name
     /// and could not name its own peer.
@@ -69,7 +116,7 @@ pub fn init() {
     });
 }
 
-pub fn listen(name: &str, owner: Pid) -> Option<ListenerId> {
+pub fn listen(name: &str, owner: Pid) -> Option<ListenerRef> {
     let mut guard = LISTENERS.lock();
     let reg = guard.as_mut().unwrap();
     if reg.by_name.contains_key(name) {
@@ -77,13 +124,14 @@ pub fn listen(name: &str, owner: Pid) -> Option<ListenerId> {
     }
     let id = reg.by_id.insert(Listener {
         name: String::from(name),
+        refs: 1,
         owner,
         pending: VecDeque::new(),
         io_uring_watchers: Vec::new(),
         acceptors: new_queue(WaitClass::Ipc),
     });
     reg.by_name.insert(String::from(name), id);
-    Some(id)
+    Some(ListenerRef(id))
 }
 
 /// The process serving `name`.
@@ -148,20 +196,6 @@ pub fn has_pending_by_id(id: ListenerId) -> bool {
 pub fn listener_id(name: &str) -> Option<ListenerId> {
     let guard = LISTENERS.lock();
     guard.as_ref().unwrap().by_name.get(name).copied()
-}
-
-/// Remove a listener. Pending connections are dropped (PipeReader/PipeWriter Drop frees pipes).
-///
-/// Addressed by id, never by name: `ListenerId`s come from an `IdMap` and are
-/// never reused, so an id that has been removed names nothing forever. A
-/// descriptor that outlived its listener therefore cannot unregister — or
-/// accept on — whichever process holds that name now.
-pub fn remove(id: ListenerId) {
-    let mut guard = LISTENERS.lock();
-    let reg = guard.as_mut().unwrap();
-    if let Some(listener) = reg.by_id.remove(id) {
-        reg.by_name.remove(&listener.name);
-    }
 }
 
 pub fn add_io_uring_watcher(id: ListenerId, ring_id: RingId) {
