@@ -182,15 +182,25 @@ pub fn hda_probe(
     ordinary_boot_is_untouched()
 }
 
-/// The other half of the feature's promise: **nothing in the ordinary boot
-/// path takes that controller out of reset.**
+/// The other half of the feature's promise: **the probe is the feature and
+/// nothing else.**
 ///
-/// Same machine, same three controllers, a kernel without the feature. Not
-/// implied by anything above — a probe wired into `drivers::init` rather than
-/// behind the flag would satisfy every assertion in this file.
+/// Same machine, same three controllers, a kernel without the flag. Not implied
+/// by anything above — a probe wired into `drivers::init` rather than behind it
+/// would satisfy every assertion in this file.
+///
+/// It can no longer be "the log says nothing about HDA": H4's driver brings
+/// every class-0403 function up on every boot, which is what it is for. What
+/// the flag owns is the four verdict blocks and the widget dump, and those are
+/// what must be absent.
 fn ordinary_boot_is_untouched() -> Result<(), String> {
     let log = probe_boot(&[])?;
-    log.must_not_say("hda:")?;
+    for absent in ["=== H0 probe", "hda: (a)", "hda: (b)", "hda: (c)", "hda: (d)", "hda: codec"] {
+        log.must_not_say(absent)?;
+    }
+    // And the driver did run, so the assertion above is about the flag rather
+    // than about a boot that never reached the controllers.
+    log.must_say("hda: 00:10.0")?;
     log.must_say("Boot: complete")?;
     log.must_be_clean()
 }
@@ -218,6 +228,167 @@ fn probe_boot(features: &'static [&'static str]) -> Result<Serial, String> {
     // it would show here and nowhere else.
     log.push(&qemu.drain_serial(Duration::from_secs(1)));
     Ok(log)
+}
+
+/// H4's gate: a 440 Hz tone out of an Intel HDA controller soundd drives
+/// itself, read back off the device rather than off the guest's opinion.
+///
+/// `-audiodev wav` is the same ground truth gate A's four recorded configs use,
+/// and the machine differs from them in the sound card alone
+/// ([`Profile::Hda`]), so the capture is comparable by construction. What is
+/// asserted here is **harm** — the tone is present, continuous, and dithered —
+/// which is the fast tier's verdict. This is not a gate-A arm: it has no
+/// recorded distribution behind it, and §5.3's four baseline sections are
+/// unrecorded (`specs/hda-driver-plan.md` §6.6).
+pub fn hda_tone(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: Profile::Hda,
+            kernel_features: &["hda-allowlist-selftest"],
+            ..Default::default()
+        },
+    );
+    // soundd claims and configures the controller the instant it starts, which
+    // is after the ready marker and before any test command — a window neither
+    // `boot_log` nor `run_test`'s own capture covers.
+    let mut log = Serial::boot(&qemu);
+    log.push(&qemu.drain_serial(Duration::from_millis(500)));
+
+    let result = qemu.run_test("test_rs_audio_tone", Duration::from_secs(30));
+    if let Some(err) = &result.error {
+        return Err(err.clone());
+    }
+    if result.exit_code != Some(0) {
+        return Err(format!("the tone did not play: {:?}\n{}", result.exit_code, result.stdout));
+    }
+    log.push(&result.serial);
+    log.push(&qemu.drain_serial(Duration::from_millis(500)));
+    let serial = log.text().to_string();
+    log.must_say("hda: 00:")?;
+    log.must_say("bound, statests=")?;
+    log.must_say("soundd: hda codec0 vendor=1af4")?;
+    log.must_say("-> pin 0x03 (line-out)")?;
+    log.must_say("soundd: hda path configured in")?;
+    if serial.contains("presenting a null sink") {
+        return Err(format!("soundd fell back to the null sink:\n{serial}"));
+    }
+
+    // The allow-list, every arm, on the one caller that can reach it.
+    for want in [
+        "hda: selftest write ICW written",
+        "hda: selftest write SDnFMT written",
+        "hda: selftest write SDnCTL written",
+        "hda: selftest write SDnCTL-tag written",
+        "hda: selftest write SDnBDPL refused",
+        "hda: selftest write SDnBDPU refused",
+        "hda: selftest write SDnCBL refused",
+        "hda: selftest write SDnLVI refused",
+        "hda: selftest write SDnSTS refused",
+        "hda: selftest write SDnCTL-srst refused",
+        "hda: selftest write SDnCTL-wide refused",
+        "hda: selftest write INTCTL refused",
+        "hda: selftest write GCTL refused",
+        "hda: selftest read ICS read",
+        "hda: selftest read IRR read",
+        "hda: selftest read SDnLPIB refused",
+        "hda: selftest read STATESTS refused",
+    ] {
+        log.must_say(want)?;
+    }
+
+    let wav = crate::common::audio::parse_wav(qemu.audio_wav_path())?;
+    let analysis = crate::common::audio::analyze(&wav);
+    if analysis.peak < 8000 {
+        return Err(format!(
+            "the capture peaks at {} — the tone plays at 16000 and nothing reached the device",
+            analysis.peak
+        ));
+    }
+    let gaps = crate::common::audio::gap_histogram(&analysis, wav.sample_rate);
+    let dropouts: u32 = gaps.values().sum();
+    let breaks = crate::common::audio::phase_breaks(&wav);
+    eprintln!(
+        "  [hda] {} frames at {} Hz {} ch, peak {} active {:.2}s dither {:.1}% gaps {} \
+         phase-breaks {}",
+        wav.mono.len(),
+        wav.sample_rate,
+        wav.channels,
+        analysis.peak,
+        analysis.active_samples as f64 / wav.sample_rate as f64,
+        analysis.dither_ratio.unwrap_or(0.0) * 100.0,
+        crate::common::audio::format_histogram(&gaps),
+        breaks.len(),
+    );
+    if dropouts > 0 {
+        return Err(format!(
+            "{dropouts} mid-tone silences in the capture: {}",
+            crate::common::audio::format_histogram(&gaps)
+        ));
+    }
+    // The instrument the gap detector cannot be: an engine that replays a
+    // period nobody refilled puts the tone back 0.28 of a cycle out, and
+    // nothing about that is silent (§5.3 item 5, risk 7). Zero here and zero on
+    // all four virtio configs, measured — so the check has a calibration and
+    // not just a threshold.
+    //
+    // `dither_ratio` is deliberately not asserted, and is printed above so the
+    // difference is visible rather than hidden. It measures the longest
+    // *silent* run, and QEMU's two device models put different silence there:
+    // virtio-sound's capture opens before the stream does, so its longest
+    // silent run is soundd's own dithered output (24.6% on this host), while
+    // `intel-hda`'s wav voice runs only while the stream does and the longest
+    // silent run is host padding at the ends of the file. The virtio arm still
+    // asserts it, over a stretch that is soundd's.
+    if !breaks.is_empty() {
+        let where_ = |n: &usize| {
+            format!("{n} (period {:.1}, {:?})", *n as f64 / 128.0, &wav.mono[n - 1..=n + 1])
+        };
+        return Err(format!(
+            "the captured tone is not one sine: {} phase breaks at {}",
+            breaks.len(),
+            breaks.iter().take(8).map(where_).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    log.must_be_clean()
+}
+
+/// Two controllers, both with a codec that answers.
+///
+/// The kernel binds neither and names both. A first-match bind would go green
+/// on every other test in this file, and it is the defect `pci.rs` records one
+/// layer down — so this is the arm that makes the rule tested rather than
+/// merely written.
+pub fn hda_two_live_refused(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions { profile: Profile::HdaTwoLive, ..Default::default() },
+    );
+    let mut log = Serial::boot(&qemu);
+    log.push(&qemu.drain_serial(Duration::from_secs(1)));
+
+    log.must_say("hda: 00:")?;
+    log.must_say("has a live link (statests=")?;
+    log.must_say("controllers answer on this machine")?;
+    log.must_say("refused by name, no HDA audio")?;
+    log.must_not_say("bound, statests=")?;
+    // The machine still boots and still has a sink: absence of hardware is a
+    // routing state, and a refusal must not be a machine that will not run.
+    log.must_say("presenting a null sink")?;
+    log.must_say("Boot: complete")?;
+    log.must_be_clean()
 }
 
 /// Every `hda:` line from one controller's banner up to the next one's.

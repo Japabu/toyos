@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::mm::paging::CachePolicy;
-use crate::mm::{PAGE_2M, align_2m};
+use crate::mm::{PAGE_2M, Unmapped, align_2m};
 use crate::process::{PageTables, Pid};
 use crate::sync::Lock;
 use crate::{DirectMap, UserAddr};
@@ -76,6 +76,11 @@ impl SharedRegion {
     }
 
     /// Unmap this region from a process, returning the VA to its AddressSpace pool.
+    ///
+    /// The virtual address goes back to that process's allocator, so even where
+    /// no physical page is freed the caller still owes a shootdown: a sibling
+    /// holding a stale entry for the address reads whatever the next mapping
+    /// puts there.
     fn unmap_from(&mut self, pid: Pid) {
         if let Some(pos) = self.mapped_in.iter().position(|(p, _, _)| *p == pid) {
             let (_, pt, vaddr) = self.mapped_in.swap_remove(pos);
@@ -83,10 +88,14 @@ impl SharedRegion {
         }
     }
 
-    /// Unmap from all processes. Takes self by value — region must be dropped after.
-    fn unmap_all(self) {
-        for (_, pt, vaddr) in &self.mapped_in {
-            pt.lock().free_and_unmap(*vaddr);
+    /// Unmap from every process that holds a mapping.
+    ///
+    /// By `&mut self` and not by value: the region has to outlive the shootdown
+    /// its callers owe, because dropping it is what returns the pages to the
+    /// PMM. Taking it by value put the free strictly *before* the flush.
+    fn unmap_all(&mut self) {
+        for (_, pt, vaddr) in self.mapped_in.drain(..) {
+            pt.lock().free_and_unmap(vaddr);
         }
     }
 }
@@ -166,17 +175,27 @@ pub fn register(phys: DirectMap, size: u64, cache: CachePolicy) -> SharedToken {
     token
 }
 
-/// Unregister a kernel-owned shared region, unmapping it from all processes.
-/// Returns `(phys, size)` so the caller can free the backing memory.
-pub fn unregister(token: SharedToken) -> Option<(DirectMap, u64)> {
+/// Regions unmapped from every process and not yet freed, held by the caller so
+/// that the shootdown happens before their memory can be reissued. Opaque: the
+/// only thing anyone does with one is drop it, and the drop is the point.
+pub struct Retired(Vec<SharedRegion>);
+
+/// Unregister a shared region, unmapping it from all processes.
+///
+/// The wrapper is built outside `with_regions_mut` on purpose: constructing it
+/// costs nothing, but *dropping* it waits for every other CPU, and doing that
+/// under the region lock would hold it across an IPI round trip.
+///
+/// It used to return `(phys, size)` "so the caller can free the backing memory",
+/// which no caller ever did — `virtio_gpu` frees through the `FbAlloc` it kept.
+pub fn unregister(token: SharedToken) -> Option<Unmapped<Retired>> {
     with_regions_mut(|regions| {
         let pos = regions.iter().position(|(t, _)| *t == token)?;
-        let (_, region) = regions.swap_remove(pos);
-        let phys = region.phys;
-        let size = region.size;
+        let (_, mut region) = regions.swap_remove(pos);
         region.unmap_all();
-        Some((phys, size))
+        Some(Retired(alloc::vec![region]))
     })
+    .map(Unmapped::new)
 }
 
 /// Grant a process permission to map a shared region. Owner only.
@@ -266,23 +285,26 @@ fn unreachable_region(region: &SharedRegion) -> bool {
 /// is unchanged. A working reclaim path makes that debt less visible, not less
 /// real.
 pub fn release(token: SharedToken, pid: Pid) -> Result<(), Error> {
-    with_regions_mut(|regions| {
+    let dropped = with_regions_mut(|regions| {
         let pos = regions.iter().position(|(t, _)| *t == token)
             .ok_or(Error::NotFound)?;
         let (_, region) = &mut regions[pos];
         region.allowed.retain(|p| *p != pid);
         region.unmap_from(pid);
-        if unreachable_region(region) {
-            regions.swap_remove(pos); // PhysPages freed via Drop
-        }
-        Ok(())
-    })
+        Ok(unreachable_region(region).then(|| regions.swap_remove(pos)))
+    })?;
+    // Out here, and it is the drop that frees the pages: `unmap_from` cleared
+    // this process's PDEs on this CPU alone, so until every other one has
+    // flushed, a sibling thread still has a writable window onto memory the PMM
+    // is about to hand to somebody else.
+    drop(Unmapped::new(dropped));
+    Ok(())
 }
 
 /// Destroy a process-owned shared region: unmap from all processes, remove from
 /// table, and free backing pages (via Drop). The caller must be the owner.
 pub fn destroy(token: SharedToken, owner: Pid) -> Result<(), Error> {
-    with_regions_mut(|regions| {
+    let dropped = with_regions_mut(|regions| {
         let pos = regions.iter().position(|(t, _)| *t == token)
             .ok_or(Error::NotFound)?;
         let (_, ref region) = regions[pos];
@@ -290,11 +312,12 @@ pub fn destroy(token: SharedToken, owner: Pid) -> Result<(), Error> {
             Ownership::Process { pid, .. } if *pid == owner => {}
             _ => return Err(Error::PermissionDenied),
         }
-        let (_, region) = regions.swap_remove(pos);
+        let (_, mut region) = regions.swap_remove(pos);
         region.unmap_all();
-        // region dropped here → PhysPages dropped → pages returned to PMM
-        Ok(())
-    })
+        Ok(region)
+    })?;
+    drop(Unmapped::new(dropped));
+    Ok(())
 }
 
 /// Remove all mappings and permissions for a given PID, freeing any region
@@ -305,12 +328,26 @@ pub fn destroy(token: SharedToken, owner: Pid) -> Result<(), Error> {
 /// pages a grantee was still entitled to map; `unreachable_region` waits for
 /// the grantee too, and cannot leak while waiting because every pid in
 /// `allowed` names a process whose own exit passes through here.
-pub fn cleanup_process(pid: Pid) {
-    with_regions_mut(|regions| {
-        regions.retain_mut(|(_, region)| {
+pub fn cleanup_process(pid: Pid) -> Unmapped<Retired> {
+    let dropped = with_regions_mut(|regions| {
+        let mut dropped = Vec::new();
+        let mut i = 0;
+        while i < regions.len() {
+            let (_, region) = &mut regions[i];
             region.unmap_from(pid);
             region.allowed.retain(|p| *p != pid);
-            !unreachable_region(region)
-        });
-    })
+            if unreachable_region(region) {
+                // `swap_remove` moves the last entry into `i`, so the index is
+                // not advanced — the entry now sitting there has not been asked.
+                dropped.push(regions.swap_remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        dropped
+    });
+    // Handed back rather than dropped here, because this runs under the process
+    // table lock and the drop waits for every other CPU. The caller drops it
+    // where nothing is held.
+    Unmapped::new(Retired(dropped))
 }

@@ -11,6 +11,7 @@ static DEBUG_WAIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 
 pub use mm::{UserAddr, DirectMap, PHYS_OFFSET};
 
+mod shootdown;
 mod sync;
 mod id_map;
 
@@ -398,7 +399,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
         .expect("ACPI: failed to find ECAM base address");
-    let ecam = mm::paging::kernel().lock().as_mut().unwrap().map_mmio(ecam_base, 256 * 32 * 8 * 4096, CachePolicy::DeferToMtrr);
+    let ecam = mm::paging::map_mmio(ecam_base, 256 * 32 * 8 * 4096, CachePolicy::DeferToMtrr);
     let pci_devices = pci::enumerate(&ecam);
     // After ACPI is readable and PCI is enumerable, before any driver `init`:
     // the unit has to be programmed before the first device is told to do DMA
@@ -539,6 +540,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     if let Some((sound, audio_info)) = virtio_sound::init(&pci_devices) {
         crate::audio::register(sound, audio_info);
     }
+    drivers::hda::init(&pci_devices);
 
     if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(&pci_devices) {
         log!("GPU: using VirtIO");

@@ -424,7 +424,7 @@ pub fn init(devices: &[PciDevice]) -> Option<NvmeBlockDevice> {
     pci_dev.enable_bus_master();
     log!("NVMe: BAR0={:#x}", bar_addr);
 
-    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x4000, CachePolicy::DeferToMtrr);
+    let bar = crate::mm::paging::map_mmio(bar_addr, 0x4000, CachePolicy::DeferToMtrr);
 
     let cap = bar.read_u64(REG_CAP);
     let stride = ((cap >> 32) & 0xF) as u32;

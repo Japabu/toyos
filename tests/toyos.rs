@@ -113,6 +113,7 @@ const SHARED_BLOCK: Sched = Sched::Parallel;
 // Rust helper binaries that are spawned by tests, not tests themselves.
 const RUST_SKIP: &[&str] = &[
     "segfault_child",
+    "disk_backtrace_child",
     "test_panic_child",
     "i8042_keyboard",
     "i8042_mouse",
@@ -479,6 +480,11 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Two boots, one kernel build each: the probe's own, and the plain kernel
     // on the same machine to show it stays out of an ordinary boot.
     ("hda_probe", Sched::Parallel),
+    // H4: soundd driving an Intel HDA controller itself, read back off the
+    // device. Serial — its verdict is a wav capture, and one taken while eleven
+    // other guests contend for the host measures the host.
+    ("hda_tone", Sched::Serial),
+    ("hda_two_live_refused", Sched::Parallel),
     ("serial_vocabulary", Sched::Parallel),
     // Host-side, no guest: the harness asking whether it can still tell a
     // suspended machine from a slow one, and whether it reports one as a
@@ -653,6 +659,19 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
     // each time — so a green is one sample of a rate and may not red the run.
     // A month: long enough that a fix already in flight lands first, short
     // enough that nobody inherits this silently.
+    stale: Stale::OnThisDate("2026-09-06"),
+}, ExpectedFailure {
+    test: "hda_tone",
+    task: 88,
+    spec: "specs/known-issues.md §4, \"HDA: the captured tone is not one sine\"",
+    // Only the phase check. Everything else `hda_tone` asserts — the kernel
+    // binding one controller, soundd walking the codec and naming its pin, the
+    // whole allow-list, a tone at full amplitude, no mid-tone silence — reds the
+    // run, because each of those is the milestone rather than the open question.
+    says: &["the captured tone is not one sine"],
+    // Intermittent: seven runs on this host gave 8, 8, 8, 8, 8, 16 and 0 breaks,
+    // so a green is one sample and may not red a healthy tree. The date is the
+    // same month the entry above uses, for the same reason.
     stale: Stale::OnThisDate("2026-09-06"),
 }];
 
@@ -925,6 +944,42 @@ fn check_panic_recovery(result: &TestResult) -> bool {
     ok
 }
 
+/// The kernel names the frames of a process it loaded off a **disk**.
+///
+/// `check_panic_recovery` above asserts the same thing for a process loaded out
+/// of the initrd, and that was the only demangled-name assertion in the tree.
+/// The two paths were different code: the initrd answered
+/// `FileBacking::memory_ptr` and nothing else did, so this one produced a
+/// backtrace of bare `[exe+0x…]` offsets and no test could tell. Watch it red
+/// with `read_backtrace_table` replaced by `SymbolTable::empty_with_bounds`.
+///
+/// `null_deref_run_from_disk` is this child's alone, so a `contains` over the
+/// capture window cannot be satisfied by `segfault_child` running in the same
+/// boot.
+fn check_disk_backtrace(result: &TestResult) -> bool {
+    if !check_rust_result(result) {
+        return false;
+    }
+
+    let checks: &[(&str, &str)] = &[
+        ("SEGFAULT tid=", "expected a SEGFAULT header for the child run off /home"),
+        (
+            "null_deref_run_from_disk",
+            "expected the faulting function's demangled name — a process loaded off a disk \
+             got a backtrace with no names in it",
+        ),
+    ];
+
+    let mut ok = true;
+    for (needle, msg) in checks {
+        if !result.serial.contains(needle) {
+            eprintln!("FAIL rs::disk_backtrace: {msg}\nserial:\n{}", result.serial);
+            ok = false;
+        }
+    }
+    ok
+}
+
 /// The §6.4 tripwire must fire, and its `panicked at` must name the syscall
 /// that held the lock rather than the scheduler that caught it — which is the
 /// only thing `#[track_caller]` on `assert_baseline` buys.
@@ -985,6 +1040,7 @@ fn check_audio_idle_suspend(result: &TestResult) -> bool {
 fn check_for(name: &str) -> fn(&TestResult) -> bool {
     match name {
         "panic_recovery" => check_panic_recovery,
+        "disk_backtrace" => check_disk_backtrace,
         "audio_idle_suspend" => check_audio_idle_suspend,
         _ => check_rust_result,
     }
@@ -1195,12 +1251,14 @@ fn measure_audio_run(
     // the quiet reading.
     let host = hostload::HostLoad::sample();
     eprintln!(
-        "        {label}{name} smp={smp} gaps: {} (baseline {}) peak {} active {:.2}s dither {:.1}%",
+        "        {label}{name} smp={smp} gaps: {} (baseline {}) peak {} active {:.2}s dither {:.1}% \
+         phase-breaks {}",
         audio::format_histogram(&gaps),
         audio::format_histogram(&baseline.gaps),
         analysis.peak,
         secs(analysis.active_samples),
         analysis.dither_ratio.unwrap_or(0.0) * 100.0,
+        audio::phase_breaks(&wav).len(),
     );
     eprintln!(
         "        {label}{name} smp={smp} soundd: wake_lat {}us ({:.2} pipelines, limit {}us) \
@@ -2823,6 +2881,29 @@ fn run_screen_test(
                 }
             };
 
+            // How long the unattended deadline actually takes to move the page,
+            // measured before a key is pressed because the first key retires it
+            // for good. This is what stops the last phase passing vacuously: a
+            // guest too slow to have paged in its window would prove nothing by
+            // not paging, and this is the window measured on *this* guest.
+            let timing_from = Instant::now();
+            let unattended_move = loop {
+                let Some(now) = footer(&mut qemu) else {
+                    return Err("the footer vanished while timing the unattended deadline".into());
+                };
+                if now != last {
+                    last = now;
+                    break timing_from.elapsed();
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "the pager never advanced on its own in {:.1}s against a 3s deadline — \
+                         nothing here can say whether a keystroke stops it",
+                        timing_from.elapsed().as_secs_f64()
+                    ));
+                }
+            };
+
             // One keystroke per sample. Every one of them should move the page,
             // where the 3 s deadline that stands in for a dead keyboard could
             // not have moved it more than once per 3 s of the elapsed run.
@@ -2841,27 +2922,79 @@ fn run_screen_test(
             }
             let elapsed = started.elapsed();
 
-            // What the deadline alone could have contributed, plus the one it
-            // may have been part-way through when the window opened. The
-            // verdict is a rate against the guest's own clock, which is why
-            // this test is `Sched::Serial`.
+            // What the deadline could have contributed if it were still running.
+            // It is not — the first keystroke above retired it — so this is a
+            // ceiling the run cannot reach and the bound is the more
+            // conservative for it. The verdict is a rate against the guest's own
+            // clock, which is why this test is `Sched::Serial`.
             let unattended = elapsed.as_secs_f64() / 3.0 + 1.0;
-            print_screen(
-                name,
-                &format!(
-                    "{moved} of {SAMPLES} keystrokes moved the page in {:.1}s; the 3s deadline \
-                     could account for {unattended:.1}",
-                    elapsed.as_secs_f64()
-                ),
-            );
             if (moved as f64) < unattended * 3.0 {
                 return Err(format!(
-                    "{moved} page moves over {SAMPLES} keystrokes in {:.1}s — the unattended \
+                    "{moved} page moves over {SAMPLES} keystrokes in {:.1}s — an unattended \
                      deadline alone could have produced {unattended:.1} of them, so nothing \
                      here says a keystroke reached the halted pager",
                     elapsed.as_secs_f64()
                 ));
             }
+
+            // Let the backlog drain before watching. A full-panel repaint on a
+            // 1920x1080 GOP outlasts QEMU's 16-byte PS/2 queue, so the pager is
+            // still working through keys for a moment after the last one is sent
+            // — and those moves are the reader's, not the deadline's. Settling is
+            // waiting for one page to stay up longer than a repaint takes.
+            const SETTLED: Duration = Duration::from_secs(1);
+            let settle_by = Instant::now() + qemu::budget(Duration::from_secs(20));
+            let mut held = last.clone();
+            let mut stable_since = Instant::now();
+            loop {
+                let Some(now) = footer(&mut qemu) else {
+                    return Err("the footer vanished while the keystroke backlog drained".into());
+                };
+                if now != held {
+                    held = now;
+                    stable_since = Instant::now();
+                } else if stable_since.elapsed() >= SETTLED {
+                    break;
+                }
+                if Instant::now() >= settle_by {
+                    return Err(format!(
+                        "the pager never held one page for {}s in the 20s after the last keystroke",
+                        SETTLED.as_secs()
+                    ));
+                }
+            }
+
+            // And now the owner's complaint, which is the other half: a page he
+            // steered to must stay up. The window is twice what the unattended
+            // deadline was measured to need above, so a pager still running it
+            // moves at least twice inside this and a slow guest cannot pass by
+            // being slow.
+            let quiet = unattended_move * 2 + Duration::from_secs(1);
+            let watching_from = Instant::now();
+            while watching_from.elapsed() < quiet {
+                let Some(now) = footer(&mut qemu) else {
+                    return Err("the footer vanished while watching a steered page".into());
+                };
+                if now != held {
+                    return Err(format!(
+                        "the page moved from {held:?} to {now:?} on its own {:.1}s into a {:.1}s \
+                         watch after the last keystroke — the deadline is still running under a \
+                         reader who has taken the wheel, which is what it must not do",
+                        watching_from.elapsed().as_secs_f64(),
+                        quiet.as_secs_f64()
+                    ));
+                }
+            }
+            print_screen(
+                name,
+                &format!(
+                    "{moved} of {SAMPLES} keystrokes moved the page in {:.1}s; unattended it \
+                     moved once in {:.1}s, and after a keystroke it held {held} for {:.1}s",
+                    elapsed.as_secs_f64(),
+                    unattended_move.as_secs_f64(),
+                    quiet.as_secs_f64(),
+                ),
+            );
             Ok(())
         }
         "screen_fatal_halt" => {
@@ -5638,8 +5771,28 @@ fn run_machine_test(
             // alive: ten of the owner's boots are byte-identical between the
             // ones that froze and the ones that did not. The gate has to prove
             // three things a `must_say` cannot — that the lines *keep coming*,
-            // that they come at the period claimed, and that the mask is a
-            // real per-CPU reading rather than a constant.
+            // that no CPU drops out of the mask on a machine with nothing to
+            // do, and that no window between two lines is wide enough to hide a
+            // death.
+            //
+            // The second is why this asserts a *constant full* mask where the
+            // old gate asserted a *varying* one — and the old gate's assertion
+            // was satisfied by the defect, so it certified it. Same guest with
+            // the tick removed: 10 of 11 lines below `alive=8/8`, six of them at
+            // `alive=2/8`, 56 lines naming a silent CPU and one silent for
+            // 2.811 s. Every line is `8/8` with the tick.
+            //
+            // The gap bound below is the one with no demonstrated teeth here:
+            // without the tick the widest gap was still 0.260 s, because QEMU's
+            // devices keep waking *someone* even when they wake nobody in
+            // particular. It is carried for the metal log, where the same code
+            // left gaps of 14 s to 102 s.
+            //
+            // **What none of it establishes**: a QEMU guest is never as quiet as
+            // the owner's laptop. This proves the tick arms, fires and re-arms,
+            // and that the instrument reads a full mask when nothing is wrong.
+            // It cannot prove the T14's LAPIC keeps counting through whatever
+            // its firmware does with a halted core.
             let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
@@ -5664,18 +5817,50 @@ fn run_machine_test(
                     beats.len()
                 ));
             }
-            // The mask has to *be* a reading. A constant would pass every
-            // cadence assertion above while telling the owner nothing about
-            // which CPUs stopped, which is the whole second half of the line.
-            let masks: BTreeSet<&str> = beats
-                .iter()
-                .filter_map(|l| l.split("mask=").nth(1))
-                .map(|m| m.split_whitespace().next().unwrap_or(""))
+            // A clear bit has to mean "that CPU stopped". On a machine with
+            // nothing to run that is only true if every CPU is woken anyway, so
+            // the assertion is that none is ever missing — and the per-CPU lines
+            // the kernel prints for a missing one must never appear at all.
+            let thin: Vec<&&str> = beats.iter().filter(|l| !l.contains("alive=8/8")).collect();
+            let named: Vec<&str> = log
+                .lines()
+                .filter(|l| l.contains("heartbeat: cpu"))
                 .collect();
-            if !beats.iter().any(|l| l.contains("passes=8/8")) && masks.len() < 2 {
+            if !thin.is_empty() || !named.is_empty() {
                 return Err(format!(
-                    "every heartbeat reports the same mask {masks:?} and none reports all eight \
-                     CPUs — the per-CPU field is not a reading\n{log}"
+                    "{} of {} heartbeats dropped a CPU from the mask and {} named one silent, on a \
+                     guest where every CPU is healthy — so a clear bit does not mean that CPU \
+                     stopped, which is the whole of the field\n{}\n{}\n{log}",
+                    thin.len(),
+                    beats.len(),
+                    named.len(),
+                    thin.iter().take(4).map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
+                    named.iter().take(4).cloned().collect::<Vec<_>>().join("\n"),
+                ));
+            }
+            // And no window between two lines may be wide enough to hide a
+            // death. The metal boots this exists for went quiet for between 14 s
+            // and 102 s; four times the period is far below any of them and far
+            // above anything a loaded host does to a 250 ms cadence.
+            const MAX_GAP_S: f64 = 1.0;
+            let gaps: Vec<f64> = beats
+                .iter()
+                .filter_map(|l| l.split("gap=").nth(1))
+                .filter_map(|g| g.trim_end_matches('s').split_whitespace().next()?.parse().ok())
+                .collect();
+            if gaps.len() != beats.len() {
+                return Err(format!(
+                    "{} of {} heartbeats carry no readable gap= — the field a reader uses to tell \
+                     a machine that went quiet from one that died\n{log}",
+                    beats.len() - gaps.len(),
+                    beats.len()
+                ));
+            }
+            let worst = gaps.iter().copied().fold(0.0f64, f64::max);
+            if worst > MAX_GAP_S {
+                return Err(format!(
+                    "the widest window between two heartbeats was {worst:.3}s against a 250 ms \
+                     period — the machine stopped reporting for long enough to have died in\n{log}"
                 ));
             }
             // And the clock in the line advances, or the timestamp cannot
@@ -5692,9 +5877,8 @@ fn run_machine_test(
                 ));
             }
             eprintln!(
-                "  [heartbeat] {} lines in ~3 s, {} distinct mask(s), t={} → t={}",
+                "  [heartbeat] {} lines in ~3 s, all alive=8/8, widest gap {worst:.3}s, t={} → t={}",
                 beats.len(),
-                masks.len(),
                 stamps.first().unwrap_or(&"?"),
                 stamps.last().unwrap_or(&"?")
             );
@@ -5737,6 +5921,10 @@ fn run_machine_test(
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         // Body in `tests/common/hda.rs`, same reason.
         "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
+        "hda_tone" => common::hda::hda_tone(test_config, c_bins, rust_bins),
+        "hda_two_live_refused" => {
+            common::hda::hda_two_live_refused(test_config, c_bins, rust_bins)
+        }
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "dump_nmi_probe" => faults::dump_nmi_probe(test_config, c_bins, rust_bins),
@@ -8517,6 +8705,9 @@ fn build_test_registry(
     for name in discover_rust_tests(rust_bins) {
         let timeout = match name.as_str() {
             "panic_recovery" => Duration::from_secs(10),
+            // Writes the child's whole image through bcachefs before it can run
+            // it, which is the only thing here that is not a spawn.
+            "disk_backtrace" => Duration::from_secs(15),
             // Its verdict is that a parked waiter woke, so the failing run is
             // the slow one: it spends its own patience before reporting, and
             // the report is worth more than the harness's timeout message.
@@ -9727,6 +9918,25 @@ fn main() {
         };
         host_budget =
             n.parse().unwrap_or_else(|_| panic!("--host-slots: {n:?} is not a budget"));
+    }
+
+    // And how many of this host's *compiles* may run at once, across every
+    // worktree. A worker holds a guest slot from the moment it takes a task and
+    // spends the first part of it building a kernel variant, so twelve workers
+    // are twelve concurrent `cargo build`s and no guest at all.
+    for (i, a) in args.iter().enumerate() {
+        let n = if let Some(v) = a.strip_prefix("--host-builds=") {
+            v
+        } else if a == "--host-builds" {
+            args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
+                panic!("--host-builds needs a budget, e.g. --host-builds 4 (0 turns it off)")
+            })
+        } else {
+            continue;
+        };
+        toyos_build::buildlock::set_host_builds(
+            n.parse().unwrap_or_else(|_| panic!("--host-builds: {n:?} is not a budget")),
+        );
     }
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
 

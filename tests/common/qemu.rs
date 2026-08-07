@@ -316,6 +316,23 @@ pub enum Profile {
     /// address is the only way to state "these two are functions of one
     /// device" — which is the whole of the first bullet.
     MetalHda,
+    /// [`Profile::Headless`] with its virtio sound card replaced by an Intel
+    /// HDA controller and one codec — the machine soundd drives itself.
+    ///
+    /// Everything else is held still on purpose. The console is still
+    /// virtio-serial, the NIC is still there, the disks are the same: what
+    /// differs from the machine gate A's four recorded configs run on is the
+    /// sound card, so a difference in the capture is a difference in the audio
+    /// path. It is not the T14's shape and does not try to be —
+    /// [`Profile::MetalHda`] is the shape arm and this is the audio one.
+    Hda,
+    /// [`Profile::Hda`] with a second controller that also has a codec.
+    ///
+    /// Two live links, which the kernel refuses by name rather than binding
+    /// the first: choosing between them means walking their codec graphs, and
+    /// that is the driver's work. The negative control on the whole bind path
+    /// — a first-match kernel would go green on every other HDA test.
+    HdaTwoLive,
 }
 
 /// The vIOMMU a profile puts on the machine.
@@ -396,6 +413,23 @@ const HDA_THREE: &[&str] = &[
     "hda-output,bus=hda2.0,cad=0,audiodev=hdaaud",
 ];
 
+/// One controller with one codec: the ordinary machine, and the one an audio
+/// arm needs. `hda-output` because it is a playback-only codec — the driver
+/// configures no input path and a duplex codec would only add widgets nothing
+/// walks.
+const HDA_ONE: &[&str] = &["intel-hda,id=hda0", "hda-output,bus=hda0.0,cad=0,audiodev=hdaaud"];
+
+/// Two controllers, each with a codec that answers.
+///
+/// The state the kernel refuses: it can tell which links are alive and cannot
+/// tell which one a human is wired to, so binding either would be a guess.
+const HDA_TWO_LIVE: &[&str] = &[
+    "intel-hda,id=hda0",
+    "hda-output,bus=hda0.0,cad=0,audiodev=hdaaud",
+    "intel-hda,id=hda1",
+    "hda-output,bus=hda1.0,cad=0,audiodev=hdaaud",
+];
+
 /// Whether a machine has the virtio block, and whether its NIC can raise an
 /// interrupt.
 ///
@@ -414,11 +448,25 @@ enum Virtio {
     /// virtio-sound's and virtio-serial's left alone — so the console still
     /// carries the refusal and audio still works while networking does not.
     NicWithoutMsix,
+    /// The whole block **without virtio-sound**, so the machine's only audio
+    /// device is the one in `hda`.
+    ///
+    /// Not a lesser [`Virtio::Present`]: soundd claims a kernel-driven card
+    /// before it looks for a controller to drive itself, so a machine carrying
+    /// both would exercise the virtio path and nothing else. This is what makes
+    /// an HDA arm of gate A a *different machine* rather than a different flag,
+    /// and it keeps the console, the NIC and the timing of the recorded audio
+    /// configs so the two arms differ in the sound card and not in the machine.
+    WithoutSound,
 }
 
 impl Virtio {
     fn present(self) -> bool {
         self != Self::Absent
+    }
+
+    fn sound(self) -> bool {
+        matches!(self, Self::Present | Self::NicWithoutMsix)
     }
 }
 
@@ -944,6 +992,16 @@ impl Profile {
                 hda: HDA_THREE,
                 iommu: Some(IOMMU_DEFAULT),
             },
+            Self::Hda => Shape {
+                virtio: Virtio::WithoutSound,
+                hda: HDA_ONE,
+                ..Self::Headless.shape()
+            },
+            Self::HdaTwoLive => Shape {
+                virtio: Virtio::WithoutSound,
+                hda: HDA_TWO_LIVE,
+                ..Self::Headless.shape()
+            },
         }
     }
 
@@ -1130,12 +1188,20 @@ pub fn build_boot_image(
 /// A feature that changes what `init` does, what a driver reads, or what a
 /// ceiling is worth belongs in its own build and is not eligible.
 /// `specs/test-cost-audit.md` §5.4.3 classifies every one of them.
+///
+/// `test-tlb-ack-delay` is the one member whose code is not confined to the
+/// match arm: `arch::tlb::serve_ipi` loads one relaxed word per flush. Nothing
+/// writes that word except the arm, and its own gate re-measures with the delay
+/// disarmed, so a kernel carrying the feature and never asked flushes exactly as
+/// one without it. Stated rather than assumed, because the claim above is what
+/// makes folding sound.
 const INERT_ACTUATORS: &[&str] = &[
     "test-fatal-halt",
     "test-screen-graffiti",
     "test-double-fault",
     "test-heap-ceiling",
     "test-kernel-canary",
+    "test-tlb-ack-delay",
 ];
 
 /// The feature set to build, with every inert actuator replaced by the union of
@@ -2137,11 +2203,26 @@ fn qemu_command(
     }
 
     if !shape.hda.is_empty() {
-        // The codecs open a backend even though nothing plays, and `none` is
-        // the one that needs no file and no host device. H0 moves no sample:
-        // gate A's wav capture arrives with H4, the arm that has something to
-        // record.
-        qemu.arg("-audiodev").arg("none,id=hdaaud");
+        // The same wav backend virtio-sound gets, so gate A's ground truth —
+        // what the *device* received — transfers with no new instrument. A boot
+        // that plays nothing leaves an empty file and costs nothing.
+        //
+        // **`timer-period` is 1000 µs here and 5000 for virtio-sound, and that
+        // is an instrument repair rather than a difference in the audio path.**
+        // At 5000 the capture of a 3 s 440 Hz tone comes back with eight phase
+        // discontinuities, at frames 2703-2705, 2821-2823 and 2939-2940 —
+        // *identical positions across six runs whose audio content differed*,
+        // which is a capture that drops samples on a fixed cadence and not a
+        // guest that plays them wrong. QEMU's `hda-codec` holds its own output
+        // ring and discards what overruns it, and shortening the host's drain
+        // interval is what stops the overrun. Measured on this host, QEMU
+        // 11.0.3: 8 breaks at 5000, 0 at 1000, with the guest's own counters
+        // (1127 periods submitted, no underruns, no drains) identical either
+        // way and identical to the virtio arm's.
+        qemu.arg("-audiodev").arg(format!(
+            "wav,id=hdaaud,path={},timer-period=1000",
+            audio_wav.display()
+        ));
         for dev in shape.hda {
             qemu.arg("-device").arg(*dev);
         }
@@ -2154,17 +2235,20 @@ fn qemu_command(
             .arg(match shape.virtio {
                 Virtio::NicWithoutMsix => "virtio-net-pci-non-transitional,netdev=net0,vectors=0",
                 _ => "virtio-net-pci-non-transitional,netdev=net0",
-            })
+            });
+        if shape.virtio.sound() {
             // virtio-sound records everything the guest plays into a per-boot
             // wav for glitch analysis; timer-period matches the interactive
             // config in src/qemu.rs so test timing represents what users hear.
-            .arg("-audiodev")
-            .arg(format!(
-                "wav,id=audio0,path={},timer-period=5000",
-                audio_wav.display()
-            ))
-            .arg("-device")
-            .arg("virtio-sound-pci,audiodev=audio0,streams=1")
+            qemu.arg("-audiodev")
+                .arg(format!(
+                    "wav,id=audio0,path={},timer-period=5000",
+                    audio_wav.display()
+                ))
+                .arg("-device")
+                .arg("virtio-sound-pci,audiodev=audio0,streams=1");
+        }
+        qemu
             // virtio-console on stdio is the primary I/O channel; UART goes to
             // a temp file so early-boot logs and panic fallback still land
             // somewhere when the kernel switches backends.

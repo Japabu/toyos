@@ -2483,6 +2483,97 @@ keeping up.
 
 ## 4. Audio and soundd
 
+### OPEN, UNASSIGNED — gate A's thorough tier is red on `main`, and the recorded dropout sample is what it disagrees with
+
+Measured 2026-08-07 on `main` at `c0365ea`, in one session, three arms:
+
+| tree | dropout runs | measured runs | verdict |
+|---|---|---|---|
+| `main` | 7 | 28 | `pooled dropout rate: 7 of 40 vs recorded 0 of 120 (Fisher p=4.00e-5)` |
+| `wt/toyos-m3` (M3) | 5 | 12 | `5 of 40 … (p=8.02e-4)` |
+| M3 with its one new wait deleted | 5 | 40 | `5 of 40 … (p=8.02e-4)` |
+
+The denominators differ because the gate stops as soon as the remaining runs
+cannot change the verdict, so each arm ran until it was decided. **All three
+fail, and `main` fails hardest.** The gate's own documentation says it cannot
+detect a doubling of the dropout rate at any N a human waits for, so it also
+cannot separate these three from each other — what it says unambiguously is that
+every one of them is far from the recorded `0 of 120`.
+
+Every gap is small and none is a silence anyone would hear as a break: the
+largest is 51 periods, most are one or two, and the fast tier — whose verdict is
+harm — is **green on all three arms**, 7 of 7 each. So this is a *rate* finding
+against a recorded sample, not a report that the machine sounds wrong.
+
+Two readings, and nothing here decides between them:
+
+- the recorded sample in `tests/audio-baseline.toml` was taken with one QEMU at a
+  time and no concurrent agents, and this host now runs several worktrees at once
+  — `specs/audio-gate-history.md`'s own lesson is that these counters drift
+  between batches on one host with no code change;
+- or something landed since the sample was recorded and nobody re-ran the
+  thorough tier to notice.
+
+The second is testable and the first is not, so **the next step is the thorough
+tier on the commit the sample was recorded against**, on this host, in one
+session. Do not re-record the baseline first: a sample re-taken now would make
+the disagreement disappear without anyone learning which of the two it was, and
+the recorded zero is the only reason the question is visible at all.
+
+Host load was 6–20 throughout and is **not** offered as the explanation — the
+owner's 2026-08-04 ruling stands, and the three arms ran back to back on the same
+host anyway, which is what makes them comparable to each other.
+
+**Consequence for anything landing while this is open:** the thorough tier cannot
+serve as a pass/fail gate. M3 used it as an A/B instead, which is what it could
+still answer, and landed on the fast tier plus the full suite.
+
+**EXPECTED RED, pending #88 — HDA: the captured tone is not one sine.**
+`hda_tone` plays the same 3.0 s 440 Hz tone the virtio arm plays, out of an
+`intel-hda` controller soundd drives itself, and the capture comes back with
+**8 to 16 phase discontinuities** where the virtio arm has none. Declared in
+`EXPECTED_FAILURES` against the message "the captured tone is not one sine";
+every other assertion that test makes still reds the run.
+
+What is *not* wrong, measured on this host (QEMU 11.0.3, 2026-08-07): the tone
+is present at full amplitude, there is **no mid-tone silence at all** (`gaps
+none`), and soundd's own counters match the virtio arm's — **1127 periods
+submitted, 0 underruns, 0 drains** on both. The guest put the same audio on the
+wire; something between soundd's buffer and the wav file did not carry it.
+
+The instrument is new and calibrated: `audio::phase_breaks` tests the recurrence
+`x[n+1] = 2·cos(ω)·x[n] − x[n−1]` that a sampled sinusoid obeys exactly, and it
+reads **0 on all four recorded virtio configs** (`audio_tone` and
+`audio_tone_load`, smp 1 and 8). It is `specs/hda-driver-plan.md` §5.3 item 5's
+second guard, built because §2.4's zero-on-complete rule — the thing that keeps
+one gap detector valid for both backends — is a design promise with no
+measurement behind it (risk 7).
+
+Evidence, and why it does not yet name a cause:
+
+- Six consecutive runs at `timer-period=5000` gave **8 breaks at identical frame
+  positions** — 2703-2705, 2821-2823, 2939-2940 — across runs whose audio
+  content differed (the dither seed is clock-derived, and the sample values at
+  those positions differ run to run). Identical positions with different content
+  is a capture dropping samples on a cadence, not a guest playing them wrong.
+- Shortening the host's drain interval to `timer-period=1000` moved the
+  positions rather than removing them: one run at 0 breaks, the next at 16,
+  clustered around frame 95725 instead. **So it is intermittent and the host
+  cadence is not the whole story.**
+- Within a cluster the breaks sit at multiples of **118 frames**, which is
+  neither the device period (128) nor either backend timer's frame count
+  (44.1 or 220.5). That number is unexplained and is the sharpest thing here.
+- The capture also holds **2.756 s of tone where the virtio arm holds 2.94 s**,
+  with no seam accounting for the difference on the runs that show none. Either
+  the capture opens late or QEMU's `hda-codec` discards on its own ring
+  overrun; both are host-side and neither is established.
+
+Where to start: QEMU's `hw/audio/hda-codec.c` output ring against soundd's
+eight-period pipeline, and then `kernel/src/drivers/hda.rs`'s `isr_complete` —
+whose `SDnLPIB`-derived mask is the one thing on the guest side that could hand
+soundd a buffer the engine has not finished with. **Do not weaken the check to
+make it green**; the virtio zero is what says it has teeth.
+
 Spec: `specs/audio-subsystem-spec.md`. Numbered as in the 2026-07-28 audit;
 (1) — see the re-filing below; it was never an SQ overrun — (2) `CommandRing::push` assert, (3) ungated
 `SYS_SET_RT_PRIORITY`, (4) NaN volume, (7) crash detection and (9) the
@@ -3356,7 +3447,7 @@ Trivial to fix the same way the kbd line already is.
 
 ## 6. Build and toolchain
 
-### `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
+### CLOSED — `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
 
 `toolchain::standing` asks `git diff --quiet main -- toyos-abi/src toyos/src
 userland/libc/src` and reads a non-empty diff as `Diverged` — the standing that
@@ -3375,9 +3466,20 @@ its own, so it was rightfully diverged — but its standing would have been
 
 The question the check means to ask is whether this checkout has content in
 those trees that main does not: `git diff --quiet main...HEAD` against the merge
-base, plus the working tree, rather than `git diff main`. Not fixed here; a
-change to the arbitration wants its own gates in `src/buildlock.rs` beside the
-three that are there.
+base, plus the working tree, rather than `git diff main`.
+
+**Fixed 2026-08-07.** `standing()` asks `git diff --quiet main...HEAD --
+<SYSROOT_SOURCES>` and, separately, `git status --porcelain --
+<SYSROOT_SOURCES>`. Two questions rather than one because they are two: the
+first is what this branch added and the second is what has not been committed —
+and `status` rather than a second `diff`, because a *new* file in `toyos-abi/src`
+changes the witness and no diff against a commit reports an untracked one, which
+the old check could not see either. Gate:
+`toolchain::tests::a_checkout_behind_main_has_no_standing_to_claim`, watched red
+on the tree as it stood (`left: Diverged, right: MatchesMain`) and green after.
+The three existing standing gates are unchanged and still green, including the
+one that deletes `main` — `git diff main...HEAD` exits 128 there, which is
+`Unknown` exactly as before.
 
 ### An std change that depends on an unlanded ABI change cannot be built at all, from anywhere
 
@@ -3524,6 +3626,17 @@ phase landed, and none reproduces on a host running one suite.
   `desktop_typing_damage` and `desktop_locale_detect`: its verdict is the dump's
   content, but *reaching* the dump crosses a compositor, a terminal and a shell,
   and that step is a wall-clock margin. Still `Sched::Parallel`.
+- **`hda_tone`** — added 2026-08-07, hours after the test itself landed. In a
+  full run on a host carrying another worktree's suite: `2 mid-tone silences in
+  the capture: total 2 [3p×1 4p×1]`, `dither 3.3%`, `phase-breaks 92`. Alone on
+  the same tree eight minutes later: `gaps none`, `phase-breaks 16` — the
+  declared #88 failure and nothing else. It is `Sched::Serial`, so like
+  `dump_nmi_probe` the harness never re-runs it alone and the run simply reds.
+  Its `EXPECTED_FAILURES` entry covers the phase-break message alone, which is
+  why a *dropout* under load reaches the verdict, and that is correct: **do not
+  widen it.** A silence and a phase break are two different defects and an entry
+  that covered both would stop saying anything. The tree it was seen on differed
+  from main only in `src/`, so the guest image was byte-identical to main's.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
@@ -3543,6 +3656,19 @@ landing storm is not made of guests. Whether the integration lock should also
 gate the gate's build, or whether these tests belong in the serial tail, is a
 decision for whoever owns the harness; what is established here is that a branch
 can be unable to land for reasons that have nothing to do with it.
+
+**Bounded the same day, and the count was closer to home than a landing storm.**
+A worker takes a guest slot and then *compiles its kernel variant*, so twelve
+workers in one suite are twelve concurrent `cargo build`s before any of them
+boots — which is the load 49.9 with twelve rustc/cargo processes and exactly one
+guest live that was measured while this was being written, on a host where the
+semaphore was doing precisely what it says. `buildlock::build_slot` is the
+second count: four across every worktree, its own directory so a suite holding
+every guest slot can still compile, `--host-builds N` to override and `0` to turn
+off (`specs/test-cost-audit.md` §5.7). It bounds the build half of a landing gate
+by construction, since a gate's builds are these builds. What it does **not**
+bound is anything that never enters `src/build.rs` — a `toyos-sched-sim measure`,
+a hand-run `cargo build` in a fork clone, the primary's `./x.py`.
 
 **What to do about a red on any of these names:** read the `ALONE` line under it
 before anything else. `GREEN` there means the host, not the kernel. What none of
@@ -3657,6 +3783,20 @@ verdict line was its own (`1 of the two overlapping clients left the mixer`)
 rather than `desktop_typing_damage`'s, so the message is not the tell — the pair
 of durations is.
 
+**And the holder can be its own victim.** 2026-08-07, task #152's worktree,
+whole suite 500 s against the ~109 s it is ordered for, with another worktree's
+toolchain build on the host: `desktop_window_child` itself took **249 s** and
+failed with `nothing typed at the terminal window reached a shell` — the
+*victim's* message, from the test that is normally the one occupying the lane.
+So the row above's "the victim is positional" is the weaker half of the claim:
+under enough host pressure the position that loses its typing window is
+whichever guest is late, and that can be the four-minute test as easily as the
+one beside it. It also means **`EXPECTED_FAILURES` does not absorb it** — the
+entry deliberately covers only "the desktop ceased to answer after a window
+closed", and this message names a shell that never answered in the first place,
+so the run reds on the very test the exemption exists for and for a reason the
+exemption is right to exclude.
+
 ### A whole parallel phase can be starved by another agent's build
 
 Measured 2026-08-04: the same tree that runs the phase in 44.8 s ran it in
@@ -3668,11 +3808,14 @@ are what separate it from a regression; a `toyos-tests-<pid>` directory per live
 suite in `$TMPDIR` names how many are up.
 
 `buildlock::guest_slot` bounds the *guests* to twelve across all worktrees, and
-that is the part of this the semaphore closes. It bounds nothing else: a
-`toyos-sched-sim measure`, a `cargo build` and the primary's bootstrap all take
-cores and no slot, so a phase can still be starved by work that boots nothing.
-A slot's wait is announced (`[host-slots] waiting …`), which is what separates a
-slow phase from a starved one without `ps`.
+that is the part of this the semaphore closes. `buildlock::build_slot` (added
+2026-08-07) bounds the compiles to four, which closes the part this entry is
+actually about — "another agent's build" is a `cargo test`'s or a
+`cargo run`'s, and both go through `src/build.rs`. What is left outside both
+counts is work that reaches neither: a `toyos-sched-sim measure`, a `cargo build`
+typed by hand in a fork clone, `./x.py` run directly in `rust/`. Each wait is
+announced (`[host-slots] waiting …`, `[host-builds] waiting …`), which is what
+separates a slow phase from a starved one without `ps`.
 
 ### The primary checkout reclaims the shared sysroot silently
 
@@ -5283,13 +5426,14 @@ which has already priced it, enumerated the sites and written the deadlock rule.
 Whoever builds this A/B builds a throwaway to test a hypothesis about the
 freeze, obeys §3.3's rule about `log!` between issue and ack, and lands nothing.
 
-**Cheaper still, and it should be tried first**: the ninth boot the owner is
-already going to make carries `heartbeat`, and the heartbeat's `mask=` field
+**Cheaper still, and it should be tried first**: the heartbeat's `mask=` field
 answers a question this experiment would answer expensively. A machine dying to
 a stale translation loses CPUs the way a memory corruption does — one at a time,
 in whatever order they touch the bad page — while a machine dying to a global
 cause loses them between two lines. One flash of an instrument that is already
-built beats one flash of a fix that is not.
+built beats one flash of a fix that is not. **The first eight boots of it read
+`0/8` for a hundred seconds on a healthy machine** and the entry below is why;
+the field means what it says from `diag-tick` on.
 
 #### What the owner should run — settled
 
@@ -5315,6 +5459,98 @@ says the software half works and the reflash asks only about the panel. That
 split is deliberate: QEMU's framebuffer is host RAM, while the T14's is a
 write-combining MMIO mapping the compositor is also writing and a full paint
 measures ~460 ms there.
+
+#### CLOSED — the heartbeat's first build was blind on an idle machine, and the eight boots that proved it
+
+Eight `--console-boot --kernel-feature heartbeat --kernel-feature
+metal-panic-probe` boots, logs at `2026-08-07-15{3347,3603,3819,3854,4108,4203,
+4259,4532}.log`. Every one has the same shape:
+
+```
+[kernel   1.150 cpu4] heartbeat: t=1.150s passes=8/8 mask=0xff
+[kernel   1.782 cpu0] heartbeat: t=1.782s passes=8/8 mask=0xff
+[kernel 104.512 cpu0] !!! PANIC !!! metal-panic-probe …
+[kernel 104.512 cpu2] heartbeat: t=104.512s passes=1/8 mask=0x01
+[kernel 104.512 cpu5] i8042: the pin asserts — 1 interrupts, 1 bytes, 1 keys …
+```
+
+**Exactly three heartbeats per boot, in all eight**: two while userland came up,
+then nothing for 14 s, 16 s, 31 s, 102 s, 115 s or 121 s depending on the boot,
+then one final line in the *same millisecond* as the first keypress. The owner's
+account matches — "waited a long time no panic, Fn button definitely causes
+panic", "same but for caps lock" — and every trigger he found is an interrupt.
+
+**The finding: after ~1.8 s no CPU takes a scheduler pass at all.** Every CPU's
+pass found no work and no deadline, so it stopped its LAPIC timer and halted
+until something external arrived. That is correct behaviour and good power
+management, and it made the instrument blind at the one job it was built for:
+`heartbeat::poll` ran from the idle loop, a halted CPU does not run the idle
+loop, and **a healthy quiescent machine and a dead one wrote byte-identical
+logs** — the precise failure the heartbeat was built to eliminate. The same
+defect blinded the probe, which is why it fired 99 s late and only on a keypress
+rather than at its deadline.
+
+**Fixed by `diag-tick`** (`kernel/Cargo.toml`, `KernelHw::idle_wait`,
+`apic::arm_within`): a diagnostic build caps how long a CPU may sleep at 100 ms,
+taking the minimum against whatever the pass just armed so no wakeup is ever
+pushed out. `heartbeat` and `metal-panic-probe` both depend on it. The line now
+reads `alive=N/8` with a `gap=` field, and names each missing CPU with how long
+it has been silent. Gated by `kernel_heartbeat`, whose teeth are recorded in its
+own comment: with the tick removed, 10 of 11 lines dropped a CPU, six of them at
+`alive=2/8`, one CPU silent for 2.811 s — and the *old* gate's assertion was a
+mask that **varies**, so it was satisfied by the defect and certified it.
+
+**What these eight boots do not establish, and must not be read as:**
+
+- **The desktop freeze was not tested.** The owner ran `--console-boot`. Nothing
+  here is evidence about #156's own reproduction.
+- **The unplug case cannot be tested with this image at all.** The probe makes
+  any interaction panic the machine. Boots 4 and 5 (`153854`, `154108`) are the
+  two truncated at 1.8 s with no panic recorded: he pulled the stick, the panic
+  fired on the pull, and the log could not be written to a removed stick. The
+  machine was then in the halted pager, so *"still responding"* is
+  `page_forever` polling the i8042 by design and says nothing about whether the
+  unplug would have frozen a running machine.
+- **A silent log still means less than death.** A set bit says that CPU took an
+  interrupt, returned from `hlt` and reached a pass; the tick that produces the
+  next one is re-armed by the timer stub in assembly, so the chain breaks only
+  where a CPU stops taking interrupts. If every CPU's LAPIC timer stopped at
+  once — a C-state that parks it, an SMI storm — the log would go quiet and read
+  as death. The kernel only ever executes `hlt` and programs no C-state MSR, but
+  the T14's firmware is not ours, so the honest claim from a stopped log is *the
+  machine stopped taking timer interrupts*.
+- **The instrument is no longer passive.** Each heartbeat carries a
+  `sync_mount` of `/log`, so a `heartbeat` build touches the boot stick four
+  times a second and the boot it watches is not quite the boot without it.
+
+#### What the owner should run next — the ninth boot
+
+```
+cargo run -- --kernel-feature heartbeat --build-only
+```
+
+The **ordinary** image and not `--console-boot`: the desktop is what freezes and
+the last eight boots did not run it. No `metal-panic-probe` — it makes any
+keypress panic the machine, which is what stopped those boots being able to test
+the unplug. Flash `target/bootable.img`, boot to the desktop, use it, and pull
+the log off `/log` afterwards. **Nothing needs to be touched for the log to be
+readable**, which is the whole change:
+
+- **Heartbeats continue at ~250 ms with `alive=8/8` to the end of the file** →
+  the machine was alive when the power went off. Previously indistinguishable
+  from death.
+- **Heartbeats stop dead** → the machine stopped, at the timestamp of the last
+  line ± 250 ms. That is the freeze, with a time on it for the first time.
+- **`alive=` falls one CPU at a time over several lines**, each named by a
+  `heartbeat: cpuN last reached one …s ago` → a local cause spreading, which is
+  what a stale translation looks like: CPUs die in the order they touch the bad
+  page. This is the reading §3.3's shootdown hypothesis is waiting on.
+- **`alive=` goes from `8/8` to nothing between two lines** → a global cause,
+  below the software layer, and the shootdown hypothesis loses its best
+  evidence.
+- **A `gap=` far larger than 0.250s on a line that is otherwise healthy** → the
+  machine went quiet and came back rather than dying. On the eight boots above
+  this was the whole file; it should now never happen.
 
 ### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
 

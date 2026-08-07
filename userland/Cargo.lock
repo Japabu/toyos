@@ -3307,6 +3307,7 @@ dependencies = [
  "rubato",
  "toyos",
  "toyos-abi",
+ "toyos-hda",
 ]
 
 [[package]]
@@ -3601,6 +3602,10 @@ version = "0.1.0"
 dependencies = [
  "toyos-abi",
 ]
+
+[[package]]
+name = "toyos-hda"
+version = "0.1.0"
 
 [[package]]
 name = "toyos-keymap"

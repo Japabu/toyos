@@ -59,11 +59,7 @@ pub fn init(
     // Vol. 3A §11.12.4 rules out one physical page held under two memory
     // types, and the panic console writes through the direct map while a
     // compositor holds a token.
-    crate::mm::paging::kernel()
-        .lock()
-        .as_mut()
-        .unwrap()
-        .map_mmio(addr, aligned_size, CachePolicy::WriteCombining);
+    crate::mm::paging::map_mmio(addr, aligned_size, CachePolicy::WriteCombining);
 
     let fb = DirectMap::from_phys(addr);
     let token0 = shared_memory::register(fb, aligned_size, CachePolicy::WriteCombining);

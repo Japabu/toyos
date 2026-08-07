@@ -1,7 +1,7 @@
 use core::arch::naked_asm;
 
 use alloc::vec::Vec;
-use super::{apic, cpu, gdt};
+use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::mm::paging::CachePolicy;
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
@@ -650,6 +650,16 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             10 => canary::address(),
             #[cfg(feature = "test-kernel-canary")]
             11 => canary::changed() as u64,
+            // Make the last CPU a shootdown waits for answer `a2` nanoseconds
+            // late, take one, and answer with how long it took. The number is
+            // the gate: an initiator that does not wait measures roughly the
+            // cost of one ICR write however slow its siblings are. The arming
+            // outlives the call, so the caller can then time an ordinary
+            // syscall and learn whether *its* free path shoots down.
+            #[cfg(feature = "test-tlb-ack-delay")]
+            12 => crate::arch::tlb::debug_arm_ack_delay(a2),
+            #[cfg(feature = "test-tlb-ack-delay")]
+            13 => crate::arch::tlb::debug_disarm_ack_delay(),
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => match ctx.copy_out(UserAddr::new(a1), &sys_sched_info()) {
@@ -681,12 +691,17 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // Exactly as strong as the claim and no stronger: `SYS_OPEN_DEVICE`
             // is first-come and ungated, so whoever wins the race gets the RT
             // band with it. Spec §9.4 wants a privilege; a claim is not one.
-            if !device::is_owner(device::DeviceType::Audio, process::current_process()) {
+            let me = process::current_process();
+            if !device::is_owner(device::DeviceType::Audio, me)
+                && !device::is_owner(device::DeviceType::HdaAudio, me)
+            {
                 return SyscallError::PermissionDenied.to_u64();
             }
             crate::scheduler::set_current_rt(a1 != 0);
             0
         },
+        SYS_DEVICE_REG_READ => sys_device_reg(a1 as u32, a2, a3, None),
+        SYS_DEVICE_REG_WRITE => sys_device_reg(a1 as u32, a2, a3, Some(a4)),
         _ => SyscallError::InvalidArgument.to_u64(),
     };
 
@@ -730,7 +745,39 @@ fn sys_write(fd_num: u32, buf: &UserBytes) -> u64 {
 enum ReadBlock {
     Pipe(alloc::sync::Arc<crate::sched::payload::KWaitQueue>, pipe::PipeId),
     Audio,
+    Hda,
     Keyboard(u64),
+}
+
+/// One register of a claimed device, read or written.
+///
+/// The fd is the authorization and the device behind it owns the allow-list, so
+/// this function knows nothing about codecs — which is the test
+/// `specs/hda-driver-plan.md` §4.4 sets for it being a device-register call
+/// rather than a device protocol back in the syscall table.
+fn sys_device_reg(fd_num: u32, offset: u64, width: u64, value: Option<u64>) -> u64 {
+    let Some(width) = toyos_abi::hda::RegWidth::from_raw(width) else {
+        return SyscallError::InvalidArgument.to_u64();
+    };
+    let claimed = process::with_fd_owner_data(|data| {
+        matches!(data.fds.get(fd_num), Some(fd::Descriptor::Hda { .. }))
+    });
+    if !claimed {
+        return SyscallError::NotFound.to_u64();
+    }
+    match value {
+        None => match crate::drivers::hda::reg_read(offset, width) {
+            Ok(v) => v as u64,
+            Err(e) => e.to_u64(),
+        },
+        Some(value) if value <= u32::MAX as u64 => {
+            match crate::drivers::hda::reg_write(offset, width, value as u32) {
+                Ok(()) => 0,
+                Err(e) => e.to_u64(),
+            }
+        }
+        Some(_) => SyscallError::InvalidArgument.to_u64(),
+    }
 }
 
 fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
@@ -747,6 +794,8 @@ fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
                         Err(Some(ReadBlock::Keyboard(0)))
                     } else if matches!(desc, Some(fd::Descriptor::Audio { info_read: true, .. })) {
                         Err(Some(ReadBlock::Audio))
+                    } else if matches!(desc, Some(fd::Descriptor::Hda { info_read: true, .. })) {
+                        Err(Some(ReadBlock::Hda))
                     } else if let Some(id) = desc.and_then(|d| d.pipe_id_read()) {
                         Err(pipe::readers_queue(id).map(|q| ReadBlock::Pipe(q, id)))
                     } else if matches!(desc, Some(fd::Descriptor::SerialConsole)) {
@@ -770,6 +819,11 @@ fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
                 &crate::sched::waitqs::AUDIO,
                 0,
                 crate::audio::has_pending,
+            ),
+            Err(Some(ReadBlock::Hda)) => crate::scheduler::wait_until(
+                &crate::sched::waitqs::AUDIO,
+                0,
+                crate::drivers::hda::has_pending,
             ),
             Err(Some(ReadBlock::Keyboard(deadline))) => crate::scheduler::wait_until(
                 &crate::sched::waitqs::KEYBOARD,
@@ -1456,8 +1510,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
             cur += crate::mm::PAGE_2M;
             offset += crate::mm::PAGE_2M;
         }
-        crate::mm::paging::flush_tlb_all();
-        apic::tlb_shootdown();
+        crate::arch::tlb::shootdown();
         process::with_fd_owner_data(|data| {
             data.mmap_regions.push(process::MmapRegion {
                 addr: UserAddr::new(start), size: aligned, _pages: pages, fixed: true,
@@ -1490,30 +1543,37 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
     }
 }
 
+/// The pages go back to the PMM here, so this is the syscall the shootdown
+/// matters most on: a sibling thread of the same process holds translations for
+/// exactly this range, and until M3 nothing told it otherwise.
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
     let pt = process::current_address_space();
-    process::with_fd_owner_data(|data| {
-        let idx = data.mmap_regions.iter().position(|r| r.addr.raw() == addr);
-        if let Some(idx) = idx {
-            let region = data.mmap_regions.swap_remove(idx);
-            data.free_count += 1;
-            if region.fixed {
-                let mut cur = region.addr.raw();
-                let end = region.addr.raw() + region.size as u64;
-                while cur < end {
-                    pt.lock().unmap(UserAddr::new(cur));
-                    cur += crate::mm::PAGE_2M;
-                }
-            } else {
-                let mut as_guard = pt.lock();
-                as_guard.unmap_range(region.addr, region.size as u64);
-                as_guard.free_region(region.addr);
+    let taken = process::with_fd_owner_data(|data| {
+        let idx = data.mmap_regions.iter().position(|r| r.addr.raw() == addr)?;
+        let region = data.mmap_regions.swap_remove(idx);
+        data.free_count += 1;
+        if region.fixed {
+            let mut cur = region.addr.raw();
+            let end = region.addr.raw() + region.size as u64;
+            while cur < end {
+                pt.lock().unmap(UserAddr::new(cur));
+                cur += crate::mm::PAGE_2M;
             }
-            0
         } else {
-            SyscallError::NotFound.to_u64()
+            let mut as_guard = pt.lock();
+            as_guard.unmap_range(region.addr, region.size as u64);
+            as_guard.free_region(region.addr);
         }
-    })
+        Some(crate::mm::Unmapped::new(region))
+    });
+    let Some(unmapped) = taken else {
+        return SyscallError::NotFound.to_u64();
+    };
+    // Dropped out here, not inside the closure: the drop shoots down and waits,
+    // and the fd-owner lock the closure holds is one a sibling can be spinning
+    // on with `IF` clear.
+    drop(unmapped);
+    0
 }
 
 /// `spawn_thread` stores `stack_ptr - stack_base`, and both are raw syscall
@@ -1848,8 +1908,7 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
                     let phys = rw_phys + i as u64 * crate::mm::PAGE_2M;
                     pt.lock().remap(UserAddr::new(user_virt), phys, true);
                 }
-                crate::mm::paging::flush_tlb_all();
-                apic::tlb_shootdown();
+                crate::arch::tlb::shootdown();
                 let delta = lib_vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 if delta != 0 {
                     crate::elf::rebase_relative_relocs(&lib, delta);

@@ -37,8 +37,15 @@ pub fn apic_id_for(cpu_id: u32) -> u32 {
 }
 
 /// Signal APs that the kernel is fully initialized and they can join the scheduler.
+///
+/// Also the point from which a TLB shootdown waits for acknowledgements. Until
+/// here every AP that `CPU_COUNT` has counted is parked in the spin below with
+/// `IF` clear and cannot take the IPI, so waiting for one would hang; the flush
+/// each of them does on release is what settles the shootdowns issued in the
+/// meantime (`arch::tlb::join`).
 pub fn set_ready() {
     SMP_READY.store(true, Ordering::Release);
+    crate::arch::tlb::siblings_answer();
 }
 
 // Shared between BSP (Rust) and AP (assembly trampoline at 0x8000).
@@ -267,6 +274,13 @@ extern "C" fn ap_entry() -> ! {
     while !SMP_READY.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
+
+    // Before this CPU touches anything it did not map itself. The BSP mapped
+    // every driver's registers and re-typed the framebuffer's leaf while this
+    // one was parked above with `IF` clear, so no shootdown could reach it; the
+    // acquire on `SMP_READY` makes those writes visible and this flush is what
+    // discards whatever the spin left cached over them.
+    crate::arch::tlb::join();
 
     log!("CPU {}: joining scheduler", percpu::cpu_id());
     process::ap_idle();
