@@ -2784,6 +2784,45 @@ passed — so it moved to the instrument-broken set, fatal in both tiers. It was
 also the one breach that could enter the thorough tier's sample as a run of
 all-zero counters, i.e. as the best run ever measured.
 
+### OPEN — gate A's *thorough* tier reds on an unmodified `main`, and that is the rate the entry below asked for
+
+The entry below says "whoever takes it should get the rate first — the thorough
+tier (`--audio-gate N`) is the instrument". H3's session got it, and the
+instrument reds on the tree it is supposed to certify.
+
+`cargo test --test toyos-build -- --audio-gate 30` on `80fe031` — **main's tip,
+no delta at all**, run as H3's A arm before that branch existed:
+
+```
+[gate A] FAILED after 15 of 30 iterations (the remaining runs cannot change this):
+    pooled dropout rate: 10 of 120 vs recorded 0 of 120 (Fisher p=8.03e-4 <= 1e-3)
+```
+
+The ten, by config and iteration: `audio_tone_load smp=1` at 4, 9, 13, 15;
+`audio_tone_load smp=8` at 9, 13, 14; `audio_tone smp=8` at 8, 9;
+`audio_tone smp=1` at 13. So **`audio_tone` at both widths reds too**, which the
+entry below had only established for `audio_tone_load`.
+
+**The load correlation is the wrong way round, and that is the finding.** The
+1-minute average across the run spanned 7.2 to 19.1 on 14 cores, with one to
+five other guests and six other `toyos-build` processes throughout. The clean
+early iterations ran at 19.1 and 16.8; the three worst — 13, 14 and 15 — ran at
+11.4, 10.6 and 11.9. Every dropout carried a wake latency of 33-117 ms against
+5-17 ms on the clean runs, which is the same "soundd was not scheduled"
+signature as the two entries below.
+
+What this changes for anyone reading them: the intermittency is not a property
+of one config, and it is **large enough to fail the thorough tier's own pooled
+test on a clean tree**. A stage transition that gates on this tier
+(`specs/scheduler-core-spec.md` §11, and H3 itself) cannot presently tell its
+own change from this. H3 therefore compared its two arms against *each other*
+rather than against the recorded sample, and said so.
+
+The recorded sample in `tests/audio-baseline.toml` is 0/120 and was taken in a
+session this host no longer resembles. **Re-recording it is not licensed by this
+entry** — a baseline widened to accept the defect is the defect made permanent.
+What is needed is the cause.
+
 ### OPEN — `audio_tone_load (smp=1)` fails gate A's fast tier intermittently, on both trees
 
 Six runs in one session, 2026-08-04, while fix bundle D was being gated. The
