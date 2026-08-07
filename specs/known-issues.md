@@ -1139,6 +1139,24 @@ before the audio landing, with the shootdown work and without it).
 tree carrying it, because a panicked guest is scored as an instrument failure and
 the tier stops. That blocked H3's own A/B (§4).
 
+**And it is not confined to audio — the reported message is never `tlb:`.** Two
+landing gates from the heartbeat worktree on 2026-08-07, with a delta provably
+inert (every changed kernel line behind `#[cfg(feature = "heartbeat")]`, which
+none of these tests enable):
+
+| gate | reported failure | what was in the log |
+|---|---|---|
+| 1 | `hda_tone` — and *not* #88's assertion | `tlb.rs:133` panic |
+| 2 | `null_sink_shipped_client` — "the shipped tone exited 101 on a device-less machine" | two `tlb: cpu N has not flushed` |
+| 3 | `metal_sim_window_caps`, `metal_sim_ipc_hostile_peer`, `metal_sim_compositor_stall`, `metal_sim_client_death` | four `tlb: cpu N has not flushed` |
+
+A guest that panics mid-test fails whatever that test happened to be asserting,
+so the name on the red is the workload that was running and never the cause.
+**Grep a red run's log for `tlb:` before believing the test name** — three of
+those four `metal_sim_*` re-ran green alone, and the fourth
+(`metal_sim_window_caps`) re-ran red, which the harness reports as "the defect
+is real" and which is this defect rather than the window caps.
+
 ### `Lock::lock`'s spin is the half of the ticket lock loom cannot reach
 
 `kernel-loom` compiles `kernel/src/sync.rs` a second time against loom's
@@ -2523,39 +2541,6 @@ stats every ~2 s. A starved synthesizer and a wrong playback clock sound
 identical to a human, and RTF is what separates them — RTF near 1.0 with the
 audio still slow means the clock, RTF well below 1.0 means synthesis is not
 keeping up.
-
-### OPEN — M3's shootdown ack timeout is a wall-clock deadline in a guest whose vCPUs the host can deschedule
-
-Observed 2026-08-07 from the heartbeat worktree, twice in two landing gates, on
-a host also carrying another worktree's suite. `null_sink_shipped_client` reds
-with `the shipped tone exited 101 on a device-less machine`, and the reason is
-not the tone:
-
-```
-tlb: cpu 0 has not flushed for generation Generation(2) in 5000000000ns — it is not taking interrupts
-tlb: cpu 1 has not flushed for generation Generation(3) in 5000000000ns — it is not taking interrupts
-```
-
-That is `arch/tlb.rs`'s own bounded failure firing — `ACK_TIMEOUT_NS`, 5 s. An
-earlier gate on the same branch took the same panic under `hda_tone`. **Both
-tests pass alone**: `null_sink_shipped_client` in 7 s with nothing else on the
-host.
-
-**The mechanism to weigh before treating this as a shootdown defect.** The
-deadline is `clock::nanos_since_boot()`, which is the TSC, and under TCG the
-guest TSC follows host wall time — so a vCPU the host has not scheduled for five
-seconds has "not flushed for 5000000000ns" while being perfectly healthy. Twelve
-guests plus a second worktree's suite on fourteen cores reaches that. This is
-the harness's own rule — *a timeout is a liveness guard and never a verdict* —
-arriving inside the kernel, where there is no `qemu::budget` to scale it and the
-failure is a panic rather than a red.
-
-**Not this task's to fix; recorded because it is costing landings now.** It
-belongs to whoever owns M3. Two things a fix has to separate: a CPU that is
-genuinely not taking interrupts, which is the state the bound exists to name,
-and a vCPU that has not been given any host time, which is not a property of
-this kernel at all. Until then, a gate red naming `tlb:` should be re-run alone
-before it is believed.
 
 ---
 
