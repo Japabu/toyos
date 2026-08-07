@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::*;
@@ -69,7 +69,8 @@ pub struct Codegen {
     func_ret_types: HashMap<String, CType>,               // C return types of functions
     func_ctypes: HashMap<String, CType>,                   // full C function types (for expr_type)
     variadic_funcs: HashMap<String, usize>,                   // variadic func name → fixed param count
-    variadic_stubs: HashMap<String, (FuncId, FuncId)>,        // x86_64: variadic func name → (stub_func_id, original_func_id)
+    // Ordered, not hashed: iterating this is the order the stubs reach the object.
+    variadic_stubs: BTreeMap<String, (FuncId, FuncId)>,       // x86_64: variadic func name → (stub_func_id, original_func_id)
     va_indirect: Option<(FuncId, cranelift_module::DataId)>,  // x86_64: (trampoline func, target global) for indirect variadic calls
     static_funcs: HashSet<String>,                             // functions declared static
     extern_provision: HashSet<String>,                         // functions with non-inline external provision
@@ -100,7 +101,8 @@ pub(super) struct FuncCtx<'a> {
     builder: FunctionBuilder<'a>,
     name: String,
     locals: HashMap<String, (LocalStorage, CType)>,
-    addr_taken: HashSet<String>, // names of variables whose address is taken anywhere in the function
+    // Ordered, not hashed: iterating this is the order their stack slots are cut.
+    addr_taken: BTreeSet<String>, // names of variables whose address is taken anywhere in the function
     return_type: CType,
     filled: bool, // current block has a terminator
     // Control flow for break/continue
@@ -162,7 +164,7 @@ impl Codegen {
             func_ret_types: HashMap::new(),
             func_ctypes: HashMap::new(),
             variadic_funcs: HashMap::new(),
-            variadic_stubs: HashMap::new(),
+            variadic_stubs: BTreeMap::new(),
             va_indirect: None,
             static_funcs: HashSet::new(),
             extern_provision: HashSet::new(),
@@ -284,7 +286,8 @@ impl Codegen {
         // Finalize tentative definitions: zero-init any globals that were never given a real initializer.
         // Use the maximum size across all tentative entries for each data_id (handles incomplete
         // arrays like `int b[]` later completed by `int b[3]`).
-        let mut tentative_info: std::collections::HashMap<_, (usize, usize)> = std::collections::HashMap::new();
+        // Ordered, not hashed: iterating this is the order they land in BSS.
+        let mut tentative_info: BTreeMap<_, (usize, usize)> = BTreeMap::new();
         for (data_id, size, align) in std::mem::take(&mut self.tentative_data) {
             let entry = tentative_info.entry(data_id).or_insert((0, 1));
             entry.0 = entry.0.max(size);
@@ -486,7 +489,7 @@ impl Codegen {
         builder.seal_block(entry);
 
         // Scan the body for variables whose address is taken
-        let mut addr_taken = HashSet::new();
+        let mut addr_taken = BTreeSet::new();
         Self::collect_addr_taken(&fdef.body, &mut addr_taken);
 
         let mut ctx = FuncCtx {
