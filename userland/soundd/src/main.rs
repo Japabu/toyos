@@ -1,4 +1,4 @@
-use toyos_abi::audio::{AudioCompletionRecord, AudioInfo, AudioSlotHeader};
+use toyos_abi::audio::{AudioCompletionRecord, AudioSlotHeader};
 use toyos_abi::Fd;
 use toyos::audio::{
     AudioSlotReader, StreamOpenRequest, StreamOpenResponse, StreamSetVolume, FORMAT_S16LE,
@@ -7,20 +7,21 @@ use toyos::audio::{
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::services;
 use toyos::shm::SharedMemory;
-use toyos::{AsHandle, AudioDev, Connection};
+use toyos::{AsHandle, Connection};
 use toyos_abi::syscall;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 mod hda;
+mod virtio;
 
 /// The device half of the mix loop.
 ///
 /// Two implementations and no more: `specs/hda-driver-plan.md` §8 item 10
-/// forbids a framework before there are three. What differs between a card the
-/// kernel drives and one this process drives is exactly the six methods below;
-/// the mixer, the ramps, the DLL, the underrun accounting and the
+/// forbids a framework before there are three. Both are drivers in this process
+/// now, and what differs between the two devices is exactly the six methods
+/// below; the mixer, the ramps, the DLL, the underrun accounting and the
 /// suspend/resume structure are one body of code either way, which is what
 /// makes gate A one instrument for both.
 trait Backend {
@@ -41,7 +42,8 @@ trait Backend {
     /// Zeroing it as it frees makes a late soundd cost silence instead, which
     /// is exactly what virtio-sound's device does when it runs dry, so one
     /// instrument certifies both (§2.4). virtio's own implementation is empty
-    /// for that reason and not by omission.
+    /// for that reason and not by omission: nothing is published for a period
+    /// that was not filled, so the device is never given it again.
     fn released(&mut self, idx: usize);
 
     /// Period `idx` is filled with `bytes` of PCM and belongs to the device.
@@ -52,36 +54,34 @@ trait Backend {
 }
 
 struct VirtioBackend {
-    dev: AudioDev,
-    buffers: Vec<*mut u8>,
+    virtio: virtio::Virtio,
 }
 
 impl Backend for VirtioBackend {
     fn handle(&self) -> Fd {
-        self.dev.as_handle()
+        self.virtio.dev().as_handle()
     }
 
     fn buffer(&self, idx: usize) -> *mut u8 {
-        self.buffers[idx]
+        self.virtio.buffer(idx)
     }
 
     fn completions(&mut self, out: &mut [AudioCompletionRecord]) -> usize {
-        match self.dev.read_completions(out) {
-            Ok(n) => n,
-            Err(syscall::SyscallError::WouldBlock) => 0,
-            Err(e) => panic!("soundd: read_completions failed: {e:?}"),
-        }
+        // Where the kernel used to service the event queue inside the same
+        // syscall: the device's own view of an underrun, which this process's
+        // counters cannot see.
+        self.virtio.poll_events();
+        self.virtio.completions(out)
     }
 
     fn released(&mut self, _idx: usize) {}
 
     fn submit(&mut self, idx: usize, bytes: usize) {
-        toyos::audio::audio_submit(idx as u32, bytes as u32)
-            .unwrap_or_else(|e| panic!("soundd: audio_submit({idx}) failed: {e}"));
+        self.virtio.submit(idx, bytes);
     }
 
     fn stop(&mut self) {
-        self.dev.stop().expect("soundd holds the audio device claim");
+        self.virtio.stop();
     }
 }
 
@@ -807,9 +807,9 @@ fn mix_thread(
     // issued — leaves the stream STARTED with an empty queue, and a successor
     // that merely believed it stopped would park forever with the host voice
     // open in permanent underrun, at exactly zero CPU. One STOP makes the
-    // belief true. It costs nothing on an ordinary boot: the kernel's
-    // `SoundController::stop` returns without a controlq round trip or a log
-    // line when the stream is already stopped.
+    // belief true. It costs nothing on an ordinary boot: a backend's own `stop`
+    // returns without a control round trip or a log line when the stream is
+    // already stopped.
     backend.stop();
     let mut started = false;
     // Wall clock at the last instant the pipeline was known full. Re-stamped
@@ -1087,7 +1087,7 @@ fn mix_thread(
         // amortize, and stopping at once is what puts the suspend markers
         // inside the audio gate's serial window on every run. The one event
         // that makes grace nonzero is a hardware backend that pops on stop,
-        // advertised per-backend through `AudioInfo`; implement it then as a
+        // advertised through the trait above; implement it then as a
         // clock comparison against a drain stamp, evaluated at the idle wakes
         // that still arrive while the buffers play out — never as an armed
         // timer, which would put a periodic wake back into the idle path this
@@ -1574,7 +1574,7 @@ fn control_thread(
 const NULL_SINK_RATE: u32 = 44_100;
 const NULL_SINK_CHANNELS: u16 = 2;
 const NULL_SINK_PERIOD_FRAMES: usize = 128;
-/// Same DMA-pipeline depth as virtio-sound (`TX_INFLIGHT_MAX`): the client ring
+/// Same DMA-pipeline depth as both hardware backends: the client ring
 /// is as deep, so a client may fill `NULL_SINK_BUFFERS - 1` periods ahead and
 /// its backpressure is the device's. Power of two — ring indices wrap mod 2^32.
 const NULL_SINK_BUFFERS: usize = 8;
@@ -1596,13 +1596,17 @@ fn main() {
     // exits can pass it and still lose the claim. That is a conflict, not an
     // absent sound card, and it has to stay loud.
     // The order is virtio first, and it is not a preference between two cards:
-    // no machine in this project has both, and taking the kernel-driven one
-    // first means a machine that has always had audio keeps exactly the path it
-    // had. The T14 has only the second.
-    match AudioDev::open() {
-        Ok(dev) => return run_virtio(listener, dev),
-        Err(syscall::SyscallError::NotFound) => {}
-        Err(e) => panic!("soundd: cannot claim the audio device: {e}"),
+    // no machine in this project has both. The T14 has only the second.
+    match virtio::Virtio::claim() {
+        Ok((virtio, rate, channels)) => return run_virtio(listener, virtio, rate, channels),
+        Err(virtio::Refusal::NoDevice(syscall::SyscallError::NotFound)) => {}
+        Err(virtio::Refusal::NoDevice(e)) => {
+            panic!("soundd: cannot claim the virtio-sound device: {e}")
+        }
+        Err(why) => {
+            eprintln!("soundd: the virtio-sound device cannot carry audio: {why}");
+            return run_null_sink(listener);
+        }
     }
     match hda::Hda::claim() {
         Ok((hda, _path, channels)) => run_hda(listener, hda, channels),
@@ -1614,25 +1618,14 @@ fn main() {
     }
 }
 
-fn run_virtio(listener: toyos::Listener, audio_dev: AudioDev) {
-    let info: AudioInfo = audio_dev.info().expect("soundd: failed to read audio info");
-
-    let num_buffers = info.num_buffers as usize;
-    let device_period_bytes = info.period_bytes as usize;
-    let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024)
-        .expect("the DMA token the audio device just reported");
-    let dma_base = dma_page.as_ptr();
-    let buffers = (0..num_buffers)
-        .map(|i| unsafe { dma_base.add(info.buf_offsets[i] as usize) })
-        .collect();
-
+fn run_virtio(listener: toyos::Listener, virtio: virtio::Virtio, rate: u32, channels: u8) {
     run_with_device(
         listener,
-        &mut VirtioBackend { dev: audio_dev, buffers },
-        num_buffers,
-        info.sample_rate,
-        info.channels as u16,
-        device_period_bytes,
+        &mut VirtioBackend { virtio },
+        toyos_abi::virtio_sound::PERIODS,
+        rate,
+        channels as u16,
+        toyos_abi::virtio_sound::PERIOD_BYTES,
     );
 }
 

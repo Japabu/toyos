@@ -7,10 +7,13 @@
 //! [`syscall::device_reg_write`], each checked against an allow-list and
 //! refused by name. Nothing here names a physical address.
 //!
+//! [`RegWidth`](crate::syscall::RegWidth) is those calls' and not this device's,
+//! since virtio-sound's stub reaches its notification registers the same way.
+//!
 //! Completions come back as [`AudioCompletionRecord`](crate::audio::AudioCompletionRecord),
-//! the same record virtio-sound produces, because the mask is derived from a
-//! position read in the interrupt handler and the two backends then differ in
-//! nothing a mixer can see.
+//! the same record the virtio-sound stub produces, because the mask is derived
+//! from a position read in the interrupt handler and the two backends then
+//! differ in nothing a mixer can see.
 //!
 //! [`syscall::device_reg_read`]: crate::syscall::device_reg_read
 //! [`syscall::device_reg_write`]: crate::syscall::device_reg_write
@@ -62,40 +65,3 @@ impl HdaInfo {
     }
 }
 
-/// How wide a register access is.
-///
-/// Not a convenience: HDA registers are 8, 16 and 32 bits and a 32-bit write to
-/// a 16-bit register is a write to its neighbour — `SDnCTL` and `SDnSTS` are
-/// adjacent bytes of one dword, and the second is the kernel's alone.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u64)]
-pub enum RegWidth {
-    U8 = 1,
-    U16 = 2,
-    U32 = 4,
-}
-
-impl RegWidth {
-    pub fn from_raw(raw: u64) -> Option<Self> {
-        match raw {
-            1 => Some(Self::U8),
-            2 => Some(Self::U16),
-            4 => Some(Self::U32),
-            _ => None,
-        }
-    }
-
-    pub const fn bytes(self) -> u64 {
-        self as u64
-    }
-
-    /// The widest value this access can carry. A caller handing a wider one is
-    /// naming bits the register does not have.
-    pub const fn max_value(self) -> u32 {
-        match self {
-            Self::U8 => u8::MAX as u32,
-            Self::U16 => u16::MAX as u32,
-            Self::U32 => u32::MAX,
-        }
-    }
-}

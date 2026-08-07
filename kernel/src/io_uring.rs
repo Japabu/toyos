@@ -147,7 +147,7 @@ pub enum Source {
     Listener(ListenerId),
     PipeReadable(PipeId),
     PipeWritable(PipeId),
-    Audio,
+    VirtioSound,
     Hda,
 }
 
@@ -796,7 +796,7 @@ impl Source {
             Self::Keyboard => crate::keyboard::has_data(),
             Self::Mouse => crate::mouse::has_data(),
             Self::Network => crate::net::has_packet(),
-            Self::Audio => crate::audio::has_pending(),
+            Self::VirtioSound => crate::drivers::virtio_sound::has_pending(),
             Self::Hda => crate::drivers::hda::has_pending(),
         }
     }
@@ -809,7 +809,7 @@ impl Source {
             Self::Keyboard => crate::keyboard::add_io_uring_watcher(ring_id),
             Self::Mouse => crate::mouse::add_io_uring_watcher(ring_id),
             Self::Network => crate::net::add_io_uring_watcher(ring_id),
-            Self::Audio => crate::audio::add_io_uring_watcher(ring_id),
+            Self::VirtioSound => crate::drivers::virtio_sound::add_io_uring_watcher(ring_id),
             Self::Hda => crate::drivers::hda::add_io_uring_watcher(ring_id),
             Self::Listener(id) => crate::listener::add_io_uring_watcher(id, ring_id),
         }
@@ -823,7 +823,7 @@ impl Source {
             Self::Keyboard => crate::keyboard::remove_io_uring_watcher(ring_id),
             Self::Mouse => crate::mouse::remove_io_uring_watcher(ring_id),
             Self::Network => crate::net::remove_io_uring_watcher(ring_id),
-            Self::Audio => crate::audio::remove_io_uring_watcher(ring_id),
+            Self::VirtioSound => crate::drivers::virtio_sound::remove_io_uring_watcher(ring_id),
             Self::Hda => crate::drivers::hda::remove_io_uring_watcher(ring_id),
             Self::Listener(id) => crate::listener::remove_io_uring_watcher(id, ring_id),
         }
@@ -837,7 +837,7 @@ impl Source {
             Self::Keyboard => crate::keyboard::io_uring_watchers(),
             Self::Mouse => crate::mouse::io_uring_watchers(),
             Self::Network => crate::net::io_uring_watchers(),
-            Self::Audio => crate::audio::io_uring_watchers(),
+            Self::VirtioSound => crate::drivers::virtio_sound::io_uring_watchers(),
             Self::Hda => crate::drivers::hda::io_uring_watchers(),
             Self::Listener(id) => crate::listener::io_uring_watchers(id),
         }

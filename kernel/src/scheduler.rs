@@ -305,7 +305,7 @@ pub fn boost_current_rt_inherited() {
     driver::boost_current(boost_window());
 }
 
-/// `SYS_SET_RT_PRIORITY`. Gated at the dispatch site on the `DeviceType::Audio`
+/// `SYS_SET_RT_PRIORITY`. Gated at the dispatch site on a sound-device
 /// claim, not here — this must stay callable from kernel init. That is not yet
 /// spec §9.4's privilege gate: `SYS_OPEN_DEVICE` is first-come and ungated, so
 /// whoever wins the claim race gets the RT band with it.
