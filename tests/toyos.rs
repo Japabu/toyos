@@ -204,6 +204,12 @@ const SCREEN_TESTS: &[(&str, Sched)] = &[
     ("screen_panic_muted", Sched::Parallel),
     ("screen_console_panic", Sched::Parallel),
     ("screen_fatal_halt", Sched::Parallel),
+    // The same fatal path with a compositor holding the panel, which is the
+    // only configuration the owner's laptop is ever in and the one no screen
+    // test covered: `screen_fatal_halt` boots a config with no compositor, and
+    // `screen_blocked_dump` has one but paints through `paint_report` rather
+    // than through `halt_all_cpus`.
+    ("screen_fatal_halt_composited", Sched::Parallel),
     ("screen_pager_keys", Sched::Serial),
 ];
 
@@ -292,9 +298,15 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Its own boot, its own feature, and it drives the guest only through
     // stdin — nothing it touches is shared with another test.
     ("idle_stack_guard", Sched::Parallel),
-    // Its own boot and its own feature; it deafens one CPU for 400 ms and
-    // nothing it touches is shared.
-    ("dump_nmi_probe", Sched::Parallel),
+    // Its own boot and its own feature, and it deafens one CPU for 400 ms —
+    // but the deafening is a *window*, and the verdict is whether the NMI is
+    // answered inside `NMI_BUDGET_NS`, which is one millisecond. That is a
+    // wall-clock margin on the host as much as on the guest: at width 12 the
+    // probe missed the window and reported the NMI as never delivered, which
+    // reads exactly like the defect it hunts, and it was green alone in the
+    // same run and three times after it. Serial by `specs/test-cost-audit.md`
+    // §3.3 — a verdict that is a duration does not go in the parallel phase.
+    ("dump_nmi_probe", Sched::Serial),
     ("diskless_boot", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
     // Its whole assertion is that a keystroke injected from the host crossed a
@@ -2884,6 +2896,78 @@ fn run_screen_test(
             }
             if dump.fill() != FILL_FATAL {
                 return Err(format!("fatal fill is {:?}, want {FILL_FATAL:?}", dump.fill()));
+            }
+            Ok(())
+        }
+        "screen_fatal_halt_composited" => {
+            // **Can a fatal panic reach the panel once a compositor owns the
+            // scanout?** Three investigations into the T14 have rested on the
+            // answer being yes and nothing has ever asked it. `screen_fatal_halt`
+            // boots a config with no compositor, so the screen it paints is one
+            // nothing else had claimed; `screen_blocked_dump` does have a
+            // compositor, but Ctrl+Alt+D paints through `paint_report`, and
+            // `halt_all_cpus` paints through `render` with a different fill and
+            // a different source. The owner pulled his stick, waited a minute,
+            // and saw the desktop unchanged — which is what this test is for:
+            // if the fatal path cannot paint over a claimed framebuffer, every
+            // "nothing appeared on the panel" observation to date says nothing
+            // about what the kernel did.
+            // Driven by `metal-panic-probe`, which is the same kernel the owner
+            // flashes: a gate that staged this with SYS_DEBUG would certify a
+            // path his image does not contain.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                smp: 8,
+                qmp: true,
+                kernel_features: &["metal-panic-probe"],
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+
+            // The compositor has the screen *before* anything panics. Asserted
+            // on the fill, exactly as `screen_blocked_dump` does: every kernel
+            // paint fills with `FILL_BOOT`, so anything else is userland
+            // holding the panel. Without this the test would prove that a
+            // fatal panic paints a screen nobody had taken, which is what the
+            // suite already knew.
+            let up = qemu.screendump_while(Duration::from_secs(30), Duration::from_millis(200), |d| {
+                d.fill() != FILL_BOOT
+            });
+            if up.fill() == FILL_BOOT {
+                return Err(
+                    "the compositor never took the screen, so this would have retested \
+                     screen_fatal_halt on a different config"
+                        .to_string(),
+                );
+            }
+
+            // The probe fires 5 s after the claim; the poll is for that plus
+            // the pager cycling pages.
+            const MARKER: &str = "metal-panic-probe";
+            let dump = qemu.screendump_until(MARKER, Duration::from_secs(40));
+            let text = dump.text();
+            print_screen(name, &text);
+            if !text.contains(MARKER) {
+                return Err(format!(
+                    "a fatal panic never reached the panel a compositor was holding — on a \
+                     machine with no serial port that is a kernel that cannot report its own \
+                     death\ndecoded screen:\n{text}"
+                ));
+            }
+            if !text.contains("!!! PANIC !!!") {
+                return Err(format!(
+                    "the marker is on the panel without the panic banner, so this painted \
+                     something other than a fatal report\ndecoded screen:\n{text}"
+                ));
+            }
+            if dump.fill() != FILL_FATAL {
+                return Err(format!(
+                    "the panel still carries {:?} rather than the fatal fill, so the compositor's \
+                     screen was never taken back",
+                    dump.fill()
+                ));
             }
             Ok(())
         }

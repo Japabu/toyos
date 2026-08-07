@@ -1273,6 +1273,25 @@ eight RIPs.
 It also blocks every landing until it is fixed, because it is on main and it is
 not flaky.
 
+**RESOLVED as a contradiction, 2026-08-07: the two agents were watching two
+different failures, and the silence is no longer reachable through this test.**
+`40ee9a6` found that `close_focused_window` waited on `windows=N` — a level
+sampled every two seconds — with `serial_until`, which scans the whole capture,
+so the previous probe's sample answered the wait instantly and the loop re-sent
+GUI+Q at the speed of a QMP round trip. The second one closed the terminal's
+window under the one it meant, and the three exits that followed were correct
+behaviour. **That signature is three logged exits in 0.25 s; the one recorded
+above is total silence with no exits at all**, so the fix did not explain the
+silence, it removed whatever was being poked hard enough to produce it.
+
+Ten runs of `cargo test -- desktop_window_child` alone on `8cfb6d8` after the
+merge: **ten green, no silent guest**. So the silence is not reachable through
+the shipped harness any more, and the LLDB-attachable reproduction the class
+still needs is not this one. What was *not* tried, and is the cheap next step
+for whoever wants it back: restore the old function's injection rate
+deliberately — a burst of GUI+Q at QMP round-trip speed while windows are being
+created and destroyed — as a test of its own rather than as a regression.
+
 ### OPEN — a `winit` app spins forever when its window is closed, and never exits
 
 Separate from the above, in the fork rather than the tree, and **decided by
@@ -4301,33 +4320,109 @@ does not exist and whose file sink is on the stick that was just pulled — and 
 absence of a line that cannot be printed is not evidence. What the withdrawal got
 right is the missing *panic screen*, and step 4 accounts for that too.
 
-**Two defects, either worth fixing on its own.**
+**Two defects, either worth fixing on its own — and neither is this bug.** The
+metal result below eliminates the chain as *the* mechanism; these stand on their
+own reading and stay open.
 
 - **A deadlock panic is classified recoverable because a syscall happens to be in
   progress.** The predicate asks whether a userland thread is current, not
   whether the kernel can continue. For `Lock::lock`'s own deadlock it
   demonstrably cannot, and the handler's response is to throw away the on-screen
   report and make the deadlock permanent.
-- **A ticket lock cannot survive an abandoned waiter.** The queue form of the
+- **A ticket lock cannot survive an abandoned waiter.** `sync.rs`'s
+  `ticket.fetch_add(1)` happens before the spin and `now` advances only in
+  `LockGuard::drop`, so a waiter that panics inside the spin never constructs a
+  guard and its ticket is never served: the lock is unacquirable for the rest of
+  the boot, machine-wide, with no diagnostic at all. The queue form of the
   "locks a dead thread can strand" class in §2, and worse than the held-guard
-  form: the abandoning thread never held the lock, so nothing in the code reads
-  as if it owned anything to release.
+  form — the abandoning thread never held the lock, so nothing in the code reads
+  as if it owned anything to release. Whatever closes it should make the failure
+  loud and terminal rather than silent and permanent, and note that a fix whose
+  only signal is a log line is invisible on the machine that needs it.
+
+**And one removed here.** `poll_if_pending` took `XHCI` with `lock()` at the top
+of every scheduler pass on every CPU, and while a port has work outstanding
+every CPU finds it due — so the acquisition alone put as many CPUs as the
+machine has on one ticket queue, each spinning with preemption disabled. It is a
+`try_lock` now: the CPU holding that lock is doing precisely the work the
+declining CPU came to do, so waiting for it buys a second look at a state
+somebody else has already advanced. The `irq_ring` record is consumed only after
+the lock is held, because `take` clears a slot an ISR coalesces into and a CPU
+that took its record and then declined would have dropped a wake.
+
+#### 2026-08-07: the metal result, and what it eliminates
+
+The owner built at `8cfb6d8` — a clean tree carrying **X2a and X2b both** — and
+pulled the stick. **Froze. Ctrl+Alt+D nothing. He then sat untouched for a full
+minute and the panel did not change at all**; the desktop image stayed as it was.
+
+**X2a and X2b are eliminated as the fix and are not eliminated as correct work.**
+They removed real unbounded waits from the scheduler pass, their gates stand, and
+the freeze is unchanged across them. What that buys is a clean narrowing: the
+remaining xHCI candidate is the **acquisition** of the one controller lock rather
+than the work done under it.
+
+**The minute of nothing is the interesting half, and the arithmetic behind it.**
+500M spins is seconds, not minutes, so a convoy would have reached
+`Lock::lock`'s DEADLOCK panic dozens of times over. `main.rs`'s recovery branch
+is per-CPU and conditional — `syscall_rip() != 0 && current_tid().is_some()` —
+and an idle CPU satisfies neither clause, so it falls through to
+`halt_all_cpus`, which paints. On eight cores running three processes, several
+CPUs are idle. Something should have appeared. Two of the three explanations are
+now closed:
+
+- **"The panic console cannot take the screen from a compositor."** False, and
+  now gated. `SCREEN_OWNED_BY_USERLAND` stops *boot checkpoints* and nothing
+  else; GOP's `set_resolution` always returns `NotSupported`, so
+  `gpu::set_resolution`'s missing `rearm()` on the success path never fires on
+  this machine; and `panic_console::disable()` is virtio-gpu's alone.
+  `screen_fatal_halt_composited` now boots metalcase with a compositor holding
+  the panel and asserts the fatal report lands on it.
+- **"A fatal panic on an idle CPU reports itself."** It did not, and that is
+  fixed in this branch. `idle_loop` is entered by `jmp`, so its frame is the
+  topmost on the 16 KiB idle stack and `rbp + 8` — which `kernel_backtrace`
+  reads before checking it — was the unmapped page above. Every fatal panic on
+  an idle CPU faulted inside `crash_report` while printing its own backtrace,
+  the fault's report faulted the same way, and the chain ended in a double fault
+  and `PANIC REENTRY`. Measured: **seven pages of cascade with no line saying
+  what panicked, against one panic and three pages afterwards.**
+
+So the "nothing paints" clause in the chain above survives, with a different and
+checkable cause than the one it was written with — not the recovery branch, but
+a report that could not be printed from the stack it was raised on. **What that
+does not establish is that a deadlock panic is what happened**; it establishes
+only that if one had, the owner would have seen a fault cascade or nothing, and
+never the reason.
+
+**A latent defect found on the way**, not live and worth an entry: on the
+success path `gpu::set_resolution` calls `panic_console::detach()` and never
+`rearm()`, so any driver whose resolution change *succeeds* blinds the panic
+console for the rest of the boot. Unreachable today — GOP always refuses and
+virtio-gpu is disabled outright — and one new GPU driver away from being live.
 
 #### What the owner should run, and what each outcome means
 
-The one change that would make his machine legible is small and is not made:
-give `Lock::lock`'s deadlock panic the fatal path, so it reaches
-`halt_all_cpus` and the panic console paints the lock's name and its call site.
-A stick pulled out of a T14 would then answer the question by itself, on the
-panel, in a photograph. Without it the machine is dark by design at step 4.
+**One reflash, and it answers the question this branch could not.**
+`cargo run -- --console-boot --kernel-feature metal-panic-probe --build-only`
+(or `--diag-boot`, or the ordinary image — the probe is orthogonal to the boot
+mode). Flash it, boot to the desktop, and wait. Five seconds after a process
+claims the framebuffer the kernel raises a real fatal panic from an idle CPU —
+the same path, the same context and the same stack a machine-stopped panic uses.
 
-Until then the discriminator costs one boot and no reflash: pull the stick and
-**wait a full minute without touching the machine**, watching the panel. `pause`
-is documented at about 140 cycles on Skylake and later, so 500M spins is on the
-order of half a minute on this laptop — an estimate from the datasheet, not a
-measurement. A panic screen inside that window is the convoy, named. A minute of
-nothing is what step 4 predicts, and is the reason the change above is worth
-making before he is asked for anything else.
+- **The panel fills with a panic report** naming
+  `metal-panic-probe` → the fatal path works on his hardware, with his
+  compositor, on his panel. Every future "nothing appeared" is then evidence
+  that no panic happened, and the freeze is not reaching one.
+- **The panel does not change** → the T14 has never been able to report a fatal
+  panic, three investigations have run blind, and that is worth more than the
+  freeze because it is the prerequisite for diagnosing anything else on that
+  machine.
+
+`screen_fatal_halt_composited` gates the same feature in QEMU, so a green suite
+says the software half works and the reflash asks only about the panel. That
+split is deliberate: QEMU's framebuffer is host RAM, while the T14's is a
+write-combining MMIO mapping the compositor is also writing and a full paint
+measures ~460 ms there.
 
 ### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
 

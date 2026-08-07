@@ -86,6 +86,16 @@ pub fn take(source: IrqSource) -> Option<u64> {
     }
 }
 
+/// Is there an undrained record for `source` on this CPU? Non-consuming.
+///
+/// For a caller that has to decide whether it has work *before* it knows it
+/// can do that work. [`take`] consumes, so a caller that takes a record and
+/// then declines has dropped a wake nothing will re-post: the ISR coalesces
+/// into an empty slot and the interrupt that filled this one is over.
+pub fn pending(source: IrqSource) -> bool {
+    SLOTS[percpu::cpu_id() as usize].0[source as usize].load(Ordering::Relaxed) != 0
+}
+
 /// Any undrained IRQ record on the current CPU? Non-consuming — the idle
 /// loop's pre-hlt recheck. Records always live on the CPU that took the
 /// interrupt, so each CPU only ever needs to check itself before sleeping.
