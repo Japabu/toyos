@@ -292,6 +292,33 @@ here.
   is N boots per config strictly one at a time, so a second machine is the only
   thing that can shorten it: `--shard 1/2` and `2/2` put one audio test on each.
 
+## 8.1 Somebody has to push `main`
+
+`cargo run -- --land` fast-forwards the primary checkout and does not push, and
+the owner's rule is that an agent pushes its own branch and never `main`. At the
+moment this landed, `origin/main` was **64 commits behind** local `main` and
+carried no `.github` directory at all; it was pushed by hand shortly after and
+now carries all eight workflows.
+
+Most of CI works either way, because a branch created from local `main` carries
+the workflows with it: **a pushed branch runs its own CI, and so does a PR** —
+the `pull_request` event resolves workflows from the merge of head and base, and
+head has them. Three things need `main` itself to be current:
+
+- `main` is otherwise never tested; a landing's gate is the only thing that ever
+  sees it.
+- `actions/cache` entries written on `main` are the only ones every branch can
+  read, so otherwise every branch's first run is cold.
+- `workflow_dispatch` requires the workflow on the default branch, and that is
+  how `gate-a.yml` is triggered.
+
+One line in `src/land.rs` after the fast-forward closes all three
+(`git -C <primary> push origin main`), and it keeps the rule intact: `main`
+would still move only through `--land`. **Not done here** — it is a change to
+the landing protocol and to the owner's rule, and both are his. Until it is, a
+`main` that has stopped moving on GitHub is the thing to check first when CI
+looks stale.
+
 ## 9. Not done
 
 - **Gate A's variance on a runner, against the dev host's.** The instrument is
