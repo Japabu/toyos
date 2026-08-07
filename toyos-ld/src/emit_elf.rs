@@ -5,7 +5,7 @@ use crate::collect::{collect_unique_symbols, InputSection, LinkState, RelocType,
 use crate::reloc::{RelocOutput, resolve_symbol, tpoff};
 use crate::{align_up, classify_sections, LinkError, BASE_VADDR, PAGE_SIZE};
 use object::elf;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ── Layout ───────────────────────────────────────────────────────────────
 
@@ -19,15 +19,15 @@ pub(crate) struct ElfLayout {
     pub(crate) tls_start: u64,
     pub(crate) tls_filesz: u64,
     pub(crate) tls_memsz: u64,
-    pub(crate) got: HashMap<SymbolRef, u64>,
+    pub(crate) got: BTreeMap<SymbolRef, u64>,
     /// Shared LD GOT pair (16 bytes) for all TLSLD accesses in shared mode.
     pub(crate) ld_got_pair: Option<u64>,
     /// Per-symbol GD GOT pairs (16 bytes each) for TLSGD in shared mode.
-    pub(crate) gd_got: HashMap<SymbolRef, u64>,
-    pub(crate) plt: HashMap<SymbolRef, u64>,
+    pub(crate) gd_got: BTreeMap<SymbolRef, u64>,
+    pub(crate) plt: BTreeMap<SymbolRef, u64>,
     pub(crate) plt_data: Vec<u8>,
     pub(crate) plt_vaddr: u64,
-    pub(crate) dyn_got: HashMap<SymbolRef, u64>,
+    pub(crate) dyn_got: BTreeMap<SymbolRef, u64>,
     pub(crate) init_array_vaddr: u64,
     pub(crate) init_array_size: u64,
     pub(crate) fini_array_vaddr: u64,
@@ -388,7 +388,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         None
     };
 
-    let mut gd_got: HashMap<SymbolRef, u64> = HashMap::new();
+    let mut gd_got: BTreeMap<SymbolRef, u64> = BTreeMap::new();
     if is_shared {
         let gd_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
             r.r_type == RelocType::X86Tlsgd
@@ -399,7 +399,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         }
     }
 
-    let mut got = HashMap::new();
+    let mut got = BTreeMap::new();
     let dyn_sym_names: std::collections::HashSet<&str> = dyn_syms.iter().map(|s| s.name()).collect();
     for sym in &got_symbols {
         if dyn_sym_names.contains(sym.name()) { continue; }
@@ -407,7 +407,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         cursor += 8;
     }
 
-    let mut dyn_got = HashMap::new();
+    let mut dyn_got = BTreeMap::new();
     for sym in &dyn_syms {
         dyn_got.insert(sym.clone(), cursor);
         cursor += 8;
@@ -451,7 +451,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     let rw_end = align_up(cursor, PAGE_SIZE);
 
     // Build PLT stub code: `jmp *[rip + offset]` (FF 25 xx xx xx xx)
-    let mut plt = HashMap::new();
+    let mut plt = BTreeMap::new();
     let mut plt_data = Vec::new();
     for (i, sym) in dyn_syms.iter().enumerate() {
         let stub_vaddr = plt_vaddr + i as u64 * PLT_STUB_SIZE;
@@ -523,7 +523,7 @@ pub(crate) fn patch_build_id(buf: &mut [u8], note_file_offset: usize) {
     buf[desc_start..desc_end].copy_from_slice(&hash);
 }
 
-fn resolve_entry(state: &LinkState, entry_name: &str, plt: Option<&HashMap<SymbolRef, u64>>) -> Result<u64, LinkError> {
+fn resolve_entry(state: &LinkState, entry_name: &str, plt: Option<&BTreeMap<SymbolRef, u64>>) -> Result<u64, LinkError> {
     state
         .globals
         .get(entry_name)
