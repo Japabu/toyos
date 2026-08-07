@@ -8630,7 +8630,10 @@ fn run_debug_mode(c_tests: &[(String, Vec<u8>)], rust_bins: &[(String, Vec<u8>)]
     );
 
     let repo = compile::repo_root();
-    let kernel_elf = repo.join("kernel/target/x86_64-unknown-none/debug/kernel");
+    let kernel_elf = repo.join(format!(
+        "kernel/target/x86_64-unknown-none/{}/kernel",
+        toyos_build::build::PROFILE
+    ));
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");

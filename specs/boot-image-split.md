@@ -278,7 +278,7 @@ Every one of them is built:
 | SCSI | same |
 | non-spinning transfers | `toyos_xhci::{job,recovery}`, one outstanding op per controller |
 | a second block device | `block::DeviceId`; `usb_storage.rs` takes 16.., NVMe takes 1 |
-| a multi-device page cache | `page_cache.rs` keys on `DeviceId` |
+| a multi-device page cache | **not built — see below** |
 
 `kernel/src/drivers/usb_storage.rs` is a 110-line `BlockDevice` over it. The T14
 boots off it; so does every `cargo test`, because the emulated boot medium is
@@ -288,6 +288,23 @@ That last fact also retires the old §5.3 / R2 proposal to swap the dev loop to
 `virtio-blk`. Doing so now would remove the *only* device that exercises the USB
 mass-storage path on every run — which is exactly the failure the old §6.5
 warned about, arriving from the other direction.
+
+**The eighth item is still open, and it is stage 2's real cost.**
+`page_cache.rs:11-12` holds one `BLOCK_DEV: Lock<Option<Box<dyn BlockDevice>>>`,
+`PageCache::_device_id` is still written and never read, and `page_cache::init`
+takes ownership of the NVMe device. So `usb_storage.rs`'s own comment — "the
+page cache keys itself on this" — describes something the page cache does not
+do, and `fat32_adapter.rs:911-915` says the consequence out loud: a machine that
+boots off an *internal* disk gets neither `/boot` nor `/log`, "because the NVMe
+device is owned by the page cache from the moment storage comes up and there is
+no second handle to it".
+
+`/boot` and `/log` work today only because they are USB, and `usb_storage::open`
+mints a fresh handle per call. A bcachefs root on the boot medium needs a
+`BlockIO` over an arbitrary `BlockDevice` at a partition offset with a cache of
+its own — `PageCacheBlockIO` is the NVMe device by construction, and
+`FatDevice`'s eight-block resident set is the shape but not the size. That is
+the work §3.4 costs, and it is a page-cache change rather than a driver.
 
 ### 3.3 What the initrd costs
 
@@ -358,11 +375,18 @@ consumer.
 everything in it. The image is therefore a function of the working tree rather
 than of the commit.
 
-The fix is to make the config name what ships, so that a file nobody named
-cannot ship and a file that is named and missing stops the build. An ignore list
-for dotfiles and `target/` would be a workaround: the next stray file ships
-again, silently, and the property "a fresh clone builds this image" is still not
-stated anywhere.
+**Built**, and the first attempt was wrong in the other direction. Filtering to
+what `git ls-files` returns is right about `.DS_Store` and about the stray
+`target/`, and wrong about the one file in that directory git deliberately does
+not carry: `.gitignore` line 3 is `assets/timgm6mb.sf2`, 5,994,284 bytes of
+SoundFont doom synthesises its music from. The image built after that commit did
+not have it, and the whole suite was green either way — **nothing in this tree
+gates doom's music**, which is a finding of its own.
+
+So `untracked-assets` in each config names the paths that ship without git
+having a copy, and an entry naming a file the build cannot find is a hard error.
+That last half is the point: a fresh clone genuinely has no SoundFont, and what
+it needs is to be told by name rather than handed a doom that plays nothing.
 
 ## 6. One profile
 
@@ -389,24 +413,57 @@ once.
 `debug = true` produces nothing today (§2.3) — `toyos-ld` drops it. It stays for
 two reasons and neither is the artifact: the intent is recorded where the next
 reader looks, and the day `toyos-ld` keeps `.debug_line` the profile does not
-have to be revisited. Its cost is compile time, measured in §8.
+have to be revisited. Its cost is compile time, unmeasured (§8).
 
-The profile is named and stated in full, in one place per crate that produces a
-guest binary, and the sentence at `kernel/Cargo.toml:371` becomes its comment.
-`--release` is not passed by anything.
+**Built as `[profile.toyos]`**, declared by every crate root the image is made
+of — kernel, bootloader, the userland workspace, `toyos-cc`, `toyos-ld`, and
+`tests/toyos-rust-tests` with its four subcrates — and passed as
+`--profile toyos` by `build::cargo_build`, which is the only place this build
+system invokes cargo for a guest target. `--release` is gone from `cargo run`,
+from `build()`, and from `build_and_assemble`; there is no second profile left
+to pick, which is why there is no longer a flag. The per-package overrides in
+`userland/Cargo.toml` go with it: one opt-level for the whole image needs none.
+
+### 6.1 What it measured
+
+Image, whole: **729,808,896 → 701,497,344 bytes**, −28,311,552 (−3.88%). All of
+it in the binaries; the toolchain does not move because it is the sysroot's
+build and not ours.
+
+| | before | after | |
+|---|---|---|---|
+| initrd `bin/` group | 89,985,665 | 64,425,193 | **−28.4%** |
+| `bin/toyos-cc` | 32,977,320 | 14,957,688 | −54.6% |
+| `bin/toyos-ld` | 6,827,984 | 3,402,328 | −50.2% |
+| `bin/sshd` | 12,245,032 | 10,311,136 | −15.8% |
+| `bin/shell` | 1,993,584 | 1,777,760 | −10.8% |
+| `bin/toybox` | 2,440,160 | 2,173,776 | −10.9% |
+| `bin/terminal` | 2,051,240 | 1,904,704 | −7.1% |
+| `BOOTx64.EFI` | 946,176 | 513,024 | −45.8% |
+
+The two halves of the table are the two halves of §1.4's inconsistency:
+`toyos-cc`, `toyos-ld`, the bootloader and every unlisted userland program were
+at opt-level 0 and roughly halve; the compositor and doom were already at 2 and
+barely move. The kernel is not comparable across this change — `main` gained the
+HDA driver between the two builds.
+
+The checks are not free and the figure is the honest one: the same kernel is
+**3,784,872 bytes with `overflow-checks` on and 3,296,672 with it off**, so
+14.8% of the kernel is the checks. That is the price of the two crafted-ELF
+panics being findable.
 
 ## 7. Gates
 
 Each stage lands with a gate that is watched red before the fix and green after.
 
-**Stage 1 — a named backtrace for a program running from disk.** The one the
-whole task turns on, and the one §2.2 shows does not exist. A test binary that
-segfaults, spawned from `/home` (which is NVMe today and is *not* the initrd),
-asserting the SEGFAULT report contains its demangled function name. Negative
-control: it is red on `main`, because `memory_ptr` returns `None` for
-`NvmeBacking`. `MAX_SYMBOL_BYTES` gets its own gate — what the caller sees when
-it is hit is a log line naming the binary and a backtrace of bare addresses,
-never a spawn failure.
+**Stage 1 — a named backtrace for a program running from disk.** *Built.*
+`disk_backtrace` copies its child onto `/home` and runs it from there;
+`check_disk_backtrace` asserts the SEGFAULT report names
+`null_deref_run_from_disk`, a symbol no other binary in the boot has. Negative
+control watched: with `read_backtrace_table` stubbed to `empty_with_bounds`, the
+report reads `0x1000000102a  [exe+0x102a]` and the test is red — twice, because
+the harness re-runs a red from the wide phase alone. Green after, with
+`0x10000001174  disk_backtrace_child::null_deref_run_from_disk+0x14`.
 
 **Stage 2 — every existing test.** The suite boots ~76 machines and every one of
 them mounts the initrd as `/`. Moving that mount to a partition is exercised by
@@ -417,32 +474,41 @@ name rather than wedge.
 **Stage 3 — the image is smaller and the system still boots.** Plus a gate that
 `hosted-rustc = true` still assembles, since the code path stays.
 
-**Stage 4 — overflow checks are on in the shipped kernel.** A kernel feature that
-overflows a `u8` and expects a panic; red if the profile ever silently becomes
-`--release`.
+**Stage 4 — overflow checks are on in the shipped kernel.** *Built, and it is not
+a test.* `build::assert_overflow_checked` searches the staged kernel for
+`attempt to add with overflow` — the panic message rustc references beside every
+checked add, which the linker's liveness pass drops when there is no call site —
+and refuses to write an image without it. In `build()` and in
+`build_test_image`, so `--build-only`, `--diag-boot`, `--console-boot` and every
+harness boot are all covered by the same check. Negative control watched: with
+`overflow-checks = false` in `kernel/Cargo.toml`, `cargo run -- --build-only`
+stops with *"the kernel was built without overflow checks: nothing in 3,717,296
+bytes references …"*.
+
+A kernel feature that overflows a `u8` would have cost a boot and proved less:
+it would say the checks are on *in the kernel that test booted*, where this says
+it about every image this build system writes.
 
 ## 8. Measurements still to take
-
-Not taken as of this writing, because the shared sysroot was held by another
-worktree for the whole session so far and nothing here has been booted. Each is
-a single command and each belongs in this document before the stage it prices
-lands.
 
 - **The four-way split of a boot's wall clock** on current `main`: firmware,
   initrd read, kernel phases, userland. The 2026-07-29 document cited 4.96 s /
   2.48 s / 1.42 s / 0.93 s from `specs/arm64-research-2026-07-28.md` §1, taken
   before `019e963` deleted the bootloader's 635 MiB memset and before the kernel
   was built with optimisation on. **Every derived timing in the old document
-  scaled off that rate and none of it is carried forward here.**
+  scaled off that rate and none of it is carried forward here.** Nothing in this
+  session timed a boot: the shared sysroot was held by another worktree for the
+  first two hours, and after that every measurement here was a size.
 - **Bootloader instrumentation** (the old §5.1 / E1): `rdtsc` deltas around the
   pool allocation, `file.read`, `load_kernel_elf` and `exit_boot_services`. Ten
   lines. It is what makes every later change attributable, and it gives the
   per-byte rate twice at two very different sizes in one boot.
-- **Image size and boot time after each of stages 2, 3 and 4.**
-- **What `debug = true` costs in kernel compile time**, since §2.3 shows it buys
-  no artifact.
-- **What stage 1 costs at spawn**: the added read is `.symtab` + `.strtab` off
-  the file cache, and `spawn:` already logs a phase breakdown.
+- **What `debug = true` costs in compile time**, since §2.3 shows it buys no
+  artifact.
+- **What stage 1 costs at spawn.** `spawn:` now prints `symbols=NKiB` per
+  process — every binary in a test boot came out at 2048 KiB, which is
+  `PageAlloc`'s one-page minimum and not a measurement of the tables — and the
+  phase breakdown beside it does not yet separate the symbol read from `layout`.
 
 ## 9. What was priced and rejected
 
