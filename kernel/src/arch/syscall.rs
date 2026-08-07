@@ -650,12 +650,16 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             10 => canary::address(),
             #[cfg(feature = "test-kernel-canary")]
             11 => canary::changed() as u64,
-            // Take one TLB shootdown with the highest-numbered CPU answering
-            // `a2` nanoseconds late, and answer with how long it took. The
-            // number is the gate: an initiator that does not wait measures
-            // roughly the cost of one ICR write however slow its siblings are.
+            // Make the last CPU a shootdown waits for answer `a2` nanoseconds
+            // late, take one, and answer with how long it took. The number is
+            // the gate: an initiator that does not wait measures roughly the
+            // cost of one ICR write however slow its siblings are. The arming
+            // outlives the call, so the caller can then time an ordinary
+            // syscall and learn whether *its* free path shoots down.
             #[cfg(feature = "test-tlb-ack-delay")]
-            12 => crate::arch::tlb::debug_timed_shootdown(a2),
+            12 => crate::arch::tlb::debug_arm_ack_delay(a2),
+            #[cfg(feature = "test-tlb-ack-delay")]
+            13 => crate::arch::tlb::debug_disarm_ack_delay(),
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => match ctx.copy_out(UserAddr::new(a1), &sys_sched_info()) {

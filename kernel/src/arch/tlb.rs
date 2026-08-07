@@ -194,7 +194,19 @@ mod delay {
 
     pub static NANOS: AtomicU64 = AtomicU64::new(0);
     pub static CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+    /// Absolute nanoseconds past which the arming lapses.
+    pub static UNTIL: AtomicU64 = AtomicU64::new(0);
 }
+
+/// How long an arming stays live.
+///
+/// It expires rather than being one-shot for two reasons, and the second is the
+/// one that matters. One-shot would be spent by whatever shootdown happened to
+/// come first — a daemon exiting, a `dlopen` — and the syscall under measurement
+/// would read zero and fail for a reason that is not the defect. And a window
+/// cannot outlive a test that panicked before disarming, which a latch would.
+#[cfg(feature = "test-tlb-ack-delay")]
+const ARM_WINDOW_NANOS: u64 = 2_000_000_000;
 
 /// Hold this CPU's acknowledgement back, without holding its flush back.
 ///
@@ -210,36 +222,55 @@ fn stage_ack_delay() {
     if delay::CPU.load(Ordering::Relaxed) != percpu::cpu_id() {
         return;
     }
-    let nanos = delay::NANOS.swap(0, Ordering::Relaxed);
-    if nanos == 0 {
+    let now = crate::clock::nanos_since_boot();
+    if now >= delay::UNTIL.load(Ordering::Relaxed) {
         return;
     }
-    let until = crate::clock::nanos_since_boot().saturating_add(nanos);
+    let until = now.saturating_add(delay::NANOS.load(Ordering::Relaxed));
     while crate::clock::nanos_since_boot() < until {
         core::hint::spin_loop();
     }
 }
 
-/// Arm the highest-numbered CPU to answer its next shootdown `nanos` late, then
-/// take one and report how long it took, in nanoseconds.
+/// The CPU an initiator on this one waits for *last*.
 ///
-/// The *highest*-numbered CPU rather than any one, because the initiator walks
-/// its targets in order: a wait that only covered the first would still measure
-/// long if the delay were armed on cpu 1, and the point of the gate is that
-/// every online CPU is waited for.
+/// The last rather than any, because [`shootdown`] walks its targets in order: a
+/// wait that covered only the first would still measure long if the delay sat on
+/// cpu 1, and what the gate is about is that every online CPU is waited for.
 #[cfg(feature = "test-tlb-ack-delay")]
-pub fn debug_timed_shootdown(nanos: u64) -> u64 {
-    use core::sync::atomic::Ordering;
-    let last = smp::cpu_count() - 1;
-    if last == percpu::cpu_id() || last == 0 {
-        return 0;
+fn last_target() -> Option<u32> {
+    let top = smp::cpu_count().checked_sub(1)?;
+    match percpu::cpu_id() {
+        me if me == top => top.checked_sub(1),
+        _ => Some(top),
     }
-    delay::CPU.store(last, Ordering::Relaxed);
+}
+
+/// Make the last CPU this one waits for answer `nanos` late for the next
+/// [`ARM_WINDOW_NANOS`], take one shootdown, and report what it cost.
+///
+/// The return value is the gate on the primitive; the arming outlives it so the
+/// caller can then time an ordinary syscall and gate the *paths*.
+#[cfg(feature = "test-tlb-ack-delay")]
+pub fn debug_arm_ack_delay(nanos: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    let Some(target) = last_target() else { return 0 };
+    delay::CPU.store(target, Ordering::Relaxed);
     delay::NANOS.store(nanos, Ordering::Relaxed);
+    delay::UNTIL.store(
+        crate::clock::nanos_since_boot().saturating_add(ARM_WINDOW_NANOS),
+        Ordering::Relaxed,
+    );
     let start = crate::clock::nanos_since_boot();
     shootdown();
-    let elapsed = crate::clock::nanos_since_boot() - start;
+    crate::clock::nanos_since_boot() - start
+}
+
+/// Give the machine its ordinary latency back before the window lapses.
+#[cfg(feature = "test-tlb-ack-delay")]
+pub fn debug_disarm_ack_delay() -> u64 {
+    use core::sync::atomic::Ordering;
+    delay::UNTIL.store(0, Ordering::Relaxed);
     delay::CPU.store(u32::MAX, Ordering::Relaxed);
-    delay::NANOS.store(0, Ordering::Relaxed);
-    elapsed
+    0
 }
