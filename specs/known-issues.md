@@ -3293,9 +3293,15 @@ soundd: client [kernel 351.736 cpu0 tid=0] syscalls: pid=46 total=28 …
 
 The second is the kernel's own ring landing inside a userland line, so this is
 not only a userland-vs-userland race. On the T14 the log *is* the instrument,
-and a periodic stats line that can be split is a counter that can be misread —
-the split above turns `soundd: client 40 removed` into two lines that a
-`grep 'client .* removed'` will not match.
+and this capture shows what that costs. Counting soundd's client lifecycle in
+it gives 45 connects and 44 removes, and the one id with no removal is 40 —
+whose removal is the split line above. A reader auditing that log for leaked
+clients finds one, and it is not there:
+
+```
+$ grep -c 'connected (id='            45
+$ grep -cE '^soundd: client [0-9]+ removed$'   44
+```
 
 Cheap in principle: give the toyos `Stderr` a line buffer, or have
 `write_user` hold the ring across one logical line. Neither is free of
