@@ -382,13 +382,29 @@ Nothing in the harness boots `system.toml` at all — every test config is its
 own file — so no suite test could go red for this change in either direction.
 Recorded in `known-issues.md` §6.
 
-**The flag is flipped and the image after it has not been measured.** The
-shared sysroot was claimed by another worktree for the last hour of this
-session and `--build-only` refuses under that, correctly. The figure to fill in
-is the whole-image size from `cargo run --example imgstat`; the content it must
-be consistent with is 80,894,365 bytes — the stage-4 image's 585,120,562 minus
-its 504,226,197 of toolchain — plus `create_initrd`'s 10% and the ESP's own
-metadata. **Do not write the derived number down as measured.**
+### 4.1 What it measured
+
+| | stage 4 | stage 3 | |
+|---|---|---|---|
+| whole image | 701,497,344 | **137,363,456** | −80.4% |
+| ESP partition | 662,794,240 | 99,385,344 | −85.0% |
+| `toyos/initrd.img` | 643,944,448 | 89,337,856 | −86.1% |
+| initrd content | 585,120,562 | 80,942,013 | −86.2% |
+| initrd entries | 129 | 49 | |
+
+Against where this task started — 729,808,896 bytes on `43ce73e` — the whole arc
+is **−81.2%, a 5.31× reduction**, and none of it cost a feature: the toolchain
+is one boolean away and every binary that was in the image is still in it.
+
+What is left in the initrd is 64,472,841 bytes of userland binaries (79.65%) and
+16,469,172 of assets (20.35%). The three largest entries are now `bin/toyos-cc`
+at 14,958,480, `bin/sshd` at 10,312,256 and `share/wallpaper.rgb` at 6,220,808 —
+so a next tier, if anyone wants one, is the C toolchain at 18.4 MiB and doom's
+two assets at 9.7 MiB.
+
+**The memory figure moves with it**, and that was §3.3's durable argument: what
+`mm::init` reserves and never frees goes from 641.0 MiB of a 2 GiB guest to
+**85.2 MiB**. Stage 2 takes the rest.
 
 ## 5. The asset sweep
 
