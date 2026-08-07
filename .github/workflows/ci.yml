@@ -1,10 +1,14 @@
 name: ci
 
-# The guest suite, on a machine the dev host does not have: x86_64 with KVM, so
-# the guests run natively instead of under cross-arch TCG.
+# The guest suite on Linux x86_64, four machines at once — which is the shape
+# the dev host does not have, and the one that costs nobody a shared sysroot.
+#
+# `ci/**` is where throwaway probe branches live; they trigger their own
+# workflows and not this one.
 
 on:
   push:
+    branches-ignore: ['ci/**']
   pull_request:
   workflow_dispatch:
 

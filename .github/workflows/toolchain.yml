@@ -11,6 +11,7 @@ name: toolchain
 
 on:
   push:
+    branches-ignore: ['ci/**']
   workflow_dispatch:
 
 concurrency:
@@ -100,7 +101,11 @@ jobs:
             | zstd -T0 -3 -o /tmp/toyos-toolchain.tar.zst
           echo "PACKAGE-SECONDS: $(( $(date +%s) - t0 ))"
           ls -l /tmp/toyos-toolchain.tar.zst
+          # Idempotent, because the tag *is* the content: two branches carrying
+          # the same four trees each build one, and whoever is second would
+          # otherwise fail having produced the same bytes.
           gh release create "${{ steps.key.outputs.tag }}" \
             --title "${{ steps.key.outputs.tag }}" \
             --notes "x86_64-unknown-linux-gnu toolchain for rust $(git rev-parse HEAD:rust), built from ${{ github.sha }}." \
-            /tmp/toyos-toolchain.tar.zst
+            /tmp/toyos-toolchain.tar.zst \
+            || gh release view "${{ steps.key.outputs.tag }}"
