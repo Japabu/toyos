@@ -3053,6 +3053,25 @@ phase landed, and none reproduces on a host running one suite.
   against the device's queue, and the lost-edge counter no longer fires on a
   pass that read the `irq_ring` record a few instructions before the ISR
   published it.
+  **Not closed after all, at the count.** 2026-08-07, two full suites in one
+  worktree while a second worktree held six of the twelve guest slots: `1003
+  pointer events reached userland out of 1004 packets injected, never more than
+  4 of them (12 bytes) outstanding against a 16-byte device queue`. The lead is
+  inside the bound the fix installed, so the summing mechanism §8 describes is
+  not what this is. A/B in one session, `git checkout main -- kernel/` in the
+  same tree minutes apart: this branch PASS 33 s first try, **main's kernel FAIL
+  with the identical 1003-of-1004 line**, then PASS 2 s on the harness's own
+  re-run. So it is not a tree difference and it is not gone — one packet in a
+  thousand is still being lost, or still being counted wrong, under a host
+  carrying two suites.
+- **`i8042_absent`** — same session, same shape, and it is `Sched::Serial`
+  already, so intra-suite width is not what reaches it. The verdict is the
+  guest's own `Boot: complete` on two boots with a 300 ms allowance; the landing
+  gate saw `601ms without an i8042 and 287ms with one`. Alone, minutes later:
+  this branch 619 vs 507 (PASS), main's kernel in the same tree 277 vs 331
+  (PASS). The absolute figure moved 277→619 ms across three runs of one boot
+  with no code change, so what the allowance is being asked to absorb is the
+  host, and a serial slot inside one suite does not buy a quiet one.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
