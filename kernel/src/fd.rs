@@ -7,6 +7,7 @@ use crate::vfs::Vfs;
 use crate::{device, keyboard, listener, mouse, pipe};
 use crate::pipe::{PipeId, PipeReader, PipeWriter};
 use crate::drivers::serial;
+use crate::user_ptr::{UserBytes, UserBytesMut};
 pub use toyos_abi::FramebufferInfo;
 use toyos_abi::syscall::{FileType, OpenFlags, SeekFrom, SyscallError};
 
@@ -365,7 +366,7 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
 
 // Read / Write / Seek / Stat
 
-pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
+pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut UserBytesMut) -> Option<u64> {
     let desc = table.get_mut(fd)?;
     match desc {
         Descriptor::File(file) => {
@@ -386,7 +387,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
                     file.file_id,
                     page_idx,
                     offset_in_page,
-                    &mut buf[read..read + to_read],
+                    &mut buf.sub(read, to_read),
                 );
                 read += to_read;
             }
@@ -419,7 +420,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             let mut count = 0;
             while count + event_size <= buf.len() {
                 if let Some(event) = keyboard::try_read_event() {
-                    buf[count..count + event_size].copy_from_slice(event.as_bytes());
+                    buf.write_at(count, event.as_bytes());
                     count += event_size;
                 } else {
                     break;
@@ -432,7 +433,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             let mut count = 0;
             while count + event_size <= buf.len() {
                 if let Some(event) = mouse::try_read_event() {
-                    buf[count..count + event_size].copy_from_slice(event.as_bytes());
+                    buf.write_at(count, event.as_bytes());
                     count += event_size;
                 } else {
                     break;
@@ -443,20 +444,20 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
         Descriptor::Framebuffer(info) => {
             let bytes = info.as_bytes();
             let count = buf.len().min(bytes.len());
-            buf[..count].copy_from_slice(&bytes[..count]);
+            buf.write_at(0, &bytes[..count]);
             Some(count as u64)
         }
         Descriptor::Nic(info) => {
             let bytes = info.as_bytes();
             let count = buf.len().min(bytes.len());
-            buf[..count].copy_from_slice(&bytes[..count]);
+            buf.write_at(0, &bytes[..count]);
             Some(count as u64)
         }
         Descriptor::Audio { info, info_read } => {
             if !*info_read {
                 let bytes = info.as_bytes();
                 let count = buf.len().min(bytes.len());
-                buf[..count].copy_from_slice(&bytes[..count]);
+                buf.write_at(0, &bytes[..count]);
                 *info_read = true;
                 return Some(count as u64);
             }
@@ -472,7 +473,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             let mut count = 0usize;
             while count < buf.len() {
                 if let Some(b) = serial::try_read_byte() {
-                    buf[count] = b;
+                    buf.write_at(count, &[b]);
                     count += 1;
                     if b == b'\n' || b == b'\r' { break; }
                 } else if count > 0 {
@@ -490,7 +491,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
     }
 }
 
-pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
+pub fn try_write(table: &mut FdTable, fd: u32, buf: &UserBytes) -> Option<u64> {
     let desc = table.get_mut(fd)?;
     match desc {
         Descriptor::File(file) => {
@@ -514,7 +515,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
                     file.file_id,
                     page_idx,
                     offset_in_page,
-                    &buf[written..written + to_write],
+                    &buf.sub(written, to_write),
                 )
                 .is_err()
                 {
@@ -553,12 +554,14 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
             }
         }
         Descriptor::SerialConsole => {
-            serial::SerialWriter::console().write_bytes(buf);
+            serial::SerialWriter::console().write_user(buf);
             Some(buf.len() as u64)
         }
         Descriptor::Audio { .. } => {
             if !buf.is_empty() {
-                match buf[0] {
+                let mut cmd = [0u8; 1];
+                buf.read_at(0, &mut cmd);
+                match cmd[0] {
                     0 => crate::audio::stop(),
                     1 => crate::audio::start(),
                     _ => {}
