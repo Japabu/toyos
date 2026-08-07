@@ -641,7 +641,7 @@ fn probe(pci: &PciDevice) -> Option<(Mmio, u16, u16)> {
     let command = pci.read_config_u16(HEADER_COMMAND);
     pci.write_config_u16(HEADER_COMMAND, command | COMMAND_MEMORY_SPACE);
 
-    let regs = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(
+    let regs = crate::mm::paging::map_mmio(
         base,
         MIN_BAR_BYTES * 4,
         CachePolicy::DeferToMtrr,

@@ -8,6 +8,8 @@
 
 use core::arch::asm;
 
+#[cfg(feature = "diag-tick")]
+use toyos_sched::cpu::SleepToken;
 use toyos_sched::cpu::RunToken;
 use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos, TraceEvent};
 use toyos_sched::task::{TaskAccounting, TaskKey};
@@ -110,7 +112,38 @@ impl Machine for KernelHw {
     fn trace(&self, ev: TraceEvent) {
         crate::trace::record(ev);
     }
+
+    /// A diagnostic build refuses full quiescence. That is the whole of
+    /// `diag-tick`, and the whole difference between the two builds.
+    ///
+    /// The default is to sleep until something arrives, which is correct for a
+    /// shipping kernel and is what the owner's T14 does: eight boots halted
+    /// every CPU at 1.8 s and took no interrupt for as long as 102 s. Everything
+    /// the kernel says to whoever is watching it is emitted from the idle loop,
+    /// so across that window it said nothing, and the boots that survived wrote
+    /// the same file as the boots that froze.
+    ///
+    /// Arming before the halt and not after the wake: `halt` is `sti; hlt` and
+    /// its STI shadow, so a fire that lands in the window between them is taken
+    /// rather than slept through. Ordering with the pass's own arming is
+    /// [`apic::arm_within`]'s minimum, so this only ever adds wakes.
+    #[cfg(feature = "diag-tick")]
+    fn idle_wait(&self, token: SleepToken) {
+        let _consumed = token;
+        apic::arm_within(DIAG_TICK_NS);
+        self.halt();
+    }
 }
+
+/// The longest a CPU may sleep on a `diag-tick` build.
+///
+/// Comfortably under `heartbeat`'s reporting period rather than equal to it, so
+/// a healthy CPU contributes two or three passes to every line. At one wake per
+/// line a CPU whose wake landed just the wrong side of the boundary would drop
+/// out of the mask, and a field that flickers on a healthy machine cannot be
+/// read as "that CPU stopped" on a sick one.
+#[cfg(feature = "diag-tick")]
+const DIAG_TICK_NS: u64 = 100_000_000;
 
 impl Hw for KernelHw {
     type Payload = KernelPayload;

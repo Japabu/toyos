@@ -479,11 +479,18 @@ impl GpuController {
         Some(FbAlloc { tokens, phys_addrs, ptrs, _pages: all_pages })
     }
 
+    /// Revoke both buffers from the compositor and return their pages.
+    ///
+    /// The order is the point and it used to be the other way round: `unregister`
+    /// takes the compositor's mapping away on *this* CPU, `retired`'s drop is
+    /// what tells the others, and only then does `fb` go — so a resolution
+    /// change cannot hand the PMM pages the compositor is still blitting into
+    /// through a stale entry.
     fn free_framebuffer(&mut self, fb: FbAlloc) {
-        for i in 0..2 {
-            shared_memory::unregister(fb.tokens[i]);
-        }
-        // PhysPages freed via Drop when _pages is dropped
+        let retired: alloc::vec::Vec<_> =
+            fb.tokens.iter().filter_map(|t| shared_memory::unregister(*t)).collect();
+        drop(retired);
+        drop(fb);
     }
 
     fn build_gpu_info(&self) -> GpuInfo {

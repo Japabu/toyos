@@ -1188,12 +1188,20 @@ pub fn build_boot_image(
 /// A feature that changes what `init` does, what a driver reads, or what a
 /// ceiling is worth belongs in its own build and is not eligible.
 /// `specs/test-cost-audit.md` §5.4.3 classifies every one of them.
+///
+/// `test-tlb-ack-delay` is the one member whose code is not confined to the
+/// match arm: `arch::tlb::serve_ipi` loads one relaxed word per flush. Nothing
+/// writes that word except the arm, and its own gate re-measures with the delay
+/// disarmed, so a kernel carrying the feature and never asked flushes exactly as
+/// one without it. Stated rather than assumed, because the claim above is what
+/// makes folding sound.
 const INERT_ACTUATORS: &[&str] = &[
     "test-fatal-halt",
     "test-screen-graffiti",
     "test-double-fault",
     "test-heap-ceiling",
     "test-kernel-canary",
+    "test-tlb-ack-delay",
 ];
 
 /// The feature set to build, with every inert actuator replaced by the union of

@@ -49,5 +49,5 @@ pub(super) extern "sysv64" fn tlb_flush_entry() {
 }
 
 fn flush() {
-    crate::mm::paging::flush_tlb_all();
+    crate::arch::tlb::serve_ipi();
 }

@@ -36,10 +36,6 @@ impl FileBacking for TmpfsBacking {
     fn file_size(&self) -> u64 {
         file_cache::size(self.file_id)
     }
-
-    // No `memory_ptr`: pages are individual heap boxes, so no run of a tmpfs
-    // file is contiguous and the loader has to copy. Only the initrd, which is
-    // one image in memory, can answer that question.
 }
 
 /// In-memory filesystem. File data lives in the unified file cache

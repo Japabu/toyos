@@ -239,24 +239,32 @@ impl Cr3 {
 }
 
 /// Next PCID to allocate. Range 1..4095. PCID 0 is reserved for the kernel.
-/// Lock ensures flush + shootdown completes atomically with PCID recycling.
 static NEXT_PCID: Lock<u16> = Lock::new(1);
 
 /// Allocate a unique PCID for a new user address space.
 /// On wrap past 4095, flushes all TLBs on all CPUs before recycling.
+///
+/// The shootdown is outside the lock, because it waits for every other CPU and
+/// may hold nothing while it does. That costs no atomicity: what has to be true
+/// is that no CPU still carries a translation under a recycled tag by the time
+/// the caller *activates* it, and the caller is `new_user`, which has not
+/// returned an address space yet — so a second CPU that takes tag 2 out of the
+/// same wrap is covered by a flush that names every tag on every CPU.
+///
+/// Recycling a live tag at all is a defect in its own right and stays open;
+/// M4 makes the tag an owned resource and deletes this branch.
 fn alloc_pcid() -> u16 {
-    let mut next = NEXT_PCID.lock();
-    let pcid = *next;
-    if pcid <= 4095 {
-        *next = pcid + 1;
-        pcid
-    } else {
-        // Wrapped — flush all TLBs before recycling PCID space.
-        flush_tlb_all();
-        crate::arch::apic::tlb_shootdown();
+    {
+        let mut next = NEXT_PCID.lock();
+        let pcid = *next;
+        if pcid <= 4095 {
+            *next = pcid + 1;
+            return pcid;
+        }
         *next = 2;
-        1
     }
+    crate::arch::tlb::shootdown();
+    1
 }
 
 /// Unified address space: hardware page tables + virtual memory region tracking.
@@ -601,7 +609,11 @@ impl AddressSpace {
 
     /// Map a physical region into the direct map using 2MB pages.
     /// Returns an Mmio handle for bounds-checked register access.
-    pub fn map_mmio(&mut self, phys: u64, size: u64, cache: CachePolicy) -> super::Mmio {
+    ///
+    /// Private, because the mapping is not usable until every CPU has been told
+    /// about it and this method holds the lock that stops it saying so — the
+    /// free function [`map_mmio`] is the whole operation.
+    fn map_mmio(&mut self, phys: u64, size: u64, cache: CachePolicy) -> super::Mmio {
         let start = phys & !(PAGE_2M - 1);
         let end = (phys + size + PAGE_2M - 1) & !(PAGE_2M - 1);
         let mut cur = start;
@@ -609,8 +621,6 @@ impl AddressSpace {
             self.map_2m(cur, PAGE_PRESENT | PAGE_WRITE | cache.pde_bits());
             cur += PAGE_2M;
         }
-        flush_tlb_all();
-        crate::arch::apic::tlb_shootdown();
         super::Mmio::new(super::DirectMap::from_phys(phys), size)
     }
 
@@ -631,19 +641,6 @@ impl AddressSpace {
 
     pub fn user_policy(&self, addr: UserAddr) -> Option<CachePolicy> {
         self.policy_at(addr.raw())
-    }
-
-    /// Unmap a physical region from the direct map.
-    pub fn unmap_mmio(&mut self, phys: u64, size: u64) {
-        let start = phys & !(PAGE_2M - 1);
-        let end = (phys + size + PAGE_2M - 1) & !(PAGE_2M - 1);
-        let mut cur = start;
-        while cur < end {
-            self.unmap_2m(cur);
-            cur += PAGE_2M;
-        }
-        flush_tlb_all();
-        crate::arch::apic::tlb_shootdown();
     }
 
     /// Take one 4 KiB page of the direct map away, splitting the 2 MiB leaf
@@ -794,6 +791,27 @@ pub fn kernel() -> &'static Lock<Option<AddressSpace>> {
 pub fn kernel_cr3() -> Cr3 {
     Cr3(KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed))
 }
+
+/// Map a device's registers into the kernel's direct map and tell every CPU.
+///
+/// The lock and the shootdown are separate statements, and that is the whole
+/// reason this is a free function rather than a method: the shootdown waits for
+/// siblings and may hold nothing, while the mapping needs the address space.
+/// Eleven callers used to write the lock-and-map incantation themselves, and
+/// none of them could have got the second half right.
+///
+/// **The shootdown is not bookkeeping on this path.** `map_2m` is allowed to
+/// replace the boot map's own leaf, so a window inside a range the memory map
+/// covers changes memory type here — write-combining for the framebuffer, most
+/// of all. A sibling holding the old write-back entry for the same physical page
+/// is SDM Vol. 3A §11.12.4 undefined behaviour, and hanging is a permitted
+/// outcome.
+pub fn map_mmio(phys: u64, size: u64, cache: CachePolicy) -> super::Mmio {
+    let mmio = kernel().lock_unwrap().map_mmio(phys, size, cache);
+    crate::arch::tlb::shootdown();
+    mmio
+}
+
 
 /// Take the 4 KiB page holding `addr` out of the kernel's direct map.
 ///
