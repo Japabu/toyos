@@ -125,6 +125,20 @@ pub enum SyscallError {
     WouldBlock = 6,
     ResourceExhausted = 7,
     NotSupported = 8,
+    /// The device did not do it.
+    ///
+    /// One word for a transfer that was issued and not completed, and for a
+    /// volume whose own structures do not decode: there is nothing a caller can
+    /// do differently about the two, and both are the opposite of `NotFound`.
+    /// The channel below it — `block::BlockDevice`, `FileBacking::read_page`,
+    /// `bcachefs::BlockIO`, `vfs::FileSystem` — is fallible the whole way so
+    /// that this is what arrives, rather than "no such file".
+    ///
+    /// It carries nothing. Which endpoint stalled, what the sense key was and
+    /// which block was asked for are in the kernel's own log line, where a
+    /// triage reads them; an enum here would be a vocabulary userland has no
+    /// use for and every new driver would have to guess an arm from.
+    Io = 9,
 }
 
 impl SyscallError {
@@ -147,6 +161,7 @@ impl SyscallError {
             6 => Some(Self::WouldBlock),
             7 => Some(Self::ResourceExhausted),
             8 => Some(Self::NotSupported),
+            9 => Some(Self::Io),
             _ => Some(Self::Unknown),
         }
     }
@@ -164,6 +179,7 @@ impl core::fmt::Display for SyscallError {
             Self::WouldBlock => f.write_str("would block"),
             Self::ResourceExhausted => f.write_str("resource exhausted"),
             Self::NotSupported => f.write_str("not supported"),
+            Self::Io => f.write_str("the device did not complete the transfer"),
         }
     }
 }
