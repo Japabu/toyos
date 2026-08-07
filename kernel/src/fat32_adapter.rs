@@ -57,6 +57,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use hashbrown::HashMap;
 
 use toyos_abi::syscall::SyscallError;
@@ -334,7 +335,18 @@ impl BlockAccess for FatVolume {
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
         let mut guard = device(self.role).lock();
-        guard.as_mut().ok_or(IoError)?.read_at(offset, buf)
+        let served = guard.as_mut().ok_or(IoError)?.read_at(offset, buf);
+        if injected_read_failure(self.role) {
+            // Both halves of what a real failure leaves behind, not just the
+            // verdict: `FatDevice::read_at` gives the caller back a buffer it
+            // must not believe, so a caller that got the volume's real bytes
+            // here would make every assertion downstream vacuous.
+            buf.fill(0);
+            log!("{}-volume: read of {} B at volume offset {offset} failed",
+                self.role, buf.len());
+            return Err(IoError);
+        }
+        served
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), IoError> {
@@ -364,6 +376,41 @@ impl BlockAccess for FatVolume {
 /// boot where the device was never asked. Same reason `xhci-one-slot` and
 /// `i8042-fault` exist.
 const FAT_BACKING_READS: bool = !cfg!(feature = "fat-backing-read-fails");
+
+/// Whether the boot volume may still answer a *filesystem* read once it is
+/// mounted.
+///
+/// The negative control for the metadata half of the error channel, and the
+/// sibling of [`FAT_BACKING_READS`] rather than a duplicate of it: that one
+/// fails [`FatBacking::read_page`], which is the page-fault path and touches no
+/// directory entry at all, so with it armed `open_file`, `list` and
+/// `file_mtime` still succeed and there is nothing in the tree that can make
+/// them fail. This one is under [`Fat32`] itself, which is where a directory
+/// entry, a FAT chain and an extent list are read.
+///
+/// A kernel feature for the same reason as its sibling: both partitions are on
+/// the disk the guest is running from, so `readonly=on` (writes only), a
+/// detached device and `rerror` each take away either the mount the failure has
+/// to be observed through or the kernel the machine is running.
+///
+/// [`Role::Boot`] and not [`Role::Log`], because nothing in the kernel reads the
+/// boot volume after it is mounted: the machine keeps its log, its shell and
+/// its serial console, and the refusal is something a process can be sent to go
+/// and ask about. The log volume is where the kernel's own log goes, so failing
+/// its reads would take the channel the evidence arrives on.
+const BOOT_VOLUME_READS: bool = !cfg!(feature = "fat-boot-reads-fail");
+
+/// Set once [`mount`] has installed the boot volume.
+///
+/// [`Fat32::probe`] and [`Fat32::mount`] read through the same [`BlockAccess`]
+/// this injects at, so arming it from the start would refuse the mount instead
+/// of the mounted volume — and a machine with no `/boot` proves nothing about
+/// what a `/boot` says when its device stops answering.
+static BOOT_MOUNTED: AtomicBool = AtomicBool::new(false);
+
+fn injected_read_failure(role: Role) -> bool {
+    !BOOT_VOLUME_READS && role == Role::Boot && BOOT_MOUNTED.load(Ordering::Relaxed)
+}
 
 /// A file on one of these volumes, as byte ranges the page-fault path can read
 /// without going back through the filesystem.
@@ -930,6 +977,9 @@ pub fn mount(role: Role) -> Option<FatFs> {
                 geom.bytes_per_cluster(),
                 geom.cluster_count
             );
+            if role == Role::Boot {
+                BOOT_MOUNTED.store(true, Ordering::Relaxed);
+            }
             Some(FatFs::new(role, fs))
         }
         Err(e) => {

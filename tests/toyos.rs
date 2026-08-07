@@ -455,6 +455,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // measurement, same afternoon.
     ("late_storage_connect", Sched::Serial),
     ("log_backing_read_error", Sched::Parallel),
+    ("boot_volume_metadata_error", Sched::Parallel),
     ("log_partition_layout", Sched::Parallel),
     ("log_partition_identity", Sched::Parallel),
     ("cache_eviction", Sched::Parallel),
@@ -5565,6 +5566,9 @@ fn run_machine_test(
         }
         "log_backing_read_error" => {
             common::volumes::log_backing_read_error(test_config, c_bins, rust_bins)
+        }
+        "boot_volume_metadata_error" => {
+            common::volumes::boot_volume_metadata_error(test_config, c_bins, rust_bins)
         }
         "usb_storage_write_error" => usb::usb_storage_write_error(test_config, c_bins, rust_bins),
         "usb_flush_optional" => usb::usb_flush_optional(test_config, c_bins, rust_bins),
