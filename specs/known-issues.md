@@ -328,6 +328,12 @@ return a handle sharing the first module's id and TLS block, and
 `std_tls_dlopen`'s test 10 exercises exactly that case. It needs its own change
 with its own test, not a hardening drive-by.
 
+Left alone again by the `toyos-elf` extraction, for the same reason and one
+more: the whole change is inside `sys_dlopen`'s arm, where the handle is minted
+and where the process's module list lives, and that arm is `arch/syscall.rs`'s.
+The extraction touched two lines of it. Whoever takes this owns the *handle*,
+not the loader.
+
 ### `bcachefs`: three residual untrusted-input holes and a mount-policy question
 
 Left open deliberately, in the same crate:
@@ -431,6 +437,48 @@ loader path. Deleted; `with_capacity` is the only way to build one, and it takes
 the ceiling check with it. The API change the previous entry could not re-verify
 was re-verified by a full suite.
 
+### CLOSED — two crafted-ELF kernel panics the first hardening wave did not reach
+
+Both are arithmetic, both are reachable from a file any process can write, and
+both are panics rather than refusals because the kernel builds with
+`overflow-checks` on — `kernel/Cargo.toml`'s `[profile.dev]` says so
+deliberately, and `--build-only` builds `debug`. Measured on the host by
+compiling each expression exactly as `elf.rs` had it, with
+`-C overflow-checks=on`:
+
+- **`e_phoff` = `u64::MAX`.** `elf.rs:475` computed
+  `ph_offset + ph_entry_size * e_phnum` in `usize` and then sliced with it.
+  `e_phoff=0xffffffffffffffff e_phnum=1: PANIC`, and
+  `e_phoff=0xffffffffffffff9b e_phnum=4: PANIC`. With overflow checks *off* it
+  wraps to an inverted range and `&data[a..b]` panics instead, so there was no
+  configuration in which it was an error return.
+- **`.gnu.hash` with `bloom_shift >= 32`.** `elf.rs:1033`'s
+  `(h >> bloom_shift) % 64` shifts a `u32`. Shifts 5 and 31 are fine; 32, 33,
+  63, 64 and `u32::MAX` all panic. Reachable by `dlopen`ing a crafted `.so` and
+  then binding anything against it — `gnu_dlsym` is called on *other* loaded
+  libraries, so the crafted one need only be in the process's list.
+
+Closed in `toyos-elf`: the header's table extent is `checked_add` on `usize`
+against the buffer, and `GnuHash::parse` refuses a `bloom_shift` of 64 or more
+and does the shift in `u64` (which is what glibc's own lookup does on x86-64).
+Host cases `a_program_header_offset_that_overflows_is_refused` and
+`a_hash_header_that_cannot_be_used_is_refused`; the second was watched go red
+with the bound removed.
+
+### CLOSED — the loader leaked a `.strtab` per spawn, for a map nothing read
+
+`build_symtab_map` ended in `Vec::leak(strtab_data)` so it could hand back
+`&'static str` keys: up to `MAX_HEAP_ALLOC` of kernel heap, never freed, once
+per spawn of a binary that exports nothing through `.dynsym` and loads at least
+one library. The map it produced was then dropped without a reader —
+`loader.rs:691-735` built it, logged its size and ended. The *live* path
+(`:795-850`) rebuilt a `.dynsym`-only map with no `.symtab` fallback at all, so
+the fallback that block's own comment describes never once ran.
+
+Closed by the `toyos-elf` extraction: both maps are `loader/symbols.rs`, they
+borrow the tables the caller read and die with the spawn, and the fallback runs
+where the comment always said it did.
+
 ### The bootloader sizes every allocation from a file the ESP handed it
 
 `bootloader/src/main.rs:61-62` reads the UEFI-reported `file_size()` and
@@ -438,7 +486,9 @@ allocates that much for the kernel and the initrd, with no bound.
 `:103,112` takes `max(p_vaddr + p_memsz)` over the kernel ELF's segments with no
 overflow check and allocates it, then `:122` copies `p_filesz` bytes into that
 `p_memsz`-sized buffer without checking `filesz <= memsz` — the kernel's own
-`elf::parse_layout:419` enforces that, the bootloader does not.
+`toyos_elf::Layout::parse` enforces that, the bootloader does not — and it is
+now a crate the bootloader could depend on, which is the cheapest form this fix
+will ever take.
 
 Lower severity than the kernel entries above: it runs before ExitBootServices,
 on files we put on the ESP ourselves. It is on the list because the metal track
@@ -3626,9 +3676,9 @@ check `KernelSlice` performs is against a size the caller asserted; `from_raw`
 cannot validate it against the allocation, so a slice longer than its buffer
 passes every check the slice makes. Three call sites, each correct only by
 adjacency: `OwnedAlloc::slice` (`process.rs:70`, the one site with an assert),
-the ELF loader (`elf.rs:1005`, size and allocation share `load_size` by
-proximity, not by construction — and every past OOB in the loader came through
-this type), and `DmaPool::alloc` (`drivers/mod.rs:34`).
+the ELF loader (`elf/mod.rs`'s `load_shared_lib`, size and allocation share
+`load_size` by proximity, not by construction — and every past OOB in the loader
+came through this type), and `DmaPool::alloc` (`drivers/mod.rs:34`).
 
 Fix shape: allocators construct the slice. Give `PageAlloc` and the contiguous
 PMM path a `slice()` method like `OwnedAlloc`'s, sized from the allocation they

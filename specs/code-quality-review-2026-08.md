@@ -141,10 +141,8 @@ rule during #74, which also gains the no-Python rule.
 
 - **`symbols.rs`** (270 lines, `core`+`alloc` only) — extract; host tests
   with a real symbol blob.
-- **`elf.rs`** (1,717 lines) — the parse half (~⅔: `parse_layout`,
-  `parse_dynamic`, relocation indexing, GNU hash) extracts to `toyos-elf`;
-  ELF is userland-supplied bytes, and host fuzzing of the trust boundary is
-  the payoff. The lib cache + mapping half stays kernel.
+- **`elf.rs`** — **done.** The parse half is `toyos-elf/`; the lib cache and the
+  mapping half stayed kernel-side as `kernel/src/elf/`.
 - **`loader.rs`** — target is a **plan/execute split**: a pure layer computes
   the complete construction (mappings, protections, TLS/stack/guards,
   relocations, initial registers) as data, host-property-tested (no overlap,
@@ -210,8 +208,16 @@ Order deliberately unassigned.
 3. The xHCI port-state-machine extraction + host sim (vehicle for
    #151/#152/#156-prologue; F-K as design input).
 4. The log subsystem redesign (core + backpressured sinks).
-5. `toyos-elf` and `toyos-symbols` extraction; crafted-ELF host fuzzing.
-6. `loader.rs` plan/execute split.
+5. **`toyos-elf` done**; `toyos-symbols` extraction still open. The parse half
+   is a crate with 56 host tests and a crafted-input corpus; `symbols.rs` and
+   its `elf` crate dependency are what is left.
+6. `loader.rs` plan/execute split. **Partly done**: the pure decisions (segment
+   overlap, vaddr-to-file-offset, the TLS block's arithmetic, relocation
+   validation) are in `toyos-elf` and host-tested, and `spawn` is 220 lines of
+   named steps rather than 613 of inline arithmetic. What is *not* built is a
+   `LoadPlan` value an executor applies — the mapping half is still a sequence
+   of effects, and M2 (#159) is about to change what a mapping's protection is,
+   so the plan's shape is not settled yet.
 7. Process-lifecycle host model (with capability-handles).
 8. `toyos-acpi` crate (= ACPI/AML track stage 0).
 9. The `toyos` SDK API audit.
