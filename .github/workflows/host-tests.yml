@@ -1,0 +1,75 @@
+name: host tests
+
+# Everything that needs no ToyOS toolchain and boots no guest, so it answers
+# before the toolchain job has finished restoring one.
+#
+# macOS because the dev host is macOS and two of these gates have a macOS-only
+# outside judge: `toyos-fat32` formats real volumes through `newfs_msdos` and
+# `hdiutil`, and both it and `src/image.rs` are judged by `fsck_msdos`. There is
+# no Linux equivalent whose output either parser understands.
+
+on:
+  push:
+    branches-ignore: ['ci/**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: host-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rust
+        run: |
+          rustc -vV
+          cargo -V
+
+      # Cold, this job is 594 s and all of it is compilation. A cache written
+      # on `main` is readable from every branch, which is the only reason this
+      # helps a branch's first run at all.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            toyos-sched/target
+            toyos-ps2/target
+            toyos-gpt/target
+            toyos-cc/target
+            toyos-hda/target
+            toyos-xhci/target
+            kernel-loom/target
+            kernel-span/target
+            toyos-fat32/target
+            userland/sshd/target
+          key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: host-${{ runner.os }}-
+
+      # The build system's own gates: the two lock scopes, the landing
+      # protocol, the sysroot witness, and the image builder's fsck gate.
+      - name: build system
+        run: cargo test --lib
+
+      - name: host crates
+        run: |
+          set -e
+          for crate in toyos-sched toyos-ps2 toyos-gpt toyos-cc toyos-hda \
+                       toyos-xhci kernel-loom kernel-span toyos-fat32; do
+            echo "=== $crate"
+            cargo test --manifest-path "$crate/Cargo.toml"
+          done
+
+      # `userland/.cargo/config.toml` cross-compiles by default, so its host
+      # tests have to name the host.
+      - name: sshd
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          cargo test --manifest-path userland/sshd/Cargo.toml --target "$host"

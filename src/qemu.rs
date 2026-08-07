@@ -83,7 +83,7 @@ pub fn launch(opts: &Options) {
     // leaves i8042/ps2-kbd/ps2-mouse alone.
     qemu.arg("-nodefaults");
 
-    if kvm_available() {
+    if toyos_build::kvm_usable() {
         qemu.arg("-accel").arg("kvm");
         qemu.arg("-cpu").arg("host,+rdrand,+smap,+fsgsbase,+x2apic");
     } else {
@@ -214,10 +214,6 @@ pub fn launch(opts: &Options) {
 
     eprintln!("QEMU stderr log: /tmp/toyos-qemu-stderr.log");
     qemu.status().expect("failed to execute QEMU");
-}
-
-fn kvm_available() -> bool {
-    cfg!(target_arch = "x86_64") && std::path::Path::new("/dev/kvm").exists()
 }
 
 fn audio_backend() -> &'static str {

@@ -359,6 +359,144 @@ pub fn hda_tone(
     log.must_be_clean()
 }
 
+/// The T14's panic, staged: a client that stops producing mid-stream.
+///
+/// **Ground truth is which of two things soundd did with the periods the client
+/// did not cover**, and the two machines must answer differently. HDA's engine
+/// is a cyclic ring — it plays buffer `i` again `num_buffers` periods after
+/// completing it, whatever soundd put there — so a period held back for a
+/// client is played as silence anyway and then completed a second time, which
+/// is a completion for a buffer soundd still holds. virtio-sound's queue plays
+/// nothing soundd has not submitted, so holding one costs nothing and §5.10's
+/// deferral is exactly right there.
+///
+/// So: the ring arm must report `underruns` (soundd filled the periods and had
+/// no client audio for them) and the queue arm must report `deferred` (soundd
+/// held them). Asserting both is what stops the two obvious wrong fixes —
+/// deleting the deferral, which reds the queue arm, and letting the ring hold a
+/// period, which reds the ring arm with the panic this exists for.
+///
+/// Nothing in the tone clients reaches this state: they keep their rings full,
+/// so `hda_tone` measured `deferred=0` on every run. The stall is the actuator,
+/// and it has to outlast one lap of the ring — 8 periods, 23.2 ms — or the
+/// engine never comes back round to a period soundd is holding.
+pub fn hda_client_stall(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let ring = stall_run(test_config, c_bins, rust_bins, "ring", Profile::Hda)?;
+    let queue = stall_run(test_config, c_bins, rust_bins, "queue", Profile::Headless)?;
+
+    if ring.underruns == 0 {
+        return Err(format!(
+            "the ring arm reports no underrun: soundd never filled a period the stalled client \
+             had not covered, so this run staged nothing\n{}",
+            ring.serial
+        ));
+    }
+    if ring.deferred != 0 {
+        return Err(format!(
+            "the ring arm deferred {} period(s): the engine replays every one of them and then \
+             completes it again, which is the panic this test exists for\n{}",
+            ring.deferred, ring.serial
+        ));
+    }
+    if queue.deferred == 0 {
+        return Err(format!(
+            "the queue arm deferred nothing: §5.10 is what a stalled client is supposed to buy on \
+             a device that plays only what it is given\n{}",
+            queue.serial
+        ));
+    }
+    eprintln!(
+        "  [hda] stalled client: ring filled {} period(s) it had no audio for and held none; \
+         queue held {}",
+        ring.underruns, queue.deferred
+    );
+    Ok(())
+}
+
+struct StallRun {
+    underruns: u32,
+    deferred: u32,
+    serial: String,
+}
+
+/// One boot of the stalling client, and what soundd did with the periods.
+///
+/// soundd's liveness is the first verdict and it is not implied by the client's
+/// exit: the client talks to soundd over IPC and a soundd that died mid-stream
+/// leaves it blocked, so the run times out rather than reporting a code. The
+/// panic line is checked by name anyway — `must_be_clean` would catch it, but
+/// not say which of soundd's assertions it was.
+fn stall_run(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+    arm: &str,
+    profile: Profile,
+) -> Result<StallRun, String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions { profile, ..Default::default() },
+    );
+    let mut log = Serial::boot(&qemu);
+    let result = qemu.run_test("test_rs_hda_client_stall", Duration::from_secs(60));
+    if let Some(err) = &result.error {
+        return Err(format!("the {arm} arm: {err}\n{}\n{}", result.stdout, result.serial));
+    }
+    log.push(&result.serial);
+    log.push(&qemu.drain_serial(Duration::from_millis(500)));
+    if result.exit_code != Some(0) {
+        return Err(format!(
+            "the stalling client exited {:?} on the {arm} arm:\n{}\n{}",
+            result.exit_code,
+            result.stdout,
+            log.text()
+        ));
+    }
+    log.must_not_say("repeated completion for free buffer")?;
+    log.must_be_clean()?;
+
+    let serial = log.text().to_string();
+    // The client plays twice with a suspend between, so a resume is under test
+    // as much as the stall is: on a ring the drain gives its periods up rather
+    // than holding them, and what the second prime fills and where in the ring
+    // it starts are both what the first stream left behind.
+    let resumes = serial.matches("soundd: resumed").count();
+    if resumes < 2 {
+        return Err(format!(
+            "soundd resumed {resumes} time(s) on the {arm} arm — the second stream did not find a \
+             suspended daemon, so nothing here tests a resume:\n{serial}"
+        ));
+    }
+    let counters = crate::common::audio::parse_soundd_counters(&serial)?;
+    if counters.windows == 0 {
+        return Err(format!("soundd reported no stats window on the {arm} arm:\n{serial}"));
+    }
+    Ok(StallRun { underruns: counters.underruns, deferred: sum_field(&serial, "deferred"), serial })
+}
+
+/// Sum one `soundd:` counter across every stats window.
+///
+/// `parse_soundd_counters` stops at the fields gate A's baseline records, and
+/// `deferred` is not one of them — it is an activity signal with no ceiling. It
+/// is read here because it is the whole difference between the two arms.
+fn sum_field(serial: &str, key: &str) -> u32 {
+    let needle = format!(" {key}=");
+    serial
+        .match_indices(&needle)
+        .filter_map(|(at, _)| {
+            let rest = &serial[at + needle.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u32>().ok()
+        })
+        .sum()
+}
+
 /// Two controllers, both with a codec that answers.
 ///
 /// The kernel binds neither and names both. A first-match bind would go green

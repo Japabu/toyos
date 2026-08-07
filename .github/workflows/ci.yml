@@ -1,0 +1,159 @@
+name: ci
+
+# The guest suite on Linux x86_64, four machines at once — which is the shape
+# the dev host does not have, and the one that costs nobody a shared sysroot.
+#
+# `ci/**` is where throwaway probe branches live; they trigger their own
+# workflows and not this one.
+
+on:
+  push:
+    branches-ignore: ['ci/**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+
+      # **Deliberately not unlocked.** `/dev/kvm` is crw-rw---- root:kvm and the
+      # runner user is not in the group, so `kvm_usable` says no and every boot
+      # is TCG. These shards are the wide, repeatable measurement and TCG is
+      # what makes them comparable with the dev host's; the `kvm` job below is
+      # the one that executes the instructions TCG only emulates.
+      - name: accelerator
+        run: ls -l /dev/kvm
+
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            qemu-system-x86 ovmf zstd
+          qemu-system-x86_64 --version | head -1
+
+      # The same key `toolchain.yml` publishes under. Waited for rather than
+      # depended on, because that workflow must survive this one being
+      # cancelled — and on nearly every branch the release is already there.
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          echo "toolchain: $tag"
+          for _ in $(seq 120); do
+            gh release view "$tag" >/dev/null 2>&1 && break
+            echo "waiting for the toolchain workflow to publish $tag ..."
+            sleep 60
+          done
+          gh release download "$tag" -p 'toyos-toolchain.tar.zst' \
+            -O /tmp/toolchain.tar.zst
+          mkdir -p rust/build
+          zstd -dc /tmp/toolchain.tar.zst | tar -C rust/build -x
+          stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+          rustup toolchain link toyos "$stage2"
+          "$stage2/bin/rustc" -vV
+
+      # `assets/timgm6mb.sf2` is `.gitignore` line 3 — 5,994,284 bytes of
+      # SoundFont doom synthesises its music from, deliberately not carried in
+      # git. Three test configs declare it in `untracked-assets`, and a build
+      # that cannot find one is a hard error by design: a fresh clone is *told*
+      # rather than handed a doom that plays nothing (`specs/boot-image-split.md`
+      # §5). A runner is a fresh clone. Whether this repository may publish that
+      # file is the owner's call and not CI's, so the URL is a repository
+      # variable: set `TOYOS_SOUNDFONT_URL` and the desktop and metal-sim
+      # families run; leave it unset and they red, by name.
+      - name: the one asset git does not carry
+        env:
+          URL: ${{ vars.TOYOS_SOUNDFONT_URL }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "TOYOS_SOUNDFONT_URL is unset: assets/timgm6mb.sf2 will be missing,"
+            echo "and every test on the desktopcase, desktopaudiocase and metalcase"
+            echo "configs will fail on it. specs/ci-plan.md §6."
+            exit 0
+          fi
+          curl -sSLf -o assets/timgm6mb.sf2 "$URL"
+          ls -l assets/timgm6mb.sf2
+
+      # `--host-slots 0`: the semaphore arbitrates between worktrees on one
+      # host, and a shard is a host with one suite on it.
+      - name: suite
+        run: |
+          cargo test --test toyos-build -- \
+            --shard ${{ matrix.shard }}/4 --jobs 4 --host-slots 0
+
+      - name: what a red run left
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}-scratch
+          path: |
+            target/test-durations
+            /tmp/toyos-tests-*/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # One test, natively — the only gate in this repository that *executes*
+  # `syscall`, `sysret`, `iret` and the segment loads instead of emulating them.
+  # It caught the defect known-issues §3 records: a `STAR[63:48]` whose RPL only
+  # Intel supplies, which put `SS = 0x18` under every user thread on an AMD host
+  # and killed the first `iretq` back to one. Nothing in the suite can see that
+  # class, on this runner or on the dev host, because QEMU's `helper_sysret`
+  # implements Intel's wording whatever the host is.
+  #
+  # **What a green here does not establish.** The vendor of the host is not
+  # ours to choose, and an Intel runner cannot reproduce that defect either way,
+  # so one green is evidence only if the model line below says AMD. That is why
+  # it is printed as part of the verdict rather than buried in a setup step.
+  #
+  # It is a gate and not a watch: it can only go red on something real.
+  kvm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: unlock kvm
+        run: |
+          sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
+          grep -m1 'model name' /proc/cpuinfo
+
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            qemu-system-x86 ovmf zstd
+
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          for _ in $(seq 90); do
+            gh release view "$tag" >/dev/null 2>&1 && break
+            echo "waiting for the toolchain workflow to publish $tag ..."
+            sleep 60
+          done
+          gh release download "$tag" -p 'toyos-toolchain.tar.zst' -O /tmp/t.tar.zst
+          mkdir -p rust/build
+          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
+          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+
+      - name: one test, on real hardware virtualisation
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats

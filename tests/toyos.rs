@@ -484,6 +484,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // device. Serial — its verdict is a wav capture, and one taken while eleven
     // other guests contend for the host measures the host.
     ("hda_tone", Sched::Serial),
+    // The T14's panic, staged: a client that stops producing for longer than
+    // the DMA ring takes to come round. The verdict is soundd's own liveness
+    // and its counters rather than a capture, so it runs wide.
+    ("hda_client_stall", Sched::Parallel),
     ("hda_two_live_refused", Sched::Parallel),
     ("serial_vocabulary", Sched::Parallel),
     // Host-side, no guest: the harness asking whether it can still tell a
@@ -5896,12 +5900,90 @@ fn run_machine_test(
                     stamps.first()
                 ));
             }
+            // The line beside every heartbeat, and the reason it is there: the
+            // T14's freeze reads `alive=8/8 ran=0` under both live hypotheses,
+            // and only the pin's own state separates them. What has teeth here
+            // is not that the line exists but that its vector is *read back off
+            // the chip* and matches the one `init` said it programmed — a probe
+            // printing a literal, or reading the wrong register, disagrees.
+            let armed = log
+                .lines()
+                .find_map(|l| l.split("scanning on, GSI ").nth(1))
+                .map(|s| s.to_string());
+            let Some(armed) = armed else {
+                return Err(format!(
+                    "no i8042 arming line on a Profile::Metal guest, so nothing says which GSI or \
+                     vector the probe below should have read\n{log}"
+                ));
+            };
+            // `1 -> vec 0x24 apic 0 on`
+            let mut fields = armed.split_whitespace();
+            let kbd_gsi = fields.next().unwrap_or("").to_string();
+            let vector = fields.nth(2).unwrap_or("").trim_start_matches("0x").to_string();
+            let lines: Vec<&str> = log.lines().filter(|l| l.contains("i8042: line ")).collect();
+            if lines.len() < beats.len() {
+                return Err(format!(
+                    "{} `i8042: line` reading(s) against {} heartbeats — the pin's state is what \
+                     separates a machine with nothing to do from one whose input died, and it has \
+                     to be readable at every heartbeat or the pairing is a guess\n{log}",
+                    lines.len(),
+                    beats.len(),
+                ));
+            }
+            // `rte=0x0000000000000024`: the vector is the low byte, bit 16 is
+            // the mask. Both are the chip's answer, not ours.
+            let healthy = |l: &str| {
+                l.split("rte=0x")
+                    .skip(1)
+                    .map(|e| e.split_whitespace().next().unwrap_or(""))
+                    .all(|e| {
+                        u64::from_str_radix(e, 16).is_ok_and(|entry| {
+                            entry & 0xFF == u64::from_str_radix(&vector, 16).unwrap_or(0)
+                                && entry & (1 << 16) == 0
+                        })
+                    })
+            };
+            let wrong: Vec<&&str> = lines.iter().filter(|l| !healthy(l)).collect();
+            if !wrong.is_empty() || !lines.iter().all(|l| l.contains(&format!("kbd gsi={kbd_gsi} "))) {
+                return Err(format!(
+                    "{} of {} `i8042: line` readings carry an entry that is masked, or whose vector \
+                     is not the {vector} `init` programmed on GSI {kbd_gsi} — the probe is not \
+                     reading the chip\n{}\n{log}",
+                    wrong.len(),
+                    lines.len(),
+                    wrong.iter().take(4).map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
+                ));
+            }
+            // OBF stuck is the state the probe exists to name, so a healthy
+            // guest must never show it — otherwise the reading is noise and a
+            // metal log carrying it proves nothing.
+            let obf: Vec<&&str> = lines
+                .iter()
+                .filter(|l| {
+                    l.split("status=0x")
+                        .nth(1)
+                        .and_then(|s| u8::from_str_radix(s.split_whitespace().next()?, 16).ok())
+                        .is_some_and(|s| s & 1 != 0)
+                })
+                .collect();
+            if !obf.is_empty() {
+                return Err(format!(
+                    "{} of {} `i8042: line` readings found the output buffer full on a guest whose \
+                     input is healthy — a set bit there is meant to mean the controller is holding \
+                     a byte no ISR will ever read\n{}\n{log}",
+                    obf.len(),
+                    lines.len(),
+                    obf.iter().take(4).map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
+                ));
+            }
             eprintln!(
                 "  [heartbeat] {} lines in ~3 s, all alive=8/8, {moved} with ran>0, widest gap \
-                 {worst:.3}s, t={} → t={}",
+                 {worst:.3}s, t={} → t={}; {} i8042 line reading(s), vec 0x{vector} on gsi \
+                 {kbd_gsi}, none masked, none with OBF set",
                 beats.len(),
                 stamps.first().unwrap_or(&"?"),
-                stamps.last().unwrap_or(&"?")
+                stamps.last().unwrap_or(&"?"),
+                lines.len(),
             );
             Ok(())
         }
@@ -5943,6 +6025,7 @@ fn run_machine_test(
         // Body in `tests/common/hda.rs`, same reason.
         "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
         "hda_tone" => common::hda::hda_tone(test_config, c_bins, rust_bins),
+        "hda_client_stall" => common::hda::hda_client_stall(test_config, c_bins, rust_bins),
         "hda_two_live_refused" => {
             common::hda::hda_two_live_refused(test_config, c_bins, rust_bins)
         }
@@ -9729,6 +9812,7 @@ fn longest_first(tasks: &mut [Task<'_>], known: &BTreeMap<String, Duration>) {
     tasks.sort_by_key(|task| std::cmp::Reverse(cost(task)));
 }
 
+
 /// One outcome, as the run prints it. Gate A goes through here too, so a
 /// suspended audio boot cannot report itself differently from a suspended
 /// machine test.
@@ -9926,6 +10010,15 @@ fn main() {
         assert!(width >= 1, "--jobs needs at least one worker");
     }
 
+    // Which slice of the suite this machine runs. Absent is the whole of it.
+    let shard = match toyos_build::testargs::parse_shard(&args) {
+        Ok(shard) => shard,
+        Err(refusal) => {
+            eprintln!("[toyos] {refusal}");
+            std::process::exit(1);
+        }
+    };
+
     // How many guests may be up on the *host* at once, across every worktree.
     // `--jobs` is this run's demand; this is what the machine will supply, and
     // zero turns it off.
@@ -10019,12 +10112,26 @@ fn main() {
     }
 
     if let Some(iterations) = audio_gate {
-        let audio_to_run: Vec<&str> = AUDIO_TESTS
+        let mut audio_to_run: Vec<&str> = AUDIO_TESTS
             .iter()
             .copied()
             .filter(|n| filter.map_or(true, |f| n.contains(f)))
             .collect();
         assert!(!audio_to_run.is_empty(), "no audio test matches filter {filter:?}");
+        // Sharded too, and this is the tier it buys the most for: the thorough
+        // tier is N boots per config taken one at a time by construction, so
+        // splitting it is the only thing that shortens it. A filter cannot do
+        // the same job — `audio_tone` is a substring of `audio_tone_load`.
+        if let Some(shard) = shard {
+            shard.keep(&mut audio_to_run, |_| None);
+            assert!(
+                !audio_to_run.is_empty(),
+                "shard {}/{} owns no audio config, and a gate that ran nothing would \
+                 report itself green",
+                shard.index,
+                shard.count,
+            );
+        }
         let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
         // One slot for the whole tier: it boots one guest at a time for the
         // length of it, so one slot is what it occupies. The owner has ruled
@@ -10065,7 +10172,7 @@ fn main() {
     let keep = |name: &str| filter.map_or(true, |f| name.contains(f));
     let tests_to_run: Vec<&TestDef> =
         all_tests.iter().filter(|t| keep(t.name.as_str())).collect();
-    let audio_to_run: Vec<&str> =
+    let mut audio_to_run: Vec<&str> =
         AUDIO_TESTS.iter().copied().filter(|n| keep(n)).collect();
     let screen_to_run: Vec<(&str, Sched)> =
         SCREEN_TESTS.iter().copied().filter(|(n, _)| keep(n)).collect();
@@ -10090,11 +10197,6 @@ fn main() {
     }
 
     let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
-    let total = tests_to_run.len()
-        + audio_to_run.len() * AUDIO_SMP.len()
-        + screen_to_run.len()
-        + machine_to_run.len();
-    eprintln!("\nrunning {total} tests\n");
     let mut tally = Tally::new(EXPECTED_FAILURES, Day::today());
     let suite_start = common::clock::mark();
 
@@ -10146,6 +10248,43 @@ fn main() {
     // believed about it. See [`retry_task`] for why both answers are findings
     // and why neither turns the run green.
     let known = load_durations();
+    // After the phases are decided and before either is ordered: what a shard
+    // divides is the work, and a task's answer to `Sched` is a property of the
+    // test rather than of how many machines are running it.
+    if let Some(shard) = shard {
+        // A task whose every name has been timed costs their sum; one carrying
+        // a name the profile has never seen is unmeasured, which is the same
+        // all-or-nothing rule [`longest_first`] states with `Duration::MAX`.
+        let cost = |task: &Task<'_>| -> Option<Duration> {
+            task.names()
+                .iter()
+                .try_fold(Duration::ZERO, |a, n| Some(a + *known.get(*n)?))
+        };
+        longest_first(&mut parallel, &known);
+        longest_first(&mut serial, &known);
+        shard.keep(&mut parallel, cost);
+        shard.keep(&mut serial, cost);
+        shard.keep(&mut audio_to_run, |name| {
+            AUDIO_SMP.iter().try_fold(Duration::ZERO, |a, smp| {
+                Some(a + *known.get(&format!("{name} (smp={smp})"))?)
+            })
+        });
+        eprintln!(
+            "[toyos] shard {}/{}: {} parallel task(s), {} serial, {} audio config(s)",
+            shard.index,
+            shard.count,
+            parallel.len(),
+            serial.len(),
+            audio_to_run.len() * AUDIO_SMP.len(),
+        );
+    }
+
+    // Counted from the task lists rather than from the filtered ones, because a
+    // shard's own total is what its summary has to add up against.
+    let total = parallel.iter().chain(serial.iter()).map(|t| t.names().len()).sum::<usize>()
+        + audio_to_run.len() * AUDIO_SMP.len();
+    eprintln!("\nrunning {total} tests\n");
+
     let mut timed: Vec<(String, Duration)> = Vec::new();
     let mut wide_reds: Vec<String> = Vec::new();
     if !parallel.is_empty() {
@@ -10177,7 +10316,16 @@ fn main() {
         outcomes.into_iter().for_each(|o| tally.record(o));
     }
     qemu::set_width(1);
-    save_durations(known, &timed);
+    // **A sharded run may not write the profile it partitioned on.** The
+    // partition is a function of the durations file, so shards that disagree
+    // about that file disagree about who owns what — and a shard that saves
+    // moves it under its siblings. Run three shards of `nvme_` in one worktree
+    // and two of them ran `nvme_home_roundtrip` while `nvme_large_device` ran
+    // nowhere: three runs, three profiles, three different partitions. It is
+    // also a third of a measurement, which is not what this file is for.
+    if shard.is_none() {
+        save_durations(known, &timed);
+    }
 
     if !wide_reds.is_empty() {
         eprintln!("  --- re-running {} wide failure(s) alone ---", wide_reds.len());

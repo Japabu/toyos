@@ -2046,7 +2046,7 @@ fn qemu_command(
 
     let mut qemu = Command::new("qemu-system-x86_64");
 
-    let kvm = cfg!(target_arch = "x86_64") && Path::new("/dev/kvm").exists();
+    let kvm = toyos_build::kvm_usable();
     if kvm {
         qemu.arg("-accel").arg("kvm");
     }

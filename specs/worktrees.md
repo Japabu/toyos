@@ -498,3 +498,9 @@ the only copy of itself.
 it — including, the first time this was tried, the build-system change that
 makes worktrees work at all, which sent the new worktree straight into the
 bootstrap this document exists to prevent.
+
+**And it carries `.cargo/config.toml` but not `assets/timgm6mb.sf2`**, which is
+`.gitignore` line 3 and named in three test configs' `untracked-assets`. A
+brand-new worktree therefore reds nine tests of the desktop and metal-sim
+families — `cp` the file from the primary before the first `cargo test`. The
+full account, and the same hole on a CI runner: `specs/ci-plan.md` §6.

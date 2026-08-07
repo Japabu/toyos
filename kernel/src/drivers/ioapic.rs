@@ -305,6 +305,26 @@ pub fn route(
     Ok(())
 }
 
+/// The redirection entry for `gsi` exactly as the chip holds it, high word
+/// first, or `None` when no unit covers it or the topology is busy.
+///
+/// Raw rather than decoded: the caller is a diagnostic read off a photograph of
+/// a panel, and every field a decode would name — mask, vector, destination,
+/// trigger, delivery status — is already one bit position of the word. A decode
+/// would also have to choose which fields matter, and the entry this exists to
+/// catch is one that changed in a way nobody predicted.
+///
+/// `try_lock` because the caller runs in the idle loop on a machine suspected of
+/// having stopped: a diagnostic that waits for a lock stops for the reason it
+/// exists to report.
+pub fn redirection(gsi: Gsi) -> Option<u64> {
+    let topology = TOPOLOGY.try_lock()?;
+    let (unit, n) = locate(&topology, gsi).ok()?;
+    let low = unit.read(REG_REDTBL + 2 * n);
+    let high = unit.read(REG_REDTBL + 2 * n + 1);
+    Some(u64::from(high) << 32 | u64::from(low))
+}
+
 pub fn set_masked(gsi: Gsi, masked: bool) -> Result<(), RouteError> {
     let topology = TOPOLOGY.lock();
     let (unit, n) = locate(&topology, gsi)?;

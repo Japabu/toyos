@@ -1,0 +1,80 @@
+name: toolchain-probe
+
+on:
+  push:
+    branches: ['ci/probe-toolchain']
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: reclaim runner disk
+        run: |
+          df -h /
+          t0=$(date +%s)
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup
+          t1=$(date +%s)
+          echo "RECLAIM-SECONDS: $((t1-t0))"
+          df -h /
+
+      - name: clone the rust fork
+        run: |
+          t0=$(date +%s)
+          git submodule update --init --progress rust
+          t1=$(date +%s)
+          echo "SUBMODULE-SECONDS: $((t1-t0))"
+          du -sh rust
+          git -C rust log --oneline -1
+
+      - name: build deps
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            cmake ninja-build build-essential pkg-config libssl-dev zstd \
+            qemu-system-x86 ovmf dosfstools
+          cmake --version | head -1
+          qemu-system-x86_64 --version | head -1
+
+      # GITHUB_ACTIONS=true puts rust's bootstrap on its own CI path, where it
+      # assumes HEAD is a PR merge commit and takes HEAD^1 as the upstream
+      # commit to fetch a prebuilt LLVM for. In this fork HEAD^1 is our own
+      # merge of upstream, which rust-lang CI never built: four 404s and
+      # `failed to download llvm from ci`. Unset, it walks back to the newest
+      # bors commit exactly as it does on the dev host.
+      - name: full build
+        run: |
+          t0=$(date +%s)
+          env -u GITHUB_ACTIONS -u CI cargo run -- --build-only
+          t1=$(date +%s)
+          echo "BUILD-ONLY-SECONDS: $((t1-t0))"
+
+      - name: what came out
+        if: always()
+        run: |
+          df -h /
+          du -sh rust/build || true
+          du -sh rust/build/*/stage2 || true
+          ls -l target/*.img || true
+
+      - name: package the toolchain
+        run: |
+          host=x86_64-unknown-linux-gnu
+          t0=$(date +%s)
+          tar -C rust/build \
+              --exclude="x86_64-unknown-toyos/stage2/lib/rustlib/$host" \
+              -c "$host/stage2" x86_64-unknown-toyos/stage2 \
+            | zstd -T0 -3 -o /tmp/toyos-toolchain.tar.zst
+          t1=$(date +%s)
+          echo "PACKAGE-SECONDS: $((t1-t0))"
+          ls -l /tmp/toyos-toolchain.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: toolchain-x86_64-unknown-linux-gnu
+          path: /tmp/toyos-toolchain.tar.zst
+          retention-days: 7
