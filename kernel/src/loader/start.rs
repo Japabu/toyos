@@ -1,0 +1,114 @@
+//! Getting a freshly built process onto a CPU.
+//!
+//! The two trampolines are the only per-architecture code in the loader.
+//! Everything else — the address space, the relocations, the TLS block — is
+//! arch-neutral, so a second architecture adds this file and nothing more.
+
+use core::arch::naked_asm;
+
+use crate::fd::FdTable;
+use crate::process::{fd_owner_data, OwnedAlloc, KERNEL_STACK_SIZE};
+use crate::scheduler;
+use toyos_abi::syscall::SyscallError;
+
+/// One `[child_fd, parent_fd]` pair of `SpawnArgs::fd_map_ptr`, in bytes.
+pub const FD_PAIR_LEN: usize = 8;
+
+/// Allocate a kernel stack and lay out the frame `context_switch` will restore.
+pub(crate) fn alloc_kernel_stack(
+    trampoline: unsafe extern "C" fn(),
+    user_entry: u64,
+    user_sp: u64,
+    arg: u64,
+) -> Option<(OwnedAlloc, u64)> {
+    let alloc = OwnedAlloc::new(KERNEL_STACK_SIZE, 4096)?;
+    scheduler::write_stack_canary(&alloc);
+    let top = alloc.ptr() as u64 + KERNEL_STACK_SIZE as u64;
+    // Must match context_switch: pushfq, push rbp..r15 (8 values), then the
+    // return address.
+    let frame = (top - 8 * 8) as *mut u64;
+    unsafe {
+        *frame.add(0) = 0; // r15
+        *frame.add(1) = arg; // r14
+        *frame.add(2) = user_sp; // r13
+        *frame.add(3) = user_entry; // r12
+        *frame.add(4) = 0; // rbx
+        *frame.add(5) = 0; // rbp
+        *frame.add(6) = 0x002; // RFLAGS (IF=0, AC=0)
+        *frame.add(7) = trampoline as u64; // return address
+    }
+    Some((alloc, frame as u64))
+}
+
+/// Entry point for new processes, reached through `context_switch`'s `ret`.
+/// r12 = entry point, r13 = user stack pointer.
+#[unsafe(naked)]
+pub(crate) extern "C" fn process_start() {
+    naked_asm!(
+        "push r12",
+        "push r13",
+        "call {unlock}",
+        "pop r13",
+        "pop r12",
+        "push 0x1B",        // SS: user_data | RPL=3
+        "push r13",         // RSP: user stack
+        "push 0x202",       // RFLAGS: IF=1
+        "push 0x23",        // CS: user_code | RPL=3
+        "push r12",         // RIP: entry point
+        "iretq",
+        unlock = sym crate::sched::driver::trampoline_entry,
+    );
+}
+
+/// Entry point for new threads. r14 carries the argument, which lands in rdi.
+#[unsafe(naked)]
+pub(crate) extern "C" fn thread_start() {
+    naked_asm!(
+        "push r12",
+        "push r13",
+        "push r14",
+        "call {unlock}",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "mov rdi, r14",
+        "sub r13, 8",       // ABI: RSP must be 16n+8 at function entry
+        "push 0x1B",
+        "push r13",
+        "push 0x202",
+        "push 0x23",
+        "push r12",
+        "iretq",
+        unlock = sym crate::sched::driver::trampoline_entry,
+    );
+}
+
+/// The last path component, truncated to what a process entry can hold.
+pub(crate) fn make_name(path: &str) -> [u8; 28] {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let mut name = [0u8; 28];
+    let len = filename.len().min(27);
+    name[..len].copy_from_slice(&filename.as_bytes()[..len]);
+    name
+}
+
+/// Build a child's `FdTable` by duplicating the parent descriptors it names.
+///
+/// A pair naming a parent fd that does not exist contributes nothing: the
+/// child simply does not get that descriptor, which is what a caller asking
+/// for a closed fd deserves and is not a reason to refuse the spawn.
+pub fn build_child_fds(pairs: &crate::user_ptr::UserBytes) -> Result<FdTable, SyscallError> {
+    let data_arc = fd_owner_data();
+    let data = data_arc.lock();
+    let mut fds = FdTable::new();
+    for i in 0..pairs.len() / FD_PAIR_LEN {
+        let mut pair = [0u8; FD_PAIR_LEN];
+        pairs.read_at(i * FD_PAIR_LEN, &mut pair);
+        let child_fd = u32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
+        let parent_fd = u32::from_ne_bytes([pair[4], pair[5], pair[6], pair[7]]);
+        if let Some(desc) = data.fds.get(parent_fd) {
+            fds.insert_at(child_fd, desc.clone())?;
+        }
+    }
+    Ok(fds)
+}

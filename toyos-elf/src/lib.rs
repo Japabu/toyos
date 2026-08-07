@@ -160,6 +160,20 @@ impl core::fmt::Display for Error {
     }
 }
 
+/// A NUL-terminated name out of a string table, or `""` when the offset names
+/// nothing readable.
+///
+/// The offset is a `u64` because every one of them — `st_name`, a `DT_NEEDED`
+/// value — came out of a file. Past the end of the table there is no name, and
+/// no name is the right answer: a name is only ever compared against another
+/// name, so an unreadable one matches nothing.
+pub fn cstr(strings: &[u8], offset: u64) -> &str {
+    match usize::try_from(offset) {
+        Ok(off) => read::cstr(strings, off),
+        Err(_) => "",
+    }
+}
+
 /// Little-endian scalar reads that answer `None` rather than panicking when the
 /// field is not wholly inside the buffer.
 ///

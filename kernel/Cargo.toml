@@ -349,6 +349,7 @@ debug = true
 bcachefs = { path = "../bcachefs", default-features = false }
 toyos-abi = { path = "../toyos-abi" }
 toyos-fat32 = { path = "../toyos-fat32" }
+toyos-elf = { path = "../toyos-elf" }
 toyos-gpt = { path = "../toyos-gpt" }
 # Optional because `hda_probe` is the only thing that decodes a codec, and it is
 # a feature: a shipping kernel that compiled the crate would be declaring a

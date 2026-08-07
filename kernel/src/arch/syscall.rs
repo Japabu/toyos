@@ -1786,7 +1786,7 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
                 }
             };
 
-            crate::elf::cache_loaded_lib_pub(&resolved, lib, rw_offset, rw_size)
+            crate::elf::cache_loaded_lib(&resolved, lib, rw_offset, rw_size)
         }
     };
 
@@ -1807,7 +1807,7 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
                     crate::elf::rebase_relative_relocs(&lib, delta);
                 }
                 lib.user_base = vaddr;
-                lib.user_end = (lib.user_end as i64 + delta) as u64;
+                
             }
             crate::elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
                 let cached_phys = cached_image.phys();
@@ -1828,7 +1828,7 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
                     crate::elf::rebase_relative_relocs(&lib, delta);
                 }
                 lib.user_base = lib_vaddr;
-                lib.user_end = (lib.user_end as i64 + delta) as u64;
+                
             }
         }
         Ok(())
@@ -2113,7 +2113,7 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
             };
             let lib_info = ModuleInfo {
                 base: lib.user_base.raw(),
-                text_end: lib.user_end,
+                text_end: lib.user_end(),
                 eh_frame_hdr: if lib.eh_frame_hdr_vaddr != 0 {
                     lib.user_base.raw() + lib.eh_frame_hdr_vaddr
                 } else { 0 },
