@@ -2,7 +2,7 @@ use crate::collect::{Arch, collect_unique_symbols, LinkState, RelocType, Section
 use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
 use sha2::{Sha256, Digest};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::mem::size_of;
 use zerocopy::{FromZeros, Immutable, IntoBytes};
 use zerocopy::little_endian::{U16 as U16Le, U32 as U32Le, U64 as U64Le};
@@ -343,7 +343,7 @@ pub(crate) struct MachOLayout {
     pub(crate) linkedit_vmaddr: u64,
     pub(crate) linkedit_fileoff: u64,
 
-    pub(crate) got: HashMap<SymbolRef, u64>,
+    pub(crate) got: BTreeMap<SymbolRef, u64>,
     pub(crate) got_entries: Vec<(SymbolRef, bool)>,
 
     pub(crate) sizeofcmds: u32,
@@ -503,7 +503,7 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     let got_sec_offset = data_fileoff + (got_sec_vmaddr - data_vmaddr);
 
     let mut got_entries = Vec::new();
-    let mut got = HashMap::new();
+    let mut got = BTreeMap::new();
     for sym in &got_symbols {
         let is_external = match sym {
             SymbolRef::Global(name) => match state.globals.get(name) {

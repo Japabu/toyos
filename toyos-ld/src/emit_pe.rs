@@ -3,7 +3,7 @@ use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
 use object::write::pe::{NtHeaders, Writer};
 use object::pe;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 const PE_FILE_ALIGNMENT: u32 = 0x200;
 const PE_SECTION_ALIGNMENT: u32 = 0x1000;
@@ -16,7 +16,7 @@ pub(crate) struct PeLayout {
     pub(crate) data_rva: u32,
     pub(crate) data_virt_size: u32,
     pub(crate) has_data: bool,
-    pub(crate) got: HashMap<SymbolRef, u64>,
+    pub(crate) got: BTreeMap<SymbolRef, u64>,
 }
 
 /// PE section layout: RVAs use PE_SECTION_ALIGNMENT, file uses PE_FILE_ALIGNMENT.
@@ -59,7 +59,7 @@ pub(crate) fn layout_pe(state: &mut LinkState) -> PeLayout {
     if !got_symbols.is_empty() {
         cursor = if has_data { align_up(cursor, 8) } else { data_rva as u64 };
     }
-    let mut got = HashMap::new();
+    let mut got = BTreeMap::new();
     for sym in &got_symbols {
         got.insert(sym.clone(), cursor);
         cursor += 8;

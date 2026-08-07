@@ -1,7 +1,7 @@
 use crate::collect::{InputReloc, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use crate::emit_pe::PeLayout;
 use crate::LinkError;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 
 pub(crate) struct RelocOutput {
@@ -40,7 +40,7 @@ pub(crate) struct RelocOutput {
 pub(crate) fn resolve_symbol(
     state: &LinkState,
     sym: &SymbolRef,
-    plt: Option<&HashMap<SymbolRef, u64>>,
+    plt: Option<&BTreeMap<SymbolRef, u64>>,
 ) -> Option<u64> {
     match sym {
         SymbolRef::Global(name) => {
@@ -118,8 +118,8 @@ fn apply_one_reloc_x86(
     reloc: &InputReloc,
     sym_addr: u64,
     reloc_vaddr: u64,
-    got: &HashMap<SymbolRef, u64>,
-    dyn_got: &HashMap<SymbolRef, u64>,
+    got: &BTreeMap<SymbolRef, u64>,
+    dyn_got: &BTreeMap<SymbolRef, u64>,
 ) -> Result<bool, LinkError> {
     match reloc.r_type {
         RelocType::X86_64 => {
@@ -222,11 +222,11 @@ fn is_padded_tls_sequence(sec_data: &[u8], reloc_offset: u64) -> bool {
 
 /// Parameters for ELF relocation application (shared between PIE and static modes).
 pub(crate) struct ElfRelocParams<'a> {
-    pub(crate) got: &'a HashMap<SymbolRef, u64>,
+    pub(crate) got: &'a BTreeMap<SymbolRef, u64>,
     pub(crate) tls_start: u64,
     pub(crate) tls_memsz: u64,
-    pub(crate) plt: Option<&'a HashMap<SymbolRef, u64>>,
-    pub(crate) dyn_got: &'a HashMap<SymbolRef, u64>,
+    pub(crate) plt: Option<&'a BTreeMap<SymbolRef, u64>>,
+    pub(crate) dyn_got: &'a BTreeMap<SymbolRef, u64>,
     /// PIE mode: record R_X86_64_RELATIVE entries for runtime relocation.
     /// Static mode: addresses are fixed at link time, no RELATIVE needed.
     pub(crate) record_relatives: bool,
@@ -237,7 +237,7 @@ pub(crate) struct ElfRelocParams<'a> {
     /// Shared LD GOT pair for all TLSLD accesses (shared mode only).
     pub(crate) ld_got_pair: Option<u64>,
     /// Per-symbol GD GOT pairs for TLSGD accesses (shared mode only).
-    pub(crate) gd_got: &'a HashMap<SymbolRef, u64>,
+    pub(crate) gd_got: &'a BTreeMap<SymbolRef, u64>,
 }
 
 pub(crate) fn apply_relocs(
@@ -593,7 +593,7 @@ fn apply_one_reloc_aarch64(
     reloc: &InputReloc,
     sym_addr: u64,
     reloc_vaddr: u64,
-    got: &HashMap<SymbolRef, u64>,
+    got: &BTreeMap<SymbolRef, u64>,
 ) -> Result<bool, LinkError> {
     match reloc.r_type {
         RelocType::Aarch64Abs64 => {
@@ -778,7 +778,7 @@ fn patch_aarch64_ldr_imm12_data(data: &mut [u8], offset: u64, value: u32, scale:
 
 /// Parameters for Mach-O relocation application.
 pub(crate) struct MachORelocParams<'a> {
-    pub(crate) got: &'a HashMap<SymbolRef, u64>,
+    pub(crate) got: &'a BTreeMap<SymbolRef, u64>,
     /// Start of the TLS template (__thread_data vmaddr). Pointers from __thread_vars
     /// into __thread_data/__thread_bss are stored as template-relative offsets.
     pub(crate) tls_template_start: u64,
@@ -920,7 +920,7 @@ pub(crate) fn apply_relocs_macho(
             | RelocType::X86_32
             | RelocType::X86_32S
             | RelocType::X86Tlv => {
-                apply_one_reloc_x86(&mut state.sections[reloc.section].data, reloc, sym_addr, reloc_vaddr, params.got, &HashMap::new())?
+                apply_one_reloc_x86(&mut state.sections[reloc.section].data, reloc, sym_addr, reloc_vaddr, params.got, &BTreeMap::new())?
             }
             other => return Err(LinkError::UnsupportedRelocation {
                 reloc_type: other, symbol: reloc.target.name().to_string(),
@@ -961,7 +961,7 @@ fn rewrite_movw_to_got(
     state: &mut LinkState,
     reloc: &InputReloc,
     reloc_vaddr: u64,
-    got: &HashMap<SymbolRef, u64>,
+    got: &BTreeMap<SymbolRef, u64>,
 ) -> Result<(), LinkError> {
     let got_slot = *got.get(&reloc.target).unwrap();
 
@@ -1029,7 +1029,7 @@ pub(crate) fn apply_relocs_pe(
             }
         };
 
-        let is_abs = apply_one_reloc_x86(&mut state.sections[reloc.section].data, reloc, sym_addr, reloc_vaddr, &layout.got, &HashMap::new())?;
+        let is_abs = apply_one_reloc_x86(&mut state.sections[reloc.section].data, reloc, sym_addr, reloc_vaddr, &layout.got, &BTreeMap::new())?;
         if is_abs {
             abs_fixups.push(reloc_vaddr as u32);
         }
