@@ -844,16 +844,18 @@ fn mix_thread(
     // whatever soundd has to put in it, so it cannot say when the pipeline has
     // played out. This can, and says the same thing on both.
     let mut unplayed: usize = 0;
-    // The period the engine plays next, on a [`Pipeline::Ring`].
+    // The period a [`Pipeline::Ring`]'s engine is playing now, read off every
+    // completion mask by `stream::decode`.
     //
     // The kernel's `stream::completed` walks the ring forward from where the
     // engine was and hands back a *set*; the engine plays a *sequence*. This is
     // the driver's half of that, and it is what the fill order has to come from:
-    // a batch that wraps (`{6,7,0,1}`) is played 6, 7, 0, 1, and filling it
+    // a batch that wraps (`{6, 7, 0, 1}`) is played 6, 7, 0, 1, and filling it
     // lowest-index-first writes the later audio into the buffer the engine
-    // reaches soonest. It follows the engine through the periods a drain gives
-    // up as well as the ones a mix fills, so a stream that stops and starts
-    // again primes the ring from where the engine froze rather than from zero.
+    // reaches soonest. It is kept between wakes for the two moments no mask can
+    // place the engine: a whole lap, and a stop — which freezes it inside the
+    // period after the last one it completed, and is where the next stream
+    // primes from.
     let mut ring_cursor: usize = 0;
     // Whether the device stream is running, i.e. soundd has submitted since
     // the last stop. Owned here: the kernel's own started flag is not
@@ -994,30 +996,33 @@ fn mix_thread(
                 stats.max_wake_lat_ns = stats.max_wake_lat_ns.max(lateness);
             }
             let mut wake_completions = 0u32;
-            // Where the ring stands before this wake's records: the fill loop
-            // works from `ring_cursor`, so the run each record has to be is
-            // checked against a walk of its own.
-            let mut run_from = ring_cursor;
             for rec in &records[..n_records] {
                 let n = rec.mask.count_ones();
                 assert!(n > 0, "soundd: completion record with empty mask");
                 assert_eq!(free_mask & rec.mask, 0, "soundd: repeated completion for free buffer");
-                // A ring's completions are the periods from where the cursor
-                // stands, in order. Nothing else can be true of them: the two
-                // sides are anchored to the same place — the kernel takes
-                // `SDnLPIB` on the edge that starts the engine, and this cursor
-                // has followed every period since — and each advances by the run
-                // the other names. A disagreement is that anchor broken, which
-                // is the same accounting the assertion above is about, said
-                // where holding nothing back makes it structural.
+                // Where the engine is, taken from what it reported rather than
+                // predicted: a mask a driver reads late is the OR of every
+                // `completed` since it last looked, so it can name a whole lap
+                // — which places the engine nowhere — and a cursor soundd
+                // stepped itself would have to be right about how many laps
+                // that was. Re-deriving it per record cannot drift.
                 if pipeline == Pipeline::Ring {
-                    assert_eq!(
-                        Some(rec.mask),
-                        stream::run_mask(run_from, n as usize, num_buffers),
-                        "soundd: the engine completed {:#x} with the ring at {run_from}",
-                        rec.mask
-                    );
-                    run_from = (run_from + n as usize) % num_buffers;
+                    match stream::decode(rec.mask, num_buffers) {
+                        Some(stream::Completed::Run { first, count }) => {
+                            ring_cursor = (first + count) % num_buffers;
+                        }
+                        // Every period played and the mask says no more than
+                        // that. The cursor stays where it was: the fill order
+                        // from here is a guess either way, and a lap of silence
+                        // has already gone out — §5.9 counts it as the drain it
+                        // is, and the next record re-anchors.
+                        Some(stream::Completed::Lapped) => {}
+                        None => panic!(
+                            "soundd: the engine completed {:#x}, which is no walk of a \
+                             {num_buffers}-period ring",
+                            rec.mask
+                        ),
+                    }
                 }
                 unplayed = unplayed.saturating_sub(n as usize);
                 free_mask |= rec.mask;
@@ -1063,20 +1068,34 @@ fn mix_thread(
             dll.reset();
         }
 
-        // A ring's periods are not soundd's to hold. With no client to mix,
-        // give the ones the engine just handed back straight up: the engine
-        // plays them again `num_buffers` periods from now whatever soundd does,
-        // as the silence `released` left in them, and holding one across that
-        // lap is a completion for a buffer soundd still has — which is what the
-        // assertion above catches and what took soundd down on the T14. The
-        // cursor follows the engine through them so a resume primes the ring
-        // from where the stop froze it. `started` is the running engine: before
-        // the first submit the whole ring really is soundd's, and that is the
-        // free list the first client's prime fills.
-        if pipeline == Pipeline::Ring && started && streams.is_empty() {
-            ring_cursor = (ring_cursor + free_mask.count_ones() as usize) % num_buffers;
-            free_mask = 0;
+        // On a ring the free list is the engine's to state, never a tally
+        // soundd keeps across a wake.
+        //
+        // While the engine runs, the periods soundd may write are the ones this
+        // wake was handed back and no others: one it does not fill is played
+        // anyway, as the silence `released` left in it, and completed again a
+        // lap later — a completion for a buffer soundd still holds, which is
+        // the assertion above and what took soundd down on the T14. So with no
+        // client to mix for they are given up rather than held.
+        //
+        // While it is stopped it holds nothing at all, so the whole ring is
+        // soundd's: that is the free list the next client's prime fills, and
+        // it starts at the cursor because the engine froze inside the period
+        // after the last one it completed and carries on there.
+        if pipeline == Pipeline::Ring {
+            if !started {
+                free_mask = (1u32 << num_buffers) - 1;
+            } else if streams.is_empty() {
+                free_mask = 0;
+            }
         }
+        // Where the fill starts: the beginning of the run soundd may write,
+        // which is as many periods back from where the engine now stands as
+        // there are of them. A stopped engine's whole lap lands on the same
+        // place, which is where it will carry on from.
+        let mut fill_at =
+            (ring_cursor + num_buffers - free_mask.count_ones() as usize % num_buffers)
+                % num_buffers;
 
         let mut refilled = false;
         let mut deferred: u32 = 0;
@@ -1090,8 +1109,8 @@ fn mix_thread(
                 Pipeline::Queue => free_mask.trailing_zeros() as usize,
                 // The engine's order, which is the ring's and not the index's.
                 Pipeline::Ring => {
-                    let at = ring_cursor;
-                    ring_cursor = (ring_cursor + 1) % num_buffers;
+                    let at = fill_at;
+                    fill_at = (fill_at + 1) % num_buffers;
                     at
                 }
             };
@@ -1175,7 +1194,7 @@ fn mix_thread(
                 eprintln!("soundd: resumed");
             }
             backend.submit(idx, device_period_bytes);
-            unplayed = (unplayed + 1).min(num_buffers);
+            unplayed += 1;
             // Plays after whatever is already queued — unless that has all
             // played out, in which case the device restarts from now.
             playout_until_ns = playout_until_ns.max(now) + period_nanos;

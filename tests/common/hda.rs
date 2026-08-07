@@ -462,6 +462,17 @@ fn stall_run(
     log.must_be_clean()?;
 
     let serial = log.text().to_string();
+    // The client plays twice with a suspend between, so a resume is under test
+    // as much as the stall is: on a ring the drain gives its periods up rather
+    // than holding them, and what the second prime fills and where in the ring
+    // it starts are both what the first stream left behind.
+    let resumes = serial.matches("soundd: resumed").count();
+    if resumes < 2 {
+        return Err(format!(
+            "soundd resumed {resumes} time(s) on the {arm} arm — the second stream did not find a \
+             suspended daemon, so nothing here tests a resume:\n{serial}"
+        ));
+    }
     let counters = crate::common::audio::parse_soundd_counters(&serial)?;
     if counters.windows == 0 {
         return Err(format!("soundd reported no stats window on the {arm} arm:\n{serial}"));

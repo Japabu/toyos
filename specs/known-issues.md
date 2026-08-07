@@ -2767,6 +2767,70 @@ host anyway, which is what makes them comparable to each other.
 serve as a pass/fail gate. M3 used it as an A/B instead, which is what it could
 still answer, and landed on the fast tier plus the full suite.
 
+### CLOSED 2026-08-07 — soundd panicked on the T14: `repeated completion for free buffer`
+
+The metal boot at `2026-08-07-222910.log`, `/bin/tone` through the T14's
+`00:1f.3` (ALC257, converter 0x02 → pin 0x14, 8 periods of 512 B, stream 7).
+soundd died 0.5 s into a 2 s tone on `assert_eq!(free_mask & rec.mask, 0)` with
+bit 3; the owner heard the tone as "more like a triangle or sawtooth wave"
+before it stopped.
+
+**The mix loop's free list is a queue model, and HDA is a ring.** On
+virtio-sound a period soundd has not submitted is a period the device does not
+have. HDA's engine owns every period for as long as `RUN` is set: it returns to
+buffer *i* exactly `num_buffers` periods after completing it and plays whatever
+is there. Three of the free list's rules were the queue model showing:
+
+1. **§5.10's deferral.** `refill_floor_nanos` bounds *unplayed audio* (5 of 8
+   periods), not the engine's return, and the selection took the lowest free
+   index — so the deferred set pinned at the top three free buffers and the same
+   ones were held cycle after cycle while lower ones were refilled. Each played
+   the silence `released` left in it, and after one lap the engine completed one
+   soundd still held. Deterministic within ~14 wakes of a client stalling. The
+   three-in-eight silence is the buzz the owner heard.
+2. **§5.8's drain.** With the last client gone the free list filled over one lap
+   with no margin: a wake landing more than `num_buffers` periods after the
+   first completion sees the lap folded into one mask and trips the same
+   assertion.
+3. **A completion posted between soundd's read and the stop landing**, which
+   arrives on the idle poll against a full free list.
+
+None of the three is reachable on virtio-sound, which is why gate A never saw
+any of them, and none of them is reachable in `hda_tone` either: its client
+keeps its ring full, so `deferred=0` on every run measured.
+
+Fixed by `Backend::pipeline` naming the difference and the three sites asking
+it. A ring gives up a period it cannot fill rather than holding it, fills in the
+engine's order off a cursor that follows the engine through a drain and a stop,
+and never defers. `unplayed` replaces `free_mask.count_ones() == num_buffers` at
+the two drain sites — the same number on a queue and the only correct one on a
+ring. `stream::decode` reads the engine's position back off every mask.
+
+**The first version stepped that cursor itself and asserted the next mask
+matched it, and the 12-wide phase killed it in one run.** `ISR.mask` accumulates
+across interrupts, so what a late driver reads is the OR of several `completed`
+calls — and at `max_wake_lat_us` in the tens of milliseconds that is `0xff`, a
+whole lap, which places the engine nowhere. A stepped cursor would have to be
+right about how many laps went by; a derived one cannot drift. `Completed::Lapped`
+is that answer said in words, and it is the drain §5.9 already counts. The wide
+phase constructed a state five deliberate `hda_client_stall` runs did not.
+
+Gate: `hda_client_stall`, a client that stops producing for 60 ms (two and a
+half laps) and then plays a second stream so a resume is under test too, on both
+machines. Both arms are asserted and must differ — the ring must report
+underruns and hold nothing, the queue must defer — so neither of the two wrong
+fixes goes green. Unfixed on this tree: the ring arm panics and the run times
+out at 120 s. Fixed: ring `underruns=128 deferred=0`, queue `deferred=539`.
+
+**Not verified on the T14.** QEMU's `intel-hda` and the laptop's controller are
+different devices and only the owner can boot the second. What the next metal
+boot should show: `tone` playing to completion with soundd alive, and soundd's
+stats line reporting `deferred=0` with `underruns` nonzero if the client ever
+stalls. A `the engine completed 0x.., which is no walk of an 8-period ring`
+panic would be new, and would mean the T14's `SDnLPIB` moves in a way
+`stream::completed` cannot walk — the first evidence that this design's one
+position source is the wrong one there (§2.4's `position_fix` paragraph).
+
 **EXPECTED RED, pending #88 — HDA: the captured tone is not one sine.**
 `hda_tone` plays the same 3.0 s 440 Hz tone the virtio arm plays, out of an
 `intel-hda` controller soundd drives itself, and the capture comes back with
@@ -2808,10 +2872,36 @@ Evidence, and why it does not yet name a cause:
   overrun; both are host-side and neither is established.
 
 Where to start: QEMU's `hw/audio/hda-codec.c` output ring against soundd's
-eight-period pipeline, and then `kernel/src/drivers/hda.rs`'s `isr_complete` —
-whose `SDnLPIB`-derived mask is the one thing on the guest side that could hand
-soundd a buffer the engine has not finished with. **Do not weaken the check to
-make it green**; the virtio zero is what says it has teeth.
+eight-period pipeline. **Do not weaken the check to make it green**; the virtio
+zero is what says it has teeth.
+
+**2026-08-07: one guest-side cause found and fixed, and it is not the whole of
+it.** soundd filled a completion batch lowest-index-first, so a batch that
+wrapped the ring — `{6,7,0,1}` — was filled 0, 1, 6, 7 and played 6, 7, 0, 1.
+That is a splice with no silence in it, which is this signature exactly. Six
+`hda_tone` runs in one session, instrumented with a counter of fills that were
+not in the engine's order, separated cleanly: **one run at `out_of_order=2`,
+`max_batch=7`, 9 phase breaks; five at `out_of_order=0`, `max_batch=4`, 0
+breaks.** It is fixed (see the entry below) and the fill order is now the
+engine's by construction.
+
+**The breaks survive it.** Two runs on the fixed tree gave 8 and 6, with
+`deferred=0` and an ordering that can no longer be wrong. So the ordering was a
+contributor and not the cause, and the remaining one is still unnamed. What the
+new numbers add:
+
+- The break count tracks **soundd's own wake lateness**, which on this host is
+  the host descheduling QEMU: 0 breaks at `max_wake_lat_us` 8626–8752 (five
+  runs), 8 at 22525, 9 at 16730, 6 at 50837. Nothing in the guest changed
+  between them.
+- soundd put **1127 periods = 144,256 frames** on the wire and the capture holds
+  **131,061** — 9.1% of what was submitted is not in the file, with `gaps none`
+  and `underruns 0`. On the run at 6 breaks it is 10.8%. A capture missing a
+  tenth of its samples has phase breaks whatever the guest did.
+
+So the next step is the host side. `isr_complete` is a weaker candidate than it
+was: `stream::decode` now refuses any mask that is not a walk of the ring, and
+soundd fills in the order that walk names rather than in index order.
 
 Spec: `specs/audio-subsystem-spec.md`. Numbered as in the 2026-07-28 audit;
 (1) — see the re-filing below; it was never an SQ overrun — (2) `CommandRing::push` assert, (3) ungated

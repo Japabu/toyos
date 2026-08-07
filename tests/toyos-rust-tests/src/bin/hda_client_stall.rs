@@ -29,10 +29,20 @@ const AMPLITUDE: f64 = 16000.0;
 /// and a half laps, and the run stages eight of them so the test does not rest
 /// on catching one window.
 const STALL: Duration = Duration::from_millis(60);
-const STALLS: u32 = 8;
+const STALLS: u64 = 8;
 const CALLBACKS_BETWEEN_STALLS: u64 = 60;
 
 fn main() {
+    let first = play(STALLS);
+    // A second stream over the same device, after soundd has drained and
+    // suspended: on a ring the drain gives the periods up rather than holding
+    // them, so what the resume primes and where in the ring it starts are both
+    // state the first stream left behind.
+    let second = play(2);
+    println!("stalled {first} then {second} times, soundd survived");
+}
+
+fn play(stalls_wanted: u64) -> u64 {
     let host = cpal::default_host();
     let device = host.default_output_device().expect("no audio output device");
     let config = device.default_output_config().expect("no audio config");
@@ -55,7 +65,7 @@ fn main() {
                 }
                 callbacks += 1;
                 if callbacks % CALLBACKS_BETWEEN_STALLS == 0
-                    && stalls_cb.load(Ordering::Relaxed) < STALLS as u64
+                    && stalls_cb.load(Ordering::Relaxed) < stalls_wanted
                 {
                     stalls_cb.fetch_add(1, Ordering::Relaxed);
                     std::thread::sleep(STALL);
@@ -67,10 +77,14 @@ fn main() {
         .expect("failed to build audio stream");
 
     stream.play().expect("failed to play");
-    while stalls.load(Ordering::Relaxed) < STALLS as u64 {
+    while stalls.load(Ordering::Relaxed) < stalls_wanted {
         std::thread::sleep(Duration::from_millis(50));
     }
-    std::thread::sleep(Duration::from_millis(200));
+    // Long enough for the pipeline to play out and soundd to suspend: the
+    // drain is one lap of the ring and the second stream has to find a
+    // suspended daemon for the resume to be the thing under test.
+    std::thread::sleep(Duration::from_millis(500));
     drop(stream);
-    println!("stalled {} times, soundd survived", stalls.load(Ordering::Relaxed));
+    std::thread::sleep(Duration::from_millis(300));
+    stalls.load(Ordering::Relaxed)
 }

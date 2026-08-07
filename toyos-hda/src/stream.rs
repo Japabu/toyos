@@ -137,25 +137,43 @@ pub fn completed(
     Some((mask, current))
 }
 
-/// The mask of the `count` periods the engine plays from `first` onwards.
+/// What a driver's accumulated completion mask says about the engine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Completed {
+    /// The engine handed back `count` periods starting at `first`, and is in
+    /// `first + count` now.
+    Run { first: usize, count: usize },
+    /// Every period in the ring. The engine has been round at least once since
+    /// the driver last looked, so nothing in the mask says where it is — the
+    /// aliasing [`completed`] documents, arriving one level up, where it means
+    /// the whole pipeline has played out.
+    Lapped,
+}
+
+/// Read an accumulated completion mask.
 ///
-/// The inverse of [`completed`], and what a driver checks its own position
-/// against: a mask is a set and the engine is a sequence, so the set alone
-/// does not say which period the engine returns to first. It is the run's
-/// start, and that is the mask's lowest-numbered bit only while the run does
-/// not wrap the ring — `{6, 7, 0, 1}` is played 6, 7, 0, 1, and a driver
-/// filling it lowest-index-first writes the later audio into the buffer the
-/// engine reaches soonest.
+/// A mask is a set and the engine is a sequence, so the set alone has to say
+/// which period the engine returns to *first* — and that is the mask's
+/// lowest-numbered bit only while the run does not wrap the ring. `{6, 7, 0,
+/// 1}` is played 6, 7, 0, 1, and a driver filling it lowest-index-first writes
+/// the later audio into the buffer the engine reaches soonest.
 ///
-/// `None` for a run a ring of `periods` cannot hold: an index outside it, or a
-/// count that would name a period twice. A full lap is one of those — the
-/// engine leaves no mark distinguishing it from having gone nowhere, which is
-/// why [`completed`] cannot report one either.
-pub fn run_mask(first: usize, count: usize, periods: usize) -> Option<u32> {
-    if !(MIN_PERIODS..=MAX_PERIODS).contains(&periods) || first >= periods || count >= periods {
+/// It is always one contiguous run, because a driver reading late sees the OR
+/// of consecutive [`completed`] calls and those abut. `None` for anything else:
+/// no sequence of them can produce it, so it is a bug on the side that built it
+/// rather than a position to act on.
+pub fn decode(mask: u32, periods: usize) -> Option<Completed> {
+    if !(MIN_PERIODS..=MAX_PERIODS).contains(&periods) || mask >> periods != 0 {
         return None;
     }
-    Some((0..count).fold(0u32, |mask, i| mask | 1 << ((first + i) % periods)))
+    let count = mask.count_ones() as usize;
+    if count == periods {
+        return Some(Completed::Lapped);
+    }
+    let first = (0..periods)
+        .find(|&i| mask & 1 << i != 0 && mask & 1 << ((i + periods - 1) % periods) == 0)?;
+    ((0..count).fold(0u32, |run, i| run | 1 << ((first + i) % periods)) == mask)
+        .then_some(Completed::Run { first, count })
 }
 
 #[cfg(test)]
@@ -268,44 +286,54 @@ mod tests {
     }
 
     #[test]
-    fn a_run_is_the_periods_the_engine_plays_from_where_it_stands() {
-        assert_eq!(run_mask(3, 3, 8), Some(0b0011_1000));
-        assert_eq!(run_mask(0, 1, 8), Some(0b0000_0001));
-        assert_eq!(run_mask(5, 0, 8), Some(0));
+    fn a_mask_names_the_period_the_engine_returns_to_first() {
+        assert_eq!(decode(0b0011_1000, 8), Some(Completed::Run { first: 3, count: 3 }));
+        assert_eq!(decode(0b0000_0001, 8), Some(Completed::Run { first: 0, count: 1 }));
     }
 
     #[test]
-    fn a_run_that_wraps_is_not_the_run_its_lowest_bit_starts() {
+    fn a_run_that_wraps_does_not_start_at_its_lowest_bit() {
         // The engine was at 6 and is now playing 2: 6, 7, 0 and 1 have played
         // and are played again in that order. A driver reading the mask
         // lowest-bit-first fills 0, 1, 6, 7 — the later audio into the two
-        // buffers the engine reaches first, which is a splice with no silence
+        // buffers the engine reaches soonest, which is a splice with no silence
         // in it for a gap detector to see.
         let (mask, _) = completed(6, 2 * 512, 512, 8).unwrap();
-        assert_eq!(run_mask(6, 4, 8), Some(mask));
-        assert_ne!(run_mask(mask.trailing_zeros() as usize, 4, 8), Some(mask));
+        assert_eq!(decode(mask, 8), Some(Completed::Run { first: 6, count: 4 }));
+        assert_ne!(mask.trailing_zeros(), 6);
     }
 
     #[test]
-    fn every_position_completed_can_report_is_a_run_from_where_it_started() {
+    fn every_position_completed_can_report_reads_back_as_the_run_it_walked() {
         for last in 0..8usize {
             for position in 0..8 * 512u32 {
                 let (mask, _) = completed(last, position, 512, 8).unwrap();
-                assert_eq!(
-                    run_mask(last, mask.count_ones() as usize, 8),
-                    Some(mask),
-                    "last={last} position={position}"
-                );
+                let count = mask.count_ones() as usize;
+                let want = (count > 0).then_some(Completed::Run { first: last, count });
+                assert_eq!(decode(mask, 8), want.or(decode(0, 8)), "last={last} pos={position}");
             }
         }
     }
 
     #[test]
-    fn a_run_the_ring_cannot_hold_is_refused() {
-        // A whole lap names every period once and is indistinguishable from
-        // standing still, which is the aliasing `completed` documents.
-        assert_eq!(run_mask(0, 8, 8), None);
-        assert_eq!(run_mask(8, 1, 8), None);
-        assert_eq!(run_mask(0, 1, 1), None);
+    fn a_driver_that_slept_a_whole_lap_is_told_the_mask_cannot_place_the_engine() {
+        // What a reader sees is the OR of every `completed` since it last
+        // looked, so a full ring is reachable where one call's is not.
+        let mut mask = 0;
+        for last in 0..8usize {
+            mask |= completed(last, ((last as u32 + 1) % 8) * 512, 512, 8).unwrap().0;
+        }
+        assert_eq!(mask, 0xFF);
+        assert_eq!(decode(mask, 8), Some(Completed::Lapped));
+    }
+
+    #[test]
+    fn a_mask_that_is_not_one_run_is_refused_rather_than_placed() {
+        // Two disjoint runs: no walk of the ring produces it, so it is a bug on
+        // the side that built the mask and not a position to fill from.
+        assert_eq!(decode(0b0010_0101, 8), None);
+        // A bit outside the ring.
+        assert_eq!(decode(1 << 8, 8), None);
+        assert_eq!(decode(1, 1), None);
     }
 }
