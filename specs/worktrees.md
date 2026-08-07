@@ -229,6 +229,30 @@ once that day. `toolchain::CLAIM_WINDOW` is that sentence, printed by the refusa
 a diverged checkout gets and again by the claim announcement — an agent in this
 situation is reading the refusal, not this file.
 
+**And the rule is now enforced at the cause rather than at the victim.** On
+2026-08-07 it was followed once in four times: `toyos-vfserr` split deliberately
+and said so; `toyos-memsec2` did not and held through two failed gates, blocking
+two agents ~35 and ~50 minutes; `toyos-h3` did not, and two landings failed
+against it in one hour — a log-audit branch at 129.6 s and a `tone` change at
+94.8 s, each burning a full build before reaching `toolchain.rs`'s refusal. That
+refusal is a good one arriving at the wrong process. `--land` now asks the same
+question of the *landing* branch, in `preflight`, before the integration lock and
+before anything is compiled: a branch whose commits touch the witnessed trees
+**and** carry commits that touch none of them is refused, naming both lists.
+
+It is a refusal and not a warning, because a warning is what the briefs already
+were. The way past it is `--abi-inseparable`, for the case the split genuinely
+cannot be made — an ABI item the branch renames or removes, whose old form the
+rest of the tree still uses — and it is not silent: the report and the landing
+commit both say the claim window was the whole task. Where the sysroot commits
+are the *oldest* on the branch the refusal prints the two-command remedy;
+where they are interleaved it says so, because nothing in this workflow rebases.
+A previous landing attempt's integration merge is not unrelated work — merges are
+excluded, or a branch whose only commit is the ABI change would be refused for
+having tried once already. Gates:
+`an_abi_change_landing_with_unrelated_work_is_refused_before_the_gate`,
+`an_abi_only_branch_lands_and_a_previous_merge_is_not_unrelated_work`.
+
 **A checkout that is merely *behind* main is not diverged from it**, and until
 2026-08-07 `standing()` could not tell the two apart: it asked `git diff main`,
 which is symmetric, so a worktree that had not merged somebody else's landed ABI
@@ -345,6 +369,38 @@ follows the queue forward instead of naming whoever was in front when the wait
 began. The kernel still keeps the queue and a thread does the talking: nothing
 polls a lock, so `flock`'s own ordering is given up nowhere. Gate:
 `a_lasting_wait_keeps_saying_so`.
+
+**The landing commit is written by `--land` and reads from main's side.** Step 2
+creates a merge whose default message is `Merge branch 'main' into
+wt/toyos-<x>` — the direction nobody reads. Measured 2026-08-07: **166 commits on
+main in twenty hours, 66 of them that one sentence**, which makes
+`git log --oneline` close to useless as a summary. The subject is now
+`wt/toyos-<x> landed: N commits, gate ok` (or `gate ok, NOT clean`), and the body
+carries the gate command, its duration and the suite's own last line quoted.
+
+Two of those are things a reader cannot recover afterwards and are the reason the
+commit carries them rather than the report alone: **which gate ran**, because
+`--gate` overrides the default and one override that day silently narrowed to a
+single test, and **whether the run was clean**, because `--land` accepts a run
+carrying declared expected failures and only the suite says so.
+
+The direction of the two parents is unchanged and nothing is squashed — the
+history is honest and only its labelling was wrong. **Read it with
+`git log --no-merges`** when you want the work rather than the landings.
+
+Composing the message needs the gate's verdict, which does not exist when the
+merge is made, so the merge is `--no-ff --no-commit` and the commit happens
+between the gate and everything after it. Two consequences worth stating:
+
+- **A failed gate still commits the merge**, with a subject saying the landing
+  did not complete and claiming no verdict. Leaving it uncommitted would make the
+  next `--land` report an unresolved conflict that is not there.
+- **`toolchain::standing` ignores the working tree while a merge is in
+  progress.** For the length of the gate the branch holds main's changes staged
+  and uncommitted, which `git status` cannot tell from local work — and a build
+  inside that gate would otherwise be told it had standing to claim a sysroot it
+  has no delta for. What the branch has of its own is the `main...HEAD` question.
+  Gate: `a_landing_s_uncommitted_merge_is_not_standing`.
 
 **A landing writes its own log**, `target/landings/landing-<epoch>-<pid>.log`,
 created with `O_EXCL` and named in the report. The gate's stdout and stderr are
