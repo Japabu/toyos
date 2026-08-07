@@ -19,7 +19,7 @@ use core::sync::atomic::{fence, Ordering};
 use toyos::shm::SharedMemory;
 use toyos::VirtioSoundDev;
 use toyos_abi::audio::AudioCompletionRecord;
-use toyos_abi::syscall::{self, SyscallError};
+use toyos_abi::syscall::SyscallError;
 use toyos_abi::virtio_sound as abi;
 
 const R_PCM_INFO: u32 = 0x0100;
@@ -50,16 +50,22 @@ const STREAM_ID: u32 = 0;
 /// 48000 is the one every other device offers.
 const SUPPORTED_RATES: [(u32, u8); 2] = [(44100, RATE_44100), (48000, RATE_48000)];
 
-/// How long a control command is given to come back.
+/// How many times a control command's completion is polled before the device is
+/// called dead.
 ///
-/// Policy, not physics: the specification has no number, and this is the one
-/// wait in the audio path — a resume sends START inline with the first period.
-/// A device that has not answered in this long has stopped, and a driver that
-/// spun forever on it would take the machine's audio down with a hang instead of
-/// a refusal.
-const CTRL_DEADLINE_NANOS: u64 = 100_000_000;
-/// Spins between clock reads while waiting for one.
-const SPINS_PER_CLOCK_READ: u32 = 256;
+/// **A count and not a deadline, and the difference is the whole of it.** A wall
+/// clock keeps running while this guest is not: under host load a vCPU can lose
+/// tens of milliseconds without executing an instruction, so a duration here
+/// would measure the host's scheduler and report a healthy device as a stopped
+/// one — at a suspend boundary, in the audio path. A count advances only when
+/// this driver actually looked.
+///
+/// Policy, not physics: the specification has no number. What it is set against
+/// is that a device answering at all answers in one round trip, so anything this
+/// side of enormous separates "slow" from "gone".
+const CTRL_POLLS: u32 = 100_000;
+/// Spins between two looks at the used ring.
+const SPINS_PER_POLL: u32 = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -446,17 +452,18 @@ impl Virtio {
         }
         self.control.publish(&self.dev, 0);
 
-        let deadline = syscall::clock_nanos() + CTRL_DEADLINE_NANOS;
-        loop {
+        let mut answered = false;
+        for _ in 0..CTRL_POLLS {
             if self.control_done.poll().is_some() {
+                answered = true;
                 break;
             }
-            for _ in 0..SPINS_PER_CLOCK_READ {
+            for _ in 0..SPINS_PER_POLL {
                 core::hint::spin_loop();
             }
-            if syscall::clock_nanos() >= deadline {
-                return Err(Refusal::Silent(what));
-            }
+        }
+        if !answered {
+            return Err(Refusal::Silent(what));
         }
 
         let status = unsafe { read_volatile(self.base.add(abi::OFF_CTRL_RESP) as *const u32) };
