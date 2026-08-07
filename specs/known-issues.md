@@ -1094,7 +1094,23 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
-### OPEN — two CPUs shooting down at once wait for each other and both panic
+### CLOSED — two CPUs shooting down at once wait for each other and both panic
+
+**Closed 2026-08-07 by `wt/toyos-tlbfix`: `arch::tlb::shootdown` waited without
+ever answering, and every path that reaches it has `IF` clear.**
+`arch::syscall`'s `MSR_FMASK` masks `IF` on the `SYSCALL` gate and nothing sets
+it again before `sysretq`, so a CPU inside the wait could not take vector 0xFE
+and had no other way to acknowledge. M3 closed that class for `Lock::lock`,
+whose spin calls `arch::tlb::poll` on every turn, and enumerated the `IF=0`
+spins it thought were left; the wait itself was not on the list and is one.
+`Shootdown::wait_turn` is one turn of the wait and it answers before it asks —
+asking first lets a CPU leave on the answer it just received without ever
+publishing the generation its sibling is waiting on. Gate:
+`an_initiator_answers_while_it_waits` in `kernel-loom`, which is this entry's
+schedule written out, red on the old shape.
+
+Everything below is the evidence as it was recorded, and it is what made the
+diagnosis: two backtraces, read together, are the whole defect.
 
 Observed 2026-08-07 on `wt/toyos-h3`, whose only kernel delta from `main` is the
 audio one; the shootdown code is `c4173f0` and `318ec10`, landed the same
@@ -2560,7 +2576,41 @@ identified it as `main`'s. Assigning it needs whoever owns H3 —
 `5fdfeb7`/`a022811` ("wip: H3, the virtio-sound stub and its userland driver")
 landed hours before this measurement.
 
-### OPEN — the wide phase reds on a five-second TLB stall, and it makes `--land` unpassable
+### CLOSED as to its cause, OPEN as to the landing — the wide phase reds on a five-second TLB stall
+
+**The signature's cause is closed: §3, two CPUs shooting down at once.** It was a
+mutual wait and not a bound, so no deadline value was ever going to fix it; the
+wait now answers before it asks. What that does *not* do is make `cargo test`
+reliably green, and this section stays open for the part it does not reach.
+
+**The wide phase still reds, on a different class, and this signature did not
+reproduce here at all.** Measured 2026-08-07 on `wt/toyos-tlbfix`, four full
+suites and 96 guest boots of the audio family, **zero `tlb:` lines in any of
+them** — including 50 boots on a kernel with the fix reverted, where the H3
+agent's twelve-run hunt had found it in roughly one boot in five. So the rate
+this defect ran at earlier in the day is not the rate it runs at now, and no
+measurement taken here can be read as the fix having lowered it. The fix rests
+on §3's two backtraces and on `an_initiator_answers_while_it_waits`, which is
+red without it.
+
+| run | wall | verdict |
+|---|---|---|
+| before the fix | 576.3 s | 4 red: `metal_sim_compositor_stall`, `metal_sim_client_death`, `screen_blocked_dump` (all `ALONE: GREEN`), `audio_tone (smp=8)` |
+| after, 1 | 559.3 s | 2 red: `i8042_mouse`, `desktop_audio_client` — 385 s wide against 13 s alone — both `ALONE: GREEN` |
+| after, 2 | 182.7 s | **clean, 289/289**, on a host that was briefly quiet |
+| after, 3 | 704.7 s | 1 red: `screen_blocked_dump`, `ALONE: red again` |
+
+Every one of those reds is the parallel-red list in §7, not this entry: the two
+that name a duration are the contention class, and the one clean run is the one
+whose host was idle. **A landing is still a coin toss and the reason is now
+squarely §7**, whose own last paragraph says a verdict that flips with the host
+is measuring the host. `audio_tone (smp=8)`'s `suspend structure: no
+'soundd: suspended' after the last client removal` fired 2 of 12 on the reverted
+kernel and 0 of 12 on the fixed one, which at n=12 is not a difference and has
+no mechanism behind it — recorded so the next person does not read it as one.
+
+What follows is the evidence as it was recorded on `wt/toyos-boot`, and it is
+what pointed at §3.
 
 Measured 2026-08-07 across two `--land` gates on `wt/toyos-boot` (289 tests
 each) and five A/B runs against `main` at `6d11938`, all in one session.
@@ -2594,19 +2644,20 @@ windows created and destroyed is 62 rounds of unmapping, which is exactly what
 took 6.14 s for a 3 s tone and its round 2 then panicked in
 `toybox/src/tone.rs:85` on `failed to open audio stream: NotFound`.
 
-So the branch is not the variable and the load is. The shootdown wait landed on
-`main` the same day (`318ec10`, `c4173f0`) and **its own diagnostic is what named
-the stall**, so the instrument is already in the tree. What it does not answer:
-which CPU was not taking interrupts and why, and whether the downstream failures
-— soundd refusing a second stream, a compositor client exiting −1 — are correct
-consequences or second defects.
+So the branch is not the variable. The shootdown wait landed on `main` the same
+day (`318ec10`, `c4173f0`) and **its own diagnostic is what named the stall**, so
+the instrument is already in the tree.
+
+The reading that "the load is the variable" was the wrong half of it, and worth
+keeping as the mistake it was: load is what made two unmaps overlap, and the
+overlap was fatal by construction. The generations here differ by one — `68` and
+`69` on two CPUs of a two-CPU guest — which is the same pair of initiators §3's
+backtraces name.
 
 **Not to be re-run away**: the owner's 2026-08-04 ruling is that a
 load-coincident failure is a real defect, and this one reproduced across two
-full runs with seven different victims. Its practical cost is that `cargo test`
-reds non-deterministically under the default 12-wide phase, so `--land`'s gate
-cannot be passed by anybody until it is settled. `cargo test -- --jobs 1` is the
-obvious next measurement and was not run here.
+full runs with seven different victims. That ruling is what produced this entry
+instead of seven re-runs, and it is what the fix came out of.
 
 ### OPEN, UNASSIGNED — gate A's thorough tier is red on `main`, and the recorded dropout sample is what it disagrees with
 
@@ -3836,6 +3887,16 @@ entry deliberately covers only "the desktop ceased to answer after a window
 closed", and this message names a shell that never answered in the first place,
 so the run reds on the very test the exemption exists for and for a reason the
 exemption is right to exclude.
+
+**And it is what is left after the TLB deadlock closed.** Four full suites on
+`wt/toyos-tlbfix` on 2026-08-07, one before that fix and three after: the reds
+were `metal_sim_compositor_stall`, `metal_sim_client_death`,
+`screen_blocked_dump`, `i8042_mouse`, `desktop_audio_client` (385 s wide against
+13 s alone) and `screen_blocked_dump` again — six of the seven `ALONE: GREEN`,
+every one of them this entry. The one clean 289/289 run is the one whose suite
+took **182.7 s**; the three red ones took 559, 576 and 705. That is the whole
+correlation, and it says the remaining landing blocker is this section rather
+than anything in the kernel.
 
 ### A whole parallel phase can be starved by another agent's build
 
