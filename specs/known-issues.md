@@ -2551,37 +2551,53 @@ identified it as `main`'s. Assigning it needs whoever owns H3 —
 `5fdfeb7`/`a022811` ("wip: H3, the virtio-sound stub and its userland driver")
 landed hours before this measurement.
 
-### OPEN — `null_sink_shipped_client` reds in the wide phase only, and the serial names a five-second TLB stall
+### OPEN — the wide phase reds on a five-second TLB stall, and it makes `--land` unpassable
 
-Measured 2026-08-07, same session, three runs:
+Measured 2026-08-07 across two `--land` gates on `wt/toyos-boot` (289 tests
+each) and five A/B runs against `main` at `6d11938`, all in one session.
 
-| tree | how | verdict |
-|---|---|---|
-| `wt/toyos-boot` | inside a 289-test `--land` gate | **FAIL**, 10 s |
-| `main` at `6d11938` | `cargo test -- null_sink`, alone | PASS, 5 s |
-| `wt/toyos-boot` | `cargo test -- null_sink`, alone | PASS, 4 s |
-
-The failing capture is round 2 of the test: round 1 played its tone and exited
-after **6.14 s** against a 3 s tone, and between the two rounds the kernel
-logged, three times,
+Seven distinct tests failed between the two gates —
+`null_sink_shipped_client`, `metal_sim_window_caps`,
+`metal_sim_ipc_hostile_peer`, `metal_sim_compositor_stall`,
+`metal_sim_client_death`, `desktop_window_child`, and an `hda_tone` that is the
+entry above. **Every one of their captures carries the same two lines**, with
+different generation numbers:
 
 ```
-tlb: cpu 0 has not flushed for generation Generation(2) in 5000000000ns
+tlb: cpu 1 has not flushed for generation Generation(69) in 5000000000ns
+     — it is not taking interrupts
+tlb: cpu 0 has not flushed for generation Generation(68) in 5000000000ns
      — it is not taking interrupts
 ```
 
-Round 2 then panicked in `toybox/src/tone.rs:85` on
-`failed to open audio stream: NotFound`, so soundd would not give a second
-stream to a client the first round had left in an unknown state.
+And every one of them **passes alone, on both trees**:
 
-**Not to be re-run away.** The owner's 2026-08-04 ruling is that a
-load-coincident audio failure is investigated as a real defect of the pipeline;
-what the A/B establishes is only that the *branch* is not the variable. The
-shootdown wait is `arch::tlb::shootdown`, landed on `main` earlier the same day
-(`318ec10`, `c4173f0`), and its own diagnostic is what named the stall — so the
-instrument for this is already in the tree. Two questions it does not answer:
-which CPU was not taking interrupts and why, and whether soundd's refusal of the
-second stream is a correct consequence or a second defect.
+| test | in the wide phase | alone on the branch | alone on `main` |
+|---|---|---|---|
+| `null_sink_shipped_client` | FAIL, 10 s | PASS, 4 s | PASS, 5 s |
+| `metal_sim_window_caps` | FAIL, 5 s (three times) | PASS, 3 s | PASS, 36 s |
+
+`metal_sim_window_caps` is the clearest: its own work *completes* —
+`window caps: oversized refused, 62 windows granted then refused` — and the
+process then exits `-1` after two CPUs have each stalled five seconds. 62
+windows created and destroyed is 62 rounds of unmapping, which is exactly what
+`arch::tlb::shootdown` is on the path of. `null_sink_shipped_client`'s round 1
+took 6.14 s for a 3 s tone and its round 2 then panicked in
+`toybox/src/tone.rs:85` on `failed to open audio stream: NotFound`.
+
+So the branch is not the variable and the load is. The shootdown wait landed on
+`main` the same day (`318ec10`, `c4173f0`) and **its own diagnostic is what named
+the stall**, so the instrument is already in the tree. What it does not answer:
+which CPU was not taking interrupts and why, and whether the downstream failures
+— soundd refusing a second stream, a compositor client exiting −1 — are correct
+consequences or second defects.
+
+**Not to be re-run away**: the owner's 2026-08-04 ruling is that a
+load-coincident failure is a real defect, and this one reproduced across two
+full runs with seven different victims. Its practical cost is that `cargo test`
+reds non-deterministically under the default 12-wide phase, so `--land`'s gate
+cannot be passed by anybody until it is settled. `cargo test -- --jobs 1` is the
+obvious next measurement and was not run here.
 
 ### OPEN, UNASSIGNED — gate A's thorough tier is red on `main`, and the recorded dropout sample is what it disagrees with
 
