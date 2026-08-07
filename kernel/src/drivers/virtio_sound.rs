@@ -2,8 +2,8 @@ use core::cell::UnsafeCell;
 use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use super::pci::PciDevice;
-use super::virtio::{BufDir, DescSlot, UsedRingConsumer, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1, COMMON_MSIX_CONFIG, COMMON_QUEUE_SELECT, COMMON_QUEUE_MSIX};
+use super::pci::{PciDevice, MSIX_ENTRY};
+use super::virtio::{BufDir, DescSlot, UsedRingConsumer, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::mm::paging::CachePolicy;
 use crate::log;
@@ -98,6 +98,11 @@ fn choose_params(info: &VirtioSndPcmInfo) -> Option<(u32, u8)> {
 
     Some((rate, channels))
 }
+
+// Virtqueue indices, fixed by the virtio sound device specification.
+const CONTROL_QUEUE: u16 = 0;
+const EVENT_QUEUE: u16 = 1;
+const TX_QUEUE: u16 = 2;
 
 // Kernel-only DMA page layout (byte offsets). Virtqueue rings, control
 // buffers and xfer/status metadata must never be reachable from userspace —
@@ -309,7 +314,7 @@ impl SoundController {
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
-            0, // controlq index
+            CONTROL_QUEUE,
         ));
 
         unsafe { read_volatile(self.resp_ptr as *const u32) }
@@ -408,7 +413,7 @@ impl SoundController {
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
-            2, // txq index
+            TX_QUEUE,
         );
         assert!(submitted == first_desc, "virtio-sound: submit used unexpected descriptor");
         self.buf_desc[idx] = first_desc as u8;
@@ -458,55 +463,36 @@ impl SoundController {
                    BufDir::Writable)],
                 self.device.notify_mmio(),
                 self.device.notify_off_multiplier(),
-                1, // eventq index
+                EVENT_QUEUE,
             );
         }
     }
 }
 
-const PCI_CAP_MSIX: u8 = 0x11;
 const VIRTIO_SOUND_VECTOR: u8 = 0x23;
 
-fn setup_msix(pci_dev: &PciDevice, device: &VirtioDevice) {
-    let cap = match pci_dev.capabilities().find(|c| c.id() == PCI_CAP_MSIX) {
-        Some(c) => c,
-        None => panic!("virtio-sound: no MSI-X capability"),
-    };
-
-    let table_info = cap.read_u32(4);
-    let table_bir = (table_info & 0x7) as u8;
-    let table_offset = (table_info & !0x7) as u64;
-    let table_bar = pci_dev.read_bar_64(table_bir);
-    let table_addr = table_bar + table_offset;
-
-    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000, CachePolicy::DeferToMtrr);
-
-    table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base
-    table.write_u32(0x04, 0);            // msg_addr_hi
-    table.write_u32(0x08, VIRTIO_SOUND_VECTOR as u32); // msg_data: vector
-    table.write_u32(0x0C, 0);            // vector control: unmask
-
-    let msg_ctrl = cap.read_u16(2);
-    cap.write_u16(2, (msg_ctrl | (1 << 15)) & !(1 << 14));
-
-    let common = device.common_config();
-
-    common.write_u16(COMMON_MSIX_CONFIG, 0);
-    let config_vec = common.read_u16(COMMON_MSIX_CONFIG);
-    if config_vec == 0xFFFF {
-        panic!("virtio-sound: MSI-X config vector assignment failed");
+/// Arm this device's txq completion interrupt, or say why the machine has no
+/// audio.
+///
+/// A refusal rather than a panic, for [`virtio_net::arm_interrupt`]'s reason
+/// and one of its own: `TX_ISR` is the only consumer of the txq used ring, so
+/// a device that cannot deliver its completions is one whose every period
+/// stays in flight forever. soundd would then have no device at all, which is
+/// a machine that boots and plays nothing rather than a machine that dies.
+fn arm_interrupt(pci_dev: &PciDevice, device: &VirtioDevice) -> bool {
+    if !pci_dev.enable_msix(VIRTIO_SOUND_VECTOR) {
+        log!("virtio-sound: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its MSI-X could not be \
+             armed and this driver has no other way to be told a period completed",
+            pci_dev.bus, pci_dev.dev, pci_dev.func);
+        return false;
     }
-
-    // Set TX queue (2) MSI-X vector
-    common.write_u16(COMMON_QUEUE_SELECT, 2);
-    common.write_u16(COMMON_QUEUE_MSIX, 0);
-    let queue_vec = common.read_u16(COMMON_QUEUE_MSIX);
-    if queue_vec == 0xFFFF {
-        panic!("virtio-sound: MSI-X queue vector assignment failed");
+    if let Err(refused) = device.bind_msix(TX_QUEUE) {
+        log!("virtio-sound: NOT INITIALISED at PCI {:02x}:{:02x}.{} — the device refused a \
+             vector for {}", pci_dev.bus, pci_dev.dev, pci_dev.func, refused);
+        return false;
     }
-
-    log!("virtio-sound: MSI-X enabled (vector {:#x}, config_vec={}, queue_vec={})",
-        VIRTIO_SOUND_VECTOR, config_vec, queue_vec);
+    log!("virtio-sound: MSI-X vector {:#x} on table entry {}", VIRTIO_SOUND_VECTOR, MSIX_ENTRY);
+    true
 }
 
 /// Initialize the VirtIO sound device. Returns the controller and AudioInfo on success.
@@ -533,18 +519,20 @@ pub fn init(devices: &[PciDevice]) -> Option<(SoundController, AudioInfo)> {
     let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000), TXQ_SIZE as u16);
 
     // The ISR is the only txq used-ring consumer. Install it before
-    // setup_msix so no interrupt on this vector can observe a half-written
+    // arm_interrupt so no interrupt on this vector can observe a half-written
     // Option (config-change interrupts share the vector).
     // SAFETY: MSI-X is not enabled yet — nothing races this store.
     unsafe { *TX_ISR.consumer.get() = Some(txq.split_used_consumer()); }
 
-    device.setup_queue(0, &mut controlq);
-    device.setup_queue(1, &mut eventq);
-    device.setup_queue(2, &mut txq);
-    setup_msix(&pci_dev, &device);
-    device.enable_queue(0);
-    device.enable_queue(1);
-    device.enable_queue(2);
+    device.setup_queue(CONTROL_QUEUE, &mut controlq);
+    device.setup_queue(EVENT_QUEUE, &mut eventq);
+    device.setup_queue(TX_QUEUE, &mut txq);
+    if !arm_interrupt(&pci_dev, &device) {
+        return None;
+    }
+    device.enable_queue(CONTROL_QUEUE);
+    device.enable_queue(EVENT_QUEUE);
+    device.enable_queue(TX_QUEUE);
     device.activate();
 
     let ctrl_bufs = dma.subslice(OFF_CTRL_BUFS, 0x1000);
@@ -608,7 +596,7 @@ pub fn init(devices: &[PciDevice]) -> Option<(SoundController, AudioInfo)> {
                BufDir::Writable)],
             ctrl.device.notify_mmio(),
             ctrl.device.notify_off_multiplier(),
-            1, // eventq index
+            EVENT_QUEUE,
         );
     }
 

@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use core::ptr::write_bytes;
 
-use super::pci::PciDevice;
+use super::pci::{PciDevice, MSIX_ENTRY};
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtqueueRegions, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::mm::paging::CachePolicy;
@@ -20,6 +20,8 @@ const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 // VirtIO 1.0 net header: always 12 bytes (includes num_buffers) with VERSION_1
 const NET_HDR_SIZE: usize = 12;
 
+const RX_QUEUE: u16 = 0;
+const TX_QUEUE: u16 = 1;
 const RX_QUEUE_SIZE: u16 = 256;
 const RX_BUF_COUNT: usize = 256;
 const RX_BUF_SIZE: u32 = 4096;
@@ -34,7 +36,6 @@ const OFF_TX_BUF: usize    = 0x4000 + 256 * 0x1000;
 const TX_BUF_LEN: usize    = 0x1000;
 const DMA_SIZE: usize       = OFF_TX_BUF + TX_BUF_LEN;
 
-const PCI_CAP_MSIX: u8 = 0x11;
 const VIRTIO_NET_VECTOR: u8 = 0x22;
 
 static DMA: Lock<Option<DmaPool>> = Lock::new(None);
@@ -71,7 +72,7 @@ impl VirtioNic {
             &[(self.rx_phys[buf_idx], RX_BUF_SIZE, BufDir::Writable)],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
-            0,
+            RX_QUEUE,
         );
         self.desc_to_buf[desc_id as usize] = buf_idx as u16;
     }
@@ -122,53 +123,34 @@ impl crate::net::Nic for VirtioNic {
             &[(self.tx_phys, total_len as u32, BufDir::Readable)],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
-            1,
+            TX_QUEUE,
         ));
     }
 }
 
-fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
-    let cap = match pci_dev.capabilities().find(|c| c.id() == PCI_CAP_MSIX) {
-        Some(c) => c,
-        None => panic!("VirtIO net: no MSI-X capability"),
-    };
-
-    let table_info = cap.read_u32(4);
-    let table_bir = (table_info & 0x7) as u8;
-    let table_offset = (table_info & !0x7) as u64;
-    let table_bar = pci_dev.read_bar_64(table_bir);
-    let table_addr = table_bar + table_offset;
-
-    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000, CachePolicy::DeferToMtrr);
-
-    // Configure MSI-X table entry 0: route to LAPIC with our vector
-    table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base
-    table.write_u32(0x04, 0);            // msg_addr_hi
-    table.write_u32(0x08, VIRTIO_NET_VECTOR as u32); // msg_data: vector
-    table.write_u32(0x0C, 0);            // vector control: unmask
-
-    let msg_ctrl = cap.read_u16(2);
-    cap.write_u16(2, (msg_ctrl | (1 << 15)) & !(1 << 14));
-
-    use super::virtio::{COMMON_MSIX_CONFIG, COMMON_QUEUE_SELECT, COMMON_QUEUE_MSIX};
-    let common = device.common_config();
-
-    common.write_u16(COMMON_MSIX_CONFIG, 0);
-    let config_vec = common.read_u16(COMMON_MSIX_CONFIG);
-    if config_vec == 0xFFFF {
-        panic!("VirtIO net: MSI-X config vector assignment failed");
+/// Arm this NIC's RX interrupt, or say why the machine has no NIC.
+///
+/// A refusal rather than a panic, and that is the whole of what this returns.
+/// Nothing in this driver polls: `poll_rx` runs behind an `irq_ring` record
+/// that only vector 0x22's ISR publishes, so a NIC whose messages cannot reach
+/// a CPU is a NIC that receives one packet's worth of nothing for the life of
+/// the boot. A machine that cannot have networking still boots, still has a
+/// console, and still says why — which is what the xHCI driver settled for the
+/// same shape of question.
+fn arm_interrupt(pci_dev: &PciDevice, device: &VirtioDevice) -> bool {
+    if !pci_dev.enable_msix(VIRTIO_NET_VECTOR) {
+        log!("VirtIO net: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its MSI-X could not be \
+             armed and this driver has no other way to be told a packet arrived",
+            pci_dev.bus, pci_dev.dev, pci_dev.func);
+        return false;
     }
-
-    // Set RX queue (0) MSI-X vector. queue_enable is called separately after.
-    common.write_u16(COMMON_QUEUE_SELECT, 0);
-    common.write_u16(COMMON_QUEUE_MSIX, 0);
-    let queue_vec = common.read_u16(COMMON_QUEUE_MSIX);
-    if queue_vec == 0xFFFF {
-        panic!("VirtIO net: MSI-X queue vector assignment failed");
+    if let Err(refused) = device.bind_msix(RX_QUEUE) {
+        log!("VirtIO net: NOT INITIALISED at PCI {:02x}:{:02x}.{} — the device refused a \
+             vector for {}", pci_dev.bus, pci_dev.dev, pci_dev.func, refused);
+        return false;
     }
-
-    log!("VirtIO net: MSI-X enabled (vector {:#x}, config_vec={}, queue_vec={})",
-        VIRTIO_NET_VECTOR, config_vec, queue_vec);
+    log!("VirtIO net: MSI-X vector {:#x} on table entry {}", VIRTIO_NET_VECTOR, MSIX_ENTRY);
+    true
 }
 
 pub fn init(devices: &[PciDevice]) {
@@ -198,11 +180,13 @@ pub fn init(devices: &[PciDevice]) {
     // TX queue: 16 entries, fits in one page
     let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000), 16);
 
-    device.setup_queue(0, &mut rxq);
-    device.setup_queue(1, &mut txq);
-    setup_msix(&pci_dev, &device);
-    device.enable_queue(0);
-    device.enable_queue(1);
+    device.setup_queue(RX_QUEUE, &mut rxq);
+    device.setup_queue(TX_QUEUE, &mut txq);
+    if !arm_interrupt(&pci_dev, &device) {
+        return;
+    }
+    device.enable_queue(RX_QUEUE);
+    device.enable_queue(TX_QUEUE);
     device.activate();
 
     let cfg = device.device_config();

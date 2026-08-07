@@ -54,8 +54,6 @@ const HEADER_BAR0: u64 = 0x10;
 const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
 
 const CAP_POWER_MANAGEMENT: u8 = 0x01;
-const CAP_MSI: u8 = 0x05;
-const CAP_MSIX: u8 = 0x11;
 
 /// `PMCSR.PowerState`, and the recovery the PCI power-management specification
 /// requires before the first register access after leaving D3hot.
@@ -324,26 +322,29 @@ fn reserved_regions(rsdp_addr: u64, hda: &PciDevice) {
 /// BAR and cannot be carved out at 2 MiB granularity, and a capability in
 /// config space simply has no such hole.
 fn interrupts(hda: &PciDevice) {
-    let msi = hda.capabilities().find(|c| c.id() == CAP_MSI).map(|cap| {
-        let ctrl = cap.read_u16(2);
-        // `Multiple Message Capable`, an exponent: three bits saying how many
-        // consecutive vectors the function can raise.
-        (1u16 << ((ctrl >> 1) & 0x7), ctrl & (1 << 7) != 0)
-    });
-    let msix = hda.capabilities().find(|c| c.id() == CAP_MSIX).map(|cap| {
-        // `Table Size`, encoded one less than it is.
-        (cap.read_u16(2) & 0x7FF) + 1
+    // An MSI-X this kernel would decline to arm is one a handoff cannot rest
+    // on either, so it is named and then treated as absent — leaving the MSI
+    // answer, which is the one §4.2 wants anyway.
+    let msix = hda.msix().and_then(|decoded| match decoded {
+        Ok(msix) => Some(msix),
+        Err(why) => {
+            log!("hda: (a) msix unusable — {why}");
+            None
+        }
     });
 
-    match (msi, msix) {
-        (_, Some(vectors)) => log!(
-            "hda: (a) msix vectors={vectors} — eligible, and its table is inside a BAR \
-             (userspace-drivers-spec §4.3)"
+    match (hda.msi(), msix) {
+        (_, Some(msix)) => log!(
+            "hda: (a) msix vectors={} — eligible, and its table is inside BAR {} \
+             (userspace-drivers-spec §4.3)",
+            msix.entries(),
+            msix.bir()
         ),
-        (Some((vectors, wide)), None) => log!(
-            "hda: (a) msi vectors={vectors} addr64={} msix=none — eligible, capability in config \
+        (Some(msi), None) => log!(
+            "hda: (a) msi vectors={} addr64={} msix=none — eligible, capability in config \
              space and no table in a BAR",
-            yn(wide)
+            msi.vectors(),
+            yn(msi.wide())
         ),
         (None, None) => log!(
             "hda: (a) msi=none msix=none — userspace-drivers-spec §4.5 makes this function \

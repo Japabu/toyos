@@ -354,6 +354,7 @@ toyos-gpt = { path = "../toyos-gpt" }
 # a feature: a shipping kernel that compiled the crate would be declaring a
 # dependency it does not have.
 toyos-hda = { path = "../toyos-hda", optional = true }
+toyos-pci = { path = "../toyos-pci" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
 toyos-xhci = { path = "../toyos-xhci" }
