@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
-use common::{audio, compile, faults, screen, serial, stats, storage, usb};
+use common::{audio, compile, faults, hostload, screen, serial, stats, storage, usb};
 
 struct TestDef {
     name: String,
@@ -314,6 +314,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // §3.3 — a verdict that is a duration does not go in the parallel phase.
     ("dump_nmi_probe", Sched::Serial),
     ("diskless_boot", Sched::Parallel),
+    // Every verdict is a line of text or a device property, and no clock is in
+    // any of them.
+    ("virtio_net_no_msix", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
     // Its whole assertion is that a keystroke injected from the host crossed a
     // USB keyboard on the *second* controller, and `input_events_run` sends
@@ -1087,6 +1090,9 @@ struct AudioRun {
     /// the thorough tier; printed but not a verdict in the fast tier, which
     /// judges `harm` instead.
     breaches: Vec<String>,
+    /// What else the host was doing while this boot was measured. Annotation
+    /// only — nothing above or below branches on it.
+    host: hostload::HostLoad,
 }
 
 impl AudioRun {
@@ -1179,6 +1185,11 @@ fn measure_audio_run(
     // Always printed, so every run leaves comparable numbers in the log.
     let gaps = audio::gap_histogram(&analysis, wav.sample_rate);
     let counters = audio::parse_soundd_counters(&serial)?;
+    // Sampled here rather than before the boot because the load averages are
+    // trailing: a reading taken now covers the run, one taken before it covers
+    // only what preceded it. This run's own guest is still up, so `qemu 1` is
+    // the quiet reading.
+    let host = hostload::HostLoad::sample();
     eprintln!(
         "        {label}{name} smp={smp} gaps: {} (baseline {}) peak {} active {:.2}s dither {:.1}%",
         audio::format_histogram(&gaps),
@@ -1189,7 +1200,7 @@ fn measure_audio_run(
     );
     eprintln!(
         "        {label}{name} smp={smp} soundd: wake_lat {}us ({:.2} pipelines, limit {}us) \
-         drains {}/{} underruns {}/{} submitted {} wakes {} batch {} windows {}",
+         drains {}/{} underruns {}/{} submitted {} wakes {} batch {} windows {} — {host}",
         counters.max_wake_lat_us,
         counters.max_wake_lat_us as f64 / audio::PIPELINE_DEPTH_US as f64,
         baseline.counters.max_wake_lat_us,
@@ -1315,6 +1326,7 @@ fn measure_audio_run(
         counters,
         broken: problems,
         breaches,
+        host,
     })
 }
 
@@ -1479,6 +1491,9 @@ fn run_audio_gate(
         .flat_map(|name| AUDIO_SMP.iter().map(move |&smp| (*name, smp)))
         .collect();
     let mut samples: BTreeMap<String, GateSamples> = BTreeMap::new();
+    // Session-wide rather than per-config: the host is one host, and this is
+    // the sentence a re-record has to carry beside the numbers below.
+    let mut host: Vec<hostload::HostLoad> = Vec::new();
     let start = std::time::Instant::now();
 
     eprintln!(
@@ -1509,6 +1524,7 @@ fn run_audio_gate(
                           run.broken.join("; "));
                 return false;
             }
+            host.push(run.host);
             let s = samples.entry(key).or_default();
             s.max_wake_lat_us.push(run.counters.max_wake_lat_us as f64);
             s.underruns.push(run.counters.underruns as f64);
@@ -1536,6 +1552,7 @@ fn run_audio_gate(
     let (mut base_ceil_k, mut base_ceil_n) = (0, 0);
 
     eprintln!("\n[gate A] {iterations} iterations in {:.0?}. Fresh sample vs recorded sample:\n", start.elapsed());
+    eprintln!("  {}\n", hostload::summarise(&host));
     for &(name, smp) in &configs {
         let key = format!("{name}.smp{smp}");
         let base = config_baseline(audio_baseline, name, smp).sample;
@@ -5599,6 +5616,7 @@ fn run_machine_test(
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "dump_nmi_probe" => faults::dump_nmi_probe(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
+        "virtio_net_no_msix" => faults::virtio_net_no_msix(),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
         "null_sink_shipped_client" => audio::null_sink_shipped_client(test_config, c_bins, rust_bins),
