@@ -3220,6 +3220,87 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
+### The page cache owns one device, and `usb_storage.rs` says it does not
+
+`page_cache.rs:11-12` holds exactly one
+`BLOCK_DEV: Lock<Option<Box<dyn BlockDevice>>>`, `page_cache::init` takes
+ownership of the NVMe device, and `PageCache::_device_id` is written at
+construction and read nowhere. So `usb_storage.rs:14-17`'s comment — *"NVMe
+takes 1; the page cache keys itself on this, so two devices sharing a number
+would serve each other's blocks"* — describes a mechanism that does not exist.
+The numbers are right and the keying is not.
+
+`fat32_adapter.rs:911-915` states the live consequence and does not work around
+it: a machine that boots off an **internal** disk gets neither `/boot` nor
+`/log`, "because the NVMe device is owned by the page cache from the moment
+storage comes up and there is no second handle to it". `/boot` and `/log` work
+on the T14 and in QEMU only because the boot medium is USB, and
+`usb_storage::open` mints a fresh handle per call.
+
+This is the real cost of `specs/boot-image-split.md` stage 2: a bcachefs root on
+the boot medium needs a `BlockIO` over an arbitrary `BlockDevice` at a partition
+offset with a cache of its own, where `PageCacheBlockIO` *is* the NVMe device by
+construction. Found 2026-08-07 while pricing that stage — the 2026-07-29 version
+of that document listed this as one of eight items a USB storage driver would
+have to bring, and it is the one that did not arrive with it.
+
+### Nothing gates doom's music, and one commit removed the SoundFont for a cycle
+
+`assets/timgm6mb.sf2` is 5,994,284 bytes, `.gitignore` line 3 excludes it on
+purpose, and `userland/doom/src/sound.rs:511` opens it as
+`/share/timgm6mb.sf2`. `b34a69c` filtered the asset sweep to what git tracks and
+took it out of every image; the full suite was green with it and without it,
+`doom_sound_flood` included — that actuator "synthesises its own sound and never
+opens the WAD or the soundfont". The only evidence anywhere was one
+`assets: skipping` line in the build output.
+
+`fdcaa0b` restored it and made a declared-but-absent asset a hard error, so the
+*file* is gated now. What is still ungated is the **music**: nothing asserts
+doom's synthesiser produced anything, so a defect between the SoundFont and the
+sink is invisible to `cargo test`. Gate A measures the test tone and doom's
+sound-stress actuator; neither is the music path.
+
+### No test boots the config the project ships
+
+`system.toml` is what `cargo run` builds and what a stick is flashed with, and
+the harness boots none of it: `tests/testcases`, `desktopcase`,
+`desktopaudiocase`, `doomcase` and `metalcase` are each their own config, and
+`screen_diag_boot` / `screen_console_shell` boot `diag/` and `console/`. So the
+shipping image's init list, its `hosted-rustc` setting and its program list are
+exercised only by the owner running `cargo run`, which agents are told not to
+do. The one gate on that file is `no_shipped_boot_config_starts_sshd`, which
+reads it rather than booting it.
+
+Noticed 2026-08-07 while landing `hosted-rustc = false`: that change alters only
+`system.toml`, so no suite test could go red for it in either direction.
+
+### `debug = true` produces no debug info, because the linker drops it
+
+`toyos-ld` matches `SectionKind::Debug | DebugString | Linker | Note | Metadata`
+and `continue`s (`collect.rs:410-416`), so **no binary this project produces has
+a `.debug_*` section**. Verified with `readelf -S` on the kernel, the compositor
+and toybox: the sections are `.text .strtab .symtab .rela.dyn .data
+.eh_frame_hdr .dynamic .shstrtab` and nothing else.
+
+`[profile.toyos]` states `debug = true` in every crate root, so rustc emits
+DWARF into every object file and the linker throws all of it away. The cost is
+compile time and has not been measured. The consequence for diagnostics is that
+a backtrace can carry a **name** and never a line number or an inlined frame, on
+any path — `.symtab`/`.strtab` is the whole of what survives, and it is 32.2% of
+the 92,138,384 bytes of ELF this tree ships. Keeping `.debug_line` in `toyos-ld`
+is what would change that, and it is not planned.
+
+### `userland/libc` is the one guest artifact built without overflow checks
+
+`src/libc.rs` passes `--release`, so the C runtime std links into every userland
+binary has `overflow-checks` and `debug-assertions` off while everything around
+it has them on. Deliberate on two grounds — CLAUDE.md gives the POSIX
+compatibility layer explicitly relaxed rules, and `libc::build` is gated on
+`stamps::dir_changed` over the *source* directory, so changing the flag alone
+would not rebuild the installed archive and the manifest would then claim
+something the artifact does not have. Recorded so that "one profile, applied
+consistently" is not read as covering it.
+
 ### CLOSED — `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
 
 `toolchain::standing` asks `git diff --quiet main -- toyos-abi/src toyos/src

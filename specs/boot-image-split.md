@@ -356,18 +356,39 @@ not a change in kind — `main.rs:475` already asserts `!initrd.is_empty()`.
 
 ## 4. `hosted-rustc = false`
 
-`system.toml:13`. Removes 504,233,082 bytes of content — 82.56% of it — and with
-it the 79 `lib/` entries. Decided by the owner; `specs/posix-bootstrap-cost.md`
-and the self-hosting north star are what bring it back, in a `--dev-boot` image
-the owner has deferred until that work.
+`system.toml`. Removes the 79 `lib/` entries and the `bin/rustc` shim —
+504,226,197 bytes measured on the stage-4 image, 86.17% of its content. Decided
+by the owner; `specs/posix-bootstrap-cost.md` and the self-hosting north star
+are what bring it back, in a `--dev-boot` image the owner has deferred until
+that work.
 
-What has to survive: `collect_hosted_rustc` (`src/build.rs:920-996`) is only
-called under the flag, so the code path stays and nothing in the build system
-assumes the sysroot is present when it is false. `cargo test` already builds this
-way — `tests/testcases/system.toml` has no `hosted-rustc` key.
+Only the *image* changes. `toolchain::ensure` still builds the hosted rustc — it
+is keyed on `hosted-rustc.stamp` and not on `system.toml` — so
+`hosted-rustc = true` still works and costs nothing to turn back on. Stopping
+the build would mean rewriting `write_config`'s bootstrap options, which
+rebuilds the shared sysroot every worktree reads; not worth it for an artifact
+that is built once.
+
+`collect_hosted_rustc` is called only under the flag, so nothing in the build
+system assumes the sysroot is there when it is false — `cargo test` has always
+built this way, since `tests/testcases/system.toml` has no `hosted-rustc` key.
 
 `share/hello.rs` (55 bytes) exists for the hosted rustc and has no other
-consumer.
+consumer. Left in place: it is git-tracked, it is 55 bytes, and it is what
+somebody will want the moment `hosted-rustc = true` goes back on.
+
+**This stage has no gate, and that is a finding rather than an omission.**
+Nothing in the harness boots `system.toml` at all — every test config is its
+own file — so no suite test could go red for this change in either direction.
+Recorded in `known-issues.md` §6.
+
+**The flag is flipped and the image after it has not been measured.** The
+shared sysroot was claimed by another worktree for the last hour of this
+session and `--build-only` refuses under that, correctly. The figure to fill in
+is the whole-image size from `cargo run --example imgstat`; the content it must
+be consistent with is 80,894,365 bytes — the stage-4 image's 585,120,562 minus
+its 504,226,197 of toolchain — plus `create_initrd`'s 10% and the ESP's own
+metadata. **Do not write the derived number down as measured.**
 
 ## 5. The asset sweep
 

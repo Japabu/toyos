@@ -10,7 +10,7 @@ init = [
     "/bin/netd",
 ]
 
-hosted-rustc = true
+hosted-rustc = false
 assets = ["assets"]
 
 # In the directory and not in git, on purpose: 5.99 MB of SoundFont that doom
