@@ -2,7 +2,7 @@ name: runner-probe
 
 on:
   push:
-    branches: ['wt/toyos-ci']
+    branches: ['ci/probe-runner']
   workflow_dispatch:
 
 jobs:

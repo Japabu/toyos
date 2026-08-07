@@ -2,7 +2,7 @@ name: kvm-probe
 
 on:
   push:
-    branches: ['wt/toyos-ci']
+    branches: ['ci/probe-kvm']
   workflow_dispatch:
 
 jobs:
