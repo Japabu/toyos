@@ -113,6 +113,7 @@ const SHARED_BLOCK: Sched = Sched::Parallel;
 // Rust helper binaries that are spawned by tests, not tests themselves.
 const RUST_SKIP: &[&str] = &[
     "segfault_child",
+    "disk_backtrace_child",
     "test_panic_child",
     "i8042_keyboard",
     "i8042_mouse",
@@ -925,6 +926,42 @@ fn check_panic_recovery(result: &TestResult) -> bool {
     ok
 }
 
+/// The kernel names the frames of a process it loaded off a **disk**.
+///
+/// `check_panic_recovery` above asserts the same thing for a process loaded out
+/// of the initrd, and that was the only demangled-name assertion in the tree.
+/// The two paths were different code: the initrd answered
+/// `FileBacking::memory_ptr` and nothing else did, so this one produced a
+/// backtrace of bare `[exe+0x…]` offsets and no test could tell. Watch it red
+/// with `read_backtrace_table` replaced by `SymbolTable::empty_with_bounds`.
+///
+/// `null_deref_run_from_disk` is this child's alone, so a `contains` over the
+/// capture window cannot be satisfied by `segfault_child` running in the same
+/// boot.
+fn check_disk_backtrace(result: &TestResult) -> bool {
+    if !check_rust_result(result) {
+        return false;
+    }
+
+    let checks: &[(&str, &str)] = &[
+        ("SEGFAULT tid=", "expected a SEGFAULT header for the child run off /home"),
+        (
+            "null_deref_run_from_disk",
+            "expected the faulting function's demangled name — a process loaded off a disk \
+             got a backtrace with no names in it",
+        ),
+    ];
+
+    let mut ok = true;
+    for (needle, msg) in checks {
+        if !result.serial.contains(needle) {
+            eprintln!("FAIL rs::disk_backtrace: {msg}\nserial:\n{}", result.serial);
+            ok = false;
+        }
+    }
+    ok
+}
+
 /// The §6.4 tripwire must fire, and its `panicked at` must name the syscall
 /// that held the lock rather than the scheduler that caught it — which is the
 /// only thing `#[track_caller]` on `assert_baseline` buys.
@@ -985,6 +1022,7 @@ fn check_audio_idle_suspend(result: &TestResult) -> bool {
 fn check_for(name: &str) -> fn(&TestResult) -> bool {
     match name {
         "panic_recovery" => check_panic_recovery,
+        "disk_backtrace" => check_disk_backtrace,
         "audio_idle_suspend" => check_audio_idle_suspend,
         _ => check_rust_result,
     }
@@ -8517,6 +8555,9 @@ fn build_test_registry(
     for name in discover_rust_tests(rust_bins) {
         let timeout = match name.as_str() {
             "panic_recovery" => Duration::from_secs(10),
+            // Writes the child's whole image through bcachefs before it can run
+            // it, which is the only thing here that is not a spawn.
+            "disk_backtrace" => Duration::from_secs(15),
             // Its verdict is that a parked waiter woke, so the failing run is
             // the slow one: it spends its own patience before reporting, and
             // the report is worth more than the harness's timeout message.

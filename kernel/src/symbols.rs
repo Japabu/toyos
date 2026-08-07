@@ -4,10 +4,26 @@ use alloc::boxed::Box;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
 
+use crate::process::PageAlloc;
+
 /// Zero-allocation symbol table. Points directly into ELF sections in memory.
 /// Resolution is a linear scan over raw Elf64_Sym entries — O(n) but lock-free,
 /// allocation-free, and safe to call from any context including panic/double-fault.
+///
+/// **That property is the reason for the raw pointers**, and it is what decides
+/// where the bytes may come from: the resolve path is reached from the fault
+/// handler and from the panic handler, so it may not allocate, may not take a
+/// lock and may not do I/O. Everything expensive happens once, when the table
+/// is built.
 pub struct SymbolTable {
+    /// What keeps the bytes below mapped, when this table owns them.
+    ///
+    /// `None` for the kernel's own tables: they point into the ELF the
+    /// bootloader left in the direct map, which outlives every reader. A
+    /// process's tables are read off its file into these pages, so they have to
+    /// die with it — and the pointers survive the struct moving, because 2 MiB
+    /// physical pages do not move when a `Vec` header does.
+    pages: Option<PageAlloc>,
     /// Raw .symtab section data in memory.
     symtab: *const u8,
     symtab_entries: usize,
@@ -22,23 +38,14 @@ pub struct SymbolTable {
     stack_end: u64,
 }
 
-// Safety: the ELF data (initrd or kernel image) is mapped for the kernel's entire lifetime.
+// Safety: the bytes are either the kernel image, mapped for the machine's
+// lifetime, or pages this table owns and frees.
 unsafe impl Send for SymbolTable {}
 unsafe impl Sync for SymbolTable {}
 
 impl SymbolTable {
     pub fn empty() -> Self {
-        Self {
-            symtab: core::ptr::null(),
-            symtab_entries: 0,
-            strtab: core::ptr::null(),
-            strtab_len: 0,
-            base: 0,
-            prog_base: 0,
-            prog_end: 0,
-            stack_base: 0,
-            stack_end: 0,
-        }
+        Self::empty_with_bounds(0, 0, 0, 0)
     }
 
     pub fn empty_with_bounds(
@@ -46,6 +53,7 @@ impl SymbolTable {
         stack_base: u64, stack_end: u64,
     ) -> Self {
         Self {
+            pages: None,
             symtab: core::ptr::null(),
             symtab_entries: 0,
             strtab: core::ptr::null(),
@@ -55,16 +63,27 @@ impl SymbolTable {
         }
     }
 
-    pub fn from_raw(
-        symtab: *const u8, symtab_entries: usize,
-        strtab: *const u8, strtab_len: usize,
+    /// A process's tables, in pages it owns: `symtab_len` bytes of `.symtab` at
+    /// the start, `strtab_len` bytes of `.strtab` immediately after.
+    ///
+    /// Laid out by one caller, [`crate::loader::symbols::read_backtrace_table`],
+    /// which is also what read them — so the two halves cannot be given
+    /// separately and cannot disagree about where the second one starts.
+    pub fn from_pages(
+        pages: PageAlloc,
+        symtab_len: usize, entry_size: usize,
+        strtab_len: usize,
         base: u64,
         prog_base: u64, prog_end: u64,
         stack_base: u64, stack_end: u64,
     ) -> Self {
+        let start = pages.ptr();
         Self {
-            symtab, symtab_entries,
-            strtab, strtab_len,
+            symtab: start,
+            symtab_entries: symtab_len / entry_size,
+            strtab: unsafe { start.add(symtab_len) },
+            strtab_len,
+            pages: Some(pages),
             base,
             prog_base, prog_end, stack_base, stack_end,
         }
@@ -113,6 +132,7 @@ impl SymbolTable {
         let entries = symtab_size / entsize;
 
         Self {
+            pages: None,
             symtab: symtab_ptr,
             symtab_entries: entries,
             strtab: strtab_ptr,
@@ -123,6 +143,11 @@ impl SymbolTable {
             stack_base: 0,
             stack_end: 0,
         }
+    }
+
+    /// How much memory this table's bytes occupy, for the spawn log.
+    pub fn resident_bytes(&self) -> usize {
+        self.pages.as_ref().map_or(0, PageAlloc::size)
     }
 
     pub fn is_valid_user_addr(&self, addr: u64) -> bool {
