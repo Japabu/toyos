@@ -12,8 +12,9 @@
 
 use core::num::NonZeroU8;
 
+use toyos_xhci::enumerate::{self, Enumeration, Learnt, Next, Request};
 use toyos_xhci::invariants::{self, Violation};
-use toyos_xhci::job::{Await, Outcome, Outstanding};
+use toyos_xhci::job::{Await, Outstanding, Stages, CC_SUCCESS};
 use toyos_xhci::port::{Flaw, GaveUp, Gone, Nanos, PortState, Reset, Step};
 use toyos_xhci::recovery::{Act, EndpointState, NeedsConfigure, Recovery};
 use toyos_xhci::Protocol;
@@ -75,8 +76,6 @@ pub enum Answers {
     Refuses(u32),
 }
 
-/// xHCI 1.2 Table 6-90's Success.
-const SUCCESS: u32 = 1;
 
 /// How long the simulated driver waits for an answer before calling the
 /// controller silent. It stands for the kernel's own transfer budget and is not
@@ -94,6 +93,11 @@ enum What {
     /// port stays marked attached and its blocks stay claimed.
     LetGo,
     Recovering(Recovery),
+    /// One act of an enumeration. `act` travels with the sequence because what
+    /// an answer *teaches* is a function of what was asked; `trained` does
+    /// because the record the port gets at the end is about the link the
+    /// enumeration started on, which by then is several passes ago.
+    Enumerating { seq: Enumeration, act: enumerate::Act, trained: bool },
 }
 
 /// How many steps one observation may produce before the machine is declared
@@ -103,9 +107,15 @@ const STEP_BUDGET: usize = 16;
 
 pub struct Driver {
     state: PortState,
-    /// What the enumeration answers, so a scenario can stage a device the
+    /// What Enable Slot answers, so a scenario can stage a device the
     /// controller has no slot for.
     slot: Option<u8>,
+    /// The slot *this* enumeration actually got, which is `None` until Enable
+    /// Slot has answered — and stays `None` where it never did. The two are
+    /// different questions and conflating them would have a port report a slot
+    /// the controller was never asked to allocate, and a teardown then disable
+    /// it.
+    spent: Option<u8>,
     /// Ask the machine what to do from *inside* an effect it is having
     /// performed, which is what a driver that polled its own ports from within
     /// an enumeration would do. The enumeration drains the event ring, so this
@@ -114,9 +124,12 @@ pub struct Driver {
     /// Enumerate and tear down without asking whether the controller still owes
     /// an answer, which is the negative gate for the deferral.
     never_defers: bool,
-    /// Keep an endpoint recovery running after its port has gone, which is the
-    /// negative gate for the cancellation.
+    /// Keep an endpoint recovery or an enumeration running after its port has
+    /// gone, which is the negative gate for the cancellation.
     never_cancels: bool,
+    /// What the device in the port says it is, which is the one branch an
+    /// enumeration's order depends on.
+    function: enumerate::Function,
     /// Give the pool block back the instant Disable Slot is submitted, which is
     /// the negative gate for the teardown's order.
     frees_blocks_early: bool,
@@ -146,6 +159,10 @@ pub struct Driver {
     pub commands: Vec<&'static str>,
     /// Recoveries abandoned because the port they were for has gone.
     pub cancelled: usize,
+    /// Enumerations abandoned for the same reason.
+    pub abandoned: usize,
+    /// Every act an enumeration issued, in order.
+    pub acts: Vec<enumerate::Act>,
     /// Times the endpoint was handed its next transfer, which is what "the
     /// device is delivering again" means.
     pub requeues: usize,
@@ -159,9 +176,11 @@ impl Driver {
         Self {
             state: PortState::EMPTY,
             slot: Some(1),
+            spent: None,
             reenter: false,
             never_defers: false,
             never_cancels: false,
+            function: enumerate::Function::BootHid,
             frees_blocks_early: false,
             outstanding: Outstanding::EMPTY,
             owed: Vec::new(),
@@ -174,6 +193,8 @@ impl Driver {
             did: Vec::new(),
             commands: Vec::new(),
             cancelled: 0,
+            abandoned: 0,
+            acts: Vec::new(),
             requeues: 0,
             let_go: 0,
             wake_at: None,
@@ -212,6 +233,13 @@ impl Driver {
     /// Stage a caller that re-enters the machine from inside an effect.
     pub fn reentrant(mut self) -> Self {
         self.reenter = true;
+        self
+    }
+
+    /// Stage a device whose configuration descriptor names this function, which
+    /// is the one branch an enumeration's order depends on.
+    pub fn presenting(mut self, function: enumerate::Function) -> Self {
+        self.function = function;
         self
     }
 
@@ -290,6 +318,7 @@ impl Driver {
             let read = port.read();
             if !read.connected() || read.connect_changed() {
                 self.cancel_recovery();
+                self.cancel_enumeration();
             }
             // A port inside an effect a previous pass began is not decided
             // about until the controller has answered for it.
@@ -364,9 +393,13 @@ impl Driver {
                     if self.outstanding.busy() {
                         return Err(Stuck::Order(Broke::ActedWithAnAnswerOutstanding));
                     }
-                    self.did.push(Did::Enumerated { slot: self.slot, trained });
-                    self.block_held = self.slot.is_some();
-                    self.state.enumerated(self.slot.and_then(NonZeroU8::new));
+                    // Submitted and left, exactly as the teardown is: the port
+                    // stays inside the effect until the last act is answered,
+                    // and the check above catches a step taken meanwhile.
+                    let (seq, act) = Enumeration::begin();
+                    self.issue_act(seq, act, trained, now);
+                    self.wake_at = self.outstanding.wake_at();
+                    return Ok(());
                 }
             }
             port.tick(now);
@@ -406,14 +439,14 @@ impl Driver {
         let trb = self.next_trb;
         self.next_trb += 16;
         let answer = match self.answers {
-            Answers::After(delay) => Some((SUCCESS, now + delay)),
+            Answers::After(delay) => Some((CC_SUCCESS, now + delay)),
             Answers::Refuses(code) => Some((code, now)),
             Answers::Never => None,
         };
         if let Some((code, at)) = answer {
             self.owed.push((trb, code, at));
         }
-        self.outstanding.submit(what, Await::Command { trb }, now + ANSWER_DEADLINE_NS);
+        self.outstanding.submit(what, Await::Command { trb }, Stages::One, now + ANSWER_DEADLINE_NS);
     }
 
     /// Hand the controller's answers to whatever is waiting for them.
@@ -424,7 +457,7 @@ impl Driver {
                 still_owed.push((trb, code, at));
                 continue;
             }
-            self.outstanding.answered(Await::Command { trb }, code);
+            self.outstanding.answered(Await::Command { trb }, code, 0);
         }
         self.owed = still_owed;
     }
@@ -434,7 +467,7 @@ impl Driver {
         while let Some((what, outcome)) = self.outstanding.finished(now) {
             match what {
                 What::SlotGone => {
-                    if outcome == Outcome::Answered(SUCCESS) {
+                    if outcome.succeeded() {
                         self.disabled += 1;
                     }
                     // The block goes back whatever the controller said: a port
@@ -445,21 +478,60 @@ impl Driver {
                     self.state.torn_down();
                 }
                 What::LetGo => {
-                    if outcome == Outcome::Answered(SUCCESS) {
+                    if outcome.succeeded() {
                         self.disabled += 1;
                     }
                 }
                 What::Recovering(mut seq) => {
-                    if outcome != Outcome::Answered(SUCCESS) {
+                    if !outcome.succeeded() {
                         self.give_up(now);
                         continue;
                     }
                     let act = seq.completed();
                     self.issue(seq, act, now);
                 }
+                What::Enumerating { seq, act, trained } => {
+                    // A device that stopped answering ends the enumeration
+                    // where it is, and the port keeps whatever slot was spent
+                    // on it — only Disable Slot gives one back.
+                    if !outcome.succeeded() {
+                        self.enumerated(trained);
+                        continue;
+                    }
+                    if act == enumerate::Act::Command(enumerate::Command::EnableSlot) {
+                        self.spent = self.slot;
+                    }
+                    match seq.completed(self.learnt(act)) {
+                        Next::Act(seq, act) => self.issue_act(seq, act, trained, now),
+                        Next::Bind | Next::Refuse => self.enumerated(trained),
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// What the device in the port teaches the sequence about the order of what
+    /// is left. Only the configuration descriptor carries any.
+    fn learnt(&self, act: enumerate::Act) -> Learnt {
+        match act {
+            enumerate::Act::Request(Request::ConfigDescriptor) => Learnt::Function(self.function),
+            _ => Learnt::Nothing,
+        }
+    }
+
+    fn issue_act(&mut self, seq: Enumeration, act: enumerate::Act, trained: bool, now: Nanos) {
+        self.acts.push(act);
+        self.submit(What::Enumerating { seq, act, trained }, now);
+    }
+
+    /// The enumeration is over, however it went. The port records the slot,
+    /// which is what a later teardown gives back.
+    fn enumerated(&mut self, trained: bool) {
+        let slot = self.spent.take();
+        self.did.push(Did::Enumerated { slot, trained });
+        self.block_held = slot.is_some();
+        self.state.enumerated(slot.and_then(NonZeroU8::new));
     }
 
     /// Start the bound endpoint's recovery, if one is owed and the controller
@@ -526,6 +598,26 @@ impl Driver {
         }
         self.outstanding.cancel();
         self.cancelled += 1;
+    }
+
+    /// The same for an enumeration, and for the same reason — **except while
+    /// Enable Slot is the act outstanding.** Its answer *is* the slot id, so a
+    /// driver that stopped listening for it would leak a Device Slot the
+    /// controller has already allocated.
+    fn cancel_enumeration(&mut self) {
+        if self.never_cancels {
+            return;
+        }
+        let Some(What::Enumerating { act, trained, .. }) = self.outstanding.what() else {
+            return;
+        };
+        if *act == enumerate::Act::Command(enumerate::Command::EnableSlot) {
+            return;
+        }
+        let trained = *trained;
+        self.outstanding.cancel();
+        self.abandoned += 1;
+        self.enumerated(trained);
     }
 
     /// Run the port forward to `deadline`, waking whenever the machine asked to

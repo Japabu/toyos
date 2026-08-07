@@ -1,16 +1,20 @@
+use core::num::NonZeroU8;
 use core::ptr::{write_volatile, write_bytes};
 
 use crate::log;
+use toyos_xhci::enumerate::{
+    self, ep0_packet_from_descriptor, initial_ep0_packet, Act, Enumeration, Learnt, Next, Request,
+};
+use toyos_xhci::job::{Await, Outcome, Stages};
 use toyos_xhci::port::{self, Reset};
-use toyos_xhci::Protocol;
-use super::{Control, Trb, TrbRing, XhciController, PAGE};
+use super::{deadline, Answer, Trb, TrbRing, What, XhciController, PAGE};
 use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
 use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, TRB_EVALUATE_CONTEXT};
-use super::CC_SUCCESS;
+use super::{enqueue_control, CC_SUCCESS};
 
 use super::hid::{HidType, HidRole, HidDevice};
-use super::msc::MscInterface;
+use super::msc::{MscInterface, MscRings};
 
 /// How much of a configuration descriptor the driver reads and parses.
 ///
@@ -76,6 +80,7 @@ impl Endpoint {
 }
 
 /// Result of parsing a USB device's configuration descriptor for HID interfaces.
+#[derive(Clone, Copy)]
 struct HidInterfaceInfo {
     protocol: HidType,
     iface_num: u8,
@@ -87,9 +92,25 @@ struct HidInterfaceInfo {
 /// Both variants are *complete*: there is no value of this type describing an
 /// interface whose endpoints the driver has not resolved, which is why the
 /// walk below accumulates into [`Walk`] and converts once.
+#[derive(Clone, Copy)]
 enum Function {
     Hid(HidInterfaceInfo),
     Msc(MscInterface),
+}
+
+impl Function {
+    /// The same interface as far as *the order of what is left* depends on it,
+    /// which is all [`Enumeration`] is given: whether there is a boot protocol
+    /// to select, and nothing about which endpoints or which interface number.
+    fn shape(self) -> enumerate::Function {
+        match self {
+            // A tablet reports in its own format, so there is no boot protocol
+            // to ask for and asking is a request it may stall for.
+            Self::Hid(info) if info.protocol == HidType::Tablet => enumerate::Function::Hid,
+            Self::Hid(_) => enumerate::Function::BootHid,
+            Self::Msc(_) => enumerate::Function::Msc,
+        }
+    }
 }
 
 /// The same interface while the walk is still reading its endpoints.
@@ -127,52 +148,12 @@ impl Walk {
     }
 }
 
-/// EP0's Max Packet Size before the device has been asked, and `None` for a
-/// speed this driver has no encoding for.
-///
-/// Low, High and SuperSpeed each fix it — 8, 64 and 512 — and a device of that
-/// speed may report nothing else. **Full Speed does not.** `bMaxPacketSize0` is
-/// 8, 16, 32 or 64 there, and it is not known until the first eight bytes of
-/// the device descriptor have been read, which is itself a transfer over EP0.
-/// 8 is the size every full-speed device can answer at, so it is what Address
-/// Device carries and what Evaluate Context replaces once the device has said
-/// (xHCI 1.2 §4.3.4; Linux does the same in `xhci_setup_addressable_virt_dev`).
-///
-/// The old table answered 64 for Full Speed and **8 for everything it did not
-/// recognise**, so a SuperSpeedPlus port — speed 5, 6 or 7, which is every
-/// Gen 2 and every two-lane link — was addressed with a 64-fold undersized
-/// control endpoint and no line said so.
-fn initial_ep0_packet(speed: u8) -> Option<u16> {
-    match speed {
-        1 | 2 => Some(8),
-        3 => Some(64),
-        4..=7 => Some(512),
-        _ => None,
-    }
-}
-
-/// What `bMaxPacketSize0` means at this speed, or `None` when the device named
-/// a size a device of that speed does not have.
-///
-/// SuperSpeed states the *exponent*: the byte is 9 and the size is 512 (USB 3.2
-/// §9.6.1). Everything below it states the size itself, and only Full Speed has
-/// a choice to state.
-fn ep0_packet_from_descriptor(speed: u8, stated: u8) -> Option<u16> {
-    match (speed, stated) {
-        (1, 8 | 16 | 32 | 64) => Some(stated as u16),
-        (2, 8) => Some(8),
-        (3, 64) => Some(64),
-        (4..=7, 9) => Some(512),
-        _ => None,
-    }
-}
-
 /// Tell the controller the Max Packet Size of EP0 that only the device knew.
 ///
 /// Evaluate Context rather than Configure Endpoint: §4.6.7 defines it as the
 /// command that changes exactly this field on a device that is already
 /// addressed, and the A1 flag alone is what says EP0 is the context to look at.
-fn evaluate_ep0_packet(ctrl: &mut XhciController, slot_id: u8, max_packet: u16) -> bool {
+fn evaluate_ep0_trb(ctrl: &mut XhciController, slot_id: u8, max_packet: u16) -> Trb {
     let dma = ctrl.dma();
     let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
     let input_ctx_ptr = input_ctx.base();
@@ -184,7 +165,7 @@ fn evaluate_ep0_packet(ctrl: &mut XhciController, slot_id: u8, max_packet: u16) 
     let mut evaluate = Trb::ZERO;
     evaluate.param = input_ctx.phys();
     evaluate.control = TRB_EVALUATE_CONTEXT | ((slot_id as u32) << 24);
-    ctrl.run_command(evaluate, "Evaluate Context (EP0 packet size)")
+    evaluate
 }
 
 /// A little-endian 16-bit field at `at`, or 0 past the end. Descriptors are
@@ -327,56 +308,48 @@ pub fn reset_done(ctrl: &XhciController, port_idx: u8) -> bool {
     super::PORT_ANSWERS && ctrl.read_portsc(port_idx).reset_changed()
 }
 
-/// Initialize and configure one USB device on a port. `Some(slot)` is a slot
-/// the controller enabled and the driver now owns — see [`configure`].
-/// **Which reset this port needs is [`port::reset_needed`]'s answer and never a
-/// second opinion.** A machine that boots off a USB stick has that stick in the
-/// port before the scheduler exists, so a SuperSpeed fix reaching only the
-/// hot-plug path would not reach the machine it was written for.
-pub fn init_device(
-    ctrl: &mut XhciController,
+/// One device's enumeration, as everything the acts still owed will need.
+///
+/// The state travels with the wait because the pass that submitted an act gave
+/// itself back: by the time the answer arrives, the local variables the
+/// straight-line version kept this in are long gone. `issued` travels with it
+/// for the same reason [`Enumeration`] does — what an answer *means* is a
+/// function of what was asked, and nothing else holds that.
+pub(super) struct Enumerating {
     port_idx: u8,
-    protocol: Option<Protocol>,
-) -> Option<u8> {
-    let Some(kind) = port::reset_needed(protocol, ctrl.read_portsc(port_idx)) else {
-        log!("xHCI: port {} link already trained, no reset needed", port_idx + 1);
-        return configure(ctrl, port_idx);
-    };
-    reset_port(ctrl, port_idx, kind);
-
-    // A port that asserts CCS and then never finishes — a device pulled between
-    // the scan and the reset, a marginal cable, a reset the controller will not
-    // run — costs that port and not the boot. This spin had no deadline, on the
-    // boot CPU, before the scheduler exists and with nothing logged.
-    if super::settles(|| reset_done(ctrl, port_idx)) {
-        return configure(ctrl, port_idx);
-    }
-
-    // A hot reset a SuperSpeed link could not take leaves it Inactive, and
-    // §4.19.1.2.4 has exactly one way out of that. Without this the port is
-    // lost for the boot, which on the T14 is a USB-A socket that mounts
-    // nothing, two boots out of two.
-    if kind == Reset::Hot && protocol == Some(Protocol::Usb3) {
-        log!("xHCI: port {} did not take a hot reset (link {:?}); warm resetting it",
-            port_idx + 1, ctrl.read_portsc(port_idx).link_state());
-        reset_port(ctrl, port_idx, Reset::Warm);
-        if super::settles(|| reset_done(ctrl, port_idx)) {
-            return configure(ctrl, port_idx);
-        }
-    }
-    log!("xHCI: port {} never finished its reset (PORTSC {:#010x}); skipping it",
-        port_idx + 1, ctrl.read_portsc(port_idx).raw());
-    None
+    speed: u8,
+    /// The slot the controller enabled. Every refusal from here on carries it
+    /// back to the port, because only Disable Slot gives one back.
+    slot_id: u8,
+    block: usize,
+    ep0_ring: TrbRing,
+    /// EP0's Max Packet Size as the controller currently believes it.
+    packet: u16,
+    seq: Enumeration,
+    issued: Act,
+    /// The configuration value and the function the descriptor named.
+    parsed: Option<(u8, Function)>,
+    /// What Configure Endpoint named, which the bind behind it owns. Carried
+    /// rather than rebuilt: a second `TrbRing::init` would zero memory the
+    /// controller is by then reading.
+    rings: Option<Rings>,
 }
 
-/// Everything between a port that has just finished its reset and a device the
-/// driver can use.
+/// The transfer rings one device's Configure Endpoint put into the Running
+/// state, and where they came from.
+#[derive(Clone, Copy)]
+enum Rings {
+    Hid(TrbRing),
+    Msc(MscRings),
+}
+
+
+/// Acknowledge the reset, read what the port came up as, and ask for a slot.
 ///
-/// `Some(slot)` whenever the controller enabled one, **including every path
-/// that then refuses the device**: the slot is the controller's resource from
-/// that moment and only Disable Slot gives it back, so the caller has to be
-/// told about one it would otherwise have no name for.
-pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
+/// The one act that needs no device state, which is why it is here and not in
+/// [`perform`]: until the controller answers there is no slot id, no pool block
+/// and no EP0 ring.
+pub(super) fn begin(ctrl: &mut XhciController, port_idx: u8) {
     let portsc = ctrl.read_portsc(port_idx);
     ctrl.write_portsc(port_idx, portsc.neutral().acknowledging_reset());
 
@@ -384,209 +357,394 @@ pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
     if !portsc.enabled() {
         log!("xHCI: port {} reset but not enabled (PORTSC {:#010x}); skipping it",
             port_idx + 1, portsc.raw());
-        return None;
+        return finish(ctrl, port_idx, None);
     }
     let speed = portsc.speed();
     log!("xHCI: port {} enabled, speed={}", port_idx + 1, speed);
-    let Some(initial_packet) = initial_ep0_packet(speed) else {
+    let Some(packet) = initial_ep0_packet(speed) else {
         log!("xHCI: port {} came up at speed {speed}, which is not a speed this driver has a \
              control-endpoint packet size for; skipping it", port_idx + 1);
-        return None;
+        return finish(ctrl, port_idx, None);
     };
 
+    let (seq, _) = Enumeration::begin();
     let mut enable_slot = Trb::ZERO;
     enable_slot.control = TRB_ENABLE_SLOT;
-    let at = ctrl.submit_command(enable_slot);
-    let slot_id = match ctrl.wait_command(at) {
-        Some((CC_SUCCESS, slot_id)) => slot_id as u8,
-        Some((code, _)) => {
-            log!("xHCI: Enable Slot failed, code={}", code);
-            return None;
-        }
-        None => {
-            log!("xHCI: Enable Slot timed out on port {}", port_idx + 1);
-            return None;
-        }
+    let on = Await::Command { trb: ctrl.submit_command(enable_slot) };
+    let what = What::SlotWanted { port_idx, speed, packet, seq };
+    ctrl.outstanding.submit(what, on, Stages::One, deadline());
+}
+
+/// The controller answered Enable Slot. Everything after this point has a
+/// device to write for.
+pub(super) fn slot_answered(
+    ctrl: &mut XhciController,
+    port_idx: u8,
+    speed: u8,
+    packet: u16,
+    seq: Enumeration,
+    outcome: Outcome,
+) {
+    let Outcome::Command { code: CC_SUCCESS, slot: slot_id } = outcome else {
+        log!("xHCI: Enable Slot on port {}: {}", port_idx + 1, Answer(outcome));
+        return finish(ctrl, port_idx, None);
     };
     // A slot id is the controller's answer, not the driver's, and CONFIG's
     // MaxSlotsEn is only advisory to a controller that chooses to ignore it —
     // QEMU's does. Nothing of the driver's is written for this device yet, so
     // there is nothing here to unwind; the controller's own Device Slot is
-    // already allocated, which is why every `return` below this line carries
-    // the slot id back rather than dropping it.
+    // already allocated, which is why every refusal below carries the slot id
+    // back rather than dropping it.
     let Some(block) = ctrl.layout.device(slot_id) else {
         log!("xHCI: slot {} is beyond the pool's {} device blocks, dropping port {}",
             slot_id, ctrl.layout.dev_blocks, port_idx + 1);
-        return Some(slot_id);
+        return finish(ctrl, port_idx, Some(slot_id));
     };
     log!("xHCI: slot {} enabled (dma +{:#x})", slot_id, block);
 
+    let ep0_ring = TrbRing::init(ctrl.dma().subslice(block + DEV_EP0_RING, PAGE));
+    let state = Enumerating {
+        port_idx,
+        speed,
+        slot_id,
+        block,
+        ep0_ring,
+        packet,
+        seq,
+        issued: Act::Command(enumerate::Command::EnableSlot),
+        parsed: None,
+        rings: None,
+    };
+    advance(ctrl, state, Learnt::Nothing);
+}
+
+/// The controller answered the act that was outstanding. Read what it says,
+/// and either carry on or leave the port with whatever it has spent.
+pub(super) fn stepped(ctrl: &mut XhciController, mut state: Enumerating, outcome: Outcome) {
+    let port = state.port_idx + 1;
+    let learnt = match state.issued {
+        Act::Command(cmd) => {
+            if !outcome.succeeded() {
+                log!("xHCI: {} on port {port}: {}", command_name(cmd), Answer(outcome));
+                return finish(ctrl, state.port_idx, Some(state.slot_id));
+            }
+            match cmd {
+                enumerate::Command::AddressDevice => log!("xHCI: device addressed"),
+                enumerate::Command::ConfigureEndpoint => log!("xHCI: endpoint configured"),
+                enumerate::Command::EnableSlot | enumerate::Command::EvaluateEp0 => {}
+            }
+            Learnt::Nothing
+        }
+        // SET_PROTOCOL is the one request a device may refuse without being
+        // refused for it: the interface said it has a boot protocol, and a
+        // device that will not select it still reports in the format its
+        // descriptors promised often enough to be worth binding.
+        Act::Request(Request::SetProtocol) => {
+            if !outcome.succeeded() {
+                log!("xHCI: SET_PROTOCOL on port {port}: {}", Answer(outcome));
+            }
+            Learnt::Nothing
+        }
+        Act::Request(request) => {
+            let want = match request {
+                Request::DeviceDescriptor { want } => want,
+                Request::ConfigDescriptor => MAX_CONFIG_DESC as u16,
+                Request::SetConfiguration | Request::SetProtocol => 0,
+            };
+            let Some(delivered) = delivered(outcome, want) else {
+                log!("xHCI: {} on port {port}: {}", request_name(request), Answer(outcome));
+                return finish(ctrl, state.port_idx, Some(state.slot_id));
+            };
+            match read_back(ctrl, &mut state, request, delivered) {
+                Ok(learnt) => learnt,
+                Err(()) => return finish(ctrl, state.port_idx, Some(state.slot_id)),
+            }
+        }
+    };
+    advance(ctrl, state, learnt);
+}
+
+/// Ask the sequence what is owed next and do it.
+fn advance(ctrl: &mut XhciController, state: Enumerating, learnt: Learnt) {
+    match state.seq.completed(learnt) {
+        Next::Act(seq, act) => perform(ctrl, Enumerating { seq, ..state }, act),
+        Next::Bind => bind(ctrl, state),
+        Next::Refuse => {
+            log!("xHCI: no HID boot interface found on port {}, skipping it",
+                state.port_idx + 1);
+            finish(ctrl, state.port_idx, Some(state.slot_id))
+        }
+    }
+}
+
+/// Submit one act and record that the controller owes an answer for it.
+fn perform(ctrl: &mut XhciController, mut state: Enumerating, act: Act) {
+    state.issued = act;
+    let submitted = match act {
+        Act::Command(cmd) => command(ctrl, &mut state, cmd)
+            .map(|trb| (Await::Command { trb: ctrl.submit_command(trb) }, Stages::One)),
+        Act::Request(request) => Some(control(ctrl, &mut state, request)),
+    };
+    let Some((on, stages)) = submitted else {
+        return finish(ctrl, state.port_idx, Some(state.slot_id));
+    };
+    ctrl.outstanding.submit(What::Enumerating(state), on, stages, deadline());
+}
+
+/// The TRB for one command act, or `None` where the driver has no room to
+/// perform it and has said so.
+fn command(
+    ctrl: &mut XhciController,
+    state: &mut Enumerating,
+    cmd: enumerate::Command,
+) -> Option<Trb> {
+    match cmd {
+        // Answered in `begin`, which is where the sequence starts; it is never
+        // asked for again.
+        enumerate::Command::EnableSlot => None,
+        enumerate::Command::AddressDevice => Some(address_device_trb(ctrl, state)),
+        enumerate::Command::EvaluateEp0 => {
+            Some(evaluate_ep0_trb(ctrl, state.slot_id, state.packet))
+        }
+        enumerate::Command::ConfigureEndpoint => configure_endpoint_trb(ctrl, state),
+    }
+}
+
+/// Put one control request on the device's EP0 ring and say what ends it.
+///
+/// **A request with a data stage is two completions**, because the data stage
+/// carries IOC so the driver can learn how many bytes arrived — and
+/// [`enqueue_control`] already answers exactly that question, so the two cannot
+/// disagree.
+fn control(
+    ctrl: &mut XhciController,
+    state: &mut Enumerating,
+    request: Request,
+) -> (Await, Stages) {
     let dma = ctrl.dma();
-    let mut ep0_ring = TrbRing::init(dma.subslice(block + DEV_EP0_RING, PAGE));
+    let scratch = dma.phys() + OFF_DATA_BUF as u64;
+    let (bm_request_type, b_request, w_value, w_index, data, len) = match request {
+        Request::DeviceDescriptor { want } => (0x80, 0x06, 0x0100, 0, Some(scratch), want),
+        Request::ConfigDescriptor => {
+            (0x80, 0x06, 0x0200, 0, Some(scratch), MAX_CONFIG_DESC as u16)
+        }
+        Request::SetConfiguration => {
+            let (config_val, _) = state.parsed.expect("a configuration named a function");
+            (0x00, 0x09, config_val as u16, 0, None, 0)
+        }
+        Request::SetProtocol => {
+            let iface = match state.parsed {
+                Some((_, Function::Hid(info))) => info.iface_num,
+                _ => unreachable!("only a HID interface has a boot protocol to select"),
+            };
+            (0x21, 0x0B, 0, iface as u16, None, 0)
+        }
+    };
+    // The scratch is one page shared by every enumeration, and enumeration is
+    // serial: the slot holds one operation and a port inside an effect is not
+    // decided about. Zeroed before each read so a short answer leaves zeroes
+    // behind it rather than the last device's descriptor.
+    if data.is_some() {
+        unsafe { write_bytes(dma.ptr_at(OFF_DATA_BUF), 0, MAX_CONFIG_DESC); }
+    }
+    let has_data = enqueue_control(
+        &mut state.ep0_ring, bm_request_type, b_request, w_value, w_index, data, len,
+    );
+    ctrl.ring_doorbell(state.slot_id, 1);
+    let stages = if has_data { Stages::DataThenStatus } else { Stages::One };
+    (Await::Transfer { slot: state.slot_id, dci: 1 }, stages)
+}
+
+/// What one control request that completed left in the scratch page, and what
+/// the order of the rest of the sequence takes from it. `Err` is a device this
+/// driver will not bind, already said so.
+fn read_back(
+    ctrl: &mut XhciController,
+    state: &mut Enumerating,
+    request: Request,
+    delivered: u16,
+) -> Result<Learnt, ()> {
+    let port = state.port_idx + 1;
+    let buf = ctrl.dma().ptr_at(OFF_DATA_BUF);
+    match request {
+        Request::DeviceDescriptor { want: 8 } => {
+            if delivered < 8 {
+                log!("xHCI: port {port} would not give up the first 8 bytes of its device \
+                     descriptor: {delivered} B delivered");
+                return Err(());
+            }
+            let stated = unsafe { *buf.add(7) };
+            let Some(ep0_packet) = ep0_packet_from_descriptor(state.speed, stated) else {
+                log!("xHCI: port {port} states bMaxPacketSize0={stated}, which is not a control \
+                     packet size a speed-{} device has; skipping it", state.speed);
+                return Err(());
+            };
+            if ep0_packet == state.packet {
+                return Ok(Learnt::Nothing);
+            }
+            log!("xHCI: port {port} EP0 packet size {} -> {ep0_packet}", state.packet);
+            state.packet = ep0_packet;
+            Ok(Learnt::Ep0PacketWrong)
+        }
+        Request::DeviceDescriptor { .. } => {
+            if delivered < 18 {
+                log!("xHCI: GET_DESCRIPTOR(Device) on port {port}: {delivered} B delivered");
+                return Err(());
+            }
+            let descriptor = unsafe { core::slice::from_raw_parts(buf, 18) };
+            log!("xHCI: device class={:#x} vendor={:04x} product={:04x}",
+                descriptor[4], le16(descriptor, 8), le16(descriptor, 10));
+            Ok(Learnt::Nothing)
+        }
+        // Nine bytes is a configuration descriptor's own header, which is where
+        // `wTotalLength` lives; fewer than that is not one. The parser is then
+        // bounded by what *arrived* rather than by what was asked for, so the
+        // zeroes behind a short answer are never walked as descriptors.
+        Request::ConfigDescriptor => {
+            if delivered < 9 {
+                log!("xHCI: port {port} answered {delivered} B to GET_DESCRIPTOR(Config); a \
+                     configuration descriptor is at least 9", );
+                return Err(());
+            }
+            let config = unsafe { core::slice::from_raw_parts(buf, delivered as usize) };
+            let Some((config_val, function)) = parse_config(config) else {
+                return Ok(Learnt::Nothing);
+            };
+            match function {
+                Function::Msc(msc) => log!("xHCI: mass storage iface={} in={:#x}/{} out={:#x}/{}",
+                    msc.iface_num, msc.in_ep.addr, msc.in_ep.max_packet,
+                    msc.out_ep.addr, msc.out_ep.max_packet),
+                Function::Hid(info) => log!("xHCI: HID {} iface={} ep={:#x} max_pkt={} \
+                     interval={} dci={}", hid_kind(info.protocol), info.iface_num, info.ep.addr,
+                    info.ep.max_packet, info.ep.interval, info.ep.dci()),
+            }
+            state.parsed = Some((config_val, function));
+            Ok(Learnt::Function(function.shape()))
+        }
+        Request::SetConfiguration => {
+            log!("xHCI: configuration set");
+            Ok(Learnt::Nothing)
+        }
+        Request::SetProtocol => Ok(Learnt::Nothing),
+    }
+}
+
+/// The bytes a control request moved, and `None` where it did not complete.
+///
+/// The completion code cannot say on its own: the status stage reports Success
+/// whether the data stage filled the buffer or left it untouched, which is how
+/// a T14 port that answered no descriptor at all was logged as `class=0x0
+/// vendor=0000 product=0000`.
+fn delivered(outcome: Outcome, want: u16) -> Option<u16> {
+    let Outcome::Transfer { code: CC_SUCCESS, residue } = outcome else { return None };
+    // A residue past the length asked for is a controller contradicting itself;
+    // believing it would report more bytes delivered than the buffer holds.
+    Some(want.saturating_sub(residue.min(u16::MAX as u32) as u16))
+}
+
+fn command_name(cmd: enumerate::Command) -> &'static str {
+    match cmd {
+        enumerate::Command::EnableSlot => "Enable Slot",
+        enumerate::Command::AddressDevice => "Address Device",
+        enumerate::Command::EvaluateEp0 => "Evaluate Context (EP0 packet size)",
+        enumerate::Command::ConfigureEndpoint => "Configure Endpoint",
+    }
+}
+
+fn request_name(request: Request) -> &'static str {
+    match request {
+        Request::DeviceDescriptor { want: 8 } => "GET_DESCRIPTOR(Device, 8)",
+        Request::DeviceDescriptor { .. } => "GET_DESCRIPTOR(Device)",
+        Request::ConfigDescriptor => "GET_DESCRIPTOR(Config)",
+        Request::SetConfiguration => "SET_CONFIGURATION",
+        Request::SetProtocol => "SET_PROTOCOL",
+    }
+}
+
+fn hid_kind(protocol: HidType) -> &'static str {
+    match protocol {
+        HidType::Keyboard => "keyboard",
+        HidType::Mouse => "mouse",
+        HidType::Tablet => "tablet",
+    }
+}
+
+/// The Address Device command, with the slot and control endpoint this device
+/// is about to be known by.
+fn address_device_trb(ctrl: &mut XhciController, state: &Enumerating) -> Trb {
+    let dma = ctrl.dma();
     let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
     let input_ctx_ptr = input_ctx.base();
-    let input_ctx_phys = input_ctx.phys();
     unsafe { input_ctx.zero(); }
 
     ctrl.write_ctx32(input_ctx_ptr, 0, 1, 0x3); // Add Slot + EP0
-    let slot_dw0 = ((speed as u32) << 20) | (1u32 << 27);
+    let slot_dw0 = ((state.speed as u32) << 20) | (1u32 << 27);
     ctrl.write_ctx32(input_ctx_ptr, 1, 0, slot_dw0);
-    ctrl.write_ctx32(input_ctx_ptr, 1, 1, (port_idx as u32 + 1) << 16);
+    ctrl.write_ctx32(input_ctx_ptr, 1, 1, (state.port_idx as u32 + 1) << 16);
 
-    let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((initial_packet as u32) << 16);
+    let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((state.packet as u32) << 16);
     ctrl.write_ctx32(input_ctx_ptr, 2, 1, ep0_dw1);
-    let ep0_dequeue = ep0_ring.dequeue();
+    let ep0_dequeue = state.ep0_ring.dequeue();
     ctrl.write_ctx32(input_ctx_ptr, 2, 2, ep0_dequeue as u32);
     ctrl.write_ctx32(input_ctx_ptr, 2, 3, (ep0_dequeue >> 32) as u32);
     ctrl.write_ctx32(input_ctx_ptr, 2, 4, 8);
 
-    let out_ctx = dma.subslice(block + DEV_OUT_CTX, PAGE / 2);
+    let out_ctx = dma.subslice(state.block + DEV_OUT_CTX, PAGE / 2);
     unsafe { out_ctx.zero(); }
     unsafe {
         let dcbaa = dma.ptr_at(OFF_DCBAA) as *mut u64;
-        write_volatile(dcbaa.add(slot_id as usize), out_ctx.phys());
+        write_volatile(dcbaa.add(state.slot_id as usize), out_ctx.phys());
     }
 
     let mut addr_dev = Trb::ZERO;
-    addr_dev.param = input_ctx_phys;
-    addr_dev.control = TRB_ADDRESS_DEVICE | ((slot_id as u32) << 24);
-    if !ctrl.run_command(addr_dev, "Address Device") {
-        return Some(slot_id);
-    }
-    log!("xHCI: device addressed");
+    addr_dev.param = input_ctx.phys();
+    addr_dev.control = TRB_ADDRESS_DEVICE | ((state.slot_id as u32) << 24);
+    addr_dev
+}
 
-    // Descriptor scratch, and shared for the same reason the input context is:
-    // it is dead the moment this function returns. The report buffer below is
-    // the one that is not, so it lives in the device's own block.
-    let data_buf = dma.subslice(OFF_DATA_BUF, PAGE);
-    let data_buf_ptr = data_buf.base();
-    let data_buf_phys = data_buf.phys();
-
-    // Eight bytes, and only eight. `bMaxPacketSize0` is the eighth of them and
-    // on a full-speed device it is what decides whether a longer read can be
-    // transferred at all — so the prefix is read at a size every device of the
-    // speed can answer at and the endpoint context is corrected before the rest
-    // of the descriptor is asked for.
-    unsafe { write_bytes(data_buf_ptr, 0, MAX_CONFIG_DESC); }
-    let got = ctrl.control_transfer(
-        slot_id, &mut ep0_ring, 0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 8,
-    );
-    if !got.moved(8) {
-        log!("xHCI: port {} would not give up the first 8 bytes of its device descriptor: {got}",
-            port_idx + 1);
-        return Some(slot_id);
-    }
-    let stated = unsafe { *data_buf_ptr.add(7) };
-    let Some(ep0_packet) = ep0_packet_from_descriptor(speed, stated) else {
-        log!("xHCI: port {} states bMaxPacketSize0={stated}, which is not a control packet size a \
-             speed-{speed} device has; skipping it", port_idx + 1);
-        return Some(slot_id);
+/// The Configure Endpoint command for whichever function this device is, with
+/// the transfer rings it will run recorded on the way through.
+///
+/// `None` where the driver has no room for the device — a disk past the pool's
+/// mass-storage blocks — which is a refusal and not a failure of the command.
+fn configure_endpoint_trb(ctrl: &mut XhciController, state: &mut Enumerating) -> Option<Trb> {
+    let (_, function) = state.parsed.expect("a configuration named a function");
+    let rings = match function {
+        Function::Hid(info) => Rings::Hid(hid_input_context(ctrl, state, &info)),
+        Function::Msc(info) => Rings::Msc(super::msc::prepare(
+            ctrl, state.slot_id, state.speed, state.port_idx, &info,
+        )?),
     };
-    if ep0_packet != initial_packet {
-        log!("xHCI: port {} EP0 packet size {initial_packet} -> {ep0_packet}", port_idx + 1);
-        if !evaluate_ep0_packet(ctrl, slot_id, ep0_packet) {
-            return Some(slot_id);
-        }
-    }
+    state.rings = Some(rings);
 
-    unsafe { write_bytes(data_buf_ptr, 0, MAX_CONFIG_DESC); }
-    let got = ctrl.control_transfer(
-        slot_id, &mut ep0_ring, 0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 18,
-    );
-    if !got.moved(18) {
-        log!("xHCI: GET_DESCRIPTOR(Device) on port {}: {got}", port_idx + 1);
-        return Some(slot_id);
-    }
-    let descriptor = unsafe { core::slice::from_raw_parts(data_buf_ptr, 18) };
-    log!("xHCI: device class={:#x} vendor={:04x} product={:04x}",
-        descriptor[4], le16(descriptor, 8), le16(descriptor, 10));
+    let mut configure = Trb::ZERO;
+    configure.param = ctrl.dma().subslice(OFF_INPUT_CTX, PAGE).phys();
+    configure.control = TRB_CONFIGURE_EP | ((state.slot_id as u32) << 24);
+    Some(configure)
+}
 
-    unsafe { write_bytes(data_buf_ptr, 0, MAX_CONFIG_DESC); }
-    let got = ctrl.control_transfer(
-        slot_id, &mut ep0_ring, 0x80, 0x06, 0x0200, 0,
-        Some(data_buf_phys), MAX_CONFIG_DESC as u16,
-    );
-    // Nine bytes is a configuration descriptor's own header, which is where
-    // `wTotalLength` lives; fewer than that is not one. The parser is then
-    // bounded by what *arrived* rather than by what was asked for, so the
-    // zeroes behind a short answer are never walked as descriptors.
-    let Control::Done { delivered } = got else {
-        log!("xHCI: GET_DESCRIPTOR(Config) on port {}: {got}", port_idx + 1);
-        return Some(slot_id);
-    };
-    if delivered < 9 {
-        log!("xHCI: port {} answered {delivered} B to GET_DESCRIPTOR(Config); a configuration \
-             descriptor is at least 9", port_idx + 1);
-        return Some(slot_id);
-    }
-    let config = unsafe { core::slice::from_raw_parts(data_buf_ptr, delivered as usize) };
-
-    let (config_val, function) = match parse_config(config) {
-        Some(f) => f,
-        None => {
-            log!("xHCI: no HID boot interface found, skipping");
-            return Some(slot_id);
-        }
-    };
-
-    let set = ctrl.control_transfer(
-        slot_id, &mut ep0_ring, 0x00, 0x09, config_val as u16, 0, None, 0,
-    );
-    if !set.done() {
-        log!("xHCI: SET_CONFIGURATION on port {}: {set}", port_idx + 1);
-        return Some(slot_id);
-    }
-    log!("xHCI: configuration set");
-
-    let info = match function {
-        Function::Msc(msc) => {
-            log!("xHCI: mass storage iface={} in={:#x}/{} out={:#x}/{}",
-                msc.iface_num, msc.in_ep.addr, msc.in_ep.max_packet,
-                msc.out_ep.addr, msc.out_ep.max_packet);
-            super::msc::bind(ctrl, ep0_ring, slot_id, block, speed, port_idx, &msc);
-            return Some(slot_id);
-        }
-        Function::Hid(info) => info,
-    };
-
-    let kind = match info.protocol {
-        HidType::Keyboard => "keyboard",
-        HidType::Mouse => "mouse",
-        HidType::Tablet => "tablet",
-    };
+/// The input context for one HID interrupt endpoint, and the ring it runs on.
+fn hid_input_context(
+    ctrl: &mut XhciController,
+    state: &Enumerating,
+    info: &HidInterfaceInfo,
+) -> TrbRing {
+    let dma = ctrl.dma();
     let int_ep_dci = info.ep.dci();
-    log!("xHCI: HID {} iface={} ep={:#x} max_pkt={} interval={} dci={}",
-        kind, info.iface_num, info.ep.addr, info.ep.max_packet, info.ep.interval, int_ep_dci);
-
-    // SET_PROTOCOL (boot protocol) — only for boot-interface devices
-    if info.protocol != HidType::Tablet {
-        let set = ctrl.control_transfer(
-            slot_id, &mut ep0_ring, 0x21, 0x0B, 0, info.iface_num as u16, None, 0,
-        );
-        if !set.done() {
-            log!("xHCI: SET_PROTOCOL on port {}: {set}", port_idx + 1);
-        }
-    }
-
-    let report = dma.subslice(block + DEV_REPORT, 8);
-    let report_phys = report.phys();
-    let report_ptr = report.base();
-
-    let int_ring = TrbRing::init(dma.subslice(block + DEV_INT_RING, PAGE));
+    let int_ring = TrbRing::init(dma.subslice(state.block + DEV_INT_RING, PAGE));
 
     let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
     let input_ctx_ptr = input_ctx.base();
-    let input_ctx_phys = input_ctx.phys();
     unsafe { input_ctx.zero(); }
 
     ctrl.write_ctx32(input_ctx_ptr, 0, 1, (1u32 << (int_ep_dci as u32)) | 1);
 
-    let slot_dw0 = ((speed as u32) << 20) | ((int_ep_dci as u32) << 27);
+    let slot_dw0 = ((state.speed as u32) << 20) | ((int_ep_dci as u32) << 27);
     ctrl.write_ctx32(input_ctx_ptr, 1, 0, slot_dw0);
-    ctrl.write_ctx32(input_ctx_ptr, 1, 1, (port_idx as u32 + 1) << 16);
+    ctrl.write_ctx32(input_ctx_ptr, 1, 1, (state.port_idx as u32 + 1) << 16);
 
     let ep_ctx_index = int_ep_dci as usize + 1;
-    let interval_val = if info.ep.interval == 0 { 0u32 } else if speed <= 2 {
+    let interval_val = if info.ep.interval == 0 { 0u32 } else if state.speed <= 2 {
         let frames = (info.ep.interval as u32) * 8;
         let mut exp = 0u32;
         let mut v = frames;
@@ -614,15 +772,36 @@ pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
     // packet size, which is what Linux's `xhci_endpoint_init` writes.
     let esit = info.ep.max_packet as u32;
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 4, (esit << 16) | esit);
+    int_ring
+}
 
-    let mut config_ep = Trb::ZERO;
-    config_ep.param = input_ctx_phys;
-    config_ep.control = TRB_CONFIGURE_EP | ((slot_id as u32) << 24);
-    if !ctrl.run_command(config_ep, "Configure Endpoint") {
-        return Some(slot_id);
+/// Everything class-specific, which is where this sequence stops and the
+/// device's own driver starts.
+fn bind(ctrl: &mut XhciController, state: Enumerating) {
+    let (_, function) = state.parsed.expect("a configuration named a function");
+    let rings = state.rings.expect("Configure Endpoint named this device's rings");
+    match (function, rings) {
+        (Function::Msc(info), Rings::Msc(msc)) => {
+            super::msc::bind(ctrl, state.ep0_ring, state.slot_id, state.block, msc, &info);
+        }
+        (Function::Hid(info), Rings::Hid(int_ring)) => {
+            bind_hid(ctrl, &state, &info, int_ring);
+        }
+        // The rings are built from the function two acts earlier and nothing
+        // between the two can change it, so a mismatch is a driver that lost
+        // track of which device it is enumerating.
+        _ => unreachable!("the rings were built for another function"),
     }
-    log!("xHCI: endpoint configured");
+    finish(ctrl, state.port_idx, Some(state.slot_id));
+}
 
+fn bind_hid(
+    ctrl: &mut XhciController,
+    state: &Enumerating,
+    info: &HidInterfaceInfo,
+    int_ring: TrbRing,
+) {
+    let report = ctrl.dma().subslice(state.block + DEV_REPORT, 8);
     let report_size = match info.protocol {
         HidType::Keyboard => 8,
         HidType::Mouse => 4,
@@ -637,21 +816,21 @@ pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
             Some(source) => HidRole::Pointer(source),
             None => {
                 log!("xHCI: slot {} is past the pointers this machine can number, dropping it",
-                    slot_id);
-                return Some(slot_id);
+                    state.slot_id);
+                return;
             }
         },
     };
     let mut dev = HidDevice {
-        slot_id,
-        port_idx,
-        block,
-        int_ep_dci,
+        slot_id: state.slot_id,
+        port_idx: state.port_idx,
+        block: state.block,
+        int_ep_dci: info.ep.dci(),
         ep_addr: info.ep.addr,
         int_ring,
-        ep0_ring,
-        report_phys,
-        report_ptr,
+        ep0_ring: state.ep0_ring,
+        report_phys: report.phys(),
+        report_ptr: report.base(),
         report_size,
         role,
         prev_report: [0; 8],
@@ -665,58 +844,55 @@ pub fn configure(ctrl: &mut XhciController, port_idx: u8) -> Option<u8> {
     // The ring offset is in the line because two devices of one class landing
     // on one ring is invisible from every other angle: both still enumerate,
     // both still bind, and both still deliver until their TRBs interleave.
-    log!("xHCI: USB {} ready on slot {}, int_ring +{:#x}", kind, slot_id, block + DEV_INT_RING);
+    log!("xHCI: USB {} ready on slot {}, int_ring +{:#x}",
+        hid_kind(info.protocol), state.slot_id, state.block + DEV_INT_RING);
     // The same argument one level up, and the only place the merge is visible:
     // two pointers on two controllers both have a slot 1, so a source derived
     // from the slot id would be one entry and each report would publish the
     // other device's buttons as released.
     if let HidRole::Pointer(source) = dev.role {
-        log!("xHCI: pointer on slot {} merges as source {}", slot_id, source.id());
+        log!("xHCI: pointer on slot {} merges as source {}", state.slot_id, source.id());
     }
     ctrl.devices.push(dev);
-    Some(slot_id)
 }
 
-/// Scan all ports on the controller and initialize connected devices.
-/// Enumeration is serial by construction, which is what lets the input
-/// context, the EP0 ring and the descriptor buffer be one each. Serial does not
-/// mean quiet: a device bound on an earlier port is armed and delivering while
-/// a later port enumerates, so the event ring carries its completions too and
-/// both waits demux by slot id rather than by TRB type alone.
+/// The enumeration is over, however it went.
 ///
-/// The root hubs must have settled first — [`super::await_connect_settle`] is
-/// what makes `PORTSC.CCS` a question with an answer.
-pub fn scan_ports(ctrl: &mut XhciController) {
-    for p in 0..ctrl.max_ports {
-        // No speed here, deliberately: §4.19.5 says the Port Speed field "shall
-        // not be considered valid by software until after the PR bit transitions
-        // from a '1' to a '0'". QEMU fills it in from the QOM tree before any
-        // reset, so a line printing it here reads as fact on QEMU and as noise
-        // on hardware. The `port N enabled, speed=` line below is the valid one, and it says
-        // enabled rather than reset because a SuperSpeed port reaches this
-        // without one.
-        if ctrl.read_portsc(p).connected() {
-            log!("xHCI: port {} connected", p + 1);
-            let slot = init_device(ctrl, p, ctrl.protocols.of(p));
-            ctrl.port_bound(p, slot);
-        }
+/// `slot` is recorded **including on every path that then refused the device**:
+/// the slot is the controller's resource from the moment Enable Slot answers
+/// and only Disable Slot gives it back, so a port that forgot one would leak it
+/// for the life of the boot.
+///
+/// The acknowledge is the port's own change flags — not PRC, which `begin`
+/// cleared, but any flag left set on a port that is now quiet: the next thing
+/// to happen here is the device being pulled, and a CSC that is already '1' is
+/// a disconnect the controller cannot report.
+pub(super) fn finish(ctrl: &mut XhciController, port_idx: u8, slot: Option<u8>) {
+    ctrl.ports[port_idx as usize].enumerated(slot.and_then(NonZeroU8::new));
+    ctrl.acknowledge_port_read(port_idx);
+}
+
+/// Drop an enumeration outstanding for a port whose device has gone, for the
+/// reason a recovery is dropped: the device it is talking to will not answer,
+/// and the teardown behind it would spend a deadline per remaining act finding
+/// that out. The slot goes to the port, which is what makes the teardown
+/// disable it.
+///
+/// The Enable Slot that has not answered yet is deliberately left alone: its
+/// answer *is* the slot id, and a driver that stopped listening for it would
+/// leak a Device Slot the controller has already allocated.
+pub(super) fn cancel_on(ctrl: &mut XhciController, port_idx: u8) {
+    let Some(What::Enumerating(state)) = ctrl.outstanding.what() else { return };
+    if state.port_idx != port_idx {
+        return;
     }
-    // Every change bit the scan left set, on every port. A change flag is what
-    // *raises* a Port Status Change Event, and it raises one only as it goes
-    // from 0 to 1 — so a CSC still set from the boot-time attach is a
-    // disconnect the controller has no way to report, and the first thing
-    // unplugged after boot would go unnoticed.
-    ctrl.acknowledge_port_changes();
-    // A device bound on an earlier port is armed and delivering while a later
-    // one enumerates, so its completions arrive inside `configure`'s own
-    // `wait_transfer` — and a broken one is recorded there rather than acted on.
-    // Nothing else would come back for it: an endpoint holding no TRB raises no
-    // further interrupt, so without this a device whose *first* transfer failed
-    // during the boot scan would stay recorded and silent for the whole boot.
-    ctrl.settle_recoveries();
-    #[cfg(feature = "xhci-portsc-rw1c")]
-    log!("xHCI: PED as RW1C, {} port(s) disabled by a driver write",
-        ctrl.software_disabled_ports());
+    let slot_id = state.slot_id;
+    ctrl.outstanding.cancel();
+    log!("xHCI: the enumeration on port {} is abandoned; its device has gone", port_idx + 1);
+    // The slot and nothing else. [`finish`]'s acknowledge would clear the very
+    // change flag that brought the caller here, and the teardown behind this
+    // decides what a port means from exactly that word.
+    ctrl.ports[port_idx as usize].enumerated(NonZeroU8::new(slot_id));
 }
 
 /// Configuration descriptors no device in reach will hand us.
