@@ -14,6 +14,7 @@ use crate::io_uring::RingId;
 use crate::process::Pid;
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
+use crate::user_ptr::{UserBytes, UserBytesMut};
 use crate::DirectMap;
 
 // PipeId — raw identifier, Copy, used internally for lookups and in
@@ -239,11 +240,17 @@ pub fn map_page(pipe_id: PipeId) -> Option<DirectMap> {
     with_pipes_mut(|pipes| Some(pipes.get_mut(pipe_id)?.back()?.page.direct_map()))
 }
 
-pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
+pub fn try_read(pipe_id: PipeId, buf: &mut UserBytesMut) -> Option<usize> {
     let (result, boost) = with_pipes_mut(|pipes| {
         let Some(pipe) = pipes.get_mut(pipe_id) else { return (None, false) };
         if pipe.available() > 0 {
-            let n = pipe.backing.as_mut().expect("available() > 0 implies a ring").ring.read(buf);
+            let len = buf.len();
+            let n = pipe
+                .backing
+                .as_mut()
+                .expect("available() > 0 implies a ring")
+                .ring
+                .read(len, |off, src| buf.write_at(off, src));
             let boost = pipe.rt_boost_pending;
             pipe.rt_boost_pending = false;
             (Some(n), boost)
@@ -270,7 +277,7 @@ pub enum PipeWrite {
     NoMemory,
 }
 
-pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
+pub fn try_write(pipe_id: PipeId, buf: &UserBytes) -> Option<PipeWrite> {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id)?;
         if pipe.readers == 0 {
@@ -280,7 +287,7 @@ pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
             return Some(PipeWrite::NoMemory);
         };
         if backing.ring.space() > 0 {
-            Some(PipeWrite::Wrote(backing.ring.write(buf)))
+            Some(PipeWrite::Wrote(backing.ring.write(buf.len(), |off, dst| buf.read_at(off, dst))))
         } else {
             None
         }

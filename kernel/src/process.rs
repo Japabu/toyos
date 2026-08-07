@@ -289,10 +289,16 @@ impl ThreadLocation {
 
 // ProcessEntry + ThreadEntry — hierarchical process/thread table
 
+/// How much of a process or thread name the table keeps.
+///
+/// Fixed by the `SYS_SYSINFO` record's name field, which is the syscall that
+/// exists to report it: anything longer would not survive being asked for.
+pub const THREAD_NAME_LEN: usize = 28;
+
 /// Per-thread metadata. Tid is the HashMap key in ProcessEntry.threads.
 pub struct ThreadEntry {
     state: ThreadLocation,
-    name: [u8; 28],
+    name: [u8; THREAD_NAME_LEN],
     thread_data: Arc<Lock<ThreadData>>,
     /// The thread's scheduler faces (rendezvous word + published counters).
     /// `None` only between the table insert that allocates the tid and the
@@ -302,7 +308,7 @@ pub struct ThreadEntry {
 
 impl ThreadEntry {
     pub fn new(thread_data: Arc<Lock<ThreadData>>) -> Self {
-        Self { state: ThreadLocation::Scheduled, name: [0u8; 28], thread_data, sched: None }
+        Self { state: ThreadLocation::Scheduled, name: [0u8; THREAD_NAME_LEN], thread_data, sched: None }
     }
     pub fn set_sched(&mut self, sched: ThreadSched) {
         assert!(self.sched.is_none(), "thread already has a scheduler record");
@@ -310,13 +316,13 @@ impl ThreadEntry {
     }
     pub fn sched(&self) -> Option<&ThreadSched> { self.sched.as_ref() }
     pub fn state(&self) -> ThreadLocation { self.state }
-    pub fn name(&self) -> &[u8; 28] { &self.name }
+    pub fn name(&self) -> &[u8; THREAD_NAME_LEN] { &self.name }
     pub fn name_str(&self) -> &str {
         core::str::from_utf8(&self.name).unwrap_or("?").trim_end_matches('\0')
     }
     pub fn set_name(&mut self, name: &[u8]) {
-        self.name = [0u8; 28];
-        let len = name.len().min(28);
+        self.name = [0u8; THREAD_NAME_LEN];
+        let len = name.len().min(THREAD_NAME_LEN);
         self.name[..len].copy_from_slice(&name[..len]);
     }
     pub fn thread_data(&self) -> &Arc<Lock<ThreadData>> { &self.thread_data }
@@ -327,7 +333,7 @@ pub struct ProcessEntry {
     pid: Pid,
     parent: Option<Pid>,
     state: ProcessState,
-    name: [u8; 28],
+    name: [u8; THREAD_NAME_LEN],
     process_data: Arc<Lock<ProcessData>>,
     symbols: Arc<Lock<SymbolTable>>,
     main_tid: Tid,
@@ -344,7 +350,7 @@ impl ProcessEntry {
     pub fn new(
         pid: Pid,
         parent: Option<Pid>,
-        name: [u8; 28],
+        name: [u8; THREAD_NAME_LEN],
         process_data: Arc<Lock<ProcessData>>,
         symbols: Arc<Lock<SymbolTable>>,
         main_thread: ThreadEntry,
@@ -356,7 +362,7 @@ impl ProcessEntry {
     pub fn pid(&self) -> Pid { self.pid }
     pub fn parent(&self) -> Option<Pid> { self.parent }
     pub fn state(&self) -> ProcessState { self.state }
-    pub fn name(&self) -> &[u8; 28] { &self.name }
+    pub fn name(&self) -> &[u8; THREAD_NAME_LEN] { &self.name }
     pub fn name_str(&self) -> &str {
         core::str::from_utf8(&self.name).unwrap_or("?").trim_end_matches('\0')
     }
