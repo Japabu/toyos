@@ -1242,7 +1242,7 @@ What is built:
   2 MiB-neighbour refusal.
 - **H4**, both halves. `toyos-hda` grew `probe::enumerate` (the walk, driven
   through one `Verbs` method, host-tested against the committed H0 logs of both
-  machines) and `config::verbs` (§2.3 step 6 as a pure function). 96 host tests,
+  machines) and `config::verbs` (§2.3 step 6 as a pure function). 81 host tests,
   up from 64.
 - **The instrument §5.3 item 5 asked for**: `audio::phase_breaks`, which reads 0
   on all four recorded virtio configs and 8–16 on the HDA arm. That is
