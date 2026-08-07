@@ -22,6 +22,27 @@ that followed the T14's first boot.
 
 ## 1. Isolation and untrusted input
 
+### Most CPU exception vectors have no IDT gate, so a userland fault halts the machine
+
+`arch::idt::init` installs six exception vectors — #DB (1), #NMI (2), #UD (6),
+#DF (8), #GP (13), #PF (14) — and leaves the rest of the table
+`IdtEntry::EMPTY`, which is `P = 0`. Delivering a fault whose gate is not
+present is itself a fault, and the two are contributory, so the CPU escalates
+to #DF: `double_fault_handler` prints and calls `halt_all_cpus`.
+
+**A divide by zero in any user process therefore stops the whole machine**,
+which is exactly what "the kernel must never crash from userland" forbids. #DE
+(0) is the cheapest instance and not the only one: #BR (5), #NM (7), #TS (10),
+#NP (11), #SS (12), #MF (16), #AC (17), #MC (18) and #XM (19) are all absent,
+and #SS is the vector the AMD `SYSRET` residue in §3 would arrive on.
+
+Not reproduced, and worth reproducing before it is fixed: no test in the guest
+suite divides by zero. The shape of the fix is `exception_handler`'s — the
+vectors that can only come from userland kill the process, the ones that mean
+the kernel is broken keep halting. `trap_dispatch`'s `panic!("unhandled
+exception vector")` arm is the honest default for anything left out, and is
+currently unreachable because no vector it does not know is ever installed.
+
 ### sshd's keys are as protected as any other file, which is not at all
 
 `/home/root/.ssh/host_ed25519` is the machine's SSH private key and
@@ -1094,46 +1115,65 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
-### Under KVM the kernel takes a #GP inside a syscall, and TCG has been hiding it
+### CLOSED — under KVM the kernel takes a #GP returning to userland, on AMD only
 
-Every guest boot on a GitHub runner with `-accel kvm` dies within about a
-second of userland starting:
+**Closed 2026-08-07 by `wt/toyos-sysret`: the RPL in `STAR[63:48]` was the
+CPU's to supply and only one vendor supplies it.** `SYSRET` builds both user
+selectors out of that field — SS from it plus 8, CS from it plus 16. Intel's
+SDM forces RPL 3 into both (`SS.Selector := (IA32_STAR[63:48]+8) OR 3`); AMD's
+APM forces it into CS alone and takes SS's straight from the field. The kernel
+put a bare `0x10` there, so on an AMD host every user thread ran with
+`SS = 0x18` instead of `0x1b`.
 
-```
-!!! FAULT rip=0xffff80007b519a02 cr2=0x0000000000000000 err=0x0000000000000018
-          cr3=0x0000000000d6f001 rsp=0xffff800000da1fd8 tid=0
-KERNEL PANIC: general protection fault (error_code=0x18)
-  Syscall: num=86 user_rip=0x100000544ad user_rsp=0xffffffe350
-```
+Nothing notices while it runs — 64-bit mode does not check a data segment. The
+*return* is what dies: an interrupt taken from such a thread pushes `SS = 0x18`,
+and the handler's `iretq` is a return to an outer privilege level, where
+`SS.RPL` must equal `CS.RPL`. 0 is not 3, so `#GP(SS selector)` — the error code
+is literally the selector.
 
-The same `err=0x18` on different syscall numbers (63, 86, 90), in different
-processes, and at the **same kernel offset** — `…9a02` in two boots whose KASLR
-slides differ — so it is one instruction. `0x18` is the GDT selector the kernel
-puts in `STAR[63:48] + 8` for `sysretq`'s SS: user data (`arch/percpu.rs`'s GDT
-comment, `arch/syscall.rs`'s `init`). `cr2` is zero and `rsp` is near the top of
-a kernel stack, so it is the syscall entry/exit stub and not anything the
-handler did.
-
-**The A/B that names the cause** — one runner image, one QEMU (8.2.2 from
-Ubuntu's apt), one commit, one toolchain, one test, run `31205890425`. The only
-difference between the two jobs is whether the job ran `sudo chmod 666
-/dev/kvm`, which is the question `toyos_build::kvm_usable` asks:
+The frame the faulting `iretq` was consuming, printed from the #GP's own
+handler (run `31214761003`, EPYC 7763 and EPYC 9V74, same line on both):
 
 ```
-accel (tcg)  PASS  process_stats  (115ms)   test result: ok
-accel (kvm)  FAIL  process_stats  — KERNEL PANIC: general protection fault (error_code=0x18)
-             ... and again on the harness's re-run alone
+!!! SEG frame@0xffff800000dcffd8 rip=0x1000008fbaa cs=0x23 rflags=0x246
+        rsp=0xfffffff6d0 ss=0x18 | here cs=0x8 ss=0x10 err=0x18
 ```
 
-So it is the accelerator, not the QEMU version and not the host. Reproduced on
-AMD EPYC 7763 and EPYC 9V74 hosts across runs.
+**Vendor, measured.** Run `31212538770`: eight `ubuntu-24.04` runners, eight
+boots each, all eight drawing an AMD EPYC (7763 or 9V74) — **64 of 64 red**,
+every one at `timer::timer_entry+0x174`, which `llvm-objdump` puts on the Ring 3
+path's `iretq`. Two Intel runners drew in other runs of the same probe (Xeon
+6973P-C, Xeon Platinum 8573C) and passed. So the original A/B — TCG green, KVM
+red on run `31205890425` — was the accelerator *and* the vendor at once, and
+only the vendor mattered: QEMU's `helper_sysret` implements Intel's wording, so
+TCG behaves like an Intel CPU whatever the host is.
 
-This is not a CI defect. It is a property of the kernel the dev host **cannot**
-observe: that host is arm64, so every guest on it is cross-arch TCG, which
-emulates the segmentation and `syscall`/`sysret` paths rather than running them.
-`.github/workflows/probe-accel.yml` reproduces it in about eight minutes, and
-`ci.yml`'s guest shards therefore run under TCG with a KVM canary beside them,
-so the day this is fixed is visible. `specs/ci-plan.md` §7.
+**With the fix, run `31219204355`**, same probe, six runners: five drew an AMD
+EPYC (7763 and 9V74) and one an Intel Xeon, **39 of 40 AMD boots green** where
+the same probe was 0 of 64. The fortieth is `process_stats: timed out after 5s`,
+twice in a row, on a guest whose log ends at `===READY===` with soundd up and no
+fault anywhere in it — a harness liveness budget on a shared runner, which is
+never a verdict (CLAUDE.md). Recorded rather than chased: the `kvm` job in
+`ci.yml` runs this test once, so it is that job's flake rate and it is not zero.
+
+**Two things this cost that are worth keeping.** The first reading of the report
+took `Syscall: num=86 user_rip=…` as evidence the fault was in the syscall stub;
+that line is the *last syscall this thread made* and `crash_report_exception`
+prints it for every kernel-mode fault, so it says nothing about where the fault
+is. And the report printed sixteen GPRs and not one segment register, which is
+what made a #GP whose error code is a selector unreadable — `cs`, `ss` and
+`rflags` are in it now.
+
+**Still open on this path, and unmeasured:** AMD's `SYSRET` does not reload SS's
+*cached descriptor* either (Linux calls this `X86_BUG_SYSRET_SS_ATTRS`), so a
+`sysretq` taken while `SS` is NULL leaves userland with an SS that looks like
+`0x1b` and raises `#SS` when used. The kernel can reach that — an IDT entry from
+Ring 3 nulls SS, `timer_handler` calls `do_preempt`, and the incoming thread may
+be one parked in a syscall that returns by `sysretq` — and it has no `#SS`
+handler, so the escalation would be `#DF`. Not observed: the full suite is green
+under KVM on AMD with the RPL fixed (see the KVM job in `ci.yml`). Linux's
+workaround is one `mov ss, __KERNEL_DS` in its context switch; ours would go in
+`KernelHw::switch`, which is the single site.
 
 ### CLOSED — two CPUs shooting down at once wait for each other and both panic
 
@@ -2936,6 +2976,70 @@ host anyway, which is what makes them comparable to each other.
 serve as a pass/fail gate. M3 used it as an A/B instead, which is what it could
 still answer, and landed on the fast tier plus the full suite.
 
+### CLOSED 2026-08-07 — soundd panicked on the T14: `repeated completion for free buffer`
+
+The metal boot at `2026-08-07-222910.log`, `/bin/tone` through the T14's
+`00:1f.3` (ALC257, converter 0x02 → pin 0x14, 8 periods of 512 B, stream 7).
+soundd died 0.5 s into a 2 s tone on `assert_eq!(free_mask & rec.mask, 0)` with
+bit 3; the owner heard the tone as "more like a triangle or sawtooth wave"
+before it stopped.
+
+**The mix loop's free list is a queue model, and HDA is a ring.** On
+virtio-sound a period soundd has not submitted is a period the device does not
+have. HDA's engine owns every period for as long as `RUN` is set: it returns to
+buffer *i* exactly `num_buffers` periods after completing it and plays whatever
+is there. Three of the free list's rules were the queue model showing:
+
+1. **§5.10's deferral.** `refill_floor_nanos` bounds *unplayed audio* (5 of 8
+   periods), not the engine's return, and the selection took the lowest free
+   index — so the deferred set pinned at the top three free buffers and the same
+   ones were held cycle after cycle while lower ones were refilled. Each played
+   the silence `released` left in it, and after one lap the engine completed one
+   soundd still held. Deterministic within ~14 wakes of a client stalling. The
+   three-in-eight silence is the buzz the owner heard.
+2. **§5.8's drain.** With the last client gone the free list filled over one lap
+   with no margin: a wake landing more than `num_buffers` periods after the
+   first completion sees the lap folded into one mask and trips the same
+   assertion.
+3. **A completion posted between soundd's read and the stop landing**, which
+   arrives on the idle poll against a full free list.
+
+None of the three is reachable on virtio-sound, which is why gate A never saw
+any of them, and none of them is reachable in `hda_tone` either: its client
+keeps its ring full, so `deferred=0` on every run measured.
+
+Fixed by `Backend::pipeline` naming the difference and the three sites asking
+it. A ring gives up a period it cannot fill rather than holding it, fills in the
+engine's order off a cursor that follows the engine through a drain and a stop,
+and never defers. `unplayed` replaces `free_mask.count_ones() == num_buffers` at
+the two drain sites — the same number on a queue and the only correct one on a
+ring. `stream::decode` reads the engine's position back off every mask.
+
+**The first version stepped that cursor itself and asserted the next mask
+matched it, and the 12-wide phase killed it in one run.** `ISR.mask` accumulates
+across interrupts, so what a late driver reads is the OR of several `completed`
+calls — and at `max_wake_lat_us` in the tens of milliseconds that is `0xff`, a
+whole lap, which places the engine nowhere. A stepped cursor would have to be
+right about how many laps went by; a derived one cannot drift. `Completed::Lapped`
+is that answer said in words, and it is the drain §5.9 already counts. The wide
+phase constructed a state five deliberate `hda_client_stall` runs did not.
+
+Gate: `hda_client_stall`, a client that stops producing for 60 ms (two and a
+half laps) and then plays a second stream so a resume is under test too, on both
+machines. Both arms are asserted and must differ — the ring must report
+underruns and hold nothing, the queue must defer — so neither of the two wrong
+fixes goes green. Unfixed on this tree: the ring arm panics and the run times
+out at 120 s. Fixed: ring `underruns=128 deferred=0`, queue `deferred=539`.
+
+**Not verified on the T14.** QEMU's `intel-hda` and the laptop's controller are
+different devices and only the owner can boot the second. What the next metal
+boot should show: `tone` playing to completion with soundd alive, and soundd's
+stats line reporting `deferred=0` with `underruns` nonzero if the client ever
+stalls. A `the engine completed 0x.., which is no walk of an 8-period ring`
+panic would be new, and would mean the T14's `SDnLPIB` moves in a way
+`stream::completed` cannot walk — the first evidence that this design's one
+position source is the wrong one there (§2.4's `position_fix` paragraph).
+
 **EXPECTED RED, pending #88 — HDA: the captured tone is not one sine.**
 `hda_tone` plays the same 3.0 s 440 Hz tone the virtio arm plays, out of an
 `intel-hda` controller soundd drives itself, and the capture comes back with
@@ -2977,10 +3081,36 @@ Evidence, and why it does not yet name a cause:
   overrun; both are host-side and neither is established.
 
 Where to start: QEMU's `hw/audio/hda-codec.c` output ring against soundd's
-eight-period pipeline, and then `kernel/src/drivers/hda.rs`'s `isr_complete` —
-whose `SDnLPIB`-derived mask is the one thing on the guest side that could hand
-soundd a buffer the engine has not finished with. **Do not weaken the check to
-make it green**; the virtio zero is what says it has teeth.
+eight-period pipeline. **Do not weaken the check to make it green**; the virtio
+zero is what says it has teeth.
+
+**2026-08-07: one guest-side cause found and fixed, and it is not the whole of
+it.** soundd filled a completion batch lowest-index-first, so a batch that
+wrapped the ring — `{6,7,0,1}` — was filled 0, 1, 6, 7 and played 6, 7, 0, 1.
+That is a splice with no silence in it, which is this signature exactly. Six
+`hda_tone` runs in one session, instrumented with a counter of fills that were
+not in the engine's order, separated cleanly: **one run at `out_of_order=2`,
+`max_batch=7`, 9 phase breaks; five at `out_of_order=0`, `max_batch=4`, 0
+breaks.** It is fixed (see the entry below) and the fill order is now the
+engine's by construction.
+
+**The breaks survive it.** Two runs on the fixed tree gave 8 and 6, with
+`deferred=0` and an ordering that can no longer be wrong. So the ordering was a
+contributor and not the cause, and the remaining one is still unnamed. What the
+new numbers add:
+
+- The break count tracks **soundd's own wake lateness**, which on this host is
+  the host descheduling QEMU: 0 breaks at `max_wake_lat_us` 8626–8752 (five
+  runs), 8 at 22525, 9 at 16730, 6 at 50837. Nothing in the guest changed
+  between them.
+- soundd put **1127 periods = 144,256 frames** on the wire and the capture holds
+  **131,061** — 9.1% of what was submitted is not in the file, with `gaps none`
+  and `underruns 0`. On the run at 6 breaks it is 10.8%. A capture missing a
+  tenth of its samples has phase breaks whatever the guest did.
+
+So the next step is the host side. `isr_complete` is a weaker candidate than it
+was: `stream::decode` now refuses any mask that is not a walk of the ring, and
+soundd fills in the order that walk names rather than in index order.
 
 Spec: `specs/audio-subsystem-spec.md`. Numbered as in the 2026-07-28 audit;
 (1) — see the re-filing below; it was never an SQ overrun — (2) `CommandRing::push` assert, (3) ungated
@@ -4266,6 +4396,16 @@ phase landed, and none reproduces on a host running one suite.
   could be the cause: the second is symmetric and lists what *main* changed since
   the branch last merged, which reads as the branch's own work and is not.
 
+- **`xhci_hid_break`** — added 2026-08-07, in a landing gate on a branch whose
+  delta since its own previous green gate was one documentation commit. `input
+  never came back: no pointer event moved by (2560, -1920); deltas seen:
+  [(256, 256), (256, 256)]`, `ALONE … GREEN`. The two deltas it did see are the
+  boot-time absolute tablet, so what went missing is the relative mouse's event
+  after the staged break — a wall-clock margin on the recovery path, not a
+  recovery that failed. It is one of the three longest jobs in the suite by
+  `longest_first`'s own profile, so it is dispatched early and runs beside
+  everything. Still `Sched::Parallel`.
+
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
 twelve guests across every worktree. It recurred on 2026-08-07: **eight
@@ -4682,6 +4822,52 @@ Outside the repo, so no commit fixes it: the owner should delete
 `/Users/jan/Dev/jan/winit` (nothing is unpushed in it) or fast-forward
 `forks/winit` and delete the stray. No other fork has a duplicate — checked
 across all 13 clones under `forks/`.
+
+### Every fork clone still carries its pre-rebase history, on no remote
+
+`git rev-list <branch> --not --remotes` over the 13 clones finds **66 commits
+reachable from no remote ref at all**, every one of them on a local `master` or
+`main`: cpal 9, mio 11, socket2 8, libloading 8, stacker 6, getrandom 5,
+target-lexicon 4, memmap2 4, ctrlc 3, tokio 3, russh 2, raw-window-handle 1,
+softbuffer 1, winit 1. They are the original ToyOS work committed straight onto
+each fork's `master` before the 2026-07-28 re-basing built the clean `toyos`
+branches on pinned upstream bases — the commit titles are the tell (`Add brief
+README for ToyOS fork orientation`, `Add .DS_Store to gitignore`, target-lexicon's
+`hack: silence warnings`), and that cruft is exactly what `forks.toml`'s header
+says was reverted.
+
+**Nothing is lost, checked rather than assumed.** For every fork, `origin/toyos`
+is identical to `master` on the ToyOS-specific paths or ahead of it: socket2,
+mio, winit, softbuffer, stacker, libloading, ctrlc byte-identical; cpal's
+`src/host/toyos/mod.rs` differs +108/-61 with `toyos` holding the newer futex
+state machine and `PERIOD_FRAMES` that master's `AtomicBool`/`BUFFER_FRAMES`
+predate; raw-window-handle's +44/-5 is the PR-alignment commit; memmap2's
+`src/toyos.rs` exists only on `toyos`; getrandom's `toyos-0.2` carries it at the
+0.2-era path `src/toyos.rs` rather than `src/backends/`.
+
+So this is dead history, not work. But it is genuinely unpushed, which is the
+honest answer to whether the estate is clean and pushed, and it is what makes
+`git log --all` in any of those clones misleading. Deleting the local `master`
+branches is the obvious close — outside the repo and the owner's call, and
+explicitly not something an agent should do on its own, since a fork's history
+is what an upstream PR is made of.
+
+### A `toyos` branch mostly has no upstream, so `git status` cannot say if it is pushed
+
+13 of the 16 consumed and PR branches across `forks/` have no tracking ref:
+`git for-each-ref --format='%(refname:short)|%(upstream:short)' refs/heads` gives
+`NO UPSTREAM` for cpal, ctrlc, getrandom (all three), mio, raw-window-handle,
+socket2, softbuffer, stacker, target-lexicon, tokio and winit. Only libloading,
+memmap2 and russh track `origin/toyos`, and target-lexicon's `add-toyos-os`
+tracks `upstream/main` — which is why it reads `ahead 1` rather than in sync.
+
+The consequence is that `git status` on a fork's `toyos` branch prints `## toyos`
+and nothing else: the ordinary way to ask "have I pushed this?" is silently
+unanswerable in the clones where the answer matters. Every one of them happened
+to be in sync on 2026-08-07, established by comparing `rev-parse HEAD` against
+`rev-parse origin/<branch>` rather than by reading `git status`. One
+`git branch -u origin/<branch> <branch>` per clone fixes it; outside the repo,
+so the owner's hands.
 
 ### The `memmap2` fork is 165 lines of unreachable code
 
