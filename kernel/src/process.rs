@@ -1047,6 +1047,13 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
 
     let retired = shared_memory::cleanup_process(process_pid);
 
+    // Beside the shared-memory release and for the same reason: the symbol
+    // table is megabytes of the process's own pages now that it is read off the
+    // binary rather than pointed at in the initrd, and a zombie has no
+    // backtrace left for anyone to take — every caller of `resolve_user_symbol`
+    // is a crash report, which runs on the live process before this.
+    *proc.symbols.lock() = SymbolTable::empty();
+
     let proc = table.get(process_pid).unwrap();
     let cpu_ms = main_cpu_ns / 1_000_000;
     let parent_pid = proc.parent;
@@ -1666,47 +1673,6 @@ fn with_user_symbols(pid: Pid, f: impl FnOnce(&crate::symbols::SymbolTable) -> b
     };
     let Some(syms) = syms_arc.try_lock() else { return false };
     f(&syms)
-}
-
-/// Find .symtab and .strtab in an ELF's section headers and return pointers
-/// into the initrd memory. No allocation — the sections are read in-place.
-pub(crate) fn find_symtab_in_memory(
-    backing: &dyn crate::file_backing::FileBacking,
-    sh_off: u64, sh_num: usize, sh_entsize: usize,
-    base: u64,
-    prog_base: u64, prog_end: u64,
-    stack_base: u64, stack_end: u64,
-) -> SymbolTable {
-    use toyos_elf::section::{SectionTable, SHT_SYMTAB};
-    const SHT_STRTAB: u32 = 3;
-    let empty = || SymbolTable::empty_with_bounds(prog_base, prog_end, stack_base, stack_end);
-
-    let shdr_data = read_file_range(backing, sh_off, sh_num * sh_entsize);
-    let Some((symtab, strtab)) = SectionTable::new(&shdr_data).symbols(SHT_SYMTAB) else {
-        return empty();
-    };
-    if symtab.size == 0 || strtab.kind != SHT_STRTAB {
-        return empty();
-    }
-
-    let Some(symtab_ptr) = backing.memory_ptr(symtab.offset, symtab.size as usize) else {
-        return empty();
-    };
-    let Some(strtab_ptr) = backing.memory_ptr(strtab.offset, strtab.size as usize) else {
-        return empty();
-    };
-
-    let entry_size = if symtab.entry_size > 0 {
-        symtab.entry_size as usize
-    } else {
-        toyos_elf::sym::ENTRY_SIZE
-    };
-    SymbolTable::from_raw(
-        symtab_ptr, symtab.size as usize / entry_size,
-        strtab_ptr, strtab.size as usize,
-        base,
-        prog_base, prog_end, stack_base, stack_end,
-    )
 }
 
 /// Kill a child process. Only the parent can kill its children.

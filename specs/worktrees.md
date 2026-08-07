@@ -216,6 +216,29 @@ wait. Two things would remove it and neither was taken today:
 - **Landing the ABI change first**, which is cheaper and which the standing rule
   now points every refused checkout at.
 
+**That mitigation is in the refusal itself now, because on 2026-08-07 the turn
+was measured twice and both times it was a whole task long.** Eight worktrees on
+the host, two of them waiting correctly rather than claiming: about 35 minutes in
+one case and about 50 in the other, during which neither could build at all. One
+of the two holders later reported having held the sysroot through two failed
+gates before landing, where landing at the first clean boundary would have ended
+the refusal for everybody. **The window is the claimant's to make small**: the ABI
+half of a change is usually a few lines that compile on their own, and landing it
+by itself makes the window one landing instead of one task. Applied successfully
+once that day. `toolchain::CLAIM_WINDOW` is that sentence, printed by the refusal
+a diverged checkout gets and again by the claim announcement — an agent in this
+situation is reading the refusal, not this file.
+
+**A checkout that is merely *behind* main is not diverged from it**, and until
+2026-08-07 `standing()` could not tell the two apart: it asked `git diff main`,
+which is symmetric, so a worktree that had not merged somebody else's landed ABI
+change read as `Diverged` and could claim — rebuilding the shared sysroot from
+sources *older* than main's and refusing the checkout whose change had already
+landed. It asks `git diff main...HEAD` against the merge base now, plus
+`git status` for the working tree, which also catches an untracked file in
+`toyos-abi/src` that no diff against a commit could see. Gate:
+`a_checkout_behind_main_has_no_standing_to_claim`.
+
 ## 4. Two lock scopes
 
 `buildlock::Scope` is named at every `act_if`, because the two are not
@@ -312,6 +335,29 @@ The optimistic alternative — gate outside, take the lock, re-check, re-gate if
 main moved — is strictly faster and available if the queue ever bites, at the
 cost of sometimes gating twice.
 
+**The queue has to be audible, and on 2026-08-07 it was not.** Eight `--land`
+processes were on this lock at once. Each printed one `[build-lock] waiting …`
+line and then said nothing for as long as the seven ahead of it took, which is
+what a wedge looks like — and an agent that kills a wedge puts its own gate back
+at the end of the queue. Every blocking acquisition in `src/buildlock.rs` now
+repeats itself every 30 s with the holder re-read each time, so the message
+follows the queue forward instead of naming whoever was in front when the wait
+began. The kernel still keeps the queue and a thread does the talking: nothing
+polls a lock, so `flock`'s own ordering is given up nowhere. Gate:
+`a_lasting_wait_keeps_saying_so`.
+
+**A landing writes its own log**, `target/landings/landing-<epoch>-<pid>.log`,
+created with `O_EXCL` and named in the report. The gate's stdout and stderr are
+copied to this process's own streams *and* into it, so the terminal still sees
+the gate live. This is not a convenience: on 2026-08-07 two agents had a peer's
+`--land` output interleave into their own redirected captures — foreign
+`Compiling …` lines, foreign test failures — because the scratch directory an
+agent redirects into is shared between concurrent sessions. One chased two
+phantom red tests; one lost three landing attempts and ended up piping its
+stream through `sed` to prefix every line. **A shell redirect cannot fix that,
+because the two shells agree on the path**, so the fix has to be a name the
+landing chooses. Do not redirect `--land`; read the file it names.
+
 **Who merges: the agent, at task end.** The current model's one real virtue is
 that agents build on each other's landings immediately, and an orchestrator
 merge queue gives that up — branches diverge further the longer they wait, and
@@ -337,7 +383,13 @@ as they were shared by every agent.
   mismeasuring everything. **Built:** `buildlock::guest_slot` is that counting
   semaphore, `HOST_GUESTS` = 12 lock files in the global lock directory, one
   slot per task and never per boot. `specs/test-cost-audit.md` §5.6 has the
-  mechanism and the four measured numbers.
+  mechanism and the four measured numbers. **And it counted the wrong thing on
+  its own**: a worker holds its guest slot from the moment it takes a task, and
+  the first part of that task is compiling a kernel variant, so twelve workers
+  are twelve concurrent `cargo build`s and no guest at all — load 49.9 on
+  fourteen cores with one guest live, measured 2026-08-07.
+  `buildlock::build_slot` is the second count, four across every worktree,
+  `specs/test-cost-audit.md` §5.7.
 - **Gate A.** `tests/audio-baseline.toml`'s numbers were recorded with one QEMU
   at a time and no concurrent agents. Worktrees make that condition rarer, not
   differently rare — six agents in one tree already broke it. The options and

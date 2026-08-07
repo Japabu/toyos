@@ -32,7 +32,6 @@ use crate::process::{
     PROCESS_TABLE,
 };
 use crate::sync::Lock;
-use crate::symbols::SymbolTable;
 use crate::{scheduler, vfs, DirectMap, UserAddr};
 use toyos_abi::syscall::SyscallError;
 use toyos_elf::section::SectionTable;
@@ -575,18 +574,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let sp = user_stack.write_argv(argv);
     let t_tls = crate::clock::nanos_since_boot();
 
-    let syms = match layout.section_headers {
-        Some(sections) => crate::process::find_symtab_in_memory(
-            backing.as_ref(), sections.file_offset, sections.count as usize,
-            sections.entry_size as usize, base,
-            base + layout.vaddr_min, base + layout.vaddr_max,
-            user_stack.base().raw(), user_stack.top(),
-        ),
-        None => SymbolTable::empty_with_bounds(
-            base + layout.vaddr_min, base + layout.vaddr_max,
-            user_stack.base().raw(), user_stack.top(),
-        ),
-    };
+    let syms = symbols::read_backtrace_table(
+        backing.as_ref(), &layout, path, base,
+        base + layout.vaddr_min, base + layout.vaddr_max,
+        user_stack.base().raw(), user_stack.top(),
+    );
+    let sym_bytes = syms.resident_bytes();
 
     let (ks_alloc, ks_rsp) = match alloc_kernel_stack(process_start, entry, sp, 0) {
         Some(ks) => ks,
@@ -681,8 +674,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     drop(guard);
 
     let t3 = crate::clock::nanos_since_boot();
-    log!("spawn: {} pid={} tid={} base={:#x} entry={:#x} cr3={:#x} (layout={}ms relocs={}ms deps={}ms tls={}ms total={}ms)",
-        path, pid, tid, base, entry, child_pt.lock().cr3().phys(),
+    log!("spawn: {} pid={} tid={} base={:#x} entry={:#x} cr3={:#x} symbols={}KiB (layout={}ms relocs={}ms deps={}ms tls={}ms total={}ms)",
+        path, pid, tid, base, entry, child_pt.lock().cr3().phys(), sym_bytes / 1024,
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t_deps - t2) / 1_000_000,
         (t_tls - t_deps) / 1_000_000, (t3 - t0) / 1_000_000);
 

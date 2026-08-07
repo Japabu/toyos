@@ -1,5 +1,5 @@
 //! One line every quarter second saying the machine is still running, and
-//! which CPUs still reach a scheduler pass.
+//! which CPUs are still alive.
 //!
 //! # The gap this closes
 //!
@@ -17,41 +17,63 @@
 //! continuous: a frozen boot's log ends at the last heartbeat before it died,
 //! which is the **time** of death rather than only the fact of it.
 //!
-//! # What the per-CPU field means, exactly
+//! # What the first build got wrong, and what `alive=` means now
 //!
-//! `passes=` counts the CPUs that reached [`note_pass`] since the previous
-//! heartbeat, and `mask=` names them. That is **"reached a scheduler pass"**,
-//! not "is alive": the LAPIC timer is one-shot, so an idle CPU with nothing
-//! parked on it can legitimately sit halted across several heartbeats and
-//! contribute nothing. A healthy machine therefore prints varying counts, and
-//! the reading that matters is the shape of the *end* — whether the mask thins
-//! out CPU by CPU over several heartbeats, which is a local cause spreading, or
-//! goes from full to nothing between two lines, which is a global one.
+//! The first build ran from the idle loop and nothing else, and its own doc
+//! conceded that a clear bit meant only "this CPU did not reach a pass". Eight
+//! metal boots showed how little that leaves. Each produced exactly three
+//! heartbeats: two while userland was still coming up, then nothing at all for
+//! between 14 s and 102 s, then one final line at `passes=1/8` in the same
+//! millisecond as the boot's first keypress. After ~1.8 s every CPU had run a
+//! pass, found no work and no deadline, stopped its LAPIC timer and halted —
+//! and a halted CPU does not run the idle loop. The instrument was blind at
+//! exactly the job it was built for: a healthy quiescent machine and a dead one
+//! logged the same nothing.
 //!
-//! # Where it runs, and why it is the idle loop
+//! `diag-tick` is the fix and it belongs to the build rather than to this
+//! module: it caps how long a CPU may sleep, so every CPU reaches a pass two or
+//! three times per line whether or not the machine has work. That is what makes
+//! the field worth printing — **a clear bit now means that CPU stopped**, not
+//! that it had nothing to do, and the shape of the end discriminates a local
+//! cause spreading (the mask thins CPU by CPU) from a global one (full to
+//! nothing between two lines).
+//!
+//! # What it is evidence of, stated exactly
+//!
+//! A set bit says: that CPU took an interrupt, returned from `hlt`, and reached
+//! the top of a scheduler pass. The next tick is armed by the timer stub in
+//! assembly before any Rust runs, so one fire arms the next and the chain
+//! breaks only where a CPU stops taking interrupts — which is the thing being
+//! measured, not a step in measuring it.
+//!
+//! The hole it does **not** close: if every CPU's LAPIC timer stopped at once —
+//! a C-state that parks the APIC timer, an SMI storm — the log would go silent
+//! and read as death. The kernel only ever executes `hlt`, never `MWAIT`, and
+//! programs no C-state MSR, so the timers should keep counting; but the T14's
+//! firmware is not ours. So a log that stops means *the machine stopped taking
+//! timer interrupts*, which is weaker than *the machine died* and should be
+//! written down as the weaker claim. `gap=` is what tells the two apart after
+//! the fact: a machine that went quiet and came back says so on the line that
+//! resumes.
+//!
+//! # Where it runs
 //!
 //! [`poll`] is called from `sched::driver::idle_loop`, immediately before
 //! `log_file::poll`, so the line it appends is flushed by the very next
-//! statement through the path that already exists. No second flush mechanism,
-//! and nothing here takes a lock: a heartbeat that could block would be a
-//! diagnostic that stops for the reason it exists to report.
-//!
-//! The consequence is worth stating rather than hiding: **a heartbeat that
-//! stops means no CPU reached the idle loop**, which on a machine saturated
-//! with runnable work is not the same as death. On the machine this is for it
-//! is the same — that desktop composites twice per two-second window and its
-//! CPUs are in the idle loop the rest of the time, and `metal-panic-probe`
-//! fired from exactly there at 6.164 s on the boot that lived. It is the same
-//! predicate the probe answered once, asked four times a second.
+//! statement through the path that already exists — and the pre-halt recheck's
+//! `file_has_pending` keeps this CPU awake until it is. No second flush
+//! mechanism, and nothing here takes a lock: a heartbeat that could block would
+//! be a diagnostic that stops for the reason it exists to report.
 //!
 //! # Cost
 //!
-//! Four lines a second, about 60 bytes each. Against `log_file`'s 1 MiB
-//! rotation that is a new part roughly every 70 minutes and sixteen of them
-//! kept, so a diagnostic session of any length anyone will sit through fits.
-//! **That is a diagnostic budget and not a shipping one**, which is why this is
-//! a feature and not a default: a machine nobody is watching should not spend
-//! its log volume saying nothing happened.
+//! Four lines a second, about 60 bytes each, each carrying a `sync_mount` of
+//! whatever `/log` sits on. Against `log_file`'s 1 MiB rotation that is a new
+//! part roughly every 70 minutes and sixteen of them kept, so a diagnostic
+//! session of any length anyone will sit through fits. **That is a diagnostic
+//! budget and not a shipping one**, which is why this is a feature — and with
+//! `diag-tick` under it, the instrument is no longer a passive observer of the
+//! boot it is watching.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -64,12 +86,13 @@ use crate::sched::MAX_CPUS;
 const PERIOD_NS: u64 = 250_000_000;
 
 /// When the last line was emitted, and the reference point every CPU's stamp is
-/// compared against. 0 until the first heartbeat.
+/// compared against. 0 until the first [`poll`], which only starts it.
 static LAST_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Per-CPU: when this CPU last reached a scheduler pass. Never reset — the
 /// comparison is against [`LAST_AT`], so a CPU that stops updating simply stops
-/// appearing in the mask, which is the signal.
+/// appearing in the mask, which is the signal. 0 means it has never reached
+/// one, which is a different report from having stopped reaching them.
 static TICKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// This CPU reached a scheduler pass. Called from `drain_irqs`, which is the
@@ -103,24 +126,51 @@ pub fn poll() {
     {
         return;
     }
+    // The first call starts the clock and says nothing. Its window would open
+    // at boot, so it would report every CPU that had not yet reached its first
+    // pass as silent — true, useless, and the first line a reader sees.
+    if last == 0 {
+        return;
+    }
 
+    let cpus = (crate::arch::smp::cpu_count() as usize).min(MAX_CPUS);
+    // Sampled once and kept, because the summary and the lines below it are one
+    // reading: taking each CPU's stamp twice let a mask that named a CPU silent
+    // sit above a line saying that CPU had just run.
+    let mut stamps = [0u64; MAX_CPUS];
     let mut mask = 0u64;
-    let mut count = 0u32;
-    for (cpu, stamp) in TICKED.iter().enumerate() {
-        // `>= last` and not `> last`: the first heartbeat has `last == 0` and
-        // every CPU that has ever run qualifies, which is what makes line one
-        // a baseline rather than an empty mask.
-        if stamp.load(Ordering::Relaxed) >= last {
+    let mut alive = 0u32;
+    for cpu in 0..cpus {
+        stamps[cpu] = TICKED[cpu].load(Ordering::Relaxed);
+        // `last` is past zero by here, so this excludes a CPU that has never
+        // reached a pass without a second test for it.
+        if stamps[cpu] >= last {
             mask |= 1 << cpu;
-            count += 1;
+            alive += 1;
         }
     }
-    log!(
-        "heartbeat: t={}.{:03}s passes={}/{} mask={:#04x}",
-        now / 1_000_000_000,
-        (now % 1_000_000_000) / 1_000_000,
-        count,
-        crate::arch::smp::cpu_count().min(MAX_CPUS as u32),
-        mask
-    );
+    let (gs, gms) = split(now - last);
+    let (ts, tms) = split(now);
+    log!("heartbeat: t={ts}.{tms:03}s alive={alive}/{cpus} mask={mask:#04x} gap={gs}.{gms:03}s");
+
+    // A CPU that is missing gets a line naming it, because the summary says
+    // only how many. Bounded by the CPU count, and silent on a healthy machine.
+    for cpu in 0..cpus {
+        if mask & (1 << cpu) != 0 {
+            continue;
+        }
+        match stamps[cpu] {
+            0 => log!("heartbeat: cpu{cpu} has never reached a scheduler pass"),
+            stamp => {
+                let (s, ms) = split(now.saturating_sub(stamp));
+                log!("heartbeat: cpu{cpu} last reached one {s}.{ms:03}s ago");
+            }
+        }
+    }
+}
+
+/// Whole seconds and milliseconds, the units the log's own timestamps carry, so
+/// a reader comparing a duration against them has no conversion to do.
+fn split(nanos: u64) -> (u64, u64) {
+    (nanos / 1_000_000_000, (nanos % 1_000_000_000) / 1_000_000)
 }

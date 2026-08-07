@@ -38,6 +38,7 @@ pub const FLAGS: &[Flag] = &[
     flag("--jobs", Value::Required),
     flag("-j", Value::Required),
     flag("--host-slots", Value::Required),
+    flag("--host-builds", Value::Required),
 ];
 
 fn accepted() -> String {
@@ -120,6 +121,7 @@ mod tests {
         assert_eq!(parse_owned(&["-j", "4"]).unwrap(), None);
         assert_eq!(parse_owned(&["--audio-gate", "30"]).unwrap(), None);
         assert_eq!(parse_owned(&["--host-slots", "0"]).unwrap(), None);
+        assert_eq!(parse_owned(&["--host-builds", "0"]).unwrap(), None);
     }
 
     #[test]
@@ -158,6 +160,7 @@ mod tests {
             vec!["--audio-gate", "30"],
             vec!["--jobs", "4"],
             vec!["--host-slots", "0"],
+            vec!["--host-builds", "0"],
             vec!["--debug"],
         ] {
             assert!(parse_owned(&argv).is_ok(), "{argv:?}");

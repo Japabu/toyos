@@ -65,6 +65,14 @@ fn main() {
     let dump_audio = args.iter().any(|a| a == "--dump-audio");
     let rebuild_toolchain = args.iter().any(|a| a == "--rebuild-toolchain");
     let claim_sysroot = args.iter().any(|a| a == "--claim-sysroot");
+    if let Some(pos) = args.iter().position(|a| a == "--host-builds") {
+        let value = args
+            .get(pos + 1)
+            .unwrap_or_else(|| panic!("--host-builds needs a budget (0 turns it off)"));
+        toyos_build::buildlock::set_host_builds(
+            value.parse().unwrap_or_else(|_| panic!("--host-builds: {value:?} is not a budget")),
+        );
+    }
     let smp = parse_smp(&args);
     let profile = parse_profile(&args);
     let mute = args.iter().any(|a| a == "--mute");
