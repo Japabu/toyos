@@ -73,9 +73,13 @@ fn test() {
         "the mouse was released by a refused duplication"
     );
 
-    // The ordinary release still works.
+    // The ordinary release still works, and so does an ordinary exit: the
+    // child below claims and then exits without closing.
     syscall::close(mouse);
     assert_eq!(claim_in_child(), None, "close did not release the claim");
+    let after_exit = syscall::open_device(DeviceType::Mouse)
+        .expect("an exited process must give its device claim back");
+    syscall::close(after_exit);
 
     // The path that matters most, and the one no `Drop` on a victim's stack
     // could ever bind: a process killed by another CPU never unwinds, so the

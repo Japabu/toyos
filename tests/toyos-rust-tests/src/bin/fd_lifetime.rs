@@ -25,7 +25,7 @@ const SELF_PATH: &str = "/bin/test_rs_fd_lifetime";
 const SERVICE: &str = "fd-lifetime-service";
 const KILLED_SERVICE: &str = "fd-lifetime-killed-service";
 const PATH: &[u8] = b"/tmp/fd-lifetime.txt";
-const KILLED_PATH: &[u8] = b"/tmp/fd-lifetime-killed.txt";
+const KILLED_PATH: &[u8] = b"/home/fd-lifetime-killed.txt";
 const PAYLOAD: &[u8] = b"a file outlives the fd that was closed first";
 const KILLED_PAYLOAD: &[u8] = b"written by a process that was killed before it could close";
 
