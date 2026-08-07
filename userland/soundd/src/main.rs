@@ -7,11 +7,122 @@ use toyos::audio::{
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::services;
 use toyos::shm::SharedMemory;
-use toyos::{AudioDev, Connection};
+use toyos::{AsHandle, AudioDev, Connection};
 use toyos_abi::syscall;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+
+mod hda;
+
+/// The device half of the mix loop.
+///
+/// Two implementations and no more: `specs/hda-driver-plan.md` §8 item 10
+/// forbids a framework before there are three. What differs between a card the
+/// kernel drives and one this process drives is exactly the six methods below;
+/// the mixer, the ramps, the DLL, the underrun accounting and the
+/// suspend/resume structure are one body of code either way, which is what
+/// makes gate A one instrument for both.
+trait Backend {
+    /// The handle a completion arrives on.
+    fn handle(&self) -> Fd;
+
+    /// Where period `idx`'s samples go. Device memory this process may write,
+    /// mapped once at claim.
+    fn buffer(&self, idx: usize) -> *mut u8;
+
+    /// Completion records, oldest first, into `out`. `0` is nothing pending.
+    fn completions(&mut self, out: &mut [AudioCompletionRecord]) -> usize;
+
+    /// Period `idx` has played and is soundd's again.
+    ///
+    /// HDA's engine is cyclic and never stops on its own, so a period nobody
+    /// refills is *replayed* — audible harm gate A's gap detector cannot see.
+    /// Zeroing it as it frees makes a late soundd cost silence instead, which
+    /// is exactly what virtio-sound's device does when it runs dry, so one
+    /// instrument certifies both (§2.4). virtio's own implementation is empty
+    /// for that reason and not by omission.
+    fn released(&mut self, idx: usize);
+
+    /// Period `idx` is filled with `bytes` of PCM and belongs to the device.
+    fn submit(&mut self, idx: usize, bytes: usize);
+
+    /// Stop the stream. Idempotent, and cheap when it is already stopped.
+    fn stop(&mut self);
+}
+
+struct VirtioBackend {
+    dev: AudioDev,
+    buffers: Vec<*mut u8>,
+}
+
+impl Backend for VirtioBackend {
+    fn handle(&self) -> Fd {
+        self.dev.as_handle()
+    }
+
+    fn buffer(&self, idx: usize) -> *mut u8 {
+        self.buffers[idx]
+    }
+
+    fn completions(&mut self, out: &mut [AudioCompletionRecord]) -> usize {
+        match self.dev.read_completions(out) {
+            Ok(n) => n,
+            Err(syscall::SyscallError::WouldBlock) => 0,
+            Err(e) => panic!("soundd: read_completions failed: {e:?}"),
+        }
+    }
+
+    fn released(&mut self, _idx: usize) {}
+
+    fn submit(&mut self, idx: usize, bytes: usize) {
+        toyos::audio::audio_submit(idx as u32, bytes as u32)
+            .unwrap_or_else(|e| panic!("soundd: audio_submit({idx}) failed: {e}"));
+    }
+
+    fn stop(&mut self) {
+        self.dev.stop().expect("soundd holds the audio device claim");
+    }
+}
+
+struct HdaBackend {
+    hda: hda::Hda,
+    buffers: Vec<*mut u8>,
+    period_bytes: usize,
+}
+
+impl Backend for HdaBackend {
+    fn handle(&self) -> Fd {
+        self.hda.dev().as_handle()
+    }
+
+    fn buffer(&self, idx: usize) -> *mut u8 {
+        self.buffers[idx]
+    }
+
+    fn completions(&mut self, out: &mut [AudioCompletionRecord]) -> usize {
+        match self.hda.dev().completions() {
+            Ok(record) => {
+                out[0] = record;
+                1
+            }
+            Err(syscall::SyscallError::WouldBlock) => 0,
+            Err(e) => panic!("soundd: hda completions failed: {e:?}"),
+        }
+    }
+
+    fn released(&mut self, idx: usize) {
+        unsafe { core::ptr::write_bytes(self.buffers[idx], 0, self.period_bytes) };
+    }
+
+    fn submit(&mut self, _idx: usize, _bytes: usize) {
+        self.hda.start();
+    }
+
+    fn stop(&mut self) {
+        self.hda.stop();
+    }
+}
 
 use rubato::{Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
@@ -650,10 +761,9 @@ fn retain_active(streams: &mut Vec<ClientStream>) {
 }
 
 fn mix_thread(
-    audio_dev: AudioDev,
+    backend: &mut dyn Backend,
     cmd_ring: &CommandRing,
     cmd_pipe_read: Fd,
-    dma_ptrs: Vec<*mut u8>,
     num_buffers: usize,
     device_sample_rate: u32,
     device_channels: u16,
@@ -700,7 +810,7 @@ fn mix_thread(
     // belief true. It costs nothing on an ordinary boot: the kernel's
     // `SoundController::stop` returns without a controlq round trip or a log
     // line when the stream is already stopped.
-    audio_dev.stop().expect("soundd holds the audio device claim");
+    backend.stop();
     let mut started = false;
     // Wall clock at the last instant the pipeline was known full. Re-stamped
     // after every refill; read only by the drain count site.
@@ -785,7 +895,7 @@ fn mix_thread(
             }
         };
 
-        poller.poll_add(&audio_dev, IORING_POLL_IN, TOKEN_AUDIO);
+        poller.poll_add_fd(backend.handle(), IORING_POLL_IN, TOKEN_AUDIO);
         poller.poll_add_fd(cmd_pipe_read, IORING_POLL_IN, TOKEN_CMD);
 
         let mut cmd_ready = false;
@@ -810,11 +920,7 @@ fn mix_thread(
             next_stats_ns = syscall::clock_nanos() + STATS_INTERVAL_NANOS;
         }
 
-        let n_records = match audio_dev.read_completions(&mut records) {
-            Ok(n) => n,
-            Err(toyos_abi::syscall::SyscallError::WouldBlock) => 0,
-            Err(e) => panic!("soundd: read_completions failed: {e:?}"),
-        };
+        let n_records = backend.completions(&mut records);
         if n_records > 0 {
             // Measured against the prediction this wait was *armed* on, not
             // against whatever the DLL holds when the wait returns. They differ
@@ -833,6 +939,14 @@ fn mix_thread(
                 assert!(n > 0, "soundd: completion record with empty mask");
                 assert_eq!(free_mask & rec.mask, 0, "soundd: repeated completion for free buffer");
                 free_mask |= rec.mask;
+                // §2.4's zero-on-complete, before anything can decide to leave
+                // this buffer unfilled: the engine returns to it in
+                // `num_buffers` periods whatever soundd does.
+                for idx in 0..num_buffers {
+                    if rec.mask & (1 << idx) != 0 {
+                        backend.released(idx);
+                    }
+                }
                 wake_completions += n;
                 dll.update(rec.timestamp_nanos as f64, n);
             }
@@ -931,7 +1045,7 @@ fn mix_thread(
             }
 
             let dma_buf = unsafe {
-                core::slice::from_raw_parts_mut(dma_ptrs[idx] as *mut i16, device_period_samples)
+                core::slice::from_raw_parts_mut(backend.buffer(idx) as *mut i16, device_period_samples)
             };
             for i in 0..device_period_samples {
                 dma_buf[i] = dither_and_quantize(mix_f32[i], &mut dither_rng);
@@ -939,13 +1053,12 @@ fn mix_thread(
 
             if !started {
                 started = true;
-                // Before the submit, because the kernel starts the stopped
-                // stream inside it: the marker must precede the kernel's own
-                // `virtio-sound: stream 0 started` line.
+                // Before the submit, because that is where a stopped stream is
+                // started: the marker has to precede whatever the backend logs
+                // about starting.
                 eprintln!("soundd: resumed");
             }
-            toyos::audio::audio_submit(idx as u32, device_period_bytes as u32)
-                .unwrap_or_else(|e| panic!("soundd: audio_submit({idx}) failed: {e}"));
+            backend.submit(idx, device_period_bytes);
             // Plays after whatever is already queued — unless that has all
             // played out, in which case the device restarts from now.
             playout_until_ns = playout_until_ns.max(now) + period_nanos;
@@ -991,7 +1104,7 @@ fn mix_thread(
             // The device's period grid dies with the stream; the next
             // completion after resume re-initializes the estimate.
             dll.reset();
-            audio_dev.stop().expect("soundd holds the audio device claim");
+            backend.stop();
             started = false;
             eprintln!("soundd: suspended");
         }
@@ -1482,20 +1595,76 @@ fn main() {
     // under different locks, so a soundd restarted the instant the previous one
     // exits can pass it and still lose the claim. That is a conflict, not an
     // absent sound card, and it has to stay loud.
+    // The order is virtio first, and it is not a preference between two cards:
+    // no machine in this project has both, and taking the kernel-driven one
+    // first means a machine that has always had audio keeps exactly the path it
+    // had. The T14 has only the second.
     match AudioDev::open() {
-        Ok(audio_dev) => run_with_device(listener, audio_dev),
-        Err(syscall::SyscallError::NotFound) => run_null_sink(listener),
+        Ok(dev) => return run_virtio(listener, dev),
+        Err(syscall::SyscallError::NotFound) => {}
         Err(e) => panic!("soundd: cannot claim the audio device: {e}"),
+    }
+    match hda::Hda::claim() {
+        Ok((hda, _path, channels)) => run_hda(listener, hda, channels),
+        Err(hda::Refusal::NoDevice(syscall::SyscallError::NotFound)) => run_null_sink(listener),
+        Err(why) => {
+            eprintln!("soundd: the HDA controller cannot carry audio: {why}");
+            run_null_sink(listener)
+        }
     }
 }
 
-fn run_with_device(listener: toyos::Listener, audio_dev: AudioDev) {
+fn run_virtio(listener: toyos::Listener, audio_dev: AudioDev) {
     let info: AudioInfo = audio_dev.info().expect("soundd: failed to read audio info");
 
     let num_buffers = info.num_buffers as usize;
-    let device_sample_rate = info.sample_rate;
-    let device_channels = info.channels as u16;
     let device_period_bytes = info.period_bytes as usize;
+    let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024)
+        .expect("the DMA token the audio device just reported");
+    let dma_base = dma_page.as_ptr();
+    let buffers = (0..num_buffers)
+        .map(|i| unsafe { dma_base.add(info.buf_offsets[i] as usize) })
+        .collect();
+
+    run_with_device(
+        listener,
+        &mut VirtioBackend { dev: audio_dev, buffers },
+        num_buffers,
+        info.sample_rate,
+        info.channels as u16,
+        device_period_bytes,
+    );
+}
+
+fn run_hda(listener: toyos::Listener, hda: hda::Hda, channels: u8) {
+    let info = hda.info();
+    let num_buffers = info.periods as usize;
+    let period_bytes = info.period_bytes as usize;
+    let ring = SharedMemory::map(info.pcm_token, 2 * 1024 * 1024)
+        .expect("the PCM token the HDA device just reported");
+    // One region, `periods` buffers end to end: the buffer descriptor list the
+    // kernel built points at exactly these offsets.
+    let base = ring.as_ptr();
+    let buffers = (0..num_buffers).map(|i| unsafe { base.add(i * period_bytes) }).collect();
+
+    run_with_device(
+        listener,
+        &mut HdaBackend { hda, buffers, period_bytes },
+        num_buffers,
+        toyos_hda::config::RATE,
+        channels as u16,
+        period_bytes,
+    );
+}
+
+fn run_with_device(
+    listener: toyos::Listener,
+    backend: &mut dyn Backend,
+    num_buffers: usize,
+    device_sample_rate: u32,
+    device_channels: u16,
+    device_period_bytes: usize,
+) {
     let device_period_frames = device_period_bytes / (device_channels as usize * 2);
 
     assert!(device_channels == 1 || device_channels == 2,
@@ -1506,14 +1675,6 @@ fn run_with_device(listener: toyos::Listener, audio_dev: AudioDev) {
     // Client ring depth matches the DMA pipeline depth: a wake gap can free
     // at most num_buffers periods, so a full client ring always covers it.
     let slot_count = num_buffers as u32;
-
-    let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024)
-        .expect("the DMA token the audio device just reported");
-    let dma_base = dma_page.as_ptr();
-    let mut dma_ptrs: Vec<*mut u8> = Vec::with_capacity(num_buffers);
-    for i in 0..num_buffers {
-        dma_ptrs.push(unsafe { dma_base.add(info.buf_offsets[i] as usize) });
-    }
 
     // ~5ms connect/disconnect/volume ramp
     let ramp_frames = device_sample_rate * 5 / 1000;
@@ -1542,10 +1703,9 @@ fn run_with_device(listener: toyos::Listener, audio_dev: AudioDev) {
         .expect("soundd: failed to spawn control thread");
 
     mix_thread(
-        audio_dev,
+        backend,
         &cmd_ring,
         cmd_pipe.read,
-        dma_ptrs,
         num_buffers,
         device_sample_rate,
         device_channels,

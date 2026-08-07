@@ -479,6 +479,11 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Two boots, one kernel build each: the probe's own, and the plain kernel
     // on the same machine to show it stays out of an ordinary boot.
     ("hda_probe", Sched::Parallel),
+    // H4: soundd driving an Intel HDA controller itself, read back off the
+    // device. Serial — its verdict is a wav capture, and one taken while eleven
+    // other guests contend for the host measures the host.
+    ("hda_tone", Sched::Serial),
+    ("hda_two_live_refused", Sched::Parallel),
     ("serial_vocabulary", Sched::Parallel),
     // Host-side, no guest: the harness asking whether it can still tell a
     // suspended machine from a slow one, and whether it reports one as a
@@ -653,6 +658,19 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
     // each time — so a green is one sample of a rate and may not red the run.
     // A month: long enough that a fix already in flight lands first, short
     // enough that nobody inherits this silently.
+    stale: Stale::OnThisDate("2026-09-06"),
+}, ExpectedFailure {
+    test: "hda_tone",
+    task: 88,
+    spec: "specs/known-issues.md §4, \"HDA: the captured tone is not one sine\"",
+    // Only the phase check. Everything else `hda_tone` asserts — the kernel
+    // binding one controller, soundd walking the codec and naming its pin, the
+    // whole allow-list, a tone at full amplitude, no mid-tone silence — reds the
+    // run, because each of those is the milestone rather than the open question.
+    says: &["the captured tone is not one sine"],
+    // Intermittent: seven runs on this host gave 8, 8, 8, 8, 8, 16 and 0 breaks,
+    // so a green is one sample and may not red a healthy tree. The date is the
+    // same month the entry above uses, for the same reason.
     stale: Stale::OnThisDate("2026-09-06"),
 }];
 
@@ -1195,12 +1213,14 @@ fn measure_audio_run(
     // the quiet reading.
     let host = hostload::HostLoad::sample();
     eprintln!(
-        "        {label}{name} smp={smp} gaps: {} (baseline {}) peak {} active {:.2}s dither {:.1}%",
+        "        {label}{name} smp={smp} gaps: {} (baseline {}) peak {} active {:.2}s dither {:.1}% \
+         phase-breaks {}",
         audio::format_histogram(&gaps),
         audio::format_histogram(&baseline.gaps),
         analysis.peak,
         secs(analysis.active_samples),
         analysis.dither_ratio.unwrap_or(0.0) * 100.0,
+        audio::phase_breaks(&wav).len(),
     );
     eprintln!(
         "        {label}{name} smp={smp} soundd: wake_lat {}us ({:.2} pipelines, limit {}us) \
@@ -5863,6 +5883,10 @@ fn run_machine_test(
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         // Body in `tests/common/hda.rs`, same reason.
         "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
+        "hda_tone" => common::hda::hda_tone(test_config, c_bins, rust_bins),
+        "hda_two_live_refused" => {
+            common::hda::hda_two_live_refused(test_config, c_bins, rust_bins)
+        }
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "dump_nmi_probe" => faults::dump_nmi_probe(test_config, c_bins, rust_bins),

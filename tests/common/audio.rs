@@ -239,6 +239,46 @@ pub fn analyze(wav: &Wav) -> Analysis {
     }
 }
 
+/// The test tone's frequency, which the phase check below has to know and
+/// `tests/toyos-rust-tests/src/tone.rs` states.
+const TONE_HZ: f64 = 440.0;
+
+/// Where the captured tone stops being one sine.
+///
+/// `specs/hda-driver-plan.md` §5.3 item 5 and risk 7: **a cyclic DMA engine
+/// replays a period nobody refilled**, and a repeat is audible harm that
+/// [`analyze`]'s gap detector cannot see — the samples are not silent and the
+/// seam is not a large enough single-sample jump to be a click. The
+/// zero-on-complete rule is what stops a repeat happening, and it is a design
+/// promise; this is the measurement beside it.
+///
+/// A sampled sinusoid obeys `x[n+1] = 2·cos(ω)·x[n] − x[n−1]` exactly, so one
+/// pass over the capture tests the whole signal for phase continuity with no
+/// transform. A replayed 128-frame period is 1.28 cycles of 440 Hz, so the
+/// tone re-enters 0.28 of a cycle out and breaks the recurrence by thousands
+/// of LSB.
+///
+/// The tolerance covers what a correct capture does contain: TPDF dither at
+/// ±1 LSB and quantization. Only the region between the first and last strong
+/// sample is examined.
+pub fn phase_breaks(wav: &Wav) -> Vec<usize> {
+    const TOLERANCE: f64 = 400.0;
+    let k = 2.0 * (2.0 * std::f64::consts::PI * TONE_HZ / wav.sample_rate as f64).cos();
+    let mono = &wav.mono;
+    let (Some(first), Some(last)) = (
+        mono.iter().position(|&s| s.abs() > SIGNAL_THRESHOLD),
+        mono.iter().rposition(|&s| s.abs() > SIGNAL_THRESHOLD),
+    ) else {
+        return Vec::new();
+    };
+    (first + 1..last)
+        .filter(|&n| {
+            let predicted = k * mono[n] as f64 - mono[n - 1] as f64;
+            (predicted - mono[n + 1] as f64).abs() > TOLERANCE
+        })
+        .collect()
+}
+
 /// Underrun histogram keyed by gap length in device periods (rounded,
 /// min 1): `gaps[n]` = number of mid-signal silent runs of ~n×2.902ms. This is
 /// the unit the scheduler-core migration gates on (spec §11 gate A): stages

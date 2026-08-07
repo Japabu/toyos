@@ -6,4 +6,5 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 toyos-abi = { path = "../../toyos-abi" }
 toyos = { path = "../../toyos" }
+toyos-hda = { path = "../../toyos-hda" }
 rubato = "0.16"
