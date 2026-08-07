@@ -568,6 +568,10 @@ fn execute(action: Action<KernelPayload>) {
 /// wakes. Runs at the top of every pass, before the mailbox drain, so a wake
 /// posted here is in the run queue by the time the pass picks.
 fn drain_irqs() {
+    // First in the function, so the stamp means "this CPU reached a pass" and
+    // not "this CPU got all the way through one".
+    #[cfg(feature = "heartbeat")]
+    crate::heartbeat::note_pass();
     // xHCI (keyboard/mouse): the controller poll dispatches HID reports, which
     // wake the keyboard/mouse queues from inside the driver.
     crate::drivers::xhci::poll_if_pending();
@@ -656,6 +660,10 @@ extern "C" fn idle_loop() -> ! {
         crate::scheduler::log_health();
         crate::scheduler::reap_poisoned();
         drain_serial();
+        // Immediately before the sink's poll, so the line it appends is flushed
+        // by the very next statement rather than waiting a trip round the loop.
+        #[cfg(feature = "heartbeat")]
+        crate::heartbeat::poll();
         // After the serial drain and before the pass, for the same reason that
         // one is here: both are I/O off the critical path, and this is the one
         // context that provably holds none of the locks a filesystem needs.

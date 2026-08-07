@@ -3129,6 +3129,29 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
+### `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
+
+`toolchain::standing` asks `git diff --quiet main -- toyos-abi/src toyos/src
+userland/libc/src` and reads a non-empty diff as `Diverged` — the standing that
+entitles a checkout to `--claim-sysroot`. A diff is symmetric, so a worktree
+that has simply **not merged main** since somebody landed an ABI change reads as
+`Diverged` too, and may claim: it would then rebuild the shared sysroot from
+sources that are *older* than main's and refuse the worktree whose change is
+already landed. That is the 2026-08-04 fight §3.2 of `specs/worktrees.md` exists
+to prevent, arrived at from the other direction.
+
+Observed on 2026-08-07 during task #133, which landed `SyscallError::Io` on its
+own commit for exactly this reason. Nothing went wrong that day — the worktree
+that claimed had merged main *and* held a real `toyos-abi/src/ring.rs` change of
+its own, so it was rightfully diverged — but its standing would have been
+`Diverged` either way, and the check did not distinguish them.
+
+The question the check means to ask is whether this checkout has content in
+those trees that main does not: `git diff --quiet main...HEAD` against the merge
+base, plus the working tree, rather than `git diff main`. Not fixed here; a
+change to the arbitration wants its own gates in `src/buildlock.rs` beside the
+three that are there.
+
 ### An std change that depends on an unlanded ABI change cannot be built at all, from anywhere
 
 `library/std` names its ToyOS dependencies by relative path —
@@ -3399,6 +3422,13 @@ test's contention wait from what the profile records, or give the profile a
 notion of how much host a task wants so two eight-CPU guests do not pair.
 **Whichever it is, a landing is currently a coin toss** — three of seven runs in
 one session were red on this and nothing else.
+
+**Cost another landing on 2026-08-07**, task #133, with the same signature and a
+wider margin than any row above: `desktop_audio_client` **787 s** in the wide
+phase against **14 s** alone, on a host carrying four other worktrees. Its
+verdict line was its own (`1 of the two overlapping clients left the mixer`)
+rather than `desktop_typing_damage`'s, so the message is not the tell — the pair
+of durations is.
 
 ### A whole parallel phase can be starved by another agent's build
 
@@ -4764,9 +4794,249 @@ success path `gpu::set_resolution` calls `panic_console::detach()` and never
 console for the rest of the boot. Unreachable today — GOP always refuses and
 virtio-gpu is disabled outright — and one new GPU driver away from being live.
 
-#### What the owner should run, and what each outcome means
+#### 2026-08-07, second metal round: the probe painted, and the convoy is retired
 
-**One reflash, and it answers the question this branch could not.**
+**The probe fired and painted on the T14**, over a compositor that was actively
+drawing — the two lines above it on the panel are `compositor: frames=3` and
+`frames=2`. Two backtrace frames, chain terminated, no cascade, no
+`PANIC REENTRY`. The seven-page cascade is gone on the machine the fix was
+written for, and the fatal path is now *proven* to reach that panel.
+
+**That turns the minute of silence into positive evidence, and it retires the
+chain above.** A fatal panic on that machine paints. The stick pull produced no
+paint in sixty seconds. Therefore **no CPU panicked**, therefore none spun 500M
+times on a ticket, therefore the convoy did not happen and neither did the
+stranded ticket. The chain is eliminated as *this* bug; both defects it named
+stay open on their own reading, because they are real and they are not this.
+
+**What is left is a machine whose CPUs never panic, never schedule and never
+answer an interrupt**, and there is exactly one state in this kernel that is all
+three: halted with `IF` clear. The audit, all read from the code today:
+
+- **`stub_halt_all` is `cli; 2: hlt; jmp 2b`** (`arch/idt/mod.rs`) — the only
+  permanent interrupt-deaf halt in the tree, reached only by the `0xFD` IPI,
+  which only `apic::halt_all_cpus` sends.
+- **`halt_all_cpus` sends that IPI *before* it renders.** Every sibling is
+  halted `IF`-clear at statement one; the paint is statement two. An initiating
+  CPU that does not complete `render()` leaves seven CPUs deaf forever, nothing
+  on the panel and no panic anywhere — the owner's report exactly.
+- **`paint` is latched on `PAINTING`**, so a CPU that finds another mid-paint
+  returns having painted nothing. `screen_claimed_by_userland` waits up to 2 s
+  on that same latch.
+- **Three of `halt_all_cpus`'s callers are not panics**:
+  `iommu::vtd::fault::service` — *any* DMA remapping fault stops the machine —
+  `scheduler::schedule_no_return`'s panicked-inside-a-pass arm, and `SYS_DEBUG`
+  action 3. The first is where to look first: the T14 boots with its unit
+  translating, and a device pulled mid-DMA is a way to raise a fault.
+- **Checked, and not reproducible here.** `Profile::Metal` declares
+  `IOMMU_DEFAULT`, so `usb_boot_stick_pulled` has been pulling the boot stick
+  with the unit *translating* all along and no fault fires. That makes it a
+  metal-only candidate rather than an untested one.
+- **The two `IF`-clear spinlocks have no deadlock detection at all.**
+  `log_ring::RingGuard::lock` and `serial::BackendGuard::lock` are `cli` plus an
+  unbounded CAS spin: no bound, no contention warning, no panic. `sync::Lock`,
+  which keeps interrupts *on* and is therefore survivable, has all three. **The
+  machine can detect the deadlock it could live through and cannot detect either
+  of the ones it cannot** — and a panic taken while holding `RING_LOCKED`
+  deadlocks the panic handler's own first `log!` on that CPU, `IF` already
+  clear, before it reaches `capture` or `render`.
+
+#### Boot 1, same image, 79 seconds earlier: possibly #156 on metal
+
+The compositor never came up. `spawned /bin/compositor pid=0`, soundd, netd,
+`Boot: complete (1144ms)`, every CPU joining the scheduler — and then the boot
+log, sitting there. **No probe panic fired, and by construction that means
+nothing ever claimed the framebuffer**, since `CLAIMED_AT` is written only by
+`screen_claimed_by_userland`.
+
+**What the photograph cannot say**: the panel carries the boot-complete
+checkpoint paint from ~1.15 s, so any userland output after that instant is
+absent from it either way. It cannot separate "the compositor wedged before its
+first instruction" from "the compositor exited at 1.2 s".
+
+**What the log on the stick decides, and it is one line.** Boot 1 is
+`/log/2026-08-07-114354.log`, boot 2 `/log/2026-08-07-114513.log`. Is there an
+`exit: compositor` line? If yes it left, and that is an exit to explain. If the
+process never appears again at all, that is **#156 on metal, in a boot rather
+than after minutes of desktop use** — a process spawned and never given a first
+instruction, the shape §3 has been describing from T14 logs and that nothing has
+been able to stage. Far cheaper to chase than anything else in this section.
+
+**Two readings off the same photographs that are not defects.** `i8042: armed at
+1002ms, idle at 1153ms, 0 interrupts … the pin has never asserted` appears on
+both boots: 150 ms after arming with nobody typing, that is the health line
+doing its job, and it becomes a finding only if a *later* line in a log still
+says zero. And the disk refusal works as designed — `gpt: device 1 has 4
+partitions and none of them is ours`, `this disk is not ours and nothing will be
+written to it`.
+
+#### 2026-08-07, the logs: the freeze is a *boot*, and USB is not the subject
+
+Both logs came off the stick. **The freeze reproduces at boot, with nothing
+unplugged, about one boot in two.** The two boots are 79 seconds apart on one
+image, and with timestamps stripped they differ only in the RTC reading, one
+millisecond in two phase timings, the SMP interleaving of the `CPU N: joining
+scheduler` lines, and the whole divergence: boot 2 has two `compositor: frames=`
+reports and boot 1 has none.
+
+Line-for-line identical through the framebuffer claim and past it:
+
+```
+shm: 0x4000000000 mapped WriteCombining into pid 0      1.162 s
+compositor: wallpaper 1920x1080, scaling to 1920x1080
+compositor: ready
+spawn: /bin/filepicker pid=3 … cr3=0x1a55000            1.348 s
+compositor: at most 221 windows (8 MiB each of 15402 MiB total)
+```
+
+Boot 2 continues with `frames=3 … scanout_blits=3`. **Boot 1 emits nothing
+further, ever.**
+
+**The probe's absence is what makes this the machine and not the compositor.**
+`0x4000000000` is the GOP framebuffer out of `KernelArgs`, so that `shm` line is
+the claim, and the claim is the only writer of `CLAIMED_AT`. Probe due at claim
++ 5 s ≈ 6.162 s; boot 2 panicked at **6.164 s**, confirming the mechanism to the
+millisecond. Boot 1 shows no panic on the panel or in the log, so **no CPU
+reached `probe_due()` in the idle loop after 6.16 s**. A wedged compositor with a
+live kernel would have panicked. Every CPU is spinning or halted with `IF`
+clear — the audit above, now with evidence.
+
+**Two honesty constraints on reading these logs.** A log file ends at the last
+successful flush and not at the moment of death — boot 2's own panic is absent
+from its log for exactly that reason — so boot 1's true last event may be later
+than its last line. And a *healthy* idle machine would also stop producing lines
+here, since the i8042 health line only repeats once the pin has asserted. **It is
+the missing probe panic that carries the conclusion, not the missing log lines.**
+
+**Consequences for the rest of this section.** The reproduction is a boot rather
+than ten minutes of desktop use, and **the unplug freeze may not be a USB defect
+at all** — the same machine state, with nothing pulled out. Treat "pull the
+stick" as one trigger of a general defect rather than as the subject. Everything
+above about xHCI stands as correct work and none of it is the cause.
+
+**The window is 1.35 s to 6.16 s.** Both ends are anchored on something that
+survives: the last line boot 1 wrote, and the probe that was due at claim + 5 s
+and did not fire. It is wider than it needs to be, and that is deliberate.
+
+**Withdrawn, and not to be re-derived: the `compositor: frames=` cadence.** An
+earlier reading of this pair narrowed the window to ~3.35 s by treating boot 2's
+two-second frame-report interval as a clock boot 1 would have obeyed. That
+inference is retracted. `frames=3 … scanout_wr_bytes=8370176` records *boot 2*
+reaching its main loop and blitting a full screen; it says nothing about how far
+boot 1 got, and nothing below may lean on it. The difference between the two
+files stays an observation and stops there: boot 2 has two frame reports, boot 1
+has none.
+
+So what is in the window is stated as what the machine had just been *told to
+do*, never as what it was caught doing. The scanout has been mapped
+write-combining, `/bin/filepicker` was spawned one line earlier and is starting
+up, and the compositor is entering a main loop whose first act is a full-screen
+blit into a WC MMIO mapping. Every desktop test in the suite runs that sequence
+in QEMU without freezing, so what differs is timing and the memory type, neither
+of which TCG models.
+
+#### The defect that is in that window: a TLB shootdown nobody waits for
+
+`apic::tlb_shootdown()` writes the ICR with vector `0xFE` **and returns**. There
+is no acknowledgement anywhere: `tlb::tlb_flush_entry` flushes, EOIs and
+`iretq`s, and nothing counts completions. So every caller continues on the
+assumption that its siblings have flushed, when a sibling may not do so for an
+unbounded time — a CPU inside any `cli` region takes that IPI only when it
+re-enables interrupts, and a CPU halted with `IF` clear never takes it at all.
+
+Its eight callers are exactly the operations in the window:
+`process.rs:161`, `:196` and `:588` — address-space teardown, which **frees the
+physical pages** — `syscall.rs:1443` and `:1825`, and `paging.rs:256`, `:613`,
+`:646`, which include the mapping whose *memory type* is being set. The log
+shows all three shapes inside two seconds: `exit: netd pid=2` at 1.307 tears an
+address space down, the scanout's memory type is set at 1.162, and
+`spawn: /bin/filepicker` builds one at 1.348.
+
+Two consequences, and the first is a defect on its own reading whatever the
+freeze turns out to be:
+
+- **Unmap-then-free is unsound.** A sibling holding a stale translation writes
+  into a page that has already been handed to somebody else. Nothing bounds how
+  long that window is.
+- **A page is left mapped WC on one CPU and WB in another CPU's stale TLB.**
+  That is a memory-type alias on one physical page, which Intel SDM Vol. 3A
+  §11.12.4 does not permit and for which it specifies no behaviour. It is
+  invisible to TCG, which models no memory types at all, and it is the one thing
+  in this window that can stop a machine below the software layer — no panic, no
+  schedule, no interrupt.
+
+**Eliminated on the way**: the kernel's *two* mappings of the framebuffer are
+not an alias — `gop.rs:66` and `panic_console/mod.rs:391` both map it
+`CachePolicy::WriteCombining`, so the panic console and the scanout agree.
+
+**This is a candidate and not a diagnosis.** What makes it worth ranking first
+is that it is the only mechanism found so far that is present in the window, is
+absent from QEMU by construction, and can produce the observed state without
+reaching any software error path.
+
+**Corroborated independently, and the other reading goes further — read it
+before touching any of this.** `specs/memory-boundary-spec.md` §2.3 reached the
+same conclusion from the memory-safety track on the same day, and it is the
+authority for the fix: it names the same `ipi_all_excluding_self` one-ICR-write,
+states that **the six existing call sites are therefore already wrong** rather
+than merely incomplete — `MappedPages::release` (`process.rs:159-163`) drops the
+pages after a shootdown nobody waited for — and enumerates four more sites that
+free pages with no shootdown at all (`sys_munmap`, `shared_memory::{release,
+destroy, unregister, cleanup_process}`, `virtio_gpu::free_framebuffer`, and
+`virtio_gpu::set_resolution`). It also carries a half this entry missed
+entirely: `invlpg` reads the *current* CR3's PCID (`paging.rs:196`), so
+`shared_memory`'s and `virtio_gpu`'s unmap paths invalidate the wrong tag on
+metal and merely the wrong CPU under QEMU.
+
+**And it prices the fix, including a deadlock class this entry did not see.**
+§3.3 is stage M3: an acknowledged shootdown with a per-CPU generation counter,
+invalidation against the *target* address space's PCID, and the shootdown moved
+ahead of every free. Its stated rule matters to anyone who reads the ninth-boot
+experiment below as an invitation to write one: **the initiator must not wait
+for acks while holding a lock a target could be spinning on with `IF` clear.**
+The `IF`-clear windows are `serial.rs:98,114,163` — the serial lock under
+`save_and_cli` — and IDT interrupt gates, so no `log!` may sit between issuing a
+shootdown and collecting its acks. That is the same `BackendGuard` this entry's
+own audit flagged as an unbounded `IF`-clear spin, arriving from the other
+direction.
+
+**M3 is memsec2's, not this task's.** The experiment below is an A/B on a
+throwaway build to test a hypothesis about the freeze; it is not the fix, and it
+must not be confused for the start of M3.
+
+#### What a ninth boot should carry
+
+Not another probe — this one is a fix-shaped A/B, and it is the cheapest
+decisive experiment available. **Make the shootdown synchronous**: a per-CPU
+acknowledgement counter, the sender spinning until every online sibling has
+flushed, bounded, with a loud named failure when the bound is hit. Then eight
+boots with it against the eight without that the owner is already collecting.
+A rate that goes from about a half to zero is the answer; a rate that does not
+move eliminates the strongest candidate in one round and costs one flash.
+
+The bounded failure is half the value: a sibling that does not acknowledge
+inside the bound is a CPU that is already `IF`-clear and unreachable, and saying
+so *by name* turns the freeze's own precondition into a printed line — on a
+machine where, as of the probe, a fatal report reaches the panel.
+
+That change is not made here, and it is **not** M3 being started early: M3 is
+`specs/memory-boundary-spec.md` §3.3 and it belongs to the memory-safety track,
+which has already priced it, enumerated the sites and written the deadlock rule.
+Whoever builds this A/B builds a throwaway to test a hypothesis about the
+freeze, obeys §3.3's rule about `log!` between issue and ack, and lands nothing.
+
+**Cheaper still, and it should be tried first**: the ninth boot the owner is
+already going to make carries `heartbeat`, and the heartbeat's `mask=` field
+answers a question this experiment would answer expensively. A machine dying to
+a stale translation loses CPUs the way a memory corruption does — one at a time,
+in whatever order they touch the bad page — while a machine dying to a global
+cause loses them between two lines. One flash of an instrument that is already
+built beats one flash of a fix that is not.
+
+#### What the owner should run — settled
+
+**Already answered: the probe painted.** Kept as the record of what it settled.
+No further reflash for that question.
 `cargo run -- --console-boot --kernel-feature metal-panic-probe --build-only`
 (or `--diag-boot`, or the ordinary image — the probe is orthogonal to the boot
 mode). Flash it, boot to the desktop, and wait. Five seconds after a process
@@ -5558,22 +5828,9 @@ data, btree node, block 0, and a write. Nothing else in the tree can stage a
 device failure (`VecBlockIO` cannot fail, QEMU's NVMe does not fail a read),
 which is the same gap the page-cache entry below records.
 
-**What is left, and both are real gaps:**
-
-`vfs::FileSystem` still has no channel where `bcachefs` now does: `file_size`
-and `read_link` return `Option`, `file_mtime` a bare `u64`, `delete` a `bool`.
-Those sites go through one `no_channel` helper in `bcachefs_adapter.rs` that
-logs and then answers "nothing here" — the sentinel moved one layer up rather
-than removed. The trait is shared with `tmpfs` and `fat32_adapter`, so growing
-it a channel is its own change.
-
-`fd::try_write` has no honest error code for "the device did not do it". It
-stops at the failed page and returns the short count, which is what `write`
-means — but a request whose *first* page fails gets `SyscallError::Unknown`,
-because none of the nine variants says this and adding one is an ABI change that
-needs discussing. `BcacheFsAdapter::list` now returns the same `Unknown` for the
-same reason, rather than an empty listing a caller cannot tell from an empty
-directory.
+**Both gaps this entry left open are closed** — `no_channel` is gone,
+`SyscallError::Io` exists, and `fd::try_write`'s first-page failure says it.
+The entry below has the shape and the gates.
 
 ### The page cache's un-index on a failed fill has no test that can fail
 
@@ -5727,19 +5984,76 @@ them from memory would be inventing them. Whoever holds that task should paste
 them in. F-E is the EP0 recovery path, which has an entry above; F-J is the
 file-cache error channel, which is its own task.
 
-### `BlockError` is a marker type because `SyscallError` has no I/O variant
+### CLOSED — `vfs::FileSystem` folded a refused device into "no such file"
 
-`BlockDevice`'s error is a unit struct in `kernel/src/block.rs`. None of
-`SyscallError`'s nine variants means "the device did not do it", and adding one
-is an ABI change that wanted discussion rather than a unilateral edit.
+Task #133. Every method of the trait now answers `Result<_, SyscallError>`, and
+`SyscallError::Io = 9` is the word for a device that did not do it — the ninth
+variant `block.rs` had been waiting for, landed on its own commit ahead of the
+rest because a change to `toyos-abi/src` diverges the sysroot witness and every
+other worktree is refused until it is on main.
 
-**The call sites it was waiting for exist now.** `BlockIO` is fallible, so a
-device failure reaches userland rather than being swallowed at the filesystem
-boundary — and there are three places it arrives as the wrong word:
-`fd::try_write` on a request whose first page fails, `BcacheFsAdapter::list`,
-and every `vfs::FileSystem` method whose return type is an `Option` or a `bool`.
-The first two say `SyscallError::Unknown`; the third says "no such file".
-`SyscallError::Io` is the thing to add, and it needs the owner.
+What the `Option`/`bool`/`u64` returns actually cost, all of it reachable from
+an ordinary boot with no crafted input:
+
+- **`fd::open` created a file over one that exists.** `CREATE` acted on the
+  `None` arm of `vfs.open_file`, which was both "no such name" and "the volume
+  would not say" — so one refused transfer got an empty file created over a
+  real one, and the next write and flush made that permanent. It acts on
+  `Err(NotFound)` and nothing else now.
+- **`file_cache::read_page` returned `()`**, so a page the device would not
+  give back reached a process as 4 KiB of zeros under a success. That is the
+  one answer nothing above it can tell from a file that really is zeros there.
+- **`FatFs::list` answered `NotFound`** for a volume that would not enumerate,
+  which reads to a caller as "there is no such directory".
+- `spawn` and `dlopen` reported every failure as `NotFound`, and the shared
+  library fallback to `/lib/<name>` retried a *device* failure at a second
+  path, turning one refusal into two log lines and the wrong verdict.
+
+Two dead trait methods went with it rather than being converted:
+`FileSystem::file_size` (no caller — `stat` is `open` + `fstat`, and `readdir`
+carries sizes) and `FileSystem::delete_prefix` (four implementations, no
+caller). `bcachefs_adapter::no_channel` is gone; both adapters now map their
+crate's error enum **exhaustively**, which `toyos_fat32::Error`'s own doc
+comment asks for by name. Corruption variants map to `Io` and not `NotFound`: a
+btree node or a cluster chain that does not decode is a volume that cannot
+answer, which is what a caller can do nothing different about.
+
+Gates, both with the control watched red and green — `specs/metal-track-history.md`
+has the discipline and this is what it looked like here:
+
+- `log_backing_read_error` (`fat-backing-read-fails`) gained a *read* claim
+  beside its write claim: the guest reads the page the host staged and the
+  device refuses, and a success there is now the failure. Control: making
+  `fd::try_read` ignore `read_page`'s error puts the file back as zeros and the
+  test reds on the count in the guest's own line.
+- `boot_volume_metadata_error` (`fat-boot-reads-fail`, new) is the *metadata*
+  half, which the older feature cannot reach — it injects at
+  `FatBacking::read_page`, the page-fault path, which touches no directory
+  entry, so with it armed `open`, `read_dir` and mtime all still succeed. The
+  new one is under `Fat32` itself and arms only once `mount` has returned, so
+  the probe and the mount still work and the boot log's mount line is a
+  load-bearing part of the verdict: an unmounted `/boot` falls through to the
+  initrd and answers `NotFound` honestly, which is the string the test refuses.
+
+**Two residuals.**
+
+`close` cannot report `EIO`. The flush a descriptor owes is in
+`fd::OpenFile::drop` now, which is the right place for it — it is the one path
+a process killed by another CPU also takes — and a `Drop` has nothing to return
+to the `close` syscall. So a failed flush is logged and no process is told.
+Every *other* way of asking is honest: `fsync` returns the code, and a `write`
+whose page the device refused returns `Io` rather than a count.
+
+And, one layer up and outside this tree:
+
+`std::sys::fs::toyos::stat` discards the error from `syscall::open` and returns
+a hardcoded `io::ErrorKind::NotFound`, so `fs::metadata` re-creates the exact
+conflation this task removed — at the userland end, where the kernel can do
+nothing about it. `File::open`, `fs::read` and `fs::read_dir` all propagate
+correctly; it is `stat`/`lstat` alone. The fix is three lines in the std fork
+and could not be made from a worktree: `rust/` is an empty stub in every linked
+worktree by design (`specs/worktrees.md` §2), so it belongs to whoever is
+working in the primary checkout.
 
 ## 10. The stick's two partitions as filesystems, and the log on one of them
 
@@ -5747,9 +6061,9 @@ The first two say `SyscallError::Unknown`; the third says "no such file".
 mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
 `kernel/src/log_file.rs` writes one file per boot to `/log`, named for the wall
 clock. Gated by `esp_filesystem`, `kernel_log_file`, `log_backing_read_error`,
-`log_partition_automount`, `log_partition_identity` and `wall_clock_file`
-(`tests/common/volumes.rs`, `tests/common/wallclock.rs`), and `toybox_cp_volume`
-(`tests/common/toybox.rs`).
+`boot_volume_metadata_error`, `log_partition_automount`,
+`log_partition_identity` and `wall_clock_file` (`tests/common/volumes.rs`,
+`tests/common/wallclock.rs`), and `toybox_cp_volume` (`tests/common/toybox.rs`).
 
 ### `Sink::append`'s error return is correct and no longer reachable from a boot
 

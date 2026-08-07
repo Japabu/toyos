@@ -48,6 +48,29 @@ pub fn try_lock() -> Option<VfsGuard> {
 
 /// Trait abstracting filesystem operations so the VFS can hold
 /// heterogeneous mount points (initrd on SliceDisk, nvme on NvmeDisk).
+///
+/// # Every answer is a `Result`, and the error is the ABI's
+///
+/// The device error channel runs from [`crate::block::BlockDevice`] up through
+/// [`crate::file_backing::FileBacking`] and `bcachefs::BlockIO`, each fallible
+/// so that nothing in the middle invents a value. This trait was where it
+/// stopped: `open_file` and `read_link` returned `Option`, `file_mtime` a bare
+/// `u64` and `delete` a `bool`, and every one of those read a device that would
+/// not answer as *no such file*. That is not a degradation a caller can act on
+/// — `fd::open` created an empty file over one that exists, because `CREATE`
+/// acted on the same `None` a refused transfer produced.
+///
+/// [`SyscallError`] and not a filesystem error type of its own, because there
+/// is no second consumer: the only thing above this trait is the syscall layer,
+/// and a vocabulary translated once more on the way out is a vocabulary two
+/// layers can come to disagree about. [`SyscallError::Io`] is the variant this
+/// channel exists for; `NotFound` means the name is not there, and nothing
+/// else may.
+///
+/// The detail belongs in the log rather than in the error. `BlockError` carries
+/// nothing on purpose — which endpoint stalled and what the sense key was is in
+/// the driver's own line — so an implementation here logs what it knows and
+/// returns the code.
 pub trait FileSystem: Send {
     /// Every name in this mount, or `ResourceExhausted` if there are more than
     /// `limit` of them.
@@ -65,15 +88,24 @@ pub trait FileSystem: Send {
     /// so it makes the refusal uniform without making the allocation bounded —
     /// see known issues.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError>;
-    fn file_size(&mut self, name: &str) -> Option<u64>;
-    fn file_mtime(&mut self, name: &str) -> u64;
-    fn read_link(&mut self, name: &str) -> Option<String>;
+
+    /// When `name` was last written, in whatever epoch the mount keeps.
+    fn file_mtime(&mut self, name: &str) -> Result<u64, SyscallError>;
+
+    /// What `name` points at, or `Ok(None)` if it is not a symbolic link.
+    ///
+    /// `Ok(None)` covers a name that is not there at all, and that is not a
+    /// sentinel this signature could remove: both callers follow it with an
+    /// `open_file` or an `open_backing` of the same name, which answers
+    /// `NotFound` for the one and opens the other. What it must never fold in
+    /// is a device that would not say, which is what the `Err` is for.
+    fn read_link(&mut self, name: &str) -> Result<Option<String>, SyscallError>;
 
     /// Open a file. Returns (FileId, optional backing for cache misses).
     /// Must return the SAME FileId for the same file across multiple opens.
-    fn open_file(&mut self, name: &str) -> Option<(FileId, Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>>)>;
+    fn open_file(&mut self, name: &str) -> Result<(FileId, Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>>), SyscallError>;
     /// Create an empty file. Returns FileId. Registers in name→FileId map.
-    fn create(&mut self, name: &str, mtime: u64) -> Result<FileId, &'static str>;
+    fn create(&mut self, name: &str, mtime: u64) -> Result<FileId, SyscallError>;
     /// Release filesystem-side state for a `FileId`.
     ///
     /// Reached only from a caller whose own `file_cache::release` returned the
@@ -82,17 +114,17 @@ pub trait FileSystem: Send {
     /// would be asking a second question at a second moment.
     fn close_file(&mut self, file_id: FileId);
 
-    fn delete(&mut self, name: &str) -> bool;
-    fn delete_prefix(&mut self, prefix: &str);
-    fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str>;
+    /// Unlink `name`, or `NotFound` if there was nothing by that name.
+    fn delete(&mut self, name: &str) -> Result<(), SyscallError>;
+    fn rename(&mut self, old: &str, new: &str) -> Result<(), SyscallError>;
 
     /// Write a single dirty page to persistent storage. The filesystem resolves
     /// page_idx to a disk block (allocating if needed).
-    fn write_page(&mut self, file_id: FileId, page_idx: u32, data: &[u8; 4096]) -> Result<(), &'static str>;
+    fn write_page(&mut self, file_id: FileId, page_idx: u32, data: &[u8; 4096]) -> Result<(), SyscallError>;
     /// Update file metadata (size, mtime) after flushing dirty pages.
-    fn update_metadata(&mut self, file_id: FileId, size: u64, mtime: u64) -> Result<(), &'static str>;
+    fn update_metadata(&mut self, file_id: FileId, size: u64, mtime: u64) -> Result<(), SyscallError>;
 
-    fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str>;
+    fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), SyscallError>;
 
     /// Push everything this filesystem has buffered all the way to the device,
     /// the device's own write cache included.
@@ -102,10 +134,15 @@ pub trait FileSystem: Send {
     /// one that worked, and the caller here is a log that writes a line when it
     /// is told something went wrong — so swallowing the error made every failed
     /// sync produce the pending bytes that ask for the next one.
-    fn sync(&mut self) -> Result<(), &'static str>;
+    fn sync(&mut self) -> Result<(), SyscallError>;
 
     /// Open a file backing for demand-paged ELF loading (separate from fd I/O).
-    fn open_backing(&mut self, _name: &str) -> Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>> { None }
+    ///
+    /// No default body. One answering "nothing here" would be the sentinel this
+    /// trait exists to have removed, wearing a mount's own signature: a
+    /// filesystem that forgot to implement it would report every program on it
+    /// as missing.
+    fn open_backing(&mut self, name: &str) -> Result<alloc::sync::Arc<dyn crate::file_backing::FileBacking>, SyscallError>;
 }
 
 
@@ -320,11 +357,11 @@ impl Vfs {
         }
     }
 
-    pub fn cd(&mut self, cwd: &str, target: &str) -> Option<String> {
+    pub fn cd(&mut self, cwd: &str, target: &str) -> Result<String, SyscallError> {
         let (mount, subdir) = self.resolve_path(cwd, target);
 
         if mount.is_empty() {
-            return Some(String::from("/"));
+            return Ok(String::from("/"));
         }
 
         let abs = directory(&mount, &subdir);
@@ -333,32 +370,32 @@ impl Vfs {
         // this returns. Refused rather than truncated — a shortened path names a
         // *different* directory, and every later `resolve_absolute` against it
         // would silently resolve to the wrong file. Checked before the three
-        // `Some(abs)` returns below so none of them can hand back an over-long
+        // `Ok(abs)` returns below so none of them can hand back an over-long
         // path, and after `mount.is_empty()`, whose "/" is a byte long.
         if abs.len() > MAX_PATH {
-            return None;
+            return Err(SyscallError::InvalidArgument);
         }
 
         if self.created_dirs.contains(&abs) {
-            return Some(abs);
+            return Ok(abs);
         }
 
         let is_named = self.mounts.contains_key(&mount);
         if subdir.is_empty() && is_named {
-            return Some(abs);
+            return Ok(abs);
         }
 
-        if let Some((fs, fs_path)) = self.resolve_fs(&mount, &subdir) {
-            let prefix = format!("{}/", fs_path);
-            // A mount too large to list is not a mount you can `cd` into
-            // either — the answer would need the same allocation.
-            let Ok(names) = fs.list(MAX_LIST_ENTRIES) else { return None };
-            if names.iter().any(|(name, _)| name.starts_with(&prefix) || *name == fs_path) {
-                return Some(abs);
-            }
+        let (fs, fs_path) = self.resolve_fs(&mount, &subdir).ok_or(SyscallError::NotFound)?;
+        let prefix = format!("{}/", fs_path);
+        // A mount too large to list is not a mount you can `cd` into either —
+        // the answer would need the same allocation — and a mount that would
+        // not answer is not one you can be told is absent.
+        let names = fs.list(MAX_LIST_ENTRIES)?;
+        if names.iter().any(|(name, _)| name.starts_with(&prefix) || *name == fs_path) {
+            return Ok(abs);
         }
 
-        None
+        Err(SyscallError::NotFound)
     }
 
     /// Every entry of one directory.
@@ -456,22 +493,22 @@ impl Vfs {
     /// cache rather than returned: it belongs to the file, not to the fd that
     /// happened to open it, and eviction is only sound for pages the cache
     /// itself knows how to fetch again.
-    pub fn open_file(&mut self, path: &str) -> Option<FileId> {
+    pub fn open_file(&mut self, path: &str) -> Result<FileId, SyscallError> {
         let (file_id, backing) = self.open_file_depth(path, 0)?;
         if let Some(backing) = backing {
             crate::file_cache::set_backing(file_id, backing);
         }
-        Some(file_id)
+        Ok(file_id)
     }
 
-    fn open_file_depth(&mut self, path: &str, depth: u32) -> Option<(FileId, Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>>)> {
-        if depth > 10 { return None; }
+    fn open_file_depth(&mut self, path: &str, depth: u32) -> Result<(FileId, Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>>), SyscallError> {
+        if depth > 10 { return Err(SyscallError::InvalidArgument); }
         let (mount, file) = self.resolve_path("/", path);
-        if mount.is_empty() { return None; }
+        if mount.is_empty() { return Err(SyscallError::NotFound); }
         let is_named = self.mounts.contains_key(&mount);
-        let (fs, fs_path) = self.resolve_fs(&mount, &file)?;
-        if fs_path.is_empty() { return None; }
-        if let Some(target) = fs.read_link(&fs_path) {
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or(SyscallError::NotFound)?;
+        if fs_path.is_empty() { return Err(SyscallError::NotFound); }
+        if let Some(target) = fs.read_link(&fs_path)? {
             let resolved = if is_named {
                 format!("/{}/{}", mount, target)
             } else {
@@ -483,11 +520,11 @@ impl Vfs {
     }
 
     /// Create a new empty file. Returns FileId.
-    pub fn create_file(&mut self, path: &str, mtime: u64) -> Result<FileId, &'static str> {
+    pub fn create_file(&mut self, path: &str, mtime: u64) -> Result<FileId, SyscallError> {
         let (mount, file) = self.resolve_path("/", path);
-        if mount.is_empty() { return Err("cannot create at root"); }
-        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or("no filesystem")?;
-        if fs_path.is_empty() { return Err("invalid path"); }
+        if mount.is_empty() { return Err(SyscallError::InvalidArgument); }
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or(SyscallError::NotFound)?;
+        if fs_path.is_empty() { return Err(SyscallError::InvalidArgument); }
         fs.create(&fs_path, mtime)
     }
 
@@ -498,13 +535,13 @@ impl Vfs {
     /// file cache and never told the filesystem — correct until the last fd
     /// closed and the cached size went with it. Callers reach this only when
     /// the fd is marked modified, so there is always something to record.
-    pub fn flush_file(&mut self, path: &str, file_id: FileId, mtime: u64) -> Result<(), &'static str> {
+    pub fn flush_file(&mut self, path: &str, file_id: FileId, mtime: u64) -> Result<(), SyscallError> {
         let dirty = crate::file_cache::clone_dirty(file_id);
 
         let (mount, file) = self.resolve_path("/", path);
-        if mount.is_empty() { return Err("invalid path"); }
-        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or("no filesystem")?;
-        if fs_path.is_empty() { return Err("invalid path"); }
+        if mount.is_empty() { return Err(SyscallError::InvalidArgument); }
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or(SyscallError::NotFound)?;
+        if fs_path.is_empty() { return Err(SyscallError::InvalidArgument); }
 
         // On the heap and not the stack. `log_file` reaches this from the idle
         // loop, whose per-CPU stack is 16 KiB of ordinary heap with no guard
@@ -531,9 +568,14 @@ impl Vfs {
 
         // A file created in this boot had no blocks to point a backing at,
         // so its pages were unevictable up to here. They are on disk now.
+        //
+        // A refusal here is not the flush's: the bytes reached the device two
+        // statements ago. It costs this file its evictability for the rest of
+        // the boot, which is a cost the caller has nothing to do about.
         if !crate::file_cache::has_backing(file_id) {
-            if let Some(backing) = fs.open_backing(&fs_path) {
-                crate::file_cache::set_backing(file_id, backing);
+            match fs.open_backing(&fs_path) {
+                Ok(backing) => crate::file_cache::set_backing(file_id, backing),
+                Err(e) => log!("vfs: {path} was flushed but has no backing to evict through: {e}"),
             }
         }
         Ok(())
@@ -549,49 +591,43 @@ impl Vfs {
     }
 
     /// Delete a file. Handles file cache mark_deleted for the FileId.
-    pub fn delete_file(&mut self, path: &str) -> bool {
+    pub fn delete_file(&mut self, path: &str) -> Result<(), SyscallError> {
         let (mount, file) = self.resolve_path("/", path);
-        if mount.is_empty() { return false; }
-        if let Some((fs, fs_path)) = self.resolve_fs(&mount, &file) {
-            if fs_path.is_empty() { return false; }
-            fs.delete(&fs_path)
-        } else {
-            false
-        }
+        if mount.is_empty() { return Err(SyscallError::InvalidArgument); }
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or(SyscallError::NotFound)?;
+        if fs_path.is_empty() { return Err(SyscallError::InvalidArgument); }
+        fs.delete(&fs_path)
     }
 
-    pub fn file_mtime(&mut self, path: &str) -> u64 {
+    pub fn file_mtime(&mut self, path: &str) -> Result<u64, SyscallError> {
         self.file_mtime_depth(path, 0)
     }
 
-    fn file_mtime_depth(&mut self, path: &str, depth: u32) -> u64 {
-        if depth > 10 { return 0; }
+    fn file_mtime_depth(&mut self, path: &str, depth: u32) -> Result<u64, SyscallError> {
+        if depth > 10 { return Err(SyscallError::InvalidArgument); }
         let (mount, file) = self.resolve_path("/", path);
-        if mount.is_empty() { return 0; }
+        if mount.is_empty() { return Err(SyscallError::NotFound); }
         let is_named = self.mounts.contains_key(&mount);
-        if let Some((fs, fs_path)) = self.resolve_fs(&mount, &file) {
-            if fs_path.is_empty() { return 0; }
-            if let Some(target) = fs.read_link(&fs_path) {
-                let resolved = if is_named {
-                    format!("/{}/{}", mount, target)
-                } else {
-                    format!("/{}", target)
-                };
-                return self.file_mtime_depth(&resolved, depth + 1);
-            }
-            fs.file_mtime(&fs_path)
-        } else {
-            0
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or(SyscallError::NotFound)?;
+        if fs_path.is_empty() { return Err(SyscallError::NotFound); }
+        if let Some(target) = fs.read_link(&fs_path)? {
+            let resolved = if is_named {
+                format!("/{}/{}", mount, target)
+            } else {
+                format!("/{}", target)
+            };
+            return self.file_mtime_depth(&resolved, depth + 1);
         }
+        fs.file_mtime(&fs_path)
     }
 
-    pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), &'static str> {
+    pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), SyscallError> {
         let (old_mount, old_file) = self.resolve_path("/", old_path);
         let (new_mount, new_file) = self.resolve_path("/", new_path);
-        if old_mount.is_empty() || new_mount.is_empty() { return Err("invalid path"); }
-        if old_mount != new_mount { return Err("cross-mount rename"); }
+        if old_mount.is_empty() || new_mount.is_empty() { return Err(SyscallError::InvalidArgument); }
+        if old_mount != new_mount { return Err(SyscallError::NotSupported); }
         let is_named = self.mounts.contains_key(&old_mount);
-        let Some((fs, old_fs_path)) = self.resolve_fs(&old_mount, &old_file) else { return Err("no filesystem") };
+        let (fs, old_fs_path) = self.resolve_fs(&old_mount, &old_file).ok_or(SyscallError::NotFound)?;
         let new_fs_path = if is_named {
             String::from(&new_file)
         } else if new_file.is_empty() {
@@ -599,7 +635,7 @@ impl Vfs {
         } else {
             format!("{}/{}", new_mount, new_file)
         };
-        if old_fs_path.is_empty() || new_fs_path.is_empty() { return Err("invalid path"); }
+        if old_fs_path.is_empty() || new_fs_path.is_empty() { return Err(SyscallError::InvalidArgument); }
         fs.rename(&old_fs_path, &new_fs_path)
     }
 
@@ -629,27 +665,27 @@ impl Vfs {
         self.created_dirs.retain(|d| !d.starts_with(&prefix));
     }
 
-    pub fn create_symlink(&mut self, path: &str, target: &str) -> Result<(), &'static str> {
+    pub fn create_symlink(&mut self, path: &str, target: &str) -> Result<(), SyscallError> {
         let (mount, file) = self.resolve_path("/", path);
         if mount.is_empty() {
-            return Err("cannot create symlink at root");
+            return Err(SyscallError::InvalidArgument);
         }
-        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or("no filesystem")?;
-        if fs_path.is_empty() { return Err("invalid path"); }
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or(SyscallError::NotFound)?;
+        if fs_path.is_empty() { return Err(SyscallError::InvalidArgument); }
         fs.create_symlink(&fs_path, target)
     }
 
-    pub fn read_link(&mut self, path: &str) -> Option<String> {
+    pub fn read_link(&mut self, path: &str) -> Result<Option<String>, SyscallError> {
         let (mount, file) = self.resolve_path("/", path);
         if mount.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let (fs, fs_path) = self.resolve_fs(&mount, &file)?;
-        if fs_path.is_empty() { return None; }
+        let Some((fs, fs_path)) = self.resolve_fs(&mount, &file) else { return Ok(None) };
+        if fs_path.is_empty() { return Ok(None); }
         fs.read_link(&fs_path)
     }
 
-    pub fn delete(&mut self, path: &str) -> bool {
+    pub fn delete(&mut self, path: &str) -> Result<(), SyscallError> {
         self.delete_file(path)
     }
 
@@ -659,8 +695,8 @@ impl Vfs {
     /// filesystem it wrote to: on a machine with a `/home` on NVMe it is a
     /// btree write-back and a device flush for a byte that went to the boot
     /// stick.
-    pub fn sync_mount(&mut self, name: &str) -> Result<(), &'static str> {
-        self.mounts.get_mut(name).ok_or("no such mount")?.fs.sync()
+    pub fn sync_mount(&mut self, name: &str) -> Result<(), SyscallError> {
+        self.mounts.get_mut(name).ok_or(SyscallError::NotFound)?.fs.sync()
     }
 
     /// Every mount, on the way down. Failures are logged here and not returned:
@@ -682,18 +718,18 @@ impl Vfs {
 
     /// Open a file backing for demand-paged ELF loading.
     /// This is separate from fd-based I/O and doesn't use the file cache.
-    pub fn open_backing(&mut self, path: &str) -> Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>> {
+    pub fn open_backing(&mut self, path: &str) -> Result<alloc::sync::Arc<dyn crate::file_backing::FileBacking>, SyscallError> {
         self.open_backing_depth(path, 0)
     }
 
-    fn open_backing_depth(&mut self, path: &str, depth: u32) -> Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>> {
-        if depth > 10 { return None; }
+    fn open_backing_depth(&mut self, path: &str, depth: u32) -> Result<alloc::sync::Arc<dyn crate::file_backing::FileBacking>, SyscallError> {
+        if depth > 10 { return Err(SyscallError::InvalidArgument); }
         let (mount, file) = self.resolve_path("/", path);
-        if mount.is_empty() { return None; }
+        if mount.is_empty() { return Err(SyscallError::NotFound); }
         let is_named = self.mounts.contains_key(&mount);
-        let (fs, fs_path) = self.resolve_fs(&mount, &file)?;
-        if fs_path.is_empty() { return None; }
-        if let Some(target) = fs.read_link(&fs_path) {
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or(SyscallError::NotFound)?;
+        if fs_path.is_empty() { return Err(SyscallError::NotFound); }
+        if let Some(target) = fs.read_link(&fs_path)? {
             let resolved = if is_named {
                 format!("/{}/{}", mount, target)
             } else {
@@ -702,14 +738,5 @@ impl Vfs {
             return self.open_backing_depth(&resolved, depth + 1);
         }
         fs.open_backing(&fs_path)
-    }
-
-    /// Get file size. For open files, use file_cache::size() instead.
-    pub fn file_size(&mut self, path: &str) -> Option<u64> {
-        let (mount, file) = self.resolve_path("/", path);
-        if mount.is_empty() { return None; }
-        let (fs, fs_path) = self.resolve_fs(&mount, &file)?;
-        if fs_path.is_empty() { return None; }
-        fs.file_size(&fs_path)
     }
 }

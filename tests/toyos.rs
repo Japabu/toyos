@@ -148,6 +148,12 @@ const RUST_SKIP: &[&str] = &[
     // Needs a boot image the harness staged a file into before the machine
     // started, which only `esp_filesystem` builds.
     "esp_files",
+    // Every question it asks has the *right* answer on an ordinary kernel, so
+    // on the shared boot it prints three successes and passes on its exit code
+    // — a second test of the same name whose verdict is vacuous.
+    // `boot_volume_metadata_error` runs it on the kernel that refuses the
+    // reads, which is the only build it says anything about.
+    "boot_volume_metadata_error",
     // Two modes, each waiting to be typed at through QMP; on its own nothing
     // ever answers it. `swiss_german_layout`, `locale_detect` and
     // `locale_detect_unrecognized` drive it.
@@ -444,6 +450,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("esp_filesystem", Sched::Parallel),
     ("toybox_cp_volume", Sched::Parallel),
     ("kernel_log_file", Sched::Parallel),
+    // Serial: its verdict is a cadence — heartbeats against a 250 ms period —
+    // and a guest sharing the host with eleven others reaches its idle loop
+    // late for reasons that are not the defect.
+    ("kernel_heartbeat", Sched::Serial),
     // Both own their images and their lanes, and neither verdict is a
     // wall-clock margin: the guest's clock starts from an instant the host set
     // and the only duration either measures is how long a boot takes to reach
@@ -458,6 +468,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // measurement, same afternoon.
     ("late_storage_connect", Sched::Serial),
     ("log_backing_read_error", Sched::Parallel),
+    ("boot_volume_metadata_error", Sched::Parallel),
     ("log_partition_layout", Sched::Parallel),
     ("log_partition_identity", Sched::Parallel),
     ("cache_eviction", Sched::Parallel),
@@ -2937,11 +2948,33 @@ fn run_screen_test(
                 profile: qemu::Profile::Metal,
                 smp: 8,
                 qmp: true,
+                // The T14's literal shape, and load-bearing rather than
+                // decoration: `halt_all_cpus` waits for the log sink only when
+                // there is no console, because a machine with serial already
+                // has the report off the box and the wait would delay the paint
+                // to buy a duplicate. Muted is therefore the only configuration
+                // in which this gate's second half — the report reaching
+                // `/log` — tests anything at all. The probe is time-based, so
+                // it needs no console to drive it.
+                mute: true,
                 kernel_features: &["metal-panic-probe"],
                 ..Default::default()
             };
             metal_sim_argv_check(&qemu::profile_argv(&options))?;
-            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            // Built here rather than by the boot, because `/log` is read off
+            // the partition afterwards and the image gets a fresh GUID every
+            // time it is built.
+            let image_path = common::lane::dir().join("fatal-composited.img");
+            let image = qemu::build_boot_image(&config, &[], &[], &["metal-panic-probe"]);
+            std::fs::write(&image_path, &image)
+                .map_err(|e| format!("write the boot image: {e}"))?;
+            let (log_start, log_len) = common::volumes::log_extent(&image, &image_path)?;
+            let mut qemu = QemuInstance::boot_with_options(
+                &config,
+                &[],
+                &[],
+                BootOptions { boot_image: Some(image_path.clone()), ..options },
+            );
 
             // The compositor has the screen *before* anything panics. Asserted
             // on the fill, exactly as `screen_blocked_dump` does: every kernel
@@ -2979,6 +3012,38 @@ fn run_screen_test(
                      something other than a fatal report\ndecoded screen:\n{text}"
                 ));
             }
+
+            // **And the report reached the stick, not only the panel.** Read
+            // off the boot image's own `/log` partition, so this is the
+            // device's view and not the guest's — the guest is halted and has
+            // no view left. Before `halt_all_cpus` waited for the sink, the
+            // file ended at the last flush *before* the panic and the report
+            // existed solely as a photograph; that is the state this asserts
+            // against, and it is what made three investigations argue from
+            // JPEGs.
+            drop(qemu);
+            let (name, on_device) =
+                common::volumes::newest_log(&image_path, log_start, log_len)?;
+            let on_device = String::from_utf8_lossy(&on_device).into_owned();
+            if !on_device.contains(MARKER) {
+                return Err(format!(
+                    "/log/{name} stops at {} bytes and never carries {MARKER:?} — the panic \
+                     painted the panel and reached no file, so reading this machine still means \
+                     photographing it",
+                    on_device.len()
+                ));
+            }
+            if !on_device.contains("!!! PANIC !!!") {
+                return Err(format!(
+                    "/log/{name} carries the marker without the panic banner, so what reached \
+                     the stick is not the report"
+                ));
+            }
+            let _ = std::fs::remove_file(&image_path);
+            eprintln!(
+                "  [panic] the fatal report is on the panel and in /log/{name} ({} bytes)",
+                on_device.len()
+            );
             if dump.fill() != FILL_FATAL {
                 return Err(format!(
                     "the panel still carries {:?} rather than the fatal fill, so the compositor's \
@@ -5568,6 +5633,73 @@ fn run_machine_test(
         // Body in `tests/common/toybox.rs`, same reason.
         "toybox_cp_volume" => common::toybox::cp_volume(test_config, c_bins, rust_bins),
         "kernel_log_file" => common::volumes::kernel_log_file(test_config, c_bins, rust_bins),
+        "kernel_heartbeat" => {
+            // The instrument for a machine whose log cannot say whether it was
+            // alive: ten of the owner's boots are byte-identical between the
+            // ones that froze and the ones that did not. The gate has to prove
+            // three things a `must_say` cannot — that the lines *keep coming*,
+            // that they come at the period claimed, and that the mask is a
+            // real per-CPU reading rather than a constant.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                smp: 8,
+                kernel_features: &["heartbeat"],
+                ..Default::default()
+            };
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            let mut log = qemu.boot_log().to_string();
+            log.push_str(&qemu.drain_serial(Duration::from_secs(3)));
+
+            let beats: Vec<&str> =
+                log.lines().filter(|l| l.contains("heartbeat: t=")).collect();
+            // Three seconds of drain at a 250 ms period is twelve; a guest that
+            // spends some of it booting produces fewer. Four is "the machine
+            // kept saying it was alive" with room, and zero or one is the
+            // failure this exists to make impossible.
+            if beats.len() < 4 {
+                return Err(format!(
+                    "{} heartbeat line(s) in ~3 s at a 250 ms period — the instrument does not \
+                     keep reporting, so a log that stops says nothing\n{log}",
+                    beats.len()
+                ));
+            }
+            // The mask has to *be* a reading. A constant would pass every
+            // cadence assertion above while telling the owner nothing about
+            // which CPUs stopped, which is the whole second half of the line.
+            let masks: BTreeSet<&str> = beats
+                .iter()
+                .filter_map(|l| l.split("mask=").nth(1))
+                .map(|m| m.split_whitespace().next().unwrap_or(""))
+                .collect();
+            if !beats.iter().any(|l| l.contains("passes=8/8")) && masks.len() < 2 {
+                return Err(format!(
+                    "every heartbeat reports the same mask {masks:?} and none reports all eight \
+                     CPUs — the per-CPU field is not a reading\n{log}"
+                ));
+            }
+            // And the clock in the line advances, or the timestamp cannot
+            // localise a death.
+            let stamps: Vec<&str> = beats
+                .iter()
+                .filter_map(|l| l.split("heartbeat: t=").nth(1))
+                .map(|s| s.split_whitespace().next().unwrap_or(""))
+                .collect();
+            if stamps.first() == stamps.last() {
+                return Err(format!(
+                    "every heartbeat carries the same timestamp {:?}\n{log}",
+                    stamps.first()
+                ));
+            }
+            eprintln!(
+                "  [heartbeat] {} lines in ~3 s, {} distinct mask(s), t={} → t={}",
+                beats.len(),
+                masks.len(),
+                stamps.first().unwrap_or(&"?"),
+                stamps.last().unwrap_or(&"?")
+            );
+            Ok(())
+        }
         // Body in `tests/common/wallclock.rs`, same reason.
         "wall_clock_file" => common::wallclock::wall_clock_file(test_config, c_bins, rust_bins),
         "wall_clock_refusals" => {
@@ -5582,6 +5714,9 @@ fn run_machine_test(
         }
         "log_backing_read_error" => {
             common::volumes::log_backing_read_error(test_config, c_bins, rust_bins)
+        }
+        "boot_volume_metadata_error" => {
+            common::volumes::boot_volume_metadata_error(test_config, c_bins, rust_bins)
         }
         "usb_storage_write_error" => usb::usb_storage_write_error(test_config, c_bins, rust_bins),
         "usb_flush_optional" => usb::usb_flush_optional(test_config, c_bins, rust_bins),

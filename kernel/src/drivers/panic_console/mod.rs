@@ -177,10 +177,17 @@ const PROBE_DELAY_NS: u64 = 5_000_000_000;
 /// which is the whole point of the probe: the recovery branch never paints.
 #[cfg(feature = "metal-panic-probe")]
 pub fn probe_due() -> bool {
-    match CLAIMED_AT.load(Ordering::Relaxed) {
-        0 => false,
-        at => crate::clock::nanos_since_boot().saturating_sub(at) >= PROBE_DELAY_NS,
+    let at = CLAIMED_AT.load(Ordering::Relaxed);
+    if at == 0 || crate::clock::nanos_since_boot().saturating_sub(at) < PROBE_DELAY_NS {
+        return false;
     }
+    // Exactly one CPU, and that is not tidiness. Every idle CPU reaches this
+    // inside the same microsecond, so without the latch the machine takes as
+    // many simultaneous panics as it has idle cores and there is no CPU left in
+    // an idle loop to put the report on `/log`. Measured: two panics 2 ms
+    // apart, and `halt_all_cpus`'s drain wait timed out against both.
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    FIRED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
 }
 
 /// Hand the screen over, and do not return while a checkpoint is still

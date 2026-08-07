@@ -36,6 +36,8 @@ mod file_backing;
 mod bcachefs_adapter;
 mod fat32_adapter;
 mod log_file;
+#[cfg(feature = "heartbeat")]
+mod heartbeat;
 #[allow(dead_code)]
 mod vfs;
 mod elf;

@@ -69,26 +69,23 @@ impl FileSystem for TmpFs {
         }).collect())
     }
 
-    fn file_size(&mut self, name: &str) -> Option<u64> {
-        let (file_id, _) = self.files.get(name)?;
-        Some(file_cache::size(*file_id))
+    /// Never `Err`. There is no device under this mount to refuse, which is the
+    /// same reason `TmpfsBacking::read_page` cannot fail.
+    fn file_mtime(&mut self, name: &str) -> Result<u64, SyscallError> {
+        self.files.get(name).map(|(_, mtime)| *mtime).ok_or(SyscallError::NotFound)
     }
 
-    fn file_mtime(&mut self, name: &str) -> u64 {
-        self.files.get(name).map_or(0, |(_, mtime)| *mtime)
+    fn read_link(&mut self, name: &str) -> Result<Option<String>, SyscallError> {
+        Ok(self.symlinks.get(name).cloned())
     }
 
-    fn read_link(&mut self, name: &str) -> Option<String> {
-        self.symlinks.get(name).cloned()
-    }
-
-    fn open_file(&mut self, name: &str) -> Option<(FileId, Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>>)> {
-        let (file_id, _) = self.files.get(name)?;
+    fn open_file(&mut self, name: &str) -> Result<(FileId, Option<Arc<dyn FileBacking>>), SyscallError> {
+        let (file_id, _) = self.files.get(name).ok_or(SyscallError::NotFound)?;
         file_cache::open(*file_id);
-        Some((*file_id, None)) // tmpfs: no backing, data is in the file cache
+        Ok((*file_id, None)) // tmpfs: no backing, data is in the file cache
     }
 
-    fn create(&mut self, name: &str, mtime: u64) -> Result<FileId, &'static str> {
+    fn create(&mut self, name: &str, mtime: u64) -> Result<FileId, SyscallError> {
         if let Some((file_id, _)) = self.files.get(name) {
             return Ok(*file_id);
         }
@@ -101,28 +98,18 @@ impl FileSystem for TmpFs {
         // tmpfs: no-op. Pages persist in file cache (non-evictable).
     }
 
-    fn delete(&mut self, name: &str) -> bool {
+    fn delete(&mut self, name: &str) -> Result<(), SyscallError> {
         if let Some((file_id, _)) = self.files.remove(name) {
             let _ = file_cache::mark_deleted(file_id);
-            return true;
+            return Ok(());
         }
-        self.symlinks.remove(name).is_some()
+        if self.symlinks.remove(name).is_some() {
+            return Ok(());
+        }
+        Err(SyscallError::NotFound)
     }
 
-    fn delete_prefix(&mut self, prefix: &str) {
-        let to_delete: Vec<String> = self.files.keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        for name in to_delete {
-            if let Some((file_id, _)) = self.files.remove(&name) {
-                let _ = file_cache::mark_deleted(file_id);
-            }
-        }
-        self.symlinks.retain(|k, _| !k.starts_with(prefix));
-    }
-
-    fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
+    fn rename(&mut self, old: &str, new: &str) -> Result<(), SyscallError> {
         if let Some((target_id, _)) = self.files.remove(new) {
             let _ = file_cache::mark_deleted(target_id);
         }
@@ -133,15 +120,15 @@ impl FileSystem for TmpFs {
             self.symlinks.insert(String::from(new), target);
             Ok(())
         } else {
-            Err("not found")
+            Err(SyscallError::NotFound)
         }
     }
 
-    fn write_page(&mut self, _file_id: FileId, _page_idx: u32, _data: &[u8; 4096]) -> Result<(), &'static str> {
+    fn write_page(&mut self, _file_id: FileId, _page_idx: u32, _data: &[u8; 4096]) -> Result<(), SyscallError> {
         Ok(()) // tmpfs: data is already in the file cache (canonical storage)
     }
 
-    fn update_metadata(&mut self, file_id: FileId, _size: u64, mtime: u64) -> Result<(), &'static str> {
+    fn update_metadata(&mut self, file_id: FileId, _size: u64, mtime: u64) -> Result<(), SyscallError> {
         for (_, (fid, mt)) in self.files.iter_mut() {
             if *fid == file_id {
                 *mt = mtime;
@@ -151,17 +138,17 @@ impl FileSystem for TmpFs {
         Ok(())
     }
 
-    fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str> {
+    fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), SyscallError> {
         self.symlinks.insert(String::from(name), String::from(target));
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<(), &'static str> {
+    fn sync(&mut self) -> Result<(), SyscallError> {
         Ok(())
     }
 
-    fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
-        let (file_id, _) = self.files.get(name)?;
-        Some(Arc::new(TmpfsBacking { file_id: *file_id }))
+    fn open_backing(&mut self, name: &str) -> Result<Arc<dyn FileBacking>, SyscallError> {
+        let (file_id, _) = self.files.get(name).ok_or(SyscallError::NotFound)?;
+        Ok(Arc::new(TmpfsBacking { file_id: *file_id }))
     }
 }

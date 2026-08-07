@@ -988,9 +988,10 @@ fn failed_flush_stops_once(
     if !log.contains("usb-storage: SCSI 0x35 failed, sense 0x04/0x44/0x00") {
         return Err(format!("the injected flush failure never reached the driver\n{log}"));
     }
-    let gave_up = log
-        .matches("log-file: the volume's device refused the sync — /log/")
-        .count();
+    // By step and not by code alone: the sink's four failure points all answer
+    // `SyscallError::Io` now, and the one this test stages is the sync rather
+    // than the append or the write-back ahead of it.
+    let gave_up = log.matches("log-file: the volume sync was refused").count();
     if gave_up != 1 {
         return Err(format!(
             "the sink gave up {gave_up} times, wanted exactly one — a failed sync has to reach \
@@ -2728,7 +2729,7 @@ pub fn usb_boot_stick_pulled(
         ));
     }
 
-    let mut probe = |qemu: &mut QemuInstance, console: &mut String, i: usize| {
+    let probe = |qemu: &mut QemuInstance, console: &mut String, i: usize| {
         let _ = writeln!(qemu.stdin_mut(), "run pull-probe-{i}");
         qemu.flush_stdin();
         console.push_str(&qemu.drain_serial(Duration::from_millis(120)));

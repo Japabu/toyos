@@ -262,26 +262,31 @@ pub fn open(table: &mut FdTable, path: &str, flags: OpenFlags) -> u64 {
 
         if truncate && create {
             let mtime = crate::clock::nanos_since_boot();
-            vfs.delete(path);
-            match vfs.create_file(path, mtime) {
-                Ok(file_id) => Ok((file_id, mtime, 0)),
-                Err(_) => Err(SyscallError::Unknown),
+            // A name that was not there is the ordinary case and not a failure
+            // of this open. Anything else is: truncating past it would create a
+            // file over one the mount could not tell us about.
+            match vfs.delete(path) {
+                Ok(()) | Err(SyscallError::NotFound) => {}
+                Err(e) => return e.to_u64(),
             }
+            vfs.create_file(path, mtime).map(|file_id| (file_id, mtime, 0))
         } else {
+            // **`CREATE` acts on `NotFound` and on nothing else.** This used to
+            // be the `None` arm of an `Option`, so a mount that would not
+            // answer took the same branch as a name that is not there: one
+            // refused transfer had a fresh empty file created over a file that
+            // exists, and the next write and flush made that permanent.
             match vfs.open_file(path) {
-                Some(file_id) => {
-                    let mtime = vfs.file_mtime(path);
-                    let position = if append { file_cache::size(file_id) as usize } else { 0 };
-                    Ok((file_id, mtime, position))
-                }
-                None if create => {
+                Ok(file_id) => vfs.file_mtime(path).map(|mtime| {
+                    let position =
+                        if append { file_cache::size(file_id) as usize } else { 0 };
+                    (file_id, mtime, position)
+                }),
+                Err(SyscallError::NotFound) if create => {
                     let mtime = crate::clock::nanos_since_boot();
-                    match vfs.create_file(path, mtime) {
-                        Ok(file_id) => Ok((file_id, mtime, 0)),
-                        Err(_) => Err(SyscallError::Unknown),
-                    }
+                    vfs.create_file(path, mtime).map(|file_id| (file_id, mtime, 0))
                 }
-                None => Err(SyscallError::NotFound),
+                Err(e) => Err(e),
             }
         }
     };
@@ -364,22 +369,36 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut UserBytesMut) -> Option<
                 return Some(0);
             }
             let mut read = 0;
+            let mut refused = false;
             while read < count {
                 let abs_pos = file.position + read;
                 let page_idx = (abs_pos / 4096) as u32;
                 let offset_in_page = abs_pos % 4096;
                 let remaining_in_page = 4096 - offset_in_page;
                 let to_read = remaining_in_page.min(count - read);
-                file_cache::read_page(
+                // A page the device would not give back is not a page of
+                // zeros. This stops short of it rather than handing the caller
+                // a hole under a success; short counts are what `read` means,
+                // and before this the return was the full count with the
+                // zeroed pages in the buffer.
+                if file_cache::read_page(
                     file.file_id,
                     page_idx,
                     offset_in_page,
                     &mut buf.sub(read, to_read),
-                );
+                )
+                .is_err()
+                {
+                    refused = true;
+                    break;
+                }
                 read += to_read;
             }
-            file.position += count;
-            Some(count as u64)
+            if read == 0 && refused {
+                return Some(SyscallError::Io.to_u64());
+            }
+            file.position += read;
+            Some(read as u64)
         }
         Descriptor::PipeRead(r) | Descriptor::TtyRead(r) => {
             pipe::try_read(r.id(), buf).map(|n| n as u64)
@@ -512,12 +531,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &UserBytes) -> Option<u64> {
                 written += to_write;
             }
             if written == 0 && refused {
-                // The honest code does not exist: none of `SyscallError`'s nine
-                // variants means "the device did not do it", and adding one is
-                // an ABI change that needs discussing. `Unknown` is the only
-                // one that does not claim something false. Known issues carries
-                // the conversion; this is its first call site.
-                return Some(SyscallError::Unknown.to_u64());
+                return Some(SyscallError::Io.to_u64());
             }
             file.position += written;
             file.modified = true;
@@ -613,8 +627,8 @@ pub fn fsync(table: &mut FdTable, fd: u32) -> u64 {
         return SyscallError::NotFound.to_u64();
     };
     if file.modified {
-        if crate::vfs::lock().flush_file(&file.path, file.file_id, file.mtime).is_err() {
-            return SyscallError::Unknown.to_u64();
+        if let Err(e) = crate::vfs::lock().flush_file(&file.path, file.file_id, file.mtime) {
+            return e.to_u64();
         }
         file.modified = false;
     }
