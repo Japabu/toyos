@@ -1094,6 +1094,47 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
+### Under KVM the kernel takes a #GP inside a syscall, and TCG has been hiding it
+
+Every guest boot on a GitHub runner with `-accel kvm` dies within about a
+second of userland starting:
+
+```
+!!! FAULT rip=0xffff80007b519a02 cr2=0x0000000000000000 err=0x0000000000000018
+          cr3=0x0000000000d6f001 rsp=0xffff800000da1fd8 tid=0
+KERNEL PANIC: general protection fault (error_code=0x18)
+  Syscall: num=86 user_rip=0x100000544ad user_rsp=0xffffffe350
+```
+
+The same `err=0x18` on different syscall numbers (63, 86, 90), in different
+processes, and at the **same kernel offset** — `…9a02` in two boots whose KASLR
+slides differ — so it is one instruction. `0x18` is the GDT selector the kernel
+puts in `STAR[63:48] + 8` for `sysretq`'s SS: user data (`arch/percpu.rs`'s GDT
+comment, `arch/syscall.rs`'s `init`). `cr2` is zero and `rsp` is near the top of
+a kernel stack, so it is the syscall entry/exit stub and not anything the
+handler did.
+
+**The A/B that names the cause** — one runner image, one QEMU (8.2.2 from
+Ubuntu's apt), one commit, one toolchain, one test, run `31205890425`. The only
+difference between the two jobs is whether the job ran `sudo chmod 666
+/dev/kvm`, which is the question `toyos_build::kvm_usable` asks:
+
+```
+accel (tcg)  PASS  process_stats  (115ms)   test result: ok
+accel (kvm)  FAIL  process_stats  — KERNEL PANIC: general protection fault (error_code=0x18)
+             ... and again on the harness's re-run alone
+```
+
+So it is the accelerator, not the QEMU version and not the host. Reproduced on
+AMD EPYC 7763 and EPYC 9V74 hosts across runs.
+
+This is not a CI defect. It is a property of the kernel the dev host **cannot**
+observe: that host is arm64, so every guest on it is cross-arch TCG, which
+emulates the segmentation and `syscall`/`sysret` paths rather than running them.
+`.github/workflows/probe-accel.yml` reproduces it in about eight minutes, and
+`ci.yml`'s guest shards therefore run under TCG with a KVM canary beside them,
+so the day this is fixed is visible. `specs/ci-plan.md` §7.
+
 ### `Lock::lock`'s spin is the half of the ticket lock loom cannot reach
 
 `kernel-loom` compiles `kernel/src/sync.rs` a second time against loom's
