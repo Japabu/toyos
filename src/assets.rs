@@ -164,12 +164,12 @@ pub fn regen_panic_font(root: &Path) {
 
 /// Which files under `dir` git tracks, as paths relative to it.
 ///
-/// **The image is a function of the commit, not of the working tree.** Sweeping
-/// the directory instead put `assets/.DS_Store` and an `assets/target/` some
-/// cargo invocation left behind into every shipped initrd — 16,368 bytes of it,
-/// measured off `target/bootable.img` — so a fresh clone built a different
-/// image and opening the directory in Finder moved the image hash with no code
-/// change.
+/// **The image is a function of what the repository declares, not of what the
+/// directory happens to hold.** Sweeping the directory instead put
+/// `assets/.DS_Store` and an `assets/target/` some cargo invocation left behind
+/// into every shipped initrd — 16,368 bytes of it, measured off
+/// `target/bootable.img` — so a fresh clone built a different image and opening
+/// the directory in Finder moved the image hash with no code change.
 ///
 /// Asked of git rather than filtered by name: an ignore list for dotfiles and
 /// `target/` states nothing about the property, and the next stray file ships
@@ -193,18 +193,43 @@ fn tracked(dir: &Path) -> BTreeSet<PathBuf> {
         .collect()
 }
 
-pub fn collect(dirs: &[String]) -> Vec<(String, Vec<u8>)> {
+/// The asset files, given the directories to sweep and the paths within them
+/// the repository deliberately does not carry.
+///
+/// `untracked` exists because git's index is not quite the whole declaration:
+/// `assets/timgm6mb.sf2` is 5.99 MB of SoundFont that doom synthesises its
+/// music from, `.gitignore` excludes it on purpose, and it has shipped in every
+/// image this project ever built. A sweep cannot tell that file from a
+/// `.DS_Store` — both are "in the directory and not in git" — so the config
+/// says which, and **an entry naming a file the build cannot find stops the
+/// build**. That is why it is a list of paths and not a flag: a fresh clone has
+/// no SoundFont, and what it needs is to be told so by name rather than to
+/// produce a doom with no music.
+pub fn collect(dirs: &[String], untracked: &[String]) -> Vec<(String, Vec<u8>)> {
     let mut files = vec![];
 
     for dir in dirs {
         let dir = Path::new(dir);
         let tracked = tracked(dir);
+        let declared: BTreeSet<PathBuf> = untracked.iter().map(PathBuf::from).collect();
+        for name in &declared {
+            let path = dir.join(name);
+            assert!(
+                path.exists(),
+                "{} is declared in `untracked-assets` and is not there. It is deliberately not \
+                 carried in git, so a fresh clone has to be given a copy.",
+                path.display()
+            );
+        }
         let ships = |path: &Path| {
             let relative = path.strip_prefix(dir).unwrap_or(path);
-            if tracked.contains(relative) {
+            if tracked.contains(relative) || declared.contains(relative) {
                 return true;
             }
-            eprintln!("assets: skipping {} — git does not track it", path.display());
+            eprintln!(
+                "assets: skipping {} — git does not track it and no config declares it",
+                path.display()
+            );
             false
         };
 
@@ -267,15 +292,21 @@ pub fn collect(dirs: &[String]) -> Vec<(String, Vec<u8>)> {
 mod tests {
     use super::*;
 
-    /// Nothing git does not track reaches the initrd.
+    /// The initrd carries what the repository declares: git's index, plus the
+    /// paths the config names, and nothing else.
     ///
     /// Against a repository this test builds, not against `assets/`: the two
     /// files that shipped for real — `.DS_Store` and a stray `target/` — are
     /// exactly what a working tree acquires by being worked in, so a gate that
     /// depended on them being present would pass on a clean checkout and prove
     /// nothing. Here they are put there on purpose.
+    ///
+    /// `declared.sf2` is the other half, and it is the half that matters most:
+    /// the first version of this filter shipped without it and silently took
+    /// the real `timgm6mb.sf2` out of the image, so doom lost its music and the
+    /// whole suite stayed green.
     #[test]
-    fn only_tracked_assets_ship() {
+    fn the_initrd_carries_what_the_repository_declares() {
         let dir = std::env::temp_dir().join(format!("toyos-assets-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("icons")).expect("make the asset tree");
@@ -283,6 +314,7 @@ mod tests {
 
         fs::write(dir.join("kept.wad"), b"tracked").expect("write kept.wad");
         fs::write(dir.join("icons/kept.svg"), b"tracked").expect("write icons/kept.svg");
+        fs::write(dir.join("declared.sf2"), b"declared").expect("write declared.sf2");
         fs::write(dir.join(".DS_Store"), b"finder").expect("write .DS_Store");
         fs::write(dir.join("target/.deps-stamp"), b"cargo").expect("write target/.deps-stamp");
 
@@ -298,13 +330,29 @@ mod tests {
         git(&["add", "kept.wad", "icons/kept.svg"]);
 
         let shipped: BTreeSet<String> =
-            collect(&[dir.display().to_string()]).into_iter().map(|(name, _)| name).collect();
-        fs::remove_dir_all(&dir).ok();
+            collect(&[dir.display().to_string()], &["declared.sf2".to_string()])
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
 
         assert_eq!(
             shipped,
-            BTreeSet::from(["share/kept.wad".to_string(), "share/icons/kept.svg".to_string()]),
-            "the initrd's asset list is not what the commit says it is"
+            BTreeSet::from([
+                "share/kept.wad".to_string(),
+                "share/icons/kept.svg".to_string(),
+                "share/declared.sf2".to_string(),
+            ]),
+            "the initrd's asset list is not what the repository says it is"
         );
+
+        // And the declaration has teeth in the other direction: a fresh clone
+        // has no SoundFont, and it must be told so rather than handed a doom
+        // with no music.
+        fs::remove_file(dir.join("declared.sf2")).expect("take declared.sf2 away");
+        let absent = std::panic::catch_unwind(|| {
+            collect(&[dir.display().to_string()], &["declared.sf2".to_string()])
+        });
+        fs::remove_dir_all(&dir).ok();
+        assert!(absent.is_err(), "a declared asset that is not there must stop the build");
     }
 }

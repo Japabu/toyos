@@ -2528,6 +2528,77 @@ keeping up.
 
 ## 4. Audio and soundd
 
+### OPEN, UNASSIGNED — `hda_tone` is red on `main` for a reason `#88`'s exemption does not cover
+
+`cargo test -- hda_tone` on `main` at `6d11938`, alone, 2026-08-07 18:5x:
+
+```
+FAIL hda_tone: 1 mid-tone silences in the capture: total 1 [1p×1]
+  FAIL  hda_tone  (15s)  — listed against #88, and this is not that failure:
+        the entry covers ["the captured tone is not one sine"]
+```
+
+The `EXPECTED_FAILURES` entry does what it is supposed to: it pins the assertion
+rather than the test, so a *second* defect in the same test still reds the run
+and says which. What is red is the mid-tone-silence assertion — a gap in the
+capture, which is gate A's harm verdict — and not #88's spectral one. So any
+landing whose gate is `cargo test` is currently red on `main` for this, and an
+agent will read it as theirs.
+
+Found while landing task #98/#12: the same test failed identically inside that
+landing's gate, and the A/B against `main` in the same session is what
+identified it as `main`'s. Assigning it needs whoever owns H3 —
+`5fdfeb7`/`a022811` ("wip: H3, the virtio-sound stub and its userland driver")
+landed hours before this measurement.
+
+### OPEN — the wide phase reds on a five-second TLB stall, and it makes `--land` unpassable
+
+Measured 2026-08-07 across two `--land` gates on `wt/toyos-boot` (289 tests
+each) and five A/B runs against `main` at `6d11938`, all in one session.
+
+Seven distinct tests failed between the two gates —
+`null_sink_shipped_client`, `metal_sim_window_caps`,
+`metal_sim_ipc_hostile_peer`, `metal_sim_compositor_stall`,
+`metal_sim_client_death`, `desktop_window_child`, and an `hda_tone` that is the
+entry above. **Every one of their captures carries the same two lines**, with
+different generation numbers:
+
+```
+tlb: cpu 1 has not flushed for generation Generation(69) in 5000000000ns
+     — it is not taking interrupts
+tlb: cpu 0 has not flushed for generation Generation(68) in 5000000000ns
+     — it is not taking interrupts
+```
+
+And every one of them **passes alone, on both trees**:
+
+| test | in the wide phase | alone on the branch | alone on `main` |
+|---|---|---|---|
+| `null_sink_shipped_client` | FAIL, 10 s | PASS, 4 s | PASS, 5 s |
+| `metal_sim_window_caps` | FAIL, 5 s (three times) | PASS, 3 s | PASS, 36 s |
+
+`metal_sim_window_caps` is the clearest: its own work *completes* —
+`window caps: oversized refused, 62 windows granted then refused` — and the
+process then exits `-1` after two CPUs have each stalled five seconds. 62
+windows created and destroyed is 62 rounds of unmapping, which is exactly what
+`arch::tlb::shootdown` is on the path of. `null_sink_shipped_client`'s round 1
+took 6.14 s for a 3 s tone and its round 2 then panicked in
+`toybox/src/tone.rs:85` on `failed to open audio stream: NotFound`.
+
+So the branch is not the variable and the load is. The shootdown wait landed on
+`main` the same day (`318ec10`, `c4173f0`) and **its own diagnostic is what named
+the stall**, so the instrument is already in the tree. What it does not answer:
+which CPU was not taking interrupts and why, and whether the downstream failures
+— soundd refusing a second stream, a compositor client exiting −1 — are correct
+consequences or second defects.
+
+**Not to be re-run away**: the owner's 2026-08-04 ruling is that a
+load-coincident failure is a real defect, and this one reproduced across two
+full runs with seven different victims. Its practical cost is that `cargo test`
+reds non-deterministically under the default 12-wide phase, so `--land`'s gate
+cannot be passed by anybody until it is settled. `cargo test -- --jobs 1` is the
+obvious next measurement and was not run here.
+
 ### OPEN, UNASSIGNED — gate A's thorough tier is red on `main`, and the recorded dropout sample is what it disagrees with
 
 Measured 2026-08-07 on `main` at `c0365ea`, in one session, three arms:
@@ -3539,6 +3610,87 @@ Trivial to fix the same way the kbd line already is.
 ---
 
 ## 6. Build and toolchain
+
+### The page cache owns one device, and `usb_storage.rs` says it does not
+
+`page_cache.rs:11-12` holds exactly one
+`BLOCK_DEV: Lock<Option<Box<dyn BlockDevice>>>`, `page_cache::init` takes
+ownership of the NVMe device, and `PageCache::_device_id` is written at
+construction and read nowhere. So `usb_storage.rs:14-17`'s comment — *"NVMe
+takes 1; the page cache keys itself on this, so two devices sharing a number
+would serve each other's blocks"* — describes a mechanism that does not exist.
+The numbers are right and the keying is not.
+
+`fat32_adapter.rs:911-915` states the live consequence and does not work around
+it: a machine that boots off an **internal** disk gets neither `/boot` nor
+`/log`, "because the NVMe device is owned by the page cache from the moment
+storage comes up and there is no second handle to it". `/boot` and `/log` work
+on the T14 and in QEMU only because the boot medium is USB, and
+`usb_storage::open` mints a fresh handle per call.
+
+This is the real cost of `specs/boot-image-split.md` stage 2: a bcachefs root on
+the boot medium needs a `BlockIO` over an arbitrary `BlockDevice` at a partition
+offset with a cache of its own, where `PageCacheBlockIO` *is* the NVMe device by
+construction. Found 2026-08-07 while pricing that stage — the 2026-07-29 version
+of that document listed this as one of eight items a USB storage driver would
+have to bring, and it is the one that did not arrive with it.
+
+### Nothing gates doom's music, and one commit removed the SoundFont for a cycle
+
+`assets/timgm6mb.sf2` is 5,994,284 bytes, `.gitignore` line 3 excludes it on
+purpose, and `userland/doom/src/sound.rs:511` opens it as
+`/share/timgm6mb.sf2`. `b34a69c` filtered the asset sweep to what git tracks and
+took it out of every image; the full suite was green with it and without it,
+`doom_sound_flood` included — that actuator "synthesises its own sound and never
+opens the WAD or the soundfont". The only evidence anywhere was one
+`assets: skipping` line in the build output.
+
+`fdcaa0b` restored it and made a declared-but-absent asset a hard error, so the
+*file* is gated now. What is still ungated is the **music**: nothing asserts
+doom's synthesiser produced anything, so a defect between the SoundFont and the
+sink is invisible to `cargo test`. Gate A measures the test tone and doom's
+sound-stress actuator; neither is the music path.
+
+### No test boots the config the project ships
+
+`system.toml` is what `cargo run` builds and what a stick is flashed with, and
+the harness boots none of it: `tests/testcases`, `desktopcase`,
+`desktopaudiocase`, `doomcase` and `metalcase` are each their own config, and
+`screen_diag_boot` / `screen_console_shell` boot `diag/` and `console/`. So the
+shipping image's init list, its `hosted-rustc` setting and its program list are
+exercised only by the owner running `cargo run`, which agents are told not to
+do. The one gate on that file is `no_shipped_boot_config_starts_sshd`, which
+reads it rather than booting it.
+
+Noticed 2026-08-07 while landing `hosted-rustc = false`: that change alters only
+`system.toml`, so no suite test could go red for it in either direction.
+
+### `debug = true` produces no debug info, because the linker drops it
+
+`toyos-ld` matches `SectionKind::Debug | DebugString | Linker | Note | Metadata`
+and `continue`s (`collect.rs:410-416`), so **no binary this project produces has
+a `.debug_*` section**. Verified with `readelf -S` on the kernel, the compositor
+and toybox: the sections are `.text .strtab .symtab .rela.dyn .data
+.eh_frame_hdr .dynamic .shstrtab` and nothing else.
+
+`[profile.toyos]` states `debug = true` in every crate root, so rustc emits
+DWARF into every object file and the linker throws all of it away. The cost is
+compile time and has not been measured. The consequence for diagnostics is that
+a backtrace can carry a **name** and never a line number or an inlined frame, on
+any path — `.symtab`/`.strtab` is the whole of what survives, and it is 32.2% of
+the 92,138,384 bytes of ELF this tree ships. Keeping `.debug_line` in `toyos-ld`
+is what would change that, and it is not planned.
+
+### `userland/libc` is the one guest artifact built without overflow checks
+
+`src/libc.rs` passes `--release`, so the C runtime std links into every userland
+binary has `overflow-checks` and `debug-assertions` off while everything around
+it has them on. Deliberate on two grounds — CLAUDE.md gives the POSIX
+compatibility layer explicitly relaxed rules, and `libc::build` is gated on
+`stamps::dir_changed` over the *source* directory, so changing the flag alone
+would not rebuild the installed archive and the manifest would then claim
+something the artifact does not have. Recorded so that "one profile, applied
+consistently" is not read as covering it.
 
 ### CLOSED — `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
 

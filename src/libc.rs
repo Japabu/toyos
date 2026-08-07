@@ -32,7 +32,15 @@ pub fn build(root: &Path, rust_dir: &Path) {
 
     eprintln!("Building toyos-libc for sysroot...");
 
-    // Build with --message-format=json to discover exact rlib artifacts
+    // The one guest artifact `build::PROFILE` does not reach, so it is the one
+    // place `overflow-checks` is off — and it is linked into std, so it is in
+    // every userland binary. Left deliberately, on two grounds: CLAUDE.md gives
+    // the POSIX compatibility layer explicitly relaxed rules, and this build is
+    // gated on `stamps::dir_changed` over the *source* directory, so changing
+    // the flag alone would not rebuild the installed archive and the manifest
+    // would then claim something the artifact does not have.
+    //
+    // --message-format=json to discover the exact rlib artifacts.
     let output = Command::new("cargo")
         .args([
             "+toyos",
