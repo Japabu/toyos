@@ -22,6 +22,7 @@ const SEEK_END: i32 = 2;
 
 // errno values
 const ENOENT: i32 = 2;
+const EIO: i32 = 5;
 const EACCES: i32 = 13;
 const EEXIST: i32 = 17;
 const EINVAL: i32 = 22;
@@ -42,6 +43,7 @@ fn set_errno(e: toyos_abi::syscall::SyscallError) -> i32 {
         SyscallError::AlreadyExists => EEXIST,
         SyscallError::InvalidArgument => EINVAL,
         SyscallError::WouldBlock => EAGAIN,
+        SyscallError::Io => EIO,
         _ => EINVAL,
     };
     unsafe { super::stdio::errno = code; }
