@@ -59,9 +59,15 @@ avx2` and does **not** list `x2apic`, `tsc_deadline_timer` or `invtsc`; the
 harness already asks for `-cpu host,+rdrand,+smap,+fsgsbase,+x2apic,+smep`, so
 KVM's in-kernel APIC supplies the one the kernel needs.
 
-**What stops us using it is §7** — the kernel takes a `#GP` inside the syscall
-stub under KVM. Until that is fixed the guest shards run TCG and one canary job
-runs KVM.
+**Which vendor a job lands on is a variable and not a detail** — §7 turned out
+to be an AMD-only defect, so a KVM job that draws Intel reproduces nothing and
+proves nothing about that class. Nothing can select the vendor, so any KVM job
+prints its `model name` as part of its own output.
+
+§7 is closed. The guest shards still run TCG, because that is the wide
+repeatable measurement and the one comparable with the dev host's; the KVM job
+beside them is the only gate that *executes* `syscall`/`sysret`/`iret` rather
+than emulating them.
 
 **A defect this uncovered on the way.** Both KVM checks (`src/qemu.rs`,
 `tests/common/qemu.rs`) asked `Path::new("/dev/kvm").exists()`. Presence is not
@@ -266,10 +272,22 @@ accel (kvm)  FAIL  process_stats  — KERNEL PANIC: general protection fault (er
              ... and again on the harness's re-run alone
 ```
 
-**It is the accelerator.** The full write-up, with the reasoning about
-`STAR[63:48] + 8` and why the dev host is structurally unable to see it, is
-`specs/known-issues.md` §3. It is not a CI defect and it is not being fixed
-here.
+**It is the accelerator — and, it turned out, the vendor with it.** That A/B
+changed one flag but the two jobs also drew different hosts, and the defect is
+AMD-only: eight runners drawing an EPYC failed 64 boots of 64, and two drawing
+an Intel Xeon passed. Both facts are one cause. `STAR[63:48]` held `0x10`, and
+`SYSRET` derives SS from it plus 8 — Intel's SDM ORs RPL 3 into that, AMD's APM
+does not, so an AMD host ran userland with `SS = 0x18` and the first `iretq`
+back to such a thread died on "SS.RPL must equal CS.RPL". QEMU's `helper_sysret`
+implements Intel's wording, which is why no TCG guest anywhere — runner or dev
+host — can see the class. Fixed in `arch/percpu.rs`; the write-up and the
+evidence are `specs/known-issues.md` §3.
+
+**The reusable part is the shape of the blind spot**, not the bug. A guest that
+emulates an instruction gives you one vendor's reading of it, and the dev host
+has no other. Anything whose correctness depends on which vendor is executing —
+`syscall`/`sysret`, segment loading, `iret`'s privilege checks — is gated by the
+KVM job or by nothing.
 
 ## 8. What CI buys that the dev host cannot
 

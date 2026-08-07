@@ -29,11 +29,9 @@ jobs:
 
       # **Deliberately not unlocked.** `/dev/kvm` is crw-rw---- root:kvm and the
       # runner user is not in the group, so `kvm_usable` says no and every boot
-      # is TCG. A `sudo chmod 666 /dev/kvm` is all it takes to run these guests
-      # natively, and today that makes every one of them panic — a real kernel
-      # defect the dev host's cross-arch TCG cannot see (known-issues §3). The
-      # canary job below is where that is watched; this is where the suite has
-      # to be able to go green.
+      # is TCG. These shards are the wide, repeatable measurement and TCG is
+      # what makes them comparable with the dev host's; the `kvm` job below is
+      # the one that executes the instructions TCG only emulates.
       - name: accelerator
         run: ls -l /dev/kvm
 
@@ -107,14 +105,23 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # One test, natively, so that the day the #GP in known-issues §3 is fixed
-  # announces itself instead of waiting for somebody to try again. Red today and
-  # `continue-on-error` because of it: this is a watch, and it may not be able
-  # to hold the whole build red.
-  kvm-canary:
+  # One test, natively — the only gate in this repository that *executes*
+  # `syscall`, `sysret`, `iret` and the segment loads instead of emulating them.
+  # It caught the defect known-issues §3 records: a `STAR[63:48]` whose RPL only
+  # Intel supplies, which put `SS = 0x18` under every user thread on an AMD host
+  # and killed the first `iretq` back to one. Nothing in the suite can see that
+  # class, on this runner or on the dev host, because QEMU's `helper_sysret`
+  # implements Intel's wording whatever the host is.
+  #
+  # **What a green here does not establish.** The vendor of the host is not
+  # ours to choose, and an Intel runner cannot reproduce that defect either way,
+  # so one green is evidence only if the model line below says AMD. That is why
+  # it is printed as part of the verdict rather than buried in a setup step.
+  #
+  # It is a gate and not a watch: it can only go red on something real.
+  kvm:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -142,4 +149,6 @@ jobs:
           rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
 
       - name: one test, on real hardware virtualisation
-        run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats

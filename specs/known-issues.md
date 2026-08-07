@@ -1094,46 +1094,57 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
-### Under KVM the kernel takes a #GP inside a syscall, and TCG has been hiding it
+### CLOSED — under KVM the kernel takes a #GP returning to userland, on AMD only
 
-Every guest boot on a GitHub runner with `-accel kvm` dies within about a
-second of userland starting:
+**Closed 2026-08-07 by `wt/toyos-sysret`: the RPL in `STAR[63:48]` was the
+CPU's to supply and only one vendor supplies it.** `SYSRET` builds both user
+selectors out of that field — SS from it plus 8, CS from it plus 16. Intel's
+SDM forces RPL 3 into both (`SS.Selector := (IA32_STAR[63:48]+8) OR 3`); AMD's
+APM forces it into CS alone and takes SS's straight from the field. The kernel
+put a bare `0x10` there, so on an AMD host every user thread ran with
+`SS = 0x18` instead of `0x1b`.
 
-```
-!!! FAULT rip=0xffff80007b519a02 cr2=0x0000000000000000 err=0x0000000000000018
-          cr3=0x0000000000d6f001 rsp=0xffff800000da1fd8 tid=0
-KERNEL PANIC: general protection fault (error_code=0x18)
-  Syscall: num=86 user_rip=0x100000544ad user_rsp=0xffffffe350
-```
+Nothing notices while it runs — 64-bit mode does not check a data segment. The
+*return* is what dies: an interrupt taken from such a thread pushes `SS = 0x18`,
+and the handler's `iretq` is a return to an outer privilege level, where
+`SS.RPL` must equal `CS.RPL`. 0 is not 3, so `#GP(SS selector)` — the error code
+is literally the selector.
 
-The same `err=0x18` on different syscall numbers (63, 86, 90), in different
-processes, and at the **same kernel offset** — `…9a02` in two boots whose KASLR
-slides differ — so it is one instruction. `0x18` is the GDT selector the kernel
-puts in `STAR[63:48] + 8` for `sysretq`'s SS: user data (`arch/percpu.rs`'s GDT
-comment, `arch/syscall.rs`'s `init`). `cr2` is zero and `rsp` is near the top of
-a kernel stack, so it is the syscall entry/exit stub and not anything the
-handler did.
-
-**The A/B that names the cause** — one runner image, one QEMU (8.2.2 from
-Ubuntu's apt), one commit, one toolchain, one test, run `31205890425`. The only
-difference between the two jobs is whether the job ran `sudo chmod 666
-/dev/kvm`, which is the question `toyos_build::kvm_usable` asks:
+The frame the faulting `iretq` was consuming, printed from the #GP's own
+handler (run `31214761003`, EPYC 7763 and EPYC 9V74, same line on both):
 
 ```
-accel (tcg)  PASS  process_stats  (115ms)   test result: ok
-accel (kvm)  FAIL  process_stats  — KERNEL PANIC: general protection fault (error_code=0x18)
-             ... and again on the harness's re-run alone
+!!! SEG frame@0xffff800000dcffd8 rip=0x1000008fbaa cs=0x23 rflags=0x246
+        rsp=0xfffffff6d0 ss=0x18 | here cs=0x8 ss=0x10 err=0x18
 ```
 
-So it is the accelerator, not the QEMU version and not the host. Reproduced on
-AMD EPYC 7763 and EPYC 9V74 hosts across runs.
+**Vendor, measured.** Run `31212538770`: eight `ubuntu-24.04` runners, eight
+boots each, all eight drawing an AMD EPYC (7763 or 9V74) — **64 of 64 red**,
+every one at `timer::timer_entry+0x174`, which `llvm-objdump` puts on the Ring 3
+path's `iretq`. Two Intel runners drew in other runs of the same probe (Xeon
+6973P-C, Xeon Platinum 8573C) and passed. So the original A/B — TCG green, KVM
+red on run `31205890425` — was the accelerator *and* the vendor at once, and
+only the vendor mattered: QEMU's `helper_sysret` implements Intel's wording, so
+TCG behaves like an Intel CPU whatever the host is.
 
-This is not a CI defect. It is a property of the kernel the dev host **cannot**
-observe: that host is arm64, so every guest on it is cross-arch TCG, which
-emulates the segmentation and `syscall`/`sysret` paths rather than running them.
-`.github/workflows/probe-accel.yml` reproduces it in about eight minutes, and
-`ci.yml`'s guest shards therefore run under TCG with a KVM canary beside them,
-so the day this is fixed is visible. `specs/ci-plan.md` §7.
+**Two things this cost that are worth keeping.** The first reading of the report
+took `Syscall: num=86 user_rip=…` as evidence the fault was in the syscall stub;
+that line is the *last syscall this thread made* and `crash_report_exception`
+prints it for every kernel-mode fault, so it says nothing about where the fault
+is. And the report printed sixteen GPRs and not one segment register, which is
+what made a #GP whose error code is a selector unreadable — `cs`, `ss` and
+`rflags` are in it now.
+
+**Still open on this path, and unmeasured:** AMD's `SYSRET` does not reload SS's
+*cached descriptor* either (Linux calls this `X86_BUG_SYSRET_SS_ATTRS`), so a
+`sysretq` taken while `SS` is NULL leaves userland with an SS that looks like
+`0x1b` and raises `#SS` when used. The kernel can reach that — an IDT entry from
+Ring 3 nulls SS, `timer_handler` calls `do_preempt`, and the incoming thread may
+be one parked in a syscall that returns by `sysretq` — and it has no `#SS`
+handler, so the escalation would be `#DF`. Not observed: the full suite is green
+under KVM on AMD with the RPL fixed (see the KVM job in `ci.yml`). Linux's
+workaround is one `mov ss, __KERNEL_DS` in its context switch; ours would go in
+`KernelHw::switch`, which is the single site.
 
 ### CLOSED — two CPUs shooting down at once wait for each other and both panic
 
