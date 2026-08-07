@@ -254,7 +254,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libloading"
 version = "0.8.9"
-source = "git+https://github.com/Japabu/rust_libloading?branch=toyos#2ca5f54b09bcadaa6ef72af94d94724e143b5820"
+source = "git+https://github.com/Japabu/rust_libloading?branch=toyos#fa0abe774f6f891a5d8918ac554bc43004232cf2"
 dependencies = [
  "cfg-if",
  "toyos-abi",

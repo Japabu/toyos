@@ -5900,12 +5900,90 @@ fn run_machine_test(
                     stamps.first()
                 ));
             }
+            // The line beside every heartbeat, and the reason it is there: the
+            // T14's freeze reads `alive=8/8 ran=0` under both live hypotheses,
+            // and only the pin's own state separates them. What has teeth here
+            // is not that the line exists but that its vector is *read back off
+            // the chip* and matches the one `init` said it programmed — a probe
+            // printing a literal, or reading the wrong register, disagrees.
+            let armed = log
+                .lines()
+                .find_map(|l| l.split("scanning on, GSI ").nth(1))
+                .map(|s| s.to_string());
+            let Some(armed) = armed else {
+                return Err(format!(
+                    "no i8042 arming line on a Profile::Metal guest, so nothing says which GSI or \
+                     vector the probe below should have read\n{log}"
+                ));
+            };
+            // `1 -> vec 0x24 apic 0 on`
+            let mut fields = armed.split_whitespace();
+            let kbd_gsi = fields.next().unwrap_or("").to_string();
+            let vector = fields.nth(2).unwrap_or("").trim_start_matches("0x").to_string();
+            let lines: Vec<&str> = log.lines().filter(|l| l.contains("i8042: line ")).collect();
+            if lines.len() < beats.len() {
+                return Err(format!(
+                    "{} `i8042: line` reading(s) against {} heartbeats — the pin's state is what \
+                     separates a machine with nothing to do from one whose input died, and it has \
+                     to be readable at every heartbeat or the pairing is a guess\n{log}",
+                    lines.len(),
+                    beats.len(),
+                ));
+            }
+            // `rte=0x0000000000000024`: the vector is the low byte, bit 16 is
+            // the mask. Both are the chip's answer, not ours.
+            let healthy = |l: &str| {
+                l.split("rte=0x")
+                    .skip(1)
+                    .map(|e| e.split_whitespace().next().unwrap_or(""))
+                    .all(|e| {
+                        u64::from_str_radix(e, 16).is_ok_and(|entry| {
+                            entry & 0xFF == u64::from_str_radix(&vector, 16).unwrap_or(0)
+                                && entry & (1 << 16) == 0
+                        })
+                    })
+            };
+            let wrong: Vec<&&str> = lines.iter().filter(|l| !healthy(l)).collect();
+            if !wrong.is_empty() || !lines.iter().all(|l| l.contains(&format!("kbd gsi={kbd_gsi} "))) {
+                return Err(format!(
+                    "{} of {} `i8042: line` readings carry an entry that is masked, or whose vector \
+                     is not the {vector} `init` programmed on GSI {kbd_gsi} — the probe is not \
+                     reading the chip\n{}\n{log}",
+                    wrong.len(),
+                    lines.len(),
+                    wrong.iter().take(4).map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
+                ));
+            }
+            // OBF stuck is the state the probe exists to name, so a healthy
+            // guest must never show it — otherwise the reading is noise and a
+            // metal log carrying it proves nothing.
+            let obf: Vec<&&str> = lines
+                .iter()
+                .filter(|l| {
+                    l.split("status=0x")
+                        .nth(1)
+                        .and_then(|s| u8::from_str_radix(s.split_whitespace().next()?, 16).ok())
+                        .is_some_and(|s| s & 1 != 0)
+                })
+                .collect();
+            if !obf.is_empty() {
+                return Err(format!(
+                    "{} of {} `i8042: line` readings found the output buffer full on a guest whose \
+                     input is healthy — a set bit there is meant to mean the controller is holding \
+                     a byte no ISR will ever read\n{}\n{log}",
+                    obf.len(),
+                    lines.len(),
+                    obf.iter().take(4).map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
+                ));
+            }
             eprintln!(
                 "  [heartbeat] {} lines in ~3 s, all alive=8/8, {moved} with ran>0, widest gap \
-                 {worst:.3}s, t={} → t={}",
+                 {worst:.3}s, t={} → t={}; {} i8042 line reading(s), vec 0x{vector} on gsi \
+                 {kbd_gsi}, none masked, none with OBF set",
                 beats.len(),
                 stamps.first().unwrap_or(&"?"),
-                stamps.last().unwrap_or(&"?")
+                stamps.last().unwrap_or(&"?"),
+                lines.len(),
             );
             Ok(())
         }
