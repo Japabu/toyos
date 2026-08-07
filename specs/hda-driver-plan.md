@@ -1327,6 +1327,16 @@ here can no longer un-decide the userspace-driver direction — it can only say
 this move made guest audio worse. Risk 3 is still what the gate prices; what is
 gone is the cheap exit.
 
+**And the gate did not price it, because the instrument was down.** The A arm —
+`main`, no delta — failed the thorough tier on its own at 10 dropouts in 120 runs
+against a recorded 0/120, which is `known-issues.md` §4's new entry and the rate
+that section had been asking for. Both B-arm attempts then stopped at iterations
+2 and 4 on a kernel double-panic in the TLB shootdown work that landed between
+the arms (§3). So **risk 3 remains unmeasured**, and the accounting above — one
+syscall per period, before and after — is what H3 actually delivers on it. What
+the change has instead is a full suite at 289/289 with all four audio configs
+clean, and ten standalone runs of the audio family; none of that is a rate.
+
 ### 6.5 What H0's boot did *not* leave behind
 
 **H0's `(a)` block is not in this repository.** §6.4 records seven findings and
