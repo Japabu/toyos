@@ -4,9 +4,11 @@ pub mod user_span;
 mod alloc;
 mod mmio;
 mod region;
+mod unmapped;
 
 pub use mmio::Mmio;
 pub use region::KernelSlice;
+pub use unmapped::Unmapped;
 
 use crate::MemoryMapEntry;
 pub use pmm::Region;

@@ -150,11 +150,7 @@ pub fn init(madt: &MadtInfo) {
     for entry in &madt.io_apics {
         // 0x20 covers IOREGSEL and IOWIN; every redirection entry is reached
         // through those two, so the window never needs to be larger.
-        let mmio = crate::mm::paging::kernel()
-            .lock()
-            .as_mut()
-            .unwrap()
-            .map_mmio(entry.address as u64, 0x20, CachePolicy::DeferToMtrr);
+        let mmio = crate::mm::paging::map_mmio(entry.address as u64, 0x20, CachePolicy::DeferToMtrr);
         let mut unit = Unit { mmio, gsi_base: entry.gsi_base, entries: 0 };
         let ver = unit.read(REG_VER);
         let version = ver & 0xFF;
