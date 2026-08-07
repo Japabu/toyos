@@ -1400,16 +1400,23 @@ if the test *passes* where the entry says a pass is proof, and is red on
 date rather than a green run. The `--skip` flag that used to be the answer is
 deleted: an exclusion nobody reviews cannot expire, and this one has to.
 
-**A stale `--skip` command line is worse than a refused one, measured
-2026-08-06.** The flag is gone but the words still parse, and `--land --gate
+**CLOSED — a stale `--skip` command line was worse than a refused one, measured
+2026-08-06.** The flag was gone but the words still parsed, and `--land --gate
 cargo test -- --skip desktop_window_child` — the form CLAUDE.md and every
-handover carried until this week — now reaches the harness as two *filters*.
+handover carried until that week — reached the harness as a *filter*.
 It ran exactly one test, `desktop_window_child`, declared it expected, and
 landed on that. `--land` does print `the gate was NOT the default cargo test`,
-which is the only thing that saved it; the run itself looks like a pass. Use
-the ordinary gate. A stale feature name is refused against `kernel/Cargo.toml`
-before any lock and a stale gate flag is not, which is the asymmetry to close
-if this bites twice.
+which is the only thing that saved it; the run itself looks like a pass.
+
+The asymmetry that entry named — a stale feature name refused against
+`kernel/Cargo.toml` before any lock, a stale gate flag not refused at all — is
+closed. `toyos_build::testargs::parse` holds one table of the flags the suite
+has, refuses anything else by name and by consequence, and returns the filter
+out of the same pass, so no word can be a flag's value to one reader and the
+filter to another. It is the first thing `main` does, before the sysroot lock
+and before anything is compiled. A flag added to the harness and not to that
+table is refused the first time it is typed, which is the direction of drift
+that says so rather than the one that narrows a gate.
 
 **What the declaration will and will not absorb.** Its `says` list covers the
 six of this test's messages whose failure is *the desktop ceasing to answer
@@ -4122,15 +4129,125 @@ aims all of them at a dead device on one event.
   `Sink::flush` then calls `vfs.flush_file` and `vfs.sync_mount`, which reach
   `msc_write`/`msc_flush`, which take `XHCI` and spend the transfer budget per
   command.
-- There is no gate for the dangerous window — device gone, teardown not yet run,
-  which is the 100 ms of debounce. A QEMU `device_del` cannot be aimed inside it,
-  and a gate that cannot be aimed is a gate that passes for the wrong reason.
+- ~~There is no gate for the dangerous window~~ — there is now a gate for the
+  *pull*, `usb_boot_stick_pulled`, and what it certifies is below. It is still
+  not a gate for the 100 ms debounce and still cannot be aimed inside it.
 
 **A negative result worth keeping.** The change did not make
 `desktop_window_child` green; it stayed red across two landing gates. That is
 evidence *against* the desktop freeze and the unplug freeze sharing the xHCI
 path, and it agrees with the scheduler track's independent exclusion of the
 ticket lock — two tracks reaching the same exclusion from different directions.
+
+#### The instrument, and what it showed
+
+`usb_boot_stick_pulled` (`tests/common/usb.rs`) is the first reproduction
+attempt anywhere but the owner's desk. The boot stick had no QEMU device id —
+every earlier unplug test names a *data* disk, which carries neither `/boot` nor
+`/log` — so `qemu::BOOT_STICK_ID` is new and the pull is `device_del` on it. It
+boots metalcase on `Profile::Metal` at eight cores with `log-rotate-fast`, so the
+sink creates, sweeps, deletes and syncs rather than only appending; it drives a
+drumbeat of `run` lines through test-runner, each a userland `println!` into the
+ring the sink drains to the stick and a VFS walk for a binary that is not there;
+it pulls the stick mid-drumbeat; and then it plugs one back in. The verdicts are
+two liveness ceilings on paths that share no mechanism — the compositor's 2 s
+frame report, which is the owner's clock that stops advancing, and a console
+round trip that comes back through the VFS. A red prints `freeze_report`:
+`info registers -a` first, Ctrl+Alt+D second.
+
+**It is green, and the hazard was staged rather than missed.** The pull landed
+with a write outstanding — `transport broke on SCSI 0x2a: no answer in the
+command phase`, then `slot 1 would not take a Bulk-Only Reset`, then
+`reset recovery failed; disk is offline`, all 89 ms *before* `xHCI: port 1
+disconnected` — which is the device-gone-teardown-not-yet-run window the entry
+above says cannot be aimed at. It was hit by accident and survived: 40/40 console
+probes answered and the desktop kept drawing, and 40/40 again after the replug.
+
+So the finding is that **QEMU does not reproduce it**, and the reason is
+visible: `c4ba7d5` ends a transfer when the slot's port reads disconnected, and
+`device_del` drops CCS at once, so nothing here ever spends the 2 s budget. What
+follows is therefore read out of the code rather than watched.
+
+#### One hypothesis killed by the code, on the machine that matters
+
+**`drain_serial`'s `BackendGuard::lock` cannot be the T14's freeze.** That
+machine has no 16550 and no virtio-console, so `serial::has_console()` is false
+for the whole boot and `log_ring::set_serial_sink(false)` pins `LogRing::len` at
+zero. `drain_chunk_to_serial` therefore returns 0 on its first call,
+`drain_serial` leaves its loop, and the backend guard is held for one memcpy of
+nothing. What makes that lock dangerous — unbounded work with interrupts off —
+needs a backend, and that machine has none.
+
+#### The mechanism the code does support, end to end
+
+A chain, each link with the line that carries it. Nothing here has been watched;
+every link is checkable by reading.
+
+1. **One `XHCI` ticket lock serves every controller**
+   (`drivers/xhci/mod.rs`, `static XHCI: Lock<Vec<XhciController>>`), and
+   `storage_write`/`storage_flush` take it from whatever thread is writing — the
+   idle loop's `log_file::poll`, a page-cache fill, a syscall.
+2. **`poll_if_pending` takes the same lock at the top of every scheduler pass.**
+   X2a made the *work* behind it submit-and-return; the *acquisition* is still a
+   blocking spin against whoever holds it. A stick that has gone leaves port work
+   pending, so every CPU entering `drain_irqs` reaches that `XHCI.lock()`.
+3. **`Lock::lock` spins with interrupts enabled.** `preempt::disable()` is a
+   per-CPU counter and touches nothing in `RFLAGS`. A convoy on this lock
+   therefore reads `HLT=0` with `IF` **set** — neither of the two answers the
+   #156 capture taught us to look for.
+4. **At 500M spins it panics `DEADLOCK`.** On a CPU running a userland thread
+   inside a syscall, `main.rs`'s `#[panic_handler]` takes the branch
+   `percpu::syscall_rip() != 0 && percpu::current_tid().is_some()`, which calls
+   `discard_capture()` and then `try_recover_from_panic()`. **A recovering panic
+   never paints**, and on a machine with no console `panic_flush` has already
+   returned early on `!has_console()`. The report exists in the ring and is
+   discarded by the code that decided the panic was survivable.
+5. **And the ticket is stranded.** `Lock::lock` does `ticket.fetch_add(1)` before
+   it spins, and `now` is advanced only by `LockGuard::drop` — a thread that
+   panics inside the spin never constructs a guard. Poisoning it leaves `now`
+   permanently one short of every ticket behind it, so **every later acquirer of
+   that lock waits forever, machine-wide, for the rest of the boot.**
+
+The chain ends where the owner's machine does: nothing scheduled because no CPU
+completes a pass, the clock stopped, the keyboard dead because a scancode is
+decoded by `i8042::service` inside `drain_irqs`, Ctrl+Alt+D silent because
+`keyboard::take_dump_request` is read from the same place, no panic screen, and
+no log anywhere.
+
+**This also repairs the argument that withdrew the ticket-lock diagnosis.** That
+withdrawal rested on the owner seeing no `LOCK CONTENTION` line. On the T14 that
+line is unobservable by construction — it goes to the log ring, whose serial sink
+does not exist and whose file sink is on the stick that was just pulled — and the
+absence of a line that cannot be printed is not evidence. What the withdrawal got
+right is the missing *panic screen*, and step 4 accounts for that too.
+
+**Two defects, either worth fixing on its own.**
+
+- **A deadlock panic is classified recoverable because a syscall happens to be in
+  progress.** The predicate asks whether a userland thread is current, not
+  whether the kernel can continue. For `Lock::lock`'s own deadlock it
+  demonstrably cannot, and the handler's response is to throw away the on-screen
+  report and make the deadlock permanent.
+- **A ticket lock cannot survive an abandoned waiter.** The queue form of the
+  "locks a dead thread can strand" class in §2, and worse than the held-guard
+  form: the abandoning thread never held the lock, so nothing in the code reads
+  as if it owned anything to release.
+
+#### What the owner should run, and what each outcome means
+
+The one change that would make his machine legible is small and is not made:
+give `Lock::lock`'s deadlock panic the fatal path, so it reaches
+`halt_all_cpus` and the panic console paints the lock's name and its call site.
+A stick pulled out of a T14 would then answer the question by itself, on the
+panel, in a photograph. Without it the machine is dark by design at step 4.
+
+Until then the discriminator costs one boot and no reflash: pull the stick and
+**wait a full minute without touching the machine**, watching the panel. `pause`
+is documented at about 140 cycles on Skylake and later, so 500M spins is on the
+order of half a minute on this laptop — an estimate from the datasheet, not a
+measurement. A panic screen inside that window is the convoy, named. A minute of
+nothing is what step 4 predicts, and is the reason the change above is worth
+making before he is asked for anything else.
 
 ### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
 

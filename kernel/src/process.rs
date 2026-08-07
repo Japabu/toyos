@@ -1240,20 +1240,40 @@ pub fn thread_sched(pid: Pid, tid: Tid) -> Option<ThreadSched> {
     table.get(pid)?.threads.get(tid)?.sched().cloned()
 }
 
+/// The physical address of a futex word, demand-paged in like any other user
+/// access.
+///
+/// The scheduler dereferences this long after the syscall returns
+/// (`scheduler::futex_wait` reads `*phys as u32` on every wake check), so the
+/// alignment is not the caller's manners: a word four bytes below a 2 MiB
+/// boundary would have its tail read out of the next *physical* page, which
+/// belongs to somebody else.
+fn futex_word(addr: UserAddr) -> Option<crate::mm::DirectMap> {
+    if addr.raw() % 4 != 0 {
+        return None;
+    }
+    crate::user_ptr::translate_user(addr)
+}
+
 /// Atomically check a user futex word and block if it matches the expected value.
-/// Returns 0 if woken normally, 1 if timed out, u64::MAX on error.
-pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
+/// Returns 0 if woken normally, 1 if timed out, an error if `addr` names no
+/// word this process may have.
+///
+/// It takes a [`UserAddr`] rather than a `u64` because the bound is the whole
+/// safety of the call and it used to live at the two syscall arms, spelled as
+/// an expression whose value was discarded — dead-looking code protecting a
+/// `pub fn` in another file, which a third caller would not have known to
+/// repeat.
+pub fn futex_wait(addr: UserAddr, expected: u32, timeout_ns: u64) -> u64 {
     let deadline = if timeout_ns != u64::MAX {
         crate::clock::nanos_since_boot().saturating_add(timeout_ns)
     } else {
         0
     };
 
-    // Translate virtual → physical so cross-process futex works on shared memory
-    let phys_addr = match scheduler::current_address_space()
-        .and_then(|pt| pt.lock().translate(UserAddr::new(addr))) {
-        Some(pa) => pa,
-        None => return u64::MAX,
+    // Physical, so a futex in shared memory works across processes.
+    let Some(phys_addr) = futex_word(addr) else {
+        return toyos_abi::syscall::SyscallError::BadAddress.to_u64();
     };
 
     if scheduler::futex_wait(phys_addr, expected, deadline) {
@@ -1264,11 +1284,9 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
 }
 
 /// Wake up to `count` threads blocked on the same physical address as `addr`.
-pub fn futex_wake(addr: u64, count: u64) -> u64 {
-    let phys_addr = match scheduler::current_address_space()
-        .and_then(|pt| pt.lock().translate(UserAddr::new(addr))) {
-        Some(pa) => pa,
-        None => return 0,
+pub fn futex_wake(addr: UserAddr, count: u64) -> u64 {
+    let Some(phys_addr) = futex_word(addr) else {
+        return toyos_abi::syscall::SyscallError::BadAddress.to_u64();
     };
     scheduler::futex_wake(phys_addr, count as usize)
 }

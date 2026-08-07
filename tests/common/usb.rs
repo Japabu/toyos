@@ -2637,3 +2637,180 @@ pub fn usb_refused_disk_first(
     );
     Ok(())
 }
+
+/// The stick the machine booted from, pulled while the desktop is up.
+///
+/// **The instrument for #152, and the reason it exists is that the failure has
+/// no other witness.** `/log` is on the stick, so the recording of the event
+/// dies with the event; the machine has no serial port; it is not a panic, so
+/// the on-screen console never paints; and Ctrl+Alt+D answers nothing. Three
+/// investigations ran on the owner's description alone.
+///
+/// The pull is `device_del` on the boot stick, which had no device id until
+/// this gate needed one — every earlier unplug test names a *data* disk, and a
+/// data disk carries neither `/boot` nor `/log` nor the mount the log sink
+/// writes through. That difference is the whole scenario.
+///
+/// The liveness signal is `compositor: frames=`, for the reason
+/// `metal_sim_pointer_churn` picked it: it comes from a composited frame, so
+/// its absence is a desktop that stopped drawing rather than an instrument that
+/// stopped counting — which is exactly what the owner reports, a clock that
+/// stops advancing. The second probe is the serial console, which reaches
+/// userland through a different path: `run` makes test-runner print a line and
+/// then walk the VFS looking for a binary.
+///
+/// **A green run does not certify the machine survives an unplug.** It
+/// certifies that this shape of unplug, on this emulated controller, leaves the
+/// guest drawing and answering. What it *is* good for is red: a red here is the
+/// first reproduction of the owner's freeze anywhere but his desk.
+pub fn usb_boot_stick_pulled(
+    test_config: &Path,
+    _c_bins: &[(String, Vec<u8>)],
+    _rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let _ = test_config;
+    /// Probes sent before the pull, and after it. The drumbeat is the liveness
+    /// signal as well as the load: each one is a userland `println!` into the
+    /// ring the log sink drains to the stick, and a VFS walk for a binary that
+    /// is not there.
+    const BEFORE: usize = 12;
+    const AFTER: usize = 40;
+    /// How many of the probes after the pull have to come back. Not all of
+    /// them: a machine that pauses while the driver tears the port down and
+    /// then carries on has survived, and this gate's subject is a machine that
+    /// never carries on.
+    const ANSWERED: usize = 8;
+
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+    let options = BootOptions {
+        profile: Profile::Metal,
+        qmp: true,
+        // Rotation at 256 bytes rather than a mebibyte, so the sink is not just
+        // appending when the device goes: every few probes it creates a file,
+        // sweeps the volume, deletes the oldest and syncs the mount. That is
+        // FAT allocation and directory writes in flight at the moment of the
+        // pull, which is the state the owner's machine is in and the one a
+        // quiet idle desktop never reaches.
+        kernel_features: &["log-rotate-fast"],
+        // The T14's core count. How many CPUs are in the idle loop when the
+        // device goes is the whole question on one hypothesis.
+        smp: 8,
+        ..Default::default()
+    };
+    let argv = qemu::profile_argv(&options);
+    if !argv.iter().any(|a| a.contains(&format!("id={}", qemu::BOOT_STICK_ID))) {
+        return Err(format!("the boot stick has no device id, so it cannot be pulled: {argv:?}"));
+    }
+
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let socket = qemu.qmp_socket().to_path_buf();
+    let mut console = qemu.boot_log().to_string();
+    let frames = |text: &str| text.matches("compositor: frames=").count();
+
+    // The machine has to be drawing before it is asked to survive anything, or
+    // a green run is a boot that never started.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && frames(&console) < 1 {
+        console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    if frames(&console) < 1 {
+        return Err(format!("the compositor never composited a frame:\n{console}"));
+    }
+
+    // And it has to be writing to the stick, or the pull is a disconnect with
+    // nothing in flight — which is not the state the owner's machine is in.
+    // The sink names the file it installed on `/log`, and that volume is on the
+    // device this test is about to take away.
+    if !console.contains("log-file: this boot's kernel log is /log/") {
+        return Err(format!(
+            "no log sink installed on /log, so the stick is not being written to and this gate \
+             stages nothing:\n{console}"
+        ));
+    }
+
+    let mut probe = |qemu: &mut QemuInstance, console: &mut String, i: usize| {
+        let _ = writeln!(qemu.stdin_mut(), "run pull-probe-{i}");
+        qemu.flush_stdin();
+        console.push_str(&qemu.drain_serial(Duration::from_millis(120)));
+    };
+
+    for i in 0..BEFORE {
+        probe(&mut qemu, &mut console, i);
+    }
+    let answered_before = console.matches("===TEST_END pull-probe-").count();
+    if answered_before < BEFORE / 2 {
+        return Err(format!(
+            "only {answered_before} of {BEFORE} probes came back *before* the pull, so the \
+             drumbeat this gate measures does not work on a healthy machine:\n{console}"
+        ));
+    }
+    // The rotation actually ran, so "the sink was busy" is a fact rather than a
+    // feature flag that might have been dropped.
+    if !console.contains("log-file: /log/") || !console.contains("and this boot continues in") {
+        return Err(format!(
+            "the log sink never rotated, so the pull below lands on a sink that is only \
+             appending:\n{console}"
+        ));
+    }
+
+    let pulled_at = console.len();
+    let mut devices = qemu::QmpDevices::open(&socket);
+    devices.del(qemu::BOOT_STICK_ID);
+    drop(devices);
+
+    for i in BEFORE..BEFORE + AFTER {
+        probe(&mut qemu, &mut console, i);
+    }
+    let after = &console[pulled_at.min(console.len())..];
+    let answered = after.matches("===TEST_END pull-probe-").count();
+    let drawn = frames(after);
+    if answered < ANSWERED || drawn < 2 {
+        return Err(format!(
+            "the boot stick was pulled and the machine answered {answered} of {AFTER} console \
+             probes and composited {drawn} frame batches after it (want {ANSWERED} and 2) — it \
+             stopped:\n{console}\n{}",
+            crate::freeze_report(&mut qemu, &mut console)
+        ));
+    }
+
+    // And the same stick put back. The owner reports the freeze from a replug
+    // as well as from a pull, and the two are different states: a replug binds
+    // a new disk under mounts that still name the old one.
+    let replug = test_dir().join("usb-replug.img");
+    drop(sparse(&replug, 512 * 1024 * 1024));
+    let replugged_at = console.len();
+    let mut devices = qemu::QmpDevices::open(&socket);
+    devices.blockdev_add("replug", &replug);
+    devices.add("usb-storage", "xhci.0", "replug0", &[("drive", "replug")]);
+    drop(devices);
+
+    for i in BEFORE + AFTER..BEFORE + 2 * AFTER {
+        probe(&mut qemu, &mut console, i);
+    }
+    let after_replug = &console[replugged_at.min(console.len())..];
+    let answered_replug = after_replug.matches("===TEST_END pull-probe-").count();
+    let drawn_replug = frames(after_replug);
+    if answered_replug < ANSWERED || drawn_replug < 2 {
+        return Err(format!(
+            "a stick was plugged back into the port the boot stick was pulled from and the \
+             machine answered {answered_replug} of {AFTER} console probes and composited \
+             {drawn_replug} frame batches after it (want {ANSWERED} and 2) — it stopped:\
+             \n{console}\n{}",
+            crate::freeze_report(&mut qemu, &mut console)
+        ));
+    }
+
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if console.contains(bad) {
+            return Err(format!("{bad:?} after the boot stick was pulled\n{console}"));
+        }
+    }
+    let _ = std::fs::remove_file(&replug);
+
+    eprintln!(
+        "  [usb] the boot stick was pulled out from under a running desktop with the log sink \
+         rotating: {answered}/{AFTER} console probes answered and {drawn} frame batches after \
+         the pull, {answered_replug}/{AFTER} and {drawn_replug} after a stick went back in"
+    );
+    Ok(())
+}

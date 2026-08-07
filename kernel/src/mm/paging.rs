@@ -449,9 +449,18 @@ impl AddressSpace {
     }
 
     /// Translate a user virtual address to a DirectMap handle.
-    /// Returns None if the page is not mapped.
+    /// Returns None if the page is not mapped, or if `vaddr` is not a user
+    /// address at all.
+    ///
+    /// The bound is here rather than at the eight callers because a user
+    /// address space shallow-copies the kernel's PML4 half: a kernel address
+    /// walks to the direct map's own 2 MiB leaf, and the caller gets a
+    /// writable pointer into kernel memory.
     pub fn translate(&self, vaddr: UserAddr) -> Option<super::DirectMap> {
         let va = vaddr.raw();
+        if !super::user_span::is_user_addr(va) {
+            return None;
+        }
         let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
         let pdpt = self.root.child(pml4_idx)?;
         let pd = pdpt.child(pdpt_idx)?;

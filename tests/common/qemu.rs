@@ -504,6 +504,14 @@ pub fn usb_device_id(i: usize) -> String {
     format!("usbdev{i}")
 }
 
+/// The boot stick's device id.
+///
+/// The data disks have carried one since a test first had to unplug one; the
+/// stick the machine booted from had none, so the one device whose removal
+/// takes `/boot` and `/log` with it was the one the host could not name — which
+/// is the removal the owner's machine dies on.
+pub const BOOT_STICK_ID: &str = "bootstick";
+
 /// What every profile but [`Profile::MetalDisk`] gives the guest. Large
 /// enough for a filesystem, small enough that a boot formats it quickly.
 const NVME_SMALL: u64 = 128 * 1024 * 1024;
@@ -1065,8 +1073,8 @@ pub fn build_boot_image(
 /// Actuators that are a `SYS_DEBUG` action arm and nothing else.
 ///
 /// A boot cannot reach any of them; only a test that asks for one by number
-/// can. So the four kernels that differ only in which of them they carry are
-/// four builds of the same machine, and [`fold_inert`] makes them one.
+/// can. So the kernels that differ only in which of them they carry are
+/// several builds of the same machine, and [`fold_inert`] makes them one.
 ///
 /// **Membership is a claim about the kernel, not about the test that uses it**,
 /// and the claim is checkable: each name below has its `#[cfg]` sites in
@@ -1079,6 +1087,7 @@ const INERT_ACTUATORS: &[&str] = &[
     "test-screen-graffiti",
     "test-double-fault",
     "test-heap-ceiling",
+    "test-kernel-canary",
 ];
 
 /// The feature set to build, with every inert actuator replaced by the union of
@@ -2032,7 +2041,7 @@ fn qemu_command(
 
     qemu.arg("-device")
         .arg(format!(
-            "usb-storage,bus={},drive=stick,bootindex=0",
+            "usb-storage,bus={},drive=stick,id={BOOT_STICK_ID},bootindex=0",
             shape.storage_bus
         ))
         .arg("-vga")

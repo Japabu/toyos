@@ -237,13 +237,46 @@ the result:
 kernel/src/scheduler.rs:326:   if unsafe { *phys_addr.as_ptr::<u32>() } != expected {
 ```
 
-A process passing a kernel address gets a **binary oracle over all of kernel
-memory**: `futex_wait` returns immediately when the word differs and blocks when
-it matches. Roughly 32 syscalls per word read, no crash, no trace. It is in
-scope because it is the same defect and the same fix; `AddressSpace::translate`
-has exactly eight callers (`user_ptr.rs:65,71`, `io_uring.rs:248`,
-`process.rs:1202,1217,1320,1504`, `syscall.rs:1827`) and closing the bound at
-the primitive closes all three at once.
+**Correction — the oracle is not reachable, and I reported that it was.** An
+earlier revision of this section claimed a process could pass a kernel address
+and read kernel memory a bit at a time. It cannot. Both syscall arms guard the
+address before calling:
+
+```
+kernel/src/arch/syscall.rs:383:  if ctx.user_ref::<u32>(UserAddr::new(a1)).is_none() { return bad_addr; }
+kernel/src/arch/syscall.rs:387:  if ctx.user_ref::<u32>(UserAddr::new(a1)).is_none() { return bad_addr; }
+```
+
+`user_ref` applies `check_user_range` (`user_ptr.rs:186`), which caps the range
+at `0x0000_8000_0000_0000`, and requires 4-byte alignment (`user_ptr.rs:189`).
+A kernel address is refused before `process::futex_wait` is ever reached, and
+those two are its only callers. The claim was wrong because I read
+`process.rs` and `scheduler.rs` and did not read the dispatch arm that calls
+them.
+
+**What is actually wrong here, and it is a latent defect rather than a live
+one.** The bound is a property of *the call site*, in a different file from the
+function it protects, and it is spelled as an expression whose value is thrown
+away. `process::futex_wait` is `pub`, takes a raw `u64`, and is safe only
+because two callers elsewhere remember. Two ways that bites: a third caller —
+an io_uring futex op, a kernel-internal wake — opens the oracle with no local
+sign anything is wrong; and the guard *reads like dead code*, so tidying it away
+would open the oracle silently. It is the same "signature promising a check it
+never performs" pattern §7 lists, inverted: a check performing a promise its
+signature does not make.
+
+So futex stays in M1a's scope, demoted from *fix an exploitable primitive* to
+*move a bound to where it cannot be forgotten* — which is what closing it at
+`AddressSpace::translate` does anyway. That primitive has exactly eight callers
+(`user_ptr.rs:65,71`, `io_uring.rs:248`, `process.rs:1202,1217,1320,1504`,
+`syscall.rs:1827`), and one bound at the bottom retires the question for all of
+them.
+
+**#158 itself is unaffected and remains live.** `SYS_DLOPEN`'s arm validates
+`a1`/`a2` (the path) with `user_str` and passes `a3` straight through with no
+check of any kind (`syscall.rs:358-361`), so `init_out` reaches `translate`
+unguarded. It is the one genuinely unvalidated address of the three, and it is
+therefore M1a's first commit rather than futex.
 
 ## 3. The four stages
 
@@ -254,6 +287,46 @@ Each leaves `main`'s tip green and is landed separately with
 
 *The largest live attack surface, and the only stage with no TLB or scheduler
 exposure. It lands first.*
+
+**M1a is built.** Three commits: dlopen's `init_out` and the copy accessors,
+the bound in `translate` with futex's signature, and the typed call sites with
+`user_ref`/`user_mut`/`user_slice_of_mut` deleted. M1b — the 33 bulk-buffer
+sites onto `UserBytes` — is not.
+
+Four things a reader of the plan below needs, because the built shape differs
+from it or settles something it left open:
+
+- **The #158 write was verified, not assumed.** A transient probe in the kernel
+  translated its own canary's address inside a live user address space:
+  `translate(0xffff80007cf7dc90)` answered `DirectMap(0x7cf7dc90)`, a writable
+  kernel pointer. The direct map is built with `map_2m`, so the walk really does
+  find a present 2 MiB leaf. (§2.5's withdrawn claim is why this was checked
+  rather than repeated.)
+- **A typed value that would cross a 2 MiB boundary is refused, not copied
+  piecewise.** The plan says "validating the whole span the way the slice
+  accessors already do", and the slice accessors *permit* a crossing when the
+  two physical pages happen to be contiguous. A copy could have done the same —
+  translate each page, copy each piece — and that was rejected for two reasons.
+  It is more code for a value of at most 48 bytes that userland can always
+  move; and it makes the gate unwritable, because mmap hands out physically
+  contiguous pages, so a correct piecewise copy writes exactly the bytes the
+  broken code wrote and no assertion can tell them apart. Refusing is one
+  comparison, and it is observable.
+- **`test-kernel-canary` is the actuator the dlopen gate needs**, and it joins
+  the inert-actuator bundle, so it costs no extra kernel build. A guest cannot
+  read a byte of the kernel's address space, so a syscall that writes there
+  leaves nothing to assert on; SYS_DEBUG 10 and 11 answer where sixteen known
+  bytes are and whether they still say what the kernel put there.
+- **The bound futex needed was not only the user/kernel one.** Deleting the
+  dispatch arms' `user_ref::<u32>(…).is_none()` probe would have taken the
+  *alignment* check and the demand paging with it, and the scheduler
+  dereferences a futex word on every wake check — an unaligned one reads its
+  tail out of the next physical page. `futex_word` carries both.
+
+The arithmetic lives in `kernel/src/mm/user_span.rs`, pure and with no `crate::`
+reference, compiled into `kernel-span/` for the host the way `kernel-loom`
+compiles `sync.rs`. `check_user_range` was a third home for the same constant
+and is gone; `in_user_half` is the one, and `sys_mmap` and the loader call it.
 
 **Fix shape.**
 
@@ -310,6 +383,22 @@ exposure. It lands first.*
 | guest | `spawn` with `SpawnArgs` straddling returns `BadAddress` | as above |
 | guest | `dlopen` with `init_out` naming a kernel address returns an error and the machine survives | revert #158's routing → the guest writes kernel memory; assert on a canary the kernel checks |
 | guest | `futex_wait` on a kernel address returns an error rather than blocking-or-not | revert → the oracle answers; the test distinguishes the two outcomes |
+
+**Built, and every control was seen red before it was seen green.**
+`kernel-span`'s six host tests are the first row: each of its three arms
+deleted alone reds exactly one test (straddle, bound, alignment), in 0.00 s.
+`abuse_page_straddle` is rows two and three; with the straddle arm deleted it
+reds twice, `fstat wrote 16 bytes past the end of the physical page it
+translated` and `spawn read a straddling SpawnArgs and started Pid(3)` — and it
+asserts the memory *before* the verdict, because an error return the kernel
+produced after making the write is exactly what the gate is for.
+`abuse_kernel_addr` is rows four and five. Its dlopen control is the transient
+probe above, which changes the canary and reds the run; its futex control is
+one line — `is_user_addr` returning true disables both the constructor and
+`translate`'s bound — and reds on `futex_wait answered 0x0 for a kernel address
+and expected=0x0`, which is the oracle answering. The dlopen half stays green
+under *that* control, because `copy_out`'s whole-object check is a second bound;
+it takes both removed to open it.
 
 The canary is the point: a gate that only checks the *verdict* is vacuous here
 (CLAUDE.md's rule about actuators that replace only a verdict). Each test must
@@ -570,15 +659,16 @@ Named so the gaps are decisions rather than oversights:
 
 | stage | kernel diff, estimated | new host tests | new guest tests | gate A |
 |---|---|---|---|---|
-| M1 | ~300 lines, `user_ptr.rs` + 3 call sites | 1 module | 5 | none |
+| M1a | **measured: 337+/144− across 7 kernel files** (estimated ~300) | 1 module, 6 tests | 2 programs, 5 properties | none |
 | M1b | ~200 lines across `syscall.rs` | — | — | none |
 | M2 | ~500 lines, `paging.rs` + fault path + `toyos-ld` none | 1 module | 4 | fast A/B |
 | M3 | ~350 lines, `apic.rs`/`paging.rs` + 6 audited sites | — | 3 + 1 actuator | fast + thorough A/B |
 | M4 | ~150 lines | 1 module | 2 | none |
 
-Every figure in this table is an estimate and says so. The measured numbers in
-this document are the ELF layout table (§2.1), the CPU feature answers (§2.1,
-§2.2), the `UserSafe` sizes (§2.4) and the call-site counts (§2.4).
+Every unbuilt figure in this table is an estimate and says so. The measured
+numbers in this document are the ELF layout table (§2.1), the CPU feature
+answers (§2.1, §2.2), the `UserSafe` sizes (§2.4), the call-site counts (§2.4),
+M1a's row above and the translate probe in §3.1.
 
 ## 6. Risks
 

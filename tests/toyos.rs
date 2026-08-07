@@ -376,6 +376,12 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("usb_storage_gate", Sched::Parallel),
     ("usb_storage_shapes", Sched::Parallel),
     ("usb_refused_disk_first", Sched::Parallel),
+    // The owner's freeze, staged: `device_del` on the stick carrying `/boot`
+    // and `/log` while the desktop draws. Serial because both verdicts are
+    // liveness ceilings — two 2 s compositor reporting intervals inside 20 s,
+    // and a console round trip inside 20 s — and a guest sharing the host with
+    // eleven others answers those late for reasons that are not the defect.
+    ("usb_boot_stick_pulled", Sched::Serial),
     ("usb_pool_exhausted", Sched::Parallel),
     ("usb_short_read", Sched::Parallel),
     // A plug over QMP and two host-side verdicts, neither of them a duration:
@@ -5449,6 +5455,7 @@ fn run_machine_test(
         // Bodies in `tests/common/usb.rs`, for the same reason.
         "usb_storage_gate" => usb::usb_storage_gate(test_config, c_bins, rust_bins),
         "usb_storage_shapes" => usb::usb_storage_shapes(test_config, c_bins, rust_bins),
+        "usb_boot_stick_pulled" => usb::usb_boot_stick_pulled(test_config, c_bins, rust_bins),
         "usb_refused_disk_first" => {
             usb::usb_refused_disk_first(test_config, c_bins, rust_bins)
         }
@@ -9414,6 +9421,17 @@ fn check_registration() {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // First, before any lock and before anything is compiled: a flag this suite
+    // does not have would otherwise cost nothing and hand its value to the
+    // filter below.
+    let filter = match toyos_build::testargs::parse(&args) {
+        Ok(filter) => filter,
+        Err(refusal) => {
+            eprintln!("[toyos] {refusal}");
+            std::process::exit(1);
+        }
+    };
+
     let debug_mode = args.iter().any(|a| a == "--debug");
     let list_mode = args.iter().any(|a| a == "--list");
     let nocapture = args.iter().any(|a| a == "--nocapture" || a == "--show-output");
@@ -9422,14 +9440,10 @@ fn main() {
     // is invisible in the command line and easy to leave set, and a test name
     // would drag ~17 minutes into every plain `cargo test`.
     let mut audio_gate: Option<u32> = None;
-    let mut consumed: Vec<usize> = Vec::new();
     for (i, a) in args.iter().enumerate() {
         let n = if let Some(v) = a.strip_prefix("--audio-gate=") {
-            consumed.push(i);
             v
         } else if a == "--audio-gate" {
-            consumed.push(i);
-            consumed.push(i + 1);
             args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
                 panic!("--audio-gate needs an iteration count, e.g. --audio-gate 30")
             })
@@ -9448,11 +9462,8 @@ fn main() {
     let mut width = DEFAULT_WIDTH;
     for (i, a) in args.iter().enumerate() {
         let n = if let Some(v) = a.strip_prefix("--jobs=") {
-            consumed.push(i);
             v
         } else if a == "--jobs" || a == "-j" {
-            consumed.push(i);
-            consumed.push(i + 1);
             args.get(i + 1)
                 .map(|s| s.as_str())
                 .unwrap_or_else(|| panic!("--jobs needs a width, e.g. --jobs 4"))
@@ -9469,11 +9480,8 @@ fn main() {
     let mut host_budget = toyos_build::buildlock::HOST_GUESTS;
     for (i, a) in args.iter().enumerate() {
         let n = if let Some(v) = a.strip_prefix("--host-slots=") {
-            consumed.push(i);
             v
         } else if a == "--host-slots" {
-            consumed.push(i);
-            consumed.push(i + 1);
             args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
                 panic!("--host-slots needs a budget, e.g. --host-slots 12 (0 turns it off)")
             })
@@ -9506,13 +9514,6 @@ fn main() {
     if nocapture || debug_mode {
         common::qemu::VERBOSE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-
-    // Filter: first positional arg that isn't a flag
-    let filter: Option<&str> = args
-        .iter()
-        .enumerate()
-        .find(|(i, a)| !a.starts_with('-') && !consumed.contains(i))
-        .map(|(_, s)| s.as_str());
 
     let c_names = discover_c_tests();
     eprintln!("[toyos] Compiling {} C tests...", c_names.len());
