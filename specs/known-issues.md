@@ -3667,6 +3667,33 @@ Cheap in principle: give the toyos `Stderr` a line buffer, or have
 tradeoffs — a line buffer changes flush ordering against the kernel's ring —
 so it is filed rather than fixed.
 
+**It reds landings, which is new.** `landing-1786130703-71774.log` (2026-08-07
+21:32) failed the gate on a **documentation-only branch**: `hda_tone` wants
+`soundd: hda codec0 vendor=1af4` and the console carried
+
+```
+soundd: hda codec[kernel 0.262 cpu1] i8042: armed at 184ms, idle at 262ms, …
+0 vendor=1af4 device=0012, 1 function group(s)
+```
+
+The splice fell between `codec` and `0`. `Serial::interleaved` named it in the
+failure message, which is that instrument working — but the run is still red,
+and re-running is the only recourse. soundd's next two needles a few
+milliseconds later matched intact, so which line is hit is chance, and every
+`must_say` naming userland output carries this rate.
+
+That is a **third** fix candidate, harness-side and free of the flush-ordering
+tradeoff the two above carry: a kernel line is *inserted* into the byte
+stream, and `is_kernel_line` already identifies it, so `Serial` can splice the
+fragments either side of one back together and match the needle against the
+stream userland actually wrote. It repairs the gate, not the log — a human
+grepping the T14's log still sees the split line, which is what the two
+guest-side fixes are for.
+
+Do not instead shorten needles to fit inside a fragment. The splice point
+moves, and a needle short enough to survive every splice is short enough to
+match the wrong line.
+
 ### OPEN — the i8042 aux line's unmask result is discarded, and its log line says nothing either way
 
 `init` captures the keyboard's unmask and prints it — `"on"` or `"MASKED"`
