@@ -68,9 +68,9 @@ impl Clone for RingRef {
     fn clone(&self) -> Self {
         let mut guard = IO_URINGS.lock();
         let map = guard.as_mut().expect("io_uring not initialized");
-        if let Some(instance) = map.get_mut(self.0) {
-            instance.refs += 1;
-        }
+        // A live `RingRef` whose instance is gone is a refcount bug: the
+        // instance is removed only when the last one drops.
+        map.get_mut(self.0).expect("RingRef outlived its ring").refs += 1;
         Self(self.0)
     }
 }
@@ -80,7 +80,7 @@ impl Drop for RingRef {
         let instance = {
             let mut guard = IO_URINGS.lock();
             let map = guard.as_mut().expect("io_uring not initialized");
-            let Some(instance) = map.get_mut(self.0) else { return };
+            let instance = map.get_mut(self.0).expect("RingRef outlived its ring");
             instance.refs -= 1;
             if instance.refs > 0 {
                 return;

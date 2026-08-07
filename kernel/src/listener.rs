@@ -54,13 +54,17 @@ impl ListenerRef {
     pub fn id(&self) -> ListenerId { self.0 }
 }
 
+/// A live `ListenerRef` whose entry is gone is a refcount bug and nothing else:
+/// the entry is removed only when the last one drops. Answering `None` here
+/// would turn that into a leaked name.
+fn entry(reg: &mut ListenerRegistry, id: ListenerId) -> &mut Listener {
+    reg.by_id.get_mut(id).expect("ListenerRef outlived its listener")
+}
+
 impl Clone for ListenerRef {
     fn clone(&self) -> Self {
         let mut guard = LISTENERS.lock();
-        let reg = guard.as_mut().unwrap();
-        if let Some(listener) = reg.by_id.get_mut(self.0) {
-            listener.refs += 1;
-        }
+        entry(guard.as_mut().unwrap(), self.0).refs += 1;
         Self(self.0)
     }
 }
@@ -69,7 +73,7 @@ impl Drop for ListenerRef {
     fn drop(&mut self) {
         let mut guard = LISTENERS.lock();
         let reg = guard.as_mut().unwrap();
-        let Some(listener) = reg.by_id.get_mut(self.0) else { return };
+        let listener = entry(reg, self.0);
         listener.refs -= 1;
         if listener.refs > 0 {
             return;
