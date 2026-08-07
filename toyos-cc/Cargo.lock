@@ -458,7 +458,7 @@ dependencies = [
 [[package]]
 name = "target-lexicon"
 version = "0.13.5"
-source = "git+https://github.com/Japabu/target-lexicon?branch=toyos#50da81b3012d68feec0678b7e7dd1a08efbed666"
+source = "git+https://github.com/Japabu/target-lexicon?branch=toyos#45832ce6b39a3f912f1d0a60a86aa3c5c099dd46"
 
 [[package]]
 name = "thiserror"

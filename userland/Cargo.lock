@@ -1048,7 +1048,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1693,7 +1693,7 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 [[package]]
 name = "libloading"
 version = "0.8.9"
-source = "git+https://github.com/Japabu/rust_libloading?branch=toyos#2ca5f54b09bcadaa6ef72af94d94724e143b5820"
+source = "git+https://github.com/Japabu/rust_libloading?branch=toyos#fa0abe774f6f891a5d8918ac554bc43004232cf2"
 dependencies = [
  "cfg-if",
  "toyos-abi",
@@ -1770,7 +1770,7 @@ dependencies = [
 [[package]]
 name = "mio"
 version = "1.2.0"
-source = "git+https://github.com/Japabu/mio?branch=toyos#c3d36f6406cff4883501894773e644d838d3f403"
+source = "git+https://github.com/Japabu/mio?branch=toyos#6356461d5e2cb467c1b815b58efafe1adb47de65"
 dependencies = [
  "libc",
  "toyos",
@@ -2616,7 +2616,7 @@ checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
 [[package]]
 name = "raw-window-handle"
 version = "0.6.2"
-source = "git+https://github.com/Japabu/raw-window-handle?branch=toyos#76c4971ce3cda5f1549cedf1b1365d6a8dff7d22"
+source = "git+https://github.com/Japabu/raw-window-handle?branch=toyos#c39042b5f2780fb02c177a471cfc3e906c6cee23"
 
 [[package]]
 name = "realfft"
@@ -2907,7 +2907,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3270,7 +3270,7 @@ dependencies = [
 [[package]]
 name = "socket2"
 version = "0.6.3"
-source = "git+https://github.com/Japabu/socket2?branch=toyos#267e19c0d0b7c0c44d2fb7084ded348c7ae3e2fe"
+source = "git+https://github.com/Japabu/socket2?branch=toyos#6b23a957f06ffbc08d8a259af5985078cf88f2de"
 dependencies = [
  "libc",
  "toyos",
@@ -3522,7 +3522,7 @@ dependencies = [
 [[package]]
 name = "tokio"
 version = "1.51.1"
-source = "git+https://github.com/Japabu/tokio?branch=toyos#db527f33348b6804e63c4e620a2566569f13ac40"
+source = "git+https://github.com/Japabu/tokio?branch=toyos#d6c5691cdb8ee281e62d282e67357f21c05d6f0d"
 dependencies = [
  "bytes",
  "libc",
@@ -3917,7 +3917,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
