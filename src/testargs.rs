@@ -12,6 +12,88 @@
 //! this table is refused the first time anyone types it — the drift that is
 //! loud rather than the one that narrows a gate.
 
+/// One machine's slice of the suite.
+///
+/// A shard is a *host*, never a lane. `--jobs` divides one machine's cores
+/// between guests that contend for them; this divides the work between machines
+/// that share nothing, which is the only lever CI has and the one the dev host
+/// does not have at all. The two compose: four shards at width 4 is sixteen
+/// guests that no `HostSlots` has to count, because no two are on one host.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shard {
+    /// One-based, as it is written on the command line and in a job matrix.
+    pub index: usize,
+    pub count: usize,
+}
+
+impl Shard {
+    /// Drop everything another shard owns, keeping the order of what is left.
+    ///
+    /// Longest-processing-time on the measured duration profile the suite
+    /// already orders its queue by, because a shard's wall clock is its bin's
+    /// total and the run's is the fullest bin. `items` is read in the order
+    /// given, so a list already sorted descending gets LPT's bound and one that
+    /// is not still gets a complete, deterministic partition — **every item
+    /// lands in exactly one shard whatever the profile says**, which is the
+    /// property a verdict depends on and the one the gates below hold.
+    pub fn keep<T, C: Ord + Copy + std::ops::Add<Output = C>>(
+        self,
+        items: &mut Vec<T>,
+        zero: C,
+        cost: impl Fn(&T) -> C,
+    ) {
+        let mut load = vec![zero; self.count];
+        let mut owner = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            let bin = (0..self.count).min_by_key(|&b| load[b]).expect("count >= 1");
+            load[bin] = load[bin] + cost(item);
+            owner.push(bin);
+        }
+        let mut i = 0;
+        items.retain(|_| {
+            let mine = owner[i] == self.index - 1;
+            i += 1;
+            mine
+        });
+    }
+}
+
+/// `--shard <index>/<count>`, or `None` for the whole suite.
+///
+/// `Err` is a refusal to print and exit on, like [`parse`]'s: a shard number
+/// outside its range would take no tests and report the run green.
+pub fn parse_shard(args: &[String]) -> Result<Option<Shard>, String> {
+    let mut out = None;
+    for (i, a) in args.iter().enumerate() {
+        let spec = if let Some(v) = a.strip_prefix("--shard=") {
+            v
+        } else if a == "--shard" {
+            args.get(i + 1)
+                .map(String::as_str)
+                .ok_or("--shard needs a slice, e.g. --shard 2/4")?
+        } else {
+            continue;
+        };
+        let (index, count) = spec
+            .split_once('/')
+            .ok_or_else(|| format!("--shard {spec}: not <index>/<count>, e.g. 2/4"))?;
+        let index: usize = index
+            .parse()
+            .map_err(|_| format!("--shard {spec}: {index:?} is not a shard number"))?;
+        let count: usize = count
+            .parse()
+            .map_err(|_| format!("--shard {spec}: {count:?} is not a shard count"))?;
+        if !(1..=count).contains(&index) {
+            return Err(format!(
+                "--shard {spec}: shards are numbered 1 through {count}, and a run outside \
+                 that range would take no tests and report itself green"
+            ));
+        }
+        out = Some(Shard { index, count });
+    }
+    Ok(out)
+}
+
 /// Whether a flag is followed by a separate word, which is then not the filter.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Value {
@@ -39,6 +121,7 @@ pub const FLAGS: &[Flag] = &[
     flag("-j", Value::Required),
     flag("--host-slots", Value::Required),
     flag("--host-builds", Value::Required),
+    flag("--shard", Value::Required),
 ];
 
 fn accepted() -> String {
@@ -143,6 +226,79 @@ mod tests {
         assert!(refusal.contains("\"futex\"") && refusal.contains("\"dlopen\""), "{refusal}");
     }
 
+    fn shard_of(args: &[&str]) -> Result<Option<Shard>, String> {
+        parse_shard(&args.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_shard_is_index_and_count() {
+        assert_eq!(shard_of(&["--shard", "2/4"]).unwrap(), Some(Shard { index: 2, count: 4 }));
+        assert_eq!(shard_of(&["--shard=1/1"]).unwrap(), Some(Shard { index: 1, count: 1 }));
+        assert_eq!(shard_of(&[]).unwrap(), None);
+    }
+
+    /// The failure with no symptom: a shard nobody owns runs nothing, and a run
+    /// that ran nothing exits 0.
+    #[test]
+    fn a_shard_outside_its_range_is_refused() {
+        for spec in ["0/4", "5/4", "2/0"] {
+            let refusal = shard_of(&["--shard", spec]).unwrap_err();
+            assert!(refusal.contains("green"), "{spec}: {refusal}");
+        }
+        assert!(shard_of(&["--shard", "half"]).is_err());
+        assert!(shard_of(&["--shard", "x/4"]).is_err());
+    }
+
+    /// The property every verdict rests on: the shards are a partition. Not one
+    /// test may be dropped by all of them, and none may be run by two.
+    #[test]
+    fn every_item_lands_in_exactly_one_shard() {
+        let items: Vec<u64> = (0..97).map(|i| (i * 37) % 23).collect();
+        for count in 1..=8 {
+            let mut seen: Vec<u64> = Vec::new();
+            for index in 1..=count {
+                let mut mine = items.clone();
+                Shard { index, count }.keep(&mut mine, 0u64, |&c| c);
+                seen.extend(mine);
+            }
+            seen.sort_unstable();
+            let mut want = items.clone();
+            want.sort_unstable();
+            assert_eq!(seen, want, "count {count}");
+        }
+    }
+
+    /// A shard's wall clock is its bin's total, so the split has to be by cost
+    /// and not by position. Descending input is what the suite hands it.
+    #[test]
+    fn the_split_is_by_cost_and_not_by_position() {
+        let items: Vec<u64> = vec![100, 90, 80, 70, 60, 50, 40, 30];
+        let totals: Vec<u64> = (1..=4)
+            .map(|index| {
+                let mut mine = items.clone();
+                Shard { index, count: 4 }.keep(&mut mine, 0u64, |&c| c);
+                mine.iter().sum()
+            })
+            .collect();
+        assert_eq!(totals, vec![130, 130, 130, 130], "{totals:?}");
+    }
+
+    /// Round-robin is what a suite with no measured profile falls back to, and
+    /// it still has to be a partition.
+    #[test]
+    fn an_unmeasured_suite_still_splits_evenly() {
+        let items: Vec<u64> = vec![u64::MAX; 10];
+        let sizes: Vec<usize> = (1..=3)
+            .map(|index| {
+                let mut mine = items.clone();
+                Shard { index, count: 3 }.keep(&mut mine, 0u64, |_| 1);
+                mine.len()
+            })
+            .collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 10);
+        assert_eq!(sizes, vec![4, 3, 3], "{sizes:?}");
+    }
+
     #[test]
     fn an_inline_value_on_a_flag_that_has_none_is_refused() {
         let refusal = parse_owned(&["--nocapture=1"]).unwrap_err();
@@ -161,6 +317,7 @@ mod tests {
             vec!["--jobs", "4"],
             vec!["--host-slots", "0"],
             vec!["--host-builds", "0"],
+            vec!["--shard", "2/4"],
             vec!["--debug"],
         ] {
             assert!(parse_owned(&argv).is_ok(), "{argv:?}");

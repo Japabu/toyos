@@ -40,10 +40,16 @@ jobs:
           cmake --version | head -1
           qemu-system-x86_64 --version | head -1
 
+      # GITHUB_ACTIONS=true puts rust's bootstrap on its own CI path, where it
+      # assumes HEAD is a PR merge commit and takes HEAD^1 as the upstream
+      # commit to fetch a prebuilt LLVM for. In this fork HEAD^1 is our own
+      # merge of upstream, which rust-lang CI never built: four 404s and
+      # `failed to download llvm from ci`. Unset, it walks back to the newest
+      # bors commit exactly as it does on the dev host.
       - name: full build
         run: |
           t0=$(date +%s)
-          cargo run -- --build-only
+          env -u GITHUB_ACTIONS -u CI cargo run -- --build-only
           t1=$(date +%s)
           echo "BUILD-ONLY-SECONDS: $((t1-t0))"
 

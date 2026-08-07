@@ -57,7 +57,7 @@ fn add(root: &Path, path: &str) {
     // created: a half-made worktree is worse than none, because the next agent
     // finds it and believes it.
     let primary = match toolchain::owner(root) {
-        toolchain::Owner::Us => root.to_path_buf(),
+        toolchain::Owner::Us | toolchain::Owner::Installed => root.to_path_buf(),
         toolchain::Owner::Elsewhere(p) => p,
     };
     let stage2 = primary.join(format!(
@@ -110,7 +110,7 @@ fn add(root: &Path, path: &str) {
 
 fn list(root: &Path) {
     let primary = match toolchain::owner(root) {
-        toolchain::Owner::Us => root.to_path_buf(),
+        toolchain::Owner::Us | toolchain::Owner::Installed => root.to_path_buf(),
         toolchain::Owner::Elsewhere(p) => p,
     };
     eprintln!("toolchain owner  {}", primary.display());

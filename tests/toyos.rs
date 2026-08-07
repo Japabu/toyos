@@ -9705,6 +9705,7 @@ fn longest_first(tasks: &mut [Task<'_>], known: &BTreeMap<String, Duration>) {
     tasks.sort_by_key(|task| std::cmp::Reverse(cost(task)));
 }
 
+
 /// One outcome, as the run prints it. Gate A goes through here too, so a
 /// suspended audio boot cannot report itself differently from a suspended
 /// machine test.
@@ -9902,6 +9903,15 @@ fn main() {
         assert!(width >= 1, "--jobs needs at least one worker");
     }
 
+    // Which slice of the suite this machine runs. Absent is the whole of it.
+    let shard = match toyos_build::testargs::parse_shard(&args) {
+        Ok(shard) => shard,
+        Err(refusal) => {
+            eprintln!("[toyos] {refusal}");
+            std::process::exit(1);
+        }
+    };
+
     // How many guests may be up on the *host* at once, across every worktree.
     // `--jobs` is this run's demand; this is what the machine will supply, and
     // zero turns it off.
@@ -10041,7 +10051,7 @@ fn main() {
     let keep = |name: &str| filter.map_or(true, |f| name.contains(f));
     let tests_to_run: Vec<&TestDef> =
         all_tests.iter().filter(|t| keep(t.name.as_str())).collect();
-    let audio_to_run: Vec<&str> =
+    let mut audio_to_run: Vec<&str> =
         AUDIO_TESTS.iter().copied().filter(|n| keep(n)).collect();
     let screen_to_run: Vec<(&str, Sched)> =
         SCREEN_TESTS.iter().copied().filter(|(n, _)| keep(n)).collect();
@@ -10066,11 +10076,6 @@ fn main() {
     }
 
     let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
-    let total = tests_to_run.len()
-        + audio_to_run.len() * AUDIO_SMP.len()
-        + screen_to_run.len()
-        + machine_to_run.len();
-    eprintln!("\nrunning {total} tests\n");
     let mut tally = Tally::new(EXPECTED_FAILURES, Day::today());
     let suite_start = common::clock::mark();
 
@@ -10122,6 +10127,47 @@ fn main() {
     // believed about it. See [`retry_task`] for why both answers are findings
     // and why neither turns the run green.
     let known = load_durations();
+    // After the phases are decided and before either is ordered: what a shard
+    // divides is the work, and a task's answer to `Sched` is a property of the
+    // test rather than of how many machines are running it.
+    if let Some(shard) = shard {
+        let cost = |task: &Task<'_>| -> Duration {
+            task.names()
+                .iter()
+                .map(|n| known.get(*n).copied().unwrap_or(Duration::MAX))
+                .fold(Duration::ZERO, |a, b| a.saturating_add(b))
+        };
+        longest_first(&mut parallel, &known);
+        longest_first(&mut serial, &known);
+        shard.keep(&mut parallel, Duration::ZERO, cost);
+        shard.keep(&mut serial, Duration::ZERO, cost);
+        shard.keep(&mut audio_to_run, Duration::ZERO, |name| {
+            AUDIO_SMP
+                .iter()
+                .map(|smp| {
+                    known
+                        .get(&format!("{name} (smp={smp})"))
+                        .copied()
+                        .unwrap_or(Duration::MAX)
+                })
+                .fold(Duration::ZERO, |a, b| a.saturating_add(b))
+        });
+        eprintln!(
+            "[toyos] shard {}/{}: {} parallel task(s), {} serial, {} audio config(s)",
+            shard.index,
+            shard.count,
+            parallel.len(),
+            serial.len(),
+            audio_to_run.len() * AUDIO_SMP.len(),
+        );
+    }
+
+    // Counted from the task lists rather than from the filtered ones, because a
+    // shard's own total is what its summary has to add up against.
+    let total = parallel.iter().chain(serial.iter()).map(|t| t.names().len()).sum::<usize>()
+        + audio_to_run.len() * AUDIO_SMP.len();
+    eprintln!("\nrunning {total} tests\n");
+
     let mut timed: Vec<(String, Duration)> = Vec::new();
     let mut wide_reds: Vec<String> = Vec::new();
     if !parallel.is_empty() {
