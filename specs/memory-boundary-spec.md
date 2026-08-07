@@ -815,6 +815,19 @@ syscall while a target answers late. The harm stays real on hardware for exactly
 the reason it is unobservable here: a real TLB, a real memory type, and no CR3
 write between the free and the sibling's next access.
 
+**Gate A, measured in one session on 2026-08-07.** Fast tier: **7 of 7 green**
+with the wait and 7 of 7 with it deleted, and *both* arms needed one confirm
+re-boot on one config — so the transient gap is not the wait. The comparable
+counters move less than the arms differ from each other: `audio_tone_load smp=1`
+wake lateness 5507 µs with the wait against 6301 µs without.
+
+The **thorough tier is red, and it is red on `main` too** — 7 dropout runs of 28
+there against 5 of 12 on this branch and 5 of 40 with the wait deleted, all three
+failing the same `0 of 120` recorded sample. That is a finding about the estate
+rather than about M3, it is written up in known-issues §4 with the numbers, and
+it is why this stage's thorough tier is an A/B rather than a pass/fail: a gate
+that is red on `main` cannot say anything about a branch by being red on it.
+
 **Is the memory-type alias now impossible?** On the paths the kernel controls,
 yes: every mapping change that alters a memory type — `map_mmio`'s re-type of a
 boot-map leaf, `shared_memory`'s write-combining framebuffer grant, and every
