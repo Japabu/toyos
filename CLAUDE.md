@@ -57,7 +57,7 @@ Corollary: **fail-fast is for kernel bugs, not for untrusted input.** An `expect
 
 Only **Rust** and **QEMU** (for development). Everything else is bootstrapped from Rust:
 
-- **toyos-ld** (`toyos-ld/`) — Custom linker. Used for bootloader, kernel, and all userland programs.
+- **toyos-ld** (`toyos-ld/`) — Custom linker. Used for bootloader, kernel, and all userland programs. **Its output is not reproducible**: the symbol table and `.rela.dyn` come out in `HashMap` order, so two links of one object give two binaries and a diff of a linked artifact is evidence of nothing (known-issues §6). `toyos-cc`'s objects are reproducible, and `toyos-cc/tests/determinism.rs` keeps them that way.
 - **toyos-cc** (`toyos-cc/`) — Minimal C compiler. Not meant to grow — exists to bootstrap C compilers (tinycc) and compile doomgeneric. **An attribute it does not implement is refused by name**: `packed` and `aligned` apply to a struct or union definition and are a hard error in every other position, a named few are accepted each carrying the reason ignoring it is the same as obeying it, and the rest stop the compile. Dropping one silently is a miscompilation, and `#define __attribute__(x)` used to drop all of them.
 - **rust/** — Fork of the Rust compiler and std with ToyOS platform support (submodule). Auto-bootstraps. Kept up to date with upstream.
 
