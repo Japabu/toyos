@@ -1139,23 +1139,14 @@ before the audio landing, with the shootdown work and without it).
 tree carrying it, because a panicked guest is scored as an instrument failure and
 the tier stops. That blocked H3's own A/B (§4).
 
-**And it is not confined to audio — the reported message is never `tlb:`.** Two
-landing gates from the heartbeat worktree on 2026-08-07, with a delta provably
-inert (every changed kernel line behind `#[cfg(feature = "heartbeat")]`, which
-none of these tests enable):
-
-| gate | reported failure | what was in the log |
-|---|---|---|
-| 1 | `hda_tone` — and *not* #88's assertion | `tlb.rs:133` panic |
-| 2 | `null_sink_shipped_client` — "the shipped tone exited 101 on a device-less machine" | two `tlb: cpu N has not flushed` |
-| 3 | `metal_sim_window_caps`, `metal_sim_ipc_hostile_peer`, `metal_sim_compositor_stall`, `metal_sim_client_death` | four `tlb: cpu N has not flushed` |
-
-A guest that panics mid-test fails whatever that test happened to be asserting,
-so the name on the red is the workload that was running and never the cause.
-**Grep a red run's log for `tlb:` before believing the test name** — three of
-those four `metal_sim_*` re-ran green alone, and the fourth
-(`metal_sim_window_caps`) re-ran red, which the harness reports as "the defect
-is real" and which is this defect rather than the window caps.
+**Independently reproduced from a third worktree**, same day, across four
+landing gates, on a branch whose every changed kernel line sits behind
+`#[cfg(feature = "heartbeat")]` and so is compiled into none of the tests that
+failed. Same victims, same two lines in every capture. The reading worth
+carrying forward: **the name on the red is the workload that was running and
+never the cause**, so grep a red run's log for `tlb:` before believing the test
+name — including when the harness re-runs one alone, reds again and reports
+"the defect is real", which `metal_sim_window_caps` did.
 
 ### `Lock::lock`'s spin is the half of the ticket lock loom cannot reach
 
