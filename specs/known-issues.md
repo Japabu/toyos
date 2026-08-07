@@ -2930,17 +2930,6 @@ microsecond-wide state** — `blocked_dump` has seen `1 OVERDUE` on a healthy
 guest. The count is evidence, not a verdict; what condemns a machine is one that
 stays.
 
-**OPEN — `blocked_dump`'s `Sched::Parallel` is wrong, by the harness's own
-verdict.** 2026-08-07, tree `4a0a07f`, in a landing gate: `nothing typed at the
-terminal window reached a shell`, then `ALONE blocked_dump: GREEN — it fails
-only beside other guests`, and the run stayed red on the classification as it is
-designed to. The host carried eight `toyos-build` processes and three guests at
-the time. Its verdict is the dump's content, but *reaching* the dump needs a
-keystroke to cross a compositor, a terminal and a shell, and that step is a
-wall-clock margin — which is what the serial tail is for. Not reclassified here,
-because whether it belongs in the tail or wants a longer margin is a decision for
-whoever owns the dump, and one occurrence is one sample.
-
 **KNOWN BLIND SPOT: the dump cannot fire when no CPU reaches a scheduler pass.**
 It is dispatched from `drain_irqs` at the top of a pass, so a *partial* wedge
 answers and a *total* freeze is silent — the owner pressed it after pulling the
@@ -3175,6 +3164,30 @@ phase landed, and none reproduces on a host running one suite.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
+- **`blocked_dump`** — added 2026-08-07, `nothing typed at the terminal window
+  reached a shell`, `ALONE … GREEN` in 5 s. Same shape and same sentence as
+  `desktop_typing_damage` and `desktop_locale_detect`: its verdict is the dump's
+  content, but *reaching* the dump crosses a compositor, a terminal and a shell,
+  and that step is a wall-clock margin. Still `Sched::Parallel`.
+
+**The eight-landing regime, and what it does to the paragraph above.** That
+paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
+twelve guests across every worktree. It recurred on 2026-08-07: **eight
+`toyos-build --land` processes were queued on the integration lock at once**, and
+one branch's two consecutive landing gates died on two *different* tests from
+this list — `blocked_dump`, then `screen_early_panic` — each `ALONE … GREEN`,
+neither related to a branch that touched only `tests/`. The semaphore is not
+wrong; it counts the thing it says it counts. But a landing gate is a full build
+plus a suite, and **the build half is bounded by nothing** — eight of them is
+eight cargo trees compiling on 14 cores, which reaches every liveness margin in
+the wide phase without a thirteenth guest ever existing. The gate's own audio
+lines recorded the host at seven `toyos-build` processes throughout.
+
+So the closing claim needs the qualifier: guest slots bound *guests*, and a
+landing storm is not made of guests. Whether the integration lock should also
+gate the gate's build, or whether these tests belong in the serial tail, is a
+decision for whoever owns the harness; what is established here is that a branch
+can be unable to land for reasons that have nothing to do with it.
 
 **What to do about a red on any of these names:** read the `ALONE` line under it
 before anything else. `GREEN` there means the host, not the kernel. What none of
