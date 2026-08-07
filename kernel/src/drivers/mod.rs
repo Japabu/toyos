@@ -13,6 +13,7 @@ pub mod virtio_gpu;
 pub mod virtio_net;
 pub mod virtio_sound;
 pub mod gop;
+pub mod hda;
 pub mod panic_console;
 #[cfg(feature = "hda-probe")]
 pub mod hda_probe;

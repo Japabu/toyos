@@ -57,6 +57,15 @@ pub struct OutputPath {
     pub codec: Address,
     pub group: Node,
     pub converter: Node,
+    /// The converter's output amplifier.
+    ///
+    /// Beside [`PinSetup::amp`] and never instead of it: the two halves of one
+    /// control live on different widgets and which half is where is the codec's
+    /// choice. The T14 puts 88 steps of gain here and no mute bit, and its mute
+    /// on the pin; QEMU's codec puts both here and gives its pin no amplifier
+    /// at all. A driver that assumed either arrangement would write a field
+    /// that does not exist, and the store would succeed and do nothing.
+    pub converter_amp: Option<AmpCaps>,
     /// What the chosen pin is for. Carried because a driver that bound a
     /// line-out on a machine with no speaker has to be able to say so — and
     /// because a field named `speaker` holding a line-out is the lie this
@@ -154,6 +163,7 @@ fn group_output(codec: Address, group: &FunctionGroup) -> Result<OutputPath, Opt
                 codec,
                 group: group.node,
                 converter,
+                converter_amp: group.widget(converter).and_then(|w| w.amp_out),
                 device,
                 output,
                 headphone,
@@ -277,6 +287,10 @@ mod tests {
         let amp = path.output.amp.expect("the speaker pin has an output amp");
         assert!(amp.mute);
         assert_eq!(amp.gain, None);
+        // The other half, on the other widget: 88 steps and no mute bit.
+        let converter = path.converter_amp.expect("the DAC has an output amp");
+        assert!(!converter.mute);
+        assert_eq!(converter.gain.map(|g| g.steps), Some(88));
     }
 
     #[test]

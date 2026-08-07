@@ -691,12 +691,17 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // Exactly as strong as the claim and no stronger: `SYS_OPEN_DEVICE`
             // is first-come and ungated, so whoever wins the race gets the RT
             // band with it. Spec §9.4 wants a privilege; a claim is not one.
-            if !device::is_owner(device::DeviceType::Audio, process::current_process()) {
+            let me = process::current_process();
+            if !device::is_owner(device::DeviceType::Audio, me)
+                && !device::is_owner(device::DeviceType::HdaAudio, me)
+            {
                 return SyscallError::PermissionDenied.to_u64();
             }
             crate::scheduler::set_current_rt(a1 != 0);
             0
         },
+        SYS_DEVICE_REG_READ => sys_device_reg(a1 as u32, a2, a3, None),
+        SYS_DEVICE_REG_WRITE => sys_device_reg(a1 as u32, a2, a3, Some(a4)),
         _ => SyscallError::InvalidArgument.to_u64(),
     };
 
@@ -740,7 +745,39 @@ fn sys_write(fd_num: u32, buf: &UserBytes) -> u64 {
 enum ReadBlock {
     Pipe(alloc::sync::Arc<crate::sched::payload::KWaitQueue>, pipe::PipeId),
     Audio,
+    Hda,
     Keyboard(u64),
+}
+
+/// One register of a claimed device, read or written.
+///
+/// The fd is the authorization and the device behind it owns the allow-list, so
+/// this function knows nothing about codecs — which is the test
+/// `specs/hda-driver-plan.md` §4.4 sets for it being a device-register call
+/// rather than a device protocol back in the syscall table.
+fn sys_device_reg(fd_num: u32, offset: u64, width: u64, value: Option<u64>) -> u64 {
+    let Some(width) = toyos_abi::hda::RegWidth::from_raw(width) else {
+        return SyscallError::InvalidArgument.to_u64();
+    };
+    let claimed = process::with_fd_owner_data(|data| {
+        matches!(data.fds.get(fd_num), Some(fd::Descriptor::Hda { .. }))
+    });
+    if !claimed {
+        return SyscallError::NotFound.to_u64();
+    }
+    match value {
+        None => match crate::drivers::hda::reg_read(offset, width) {
+            Ok(v) => v as u64,
+            Err(e) => e.to_u64(),
+        },
+        Some(value) if value <= u32::MAX as u64 => {
+            match crate::drivers::hda::reg_write(offset, width, value as u32) {
+                Ok(()) => 0,
+                Err(e) => e.to_u64(),
+            }
+        }
+        Some(_) => SyscallError::InvalidArgument.to_u64(),
+    }
 }
 
 fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
@@ -757,6 +794,8 @@ fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
                         Err(Some(ReadBlock::Keyboard(0)))
                     } else if matches!(desc, Some(fd::Descriptor::Audio { info_read: true, .. })) {
                         Err(Some(ReadBlock::Audio))
+                    } else if matches!(desc, Some(fd::Descriptor::Hda { info_read: true, .. })) {
+                        Err(Some(ReadBlock::Hda))
                     } else if let Some(id) = desc.and_then(|d| d.pipe_id_read()) {
                         Err(pipe::readers_queue(id).map(|q| ReadBlock::Pipe(q, id)))
                     } else if matches!(desc, Some(fd::Descriptor::SerialConsole)) {
@@ -780,6 +819,11 @@ fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
                 &crate::sched::waitqs::AUDIO,
                 0,
                 crate::audio::has_pending,
+            ),
+            Err(Some(ReadBlock::Hda)) => crate::scheduler::wait_until(
+                &crate::sched::waitqs::AUDIO,
+                0,
+                crate::drivers::hda::has_pending,
             ),
             Err(Some(ReadBlock::Keyboard(deadline))) => crate::scheduler::wait_until(
                 &crate::sched::waitqs::KEYBOARD,

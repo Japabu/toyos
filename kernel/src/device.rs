@@ -13,6 +13,7 @@ pub fn class_of(raw: u64) -> Option<DeviceType> {
         2 => Some(DeviceType::Framebuffer),
         3 => Some(DeviceType::Nic),
         4 => Some(DeviceType::Audio),
+        5 => Some(DeviceType::HdaAudio),
         _ => None,
     }
 }
@@ -22,6 +23,7 @@ static MOUSE_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static FRAMEBUFFER_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static NIC_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static AUDIO_OWNER: Lock<Option<Pid>> = Lock::new(None);
+static HDA_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
 
 fn owner_of(class: DeviceType) -> &'static Lock<Option<Pid>> {
@@ -31,6 +33,7 @@ fn owner_of(class: DeviceType) -> &'static Lock<Option<Pid>> {
         DeviceType::Framebuffer => &FRAMEBUFFER_OWNER,
         DeviceType::Nic => &NIC_OWNER,
         DeviceType::Audio => &AUDIO_OWNER,
+        DeviceType::HdaAudio => &HDA_OWNER,
     }
 }
 
@@ -141,6 +144,12 @@ pub fn try_claim(class: DeviceType, pid: Pid) -> Result<Descriptor, ClaimError> 
             let claim = Claim::acquire(class, pid)?;
             grant(info.dma_token, pid)?;
             Ok(Descriptor::Audio { claim, info, info_read: false })
+        }
+        DeviceType::HdaAudio => {
+            let info = crate::drivers::hda::info().ok_or(ClaimError::Absent)?;
+            let claim = Claim::acquire(class, pid)?;
+            grant(info.pcm_token, pid)?;
+            Ok(Descriptor::Hda { claim, info, info_read: false })
         }
     }
 }
