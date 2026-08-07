@@ -2919,6 +2919,95 @@ between the milestone and a silent recurrence: a client through the null sink
 must exit, a second must be taken up while the first streams, and the desktop
 must still answer afterwards.
 
+### OPEN — a desktop session put 26 ms of silence on the wire, and gate A has never measured this workload
+
+The owner ran `cargo run` on 2026-08-07 (guest RTC 13:14:51 UTC, tree at or
+after `43ce73e`), started doom from the terminal, let its demo loop run to
+t=69 s, then ran `tone` 44 times. 391 s of serial, 119 soundd stats windows.
+Every number below is from that capture.
+
+**Harm, by the fast tier's own definition.** Two windows during doom:
+
+```
+soundd: wakes=537 completions=675 submitted=675 underruns=8 drains=1 max_wake_lat_us=86779 max_batch=8 clients=1 deferred=33
+soundd: wakes=389 completions=690 submitted=690 underruns=1 drains=2 max_wake_lat_us=92175 max_batch=8 clients=1 deferred=7
+```
+
+Nine periods — 26 ms — submitted with a client streaming and no client audio
+behind them (`main.rs:954`). `tests/audio-baseline.toml` records `underruns` 0
+on all 120 runs of its sample, and the fast tier's verdict is exactly this
+counter. There is no capture to corroborate it: `--dump-audio` was not on.
+
+**And it is not confined to those two windows.** Across the whole run, 15 of
+119 windows report `drains` (22 events; recorded sample 0/120), and the
+`max_wake_lat_us` distribution never once enters the recorded range:
+
+```
+                     n     min     p50     p90     max
+doom phase          31   21167   30367       —  106654   (4.59 pipeline depths)
+tone phase          88   18116   21896   24079   63664
+audio_tone sample   30    5666       —       —   10090   (baseline file)
+```
+
+The tone phase is 88 windows, none below 18116 us, against a recorded sample
+whose *worst of 30* is 10090. The two distributions are disjoint. 106654 us is
+past the `audio_tone_load.smp8` ceiling of 80000 (this guest is `--smp 8`).
+
+**Two things make this different from the three entries above**, which are all
+gate A reddening on its own configuration:
+
+- The client is doom — a real producer with a SoundFont synthesizer thread —
+  and there is a compositor blitting 200-450 MB/s to the scanout beside it.
+  Nothing in gate A resembles that.
+- The 44 `tone` runs exercise **suspend → resume**, 44 times. Gate A's single
+  client never leaves and comes back, so the resume path has no coverage at
+  all. Every resume here costs a ~22 ms lateness sample, and 22 ms is 0.94 of
+  one pipeline depth (23219 us), which is what a wake measured against a
+  prediction one whole pipeline stale would look like.
+
+**Read the tone-phase cluster carefully before treating it as load.** It is far
+too tight to be scheduling noise (min 18116, p50 21896, p90 24079 over 88
+windows, one per stream start). One candidate mechanism, offered as a
+hypothesis and not a measurement: `signal_clients`' caller arms its wait on
+`target` — the *next future* grid point when the DLL estimate is past due
+(`userland/soundd/src/main.rs:773-783`) — but records `armed_on = Some(t_est)`,
+the stale estimate. `lateness` at :827 is then measured from an instant soundd
+deliberately did not ask to be woken at, and includes every whole period it
+skipped. The comment at :819-825 says the sample is taken "against the
+prediction this wait was *armed* on"; `target` is what it was armed on.
+Whoever takes this should settle that before reading any of the numbers above
+as a property of the scheduler.
+
+**Reproduction.** `cargo run`, `doom` in the terminal, wait for the demo loop,
+quit, then `tone` repeatedly. Add `--dump-audio` so the wav can corroborate the
+underruns. The counters print every 2 s while a client exists.
+
+### OPEN — soundd reports a clean client exit as a death, 5 times in 44
+
+Same capture. `tone` exits with `code=0` every time, and 5 of the 44 runs
+produced:
+
+```
+[kernel 164.648 cpu6 tid=0] exit: tone pid=21 code=0 cpu=45ms
+soundd: client 15 died, ramping down
+soundd: client 15 removed
+```
+
+Clients 15, 17, 25, 34 and 39; the other 39 print only `removed`. The condition
+is genuine — `signal_clients` (`main.rs:594-605`) got `NotFound` from the
+signal pipe because the client process was gone — but it is a *race between
+soundd's own two detection paths*, not a crash: whether the broken pipe or the
+control thread's `RemoveClient` arrives first. Both set `pending_removal` and
+start the same ramp, so no audio differs.
+
+What is wrong is the word. §5.7's crash detector cannot distinguish a crash
+from a clean exit that raced it, so "died" is a false positive at 11% of normal
+disconnects — and it is the line an operator or a test would grep for. A
+disconnect the control connection has *already* announced is knowable: the
+control thread saw the peer close before the pipe broke.
+
+Cosmetic today. It stops being cosmetic the moment anything gates on it.
+
 ---
 
 ## 5. Diagnostics
@@ -3124,6 +3213,116 @@ layer-2 one.
 Layer 1 (process accounting counters + the `stats` tool) is implemented, with
 the read-path restriction above. Event tracing and RIP sampling are not. See
 CLAUDE.md's diagnostics roadmap.
+
+### OPEN — the syscall profile is 64 bins wide and the ABI reaches 96, so every audio, net, IPC and pipe call is missing from it
+
+`ProcessData::syscall_counts` is `[u32; 64]` (`kernel/src/process.rs:552`) and
+`syscall_dispatch` guards the bump with `if (num as usize) <
+data.syscall_counts.len()` (`kernel/src/arch/syscall.rs:218`). `syscall_total`
+at :217 is bumped unconditionally. `SYS_MMAP` is 63 — the last bin — and
+`SYS_MUNMAP` is 64, the first one dropped. Everything above it goes with it:
+`SYS_AUDIO_SUBMIT` 71 and `SYS_AUDIO_POLL` 84, `SYS_NIC_{RX_POLL,RX_DONE,TX}`
+78-80, `SYS_LISTEN`/`ACCEPT`/`CONNECT` 85-87, `SYS_PIPE_{OPEN,ID,MAP}`,
+`SYS_READ_NONBLOCK`/`WRITE_NONBLOCK`, `SYS_IO_URING_{SETUP,ENTER}`,
+`SYS_EXIT`, `SYS_PROCESS_STATS`, `SYS_SET_RT_PRIORITY`.
+
+The line therefore prints a total that is not the sum of its parts, silently.
+From the 2026-08-07 desktop capture, doom:
+
+```
+syscalls: pid=6 total=33190 syscall_wall=3806ms 0=6129 1=4585 6=1 8=14727 9=4 10=3 13=891 14=3 38=4 39=1 40=2 41=2 49=1919 53=2 59=5 63=17
+```
+
+The bins sum to 28295 against `total=33190` — **4895 calls, 15% of the process,
+invisible**. Every one of the 44 `tone` processes in the same capture reports
+`total=28` with bins summing to 22; the six missing are its whole reason for
+existing (connect to soundd, map the ring, exit).
+
+Reproduce with any process that makes an audio or network call:
+
+```
+grep 'syscalls: pid=' <log> | awk '{t=0;s=0; for(i=1;i<=NF;i++){ if($i~/^total=/){split($i,a,"=");t=a[2]} else if($i~/^[0-9]+=[0-9]+$/){split($i,b,"=");s+=b[2]} } print t, s, t-s}'
+```
+
+This is the diagnostics roadmap's layer 1 — the layer that exists to answer
+"where is time going" — and it cannot see the audio path at all. Whatever the
+fix (size the array from the ABI's highest number, or make the array
+`[u32; SYS_MAX]` with a compile-time bound), the silent `if <` is the defect:
+a bin that cannot hold a number should refuse it by name or not exist.
+
+### OPEN — `exit: <name> pid=N cpu=Xms` is the main thread's CPU, not the process's, and the two lines look identical
+
+`teardown_bookkeeping` prints `cpu={main_cpu_ns}` (`kernel/src/process.rs:1037,
+1040`) — the main thread's scheduler total, the same value
+`stash_accounting_snapshot` then *adds* `child_threads_cpu_ns` to at :1082
+before handing it to `waitpid`. The per-thread line at :1230 has the same shape
+and prints that thread's total. Nothing distinguishes them but `pid=` versus
+`tid=`.
+
+The result is a process that used less CPU than one of its own threads. From
+the 2026-08-07 capture, 43 of the 44 `tone` runs read this way:
+
+```
+[kernel  87.632 cpu5 tid=1] exit: tone tid=1 code=0 cpu=121ms
+[kernel  87.634 cpu4 tid=0] exit: tone pid=8  code=0 cpu=46ms
+```
+
+and doom's three lines (`tid=1` 3409 ms, `tid=2` 14759 ms, `pid=6` 59050 ms)
+cannot be added, subtracted or reconciled by a reader who does not have
+`process.rs` open. The whole-process figure exists — `waitpid` gets it — and is
+the one number the log does not carry.
+
+### OPEN — the serial console has no line atomicity, so a stats line can be cut in half by another writer
+
+std's `Stderr` is unbuffered, so one `eprintln!` reaches `SYS_WRITE` as several
+calls, one per format fragment. `SerialWriter::console` buffers a *single*
+write and commits on drop (`kernel/src/drivers/serial.rs:303-319`), which makes
+each fragment atomic and a line not. Two instances in one 2110-line capture,
+2026-08-07:
+
+```
+netd: MAC soundd: ready, 52:54:8 buffers, 00:12:34:56
+44100Hz 2ch, 512 bytes/period, 128 frames/period
+netd: ready, at most 42 piped connections (4 MiB each of 1356 MiB total)
+```
+
+```
+soundd: client [kernel 351.736 cpu0 tid=0] syscalls: pid=46 total=28 …
+40 removed
+```
+
+The second is the kernel's own ring landing inside a userland line, so this is
+not only a userland-vs-userland race. On the T14 the log *is* the instrument,
+and a periodic stats line that can be split is a counter that can be misread —
+the split above turns `soundd: client 40 removed` into two lines that a
+`grep 'client .* removed'` will not match.
+
+Cheap in principle: give the toyos `Stderr` a line buffer, or have
+`write_user` hold the ring across one logical line. Neither is free of
+tradeoffs — a line buffer changes flush ordering against the kernel's ring —
+so it is filed rather than fixed.
+
+### OPEN — the i8042 aux line's unmask result is discarded, and its log line says nothing either way
+
+`init` captures the keyboard's unmask and prints it — `"on"` or `"MASKED"`
+(`kernel/src/drivers/i8042/mod.rs:1527, 1544`). The aux line one statement
+later is `let _ = ioapic::set_masked(l.gsi, false);` (:1529), and its log line
+(:1547) reports the GSI, the vector and the APIC and stops:
+
+```
+i8042: kbd set2+xlat (readback 0x41) scanning on, GSI 1 -> vec 0x24 apic 0 on
+i8042: aux rate=100 res=8/mm, GSI 12 -> vec 0x24 apic 0
+```
+
+An aux GSI that failed to unmask prints exactly that line. On the T14 that is
+the TrackPoint and touchpad silently dead with a green-looking boot — the
+failure mode the comment 30 lines above (:1494-1497, "every line below prints
+green") was written to prevent, reached by the one path that does not check.
+Not observed failing: this capture is QEMU with USB HID, and `i8042: armed at
+191ms, idle at 335ms, 0 interrupts` is expected there. The point is that the
+log cannot tell you which it was.
+
+Trivial to fix the same way the kbd line already is.
 
 ---
 
@@ -3976,6 +4175,37 @@ through a pointer into a WAD buffer.
 
 Defining `__GNUC__` would be a much larger change than it looks: it turns on
 every `#ifdef __GNUC__` block in doomgeneric and in any header that has one.
+
+### OPEN — the initrd ships two git-ignored files, so the image is not reproducible from the repo
+
+`system.toml`'s `assets = ["assets"]` sweeps the directory whole. Two of the
+files it finds are not in VCS:
+
+```
+$ git check-ignore -v assets/.DS_Store assets/target/.deps-stamp
+.gitignore:6:.DS_Store	assets/.DS_Store
+.gitignore:1:target/	assets/target/.deps-stamp
+```
+
+and both reach the image. From the 2026-08-07 build:
+
+```
+initrd: adding 'share/.ds_store' (6148 bytes)
+initrd: adding 'share/target/.deps-stamp' (10220 bytes)
+```
+
+A fresh clone therefore builds a *different* initrd from this checkout's, and
+`.DS_Store` changes whenever Finder touches the folder — so the image hash moves
+with no code change at all. That is the same property `toyos-cc` and `toyos-ld`
+were made deterministic for on 2026-08-07, defeated one directory up.
+
+`assets/target/` is stray: an empty `target/` with one `.deps-stamp`, mtime
+2026-08-01 08:28, the same minute as the `.DS_Store` — something ran cargo with
+`assets` as its working directory. It should be deleted; the sweep should refuse
+anything git ignores, or take an explicit list.
+
+Costs 16 KiB of a 672 MB initrd, so nothing breaks. The reproducibility claim
+does.
 
 ---
 
