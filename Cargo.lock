@@ -834,6 +834,7 @@ dependencies = [
  "fontdue",
  "gpt",
  "image",
+ "libc",
  "serde",
  "serde_json",
  "toml",
