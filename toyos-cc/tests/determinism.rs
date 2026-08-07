@@ -17,17 +17,12 @@ use std::process::{Command, Stdio};
 /// compile each instead of one exec each.
 const RUNS: usize = 8;
 
-fn options(include_paths: Vec<PathBuf>) -> toyos_cc::CompileOptions {
-    toyos_cc::CompileOptions {
-        include_paths,
+/// The one failure this file reports: which run diverged, and where.
+fn assert_stable(case: &str, source: &str) {
+    let opts = toyos_cc::CompileOptions {
         target: Some("x86_64-unknown-toyos".to_string()),
         ..Default::default()
-    }
-}
-
-/// The one failure this file reports: which run diverged, and where.
-fn assert_stable(case: &str, source: &str, include_paths: Vec<PathBuf>) {
-    let opts = options(include_paths);
+    };
     let first = toyos_cc::compile(source, &format!("{case}.c"), &opts);
     for run in 1..RUNS {
         let again = toyos_cc::compile(source, &format!("{case}.c"), &opts);
@@ -53,7 +48,7 @@ fn tentative_globals_keep_their_order() {
         writeln!(source, "int tentative_{i}[4];").unwrap();
     }
     source.push_str("int main(void) { return tentative_0[0]; }\n");
-    assert_stable("tentative", &source, vec![]);
+    assert_stable("tentative", &source);
 }
 
 /// x86_64 calls a variadic function through a hand-emitted stub, one per callee.
@@ -68,7 +63,7 @@ fn variadic_call_stubs_keep_their_order() {
         write!(source, " {} variadic_{i}(1, 2)", if i == 0 { "" } else { "+" }).unwrap();
     }
     source.push_str("; }\n");
-    assert_stable("variadic", &source, vec![]);
+    assert_stable("variadic", &source);
 }
 
 /// A parameter whose address is taken is spilled to a stack slot in the entry
@@ -86,7 +81,7 @@ fn spilled_parameters_keep_their_order() {
         writeln!(source, "  sink(&p{i});").unwrap();
     }
     source.push_str("  return 0;\n}\n");
-    assert_stable("spilled", &source, vec![]);
+    assert_stable("spilled", &source);
 }
 
 /// Breadth against the shapes nobody thought to write a case for. Driven
