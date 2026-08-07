@@ -134,8 +134,16 @@ fn draw_window(
     let frame = win.frame(chrome);
     let strip = chrome.title_strip(frame);
     if clip.overlaps(strip) {
-        fill(surface, Rect::corners(frame.x0, frame.y0, frame.x1, strip.y1 - chrome.border), border_color);
-        let bar = Rect::corners(frame.x0 + chrome.border, frame.y0 + chrome.border, frame.x1 - chrome.border, strip.y1 - chrome.border);
+        fill(surface, strip, border_color);
+        // The title bar's own colour, inset by the border on three sides. Its
+        // bottom edge is the content's top edge: a window's chrome has no rule
+        // between the title and what the client draws.
+        let bar = Rect::corners(
+            strip.x0 + chrome.border,
+            strip.y0 + chrome.border,
+            strip.x1 - chrome.border,
+            strip.y1,
+        );
         fill(surface, bar, title_color);
 
         let title = if win.title.is_empty() { "Window" } else { &win.title };
@@ -264,7 +272,8 @@ fn draw_taskbar(
                 .collect();
         fill(back, status, TASKBAR_COLOR);
         let text_w = text.chars().count() * assets.font.width();
-        let x = status.x1 as usize - toyos_desktop::STATUS_MARGIN as usize - text_w;
+        let x = (status.x1 as usize)
+            .saturating_sub(toyos_desktop::STATUS_MARGIN as usize + text_w);
         assets.font.draw_string(back, x, text_y, &text, TASKBAR_ACTIVE_TEXT, TASKBAR_COLOR);
     }
 }

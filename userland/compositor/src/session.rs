@@ -76,6 +76,10 @@ pub struct Session {
     mouse: Mouse,
     poller: Poller,
 
+    /// Held because closing it gives the framebuffer back to the kernel, and
+    /// every `gpu::` call afterwards is made by a process that no longer owns
+    /// the panel it is drawing on.
+    _fb_dev: FramebufferDev,
     fb_info: toyos_abi::FramebufferInfo,
     /// Held because [`Session::screen`] points into it.
     _fb_shm: SharedMemory,
@@ -223,6 +227,7 @@ impl Session {
             kb,
             mouse,
             poller,
+            _fb_dev: fb_dev,
             fb_info,
             _fb_shm: fb_shm,
             screen,
