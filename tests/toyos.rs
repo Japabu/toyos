@@ -298,9 +298,15 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Its own boot, its own feature, and it drives the guest only through
     // stdin — nothing it touches is shared with another test.
     ("idle_stack_guard", Sched::Parallel),
-    // Its own boot and its own feature; it deafens one CPU for 400 ms and
-    // nothing it touches is shared.
-    ("dump_nmi_probe", Sched::Parallel),
+    // Its own boot and its own feature, and it deafens one CPU for 400 ms —
+    // but the deafening is a *window*, and the verdict is whether the NMI is
+    // answered inside `NMI_BUDGET_NS`, which is one millisecond. That is a
+    // wall-clock margin on the host as much as on the guest: at width 12 the
+    // probe missed the window and reported the NMI as never delivered, which
+    // reads exactly like the defect it hunts, and it was green alone in the
+    // same run and three times after it. Serial by `specs/test-cost-audit.md`
+    // §3.3 — a verdict that is a duration does not go in the parallel phase.
+    ("dump_nmi_probe", Sched::Serial),
     ("diskless_boot", Sched::Parallel),
     ("xhci_many_devices", Sched::Parallel),
     // Its whole assertion is that a keystroke injected from the host crossed a
