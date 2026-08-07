@@ -9728,6 +9728,25 @@ fn main() {
         host_budget =
             n.parse().unwrap_or_else(|_| panic!("--host-slots: {n:?} is not a budget"));
     }
+
+    // And how many of this host's *compiles* may run at once, across every
+    // worktree. A worker holds a guest slot from the moment it takes a task and
+    // spends the first part of it building a kernel variant, so twelve workers
+    // are twelve concurrent `cargo build`s and no guest at all.
+    for (i, a) in args.iter().enumerate() {
+        let n = if let Some(v) = a.strip_prefix("--host-builds=") {
+            v
+        } else if a == "--host-builds" {
+            args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
+                panic!("--host-builds needs a budget, e.g. --host-builds 4 (0 turns it off)")
+            })
+        } else {
+            continue;
+        };
+        toyos_build::buildlock::set_host_builds(
+            n.parse().unwrap_or_else(|_| panic!("--host-builds: {n:?} is not a budget")),
+        );
+    }
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
 
     // For the whole run, and outermost: a `--claim-sysroot` in another worktree

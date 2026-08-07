@@ -32,6 +32,7 @@ fn libc_archive_toyos() -> PathBuf {
             let target_dir = libc_dir.join("target");
             let archive = target_dir.join(format!("{target}/release/libtoyos_libc.a"));
 
+            let _slot = toyos_build::buildlock::build_slot(&repo_root(), "the libc archive");
             // The toolchain phase drops this very directory when the sysroot is
             // replaced, so this build has to be visible to it as a build.
             let _lock = toyos_build::buildlock::shared(&repo_root(), "toyos-libc archive");

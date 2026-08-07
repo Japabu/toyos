@@ -17,11 +17,71 @@
 //!
 //! Nothing here rewrites history and nothing pushes.
 
-use std::path::Path;
-use std::process::Command;
-use std::time::Instant;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::buildlock;
+
+/// This landing's own log, named after this landing and nothing else.
+///
+/// **The caller does not get to choose the path, and that is the point.** On
+/// 2026-08-07 two agents watched a *peer's* `--land` output arrive in their own
+/// redirected capture — foreign `Compiling …` lines, foreign test failures —
+/// because the scratch directory an agent redirects into is shared between
+/// concurrent sessions. One chased two phantom red tests; one lost three
+/// landing attempts and ended up piping its stream through `sed` to prefix every
+/// line with its own name. A shell redirect cannot fix that, because the two
+/// shells agree on the path. A file named for the process that writes it can.
+struct LandLog {
+    path: PathBuf,
+    file: Mutex<fs::File>,
+}
+
+impl LandLog {
+    fn open(root: &Path) -> Self {
+        let dir = root.join("target/landings");
+        fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("[land] create {}: {e}", dir.display()));
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let pid = std::process::id();
+        // `create_new`, and a suffix if the name is taken: the pid separates two
+        // landings on the host and nothing separates two in one process within
+        // one second. A name that is unique because collisions are unlikely is
+        // the defect this exists to remove, not a smaller version of it.
+        for attempt in 1.. {
+            let name = match attempt {
+                1 => format!("landing-{stamp}-{pid}.log"),
+                n => format!("landing-{stamp}-{pid}-{n}.log"),
+            };
+            let path = dir.join(name);
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Self { path, file: Mutex::new(file) },
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("[land] create {}: {e}", path.display()),
+            }
+        }
+        unreachable!("the loop above returns or panics")
+    }
+
+    /// To the terminal and to the file, because an agent that watches silence
+    /// kills things and an agent that has to reconstruct what happened reads
+    /// the file.
+    fn say(&self, line: &str) {
+        eprintln!("{line}");
+        self.raw(line.as_bytes());
+        self.raw(b"\n");
+    }
+
+    fn raw(&self, bytes: &[u8]) {
+        let mut file = self.file.lock().expect("the landing log's writer panicked");
+        let _ = file.write_all(bytes);
+        let _ = file.flush();
+    }
+}
 
 /// The whole suite. A landing that runs less than this says so, twice: once
 /// before the gate runs and once in the report, because the second is what an
@@ -73,17 +133,48 @@ fn is_default(gate: &[String]) -> bool {
 /// main exactly where it was.
 fn run(root: &Path, gate: &[String]) -> Result<String, String> {
     let primary = crate::primary_checkout(root);
+    // After preflight, which is instantaneous and prints its own refusal: the
+    // log is for the part that takes minutes.
     let branch = preflight(root, &primary)?;
-    eprintln!("[land] landing {branch} into main at {}", primary.display());
+    let log = LandLog::open(root);
+    log.say(&format!("[land] landing {branch} into main at {}", primary.display()));
+    log.say(&format!(
+        "[land] this landing's log: {}\n\
+         [land] it is named for this process, so do not redirect this command into a path of \
+         your own — a scratch directory is shared between concurrent sessions and a peer's \
+         output lands in it.",
+        log.path.display()
+    ));
 
+    // Every outcome goes into the log, refusals included: a refusal is the whole
+    // product of a failed landing, and reading it back out of a scrollback that
+    // eight other landings' output went through was the thing that could not be
+    // done on 2026-08-07.
+    let outcome = steps(root, &primary, &branch, gate, &log);
+    match &outcome {
+        Ok(report) | Err(report) => {
+            log.raw(report.as_bytes());
+            log.raw(b"\n");
+        }
+    }
+    outcome
+}
+
+fn steps(
+    root: &Path,
+    primary: &Path,
+    branch: &str,
+    gate: &[String],
+    log: &LandLog,
+) -> Result<String, String> {
     let _lock = buildlock::integration(root);
 
-    let main_before = git(&primary, &["rev-parse", "main"])?;
-    merge_main(root, &branch)?;
+    let main_before = git(primary, &["rev-parse", "main"])?;
+    merge_main(root, branch, log)?;
 
-    let took = run_gate(root, gate)?;
+    let took = run_gate(root, gate, log)?;
 
-    let dirty = git(&primary, &["status", "--porcelain"])?;
+    let dirty = git(primary, &["status", "--porcelain"])?;
     if !dirty.is_empty() {
         return Err(format!(
             "[land] the gate passed, but {} has uncommitted work in it now and step 4 moves \
@@ -92,25 +183,27 @@ fn run(root: &Path, gate: &[String]) -> Result<String, String> {
             primary.display()
         ));
     }
-    let main_now = git(&primary, &["rev-parse", "main"])?;
+    let main_now = git(primary, &["rev-parse", "main"])?;
     if main_now != main_before {
-        return Err(bypassed(&primary, &main_before, &main_now));
+        return Err(bypassed(primary, &main_before, &main_now));
     }
-    git(&primary, &["merge", "--ff-only", &branch]).map_err(|e| {
+    git(primary, &["merge", "--ff-only", branch]).map_err(|e| {
         format!(
             "[land] main refused the fast-forward to {branch}, and main has not moved since this \
              branch merged it. That is not a case the protocol has a name for — report it.\n{e}"
         )
     })?;
 
-    let landed = git(&primary, &["rev-parse", "--short", "main"])?;
-    let before = git(&primary, &["rev-parse", "--short", &main_before])?;
+    let landed = git(primary, &["rev-parse", "--short", "main"])?;
+    let before = git(primary, &["rev-parse", "--short", &main_before])?;
     let mut report = format!(
         "[land] landed {branch} on main\n\
          [land]   main  {before} -> {landed}\n\
-         [land]   gate  {}, {:.1?}",
+         [land]   gate  {}, {:.1?}\n\
+         [land]   log   {}",
         gate.join(" "),
-        took
+        took,
+        log.path.display(),
     );
     if !is_default(gate) {
         report.push_str(&format!(
@@ -180,11 +273,11 @@ fn preflight(root: &Path, primary: &Path) -> Result<String, String> {
 
 /// Step 2. `--no-ff` so the landing record names both parents; `--no-edit`
 /// because nothing here has a terminal to open an editor on.
-fn merge_main(root: &Path, branch: &str) -> Result<(), String> {
+fn merge_main(root: &Path, branch: &str, log: &LandLog) -> Result<(), String> {
     match git(root, &["merge", "--no-ff", "--no-edit", "main"]) {
         Ok(out) => {
             for line in out.lines() {
-                eprintln!("[land] {line}");
+                log.say(&format!("[land] {line}"));
             }
             Ok(())
         }
@@ -202,21 +295,38 @@ fn merge_main(root: &Path, branch: &str) -> Result<(), String> {
 
 /// Step 3, with the gate's own output going straight to the terminal: it is the
 /// long part, and an agent watching silence kills things.
-fn run_gate(root: &Path, gate: &[String]) -> Result<std::time::Duration, String> {
-    eprintln!("[land] gate: {}", gate.join(" "));
+fn run_gate(
+    root: &Path,
+    gate: &[String],
+    log: &LandLog,
+) -> Result<std::time::Duration, String> {
+    log.say(&format!("[land] gate: {}", gate.join(" ")));
     if !is_default(gate) {
-        eprintln!(
+        log.say(&format!(
             "[land] that is NOT the default `{}` — the whole suite. Everything the default \
              covers and this does not will be ungated on main.",
             DEFAULT_GATE.join(" ")
-        );
+        ));
     }
     let started = Instant::now();
-    let status = Command::new(&gate[0])
+    let mut child = Command::new(&gate[0])
         .args(&gate[1..])
         .current_dir(root)
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("[land] cannot run the gate {:?}: {e}", gate[0]))?;
+    // Piped rather than inherited, and copied straight back out: the terminal
+    // sees the gate live, as it must, and the log gets the same bytes without
+    // the agent having to choose a path that another session is also writing.
+    let out = child.stdout.take().expect("the gate's stdout was piped");
+    let err = child.stderr.take().expect("the gate's stderr was piped");
+    let status = std::thread::scope(|scope| {
+        scope.spawn(|| tee(out, log, false));
+        scope.spawn(|| tee(err, log, true));
+        child.wait()
+    })
+    .map_err(|e| format!("[land] the gate {:?} could not be waited on: {e}", gate[0]))?;
     let took = started.elapsed();
     // 2 is the suite's "this run established nothing" — the host was suspended
     // in the middle of it (`tests/toyos.rs`, and cargo propagates a test
@@ -236,6 +346,29 @@ fn run_gate(root: &Path, gate: &[String]) -> Result<std::time::Duration, String>
         ));
     }
     Ok(took)
+}
+
+/// Copy `from` to this process's own stream and to the log, in chunks rather
+/// than lines: `cargo test` writes progress without a newline, and a line
+/// reader would hold it back until the next one arrived.
+fn tee(mut from: impl Read, log: &LandLog, is_stderr: bool) {
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = from.read(&mut buf) {
+        if n == 0 {
+            return;
+        }
+        let chunk = &buf[..n];
+        if is_stderr {
+            let mut out = io::stderr();
+            let _ = out.write_all(chunk);
+            let _ = out.flush();
+        } else {
+            let mut out = io::stdout();
+            let _ = out.write_all(chunk);
+            let _ = out.flush();
+        }
+        log.raw(chunk);
+    }
 }
 
 /// main moved while this process held the lock, and only `--land` takes it.
@@ -303,7 +436,12 @@ mod tests {
         sh(&primary, &["config", "user.name", "t"]);
         sh(&primary, &["config", "commit.gpgsign", "false"]);
         fs::write(primary.join("f"), "base\n").unwrap();
-        sh(&primary, &["add", "f"]);
+        // As the real repository does, and for the reason `--land` now needs it
+        // to: the landing writes its own log under `target/`, and an untracked
+        // one there would make every one of these tests the dirty-worktree
+        // refusal instead of what it is about.
+        fs::write(primary.join(".gitignore"), "target/\n").unwrap();
+        sh(&primary, &["add", "f", ".gitignore"]);
         sh(&primary, &["commit", "-qm", "base"]);
 
         sh(&primary, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "wt", "main"]);
@@ -474,6 +612,60 @@ mod tests {
         let report = run(&wt, &pass()).unwrap();
         assert!(report.contains("NOT the default"), "an override went unreported: {report}");
         assert!(buildlock::integration_is_free(&primary), "the lock was left held");
+    }
+
+    /// The whole of the shared-scratchpad defect: two landings must not be able
+    /// to write one file, and neither may be told where to write by its caller.
+    ///
+    /// Both halves matter. A unique name that did not carry the gate's output
+    /// would leave the agent redirecting anyway, which is the thing that
+    /// collided; a captured gate under a caller-chosen name collides just the
+    /// same.
+    #[test]
+    fn each_landing_writes_its_own_log_and_the_gate_is_in_it() {
+        let (_primary, wt) = repo("log");
+        commit(&wt, "g", "mine\n", "work");
+        // Assembled by the gate rather than quoted in its argv, so the `[land]
+        // gate: …` header cannot satisfy the assertion the gate's own output is
+        // supposed to.
+        let shout =
+            vec!["sh".to_string(), "-c".to_string(), r"printf 'gate-said-%s\n' hello".to_string()];
+
+        let report = run(&wt, &shout).expect("the landing should have gone through");
+        let named = report
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("[land]   log   "))
+            .expect("the report does not name the log");
+        let text = fs::read_to_string(named).expect("the named log is not there");
+        assert!(text.contains("gate-said-hello"), "the gate's own output is not in the log:\n{text}");
+        assert!(text.contains("landed wt on main"), "the outcome is not in the log:\n{text}");
+
+        commit(&wt, "g", "more\n", "again");
+        let second = run(&wt, &shout).expect("the second landing should have gone through");
+        let also = second
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("[land]   log   "))
+            .expect("the second report does not name the log");
+        assert_ne!(named, also, "two landings wrote one file");
+    }
+
+    /// A refusal is the whole product of a failed landing, and reading one back
+    /// out of a scrollback that eight other landings went through is what could
+    /// not be done.
+    #[test]
+    fn a_refused_landing_leaves_its_refusal_in_the_log() {
+        let (_primary, wt) = repo("log-refusal");
+        commit(&wt, "g", "mine\n", "work");
+
+        let refusal = run(&wt, &["false".to_string()]).expect_err("a red gate must not land");
+        let logs: Vec<PathBuf> = fs::read_dir(wt.join("target/landings"))
+            .expect("no landings directory")
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        let text = fs::read_to_string(&logs[0]).unwrap();
+        assert!(text.contains("the gate failed"), "{text}");
+        assert!(refusal.contains("the gate failed"), "{refusal}");
     }
 
     /// The unquoted form is the whole contract of `--gate`, and the quoted one
