@@ -84,8 +84,26 @@ as authority, guessing or outliving the designation was the entire attack:
   Not closed by `be604ef`, which this file briefly claimed: `Listener(String)`
   is an unchanged *context* line in that commit's own `fd.rs` hunk. See the
   postscript at the end of this section.
+
+  **The setup is gone too** (tasks #61/#170): a listener is refcounted by the
+  descriptors naming it (`listener::ListenerRef`), so the `close(fd)` in that
+  three-call attack unregisters nothing and the real compositor's `listen` is
+  *refused*. What is left is a squat, which is the "no namespace" bullet in the
+  next entry and a different defect. `abuse_listener_hijack.rs` now asserts that
+  refusal; the `ListenerId` half is the second line and is no longer reachable
+  from userland at all, because nothing can produce a descriptor whose listener
+  is gone.
 - **`SharedToken`** — a bare `u32` with no RAII and no ownership, still open
   (§7).
+- **A device claim** — same shape, closed by the same tasks. `dup` cloned
+  `Descriptor::Keyboard`/`Framebuffer`/… as a plain value while `close` released
+  the class unconditionally, so `open_device(d); dup(fd); close(fd)` freed the
+  device for anyone to take *and* left the caller a working descriptor: two
+  processes composing to one scanout, or one reading another's keystrokes.
+  `device::Claim` is now a non-`Clone` token whose `Drop` releases the class, so
+  `Descriptor` cannot be `Clone` either and `Descriptor::duplicate` cannot
+  answer `Some` for those five variants — `dup`, `dup2` and a spawn `fd_map` all
+  say `PermissionDenied`. `device_claim_lifetime.rs` is the exploit test.
 
 The adjacent failure, same root: **a reference that outlives the object it
 names.** `FileBacking` after an unlink is the live instance (below) — the
@@ -252,8 +270,12 @@ this is a class, not an instance.
 Those gates are exactly as strong as the claim and no stronger. `SYS_OPEN_DEVICE`
 is itself first-come and ungated, so a process that beats the daemon to a device,
 or claims it after the daemon dies, holds everything the claim unlocks — for
-`DEVICE_AUDIO` that includes the RT band, which audio spec §9.4 wants to be a
-privilege. "Gated" here does not mean "privileged".
+`DeviceType::Audio` that includes the RT band, which audio spec §9.4 wants to be
+a privilege. "Gated" here does not mean "privileged".
+
+What is no longer *also* true is that the claim leaks: a claim admits exactly one
+descriptor now (`device::Claim`, `Descriptor::duplicate`), so racing the daemon
+is the whole remaining attack rather than the cheap half of it.
 
 ### `SYS_DEBUG` is ungated, and two of its actions are a diagnostic-channel DoS
 
@@ -1645,6 +1667,48 @@ behaviour is now deterministic, and deterministically weaker than §7.4 assumes.
 Whether that matters is measurable — gate A's wake-lateness distribution is the
 instrument — and it did not move at N=8.
 
+### CLOSED — check-and-act across a released global lock, and the three residuals it leaves
+
+`pipe::open_reader`, `sys_socket_create` and six `file_cache::ref_count` call
+sites each read an answer out from under a global lock, released it, and acted.
+The pipe one was the one with teeth: `exists(id)` then `add_reader(id)` panicked
+on `.expect("add_reader: pipe not found")` when the pipe's last other end closed
+in between, *inside* `with_pipes_mut` — and a recovered syscall-context panic
+leaves `PIPES` held for the rest of the boot, which wedges all IPC. Closed by
+making the count and the handle one construction: `PipeReader`/`PipeWriter` live
+in a child module of `pipe.rs` whose field is private to it, so the only way to
+name a pipe as an owned reference is `acquire(&mut Pipe)`, and only a holder of
+`PIPES` can produce a `&mut Pipe`. `exists`, `creator` and `ref_count` are
+deleted; `mark_deleted` returns `Residency`; `copy_page_out` returns whether the
+page was there instead of zero-filling. Negative controls in the commit message.
+
+Three things the change does not reach:
+
+- **A count can still move without a handle.** `close_read`/`close_write` must
+  decrement and decide whether to free the pipe in one acquisition, so they live
+  in `pipe.rs` and touch `Pipe::readers` directly. Binding that direction too
+  needs the counts in a struct declared inside the handle module with a
+  `pub(super)` decrement, which buys a named operation and not an unwritable
+  one. The direction that was the defect is closed; this one has two writers and
+  both are in that file.
+
+- **`SYS_FTRUNCATE` takes no VFS lock and `SYS_FSYNC` does** (`arch/syscall.rs`,
+  `SYS_FTRUNCATE => fd::ftruncate(&mut data.fds, ...)` against
+  `SYS_FSYNC => fd::fsync(&mut data.fds, &mut *vfs::lock(), ...)`). That
+  asymmetry is what let a truncate remove a page between `clone_dirty` and
+  `copy_page_out`. The write of fabricated zeros is closed; the window is not,
+  and `flush_file`'s `size()` + `update_metadata` pair sits in it too — a
+  truncate landing between them records the older size, corrected by the next
+  flush because `ftruncate` sets `modified`.
+
+- **`file_cache::read_page` has two paths that return with `buf` untouched**
+  (`file_cache.rs`, both `let Some(file) = cache.files.get_mut(&file_id) else {
+  return }`), while `fd::try_read` has already told its caller how many bytes it
+  is producing, from a `file_cache::size` read under a different acquisition. It
+  is not reachable today — `try_read` runs holding a descriptor for the file, so
+  its refcount is at least one and neither `release` nor `mark_deleted` can drop
+  it — but the signature makes no such claim, and the honest return is fallible.
+
 ### `retire_task` is never reached by `cargo test`
 
 Instrumented across all 140 tests: zero calls. Threads that `join` are removed
@@ -3011,6 +3075,25 @@ phase landed, and none reproduces on a host running one suite.
   against the device's queue, and the lost-edge counter no longer fires on a
   pass that read the `irq_ring` record a few instructions before the ISR
   published it.
+  **Not closed after all, at the count.** 2026-08-07, two full suites in one
+  worktree while a second worktree held six of the twelve guest slots: `1003
+  pointer events reached userland out of 1004 packets injected, never more than
+  4 of them (12 bytes) outstanding against a 16-byte device queue`. The lead is
+  inside the bound the fix installed, so the summing mechanism §8 describes is
+  not what this is. A/B in one session, `git checkout main -- kernel/` in the
+  same tree minutes apart: this branch PASS 33 s first try, **main's kernel FAIL
+  with the identical 1003-of-1004 line**, then PASS 2 s on the harness's own
+  re-run. So it is not a tree difference and it is not gone — one packet in a
+  thousand is still being lost, or still being counted wrong, under a host
+  carrying two suites.
+- **`i8042_absent`** — same session, same shape, and it is `Sched::Serial`
+  already, so intra-suite width is not what reaches it. The verdict is the
+  guest's own `Boot: complete` on two boots with a 300 ms allowance; the landing
+  gate saw `601ms without an i8042 and 287ms with one`. Alone, minutes later:
+  this branch 619 vs 507 (PASS), main's kernel in the same tree 277 vs 331
+  (PASS). The absolute figure moved 277→619 ms across three runs of one boot
+  with no code change, so what the allowance is being asked to absorb is the
+  host, and a serial slot inside one suite does not buy a quiet one.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
@@ -4099,12 +4182,12 @@ and it is not measurable here.
 
 ### A device claim succeeds on a machine that has no such device
 
-`device::try_claim` gates `DEVICE_FRAMEBUFFER`, `DEVICE_NIC` and `DEVICE_AUDIO`
+`device::try_claim` gates `DeviceType::{Framebuffer, Nic, Audio}`
 on an info struct the driver registered, so those three return
 `ClaimError::Absent` when the hardware is absent — which is what makes soundd
 and netd able to exit cleanly.
-`DEVICE_KEYBOARD` and `DEVICE_MOUSE` are gated on nothing at all: they hand out
-a `Descriptor` whether or not any driver will ever produce an event. Under
+`DeviceType::Keyboard` and `DeviceType::Mouse` are gated on nothing at all: they
+hand out a `Descriptor` whether or not any driver will ever produce an event. Under
 metal-sim the compositor holds both claims on a machine with no HID of any kind
 and polls them forever. Harmless today, wrong in the same way the isolation
 issues in §1 are wrong: a claim is supposed to be evidence.
@@ -5037,7 +5120,7 @@ uninterpretable.
 
 `panic_console::boot_checkpoint` returns immediately once
 `SCREEN_OWNED_BY_USERLAND` is set (`panic_console/mod.rs:478`), and
-`device::try_claim(DEVICE_FRAMEBUFFER)` sets it (`device.rs:83`) as the
+`device::try_claim(DeviceType::Framebuffer)` sets it as the
 compositor's third statement (`compositor/src/main.rs:719`). So the last
 kernel screenful ever painted is the one at `Boot: complete`, and the compositor
 overwrites it with the desktop a few tens of milliseconds later. Measured on
