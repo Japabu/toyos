@@ -54,11 +54,11 @@ pub fn try_lock() -> Option<VfsGuard> {
 /// The device error channel runs from [`crate::block::BlockDevice`] up through
 /// [`crate::file_backing::FileBacking`] and `bcachefs::BlockIO`, each fallible
 /// so that nothing in the middle invents a value. This trait was where it
-/// stopped: `file_size` and `read_link` returned `Option`, `file_mtime` a bare
+/// stopped: `open_file` and `read_link` returned `Option`, `file_mtime` a bare
 /// `u64` and `delete` a `bool`, and every one of those read a device that would
 /// not answer as *no such file*. That is not a degradation a caller can act on
-/// — it unlinks a name it believes is already absent, or reports a program
-/// missing off a stick that is merely refusing one transfer.
+/// — `fd::open` created an empty file over one that exists, because `CREATE`
+/// acted on the same `None` a refused transfer produced.
 ///
 /// [`SyscallError`] and not a filesystem error type of its own, because there
 /// is no second consumer: the only thing above this trait is the syscall layer,

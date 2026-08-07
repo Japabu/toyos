@@ -308,11 +308,10 @@ pub fn close(
     let Some(desc) = table.remove(fd) else {
         return SyscallError::NotFound.to_u64();
     };
-    // A flush that failed still closes the fd — the descriptor is gone above
-    // and everything below runs — and is still *reported*, which is what POSIX
-    // means by `close` returning `EIO`. It used to be `let _ =`: the last write
-    // of a file never reached the device and the process that made it was told
-    // the close worked.
+    // What the caller is told, once the release below has run whatever it was
+    // going to run: a flush that failed does not stop a close, but a close that
+    // swallowed it told a process its last write reached the device when it did
+    // not. `EIO` from `close` is what POSIX means by that.
     let mut result = 0;
     for id in [desc.pipe_id_read(), desc.pipe_id_write()].into_iter().flatten() {
         let still_held = table
