@@ -2866,6 +2866,17 @@ microsecond-wide state** — `blocked_dump` has seen `1 OVERDUE` on a healthy
 guest. The count is evidence, not a verdict; what condemns a machine is one that
 stays.
 
+**OPEN — `blocked_dump`'s `Sched::Parallel` is wrong, by the harness's own
+verdict.** 2026-08-07, tree `4a0a07f`, in a landing gate: `nothing typed at the
+terminal window reached a shell`, then `ALONE blocked_dump: GREEN — it fails
+only beside other guests`, and the run stayed red on the classification as it is
+designed to. The host carried eight `toyos-build` processes and three guests at
+the time. Its verdict is the dump's content, but *reaching* the dump needs a
+keystroke to cross a compositor, a terminal and a shell, and that step is a
+wall-clock margin — which is what the serial tail is for. Not reclassified here,
+because whether it belongs in the tail or wants a longer margin is a decision for
+whoever owns the dump, and one occurrence is one sample.
+
 **KNOWN BLIND SPOT: the dump cannot fire when no CPU reaches a scheduler pass.**
 It is dispatched from `drain_irqs` at the top of a pass, so a *partial* wedge
 answers and a *total* freeze is silent — the owner pressed it after pulling the
