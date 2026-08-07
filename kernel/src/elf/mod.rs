@@ -332,6 +332,7 @@ pub fn load_shared_lib(
     // indexes only the exports, so a count derived from it is short whenever
     // the module imports anything.
     let declared = dynsym_count_from_sections(backing, &layout)
+        .filter(|&n| n > 0)
         .or_else(|| {
             let table = GnuHash::parse(unsafe { gnu_hash.as_ref()?.as_slice() })?;
             table.sym_count()
@@ -369,6 +370,13 @@ pub fn load_shared_lib(
     //
     // The bound is the writable window, not the image: once this module is
     // cached the write lands in `rw_alloc`, which covers only that window.
+    //
+    // The window is image-relative, and so is `LoadedLib::write_at`'s offset —
+    // but the `RELATIVE` pass below goes through `ModuleImage::slice`, which
+    // subtracts `vaddr_min`. The two agree for every `vaddr_min` of zero, which
+    // is every module a linker produces; above zero `slice` refuses rather than
+    // writing somewhere else, so the disagreement is a refusal and not a
+    // corruption.
     let window = (rw_offset as u64, (rw_offset + rw_size) as u64);
     let entries = table_entries(&rela).chain(table_entries(&jmprel));
     rela::validate(entries, window, sym_count).map_err(|e| e.as_str())?;
