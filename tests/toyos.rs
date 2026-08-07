@@ -2881,6 +2881,29 @@ fn run_screen_test(
                 }
             };
 
+            // How long the unattended deadline actually takes to move the page,
+            // measured before a key is pressed because the first key retires it
+            // for good. This is what stops the last phase passing vacuously: a
+            // guest too slow to have paged in its window would prove nothing by
+            // not paging, and this is the window measured on *this* guest.
+            let timing_from = Instant::now();
+            let unattended_move = loop {
+                let Some(now) = footer(&mut qemu) else {
+                    return Err("the footer vanished while timing the unattended deadline".into());
+                };
+                if now != last {
+                    last = now;
+                    break timing_from.elapsed();
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "the pager never advanced on its own in {:.1}s against a 3s deadline — \
+                         nothing here can say whether a keystroke stops it",
+                        timing_from.elapsed().as_secs_f64()
+                    ));
+                }
+            };
+
             // One keystroke per sample. Every one of them should move the page,
             // where the 3 s deadline that stands in for a dead keyboard could
             // not have moved it more than once per 3 s of the elapsed run.
@@ -2899,27 +2922,79 @@ fn run_screen_test(
             }
             let elapsed = started.elapsed();
 
-            // What the deadline alone could have contributed, plus the one it
-            // may have been part-way through when the window opened. The
-            // verdict is a rate against the guest's own clock, which is why
-            // this test is `Sched::Serial`.
+            // What the deadline could have contributed if it were still running.
+            // It is not — the first keystroke above retired it — so this is a
+            // ceiling the run cannot reach and the bound is the more
+            // conservative for it. The verdict is a rate against the guest's own
+            // clock, which is why this test is `Sched::Serial`.
             let unattended = elapsed.as_secs_f64() / 3.0 + 1.0;
-            print_screen(
-                name,
-                &format!(
-                    "{moved} of {SAMPLES} keystrokes moved the page in {:.1}s; the 3s deadline \
-                     could account for {unattended:.1}",
-                    elapsed.as_secs_f64()
-                ),
-            );
             if (moved as f64) < unattended * 3.0 {
                 return Err(format!(
-                    "{moved} page moves over {SAMPLES} keystrokes in {:.1}s — the unattended \
+                    "{moved} page moves over {SAMPLES} keystrokes in {:.1}s — an unattended \
                      deadline alone could have produced {unattended:.1} of them, so nothing \
                      here says a keystroke reached the halted pager",
                     elapsed.as_secs_f64()
                 ));
             }
+
+            // Let the backlog drain before watching. A full-panel repaint on a
+            // 1920x1080 GOP outlasts QEMU's 16-byte PS/2 queue, so the pager is
+            // still working through keys for a moment after the last one is sent
+            // — and those moves are the reader's, not the deadline's. Settling is
+            // waiting for one page to stay up longer than a repaint takes.
+            const SETTLED: Duration = Duration::from_secs(1);
+            let settle_by = Instant::now() + qemu::budget(Duration::from_secs(20));
+            let mut held = last.clone();
+            let mut stable_since = Instant::now();
+            loop {
+                let Some(now) = footer(&mut qemu) else {
+                    return Err("the footer vanished while the keystroke backlog drained".into());
+                };
+                if now != held {
+                    held = now;
+                    stable_since = Instant::now();
+                } else if stable_since.elapsed() >= SETTLED {
+                    break;
+                }
+                if Instant::now() >= settle_by {
+                    return Err(format!(
+                        "the pager never held one page for {}s in the 20s after the last keystroke",
+                        SETTLED.as_secs()
+                    ));
+                }
+            }
+
+            // And now the owner's complaint, which is the other half: a page he
+            // steered to must stay up. The window is twice what the unattended
+            // deadline was measured to need above, so a pager still running it
+            // moves at least twice inside this and a slow guest cannot pass by
+            // being slow.
+            let quiet = unattended_move * 2 + Duration::from_secs(1);
+            let watching_from = Instant::now();
+            while watching_from.elapsed() < quiet {
+                let Some(now) = footer(&mut qemu) else {
+                    return Err("the footer vanished while watching a steered page".into());
+                };
+                if now != held {
+                    return Err(format!(
+                        "the page moved from {held:?} to {now:?} on its own {:.1}s into a {:.1}s \
+                         watch after the last keystroke — the deadline is still running under a \
+                         reader who has taken the wheel, which is what it must not do",
+                        watching_from.elapsed().as_secs_f64(),
+                        quiet.as_secs_f64()
+                    ));
+                }
+            }
+            print_screen(
+                name,
+                &format!(
+                    "{moved} of {SAMPLES} keystrokes moved the page in {:.1}s; unattended it \
+                     moved once in {:.1}s, and after a keystroke it held {held} for {:.1}s",
+                    elapsed.as_secs_f64(),
+                    unattended_move.as_secs_f64(),
+                    quiet.as_secs_f64(),
+                ),
+            );
             Ok(())
         }
         "screen_fatal_halt" => {
@@ -5696,8 +5771,28 @@ fn run_machine_test(
             // alive: ten of the owner's boots are byte-identical between the
             // ones that froze and the ones that did not. The gate has to prove
             // three things a `must_say` cannot — that the lines *keep coming*,
-            // that they come at the period claimed, and that the mask is a
-            // real per-CPU reading rather than a constant.
+            // that no CPU drops out of the mask on a machine with nothing to
+            // do, and that no window between two lines is wide enough to hide a
+            // death.
+            //
+            // The second is why this asserts a *constant full* mask where the
+            // old gate asserted a *varying* one — and the old gate's assertion
+            // was satisfied by the defect, so it certified it. Same guest with
+            // the tick removed: 10 of 11 lines below `alive=8/8`, six of them at
+            // `alive=2/8`, 56 lines naming a silent CPU and one silent for
+            // 2.811 s. Every line is `8/8` with the tick.
+            //
+            // The gap bound below is the one with no demonstrated teeth here:
+            // without the tick the widest gap was still 0.260 s, because QEMU's
+            // devices keep waking *someone* even when they wake nobody in
+            // particular. It is carried for the metal log, where the same code
+            // left gaps of 14 s to 102 s.
+            //
+            // **What none of it establishes**: a QEMU guest is never as quiet as
+            // the owner's laptop. This proves the tick arms, fires and re-arms,
+            // and that the instrument reads a full mask when nothing is wrong.
+            // It cannot prove the T14's LAPIC keeps counting through whatever
+            // its firmware does with a halted core.
             let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
@@ -5722,18 +5817,50 @@ fn run_machine_test(
                     beats.len()
                 ));
             }
-            // The mask has to *be* a reading. A constant would pass every
-            // cadence assertion above while telling the owner nothing about
-            // which CPUs stopped, which is the whole second half of the line.
-            let masks: BTreeSet<&str> = beats
-                .iter()
-                .filter_map(|l| l.split("mask=").nth(1))
-                .map(|m| m.split_whitespace().next().unwrap_or(""))
+            // A clear bit has to mean "that CPU stopped". On a machine with
+            // nothing to run that is only true if every CPU is woken anyway, so
+            // the assertion is that none is ever missing — and the per-CPU lines
+            // the kernel prints for a missing one must never appear at all.
+            let thin: Vec<&&str> = beats.iter().filter(|l| !l.contains("alive=8/8")).collect();
+            let named: Vec<&str> = log
+                .lines()
+                .filter(|l| l.contains("heartbeat: cpu"))
                 .collect();
-            if !beats.iter().any(|l| l.contains("passes=8/8")) && masks.len() < 2 {
+            if !thin.is_empty() || !named.is_empty() {
                 return Err(format!(
-                    "every heartbeat reports the same mask {masks:?} and none reports all eight \
-                     CPUs — the per-CPU field is not a reading\n{log}"
+                    "{} of {} heartbeats dropped a CPU from the mask and {} named one silent, on a \
+                     guest where every CPU is healthy — so a clear bit does not mean that CPU \
+                     stopped, which is the whole of the field\n{}\n{}\n{log}",
+                    thin.len(),
+                    beats.len(),
+                    named.len(),
+                    thin.iter().take(4).map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
+                    named.iter().take(4).cloned().collect::<Vec<_>>().join("\n"),
+                ));
+            }
+            // And no window between two lines may be wide enough to hide a
+            // death. The metal boots this exists for went quiet for between 14 s
+            // and 102 s; four times the period is far below any of them and far
+            // above anything a loaded host does to a 250 ms cadence.
+            const MAX_GAP_S: f64 = 1.0;
+            let gaps: Vec<f64> = beats
+                .iter()
+                .filter_map(|l| l.split("gap=").nth(1))
+                .filter_map(|g| g.trim_end_matches('s').split_whitespace().next()?.parse().ok())
+                .collect();
+            if gaps.len() != beats.len() {
+                return Err(format!(
+                    "{} of {} heartbeats carry no readable gap= — the field a reader uses to tell \
+                     a machine that went quiet from one that died\n{log}",
+                    beats.len() - gaps.len(),
+                    beats.len()
+                ));
+            }
+            let worst = gaps.iter().copied().fold(0.0f64, f64::max);
+            if worst > MAX_GAP_S {
+                return Err(format!(
+                    "the widest window between two heartbeats was {worst:.3}s against a 250 ms \
+                     period — the machine stopped reporting for long enough to have died in\n{log}"
                 ));
             }
             // And the clock in the line advances, or the timestamp cannot
@@ -5750,9 +5877,8 @@ fn run_machine_test(
                 ));
             }
             eprintln!(
-                "  [heartbeat] {} lines in ~3 s, {} distinct mask(s), t={} → t={}",
+                "  [heartbeat] {} lines in ~3 s, all alive=8/8, widest gap {worst:.3}s, t={} → t={}",
                 beats.len(),
-                masks.len(),
                 stamps.first().unwrap_or(&"?"),
                 stamps.last().unwrap_or(&"?")
             );

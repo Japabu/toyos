@@ -278,6 +278,39 @@ pub fn arm_one_shot(nanos: u64) {
     crate::trace::trace(crate::trace::Kind::TimerArm, nanos as u32);
 }
 
+/// Shorten this CPU's armed interval to at most `nanos`, arming it if the last
+/// pass left it stopped.
+///
+/// The minimum against what is already armed is what keeps this a pure
+/// addition: a parked task's deadline is never pushed out, and all the
+/// scheduler ever sees is extra passes — which it already tolerates, since a
+/// kick IPI is one.
+///
+/// `last_armed_ticks` is written too, so the reload the timer stub does in
+/// assembly before any Rust runs carries the cap forward. That is what stops
+/// the tick depending on the code it exists to watch: one fire arms the next,
+/// and the chain breaks only where a CPU stops taking interrupts.
+///
+/// Traces nothing, unlike [`arm_one_shot`]: no scheduler deadline is being set
+/// here, and a `TimerArm` record would make the trace say one was.
+#[cfg(feature = "diag-tick")]
+pub fn arm_within(nanos: u64) {
+    let ticks_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u64;
+    let ticks = (nanos as u128 * ticks_10ms as u128 / 10_000_000) as u64;
+    let ticks = ticks.clamp(1, u32::MAX as u64) as u32;
+    // A running count never reaches zero without the fire that reloads it, so
+    // zero is `stop_timer` and not an expiry an instant away.
+    let remaining = cpu::rdmsr(X2APIC_TIMER_CURRENT) as u32;
+    let ticks = if remaining == 0 { ticks } else { ticks.min(remaining) };
+    cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
+    // An AP reaches its first idle before it has ever run a task, so before
+    // `arm_one_shot` has ever written this register — and an LVT resets masked.
+    cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
+    let percpu = unsafe { &*percpu::percpu_ptr() };
+    percpu.last_armed_ticks.store(ticks, Ordering::Relaxed);
+    cpu::wrmsr(X2APIC_TIMER_INIT, ticks as u64);
+}
+
 /// Stop the timer. No more interrupts until re-armed.
 pub fn stop_timer() {
     let percpu = unsafe { &*percpu::percpu_ptr() };

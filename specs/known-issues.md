@@ -3511,6 +3511,20 @@ verdict line was its own (`1 of the two overlapping clients left the mixer`)
 rather than `desktop_typing_damage`'s, so the message is not the tell — the pair
 of durations is.
 
+**And the holder can be its own victim.** 2026-08-07, task #152's worktree,
+whole suite 500 s against the ~109 s it is ordered for, with another worktree's
+toolchain build on the host: `desktop_window_child` itself took **249 s** and
+failed with `nothing typed at the terminal window reached a shell` — the
+*victim's* message, from the test that is normally the one occupying the lane.
+So the row above's "the victim is positional" is the weaker half of the claim:
+under enough host pressure the position that loses its typing window is
+whichever guest is late, and that can be the four-minute test as easily as the
+one beside it. It also means **`EXPECTED_FAILURES` does not absorb it** — the
+entry deliberately covers only "the desktop ceased to answer after a window
+closed", and this message names a shell that never answered in the first place,
+so the run reds on the very test the exemption exists for and for a reason the
+exemption is right to exclude.
+
 ### A whole parallel phase can be starved by another agent's build
 
 Measured 2026-08-04: the same tree that runs the phase in 44.8 s ran it in
@@ -5109,13 +5123,14 @@ which has already priced it, enumerated the sites and written the deadlock rule.
 Whoever builds this A/B builds a throwaway to test a hypothesis about the
 freeze, obeys §3.3's rule about `log!` between issue and ack, and lands nothing.
 
-**Cheaper still, and it should be tried first**: the ninth boot the owner is
-already going to make carries `heartbeat`, and the heartbeat's `mask=` field
+**Cheaper still, and it should be tried first**: the heartbeat's `mask=` field
 answers a question this experiment would answer expensively. A machine dying to
 a stale translation loses CPUs the way a memory corruption does — one at a time,
 in whatever order they touch the bad page — while a machine dying to a global
 cause loses them between two lines. One flash of an instrument that is already
-built beats one flash of a fix that is not.
+built beats one flash of a fix that is not. **The first eight boots of it read
+`0/8` for a hundred seconds on a healthy machine** and the entry below is why;
+the field means what it says from `diag-tick` on.
 
 #### What the owner should run — settled
 
@@ -5141,6 +5156,98 @@ says the software half works and the reflash asks only about the panel. That
 split is deliberate: QEMU's framebuffer is host RAM, while the T14's is a
 write-combining MMIO mapping the compositor is also writing and a full paint
 measures ~460 ms there.
+
+#### CLOSED — the heartbeat's first build was blind on an idle machine, and the eight boots that proved it
+
+Eight `--console-boot --kernel-feature heartbeat --kernel-feature
+metal-panic-probe` boots, logs at `2026-08-07-15{3347,3603,3819,3854,4108,4203,
+4259,4532}.log`. Every one has the same shape:
+
+```
+[kernel   1.150 cpu4] heartbeat: t=1.150s passes=8/8 mask=0xff
+[kernel   1.782 cpu0] heartbeat: t=1.782s passes=8/8 mask=0xff
+[kernel 104.512 cpu0] !!! PANIC !!! metal-panic-probe …
+[kernel 104.512 cpu2] heartbeat: t=104.512s passes=1/8 mask=0x01
+[kernel 104.512 cpu5] i8042: the pin asserts — 1 interrupts, 1 bytes, 1 keys …
+```
+
+**Exactly three heartbeats per boot, in all eight**: two while userland came up,
+then nothing for 14 s, 16 s, 31 s, 102 s, 115 s or 121 s depending on the boot,
+then one final line in the *same millisecond* as the first keypress. The owner's
+account matches — "waited a long time no panic, Fn button definitely causes
+panic", "same but for caps lock" — and every trigger he found is an interrupt.
+
+**The finding: after ~1.8 s no CPU takes a scheduler pass at all.** Every CPU's
+pass found no work and no deadline, so it stopped its LAPIC timer and halted
+until something external arrived. That is correct behaviour and good power
+management, and it made the instrument blind at the one job it was built for:
+`heartbeat::poll` ran from the idle loop, a halted CPU does not run the idle
+loop, and **a healthy quiescent machine and a dead one wrote byte-identical
+logs** — the precise failure the heartbeat was built to eliminate. The same
+defect blinded the probe, which is why it fired 99 s late and only on a keypress
+rather than at its deadline.
+
+**Fixed by `diag-tick`** (`kernel/Cargo.toml`, `KernelHw::idle_wait`,
+`apic::arm_within`): a diagnostic build caps how long a CPU may sleep at 100 ms,
+taking the minimum against whatever the pass just armed so no wakeup is ever
+pushed out. `heartbeat` and `metal-panic-probe` both depend on it. The line now
+reads `alive=N/8` with a `gap=` field, and names each missing CPU with how long
+it has been silent. Gated by `kernel_heartbeat`, whose teeth are recorded in its
+own comment: with the tick removed, 10 of 11 lines dropped a CPU, six of them at
+`alive=2/8`, one CPU silent for 2.811 s — and the *old* gate's assertion was a
+mask that **varies**, so it was satisfied by the defect and certified it.
+
+**What these eight boots do not establish, and must not be read as:**
+
+- **The desktop freeze was not tested.** The owner ran `--console-boot`. Nothing
+  here is evidence about #156's own reproduction.
+- **The unplug case cannot be tested with this image at all.** The probe makes
+  any interaction panic the machine. Boots 4 and 5 (`153854`, `154108`) are the
+  two truncated at 1.8 s with no panic recorded: he pulled the stick, the panic
+  fired on the pull, and the log could not be written to a removed stick. The
+  machine was then in the halted pager, so *"still responding"* is
+  `page_forever` polling the i8042 by design and says nothing about whether the
+  unplug would have frozen a running machine.
+- **A silent log still means less than death.** A set bit says that CPU took an
+  interrupt, returned from `hlt` and reached a pass; the tick that produces the
+  next one is re-armed by the timer stub in assembly, so the chain breaks only
+  where a CPU stops taking interrupts. If every CPU's LAPIC timer stopped at
+  once — a C-state that parks it, an SMI storm — the log would go quiet and read
+  as death. The kernel only ever executes `hlt` and programs no C-state MSR, but
+  the T14's firmware is not ours, so the honest claim from a stopped log is *the
+  machine stopped taking timer interrupts*.
+- **The instrument is no longer passive.** Each heartbeat carries a
+  `sync_mount` of `/log`, so a `heartbeat` build touches the boot stick four
+  times a second and the boot it watches is not quite the boot without it.
+
+#### What the owner should run next — the ninth boot
+
+```
+cargo run -- --kernel-feature heartbeat --build-only
+```
+
+The **ordinary** image and not `--console-boot`: the desktop is what freezes and
+the last eight boots did not run it. No `metal-panic-probe` — it makes any
+keypress panic the machine, which is what stopped those boots being able to test
+the unplug. Flash `target/bootable.img`, boot to the desktop, use it, and pull
+the log off `/log` afterwards. **Nothing needs to be touched for the log to be
+readable**, which is the whole change:
+
+- **Heartbeats continue at ~250 ms with `alive=8/8` to the end of the file** →
+  the machine was alive when the power went off. Previously indistinguishable
+  from death.
+- **Heartbeats stop dead** → the machine stopped, at the timestamp of the last
+  line ± 250 ms. That is the freeze, with a time on it for the first time.
+- **`alive=` falls one CPU at a time over several lines**, each named by a
+  `heartbeat: cpuN last reached one …s ago` → a local cause spreading, which is
+  what a stale translation looks like: CPUs die in the order they touch the bad
+  page. This is the reading §3.3's shootdown hypothesis is waiting on.
+- **`alive=` goes from `8/8` to nothing between two lines** → a global cause,
+  below the software layer, and the shootdown hypothesis loses its best
+  evidence.
+- **A `gap=` far larger than 0.250s on a line that is otherwise healthy** → the
+  machine went quiet and came back rather than dying. On the eight boots above
+  this was the whole file; it should now never happen.
 
 ### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
 
