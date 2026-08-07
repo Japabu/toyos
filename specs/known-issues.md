@@ -5278,14 +5278,15 @@ the unplug. Flash `target/bootable.img`, boot to the desktop, use it, and pull
 the log off `/log` afterwards. **Nothing needs to be touched for the log to be
 readable**, which is the whole change:
 
-- **Heartbeats continue at ~250 ms with `alive=8/8` to the end of the file** →
-  the machine was still scheduling when the power went off. Previously
-  indistinguishable from death. **If the owner saw it frozen and the heartbeat
-  is still printing, that is the decisive reading**: the scheduler and the
-  interrupt layer are alive and the failure is above them — a lost wakeup, or
-  userland wedged — and every hypothesis below the software layer is out,
-  including the shootdown. That case is the one the `tone` boot below makes
-  live, and it is the whole reason the next flash is worth making.
+- **Heartbeats continue at ~250 ms with `alive=8/8` and `ran=` moving, to the
+  end of the file** → the machine was still scheduling *and still running
+  tasks* when the power went off. Previously indistinguishable from death.
+- **Heartbeats continue with `alive=8/8` and `ran=0` line after line** → the
+  decisive reading. The scheduler and the interrupt layer are alive and the
+  failure is above them — a lost wakeup, or userland wedged — and every
+  hypothesis below the software layer is out, including the shootdown. This is
+  the case the `tone` boot below makes live, and it is the whole reason the next
+  flash is worth making.
 - **Heartbeats stop dead** → the machine stopped, at the timestamp of the last
   line ± 250 ms. That is the freeze, with a time on it for the first time.
 - **`alive=` falls one CPU at a time over several lines**, each named by a
@@ -5373,19 +5374,45 @@ near-zero on an idle machine to ~80/s machine-wide. If the next boot behaves
 differently from these, that is the first thing to suspect, and it is why the
 build carrying this must not be confused with the shipping one.
 
-**What would actually detect a lost wakeup, and its price.** The signal is "a
-wake was posted and nothing consumed it", which needs the per-CPU census the
-heartbeat cannot take: `ready_len`/`parked_len` are `try_with_cpu`, a `CpuSched`
-is `!Sync`, and one CPU cannot read a sibling's queue — which is why Ctrl+Alt+D
-marks and kicks every sibling instead. The cheap shape is each CPU recording its
-own `(ready, parked, current)` beside its `TICKED` stamp in `note_pass`, and the
-heartbeat printing the collected snapshot; that turns the 10 s census into a
-250 ms one. **Not built**, and deliberately: `note_pass` runs at the top of
-`drain_irqs`, inside a pass that may already be borrowing the `CpuSched`, so
-this is a borrow question rather than a formatting one, and getting it wrong
-perturbs the machine being measured. It is worth doing *after* the next flash
-says whether the heartbeat stops, because that answer decides whether a lost
-wakeup is still a live hypothesis at all.
+**So `ran=` was built, and the obvious design would not have served.** That
+design is a per-CPU `(ready, parked, current)` census beside the `TICKED` stamp,
+and it is wrong for a reason worth keeping: a woken task is dispatched within
+microseconds, so `ready=` sampled four times a second reads 0 on a healthy
+machine and 0 on a dead one. **The signal is a rate, so the instrument has to be
+a counter.** `heartbeat::note_dispatch` counts tasks switched onto a CPU — from
+`KernelHw::switch`'s `Some(_)` arm, the one place a task rather than the idle
+context becomes what a CPU is running — and the line carries the machine-wide
+delta since the previous one. Two signatures that used to be one:
+
+- **the line stops** → nothing is scheduling; the machine stopped.
+- **the line continues with `ran=0`** → the machine is scheduling and running
+  nothing. A lost wakeup, or a userland that has stopped asking.
+
+`ran=0` is not self-interpreting and the module doc says so: a machine with
+genuinely nothing to do also runs nothing. It is diagnostic on the T14 because
+that desktop always has something — the compositor wakes about twice a second to
+blink a cursor and every one of those is a dispatch — so a *run* of `ran=0`
+there is a machine that has stopped doing what it was doing. Cross-check against
+the i8042 counter line, which says whether input was arriving meanwhile.
+
+#### The third freeze — the first audio period, and why one signature was not enough
+
+`hda-metal/2026-08-07-183104.log`, 236 lines. **An older image**: flashed after
+H2/H4 landed and *before* M3's shootdown, so the defect it shows may already be
+closed, and it is evidence about the shape rather than about the current tree.
+The HDA driver bound on the T14 — ALC257 found, both codecs walked, speaker pin
+selected, path configured — then `spawn: /bin/tone pid=6` at 3.799 s, `soundd:
+opening stream: 44100Hz 2ch`, `client 0 connected`, `soundd: resumed`, `tone:
+440Hz for 2s`, and nothing ever again. That banner prints *before* the first
+audio callback, so the machine stopped as the HDA DMA stream started.
+
+That makes three metal freezes with three triggers: a process reaching its first
+instruction (~1.36 s), a keypress after 57 s of idle (86.9 s), and a stream's
+first DMA (~3.8 s). The common factor is **something being scheduled or woken**,
+which is #156's own title almost verbatim. Against the instrument as it first
+stood all three would have read `heartbeats stopped at T` — a time and never a
+class. With `ran=` they read as a time *and* one of two classes, which is what
+makes a fourth flash worth more than the third was.
 
 ### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
 

@@ -176,6 +176,12 @@ impl Hw for KernelHw {
             percpu::set_current_pid(incoming.id.map(|id| id.0));
             match incoming.id {
                 Some(_) => {
+                    // Here and not in the pass: this arm is the one place a
+                    // *task* rather than the idle context becomes what a CPU is
+                    // running, which is what `ran=` has to count for a machine
+                    // that schedules but runs nothing to be visible at all.
+                    #[cfg(feature = "heartbeat")]
+                    crate::heartbeat::note_dispatch();
                     percpu::set_kernel_stack(incoming.kernel_stack_top);
                     incoming.cr3.activate();
                     cpu::wrfsbase(incoming.fs_base);
