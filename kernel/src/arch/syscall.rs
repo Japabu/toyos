@@ -264,7 +264,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                 Err(e) => e.to_u64(),
             }
         }
-        SYS_FSYNC => process::with_fd_owner_data(|data| fd::fsync(&mut data.fds, &mut *vfs::lock(), a1 as u32)),
+        SYS_FSYNC => process::with_fd_owner_data(|data| fd::fsync(&mut data.fds, a1 as u32)),
         SYS_READDIR => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
             let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a3), a4) else { return bad_addr };
@@ -342,7 +342,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         // behind shared_memory grants either way. Ungated, any process could
         // scan out over the compositor's frames and move the cursor.
         SYS_GPU_PRESENT | SYS_GPU_SET_CURSOR | SYS_GPU_MOVE_CURSOR => {
-            if !device::is_owner(device::DEVICE_FRAMEBUFFER, process::current_process()) {
+            if !device::is_owner(device::DeviceType::Framebuffer, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
             }
             match num {
@@ -463,7 +463,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // `tx_free_slots` out from under it. Checked here rather than in
             // `audio::submit_buffer`, which init paths reach with no current
             // process.
-            if !device::is_owner(device::DEVICE_AUDIO, process::current_process()) {
+            if !device::is_owner(device::DeviceType::Audio, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
             }
             if crate::audio::submit_buffer(a1 as usize, a2 as u32) { 0 } else { SyscallError::InvalidArgument.to_u64() }
@@ -486,7 +486,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         // process could pop frames out of the used ring before netd sees them
         // and, by never refilling, exhaust all 256 RX slots.
         SYS_NIC_RX_POLL => {
-            if !device::is_owner(device::DEVICE_NIC, process::current_process()) {
+            if !device::is_owner(device::DeviceType::Nic, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
             }
             match crate::net::poll_rx() {
@@ -495,13 +495,13 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             }
         }
         SYS_NIC_RX_DONE => {
-            if !device::is_owner(device::DEVICE_NIC, process::current_process()) {
+            if !device::is_owner(device::DeviceType::Nic, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
             }
             crate::net::refill_rx_buf(a1 as usize).map_or_else(|e| e.to_u64(), |()| 0)
         }
         SYS_NIC_TX => {
-            if !device::is_owner(device::DEVICE_NIC, process::current_process()) {
+            if !device::is_owner(device::DeviceType::Nic, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
             }
             match crate::net::submit_tx(a1 as usize) {
@@ -523,7 +523,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // Checked before the driver, so a non-claimant never gets its two
             // arbitrary u32s turned into a contiguous physical allocation.
             let pid = process::current_process();
-            if !device::is_owner(device::DEVICE_FRAMEBUFFER, pid) {
+            if !device::is_owner(device::DeviceType::Framebuffer, pid) {
                 return SyscallError::PermissionDenied.to_u64();
             }
             // Checked before the allocation for the same reason the ownership
@@ -681,7 +681,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // Exactly as strong as the claim and no stronger: `SYS_OPEN_DEVICE`
             // is first-come and ungated, so whoever wins the race gets the RT
             // band with it. Spec §9.4 wants a privilege; a claim is not one.
-            if !device::is_owner(device::DEVICE_AUDIO, process::current_process()) {
+            if !device::is_owner(device::DeviceType::Audio, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
             }
             crate::scheduler::set_current_rt(a1 != 0);
@@ -743,7 +743,7 @@ fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
                 }
                 None => {
                     let desc = data.fds.get(fd_num);
-                    if matches!(desc, Some(fd::Descriptor::Keyboard)) {
+                    if matches!(desc, Some(fd::Descriptor::Keyboard(_))) {
                         Err(Some(ReadBlock::Keyboard(0)))
                     } else if matches!(desc, Some(fd::Descriptor::Audio { info_read: true, .. })) {
                         Err(Some(ReadBlock::Audio))
@@ -800,16 +800,15 @@ fn sys_open(path: &str, flags: OpenFlags) -> u64 {
     if open_modifies(flags) && !vfs::lock().user_may_modify(&resolved) {
         return SyscallError::PermissionDenied.to_u64();
     }
-    process::with_fd_owner_data(|data| fd::open(&mut data.fds, &mut *vfs::lock(), &resolved, flags))
+    process::with_fd_owner_data(|data| fd::open(&mut data.fds, &resolved, flags))
 }
 
 fn sys_close(fd_num: u32) -> u64 {
-    let pid = process::current_process();
     let (result, wake_readers, wake_writers) = process::with_fd_owner_data(|data| {
         // Grab pipe IDs before close drops the descriptor
         let wake_r = data.fds.get(fd_num).and_then(|d| d.pipe_id_write()); // writer closed → wake readers
         let wake_w = data.fds.get(fd_num).and_then(|d| d.pipe_id_read());  // reader closed → wake writers
-        let r = fd::close(&mut data.fds, &mut *vfs::lock(), fd_num, pid, &mut data.pipe_maps);
+        let r = fd::close(&mut data.fds, fd_num, &mut data.pipe_maps);
         (r, wake_r, wake_w)
     });
     if let Some(id) = wake_readers { process::wake_pipe_readers(id); }
@@ -955,7 +954,7 @@ fn sys_pipe() -> u64 {
             return SyscallError::ResourceExhausted.to_u64();
         };
         let Ok(write_fd) = data.fds.insert(fd::Descriptor::PipeWrite(writer)) else {
-            fd::close(&mut data.fds, &mut *vfs::lock(), read_fd, process::current_process(), &mut data.pipe_maps);
+            fd::close(&mut data.fds, read_fd, &mut data.pipe_maps);
             return SyscallError::ResourceExhausted.to_u64();
         };
         ((read_fd as u64) << 32) | write_fd as u64
@@ -985,38 +984,53 @@ fn sys_pipe() -> u64 {
 /// clients' pipes. Narrowing that needs a right attached to the id itself,
 /// which is what `specs/capability-handles-spec.md` replaces this syscall
 /// with entirely. Stopgap until then.
-fn may_open_pipe(caller: process::Pid, creator: process::Pid, id: pipe::PipeId) -> bool {
+///
+/// Takes the caller's table rather than locking it: this runs inside the
+/// `open_reader`/`open_writer` acquisition of `PIPES`, and both callers already
+/// hold the table across that.
+fn may_open_pipe(
+    caller: process::Pid,
+    creator: process::Pid,
+    id: pipe::PipeId,
+    fds: &fd::FdTable,
+) -> bool {
     if caller == creator {
         return true;
     }
-    process::with_fd_owner_data(|data| {
-        data.fds.iter().any(|(_, d)| {
-            d.pipe_id_read() == Some(id)
-                || d.pipe_id_write() == Some(id)
-                || matches!(d, fd::Descriptor::Socket { peer, .. } if *peer == creator)
-        })
+    fds.iter().any(|(_, d)| {
+        d.pipe_id_read() == Some(id)
+            || d.pipe_id_write() == Some(id)
+            || matches!(d, fd::Descriptor::Socket { peer, .. } if *peer == creator)
     })
+}
+
+fn not_opened(e: pipe::NotOpened) -> u64 {
+    match e {
+        pipe::NotOpened::NoSuchPipe => SyscallError::NotFound.to_u64(),
+        pipe::NotOpened::NotPermitted => SyscallError::PermissionDenied.to_u64(),
+    }
 }
 
 fn sys_pipe_open(pipe_id: u64, mode: u64) -> u64 {
     let id = pipe::PipeId::from_raw(pipe_id as usize);
-    let Some(creator) = pipe::creator(id) else {
-        return SyscallError::NotFound.to_u64();
-    };
-    if !may_open_pipe(process::current_process(), creator, id) {
-        return SyscallError::PermissionDenied.to_u64();
+    let caller = process::current_process();
+    if mode > 1 {
+        return SyscallError::InvalidArgument.to_u64();
     }
-    match mode {
-        0 => {
-            let Some(reader) = pipe::open_reader(id) else { return SyscallError::NotFound.to_u64() };
-            process::with_fd_owner_data(|data| fd_result(data.fds.insert(fd::Descriptor::PipeRead(reader))))
+    // The whole syscall under one acquisition of the caller's table, so the
+    // descriptors `may_open_pipe` weighs are the descriptors the new one joins.
+    process::with_fd_owner_data(|data| {
+        let permitted = |creator| may_open_pipe(caller, creator, id, &data.fds);
+        let descriptor = if mode == 0 {
+            pipe::open_reader(id, permitted).map(fd::Descriptor::PipeRead)
+        } else {
+            pipe::open_writer(id, permitted).map(fd::Descriptor::PipeWrite)
+        };
+        match descriptor {
+            Ok(d) => fd_result(data.fds.insert(d)),
+            Err(e) => not_opened(e),
         }
-        1 => {
-            let Some(writer) = pipe::open_writer(id) else { return SyscallError::NotFound.to_u64() };
-            process::with_fd_owner_data(|data| fd_result(data.fds.insert(fd::Descriptor::PipeWrite(writer))))
-        }
-        _ => SyscallError::InvalidArgument.to_u64(),
-    }
+    })
 }
 
 fn sys_pipe_id(fd_num: u32) -> u64 {
@@ -1080,22 +1094,24 @@ fn sys_pipe_map(fd_num: u32) -> u64 {
 fn sys_socket_create(rx_pipe_id_raw: u64, tx_pipe_id_raw: u64) -> u64 {
     let rx_id = pipe::PipeId::from_raw(rx_pipe_id_raw as usize);
     let tx_id = pipe::PipeId::from_raw(tx_pipe_id_raw as usize);
-    let holds_both = process::with_fd_owner_data(|data| {
-        let mut has_rx = false;
-        let mut has_tx = false;
-        for (_, d) in data.fds.iter() {
-            has_rx |= d.pipe_id_read() == Some(rx_id);
-            has_tx |= d.pipe_id_write() == Some(tx_id);
-        }
-        has_rx && has_tx
-    });
-    if !holds_both {
-        return SyscallError::PermissionDenied.to_u64();
-    }
-    let Some(rx) = pipe::open_reader(rx_id) else { return SyscallError::NotFound.to_u64() };
-    let Some(tx) = pipe::open_writer(tx_id) else { return SyscallError::NotFound.to_u64() };
     let peer = process::current_process();
     process::with_fd_owner_data(|data| {
+        let rx = pipe::open_reader(rx_id, |_| {
+            data.fds.iter().any(|(_, d)| d.pipe_id_read() == Some(rx_id))
+        });
+        let rx = match rx {
+            Ok(rx) => rx,
+            Err(e) => return not_opened(e),
+        };
+        // A refusal here drops `rx`, which gives its count straight back. That
+        // is the whole reason the two ends need not be taken together.
+        let tx = pipe::open_writer(tx_id, |_| {
+            data.fds.iter().any(|(_, d)| d.pipe_id_write() == Some(tx_id))
+        });
+        let tx = match tx {
+            Ok(tx) => tx,
+            Err(e) => return not_opened(e),
+        };
         fd_result(data.fds.insert(fd::Descriptor::Socket { rx, tx, peer }))
     })
 }
@@ -1170,42 +1186,40 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
 }
 
 fn sys_open_device(device_type: u64) -> u64 {
+    let Some(class) = device::class_of(device_type) else {
+        return SyscallError::InvalidArgument.to_u64();
+    };
     let pid = process::current_process();
     // NotFound means the machine has no such device and nothing else, because
     // that is the one answer a daemon is entitled to degrade on. soundd now
     // routes NotFound to a null sink, so collapsing Owned into it is worse than
     // before: soundd would silently discard all audio whenever another process
     // held the claim, instead of failing loudly on a real conflict.
-    let desc = match device::try_claim(device_type, pid) {
+    let desc = match device::try_claim(class, pid) {
         Ok(d) => d,
         Err(device::ClaimError::Absent) => return SyscallError::NotFound.to_u64(),
         Err(device::ClaimError::Owned) => return SyscallError::AlreadyExists.to_u64(),
-        Err(device::ClaimError::UnknownType) => return SyscallError::InvalidArgument.to_u64(),
         Err(device::ClaimError::GrantFailed) => return SyscallError::ResourceExhausted.to_u64(),
     };
+    // A refused insert drops the descriptor, which gives the claim straight
+    // back — the device is not left owned by a process that got no fd for it.
     process::with_fd_owner_data(|data| fd_result(data.fds.insert(desc)))
 }
 
 // Service IPC: listen / accept / connect
 
 fn sys_listen(name: &str) -> u64 {
-    let Some(id) = crate::listener::listen(name, process::current_process()) else {
+    let Some(listener) = crate::listener::listen(name, process::current_process()) else {
         return SyscallError::AlreadyExists.to_u64();
     };
-    let fd = process::with_fd_owner_data(|data| data.fds.insert(fd::Descriptor::Listener(id)));
-    match fd {
-        Ok(fd_num) => fd_num as u64,
-        Err(e) => {
-            crate::listener::remove(id);
-            e.to_u64()
-        }
-    }
+    // A refused insert drops the reference, which unbinds the name again.
+    process::with_fd_owner_data(|data| fd_result(data.fds.insert(fd::Descriptor::Listener(listener))))
 }
 
 fn sys_accept(fd_num: u32) -> u64 {
     let listener_id = process::with_fd_owner_data(|data| {
         match data.fds.get(fd_num) {
-            Some(fd::Descriptor::Listener(id)) => Some(*id),
+            Some(fd::Descriptor::Listener(l)) => Some(l.id()),
             _ => None,
         }
     });
@@ -1270,7 +1284,7 @@ fn sys_connect(name: &str) -> u64 {
     });
     if let Err(e) = queued {
         process::with_fd_owner_data(|data| {
-            fd::close(&mut data.fds, &mut *vfs::lock(), fd, client_pid, &mut data.pipe_maps);
+            fd::close(&mut data.fds, fd, &mut data.pipe_maps);
         });
         return match e {
             listener::PushError::NoListener => SyscallError::NotFound.to_u64(),
@@ -1664,10 +1678,17 @@ fn sys_nanosleep(nanos: u64) -> u64 {
     0
 }
 
+/// A second descriptor for the object `fd_num` names.
+///
+/// `PermissionDenied` is the answer for a device claim: it is the one object
+/// that admits a single descriptor, and `Descriptor::duplicate` says so at the
+/// only place that can. Before this, `dup` handed back a claim's exclusivity
+/// while leaving the caller a working descriptor.
 fn sys_dup(fd_num: u32) -> u64 {
     process::with_fd_owner_data(|data| {
-        let desc = match data.fds.get(fd_num) {
-            Some(d) => d.clone(),
+        let desc = match data.fds.get(fd_num).map(fd::Descriptor::duplicate) {
+            Some(Some(d)) => d,
+            Some(None) => return SyscallError::PermissionDenied.to_u64(),
             None => return SyscallError::NotFound.to_u64(),
         };
         fd_result(data.fds.insert(desc))
@@ -1678,15 +1699,15 @@ fn sys_dup2(old_fd: u32, new_fd: u32) -> u64 {
     let mut wake_read = None;
     let mut wake_write = None;
     let result = process::with_fd_owner_data(|data| {
-        let desc = match data.fds.get(old_fd) {
-            Some(d) => d.clone(),
+        let desc = match data.fds.get(old_fd).map(fd::Descriptor::duplicate) {
+            Some(Some(d)) => d,
+            Some(None) => return SyscallError::PermissionDenied.to_u64(),
             None => return SyscallError::NotFound.to_u64(),
         };
         if let Some(existing) = data.fds.get(new_fd) {
             wake_read = existing.pipe_id_read();
             wake_write = existing.pipe_id_write();
-            let mut vfs = vfs::lock();
-            fd::close(&mut data.fds, &mut vfs, new_fd, process::current_process(), &mut data.pipe_maps);
+            fd::close(&mut data.fds, new_fd, &mut data.pipe_maps);
         }
         match data.fds.insert_at(new_fd, desc) {
             Ok(()) => new_fd as u64,
@@ -2005,28 +2026,24 @@ fn sys_dlsym(handle: u64, name: &str) -> u64 {
 }
 
 fn sys_io_uring_setup(depth: u32) -> u64 {
-    let (ring_id, shm_token) = match crate::io_uring::create(depth) {
+    let (ring, shm_token) = match crate::io_uring::create(depth) {
         Ok(v) => v,
         Err(e) => return e.to_u64(),
     };
+    // A refused insert drops the reference, which tears the ring down again.
     let fd = process::with_fd_owner_data(|data| {
-        data.fds.insert(fd::Descriptor::IoUring(ring_id))
+        data.fds.insert(fd::Descriptor::IoUring(ring))
     });
     match fd {
-        Ok(fd_num) => {
-            ((shm_token.raw() as u64) << 32) | (fd_num as u64)
-        }
-        Err(e) => {
-            crate::io_uring::destroy(ring_id);
-            e.to_u64()
-        }
+        Ok(fd_num) => ((shm_token.raw() as u64) << 32) | (fd_num as u64),
+        Err(e) => e.to_u64(),
     }
 }
 
 fn sys_io_uring_enter(ring_fd: u32, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> u64 {
     let ring_id = process::with_fd_owner_data(|data| {
         match data.fds.get(ring_fd) {
-            Some(fd::Descriptor::IoUring(id)) => Some(*id),
+            Some(fd::Descriptor::IoUring(r)) => Some(r.id()),
             _ => None,
         }
     });

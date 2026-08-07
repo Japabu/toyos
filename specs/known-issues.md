@@ -84,8 +84,26 @@ as authority, guessing or outliving the designation was the entire attack:
   Not closed by `be604ef`, which this file briefly claimed: `Listener(String)`
   is an unchanged *context* line in that commit's own `fd.rs` hunk. See the
   postscript at the end of this section.
+
+  **The setup is gone too** (tasks #61/#170): a listener is refcounted by the
+  descriptors naming it (`listener::ListenerRef`), so the `close(fd)` in that
+  three-call attack unregisters nothing and the real compositor's `listen` is
+  *refused*. What is left is a squat, which is the "no namespace" bullet in the
+  next entry and a different defect. `abuse_listener_hijack.rs` now asserts that
+  refusal; the `ListenerId` half is the second line and is no longer reachable
+  from userland at all, because nothing can produce a descriptor whose listener
+  is gone.
 - **`SharedToken`** — a bare `u32` with no RAII and no ownership, still open
   (§7).
+- **A device claim** — same shape, closed by the same tasks. `dup` cloned
+  `Descriptor::Keyboard`/`Framebuffer`/… as a plain value while `close` released
+  the class unconditionally, so `open_device(d); dup(fd); close(fd)` freed the
+  device for anyone to take *and* left the caller a working descriptor: two
+  processes composing to one scanout, or one reading another's keystrokes.
+  `device::Claim` is now a non-`Clone` token whose `Drop` releases the class, so
+  `Descriptor` cannot be `Clone` either and `Descriptor::duplicate` cannot
+  answer `Some` for those five variants — `dup`, `dup2` and a spawn `fd_map` all
+  say `PermissionDenied`. `device_claim_lifetime.rs` is the exploit test.
 
 The adjacent failure, same root: **a reference that outlives the object it
 names.** `FileBacking` after an unlink is the live instance (below) — the
@@ -252,8 +270,12 @@ this is a class, not an instance.
 Those gates are exactly as strong as the claim and no stronger. `SYS_OPEN_DEVICE`
 is itself first-come and ungated, so a process that beats the daemon to a device,
 or claims it after the daemon dies, holds everything the claim unlocks — for
-`DEVICE_AUDIO` that includes the RT band, which audio spec §9.4 wants to be a
-privilege. "Gated" here does not mean "privileged".
+`DeviceType::Audio` that includes the RT band, which audio spec §9.4 wants to be
+a privilege. "Gated" here does not mean "privileged".
+
+What is no longer *also* true is that the claim leaks: a claim admits exactly one
+descriptor now (`device::Claim`, `Descriptor::duplicate`), so racing the daemon
+is the whole remaining attack rather than the cheap half of it.
 
 ### `SYS_DEBUG` is ungated, and two of its actions are a diagnostic-channel DoS
 
@@ -1645,6 +1667,48 @@ behaviour is now deterministic, and deterministically weaker than §7.4 assumes.
 Whether that matters is measurable — gate A's wake-lateness distribution is the
 instrument — and it did not move at N=8.
 
+### CLOSED — check-and-act across a released global lock, and the three residuals it leaves
+
+`pipe::open_reader`, `sys_socket_create` and six `file_cache::ref_count` call
+sites each read an answer out from under a global lock, released it, and acted.
+The pipe one was the one with teeth: `exists(id)` then `add_reader(id)` panicked
+on `.expect("add_reader: pipe not found")` when the pipe's last other end closed
+in between, *inside* `with_pipes_mut` — and a recovered syscall-context panic
+leaves `PIPES` held for the rest of the boot, which wedges all IPC. Closed by
+making the count and the handle one construction: `PipeReader`/`PipeWriter` live
+in a child module of `pipe.rs` whose field is private to it, so the only way to
+name a pipe as an owned reference is `acquire(&mut Pipe)`, and only a holder of
+`PIPES` can produce a `&mut Pipe`. `exists`, `creator` and `ref_count` are
+deleted; `mark_deleted` returns `Residency`; `copy_page_out` returns whether the
+page was there instead of zero-filling. Negative controls in the commit message.
+
+Three things the change does not reach:
+
+- **A count can still move without a handle.** `close_read`/`close_write` must
+  decrement and decide whether to free the pipe in one acquisition, so they live
+  in `pipe.rs` and touch `Pipe::readers` directly. Binding that direction too
+  needs the counts in a struct declared inside the handle module with a
+  `pub(super)` decrement, which buys a named operation and not an unwritable
+  one. The direction that was the defect is closed; this one has two writers and
+  both are in that file.
+
+- **`SYS_FTRUNCATE` takes no VFS lock and `SYS_FSYNC` does** (`arch/syscall.rs`,
+  `SYS_FTRUNCATE => fd::ftruncate(&mut data.fds, ...)` against
+  `SYS_FSYNC => fd::fsync(&mut data.fds, &mut *vfs::lock(), ...)`). That
+  asymmetry is what let a truncate remove a page between `clone_dirty` and
+  `copy_page_out`. The write of fabricated zeros is closed; the window is not,
+  and `flush_file`'s `size()` + `update_metadata` pair sits in it too — a
+  truncate landing between them records the older size, corrected by the next
+  flush because `ftruncate` sets `modified`.
+
+- **`file_cache::read_page` has two paths that return with `buf` untouched**
+  (`file_cache.rs`, both `let Some(file) = cache.files.get_mut(&file_id) else {
+  return }`), while `fd::try_read` has already told its caller how many bytes it
+  is producing, from a `file_cache::size` read under a different acquisition. It
+  is not reachable today — `try_read` runs holding a descriptor for the file, so
+  its refcount is at least one and neither `release` nor `mark_deleted` can drop
+  it — but the signature makes no such claim, and the honest return is fallible.
+
 ### `retire_task` is never reached by `cargo test`
 
 Instrumented across all 140 tests: zero calls. Threads that `join` are removed
@@ -3034,6 +3098,25 @@ phase landed, and none reproduces on a host running one suite.
   against the device's queue, and the lost-edge counter no longer fires on a
   pass that read the `irq_ring` record a few instructions before the ISR
   published it.
+  **Not closed after all, at the count.** 2026-08-07, two full suites in one
+  worktree while a second worktree held six of the twelve guest slots: `1003
+  pointer events reached userland out of 1004 packets injected, never more than
+  4 of them (12 bytes) outstanding against a 16-byte device queue`. The lead is
+  inside the bound the fix installed, so the summing mechanism §8 describes is
+  not what this is. A/B in one session, `git checkout main -- kernel/` in the
+  same tree minutes apart: this branch PASS 33 s first try, **main's kernel FAIL
+  with the identical 1003-of-1004 line**, then PASS 2 s on the harness's own
+  re-run. So it is not a tree difference and it is not gone — one packet in a
+  thousand is still being lost, or still being counted wrong, under a host
+  carrying two suites.
+- **`i8042_absent`** — same session, same shape, and it is `Sched::Serial`
+  already, so intra-suite width is not what reaches it. The verdict is the
+  guest's own `Boot: complete` on two boots with a 300 ms allowance; the landing
+  gate saw `601ms without an i8042 and 287ms with one`. Alone, minutes later:
+  this branch 619 vs 507 (PASS), main's kernel in the same tree 277 vs 331
+  (PASS). The absolute figure moved 277→619 ms across three runs of one boot
+  with no code change, so what the allowance is being asked to absorb is the
+  host, and a serial slot inside one suite does not buy a quiet one.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
@@ -3596,31 +3679,88 @@ reverted, each of the three targeted cases went red 40 times out of 40 and the
 corpus sweep named 6 files. Two runs per case rather than eight would have been
 39/40 on the spilled-parameter one, which is why it is eight.
 
-### OPEN, UNASSIGNED — `toyos-ld` has the same defect, and every ToyOS binary
-goes through it
+### CLOSED — `toyos-ld` gave a different binary for the same objects
 
-Found while closing the one above; not fixed with it, because the two crates
-share the shape of the bug and none of its code. Linking one **byte-identical**
-object six times gives six different binaries — 73 bytes differ between the
-first two, in two regions:
+The larger half of the same hole: the compiler's outputs are intermediate, and
+the linker's are the kernel, the bootloader and every binary in the image the
+owner flashes. Four hash containers were the emission order, one more than the
+two the original write-up named, and the third is not a symbol table:
 
-- `.rela.dyn`. `reloc.rs` builds `relatives` and `glob_dats` by iterating
-  `params.got` and `params.dyn_got`, both `HashMap<SymbolRef, u64>`. Confirmed:
-  sorting those two vectors before they leave `apply_relocations` makes that
-  region identical across runs.
-- `.symtab`/`.strtab`. `emit_elf.rs` walks `state.locals` and then
-  `state.globals`, both `HashMap`s, to build the symbol entries — this is the
-  residual once the relocations are sorted, and it moves the string table too.
+- `ElfLayout::{got, dyn_got}` — `reloc.rs` iterates them to build `relatives`
+  and `glob_dats`, which are `.rela.dyn` and, through the import strings, the
+  `.dynsym`/`.dynstr` that name them.
+- `LinkState::{globals, locals}` — `emit_elf.rs` walks both to build the symbol
+  entries, so this is `.symtab` and the `.strtab` that follows it. `emit_macho.rs`
+  walks `globals` too, but sorts by name at the call site, which is why Mach-O
+  never showed it.
+- **`resolve_libs_with_entry`'s archive pull-in worklist** — seeded from a
+  `HashSet` of undefined symbols and grown from `HashSet`s of each member's
+  references. Where two archive members define one symbol, the member pulled in
+  is whichever the worklist reaches while that symbol is still undefined, so a
+  hash order decided **which sections existed at all**. Not a symbol-table
+  defect and not reachable by sorting anything the writer sees.
 
-Reproduce with any object at all: `toyos-cc --target x86_64-unknown-toyos x.o -o
-out` twice and `cmp`. `SymbolRef` is not `Ord`, so the `BTreeMap` that fixed the
-compiler needs a derive here first. Whether the Mach-O and PE writers share it
-is unmeasured; `emit_macho.rs` and `emit_pe.rs` each hold a `got: HashMap` of
-the same shape.
+All of them are `BTreeMap`/`BTreeSet` now, with `Ord` derived on `SectionIdx`,
+`ObjIdx` and `SymbolRef`. That order is over an input position and a name, both
+of which byte-identical inputs fix, so the derive removes the nondeterminism
+rather than moving it. The rule the crate now follows, stated on `LinkState`: a
+container iterated into the output carries its own total order, one asked only
+whether it contains a name stays a hash container.
 
-This is the larger half of the reproducibility hole: the compiler's outputs are
-intermediate, and the linker's are the kernel, the bootloader and every binary
-in the image the owner flashes.
+**PE did not share the defect** and passes the gate with the fix reverted:
+`PeLayout::got` is iterated in exactly two places, one writing disjoint 8-byte
+GOT slots and one pushing into `abs_fixups`, which is sorted before it is
+written. PE also emits no symbol table. It is a `BTreeMap` now regardless,
+because "safe by what the call site happens to do" is the rung below.
+
+Measured. Real corpus, one release binary, eight links each: the toyos sysroot's
+30 rlibs linked `--shared` (17.8 MB of objects, 1,855,584-byte output) differed
+from run 0 in 7 of 7 later runs before, worst delta 26,408 bytes; 0 of 7 after.
+The `x86_64-unknown-none` sysroot linked `--static` went 7 of 7 (40 bytes) to 0
+of 7. The `x86_64-unknown-uefi` sysroot linked `--pe` was 0 of 7 both times.
+Cost: the link phase of that shared link is 0.017 s before and 0.023 s after
+(median of 15 interleaved runs), +6 ms for `BTreeMap` lookups on ~35 objects.
+
+`toyos-ld/tests/determinism.rs` is the gate — eight cases naming one hazard
+each, inputs synthesized with `object::write` so the test needs nothing outside
+its own crate, each linked eight times through the binary because a build is a
+process per output. 0.25 s, no guest. Negative control with the fix reverted:
+each of the seven hazard cases red 40 times out of 40, PE green 40 out of 40.
+Two runs per case rather than eight was also 40 out of 40 — these cases are
+wide by construction; the eight is margin for a narrower one added later, which
+is the case `toyos-cc`'s gate has.
+
+### OPEN, UNASSIGNED — `toyos-ld`'s alloc-shim table names a compiler hash that no longer exists
+
+`ALLOC_SHIMS` and `SHIM_NO_ALLOC_UNSTABLE` in `toyos-ld/src/collect.rs` are
+eleven string literals of the form
+`_RNvCs2fcwfXhWpkc_7___rustc12___rust_alloc`, where `Cs2fcwfXhWpkc` is a rustc
+crate disambiguator. Measured 2026-08-07: that spelling occurs **zero** times
+across the 30 rlibs of the `x86_64-unknown-toyos` sysroot, and the live
+disambiguator is `CshVjSbrpHdcL` — 4 occurrences in `liballoc`, 5 in
+`libpanic_abort`, and so on. So `synthesize_alloc_shims` currently synthesizes
+nothing, and would again the next time `rust/` is rebuilt.
+
+Inert today, because rustc emits the allocator shim into the leaf crate's own
+object for a real binary; the table only matters for a link that has rlibs and
+no leaf crate. Found while assembling a real corpus for the determinism gate,
+which is exactly such a link and which failed on those six names.
+
+The defect is the shape rather than the staleness: a compiler-internal hash
+frozen into a string literal has no way to announce that it has gone stale, and
+the symptom when it does is an undefined symbol far from the cause. Matching on
+the `___rustc` path and the function name, with the disambiguator wild, would
+not need updating.
+
+### OPEN, UNASSIGNED — `toyos-cc`'s preprocessor exits the process instead of returning
+
+Three `process::exit(1)` calls in `toyos-cc/src/preprocess/mod.rs`: a `#error`
+directive (line 309) and a missing include, system or otherwise (lines 527,
+530). A library denying its caller the choice — the compiler cannot report the
+diagnostic in its own format, cannot continue to find a second error, and
+cannot be embedded in a driver that wants to keep going. Every other error in
+the crate returns. Recorded by the determinism task rather than fixed, on the
+owner's standing rule about staying focused.
 
 ### `toyos-cc` does not implement packed bitfield layout, and says so
 
@@ -4065,12 +4205,12 @@ and it is not measurable here.
 
 ### A device claim succeeds on a machine that has no such device
 
-`device::try_claim` gates `DEVICE_FRAMEBUFFER`, `DEVICE_NIC` and `DEVICE_AUDIO`
+`device::try_claim` gates `DeviceType::{Framebuffer, Nic, Audio}`
 on an info struct the driver registered, so those three return
 `ClaimError::Absent` when the hardware is absent — which is what makes soundd
 and netd able to exit cleanly.
-`DEVICE_KEYBOARD` and `DEVICE_MOUSE` are gated on nothing at all: they hand out
-a `Descriptor` whether or not any driver will ever produce an event. Under
+`DeviceType::Keyboard` and `DeviceType::Mouse` are gated on nothing at all: they
+hand out a `Descriptor` whether or not any driver will ever produce an event. Under
 metal-sim the compositor holds both claims on a machine with no HID of any kind
 and polls them forever. Harmless today, wrong in the same way the isolation
 issues in §1 are wrong: a claim is supposed to be evidence.
@@ -4763,7 +4903,7 @@ uninterpretable.
 
 `panic_console::boot_checkpoint` returns immediately once
 `SCREEN_OWNED_BY_USERLAND` is set (`panic_console/mod.rs:478`), and
-`device::try_claim(DEVICE_FRAMEBUFFER)` sets it (`device.rs:83`) as the
+`device::try_claim(DeviceType::Framebuffer)` sets it as the
 compositor's third statement (`compositor/src/main.rs:719`). So the last
 kernel screenful ever painted is the one at `Boot: complete`, and the compositor
 overwrites it with the desktop a few tens of milliseconds later. Measured on
@@ -5442,10 +5582,6 @@ an ordinary boot with no crafted input:
   would not say" — so one refused transfer got an empty file created over a
   real one, and the next write and flush made that permanent. It acts on
   `Err(NotFound)` and nothing else now.
-- **`fd::close` discarded the flush.** `let _ = vfs.flush_file(..)`: the last
-  write of a file never reached the device and the process was told the close
-  worked. It returns the error now, which is what POSIX means by `close`
-  returning `EIO`, and closes the fd either way.
 - **`file_cache::read_page` returned `()`**, so a page the device would not
   give back reached a process as 4 KiB of zeros under a success. That is the
   one answer nothing above it can tell from a file that really is zeros there.
@@ -5481,7 +5617,17 @@ has the discipline and this is what it looked like here:
   load-bearing part of the verdict: an unmounted `/boot` falls through to the
   initrd and answers `NotFound` honestly, which is the string the test refuses.
 
-**What is still open, one layer up and outside this tree.**
+**Two residuals.**
+
+`close` cannot report `EIO`. The flush a descriptor owes is in
+`fd::OpenFile::drop` now, which is the right place for it — it is the one path
+a process killed by another CPU also takes — and a `Drop` has nothing to return
+to the `close` syscall. So a failed flush is logged and no process is told.
+Every *other* way of asking is honest: `fsync` returns the code, and a `write`
+whose page the device refused returns `Io` rather than a count.
+
+And, one layer up and outside this tree:
+
 `std::sys::fs::toyos::stat` discards the error from `syscall::open` and returns
 a hardcoded `io::ErrorKind::NotFound`, so `fs::metadata` re-creates the exact
 conflation this task removed — at the userland end, where the kernel can do

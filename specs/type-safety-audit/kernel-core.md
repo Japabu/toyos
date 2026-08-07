@@ -49,9 +49,11 @@ prevent work, and §Not flagged says which items it dropped and why.
    `checked_add`s. Their totality currently depends on `overflow-checks`, which
    `kernel/Cargo.toml` sets for `[profile.dev]` only while `--release` is a real
    CLI flag.
-5. **`pipe::open_reader` checks then acts across two lock acquisitions and
-   fails into `.expect`** — a userland-reachable kernel panic on a legitimate
-   race. The fix also makes an un-refcounted `PipeReader` unrepresentable.
+5. **FIXED.** `pipe::open_reader` checked then acted across two lock
+   acquisitions and failed into `.expect` — a userland-reachable kernel panic on
+   a legitimate race, and the panic stranded `PIPES`. Closed by making an
+   un-refcounted `PipeReader` unrepresentable, not by ordering the two calls
+   better — see §5.
 6. **Six `pub fn init()` are public reset buttons.** Const-init deletes 4
    wrapper functions, 6 `init` functions, and 22 `.expect("not initialized")`
    sites, and closes a use-after-free.
@@ -434,7 +436,17 @@ construct the slice", and the `checked_add` stands alone in the meantime.
 
 ---
 
-## 5. `pipe::open_reader` checks then acts across two lock acquisitions
+## 5. `pipe::open_reader` checks then acts across two lock acquisitions — FIXED
+
+Fixed, and the fix went further than what this section proposed. The `acquire`
+below still takes an `id` and can still fail, so it can still be called with the
+wrong one, and `PipeReader(id)` remains writable anywhere in `pipe.rs`. What
+landed puts the handles in a child module whose field `pipe.rs` cannot name, and
+`acquire` takes the `&mut Pipe` — no id, no failure mode, and a handle carrying a
+different id than the count it bumped is unwritable. `exists` and `creator` are
+deleted rather than kept for careful use, and `sys_pipe_open`'s entitlement
+became a closure evaluated inside the acquisition instead of a fact read a moment
+earlier. Known issues §3 carries the three residuals.
 
 **Location.** `pipe.rs:171-181`, panicking at `:262-268` / `:270-276`.
 
