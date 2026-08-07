@@ -14,7 +14,7 @@
 //! corrupted.
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::qemu::{self, BootOptions, QemuInstance};
 
@@ -217,8 +217,16 @@ pub fn virtio_net_no_msix() -> Result<(), String> {
     // that runs netd — and netd's own answer is the assertion below that the
     // refusal reached userland rather than stopping at a log line.
     let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/netcase");
-    let qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
-    let log = crate::common::serial::Serial::boot(&qemu);
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let mut log = crate::common::serial::Serial::boot(&qemu);
+    // netd is spawned before the ready marker and speaks after it, so its line
+    // is drained for rather than read out of the boot capture. A ceiling and
+    // not a measurement: what is asserted is that the line came, never when.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !log.text().contains("netd: ") {
+        let more = qemu.drain_serial(Duration::from_millis(200));
+        log.push(&more);
+    }
 
     // Refused by name, at a named function, and not by claiming a mode it does
     // not have: the xHCI driver's `polled mode` line is the defect this whole
