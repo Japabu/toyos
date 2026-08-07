@@ -271,6 +271,51 @@ accel (kvm)  FAIL  process_stats  — KERNEL PANIC: general protection fault (er
 `specs/known-issues.md` §3. It is not a CI defect and it is not being fixed
 here.
 
+## 7.1 And TCG on four cores does not fit the suite's clocks
+
+The first full guest run on `main` after the shootdown fix — run `31213985427`,
+four `ubuntu-24.04` shards, `--jobs 4`, TCG:
+
+| shard | tests | passed | failed | parallel phase | total |
+|---|---|---|---|---|---|
+| 1 | 203 (carries the 153-test shared block) | — | — | — | **cancelled at the 110 min job timeout** |
+| 2 | 32 | 17 | 15 | 677.7 s | 1263.3 s |
+| 3 | 27 | 13 | 14 | 813.3 s | 1553.3 s |
+| 4 | 27 | 13 | 14 | 1236.3 s | 1824.2 s |
+
+Against the dev host, same tree, same day: **289 tests, 243.4 s, one machine.**
+
+The failure classes, counted over the whole run:
+
+```
+ 198  timed out after 40s
+ 109  timed out after 20s
+  27  assets/timgm6mb.sf2 ... is not there
+  10  timed out after 120s
+   9  no /sbin/fsck_msdos
+   7  timed out after 80s
+   ... and a long tail of 30 s–720 s timeouts
+```
+
+**Overwhelmingly timeouts, and they are liveness guards rather than verdicts.**
+`qemu::budget` pays them out per guest the phase may have up, which corrects for
+*width* and not for how fast the host is; a 4-core Azure vCPU emulating x86 on
+x86 is far enough below a 14-core M4 Pro that ceilings written for the latter do
+not hold. §6 and §6.1 are 36 of the failures; every other one is the clock.
+
+So **TCG on a standard runner is not a working configuration for this suite**,
+and the shards as landed are red. Three directions, none taken here and the
+first two only worth doing if the third fails:
+
+- `--jobs 1` or `2` — fewer guests contending for four cores, at the cost of
+  wall clock a shard already does not have.
+- Scale the ceilings by a measured host speed rather than by width, which is a
+  change to `qemu::budget` and to what every ceiling in the tree means.
+- **Fix §7 and run KVM**, where a guest runs at near-native speed and the
+  ceilings are comfortable by a wide margin. This is the real answer: CI's
+  viable configuration was always the one the dev host cannot offer, and the
+  `#GP` is the whole of what stands in the way.
+
 ## 8. What CI buys that the dev host cannot
 
 - **A machine that can run these guests natively**, once §7 is closed. The dev
@@ -334,8 +379,8 @@ looks stale.
   `ubuntu-24.04-arm` and no HVF on `macos-latest`. An aarch64 guest there would
   be TCG on an arm64 host, which is what the dev host already is.
 - **`fsck.vfat`**, §6.
-- **A measured suite wall clock.** Every TCG shard run so far was on a tree that
-  predates the shootdown fix (`ee48f9c`), so its timings say nothing about a
-  healthy tree and are deliberately not recorded here.
-- **Larger runners** were not tried; they are a billed feature even on public
-  repos, and 4 cores has not been the binding constraint.
+- **A green guest suite.** §7.1 — the shards are red today, on timeouts rather
+  than on assertions, and the fix that matters is §7.
+- **Larger runners** were not tried. They are a billed feature even on public
+  repos, so trying one is the owner's call — and §7.1 makes core count the first
+  thing worth trying if KVM stays out of reach.
