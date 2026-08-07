@@ -470,6 +470,7 @@ dependencies = [
  "sprite",
  "toyos",
  "toyos-abi",
+ "toyos-desktop",
  "window",
 ]
 
@@ -3593,6 +3594,13 @@ dependencies = [
 [[package]]
 name = "toyos-abi"
 version = "0.1.0"
+
+[[package]]
+name = "toyos-desktop"
+version = "0.1.0"
+dependencies = [
+ "toyos-abi",
+]
 
 [[package]]
 name = "toyos-keymap"
