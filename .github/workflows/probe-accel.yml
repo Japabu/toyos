@@ -1,0 +1,51 @@
+name: accel-probe
+
+# One runner, one image, one filter, twice: with KVM and without. The suite's
+# own `kvm_usable` opens /dev/kvm, so leaving the node at its default 0660 is
+# how a job asks for TCG — nothing in the tree branches on anything else.
+
+on:
+  push:
+    branches: ['ci/probe-accel']
+  workflow_dispatch:
+
+jobs:
+  accel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        accel: [kvm, tcg]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: accelerator
+        run: |
+          if [ "${{ matrix.accel }}" = kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm
+
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            qemu-system-x86 ovmf zstd
+          qemu-system-x86_64 --version | head -1
+          grep -m1 'model name' /proc/cpuinfo
+
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          gh release download "$tag" -p 'toyos-toolchain.tar.zst' -O /tmp/t.tar.zst
+          mkdir -p rust/build
+          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
+          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+
+      - name: a handful of tests, serially
+        run: |
+          cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats \
+            2>&1 | tail -120
+          exit "${PIPESTATUS[0]}"
