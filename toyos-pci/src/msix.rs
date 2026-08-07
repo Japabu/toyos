@@ -95,7 +95,8 @@ impl Msix {
         self.bir
     }
 
-    /// Where entry 0 sits, given the base address the named BAR holds.
+    /// Where the table starts, given the base address the named BAR holds.
+    /// Which entry inside it a caller programs is the caller's.
     pub fn table_address(&self, bar_base: u64) -> Result<u64, Unusable> {
         if bar_base == 0 {
             return Err(Unusable::BarUnassigned(self.bir));

@@ -132,11 +132,10 @@ impl crate::net::Nic for VirtioNic {
 ///
 /// A refusal rather than a panic, and that is the whole of what this returns.
 /// Nothing in this driver polls: `poll_rx` runs behind an `irq_ring` record
-/// that only vector 0x22's ISR publishes, so a NIC whose messages cannot reach
-/// a CPU is a NIC that receives one packet's worth of nothing for the life of
-/// the boot. A machine that cannot have networking still boots, still has a
-/// console, and still says why — which is what the xHCI driver settled for the
-/// same shape of question.
+/// only vector 0x22's ISR publishes, so a NIC whose messages cannot reach a CPU
+/// delivers nothing for the life of the boot. A machine that cannot have
+/// networking still boots, still has a console, and still says why — which is
+/// what the xHCI driver settled for the same shape of question.
 fn arm_interrupt(pci_dev: &PciDevice, device: &VirtioDevice) -> bool {
     if !pci_dev.enable_msix(VIRTIO_NET_VECTOR) {
         log!("VirtIO net: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its MSI-X could not be \

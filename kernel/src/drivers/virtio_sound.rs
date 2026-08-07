@@ -474,11 +474,12 @@ const VIRTIO_SOUND_VECTOR: u8 = 0x23;
 /// Arm this device's txq completion interrupt, or say why the machine has no
 /// audio.
 ///
-/// A refusal rather than a panic, for [`virtio_net::arm_interrupt`]'s reason
-/// and one of its own: `TX_ISR` is the only consumer of the txq used ring, so
-/// a device that cannot deliver its completions is one whose every period
-/// stays in flight forever. soundd would then have no device at all, which is
-/// a machine that boots and plays nothing rather than a machine that dies.
+/// A refusal rather than a panic, for `virtio_net::arm_interrupt`'s reason and
+/// one of its own: `TX_ISR` is the only consumer of the txq used ring, so a
+/// device that cannot deliver its completions is one whose every period stays
+/// in flight forever. `None` here leaves `audio::register` uncalled, so soundd
+/// finds no device and exits — a machine that boots and plays nothing rather
+/// than a machine that dies.
 fn arm_interrupt(pci_dev: &PciDevice, device: &VirtioDevice) -> bool {
     if !pci_dev.enable_msix(VIRTIO_SOUND_VECTOR) {
         log!("virtio-sound: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its MSI-X could not be \
