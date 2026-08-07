@@ -59,10 +59,6 @@ impl Claim {
         *owner = Some(pid);
         Ok(Self { class })
     }
-
-    pub fn class(&self) -> DeviceType {
-        self.class
-    }
 }
 
 impl Drop for Claim {
