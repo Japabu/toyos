@@ -12,6 +12,8 @@
 //! this table is refused the first time anyone types it — the drift that is
 //! loud rather than the one that narrows a gate.
 
+use std::time::Duration;
+
 /// One machine's slice of the suite.
 ///
 /// A shard is a *host*, never a lane. `--jobs` divides one machine's cores
@@ -36,17 +38,24 @@ impl Shard {
     /// is not still gets a complete, deterministic partition — **every item
     /// lands in exactly one shard whatever the profile says**, which is the
     /// property a verdict depends on and the one the gates below hold.
-    pub fn keep<T, C: Ord + Copy + std::ops::Add<Output = C>>(
-        self,
-        items: &mut Vec<T>,
-        zero: C,
-        cost: impl Fn(&T) -> C,
-    ) {
-        let mut load = vec![zero; self.count];
+    ///
+    /// `None` is an item the profile has never seen, and it is priced at the
+    /// longest that was measured — the same conservatism `longest_first`
+    /// expresses by sorting unknowns first, in a form that can be added up.
+    /// Where *nothing* was measured, every item prices the same and LPT
+    /// degenerates to round-robin, which is the best a machine with no profile
+    /// can do and is what every runner's first run gets.
+    pub fn keep<T>(self, items: &mut Vec<T>, cost: impl Fn(&T) -> Option<Duration>) {
+        let unmeasured = items
+            .iter()
+            .filter_map(&cost)
+            .max()
+            .unwrap_or(Duration::from_secs(1));
+        let mut load = vec![Duration::ZERO; self.count];
         let mut owner = Vec::with_capacity(items.len());
         for item in items.iter() {
             let bin = (0..self.count).min_by_key(|&b| load[b]).expect("count >= 1");
-            load[bin] = load[bin] + cost(item);
+            load[bin] += cost(item).unwrap_or(unmeasured);
             owner.push(bin);
         }
         let mut i = 0;
@@ -258,7 +267,7 @@ mod tests {
             let mut seen: Vec<u64> = Vec::new();
             for index in 1..=count {
                 let mut mine = items.clone();
-                Shard { index, count }.keep(&mut mine, 0u64, |&c| c);
+                Shard { index, count }.keep(&mut mine, |&c| Some(Duration::from_secs(c)));
                 seen.extend(mine);
             }
             seen.sort_unstable();
@@ -276,26 +285,30 @@ mod tests {
         let totals: Vec<u64> = (1..=4)
             .map(|index| {
                 let mut mine = items.clone();
-                Shard { index, count: 4 }.keep(&mut mine, 0u64, |&c| c);
+                Shard { index, count: 4 }.keep(&mut mine, |&c| Some(Duration::from_secs(c)));
                 mine.iter().sum()
             })
             .collect();
         assert_eq!(totals, vec![130, 130, 130, 130], "{totals:?}");
     }
 
-    /// Round-robin is what a suite with no measured profile falls back to, and
-    /// it still has to be a partition.
+    /// A test the profile has never seen costs `Duration::MAX` so that it sorts
+    /// first, and a machine with no recorded profile at all — every runner's
+    /// first run — has a whole suite of them. Plain addition panicked on the
+    /// second item, which is what the first sharded CI run found.
     #[test]
-    fn an_unmeasured_suite_still_splits_evenly() {
-        let items: Vec<u64> = vec![u64::MAX; 10];
-        let sizes: Vec<usize> = (1..=3)
-            .map(|index| {
-                let mut mine = items.clone();
-                Shard { index, count: 3 }.keep(&mut mine, 0u64, |_| 1);
-                mine.len()
-            })
-            .collect();
-        assert_eq!(sizes.iter().sum::<usize>(), 10);
+    fn a_suite_with_no_measured_profile_still_splits_evenly() {
+        let items: Vec<usize> = (0..10).collect();
+        let mut seen: Vec<usize> = Vec::new();
+        let mut sizes = Vec::new();
+        for index in 1..=3 {
+            let mut mine = items.clone();
+            Shard { index, count: 3 }.keep(&mut mine, |_| None);
+            sizes.push(mine.len());
+            seen.extend(mine);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, items);
         assert_eq!(sizes, vec![4, 3, 3], "{sizes:?}");
     }
 

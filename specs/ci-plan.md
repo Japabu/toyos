@@ -102,6 +102,24 @@ makes the runner do exactly what the dev host does.
 The submodule clone is full-history for the same reason — 106 s, and a shallow
 one contains no bors commit to walk back to.
 
+**It costs an hour and it works.** Run `31194201422`, `ubuntu-24.04`, cold:
+
+```
+RECLAIM-SECONDS: 170        # 88 GB free -> 107 GB
+SUBMODULE-SECONDS: 101      # full-history clone of the rust fork
+BUILD-ONLY-SECONDS: 3683    # x.py stage 2, the hosted rustc, and the whole
+                            # kernel/bootloader/userland/initrd/boot image
+PACKAGE-SECONDS: 3          # 1.56 GiB -> 401 MiB, zstd -3 -T0
+```
+
+`rust/build` ends at 16 GB and the disk at 82 GB free, so nothing is tight.
+`rust/build/x86_64-unknown-linux-gnu/stage2` is 1.3 GB and
+`rust/build/x86_64-unknown-toyos/stage2` 364 MB; together they compress to a
+401 MiB release asset, against GitHub's 2 GiB per-asset limit.
+
+One hour, once per (rust fork, `toyos-abi`, `toyos`, `libc`) — and the job
+that pays it publishes for everybody.
+
 **`Owner::Installed`** (`src/toolchain.rs`) is the third answer to "who owns the
 toolchain": a checkout whose `rust/build` holds one and whose `rust/` holds no
 source to have built it from. Read off the disk rather than declared, because

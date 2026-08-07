@@ -29,6 +29,29 @@ jobs:
           rustc -vV
           cargo -V
 
+      # Cold, this job is 594 s and all of it is compilation. A cache written
+      # on `main` is readable from every branch, which is the only reason this
+      # helps a branch's first run at all.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            toyos-sched/target
+            toyos-ps2/target
+            toyos-gpt/target
+            toyos-cc/target
+            toyos-hda/target
+            toyos-xhci/target
+            kernel-loom/target
+            kernel-span/target
+            toyos-fat32/target
+            userland/sshd/target
+          key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: host-${{ runner.os }}-
+
       # The build system's own gates: the two lock scopes, the landing
       # protocol, the sysroot witness, and the image builder's fsck gate.
       - name: build system

@@ -10016,7 +10016,7 @@ fn main() {
         // splitting it is the only thing that shortens it. A filter cannot do
         // the same job — `audio_tone` is a substring of `audio_tone_load`.
         if let Some(shard) = shard {
-            shard.keep(&mut audio_to_run, 0u32, |_| 1);
+            shard.keep(&mut audio_to_run, |_| None);
             assert!(
                 !audio_to_run.is_empty(),
                 "shard {}/{} owns no audio config, and a gate that ran nothing would \
@@ -10145,26 +10145,22 @@ fn main() {
     // divides is the work, and a task's answer to `Sched` is a property of the
     // test rather than of how many machines are running it.
     if let Some(shard) = shard {
-        let cost = |task: &Task<'_>| -> Duration {
+        // A task whose every name has been timed costs their sum; one carrying
+        // a name the profile has never seen is unmeasured, which is the same
+        // all-or-nothing rule [`longest_first`] states with `Duration::MAX`.
+        let cost = |task: &Task<'_>| -> Option<Duration> {
             task.names()
                 .iter()
-                .map(|n| known.get(*n).copied().unwrap_or(Duration::MAX))
-                .fold(Duration::ZERO, |a, b| a.saturating_add(b))
+                .try_fold(Duration::ZERO, |a, n| Some(a + *known.get(*n)?))
         };
         longest_first(&mut parallel, &known);
         longest_first(&mut serial, &known);
-        shard.keep(&mut parallel, Duration::ZERO, cost);
-        shard.keep(&mut serial, Duration::ZERO, cost);
-        shard.keep(&mut audio_to_run, Duration::ZERO, |name| {
-            AUDIO_SMP
-                .iter()
-                .map(|smp| {
-                    known
-                        .get(&format!("{name} (smp={smp})"))
-                        .copied()
-                        .unwrap_or(Duration::MAX)
-                })
-                .fold(Duration::ZERO, |a, b| a.saturating_add(b))
+        shard.keep(&mut parallel, cost);
+        shard.keep(&mut serial, cost);
+        shard.keep(&mut audio_to_run, |name| {
+            AUDIO_SMP.iter().try_fold(Duration::ZERO, |a, smp| {
+                Some(a + *known.get(&format!("{name} (smp={smp})"))?)
+            })
         });
         eprintln!(
             "[toyos] shard {}/{}: {} parallel task(s), {} serial, {} audio config(s)",
