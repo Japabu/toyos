@@ -113,7 +113,7 @@ jobs:
   # to hold the whole build red.
   kvm-canary:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -136,6 +136,11 @@ jobs:
         run: |
           tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          for _ in $(seq 90); do
+            gh release view "$tag" >/dev/null 2>&1 && break
+            echo "waiting for the toolchain workflow to publish $tag ..."
+            sleep 60
+          done
           gh release download "$tag" -p 'toyos-toolchain.tar.zst' -O /tmp/t.tar.zst
           mkdir -p rust/build
           zstd -dc /tmp/t.tar.zst | tar -C rust/build -x

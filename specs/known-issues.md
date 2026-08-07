@@ -3581,6 +3581,30 @@ Cosmetic today. It stops being cosmetic the moment anything gates on it.
 
 ## 5. Diagnostics
 
+### OPEN — `screen_blocked_dump` is `Sched::Parallel` and reds in the wide phase
+
+```
+FAIL screen_blocked_dump: the panel does not carry "cpu(s) answered", so a
+     photograph of this machine answers nothing
+  FAIL  screen_blocked_dump  (3s)
+  ALONE screen_blocked_dump: GREEN — it fails only beside other guests, so its
+        Sched::Parallel is wrong. The run stays red on the classification.
+```
+
+Twice on 2026-08-07 on a quiet host — once in a plain `cargo test` and once in a
+226.5 s `--land` gate — both times green on the lone re-run, and green in a
+third gate on the same tree. So it is intermittent rather than reproducible, and
+the harness's own rule is the finding: a test that fails only beside other
+guests is misclassified, not flaky.
+
+What it asserts is a *count*, that every CPU answered the blocked-task dump
+inside the 250 ms budget before the NMI path takes over. That is a wall-clock
+margin, and `specs/test-cost-audit.md` §3.3 puts those in the serial tail. The
+one-word fix is `Sched::Serial` (`tests/toyos.rs` line 206); it is not taken
+here because it costs a tail slot, because it belongs to whoever owns
+`sched/dump.rs`, and because two samples of an intermittent test are two
+samples.
+
 ### OPEN — QEMU 11.0.3 sets `ECAP.PT`, so `Iova::identity`'s comment gives a false reason for correct behaviour
 
 Measured 2026-08-05 off the `hda_probe` boot, in the unit configuration
