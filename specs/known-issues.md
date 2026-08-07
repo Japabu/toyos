@@ -2597,6 +2597,26 @@ bundle D, twice more     GREEN
 `audio_tone_load (smp=8)`, `audio_tone` at both widths, `audio_idle_suspend` and
 `metal_sim_null_audio` were green in every one of the six.
 
+**`smp=8` is not exempt — 2026-08-07, task #58's session.** It failed the same
+two-boot rule twice, on a tree whose only kernel delta was the MSI-X unification
+(boot-time register programming; the per-period path is untouched). A/B in one
+session, `cargo test -- audio_tone_load`, HEAD against `main`'s tip merged into
+it:
+
+```
+branch, in a full suite  RED  smp=8  1 [1p]/1118, then 1 [2p]/1124   wake_lat 76124us then 44159us
+branch, alone            RED  both   smp=8 1 [3p]/1138, then 3/1131  wake_lat 102055us then 296659us
+branch, alone × 7        GREEN both widths                            wake_lat 6543-45930us
+main,   alone × 3        GREEN both widths                            wake_lat 6556-54197us
+```
+
+Both reds coincided with another worktree's suite holding all twelve guest
+slots, and both carried wake latencies of 76-297 ms where every green run on
+either tree sat at 6.5-46 ms — soundd not being scheduled, rather than a cost
+per period. That is the same signature as the entry below and adds nothing to
+the diagnosis; what it adds is that **the smp=8 config reds too**, so a future
+A/B may not treat it as the quiet control.
+
 **Two things are established and a third is not.** It is real harm — a gap in
 the capture, on two boots running, four times. It is **not fix bundle D**: the
 A/B alternated trees in one session on one host, and both sides are red with
