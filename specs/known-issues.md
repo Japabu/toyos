@@ -2592,12 +2592,26 @@ which CPU was not taking interrupts and why, and whether the downstream failures
 — soundd refusing a second stream, a compositor client exiting −1 — are correct
 consequences or second defects.
 
+**The width is the variable, measured.** Same session, same branch, same 289
+tests:
+
+| width | verdict |
+|---|---|
+| 12 (default) | 2 failed, 287 passed — 526.9 s |
+| 12 (default) | 5 failed, 284 passed — 497.0 s |
+| **4** (`--test toyos-build -- --jobs 4`) | **289 passed, 0 failed — 265.2 s** |
+
+The 4-wide run is also *faster in wall clock* than either 12-wide run, which is
+`specs/test-cost-audit.md` §4.1 constraint 3 arriving from a new direction: 12
+guests on 14 cores is now past the point where more width buys anything, and the
+extra load is what turns the shootdown wait into a five-second stall. That gives
+a workaround — `--land --gate cargo test --test toyos-build -- --jobs 4`, which
+the landing prints and reports — and it is a workaround: at 4-wide the stall is
+rarer, not absent, and nothing has been fixed.
+
 **Not to be re-run away**: the owner's 2026-08-04 ruling is that a
 load-coincident failure is a real defect, and this one reproduced across two
-full runs with seven different victims. Its practical cost is that `cargo test`
-reds non-deterministically under the default 12-wide phase, so `--land`'s gate
-cannot be passed by anybody until it is settled. `cargo test -- --jobs 1` is the
-obvious next measurement and was not run here.
+full runs with seven different victims.
 
 ### OPEN, UNASSIGNED — gate A's thorough tier is red on `main`, and the recorded dropout sample is what it disagrees with
 
