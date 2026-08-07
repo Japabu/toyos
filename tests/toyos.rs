@@ -5592,7 +5592,7 @@ fn run_machine_test(
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "dump_nmi_probe" => faults::dump_nmi_probe(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
-        "virtio_net_no_msix" => faults::virtio_net_no_msix(test_config, c_bins, rust_bins),
+        "virtio_net_no_msix" => faults::virtio_net_no_msix(),
         // Body in `tests/common/audio.rs`, so the hunk here stays one line.
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
         "null_sink_shipped_client" => audio::null_sink_shipped_client(test_config, c_bins, rust_bins),

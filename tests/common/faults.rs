@@ -178,11 +178,7 @@ pub fn idle_stack_guard(
 /// verdict mean anything: the console that carries the refusal and the audio
 /// device beside it are on the same bus, driven by the same code, and neither
 /// notices.
-pub fn virtio_net_no_msix(
-    test_config: &Path,
-    c_bins: &[(String, Vec<u8>)],
-    rust_bins: &[(String, Vec<u8>)],
-) -> Result<(), String> {
+pub fn virtio_net_no_msix() -> Result<(), String> {
     let options = BootOptions {
         profile: qemu::Profile::VirtioNetNoMsix,
         ..Default::default()
@@ -217,7 +213,11 @@ pub fn virtio_net_no_msix(
         }
     }
 
-    let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+    // `tests/netcase` rather than the ordinary config, because it is the one
+    // that runs netd — and netd's own answer is the assertion below that the
+    // refusal reached userland rather than stopping at a log line.
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/netcase");
+    let qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
     let log = crate::common::serial::Serial::boot(&qemu);
 
     // Refused by name, at a named function, and not by claiming a mode it does

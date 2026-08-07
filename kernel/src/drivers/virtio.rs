@@ -31,15 +31,15 @@ pub const COMMON_DEVICE_STATUS: u64 = 0x14;
 const COMMON_QUEUE_SELECT: u64 = 0x16;
 pub const COMMON_QUEUE_SIZE: u64 = 0x18;
 const COMMON_QUEUE_MSIX: u64 = 0x1A;
-
-/// What a virtio device reads back where it was written a vector it could not
-/// allocate resources for (virtio 1.2 §4.1.5.1.2).
-const NO_VECTOR: u16 = 0xFFFF;
 pub const COMMON_QUEUE_ENABLE: u64 = 0x1C;
 pub const COMMON_QUEUE_NOTIFY_OFF: u64 = 0x1E;
 pub const COMMON_QUEUE_DESC: u64 = 0x20;
 pub const COMMON_QUEUE_DRIVER: u64 = 0x28;
 pub const COMMON_QUEUE_DEVICE: u64 = 0x30;
+
+/// What a virtio device reads back where it was written a vector it could not
+/// allocate resources for (virtio 1.2 §4.1.5.1.2).
+const NO_VECTOR: u16 = 0xFFFF;
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -493,8 +493,8 @@ impl VirtioDevice {
     }
 
     /// Point this device's configuration-change interrupt and `queue`'s
-    /// used-ring interrupt at [`MSIX_ENTRY`] — the table entry
-    /// [`PciDevice::enable_msix`] armed.
+    /// used-ring interrupt at `pci::MSIX_ENTRY` — the table entry
+    /// `PciDevice::enable_msix` armed.
     ///
     /// Deliberately not part of that call: the table is PCI's and this is
     /// virtio's own protocol, and a device given the first without the second
