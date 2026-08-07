@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Rasterize `codepoints` into `cell_width * cell_height` 8-bit alpha cells,
 /// laid out one cell after another. The pixel size is the largest at which
@@ -160,16 +162,56 @@ pub fn regen_panic_font(root: &Path) {
     println!("wrote {} ({} bytes)", path.display(), out.len());
 }
 
+/// Which files under `dir` git tracks, as paths relative to it.
+///
+/// **The image is a function of the commit, not of the working tree.** Sweeping
+/// the directory instead put `assets/.DS_Store` and an `assets/target/` some
+/// cargo invocation left behind into every shipped initrd — 16,368 bytes of it,
+/// measured off `target/bootable.img` — so a fresh clone built a different
+/// image and opening the directory in Finder moved the image hash with no code
+/// change.
+///
+/// Asked of git rather than filtered by name: an ignore list for dotfiles and
+/// `target/` states nothing about the property, and the next stray file ships
+/// again. A build that cannot find out what is committed refuses, because it
+/// cannot honestly build an image either.
+fn tracked(dir: &Path) -> BTreeSet<PathBuf> {
+    let out = Command::new("git")
+        .args(["-C", &dir.display().to_string(), "ls-files", "-z"])
+        .output()
+        .unwrap_or_else(|e| panic!("asking git what it tracks under {}: {e}", dir.display()));
+    assert!(
+        out.status.success(),
+        "git could not list {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 pub fn collect(dirs: &[String]) -> Vec<(String, Vec<u8>)> {
     let mut files = vec![];
 
     for dir in dirs {
         let dir = Path::new(dir);
+        let tracked = tracked(dir);
+        let ships = |path: &Path| {
+            let relative = path.strip_prefix(dir).unwrap_or(path);
+            if tracked.contains(relative) {
+                return true;
+            }
+            eprintln!("assets: skipping {} — git does not track it", path.display());
+            false
+        };
 
         // Pre-rasterize TTF fonts
         for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("Failed to read {}: {e}", dir.display())) {
             let path = entry.unwrap().path();
-            if path.extension().is_some_and(|e| e == "ttf") {
+            if path.extension().is_some_and(|e| e == "ttf") && ships(&path) {
                 let ttf = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
                 let stem = path.file_stem().unwrap().to_str().unwrap();
                 let font_data = rasterize_font(&ttf, 8, 16);
@@ -180,7 +222,7 @@ pub fn collect(dirs: &[String]) -> Vec<(String, Vec<u8>)> {
         // Pre-decode JPEG images
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
-            if path.extension().is_some_and(|e| e == "jpg") {
+            if path.extension().is_some_and(|e| e == "jpg") && ships(&path) {
                 let jpg_data = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
                 let img = image::load_from_memory_with_format(&jpg_data, image::ImageFormat::Jpeg)
                     .expect("Failed to decode JPEG")
@@ -195,23 +237,74 @@ pub fn collect(dirs: &[String]) -> Vec<(String, Vec<u8>)> {
         }
 
         // Include all other files recursively (skipping pre-processed types)
-        fn add_dir(dir: &Path, prefix: &str, files: &mut Vec<(String, Vec<u8>)>) {
+        fn add_dir(
+            dir: &Path,
+            prefix: &str,
+            ships: &dyn Fn(&Path) -> bool,
+            files: &mut Vec<(String, Vec<u8>)>,
+        ) {
             for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("Failed to read {}: {e}", dir.display())) {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     let subdir = path.file_name().unwrap().to_str().unwrap();
-                    add_dir(&path, &format!("{prefix}{subdir}/"), files);
+                    add_dir(&path, &format!("{prefix}{subdir}/"), ships, files);
                 } else if path.extension().is_some_and(|e| e == "ttf" || e == "jpg") {
                     continue;
-                } else {
+                } else if ships(&path) {
                     let name = path.file_name().unwrap().to_str().unwrap().to_lowercase();
                     let data = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
                     files.push((format!("{prefix}{name}"), data));
                 }
             }
         }
-        add_dir(dir, "share/", &mut files);
+        add_dir(dir, "share/", &ships, &mut files);
     }
 
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nothing git does not track reaches the initrd.
+    ///
+    /// Against a repository this test builds, not against `assets/`: the two
+    /// files that shipped for real — `.DS_Store` and a stray `target/` — are
+    /// exactly what a working tree acquires by being worked in, so a gate that
+    /// depended on them being present would pass on a clean checkout and prove
+    /// nothing. Here they are put there on purpose.
+    #[test]
+    fn only_tracked_assets_ship() {
+        let dir = std::env::temp_dir().join(format!("toyos-assets-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("icons")).expect("make the asset tree");
+        fs::create_dir_all(dir.join("target")).expect("make a stray target/");
+
+        fs::write(dir.join("kept.wad"), b"tracked").expect("write kept.wad");
+        fs::write(dir.join("icons/kept.svg"), b"tracked").expect("write icons/kept.svg");
+        fs::write(dir.join(".DS_Store"), b"finder").expect("write .DS_Store");
+        fs::write(dir.join("target/.deps-stamp"), b"cargo").expect("write target/.deps-stamp");
+
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-C", &dir.display().to_string()])
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["add", "kept.wad", "icons/kept.svg"]);
+
+        let shipped: BTreeSet<String> =
+            collect(&[dir.display().to_string()]).into_iter().map(|(name, _)| name).collect();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            shipped,
+            BTreeSet::from(["share/kept.wad".to_string(), "share/icons/kept.svg".to_string()]),
+            "the initrd's asset list is not what the commit says it is"
+        );
+    }
 }

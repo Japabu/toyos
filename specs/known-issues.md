@@ -3175,7 +3175,7 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
-### `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
+### CLOSED — `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
 
 `toolchain::standing` asks `git diff --quiet main -- toyos-abi/src toyos/src
 userland/libc/src` and reads a non-empty diff as `Diverged` — the standing that
@@ -3194,9 +3194,20 @@ its own, so it was rightfully diverged — but its standing would have been
 
 The question the check means to ask is whether this checkout has content in
 those trees that main does not: `git diff --quiet main...HEAD` against the merge
-base, plus the working tree, rather than `git diff main`. Not fixed here; a
-change to the arbitration wants its own gates in `src/buildlock.rs` beside the
-three that are there.
+base, plus the working tree, rather than `git diff main`.
+
+**Fixed 2026-08-07.** `standing()` asks `git diff --quiet main...HEAD --
+<SYSROOT_SOURCES>` and, separately, `git status --porcelain --
+<SYSROOT_SOURCES>`. Two questions rather than one because they are two: the
+first is what this branch added and the second is what has not been committed —
+and `status` rather than a second `diff`, because a *new* file in `toyos-abi/src`
+changes the witness and no diff against a commit reports an untracked one, which
+the old check could not see either. Gate:
+`toolchain::tests::a_checkout_behind_main_has_no_standing_to_claim`, watched red
+on the tree as it stood (`left: Diverged, right: MatchesMain`) and green after.
+The three existing standing gates are unchanged and still green, including the
+one that deletes `main` — `git diff main...HEAD` exits 128 there, which is
+`Unknown` exactly as before.
 
 ### An std change that depends on an unlanded ABI change cannot be built at all, from anywhere
 
@@ -3343,6 +3354,17 @@ phase landed, and none reproduces on a host running one suite.
   `desktop_typing_damage` and `desktop_locale_detect`: its verdict is the dump's
   content, but *reaching* the dump crosses a compositor, a terminal and a shell,
   and that step is a wall-clock margin. Still `Sched::Parallel`.
+- **`hda_tone`** — added 2026-08-07, hours after the test itself landed. In a
+  full run on a host carrying another worktree's suite: `2 mid-tone silences in
+  the capture: total 2 [3p×1 4p×1]`, `dither 3.3%`, `phase-breaks 92`. Alone on
+  the same tree eight minutes later: `gaps none`, `phase-breaks 16` — the
+  declared #88 failure and nothing else. It is `Sched::Serial`, so like
+  `dump_nmi_probe` the harness never re-runs it alone and the run simply reds.
+  Its `EXPECTED_FAILURES` entry covers the phase-break message alone, which is
+  why a *dropout* under load reaches the verdict, and that is correct: **do not
+  widen it.** A silence and a phase break are two different defects and an entry
+  that covered both would stop saying anything. The tree it was seen on differed
+  from main only in `src/`, so the guest image was byte-identical to main's.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
@@ -3362,6 +3384,19 @@ landing storm is not made of guests. Whether the integration lock should also
 gate the gate's build, or whether these tests belong in the serial tail, is a
 decision for whoever owns the harness; what is established here is that a branch
 can be unable to land for reasons that have nothing to do with it.
+
+**Bounded the same day, and the count was closer to home than a landing storm.**
+A worker takes a guest slot and then *compiles its kernel variant*, so twelve
+workers in one suite are twelve concurrent `cargo build`s before any of them
+boots — which is the load 49.9 with twelve rustc/cargo processes and exactly one
+guest live that was measured while this was being written, on a host where the
+semaphore was doing precisely what it says. `buildlock::build_slot` is the
+second count: four across every worktree, its own directory so a suite holding
+every guest slot can still compile, `--host-builds N` to override and `0` to turn
+off (`specs/test-cost-audit.md` §5.7). It bounds the build half of a landing gate
+by construction, since a gate's builds are these builds. What it does **not**
+bound is anything that never enters `src/build.rs` — a `toyos-sched-sim measure`,
+a hand-run `cargo build` in a fork clone, the primary's `./x.py`.
 
 **What to do about a red on any of these names:** read the `ALONE` line under it
 before anything else. `GREEN` there means the host, not the kernel. What none of
@@ -3501,11 +3536,14 @@ are what separate it from a regression; a `toyos-tests-<pid>` directory per live
 suite in `$TMPDIR` names how many are up.
 
 `buildlock::guest_slot` bounds the *guests* to twelve across all worktrees, and
-that is the part of this the semaphore closes. It bounds nothing else: a
-`toyos-sched-sim measure`, a `cargo build` and the primary's bootstrap all take
-cores and no slot, so a phase can still be starved by work that boots nothing.
-A slot's wait is announced (`[host-slots] waiting …`), which is what separates a
-slow phase from a starved one without `ps`.
+that is the part of this the semaphore closes. `buildlock::build_slot` (added
+2026-08-07) bounds the compiles to four, which closes the part this entry is
+actually about — "another agent's build" is a `cargo test`'s or a
+`cargo run`'s, and both go through `src/build.rs`. What is left outside both
+counts is work that reaches neither: a `toyos-sched-sim measure`, a `cargo build`
+typed by hand in a fork clone, `./x.py` run directly in `rust/`. Each wait is
+announced (`[host-slots] waiting …`, `[host-builds] waiting …`), which is what
+separates a slow phase from a starved one without `ps`.
 
 ### The primary checkout reclaims the shared sysroot silently
 
