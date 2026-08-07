@@ -18,7 +18,7 @@ pub mod shm;
 pub mod system;
 
 pub use ipc::Connection;
-pub use device::{Keyboard, Mouse, FramebufferDev, Nic, AudioDev};
+pub use device::{Keyboard, Mouse, FramebufferDev, Nic, AudioDev, HdaDev};
 
 pub use toyos_abi::Fd;
 

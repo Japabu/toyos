@@ -551,6 +551,63 @@ pub fn init(devices: &[PciDevice]) {
         pci.dev,
         pci.func
     );
+
+    #[cfg(feature = "hda-allowlist-selftest")]
+    allowlist_selftest(stream_offset);
+}
+
+/// Every arm of [`write_permit`] and [`read_permit`], run against the bound
+/// controller and reported by name.
+///
+/// **Nothing else can reach it.** The check is gated on holding the device
+/// claim, soundd takes that claim for the life of the boot, and a `Claim` is
+/// exclusive by construction — so no guest test can be the caller. The
+/// alternative, a boot with no soundd, is a machine with no audio, which
+/// answers nothing about a driver's refusals.
+///
+/// The permitted cases really write: `ICW` takes a null verb nothing has told
+/// the controller to send, and `SDnFMT` takes back the word it already holds,
+/// so what runs is the shipped path and not a rehearsal of the table.
+#[cfg(feature = "hda-allowlist-selftest")]
+fn allowlist_selftest(stream_offset: u64) {
+    let sd = |field: u64| stream_offset + field;
+    let cases: &[(&str, u64, RegWidth, u32)] = &[
+        ("ICW", IMMEDIATE_COMMAND, RegWidth::U32, 0),
+        ("SDnFMT", sd(SD_FMT), RegWidth::U16, 0),
+        ("SDnCTL", sd(SD_CTL), RegWidth::U8, SD_CTL_IOCE as u32),
+        ("SDnCTL-tag", sd(SD_CTL_TAG), RegWidth::U8, (STREAM_TAG as u32) << 4),
+        // Every one below carries a value the kernel must own.
+        ("SDnBDPL", sd(SD_BDPL), RegWidth::U32, 0),
+        ("SDnBDPU", sd(SD_BDPU), RegWidth::U32, 0),
+        ("SDnCBL", sd(SD_CBL), RegWidth::U32, 0),
+        ("SDnLVI", sd(SD_LVI), RegWidth::U16, 0xFF),
+        ("SDnSTS", sd(SD_STS), RegWidth::U8, 0),
+        ("SDnCTL-srst", sd(SD_CTL), RegWidth::U8, SD_CTL_SRST as u32),
+        // A 32-bit write of SDnCTL reaches SDnSTS, which is the interrupt
+        // acknowledgement and the kernel's alone.
+        ("SDnCTL-wide", sd(SD_CTL), RegWidth::U32, 0),
+        ("INTCTL", INTCTL, RegWidth::U32, 0),
+        ("GCTL", GCTL, RegWidth::U32, 0),
+    ];
+    for &(name, offset, width, value) in cases {
+        let verdict = match reg_write(offset, width, value) {
+            Ok(()) => "written",
+            Err(_) => "refused",
+        };
+        log!("hda: selftest write {name} {verdict}");
+    }
+    for (name, offset, width) in [
+        ("ICS", IMMEDIATE_STATUS, RegWidth::U16),
+        ("IRR", IMMEDIATE_RESPONSE, RegWidth::U32),
+        ("SDnLPIB", sd(SD_LPIB), RegWidth::U32),
+        ("STATESTS", STATESTS, RegWidth::U16),
+    ] {
+        let verdict = match reg_read(offset, width) {
+            Ok(_) => "read",
+            Err(_) => "refused",
+        };
+        log!("hda: selftest read {name} {verdict}");
+    }
 }
 
 /// Take one controller out of reset and ask whether anything is on its link.

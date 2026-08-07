@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod caps;
+pub mod config;
 pub mod graph;
 pub mod path;
 pub mod probe;

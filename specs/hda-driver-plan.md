@@ -518,6 +518,86 @@ is not on the list at all because it is a store into DMA memory soundd owns.
   the one line of existing code the stub contradicts, and because a stub whose
   BAR mapping came out writable would look exactly like a stub that worked.
 
+#### 4.1.6 What H2/H4 built, and the one place it differs from §4.1.1
+
+Built on 2026-08-07. §4.1.1's decision — **the kernel never accepts an address**
+— stands, and is stricter in the code than on this page. One thing changed and
+the owner should read it, because it reverses a line he decided:
+
+> **soundd does not map the BAR at all, in either direction.**
+
+§4.1.1 item 2 kept the mapping so the per-period `SDnLPIB` read would cost no
+syscall. That read moved instead: **the interrupt handler reads `SDnLPIB` and
+turns it into the completion mask** — which is what §2.4 already said it should
+do — so the position reaches soundd inside a record it was going to read anyway.
+The mapping then had one consumer left, the verb poll, and that is two registers
+rather than a 16 KiB window.
+
+What it costs and what it buys:
+
+- **Per period the audio path is unchanged and one syscall shorter than
+  virtio's.** Measured on a boot: `submitted` is 1127 periods for the same 3 s
+  tone on both backends, and HDA's loop makes no `SYS_AUDIO_SUBMIT` call at all.
+  The driver performs **zero register accesses per period**; the one write is
+  the ISR's `SDnSTS` acknowledgement, as §2.4 counted.
+- **§4.1.4's read-side residual is gone**, and with it risk 11, the claim-time
+  2 MiB-neighbour refusal, and `CachePolicy::Uncacheable`. There is no user
+  mapping of device registers, so there is no page whose other occupants matter
+  and no memory type to get wrong. `SharedRegion`'s `writable` field goes with
+  them — the PCM ring is mapped writable, which is what it already did.
+  **§6's H2 row names all three as its content and none was built**; they
+  existed only to serve the mapping, which is the previous agent's finding
+  ("dead code without their consumer") reaching its conclusion.
+- **The driver reads two registers through the kernel**, `ICS` and `IRR`, on a
+  read allow-list with the same polarity as the write one. That is a syscall per
+  poll of a verb, and verbs are never in the audio path: roughly four thousand
+  syscalls once at claim time, against 344.53 periods per second thereafter.
+
+**CORB/RIRB is not built either.** Verbs go over the immediate-command
+registers, which is what H0 used and what both machines in reach answer. The
+ring pair buys one thing — several verbs behind one `CORBWP` write — and there
+is nothing in the audio path to batch, so it would be two DMA rings and their
+setup in the kernel for a saving on a path that runs once. A controller with no
+immediate-command interface is a refusal by name, and §6.3's own table already
+carries that line.
+
+**The allow-list, as built.** Five writes and two reads, each on it because its
+value is not an address *and* indexes nothing the kernel allocated:
+
+| Write | Width | Why it is on the list |
+|---|---|---|
+| `ICW` | 32 | a codec verb, which names no memory |
+| `ICS` | 16 | the immediate-command busy and valid bits |
+| `SDnCTL`+0 | 8 | run and interrupt enables — **`SRST` refused**, because stream reset clears `SDnBDPL` and the driver cannot write it back |
+| `SDnCTL`+2 | 8 | the stream tag, which the converter is told too |
+| `SDnFMT` | 16 | the format word `toyos-hda::stream` encodes |
+
+| Read | Width |
+|---|---|
+| `ICS` | 16 |
+| `IRR` | 32 |
+
+`SDnCBL` and `SDnLVI` are **not** on it, and §4.1.3's complement is wrong to
+list them: both index the buffer descriptor list, and an `SDnLVI` past its end
+is a DMA engine reading descriptors out of memory nobody initialised. The kernel
+writes both itself from the list it built. `SDnSTS` is absent for §2.4's reason,
+and a 32-bit `SDnCTL` write is refused on width alone because it reaches
+`SDnSTS`.
+
+Every arm of both lists runs at bind time under the `hda-allowlist-selftest`
+kernel feature and is asserted by name in `hda_tone`. Nothing else can be the
+caller: the check is gated on the device claim, soundd holds that claim for the
+life of the boot, and the claim is exclusive by construction.
+
+**Two controllers with live links is a refusal naming both.** The kernel can
+tell which links answer and cannot tell which one a human is wired to — that
+needs the codec graph, which is the driver's. `Profile::HdaTwoLive` and
+`hda_two_live_refused` are that arm; a first-match kernel goes green on every
+other HDA test.
+
+**Nothing in §4.1.5 has fired**: no per-period register write turned up, the
+list is seven entries, and the kernel's bring-up still decides nothing.
+
 #### 4.1.5 What would reopen it
 
 Recorded so the decision is falsifiable later (`wlan-plan.md` §3.2, same
@@ -1140,6 +1220,40 @@ file had only argued:
    became `.output` with a `.device` beside it. A field named `speaker`
    holding a line-out is the lie the comment rule is about, and a driver that
    bound one has to be able to say so in its log.
+
+### 6.6 Where the stages actually stand, 2026-08-07
+
+**H2 and H4 are built and H3 is not**, which is a re-ordering §6's table does not
+contain and which the owner should accept or reject. What H3 does is move
+*virtio-sound* into userland and delete the kernel's audio path; what H4 needs
+from it is a backend seam in soundd, and that seam is 90 lines and is now there
+with two implementations. So HDA reached the wire without the deletion, and the
+deletion is now a cleanup of a path the T14 does not have rather than a
+prerequisite for the machine that does. **The risk H3 exists to price — that the
+userspace boundary costs more than audio can pay (risk 3) — is not measured by
+this, and is still open.**
+
+What is built:
+
+- **H2**, as §4.1.6 rewrote it: two syscalls (`SYS_DEVICE_REG_READ` 97,
+  `SYS_DEVICE_REG_WRITE` 98), a `DeviceType::HdaAudio` claim carrying `HdaInfo`,
+  and the allow-list. Not built, and §4.1.6 says why each is now unnecessary:
+  `CachePolicy::Uncacheable`, `SharedRegion`'s `writable` field, the claim-time
+  2 MiB-neighbour refusal.
+- **H4**, both halves. `toyos-hda` grew `probe::enumerate` (the walk, driven
+  through one `Verbs` method, host-tested against the committed H0 logs of both
+  machines) and `config::verbs` (§2.3 step 6 as a pure function). 96 host tests,
+  up from 64.
+- **The instrument §5.3 item 5 asked for**: `audio::phase_breaks`, which reads 0
+  on all four recorded virtio configs and 8–16 on the HDA arm. That is
+  `known-issues.md` §4's declared red and the largest open thing in this track.
+
+What is **not** built, and is H4's own gate as §5.3 states it: the four new
+`tests/audio-baseline.toml` sections. Recording them is 30 invocations of four
+configs on a quiet session, and this branch has no such sample — so `hda_tone`
+asserts *harm* (a tone at full amplitude, no mid-tone silence, and soundd's
+counters) and claims no distribution. A thorough tier for the HDA arm needs
+those sections first.
 
 ### 6.5 What H0's boot did *not* leave behind
 
