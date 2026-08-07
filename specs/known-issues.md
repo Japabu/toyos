@@ -1094,7 +1094,23 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
-### OPEN — two CPUs shooting down at once wait for each other and both panic
+### CLOSED — two CPUs shooting down at once wait for each other and both panic
+
+**Closed 2026-08-07 by `wt/toyos-tlbfix`: `arch::tlb::shootdown` waited without
+ever answering, and every path that reaches it has `IF` clear.**
+`arch::syscall`'s `MSR_FMASK` masks `IF` on the `SYSCALL` gate and nothing sets
+it again before `sysretq`, so a CPU inside the wait could not take vector 0xFE
+and had no other way to acknowledge. M3 closed that class for `Lock::lock`,
+whose spin calls `arch::tlb::poll` on every turn, and enumerated the `IF=0`
+spins it thought were left; the wait itself was not on the list and is one.
+`Shootdown::wait_turn` is one turn of the wait and it answers before it asks —
+asking first lets a CPU leave on the answer it just received without ever
+publishing the generation its sibling is waiting on. Gate:
+`an_initiator_answers_while_it_waits` in `kernel-loom`, which is this entry's
+schedule written out, red on the old shape.
+
+Everything below is the evidence as it was recorded, and it is what made the
+diagnosis: two backtraces, read together, are the whole defect.
 
 Observed 2026-08-07 on `wt/toyos-h3`, whose only kernel delta from `main` is the
 audio one; the shootdown code is `c4173f0` and `318ec10`, landed the same
@@ -1138,6 +1154,15 @@ before the audio landing, with the shootdown work and without it).
 **What it costs right now**: gate A's thorough tier cannot complete a run on any
 tree carrying it, because a panicked guest is scored as an instrument failure and
 the tier stops. That blocked H3's own A/B (§4).
+
+**Independently reproduced from a third worktree**, same day, across four
+landing gates, on a branch whose every changed kernel line sits behind
+`#[cfg(feature = "heartbeat")]` and so is compiled into none of the tests that
+failed. Same victims, same two lines in every capture. The reading worth
+carrying forward: **the name on the red is the workload that was running and
+never the cause**, so grep a red run's log for `tlb:` before believing the test
+name — including when the harness re-runs one alone, reds again and reports
+"the defect is real", which `metal_sim_window_caps` did.
 
 ### `Lock::lock`'s spin is the half of the ticket lock loom cannot reach
 
@@ -2528,6 +2553,112 @@ keeping up.
 
 ## 4. Audio and soundd
 
+### OPEN, UNASSIGNED — `hda_tone` is red on `main` for a reason `#88`'s exemption does not cover
+
+`cargo test -- hda_tone` on `main` at `6d11938`, alone, 2026-08-07 18:5x:
+
+```
+FAIL hda_tone: 1 mid-tone silences in the capture: total 1 [1p×1]
+  FAIL  hda_tone  (15s)  — listed against #88, and this is not that failure:
+        the entry covers ["the captured tone is not one sine"]
+```
+
+The `EXPECTED_FAILURES` entry does what it is supposed to: it pins the assertion
+rather than the test, so a *second* defect in the same test still reds the run
+and says which. What is red is the mid-tone-silence assertion — a gap in the
+capture, which is gate A's harm verdict — and not #88's spectral one. So any
+landing whose gate is `cargo test` is currently red on `main` for this, and an
+agent will read it as theirs.
+
+Found while landing task #98/#12: the same test failed identically inside that
+landing's gate, and the A/B against `main` in the same session is what
+identified it as `main`'s. Assigning it needs whoever owns H3 —
+`5fdfeb7`/`a022811` ("wip: H3, the virtio-sound stub and its userland driver")
+landed hours before this measurement.
+
+### CLOSED as to its cause, OPEN as to the landing — the wide phase reds on a five-second TLB stall
+
+**The signature's cause is closed: §3, two CPUs shooting down at once.** It was a
+mutual wait and not a bound, so no deadline value was ever going to fix it; the
+wait now answers before it asks. What that does *not* do is make `cargo test`
+reliably green, and this section stays open for the part it does not reach.
+
+**The wide phase still reds, on a different class, and this signature did not
+reproduce here at all.** Measured 2026-08-07 on `wt/toyos-tlbfix`, four full
+suites and 96 guest boots of the audio family, **zero `tlb:` lines in any of
+them** — including 50 boots on a kernel with the fix reverted, where the H3
+agent's twelve-run hunt had found it in roughly one boot in five. So the rate
+this defect ran at earlier in the day is not the rate it runs at now, and no
+measurement taken here can be read as the fix having lowered it. The fix rests
+on §3's two backtraces and on `an_initiator_answers_while_it_waits`, which is
+red without it.
+
+| run | wall | verdict |
+|---|---|---|
+| before the fix | 576.3 s | 4 red: `metal_sim_compositor_stall`, `metal_sim_client_death`, `screen_blocked_dump` (all `ALONE: GREEN`), `audio_tone (smp=8)` |
+| after, 1 | 559.3 s | 2 red: `i8042_mouse`, `desktop_audio_client` — 385 s wide against 13 s alone — both `ALONE: GREEN` |
+| after, 2 | 182.7 s | **clean, 289/289**, on a host that was briefly quiet |
+| after, 3 | 704.7 s | 1 red: `screen_blocked_dump`, `ALONE: red again` |
+
+Every one of those reds is the parallel-red list in §7, not this entry: the two
+that name a duration are the contention class, and the one clean run is the one
+whose host was idle. **A landing is still a coin toss and the reason is now
+squarely §7**, whose own last paragraph says a verdict that flips with the host
+is measuring the host. `audio_tone (smp=8)`'s `suspend structure: no
+'soundd: suspended' after the last client removal` fired 2 of 12 on the reverted
+kernel and 0 of 12 on the fixed one, which at n=12 is not a difference and has
+no mechanism behind it — recorded so the next person does not read it as one.
+
+What follows is the evidence as it was recorded on `wt/toyos-boot`, and it is
+what pointed at §3.
+
+Measured 2026-08-07 across two `--land` gates on `wt/toyos-boot` (289 tests
+each) and five A/B runs against `main` at `6d11938`, all in one session.
+
+Seven distinct tests failed between the two gates —
+`null_sink_shipped_client`, `metal_sim_window_caps`,
+`metal_sim_ipc_hostile_peer`, `metal_sim_compositor_stall`,
+`metal_sim_client_death`, `desktop_window_child`, and an `hda_tone` that is the
+entry above. **Every one of their captures carries the same two lines**, with
+different generation numbers:
+
+```
+tlb: cpu 1 has not flushed for generation Generation(69) in 5000000000ns
+     — it is not taking interrupts
+tlb: cpu 0 has not flushed for generation Generation(68) in 5000000000ns
+     — it is not taking interrupts
+```
+
+And every one of them **passes alone, on both trees**:
+
+| test | in the wide phase | alone on the branch | alone on `main` |
+|---|---|---|---|
+| `null_sink_shipped_client` | FAIL, 10 s | PASS, 4 s | PASS, 5 s |
+| `metal_sim_window_caps` | FAIL, 5 s (three times) | PASS, 3 s | PASS, 36 s |
+
+`metal_sim_window_caps` is the clearest: its own work *completes* —
+`window caps: oversized refused, 62 windows granted then refused` — and the
+process then exits `-1` after two CPUs have each stalled five seconds. 62
+windows created and destroyed is 62 rounds of unmapping, which is exactly what
+`arch::tlb::shootdown` is on the path of. `null_sink_shipped_client`'s round 1
+took 6.14 s for a 3 s tone and its round 2 then panicked in
+`toybox/src/tone.rs:85` on `failed to open audio stream: NotFound`.
+
+So the branch is not the variable. The shootdown wait landed on `main` the same
+day (`318ec10`, `c4173f0`) and **its own diagnostic is what named the stall**, so
+the instrument is already in the tree.
+
+The reading that "the load is the variable" was the wrong half of it, and worth
+keeping as the mistake it was: load is what made two unmaps overlap, and the
+overlap was fatal by construction. The generations here differ by one — `68` and
+`69` on two CPUs of a two-CPU guest — which is the same pair of initiators §3's
+backtraces name.
+
+**Not to be re-run away**: the owner's 2026-08-04 ruling is that a
+load-coincident failure is a real defect, and this one reproduced across two
+full runs with seven different victims. That ruling is what produced this entry
+instead of seven re-runs, and it is what the fix came out of.
+
 ### OPEN, UNASSIGNED — gate A's thorough tier is red on `main`, and the recorded dropout sample is what it disagrees with
 
 Measured 2026-08-07 on `main` at `c0365ea`, in one session, three arms:
@@ -3103,6 +3234,117 @@ between the milestone and a silent recurrence: a client through the null sink
 must exit, a second must be taken up while the first streams, and the desktop
 must still answer afterwards.
 
+### OPEN — a desktop session put 26 ms of silence on the wire, and gate A has never measured this workload
+
+The owner ran `cargo run` on 2026-08-07 (guest RTC 13:14:51 UTC, tree at or
+after `43ce73e`), started doom from the terminal, let its demo loop run to
+t=69 s, then ran `tone` 44 times. 391 s of serial, 119 soundd stats windows.
+Every number below is from that capture.
+
+**Harm, by the fast tier's own definition.** Two windows during doom:
+
+```
+soundd: wakes=537 completions=675 submitted=675 underruns=8 drains=1 max_wake_lat_us=86779 max_batch=8 clients=1 deferred=33
+soundd: wakes=389 completions=690 submitted=690 underruns=1 drains=2 max_wake_lat_us=92175 max_batch=8 clients=1 deferred=7
+```
+
+Nine periods — 26 ms — submitted with a client streaming and no client audio
+behind them (`main.rs:954`). `tests/audio-baseline.toml` records `underruns` 0
+on all 120 runs of its sample, and the fast tier's verdict is exactly this
+counter. There is no capture to corroborate it: `--dump-audio` was not on.
+
+**And it is not confined to those two windows.** Across the whole run, 15 of
+119 windows report `drains` (22 events; recorded sample 0/120), and the
+`max_wake_lat_us` distribution never once enters the recorded range:
+
+```
+                     n     min     p50     p90     max
+doom phase          31   21167   30367       —  106654   (4.59 pipeline depths)
+tone phase          88   18116   21896   24079   63664
+audio_tone sample   30    5666       —       —   10090   (baseline file)
+```
+
+The tone phase is 88 windows, none below 18116 us, against a recorded sample
+whose *worst of 30* is 10090. The two distributions are disjoint. 106654 us is
+past the `audio_tone_load.smp8` ceiling of 80000 (this guest is `--smp 8`).
+
+**Whose lateness it is, is not the same question in the two phases, and the
+`deferred` column separates them.** `deferred` counts a mix cycle declining to
+submit because a streaming client's ring was empty and there was still playout
+margin (`main.rs:894-901`) — soundd's restraint, waiting for a producer:
+
+```
+doom phase   173 deferrals across 14 of 31 windows
+tone phase     1 deferral  across  1 of 88 windows
+```
+
+Same soundd, same device, same kernel. So the doom-phase underruns are **doom
+failing to fill its ring**, held off by soundd until the floor and then paid in
+silence — not the audio path being late. The 92175 us window sits beside a
+compositor window of `frames=23` where the steady state is 65-70, so doom
+stopped presenting at the same moment it stopped producing; both recovered
+within one window. `tone` is a trivial producer and never does this.
+
+That leaves the tone phase as the clean signal, and it has `deferred` 1,
+`drains` 3 and `underruns` 0 across 88 windows — nothing wrong with the audio
+at all, and a wake-lateness figure 2-4x the recorded sample anyway. Which is
+why the measurement itself is the first thing to rule out.
+
+**Two things make this different from the three entries above**, which are all
+gate A reddening on its own configuration:
+
+- The client is doom — a real producer with a SoundFont synthesizer thread —
+  and there is a compositor blitting 200-450 MB/s to the scanout beside it.
+  Nothing in gate A resembles that.
+- The 44 `tone` runs exercise **suspend → resume**, 44 times. Gate A's single
+  client never leaves and comes back, so the resume path has no coverage at
+  all. Every resume here costs a ~22 ms lateness sample, and 22 ms is 0.94 of
+  one pipeline depth (23219 us), which is what a wake measured against a
+  prediction one whole pipeline stale would look like.
+
+**Read the tone-phase cluster carefully before treating it as load.** It is far
+too tight to be scheduling noise (min 18116, p50 21896, p90 24079 over 88
+windows, one per stream start). One candidate mechanism, offered as a
+hypothesis and not a measurement: `signal_clients`' caller arms its wait on
+`target` — the *next future* grid point when the DLL estimate is past due
+(`userland/soundd/src/main.rs:773-783`) — but records `armed_on = Some(t_est)`,
+the stale estimate. `lateness` at :827 is then measured from an instant soundd
+deliberately did not ask to be woken at, and includes every whole period it
+skipped. The comment at :819-825 says the sample is taken "against the
+prediction this wait was *armed* on"; `target` is what it was armed on.
+Whoever takes this should settle that before reading any of the numbers above
+as a property of the scheduler.
+
+**Reproduction.** `cargo run`, `doom` in the terminal, wait for the demo loop,
+quit, then `tone` repeatedly. Add `--dump-audio` so the wav can corroborate the
+underruns. The counters print every 2 s while a client exists.
+
+### OPEN — soundd reports a clean client exit as a death, 5 times in 44
+
+Same capture. `tone` exits with `code=0` every time, and 5 of the 44 runs
+produced:
+
+```
+[kernel 164.648 cpu6 tid=0] exit: tone pid=21 code=0 cpu=45ms
+soundd: client 15 died, ramping down
+soundd: client 15 removed
+```
+
+Clients 15, 17, 25, 34 and 39; the other 39 print only `removed`. The condition
+is genuine — `signal_clients` (`main.rs:594-605`) got `NotFound` from the
+signal pipe because the client process was gone — but it is a *race between
+soundd's own two detection paths*, not a crash: whether the broken pipe or the
+control thread's `RemoveClient` arrives first. Both set `pending_removal` and
+start the same ramp, so no audio differs.
+
+What is wrong is the word. §5.7's crash detector cannot distinguish a crash
+from a clean exit that raced it, so "died" is a false positive at 11% of normal
+disconnects — and it is the line an operator or a test would grep for. A
+disconnect the control connection has *already* announced is knowable: the
+control thread saw the peer close before the pipe broke.
+
+Cosmetic today. It stops being cosmetic the moment anything gates on it.
+
 ---
 
 ## 5. Diagnostics
@@ -3309,9 +3551,206 @@ Layer 1 (process accounting counters + the `stats` tool) is implemented, with
 the read-path restriction above. Event tracing and RIP sampling are not. See
 CLAUDE.md's diagnostics roadmap.
 
+### OPEN — the syscall profile is 64 bins wide and the ABI reaches 96, so every audio, net, IPC and pipe call is missing from it
+
+`ProcessData::syscall_counts` is `[u32; 64]` (`kernel/src/process.rs:552`) and
+`syscall_dispatch` guards the bump with `if (num as usize) <
+data.syscall_counts.len()` (`kernel/src/arch/syscall.rs:218`). `syscall_total`
+at :217 is bumped unconditionally. `SYS_MMAP` is 63 — the last bin — and
+`SYS_MUNMAP` is 64, the first one dropped. Everything above it goes with it:
+`SYS_AUDIO_SUBMIT` 71 and `SYS_AUDIO_POLL` 84, `SYS_NIC_{RX_POLL,RX_DONE,TX}`
+78-80, `SYS_LISTEN`/`ACCEPT`/`CONNECT` 85-87, `SYS_PIPE_{OPEN,ID,MAP}`,
+`SYS_READ_NONBLOCK`/`WRITE_NONBLOCK`, `SYS_IO_URING_{SETUP,ENTER}`,
+`SYS_EXIT`, `SYS_PROCESS_STATS`, `SYS_SET_RT_PRIORITY`.
+
+The line therefore prints a total that is not the sum of its parts, silently.
+From the 2026-08-07 desktop capture, doom:
+
+```
+syscalls: pid=6 total=33190 syscall_wall=3806ms 0=6129 1=4585 6=1 8=14727 9=4 10=3 13=891 14=3 38=4 39=1 40=2 41=2 49=1919 53=2 59=5 63=17
+```
+
+The bins sum to 28295 against `total=33190` — **4895 calls, 15% of the process,
+invisible**. Every one of the 44 `tone` processes in the same capture reports
+`total=28` with bins summing to 22; the six missing are its whole reason for
+existing (connect to soundd, map the ring, exit).
+
+Reproduce with any process that makes an audio or network call:
+
+```
+grep 'syscalls: pid=' <log> | awk '{t=0;s=0; for(i=1;i<=NF;i++){ if($i~/^total=/){split($i,a,"=");t=a[2]} else if($i~/^[0-9]+=[0-9]+$/){split($i,b,"=");s+=b[2]} } print t, s, t-s}'
+```
+
+This is the diagnostics roadmap's layer 1 — the layer that exists to answer
+"where is time going" — and it cannot see the audio path at all. Whatever the
+fix (size the array from the ABI's highest number, or make the array
+`[u32; SYS_MAX]` with a compile-time bound), the silent `if <` is the defect:
+a bin that cannot hold a number should refuse it by name or not exist.
+
+### OPEN — `exit: <name> pid=N cpu=Xms` is the main thread's CPU, not the process's, and the two lines look identical
+
+`teardown_bookkeeping` prints `cpu={main_cpu_ns}` (`kernel/src/process.rs:1037,
+1040`) — the main thread's scheduler total, the same value
+`stash_accounting_snapshot` then *adds* `child_threads_cpu_ns` to at :1082
+before handing it to `waitpid`. The per-thread line at :1230 has the same shape
+and prints that thread's total. Nothing distinguishes them but `pid=` versus
+`tid=`.
+
+The result is a process that used less CPU than one of its own threads. From
+the 2026-08-07 capture, 43 of the 44 `tone` runs read this way:
+
+```
+[kernel  87.632 cpu5 tid=1] exit: tone tid=1 code=0 cpu=121ms
+[kernel  87.634 cpu4 tid=0] exit: tone pid=8  code=0 cpu=46ms
+```
+
+and doom's three lines (`tid=1` 3409 ms, `tid=2` 14759 ms, `pid=6` 59050 ms)
+cannot be added, subtracted or reconciled by a reader who does not have
+`process.rs` open. The whole-process figure exists — `waitpid` gets it — and is
+the one number the log does not carry.
+
+### OPEN — the serial console has no line atomicity, so a stats line can be cut in half by another writer
+
+std's `Stderr` is unbuffered, so one `eprintln!` reaches `SYS_WRITE` as several
+calls, one per format fragment. `SerialWriter::console` buffers a *single*
+write and commits on drop (`kernel/src/drivers/serial.rs:303-319`), which makes
+each fragment atomic and a line not. Two instances in one 2110-line capture,
+2026-08-07:
+
+```
+netd: MAC soundd: ready, 52:54:8 buffers, 00:12:34:56
+44100Hz 2ch, 512 bytes/period, 128 frames/period
+netd: ready, at most 42 piped connections (4 MiB each of 1356 MiB total)
+```
+
+```
+soundd: client [kernel 351.736 cpu0 tid=0] syscalls: pid=46 total=28 …
+40 removed
+```
+
+The second is the kernel's own ring landing inside a userland line, so this is
+not only a userland-vs-userland race. On the T14 the log *is* the instrument,
+and this capture shows what that costs. Counting soundd's client lifecycle in
+it gives 45 connects and 44 removes, and the one id with no removal is 40 —
+whose removal is the split line above. A reader auditing that log for leaked
+clients finds one, and it is not there:
+
+```
+$ grep -c 'connected (id='            45
+$ grep -cE '^soundd: client [0-9]+ removed$'   44
+```
+
+Cheap in principle: give the toyos `Stderr` a line buffer, or have
+`write_user` hold the ring across one logical line. Neither is free of
+tradeoffs — a line buffer changes flush ordering against the kernel's ring —
+so it is filed rather than fixed.
+
+### OPEN — the i8042 aux line's unmask result is discarded, and its log line says nothing either way
+
+`init` captures the keyboard's unmask and prints it — `"on"` or `"MASKED"`
+(`kernel/src/drivers/i8042/mod.rs:1527, 1544`). The aux line one statement
+later is `let _ = ioapic::set_masked(l.gsi, false);` (:1529), and its log line
+(:1547) reports the GSI, the vector and the APIC and stops:
+
+```
+i8042: kbd set2+xlat (readback 0x41) scanning on, GSI 1 -> vec 0x24 apic 0 on
+i8042: aux rate=100 res=8/mm, GSI 12 -> vec 0x24 apic 0
+```
+
+An aux GSI that failed to unmask prints exactly that line. On the T14 that is
+the TrackPoint and touchpad silently dead with a green-looking boot — the
+failure mode the comment 30 lines above (:1494-1497, "every line below prints
+green") was written to prevent, reached by the one path that does not check.
+Not observed failing: this capture is QEMU with USB HID, and `i8042: armed at
+191ms, idle at 335ms, 0 interrupts` is expected there. The point is that the
+log cannot tell you which it was.
+
+Trivial to fix the same way the kbd line already is.
+
 ---
 
 ## 6. Build and toolchain
+
+### The page cache owns one device, and `usb_storage.rs` says it does not
+
+`page_cache.rs:11-12` holds exactly one
+`BLOCK_DEV: Lock<Option<Box<dyn BlockDevice>>>`, `page_cache::init` takes
+ownership of the NVMe device, and `PageCache::_device_id` is written at
+construction and read nowhere. So `usb_storage.rs:14-17`'s comment — *"NVMe
+takes 1; the page cache keys itself on this, so two devices sharing a number
+would serve each other's blocks"* — describes a mechanism that does not exist.
+The numbers are right and the keying is not.
+
+`fat32_adapter.rs:911-915` states the live consequence and does not work around
+it: a machine that boots off an **internal** disk gets neither `/boot` nor
+`/log`, "because the NVMe device is owned by the page cache from the moment
+storage comes up and there is no second handle to it". `/boot` and `/log` work
+on the T14 and in QEMU only because the boot medium is USB, and
+`usb_storage::open` mints a fresh handle per call.
+
+This is the real cost of `specs/boot-image-split.md` stage 2: a bcachefs root on
+the boot medium needs a `BlockIO` over an arbitrary `BlockDevice` at a partition
+offset with a cache of its own, where `PageCacheBlockIO` *is* the NVMe device by
+construction. Found 2026-08-07 while pricing that stage — the 2026-07-29 version
+of that document listed this as one of eight items a USB storage driver would
+have to bring, and it is the one that did not arrive with it.
+
+### Nothing gates doom's music, and one commit removed the SoundFont for a cycle
+
+`assets/timgm6mb.sf2` is 5,994,284 bytes, `.gitignore` line 3 excludes it on
+purpose, and `userland/doom/src/sound.rs:511` opens it as
+`/share/timgm6mb.sf2`. `b34a69c` filtered the asset sweep to what git tracks and
+took it out of every image; the full suite was green with it and without it,
+`doom_sound_flood` included — that actuator "synthesises its own sound and never
+opens the WAD or the soundfont". The only evidence anywhere was one
+`assets: skipping` line in the build output.
+
+`fdcaa0b` restored it and made a declared-but-absent asset a hard error, so the
+*file* is gated now. What is still ungated is the **music**: nothing asserts
+doom's synthesiser produced anything, so a defect between the SoundFont and the
+sink is invisible to `cargo test`. Gate A measures the test tone and doom's
+sound-stress actuator; neither is the music path.
+
+### No test boots the config the project ships
+
+`system.toml` is what `cargo run` builds and what a stick is flashed with, and
+the harness boots none of it: `tests/testcases`, `desktopcase`,
+`desktopaudiocase`, `doomcase` and `metalcase` are each their own config, and
+`screen_diag_boot` / `screen_console_shell` boot `diag/` and `console/`. So the
+shipping image's init list, its `hosted-rustc` setting and its program list are
+exercised only by the owner running `cargo run`, which agents are told not to
+do. The one gate on that file is `no_shipped_boot_config_starts_sshd`, which
+reads it rather than booting it.
+
+Noticed 2026-08-07 while landing `hosted-rustc = false`: that change alters only
+`system.toml`, so no suite test could go red for it in either direction.
+
+### `debug = true` produces no debug info, because the linker drops it
+
+`toyos-ld` matches `SectionKind::Debug | DebugString | Linker | Note | Metadata`
+and `continue`s (`collect.rs:410-416`), so **no binary this project produces has
+a `.debug_*` section**. Verified with `readelf -S` on the kernel, the compositor
+and toybox: the sections are `.text .strtab .symtab .rela.dyn .data
+.eh_frame_hdr .dynamic .shstrtab` and nothing else.
+
+`[profile.toyos]` states `debug = true` in every crate root, so rustc emits
+DWARF into every object file and the linker throws all of it away. The cost is
+compile time and has not been measured. The consequence for diagnostics is that
+a backtrace can carry a **name** and never a line number or an inlined frame, on
+any path — `.symtab`/`.strtab` is the whole of what survives, and it is 32.2% of
+the 92,138,384 bytes of ELF this tree ships. Keeping `.debug_line` in `toyos-ld`
+is what would change that, and it is not planned.
+
+### `userland/libc` is the one guest artifact built without overflow checks
+
+`src/libc.rs` passes `--release`, so the C runtime std links into every userland
+binary has `overflow-checks` and `debug-assertions` off while everything around
+it has them on. Deliberate on two grounds — CLAUDE.md gives the POSIX
+compatibility layer explicitly relaxed rules, and `libc::build` is gated on
+`stamps::dir_changed` over the *source* directory, so changing the flag alone
+would not rebuild the installed archive and the manifest would then claim
+something the artifact does not have. Recorded so that "one profile, applied
+consistently" is not read as covering it.
 
 ### CLOSED — `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
 
@@ -3492,6 +3931,12 @@ phase landed, and none reproduces on a host running one suite.
   `desktop_typing_damage` and `desktop_locale_detect`: its verdict is the dump's
   content, but *reaching* the dump crosses a compositor, a terminal and a shell,
   and that step is a wall-clock margin. Still `Sched::Parallel`.
+- **`screen_console_scroll`** — added 2026-08-07. `round 1: the guest never
+  printed CHURN-DONE 0 100`, **598 s** in the wide phase, `ALONE … GREEN`. The
+  landing gate it killed ran 778.9 s with four other `--land` processes on the
+  host, on a branch whose whole delta was two documentation lines. 598 s against
+  a phase that is ~45 s on a quiet host is the finding; the message is not.
+  Still `Sched::Parallel`.
 - **`hda_tone`** — added 2026-08-07, hours after the test itself landed. In a
   full run on a host carrying another worktree's suite: `2 mid-tone silences in
   the capture: total 2 [3p×1 4p×1]`, `dither 3.3%`, `phase-breaks 92`. Alone on
@@ -3503,6 +3948,13 @@ phase landed, and none reproduces on a host running one suite.
   widen it.** A silence and a phase break are two different defects and an entry
   that covered both would stop saying anything. The tree it was seen on differed
   from main only in `src/`, so the guest image was byte-identical to main's.
+  **Three times the same day**, all three in landing gates of that one
+  build-system branch and all three confirmed alone within ten minutes: `2
+  mid-tone silences`, then `1 mid-tone silence`, `gaps none` alone every time,
+  with three to five other `--land` processes on the host. Ask
+  `git diff main...HEAD` and never `git diff main` when checking whether a tree
+  could be the cause: the second is symmetric and lists what *main* changed since
+  the branch last merged, which reads as the branch's own work and is not.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
@@ -3662,6 +4114,16 @@ entry deliberately covers only "the desktop ceased to answer after a window
 closed", and this message names a shell that never answered in the first place,
 so the run reds on the very test the exemption exists for and for a reason the
 exemption is right to exclude.
+
+**And it is what is left after the TLB deadlock closed.** Four full suites on
+`wt/toyos-tlbfix` on 2026-08-07, one before that fix and three after: the reds
+were `metal_sim_compositor_stall`, `metal_sim_client_death`,
+`screen_blocked_dump`, `i8042_mouse`, `desktop_audio_client` (385 s wide against
+13 s alone) and `screen_blocked_dump` again — six of the seven `ALONE: GREEN`,
+every one of them this entry. The one clean 289/289 run is the one whose suite
+took **182.7 s**; the three red ones took 559, 576 and 705. That is the whole
+correlation, and it says the remaining landing blocker is this section rather
+than anything in the kernel.
 
 ### A whole parallel phase can be starved by another agent's build
 
@@ -4212,6 +4674,37 @@ through a pointer into a WAD buffer.
 
 Defining `__GNUC__` would be a much larger change than it looks: it turns on
 every `#ifdef __GNUC__` block in doomgeneric and in any header that has one.
+
+### OPEN — the initrd ships two git-ignored files, so the image is not reproducible from the repo
+
+`system.toml`'s `assets = ["assets"]` sweeps the directory whole. Two of the
+files it finds are not in VCS:
+
+```
+$ git check-ignore -v assets/.DS_Store assets/target/.deps-stamp
+.gitignore:6:.DS_Store	assets/.DS_Store
+.gitignore:1:target/	assets/target/.deps-stamp
+```
+
+and both reach the image. From the 2026-08-07 build:
+
+```
+initrd: adding 'share/.ds_store' (6148 bytes)
+initrd: adding 'share/target/.deps-stamp' (10220 bytes)
+```
+
+A fresh clone therefore builds a *different* initrd from this checkout's, and
+`.DS_Store` changes whenever Finder touches the folder — so the image hash moves
+with no code change at all. That is the same property `toyos-cc` and `toyos-ld`
+were made deterministic for on 2026-08-07, defeated one directory up.
+
+`assets/target/` is stray: an empty `target/` with one `.deps-stamp`, mtime
+2026-08-01 08:28, the same minute as the `.DS_Store` — something ran cargo with
+`assets` as its working directory. It should be deleted; the sweep should refuse
+anything git ignores, or take an explicit list.
+
+Costs 16 KiB of a 672 MB initrd, so nothing breaks. The reproducibility claim
+does.
 
 ---
 
@@ -5371,9 +5864,15 @@ the unplug. Flash `target/bootable.img`, boot to the desktop, use it, and pull
 the log off `/log` afterwards. **Nothing needs to be touched for the log to be
 readable**, which is the whole change:
 
-- **Heartbeats continue at ~250 ms with `alive=8/8` to the end of the file** →
-  the machine was alive when the power went off. Previously indistinguishable
-  from death.
+- **Heartbeats continue at ~250 ms with `alive=8/8` and `ran=` moving, to the
+  end of the file** → the machine was still scheduling *and still running
+  tasks* when the power went off. Previously indistinguishable from death.
+- **Heartbeats continue with `alive=8/8` and `ran=0` line after line** → the
+  decisive reading. The scheduler and the interrupt layer are alive and the
+  failure is above them — a lost wakeup, or userland wedged — and every
+  hypothesis below the software layer is out, including the shootdown. This is
+  the case the `tone` boot below makes live, and it is the whole reason the next
+  flash is worth making.
 - **Heartbeats stop dead** → the machine stopped, at the timestamp of the last
   line ± 250 ms. That is the freeze, with a time on it for the first time.
 - **`alive=` falls one CPU at a time over several lines**, each named by a
@@ -5386,6 +5885,120 @@ readable**, which is the whole change:
 - **A `gap=` far larger than 0.250s on a line that is otherwise healthy** → the
   machine went quiet and came back rather than dying. On the eight boots above
   this was the whole file; it should now never happen.
+
+#### The `tone` boot — 86.9 s healthy, and what the heartbeat would and would not have caught
+
+`2026-08-07-174543.log`, 366 lines, ordinary desktop image with **no** heartbeat
+feature. The owner typed `tone` into a terminal, deleted a character, let it sit,
+and the machine froze; Ctrl+Alt+D did nothing afterwards. His words: *"it felt
+like it died idling."* This is the first freeze with a long healthy run, a
+precise last event, and a working control in the same capture.
+
+**Observed.** Shell at 5.08 s, compositor reporting `frames=2` every ~2 s
+throughout (a blinking cursor), PMM flat at 168/15402 MB across every 10 s
+report, every allocator tag steady. Keys counted 4 @13.4 s, 5 @28.6 s, 12
+@38.6 s (`last byte at 29115ms`), 13 @86.859 s. The log ends on three lines —
+the i8042 counter from cpu0, then `sched: cpu=5` and `sched: cpu=6`, each
+`ready=0 parked=1 current=None`. No dump lines at all, so Ctrl+Alt+D never
+began.
+
+**The control is real and it matters.** At 28.645 s a key produced the *identical
+three lines*, and the machine carried on — the compositor's next window went
+`frames=2 → 6` as the character echoed. So the last three lines of this log are
+byte-shaped like a healthy keystroke, and nothing in them is a symptom.
+
+**Correction to "died idling": the evidence says it did not.** The compositor's
+2 s reports run unbroken to the end — three of them between the 81.229 s PMM
+dump and the 86.859 s counter line, at ~1.9 s apart, exactly its healthy
+cadence. A machine that died during the 57 s of idle would have stopped
+producing those, and the log would show the gap. **It stopped at the 13th
+keystroke**, within the flush window of 86.859 s. The owner's impression is
+explained without contradicting him: he had stopped typing 57 s earlier, so from
+his side the machine had been idle, and the key he pressed to check was the one
+that coincided with the stop.
+
+**Second correction, smaller:** `ready_len`/`parked_len` are `try_with_cpu`, so
+`parked=1` is *this CPU's* count. cpu5 and cpu6 each had one parked task, and
+cpu0 reported `parked=1` at 81.229 s too — three parked tasks, not one.
+
+**Would the heartbeat have caught it? Total stoppage yes, a lost wakeup no —
+and that is the honest answer.**
+
+- If the machine stopped scheduling or stopped taking interrupts, the heartbeat
+  ends at 86.859 ± 250 ms and the mask says whether the CPUs went together or
+  one at a time. Caught, with a time on it.
+- If the failure is a **lost wakeup** — timers still firing, CPUs still taking
+  passes, a parked task never woken — every CPU still reaches the idle loop and
+  the line reads `alive=8/8` for as long as the machine sits there dead. Not
+  caught. Worse than not caught: the instrument would assert health through the
+  freeze.
+
+**But this log already argues against a lost wakeup confined to the input path.**
+The compositor wakes on its own timer to blink a cursor; it does not depend on
+the keyboard. A lost keyboard wake leaves it blinking and leaves its 2 s report
+coming. Both stopped at the same instant, so whatever failed took the compositor
+with it. That does not eliminate a *global* wake failure — every wake lost while
+timers still fire would look exactly like this and would still print `alive=8/8`
+— but it does eliminate the narrow reading.
+
+**What `diag-tick` buys this investigation anyway, and it is not small.** In this
+log cpu5 and cpu6 published their scheduler census **twice in 87 seconds** —
+at 28.645 s and 86.859 s — because `log_health` runs from the idle loop and those
+CPUs reached it only when a keystroke happened to wake them. Every other CPU's
+state across 87 s of a freeze investigation is simply absent. With the tick, all
+eight publish `ready`/`parked`/`current` every 10 s regardless of quiescence, so
+the next capture carries a whole-machine census right up to the last flush
+rather than a two-CPU sample taken at the two moments a key arrived.
+
+**The instrument's own risk, stated because it is on the suspect path.** The tick
+makes all eight CPUs run the idle loop ~10×/s where they previously halted, and
+every iteration takes `drain_serial`'s `BackendGuard::lock` — `save_and_cli`
+then an unbounded spin with no deadline and no panic (`serial.rs:97`), the one
+lock §10 calls out for exactly that. On the T14 there is no serial device so each
+hold is an empty drain, but the *acquisition rate with `IF` clear* goes from
+near-zero on an idle machine to ~80/s machine-wide. If the next boot behaves
+differently from these, that is the first thing to suspect, and it is why the
+build carrying this must not be confused with the shipping one.
+
+**So `ran=` was built, and the obvious design would not have served.** That
+design is a per-CPU `(ready, parked, current)` census beside the `TICKED` stamp,
+and it is wrong for a reason worth keeping: a woken task is dispatched within
+microseconds, so `ready=` sampled four times a second reads 0 on a healthy
+machine and 0 on a dead one. **The signal is a rate, so the instrument has to be
+a counter.** `heartbeat::note_dispatch` counts tasks switched onto a CPU — from
+`KernelHw::switch`'s `Some(_)` arm, the one place a task rather than the idle
+context becomes what a CPU is running — and the line carries the machine-wide
+delta since the previous one. Two signatures that used to be one:
+
+- **the line stops** → nothing is scheduling; the machine stopped.
+- **the line continues with `ran=0`** → the machine is scheduling and running
+  nothing. A lost wakeup, or a userland that has stopped asking.
+
+`ran=0` is not self-interpreting and the module doc says so: a machine with
+genuinely nothing to do also runs nothing. It is diagnostic on the T14 because
+that desktop always has something — the compositor wakes about twice a second to
+blink a cursor and every one of those is a dispatch — so a *run* of `ran=0`
+there is a machine that has stopped doing what it was doing. Cross-check against
+the i8042 counter line, which says whether input was arriving meanwhile.
+
+#### The third freeze — the first audio period, and why one signature was not enough
+
+`hda-metal/2026-08-07-183104.log`, 236 lines. **An older image**: flashed after
+H2/H4 landed and *before* M3's shootdown, so the defect it shows may already be
+closed, and it is evidence about the shape rather than about the current tree.
+The HDA driver bound on the T14 — ALC257 found, both codecs walked, speaker pin
+selected, path configured — then `spawn: /bin/tone pid=6` at 3.799 s, `soundd:
+opening stream: 44100Hz 2ch`, `client 0 connected`, `soundd: resumed`, `tone:
+440Hz for 2s`, and nothing ever again. That banner prints *before* the first
+audio callback, so the machine stopped as the HDA DMA stream started.
+
+That makes three metal freezes with three triggers: a process reaching its first
+instruction (~1.36 s), a keypress after 57 s of idle (86.9 s), and a stream's
+first DMA (~3.8 s). The common factor is **something being scheduled or woken**,
+which is #156's own title almost verbatim. Against the instrument as it first
+stood all three would have read `heartbeats stopped at T` — a time and never a
+class. With `ran=` they read as a time *and* one of two classes, which is what
+makes a fourth flash worth more than the third was.
 
 ### FOLLOW-UP — the xHCI driver's waits are spins with preemption disabled, wherever they run
 

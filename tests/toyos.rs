@@ -5863,6 +5863,26 @@ fn run_machine_test(
                      period — the machine stopped reporting for long enough to have died in\n{log}"
                 ));
             }
+            // `ran=` has to be a reading too, and its failure mode is the
+            // opposite of the mask's: a counter that never moves reports a
+            // machine that schedules and runs nothing, which is the second
+            // freeze signature and the one `alive=` cannot carry. This guest
+            // composites, so some window must be nonzero.
+            let rans: Vec<u64> = beats
+                .iter()
+                .filter_map(|l| l.split("ran=").nth(1))
+                .filter_map(|r| r.split_whitespace().next()?.parse().ok())
+                .collect();
+            let moved = rans.iter().filter(|&&r| r > 0).count();
+            if rans.len() != beats.len() || moved == 0 {
+                return Err(format!(
+                    "{} of {} heartbeats carry a readable ran= and {moved} of them are nonzero — \
+                     a counter that never moves cannot tell a machine that stopped scheduling \
+                     from one that schedules and runs nothing\n{log}",
+                    rans.len(),
+                    beats.len(),
+                ));
+            }
             // And the clock in the line advances, or the timestamp cannot
             // localise a death.
             let stamps: Vec<&str> = beats
@@ -5877,7 +5897,8 @@ fn run_machine_test(
                 ));
             }
             eprintln!(
-                "  [heartbeat] {} lines in ~3 s, all alive=8/8, widest gap {worst:.3}s, t={} → t={}",
+                "  [heartbeat] {} lines in ~3 s, all alive=8/8, {moved} with ran>0, widest gap \
+                 {worst:.3}s, t={} → t={}",
                 beats.len(),
                 stamps.first().unwrap_or(&"?"),
                 stamps.last().unwrap_or(&"?")
@@ -8756,7 +8777,10 @@ fn run_debug_mode(c_tests: &[(String, Vec<u8>)], rust_bins: &[(String, Vec<u8>)]
     );
 
     let repo = compile::repo_root();
-    let kernel_elf = repo.join("kernel/target/x86_64-unknown-none/debug/kernel");
+    let kernel_elf = repo.join(format!(
+        "kernel/target/x86_64-unknown-none/{}/kernel",
+        toyos_build::build::PROFILE
+    ));
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");

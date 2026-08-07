@@ -13,7 +13,9 @@
 //! - an initiator writes page tables, then [`Shootdown::issue`] names a
 //!   generation, then it waits until every other CPU has [`Shootdown::served`]
 //!   that generation;
-//! - a target reads what is owed, flushes, and publishes what it read.
+//! - a target reads what is owed, flushes, and publishes what it read;
+//! - and an initiator is a target for the whole of its wait
+//!   ([`Shootdown::wait_turn`]), because nothing else can answer for it.
 //!
 //! **The read is before the flush, and that ordering is the protocol.** A target
 //! that read the counter after flushing could publish a generation whose
@@ -105,5 +107,36 @@ impl Shootdown {
     /// would be a load-bearing omission the moment one does.
     pub fn served(&self, cpu: usize, generation: Generation) -> bool {
         self.flushed[cpu].load(Ordering::Acquire) >= generation.0
+    }
+
+    /// [`serve`](Self::serve) for a CPU that is not taking the interrupt, which
+    /// is the whole of what such a CPU owes the protocol.
+    pub fn serve_if_owed(&self, cpu: usize, flush: impl FnOnce()) {
+        if self.owes(cpu) {
+            self.serve(cpu, flush);
+        }
+    }
+
+    /// One turn of an initiator's wait for `cpu`: answer first, then ask.
+    ///
+    /// **An initiator is a target too**, and until this existed the wait was the
+    /// one place in the protocol that forgot it. Every path that reaches a wait
+    /// has `IF` clear — `arch::syscall`'s `MSR_FMASK` masks it for the whole of
+    /// a syscall and no gate ever sets it — so vector 0xFE cannot be delivered
+    /// to a waiting CPU, and two CPUs that issue concurrently each wait for a
+    /// flush the other can no longer perform.
+    ///
+    /// The order is the fix and not a preference: a wait that asked first would
+    /// leave on its own answer without ever publishing the generation its
+    /// sibling is waiting on.
+    pub fn wait_turn(
+        &self,
+        me: usize,
+        cpu: usize,
+        generation: Generation,
+        flush: impl FnOnce(),
+    ) -> bool {
+        self.serve_if_owed(me, flush);
+        self.served(cpu, generation)
     }
 }
