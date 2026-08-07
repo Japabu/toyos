@@ -20,29 +20,34 @@
 //! waits for it while holding what it is spinning on never finishes — and it
 //! would look exactly like the freeze this stage is a candidate for.
 //!
-//! The `IF=0` windows in this kernel are `drivers::serial`'s `save_and_cli`
-//! around the backend lock, and every IDT gate, which the CPU enters with `IF`
-//! clear. The second is the wide one: **every lock any interrupt or exception
-//! handler takes is in the class**, and that includes the page-fault handler's
-//! address-space and process-data locks and everything a scheduler pass touches
-//! from the timer. So "do not hold a lock a target could be spinning on" cannot
-//! be enumerated once and stay true; it would have to be re-derived every time
-//! somebody added a lock to a handler.
+//! **`IF` is clear for the whole of every syscall** — `arch::syscall`'s
+//! `MSR_FMASK` masks it on the `SYSCALL` gate and nothing sets it again before
+//! `sysretq` — and every IDT gate is entered with it clear too. So the class is
+//! not a window somebody could enumerate: it is every unmap-then-free the kernel
+//! performs, since all of them are reached from a syscall or a fault, plus every
+//! lock any handler takes.
 //!
 //! **So the target answers instead of the initiator abstaining.** `Lock::lock`'s
-//! spin calls [`poll`] on every turn, which serves any outstanding shootdown.
-//! A flush is safe from anywhere — it takes no lock, allocates nothing, and a
-//! CPU that flushes more often than asked is merely slower — so a CPU waiting
-//! for a lock with interrupts disabled acknowledges as promptly as one that took
-//! the interrupt. That closes the class structurally, for locks nobody has
-//! written yet as much as for the ones in the tree today.
+//! spin calls [`poll`] on every turn, and the wait below calls
+//! `Shootdown::wait_turn`, which answers before it asks. A flush is safe from
+//! anywhere — it takes no lock, allocates nothing, and a CPU that flushes more
+//! often than asked is merely slower — so a CPU that cannot take the interrupt
+//! acknowledges as promptly as one that did. That closes the class structurally,
+//! for locks nobody has written yet as much as for the ones in the tree today.
 //!
-//! What is left is an `IF=0` spin that is *not* a `Lock`: a driver waiting on a
-//! device register inside a handler. Those are latency, not deadlock, because
-//! each carries its own deadline — but the deadline can be seconds
-//! (`specs/known-issues.md` §3, xHCI inside `drain_irqs`), so [`ACK_TIMEOUT_NS`]
-//! is set above the largest of them and a CPU past it is named in a panic
-//! rather than waited for forever.
+//! **The initiator's own wait was outside that closure until 2026-08-07 and is
+//! the reason this paragraph is longer than its author left it.** Two CPUs that
+//! issued concurrently each spun for the other's acknowledgement with `IF`
+//! clear and no path left by which either could give one, so both died at the
+//! deadline — reproduced as a double kernel panic and as seven different
+//! wide-phase test failures carrying one signature (`specs/known-issues.md` §3).
+//!
+//! What is left is an `IF=0` spin that is *not* a `Lock` and not this wait: a
+//! driver waiting on a device register inside a handler. Those are latency, not
+//! deadlock, because each carries its own deadline — but the deadline can be
+//! seconds (`specs/known-issues.md` §3, xHCI inside `drain_irqs`), so
+//! [`ACK_TIMEOUT_NS`] is set above the largest of them and a CPU past it is
+//! named in a panic rather than waited for forever.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -92,21 +97,21 @@ const SPINS_PER_DEADLINE_CHECK: u32 = 1024;
 /// from a process that is not the one running here. A CPU-wide flush is correct
 /// under every PCID configuration and is what the targets do anyway.
 pub fn shootdown() {
-    crate::mm::paging::flush_tlb_all();
-
-    if !SIBLINGS_ANSWER.load(Ordering::Acquire) {
-        return;
-    }
     let cpus = smp::cpu_count();
-    if cpus <= 1 {
+    if !SIBLINGS_ANSWER.load(Ordering::Acquire) || cpus <= 1 {
+        crate::mm::paging::flush_tlb_all();
         return;
     }
-    let me = percpu::cpu_id();
+    let me = percpu::cpu_id() as usize;
     let generation = SHOOTDOWN.issue();
+    // The local flush and this CPU's own acknowledgement are one act: a sibling
+    // that issued while this CPU was writing page tables has the same claim on
+    // an answer from here as this one has on an answer from it.
+    SHOOTDOWN.serve(me, crate::mm::paging::flush_tlb_all);
     apic::tlb_ipi();
     for cpu in 0..cpus {
-        if cpu != me {
-            wait_for(cpu, generation);
+        if cpu as usize != me {
+            wait_for(me, cpu, generation);
         }
     }
 }
@@ -119,10 +124,10 @@ pub fn shootdown() {
 /// initiator would hold the one lock a target cannot wait for. The panic at the
 /// deadline is the exception and it is deliberate: by then the wait has already
 /// failed and the machine is going down either way.
-fn wait_for(cpu: u32, generation: Generation) {
+fn wait_for(me: usize, cpu: u32, generation: Generation) {
     let mut spins = 0u32;
     let mut deadline = None;
-    while !SHOOTDOWN.served(cpu as usize, generation) {
+    while !SHOOTDOWN.wait_turn(me, cpu as usize, generation, crate::mm::paging::flush_tlb_all) {
         core::hint::spin_loop();
         spins += 1;
         if spins == SPINS_PER_DEADLINE_CHECK {
@@ -162,9 +167,7 @@ pub fn poll() {
         return;
     }
     let cpu = percpu::cpu_id() as usize;
-    if SHOOTDOWN.owes(cpu) {
-        SHOOTDOWN.serve(cpu, crate::mm::paging::flush_tlb_all);
-    }
+    SHOOTDOWN.serve_if_owed(cpu, crate::mm::paging::flush_tlb_all);
 }
 
 /// A CPU joining the machine settles every shootdown issued while it could not

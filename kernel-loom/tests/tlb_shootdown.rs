@@ -173,3 +173,46 @@ fn one_serve_answers_two_concurrent_shootdowns() {
         "no interleaving completed a wait, so the assertions never ran",
     );
 }
+
+/// A CPU that is waiting for an acknowledgement has not stopped giving them.
+///
+/// **Not an interleaving question, so loom explores nothing here** — the
+/// schedule below is written out because it is the one two CPUs took on
+/// 2026-08-07, and it is the whole defect. `loom::model` is still what wraps it:
+/// this crate compiles `shootdown.rs` against loom's atomics, which panic
+/// outside a model, and the property under test is the protocol's shape rather
+/// than any edge between its atomics.
+///
+/// `IF` is clear for the whole of a syscall (`arch::syscall`'s `MSR_FMASK`), so
+/// neither CPU below can take the other's IPI. Each one's own wait is the only
+/// thing left that can answer the other, and until this test existed the wait
+/// asked without answering: both spun until `ACK_TIMEOUT_NS` killed them, as a
+/// double kernel panic and as seven wide-phase test failures sharing one line.
+#[test]
+fn an_initiator_answers_while_it_waits() {
+    model(|| {
+        let s = Shootdown::new();
+
+        // cpu 0 unmaps and answers for itself; cpu 1 has not issued yet, so the
+        // generation cpu 0 publishes is its own.
+        let g0 = s.issue();
+        s.serve(0, || {});
+
+        // cpu 1 unmaps while cpu 0 is between its own `serve` and its wait.
+        let g1 = s.issue();
+
+        // cpu 0's wait is not satisfied — cpu 1 has not flushed — and that turn
+        // is nevertheless where cpu 1's answer comes from.
+        assert!(!s.wait_turn(0, 1, g0, || {}));
+        assert!(
+            s.served(0, g1),
+            "cpu 0 is waiting for cpu 1 and has stopped answering it, which is \
+             a wait neither CPU can leave",
+        );
+
+        // And cpu 1's own wait then has an answer to find.
+        s.serve(1, || {});
+        assert!(s.wait_turn(1, 0, g1, || {}));
+        assert!(s.wait_turn(0, 1, g0, || {}));
+    });
+}
