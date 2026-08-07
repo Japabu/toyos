@@ -279,7 +279,7 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     };
     log!("xHCI: {irq} enabled (vector {XHCI_VECTOR:#x})");
 
-    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x10000, CachePolicy::DeferToMtrr);
+    let bar = crate::mm::paging::map_mmio(bar_addr, 0x10000, CachePolicy::DeferToMtrr);
 
     let cap_length = bar.read_u8(CAP_CAPLENGTH) as u64;
     let hcsparams1 = bar.read_u32(CAP_HCSPARAMS1);
