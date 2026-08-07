@@ -204,6 +204,13 @@ fn insert_elf_regions(
 /// twice from the same tags, and one of those derivations built a symbol map
 /// that nothing read.
 struct ExeTables {
+    /// `DT_NEEDED` values, as offsets into `dynstr`. Collected while the
+    /// dynamic table is still in hand, and reserved exactly: a table with no
+    /// `DT_NULL` runs to the end of the buffer and every entry in it can be a
+    /// `DT_NEEDED`, which is `len / 16` — half an input that was already
+    /// bounded, rather than a doubling sequence whose last step is larger than
+    /// the input.
+    needed: Vec<u64>,
     dynstr: Vec<u8>,
     dynsym: Vec<u8>,
     symtab_file_off: Option<u64>,
@@ -269,12 +276,15 @@ fn read_exe_tables(
     layout: &Layout,
     path: &str,
 ) -> Result<ExeTables, SyscallError> {
-    let dyn_info = match layout.dynamic {
+    let (dyn_info, needed) = match layout.dynamic {
         Some((dyn_off, _, dyn_size)) => {
             let data = table(backing, path, "PT_DYNAMIC", dyn_off, dyn_size as usize)?;
-            toyos_elf::Dynamic::parse(&data)
+            let mut needed = Vec::new();
+            needed.reserve_exact(data.len() / toyos_elf::dynamic::ENTRY_SIZE);
+            needed.extend(toyos_elf::Dynamic::needed(&data));
+            (toyos_elf::Dynamic::parse(&data), needed)
         }
-        None => toyos_elf::Dynamic::default(),
+        None => (toyos_elf::Dynamic::default(), Vec::new()),
     };
 
     let rela_data = match dyn_info.rela {
@@ -317,7 +327,7 @@ fn read_exe_tables(
         _ => Vec::new(),
     };
 
-    Ok(ExeTables { dynstr, dynsym, symtab_file_off, relas })
+    Ok(ExeTables { needed, dynstr, dynsym, symtab_file_off, relas })
 }
 
 /// `.dynsym`'s entry count, from `.gnu.hash` if the file has one and from the
@@ -686,14 +696,14 @@ struct NeededLibs {
 /// and `/lib` second.
 fn load_needed_libs(exe: &ExeTables, path: &str) -> Result<NeededLibs, SyscallError> {
     let mut out = NeededLibs { libs: Vec::new(), paths: Vec::new() };
-    if exe.dynstr.is_empty() {
+    if exe.needed.is_empty() {
         return Ok(out);
     }
     let exe_dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
 
-    for name_offset in toyos_elf::Dynamic::needed(&exe.dynstr) {
-        // The offsets are into `.dynstr`, which this loop is also reading from,
-        // so a garbage offset is an empty name and not a bounds failure.
+    for &name_offset in &exe.needed {
+        // An offset the string table does not hold is an empty name, not a
+        // bounds failure: nothing is named, so nothing is loaded.
         let lib_name = toyos_elf::cstr(&exe.dynstr, name_offset);
         if lib_name.is_empty() {
             continue;
