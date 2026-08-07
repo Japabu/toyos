@@ -6,8 +6,9 @@
 //!
 //! **Nothing here hands out a reference to user memory.** Small values are
 //! copied ([`SyscallContext::copy_in`], [`SyscallContext::copy_out`]), strings
-//! are copied, and bulk buffers are a [`UserBytes`] window the kernel reads and
-//! writes but never borrows — see that type for why the borrow was the bug.
+//! are copied, and bulk buffers are a [`UserBytes`] / [`UserBytesMut`] window
+//! the kernel reads or writes but never borrows — see [`UserBytes`] for why the
+//! borrow was the bug.
 
 use alloc::string::String;
 use alloc::vec;
@@ -48,6 +49,9 @@ unsafe impl UserSafe for crate::fd::Stat {}
 
 // ABI types.
 unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
+unsafe impl UserSafe for toyos_abi::syscall::SchedInfo {}
+unsafe impl UserSafe for toyos_abi::syscall::ProcessStats {}
+unsafe impl UserSafe for toyos_abi::FramebufferInfo {}
 
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
@@ -108,38 +112,18 @@ impl<'a> SyscallContext<'a> {
         Self { _scope: PhantomData }
     }
 
-    /// Validate a user pointer range and return a shared byte slice.
-    /// The returned slice points into the kernel direct map.
-    ///
-    /// **Being deleted** ([`UserBytes`] says why a `&[u8]` over user memory is
-    /// a lie). What is left of it is the read and write path — `fd::try_read`
-    /// and `fd::try_write` down to their per-descriptor leaves — which is M1b's
-    /// second half in `specs/memory-boundary-spec.md` §3.1.
-    pub fn user_slice(&self, ptr: UserAddr, len: u64) -> Option<&'a [u8]> {
-        let len = len as usize;
-        if len == 0 {
-            return Some(&[]);
-        }
-        let kptr = window(ptr, len)?;
-        Some(unsafe { core::slice::from_raw_parts(kptr as *const u8, len) })
-    }
-
-    /// Validate a user pointer range and return a mutable byte slice.
-    /// Same contiguity constraints, and the same deletion, as [`Self::user_slice`].
-    pub fn user_slice_mut(&self, ptr: UserAddr, len: u64) -> Option<&'a mut [u8]> {
-        let len = len as usize;
-        if len == 0 {
-            return Some(&mut []);
-        }
-        let kptr = window(ptr, len)?;
-        Some(unsafe { core::slice::from_raw_parts_mut(kptr, len) })
-    }
-
-    /// A bulk buffer the kernel may read and write but not borrow.
+    /// A bulk buffer the kernel reads out of and never borrows.
     pub fn user_bytes(&self, ptr: UserAddr, len: u64) -> Option<UserBytes<'a>> {
         let len = len as usize;
         let kptr = if len == 0 { core::ptr::NonNull::dangling().as_ptr() } else { window(ptr, len)? };
         Some(UserBytes { kptr, len, _scope: PhantomData })
+    }
+
+    /// A bulk buffer the kernel writes into and never borrows.
+    pub fn user_bytes_mut(&self, ptr: UserAddr, len: u64) -> Option<UserBytesMut<'a>> {
+        let len = len as usize;
+        let kptr = if len == 0 { core::ptr::NonNull::dangling().as_ptr() } else { window(ptr, len)? };
+        Some(UserBytesMut { kptr, len, _scope: PhantomData })
     }
 
     /// Copy a user string of at most [`MAX_USER_STR`] bytes into kernel memory.
@@ -165,7 +149,7 @@ impl<'a> SyscallContext<'a> {
     /// A copy rather than a borrow: a `&T` over a page userland can still write
     /// is a claim the compiler enforces and the hardware does not, and the
     /// kernel would be reading a value that can change between two of its own
-    /// reads. Every `UserSafe` type is at most 48 bytes, so the copy costs less
+    /// reads. Every `UserSafe` type is at most 128 bytes, so the copy costs less
     /// than the second lock-and-translate the borrow already paid.
     pub fn copy_in<T: UserSafe>(&self, ptr: UserAddr) -> Result<T, SyscallError> {
         let kptr = object::<T>(ptr)?;
@@ -192,8 +176,7 @@ impl<'a> SyscallContext<'a> {
     }
 }
 
-/// A bulk buffer in user memory: the kernel reads and writes it, and never
-/// borrows it.
+/// A bulk buffer in user memory the kernel copies *out of*, and never borrows.
 ///
 /// **The borrow was the bug.** A `&[u8]` or `&mut [u8]` over a page userland
 /// can write carries `noalias` and `dereferenceable` into LLVM, so the compiler
@@ -205,12 +188,12 @@ impl<'a> SyscallContext<'a> {
 /// are two reads of the same reference and nothing stops the compiler undoing
 /// the split.
 ///
-/// So this type hands out no reference. `read_at` and `write_at` are raw
-/// `copy_nonoverlapping`s between kernel memory and the window, which is what
-/// the bytes are: a snapshot as of the moment the kernel looked, exactly like a
-/// device read, with no promise of stability attached. A torn buffer is then a
-/// *value* the caller has to be prepared for, and the kernel is prepared for it
-/// by never deciding anything twice from the same window.
+/// So this type hands out no reference. `read_at` is a raw
+/// `copy_nonoverlapping` out of the window, which is what the bytes are: a
+/// snapshot as of the moment the kernel looked, exactly like a device read,
+/// with no promise of stability attached. A torn buffer is then a *value* the
+/// caller has to be prepared for, and the kernel is prepared for it by never
+/// deciding anything twice from the same window.
 ///
 /// Not per-byte volatile, deliberately: volatile buys nothing here that the
 /// absence of a reference has not already bought — a data race is a data race
@@ -219,10 +202,15 @@ impl<'a> SyscallContext<'a> {
 ///
 /// The window is physically contiguous, proven at every 2 MiB boundary when it
 /// is built, which is what makes an offset into it mean anything.
+///
+/// Read-only, and [`UserBytesMut`] is the other direction, because `&[u8]` and
+/// `&mut [u8]` told a syscall's two paths apart and a single type would not:
+/// `SYS_WRITE`'s buffer is the caller's to read and nothing below `fd::try_write`
+/// has any business storing into it.
 pub struct UserBytes<'a> {
-    kptr: *mut u8,
+    kptr: *const u8,
     len: usize,
-    _scope: PhantomData<&'a mut ()>,
+    _scope: PhantomData<&'a ()>,
 }
 
 impl UserBytes<'_> {
@@ -251,17 +239,103 @@ impl UserBytes<'_> {
         }
     }
 
+    /// The `len`-byte window at `off` inside this one — what `buf[a..b]` was.
+    pub fn sub(&self, off: usize, len: usize) -> UserBytes<'_> {
+        assert!(
+            off.checked_add(len).is_some_and(|end| end <= self.len),
+            "UserBytes::sub {off}+{len} past a {}-byte window",
+            self.len
+        );
+        UserBytes { kptr: unsafe { self.kptr.add(off) }, len, _scope: PhantomData }
+    }
+}
+
+/// A bulk buffer in user memory the kernel copies *into*. [`UserBytes`] carries
+/// the argument for why neither hands out a reference.
+///
+/// Write-only, which is one property stronger than `&mut [u8]` was: a kernel
+/// that never reads back what it put in a user buffer cannot be made to act on
+/// a value another thread of that process substituted in between.
+pub struct UserBytesMut<'a> {
+    kptr: *mut u8,
+    len: usize,
+    _scope: PhantomData<&'a mut ()>,
+}
+
+impl UserBytesMut<'_> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Copy `src` into the window at `off`.
-    pub fn write_at(&self, off: usize, src: &[u8]) {
+    ///
+    /// The bound is an assertion for the same reason [`UserBytes::read_at`]'s
+    /// is: userland chose the size and the kernel computed the offset.
+    pub fn write_at(&mut self, off: usize, src: &[u8]) {
         assert!(
             off.checked_add(src.len()).is_some_and(|end| end <= self.len),
-            "UserBytes::write_at {off}+{} past a {}-byte window",
+            "UserBytesMut::write_at {off}+{} past a {}-byte window",
             src.len(),
             self.len
         );
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), self.kptr.add(off), src.len());
         }
+    }
+
+    /// Zero `len` bytes of the window at `off`.
+    pub fn fill_zero(&mut self, off: usize, len: usize) {
+        assert!(
+            off.checked_add(len).is_some_and(|end| end <= self.len),
+            "UserBytesMut::fill_zero {off}+{len} past a {}-byte window",
+            self.len
+        );
+        unsafe { core::ptr::write_bytes(self.kptr.add(off), 0, len) };
+    }
+
+    /// The `len`-byte window at `off` inside this one — what `buf[a..b]` was.
+    pub fn sub(&mut self, off: usize, len: usize) -> UserBytesMut<'_> {
+        assert!(
+            off.checked_add(len).is_some_and(|end| end <= self.len),
+            "UserBytesMut::sub {off}+{len} past a {}-byte window",
+            self.len
+        );
+        UserBytesMut { kptr: unsafe { self.kptr.add(off) }, len, _scope: PhantomData }
+    }
+}
+
+/// Bytes the kernel copies *from*, wherever they live.
+///
+/// Exists for one caller: `file_cache::write_page` is reached both by a syscall
+/// carrying a [`UserBytes`] window and by `log_file`, whose bytes are the
+/// kernel's own. A slice cannot express the first and this type cannot express
+/// the second, so the page cache names the capability it actually needs.
+pub trait ByteSource {
+    fn len(&self) -> usize;
+    fn read_at(&self, off: usize, dst: &mut [u8]);
+}
+
+impl ByteSource for [u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn read_at(&self, off: usize, dst: &mut [u8]) {
+        dst.copy_from_slice(&self[off..off + dst.len()]);
+    }
+}
+
+impl ByteSource for UserBytes<'_> {
+    fn len(&self) -> usize {
+        UserBytes::len(self)
+    }
+
+    fn read_at(&self, off: usize, dst: &mut [u8]) {
+        UserBytes::read_at(self, off, dst);
     }
 }
 

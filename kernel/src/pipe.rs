@@ -14,6 +14,7 @@ use crate::io_uring::RingId;
 use crate::process::Pid;
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
+use crate::user_ptr::{UserBytes, UserBytesMut};
 use crate::DirectMap;
 
 // PipeId — raw identifier, Copy, used internally for lookups and in
@@ -239,11 +240,20 @@ pub fn map_page(pipe_id: PipeId) -> Option<DirectMap> {
     with_pipes_mut(|pipes| Some(pipes.get_mut(pipe_id)?.back()?.page.direct_map()))
 }
 
-pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
+pub fn try_read(pipe_id: PipeId, buf: &mut UserBytesMut) -> Option<usize> {
     let (result, boost) = with_pipes_mut(|pipes| {
         let Some(pipe) = pipes.get_mut(pipe_id) else { return (None, false) };
         if pipe.available() > 0 {
-            let n = pipe.backing.as_mut().expect("available() > 0 implies a ring").ring.read(buf);
+            let ring = &mut pipe.backing.as_mut().expect("available() > 0 implies a ring").ring;
+            let mut chunk = [0u8; 4096];
+            let mut n = 0;
+            while n < buf.len() {
+                let take = chunk.len().min(buf.len() - n);
+                let got = ring.read(&mut chunk[..take]);
+                if got == 0 { break }
+                buf.write_at(n, &chunk[..got]);
+                n += got;
+            }
             let boost = pipe.rt_boost_pending;
             pipe.rt_boost_pending = false;
             (Some(n), boost)
@@ -270,7 +280,7 @@ pub enum PipeWrite {
     NoMemory,
 }
 
-pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
+pub fn try_write(pipe_id: PipeId, buf: &UserBytes) -> Option<PipeWrite> {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id)?;
         if pipe.readers == 0 {
@@ -280,7 +290,16 @@ pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
             return Some(PipeWrite::NoMemory);
         };
         if backing.ring.space() > 0 {
-            Some(PipeWrite::Wrote(backing.ring.write(buf)))
+            let mut chunk = [0u8; 4096];
+            let mut n = 0;
+            while n < buf.len() {
+                let take = chunk.len().min(buf.len() - n);
+                buf.read_at(n, &mut chunk[..take]);
+                let put = backing.ring.write(&chunk[..take]);
+                n += put;
+                if put < take { break }
+            }
+            Some(PipeWrite::Wrote(n))
         } else {
             None
         }
