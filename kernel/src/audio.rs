@@ -119,7 +119,7 @@ pub fn submit_buffer(idx: usize, len: u32) -> bool {
 /// Copy up to `buf.len() / 16` pending completion records into `buf`
 /// (oldest first) and recycle their descriptors. Returns bytes written;
 /// 0 means nothing pending.
-pub fn drain_completed(buf: &mut [u8]) -> usize {
+pub fn drain_completed(buf: &mut crate::user_ptr::UserBytesMut) -> usize {
     let max = buf.len() / AudioCompletionRecord::SIZE;
     let mut guard = AUDIO.lock();
     // The audio fd only exists once the device was claimed, which requires
@@ -131,9 +131,10 @@ pub fn drain_completed(buf: &mut [u8]) -> usize {
         let Some(rec) = pop_completion() else { break };
         ctrl.recycle(rec.mask);
         // Field-wise serialization — never expose struct padding.
-        buf[written..written + 4].copy_from_slice(&rec.mask.to_le_bytes());
-        buf[written + 4..written + 8].copy_from_slice(&0u32.to_le_bytes());
-        buf[written + 8..written + 16].copy_from_slice(&rec.timestamp_nanos.to_le_bytes());
+        let mut record = [0u8; AudioCompletionRecord::SIZE];
+        record[0..4].copy_from_slice(&rec.mask.to_le_bytes());
+        record[8..16].copy_from_slice(&rec.timestamp_nanos.to_le_bytes());
+        buf.write_at(written, &record);
         written += AudioCompletionRecord::SIZE;
     }
     written

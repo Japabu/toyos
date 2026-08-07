@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use super::{apic, cpu, gdt};
 use crate::drivers::acpi;
 use crate::mm::paging::CachePolicy;
-use crate::user_ptr::SyscallContext;
+use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
 use crate::{device, fd, listener, log, pipe, process, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
 
@@ -227,17 +227,17 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 
     let result = match num {
         SYS_WRITE => {
-            let Some(buf) = ctx.user_slice(UserAddr::new(a2), a3) else { return bad_addr };
-            sys_write(a1 as u32, buf)
+            let Some(buf) = ctx.user_bytes(UserAddr::new(a2), a3) else { return bad_addr };
+            sys_write(a1 as u32, &buf)
         }
         SYS_READ => {
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a2), a3) else { return bad_addr };
-            sys_read(a1 as u32, buf)
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a2), a3) else { return bad_addr };
+            sys_read(a1 as u32, &mut buf)
         }
         SYS_THREAD_EXIT => sys_thread_exit(a1 as i32),
         SYS_RANDOM => {
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
-            sys_random(buf)
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
+            sys_random(&mut buf)
         }
         SYS_CLOCK => crate::clock::nanos_since_boot(),
         SYS_OPEN => {
@@ -267,8 +267,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_FSYNC => process::with_fd_owner_data(|data| fd::fsync(&mut data.fds, &mut *vfs::lock(), a1 as u32)),
         SYS_READDIR => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a3), a4) else { return bad_addr };
-            sys_readdir(&path, buf)
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a3), a4) else { return bad_addr };
+            sys_readdir(&path, &mut buf)
         }
         SYS_DELETE => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
@@ -289,8 +289,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_chdir(&path)
         }
         SYS_GETCWD => {
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
-            sys_getcwd(buf)
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
+            sys_getcwd(&mut buf)
         }
         SYS_PIPE => sys_pipe(),
         SYS_SPAWN => {
@@ -381,8 +381,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             crate::clock::utc_secs().map_or(SyscallError::NotSupported.to_u64(), |secs| secs)
         }
         SYS_SYSINFO => {
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
-            sys_sysinfo(buf)
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
+            sys_sysinfo(&mut buf)
         }
         SYS_NANOSLEEP => sys_nanosleep(a1),
         SYS_DUP => sys_dup(a1 as u32),
@@ -448,12 +448,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_MUNMAP => sys_munmap(a1, a2),
         SYS_KILL => process::kill_process(process::Pid::from_raw(a1 as u32)),
         SYS_READ_NONBLOCK => {
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a2), a3) else { return bad_addr };
-            sys_read_nonblock(a1 as u32, buf)
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a2), a3) else { return bad_addr };
+            sys_read_nonblock(a1 as u32, &mut buf)
         }
         SYS_WRITE_NONBLOCK => {
-            let Some(buf) = ctx.user_slice(UserAddr::new(a2), a3) else { return bad_addr };
-            sys_write_nonblock(a1 as u32, buf)
+            let Some(buf) = ctx.user_bytes(UserAddr::new(a2), a3) else { return bad_addr };
+            sys_write_nonblock(a1 as u32, &buf)
         }
         SYS_PIPE_OPEN => sys_pipe_open(a1, a2),
         SYS_PIPE_ID => sys_pipe_id(a1 as u32),
@@ -474,9 +474,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             if a2 == 0 {
                 env.len() as u64
             } else {
-                let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
+                let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
                 let copy_len = env.len().min(buf.len());
-                buf[..copy_len].copy_from_slice(&env[..copy_len]);
+                buf.write_at(0, &env[..copy_len]);
                 copy_len as u64
             }
         }
@@ -516,8 +516,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_READLINK => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a3), a4) else { return bad_addr };
-            sys_readlink(&path, buf)
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a3), a4) else { return bad_addr };
+            sys_readlink(&path, &mut buf)
         }
         SYS_GPU_SET_RESOLUTION => {
             // Checked before the driver, so a non-claimant never gets its two
@@ -526,8 +526,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             if !device::is_owner(device::DEVICE_FRAMEBUFFER, pid) {
                 return SyscallError::PermissionDenied.to_u64();
             }
-            let info_size = core::mem::size_of::<fd::FramebufferInfo>() as u64;
-            let Some(out_buf) = ctx.user_slice_mut(UserAddr::new(a3), info_size) else { return bad_addr };
+            // Checked before the allocation for the same reason the ownership
+            // is: a caller that named an address the kernel will not write to
+            // must not be left with a resolution it is never told about.
+            let Some(info_out) = UserAddr::checked(a3) else { return bad_addr };
             match crate::gpu::set_resolution(a1 as u32, a2 as u32) {
                 Ok(gpu_info) => {
                     let fb_info = fd::FramebufferInfo {
@@ -548,8 +550,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                     if shared_memory::grant_kernel(gpu_info.cursor_token, pid).is_err() {
                         return SyscallError::Unknown.to_u64();
                     }
-                    out_buf.copy_from_slice(fb_info.as_bytes());
-                    0
+                    match ctx.copy_out(info_out, &fb_info) {
+                        Ok(()) => 0,
+                        Err(e) => e.to_u64(),
+                    }
                 }
                 Err(e) => e.to_u64(),
             }
@@ -567,8 +571,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_IO_URING_SETUP => sys_io_uring_setup(a1 as u32),
         SYS_IO_URING_ENTER => sys_io_uring_enter(a1 as u32, a2 as u32, a3 as u32, a4),
         SYS_QUERY_MODULES => {
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
-            sys_query_modules(buf)
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
+            sys_query_modules(&mut buf)
         }
         SYS_DEBUG => match a1 {
             0 => panic!("SYS_DEBUG: kernel panic triggered by userspace"),
@@ -648,28 +652,24 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             11 => canary::changed() as u64,
             _ => SyscallError::InvalidArgument.to_u64(),
         },
-        SYS_SCHED_INFO => {
-            let info_size = core::mem::size_of::<toyos_abi::syscall::SchedInfo>() as u64;
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), info_size) else {
-                return bad_addr;
-            };
-            let out = unsafe { &mut *(buf.as_mut_ptr() as *mut toyos_abi::syscall::SchedInfo) };
-            sys_sched_info(out)
+        SYS_SCHED_INFO => match ctx.copy_out(UserAddr::new(a1), &sys_sched_info()) {
+            Ok(()) => 0,
+            Err(e) => e.to_u64(),
         },
         SYS_PROCESS_STATS => {
             let stats_size = core::mem::size_of::<toyos_abi::syscall::ProcessStats>() as u64;
             if a3 < stats_size { return SyscallError::InvalidArgument.to_u64(); }
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a2), stats_size) else {
-                return bad_addr;
-            };
-            let out = unsafe { &mut *(buf.as_mut_ptr() as *mut toyos_abi::syscall::ProcessStats) };
-            sys_process_stats(process::Pid::from_raw(a1 as u32), out)
+            let Some(addr) = UserAddr::checked(a2) else { return bad_addr };
+            sys_process_stats(&ctx, process::Pid::from_raw(a1 as u32), addr)
         },
         SYS_SET_THREAD_NAME => {
-            let Some(name) = ctx.user_slice(UserAddr::new(a1), a2.min(28)) else {
+            let len = (a2 as usize).min(process::THREAD_NAME_LEN);
+            let Some(bytes) = ctx.user_bytes(UserAddr::new(a1), len as u64) else {
                 return bad_addr;
             };
-            process::set_current_thread_name(name);
+            let mut name = [0u8; process::THREAD_NAME_LEN];
+            bytes.read_at(0, &mut name[..len]);
+            process::set_current_thread_name(&name[..len]);
             0
         },
         SYS_SET_RT_PRIORITY => {
@@ -699,7 +699,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     result
 }
 
-fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
+fn sys_write(fd_num: u32, buf: &UserBytes) -> u64 {
     loop {
         let action = process::with_fd_owner_data(|data| {
             match fd::try_write(&mut data.fds, fd_num, buf) {
@@ -733,7 +733,7 @@ enum ReadBlock {
     Keyboard(u64),
 }
 
-fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
+fn sys_read(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
     loop {
         let action = process::with_fd_owner_data(|data| {
             match fd::try_read(&mut data.fds, fd_num, buf) {
@@ -825,16 +825,16 @@ fn sys_exit(code: i32) -> u64 {
     process::exit(code);
 }
 
-fn sys_random(buf: &mut [u8]) -> u64 {
+fn sys_random(out: &mut UserBytesMut) -> u64 {
     let mut i = 0;
-    while i + 8 <= buf.len() {
-        buf[i..i + 8].copy_from_slice(&cpu::rdrand().to_ne_bytes());
+    while i + 8 <= out.len() {
+        out.write_at(i, &cpu::rdrand().to_ne_bytes());
         i += 8;
     }
-    let remaining = buf.len() - i;
+    let remaining = out.len() - i;
     if remaining > 0 {
         let bytes = cpu::rdrand().to_ne_bytes();
-        buf[i..].copy_from_slice(&bytes[..remaining]);
+        out.write_at(i, &bytes[..remaining]);
     }
     0
 }
@@ -853,7 +853,7 @@ fn sys_random(buf: &mut [u8]) -> u64 {
 /// `n > buf.len()` means nothing was written and `n` is what to allocate.
 /// Refusing to write a partial answer is the point — a caller that ignores
 /// the return still gets zeroes rather than a plausible short listing.
-fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
+fn sys_readdir(path: &str, out: &mut UserBytesMut) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let entries = match vfs::lock().list(&cwd, path) {
         Ok(e) => e,
@@ -863,7 +863,7 @@ fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
     // A directory name is stored with its trailing slash and encoded without.
     let encoded = |name: &alloc::string::String| 1 + name.trim_end_matches('/').len() + 1 + 8;
     let needed: usize = entries.iter().map(|(name, _)| encoded(name)).sum();
-    if needed > buf.len() {
+    if needed > out.len() {
         return needed as u64;
     }
 
@@ -871,13 +871,13 @@ fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
     for (name, size) in &entries {
         let is_dir = name.ends_with('/');
         let clean_name = if is_dir { &name[..name.len() - 1] } else { name.as_str() };
-        buf[pos] = if is_dir { 2 } else { 1 };
+        out.write_at(pos, &[if is_dir { 2 } else { 1 }]);
         pos += 1;
-        buf[pos..pos + clean_name.len()].copy_from_slice(clean_name.as_bytes());
+        out.write_at(pos, clean_name.as_bytes());
         pos += clean_name.len();
-        buf[pos] = 0;
+        out.write_at(pos, &[0]);
         pos += 1;
-        buf[pos..pos + 8].copy_from_slice(&size.to_le_bytes());
+        out.write_at(pos, &size.to_le_bytes());
         pos += 8;
     }
     debug_assert_eq!(pos, needed);
@@ -926,16 +926,16 @@ fn sys_chdir(path: &str) -> u64 {
 /// wrong directory, and leaving one in the caller's buffer invites its use.
 ///
 /// An empty buffer is therefore a size query, which falls out rather than
-/// being bolted on: the dispatch hands `user_slice_mut` a zero length back as
-/// an empty slice, so `getcwd(NULL, 0)` reports the length and touches nothing.
+/// being bolted on: the dispatch hands `user_bytes_mut` a zero length back as
+/// an empty window, so `getcwd(NULL, 0)` reports the length and touches nothing.
 ///
 /// `vfs::MAX_PATH` bounds `cwd`, so the required length is always far below the
 /// range `SyscallError` encodes and can never be misread as one.
-fn sys_getcwd(buf: &mut [u8]) -> u64 {
+fn sys_getcwd(out: &mut UserBytesMut) -> u64 {
     process::with_fd_owner_data(|data| {
         let cwd = data.cwd.as_bytes();
-        if cwd.len() <= buf.len() {
-            buf[..cwd.len()].copy_from_slice(cwd);
+        if cwd.len() <= out.len() {
+            out.write_at(0, cwd);
         }
         cwd.len() as u64
     })
@@ -1100,7 +1100,7 @@ fn sys_socket_create(rx_pipe_id_raw: u64, tx_pipe_id_raw: u64) -> u64 {
     })
 }
 
-fn sys_read_nonblock(fd_num: u32, buf: &mut [u8]) -> u64 {
+fn sys_read_nonblock(fd_num: u32, buf: &mut UserBytesMut) -> u64 {
     let result = process::with_fd_owner_data(|data| {
         let r = fd::try_read(&mut data.fds, fd_num, buf);
         let wake = data.fds.get(fd_num).and_then(|d| d.pipe_id_read());
@@ -1115,7 +1115,7 @@ fn sys_read_nonblock(fd_num: u32, buf: &mut [u8]) -> u64 {
     }
 }
 
-fn sys_write_nonblock(fd_num: u32, buf: &[u8]) -> u64 {
+fn sys_write_nonblock(fd_num: u32, buf: &UserBytes) -> u64 {
     let result = process::with_fd_owner_data(|data| {
         let r = fd::try_write(&mut data.fds, fd_num, buf);
         let wake = data.fds.get(fd_num).and_then(|d| d.pipe_id_write());
@@ -1564,10 +1564,10 @@ const MAX_SYSINFO_THREADS: usize = 65_536;
 #[cfg(feature = "test-heap-ceiling")]
 const MAX_SYSINFO_THREADS: usize = 16;
 
-fn sys_sysinfo(buf: &mut [u8]) -> u64 {
+fn sys_sysinfo(out: &mut UserBytesMut) -> u64 {
     const HEADER_SIZE: usize = 48;
     const ENTRY_SIZE: usize = 64;
-    if buf.len() < HEADER_SIZE {
+    if out.len() < HEADER_SIZE {
         return SyscallError::InvalidArgument.to_u64();
     }
 
@@ -1585,15 +1585,17 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         return SyscallError::ResourceExhausted.to_u64();
     }
 
-    buf[0..8].copy_from_slice(&total_mem.to_le_bytes());
-    buf[8..16].copy_from_slice(&used_mem.to_le_bytes());
-    buf[16..20].copy_from_slice(&cpu_count.to_le_bytes());
-    buf[20..24].copy_from_slice(&entry_count.to_le_bytes());
-    buf[24..32].copy_from_slice(&uptime.to_le_bytes());
-    buf[32..40].copy_from_slice(&total_cpu_ns.to_le_bytes());
-    buf[40..48].copy_from_slice(&total_available_ns.to_le_bytes());
+    let mut header = [0u8; HEADER_SIZE];
+    header[0..8].copy_from_slice(&total_mem.to_le_bytes());
+    header[8..16].copy_from_slice(&used_mem.to_le_bytes());
+    header[16..20].copy_from_slice(&cpu_count.to_le_bytes());
+    header[20..24].copy_from_slice(&entry_count.to_le_bytes());
+    header[24..32].copy_from_slice(&uptime.to_le_bytes());
+    header[32..40].copy_from_slice(&total_cpu_ns.to_le_bytes());
+    header[40..48].copy_from_slice(&total_available_ns.to_le_bytes());
+    out.write_at(0, &header);
 
-    let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
+    let max_entries = (out.len() - HEADER_SIZE) / ENTRY_SIZE;
 
     // Collect and sort by (pid, tid) for stable output. Reserved exactly from
     // the count above, so the buffer is `entry_count * 24` and not whatever
@@ -1634,16 +1636,16 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
 
         let name = if thread.name()[0] != 0 { thread.name() } else { proc.name() };
 
-        buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());
-        buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.raw().to_le_bytes());
-        buf[pos + 8..pos + 12].copy_from_slice(&tid.raw().to_le_bytes());
-        buf[pos + 12] = state;
-        buf[pos + 13] = is_thread;
-        buf[pos + 14..pos + 16].copy_from_slice(&[0, 0]);
-        buf[pos + 16..pos + 24].copy_from_slice(&memory.to_le_bytes());
-        buf[pos + 24..pos + 32].copy_from_slice(&cpu_ns.to_le_bytes());
-        buf[pos + 32..pos + 60].copy_from_slice(name);
-        buf[pos + 60..pos + 64].copy_from_slice(&[0, 0, 0, 0]);
+        let mut entry = [0u8; ENTRY_SIZE];
+        entry[0..4].copy_from_slice(&pid.raw().to_le_bytes());
+        entry[4..8].copy_from_slice(&parent_pid.raw().to_le_bytes());
+        entry[8..12].copy_from_slice(&tid.raw().to_le_bytes());
+        entry[12] = state;
+        entry[13] = is_thread;
+        entry[16..24].copy_from_slice(&memory.to_le_bytes());
+        entry[24..32].copy_from_slice(&cpu_ns.to_le_bytes());
+        entry[32..60].copy_from_slice(name);
+        out.write_at(pos, &entry);
 
         pos += ENTRY_SIZE;
     }
@@ -1750,15 +1752,15 @@ fn sys_symlink(target: &str, link: &str) -> u64 {
     }
 }
 
-fn sys_readlink(path: &str, buf: &mut [u8]) -> u64 {
+fn sys_readlink(path: &str, out: &mut UserBytesMut) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     match vfs.read_link(&resolved) {
         Ok(Some(target)) => {
             let bytes = target.as_bytes();
-            let len = bytes.len().min(buf.len());
-            buf[..len].copy_from_slice(&bytes[..len]);
+            let len = bytes.len().min(out.len());
+            out.write_at(0, &bytes[..len]);
             len as u64
         }
         Ok(None) => SyscallError::NotFound.to_u64(),
@@ -2037,23 +2039,35 @@ fn sys_io_uring_enter(ring_fd: u32, to_submit: u32, min_complete: u32, timeout_n
     }
 }
 
-fn sys_sched_info(out: &mut toyos_abi::syscall::SchedInfo) -> u64 {
+fn sys_sched_info() -> toyos_abi::syscall::SchedInfo {
     let pid = process::current_process();
-    out.vruntime = crate::scheduler::process_vruntime(pid);
-    out.min_vruntime = crate::scheduler::global_min_vruntime();
-    out.lag = crate::scheduler::process_lag(pid);
-    0
+    toyos_abi::syscall::SchedInfo {
+        vruntime: crate::scheduler::process_vruntime(pid),
+        min_vruntime: crate::scheduler::global_min_vruntime(),
+        lag: crate::scheduler::process_lag(pid),
+    }
 }
 
-fn sys_process_stats(child_pid: process::Pid, out: &mut toyos_abi::syscall::ProcessStats) -> u64 {
+/// Hand the caller its exited child's accounting snapshot, which it may read
+/// exactly once.
+///
+/// Copied out before it is removed, because the removal is what makes this the
+/// only chance to read it: a write the kernel refused after taking the snapshot
+/// would leave nobody able to ask again.
+fn sys_process_stats(
+    ctx: &crate::user_ptr::SyscallContext,
+    child_pid: process::Pid,
+    out: UserAddr,
+) -> u64 {
     let snap = process::with_fd_owner_data(|data| {
-        let pos = data.child_stats.iter().position(|(pid, _)| *pid == child_pid);
-        pos.map(|i| data.child_stats.remove(i).1)
+        data.child_stats.iter().find(|(pid, _)| *pid == child_pid).map(|(_, s)| *s)
     });
-    match snap {
-        Some(s) => { *out = s; 0 }
-        None => SyscallError::NotFound.to_u64(),
+    let Some(stats) = snap else { return SyscallError::NotFound.to_u64() };
+    if let Err(e) = ctx.copy_out(out, &stats) {
+        return e.to_u64();
     }
+    process::with_fd_owner_data(|data| data.child_stats.retain(|(pid, _)| *pid != child_pid));
+    0
 }
 
 /// Describe every loaded module into `buf`; return the length it *needs*.
@@ -2075,9 +2089,16 @@ fn sys_process_stats(child_pid: process::Pid, out: &mut toyos_abi::syscall::Proc
 /// Every module holds address space for as long as it is loaded, so the count
 /// is bounded by the process's own arena and the required length stays far
 /// below the range `SyscallError` encodes — it can never be misread as one.
-fn sys_query_modules(buf: &mut [u8]) -> u64 {
+fn sys_query_modules(out: &mut UserBytesMut) -> u64 {
     use toyos_abi::syscall::ModuleInfo;
     let info_size = core::mem::size_of::<ModuleInfo>();
+
+    // The record is `#[repr(C)]` over five integers with no padding, so its
+    // bytes are its fields — the alternative is a per-field encoder for a
+    // layout the ABI already fixes.
+    fn encode(info: &ModuleInfo) -> [u8; core::mem::size_of::<ModuleInfo>()] {
+        unsafe { core::mem::transmute_copy(info) }
+    }
 
     process::with_fd_owner_data(|data| {
         let module_count = 1 + data.elf.loaded_libs.len();
@@ -2087,7 +2108,7 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
             + data.elf.lib_paths.iter().map(|p| p.as_bytes().len()).sum::<usize>();
 
         let required = module_count * info_size + total_path_bytes;
-        if buf.len() < required {
+        if out.len() < required {
             return required as u64;
         }
 
@@ -2102,11 +2123,8 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
             path_offset,
             path_len: exe_path_bytes.len() as u32,
         };
-        buf[..info_size].copy_from_slice(unsafe {
-            core::slice::from_raw_parts(&exe_info as *const ModuleInfo as *const u8, info_size)
-        });
-        buf[path_offset as usize..path_offset as usize + exe_path_bytes.len()]
-            .copy_from_slice(exe_path_bytes);
+        out.write_at(0, &encode(&exe_info));
+        out.write_at(path_offset as usize, exe_path_bytes);
         path_offset += exe_path_bytes.len() as u32;
 
         for (i, lib) in data.elf.loaded_libs.iter().enumerate() {
@@ -2125,12 +2143,8 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
                 path_offset,
                 path_len: lib_path_bytes.len() as u32,
             };
-            let off = (1 + i) * info_size;
-            buf[off..off + info_size].copy_from_slice(unsafe {
-                core::slice::from_raw_parts(&lib_info as *const ModuleInfo as *const u8, info_size)
-            });
-            buf[path_offset as usize..path_offset as usize + lib_path_bytes.len()]
-                .copy_from_slice(lib_path_bytes);
+            out.write_at((1 + i) * info_size, &encode(&lib_info));
+            out.write_at(path_offset as usize, lib_path_bytes);
             path_offset += lib_path_bytes.len() as u32;
         }
 
