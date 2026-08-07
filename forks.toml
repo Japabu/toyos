@@ -26,14 +26,21 @@
 # A fork being sendable is not the same as it being *worth* sending. See memmap2
 # below: purely additive, unblocked, and still a bad PR.
 #
-# `delta` is `git diff --shortstat <base>..<branch>`, re-measured 2026-07-28.
-# The numbers before that date were inflated by vendoring cruft — gutted upstream
-# READMEs (memmap2's deleted the upstream authors' copyright notices) and stray
-# .gitignore entries — which has now been reverted everywhere. The invariant is
-# that base..branch contains no hunk an upstream PR would not: check with
-#   git diff <base>..<branch> -- README* LICENSE* COPYRIGHT NOTICE .gitignore
-# and expect empty. Fork identity lives in each repo's GitHub description, which
-# costs no diff.
+# `delta` is `git diff --shortstat <base>..origin/<branch>`, re-measured
+# 2026-08-07, and it describes the *branch head* rather than whatever a lockfile
+# pins. The numbers before 2026-07-28 were inflated by vendoring cruft — gutted
+# upstream READMEs (memmap2's deleted the upstream authors' copyright notices)
+# and stray .gitignore entries — which has now been reverted everywhere. The
+# invariant is that base..branch contains no hunk an upstream PR would not:
+#   git diff <base>..origin/<branch> -- README* LICENSE* COPYRIGHT NOTICE .gitignore
+# and expect empty. It was empty for all sixteen branches on 2026-08-07.
+# Fork identity lives in each repo's GitHub description, which costs no diff.
+#
+# Where a fork has an open PR, the fork repo carries a *second* branch at the PR
+# head, named below as `pr_branch`. It is not redundant with `toyos`: the PR sits
+# on whatever upstream commit the maintainer wants and carries only PR content,
+# while `toyos` stays on `base` and may carry local-build accommodations that
+# `not_pr_content` records. `toyos` is the branch every [patch] entry consumes.
 
 [meta]
 owner = "Japabu"
@@ -88,7 +95,7 @@ pr = "none — blocked on publishing"
 [winit]
 upstream = "rust-windowing/winit"
 base = "c4afadbf"
-delta = "+1243"
+delta = "+1249"
 tier = "sibling"
 why = "Adds the winit-toyos sibling crate — the model case for this tier."
 pr = "none — winit-toyos must be published before upstream can depend on it by version"
@@ -109,7 +116,8 @@ delta = "+109"
 tier = "sibling"
 why = "Pure addition: a ToyOS handle variant. Depends on nothing of ours, so it was sendable without publishing."
 pr = "https://github.com/rust-windowing/raw-window-handle/pull/223 (open, 2026-07-28)"
-pr_note = "`toyos` was moved to c39042b so its tree is byte-identical to the PR head; the delta grew +69 → +109 by adding the doc examples and CHANGELOG entry every other platform module carries."
+pr_branch = "add-toyos-support"
+pr_note = "`toyos` was moved to c39042b so its tree is byte-identical to the PR head; the delta grew +69 → +109 by adding the doc examples and CHANGELOG entry every other platform module carries. Verified 2026-08-07: `git diff origin/toyos origin/add-toyos-support` is empty, and both are +109 off 1b85948."
 
 [getrandom]
 upstream = "rust-random/getrandom"
@@ -209,6 +217,9 @@ delta = "+7/-1"
 tier = "fork"
 why = "Adds the toyos target triple. Five lines of code across two files."
 pr = "https://github.com/bytecodealliance/target-lexicon/pull/134 (open, 2026-07-27)"
+pr_branch = "add-toyos-os"
+pr_note = "Unlike raw-window-handle the two branches cannot be made identical: `add-toyos-os` sits on a later upstream (it carries #131 and #133) and is +5/-1, while `toyos` stays on v0.13.5 and is +7/-1. The ToyOS hunks in src/targets.rs and src/triple.rs are the same on both; the extra two lines are `not_pr_content`."
+not_pr_content = "`#![allow(unexpected_cfgs)]` in build.rs and src/lib.rs. build.rs:56 emits `cargo:rustc-cfg=feature=\"rust_1_40\"`, a feature the manifest never declares, so the lint fires on a crate that denies warnings. It is an upstream lint debt, not ToyOS content — fixing it upstream is its own PR, and doing so would let this fork drop to +5/-1."
 
 # Not a crate fork: rust/ is a submodule of Japabu/rust (compiler + std with
 # ToyOS as a target). Its own upstream sync is tracked separately.
