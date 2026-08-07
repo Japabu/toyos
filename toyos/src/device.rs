@@ -99,14 +99,20 @@ impl AsHandle for Nic {
     fn as_handle(&self) -> Fd { self.0.fd() }
 }
 
-pub struct AudioDev(pub(crate) Device);
+/// A virtio-sound device the kernel brought up and drives no policy on.
+///
+/// What the claimant gets is the region the descriptors point into, mapped
+/// writable, an interrupt it may wait on, and one register call per queue
+/// doorbell. It gets no descriptor table and no physical address, so there is
+/// nothing here that can point the device at memory.
+pub struct VirtioSoundDev(pub(crate) Device);
 
-impl AudioDev {
+impl VirtioSoundDev {
     pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::Audio).map(|fd| AudioDev(Device(Handle(fd))))
+        syscall::open_device(DeviceType::VirtioSound).map(|fd| VirtioSoundDev(Device(Handle(fd))))
     }
 
-    pub fn info(&self) -> Result<toyos_abi::audio::AudioInfo, SyscallError> {
+    pub fn info(&self) -> Result<toyos_abi::virtio_sound::VirtioSoundInfo, SyscallError> {
         read_info(&self.0)
     }
 
@@ -131,15 +137,14 @@ impl AudioDev {
         Ok(n / REC_SIZE)
     }
 
-    /// PCM STOP. The reverse transition needs no method: the kernel starts a
-    /// stopped stream inside the next buffer submit.
-    pub fn stop(&self) -> Result<(), SyscallError> {
-        syscall::write(self.0.0.0, &[0])?;
-        Ok(())
+    /// Ring one queue's doorbell. `offset` is one of the three the info struct
+    /// reports and nothing else is on the kernel's allow-list.
+    pub fn notify(&self, offset: u32, queue: u16) -> Result<(), SyscallError> {
+        syscall::device_reg_write(self.0.fd(), offset, syscall::RegWidth::U16, queue as u32)
     }
 }
 
-impl AsHandle for AudioDev {
+impl AsHandle for VirtioSoundDev {
     fn as_handle(&self) -> Fd { self.0.fd() }
 }
 
@@ -189,7 +194,7 @@ impl HdaDev {
     pub fn reg_read(
         &self,
         offset: u32,
-        width: toyos_abi::hda::RegWidth,
+        width: toyos_abi::syscall::RegWidth,
     ) -> Result<u32, SyscallError> {
         syscall::device_reg_read(self.0.fd(), offset, width)
     }
@@ -197,7 +202,7 @@ impl HdaDev {
     pub fn reg_write(
         &self,
         offset: u32,
-        width: toyos_abi::hda::RegWidth,
+        width: toyos_abi::syscall::RegWidth,
         value: u32,
     ) -> Result<(), SyscallError> {
         syscall::device_reg_write(self.0.fd(), offset, width, value)

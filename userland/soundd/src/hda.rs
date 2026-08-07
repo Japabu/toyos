@@ -11,8 +11,8 @@
 //! registers, and the stream's run bit.
 
 use toyos::HdaDev;
-use toyos_abi::hda::{HdaInfo, RegWidth};
-use toyos_abi::syscall::SyscallError;
+use toyos_abi::hda::HdaInfo;
+use toyos_abi::syscall::{RegWidth, SyscallError};
 use toyos_hda::graph::Codec;
 use toyos_hda::path::{OutputPath, PathError};
 use toyos_hda::verb::{Address, Node, Response, Verb};

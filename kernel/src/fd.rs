@@ -80,7 +80,6 @@ pub enum Descriptor {
     /// authorizes `SYS_PIPE_OPEN` on a pipe that process created.
     Socket { rx: PipeReader, tx: PipeWriter, peer: Pid },
     Nic(device::Claim, crate::net::NicInfo),
-    Audio { claim: device::Claim, info: toyos_abi::audio::AudioInfo, info_read: bool },
     /// An HDA controller the kernel brought up and drives no policy on. Holding
     /// it is what authorizes [`SYS_DEVICE_REG_READ`] and [`SYS_DEVICE_REG_WRITE`]
     /// against that device's allow-list.
@@ -88,6 +87,13 @@ pub enum Descriptor {
     /// [`SYS_DEVICE_REG_READ`]: toyos_abi::syscall::SYS_DEVICE_REG_READ
     /// [`SYS_DEVICE_REG_WRITE`]: toyos_abi::syscall::SYS_DEVICE_REG_WRITE
     Hda { claim: device::Claim, info: toyos_abi::hda::HdaInfo, info_read: bool },
+    /// A virtio-sound device, on the same terms and authorizing the same two
+    /// calls against its own allow-list.
+    VirtioSound {
+        claim: device::Claim,
+        info: toyos_abi::virtio_sound::VirtioSoundInfo,
+        info_read: bool,
+    },
     /// A registered service. Identified by `ListenerId` and not by name: ids
     /// are never reused, so a descriptor that outlived its listener names
     /// nothing, where a name would re-resolve to whichever process registered
@@ -122,7 +128,7 @@ impl Descriptor {
             Self::Listener(l) => Some(Self::Listener(l.clone())),
             Self::IoUring(r) => Some(Self::IoUring(r.clone())),
             Self::Keyboard(_) | Self::Mouse(_) | Self::Framebuffer(..)
-            | Self::Nic(..) | Self::Audio { .. } | Self::Hda { .. } => None,
+            | Self::Nic(..) | Self::Hda { .. } | Self::VirtioSound { .. } => None,
         }
     }
 
@@ -152,7 +158,7 @@ impl Descriptor {
             Self::Listener(l) => Some(Source::Listener(l.id())),
             Self::PipeRead(r) | Self::TtyRead(r) => Some(Source::PipeReadable(r.id())),
             Self::Socket { rx, .. } => Some(Source::PipeReadable(rx.id())),
-            Self::Audio { .. } => Some(Source::Audio),
+            Self::VirtioSound { .. } => Some(Source::VirtioSound),
             Self::Hda { .. } => Some(Source::Hda),
             Self::File(_) | Self::Framebuffer(..) => None,
             Self::PipeWrite(..) | Self::TtyWrite(_) => None,
@@ -166,7 +172,7 @@ impl Descriptor {
             Self::PipeWrite(w) | Self::TtyWrite(w) => Some(Source::PipeWritable(w.id())),
             Self::Socket { tx, .. } => Some(Source::PipeWritable(tx.id())),
             Self::File(_) | Self::SerialConsole => None,
-            Self::Keyboard(_) | Self::Mouse(_) | Self::Nic(..) | Self::Audio { .. }
+            Self::Keyboard(_) | Self::Mouse(_) | Self::Nic(..) | Self::VirtioSound { .. }
             | Self::Hda { .. } | Self::Framebuffer(..) | Self::Listener(_)
             | Self::PipeRead(..) | Self::TtyRead(_) | Self::IoUring(_) => None,
         }
@@ -467,7 +473,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut UserBytesMut) -> Option<
             buf.write_at(0, &bytes[..count]);
             Some(count as u64)
         }
-        Descriptor::Audio { info, info_read, .. } => {
+        Descriptor::VirtioSound { info, info_read, .. } => {
             if !*info_read {
                 let bytes = info.as_bytes();
                 let count = buf.len().min(bytes.len());
@@ -480,7 +486,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut UserBytesMut) -> Option<
             }
             // Completion records, oldest first. Empty → None: blocking reads
             // park on `waitqs::AUDIO`, nonblocking reads get WouldBlock.
-            let n = crate::audio::drain_completed(buf);
+            let n = crate::drivers::virtio_sound::drain_completed(buf);
             if n == 0 { None } else { Some(n as u64) }
         }
         Descriptor::Hda { info, info_read, .. } => {
@@ -580,20 +586,6 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &UserBytes) -> Option<u64> {
             serial::SerialWriter::console().write_user(buf);
             Some(buf.len() as u64)
         }
-        Descriptor::Audio { .. } => {
-            if !buf.is_empty() {
-                let mut cmd = [0u8; 1];
-                buf.read_at(0, &mut cmd);
-                match cmd[0] {
-                    0 => crate::audio::stop(),
-                    1 => crate::audio::start(),
-                    _ => {}
-                }
-                Some(1)
-            } else {
-                Some(0)
-            }
-        }
         _ => Some(SyscallError::PermissionDenied.to_u64()),
     }
 }
@@ -637,7 +629,7 @@ pub fn fstat(table: &FdTable, fd: u32, stat: &mut Stat) -> bool {
         Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => { stat.file_type = FileType::Tty as u64; true }
         Some(Descriptor::Socket { .. }) => { stat.file_type = FileType::Socket as u64; true }
         Some(Descriptor::Nic(..)) => { stat.file_type = FileType::Nic as u64; true }
-        Some(Descriptor::Audio { .. } | Descriptor::Hda { .. }) => { stat.file_type = FileType::Unknown as u64; true }
+        Some(Descriptor::VirtioSound { .. } | Descriptor::Hda { .. }) => { stat.file_type = FileType::Unknown as u64; true }
         Some(Descriptor::Listener(_)) => { stat.file_type = FileType::Pipe as u64; true }
         Some(Descriptor::IoUring(_)) => { stat.file_type = FileType::Unknown as u64; true }
         None => false,
@@ -679,8 +671,10 @@ pub fn has_data(table: &FdTable, fd: u32) -> bool {
                 Descriptor::Listener(l) => listener::has_pending_by_id(l.id()),
                 Descriptor::SerialConsole => serial::has_data(),
                 Descriptor::Nic(..) => crate::net::has_packet(),
-                Descriptor::Audio { info_read: false, .. } => true,
-                Descriptor::Audio { info_read: true, .. } => crate::audio::has_pending(),
+                Descriptor::VirtioSound { info_read: false, .. } => true,
+                Descriptor::VirtioSound { info_read: true, .. } => {
+                    crate::drivers::virtio_sound::has_pending()
+                }
                 Descriptor::Hda { info_read: false, .. } => true,
                 Descriptor::Hda { info_read: true, .. } => crate::drivers::hda::has_pending(),
                 Descriptor::File(_) | Descriptor::Framebuffer(..) => true,

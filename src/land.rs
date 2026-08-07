@@ -88,9 +88,18 @@ impl LandLog {
 /// agent pastes into its own summary.
 const DEFAULT_GATE: [&str; 2] = ["cargo", "test"];
 
+/// The declaration that this branch's sysroot change cannot be landed on its
+/// own — an ABI item it renames or removes, whose old form the rest of the tree
+/// still uses.
+const ABI_INSEPARABLE: &str = "--abi-inseparable";
+
 pub fn dispatch(root: &Path, args: &[String]) {
     let gate = parse_gate(args);
-    match run(root, &gate) {
+    // Read only among this command's own words: everything after `--gate` is
+    // another command's argv and nothing here may take a flag out of it.
+    let own = &args[..args.iter().position(|a| a == "--gate").unwrap_or(args.len())];
+    let inseparable = own.iter().any(|a| a == ABI_INSEPARABLE);
+    match run_declaring(root, &gate, inseparable) {
         Ok(report) => println!("{report}"),
         Err(refusal) => {
             eprintln!("{refusal}");
@@ -131,11 +140,19 @@ fn is_default(gate: &[String]) -> bool {
 
 /// Steps 1-5. `Err` is a refusal to print and exit on; every one of them leaves
 /// main exactly where it was.
+#[cfg(test)]
 fn run(root: &Path, gate: &[String]) -> Result<String, String> {
+    run_declaring(root, gate, false)
+}
+
+fn run_declaring(root: &Path, gate: &[String], inseparable: bool) -> Result<String, String> {
     let primary = crate::primary_checkout(root);
     // After preflight, which is instantaneous and prints its own refusal: the
     // log is for the part that takes minutes.
     let branch = preflight(root, &primary)?;
+    if !inseparable {
+        abi_lands_alone(root, &branch)?;
+    }
     let log = Arc::new(LandLog::open(root));
     log.say(&format!("[land] landing {branch} into main at {}", primary.display()));
     log.say(&format!(
@@ -150,7 +167,7 @@ fn run(root: &Path, gate: &[String]) -> Result<String, String> {
     // product of a failed landing, and reading it back out of a scrollback that
     // eight other landings' output went through was the thing that could not be
     // done on 2026-08-07.
-    let outcome = steps(root, &primary, &branch, gate, &log);
+    let outcome = steps(root, &primary, &branch, gate, &log, inseparable);
     match &outcome {
         Ok(report) | Err(report) => {
             log.raw(report.as_bytes());
@@ -166,13 +183,23 @@ fn steps(
     branch: &str,
     gate: &[String],
     log: &Arc<LandLog>,
+    inseparable: bool,
 ) -> Result<String, String> {
     let _lock = buildlock::integration(root);
 
     let main_before = git(primary, &["rev-parse", "main"])?;
-    merge_main(root, branch, log)?;
+    let pending = merge_main(root, branch, log)?;
 
-    let took = run_gate(root, gate, log)?;
+    let outcome = run_gate(root, gate, log);
+    // **Between the gate and everything that follows**, because that commit is
+    // the one main's history shows and the gate's verdict is the thing worth
+    // showing. It is also the only ordering that leaves no window: a worktree
+    // holding an uncommitted merge reads as an unresolved conflict to the next
+    // `--land`.
+    if pending {
+        commit_merge(root, &merge_message(root, branch, &main_before, gate, &outcome, log, inseparable))?;
+    }
+    let took = outcome?;
 
     let dirty = git(primary, &["status", "--porcelain"])?;
     if !dirty.is_empty() {
@@ -210,6 +237,12 @@ fn steps(
             "\n[land]   the gate was NOT the default `{}`; whatever the default covers and \
              this did not is ungated on main now",
             DEFAULT_GATE.join(" ")
+        ));
+    }
+    if inseparable {
+        report.push_str(&format!(
+            "\n[land]   landed under `{ABI_INSEPARABLE}`: the sysroot's sources went to main \
+             with the rest of this branch, so the claim window was this whole task"
         ));
     }
     Ok(report)
@@ -271,15 +304,143 @@ fn preflight(root: &Path, primary: &Path) -> Result<String, String> {
     Ok(branch)
 }
 
+/// **Refuse a sysroot change that is being landed with unrelated work, before
+/// the gate rather than after somebody else's build.**
+///
+/// `toyos-abi/src`, `toyos/src` and `userland/libc/src` are compiled into the
+/// one sysroot every worktree builds against, so a branch that changes them
+/// holds it from the moment it builds until the moment it lands. The rule every
+/// brief carries — land the sysroot half on its own commit first — makes that
+/// window one landing instead of one task. **It was followed once in four times
+/// on 2026-08-07.** Two agents lost about 35 and about 50 minutes to one miss,
+/// and two landings burned a full build each against another before reaching
+/// the refusal in `toolchain.rs`.
+///
+/// That refusal is a good one and it arrives at the wrong process: at the
+/// victim, after its build, rather than at the cause, before one. This is the
+/// same words at the other end.
+///
+/// Merges are skipped: a previous landing attempt's integration merge touches
+/// nothing of its own, and counting it as unrelated work would refuse a branch
+/// whose only commit is the ABI change.
+fn abi_lands_alone(root: &Path, branch: &str) -> Result<(), String> {
+    let (touching, rest) = split_by_sysroot(root)?;
+    if touching.is_empty() || rest.is_empty() {
+        return Ok(());
+    }
+
+    let listed = |commits: &[(String, String)]| {
+        commits
+            .iter()
+            .map(|(sha, subject)| format!("[land]     {sha}  {subject}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // A prefix is the only shape the remedy below is available for: git can put
+    // the first N commits on main by themselves and cannot put a later one there
+    // without the ones under it, and nothing in this workflow rebases.
+    let ordered = split_by_sysroot_is_prefix(root)?;
+    let remedy = if ordered {
+        format!(
+            "[land] Land the sysroot half by itself first — the shortest claim window there is:\n\
+             [land]     git switch -c {branch}-abi {}\n\
+             [land]     cargo run -- --land\n\
+             [land]     git switch {branch} && cargo run -- --land",
+            touching.last().expect("non-empty").0,
+        )
+    } else {
+        format!(
+            "[land] The sysroot commits are not the oldest ones here, so they cannot be landed \
+             by themselves without reordering — and nothing in this workflow rebases. Either \
+             redo the split on a fresh branch, or declare it below."
+        )
+    };
+
+    Err(format!(
+        "[land] this branch changes the shared sysroot's sources and carries {} commit(s) that \
+         do not.\n\
+         [land] {} are compiled into the one sysroot every worktree builds against, so this \
+         branch holds it from its first build until it lands. Landing the sysroot half on its \
+         own makes that window one landing instead of one whole task — followed once in four \
+         times on 2026-08-07, and each miss cost two agents 35 to 50 minutes.\n\
+         [land]   touching the sysroot's sources:\n{}\n\
+         [land]   the rest:\n{}\n\
+         {remedy}\n\
+         [land] If the two genuinely cannot be split — an ABI item this branch renames or \
+         removes, whose old form the rest of the tree still uses — pass `{ABI_INSEPARABLE}`. \
+         It lands as one unit and says so in the landing commit.\n\
+         [land] Nothing was merged and main was not touched.",
+        rest.len(),
+        crate::toolchain::SYSROOT_SOURCES.join(", "),
+        listed(&touching),
+        listed(&rest),
+    ))
+}
+
+/// This branch's non-merge commits, split by whether they touch the sysroot's
+/// sources — oldest first, each with its subject so the refusal can name them.
+fn split_by_sysroot(root: &Path) -> Result<(Vec<(String, String)>, Vec<(String, String)>), String> {
+    let mut touching = Vec::new();
+    let mut rest = Vec::new();
+    for (sha, subject, files) in branch_commits(root)? {
+        let hits = files.iter().any(|f| {
+            crate::toolchain::SYSROOT_SOURCES.iter().any(|tree| f.starts_with(tree))
+        });
+        if hits { touching.push((sha, subject)) } else { rest.push((sha, subject)) }
+    }
+    Ok((touching, rest))
+}
+
+fn split_by_sysroot_is_prefix(root: &Path) -> Result<bool, String> {
+    let commits = branch_commits(root)?;
+    let touches = |files: &[String]| {
+        files.iter().any(|f| {
+            crate::toolchain::SYSROOT_SOURCES.iter().any(|tree| f.starts_with(tree))
+        })
+    };
+    let last = commits.iter().rposition(|(_, _, files)| touches(files));
+    Ok(last.is_some_and(|last| commits[..=last].iter().all(|(_, _, f)| touches(f))))
+}
+
+/// `main..HEAD` oldest first as (short sha, subject, files), merges excluded.
+///
+/// One `git log` and not one call per commit: the `\x01` marker starts the
+/// header lines, and no path can contain that byte.
+fn branch_commits(root: &Path) -> Result<Vec<(String, String, Vec<String>)>, String> {
+    let out = git(
+        root,
+        &["log", "--reverse", "--no-merges", "--name-only", "--format=\x01%h %s", "main..HEAD"],
+    )?;
+    let mut commits: Vec<(String, String, Vec<String>)> = Vec::new();
+    for line in out.lines() {
+        match line.strip_prefix('\x01') {
+            Some(header) => {
+                let (sha, subject) = header.split_once(' ').unwrap_or((header, ""));
+                commits.push((sha.to_string(), subject.to_string(), Vec::new()));
+            }
+            None if !line.trim().is_empty() => {
+                if let Some(last) = commits.last_mut() {
+                    last.2.push(line.to_string());
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(commits)
+}
+
 /// Step 2. `--no-ff` so the landing record names both parents; `--no-edit`
 /// because nothing here has a terminal to open an editor on.
-fn merge_main(root: &Path, branch: &str, log: &LandLog) -> Result<(), String> {
-    match git(root, &["merge", "--no-ff", "--no-edit", "main"]) {
+fn merge_main(root: &Path, branch: &str, log: &LandLog) -> Result<bool, String> {
+    match git(root, &["merge", "--no-ff", "--no-commit", "main"]) {
         Ok(out) => {
             for line in out.lines() {
                 log.say(&format!("[land] {line}"));
             }
-            Ok(())
+            // "Already up to date" writes no `MERGE_HEAD` and there is nothing
+            // to commit. main then gets this branch's own commits and no
+            // landing commit at all, which is correct: nothing was integrated.
+            Ok(merging(root))
         }
         Err(e) if merging(root) => Err(format!(
             "{e}\n\
@@ -370,6 +531,112 @@ fn run_gate(
         ));
     }
     Ok(took)
+}
+
+/// The landing commit's message, written from **main's** point of view.
+///
+/// git's default for this merge is "Merge branch 'main' into wt/toyos-x", which
+/// names the direction nobody reads: from main's history what happened is that
+/// the branch landed. 66 of the 166 commits on main in the twenty hours to
+/// 2026-08-07 were that sentence, which makes `git log --oneline` close to
+/// useless as a summary.
+///
+/// Two things a reader cannot recover afterwards go in it: **which gate ran**,
+/// because `--gate` overrides the default and one override on that day silently
+/// narrowed to a single test, and **whether the run was clean**, because a run
+/// carrying declared expected failures is accepted and only the suite's own last
+/// line says so. That line is quoted rather than summarised — a restatement
+/// drifts from what the harness says and a quotation does not.
+///
+/// The direction of the two parents is not changed and the merge is not
+/// squashed. Only the label was wrong.
+fn merge_message(
+    root: &Path,
+    branch: &str,
+    main_before: &str,
+    gate: &[String],
+    outcome: &Result<std::time::Duration, String>,
+    log: &LandLog,
+    inseparable: bool,
+) -> String {
+    let carried = git(root, &["rev-list", "--count", &format!("main..{branch}")])
+        .unwrap_or_else(|_| "?".to_string());
+    let short = git(root, &["rev-parse", "--short", main_before]).unwrap_or_else(|_| "?".to_string());
+    let verdict = gate_verdict(log);
+
+    let Ok(took) = outcome else {
+        return format!(
+            "{branch}: merged main {short} during a landing that did not complete\n\n\
+             The gate this merge was made for did not pass, so this is an integration \
+             merge and not a landing. Whatever lands on top of it carries its own record.\n\n\
+             \x20 gate    {}\n\
+             \x20         {verdict}\n",
+            gate.join(" "),
+        );
+    };
+
+    let mut message = format!(
+        "{branch} landed: {carried} commits, gate {}\n\n\
+         Merged main {short} into the branch under the integration lock and \
+         fast-forwarded main onto the result (specs/worktrees.md §5). This commit's \
+         parents run branch-side; from main's history what happened is the subject line.\n\n\
+         \x20 gate    {}, {:.1?}\n\
+         \x20         {verdict}\n",
+        clean_or_not(log),
+        gate.join(" "),
+        took,
+    );
+    if !is_default(gate) {
+        message.push_str(&format!(
+            "\nThe gate was NOT the default `{}` — the whole suite. Whatever the default \
+             covers and this did not is ungated on main.\n",
+            DEFAULT_GATE.join(" "),
+        ));
+    }
+    if inseparable {
+        message.push_str(&format!(
+            "\nLanded under `{ABI_INSEPARABLE}`: this branch changes the shared sysroot's \
+             sources and carries work that does not, declared unsplittable. The claim window \
+             was the whole task rather than one landing.\n"
+        ));
+    }
+    message
+}
+
+/// The suite's own last word on the run, quoted.
+///
+/// `test result:` alone is not enough — `cargo test` runs several binaries and
+/// the last of them is the doc-tests, whose line says nothing about the suite.
+/// The suite's own line is the one that counts a total, which libtest's never
+/// does. A `--gate` override that runs something else has no such line at all,
+/// and says so rather than borrowing one.
+fn gate_verdict(log: &LandLog) -> String {
+    let Ok(text) = fs::read_to_string(&log.path) else {
+        return "the gate's output could not be read back".to_string();
+    };
+    text.lines()
+        .filter(|l| l.trim_start().starts_with("test result:") && l.contains(" total ("))
+        .next_back()
+        .map_or_else(
+            || "the gate printed no suite result line".to_string(),
+            |l| l.trim().to_string(),
+        )
+}
+
+fn clean_or_not(log: &LandLog) -> &'static str {
+    if gate_verdict(log).contains("NOT clean") { "ok, NOT clean" } else { "ok" }
+}
+
+/// Commit the merge [`merge_main`] left staged.
+///
+/// Through a file and never `-m`: the message is several lines and carries
+/// backticks. Nothing else about the commit changes — signing and hooks are
+/// whatever `git merge` was already doing here.
+fn commit_merge(root: &Path, message: &str) -> Result<(), String> {
+    let file = root.join(format!("target/landings/message-{}.txt", std::process::id()));
+    fs::write(&file, message).map_err(|e| format!("[land] write {}: {e}", file.display()))?;
+    git(root, &["commit", "-q", "-F", &file.to_string_lossy()])?;
+    Ok(())
 }
 
 /// Copy `from` to this process's own stream and to the log, in chunks rather
@@ -636,6 +903,103 @@ mod tests {
         let report = run(&wt, &pass()).unwrap();
         assert!(report.contains("NOT the default"), "an override went unreported: {report}");
         assert!(buildlock::integration_is_free(&primary), "the lock was left held");
+    }
+
+    /// **The sysroot rule is refused at the cause, before a build, not at the
+    /// victim after one.** Followed once in four times on 2026-08-07; the two
+    /// misses cost two agents 35 and 50 minutes and burned two landings' builds
+    /// against `toolchain.rs`'s refusal.
+    #[test]
+    fn an_abi_change_landing_with_unrelated_work_is_refused_before_the_gate() {
+        let (primary, wt) = repo("abi-mixed");
+        let before = head(&primary, "main");
+        fs::create_dir_all(wt.join("toyos-abi/src")).unwrap();
+        commit(&wt, "toyos-abi/src/lib.rs", "pub struct A(pub u64);\n", "abi: widen A");
+        commit(&wt, "g", "mine\n", "vfs: the work that depends on it");
+
+        // `false` as the gate: a refusal that let the gate run would still be
+        // green on the assertions below, and the whole point is that it does not.
+        let refusal = run(&wt, &["false".to_string()])
+            .expect_err("an ABI change carrying unrelated work must be refused");
+        assert!(refusal.contains("shared sysroot's sources"), "{refusal}");
+        assert!(refusal.contains("abi: widen A"), "the refusal does not name the ABI commit:\n{refusal}");
+        assert!(refusal.contains("vfs: the work"), "the refusal does not name the rest:\n{refusal}");
+        assert!(refusal.contains("git switch -c wt-abi"), "no remedy for a prefix:\n{refusal}");
+        assert!(refusal.contains("--abi-inseparable"), "{refusal}");
+        assert_eq!(head(&primary, "main"), before);
+        assert!(
+            !wt.join("target/landings").exists(),
+            "the refusal came after the landing had started work"
+        );
+
+        // Declared, it lands — and the declaration is not silent.
+        let report = run_declaring(&wt, &pass(), true).expect("the declaration must let it land");
+        assert_eq!(head(&primary, "main"), head(&wt, "HEAD"));
+        assert!(report.contains("abi-inseparable"), "the declaration went unreported:\n{report}");
+    }
+
+    /// A branch whose only commits are the sysroot's is the shape the rule asks
+    /// for, and an earlier landing attempt's integration merge is not work.
+    #[test]
+    fn an_abi_only_branch_lands_and_a_previous_merge_is_not_unrelated_work() {
+        let (primary, wt) = repo("abi-alone");
+        fs::create_dir_all(wt.join("toyos/src")).unwrap();
+        commit(&wt, "toyos/src/lib.rs", "pub fn f() {}\n", "sdk: add f");
+        commit(&primary, "theirs", "theirs\n", "meanwhile");
+        sh(&wt, &["merge", "--no-ff", "--no-edit", "main"]);
+
+        run(&wt, &pass()).expect("a branch carrying only the sysroot's sources must land");
+        assert_eq!(head(&primary, "main"), head(&wt, "HEAD"));
+    }
+
+    /// **The landing commit is read from main's side, so it says what main
+    /// got.** git's default message names the other direction, and 66 of the
+    /// 166 commits on main in the twenty hours to 2026-08-07 were that one
+    /// sentence.
+    #[test]
+    fn the_landing_commit_says_which_branch_landed_and_how_it_was_gated() {
+        let (primary, wt) = repo("merge-message");
+        commit(&wt, "g", "mine\n", "work");
+        commit(&wt, "h", "more\n", "and more");
+        // main has to have moved, or there is nothing to merge and no landing
+        // commit at all — which is correct and is the other half of this.
+        commit(&primary, "theirs", "theirs\n", "meanwhile");
+
+        run(&wt, &pass()).expect("the landing should have gone through");
+        let subject = git(&primary, &["log", "-1", "--format=%s", "main"]).unwrap();
+        assert!(subject.starts_with("wt landed: 2 commits"), "{subject}");
+        assert!(
+            !subject.contains("Merge branch 'main' into"),
+            "the default message is still what main records: {subject}"
+        );
+        let body = git(&primary, &["log", "-1", "--format=%b", "main"]).unwrap();
+        assert!(body.contains("gate    true"), "the gate that ran is not in the commit:\n{body}");
+        assert!(
+            body.contains("NOT the default"),
+            "an overridden gate is not declared in the commit:\n{body}"
+        );
+        let parents = git(&primary, &["rev-list", "--parents", "-n", "1", "main"]).unwrap();
+        assert_eq!(
+            parents.split_whitespace().count(),
+            3,
+            "the landing commit stopped being a merge: {parents}"
+        );
+    }
+
+    /// A landing whose gate failed still has to leave the merge committed —
+    /// otherwise the next `--land` finds `MERGE_HEAD` and reports an unresolved
+    /// conflict that is not there. It must not claim a verdict it did not get.
+    #[test]
+    fn a_failed_gate_leaves_the_merge_committed_and_claims_nothing() {
+        let (primary, wt) = repo("merge-message-red");
+        commit(&wt, "g", "mine\n", "work");
+        commit(&primary, "theirs", "theirs\n", "meanwhile");
+
+        run(&wt, &["false".to_string()]).expect_err("a red gate must not land");
+        assert!(!merging(&wt), "the merge was left uncommitted for the next run to misread");
+        let subject = git(&wt, &["log", "-1", "--format=%s", "HEAD"]).unwrap();
+        assert!(subject.contains("did not complete"), "{subject}");
+        assert!(!subject.contains("landed"), "a failed landing claimed to have landed: {subject}");
     }
 
     /// The whole of the shared-scratchpad defect: two landings must not be able

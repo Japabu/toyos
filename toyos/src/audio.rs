@@ -42,10 +42,6 @@ crate::ipc_payload! {
     }
 }
 
-pub fn audio_submit(buf_idx: u32, len: u32) -> Result<(), syscall::SyscallError> {
-    syscall::audio_submit(buf_idx, len)
-}
-
 pub struct AudioSlotWriter {
     shm: SharedMemory,
     period_bytes: u32,

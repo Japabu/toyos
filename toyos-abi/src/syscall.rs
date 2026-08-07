@@ -61,8 +61,10 @@ pub const SYS_READ_NONBLOCK: u64 = 66;
 pub const SYS_WRITE_NONBLOCK: u64 = 67;
 pub const SYS_PIPE_OPEN: u64 = 68;
 pub const SYS_PIPE_ID: u64 = 70;
-pub const SYS_AUDIO_SUBMIT: u64 = 71;
-pub const SYS_AUDIO_POLL: u64 = 84;
+// Syscall numbers 71 and 84 unused (formerly SYS_AUDIO_SUBMIT and
+// SYS_AUDIO_POLL: the kernel no longer drives a sound card, so a period is
+// published into a ring the kernel built and there is nothing to submit).
+// 84 never had a dispatch arm or a caller, so retiring it saves nothing.
 pub const SYS_EXIT: u64 = 72;
 pub const SYS_GET_ENV: u64 = 73;
 pub const SYS_DUP2: u64 = 74;
@@ -624,18 +626,63 @@ pub enum DeviceType {
     Mouse = 1,
     Framebuffer = 2,
     Nic = 3,
-    Audio = 4,
+    // 4 was `Audio`, a sound card the kernel drove on the claimant's behalf.
+    // Retired with the syscall that fed it rather than reused for the stub that
+    // replaced it: the claim below authorizes register writes and answers no
+    // submit, so a caller that still names 4 has to be refused rather than
+    // handed a capability of a different shape.
     /// An Intel HDA controller the kernel has brought up but drives no policy
-    /// on. Distinct from [`DeviceType::Audio`], which is a sound card the
-    /// kernel drives on the claimant's behalf: these are two capabilities, and
-    /// a process that can drive a codec is not the same as one that can submit
-    /// a period.
+    /// on.
     HdaAudio = 5,
+    /// A virtio-sound device, on the same terms: the kernel negotiated its
+    /// features, built its virtqueues and owns their descriptors, and every
+    /// decision above that — the stream, the rate, the format, when a period is
+    /// published — belongs to whoever holds this.
+    VirtioSound = 6,
 }
 
 /// Claim exclusive access to a device.
 pub fn open_device(device: DeviceType) -> Result<Fd, SyscallError> {
     check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| Fd(v as i32))
+}
+
+/// How wide a register access is.
+///
+/// Not a convenience: a device's registers are 8, 16 and 32 bits and a 32-bit
+/// write to a 16-bit register is a write to its neighbour — HDA's `SDnCTL` and
+/// `SDnSTS` are adjacent bytes of one dword, and the second is the kernel's
+/// alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
+pub enum RegWidth {
+    U8 = 1,
+    U16 = 2,
+    U32 = 4,
+}
+
+impl RegWidth {
+    pub fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            1 => Some(Self::U8),
+            2 => Some(Self::U16),
+            4 => Some(Self::U32),
+            _ => None,
+        }
+    }
+
+    pub const fn bytes(self) -> u64 {
+        self as u64
+    }
+
+    /// The widest value this access can carry. A caller handing a wider one is
+    /// naming bits the register does not have.
+    pub const fn max_value(self) -> u32 {
+        match self {
+            Self::U8 => u8::MAX as u32,
+            Self::U16 => u16::MAX as u32,
+            Self::U32 => u32::MAX,
+        }
+    }
 }
 
 /// Read one register of the device `fd` claims.
@@ -647,7 +694,7 @@ pub fn open_device(device: DeviceType) -> Result<Fd, SyscallError> {
 pub fn device_reg_read(
     fd: Fd,
     offset: u32,
-    width: crate::hda::RegWidth,
+    width: RegWidth,
 ) -> Result<u32, SyscallError> {
     check(syscall(SYS_DEVICE_REG_READ, fd.0 as u64, offset as u64, width.bytes(), 0))
         .map(|v| v as u32)
@@ -662,7 +709,7 @@ pub fn device_reg_read(
 pub fn device_reg_write(
     fd: Fd,
     offset: u32,
-    width: crate::hda::RegWidth,
+    width: RegWidth,
     value: u32,
 ) -> Result<(), SyscallError> {
     check(syscall(
@@ -977,16 +1024,6 @@ pub fn nic_rx_done(buf_index: u64) -> Result<(), SyscallError> {
 /// indistinguishable from a delivered one.
 pub fn nic_tx(total_len: u64) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_NIC_TX, total_len, 0, 0, 0))
-}
-
-/// Submit a filled DMA buffer to the audio device.
-/// `buf_idx`: index of the DMA buffer (0..num_buffers).
-/// `len`: number of bytes of PCM data written to the buffer.
-///
-/// A failed submit means the buffer never completes and the caller's
-/// pipeline silently shrinks — the error must not be discarded.
-pub fn audio_submit(buf_idx: u32, len: u32) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_AUDIO_SUBMIT, buf_idx as u64, len as u64, 0, 0))
 }
 
 /// Allocate a TLS block for a dlopen'd module on the current thread.

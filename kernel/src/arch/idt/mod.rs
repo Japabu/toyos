@@ -70,6 +70,10 @@ pub const DMA_FAULT_VECTOR: u8 = Vector::DmaFault as u8;
 /// offers, and only one place knows the number.
 pub const HDA_VECTOR: u8 = Vector::Hda as u8;
 
+/// The vector the virtio-sound device's MSI-X entry carries, for the same
+/// reason.
+pub const VIRTIO_SOUND_VECTOR: u8 = Vector::VirtioSound as u8;
+
 // Page fault error code bits
 const PF_PRESENT: u64 = 1 << 0;
 const PF_WRITE: u64 = 1 << 1;
