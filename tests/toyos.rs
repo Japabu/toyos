@@ -148,6 +148,12 @@ const RUST_SKIP: &[&str] = &[
     // Needs a boot image the harness staged a file into before the machine
     // started, which only `esp_filesystem` builds.
     "esp_files",
+    // Every question it asks has the *right* answer on an ordinary kernel, so
+    // on the shared boot it prints three successes and passes on its exit code
+    // — a second test of the same name whose verdict is vacuous.
+    // `boot_volume_metadata_error` runs it on the kernel that refuses the
+    // reads, which is the only build it says anything about.
+    "boot_volume_metadata_error",
     // Two modes, each waiting to be typed at through QMP; on its own nothing
     // ever answers it. `swiss_german_layout`, `locale_detect` and
     // `locale_detect_unrecognized` drive it.
@@ -462,6 +468,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // measurement, same afternoon.
     ("late_storage_connect", Sched::Serial),
     ("log_backing_read_error", Sched::Parallel),
+    ("boot_volume_metadata_error", Sched::Parallel),
     ("log_partition_layout", Sched::Parallel),
     ("log_partition_identity", Sched::Parallel),
     ("cache_eviction", Sched::Parallel),
@@ -5707,6 +5714,9 @@ fn run_machine_test(
         }
         "log_backing_read_error" => {
             common::volumes::log_backing_read_error(test_config, c_bins, rust_bins)
+        }
+        "boot_volume_metadata_error" => {
+            common::volumes::boot_volume_metadata_error(test_config, c_bins, rust_bins)
         }
         "usb_storage_write_error" => usb::usb_storage_write_error(test_config, c_bins, rust_bins),
         "usb_flush_optional" => usb::usb_flush_optional(test_config, c_bins, rust_bins),

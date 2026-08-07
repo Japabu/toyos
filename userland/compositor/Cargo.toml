@@ -9,4 +9,5 @@ font = { path = "../font" }
 sprite = { path = "../sprite" }
 toyos = { path = "../../toyos" }
 toyos-abi = { path = "../../toyos-abi" }
+toyos-desktop = { path = "../../toyos-desktop" }
 window = { path = "../window" }

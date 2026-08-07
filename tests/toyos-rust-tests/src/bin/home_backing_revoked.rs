@@ -30,10 +30,10 @@ fn write_file(path: &str, byte: u8) {
     f.sync_all().unwrap_or_else(|e| panic!("fsync {path}: {e}"));
 }
 
-fn read_all(f: &mut fs::File) -> Vec<u8> {
+fn read_all(f: &mut fs::File) -> std::io::Result<Vec<u8>> {
     let mut got = Vec::new();
-    f.read_to_end(&mut got).expect("read the open descriptor");
-    got
+    f.read_to_end(&mut got)?;
+    Ok(got)
 }
 
 fn main() {
@@ -41,7 +41,8 @@ fn main() {
     // served by the backing and not by anything left over from the write — if
     // it were not, the attack below would prove nothing about that path.
     write_file(CONTROL, VICTIM_BYTE);
-    let control = read_all(&mut fs::File::open(CONTROL).expect("open the control"));
+    let control = read_all(&mut fs::File::open(CONTROL).expect("open the control"))
+        .expect("read the control");
     assert_eq!(control.len(), LEN, "the control read short");
     assert!(
         control.iter().all(|&b| b == VICTIM_BYTE),
@@ -59,29 +60,41 @@ fn main() {
     // The victim's blocks are the lowest free ones now, so this takes them.
     write_file(ATTACKER, ATTACKER_BYTE);
 
-    let got = read_all(&mut held);
-    assert_eq!(got.len(), LEN, "the read through the deleted file came up short");
-    if let Some(at) = got.iter().position(|&b| b == ATTACKER_BYTE) {
-        panic!(
-            "byte {at} read through the deleted file's descriptor is {ATTACKER_BYTE:#04x} — \
-             the backing served another file's data",
-        );
-    }
-
-    // Zeros, not the victim's own bytes: the backing was *revoked*, so the
-    // read failed and the file cache had nothing to put in the buffer. Asked
-    // this way the test does not depend on the attacker actually landing on
-    // the victim's blocks — a backing that still resolves reads either
-    // {ATTACKER_BYTE:#04x} or {VICTIM_BYTE:#04x}, and neither is zero.
-    if let Some(at) = got.iter().position(|&b| b != 0) {
-        panic!(
-            "byte {at} read through the deleted file's descriptor is {:#04x}, not zero — \
-             the backing still resolves blocks the allocator has taken back",
-            got[at],
-        );
-    }
+    // **Refused, not zeroed.** The read used to come back as `LEN` bytes of
+    // zeros and a success, because the revocation reached a `read_page` that
+    // had no way to say so — and a hole is not distinguishable from data a
+    // caller may act on. It reaches the process now, so this asks for the
+    // refusal and keeps the byte checks for the case where it does not come:
+    // a backing that still resolves serves either {ATTACKER_BYTE:#04x} or
+    // {VICTIM_BYTE:#04x}, and neither is zero.
+    let refused = match read_all(&mut held) {
+        Err(e) => e,
+        Ok(got) => {
+            if let Some(at) = got.iter().position(|&b| b == ATTACKER_BYTE) {
+                panic!(
+                    "byte {at} read through the deleted file's descriptor is \
+                     {ATTACKER_BYTE:#04x} — the backing served another file's data",
+                );
+            }
+            if let Some(at) = got.iter().position(|&b| b != 0) {
+                panic!(
+                    "byte {at} read through the deleted file's descriptor is {:#04x}, not \
+                     zero — the backing still resolves blocks the allocator has taken back",
+                    got[at],
+                );
+            }
+            panic!(
+                "the read through the deleted file's descriptor returned {} bytes and \
+                 succeeded; a revoked backing has no bytes to serve and has to say so",
+                got.len(),
+            );
+        }
+    };
 
     let _ = fs::remove_file(ATTACKER);
     let _ = fs::remove_file(CONTROL);
-    println!("a backing whose file was deleted served none of the next file's {LEN} bytes");
+    println!(
+        "a read through a backing whose file was deleted was refused ({refused}) rather than \
+         serving any of the next file's {LEN} bytes"
+    );
 }

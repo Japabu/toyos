@@ -312,6 +312,20 @@ log-rotate-fast = []
 # new bytes into a page of zeros and flushed it back over the kernel's own log.
 # See `fat32_adapter.rs`'s `FAT_BACKING_READS`.
 fat-backing-read-fails = []
+# Fail every *filesystem* read of the boot volume once it is mounted, with the
+# mount and the rest of the machine working. Its sibling above injects one layer
+# higher, at `FatBacking::read_page`, which is the page-fault path and reaches
+# no directory entry — so with that one armed an `open`, a `read_dir` and an
+# mtime of the same volume all still succeed, and nothing in the tree can make
+# `vfs::FileSystem`'s metadata calls fail. This one is under `Fat32` itself,
+# where a directory entry, a FAT chain and an extent list are read. Same reason
+# neither can be staged host-side: both partitions are on the disk the guest
+# runs from, so `readonly=on` is writes only and `rerror` takes the whole drive.
+# `Role::Boot` because nothing in the kernel reads that volume after the mount,
+# so the log, the shell and the serial console all survive and a process can be
+# sent to ask it a question. The read is still issued and the buffer is scrubbed
+# with the verdict. See `fat32_adapter.rs`'s `BOOT_VOLUME_READS`.
+fat-boot-reads-fail = []
 # Mis-program the IOMMU for the NVMe controller and nothing else:
 # `iommu-context-absent` leaves it out of the root table, so it reaches
 # translation with no context entry; `iommu-empty-domain` gives it a present

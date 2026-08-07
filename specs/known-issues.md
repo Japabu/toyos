@@ -3079,6 +3079,29 @@ CLAUDE.md's diagnostics roadmap.
 
 ## 6. Build and toolchain
 
+### `standing()` cannot tell a worktree that is *ahead* of main from one that is *behind* it
+
+`toolchain::standing` asks `git diff --quiet main -- toyos-abi/src toyos/src
+userland/libc/src` and reads a non-empty diff as `Diverged` — the standing that
+entitles a checkout to `--claim-sysroot`. A diff is symmetric, so a worktree
+that has simply **not merged main** since somebody landed an ABI change reads as
+`Diverged` too, and may claim: it would then rebuild the shared sysroot from
+sources that are *older* than main's and refuse the worktree whose change is
+already landed. That is the 2026-08-04 fight §3.2 of `specs/worktrees.md` exists
+to prevent, arrived at from the other direction.
+
+Observed on 2026-08-07 during task #133, which landed `SyscallError::Io` on its
+own commit for exactly this reason. Nothing went wrong that day — the worktree
+that claimed had merged main *and* held a real `toyos-abi/src/ring.rs` change of
+its own, so it was rightfully diverged — but its standing would have been
+`Diverged` either way, and the check did not distinguish them.
+
+The question the check means to ask is whether this checkout has content in
+those trees that main does not: `git diff --quiet main...HEAD` against the merge
+base, plus the working tree, rather than `git diff main`. Not fixed here; a
+change to the arbitration wants its own gates in `src/buildlock.rs` beside the
+three that are there.
+
 ### An std change that depends on an unlanded ABI change cannot be built at all, from anywhere
 
 `library/std` names its ToyOS dependencies by relative path —
@@ -3339,6 +3362,13 @@ test's contention wait from what the profile records, or give the profile a
 notion of how much host a task wants so two eight-CPU guests do not pair.
 **Whichever it is, a landing is currently a coin toss** — three of seven runs in
 one session were red on this and nothing else.
+
+**Cost another landing on 2026-08-07**, task #133, with the same signature and a
+wider margin than any row above: `desktop_audio_client` **787 s** in the wide
+phase against **14 s** alone, on a host carrying four other worktrees. Its
+verdict line was its own (`1 of the two overlapping clients left the mixer`)
+rather than `desktop_typing_damage`'s, so the message is not the tell — the pair
+of durations is.
 
 ### A whole parallel phase can be starved by another agent's build
 
@@ -5738,22 +5768,9 @@ data, btree node, block 0, and a write. Nothing else in the tree can stage a
 device failure (`VecBlockIO` cannot fail, QEMU's NVMe does not fail a read),
 which is the same gap the page-cache entry below records.
 
-**What is left, and both are real gaps:**
-
-`vfs::FileSystem` still has no channel where `bcachefs` now does: `file_size`
-and `read_link` return `Option`, `file_mtime` a bare `u64`, `delete` a `bool`.
-Those sites go through one `no_channel` helper in `bcachefs_adapter.rs` that
-logs and then answers "nothing here" — the sentinel moved one layer up rather
-than removed. The trait is shared with `tmpfs` and `fat32_adapter`, so growing
-it a channel is its own change.
-
-`fd::try_write` has no honest error code for "the device did not do it". It
-stops at the failed page and returns the short count, which is what `write`
-means — but a request whose *first* page fails gets `SyscallError::Unknown`,
-because none of the nine variants says this and adding one is an ABI change that
-needs discussing. `BcacheFsAdapter::list` now returns the same `Unknown` for the
-same reason, rather than an empty listing a caller cannot tell from an empty
-directory.
+**Both gaps this entry left open are closed** — `no_channel` is gone,
+`SyscallError::Io` exists, and `fd::try_write`'s first-page failure says it.
+The entry below has the shape and the gates.
 
 ### The page cache's un-index on a failed fill has no test that can fail
 
@@ -5907,19 +5924,76 @@ them from memory would be inventing them. Whoever holds that task should paste
 them in. F-E is the EP0 recovery path, which has an entry above; F-J is the
 file-cache error channel, which is its own task.
 
-### `BlockError` is a marker type because `SyscallError` has no I/O variant
+### CLOSED — `vfs::FileSystem` folded a refused device into "no such file"
 
-`BlockDevice`'s error is a unit struct in `kernel/src/block.rs`. None of
-`SyscallError`'s nine variants means "the device did not do it", and adding one
-is an ABI change that wanted discussion rather than a unilateral edit.
+Task #133. Every method of the trait now answers `Result<_, SyscallError>`, and
+`SyscallError::Io = 9` is the word for a device that did not do it — the ninth
+variant `block.rs` had been waiting for, landed on its own commit ahead of the
+rest because a change to `toyos-abi/src` diverges the sysroot witness and every
+other worktree is refused until it is on main.
 
-**The call sites it was waiting for exist now.** `BlockIO` is fallible, so a
-device failure reaches userland rather than being swallowed at the filesystem
-boundary — and there are three places it arrives as the wrong word:
-`fd::try_write` on a request whose first page fails, `BcacheFsAdapter::list`,
-and every `vfs::FileSystem` method whose return type is an `Option` or a `bool`.
-The first two say `SyscallError::Unknown`; the third says "no such file".
-`SyscallError::Io` is the thing to add, and it needs the owner.
+What the `Option`/`bool`/`u64` returns actually cost, all of it reachable from
+an ordinary boot with no crafted input:
+
+- **`fd::open` created a file over one that exists.** `CREATE` acted on the
+  `None` arm of `vfs.open_file`, which was both "no such name" and "the volume
+  would not say" — so one refused transfer got an empty file created over a
+  real one, and the next write and flush made that permanent. It acts on
+  `Err(NotFound)` and nothing else now.
+- **`file_cache::read_page` returned `()`**, so a page the device would not
+  give back reached a process as 4 KiB of zeros under a success. That is the
+  one answer nothing above it can tell from a file that really is zeros there.
+- **`FatFs::list` answered `NotFound`** for a volume that would not enumerate,
+  which reads to a caller as "there is no such directory".
+- `spawn` and `dlopen` reported every failure as `NotFound`, and the shared
+  library fallback to `/lib/<name>` retried a *device* failure at a second
+  path, turning one refusal into two log lines and the wrong verdict.
+
+Two dead trait methods went with it rather than being converted:
+`FileSystem::file_size` (no caller — `stat` is `open` + `fstat`, and `readdir`
+carries sizes) and `FileSystem::delete_prefix` (four implementations, no
+caller). `bcachefs_adapter::no_channel` is gone; both adapters now map their
+crate's error enum **exhaustively**, which `toyos_fat32::Error`'s own doc
+comment asks for by name. Corruption variants map to `Io` and not `NotFound`: a
+btree node or a cluster chain that does not decode is a volume that cannot
+answer, which is what a caller can do nothing different about.
+
+Gates, both with the control watched red and green — `specs/metal-track-history.md`
+has the discipline and this is what it looked like here:
+
+- `log_backing_read_error` (`fat-backing-read-fails`) gained a *read* claim
+  beside its write claim: the guest reads the page the host staged and the
+  device refuses, and a success there is now the failure. Control: making
+  `fd::try_read` ignore `read_page`'s error puts the file back as zeros and the
+  test reds on the count in the guest's own line.
+- `boot_volume_metadata_error` (`fat-boot-reads-fail`, new) is the *metadata*
+  half, which the older feature cannot reach — it injects at
+  `FatBacking::read_page`, the page-fault path, which touches no directory
+  entry, so with it armed `open`, `read_dir` and mtime all still succeed. The
+  new one is under `Fat32` itself and arms only once `mount` has returned, so
+  the probe and the mount still work and the boot log's mount line is a
+  load-bearing part of the verdict: an unmounted `/boot` falls through to the
+  initrd and answers `NotFound` honestly, which is the string the test refuses.
+
+**Two residuals.**
+
+`close` cannot report `EIO`. The flush a descriptor owes is in
+`fd::OpenFile::drop` now, which is the right place for it — it is the one path
+a process killed by another CPU also takes — and a `Drop` has nothing to return
+to the `close` syscall. So a failed flush is logged and no process is told.
+Every *other* way of asking is honest: `fsync` returns the code, and a `write`
+whose page the device refused returns `Io` rather than a count.
+
+And, one layer up and outside this tree:
+
+`std::sys::fs::toyos::stat` discards the error from `syscall::open` and returns
+a hardcoded `io::ErrorKind::NotFound`, so `fs::metadata` re-creates the exact
+conflation this task removed — at the userland end, where the kernel can do
+nothing about it. `File::open`, `fs::read` and `fs::read_dir` all propagate
+correctly; it is `stat`/`lstat` alone. The fix is three lines in the std fork
+and could not be made from a worktree: `rust/` is an empty stub in every linked
+worktree by design (`specs/worktrees.md` §2), so it belongs to whoever is
+working in the primary checkout.
 
 ## 10. The stick's two partitions as filesystems, and the log on one of them
 
@@ -5927,9 +6001,9 @@ The first two say `SyscallError::Unknown`; the third says "no such file".
 mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
 `kernel/src/log_file.rs` writes one file per boot to `/log`, named for the wall
 clock. Gated by `esp_filesystem`, `kernel_log_file`, `log_backing_read_error`,
-`log_partition_automount`, `log_partition_identity` and `wall_clock_file`
-(`tests/common/volumes.rs`, `tests/common/wallclock.rs`), and `toybox_cp_volume`
-(`tests/common/toybox.rs`).
+`boot_volume_metadata_error`, `log_partition_automount`,
+`log_partition_identity` and `wall_clock_file` (`tests/common/volumes.rs`,
+`tests/common/wallclock.rs`), and `toybox_cp_volume` (`tests/common/toybox.rs`).
 
 ### `Sink::append`'s error return is correct and no longer reachable from a boot
 

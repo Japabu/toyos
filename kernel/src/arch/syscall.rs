@@ -890,17 +890,20 @@ fn sys_delete(path: &str) -> u64 {
     if !vfs.user_may_modify(&resolved) {
         return SyscallError::PermissionDenied.to_u64();
     }
-    if vfs.delete(&resolved) { 0 } else { SyscallError::NotFound.to_u64() }
+    match vfs.delete(&resolved) {
+        Ok(()) => 0,
+        Err(e) => e.to_u64(),
+    }
 }
 
 fn sys_chdir(path: &str) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     match vfs::lock().cd(&cwd, path) {
-        Some(new_cwd) => {
+        Ok(new_cwd) => {
             process::with_fd_owner_data(|d| d.cwd = new_cwd);
             0
         }
-        None => SyscallError::NotFound.to_u64(),
+        Err(e) => e.to_u64(),
     }
 }
 
@@ -1726,7 +1729,7 @@ fn sys_rename(old: &str, new: &str) -> u64 {
     }
     match vfs.rename(&old_abs, &new_abs) {
         Ok(()) => 0,
-        Err(_) => SyscallError::NotFound.to_u64(),
+        Err(e) => e.to_u64(),
     }
 }
 
@@ -1765,7 +1768,7 @@ fn sys_symlink(target: &str, link: &str) -> u64 {
         Ok(()) => 0,
         Err(e) => {
             log!("symlink({target} -> {link}): {e}");
-            SyscallError::Unknown.to_u64()
+            e.to_u64()
         }
     }
 }
@@ -1775,13 +1778,14 @@ fn sys_readlink(path: &str, out: &mut UserBytesMut) -> u64 {
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     match vfs.read_link(&resolved) {
-        Some(target) => {
+        Ok(Some(target)) => {
             let bytes = target.as_bytes();
             let len = bytes.len().min(out.len());
             out.write_at(0, &bytes[..len]);
             len as u64
         }
-        None => SyscallError::NotFound.to_u64(),
+        Ok(None) => SyscallError::NotFound.to_u64(),
+        Err(e) => e.to_u64(),
     }
 }
 
@@ -1794,10 +1798,10 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
         Some(lib) => lib,
         None => {
             let backing = match vfs::lock().open_backing(&resolved) {
-                Some(b) => b,
-                None => {
-                    log!("dlopen: {}: not found", resolved);
-                    return SyscallError::NotFound.to_u64();
+                Ok(b) => b,
+                Err(e) => {
+                    log!("dlopen: {}: {e}", resolved);
+                    return e.to_u64();
                 }
             };
 

@@ -628,10 +628,6 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
         Ok(self.find_by_name(name)?.is_some_and(|(key, _)| key.key_type == KeyType::Symlink))
     }
 
-    /// Get file size without reading data (metadata only).
-    pub fn file_size_meta(&self, name: &str) -> Result<Option<u64>, FsError> {
-        Ok(self.leaf(name)?.map(|leaf| leaf.size()))
-    }
 }
 
 // --- ReadWrite-only operations ---

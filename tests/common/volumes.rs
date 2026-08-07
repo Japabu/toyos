@@ -1071,6 +1071,24 @@ pub fn log_backing_read_error(
         ));
     }
 
+    // 2b. The read of the same page, which is the sharper half and was the
+    //     later fix: `file_cache::read_page` returned `()`, so the process got
+    //     the page zeroed and a success. Nothing above it — not this test, not
+    //     a `cat`, not the ELF loader — can tell that from a file that really
+    //     is zeros there, which is why the count is in the guest's line and
+    //     why this refuses the success rather than checking the bytes.
+    if !log.contains("reread: the read failed") {
+        let said = log
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("reread: the read"))
+            .unwrap_or("(the guest never reported its read)");
+        return Err(format!(
+            "a page the device would not give back reached the process as data: {said}\n\
+             A failed read has to be distinguishable from a hole.\n{log}"
+        ));
+    }
+
     // 3. And the machine is fine. A refusal that costs the boot is not a fix.
     if !log.contains("Boot: complete") {
         return Err(format!("the boot did not finish\n{log}"));
@@ -1102,6 +1120,131 @@ pub fn log_backing_read_error(
         "  [log] {reported} page re-read(s) refused by the device: reported, propagated to the \
          process that asked, and the {} bytes the host staged are intact",
         STAGED_TEXT.len()
+    );
+    Ok(())
+}
+
+/// A mounted volume that stops answering, and the questions `vfs::FileSystem`
+/// used to fold into "no such file".
+///
+/// `open` and `read_dir` reached filesystem methods returning an `Option`, a
+/// `bool` and a bare `u64`, so a device that refused a transfer was reported to
+/// userland as a name that is not there. Nothing downstream can act on that: it
+/// creates a file over one that exists, reports a program missing off a stick
+/// that is merely unhappy, and unlinks a name it believes is already gone.
+///
+/// `fat-boot-reads-fail` is the actuator and its sibling
+/// `fat-backing-read-fails` is not: that one injects at
+/// `FatBacking::read_page`, which is the page-fault path and reaches no
+/// directory entry, so with it armed every question below still succeeds. This
+/// one is under `Fat32` itself. Neither can be staged from the host — both
+/// partitions live on the disk the guest is running from, so `readonly=on` is
+/// writes only and `rerror` takes the whole drive.
+///
+/// **The mount line is a load-bearing assertion and not decoration.** A `/boot`
+/// that failed to mount is not a mount at all: `Vfs::resolve_fs` falls through
+/// to the root filesystem, the initrd has no `boot/` in it, and every question
+/// below would then answer `NotFound` for an honest reason — which is precisely
+/// the string this test exists to refuse.
+pub fn boot_volume_metadata_error(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const FEATURES: &[&str] = &["fat-boot-reads-fail"];
+    /// What the injection prints from under `Fat32`, once per refused read.
+    const REFUSED: &str = "boot-volume: read of";
+
+    let image_path = test_dir().join("fat-boot-reads-fail.img");
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURES);
+    std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: qemu::Profile::Metal,
+            boot_image: Some(image_path.clone()),
+            kernel_features: FEATURES,
+            ..Default::default()
+        },
+    );
+    let mut log = qemu.boot_log().to_string();
+    if !log.contains("boot-volume: partition mounted") {
+        return Err(format!(
+            "the boot partition did not mount, so every question below would answer NotFound \
+             for an honest reason and this boot proves nothing:\n{}",
+            volume_lines(&log)
+        ));
+    }
+
+    let attempt = qemu.run_test("test_rs_boot_volume_metadata_error", Duration::from_secs(30));
+    log.push_str(&attempt.stdout);
+    log.push_str(&attempt.serial);
+    writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
+    drop(qemu);
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?} on the boot\n{log}"));
+        }
+    }
+
+    // 1. The injection reached the device layer under the filesystem, so what
+    //    follows is a volume that was asked and would not answer, rather than a
+    //    code path that never ran.
+    let refused = log.matches(REFUSED).count();
+    if refused == 0 {
+        return Err(format!(
+            "no {REFUSED:?} line — nothing read the boot volume after it was mounted, so this \
+             boot exercises none of the metadata path\n{log}"
+        ));
+    }
+
+    // 2. and 3. The two questions, each judged on the word it came back with.
+    //    `NotFound` is named explicitly because it is the *old* answer and the
+    //    whole defect: a check for "an error" alone would have passed before the
+    //    change, since a missing file is an error too.
+    for (what, prefix) in [("open", "boot-io: open"), ("read_dir", "boot-io: read_dir")] {
+        let Some(said) = log.lines().map(str::trim).find(|l| l.starts_with(prefix)) else {
+            return Err(format!("the guest never reported its {what}\n{log}"));
+        };
+        if said.contains("succeeded") {
+            return Err(format!(
+                "{what} of a volume that refused every read succeeded: {said}\n{log}"
+            ));
+        }
+        if said.contains("kind=NotFound") {
+            return Err(format!(
+                "{what} reported a device that would not answer as a missing file: {said}\n\
+                 That is the conflation this gate exists for — `vfs::FileSystem` folding a \
+                 refused read into NotFound.\n{log}"
+            ));
+        }
+    }
+
+    // 4. And it is this volume's refusal and not the machine's. The other FAT
+    //    mount is the same adapter over the same driver, so a break that
+    //    reached both would look identical in the two lines above.
+    if !log.contains("boot-io: /log still lists") {
+        return Err(format!(
+            "/log stopped answering too, so the refusal above is not the boot volume's\n{log}"
+        ));
+    }
+
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not finish\n{log}"));
+    }
+    if !log.contains("Shutting down.") {
+        return Err(format!("the guest did not shut down cleanly\n{log}"));
+    }
+
+    let _ = std::fs::remove_file(&image_path);
+    eprintln!(
+        "  [boot] {refused} filesystem read(s) refused by the mounted boot volume: open and \
+         read_dir both reported the device rather than a missing file, and /log kept answering"
     );
     Ok(())
 }
