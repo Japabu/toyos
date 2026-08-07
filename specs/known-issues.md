@@ -3363,6 +3363,13 @@ notion of how much host a task wants so two eight-CPU guests do not pair.
 **Whichever it is, a landing is currently a coin toss** — three of seven runs in
 one session were red on this and nothing else.
 
+**Cost another landing on 2026-08-07**, task #133, with the same signature and a
+wider margin than any row above: `desktop_audio_client` **787 s** in the wide
+phase against **14 s** alone, on a host carrying four other worktrees. Its
+verdict line was its own (`1 of the two overlapping clients left the mixer`)
+rather than `desktop_typing_damage`'s, so the message is not the tell — the pair
+of durations is.
+
 ### A whole parallel phase can be starved by another agent's build
 
 Measured 2026-08-04: the same tree that runs the phase in 44.8 s ran it in
