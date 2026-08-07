@@ -26,7 +26,24 @@ test-actuators = [
     "test-double-fault",
     "test-heap-ceiling",
     "test-kernel-canary",
+    "test-tlb-ack-delay",
 ]
+# SYS_DEBUG action 12: make the highest-numbered CPU answer its next TLB
+# shootdown late, and report how long the shootdown took.
+#
+# What nothing else reaches: whether the initiator *waits*. A correct wait and no
+# wait at all both measure zero on a machine where every CPU answers in
+# microseconds, and QEMU has no way to make one vCPU answer an IPI late — no
+# device, no machine property, no `-cpu` flag. The delay is staged after the
+# flush and before the publication, so what it produces is a slow answer and
+# never an incorrect one.
+#
+# The one place it is not inert: `serve_ipi` loads one relaxed word per flush, on
+# a path a boot runs. That word is written by nothing except action 12, so a
+# kernel carrying this feature and never asked flushes exactly as one without it
+# — which is the claim `INERT_ACTUATORS` membership makes, stated here because
+# this is the first member whose code is not confined to the match arm.
+test-tlb-ack-delay = []
 debug-wait = []
 # Panic between arming the on-screen console and mm::init, so a test can
 # assert the console covers the window where nothing else can report.

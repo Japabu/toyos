@@ -145,20 +145,26 @@ impl MappedPages {
 
     pub fn size(&self) -> usize { self.pages.size() }
 
-    /// Take the mapping out of `addr_space` and hand back the pages. The
-    /// caller must complete a TLB shootdown before dropping them: `unmap`'s
-    /// `invlpg` reaches this CPU only, and a sibling running another thread of
-    /// the same process can still hold an entry for a page the PMM is about to
-    /// reissue.
-    #[must_use]
-    fn unmap_from(self, addr_space: &mut crate::mm::paging::AddressSpace) -> PageAlloc {
+    /// Take the mapping out of `addr_space` and hand back the pages, still
+    /// reachable from every other CPU until the wrapper is dropped.
+    ///
+    /// The obligation used to be a sentence in this comment and is now the
+    /// return type: `unmap`'s `invlpg` reaches this CPU only, and a sibling
+    /// running another thread of the same process can still hold an entry for a
+    /// page the PMM is about to reissue.
+    fn unmap_from(
+        self,
+        addr_space: &mut crate::mm::paging::AddressSpace,
+    ) -> crate::mm::Unmapped<PageAlloc> {
         addr_space.free_and_unmap(self.vaddr);
-        self.pages
+        crate::mm::Unmapped::new(self.pages)
     }
 
     pub fn release(self, pt: &PageTables) {
+        // Two statements, because the shootdown inside the drop may not run
+        // while the address-space lock is held: a sibling taking a page fault
+        // spins on that lock with `IF` clear and could never acknowledge.
         let pages = self.unmap_from(&mut pt.lock());
-        crate::arch::apic::tlb_shootdown();
         drop(pages);
     }
 }
@@ -172,13 +178,17 @@ impl MappedPages {
 /// address space left to unmap from.
 ///
 /// `tls` arrives by value because the caller holds the `ProcessData` lock and
-/// the `ThreadData` lock is never held at the same time.
+/// the `ThreadData` lock is never held at the same time. The pages go back out
+/// for the same reason: freeing one waits for every other CPU to flush, and one
+/// shootdown per block is what the caller pays — a thread owns its TLS and at
+/// most one block per module it touched, and thread exit is not a hot path.
+#[must_use]
 fn release_thread_mappings(
     data: &mut ProcessData,
     tls: Option<MappedPages>,
     pt: &PageTables,
     tid: Tid,
-) {
+) -> Vec<crate::mm::Unmapped<PageAlloc>> {
     let keys: Vec<(Tid, u64)> = data.elf.dynamic_tls_blocks.keys()
         .filter(|&&(t, _)| t == tid)
         .copied()
@@ -193,8 +203,7 @@ fn release_thread_mappings(
             data.free_count += 1;
         }
     }
-    crate::arch::apic::tlb_shootdown();
-    drop(pages);
+    pages
 }
 
 pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
@@ -591,7 +600,9 @@ pub fn revoke_pipe_maps(maps: &mut Vec<PipeMap>, pt: &PageTables, pipe: pipe::Pi
             false
         });
     }
-    crate::arch::apic::tlb_shootdown();
+    // Outside the block, because it waits: the lock this CPU would still be
+    // holding is one a sibling can be spinning on with `IF` clear.
+    crate::arch::tlb::shootdown();
 }
 
 pub struct MmapRegion {
@@ -1016,9 +1027,12 @@ fn teardown_resources(
 ///
 /// Caller must hold the PROCESS_TABLE lock, have claimed teardown, retired
 /// every other thread of the process (so none can run), and freed resources.
-/// Returns (pid, tid) wakes to deliver after the table lock drops.
+/// Returns the (pid, tid) wakes to deliver after the table lock drops, and the
+/// shared regions to free after it — freeing one waits for every other CPU to
+/// flush, which is not something to do holding the process table.
 fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
-                        main_cpu_ns: u64) -> Vec<(Pid, Tid)> {
+                        main_cpu_ns: u64)
+                        -> (Vec<(Pid, Tid)>, crate::mm::Unmapped<shared_memory::Retired>) {
     let proc = table.get_mut(process_pid)
         .expect("teardown_bookkeeping: process not found");
     let main_tid = proc.main_tid;
@@ -1031,7 +1045,7 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
         }
     }
 
-    shared_memory::cleanup_process(process_pid);
+    let retired = shared_memory::cleanup_process(process_pid);
 
     let proc = table.get(process_pid).unwrap();
     let cpu_ms = main_cpu_ns / 1_000_000;
@@ -1055,7 +1069,7 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
         }
     }
 
-    to_wake
+    (to_wake, retired)
 }
 
 /// Snapshot this process's accounting onto its parent, for `waitpid` to read.
@@ -1171,11 +1185,13 @@ pub fn exit(code: i32) -> ! {
     let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
 
     // Phase 4: table bookkeeping (zombie marks, orphan adoption, parent wake)
-    let to_wake = {
+    let (to_wake, retired) = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         teardown_bookkeeping(table, process_pid, code, main_cpu_ns)
     };
+    // After the table lock, because the drop waits for every other CPU to flush.
+    drop(retired);
 
     // Phase 5: stash accounting on the parent, wake waiters, exit
     stash_accounting_snapshot(&process_data_arc, process_pid, parent_pid, syscall_total, syscall_total_ns, main_cpu_ns);
@@ -1212,11 +1228,15 @@ pub fn thread_exit(code: i32) -> ! {
         let mut tdata = tdata_arc.lock();
         tdata.tls_pages.take()
     };
-    {
+    let released = {
         let owner_arc = fd_owner_data();
         let mut owner_data = owner_arc.lock();
-        release_thread_mappings(&mut owner_data, tls, &addr_space, tid);
-    }
+        release_thread_mappings(&mut owner_data, tls, &addr_space, tid)
+    };
+    // After the block: dropping these waits for every other CPU, and the
+    // process-data lock they were taken under is one the page-fault handler
+    // takes with `IF` clear.
+    drop(released);
 
     let parent_main_tid = {
         let mut guard = PROCESS_TABLE.lock();
@@ -1732,11 +1752,13 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, target_pid);
 
     // Phase 4: Table bookkeeping (same path as exit)
-    let to_wake = {
+    let (to_wake, retired) = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         teardown_bookkeeping(table, target_pid, 137, main_cpu_ns)
     };
+    // After the table lock, because the drop waits for every other CPU to flush.
+    drop(retired);
 
     // Phase 5: Stash accounting snapshot on parent
     stash_accounting_snapshot(&process_data_arc, target_pid, Some(caller), syscall_total, syscall_total_ns, main_cpu_ns);

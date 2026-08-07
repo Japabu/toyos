@@ -391,11 +391,7 @@ pub fn remap() {
         return;
     }
     let size = RAW_SIZE.load(Ordering::Relaxed);
-    mm::paging::kernel()
-        .lock()
-        .as_mut()
-        .unwrap()
-        .map_mmio(phys, align_2m(size as usize) as u64, CachePolicy::WriteCombining);
+    mm::paging::map_mmio(phys, align_2m(size as usize) as u64, CachePolicy::WriteCombining);
     rearm();
 }
 

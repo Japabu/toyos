@@ -72,8 +72,11 @@ fn ipi_all_excluding_self(vector: u8) {
     cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | vector as u64);
 }
 
-/// Flush TLB on all other CPUs. No-op if x2APIC not yet initialized.
-pub fn tlb_shootdown() {
+/// Ask every other CPU to flush its TLB. The *asking* only — `arch::tlb` owns
+/// the protocol that turns it into an answer, and nothing outside that module
+/// may send this vector: a flush request nobody waits for is exactly the defect
+/// M3 removed, and a second sender would reintroduce it one call at a time.
+pub(super) fn tlb_ipi() {
     if X2APIC_ENABLED.load(Ordering::Relaxed) {
         ipi_all_excluding_self(0xFE);
     }
