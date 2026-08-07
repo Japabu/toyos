@@ -602,9 +602,12 @@ fn drain_irqs() {
         // One wait queue for both backends: an over-wake costs a recheck, and a
         // second queue would have to be chosen by whichever driver bound —
         // which is a fact the parking side does not have.
-        crate::audio::wake_waiters();
+        crate::sched::waitqs::wake_all(&crate::sched::waitqs::AUDIO);
         for (watchers, source) in [
-            (crate::audio::io_uring_watchers(), crate::io_uring::Source::Audio),
+            (
+                crate::drivers::virtio_sound::io_uring_watchers(),
+                crate::io_uring::Source::VirtioSound,
+            ),
             (crate::drivers::hda::io_uring_watchers(), crate::io_uring::Source::Hda),
         ] {
             if !watchers.is_empty() {

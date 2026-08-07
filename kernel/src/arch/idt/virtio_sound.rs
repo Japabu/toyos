@@ -1,19 +1,10 @@
 use super::device_irq::device_irq_entry;
-use crate::irq_ring::IrqSource;
 
-/// Rust half of the MSI-X handler. Lock-free and heap-free: it may interrupt
-/// a CPU that holds the AUDIO lock (the lock disables preemption, not IRQs).
+/// Rust half of the MSI-X handler. Lock-free and heap-free: it may interrupt a
+/// CPU that holds the controller lock, which disables preemption and not
+/// interrupts.
 extern "sysv64" fn virtio_sound_handler() {
-    // Timestamp first — this is the hardware-completion time the DLL feeds on.
-    let timestamp = crate::clock::nanos_since_boot();
-    let mask = crate::drivers::virtio_sound::isr_drain_tx();
-    if mask != 0 {
-        crate::audio::isr_push_completion(mask, timestamp);
-        crate::irq_ring::isr_publish(IrqSource::Audio, timestamp);
-        // Force a scheduler entry on IRQ return so drain_irqs converts the
-        // record into wakes now, not at the next 10ms quantum tick.
-        crate::preempt::set_need_resched();
-    }
+    crate::drivers::virtio_sound::isr_complete();
     crate::arch::apic::eoi();
 }
 

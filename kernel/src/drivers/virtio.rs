@@ -53,6 +53,9 @@ struct VirtqDesc {
     next: u16,
 }
 
+/// One descriptor, for a caller sizing a table it allocates itself.
+pub const DESC_BYTES: usize = core::mem::size_of::<VirtqDesc>();
+
 // Avail ring layout: flags(u16) + idx(u16) + ring[size](u16 each)
 const AVAIL_IDX_OFF: usize = 2;
 const AVAIL_RING_OFF: usize = 4;
@@ -170,13 +173,6 @@ pub struct DescSlot(u16);
 
 impl DescSlot {
     pub fn id(&self) -> u16 { self.0 }
-
-    /// Re-mint a slot whose completion was observed out-of-band. The audio
-    /// ISR owns the txq used ring (`UsedRingConsumer`), so the syscall side
-    /// recycles descriptors from completion-record masks instead of
-    /// `poll_used` — this is the only path that bypasses the proof-token
-    /// flow, restricted to driver code.
-    pub(in crate::drivers) fn reclaim(id: u16) -> Self { Self(id) }
 }
 
 /// Interrupt-context consumer of a virtqueue's used ring, split off with
@@ -269,6 +265,47 @@ impl Virtqueue {
     pub fn avail_phys(&self) -> u64 { self.avail.phys() }
     pub fn used_phys(&self) -> u64 { self.used.phys() }
 
+    /// Where in the notification region this queue's doorbell sits, in bytes.
+    ///
+    /// Read from the device by `setup_queue`, so it is meaningless before that.
+    pub fn notify_bytes(&self, multiplier: u32) -> u64 {
+        self.notify_offset as u64 * multiplier as u64
+    }
+
+    /// Write one descriptor chain and publish nothing.
+    ///
+    /// The half of [`submit`](Self::submit) that names memory, separated so a
+    /// queue whose chains are fixed at bind can have them built once by the
+    /// kernel and published by somebody who never sees a descriptor
+    /// (`specs/hda-driver-plan.md` §4.1). Chains built this way are addressed by
+    /// index rather than by a [`DescSlot`], because the proof a slot carries —
+    /// that this descriptor is not in flight — is the publisher's to hold and
+    /// the publisher is not here.
+    pub fn write_chain(&self, first_desc: u16, bufs: &[(u64, u32, BufDir)]) {
+        assert!(
+            (first_desc as usize + bufs.len()) <= self.size as usize,
+            "virtqueue: chain at {first_desc} of {} descriptors runs past a queue of {}",
+            bufs.len(),
+            self.size
+        );
+        for (i, (addr, len, dir)) in bufs.iter().enumerate() {
+            let desc_idx = first_desc + i as u16;
+            let mut flags: u16 = match dir {
+                BufDir::Readable => 0,
+                BufDir::Writable => VIRTQ_DESC_F_WRITE,
+            };
+            if i != bufs.len() - 1 {
+                flags |= VIRTQ_DESC_F_NEXT;
+            }
+            let desc = VirtqDesc { addr: *addr, len: *len, flags, next: desc_idx + 1 };
+            let desc_ptr = self
+                .desc
+                .ptr_at(desc_idx as usize * core::mem::size_of::<VirtqDesc>())
+                as *mut VirtqDesc;
+            unsafe { write_volatile(desc_ptr, desc) };
+        }
+    }
+
     fn avail_idx_ptr(&self) -> *mut u16 {
         self.avail.ptr_at(AVAIL_IDX_OFF) as *mut u16
     }
@@ -290,18 +327,6 @@ impl Virtqueue {
     /// The caller manages these tokens — `submit()` consumes one, `poll_used()` returns one.
     pub fn initial_slots(&self) -> alloc::vec::Vec<DescSlot> {
         (0..self.size).map(DescSlot).collect()
-    }
-
-    /// Like `initial_slots`, but returns only slots spaced `stride` apart.
-    /// Use when each submission chains multiple consecutive descriptors.
-    /// Slots whose chain would wrap past the end of the descriptor table are
-    /// excluded — `submit` indexes descriptors mod `size`, so a wrapping
-    /// chain would alias slot 0's descriptors.
-    pub fn initial_slots_strided(&self, stride: u16) -> alloc::vec::Vec<DescSlot> {
-        (0..self.size).step_by(stride as usize)
-            .filter(|s| s + stride <= self.size)
-            .map(DescSlot)
-            .collect()
     }
 
     /// Submit a descriptor chain and notify the device (non-blocking).
