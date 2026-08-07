@@ -115,23 +115,28 @@ impl Ring {
         self.capacity - self.available()
     }
 
-    /// Read up to `buf.len()` bytes. Returns number of bytes read.
-    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+    /// Read up to `want` bytes, handing `sink` each contiguous run of them with
+    /// its offset in the destination. Returns the number of bytes read.
+    ///
+    /// The destination is described rather than passed because the kernel's is
+    /// user memory, and a `&mut [u8]` over a page userland can write is the
+    /// aliasing claim `kernel::user_ptr` exists to stop making. One or two runs,
+    /// never more: the second is the ring's own wrap.
+    pub fn read(&mut self, want: usize, mut sink: impl FnMut(usize, &[u8])) -> usize {
         let avail = self.available() as usize;
         if avail == 0 {
             return 0;
         }
-        let count = buf.len().min(avail);
+        let count = want.min(avail);
         let cap = self.capacity as usize;
         let offset = self.read_cursor as usize % cap;
         let data = self.data_ptr();
 
-        // May need two copies if wrapping around the buffer end
         let first = count.min(cap - offset);
         unsafe {
-            core::ptr::copy_nonoverlapping(data.add(offset), buf.as_mut_ptr(), first);
+            sink(0, core::slice::from_raw_parts(data.add(offset), first));
             if first < count {
-                core::ptr::copy_nonoverlapping(data, buf.as_mut_ptr().add(first), count - first);
+                sink(first, core::slice::from_raw_parts(data, count - first));
             }
         }
 
@@ -139,22 +144,25 @@ impl Ring {
         count
     }
 
-    /// Write up to `buf.len()` bytes. Returns number of bytes written.
-    pub fn write(&mut self, buf: &[u8]) -> usize {
+    /// Write up to `want` bytes, asking `fill` for each contiguous run of them
+    /// by its offset in the source. Returns the number of bytes written.
+    ///
+    /// The mirror of [`Self::read`], and the same reason.
+    pub fn write(&mut self, want: usize, mut fill: impl FnMut(usize, &mut [u8])) -> usize {
         let free = self.space() as usize;
         if free == 0 {
             return 0;
         }
-        let count = buf.len().min(free);
+        let count = want.min(free);
         let cap = self.capacity as usize;
         let offset = self.write_cursor as usize % cap;
         let data = self.data_ptr();
 
         let first = count.min(cap - offset);
         unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), data.add(offset), first);
+            fill(0, core::slice::from_raw_parts_mut(data.add(offset), first));
             if first < count {
-                core::ptr::copy_nonoverlapping(buf.as_ptr().add(first), data, count - first);
+                fill(first, core::slice::from_raw_parts_mut(data, count - first));
             }
         }
 
@@ -209,6 +217,17 @@ mod tests {
         fn drop(&mut self) {
             unsafe { dealloc(self.ptr, self.layout) }
         }
+    }
+
+    /// The slice forms the kernel cannot have: here the destination is an
+    /// ordinary allocation, so describing it buys nothing.
+    fn read_slice(ring: &mut Ring, buf: &mut [u8]) -> usize {
+        let want = buf.len();
+        ring.read(want, |off, src| buf[off..off + src.len()].copy_from_slice(src))
+    }
+
+    fn write_slice(ring: &mut Ring, buf: &[u8]) -> usize {
+        ring.write(buf.len(), |off, dst| dst.copy_from_slice(&buf[off..off + dst.len()]))
     }
 
     /// Byte at absolute stream position `pos`. Every aligned 16-byte group
@@ -274,15 +293,15 @@ mod tests {
         ring.read_cursor = seed;
 
         let sent: [u8; 32] = core::array::from_fn(|i| stream_byte(i as u64));
-        assert_eq!(ring.write(&sent), 32);
+        assert_eq!(write_slice(&mut ring, &sent), 32);
 
         let mut got = [0u8; 32];
-        assert_eq!(ring.read(&mut got[..16]), 16);
+        assert_eq!(read_slice(&mut ring, &mut got[..16]), 16);
         assert_eq!(
             ring.read_cursor, 0,
             "the seed did not put the wrap between the two halves"
         );
-        assert_eq!(ring.read(&mut got[16..]), 16);
+        assert_eq!(read_slice(&mut ring, &mut got[16..]), 16);
         assert_eq!(
             got, sent,
             "a read straddling the cursor wrap did not return what was written"
@@ -313,13 +332,13 @@ mod tests {
             while written < target {
                 let n = wbuf.len().min((target - written) as usize);
                 fill(&mut wbuf[..n], written);
-                let put = ring.write(&wbuf[..n]);
+                let put = write_slice(&mut ring, &wbuf[..n]);
                 written += put as u64;
                 if put < n {
                     break;
                 }
             }
-            let got = ring.read(&mut rbuf);
+            let got = read_slice(&mut ring, &mut rbuf);
             assert!(got > 0, "ring stalled at {read} of {target}");
             fill(&mut expect[..got], read);
             if rbuf[..got] != expect[..got] {
@@ -355,9 +374,9 @@ mod tests {
             unsafe { core::ptr::write_bytes(backing.ptr, pattern, core::mem::size_of::<RingHeader>()) };
             let mut sent = std::vec![0u8; 3571];
             fill(&mut sent, pos);
-            assert_eq!(ring.write(&sent), sent.len());
+            assert_eq!(write_slice(&mut ring, &sent), sent.len());
             let mut got = std::vec![0u8; sent.len()];
-            assert_eq!(ring.read(&mut got), sent.len());
+            assert_eq!(read_slice(&mut ring, &mut got), sent.len());
             assert_eq!(got, sent, "header pattern {pattern:#04x} changed the stream");
             pos += sent.len() as u64;
         }

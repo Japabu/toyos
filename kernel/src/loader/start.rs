@@ -84,10 +84,10 @@ pub(crate) extern "C" fn thread_start() {
 }
 
 /// The last path component, truncated to what a process entry can hold.
-pub(crate) fn make_name(path: &str) -> [u8; 28] {
+pub(crate) fn make_name(path: &str) -> [u8; crate::process::THREAD_NAME_LEN] {
     let filename = path.rsplit('/').next().unwrap_or(path);
-    let mut name = [0u8; 28];
-    let len = filename.len().min(27);
+    let mut name = [0u8; crate::process::THREAD_NAME_LEN];
+    let len = filename.len().min(crate::process::THREAD_NAME_LEN - 1);
     name[..len].copy_from_slice(&filename.as_bytes()[..len]);
     name
 }
