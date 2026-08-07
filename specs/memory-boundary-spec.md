@@ -345,11 +345,24 @@ one copy, the same one, with the reference on the kernel side where it is true.
   nobody able to ask again — CLAUDE.md's rule that a failed operation must not
   have kept what it took. This is the only ordering M1b-2 changed and it has its
   own gate.
-- **The serial console's CSI filter is a state machine.** It was an index walk
-  with a one-byte lookahead, which the user path cannot do; `write_bytes` and
-  `write_user` now feed one shared `Csi` a byte at a time, so there is no second
-  implementation to disagree with the first and no chunk boundary for a sequence
-  to straddle. The path below it is already per-byte and ends at a UART.
+- **The serial console's CSI filter is a state machine**, because it was an
+  index walk with a one-byte lookahead and the user path cannot look ahead.
+  `write_bytes` hands it a slice and `write_user` hands it 256 bytes at a time
+  out of the window, with the filter's state carried across the chunks — so a
+  sequence straddling a chunk comes out as one that does not.
+
+  **The byte-at-a-time version was written first and measured 3× slower to
+  boot.** It has no chunk boundary at all, which is a property worth something,
+  and `xhci_slow_connect` refused it: with the loop inside `feed` the guest
+  reaches `xHCI: controller started` at 0.105 s (three runs: 0.104, 0.105,
+  0.105), and with one call per logged byte at 0.32 s (six runs, 0.317–0.338),
+  past the 0.3 s that test's actuator holds the ports empty for. The pre-xHCI
+  log is 53 lines and 4,711 bytes of *surviving* output, so the cost is not one
+  call per visible byte — a lossy ring drops most of what a boot logs, and what
+  the number really says is that this path is a much larger share of early boot
+  than its 4 KB of output suggests. Recorded because it makes `xhci_slow_connect`
+  a boot-cost gate as much as a USB one, and the next agent to touch `log!`
+  should expect it to answer.
 
 **Delta from the plan: `read_at`/`write_at` are a raw `copy_nonoverlapping`,
 not per-byte volatile.** What this stage exists to remove is the *reference*.
