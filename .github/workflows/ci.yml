@@ -67,6 +67,28 @@ jobs:
           rustup toolchain link toyos "$stage2"
           "$stage2/bin/rustc" -vV
 
+      # `assets/timgm6mb.sf2` is `.gitignore` line 3 — 5,994,284 bytes of
+      # SoundFont doom synthesises its music from, deliberately not carried in
+      # git. Three test configs declare it in `untracked-assets`, and a build
+      # that cannot find one is a hard error by design: a fresh clone is *told*
+      # rather than handed a doom that plays nothing (`specs/boot-image-split.md`
+      # §5). A runner is a fresh clone. Whether this repository may publish that
+      # file is the owner's call and not CI's, so the URL is a repository
+      # variable: set `TOYOS_SOUNDFONT_URL` and the desktop and metal-sim
+      # families run; leave it unset and they red, by name.
+      - name: the one asset git does not carry
+        env:
+          URL: ${{ vars.TOYOS_SOUNDFONT_URL }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "TOYOS_SOUNDFONT_URL is unset: assets/timgm6mb.sf2 will be missing,"
+            echo "and every test on the desktopcase, desktopaudiocase and metalcase"
+            echo "configs will fail on it. specs/ci-plan.md §6."
+            exit 0
+          fi
+          curl -sSLf -o assets/timgm6mb.sf2 "$URL"
+          ls -l assets/timgm6mb.sf2
+
       # `--host-slots 0`: the semaphore arbitrates between worktrees on one
       # host, and a shard is a host with one suite on it.
       - name: suite

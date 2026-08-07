@@ -203,7 +203,31 @@ compilation. With the cargo cache: 442 s (run `31201564400`).
 
 `toolchain.yml` when the release exists: **6 seconds** (run `31201563879`).
 
-## 6. What does not survive a Linux host
+## 6. What a fresh clone does not have
+
+**The SoundFont, and it is the one thing standing between CI and a green guest
+suite.** `assets/timgm6mb.sf2` is `.gitignore` line 3 — 5,994,284 bytes doom
+synthesises its music from, deliberately not carried in git. Three test configs
+declare it in `untracked-assets` (`desktopcase`, `desktopaudiocase`,
+`metalcase`) and a build that cannot find a declared asset is a hard error by
+design, so that a fresh clone is *told* rather than handed a doom that plays
+nothing (`specs/boot-image-split.md` §5). **A runner is a fresh clone**, so the
+whole desktop and metal-sim families red on it.
+
+Whether this repository may publish that file is a licensing decision and the
+owner's, not CI's. `ci.yml` therefore reads a repository variable
+`TOYOS_SOUNDFONT_URL`: set it and the guest job fetches the file before
+building; leave it unset and the job says so in one line and lets those tests
+red by name rather than mysteriously. **Nothing else is blocking a green guest
+suite.** Gate A is unaffected — it runs on `tests/testcases`, which declares no
+untracked asset.
+
+Observed on the dev host too, and it is the same defect wearing worktree
+clothes: `cargo run -- --worktree add` carries `.cargo/config.toml` and not
+this, so a brand-new worktree fails `metal_sim_compositor` and
+`metal_sim_pointer_churn` on it until somebody copies it across.
+
+## 6.1 What does not survive a Linux host
 
 `fsck_complaints` (`tests/common/volumes.rs`) shells out to `/sbin/fsck_msdos`
 and returns `no /sbin/fsck_msdos: this gate's outside judge is missing`
