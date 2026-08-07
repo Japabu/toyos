@@ -569,8 +569,15 @@ fn as_syscall_error(e: Error) -> SyscallError {
 /// The variant is in the line and not in the return: `SyscallError` has no room
 /// for one, and a triage that wants to know whether the chain was cyclic or the
 /// stick unplugged reads the log.
+///
+/// A name that is not there is the one answer with nothing to say. Logging it
+/// would put a line in the kernel's log for every `open` of a path that does
+/// not exist — on the volume that log lives on, which is work made for the
+/// thing that failed.
 fn refused(role: Role, op: &str, name: &str, e: Error) -> SyscallError {
-    log!("{role}-volume: {op} of {name}: {e}");
+    if e != Error::NotFound {
+        log!("{role}-volume: {op} of {name}: {e}");
+    }
     as_syscall_error(e)
 }
 
