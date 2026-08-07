@@ -327,19 +327,69 @@ impl SerialWriter {
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-                // Skip CSI escape sequence: ESC '[' ... <terminator 0x40-0x7E>
-                i += 2;
-                while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
-                    i += 1;
+        let mut csi = Csi::Text;
+        csi.feed(self, bytes);
+        csi.finish(self);
+    }
+
+    /// The same, for bytes that live in user memory and so cannot be a slice.
+    ///
+    /// Read in chunks, with the filter's state carried across them: a CSI
+    /// sequence straddling a chunk boundary must come out the same as one that
+    /// does not, and a fresh filter per chunk would emit its head.
+    pub fn write_user(&mut self, src: &crate::user_ptr::UserBytes) {
+        let mut chunk = [0u8; 256];
+        let mut csi = Csi::Text;
+        let mut off = 0;
+        while off < src.len() {
+            let n = chunk.len().min(src.len() - off);
+            src.read_at(off, &mut chunk[..n]);
+            csi.feed(self, &chunk[..n]);
+            off += n;
+        }
+        csi.finish(self);
+    }
+}
+
+/// Strips ANSI CSI sequences, so the ring never holds bytes the backend would
+/// drop.
+///
+/// A state machine rather than an index walk because the bytes arrive in two
+/// shapes — a kernel slice from `log!`, and 256 bytes at a time out of a user
+/// window — and only a machine that survives the gap between two chunks gives
+/// both the same answer.
+enum Csi {
+    Text,
+    /// An ESC held back: it is only the start of a sequence if `[` follows, and
+    /// it is emitted as itself if anything else does.
+    Esc,
+    Body,
+}
+
+impl Csi {
+    fn feed(&mut self, out: &mut SerialWriter, bytes: &[u8]) {
+        for &b in bytes {
+            match self {
+                Self::Text if b == 0x1B => *self = Self::Esc,
+                Self::Text => out.push_byte(b),
+                Self::Esc if b == b'[' => *self = Self::Body,
+                Self::Esc => {
+                    out.push_byte(0x1B);
+                    *self = Self::Text;
+                    if b == 0x1B { *self = Self::Esc } else { out.push_byte(b) }
                 }
-                if i < bytes.len() { i += 1; }
-            } else {
-                self.push_byte(bytes[i]);
-                i += 1;
+                Self::Body if (0x40..=0x7E).contains(&b) => *self = Self::Text,
+                Self::Body => {}
             }
+        }
+    }
+
+    /// A sequence the input ended in the middle of. The lone ESC is the caller's
+    /// byte and is emitted; a started CSI body is not, and its terminator was
+    /// never going to arrive.
+    fn finish(self, out: &mut SerialWriter) {
+        if matches!(self, Self::Esc) {
+            out.push_byte(0x1B);
         }
     }
 }

@@ -798,6 +798,23 @@ The fix is a typed BAR decode beside those, and it changes the signature: a
 caller that wants memory has to be handed an `Option<u64>` and say what it does
 without one. Four call sites in three drivers, one of them in `xhci/`.
 
+### `KernelSlice` is the last `&[u8]` over memory userland can write
+
+`user_ptr` hands out no reference to user memory any more (M1b of
+`specs/memory-boundary-spec.md`), but that is a statement about addresses
+*userland chose*. `mm::region::KernelSlice::as_slice` (`mm/region.rs:52-54`) is
+the other direction: a kernel allocation the loader later maps into a process,
+so the borrow is created before the aliasing exists. `elf.rs:973` builds a
+`&str` out of one — a `dynstr` symbol name read during relocation.
+
+Whether it is reachable depends on #159, not on this. `vma_map` passes
+`writable = true` unconditionally, so a `LibMemory::Shared` image one process
+already has mapped is writable by that process while `dlopen` relocates the
+same image for another. Fixing the protection (M2, `Protection` as a type)
+closes the aliasing and makes the borrow honest; converting the borrow first
+would describe a hazard that M2 removes. Recorded so the two are known to be
+one question rather than two.
+
 ---
 
 ## 2. The panic path
@@ -3552,24 +3569,60 @@ against.
 nothing at all — `compile::testcases_dir()` returns only `tests/testcases/tinycc`
 and no other Rust file mentions `pp_tcc`.
 
-### `toyos-cc` is not reproducible: the same source gives a different object
+### CLOSED — `toyos-cc` gave a different object for the same source
 
-Measured 2026-08-05. One binary, one source file, three runs:
-`d_event.c` from doomgeneric produced three objects that differ from each other
-at byte 345. The sizes are identical and the code is identical; what moves is
-where each BSS symbol lands — `eventhead`, `events` and `eventtail` swap
-between offsets 0, 4 and 0x500 from run to run. A `HashMap` iteration order
-somewhere in `codegen` is the obvious suspect and was not chased.
+Three `HashMap`/`HashSet` iterations in `codegen` were the emission order of
+three different things, and `RandomState` reseeds each of them per map:
 
-Across doomgeneric's 82 sources, comparing one binary against *itself* on two
-runs, 14 objects differ by disassembly. So a byte-for-byte object diff is not
-available as evidence that a compiler change was inert, and anyone who tries
-one will find 40-odd differences and no change behind them. What does work is
-diffing preprocessed output, which is stable — that comparison was byte
-identical on all 82 across the `__attribute__` change.
+- `tentative_info` (`codegen/mod.rs`) — the order tentative definitions are
+  zero-inited in, which is their order in BSS. This is the recorded symptom:
+  `d_event.c`'s `eventhead`, `events` and `eventtail` trading offsets 0, 4 and
+  0x500.
+- `variadic_stubs` — the order the x86_64 variadic call stubs are emitted in.
+- `FuncCtx::addr_taken` — the order the stack slots of address-taken parameters
+  are cut in, so it moves code and not just data.
 
-Consequences beyond that: no build cache anywhere can trust an object hash, and
-a miscompilation that depends on symbol placement would not reproduce.
+All three are now `BTreeMap`/`BTreeSet`, which is the whole fix: the container's
+own type carries a total order, so an iteration that reaches the object writer
+cannot be an unordered one. Nothing else in the crate iterates a hash container
+into the output — `defined_data` is membership-tested only, and `strings` and
+`tentative_data` were already `Vec`s.
+
+Measured before and after on doomgeneric's 83 compilable sources, one release
+binary: before, 42 of 83 objects differed between two runs; after, 0 of 83
+differed across five runs. `toyos-cc/tests/determinism.rs` is the gate — three
+cases naming one hazard each, compiled eight times per process, plus a sweep of
+the 133 tinycc cases that compile, driven through the binary so the seeding is a
+build's. It runs in 3.6 s with no guest. Negative control: with the fix
+reverted, each of the three targeted cases went red 40 times out of 40 and the
+corpus sweep named 6 files. Two runs per case rather than eight would have been
+39/40 on the spilled-parameter one, which is why it is eight.
+
+### OPEN, UNASSIGNED — `toyos-ld` has the same defect, and every ToyOS binary
+goes through it
+
+Found while closing the one above; not fixed with it, because the two crates
+share the shape of the bug and none of its code. Linking one **byte-identical**
+object six times gives six different binaries — 73 bytes differ between the
+first two, in two regions:
+
+- `.rela.dyn`. `reloc.rs` builds `relatives` and `glob_dats` by iterating
+  `params.got` and `params.dyn_got`, both `HashMap<SymbolRef, u64>`. Confirmed:
+  sorting those two vectors before they leave `apply_relocations` makes that
+  region identical across runs.
+- `.symtab`/`.strtab`. `emit_elf.rs` walks `state.locals` and then
+  `state.globals`, both `HashMap`s, to build the symbol entries — this is the
+  residual once the relocations are sorted, and it moves the string table too.
+
+Reproduce with any object at all: `toyos-cc --target x86_64-unknown-toyos x.o -o
+out` twice and `cmp`. `SymbolRef` is not `Ord`, so the `BTreeMap` that fixed the
+compiler needs a derive here first. Whether the Mach-O and PE writers share it
+is unmeasured; `emit_macho.rs` and `emit_pe.rs` each hold a `got: HashMap` of
+the same shape.
+
+This is the larger half of the reproducibility hole: the compiler's outputs are
+intermediate, and the linker's are the kernel, the bootloader and every binary
+in the image the owner flashes.
 
 ### `toyos-cc` does not implement packed bitfield layout, and says so
 

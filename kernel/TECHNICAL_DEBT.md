@@ -10,14 +10,17 @@ PML4 for AP transition, then switches to kernel PML4 in ap_entry.
 
 ## 2. user_ptr assumes physically contiguous user buffers
 
-`SyscallContext::user_slice()` translates the first page of a user buffer and
-returns a `&[u8]` spanning the full length. This works because ToyOS allocates
-user memory in physically contiguous 2MB blocks. If we ever add swap, COW fork,
-or non-contiguous VMAs, this breaks silently.
+`user_ptr::window` walks every 2 MiB boundary a buffer crosses and refuses one
+whose pages are not physically adjacent, so a non-contiguous buffer is a
+`BadAddress` and not a silent misread. What remains is that it *only* refuses:
+ToyOS allocates user memory in contiguous 2 MiB blocks, so nothing produces one
+today, and swap, COW fork or non-contiguous VMAs would turn ordinary reads and
+writes into refusals rather than into corruption.
 
-**Fix:** Replace `user_slice` / `user_slice_mut` with `UserBuf` / `UserBufMut`
-types that copy page-at-a-time through the direct map. The types exist but the
-syscall handler refactoring had bugs. Port handlers one at a time with testing.
+**Fix, when one of those arrives:** `UserBytes`/`UserBytesMut` already hand out
+no reference, so the change is confined to how a window addresses its pages —
+a run list instead of one base pointer, with `read_at`/`write_at` splitting at
+the boundaries. No caller's signature moves.
 
 **Not urgent while all user allocations are 2MB-aligned contiguous blocks.**
 
