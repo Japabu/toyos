@@ -14,7 +14,7 @@
 //! corrupted.
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::qemu::{self, BootOptions, QemuInstance};
 
@@ -162,6 +162,85 @@ pub fn idle_stack_guard(
     // policy. The whole change is that it is now reported at all: without the
     // guard the same overflow writes into the heap and the machine carries on
     // with a `BTreeMap` node the allocator no longer agrees about.
+    Ok(())
+}
+
+/// A NIC that cannot raise an interrupt must cost the machine networking and
+/// nothing else.
+///
+/// The MSI-X setup was written out three times and the copies answered this
+/// question three different ways: the xHCI driver fell back to MSI, and both
+/// virtio drivers called `panic!`. So the one device on the bus with no way to
+/// deliver a packet took down a kernel whose disk, console, audio and USB were
+/// all working — class M1 again, on the mechanism M1's own fix went through.
+///
+/// The other two virtio functions keep their vectors, which is what makes the
+/// verdict mean anything: the console that carries the refusal and the audio
+/// device beside it are on the same bus, driven by the same code, and neither
+/// notices.
+pub fn virtio_net_no_msix() -> Result<(), String> {
+    let options = BootOptions {
+        profile: qemu::Profile::VirtioNetNoMsix,
+        ..Default::default()
+    };
+    // The actuator is a device property and argv is the only place one is
+    // visible: a NIC that quietly kept its MSI-X table would make every line
+    // below a re-run of the happy path under a different name.
+    let argv = qemu::profile_argv(&options);
+    let devices = |kind: &str| -> Vec<&str> {
+        argv.windows(2)
+            .filter(|w| w[0] == "-device" && w[1].starts_with(kind))
+            .map(|w| w[1].as_str())
+            .collect()
+    };
+    let nics = devices("virtio-net");
+    let [nic] = nics[..] else {
+        return Err(format!("this profile is one NIC; argv has {nics:?}"));
+    };
+    if !nic.contains("vectors=0") {
+        return Err(format!("{nic} still has its MSI-X table"));
+    }
+    for kind in ["virtio-sound", "virtio-serial"] {
+        let others = devices(kind);
+        let [other] = others[..] else {
+            return Err(format!("this profile is one {kind}; argv has {others:?}"));
+        };
+        if other.contains("vectors=") {
+            return Err(format!(
+                "{other} is crippled too, so a refusal could not be shown to be per device \
+                 — and with no console there would be nothing to read it on"
+            ));
+        }
+    }
+
+    // `tests/netcase` rather than the ordinary config, because it is the one
+    // that runs netd — and netd's own answer is the assertion below that the
+    // refusal reached userland rather than stopping at a log line.
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/netcase");
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let mut log = crate::common::serial::Serial::boot(&qemu);
+    // netd is spawned before the ready marker and speaks after it, so its line
+    // is drained for rather than read out of the boot capture. A ceiling and
+    // not a measurement: what is asserted is that the line came, never when.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !log.text().contains("netd: ") {
+        let more = qemu.drain_serial(Duration::from_millis(200));
+        log.push(&more);
+    }
+
+    // Refused by name, at a named function, and not by claiming a mode it does
+    // not have: the xHCI driver's `polled mode` line is the defect this whole
+    // family exists to keep out of the tree.
+    log.must_say("VirtIO net: NOT INITIALISED at PCI")?;
+    log.must_not_say("VirtIO net: MSI-X vector")?;
+    // All the way out to userland, rather than a kernel that logged a refusal
+    // and handed netd a NIC anyway.
+    log.must_say("netd: no NIC on this machine, exiting")?;
+    // And the machine is otherwise whole. `must_be_clean` is what makes the
+    // change from `panic!` an assertion rather than a hope.
+    log.must_say("virtio-sound: MSI-X vector")?;
+    log.must_say("Boot: complete")?;
+    log.must_be_clean()?;
     Ok(())
 }
 

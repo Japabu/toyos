@@ -10,7 +10,7 @@ use crate::fd::{self, FdTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
 use crate::sched::payload::ThreadSched;
-use crate::{elf, pipe, scheduler, shared_memory, vfs};
+use crate::{elf, pipe, scheduler, shared_memory};
 use crate::{DirectMap, UserAddr};
 use crate::loader::{
     setup_tls, setup_combined_tls, alloc_kernel_stack, thread_start,
@@ -1000,7 +1000,7 @@ fn teardown_resources(
             data.peak_memory / (1024 * 1024), data.alloc_count, data.free_count);
     }
 
-    fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
+    fd::close_all(&mut data.fds);
     data.elf.elf_alloc.take();
     data.elf.loaded_libs.clear();
     data.mmap_regions.clear();

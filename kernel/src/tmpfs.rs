@@ -23,11 +23,13 @@ struct TmpfsBacking {
 impl FileBacking for TmpfsBacking {
     /// Never `Err`: the pages are the file, so there is no device to refuse.
     fn read_page(&self, file_offset: u64, buf: &mut [u8; 4096]) -> crate::block::BlockResult {
-        if file_offset >= file_cache::size(self.file_id) {
+        // An absent page below the file size is a hole a seek-and-write left,
+        // and a hole reads as zeros.
+        if file_offset >= file_cache::size(self.file_id)
+            || !file_cache::copy_page_out(self.file_id, (file_offset / 4096) as u32, buf)
+        {
             buf.fill(0);
-            return Ok(());
         }
-        file_cache::copy_page_out(self.file_id, (file_offset / 4096) as u32, buf);
         Ok(())
     }
 
@@ -101,7 +103,7 @@ impl FileSystem for TmpFs {
 
     fn delete(&mut self, name: &str) -> bool {
         if let Some((file_id, _)) = self.files.remove(name) {
-            file_cache::mark_deleted(file_id);
+            let _ = file_cache::mark_deleted(file_id);
             return true;
         }
         self.symlinks.remove(name).is_some()
@@ -114,7 +116,7 @@ impl FileSystem for TmpFs {
             .collect();
         for name in to_delete {
             if let Some((file_id, _)) = self.files.remove(&name) {
-                file_cache::mark_deleted(file_id);
+                let _ = file_cache::mark_deleted(file_id);
             }
         }
         self.symlinks.retain(|k, _| !k.starts_with(prefix));
@@ -122,7 +124,7 @@ impl FileSystem for TmpFs {
 
     fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
         if let Some((target_id, _)) = self.files.remove(new) {
-            file_cache::mark_deleted(target_id);
+            let _ = file_cache::mark_deleted(target_id);
         }
         if let Some(entry) = self.files.remove(old) {
             self.files.insert(String::from(new), entry);

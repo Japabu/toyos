@@ -57,6 +57,35 @@ second by carrying a refcount.
 Criteria order honored throughout: (1) compile-time impossibility, (2) runtime
 fail-fast, (3) tests.
 
+### 2.1 What tasks #61/#170 already moved, and what they pin
+
+`Descriptor` is owning now: every variant releases what it names in `Drop`, and
+`fd::close`/`close_all` match on no resource kind at all. Three consequences,
+none of which this spec has to undo:
+
+- **§6.5's "no DUP right" for a device claim is built, in its strongest form.**
+  `device::Claim` is not `Clone`, so `Descriptor` is not either, and
+  `Descriptor::duplicate` is a `-> Option<Self>` that *cannot* answer `Some` for
+  a claim. `dup`, `dup2` and a spawn `fd_map` all say `PermissionDenied`. The
+  `DEVICE_*_OWNER` statics survive because `is_owner` still reads them, so §7's
+  row deleting them stands and what is left there is only the pid-keyed gate.
+- **§5.3's `on_zero_handles` for `ListenerObject` and `IoUringObject` is built as
+  a plain refcount** — `listener::ListenerRef` and `io_uring::RingRef`, the
+  `PipeReader` shape. When those become objects the counters *are* the ends'
+  `handle_count`s and both types go away; nothing about them prejudges the
+  Arc-vs-handle question, so §5.1 is untouched.
+- **§5.1's premise is re-checked for descriptors and holds narrowly.** Process
+  kill *does* run the descriptor table's drops: `kill_process` and `exit` share
+  `teardown_resources`, which drains the table on the killer's CPU. What §5.1 is
+  about — an `Arc` a *blocked* thread cloned onto a kernel stack that is then
+  freed without unwinding — is a different value on a different stack, and stays
+  the reason `handle_count` cannot be an Arc count.
+
+Constraint this adds: `fd::OpenFile::drop` takes the VFS lock, so no `fd`-module
+entry point may accept a `&mut Vfs`. `FileObject` inherits that question —
+either it keeps the same rule, or the flush moves behind something the zero
+queue can drain (§5.2), which is the shape that would actually retire it.
+
 ## 3. Design overview
 
 - Every kernel object is a plain `Arc<T>`. No custom refcounting, no `dyn` dispatcher
@@ -426,7 +455,7 @@ pub struct DeviceClaim {
 }
 ```
 
-> **`SYS_AUDIO_SUBMIT` is already gated** on `device::is_owner(DEVICE_AUDIO, ..)`
+> **`SYS_AUDIO_SUBMIT` is already gated** on `device::is_owner(DeviceType::Audio, ..)`
 > (`arch/syscall.rs:366`), with the reason recorded at the site. The residual this
 > section should target is not the missing gate but that **a claim is not a
 > privilege**: `SYS_OPEN_DEVICE` is first-come, so whoever asks first holds

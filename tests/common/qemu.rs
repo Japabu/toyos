@@ -73,6 +73,15 @@ pub fn budget(one_guest: Duration) -> Duration {
 #[derive(Clone, Copy, PartialEq)]
 pub enum Profile {
     Headless,
+    /// [`Profile::Headless`] with the NIC's MSI-X capability taken away.
+    ///
+    /// The one configuration in this suite where a device the kernel has
+    /// already reset and negotiated features with turns out to have no way of
+    /// raising an interrupt. Every virtio function QEMU builds and every one
+    /// that ships has the capability, so nothing else could ask what the
+    /// driver does without it — and what it used to do was panic the kernel,
+    /// on a machine whose other devices were all fine.
+    VirtioNetNoMsix,
     Gop,
     /// M1 metal-sim: GOP, NVMe, xHCI with the boot stick on it, i8042 from
     /// q35, and nothing else -- no virtio device and no USB HID. This is the
@@ -387,6 +396,32 @@ const HDA_THREE: &[&str] = &[
     "hda-output,bus=hda2.0,cad=0,audiodev=hdaaud",
 ];
 
+/// Whether a machine has the virtio block, and whether its NIC can raise an
+/// interrupt.
+///
+/// Two shape dimensions and not one, because a device that publishes no MSI-X
+/// capability is a device, not an absence: the driver reaches it, resets it,
+/// negotiates features with it and only then finds it has no way to be told a
+/// packet arrived. `vectors=0` is the actuator — QEMU builds a virtio-pci
+/// function's MSI-X table only for a non-zero vector count — and it is the
+/// only one, since every emulated and every real virtio function has the
+/// capability.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Virtio {
+    Absent,
+    Present,
+    /// The whole block, with the NIC's MSI-X capability removed and
+    /// virtio-sound's and virtio-serial's left alone — so the console still
+    /// carries the refusal and audio still works while networking does not.
+    NicWithoutMsix,
+}
+
+impl Virtio {
+    fn present(self) -> bool {
+        self != Self::Absent
+    }
+}
+
 /// Everything a profile decides about the machine, in one table. A new
 /// variant answers every question here or does not compile — which `self !=
 /// Profile::Metal` did the opposite of: it handed anything that was not
@@ -403,7 +438,7 @@ struct Shape {
     /// were all blind to the remainder until one profile had one.
     vgamem_mb: Option<u32>,
     /// virtio-net, virtio-sound, and the console on virtio-serial.
-    virtio: bool,
+    virtio: Virtio,
     /// The `-device` argument for each xHCI controller, port and slot counts
     /// included. A list because a machine can have more than one and the T14
     /// does — its keyboard is on the second.
@@ -548,7 +583,20 @@ impl Profile {
             Self::Headless => Shape {
                 vga: "none",
                 vgamem_mb: None,
-                virtio: true,
+                virtio: Virtio::Present,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &["usb-kbd,bus=xhci.0"],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disks: &[],
+                hda: &[],
+                iommu: Some(IOMMU_DEFAULT),
+            },
+            Self::VirtioNetNoMsix => Shape {
+                vga: "none",
+                vgamem_mb: None,
+                virtio: Virtio::NicWithoutMsix,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &["usb-kbd,bus=xhci.0"],
@@ -561,7 +609,7 @@ impl Profile {
             Self::Gop => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: true,
+                virtio: Virtio::Present,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &["usb-kbd,bus=xhci.0"],
@@ -574,7 +622,7 @@ impl Profile {
             Self::Diskless => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -596,7 +644,7 @@ impl Profile {
                 // which is the geometry the machine actually has and the one
                 // the 2048x2048 default could not express.
                 vgamem_mb: Some(8),
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -613,7 +661,7 @@ impl Profile {
             Self::MetalUsb => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_WIDE],
                 storage_bus: "xhci.0",
                 usb: &[
@@ -632,7 +680,7 @@ impl Profile {
             Self::MetalDisk => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -645,7 +693,7 @@ impl Profile {
             Self::NvmeWideSector => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -658,7 +706,7 @@ impl Profile {
             Self::UsbDisk => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -671,7 +719,7 @@ impl Profile {
             Self::UsbDisk4k => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -684,7 +732,7 @@ impl Profile {
             Self::UsbDiskHuge => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -697,7 +745,7 @@ impl Profile {
             Self::UsbDiskRefusedFirst => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -710,7 +758,7 @@ impl Profile {
             Self::UsbDiskReadOnly => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -723,7 +771,7 @@ impl Profile {
             Self::UsbDiskCrowd => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -742,7 +790,7 @@ impl Profile {
             Self::MetalFullSpeed => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &["usb-wacom-tablet,bus=xhci.0", "usb-ccid,bus=xhci.0"],
@@ -755,7 +803,7 @@ impl Profile {
             Self::MetalXhciSecond => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT, XHCI_SECOND],
                 storage_bus: "xhci1.0",
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
@@ -774,7 +822,7 @@ impl Profile {
             Self::MetalXhciBoth => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT, XHCI_SECOND],
                 storage_bus: "xhci.0",
                 usb: &[
@@ -802,7 +850,7 @@ impl Profile {
             Self::MetalXhciMsi => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_NO_IRQ_FIRST, XHCI_MSI_ONLY],
                 storage_bus: "xhci.0",
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
@@ -818,7 +866,7 @@ impl Profile {
             Self::MetalXhciNoIrq => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT, XHCI_NO_IRQ_SECOND],
                 storage_bus: "xhci.0",
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
@@ -831,7 +879,7 @@ impl Profile {
             Self::MetalHotplug => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT, XHCI_SECOND],
                 storage_bus: "xhci.0",
                 usb: &["usb-tablet,bus=xhci.0"],
@@ -847,7 +895,7 @@ impl Profile {
             Self::NoIommu => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -860,7 +908,7 @@ impl Profile {
             Self::IommuNarrow => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -873,7 +921,7 @@ impl Profile {
             Self::IommuNoIntremap => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -886,7 +934,7 @@ impl Profile {
             Self::MetalHda => Shape {
                 vga: "std",
                 vgamem_mb: Some(8),
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -1923,7 +1971,7 @@ fn qemu_command(
 ) -> Command {
     let shape = options.profile.shape();
     assert!(
-        !options.mute || !shape.virtio,
+        !options.mute || !shape.virtio.present(),
         "mute removes the only console a virtio profile has"
     );
 
@@ -2099,11 +2147,14 @@ fn qemu_command(
         }
     }
 
-    if shape.virtio {
+    if shape.virtio.present() {
         qemu.arg("-netdev")
             .arg("user,id=net0")
             .arg("-device")
-            .arg("virtio-net-pci-non-transitional,netdev=net0")
+            .arg(match shape.virtio {
+                Virtio::NicWithoutMsix => "virtio-net-pci-non-transitional,netdev=net0,vectors=0",
+                _ => "virtio-net-pci-non-transitional,netdev=net0",
+            })
             // virtio-sound records everything the guest plays into a per-boot
             // wav for glitch analysis; timer-period matches the interactive
             // config in src/qemu.rs so test timing represents what users hear.

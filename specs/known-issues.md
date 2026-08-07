@@ -84,8 +84,26 @@ as authority, guessing or outliving the designation was the entire attack:
   Not closed by `be604ef`, which this file briefly claimed: `Listener(String)`
   is an unchanged *context* line in that commit's own `fd.rs` hunk. See the
   postscript at the end of this section.
+
+  **The setup is gone too** (tasks #61/#170): a listener is refcounted by the
+  descriptors naming it (`listener::ListenerRef`), so the `close(fd)` in that
+  three-call attack unregisters nothing and the real compositor's `listen` is
+  *refused*. What is left is a squat, which is the "no namespace" bullet in the
+  next entry and a different defect. `abuse_listener_hijack.rs` now asserts that
+  refusal; the `ListenerId` half is the second line and is no longer reachable
+  from userland at all, because nothing can produce a descriptor whose listener
+  is gone.
 - **`SharedToken`** — a bare `u32` with no RAII and no ownership, still open
   (§7).
+- **A device claim** — same shape, closed by the same tasks. `dup` cloned
+  `Descriptor::Keyboard`/`Framebuffer`/… as a plain value while `close` released
+  the class unconditionally, so `open_device(d); dup(fd); close(fd)` freed the
+  device for anyone to take *and* left the caller a working descriptor: two
+  processes composing to one scanout, or one reading another's keystrokes.
+  `device::Claim` is now a non-`Clone` token whose `Drop` releases the class, so
+  `Descriptor` cannot be `Clone` either and `Descriptor::duplicate` cannot
+  answer `Some` for those five variants — `dup`, `dup2` and a spawn `fd_map` all
+  say `PermissionDenied`. `device_claim_lifetime.rs` is the exploit test.
 
 The adjacent failure, same root: **a reference that outlives the object it
 names.** `FileBacking` after an unlink is the live instance (below) — the
@@ -252,8 +270,12 @@ this is a class, not an instance.
 Those gates are exactly as strong as the claim and no stronger. `SYS_OPEN_DEVICE`
 is itself first-come and ungated, so a process that beats the daemon to a device,
 or claims it after the daemon dies, holds everything the claim unlocks — for
-`DEVICE_AUDIO` that includes the RT band, which audio spec §9.4 wants to be a
-privilege. "Gated" here does not mean "privileged".
+`DeviceType::Audio` that includes the RT band, which audio spec §9.4 wants to be
+a privilege. "Gated" here does not mean "privileged".
+
+What is no longer *also* true is that the claim leaks: a claim admits exactly one
+descriptor now (`device::Claim`, `Descriptor::duplicate`), so racing the daemon
+is the whole remaining attack rather than the cheap half of it.
 
 ### `SYS_DEBUG` is ungated, and two of its actions are a diagnostic-channel DoS
 
@@ -772,6 +794,31 @@ wrong pointer instead.
 
 Batch them: one quiet-tree window covers both, and the audit's F9 (`get_env`,
 `waitpid`) is the same window again.
+
+### `PciDevice::read_bar_64` cannot see an I/O BAR, and reads the next register as one
+
+`kernel/src/drivers/pci.rs:118`. It takes bits 2:1 of the low dword as the
+Memory Space BAR's Type field without first checking bit 0, which is the bit
+that says whether the register describes memory at all.
+
+On an I/O BAR bit 0 is set, bit 1 is reserved, and **bits 31:2 are the port
+number** — so bits 2:1 read as `(0, address bit 2)`. A port whose bit 2 is set
+therefore decodes as Type `0b10`, the 64-bit encoding, and the function reads
+the *next* BAR register as the upper half of an address. The other half of the
+same defect is quieter: with bit 2 clear it returns the port number with the low
+nibble masked off, as a physical address. There is no encoding of an I/O BAR
+this function refuses.
+
+Nothing reaches it today. `read_bar_64(0)` on an NVMe or xHCI controller and the
+BARs a virtio capability names are memory BARs on every part that exists;
+`enable_msix` is the one caller whose index comes out of a device-supplied
+field, and that path now refuses the reserved indicators and an unassigned BAR
+(`toyos-pci::msix`) — but not an I/O one, because the type is not in the
+register it decodes.
+
+The fix is a typed BAR decode beside those, and it changes the signature: a
+caller that wants memory has to be handed an `Option<u64>` and say what it does
+without one. Four call sites in three drivers, one of them in `xhci/`.
 
 ### `KernelSlice` is the last `&[u8]` over memory userland can write
 
@@ -1644,6 +1691,48 @@ drop inside a syscall reached zero at random and preempted at random. The
 behaviour is now deterministic, and deterministically weaker than §7.4 assumes.
 Whether that matters is measurable — gate A's wake-lateness distribution is the
 instrument — and it did not move at N=8.
+
+### CLOSED — check-and-act across a released global lock, and the three residuals it leaves
+
+`pipe::open_reader`, `sys_socket_create` and six `file_cache::ref_count` call
+sites each read an answer out from under a global lock, released it, and acted.
+The pipe one was the one with teeth: `exists(id)` then `add_reader(id)` panicked
+on `.expect("add_reader: pipe not found")` when the pipe's last other end closed
+in between, *inside* `with_pipes_mut` — and a recovered syscall-context panic
+leaves `PIPES` held for the rest of the boot, which wedges all IPC. Closed by
+making the count and the handle one construction: `PipeReader`/`PipeWriter` live
+in a child module of `pipe.rs` whose field is private to it, so the only way to
+name a pipe as an owned reference is `acquire(&mut Pipe)`, and only a holder of
+`PIPES` can produce a `&mut Pipe`. `exists`, `creator` and `ref_count` are
+deleted; `mark_deleted` returns `Residency`; `copy_page_out` returns whether the
+page was there instead of zero-filling. Negative controls in the commit message.
+
+Three things the change does not reach:
+
+- **A count can still move without a handle.** `close_read`/`close_write` must
+  decrement and decide whether to free the pipe in one acquisition, so they live
+  in `pipe.rs` and touch `Pipe::readers` directly. Binding that direction too
+  needs the counts in a struct declared inside the handle module with a
+  `pub(super)` decrement, which buys a named operation and not an unwritable
+  one. The direction that was the defect is closed; this one has two writers and
+  both are in that file.
+
+- **`SYS_FTRUNCATE` takes no VFS lock and `SYS_FSYNC` does** (`arch/syscall.rs`,
+  `SYS_FTRUNCATE => fd::ftruncate(&mut data.fds, ...)` against
+  `SYS_FSYNC => fd::fsync(&mut data.fds, &mut *vfs::lock(), ...)`). That
+  asymmetry is what let a truncate remove a page between `clone_dirty` and
+  `copy_page_out`. The write of fabricated zeros is closed; the window is not,
+  and `flush_file`'s `size()` + `update_metadata` pair sits in it too — a
+  truncate landing between them records the older size, corrected by the next
+  flush because `ftruncate` sets `modified`.
+
+- **`file_cache::read_page` has two paths that return with `buf` untouched**
+  (`file_cache.rs`, both `let Some(file) = cache.files.get_mut(&file_id) else {
+  return }`), while `fd::try_read` has already told its caller how many bytes it
+  is producing, from a `file_cache::size` read under a different acquisition. It
+  is not reachable today — `try_read` runs holding a descriptor for the file, so
+  its refcount is at least one and neither `release` nor `mark_deleted` can drop
+  it — but the signature makes no such claim, and the honest return is fallible.
 
 ### `retire_task` is never reached by `cargo test`
 
@@ -2572,6 +2661,26 @@ bundle D, twice more     GREEN
 `audio_tone_load (smp=8)`, `audio_tone` at both widths, `audio_idle_suspend` and
 `metal_sim_null_audio` were green in every one of the six.
 
+**`smp=8` is not exempt — 2026-08-07, task #58's session.** It failed the same
+two-boot rule twice, on a tree whose only kernel delta was the MSI-X unification
+(boot-time register programming; the per-period path is untouched). A/B in one
+session, `cargo test -- audio_tone_load`, HEAD against `main`'s tip merged into
+it:
+
+```
+branch, in a full suite  RED  smp=8  1 [1p]/1118, then 1 [2p]/1124   wake_lat 76124us then 44159us
+branch, alone            RED  both   smp=8 1 [3p]/1138, then 3/1131  wake_lat 102055us then 296659us
+branch, alone × 7        GREEN both widths                            wake_lat 6543-45930us
+main,   alone × 3        GREEN both widths                            wake_lat 6556-54197us
+```
+
+Both reds coincided with another worktree's suite holding all twelve guest
+slots, and both carried wake latencies of 76-297 ms where every green run on
+either tree sat at 6.5-46 ms — soundd not being scheduled, rather than a cost
+per period. That is the same signature as the entry below and adds nothing to
+the diagnosis; what it adds is that **the smp=8 config reds too**, so a future
+A/B may not treat it as the quiet control.
+
 **Two things are established and a third is not.** It is real harm — a gap in
 the capture, on two boots running, four times. It is **not fix bundle D**: the
 A/B alternated trees in one session on one host, and both sides are red with
@@ -2629,6 +2738,48 @@ The nearest suspect on file is §10's ESP-log flush on the idle path and the
 `log_file` flush in `idle_loop` (§3): unbounded, uninterruptible, and in the one
 place a `--smp 1` machine spends the time between audio periods. That is a
 hypothesis, not a measurement.
+
+### OPEN — the first gate A run to record its host: four of six boots outside the recorded sample, two of them harm
+
+2026-08-07, tree `4a0a07f`, the run that verified the host-conditions
+annotation itself (`cargo test -- audio_tone`, filtered). Every line below is
+the harness's own, printed beside the counters it qualifies:
+
+```
+audio_tone      smp=1  gaps 1 [3p]  underruns 3/1137  drains 8  wake_lat 86862us (3.74 pl)  host: load 49.8/22.7/15.0 qemu 1 toyos-build 4
+        confirm        gaps none    underruns 0/1136  drains 0  wake_lat 16968us (0.73 pl)  host: load 49.0/23.4/15.4 qemu 1 toyos-build 4
+audio_tone      smp=8  gaps 1 [1p]  underruns 1/1113  drains 0  wake_lat 28118us (1.21 pl)  host: load 48.3/24.1/15.7 qemu 1 toyos-build 4
+        confirm        gaps none    underruns 0/1111  drains 0  wake_lat  8434us (0.36 pl)  host: load 46.5/24.1/15.8 qemu 1 toyos-build 3
+audio_tone_load smp=1  gaps none    underruns 0/1132  drains 0  wake_lat  7174us (0.31 pl)  host: load 41.2/23.7/15.7 qemu 1 toyos-build 3
+audio_tone_load smp=8  gaps none    underruns 0/1126  drains 0  wake_lat 23083us (0.99 pl)  host: load 37.9/23.6/15.8 qemu 1 toyos-build 3
+```
+
+**The invocation passed**, and correctly: harm appeared on both `audio_tone`
+configs and neither reproduced on its confirming boot, which is precisely what
+the two-boot rule is for. What it passed *with* is the finding.
+
+- `audio_tone.smp1` at **86862us — 3.74 pipeline depths, 8.6x that config's
+  recorded worst (10090us), and past its 56000us ceiling.** The baseline file
+  records `ceiling_runs = 0` across all 120 runs of the 2026-07-31 sample; this
+  is the first breach since. It came with `drains 8` — the ceiling exactly —
+  three periods of silence on the wire and a 3-period gap in the capture.
+- **Two of six boots passed a whole pipeline depth** (3.74 and 1.21), which the
+  baseline file states no run of its 120 reached.
+- `audio_tone_load.smp8` at 23083us is 2.9x its recorded worst with no harm at
+  all — the "bad but real" shape the ceilings exist to admit.
+
+**And now the conditions are on the record rather than reconstructed.** 1-minute
+load 37.9-49.8 on 14 cores with three to four other `toyos-build` processes and
+no other guest, against the 4.2-6.1 the 2026-07-29 ceiling derivation recorded
+per run — six to twelve times it. Under the owner's ruling of 2026-08-04 that is
+**not** an excuse and not grounds to re-run it away: it is a defect of the
+pipeline until something shows otherwise, and it is the same shape as the two
+entries above. What is new is only that the next investigation starts from a
+measured host state instead of a guess.
+
+Whoever takes it: the thorough tier is the instrument for the rate, and it now
+prints `host conditions over N runs` so its own arm's conditions can be stated.
+The recorded arm's cannot — see `tests/audio-baseline.toml`.
 
 ### OPEN — nothing explains why doom's audio callback stalled on the T14
 
@@ -3011,6 +3162,25 @@ phase landed, and none reproduces on a host running one suite.
   against the device's queue, and the lost-edge counter no longer fires on a
   pass that read the `irq_ring` record a few instructions before the ISR
   published it.
+  **Not closed after all, at the count.** 2026-08-07, two full suites in one
+  worktree while a second worktree held six of the twelve guest slots: `1003
+  pointer events reached userland out of 1004 packets injected, never more than
+  4 of them (12 bytes) outstanding against a 16-byte device queue`. The lead is
+  inside the bound the fix installed, so the summing mechanism §8 describes is
+  not what this is. A/B in one session, `git checkout main -- kernel/` in the
+  same tree minutes apart: this branch PASS 33 s first try, **main's kernel FAIL
+  with the identical 1003-of-1004 line**, then PASS 2 s on the harness's own
+  re-run. So it is not a tree difference and it is not gone — one packet in a
+  thousand is still being lost, or still being counted wrong, under a host
+  carrying two suites.
+- **`i8042_absent`** — same session, same shape, and it is `Sched::Serial`
+  already, so intra-suite width is not what reaches it. The verdict is the
+  guest's own `Boot: complete` on two boots with a 300 ms allowance; the landing
+  gate saw `601ms without an i8042 and 287ms with one`. Alone, minutes later:
+  this branch 619 vs 507 (PASS), main's kernel in the same tree 277 vs 331
+  (PASS). The absolute figure moved 277→619 ms across three runs of one boot
+  with no code change, so what the allowance is being asked to absorb is the
+  host, and a serial slot inside one suite does not buy a quiet one.
 - **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
   second line is not a second staged break but the driver's *recovery* retrying,
   `transport broke on SCSI 0x2a: command phase completion code 6` against an
@@ -3039,6 +3209,30 @@ phase landed, and none reproduces on a host running one suite.
 - **`metal_sim_pointer_churn`** — observed once, on a host carrying three other
   suites *and* a `toyos-sched-sim` run. Not investigated. Still
   `Sched::Parallel`.
+- **`blocked_dump`** — added 2026-08-07, `nothing typed at the terminal window
+  reached a shell`, `ALONE … GREEN` in 5 s. Same shape and same sentence as
+  `desktop_typing_damage` and `desktop_locale_detect`: its verdict is the dump's
+  content, but *reaching* the dump crosses a compositor, a terminal and a shell,
+  and that step is a wall-clock margin. Still `Sched::Parallel`.
+
+**The eight-landing regime, and what it does to the paragraph above.** That
+paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
+twelve guests across every worktree. It recurred on 2026-08-07: **eight
+`toyos-build --land` processes were queued on the integration lock at once**, and
+one branch's two consecutive landing gates died on two *different* tests from
+this list — `blocked_dump`, then `screen_early_panic` — each `ALONE … GREEN`,
+neither related to a branch that touched only `tests/`. The semaphore is not
+wrong; it counts the thing it says it counts. But a landing gate is a full build
+plus a suite, and **the build half is bounded by nothing** — eight of them is
+eight cargo trees compiling on 14 cores, which reaches every liveness margin in
+the wide phase without a thirteenth guest ever existing. The gate's own audio
+lines recorded the host at seven `toyos-build` processes throughout.
+
+So the closing claim needs the qualifier: guest slots bound *guests*, and a
+landing storm is not made of guests. Whether the integration lock should also
+gate the gate's build, or whether these tests belong in the serial tail, is a
+decision for whoever owns the harness; what is established here is that a branch
+can be unable to land for reasons that have nothing to do with it.
 
 **What to do about a red on any of these names:** read the `ALONE` line under it
 before anything else. `GREEN` there means the host, not the kernel. What none of
@@ -4099,12 +4293,12 @@ and it is not measurable here.
 
 ### A device claim succeeds on a machine that has no such device
 
-`device::try_claim` gates `DEVICE_FRAMEBUFFER`, `DEVICE_NIC` and `DEVICE_AUDIO`
+`device::try_claim` gates `DeviceType::{Framebuffer, Nic, Audio}`
 on an info struct the driver registered, so those three return
 `ClaimError::Absent` when the hardware is absent — which is what makes soundd
 and netd able to exit cleanly.
-`DEVICE_KEYBOARD` and `DEVICE_MOUSE` are gated on nothing at all: they hand out
-a `Descriptor` whether or not any driver will ever produce an event. Under
+`DeviceType::Keyboard` and `DeviceType::Mouse` are gated on nothing at all: they
+hand out a `Descriptor` whether or not any driver will ever produce an event. Under
 metal-sim the compositor holds both claims on a machine with no HID of any kind
 and polls them forever. Harmless today, wrong in the same way the isolation
 issues in §1 are wrong: a claim is supposed to be evidence.
@@ -4797,7 +4991,7 @@ uninterpretable.
 
 `panic_console::boot_checkpoint` returns immediately once
 `SCREEN_OWNED_BY_USERLAND` is set (`panic_console/mod.rs:478`), and
-`device::try_claim(DEVICE_FRAMEBUFFER)` sets it (`device.rs:83`) as the
+`device::try_claim(DeviceType::Framebuffer)` sets it as the
 compositor's third statement (`compositor/src/main.rs:719`). So the last
 kernel screenful ever painted is the one at `Boot: complete`, and the compositor
 overwrites it with the desktop a few tens of milliseconds later. Measured on

@@ -3,12 +3,19 @@ use crate::{keyboard, mouse};
 use crate::process::Pid;
 use crate::shared_memory;
 use crate::sync::Lock;
+pub use toyos_abi::syscall::DeviceType;
 
-pub const DEVICE_KEYBOARD: u64 = 0;
-pub const DEVICE_MOUSE: u64 = 1;
-pub const DEVICE_FRAMEBUFFER: u64 = 2;
-pub const DEVICE_NIC: u64 = 3;
-pub const DEVICE_AUDIO: u64 = 4;
+/// The wire number `SYS_OPEN_DEVICE` carries, decoded once.
+pub fn class_of(raw: u64) -> Option<DeviceType> {
+    match raw {
+        0 => Some(DeviceType::Keyboard),
+        1 => Some(DeviceType::Mouse),
+        2 => Some(DeviceType::Framebuffer),
+        3 => Some(DeviceType::Nic),
+        4 => Some(DeviceType::Audio),
+        _ => None,
+    }
+}
 
 static KEYBOARD_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static MOUSE_OWNER: Lock<Option<Pid>> = Lock::new(None);
@@ -16,6 +23,49 @@ static FRAMEBUFFER_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static NIC_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static AUDIO_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
+
+fn owner_of(class: DeviceType) -> &'static Lock<Option<Pid>> {
+    match class {
+        DeviceType::Keyboard => &KEYBOARD_OWNER,
+        DeviceType::Mouse => &MOUSE_OWNER,
+        DeviceType::Framebuffer => &FRAMEBUFFER_OWNER,
+        DeviceType::Nic => &NIC_OWNER,
+        DeviceType::Audio => &AUDIO_OWNER,
+    }
+}
+
+/// The claim itself, as a value.
+///
+/// Not `Clone` and not `Copy`, and the field is private, so the only ways to
+/// obtain one are [`Claim::acquire`] and moving an existing one. That is the
+/// exclusivity: at most one `Claim` per class can exist at a time, and the
+/// compiler — not a check in `dup` — is what says so. `Descriptor` therefore
+/// cannot implement `Clone` either, which is where the rule reaches userland
+/// (`Descriptor::duplicate`).
+///
+/// `capability-handles-spec.md` §6.5 reaches the same shape from the other
+/// end: a claim handle carries no DUP right, and TRANSFER moves it whole.
+pub struct Claim {
+    class: DeviceType,
+}
+
+impl Claim {
+    /// Take the class for `pid`, or say who has it.
+    fn acquire(class: DeviceType, pid: Pid) -> Result<Self, ClaimError> {
+        let mut owner = owner_of(class).lock();
+        if owner.is_some() {
+            return Err(ClaimError::Owned);
+        }
+        *owner = Some(pid);
+        Ok(Self { class })
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        *owner_of(self.class).lock() = None;
+    }
+}
 
 pub fn set_framebuffer_info(info: FramebufferInfo) {
     // A relative pointer accumulates into a square 0..32767 space that this
@@ -39,127 +89,70 @@ pub enum ClaimError {
     Owned,
     /// This machine has no such device — no driver ever registered one.
     Absent,
-    /// No such device type.
-    UnknownType,
     /// The device exists and is free, but its buffers could not be granted.
     GrantFailed,
 }
 
-/// Try to claim exclusive access to a device. Returns the Descriptor if unclaimed.
-pub fn try_claim(device_type: u64, pid: Pid) -> Result<Descriptor, ClaimError> {
-    match device_type {
-        DEVICE_KEYBOARD => {
-            let mut owner = KEYBOARD_OWNER.lock();
-            if owner.is_some() {
-                return Err(ClaimError::Owned);
-            }
-            *owner = Some(pid);
+/// Try to claim exclusive access to a device.
+///
+/// Every `?` past the `acquire` gives the class straight back: the `Claim` is
+/// on this stack frame, so a failure cannot leave the device owned by a
+/// process that was refused it. The three hand-written `*owner = None`
+/// rollbacks this replaced were what an added grant would have had to
+/// remember.
+pub fn try_claim(class: DeviceType, pid: Pid) -> Result<Descriptor, ClaimError> {
+    // Availability is decided before the claim, so a second claimant of an
+    // absent device is told `Absent` and not `Owned` — the distinction soundd
+    // and netd degrade on.
+    match class {
+        DeviceType::Keyboard => {
+            let claim = Claim::acquire(class, pid)?;
             // Whatever was typed while nobody held the device belongs to
             // nobody. Delivering it to whoever claims next hands one program
             // another's keystrokes, and a compositor restarted mid-sentence
             // would open with the tail of what was being typed into the one
             // that died.
             keyboard::discard_queued();
-            Ok(Descriptor::Keyboard)
+            Ok(Descriptor::Keyboard(claim))
         }
-        DEVICE_MOUSE => {
-            let mut owner = MOUSE_OWNER.lock();
-            if owner.is_some() {
-                return Err(ClaimError::Owned);
-            }
-            *owner = Some(pid);
+        DeviceType::Mouse => {
+            let claim = Claim::acquire(class, pid)?;
             mouse::discard_queued();
-            Ok(Descriptor::Mouse)
+            Ok(Descriptor::Mouse(claim))
         }
-        DEVICE_FRAMEBUFFER => {
-            let mut owner = FRAMEBUFFER_OWNER.lock();
-            if owner.is_some() {
-                return Err(ClaimError::Owned);
-            }
+        DeviceType::Framebuffer => {
             let info = (*FB_INFO.lock()).ok_or(ClaimError::Absent)?;
-            *owner = Some(pid);
+            let claim = Claim::acquire(class, pid)?;
             for &token in &info.token {
-                if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid).is_err() {
-                    *owner = None;
-                    return Err(ClaimError::GrantFailed);
-                }
+                grant(token, pid)?;
             }
-            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.cursor_token), pid).is_err() {
-                *owner = None;
-                return Err(ClaimError::GrantFailed);
-            }
+            grant(info.cursor_token, pid)?;
             crate::drivers::panic_console::screen_claimed_by_userland();
-            Ok(Descriptor::Framebuffer(info))
+            Ok(Descriptor::Framebuffer(claim, info))
         }
-        DEVICE_NIC => {
-            let mut owner = NIC_OWNER.lock();
-            if owner.is_some() {
-                return Err(ClaimError::Owned);
-            }
+        DeviceType::Nic => {
             let info = crate::net::nic_info().ok_or(ClaimError::Absent)?;
-            *owner = Some(pid);
-            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.dma_token), pid).is_err() {
-                *owner = None;
-                return Err(ClaimError::GrantFailed);
-            }
-            Ok(Descriptor::Nic(info))
+            let claim = Claim::acquire(class, pid)?;
+            grant(info.dma_token, pid)?;
+            Ok(Descriptor::Nic(claim, info))
         }
-        DEVICE_AUDIO => {
-            let mut owner = AUDIO_OWNER.lock();
-            if owner.is_some() {
-                return Err(ClaimError::Owned);
-            }
+        DeviceType::Audio => {
             let info = crate::audio::audio_info().ok_or(ClaimError::Absent)?;
-            *owner = Some(pid);
-            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.dma_token), pid).is_err() {
-                *owner = None;
-                return Err(ClaimError::GrantFailed);
-            }
-            Ok(Descriptor::Audio { info, info_read: false })
+            let claim = Claim::acquire(class, pid)?;
+            grant(info.dma_token, pid)?;
+            Ok(Descriptor::Audio { claim, info, info_read: false })
         }
-        _ => Err(ClaimError::UnknownType),
     }
 }
 
-/// True when `pid` currently holds the claim on `device_type`. Syscalls that
-/// drive a claimed device gate on this — a claim is what makes a process the
-/// device's owner, so it is also what makes it allowed to reconfigure it.
-pub fn is_owner(device_type: u64, pid: Pid) -> bool {
-    let owner = match device_type {
-        DEVICE_KEYBOARD => KEYBOARD_OWNER.lock(),
-        DEVICE_MOUSE => MOUSE_OWNER.lock(),
-        DEVICE_FRAMEBUFFER => FRAMEBUFFER_OWNER.lock(),
-        DEVICE_NIC => NIC_OWNER.lock(),
-        DEVICE_AUDIO => AUDIO_OWNER.lock(),
-        _ => return false,
-    };
-    *owner == Some(pid)
+fn grant(token: u32, pid: Pid) -> Result<(), ClaimError> {
+    shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid)
+        .map_err(|_| ClaimError::GrantFailed)
 }
 
-/// Release a device owned by the given PID.
-pub fn release(device_type: u64, pid: Pid) {
-    let mut owner = match device_type {
-        DEVICE_KEYBOARD => KEYBOARD_OWNER.lock(),
-        DEVICE_MOUSE => MOUSE_OWNER.lock(),
-        DEVICE_FRAMEBUFFER => FRAMEBUFFER_OWNER.lock(),
-        DEVICE_NIC => NIC_OWNER.lock(),
-        DEVICE_AUDIO => AUDIO_OWNER.lock(),
-        _ => return,
-    };
-    if *owner == Some(pid) {
-        *owner = None;
-    }
+/// True when `pid` currently holds the claim on `class`. Syscalls that drive a
+/// claimed device gate on this — a claim is what makes a process the device's
+/// owner, so it is also what makes it allowed to reconfigure it.
+pub fn is_owner(class: DeviceType, pid: Pid) -> bool {
+    *owner_of(class).lock() == Some(pid)
 }
-
-/// Release a device descriptor, determining the type from the descriptor variant.
-pub fn release_descriptor(desc: &Descriptor, pid: Pid) {
-    match desc {
-        Descriptor::Keyboard => release(DEVICE_KEYBOARD, pid),
-        Descriptor::Mouse => release(DEVICE_MOUSE, pid),
-        Descriptor::Framebuffer(_) => release(DEVICE_FRAMEBUFFER, pid),
-        Descriptor::Nic(_) => release(DEVICE_NIC, pid),
-        Descriptor::Audio { .. } => release(DEVICE_AUDIO, pid),
-        _ => {}
-    }
-}
-

@@ -74,7 +74,12 @@ pub trait FileSystem: Send {
     fn open_file(&mut self, name: &str) -> Option<(FileId, Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>>)>;
     /// Create an empty file. Returns FileId. Registers in name→FileId map.
     fn create(&mut self, name: &str, mtime: u64) -> Result<FileId, &'static str>;
-    /// Release filesystem-side state for a FileId (called when ref_count reaches 0).
+    /// Release filesystem-side state for a `FileId`.
+    ///
+    /// Reached only from a caller whose own `file_cache::release` returned the
+    /// last reference, under the VFS lock that a reopen would need — so the
+    /// answer arrives established, and an implementation asking the cache again
+    /// would be asking a second question at a second moment.
     fn close_file(&mut self, file_id: FileId);
 
     fn delete(&mut self, name: &str) -> bool;
@@ -512,8 +517,12 @@ impl Vfs {
         let mut heap = alloc::vec![0u8; 4096].into_boxed_slice();
         let buf: &mut [u8; 4096] = (&mut heap[..]).try_into().expect("4096 bytes");
         for &page_idx in &dirty {
-            crate::file_cache::copy_page_out(file_id, page_idx, buf);
-            fs.write_page(file_id, page_idx, buf)?;
+            // A truncate on another CPU can take a page out of the cache
+            // between `clone_dirty` and here. Writing whatever the buffer
+            // happens to hold would put bytes in the file no writer produced.
+            if crate::file_cache::copy_page_out(file_id, page_idx, buf) {
+                fs.write_page(file_id, page_idx, buf)?;
+            }
         }
         crate::file_cache::clear_dirty(file_id, &dirty);
 
