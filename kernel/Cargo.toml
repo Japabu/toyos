@@ -28,8 +28,9 @@ test-actuators = [
     "test-kernel-canary",
     "test-tlb-ack-delay",
 ]
-# SYS_DEBUG action 12: make the highest-numbered CPU answer its next TLB
-# shootdown late, and report how long the shootdown took.
+# SYS_DEBUG actions 12 and 13: make the last CPU a TLB shootdown waits for
+# answer late — 12 arms it, takes one shootdown and reports what it cost, 13
+# gives the machine its latency back.
 #
 # What nothing else reaches: whether the initiator *waits*. A correct wait and no
 # wait at all both measure zero on a machine where every CPU answers in
