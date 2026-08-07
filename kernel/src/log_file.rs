@@ -288,12 +288,12 @@ pub fn poll() {
     sink.blocked_since = None;
     let outcome = sink.flush(&mut vfs);
     drop(vfs);
-    if let Err(e) = outcome {
+    if let Err((step, err)) = outcome {
         let stopped = sink.stopped_at();
         *guard = None;
         drop(guard);
         log_ring::disable_file_sink();
-        log!("log-file: {e} — {stopped}");
+        log!("log-file: {step} was refused ({err}) — {stopped}");
     }
 }
 
@@ -309,14 +309,24 @@ pub fn flush_final() {
     let mut vfs = vfs::lock();
     let outcome = sink.flush(&mut vfs);
     drop(vfs);
-    if let Err(e) = outcome {
+    if let Err((step, err)) = outcome {
         drop(guard);
-        log!("log-file: the final flush failed: {e}");
+        log!("log-file: the final flush was refused at {step}: {err}");
     }
 }
 
+/// Where a flush stopped, and what it was told there.
+///
+/// The code alone does not identify the fault: `Io` from the append is a page
+/// the stick would not give back, and `Io` from the sync is a device that would
+/// not commit what it already took. The line naming one of them is the last
+/// thing the sink ever writes, and it is written after the sink is disabled —
+/// which is why the step has to travel out of here rather than be logged where
+/// it happened.
+type Refusal = (&'static str, SyscallError);
+
 impl Sink {
-    fn flush(&mut self, vfs: &mut Vfs) -> Result<(), SyscallError> {
+    fn flush(&mut self, vfs: &mut Vfs) -> Result<(), Refusal> {
         let lost = log_ring::take_file_drops();
         if lost > 0 {
             // Into the ring, so this line is itself in the batch below and the
@@ -331,7 +341,7 @@ impl Sink {
             if n == 0 {
                 break;
             }
-            self.append(&buf[..n])?;
+            self.append(&buf[..n]).map_err(|e| ("the append", e))?;
             moved += n;
         }
         if moved == 0 {
@@ -339,15 +349,16 @@ impl Sink {
         }
 
         let path = path(&self.stem, self.part);
-        vfs.flush_file(&path, self.file_id, clock::nanos_since_boot())?;
+        vfs.flush_file(&path, self.file_id, clock::nanos_since_boot())
+            .map_err(|e| ("the write-back", e))?;
         // The FAT and the directory entry have reached the device; the device's
         // own write cache has not. A log that survives a wedge has to survive
         // the power being cut with it, which is the whole point, so the flush
         // is not optional and is per batch rather than per line.
-        vfs.sync_mount(MOUNT)?;
+        vfs.sync_mount(MOUNT).map_err(|e| ("the volume sync", e))?;
 
         if self.size >= MAX_LOG_BYTES {
-            self.continue_in_next_part(vfs)?;
+            self.continue_in_next_part(vfs).map_err(|e| ("the rotation", e))?;
         }
         Ok(())
     }
