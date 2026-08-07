@@ -441,6 +441,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("esp_filesystem", Sched::Parallel),
     ("toybox_cp_volume", Sched::Parallel),
     ("kernel_log_file", Sched::Parallel),
+    // Serial: its verdict is a cadence — heartbeats against a 250 ms period —
+    // and a guest sharing the host with eleven others reaches its idle loop
+    // late for reasons that are not the defect.
+    ("kernel_heartbeat", Sched::Serial),
     // Both own their images and their lanes, and neither verdict is a
     // wall-clock margin: the guest's clock starts from an instant the host set
     // and the only duration either measures is how long a boot takes to reach
@@ -5551,6 +5555,73 @@ fn run_machine_test(
         // Body in `tests/common/toybox.rs`, same reason.
         "toybox_cp_volume" => common::toybox::cp_volume(test_config, c_bins, rust_bins),
         "kernel_log_file" => common::volumes::kernel_log_file(test_config, c_bins, rust_bins),
+        "kernel_heartbeat" => {
+            // The instrument for a machine whose log cannot say whether it was
+            // alive: ten of the owner's boots are byte-identical between the
+            // ones that froze and the ones that did not. The gate has to prove
+            // three things a `must_say` cannot — that the lines *keep coming*,
+            // that they come at the period claimed, and that the mask is a
+            // real per-CPU reading rather than a constant.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                smp: 8,
+                kernel_features: &["heartbeat"],
+                ..Default::default()
+            };
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            let mut log = qemu.boot_log().to_string();
+            log.push_str(&qemu.drain_serial(Duration::from_secs(3)));
+
+            let beats: Vec<&str> =
+                log.lines().filter(|l| l.contains("heartbeat: t=")).collect();
+            // Three seconds of drain at a 250 ms period is twelve; a guest that
+            // spends some of it booting produces fewer. Four is "the machine
+            // kept saying it was alive" with room, and zero or one is the
+            // failure this exists to make impossible.
+            if beats.len() < 4 {
+                return Err(format!(
+                    "{} heartbeat line(s) in ~3 s at a 250 ms period — the instrument does not \
+                     keep reporting, so a log that stops says nothing\n{log}",
+                    beats.len()
+                ));
+            }
+            // The mask has to *be* a reading. A constant would pass every
+            // cadence assertion above while telling the owner nothing about
+            // which CPUs stopped, which is the whole second half of the line.
+            let masks: BTreeSet<&str> = beats
+                .iter()
+                .filter_map(|l| l.split("mask=").nth(1))
+                .map(|m| m.split_whitespace().next().unwrap_or(""))
+                .collect();
+            if !beats.iter().any(|l| l.contains("passes=8/8")) && masks.len() < 2 {
+                return Err(format!(
+                    "every heartbeat reports the same mask {masks:?} and none reports all eight \
+                     CPUs — the per-CPU field is not a reading\n{log}"
+                ));
+            }
+            // And the clock in the line advances, or the timestamp cannot
+            // localise a death.
+            let stamps: Vec<&str> = beats
+                .iter()
+                .filter_map(|l| l.split("heartbeat: t=").nth(1))
+                .map(|s| s.split_whitespace().next().unwrap_or(""))
+                .collect();
+            if stamps.first() == stamps.last() {
+                return Err(format!(
+                    "every heartbeat carries the same timestamp {:?}\n{log}",
+                    stamps.first()
+                ));
+            }
+            eprintln!(
+                "  [heartbeat] {} lines in ~3 s, {} distinct mask(s), t={} → t={}",
+                beats.len(),
+                masks.len(),
+                stamps.first().unwrap_or(&"?"),
+                stamps.last().unwrap_or(&"?")
+            );
+            Ok(())
+        }
         // Body in `tests/common/wallclock.rs`, same reason.
         "wall_clock_file" => common::wallclock::wall_clock_file(test_config, c_bins, rust_bins),
         "wall_clock_refusals" => {

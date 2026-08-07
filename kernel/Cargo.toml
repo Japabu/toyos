@@ -259,6 +259,20 @@ test-late-panic = []
 # `test-late-panic` cannot serve: it fires during the boot phases, before any
 # userland process exists, so it paints a screen nobody had claimed.
 metal-panic-probe = []
+# One log line every 250 ms carrying the monotonic time and which CPUs reached a
+# scheduler pass since the previous one.
+#
+# What nothing else reaches: *was this boot alive at time T*. Ten logs off the
+# owner's stick are byte-identical between the boots that froze and the boots
+# that did not — a live idle desktop and a dead machine have the same last thing
+# to say — so the log records the freeze's existence and never its time. With
+# this, a frozen boot's log ends at the last heartbeat before death, and the mask
+# says whether the machine stopped all at once or a CPU at a time, which is the
+# difference between a global cause and a local one.
+#
+# Not a default: four lines a second is a diagnostic budget, and a machine
+# nobody is watching should not spend its log volume saying nothing happened.
+heartbeat = []
 # SYS_DEBUG actions 5, 6 and 7: one kernel heap allocation at
 # `mm::MAX_HEAP_ALLOC`, one a page over it, and one at the ceiling but
 # page-aligned. Ordinary code can still ask for more than one page backs — a

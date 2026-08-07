@@ -2728,7 +2728,7 @@ pub fn usb_boot_stick_pulled(
         ));
     }
 
-    let mut probe = |qemu: &mut QemuInstance, console: &mut String, i: usize| {
+    let probe = |qemu: &mut QemuInstance, console: &mut String, i: usize| {
         let _ = writeln!(qemu.stdin_mut(), "run pull-probe-{i}");
         qemu.flush_stdin();
         console.push_str(&qemu.drain_serial(Duration::from_millis(120)));
