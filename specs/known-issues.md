@@ -1127,6 +1127,14 @@ red on run `31205890425` — was the accelerator *and* the vendor at once, and
 only the vendor mattered: QEMU's `helper_sysret` implements Intel's wording, so
 TCG behaves like an Intel CPU whatever the host is.
 
+**With the fix, run `31219204355`**, same probe, six runners: five drew an AMD
+EPYC (7763 and 9V74) and one an Intel Xeon, **39 of 40 AMD boots green** where
+the same probe was 0 of 64. The fortieth is `process_stats: timed out after 5s`,
+twice in a row, on a guest whose log ends at `===READY===` with soundd up and no
+fault anywhere in it — a harness liveness budget on a shared runner, which is
+never a verdict (CLAUDE.md). Recorded rather than chased: the `kvm` job in
+`ci.yml` runs this test once, so it is that job's flake rate and it is not zero.
+
 **Two things this cost that are worth keeping.** The first reading of the report
 took `Syscall: num=86 user_rip=…` as evidence the fault was in the syscall stub;
 that line is the *last syscall this thread made* and `crash_report_exception`
