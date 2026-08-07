@@ -2524,6 +2524,39 @@ identical to a human, and RTF is what separates them — RTF near 1.0 with the
 audio still slow means the clock, RTF well below 1.0 means synthesis is not
 keeping up.
 
+### OPEN — M3's shootdown ack timeout is a wall-clock deadline in a guest whose vCPUs the host can deschedule
+
+Observed 2026-08-07 from the heartbeat worktree, twice in two landing gates, on
+a host also carrying another worktree's suite. `null_sink_shipped_client` reds
+with `the shipped tone exited 101 on a device-less machine`, and the reason is
+not the tone:
+
+```
+tlb: cpu 0 has not flushed for generation Generation(2) in 5000000000ns — it is not taking interrupts
+tlb: cpu 1 has not flushed for generation Generation(3) in 5000000000ns — it is not taking interrupts
+```
+
+That is `arch/tlb.rs`'s own bounded failure firing — `ACK_TIMEOUT_NS`, 5 s. An
+earlier gate on the same branch took the same panic under `hda_tone`. **Both
+tests pass alone**: `null_sink_shipped_client` in 7 s with nothing else on the
+host.
+
+**The mechanism to weigh before treating this as a shootdown defect.** The
+deadline is `clock::nanos_since_boot()`, which is the TSC, and under TCG the
+guest TSC follows host wall time — so a vCPU the host has not scheduled for five
+seconds has "not flushed for 5000000000ns" while being perfectly healthy. Twelve
+guests plus a second worktree's suite on fourteen cores reaches that. This is
+the harness's own rule — *a timeout is a liveness guard and never a verdict* —
+arriving inside the kernel, where there is no `qemu::budget` to scale it and the
+failure is a panic rather than a red.
+
+**Not this task's to fix; recorded because it is costing landings now.** It
+belongs to whoever owns M3. Two things a fix has to separate: a CPU that is
+genuinely not taking interrupts, which is the state the bound exists to name,
+and a vCPU that has not been given any host time, which is not a property of
+this kernel at all. Until then, a gate red naming `tlb:` should be re-run alone
+before it is believed.
+
 ---
 
 ## 4. Audio and soundd
