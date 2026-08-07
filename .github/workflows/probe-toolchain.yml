@@ -35,8 +35,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            cmake ninja-build build-essential pkg-config libssl-dev zstd
+            cmake ninja-build build-essential pkg-config libssl-dev zstd \
+            qemu-system-x86 ovmf dosfstools
           cmake --version | head -1
+          qemu-system-x86_64 --version | head -1
 
       - name: full build
         run: |
