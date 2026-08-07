@@ -21,7 +21,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::buildlock;
@@ -136,7 +136,7 @@ fn run(root: &Path, gate: &[String]) -> Result<String, String> {
     // After preflight, which is instantaneous and prints its own refusal: the
     // log is for the part that takes minutes.
     let branch = preflight(root, &primary)?;
-    let log = LandLog::open(root);
+    let log = Arc::new(LandLog::open(root));
     log.say(&format!("[land] landing {branch} into main at {}", primary.display()));
     log.say(&format!(
         "[land] this landing's log: {}\n\
@@ -165,7 +165,7 @@ fn steps(
     primary: &Path,
     branch: &str,
     gate: &[String],
-    log: &LandLog,
+    log: &Arc<LandLog>,
 ) -> Result<String, String> {
     let _lock = buildlock::integration(root);
 
@@ -298,7 +298,7 @@ fn merge_main(root: &Path, branch: &str, log: &LandLog) -> Result<(), String> {
 fn run_gate(
     root: &Path,
     gate: &[String],
-    log: &LandLog,
+    log: &Arc<LandLog>,
 ) -> Result<std::time::Duration, String> {
     log.say(&format!("[land] gate: {}", gate.join(" ")));
     if !is_default(gate) {
@@ -319,14 +319,38 @@ fn run_gate(
     // Piped rather than inherited, and copied straight back out: the terminal
     // sees the gate live, as it must, and the log gets the same bytes without
     // the agent having to choose a path that another session is also writing.
+    //
+    // **Detached, and waited for with a deadline rather than joined.** A pipe
+    // reads EOF when the last writer closes it, and the gate boots guests — one
+    // stray QEMU inheriting the fd would hold the read open after the gate
+    // itself had exited, and a `thread::scope` would then hang the landing on
+    // its own log. The log is advisory; the landing is the product.
     let out = child.stdout.take().expect("the gate's stdout was piped");
     let err = child.stderr.take().expect("the gate's stderr was piped");
-    let status = std::thread::scope(|scope| {
-        scope.spawn(|| tee(out, log, false));
-        scope.spawn(|| tee(err, log, true));
-        child.wait()
-    })
-    .map_err(|e| format!("[land] the gate {:?} could not be waited on: {e}", gate[0]))?;
+    let (done, drained) = std::sync::mpsc::channel::<()>();
+    {
+        let (log, done) = (Arc::clone(log), done.clone());
+        std::thread::spawn(move || {
+            tee(out, &log, false);
+            let _ = done.send(());
+        });
+    }
+    {
+        let (log, done) = (Arc::clone(log), done.clone());
+        std::thread::spawn(move || {
+            tee(err, &log, true);
+            let _ = done.send(());
+        });
+    }
+    drop(done);
+    let status = child
+        .wait()
+        .map_err(|e| format!("[land] the gate {:?} could not be waited on: {e}", gate[0]))?;
+    for _ in 0..2 {
+        if drained.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+            break;
+        }
+    }
     let took = started.elapsed();
     // 2 is the suite's "this run established nothing" — the host was suspended
     // in the middle of it (`tests/toyos.rs`, and cargo propagates a test

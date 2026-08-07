@@ -395,7 +395,7 @@ const GUESTS: Slots = Slots { tag: "host-slots", one: "guest slot" };
 const BUILDS: Slots = Slots { tag: "host-builds", one: "build slot" };
 
 fn slot(dir: &Path, budget: usize, what: &str, kind: Slots) -> Guard {
-    assert!(budget >= 1, "a host with no guest slots can run no guests");
+    assert!(budget >= 1, "a host with no {} can run nothing at all", kind.one);
     let mut files: Vec<fs::File> =
         (0..budget).map(|i| open_lock_file(&slot_path(dir, i))).collect();
 
@@ -565,35 +565,32 @@ fn announce(lock: &str, label: &str, holder: &str) {
 /// each time, so the message follows the queue forward rather than naming the
 /// process that was in front when the wait began.
 fn take_lock_announcing(file: &fs::File, op: i32, path: &Path, lock: &str, label: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
 
-    let done = Arc::new(AtomicBool::new(false));
+    // A channel and not a polled flag: this runs on every *contended*
+    // acquisition, the artifact lock among them, and a flag checked every few
+    // milliseconds would put that granularity on the front of each one. The
+    // sender dropping wakes the thread at once and it never sleeps past the
+    // acquisition.
+    let (tx, rx) = channel::<()>();
     let heartbeat = {
-        let done = Arc::clone(&done);
         let path = path.to_path_buf();
         let lock = lock.to_string();
         let label = label.to_string();
         std::thread::spawn(move || {
             let began = Instant::now();
-            let mut said = Instant::now();
-            while !done.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(50));
-                if said.elapsed() < HEARTBEAT {
-                    continue;
-                }
+            while rx.recv_timeout(HEARTBEAT) == Err(RecvTimeoutError::Timeout) {
                 let holder = describe_holder(&path)
                     .unwrap_or_else(|| "the holder left no readable note".to_string());
                 eprintln!(
                     "[build-lock] still waiting for the {lock} ({label}), {:.0?} so far — {holder}",
                     began.elapsed()
                 );
-                said = Instant::now();
             }
         })
     };
     take_lock(file, op, path);
-    done.store(true, Ordering::Relaxed);
+    drop(tx);
     heartbeat.join().expect("the lock heartbeat panicked");
 }
 
