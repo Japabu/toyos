@@ -2928,7 +2928,20 @@ fn run_screen_test(
                 ..Default::default()
             };
             metal_sim_argv_check(&qemu::profile_argv(&options))?;
-            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            // Built here rather than by the boot, because `/log` is read off
+            // the partition afterwards and the image gets a fresh GUID every
+            // time it is built.
+            let image_path = common::lane::dir().join("fatal-composited.img");
+            let image = qemu::build_boot_image(&config, &[], &[], &["metal-panic-probe"]);
+            std::fs::write(&image_path, &image)
+                .map_err(|e| format!("write the boot image: {e}"))?;
+            let (log_start, log_len) = common::volumes::log_extent(&image, &image_path)?;
+            let mut qemu = QemuInstance::boot_with_options(
+                &config,
+                &[],
+                &[],
+                BootOptions { boot_image: Some(image_path.clone()), ..options },
+            );
 
             // The compositor has the screen *before* anything panics. Asserted
             // on the fill, exactly as `screen_blocked_dump` does: every kernel
@@ -2966,6 +2979,38 @@ fn run_screen_test(
                      something other than a fatal report\ndecoded screen:\n{text}"
                 ));
             }
+
+            // **And the report reached the stick, not only the panel.** Read
+            // off the boot image's own `/log` partition, so this is the
+            // device's view and not the guest's — the guest is halted and has
+            // no view left. Before `halt_all_cpus` waited for the sink, the
+            // file ended at the last flush *before* the panic and the report
+            // existed solely as a photograph; that is the state this asserts
+            // against, and it is what made three investigations argue from
+            // JPEGs.
+            drop(qemu);
+            let (name, on_device) =
+                common::volumes::newest_log(&image_path, log_start, log_len)?;
+            let on_device = String::from_utf8_lossy(&on_device).into_owned();
+            if !on_device.contains(MARKER) {
+                return Err(format!(
+                    "/log/{name} stops at {} bytes and never carries {MARKER:?} — the panic \
+                     painted the panel and reached no file, so reading this machine still means \
+                     photographing it",
+                    on_device.len()
+                ));
+            }
+            if !on_device.contains("!!! PANIC !!!") {
+                return Err(format!(
+                    "/log/{name} carries the marker without the panic banner, so what reached \
+                     the stick is not the report"
+                ));
+            }
+            let _ = std::fs::remove_file(&image_path);
+            eprintln!(
+                "  [panic] the fatal report is on the panel and in /log/{name} ({} bytes)",
+                on_device.len()
+            );
             if dump.fill() != FILL_FATAL {
                 return Err(format!(
                     "the panel still carries {:?} rather than the fatal fill, so the compositor's \

@@ -105,6 +105,62 @@ pub fn send_nmi(cpu_id: u32) {
     cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4400);
 }
 
+/// How long a dying machine gives its siblings to put the report on `/log`.
+///
+/// The idle loop goes round in microseconds and a flush is one FAT append plus
+/// a sync, so a machine with a healthy CPU left finishes far inside this; the
+/// bound is what a machine with none pays, once, on its way down. Half a second
+/// against the ~460 ms the panel paint costs on the T14 anyway.
+const LOG_FILE_DRAIN_NANOS: u64 = 500_000_000;
+
+/// Give the log sink a chance to put this report on the stick before the
+/// machine stops.
+///
+/// **The panic path still writes nothing itself, and that is the design.**
+/// `log_file`'s own module doc rules a panic-time flush out on locks alone —
+/// it would need this module's lock, the VFS lock, the file cache lock, the
+/// kernel heap, the volume's device lock and the xHCI lock, and a panicking
+/// thread may hold any of them. `try_lock` does not rescue it either: a
+/// spinlock's `try_lock` fails for its own holder, so the cases where the
+/// report matters most are exactly the cases it would decline, and the heap is
+/// not try-able at all. That is "sometimes writes and sometimes hangs", which
+/// is worse than the panel alone.
+///
+/// What this does instead takes no lock, allocates nothing and touches no
+/// device: **it waits.** The report is already in the log ring, the halt IPI has
+/// not gone out yet, and every other CPU's idle loop is still running
+/// `log_file::poll`, which is the ordinary, proven path to the stick. So the
+/// dying CPU spins on one relaxed atomic against a deadline and lets a healthy
+/// sibling do the write.
+///
+/// It cannot deadlock and it cannot make a panic worse: `file_has_pending` is a
+/// load, the deadline is absolute, and every outcome ends in the same
+/// `halt_all_cpus` tail that ran before. A machine where no CPU can flush —
+/// the VFS lock stranded, the sink disabled, no `/log` at all — pays the bound
+/// and halts exactly as it used to, with the panel as the only copy and a line
+/// saying so.
+///
+/// Placed before the halt IPI rather than after, because after it there is
+/// nobody left to do the writing.
+fn wait_for_log_file() {
+    if !crate::drivers::log_ring::file_has_pending() {
+        return;
+    }
+    let deadline = crate::clock::nanos_since_boot().saturating_add(LOG_FILE_DRAIN_NANOS);
+    while crate::drivers::log_ring::file_has_pending() {
+        if crate::clock::nanos_since_boot() >= deadline {
+            // Reaches the panel only on the fatal paths that paint the live
+            // ring rather than a snapshot taken before this ran, and reaches
+            // serial on a machine that has one. On a T14 mid-panic it is the
+            // honest record for whoever reads the *next* boot's log and finds
+            // no report in this one.
+            crate::log!("panic: the report did not reach /log in {LOG_FILE_DRAIN_NANOS}ns; the panel is the only copy");
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Halt all CPUs. Sends halt IPI to all other CPUs, then flushes any
 /// pending log output to the serial backend, then halts self.
 ///
@@ -116,6 +172,7 @@ pub fn send_nmi(cpu_id: u32) {
 /// normally could therefore deadlock; `panic_flush` first waits out live
 /// holders, then bypasses the wedged ones.
 pub fn halt_all_cpus() -> ! {
+    wait_for_log_file();
     if X2APIC_ENABLED.load(Ordering::Relaxed) {
         cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | 0xFD);
     }
