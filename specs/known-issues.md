@@ -3354,6 +3354,12 @@ phase landed, and none reproduces on a host running one suite.
   `desktop_typing_damage` and `desktop_locale_detect`: its verdict is the dump's
   content, but *reaching* the dump crosses a compositor, a terminal and a shell,
   and that step is a wall-clock margin. Still `Sched::Parallel`.
+- **`screen_console_scroll`** — added 2026-08-07. `round 1: the guest never
+  printed CHURN-DONE 0 100`, **598 s** in the wide phase, `ALONE … GREEN`. The
+  landing gate it killed ran 778.9 s with four other `--land` processes on the
+  host, on a branch whose whole delta was two documentation lines. 598 s against
+  a phase that is ~45 s on a quiet host is the finding; the message is not.
+  Still `Sched::Parallel`.
 - **`hda_tone`** — added 2026-08-07, hours after the test itself landed. In a
   full run on a host carrying another worktree's suite: `2 mid-tone silences in
   the capture: total 2 [3p×1 4p×1]`, `dither 3.3%`, `phase-breaks 92`. Alone on

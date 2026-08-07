@@ -170,9 +170,18 @@ fn steps(
     let _lock = buildlock::integration(root);
 
     let main_before = git(primary, &["rev-parse", "main"])?;
-    merge_main(root, branch, log)?;
+    let pending = merge_main(root, branch, log)?;
 
-    let took = run_gate(root, gate, log)?;
+    let outcome = run_gate(root, gate, log);
+    // **Between the gate and everything that follows**, because that commit is
+    // the one main's history shows and the gate's verdict is the thing worth
+    // showing. It is also the only ordering that leaves no window: a worktree
+    // holding an uncommitted merge reads as an unresolved conflict to the next
+    // `--land`.
+    if pending {
+        commit_merge(root, &merge_message(root, branch, &main_before, gate, &outcome, log))?;
+    }
+    let took = outcome?;
 
     let dirty = git(primary, &["status", "--porcelain"])?;
     if !dirty.is_empty() {
@@ -273,13 +282,16 @@ fn preflight(root: &Path, primary: &Path) -> Result<String, String> {
 
 /// Step 2. `--no-ff` so the landing record names both parents; `--no-edit`
 /// because nothing here has a terminal to open an editor on.
-fn merge_main(root: &Path, branch: &str, log: &LandLog) -> Result<(), String> {
-    match git(root, &["merge", "--no-ff", "--no-edit", "main"]) {
+fn merge_main(root: &Path, branch: &str, log: &LandLog) -> Result<bool, String> {
+    match git(root, &["merge", "--no-ff", "--no-commit", "main"]) {
         Ok(out) => {
             for line in out.lines() {
                 log.say(&format!("[land] {line}"));
             }
-            Ok(())
+            // "Already up to date" writes no `MERGE_HEAD` and there is nothing
+            // to commit. main then gets this branch's own commits and no
+            // landing commit at all, which is correct: nothing was integrated.
+            Ok(merging(root))
         }
         Err(e) if merging(root) => Err(format!(
             "{e}\n\
@@ -370,6 +382,104 @@ fn run_gate(
         ));
     }
     Ok(took)
+}
+
+/// The landing commit's message, written from **main's** point of view.
+///
+/// git's default for this merge is "Merge branch 'main' into wt/toyos-x", which
+/// names the direction nobody reads: from main's history what happened is that
+/// the branch landed. 66 of the 166 commits on main in the twenty hours to
+/// 2026-08-07 were that sentence, which makes `git log --oneline` close to
+/// useless as a summary.
+///
+/// Two things a reader cannot recover afterwards go in it: **which gate ran**,
+/// because `--gate` overrides the default and one override on that day silently
+/// narrowed to a single test, and **whether the run was clean**, because a run
+/// carrying declared expected failures is accepted and only the suite's own last
+/// line says so. That line is quoted rather than summarised — a restatement
+/// drifts from what the harness says and a quotation does not.
+///
+/// The direction of the two parents is not changed and the merge is not
+/// squashed. Only the label was wrong.
+fn merge_message(
+    root: &Path,
+    branch: &str,
+    main_before: &str,
+    gate: &[String],
+    outcome: &Result<std::time::Duration, String>,
+    log: &LandLog,
+) -> String {
+    let carried = git(root, &["rev-list", "--count", &format!("main..{branch}")])
+        .unwrap_or_else(|_| "?".to_string());
+    let short = git(root, &["rev-parse", "--short", main_before]).unwrap_or_else(|_| "?".to_string());
+    let verdict = gate_verdict(log);
+
+    let Ok(took) = outcome else {
+        return format!(
+            "{branch}: merged main {short} during a landing that did not complete\n\n\
+             The gate this merge was made for did not pass, so this is an integration \
+             merge and not a landing. Whatever lands on top of it carries its own record.\n\n\
+             \x20 gate    {}\n\
+             \x20         {verdict}\n",
+            gate.join(" "),
+        );
+    };
+
+    let mut message = format!(
+        "{branch} landed: {carried} commits, gate {}\n\n\
+         Merged main {short} into the branch under the integration lock and \
+         fast-forwarded main onto the result (specs/worktrees.md §5). This commit's \
+         parents run branch-side; from main's history what happened is the subject line.\n\n\
+         \x20 gate    {}, {:.1?}\n\
+         \x20         {verdict}\n",
+        clean_or_not(log),
+        gate.join(" "),
+        took,
+    );
+    if !is_default(gate) {
+        message.push_str(&format!(
+            "\nThe gate was NOT the default `{}` — the whole suite. Whatever the default \
+             covers and this did not is ungated on main.\n",
+            DEFAULT_GATE.join(" "),
+        ));
+    }
+    message
+}
+
+/// The suite's own last word on the run, quoted.
+///
+/// `test result:` alone is not enough — `cargo test` runs several binaries and
+/// the last of them is the doc-tests, whose line says nothing about the suite.
+/// The suite's own line is the one that counts a total, which libtest's never
+/// does. A `--gate` override that runs something else has no such line at all,
+/// and says so rather than borrowing one.
+fn gate_verdict(log: &LandLog) -> String {
+    let Ok(text) = fs::read_to_string(&log.path) else {
+        return "the gate's output could not be read back".to_string();
+    };
+    text.lines()
+        .filter(|l| l.trim_start().starts_with("test result:") && l.contains(" total ("))
+        .next_back()
+        .map_or_else(
+            || "the gate printed no suite result line".to_string(),
+            |l| l.trim().to_string(),
+        )
+}
+
+fn clean_or_not(log: &LandLog) -> &'static str {
+    if gate_verdict(log).contains("NOT clean") { "ok, NOT clean" } else { "ok" }
+}
+
+/// Commit the merge [`merge_main`] left staged.
+///
+/// Through a file and never `-m`: the message is several lines and carries
+/// backticks. Nothing else about the commit changes — signing and hooks are
+/// whatever `git merge` was already doing here.
+fn commit_merge(root: &Path, message: &str) -> Result<(), String> {
+    let file = root.join(format!("target/landings/message-{}.txt", std::process::id()));
+    fs::write(&file, message).map_err(|e| format!("[land] write {}: {e}", file.display()))?;
+    git(root, &["commit", "-q", "-F", &file.to_string_lossy()])?;
+    Ok(())
 }
 
 /// Copy `from` to this process's own stream and to the log, in chunks rather
@@ -636,6 +746,56 @@ mod tests {
         let report = run(&wt, &pass()).unwrap();
         assert!(report.contains("NOT the default"), "an override went unreported: {report}");
         assert!(buildlock::integration_is_free(&primary), "the lock was left held");
+    }
+
+    /// **The landing commit is read from main's side, so it says what main
+    /// got.** git's default message names the other direction, and 66 of the
+    /// 166 commits on main in the twenty hours to 2026-08-07 were that one
+    /// sentence.
+    #[test]
+    fn the_landing_commit_says_which_branch_landed_and_how_it_was_gated() {
+        let (primary, wt) = repo("merge-message");
+        commit(&wt, "g", "mine\n", "work");
+        commit(&wt, "h", "more\n", "and more");
+        // main has to have moved, or there is nothing to merge and no landing
+        // commit at all — which is correct and is the other half of this.
+        commit(&primary, "theirs", "theirs\n", "meanwhile");
+
+        run(&wt, &pass()).expect("the landing should have gone through");
+        let subject = git(&primary, &["log", "-1", "--format=%s", "main"]).unwrap();
+        assert!(subject.starts_with("wt landed: 2 commits"), "{subject}");
+        assert!(
+            !subject.contains("Merge branch 'main' into"),
+            "the default message is still what main records: {subject}"
+        );
+        let body = git(&primary, &["log", "-1", "--format=%b", "main"]).unwrap();
+        assert!(body.contains("gate    true"), "the gate that ran is not in the commit:\n{body}");
+        assert!(
+            body.contains("NOT the default"),
+            "an overridden gate is not declared in the commit:\n{body}"
+        );
+        let parents = git(&primary, &["rev-list", "--parents", "-n", "1", "main"]).unwrap();
+        assert_eq!(
+            parents.split_whitespace().count(),
+            3,
+            "the landing commit stopped being a merge: {parents}"
+        );
+    }
+
+    /// A landing whose gate failed still has to leave the merge committed —
+    /// otherwise the next `--land` finds `MERGE_HEAD` and reports an unresolved
+    /// conflict that is not there. It must not claim a verdict it did not get.
+    #[test]
+    fn a_failed_gate_leaves_the_merge_committed_and_claims_nothing() {
+        let (primary, wt) = repo("merge-message-red");
+        commit(&wt, "g", "mine\n", "work");
+        commit(&primary, "theirs", "theirs\n", "meanwhile");
+
+        run(&wt, &["false".to_string()]).expect_err("a red gate must not land");
+        assert!(!merging(&wt), "the merge was left uncommitted for the next run to misread");
+        let subject = git(&wt, &["log", "-1", "--format=%s", "HEAD"]).unwrap();
+        assert!(subject.contains("did not complete"), "{subject}");
+        assert!(!subject.contains("landed"), "a failed landing claimed to have landed: {subject}");
     }
 
     /// The whole of the shared-scratchpad defect: two landings must not be able

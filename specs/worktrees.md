@@ -346,6 +346,38 @@ began. The kernel still keeps the queue and a thread does the talking: nothing
 polls a lock, so `flock`'s own ordering is given up nowhere. Gate:
 `a_lasting_wait_keeps_saying_so`.
 
+**The landing commit is written by `--land` and reads from main's side.** Step 2
+creates a merge whose default message is `Merge branch 'main' into
+wt/toyos-<x>` — the direction nobody reads. Measured 2026-08-07: **166 commits on
+main in twenty hours, 66 of them that one sentence**, which makes
+`git log --oneline` close to useless as a summary. The subject is now
+`wt/toyos-<x> landed: N commits, gate ok` (or `gate ok, NOT clean`), and the body
+carries the gate command, its duration and the suite's own last line quoted.
+
+Two of those are things a reader cannot recover afterwards and are the reason the
+commit carries them rather than the report alone: **which gate ran**, because
+`--gate` overrides the default and one override that day silently narrowed to a
+single test, and **whether the run was clean**, because `--land` accepts a run
+carrying declared expected failures and only the suite says so.
+
+The direction of the two parents is unchanged and nothing is squashed — the
+history is honest and only its labelling was wrong. **Read it with
+`git log --no-merges`** when you want the work rather than the landings.
+
+Composing the message needs the gate's verdict, which does not exist when the
+merge is made, so the merge is `--no-ff --no-commit` and the commit happens
+between the gate and everything after it. Two consequences worth stating:
+
+- **A failed gate still commits the merge**, with a subject saying the landing
+  did not complete and claiming no verdict. Leaving it uncommitted would make the
+  next `--land` report an unresolved conflict that is not there.
+- **`toolchain::standing` ignores the working tree while a merge is in
+  progress.** For the length of the gate the branch holds main's changes staged
+  and uncommitted, which `git status` cannot tell from local work — and a build
+  inside that gate would otherwise be told it had standing to claim a sysroot it
+  has no delta for. What the branch has of its own is the `main...HEAD` question.
+  Gate: `a_landing_s_uncommitted_merge_is_not_standing`.
+
 **A landing writes its own log**, `target/landings/landing-<epoch>-<pid>.log`,
 created with `O_EXCL` and named in the report. The gate's stdout and stderr are
 copied to this process's own streams *and* into it, so the terminal still sees
