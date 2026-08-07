@@ -6,6 +6,7 @@ use alloc::sync::Arc;
 use crate::block;
 use crate::file_backing::FileBacking;
 use crate::sync::Lock;
+use crate::user_ptr::{ByteSource, UserBytesMut};
 
 pub type FileId = u64;
 
@@ -136,7 +137,7 @@ pub fn release(file_id: FileId) -> bool {
 
 /// Read from a file page into `buf`. Handles cache miss via the file's backing.
 /// Lock is NOT held during disk I/O (unlock-fetch-relock pattern).
-pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) {
+pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut UserBytesMut) {
     let backing;
     {
         let mut cache = FILE_CACHE.lock();
@@ -145,7 +146,7 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
 
         // Beyond file size: zero-fill, no cache insert.
         if (page_idx as u64) * PAGE_SIZE as u64 >= file_size {
-            buf.fill(0);
+            buf.fill_zero(0, buf.len());
             return;
         }
 
@@ -167,7 +168,7 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
         // through `write_page` find the page resident, merge into the zeros
         // and flush them back over the file.
         if backing.read_page(page_idx as u64 * PAGE_SIZE as u64, &mut fetched).is_err() {
-            buf.fill(0);
+            buf.fill_zero(0, buf.len());
             return;
         }
     }
@@ -202,11 +203,11 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
 /// that was fine — or to refuse. It refuses. The caller decides what to do
 /// about a write that did not happen, which is a decision this layer does not
 /// have the standing to make silently.
-pub fn write_page(
+pub fn write_page<S: ByteSource + ?Sized>(
     file_id: FileId,
     page_idx: u32,
     offset: usize,
-    data: &[u8],
+    data: &S,
 ) -> Result<(), block::BlockError> {
     // A resident page is written under the acquisition that found it. The
     // fetch path below drops the lock, and a sibling CPU's eviction inside
@@ -258,10 +259,15 @@ pub fn write_page(
     Ok(())
 }
 
-fn apply_write(file: &mut CachedFile, page_idx: u32, offset: usize, data: &[u8]) {
+fn apply_write<S: ByteSource + ?Sized>(
+    file: &mut CachedFile,
+    page_idx: u32,
+    offset: usize,
+    data: &S,
+) {
     let page = file.pages.get_mut(&page_idx).expect("write_page: page not resident");
     let end = (offset + data.len()).min(PAGE_SIZE);
-    page.data[offset..end].copy_from_slice(&data[..end - offset]);
+    data.read_at(0, &mut page.data[offset..end]);
     page.dirty = true;
     page.referenced = true;
 
@@ -405,16 +411,16 @@ fn valid_bytes_in_page(page_idx: u32, file_size: u64) -> usize {
     }
 }
 
-fn copy_page_region_to_buf(page: &[u8], offset: usize, buf: &mut [u8], valid: usize) {
+fn copy_page_region_to_buf(page: &[u8], offset: usize, buf: &mut UserBytesMut, valid: usize) {
     let start = offset.min(valid);
     let end = (offset + buf.len()).min(valid);
     let count = end.saturating_sub(start);
     if count > 0 {
-        buf[..count].copy_from_slice(&page[start..start + count]);
+        buf.write_at(0, &page[start..start + count]);
     }
     // Zero-fill remainder (past valid data or past file end).
     if count < buf.len() {
-        buf[count..].fill(0);
+        buf.fill_zero(count, buf.len() - count);
     }
 }
 

@@ -296,24 +296,73 @@ the bound in `translate` with futex's signature, and the typed call sites with
 
 - **M1b-1, built**: the `UserBytes` type, the 16 `user_str` sites, spawn's fd
   map and its env blob. Eighteen of the thirty-three.
-- **M1b-2, not built**: the fifteen remaining `user_slice`/`user_slice_mut`
-  sites. Eleven are shallow — the kernel builds a small answer (`getcwd`,
-  `readdir`, `sysinfo`, `readlink`, `sched_info`, `process_stats`, `random`, a
-  device name) and copies it once, so each is a `buf.write_at(0, &answer)` and a
-  signature. Four are the read and write path (`SYS_READ`, `SYS_WRITE` and their
-  non-blocking twins), which reach `fd::try_read`/`try_write` and from there a
-  leaf per descriptor kind: the page cache, a pipe's ring, the serial port, the
-  input queues.
+- **M1b-2, built**: the fifteen remaining sites, and with them `user_slice` and
+  `user_slice_mut`. **No accessor in the kernel returns a reference to user
+  memory any more** — that is the stage's deliverable, and it is a property of
+  the type surface rather than of fifteen call sites having moved.
 
-**The leaf is where M1b-2's decision is, so it is recorded here rather than
-rediscovered.** Do *not* bounce through a kernel buffer at the syscall
-boundary: a bounded chunk loop breaks the atomicity a pipe write has today, and
-an unbounded copy puts a userland-chosen length on the allocator, which is what
-`MAX_HEAP_ALLOC` exists to refuse. Thread the window down instead. Every leaf
-already holds the *kernel* side of its copy — a page-cache page, the ring's
-shared memory — so `buf[a..b].copy_from_slice(&page[..])` becomes
-`user.write_at(a, &page[..])`: one copy, the same one, with the reference on the
-kernel side where it is true.
+**The leaf is where M1b-2's decision was, and the plan's instruction held.** Do
+*not* bounce through a kernel buffer at the syscall boundary: a bounded chunk
+loop breaks the atomicity a pipe write has today, and an unbounded copy puts a
+userland-chosen length on the allocator, which is what `MAX_HEAP_ALLOC` exists
+to refuse. The window is threaded down instead, so
+`buf[a..b].copy_from_slice(&page[..])` became `user.write_at(a, &page[..])`:
+one copy, the same one, with the reference on the kernel side where it is true.
+
+**What M1b-2 built, where it differs from the sketch above.**
+
+- **Two types, and the direction is the reference's mutability.** `UserBytes`
+  reads and `UserBytesMut` writes, mirroring `&[u8]`/`&mut [u8]`, because a
+  single type would let `fd::try_write`'s leaves store into a buffer the caller
+  passed to be *read* — a distinction the tree had for free and would have paid
+  to lose. `UserBytesMut` is write-only, which is one property stronger than
+  `&mut [u8]` was: the kernel cannot be made to act on a value another thread
+  substituted into a buffer it had already filled. `sub(off, len)` is what
+  `buf[a..b]` was, and it exists on each type separately so a read-only window
+  cannot produce a writable one.
+- **`ByteSource` is the page cache's one concession.** `file_cache::write_page`
+  is reached by a syscall carrying a `UserBytes` and by `log_file`, whose bytes
+  are the kernel's own; a slice cannot express the first and a window cannot
+  express the second, so the signature names the capability instead of a
+  representation.
+- **`Ring::read`/`write` describe the destination rather than take it.** They
+  hand each contiguous run to a closure with its offset — one run, or two at the
+  ring's wrap. The alternative was a staging buffer in `pipe::try_read`, which
+  doubles the copy on the IPC path for no property, and the cost of avoiding it
+  is that this stage touches `toyos-abi/src` and therefore claims the shared
+  sysroot (`specs/worktrees.md` §3.1). That is the whole reason M1b-2 is two
+  commits: everything else lands with no claim at all.
+- **Four typed sites became `copy_out`, and each deleted an `unsafe` cast.**
+  `SchedInfo`, `ProcessStats`, `FramebufferInfo` and `sys_query_modules`'
+  `ModuleInfo` were reached by casting a validated byte slice to the struct —
+  which checked the span but never the *alignment* the cast needs, so an
+  unaligned pointer produced an unaligned `&mut T` and wrote through it. What
+  the conversion adds is the whole-object check every `UserSafe` type already
+  has; what it removes is the cast. `ProcessStats` is 128 bytes, so the
+  accessors' "at most 48 bytes" claim moved to 128.
+- **`sys_process_stats` copies before it removes.** The snapshot may be read
+  exactly once, so a `copy_out` the kernel refused after taking it would leave
+  nobody able to ask again — CLAUDE.md's rule that a failed operation must not
+  have kept what it took. This is the only ordering M1b-2 changed and it has its
+  own gate.
+- **The serial console's CSI filter is a state machine**, because it was an
+  index walk with a one-byte lookahead and the user path cannot look ahead.
+  `write_bytes` hands it a slice and `write_user` hands it 256 bytes at a time
+  out of the window, with the filter's state carried across the chunks — so a
+  sequence straddling a chunk comes out as one that does not.
+
+  **The byte-at-a-time version was written first and measured 3× slower to
+  boot.** It has no chunk boundary at all, which is a property worth something,
+  and `xhci_slow_connect` refused it: with the loop inside `feed` the guest
+  reaches `xHCI: controller started` at 0.105 s (three runs: 0.104, 0.105,
+  0.105), and with one call per logged byte at 0.32 s (six runs, 0.317–0.338),
+  past the 0.3 s that test's actuator holds the ports empty for. The pre-xHCI
+  log is 53 lines and 4,711 bytes of *surviving* output, so the cost is not one
+  call per visible byte — a lossy ring drops most of what a boot logs, and what
+  the number really says is that this path is a much larger share of early boot
+  than its 4 KB of output suggests. Recorded because it makes `xhci_slow_connect`
+  a boot-cost gate as much as a USB one, and the next agent to touch `log!`
+  should expect it to answer.
 
 **Delta from the plan: `read_at`/`write_at` are a raw `copy_nonoverlapping`,
 not per-byte volatile.** What this stage exists to remove is the *reference*.
@@ -447,6 +496,32 @@ The canary is the point: a gate that only checks the *verdict* is vacuous here
 (CLAUDE.md's rule about actuators that replace only a verdict). Each test must
 observe that the out-of-bounds write did not happen, not merely that the call
 returned an error.
+
+**M1b-2's gates, and what each control was seen to say.** Its central property
+is a type-surface one — no accessor returns a reference to user memory — whose
+gate is the compiler and whose control does not compile, so what is gated here
+is the behaviour the conversion *changed*. Two rows join `abuse_page_straddle`,
+each observing the memory rather than the verdict:
+
+| gate | asserts | negative control |
+|---|---|---|
+| guest | `sched_info` with its 24-byte `SchedInfo` 8 bytes below a boundary returns `BadAddress` and the next physical page is unchanged | straddle arm off for size 24 → `sched_info wrote 16 bytes past the end of the physical page it translated` |
+| guest | `process_stats` refuses a straddling 128-byte `ProcessStats` **and the snapshot is still readable afterwards** | straddle arm off for size 128 → the canary changes; separately, remove-before-copy → `process_stats had already spent the snapshot on the call it refused` |
+
+The controls were narrowed *by size* rather than deleted outright, because
+`Stat` and `SchedInfo` are both 24 bytes and the pre-existing `fstat` row would
+otherwise red first and stop the run — the same reason the existing rows assert
+the canary before the verdict. `kernel-span`'s table grew the three new
+`UserSafe` shapes (`SchedInfo` 24/8, `FramebufferInfo` 32/4, `ProcessStats`
+128/8), whose sizes were measured by compiling the declarations rather than
+counted by hand.
+
+Everything else M1b-2 touched is gated by the suite as it stands, and that is a
+claim about the change: `getcwd`, `readdir`, `sysinfo`, `readlink`, `random`,
+`get_env`, `query_modules`, the whole read and write path and every pipe in the
+system produce the same bytes and the same errors as before, so a conversion
+that got one wrong reds something. `Ring`'s own host tests cover the closure
+form at the wrap, which is the one place its two runs differ.
 
 **Gate A exposure:** none. No TLB, scheduler or mapping path is touched.
 
@@ -703,7 +778,8 @@ Named so the gaps are decisions rather than oversights:
 | stage | kernel diff, estimated | new host tests | new guest tests | gate A |
 |---|---|---|---|---|
 | M1a | **measured: 337+/144− across 7 kernel files** (estimated ~300) | 1 module, 6 tests | 2 programs, 5 properties | none |
-| M1b | ~200 lines across `syscall.rs` | — | — | none |
+| M1b-1 | measured: 226+/122− across 3 kernel files | — | — | none |
+| M1b-2 | measured: 465+/228− across 10 kernel files, `toyos-abi/src/ring.rs` and one test program | 3 rows added to the span table | 2 properties added to `abuse_page_straddle` | none |
 | M2 | ~500 lines, `paging.rs` + fault path + `toyos-ld` none | 1 module | 4 | fast A/B |
 | M3 | ~350 lines, `apic.rs`/`paging.rs` + 6 audited sites | — | 3 + 1 actuator | fast + thorough A/B |
 | M4 | ~150 lines | 1 module | 2 | none |
