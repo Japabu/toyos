@@ -65,7 +65,10 @@ mod tests {
         ("RawKeyEvent", 2, 1),
         ("MouseEvent", 6, 2),
         ("Stat", 24, 8),
+        ("SchedInfo", 24, 8),
+        ("FramebufferInfo", 32, 4),
         ("SpawnArgs", 48, 8),
+        ("ProcessStats", 128, 8),
     ];
 
     #[test]
