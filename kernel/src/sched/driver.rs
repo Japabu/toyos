@@ -617,6 +617,22 @@ pub fn enter_idle_loop() -> ! {
     unsafe {
         asm!(
             "mov rsp, {sp}",
+            // Terminate the frame chain, and leave the zero return-address
+            // slot a `call` would have left. `idle_loop` is entered by `jmp`,
+            // so its frame is the topmost on this stack and `rbp + 8` — where
+            // `kernel_backtrace` reads the return address — was the unmapped
+            // page above a 16 KiB idle stack. A fatal panic taken on an idle
+            // CPU therefore faulted inside `crash_report` while printing its
+            // own backtrace; that fault's report faulted the same way, and it
+            // ended in a double fault with the panel carrying seven pages of
+            // cascade and not one line of the reason. The one context a
+            // machine-stopped panic is raised from was the one context that
+            // could not say why.
+            //
+            // `push` also leaves `rsp` where the ABI expects it at a function
+            // entry, which jumping to the raw top does not.
+            "xor ebp, ebp",
+            "push rbp",
             "jmp {func}",
             sp = in(reg) sp,
             func = in(reg) idle_loop as *const () as usize,
@@ -631,6 +647,12 @@ extern "C" fn idle_loop() -> ! {
         // reaches one.
         #[cfg(feature = "dump-deaf-cpu")]
         super::dump::deaf_window();
+        // Here and not from a syscall: the panic handler recovers rather than
+        // paints when a userland thread is current, and this context has none.
+        #[cfg(feature = "metal-panic-probe")]
+        if crate::drivers::panic_console::probe_due() {
+            panic!("metal-panic-probe: a fatal report over a desktop that owns the screen");
+        }
         crate::scheduler::log_health();
         crate::scheduler::reap_poisoned();
         drain_serial();

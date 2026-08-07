@@ -243,6 +243,22 @@ test-double-fault = []
 # drive the ordinary fatal panic — the one path where the report reaches the
 # screen only because the panic handler captured it before draining the ring.
 test-late-panic = []
+# Panic a few seconds after a *compositor* has claimed the framebuffer, from an
+# idle CPU, so the panic handler's recovery branch is not taken and the report
+# reaches `halt_all_cpus`.
+#
+# What nothing else reaches: whether a fatal report lands on the panel of the
+# owner's T14 while his desktop owns the scanout. `screen_fatal_halt_composited`
+# certifies the software half and cannot certify more — QEMU's framebuffer is
+# host RAM, while the T14's is a write-combining MMIO mapping the compositor is
+# also writing, and a full paint measures ~460 ms there. Three investigations
+# into the machine freeze have assumed a fatal panic would have been seen if one
+# had happened; this is the boot that turns that assumption into an observation,
+# and its negative result would be the larger finding of the two.
+#
+# `test-late-panic` cannot serve: it fires during the boot phases, before any
+# userland process exists, so it paints a screen nobody had claimed.
+metal-panic-probe = []
 # SYS_DEBUG actions 5, 6 and 7: one kernel heap allocation at
 # `mm::MAX_HEAP_ALLOC`, one a page over it, and one at the ceiling but
 # page-aligned. Ordinary code can still ask for more than one page backs — a

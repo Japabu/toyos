@@ -161,6 +161,28 @@ static LIVE: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
 /// this entirely and takes the screen back unconditionally.
 static SCREEN_OWNED_BY_USERLAND: AtomicBool = AtomicBool::new(false);
 
+/// When userland took the screen, so [`probe_due`] can wait a few seconds past
+/// it. 0 means it has not.
+#[cfg(feature = "metal-panic-probe")]
+static CLAIMED_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How long after the claim the probe fires. Long enough for a desktop to
+/// finish coming up and for whoever is watching the panel to be watching it.
+#[cfg(feature = "metal-panic-probe")]
+const PROBE_DELAY_NS: u64 = 5_000_000_000;
+
+/// Whether the `metal-panic-probe` boot should panic now. The idle loop asks,
+/// because a CPU there has no thread current and therefore takes the panic
+/// handler's fall-through to `halt_all_cpus` rather than its recovery branch —
+/// which is the whole point of the probe: the recovery branch never paints.
+#[cfg(feature = "metal-panic-probe")]
+pub fn probe_due() -> bool {
+    match CLAIMED_AT.load(Ordering::Relaxed) {
+        0 => false,
+        at => crate::clock::nanos_since_boot().saturating_sub(at) >= PROBE_DELAY_NS,
+    }
+}
+
 /// Hand the screen over, and do not return while a checkpoint is still
 /// drawing on it.
 ///
@@ -185,6 +207,8 @@ static SCREEN_OWNED_BY_USERLAND: AtomicBool = AtomicBool::new(false);
 /// already painted on the glass, which is the same corruption.
 pub fn screen_claimed_by_userland() {
     SCREEN_OWNED_BY_USERLAND.store(true, Ordering::SeqCst);
+    #[cfg(feature = "metal-panic-probe")]
+    CLAIMED_AT.store(crate::clock::nanos_since_boot().max(1), Ordering::Relaxed);
     // Bounded because a CPU that died holding the latch must not take the
     // display down with it; one paint is the honest ceiling and this is twice
     // the slowest one measured.

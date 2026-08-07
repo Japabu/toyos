@@ -1725,7 +1725,7 @@ static XHCI: Lock<Vec<XhciController>> = Lock::new(Vec::new());
 /// with a live kernel and nothing dropped. A caller that wants fresh input
 /// wants the scheduler pass that is already about to run, not this.
 pub fn poll_if_pending() {
-    let interrupted = crate::irq_ring::take(crate::irq_ring::IrqSource::Xhci).is_some();
+    let interrupted = crate::irq_ring::pending(crate::irq_ring::IrqSource::Xhci);
     if !interrupted {
         match PORT_WORK_AT.load(Ordering::Relaxed) {
             0 => return,
@@ -1733,8 +1733,27 @@ pub fn poll_if_pending() {
             _ => {}
         }
     }
+    // **Decline rather than queue.** Every CPU reaches this at the top of
+    // every pass, and while a port has work outstanding every one of them
+    // finds it due — so `lock()` here puts as many CPUs as the machine has on
+    // one ticket queue, each spinning with preemption disabled, at the one
+    // place the scheduler cannot afford to be.
+    //
+    // A `try_lock` loses nothing, and that is the argument rather than a
+    // mitigation: the CPU holding this lock is doing precisely the work this
+    // CPU came to do, against one shared event ring and one shared port
+    // machine. Waiting for it buys a second look at a state somebody else has
+    // already advanced. The decline costs one pass of latency, and the idle
+    // loop's pre-halt check reads `irq_ring` and `PORT_WORK_AT` directly, so
+    // the CPU comes straight back instead of sleeping through it.
+    let Some(mut guard) = XHCI.try_lock() else { return };
+    // Consumed only now that the work will actually be done. `take` clears the
+    // slot and an ISR coalesces into an empty one, so a CPU that took its
+    // record and then declined the lock would have dropped a wake with nothing
+    // left to re-post it.
+    crate::irq_ring::take(crate::irq_ring::IrqSource::Xhci);
     let mut wake_at: Option<u64> = None;
-    for ctrl in XHCI.lock().iter_mut() {
+    for ctrl in guard.iter_mut() {
         if let Some(at) = ctrl.poll() {
             wake_at = Some(wake_at.map_or(at, |w: u64| w.min(at)));
         }
