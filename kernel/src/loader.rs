@@ -235,8 +235,13 @@ pub fn build_child_fds(pairs: &crate::user_ptr::UserBytes) -> Result<FdTable, Sy
         let child_fd = u32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
         let parent_fd = u32::from_ne_bytes([pair[4], pair[5], pair[6], pair[7]]);
         if let Some(desc) = data.fds.get(parent_fd) {
-            let cloned = desc.clone();
-            fds.insert_at(child_fd, cloned)?;
+            // A device claim admits one descriptor, so it cannot be given to a
+            // child: that would be a transfer, and there is no transfer
+            // operation — `capability-handles-spec.md` §6.5 scopes spawn-time
+            // device grants out of v1. Refused by name rather than skipped,
+            // which would start the child without an fd it asked for.
+            let child_desc = desc.duplicate().ok_or(SyscallError::PermissionDenied)?;
+            fds.insert_at(child_fd, child_desc)?;
         }
     }
     Ok(fds)
@@ -516,8 +521,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
     let t0 = crate::clock::nanos_since_boot();
 
-    // 1. Open file backing from VFS (follows symlinks)
-    let backing: Arc<dyn crate::file_backing::FileBacking> = match vfs::lock().open_backing(path) {
+    // 1. Open file backing from VFS (follows symlinks). The guard is scoped
+    // rather than held across the match: every `return` past this point drops
+    // `fds`, and releasing a file descriptor takes the VFS lock
+    // (`fd::OpenFile::drop`).
+    let opened = vfs::lock().open_backing(path);
+    let backing: Arc<dyn crate::file_backing::FileBacking> = match opened {
         Some(b) => b,
         None => {
             log!("spawn: {}: not found", path);

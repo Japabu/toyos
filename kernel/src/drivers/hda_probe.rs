@@ -9,7 +9,7 @@
 //! **Why this is a kernel feature and nothing else can reach it**
 //! (`specs/device-test-strategy.md`'s requirement of an actuator): there is no
 //! way for a userland process to touch a codec at all. `SYS_OPEN_DEVICE` hands
-//! out a `DEVICE_AUDIO` claim, not a PCI function; the capability that would
+//! out a `DeviceType::Audio` claim, not a PCI function; the capability that would
 //! let a process map a BAR and drive one is `specs/userspace-drivers-spec.md`
 //! stage 4, and it is unbuilt. The questions here are precisely the ones that
 //! decide whether that capability will ever be given this device, so the thing

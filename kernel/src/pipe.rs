@@ -38,47 +38,77 @@ impl IdKey for PipeId {
     const ONE: Self = PipeId(1);
 }
 
-// PipeReader / PipeWriter — owned refcounted references.
-// Creation bumps, Drop decrements. Clone bumps. No other way to get one.
+pub use handle::{PipeReader, PipeWriter};
 
-/// Owned reader reference to a pipe. Bumps reader refcount on creation/clone,
-/// decrements on drop. Like Arc but for pipe reader slots.
-pub struct PipeReader(PipeId);
+/// Owned references to a pipe's two ends.
+///
+/// The id inside each handle is private to this module, and `pipe.rs` is this
+/// module's *parent*, so nothing in the kernel — this file included — can name
+/// a pipe as an owned reference except through `acquire`. `acquire` takes the
+/// `&mut Pipe` that only a holder of `PIPES` can produce, so finding the pipe
+/// and taking the reference that keeps it alive are one acquisition. There is
+/// no program point between them at which the last other end can close and
+/// free it, which is what an `exists`-then-`add_reader` pair had.
+mod handle {
+    use super::{close_read, close_write, with_pipes_mut, Pipe, PipeId};
 
-/// Owned writer reference to a pipe. Same semantics as PipeReader but for writers.
-pub struct PipeWriter(PipeId);
+    /// One counted reference to a pipe's read end — `Arc`, for a reader slot.
+    pub struct PipeReader(PipeId);
 
-impl PipeReader {
-    pub fn id(&self) -> PipeId { self.0 }
-}
+    /// One counted reference to a pipe's write end.
+    pub struct PipeWriter(PipeId);
 
-impl PipeWriter {
-    pub fn id(&self) -> PipeId { self.0 }
-}
+    impl PipeReader {
+        /// The only constructor. Taking the reference and counting it are the
+        /// same statement, so an uncounted `PipeReader` cannot be written.
+        pub(super) fn acquire(pipe: &mut Pipe) -> Self {
+            pipe.readers = pipe.readers.checked_add(1).expect("pipe reader overflow");
+            pipe.publish_ends();
+            Self(pipe.id)
+        }
 
-impl Clone for PipeReader {
-    fn clone(&self) -> Self {
-        add_reader(self.0);
-        Self(self.0)
+        pub fn id(&self) -> PipeId { self.0 }
     }
-}
 
-impl Clone for PipeWriter {
-    fn clone(&self) -> Self {
-        add_writer(self.0);
-        Self(self.0)
+    impl PipeWriter {
+        pub(super) fn acquire(pipe: &mut Pipe) -> Self {
+            pipe.writers = pipe.writers.checked_add(1).expect("pipe writer overflow");
+            pipe.publish_ends();
+            Self(pipe.id)
+        }
+
+        pub fn id(&self) -> PipeId { self.0 }
     }
-}
 
-impl Drop for PipeReader {
-    fn drop(&mut self) {
-        close_read(self.0);
+    /// A live handle proves the count is at least one, which proves the pipe is
+    /// in the table — so unlike `open_reader` this cannot fail on a race, and
+    /// its `expect` is the kernel-bug assert it looks like.
+    impl Clone for PipeReader {
+        fn clone(&self) -> Self {
+            with_pipes_mut(|pipes| {
+                Self::acquire(pipes.get_mut(self.0).expect("a held PipeReader's pipe is in the table"))
+            })
+        }
     }
-}
 
-impl Drop for PipeWriter {
-    fn drop(&mut self) {
-        close_write(self.0);
+    impl Clone for PipeWriter {
+        fn clone(&self) -> Self {
+            with_pipes_mut(|pipes| {
+                Self::acquire(pipes.get_mut(self.0).expect("a held PipeWriter's pipe is in the table"))
+            })
+        }
+    }
+
+    impl Drop for PipeReader {
+        fn drop(&mut self) {
+            close_read(self.0);
+        }
+    }
+
+    impl Drop for PipeWriter {
+        fn drop(&mut self) {
+            close_write(self.0);
+        }
     }
 }
 
@@ -98,6 +128,10 @@ struct Backing {
 }
 
 struct Pipe {
+    /// Its own key in `PIPES`. A handle's id comes from here rather than from
+    /// the caller of `acquire`, so a handle cannot be built naming a different
+    /// pipe than the one whose count it bumped.
+    id: PipeId,
     /// `None` until the pipe is first used. A pipe costs 2 MiB and a
     /// connection is two of them, so allocating on `create` charged every
     /// `SYS_CONNECT` 4 MiB of physical memory before either end had sent a
@@ -128,8 +162,9 @@ struct Pipe {
 unsafe impl Send for Pipe {}
 
 impl Pipe {
-    fn new(creator: Pid) -> Self {
+    fn new(id: PipeId, creator: Pid) -> Self {
         Self {
+            id,
             backing: None,
             creator,
             readers: 0,
@@ -203,32 +238,56 @@ pub fn init() {
 /// physical memory — `SYS_PIPE` or `SYS_CONNECT` in a loop — meets an error
 /// return.
 pub fn create(creator: Pid) -> (PipeReader, PipeWriter) {
-    let id = with_pipes_mut(|pipes| pipes.insert(Pipe::new(creator)));
-    add_reader(id);
-    add_writer(id);
-    (PipeReader(id), PipeWriter(id))
+    with_pipes_mut(|pipes| {
+        let id = pipes.insert_with(|id| Pipe::new(id, creator));
+        let pipe = pipes.get_mut(id).expect("the pipe just inserted");
+        let reader = PipeReader::acquire(pipe);
+        let writer = PipeWriter::acquire(pipe);
+        (reader, writer)
+    })
 }
 
-/// The process that created this pipe, or `None` if the id names no pipe.
-pub fn creator(id: PipeId) -> Option<Pid> {
-    with_pipes(|pipes| pipes.get(id).map(|p| p.creator))
+/// Why no reference to a pipe was taken.
+pub enum NotOpened {
+    /// No pipe has this id — it never existed, or both its ends have closed.
+    /// `IdMap` never reuses a key, so this can never mean some *other* pipe.
+    NoSuchPipe,
+    /// The pipe is there and `permitted` declined it.
+    NotPermitted,
 }
 
-/// Open an existing pipe by raw ID (for cross-process pipe sharing).
-pub fn open_reader(id: PipeId) -> Option<PipeReader> {
-    if !exists(id) { return None; }
-    add_reader(id);
-    Some(PipeReader(id))
+/// Take a reader reference to an existing pipe, if `permitted` agrees with the
+/// pid that created it.
+///
+/// The creator is decided upon inside the acquisition that finds the pipe and
+/// counts the new reference, and is never handed back to be judged afterwards:
+/// the pipe the verdict is about and the pipe the count belongs to are the same
+/// `&mut Pipe`. `permitted` therefore must not touch `PIPES` itself — the lock
+/// is a non-reentrant ticket spinlock.
+pub fn open_reader(
+    id: PipeId,
+    permitted: impl FnOnce(Pid) -> bool,
+) -> Result<PipeReader, NotOpened> {
+    with_pipes_mut(|pipes| {
+        let pipe = pipes.get_mut(id).ok_or(NotOpened::NoSuchPipe)?;
+        if !permitted(pipe.creator) {
+            return Err(NotOpened::NotPermitted);
+        }
+        Ok(PipeReader::acquire(pipe))
+    })
 }
 
-pub fn open_writer(id: PipeId) -> Option<PipeWriter> {
-    if !exists(id) { return None; }
-    add_writer(id);
-    Some(PipeWriter(id))
-}
-
-pub fn exists(pipe_id: PipeId) -> bool {
-    with_pipes(|pipes| pipes.get(pipe_id).is_some())
+pub fn open_writer(
+    id: PipeId,
+    permitted: impl FnOnce(Pid) -> bool,
+) -> Result<PipeWriter, NotOpened> {
+    with_pipes_mut(|pipes| {
+        let pipe = pipes.get_mut(id).ok_or(NotOpened::NoSuchPipe)?;
+        if !permitted(pipe.creator) {
+            return Err(NotOpened::NotPermitted);
+        }
+        Ok(PipeWriter::acquire(pipe))
+    })
 }
 
 /// The pipe's ring page, allocating it if this is its first use.
@@ -313,24 +372,6 @@ pub fn set_rt_boost_pending(pipe_id: PipeId) {
         if let Some(pipe) = pipes.get_mut(pipe_id) {
             pipe.rt_boost_pending = true;
         }
-    });
-}
-
-// Internal refcount management (called by PipeReader/PipeWriter)
-
-fn add_reader(pipe_id: PipeId) {
-    with_pipes_mut(|pipes| {
-        let pipe = pipes.get_mut(pipe_id).expect("add_reader: pipe not found");
-        pipe.readers = pipe.readers.checked_add(1).expect("pipe reader overflow");
-        pipe.publish_ends();
-    });
-}
-
-fn add_writer(pipe_id: PipeId) {
-    with_pipes_mut(|pipes| {
-        let pipe = pipes.get_mut(pipe_id).expect("add_writer: pipe not found");
-        pipe.writers = pipe.writers.checked_add(1).expect("pipe writer overflow");
-        pipe.publish_ends();
     });
 }
 
