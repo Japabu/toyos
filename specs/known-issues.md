@@ -1545,6 +1545,36 @@ that all produce exactly the file above:
 
 #### What to do at the machine, in order
 
+**Zeroth, and it costs a glance: what is on the panel?** Nobody has recorded it,
+and the compositor's own source makes it a real split rather than a curiosity.
+`Session::new` ends:
+
+```rust
+let mut damage = Damage::default();
+damage.add(desk.screen);
+eprintln!("compositor: ready");
+Command::new("/bin/filepicker").spawn().ok();     // <- the last line in four of the five logs
+```
+
+Nothing has been painted at that point: the wallpaper was rescaled into RAM, the
+whole screen was *staged* as damage, and the first composite happens in the
+caller's loop, **strictly after the `spawn:` line the frozen logs end on**. The
+panel therefore answers a question the log cannot:
+
+- **wallpaper** (with or without the filepicker's window) → the compositor
+  returned from that syscall and completed its first frame. The machine got past
+  the last line in its own log, and the three hypotheses below are the live ones.
+- **the kernel's boot log, 8x16, still from `boot_checkpoint`** → it did not.
+  `screen_claimed_by_userland` fires at the *claim*, several lines earlier, so
+  the checkpoint had already stopped repainting and what is on the glass is the
+  last thing the kernel put there. That puts the failure between the compositor's
+  `spawn()` and its first blit — one syscall wide, on the process that had been
+  running fine a millisecond earlier — and it is #142's shape, not a scheduler
+  that stopped.
+
+`223152` is the one boot where this is already known: it ends at `spawn:
+/bin/shell pid=5`, two composites and one keystroke past that boundary.
+
 **First, and it needs no reflash: plug a USB keyboard into the frozen T14.**
 This is the input-independent source the dump has always needed and it already
 exists — `keyboard::handle_key` is the single production path for every keyboard
@@ -3701,6 +3731,33 @@ or removes it by accident.
 
 What is left of this entry: `ps` and `stats` still have no cross-CPU view of
 anything the handles do not publish.
+
+#### OPEN — `screen_blocked_dump` is intermittent *alone*, and the reason is the report's own design
+
+Measured 2026-08-07 in one session, five runs a side, the same host: **three
+green and two red on `main` at `48147c2`, three green and two red on
+`wt/toyos-wedge`.** So it is not a parallel-phase flake — it reds with the host
+to itself and at the same rate on an untouched tree. `ALONE: red again` on this
+test therefore means nothing on its own, and the harness's own re-run cannot
+classify it.
+
+The failing assertion is always `cpu(s) answered`, never `== VERDICT:` or `==
+deadlines:` — the *first* of the three summary lines, i.e. the one furthest from
+the bottom. That is the mechanism: `paint_report` shows `Page::Last` of the log
+**ring**, not of the dump, so anything logged while the dump is being assembled
+— a compositor stats line, soundd — lifts the top of the summary off the
+screenful a photograph would catch. The dump is machine-wide and the machine is
+still running, so there is always something else writing.
+
+Two consequences, neither fixed here:
+
+- **The instrument's own contract is weaker than the entry above claims.** "The
+  summary is last, so last is what a photograph catches" is true of the summary's
+  last *line* and not of the summary. On the owner's T14 that is the difference
+  between a photograph that says how many CPUs answered and one that does not.
+- **The test asserts on a screenful whose contents it does not control.** A fix
+  that made the summary one line, or had `paint_report` show the dump's own tail
+  rather than the ring's, would close both halves at once.
 
 ### CPU attribution: the recorded "half the CPU is unattributed" claim was wrong
 
