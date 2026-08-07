@@ -13,24 +13,27 @@
 //! them contiguously, so the bytes the kernel would have written past the end
 //! of the first physical page are bytes this process can read back.
 
-use toyos_abi::syscall::{self, MmapFlags, MmapProt, OpenFlags, SpawnArgs, SyscallError, SYS_FSTAT};
+use toyos_abi::syscall::{
+    self, MmapFlags, MmapProt, OpenFlags, ProcessStats, SchedInfo, SpawnArgs, SyscallError,
+    SYS_FSTAT, SYS_PROCESS_STATS, SYS_SCHED_INFO,
+};
 
 const PAGE_2M: u64 = 2 * 1024 * 1024;
 /// `Stat` is three `u64`, and `SpawnArgs` six.
 const STAT_LEN: usize = 24;
 const CANARY: u8 = 0xA5;
 
-/// The typed wrapper fills a `Stat` on its own stack, so it cannot express the
-/// argument under test. Number in rdi, arguments in rsi/rdx/r8/r9.
-fn fstat_raw(fd: i32, out: u64) -> u64 {
+/// Every typed wrapper fills the value on its own stack, so none of them can
+/// express the argument under test. Number in rdi, arguments in rsi/rdx/r8/r9.
+fn raw(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let ret: u64;
     unsafe {
         core::arch::asm!(
             "syscall",
-            in("rdi") SYS_FSTAT,
-            in("rsi") fd as u64,
-            in("rdx") out,
-            in("r8") 0u64,
+            in("rdi") num,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r8") a3,
             in("r9") 0u64,
             lateout("rax") ret,
             out("rcx") _,
@@ -38,6 +41,10 @@ fn fstat_raw(fd: i32, out: u64) -> u64 {
         );
     }
     ret
+}
+
+fn fstat_raw(fd: i32, out: u64) -> u64 {
+    raw(SYS_FSTAT, fd as u64, out, 0)
 }
 
 fn err(ret: u64) -> Option<SyscallError> {
@@ -125,6 +132,51 @@ fn main() {
     unsafe { fitting.write_volatile(args) };
     let pid = unsafe { syscall::spawn(&*fitting) }.expect("spawn a SpawnArgs that fits");
     syscall::waitpid(pid);
+
+    // 5. `SchedInfo`, 24 bytes the kernel fills. It used to be reached by
+    //    casting a validated byte slice to `&mut SchedInfo`, which checked
+    //    neither the alignment the cast needs nor the page the write lands in.
+    let info_len = core::mem::size_of::<SchedInfo>();
+    let straddling = boundary - 8;
+    poison(straddling, info_len);
+    let ret = raw(SYS_SCHED_INFO, straddling, 0, 0);
+    assert!(
+        intact(boundary, info_len - 8),
+        "sched_info wrote {} bytes past the end of the physical page it translated",
+        info_len - 8,
+    );
+    assert!(intact(straddling, 8), "sched_info wrote the near half of a SchedInfo it refused");
+    assert_eq!(err(ret), Some(SyscallError::BadAddress), "sched_info took a straddling SchedInfo");
+
+    let ret = raw(SYS_SCHED_INFO, boundary - info_len as u64, 0, 0);
+    assert!(err(ret).is_none(), "sched_info refused a SchedInfo that ends at the boundary: {ret:#x}");
+
+    // 6. `ProcessStats` is 128 bytes, and the child reaped above left one. The
+    //    snapshot may be read exactly once, so the refusal must not spend it:
+    //    the second call is the assertion that the kernel copies before it
+    //    removes, and it says `NotFound` if that order is reversed.
+    let stats_len = core::mem::size_of::<ProcessStats>();
+    let straddling = boundary - 8;
+    poison(straddling, stats_len);
+    let ret = raw(SYS_PROCESS_STATS, pid.0 as u64, straddling, stats_len as u64);
+    assert!(
+        intact(boundary, stats_len - 8),
+        "process_stats wrote {} bytes past the end of the physical page it translated",
+        stats_len - 8,
+    );
+    assert_eq!(
+        err(ret),
+        Some(SyscallError::BadAddress),
+        "process_stats took a straddling ProcessStats",
+    );
+
+    let ret = raw(SYS_PROCESS_STATS, pid.0 as u64, base, stats_len as u64);
+    assert!(
+        err(ret).is_none(),
+        "process_stats had already spent the snapshot on the call it refused: {ret:#x}",
+    );
+    let wall_ns = unsafe { (base as *const u64).read_volatile() };
+    assert!(wall_ns > 0, "process_stats wrote a snapshot with no wall time in it");
 
     unsafe { syscall::munmap(region, 2 * PAGE_2M as usize) }.expect("munmap");
     println!("a typed syscall argument may not cross the page its translation answers for");
