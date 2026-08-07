@@ -1628,6 +1628,48 @@ behaviour is now deterministic, and deterministically weaker than §7.4 assumes.
 Whether that matters is measurable — gate A's wake-lateness distribution is the
 instrument — and it did not move at N=8.
 
+### CLOSED — check-and-act across a released global lock, and the three residuals it leaves
+
+`pipe::open_reader`, `sys_socket_create` and six `file_cache::ref_count` call
+sites each read an answer out from under a global lock, released it, and acted.
+The pipe one was the one with teeth: `exists(id)` then `add_reader(id)` panicked
+on `.expect("add_reader: pipe not found")` when the pipe's last other end closed
+in between, *inside* `with_pipes_mut` — and a recovered syscall-context panic
+leaves `PIPES` held for the rest of the boot, which wedges all IPC. Closed by
+making the count and the handle one construction: `PipeReader`/`PipeWriter` live
+in a child module of `pipe.rs` whose field is private to it, so the only way to
+name a pipe as an owned reference is `acquire(&mut Pipe)`, and only a holder of
+`PIPES` can produce a `&mut Pipe`. `exists`, `creator` and `ref_count` are
+deleted; `mark_deleted` returns `Residency`; `copy_page_out` returns whether the
+page was there instead of zero-filling. Negative controls in the commit message.
+
+Three things the change does not reach:
+
+- **A count can still move without a handle.** `close_read`/`close_write` must
+  decrement and decide whether to free the pipe in one acquisition, so they live
+  in `pipe.rs` and touch `Pipe::readers` directly. Binding that direction too
+  needs the counts in a struct declared inside the handle module with a
+  `pub(super)` decrement, which buys a named operation and not an unwritable
+  one. The direction that was the defect is closed; this one has two writers and
+  both are in that file.
+
+- **`SYS_FTRUNCATE` takes no VFS lock and `SYS_FSYNC` does** (`arch/syscall.rs`,
+  `SYS_FTRUNCATE => fd::ftruncate(&mut data.fds, ...)` against
+  `SYS_FSYNC => fd::fsync(&mut data.fds, &mut *vfs::lock(), ...)`). That
+  asymmetry is what let a truncate remove a page between `clone_dirty` and
+  `copy_page_out`. The write of fabricated zeros is closed; the window is not,
+  and `flush_file`'s `size()` + `update_metadata` pair sits in it too — a
+  truncate landing between them records the older size, corrected by the next
+  flush because `ftruncate` sets `modified`.
+
+- **`file_cache::read_page` has two paths that return with `buf` untouched**
+  (`file_cache.rs`, both `let Some(file) = cache.files.get_mut(&file_id) else {
+  return }`), while `fd::try_read` has already told its caller how many bytes it
+  is producing, from a `file_cache::size` read under a different acquisition. It
+  is not reachable today — `try_read` runs holding a descriptor for the file, so
+  its refcount is at least one and neither `release` nor `mark_deleted` can drop
+  it — but the signature makes no such claim, and the honest return is fallible.
+
 ### `retire_task` is never reached by `cargo test`
 
 Instrumented across all 140 tests: zero calls. Threads that `join` are removed
