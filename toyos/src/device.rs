@@ -142,3 +142,68 @@ impl AudioDev {
 impl AsHandle for AudioDev {
     fn as_handle(&self) -> Fd { self.0.fd() }
 }
+
+/// An Intel HDA controller the kernel brought up and drives no policy on.
+///
+/// What the claimant gets is a PCM ring it may write, an interrupt it may wait
+/// on, and two register calls checked against the kernel's allow-list. It gets
+/// no register window and no physical address, so there is nothing here that
+/// can point the device at memory.
+pub struct HdaDev(pub(crate) Device);
+
+impl HdaDev {
+    pub fn open() -> Result<Self, SyscallError> {
+        syscall::open_device(DeviceType::HdaAudio).map(|fd| HdaDev(Device(Handle(fd))))
+    }
+
+    pub fn info(&self) -> Result<toyos_abi::hda::HdaInfo, SyscallError> {
+        read_info(&self.0)
+    }
+
+    /// The periods that have played since the last read, or `Err(WouldBlock)`.
+    ///
+    /// One record and not a queue: the kernel accumulates, so a reader that
+    /// slept through several interrupts is told about all of them at once and
+    /// there is no ring for it to overflow.
+    pub fn completions(&self) -> Result<toyos_abi::audio::AudioCompletionRecord, SyscallError> {
+        let mut record = toyos_abi::audio::AudioCompletionRecord {
+            mask: 0,
+            _pad: 0,
+            timestamp_nanos: 0,
+        };
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut record as *mut _ as *mut u8,
+                toyos_abi::audio::AudioCompletionRecord::SIZE,
+            )
+        };
+        let n = syscall::read_nonblock(self.0.0.0, buf)?;
+        assert_eq!(
+            n,
+            toyos_abi::audio::AudioCompletionRecord::SIZE,
+            "partial HDA completion record ({n} bytes)"
+        );
+        Ok(record)
+    }
+
+    pub fn reg_read(
+        &self,
+        offset: u32,
+        width: toyos_abi::hda::RegWidth,
+    ) -> Result<u32, SyscallError> {
+        syscall::device_reg_read(self.0.fd(), offset, width)
+    }
+
+    pub fn reg_write(
+        &self,
+        offset: u32,
+        width: toyos_abi::hda::RegWidth,
+        value: u32,
+    ) -> Result<(), SyscallError> {
+        syscall::device_reg_write(self.0.fd(), offset, width, value)
+    }
+}
+
+impl AsHandle for HdaDev {
+    fn as_handle(&self) -> Fd { self.0.fd() }
+}

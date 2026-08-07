@@ -2483,6 +2483,52 @@ keeping up.
 
 ## 4. Audio and soundd
 
+**EXPECTED RED, pending #88 — HDA: the captured tone is not one sine.**
+`hda_tone` plays the same 3.0 s 440 Hz tone the virtio arm plays, out of an
+`intel-hda` controller soundd drives itself, and the capture comes back with
+**8 to 16 phase discontinuities** where the virtio arm has none. Declared in
+`EXPECTED_FAILURES` against the message "the captured tone is not one sine";
+every other assertion that test makes still reds the run.
+
+What is *not* wrong, measured on this host (QEMU 11.0.3, 2026-08-07): the tone
+is present at full amplitude, there is **no mid-tone silence at all** (`gaps
+none`), and soundd's own counters match the virtio arm's — **1127 periods
+submitted, 0 underruns, 0 drains** on both. The guest put the same audio on the
+wire; something between soundd's buffer and the wav file did not carry it.
+
+The instrument is new and calibrated: `audio::phase_breaks` tests the recurrence
+`x[n+1] = 2·cos(ω)·x[n] − x[n−1]` that a sampled sinusoid obeys exactly, and it
+reads **0 on all four recorded virtio configs** (`audio_tone` and
+`audio_tone_load`, smp 1 and 8). It is `specs/hda-driver-plan.md` §5.3 item 5's
+second guard, built because §2.4's zero-on-complete rule — the thing that keeps
+one gap detector valid for both backends — is a design promise with no
+measurement behind it (risk 7).
+
+Evidence, and why it does not yet name a cause:
+
+- Six consecutive runs at `timer-period=5000` gave **8 breaks at identical frame
+  positions** — 2703-2705, 2821-2823, 2939-2940 — across runs whose audio
+  content differed (the dither seed is clock-derived, and the sample values at
+  those positions differ run to run). Identical positions with different content
+  is a capture dropping samples on a cadence, not a guest playing them wrong.
+- Shortening the host's drain interval to `timer-period=1000` moved the
+  positions rather than removing them: one run at 0 breaks, the next at 16,
+  clustered around frame 95725 instead. **So it is intermittent and the host
+  cadence is not the whole story.**
+- Within a cluster the breaks sit at multiples of **118 frames**, which is
+  neither the device period (128) nor either backend timer's frame count
+  (44.1 or 220.5). That number is unexplained and is the sharpest thing here.
+- The capture also holds **2.756 s of tone where the virtio arm holds 2.94 s**,
+  with no seam accounting for the difference on the runs that show none. Either
+  the capture opens late or QEMU's `hda-codec` discards on its own ring
+  overrun; both are host-side and neither is established.
+
+Where to start: QEMU's `hw/audio/hda-codec.c` output ring against soundd's
+eight-period pipeline, and then `kernel/src/drivers/hda.rs`'s `isr_complete` —
+whose `SDnLPIB`-derived mask is the one thing on the guest side that could hand
+soundd a buffer the engine has not finished with. **Do not weaken the check to
+make it green**; the virtio zero is what says it has teeth.
+
 Spec: `specs/audio-subsystem-spec.md`. Numbered as in the 2026-07-28 audit;
 (1) — see the re-filing below; it was never an SQ overrun — (2) `CommandRing::push` assert, (3) ungated
 `SYS_SET_RT_PRIORITY`, (4) NaN volume, (7) crash detection and (9) the
