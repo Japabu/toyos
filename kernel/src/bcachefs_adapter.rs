@@ -5,7 +5,7 @@ use hashbrown::HashMap;
 
 use bcachefs::{BlockIO, BlockBuf, BlockNum, DeviceError, FsError, Mounted, ReadWrite, ReadOnly, Formatted, SliceBlockIO, Extent};
 use crate::file_backing::{FileBacking, FileBlocks, NvmeBacking, InitrdBacking};
-use crate::file_cache::{self, FileId};
+use crate::file_cache::{self, FileId, Residency};
 use crate::page_cache;
 use toyos_abi::syscall::SyscallError;
 
@@ -210,17 +210,14 @@ impl FileSystem for BcacheFsAdapter {
     }
 
     fn close_file(&mut self, file_id: FileId) {
-        if file_cache::ref_count(file_id) == 0 {
-            if let Some(info) = self.open_files.remove(&file_id) {
-                self.name_to_id.remove(&info.name);
-            }
+        if let Some(info) = self.open_files.remove(&file_id) {
+            self.name_to_id.remove(&info.name);
         }
     }
 
     fn delete(&mut self, name: &str) -> bool {
         if let Some(&file_id) = self.name_to_id.get(name) {
-            file_cache::mark_deleted(file_id);
-            if file_cache::ref_count(file_id) == 0 {
+            if file_cache::mark_deleted(file_id) == Residency::Gone {
                 self.open_files.remove(&file_id);
             }
             self.name_to_id.remove(name);
@@ -236,8 +233,7 @@ impl FileSystem for BcacheFsAdapter {
             .collect();
         for name in &to_delete {
             if let Some(&file_id) = self.name_to_id.get(name.as_str()) {
-                file_cache::mark_deleted(file_id);
-                if file_cache::ref_count(file_id) == 0 {
+                if file_cache::mark_deleted(file_id) == Residency::Gone {
                     self.open_files.remove(&file_id);
                 }
             }
@@ -257,8 +253,7 @@ impl FileSystem for BcacheFsAdapter {
 
     fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
         if let Some(&target_id) = self.name_to_id.get(new) {
-            file_cache::mark_deleted(target_id);
-            if file_cache::ref_count(target_id) == 0 {
+            if file_cache::mark_deleted(target_id) == Residency::Gone {
                 self.open_files.remove(&target_id);
             }
             self.name_to_id.remove(new);
@@ -391,13 +386,11 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
     }
 
     fn close_file(&mut self, file_id: FileId) {
-        if file_cache::ref_count(file_id) == 0 {
-            let name = self.name_to_id.iter()
-                .find(|(_, &v)| v == file_id)
-                .map(|(k, _)| k.clone());
-            if let Some(name) = name {
-                self.name_to_id.remove(&name);
-            }
+        let name = self.name_to_id.iter()
+            .find(|(_, &v)| v == file_id)
+            .map(|(k, _)| k.clone());
+        if let Some(name) = name {
+            self.name_to_id.remove(&name);
         }
     }
 
