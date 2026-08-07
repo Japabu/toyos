@@ -484,6 +484,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // device. Serial — its verdict is a wav capture, and one taken while eleven
     // other guests contend for the host measures the host.
     ("hda_tone", Sched::Serial),
+    // The T14's panic, staged: a client that stops producing for longer than
+    // the DMA ring takes to come round. The verdict is soundd's own liveness
+    // and its counters rather than a capture, so it runs wide.
+    ("hda_client_stall", Sched::Parallel),
     ("hda_two_live_refused", Sched::Parallel),
     ("serial_vocabulary", Sched::Parallel),
     // Host-side, no guest: the harness asking whether it can still tell a
@@ -5943,6 +5947,7 @@ fn run_machine_test(
         // Body in `tests/common/hda.rs`, same reason.
         "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
         "hda_tone" => common::hda::hda_tone(test_config, c_bins, rust_bins),
+        "hda_client_stall" => common::hda::hda_client_stall(test_config, c_bins, rust_bins),
         "hda_two_live_refused" => {
             common::hda::hda_two_live_refused(test_config, c_bins, rust_bins)
         }

@@ -137,6 +137,27 @@ pub fn completed(
     Some((mask, current))
 }
 
+/// The mask of the `count` periods the engine plays from `first` onwards.
+///
+/// The inverse of [`completed`], and what a driver checks its own position
+/// against: a mask is a set and the engine is a sequence, so the set alone
+/// does not say which period the engine returns to first. It is the run's
+/// start, and that is the mask's lowest-numbered bit only while the run does
+/// not wrap the ring — `{6, 7, 0, 1}` is played 6, 7, 0, 1, and a driver
+/// filling it lowest-index-first writes the later audio into the buffer the
+/// engine reaches soonest.
+///
+/// `None` for a run a ring of `periods` cannot hold: an index outside it, or a
+/// count that would name a period twice. A full lap is one of those — the
+/// engine leaves no mark distinguishing it from having gone nowhere, which is
+/// why [`completed`] cannot report one either.
+pub fn run_mask(first: usize, count: usize, periods: usize) -> Option<u32> {
+    if !(MIN_PERIODS..=MAX_PERIODS).contains(&periods) || first >= periods || count >= periods {
+        return None;
+    }
+    Some((0..count).fold(0u32, |mask, i| mask | 1 << ((first + i) % periods)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +265,47 @@ mod tests {
     #[test]
     fn a_last_index_outside_the_ring_is_refused() {
         assert_eq!(completed(8, 0, 512, 8), None);
+    }
+
+    #[test]
+    fn a_run_is_the_periods_the_engine_plays_from_where_it_stands() {
+        assert_eq!(run_mask(3, 3, 8), Some(0b0011_1000));
+        assert_eq!(run_mask(0, 1, 8), Some(0b0000_0001));
+        assert_eq!(run_mask(5, 0, 8), Some(0));
+    }
+
+    #[test]
+    fn a_run_that_wraps_is_not_the_run_its_lowest_bit_starts() {
+        // The engine was at 6 and is now playing 2: 6, 7, 0 and 1 have played
+        // and are played again in that order. A driver reading the mask
+        // lowest-bit-first fills 0, 1, 6, 7 — the later audio into the two
+        // buffers the engine reaches first, which is a splice with no silence
+        // in it for a gap detector to see.
+        let (mask, _) = completed(6, 2 * 512, 512, 8).unwrap();
+        assert_eq!(run_mask(6, 4, 8), Some(mask));
+        assert_ne!(run_mask(mask.trailing_zeros() as usize, 4, 8), Some(mask));
+    }
+
+    #[test]
+    fn every_position_completed_can_report_is_a_run_from_where_it_started() {
+        for last in 0..8usize {
+            for position in 0..8 * 512u32 {
+                let (mask, _) = completed(last, position, 512, 8).unwrap();
+                assert_eq!(
+                    run_mask(last, mask.count_ones() as usize, 8),
+                    Some(mask),
+                    "last={last} position={position}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_the_ring_cannot_hold_is_refused() {
+        // A whole lap names every period once and is indistinguishable from
+        // standing still, which is the aliasing `completed` documents.
+        assert_eq!(run_mask(0, 8, 8), None);
+        assert_eq!(run_mask(8, 1, 8), None);
+        assert_eq!(run_mask(0, 1, 1), None);
     }
 }
