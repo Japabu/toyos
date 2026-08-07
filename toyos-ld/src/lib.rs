@@ -9,7 +9,7 @@ mod emit_elf;
 mod emit_pe;
 mod emit_macho;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::fs;
 
@@ -74,13 +74,12 @@ impl Collected {
     /// Determines whether each symbol is a function or data by checking if it
     /// has any call-type relocations (functions) vs only GOT/data relocations (data).
     fn mark_dynamic_symbols(&mut self) {
-        use std::collections::HashMap as Map;
         let call_relocs: &[RelocType] = match self.state.arch {
             Arch::Aarch64 => &[RelocType::Aarch64Call26, RelocType::Aarch64Jump26],
             Arch::X86_64 => &[RelocType::X86Plt32, RelocType::X86Pc32],
         };
         // Collect referenced symbols and whether they have call relocations
-        let mut referenced: Map<String, bool> = Map::new();
+        let mut referenced: BTreeMap<String, bool> = BTreeMap::new();
         for r in &self.state.relocs {
             let name = r.target.name().to_string();
             let entry = referenced.entry(name).or_insert(false);
@@ -101,7 +100,7 @@ impl Collected {
 
     /// Mark sections with absolute relocations as writable (needed for Mach-O rebasing).
     fn mark_abs_reloc_sections_writable(&mut self) {
-        let abs_reloc_sections: std::collections::HashSet<SectionIdx> = self.state.relocs.iter()
+        let abs_reloc_sections: BTreeSet<SectionIdx> = self.state.relocs.iter()
             .filter(|r| matches!(r.r_type,
                 RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
                 | RelocType::X86_64 | RelocType::X86_32))
@@ -155,8 +154,8 @@ impl LaidOut<ElfLayout> {
     }
 
     fn relocate_and_emit_static(mut self, entry: &str) -> Result<Vec<u8>, LinkError> {
-        let empty_dyn_got = HashMap::new();
-        let empty_gd_got = HashMap::new();
+        let empty_dyn_got = BTreeMap::new();
+        let empty_gd_got = BTreeMap::new();
         let params = ElfRelocParams {
             got: &self.layout.got,
             tls_start: self.layout.tls_start,
@@ -336,8 +335,6 @@ pub fn resolve_libs_with_entry(
     libs: &[String],
     entry: Option<&str>,
 ) -> Result<Vec<(String, Vec<u8>)>, LinkError> {
-    use std::collections::HashSet;
-
     let mut objects: Vec<(String, Vec<u8>)> = Vec::new();
     // Archive members available for pull-in: (archive_name, member_name, data)
     let mut archive_members: Vec<(String, Vec<u8>)> = Vec::new();
@@ -380,8 +377,12 @@ pub fn resolve_libs_with_entry(
     // Scan direct objects for defined/referenced symbols.
     // Symbols from shared libraries (.so) must NOT count as "defined" for archive pull-in —
     // they're resolved at load time, not link time. Only .o file definitions prevent pull-in.
-    let mut defined = HashSet::new();
-    let mut undefined = HashSet::new();
+    // Ordered because the pull-in worklist is seeded from `undefined` and grown
+    // from `member_refs`: where two archive members define one symbol, the one
+    // pulled in is whichever the worklist reaches while that symbol is still
+    // undefined, so the worklist's order decides which sections exist at all.
+    let mut defined = BTreeSet::new();
+    let mut undefined = BTreeSet::new();
     // The entry point is an implicit undefined — ensure its archive member
     // gets pulled in even if no direct object references it.
     if let Some(entry) = entry {
@@ -398,9 +399,9 @@ pub fn resolve_libs_with_entry(
     undefined.retain(|s| !defined.contains(s));
 
     // Scan archive members and build a symbol → member index for O(1) lookup.
-    let mut member_defs: Vec<HashSet<String>> = Vec::with_capacity(archive_members.len());
-    let mut member_refs: Vec<HashSet<String>> = Vec::with_capacity(archive_members.len());
-    let mut sym_to_members: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut member_defs: Vec<BTreeSet<String>> = Vec::with_capacity(archive_members.len());
+    let mut member_refs: Vec<BTreeSet<String>> = Vec::with_capacity(archive_members.len());
+    let mut sym_to_members: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, (_, data)) in archive_members.iter().enumerate() {
         let (defs, refs) = scan_symbols(data);
         for sym in &defs {

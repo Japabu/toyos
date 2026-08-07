@@ -3634,31 +3634,88 @@ reverted, each of the three targeted cases went red 40 times out of 40 and the
 corpus sweep named 6 files. Two runs per case rather than eight would have been
 39/40 on the spilled-parameter one, which is why it is eight.
 
-### OPEN, UNASSIGNED — `toyos-ld` has the same defect, and every ToyOS binary
-goes through it
+### CLOSED — `toyos-ld` gave a different binary for the same objects
 
-Found while closing the one above; not fixed with it, because the two crates
-share the shape of the bug and none of its code. Linking one **byte-identical**
-object six times gives six different binaries — 73 bytes differ between the
-first two, in two regions:
+The larger half of the same hole: the compiler's outputs are intermediate, and
+the linker's are the kernel, the bootloader and every binary in the image the
+owner flashes. Four hash containers were the emission order, one more than the
+two the original write-up named, and the third is not a symbol table:
 
-- `.rela.dyn`. `reloc.rs` builds `relatives` and `glob_dats` by iterating
-  `params.got` and `params.dyn_got`, both `HashMap<SymbolRef, u64>`. Confirmed:
-  sorting those two vectors before they leave `apply_relocations` makes that
-  region identical across runs.
-- `.symtab`/`.strtab`. `emit_elf.rs` walks `state.locals` and then
-  `state.globals`, both `HashMap`s, to build the symbol entries — this is the
-  residual once the relocations are sorted, and it moves the string table too.
+- `ElfLayout::{got, dyn_got}` — `reloc.rs` iterates them to build `relatives`
+  and `glob_dats`, which are `.rela.dyn` and, through the import strings, the
+  `.dynsym`/`.dynstr` that name them.
+- `LinkState::{globals, locals}` — `emit_elf.rs` walks both to build the symbol
+  entries, so this is `.symtab` and the `.strtab` that follows it. `emit_macho.rs`
+  walks `globals` too, but sorts by name at the call site, which is why Mach-O
+  never showed it.
+- **`resolve_libs_with_entry`'s archive pull-in worklist** — seeded from a
+  `HashSet` of undefined symbols and grown from `HashSet`s of each member's
+  references. Where two archive members define one symbol, the member pulled in
+  is whichever the worklist reaches while that symbol is still undefined, so a
+  hash order decided **which sections existed at all**. Not a symbol-table
+  defect and not reachable by sorting anything the writer sees.
 
-Reproduce with any object at all: `toyos-cc --target x86_64-unknown-toyos x.o -o
-out` twice and `cmp`. `SymbolRef` is not `Ord`, so the `BTreeMap` that fixed the
-compiler needs a derive here first. Whether the Mach-O and PE writers share it
-is unmeasured; `emit_macho.rs` and `emit_pe.rs` each hold a `got: HashMap` of
-the same shape.
+All of them are `BTreeMap`/`BTreeSet` now, with `Ord` derived on `SectionIdx`,
+`ObjIdx` and `SymbolRef`. That order is over an input position and a name, both
+of which byte-identical inputs fix, so the derive removes the nondeterminism
+rather than moving it. The rule the crate now follows, stated on `LinkState`: a
+container iterated into the output carries its own total order, one asked only
+whether it contains a name stays a hash container.
 
-This is the larger half of the reproducibility hole: the compiler's outputs are
-intermediate, and the linker's are the kernel, the bootloader and every binary
-in the image the owner flashes.
+**PE did not share the defect** and passes the gate with the fix reverted:
+`PeLayout::got` is iterated in exactly two places, one writing disjoint 8-byte
+GOT slots and one pushing into `abs_fixups`, which is sorted before it is
+written. PE also emits no symbol table. It is a `BTreeMap` now regardless,
+because "safe by what the call site happens to do" is the rung below.
+
+Measured. Real corpus, one release binary, eight links each: the toyos sysroot's
+30 rlibs linked `--shared` (17.8 MB of objects, 1,855,584-byte output) differed
+from run 0 in 7 of 7 later runs before, worst delta 26,408 bytes; 0 of 7 after.
+The `x86_64-unknown-none` sysroot linked `--static` went 7 of 7 (40 bytes) to 0
+of 7. The `x86_64-unknown-uefi` sysroot linked `--pe` was 0 of 7 both times.
+Cost: the link phase of that shared link is 0.017 s before and 0.023 s after
+(median of 15 interleaved runs), +6 ms for `BTreeMap` lookups on ~35 objects.
+
+`toyos-ld/tests/determinism.rs` is the gate — eight cases naming one hazard
+each, inputs synthesized with `object::write` so the test needs nothing outside
+its own crate, each linked eight times through the binary because a build is a
+process per output. 0.25 s, no guest. Negative control with the fix reverted:
+each of the seven hazard cases red 40 times out of 40, PE green 40 out of 40.
+Two runs per case rather than eight was also 40 out of 40 — these cases are
+wide by construction; the eight is margin for a narrower one added later, which
+is the case `toyos-cc`'s gate has.
+
+### OPEN, UNASSIGNED — `toyos-ld`'s alloc-shim table names a compiler hash that no longer exists
+
+`ALLOC_SHIMS` and `SHIM_NO_ALLOC_UNSTABLE` in `toyos-ld/src/collect.rs` are
+eleven string literals of the form
+`_RNvCs2fcwfXhWpkc_7___rustc12___rust_alloc`, where `Cs2fcwfXhWpkc` is a rustc
+crate disambiguator. Measured 2026-08-07: that spelling occurs **zero** times
+across the 30 rlibs of the `x86_64-unknown-toyos` sysroot, and the live
+disambiguator is `CshVjSbrpHdcL` — 4 occurrences in `liballoc`, 5 in
+`libpanic_abort`, and so on. So `synthesize_alloc_shims` currently synthesizes
+nothing, and would again the next time `rust/` is rebuilt.
+
+Inert today, because rustc emits the allocator shim into the leaf crate's own
+object for a real binary; the table only matters for a link that has rlibs and
+no leaf crate. Found while assembling a real corpus for the determinism gate,
+which is exactly such a link and which failed on those six names.
+
+The defect is the shape rather than the staleness: a compiler-internal hash
+frozen into a string literal has no way to announce that it has gone stale, and
+the symptom when it does is an undefined symbol far from the cause. Matching on
+the `___rustc` path and the function name, with the disambiguator wild, would
+not need updating.
+
+### OPEN, UNASSIGNED — `toyos-cc`'s preprocessor exits the process instead of returning
+
+Three `process::exit(1)` calls in `toyos-cc/src/preprocess/mod.rs`: a `#error`
+directive (line 309) and a missing include, system or otherwise (lines 527,
+530). A library denying its caller the choice — the compiler cannot report the
+diagnostic in its own format, cannot continue to find a second error, and
+cannot be embedded in a driver that wants to keep going. Every other error in
+the crate returns. Recorded by the determinism task rather than fixed, on the
+owner's standing rule about staying focused.
 
 ### `toyos-cc` does not implement packed bitfield layout, and says so
 
