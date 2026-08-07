@@ -3430,6 +3430,20 @@ verdict line was its own (`1 of the two overlapping clients left the mixer`)
 rather than `desktop_typing_damage`'s, so the message is not the tell — the pair
 of durations is.
 
+**And the holder can be its own victim.** 2026-08-07, task #152's worktree,
+whole suite 500 s against the ~109 s it is ordered for, with another worktree's
+toolchain build on the host: `desktop_window_child` itself took **249 s** and
+failed with `nothing typed at the terminal window reached a shell` — the
+*victim's* message, from the test that is normally the one occupying the lane.
+So the row above's "the victim is positional" is the weaker half of the claim:
+under enough host pressure the position that loses its typing window is
+whichever guest is late, and that can be the four-minute test as easily as the
+one beside it. It also means **`EXPECTED_FAILURES` does not absorb it** — the
+entry deliberately covers only "the desktop ceased to answer after a window
+closed", and this message names a shell that never answered in the first place,
+so the run reds on the very test the exemption exists for and for a reason the
+exemption is right to exclude.
+
 ### A whole parallel phase can be starved by another agent's build
 
 Measured 2026-08-04: the same tree that runs the phase in 44.8 s ran it in
