@@ -25,7 +25,7 @@ use crate::process::PageAlloc;
 use crate::UserAddr;
 use toyos_elf::dynamic::Dynamic;
 use toyos_elf::section::{SectionTable, SHT_DYNSYM};
-use toyos_elf::sym::{Sym, SymTab};
+use toyos_elf::sym::SymTab;
 use toyos_elf::{rela, GnuHash, Layout, RelaTable};
 
 /// The crate's TLS alignment ceiling is the largest page the kernel maps, and

@@ -117,8 +117,8 @@ impl<'a> SymTab<'a> {
     }
 
     /// Every index whose symbol is defined and named, in order.
-    pub fn defined(&self) -> impl Iterator<Item = (usize, Sym)> + '_ {
-        (1..self.count()).filter_map(|i| {
+    pub fn defined(self) -> impl Iterator<Item = (usize, Sym)> + 'a {
+        (1..self.count()).filter_map(move |i| {
             let sym = self.get(i)?;
             sym.is_defined().then_some((i, sym))
         })

@@ -63,12 +63,12 @@ impl<'a> SectionTable<'a> {
         })
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = SectionHeader> + '_ {
-        (0..self.len()).filter_map(|i| self.get(i))
+    pub fn iter(self) -> impl Iterator<Item = SectionHeader> + 'a {
+        (0..self.len()).filter_map(move |i| self.get(i))
     }
 
     /// The first section of this type.
-    pub fn find(&self, kind: u32) -> Option<SectionHeader> {
+    pub fn find(self, kind: u32) -> Option<SectionHeader> {
         self.iter().find(|sh| sh.kind == kind)
     }
 
@@ -78,7 +78,7 @@ impl<'a> SectionTable<'a> {
     /// `None` when there is no such section or its `sh_link` names no section
     /// in this table — a symbol table whose names are unreachable resolves
     /// every name to `""`, which is worse than having no map at all.
-    pub fn symbols(&self, kind: u32) -> Option<(SectionHeader, SectionHeader)> {
+    pub fn symbols(self, kind: u32) -> Option<(SectionHeader, SectionHeader)> {
         let syms = self.find(kind)?;
         let strs = self.get(syms.link as usize)?;
         Some((syms, strs))
@@ -92,7 +92,7 @@ impl<'a> SectionTable<'a> {
     /// file, and only a table whose first entry is a `R_X86_64_RELATIVE`
     /// qualifies — a `SHT_RELA` of any other shape belongs to something else.
     pub fn rela_dyn(
-        &self,
+        self,
         first_entry: &mut dyn FnMut(u64) -> Option<crate::rela::Rela>,
     ) -> Option<(u64, u64)> {
         for sh in self.iter() {

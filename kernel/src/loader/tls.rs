@@ -113,6 +113,45 @@ pub fn setup_combined_tls(
     Some((page_alloc, tp_user))
 }
 
+/// Build one thread's TLS block and map it into the child address space.
+///
+/// The block is filled with *physical* addresses because it has no virtual
+/// address until it is mapped, so the thread pointer, the DTV pointer and every
+/// filled DTV entry are rebased by one delta afterwards. `None` when the block
+/// cannot be allocated or the address space has no room for it.
+pub fn map_block(
+    child_pt: &crate::process::PageTables,
+    modules: &[TlsModule],
+    total_memsz: usize,
+    max_align: usize,
+) -> Option<(crate::process::MappedPages, u64)> {
+    let (alloc, fs_base) = if total_memsz > 0 {
+        setup_combined_tls(modules, total_memsz, max_align)?
+    } else {
+        setup_tls(None, 0, 1)?
+    };
+
+    let phys = alloc.phys();
+    let (vaddr, _) = crate::process::vma_map(child_pt, phys, alloc.size() as u64)?;
+    let rebase = vaddr.raw() as i64 - phys as i64;
+    let fs_base = (fs_base as i64 + rebase) as u64;
+    unsafe {
+        let block = DirectMap::from_phys(phys).as_mut_ptr::<u8>();
+        let tp = block.add((fs_base - vaddr.raw()) as usize) as *mut u64;
+        *tp = fs_base;
+        *tp.add(1) = (*tp.add(1) as i64 + rebase) as u64;
+        let dtv = block as *mut u64;
+        let dtv_len = *dtv.add(1) as usize;
+        for i in 0..dtv_len {
+            let entry = *dtv.add(2 + i);
+            if entry != DTV_UNALLOCATED && entry != 0 {
+                *dtv.add(2 + i) = (entry as i64 + rebase) as u64;
+            }
+        }
+    }
+    Some((crate::process::MappedPages::new(vaddr, alloc), fs_base))
+}
+
 /// Place every startup module in one combined block: libraries first, then the
 /// executable.
 ///

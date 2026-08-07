@@ -1651,48 +1651,33 @@ pub(crate) fn find_symtab_in_memory(
     prog_base: u64, prog_end: u64,
     stack_base: u64, stack_end: u64,
 ) -> SymbolTable {
-    const SHT_SYMTAB: u32 = 2;
+    use toyos_elf::section::{SectionTable, SHT_SYMTAB};
     const SHT_STRTAB: u32 = 3;
     let empty = || SymbolTable::empty_with_bounds(prog_base, prog_end, stack_base, stack_end);
 
-    // Read section headers — they're small enough to read via read_file_range.
-    let shdr_size = sh_num * sh_entsize;
-    let shdr_data = read_file_range(backing, sh_off, shdr_size);
-
-    let mut symtab_off = 0u64;
-    let mut symtab_size = 0u64;
-    let mut symtab_entsize = 0u64;
-    let mut symtab_link = 0u32;
-    for i in 0..sh_num {
-        let off = i * sh_entsize;
-        if off + 64 > shdr_data.len() { break; }
-        let sh_type = u32::from_le_bytes(shdr_data[off + 4..off + 8].try_into().unwrap());
-        if sh_type == SHT_SYMTAB {
-            symtab_off = u64::from_le_bytes(shdr_data[off + 24..off + 32].try_into().unwrap());
-            symtab_size = u64::from_le_bytes(shdr_data[off + 32..off + 40].try_into().unwrap());
-            symtab_link = u32::from_le_bytes(shdr_data[off + 40..off + 44].try_into().unwrap());
-            symtab_entsize = u64::from_le_bytes(shdr_data[off + 56..off + 64].try_into().unwrap());
-            break;
-        }
+    let shdr_data = read_file_range(backing, sh_off, sh_num * sh_entsize);
+    let Some((symtab, strtab)) = SectionTable::new(&shdr_data).symbols(SHT_SYMTAB) else {
+        return empty();
+    };
+    if symtab.size == 0 || strtab.kind != SHT_STRTAB {
+        return empty();
     }
-    if symtab_size == 0 { return empty(); }
 
-    let link_off = symtab_link as usize * sh_entsize;
-    if link_off + 64 > shdr_data.len() { return empty(); }
-    let strtab_type = u32::from_le_bytes(shdr_data[link_off + 4..link_off + 8].try_into().unwrap());
-    if strtab_type != SHT_STRTAB { return empty(); }
-    let strtab_off = u64::from_le_bytes(shdr_data[link_off + 24..link_off + 32].try_into().unwrap());
-    let strtab_size = u64::from_le_bytes(shdr_data[link_off + 32..link_off + 40].try_into().unwrap());
+    let Some(symtab_ptr) = backing.memory_ptr(symtab.offset, symtab.size as usize) else {
+        return empty();
+    };
+    let Some(strtab_ptr) = backing.memory_ptr(strtab.offset, strtab.size as usize) else {
+        return empty();
+    };
 
-    let Some(symtab_ptr) = backing.memory_ptr(symtab_off, symtab_size as usize) else { return empty() };
-    let Some(strtab_ptr) = backing.memory_ptr(strtab_off, strtab_size as usize) else { return empty() };
-
-    let entry_size = if symtab_entsize > 0 { symtab_entsize as usize } else { 24 };
-    let entries = symtab_size as usize / entry_size;
-
+    let entry_size = if symtab.entry_size > 0 {
+        symtab.entry_size as usize
+    } else {
+        toyos_elf::sym::ENTRY_SIZE
+    };
     SymbolTable::from_raw(
-        symtab_ptr, entries,
-        strtab_ptr, strtab_size as usize,
+        symtab_ptr, symtab.size as usize / entry_size,
+        strtab_ptr, strtab.size as usize,
         base,
         prog_base, prog_end, stack_base, stack_end,
     )

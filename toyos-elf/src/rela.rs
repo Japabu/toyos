@@ -123,8 +123,10 @@ impl<'a> RelaTable<'a> {
         })
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = Rela> + '_ {
-        (0..self.len()).filter_map(|i| self.get(i))
+    /// Takes `self` by value — the table is a `Copy` view, so the iterator
+    /// borrows the bytes rather than the caller's handle on them.
+    pub fn iter(self) -> impl Iterator<Item = Rela> + 'a {
+        (0..self.len()).filter_map(move |i| self.get(i))
     }
 }
 

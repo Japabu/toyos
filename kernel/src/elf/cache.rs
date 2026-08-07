@@ -164,17 +164,23 @@ static SO_CACHE: Lock<Vec<(String, CachedLib)>> = Lock::new(Vec::new());
 /// drift apart. A library that cannot be cached is handed back unchanged: this
 /// is an optimisation, and refusing it costs only the next load's time.
 pub fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_offset: usize, rw_size: usize) -> LoadedLib {
-    let LibMemory::Owned(alloc) = lib.memory else {
+    if !matches!(lib.memory, LibMemory::Owned(_)) {
         return lib;
-    };
+    }
     let snapshot = Snapshot::of(&lib);
     let user_base = lib.user_base;
+    // Before the allocation moves out of `lib`, because the scan reads the
+    // relocation tables through it.
+    let scanned = prescan_relocs(&lib);
+    let LibMemory::Owned(alloc) = lib.memory else {
+        unreachable!("the check above established this")
+    };
 
     // Refusing to prescan means refusing to cache: the cached image is what
     // `cached_relocs` describes, so a lib without one must keep taking the
     // scan-every-table path.
     let owned = |alloc| snapshot.into_lib(LibMemory::Owned(alloc), user_base, None);
-    let Some(relocs) = prescan_relocs(&lib) else {
+    let Some(relocs) = scanned else {
         return owned(alloc);
     };
     log!(

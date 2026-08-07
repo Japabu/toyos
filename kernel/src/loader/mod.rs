@@ -27,7 +27,7 @@ use crate::fd::{Descriptor, FdTable};
 use crate::mm::paging::CachePolicy;
 use crate::mm::PAGE_2M;
 use crate::process::{
-    fd_owner_data, vma_map, ElfInfo, OwnedAlloc, PageAlloc, PageFaultTrace, PageTables, Pid,
+    vma_map, ElfInfo, OwnedAlloc, PageAlloc, PageFaultTrace, PageTables, Pid,
     ProcessAccounting, ProcessData, ProcessEntry, ThreadData, ThreadEntry, UserStack,
     PROCESS_TABLE,
 };
@@ -549,42 +549,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
 
     log!("spawn: TLS {} modules, total_memsz={}", tls_modules.len(), tls_total_memsz);
-    let allocated = if tls_total_memsz > 0 {
-        setup_combined_tls(&tls_modules, tls_total_memsz, max_tls_align)
-    } else {
-        setup_tls(None, 0, 1)
-    };
-    let Some((tls_alloc, fs_base)) = allocated else {
+    let Some((tls_pages, fs_base)) =
+        tls::map_block(&child_pt, &tls_modules, tls_total_memsz, max_tls_align)
+    else {
         log!("spawn: {}: failed to allocate TLS ({} bytes)", path, tls_total_memsz);
         return Err(SyscallError::ResourceExhausted);
     };
-
-    // The block was built with physical addresses in it, because it had no
-    // virtual address until now. Rebase the thread pointer, the DTV pointer and
-    // every filled DTV entry by the same delta.
-    let tls_phys = tls_alloc.phys();
-    let Some((tls_vaddr, _)) = vma_map(&child_pt, tls_phys, tls_alloc.size() as u64) else {
-        log!("spawn: {}: out of virtual address space for TLS", path);
-        return Err(SyscallError::ResourceExhausted);
-    };
-    let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
-    let fs_base = (fs_base as i64 + tls_rebase) as u64;
-    unsafe {
-        let tls_base_ptr = DirectMap::from_phys(tls_phys).as_mut_ptr::<u8>();
-        let tp_kern = tls_base_ptr.add((fs_base - tls_vaddr.raw()) as usize);
-        let self_ptr = tp_kern as *mut u64;
-        *self_ptr = fs_base;
-        let dtv_phys = *self_ptr.add(1);
-        *self_ptr.add(1) = (dtv_phys as i64 + tls_rebase) as u64;
-        let dtv_kern = tls_base_ptr as *mut u64;
-        let dtv_len = *dtv_kern.add(1) as usize;
-        for i in 0..dtv_len {
-            let entry = *dtv_kern.add(2 + i);
-            if entry != !0u64 && entry != 0 {
-                *dtv_kern.add(2 + i) = (entry as i64 + tls_rebase) as u64;
-            }
-        }
-    }
 
     let entry = base + layout.entry;
     let sp = user_stack.write_argv(argv);
@@ -660,7 +630,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     }));
 
     let thread_data = Arc::new(Lock::new(ThreadData {
-        tls_pages: Some(crate::process::MappedPages::new(tls_vaddr, tls_alloc)),
+        tls_pages: Some(tls_pages),
         stack_pages: Some(stack_pages),
         user_stack_base: user_stack.base(),
         user_stack_size: user_stack.size(),
@@ -723,7 +693,7 @@ fn load_needed_libs(exe: &ExeTables, path: &str) -> Result<NeededLibs, SyscallEr
     for name_offset in toyos_elf::Dynamic::needed(&exe.dynstr) {
         // The offsets are into `.dynstr`, which this loop is also reading from,
         // so a garbage offset is an empty name and not a bounds failure.
-        let lib_name = toyos_elf::read_cstr(&exe.dynstr, name_offset);
+        let lib_name = toyos_elf::cstr(&exe.dynstr, name_offset);
         if lib_name.is_empty() {
             continue;
         }
