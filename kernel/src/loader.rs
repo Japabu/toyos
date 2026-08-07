@@ -220,13 +220,20 @@ fn make_name(path: &str) -> [u8; 28] {
     name
 }
 
+/// One `[child_fd, parent_fd]` pair of `SpawnArgs::fd_map_ptr`, in bytes.
+pub const FD_PAIR_LEN: usize = 8;
+
 /// Build a child's FdTable from (child_fd, parent_fd) pairs.
 /// Duplicates each referenced parent descriptor into the child table.
-pub fn build_child_fds(pairs: &[[u32; 2]]) -> Result<FdTable, SyscallError> {
+pub fn build_child_fds(pairs: &crate::user_ptr::UserBytes) -> Result<FdTable, SyscallError> {
     let data_arc = fd_owner_data();
     let data = data_arc.lock();
     let mut fds = FdTable::new();
-    for &[child_fd, parent_fd] in pairs {
+    for i in 0..pairs.len() / FD_PAIR_LEN {
+        let mut pair = [0u8; FD_PAIR_LEN];
+        pairs.read_at(i * FD_PAIR_LEN, &mut pair);
+        let child_fd = u32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
+        let parent_fd = u32::from_ne_bytes([pair[4], pair[5], pair[6], pair[7]]);
         if let Some(desc) = data.fds.get(parent_fd) {
             let cloned = desc.clone();
             fds.insert_at(child_fd, cloned)?;
