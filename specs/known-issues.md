@@ -3416,6 +3416,13 @@ phase landed, and none reproduces on a host running one suite.
   widen it.** A silence and a phase break are two different defects and an entry
   that covered both would stop saying anything. The tree it was seen on differed
   from main only in `src/`, so the guest image was byte-identical to main's.
+  **Three times the same day**, all three in landing gates of that one
+  build-system branch and all three confirmed alone within ten minutes: `2
+  mid-tone silences`, then `1 mid-tone silence`, `gaps none` alone every time,
+  with three to five other `--land` processes on the host. Ask
+  `git diff main...HEAD` and never `git diff main` when checking whether a tree
+  could be the cause: the second is symmetric and lists what *main* changed since
+  the branch last merged, which reads as the branch's own work and is not.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
