@@ -4573,13 +4573,26 @@ at all** — the same machine state, with nothing pulled out. Treat "pull the
 stick" as one trigger of a general defect rather than as the subject. Everything
 above about xHCI stands as correct work and none of it is the cause.
 
-**The window is 1.35 s to about 3.35 s**, and three things happen in it: the
-compositor has just had the scanout mapped write-combining, `/bin/filepicker`
-was spawned one line earlier and is starting up, and the compositor enters its
-main loop and blits a full screen — `scanout_wr_bytes=8370176`, 8 MiB into a WC
-MMIO mapping on real hardware. Every desktop test in the suite runs that
-sequence in QEMU without freezing, so what differs is timing and the memory
-type, neither of which TCG models.
+**The window is 1.35 s to 6.16 s.** Both ends are anchored on something that
+survives: the last line boot 1 wrote, and the probe that was due at claim + 5 s
+and did not fire. It is wider than it needs to be, and that is deliberate.
+
+**Withdrawn, and not to be re-derived: the `compositor: frames=` cadence.** An
+earlier reading of this pair narrowed the window to ~3.35 s by treating boot 2's
+two-second frame-report interval as a clock boot 1 would have obeyed. That
+inference is retracted. `frames=3 … scanout_wr_bytes=8370176` records *boot 2*
+reaching its main loop and blitting a full screen; it says nothing about how far
+boot 1 got, and nothing below may lean on it. The difference between the two
+files stays an observation and stops there: boot 2 has two frame reports, boot 1
+has none.
+
+So what is in the window is stated as what the machine had just been *told to
+do*, never as what it was caught doing. The scanout has been mapped
+write-combining, `/bin/filepicker` was spawned one line earlier and is starting
+up, and the compositor is entering a main loop whose first act is a full-screen
+blit into a WC MMIO mapping. Every desktop test in the suite runs that sequence
+in QEMU without freezing, so what differs is timing and the memory type, neither
+of which TCG models.
 
 #### The defect that is in that window: a TLB shootdown nobody waits for
 
@@ -4620,6 +4633,36 @@ is that it is the only mechanism found so far that is present in the window, is
 absent from QEMU by construction, and can produce the observed state without
 reaching any software error path.
 
+**Corroborated independently, and the other reading goes further — read it
+before touching any of this.** `specs/memory-boundary-spec.md` §2.3 reached the
+same conclusion from the memory-safety track on the same day, and it is the
+authority for the fix: it names the same `ipi_all_excluding_self` one-ICR-write,
+states that **the six existing call sites are therefore already wrong** rather
+than merely incomplete — `MappedPages::release` (`process.rs:159-163`) drops the
+pages after a shootdown nobody waited for — and enumerates four more sites that
+free pages with no shootdown at all (`sys_munmap`, `shared_memory::{release,
+destroy, unregister, cleanup_process}`, `virtio_gpu::free_framebuffer`, and
+`virtio_gpu::set_resolution`). It also carries a half this entry missed
+entirely: `invlpg` reads the *current* CR3's PCID (`paging.rs:196`), so
+`shared_memory`'s and `virtio_gpu`'s unmap paths invalidate the wrong tag on
+metal and merely the wrong CPU under QEMU.
+
+**And it prices the fix, including a deadlock class this entry did not see.**
+§3.3 is stage M3: an acknowledged shootdown with a per-CPU generation counter,
+invalidation against the *target* address space's PCID, and the shootdown moved
+ahead of every free. Its stated rule matters to anyone who reads the ninth-boot
+experiment below as an invitation to write one: **the initiator must not wait
+for acks while holding a lock a target could be spinning on with `IF` clear.**
+The `IF`-clear windows are `serial.rs:98,114,163` — the serial lock under
+`save_and_cli` — and IDT interrupt gates, so no `log!` may sit between issuing a
+shootdown and collecting its acks. That is the same `BackendGuard` this entry's
+own audit flagged as an unbounded `IF`-clear spin, arriving from the other
+direction.
+
+**M3 is memsec2's, not this task's.** The experiment below is an A/B on a
+throwaway build to test a hypothesis about the freeze; it is not the fix, and it
+must not be confused for the start of M3.
+
 #### What a ninth boot should carry
 
 Not another probe — this one is a fix-shaped A/B, and it is the cheapest
@@ -4635,9 +4678,19 @@ inside the bound is a CPU that is already `IF`-clear and unreachable, and saying
 so *by name* turns the freeze's own precondition into a printed line — on a
 machine where, as of the probe, a fatal report reaches the panel.
 
-That change is not made here. It is a kernel change on the hottest correctness
-path in the tree, it wants its own gates, and this task's subject was the
-instrument.
+That change is not made here, and it is **not** M3 being started early: M3 is
+`specs/memory-boundary-spec.md` §3.3 and it belongs to the memory-safety track,
+which has already priced it, enumerated the sites and written the deadlock rule.
+Whoever builds this A/B builds a throwaway to test a hypothesis about the
+freeze, obeys §3.3's rule about `log!` between issue and ack, and lands nothing.
+
+**Cheaper still, and it should be tried first**: the ninth boot the owner is
+already going to make carries `heartbeat`, and the heartbeat's `mask=` field
+answers a question this experiment would answer expensively. A machine dying to
+a stale translation loses CPUs the way a memory corruption does — one at a time,
+in whatever order they touch the bad page — while a machine dying to a global
+cause loses them between two lines. One flash of an instrument that is already
+built beats one flash of a fix that is not.
 
 #### What the owner should run — settled
 
