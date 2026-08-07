@@ -258,9 +258,33 @@ test-late-panic = []
 #
 # `test-late-panic` cannot serve: it fires during the boot phases, before any
 # userland process exists, so it paints a screen nobody had claimed.
-metal-panic-probe = []
-# One log line every 250 ms carrying the monotonic time and which CPUs reached a
-# scheduler pass since the previous one.
+#
+# Takes `diag-tick` because the probe's deadline is read from the idle loop, and
+# without it the probe fires on the first interrupt after the deadline rather
+# than at the deadline. On the owner's T14 that was 99 seconds late and looked
+# like a probe that never fired.
+metal-panic-probe = ["diag-tick"]
+# Cap how long a CPU with nothing to run may sleep, so the idle loop keeps
+# running on a machine that has gone quiet.
+#
+# The shipping kernel is right not to: a CPU whose pass found no work and no
+# deadline stops its LAPIC timer and halts until an interrupt arrives, which is
+# correct and is good power management. But everything the kernel does *for the
+# person watching it* lives in the idle loop — the heartbeat, the probe's
+# deadline, the log sink's flush — so on a machine that has gone quiet none of
+# it runs. Eight boots of the owner's T14 produced two heartbeats each, at
+# 1.15 s and 1.78 s, then nothing for as long as 102 s until a keypress; the
+# instrument built to tell a live machine from a dead one wrote the same file
+# for both.
+#
+# So a diagnostic build holds the machine out of full quiescence and a shipping
+# build must not, and that difference is this feature. It costs the wakes and
+# the flushes they carry — with `heartbeat` on, four `sync_mount`s a second on
+# whatever `/log` sits on — which also means the instrument is no longer a
+# passive observer of the boot it is watching.
+diag-tick = []
+# One log line every 250 ms carrying the monotonic time and which CPUs are still
+# alive.
 #
 # What nothing else reaches: *was this boot alive at time T*. Ten logs off the
 # owner's stick are byte-identical between the boots that froze and the boots
@@ -270,9 +294,13 @@ metal-panic-probe = []
 # says whether the machine stopped all at once or a CPU at a time, which is the
 # difference between a global cause and a local one.
 #
+# `diag-tick` is what makes the mask mean that. Without it a clear bit means
+# "this CPU had nothing to do", which every idle CPU on a quiet machine has, and
+# the field discriminates nothing.
+#
 # Not a default: four lines a second is a diagnostic budget, and a machine
 # nobody is watching should not spend its log volume saying nothing happened.
-heartbeat = []
+heartbeat = ["diag-tick"]
 # SYS_DEBUG actions 5, 6 and 7: one kernel heap allocation at
 # `mm::MAX_HEAP_ALLOC`, one a page over it, and one at the ceiling but
 # page-aligned. Ordinary code can still ask for more than one page backs — a
