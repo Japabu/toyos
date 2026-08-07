@@ -1447,6 +1447,82 @@ matcher absorbing everything, a stale or expired entry not redding, a review dat
 that never arrives, an expected failure filed as a pass, and the three
 declaration checks each defeated in turn.
 
+## 5.7 The host's build budget, and the count §5.6.1 was not
+
+Added 2026-08-07, with ten worktrees on the host for the first time.
+
+### 5.7.1 A worker that is compiling is not a guest
+
+§5.6.1's four load-bearing properties are all still true, and one sentence in it
+is what this section corrects: "one slot per task, never per boot". A task is not
+a boot — it is *a build and then a boot*. `run_phase` takes the guest slot before
+`run_task`, and the first thing `run_task` reaches is `build_boot_image`, which
+compiles the kernel variant that boot needs. So twelve workers on a fresh profile
+are twelve concurrent `cargo build`s and no guest at all, and the semaphore that
+was written to stop four agents putting 48 guests on 14 cores was, in that
+window, guarding nothing.
+
+Measured on 2026-08-07 while the eight-landing storm in `specs/known-issues.md`
+was under way: **load average 49.9 on 14 cores, twelve `rustc`/`cargo` processes,
+and exactly one QEMU guest live.** The one worker that had got as far as booting
+had a fiftieth of the machine its wall-clock margins were written for. Two of the
+suite's own liveness-margin tests (`blocked_dump`, then `screen_early_panic`)
+went red in consecutive landing gates on a branch that touched only `tests/`,
+each `ALONE … GREEN`.
+
+The same hole is what "nothing bounds the build half of a landing gate" names: a
+gate is `cargo test`, a `cargo test` is a build plus a suite, and only the suite
+half was counted. It is not a separate defect and it does not need a separate
+mechanism — a gate's builds *are* these builds.
+
+### 5.7.2 The mechanism
+
+`buildlock::build_slot` is a second counting semaphore over the same `slot()`
+primitive `guest_slot` uses, in `<common-dir>/toyos-build-locks/build-slots/`.
+Four properties, and three of them are inherited:
+
+- **Its own directory, so its own count.** A single count for both would deadlock
+  by construction: a suite holding all twelve guest slots would be waiting for a
+  slot it is itself holding. Gate:
+  `guests_and_builds_are_counted_separately`.
+- **The budget is 4**, and unlike §5.6.1's twelve it is **policy rather than a
+  measurement**. A build's own `-j` is already the whole machine, so the honest
+  question is not how many builds fit but how far the machine may be
+  oversubscribed; four builds against fourteen cores is about the ratio the
+  measured pathology (twelve, at load 49.9) exceeded by three. A bound that is
+  too generous is recoverable and one that is too tight makes every agent wait on
+  every other, which is why the error is deliberately on the generous side.
+  `--host-builds N` overrides it, `0` turns it off.
+- **Below the memo, above every build lock.** `build_test_image` returns from its
+  three-part memo before taking anything, so a boot that compiles nothing queues
+  for nothing — which matters, since most of a run's ~76 boots are memo hits.
+  Taken at `build::build`, `build::build_test_image`, `build::build_toyos_bins`
+  and the libc archive in `tests/common/compile.rs`, which between them are every
+  cargo invocation the build system makes.
+- **The order is a constraint**: sysroot → host slot → build lock → artifact, at
+  every acquirer of two of them. A build slot taken *before* the sysroot lock
+  closes a cycle with a `--claim-sysroot`, which holds the sysroot and then wants
+  a build slot; a build slot taken *inside* a build lock closes one with the
+  escalation in `Held::act_if`. Both orders are stated in the module header
+  because neither is checkable from a call site.
+
+Gates in `src/buildlock.rs`, each watched red before and green after:
+`a_full_host_makes_the_next_build_wait` (budget widened by one),
+`a_killed_build_gives_its_slot_back` (the guard handed an fd that never locked),
+`guests_and_builds_are_counted_separately` (one directory for both).
+
+### 5.7.3 A queue is not silence
+
+`flock` gives no progress and the exclusive holds here are minutes long. Eight
+`--land` processes on the integration lock printed one `[build-lock] waiting …`
+line each and then nothing, which is what a wedge looks like — and an agent that
+kills a wedge puts its own gate back at the end of the queue. Every blocking
+acquisition now repeats itself every 30 s, re-reading the holder each time so the
+message follows the queue forward rather than naming whoever was in front when
+the wait began. A thread does the talking and the kernel still keeps the queue,
+so `flock`'s ordering is given up nowhere. Gate:
+`a_lasting_wait_keeps_saying_so`, which is red on the tree as it stood.
+
 ## 6. What this audit did not measure
 
 - The split of a machine test's time *above* the 3.7 s floor into guest work
