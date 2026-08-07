@@ -205,6 +205,27 @@ struct Sink {
 
 static SINK: Lock<Option<Sink>> = Lock::new(None);
 
+/// Whether a flush is between taking bytes out of the ring and getting them on
+/// the device.
+///
+/// [`log_ring::file_has_pending`] answers "the ring still owes the sink", which
+/// goes false at `drain_to_file` — *before* `flush_file` and `sync_mount` have
+/// run. A dying machine waiting on that predicate alone therefore stops waiting
+/// in the middle of the write and halts the CPU doing it, which is exactly what
+/// `halt_all_cpus`'s drain wait did until this existed: the report left the ring
+/// and never reached the stick.
+///
+/// The pair has no gap. `FILE_OWED` only drops inside this flag's window, so
+/// "ring empty and no flush running" cannot be observed while bytes are still
+/// owed to the volume.
+static IN_FLUSH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Is a flush still between the ring and the device? For the fatal path, which
+/// must not halt the CPU doing the writing.
+pub fn flush_in_progress() -> bool {
+    IN_FLUSH.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Start writing the kernel's log to the log volume. Call once, after `/log`
 /// is mounted.
 pub fn install() {
@@ -285,7 +306,9 @@ pub fn poll() {
         return;
     };
     sink.blocked_since = None;
+    IN_FLUSH.store(true, core::sync::atomic::Ordering::Release);
     let outcome = sink.flush(&mut vfs);
+    IN_FLUSH.store(false, core::sync::atomic::Ordering::Release);
     drop(vfs);
     if let Err(e) = outcome {
         let stopped = sink.stopped_at();

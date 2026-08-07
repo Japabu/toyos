@@ -113,6 +113,18 @@ pub fn send_nmi(cpu_id: u32) {
 /// against the ~460 ms the panel paint costs on the T14 anyway.
 const LOG_FILE_DRAIN_NANOS: u64 = 500_000_000;
 
+/// Does the log volume still owe this boot bytes?
+///
+/// **Both halves, and the second is not belt-and-braces.** The ring's own
+/// predicate goes false at `drain_to_file`, which is before `flush_file` and
+/// `sync_mount` have put anything on the device — so waiting on it alone
+/// returns mid-write and the halt IPI then stops the CPU doing the writing.
+/// Measured: the wait was satisfied, no timeout line was printed, and the
+/// report was still absent from the file.
+fn owed() -> bool {
+    crate::drivers::log_ring::file_has_pending() || crate::log_file::flush_in_progress()
+}
+
 /// Give the log sink a chance to put this report on the stick before the
 /// machine stops.
 ///
@@ -143,11 +155,24 @@ const LOG_FILE_DRAIN_NANOS: u64 = 500_000_000;
 /// Placed before the halt IPI rather than after, because after it there is
 /// nobody left to do the writing.
 fn wait_for_log_file() {
-    if !crate::drivers::log_ring::file_has_pending() {
+    if !owed() {
         return;
     }
+    // Wake them first. A sibling with nothing to run is sitting in `sti; hlt`
+    // and is not going round its idle loop at all, so waiting for it to flush
+    // waits for something that is not happening — the LAPIC timer is one-shot
+    // and a quiet machine may have none armed. This is the ordinary wake IPI,
+    // the same one a scheduler wake sends, and the halt IPI has not gone out
+    // yet, so there is still somebody to wake.
+    let cpus = crate::arch::smp::cpu_count();
+    let me = percpu::cpu_id();
+    for cpu in 0..cpus {
+        if cpu != me {
+            kick_cpu(cpu);
+        }
+    }
     let deadline = crate::clock::nanos_since_boot().saturating_add(LOG_FILE_DRAIN_NANOS);
-    while crate::drivers::log_ring::file_has_pending() {
+    while owed() {
         if crate::clock::nanos_since_boot() >= deadline {
             // Reaches the panel only on the fatal paths that paint the live
             // ring rather than a snapshot taken before this ran, and reaches
