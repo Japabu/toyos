@@ -1094,6 +1094,51 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
+### OPEN — two CPUs shooting down at once wait for each other and both panic
+
+Observed 2026-08-07 on `wt/toyos-h3`, whose only kernel delta from `main` is the
+audio one; the shootdown code is `c4173f0` and `318ec10`, landed the same
+afternoon. Reproduced twice inside gate A's thorough tier and once more in a
+twelve-run hunt of `cargo test -- audio_tone` — roughly one boot in five of that
+family. **The machine goes down**, so it is a double kernel panic, not a test
+failure.
+
+```
+[kernel 8.597 cpu4 tid=1] !!! PANIC !!!: panicked at src/arch/tlb.rs:133:42:
+  tlb: cpu 0 has not flushed for generation Generation(2) in 5000000000ns — it is not taking interrupts
+    kernel::arch::tlb::shootdown+0x1dc
+    drop_glue::<Vec<kernel::mm::unmapped::Unmapped<kernel::process::PageAlloc>>>
+    kernel::process::thread_exit+0x61b
+  Running: pid=2 test_rs_audio_tone, syscall num=5 (SYS_THREAD_EXIT)
+
+[kernel 8.599 cpu0 tid=0] !!! PANIC !!!: panicked at src/arch/tlb.rs:133:42:
+  tlb: cpu 4 has not flushed for generation Generation(3) in 5000000000ns — it is not taking interrupts
+    kernel::arch::tlb::shootdown+0x1dc
+    kernel::arch::syscall::sys_release_shared+0x9a
+  Running: pid=0 soundd, syscall num=39 (SYS_RELEASE_SHARED)
+```
+
+**Read the two together: cpu4 is waiting for cpu0 and cpu0 is waiting for cpu4.**
+Each is inside `shootdown`'s `wait_for`, each spinning on the other's flush
+acknowledgement, and each times out at the 5 s deadline. Neither is serving the
+other's IPI while it waits. The generations differ by one, which is the two
+initiators having taken `SHOOTDOWN`'s sequence in opposite order.
+
+The workload is ordinary and is not audio's: a thread exiting and freeing its
+unmapped pages on one CPU, while another process releases a shared-memory region
+on another. soundd's client stream ring is the region here only because that is
+what the audio tests run.
+
+**Attribution, and its limit.** No frame in either backtrace is in code the audio
+branch touched, and gate A's A arm — 60 audio boots of `80fe031`, which predates
+both shootdown commits — never produced it. That is strong and it is not a
+bisect; whoever takes this should confirm against `5ef66f0` (main immediately
+before the audio landing, with the shootdown work and without it).
+
+**What it costs right now**: gate A's thorough tier cannot complete a run on any
+tree carrying it, because a panicked guest is scored as an instrument failure and
+the tier stops. That blocked H3's own A/B (§4).
+
 ### `Lock::lock`'s spin is the half of the ticket lock loom cannot reach
 
 `kernel-loom` compiles `kernel/src/sync.rs` a second time against loom's
@@ -2783,6 +2828,54 @@ window at all used to be a ceiling breach — which under a harm verdict would h
 passed — so it moved to the instrument-broken set, fatal in both tiers. It was
 also the one breach that could enter the thorough tier's sample as a run of
 all-zero counters, i.e. as the best run ever measured.
+
+### OPEN — gate A's *thorough* tier reds on an unmodified `main`, and that is the rate the entry below asked for
+
+The entry below says "whoever takes it should get the rate first — the thorough
+tier (`--audio-gate N`) is the instrument". H3's session got it, and the
+instrument reds on the tree it is supposed to certify.
+
+`cargo test --test toyos-build -- --audio-gate 30` on `80fe031` — **main's tip,
+no delta at all**, run as H3's A arm before that branch existed:
+
+```
+[gate A] FAILED after 15 of 30 iterations (the remaining runs cannot change this):
+    pooled dropout rate: 10 of 120 vs recorded 0 of 120 (Fisher p=8.03e-4 <= 1e-3)
+```
+
+The ten, by config and iteration: `audio_tone_load smp=1` at 4, 9, 13, 15;
+`audio_tone_load smp=8` at 9, 13, 14; `audio_tone smp=8` at 8, 9;
+`audio_tone smp=1` at 13. So **`audio_tone` at both widths reds too**, which the
+entry below had only established for `audio_tone_load`.
+
+**The load correlation is the wrong way round, and that is the finding.** The
+1-minute average across the run spanned 7.2 to 19.1 on 14 cores, with one to
+five other guests and six other `toyos-build` processes throughout. The clean
+early iterations ran at 19.1 and 16.8; the three worst — 13, 14 and 15 — ran at
+11.4, 10.6 and 11.9. Every dropout carried a wake latency of 33-117 ms against
+5-17 ms on the clean runs, which is the same "soundd was not scheduled"
+signature as the two entries below.
+
+What this changes for anyone reading them: the intermittency is not a property
+of one config, and it is **large enough to fail the thorough tier's own pooled
+test on a clean tree**. A stage transition that gates on this tier
+(`specs/scheduler-core-spec.md` §11, and H3 itself) cannot presently tell its
+own change from this. H3 therefore compared its two arms against *each other*
+rather than against the recorded sample, and said so.
+
+The recorded sample in `tests/audio-baseline.toml` is 0/120 and was taken in a
+session this host no longer resembles. **Re-recording it is not licensed by this
+entry** — a baseline widened to accept the defect is the defect made permanent.
+What is needed is the cause.
+
+**The B arm was never obtainable, and the reason is §3's shootdown deadlock.**
+Two attempts on the audio branch stopped at iterations 2 and 4, both on
+`audio_tone.smp8`, both with the tier's "instrument broken" verdict — which is
+what a guest whose kernel double-panicked looks like from here. Those commits
+landed between the two arms and `--land` merged them in, so the arms differ by
+more than the change under test and no comparison between them means anything.
+What H3 has instead: a full suite green at 289/289 with all four audio configs
+clean, and ten standalone runs of the audio family. None of that is a rate.
 
 ### OPEN — `audio_tone_load (smp=1)` fails gate A's fast tier intermittently, on both trees
 
