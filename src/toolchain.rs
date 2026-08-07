@@ -63,7 +63,7 @@ pub fn rust_dir(root: &Path) -> PathBuf {
 
 /// The per-worktree sources that end up *inside* the shared sysroot: std links
 /// `toyos-abi` and `toyos`, and `libtoyos_c.a` is `userland/libc`.
-const SYSROOT_SOURCES: [&str; 3] = ["toyos-abi/src", "toyos/src", "userland/libc/src"];
+pub const SYSROOT_SOURCES: [&str; 3] = ["toyos-abi/src", "toyos/src", "userland/libc/src"];
 
 /// Of those, the ones a change to obliges an std rebuild.
 const STD_SOURCES: [&str; 2] = ["toyos-abi/src", "toyos/src"];

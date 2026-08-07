@@ -229,6 +229,30 @@ once that day. `toolchain::CLAIM_WINDOW` is that sentence, printed by the refusa
 a diverged checkout gets and again by the claim announcement — an agent in this
 situation is reading the refusal, not this file.
 
+**And the rule is now enforced at the cause rather than at the victim.** On
+2026-08-07 it was followed once in four times: `toyos-vfserr` split deliberately
+and said so; `toyos-memsec2` did not and held through two failed gates, blocking
+two agents ~35 and ~50 minutes; `toyos-h3` did not, and two landings failed
+against it in one hour — a log-audit branch at 129.6 s and a `tone` change at
+94.8 s, each burning a full build before reaching `toolchain.rs`'s refusal. That
+refusal is a good one arriving at the wrong process. `--land` now asks the same
+question of the *landing* branch, in `preflight`, before the integration lock and
+before anything is compiled: a branch whose commits touch the witnessed trees
+**and** carry commits that touch none of them is refused, naming both lists.
+
+It is a refusal and not a warning, because a warning is what the briefs already
+were. The way past it is `--abi-inseparable`, for the case the split genuinely
+cannot be made — an ABI item the branch renames or removes, whose old form the
+rest of the tree still uses — and it is not silent: the report and the landing
+commit both say the claim window was the whole task. Where the sysroot commits
+are the *oldest* on the branch the refusal prints the two-command remedy;
+where they are interleaved it says so, because nothing in this workflow rebases.
+A previous landing attempt's integration merge is not unrelated work — merges are
+excluded, or a branch whose only commit is the ABI change would be refused for
+having tried once already. Gates:
+`an_abi_change_landing_with_unrelated_work_is_refused_before_the_gate`,
+`an_abi_only_branch_lands_and_a_previous_merge_is_not_unrelated_work`.
+
 **A checkout that is merely *behind* main is not diverged from it**, and until
 2026-08-07 `standing()` could not tell the two apart: it asked `git diff main`,
 which is symmetric, so a worktree that had not merged somebody else's landed ABI
