@@ -2592,22 +2592,27 @@ which CPU was not taking interrupts and why, and whether the downstream failures
 — soundd refusing a second stream, a compositor client exiting −1 — are correct
 consequences or second defects.
 
-**The width is the variable, measured.** Same session, same branch, same 289
-tests:
+**The load is the variable, not the width.** Four full runs, same session, same
+289 tests, one branch:
 
-| width | verdict |
-|---|---|
-| 12 (default) | 2 failed, 287 passed — 526.9 s |
-| 12 (default) | 5 failed, 284 passed — 497.0 s |
-| **4** (`--test toyos-build -- --jobs 4`) | **289 passed, 0 failed — 265.2 s** |
+| width | host | verdict |
+|---|---|---|
+| 12 (default) | this worktree alone | 2 failed, 287 passed — 526.9 s |
+| 12 (default) | this worktree alone | 5 failed, 284 passed — 497.0 s |
+| **4** | this worktree alone | **289 passed, 0 failed — 265.2 s** |
+| 4 | `toyos-tlbfix` running its own suite | 4 failed, 284 passed — **610.4 s** |
 
-The 4-wide run is also *faster in wall clock* than either 12-wide run, which is
-`specs/test-cost-audit.md` §4.1 constraint 3 arriving from a new direction: 12
-guests on 14 cores is now past the point where more width buys anything, and the
-extra load is what turns the shootdown wait into a five-second stall. That gives
-a workaround — `--land --gate cargo test --test toyos-build -- --jobs 4`, which
-the landing prints and reports — and it is a workaround: at 4-wide the stall is
-rarer, not absent, and nothing has been fixed.
+The third row is the one that looks like a fix and is not: the fourth is the
+same width against a second worktree's suite, and it is red again with three of
+the same victims (`metal_sim_window_caps`, `metal_sim_ipc_hostile_peer`,
+`metal_sim_compositor_stall`) and the same `tlb:` lines. What the third row does
+show is that **4-wide beat 12-wide on wall clock by a factor of two on a quiet
+host** — `specs/test-cost-audit.md` §4.1 constraint 3 arriving from a new
+direction, and a measurement worth re-taking on its own terms.
+
+So `--land --gate cargo test --test toyos-build -- --jobs 4` is a way through
+when the host is otherwise idle, the landing prints it as an override, and it
+fixes nothing.
 
 **Not to be re-run away**: the owner's 2026-08-04 ruling is that a
 load-coincident failure is a real defect, and this one reproduced across two
