@@ -50,7 +50,7 @@ The findings are where those types stop.
 | # | Finding | Bug permitted | Code delta |
 |---|---|---|---|
 | F1 | `Virtqueue::poll_used` hands out a device-chosen index and length with no parse step; three consumers use them raw, one as a pointer offset | **Out-of-bounds read** in `unsafe`; two panic paths; silent descriptor aliasing | −2 hand-written checks, +6 lines at one primitive |
-| F2 | MSI-X is programmed three times from three copies that have already diverged | Divergent absent-capability policy; **nobody reads the table-size field before writing entry 0** | **−50 lines (projected)**, 88 counted today |
+| F2 | MSI-X is programmed three times from three copies that have already diverged | Divergent absent-capability policy; **nobody reads the table-size field before writing entry 0** | **Closed** (#58) — 86 → 71 kernel lines plus `toyos-pci/`; the table-size bound turned out to be unfirable and two others real |
 | F3 | `BlockDevice::read_blocks` returns `()`; NVMe discards all 6 completion statuses | Page cache serves one block's bytes under another block's number | +1 enum, `?` at 7 call sites |
 | F4 | Zero `#[must_use]` in the scope; 20 counted sites discard a status they already hold | `442f3e8`'s exact class: "the write that arms the pin was the one nobody checked" | +1 attribute, +14 `let _ =` |
 | F5 | ACPI tables parsed with no length check and no checksum; two subtractions underflow | Unbounded walk over firmware-chosen memory; boot dies on a legal table set | −4 `unsafe { &*ptr }`, +1 `Table` type |
@@ -400,7 +400,36 @@ identical `0xFF`-is-broadcast hazard, on the other delivery path.
 **Blast radius.** Three drivers, one new type in `pci.rs`. The two virtio drivers
 are not under active edit; `xhci/` is.
 
-**Standing.** New.
+**Standing. Closed** (task #58), in a different shape than proposed above —
+recorded because the difference is the projection's mistake and not the
+implementation's.
+
+- **No `MsixTable` type.** Every call site arms one entry, so `route(entry, …)`
+  would have been a parameter nobody varies, and the table-size bound it existed
+  to enforce cannot fire: Table Size is encoded *one less than it is*, so a
+  function that has the capability at all has at least one entry and entry 0
+  needs no check. The shared form is `PciDevice::enable_msix(vector)`, which was
+  already there, plus `MSIX_ENTRY` naming the entry once.
+- **The decode moved out of the kernel**, to `toyos-pci/` — with `enable_msi`'s
+  register layout for company, since that one *does* shift by four bytes on a
+  64-bit-address function and no test could reach the arithmetic. 15 host tests,
+  each with its negative control run.
+- **Two of the numbers being believed are real bugs, and neither is the table
+  size.** A reserved BIR (6 or 7) sent `read_bar_64` into the CardBus CIS
+  pointer at config offset 0x28 and mapped whatever that decoded to; a BAR
+  firmware left unassigned put the table at physical 0. Both refuse by name now.
+  The third — an I/O BAR, which `read_bar_64` cannot see at all — is filed in
+  known-issues §1 rather than fixed, because the fix changes that function's
+  signature at four call sites.
+- **Counted, and it is not −50.** Kernel-side MSI-X setup went 86 → 71 lines
+  (21+33+32 → 28 in `pci.rs`, 13 in `virtio.rs`, 15 in each virtio driver), and
+  `toyos-pci` is 119 more with 100 of tests. The projection left out
+  `enable_msi`, and left out that replacing two `panic!`s with refusals costs
+  lines a panic did not.
+
+The destination-id check is still not built, and now has nowhere to go: every
+message this kernel programs goes to APIC id 0 by one constant, so there is no
+destination for a call site to get wrong.
 
 ---
 

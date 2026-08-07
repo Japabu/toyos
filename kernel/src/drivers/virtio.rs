@@ -26,16 +26,20 @@ pub const COMMON_DEVICE_FEATURE_SELECT: u64 = 0x00;
 pub const COMMON_DEVICE_FEATURE: u64 = 0x04;
 pub const COMMON_DRIVER_FEATURE_SELECT: u64 = 0x08;
 pub const COMMON_DRIVER_FEATURE: u64 = 0x0C;
-pub const COMMON_MSIX_CONFIG: u64 = 0x10;
+const COMMON_MSIX_CONFIG: u64 = 0x10;
 pub const COMMON_DEVICE_STATUS: u64 = 0x14;
-pub const COMMON_QUEUE_SELECT: u64 = 0x16;
+const COMMON_QUEUE_SELECT: u64 = 0x16;
 pub const COMMON_QUEUE_SIZE: u64 = 0x18;
-pub const COMMON_QUEUE_MSIX: u64 = 0x1A;
+const COMMON_QUEUE_MSIX: u64 = 0x1A;
 pub const COMMON_QUEUE_ENABLE: u64 = 0x1C;
 pub const COMMON_QUEUE_NOTIFY_OFF: u64 = 0x1E;
 pub const COMMON_QUEUE_DESC: u64 = 0x20;
 pub const COMMON_QUEUE_DRIVER: u64 = 0x28;
 pub const COMMON_QUEUE_DEVICE: u64 = 0x30;
+
+/// What a virtio device reads back where it was written a vector it could not
+/// allocate resources for (virtio 1.2 §4.1.5.1.2).
+const NO_VECTOR: u16 = 0xFFFF;
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -389,6 +393,24 @@ impl Virtqueue {
     }
 }
 
+/// Which of a device's two interrupt sources it declined to bind. Not a
+/// driver bug and not a kernel bug: this device, on this machine, saying it
+/// has no resources to deliver with.
+#[derive(Debug, Clone, Copy)]
+pub enum NoVector {
+    Config,
+    Queue(u16),
+}
+
+impl core::fmt::Display for NoVector {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Config => write!(f, "its configuration-change interrupt"),
+            Self::Queue(queue) => write!(f, "queue {queue}'s interrupt"),
+        }
+    }
+}
+
 /// A fully initialized VirtIO device.
 pub struct VirtioDevice {
     config: VirtioPciConfig,
@@ -468,6 +490,28 @@ impl VirtioDevice {
         let common = self.config.common;
         common.write_u16(COMMON_QUEUE_SELECT, index);
         common.write_u16(COMMON_QUEUE_ENABLE, 1);
+    }
+
+    /// Point this device's configuration-change interrupt and `queue`'s
+    /// used-ring interrupt at `pci::MSIX_ENTRY` — the table entry
+    /// `PciDevice::enable_msix` armed.
+    ///
+    /// Deliberately not part of that call: the table is PCI's and this is
+    /// virtio's own protocol, and a device given the first without the second
+    /// leaves every queue silent. Both halves are needed and neither implies
+    /// the other, so a driver that wants interrupts makes both calls.
+    pub fn bind_msix(&self, queue: u16) -> Result<(), NoVector> {
+        let common = self.config.common;
+        common.write_u16(COMMON_MSIX_CONFIG, super::pci::MSIX_ENTRY);
+        if common.read_u16(COMMON_MSIX_CONFIG) == NO_VECTOR {
+            return Err(NoVector::Config);
+        }
+        common.write_u16(COMMON_QUEUE_SELECT, queue);
+        common.write_u16(COMMON_QUEUE_MSIX, super::pci::MSIX_ENTRY);
+        if common.read_u16(COMMON_QUEUE_MSIX) == NO_VECTOR {
+            return Err(NoVector::Queue(queue));
+        }
+        Ok(())
     }
 
     /// Set DRIVER_OK — device is now live.
