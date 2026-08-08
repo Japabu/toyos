@@ -3854,9 +3854,8 @@ argument does not depend on it and is the one to keep.
 
 ### OPEN, UNASSIGNED — `screen_pager_keys` is red on `main`, and no keystroke reaches the halted pager
 
-Found 2026-08-08 by the licence work's gate, and it belongs to nobody yet.
-Three runs in one session, the same hard zero every time, with the identical
-message.
+Found 2026-08-08 by the licence work's gate, and it belongs to nobody yet. It
+is what currently stops any branch landing on the default gate.
 
 ```
 FAIL screen_pager_keys: 0 page moves over 30 keystrokes in 0.4s — an
@@ -3885,39 +3884,55 @@ Note the earlier phases pass: the footer appears, and the *unattended* 3 s
 deadline still advances the page, so the pager is running and painting. Only
 the keyboard half is dead.
 
-**It was green a day ago, and the window is narrow.** `8273964`
-(2026-08-07 23:40) is the last landing whose gate was the whole suite, and its
-recorded last line is `test result: ok. 291 passed, 291 total (366.2s)` — this
-test among them. Between there and `e39f038` only two commits touch
-`panic_console/`, `log_ring.rs` or `sched/dump.rs`:
+**Bisected, and the answer is a merge whose two parents are both green.**
+`8273964` (2026-08-07 23:40) is the last landing whose gate was the whole suite
+and its recorded line is `test result: ok. 291 passed, 291 total (366.2s)`, so
+the window was one day. Seven boots in one session, `cargo test --
+screen_pager_keys` at each:
 
-```
-f7c87ee dump: the panel gets the report, and keeps it
-77e818d log_ring: peek_range went in above peek_tail's doc comment, not below its body
-```
+| Commit | | Result |
+|---|---|---|
+| `543c7b0` | before both lanes | **PASS** 18.6 s |
+| `9bd7a9e` | `idt: a vector without a gate is not a fault` — main's lane, no dump work | **PASS** 18.4 s |
+| `f7c87ee` | `dump: the panel gets the report, and keeps it` — the dump lane, no IDT work | **PASS** 17.9 s |
+| `3dfb216` | the third lane (harness/CI), off `543c7b0` | **PASS** 17.9 s |
+| **`f96d52e`** | **`wt/toyos-dump: merged main db34b2b` — the merge of the two above** | **FAIL** 10.0 s |
+| `eaaac80` | docs only, on top of it | **FAIL** 8.4 s |
+| `1bcbc99` | `log_ring: a mark is a store under the lock` | **FAIL** 10.2 s |
+| `b36cf64` | main's tip at the branch point | **FAIL** ×3, 6–7 s |
 
-`f7c87ee` is the first suspect by shape rather than by suspicion:
-`panic_console::hold_report` now repaints the report from `drain_irqs` whenever
-128 remembered pixels say the panel stopped carrying it. A repaint that restores
-the page a keystroke has just moved is indistinguishable, to this test, from a
-keystroke that never arrived — the footer is its only instrument.
+**`f96d52e` is the first bad commit and neither parent is bad.** Everything
+between `f7c87ee` and `f96d52e` on main's side is `9bd7a9e` (green alone),
+`a0f724c` (touches only `fault_gates.rs` and one harness line) and three
+docs-only commits, so the regression is not any single change: it is the
+interaction of the panic console's new `hold_report` repaint with the IDT
+work that landed beside it. Both agents' gates were honest and both were green.
 
-Not bisected. That is the next step and it is two boots.
+That is the class this codebase has no gate for — CLAUDE.md's landing rule is
+that main's tip must *compile*, and this is a case where main's tip stopped
+*working* while every branch that built it passed.
 
-**A second explanation the A/B cannot separate, and whoever takes this must
-rule it out first.** The sampling loop sends one key and screendumps
-immediately, with no wait in between: `footer()` returns on its first dump when
-a footer is present, and only sleeps 50 ms when there is none. Thirty samples
-took **0.3 s**, so each round trip was about 10 ms — and a guest that needs
-longer than that to repaint after a key reads as "did not move" on every
-sample, giving exactly 0 of 30. The three reds were taken with load 11–16 on a
-14-core host and boots at 1.7–1.8x the reference, so a slow guest is live.
+`hold_report` remains the first thing to look at: it repaints the report from
+`drain_irqs` whenever 128 remembered pixels say the panel stopped carrying it,
+and a repaint that restores the page a keystroke just moved is
+indistinguishable, to this test, from a keystroke that never arrived — the
+footer is its only instrument. What the bisect adds is that the repaint alone
+does not do it.
 
-That is *not* a reason to re-run it away: it would make the test's verdict a
-wall-clock margin with no margin at all, which is a defect of the instrument and
-belongs in §7 with the rest of that class. Distinguishing the two is one
-experiment — put a bounded wait for *change* in the sample loop and see whether
-the moves appear. If they do, the test is the bug; if they do not, `f7c87ee` is.
+**Two things it also settles.** Host load is *not* the cause: the landing gate
+that produced the fifth red ran at load 2.1–2.4 with `fastest boot 1388 ms
+against the reference 1320 ms`, i.e. a quiet host at 1.05x, and the failure was
+byte-identical to the ones taken at load 11–16. And every green took 18 s
+against every red's 6–10 s, which is the pager phases taking real time versus
+not happening at all.
+
+**A separate instrument weakness, worth fixing whoever wins.** The sampling
+loop sends one key and screendumps immediately: `footer()` returns on its first
+dump when a footer is present and only sleeps 50 ms when there is none. Thirty
+samples in 0.3 s is a 10 ms round trip, so a guest slower than that to repaint
+reads as "did not move" on every sample. The bisect says that is not what is
+happening here — a timing margin would not split this cleanly by commit — but a
+verdict with no margin at all belongs in §7 with the rest of that class.
 
 It is **not** in `EXPECTED_FAILURES` and must not be put there to get a landing
 through: an entry needs a task, a write-up and the failure text it covers, and
