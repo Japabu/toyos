@@ -59,7 +59,65 @@ pub fn set_width(width: u32) {
 /// says a guest hung when it was only sharing a machine, which is the failure
 /// mode that put the whole shared block in the serial tail.
 pub fn budget(one_guest: Duration) -> Duration {
-    one_guest * WIDTH.load(Ordering::SeqCst)
+    let (num, den) = host_scale();
+    one_guest * WIDTH.load(Ordering::SeqCst) * num / den
+}
+
+/// The fastest boot-to-ready this run has seen, in milliseconds.
+///
+/// A boot is the one piece of guest work every test does and no test asserts on
+/// — `wait_for_ready`'s own comment names the two exceptions, and both read the
+/// guest's stamps rather than this clock — so it is a measurement of the host
+/// that costs nothing to take. The *fastest* rather than the mean because a boot
+/// taken with three other guests up measures the phase; the minimum over a run
+/// is the closest this can get to the machine with nothing else on it.
+static FASTEST_BOOT_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The same measurement on the host every ceiling in this tree was written for.
+///
+/// Dev host, M4 Pro, cross-arch TCG, `--jobs 1`, the fastest of ten boots across
+/// `doom_sound_flood`, `xhci_hotplug`, `metal_sim_pointer_churn`,
+/// `hda_client_stall`, `null_sink_shipped_client`, `usb_boot_stick_pulled`,
+/// `screen_pager_keys` and `xhci_flap`, measured 2026-08-08. The spread over
+/// those ten was 1433–2063 ms, which is why the comparison is minimum against
+/// minimum: it is the one statistic of a boot that both hosts can take the same
+/// way.
+const REFERENCE_BOOT_MS: u32 = 1433;
+
+fn record_boot(took: Duration) {
+    let ms = took.as_millis().min(u32::MAX as u128) as u32;
+    FASTEST_BOOT_MS.fetch_min(ms, Ordering::SeqCst);
+}
+
+/// How much slower than the host these ceilings were written on this one is, as
+/// a fraction so that a 1.4× host is not rounded to 1.
+///
+/// [`budget`] corrects a ceiling for how many guests share the machine. It never
+/// corrected for how fast the machine *is*, and that is the other half of the
+/// same mistake: a number reasoned about on an M4 Pro is not a liveness ceiling
+/// on a four-core Azure vCPU, it is a verdict about which of the two is running
+/// the test. `specs/ci-plan.md` §7.1 counted 307 bare timeouts in one CI run and
+/// every one of them was that.
+///
+/// **Only ever upward.** On a faster host the number in the source stands,
+/// because it is the number its author reasoned about, and a ceiling that shrank
+/// would start reporting wedges that are not there. The ceiling of 8 is because
+/// one anomalous boot must not be able to disable every liveness guard in the
+/// suite at once.
+fn host_scale() -> (u32, u32) {
+    let fastest = FASTEST_BOOT_MS.load(Ordering::SeqCst);
+    // Before the first boot there is no measurement, and the sentinel must not
+    // read as the slowest host imaginable.
+    if fastest == u32::MAX || fastest <= REFERENCE_BOOT_MS {
+        return (1, 1);
+    }
+    (fastest.min(REFERENCE_BOOT_MS * 8), REFERENCE_BOOT_MS)
+}
+
+/// The fastest boot seen and the factor it produced, for a run's own report.
+pub fn host_speed() -> (u32, u32, u32) {
+    let (num, den) = host_scale();
+    (FASTEST_BOOT_MS.load(Ordering::SeqCst), num, den)
 }
 
 /// A liveness guard that watches the guest instead of the host's clock.
@@ -2453,7 +2511,14 @@ fn wait_for_ready(
     // on how long a boot took by *this* clock: `i8042_absent` and
     // `xhci_slow_connect` do assert on boot timing and read the guest's own
     // stamps, and both are in the serial tail.
-    let boot_timeout = Duration::from_secs(10) * WIDTH.load(Ordering::SeqCst).max(2);
+    //
+    // Scaled by the host too, and the first boot of a run is the one that
+    // cannot be: nothing has been measured yet, so it gets the flat number and
+    // every boot after it gets the corrected one. Two boot timeouts in CI run
+    // `31233476555` were this — `console: ready` and `compositor: ready`, on a
+    // runner where the same boots take twice what they take here.
+    let (num, den) = host_scale();
+    let boot_timeout = Duration::from_secs(10) * WIDTH.load(Ordering::SeqCst).max(2) * num / den;
     let start = Instant::now();
     let mut seen = String::new();
     loop {
@@ -2512,5 +2577,6 @@ fn wait_for_ready(
             }
         }
     }
+    record_boot(start.elapsed());
     seen
 }

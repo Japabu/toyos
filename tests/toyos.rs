@@ -9199,6 +9199,18 @@ impl Tally {
             out.push('\n');
         };
         say(String::new());
+        // What the run's liveness ceilings were actually worth, because the
+        // number in the source is no longer the number that was enforced. A
+        // reader comparing two runs' timings needs to know which host each was
+        // taken on, and this is the suite's own measurement of that.
+        let (fastest, num, den) = qemu::host_speed();
+        if fastest != u32::MAX {
+            say(format!(
+                "host: fastest boot {fastest} ms against the reference {den} ms — liveness \
+                 ceilings paid at {:.2}x width",
+                f64::from(num) / f64::from(den)
+            ));
+        }
         if suspended >= common::clock::SUSPENDED_AT_LEAST {
             // The elapsed figure below is monotonic and therefore already
             // excludes it, which is worth saying: the two numbers do not add up
