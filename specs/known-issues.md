@@ -3131,6 +3131,72 @@ never a driver register poll, and does not mention NVMe at all.
 
 ## 4. Audio and soundd
 
+### CLOSED as to cause 2026-08-08 — the T14's audio pops were the log sink writing `/log` from the idle loop, ahead of the scheduler pass
+
+Evidence, both logs and the arithmetic: `specs/metal-logs/2026-08-08-audio-wake/`.
+
+Two boots of the T14, same tree, differing only in `--kernel-feature
+heartbeat`. Per-window worst wake, median over the streaming windows: 50,512 µs
+with `heartbeat`, **1,307 µs** without; drains 375 against **5**. The first
+number measures the instrument — `heartbeat` carries `diag-tick` and emits two
+lines every 250 ms, and `/log` on that machine is the USB stick it boots from,
+so it was four `sync_mount`s a second of USB mass storage.
+
+On the clean boot the healthy windows (`max_batch=1`) report 485–514 µs, a
+sixth of the 2.902 ms period. **Every one of the six tail events instead
+follows a burst of kernel log lines** — three of them the 13-line
+`sched:`/`PMM:` burst `scheduler::log_health` emits every 10 s, at 21.241,
+41.253 and 61.257 s, each followed by the worst wake of the session (39.4,
+55.4, 63.2 ms). The README tabulates all six.
+
+Mechanism: `idle_loop` runs `log_file::poll()` before `pass()`. The flush is
+append + `flush_file` + `sync_mount`, each a USB bulk transfer, and
+`xhci::wait_transfer` spins for the whole of one with the controller lock held
+and preemption disabled — so that CPU reaches no scheduler pass until it ends.
+The CPU is not incidental: a task parks on the CPU with nothing else to run, so
+the CPU soundd waits on is the one that reaches the idle loop first, and both
+soundd's `irq_ring` completion record (drainable only by the CPU that took the
+interrupt) and its parked deadline (armed on its home CPU) are stranded there.
+`max_batch=8` on all six is the signature.
+
+Fixed by `sched::driver::flush_log_file_if_affordable`: a CPU that owes a
+deadline leaves the log to one that does not, with
+`LOG_DEFERRAL_CEILING_NS` = 1 s so that "prefer another CPU" cannot become
+"never" on one core or on a machine that owes a deadline everywhere.
+
+**Still open, and it is the general form:** a USB or NVMe transfer holds
+whatever CPU issues it with preemption disabled for the whole device round
+trip. The fix above keeps that off the CPU an audio daemon is parked on; it
+does not make the transfer interruptible, and any other unbounded I/O reached
+from the idle loop inherits the same hazard. The measurement that would size it
+is a metal boot with the fix in — the owner's next one.
+
+### CLOSED 2026-08-08 — `/bin/tone` accumulated its phase in `f32`, so the tone the owner judges the machine by was flat and dirty
+
+`userland/toybox/src/tone.rs` advanced `phase: f32` by one increment per frame
+and never wrapped it. The sum is unbounded, so each increment is eventually
+rounded against a total far larger than itself. Measured on the host against an
+exact `f64` reference, 10 s at amplitude 3276, last 0.5 s:
+
+| | fundamental | signal/residual | peak |
+|---|---|---|---|
+| 440 Hz before | 438.671 Hz (−0.302%) | 35.1 dB | 3276 |
+| 440 Hz after | 439.999 Hz (−0.000%) | below this sweep's floor | 3275 |
+| 880 Hz before | 877.341 Hz (−0.302%) | 37.9 dB | 3276 |
+| 880 Hz after | 879.999 Hz (−0.000%) | below this sweep's floor | 3275 |
+
+Fixed by taking the angle as the sample index times the increment in `f64`,
+which is what `tests/toyos-rust-tests/src/tone.rs` — the program gate A
+captures — already did. **Gate A was therefore never affected**, and neither
+`#88`'s phase-break count nor any recorded baseline moves.
+
+Ruled out by the same measurement: the owner's report that 880 Hz sounds much
+louder than 440 Hz at one volume setting is **not** amplitude. Both peak at
+exactly the same value before and after, both are flat by the same 0.302%, and
+soundd resamples nothing here (the client opens 44100 Hz and the codec runs
+44100 Hz). What is left is the T14's speakers rolling off below ~500 Hz and the
+ear's own sensitivity curve.
+
 ### OPEN, UNASSIGNED — `hda_tone` is red on `main` for a reason `#88`'s exemption does not cover
 
 `cargo test -- hda_tone` on `main` at `6d11938`, alone, 2026-08-07 18:5x:

@@ -1,0 +1,465 @@
+[kernel 0.000 boot] panic console: framebuffer at 0x4000000000 is above the boot map, armed after mm::init
+[kernel 0.000 boot] serial: 16550 loopback read 0xff (absent or wrong port)
+[kernel 0.000 boot] PAT: IA32_PAT=0x0007040100070406, entry 4 = WC
+[kernel 0.000 boot] KernelArgs { memory_map_addr: 1672929304, memory_map_size: 2040, kernel_memory_addr: 1541406720, kernel_memory_size: 11653120, kernel_stack_addr: 3264512, kernel_stack_size: 8388608, rsdp_addr: 2495602708, initrd_addr: 1553387544, initrd_size: 82747392, init_program_addr: 1645157984, init_program_len: 37, kernel_elf_addr: 1636139032, kernel_elf_size: 3828736, gop_framebuffer: 274877906944, gop_framebuffer_size: 8294400, gop_width: 1920, gop_height: 1080, gop_stride: 1920, gop_pixel_format: 1, boot_pml4_addr: 1672876032, boot_partition_start_lba: 2048, boot_partition_blocks: 181120, boot_partition_guid: [64, 230, 134, 205, 128, 79, 202, 79, 150, 253, 143, 187, 129, 102, 108, 80], boot_partition_present: 1, log_partition_guid: [123, 85, 172, 90, 19, 80, 190, 71, 134, 120, 223, 150, 136, 206, 14, 189], rtc_utc_offset_minutes: 0, rtc_utc_offset_known: 0 }
+[kernel 0.000 boot] ACPI: MADT cpus=[0, 2, 4, 6, 1, 3, 5, 7]
+[kernel 0.000 boot] LAPIC: x2APIC enabled (ID 0)
+[kernel 0.000 cpu0] percpu: BSP cpu_id=0 lapic_id=0 smep=on smap=on pcid=on
+[kernel 0.000 cpu0] ioapic: id=2 at 0xfec00000 ver=0x20 gsi 0..119 masked 120/120
+[kernel 0.000 cpu0] ioapic: iso bus:irq->gsi [0:0->2 edge/high, 0:9->9 level/high]
+[kernel 0.000 cpu0] symbols: loaded 5134 kernel symbols
+[kernel 0.000 cpu0] ACPI: HPET at 0xfed00000
+[kernel 0.050 cpu0] TSC: 2419MHz (period=413293fs, calibrated over 50ms)
+[kernel 0.050 cpu0] ACPI: the FADT puts the RTC century register at CMOS 0x32
+[kernel 0.050 cpu0] clock: the RTC reads 2026-08-08 15:31:38; firmware named no zone, so it is taken as UTC
+[kernel 0.060 cpu0] LAPIC timer: 384065 ticks/10ms
+[kernel 0.060 cpu0] Boot: CPU ready (60ms)
+[kernel 0.065 cpu0] ACPI: RSDP at 0x94bfe014
+[kernel 0.065 cpu0] ACPI: MCFG found at 0x8f428000
+[kernel 0.065 cpu0] ACPI: ECAM base address: 0xc0000000
+[kernel 0.065 cpu0] PCI: Enumerating devices...
+[kernel 0.065 cpu0]   PCI 00:00.0 [0600] vendor=8086 device=9a14 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:02.0 [0300] vendor=8086 device=9a49 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:04.0 [1180] vendor=8086 device=9a03 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:06.0 [0604] vendor=8086 device=9a09 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:07.0 [0604] vendor=8086 device=9a25 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:07.2 [0604] vendor=8086 device=9a27 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:0a.0 [1180] vendor=8086 device=9a0d prog_if=00
+[kernel 0.066 cpu0]   PCI 00:0d.0 [0c03] vendor=8086 device=9a13 prog_if=30
+[kernel 0.066 cpu0]   PCI 00:0d.2 [0c03] vendor=8086 device=9a1b prog_if=40
+[kernel 0.066 cpu0]   PCI 00:0d.3 [0c03] vendor=8086 device=9a1d prog_if=40
+[kernel 0.066 cpu0]   PCI 00:14.0 [0c03] vendor=8086 device=a0ed prog_if=30
+[kernel 0.066 cpu0]   PCI 00:14.2 [0500] vendor=8086 device=a0ef prog_if=00
+[kernel 0.066 cpu0]   PCI 00:16.0 [0780] vendor=8086 device=a0e0 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1c.0 [0604] vendor=8086 device=a0b8 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1c.4 [0604] vendor=8086 device=a0bc prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1c.7 [0604] vendor=8086 device=a0bf prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1f.0 [0601] vendor=8086 device=a082 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1f.3 [0403] vendor=8086 device=a0c8 prog_if=80
+[kernel 0.066 cpu0]   PCI 00:1f.4 [0c05] vendor=8086 device=a0a3 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1f.5 [0c80] vendor=8086 device=a0a4 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1f.6 [0200] vendor=8086 device=15fc prog_if=00
+[kernel 0.068 cpu0]   PCI 04:00.0 [0108] vendor=1c5c device=1327 prog_if=02
+[kernel 0.069 cpu0]   PCI 09:00.0 [0280] vendor=8086 device=2725 prog_if=00
+[kernel 0.073 cpu0]   PCI 0a:00.0 [0805] vendor=17a0 device=9750 prog_if=01
+[kernel 0.145 cpu0] PCI: Enumeration complete, 24 functions.
+[kernel 0.145 cpu0] iommu: DMAR haw=39 flags=0x05 intr_remap=y x2apic_opt_out=n dma_ctrl_opt_in=y
+[kernel 0.145 cpu0] iommu: unit0 @0xfed90000 seg=0 pci_all=n ver=4.0 cap=0x01c0000c40660462 ecap=0x0000029a00f0505e aw=48 sagaw=0x04 mgaw=39 nd=256 sps2m=y cm=n psi=n nfr=1 fro=0x400 qi=y ir=y eim=y pt=y coherent=n sc=n
+[kernel 0.145 cpu0] iommu: unit0 scope pci-endpoint 00:02.0 id=0
+[kernel 0.148 cpu0] iommu: identity domain aw=48 covers 0x0..0x45f800000 in 8956 2 MiB leaves
+[kernel 0.148 cpu0] iommu: unit0 @0xfed90000 translating gsts=0xc4000000 tes=y qies=y root=0x1014000 domain=1 aw=48 streams=24
+[kernel 0.148 cpu0] iommu: unit1 @0xfed85000 seg=0 pci_all=n ver=1.0 cap=0x00d2008c40660462 ecap=0x0000000000f050da aw=48 sagaw=0x04 mgaw=39 nd=256 sps2m=y cm=n psi=y nfr=1 fro=0x400 qi=y ir=y eim=y pt=y coherent=n sc=y
+[kernel 0.148 cpu0] iommu: unit1 scope pci-bridge 00:07.0 id=0
+[kernel 0.148 cpu0] iommu: unit1 @0xfed85000 translating gsts=0xc4000000 tes=y qies=y root=0x101b000 domain=1 aw=48 streams=24
+[kernel 0.148 cpu0] iommu: unit2 @0xfed86000 seg=0 pci_all=n ver=1.0 cap=0x00d2008c40660462 ecap=0x0000000000f050da aw=48 sagaw=0x04 mgaw=39 nd=256 sps2m=y cm=n psi=y nfr=1 fro=0x400 qi=y ir=y eim=y pt=y coherent=n sc=y
+[kernel 0.148 cpu0] iommu: unit2 scope pci-bridge 00:07.2 id=0
+[kernel 0.148 cpu0] iommu: unit2 @0xfed86000 translating gsts=0xc4000000 tes=y qies=y root=0x1022000 domain=1 aw=48 streams=24
+[kernel 0.148 cpu0] iommu: unit3 @0xfed91000 seg=0 pci_all=y ver=1.0 cap=0x00d2008c40660462 ecap=0x0000000000f050da aw=48 sagaw=0x04 mgaw=39 nd=256 sps2m=y cm=n psi=y nfr=1 fro=0x400 qi=y ir=y eim=y pt=y coherent=n sc=y
+[kernel 0.148 cpu0] iommu: unit3 scope ioapic 00:1e.7 id=2
+[kernel 0.148 cpu0] iommu: unit3 scope hpet 00:1e.6 id=0
+[kernel 0.148 cpu0] iommu: unit3 @0xfed91000 translating gsts=0xc4000000 tes=y qies=y root=0x1029000 domain=1 aw=48 streams=24
+[kernel 0.148 cpu0] iommu: rmrr0 seg=0 0x000000009c000000..0x00000000a07fffff
+[kernel 0.148 cpu0] iommu: rmrr0 scope pci-endpoint 00:02.0 id=0
+[kernel 0.148 cpu0] file cache: budget 63848 pages (249 MiB)
+[kernel 0.148 cpu0] gpt: the boot volume names 5AAC557B-5013-47BE-8678-DF9688CE0EBD as the log partition
+[kernel 0.148 cpu0] gpt: firmware booted us from partition CD86E640-4F80-4FCA-96FD-8FBB81666C50 at LBA 2048+181120
+[kernel 0.148 cpu0] NVMe: found at PCI 04:00.0
+[kernel 0.148 cpu0] NVMe: BAR0=0xbce00000
+[kernel 0.149 cpu0] NVMe: controller enabled
+[kernel 0.149 cpu0] NVMe: NS1 size=500118192 sectors, sector_size=512
+[kernel 0.149 cpu0] NVMe: block device id=1 blocks=62514774 (244198MB)
+[kernel 0.149 cpu0] gpt: device 1 has 4 partitions and none of them is ours
+[kernel 0.149 cpu0] page cache: 62514774 device blocks, index sized for 7168 cached blocks, cap 4096 slots
+[kernel 0.149 cpu0] storage: no ToyOS volume and no designation stamp at block 0 — this disk is not ours and nothing will be written to it
+[kernel 0.149 cpu0] Boot: storage ready (84ms)
+[kernel 0.161 cpu0] xHCI: found at PCI 00:0d.0
+[kernel 0.161 cpu0] xHCI: BAR0=0x603dbb0000
+[kernel 0.161 cpu0] xHCI: MSI enabled (vector 0x21)
+[kernel 0.161 cpu0] xHCI: max_slots=64 max_ports=5 ctx_size=32 pagesize=0x1
+[kernel 0.161 cpu0] xHCI: dma 2048 KiB: scratchpad=34 device blocks=64 of 12288 B (max_slots=64)
+[kernel 0.161 cpu0] xHCI: firmware did not claim the controller (USBLEGSUP 0x01002201)
+[kernel 0.161 cpu0] xHCI: USBLEGCTLSTS 0xe0000000 -> 0x00000000 (SMI generation off)
+[kernel 0.161 cpu0] xHCI: USB 2.0 on ports 1..=1
+[kernel 0.161 cpu0] xHCI: USB 3.1 on ports 2..=5
+[kernel 0.161 cpu0] xHCI: 1 USB2 and 4 USB3 port register(s) of 5 named, 0 capability(ies) refused
+[kernel 0.161 cpu0] xHCI: controller reset
+[kernel 0.161 cpu0] xHCI: 34 scratchpad buffers configured
+[kernel 0.161 cpu0] xHCI: controller started
+[kernel 0.161 cpu0] xHCI: 5/5 root-hub ports powered (PPC=0)
+[kernel 0.161 cpu0] xHCI: found at PCI 00:14.0
+[kernel 0.161 cpu0] xHCI: BAR0=0x603dba0000
+[kernel 0.161 cpu0] xHCI: MSI enabled (vector 0x21)
+[kernel 0.161 cpu0] xHCI: max_slots=64 max_ports=16 ctx_size=32 pagesize=0x1
+[kernel 0.161 cpu0] xHCI: dma 2048 KiB: scratchpad=34 device blocks=64 of 12288 B (max_slots=64)
+[kernel 0.161 cpu0] xHCI: firmware did not claim the controller (USBLEGSUP 0x01002201)
+[kernel 0.161 cpu0] xHCI: USBLEGCTLSTS 0xe0000000 -> 0x00000000 (SMI generation off)
+[kernel 0.161 cpu0] xHCI: USB 2.0 on ports 1..=12
+[kernel 0.161 cpu0] xHCI: USB 3.1 on ports 13..=16
+[kernel 0.161 cpu0] xHCI: 12 USB2 and 4 USB3 port register(s) of 16 named, 0 capability(ies) refused
+[kernel 0.161 cpu0] xHCI: controller reset
+[kernel 0.161 cpu0] xHCI: 34 scratchpad buffers configured
+[kernel 0.161 cpu0] xHCI: controller started
+[kernel 0.162 cpu0] xHCI: 16/16 root-hub ports powered (PPC=0)
+[kernel 0.283 cpu0] xHCI: no HID devices on the controller at 00:0d.0
+[kernel 0.283 cpu0] xHCI: port 3 connected
+[kernel 0.338 cpu0] xHCI: port 3 enabled, speed=1
+[kernel 0.338 cpu0] xHCI: slot 1 enabled (dma +0x50000)
+[kernel 0.339 cpu0] xHCI: device addressed
+[kernel 0.339 cpu0] xHCI: device class=0xff vendor=06cb product=00bd
+[kernel 0.339 cpu0] xHCI: no HID boot interface found on port 3, skipping it
+[kernel 0.339 cpu0] xHCI: port 4 connected
+[kernel 0.394 cpu0] xHCI: port 4 enabled, speed=3
+[kernel 0.394 cpu0] xHCI: slot 2 enabled (dma +0x53000)
+[kernel 0.394 cpu0] xHCI: device addressed
+[kernel 0.395 cpu0] xHCI: device class=0xef vendor=13d3 product=5406
+[kernel 0.395 cpu0] xHCI: no HID boot interface found on port 4, skipping it
+[kernel 0.395 cpu0] xHCI: port 6 connected
+[kernel 0.483 cpu0] xHCI: port 6 enabled, speed=3
+[kernel 0.483 cpu0] xHCI: slot 3 enabled (dma +0x56000)
+[kernel 0.545 cpu0] xHCI: device addressed
+[kernel 0.545 cpu0] xHCI: device class=0x0 vendor=0781 product=5581
+[kernel 0.545 cpu0] xHCI: mass storage iface=0 in=0x81/512 out=0x2/512
+[kernel 0.545 cpu0] xHCI: configuration set
+[kernel 0.545 cpu0] xHCI: endpoint configured
+[kernel 0.546 cpu0] usb-storage: slot 3 vendor "SanDisk." product "Ultra..........."
+[kernel 0.546 cpu0] usb-storage: disk 0 ready on slot 3, 7507812 blocks of 512 B (29327 MiB), msc_block +0x30000
+[kernel 0.546 cpu0] xHCI: port 9 connected
+[kernel 0.601 cpu0] xHCI: port 9 enabled, speed=1
+[kernel 0.601 cpu0] xHCI: slot 4 enabled (dma +0x59000)
+[kernel 0.602 cpu0] xHCI: device addressed
+[kernel 0.603 cpu0] xHCI: device class=0x0 vendor=058f product=9540
+[kernel 0.608 cpu0] xHCI: no HID boot interface found on port 9, skipping it
+[kernel 0.608 cpu0] xHCI: port 10 connected
+[kernel 0.663 cpu0] xHCI: port 10 enabled, speed=1
+[kernel 0.663 cpu0] xHCI: slot 5 enabled (dma +0x5c000)
+[kernel 0.663 cpu0] xHCI: device addressed
+[kernel 0.663 cpu0] xHCI: port 10 EP0 packet size 8 -> 64
+[kernel 0.663 cpu0] xHCI: device class=0xe0 vendor=8087 product=0032
+[kernel 0.663 cpu0] xHCI: no HID boot interface found on port 10, skipping it
+[kernel 0.663 cpu0] xHCI: no HID devices on the controller at 00:14.0
+[kernel 0.663 cpu0] xHCI: 2 controller(s), 0 HID device(s)
+[kernel 0.663 cpu0] usb-storage: 1 device(s)
+[kernel 0.676 cpu0] gpt: device 16 carries the log partition 5AAC557B-5013-47BE-8678-DF9688CE0EBD at LBA 184320+69632, entry 1 of 2
+[kernel 0.676 cpu0] gpt: device 16 carries the boot partition at LBA 2048+181120 (512-byte blocks), entry 0 of 2 on disk 5D4C948F-725A-46FD-AC2B-646C391876C7
+[kernel 0.676 cpu0] i8042: FADT rev 6 iapc_boot_arch=0x0011, bit 1 (8042) clear — probing either way
+[kernel 0.677 cpu0] i8042: ok selftest=0x55 cfg=0x77->0x64 port1=ok port2=ok
+[kernel 0.677 cpu0] i8042: kbd will not report its scancode set (0xF0 0x00 answered 0xee); firmware's own cfg 0x77 has translate on, so the wire is set 1
+[kernel 1.069 cpu0] i8042: kbd set2+xlat (assumed, the set query was refused) scanning on, GSI 1 -> vec 0x24 apic 0 on
+[kernel 1.069 cpu0] i8042: aux rate=100 res=8/mm, GSI 12 -> vec 0x24 apic 0
+[kernel 1.070 cpu0] ACPI: PM1a=0x1804 SLP_TYPa=7
+[kernel 1.070 cpu0] Boot: peripherals ready (909ms)
+[kernel 1.092 cpu0] SMP: AP cpu1 lapic=2 online
+[kernel 1.104 cpu0] SMP: AP cpu2 lapic=4 online
+[kernel 1.116 cpu0] SMP: AP cpu3 lapic=6 online
+[kernel 1.129 cpu0] SMP: AP cpu4 lapic=1 online
+[kernel 1.141 cpu0] SMP: AP cpu5 lapic=3 online
+[kernel 1.153 cpu0] SMP: AP cpu6 lapic=5 online
+[kernel 1.165 cpu0] SMP: AP cpu7 lapic=7 online
+[kernel 1.165 cpu0] storage: /home is a tmpfs — it will not survive a reboot
+[kernel 1.166 cpu0] boot-volume: partition mounted, 92733440 bytes of a 92733440-byte partition at device offset 1048576, 512-byte sectors, 512-byte clusters, 178324 clusters
+[kernel 1.166 cpu0] log-volume: partition mounted, 35651584 bytes of a 35651584-byte partition at device offset 94371840, 512-byte sectors, 512-byte clusters, 68552 clusters
+[kernel 1.173 cpu0] log-file: this boot's kernel log is /log/2026-08-08-153139.log
+[kernel 1.173 cpu0] Boot: subsystems ready (93ms)
+[kernel 1.187 cpu0] virtio-console: no device found
+[kernel 1.190 cpu0] VirtIO net: no device found
+[kernel 1.199 cpu0] hda: 00:1f.3 8086:a0c8 version 1.0 gcap=0x9701 statests=0x0005
+[kernel 1.199 cpu0] hda: 00:1f.3 bound, statests=0x0005, output stream 7 at 0x160, tag 1, 8 periods of 512 bytes
+[kernel 1.203 cpu0] GPU: using UEFI GOP
+[kernel 1.203 cpu0] GOP: 1920x1080 stride=1920 format=1 at 0x4000000000 tokens=[SharedToken(2), SharedToken(3)]
+[kernel 1.203 cpu0] GOP: scanout memory type WC (MTRR UC, PAT entry 4)
+[kernel 1.203 cpu0] mouse: rel scale x=36 y=64 (screen 1920x1080)
+[kernel 1.203 cpu0] Boot: devices ready (20ms)
+[kernel 1.215 cpu0] ELF: 9110 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 1.215 cpu0] spawn: TLS 1 modules, total_memsz=144
+[kernel 1.216 cpu0] spawn: /bin/compositor pid=0 tid=0 base=0x10000000000 entry=0x100001e81e4 cr3=0x1e24000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=2ms)
+[kernel 1.216 cpu0] spawned /bin/compositor pid=0
+[kernel 1.217 cpu0] ELF: 3162 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 1.217 cpu0] spawn: TLS 1 modules, total_memsz=144
+[kernel 1.217 cpu0] spawn: /bin/soundd pid=1 tid=0 base=0x10000000000 entry=0x10000038b04 cr3=0xdf9000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=0ms total=1ms)
+[kernel 1.217 cpu0] spawned /bin/soundd pid=1
+[kernel 1.218 cpu0] ELF: 3167 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 1.218 cpu0] spawn: TLS 1 modules, total_memsz=144
+[kernel 1.218 cpu0] spawn: /bin/netd pid=2 tid=0 base=0x10000000000 entry=0x1000003a0a4 cr3=0x1e57000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=0ms total=1ms)
+[kernel 1.218 cpu0] spawned /bin/netd pid=2
+[kernel 1.218 cpu0] log: no serial console - this boot is in /log/2026-08-08-153139.log and on the screen
+[kernel 1.218 cpu0] Boot: complete (1218ms)
+[kernel 1.228 cpu4] CPU 4: joining scheduler
+[kernel 1.228 cpu5] CPU 5: joining scheduler
+[kernel 1.228 cpu1] CPU 1: joining scheduler
+[kernel 1.228 cpu0] sched: cpu=0 ready=0 parked=0 current=None
+[kernel 1.228 cpu4] sched: cpu=4 ready=0 parked=0 current=None
+[kernel 1.228 cpu2] CPU 2: joining scheduler
+[kernel 1.228 cpu7] CPU 7: joining scheduler
+[kernel 1.228 cpu6] CPU 6: joining scheduler
+[kernel 1.228 cpu3] CPU 3: joining scheduler
+[kernel 1.228 cpu1] sched: cpu=1 ready=0 parked=0 current=None
+[kernel 1.228 cpu5] sched: cpu=5 ready=0 parked=0 current=None
+[kernel 1.228 cpu7] sched: cpu=7 ready=0 parked=0 current=None
+[kernel 1.228 cpu3] sched: cpu=3 ready=0 parked=0 current=None
+[kernel 1.228 cpu6] sched: cpu=6 ready=0 parked=0 current=None
+[kernel 1.228 cpu2] sched: cpu=2 ready=0 parked=0 current=None
+[kernel 1.228 cpu3] i8042: armed at 1069ms, idle at 1228ms, 0 interrupts — the pin has never asserted (kbd GSI 1, aux GSI 12)
+netd: no NIC on this machine, exiting
+[kernel 1.229 cpu2 tid=0] syscalls: pid=2 total=7 syscall_wall=0ms 0=1 6=1 31=1 63=1
+[kernel 1.229 cpu2 tid=0] memory: pid=2 peak=2MB allocs=2 frees=0
+[kernel 1.229 cpu2 tid=0] exit: netd pid=2 code=0 cpu=1ms
+soundd: hda codec0 vendor=10ec device=0257, 1 function group(s)
+soundd: hda codec2 vendor=8086 device=2812, 1 function group(s)
+soundd: hda codec0 group 0x01 converter 0x02 -> pin 0x14 (speaker), headphone 0x21, format 0x2011 (44100 Hz 2 ch 16-bit)
+soundd: hda path configured in 14 verbs, stream tag 1
+soundd: ready, 8 buffers, 44100Hz 2ch, 512 bytes/period, 128 frames/period
+soundd: suspended
+[kernel 1.387 cpu0] usb-storage: disk 0 does not implement SYNCHRONIZE CACHE (sense 0x05/0x20/0x00); its writes are durable once they complete
+[kernel 1.388 cpu0 tid=0] shm: 0x4000000000 mapped WriteCombining into pid 0
+compositor: wallpaper 1920x1080, scaling to 1920x1080
+compositor: at most 221 windows (8 MiB each of 15962 MiB total)
+compositor: ready
+[kernel 1.528 cpu0 tid=0] ELF: 3548 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 1.528 cpu0 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 1.529 cpu0 tid=0] spawn: /bin/filepicker pid=3 tid=0 base=0x10000000000 entry=0x10000017df4 cr3=0x1e57000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=1ms)
+[kernel 3.523 cpu0] i8042: 1 interrupts and 1 bytes, nothing decoded — first seen at 3523ms
+[kernel 3.569 cpu0] i8042: the pin asserts — 12 interrupts, 12 bytes, 0 keys, 4 motion, first seen at 3523ms
+compositor: frames=3 rects=5 damage_px=2093344 damage_px_max=2073600 composite_us_min=68 composite_us_max=2985 composite_us_total=3150 scanout_wr_bytes=8373376 scanout_blits=5 back_rd_bytes=325224 cursor=2 windows=0
+[kernel 4.684 cpu0 tid=0] ELF: 3609 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 4.684 cpu0 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 4.684 cpu0 tid=0] spawn: /bin/terminal pid=4 tid=0 base=0x10000000000 entry=0x1000001ec28 cr3=0x1ec6000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=1ms)
+[kernel 4.726 cpu5 tid=0] ELF: 2771 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 4.726 cpu5 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 4.727 cpu5 tid=0] spawn: /bin/shell pid=5 tid=0 base=0x10000000000 entry=0x1000001d93c cr3=0x1ec2000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=0ms total=1ms)
+terminal: ready
+compositor: frames=35 rects=42 damage_px=3608962 damage_px_max=1842560 composite_us_min=6 composite_us_max=3152 composite_us_total=6755 scanout_wr_bytes=14435848 scanout_blits=42 back_rd_bytes=796400 cursor=32 windows=1
+compositor: frames=10 rects=10 damage_px=20992 damage_px_max=9472 composite_us_min=7 composite_us_max=69 composite_us_total=202 scanout_wr_bytes=83968 scanout_blits=10 back_rd_bytes=75768 cursor=0 windows=1
+compositor: frames=3 rects=3 damage_px=19200 damage_px_max=9472 composite_us_min=7 composite_us_max=70 composite_us_total=144 scanout_wr_bytes=76800 scanout_blits=3 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 11.238 cpu0] sched: cpu=0 ready=0 parked=1 current=None
+[kernel 11.238 cpu0] PMM: 178/15962MB used (7892 pages free)
+[kernel 11.238 cpu0]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 11.238 cpu0]   demand-page  alloc=     7 free=     1 held=     6 (12MB) rate=0/s
+[kernel 11.238 cpu0]   mmap         alloc=    27 free=     1 held=    26 (52MB) rate=0/s
+[kernel 11.238 cpu0]   shared-mem   alloc=     9 free=     0 held=     9 (18MB) rate=0/s
+[kernel 11.238 cpu0]   pipe         alloc=     4 free=     0 held=     4 (8MB) rate=0/s
+[kernel 11.238 cpu0]   elf          alloc=     6 free=     1 held=     5 (10MB) rate=0/s
+[kernel 11.238 cpu0]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 11.238 cpu0]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 11.238 cpu0]   stack        alloc=    24 free=     4 held=    20 (40MB) rate=0/s
+[kernel 11.238 cpu0]   init-tls     alloc=     7 free=     1 held=     6 (12MB) rate=0/s
+[kernel 11.338 cpu5] sched: cpu=5 ready=0 parked=1 current=None
+[kernel 11.359 cpu6] sched: cpu=6 ready=0 parked=1 current=None
+compositor: frames=7 rects=7 damage_px=20224 damage_px_max=9472 composite_us_min=7 composite_us_max=82 composite_us_total=200 scanout_wr_bytes=80896 scanout_blits=7 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 13.582 cpu0] i8042: 150 interrupts, 150 bytes, 39 keys, 37 motion, 0 undecoded, 0 discarded, 0 overruns, 0 dropped, 0 lost edges — last byte at 13565ms
+compositor: frames=5 rects=5 damage_px=19712 damage_px_max=9472 composite_us_min=7 composite_us_max=74 composite_us_total=171 scanout_wr_bytes=78848 scanout_blits=5 back_rd_bytes=75768 cursor=0 windows=1
+/home/root> tone 440 10 0.1 01
+[kernel 14.324 cpu6 tid=0] ELF: 3554 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 14.324 cpu6 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 14.324 cpu6 tid=0] spawn: /bin/tone pid=6 tid=0 base=0x10000000000 entry=0x1000002d4f4 cr3=0x1f53000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=1ms)
+[kernel 14.324 cpu7] sched: cpu=7 ready=0 parked=0 current=None
+[kernel 14.325 cpu3] sched: cpu=3 ready=0 parked=1 current=None
+soundd: opening stream: 44100Hz 2ch fmt=0
+tone: 440Hz for 10s at amplitude 327
+[kernel 14.325 cpu1] sched: cpu=1 ready=0 parked=1 current=None
+soundd: client 0 connected (id=0)
+soundd: resumed
+compositor: frames=4 rects=4 damage_px=35584 damage_px_max=9472 composite_us_min=27 composite_us_max=65 composite_us_total=189 scanout_wr_bytes=142336 scanout_blits=4 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1097 completions=750 submitted=758 underruns=19 drains=0 max_wake_lat_us=1307 max_batch=2 clients=1 deferred=0
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=58 composite_us_max=58 composite_us_total=116 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1076 completions=751 submitted=751 underruns=15 drains=0 max_wake_lat_us=506 max_batch=1 clients=1 deferred=0
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=58 composite_us_max=68 composite_us_total=126 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1081 completions=750 submitted=750 underruns=12 drains=0 max_wake_lat_us=514 max_batch=1 clients=1 deferred=0
+[kernel 21.241 cpu0] sched: cpu=0 ready=0 parked=2 current=None
+[kernel 21.241 cpu0] PMM: 212/15962MB used (7875 pages free)
+[kernel 21.241 cpu0]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 21.241 cpu0]   demand-page  alloc=     8 free=     1 held=     7 (14MB) rate=0/s
+[kernel 21.241 cpu0]   mmap         alloc=    30 free=     1 held=    29 (58MB) rate=0/s
+[kernel 21.241 cpu0]   shared-mem   alloc=    10 free=     0 held=    10 (20MB) rate=0/s
+[kernel 21.241 cpu0]   pipe         alloc=     9 free=     0 held=     9 (18MB) rate=0/s
+[kernel 21.241 cpu0]   elf          alloc=     7 free=     1 held=     6 (12MB) rate=0/s
+[kernel 21.241 cpu0]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 21.241 cpu0]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 21.241 cpu0]   stack        alloc=    28 free=     4 held=    24 (48MB) rate=0/s
+[kernel 21.241 cpu0]   init-tls     alloc=     9 free=     1 held=     8 (16MB) rate=0/s
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=57 composite_us_max=58 composite_us_total=116 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1072 completions=745 submitted=745 underruns=2 drains=1 max_wake_lat_us=39411 max_batch=8 clients=1 deferred=0
+[kernel 23.582 cpu1] i8042: 153 interrupts, 153 bytes, 42 keys, 37 motion, 0 undecoded, 0 discarded, 0 overruns, 0 dropped, 0 lost edges — last byte at 14387ms
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=58 composite_us_max=60 composite_us_total=118 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 23.741 cpu5] sched: cpu=5 ready=0 parked=1 current=None
+[kernel 23.742 cpu4] sched: cpu=4 ready=0 parked=1 current=None
+[kernel 23.742 cpu6] sched: cpu=6 ready=0 parked=1 current=None
+[kernel 23.742 cpu0 tid=1] exit: tone tid=1 code=0 cpu=45ms
+[kernel 23.742 cpu2] sched: cpu=2 ready=0 parked=0 current=None
+[kernel 23.742 cpu7 tid=0] syscalls: pid=6 total=31 syscall_wall=9417ms 0=12 1=2 6=1 8=1 38=1 40=1 41=1 49=1 58=1 59=2 63=2
+[kernel 23.742 cpu7 tid=0] memory: pid=6 peak=6MB allocs=3 frees=0
+[kernel 23.742 cpu7 tid=0] exit: tone pid=6 code=0 cpu=1ms
+soundd: client 0 removed
+soundd: wakes=762 completions=530 submitted=530 underruns=0 drains=0 max_wake_lat_us=14121 max_batch=6 clients=0 deferred=0
+/home/root> tone: done
+soundd: suspended
+compositor: frames=4 rects=4 damage_px=26240 damage_px_max=9472 composite_us_min=14 composite_us_max=77 composite_us_total=207 scanout_wr_bytes=104960 scanout_blits=4 back_rd_bytes=75768 cursor=0 windows=1
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=67 composite_us_max=69 composite_us_total=137 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+compositor: frames=7 rects=7 damage_px=24064 damage_px_max=9472 composite_us_min=7 composite_us_max=67 composite_us_total=180 scanout_wr_bytes=96256 scanout_blits=7 back_rd_bytes=75768 cursor=0 windows=1
+tone 440 10 0.011                f
+f: not found
+[kernel 31.253 cpu0] sched: cpu=0 ready=0 parked=1 current=None
+[kernel 31.253 cpu0] PMM: 182/15962MB used (7890 pages free)
+[kernel 31.253 cpu0]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 31.253 cpu0]   demand-page  alloc=     8 free=     2 held=     6 (12MB) rate=0/s
+[kernel 31.253 cpu0]   mmap         alloc=    30 free=     4 held=    26 (52MB) rate=0/s
+[kernel 31.253 cpu0]   shared-mem   alloc=    10 free=     1 held=     9 (18MB) rate=0/s
+[kernel 31.253 cpu0]   pipe         alloc=     9 free=     3 held=     6 (12MB) rate=0/s
+[kernel 31.253 cpu0]   elf          alloc=     7 free=     2 held=     5 (10MB) rate=0/s
+[kernel 31.253 cpu0]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 31.253 cpu0]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 31.253 cpu0]   stack        alloc=    28 free=     8 held=    20 (40MB) rate=0/s
+[kernel 31.253 cpu0]   init-tls     alloc=     9 free=     3 held=     6 (12MB) rate=0/s
+compositor: frames=8 rects=8 damage_px=26880 damage_px_max=9472 composite_us_min=7 composite_us_max=80 composite_us_total=240 scanout_wr_bytes=107520 scanout_blits=8 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 33.591 cpu0] i8042: 187 interrupts, 187 bytes, 62 keys, 37 motion, 0 undecoded, 0 discarded, 0 overruns, 0 dropped, 0 lost edges — last byte at 32055ms
+compositor: frames=4 rects=4 damage_px=19456 damage_px_max=9472 composite_us_min=7 composite_us_max=77 composite_us_total=163 scanout_wr_bytes=77824 scanout_blits=4 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 33.826 cpu5] sched: cpu=5 ready=0 parked=1 current=None
+[kernel 33.910 cpu6] sched: cpu=6 ready=0 parked=1 current=None
+/home/root> ftone 440 10 0.011  10
+[kernel 35.350 cpu6 tid=0] ELF: 3554 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 35.350 cpu6 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 35.351 cpu6 tid=0] spawn: /bin/tone pid=7 tid=0 base=0x10000000000 entry=0x1000002d4f4 cr3=0x1f66000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=1ms)
+[kernel 35.351 cpu1] sched: cpu=1 ready=0 parked=1 current=None
+[kernel 35.351 cpu3] sched: cpu=3 ready=0 parked=1 current=None
+soundd: opening stream: 44100Hz 2ch fmt=0
+tone: 440Hz for 10s at amplitude 3276
+[kernel 35.352 cpu2] sched: cpu=2 ready=0 parked=0 current=None
+soundd: client 0 connected (id=1)
+soundd: resumed
+compositor: frames=13 rects=13 damage_px=38784 damage_px_max=9472 composite_us_min=7 composite_us_max=67 composite_us_total=303 scanout_wr_bytes=155136 scanout_blits=13 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1082 completions=750 submitted=758 underruns=0 drains=0 max_wake_lat_us=2670 max_batch=1 clients=1 deferred=0
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=58 composite_us_max=60 composite_us_total=119 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1070 completions=751 submitted=751 underruns=0 drains=0 max_wake_lat_us=10723 max_batch=5 clients=1 deferred=0
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=58 composite_us_max=58 composite_us_total=116 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 41.253 cpu0] sched: cpu=0 ready=0 parked=1 current=None
+[kernel 41.253 cpu1] PMM: 212/15962MB used (7875 pages free)
+[kernel 41.253 cpu1]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 41.253 cpu1]   demand-page  alloc=     9 free=     2 held=     7 (14MB) rate=0/s
+[kernel 41.253 cpu1]   mmap         alloc=    33 free=     4 held=    29 (58MB) rate=0/s
+[kernel 41.253 cpu1]   shared-mem   alloc=    11 free=     1 held=    10 (20MB) rate=0/s
+[kernel 41.253 cpu1]   pipe         alloc=    12 free=     3 held=     9 (18MB) rate=0/s
+[kernel 41.253 cpu1]   elf          alloc=     8 free=     2 held=     6 (12MB) rate=0/s
+[kernel 41.253 cpu1]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 41.253 cpu1]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 41.253 cpu1]   stack        alloc=    32 free=     8 held=    24 (48MB) rate=0/s
+[kernel 41.253 cpu1]   init-tls     alloc=    11 free=     3 held=     8 (16MB) rate=0/s
+soundd: wakes=1029 completions=738 submitted=738 underruns=0 drains=1 max_wake_lat_us=55391 max_batch=8 clients=1 deferred=0
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=58 composite_us_max=58 composite_us_total=116 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1057 completions=746 submitted=746 underruns=0 drains=1 max_wake_lat_us=30950 max_batch=8 clients=1 deferred=0
+[kernel 43.591 cpu0] i8042: 225 interrupts, 225 bytes, 82 keys, 37 motion, 0 undecoded, 0 discarded, 0 overruns, 0 dropped, 0 lost edges — last byte at 35389ms
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=58 composite_us_max=58 composite_us_total=116 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 44.667 cpu5] sched: cpu=5 ready=0 parked=1 current=None
+[kernel 44.668 cpu6] sched: cpu=6 ready=0 parked=1 current=None
+[kernel 44.668 cpu4] sched: cpu=4 ready=0 parked=1 current=None
+[kernel 44.668 cpu2 tid=1] exit: tone tid=1 code=0 cpu=92ms
+[kernel 44.668 cpu7] sched: cpu=7 ready=0 parked=0 current=None
+[kernel 44.669 cpu1 tid=0] syscalls: pid=7 total=31 syscall_wall=9317ms 0=12 1=2 6=1 8=1 38=1 40=1 41=1 49=1 58=1 59=2 63=2
+[kernel 44.669 cpu1 tid=0] memory: pid=7 peak=6MB allocs=3 frees=0
+[kernel 44.669 cpu1 tid=0] exit: tone pid=7 code=0 cpu=1ms
+soundd: client 1 removed
+soundd: wakes=688 completions=486 submitted=486 underruns=0 drains=1 max_wake_lat_us=39194 max_batch=8 clients=0 deferred=0
+/home/root> tone: done
+soundd: suspended
+compositor: frames=4 rects=4 damage_px=26240 damage_px_max=9472 composite_us_min=15 composite_us_max=72 composite_us_total=201 scanout_wr_bytes=104960 scanout_blits=4 back_rd_bytes=75768 cursor=0 windows=1
+ps
+[kernel 47.300 cpu6 tid=0] ELF: 3554 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 47.300 cpu6 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 47.301 cpu6 tid=0] spawn: /bin/ps pid=8 tid=0 base=0x10000000000 entry=0x1000002d4f4 cr3=0x1f4b000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=0ms total=1ms)
+[kernel 47.301 cpu3] sched: cpu=3 ready=0 parked=1 current=None
+[kernel 47.301 cpu3 tid=0] syscalls: pid=8 total=15 syscall_wall=0ms 0=8 6=1 45=1 63=1
+[kernel 47.301 cpu3 tid=0] memory: pid=8 peak=2MB allocs=2 frees=0
+[kernel 47.301 cpu3 tid=0] exit: ps pid=8 code=0 cpu=0ms
+[kernel 47.301 cpu1] sched: cpu=1 ready=0 parked=1 current=None
+[kernel 47.301 cpu2] sched: cpu=2 ready=0 parked=0 current=None
+  PID TID  PPID  S      CPU  %CPU   MEM  NAME
+    0   0     0  S    0.213    0%   32M  compositor
+    1   0     0  S    0.307    0%    8M  soundd
+    1   1     0  S    0.001    0%    8M  soundd-ctrl (thread)
+    3   0     0  S    0.000    0%    4M  filepicker
+    4   0     0  S    0.065    0%   16M  terminal
+    5   0     4  S    0.049    0%    4M  shell
+    8   0     5  R    0.000    0%    4M  ps
+compositor: frames=8 rects=8 damage_px=93568 damage_px_max=39040 composite_us_min=7 composite_us_max=106 composite_us_total=395 scanout_wr_bytes=374272 scanout_blits=8 back_rd_bytes=75768 cursor=0 windows=1
+compositor: frames=21 rects=33 damage_px=32888 damage_px_max=9472 composite_us_min=6 composite_us_max=84 composite_us_total=423 scanout_wr_bytes=131552 scanout_blits=33 back_rd_bytes=83672 cursor=19 windows=1
+[kernel 51.257 cpu0] sched: cpu=0 ready=0 parked=1 current=None
+[kernel 51.257 cpu0] PMM: 182/15962MB used (7890 pages free)
+[kernel 51.257 cpu0]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 51.257 cpu0]   demand-page  alloc=    10 free=     4 held=     6 (12MB) rate=0/s
+[kernel 51.257 cpu0]   mmap         alloc=    34 free=     8 held=    26 (52MB) rate=0/s
+[kernel 51.257 cpu0]   shared-mem   alloc=    11 free=     2 held=     9 (18MB) rate=0/s
+[kernel 51.257 cpu0]   pipe         alloc=    12 free=     6 held=     6 (12MB) rate=0/s
+[kernel 51.257 cpu0]   elf          alloc=     9 free=     4 held=     5 (10MB) rate=0/s
+[kernel 51.257 cpu0]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 51.257 cpu0]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 51.257 cpu0]   stack        alloc=    36 free=    16 held=    20 (40MB) rate=0/s
+[kernel 51.257 cpu0]   init-tls     alloc=    12 free=     6 held=     6 (12MB) rate=0/s
+compositor: frames=12 rects=12 damage_px=21504 damage_px_max=9472 composite_us_min=7 composite_us_max=67 composite_us_total=218 scanout_wr_bytes=86016 scanout_blits=12 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 53.593 cpu0] i8042: 324 interrupts, 324 bytes, 124 keys, 56 motion, 0 undecoded, 0 discarded, 0 overruns, 0 dropped, 0 lost edges — last byte at 53560ms
+compositor: frames=10 rects=10 damage_px=20992 damage_px_max=9472 composite_us_min=7 composite_us_max=71 composite_us_total=206 scanout_wr_bytes=83968 scanout_blits=10 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 54.833 cpu5] sched: cpu=5 ready=0 parked=1 current=None
+[kernel 54.859 cpu6] sched: cpu=6 ready=0 parked=1 current=None
+compositor: frames=6 rects=6 damage_px=19968 damage_px_max=9472 composite_us_min=7 composite_us_max=72 composite_us_total=177 scanout_wr_bytes=79872 scanout_blits=6 back_rd_bytes=75768 cursor=0 windows=1
+compositor: frames=11 rects=11 damage_px=23040 damage_px_max=9472 composite_us_min=7 composite_us_max=81 composite_us_total=230 scanout_wr_bytes=92160 scanout_blits=11 back_rd_bytes=75768 cursor=0 windows=1
+/home/root> shutdon wn        topstopstopstone 440 10 0.10 10 0.1 0 10 0.1 80 10 0.180 10 0.1
+[kernel 59.145 cpu6 tid=0] ELF: 3554 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 59.145 cpu6 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 59.145 cpu6 tid=0] spawn: /bin/tone pid=9 tid=0 base=0x10000000000 entry=0x1000002d4f4 cr3=0x1f4c000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=1ms)
+[kernel 59.145 cpu4] sched: cpu=4 ready=0 parked=1 current=None
+[kernel 59.146 cpu3] sched: cpu=3 ready=0 parked=1 current=None
+soundd: opening stream: 44100Hz 2ch fmt=0
+tone: 880Hz for 10s at amplitude 3276
+[kernel 59.146 cpu1] sched: cpu=1 ready=0 parked=1 current=None
+soundd: client 0 connected (id=2)
+soundd: resumed
+compositor: frames=9 rects=9 damage_px=38400 damage_px_max=9472 composite_us_min=6 composite_us_max=79 composite_us_total=276 scanout_wr_bytes=153600 scanout_blits=9 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1089 completions=750 submitted=758 underruns=2 drains=0 max_wake_lat_us=1128 max_batch=1 clients=1 deferred=0
+[kernel 61.257 cpu1] PMM: 212/15962MB used (7875 pages free)
+[kernel 61.257 cpu1]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 61.257 cpu1]   demand-page  alloc=    11 free=     4 held=     7 (14MB) rate=0/s
+[kernel 61.257 cpu1]   mmap         alloc=    37 free=     8 held=    29 (58MB) rate=0/s
+[kernel 61.257 cpu1]   shared-mem   alloc=    12 free=     2 held=    10 (20MB) rate=0/s
+[kernel 61.257 cpu1]   pipe         alloc=    15 free=     6 held=     9 (18MB) rate=0/s
+[kernel 61.257 cpu1]   elf          alloc=    10 free=     4 held=     6 (12MB) rate=0/s
+[kernel 61.257 cpu1]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 61.257 cpu1]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 61.257 cpu1]   stack        alloc=    40 free=    16 held=    24 (48MB) rate=0/s
+[kernel 61.257 cpu1]   init-tls     alloc=    14 free=     6 held=     8 (16MB) rate=0/s
+[kernel 61.257 cpu0] sched: cpu=0 ready=0 parked=1 current=None
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=58 composite_us_max=69 composite_us_total=128 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1053 completions=734 submitted=734 underruns=0 drains=1 max_wake_lat_us=63225 max_batch=8 clients=1 deferred=0
+[kernel 63.595 cpu1] i8042: 396 interrupts, 396 bytes, 168 keys, 56 motion, 0 undecoded, 0 discarded, 0 overruns, 0 dropped, 0 lost edges — last byte at 59183ms
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=57 composite_us_max=58 composite_us_total=116 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 64.835 cpu5] sched: cpu=5 ready=0 parked=2 current=None
+soundd: wakes=1103 completions=751 submitted=751 underruns=26 drains=0 max_wake_lat_us=494 max_batch=1 clients=1 deferred=0
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=57 composite_us_max=58 composite_us_total=116 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+soundd: wakes=1089 completions=750 submitted=750 underruns=4 drains=0 max_wake_lat_us=485 max_batch=1 clients=1 deferred=0
+compositor: frames=2 rects=2 damage_px=18944 damage_px_max=9472 composite_us_min=58 composite_us_max=59 composite_us_total=117 scanout_wr_bytes=75776 scanout_blits=2 back_rd_bytes=75768 cursor=0 windows=1
+tone: done
+[kernel 68.565 cpu5 tid=1] exit: tone tid=1 code=0 cpu=39ms
+[kernel 68.565 cpu7] sched: cpu=7 ready=0 parked=0 current=None
+[kernel 68.565 cpu2] sched: cpu=2 ready=0 parked=0 current=None
+[kernel 68.565 cpu6] sched: cpu=6 ready=0 parked=1 current=None
+[kernel 68.565 cpu4 tid=0] syscalls: pid=9 total=31 syscall_wall=9419ms 0=12 1=2 6=1 8=1 38=1 40=1 41=1 49=1 58=1 59=2 63=2
+[kernel 68.565 cpu4 tid=0] memory: pid=9 peak=6MB allocs=3 frees=0
+[kernel 68.565 cpu4 tid=0] exit: tone pid=9 code=0 cpu=1ms
+soundd: client 2 removed
+soundd: wakes=780 completions=533 submitted=533 underruns=8 drains=0 max_wake_lat_us=498 max_batch=1 clients=0 deferred=0
+soundd: suspended
+compositor: frames=5 rects=5 damage_px=23424 damage_px_max=9472 composite_us_min=8 composite_us_max=70 composite_us_total=190 scanout_wr_bytes=93696 scanout_blits=5 back_rd_bytes=75768 cursor=0 windows=1
+[kernel 71.262 cpu0] sched: cpu=0 ready=0 parked=1 current=None
+[kernel 71.262 cpu0] PMM: 182/15962MB used (7890 pages free)
+[kernel 71.262 cpu0]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 71.262 cpu0]   demand-page  alloc=    11 free=     5 held=     6 (12MB) rate=0/s
+[kernel 71.262 cpu0]   mmap         alloc=    37 free=    11 held=    26 (52MB) rate=0/s
+[kernel 71.262 cpu0]   shared-mem   alloc=    12 free=     3 held=     9 (18MB) rate=0/s
+[kernel 71.262 cpu0]   pipe         alloc=    15 free=     9 held=     6 (12MB) rate=0/s
+[kernel 71.262 cpu0]   elf          alloc=    10 free=     5 held=     5 (10MB) rate=0/s
+[kernel 71.262 cpu0]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 71.262 cpu0]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 71.262 cpu0]   stack        alloc=    40 free=    20 held=    20 (40MB) rate=0/s
+[kernel 71.262 cpu0]   init-tls     alloc=    14 free=     8 held=     6 (12MB) rate=0/s
+/home/root> shutdown
+[kernel 71.775 cpu6 tid=0] ELF: 3554 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 71.775 cpu6 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 71.775 cpu6 tid=0] spawn: /bin/shutdown pid=10 tid=0 base=0x10000000000 entry=0x1000002d4f4 cr3=0x1f5d000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=1ms)
+[kernel 71.776 cpu6 tid=0] Syncing filesystems...
+[kernel 71.777 cpu6 tid=0] Shutting down.
