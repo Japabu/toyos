@@ -8,6 +8,7 @@ pub mod libc;
 pub mod stamps;
 pub mod testargs;
 pub mod toolchain;
+pub mod wallpaper;
 pub mod worktree;
 
 use std::path::{Path, PathBuf};
