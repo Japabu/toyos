@@ -6439,6 +6439,37 @@ guest, bounded, rather than N ceilings. What a machine group needs first is
 something that plays `started`'s part, and the honest candidate is the boot's own
 ready marker: a guest that will not reach `wait_for_ready` again is gone.
 
+### OPEN, UNASSIGNED — a runner reds a rotating handful every run, and the rate is unmeasured
+
+Two runs of one configuration on one branch, twelve `debian:sid` shards on KVM at
+`--jobs 1`: **280 of 290** (run `31249703011`) and **274 of 290** (run
+`31250706113`). Every shard finished both times. The two failure lists are ten
+and sixteen names and only seven appear in both — `metal_sim_client_death`,
+`metal_sim_pointer_churn`, `doom_sound_flood`, `i8042_health_cadence`,
+`usb_transport_break`, `std_unwind`, `std_unwind_so`.
+
+**The `ALONE:` verdict rotates with them**, which is the part to hold before
+reading any entry here: `metal_sim_pointer_churn` was `red again — the defect is
+real` in the first run and green alone in the second, and `hda_tone`'s mid-tone
+silence fired in one and not the other. On a runner one `ALONE:` line is one
+sample. That is §7's warning in a place where the contention explanation has been
+removed by construction — one lane, one machine, nothing else up either time.
+
+Two shapes are visible in the noise:
+
+- **`std_unwind` and `std_unwind_so` fail in both runs and only in the shared
+  block** — 55–61 ms, `exit code Some(-1)`, green alone every time. Not a clock;
+  something a member of the block leaves behind. The one reproducible shared-boot
+  pair on a runner, and never seen here.
+- **A guest that stops making progress and pays its whole ceiling.**
+  `metal_sim_client_death` 364 s, `metal_sim_window_drag` 355 s,
+  `desktop_audio_client` 354 s, `blocked_dump` 329 s, `doom_sound_flood` 240 s.
+  One guest, two vCPUs, four cores, nothing else on the machine.
+
+Nothing here is diagnosed, and what is missing before anything can be is the
+rate: one shard, N runs, on one runner, counted. That is a single job and nobody
+has run it.
+
 ### OPEN — four reds on a runner that are not the xHCI class and not the width
 
 Run `31247206462`, each red again when re-run alone, none of them reproduced on

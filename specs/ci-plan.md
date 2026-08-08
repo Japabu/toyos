@@ -697,18 +697,31 @@ looks stale.
 - **An ARM runner running aarch64 guests.** Not possible: no `/dev/kvm` on
   `ubuntu-24.04-arm` and no HVF on `macos-latest`. An aarch64 guest there would
   be TCG on an arm64 host, which is what the dev host already is.
-- **A green guest suite.** **280 of 290 on twelve shards, all of which finished**
-  (run `31249703011`), against 246 of 268 on the five that finished of
-  `31238056513` and 43 of 86 under TCG. Two of the ten are the xHCI plug/unplug
-  class under KVM (`xhci_hotplug`, `metal_sim_pointer_churn`, both red again
-  alone), one is `hda_tone`'s mid-tone silence, one is `usb_transport_break`
-  (serial, so nothing re-ran it), and **six failed once and passed once at one
-  lane** — a rate, not a classification, and the thing to attack next. The named
-  list is `specs/known-issues.md` §8.
-- **Whether six-in-290 is this tree's flake rate or this configuration's.** One
-  lane per machine removed the contention explanation, so what is left needs a
-  rate measured rather than argued: the same shard re-run N times is one runner
-  job and nobody has done it.
+- **A green guest suite. What is left is a *rate*, and that is the finding.**
+  Two runs of the same configuration on the same branch: **280 of 290** (run
+  `31249703011`) and **274 of 290** (run `31250706113`, the first to read the
+  committed profile) — against 246 of 268 on the five shards that finished of
+  `31238056513`, and 43 of 86 under TCG. Every shard finished in both.
+
+  The two failure lists are ten and sixteen names and **seven are in both**:
+  `metal_sim_client_death`, `metal_sim_pointer_churn`, `doom_sound_flood`,
+  `i8042_health_cadence`, `usb_transport_break`, `std_unwind`, `std_unwind_so`.
+  The rest rotate, and they rotate *through the `ALONE:` verdict too* —
+  `metal_sim_pointer_churn` was "red again, the defect is real" in one run and
+  green alone in the next, `hda_tone`'s mid-tone silence fired in one and not the
+  other. So a single `ALONE:` line on a runner is one sample and settles nothing,
+  exactly as CLAUDE.md now says of the class.
+
+  The shapes are worth separating even so. `std_unwind` and `std_unwind_so` fail
+  in **both** runs, in the shared block, in 55–61 ms, with `exit code Some(-1)`,
+  and pass alone every time — a shared-boot interaction rather than a clock.
+  Several of the rest are a guest that stopped making progress and paid its whole
+  ceiling: `metal_sim_client_death` 364 s, `metal_sim_window_drag` 355 s,
+  `desktop_audio_client` 354 s, `blocked_dump` 329 s.
+- **The rate itself, measured.** One lane per machine removed the contention
+  explanation and what is left is unquantified: nobody has run one shard N times
+  on a runner and counted. That is one job and it is the next thing to do, because
+  every judgement above rests on two samples.
 
 ### Larger runners: not purchasable for this repository
 
