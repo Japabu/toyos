@@ -228,16 +228,36 @@ fn sync(root: &Path) -> Result<String, String> {
     if behind.trim() == "0" {
         return Ok(format!("fetched origin; this host's main is current at {before}"));
     }
-    git(&primary, &["merge", "--ff-only", "origin/main"]).map_err(|e| {
-        format!(
-            "{e}\n\
-             [pr] this host's main could not be fast-forwarded onto origin/main, which means it \
-             carries commits GitHub has not got. Nothing pushes main any more, so those arrived \
-             some other way — settle that before opening a pull request."
-        )
-    })?;
+    git(&primary, &["merge", "--ff-only", "origin/main"]).map_err(|_| stranded(&primary))?;
     let after = git(&primary, &["rev-parse", "--short", "main"])?;
     Ok(format!("fetched origin; this host's main {before} -> {after} ({} commit(s))", behind.trim()))
+}
+
+/// This host's `main` has commits GitHub does not, so it is not a cache of
+/// `origin/main` any more and nothing can fast-forward it.
+///
+/// **It happened within minutes of `main` being protected**, and by exactly the
+/// route this names: another worktree's `--land`, built before that command was
+/// retired, fast-forwarded the primary onto its own branch and could then never
+/// push it. Eleven commits, all of them still on the branch. So the refusal
+/// lists what is stranded and says where to look for it, because "settle that"
+/// on its own sends an agent to read the reflog.
+fn stranded(primary: &Path) -> String {
+    let extra = git(primary, &["log", "--oneline", "origin/main..main"]).unwrap_or_else(|e| e);
+    let holders = git(primary, &["branch", "--contains", "main", "--list", "wt/*"])
+        .unwrap_or_else(|e| e);
+    format!(
+        "[pr] this host's main carries commits origin/main has not got, so it cannot be \
+         fast-forwarded and it is no longer a copy of what GitHub has. Nothing pushes main any \
+         more, so these arrived from a landing that predates that:\n{extra}\n\
+         [pr] branches that already contain all of them:\n{}\n\
+         [pr] If one of those holds every commit above, nothing is lost — open a pull request \
+         for it and put this host's main back with \
+         `git -C {} reset --hard origin/main`. If none does, do not reset anything: work out \
+         where those commits live first.",
+        if holders.trim().is_empty() { "[pr]     none".to_string() } else { holders },
+        primary.display(),
+    )
 }
 
 /// The merged-result property, made by hand because no merge queue will make it.
