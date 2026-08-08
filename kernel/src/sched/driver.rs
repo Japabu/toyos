@@ -587,6 +587,10 @@ fn drain_irqs() {
     // A CPU cannot read a sibling's `CpuSched`, so the dump reaches every CPU
     // by asking, and this is where each one answers.
     super::dump::serve_if_owed();
+    // And this is where the report it painted goes back on the panel if whoever
+    // owns the screen has drawn over it. One clock read per pass while nothing
+    // is held, and nothing at all once the hold expires.
+    crate::drivers::panic_console::hold_report();
 
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Net).is_some() {
         crate::net::wake_waiters();

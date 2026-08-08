@@ -114,6 +114,7 @@ const SHARED_BLOCK: Sched = Sched::Parallel;
 const RUST_SKIP: &[&str] = &[
     "segfault_child",
     "disk_backtrace_child",
+    "fault_gate_child",
     "test_panic_child",
     "i8042_keyboard",
     "i8042_mouse",
@@ -1040,12 +1041,52 @@ fn check_audio_idle_suspend(result: &TestResult) -> bool {
     true
 }
 
+/// The exit code says the child died; only the serial says *why*.
+///
+/// A #DE with no gate escalates to #DF, and `double_fault_handler` halts every
+/// CPU — so a run that reaches this function at all already survived. What is
+/// left to check is that the kernel took the fault as a #DE rather than as
+/// something the escalation left behind: the report names the vector and the
+/// function that raised it, and no double fault appears in the window.
+fn check_fault_gates(result: &TestResult) -> bool {
+    if !check_rust_result(result) {
+        return false;
+    }
+
+    let checks: &[(&str, &str)] = &[
+        ("SIGFPE tid=", "expected a SIGFPE header for the divide by zero"),
+        ("divide error", "expected the #DE report to name the vector"),
+        (
+            "fault_gate_child::divide_by_zero",
+            "expected the faulting function in the #DE backtrace",
+        ),
+    ];
+
+    let mut ok = true;
+    for (needle, msg) in checks {
+        if !result.serial.contains(needle) {
+            eprintln!("FAIL rs::fault_gates: {msg}\nserial:\n{}", result.serial);
+            ok = false;
+        }
+    }
+    if result.serial.contains("DOUBLE FAULT") {
+        eprintln!(
+            "FAIL rs::fault_gates: a Ring 3 fault escalated to #DF — its vector has no gate\
+             \nserial:\n{}",
+            result.serial
+        );
+        ok = false;
+    }
+    ok
+}
+
 /// Select check function by test name convention.
 fn check_for(name: &str) -> fn(&TestResult) -> bool {
     match name {
         "panic_recovery" => check_panic_recovery,
         "disk_backtrace" => check_disk_backtrace,
         "audio_idle_suspend" => check_audio_idle_suspend,
+        "fault_gates" => check_fault_gates,
         _ => check_rust_result,
     }
 }
@@ -1741,6 +1782,42 @@ fn print_screen(name: &str, text: &str) {
     for line in text.lines() {
         eprintln!("        | {line}");
     }
+}
+
+/// Everything a photograph of a frozen machine has to carry, asked of one
+/// screendump.
+///
+/// The three summary strings are the answer; the absence of a `[page n/m]`
+/// footer is what makes one photograph the *whole* answer, because Ctrl+Alt+D
+/// paints once and never enters the pager — a report that needed two pages
+/// would leave the verdict on one nobody can reach. And the fill is the report
+/// having taken the panel rather than sitting on a client's screen, which is
+/// the half `boot_checkpoint` deliberately will not do.
+fn report_is_photographable(dump: &screen::Ppm, what: &str) -> Result<(), String> {
+    let text = dump.text();
+    for want in ["== VERDICT:", "cpu(s) answered", "== deadlines:"] {
+        if !text.contains(want) {
+            return Err(format!(
+                "{what} does not carry {want:?}, so a photograph of this machine answers \
+                 nothing\ndecoded screen:\n{text}"
+            ));
+        }
+    }
+    if let Some(row) = dump.rows().iter().find(|r| r.contains("[page ")) {
+        return Err(format!(
+            "{what} is paginated ({}), and nothing advances the page after Ctrl+Alt+D — so the \
+             panel is a slice of the machine's log rather than the report\ndecoded screen:\n{text}",
+            row.trim()
+        ));
+    }
+    if dump.fill() != FILL_BOOT {
+        return Err(format!(
+            "{what} is on a panel whose fill is {:?} — this is a client's screen with kernel \
+             text on it, not the report holding the panel",
+            dump.fill()
+        ));
+    }
+    Ok(())
 }
 
 /// Assert the two colour decisions `text()` cannot see: the fill, and the
@@ -3199,9 +3276,15 @@ fn run_screen_test(
             // question into a log file nothing is left running to flush.
             //
             // The verdict is asserted on the *panel* and nowhere else, and it
-            // is the summary rather than any one thread: the summary is printed
-            // last, the console paints the newest page, so the screenful a
-            // phone camera catches is the one that carries the discriminator.
+            // is the summary rather than any one thread: the summary is what
+            // tells the three states apart, and a photograph that has it has
+            // the answer.
+            //
+            // Twice, and the second time is the half that matters. A photograph
+            // is taken seconds after the key, by a person, of a machine whose
+            // userland may still be composing — so the assertion is not that
+            // the paint happened but that the panel still carries it once the
+            // desktop has had its turn.
             let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/desktopaudiocase");
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
@@ -3233,9 +3316,17 @@ fn run_screen_test(
             // keystroke that lands while a desktop is still settling reaches a
             // machine that repaints over the answer, and the retry is cheaper
             // than a rule about when a desktop is finished.
+            //
+            // Polled on the whole verdict rather than on one string of it. A
+            // screendump is not a shutter: QEMU converts the panel while the
+            // guest is still drawing on it, so a capture taken across a paint
+            // carries the rows already drawn and nobody's rows for the rest.
+            // A predicate satisfied by `== VERDICT:` alone accepts one of those
+            // and then asserts on the missing half — which is what this test
+            // did, and what made it intermittent on a quiet host.
             let deadline = Instant::now() + qemu::budget(Duration::from_secs(40));
             let mut dump = up;
-            while Instant::now() < deadline && !dump.text().contains("== VERDICT:") {
+            while Instant::now() < deadline && report_is_photographable(&dump, "").is_err() {
                 {
                     let mut input = qemu::QmpInput::open(qemu.qmp_socket());
                     input.keys(&[
@@ -3247,29 +3338,57 @@ fn run_screen_test(
                         ("ctrl", false),
                     ]);
                 }
-                dump = qemu.screendump_until("== VERDICT:", Duration::from_secs(4));
+                dump = qemu.screendump_while(
+                    Duration::from_secs(4),
+                    Duration::from_millis(100),
+                    |d| report_is_photographable(d, "").is_ok(),
+                );
             }
             let text = dump.text();
             print_screen(name, &text);
-            for want in ["== VERDICT:", "cpu(s) answered", "== deadlines:"] {
-                if !text.contains(want) {
-                    return Err(format!(
-                        "the panel does not carry {want:?}, so a photograph of this machine \
-                         answers nothing\ndecoded screen:\n{text}"
-                    ));
-                }
+            report_is_photographable(&dump, "the report the keystroke painted")?;
+
+            // **A single paint is not a report.** Whoever owns the screen goes
+            // on composing and has no idea the kernel drew, so the panel the
+            // owner photographs is the one that survived the next client frame
+            // — not the one the dump painted. Typing is the actuator: the shell
+            // echoes and the terminal repaints its whole window, which is
+            // exactly what was measured blanking every row of the report that
+            // lay under it, inside 100 ms, leaving the four rows below the
+            // window and a 40-pixel strip beside it.
+            {
+                let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+                input.type_text("echo zqjxk\n");
             }
-            // The report took the screen back from the compositor, which is the
-            // half of this that `boot_checkpoint` deliberately will not do.
-            if dump.fill() != FILL_BOOT {
-                return Err(format!(
-                    "the verdict is on the panel but the fill is {:?} — this is a client's \
-                     screen with kernel text on it, not the report taking the panel",
-                    dump.fill()
-                ));
-            }
-            let row = dump.row_index("== VERDICT:").expect("checked above");
-            eprintln!("  [dump] on the panel of a guest with no console: {}", dump.rows()[row].trim());
+            // Userland's turn, and the wait is the assertion's premise rather
+            // than padding: measured with the hold compiled out, an idle
+            // desktop changes this panel inside 1.5 s on its own, and without
+            // this the check below answered on its first capture — before the
+            // compositor had composed once — and passed vacuously.
+            //
+            // **Deliberately not `qemu::budget`.** That pays a *liveness
+            // ceiling* out per guest, and this is not one: it is a settle
+            // inside a window the guest itself is timing, so scaling it by the
+            // phase width walks out of the window it has to stay inside.
+            // Twelve wide it became 36 s against a 15 s hold, and the check
+            // then measured a machine that had already given the screen back.
+            // The window is guest time and a loaded guest's is *longer* in host
+            // seconds, so a fixed wait errs inwards from both sides.
+            std::thread::sleep(Duration::from_secs(2));
+            let back = qemu.screendump_while(
+                Duration::from_secs(5),
+                Duration::from_millis(100),
+                |d| report_is_photographable(d, "").is_ok(),
+            );
+            print_screen(&format!("{name} after a client repaint"), &back.text());
+            report_is_photographable(&back, "the report after a client repainted over it")?;
+
+            let row = back.row_index("== VERDICT:").expect("checked above");
+            eprintln!(
+                "  [dump] on the panel of a guest with no console, and still there after the \
+                 desktop repainted: {}",
+                back.rows()[row].trim()
+            );
             Ok(())
         }
         "screen_recoverable_untouched" => {

@@ -92,6 +92,7 @@ impl LogRing {
         let mut file_dropped = 0u64;
         let to_serial = SERIAL_SINK.load(Ordering::Relaxed);
         let to_file = FILE_SINK.load(Ordering::Relaxed);
+        let written = WRITTEN.load(Ordering::Relaxed);
         for &b in data {
             if to_serial && self.len == RING_SIZE {
                 self.tail = (self.tail + 1) % RING_SIZE;
@@ -124,6 +125,15 @@ impl LogRing {
         if file_dropped > 0 {
             FILE_DROPPED.fetch_add(file_dropped, Ordering::Relaxed);
         }
+        // After the copy, so a lock-free reader never sees a mark for a byte
+        // the writer has not stored yet.
+        //
+        // A load and a store rather than a `fetch_add`, for the same reason
+        // `OWED` is: this runs under `RingGuard`, so nothing can be between
+        // them. Not a micro-optimisation — the `lock xadd` cost **350 ms of
+        // boot**, because every guest this host runs is TCG and an atomic
+        // read-modify-write there is not one instruction.
+        WRITTEN.store(written.wrapping_add(data.len() as u64), Ordering::Release);
         dropped
     }
 
@@ -156,6 +166,27 @@ unsafe impl Sync for RingCell {}
 static RING: RingCell = RingCell(UnsafeCell::new(LogRing::new()));
 static RING_LOCKED: AtomicBool = AtomicBool::new(false);
 static DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Every byte ever appended. `LogRing::head` is this modulo [`RING_SIZE`] and
+/// `retained` is this capped at it, so a mark needs no other field — which is
+/// what lets [`peek_range`] read the ring with one relaxed load and no lock.
+static WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// A position in the ring's byte stream, monotonic for the life of the boot.
+///
+/// Two of them bracket a span of log, which is what lets a reader ask for *one
+/// report* rather than for the newest bytes: the lines are already in the ring
+/// in the order every CPU produced them, and the only thing missing was a way
+/// to say where the report stopped.
+#[derive(Clone, Copy)]
+pub struct Mark(u64);
+
+/// Where the stream is now. Takes no lock, because the one caller is the
+/// blocked-task dump and it takes none either.
+pub fn mark() -> Mark {
+    Mark(WRITTEN.load(Ordering::Relaxed))
+}
+
 /// A lock-free mirror of `LogRing::len` — what serial still owes the host.
 ///
 /// It exists for exactly one reader: the pre-halt recheck in
@@ -489,6 +520,30 @@ pub unsafe fn peek_tail(out: &mut [u8]) -> usize {
     let start = (head + RING_SIZE - n) % RING_SIZE;
     for (i, slot) in out[..n].iter_mut().enumerate() {
         *slot = ring.buf[(start + i) % RING_SIZE];
+    }
+    n
+}
+
+/// Copy the bytes between two marks, without taking the lock and without
+/// consuming them. Returns the number copied.
+///
+/// The *newest* bytes of the span when it does not all fit, because a caller
+/// with a screen shows the end of a report and a truncated head costs it
+/// context rather than the answer. A span the ring has since overwritten
+/// shortens the same way: a mark names a byte, never a promise to have kept it.
+///
+/// # Safety
+/// Exactly [`peek_tail`]'s contract, and for exactly its reasons.
+pub unsafe fn peek_range(from: Mark, to: Mark, out: &mut [u8]) -> usize {
+    let ring = unsafe { &*RING.0.get() };
+    let written = WRITTEN.load(Ordering::Acquire);
+    let end = to.0.min(written);
+    let oldest = written.saturating_sub(RING_SIZE as u64);
+    let start = from.0.max(oldest).min(end);
+    let n = ((end - start) as usize).min(out.len());
+    let first = end - n as u64;
+    for (i, slot) in out[..n].iter_mut().enumerate() {
+        *slot = ring.buf[((first + i as u64) % RING_SIZE as u64) as usize];
     }
     n
 }
