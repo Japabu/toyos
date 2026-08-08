@@ -13,6 +13,13 @@
 //! has already pushed it as part of its GPR save, and one that has not would
 //! lose the user's `r11` regardless.
 //!
+//! **What it saves is everything this kernel permits to exist.** `CR4.OSXSAVE`
+//! is set nowhere, so `XCR0` is 1 and `FXSAVE64` is complete rather than cheap.
+//! Every user thread's x87 register file, control, status and tag words, XMM0-15
+//! and `MXCSR` cross a ring transition intact — including a *pending unmasked
+//! x87 exception*, which used to be left on the CPU for whatever ran next
+//! (`specs/user-machine-state.md` §2).
+//!
 //! **The area is sized by the type, at every site, without the site saying so.**
 //! [`ring3_naked_asm`] appends the two `const` operands the templates name, so
 //! there is nowhere to write a number. That is the whole of the AVX-512 guard:
@@ -54,26 +61,11 @@ macro_rules! save_user_state {
             "sub rsp, {fp_align}\n",
             "and rsp, -{fp_align}\n",
             "mov [rsp + {fp_bytes}], r11\n",
-            // Transitional body: XMM0-15 and MXCSR only, at their FXSAVE64
-            // image offsets, so nothing but these lines moves when it becomes
-            // one instruction.
-            "stmxcsr [rsp + 24]\n",
-            "movdqu [rsp + 160 + 0*16], xmm0\n",
-            "movdqu [rsp + 160 + 1*16], xmm1\n",
-            "movdqu [rsp + 160 + 2*16], xmm2\n",
-            "movdqu [rsp + 160 + 3*16], xmm3\n",
-            "movdqu [rsp + 160 + 4*16], xmm4\n",
-            "movdqu [rsp + 160 + 5*16], xmm5\n",
-            "movdqu [rsp + 160 + 6*16], xmm6\n",
-            "movdqu [rsp + 160 + 7*16], xmm7\n",
-            "movdqu [rsp + 160 + 8*16], xmm8\n",
-            "movdqu [rsp + 160 + 9*16], xmm9\n",
-            "movdqu [rsp + 160 + 10*16], xmm10\n",
-            "movdqu [rsp + 160 + 11*16], xmm11\n",
-            "movdqu [rsp + 160 + 12*16], xmm12\n",
-            "movdqu [rsp + 160 + 13*16], xmm13\n",
-            "movdqu [rsp + 160 + 14*16], xmm14\n",
-            "movdqu [rsp + 160 + 15*16], xmm15\n",
+            // Non-waiting, which is the whole reason this family and not
+            // FSAVE: a pending unmasked x87 exception must be *saved*, not
+            // trapped on, and certainly not in Ring 0. The REX.W form, because
+            // plain FXSAVE keeps only the low 32 bits of FIP and FDP.
+            "fxsave64 [rsp]\n",
         )
     };
 }
@@ -82,23 +74,7 @@ macro_rules! save_user_state {
 macro_rules! restore_user_state {
     () => {
         concat!(
-            "movdqu xmm0,  [rsp + 160 + 0*16]\n",
-            "movdqu xmm1,  [rsp + 160 + 1*16]\n",
-            "movdqu xmm2,  [rsp + 160 + 2*16]\n",
-            "movdqu xmm3,  [rsp + 160 + 3*16]\n",
-            "movdqu xmm4,  [rsp + 160 + 4*16]\n",
-            "movdqu xmm5,  [rsp + 160 + 5*16]\n",
-            "movdqu xmm6,  [rsp + 160 + 6*16]\n",
-            "movdqu xmm7,  [rsp + 160 + 7*16]\n",
-            "movdqu xmm8,  [rsp + 160 + 8*16]\n",
-            "movdqu xmm9,  [rsp + 160 + 9*16]\n",
-            "movdqu xmm10, [rsp + 160 + 10*16]\n",
-            "movdqu xmm11, [rsp + 160 + 11*16]\n",
-            "movdqu xmm12, [rsp + 160 + 12*16]\n",
-            "movdqu xmm13, [rsp + 160 + 13*16]\n",
-            "movdqu xmm14, [rsp + 160 + 14*16]\n",
-            "movdqu xmm15, [rsp + 160 + 15*16]\n",
-            "ldmxcsr [rsp + 24]\n",
+            "fxrstor64 [rsp]\n",
             "mov rsp, [rsp + {fp_bytes}]\n",
         )
     };
