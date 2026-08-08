@@ -56,6 +56,7 @@ macro_rules! ring3_naked_asm {
 /// time, with the declared state's address supplied from [`fpu`].
 ///
 /// [`fpu`]: super::fpu
+#[cfg(not(feature = "fpu-save-nothing"))]
 macro_rules! ring3_trampoline_asm {
     ($($body:tt)*) => {
         core::arch::naked_asm!(
@@ -66,6 +67,7 @@ macro_rules! ring3_trampoline_asm {
 }
 
 /// The state a task that has never been in Ring 3 starts from.
+#[cfg(not(feature = "fpu-save-nothing"))]
 macro_rules! initial_user_state {
     () => {
         "fxrstor64 [rip + {fp_initial}]\n"
@@ -73,6 +75,7 @@ macro_rules! initial_user_state {
 }
 
 /// Park the user machine state on this kernel stack.
+#[cfg(not(feature = "fpu-save-nothing"))]
 macro_rules! save_user_state {
     () => {
         concat!(
@@ -91,12 +94,50 @@ macro_rules! save_user_state {
 }
 
 /// Put it back, and `rsp` with it.
+#[cfg(not(feature = "fpu-save-nothing"))]
 macro_rules! restore_user_state {
     () => {
         concat!(
             "fxrstor64 [rsp]\n",
             "mov rsp, [rsp + {fp_bytes}]\n",
         )
+    };
+}
+
+// The negative control (`fpu-save-nothing`, declared in `kernel/Cargo.toml`).
+// Everything the bracket does *except* move the state: the same reservation,
+// the same alignment, the same rsp bookkeeping, so what the gate then observes
+// is one missing instruction and not a different kernel.
+
+#[cfg(feature = "fpu-save-nothing")]
+macro_rules! ring3_trampoline_asm {
+    ($($body:tt)*) => { core::arch::naked_asm!($($body)*) };
+}
+
+#[cfg(feature = "fpu-save-nothing")]
+macro_rules! initial_user_state {
+    () => {
+        ""
+    };
+}
+
+#[cfg(feature = "fpu-save-nothing")]
+macro_rules! save_user_state {
+    () => {
+        concat!(
+            "mov r11, rsp\n",
+            "sub rsp, {fp_bytes}\n",
+            "sub rsp, {fp_align}\n",
+            "and rsp, -{fp_align}\n",
+            "mov [rsp + {fp_bytes}], r11\n",
+        )
+    };
+}
+
+#[cfg(feature = "fpu-save-nothing")]
+macro_rules! restore_user_state {
+    () => {
+        "mov rsp, [rsp + {fp_bytes}]\n"
     };
 }
 
