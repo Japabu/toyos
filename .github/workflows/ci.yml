@@ -19,7 +19,13 @@ concurrency:
 jobs:
   guest:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # 60 was too tight and cost three shards of run `31238056513`: two finished
+    # their suite and lost the artifact upload, one was cut off mid-phase at
+    # 1932 s. The partition is the reason — a runner has no
+    # `target/test-durations`, so `longest_first` prices every test the same and
+    # degenerates to round-robin, and the metal-sim shard drew far more than a
+    # sixth of the work.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

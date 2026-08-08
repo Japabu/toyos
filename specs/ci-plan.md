@@ -384,23 +384,84 @@ The failure classes, counted over the whole run:
 x86 is far enough below a 14-core M4 Pro that ceilings written for the latter do
 not hold. §6 and §6.1 are 36 of the failures; every other one is the clock.
 
-So **TCG on a standard runner is not a working configuration for this suite**,
-and the shards as landed are red on it. Three directions, none taken here:
+So **TCG on a standard runner is not a working configuration for this suite**.
+Three directions were named here, and all three were taken — the owner chose the
+accelerator (§2) and the other two turned out to be the rest of the same answer.
 
-- **Run the shards on KVM.** A native guest is fast enough that none of these
-  ceilings is marginal, and §7 — the reason they were on TCG at all — closed
-  while this was being measured. §2 argues the other way, that TCG keeps the
-  shards comparable with the dev host's numbers; that argument was written
-  before this measurement existed, and the two now have to be weighed against
-  each other. **This is the open decision**, and it is the one that decides
-  whether the guest suite can be green at all.
-- `--jobs 1` or `2` — fewer guests contending for four cores, at the cost of
-  wall clock a shard already does not have.
-- Scale the ceilings by a measured host speed rather than by width, which is a
-  change to `qemu::budget` and to what every ceiling in the tree means.
+## 7.2 All three, measured
 
-Whichever wins, the comparison §2 wants is still available: one shard on each
-accelerator costs one extra runner and nothing else.
+Three runs on `wt/toyos-cifit`, one change at a time.
+
+| run | config | result |
+|---|---|---|
+| `31222412737` | TCG, 4 shards, `--jobs 4` | shard 1 cancelled at 110 min; 2/3/4 at 17/32, 13/27, 13/27 |
+| `31233476555` | **KVM**, 4 shards, `--jobs 4` | shard 1 cancelled at 110 min; 2/3/4 at 21/32, 19/27, 20/27 |
+| `31238056513` | KVM, 6 shards, `--jobs 2`, host-scaled ceilings | 1/2/3/4/6 at 189/191, 16/23, 10/18, 15/18, 16/18; shard 5 cut off |
+
+**KVM alone stopped the timeouts being the story.** 307 bare timeouts became a
+named failure list. What it did not do is make four guests fit on four cores:
+every profile boots `-smp 2` and six tests boot `-smp 8`, so `--jobs 4` is eight
+to thirty-two vCPUs on four, and a guest whose kernel spins with `IF` clear pays
+lock-holder preemption for the difference. The harness's own re-run-alone column
+priced it — `netd_connection_caps` 551 s wide against 6 s alone,
+`metal_sim_input` 336 s against 4 s, `desktop_locale_detect` 51 s against 4 s.
+
+**Host-scaled ceilings are the third, and the boot is the measurement.**
+`qemu::budget` now multiplies by `fastest_boot / 1320 ms` as well as by the
+width, never below 1 and never above 8. The reference is the fastest boot of a
+291-test suite on the dev host; a runner's fastest is 1672–2308 ms, so CI pays
+1.27×–1.75×. The TCG canary is the demonstration that this was needed at all: it
+ran `process_stats` green on one push and `timed out after 5s` on the next, same
+command, same commit content — and is green again with the scaling on.
+
+**Shard 1 is the headline: 189 of 191.** The 153-test shared block, which
+neither TCG run ever finished, runs in one guest with almost every test under a
+second.
+
+### What is left, and it is not the clock
+
+Twenty-two failures over the five shards that finished. The harness classifies
+them itself and the classes are worth separating:
+
+- **`ALONE: GREEN` — the classification, not the tree.** `i8042_quarantine`,
+  `i8042_fadt_denial`, `hda_client_stall`, `cache_eviction`, `nvme_large_device`,
+  `usb_flush_optional`, `screen_console_scroll`, `metal_sim_input`. Every one is
+  `Sched::Parallel` and every one is on `specs/known-issues.md` §7's list or
+  belongs on it. Two lanes on four cores is still two guests.
+- **Input delivery, and this is the real finding.** `desktop_typing_damage` (6
+  of 16 echoes, *alone*), `i8042_mouse` ("1007 of the 1007 packets injected came
+  back out" and still stalled, alone), `xhci_hotplug` (alone),
+  `metal_sim_pointer_churn` ("the churn did not reach the kernel", alone),
+  `desktop_window_child` (nothing typed reached a shell, alone), `xhci_flap`.
+  All six pass on the dev host in seconds — measured, `--jobs 1`, all eight
+  suspects green. Two things differ and neither has been separated yet: the
+  accelerator, and **QEMU 8.2.2 on the runner against 11.0.3 here**. Injection
+  is a QMP path through the emulated i8042 and xHCI, which is exactly where a
+  three-major-version gap would show. This is what the owner's rule is for —
+  "everything should work under emulation and kvm if it doesnt something with
+  the guest is wrong" — and it is the next thing to settle.
+- **Two audio reds.** `hda_tone` with `1 mid-tone silences`, which the #88
+  exemption correctly does not cover, and `audio_tone_load (smp=8)` timing out
+  with eight vCPUs on four cores. Both are known-issues §4 shapes.
+- **`doom_sound_flood`**, timed out at 300 s wide and 104 s alone against 4–26 s
+  here. Not input and not obviously the clock.
+- **`usb_storage_shapes`** — `the driver did not report "blocks of 4096 B"`,
+  alone, in 4 s. Reads like a real difference and not a margin.
+- **`metal_sim_compositor`** — `"sshd: no network on this machine, exiting"
+  never reached the console`.
+
+Nothing left in the list is a bare timeout at a ceiling nobody chose, which was
+the whole of §7.1.
+
+### Still open on the configuration itself
+
+- **The partition is round-robin.** `longest_first` orders on
+  `target/test-durations` and a runner has none, so every test prices the same
+  (§4). Shard 5 spent 1932 s in its parallel phase and was cut off; shard 6
+  spent 411 s. A profile committed for CI to read would fix the partition, and
+  §4's rule that a shard may not *write* one is what makes that safe.
+- **The comparison §2 wants** is still available and still costs one runner: the
+  `tcg` job is one test, and a whole TCG shard would be the other arm.
 
 ## 8. What CI buys that the dev host cannot
 
@@ -464,9 +525,15 @@ looks stale.
 - **An ARM runner running aarch64 guests.** Not possible: no `/dev/kvm` on
   `ubuntu-24.04-arm` and no HVF on `macos-latest`. An aarch64 guest there would
   be TCG on an arm64 host, which is what the dev host already is.
-- **`fsck.vfat`**, §6.
-- **A green guest suite.** §7.1 — the shards are red today, on timeouts rather
-  than on assertions, and the open decision is the accelerator they run on.
+- **A green guest suite.** 246 of 268 on the five shards that finished
+  (§7.2), against 43 of 86 on the three that finished under TCG. What is left is
+  a named list rather than a wall of clocks, and the biggest single item in it is
+  **input delivery**: six tests that inject a keystroke or a plug event fail on a
+  runner and pass here, and nobody has separated the accelerator from QEMU 8.2.2
+  against 11.0.3.
+- **The shard partition**, §7.2 — round-robin because a runner has no duration
+  profile, and shard 5 was cut off at 1932 s in its parallel phase because of it.
 - **Larger runners** were not tried. They are a billed feature even on public
-  repos, so trying one is the owner's call — and §7.1 makes core count the first
-  thing worth trying if KVM stays out of reach.
+  repos, so trying one is the owner's call. §7.2 makes core count the standing
+  constraint: two lanes is the most four cores will take, and the `ALONE: GREEN`
+  class is what is left of the ones that will not fit.

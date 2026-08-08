@@ -4589,6 +4589,28 @@ took **182.7 s**; the three red ones took 559, 576 and 705. That is the whole
 correlation, and it says the remaining landing blocker is this section rather
 than anything in the kernel.
 
+**Two of this entry's three named victims are closed as of 2026-08-08, and the
+mechanism was not the scheduler.** Both `desktop_typing_damage` and
+`desktop_audio_client` reached their shell through `shell_answers`, which
+retyped `echo <nonce>` against `qemu::budget(20 s)` because nothing knew when
+the terminal was up — so "how long does a desktop take to come up on the host of
+the day" *was* the verdict. The terminal prints `terminal: ready` now (and
+`/bin/console` already printed its own), so the coming-up half waits on the
+guest's own liveness and only the keystroke round trip has a clock on it.
+`close_focused_window` took the same guard and it cuts the other way there: #156
+is a freeze, so the machine goes quiet and the wait ends in fifteen seconds
+instead of spending up to four minutes at width 12 — which is the lane
+`desktop_window_child` was holding for a quarter of every run, and the whole
+mechanism of "whichever other desktop lands beside it loses its typing window".
+
+`qemu::budget` also scales by how fast the host is now, not only by how many
+guests are on it (`specs/ci-plan.md` §7.2). Neither change touches
+`screen_blocked_dump`, `i8042_mouse`, `screen_console_scroll` or the rest of the
+list above, whose verdicts are elsewhere — this closes the desktop family's
+share of it and no more. Measured after: four desktop tests wide, 16/27/28/31 s
+and 18/41/48/20 s in two runs, all green; a 291-test suite at width 12 in 478 s
+with `desktop_window_child` no longer in the long tail.
+
 ### A whole parallel phase can be starved by another agent's build
 
 Measured 2026-08-04: the same tree that runs the phase in 44.8 s ran it in
@@ -5386,6 +5408,42 @@ choice survives a login and not a reboot.
 ---
 
 ## 8. Hardware and performance gaps
+
+### OPEN — six input tests fail on a GitHub runner and pass here, and nobody has separated the accelerator from the QEMU version
+
+Found 2026-08-08 taking the guest suite to CI. Run `31238056513`, six
+`ubuntu-24.04` shards on KVM at `--jobs 2`, 246 of 268 passing on the five that
+finished. After the `ALONE: GREEN` contention class is set aside
+(`specs/ci-plan.md` §7.2), the largest thing left is one class and every member
+of it injects something:
+
+| test | on a runner, **alone** | here, `--jobs 1` |
+|---|---|---|
+| `desktop_typing_damage` | 6 of the 16 echoes, 89 s | green, 41 s |
+| `i8042_mouse` | stalled with `1007 of the 1007 packets injected came back out`, 82 s | green |
+| `xhci_hotplug` | timed out, 86 s | green, 6 s |
+| `metal_sim_pointer_churn` | `the churn did not reach the kernel`, 22 s | green, 17–37 s |
+| `desktop_window_child` | `nothing typed at the terminal window reached a shell`, 303 s | green, 28–48 s |
+| `xhci_flap` | timed out, 83 s | green, 6 s |
+
+The eight suspects were run on the dev host at `--jobs 1` the same day and all
+eight passed. So this is not the shape of a margin: `i8042_mouse` says every
+packet it injected came back and it still stalled, and `metal_sim_pointer_churn`
+says nothing reached the kernel at all.
+
+**Two things differ and neither has been isolated.** The accelerator — these
+guests execute on KVM and the dev host's emulate — and **QEMU 8.2.2 on
+`ubuntu-24.04` against 11.0.3 here**, three major versions. Injection is a QMP
+path through the emulated i8042 and xHCI, which is exactly the surface a version
+gap would move; `-nodefaults` and the tablet/mouse device set are already known
+to have shifted in QEMU 11 (`tests/common/qemu.rs` carries that comment).
+
+Separating them is one probe workflow and two jobs: the same test on one runner
+with `/dev/kvm` unlocked and one without. That is the §7 method and it settled
+the SYSRET class in a single run. **Do not guess which it is** — if it is the
+accelerator it is a guest defect and the owner's rule says so out loud; if it is
+the QEMU version it is a harness assumption that this tree has never had a
+second data point on.
 
 ### `i8042_mouse`: closed — the host outran QEMU's PS/2 queue, twice over
 
