@@ -9485,20 +9485,35 @@ fn control_regs_negative(
              nothing or the verdict cannot see the machine it was written for\n{log}"
         ));
     };
-    // Named, and named as the defect: `CD` is what an AP arrives with and the
-    // consequence the whole file exists for. A refusal for a missing line or an
-    // unreadable one would satisfy `is_err` and mean nothing.
-    if !refusal.contains("cpu1") || !refusal.contains("CD") {
+    // Named, and named for a bit rather than for the count: a refusal about a
+    // missing line or an unreadable one satisfies `is_err` and means nothing.
+    //
+    // **`WP`, not `CD`, and that is a finding rather than a preference.** `CD`
+    // is the consequence this whole file exists for, and it is the obvious bit
+    // to demand — but a guest cannot hold it under KVM. Measured 2026-08-08:
+    // an AP that has executed nothing but the trampoline reads `cr0=0xe0000011`
+    // under this host's TCG and `cr0=0x80000011` on an Intel Xeon 6973P-C KVM
+    // runner (CI run 31278396401, shard 3), `CD` and `NW` clear, everything
+    // else identical. So `CD` here would be a gate that only one of the two
+    // machines this suite runs on can fail. `WP` is absent on the AP either
+    // way, and its consequence — the kernel's own read-only mappings not
+    // binding supervisor writes — does not depend on the hypervisor.
+    if !refusal.contains("cpu1") || !refusal.contains("WP") {
         return Err(format!(
-            "the verdict refused for something other than cpu1's caching: {refusal}"
+            "the verdict refused for something other than cpu1's write protection: {refusal}"
+        ));
+    }
+    // Where the host does leave `CD` set, it is demanded, so the arm that *can*
+    // see the caching defect does not quietly become the weaker of the two.
+    if !toyos_build::kvm_usable() && !refusal.contains("CD") {
+        return Err(format!(
+            "TCG leaves an AP's `CD` set and the refusal does not name it: {refusal}"
         ));
     }
     // And the kernel refused too, on its own assertion rather than on a fault
-    // somewhere downstream of one — the shipped check, on the shipped line.
-    for want in [
-        "control_regs: cpu1 holds cr0=0xe0000011",
-        "the declaration is 0x80010033",
-    ] {
+    // somewhere downstream of one — the shipped check, on the shipped line. The
+    // declaration is a constant, so it is the same number on either host.
+    for want in ["control_regs: cpu1 holds cr0=", "the declaration is 0x80010033"] {
         if !log.contains(want) {
             return Err(format!("the kernel never said {want:?}:\n{log}"));
         }

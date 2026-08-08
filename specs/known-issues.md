@@ -6949,6 +6949,28 @@ consequence. Every number is a multiple of 1000 — TCG's TSC granularity — an
 cpu2 and cpu3 on the same boot answered `11000/10000/5000` with byte-identical
 registers, a fourfold spread that is the host's scheduling and not the guest's.
 
+**Nor can a KVM host, for a second and unrelated reason: a guest there does not
+hold `CD` at all.** Measured 2026-08-08 by `control_regs_negative`, which boots
+the `no-ap-control-regs` kernel and reads the AP's own registers. The same
+kernel, the same actuator, the same `smp=2`:
+
+| host | an AP that has run only the trampoline |
+|---|---|
+| this machine, TCG | `cr0=0xe0000011 cr4=0x00000020` |
+| CI shard 3, KVM on an Intel Xeon 6973P-C ([run 31278396401](https://github.com/Japabu/toyos/actions/runs/31278396401)) | `cr0=0x80000011 cr4=0x00000020` |
+
+`0xe0000011` against `0x80000011` is `CD` and `NW`, and nothing else differs.
+So under KVM the AP arrives with **caching on** whether or not the kernel puts
+it there, and the twelve KVM shards could never have failed on the caching half
+of §3's defect however long it stood. **The cause is not established here** —
+the observation is the AP's own read-back of `CR0`, and whether that is QEMU's
+reset value, KVM's, or a hypervisor that declines to honour a guest `CD` was not
+determined. Two consequences that do not depend on which: a gate that asserts on
+`CD` is a TCG-only gate (which is why `control_regs_negative` asserts on `WP`
+and adds `CD` only where the host leaves it set), and `control-regs-bench` run
+under any hypervisor measures nothing, so "real silicon" above means bare metal
+and not a VM on it.
+
 **How the owner takes it:**
 `cargo run -- --diag-boot --kernel-feature control-regs-bench --build-only`,
 flash, read the per-CPU rows off the panel. cpu0's row is the control and every

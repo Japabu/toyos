@@ -264,8 +264,10 @@ fn opt(value: u64, bit: u64, name: &'static str) -> &'static str {
 /// of the one instruction that turns it on.
 ///
 /// **The dev host cannot answer this and no test asserts on it.** QEMU's TCG
-/// models no cache, so `CR0.CD` there is a bit with no timing consequence; the
-/// number is real silicon's and the owner takes it with
+/// models no cache, so `CR0.CD` there is a bit with no timing consequence, and
+/// a KVM guest does not hold the bit at all — an AP that never cleared `CD`
+/// reads it clear (known-issues §8). The number is bare metal's, not a VM on
+/// it, and the owner takes it with
 /// `--diag-boot --kernel-feature control-regs-bench`, off the panel.
 ///
 /// Nothing outside the kernel can ask. There is no CPU affinity, so no userland
