@@ -9,9 +9,17 @@ name: toolchain
 # superseded run by design; a second push during an hour-long bootstrap would
 # throw that hour away and the next run would start it again.
 
+# **On pull requests too, and that is not optional.** `ci.yml` waits up to two
+# hours for the release keyed on the four trees it is about to build against, and
+# a branch is no longer pushed *and* opened as a pull request — it is one event.
+# A branch that changes one of those trees and never got a `push` event would
+# have every shard wait that out and then fail. A pull-request checkout is the
+# merge of head and base, which is the commit `ci.yml` keys on, so the two agree.
+
 on:
   push:
-    branches-ignore: ['ci/**']
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 concurrency:

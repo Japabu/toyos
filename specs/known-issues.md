@@ -2186,8 +2186,8 @@ test can now reach the snake rounds where the freeze was seen, which it could
 not before. Judge the next occurrence by the signature, never by a run.
 
 **Landing while it is red** needs nothing special: `desktop_window_child` is
-declared in `EXPECTED_FAILURES` (`tests/toyos.rs`) and `cargo run -- --land`
-runs the ordinary gate. The declaration reports it by name on every run, is red
+declared in `EXPECTED_FAILURES` (`tests/toyos.rs`) and the gate is the ordinary
+one. The declaration reports it by name on every run, is red
 if the test *passes* where the entry says a pass is proof, and is red on
 `2026-09-06` regardless — this entry is intermittent, so its own expiry is a
 date rather than a green run. The `--skip` flag that used to be the answer is

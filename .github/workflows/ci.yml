@@ -5,10 +5,16 @@ name: ci
 #
 # `ci/**` is where throwaway probe branches live; they trigger their own
 # workflows and not this one.
+#
+# **A pull request and `main`, and nothing in between.** `main` moves only
+# through a merged pull request now (`specs/worktrees.md` §5), so a branch push
+# and the pull request on it were two runs of the same twelve shards. `main`
+# itself still runs: it is what `landing.yml`'s `gate-stage` reads, and its
+# `actions/cache` entries are the only ones every branch can restore.
 
 on:
   push:
-    branches-ignore: ['ci/**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -126,8 +132,26 @@ jobs:
       # the minutes are unmetered.
       - name: suite
         run: |
+          set -o pipefail
           cargo test --test toyos-build -- \
-            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0
+            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0 2>&1 \
+            | tee /tmp/suite.log
+
+      # **`--land` wrote "gate ok" or "gate ok, NOT clean" into the landing
+      # commit, and only the suite can tell those apart.** A run carrying
+      # declared `EXPECTED_FAILURES` exits 0 and says so in one line; a merge
+      # that accepted one has to say so somewhere a reader will find it, and the
+      # merge commit is not written on this side any more.
+      #
+      # The filter is `--land`'s: `cargo test` runs several binaries and the last
+      # `test result:` is the doc-tests', so the suite's own line is the one that
+      # counts a total, which libtest's never does.
+      - name: what the suite said
+        if: always()
+        run: |
+          line=$(grep 'test result:' /tmp/suite.log | grep ' total (' | tail -1)
+          echo "- shard ${{ matrix.shard }}: ${line:-no suite result line}" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       # Always, and not only on a red: this is the measurement that fixes the
       # partition. A shard writes `test-durations.shard-<i>-of-<n>`, which
@@ -235,3 +259,21 @@ jobs:
 
       - name: one test, emulated
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
+
+  # **One name for twelve shards, because a required status check is matched by
+  # job name and a matrix produces twelve of them.** Twelve entries in a
+  # protection rule is twelve things that can silently disagree with the matrix;
+  # this is one, and `needs.guest.result` is `success` only when every shard was.
+  #
+  # It is what `specs/ci-plan.md` §10's stage 2 makes required. Until then it
+  # runs, it reds when a shard reds, and `landing.yml`'s `gate-stage` is what
+  # stops that being a permanent arrangement.
+  guest-suite:
+    needs: [guest]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: every shard
+        run: |
+          echo "twelve shards: ${{ needs.guest.result }}"
+          test "${{ needs.guest.result }}" = success
