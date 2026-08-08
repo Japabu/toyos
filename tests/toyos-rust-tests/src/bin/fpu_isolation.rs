@@ -26,7 +26,8 @@ use std::sync::Arc;
 use core::mem::offset_of;
 
 use toyos_abi::syscall::{
-    mmap, thread_join, thread_spawn, MmapFlags, MmapProt, SYS_CLOCK, SYS_EXIT, SYS_THREAD_EXIT,
+    mmap, nanosleep, thread_join, thread_spawn, MmapFlags, MmapProt, SYS_CLOCK, SYS_EXIT,
+    SYS_THREAD_EXIT,
 };
 
 /// The FXSAVE64 image, at the alignment the instruction requires.
@@ -54,15 +55,19 @@ const FCW_PINNED: u16 = 0x0C7F;
 const MXCSR_PINNED: u32 = 0x7F80;
 
 /// Everything the pinning assembly reads or writes, in one object, so the
-/// blocks below need three registers rather than eight — with `clobber_abi`
-/// declared, an operand has to live in a callee-saved register and there are
-/// only five of those.
+/// blocks below need one base register rather than eight.
+///
+/// `r15` is that register, named explicitly at every site rather than left to
+/// the allocator: `clobber_abi("sysv64")` does not stop LLVM putting an
+/// `in(reg)` input in a clobbered register, and it put this one in `rax`, which
+/// the `syscall` loop then destroyed — the base register read back as a
+/// truncated 32-bit value and the next load segfaulted.
 #[repr(C, align(16))]
 struct Arena {
     cw: u16,
     _pad: [u8; 2],
     mx: u32,
-    /// The page-fault arm's fresh mapping.
+    /// The page-fault arm's first untouched page.
     region: u64,
     /// Sixteen distinctive XMM values, one per register.
     xmm: [u64; 32],
@@ -91,6 +96,24 @@ static mut ARENA: Arena = Arena {
 /// What this process's own state was at the first instruction of `main`.
 static mut ENTRY_IMAGE: FpImage = FpImage([0; 512]);
 
+const PAGE_2M: usize = 2 * 1024 * 1024;
+/// First touches the preservation arm makes of [`DEMAND`], 2 MiB apart, so each
+/// is a page of its own and each is a `#PF`.
+const FAULT_TOUCHES: u64 = 2;
+
+/// The page-fault workload, and the only kind of demand-paged memory a userland
+/// program on this kernel can reach.
+///
+/// Not `mmap`: `sys_mmap` allocates and maps its whole region up front, so the
+/// first touch of a fresh mapping faults nothing. Not `.bss` either: `toyos-ld`
+/// writes it into the file, so a `PT_LOAD`'s `filesz` equals its `memsz` and
+/// the loader's `Anonymous` tail is empty. What is left is a *writable
+/// file-backed* page — non-zero so it lands in `.data`, and named by nothing
+/// else so no relocation has touched it — which faults on first write and takes
+/// the allocate-and-copy path. Four megabytes of test image is what two faults
+/// cost, and that is the whole reason there are two rather than twenty.
+static mut DEMAND: [u8; PAGE_2M * 2] = [1; PAGE_2M * 2];
+
 /// Where the raw thread probe writes what it found at its very first
 /// instruction. A static, because there is nothing between the trampoline's
 /// `iretq` and the `fxsave64` and there must not be.
@@ -102,25 +125,25 @@ macro_rules! pin_state {
     () => {
         concat!(
             "fninit\n",
-            "fldcw [{a}]\n",
+            "fldcw [r15]\n",
             "fld1\nfldl2t\nfldl2e\nfldpi\nfldlg2\nfldln2\nfld1\nfldpi\n",
-            "ldmxcsr [{a} + {mx}]\n",
-            "movdqu xmm0,  [{a} + {x} + 0*16]\n",
-            "movdqu xmm1,  [{a} + {x} + 1*16]\n",
-            "movdqu xmm2,  [{a} + {x} + 2*16]\n",
-            "movdqu xmm3,  [{a} + {x} + 3*16]\n",
-            "movdqu xmm4,  [{a} + {x} + 4*16]\n",
-            "movdqu xmm5,  [{a} + {x} + 5*16]\n",
-            "movdqu xmm6,  [{a} + {x} + 6*16]\n",
-            "movdqu xmm7,  [{a} + {x} + 7*16]\n",
-            "movdqu xmm8,  [{a} + {x} + 8*16]\n",
-            "movdqu xmm9,  [{a} + {x} + 9*16]\n",
-            "movdqu xmm10, [{a} + {x} + 10*16]\n",
-            "movdqu xmm11, [{a} + {x} + 11*16]\n",
-            "movdqu xmm12, [{a} + {x} + 12*16]\n",
-            "movdqu xmm13, [{a} + {x} + 13*16]\n",
-            "movdqu xmm14, [{a} + {x} + 14*16]\n",
-            "movdqu xmm15, [{a} + {x} + 15*16]\n",
+            "ldmxcsr [r15 + {mx}]\n",
+            "movdqu xmm0,  [r15 + {x} + 0*16]\n",
+            "movdqu xmm1,  [r15 + {x} + 1*16]\n",
+            "movdqu xmm2,  [r15 + {x} + 2*16]\n",
+            "movdqu xmm3,  [r15 + {x} + 3*16]\n",
+            "movdqu xmm4,  [r15 + {x} + 4*16]\n",
+            "movdqu xmm5,  [r15 + {x} + 5*16]\n",
+            "movdqu xmm6,  [r15 + {x} + 6*16]\n",
+            "movdqu xmm7,  [r15 + {x} + 7*16]\n",
+            "movdqu xmm8,  [r15 + {x} + 8*16]\n",
+            "movdqu xmm9,  [r15 + {x} + 9*16]\n",
+            "movdqu xmm10, [r15 + {x} + 10*16]\n",
+            "movdqu xmm11, [r15 + {x} + 11*16]\n",
+            "movdqu xmm12, [r15 + {x} + 12*16]\n",
+            "movdqu xmm13, [r15 + {x} + 13*16]\n",
+            "movdqu xmm14, [r15 + {x} + 14*16]\n",
+            "movdqu xmm15, [r15 + {x} + 15*16]\n",
         )
     };
 }
@@ -168,13 +191,25 @@ fn main() {
     }
 }
 
+/// Every arm runs and every verdict is collected, rather than the first failure
+/// ending the run: the negative control's whole job is to show that each arm
+/// has teeth, and a run that stops at the first one proves it about one.
 fn driver() {
+    let mut failures: Vec<String> = Vec::new();
     for round in 0..3 {
-        leak_arm(round);
-        fault_arm(round);
+        failures.extend(leak_arm(round).err());
+        failures.extend(fault_arm(round).err());
     }
-    preservation_arm();
+    failures.extend(preservation_arm().err());
+    for f in &failures {
+        println!("  FAILED: {f}");
+    }
+    assert!(failures.is_empty(), "{} arm(s) did not preserve the state", failures.len());
     println!("every transition out of Ring 3 preserved the whole user machine state");
+}
+
+fn require(ok: bool, why: impl FnOnce() -> String) -> Result<(), String> {
+    if ok { Ok(()) } else { Err(why()) }
 }
 
 fn spawn_mode(mode: &str) -> std::process::ExitStatus {
@@ -185,32 +220,37 @@ fn spawn_mode(mode: &str) -> std::process::ExitStatus {
 }
 
 /// Arm 1. `pin` leaves a state behind; `check` must not find it.
-fn leak_arm(round: u32) {
+fn leak_arm(round: u32) -> Result<(), String> {
     let pinned = spawn_mode("pin");
-    assert!(pinned.success(), "round {round}: the pin child exited {:?}", pinned.code());
+    require(pinned.success(), || {
+        format!("round {round}: the pin child exited {:?}", pinned.code())
+    })?;
     let status = spawn_mode("check");
-    assert!(
-        status.success(),
-        "round {round}: a process started with the previous one's FP registers (exit {:?})",
-        status.code(),
-    );
+    require(status.success(), || {
+        format!(
+            "leak, round {round}: a process started with the previous one's FP registers \
+             (exit {:?})",
+            status.code(),
+        )
+    })
 }
 
 /// Arm 2. A process dies with an unmasked x87 exception pending; the next one
 /// executes a waiting instruction and must live.
-fn fault_arm(round: u32) {
+fn fault_arm(round: u32) -> Result<(), String> {
     // The child's own verdict is not asserted: it dies on a machine that raises
     // #MF and survives on one that does not, and known-issues §1 has an
     // unexplained instance of the latter. Either way it leaves the control word
     // unmasked, which is what the next process has to be protected from.
     let _ = Command::new("/bin/test_rs_fault_gate_child").arg("mf").status();
     let status = spawn_mode("fldcw");
-    assert!(
-        status.success(),
-        "round {round}: FLDCW took an exception the process never caused — the previous \
-         process's pending x87 exception was still on the CPU (exit {:?})",
-        status.code(),
-    );
+    require(status.success(), || {
+        format!(
+            "fault, round {round}: FLDCW took an exception the process never caused — the \
+             previous process's pending x87 exception was still on the CPU (exit {:?})",
+            status.code(),
+        )
+    })
 }
 
 /// Load the distinctive state and leave Ring 3 in the same instruction stream,
@@ -222,7 +262,7 @@ fn pin_and_exit() -> ! {
             "mov rdi, {exit}",
             "xor esi, esi",
             "syscall",
-            a = in(reg) &raw const ARENA,
+            in("r15") &raw const ARENA,
             mx = const offset_of!(Arena, mx),
             x = const offset_of!(Arena, xmm),
             exit = const SYS_EXIT,
@@ -317,22 +357,22 @@ fn fldcw_survivor() {
 
 /// Arm 3. Everything from the pin to the capture is one instruction stream, so
 /// nothing the compiler emits between them can touch the state under test.
-fn preservation_arm() {
-    const FAULT_PAGES: u64 = 16;
-    const PAGE_2M: u64 = 2 * 1024 * 1024;
+///
+/// **An unbracketed transition only corrupts if it switches**, and that is what
+/// the sibling is for. Kernel code is soft-float, so a `#PF` that allocates a
+/// page and returns disturbs nothing however unbracketed it is; what does the
+/// damage is another task running Ring 3 code in between. A sibling that sleeps
+/// in a short loop wakes several times inside a single 2 MiB fault — the fault
+/// path runs with interrupts on and the measured cost of one is hundreds of
+/// microseconds — so `need_resched` is set when `common_entry` reaches its exit
+/// and the switch happens there rather than by luck.
+fn preservation_arm() -> Result<(), String> {
     const SYSCALLS: u64 = 20_000;
-    const SPIN: u64 = 40_000_000;
+    const SPIN: u64 = 2_000_000;
+    /// Short against the fault's own cost, so several land inside one.
+    const SIBLING_NAP_NS: u64 = 100_000;
 
-    let region = unsafe {
-        mmap(
-            core::ptr::null_mut(),
-            (FAULT_PAGES * PAGE_2M) as usize,
-            MmapProt::READ | MmapProt::WRITE,
-            MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
-        )
-    };
-    assert!(!region.is_null(), "no region for the page-fault arm");
-    unsafe { ARENA.region = region as u64 };
+    unsafe { ARENA.region = (&raw mut DEMAND) as u64 };
 
     let stop = Arc::new(AtomicBool::new(false));
     let sibling = {
@@ -340,6 +380,7 @@ fn preservation_arm() {
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 fp_noise();
+                nanosleep(SIBLING_NAP_NS);
             }
         })
     };
@@ -347,7 +388,7 @@ fn preservation_arm() {
     unsafe {
         core::arch::asm!(
             pin_state!(),
-            "fxsave64 [{a} + {before}]",
+            "fxsave64 [r15 + {before}]",
 
             // r13 is the counter and r14 the cursor: `clobber_abi` requires an
             // output to name its register, and these two have to outlive the
@@ -359,10 +400,10 @@ fn preservation_arm() {
             "dec r13",
             "jnz 2b",
 
-            // One write per 2 MiB page of a mapping nothing has touched, so
+            // One write per 2 MiB page of a writable file-backed region, so
             // every iteration is exactly one #PF through `common_entry`.
             "mov r13, {npages}",
-            "mov r14, [{a} + {region}]",
+            "mov r14, [r15 + {region}]",
             "3:",
             "mov byte ptr [r14], 1",
             "add r14, {step}",
@@ -375,17 +416,17 @@ fn preservation_arm() {
             "dec r13",
             "jnz 4b",
 
-            "fxsave64 [{a} + {after}]",
+            "fxsave64 [r15 + {after}]",
             // Leave the x87 stack as Rust expects to find it.
             "fninit",
-            a = in(reg) &raw mut ARENA,
+            in("r15") &raw mut ARENA,
             mx = const offset_of!(Arena, mx),
             x = const offset_of!(Arena, xmm),
             region = const offset_of!(Arena, region),
             before = const offset_of!(Arena, before),
             after = const offset_of!(Arena, after),
             step = const PAGE_2M,
-            npages = const FAULT_PAGES,
+            npages = const FAULT_TOUCHES,
             nsys = const SYSCALLS,
             spin = const SPIN,
             clock = const SYS_CLOCK,
@@ -400,20 +441,39 @@ fn preservation_arm() {
 
     let before = unsafe { &*(&raw const ARENA.before) };
     let after = unsafe { &*(&raw const ARENA.after) };
-    assert_eq!(fcw(after), fcw(before), "the x87 control word did not survive");
-    assert_eq!(fsw(after), fsw(before), "the x87 status word did not survive");
-    assert_eq!(after.0[OFF_FTW], before.0[OFF_FTW], "the x87 tag word did not survive");
-    assert_eq!(mxcsr(after), mxcsr(before), "MXCSR did not survive");
+    let what = format!(
+        "{SYSCALLS} syscalls, {FAULT_TOUCHES} page faults and a preemption spin"
+    );
+    require(fcw(after) == fcw(before), || {
+        format!(
+            "preservation: the x87 control word did not survive {what} — {:#06x} became {:#06x}",
+            fcw(before),
+            fcw(after),
+        )
+    })?;
+    require(fsw(after) == fsw(before), || {
+        format!("preservation: the x87 status word did not survive {what}")
+    })?;
+    require(after.0[OFF_FTW] == before.0[OFF_FTW], || {
+        format!("preservation: the x87 tag word did not survive {what}")
+    })?;
+    require(mxcsr(after) == mxcsr(before), || {
+        format!(
+            "preservation: MXCSR did not survive {what} — {:#010x} became {:#010x}",
+            mxcsr(before),
+            mxcsr(after),
+        )
+    })?;
     let differing =
         registers(before).iter().zip(registers(after)).filter(|(a, b)| a != b).count();
-    assert_eq!(
-        differing,
-        0,
-        "{differing} of {} register bytes changed across {SYSCALLS} syscalls, \
-         {FAULT_PAGES} page faults and a preemption spin",
-        registers(before).len(),
-    );
-    println!("  the whole state survived {SYSCALLS} syscalls and {FAULT_PAGES} page faults");
+    require(differing == 0, || {
+        format!(
+            "preservation: {differing} of {} register bytes changed across {what}",
+            registers(before).len(),
+        )
+    })?;
+    println!("  the whole state survived {what}");
+    Ok(())
 }
 
 /// What the sibling does: dirty every kind of FP register there is.
@@ -424,12 +484,12 @@ fn fp_noise() {
             "fldpi",
             "fldl2t",
             "fldln2",
-            "movdqu xmm0,  [{a} + {x} + 0*16]",
-            "movdqu xmm3,  [{a} + {x} + 1*16]",
-            "movdqu xmm7,  [{a} + {x} + 2*16]",
-            "movdqu xmm11, [{a} + {x} + 3*16]",
-            "movdqu xmm15, [{a} + {x} + 4*16]",
-            a = in(reg) &raw const ARENA,
+            "movdqu xmm0,  [r15 + {x} + 0*16]",
+            "movdqu xmm3,  [r15 + {x} + 1*16]",
+            "movdqu xmm7,  [r15 + {x} + 2*16]",
+            "movdqu xmm11, [r15 + {x} + 3*16]",
+            "movdqu xmm15, [r15 + {x} + 4*16]",
+            in("r15") &raw const ARENA,
             x = const offset_of!(Arena, xmm),
             clobber_abi("sysv64"),
         );

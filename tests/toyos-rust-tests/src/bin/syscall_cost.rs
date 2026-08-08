@@ -1,8 +1,11 @@
 //! What a transition out of Ring 3 costs, in cycles.
 //!
-//! Two paths, because `specs/user-machine-state.md` §11 needs them attributed
-//! separately: the syscall entry, and the exception entry through a demand
-//! page fault. Both are the paths `arch::entry`'s bracket sits on.
+//! The syscall entry, which is the busiest of the five places `arch::entry`'s
+//! bracket sits. The exception entry pays the same two instructions, and there
+//! is no cheap way to measure it here: the only demand-paged memory a userland
+//! program can reach is its own file-backed pages — `sys_mmap` allocates and
+//! maps its whole region up front — so a workload of N faults costs N × 2 MiB
+//! of test image.
 //!
 //! **It prints and never asserts.** A threshold measured under TCG is
 //! meaningless — QEMU implements `FXSAVE` as a helper call and prices nothing
@@ -14,14 +17,10 @@
 //! is the run with the least interference, and on a host running eleven other
 //! guests interference is all the mean measures.
 
-use toyos_abi::syscall::{clock_nanos, mmap, munmap, MmapFlags, MmapProt};
+use toyos_abi::syscall::clock_nanos;
 
 const REPS: usize = 9;
 const SYSCALLS_PER_REP: u64 = 20_000;
-
-/// 2 MiB pages, so this many faults is this many private-page allocations.
-const FAULT_PAGES: usize = 64;
-const PAGE_2M: usize = 2 * 1024 * 1024;
 
 fn rdtsc() -> u64 {
     let lo: u32;
@@ -49,39 +48,12 @@ fn syscall_cycles() -> u64 {
     (end - start) / SYSCALLS_PER_REP
 }
 
-/// Cycles per demand page fault on a freshly mapped anonymous region.
-///
-/// One write per 2 MiB page, so every iteration is exactly one `#PF` through
-/// `common_entry` plus the page the kernel allocates behind it.
-fn page_fault_cycles() -> Option<u64> {
-    let size = PAGE_2M * FAULT_PAGES;
-    let base = unsafe {
-        mmap(
-            core::ptr::null_mut(),
-            size,
-            MmapProt::READ | MmapProt::WRITE,
-            MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
-        )
-    };
-    if base.is_null() {
-        return None;
-    }
-    let start = rdtsc();
-    for page in 0..FAULT_PAGES {
-        unsafe { core::ptr::write_volatile(base.add(page * PAGE_2M), 1u8) };
-    }
-    let end = rdtsc();
-    let _ = unsafe { munmap(base, size) };
-    Some((end - start) / FAULT_PAGES as u64)
-}
-
 fn main() {
     // A first pass nobody reads: the loop's own pages have to be faulted in
     // before the number is about the syscall rather than about the text.
     syscall_cycles();
 
     let syscall = (0..REPS).map(|_| syscall_cycles()).min().unwrap();
-    let fault = (0..REPS).filter_map(|_| page_fault_cycles()).min();
 
     // The clock alongside the cycles, because a TSC that does not tick at a
     // fixed rate makes the cycle counts incomparable and this is the only
@@ -92,9 +64,5 @@ fn main() {
     let hz = (rdtsc() - c0) * 1_000_000_000 / (clock_nanos() - t0);
 
     println!("syscall_cost: {syscall} cycles/syscall over {REPS}x{SYSCALLS_PER_REP}");
-    match fault {
-        Some(f) => println!("syscall_cost: {f} cycles/pagefault over {REPS}x{FAULT_PAGES}"),
-        None => println!("syscall_cost: no pagefault measurement — mmap refused"),
-    }
     println!("syscall_cost: tsc {} MHz", hz / 1_000_000);
 }
