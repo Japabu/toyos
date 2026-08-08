@@ -78,7 +78,7 @@ Largest entries:
 | 12,245,032 | `bin/sshd` |
 | 6,827,984 | `bin/toyos-ld` |
 | 6,220,808 | `share/wallpaper.rgb` |
-| 5,994,284 | `share/timgm6mb.sf2` (no longer shipped — §5) |
+| 5,994,284 | `share/timgm6mb.sf2` (gone; `share/soundfont.sf2` is 15,546,764 in its place — §5) |
 | 5,225,776 | `bin/compositor` |
 | 5,161,144 | `bin/files` |
 | 4,196,020 | `share/doom1.wad` |
@@ -420,14 +420,16 @@ its music from. The image built after that commit did not have it, and the whole
 suite was green either way — **nothing in this tree gates doom's music**, which
 is a finding of its own.
 
-So `untracked-assets` in each config names the paths that ship without git
-having a copy. Both halves of what that meant changed on 2026-08-08. TimGM6mb is
-GPL-2.0 under an MIT OR Apache-2.0 tree, so it is gone from the repository
-altogether and §1.2's 5,994,284-byte entry with it; music is opt-in, from a
-`.sf2` the owner of a build drops in himself. And a declared entry the build
-cannot find is now named and skipped rather than fatal — the naming is what the
-hard error was for, the stopping was what made a fresh clone, a runner and every
-new worktree red on a file none of them was ever going to have.
+That was answered with `untracked-assets`, a per-config list of paths that ship
+without git having a copy, and it lasted one day. TimGM6mb is GPL-2.0 under an
+MIT OR Apache-2.0 tree, so it left the repository and §1.2's 5,994,284-byte
+entry with it; `assets/soundfont.sf2` — the GeneralUser GS subset
+`src/soundfont.rs` produces, 15,546,764 bytes — replaced it committed, which
+left `untracked-assets` with no users and it is deleted. **The declaration is
+git's index again, and what survived is the naming**: an asset git carries that
+the working tree does not is named and skipped rather than fatal. The naming is
+what the hard error was for; the stopping is what made a fresh clone, a runner
+and every new worktree red on a file none of them was ever going to have.
 
 ## 6. One profile
 

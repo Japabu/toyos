@@ -178,6 +178,10 @@ const RUST_SKIP: &[&str] = &[
     // 4 MiB and every other test boots that config. `doom_sound_flood` runs it
     // on `tests/doomcase`.
     "doom_sound_flood",
+    // Same, plus the WAD and the SoundFont doom's music is made of, which no
+    // other config should pay 19 MiB of initrd for. `doom_music` runs it on
+    // `tests/doommusiccase`.
+    "doom_music",
     // Its failure mode is a CPU that never runs anything again, so on the
     // shared boot it would be reported against whichever test came next — and
     // every one after that. `short_sleep_livelock` gives it a boot of its own.
@@ -326,6 +330,10 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // counted in periods, and the capture is read for amplitude and never for
     // timing. Its own boot, its own config, and the only client its soundd has.
     ("doom_sound_flood", Sched::Parallel),
+    // Parallel on the same argument: the play is bounded by the audio
+    // callback's own period count, and the capture is read for amplitude and
+    // for what fraction of it carries signal — never for when.
+    ("doom_music", Sched::Parallel),
     ("netd_connection_caps", Sched::Parallel),
     // Its own boot with a NIC under it, because sshd leaves at the bind on
     // every other config. Every verdict is a line of text; no clock in any.
@@ -4796,6 +4804,121 @@ const SNAKE_ROUNDS: usize = 3;
 /// a program that has been running and drawing rather than one a second old.
 const SNAKE_TURNS: usize = 8;
 
+/// Gate: doom's music reaches the device, with the SoundFont this tree ships.
+///
+/// **The wiring is all this measures, and the wiring is the part nothing else
+/// can.** `src/soundfont.rs`'s host tests say the committed bank covers every
+/// instrument `assets/DOOM1.WAD` selects, and `specs/doom-music-soundfont.md`
+/// §4 says the subset renders bit-exact against the full bank through this same
+/// `mus2mid.c` and this same rustysynth. Neither can say the file got into an
+/// initrd, that doom opened it, or that what came out reached an audio device.
+/// Those three are what `b8b0749` broke for a cycle with the suite green.
+///
+/// Three verdicts, none of them a clock:
+///
+/// 1. **doom opened the file this tree committed.** The guest prints the byte
+///    count it read, and the host compares it against `assets/soundfont.sf2` on
+///    disk. A stale initrd, a truncated asset and a second SoundFont from
+///    somewhere else all fail here rather than turning into quiet silence.
+/// 2. **It played to the end of the check.** The actuator counts the audio
+///    callback's own periods, so a host that stopped this guest cannot shorten
+///    what the capture is judged on.
+/// 3. **Music reached the wire.** The device capture carries signal across most
+///    of its length — which separates music from the one thing a broken
+///    soundfont path still produces, a stream of zeroes.
+fn doom_music(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shipped = fs::metadata(root.join(toyos_build::soundfont::SOUNDFONT_PATH))
+        .map_err(|e| format!("{}: {e}", toyos_build::soundfont::SOUNDFONT_PATH))?
+        .len();
+
+    let config = root.join("tests/doommusiccase");
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], rust_bins, BootOptions::default());
+
+    let result = qemu.run_test("test_rs_doom_music", Duration::from_secs(120));
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\n{}", result.stdout));
+    }
+    if result.exit_code != Some(0) {
+        return Err(format!(
+            "doom could not play its own music (exit {:?}):\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+
+    let opened = result
+        .stdout
+        .lines()
+        .find(|line| line.contains("[doom-sound] /share/soundfont.sf2:"))
+        .ok_or_else(|| {
+            format!(
+                "doom said nothing about the SoundFont, so this image has none:\n{}",
+                result.stdout
+            )
+        })?;
+    let bytes: u64 = opened
+        .split_whitespace()
+        .find_map(|token| token.parse().ok())
+        .ok_or_else(|| format!("no byte count in {opened:?}"))?;
+    if bytes != shipped {
+        return Err(format!(
+            "doom opened a {bytes}-byte SoundFont and this tree ships {shipped} bytes: the \
+             image is not carrying {}",
+            toyos_build::soundfont::SOUNDFONT_PATH
+        ));
+    }
+
+    let played = result
+        .stdout
+        .lines()
+        .find(|line| line.contains("[music-check] lump="))
+        .ok_or_else(|| format!("doom printed no [music-check] line:\n{}", result.stdout))?
+        .to_string();
+
+    let _ = qemu.drain_serial(Duration::from_millis(500));
+    let wav = audio::parse_wav(qemu.audio_wav_path())?;
+    let analysis = audio::analyze(&wav);
+
+    // Seconds of signal, not a fraction of the capture: the capture runs from
+    // soundd opening the stream to the harness closing the file, so a fraction
+    // measures the harness as much as the music. Three of these four runs
+    // measured 1.19 s over a 3.11 s capture — the material's own dynamics, not
+    // a shortfall, since 500 LSB is -36 dBFS and E1M1's riff drops through it
+    // between notes.
+    const MIN_SIGNAL_SECS: f64 = 0.8;
+    let signal = analysis.active_samples as f64 / wav.sample_rate as f64;
+    if signal < MIN_SIGNAL_SECS {
+        return Err(format!(
+            "{signal:.2} s of the capture carries signal, under {MIN_SIGNAL_SECS} s: what doom \
+             rendered is not what the device played\n{played}"
+        ));
+    }
+    // A floor and not a band: how loud E1M1 is at a given moment is the
+    // arrangement's business, and what this excludes is a dither floor being
+    // read as music. Measured 13547.
+    const MIN_PEAK: i32 = 6000;
+    if analysis.peak < MIN_PEAK {
+        return Err(format!(
+            "the device peaked at {} (expected at least {MIN_PEAK}): the music is inaudible\
+             \n{played}",
+            analysis.peak
+        ));
+    }
+
+    // Underruns are reported and fail nothing: whether music *stutters* is gate
+    // A's question and it has the statistics to ask it, where one boot of one
+    // track is one sample of an intermittent.
+    eprintln!(
+        "  [doommusiccase] {}, {signal:.2} s of signal in a {:.2} s capture at peak {}, \
+         {} underrun(s)",
+        played.trim(),
+        wav.mono.len() as f64 / wav.sample_rate as f64,
+        analysis.peak,
+        analysis.underruns.len(),
+    );
+    Ok(())
+}
+
 fn desktop_window_child(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> {
     let bins: Vec<(String, Vec<u8>)> =
         rust_bins.iter().filter(|(name, _)| name == "window_child").cloned().collect();
@@ -6446,6 +6569,7 @@ fn run_machine_test(
         "metal_sim_null_audio" => audio::null_sink_real_rate(test_config, c_bins, rust_bins),
         "null_sink_shipped_client" => audio::null_sink_shipped_client(test_config, c_bins, rust_bins),
         "doom_sound_flood" => audio::doom_sound_flood(rust_bins),
+        "doom_music" => doom_music(rust_bins),
         "metal_sim_compositor" => {
             metal_sim_compositor(group_boot(held, METAL_SIM_DESKTOP, || {
                 boot_metal_sim_desktop(rust_bins)

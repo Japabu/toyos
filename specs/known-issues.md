@@ -4880,7 +4880,10 @@ construction. Found 2026-08-07 while pricing that stage — the 2026-07-29 versi
 of that document listed this as one of eight items a USB storage driver would
 have to bring, and it is the one that did not arrive with it.
 
-### Nothing gates doom's music, and nothing ships a SoundFont to gate it with
+### CLOSED — nothing gated doom's music, and nothing shipped a SoundFont to gate it with
+
+**Closed 2026-08-08 by `wt/toyos-doommusic`: the image ships a SoundFont again
+and `doom_music` plays it at the device.**
 
 The original finding: `b34a69c` filtered the asset sweep to what git tracks and
 took `assets/timgm6mb.sf2` out of every image; the full suite was green with it
@@ -4888,27 +4891,57 @@ and without it, `doom_sound_flood` included — that actuator "synthesises its o
 sound and never opens the WAD or the soundfont". The only evidence anywhere was
 one `assets: skipping` line in the build output. `fdcaa0b` restored the file and
 made a declared-but-absent asset a hard error, so for a while the *file* was
-gated even though the music was not.
+gated even though the music was not. `b8b0749` then removed it for the licence —
+TimGM6mb is GPL-2.0 under an MIT OR Apache-2.0 tree — which fixed the licence
+and left the milestone unmet.
 
-**The file is now deliberately absent and the hard error is gone** — the owner's
-decision, 2026-08-08. TimGM6mb is GPL-2.0 and this tree is MIT OR Apache-2.0, so
-shipping it put copyleft obligations on anyone redistributing an image; every
-permissive General MIDI replacement is around six times the size of the image's
-largest entry, and the image is already too big. Music is opt-in from a `.sf2`
-dropped in as `assets/soundfont.sf2`; a declared entry the build cannot find is
-named and skipped; the absence is stated at build time and again by
-`toyos_music_init`'s "playing without music". `system.toml` names GeneralUser GS
-(CC-BY-4.0) as the recommended one and records that its author cannot be certain
-of every sample's origin.
+**What shipped.** `assets/soundfont.sf2`, 15,546,764 bytes: GeneralUser GS
+v2.0.3 cut down by `src/soundfont.rs` to the 37 melodic programs and 23
+percussion keys `assets/DOOM1.WAD`'s own MUS headers select. `NOTICE` carries
+its licence and the author's provenance caveat; `specs/doom-music-soundfont.md`
+prices every option including the zero-byte OPL3 one the owner may take later.
+The default image goes from 131,072,000 to 148,897,792 bytes, both measured in
+one session.
 
-**What is left is the ungated half this entry was always about, and it is now the
-normal case rather than an accident.** Nothing asserts doom's synthesiser
-produced anything, so a defect between a SoundFont and the sink is invisible to
-`cargo test` — and on CI, on a fresh clone and in every worktree there is now no
-SoundFont for such a defect to be found with at all. Gate A measures the test
-tone and doom's sound-stress actuator; neither is the music path. A gate on
-music would have to carry a permissively-licensed `.sf2` of its own, which is
-the same licence question one size down, and that is why there is not one.
+**Three gates where there were none.** In `cargo test --lib`, seconds and no
+guest: the shipped bank sounds every instrument the shipped WAD selects, carries
+nothing else, and still holds its source's `ICOP` and licence text — both halves
+read from the files that ship rather than from a list somebody typed, so a
+missing file, a truncated one and a bank subset against a different WAD all land
+there. In the guest, `doom_music` on `tests/doommusiccase`:
+`/bin/doom --music-check` converts `D_E1M1` through the real `mus2mid.c` and
+rustysynth and plays it at the real device, and the host asserts the byte count
+doom opened against `assets/soundfont.sf2` on disk, 1,033 mixed periods, and
+signal in the capture. First green run: 1.20 s of signal in a 3.13 s capture at
+peak 13,547, 0 underruns.
+
+**What is still not gated** is how *well* it plays. A stutter in the music is
+gate A's question and one boot of one track is one sample of an intermittent, so
+`doom_music` reports underruns and fails on none. The synthesis needs no gate
+here: `specs/doom-music-soundfont.md` §4 renders all 13 tracks bit-exact against
+the full bank, through the same `mus2mid.c` and the same rustysynth the guest
+runs.
+
+### Four configs ship doom's assets into initrds holding nothing that can open them
+
+`assets = ["assets"]` sweeps the directory whole and there is no way to name
+part of it, so `console/`, `tests/desktopcase`, `tests/desktopaudiocase` and
+`tests/metalcase` each carry `DOOM1.WAD` (4,196,020 B) and now
+`soundfont.sf2` (15,546,764 B) into an image with no doom in it. This is
+`specs/boot-image-split.md` §5's shape, four times bigger: that section records
+the same four configs paying 5,994,284 B for TimGM6mb when
+`untracked-assets` declared it in configs that did not build doom.
+
+**Measured before it was left alone**, 2026-08-08, one session, same worktree:
+`metal_sim_compositor` is 8 s either way, and the harness's own boot probe moves
+from 1,445 ms to ~1,485 ms — about 40 ms of boot for 15.5 MB of initrd. The
+flashable `--console-boot` image grows by the same 15.5 MB, which matters more
+to whoever writes it to a stick than to the suite.
+
+The fix is per-config asset selection — `assets` naming files as well as
+directories — and it changes what five configs ship, under screen tests that
+read pixels off four of them. Not worth 40 ms; worth doing when something else
+touches that code.
 
 ### No test boots the config the project ships
 

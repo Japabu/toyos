@@ -1,6 +1,8 @@
 # Doom's music: what it needs, and what each way of supplying it costs
 
-Status: **options priced, decision open.** The licence call is the owner's.
+Status: **decided and shipped — option 1**, by the owner on 2026-08-08 with the
+licences and the sizes in front of him. §8 is what was built and what gates it.
+§1–§7 are the survey it was decided from, left as they were written.
 
 `b8b0749` removed `assets/timgm6mb.sf2` because it is GPL-2.0 under an
 MIT OR Apache-2.0 tree, and made music opt-in from `assets/soundfont.sf2`. That
@@ -173,3 +175,55 @@ default-silent Doom does not meet it.
   time or ships a pre-made file.
 - Nothing here was committed to `assets/`; `.gitignore:7` (`assets/*.sf2`) means
   a dropped-in font cannot be committed by accident.
+
+## 8. What shipped, and what gates it
+
+Every number here came from a command run on 2026-08-08 in one session.
+
+**The file.** `assets/soundfont.sf2`, 15,546,764 bytes, sha256 `89a13a5c…5905c3`.
+It is §4's subset: `src/soundfont.rs` is `sf2sub` ported into the build crate,
+and the port is byte-identical to the scratch tool's output — the shipped file's
+`sdta` and `pdta` chunks are `cmp`-identical to the file whose 13 tracks §4
+verified, and the whole file differs from it only in the `INFO` chunk that names
+the tool. So §4's bit-exactness carries to what ships without re-rendering.
+
+**The instrument list is read, not written down.** `doom_instruments` walks
+`assets/DOOM1.WAD`'s MUS headers and answers §1's 37 programs and 23 keys, and
+the same function feeds the subsetter and the gate. §1's percussion set is
+confirmed exactly: 35, 36, 38, 40–53, 55, 57, 59, 75, 80, 81.
+
+**`cargo run -- --regen-soundfont <bank.sf2>`** rewrites it, the shape
+`--regen-font` and `--regen-wallpaper` already have. The source bank is not
+committed: 32,319,396 bytes to prove a property of 15,546,748 is the same
+samples twice, so unlike the wallpaper there is no byte-for-byte
+"the artifact is what this code draws" test. What replaces it is three
+properties checked against the files that *do* ship — the bank sounds every
+instrument the WAD selects, carries nothing else (exactly 37 bank-0 presets plus
+bank 128 preset 0, and exactly 23 sounding drum keys), and still holds the
+source's `ICOP` and licence text. All in `cargo test --lib`, no guest, 0.01 s.
+
+**The image cost.** 131,072,000 → 148,897,792 bytes, both measured in this
+worktree in one session by building with and without the file. That is
+17,825,792 bytes for a 15,546,764-byte asset; the difference is the image's
+sector rounding.
+
+**`doom_music` is the guest gate**, on `tests/doommusiccase` (soundd,
+test-runner, doom, assets). `/bin/doom --music-check` reads `D_E1M1` out of the
+WAD, converts it through the real `mus2mid.c`, plays it through the real
+rustysynth at the real device, and waits on the audio callback's own period
+count rather than a clock. The host asserts the byte count doom printed against
+`assets/soundfont.sf2` on disk, that 1,033 periods were mixed, and that the
+capture carries signal. Green: `lump=D_E1M1 midi_bytes=17283 periods=1033
+rendered_frames=261120`, 1.20 s of signal in a 3.13 s capture at peak 13,547,
+0 underruns. Underruns are printed and fail nothing — how *well* it plays is
+gate A's question, and one boot of one track is one sample.
+
+**The one thing that could not be checked in the tree.** `music_check` calls
+`Z_Init()` before `mus2mid`, because `memio.c` allocates out of doomgeneric's
+zone and the path that sets it up is `D_DoomMain`, which needs a window, an
+event loop and a compositor. Without it the first `Z_Malloc` faults at `0x30`.
+
+**The part that cannot be undone.** 15,546,764 bytes are in git history now.
+Option 2 can delete the file; it cannot delete the history. That was priced
+before the decision and `NOTICE` says so where somebody taking option 2 will
+read it.

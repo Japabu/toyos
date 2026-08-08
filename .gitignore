@@ -1,10 +1,12 @@
 target/
 .claude/
-# A SoundFont is a licence question and this repository answers it by shipping
-# none: TimGM6mb was GPL-2.0 under an MIT OR Apache-2.0 tree. The pattern rather
-# than the one filename, because the reason applies to whichever one somebody
-# drops in for music of their own.
+# A SoundFont is a licence question, and this repository answers it for exactly
+# one: `assets/soundfont.sf2`, which `NOTICE` accounts for. The pattern stays
+# for every other one, because a bank somebody drops in to try is a bank nobody
+# has established this project may redistribute — TimGM6mb was GPL-2.0 under an
+# MIT OR Apache-2.0 tree and reached `assets/` the same way.
 assets/*.sf2
+!assets/soundfont.sf2
 .vscode/
 .mcp.json
 .DS_Store

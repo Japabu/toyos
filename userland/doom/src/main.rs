@@ -206,6 +206,13 @@ fn main() {
         std::process::exit(sound::sound_stress());
     }
 
+    // The shipped SoundFont reaching the device, without a window, a compositor
+    // or 30 seconds of title screen in the way. Driven by
+    // `tests/toyos-rust-tests/src/bin/doom_music.rs`.
+    if std::env::args().any(|arg| arg == "--music-check") {
+        std::process::exit(sound::music_check());
+    }
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let app = DoomApp {
         window: None,

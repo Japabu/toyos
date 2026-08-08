@@ -502,6 +502,7 @@ bootstrap this document exists to prevent.
 **It carried `.cargo/config.toml` and not `assets/timgm6mb.sf2`**, which reddened
 nine tests of the desktop and metal-sim families in every brand-new worktree
 until somebody copied that file across. Closed 2026-08-08, and not by copying it:
-no config that builds no doom declares a SoundFont any longer, and the one that
-does declares an absence rather than a requirement. There is nothing left to copy
-— `specs/ci-plan.md` §6 is the account.
+the SoundFont a worktree needs is `assets/soundfont.sf2` and git carries it, so a
+checkout has it like every other asset. There is nothing left to copy —
+`specs/ci-plan.md` §6 is the account, and its own SoundFont paragraph predates
+this.

@@ -19,6 +19,9 @@ extern "C" {
 
 // MUS-to-MIDI conversion (mus2mid.c / memio.c)
 extern "C" {
+    /// doomgeneric's zone allocator, which `memio.c` allocates out of.
+    /// `D_DoomMain` calls it and `music_check` runs before there is one.
+    fn Z_Init();
     fn mem_fopen_read(buf: *const u8, buflen: usize) -> *mut c_void;
     fn mem_fopen_write() -> *mut c_void;
     fn mem_get_buf(stream: *mut c_void, buf: *mut *mut u8, buflen: *mut usize);
@@ -505,12 +508,12 @@ unsafe extern "C" fn toyos_sound_is_playing(handle: i32) -> bool {
 
 // ── Music ──
 
-// A General MIDI SoundFont, and this project ships none: the one it used to
-// carry was GPL-2.0 under an MIT OR Apache-2.0 tree, and every permissive
-// replacement is around six times the size of the image's largest entry. So the
-// file is whatever the owner of a build drops into `assets/` — named for the
-// role and not for one SoundFont — and `toyos_music_init` says what it is doing
-// without it. `system.toml` is where it is declared.
+// A General MIDI SoundFont. The image ships one — `src/soundfont.rs` cuts
+// GeneralUser GS down to the instruments this WAD's MUS lumps select — and the
+// name is the role rather than that bank, so a build carrying another one plays
+// through it unchanged. `toyos_music_init` says which it opened and says so
+// again when there is none, because an image without music must not be an image
+// that is merely quiet.
 const SOUNDFONT_PATH: &str = "/share/soundfont.sf2";
 
 // ~3s of render-ahead at 44100Hz. On a saturated single core the game thread
@@ -757,6 +760,7 @@ unsafe extern "C" fn toyos_music_init() -> bool {
                 return false;
             }
         };
+        let bytes = sf2.len();
         let sf = match SoundFont::new(&mut std::io::Cursor::new(sf2)) {
             Ok(sf) => Arc::new(sf),
             Err(e) => {
@@ -764,6 +768,13 @@ unsafe extern "C" fn toyos_music_init() -> bool {
                 return false;
             }
         };
+        // Said out loud, because "no line about music" and "music is playing"
+        // must not be the same observation: the last SoundFont left the image
+        // and nothing anywhere noticed for a cycle.
+        println!(
+            "[doom-sound] {SOUNDFONT_PATH}: {bytes} bytes, {} presets; music enabled",
+            sf.get_presets().len()
+        );
 
         let ring = Arc::new(MusicRing::new());
         MUSIC_RING.set(ring.clone()).unwrap_or_else(|_| panic!("music initialized twice"));
@@ -1121,6 +1132,132 @@ pub fn sound_stress() -> i32 {
         "[sound-stress] stalled_burst={stalled_burst} tone_periods={tone_periods} \
          tone_frames={TONE_FRAMES} concurrent_cmds={concurrent} probe_periods={probe_periods} \
          probe_frames={PROBE_FRAMES}"
+    );
+    0
+}
+
+// ── The music actuator ──
+
+/// The track `--music-check` plays. E1M1's, and it is the right one for two
+/// reasons: it is the first thing a person hears, and its instrument list
+/// exercises melodic programs and the drum kit together, so a bank subset that
+/// lost either fails here.
+const MUSIC_CHECK_LUMP: &[u8; 6] = b"D_E1M1";
+
+/// Where the WAD is in the image. `main.rs` passes the same path to doomgeneric.
+const WAD_PATH: &str = "/share/doom1.wad";
+
+/// How much of the track to put on the wire. Long enough that the host's
+/// capture has a stretch of music in it and not just an onset, short enough
+/// that the whole check is a few seconds — a period is 128 frames.
+const MUSIC_CHECK_PERIODS: u32 = 3 * OUTPUT_RATE / 128;
+
+/// The lump named `want` in a WAD, if it has one.
+///
+/// A whole WAD reader is `w_wad.c`'s job and it is in this binary — but it is
+/// only reachable after `doomgeneric_Create`, which needs a window, an event
+/// loop and a compositor. Fifteen lines of directory walk here is what makes
+/// the music path answerable without any of that.
+fn wad_lump<'a>(wad: &'a [u8], want: &[u8; 6]) -> Option<&'a [u8]> {
+    fn u32le(wad: &[u8], at: usize) -> Option<usize> {
+        let bytes: [u8; 4] = wad.get(at..at + 4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(bytes) as usize)
+    }
+    if wad.len() < 12 || (&wad[0..4] != b"IWAD" && &wad[0..4] != b"PWAD") {
+        return None;
+    }
+    let count = u32le(wad, 4)?;
+    let directory = u32le(wad, 8)?;
+    (0..count).find_map(|i| {
+        let entry = directory.checked_add(i.checked_mul(16)?)?;
+        let name = wad.get(entry + 8..entry + 16)?;
+        if &name[..want.len()] != want || name[want.len()] != 0 {
+            return None;
+        }
+        let start = u32le(wad, entry)?;
+        let len = u32le(wad, entry + 4)?;
+        wad.get(start..start.checked_add(len)?)
+    })
+}
+
+/// Plays one of doom's own MUS lumps through the shipped SoundFont and the
+/// real audio output, then says what happened.
+///
+/// **This is the wiring, and the wiring is the only part the soundfont
+/// investigation could not measure.** That all 13 tracks render bit-exact
+/// against the full bank was established on the host, through this same
+/// `mus2mid.c` and this same rustysynth; what no host render can answer is
+/// whether the file reaches the image, whether doom finds it, and whether the
+/// result gets as far as the device. Every one of those is a fact about a guest.
+///
+/// Driven by `tests/toyos-rust-tests/src/bin/doom_music.rs`; the verdict on the
+/// sound itself is the host's capture, not anything printed here.
+pub fn music_check() -> i32 {
+    let wad = match std::fs::read(WAD_PATH) {
+        Ok(wad) => wad,
+        Err(e) => {
+            eprintln!("[music-check] {WAD_PATH}: {e}");
+            return 1;
+        }
+    };
+    let Some(lump) = wad_lump(&wad, MUSIC_CHECK_LUMP) else {
+        eprintln!("[music-check] {WAD_PATH} has no {} lump", String::from_utf8_lossy(MUSIC_CHECK_LUMP));
+        return 1;
+    };
+
+    if !unsafe { toyos_init_sound(false) } {
+        eprintln!("[music-check] no audio output; nothing can carry the music");
+        return 1;
+    }
+    if !unsafe { toyos_music_init() } {
+        eprintln!("[music-check] the music module did not come up");
+        return 1;
+    }
+
+    // `mus2mid` writes into a `memio` stream and `memio` allocates out of the
+    // zone, which `D_DoomMain` sets up on the path this one bypasses.
+    unsafe { Z_Init() };
+
+    let song = unsafe { toyos_register_song(lump.as_ptr() as *mut c_void, lump.len() as i32) };
+    if song.is_null() {
+        eprintln!("[music-check] {} did not convert to a MIDI file", String::from_utf8_lossy(MUSIC_CHECK_LUMP));
+        return 1;
+    }
+    unsafe { toyos_play_song(song, true) };
+
+    // Bounded by the callback's own period count rather than by wall clock: a
+    // host that stopped this guest for a second must not shorten the music the
+    // capture is judged on. The iteration cap is the liveness half — a callback
+    // that died stops the period clock too.
+    let start = MIXED_PERIODS.load(Ordering::Relaxed);
+    let mut periods = 0;
+    for _ in 0..30_000 {
+        periods = MIXED_PERIODS.load(Ordering::Relaxed).wrapping_sub(start);
+        if periods >= MUSIC_CHECK_PERIODS {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let rendered = MUSIC_RING.get().map_or(0, |ring| ring.write.load(Ordering::Relaxed));
+    let playing = unsafe { toyos_music_is_playing() };
+
+    unsafe { toyos_stop_song() };
+    unsafe { toyos_music_shutdown() };
+    unsafe { toyos_shutdown_sound() };
+
+    if periods < MUSIC_CHECK_PERIODS {
+        eprintln!("[music-check] the audio callback mixed {periods} periods of {MUSIC_CHECK_PERIODS}");
+        return 1;
+    }
+    if !playing {
+        eprintln!("[music-check] the music stopped before the check did");
+        return 1;
+    }
+
+    println!(
+        "[music-check] lump={} midi_bytes={} periods={periods} rendered_frames={rendered}",
+        String::from_utf8_lossy(MUSIC_CHECK_LUMP),
+        lump.len(),
     );
     0
 }
