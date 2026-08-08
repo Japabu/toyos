@@ -138,11 +138,9 @@ fn prepare(root: &Path) -> Result<String, String> {
         "[pr] {}\n\
          [pr] {branch} is at {head} on origin and CI is running on it.\n\
          [pr]\n\
-         [pr]   gh pr create --fill --base main --head {branch}    (once; --draft while it is \
-         not ready)\n\
-         [pr]   gh pr merge --auto --merge                          (merges when the required \
-         checks pass)\n\
-         [pr]   gh pr checks --watch                                (what the gate is doing)\n\
+         [pr]   gh pr create --fill --base main --head {branch}   (once; --draft if not ready)\n\
+         [pr]   gh pr merge --auto --merge   (merges when the required checks pass)\n\
+         [pr]   gh pr checks --watch   (what the gate is doing)\n\
          [pr]\n\
          [pr] The pull request's title and body become the merge commit's, so write them as the \
          record of what landed.\n\

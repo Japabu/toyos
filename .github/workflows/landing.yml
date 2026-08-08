@@ -118,4 +118,4 @@ jobs:
               exit 1
               ;;
           esac
-          echo "the guest gate stays advisory: specs/ci-plan.md §9.2 has the five that reproduce."
+          echo "the guest gate stays advisory: specs/ci-plan.md §9.2 has what still reproduces."

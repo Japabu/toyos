@@ -1141,9 +1141,22 @@ state that cannot survive being unnecessary.
 None of this is in VCS and none of it is reviewable in a diff, so it is listed
 here. Repository settings on `Japabu/toyos`:
 
-- **Ruleset `main`** — `pull_request` (0 approving reviews required),
+- **Ruleset `main`** (id `20589156`) — `pull_request` with
+  `required_approving_review_count: 0` and `allowed_merge_methods: ["merge"]`,
   `required_status_checks` with `strict_required_status_checks_policy: true` and
-  the four contexts of §10.4, `non_fast_forward`, `deletion`. No bypass actors.
+  the four contexts of §10.4, `non_fast_forward`, `deletion`. **No bypass
+  actors**, so it binds the owner too; taking it off is one API call and a
+  visible act rather than a habit.
+
+  It was verified by trying, not by reading it back. An empty commit on top of
+  `origin/main`, pushed straight at `refs/heads/main`:
+
+  ```
+  remote: error: GH013: Repository rule violations found for refs/heads/main.
+  remote: - Changes must be made through a pull request.
+  remote: - 4 of 4 required status checks are expected.
+   ! [remote rejected] 19d8289 -> main (push declined due to repository rule violations)
+  ```
 - `allow_squash_merge: false`, `allow_rebase_merge: false` — nothing rewrites
   history, which is CLAUDE.md's rule said at the remote.
 - `allow_auto_merge: true` — `gh pr merge --auto --merge` is how an agent leaves
