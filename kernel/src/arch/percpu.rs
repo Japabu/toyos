@@ -407,46 +407,16 @@ pub fn init_bsp(lapic_id: u32) {
     alloc_ist1_stack(percpu);
 
     unsafe { percpu.load_gdt(); }
-    cpu::enable_sse();
+    super::control_regs::init(0);
     super::fpu::init();
-    let smep = cpu::enable_smep();
-    let smap = cpu::enable_smap();
-    require_fsgsbase(cpu::enable_fsgsbase());
-    let pcid = crate::mm::paging::enable_pcid();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
 
     // GS base is now valid — enable CPU/TID context in log! macro
     crate::log::PERCPU_READY.store(true, core::sync::atomic::Ordering::Release);
 
-    // One line for the whole machine. Every CPU runs the identical sequence
-    // against identical silicon, so the per-CPU repetition this replaces was
-    // 4 lines times the core count of noise carrying one bit each — 28 of the
-    // T14's ~150 boot lines, on a screen that holds 67. Reported rather than
-    // asserted: on TCG none of the three is available, and a line claiming
-    // otherwise would be a diagnostic that lies on the only machine most of
-    // this tree's boots happen on.
-    log!(
-        "percpu: BSP cpu_id=0 lapic_id={} smep={} smap={} pcid={}",
-        lapic_id, on(smep), on(smap), on(pcid)
-    );
+    log!("percpu: BSP cpu_id=0 lapic_id={lapic_id}");
     super::fpu::log_state();
-}
-
-fn on(enabled: bool) -> &'static str {
-    if enabled { "on" } else { "off" }
-}
-
-/// Unlike SMEP, SMAP and PCID, FSGSBASE is not optional here: `hw.rs` saves and
-/// restores the user TLS base with `rdfsbase`/`wrfsbase` on every context
-/// switch, so a CPU without it would #UD at the first one. Said out loud rather
-/// than discovered, because the alternative is a fault on a path that has no
-/// business faulting, on some future machine, with no line explaining it.
-fn require_fsgsbase(enabled: bool) {
-    assert!(
-        enabled,
-        "cpu: FSGSBASE is required — every context switch uses rdfsbase/wrfsbase",
-    );
 }
 
 /// Allocate percpu for an AP on the BSP. Returns the raw pointer for the trampoline
@@ -461,18 +431,15 @@ pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
 
 /// Finish AP percpu initialization (called from ap_entry after GS base is set by trampoline).
 ///
-/// The feature questions are silent: `boot_aps` already logs one line per AP
-/// that came up, and this CPU's answers are the BSP's answers. `fpu::log_state`
-/// is the exception and says at its own definition why it may not assume that.
+/// `control_regs::init` and `fpu::log_state` are the two things here that print,
+/// and each says at its own definition why it may not assume this CPU answers
+/// like the BSP. Everything else is silent: `boot_aps` already logs one line per
+/// AP that came up.
 pub fn init_ap(percpu_ptr: *mut PerCpu) {
     let percpu = unsafe { &mut *percpu_ptr };
     unsafe { percpu.load_gdt(); }
-    cpu::enable_sse();
+    super::control_regs::init(percpu.cpu_id);
     super::fpu::init();
-    cpu::enable_smep();
-    cpu::enable_smap();
-    require_fsgsbase(cpu::enable_fsgsbase());
-    crate::mm::paging::enable_pcid();
     super::fpu::log_state();
 }
 

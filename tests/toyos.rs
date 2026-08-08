@@ -298,6 +298,8 @@ const GRAFFITI: [u8; 3] = [0x00, 0xC0, 0x00];
 /// tidy.
 const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("ioapic_topology", Sched::Parallel),
+    ("control_regs", Sched::Parallel),
+    ("control_regs_negative", Sched::Parallel),
     ("input_merge", Sched::Parallel),
     ("metal_sim_input", Sched::Parallel),
     // One boot from here to `metal_sim_compositor_stall` (`METAL_SIM_DESKTOP`).
@@ -559,6 +561,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("expected_failure_verdicts", Sched::Parallel),
     ("expected_failure_exit_status", Sched::Parallel),
     ("expected_failure_entries", Sched::Parallel),
+    // Same: the control-register verdict, against the machine this tree
+    // actually booted before `arch/control_regs.rs`.
+    ("control_regs_verdict", Sched::Parallel),
 ];
 
 /// What makes an entry stale, which is the whole safety argument for having a
@@ -7333,6 +7338,7 @@ fn run_machine_test(
         "expected_failure_verdicts" => expected_failure_verdicts(),
         "expected_failure_exit_status" => expected_failure_exit_status(),
         "expected_failure_entries" => expected_failure_entries(),
+        "control_regs_verdict" => control_regs_verdict(),
         "nvme_wide_sector" => {
             // The other half of "a device's size is a shape dimension": not how
             // many sectors, but how big one is. `lba_ds` is an 8-bit
@@ -7910,6 +7916,17 @@ fn run_machine_test(
             eprintln!("  [ioapic] {} unit(s), overrides {isos}", units.len());
             Ok(())
         }
+        "control_regs" => {
+            const CPUS: u32 = 4;
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions { smp: CPUS, ..Default::default() },
+            );
+            control_regs(&qemu.boot_log().to_string(), CPUS)
+        }
+        "control_regs_negative" => control_regs_negative(test_config, c_bins, rust_bins),
         "input_merge" => {
             // The check runs in the kernel and panics on mismatch, so a
             // failure arrives as a dead boot; the marker is the only proof it
@@ -9221,6 +9238,288 @@ fn parse_xhci_binds(log: &str) -> Vec<XhciBind> {
             })
         })
         .collect()
+}
+
+/// Every CPU's `CR0` and `CR4`, against what a CPU running this kernel must
+/// hold.
+///
+/// **Not the same question the kernel's own self-check asks.** That one compares
+/// each CPU against the declaration, so it catches a CPU that missed it and
+/// nothing else; a declaration that is wrong satisfies it on every core. The
+/// bits below are spelled out here, away from the constants that produce them,
+/// so the two have to agree independently — and the ones that matter are the
+/// ones an AP used to arrive with: `CD`/`NW` set is caching off, `WP` clear is
+/// the kernel's own read-only mappings not binding supervisor writes, `NE`
+/// clear routes an unmasked x87 exception to a pin nothing listens on.
+///
+/// `OSXSAVE` is asserted *clear*: with it set the CPU would permit `XCR0` to
+/// name components `FXSAVE64` does not save, and this kernel saves user FP
+/// state with `FXSAVE64` (`specs/user-machine-state.md` §5).
+///
+/// Both halves, because the kernel writes both registers whole: every bit named
+/// below must hold its named value, **and a bit named nowhere below may not be
+/// set at all**. Silence about a bit is a hole rather than a permission.
+fn control_regs(log: &str, cpus: u32) -> Result<(), String> {
+    /// `(bit, name, must_be_set)`. Every bit `CR0` defines, so a value with any
+    /// other bit set is reserved state the kernel put there.
+    const CR0_BITS: &[(u32, &str, bool)] = &[
+        (0, "PE", true),
+        (1, "MP", true),
+        (2, "EM", false),
+        (3, "TS", false),
+        (4, "ET", true),
+        (5, "NE", true),
+        (16, "WP", true),
+        (18, "AM", false),
+        (29, "NW", false),
+        (30, "CD", false),
+        (31, "PG", true),
+    ];
+    const CR4_BITS: &[(u32, &str, bool)] = &[
+        (3, "DE", true),
+        (5, "PAE", true),
+        (6, "MCE", true),
+        (9, "OSFXSR", true),
+        (10, "OSXMMEXCPT", true),
+        (12, "LA57", false),
+        (16, "FSGSBASE", true),
+        (18, "OSXSAVE", false),
+    ];
+    /// The three `CR4` bits the CPU may withhold, so neither answer is wrong.
+    const CR4_MAY: &[(u32, &str)] = &[(17, "PCIDE"), (20, "SMEP"), (21, "SMAP")];
+
+    let mut seen: Vec<(u32, u64, u64)> = Vec::new();
+    for line in log.lines() {
+        let Some(rest) = line.split("control_regs: cpu").nth(1) else { continue };
+        let Some((id, rest)) = rest.split_once(" cr0=0x") else { continue };
+        let Some((cr0, cr4)) = rest.split_once(" cr4=0x") else { continue };
+        let (Ok(id), Ok(cr0), Ok(cr4)) = (
+            id.parse::<u32>(),
+            u64::from_str_radix(cr0, 16),
+            u64::from_str_radix(cr4.split_whitespace().next().unwrap_or(""), 16),
+        ) else {
+            return Err(format!("unreadable control-register line: {line:?}"));
+        };
+        seen.push((id, cr0, cr4));
+    }
+
+    // Which CPUs answered, not how many lines were printed: a boot where one AP
+    // never came up at all must not pass by having the BSP print twice.
+    let ids: BTreeSet<u32> = seen.iter().map(|&(id, _, _)| id).collect();
+    let want: BTreeSet<u32> = (0..cpus).collect();
+    if ids != want {
+        return Err(format!(
+            "expected one line from each of {want:?}, got {ids:?}:\n{log}"
+        ));
+    }
+
+    // A bit named nowhere above is as much of the declaration as a named one,
+    // and the kernel writes both registers whole — so `UMIP`, `PGE`, `TSD` or
+    // `PKE` would reach every CPU with nothing here to say so. Which is why
+    // what follows is the set this gate has an opinion about, rather than a
+    // second list of bits to forbid: a forbid-list fails open on the next bit.
+    let named = |bits: &[(u32, &str, bool)], may: &[(u32, &str)]| -> u64 {
+        bits.iter().fold(0, |m, b| m | 1u64 << b.0)
+            | may.iter().fold(0, |m, b| m | 1u64 << b.0)
+    };
+
+    // Every wrong bit on a CPU rather than the first: an AP holding INIT's CR0
+    // is wrong in five at once and each is a different consequence, so a
+    // message naming one sends the next reader after a fifth of it.
+    for &(id, cr0, cr4) in &seen {
+        let mut wrong = String::new();
+        for (reg, value, bits, known) in [
+            ("cr0", cr0, CR0_BITS, named(CR0_BITS, &[])),
+            ("cr4", cr4, CR4_BITS, named(CR4_BITS, CR4_MAY)),
+        ] {
+            for &(bit, name, set) in bits {
+                if (value & (1 << bit) != 0) != set {
+                    wrong += &format!(" {reg}.{name} must be {}", if set { "set" } else { "clear" });
+                }
+            }
+            let extra = value & !known;
+            if extra != 0 {
+                wrong += &format!(" {reg} holds {extra:#x}, which this gate never named");
+            }
+        }
+        if !wrong.is_empty() {
+            return Err(format!("cpu{id} cr0={cr0:#010x} cr4={cr4:#010x}:{wrong}"));
+        }
+    }
+
+    // A CPU that agrees about every bit named above can still differ in one
+    // that is not, and a thread migrating onto it would execute differently
+    // from one moment to the next.
+    let (_, cr0, cr4) = seen[0];
+    if let Some(&(id, other0, other4)) = seen.iter().find(|&&(_, a, b)| (a, b) != (cr0, cr4)) {
+        return Err(format!(
+            "cpu0 has cr0={cr0:#010x} cr4={cr4:#010x} and cpu{id} has \
+             cr0={other0:#010x} cr4={other4:#010x}"
+        ));
+    }
+
+    eprintln!("  [control_regs] {cpus} CPUs, cr0={cr0:#010x} cr4={cr4:#010x}");
+    Ok(())
+}
+
+/// [`control_regs`] against machines this host cannot boot, with no guest.
+///
+/// [`control_regs_negative`] runs the real defective machine and is the link
+/// between this verdict and a kernel; what is here is the states no actuator
+/// reaches — a CPU that differs from three others, a bit set uniformly on all
+/// four, an AP that never printed. Every value is one this tree has printed or
+/// one bit away from it.
+fn control_regs_verdict() -> Result<(), String> {
+    /// The pre-fix machine, `smp=4`, TCG, read off this tree on 2026-08-08:
+    /// firmware's registers on the BSP and INIT's on every AP.
+    const AP_BEFORE: (u64, u64) = (0xe000_0011, 0x0031_0620);
+    const DECLARED: (u64, u64) = (0x8001_0033, 0x0031_0668);
+
+    fn log(cpus: &[(u64, u64)]) -> String {
+        cpus.iter()
+            .enumerate()
+            .map(|(i, (cr0, cr4))| {
+                format!("[kernel 0.1 cpu{i}] control_regs: cpu{i} cr0={cr0:#010x} cr4={cr4:#010x}\n")
+            })
+            .collect()
+    }
+
+    let refused = |what: &str, cpus: &[(u64, u64)], says: &str| match control_regs(&log(cpus), 4) {
+        Ok(()) => Err(format!("{what} was accepted")),
+        Err(e) if e.contains(says) => Ok(()),
+        Err(e) => Err(format!("{what} was refused for the wrong reason: {e}")),
+    };
+
+    // Positive control first: a verdict that refuses everything refuses the
+    // defect too, and would prove nothing below.
+    control_regs(&log(&[DECLARED; 4]), 4)
+        .map_err(|e| format!("the declared machine was refused: {e}"))?;
+
+    refused("the machine this tree booted", &[DECLARED, AP_BEFORE, AP_BEFORE, AP_BEFORE], "CD")?;
+    // The case a "do all the CPUs agree?" test passes: they agree, on INIT's
+    // value. Nothing about uniformity says caching is on.
+    refused("four CPUs agreeing on INIT's CR0", &[AP_BEFORE; 4], "CD")?;
+    refused(
+        "one CPU without WP",
+        &[DECLARED, (DECLARED.0 & !(1 << 16), DECLARED.1), DECLARED, DECLARED],
+        "WP",
+    )?;
+    refused(
+        "one CPU without NE",
+        &[DECLARED, DECLARED, (DECLARED.0 & !(1 << 5), DECLARED.1), DECLARED],
+        "NE",
+    )?;
+    // The bit that must be *absent*: with it set, XCR0 can name components
+    // FXSAVE64 does not save (`specs/user-machine-state.md` §5).
+    refused("OSXSAVE set", &[(DECLARED.0, DECLARED.1 | (1 << 18)); 4], "OSXSAVE")?;
+    // Two bits a machine could hold uniformly, each one line of kernel diff
+    // away, and neither reachable by an actuator. `AM` is named clear above and
+    // answers by name; `UMIP` is named nowhere, which is the case the whole
+    // never-named rule exists for — `PGE`, `TSD` and `PKE` are the same case.
+    refused("every CPU with AM set", &[(DECLARED.0 | (1 << 18), DECLARED.1); 4], "AM")?;
+    refused(
+        "every CPU with UMIP set",
+        &[(DECLARED.0, DECLARED.1 | (1 << 11)); 4],
+        "never named",
+    )?;
+    // A CPU that agrees about every named bit and differs in one the CPU is
+    // allowed to withhold, so nothing above it can object.
+    refused("one CPU with PCID and three without", &[DECLARED, DECLARED, DECLARED, (DECLARED.0, DECLARED.1 | (1 << 17))], "cpu3")?;
+    // And an AP that never printed at all, which is what a machine whose AP
+    // died before the check looks like.
+    refused("three lines for four CPUs", &[DECLARED; 3], "{0, 1, 2, 3}")?;
+
+    eprintln!("  [control_regs] the verdict refuses 9 machines and accepts the declared one");
+    Ok(())
+}
+
+/// The negative control, executed: an AP left holding what `INIT` gave it, and
+/// [`control_regs`] refusing the machine that produces.
+///
+/// The one link the two tests above do not cover. [`control_regs`] reads a
+/// healthy boot and [`control_regs_verdict`] reads values typed into this file;
+/// between them sits the question of whether the verdict would recognise a real
+/// divergent CPU, and a `no-ap-control-regs` kernel nothing runs answers it in
+/// prose. The boot dies here — the kernel's own assertion kills it — but
+/// `self_check` logs *before* it asserts, exactly so that the values a CPU
+/// failed with survive the failure, and that is what this reads.
+///
+/// `smp=2` because the first AP to check itself panics and `halt_all_cpus`
+/// follows it: any CPU after that one is a line that never arrives, and the
+/// refusal would then be about the count rather than about the registers.
+/// [`qemu::Profile::Metal`] because there the 16550 is the console: a guest that
+/// dies during `boot_aps` has no virtio-console yet, and this way one channel
+/// carries the per-CPU line and the panic that follows it.
+fn control_regs_negative(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const CPUS: u32 = 2;
+    // The AP's own line, which arrives whether or not the actuator did anything
+    // — so a feature that silently stopped working is a named failure below
+    // rather than a boot timeout with nothing to read.
+    const MARKER: &str = "control_regs: cpu1 cr0=";
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            smp: CPUS,
+            profile: qemu::Profile::Metal,
+            kernel_features: &["no-ap-control-regs"],
+            ready_marker: MARKER,
+            ..Default::default()
+        },
+    );
+    let mut log = qemu.boot_log().to_string();
+    log += &qemu.drain_until(Duration::from_secs(20), |l| l.contains("the declaration is"));
+
+    // The premise: a divergent CPU, not merely a dead boot. Anything can kill a
+    // boot, and a test that only asserted the panic would pass on a kernel
+    // whose registers were right and whose assertion was wrong.
+    let Err(refusal) = control_regs(&log, CPUS) else {
+        return Err(format!(
+            "the verdict accepted a `no-ap-control-regs` boot — either the actuator did \
+             nothing or the verdict cannot see the machine it was written for\n{log}"
+        ));
+    };
+    // Named, and named for a bit rather than for the count: a refusal about a
+    // missing line or an unreadable one satisfies `is_err` and means nothing.
+    //
+    // **`WP`, not `CD`, and that is a finding rather than a preference.** `CD`
+    // is the consequence this whole file exists for, and it is the obvious bit
+    // to demand — but a guest cannot hold it under KVM. Measured 2026-08-08:
+    // an AP that has executed nothing but the trampoline reads `cr0=0xe0000011`
+    // under this host's TCG and `cr0=0x80000011` on an Intel Xeon 6973P-C KVM
+    // runner (CI run 31278396401, shard 3), `CD` and `NW` clear, everything
+    // else identical. So `CD` here would be a gate that only one of the two
+    // machines this suite runs on can fail. `WP` is absent on the AP either
+    // way, and its consequence — the kernel's own read-only mappings not
+    // binding supervisor writes — does not depend on the hypervisor.
+    if !refusal.contains("cpu1") || !refusal.contains("WP") {
+        return Err(format!(
+            "the verdict refused for something other than cpu1's write protection: {refusal}"
+        ));
+    }
+    // Where the host does leave `CD` set, it is demanded, so the arm that *can*
+    // see the caching defect does not quietly become the weaker of the two.
+    if !toyos_build::kvm_usable() && !refusal.contains("CD") {
+        return Err(format!(
+            "TCG leaves an AP's `CD` set and the refusal does not name it: {refusal}"
+        ));
+    }
+    // And the kernel refused too, on its own assertion rather than on a fault
+    // somewhere downstream of one — the shipped check, on the shipped line. The
+    // declaration is a constant, so it is the same number on either host.
+    for want in ["control_regs: cpu1 holds cr0=", "the declaration is 0x80010033"] {
+        if !log.contains(want) {
+            return Err(format!("the kernel never said {want:?}:\n{log}"));
+        }
+    }
+    eprintln!("  [control_regs] a real divergent AP, refused: {refusal}");
+    Ok(())
 }
 
 /// Everything the driver derived its DMA pool from, off the two lines it
