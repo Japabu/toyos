@@ -14,6 +14,8 @@ const MASK: u32 = 0x0FFF_FFFF;
 /// At or above this an entry ends a chain (fatgen103 §4).
 const EOC: u32 = 0x0FFF_FFF8;
 const BAD: u32 = 0x0FFF_FFF7;
+/// `FAT[1]`'s two state bits (fatgen103 §4): set is clean, clear is the
+/// complaint.
 const CLEAN_SHUTDOWN: u32 = 0x0800_0000;
 const NO_HARD_ERROR: u32 = 0x0400_0000;
 
@@ -40,7 +42,7 @@ pub(crate) fn head(table: &[u32], geo: &Geometry, r: &mut Report) {
         r.say(Complaint::Fat0 { got: table[0], want });
     }
     let one = table[1];
-    if one & !(CLEAN_SHUTDOWN | NO_HARD_ERROR) & MASK != MASK & !(CLEAN_SHUTDOWN | NO_HARD_ERROR) {
+    if one | CLEAN_SHUTDOWN | NO_HARD_ERROR != MASK {
         r.say(Complaint::Fat1 { got: one });
     }
     if one & CLEAN_SHUTDOWN == 0 {
@@ -72,12 +74,12 @@ pub(crate) fn mirrors(vol: &[u8], geo: &Geometry, r: &mut Report) {
         let Ok(at) = usize::try_from(geo.fat_offset(copy)) else { continue };
         let Some(got) = vol.get(at..at + len) else { continue };
         let Some(byte) = got.iter().zip(want).position(|(a, b)| a != b) else { continue };
-        let entry = byte / 4 * 4;
+        let entry = byte / 4;
         r.say(Complaint::FatMirror {
             fat: copy,
-            entry: (entry / 4) as u32,
-            got: u32_at(got, entry),
-            want: u32_at(want, entry),
+            entry: entry as u32,
+            got: u32_at(got, entry * 4),
+            want: u32_at(want, entry * 4),
         });
     }
 }
@@ -181,7 +183,7 @@ pub(crate) fn lost(table: &[u32], owners: &Owners, r: &mut Report) {
     }
 
     let mut seen = vec![false; len];
-    let mut walk = |from: usize, seen: &mut Vec<bool>, r: &mut Report| {
+    let walk = |from: usize, seen: &mut Vec<bool>, r: &mut Report| {
         let mut at = from;
         let mut clusters = 0u32;
         while at < len && orphan[at] && !seen[at] {

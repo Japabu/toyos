@@ -12,7 +12,7 @@
 //!    volume is filled here to a hair over one copy's worth of free space, so
 //!    the first `cp` succeeds and the second cannot. What the second must leave
 //!    behind is *nothing*: no file under the destination's name, no `.part`
-//!    sibling, and nothing new for `fsck_msdos` to say — a half-allocated
+//!    sibling, and nothing new for the volume checker to say — a half-allocated
 //!    cluster chain is what a "did the command exit non-zero" check cannot see.
 //!
 //! The log partition and not the ESP, which is where this started. Measured on
@@ -37,7 +37,9 @@ use fatfs::FsOptions;
 
 use super::qemu::{self, BootOptions, QemuInstance};
 use super::serial;
-use super::volumes::{fsck_complaints, log_extent, read_files};
+use toyos_fat32_check::{check, describe};
+
+use super::volumes::{log_extent, read_files};
 
 /// The file the guest copies. Several times `cp`'s `FLUSH_BYTES` and not a page
 /// multiple: the periodic flush fires repeatedly and the tail is partial, which
@@ -162,7 +164,7 @@ pub fn cp_volume(
         ));
     }
     std::fs::write(&image_path, &image).map_err(|e| format!("rewrite the boot image: {e}"))?;
-    let complaints_before = fsck_complaints(&image[start..start + len], "toybox-cp-before")?;
+    let complaints_before = check(&image[start..start + len]);
     eprintln!("  [toybox] staged {SRC_LEN} bytes and a {filler}-byte filler, {left} bytes free");
 
     let mut qemu = QemuInstance::boot_with_options(
@@ -219,16 +221,20 @@ pub fn cp_volume(
     let volume = &after[start..start + len];
 
     // Strongest first: a failed allocation that damaged the FAT would still
-    // pass every byte comparison below.
-    let complaints_after = fsck_complaints(volume, "toybox-cp-after")?;
-    let fresh: Vec<&String> =
+    // pass every byte comparison below. The staging above is `fatfs`'s work
+    // rather than the guest's, so what is asked is that the boot add nothing —
+    // and a complaint carries its numbers as fields, so a moved free-cluster
+    // count is a different complaint of the same kind rather than a string that
+    // has to have its digits blanked before the two lists can be compared.
+    let complaints_after = check(volume);
+    let fresh: Vec<&toyos_fat32_check::Complaint> =
         complaints_after.iter().filter(|c| !complaints_before.contains(c)).collect();
     if !fresh.is_empty() {
         return Err(format!(
-            "cp gave fsck_msdos something new to say about the log volume:\n{}\n\
-             it already said, before the boot:\n{}",
-            fresh.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"),
-            complaints_before.join("\n")
+            "cp left the log volume breaking the format:\n{}\n\
+             before the boot the checker said:\n{}",
+            fresh.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("\n"),
+            describe(&complaints_before)
         ));
     }
 

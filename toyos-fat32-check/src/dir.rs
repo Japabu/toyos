@@ -18,6 +18,17 @@ const LAST_LONG_ENTRY: u8 = 0x40;
 /// run of them is longer than this and no ordinal is higher (fatgen103 §7).
 const MAX_LONG_ENTRIES: u8 = 20;
 
+/// The `DIR_NTRes` bits something defines.
+///
+/// fatgen103 §6 reserves the whole byte "for use by Windows NT" and tells a
+/// formatter to write 0. What Windows NT put there is deployed everywhere and
+/// is not a defect: 0x08 says the 8.3 base is really lowercase and 0x10 says
+/// the extension is. macOS writes them — the volumes this crate's own suite is
+/// built on carry 0x08 and 0x18 — so a checker that reads the sentence and not
+/// the world reds on every one of them. Any *other* bit is a byte nothing has
+/// ever defined, which is what this complains about.
+const NT_RESERVED_DEFINED: u8 = 0x18;
+
 const DOT: [u8; 11] = *b".          ";
 const DOT_DOT: [u8; 11] = *b"..         ";
 /// What the checker reports in place of an entry that is not there at all,
@@ -333,7 +344,7 @@ fn check_short(
     children: &mut Vec<(String, u32)>,
     r: &mut Report,
 ) {
-    if short.nt_reserved != 0 {
+    if short.nt_reserved & !NT_RESERVED_DEFINED != 0 {
         r.say(Complaint::ReservedEntryByte {
             path: dir.path.to_string(),
             entry: short.index,
@@ -369,9 +380,10 @@ fn check_short(
         return;
     }
 
+    let name = child_path(dir.path, &long.unwrap_or_else(|| short_text(&short.name)));
     if short.first_cluster != 0 && !ctx.geo.holds(short.first_cluster) {
         r.say(Complaint::FirstCluster {
-            path: dir.path.to_string(),
+            path: name,
             entry: short.index,
             got: short.first_cluster,
             clusters: ctx.geo.cluster_count,
@@ -379,7 +391,6 @@ fn check_short(
         return;
     }
 
-    let name = child_path(dir.path, &long.unwrap_or_else(|| short_text(&short.name)));
     if short.is_directory() {
         if short.size != 0 {
             r.say(Complaint::DirectorySize { path: name.clone(), size: u64::from(short.size) });

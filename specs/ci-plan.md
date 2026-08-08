@@ -203,24 +203,31 @@ prices the same and LPT degenerates to round-robin.
 
 | workflow | trigger | runner | what it is |
 |---|---|---|---|
-| `host-tests.yml` | every push, every PR | `macos-latest` | `cargo test --lib` plus the nine host crates and `userland/sshd`. No toolchain, no guest. |
+| `host-tests.yml` | every push, every PR | `macos-latest` | `cargo test --lib` plus all fourteen host crates and `userland/sshd`. No toolchain, no guest. |
 | `toolchain.yml` | every push | `ubuntu-24.04` | Publishes the content-addressed toolchain release, or does nothing. |
-| `ci.yml` | every push, every PR | `ubuntu-24.04` ×5 | Four guest shards under TCG, plus one KVM canary. |
+| `ci.yml` | every push, every PR | `ubuntu-24.04` ×5 | Four guest shards on KVM, plus one TCG canary. |
 | `gate-a.yml` | `workflow_dispatch` | `ubuntu-24.04` ×2 | The thorough audio tier, one audio test per machine. |
 | `probe-*.yml` | push to `ci/probe-*` | various | The measurement workflows this document is made of. |
 
 `ci/**` is a throwaway namespace excluded from the first three, so a probe push
 does not start a suite.
 
-**macOS for the host tests is not incidental.** Two of those gates have a
-macOS-only outside judge: `toyos-fat32` formats real volumes through
-`newfs_msdos` and `hdiutil`, and both it and `src/image.rs` are judged by
-`fsck_msdos`. There is no Linux equivalent whose output either parser
-understands — which is also the one hole in the guest suite on Linux (§6).
+**macOS for the host tests used to be two things and is now one.** The *judge*
+was macOS-only — `fsck_msdos`, on both `toyos-fat32` and `src/image.rs` — and it
+is ours now (§6.1). What is left is that `toyos-fat32` still *builds* its volumes
+through `newfs_msdos` and `hdiutil`, and that is the whole reason this job is
+not on Linux.
+
+The crate list is CLAUDE.md's, whole. It was nine of the thirteen until
+2026-08-08, and the four missing — `toyos-elf`, `toyos-ld`, `toyos-pci`,
+`toyos-desktop` — are exactly the pure crates whose point is that a decision is
+testable without a guest, so CI was skipping the cheapest tests it had.
+`toyos-fat32-check` is the fourteenth.
 
 Measured, `macos-latest`, run `31194966771`, cold: 594 s end to end — `cargo
 test --lib` 183 s, the nine host crates 274 s, sshd 124 s, all of it
-compilation. With the cargo cache: 442 s (run `31201564400`).
+compilation. With the cargo cache: 442 s (run `31201564400`). Those numbers
+predate the five crates added since.
 
 `toolchain.yml` when the release exists: **6 seconds** (run `31201563879`).
 
@@ -262,18 +269,45 @@ absence is stated twice, at build time by name and in the guest's log by
 Gate A was never affected — it runs on `tests/testcases`, which declares no
 untracked asset.
 
-## 6.1 What does not survive a Linux host
+## 6.1 The outside judge is ours now
 
-`fsck_complaints` (`tests/common/volumes.rs`) shells out to `/sbin/fsck_msdos`
-and returns `no /sbin/fsck_msdos: this gate's outside judge is missing`
-anywhere else — a red, correctly, rather than a silent pass. Five guest tests
-reach it: `esp_filesystem`, `kernel_log_file`, `log_partition_layout`,
-`log_partition_identity`, and the toybox `cp` case. `fsck.vfat` from dosfstools
-is the Linux equivalent and prints a different format, so a second arm in that
-parser is real work and is **not done**.
+`fsck_complaints` used to shell out to `/sbin/fsck_msdos` and return `no
+/sbin/fsck_msdos: this gate's outside judge is missing` anywhere else — a red,
+correctly, rather than a silent pass, and 13 of run `31222412737`'s failures.
+Six guest tests reach it (`esp_filesystem`, `kernel_log_file`,
+`log_partition_layout`, `log_partition_identity`, the toybox `cp` case) and so
+does `cargo test --lib`.
 
-That is the whole list. `ps -Ao comm=` and `getloadavg` — the other two host
-calls the harness makes — are both Linux-native.
+**This section used to recommend `fsck.vfat` from dosfstools. The owner refused
+it and the binary it would have replaced**, on 2026-08-08 and on the rule
+CLAUDE.md already states: "no dependencies on binaries that dont come with rust
+or qemu... we even have our own c compiler and linker because we dont like
+dependencies why should we now accept something like that?"
+
+So `toyos-fat32-check/` is a FAT32 volume checker written from Microsoft's
+fatgen103 — no dependencies, `forbid(unsafe_code)`, `no_std` + `alloc`, and
+deliberately derived from neither `toyos-fat32` nor `fatfs`, because a checker
+written from the code it judges shares that code's bugs. `check(&[u8])` returns
+typed `Complaint`s carrying their own numbers, which is what let the digit
+masking `fsck_complaints` needed go away entirely. Its 66 mutation tests each
+corrupt one thing in a hand-built volume and require the matching complaint.
+
+**It is stronger than what it replaces, and that was measured rather than
+assumed.** A development-time A/B ran 59 corruptions through both: no arm where
+`fsck_msdos` complained and the checker was silent, and twelve where the checker
+complains and fsck does not — including the two `specs/known-issues.md` §9
+records fsck missing outright, a stale FAT mirror and duplicate 8.3 short names.
+The hand-built fixture passes `fsck_msdos -n` clean, so it is a real volume.
+
+**What is still macOS-only is the *formatter*, not the judge.**
+`toyos-fat32/tests/` builds its volumes with `newfs_msdos` and populates them
+through a `hdiutil` mount, which is the point of that suite — our reader against
+bytes we did not write. Replacing those two is a larger job and is scoped in
+`specs/known-issues.md` §9. Nothing in the *guest* suite touches them.
+
+`ps -Ao comm=` and `getloadavg` — the other two host calls the harness makes —
+are both Linux-native, so with the judge portable there is nothing left in the
+guest suite that a Linux host cannot run.
 
 ## 7. The KVM finding
 

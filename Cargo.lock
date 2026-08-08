@@ -840,6 +840,7 @@ dependencies = [
  "toml",
  "toyos-cc",
  "toyos-fat32",
+ "toyos-fat32-check",
  "toyos-gpt",
  "toyos-ld",
  "uuid",
@@ -859,6 +860,10 @@ dependencies = [
 
 [[package]]
 name = "toyos-fat32"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-fat32-check"
 version = "0.1.0"
 
 [[package]]

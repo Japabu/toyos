@@ -255,14 +255,16 @@ pub(crate) fn signatures(vol: &[u8], geo: &Geometry, r: &mut Report) {
 
 /// `FSI_Free_Count` against the FAT it claims to summarise.
 ///
-/// fatgen103 §5 calls the field a hint and allows 0xFFFFFFFF for "unknown" — so
-/// a driver that does not maintain it says so, and one that writes a number is
-/// held to it. A stale number is the failure mode this catches: every host that
-/// mounts the volume reports free space from here without counting.
+/// A stale number is the failure mode: every host that mounts the volume
+/// reports free space from here without counting. fatgen103 §5 also allows
+/// 0xFFFFFFFF, meaning the writer does not maintain the field — see
+/// [`Complaint::FsInfoFreeCountUnknown`] for why that is a complaint here and
+/// the only one in this crate that is not the format's own.
 pub(crate) fn free_count(vol: &[u8], geo: &Geometry, table: &[u32], r: &mut Report) {
     let Some(fsi) = fs_info(vol, geo) else { return };
     let declared = u32_at(fsi, 488);
     if declared == u32::MAX {
+        r.say(Complaint::FsInfoFreeCountUnknown);
         return;
     }
     let counted = table[2..].iter().filter(|&&e| e == 0).count() as u32;

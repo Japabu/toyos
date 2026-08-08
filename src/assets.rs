@@ -209,6 +209,16 @@ fn tracked(dir: &Path) -> BTreeSet<PathBuf> {
 /// worktree red on a file that is now deliberately absent from all three. Being
 /// told happens twice: here by name, and again in the guest's own log when
 /// whatever wanted the file opens it and says what it is doing without it.
+/// The declared paths under `dir` that are not there, in the order they will be
+/// named in.
+///
+/// Its own function so that the naming is what a test can hold: the absence is
+/// no longer a panic to catch, and "it printed something" is not a claim this
+/// build can check about itself.
+fn absentees(dir: &Path, declared: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    declared.iter().map(|name| dir.join(name)).filter(|path| !path.exists()).collect()
+}
+
 pub fn collect(dirs: &[String], untracked: &[String]) -> Vec<(String, Vec<u8>)> {
     let mut files = vec![];
 
@@ -216,19 +226,15 @@ pub fn collect(dirs: &[String], untracked: &[String]) -> Vec<(String, Vec<u8>)> 
         let dir = Path::new(dir);
         let tracked = tracked(dir);
         let mut declared: BTreeSet<PathBuf> = untracked.iter().map(PathBuf::from).collect();
-        declared.retain(|name| {
-            let path = dir.join(name);
-            if path.exists() {
-                return true;
-            }
+        for absent in absentees(dir, &declared) {
             eprintln!(
                 "assets: NOT IN THIS IMAGE — {} is declared in `untracked-assets` and is not \
-                 there. It is deliberately not carried in git, so a fresh clone has to be given \
-                 a copy; whatever wants it runs without it.",
-                path.display()
+                 there. It is deliberately not carried in git, so whatever wants it runs \
+                 without it.",
+                absent.display()
             );
-            false
-        });
+            declared.remove(absent.strip_prefix(dir).unwrap_or(&absent));
+        }
         let ships = |path: &Path| {
             let relative = path.strip_prefix(dir).unwrap_or(path);
             if tracked.contains(relative) || declared.contains(relative) {
@@ -353,14 +359,31 @@ mod tests {
             "the initrd's asset list is not what the repository says it is"
         );
 
-        // And the declaration has teeth in the other direction: a fresh clone
-        // has no SoundFont, and it must be told so rather than handed a doom
-        // with no music.
+        // And the declaration's other half. A SoundFont is the owner of a
+        // build's to supply, so an image without one is the ordinary case and
+        // no longer stops the build — what has to survive is that the rest of
+        // the image is exactly what it was, and that the absent one is named.
         fs::remove_file(dir.join("declared.sf2")).expect("take declared.sf2 away");
-        let absent = std::panic::catch_unwind(|| {
+        let without: BTreeSet<String> =
             collect(&[dir.display().to_string()], &["declared.sf2".to_string()])
-        });
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+        let named = absentees(&dir, &BTreeSet::from([PathBuf::from("declared.sf2")]));
         fs::remove_dir_all(&dir).ok();
-        assert!(absent.is_err(), "a declared asset that is not there must stop the build");
+
+        assert_eq!(
+            without,
+            BTreeSet::from([
+                "share/kept.wad".to_string(),
+                "share/icons/kept.svg".to_string(),
+            ]),
+            "a declared asset that is not there took something else with it"
+        );
+        assert_eq!(
+            named,
+            vec![dir.join("declared.sf2")],
+            "a declared asset that is not there has to be named"
+        );
     }
 }

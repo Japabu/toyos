@@ -4688,20 +4688,27 @@ fn desktop_typing_damage() -> Result<(), String> {
     // is 58 text rows on this screen, `shell_answers` leaves under ten of them
     // used, and eight commands echoed and answered are twenty-four.
     const NONCE: &str = "typing-damage-gate";
-    {
-        let mut input = qemu::QmpInput::open(qemu.qmp_socket());
-        for _ in 0..8 {
+    // **Guest-paced.** The eight lines used to go in on a 250 ms host cadence
+    // and the sixteen appearances were then waited for; the waiting was already
+    // right and the typing was not. A keystroke injected faster than the guest
+    // drains its keyboard is a keystroke that never damages a cell, so on a
+    // contended host this measured whatever fraction survived — 2 of 16 on a
+    // four-guest CI runner, and the message it produced named the shortfall
+    // rather than the cause. Each line now waits for its own echo before the
+    // next goes in, which costs a slow guest wall clock and never the stimulus.
+    for line in 0..8u32 {
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
             type_line(&mut input, &format!("echo {NONCE}"));
-            thread::sleep(Duration::from_millis(250));
         }
-    }
-    // Wait for the eight echoes rather than count how many arrived inside a
-    // window. A guest that is slow has typed the same eight characters and
-    // damaged the same cells; only the wall clock differs, and a verdict that
-    // read the clock here would be a verdict about the host's load.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline && log[before..].matches(NONCE).count() < 16 {
-        log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+        // Two: the shell echoes the command as it is typed and again as its
+        // output. The same arithmetic the verdict below makes.
+        let want = ((line + 1) * 2) as usize;
+        let mut live = qemu::Liveness::new(Duration::from_secs(15), Duration::from_secs(60));
+        while log[before..].matches(NONCE).count() < want && live.working(&log) {
+            let seen = qemu.drain_serial(Duration::from_millis(100));
+            log.push_str(&seen);
+        }
     }
     log.push_str(&qemu.drain_serial(Duration::from_secs(3)));
 

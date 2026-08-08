@@ -7,9 +7,9 @@
 //! writer's bugs. Its dependency list is empty, which is the mechanical half of
 //! that claim.
 //!
-//! It replaced `/sbin/fsck_msdos`, and it is deliberately stronger in two
-//! places where that binary is silent, both of which cost this project a
-//! defect that every other gate passed (`specs/known-issues.md`): a **stale FAT
+//! It is deliberately stronger than the host `fsck_msdos` it stands in for, in
+//! two places where that binary is silent and each of which cost this project a
+//! defect every other gate passed (`specs/known-issues.md`): a **stale FAT
 //! mirror**, which fsck does not compare and a mount never reads, and
 //! **duplicate 8.3 short names**, which neither fsck nor a mount looks at
 //! because both use the long names.
@@ -38,8 +38,6 @@ mod boot;
 mod dir;
 mod fat;
 
-pub(crate) use boot::Geometry;
-
 /// How many complaints a check reports before it stops enumerating.
 ///
 /// Policy, not physics: a volume whose FAT is a page of random bytes has a
@@ -50,9 +48,10 @@ pub const MAX_COMPLAINTS: usize = 256;
 
 /// How deep the directory tree is walked before the checker stops descending.
 ///
-/// Policy. FAT32 has no depth limit of its own; a volume nested past this is
-/// reported rather than followed, so the walk cannot be made expensive by the
-/// bytes it is reading.
+/// Policy. FAT32 has no depth limit of its own, and the walk is one stack frame
+/// per level: the cluster claim already stops it visiting a directory twice, so
+/// the deepest a crafted volume could nest is its cluster count. This bounds the
+/// recursion and nothing else.
 pub const MAX_DEPTH: u32 = 64;
 
 /// Everything wrong with a volume, in the terms the format defines.
@@ -80,7 +79,7 @@ pub enum Complaint {
     ActiveFat { got: u32, num_fats: u64 },
     /// The reserved sectors and the FATs leave no data area.
     NoDataArea { metadata_sectors: u64, total_sectors: u64 },
-    /// `BPB_TotSec32` describes more volume than the caller was handed.
+    /// The boot sector describes more volume than the caller was handed.
     VolumeShorterThanDeclared { declared_bytes: u64, actual_bytes: u64 },
     /// Under 65,525 clusters is not a FAT32 volume by the specification's own
     /// definition of the three formats.
@@ -92,6 +91,12 @@ pub enum Complaint {
     FsInfoStructSignature { got: u32 },
     FsInfoTrailSignature { got: u32 },
     FsInfoFreeCount { declared: u32, counted: u32 },
+    /// The one complaint the specification does not require, and the one the
+    /// replaced `fsck_msdos` printed as `Free space in FSInfo block is unset`.
+    /// fatgen103 §5 permits 0xFFFFFFFF, meaning a driver that does not maintain
+    /// the count; every volume this project writes maintains it, and the field
+    /// going unknown is that stopping rather than a format the checker met.
+    FsInfoFreeCountUnknown,
     FsInfoNextFree { got: u32, clusters: u32 },
 
     Fat0 { got: u32, want: u32 },
@@ -125,10 +130,13 @@ pub enum Complaint {
     DotDotCluster { path: String, got: u32, want: u32 },
     /// `.` or `..` in the root directory, which has neither.
     DotInRoot { got: [u8; 11] },
-    /// `DIR_NTRes`, which the format reserves and requires to be zero.
+    /// `DIR_NTRes` carrying a bit nothing has ever defined.
     ReservedEntryByte { path: String, entry: u32, got: u8 },
     LongNameChecksum { path: String, entry: u32, got: u8, want: u8 },
     LongNameOrdinal { path: String, entry: u32, got: u8, want: u8 },
+    /// The ordinal a long-name run opens with, which is the number of entries
+    /// in it and cannot be 0 or above 20.
+    LongNameRunLength { path: String, entry: u32, got: u8 },
     /// The first entry of a long-name run without `LAST_LONG_ENTRY`.
     LongNameLastFlag { path: String, entry: u32, got: u8 },
     /// A long-name run no short entry follows.
@@ -310,8 +318,8 @@ impl fmt::Display for Complaint {
             ),
             Complaint::VolumeShorterThanDeclared { declared_bytes, actual_bytes } => write!(
                 f,
-                "geometry: BPB_TotSec32 declares {declared_bytes} bytes and the volume is \
-                 {actual_bytes}"
+                "geometry: the boot sector describes at least {declared_bytes} bytes of volume and \
+                 this one is {actual_bytes}"
             ),
             Complaint::NotFat32 { clusters } => write!(
                 f,
@@ -344,6 +352,12 @@ impl fmt::Display for Complaint {
                 f,
                 "FSInfo: FSI_Free_Count is {declared} and the FAT has {counted} free clusters; the \
                  format allows 0xFFFFFFFF for unknown and nothing else that is not the count"
+            ),
+            Complaint::FsInfoFreeCountUnknown => write!(
+                f,
+                "FSInfo: FSI_Free_Count is 0xFFFFFFFF, which the format defines as unknown; every \
+                 host reports this volume's free space from that field without counting, and a \
+                 writer that has finished with the volume knows the number"
             ),
             Complaint::FsInfoNextFree { got, clusters } => write!(
                 f,
@@ -436,10 +450,14 @@ impl fmt::Display for Complaint {
                 "{path}: \".\" names cluster {got}; the format requires the directory's own \
                  cluster {want}"
             ),
+            Complaint::DotDotCluster { path, got, want: 0 } => write!(
+                f,
+                "{path}: \"..\" names cluster {got}; the format requires 0 in a directory whose \
+                 parent is the root, whatever BPB_RootClus is"
+            ),
             Complaint::DotDotCluster { path, got, want } => write!(
                 f,
-                "{path}: \"..\" names cluster {got}; the format requires the parent's cluster \
-                 {want}, and 0 where the parent is the root"
+                "{path}: \"..\" names cluster {got}; the format requires the parent's cluster {want}"
             ),
             Complaint::DotInRoot { got } => write!(
                 f,
@@ -448,8 +466,8 @@ impl fmt::Display for Complaint {
             ),
             Complaint::ReservedEntryByte { path, entry, got } => write!(
                 f,
-                "{path}: entry {entry} has DIR_NTRes {got:#04X}; the format reserves that byte and \
-                 requires 0"
+                "{path}: entry {entry} has DIR_NTRes {got:#04X}; the format reserves that byte for \
+                 Windows NT, which defines only 0x08 and 0x10 for a lowercase base and extension"
             ),
             Complaint::LongNameChecksum { path, entry, got, want } => write!(
                 f,
@@ -460,6 +478,11 @@ impl fmt::Display for Complaint {
                 f,
                 "{path}: entry {entry} is long-name ordinal {got} where the run requires {want}; \
                  the format numbers them downward to 1"
+            ),
+            Complaint::LongNameRunLength { path, entry, got } => write!(
+                f,
+                "{path}: entry {entry} opens a long-name run of {got} entries; a long name is at \
+                 most 255 characters and an entry holds 13, so a run is 1 to 20"
             ),
             Complaint::LongNameLastFlag { path, entry, got } => write!(
                 f,
