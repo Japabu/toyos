@@ -114,6 +114,7 @@ const SHARED_BLOCK: Sched = Sched::Parallel;
 const RUST_SKIP: &[&str] = &[
     "segfault_child",
     "disk_backtrace_child",
+    "fault_gate_child",
     "test_panic_child",
     "i8042_keyboard",
     "i8042_mouse",
@@ -1040,12 +1041,52 @@ fn check_audio_idle_suspend(result: &TestResult) -> bool {
     true
 }
 
+/// The exit code says the child died; only the serial says *why*.
+///
+/// A #DE with no gate escalates to #DF, and `double_fault_handler` halts every
+/// CPU — so a run that reaches this function at all already survived. What is
+/// left to check is that the kernel took the fault as a #DE rather than as
+/// something the escalation left behind: the report names the vector and the
+/// function that raised it, and no double fault appears in the window.
+fn check_fault_gates(result: &TestResult) -> bool {
+    if !check_rust_result(result) {
+        return false;
+    }
+
+    let checks: &[(&str, &str)] = &[
+        ("SIGFPE tid=", "expected a SIGFPE header for the divide by zero"),
+        ("divide error", "expected the #DE report to name the vector"),
+        (
+            "fault_gate_child::divide_by_zero",
+            "expected the faulting function in the #DE backtrace",
+        ),
+    ];
+
+    let mut ok = true;
+    for (needle, msg) in checks {
+        if !result.serial.contains(needle) {
+            eprintln!("FAIL rs::fault_gates: {msg}\nserial:\n{}", result.serial);
+            ok = false;
+        }
+    }
+    if result.serial.contains("DOUBLE FAULT") {
+        eprintln!(
+            "FAIL rs::fault_gates: a Ring 3 fault escalated to #DF — its vector has no gate\
+             \nserial:\n{}",
+            result.serial
+        );
+        ok = false;
+    }
+    ok
+}
+
 /// Select check function by test name convention.
 fn check_for(name: &str) -> fn(&TestResult) -> bool {
     match name {
         "panic_recovery" => check_panic_recovery,
         "disk_backtrace" => check_disk_backtrace,
         "audio_idle_suspend" => check_audio_idle_suspend,
+        "fault_gates" => check_fault_gates,
         _ => check_rust_result,
     }
 }
