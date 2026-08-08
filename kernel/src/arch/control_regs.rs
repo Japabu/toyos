@@ -65,9 +65,10 @@ pub const CR0: u64 = cr0::PE | cr0::MP | cr0::ET | cr0::NE | cr0::WP | cr0::PG;
 /// `PAE` is long mode's, `OSFXSR` and `OSXMMEXCPT` are `FXSAVE64`'s and SSE's,
 /// and `MCE` is a machine check reported rather than a shutdown with nothing to
 /// read. **`DE` is here for zero legacy and not for a need**: this kernel
-/// programs no debug register, and `DE` clear is the 386 behaviour where `DR4`
-/// and `DR5` alias `DR6` and `DR7` instead of raising `#UD` (SDM Vol. 3B
-/// §17.2.2, *Debug Registers DR4 and DR5*). All five are older than x86-64 and
+/// references no `DR4` or `DR5` — `arch::debug` and the `#DB` handler use `DR0`,
+/// `DR6` and `DR7` — and `DE` clear is the 386 behaviour where `DR4` and `DR5`
+/// alias `DR6` and `DR7` instead of raising `#UD` (SDM Vol. 3B §17.2.2,
+/// *Debug Registers DR4 and DR5*). All five are older than x86-64 and
 /// present on everything that implements it, and `FSGSBASE` is not — but every
 /// context switch uses `rdfsbase`/`wrfsbase`, so a CPU without it would `#UD` at
 /// the first one. All are checked against CPUID rather than assumed: setting a
