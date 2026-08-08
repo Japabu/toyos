@@ -22,26 +22,77 @@ that followed the T14's first boot.
 
 ## 1. Isolation and untrusted input
 
-### Most CPU exception vectors have no IDT gate, so a userland fault halts the machine
+### Four exception gates are installed with no test behind them, and each for a different reason
 
-`arch::idt::init` installs six exception vectors — #DB (1), #NMI (2), #UD (6),
-#DF (8), #GP (13), #PF (14) — and leaves the rest of the table
-`IdtEntry::EMPTY`, which is `P = 0`. Delivering a fault whose gate is not
-present is itself a fault, and the two are contributory, so the CPU escalates
-to #DF: `double_fault_handler` prints and calls `halt_all_cpus`.
+Closed by `wt/toyos-idt`: every vector Intel names for 64-bit mode now has a
+gate, and `fault_gates` is the guest test. What that test cannot reach is worth
+keeping, because it is the list a later change makes reachable.
 
-**A divide by zero in any user process therefore stops the whole machine**,
-which is exactly what "the kernel must never crash from userland" forbids. #DE
-(0) is the cheapest instance and not the only one: #BR (5), #NM (7), #TS (10),
-#NP (11), #SS (12), #MF (16), #AC (17), #MC (18) and #XM (19) are all absent,
-and #SS is the vector the AMD `SYSRET` residue in §3 would arrive on.
+Measured on the QEMU profile the suite boots, off `info registers` on a live
+guest whose GDT limit says the kernel had already loaded its own:
+`CR0=0x80010033`, `CR4=0x00310668`.
 
-Not reproduced, and worth reproducing before it is fixed: no test in the guest
-suite divides by zero. The shape of the fix is `exception_handler`'s — the
-vectors that can only come from userland kill the process, the ones that mean
-the kernel is broken keep halting. `trap_dispatch`'s `panic!("unhandled
-exception vector")` arm is the honest default for anything left out, and is
-currently unreachable because no vector it does not know is ever installed.
+- **#NM (7)** — CR0.TS and CR0.EM are both clear, so nothing can raise it. Only
+  a lazy-FPU scheme would, and there is none.
+- **#AC (17)** — CR0.AM is clear, so RFLAGS.AC buys a Ring 3 process nothing.
+  The `ac` arm sets AC, reads it back as 1, and the misaligned load still does
+  not fault.
+- **#MC (18)** — CR4.MCE is **set**, by firmware, and the kernel never clears
+  it, so a machine check does arrive on vector 18 rather than shutting the
+  processor down. Nothing in the harness can stage one. Handled as an abort:
+  `machine_check_handler` halts from either ring rather than killing a process
+  over a machine that has stopped being trustworthy.
+- **#XM (19)** — CR4.OSXMMEXCPT is set, so the architecture delivers this one;
+  TCG does not. With the SSE invalid-operation exception unmasked, `0.0/0.0`
+  leaves `MXCSR=0x00001f01` — IE raised, IM clear — and takes no trap. Real
+  hardware would fault, so this arm is untested rather than unreachable.
+
+Two more are kernel-only by construction and stay untested: **#TS (10)** needs
+a task switch or an `iretq` to a bad TSS, and **#NP (11)** needs a descriptor
+with `P = 0` inside the GDT limit, which this seven-entry GDT does not have.
+
+And **#SS (12) is not reachable under TCG at all**: QEMU raises `EXCP0D_GPF`
+for every non-canonical access and models #SS for none, so both `ss` arms — one
+through RBP, one through RSP itself — come back as `SIGBUS … general protection
+fault`. On metal the SDM gives #SS for an SS-relative non-canonical address, so
+that gate is exercised by the same arms on hardware and by neither here. It is
+the vector the AMD `SYSRET` residue in §3 would arrive on.
+
+### A Ring 3 process that sets RFLAGS.TF floods the log forever and is never killed
+
+`popfq` at CPL 3 sets the trap flag, and every instruction after it raises #DB.
+`debug_handler` prints a 25-line `HARDWARE WATCHPOINT HIT` report and
+**returns** — it clears DR6 and DR7 on the way out, neither of which is TF, and
+`iretq` restores the saved RFLAGS with TF still set. So the next instruction
+traps again, forever.
+
+Measured with a throwaway `tf` arm on `fault_gate_child` (three instructions:
+`pushfq`, `or qword ptr [rsp], 0x100`, `popfq`): **56 and 58 reports** in the
+two five-second boots the harness allows, every one `mode=user`, the child
+still running when the guest was killed, and the test red on a timeout. The
+rate is low only because each report is 25 lines of serial.
+
+Pre-existing and not introduced by the gates work — vector 1 was one of the six
+that always had a gate. Two things are wrong and they are separable: the
+handler is a debugging facility that a userland process can summon at will, and
+it resumes a fault it has no way to stop. #DB from Ring 3 with no debugger
+attached has one correct answer, and it is the one every other fault gets.
+
+### No context switch saves x87 state
+
+Verified by grep across `kernel/src`: there is no `fxsave`, `fnsave` or
+`fsave` anywhere. XMM0–15 and MXCSR *are* saved and restored on all three
+Ring 3 entry paths — `arch/syscall.rs`, `idt/timer.rs`, `idt/device_irq.rs` —
+and the x87 register file, control word, status word and tag word are on none
+of them. So one process's x87 state, including a pending unmasked exception, is
+visible to the next.
+
+Latent rather than active: Rust on `x86_64-unknown-toyos` does all float work
+in SSE and never touches x87, and the kernel is `x86_64-unknown-none`, which is
+soft-float. Recorded because `fault_gates`' `mf` arm depends on a pending x87
+exception surviving from the `fdivrp` that raises it to the `fwait` two bytes
+later, and nothing but the narrowness of that window makes it do so. 6 of 6
+runs killed the child.
 
 ### sshd's keys are as protected as any other file, which is not at all
 

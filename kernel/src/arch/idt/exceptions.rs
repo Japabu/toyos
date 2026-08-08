@@ -156,26 +156,47 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         ("", "")
     };
 
+    let name = match ctx.vector() {
+        Vector::DivideError => "divide error",
+        Vector::Debug => "debug",
+        Vector::Breakpoint => "breakpoint",
+        Vector::Overflow => "overflow",
+        Vector::BoundRange => "bound range exceeded",
+        Vector::InvalidOpcode => "invalid opcode",
+        Vector::DeviceNotAvailable => "device not available",
+        Vector::DoubleFault => "double fault",
+        Vector::InvalidTss => "invalid TSS",
+        Vector::SegmentNotPresent => "segment not present",
+        Vector::StackSegment => "stack fault",
+        Vector::GeneralProtection => "general protection fault",
+        Vector::PageFault => "page fault",
+        Vector::X87FloatingPoint => "x87 floating-point exception",
+        Vector::AlignmentCheck => "alignment check",
+        Vector::MachineCheck => "machine check",
+        Vector::SimdFloatingPoint => "SIMD floating-point exception",
+        Vector::Virtualization => "virtualization exception",
+        Vector::ControlProtection => "control protection",
+        // Vectors with a `direct` gate never reach this report: their entries
+        // do not go through `trap_dispatch`.
+        _ => "exception",
+    };
+
     if is_user {
         match ctx.vector() {
             Vector::PageFault => log!("SEGFAULT tid={}: {} {} at {:#x}", tid, pf_action, pf_cause, ctx.cr2),
             Vector::InvalidOpcode => log!("SIGILL tid={}: illegal instruction", tid),
-            Vector::GeneralProtection => log!("SIGBUS tid={}: general protection fault (error_code={:#x})", tid, ctx.frame.error_code),
-            Vector::DoubleFault => log!("FATAL tid={}: double fault", tid),
-            _ => log!("FATAL tid={}: exception {:?}", tid, ctx.vector()),
+            Vector::DivideError | Vector::X87FloatingPoint | Vector::SimdFloatingPoint => {
+                log!("SIGFPE tid={}: {}", tid, name)
+            }
+            Vector::GeneralProtection | Vector::StackSegment | Vector::AlignmentCheck => {
+                log!("SIGBUS tid={}: {} (error_code={:#x})", tid, name, ctx.frame.error_code)
+            }
+            _ => log!("FATAL tid={}: {}", tid, name),
         }
     } else {
         match ctx.vector() {
             Vector::PageFault => log!("KERNEL PANIC: {} {} at {:#x}", pf_action, pf_cause, ctx.cr2),
-            _ => {
-                let name = match ctx.vector() {
-                    Vector::InvalidOpcode => "invalid opcode",
-                    Vector::GeneralProtection => "general protection fault",
-                    Vector::DoubleFault => "double fault",
-                    _ => "exception",
-                };
-                log!("KERNEL PANIC: {} (error_code={:#x})", name, ctx.frame.error_code);
-            }
+            _ => log!("KERNEL PANIC: {} (error_code={:#x})", name, ctx.frame.error_code),
         }
     }
 
@@ -464,6 +485,21 @@ pub(super) fn double_fault_handler(frame: &TrapFrame) -> ! {
         addr += 8;
     }
 
+    apic::halt_all_cpus();
+}
+
+/// #MC — an abort, and the one exception a Ring 3 frame does not make the
+/// process's fault. There is no instruction to return to and the state that
+/// reported it is not trustworthy, so this halts whichever ring it came from
+/// rather than killing a process and carrying on over a broken machine.
+///
+/// Deliverable and untested: firmware leaves CR4.MCE set and this kernel never
+/// clears it, so a machine check arrives here rather than shutting the
+/// processor down. Nothing in the suite can stage one.
+pub(super) fn machine_check_handler(frame: &TrapFrame) -> ! {
+    log!("MACHINE CHECK on CPU {}", percpu::cpu_id());
+    let ctx = ExceptionContext { frame, cr2: 0 };
+    crash_report(&CrashInfo::Exception(&ctx));
     apic::halt_all_cpus();
 }
 
