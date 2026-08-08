@@ -100,6 +100,14 @@ impl UserFpState {
     }
 }
 
+/// [`UserFpState::INITIAL`] in memory, so the loader's trampolines can put a
+/// new thread into it with one instruction and no stack of their own.
+///
+/// A trampoline cannot use `FNINIT` instead: it marks the x87 registers empty
+/// without clearing them, so an `FXSAVE` reads the previous tenant's data back
+/// out, and it does not touch XMM at all.
+pub static INITIAL_IMAGE: UserFpState = UserFpState::INITIAL;
+
 /// Put this CPU's FPU into the declared state and check that it is the state we
 /// think it is.
 ///
@@ -130,6 +138,11 @@ fn load_initial() {
 /// and would be wrong on every one of them, silently. The caller has just run
 /// [`load_initial`], so this compares like with like.
 fn self_check() {
+    assert_eq!(
+        (&raw const INITIAL_IMAGE) as usize % core::mem::align_of::<UserFpState>(),
+        0,
+        "fpu: the initial image is misaligned, so every trampoline would #GP",
+    );
     let live = UserFpState::saved_from_cpu();
     assert!(
         live.matches(&UserFpState::INITIAL),

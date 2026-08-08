@@ -52,6 +52,26 @@ macro_rules! ring3_naked_asm {
     };
 }
 
+/// `naked_asm!` for a trampoline that puts a thread into Ring 3 for the first
+/// time, with the declared state's address supplied from [`fpu`].
+///
+/// [`fpu`]: super::fpu
+macro_rules! ring3_trampoline_asm {
+    ($($body:tt)*) => {
+        core::arch::naked_asm!(
+            $($body)*
+            fp_initial = sym $crate::arch::fpu::INITIAL_IMAGE,
+        )
+    };
+}
+
+/// The state a task that has never been in Ring 3 starts from.
+macro_rules! initial_user_state {
+    () => {
+        "fxrstor64 [rip + {fp_initial}]\n"
+    };
+}
+
 /// Park the user machine state on this kernel stack.
 macro_rules! save_user_state {
     () => {
@@ -80,4 +100,6 @@ macro_rules! restore_user_state {
     };
 }
 
-pub(crate) use {restore_user_state, ring3_naked_asm, save_user_state};
+pub(crate) use {
+    initial_user_state, restore_user_state, ring3_naked_asm, ring3_trampoline_asm, save_user_state,
+};
