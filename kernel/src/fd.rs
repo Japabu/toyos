@@ -3,10 +3,10 @@ use alloc::string::String;
 use crate::file_cache::{self, FileId};
 use crate::id_map::IdMap;
 use crate::process::Pid;
-use crate::vfs::Vfs;
 use crate::{device, keyboard, listener, mouse, pipe};
 use crate::pipe::{PipeId, PipeReader, PipeWriter};
 use crate::drivers::serial;
+use crate::user_ptr::{UserBytes, UserBytesMut};
 pub use toyos_abi::FramebufferInfo;
 use toyos_abi::syscall::{FileType, OpenFlags, SeekFrom, SyscallError};
 
@@ -33,52 +33,105 @@ impl Clone for OpenFile {
     }
 }
 
+/// The reference `Clone` took is given back here, so the two are inverses and
+/// nothing counts open files by hand.
+///
+/// **This takes the VFS lock** — flushing needs it — which is why no entry
+/// point in this module accepts a `&mut Vfs` any more: a caller still holding
+/// the guard when a descriptor drops would deadlock against itself.
+/// `loader::spawn` is the one place outside this module that owns descriptors,
+/// and it scopes its guard for that reason.
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        let mut vfs = crate::vfs::lock();
+        if self.modified {
+            if let Err(e) = vfs.flush_file(&self.path, self.file_id, self.mtime) {
+                crate::log!("warning: flush failed on close: {}: {}", self.path, e);
+            }
+        }
+        if file_cache::release(self.file_id) {
+            vfs.close_file(&self.path, self.file_id);
+        }
+    }
+}
+
+/// One entry in a process's descriptor table.
+///
+/// **Every variant owns what it names and gives it back in `Drop`** — the
+/// file's cache reference, the pipe end, the device claim, the service name,
+/// the ring. No code releases a resource by matching on the kind, so a sixth
+/// kind is one `Drop` in the module that owns it and no edit here.
+///
+/// Deliberately not `Clone`: [`device::Claim`] is not, so the compiler refuses
+/// a second descriptor for a device claim. [`Descriptor::duplicate`] is what
+/// `dup`, `dup2` and a spawn `fd_map` go through.
 pub enum Descriptor {
     File(OpenFile),
     PipeRead(PipeReader),
     PipeWrite(PipeWriter),
     TtyRead(PipeReader),
     TtyWrite(PipeWriter),
-    Keyboard,
-    Mouse,
+    Keyboard(device::Claim),
+    Mouse(device::Claim),
     SerialConsole,
-    Framebuffer(FramebufferInfo),
+    Framebuffer(device::Claim, FramebufferInfo),
     /// An accepted or connected IPC channel. `peer` is the process on the
     /// other end — recorded because holding this descriptor is what
     /// authorizes `SYS_PIPE_OPEN` on a pipe that process created.
     Socket { rx: PipeReader, tx: PipeWriter, peer: Pid },
-    Nic(crate::net::NicInfo),
-    Audio { info: toyos_abi::audio::AudioInfo, info_read: bool },
+    Nic(device::Claim, crate::net::NicInfo),
+    /// An HDA controller the kernel brought up and drives no policy on. Holding
+    /// it is what authorizes [`SYS_DEVICE_REG_READ`] and [`SYS_DEVICE_REG_WRITE`]
+    /// against that device's allow-list.
+    ///
+    /// [`SYS_DEVICE_REG_READ`]: toyos_abi::syscall::SYS_DEVICE_REG_READ
+    /// [`SYS_DEVICE_REG_WRITE`]: toyos_abi::syscall::SYS_DEVICE_REG_WRITE
+    Hda { claim: device::Claim, info: toyos_abi::hda::HdaInfo, info_read: bool },
+    /// A virtio-sound device, on the same terms and authorizing the same two
+    /// calls against its own allow-list.
+    VirtioSound {
+        claim: device::Claim,
+        info: toyos_abi::virtio_sound::VirtioSoundInfo,
+        info_read: bool,
+    },
     /// A registered service. Identified by `ListenerId` and not by name: ids
     /// are never reused, so a descriptor that outlived its listener names
     /// nothing, where a name would re-resolve to whichever process registered
-    /// it next. See `listener::remove`.
-    Listener(listener::ListenerId),
-    IoUring(crate::io_uring::RingId),
-}
-
-impl Clone for Descriptor {
-    fn clone(&self) -> Self {
-        match self {
-            Self::PipeRead(r) => Self::PipeRead(r.clone()),
-            Self::PipeWrite(w) => Self::PipeWrite(w.clone()),
-            Self::TtyRead(r) => Self::TtyRead(r.clone()),
-            Self::TtyWrite(w) => Self::TtyWrite(w.clone()),
-            Self::Socket { rx, tx, peer } => Self::Socket { rx: rx.clone(), tx: tx.clone(), peer: *peer },
-            Self::File(file) => Self::File(file.clone()),
-            Self::Keyboard => Self::Keyboard,
-            Self::Mouse => Self::Mouse,
-            Self::SerialConsole => Self::SerialConsole,
-            Self::Framebuffer(info) => Self::Framebuffer(*info),
-            Self::Nic(info) => Self::Nic(*info),
-            Self::Audio { info, info_read } => Self::Audio { info: *info, info_read: *info_read },
-            Self::Listener(id) => Self::Listener(*id),
-            Self::IoUring(id) => Self::IoUring(*id),
-        }
-    }
+    /// it next.
+    Listener(listener::ListenerRef),
+    IoUring(crate::io_uring::RingRef),
 }
 
 impl Descriptor {
+    /// A second descriptor for the same object, or `None` where the object
+    /// admits only one.
+    ///
+    /// A device claim is that object, and the refusal is structural rather
+    /// than a check: `device::Claim` has no `Clone`, so no expression could
+    /// return `Some` for those five variants. Exclusivity used to last only as
+    /// long as nobody called `dup` — `open_device(FRAMEBUFFER); dup(fd);
+    /// close(fd)` gave the claim back while leaving a live descriptor behind,
+    /// so a second process could take the scanout the first was still
+    /// composing to. The same three calls on the keyboard put one process's
+    /// keystrokes in front of another.
+    pub fn duplicate(&self) -> Option<Self> {
+        match self {
+            Self::PipeRead(r) => Some(Self::PipeRead(r.clone())),
+            Self::PipeWrite(w) => Some(Self::PipeWrite(w.clone())),
+            Self::TtyRead(r) => Some(Self::TtyRead(r.clone())),
+            Self::TtyWrite(w) => Some(Self::TtyWrite(w.clone())),
+            Self::Socket { rx, tx, peer } => {
+                Some(Self::Socket { rx: rx.clone(), tx: tx.clone(), peer: *peer })
+            }
+            Self::File(file) => Some(Self::File(file.clone())),
+            Self::SerialConsole => Some(Self::SerialConsole),
+            Self::Listener(l) => Some(Self::Listener(l.clone())),
+            Self::IoUring(r) => Some(Self::IoUring(r.clone())),
+            Self::Keyboard(_) | Self::Mouse(_) | Self::Framebuffer(..)
+            | Self::Nic(..) | Self::Hda { .. } | Self::VirtioSound { .. } => None,
+        }
+    }
+
     pub fn pipe_id_read(&self) -> Option<PipeId> {
         match self {
             Self::PipeRead(r) | Self::TtyRead(r) => Some(r.id()),
@@ -98,15 +151,16 @@ impl Descriptor {
     pub fn read_source(&self) -> Option<crate::io_uring::Source> {
         use crate::io_uring::Source;
         match self {
-            Self::Keyboard => Some(Source::Keyboard),
-            Self::Mouse => Some(Source::Mouse),
+            Self::Keyboard(_) => Some(Source::Keyboard),
+            Self::Mouse(_) => Some(Source::Mouse),
             Self::SerialConsole => Some(Source::Keyboard),
-            Self::Nic(_) => Some(Source::Network),
-            Self::Listener(id) => Some(Source::Listener(*id)),
+            Self::Nic(..) => Some(Source::Network),
+            Self::Listener(l) => Some(Source::Listener(l.id())),
             Self::PipeRead(r) | Self::TtyRead(r) => Some(Source::PipeReadable(r.id())),
             Self::Socket { rx, .. } => Some(Source::PipeReadable(rx.id())),
-            Self::Audio { .. } => Some(Source::Audio),
-            Self::File(_) | Self::Framebuffer(_) => None,
+            Self::VirtioSound { .. } => Some(Source::VirtioSound),
+            Self::Hda { .. } => Some(Source::Hda),
+            Self::File(_) | Self::Framebuffer(..) => None,
             Self::PipeWrite(..) | Self::TtyWrite(_) => None,
             Self::IoUring(_) => None,
         }
@@ -118,8 +172,8 @@ impl Descriptor {
             Self::PipeWrite(w) | Self::TtyWrite(w) => Some(Source::PipeWritable(w.id())),
             Self::Socket { tx, .. } => Some(Source::PipeWritable(tx.id())),
             Self::File(_) | Self::SerialConsole => None,
-            Self::Keyboard | Self::Mouse | Self::Nic(_) | Self::Audio { .. }
-            | Self::Framebuffer(_) | Self::Listener(_)
+            Self::Keyboard(_) | Self::Mouse(_) | Self::Nic(..) | Self::VirtioSound { .. }
+            | Self::Hda { .. } | Self::Framebuffer(..) | Self::Listener(_)
             | Self::PipeRead(..) | Self::TtyRead(_) | Self::IoUring(_) => None,
         }
     }
@@ -143,7 +197,8 @@ impl FdTable {
         Self { map: IdMap::new() }
     }
 
-    /// Insert at the lowest unused id.
+    /// Insert at the next id. `IdMap`'s counter is monotonic, so it is never
+    /// the lowest unused one and a closed fd number is never handed out again.
     pub fn insert(&mut self, desc: Descriptor) -> Result<u32, SyscallError> {
         self.check_room(None)?;
         Ok(self.map.insert(desc))
@@ -198,100 +253,91 @@ impl FdTable {
 
 }
 
-pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) -> u64 {
+/// Open `path` and install it in `table`.
+///
+/// Takes the VFS lock itself and gives it up before the descriptor exists, so
+/// a refused insert drops the `OpenFile` — and re-takes the lock in
+/// [`OpenFile::drop`] — with nothing held. See that impl.
+pub fn open(table: &mut FdTable, path: &str, flags: OpenFlags) -> u64 {
     let writable = flags.contains(OpenFlags::WRITE);
     let create = flags.contains(OpenFlags::CREATE);
     let truncate = flags.contains(OpenFlags::TRUNCATE);
     let append = flags.contains(OpenFlags::APPEND);
 
-    if create {
-        let (_, file) = vfs.resolve_path("/", path);
-        if file.is_empty() {
-            return SyscallError::InvalidArgument.to_u64();
-        }
-    }
+    let opened = {
+        let mut vfs = crate::vfs::lock();
 
-    if truncate && create {
-        let mtime = crate::clock::nanos_since_boot();
-        vfs.delete(path);
-        let file_id = match vfs.create_file(path, mtime) {
-            Ok(id) => id,
-            Err(_) => return SyscallError::Unknown.to_u64(),
-        };
-        let file = OpenFile {
-            path: String::from(path),
-            file_id,
-            position: 0,
-            writable,
-            modified: false,
-            mtime,
-        };
-        return match table.insert(Descriptor::File(file)) {
-            Ok(fd) => fd as u64,
-            Err(e) => e.to_u64(),
-        };
-    }
-
-    match vfs.open_file(path) {
-        Some(file_id) => {
-            let mtime = vfs.file_mtime(path);
-            let size = file_cache::size(file_id);
-            let position = if append { size as usize } else { 0 };
-            let file = OpenFile {
-                path: String::from(path),
-                file_id,
-                position,
-                writable,
-                modified: false,
-                mtime,
-            };
-            match table.insert(Descriptor::File(file)) {
-                Ok(fd) => fd as u64,
-                Err(e) => e.to_u64(),
+        if create {
+            let (_, file) = vfs.resolve_path("/", path);
+            if file.is_empty() {
+                return SyscallError::InvalidArgument.to_u64();
             }
         }
-        None => {
-            if create {
-                let mtime = crate::clock::nanos_since_boot();
-                let file_id = match vfs.create_file(path, mtime) {
-                    Ok(id) => id,
-                    Err(_) => return SyscallError::Unknown.to_u64(),
-                };
-                let file = OpenFile {
-                    path: String::from(path),
-                    file_id,
-                    position: 0,
-                    writable,
-                    modified: false,
-                    mtime,
-                };
-                match table.insert(Descriptor::File(file)) {
-                    Ok(fd) => fd as u64,
-                    Err(e) => e.to_u64(),
+
+        if truncate && create {
+            let mtime = crate::clock::nanos_since_boot();
+            // A name that was not there is the ordinary case and not a failure
+            // of this open. Anything else is: truncating past it would create a
+            // file over one the mount could not tell us about.
+            match vfs.delete(path) {
+                Ok(()) | Err(SyscallError::NotFound) => {}
+                Err(e) => return e.to_u64(),
+            }
+            vfs.create_file(path, mtime).map(|file_id| (file_id, mtime, 0))
+        } else {
+            // **`CREATE` acts on `NotFound` and on nothing else.** This used to
+            // be the `None` arm of an `Option`, so a mount that would not
+            // answer took the same branch as a name that is not there: one
+            // refused transfer had a fresh empty file created over a file that
+            // exists, and the next write and flush made that permanent.
+            match vfs.open_file(path) {
+                Ok(file_id) => vfs.file_mtime(path).map(|mtime| {
+                    let position =
+                        if append { file_cache::size(file_id) as usize } else { 0 };
+                    (file_id, mtime, position)
+                }),
+                Err(SyscallError::NotFound) if create => {
+                    let mtime = crate::clock::nanos_since_boot();
+                    vfs.create_file(path, mtime).map(|file_id| (file_id, mtime, 0))
                 }
-            } else {
-                SyscallError::NotFound.to_u64()
+                Err(e) => Err(e),
             }
         }
+    };
+
+    let (file_id, mtime, position) = match opened {
+        Ok(v) => v,
+        Err(e) => return e.to_u64(),
+    };
+    let file = OpenFile {
+        path: String::from(path),
+        file_id,
+        position,
+        writable,
+        modified: false,
+        mtime,
+    };
+    match table.insert(Descriptor::File(file)) {
+        Ok(fd) => fd as u64,
+        Err(e) => e.to_u64(),
     }
 }
 
-/// Close an fd. Flushes modified files, handles pipe refcounts.
 /// Release one descriptor.
 ///
-/// `pipe_maps` is the process's live `SYS_PIPE_MAP` windows, and it is a
-/// parameter because this is the one place every descriptor release passes
-/// through. A window's warrant is the descriptor: past the last one naming a
-/// pipe, nothing holds the ring page and the PMM may hand it to anything, so
-/// the mapping has to go with the descriptor rather than with the process.
+/// What the descriptor *holds* is given back by its own `Drop`. What is left
+/// here is the two things that are the *process's* and not the object's, and
+/// neither is written per resource kind:
 ///
-/// [`close_all`] takes no such argument on purpose — the only caller is
-/// process teardown, which destroys the address space the windows are in.
+/// `pipe_maps` is the process's live `SYS_PIPE_MAP` windows. A window's
+/// warrant is the descriptor: past the last one naming a pipe, nothing holds
+/// the ring page and the PMM may hand it to anything, so the mapping has to go
+/// with the descriptor rather than with the process. [`close_all`] needs no
+/// such argument — its only caller is process teardown, which destroys the
+/// address space the windows are in.
 pub fn close(
     table: &mut FdTable,
-    vfs: &mut Vfs,
     fd: u32,
-    pid: Pid,
     pipe_maps: &mut alloc::vec::Vec<crate::process::PipeMap>,
 ) -> u64 {
     let Some(desc) = table.remove(fd) else {
@@ -311,61 +357,22 @@ pub fn close(
     if sources.iter().any(|s| s.is_some()) {
         crate::io_uring::remove_fd(&sources);
     }
-    match &desc {
-        Descriptor::File(file) => {
-            if file.modified {
-                let _ = vfs.flush_file(&file.path, file.file_id, file.mtime);
-            }
-            let last_ref = file_cache::release(file.file_id);
-            if last_ref {
-                vfs.close_file(&file.path, file.file_id);
-            }
-        }
-        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio { .. } => {
-            device::release_descriptor(&desc, pid);
-        }
-        Descriptor::Listener(id) => {
-            listener::remove(*id);
-        }
-        Descriptor::IoUring(id) => {
-            crate::io_uring::destroy(*id);
-        }
-        _ => {}
-    }
     0
 }
 
-pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
+/// Release every descriptor a process holds. Called by exit *and by kill*, so
+/// the drops below are on the path a process taken down by another CPU
+/// follows — this kernel does not unwind, and a `Drop` that only ran on the
+/// orderly path would guarantee nothing.
+pub fn close_all(table: &mut FdTable) {
     for (_, desc) in table.drain() {
-        match &desc {
-            Descriptor::File(file) => {
-                if file.modified {
-                    if let Err(e) = vfs.flush_file(&file.path, file.file_id, file.mtime) {
-                        crate::log!("warning: flush failed on process exit: {}: {}", file.path, e);
-                    }
-                }
-                let last_ref = file_cache::release(file.file_id);
-                if last_ref {
-                    vfs.close_file(&file.path, file.file_id);
-                }
-            }
-            Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio { .. } => {
-                device::release_descriptor(&desc, pid);
-            }
-            Descriptor::Listener(id) => {
-                listener::remove(*id);
-            }
-            Descriptor::IoUring(id) => {
-                crate::io_uring::destroy(*id);
-            }
-            _ => {}
-        }
+        drop(desc);
     }
 }
 
 // Read / Write / Seek / Stat
 
-pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
+pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut UserBytesMut) -> Option<u64> {
     let desc = table.get_mut(fd)?;
     match desc {
         Descriptor::File(file) => {
@@ -376,22 +383,36 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
                 return Some(0);
             }
             let mut read = 0;
+            let mut refused = false;
             while read < count {
                 let abs_pos = file.position + read;
                 let page_idx = (abs_pos / 4096) as u32;
                 let offset_in_page = abs_pos % 4096;
                 let remaining_in_page = 4096 - offset_in_page;
                 let to_read = remaining_in_page.min(count - read);
-                file_cache::read_page(
+                // A page the device would not give back is not a page of
+                // zeros. This stops short of it rather than handing the caller
+                // a hole under a success; short counts are what `read` means,
+                // and before this the return was the full count with the
+                // zeroed pages in the buffer.
+                if file_cache::read_page(
                     file.file_id,
                     page_idx,
                     offset_in_page,
-                    &mut buf[read..read + to_read],
-                );
+                    &mut buf.sub(read, to_read),
+                )
+                .is_err()
+                {
+                    refused = true;
+                    break;
+                }
                 read += to_read;
             }
-            file.position += count;
-            Some(count as u64)
+            if read == 0 && refused {
+                return Some(SyscallError::Io.to_u64());
+            }
+            file.position += read;
+            Some(read as u64)
         }
         Descriptor::PipeRead(r) | Descriptor::TtyRead(r) => {
             pipe::try_read(r.id(), buf).map(|n| n as u64)
@@ -414,12 +435,12 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
         // waiters woken before any thread that wants it is picked. What a
         // reader gives up is at most one pass of latency; what it gains is that
         // a read cannot become a bus operation.
-        Descriptor::Keyboard => {
+        Descriptor::Keyboard(_) => {
             let event_size = core::mem::size_of::<keyboard::RawKeyEvent>();
             let mut count = 0;
             while count + event_size <= buf.len() {
                 if let Some(event) = keyboard::try_read_event() {
-                    buf[count..count + event_size].copy_from_slice(event.as_bytes());
+                    buf.write_at(count, event.as_bytes());
                     count += event_size;
                 } else {
                     break;
@@ -427,12 +448,12 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             }
             if count > 0 { Some(count as u64) } else { None }
         }
-        Descriptor::Mouse => {
+        Descriptor::Mouse(_) => {
             let event_size = core::mem::size_of::<mouse::MouseEvent>();
             let mut count = 0;
             while count + event_size <= buf.len() {
                 if let Some(event) = mouse::try_read_event() {
-                    buf[count..count + event_size].copy_from_slice(event.as_bytes());
+                    buf.write_at(count, event.as_bytes());
                     count += event_size;
                 } else {
                     break;
@@ -440,23 +461,23 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             }
             if count > 0 { Some(count as u64) } else { None }
         }
-        Descriptor::Framebuffer(info) => {
+        Descriptor::Framebuffer(_, info) => {
             let bytes = info.as_bytes();
             let count = buf.len().min(bytes.len());
-            buf[..count].copy_from_slice(&bytes[..count]);
+            buf.write_at(0, &bytes[..count]);
             Some(count as u64)
         }
-        Descriptor::Nic(info) => {
+        Descriptor::Nic(_, info) => {
             let bytes = info.as_bytes();
             let count = buf.len().min(bytes.len());
-            buf[..count].copy_from_slice(&bytes[..count]);
+            buf.write_at(0, &bytes[..count]);
             Some(count as u64)
         }
-        Descriptor::Audio { info, info_read } => {
+        Descriptor::VirtioSound { info, info_read, .. } => {
             if !*info_read {
                 let bytes = info.as_bytes();
                 let count = buf.len().min(bytes.len());
-                buf[..count].copy_from_slice(&bytes[..count]);
+                buf.write_at(0, &bytes[..count]);
                 *info_read = true;
                 return Some(count as u64);
             }
@@ -465,14 +486,28 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             }
             // Completion records, oldest first. Empty → None: blocking reads
             // park on `waitqs::AUDIO`, nonblocking reads get WouldBlock.
-            let n = crate::audio::drain_completed(buf);
+            let n = crate::drivers::virtio_sound::drain_completed(buf);
+            if n == 0 { None } else { Some(n as u64) }
+        }
+        Descriptor::Hda { info, info_read, .. } => {
+            if !*info_read {
+                let bytes = info.as_bytes();
+                let count = buf.len().min(bytes.len());
+                buf.write_at(0, &bytes[..count]);
+                *info_read = true;
+                return Some(count as u64);
+            }
+            if buf.len() < toyos_abi::audio::AudioCompletionRecord::SIZE {
+                return Some(SyscallError::InvalidArgument.to_u64());
+            }
+            let n = crate::drivers::hda::drain_completed(buf);
             if n == 0 { None } else { Some(n as u64) }
         }
         Descriptor::SerialConsole => {
             let mut count = 0usize;
             while count < buf.len() {
                 if let Some(b) = serial::try_read_byte() {
-                    buf[count] = b;
+                    buf.write_at(count, &[b]);
                     count += 1;
                     if b == b'\n' || b == b'\r' { break; }
                 } else if count > 0 {
@@ -490,7 +525,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
     }
 }
 
-pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
+pub fn try_write(table: &mut FdTable, fd: u32, buf: &UserBytes) -> Option<u64> {
     let desc = table.get_mut(fd)?;
     match desc {
         Descriptor::File(file) => {
@@ -514,7 +549,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
                     file.file_id,
                     page_idx,
                     offset_in_page,
-                    &buf[written..written + to_write],
+                    &buf.sub(written, to_write),
                 )
                 .is_err()
                 {
@@ -524,12 +559,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
                 written += to_write;
             }
             if written == 0 && refused {
-                // The honest code does not exist: none of `SyscallError`'s nine
-                // variants means "the device did not do it", and adding one is
-                // an ABI change that needs discussing. `Unknown` is the only
-                // one that does not claim something false. Known issues carries
-                // the conversion; this is its first call site.
-                return Some(SyscallError::Unknown.to_u64());
+                return Some(SyscallError::Io.to_u64());
             }
             file.position += written;
             file.modified = true;
@@ -553,20 +583,8 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
             }
         }
         Descriptor::SerialConsole => {
-            serial::SerialWriter::console().write_bytes(buf);
+            serial::SerialWriter::console().write_user(buf);
             Some(buf.len() as u64)
-        }
-        Descriptor::Audio { .. } => {
-            if !buf.is_empty() {
-                match buf[0] {
-                    0 => crate::audio::stop(),
-                    1 => crate::audio::start(),
-                    _ => {}
-                }
-                Some(1)
-            } else {
-                Some(0)
-            }
         }
         _ => Some(SyscallError::PermissionDenied.to_u64()),
     }
@@ -604,27 +622,27 @@ pub fn fstat(table: &FdTable, fd: u32, stat: &mut Stat) -> bool {
             true
         }
         Some(Descriptor::PipeRead(..) | Descriptor::PipeWrite(..)) => { stat.file_type = FileType::Pipe as u64; true }
-        Some(Descriptor::Keyboard) => { stat.file_type = FileType::Keyboard as u64; true }
-        Some(Descriptor::Mouse) => { stat.file_type = FileType::Mouse as u64; true }
+        Some(Descriptor::Keyboard(_)) => { stat.file_type = FileType::Keyboard as u64; true }
+        Some(Descriptor::Mouse(_)) => { stat.file_type = FileType::Mouse as u64; true }
         Some(Descriptor::SerialConsole) => { stat.file_type = FileType::Serial as u64; true }
-        Some(Descriptor::Framebuffer(_)) => { stat.file_type = FileType::Framebuffer as u64; true }
+        Some(Descriptor::Framebuffer(..)) => { stat.file_type = FileType::Framebuffer as u64; true }
         Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => { stat.file_type = FileType::Tty as u64; true }
         Some(Descriptor::Socket { .. }) => { stat.file_type = FileType::Socket as u64; true }
-        Some(Descriptor::Nic(_)) => { stat.file_type = FileType::Nic as u64; true }
-        Some(Descriptor::Audio { .. }) => { stat.file_type = FileType::Unknown as u64; true }
+        Some(Descriptor::Nic(..)) => { stat.file_type = FileType::Nic as u64; true }
+        Some(Descriptor::VirtioSound { .. } | Descriptor::Hda { .. }) => { stat.file_type = FileType::Unknown as u64; true }
         Some(Descriptor::Listener(_)) => { stat.file_type = FileType::Pipe as u64; true }
         Some(Descriptor::IoUring(_)) => { stat.file_type = FileType::Unknown as u64; true }
         None => false,
     }
 }
 
-pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u32) -> u64 {
+pub fn fsync(table: &mut FdTable, fd: u32) -> u64 {
     let Some(Descriptor::File(file)) = table.get_mut(fd) else {
         return SyscallError::NotFound.to_u64();
     };
     if file.modified {
-        if let Err(_) = vfs.flush_file(&file.path, file.file_id, file.mtime) {
-            return SyscallError::Unknown.to_u64();
+        if let Err(e) = crate::vfs::lock().flush_file(&file.path, file.file_id, file.mtime) {
+            return e.to_u64();
         }
         file.modified = false;
     }
@@ -648,14 +666,18 @@ pub fn has_data(table: &FdTable, fd: u32) -> bool {
         Some(desc) => match desc.pipe_id_read() {
             Some(id) => pipe::has_data(id),
             None => match desc {
-                Descriptor::Keyboard => keyboard::has_data(),
-                Descriptor::Mouse => mouse::has_data(),
-                Descriptor::Listener(id) => listener::has_pending_by_id(*id),
+                Descriptor::Keyboard(_) => keyboard::has_data(),
+                Descriptor::Mouse(_) => mouse::has_data(),
+                Descriptor::Listener(l) => listener::has_pending_by_id(l.id()),
                 Descriptor::SerialConsole => serial::has_data(),
-                Descriptor::Nic(_) => crate::net::has_packet(),
-                Descriptor::Audio { info_read: false, .. } => true,
-                Descriptor::Audio { info_read: true, .. } => crate::audio::has_pending(),
-                Descriptor::File(_) | Descriptor::Framebuffer(_) => true,
+                Descriptor::Nic(..) => crate::net::has_packet(),
+                Descriptor::VirtioSound { info_read: false, .. } => true,
+                Descriptor::VirtioSound { info_read: true, .. } => {
+                    crate::drivers::virtio_sound::has_pending()
+                }
+                Descriptor::Hda { info_read: false, .. } => true,
+                Descriptor::Hda { info_read: true, .. } => crate::drivers::hda::has_pending(),
+                Descriptor::File(_) | Descriptor::Framebuffer(..) => true,
                 _ => false,
             }
         }

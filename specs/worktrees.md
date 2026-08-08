@@ -131,11 +131,11 @@ Three things follow, and all three are constraints rather than preferences:
   anything.
 - **It is taken once per process.** A second acquisition where the process
   already holds it shared is a cycle with a queued claim's intent.
-- **`--land` does not take it; its gate does**, because the gate is a separate
-  `cargo test` process and a landing holding the lock while its own gate queued
-  behind a claim would be exactly that cycle. What the landing leaves
-  unprotected is the merge and the fast-forward, neither of which reads a
-  sysroot.
+- **Landing does not take it, and now cannot.** `cargo run -- --pr` builds
+  nothing: it is git, a merge and a push, none of which reads a sysroot. While
+  the landing gate was a `cargo test` on this host, the rule was that `--land`
+  itself had to stay out of the lock and let its gate — a separate process —
+  take it, or the two were exactly that cycle.
 
 Why not the `Scope::Global` lock a build already takes? Because it is the wrong
 *length*. It says "nothing replaces the sysroot while I build", and a suite is a
@@ -216,6 +216,59 @@ wait. Two things would remove it and neither was taken today:
 - **Landing the ABI change first**, which is cheaper and which the standing rule
   now points every refused checkout at.
 
+**That mitigation is in the refusal itself now, because on 2026-08-07 the turn
+was measured twice and both times it was a whole task long.** Eight worktrees on
+the host, two of them waiting correctly rather than claiming: about 35 minutes in
+one case and about 50 in the other, during which neither could build at all. One
+of the two holders later reported having held the sysroot through two failed
+gates before landing, where landing at the first clean boundary would have ended
+the refusal for everybody. **The window is the claimant's to make small**: the ABI
+half of a change is usually a few lines that compile on their own, and landing it
+by itself makes the window one landing instead of one task. Applied successfully
+once that day. `toolchain::CLAIM_WINDOW` is that sentence, printed by the refusal
+a diverged checkout gets and again by the claim announcement — an agent in this
+situation is reading the refusal, not this file.
+
+**And the rule is now enforced at the cause rather than at the victim.** On
+2026-08-07 it was followed once in four times: `toyos-vfserr` split deliberately
+and said so; `toyos-memsec2` did not and held through two failed gates, blocking
+two agents ~35 and ~50 minutes; `toyos-h3` did not, and two landings failed
+against it in one hour — a log-audit branch at 129.6 s and a `tone` change at
+94.8 s, each burning a full build before reaching `toolchain.rs`'s refusal. That
+refusal is a good one arriving at the wrong process. The same question is asked
+of the *landing* branch now, before anything is compiled: a branch whose commits
+touch the witnessed trees **and** carry commits that touch none of them is
+refused, naming both lists. `pr::abi_lands_alone` is the one implementation and
+it answers in two places — at `cargo run -- --pr` in a second, and at CI's
+`abi-split` check for a branch that skipped the preflight, CI being the only
+thing between a branch and `main`.
+
+It is a refusal and not a warning, because a warning is what the briefs already
+were. The way past it is an **`Abi-Inseparable: <why>` trailer** in one of the
+branch's commit messages, for the case the split genuinely cannot be made — an
+ABI item the branch renames or removes, whose old form the rest of the tree
+still uses. It was a flag on `--land`, whose only record was the commit that
+command wrote; a trailer is in the branch's own history, lands with it, and is
+the one form CI can read at all, since CI has no command line from the author.
+Where the sysroot commits are the *oldest* on the branch the refusal prints the
+two-command remedy; where they are interleaved it says so, because nothing in
+this workflow rebases. A branch's own update merges are not unrelated work —
+merges are excluded, or a branch whose only commit is the ABI change would be
+refused for having merged main once. Gates:
+`a_branch_mixing_the_sysroot_with_dependent_work_is_refused`,
+`the_inseparable_trailer_is_the_escape_and_it_is_in_the_history`,
+`an_abi_only_branch_and_an_ordinary_branch_both_pass`.
+
+**A checkout that is merely *behind* main is not diverged from it**, and until
+2026-08-07 `standing()` could not tell the two apart: it asked `git diff main`,
+which is symmetric, so a worktree that had not merged somebody else's landed ABI
+change read as `Diverged` and could claim — rebuilding the shared sysroot from
+sources *older* than main's and refusing the checkout whose change had already
+landed. It asks `git diff main...HEAD` against the merge base now, plus
+`git status` for the working tree, which also catches an untracked file in
+`toyos-abi/src` that no diff against a commit could see. Gate:
+`a_checkout_behind_main_has_no_standing_to_claim`.
+
 ## 4. Two lock scopes
 
 `buildlock::Scope` is named at every `act_if`, because the two are not
@@ -240,89 +293,119 @@ way round, and two builds in one worktree are that pair.
 ## 5. Integration
 
 Agents commit freely on their own branch. Landing is explicit, serialized, and
-never rewrites history.
+never rewrites history. **It happens on GitHub.**
 
-In the worktree, at task end, `cargo run -- --land`:
+`cargo run -- --land` used to be the whole protocol: an integration lock on this
+host, `git merge --no-ff main`, the whole suite as a gate, `git -C <primary>
+merge --ff-only`. It is retired, and the reason is the gate rather than the
+mechanism — the dev host is arm64 emulating x86, `specs/ci-plan.md` §7 is a
+class of defect it cannot execute at all, and a gate blind to a class is not a
+gate against it. The gate is twelve KVM shards on x86_64 now, and the merge went
+with it.
 
-1. Take the integration lock — exclusive.
-2. `git merge --no-ff main`. Conflicts are resolved *here*, where the agent can
-   build and test the merged result. This merge commit is the landing record and
-   it names both parents.
-3. Run the gate the change deserves.
-4. `git -C <primary> merge --ff-only <branch>`.
-5. Release.
+In the worktree, at task end:
 
-`--ff-only` cannot silently take anything: step 2 already put main into the
-branch, so a non-fast-forward means someone landed in between. Under the lock
-that cannot happen, which makes the flag a check on the lock rather than a
-fallback.
+1. `cargo run -- --pr`. It refuses what would be wrong (on `main`, detached, an
+   unresolved merge, an uncommitted tree, a sysroot change carrying dependent
+   work), fetches, fast-forwards this host's `main`, merges `origin/main` into
+   the branch, and pushes the branch.
+2. `gh pr create --fill` the first time; every later `--pr` updates the same
+   pull request by pushing to its head.
+3. `gh pr merge --auto --merge`, and walk away. GitHub merges when the required
+   checks pass.
+4. `cargo run -- --sync` afterwards, or at the top of the next task, to bring
+   this host's `main` up to what was merged.
 
-**The command is `src/land.rs`, and it is the whole protocol.** The lock is
-`integration` in `<common-dir>/toyos-build-locks/`, taken exclusively for the
-length of one landing and by nothing else. A distinct file from the `state` that
-builds take in `Scope::Global`, because step 3's gate *is* a build and would
-otherwise queue behind its own holder — `a_landing_and_a_build_do_not_exclude_each_other`
-is the gate on that. No `intent` beside it: writer preference exists to keep a
-stream of shared acquirers from starving an exclusive one, and nothing takes
-this file shared at all.
+**Step 1's merge is the load-bearing one and it is not a convenience.** The
+required checks are *strict* — GitHub refuses the merge button until the branch
+contains `origin/main` — so the checks that run on the branch head are checks on
+the merged result. That is what catches a semantic conflict between two branches
+that each pass alone, and it is the one property a naive "CI on the pull request"
+setup throws away. GitHub's native merge queue is the feature that restores it
+properly; it is **not available on this repository** and `specs/ci-plan.md` §10.1
+has the two API answers that say so.
 
-What it refuses rather than guesses at:
+**Serialization comes from the same place.** The first merge moves `main`, and
+from that instant every other open pull request is out of date and has to merge
+again and re-run. That is the integration lock, enforced by the thing that
+actually moves `main` — where the old one was an advisory `flock` on one laptop
+that two landings got past, both recorded below.
+
+`specs/ci-plan.md` §10.3 is the table of where each of `--land`'s invariants
+went, and §10.4 is the two-stage switch and its trigger.
+
+### What `--pr` refuses rather than guesses at
 
 - **A conflict is left in the worktree**, not aborted — the index and the markers
   git has already written are what the agent resolves against, and an abort
-  deletes exactly those. The lock goes down first. Resolve, `git add`,
-  `git commit`, re-run `--land`; a *next* run that finds `MERGE_HEAD` says so
-  instead of merging over it.
-- **main moving under the lock is reported as a bypass**, by name, listing what
-  arrived, with nothing merged. Only `--land` takes the lock, so a main that
-  moved between step 2 and step 4 means someone landed without it.
-- **An uncommitted tree on either side.** The branch's, because the gate measures
-  the working tree while main gets the commits; the primary's, because step 4
-  moves it.
+  deletes exactly those. Resolve, `git add`, `git commit`, re-run `--pr`; a run
+  that finds `MERGE_HEAD` says so instead of merging over it.
+- **An uncommitted tree.** CI gates what was pushed, so uncommitted work would be
+  gated by nothing and merged by nothing.
+- **A branch mixing the shared sysroot's sources with work that depends on
+  them** — §3.2's rule, refused here in a second and again by CI's `abi-split`
+  check, both out of `pr::abi_lands_alone`. The escape is an
+  `Abi-Inseparable: <why>` trailer in a commit message, which lands with the
+  branch and stays as the record; it was a flag, and a flag is a thing CI can
+  never see.
+- **A push that is not a fast-forward.** Nothing here forces one. A pushed branch
+  is a hash somebody's CI run may already have cited.
 
-**The gate is `cargo test`**, the whole suite. `--gate <program> [args...]`
-overrides it and takes the rest of the command line, so it comes last; any
-override is printed before the gate runs and again in the report, because a
-landing that gated less than the default must not be able to look like one that
-did not.
+### The merge commit is the record, and it reads from main's side
 
-**Both landings before the command paid for its absence.** macOS ships no
-`flock` CLI, so nothing outside this build system can take a lock at all: one
-agent reached for Python, and during the first landing's 10-minute gate another
-agent put three commits on main. What caught that was `--ff-only`, exactly as
-above — a check on a lock nobody was holding. Steps 2-4 were redone.
+git's default for a branch merge is `Merge branch 'main' into wt/toyos-x`, the
+direction nobody reads: **166 commits on main in the twenty hours to 2026-08-07,
+66 of them that one sentence.** `--land` fixed it by composing the message
+itself. GitHub composes it now, out of the pull request's title and body
+(`merge_commit_title=PR_TITLE`, `merge_commit_message=PR_BODY`), so the title is
+what `git log --oneline` shows and `.github/pull_request_template.md` asks for
+the rest. **Read the history with `git log --no-merges`** when you want the work
+rather than the landings.
 
-**And the third landing was `--land`'s own, which caught the same thing on its
-first run.** Six commits — the Swiss German keyboard work, `a5c26b6..8e3f76d` —
-went onto main during its 870 s gate, by hand, because on main the command did
-not exist yet. The bypass report named all six and merged nothing; step 2 and
-step 3 were run again against the new main. That is the last landing that can
-happen, since `--land` is on main from that merge onward.
+Two things `--land` put in that commit and GitHub does not, and where they went:
+**which gate ran** is the check run on the head commit, durable and linked from
+the merge; **whether the run was clean** is `EXPECTED_FAILURES` in
+`tests/toyos.rs`, which is in the diff being reviewed, and every shard's own
+`test result:` line in the run's job summary.
 
-The redo is cheap only when the code delta is provable: `git diff <gated>..HEAD`
-after the second merge showed markdown alone, so the 233-test run carried and
-only the audio family was re-run before the fast-forward, both inside one hold.
-A merge that moves code has no such shortcut and pays the full gate again.
-`--land` has no such shortcut either — it re-gates in full.
+### What is left of the integration lock
 
-**The gate runs inside the lock.** That queues landings, and the queue is the
-honest cost of a gate that means something: CLAUDE.md's concurrent-measurement
-rule says a suite perturbed by five other agents' QEMU boots is not evidence.
-The optimistic alternative — gate outside, take the lock, re-check, re-gate if
-main moved — is strictly faster and available if the queue ever bites, at the
-cost of sometimes gating twice.
+`buildlock::integration` survives with a narrower job: **one process at a time
+moves this host's `main`**. `--sync` fast-forwards the primary checkout, and the
+primary is a checkout somebody may be building in.
 
-**Who merges: the agent, at task end.** The current model's one real virtue is
-that agents build on each other's landings immediately, and an orchestrator
-merge queue gives that up — branches diverge further the longer they wait, and
-the person merging has the least context about the change. The agent has the
-most. The orchestrator's leverage is *before* the merge, reviewing changes to
-files that govern other agents (CLAUDE.md, specs that others read); that is a
-review gate, not a merge queue.
+The lock's own history is worth keeping, because it is about locks and not about
+landing. macOS ships no `flock` CLI, so nothing outside this build system can
+take one at all: before `--land` existed, one agent reached for Python and
+another put three commits on main during a 10-minute gate. `--land`'s own first
+run caught six more (`a5c26b6..8e3f76d`) going onto main by hand, because on main
+the command did not exist yet. Both were caught by `--ff-only` doing the work of
+a lock nobody was holding — which is why the replacement is enforced by GitHub
+rather than by agreement.
 
-**Merging into `main` needs the primary's tree clean**, since step 4 moves it.
-The primary is therefore not an agent's workspace. It owns the toolchain, holds
-`main`, and is where landings arrive.
+**A queue has to be audible**, and on 2026-08-07 eight `--land` processes on this
+lock each printed one `[build-lock] waiting …` line and then said nothing for as
+long as the seven ahead of them took, which is what a wedge looks like. Every
+blocking acquisition in `src/buildlock.rs` repeats itself every 30 s with the
+holder re-read each time. Gate: `a_lasting_wait_keeps_saying_so`.
+
+### Who merges: the agent, at task end
+
+Unchanged, and it is the same argument. The current model's one real virtue is
+that agents build on each other's landings immediately, and an orchestrator merge
+queue gives that up — branches diverge further the longer they wait, and the
+person merging has the least context about the change. The agent has the most,
+and `gh pr merge --auto` is the agent saying so and then leaving.
+
+What is new is that the owner's leverage now has an artifact. The review gate
+this section used to ask for — someone looking at changes to the files that
+govern other agents, CLAUDE.md and the specs others read — is a pull request,
+which is the first thing this workflow has ever produced that he can review
+before it lands. **Zero approving reviews are required**, deliberately: one human
+and several agents means a review requirement is a deadlock on him being awake.
+
+**The primary checkout is still not an agent's workspace.** It owns the
+toolchain, holds `main`, and `--sync` moves its tree.
 
 ## 6. The host is still one host
 
@@ -337,7 +420,13 @@ as they were shared by every agent.
   mismeasuring everything. **Built:** `buildlock::guest_slot` is that counting
   semaphore, `HOST_GUESTS` = 12 lock files in the global lock directory, one
   slot per task and never per boot. `specs/test-cost-audit.md` §5.6 has the
-  mechanism and the four measured numbers.
+  mechanism and the four measured numbers. **And it counted the wrong thing on
+  its own**: a worker holds its guest slot from the moment it takes a task, and
+  the first part of that task is compiling a kernel variant, so twelve workers
+  are twelve concurrent `cargo build`s and no guest at all — load 49.9 on
+  fourteen cores with one guest live, measured 2026-08-07.
+  `buildlock::build_slot` is the second count, four across every worktree,
+  `specs/test-cost-audit.md` §5.7.
 - **Gate A.** `tests/audio-baseline.toml`'s numbers were recorded with one QEMU
   at a time and no concurrent agents. Worktrees make that condition rarer, not
   differently rare — six agents in one tree already broke it. The options and
@@ -390,3 +479,11 @@ the only copy of itself.
 it — including, the first time this was tried, the build-system change that
 makes worktrees work at all, which sent the new worktree straight into the
 bootstrap this document exists to prevent.
+
+**It carried `.cargo/config.toml` and not `assets/timgm6mb.sf2`**, which reddened
+nine tests of the desktop and metal-sim families in every brand-new worktree
+until somebody copied that file across. Closed 2026-08-08, and not by copying it:
+the SoundFont a worktree needs is `assets/soundfont.sf2` and git carries it, so a
+checkout has it like every other asset. There is nothing left to copy —
+`specs/ci-plan.md` §6 is the account, and its own SoundFont paragraph predates
+this.

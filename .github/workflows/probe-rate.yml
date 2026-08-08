@@ -1,0 +1,91 @@
+name: rate-probe
+
+# **The measurement `specs/ci-plan.md` §9 says nobody has taken.** Three runs of
+# the twelve-shard configuration produced red lists of ten, sixteen and five
+# names with only three in all of them, so most of what is red on a runner is a
+# *rate* and nothing had counted it. Two samples cannot tell a defect that
+# reproduces from one that fires one run in five.
+#
+# So: the exact configuration `ci.yml` runs — same image, same accelerator, same
+# `--jobs 1`, same twelve-way partition — five times over, and every job's whole
+# log kept. `--merge-durations` is not involved and neither is any verdict: the
+# product is the per-test red count over N runs.
+#
+# It never fails. A probe that reds is a probe whose own summary nobody reads.
+
+on:
+  push:
+    branches: ['ci/probe-rate']
+  workflow_dispatch:
+
+jobs:
+  rate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    container:
+      image: debian:sid
+      options: --device=/dev/kvm
+    steps:
+      - name: deps
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            git curl ca-certificates jq zstd xz-utils build-essential \
+            qemu-system-x86 > /dev/null
+          qemu-system-x86_64 --version | head -1
+          grep -m1 'model name' /proc/cpuinfo
+
+      - uses: actions/checkout@v4
+
+      - name: rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          echo "toolchain: $tag"
+          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
+          for _ in $(seq 90); do
+            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
+              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
+            [ -n "$asset" ] && break
+            echo "waiting for the toolchain workflow to publish $tag ..."
+            sleep 60
+          done
+          test -n "$asset"
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
+          mkdir -p rust/build
+          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
+          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+
+      # `|| true`: a red is the datum, not the job's verdict.
+      - name: suite
+        run: |
+          set -o pipefail
+          cargo test --test toyos-build -- \
+            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0 \
+            2>&1 | tee /tmp/suite.log || echo "SUITE-EXIT: $?"
+          echo "=== rep ${{ matrix.rep }} shard ${{ matrix.shard }} verdicts"
+          grep -E '^(FAIL |  ALONE |  STALL |XFAIL |  INVL )' /tmp/suite.log || true
+
+      - name: the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rate-r${{ matrix.rep }}-s${{ matrix.shard }}
+          path: /tmp/suite.log
+          if-no-files-found: warn
+          retention-days: 5

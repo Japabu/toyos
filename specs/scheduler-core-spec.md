@@ -70,7 +70,7 @@ toyos-sched/                     # workspace member; no_std + alloc
   src/fair.rs                    # FairShare: per-process vruntime/lag/frontier math (pure)
   src/mailbox.rs                 # intrusive MPSC + doorbell   [#[allow(unsafe_code)], loom-checked]
   src/waitq.rs                   # WaitQueue + WaitTicket two-phase commit + boost window
-  src/timer.rs                   # per-CPU deadline heap (lazy deletion) + TimerPlan
+  src/timer.rs                   # TimerPlan + TimerApplied (a deadline lives in ParkedEntry, §8.3)
   src/cpu.rs                     # CpuSched, SchedPass type-state, Action, sleep handshake
   src/retire.rs                  # kill bit + retire message chase
   src/msg.rs                     # Msg: the per-CPU mailbox message type
@@ -238,7 +238,7 @@ pub struct TaskShared {
 queues — the *invariant* the node was for, without the allocation-free list. `waitq.rs:20-26`
 records this as a deliberate departure taken to keep `unsafe` confined to `mailbox.rs`, and
 says the intrusive list is still owed. It is the same debt as the parked-thread wait-queue node
-leak in `specs/known-issues.md`.
+leak in `specs/issues/`.
 
 Legal CAS edges mirror §5.2 exactly and are written in one `match` in `task.rs`; any other
 observed edge panics. `feature = "check"` verifies word-vs-container agreement at every
@@ -259,8 +259,9 @@ pub struct CpuSched<X: SchedPayload> {
     id: CpuId,                                   // identity is a FIELD, never an ambient query
     running: Option<RunningTask<X>>,
     rq: RunQueue<X>,                             // §9.2
-    parked: BTreeMap<TaskKey, ParkedEntry<X>>,   // BTreeMap, not HashMap (no_std, ordered)
-    deadlines: DeadlineHeap,                     // named type; lazy deletion, validated against `parked`
+    parked: BTreeMap<TaskKey, ParkedEntry<X>>,   // BTreeMap, not HashMap (no_std, ordered).
+                                                 //   Deadlines live in the entries and nowhere
+                                                 //   else — there is no second index (§8.3)
     zombie: Option<DeadTask<X>>,                 // freed by the NEXT pass (can't free the stack we run on)
     mailbox: MailboxConsumer<Msg<X>>,
     steal_probe: MailboxNode<Msg<X>>,            // NOT a StealNode — see §7.7
@@ -728,27 +729,37 @@ device ISR tails, join, timer — terminate in this one `claim` routine; there i
 ### 8.3 Deadline timeouts (owner-local)
 
 Blocked-with-deadline tasks park locally; only ready tasks migrate. Every deadline therefore
-lives in exactly one place: the home CPU's heap, maintained by the same pass that owns the
-parking. The heap uses **lazy deletion**: entries are `(Nanos, TaskKey)`; firing validates
-against `parked` — a popped entry whose key is absent or whose `ParkedEntry.deadline` no longer
-matches is stale and skipped (no O(log n) removal on wake).
+lives in exactly one place: the `ParkedEntry` of the task that owns it, on that task's home CPU.
+**There is no separate index, and that is the design.** An ordered index holds the deadline a
+second time, and every pass that ends a park has to retire both copies; the one that did not was
+`fire_deadlines`' lost-claim arm, which discarded the index entry and left the entry's copy
+standing — a CPU reporting a deadline nothing will fire, indistinguishable from health to
+`sched::dump` and to anything else that reads it. `earliest_deadline` and `next_due` scan
+`parked`, which is O(parked-on-this-CPU) and sits on the pass path; the number that would change
+this decision is a machine with hundreds of threads blocked on one CPU, and it is not this one
+(see `scheduler-migration-log.md`).
 
-Fire path: pass start pops due entries → for each valid one, CAS `Blocked(c) → WakeQueued(c)`
-*locally*. CAS success → the owner wakes it with `WakeReason::Timeout` (dequeue from its waitq
-under the leaf lock — idempotent). CAS failure → a remote waker won; its `Wake` message is in our
-mailbox or in flight (doorbell KICK set → this CPU will pass again before sleeping); the timeout
-is superseded — do nothing. Same arbitration CAS as §8.2, no special cases.
+Fire path: pass start walks for a due entry → CAS `Blocked(c) → WakeQueued(c)` *locally*. CAS
+success → the owner wakes it with `WakeReason::Timeout` (dequeue from its waitq under the leaf
+lock — idempotent). CAS failure → a remote waker won; its `Wake` message is in our mailbox or in
+flight (doorbell KICK set → this CPU will pass again before sleeping); the timeout is superseded,
+**and the entry's deadline is cleared**, because no later claim can succeed either and a deadline
+that will not be honoured must not be reported as pending. Same arbitration CAS as §8.2, no
+special cases. Gated by `sim/tests/deadline_claim_race.rs`, which is the only thing that can
+construct that arm at all — see §10.5's note on I3.
 
 ### 8.4 The armed-if-needed invariant (kills B5)
 
 **Invariant T (provable, checked):** whenever CPU `c` is outside a pass:
-`armed_deadline(c) ≤ min(quantum_end(c) if running, min-valid(deadlines(c)))`, and hlt with a
-nonempty valid heap implies the timer is armed to its min. Proof: (a) all heap mutations happen
-inside a pass on `c` (block disposition inserts, wake/retire invalidate); (b) `finish()` is the
-only pass exit and programs the timer *after* all mutations; (c) `SleepToken` construction
-requires the timer plan applied. `ensure_armed_before`, the global `LAST_ARMED_TICKS` saga, and
-the "deadline honored 7 ms late" audio failure disappear structurally. Sim invariant I3 re-checks
-after every step; kernel `feature="check"` builds assert it at pass end.
+`armed_deadline(c) ≤ min(quantum_end(c) if running, earliest deadline in parked(c))`, and hlt
+with any parked deadline implies the timer is armed to the earliest. Proof: (a) `parked` is only
+mutated inside a pass on `c` (the block disposition inserts, wake/retire/timeout remove); (b)
+`finish()` is the only pass exit and programs the timer *after* all of them; (c) `SleepToken`
+construction requires the timer plan applied; (d) the arming reads the same field the invariant
+reads, so no second copy can be the one that is right. `ensure_armed_before`, the global
+`LAST_ARMED_TICKS` saga, and the "deadline honored 7 ms late" audio failure disappear
+structurally. Sim invariant I3 re-checks after every step; kernel `feature="check"` builds assert
+it at pass end.
 
 ### 8.5 Priority inheritance for the audio path (audio spec §5.10)
 
@@ -966,7 +977,7 @@ never calls it either. It stays on the trait as a declared surface; the first re
 its shape.
 
 Real vs mocked (the kernel-equivalence contract): task types, state word, transitions, RunQueue,
-FairShare math, mailbox, doorbell, sleep handshake, ticket protocol, retire chase, deadline heap,
+FairShare math, mailbox, doorbell, sleep handshake, ticket protocol, retire chase, deadlines,
 pass logic, invariant checks — **real and shared** in both worlds. Time/timer/IPI/hlt/cli/switch —
 LAPIC/TSC/ICR/asm in the kernel; virtual clock, delayed events, vcpu bookkeeping in the sim. The
 sim payload holds a real `Arc<MockAddressSpace>` (refcount invariant I8) and a `ctx_saved` shadow
@@ -1028,7 +1039,7 @@ checkers.
 |---|---|---|
 | I1 | Single ownership: every live `TaskKey` in exactly one container/message system-wide; state word agrees | sim (global walk) + kernel check builds (local) |
 | I2 | Sleeping CPU ⇒ empty rq ∧ empty mailbox, or an IPI pending to it | sim + loom_sleep |
-| I3 | Invariant T: timer armed ≤ min(quantum, valid deadline min); hlt with deadlines ⇒ armed | sim + kernel check builds |
+| I3 | Invariant T: timer armed ≤ min(quantum, earliest parked deadline); hlt with deadlines ⇒ armed. Its teeth were never the problem — no *scenario* could construct a divergence, because `SchedPass::begin` runs the drain and the deadline fire with no step boundary between them. `sim/tests/deadline_claim_race.rs` is that window, scripted | sim + kernel check builds (+ `deadline_claim_race`) |
 | I4 | RT-ready task while any CPU runs a normal task beyond IPI+pass+max-KernelSection bound ⇒ fail | sim |
 | I5 | Fairness: per-share service within lag bounds; \|lag\| ≤ 50 ms at transitions | sim |
 | I6 | `FairShare.runnable_threads` == actual Ready+Running count per share | sim |

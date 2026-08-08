@@ -568,7 +568,7 @@ toyos -> /Users/jan/Dev/jan/toyos/rust/build/aarch64-apple-darwin/stage2
 point at *the current tree's* stage2, and `ensure` then re-links it. **Two
 worktrees would relink it away from each other on every build**, and a build in
 tree A between B's relink and A's next check either uses B's compiler or fails.
-That failure already has a name in known-issues §6 — `'rustc' is not installed
+That failure already has a name in `specs/issues/build/` — `'rustc' is not installed
 for the custom toolchain 'toyos'` — and today it is a within-tree race window.
 Worktrees would make it the steady state. **This is a hard blocker for #117 and
 it must be solved before any worktree runs a build**, not discovered by it.
@@ -780,7 +780,7 @@ default arguments, printed 400 lines to a console nothing was reading, and
 passed on its exit code. Making its arguments required is what surfaced that; it
 is in `RUST_SKIP` now, beside the other bins that are driven rather than run.
 
-Two things this found and did not fix are in `specs/known-issues.md` §8: the
+Two things this found and did not fix are in `specs/issues/hardware/`: the
 collapsed-scroll paint the workload believed it exercised is unreachable through
 a pipe and is asserted by nothing, and `Console::flush` records the rightmost
 glyph column as painted when the scrollbar clamped the blit away from it.
@@ -859,7 +859,7 @@ wants the post-cut profile, not this one.
   `allocator_stress` went from 1 s to past its 5 s. A per-test wall-clock ceiling
   *is* the tail's definition; the reasoning simply had the wrong median in it.
   It cost 114 red of 238 to learn, because a timeout desynchronises every later
-  test on that boot — known-issues §6, and a defect that predates this work.
+  test on that boot — `specs/issues/build/`, and a defect that predates this work.
 - `xhci_second_controller` joins them on its own evidence: at width 4 its four
   injected pointer events arrived and **all five keys were lost**, which reads
   exactly like the defect it exists to catch. Host-paced injection has no flow
@@ -1147,11 +1147,14 @@ worktrees' suites:
 - **`i8042_mouse`: one discarded byte, green alone.** A pre-existing
   `Sched::Parallel`, red only under five concurrent suites.
 - **`usb_transport_break`: "the transport broke 2 times; the injection is armed
-  once per boot", green alone.** Also pre-existing, also five-suite load.
+  once per boot", green alone.** Also pre-existing — and not load at all, which
+  took until `specs/issues/hardware/` to establish. Five concurrent suites
+  slowed the host enough for the guest to win a race it loses on a quiet one,
+  which is the same variable KVM changes by 50x; the defect underneath was the
+  driver's, and load was only ever the thing that exposed it.
 
-The last two are in `specs/known-issues.md`. Neither was introduced here and
-neither reproduces on a host running one suite; both are exactly what the
-mechanism exists to surface.
+Both are in `specs/issues/`. Neither was introduced here, and both are
+exactly what the mechanism exists to surface.
 
 ## 5.5 Wave 6: the regression, and pacing as the general fix
 
@@ -1214,7 +1217,7 @@ line, so an injection can be driven by what the guest has printed.
   **every injected packet arrived**, plus `0 discarded`, `0 overruns`,
   `0 dropped`, `0 lost edges` off the driver's own line — counters that a
   starved guest could previously have explained and now cannot. The lead was 32
-  for its first year and that is what made the test flaky: known-issues §8.
+  for its first year and that is what made the test flaky: `specs/issues/hardware/`.
 - `input_events_run` is the shared sequence of `metal_sim_input` and
   `xhci_second_controller` as a script whose every step waits for the guest to
   print what the step before it produced.
@@ -1279,17 +1282,23 @@ of it anyway, both fixes on their own terms and neither a response to the load:
 - `shell_answers` typed ten times with a flat two seconds between, a
   twenty-second ceiling on a desktop coming up that does not scale with the
   phase. Now `qemu::budget(20 s)`.
-- `usb_transport_break` is `Sched::Serial`. Its second `transport broke` line is
-  the driver's recovery retrying against an endpoint still halted from the
-  staged break, so "the recovery finished on its first try" was part of its
-  verdict. Costs 3 s of tail.
+- `usb_transport_break` is `Sched::Serial`. Costs 3 s of tail. **The reading of
+  its second `transport broke` line recorded here — "the driver's recovery
+  retrying against an endpoint still halted from the staged break" — was
+  wrong.** The endpoint was Running; what stalled was the *device*, refusing the
+  next command block because the Bulk-Only Reset had gone out while the
+  abandoned transfer could still be answered. A driver defect that lost a write,
+  not a measure of how much of the host the guest had
+  (`specs/issues/hardware/`). The lesson for this document: a red attributed
+  to load without the mechanism being read out of the log is a guess, and a
+  costs table is where a guess stops being questioned.
 
 One caution recorded rather than resolved: a run under that contention wedged in
 the metal-sim desktop group — one vCPU at 100% for twenty minutes, no output,
 killed rather than waited out (`metal_sim_compositor_stall`'s ceiling is
 `budget(240 s)`, 48 minutes at width 12). That group is green three times out of
 three in isolation on the same tree and green in every full run that completed.
-Both are filed in `specs/known-issues.md`.
+Both are filed in `specs/issues/`.
 
 ## 5.6 The host's guest budget, and a run that knows it was invalid
 
@@ -1328,6 +1337,15 @@ the moment the process dies. Four properties are load-bearing:
 `--host-slots N` overrides the budget and `0` turns it off, which is the only
 way to measure a suite against one that has it.
 
+**It has to be `cargo test --test toyos-build -- --host-slots N`.** A bare
+`cargo test --` hands the flag to every test binary in the package, the `--lib`
+unit tests among them, and libtest refuses an unknown flag by name: `error:
+Unrecognized option: 'host-slots'`, exit 101, before the suite has started. The
+form this section and CLAUDE.md carried was the bare one, and it never worked;
+found 2026-08-07 by an A/B that failed in one second. `src/testargs.rs` cannot
+catch it — that table governs the flags the *suite* reads, and this one never
+reaches the suite.
+
 Gate A takes one slot like everything else and reserves nothing. §4.1
 constraint 4 offered a quiet-host reservation as one of three options; **the
 owner ruled on 2026-08-04 that there are no measurement locks and no quiet-host
@@ -1361,6 +1379,9 @@ own list in the summary, and:
 | 1 | a real red — including a run that also had invalidated tests, because a red that survives is still a red |
 | 2 | the run established nothing; the host stopped in the middle of it |
 
+§5.6.3 adds no fourth status and deliberately: a declared red is not a red, and a
+declaration the run found stale is one.
+
 **Why 2 and not 0 or 1.** `--land`'s gate consumes this number, and 0 is a claim
 that the tree passed — which a run measured across a stopped host did not
 establish. Exiting 1 is no better: it sends an agent hunting a defect that is
@@ -1384,6 +1405,239 @@ that silently passes is as bad as one that silently fails**.
 What it does not do: a suspend that lands *between* two tests invalidates
 nothing, and is right not to. It is reported as a note, and the suite time
 printed beside it is monotonic and already excludes it.
+
+### 5.6.3 A known red is declared, not skipped
+
+The blockage this closes: `--land`'s gate is the whole suite and refuses a
+non-zero exit, so one test that is red for a reason everybody already knows
+blocks every landing in the tree. The two ways out before this were both wrong.
+Reclassifying `desktop_window_child` to `Sched::Serial` would have made the suite
+green by destroying the only QEMU reproduction of #156. `--land --gate cargo
+test -- --skip <name>` ran everything else, which was honest about *this*
+landing and silent forever after: an exclusion typed on a command line cannot
+notice that its defect is fixed, and lives in muscle memory rather than in the
+tree. `--skip` is deleted; `EXPECTED_FAILURES` in `tests/toyos.rs` replaces it.
+
+An entry names the test, the task, where the defect is written up, and the
+failure messages the exemption covers. The verdict table gains two rows, and
+`Verdict::Pass`/`Fail` each gain the entry that was consulted and *did not
+apply* — so no arm can treat a case as covered by forgetting to look one up.
+Exit status is unchanged: an expected failure is not a failure and never reaches
+`Tally::exit_code`, so a run whose only reds were declared is exit 0 and
+`src/land.rs` needs no change at all. The result line says `ok, NOT clean` and
+names every entry that fired, because the whole hazard of the mechanism is a run
+that reads as green to somebody who did not scroll up.
+
+**The design question is what makes an entry stale, and it has two answers
+rather than one.** The brief's requirement — *a listed test that passes is a red
+run* — is what stops the list outliving the defect, and it is exact for a
+failure that fires every time. It is wrong for one that does not:
+`desktop_window_child` is intermittent (red alone and red wide, at a different
+assertion each time), so a single green is one sample of a rate, and
+`specs/audio-gate-history.md`'s standing lesson is that a verdict taken from one
+sample is a verdict about nothing. Redding the run on it would fire on a healthy
+tree and teach everybody to re-run until it went away — which is the exact habit
+this mechanism exists to make unnecessary. So `Stale::OnAPass` is the strong
+form and stays the default to reach for; `Stale::OnThisDate` is the honest
+weaker one, and it does not claim to detect a fix. It claims that on a stated
+day the entry reds and somebody looks. Both halves are the anti-rot property:
+neither kind of entry can go quiet.
+
+**What the message matcher does and does not buy.** `says` is a list of
+alternatives quoted from the test's own messages, and a failure matching none of
+them reds with a line saying the entry did not cover it. That pins *which*
+assertion failed, not why, so a second defect reaching the same assertion is
+absorbed — and where the real discriminator is a property of the log rather than
+of the message, as #156's is (the guest stops emitting anything, the ~2 s
+compositor stats line included), no cheap matcher reaches it. That one stays a
+human's, which is why every `XFAIL` line prints the pointer to where it is
+written up. Quotation rather than prose is deliberate: a restatement drifts
+silently from what the test says, and a quotation reds the day somebody rewords
+the assertion.
+
+Three host-side gates, no guest, ~0.2 ms between them:
+`expected_failure_verdicts` (the table, both directions),
+`expected_failure_exit_status` (through `Tally`, to the exit code and the report
+text), `expected_failure_entries` (the declaration's own shape, and the calendar
+under `OnThisDate`). Eight deliberate breaks of the implementation, each red,
+against the unbroken tree green — a listed pass filed as an ordinary pass, the
+matcher absorbing everything, a stale or expired entry not redding, a review date
+that never arrives, an expected failure filed as a pass, and the three
+declaration checks each defeated in turn.
+
+## 5.7 The host's build budget, and the count §5.6.1 was not
+
+Added 2026-08-07, with ten worktrees on the host for the first time.
+
+### 5.7.1 A worker that is compiling is not a guest
+
+§5.6.1's four load-bearing properties are all still true, and one sentence in it
+is what this section corrects: "one slot per task, never per boot". A task is not
+a boot — it is *a build and then a boot*. `run_phase` takes the guest slot before
+`run_task`, and the first thing `run_task` reaches is `build_boot_image`, which
+compiles the kernel variant that boot needs. So twelve workers on a fresh profile
+are twelve concurrent `cargo build`s and no guest at all, and the semaphore that
+was written to stop four agents putting 48 guests on 14 cores was, in that
+window, guarding nothing.
+
+Measured on 2026-08-07 while the eight-landing storm in `specs/issues/`
+was under way: **load average 49.9 on 14 cores, twelve `rustc`/`cargo` processes,
+and exactly one QEMU guest live.** The one worker that had got as far as booting
+had a fiftieth of the machine its wall-clock margins were written for. Two of the
+suite's own liveness-margin tests (`blocked_dump`, then `screen_early_panic`)
+went red in consecutive landing gates on a branch that touched only `tests/`,
+each `ALONE … GREEN`.
+
+The same hole is what "nothing bounds the build half of a landing gate" names: a
+gate is `cargo test`, a `cargo test` is a build plus a suite, and only the suite
+half was counted. It is not a separate defect and it does not need a separate
+mechanism — a gate's builds *are* these builds.
+
+### 5.7.2 The mechanism
+
+`buildlock::build_slot` is a second counting semaphore over the same `slot()`
+primitive `guest_slot` uses, in `<common-dir>/toyos-build-locks/build-slots/`.
+Four properties, and three of them are inherited:
+
+- **Its own directory, so its own count.** A single count for both would deadlock
+  by construction: a suite holding all twelve guest slots would be waiting for a
+  slot it is itself holding. Gate:
+  `guests_and_builds_are_counted_separately`.
+- **The budget is 4**, and unlike §5.6.1's twelve it is **policy rather than a
+  measurement**. A build's own `-j` is already the whole machine, so the honest
+  question is not how many builds fit but how far the machine may be
+  oversubscribed; four builds against fourteen cores is about the ratio the
+  measured pathology (twelve, at load 49.9) exceeded by three. A bound that is
+  too generous is recoverable and one that is too tight makes every agent wait on
+  every other, which is why the error is deliberately on the generous side.
+  `--host-builds N` overrides it, `0` turns it off.
+- **Below the memo, above every build lock.** `build_test_image` returns from its
+  three-part memo before taking anything, so a boot that compiles nothing queues
+  for nothing — which matters, since most of a run's ~76 boots are memo hits.
+  Taken at `build::build`, `build::build_test_image`, `build::build_toyos_bins`
+  and the libc archive in `tests/common/compile.rs`, which between them are every
+  cargo invocation the build system makes.
+- **The order is a constraint**: sysroot → host slot → build lock → artifact, at
+  every acquirer of two of them. A build slot taken *before* the sysroot lock
+  closes a cycle with a `--claim-sysroot`, which holds the sysroot and then wants
+  a build slot; a build slot taken *inside* a build lock closes one with the
+  escalation in `Held::act_if`. Both orders are stated in the module header
+  because neither is checkable from a call site.
+
+Gates in `src/buildlock.rs`, each watched red before and green after:
+`a_full_host_makes_the_next_build_wait` (budget widened by one),
+`a_killed_build_gives_its_slot_back` (the guard handed an fd that never locked),
+`guests_and_builds_are_counted_separately` (one directory for both).
+
+**What the first bounded run showed, and what it cannot show.** 287 tests,
+700.3 s (456.3 s parallel, 212.9 s serial), on a host that was also carrying
+another worktree's suite — one running `main`, and therefore *unbounded*. Peak
+load 80.05. The bound bit: 146 `[host-builds]` lines, the longest single wait
+49.3 s, and the message names its own process (`all 4 held by 1 holder(s): pid
+10913`) because four workers of one suite is what filled it. So the mechanism
+does what it says, and **the run establishes nothing about whether four is the
+right number**: an A/B against `--host-builds 0` in that session would have
+compared a bounded suite against an unbounded peer either way. The clean
+measurement — one suite alone, four against off — is not taken here and wants a
+quiet host. Until it is, the number is the policy above and the flag is how to
+change it.
+
+### 5.7.3 A queue is not silence
+
+`flock` gives no progress and the exclusive holds here are minutes long. Eight
+`--land` processes on the integration lock printed one `[build-lock] waiting …`
+line each and then nothing, which is what a wedge looks like — and an agent that
+kills a wedge puts its own gate back at the end of the queue. Every blocking
+acquisition now repeats itself every 30 s, re-reading the holder each time so the
+message follows the queue forward rather than naming whoever was in front when
+the wait began. A thread does the talking and the kernel still keeps the queue,
+so `flock`'s ordering is given up nowhere. Gate:
+`a_lasting_wait_keeps_saying_so`, which is red on the tree as it stood.
+
+## 5.8 Wave 7: the wall-clock verdict, and what was hiding behind it
+
+**The direction CLAUDE.md does not state.** It says a red that is green alone
+names the classification as the bug. The converse case is a machine-wide kernel
+panic: it reds whichever test happened to be running, so the red's name is the
+workload and never the cause — including when the harness re-runs that test
+alone, it reds again, and the run reports the defect as real.
+
+`specs/issues/build/`'s list of `Sched::Parallel` tests that red beside
+other guests had one shared shape: a test waits a number of host seconds for the
+guest to do something, and reports the *content* it was going to assert when the
+number expires. §5.5.2 fixed that for injection by pacing; this is the same idea
+for waiting.
+
+### 5.8.1 What was changed
+
+- **`await_guest`** (`tests/toyos.rs`) replaces `serial_until`'s span of
+  seconds. It ends when the guest goes quiet (15 s of no console output) or
+  wedges (300 s flat, unscaled — width is the correction for a *slow* guest, and
+  a slow guest keeps talking). Sixteen call sites, including every wait in
+  `desktop_audio_client`, both locale wizards, `blocked_dump`'s report and
+  `screen_console_scroll`'s round marker.
+- **The two compositor tails** — `metal_sim_compositor_stall` and
+  `metal_sim_client_death` — asked for two frame batches *inside 20 s*. They now
+  ask for two frame batches.
+- **`shell_echoes` and `open_terminal`**'s retype loops became a count of
+  attempts (ten) with a per-attempt window scaled by host speed and **not** by
+  width (`round_trip`). A shell echoing a line it has not run yet is
+  microseconds of guest time whatever share of the machine it has.
+- **`screen_pager_keys`** is paced: one PageDown, then the page it moved, then
+  the next. Its verdict was `moved >= (elapsed/3 + 1) * 3`, an arithmetic that
+  asks a guest given no time to repaint once for 3.3 moves, and it reported
+  `0 page moves over 30 keystrokes in 0.3s`. Unpaced it was also wrong about the
+  wire: 60 scancodes into QEMU's 16-byte `PS2_QUEUE_SIZE`.
+- **A blown guard is named.** Such a red carries `STALLED:`, prints as `STALL`,
+  and is counted apart in the summary. Still red. Gate:
+  `stall_is_not_a_verdict`.
+
+### 5.8.2 The measurement
+
+Eight full suites, one session, 2026-08-08: two concurrent twelve-wide runs at a
+time from one worktree with `--host-slots 0`, four on `main`'s `tests/toyos.rs`
+and four on the branch's, the guest image byte-identical between them.
+
+| arm | suite wall clock | red suites |
+|---|---|---|
+| `main` | 250, 520, 472, 474 s (mean 429) | 3 of 4 |
+| branch | 202, 214, 202, 209 s (mean 207) | 2 of 4 |
+
+Per test, seconds, across the four suites of each arm:
+
+| test | `main` | branch |
+|---|---|---|
+| `desktop_audio_client` | 17, 14, **FAIL 307**, **FAIL 305** | 20, 17, 17, 17 |
+| `desktop_typing_damage` | 18, **FAIL 303**, 18, 16 | 15, 17, 17, 16 |
+| `blocked_dump` | 4, 8, 5, 3 | 5, **FAIL 2**, 5, **FAIL 2** |
+| `screen_pager_keys` | 14, 14, 14, 14 | 14, 14, 14, 14 |
+| `screen_console_scroll` | 14, 9, 15, 13 | 16, 15, 11, 13 |
+| `screen_blocked_dump` | 8, 5, 6, 7 | 6, 4, 6, 7 |
+| `metal_sim_compositor_stall` | 13, 15, 13, 13 | 13, 14, 13, 13 |
+| `metal_sim_client_death` | 4, 4, 4, 4 | 4, 4, 4, 4 |
+
+Pacing `screen_pager_keys` is free: the old loop already paid one screendump per
+keystroke, which is about what a repaint costs.
+
+### 5.8.3 What the guard was hiding
+
+**Every one of `main`'s three reds was the `/bin/terminal` boot race**
+(`specs/issues/kernel/`), and every one was reported as `nothing typed at the terminal
+window reached a shell` with `ALONE: GREEN` under it. Every red suite in the
+session — both arms — carried that race in a boot log, and every green suite did
+not.
+
+So the class this wave set out to kill was, in this session, one real guest
+defect wearing its clothes: the test waited out a ready marker that
+`exit: terminal pid=1 code=1` had ruled out at 0.6 s, spent 300 s of a lane
+doing it, and reported the symptom. `shell_echoes` ends on that line too now and
+names the race, which is the 307 s → 2 s in the table above and most of the
+429 s → 207 s beside it.
+
+The general lesson, and it is the one `ALONE: GREEN` invites an agent to miss: a
+verdict that expires on the host's clock does not merely fail on a busy host, it
+**cannot report anything else** — so every defect underneath it arrives wearing
+the same sentence.
 
 ## 6. What this audit did not measure
 

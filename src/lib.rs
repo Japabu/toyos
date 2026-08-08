@@ -1,15 +1,39 @@
 pub mod assets;
 pub mod build;
 pub mod buildlock;
+pub mod docs;
+pub mod durations;
+pub mod forkcheck;
 pub mod image;
-pub mod land;
 pub mod libc;
+pub mod pr;
+pub mod soundfont;
 pub mod stamps;
+pub mod testargs;
 pub mod toolchain;
+pub mod wallpaper;
 pub mod worktree;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Whether this host will actually let a guest run on KVM.
+///
+/// **Presence is not permission**, and `Path::exists` cannot tell the two
+/// apart. A GitHub runner ships `/dev/kvm` as `crw-rw---- root:kvm` with the
+/// build user outside the group, so a check on existence puts `-accel kvm` on
+/// every boot and every boot dies on `failed to initialize kvm: Permission
+/// denied` — a whole suite red for a reason no test names. Any Linux box whose
+/// user is not in `kvm` is that machine. Opening it is the question QEMU is
+/// about to ask.
+pub fn kvm_usable() -> bool {
+    cfg!(target_arch = "x86_64")
+        && std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok()
+}
 
 /// The `.git` directory every worktree of this repository shares.
 ///

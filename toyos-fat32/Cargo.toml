@@ -10,3 +10,9 @@ name = "toyos-fat32"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+
+[dev-dependencies]
+# The volume checker this crate's tests are judged by. A dev-dependency and
+# never a dependency: it is the outside judge of what this crate writes, and it
+# must not be reachable from the driver it judges.
+toyos-fat32-check = { path = "../toyos-fat32-check" }

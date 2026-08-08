@@ -1,4 +1,4 @@
-use toyos_abi::audio::{AudioCompletionRecord, AudioInfo, AudioSlotHeader};
+use toyos_abi::audio::{AudioCompletionRecord, AudioSlotHeader};
 use toyos_abi::Fd;
 use toyos::audio::{
     AudioSlotReader, StreamOpenRequest, StreamOpenResponse, StreamSetVolume, FORMAT_S16LE,
@@ -7,11 +7,161 @@ use toyos::audio::{
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::services;
 use toyos::shm::SharedMemory;
-use toyos::{AudioDev, Connection};
+use toyos::{AsHandle, Connection};
 use toyos_abi::syscall;
+use toyos_hda::stream;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+
+mod hda;
+mod virtio;
+
+/// Who owns a period soundd has been given back and has not refilled.
+///
+/// The mix loop's free list was written for [`Pipeline::Queue`] throughout, and
+/// three of its rules are that model showing: it holds a period back while a
+/// client is mid-refill (§5.10), it drains by not submitting (§5.8), and it
+/// takes the lowest free index first because the device plays what it is given
+/// in the order it is given.
+///
+/// [`Pipeline::Ring`] breaks all three, which is what killed soundd on the T14.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pipeline {
+    /// virtio-sound: a period soundd has not submitted is a period the device
+    /// does not have. Holding one costs nothing, indefinitely, and the play
+    /// order is the submit order.
+    Queue,
+    /// HDA: the engine owns every period for as long as it runs. It returns to
+    /// buffer `i` exactly `num_buffers` periods after completing it and plays
+    /// whatever is there, so a period soundd holds back is played as the
+    /// silence `released` left in it *and* completed a second time — a
+    /// completion for a buffer soundd still holds. The play order is the
+    /// ring's, which is the lowest free index only while a batch does not wrap.
+    Ring,
+}
+
+/// The device half of the mix loop.
+///
+/// Two implementations and no more: `specs/hda-driver-plan.md` §8 item 10
+/// forbids a framework before there are three. Both are drivers in this process
+/// now, and what differs between the two devices is exactly the methods below;
+/// the mixer, the ramps, the DLL, the underrun accounting and the
+/// suspend/resume structure are one body of code either way, which is what
+/// makes gate A one instrument for both.
+trait Backend {
+    /// Who owns a freed period soundd does not refill.
+    fn pipeline(&self) -> Pipeline;
+
+    /// The handle a completion arrives on.
+    fn handle(&self) -> Fd;
+
+    /// Where period `idx`'s samples go. Device memory this process may write,
+    /// mapped once at claim.
+    fn buffer(&self, idx: usize) -> *mut u8;
+
+    /// Completion records, oldest first, into `out`. `0` is nothing pending.
+    fn completions(&mut self, out: &mut [AudioCompletionRecord]) -> usize;
+
+    /// Period `idx` has played and is soundd's again.
+    ///
+    /// HDA's engine is cyclic and never stops on its own, so a period nobody
+    /// refills is *replayed* — audible harm gate A's gap detector cannot see.
+    /// Zeroing it as it frees makes a late soundd cost silence instead, which
+    /// is exactly what virtio-sound's device does when it runs dry, so one
+    /// instrument certifies both (§2.4). virtio's own implementation is empty
+    /// for that reason and not by omission: nothing is published for a period
+    /// that was not filled, so the device is never given it again.
+    fn released(&mut self, idx: usize);
+
+    /// Period `idx` holds `bytes` of PCM and is the device's to play.
+    ///
+    /// On a [`Pipeline::Ring`] that is a statement about the *contents*: the
+    /// period was already the device's and this only says it now holds audio.
+    fn submit(&mut self, idx: usize, bytes: usize);
+
+    /// Stop the stream. Idempotent, and cheap when it is already stopped.
+    fn stop(&mut self);
+}
+
+struct VirtioBackend {
+    virtio: virtio::Virtio,
+}
+
+impl Backend for VirtioBackend {
+    fn pipeline(&self) -> Pipeline {
+        Pipeline::Queue
+    }
+
+    fn handle(&self) -> Fd {
+        self.virtio.dev().as_handle()
+    }
+
+    fn buffer(&self, idx: usize) -> *mut u8 {
+        self.virtio.buffer(idx)
+    }
+
+    fn completions(&mut self, out: &mut [AudioCompletionRecord]) -> usize {
+        // Where the kernel used to service the event queue inside the same
+        // syscall: the device's own view of an underrun, which this process's
+        // counters cannot see.
+        self.virtio.poll_events();
+        self.virtio.completions(out)
+    }
+
+    fn released(&mut self, _idx: usize) {}
+
+    fn submit(&mut self, idx: usize, bytes: usize) {
+        self.virtio.submit(idx, bytes);
+    }
+
+    fn stop(&mut self) {
+        self.virtio.stop();
+    }
+}
+
+struct HdaBackend {
+    hda: hda::Hda,
+    buffers: Vec<*mut u8>,
+    period_bytes: usize,
+}
+
+impl Backend for HdaBackend {
+    fn pipeline(&self) -> Pipeline {
+        Pipeline::Ring
+    }
+
+    fn handle(&self) -> Fd {
+        self.hda.dev().as_handle()
+    }
+
+    fn buffer(&self, idx: usize) -> *mut u8 {
+        self.buffers[idx]
+    }
+
+    fn completions(&mut self, out: &mut [AudioCompletionRecord]) -> usize {
+        match self.hda.dev().completions() {
+            Ok(record) => {
+                out[0] = record;
+                1
+            }
+            Err(syscall::SyscallError::WouldBlock) => 0,
+            Err(e) => panic!("soundd: hda completions failed: {e:?}"),
+        }
+    }
+
+    fn released(&mut self, idx: usize) {
+        unsafe { core::ptr::write_bytes(self.buffers[idx], 0, self.period_bytes) };
+    }
+
+    fn submit(&mut self, _idx: usize, _bytes: usize) {
+        self.hda.start();
+    }
+
+    fn stop(&mut self) {
+        self.hda.stop();
+    }
+}
 
 use rubato::{Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
@@ -326,6 +476,17 @@ struct MixStats {
     /// narrower than `submitted`, which like `wakes`/`completions`/`drains`
     /// covers the whole time soundd has clients.
     underruns: u32,
+    /// The longest unbroken run of them, which is the silence a listener
+    /// actually hears — 54 scattered singles and one gap of 54 are the same
+    /// `underruns` and are not the same defect. It is also the only thing that
+    /// separates a client that never had margin from one that lost it: the ring
+    /// is eight periods deep, so a run past one is a producer that stopped for
+    /// a measurable time rather than one that missed a deadline by a hair.
+    starve_max: u32,
+    /// The run [`starve_max`](Self::starve_max) is the maximum of. Working
+    /// state, not a field of the report; a run crossing a window boundary is
+    /// counted in both, which understates it and never invents one.
+    starve_run: u32,
     /// Cycles that found the whole DMA pipeline free (§5.9) *and* could only
     /// have got there by soundd being late. A device that retires the pipeline
     /// faster than it plays it empties the free list without soundd having
@@ -343,10 +504,25 @@ struct MixStats {
 }
 
 impl MixStats {
+    /// Account one period, whichever sink played it.
+    fn period(&mut self, streaming: bool, covered: bool) {
+        if !streaming {
+            return;
+        }
+        if covered {
+            self.starve_run = 0;
+            return;
+        }
+        self.underruns += 1;
+        self.starve_run += 1;
+        self.starve_max = self.starve_max.max(self.starve_run);
+    }
+
     fn report(&self, clients: usize) {
-        eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={}",
+        eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={}",
             self.wakes, self.completions, self.submitted, self.underruns, self.drains,
-            self.max_wake_lat_ns / 1_000, self.max_batch, clients, self.deferred);
+            self.max_wake_lat_ns / 1_000, self.max_batch, clients, self.deferred,
+            self.starve_max);
     }
 }
 
@@ -650,10 +826,9 @@ fn retain_active(streams: &mut Vec<ClientStream>) {
 }
 
 fn mix_thread(
-    audio_dev: AudioDev,
+    backend: &mut dyn Backend,
     cmd_ring: &CommandRing,
     cmd_pipe_read: Fd,
-    dma_ptrs: Vec<*mut u8>,
     num_buffers: usize,
     device_sample_rate: u32,
     device_channels: u16,
@@ -663,6 +838,7 @@ fn mix_thread(
 ) {
     let device_period_samples = device_period_frames * device_channels as usize;
     let period_nanos = (device_period_frames as u64 * 1_000_000_000) / device_sample_rate as u64;
+    let pipeline = backend.pipeline();
     // The device plays one period per `period_nanos`, so the wall-clock cost of
     // emptying the pipeline is bounded from below. Every buffer is in flight
     // the moment the mix loop finishes submitting, and the head one is only
@@ -685,6 +861,28 @@ fn mix_thread(
     // first client's ordinary refill fills the whole pipeline through the
     // dithering mix path, and the kernel starts the stream on that submit.
     let mut free_mask: u32 = (1u32 << num_buffers) - 1;
+    // Periods soundd has filled that the device has not finished playing.
+    //
+    // `num_buffers - free_mask.count_ones()` on a [`Pipeline::Queue`], which is
+    // what the free list used to be read as at the two sites below. It is not
+    // that on a [`Pipeline::Ring`]: there the free list is empty at every wake,
+    // because a period the engine hands back is given up the same cycle
+    // whatever soundd has to put in it, so it cannot say when the pipeline has
+    // played out. This can, and says the same thing on both.
+    let mut unplayed: usize = 0;
+    // The period a [`Pipeline::Ring`]'s engine is playing now, read off every
+    // completion mask by `stream::decode`.
+    //
+    // The kernel's `stream::completed` walks the ring forward from where the
+    // engine was and hands back a *set*; the engine plays a *sequence*. This is
+    // the driver's half of that, and it is what the fill order has to come from:
+    // a batch that wraps (`{6, 7, 0, 1}`) is played 6, 7, 0, 1, and filling it
+    // lowest-index-first writes the later audio into the buffer the engine
+    // reaches soonest. It is kept between wakes for the two moments no mask can
+    // place the engine: a whole lap, and a stop — which freezes it inside the
+    // period after the last one it completed, and is where the next stream
+    // primes from.
+    let mut ring_cursor: usize = 0;
     // Whether the device stream is running, i.e. soundd has submitted since
     // the last stop. Owned here: the kernel's own started flag is not
     // readable, and the two agree because every submit starts a stopped
@@ -697,10 +895,10 @@ fn mix_thread(
     // issued — leaves the stream STARTED with an empty queue, and a successor
     // that merely believed it stopped would park forever with the host voice
     // open in permanent underrun, at exactly zero CPU. One STOP makes the
-    // belief true. It costs nothing on an ordinary boot: the kernel's
-    // `SoundController::stop` returns without a controlq round trip or a log
-    // line when the stream is already stopped.
-    audio_dev.stop().expect("soundd holds the audio device claim");
+    // belief true. It costs nothing on an ordinary boot: a backend's own `stop`
+    // returns without a control round trip or a log line when the stream is
+    // already stopped.
+    backend.stop();
     let mut started = false;
     // Wall clock at the last instant the pipeline was known full. Re-stamped
     // after every refill; read only by the drain count site.
@@ -785,7 +983,7 @@ fn mix_thread(
             }
         };
 
-        poller.poll_add(&audio_dev, IORING_POLL_IN, TOKEN_AUDIO);
+        poller.poll_add_fd(backend.handle(), IORING_POLL_IN, TOKEN_AUDIO);
         poller.poll_add_fd(cmd_pipe_read, IORING_POLL_IN, TOKEN_CMD);
 
         let mut cmd_ready = false;
@@ -810,11 +1008,7 @@ fn mix_thread(
             next_stats_ns = syscall::clock_nanos() + STATS_INTERVAL_NANOS;
         }
 
-        let n_records = match audio_dev.read_completions(&mut records) {
-            Ok(n) => n,
-            Err(toyos_abi::syscall::SyscallError::WouldBlock) => 0,
-            Err(e) => panic!("soundd: read_completions failed: {e:?}"),
-        };
+        let n_records = backend.completions(&mut records);
         if n_records > 0 {
             // Measured against the prediction this wait was *armed* on, not
             // against whatever the DLL holds when the wait returns. They differ
@@ -832,7 +1026,40 @@ fn mix_thread(
                 let n = rec.mask.count_ones();
                 assert!(n > 0, "soundd: completion record with empty mask");
                 assert_eq!(free_mask & rec.mask, 0, "soundd: repeated completion for free buffer");
+                // Where the engine is, taken from what it reported rather than
+                // predicted: a mask a driver reads late is the OR of every
+                // `completed` since it last looked, so it can name a whole lap
+                // — which places the engine nowhere — and a cursor soundd
+                // stepped itself would have to be right about how many laps
+                // that was. Re-deriving it per record cannot drift.
+                if pipeline == Pipeline::Ring {
+                    match stream::decode(rec.mask, num_buffers) {
+                        Some(stream::Completed::Run { first, count }) => {
+                            ring_cursor = (first + count) % num_buffers;
+                        }
+                        // Every period played and the mask says no more than
+                        // that. The cursor stays where it was: the fill order
+                        // from here is a guess either way, and a lap of silence
+                        // has already gone out — §5.9 counts it as the drain it
+                        // is, and the next record re-anchors.
+                        Some(stream::Completed::Lapped) => {}
+                        None => panic!(
+                            "soundd: the engine completed {:#x}, which is no walk of a \
+                             {num_buffers}-period ring",
+                            rec.mask
+                        ),
+                    }
+                }
+                unplayed = unplayed.saturating_sub(n as usize);
                 free_mask |= rec.mask;
+                // §2.4's zero-on-complete, before anything can decide to leave
+                // this buffer unfilled: the engine returns to it in
+                // `num_buffers` periods whatever soundd does.
+                for idx in 0..num_buffers {
+                    if rec.mask & (1 << idx) != 0 {
+                        backend.released(idx);
+                    }
+                }
                 wake_completions += n;
                 dll.update(rec.timestamp_nanos as f64, n);
             }
@@ -842,8 +1069,8 @@ fn mix_thread(
             }
         }
 
-        // §5.9: every buffer free means the pipeline drained. What died with it
-        // is the *clock*, not the audio — the device restarts its period grid
+        // §5.9: nothing unplayed left means the pipeline drained. What died with
+        // it is the *clock*, not the audio — the device restarts its period grid
         // from whatever we submit next, so the DLL estimate must be dropped or
         // the next update reads the discontinuity as drift and drags the
         // period. The buffers themselves are refilled by the ordinary mix loop
@@ -852,14 +1079,14 @@ fn mix_thread(
         //
         // Counting a drain is narrower than detecting one. `drains` means
         // "soundd was late enough that the device ran out of audio", so the
-        // three ways to see a full free list without being late must not raise
+        // three ways to see an empty pipeline without being late must not raise
         // it: the idle path (§5.8) empties the pipeline by design and is the
         // only wake with `was_streaming` false; a device retiring faster than
         // it plays is rejected arithmetically by `min_drain_nanos`, which no
         // device playing at its own rate can beat; and a previous cycle's
         // deferral is soundd's own restraint, not a stall, so it suppresses the
         // DLL reset too.
-        if free_mask.count_ones() as usize == num_buffers && deferred_last == 0 {
+        if unplayed == 0 && deferred_last == 0 {
             let since_filled = syscall::clock_nanos().saturating_sub(pipeline_filled_ns);
             if was_streaming && since_filled >= min_drain_nanos {
                 stats.drains += 1;
@@ -867,14 +1094,54 @@ fn mix_thread(
             dll.reset();
         }
 
+        // On a ring the free list is the engine's to state, never a tally
+        // soundd keeps across a wake.
+        //
+        // While the engine runs, the periods soundd may write are the ones this
+        // wake was handed back and no others: one it does not fill is played
+        // anyway, as the silence `released` left in it, and completed again a
+        // lap later — a completion for a buffer soundd still holds, which is
+        // the assertion above and what took soundd down on the T14. So with no
+        // client to mix for they are given up rather than held.
+        //
+        // While it is stopped it holds nothing at all, so the whole ring is
+        // soundd's: that is the free list the next client's prime fills, and
+        // it starts at the cursor because the engine froze inside the period
+        // after the last one it completed and carries on there.
+        if pipeline == Pipeline::Ring {
+            if !started {
+                free_mask = (1u32 << num_buffers) - 1;
+            } else if streams.is_empty() {
+                free_mask = 0;
+            }
+        }
+        // Where the fill starts: the beginning of the run soundd may write,
+        // which is as many periods back from where the engine now stands as
+        // there are of them. A stopped engine's whole lap lands on the same
+        // place, which is where it will carry on from.
+        let mut fill_at =
+            (ring_cursor + num_buffers - free_mask.count_ones() as usize % num_buffers)
+                % num_buffers;
+
         let mut refilled = false;
         let mut deferred: u32 = 0;
         // With no clients there is nothing to mix: leaving the freed buffers
         // unsubmitted is what drains the pipeline (§5.8) instead of feeding
         // the device silence forever.
         while free_mask != 0 && !streams.is_empty() {
-            let idx = free_mask.trailing_zeros() as usize;
+            let idx = match pipeline {
+                // Any order will do: the device plays what it is given in the
+                // order it is given, so the free list is a set.
+                Pipeline::Queue => free_mask.trailing_zeros() as usize,
+                // The engine's order, which is the ring's and not the index's.
+                Pipeline::Ring => {
+                    let at = fill_at;
+                    fill_at = (fill_at + 1) % num_buffers;
+                    at
+                }
+            };
             assert!(idx < num_buffers, "soundd: completion for nonexistent buffer {idx}");
+            assert!(free_mask & (1 << idx) != 0, "soundd: buffer {idx} is not free to fill");
             free_mask &= !(1 << idx);
 
             // §5.10's "wait until clients have filled", reached by deferring
@@ -890,10 +1157,18 @@ fn mix_thread(
             // safe for exactly as long as audio already on the wire has not run
             // out, so a client that stops producing altogether still costs
             // silence — at the floor rather than immediately.
+            //
+            // **A [`Pipeline::Ring`] cannot take that bet.** The floor is a
+            // bound on unplayed audio, not on the engine's return, and the
+            // engine reaches this period again in `num_buffers` periods and
+            // plays the silence `released` left in it — so deferring buys the
+            // very gap it exists to avoid, and then hands soundd a completion
+            // for a buffer it still holds. It buys nothing even when soundd is
+            // in time: the client's period lands one period later than the
+            // engine wanted it either way.
             let now = syscall::clock_nanos();
-            let mid_refill = streams
-                .iter()
-                .any(|s| s.is_streaming() && s.slot_reader.peek().is_none());
+            let mid_refill = pipeline == Pipeline::Queue
+                && streams.iter().any(|s| s.is_streaming() && s.slot_reader.peek().is_none());
             if mid_refill && playout_until_ns.saturating_sub(now) >= refill_floor_nanos {
                 deferred |= 1 << idx;
                 stats.deferred += 1;
@@ -931,7 +1206,7 @@ fn mix_thread(
             }
 
             let dma_buf = unsafe {
-                core::slice::from_raw_parts_mut(dma_ptrs[idx] as *mut i16, device_period_samples)
+                core::slice::from_raw_parts_mut(backend.buffer(idx) as *mut i16, device_period_samples)
             };
             for i in 0..device_period_samples {
                 dma_buf[i] = dither_and_quantize(mix_f32[i], &mut dither_rng);
@@ -939,19 +1214,19 @@ fn mix_thread(
 
             if !started {
                 started = true;
-                // Before the submit, because the kernel starts the stopped
-                // stream inside it: the marker must precede the kernel's own
-                // `virtio-sound: stream 0 started` line.
+                // Before the submit, because that is where a stopped stream is
+                // started: the marker has to precede whatever the backend logs
+                // about starting.
                 eprintln!("soundd: resumed");
             }
-            toyos::audio::audio_submit(idx as u32, device_period_bytes as u32)
-                .unwrap_or_else(|e| panic!("soundd: audio_submit({idx}) failed: {e}"));
+            backend.submit(idx, device_period_bytes);
+            unplayed += 1;
             // Plays after whatever is already queued — unless that has all
             // played out, in which case the device restarts from now.
             playout_until_ns = playout_until_ns.max(now) + period_nanos;
             refilled = true;
             stats.submitted += 1;
-            if any_streaming && !any_data { stats.underruns += 1; }
+            stats.period(any_streaming, any_data);
         }
         // Deferred buffers stay free and are reconsidered next cycle, by which
         // point the client has had another signal-to-mix window to produce.
@@ -965,8 +1240,8 @@ fn mix_thread(
 
         retain_active(&mut streams);
 
-        // §5.8 DRAINING → SUSPENDED, on the completion that frees the last
-        // buffer. The stop is immediate: grace between the drain and the PCM
+        // §5.8 DRAINING → SUSPENDED, on the completion that plays out the last
+        // filled period. The stop is immediate: grace between the drain and the PCM
         // STOP is zero, and that is policy like `refill_floor_nanos` above,
         // not physics. virtio STOP does not RELEASE — SET_PARAMS and PREPARE
         // stay valid and resume is one control verb inline with the first
@@ -974,7 +1249,7 @@ fn mix_thread(
         // amortize, and stopping at once is what puts the suspend markers
         // inside the audio gate's serial window on every run. The one event
         // that makes grace nonzero is a hardware backend that pops on stop,
-        // advertised per-backend through `AudioInfo`; implement it then as a
+        // advertised through the trait above; implement it then as a
         // clock comparison against a drain stamp, evaluated at the idle wakes
         // that still arrive while the buffers play out — never as an armed
         // timer, which would put a periodic wake back into the idle path this
@@ -987,11 +1262,11 @@ fn mix_thread(
         // device started and nothing left to complete. The `started` guard
         // keeps a stray cmd wake (a SetVolume for a removed client) from
         // costing a controlq round trip.
-        if started && streams.is_empty() && free_mask.count_ones() as usize == num_buffers {
+        if started && streams.is_empty() && unplayed == 0 {
             // The device's period grid dies with the stream; the next
             // completion after resume re-initializes the estimate.
             dll.reset();
-            audio_dev.stop().expect("soundd holds the audio device claim");
+            backend.stop();
             started = false;
             eprintln!("soundd: suspended");
         }
@@ -1149,9 +1424,7 @@ fn null_sink_thread(
             // The mix is discarded here — no dither, no DMA buffer, no submit.
             stats.submitted += 1;
             stats.completions += 1;
-            if any_streaming && !any_data {
-                stats.underruns += 1;
-            }
+            stats.period(any_streaming, any_data);
             next_period_ns += period_nanos;
             batch += 1;
         }
@@ -1461,7 +1734,7 @@ fn control_thread(
 const NULL_SINK_RATE: u32 = 44_100;
 const NULL_SINK_CHANNELS: u16 = 2;
 const NULL_SINK_PERIOD_FRAMES: usize = 128;
-/// Same DMA-pipeline depth as virtio-sound (`TX_INFLIGHT_MAX`): the client ring
+/// Same DMA-pipeline depth as both hardware backends: the client ring
 /// is as deep, so a client may fill `NULL_SINK_BUFFERS - 1` periods ahead and
 /// its backpressure is the device's. Power of two — ring indices wrap mod 2^32.
 const NULL_SINK_BUFFERS: usize = 8;
@@ -1482,20 +1755,69 @@ fn main() {
     // under different locks, so a soundd restarted the instant the previous one
     // exits can pass it and still lose the claim. That is a conflict, not an
     // absent sound card, and it has to stay loud.
-    match AudioDev::open() {
-        Ok(audio_dev) => run_with_device(listener, audio_dev),
-        Err(syscall::SyscallError::NotFound) => run_null_sink(listener),
-        Err(e) => panic!("soundd: cannot claim the audio device: {e}"),
+    // The order is virtio first, and it is not a preference between two cards:
+    // no machine in this project has both. The T14 has only the second.
+    match virtio::Virtio::claim() {
+        Ok((virtio, rate, channels)) => return run_virtio(listener, virtio, rate, channels),
+        Err(virtio::Refusal::NoDevice(syscall::SyscallError::NotFound)) => {}
+        Err(virtio::Refusal::NoDevice(e)) => {
+            panic!("soundd: cannot claim the virtio-sound device: {e}")
+        }
+        Err(why) => {
+            eprintln!("soundd: the virtio-sound device cannot carry audio: {why}");
+            return run_null_sink(listener);
+        }
+    }
+    match hda::Hda::claim() {
+        Ok((hda, _path, channels)) => run_hda(listener, hda, channels),
+        Err(hda::Refusal::NoDevice(syscall::SyscallError::NotFound)) => run_null_sink(listener),
+        Err(why) => {
+            eprintln!("soundd: the HDA controller cannot carry audio: {why}");
+            run_null_sink(listener)
+        }
     }
 }
 
-fn run_with_device(listener: toyos::Listener, audio_dev: AudioDev) {
-    let info: AudioInfo = audio_dev.info().expect("soundd: failed to read audio info");
+fn run_virtio(listener: toyos::Listener, virtio: virtio::Virtio, rate: u32, channels: u8) {
+    run_with_device(
+        listener,
+        &mut VirtioBackend { virtio },
+        toyos_abi::virtio_sound::PERIODS,
+        rate,
+        channels as u16,
+        toyos_abi::virtio_sound::PERIOD_BYTES,
+    );
+}
 
-    let num_buffers = info.num_buffers as usize;
-    let device_sample_rate = info.sample_rate;
-    let device_channels = info.channels as u16;
-    let device_period_bytes = info.period_bytes as usize;
+fn run_hda(listener: toyos::Listener, hda: hda::Hda, channels: u8) {
+    let info = hda.info();
+    let num_buffers = info.periods as usize;
+    let period_bytes = info.period_bytes as usize;
+    let ring = SharedMemory::map(info.pcm_token, 2 * 1024 * 1024)
+        .expect("the PCM token the HDA device just reported");
+    // One region, `periods` buffers end to end: the buffer descriptor list the
+    // kernel built points at exactly these offsets.
+    let base = ring.as_ptr();
+    let buffers = (0..num_buffers).map(|i| unsafe { base.add(i * period_bytes) }).collect();
+
+    run_with_device(
+        listener,
+        &mut HdaBackend { hda, buffers, period_bytes },
+        num_buffers,
+        toyos_hda::config::RATE,
+        channels as u16,
+        period_bytes,
+    );
+}
+
+fn run_with_device(
+    listener: toyos::Listener,
+    backend: &mut dyn Backend,
+    num_buffers: usize,
+    device_sample_rate: u32,
+    device_channels: u16,
+    device_period_bytes: usize,
+) {
     let device_period_frames = device_period_bytes / (device_channels as usize * 2);
 
     assert!(device_channels == 1 || device_channels == 2,
@@ -1506,14 +1828,6 @@ fn run_with_device(listener: toyos::Listener, audio_dev: AudioDev) {
     // Client ring depth matches the DMA pipeline depth: a wake gap can free
     // at most num_buffers periods, so a full client ring always covers it.
     let slot_count = num_buffers as u32;
-
-    let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024)
-        .expect("the DMA token the audio device just reported");
-    let dma_base = dma_page.as_ptr();
-    let mut dma_ptrs: Vec<*mut u8> = Vec::with_capacity(num_buffers);
-    for i in 0..num_buffers {
-        dma_ptrs.push(unsafe { dma_base.add(info.buf_offsets[i] as usize) });
-    }
 
     // ~5ms connect/disconnect/volume ramp
     let ramp_frames = device_sample_rate * 5 / 1000;
@@ -1542,10 +1856,9 @@ fn run_with_device(listener: toyos::Listener, audio_dev: AudioDev) {
         .expect("soundd: failed to spawn control thread");
 
     mix_thread(
-        audio_dev,
+        backend,
         &cmd_ring,
         cmd_pipe.read,
-        dma_ptrs,
         num_buffers,
         device_sample_rate,
         device_channels,

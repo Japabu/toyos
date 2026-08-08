@@ -17,7 +17,10 @@ toyos-fat32 = { path = "toyos-fat32" }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [dev-dependencies]
+# `getloadavg` for gate A's host-conditions annotation; already in the lock.
+libc = "0.2"
 toyos-cc = { path = "toyos-cc" }
+toyos-fat32-check = { path = "toyos-fat32-check" }
 toyos-gpt = { path = "toyos-gpt" }
 toyos-ld = { path = "toyos-ld" }
 

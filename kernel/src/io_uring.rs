@@ -54,6 +54,48 @@ impl IdKey for RingId {
     const ONE: Self = RingId(1);
 }
 
+/// An owned reference to a ring. Creation and `Clone` bump the ring's
+/// reference count, `Drop` tears it down at zero — the `PipeReader` shape.
+/// Held by `Descriptor::IoUring`, so a `dup`ped ring fd stays usable after the
+/// original is closed instead of naming a destroyed instance.
+pub struct RingRef(RingId);
+
+impl RingRef {
+    pub fn id(&self) -> RingId { self.0 }
+}
+
+impl Clone for RingRef {
+    fn clone(&self) -> Self {
+        let mut guard = IO_URINGS.lock();
+        let map = guard.as_mut().expect("io_uring not initialized");
+        // A live `RingRef` whose instance is gone is a refcount bug: the
+        // instance is removed only when the last one drops.
+        map.get_mut(self.0).expect("RingRef outlived its ring").refs += 1;
+        Self(self.0)
+    }
+}
+
+impl Drop for RingRef {
+    fn drop(&mut self) {
+        let instance = {
+            let mut guard = IO_URINGS.lock();
+            let map = guard.as_mut().expect("io_uring not initialized");
+            let instance = map.get_mut(self.0).expect("RingRef outlived its ring");
+            instance.refs -= 1;
+            if instance.refs > 0 {
+                return;
+            }
+            map.remove(self.0)
+        };
+        if let Some(mut instance) = instance {
+            // The polls' `WatcherGuard`s clean the per-source watcher lists.
+            instance.pending_polls.clear();
+            // Unmaps from every process and frees the backing pages.
+            let _ = shared_memory::destroy(instance.shm_token, instance.owner_pid);
+        }
+    }
+}
+
 // IoUringOp — type-safe op code, converted from raw u8 at boundary
 
 #[derive(Clone, Copy)]
@@ -105,7 +147,8 @@ pub enum Source {
     Listener(ListenerId),
     PipeReadable(PipeId),
     PipeWritable(PipeId),
-    Audio,
+    VirtioSound,
+    Hda,
 }
 
 // WatcherGuard — RAII cleanup of per-fd watcher lists
@@ -155,6 +198,8 @@ const MAX_PENDING_POLLS: usize = 1024;
 struct IoUringInstance {
     shm_phys: DirectMap,
     shm_token: SharedToken,
+    /// Live `RingRef`s. Never zero while this entry is in the map.
+    refs: u32,
     sq_size: u32,
     cq_size: u32,
     pending_polls: Vec<PendingPoll>,
@@ -217,6 +262,11 @@ impl IoUringInstance {
         let head = self.cq_header().head.load(Ordering::Acquire);
         self.cq_tail.get().wrapping_sub(head)
     }
+
+    /// Completions this ring has thrown away. Cumulative, never cleared.
+    fn dropped(&self) -> u32 {
+        self.cq_header().dropped.load(Ordering::Relaxed)
+    }
 }
 
 static IO_URINGS: Lock<Option<IdMap<RingId, IoUringInstance>>> = Lock::new(None);
@@ -229,8 +279,8 @@ pub fn init() {
 /// `submit_sqes` that a process can influence.
 const MAX_SQ_DEPTH: u32 = 256;
 
-/// Create an io_uring instance. Returns (ring_id, shared_memory_token).
-pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
+/// Create an io_uring instance. Returns (ring reference, shared_memory_token).
+pub fn create(depth: u32) -> Result<(RingRef, SharedToken), SyscallError> {
     if depth == 0 || depth > MAX_SQ_DEPTH || !depth.is_power_of_two() {
         return Err(SyscallError::InvalidArgument);
     }
@@ -279,6 +329,7 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
         map.insert(IoUringInstance {
             shm_phys,
             shm_token,
+            refs: 1,
             sq_size,
             cq_size,
             pending_polls: Vec::new(),
@@ -288,13 +339,19 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
         })
     };
 
-    Ok((ring_id, shm_token))
+    Ok((RingRef(ring_id), shm_token))
 }
 
 // Enter — submit SQEs and/or wait for CQEs
 
 fn cq_count(ring_id: RingId) -> Result<u32, SyscallError> {
     with_instance(ring_id, |inst| inst.cq_count())
+}
+
+/// What `enter` sees of a ring before deciding to park: how many completions
+/// are readable, and whether any have been thrown away.
+fn cq_state(ring_id: RingId) -> Result<(u32, u32), SyscallError> {
+    with_instance(ring_id, |inst| (inst.cq_count(), inst.dropped()))
 }
 
 /// Process SQEs and wait for completions. Called from the syscall handler.
@@ -321,13 +378,21 @@ pub fn enter(
     // registration can borrow it across the park without holding the table.
     let queue = waiters_of(ring_id)?;
     loop {
-        let count = cq_count(ring_id)?;
+        let (count, dropped) = cq_state(ring_id)?;
 
         if count >= min_complete || min_complete == 0 {
             return Ok(count);
         }
 
         if deadline == 1 {
+            return Ok(count);
+        }
+
+        // A ring that has thrown a completion away must not be slept on: the
+        // one this thread waits for may be the one discarded. Returning short
+        // puts the counter in front of `Poller::wait`'s assertion, which is
+        // otherwise read only after the call that blocks.
+        if dropped > 0 {
             return Ok(count);
         }
 
@@ -501,6 +566,9 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
             instance.pending_polls.push(new_pp);
         } else {
             instance.post_cqe(user_data, -(SyscallError::ResourceExhausted as i32), 0);
+            let queue = instance.waiters.clone();
+            drop(guard);
+            wake_all(&queue);
             return;
         }
 
@@ -546,7 +614,7 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
 
     let listener_id = process::with_fd_owner_data(|data| {
         match data.fds.get(fd_num) {
-            Some(fd::Descriptor::Listener(id)) => Some(*id),
+            Some(fd::Descriptor::Listener(l)) => Some(l.id()),
             _ => None,
         }
     });
@@ -579,21 +647,29 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
 fn process_close(ring_id: RingId, sqe: &IoUringSqe) {
     let fd_num = sqe.fd as u32;
     let user_data = sqe.user_data;
-    let pid = process::current_process();
 
     let result = process::with_fd_owner_data(|data| {
-        fd::close(&mut data.fds, &mut *crate::vfs::lock(), fd_num, pid, &mut data.pipe_maps)
+        fd::close(&mut data.fds, fd_num, &mut data.pipe_maps)
     });
 
     post_cqe_locked(ring_id, user_data, result as i32, 0);
 }
 
-/// Post a CQE, acquiring the IO_URINGS lock.
+/// Post a CQE and wake this ring's waiters.
+///
+/// The wake is not optional although every caller is the submitting thread: a
+/// ring is a process-wide object, and a sibling thread parked in `enter` on it
+/// never sees a completion nobody announced.
 fn post_cqe_locked(ring_id: RingId, user_data: u64, result: i32, flags: u32) {
     let guard = IO_URINGS.lock();
     let map = guard.as_ref().expect("io_uring not initialized");
-    if let Some(instance) = map.get(ring_id) {
+    let woken = map.get(ring_id).map(|instance| {
         instance.post_cqe(user_data, result, flags);
+        instance.waiters.clone()
+    });
+    drop(guard);
+    if let Some(queue) = woken {
+        wake_all(&queue);
     }
 }
 
@@ -652,6 +728,11 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
 /// there then read ready with nothing queued and blocked in `accept` forever.
 /// Found in the layout wizard's gate, where the wizard's fd 3 was the gate's
 /// listener; the compositor is exposed to exactly the same shape.
+///
+/// **Every cancellation is woken.** The ring belongs to a thread parked in
+/// `enter` on it — that is what a pending `POLL_ADD` means — and nothing else
+/// can end that park: the poll is gone, so the source's own close-path wake
+/// finds no watcher for it, and a `u64::MAX` wait never returns.
 pub fn remove_fd(sources: &[Option<Source>]) {
     let mut affected: Vec<RingId> = Vec::new();
     for source in sources.iter().flatten() {
@@ -671,40 +752,36 @@ pub fn remove_fd(sources: &[Option<Source>]) {
             .any(|&s| pp.read_source == Some(s) || pp.write_source == Some(s))
     };
 
+    let mut to_wake: Vec<Arc<KWaitQueue>> = Vec::new();
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     for ring_id in affected {
         if let Some(instance) = map.get_mut(ring_id) {
             // WatcherGuard drops with the poll → cleans the watcher lists.
             let mut i = 0;
+            let mut cancelled = false;
             while i < instance.pending_polls.len() {
                 if watches_a_closing_source(&instance.pending_polls[i]) {
                     let pp = instance.pending_polls.swap_remove(i);
                     // Post error CQE so userspace knows the poll was cancelled
                     instance.post_cqe(pp.user_data, -(SyscallError::NotFound as i32), 0);
+                    cancelled = true;
                 } else {
                     i += 1;
                 }
             }
+            if cancelled {
+                to_wake.push(instance.waiters.clone());
+            }
         }
+    }
+    drop(guard);
+    for queue in to_wake {
+        wake_all(&queue);
     }
 }
 
 /// Destroy an io_uring instance. Called when the ring fd is closed.
-pub fn destroy(ring_id: RingId) {
-    let instance = {
-        let mut guard = IO_URINGS.lock();
-        let map = guard.as_mut().expect("io_uring not initialized");
-        map.remove(ring_id)
-    };
-
-    if let Some(mut instance) = instance {
-        // Drop all pending polls (WatcherGuards clean up watcher lists)
-        instance.pending_polls.clear();
-        // Destroy shared memory region — unmaps from all processes, frees backing pages
-        let _ = shared_memory::destroy(instance.shm_token, instance.owner_pid);
-    }
-}
 
 // Watcher list operations — dispatch to the source object
 
@@ -719,7 +796,8 @@ impl Source {
             Self::Keyboard => crate::keyboard::has_data(),
             Self::Mouse => crate::mouse::has_data(),
             Self::Network => crate::net::has_packet(),
-            Self::Audio => crate::audio::has_pending(),
+            Self::VirtioSound => crate::drivers::virtio_sound::has_pending(),
+            Self::Hda => crate::drivers::hda::has_pending(),
         }
     }
 
@@ -731,7 +809,8 @@ impl Source {
             Self::Keyboard => crate::keyboard::add_io_uring_watcher(ring_id),
             Self::Mouse => crate::mouse::add_io_uring_watcher(ring_id),
             Self::Network => crate::net::add_io_uring_watcher(ring_id),
-            Self::Audio => crate::audio::add_io_uring_watcher(ring_id),
+            Self::VirtioSound => crate::drivers::virtio_sound::add_io_uring_watcher(ring_id),
+            Self::Hda => crate::drivers::hda::add_io_uring_watcher(ring_id),
             Self::Listener(id) => crate::listener::add_io_uring_watcher(id, ring_id),
         }
     }
@@ -744,7 +823,8 @@ impl Source {
             Self::Keyboard => crate::keyboard::remove_io_uring_watcher(ring_id),
             Self::Mouse => crate::mouse::remove_io_uring_watcher(ring_id),
             Self::Network => crate::net::remove_io_uring_watcher(ring_id),
-            Self::Audio => crate::audio::remove_io_uring_watcher(ring_id),
+            Self::VirtioSound => crate::drivers::virtio_sound::remove_io_uring_watcher(ring_id),
+            Self::Hda => crate::drivers::hda::remove_io_uring_watcher(ring_id),
             Self::Listener(id) => crate::listener::remove_io_uring_watcher(id, ring_id),
         }
     }
@@ -757,7 +837,8 @@ impl Source {
             Self::Keyboard => crate::keyboard::io_uring_watchers(),
             Self::Mouse => crate::mouse::io_uring_watchers(),
             Self::Network => crate::net::io_uring_watchers(),
-            Self::Audio => crate::audio::io_uring_watchers(),
+            Self::VirtioSound => crate::drivers::virtio_sound::io_uring_watchers(),
+            Self::Hda => crate::drivers::hda::io_uring_watchers(),
             Self::Listener(id) => crate::listener::io_uring_watchers(id),
         }
     }

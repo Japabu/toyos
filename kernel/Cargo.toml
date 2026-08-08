@@ -13,11 +13,11 @@ license = "MIT OR Apache-2.0"
 # is declared only so `cfg` checking knows the name.
 loom = []
 # Every actuator below that a boot cannot reach on its own: each is a `SYS_DEBUG`
-# action arm and nothing else, so a kernel carrying all four boots, schedules,
+# action arm and nothing else, so a kernel carrying all of them boots, schedules,
 # drives its devices and panics exactly as a kernel carrying none does. The
 # harness folds any request for one of them into this, because a feature set is
-# a whole kernel build and four sets that differ only in which unreachable arm
-# they carry are four builds of one kernel. `specs/test-cost-audit.md` §5.4.3 is
+# a whole kernel build and sets that differ only in which unreachable arm
+# they carry are several builds of one kernel. `specs/test-cost-audit.md` §5.4.3 is
 # the per-feature ledger this is the "inert" half of; every other feature there
 # changes a path a boot takes and keeps its own build.
 test-actuators = [
@@ -25,7 +25,26 @@ test-actuators = [
     "test-screen-graffiti",
     "test-double-fault",
     "test-heap-ceiling",
+    "test-kernel-canary",
+    "test-tlb-ack-delay",
 ]
+# SYS_DEBUG actions 12 and 13: make the last CPU a TLB shootdown waits for
+# answer late — 12 arms it, takes one shootdown and reports what it cost, 13
+# gives the machine its latency back.
+#
+# What nothing else reaches: whether the initiator *waits*. A correct wait and no
+# wait at all both measure zero on a machine where every CPU answers in
+# microseconds, and QEMU has no way to make one vCPU answer an IPI late — no
+# device, no machine property, no `-cpu` flag. The delay is staged after the
+# flush and before the publication, so what it produces is a slow answer and
+# never an incorrect one.
+#
+# The one place it is not inert: `serve_ipi` loads one relaxed word per flush, on
+# a path a boot runs. That word is written by nothing except action 12, so a
+# kernel carrying this feature and never asked flushes exactly as one without it
+# — which is the claim `INERT_ACTUATORS` membership makes, stated here because
+# this is the first member whose code is not confined to the match arm.
+test-tlb-ack-delay = []
 debug-wait = []
 # Panic between arming the on-screen console and mm::init, so a test can
 # assert the console covers the window where nothing else can report.
@@ -39,6 +58,14 @@ test-fatal-halt = []
 # screendump. Nothing else in the kernel addresses that page, which is the
 # whole point of it, so a test cannot reach it any other way.
 test-idle-guard = []
+# SYS_DEBUG actions 10 and 11: the address of sixteen bytes of kernel memory,
+# and whether they still hold what the kernel put there. A guest cannot read
+# the kernel's address space, so a syscall that writes through a user-chosen
+# address into it leaves nothing a test can assert on — the call returns, the
+# machine survives, and the corruption is somebody else's crash later. This is
+# the only way to make that write observable from userland, and what it
+# observes is the memory itself rather than a verdict about it.
+test-kernel-canary = []
 # SYS_DEBUG action 8: paint the whole panel a colour no glyph contains, over a
 # screen a userland process owns and is still drawing on. Nothing else can put
 # a pixel on the glass behind a running console's back -- the framebuffer is
@@ -153,6 +180,14 @@ usb-short-read = ["usb-storage-gate"]
 # See `xhci/mod.rs`'s `settles`.
 xhci-deaf-controller = []
 xhci-deaf-port = []
+# Make one CPU ignore a kick — the one machine state the blocked-task dump
+# exists to describe, and the one nothing on the host can stage: QEMU delivers
+# every IPI it is given, so a guest CPU stops answering only for reasons that
+# are properties of this code. The victim really clears IF and really spins,
+# for longer than the dump's kick budget and then no longer, so the kick is
+# genuinely unanswered, the NMI is genuinely what reaches it, and the CPU
+# genuinely comes back. See `sched/dump.rs`'s `deaf_window`.
+dump-deaf-cpu = []
 # Report an empty root hub for the first 300 ms of the boot, so the port scan
 # runs against a controller that has not finished detecting its devices yet.
 # That is what every physical root hub does after HCRST and what QEMU's cannot:
@@ -206,6 +241,22 @@ xhci-hid-break-late = []
 # endpoint 0 above all, which resolves to the slot context or to EP0's — would
 # ship never having executed. See `xhci/device.rs`'s `selftest`.
 xhci-descriptor-selftest = []
+# Leave every AP holding the CR0 and CR4 that INIT left it, which is what every
+# boot before `arch/control_regs.rs` was: caching disabled, WP clear, NE clear.
+# `control_regs_negative` boots it and holds the verdict against what comes out.
+# The per-CPU line and both assertions are the shipped ones and only the two
+# register writes are absent, so the CPU it names is a real divergent CPU.
+#
+# Nothing else can stage it. A control register is written by the guest and read
+# by nobody outside it, so there is no QEMU device, machine property or `-cpu`
+# flag that leaves one wrong; the state under test is one the kernel puts itself
+# into or fails to.
+no-ap-control-regs = []
+# Time the same read loop on every CPU, either side of the `mov cr0` that turns
+# its caching on. See `arch/control_regs.rs`'s `bench` for why nothing outside
+# the kernel can ask this and why the answer is not on this host: TCG models no
+# cache at all, so `CR0.CD` there costs nothing and the number is metal's.
+control-regs-bench = []
 # Shrink both disk caches to 64 entries each. The honest ceilings are tens of
 # megabytes, so a test that reached them by doing real I/O would spend minutes
 # proving what 256 KiB proves in a second. The eviction code under test is the
@@ -226,6 +277,64 @@ test-double-fault = []
 # drive the ordinary fatal panic — the one path where the report reaches the
 # screen only because the panic handler captured it before draining the ring.
 test-late-panic = []
+# Panic a few seconds after a *compositor* has claimed the framebuffer, from an
+# idle CPU, so the panic handler's recovery branch is not taken and the report
+# reaches `halt_all_cpus`.
+#
+# What nothing else reaches: whether a fatal report lands on the panel of the
+# owner's T14 while his desktop owns the scanout. `screen_fatal_halt_composited`
+# certifies the software half and cannot certify more — QEMU's framebuffer is
+# host RAM, while the T14's is a write-combining MMIO mapping the compositor is
+# also writing, and a full paint measures ~460 ms there. Three investigations
+# into the machine freeze have assumed a fatal panic would have been seen if one
+# had happened; this is the boot that turns that assumption into an observation,
+# and its negative result would be the larger finding of the two.
+#
+# `test-late-panic` cannot serve: it fires during the boot phases, before any
+# userland process exists, so it paints a screen nobody had claimed.
+#
+# Takes `diag-tick` because the probe's deadline is read from the idle loop, and
+# without it the probe fires on the first interrupt after the deadline rather
+# than at the deadline. On the owner's T14 that was 99 seconds late and looked
+# like a probe that never fired.
+metal-panic-probe = ["diag-tick"]
+# Cap how long a CPU with nothing to run may sleep, so the idle loop keeps
+# running on a machine that has gone quiet.
+#
+# The shipping kernel is right not to: a CPU whose pass found no work and no
+# deadline stops its LAPIC timer and halts until an interrupt arrives, which is
+# correct and is good power management. But everything the kernel does *for the
+# person watching it* lives in the idle loop — the heartbeat, the probe's
+# deadline, the log sink's flush — so on a machine that has gone quiet none of
+# it runs. Eight boots of the owner's T14 produced two heartbeats each, at
+# 1.15 s and 1.78 s, then nothing for as long as 102 s until a keypress; the
+# instrument built to tell a live machine from a dead one wrote the same file
+# for both.
+#
+# So a diagnostic build holds the machine out of full quiescence and a shipping
+# build must not, and that difference is this feature. It costs the wakes and
+# the flushes they carry — with `heartbeat` on, four `sync_mount`s a second on
+# whatever `/log` sits on — which also means the instrument is no longer a
+# passive observer of the boot it is watching.
+diag-tick = []
+# One log line every 250 ms carrying the monotonic time and which CPUs are still
+# alive.
+#
+# What nothing else reaches: *was this boot alive at time T*. Ten logs off the
+# owner's stick are byte-identical between the boots that froze and the boots
+# that did not — a live idle desktop and a dead machine have the same last thing
+# to say — so the log records the freeze's existence and never its time. With
+# this, a frozen boot's log ends at the last heartbeat before death, and the mask
+# says whether the machine stopped all at once or a CPU at a time, which is the
+# difference between a global cause and a local one.
+#
+# `diag-tick` is what makes the mask mean that. Without it a clear bit means
+# "this CPU had nothing to do", which every idle CPU on a quiet machine has, and
+# the field discriminates nothing.
+#
+# Not a default: four lines a second is a diagnostic budget, and a machine
+# nobody is watching should not spend its log volume saying nothing happened.
+heartbeat = ["diag-tick"]
 # SYS_DEBUG actions 5, 6 and 7: one kernel heap allocation at
 # `mm::MAX_HEAP_ALLOC`, one a page over it, and one at the ceiling but
 # page-aligned. Ordinary code can still ask for more than one page backs — a
@@ -265,6 +374,20 @@ log-rotate-fast = []
 # new bytes into a page of zeros and flushed it back over the kernel's own log.
 # See `fat32_adapter.rs`'s `FAT_BACKING_READS`.
 fat-backing-read-fails = []
+# Fail every *filesystem* read of the boot volume once it is mounted, with the
+# mount and the rest of the machine working. Its sibling above injects one layer
+# higher, at `FatBacking::read_page`, which is the page-fault path and reaches
+# no directory entry — so with that one armed an `open`, a `read_dir` and an
+# mtime of the same volume all still succeed, and nothing in the tree can make
+# `vfs::FileSystem`'s metadata calls fail. This one is under `Fat32` itself,
+# where a directory entry, a FAT chain and an extent list are read. Same reason
+# neither can be staged host-side: both partitions are on the disk the guest
+# runs from, so `readonly=on` is writes only and `rerror` takes the whole drive.
+# `Role::Boot` because nothing in the kernel reads that volume after the mount,
+# so the log, the shell and the serial console all survive and a process can be
+# sent to ask it a question. The read is still issued and the buffer is scrubbed
+# with the verdict. See `fat32_adapter.rs`'s `BOOT_VOLUME_READS`.
+fat-boot-reads-fail = []
 # Mis-program the IOMMU for the NVMe controller and nothing else:
 # `iommu-context-absent` leaves it out of the root table, so it reaches
 # translation with no context entry; `iommu-empty-domain` gives it a present
@@ -289,6 +412,14 @@ iommu-empty-domain = []
 # shipped path takes an audio controller out of reset, and the whole feature is
 # deleted at H9. See `kernel/src/drivers/hda_probe.rs`.
 hda-probe = []
+# Run the HDA register allow-list over every arm of it at bind time, and report
+# each verdict by name. Nothing else can be the caller: the check is gated on
+# holding the device claim, soundd takes that claim for the life of the boot,
+# and the claim is exclusive by construction — so a guest test can only reach
+# the allow-list on a machine where nothing is driving the sound card, which is
+# a machine with no audio. The shipped path runs; only the caller is staged.
+# See `kernel/src/drivers/hda.rs`'s `allowlist_selftest`.
+hda-allowlist-selftest = []
 # Four states of the wall clock, none of which the host can produce: QEMU has no
 # switch that removes or wedges the mc146818, its RTC always presents the guest
 # a coherent register set, the FADT a guest reads is generated by QEMU and
@@ -306,17 +437,42 @@ rtc-century-next = []
 # this every emulated boot assumes UTC and the arithmetic between local time and
 # UTC never runs. See `clock::init_wall`.
 rtc-zone-east = []
+# Take the FP body out of `arch::entry`'s bracket and the declared state out of
+# the loader's trampolines, leaving a kernel that preserves the *rest* of the
+# user machine state and nothing else — which is the kernel this tree had before
+# `specs/user-machine-state.md`.
+#
+# The negative control for `fpu_isolation`, and the only way to have one: the
+# defect it stages is a CPU register file surviving a task switch, and QEMU has
+# no device, machine property or `-cpu` flag that changes what an entry saves.
+#
+# It replaces the *behaviour* and not a verdict. The reservation, the alignment,
+# the rsp bookkeeping and every assertion are the shipped ones; what is absent
+# is the `fxsave64`, the `fxrstor64` and the trampoline's load. A feature that
+# flipped an assertion would make its own gate vacuous.
+fpu-save-nothing = []
 
-# debug-assertions and overflow-checks stay on: fail-fast beats speed here.
-[profile.dev]
+# The one profile every guest binary is built with — `specs/boot-image-split.md`
+# §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
+# debug-assertions and overflow-checks on, because fail-fast beats speed here
+# and both crafted-ELF kernel panics in `specs/issues/` were *found* by
+# an overflow check. `--release` would turn the last two off silently, so this
+# build system no longer has the flag.
+[profile.toyos]
+inherits = "dev"
 opt-level = 2
 debug = true
+debug-assertions = true
+overflow-checks = true
 
 [dependencies]
 bcachefs = { path = "../bcachefs", default-features = false }
 toyos-abi = { path = "../toyos-abi" }
 toyos-fat32 = { path = "../toyos-fat32" }
+toyos-elf = { path = "../toyos-elf" }
 toyos-gpt = { path = "../toyos-gpt" }
+toyos-hda = { path = "../toyos-hda" }
+toyos-pci = { path = "../toyos-pci" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
 toyos-xhci = { path = "../toyos-xhci" }

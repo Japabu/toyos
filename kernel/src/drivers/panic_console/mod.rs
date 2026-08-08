@@ -1,11 +1,17 @@
 //! On-screen panic console.
 //!
-//! A dumb tail of the log ring rendered as an 8x16 text grid onto the UEFI
-//! GOP framebuffer, armed before `serial::init` and painted only on fatal
-//! paths. It formats nothing: `crash_report` already produced the text and
-//! every ring line already carries `[kernel 12.481 cpu3 tid=7]`. A second
-//! formatter for a second device would be a terminal subsystem, and it would
-//! drift from the first.
+//! Log text rendered as an 8x16 text grid onto the UEFI GOP framebuffer, armed
+//! before `serial::init`. It formats nothing: `crash_report` already produced
+//! the text and every ring line already carries `[kernel 12.481 cpu3 tid=7]`. A
+//! second formatter for a second device would be a terminal subsystem, and it
+//! would drift from the first.
+//!
+//! **Which text differs by caller, and that is a decision rather than an
+//! accident.** A fatal path and a boot checkpoint show the *tail* of the ring,
+//! because what they are reporting is the last thing the machine did. Ctrl+Alt+D
+//! shows the log between two marks (see [`paint_report`]), because what it is
+//! reporting is one report and a tail would paginate it against a whole boot's
+//! logging.
 //!
 //! It exists because a laptop has no serial port. On such a machine the
 //! screen is the only channel a kernel panic can reach, and today a panic
@@ -37,7 +43,10 @@
 //! has halted: a phone camera left running collects the whole thing. PageUp and
 //! PageDown steer it, polled off the i8042 with every CPU already halted, and
 //! the deadline is what a machine whose keyboard is dead, disabled or absent
-//! still gets -- so the reader chooses between them and neither is owed. Paging
+//! still gets. **The first key retires the deadline for the rest of the
+//! session**: a reader who has taken the wheel is reading one page, and a
+//! camera that has been replaced by a person no longer needs the cycle. The
+//! owner asked for that after the pager moved out from under him. Paging
 //! happens only when the text does not fit, and the `[page n/m]` footer is what
 //! tells a photograph which slice it caught.
 //!
@@ -87,6 +96,23 @@ const _: () = assert!(SNAPSHOT_CAP >= MAX_ROWS * MAX_COLS);
 /// How long each page stays up. Long enough to photograph, short enough that
 /// a five-page report cycles inside a 15-second video.
 const PAGE_HOLD_NS: u64 = 3_000_000_000;
+
+/// How long Ctrl+Alt+D's report keeps the panel. Policy, and the two ends of it
+/// are a reader and a desktop: he has to notice the panel changed and raise a
+/// camera, which is several of [`PAGE_HOLD_NS`], while a machine that is still
+/// scheduling has to get its own screen back without being switched off.
+///
+/// The two do not fight continuously. A compositor repaints on damage, and the
+/// kernel drawing over the scanout behind its back is not damage in its model,
+/// so each client frame costs one paint and an idle desktop produces about one
+/// of those a second.
+const REPORT_HOLD_NS: u64 = 15_000_000_000;
+
+/// The longest the panel may carry somebody else's paint before the report goes
+/// back on it. It bounds what a photograph taken at the wrong instant loses,
+/// and it is not a repaint rate: a panel nothing else draws on is *checked*
+/// this often and repainted never.
+const REPORT_CHECK_NS: u64 = 20_000_000;
 
 /// The bootloader identity+high maps the first 4 GiB, and `paging::init`
 /// re-maps at least that much. A framebuffer below this line is therefore
@@ -156,10 +182,55 @@ static SNAPSHOT_LEN: AtomicUsize = AtomicUsize::new(0);
 /// already captured and not yet painted.
 static LIVE: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
 
-/// Set the first time a process claims `DEVICE_FRAMEBUFFER`. Boot checkpoints
+/// Ctrl+Alt+D's report, copied out of the ring the moment it is complete.
+///
+/// A third buffer and not a third reader of the ring, because the report has
+/// to survive being repainted: [`hold_report`] puts it back on the panel for
+/// [`REPORT_HOLD_NS`], and by then the ring holds whatever the machine has said
+/// since. A screenful is all a repaint can show and `SNAPSHOT_CAP` is five of
+/// those, so nothing here is sized for the paging the report does not do.
+static REPORT: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
+static REPORT_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// When the report gives the panel back. 0 means it does not hold it.
+static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// The next `nanos_since_boot` at which a CPU may look at the panel. A CAS, so
+/// one CPU of the eight in `drain_irqs` does the looking.
+static HOLD_CHECK_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Set the first time a process claims `DeviceType::Framebuffer`. Boot checkpoints
 /// stop repainting once something owns the screen; a *fatal* panic ignores
 /// this entirely and takes the screen back unconditionally.
 static SCREEN_OWNED_BY_USERLAND: AtomicBool = AtomicBool::new(false);
+
+/// When userland took the screen, so [`probe_due`] can wait a few seconds past
+/// it. 0 means it has not.
+#[cfg(feature = "metal-panic-probe")]
+static CLAIMED_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How long after the claim the probe fires. Long enough for a desktop to
+/// finish coming up and for whoever is watching the panel to be watching it.
+#[cfg(feature = "metal-panic-probe")]
+const PROBE_DELAY_NS: u64 = 5_000_000_000;
+
+/// Whether the `metal-panic-probe` boot should panic now. The idle loop asks,
+/// because a CPU there has no thread current and therefore takes the panic
+/// handler's fall-through to `halt_all_cpus` rather than its recovery branch —
+/// which is the whole point of the probe: the recovery branch never paints.
+#[cfg(feature = "metal-panic-probe")]
+pub fn probe_due() -> bool {
+    let at = CLAIMED_AT.load(Ordering::Relaxed);
+    if at == 0 || crate::clock::nanos_since_boot().saturating_sub(at) < PROBE_DELAY_NS {
+        return false;
+    }
+    // Exactly one CPU, and that is not tidiness. Every idle CPU reaches this
+    // inside the same microsecond, so without the latch the machine takes as
+    // many simultaneous panics as it has idle cores and there is no CPU left in
+    // an idle loop to put the report on `/log`. Measured: two panics 2 ms
+    // apart, and `halt_all_cpus`'s drain wait timed out against both.
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    FIRED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+}
 
 /// Hand the screen over, and do not return while a checkpoint is still
 /// drawing on it.
@@ -185,6 +256,8 @@ static SCREEN_OWNED_BY_USERLAND: AtomicBool = AtomicBool::new(false);
 /// already painted on the glass, which is the same corruption.
 pub fn screen_claimed_by_userland() {
     SCREEN_OWNED_BY_USERLAND.store(true, Ordering::SeqCst);
+    #[cfg(feature = "metal-panic-probe")]
+    CLAIMED_AT.store(crate::clock::nanos_since_boot().max(1), Ordering::Relaxed);
     // Bounded because a CPU that died holding the latch must not take the
     // display down with it; one paint is the honest ceiling and this is twice
     // the slowest one measured.
@@ -360,11 +433,7 @@ pub fn remap() {
         return;
     }
     let size = RAW_SIZE.load(Ordering::Relaxed);
-    mm::paging::kernel()
-        .lock()
-        .as_mut()
-        .unwrap()
-        .map_mmio(phys, align_2m(size as usize) as u64, CachePolicy::WriteCombining);
+    mm::paging::map_mmio(phys, align_2m(size as usize) as u64, CachePolicy::WriteCombining);
     rearm();
 }
 
@@ -458,7 +527,7 @@ pub fn render() -> bool {
     if PAINTING.swap(true, Ordering::SeqCst) {
         return false;
     }
-    paint(Fill::Fatal, fatal_text(), Page::Last);
+    paint(Fill::Fatal, fatal_text(), Page::Last, Watch::No);
     true
 }
 
@@ -492,15 +561,20 @@ pub fn page_forever() {
     // at the top, and a key from there reaches either end of it.
     let mut shown: Option<usize> = None;
     let mut keys = KeyDecoder::new();
+    // Once the reader has steered, the cycle is his and the deadline never runs
+    // again. There is no way back to automatic paging, and none is wanted: the
+    // page he stopped on is the one he is photographing.
+    let mut steered = false;
     loop {
-        let step = hold(PAGE_HOLD_NS, &mut keys);
-        let next = match (shown, step) {
+        let step = hold((!steered).then_some(PAGE_HOLD_NS), &mut keys);
+        steered |= step.is_some();
+        let next = match (shown, step.unwrap_or(PageKey::Down)) {
             (None, PageKey::Down) => 0,
             (None, PageKey::Up) => pages - 1,
             (Some(page), PageKey::Down) => (page + 1) % pages,
             (Some(page), PageKey::Up) => (page + pages - 1) % pages,
         };
-        paint(Fill::Fatal, text, Page::Nth(next));
+        paint(Fill::Fatal, text, Page::Nth(next), Watch::No);
         shown = Some(next);
     }
 }
@@ -517,7 +591,8 @@ enum PageKey {
 const HID_PAGE_UP: u8 = 0x4B;
 const HID_PAGE_DOWN: u8 = 0x4E;
 
-/// Busy-wait `nanos`, and answer which way the page moves.
+/// Wait for a page key, giving up after `nanos` if there is a deadline at all.
+/// `None` back is the deadline expiring, and is unreachable without one.
 ///
 /// `nanos_since_boot` is an `rdtsc` and two relaxed loads and [`i8042::poll_byte`]
 /// is an `inb` of the status port -- no lock, no MMIO, nothing the panic path is
@@ -525,21 +600,23 @@ const HID_PAGE_DOWN: u8 = 0x4E;
 /// what a machine with no keyboard gets, and it only ever goes forward.
 ///
 /// [`i8042::poll_byte`]: crate::drivers::i8042::poll_byte
-fn hold(nanos: u64, keys: &mut KeyDecoder) -> PageKey {
-    let target = crate::clock::nanos_since_boot().saturating_add(nanos);
-    while crate::clock::nanos_since_boot() < target {
+fn hold(nanos: Option<u64>, keys: &mut KeyDecoder) -> Option<PageKey> {
+    let target = nanos.map(|n| crate::clock::nanos_since_boot().saturating_add(n));
+    while target.is_none_or(|t| crate::clock::nanos_since_boot() < t) {
         // The pointer shares the port, and its packet bytes are scancodes to
         // anything that does not skip them.
         if let Some((byte, false)) = crate::drivers::i8042::poll_byte() {
             match keys.feed(byte) {
-                KeyOutcome::Key { usage: HID_PAGE_UP, pressed: true } => return PageKey::Up,
-                KeyOutcome::Key { usage: HID_PAGE_DOWN, pressed: true } => return PageKey::Down,
+                KeyOutcome::Key { usage: HID_PAGE_UP, pressed: true } => return Some(PageKey::Up),
+                KeyOutcome::Key { usage: HID_PAGE_DOWN, pressed: true } => {
+                    return Some(PageKey::Down);
+                }
                 _ => {}
             }
         }
         core::hint::spin_loop();
     }
-    PageKey::Down
+    None
 }
 
 /// Repaint at a boot phase boundary, so a machine that wedges later still
@@ -557,8 +634,96 @@ pub fn boot_checkpoint() {
     if PAINTING.swap(true, Ordering::SeqCst) {
         return;
     }
-    paint(Fill::Boot, live_tail(), Page::Last);
+    paint(Fill::Boot, live_tail(), Page::Last, Watch::No);
     PAINTING.store(false, Ordering::SeqCst);
+}
+
+/// Put the log between two marks on the panel, and keep it there.
+///
+/// [`boot_checkpoint`] without the userland check, and that is the first of two
+/// differences. The caller is Ctrl+Alt+D, pressed on a machine its owner
+/// believes has stopped, and the machine this exists for has no serial port —
+/// so declining because a compositor holds the screen would answer the
+/// question into a log file nothing is left running to flush. The keystroke is
+/// the consent.
+///
+/// The second difference is the marks. A tail of the ring is whatever the
+/// machine last said, and a boot log is mostly not an answer to the question
+/// the key asked — worse, the tail paginates over the *whole* ring, so the
+/// panel shows one slice of a log and the verdict is on it by luck. A bracket
+/// is one report: it fits a screen, there is no page for the answer to be on
+/// the wrong side of, and its last line is the verdict whatever else the
+/// machine logs while the CPUs are answering.
+///
+/// **A single paint is not a report.** Whoever owns the screen goes on
+/// composing and has no idea the kernel drew, so what a photograph catches is
+/// whatever survived the next client frame. The paint therefore arms a hold,
+/// and [`hold_report`] is the other half.
+pub fn paint_report(from: crate::drivers::log_ring::Mark, to: crate::drivers::log_ring::Mark) {
+    let buf = unsafe { &mut *REPORT.0.get() };
+    let n = unsafe { crate::drivers::log_ring::peek_range(from, to, buf) };
+    REPORT_LEN.store(n, Ordering::Relaxed);
+    HOLD_UNTIL.store(
+        crate::clock::nanos_since_boot().saturating_add(REPORT_HOLD_NS),
+        Ordering::Relaxed,
+    );
+    paint_held_report();
+}
+
+/// The report as it was when the dump finished, for however long the hold
+/// lasts. Empty until one has been asked for.
+fn report_text() -> &'static [u8] {
+    let n = REPORT_LEN.load(Ordering::Relaxed).min(SNAPSHOT_CAP);
+    unsafe { core::slice::from_raw_parts(REPORT.0.get().cast::<u8>(), n) }
+}
+
+fn paint_held_report() {
+    if PAINTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    paint(Fill::Boot, report_text(), Page::Last, Watch::Yes);
+    PAINTING.store(false, Ordering::SeqCst);
+}
+
+/// Put the report back if the panel has stopped carrying it. Called from
+/// `drain_irqs` on every CPU, every pass.
+///
+/// It repaints on evidence rather than on a timer, and the difference is the
+/// photograph. A machine that has genuinely stopped has nobody to draw over the
+/// report, so this costs it [`PROBES`] uncached reads every [`REPORT_CHECK_NS`]
+/// and never a paint — where a timer would blank and redraw the panel every
+/// tick, and a camera that caught the fill would come away with a black frame.
+/// A machine whose compositor is still running pays a paint per overwrite until
+/// the hold expires, which is the cost of answering at all on that machine.
+pub fn hold_report() {
+    let until = HOLD_UNTIL.load(Ordering::Relaxed);
+    if until == 0 {
+        return;
+    }
+    let now = crate::clock::nanos_since_boot();
+    if now >= until {
+        HOLD_UNTIL.store(0, Ordering::Relaxed);
+        return;
+    }
+    let due = HOLD_CHECK_AT.load(Ordering::Relaxed);
+    if now < due
+        || HOLD_CHECK_AT
+            .compare_exchange(
+                due,
+                now.saturating_add(REPORT_CHECK_NS),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        return;
+    }
+    let Some(fb) = snapshot() else { return };
+    if !mapped(&fb) || panel_carries_report(&fb) {
+        return;
+    }
+    log!("panic console: the panel was drawn over, putting the report back");
+    paint_held_report();
 }
 
 /// Which slice of the text a paint shows.
@@ -656,7 +821,46 @@ fn row_offsets(text: &[u8], cols: usize, first: usize, out: &mut [u32]) {
     }
 }
 
-fn paint(fill: Fill, text: &[u8], page: Page) {
+/// Whether a later pass has to be able to tell this paint apart from the panel
+/// having been drawn over.
+///
+/// Only the report does, and it is the only paint anything is expected to put
+/// back: a checkpoint's screen is superseded by the next phase and a fatal
+/// one's by nothing, because that machine is halted. Saying so at the call site
+/// is what stops a checkpoint that ran during a hold from becoming the image
+/// [`hold_report`] preserves.
+#[derive(Clone, Copy, PartialEq)]
+enum Watch {
+    No,
+    Yes,
+}
+
+/// Pixels of the watched paint remembered, so a later pass can tell "the report
+/// is still up" from "something drew over it" without keeping a copy of the
+/// panel.
+const PROBES: usize = 128;
+
+/// How many of those are a grid over the whole panel rather than ink of the
+/// text. Both halves are load-bearing and neither replaces the other: the grid
+/// notices a repaint where the report has no glyphs — a taskbar below a short
+/// report, the strip under the last cell row — and the ink notices one that
+/// writes its own background over the text, which a grid probe sitting on the
+/// report's own black background cannot tell from the report still being up.
+const GRID_PROBES: usize = 32;
+const GRID_COLS: usize = 8;
+const GRID_ROWS: usize = GRID_PROBES / GRID_COLS;
+const _: () = assert!(GRID_COLS > 1 && GRID_ROWS > 1);
+
+/// One ink probe every this many inked glyphs, so the set spans the page rather
+/// than clustering in its first line — and so a client that repaints one band
+/// of the panel is seen by the probes inside that band.
+const PROBE_STRIDE: usize = 29;
+
+static PROBE_AT: [AtomicU32; PROBES] = [const { AtomicU32::new(0) }; PROBES];
+static PROBE_PX: [AtomicU32; PROBES] = [const { AtomicU32::new(0) }; PROBES];
+static PROBE_N: AtomicUsize = AtomicUsize::new(0);
+
+fn paint(fill: Fill, text: &[u8], page: Page, watch: Watch) {
     let Some(fb) = snapshot() else { return };
     if !mapped(&fb) {
         return;
@@ -692,16 +896,29 @@ fn paint(fill: Fill, text: &[u8], page: Page) {
     let white = rgb(&fb, 0xFF, 0xFF, 0xFF);
     let alert = rgb(&fb, 0xFF, 0x50, 0x50);
 
+    let mut inked = 0usize;
+    let mut probes = 0usize;
     for r in 0..draw {
         let start = row_start[r] as usize;
         let color = if has_alert(text, start, len, cols) { alert } else { white };
         let mut off = start;
         let mut c = 0;
         while c < cols && off < len {
-            if text[off] == b'\n' {
+            let byte = text[off];
+            if byte == b'\n' {
                 break;
             }
-            draw_glyph(&fb, c, r, text[off], color);
+            draw_glyph(&fb, c, r, byte, color);
+            if watch == Watch::Yes {
+                if let Some((bx, by)) = glyph_ink(byte) {
+                    if inked % PROBE_STRIDE == 0 && probes < PROBES - GRID_PROBES {
+                        let (x, y) = (c * GLYPH_W + bx, r * GLYPH_H + by);
+                        PROBE_AT[probes].store(((y as u32) << 16) | x as u32, Ordering::Relaxed);
+                        probes += 1;
+                    }
+                    inked += 1;
+                }
+            }
             off += 1;
             c += 1;
         }
@@ -712,6 +929,49 @@ fn paint(fill: Fill, text: &[u8], page: Page) {
     }
 
     flush_stores();
+    if watch == Watch::Yes {
+        sample_probes(&fb, probes);
+    }
+}
+
+/// Read back what this paint left at each probe, after the grid has been added
+/// to the ink the draw loop chose.
+///
+/// Read back rather than assumed from the colour asked for: a probe outside the
+/// published byte count was never written, and one under the footer is whatever
+/// the footer put there. What [`panel_carries_report`] compares against has to
+/// be what is on the glass, or the first check would report an overwrite that
+/// never happened.
+fn sample_probes(fb: &Fb, ink: usize) {
+    let mut n = ink.min(PROBES - GRID_PROBES);
+    let w = (fb.width as usize).saturating_sub(1);
+    let h = (fb.height as usize).saturating_sub(1);
+    for i in 0..GRID_PROBES {
+        // Corners included, which is where a taskbar and the strip below the
+        // last cell row are, and where `Ppm::fill` reads.
+        let (x, y) = (w * (i % GRID_COLS) / (GRID_COLS - 1), h * (i / GRID_COLS) / (GRID_ROWS - 1));
+        PROBE_AT[n].store(((y as u32) << 16) | x as u32, Ordering::Relaxed);
+        n += 1;
+    }
+    for i in 0..n {
+        let at = PROBE_AT[i].load(Ordering::Relaxed);
+        let px = get_pixel(fb, (at & 0xFFFF) as usize, (at >> 16) as usize);
+        PROBE_PX[i].store(px, Ordering::Relaxed);
+    }
+    PROBE_N.store(n, Ordering::Relaxed);
+}
+
+/// Whether every probe still holds what the last paint left there.
+///
+/// No probes means nothing has been painted, and there is then nothing to put
+/// back — which is why this answers yes rather than no.
+fn panel_carries_report(fb: &Fb) -> bool {
+    let n = PROBE_N.load(Ordering::Relaxed).min(PROBES);
+    (0..n).all(|i| {
+        let at = PROBE_AT[i].load(Ordering::Relaxed);
+        get_pixel(fb, (at & 0xFFFF) as usize, (at >> 16) as usize)
+            == PROBE_PX[i].load(Ordering::Relaxed)
+    })
 }
 
 /// Put every store this module has made on the bus.
@@ -815,6 +1075,18 @@ fn rgb(fb: &Fb, r: u32, g: u32, b: u32) -> u32 {
     }
 }
 
+/// What is on the glass at one pixel, or 0 where nothing may be read — the
+/// same clamp [`put_pixel`] applies, so a position that could not be written
+/// answers the same both ways and a probe on one is never a false alarm.
+fn get_pixel(fb: &Fb, x: usize, y: usize) -> u32 {
+    let Some(row) = (y as u64).checked_mul(fb.stride_px as u64) else { return 0 };
+    let Some(idx) = row.checked_add(x as u64).and_then(|v| v.checked_mul(4)) else { return 0 };
+    if idx.saturating_add(4) > fb.bytes {
+        return 0;
+    }
+    unsafe { core::ptr::read_volatile(fb.ptr.add(idx as usize) as *const u32) }
+}
+
 #[inline]
 fn put_pixel(fb: &Fb, x: usize, y: usize, color: u32) {
     let Some(row) = (y as u64).checked_mul(fb.stride_px as u64) else { return };
@@ -844,7 +1116,7 @@ fn row_base(fb: &Fb, y: usize, len: usize) -> Option<*mut u32> {
 /// Paint the whole panel a colour no glyph contains, over whatever is there.
 ///
 /// The actuator for "something drew on the glass behind the console's back".
-/// Nothing else in reach can stage it: `DEVICE_FRAMEBUFFER` is claimed
+/// Nothing else in reach can stage it: `DeviceType::Framebuffer` is claimed
 /// exclusively so no second process can map the scanout, `boot_checkpoint`
 /// returns the moment userland owns the screen, and the one painter that
 /// ignores that claim — `render` — halts the machine on its way out, which
@@ -873,16 +1145,37 @@ fn fill_screen(fb: &Fb, color: u32) {
     }
 }
 
-fn draw_glyph(fb: &Fb, cell_x: usize, cell_y: usize, byte: u8, color: u32) {
+/// The 16 rows the font draws a byte with. One mapping, because the probe
+/// picker below has to name a pixel [`draw_glyph`] actually sets and a second
+/// copy of this `match` would be free to disagree with it.
+fn glyph(byte: u8) -> &'static [u8] {
     let ch = match byte {
         b'\t' => b' ',
         0x20..=0x7E => byte,
         _ => b'.',
     };
     let base = (ch - 0x20) as usize * GLYPH_H;
+    &FONT[base..base + GLYPH_H]
+}
+
+/// A pixel of this byte's glyph, in its cell. `None` for a glyph with no ink,
+/// which is the only kind a probe must refuse: on a blank cell the report and
+/// whatever replaced it look identical.
+fn glyph_ink(byte: u8) -> Option<(usize, usize)> {
+    for (row, &bits) in glyph(byte).iter().enumerate() {
+        for bit in 0..GLYPH_W {
+            if bits & (0x80 >> bit) != 0 {
+                return Some((bit, row));
+            }
+        }
+    }
+    None
+}
+
+fn draw_glyph(fb: &Fb, cell_x: usize, cell_y: usize, byte: u8, color: u32) {
     let ox = cell_x * GLYPH_W;
     let oy = cell_y * GLYPH_H;
-    for (row, &bits) in FONT[base..base + GLYPH_H].iter().enumerate() {
+    for (row, &bits) in glyph(byte).iter().enumerate() {
         if bits == 0 {
             continue;
         }

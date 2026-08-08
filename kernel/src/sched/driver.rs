@@ -541,7 +541,15 @@ fn execute(action: Action<KernelPayload>) {
                 // owed, and the paths on which it cannot (a VFS lock a dead
                 // thread still holds) turn the sink off after a bounded number
                 // of tries, which clears this too.
-                || crate::drivers::log_ring::file_has_pending()
+                //
+                // Asked as "would the next trip write it", not "is anything
+                // owed", or the condition stops self-clearing: a CPU that
+                // declines the flush and then stays awake *because* the log is
+                // unwritten spins for as long as the bytes sit there. Declining
+                // costs it the halt and nothing else — it holds a deadline, so
+                // its own timer brings it back, and the deferral ceiling makes
+                // the flush its own if nobody else has taken it.
+                || log_file_flush_due()
                 // A root-hub port whose connect state the driver has not
                 // finished acting on. The connect edge that started it was the
                 // last interrupt that controller has to give — a device sitting
@@ -568,6 +576,10 @@ fn execute(action: Action<KernelPayload>) {
 /// wakes. Runs at the top of every pass, before the mailbox drain, so a wake
 /// posted here is in the run queue by the time the pass picks.
 fn drain_irqs() {
+    // First in the function, so the stamp means "this CPU reached a pass" and
+    // not "this CPU got all the way through one".
+    #[cfg(feature = "heartbeat")]
+    crate::heartbeat::note_pass();
     // xHCI (keyboard/mouse): the controller poll dispatches HID reports, which
     // wake the keyboard/mouse queues from inside the driver.
     crate::drivers::xhci::poll_if_pending();
@@ -578,8 +590,15 @@ fn drain_irqs() {
     // whichever driver's guard produced it: this walks the scheduler and logs
     // a line per parked thread, and both drivers are done above.
     if crate::keyboard::take_dump_request() {
-        crate::scheduler::dump_blocked();
+        super::dump::request();
     }
+    // A CPU cannot read a sibling's `CpuSched`, so the dump reaches every CPU
+    // by asking, and this is where each one answers.
+    super::dump::serve_if_owed();
+    // And this is where the report it painted goes back on the panel if whoever
+    // owns the screen has drawn over it. One clock read per pass while nothing
+    // is held, and nothing at all once the hold expires.
+    crate::drivers::panic_console::hold_report();
 
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Net).is_some() {
         crate::net::wake_waiters();
@@ -592,13 +611,20 @@ fn drain_irqs() {
         }
     }
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Audio).is_some() {
-        crate::audio::wake_waiters();
-        let watchers = crate::audio::io_uring_watchers();
-        if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
-                &watchers,
-                crate::io_uring::Source::Audio,
-            );
+        // One wait queue for both backends: an over-wake costs a recheck, and a
+        // second queue would have to be chosen by whichever driver bound —
+        // which is a fact the parking side does not have.
+        crate::sched::waitqs::wake_all(&crate::sched::waitqs::AUDIO);
+        for (watchers, source) in [
+            (
+                crate::drivers::virtio_sound::io_uring_watchers(),
+                crate::io_uring::Source::VirtioSound,
+            ),
+            (crate::drivers::hda::io_uring_watchers(), crate::io_uring::Source::Hda),
+        ] {
+            if !watchers.is_empty() {
+                crate::io_uring::complete_pending_for_event(&watchers, source);
+            }
         }
     }
 }
@@ -614,6 +640,22 @@ pub fn enter_idle_loop() -> ! {
     unsafe {
         asm!(
             "mov rsp, {sp}",
+            // Terminate the frame chain, and leave the zero return-address
+            // slot a `call` would have left. `idle_loop` is entered by `jmp`,
+            // so its frame is the topmost on this stack and `rbp + 8` — where
+            // `kernel_backtrace` reads the return address — was the unmapped
+            // page above a 16 KiB idle stack. A fatal panic taken on an idle
+            // CPU therefore faulted inside `crash_report` while printing its
+            // own backtrace; that fault's report faulted the same way, and it
+            // ended in a double fault with the panel carrying seven pages of
+            // cascade and not one line of the reason. The one context a
+            // machine-stopped panic is raised from was the one context that
+            // could not say why.
+            //
+            // `push` also leaves `rsp` where the ABI expects it at a function
+            // entry, which jumping to the raw top does not.
+            "xor ebp, ebp",
+            "push rbp",
             "jmp {func}",
             sp = in(reg) sp,
             func = in(reg) idle_loop as *const () as usize,
@@ -624,14 +666,92 @@ pub fn enter_idle_loop() -> ! {
 
 extern "C" fn idle_loop() -> ! {
     loop {
+        // The idle loop and not a pass: the state it stages is a CPU that never
+        // reaches one.
+        #[cfg(feature = "dump-deaf-cpu")]
+        super::dump::deaf_window();
+        // Here and not from a syscall: the panic handler recovers rather than
+        // paints when a userland thread is current, and this context has none.
+        #[cfg(feature = "metal-panic-probe")]
+        if crate::drivers::panic_console::probe_due() {
+            panic!("metal-panic-probe: a fatal report over a desktop that owns the screen");
+        }
         crate::scheduler::log_health();
         crate::scheduler::reap_poisoned();
         drain_serial();
+        // Immediately before the sink's poll, so the line it appends is flushed
+        // by the very next statement rather than waiting a trip round the loop.
+        #[cfg(feature = "heartbeat")]
+        crate::heartbeat::poll();
         // After the serial drain and before the pass, for the same reason that
         // one is here: both are I/O off the critical path, and this is the one
         // context that provably holds none of the locks a filesystem needs.
-        crate::log_file::poll();
+        flush_log_file_if_affordable();
         pass(Dispose::None);
+    }
+}
+
+/// The longest the log file may go unwritten because every CPU that reached
+/// the idle loop owed a wake.
+///
+/// A ceiling and not a target. On a machine with a spare CPU it never expires;
+/// it exists so that "prefer a CPU that owes nothing" cannot become "never" —
+/// on one core there is no other CPU, and on any number of them a busy machine
+/// could owe a deadline everywhere at once.
+const LOG_DEFERRAL_CEILING_NS: u64 = 1_000_000_000;
+
+/// When the first CPU declined to write the log, or 0 if none has since the
+/// last flush. Global rather than per-CPU: the question is how long the *file*
+/// has been owed bytes, and any CPU may answer it.
+static LOG_DEFERRED_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// Write the log file, unless this CPU is the wrong one to spend the time on.
+///
+/// A flush is a device transfer — on the machine this matters on, a USB one,
+/// whose whole duration `xhci::wait_transfer` spends with preemption disabled.
+/// It cannot be abandoned once begun, so the only place to decline is before.
+///
+/// A CPU that owes a wake is the wrong one to spend it: a task parks on the CPU
+/// with nothing else to run, so the CPU an audio daemon is waiting on is
+/// exactly the CPU that reaches this loop first. Whoever owes nothing takes the
+/// bytes instead — and if nobody has for [`LOG_DEFERRAL_CEILING_NS`], this CPU
+/// takes them anyway.
+///
+/// The one writer of the deferral clock, so that [`log_file_flush_due`] can
+/// answer the pre-halt check without consuming an expiry this has not acted on.
+fn flush_log_file_if_affordable() {
+    if !crate::drivers::log_ring::file_has_pending() {
+        LOG_DEFERRED_SINCE.store(0, Ordering::Relaxed);
+        return;
+    }
+    if owes_wake() {
+        let now = crate::clock::nanos_since_boot().max(1);
+        match LOG_DEFERRED_SINCE.load(Ordering::Relaxed) {
+            0 => {
+                LOG_DEFERRED_SINCE.store(now, Ordering::Relaxed);
+                return;
+            }
+            since if now.saturating_sub(since) < LOG_DEFERRAL_CEILING_NS => return,
+            _ => {}
+        }
+    }
+    LOG_DEFERRED_SINCE.store(0, Ordering::Relaxed);
+    crate::log_file::poll();
+}
+
+/// Would the next trip round the idle loop write the log file? Read-only.
+fn log_file_flush_due() -> bool {
+    if !crate::drivers::log_ring::file_has_pending() {
+        return false;
+    }
+    if !owes_wake() {
+        return true;
+    }
+    match LOG_DEFERRED_SINCE.load(Ordering::Relaxed) {
+        0 => false,
+        since => {
+            crate::clock::nanos_since_boot().saturating_sub(since) >= LOG_DEFERRAL_CEILING_NS
+        }
     }
 }
 
@@ -696,14 +816,57 @@ pub fn parked_len() -> usize {
     try_with_cpu(|cpu| cpu.parked().count()).unwrap_or(0)
 }
 
-pub fn for_each_parked(
-    mut f: impl FnMut(TaskKey, Option<Nanos>, toyos_sched::task::WaitClass),
-) {
+/// Is any task parked here? The idle loop's admission test for unbounded I/O.
+///
+/// A deadline is not the question, though it was: a timed waiter is only the
+/// subset of owed wakes whose *time* this CPU happens to know, and the audio
+/// path's producer is not in it — a client filling soundd's ring parks on a
+/// pipe with no deadline at all, and is woken by an RT daemon that expects it
+/// back inside one 2.9 ms period. Deferring only for deadlines steers the flush
+/// off the daemon's CPU and onto its client's, where it costs the same audio.
+///
+/// A CPU cannot answer for a sibling, and does not need to: the question is
+/// only ever asked about the CPU that is about to spend the time. `true` when
+/// the answer is unavailable — declining costs a trip round the loop, and
+/// proceeding costs whatever the device takes.
+pub fn owes_wake() -> bool {
+    try_with_cpu(|cpu| cpu.parked().next().is_some()).unwrap_or(true)
+}
+
+/// The thread this CPU has loaded, if any.
+pub fn running_id() -> Option<TaskId> {
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().id)).flatten()
+}
+
+/// One parked task, flattened for a reader outside the scheduler.
+///
+/// Flattened here because a `ParkedView` borrows the `CpuSched`, and nothing
+/// outside this file may hold that borrow — that a CPU's state is reachable
+/// only from that CPU is the property the whole core is built on.
+pub struct ParkedInfo {
+    pub id: TaskId,
+    pub class: toyos_sched::task::WaitClass,
+    pub deadline: Option<u64>,
+    /// When the park began.
+    pub since: u64,
+    pub rt: bool,
+}
+
+/// Walk this CPU's parked tasks. `false` means a pass owns the state right
+/// now, and a diagnostic does not wait for one.
+pub fn for_each_parked(mut f: impl FnMut(ParkedInfo)) -> bool {
     try_with_cpu(|cpu| {
-        for (key, deadline, class) in cpu.parked() {
-            f(key, deadline, class);
+        for parked in cpu.parked() {
+            f(ParkedInfo {
+                id: parked.ext().id,
+                class: parked.class(),
+                deadline: parked.deadline().map(|n| n.0),
+                since: parked.since().0,
+                rt: parked.is_rt(),
+            });
         }
-    });
+    })
+    .is_some()
 }
 
 /// Tail of the first switch into a fresh task, called by

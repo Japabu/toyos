@@ -26,16 +26,20 @@ pub const COMMON_DEVICE_FEATURE_SELECT: u64 = 0x00;
 pub const COMMON_DEVICE_FEATURE: u64 = 0x04;
 pub const COMMON_DRIVER_FEATURE_SELECT: u64 = 0x08;
 pub const COMMON_DRIVER_FEATURE: u64 = 0x0C;
-pub const COMMON_MSIX_CONFIG: u64 = 0x10;
+const COMMON_MSIX_CONFIG: u64 = 0x10;
 pub const COMMON_DEVICE_STATUS: u64 = 0x14;
-pub const COMMON_QUEUE_SELECT: u64 = 0x16;
+const COMMON_QUEUE_SELECT: u64 = 0x16;
 pub const COMMON_QUEUE_SIZE: u64 = 0x18;
-pub const COMMON_QUEUE_MSIX: u64 = 0x1A;
+const COMMON_QUEUE_MSIX: u64 = 0x1A;
 pub const COMMON_QUEUE_ENABLE: u64 = 0x1C;
 pub const COMMON_QUEUE_NOTIFY_OFF: u64 = 0x1E;
 pub const COMMON_QUEUE_DESC: u64 = 0x20;
 pub const COMMON_QUEUE_DRIVER: u64 = 0x28;
 pub const COMMON_QUEUE_DEVICE: u64 = 0x30;
+
+/// What a virtio device reads back where it was written a vector it could not
+/// allocate resources for (virtio 1.2 §4.1.5.1.2).
+const NO_VECTOR: u16 = 0xFFFF;
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -48,6 +52,9 @@ struct VirtqDesc {
     flags: u16,
     next: u16,
 }
+
+/// One descriptor, for a caller sizing a table it allocates itself.
+pub const DESC_BYTES: usize = core::mem::size_of::<VirtqDesc>();
 
 // Avail ring layout: flags(u16) + idx(u16) + ring[size](u16 each)
 const AVAIL_IDX_OFF: usize = 2;
@@ -83,7 +90,7 @@ impl VirtioPciConfig {
             if bar_idx < 6 && mapped_bars[bar_idx].is_none() {
                 let bar_addr = pci_dev.read_bar_64(bar_idx as u8);
                 if bar_addr != 0 {
-                    mapped_bars[bar_idx] = Some(crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x4000, CachePolicy::DeferToMtrr));
+                    mapped_bars[bar_idx] = Some(crate::mm::paging::map_mmio(bar_addr, 0x4000, CachePolicy::DeferToMtrr));
                 }
             }
         }
@@ -166,13 +173,6 @@ pub struct DescSlot(u16);
 
 impl DescSlot {
     pub fn id(&self) -> u16 { self.0 }
-
-    /// Re-mint a slot whose completion was observed out-of-band. The audio
-    /// ISR owns the txq used ring (`UsedRingConsumer`), so the syscall side
-    /// recycles descriptors from completion-record masks instead of
-    /// `poll_used` — this is the only path that bypasses the proof-token
-    /// flow, restricted to driver code.
-    pub(in crate::drivers) fn reclaim(id: u16) -> Self { Self(id) }
 }
 
 /// Interrupt-context consumer of a virtqueue's used ring, split off with
@@ -265,6 +265,47 @@ impl Virtqueue {
     pub fn avail_phys(&self) -> u64 { self.avail.phys() }
     pub fn used_phys(&self) -> u64 { self.used.phys() }
 
+    /// Where in the notification region this queue's doorbell sits, in bytes.
+    ///
+    /// Read from the device by `setup_queue`, so it is meaningless before that.
+    pub fn notify_bytes(&self, multiplier: u32) -> u64 {
+        self.notify_offset as u64 * multiplier as u64
+    }
+
+    /// Write one descriptor chain and publish nothing.
+    ///
+    /// The half of [`submit`](Self::submit) that names memory, separated so a
+    /// queue whose chains are fixed at bind can have them built once by the
+    /// kernel and published by somebody who never sees a descriptor
+    /// (`specs/hda-driver-plan.md` §4.1). Chains built this way are addressed by
+    /// index rather than by a [`DescSlot`], because the proof a slot carries —
+    /// that this descriptor is not in flight — is the publisher's to hold and
+    /// the publisher is not here.
+    pub fn write_chain(&self, first_desc: u16, bufs: &[(u64, u32, BufDir)]) {
+        assert!(
+            (first_desc as usize + bufs.len()) <= self.size as usize,
+            "virtqueue: chain at {first_desc} of {} descriptors runs past a queue of {}",
+            bufs.len(),
+            self.size
+        );
+        for (i, (addr, len, dir)) in bufs.iter().enumerate() {
+            let desc_idx = first_desc + i as u16;
+            let mut flags: u16 = match dir {
+                BufDir::Readable => 0,
+                BufDir::Writable => VIRTQ_DESC_F_WRITE,
+            };
+            if i != bufs.len() - 1 {
+                flags |= VIRTQ_DESC_F_NEXT;
+            }
+            let desc = VirtqDesc { addr: *addr, len: *len, flags, next: desc_idx + 1 };
+            let desc_ptr = self
+                .desc
+                .ptr_at(desc_idx as usize * core::mem::size_of::<VirtqDesc>())
+                as *mut VirtqDesc;
+            unsafe { write_volatile(desc_ptr, desc) };
+        }
+    }
+
     fn avail_idx_ptr(&self) -> *mut u16 {
         self.avail.ptr_at(AVAIL_IDX_OFF) as *mut u16
     }
@@ -286,18 +327,6 @@ impl Virtqueue {
     /// The caller manages these tokens — `submit()` consumes one, `poll_used()` returns one.
     pub fn initial_slots(&self) -> alloc::vec::Vec<DescSlot> {
         (0..self.size).map(DescSlot).collect()
-    }
-
-    /// Like `initial_slots`, but returns only slots spaced `stride` apart.
-    /// Use when each submission chains multiple consecutive descriptors.
-    /// Slots whose chain would wrap past the end of the descriptor table are
-    /// excluded — `submit` indexes descriptors mod `size`, so a wrapping
-    /// chain would alias slot 0's descriptors.
-    pub fn initial_slots_strided(&self, stride: u16) -> alloc::vec::Vec<DescSlot> {
-        (0..self.size).step_by(stride as usize)
-            .filter(|s| s + stride <= self.size)
-            .map(DescSlot)
-            .collect()
     }
 
     /// Submit a descriptor chain and notify the device (non-blocking).
@@ -389,6 +418,24 @@ impl Virtqueue {
     }
 }
 
+/// Which of a device's two interrupt sources it declined to bind. Not a
+/// driver bug and not a kernel bug: this device, on this machine, saying it
+/// has no resources to deliver with.
+#[derive(Debug, Clone, Copy)]
+pub enum NoVector {
+    Config,
+    Queue(u16),
+}
+
+impl core::fmt::Display for NoVector {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Config => write!(f, "its configuration-change interrupt"),
+            Self::Queue(queue) => write!(f, "queue {queue}'s interrupt"),
+        }
+    }
+}
+
 /// A fully initialized VirtIO device.
 pub struct VirtioDevice {
     config: VirtioPciConfig,
@@ -468,6 +515,28 @@ impl VirtioDevice {
         let common = self.config.common;
         common.write_u16(COMMON_QUEUE_SELECT, index);
         common.write_u16(COMMON_QUEUE_ENABLE, 1);
+    }
+
+    /// Point this device's configuration-change interrupt and `queue`'s
+    /// used-ring interrupt at `pci::MSIX_ENTRY` — the table entry
+    /// `PciDevice::enable_msix` armed.
+    ///
+    /// Deliberately not part of that call: the table is PCI's and this is
+    /// virtio's own protocol, and a device given the first without the second
+    /// leaves every queue silent. Both halves are needed and neither implies
+    /// the other, so a driver that wants interrupts makes both calls.
+    pub fn bind_msix(&self, queue: u16) -> Result<(), NoVector> {
+        let common = self.config.common;
+        common.write_u16(COMMON_MSIX_CONFIG, super::pci::MSIX_ENTRY);
+        if common.read_u16(COMMON_MSIX_CONFIG) == NO_VECTOR {
+            return Err(NoVector::Config);
+        }
+        common.write_u16(COMMON_QUEUE_SELECT, queue);
+        common.write_u16(COMMON_QUEUE_MSIX, super::pci::MSIX_ENTRY);
+        if common.read_u16(COMMON_QUEUE_MSIX) == NO_VECTOR {
+            return Err(NoVector::Queue(queue));
+        }
+        Ok(())
     }
 
     /// Set DRIVER_OK — device is now live.

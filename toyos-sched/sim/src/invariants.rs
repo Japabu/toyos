@@ -270,7 +270,7 @@ fn check_timers(vm: &mut Vm<'_>) {
     for cpu in 0..vm.scenario.cpus {
         let armed = vm.cpus[cpu].armed();
         let quantum = vm.cpus[cpu].running().map(|_| vm.cpus[cpu].quantum_end());
-        let deadline = vm.cpus[cpu].parked().filter_map(|(_, at, _)| at).min();
+        let deadline = vm.cpus[cpu].parked().filter_map(|p| p.deadline()).min();
         let earliest = match (quantum, deadline) {
             (Some(q), Some(d)) => Some(q.min(d)),
             (Some(q), None) => Some(q),
@@ -344,9 +344,9 @@ fn note_rt_service(vm: &mut Vm<'_>) -> bool {
                 occupied = true;
             }
         }
-        for (key, _, _) in sched.parked() {
-            if sched.parked_task(key).is_some_and(|t| t.rt().is_rt()) {
-                rt.push(key);
+        for parked in sched.parked() {
+            if parked.is_rt() {
+                rt.push(parked.key());
             }
         }
     }

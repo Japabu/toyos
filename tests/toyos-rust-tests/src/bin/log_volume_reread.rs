@@ -13,6 +13,11 @@
 //! nothing it does re-reads from the stick. The hazard in `write_page` is
 //! unchanged and reachable by anything that appends to an existing file, which
 //! is what this is.
+//!
+//! The *read* of the same page is the other half and is the sharper of the two:
+//! `file_cache::read_page` returned `()`, so a page the device would not give
+//! back reached the process as zeros under a success — which nothing above it
+//! can tell from a file that really is zeros there.
 
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
@@ -24,6 +29,18 @@ const PATH: &str = "/log/staged-reread.txt";
 const AT: u64 = 50;
 
 fn main() {
+    // First, and it costs the write below nothing: a fetch that failed is
+    // deliberately never made resident, so the write still misses and still
+    // re-fetches the same page.
+    match std::fs::read(PATH) {
+        Ok(bytes) => println!(
+            "reread: the read succeeded with {} bytes, {} of them zero",
+            bytes.len(),
+            bytes.iter().filter(|b| **b == 0).count()
+        ),
+        Err(e) => println!("reread: the read failed: {e}"),
+    }
+
     let mut file = match OpenOptions::new().write(true).open(PATH) {
         Ok(file) => file,
         Err(e) => {

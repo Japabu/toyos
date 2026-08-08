@@ -59,7 +59,231 @@ pub fn set_width(width: u32) {
 /// says a guest hung when it was only sharing a machine, which is the failure
 /// mode that put the whole shared block in the serial tail.
 pub fn budget(one_guest: Duration) -> Duration {
-    one_guest * WIDTH.load(Ordering::SeqCst)
+    let (num, den) = host_scale();
+    one_guest * WIDTH.load(Ordering::SeqCst) * num / den
+}
+
+/// The fastest boot-to-ready this run has seen, in milliseconds.
+///
+/// A boot is the one piece of guest work every test does and no test asserts on
+/// — `wait_for_ready`'s own comment names the two exceptions, and both read the
+/// guest's stamps rather than this clock — so it is a measurement of the host
+/// that costs nothing to take. The *fastest* rather than the mean because a boot
+/// taken with three other guests up measures the phase; the minimum over a run
+/// is the closest this can get to the machine with nothing else on it.
+static FASTEST_BOOT_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The same measurement on the host every ceiling in this tree was written for.
+///
+/// Dev host, M4 Pro, cross-arch TCG, measured 2026-08-08: the fastest of ten
+/// boots at `--jobs 1` was 1433 ms against a 1433–2063 ms spread, and the
+/// fastest of a whole 291-test suite at width 12 was this. The smaller of the
+/// two is the one to hold, because the factor only widens and a reference set
+/// too high is a correction that does not happen.
+const REFERENCE_BOOT_MS: u32 = 1320;
+
+fn record_boot(took: Duration) {
+    let ms = took.as_millis().min(u32::MAX as u128) as u32;
+    FASTEST_BOOT_MS.fetch_min(ms, Ordering::SeqCst);
+}
+
+/// How much slower than the host these ceilings were written on this one is, as
+/// a fraction so that a 1.4× host is not rounded to 1.
+///
+/// [`budget`] corrects a ceiling for how many guests share the machine. It never
+/// corrected for how fast the machine *is*, and that is the other half of the
+/// same mistake: a number reasoned about on an M4 Pro is not a liveness ceiling
+/// on a four-core Azure vCPU, it is a verdict about which of the two is running
+/// the test. `specs/ci-plan.md` §7.1 counted 307 bare timeouts in one CI run and
+/// every one of them was that.
+///
+/// **Only ever upward.** On a faster host the number in the source stands,
+/// because it is the number its author reasoned about, and a ceiling that shrank
+/// would start reporting wedges that are not there. The ceiling of 8 is because
+/// one anomalous boot must not be able to disable every liveness guard in the
+/// suite at once.
+fn host_scale() -> (u32, u32) {
+    let fastest = FASTEST_BOOT_MS.load(Ordering::SeqCst);
+    // Before the first boot there is no measurement, and the sentinel must not
+    // read as the slowest host imaginable.
+    if fastest == u32::MAX || fastest <= REFERENCE_BOOT_MS {
+        return (1, 1);
+    }
+    (fastest.min(REFERENCE_BOOT_MS * 8), REFERENCE_BOOT_MS)
+}
+
+/// The fastest boot seen, the reference, and the scale it produced — for a run's
+/// own report, because the number in the source is no longer the number that was
+/// enforced.
+pub fn host_speed() -> (Option<u32>, u32, u32, u32) {
+    let (num, den) = host_scale();
+    let fastest = FASTEST_BOOT_MS.load(Ordering::SeqCst);
+    ((fastest != u32::MAX).then_some(fastest), REFERENCE_BOOT_MS, num, den)
+}
+
+/// A liveness guard that watches the guest instead of the host's clock.
+///
+/// [`budget`] corrects a ceiling for how many guests share the machine, which
+/// is the part of "how fast is the host today" the harness knows. It does not
+/// know the rest, and a retry loop bounded by elapsed time has that ceiling for
+/// a *verdict* the moment the rest moves: a guest that is merely late reports
+/// exactly what a wedged one reports. `specs/issues/design-debt/` is the bill —
+/// `desktop_audio_client` 385 s wide against 13 s alone, a landing gate that is
+/// a coin toss, and six reds in four suites every one of which was
+/// `ALONE: GREEN`.
+///
+/// The two are distinguishable and the console is what distinguishes them: a
+/// guest still printing is a guest still working. So the ceiling here is time in
+/// which **nothing arrived**, and a guest that keeps talking is given as long as
+/// it needs. That is the whole idea — no number in this type is a statement
+/// about the host.
+///
+/// `total` is the second half, and it is a wedge guard rather than a verdict
+/// too. A guest can be stuck and chatty: the compositor prints an interval line
+/// every two seconds whatever else has stopped, so silence alone cannot end a
+/// desktop loop and a suite that never ends is worse than one that reds.
+///
+/// The caller owns the capture, so progress is "did it grow" and costs nothing.
+pub struct Liveness {
+    quiet_for: Duration,
+    last_growth: Instant,
+    seen: usize,
+    give_up: Instant,
+}
+
+impl Liveness {
+    /// `quiet_for` of silence ends the wait, and so does `total` however loud
+    /// the guest is.
+    pub fn new(quiet_for: Duration, total: Duration) -> Self {
+        let now = Instant::now();
+        Self { quiet_for, last_growth: now, seen: 0, give_up: now + total }
+    }
+
+    /// Whether the guest may still be working, given everything it has said.
+    pub fn working(&mut self, capture: &str) -> bool {
+        if capture.len() != self.seen {
+            self.seen = capture.len();
+            self.last_growth = Instant::now();
+        }
+        let now = Instant::now();
+        now < self.give_up && now.duration_since(self.last_growth) < self.quiet_for
+    }
+
+    /// What ended the wait, for a caller putting it in a failure message.
+    pub fn why(&self) -> &'static str {
+        if Instant::now() >= self.give_up {
+            "it never stopped talking and never got there"
+        } else {
+            "it went quiet"
+        }
+    }
+}
+
+/// How the reason line begins when what expired was a **guard** and not an
+/// assertion.
+///
+/// A test that ran out of time has not found the guest doing the wrong thing;
+/// it has found nothing at all, and the two readings send an agent to opposite
+/// places. `screen_pager_keys` reporting `0 page moves over 30 keystrokes`
+/// after 0.3 s was bisected as a kernel regression twice in one day by two
+/// agents, and the fact it was hiding is that the whole run had collapsed
+/// before the guest could answer once.
+///
+/// Still red. A guest that stopped answering may have stopped for a reason this
+/// tree owns, and a status that is not a failure is a status nobody reads. What
+/// this buys is that the summary says which of the two kinds of red it is.
+///
+/// It lives here rather than beside the classifier because [`Liveness`] is what
+/// produces the evidence for it, and [`QemuInstance::run_test_paced`] is a
+/// second producer: a test's own ceiling is a guard of exactly this kind.
+pub const STALLED: &str = "STALLED:";
+
+/// How long a guest may say nothing before a wait on it is a stall.
+///
+/// Every config these waits run on has something on a periodic interval — the
+/// compositor's frame batch and soundd's stats window are both about 2 s — so
+/// silence here is a machine that has stopped rather than a machine that is
+/// thinking. It is not a verdict about any of them: no assertion in this suite
+/// is satisfied by the guest merely talking.
+pub const GUEST_QUIET: Duration = Duration::from_secs(15);
+
+/// The other end of the same guard: a guest can be stuck and chatty.
+///
+/// The compositor prints its interval line whatever else has stopped, so
+/// silence alone cannot end a desktop wait, and a suite that never ends is
+/// worse than one that reds.
+///
+/// **Not [`budget`]-scaled, and that is the point of the pair.** Width is what a
+/// ceiling on a *slow* guest has to be corrected for, and the silence bound
+/// above is what a slow guest is now judged by — it keeps talking, so it is
+/// never judged by this at all. What is left for this number to catch is a guest
+/// that is stuck *and* chatty, which is a state the width does not produce;
+/// scaling it would only make that state cost an hour at width 12. The longest
+/// guest action any caller waits on is eight seconds of audio.
+pub const GUEST_WEDGED: Duration = Duration::from_secs(300);
+
+pub fn guest_liveness() -> Liveness {
+    Liveness::new(GUEST_QUIET, GUEST_WEDGED)
+}
+
+/// Collect console output until `done` reads true of the whole capture, or the
+/// guest stops making progress.
+///
+/// The shape [`QemuInstance::drain_serial`] cannot have: its caller passes a
+/// number of seconds, and a number of seconds is a claim about the host. Here
+/// the wait ends when the guest goes quiet or wedges, so a guest with a twelfth
+/// of the machine costs the run wall clock and never a verdict — and when it
+/// does end early the message says so in the words the classifier reads
+/// ([`STALLED`]).
+///
+/// `doing` is what the guest was asked to do, in the caller's own words. The
+/// caller keeps its assertion; what this owns is the difference between "it did
+/// the wrong thing" and "it never got there".
+///
+/// It lives beside [`Liveness`] rather than in the test list because a test in
+/// `tests/common/` could not reach it there, and the two that could not —
+/// `metal_sim_null_audio` and `hda_two_live_refused` — each reached for a span
+/// of host wall clock instead and lost the race on a runner.
+pub fn await_guest(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    doing: &str,
+    done: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let mut live = guest_liveness();
+    while !done(log) && live.working(log) {
+        let more = qemu.drain_serial(Duration::from_millis(200));
+        log.push_str(&more);
+    }
+    if done(log) {
+        return Ok(());
+    }
+    Err(format!("{STALLED} waiting for {doing} — {}", live.why()))
+}
+
+/// [`await_guest`] for the common case: one marker anywhere in the capture.
+pub fn await_marker(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    marker: &str,
+    doing: &str,
+) -> Result<(), String> {
+    await_marker_new(qemu, log, marker, 0, doing)
+}
+
+/// [`await_marker`] over what arrives after `from`.
+///
+/// For a marker a test asks for more than once: a whole-capture scan answers
+/// the second ask with the first ask's line and carries on against a guest that
+/// has not done the thing yet.
+pub fn await_marker_new(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    marker: &str,
+    from: usize,
+    doing: &str,
+) -> Result<(), String> {
+    await_guest(qemu, log, doing, |log| log[from.min(log.len())..].contains(marker))
 }
 
 /// The hardware shape QEMU presents to the guest.
@@ -73,6 +297,15 @@ pub fn budget(one_guest: Duration) -> Duration {
 #[derive(Clone, Copy, PartialEq)]
 pub enum Profile {
     Headless,
+    /// [`Profile::Headless`] with the NIC's MSI-X capability taken away.
+    ///
+    /// The one configuration in this suite where a device the kernel has
+    /// already reset and negotiated features with turns out to have no way of
+    /// raising an interrupt. Every virtio function QEMU builds and every one
+    /// that ships has the capability, so nothing else could ask what the
+    /// driver does without it — and what it used to do was panic the kernel,
+    /// on a machine whose other devices were all fine.
+    VirtioNetNoMsix,
     Gop,
     /// M1 metal-sim: GOP, NVMe, xHCI with the boot stick on it, i8042 from
     /// q35, and nothing else -- no virtio device and no USB HID. This is the
@@ -307,6 +540,23 @@ pub enum Profile {
     /// address is the only way to state "these two are functions of one
     /// device" — which is the whole of the first bullet.
     MetalHda,
+    /// [`Profile::Headless`] with its virtio sound card replaced by an Intel
+    /// HDA controller and one codec — the machine soundd drives itself.
+    ///
+    /// Everything else is held still on purpose. The console is still
+    /// virtio-serial, the NIC is still there, the disks are the same: what
+    /// differs from the machine gate A's four recorded configs run on is the
+    /// sound card, so a difference in the capture is a difference in the audio
+    /// path. It is not the T14's shape and does not try to be —
+    /// [`Profile::MetalHda`] is the shape arm and this is the audio one.
+    Hda,
+    /// [`Profile::Hda`] with a second controller that also has a codec.
+    ///
+    /// Two live links, which the kernel refuses by name rather than binding
+    /// the first: choosing between them means walking their codec graphs, and
+    /// that is the driver's work. The negative control on the whole bind path
+    /// — a first-match kernel would go green on every other HDA test.
+    HdaTwoLive,
 }
 
 /// The vIOMMU a profile puts on the machine.
@@ -387,6 +637,63 @@ const HDA_THREE: &[&str] = &[
     "hda-output,bus=hda2.0,cad=0,audiodev=hdaaud",
 ];
 
+/// One controller with one codec: the ordinary machine, and the one an audio
+/// arm needs. `hda-output` because it is a playback-only codec — the driver
+/// configures no input path and a duplex codec would only add widgets nothing
+/// walks.
+const HDA_ONE: &[&str] = &["intel-hda,id=hda0", "hda-output,bus=hda0.0,cad=0,audiodev=hdaaud"];
+
+/// Two controllers, each with a codec that answers.
+///
+/// The state the kernel refuses: it can tell which links are alive and cannot
+/// tell which one a human is wired to, so binding either would be a guess.
+const HDA_TWO_LIVE: &[&str] = &[
+    "intel-hda,id=hda0",
+    "hda-output,bus=hda0.0,cad=0,audiodev=hdaaud",
+    "intel-hda,id=hda1",
+    "hda-output,bus=hda1.0,cad=0,audiodev=hdaaud",
+];
+
+/// Whether a machine has the virtio block, and whether its NIC can raise an
+/// interrupt.
+///
+/// Two shape dimensions and not one, because a device that publishes no MSI-X
+/// capability is a device, not an absence: the driver reaches it, resets it,
+/// negotiates features with it and only then finds it has no way to be told a
+/// packet arrived. `vectors=0` is the actuator — QEMU builds a virtio-pci
+/// function's MSI-X table only for a non-zero vector count — and it is the
+/// only one, since every emulated and every real virtio function has the
+/// capability.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Virtio {
+    Absent,
+    Present,
+    /// The whole block, with the NIC's MSI-X capability removed and
+    /// virtio-sound's and virtio-serial's left alone — so the console still
+    /// carries the refusal and audio still works while networking does not.
+    NicWithoutMsix,
+    /// The whole block **without virtio-sound**, so the machine's only audio
+    /// device is the one in `hda`.
+    ///
+    /// Not a lesser [`Virtio::Present`]: soundd claims a kernel-driven card
+    /// before it looks for a controller to drive itself, so a machine carrying
+    /// both would exercise the virtio path and nothing else. This is what makes
+    /// an HDA arm of gate A a *different machine* rather than a different flag,
+    /// and it keeps the console, the NIC and the timing of the recorded audio
+    /// configs so the two arms differ in the sound card and not in the machine.
+    WithoutSound,
+}
+
+impl Virtio {
+    fn present(self) -> bool {
+        self != Self::Absent
+    }
+
+    fn sound(self) -> bool {
+        matches!(self, Self::Present | Self::NicWithoutMsix)
+    }
+}
+
 /// Everything a profile decides about the machine, in one table. A new
 /// variant answers every question here or does not compile — which `self !=
 /// Profile::Metal` did the opposite of: it handed anything that was not
@@ -403,7 +710,7 @@ struct Shape {
     /// were all blind to the remainder until one profile had one.
     vgamem_mb: Option<u32>,
     /// virtio-net, virtio-sound, and the console on virtio-serial.
-    virtio: bool,
+    virtio: Virtio,
     /// The `-device` argument for each xHCI controller, port and slot counts
     /// included. A list because a machine can have more than one and the T14
     /// does — its keyboard is on the second.
@@ -504,6 +811,14 @@ pub fn usb_device_id(i: usize) -> String {
     format!("usbdev{i}")
 }
 
+/// The boot stick's device id.
+///
+/// The data disks have carried one since a test first had to unplug one; the
+/// stick the machine booted from had none, so the one device whose removal
+/// takes `/boot` and `/log` with it was the one the host could not name — which
+/// is the removal the owner's machine dies on.
+pub const BOOT_STICK_ID: &str = "bootstick";
+
 /// What every profile but [`Profile::MetalDisk`] gives the guest. Large
 /// enough for a filesystem, small enough that a boot formats it quickly.
 const NVME_SMALL: u64 = 128 * 1024 * 1024;
@@ -540,7 +855,20 @@ impl Profile {
             Self::Headless => Shape {
                 vga: "none",
                 vgamem_mb: None,
-                virtio: true,
+                virtio: Virtio::Present,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &["usb-kbd,bus=xhci.0"],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disks: &[],
+                hda: &[],
+                iommu: Some(IOMMU_DEFAULT),
+            },
+            Self::VirtioNetNoMsix => Shape {
+                vga: "none",
+                vgamem_mb: None,
+                virtio: Virtio::NicWithoutMsix,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &["usb-kbd,bus=xhci.0"],
@@ -553,7 +881,7 @@ impl Profile {
             Self::Gop => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: true,
+                virtio: Virtio::Present,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &["usb-kbd,bus=xhci.0"],
@@ -566,7 +894,7 @@ impl Profile {
             Self::Diskless => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -588,7 +916,7 @@ impl Profile {
                 // which is the geometry the machine actually has and the one
                 // the 2048x2048 default could not express.
                 vgamem_mb: Some(8),
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -605,7 +933,7 @@ impl Profile {
             Self::MetalUsb => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_WIDE],
                 storage_bus: "xhci.0",
                 usb: &[
@@ -624,7 +952,7 @@ impl Profile {
             Self::MetalDisk => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -637,7 +965,7 @@ impl Profile {
             Self::NvmeWideSector => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -650,7 +978,7 @@ impl Profile {
             Self::UsbDisk => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -663,7 +991,7 @@ impl Profile {
             Self::UsbDisk4k => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -676,7 +1004,7 @@ impl Profile {
             Self::UsbDiskHuge => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -689,7 +1017,7 @@ impl Profile {
             Self::UsbDiskRefusedFirst => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -702,7 +1030,7 @@ impl Profile {
             Self::UsbDiskReadOnly => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -715,7 +1043,7 @@ impl Profile {
             Self::UsbDiskCrowd => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -734,7 +1062,7 @@ impl Profile {
             Self::MetalFullSpeed => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &["usb-wacom-tablet,bus=xhci.0", "usb-ccid,bus=xhci.0"],
@@ -747,7 +1075,7 @@ impl Profile {
             Self::MetalXhciSecond => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT, XHCI_SECOND],
                 storage_bus: "xhci1.0",
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
@@ -766,7 +1094,7 @@ impl Profile {
             Self::MetalXhciBoth => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT, XHCI_SECOND],
                 storage_bus: "xhci.0",
                 usb: &[
@@ -794,7 +1122,7 @@ impl Profile {
             Self::MetalXhciMsi => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_NO_IRQ_FIRST, XHCI_MSI_ONLY],
                 storage_bus: "xhci.0",
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
@@ -810,7 +1138,7 @@ impl Profile {
             Self::MetalXhciNoIrq => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT, XHCI_NO_IRQ_SECOND],
                 storage_bus: "xhci.0",
                 usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
@@ -823,7 +1151,7 @@ impl Profile {
             Self::MetalHotplug => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT, XHCI_SECOND],
                 storage_bus: "xhci.0",
                 usb: &["usb-tablet,bus=xhci.0"],
@@ -839,7 +1167,7 @@ impl Profile {
             Self::NoIommu => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -852,7 +1180,7 @@ impl Profile {
             Self::IommuNarrow => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -865,7 +1193,7 @@ impl Profile {
             Self::IommuNoIntremap => Shape {
                 vga: "std",
                 vgamem_mb: None,
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -878,7 +1206,7 @@ impl Profile {
             Self::MetalHda => Shape {
                 vga: "std",
                 vgamem_mb: Some(8),
-                virtio: false,
+                virtio: Virtio::Absent,
                 xhci: &[XHCI_DEFAULT],
                 storage_bus: "xhci.0",
                 usb: &[],
@@ -887,6 +1215,16 @@ impl Profile {
                 usb_disks: &[],
                 hda: HDA_THREE,
                 iommu: Some(IOMMU_DEFAULT),
+            },
+            Self::Hda => Shape {
+                virtio: Virtio::WithoutSound,
+                hda: HDA_ONE,
+                ..Self::Headless.shape()
+            },
+            Self::HdaTwoLive => Shape {
+                virtio: Virtio::WithoutSound,
+                hda: HDA_TWO_LIVE,
+                ..Self::Headless.shape()
             },
         }
     }
@@ -971,6 +1309,12 @@ pub struct BootOptions {
 }
 
 /// The in-guest test runner's startup marker.
+///
+/// It is that runner's own first line and nothing else's. Init spawns its
+/// programs without waiting, so this marker orders nothing about any other
+/// program's startup — a test asking about a daemon's line waits on the guest
+/// for that line ([`await_guest`]), never on a span of host wall clock after
+/// this one.
 pub const DEFAULT_READY: &str = "===READY===";
 
 impl Default for BootOptions {
@@ -1000,6 +1344,22 @@ pub struct TestResult {
     pub stdout: String,
     pub serial: String,
     pub error: Option<String>,
+    /// Whether the guest ever announced *this* test.
+    ///
+    /// The in-guest runner reads one command, prints `===TEST_START <name>` and
+    /// spawns; so a test that never started is a guest that never got as far as
+    /// reading its command, which is a different thing from a test that ran and
+    /// hung. On a shared boot the two want different answers — the first is
+    /// about the boot, the second about the test.
+    pub started: bool,
+}
+
+impl TestResult {
+    /// The guest is not answering any more: this test's turn came, its whole
+    /// ceiling passed, and it was never even announced.
+    pub fn boot_stopped_answering(&self) -> bool {
+        !self.started && self.error.is_some()
+    }
 }
 
 pub struct QemuInstance {
@@ -1065,8 +1425,8 @@ pub fn build_boot_image(
 /// Actuators that are a `SYS_DEBUG` action arm and nothing else.
 ///
 /// A boot cannot reach any of them; only a test that asks for one by number
-/// can. So the four kernels that differ only in which of them they carry are
-/// four builds of the same machine, and [`fold_inert`] makes them one.
+/// can. So the kernels that differ only in which of them they carry are
+/// several builds of the same machine, and [`fold_inert`] makes them one.
 ///
 /// **Membership is a claim about the kernel, not about the test that uses it**,
 /// and the claim is checkable: each name below has its `#[cfg]` sites in
@@ -1074,11 +1434,20 @@ pub fn build_boot_image(
 /// A feature that changes what `init` does, what a driver reads, or what a
 /// ceiling is worth belongs in its own build and is not eligible.
 /// `specs/test-cost-audit.md` §5.4.3 classifies every one of them.
+///
+/// `test-tlb-ack-delay` is the one member whose code is not confined to the
+/// match arm: `arch::tlb::serve_ipi` loads one relaxed word per flush. Nothing
+/// writes that word except the arm, and its own gate re-measures with the delay
+/// disarmed, so a kernel carrying the feature and never asked flushes exactly as
+/// one without it. Stated rather than assumed, because the claim above is what
+/// makes folding sound.
 const INERT_ACTUATORS: &[&str] = &[
     "test-fatal-halt",
     "test-screen-graffiti",
     "test-double-fault",
     "test-heap-ceiling",
+    "test-kernel-canary",
+    "test-tlb-ack-delay",
 ];
 
 /// The feature set to build, with every inert actuator replaced by the union of
@@ -1484,29 +1853,76 @@ impl QemuInstance {
         let mut fire =
             |line: &str, socket: Option<&PathBuf>| step(socket.map(PathBuf::as_path), line);
 
+        // `run <name> [args...]`, and the markers carry only the binary name.
+        let want = name.split_whitespace().next().unwrap_or(name);
+
         let timeout = budget(timeout);
         let start = Instant::now();
         let mut stdout = String::new();
         let mut serial = String::new();
         let mut in_test = false;
+        // **Which of the two things the ceiling caught.** A test's `timeout` is
+        // a liveness guard and never a verdict, and until now its expiry said
+        // only how many seconds had passed — `metal_sim_client_death` 364 s,
+        // `metal_sim_window_drag` 355 s, `desktop_audio_client` 354 s and
+        // `blocked_dump` 329 s in run `31250706113`, four reds indistinguishable
+        // from four slow tests. The console tells them apart for free, and the
+        // fix `1cf7fee` made to the waits *inside* a test never reached this
+        // one: a guest that has said nothing for [`GUEST_QUIET`] has stopped,
+        // and one still talking at the ceiling has not.
+        let mut last_line = Instant::now();
+        let mut lines = 0usize;
 
         loop {
             if start.elapsed() > timeout {
+                let quiet = last_line.elapsed();
+                let secs = timeout.as_secs();
+                let error = if quiet >= GUEST_QUIET {
+                    format!(
+                        "{STALLED} {secs}s of guard expired, and the guest had said nothing for \
+                         the last {:.0?} of it — the ceiling caught a machine that had stopped, \
+                         which is not an answer to what this test asked",
+                        quiet
+                    )
+                } else {
+                    format!(
+                        "timed out after {secs}s, with the guest still talking {:.0?} ago \
+                         ({lines} console line(s) while it ran) — it was working and did not \
+                         finish",
+                        quiet
+                    )
+                };
                 return TestResult {
                     name: name.to_string(),
                     exit_code: None,
                     stdout,
                     serial,
-                    error: Some(format!("timed out after {}s", timeout.as_secs())),
+                    error: Some(error),
+                    started: in_test,
                 };
             }
 
             match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(line) => {
+                    last_line = Instant::now();
+                    lines += 1;
                     fire(&line, self.qmp_socket.as_ref());
-                    if line.contains("===TEST_START ") {
+                    if line.contains(&format!("===TEST_START {want}===")) {
                         in_test = true;
                     } else if let Some(at) = line.find(END_MARKER) {
+                        let rest = &line[at + END_MARKER.len()..];
+                        let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
+                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                        // **A marker naming another test is the previous one's**,
+                        // and taking it was `specs/issues/build/`'s cascade:
+                        // one timed-out test left the guest still producing its
+                        // output, every later member of the block read a window
+                        // that opened on it, and 110 of 238 went red on an
+                        // "actual" that was verbatim the previous expectation.
+                        // The name has been on the wire the whole time.
+                        if parts[0] != want {
+                            continue;
+                        }
                         // Everything before the marker is a line some other
                         // console writer was in the middle of when the runner
                         // printed; it is still real output and the audio gate
@@ -1515,9 +1931,6 @@ impl QemuInstance {
                             serial.push_str(&line[..at]);
                             serial.push('\n');
                         }
-                        let rest = &line[at + END_MARKER.len()..];
-                        let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
-                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         let (exit_code, error) = if parts.len() > 1 {
                             if let Some(code_str) = parts[1].strip_prefix("exit=") {
                                 (code_str.parse::<i32>().ok(), None)
@@ -1535,6 +1948,7 @@ impl QemuInstance {
                             stdout,
                             serial,
                             error,
+                            started: in_test,
                         };
                     } else if line.contains("KERNEL PANIC") {
                         return TestResult {
@@ -1543,6 +1957,7 @@ impl QemuInstance {
                             stdout,
                             serial,
                             error: Some(format!("kernel panic: {line}")),
+                            started: in_test,
                         };
                     } else if in_test {
                         serial.push_str(&line);
@@ -1567,6 +1982,7 @@ impl QemuInstance {
                         stdout,
                         serial,
                         error: Some("QEMU disconnected".to_string()),
+                        started: in_test,
                     };
                 }
             }
@@ -1581,7 +1997,20 @@ impl Drop for QemuInstance {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.audio_wav);
-        let _ = fs::remove_file(&self.uart_log);
+        // **The 16550's log outlives the guest, because it is the one channel
+        // that exists before the console does.** Firmware, the bootloader and
+        // the kernel up to the backend switch write here and nowhere else, so a
+        // boot that dies before virtio-console comes up leaves this file and an
+        // empty capture — which is exactly the shape `specs/issues/diagnostics/`
+        // records as looking like a kernel that never started. 1.4 KB on a
+        // healthy `tests/testcases` boot, measured, against the hundreds of
+        // megabytes of per-boot image beside it.
+        //
+        // Deleting it here is also why `ci.yml`'s "what a red run left" step had
+        // never uploaded one byte: run `31252989653` reds four shards and
+        // publishes twelve duration files and no scratch artifact at all, which
+        // reads as "there was nothing to keep" rather than "it was deleted
+        // before the step ran".
         let _ = fs::remove_file(&self.screendump);
         if let Some(socket) = &self.qmp_socket {
             let _ = fs::remove_file(socket);
@@ -1670,6 +2099,62 @@ impl Qmp {
         self.stream.write_all(command.as_bytes()).unwrap();
         self.stream.write_all(b"\n").unwrap();
         self.await_reply("\"return\"");
+    }
+
+    /// `execute`, keeping what the command answered with. Only the human
+    /// monitor answers with anything; every other command here returns `{}`.
+    fn execute_capturing(&mut self, command: &str) -> String {
+        use std::io::Read;
+        self.stream.write_all(command.as_bytes()).unwrap();
+        self.stream.write_all(b"\n").unwrap();
+        self.await_reply("\"return\"");
+        let rest = loop {
+            if let Some(at) = self.pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=at).collect();
+                break String::from_utf8_lossy(&line).into_owned();
+            }
+            let mut buf = [0u8; 4096];
+            let n = self.stream.read(&mut buf).expect("qmp: read failed");
+            assert!(n > 0, "qmp: socket closed mid-reply");
+            self.pending.extend_from_slice(&buf[..n]);
+        };
+        let Some(body) = rest.split_once('"').map(|(_, tail)| tail) else {
+            return String::new();
+        };
+        let body = body.rsplit_once('"').map_or(body, |(head, _)| head);
+        let mut out = String::with_capacity(body.len());
+        let mut chars = body.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                out.push(ch);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => {}
+                Some(escaped) => out.push(escaped),
+                None => break,
+            }
+        }
+        out
+    }
+}
+
+/// An open QMP connection to QEMU's human monitor, for the questions QMP has
+/// no command of its own for.
+pub struct QmpMonitor(Qmp);
+
+impl QmpMonitor {
+    pub fn open(socket: &Path) -> Self {
+        Self(Qmp::connect(socket))
+    }
+
+    /// Run `command` in the human monitor and return what it printed.
+    pub fn human(&mut self, command: &str) -> String {
+        self.0.execute_capturing(&format!(
+            "{{\"execute\":\"human-monitor-command\",\"arguments\":\
+             {{\"command-line\":\"{command}\"}}}}"
+        ))
     }
 }
 
@@ -1782,6 +2267,7 @@ fn qcode(ch: char) -> (&'static str, bool) {
         '_' => ("minus", true),
         '.' => ("dot", false),
         '/' => ("slash", false),
+        '&' => ("7", true),
         _ => panic!("no qcode for {ch:?}; add it rather than typing something else"),
     }
 }
@@ -1857,7 +2343,7 @@ fn qemu_command(
 ) -> Command {
     let shape = options.profile.shape();
     assert!(
-        !options.mute || !shape.virtio,
+        !options.mute || !shape.virtio.present(),
         "mute removes the only console a virtio profile has"
     );
 
@@ -1866,7 +2352,7 @@ fn qemu_command(
 
     let mut qemu = Command::new("qemu-system-x86_64");
 
-    let kvm = cfg!(target_arch = "x86_64") && Path::new("/dev/kvm").exists();
+    let kvm = toyos_build::kvm_usable();
     if kvm {
         qemu.arg("-accel").arg("kvm");
     }
@@ -1899,7 +2385,7 @@ fn qemu_command(
     qemu.arg("-machine")
         .arg(&machine)
         .arg("-cpu")
-        .arg(if kvm { "host,+rdrand,+smap,+fsgsbase,+x2apic" } else { "qemu64,+rdrand,+smap,+fsgsbase,+x2apic" })
+        .arg(if kvm { "host,+rdrand,+smap,+fsgsbase,+x2apic,+smep" } else { "qemu64,+rdrand,+smap,+fsgsbase,+x2apic,+smep" })
         .arg("-smp")
         .arg(options.smp.to_string())
         .arg("-m")
@@ -1975,7 +2461,7 @@ fn qemu_command(
 
     qemu.arg("-device")
         .arg(format!(
-            "usb-storage,bus={},drive=stick,bootindex=0",
+            "usb-storage,bus={},drive=stick,id={BOOT_STICK_ID},bootindex=0",
             shape.storage_bus
         ))
         .arg("-vga")
@@ -2023,31 +2509,52 @@ fn qemu_command(
     }
 
     if !shape.hda.is_empty() {
-        // The codecs open a backend even though nothing plays, and `none` is
-        // the one that needs no file and no host device. H0 moves no sample:
-        // gate A's wav capture arrives with H4, the arm that has something to
-        // record.
-        qemu.arg("-audiodev").arg("none,id=hdaaud");
+        // The same wav backend virtio-sound gets, so gate A's ground truth —
+        // what the *device* received — transfers with no new instrument. A boot
+        // that plays nothing leaves an empty file and costs nothing.
+        //
+        // **`timer-period` is 1000 µs here and 5000 for virtio-sound, and that
+        // is an instrument repair rather than a difference in the audio path.**
+        // At 5000 the capture of a 3 s 440 Hz tone comes back with eight phase
+        // discontinuities, at frames 2703-2705, 2821-2823 and 2939-2940 —
+        // *identical positions across six runs whose audio content differed*,
+        // which is a capture that drops samples on a fixed cadence and not a
+        // guest that plays them wrong. QEMU's `hda-codec` holds its own output
+        // ring and discards what overruns it, and shortening the host's drain
+        // interval is what stops the overrun. Measured on this host, QEMU
+        // 11.0.3: 8 breaks at 5000, 0 at 1000, with the guest's own counters
+        // (1127 periods submitted, no underruns, no drains) identical either
+        // way and identical to the virtio arm's.
+        qemu.arg("-audiodev").arg(format!(
+            "wav,id=hdaaud,path={},timer-period=1000",
+            audio_wav.display()
+        ));
         for dev in shape.hda {
             qemu.arg("-device").arg(*dev);
         }
     }
 
-    if shape.virtio {
+    if shape.virtio.present() {
         qemu.arg("-netdev")
             .arg("user,id=net0")
             .arg("-device")
-            .arg("virtio-net-pci-non-transitional,netdev=net0")
+            .arg(match shape.virtio {
+                Virtio::NicWithoutMsix => "virtio-net-pci-non-transitional,netdev=net0,vectors=0",
+                _ => "virtio-net-pci-non-transitional,netdev=net0",
+            });
+        if shape.virtio.sound() {
             // virtio-sound records everything the guest plays into a per-boot
             // wav for glitch analysis; timer-period matches the interactive
             // config in src/qemu.rs so test timing represents what users hear.
-            .arg("-audiodev")
-            .arg(format!(
-                "wav,id=audio0,path={},timer-period=5000",
-                audio_wav.display()
-            ))
-            .arg("-device")
-            .arg("virtio-sound-pci,audiodev=audio0,streams=1")
+            qemu.arg("-audiodev")
+                .arg(format!(
+                    "wav,id=audio0,path={},timer-period=5000",
+                    audio_wav.display()
+                ))
+                .arg("-device")
+                .arg("virtio-sound-pci,audiodev=audio0,streams=1");
+        }
+        qemu
             // virtio-console on stdio is the primary I/O channel; UART goes to
             // a temp file so early-boot logs and panic fallback still land
             // somewhere when the kernel switches backends.
@@ -2194,7 +2701,14 @@ fn wait_for_ready(
     // on how long a boot took by *this* clock: `i8042_absent` and
     // `xhci_slow_connect` do assert on boot timing and read the guest's own
     // stamps, and both are in the serial tail.
-    let boot_timeout = Duration::from_secs(10) * WIDTH.load(Ordering::SeqCst).max(2);
+    //
+    // Scaled by the host too, and the first boot of a run is the one that
+    // cannot be: nothing has been measured yet, so it gets the flat number and
+    // every boot after it gets the corrected one. Two boot timeouts in CI run
+    // `31233476555` were this — `console: ready` and `compositor: ready`, on a
+    // runner where the same boots take twice what they take here.
+    let (num, den) = host_scale();
+    let boot_timeout = Duration::from_secs(10) * WIDTH.load(Ordering::SeqCst).max(2) * num / den;
     let start = Instant::now();
     let mut seen = String::new();
     loop {
@@ -2253,5 +2767,6 @@ fn wait_for_ready(
             }
         }
     }
+    record_boot(start.elapsed());
     seen
 }

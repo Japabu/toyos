@@ -158,6 +158,10 @@ pub fn post(source: Source) {
 }
 ```
 
+**A tripwire for a failure that presents as a hang must be read before the call
+that can hang**, or the one state it exists to report is the state it never
+reaches.
+
 There is no `post_inline()`, no `post_irq()`, and no second path. RT attribution and
 timestamping are derived from percpu state that is correct in every context, so there is no
 wrong-context misuse to guard against — which is why no `IrqCtx`-style capability token
@@ -252,7 +256,7 @@ source B. `arm()` replaces A (deregistering its fan-out entry, clearing any stal
 
 ### 5.2 Ring arena — 32KB per ring
 
-`io_uring` stops abusing `shared_memory` (removes the known-issues entry and the last
+`io_uring` stops abusing `shared_memory` (removes the `specs/issues/` entry and the last
 caller of `shared_memory::destroy()`). One `RingArena` per process, created on first
 user-ring creation, stored in `ProcessData`:
 
@@ -394,9 +398,9 @@ Already dead: `EventSource`, `scheduler::block`, `wake_by_event`, `event_ready()
 (dead ABI) deleted.
 
 Deadlines: `Deadline::FOREVER` (`u64::MAX`) inserts no entry in the deadline structure;
-finite deadlines insert `(t, id)`. The per-CPU deadline heap already keeps a parked
-deadline covered by its home CPU's LAPIC one-shot (`TimerPlan` → `Hw::set_timer`), so the
-block-handoff timer hole stays closed.
+finite deadlines insert `(t, id)`. A parked deadline is already covered by its home CPU's
+LAPIC one-shot — it lives in the `ParkedEntry` that `TimerPlan` → `Hw::set_timer` arms from,
+and in nothing else (scheduler-core §8.3) — so the block-handoff timer hole stays closed.
 
 ### 6.3 Kill/retire protocol (deletes the directed-wake class)
 

@@ -5,6 +5,11 @@
 # Every config must appear here. A missing section is a hard error, not a
 # pass: an ungated config would go green by omission.
 #
+# What no config here covers: `/bin/tone` and tests/toyos-rust-tests/src/tone.rs
+# are two implementations of the same generator and gate A captures only the
+# second, so nothing in the suite ever hears the tone the owner judges the
+# machine by.
+#
 # Two independent instruments per config. What each one is allowed to decide
 # differs by tier, and TWO TIERS below is where that is settled: only silence
 # that reached the device fails a single run.
@@ -85,7 +90,7 @@
 # The one statistic that separated the arms was audio_tone.smp8 wake lateness:
 # 6691 with the sink off, 7346 with it on (recorded 6658). That is the ESP
 # log's residual flush cost on the idle path, not drift, and it is written up
-# in specs/known-issues.md §10 rather than recorded here.
+# in `specs/issues/boot-media/` rather than recorded here.
 #
 # Why the counters are here at all: the wav is a rare-event detector. One 3s
 # tone samples ~1100 device periods once per run, so it only fires when a
@@ -250,6 +255,56 @@
 #   of magnitude above the ones above, because a ceiling admits values that are
 #   bad but real, and a stall of even three seconds should still be reported as
 #   the regression it is.
+#
+# ===========================================================================
+# THE CONDITIONS A VERDICT WAS TAKEN UNDER
+# ===========================================================================
+#
+# Every run of either tier prints the host's concurrent load beside its
+# counters — `host: load <1min>/<5min>/<15min> qemu N toyos-build N`, sampled
+# once per boot — and the thorough tier prints the range over its whole sample
+# beside the numbers a re-record is pasted from. NOTHING BRANCHES ON ANY OF IT.
+# CLAUDE.md's 2026-08-04 ruling stands unchanged: load is not an excuse, and a
+# load-coincident red is investigated as a real defect of the pipeline, never
+# re-run away as noise.
+#
+# What moved is the premise's context, not the ruling. It was made when the only
+# load was the audio test itself; the tree now runs several agents in separate
+# worktrees at once. The load that prompted this was measured at 49.9 on this
+# 14-core host with twelve rustc/cargo processes and a single guest live; while
+# this was written the same host read 6.6/8.1/14.3. A verdict taken there and
+# one taken quiet are different measurements, and nothing recorded which was
+# which.
+#
+# The three readings answer different questions. The load average lags — no
+# figure of it resolves one ~15 s boot — but the competition is other worktrees'
+# builds, which last minutes, and the triple's shape says whether the host was
+# ramping up or winding down. `qemu` and `toyos-build` are exact and
+# instantaneous, and they name the competition as ToyOS work; the harness's own
+# knowledge says nothing here, because gate A already asserts
+# `live_instances() == 0` and runs at width 1, so every intra-run fact is a
+# constant. The run's own guest is up when the sample is taken, so
+# `qemu 1 toyos-build 1` is the quiet reading.
+#
+# WHAT THE RECORDED SAMPLE'S OWN CONDITIONS ARE — and the two recordings this
+# file rests on are not symmetric:
+#
+#   2026-07-29, the ceiling derivation: "1-min load 4.2-6.1" recorded per run.
+#   A real measurement, and the reason the 1-minute figure leads the triple: a
+#   fresh reading compares directly against it.
+#
+#   2026-07-31, THE SAMPLE BELOW — the one both tiers compare against: "quiet
+#   host, one QEMU at a time, no concurrent agents or builds for the whole
+#   session". That is an attestation by whoever took it, not a measurement, and
+#   no per-run conditions were stored. It cannot be recovered in retrospect: the
+#   runs are gone and nothing sampled the host while they ran.
+#
+# So the thorough tier's Mann-Whitney and Fisher comparisons run between a fresh
+# arm whose conditions are measured and a recorded arm whose conditions are
+# attested, and that bounds what a rejection means. It is a further reason —
+# beyond the four drift instances above — that only a same-session A/B is worth
+# acting on. The next re-record closes it by carrying the
+# `host conditions over N runs` line the gate now prints.
 #
 # ===========================================================================
 # THE RECORDED SAMPLE

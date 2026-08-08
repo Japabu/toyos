@@ -72,8 +72,11 @@ fn ipi_all_excluding_self(vector: u8) {
     cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | vector as u64);
 }
 
-/// Flush TLB on all other CPUs. No-op if x2APIC not yet initialized.
-pub fn tlb_shootdown() {
+/// Ask every other CPU to flush its TLB. The *asking* only — `arch::tlb` owns
+/// the protocol that turns it into an answer, and nothing outside that module
+/// may send this vector: a flush request nobody waits for is exactly the defect
+/// M3 removed, and a second sender would reintroduce it one call at a time.
+pub(super) fn tlb_ipi() {
     if X2APIC_ENABLED.load(Ordering::Relaxed) {
         ipi_all_excluding_self(0xFE);
     }
@@ -89,6 +92,118 @@ pub fn kick_cpu(cpu_id: u32) {
     cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4000 | TIMER_VECTOR as u64);
 }
 
+/// Send an NMI to one CPU. Same targeted write as [`kick_cpu`] with delivery
+/// mode NMI (0x400) instead of a vector, and it exists for the one question
+/// [`kick_cpu`] cannot answer: a CPU that spins with interrupts disabled never
+/// takes a kick, so a kick that goes unanswered does not distinguish "wedged"
+/// from "not listening". An NMI is not maskable by `IF`, so it does.
+///
+/// Diagnostic only — `sched::dump` sends it to a CPU that has already failed to
+/// answer a kick. Nothing on a working path may use it: an NMI can land between
+/// any two instructions, including inside a critical section this kernel has no
+/// way to make NMI-safe.
+pub fn send_nmi(cpu_id: u32) {
+    if !X2APIC_ENABLED.load(Ordering::Relaxed) { return; }
+    let apic_id = crate::arch::smp::apic_id_for(cpu_id);
+    cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4400);
+}
+
+/// How long a dying machine gives its siblings to put the report on `/log`.
+///
+/// The idle loop goes round in microseconds and a flush is one FAT append plus
+/// a sync, so a machine with a healthy CPU left finishes far inside this; the
+/// bound is what a machine with none pays, once, on its way down. Half a second
+/// against the ~460 ms the panel paint costs on the T14 anyway.
+const LOG_FILE_DRAIN_NANOS: u64 = 500_000_000;
+
+/// Does the log volume still owe this boot bytes?
+///
+/// **Both halves, and the second is not belt-and-braces.** The ring's own
+/// predicate goes false at `drain_to_file`, which is before `flush_file` and
+/// `sync_mount` have put anything on the device — so waiting on it alone
+/// returns mid-write and the halt IPI then stops the CPU doing the writing.
+/// Measured: the wait was satisfied, no timeout line was printed, and the
+/// report was still absent from the file.
+fn owed() -> bool {
+    crate::drivers::log_ring::file_has_pending() || crate::log_file::flush_in_progress()
+}
+
+/// Give the log sink a chance to put this report on the stick before the
+/// machine stops.
+///
+/// **The panic path still writes nothing itself, and that is the design.**
+/// `log_file`'s own module doc rules a panic-time flush out on locks alone —
+/// it would need this module's lock, the VFS lock, the file cache lock, the
+/// kernel heap, the volume's device lock and the xHCI lock, and a panicking
+/// thread may hold any of them. `try_lock` does not rescue it either: a
+/// spinlock's `try_lock` fails for its own holder, so the cases where the
+/// report matters most are exactly the cases it would decline, and the heap is
+/// not try-able at all. That is "sometimes writes and sometimes hangs", which
+/// is worse than the panel alone.
+///
+/// What this does instead takes no lock, allocates nothing and touches no
+/// device: **it waits.** The report is already in the log ring, the halt IPI has
+/// not gone out yet, and every other CPU's idle loop is still running
+/// `log_file::poll`, which is the ordinary, proven path to the stick. So the
+/// dying CPU spins on one relaxed atomic against a deadline and lets a healthy
+/// sibling do the write.
+///
+/// It cannot deadlock and it cannot make a panic worse: `file_has_pending` is a
+/// load, the deadline is absolute, and every outcome ends in the same
+/// `halt_all_cpus` tail that ran before. A machine where no CPU can flush —
+/// the VFS lock stranded, the sink disabled, no `/log` at all — pays the bound
+/// and halts exactly as it used to, with the panel as the only copy and a line
+/// saying so.
+///
+/// Placed before the halt IPI rather than after, because after it there is
+/// nobody left to do the writing.
+fn wait_for_log_file() {
+    // **Only where the panel is the only channel.** This exists because a T14
+    // has no serial port, so the file is the sole copy of a fatal report. A
+    // machine with a working console has already got that report off the box
+    // through `panic_flush`, and making it wait here buys a duplicate at the
+    // price of delaying every step below it — `render`, the drain, and
+    // `page_forever`.
+    //
+    // The price is measured, not assumed: without this guard `screen_pager_keys`
+    // failed alone and reproducibly with `0 page moves over 30 keystrokes`,
+    // because the pager had not started by the time the host began injecting.
+    // A diagnostic that perturbs the path it is diagnosing is worth less than
+    // the delay it costs, and on a machine with serial it is worth nothing.
+    if crate::drivers::serial::has_console() {
+        return;
+    }
+    if !owed() {
+        return;
+    }
+    // Wake them first. A sibling with nothing to run is sitting in `sti; hlt`
+    // and is not going round its idle loop at all, so waiting for it to flush
+    // waits for something that is not happening — the LAPIC timer is one-shot
+    // and a quiet machine may have none armed. This is the ordinary wake IPI,
+    // the same one a scheduler wake sends, and the halt IPI has not gone out
+    // yet, so there is still somebody to wake.
+    let cpus = crate::arch::smp::cpu_count();
+    let me = percpu::cpu_id();
+    for cpu in 0..cpus {
+        if cpu != me {
+            kick_cpu(cpu);
+        }
+    }
+    let deadline = crate::clock::nanos_since_boot().saturating_add(LOG_FILE_DRAIN_NANOS);
+    while owed() {
+        if crate::clock::nanos_since_boot() >= deadline {
+            // Reaches the panel only on the fatal paths that paint the live
+            // ring rather than a snapshot taken before this ran, and reaches
+            // serial on a machine that has one. On a T14 mid-panic it is the
+            // honest record for whoever reads the *next* boot's log and finds
+            // no report in this one.
+            crate::log!("panic: the report did not reach /log in {LOG_FILE_DRAIN_NANOS}ns; the panel is the only copy");
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Halt all CPUs. Sends halt IPI to all other CPUs, then flushes any
 /// pending log output to the serial backend, then halts self.
 ///
@@ -100,6 +215,7 @@ pub fn kick_cpu(cpu_id: u32) {
 /// normally could therefore deadlock; `panic_flush` first waits out live
 /// holders, then bypasses the wedged ones.
 pub fn halt_all_cpus() -> ! {
+    wait_for_log_file();
     if X2APIC_ENABLED.load(Ordering::Relaxed) {
         cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | 0xFD);
     }
@@ -145,27 +261,98 @@ pub fn init_timer() {
     TIMER_TICKS.store(ticks_10ms, Ordering::Release);
     // Fallback for any Ring 0 fire before the scheduler arms its first quantum.
     let percpu = unsafe { &*percpu::percpu_ptr() };
-    percpu.last_armed_ticks.store(ticks_10ms, Ordering::Relaxed);
+    percpu.last_armed_ticks.store(OneShot::ticks(ticks_10ms as u64).0, Ordering::Relaxed);
     log!("LAPIC timer: {} ticks/10ms", ticks_10ms);
 }
 
 /// AP timer init — calibration was done on the BSP, nothing to start.
 pub fn init_timer_ap() {}
 
-/// Arm a one-shot timer to fire after `nanos` nanoseconds.
+/// The shortest interval this kernel will ask the one-shot for, and therefore
+/// the resolution of every deadline in the system.
+///
+/// **A CPU that takes the timer interrupt again before it can retire the
+/// instruction after the one that armed it never retires anything again.** The
+/// Ring 0 stub reloads whatever was last armed with no Rust in the path, so a
+/// count too small to outlast the interrupt it schedules is not one late tick
+/// but a livelock nothing recomputes its way out of. Ring 3 can ask for one — a
+/// deadline already past when the pass arms it — and did (`#156`,
+/// `specs/metal-logs/2026-08-08-cpu0/`).
+///
+/// Policy, not physics, and it sits between two bounds. Below: an interrupt
+/// entry and `iretq`, which is what the interval has to be worth more than for
+/// the interrupted code to get any of the CPU at all. Above: `QUANTUM_NS`,
+/// which this is a thousandth of, so no scheduling decision can feel it.
+const MIN_ONE_SHOT_NS: u64 = 10_000;
+
+/// A count the CPU can make progress under, and the only thing that reaches
+/// `X2APIC_TIMER_INIT` or `last_armed_ticks`.
+///
+/// The floor is in the constructor rather than at the three call sites because
+/// the assembly stub reloads the remembered count with no Rust in the path: an
+/// arm that could not be survived is a state this module has to be unable to
+/// name, not one each caller has to remember not to ask for.
+struct OneShot(u32);
+
+impl OneShot {
+    fn ticks(ticks: u64) -> Self {
+        let per_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u64;
+        let floor = (MIN_ONE_SHOT_NS * per_10ms / 10_000_000).max(1);
+        // Zero is the register's "stopped", so it is `stop_timer`'s word and
+        // never a count — `min` alone would let a calibration this small write
+        // it. `u32::MAX` is the register.
+        Self(ticks.clamp(floor, u32::MAX as u64) as u32)
+    }
+
+    fn after(nanos: u64) -> Self {
+        let per_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u128;
+        Self::ticks((nanos as u128 * per_10ms / 10_000_000) as u64)
+    }
+
+    /// Program it, and remember it for the Ring 0 stub's reload.
+    fn arm(self) {
+        cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
+        // An AP reaches its first idle before it has ever run a task, so before
+        // this register has ever been written — and an LVT resets masked.
+        cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
+        let percpu = unsafe { &*percpu::percpu_ptr() };
+        percpu.last_armed_ticks.store(self.0, Ordering::Relaxed);
+        cpu::wrmsr(X2APIC_TIMER_INIT, self.0 as u64);
+    }
+}
+
+/// Arm a one-shot timer to fire after `nanos` nanoseconds, or after
+/// [`MIN_ONE_SHOT_NS`] if that is longer.
 pub fn arm_one_shot(nanos: u64) {
-    let ticks_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u64;
-    let ticks = (nanos as u128 * ticks_10ms as u128 / 10_000_000) as u64;
-    let ticks = ticks.clamp(1, u32::MAX as u64) as u32;
-    cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
-    cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
-    let percpu = unsafe { &*percpu::percpu_ptr() };
-    percpu.last_armed_ticks.store(ticks, Ordering::Relaxed);
-    cpu::wrmsr(X2APIC_TIMER_INIT, ticks as u64);
+    OneShot::after(nanos).arm();
     crate::trace::trace(crate::trace::Kind::TimerArm, nanos as u32);
 }
 
+/// Shorten this CPU's armed interval to at most `nanos`, arming it if the last
+/// pass left it stopped.
+///
+/// The minimum against what is already armed is what keeps this close to a pure
+/// addition: a parked task's deadline is never pushed out by more than
+/// [`MIN_ONE_SHOT_NS`], and all the scheduler ever sees is extra passes — which
+/// it already tolerates, since a kick IPI is one.
+///
+/// Traces nothing, unlike [`arm_one_shot`]: no scheduler deadline is being set
+/// here, and a `TimerArm` record would make the trace say one was.
+#[cfg(feature = "diag-tick")]
+pub fn arm_within(nanos: u64) {
+    let want = OneShot::after(nanos);
+    // A running count never reaches zero without the fire that reloads it, so
+    // zero is `stop_timer` and not an expiry an instant away.
+    let remaining = cpu::rdmsr(X2APIC_TIMER_CURRENT) as u32;
+    let ticks = if remaining == 0 { want.0 } else { want.0.min(remaining) };
+    OneShot::ticks(ticks as u64).arm();
+}
+
 /// Stop the timer. No more interrupts until re-armed.
+///
+/// Zero in both places, which is the hardware's word for a stopped counter and
+/// the Ring 0 stub's for "do not re-arm" — the one count that is not a
+/// [`OneShot`], because it is not an interval.
 pub fn stop_timer() {
     let percpu = unsafe { &*percpu::percpu_ptr() };
     percpu.last_armed_ticks.store(0, Ordering::Relaxed);

@@ -54,8 +54,11 @@ dependencies = [
  "hashbrown",
  "rustc-demangle",
  "toyos-abi",
+ "toyos-elf",
  "toyos-fat32",
  "toyos-gpt",
+ "toyos-hda",
+ "toyos-pci",
  "toyos-ps2",
  "toyos-sched",
  "toyos-xhci",
@@ -78,11 +81,23 @@ name = "toyos-abi"
 version = "0.1.0"
 
 [[package]]
+name = "toyos-elf"
+version = "0.1.0"
+
+[[package]]
 name = "toyos-fat32"
 version = "0.1.0"
 
 [[package]]
 name = "toyos-gpt"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-hda"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-pci"
 version = "0.1.0"
 
 [[package]]

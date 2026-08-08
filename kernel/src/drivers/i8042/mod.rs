@@ -452,6 +452,62 @@ fn report_counters() {
     );
 }
 
+/// What the line looks like from outside, for a machine on which the pin has
+/// gone quiet and nothing else can say why.
+///
+/// [`report_counters`] speaks only when the pin has asserted since its last
+/// line, which is what makes its silence evidence — but evidence of one fact
+/// with three causes, and it cannot separate them:
+///
+/// - **the controller is still holding a byte nobody took.** Delivery is edge
+///   triggered, so it does not assert again until port 0x60 is read, and the
+///   only reader is an ISR that will never run. `OBF` set on sample after
+///   sample is that state and nothing else is.
+/// - **the redirection entry changed.** Masked, re-pointed, or carrying a
+///   vector that is no longer ours — all one word, printed raw.
+/// - **neither, and the counters are flat**, which puts the fault at the EC or
+///   the device and takes this driver out of it.
+///
+/// Every read is free of side effects: 0x64 is the status register, and an
+/// entry is read through `IOREGSEL`/`IOWIN` under the topology's own lock. So
+/// this does not have to run on the CPU the vector is pinned to, and it does
+/// not disturb the ISR's sole ownership of 0x60.
+///
+/// Behind `heartbeat` because it can only be asked from the idle loop and only
+/// a `diag-tick` build reaches that on a machine with nothing to run — which is
+/// exactly the machine it is for.
+#[cfg(feature = "heartbeat")]
+pub fn report_line() {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    log!(
+        "i8042: line status={:#04x} irqs={} bytes={} kbd {} aux {}",
+        inb(STATUS),
+        IRQS.load(Ordering::Relaxed),
+        RX_BYTES.load(Ordering::Relaxed),
+        Rte(KEYBOARD_GSI.load(Ordering::Relaxed)),
+        Rte(AUX_GSI.load(Ordering::Relaxed)),
+    );
+}
+
+/// `gsi=1 rte=0x0000000000000024`, or why there is no entry to print.
+#[cfg(feature = "heartbeat")]
+struct Rte(u32);
+
+#[cfg(feature = "heartbeat")]
+impl core::fmt::Display for Rte {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == u32::MAX {
+            return write!(f, "unrouted");
+        }
+        match ioapic::redirection(Gsi(self.0)) {
+            Some(entry) => write!(f, "gsi={} rte={:#018x}", self.0, entry),
+            None => write!(f, "gsi={} rte=busy", self.0),
+        }
+    }
+}
+
 /// Put the verdict on the panel as well as in the log ring, and only on a
 /// machine that has nowhere else to put it.
 ///

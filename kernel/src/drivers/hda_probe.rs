@@ -9,9 +9,10 @@
 //! **Why this is a kernel feature and nothing else can reach it**
 //! (`specs/device-test-strategy.md`'s requirement of an actuator): there is no
 //! way for a userland process to touch a codec at all. `SYS_OPEN_DEVICE` hands
-//! out a `DEVICE_AUDIO` claim, not a PCI function; the capability that would
-//! let a process map a BAR and drive one is `specs/userspace-drivers-spec.md`
-//! stage 4, and it is unbuilt. The questions here are precisely the ones that
+//! out a claim on a device the kernel already bound, not a PCI function; the
+//! capability that would let a process map a BAR and drive one is
+//! `specs/userspace-drivers-spec.md` stage 4, and it is unbuilt. The questions
+//! here are precisely the ones that
 //! decide whether that capability will ever be given this device, so the thing
 //! that answers them cannot be built on top of it.
 //!
@@ -30,6 +31,13 @@
 
 use alloc::vec::Vec;
 
+use toyos_hda::caps::{ConfigDefault, DefaultDevice, WidgetCaps, WidgetKind};
+use toyos_hda::graph::{
+    decode_connections, ConnectionListLen, FunctionKind, MAX_CONNECTIONS, MAX_FUNCTION_GROUPS,
+    MAX_WIDGETS,
+};
+use toyos_hda::verb::{self, Address, NoSubordinates, Node, Response, Subordinates, Verb};
+
 use crate::drivers::pci::PciDevice;
 use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
@@ -47,8 +55,6 @@ const HEADER_BAR0: u64 = 0x10;
 const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
 
 const CAP_POWER_MANAGEMENT: u8 = 0x01;
-const CAP_MSI: u8 = 0x05;
-const CAP_MSIX: u8 = 0x11;
 
 /// `PMCSR.PowerState`, and the recovery the PCI power-management specification
 /// requires before the first register access after leaving D3hot.
@@ -93,21 +99,6 @@ const SETTLE_NS: u64 = 100_000_000;
 /// twice a millisecond apart, because a codec that appears late reads as no
 /// codec at all — and "no codec" is the answer that ends this plan.
 const CODEC_DETECT_NS: u64 = 1_000_000;
-
-/// `STATESTS` has one bit per SDI link, and the specification gives it fifteen.
-const MAX_CODECS: u8 = 15;
-
-/// Bounds on what a codec says about itself. All four are policy: a codec's own
-/// numbers are untrusted input, a walk over them needs a ceiling that is not
-/// the codec's, and what a device past one loses is the part past it — which it
-/// is told, rather than left to infer from a short dump.
-const MAX_FUNCTION_GROUPS: u8 = 8;
-const MAX_WIDGETS: u8 = 128;
-const MAX_CONNECTIONS: u8 = 64;
-
-/// A response of all ones is what a link with nothing on it, and a codec that
-/// has stopped answering, both read as. Neither is a value to decode.
-const NO_RESPONSE: u32 = u32::MAX;
 
 pub fn run(rsdp_addr: u64, devices: &[PciDevice]) {
     log!("hda: === H0 probe: specs/hda-driver-plan.md §6 ===");
@@ -332,26 +323,29 @@ fn reserved_regions(rsdp_addr: u64, hda: &PciDevice) {
 /// BAR and cannot be carved out at 2 MiB granularity, and a capability in
 /// config space simply has no such hole.
 fn interrupts(hda: &PciDevice) {
-    let msi = hda.capabilities().find(|c| c.id() == CAP_MSI).map(|cap| {
-        let ctrl = cap.read_u16(2);
-        // `Multiple Message Capable`, an exponent: three bits saying how many
-        // consecutive vectors the function can raise.
-        (1u16 << ((ctrl >> 1) & 0x7), ctrl & (1 << 7) != 0)
-    });
-    let msix = hda.capabilities().find(|c| c.id() == CAP_MSIX).map(|cap| {
-        // `Table Size`, encoded one less than it is.
-        (cap.read_u16(2) & 0x7FF) + 1
+    // An MSI-X this kernel would decline to arm is one a handoff cannot rest
+    // on either, so it is named and then treated as absent — leaving the MSI
+    // answer, which is the one §4.2 wants anyway.
+    let msix = hda.msix().and_then(|decoded| match decoded {
+        Ok(msix) => Some(msix),
+        Err(why) => {
+            log!("hda: (a) msix unusable — {why}");
+            None
+        }
     });
 
-    match (msi, msix) {
-        (_, Some(vectors)) => log!(
-            "hda: (a) msix vectors={vectors} — eligible, and its table is inside a BAR \
-             (userspace-drivers-spec §4.3)"
+    match (hda.msi(), msix) {
+        (_, Some(msix)) => log!(
+            "hda: (a) msix vectors={} — eligible, and its table is inside BAR {} \
+             (userspace-drivers-spec §4.3)",
+            msix.entries(),
+            msix.bir()
         ),
-        (Some((vectors, wide)), None) => log!(
-            "hda: (a) msi vectors={vectors} addr64={} msix=none — eligible, capability in config \
+        (Some(msi), None) => log!(
+            "hda: (a) msi vectors={} addr64={} msix=none — eligible, capability in config \
              space and no table in a BAR",
-            yn(wide)
+            msi.vectors(),
+            yn(msi.wide())
         ),
         (None, None) => log!(
             "hda: (a) msi=none msix=none — userspace-drivers-spec §4.5 makes this function \
@@ -510,7 +504,7 @@ fn codecs(hda: &PciDevice, bar: &Bar) {
     let command = hda.read_config_u16(HEADER_COMMAND);
     hda.write_config_u16(HEADER_COMMAND, command | COMMAND_MEMORY_SPACE);
 
-    let regs = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(
+    let regs = crate::mm::paging::map_mmio(
         bar.base,
         bar.size.min(MIN_BAR_BYTES * 4),
         CachePolicy::DeferToMtrr,
@@ -557,10 +551,7 @@ fn codecs(hda: &PciDevice, bar: &Bar) {
 
     let mut found = 0usize;
     let mut speakers = 0usize;
-    for address in 0..MAX_CODECS {
-        if statests & (1 << address) == 0 {
-            continue;
-        }
+    for address in verb::present(statests) {
         found += 1;
         speakers += dump_codec(regs, address);
     }
@@ -632,24 +623,51 @@ fn reset(regs: Mmio) -> bool {
     true
 }
 
+/// What one immediate command came back as.
+///
+/// The controller not answering is a different fact from a codec answering all
+/// ones, and H0 is the boot that has to tell them apart: a controller with no
+/// immediate-command implementation and a codec that has stopped look identical
+/// to anything that folds them together.
+#[derive(Clone, Copy)]
+enum Answer {
+    Codec(Response),
+    /// All ones — a link with nothing on it, and a codec that has stopped
+    /// answering, both read as this, and neither is a value to decode.
+    AllOnes,
+    /// The controller never completed the command.
+    Silent,
+}
+
+impl Answer {
+    /// The word a dump line carries: what the codec said, or the all ones the
+    /// link reads as when nothing did. Re-encoded here because a fixture line
+    /// records what the wire carried; nothing in this file decides on it.
+    fn word(self) -> u32 {
+        match self {
+            Self::Codec(response) => response.raw(),
+            Self::AllOnes | Self::Silent => u32::MAX,
+        }
+    }
+
+    fn codec(self) -> Option<Response> {
+        match self {
+            Self::Codec(response) => Some(response),
+            Self::AllOnes | Self::Silent => None,
+        }
+    }
+}
+
 /// One verb over the immediate-command registers: one write, one poll, one
 /// read, and no DMA anywhere.
-///
-/// `None` is the controller not answering, which is a different fact from a
-/// codec answering all ones — the caller separates them, because a controller
-/// with no immediate-command implementation and a codec that has stopped look
-/// identical to anything that folds them together.
-fn get(regs: Mmio, codec: u8, node: u8, verb: u32, payload: u32) -> Option<u32> {
-    // A 12-bit verb in bits 19:8 with an 8-bit payload under it, which is every
-    // verb this probe sends. The 4-bit form with a 16-bit payload exists and is
-    // for setting things, which a question does not do.
-    let command = ((codec as u32) << 28) | ((node as u32) << 20) | (verb << 8) | payload;
+fn get(regs: Mmio, codec: Address, node: Node, verb: u16, payload: u8) -> Answer {
+    let command = Verb::short(codec, node, verb, payload);
 
     if !settles(|| regs.read_u16(IMMEDIATE_STATUS) & IMMEDIATE_BUSY == 0) {
-        return None;
+        return Answer::Silent;
     }
     regs.write_u16(IMMEDIATE_STATUS, IMMEDIATE_RESULT_VALID);
-    regs.write_u32(IMMEDIATE_COMMAND, command);
+    regs.write_u32(IMMEDIATE_COMMAND, command.raw());
     regs.write_u16(IMMEDIATE_STATUS, IMMEDIATE_BUSY);
 
     let done = settles(|| {
@@ -657,246 +675,198 @@ fn get(regs: Mmio, codec: u8, node: u8, verb: u32, payload: u32) -> Option<u32> 
         status & IMMEDIATE_BUSY == 0 && status & IMMEDIATE_RESULT_VALID != 0
     });
     if !done {
-        return None;
+        return Answer::Silent;
     }
     let response = regs.read_u32(IMMEDIATE_RESPONSE);
     regs.write_u16(IMMEDIATE_STATUS, IMMEDIATE_RESULT_VALID);
-    Some(response)
+    Response::new(response).map_or(Answer::AllOnes, Answer::Codec)
 }
 
-const VERB_GET_PARAMETER: u32 = 0xF00;
-const VERB_GET_CONNECTION_LIST: u32 = 0xF02;
-const VERB_GET_POWER_STATE: u32 = 0xF05;
-const VERB_GET_PIN_CONTROL: u32 = 0xF07;
-const VERB_GET_EAPD: u32 = 0xF0C;
-const VERB_GET_CONFIG_DEFAULT: u32 = 0xF1C;
-
-const PARAM_VENDOR_ID: u32 = 0x00;
-const PARAM_REVISION_ID: u32 = 0x02;
-const PARAM_SUB_NODE_COUNT: u32 = 0x04;
-const PARAM_FUNCTION_TYPE: u32 = 0x05;
-const PARAM_FUNCTION_CAPS: u32 = 0x08;
-const PARAM_WIDGET_CAPS: u32 = 0x09;
-const PARAM_PCM_RATES: u32 = 0x0A;
-const PARAM_STREAM_FORMATS: u32 = 0x0B;
-const PARAM_PIN_CAPS: u32 = 0x0C;
-const PARAM_AMP_IN_CAPS: u32 = 0x0D;
-const PARAM_CONNECTION_LENGTH: u32 = 0x0E;
-const PARAM_POWER_STATES: u32 = 0x0F;
-const PARAM_PROCESSING_CAPS: u32 = 0x10;
-const PARAM_GPIO_COUNT: u32 = 0x11;
-const PARAM_AMP_OUT_CAPS: u32 = 0x12;
-const PARAM_VOLUME_KNOB_CAPS: u32 = 0x13;
-
-fn param(regs: Mmio, codec: u8, node: u8, which: u32) -> Option<u32> {
-    get(regs, codec, node, VERB_GET_PARAMETER, which)
+fn param(regs: Mmio, codec: Address, node: Node, which: u8) -> Answer {
+    get(regs, codec, node, verb::GET_PARAMETER, which)
 }
 
-/// A subordinate node count, as the start id and the count the codec declared.
-///
-/// The two are checked together and against the node id space, because a codec
-/// claiming a range that runs past 255 is a codec whose walk would wrap — and
-/// a wrapped walk re-reads node 0 and calls it a widget.
-fn subordinates(regs: Mmio, codec: u8, node: u8, limit: u8, what: &str) -> Option<(u8, u8)> {
-    let raw = param(regs, codec, node, PARAM_SUB_NODE_COUNT)?;
-    if raw == NO_RESPONSE {
-        log!("hda: codec{codec} node={node:#04x} answered all ones to its {what} count — stopping");
-        return None;
-    }
-    let start = ((raw >> 16) & 0xFF) as u8;
-    let count = (raw & 0xFF) as u8;
-    if count == 0 {
-        return None;
-    }
-    if start as u16 + count as u16 > 256 {
+/// The subordinate node range a node declares, clamped to what this probe walks.
+fn subordinates(
+    regs: Mmio,
+    codec: Address,
+    node: Node,
+    limit: usize,
+    what: &str,
+) -> Option<Subordinates> {
+    let response = match param(regs, codec, node, verb::PARAM_SUB_NODE_COUNT) {
+        Answer::Codec(response) => response,
+        Answer::Silent => return None,
+        Answer::AllOnes => {
+            log!(
+                "hda: codec{codec} node={node:#04x} answered all ones to its {what} count — \
+                 stopping"
+            );
+            return None;
+        }
+    };
+    let range = match Subordinates::decode(response) {
+        Ok(range) => range,
+        Err(NoSubordinates::Leaf) => return None,
+        Err(NoSubordinates::PastNodeSpace { first, count }) => {
+            log!(
+                "hda: codec{codec} node={node:#04x} declares {count} {what}s from {first:#04x}, \
+                 past the node id space — refused"
+            );
+            return None;
+        }
+    };
+    let walked = (range.count as usize).min(limit);
+    if walked < range.count as usize {
         log!(
-            "hda: codec{codec} node={node:#04x} declares {count} {what}s from {start:#04x}, past \
-             the node id space — refused"
+            "hda: codec{codec} node={node:#04x} declares {} {what}s, more than this probe walks \
+             ({limit}) — the rest are not dumped",
+            range.count
         );
-        return None;
     }
-    if count > limit {
-        log!(
-            "hda: codec{codec} node={node:#04x} declares {count} {what}s, more than this probe \
-             walks ({limit}) — the rest are not dumped"
-        );
-        return Some((start, limit));
-    }
-    Some((start, count))
+    Some(Subordinates { first: range.first, count: walked as u8 })
 }
 
 /// Returns how many pins on this codec name a speaker as their default device.
-fn dump_codec(regs: Mmio, codec: u8) -> usize {
-    let Some(vendor) = param(regs, codec, 0, PARAM_VENDOR_ID) else {
-        log!(
-            "hda: codec{codec} the controller did not answer an immediate command — no verb \
-             interface on this controller, so nothing below could be read"
-        );
-        return 0;
+fn dump_codec(regs: Mmio, codec: Address) -> usize {
+    let vendor = match param(regs, codec, Node::ROOT, verb::PARAM_VENDOR_ID) {
+        Answer::Codec(vendor) => vendor.raw(),
+        Answer::Silent => {
+            log!(
+                "hda: codec{codec} the controller did not answer an immediate command — no verb \
+                 interface on this controller, so nothing below could be read"
+            );
+            return 0;
+        }
+        Answer::AllOnes => {
+            log!(
+                "hda: codec{codec} answered all ones to its vendor id — STATESTS claims a codec \
+                 the link does not carry"
+            );
+            return 0;
+        }
     };
-    if vendor == NO_RESPONSE {
-        log!(
-            "hda: codec{codec} answered all ones to its vendor id — STATESTS claims a codec the \
-             link does not carry"
-        );
-        return 0;
-    }
     log!(
         "hda: codec{codec} vendor={:04x} device={:04x} revision={:#010x}",
         vendor >> 16,
         vendor & 0xFFFF,
-        param(regs, codec, 0, PARAM_REVISION_ID).unwrap_or(NO_RESPONSE)
+        param(regs, codec, Node::ROOT, verb::PARAM_REVISION_ID).word()
     );
 
-    let Some((first, groups)) = subordinates(regs, codec, 0, MAX_FUNCTION_GROUPS, "function group")
+    let Some(groups) = subordinates(regs, codec, Node::ROOT, MAX_FUNCTION_GROUPS, "function group")
     else {
         log!("hda: codec{codec} declares no function group");
         return 0;
     };
 
     let mut speakers = 0usize;
-    for group in nodes(first, groups) {
+    for group in groups.nodes() {
         speakers += dump_function_group(regs, codec, group);
     }
     speakers
 }
 
-/// `count` node ids from `first`, counted in `u16` and narrowed per element.
-///
-/// A `u8` range cannot express one ending at node 255 — `first + count` is 256
-/// there — and `saturating_add` would quietly drop that last node rather than
-/// say so. [`subordinates`] has already refused anything past 256, so this
-/// narrowing cannot truncate.
-fn nodes(first: u8, count: u8) -> impl Iterator<Item = u8> {
-    (first as u16..first as u16 + count as u16).map(|node| node as u8)
-}
-
-fn dump_function_group(regs: Mmio, codec: u8, group: u8) -> usize {
-    let kind = param(regs, codec, group, PARAM_FUNCTION_TYPE).unwrap_or(NO_RESPONSE) & 0xFF;
+fn dump_function_group(regs: Mmio, codec: Address, group: Node) -> usize {
+    let kind = param(regs, codec, group, verb::PARAM_FUNCTION_TYPE)
+        .codec()
+        .map_or(FunctionKind::Other(u8::MAX), FunctionKind::decode);
     log!(
-        "hda: codec{codec} fg={group:#04x} type={kind:#04x} ({}) caps={:#010x} power={:#010x} \
+        "hda: codec{codec} fg={group:#04x} type={:#04x} ({}) caps={:#010x} power={:#010x} \
          gpio={:#010x}",
-        function_type_name(kind),
-        param(regs, codec, group, PARAM_FUNCTION_CAPS).unwrap_or(NO_RESPONSE),
-        param(regs, codec, group, PARAM_POWER_STATES).unwrap_or(NO_RESPONSE),
-        param(regs, codec, group, PARAM_GPIO_COUNT).unwrap_or(NO_RESPONSE),
+        kind.code(),
+        kind.name(),
+        param(regs, codec, group, verb::PARAM_FUNCTION_CAPS).word(),
+        param(regs, codec, group, verb::PARAM_POWER_STATES).word(),
+        param(regs, codec, group, verb::PARAM_GPIO_COUNT).word(),
     );
     // A modem function group is walked no further, and said so rather than
     // dropped: §2.3 step 1 keeps the audio groups and logs the rest.
-    if kind != FUNCTION_TYPE_AUDIO {
+    if kind != FunctionKind::Audio {
         log!("hda: codec{codec} fg={group:#04x} is not an audio function group — not walked");
         return 0;
     }
 
-    let Some((first, widgets)) = subordinates(regs, codec, group, MAX_WIDGETS, "widget") else {
+    let Some(widgets) = subordinates(regs, codec, group, MAX_WIDGETS, "widget") else {
         log!("hda: codec{codec} fg={group:#04x} declares no widget");
         return 0;
     };
     log!(
-        "hda: codec{codec} fg={group:#04x} widgets={first:#04x}..{:#04x}",
-        first as u16 + widgets as u16 - 1
+        "hda: codec{codec} fg={group:#04x} widgets={:#04x}..{:#04x}",
+        widgets.first,
+        widgets.last()
     );
 
     let mut speakers = 0usize;
-    for node in nodes(first, widgets) {
+    for node in widgets.nodes() {
         speakers += dump_widget(regs, codec, node);
     }
     speakers
 }
 
-const FUNCTION_TYPE_AUDIO: u32 = 0x01;
-
-fn function_type_name(kind: u32) -> &'static str {
-    match kind {
-        0x00 => "reserved",
-        FUNCTION_TYPE_AUDIO => "audio",
-        0x02 => "modem",
-        _ => "vendor/unknown",
-    }
-}
-
-const WIDGET_PIN_COMPLEX: u32 = 4;
-
-fn widget_type_name(kind: u32) -> &'static str {
-    match kind {
-        0 => "audio-out",
-        1 => "audio-in",
-        2 => "mixer",
-        3 => "selector",
-        WIDGET_PIN_COMPLEX => "pin",
-        5 => "power",
-        6 => "volume-knob",
-        7 => "beep",
-        0xF => "vendor-defined",
-        _ => "reserved",
-    }
-}
-
 /// One widget, in as many lines as it has facts. Returns 1 if this is a pin
 /// complex whose configuration default names a speaker.
-fn dump_widget(regs: Mmio, codec: u8, node: u8) -> usize {
-    let caps = param(regs, codec, node, PARAM_WIDGET_CAPS).unwrap_or(NO_RESPONSE);
-    if caps == NO_RESPONSE {
+fn dump_widget(regs: Mmio, codec: Address, node: Node) -> usize {
+    let Some(response) = param(regs, codec, node, verb::PARAM_WIDGET_CAPS).codec() else {
         log!("hda: codec{codec} node={node:#04x} answered all ones to its capabilities — skipped");
         return 0;
-    }
-    let kind = (caps >> 20) & 0xF;
-    // `Chan Count Ext` in bits 15:13 and `Stereo` in bit 0 together, both
-    // encoded one pair short of the count.
-    let channels = (((caps >> 13) & 0x7) << 1 | (caps & 1)) + 1;
+    };
+    let caps = WidgetCaps::decode(response);
     log!(
-        "hda: codec{codec} node={node:#04x} type={kind:#x} ({}) caps={caps:#010x} channels={channels} \
+        "hda: codec{codec} node={node:#04x} type={:#x} ({}) caps={:#010x} channels={} \
          amp-in={} amp-out={} power={} digital={} conn-list={}",
-        widget_type_name(kind),
-        yn(caps & (1 << 1) != 0),
-        yn(caps & (1 << 2) != 0),
-        yn(caps & (1 << 10) != 0),
-        yn(caps & (1 << 9) != 0),
-        yn(caps & (1 << 8) != 0),
+        caps.kind.code(),
+        caps.kind.name(),
+        response.raw(),
+        caps.channels,
+        yn(caps.input_amp),
+        yn(caps.output_amp),
+        yn(caps.power_control),
+        yn(caps.digital),
+        yn(caps.connection_list),
     );
 
-    if caps & (1 << 1) != 0 {
+    if caps.input_amp {
         log!(
             "hda: codec{codec} node={node:#04x} amp-in-caps={:#010x}",
-            param(regs, codec, node, PARAM_AMP_IN_CAPS).unwrap_or(NO_RESPONSE)
+            param(regs, codec, node, verb::PARAM_AMP_IN_CAPS).word()
         );
     }
-    if caps & (1 << 2) != 0 {
+    if caps.output_amp {
         log!(
             "hda: codec{codec} node={node:#04x} amp-out-caps={:#010x}",
-            param(regs, codec, node, PARAM_AMP_OUT_CAPS).unwrap_or(NO_RESPONSE)
+            param(regs, codec, node, verb::PARAM_AMP_OUT_CAPS).word()
         );
     }
-    if kind == 0 || kind == 1 {
+    if matches!(caps.kind, WidgetKind::AudioOutput | WidgetKind::AudioInput) {
         log!(
             "hda: codec{codec} node={node:#04x} pcm={:#010x} formats={:#010x}",
-            param(regs, codec, node, PARAM_PCM_RATES).unwrap_or(NO_RESPONSE),
-            param(regs, codec, node, PARAM_STREAM_FORMATS).unwrap_or(NO_RESPONSE)
+            param(regs, codec, node, verb::PARAM_PCM).word(),
+            param(regs, codec, node, verb::PARAM_STREAM_FORMATS).word()
         );
     }
-    if caps & (1 << 10) != 0 {
+    if caps.power_control {
         log!(
             "hda: codec{codec} node={node:#04x} power-states={:#010x} power-state={:#010x}",
-            param(regs, codec, node, PARAM_POWER_STATES).unwrap_or(NO_RESPONSE),
-            get(regs, codec, node, VERB_GET_POWER_STATE, 0).unwrap_or(NO_RESPONSE)
+            param(regs, codec, node, verb::PARAM_POWER_STATES).word(),
+            get(regs, codec, node, verb::GET_POWER_STATE, 0).word()
         );
     }
-    if kind == 6 {
+    if caps.kind == WidgetKind::VolumeKnob {
         log!(
             "hda: codec{codec} node={node:#04x} volume-knob-caps={:#010x}",
-            param(regs, codec, node, PARAM_VOLUME_KNOB_CAPS).unwrap_or(NO_RESPONSE)
+            param(regs, codec, node, verb::PARAM_VOLUME_KNOB_CAPS).word()
         );
     }
-    if caps & (1 << 6) != 0 {
+    if caps.proc_widget {
         log!(
             "hda: codec{codec} node={node:#04x} processing-caps={:#010x}",
-            param(regs, codec, node, PARAM_PROCESSING_CAPS).unwrap_or(NO_RESPONSE)
+            param(regs, codec, node, verb::PARAM_PROCESSING_CAPS).word()
         );
     }
 
     connections(regs, codec, node);
 
-    if kind == WIDGET_PIN_COMPLEX {
+    if caps.kind == WidgetKind::PinComplex {
         return pin(regs, codec, node);
     }
     0
@@ -906,142 +876,101 @@ fn dump_widget(regs: Mmio, codec: u8, node: u8) -> usize {
 ///
 /// §2.3 step 4 walks this list backwards to find a converter, so it is the part
 /// of the dump the traversal is tested against and the part a codec is most
-/// able to lie about. Range entries are expanded here — the short form marks a
-/// range end in bit 7 of an entry and the long form in bit 15 — and an expansion
-/// that would run backwards is printed as the raw pair rather than guessed at.
-fn connections(regs: Mmio, codec: u8, node: u8) {
-    let Some(raw) = param(regs, codec, node, PARAM_CONNECTION_LENGTH) else { return };
-    if raw == NO_RESPONSE {
+/// able to lie about. The decode is `toyos-hda`'s, which refuses a list whose
+/// range entries run backwards or off the end of the bound rather than guessing
+/// at one: this dump is what H1's fixtures are made of, and a list the driver
+/// would refuse must not reach one looking like a list it accepted. The words
+/// the codec sent are on the refusal line, so nothing it said is lost.
+fn connections(regs: Mmio, codec: Address, node: Node) {
+    let Some(length) = param(regs, codec, node, verb::PARAM_CONNECTION_LENGTH).codec() else {
+        return;
+    };
+    let declared = ConnectionListLen::decode(length);
+    if declared.count == 0 {
         return;
     }
-    let long = raw & (1 << 7) != 0;
-    let declared = (raw & 0x7F) as u8;
-    if declared == 0 {
-        return;
-    }
-    let count = declared.min(MAX_CONNECTIONS);
-    if count < declared {
+    let len = ConnectionListLen {
+        count: (declared.count as usize).min(MAX_CONNECTIONS) as u8,
+        long: declared.long,
+    };
+    if len.count < declared.count {
         log!(
-            "hda: codec{codec} node={node:#04x} declares {declared} connections, more than this \
-             probe walks ({MAX_CONNECTIONS}) — the rest are not dumped"
+            "hda: codec{codec} node={node:#04x} declares {} connections, more than this probe \
+             walks ({MAX_CONNECTIONS}) — the rest are not dumped",
+            declared.count
         );
     }
 
-    let per_response = if long { 2 } else { 4 };
-    let mut entries: Vec<u16> = Vec::new();
-    let mut index = 0u32;
-    while (entries.len() as u8) < count {
-        let Some(response) = get(regs, codec, node, VERB_GET_CONNECTION_LIST, index) else {
+    let mut responses: Vec<Response> = Vec::with_capacity(len.responses());
+    for index in 0..len.responses() {
+        let entry = (index * len.per_response()) as u8;
+        let Some(response) = get(regs, codec, node, verb::GET_CONNECTION_LIST, entry).codec() else {
             return;
         };
-        for slot in 0..per_response {
-            if (entries.len() as u8) >= count {
-                break;
-            }
-            entries.push(if long {
-                ((response >> (slot * 16)) & 0xFFFF) as u16
-            } else {
-                ((response >> (slot * 8)) & 0xFF) as u16
-            });
+        responses.push(response);
+    }
+
+    match decode_connections(len, &responses) {
+        Some(list) => {
+            let list: Vec<u8> = list.iter().map(|named| named.0).collect();
+            log!(
+                "hda: codec{codec} node={node:#04x} conn-len={:#010x} long={} count={} list={:?}",
+                length.raw(),
+                yn(len.long),
+                list.len(),
+                list
+            );
         }
-        index += per_response as u32;
-    }
-
-    let range_bit: u16 = if long { 1 << 15 } else { 1 << 7 };
-    let mut line: Vec<u16> = Vec::new();
-    let mut previous: Option<u16> = None;
-    for entry in &entries {
-        let id = entry & !range_bit;
-        match (entry & range_bit != 0, previous) {
-            (true, Some(from)) if id > from => line.extend((from + 1)..=id),
-            // A range whose end is not above its start is not a range. Printed
-            // as the entry it is, because a probe that guessed which way the
-            // codec meant it would put a node id in a fixture that the codec
-            // never named.
-            (true, _) => line.push(id),
-            (false, _) => line.push(id),
+        None => {
+            let words: Vec<u32> = responses.iter().map(|response| response.raw()).collect();
+            log!(
+                "hda: codec{codec} node={node:#04x} conn-len={:#010x} long={} entries={} \
+                 responses={:08x?} — the entries do not name a node list and are not dumped as one",
+                length.raw(),
+                yn(len.long),
+                len.count,
+                words
+            );
         }
-        previous = Some(id);
-    }
-
-    log!(
-        "hda: codec{codec} node={node:#04x} conn-len={raw:#010x} long={} count={} list={:?}",
-        yn(long),
-        line.len(),
-        line
-    );
-}
-
-const PIN_DEVICE_SPEAKER: u32 = 0x1;
-const PIN_DEVICE_HEADPHONE: u32 = 0x2;
-
-fn pin_device_name(device: u32) -> &'static str {
-    match device {
-        0x0 => "line-out",
-        PIN_DEVICE_SPEAKER => "speaker",
-        PIN_DEVICE_HEADPHONE => "hp-out",
-        0x3 => "cd",
-        0x4 => "spdif-out",
-        0x5 => "digital-other-out",
-        0x6 => "modem-line",
-        0x7 => "modem-handset",
-        0x8 => "line-in",
-        0x9 => "aux",
-        0xA => "mic-in",
-        0xB => "telephony",
-        0xC => "spdif-in",
-        0xD => "digital-other-in",
-        0xF => "other",
-        _ => "reserved",
     }
 }
 
-fn pin_connectivity_name(connectivity: u32) -> &'static str {
-    match connectivity {
-        0 => "jack",
-        1 => "none",
-        2 => "fixed",
-        3 => "jack+fixed",
-        _ => unreachable!("two bits"),
-    }
-}
-
-fn pin(regs: Mmio, codec: u8, node: u8) -> usize {
-    let config = get(regs, codec, node, VERB_GET_CONFIG_DEFAULT, 0).unwrap_or(NO_RESPONSE);
+fn pin(regs: Mmio, codec: Address, node: Node) -> usize {
+    let config = get(regs, codec, node, verb::GET_CONFIG_DEFAULT, 0);
     log!(
         "hda: codec{codec} node={node:#04x} pin-caps={:#010x} pin-ctl={:#010x} eapd={:#010x}",
-        param(regs, codec, node, PARAM_PIN_CAPS).unwrap_or(NO_RESPONSE),
-        get(regs, codec, node, VERB_GET_PIN_CONTROL, 0).unwrap_or(NO_RESPONSE),
-        get(regs, codec, node, VERB_GET_EAPD, 0).unwrap_or(NO_RESPONSE),
+        param(regs, codec, node, verb::PARAM_PIN_CAPS).word(),
+        get(regs, codec, node, verb::GET_PIN_CONTROL, 0).word(),
+        get(regs, codec, node, verb::GET_EAPD, 0).word(),
     );
     // All ones decodes to a perfectly plausible pin — "jack+fixed", device
     // "other" — which is a name for a read that did not happen. §2.3 chooses a
     // pin off exactly these fields, so a fixture carrying one of these would
     // put a speaker in a graph the codec never described.
-    if config == NO_RESPONSE {
+    let Some(config) = config.codec() else {
         log!(
             "hda: codec{codec} node={node:#04x} cfgdef=0xffffffff — no answer, not decoded and \
              not a candidate"
         );
         return 0;
-    }
-    let connectivity = (config >> 30) & 0x3;
-    let device = (config >> 20) & 0xF;
+    };
+    let default = ConfigDefault::decode(config);
     log!(
-        "hda: codec{codec} node={node:#04x} cfgdef={config:#010x} conn={} device={} location={:#04x} \
+        "hda: codec{codec} node={node:#04x} cfgdef={:#010x} conn={} device={} location={:#04x} \
          type={:#x} colour={:#x} assoc={} sequence={}",
-        pin_connectivity_name(connectivity),
-        pin_device_name(device),
-        (config >> 24) & 0x3F,
-        (config >> 16) & 0xF,
-        (config >> 12) & 0xF,
-        (config >> 4) & 0xF,
-        config & 0xF,
+        config.raw(),
+        default.connectivity.name(),
+        default.device.name(),
+        default.location,
+        default.connection_type,
+        default.colour,
+        default.association,
+        default.sequence,
     );
     // §2.3 step 3 discards a pin whose port connectivity says no physical
     // connection, whatever its default device claims — a header nobody
     // soldered still names a speaker.
-    usize::from(device == PIN_DEVICE_SPEAKER && connectivity != 1)
+    usize::from(default.device == DefaultDevice::Speaker && default.is_physical())
 }
 
 // --- bounded waiting ---

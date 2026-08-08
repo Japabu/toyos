@@ -8,6 +8,8 @@
 
 use core::arch::asm;
 
+#[cfg(feature = "diag-tick")]
+use toyos_sched::cpu::SleepToken;
 use toyos_sched::cpu::RunToken;
 use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos, TraceEvent};
 use toyos_sched::task::{TaskAccounting, TaskKey};
@@ -74,9 +76,10 @@ impl Machine for KernelHw {
     /// absolute value, so the conversion here becomes ns→TSC scaling with no
     /// clock read at all.
     ///
-    /// A deadline already in the past arms the one-tick minimum and fires
-    /// immediately (`arm_one_shot` clamps), which is what a past-due deadline
-    /// should do.
+    /// A deadline already in the past arms the one-shot's floor and fires at
+    /// the end of it. Not sooner: "as soon as possible" is an interrupt the
+    /// CPU takes before it can retire the instruction that armed it, and the
+    /// Ring 0 stub then reloads the same count forever.
     fn set_timer(&self, deadline: Nanos) {
         apic::arm_one_shot(deadline.0.saturating_sub(self.now().0));
     }
@@ -110,7 +113,38 @@ impl Machine for KernelHw {
     fn trace(&self, ev: TraceEvent) {
         crate::trace::record(ev);
     }
+
+    /// A diagnostic build refuses full quiescence. That is the whole of
+    /// `diag-tick`, and the whole difference between the two builds.
+    ///
+    /// The default is to sleep until something arrives, which is correct for a
+    /// shipping kernel and is what the owner's T14 does: eight boots halted
+    /// every CPU at 1.8 s and took no interrupt for as long as 102 s. Everything
+    /// the kernel says to whoever is watching it is emitted from the idle loop,
+    /// so across that window it said nothing, and the boots that survived wrote
+    /// the same file as the boots that froze.
+    ///
+    /// Arming before the halt and not after the wake: `halt` is `sti; hlt` and
+    /// its STI shadow, so a fire that lands in the window between them is taken
+    /// rather than slept through. Ordering with the pass's own arming is
+    /// [`apic::arm_within`]'s minimum, so this only ever adds wakes.
+    #[cfg(feature = "diag-tick")]
+    fn idle_wait(&self, token: SleepToken) {
+        let _consumed = token;
+        apic::arm_within(DIAG_TICK_NS);
+        self.halt();
+    }
 }
+
+/// The longest a CPU may sleep on a `diag-tick` build.
+///
+/// Comfortably under `heartbeat`'s reporting period rather than equal to it, so
+/// a healthy CPU contributes two or three passes to every line. At one wake per
+/// line a CPU whose wake landed just the wrong side of the boundary would drop
+/// out of the mask, and a field that flickers on a healthy machine cannot be
+/// read as "that CPU stopped" on a sick one.
+#[cfg(feature = "diag-tick")]
+const DIAG_TICK_NS: u64 = 100_000_000;
 
 impl Hw for KernelHw {
     type Payload = KernelPayload;
@@ -143,6 +177,12 @@ impl Hw for KernelHw {
             percpu::set_current_pid(incoming.id.map(|id| id.0));
             match incoming.id {
                 Some(_) => {
+                    // Here and not in the pass: this arm is the one place a
+                    // *task* rather than the idle context becomes what a CPU is
+                    // running, which is what `ran=` has to count for a machine
+                    // that schedules but runs nothing to be visible at all.
+                    #[cfg(feature = "heartbeat")]
+                    crate::heartbeat::note_dispatch();
                     percpu::set_kernel_stack(incoming.kernel_stack_top);
                     incoming.cr3.activate();
                     cpu::wrfsbase(incoming.fs_base);

@@ -1,10 +1,11 @@
 //! Host-side scaffolding: real FAT32 images made by macOS, devices that carry
-//! them, and the `fsck_msdos` gate.
+//! them, and the volume-checker gate.
 //!
 //! Nothing here formats a volume. The images come from `newfs_msdos`, are
-//! populated through a real mount, and are judged by `fsck_msdos` — so the
-//! ground truth on both sides of every test is an implementation that was not
-//! written here.
+//! populated through a real mount, and are judged by `toyos-fat32-check`, which
+//! is written from the specification and shares no code with this crate — so
+//! the ground truth on both sides of every test is something other than the
+//! driver under test.
 
 #![allow(dead_code)]
 
@@ -310,41 +311,21 @@ impl Image {
         }
     }
 
-    /// Assert `fsck_msdos` finds nothing to complain about.
+    /// Assert the volume checker finds nothing to complain about.
     ///
-    /// The exit code alone is not the gate: `fsck_msdos -n` exits 0 while
-    /// printing `Fix?` for problems it declined to repair, and it exits 0 on a
-    /// volume it has just declared dirty. So the output is matched line by
-    /// line against the exact shape of a clean run, and anything else fails.
+    /// Silence is the whole gate: [`toyos_fat32_check::check`] answers with the
+    /// list of invariants the volume breaks, so there is no exit code to
+    /// misread and no summary line to filter out.
     pub fn fsck(&self) {
-        let (_, out) = run(Command::new("/sbin/fsck_msdos").arg("-n").arg(&self.path));
-        let mut unexplained = Vec::new();
-        let mut summaries = 0;
-        for line in out.lines() {
-            let line = line.trim_end();
-            if line.is_empty() || line.starts_with("**") {
-                continue;
-            }
-            if is_summary(line) {
-                summaries += 1;
-                continue;
-            }
-            unexplained.push(line.to_string());
-        }
+        let bytes = std::fs::read(&self.path).expect("read the volume back");
+        let complaints = toyos_fat32_check::check(&bytes);
         assert!(
-            unexplained.is_empty() && summaries == 1,
-            "fsck_msdos is not happy with {}:\n{out}",
-            self.path.display()
+            complaints.is_empty(),
+            "the volume checker is not happy with {}:\n{}",
+            self.path.display(),
+            toyos_fat32_check::describe(&complaints)
         );
     }
-}
-
-/// `Warning: 5 files, 306560 KiB free (76640 clusters)` — the one line a clean
-/// run prints that is not a `**` banner.
-fn is_summary(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("Warning: ") else { return false };
-    let Some((count, tail)) = rest.split_once(' ') else { return false };
-    count.chars().all(|c| c.is_ascii_digit()) && tail.starts_with("files,")
 }
 
 impl Drop for Image {
@@ -425,14 +406,15 @@ pub fn write_new<D: BlockAccess>(
     fs.flush_meta(&mut f, time).unwrap_or_else(|e| panic!("flush {path}: {e}"));
 }
 
-/// Assert every FAT holds the same bytes.
+/// Assert every FAT holds the same bytes, through the crate's own device.
 ///
-/// Nothing else checks this. `fsck_msdos -n` does not compare the copies, and
-/// a mount reads only the active one — so a driver that updates FAT 0 and
-/// leaves FAT 1 behind passes every other test in this suite while leaving a
-/// volume that reads differently the moment something consults the mirror.
-/// Found by breaking `Geometry::fat_mirrors` on purpose and watching nothing
-/// go red.
+/// The invariant a mount cannot see, because it reads the active copy only: a
+/// driver that updates FAT 0 and leaves FAT 1 behind reads back correctly until
+/// something consults the mirror. `fsck_msdos` did not compare the copies
+/// either, which is how breaking `Geometry::fat_mirrors` on purpose went
+/// unnoticed. [`Image::fsck`]'s checker compares them off the raw volume; this
+/// asks the same question through `BlockAccess`, at a point where the
+/// filesystem is still mounted and the answer names the byte.
 pub fn assert_fats_agree<D: BlockAccess>(fs: &mut toyos_fat32::Fat32<D>) {
     let g = *fs.geometry();
     assert!(g.num_fats >= 2, "volume has one FAT, so this proves nothing");
@@ -460,8 +442,8 @@ pub fn assert_fats_agree<D: BlockAccess>(fs: &mut toyos_fat32::Fat32<D>) {
 ///
 /// Read straight off the device rather than through the crate: the crate
 /// reports the *long* name, and duplicate short names are invisible from
-/// there — which is why a build that stopped uniquifying them passed
-/// everything, `fsck_msdos` included.
+/// there — which is why a build that stopped uniquifying them once passed
+/// everything, `fsck_msdos` and a real mount included.
 pub fn short_names_in<D: BlockAccess>(
     fs: &mut toyos_fat32::Fat32<D>,
     first_cluster: u32,

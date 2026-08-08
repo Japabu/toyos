@@ -5,7 +5,7 @@
 //! (`sched::driver::drain_irqs`) consumes the record and converts it into
 //! waiter wakes, io_uring CQEs, or controller polls. The audio DATA path
 //! (per-completion `(mask, timestamp)` records read by soundd) lives in
-//! `crate::audio` and is unrelated — this module only drives *scheduling* off
+//! the sound stubs and is unrelated — this module only drives *scheduling* off
 //! IRQs.
 //!
 //! Shape: one timestamp slot per `(cpu, source)` instead of a record queue.
@@ -84,6 +84,16 @@ pub fn take(source: IrqSource) -> Option<u64> {
             Some(ts)
         }
     }
+}
+
+/// Is there an undrained record for `source` on this CPU? Non-consuming.
+///
+/// For a caller that has to decide whether it has work *before* it knows it
+/// can do that work. [`take`] consumes, so a caller that takes a record and
+/// then declines has dropped a wake nothing will re-post: the ISR coalesces
+/// into an empty slot and the interrupt that filled this one is over.
+pub fn pending(source: IrqSource) -> bool {
+    SLOTS[percpu::cpu_id() as usize].0[source as usize].load(Ordering::Relaxed) != 0
 }
 
 /// Any undrained IRQ record on the current CPU? Non-consuming — the idle

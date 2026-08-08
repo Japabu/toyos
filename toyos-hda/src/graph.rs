@@ -29,6 +29,24 @@ impl FunctionKind {
             other => Self::Other(other),
         }
     }
+
+    /// The byte the codec answered, so a report can carry it beside the name.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Audio => 0x01,
+            Self::Modem => 0x02,
+            Self::Other(code) => code,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Modem => "modem",
+            Self::Other(0x00) => "reserved",
+            Self::Other(_) => "vendor/unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -96,10 +114,19 @@ impl ConnectionListLen {
         Self { count: (raw & 0x7F) as u8, long: raw & (1 << 7) != 0 }
     }
 
+    /// How many entries one response carries, which is also the step between
+    /// the entry indices a reader asks for.
+    pub fn per_response(self) -> usize {
+        if self.long {
+            2
+        } else {
+            4
+        }
+    }
+
     /// How many responses it takes to read the whole list.
     pub fn responses(self) -> usize {
-        let per = if self.long { 2 } else { 4 };
-        (self.count as usize).div_ceil(per)
+        (self.count as usize).div_ceil(self.per_response())
     }
 }
 
@@ -114,7 +141,7 @@ impl ConnectionListLen {
 pub fn decode_connections(len: ConnectionListLen, responses: &[Response]) -> Option<Vec<Node>> {
     let wanted = (len.count as usize).min(MAX_CONNECTIONS);
     let mut raw: Vec<u16> = Vec::with_capacity(wanted);
-    let per = if len.long { 2 } else { 4 };
+    let per = len.per_response();
     for response in responses {
         for slot in 0..per {
             if raw.len() == wanted {
@@ -166,6 +193,17 @@ mod tests {
 
     fn short(count: u8) -> ConnectionListLen {
         ConnectionListLen { count, long: false }
+    }
+
+    #[test]
+    fn a_function_type_keeps_the_byte_it_was_decoded_from() {
+        for byte in 0..=u8::MAX {
+            assert_eq!(FunctionKind::decode(response(byte as u32)).code(), byte);
+        }
+        assert_eq!(FunctionKind::Audio.name(), "audio");
+        assert_eq!(FunctionKind::Modem.name(), "modem");
+        assert_eq!(FunctionKind::Other(0x00).name(), "reserved");
+        assert_eq!(FunctionKind::Other(0xFF).name(), "vendor/unknown");
     }
 
     #[test]

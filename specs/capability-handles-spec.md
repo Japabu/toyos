@@ -29,7 +29,7 @@
 at open and reads them by absolute block number with no re-validation, so after an unlink
 frees those blocks to bcachefs's allocator and another file takes them, a process
 demand-paging the unlinked file reads **another process's file contents**. Ordinary
-filesystem operations, no crafting (`specs/known-issues.md` §1).
+filesystem operations, no crafting (`specs/issues/isolation/`).
 
 That is this spec's refcount, missing: the backing must keep the file's blocks alive for
 as long as it can read them. It is deliberately left unfixed pending this work, because a
@@ -37,7 +37,7 @@ local patch — re-validating extents per read, or invalidating backings on unli
 reimplements refcounting badly at one call site while every other cached reference keeps
 the same shape.
 
-`known-issues.md` §1 names the pair this closes: **an id or a name treated as a
+`specs/issues/isolation/` names the pair this closes: **an id or a name treated as a
 capability** (guessing a designation) and **a reference that outlives the object it
 names** (outliving one). Handles make the first unrepresentable by carrying rights and the
 second by carrying a refcount.
@@ -56,6 +56,35 @@ second by carrying a refcount.
 
 Criteria order honored throughout: (1) compile-time impossibility, (2) runtime
 fail-fast, (3) tests.
+
+### 2.1 What tasks #61/#170 already moved, and what they pin
+
+`Descriptor` is owning now: every variant releases what it names in `Drop`, and
+`fd::close`/`close_all` match on no resource kind at all. Three consequences,
+none of which this spec has to undo:
+
+- **§6.5's "no DUP right" for a device claim is built, in its strongest form.**
+  `device::Claim` is not `Clone`, so `Descriptor` is not either, and
+  `Descriptor::duplicate` is a `-> Option<Self>` that *cannot* answer `Some` for
+  a claim. `dup`, `dup2` and a spawn `fd_map` all say `PermissionDenied`. The
+  `DEVICE_*_OWNER` statics survive because `is_owner` still reads them, so §7's
+  row deleting them stands and what is left there is only the pid-keyed gate.
+- **§5.3's `on_zero_handles` for `ListenerObject` and `IoUringObject` is built as
+  a plain refcount** — `listener::ListenerRef` and `io_uring::RingRef`, the
+  `PipeReader` shape. When those become objects the counters *are* the ends'
+  `handle_count`s and both types go away; nothing about them prejudges the
+  Arc-vs-handle question, so §5.1 is untouched.
+- **§5.1's premise is re-checked for descriptors and holds narrowly.** Process
+  kill *does* run the descriptor table's drops: `kill_process` and `exit` share
+  `teardown_resources`, which drains the table on the killer's CPU. What §5.1 is
+  about — an `Arc` a *blocked* thread cloned onto a kernel stack that is then
+  freed without unwinding — is a different value on a different stack, and stays
+  the reason `handle_count` cannot be an Arc count.
+
+Constraint this adds: `fd::OpenFile::drop` takes the VFS lock, so no `fd`-module
+entry point may accept a `&mut Vfs`. `FileObject` inherits that question —
+either it keeps the same rule, or the flush moves behind something the zero
+queue can drain (§5.2), which is the shape that would actually retire it.
 
 ## 3. Design overview
 
@@ -426,7 +455,7 @@ pub struct DeviceClaim {
 }
 ```
 
-> **`SYS_AUDIO_SUBMIT` is already gated** on `device::is_owner(DEVICE_AUDIO, ..)`
+> **`SYS_AUDIO_SUBMIT` is already gated** on `device::is_owner(DeviceType::Audio, ..)`
 > (`arch/syscall.rs:366`), with the reason recorded at the site. The residual this
 > section should target is not the missing gate but that **a claim is not a
 > privilege**: `SYS_OPEN_DEVICE` is first-come, so whoever asks first holds
@@ -517,6 +546,14 @@ stdio pre-seeding at spawn.
 `shared_memory::destroy()` caller and closes the "io_uring abuses shared_memory"
 known issue. `PendingPoll` keys move from fd numbers to `(Koid, RawHandle)`;
 close-cancels-poll is preserved via the koid.
+
+**The rule underneath that move:** an fd number names a slot in one process's
+table and means nothing in another's, so anything reached across a process
+boundary is selected by the object it watches and never by the number.
+`io_uring::remove_fd` now takes `sources: &[Option<Source>]` with no fd number
+in its signature, which makes the old shape unrepresentable at its one call
+site; the rule is what stops the next cross-process structure being keyed the
+same way.
 
 ## 7. Kernel-internal integers: what stays, what dies
 
@@ -944,7 +981,7 @@ kill-soundd-respawn-audio-recovers.
 
 **Stage F — audit & shrink.**
 Dead constants and `_ =>` arms deleted; grep-gates added to CI (§12.2); CLAUDE.md
-architecture + known-issues updated (closes: `SharedToken` RAII, io_uring shm abuse,
+architecture + `specs/issues/` updated (closes: `SharedToken` RAII, io_uring shm abuse,
 `Fd` rename, unprivileged RT); census check in `log_health` behind a boot flag.
 
 Dependency notes: Stages A–D are independent of Phase 1 (scheduler) and Phase 2

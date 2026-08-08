@@ -26,6 +26,12 @@ impl Address {
     }
 }
 
+impl core::fmt::Display for Address {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// Every codec address `statests` reports, lowest first.
 ///
 /// The whole of codec presence detection. Returned as an iterator over *all*
@@ -41,6 +47,12 @@ pub struct Node(pub u8);
 
 impl Node {
     pub const ROOT: Self = Self(0);
+}
+
+impl core::fmt::LowerHex for Node {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::LowerHex::fmt(&self.0, f)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,6 +105,7 @@ pub const SET_CONNECTION_SELECT: u16 = 0x701;
 pub const GET_CONFIG_DEFAULT: u16 = 0xF1C;
 pub const GET_PIN_SENSE: u16 = 0xF09;
 pub const SET_AMP_GAIN_MUTE: u16 = 0x3;
+pub const SET_CONVERTER_FORMAT: u16 = 0x2;
 
 pub const PARAM_VENDOR_ID: u8 = 0x00;
 pub const PARAM_REVISION_ID: u8 = 0x02;
@@ -106,7 +119,10 @@ pub const PARAM_PIN_CAPS: u8 = 0x0C;
 pub const PARAM_AMP_IN_CAPS: u8 = 0x0D;
 pub const PARAM_CONNECTION_LENGTH: u8 = 0x0E;
 pub const PARAM_POWER_STATES: u8 = 0x0F;
+pub const PARAM_PROCESSING_CAPS: u8 = 0x10;
+pub const PARAM_GPIO_COUNT: u8 = 0x11;
 pub const PARAM_AMP_OUT_CAPS: u8 = 0x12;
+pub const PARAM_VOLUME_KNOB_CAPS: u8 = 0x13;
 
 /// A codec's 32-bit answer.
 ///
@@ -137,19 +153,39 @@ pub struct Subordinates {
     pub count: u8,
 }
 
+/// Why a subordinate-node count named no range.
+///
+/// Two facts and not one: a codec declaring none is a leaf, a codec declaring a
+/// range that runs off the node id space is a codec contradicting itself, and
+/// nothing that reports the second can afford to have them folded together.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoSubordinates {
+    Leaf,
+    PastNodeSpace { first: Node, count: u8 },
+}
+
 impl Subordinates {
-    pub fn decode(response: Response) -> Option<Self> {
-        let first = ((response.0 >> 16) & 0xFF) as u8;
+    pub fn decode(response: Response) -> Result<Self, NoSubordinates> {
+        let first = Node(((response.0 >> 16) & 0xFF) as u8);
         let count = (response.0 & 0xFF) as u8;
-        if count == 0 || first as u16 + count as u16 > 256 {
-            return None;
+        if count == 0 {
+            return Err(NoSubordinates::Leaf);
         }
-        Some(Self { first: Node(first), count })
+        if first.0 as u16 + count as u16 > 256 {
+            return Err(NoSubordinates::PastNodeSpace { first, count });
+        }
+        Ok(Self { first, count })
     }
 
     pub fn nodes(self) -> impl Iterator<Item = Node> {
         let first = self.first.0 as u16;
         (first..first + self.count as u16).map(|node| Node(node as u8))
+    }
+
+    /// The highest node id in the range. There is always one: a range with no
+    /// node in it is not a `Subordinates`.
+    pub fn last(self) -> Node {
+        Node((self.first.0 as u16 + self.count as u16 - 1) as u8)
     }
 
     pub fn contains(self, node: Node) -> bool {
@@ -193,6 +229,13 @@ mod tests {
     }
 
     #[test]
+    fn an_address_and_a_node_print_the_way_a_dump_names_them() {
+        assert_eq!(alloc::format!("codec{}", Address::new(2).unwrap()), "codec2");
+        assert_eq!(alloc::format!("node={:#04x}", Node(0x02)), "node=0x02");
+        assert_eq!(alloc::format!("{:#04x}", Node(0xFF)), "0xff");
+    }
+
+    #[test]
     fn statests_bit_15_is_not_an_address() {
         assert_eq!(present(0x8000).count(), 0);
         assert_eq!(Address::new(15), None);
@@ -202,16 +245,23 @@ mod tests {
     fn a_range_running_past_the_node_space_is_refused() {
         // 200 nodes from 200 is 400, and a u8 walk would wrap to node 0 and
         // report the root as a widget.
-        assert_eq!(Subordinates::decode(Response::new(0x00C8_00C8).unwrap()), None);
+        assert_eq!(
+            Subordinates::decode(Response::new(0x00C8_00C8).unwrap()),
+            Err(NoSubordinates::PastNodeSpace { first: Node(200), count: 200 })
+        );
         // Ending exactly at 256 is the last legal range.
         let last = Subordinates::decode(Response::new(0x0080_0080).unwrap()).unwrap();
         assert_eq!(last.nodes().last(), Some(Node(255)));
+        assert_eq!(last.last(), Node(255));
         assert_eq!(last.nodes().count(), 128);
     }
 
     #[test]
     fn zero_subordinates_is_no_range_at_all() {
-        assert_eq!(Subordinates::decode(Response::new(0x0002_0000).unwrap()), None);
+        assert_eq!(
+            Subordinates::decode(Response::new(0x0002_0000).unwrap()),
+            Err(NoSubordinates::Leaf)
+        );
     }
 
     #[test]
@@ -219,6 +269,7 @@ mod tests {
         // `hda: codec0 fg=0x01 widgets=0x02..0x24`, from the boot.
         let range = Subordinates::decode(Response::new(0x0002_0023).unwrap()).unwrap();
         assert_eq!(range.first, Node(0x02));
+        assert_eq!(range.last(), Node(0x24));
         assert_eq!(range.nodes().last(), Some(Node(0x24)));
         assert!(range.contains(Node(0x14)));
         assert!(!range.contains(Node(0x01)));

@@ -1,7 +1,10 @@
 pub mod apic;
+pub mod control_regs;
 pub mod cpu;
 #[allow(dead_code)]
 pub mod debug;
+pub mod entry;
+pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod mtrr;
@@ -9,4 +12,5 @@ pub mod pat;
 pub mod percpu;
 pub mod smp;
 pub mod syscall;
+pub mod tlb;
 

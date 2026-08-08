@@ -305,7 +305,7 @@ pub fn boost_current_rt_inherited() {
     driver::boost_current(boost_window());
 }
 
-/// `SYS_SET_RT_PRIORITY`. Gated at the dispatch site on the `DEVICE_AUDIO`
+/// `SYS_SET_RT_PRIORITY`. Gated at the dispatch site on a sound-device
 /// claim, not here — this must stay callable from kernel init. That is not yet
 /// spec §9.4's privilege gate: `SYS_OPEN_DEVICE` is first-come and ungated, so
 /// whoever wins the claim race gets the RT band with it.
@@ -544,29 +544,5 @@ pub fn log_health() {
     {
         crate::mm::pmm::dump_stats();
     }
-}
-
-/// Dump this CPU's parked threads.
-///
-/// Only this CPU's: a `CpuSched` is `!Sync`, so a sibling's parked map is not
-/// walkable. A cross-CPU view costs a message round trip.
-///
-/// Its one caller is `drain_irqs`, past every device service, and the assert is
-/// what keeps that true: this walks the scheduler and logs a line per parked
-/// thread, and the keystroke that asks for it is decoded under a driver's guard
-/// on both input paths. `pass` owns the one level; a `Lock` guard would add
-/// another.
-pub fn dump_blocked() {
-    let depth = crate::preempt::count();
-    assert!(depth <= 1, "dump_blocked ran under a lock: preempt depth {depth}");
-    crate::log!(
-        "=== PARKED THREADS on cpu {} ({}) ===",
-        percpu::cpu_id(),
-        driver::parked_len()
-    );
-    driver::for_each_parked(|key, deadline, class| {
-        crate::log!("  task={:?} class={:?} deadline={:?}", key, class, deadline);
-    });
-    crate::log!("=== END PARKED ===");
 }
 

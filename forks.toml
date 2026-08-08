@@ -11,6 +11,11 @@
 #              backends: the fork eventually disappears.
 #   fork     — the change is genuinely invasive and must live in the crate.
 #   toolchain— consumed by the rust/ submodule rather than userland.
+#   source   — not a crate: third-party source this project compiles, pinned to
+#              an upstream commit and fetched rather than patched. doomgeneric
+#              is the only one. The tier exists because this manifest is the
+#              estate's inventory, and a third-party source tree that is not in
+#              it is precisely the hole the manifest closes.
 #
 # `base` is the upstream commit the branch is built on. Several are NOT release
 # tags: the vendored snapshots predated the tags they claimed, and using the tag
@@ -26,14 +31,21 @@
 # A fork being sendable is not the same as it being *worth* sending. See memmap2
 # below: purely additive, unblocked, and still a bad PR.
 #
-# `delta` is `git diff --shortstat <base>..<branch>`, re-measured 2026-07-28.
-# The numbers before that date were inflated by vendoring cruft — gutted upstream
-# READMEs (memmap2's deleted the upstream authors' copyright notices) and stray
-# .gitignore entries — which has now been reverted everywhere. The invariant is
-# that base..branch contains no hunk an upstream PR would not: check with
-#   git diff <base>..<branch> -- README* LICENSE* COPYRIGHT NOTICE .gitignore
-# and expect empty. Fork identity lives in each repo's GitHub description, which
-# costs no diff.
+# `delta` is `git diff --shortstat <base>..origin/<branch>`, re-measured
+# 2026-08-07, and it describes the *branch head* rather than whatever a lockfile
+# pins. The numbers before 2026-07-28 were inflated by vendoring cruft — gutted
+# upstream READMEs (memmap2's deleted the upstream authors' copyright notices)
+# and stray .gitignore entries — which has now been reverted everywhere. The
+# invariant is that base..branch contains no hunk an upstream PR would not:
+#   git diff <base>..origin/<branch> -- README* LICENSE* COPYRIGHT NOTICE .gitignore
+# and expect empty. It was empty for all sixteen branches on 2026-08-07.
+# Fork identity lives in each repo's GitHub description, which costs no diff.
+#
+# Where a fork has an open PR, the fork repo carries a *second* branch at the PR
+# head, named below as `pr_branch`. It is not redundant with `toyos`: the PR sits
+# on whatever upstream commit the maintainer wants and carries only PR content,
+# while `toyos` stays on `base` and may carry local-build accommodations that
+# `not_pr_content` records. `toyos` is the branch every [patch] entry consumes.
 
 [meta]
 owner = "Japabu"
@@ -88,7 +100,7 @@ pr = "none — blocked on publishing"
 [winit]
 upstream = "rust-windowing/winit"
 base = "c4afadbf"
-delta = "+1243"
+delta = "+1249"
 tier = "sibling"
 why = "Adds the winit-toyos sibling crate — the model case for this tier."
 pr = "none — winit-toyos must be published before upstream can depend on it by version"
@@ -109,7 +121,8 @@ delta = "+109"
 tier = "sibling"
 why = "Pure addition: a ToyOS handle variant. Depends on nothing of ours, so it was sendable without publishing."
 pr = "https://github.com/rust-windowing/raw-window-handle/pull/223 (open, 2026-07-28)"
-pr_note = "`toyos` was moved to c39042b so its tree is byte-identical to the PR head; the delta grew +69 → +109 by adding the doc examples and CHANGELOG entry every other platform module carries."
+pr_branch = "add-toyos-support"
+pr_note = "`toyos` was moved to c39042b so its tree is byte-identical to the PR head; the delta grew +69 → +109 by adding the doc examples and CHANGELOG entry every other platform module carries. Verified 2026-08-07: `git diff origin/toyos origin/add-toyos-support` is empty, and both are +109 off 1b85948."
 
 [getrandom]
 upstream = "rust-random/getrandom"
@@ -209,6 +222,53 @@ delta = "+7/-1"
 tier = "fork"
 why = "Adds the toyos target triple. Five lines of code across two files."
 pr = "https://github.com/bytecodealliance/target-lexicon/pull/134 (open, 2026-07-27)"
+pr_branch = "add-toyos-os"
+pr_note = "Unlike raw-window-handle the two branches cannot be made identical: `add-toyos-os` sits on a later upstream (it carries #131 and #133) and is +5/-1, while `toyos` stays on v0.13.5 and is +7/-1. The ToyOS hunks in src/targets.rs and src/triple.rs are the same on both; the extra two lines are `not_pr_content`."
+not_pr_content = "`#![allow(unexpected_cfgs)]` in build.rs and src/lib.rs. build.rs:56 emits `cargo:rustc-cfg=feature=\"rust_1_40\"`, a feature the manifest never declares, so the lint fires on a crate that denies warnings. It is an upstream lint debt, not ToyOS content — fixing it upstream is its own PR, and doing so would let this fork drop to +5/-1."
+
+[doomgeneric]
+upstream = "ozkl/doomgeneric"
+base = "fc601639494e089702a1ada082eb51aaafc03722"
+base_note = """
+"I_Error exits instead of infinite loop", 2025-08-24. Not a tag — doomgeneric
+publishes none. Chosen because it is what this project has been building all
+along: of the 202 files in the checkout that produced every doom measurement on
+record, the 197 nobody had touched match this commit's `doomgeneric/` tree
+exactly, and it is the newest commit for which that is true. Identified by
+hashing each file and comparing against every commit on master.
+"""
+delta = "none"
+tier = "source"
+why = """
+The C half of /bin/doom — 56,726 lines descended from id Software's Doom, via
+Chocolate Doom. `userland/doom/build.rs` fetches the commit's archive into
+`userland/doom/doomgeneric/`, which is gitignored, and compiles it with
+`toyos-cc`. Every ToyOS-side change lives beside it rather than in it:
+`userland/doom/include/` is force-included ahead of the C tree and
+`userland/doom/src/` is the Rust side, so the fetched sources are upstream's
+unmodified and `delta` is honestly zero.
+"""
+pin = """
+The commit is the pin and the checksum both: GitHub's archive of a sha is that
+sha's tree and can be nothing else, so no second hash of ours would say more.
+`userland/doom/doomgeneric/.toyos-commit` records what a checkout actually has,
+and a mismatch replaces the tree. Before 2026-08-08 the fetch was
+`refs/heads/master` guarded by whether the directory existed, so which Doom
+sources you built was a function of when you first cloned.
+"""
+licence = "GPL-2.0 — the one exception the README's licence section already declares."
+pr = """
+none, and none is owed: nothing of ours is in the tree to send back.
+"""
+followup = """
+This is a fetch, not a fork, and the two differ where it matters: there is no
+`toyos` branch, so a ToyOS patch to the C would have nowhere to live but an
+untracked directory — which is where the one that existed had been living. The
+end state the audit recommends is Japabu/doomgeneric as a submodule at that
+path, which deletes the fetch and the five build-dependencies that serve it
+(`ureq`, `rustls-rustcrypto`, `webpki-roots`, `flate2`, `tar`). It needs a repo
+the owner creates, so it is his call rather than an agent's.
+"""
 
 # Not a crate fork: rust/ is a submodule of Japabu/rust (compiler + std with
 # ToyOS as a target). Its own upstream sync is tracked separately.

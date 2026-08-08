@@ -104,20 +104,11 @@ fn stage(path: &Path, bytes: u64) -> u64 {
 }
 
 /// Every claim the host can make about what the guest did to the disk.
-fn verify(path: &Path, bytes: u64, nonce: u64) -> Result<(), String> {
-    verify_except(path, bytes, nonce, &[])
-}
-
-/// The same, for a boot in which one of the guest's writes was deliberately
-/// broken mid-flight.
 ///
-/// `unwritten` names the blocks whose *content* is nobody's claim afterwards —
-/// the injected break abandons a data phase the emulator has already been handed,
-/// so whether those bytes reached the medium before the Bulk-Only Reset cancelled
-/// the command is QEMU's to decide. Everything else is still checked, which is
-/// the whole assertion: a disk taken offline by one broken transfer writes none
-/// of it.
-fn verify_except(path: &Path, bytes: u64, nonce: u64, unwritten: &[i64]) -> Result<(), String> {
+/// **Every block, on every boot, the one a staged break interrupted included.**
+/// `usb_transport_break` used to name that block as nobody's claim, which was
+/// the driver's lost write written into the harness as an expectation.
+fn verify(path: &Path, bytes: u64, nonce: u64) -> Result<(), String> {
     let blocks = bytes / BLOCK;
     let guest_nonce = !nonce;
     let mut file = std::fs::OpenOptions::new()
@@ -128,9 +119,6 @@ fn verify_except(path: &Path, bytes: u64, nonce: u64, unwritten: &[i64]) -> Resu
 
     // What the guest wrote, at the LBAs it was told to write them.
     for index in GUEST_BLOCKS {
-        if unwritten.contains(&index) {
-            continue;
-        }
         let block = block_of(blocks, index);
         let got = read_block(&mut file, block);
         if let Some(at) = (0..BLOCK as usize).find(|&i| got[i] != pattern(guest_nonce, block, i)) {
@@ -988,9 +976,10 @@ fn failed_flush_stops_once(
     if !log.contains("usb-storage: SCSI 0x35 failed, sense 0x04/0x44/0x00") {
         return Err(format!("the injected flush failure never reached the driver\n{log}"));
     }
-    let gave_up = log
-        .matches("log-file: the volume's device refused the sync — /log/")
-        .count();
+    // By step and not by code alone: the sink's four failure points all answer
+    // `SyscallError::Io` now, and the one this test stages is the sync rather
+    // than the append or the write-back ahead of it.
+    let gave_up = log.matches("log-file: the volume sync was refused").count();
     if gave_up != 1 {
         return Err(format!(
             "the sink gave up {gave_up} times, wanted exactly one — a failed sync has to reach \
@@ -1177,7 +1166,7 @@ pub fn xhci_slow_connect(
     /// guest's own clock and the settle re-reads it every `PORT_POLL_NS`, so the
     /// spread is a millisecond of polling and not a share of the host. Six runs
     /// here — three sequential, three with four concurrent test processes on the
-    /// machine — put the first port line at 0.400-0.402 s, and known-issues
+    /// machine — put the first port line at 0.400-0.402 s, and `specs/issues/`
     /// records one at 0.413 under five-agent load. 13 ms of worst observed
     /// excursion against 150 of slack, and 700 of clearance to the shape above.
     const SETTLE_SLACK_S: f64 = 0.150;
@@ -1208,7 +1197,7 @@ pub fn xhci_slow_connect(
     // a delta from `controller started` instead compared a delta against an
     // absolute window, which silently required the boot to reach its controller
     // within `PORT_DEBOUNCE_NS`: a budget it has since grown out of, and four
-    // red runs and an afternoon in the driver (known-issues).
+    // red runs and an afternoon in the driver (`specs/issues/`).
     let started = stamp_of(&log, "xHCI: controller started")?;
     // The first line this driver prints about any port at all. Every other
     // per-port line is preceded by that port's connect line, so the first match
@@ -1419,21 +1408,27 @@ pub fn xhci_portsc_rw1c(
 /// transfer which ran out `USB_TIMEOUT_NS` leaves behind, byte for byte, so the
 /// recovery under test runs against a real endpoint state rather than a flag.
 ///
-/// The assertion that decides it is host-side and is about bytes: everything the
-/// guest wrote *after* the break is byte-correct in the backing file. Before the
-/// fix the disk is offline from the break onward, so the nine-block run and the
-/// second guest block never leave the guest at all.
+/// **One injection is one abandoned transfer, and not one broken transfer.** The
+/// device answers that transfer after the driver has stopped listening, and
+/// where that answer lands relative to the Bulk-Only Reset decides whether the
+/// reset holds: the guest wins the race under KVM and loses it under TCG, so
+/// this boot produces one break on the dev host and two on CI, off the same
+/// tree. Counting breaks is therefore a count of who won a race. What the driver
+/// owes either way is that the caller's write survives, and that is what is
+/// asserted here.
+///
+/// The assertion that decides it is host-side and is about bytes: **every** block
+/// the guest was told to write is byte-correct in the backing file, the broken
+/// one included. Before the recovery existed the disk is offline from the break
+/// onward, so the nine-block run and the second guest block never leave the guest
+/// at all; before the command was re-issued over the transport the recovery gave
+/// back, the broken block is missing from the image and `wr_err` is not zero.
 pub fn usb_transport_break(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     const FEATURES: &[&str] = &["usb-storage-gate", "usb-transport-break"];
-    /// The kernel arms the injection on the first WRITE(10) of the boot, and
-    /// the gate's first write is `GUEST_BLOCKS[0]`. If anything ever writes a
-    /// USB disk earlier the `wr_err=1` assertion below stops matching, which is
-    /// what keeps this constant honest.
-    const EATEN: i64 = GUEST_BLOCKS[0];
 
     let (bytes, lba) = Profile::UsbDisk.usb_disk().expect("UsbDisk declares a disk");
     let image = test_dir().join("usb-transport-break.img");
@@ -1459,15 +1454,26 @@ pub fn usb_transport_break(
     // wrong — which is the line the T14 produced, and the reason the cause of
     // that break cannot be read out of its log today.
     const BROKE: &str = "usb-storage: transport broke on SCSI 0x2a: no answer in the data phase";
-    if !log.contains(BROKE) {
-        return Err(format!("the guest never printed {BROKE:?}; did the injection run?\n{log}"));
-    }
-    let breaks = log.matches("transport broke").count();
-    if breaks != 1 {
+    let staged = log.matches(BROKE).count();
+    if staged != 1 {
         return Err(format!(
-            "the transport broke {breaks} times; the injection is armed once per boot, so \
-             anything else is a break this test did not stage\n{log}"
+            "the staged break happened {staged} times, want the one the injection arms per \
+             boot; did it run?\n{log}"
         ));
+    }
+    // And the driver got over it. Two attempts are explained by the fault — the
+    // fault itself, and the recovery the device's late answer to the abandoned
+    // transfer can undo — so a third that also breaks is the transport failing
+    // to come back rather than this test's doing.
+    let breaks = log.matches("transport broke").count();
+    if breaks > 2 {
+        return Err(format!(
+            "the transport broke {breaks} times off one abandoned transfer, which can undo one \
+             recovery and no more\n{log}"
+        ));
+    }
+    if let Some(gave_up) = log.lines().find(|l| l.contains("times running; the transport is not")) {
+        return Err(format!("{gave_up:?}\n{log}"));
     }
 
     // The endpoint state the recovery had to be chosen for, read out of the
@@ -1498,17 +1504,18 @@ pub fn usb_transport_break(
         }
     }
 
-    // One write reported a failure, and the disk stayed online through it.
-    // Before the fix this line reads `wr_err=3 healthy=false`.
-    if !log.contains("usb-gate: disk done reads=ok writes=bad refusal=true wr_err=1 healthy=true") {
-        return Err(format!("the disk did not survive one broken transfer\n{log}"));
+    // Not one write reported a failure, and the disk stayed online. Before the
+    // recovery existed this line reads `wr_err=3 healthy=false`; before the
+    // command was re-issued it reads `writes=bad ... wr_err=1`.
+    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true wr_err=0 healthy=true") {
+        return Err(format!("a write did not survive one broken transfer\n{log}"));
     }
 
     // And the bytes, which is the claim nothing in the guest can make for
-    // itself: everything written after the break is in the backing file, the
-    // host's own blocks are unchanged, and the blocks either side of the run
-    // are still zero.
-    verify_except(&image, bytes, nonce, &[EATEN])?;
+    // itself: every block the guest was told to write is in the backing file,
+    // the host's own blocks are unchanged, and the blocks either side of the
+    // run are still zero.
+    verify(&image, bytes, nonce)?;
     if !log.contains("Boot: complete") {
         return Err(format!("the boot did not finish after the break\n{log}"));
     }
@@ -1517,8 +1524,8 @@ pub fn usb_transport_break(
 
     eprintln!(
         "  [usb] a bulk transfer abandoned mid-flight: the endpoint was found Running and \
-         stopped rather than reset, the disk stayed online, and every write after the break \
-         verified host-side"
+         stopped rather than reset, the transport came back in {breaks} break(s), and every \
+         block the guest was told to write verified host-side"
     );
     Ok(())
 }
@@ -2634,6 +2641,183 @@ pub fn usb_refused_disk_first(
         "  [usb] a {huge} B disk refused on slot 1, enumerated first: the boot stick behind it \
          binds at msc_block +0x20000, not the refused disk's block — and once the refused disk \
          is unplugged a {REPLACEMENT_BYTES} B one binds at +0x10000, which is that block back"
+    );
+    Ok(())
+}
+
+/// The stick the machine booted from, pulled while the desktop is up.
+///
+/// **The instrument for #152, and the reason it exists is that the failure has
+/// no other witness.** `/log` is on the stick, so the recording of the event
+/// dies with the event; the machine has no serial port; it is not a panic, so
+/// the on-screen console never paints; and Ctrl+Alt+D answers nothing. Three
+/// investigations ran on the owner's description alone.
+///
+/// The pull is `device_del` on the boot stick, which had no device id until
+/// this gate needed one — every earlier unplug test names a *data* disk, and a
+/// data disk carries neither `/boot` nor `/log` nor the mount the log sink
+/// writes through. That difference is the whole scenario.
+///
+/// The liveness signal is `compositor: frames=`, for the reason
+/// `metal_sim_pointer_churn` picked it: it comes from a composited frame, so
+/// its absence is a desktop that stopped drawing rather than an instrument that
+/// stopped counting — which is exactly what the owner reports, a clock that
+/// stops advancing. The second probe is the serial console, which reaches
+/// userland through a different path: `run` makes test-runner print a line and
+/// then walk the VFS looking for a binary.
+///
+/// **A green run does not certify the machine survives an unplug.** It
+/// certifies that this shape of unplug, on this emulated controller, leaves the
+/// guest drawing and answering. What it *is* good for is red: a red here is the
+/// first reproduction of the owner's freeze anywhere but his desk.
+pub fn usb_boot_stick_pulled(
+    test_config: &Path,
+    _c_bins: &[(String, Vec<u8>)],
+    _rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let _ = test_config;
+    /// Probes sent before the pull, and after it. The drumbeat is the liveness
+    /// signal as well as the load: each one is a userland `println!` into the
+    /// ring the log sink drains to the stick, and a VFS walk for a binary that
+    /// is not there.
+    const BEFORE: usize = 12;
+    const AFTER: usize = 40;
+    /// How many of the probes after the pull have to come back. Not all of
+    /// them: a machine that pauses while the driver tears the port down and
+    /// then carries on has survived, and this gate's subject is a machine that
+    /// never carries on.
+    const ANSWERED: usize = 8;
+
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+    let options = BootOptions {
+        profile: Profile::Metal,
+        qmp: true,
+        // Rotation at 256 bytes rather than a mebibyte, so the sink is not just
+        // appending when the device goes: every few probes it creates a file,
+        // sweeps the volume, deletes the oldest and syncs the mount. That is
+        // FAT allocation and directory writes in flight at the moment of the
+        // pull, which is the state the owner's machine is in and the one a
+        // quiet idle desktop never reaches.
+        kernel_features: &["log-rotate-fast"],
+        // The T14's core count. How many CPUs are in the idle loop when the
+        // device goes is the whole question on one hypothesis.
+        smp: 8,
+        ..Default::default()
+    };
+    let argv = qemu::profile_argv(&options);
+    if !argv.iter().any(|a| a.contains(&format!("id={}", qemu::BOOT_STICK_ID))) {
+        return Err(format!("the boot stick has no device id, so it cannot be pulled: {argv:?}"));
+    }
+
+    let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+    let socket = qemu.qmp_socket().to_path_buf();
+    let mut console = qemu.boot_log().to_string();
+    let frames = |text: &str| text.matches("compositor: frames=").count();
+
+    // The machine has to be drawing before it is asked to survive anything, or
+    // a green run is a boot that never started.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && frames(&console) < 1 {
+        console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+    }
+    if frames(&console) < 1 {
+        return Err(format!("the compositor never composited a frame:\n{console}"));
+    }
+
+    // And it has to be writing to the stick, or the pull is a disconnect with
+    // nothing in flight — which is not the state the owner's machine is in.
+    // The sink names the file it installed on `/log`, and that volume is on the
+    // device this test is about to take away.
+    if !console.contains("log-file: this boot's kernel log is /log/") {
+        return Err(format!(
+            "no log sink installed on /log, so the stick is not being written to and this gate \
+             stages nothing:\n{console}"
+        ));
+    }
+
+    let probe = |qemu: &mut QemuInstance, console: &mut String, i: usize| {
+        let _ = writeln!(qemu.stdin_mut(), "run pull-probe-{i}");
+        qemu.flush_stdin();
+        console.push_str(&qemu.drain_serial(Duration::from_millis(120)));
+    };
+
+    for i in 0..BEFORE {
+        probe(&mut qemu, &mut console, i);
+    }
+    let answered_before = console.matches("===TEST_END pull-probe-").count();
+    if answered_before < BEFORE / 2 {
+        return Err(format!(
+            "only {answered_before} of {BEFORE} probes came back *before* the pull, so the \
+             drumbeat this gate measures does not work on a healthy machine:\n{console}"
+        ));
+    }
+    // The rotation actually ran, so "the sink was busy" is a fact rather than a
+    // feature flag that might have been dropped.
+    if !console.contains("log-file: /log/") || !console.contains("and this boot continues in") {
+        return Err(format!(
+            "the log sink never rotated, so the pull below lands on a sink that is only \
+             appending:\n{console}"
+        ));
+    }
+
+    let pulled_at = console.len();
+    let mut devices = qemu::QmpDevices::open(&socket);
+    devices.del(qemu::BOOT_STICK_ID);
+    drop(devices);
+
+    for i in BEFORE..BEFORE + AFTER {
+        probe(&mut qemu, &mut console, i);
+    }
+    let after = &console[pulled_at.min(console.len())..];
+    let answered = after.matches("===TEST_END pull-probe-").count();
+    let drawn = frames(after);
+    if answered < ANSWERED || drawn < 2 {
+        return Err(format!(
+            "the boot stick was pulled and the machine answered {answered} of {AFTER} console \
+             probes and composited {drawn} frame batches after it (want {ANSWERED} and 2) — it \
+             stopped:\n{console}\n{}",
+            crate::freeze_report(&mut qemu, &mut console)
+        ));
+    }
+
+    // And the same stick put back. The owner reports the freeze from a replug
+    // as well as from a pull, and the two are different states: a replug binds
+    // a new disk under mounts that still name the old one.
+    let replug = test_dir().join("usb-replug.img");
+    drop(sparse(&replug, 512 * 1024 * 1024));
+    let replugged_at = console.len();
+    let mut devices = qemu::QmpDevices::open(&socket);
+    devices.blockdev_add("replug", &replug);
+    devices.add("usb-storage", "xhci.0", "replug0", &[("drive", "replug")]);
+    drop(devices);
+
+    for i in BEFORE + AFTER..BEFORE + 2 * AFTER {
+        probe(&mut qemu, &mut console, i);
+    }
+    let after_replug = &console[replugged_at.min(console.len())..];
+    let answered_replug = after_replug.matches("===TEST_END pull-probe-").count();
+    let drawn_replug = frames(after_replug);
+    if answered_replug < ANSWERED || drawn_replug < 2 {
+        return Err(format!(
+            "a stick was plugged back into the port the boot stick was pulled from and the \
+             machine answered {answered_replug} of {AFTER} console probes and composited \
+             {drawn_replug} frame batches after it (want {ANSWERED} and 2) — it stopped:\
+             \n{console}\n{}",
+            crate::freeze_report(&mut qemu, &mut console)
+        ));
+    }
+
+    for bad in ["!!! PANIC !!!", "panicked at"] {
+        if console.contains(bad) {
+            return Err(format!("{bad:?} after the boot stick was pulled\n{console}"));
+        }
+    }
+    let _ = std::fs::remove_file(&replug);
+
+    eprintln!(
+        "  [usb] the boot stick was pulled out from under a running desktop with the log sink \
+         rotating: {answered}/{AFTER} console probes answered and {drawn} frame batches after \
+         the pull, {answered_replug}/{AFTER} and {drawn_replug} after a stick went back in"
     );
     Ok(())
 }

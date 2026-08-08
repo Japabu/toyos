@@ -234,7 +234,7 @@ to reading the drained cursor.
   Removing them touches the panic handler's most carefully argued ordering, so
   it is a change of its own, not a rider on this one.
 - **A live on-screen channel for a *running* machine: considered and declined**
-  (2026-08-01), not deferred. It would close known-issues §8's "no output channel
+  (2026-08-01), not deferred. It would close `specs/issues/hardware/`'s "no output channel
   once boot is done", and it is still the wrong trade.
 
   A periodic repainter has to render from timer context through the same

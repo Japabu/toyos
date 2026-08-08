@@ -10,11 +10,15 @@ pub type DeviceId = u32;
 /// enum here would be a vocabulary nothing matches on and every new driver
 /// would have to guess an arm from.
 ///
-/// It is not `SyscallError` because none of that enum's nine variants means
-/// "the device did not do it", and inventing one is an ABI change. Nothing
-/// above this trait reports an I/O failure to userland yet — the filesystem
-/// boundary swallows it — so that conversion has no call site to be written
-/// against; known-issues carries it.
+/// It is not [`SyscallError`] because a driver has no business naming a
+/// syscall's return, and because this type is one bit where that one is a
+/// vocabulary. The conversion happens where the two meet: `vfs::FileSystem`
+/// answers `SyscallError` and [`SyscallError::Io`] is the variant that exists
+/// for this, so a refused transfer reaches userland as itself rather than as
+/// "no such file".
+///
+/// [`SyscallError`]: toyos_abi::syscall::SyscallError
+/// [`SyscallError::Io`]: toyos_abi::syscall::SyscallError::Io
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockError;
 
@@ -57,7 +61,7 @@ pub trait BlockDevice: Send {
 ///
 /// Both numbers are hard ceilings, not targets. Linux lets its page cache take
 /// the whole machine because it has a pressure signal and a reclaim path to
-/// give it back on demand; ToyOS has neither (known-issues §"No physical
+/// give it back on demand; ToyOS has neither (`specs/issues/isolation/no-physical-memory-fairness.md` ("No physical
 /// memory fairness"), so a cache that grows to fit the workload is a cache
 /// that starves userland with no way to stop it. Until there is a pressure
 /// signal, the ceiling has to be a number the machine can lose outright.

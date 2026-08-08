@@ -12,7 +12,25 @@ const MSR_GS_BASE: u32 = 0xC000_0101;
 // GDT selectors (must match entry order)
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
+/// The two selectors a thread runs userland with. RPL 3 is part of the value.
+pub const USER_DS: u16 = 0x1B;
+pub const USER_CS: u16 = 0x23;
 const TSS_SEL: u16 = 0x28;
+
+/// `STAR[63:48]`, which `SYSRET` derives both user selectors from: SS is this
+/// plus 8 and CS is this plus 16.
+///
+/// **RPL 3 belongs in this value rather than to the CPU, because the two
+/// vendors disagree about who supplies it.** Intel's SDM forces it into both —
+/// SYSRET's operation reads `SS.Selector := (IA32_STAR[63:48]+8) OR 3` — while
+/// AMD's APM forces it into CS alone and takes SS's straight from this field.
+/// So a bare [`KERNEL_DS`] here runs every user thread on an AMD machine with
+/// `SS = 0x18`, and the first interrupt taken from one dies on the handler's
+/// `iretq`: a return to an outer privilege level requires `SS.RPL == CS.RPL`,
+/// and 0 is not 3. `#GP(0x18)`, naming the selector.
+pub const STAR_SYSRET_BASE: u16 = USER_DS - 8;
+const _: () = assert!(STAR_SYSRET_BASE + 8 == USER_DS);
+const _: () = assert!(STAR_SYSRET_BASE + 16 == USER_CS);
 
 /// 64-bit TSS (104 bytes).
 #[repr(C, packed)]
@@ -389,44 +407,16 @@ pub fn init_bsp(lapic_id: u32) {
     alloc_ist1_stack(percpu);
 
     unsafe { percpu.load_gdt(); }
-    cpu::enable_sse();
-    let smep = cpu::enable_smep();
-    let smap = cpu::enable_smap();
-    require_fsgsbase(cpu::enable_fsgsbase());
-    let pcid = crate::mm::paging::enable_pcid();
+    super::control_regs::init(0);
+    super::fpu::init();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
 
     // GS base is now valid — enable CPU/TID context in log! macro
     crate::log::PERCPU_READY.store(true, core::sync::atomic::Ordering::Release);
 
-    // One line for the whole machine. Every CPU runs the identical sequence
-    // against identical silicon, so the per-CPU repetition this replaces was
-    // 4 lines times the core count of noise carrying one bit each — 28 of the
-    // T14's ~150 boot lines, on a screen that holds 67. Reported rather than
-    // asserted: on TCG none of the three is available, and a line claiming
-    // otherwise would be a diagnostic that lies on the only machine most of
-    // this tree's boots happen on.
-    log!(
-        "percpu: BSP cpu_id=0 lapic_id={} smep={} smap={} pcid={}",
-        lapic_id, on(smep), on(smap), on(pcid)
-    );
-}
-
-fn on(enabled: bool) -> &'static str {
-    if enabled { "on" } else { "off" }
-}
-
-/// Unlike SMEP, SMAP and PCID, FSGSBASE is not optional here: `hw.rs` saves and
-/// restores the user TLS base with `rdfsbase`/`wrfsbase` on every context
-/// switch, so a CPU without it would #UD at the first one. Said out loud rather
-/// than discovered, because the alternative is a fault on a path that has no
-/// business faulting, on some future machine, with no line explaining it.
-fn require_fsgsbase(enabled: bool) {
-    assert!(
-        enabled,
-        "cpu: FSGSBASE is required — every context switch uses rdfsbase/wrfsbase",
-    );
+    log!("percpu: BSP cpu_id=0 lapic_id={lapic_id}");
+    super::fpu::log_state();
 }
 
 /// Allocate percpu for an AP on the BSP. Returns the raw pointer for the trampoline
@@ -441,16 +431,16 @@ pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
 
 /// Finish AP percpu initialization (called from ap_entry after GS base is set by trampoline).
 ///
-/// Silent throughout: `boot_aps` already logs one line per AP that came up,
-/// and this CPU's answers to the feature questions are the BSP's answers.
+/// `control_regs::init` and `fpu::log_state` are the two things here that print,
+/// and each says at its own definition why it may not assume this CPU answers
+/// like the BSP. Everything else is silent: `boot_aps` already logs one line per
+/// AP that came up.
 pub fn init_ap(percpu_ptr: *mut PerCpu) {
     let percpu = unsafe { &mut *percpu_ptr };
     unsafe { percpu.load_gdt(); }
-    cpu::enable_sse();
-    cpu::enable_smep();
-    cpu::enable_smap();
-    require_fsgsbase(cpu::enable_fsgsbase());
-    crate::mm::paging::enable_pcid();
+    super::control_regs::init(percpu.cpu_id);
+    super::fpu::init();
+    super::fpu::log_state();
 }
 
 /// Update both the percpu kernel_rsp (for syscall entry) and tss.rsp0 (for interrupts).

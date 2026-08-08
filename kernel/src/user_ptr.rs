@@ -4,9 +4,15 @@
 //! then accessed through the kernel's high-half direct map (PHYS_OFFSET).
 //! SMAP stays enabled 100% — no stac/clac anywhere.
 //!
-//! Returns kernel-accessible references (&T, &[u8], &str) that point into
-//! the direct map. These are valid for the duration of the syscall.
+//! **Nothing here hands out a reference to user memory.** Small values are
+//! copied ([`SyscallContext::copy_in`], [`SyscallContext::copy_out`]), strings
+//! are copied, and bulk buffers are a [`UserBytes`] / [`UserBytesMut`] window
+//! the kernel reads or writes but never borrows — see [`UserBytes`] for why the
+//! borrow was the bug.
 
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use toyos_abi::syscall::SyscallError;
@@ -36,40 +42,57 @@ pub unsafe trait UserSafe: Copy {}
 unsafe impl UserSafe for u32 {}
 unsafe impl UserSafe for u64 {}
 unsafe impl UserSafe for [u32; 2] {}
+unsafe impl UserSafe for [u64; 2] {}
 
 // Kernel types.
 unsafe impl UserSafe for crate::fd::Stat {}
 
 // ABI types.
 unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
+unsafe impl UserSafe for toyos_abi::syscall::SchedInfo {}
+unsafe impl UserSafe for toyos_abi::syscall::ProcessStats {}
+unsafe impl UserSafe for toyos_abi::FramebufferInfo {}
 
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
 
-/// Check that [ptr..ptr+size) is in the user half of the address space.
+/// Translate a user virtual address to its direct-map address, demand-paging
+/// it in if it is not mapped yet.
 ///
-/// Also used by `sys_mmap`, which installs mappings rather than dereferencing
-/// them: the hardware user/kernel split is the same bound either way, and a
-/// second copy of the constant is a second thing to get wrong.
-pub(crate) fn check_user_range(ptr: UserAddr, size: u64) -> bool {
-    if size == 0 { return true; }
-    let raw = ptr.raw();
-    let Some(end) = raw.checked_add(size) else { return false };
-    end <= 0x0000_8000_0000_0000
-}
-
-/// Translate a user virtual address to a kernel-accessible pointer via
-/// page table walk + direct map. Triggers demand paging if needed.
-fn translate(user_addr: u64) -> Option<*mut u8> {
+/// `pub(crate)` for the futex, whose word the *scheduler* dereferences long
+/// after the syscall that named it has returned — the one user address the
+/// kernel keeps rather than reads.
+pub(crate) fn translate_user(addr: UserAddr) -> Option<crate::mm::DirectMap> {
     let pt = crate::process::current_address_space();
-    if let Some(dm) = pt.lock().translate(UserAddr::new(user_addr)) {
-        return Some(dm.as_mut_ptr());
+    if let Some(dm) = pt.lock().translate(addr) {
+        return Some(dm);
     }
-    if !crate::process::handle_page_fault(user_addr, 0) {
+    if !crate::process::handle_page_fault(addr.raw(), 0) {
         return None;
     }
-    let result = pt.lock().translate(UserAddr::new(user_addr)).map(|dm| dm.as_mut_ptr());
+    let result = pt.lock().translate(addr);
     result
+}
+
+fn translate(user_addr: u64) -> Option<*mut u8> {
+    translate_user(UserAddr::new(user_addr)).map(|dm| dm.as_mut_ptr())
+}
+
+/// The direct-map address of a `T` the kernel may read or write at `ptr`.
+///
+/// One translation answers for one 2 MiB page, so [`user_span::is_user_object`]
+/// is what stands between a value near a page boundary and a copy that walks
+/// off the end of a *physical* page into whatever the PMM handed out next.
+fn object<T: UserSafe>(ptr: UserAddr) -> Result<*mut u8, SyscallError> {
+    let ok = crate::mm::user_span::is_user_object(
+        ptr.raw(),
+        core::mem::size_of::<T>() as u64,
+        core::mem::align_of::<T>() as u64,
+    );
+    if !ok {
+        return Err(SyscallError::BadAddress);
+    }
+    translate(ptr.raw()).ok_or(SyscallError::BadAddress)
 }
 
 
@@ -89,192 +112,257 @@ impl<'a> SyscallContext<'a> {
         Self { _scope: PhantomData }
     }
 
-    /// Validate a user pointer range and return a shared byte slice.
-    /// The returned slice points into the kernel direct map.
-    ///
-    /// Safe only if the user buffer is physically contiguous (single 2MB page
-    /// or contiguous allocation like stack/TLS/mmap). For buffers that may
-    /// span independently demand-paged 2MB pages, the physical pages might not
-    /// be contiguous — the slice would read wrong memory at page boundaries.
-    ///
-    /// Currently safe because: stack (contiguous OwnedAlloc), TLS (contiguous),
-    /// mmap (contiguous), pipes (single 2MB page). Demand-paged ELF code is
-    /// never accessed via user_slice (only via page fault handler).
-    pub fn user_slice(&self, ptr: UserAddr, len: u64) -> Option<&'a [u8]> {
+    /// A bulk buffer the kernel reads out of and never borrows.
+    pub fn user_bytes(&self, ptr: UserAddr, len: u64) -> Option<UserBytes<'a>> {
         let len = len as usize;
-        if len == 0 {
-            return Some(&[]);
-        }
-        if !check_user_range(ptr, len as u64) {
-            return None;
-        }
-        let kptr = translate(ptr.raw())?;
-        // Verify contiguity at every 2MB page boundary crossing.
-        // One translate() per boundary — negligible for typical syscall buffers.
-        let start = ptr.raw();
-        let end = start + len as u64;
-        let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
-        while boundary < end {
-            let k = translate(boundary)?;
-            let expected = unsafe { kptr.add((boundary - start) as usize) };
-            if k != expected {
-                return None;
-            }
-            boundary += crate::mm::PAGE_2M;
-        }
-        if len > 1 {
-            let end_kptr = translate(end - 1)?;
-            let expected_end = unsafe { kptr.add(len - 1) };
-            if end_kptr != expected_end {
-                return None;
-            }
-        }
-        Some(unsafe { core::slice::from_raw_parts(kptr as *const u8, len) })
+        let kptr = if len == 0 { core::ptr::NonNull::dangling().as_ptr() } else { window(ptr, len)? };
+        Some(UserBytes { kptr, len, _scope: PhantomData })
     }
 
-    /// Validate a user pointer range and return a mutable byte slice.
-    /// Same contiguity constraints as user_slice.
-    pub fn user_slice_mut(&self, ptr: UserAddr, len: u64) -> Option<&'a mut [u8]> {
+    /// A bulk buffer the kernel writes into and never borrows.
+    pub fn user_bytes_mut(&self, ptr: UserAddr, len: u64) -> Option<UserBytesMut<'a>> {
         let len = len as usize;
-        if len == 0 {
-            return Some(&mut []);
-        }
-        if !check_user_range(ptr, len as u64) {
-            return None;
-        }
-        let kptr = translate(ptr.raw())?;
-        let start = ptr.raw();
-        let end = start + len as u64;
-        let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
-        while boundary < end {
-            let k = translate(boundary)?;
-            let expected = unsafe { kptr.add((boundary - start) as usize) };
-            if k != expected {
-                return None;
-            }
-            boundary += crate::mm::PAGE_2M;
-        }
-        if len > 1 {
-            let end_kptr = translate(end - 1)?;
-            let expected_end = unsafe { kptr.add(len - 1) };
-            if end_kptr != expected_end {
-                return None;
-            }
-        }
-        Some(unsafe { core::slice::from_raw_parts_mut(kptr, len) })
+        let kptr = if len == 0 { core::ptr::NonNull::dangling().as_ptr() } else { window(ptr, len)? };
+        Some(UserBytesMut { kptr, len, _scope: PhantomData })
     }
 
-    /// Validate a user pointer range as a UTF-8 string of at most
-    /// [`MAX_USER_STR`] bytes.
+    /// Copy a user string of at most [`MAX_USER_STR`] bytes into kernel memory.
     ///
-    /// Unlike the slice accessors this returns a typed error, because an
-    /// over-long or non-UTF-8 string is a bad *argument*, not a bad address —
-    /// the range may be perfectly mapped. `user_slice` stays unbounded on
-    /// purpose: read/write buffers are borrowed, never copied, so their size
-    /// costs the kernel nothing.
-    pub fn user_str(&self, ptr: UserAddr, len: u64) -> Result<&'a str, SyscallError> {
+    /// Copied, not borrowed: a `&str` over a page userland can rewrite while
+    /// the VFS walks it is a path that can be one thing when it is resolved and
+    /// another when it is opened. The allocation is the string's own length,
+    /// and every consumer was already copying it or splitting it into tokens
+    /// that outlive nothing.
+    ///
+    /// The error is typed because an over-long or non-UTF-8 string is a bad
+    /// *argument*, not a bad address — the range may be perfectly mapped.
+    pub fn user_str(&self, ptr: UserAddr, len: u64) -> Result<String, SyscallError> {
         if len > MAX_USER_STR {
             return Err(SyscallError::InvalidArgument);
         }
-        let slice = self.user_slice(ptr, len).ok_or(SyscallError::BadAddress)?;
-        core::str::from_utf8(slice).map_err(|_| SyscallError::InvalidArgument)
+        let bytes = self.user_vec(ptr, len)?;
+        String::from_utf8(bytes).map_err(|_| SyscallError::InvalidArgument)
     }
 
-    /// Validate a user pointer to a typed struct (immutable).
-    pub fn user_ref<T: UserSafe>(&self, ptr: UserAddr) -> Option<&'a T> {
-        let size = core::mem::size_of::<T>() as u64;
-        if size == 0 || !check_user_range(ptr, size) {
-            return None;
-        }
-        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
-            return None;
-        }
-        let kptr = translate(ptr.raw())?;
-        Some(unsafe { &*(kptr as *const T) })
+    /// Read a typed value out of user memory.
+    ///
+    /// A copy rather than a borrow: a `&T` over a page userland can still write
+    /// is a claim the compiler enforces and the hardware does not, and the
+    /// kernel would be reading a value that can change between two of its own
+    /// reads. Every `UserSafe` type is at most 128 bytes, so the copy costs less
+    /// than the second lock-and-translate the borrow already paid.
+    pub fn copy_in<T: UserSafe>(&self, ptr: UserAddr) -> Result<T, SyscallError> {
+        let kptr = object::<T>(ptr)?;
+        Ok(unsafe { (kptr as *const T).read_volatile() })
     }
 
-    /// Validate a user pointer to a typed struct (mutable).
-    pub fn user_mut<T: UserSafe>(&self, ptr: UserAddr) -> Option<&'a mut T> {
-        let size = core::mem::size_of::<T>() as u64;
-        if size == 0 || !check_user_range(ptr, size) {
-            return None;
-        }
-        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
-            return None;
-        }
-        let kptr = translate(ptr.raw())?;
-        Some(unsafe { &mut *(kptr as *mut T) })
+    /// Write a typed value into user memory.
+    pub fn copy_out<T: UserSafe>(&self, ptr: UserAddr, value: &T) -> Result<(), SyscallError> {
+        let kptr = object::<T>(ptr)?;
+        unsafe { (kptr as *mut T).write_volatile(*value) };
+        Ok(())
     }
 
-    /// Validate a user pointer to a slice of typed structs.
-    pub fn user_slice_of<T: UserSafe>(&self, ptr: UserAddr, count: usize) -> Option<&'a [T]> {
-        if count == 0 {
-            return Some(&[]);
-        }
-        let byte_len = count.checked_mul(core::mem::size_of::<T>())?;
-        if !check_user_range(ptr, byte_len as u64) {
-            return None;
-        }
-        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
-            return None;
-        }
-        let kptr = translate(ptr.raw())?;
-        // Verify contiguity at every 2MB page boundary crossing.
-        let start = ptr.raw();
-        let end = start + byte_len as u64;
-        let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
-        while boundary < end {
-            let k = translate(boundary)?;
-            let expected = unsafe { kptr.add((boundary - start) as usize) };
-            if k != expected {
-                return None;
-            }
-            boundary += crate::mm::PAGE_2M;
-        }
-        if byte_len > 1 {
-            let end_kptr = translate(end - 1)?;
-            let expected_end = unsafe { kptr.add(byte_len - 1) };
-            if end_kptr != expected_end {
-                return None;
-            }
-        }
-        Some(unsafe { core::slice::from_raw_parts(kptr as *const T, count) })
+    /// Copy `len` bytes of user memory onto the kernel heap.
+    ///
+    /// Every caller has a bound of its own on `len` — [`MAX_USER_STR`] for the
+    /// strings, the env blob's own check — because this is the one accessor
+    /// that puts a userland-chosen size on the allocator.
+    pub fn user_vec(&self, ptr: UserAddr, len: u64) -> Result<Vec<u8>, SyscallError> {
+        let bytes = self.user_bytes(ptr, len).ok_or(SyscallError::BadAddress)?;
+        let mut out = vec![0u8; bytes.len()];
+        bytes.read_at(0, &mut out);
+        Ok(out)
+    }
+}
+
+/// A bulk buffer in user memory the kernel copies *out of*, and never borrows.
+///
+/// **The borrow was the bug.** A `&[u8]` or `&mut [u8]` over a page userland
+/// can write carries `noalias` and `dereferenceable` into LLVM, so the compiler
+/// is entitled to assume the bytes do not change under it — to hoist a read out
+/// of a loop, to fold two of them into one, to reorder a check with the use it
+/// guards. Another thread of the same process can change them between any two
+/// instructions. Every "read it once and validate the copy" rule the kernel has
+/// is unenforceable while the reference exists, because the copy and the check
+/// are two reads of the same reference and nothing stops the compiler undoing
+/// the split.
+///
+/// So this type hands out no reference. `read_at` is a raw
+/// `copy_nonoverlapping` out of the window, which is what the bytes are: a
+/// snapshot as of the moment the kernel looked, exactly like a device read,
+/// with no promise of stability attached. A torn buffer is then a *value* the
+/// caller has to be prepared for, and the kernel is prepared for it by never
+/// deciding anything twice from the same window.
+///
+/// Not per-byte volatile, deliberately: volatile buys nothing here that the
+/// absence of a reference has not already bought — a data race is a data race
+/// either way — and it costs the read and write path several times its
+/// throughput. The unsoundness was the `&`, not the `memcpy`.
+///
+/// The window is physically contiguous, proven at every 2 MiB boundary when it
+/// is built, which is what makes an offset into it mean anything.
+///
+/// Read-only, and [`UserBytesMut`] is the other direction, because `&[u8]` and
+/// `&mut [u8]` told a syscall's two paths apart and a single type would not:
+/// `SYS_WRITE`'s buffer is the caller's to read and nothing below `fd::try_write`
+/// has any business storing into it.
+pub struct UserBytes<'a> {
+    kptr: *const u8,
+    len: usize,
+    _scope: PhantomData<&'a ()>,
+}
+
+impl UserBytes<'_> {
+    pub fn len(&self) -> usize {
+        self.len
     }
 
-    /// Validate a user pointer to a mutable slice of typed structs.
-    /// Same contiguity constraints as user_slice_of.
-    #[allow(dead_code)]
-    pub fn user_slice_of_mut<T: UserSafe>(&self, ptr: UserAddr, count: usize) -> Option<&'a mut [T]> {
-        if count == 0 {
-            return Some(&mut []);
-        }
-        let byte_len = count.checked_mul(core::mem::size_of::<T>())?;
-        if !check_user_range(ptr, byte_len as u64) {
-            return None;
-        }
-        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
-            return None;
-        }
-        let kptr = translate(ptr.raw())?;
-        // Verify contiguity at every 2MB page boundary crossing.
-        let start = ptr.raw();
-        let end = start + byte_len as u64;
-        let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
-        while boundary < end {
-            let k = translate(boundary)?;
-            let expected = unsafe { kptr.add((boundary - start) as usize) };
-            if k != expected {
-                return None;
-            }
-            boundary += crate::mm::PAGE_2M;
-        }
-        if byte_len > 1 {
-            let end_kptr = translate(end - 1)?;
-            let expected_end = unsafe { kptr.add(byte_len - 1) };
-            if end_kptr != expected_end {
-                return None;
-            }
-        }
-        Some(unsafe { core::slice::from_raw_parts_mut(kptr as *mut T, count) })
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
+
+    /// Copy `dst.len()` bytes out of the window at `off`.
+    ///
+    /// The bound is an assertion rather than a refusal because `off` and
+    /// `dst.len()` are the kernel's own arithmetic: userland chose the window's
+    /// size, and every offset into it is computed against `len()`.
+    pub fn read_at(&self, off: usize, dst: &mut [u8]) {
+        assert!(
+            off.checked_add(dst.len()).is_some_and(|end| end <= self.len),
+            "UserBytes::read_at {off}+{} past a {}-byte window",
+            dst.len(),
+            self.len
+        );
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.kptr.add(off), dst.as_mut_ptr(), dst.len());
+        }
+    }
+
+    /// The `len`-byte window at `off` inside this one — what `buf[a..b]` was.
+    pub fn sub(&self, off: usize, len: usize) -> UserBytes<'_> {
+        assert!(
+            off.checked_add(len).is_some_and(|end| end <= self.len),
+            "UserBytes::sub {off}+{len} past a {}-byte window",
+            self.len
+        );
+        UserBytes { kptr: unsafe { self.kptr.add(off) }, len, _scope: PhantomData }
+    }
+}
+
+/// A bulk buffer in user memory the kernel copies *into*. [`UserBytes`] carries
+/// the argument for why neither hands out a reference.
+///
+/// Write-only, which is one property stronger than `&mut [u8]` was: a kernel
+/// that never reads back what it put in a user buffer cannot be made to act on
+/// a value another thread of that process substituted in between.
+pub struct UserBytesMut<'a> {
+    kptr: *mut u8,
+    len: usize,
+    _scope: PhantomData<&'a mut ()>,
+}
+
+impl UserBytesMut<'_> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Copy `src` into the window at `off`.
+    ///
+    /// The bound is an assertion for the same reason [`UserBytes::read_at`]'s
+    /// is: userland chose the size and the kernel computed the offset.
+    pub fn write_at(&mut self, off: usize, src: &[u8]) {
+        assert!(
+            off.checked_add(src.len()).is_some_and(|end| end <= self.len),
+            "UserBytesMut::write_at {off}+{} past a {}-byte window",
+            src.len(),
+            self.len
+        );
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), self.kptr.add(off), src.len());
+        }
+    }
+
+    /// Zero `len` bytes of the window at `off`.
+    pub fn fill_zero(&mut self, off: usize, len: usize) {
+        assert!(
+            off.checked_add(len).is_some_and(|end| end <= self.len),
+            "UserBytesMut::fill_zero {off}+{len} past a {}-byte window",
+            self.len
+        );
+        unsafe { core::ptr::write_bytes(self.kptr.add(off), 0, len) };
+    }
+
+    /// The `len`-byte window at `off` inside this one — what `buf[a..b]` was.
+    pub fn sub(&mut self, off: usize, len: usize) -> UserBytesMut<'_> {
+        assert!(
+            off.checked_add(len).is_some_and(|end| end <= self.len),
+            "UserBytesMut::sub {off}+{len} past a {}-byte window",
+            self.len
+        );
+        UserBytesMut { kptr: unsafe { self.kptr.add(off) }, len, _scope: PhantomData }
+    }
+}
+
+/// Bytes the kernel copies *from*, wherever they live.
+///
+/// Exists for one caller: `file_cache::write_page` is reached both by a syscall
+/// carrying a [`UserBytes`] window and by `log_file`, whose bytes are the
+/// kernel's own. A slice cannot express the first and a `UserBytes` cannot
+/// express the second, so the page cache names the capability it needs instead
+/// of one of the two representations.
+pub trait ByteSource {
+    fn len(&self) -> usize;
+    fn read_at(&self, off: usize, dst: &mut [u8]);
+}
+
+impl ByteSource for [u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn read_at(&self, off: usize, dst: &mut [u8]) {
+        dst.copy_from_slice(&self[off..off + dst.len()]);
+    }
+}
+
+impl ByteSource for UserBytes<'_> {
+    fn len(&self) -> usize {
+        UserBytes::len(self)
+    }
+
+    fn read_at(&self, off: usize, dst: &mut [u8]) {
+        UserBytes::read_at(self, off, dst);
+    }
+}
+
+/// Validate `[ptr, ptr+len)` as one physically contiguous user window and
+/// return its direct-map address.
+///
+/// One `translate` per 2 MiB boundary crossed, plus the last byte: a window
+/// whose pages are not physically adjacent would make an offset into it name a
+/// page belonging to somebody else.
+fn window(ptr: UserAddr, len: usize) -> Option<*mut u8> {
+    if !crate::mm::user_span::in_user_half(ptr.raw(), len as u64) {
+        return None;
+    }
+    let kptr = translate(ptr.raw())?;
+    let start = ptr.raw();
+    let end = start + len as u64;
+    let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
+    while boundary < end {
+        let k = translate(boundary)?;
+        if k != unsafe { kptr.add((boundary - start) as usize) } {
+            return None;
+        }
+        boundary += crate::mm::PAGE_2M;
+    }
+    if len > 1 && translate(end - 1)? != unsafe { kptr.add(len - 1) } {
+        return None;
+    }
+    Some(kptr)
 }

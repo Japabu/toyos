@@ -24,6 +24,15 @@ pub enum Owner {
     Us,
     /// The primary checkout, named so a refusal can point at it.
     Elsewhere(PathBuf),
+    /// Nobody in this repository: `rust/build` holds a toolchain that arrived
+    /// as an artifact, and there is no `rust/` source to have built it from.
+    ///
+    /// Read off the disk rather than declared, because a checkout with a
+    /// toolchain and no compiler source has exactly one thing it can do with
+    /// it, and a flag or an env var saying so could disagree with what is
+    /// there. This is how a CI runner gets a sysroot: `x.py` on four cores is
+    /// an hour, and the product is 1.1 GB.
+    Installed,
 }
 
 /// One `rust/` per repository, in the primary checkout, and every worktree
@@ -39,7 +48,11 @@ pub fn owner(root: &Path) -> Owner {
     let primary = crate::primary_checkout(root);
     let same = fs::canonicalize(root).map(|r| r == primary).unwrap_or(false);
     if same {
-        return Owner::Us;
+        let installed = !root.join("rust/x.py").exists()
+            && root
+                .join(format!("rust/build/{}/stage2/bin/rustc", host_triple()))
+                .exists();
+        return if installed { Owner::Installed } else { Owner::Us };
     }
     assert!(
         primary.join("rust/x.py").exists(),
@@ -56,14 +69,14 @@ pub fn owner(root: &Path) -> Owner {
 /// compiles against.
 pub fn rust_dir(root: &Path) -> PathBuf {
     match owner(root) {
-        Owner::Us => root.join("rust"),
+        Owner::Us | Owner::Installed => root.join("rust"),
         Owner::Elsewhere(primary) => primary.join("rust"),
     }
 }
 
 /// The per-worktree sources that end up *inside* the shared sysroot: std links
 /// `toyos-abi` and `toyos`, and `libtoyos_c.a` is `userland/libc`.
-const SYSROOT_SOURCES: [&str; 3] = ["toyos-abi/src", "toyos/src", "userland/libc/src"];
+pub const SYSROOT_SOURCES: [&str; 3] = ["toyos-abi/src", "toyos/src", "userland/libc/src"];
 
 /// Of those, the ones a change to obliges an std rebuild.
 const STD_SOURCES: [&str; 2] = ["toyos-abi/src", "toyos/src"];
@@ -151,14 +164,69 @@ enum Standing {
     Unknown,
 }
 
+/// **Against the merge base, not against main's tip.** `git diff main` is
+/// symmetric: a worktree that has merely not merged somebody else's landed ABI
+/// change looked exactly like one holding an unlanded change of its own, and
+/// could claim — rebuilding the shared sysroot from sources *older* than main's
+/// and refusing the checkout whose change had already landed. `main...HEAD` asks
+/// what this branch added and answers nothing for a checkout that is only
+/// behind, whose whole answer is to merge.
+///
+/// The working tree is asked separately and with `status` rather than `diff`,
+/// because a new file in `toyos-abi/src` changes the witness and no `diff`
+/// against a commit reports an untracked one.
+/// What a claimant is told to do about the fact that a claim blocks everybody.
+///
+/// One sysroot serves N worktrees, so a checkout with a real ABI change takes a
+/// turn during which the others cannot build at all — measured twice on
+/// 2026-08-07 at about 35 and about 50 minutes, both of them a whole task long
+/// because the claim was held for the whole task. It does not have to be: the
+/// ABI half of a change is usually a few lines that compile on their own, and
+/// landing it by itself makes the window one landing instead. Applied once that
+/// day, successfully. Said here rather than only in the spec, because the
+/// refusal is what an agent in this situation is actually reading.
+const CLAIM_WINDOW: &str = "\
+    The window is yours to make small: land the toyos-abi/toyos change on its own commit \
+    first, before the work that depends on it. Every other worktree is refused for as long \
+    as you hold the sysroot, and holding it for a whole task is what cost ~35 and ~50 \
+    minutes of eight agents' time on 2026-08-07 (specs/worktrees.md §3.2).";
+
 fn standing(root: &Path) -> Standing {
-    let mut args = vec!["diff", "--quiet", "main", "--"];
-    args.extend(SYSROOT_SOURCES);
-    match Command::new("git").args(&args).current_dir(root).status().ok().and_then(|s| s.code()) {
-        Some(0) => Standing::MatchesMain,
-        Some(1) => Standing::Diverged,
+    let mut ahead = vec!["diff", "--quiet", "main...HEAD", "--"];
+    ahead.extend(SYSROOT_SOURCES);
+    let committed =
+        Command::new("git").args(&ahead).current_dir(root).status().ok().and_then(|s| s.code());
+
+    if committed == Some(1) {
+        return Standing::Diverged;
+    }
+    // **A merge in progress is not this branch's statement about itself.**
+    // An agent resolving `--pr`'s merge of main holds every file main changed as
+    // staged local work, and a build in that state would be told it had standing
+    // to claim a sysroot it has no delta for. What the branch has of its own is
+    // the committed question above.
+    if merging(root) {
+        return if committed == Some(0) { Standing::MatchesMain } else { Standing::Unknown };
+    }
+
+    let mut local = vec!["status", "--porcelain", "--"];
+    local.extend(SYSROOT_SOURCES);
+    let uncommitted = Command::new("git").args(&local).current_dir(root).output().ok();
+
+    match (committed, uncommitted) {
+        (Some(0), Some(out)) if out.status.success() => {
+            if out.stdout.is_empty() { Standing::MatchesMain } else { Standing::Diverged }
+        }
         _ => Standing::Unknown,
     }
+}
+
+fn merging(root: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// Fingerprint the sources that get compiled into the shared sysroot.
@@ -241,7 +309,7 @@ fn rustup_link() -> Option<PathBuf> {
 /// serialisation, and two agents cannot both conclude the toolchain is stale
 /// and both start `x.py build` in the same directory. That pair is what left a
 /// half-written `librustc_driver` for cargo to probe, and cargo memoises a
-/// failed probe (known-issues §6).
+/// failed probe (`specs/issues/build/`).
 ///
 /// The steps are ordered, and each invalidates what it makes stale rather than
 /// threading a `rebuilt` flag through: a step that decides for itself still
@@ -299,9 +367,16 @@ pub fn ensure(
         },
     );
 
-    if let Owner::Elsewhere(primary) = owner(root) {
-        adopt_shared_sysroot(root, &rust_dir, &primary, force_rebuild, claim_sysroot, lock);
-        return;
+    match owner(root) {
+        Owner::Elsewhere(primary) => {
+            adopt_shared_sysroot(root, &rust_dir, &primary, force_rebuild, claim_sysroot, lock);
+            return;
+        }
+        Owner::Installed => {
+            check_installed_toolchain(root, &rust_dir, force_rebuild, claim_sysroot);
+            return;
+        }
+        Owner::Us => {}
     }
 
     // **The primary's ordinary build is a claim too, and it used to be a silent
@@ -433,6 +508,52 @@ pub fn ensure(
     );
 }
 
+/// Everything a checkout may do with a toolchain it did not build: check that
+/// it is the one this tree needs, and say what to do when it is not.
+///
+/// The same three questions [`adopt_shared_sysroot`] asks, minus the claim: no
+/// amount of source here can rebuild a sysroot without `rust/`, so there is
+/// nothing to arbitrate and the answer is always to publish a toolchain built
+/// from these sources.
+fn check_installed_toolchain(root: &Path, rust_dir: &Path, force_rebuild: bool, claim: bool) {
+    let stage2 = rust_dir.join(format!("build/{}/stage2", host_triple()));
+    assert!(
+        !force_rebuild && !claim,
+        "there is no `rust/` source in {}, so neither --rebuild-toolchain nor \
+         --claim-sysroot has anything to build from.\n\
+         The toolchain at {} arrived as an artifact; rebuild it where it is published.",
+        root.display(),
+        stage2.display(),
+    );
+
+    let linked = rustup_link();
+    assert!(
+        linked.as_deref() == Some(stage2.as_path()),
+        "the rustup toolchain `toyos` points at {}, not at the installed toolchain at {}.\n\
+         Link it: rustup toolchain link toyos {}",
+        linked.map_or_else(|| "nothing".to_string(), |p| p.display().to_string()),
+        stage2.display(),
+        stage2.display(),
+    );
+
+    // Recreated rather than shipped: it points into whatever stable toolchain
+    // this machine has, which is not a path any artifact can know.
+    if host_target_missing(rust_dir) {
+        link_host_target(rust_dir);
+    }
+
+    let want = witness(root);
+    let recorded = fs::read_to_string(witness_path(rust_dir)).ok();
+    assert!(
+        recorded.as_deref() == Some(want.as_str()),
+        "this checkout and the installed toolchain at {} disagree about {}, so a build \
+         here would link its kernel against another tree's struct layouts.\n\
+         Publish a toolchain built from these sources and install that one instead.",
+        stage2.display(),
+        differing_trees(recorded.as_deref(), &want),
+    );
+}
+
 /// Whether the sysroot's std was built from other `toyos-abi`/`toyos` sources
 /// than the ones in this checkout.
 ///
@@ -545,7 +666,8 @@ fn adopt_shared_sysroot(
          This worktree does differ from main in those trees, so it is the one checkout \
          that cannot merge its way out: merge main first if that is enough, otherwise \
          pass --claim-sysroot to rebuild the sysroot from here — which makes every other \
-         worktree wait for you to land.",
+         worktree wait for you to land.\n\
+         {CLAIM_WINDOW}",
         rust_dir.display(),
         differs,
         holder(rust_dir),
@@ -556,7 +678,8 @@ fn adopt_shared_sysroot(
     eprintln!(
         "Claiming the shared sysroot for {}.\n\
          It currently belongs to {}. Land this change as soon as it is ready: until you \
-         do, every other worktree is refused, and none of them can fix that from its end.",
+         do, every other worktree is refused, and none of them can fix that from its end.\n\
+         {CLAIM_WINDOW}",
         root.display(),
         holder(rust_dir),
     );
@@ -906,6 +1029,55 @@ mod tests {
         git(&root, &["merge", "-q", "--ff-only", "wt/abi"]);
         git(&root, &["checkout", "-q", "wt/abi"]);
         assert_eq!(standing(&root), Standing::MatchesMain);
+    }
+
+    /// **A worktree that is merely *behind* main has nothing to claim with.**
+    ///
+    /// `git diff main` is symmetric, so a checkout that has simply not merged
+    /// somebody else's landed ABI change read as `Diverged` and could claim —
+    /// rebuilding the shared sysroot from sources *older* than main's and
+    /// refusing the worktree whose change is already landed. That is the
+    /// 2026-08-04 fight `specs/worktrees.md` §3.2 exists to prevent, arrived at
+    /// from the other direction, and merging is this checkout's whole answer.
+    #[test]
+    fn a_checkout_behind_main_has_no_standing_to_claim() {
+        let root = scratch("behind");
+        git(&root, &["checkout", "-qb", "wt/idle"]);
+
+        git(&root, &["checkout", "-q", "main"]);
+        fs::write(root.join("toyos-abi/src/lib.rs"), b"pub struct A(pub u64);\n").unwrap();
+        git(&root, &["commit", "-qam", "somebody else's ABI change, landed"]);
+
+        git(&root, &["checkout", "-q", "wt/idle"]);
+        assert_eq!(
+            standing(&root),
+            Standing::MatchesMain,
+            "a worktree that has not merged main is not diverged from it"
+        );
+    }
+
+    /// **A landing's own merge must not look like standing.** A branch part-way
+    /// through merging main holds every file main changed as local work as far
+    /// as `git status` is concerned — and a build in that state would be told it
+    /// could claim a sysroot it has no delta for.
+    #[test]
+    fn a_landing_s_uncommitted_merge_is_not_standing() {
+        let root = scratch("mid-landing");
+        git(&root, &["checkout", "-qb", "wt/idle"]);
+        fs::write(root.join("kernel/src/main.rs"), b"fn main() { loop {} }\n").unwrap();
+        git(&root, &["commit", "-qam", "work of its own, outside the witnessed trees"]);
+
+        git(&root, &["checkout", "-q", "main"]);
+        fs::write(root.join("toyos-abi/src/lib.rs"), b"pub struct A(pub u64);\n").unwrap();
+        git(&root, &["commit", "-qam", "somebody else's ABI change, landed"]);
+
+        git(&root, &["checkout", "-q", "wt/idle"]);
+        git(&root, &["merge", "--no-ff", "--no-commit", "main"]);
+        assert_eq!(
+            standing(&root),
+            Standing::MatchesMain,
+            "a landing gating its own merge of main was told it could claim"
+        );
     }
 
     /// An unanswered question is not permission: a claim is destructive.

@@ -1,0 +1,339 @@
+//! The suite's command line, checked against the flags it actually has.
+//!
+//! `tests/toyos.rs` reads its flags by name and takes the first remaining
+//! positional argument as the run's filter. A flag it does not have therefore
+//! costs nothing and its *value* becomes that filter, so a command line naming
+//! a deleted flag runs one test and reports the run as a pass, and nothing
+//! between such a command line and a green check refuses it.
+//!
+//! So the flag table is here, one entry per flag the harness reads, and the
+//! filter falls out of the same pass rather than out of a second guess about
+//! which words were already spoken for. A flag added to the harness and not to
+//! this table is refused the first time anyone types it — the drift that is
+//! loud rather than the one that narrows a gate.
+
+use std::time::Duration;
+
+/// One machine's slice of the suite.
+///
+/// A shard is a *host*, never a lane. `--jobs` divides one machine's cores
+/// between guests that contend for them; this divides the work between machines
+/// that share nothing, which is the only lever CI has and the one the dev host
+/// does not have at all. The two compose: four shards at width 4 is sixteen
+/// guests that no `HostSlots` has to count, because no two are on one host.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shard {
+    /// One-based, as it is written on the command line and in a job matrix.
+    pub index: usize,
+    pub count: usize,
+}
+
+impl Shard {
+    /// Drop everything another shard owns, keeping the order of what is left.
+    ///
+    /// Longest-processing-time on the measured duration profile the suite
+    /// already orders its queue by, because a shard's wall clock is its bin's
+    /// total and the run's is the fullest bin. `items` is read in the order
+    /// given, so a list already sorted descending gets LPT's bound and one that
+    /// is not still gets a complete, deterministic partition — **every item
+    /// lands in exactly one shard whatever the profile says**, which is the
+    /// property a verdict depends on and the one the gates below hold.
+    ///
+    /// `None` is an item the profile has never seen, and it is priced at the
+    /// longest that was measured — the same conservatism `longest_first`
+    /// expresses by sorting unknowns first, in a form that can be added up.
+    /// Where *nothing* was measured, every item prices the same and LPT
+    /// degenerates to round-robin, which is the best a machine with no profile
+    /// can do and is what every runner's first run gets.
+    pub fn keep<T>(self, items: &mut Vec<T>, cost: impl Fn(&T) -> Option<Duration>) {
+        let unmeasured = items
+            .iter()
+            .filter_map(&cost)
+            .max()
+            .unwrap_or(Duration::from_secs(1));
+        let mut load = vec![Duration::ZERO; self.count];
+        let mut owner = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            let bin = (0..self.count).min_by_key(|&b| load[b]).expect("count >= 1");
+            load[bin] += cost(item).unwrap_or(unmeasured);
+            owner.push(bin);
+        }
+        let mut i = 0;
+        items.retain(|_| {
+            let mine = owner[i] == self.index - 1;
+            i += 1;
+            mine
+        });
+    }
+}
+
+/// `--shard <index>/<count>`, or `None` for the whole suite.
+///
+/// `Err` is a refusal to print and exit on, like [`parse`]'s: a shard number
+/// outside its range would take no tests and report the run green.
+pub fn parse_shard(args: &[String]) -> Result<Option<Shard>, String> {
+    let mut out = None;
+    for (i, a) in args.iter().enumerate() {
+        let spec = if let Some(v) = a.strip_prefix("--shard=") {
+            v
+        } else if a == "--shard" {
+            args.get(i + 1)
+                .map(String::as_str)
+                .ok_or("--shard needs a slice, e.g. --shard 2/4")?
+        } else {
+            continue;
+        };
+        let (index, count) = spec
+            .split_once('/')
+            .ok_or_else(|| format!("--shard {spec}: not <index>/<count>, e.g. 2/4"))?;
+        let index: usize = index
+            .parse()
+            .map_err(|_| format!("--shard {spec}: {index:?} is not a shard number"))?;
+        let count: usize = count
+            .parse()
+            .map_err(|_| format!("--shard {spec}: {count:?} is not a shard count"))?;
+        if !(1..=count).contains(&index) {
+            return Err(format!(
+                "--shard {spec}: shards are numbered 1 through {count}, and a run outside \
+                 that range would take no tests and report itself green"
+            ));
+        }
+        out = Some(Shard { index, count });
+    }
+    Ok(out)
+}
+
+/// Whether a flag is followed by a separate word, which is then not the filter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Value {
+    None,
+    Required,
+}
+
+pub struct Flag {
+    pub name: &'static str,
+    pub value: Value,
+}
+
+const fn flag(name: &'static str, value: Value) -> Flag {
+    Flag { name, value }
+}
+
+/// Every flag `tests/toyos.rs` reads, and nothing else.
+pub const FLAGS: &[Flag] = &[
+    flag("--debug", Value::None),
+    flag("--list", Value::None),
+    flag("--nocapture", Value::None),
+    flag("--show-output", Value::None),
+    flag("--audio-gate", Value::Required),
+    flag("--jobs", Value::Required),
+    flag("-j", Value::Required),
+    flag("--host-slots", Value::Required),
+    flag("--host-builds", Value::Required),
+    flag("--shard", Value::Required),
+];
+
+fn accepted() -> String {
+    FLAGS
+        .iter()
+        .map(|f| match f.value {
+            Value::None => f.name.to_string(),
+            Value::Required => format!("{} <value>", f.name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Validate the harness's argv and return the run's filter.
+///
+/// `Err` is a refusal to print and exit on. It is asked before the sysroot lock
+/// and before anything is compiled, so a stale command line costs a message
+/// rather than a queue behind it.
+pub fn parse(args: &[String]) -> Result<Option<&str>, String> {
+    let mut filter: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        i += 1;
+        if !arg.starts_with('-') {
+            if let Some(first) = filter {
+                return Err(format!(
+                    "{first:?} and {arg:?}: the suite takes one filter, and the second word \
+                     would have been dropped in silence.\n\
+                     A filter is a substring, so `{first}` and `{arg}` are one run only if one \
+                     substring matches both."
+                ));
+            }
+            filter = Some(arg);
+            continue;
+        }
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (arg, false),
+        };
+        let Some(f) = FLAGS.iter().find(|f| f.name == name) else {
+            return Err(format!(
+                "{arg}: the suite has no such flag, and an unknown flag's value becomes the \
+                 run's filter — so this would have measured whatever one test it named.\n\
+                 Flags it has: {}.",
+                accepted()
+            ));
+        };
+        if inline && f.value == Value::None {
+            return Err(format!("{arg}: {name} takes no value.\nFlags it has: {}.", accepted()));
+        }
+        if !inline && f.value == Value::Required {
+            i += 1;
+        }
+    }
+    Ok(filter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_owned(args: &[&str]) -> Result<Option<String>, String> {
+        let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
+        parse(&owned).map(|f| f.map(ToString::to_string))
+    }
+
+    /// The incident: `--skip` was deleted with the expected-failure declaration,
+    /// and every handover still carried it.
+    #[test]
+    fn a_deleted_flag_is_refused_rather_than_becoming_the_filter() {
+        let refusal = parse_owned(&["--skip", "desktop_window_child"]).unwrap_err();
+        assert!(refusal.starts_with("--skip:"), "{refusal}");
+        assert!(refusal.contains("--jobs <value>"), "{refusal}");
+    }
+
+    #[test]
+    fn a_flags_value_is_not_the_filter() {
+        assert_eq!(parse_owned(&["--jobs", "4"]).unwrap(), None);
+        assert_eq!(parse_owned(&["-j", "4"]).unwrap(), None);
+        assert_eq!(parse_owned(&["--audio-gate", "30"]).unwrap(), None);
+        assert_eq!(parse_owned(&["--host-slots", "0"]).unwrap(), None);
+        assert_eq!(parse_owned(&["--host-builds", "0"]).unwrap(), None);
+    }
+
+    #[test]
+    fn the_filter_is_the_word_that_is_nobodys_value() {
+        assert_eq!(parse_owned(&["process_stats"]).unwrap().as_deref(), Some("process_stats"));
+        assert_eq!(
+            parse_owned(&["--audio-gate", "30", "audio_tone", "--nocapture"]).unwrap().as_deref(),
+            Some("audio_tone")
+        );
+        assert_eq!(
+            parse_owned(&["--jobs=4", "futex", "--show-output"]).unwrap().as_deref(),
+            Some("futex")
+        );
+    }
+
+    #[test]
+    fn two_filters_are_refused_because_only_one_would_run() {
+        let refusal = parse_owned(&["futex", "dlopen"]).unwrap_err();
+        assert!(refusal.contains("\"futex\"") && refusal.contains("\"dlopen\""), "{refusal}");
+    }
+
+    fn shard_of(args: &[&str]) -> Result<Option<Shard>, String> {
+        parse_shard(&args.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_shard_is_index_and_count() {
+        assert_eq!(shard_of(&["--shard", "2/4"]).unwrap(), Some(Shard { index: 2, count: 4 }));
+        assert_eq!(shard_of(&["--shard=1/1"]).unwrap(), Some(Shard { index: 1, count: 1 }));
+        assert_eq!(shard_of(&[]).unwrap(), None);
+    }
+
+    /// The failure with no symptom: a shard nobody owns runs nothing, and a run
+    /// that ran nothing exits 0.
+    #[test]
+    fn a_shard_outside_its_range_is_refused() {
+        for spec in ["0/4", "5/4", "2/0"] {
+            let refusal = shard_of(&["--shard", spec]).unwrap_err();
+            assert!(refusal.contains("green"), "{spec}: {refusal}");
+        }
+        assert!(shard_of(&["--shard", "half"]).is_err());
+        assert!(shard_of(&["--shard", "x/4"]).is_err());
+    }
+
+    /// The property every verdict rests on: the shards are a partition. Not one
+    /// test may be dropped by all of them, and none may be run by two.
+    #[test]
+    fn every_item_lands_in_exactly_one_shard() {
+        let items: Vec<u64> = (0..97).map(|i| (i * 37) % 23).collect();
+        for count in 1..=8 {
+            let mut seen: Vec<u64> = Vec::new();
+            for index in 1..=count {
+                let mut mine = items.clone();
+                Shard { index, count }.keep(&mut mine, |&c| Some(Duration::from_secs(c)));
+                seen.extend(mine);
+            }
+            seen.sort_unstable();
+            let mut want = items.clone();
+            want.sort_unstable();
+            assert_eq!(seen, want, "count {count}");
+        }
+    }
+
+    /// A shard's wall clock is its bin's total, so the split has to be by cost
+    /// and not by position. Descending input is what the suite hands it.
+    #[test]
+    fn the_split_is_by_cost_and_not_by_position() {
+        let items: Vec<u64> = vec![100, 90, 80, 70, 60, 50, 40, 30];
+        let totals: Vec<u64> = (1..=4)
+            .map(|index| {
+                let mut mine = items.clone();
+                Shard { index, count: 4 }.keep(&mut mine, |&c| Some(Duration::from_secs(c)));
+                mine.iter().sum()
+            })
+            .collect();
+        assert_eq!(totals, vec![130, 130, 130, 130], "{totals:?}");
+    }
+
+    /// A test the profile has never seen costs `Duration::MAX` so that it sorts
+    /// first, and a machine with no recorded profile at all — every runner's
+    /// first run — has a whole suite of them. Plain addition panicked on the
+    /// second item, which is what the first sharded CI run found.
+    #[test]
+    fn a_suite_with_no_measured_profile_still_splits_evenly() {
+        let items: Vec<usize> = (0..10).collect();
+        let mut seen: Vec<usize> = Vec::new();
+        let mut sizes = Vec::new();
+        for index in 1..=3 {
+            let mut mine = items.clone();
+            Shard { index, count: 3 }.keep(&mut mine, |_| None);
+            sizes.push(mine.len());
+            seen.extend(mine);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, items);
+        assert_eq!(sizes, vec![4, 3, 3], "{sizes:?}");
+    }
+
+    #[test]
+    fn an_inline_value_on_a_flag_that_has_none_is_refused() {
+        let refusal = parse_owned(&["--nocapture=1"]).unwrap_err();
+        assert!(refusal.contains("--nocapture"), "{refusal}");
+    }
+
+    #[test]
+    fn the_documented_command_lines_parse() {
+        for argv in [
+            vec![],
+            vec!["--nocapture"],
+            vec!["process_stats"],
+            vec!["process_stats", "--nocapture"],
+            vec!["--list"],
+            vec!["--audio-gate", "30"],
+            vec!["--jobs", "4"],
+            vec!["--host-slots", "0"],
+            vec!["--host-builds", "0"],
+            vec!["--shard", "2/4"],
+            vec!["--debug"],
+        ] {
+            assert!(parse_owned(&argv).is_ok(), "{argv:?}");
+        }
+    }
+}

@@ -11,6 +11,15 @@ use alloc::vec::Vec;
 /// The two rate bases the format field can name, and the only two.
 const BASES: [u32; 2] = [48_000, 44_100];
 
+/// Where each field of `SDnFMT` starts. The base bit is bit 14 and the three
+/// below it are the multiplier, so a base written one bit low is a 48 kHz
+/// stream carrying a reserved multiplier — a format both a codec and a
+/// controller accept, and a rate neither plays at.
+const BASE_SHIFT: u16 = 14;
+const MULT_SHIFT: u16 = 11;
+const DIV_SHIFT: u16 = 8;
+const BITS_SHIFT: u16 = 4;
+
 /// How many periods a cyclic buffer may have.
 ///
 /// Policy: the mask is a `u32` and soundd's pipeline is eight deep. A caller
@@ -47,10 +56,10 @@ pub fn stream_format(rate: u32, bits: u8, channels: u8) -> Option<u16> {
                     continue;
                 }
                 return Some(
-                    ((base_bit as u16) << 13)
-                        | (((mult - 1) as u16) << 11)
-                        | (((div - 1) as u16) << 8)
-                        | (width << 4)
+                    ((base_bit as u16) << BASE_SHIFT)
+                        | (((mult - 1) as u16) << MULT_SHIFT)
+                        | (((div - 1) as u16) << DIV_SHIFT)
+                        | (width << BITS_SHIFT)
                         | (channels - 1) as u16,
                 );
             }
@@ -137,15 +146,84 @@ pub fn completed(
     Some((mask, current))
 }
 
+/// What a driver's accumulated completion mask says about the engine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Completed {
+    /// The engine handed back `count` periods starting at `first`, and is in
+    /// `first + count` now.
+    Run { first: usize, count: usize },
+    /// Every period in the ring. The engine has been round at least once since
+    /// the driver last looked, so nothing in the mask says where it is — the
+    /// aliasing [`completed`] documents, arriving one level up, where it means
+    /// the whole pipeline has played out.
+    Lapped,
+}
+
+/// Read an accumulated completion mask.
+///
+/// A mask is a set and the engine is a sequence, so the set alone has to say
+/// which period the engine returns to *first* — and that is the mask's
+/// lowest-numbered bit only while the run does not wrap the ring. `{6, 7, 0,
+/// 1}` is played 6, 7, 0, 1, and a driver filling it lowest-index-first writes
+/// the later audio into the buffer the engine reaches soonest.
+///
+/// It is always one contiguous run, because a driver reading late sees the OR
+/// of consecutive [`completed`] calls and those abut. `None` for anything else:
+/// no sequence of them can produce it, so it is a bug on the side that built it
+/// rather than a position to act on.
+pub fn decode(mask: u32, periods: usize) -> Option<Completed> {
+    if !(MIN_PERIODS..=MAX_PERIODS).contains(&periods) || mask >> periods != 0 {
+        return None;
+    }
+    let count = mask.count_ones() as usize;
+    if count == periods {
+        return Some(Completed::Lapped);
+    }
+    let first = (0..periods)
+        .find(|&i| mask & 1 << i != 0 && mask & 1 << ((i + periods - 1) % periods) == 0)?;
+    ((0..count).fold(0u32, |run, i| run | 1 << ((first + i) % periods)) == mask)
+        .then_some(Completed::Run { first, count })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rate half of the field, against a second implementation of the same
+    /// specification rather than against this one restated.
+    ///
+    /// Linux carries the whole rate field as a literal table
+    /// (`sound/hda/hdac_device.c`, `rate_bits[]`), so these are twelve numbers
+    /// nothing here derived. That is the point: the encoding this crate builds
+    /// arithmetically had the base bit one place low, which every
+    /// self-consistent assertion agreed with — and it is a stream a codec and a
+    /// controller both accept and play at the wrong speed.
+    #[test]
+    fn every_rate_linux_tabulates_encodes_to_the_number_linux_tabulates() {
+        for (rate, bits) in [
+            (8_000u32, 0x0500u16),
+            (11_025, 0x4300),
+            (16_000, 0x0200),
+            (22_050, 0x4100),
+            (32_000, 0x0a00),
+            (44_100, 0x4000),
+            (48_000, 0x0000),
+            (88_200, 0x4800),
+            (96_000, 0x0800),
+            (176_400, 0x5800),
+            (192_000, 0x1800),
+            (24_000, 0x0100),
+        ] {
+            // S16 stereo, which is the width and channel fields' own bits.
+            assert_eq!(stream_format(rate, 16, 2), Some(bits | 0x11), "{rate} Hz");
+        }
+    }
 
     #[test]
     fn the_rate_this_pipeline_plays_encodes_as_the_forty_four_one_base() {
         // 44.1 kHz, S16, stereo — soundd's grid, and what both the T14's
         // converter and QEMU's offer.
-        assert_eq!(stream_format(44_100, 16, 2), Some(0x2011));
+        assert_eq!(stream_format(44_100, 16, 2), Some(0x4011));
     }
 
     #[test]
@@ -156,7 +234,7 @@ mod tests {
     #[test]
     fn a_divided_rate_uses_the_divisor_field() {
         // 22.05 kHz is 44.1 halved, not a base of its own.
-        assert_eq!(stream_format(22_050, 16, 2), Some(0x2111));
+        assert_eq!(stream_format(22_050, 16, 2), Some(0x4111));
         // 24 kHz is 48 halved.
         assert_eq!(stream_format(24_000, 16, 2), Some(0x0111));
     }
@@ -164,13 +242,34 @@ mod tests {
     #[test]
     fn a_multiplied_rate_uses_the_multiplier_field() {
         assert_eq!(stream_format(96_000, 16, 2), Some(0x0811));
-        assert_eq!(stream_format(88_200, 16, 2), Some(0x2811));
+        assert_eq!(stream_format(88_200, 16, 2), Some(0x4811));
     }
 
     #[test]
     fn widths_and_channel_counts_land_in_their_own_fields() {
         assert_eq!(stream_format(48_000, 24, 2), Some(0x0031));
         assert_eq!(stream_format(48_000, 16, 8), Some(0x0017));
+    }
+
+    /// No rate may set a bit that belongs to another field.
+    ///
+    /// The defect this crate had was exactly that: a base that landed in the
+    /// multiplier. Asserting the encoding of one rate cannot catch it — the
+    /// wrong number is a perfectly good number — but a rate whose multiplier
+    /// field contradicts the rate it asked for can be caught by decoding what
+    /// was built and comparing it with the arithmetic the field defines.
+    #[test]
+    fn a_built_format_decodes_back_to_the_rate_it_was_asked_for() {
+        for rate in [8_000u32, 11_025, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200,
+            96_000, 176_400, 192_000]
+        {
+            let format = stream_format(rate, 16, 2).expect("a rate the field can express");
+            let base = if format & (1 << BASE_SHIFT) != 0 { 44_100 } else { 48_000 };
+            let mult = ((format >> MULT_SHIFT) & 0b111) as u32 + 1;
+            let div = ((format >> DIV_SHIFT) & 0b111) as u32 + 1;
+            assert!(mult <= 4, "{rate} Hz encodes multiplier {mult}, which the field reserves");
+            assert_eq!(base * mult / div, rate, "{rate} Hz decodes back wrong ({format:#06x})");
+        }
     }
 
     #[test]
@@ -244,5 +343,57 @@ mod tests {
     #[test]
     fn a_last_index_outside_the_ring_is_refused() {
         assert_eq!(completed(8, 0, 512, 8), None);
+    }
+
+    #[test]
+    fn a_mask_names_the_period_the_engine_returns_to_first() {
+        assert_eq!(decode(0b0011_1000, 8), Some(Completed::Run { first: 3, count: 3 }));
+        assert_eq!(decode(0b0000_0001, 8), Some(Completed::Run { first: 0, count: 1 }));
+    }
+
+    #[test]
+    fn a_run_that_wraps_does_not_start_at_its_lowest_bit() {
+        // The engine was at 6 and is now playing 2: 6, 7, 0 and 1 have played
+        // and are played again in that order. A driver reading the mask
+        // lowest-bit-first fills 0, 1, 6, 7 — the later audio into the two
+        // buffers the engine reaches soonest, which is a splice with no silence
+        // in it for a gap detector to see.
+        let (mask, _) = completed(6, 2 * 512, 512, 8).unwrap();
+        assert_eq!(decode(mask, 8), Some(Completed::Run { first: 6, count: 4 }));
+        assert_ne!(mask.trailing_zeros(), 6);
+    }
+
+    #[test]
+    fn every_position_completed_can_report_reads_back_as_the_run_it_walked() {
+        for last in 0..8usize {
+            for position in 0..8 * 512u32 {
+                let (mask, _) = completed(last, position, 512, 8).unwrap();
+                let count = mask.count_ones() as usize;
+                let want = (count > 0).then_some(Completed::Run { first: last, count });
+                assert_eq!(decode(mask, 8), want.or(decode(0, 8)), "last={last} pos={position}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_driver_that_slept_a_whole_lap_is_told_the_mask_cannot_place_the_engine() {
+        // What a reader sees is the OR of every `completed` since it last
+        // looked, so a full ring is reachable where one call's is not.
+        let mut mask = 0;
+        for last in 0..8usize {
+            mask |= completed(last, ((last as u32 + 1) % 8) * 512, 512, 8).unwrap().0;
+        }
+        assert_eq!(mask, 0xFF);
+        assert_eq!(decode(mask, 8), Some(Completed::Lapped));
+    }
+
+    #[test]
+    fn a_mask_that_is_not_one_run_is_refused_rather_than_placed() {
+        // Two disjoint runs: no walk of the ring produces it, so it is a bug on
+        // the side that built the mask and not a position to fill from.
+        assert_eq!(decode(0b0010_0101, 8), None);
+        // A bit outside the ring.
+        assert_eq!(decode(1 << 8, 8), None);
+        assert_eq!(decode(1, 1), None);
     }
 }

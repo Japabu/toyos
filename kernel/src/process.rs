@@ -10,7 +10,7 @@ use crate::fd::{self, FdTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
 use crate::sched::payload::ThreadSched;
-use crate::{elf, pipe, scheduler, shared_memory, vfs};
+use crate::{elf, pipe, scheduler, shared_memory};
 use crate::{DirectMap, UserAddr};
 use crate::loader::{
     setup_tls, setup_combined_tls, alloc_kernel_stack, thread_start,
@@ -124,7 +124,7 @@ impl PageAlloc {
 /// `PageAlloc`'s Drop returns the pages to the PMM and reaches no address
 /// space, so pages and mapping cannot be dropped as one. Holding the two
 /// together is what makes the unmap expressible at all; enforcing it is the
-/// `SharedToken`/RAII item in `specs/known-issues.md`.
+/// `SharedToken`/RAII item in `specs/issues/`.
 ///
 /// Dropping without unmapping is only sound when the address space itself is
 /// being destroyed (process teardown).
@@ -145,20 +145,26 @@ impl MappedPages {
 
     pub fn size(&self) -> usize { self.pages.size() }
 
-    /// Take the mapping out of `addr_space` and hand back the pages. The
-    /// caller must complete a TLB shootdown before dropping them: `unmap`'s
-    /// `invlpg` reaches this CPU only, and a sibling running another thread of
-    /// the same process can still hold an entry for a page the PMM is about to
-    /// reissue.
-    #[must_use]
-    fn unmap_from(self, addr_space: &mut crate::mm::paging::AddressSpace) -> PageAlloc {
+    /// Take the mapping out of `addr_space` and hand back the pages, still
+    /// reachable from every other CPU until the wrapper is dropped.
+    ///
+    /// The obligation used to be a sentence in this comment and is now the
+    /// return type: `unmap`'s `invlpg` reaches this CPU only, and a sibling
+    /// running another thread of the same process can still hold an entry for a
+    /// page the PMM is about to reissue.
+    fn unmap_from(
+        self,
+        addr_space: &mut crate::mm::paging::AddressSpace,
+    ) -> crate::mm::Unmapped<PageAlloc> {
         addr_space.free_and_unmap(self.vaddr);
-        self.pages
+        crate::mm::Unmapped::new(self.pages)
     }
 
     pub fn release(self, pt: &PageTables) {
+        // Two statements, because the shootdown inside the drop may not run
+        // while the address-space lock is held: a sibling taking a page fault
+        // spins on that lock with `IF` clear and could never acknowledge.
         let pages = self.unmap_from(&mut pt.lock());
-        crate::arch::apic::tlb_shootdown();
         drop(pages);
     }
 }
@@ -172,13 +178,17 @@ impl MappedPages {
 /// address space left to unmap from.
 ///
 /// `tls` arrives by value because the caller holds the `ProcessData` lock and
-/// the `ThreadData` lock is never held at the same time.
+/// the `ThreadData` lock is never held at the same time. The pages go back out
+/// for the same reason: freeing one waits for every other CPU to flush, and one
+/// shootdown per block is what the caller pays — a thread owns its TLS and at
+/// most one block per module it touched, and thread exit is not a hot path.
+#[must_use]
 fn release_thread_mappings(
     data: &mut ProcessData,
     tls: Option<MappedPages>,
     pt: &PageTables,
     tid: Tid,
-) {
+) -> Vec<crate::mm::Unmapped<PageAlloc>> {
     let keys: Vec<(Tid, u64)> = data.elf.dynamic_tls_blocks.keys()
         .filter(|&&(t, _)| t == tid)
         .copied()
@@ -193,8 +203,7 @@ fn release_thread_mappings(
             data.free_count += 1;
         }
     }
-    crate::arch::apic::tlb_shootdown();
-    drop(pages);
+    pages
 }
 
 pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
@@ -289,10 +298,16 @@ impl ThreadLocation {
 
 // ProcessEntry + ThreadEntry — hierarchical process/thread table
 
+/// How much of a process or thread name the table keeps.
+///
+/// Fixed by the `SYS_SYSINFO` record's name field, which is the syscall that
+/// exists to report it: anything longer would not survive being asked for.
+pub const THREAD_NAME_LEN: usize = 28;
+
 /// Per-thread metadata. Tid is the HashMap key in ProcessEntry.threads.
 pub struct ThreadEntry {
     state: ThreadLocation,
-    name: [u8; 28],
+    name: [u8; THREAD_NAME_LEN],
     thread_data: Arc<Lock<ThreadData>>,
     /// The thread's scheduler faces (rendezvous word + published counters).
     /// `None` only between the table insert that allocates the tid and the
@@ -302,7 +317,7 @@ pub struct ThreadEntry {
 
 impl ThreadEntry {
     pub fn new(thread_data: Arc<Lock<ThreadData>>) -> Self {
-        Self { state: ThreadLocation::Scheduled, name: [0u8; 28], thread_data, sched: None }
+        Self { state: ThreadLocation::Scheduled, name: [0u8; THREAD_NAME_LEN], thread_data, sched: None }
     }
     pub fn set_sched(&mut self, sched: ThreadSched) {
         assert!(self.sched.is_none(), "thread already has a scheduler record");
@@ -310,10 +325,13 @@ impl ThreadEntry {
     }
     pub fn sched(&self) -> Option<&ThreadSched> { self.sched.as_ref() }
     pub fn state(&self) -> ThreadLocation { self.state }
-    pub fn name(&self) -> &[u8; 28] { &self.name }
+    pub fn name(&self) -> &[u8; THREAD_NAME_LEN] { &self.name }
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name).unwrap_or("?").trim_end_matches('\0')
+    }
     pub fn set_name(&mut self, name: &[u8]) {
-        self.name = [0u8; 28];
-        let len = name.len().min(28);
+        self.name = [0u8; THREAD_NAME_LEN];
+        let len = name.len().min(THREAD_NAME_LEN);
         self.name[..len].copy_from_slice(&name[..len]);
     }
     pub fn thread_data(&self) -> &Arc<Lock<ThreadData>> { &self.thread_data }
@@ -324,7 +342,7 @@ pub struct ProcessEntry {
     pid: Pid,
     parent: Option<Pid>,
     state: ProcessState,
-    name: [u8; 28],
+    name: [u8; THREAD_NAME_LEN],
     process_data: Arc<Lock<ProcessData>>,
     symbols: Arc<Lock<SymbolTable>>,
     main_tid: Tid,
@@ -341,7 +359,7 @@ impl ProcessEntry {
     pub fn new(
         pid: Pid,
         parent: Option<Pid>,
-        name: [u8; 28],
+        name: [u8; THREAD_NAME_LEN],
         process_data: Arc<Lock<ProcessData>>,
         symbols: Arc<Lock<SymbolTable>>,
         main_thread: ThreadEntry,
@@ -353,7 +371,7 @@ impl ProcessEntry {
     pub fn pid(&self) -> Pid { self.pid }
     pub fn parent(&self) -> Option<Pid> { self.parent }
     pub fn state(&self) -> ProcessState { self.state }
-    pub fn name(&self) -> &[u8; 28] { &self.name }
+    pub fn name(&self) -> &[u8; THREAD_NAME_LEN] { &self.name }
     pub fn name_str(&self) -> &str {
         core::str::from_utf8(&self.name).unwrap_or("?").trim_end_matches('\0')
     }
@@ -582,7 +600,9 @@ pub fn revoke_pipe_maps(maps: &mut Vec<PipeMap>, pt: &PageTables, pipe: pipe::Pi
             false
         });
     }
-    crate::arch::apic::tlb_shootdown();
+    // Outside the block, because it waits: the lock this CPU would still be
+    // holding is one a sibling can be spinning on with `IF` clear.
+    crate::arch::tlb::shootdown();
 }
 
 pub struct MmapRegion {
@@ -621,6 +641,55 @@ pub static PROCESS_TABLE: Lock<Option<ProcessTable>> = Lock::new(None);
 
 pub fn init() {
     *PROCESS_TABLE.lock() = Some(ProcessTable::new());
+}
+
+/// One thread as a diagnostic sees it: who it is, and what the scheduler's
+/// cross-CPU-readable face says about it.
+pub struct ThreadCensus<'a> {
+    pub pid: Pid,
+    pub tid: Tid,
+    pub process: &'a str,
+    pub thread: &'a str,
+    pub zombie: Option<i32>,
+    /// One of `sched::payload`'s `SCHED_*`. `None` is the window between the
+    /// table insert that allocates the tid and the `sched::spawn` that mints
+    /// the task — a thread that has no scheduler record cannot be scheduled,
+    /// which is a state worth naming rather than eliding.
+    pub sched: Option<u8>,
+    /// Zero means the thread has never executed a user instruction.
+    pub cpu_ns: u64,
+}
+
+/// Walk every thread in the table, or answer `false` because the table is
+/// held.
+///
+/// `try_lock` and not `lock`: the one time anybody asks is when the machine is
+/// stuck, and whatever holds this lock is a candidate for what is stuck.
+pub fn try_for_each_thread(mut f: impl FnMut(ThreadCensus<'_>)) -> bool {
+    let Some(guard) = PROCESS_TABLE.try_lock() else {
+        return false;
+    };
+    let Some(table) = guard.as_ref() else {
+        return false;
+    };
+    for (pid, proc) in table.iter() {
+        for (tid, thread) in proc.threads().iter() {
+            let sched = thread.sched();
+            f(ThreadCensus {
+                pid,
+                tid,
+                process: proc.name_str(),
+                thread: thread.name_str(),
+                zombie: match thread.state() {
+                    ThreadLocation::Zombie(code) => Some(code),
+                    ThreadLocation::Scheduled => None,
+                },
+                sched: sched.map(|s| s.sched_state()),
+                cpu_ns: sched.map_or(0, |s| s.handle.cpu_ns()),
+            });
+        }
+    }
+    true
 }
 
 /// Waitpid: collect a zombie child process. Removes process and ALL its threads.
@@ -942,7 +1011,7 @@ fn teardown_resources(
             data.peak_memory / (1024 * 1024), data.alloc_count, data.free_count);
     }
 
-    fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
+    fd::close_all(&mut data.fds);
     data.elf.elf_alloc.take();
     data.elf.loaded_libs.clear();
     data.mmap_regions.clear();
@@ -958,9 +1027,12 @@ fn teardown_resources(
 ///
 /// Caller must hold the PROCESS_TABLE lock, have claimed teardown, retired
 /// every other thread of the process (so none can run), and freed resources.
-/// Returns (pid, tid) wakes to deliver after the table lock drops.
+/// Returns the (pid, tid) wakes to deliver after the table lock drops, and the
+/// shared regions to free after it — freeing one waits for every other CPU to
+/// flush, which is not something to do holding the process table.
 fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
-                        main_cpu_ns: u64) -> Vec<(Pid, Tid)> {
+                        main_cpu_ns: u64)
+                        -> (Vec<(Pid, Tid)>, crate::mm::Unmapped<shared_memory::Retired>) {
     let proc = table.get_mut(process_pid)
         .expect("teardown_bookkeeping: process not found");
     let main_tid = proc.main_tid;
@@ -973,7 +1045,14 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
         }
     }
 
-    shared_memory::cleanup_process(process_pid);
+    let retired = shared_memory::cleanup_process(process_pid);
+
+    // Beside the shared-memory release and for the same reason: the symbol
+    // table is megabytes of the process's own pages now that it is read off the
+    // binary rather than pointed at in the initrd, and a zombie has no
+    // backtrace left for anyone to take — every caller of `resolve_user_symbol`
+    // is a crash report, which runs on the live process before this.
+    *proc.symbols.lock() = SymbolTable::empty();
 
     let proc = table.get(process_pid).unwrap();
     let cpu_ms = main_cpu_ns / 1_000_000;
@@ -997,7 +1076,7 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
         }
     }
 
-    to_wake
+    (to_wake, retired)
 }
 
 /// Snapshot this process's accounting onto its parent, for `waitpid` to read.
@@ -1113,11 +1192,13 @@ pub fn exit(code: i32) -> ! {
     let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
 
     // Phase 4: table bookkeeping (zombie marks, orphan adoption, parent wake)
-    let to_wake = {
+    let (to_wake, retired) = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         teardown_bookkeeping(table, process_pid, code, main_cpu_ns)
     };
+    // After the table lock, because the drop waits for every other CPU to flush.
+    drop(retired);
 
     // Phase 5: stash accounting on the parent, wake waiters, exit
     stash_accounting_snapshot(&process_data_arc, process_pid, parent_pid, syscall_total, syscall_total_ns, main_cpu_ns);
@@ -1154,11 +1235,15 @@ pub fn thread_exit(code: i32) -> ! {
         let mut tdata = tdata_arc.lock();
         tdata.tls_pages.take()
     };
-    {
+    let released = {
         let owner_arc = fd_owner_data();
         let mut owner_data = owner_arc.lock();
-        release_thread_mappings(&mut owner_data, tls, &addr_space, tid);
-    }
+        release_thread_mappings(&mut owner_data, tls, &addr_space, tid)
+    };
+    // After the block: dropping these waits for every other CPU, and the
+    // process-data lock they were taken under is one the page-fault handler
+    // takes with `IF` clear.
+    drop(released);
 
     let parent_main_tid = {
         let mut guard = PROCESS_TABLE.lock();
@@ -1188,20 +1273,40 @@ pub fn thread_sched(pid: Pid, tid: Tid) -> Option<ThreadSched> {
     table.get(pid)?.threads.get(tid)?.sched().cloned()
 }
 
+/// The physical address of a futex word, demand-paged in like any other user
+/// access.
+///
+/// The scheduler dereferences this long after the syscall returns
+/// (`scheduler::futex_wait` reads `*phys as u32` on every wake check), so the
+/// alignment is not the caller's manners: a word four bytes below a 2 MiB
+/// boundary would have its tail read out of the next *physical* page, which
+/// belongs to somebody else.
+fn futex_word(addr: UserAddr) -> Option<crate::mm::DirectMap> {
+    if addr.raw() % 4 != 0 {
+        return None;
+    }
+    crate::user_ptr::translate_user(addr)
+}
+
 /// Atomically check a user futex word and block if it matches the expected value.
-/// Returns 0 if woken normally, 1 if timed out, u64::MAX on error.
-pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
+/// Returns 0 if woken normally, 1 if timed out, an error if `addr` names no
+/// word this process may have.
+///
+/// It takes a [`UserAddr`] rather than a `u64` because the bound is the whole
+/// safety of the call and it used to live at the two syscall arms, spelled as
+/// an expression whose value was discarded — dead-looking code protecting a
+/// `pub fn` in another file, which a third caller would not have known to
+/// repeat.
+pub fn futex_wait(addr: UserAddr, expected: u32, timeout_ns: u64) -> u64 {
     let deadline = if timeout_ns != u64::MAX {
         crate::clock::nanos_since_boot().saturating_add(timeout_ns)
     } else {
         0
     };
 
-    // Translate virtual → physical so cross-process futex works on shared memory
-    let phys_addr = match scheduler::current_address_space()
-        .and_then(|pt| pt.lock().translate(UserAddr::new(addr))) {
-        Some(pa) => pa,
-        None => return u64::MAX,
+    // Physical, so a futex in shared memory works across processes.
+    let Some(phys_addr) = futex_word(addr) else {
+        return toyos_abi::syscall::SyscallError::BadAddress.to_u64();
     };
 
     if scheduler::futex_wait(phys_addr, expected, deadline) {
@@ -1212,11 +1317,9 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
 }
 
 /// Wake up to `count` threads blocked on the same physical address as `addr`.
-pub fn futex_wake(addr: u64, count: u64) -> u64 {
-    let phys_addr = match scheduler::current_address_space()
-        .and_then(|pt| pt.lock().translate(UserAddr::new(addr))) {
-        Some(pa) => pa,
-        None => return 0,
+pub fn futex_wake(addr: UserAddr, count: u64) -> u64 {
+    let Some(phys_addr) = futex_word(addr) else {
+        return toyos_abi::syscall::SyscallError::BadAddress.to_u64();
     };
     scheduler::futex_wake(phys_addr, count as usize)
 }
@@ -1572,62 +1675,6 @@ fn with_user_symbols(pid: Pid, f: impl FnOnce(&crate::symbols::SymbolTable) -> b
     f(&syms)
 }
 
-/// Find .symtab and .strtab in an ELF's section headers and return pointers
-/// into the initrd memory. No allocation — the sections are read in-place.
-pub(crate) fn find_symtab_in_memory(
-    backing: &dyn crate::file_backing::FileBacking,
-    sh_off: u64, sh_num: usize, sh_entsize: usize,
-    base: u64,
-    prog_base: u64, prog_end: u64,
-    stack_base: u64, stack_end: u64,
-) -> SymbolTable {
-    const SHT_SYMTAB: u32 = 2;
-    const SHT_STRTAB: u32 = 3;
-    let empty = || SymbolTable::empty_with_bounds(prog_base, prog_end, stack_base, stack_end);
-
-    // Read section headers — they're small enough to read via read_file_range.
-    let shdr_size = sh_num * sh_entsize;
-    let shdr_data = read_file_range(backing, sh_off, shdr_size);
-
-    let mut symtab_off = 0u64;
-    let mut symtab_size = 0u64;
-    let mut symtab_entsize = 0u64;
-    let mut symtab_link = 0u32;
-    for i in 0..sh_num {
-        let off = i * sh_entsize;
-        if off + 64 > shdr_data.len() { break; }
-        let sh_type = u32::from_le_bytes(shdr_data[off + 4..off + 8].try_into().unwrap());
-        if sh_type == SHT_SYMTAB {
-            symtab_off = u64::from_le_bytes(shdr_data[off + 24..off + 32].try_into().unwrap());
-            symtab_size = u64::from_le_bytes(shdr_data[off + 32..off + 40].try_into().unwrap());
-            symtab_link = u32::from_le_bytes(shdr_data[off + 40..off + 44].try_into().unwrap());
-            symtab_entsize = u64::from_le_bytes(shdr_data[off + 56..off + 64].try_into().unwrap());
-            break;
-        }
-    }
-    if symtab_size == 0 { return empty(); }
-
-    let link_off = symtab_link as usize * sh_entsize;
-    if link_off + 64 > shdr_data.len() { return empty(); }
-    let strtab_type = u32::from_le_bytes(shdr_data[link_off + 4..link_off + 8].try_into().unwrap());
-    if strtab_type != SHT_STRTAB { return empty(); }
-    let strtab_off = u64::from_le_bytes(shdr_data[link_off + 24..link_off + 32].try_into().unwrap());
-    let strtab_size = u64::from_le_bytes(shdr_data[link_off + 32..link_off + 40].try_into().unwrap());
-
-    let Some(symtab_ptr) = backing.memory_ptr(symtab_off, symtab_size as usize) else { return empty() };
-    let Some(strtab_ptr) = backing.memory_ptr(strtab_off, strtab_size as usize) else { return empty() };
-
-    let entry_size = if symtab_entsize > 0 { symtab_entsize as usize } else { 24 };
-    let entries = symtab_size as usize / entry_size;
-
-    SymbolTable::from_raw(
-        symtab_ptr, entries,
-        strtab_ptr, strtab_size as usize,
-        base,
-        prog_base, prog_end, stack_base, stack_end,
-    )
-}
-
 /// Kill a child process. Only the parent can kill its children.
 /// Returns 0 on success, error code on failure.
 pub fn kill_process(target_pid: Pid) -> u64 {
@@ -1671,11 +1718,13 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, target_pid);
 
     // Phase 4: Table bookkeeping (same path as exit)
-    let to_wake = {
+    let (to_wake, retired) = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         teardown_bookkeeping(table, target_pid, 137, main_cpu_ns)
     };
+    // After the table lock, because the drop waits for every other CPU to flush.
+    drop(retired);
 
     // Phase 5: Stash accounting snapshot on parent
     stash_accounting_snapshot(&process_data_arc, target_pid, Some(caller), syscall_total, syscall_total_ns, main_cpu_ns);

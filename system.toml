@@ -10,7 +10,13 @@ init = [
     "/bin/netd",
 ]
 
-hosted-rustc = true
+hosted-rustc = false
+
+# `assets/soundfont.sf2` is in here and is doom's music: GeneralUser GS cut down
+# to the 37 melodic programs and 23 percussion keys `assets/DOOM1.WAD`'s own MUS
+# headers select, by `src/soundfont.rs`. `NOTICE` carries its licence and the
+# provenance caveat that comes with it; `specs/doom-music-soundfont.md` prices
+# the alternatives, including the zero-byte OPL3 path that may one day delete it.
 assets = ["assets"]
 
 [programs]

@@ -34,7 +34,7 @@ pub fn residents<X: SchedPayload>(
         .map(|t| (t.key(), Container::Running))
         .into_iter()
         .chain(cpu.rq().keys().map(|k| (k, Container::Ready)))
-        .chain(cpu.parked().map(|(k, _, _)| (k, Container::Parked)))
+        .chain(cpu.parked().map(|p| (p.key(), Container::Parked)))
         .chain(cpu.zombie_key().map(|k| (k, Container::Zombie)))
 }
 
@@ -62,9 +62,9 @@ pub fn check_cpu<X: SchedPayload>(cpu: &CpuSched<X>) {
         );
     }
 
-    for (key, _, _) in cpu.parked() {
-        let task = cpu.parked_task(key).expect("key came from the map");
-        let state = task.shared().state();
+    for parked in cpu.parked() {
+        let key = parked.key();
+        let state = parked.shared_state();
         assert!(
             matches!(state, TaskState::Blocked(c) | TaskState::WakeQueued(c) if c == id),
             "parked task {key:?} disagrees with its state word: {state:?}",
@@ -103,7 +103,7 @@ pub fn check_timer<X: SchedPayload>(cpu: &CpuSched<X>) {
 
 fn earliest_event<X: SchedPayload>(cpu: &CpuSched<X>) -> Option<Nanos> {
     let quantum = cpu.running().map(|_| cpu.quantum_end());
-    let deadline = cpu.parked().filter_map(|(_, deadline, _)| deadline).min();
+    let deadline = cpu.parked().filter_map(|p| p.deadline()).min();
     match (quantum, deadline) {
         (Some(q), Some(d)) => Some(q.min(d)),
         (Some(q), None) => Some(q),

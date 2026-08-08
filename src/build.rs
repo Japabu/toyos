@@ -191,6 +191,16 @@ fn config_targets(root: &Path, config: &SystemConfig) -> Vec<(PathBuf, Clean)> {
 
 // --- Cargo helpers ---
 
+/// The profile every guest binary is built with, and the directory cargo puts
+/// it in.
+///
+/// One name, passed to every `cargo build` here and declared by every crate
+/// root the image is made of. `--release` used to be a flag on `cargo run`, and
+/// it silently turned `debug-assertions` and `overflow-checks` off — the two
+/// knobs `specs/issues/`'s crafted-ELF panics were *found* by. There is
+/// no longer a second profile to pick, which is why there is no longer a flag.
+pub const PROFILE: &str = "toyos";
+
 fn cargo_build(
     crate_dir: &Path,
     target: &str,
@@ -199,7 +209,7 @@ fn cargo_build(
     extra_env: &[(&str, &str)],
     quiet: bool,
 ) {
-    let mut args = vec!["build", "--target", target];
+    let mut args = vec!["build", "--target", target, "--profile", PROFILE];
     if quiet {
         args.push("--quiet");
     }
@@ -281,13 +291,82 @@ fn stage_artifact(root: &Path, built: &Path, stem: &str, key: u64) -> PathBuf {
     staged
 }
 
+/// The panic message rustc emits beside every checked add. Absent from a binary
+/// built with `overflow-checks = false`, because then there is no call site to
+/// reference it and the linker's liveness pass drops it — measured on this
+/// kernel: present at 3,784,872 bytes with the checks on, gone at 3,296,672
+/// with them off.
+const OVERFLOW_CHECK_MARKER: &[u8] = b"attempt to add with overflow";
+
+/// Refuse to build a kernel whose target has hardware float.
+///
+/// `arch::entry`'s bracket saves the user machine state at the ring transition
+/// and nowhere else, which is sound only because kernel code cannot disturb it:
+/// the FPU may be left dirty for a whole Ring 0 excursion because nothing in
+/// Ring 0 reads or writes it. That rests on one line of the target spec —
+/// `RustcAbi::Softfloat` and `+soft-float` in
+/// `rust/compiler/rustc_target/src/spec/targets/x86_64_unknown_none.rs` — and an
+/// edit turning it off would make every bracket in the kernel insufficient
+/// without changing a byte of `kernel/`. `specs/user-machine-state.md` §8.
+///
+/// Asked of the compiler rather than of the manifest, and once per process: it
+/// is a property of the toolchain rather than of any one image.
+fn assert_kernel_is_softfloat(path_env: &str) {
+    static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(|| {
+        let out = Command::new("rustc")
+            .args(["--print", "cfg", "--target", "x86_64-unknown-none"])
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("PATH", path_env)
+            .env_remove("RUSTFLAGS")
+            .env_remove("RUSTC")
+            .output()
+            .expect("rustc --print cfg failed to launch");
+        assert!(out.status.success(), "rustc --print cfg failed for the kernel target");
+        let cfg = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            cfg.lines().any(|l| l == r#"target_feature="x87""#),
+            "the kernel target no longer reports x87, so `arch::fpu`'s FXSAVE64 image is not \
+             the state this machine has:\n{cfg}"
+        );
+        assert!(
+            !cfg.lines().any(|l| l == r#"target_feature="sse""#),
+            "the kernel target has hardware float, so kernel code may now clobber the user \
+             machine state between `arch::entry`'s save and its restore:\n{cfg}"
+        );
+    });
+}
+
+/// Refuse to build an image whose kernel does not carry its overflow checks.
+///
+/// [`PROFILE`] states them and `--release` is gone from this build system, so
+/// the way they can still be lost is somebody editing `[profile.toyos]`. This
+/// asks the artifact rather than the manifest, which is the only question worth
+/// asking: `specs/issues/`'s two crafted-ELF kernel panics were both
+/// *found* by an overflow check, and one of them had no configuration in which
+/// it was an error return.
+fn assert_overflow_checked(what: &str, image: &[u8]) {
+    let found = image
+        .iter()
+        .enumerate()
+        .filter(|&(_, &b)| b == OVERFLOW_CHECK_MARKER[0])
+        .any(|(at, _)| image[at..].starts_with(OVERFLOW_CHECK_MARKER));
+    assert!(
+        found,
+        "the {what} was built without overflow checks: nothing in {} bytes references \
+         {:?}. `[profile.toyos]` states `overflow-checks = true` in every crate root the \
+         image is made of; something has stopped being true.",
+        image.len(),
+        core::str::from_utf8(OVERFLOW_CHECK_MARKER).unwrap()
+    );
+}
+
 // --- Shared initrd assembly ---
 
 /// Build all programs from a config and assemble an initrd.
 fn build_and_assemble(
     root: &Path,
     config: &SystemConfig,
-    profile: &str,
     path_env: &str,
     extra_files: &[(String, Vec<u8>)],
     quiet: bool,
@@ -311,7 +390,7 @@ fn build_and_assemble(
     }
 
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
-    let ws_target = userland_dir.join(format!("target/x86_64-unknown-toyos/{profile}"));
+    let ws_target = userland_dir.join(format!("target/x86_64-unknown-toyos/{PROFILE}"));
 
     // Build and read under one hold, exactly as `build_toyos_bins` does and for
     // the same reason: a program's path is keyed on (crate, target, profile)
@@ -324,9 +403,6 @@ fn build_and_assemble(
         let _artifact = buildlock::artifact(root);
         if !workspace_packages.is_empty() {
             let mut extra: Vec<&str> = Vec::new();
-            if profile == "release" {
-                extra.push("--release");
-            }
             for pkg in &workspace_packages {
                 extra.push("-p");
                 extra.push(pkg);
@@ -344,9 +420,6 @@ fn build_and_assemble(
         for (name, cfg) in &standalone {
             let crate_dir = cfg.crate_dir(root, name);
             let mut extra: Vec<&str> = Vec::new();
-            if profile == "release" {
-                extra.push("--release");
-            }
             if cfg.no_default_features {
                 extra.push("--no-default-features");
             }
@@ -365,7 +438,7 @@ fn build_and_assemble(
                 ws_target.join(name)
             } else {
                 let crate_dir = cfg.crate_dir(root, name);
-                crate_dir.join(format!("target/x86_64-unknown-toyos/{profile}/{name}"))
+                crate_dir.join(format!("target/x86_64-unknown-toyos/{PROFILE}/{name}"))
             };
             let data =
                 fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));
@@ -493,7 +566,6 @@ fn declared_kernel_features(root: &Path) -> Vec<String> {
 pub fn build(
     root: &Path,
     debug: bool,
-    release: bool,
     boot: Boot,
     rebuild_toolchain: bool,
     claim_sysroot: bool,
@@ -511,12 +583,16 @@ pub fn build(
     // identical refusals looked like on 2026-08-04.
     let _claim = claim_sysroot.then(|| buildlock::claim_sysroot(root, "--claim-sysroot"));
 
+    // After the sysroot lock and before every build lock, which is the order
+    // the module header fixes. What it bounds is the host: ten agents' builds
+    // spend the same fourteen cores, and nothing was counting them.
+    let _slot = buildlock::build_slot(root, "cargo run");
+
     // Held until the last staged artifact has been read back, so no other
     // agent's clean or toolchain rebuild can land inside this build.
     let mut lock = buildlock::shared(root, "build");
     toolchain::ensure(root, rebuild_toolchain, claim_sysroot, &mut lock);
 
-    let profile = if release { "release" } else { "debug" };
     let path_env = toolchain::path_with_toyos_ld(root);
     let config = parse_config(&root.join(boot.config()));
 
@@ -534,9 +610,6 @@ pub fn build(
             let features = kernel_features.clone();
             std::thread::spawn(move || {
                 let mut extra = Vec::new();
-                if release {
-                    extra.push("--release");
-                }
                 if !features.is_empty() {
                     extra.push("--features");
                     extra.push(&features);
@@ -552,14 +625,10 @@ pub fn build(
             })
         };
         {
-            let mut extra = Vec::new();
-            if release {
-                extra.push("--release");
-            }
             cargo_build(
                 &root.join("bootloader"),
                 "x86_64-unknown-uefi",
-                &extra,
+                &[],
                 &path_env,
                 &[("INIT_PROGRAMS", init_programs.as_str())],
                 false,
@@ -569,25 +638,27 @@ pub fn build(
         (
             stage_artifact(
                 root,
-                &root.join(format!("kernel/target/x86_64-unknown-none/{profile}/kernel")),
+                &root.join(format!("kernel/target/x86_64-unknown-none/{PROFILE}/kernel")),
                 "kernel",
-                key_hash(&[profile, &kernel_features]),
+                key_hash(&[PROFILE, &kernel_features]),
             ),
             stage_artifact(
                 root,
                 &root.join(format!(
-                    "bootloader/target/x86_64-unknown-uefi/{profile}/bootloader.efi"
+                    "bootloader/target/x86_64-unknown-uefi/{PROFILE}/bootloader.efi"
                 )),
                 "bootloader.efi",
-                key_hash(&[profile, &init_programs]),
+                key_hash(&[PROFILE, &init_programs]),
             ),
         )
     };
 
     let initrd_bytes =
-        build_and_assemble(root, &config, profile, &path_env, &[], false);
+        build_and_assemble(root, &config, &path_env, &[], false);
 
     let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
+    assert_overflow_checked("kernel", &kernel_bytes);
+    assert_kernel_is_softfloat(&path_env);
     let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
     let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes);
     let image_path = root.join(boot.image());
@@ -733,8 +804,8 @@ pub fn build_test_image(
     let config = parse_config(config_path);
     let init_programs = config.init.join(";");
     let features = kernel_features.join(",");
-    let kernel_key = key_hash(&["debug", &features]);
-    let bl_key = key_hash(&["debug", &init_programs]);
+    let kernel_key = key_hash(&[PROFILE, &features]);
+    let bl_key = key_hash(&[PROFILE, &init_programs]);
     let initrd_key = initrd_key(config_path, extra_files);
 
     // Nothing left to build, so nothing for the lock, the toolchain check or the
@@ -744,6 +815,14 @@ pub fn build_test_image(
     {
         return image::create_boot_image(&kernel, &bl, &initrd);
     }
+
+    // **Below the memo's early return, so a boot that builds nothing queues for
+    // nothing.** Above every build lock, per the module header. This is the
+    // acquisition the eight-landing day was about: twelve suite workers each
+    // hold a guest slot and the first thing each does is compile its kernel
+    // variant, so the semaphore that bounds guests was bounding the phase that
+    // was not scarce.
+    let _slot = buildlock::build_slot(root, "a test image");
 
     // Held to the end of the function: the staged artifacts below are read
     // back after the userland build, and a clean landing in between is the
@@ -775,11 +854,16 @@ pub fn build_test_image(
             );
             let staged = stage_artifact(
                 root,
-                &root.join("kernel/target/x86_64-unknown-none/debug/kernel"),
+                &root.join(format!("kernel/target/x86_64-unknown-none/{PROFILE}/kernel")),
                 "kernel",
                 kernel_key,
             );
-            fs::read(&staged).expect("Failed to read staged kernel")
+            {
+                let bytes = fs::read(&staged).expect("Failed to read staged kernel");
+                assert_overflow_checked("kernel", &bytes);
+                assert_kernel_is_softfloat(&path_env);
+                bytes
+            }
         });
         let bl = BOOTLOADER.get_or_build(bl_key, || {
             cargo_build(
@@ -792,7 +876,7 @@ pub fn build_test_image(
             );
             let staged = stage_artifact(
                 root,
-                &root.join("bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi"),
+                &root.join(format!("bootloader/target/x86_64-unknown-uefi/{PROFILE}/bootloader.efi")),
                 "bootloader.efi",
                 bl_key,
             );
@@ -802,7 +886,7 @@ pub fn build_test_image(
     };
 
     let initrd_bytes = INITRD.get_or_build(initrd_key, || {
-        build_and_assemble(root, &config, "debug", &path_env, extra_files, quiet)
+        build_and_assemble(root, &config, &path_env, extra_files, quiet)
     });
 
     image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes)
@@ -811,6 +895,7 @@ pub fn build_test_image(
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
 /// Also builds any cdylib subcrates and includes their .so files.
 pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(String, Vec<u8>)> {
+    let _slot = buildlock::build_slot(root, "the test binaries");
     let mut lock = buildlock::shared(root, "test binaries");
     crate::toolchain::ensure(root, false, false, &mut lock);
     let path_env = toolchain::path_with_toyos_ld(root);
@@ -857,7 +942,7 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(Str
         }
         cargo_build(&sub_path, "x86_64-unknown-toyos", &[], &path_env, &[], quiet);
 
-        let lib_out = sub_path.join("target/x86_64-unknown-toyos/debug");
+        let lib_out = sub_path.join(format!("target/x86_64-unknown-toyos/{PROFILE}"));
         lib_search_dirs.push(lib_out.clone());
 
         for so_entry in fs::read_dir(&lib_out).unwrap() {
@@ -891,7 +976,7 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(Str
         quiet,
     );
 
-    let bin_dir = crate_path.join("target/x86_64-unknown-toyos/debug");
+    let bin_dir = crate_path.join(format!("target/x86_64-unknown-toyos/{PROFILE}"));
     let bin_src = crate_path.join("src/bin");
     if bin_src.exists() {
         for entry in fs::read_dir(&bin_src).unwrap() {

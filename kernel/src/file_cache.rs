@@ -6,6 +6,7 @@ use alloc::sync::Arc;
 use crate::block;
 use crate::file_backing::FileBacking;
 use crate::sync::Lock;
+use crate::user_ptr::{ByteSource, UserBytesMut};
 
 pub type FileId = u64;
 
@@ -136,24 +137,36 @@ pub fn release(file_id: FileId) -> bool {
 
 /// Read from a file page into `buf`. Handles cache miss via the file's backing.
 /// Lock is NOT held during disk I/O (unlock-fetch-relock pattern).
-pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) {
+///
+/// `Err` means the page could not be fetched and `buf` holds zeros rather than
+/// the file's bytes. Fallible for the same reason [`write_page`] is, and it is
+/// the *read* half of the same defect: this returned `()`, so a process reading
+/// a file off a stick that refused the transfer got a page of zeros and a
+/// success, which is the one answer nothing downstream can tell from a file
+/// that really is zeros there.
+pub fn read_page(
+    file_id: FileId,
+    page_idx: u32,
+    offset: usize,
+    buf: &mut UserBytesMut,
+) -> Result<(), block::BlockError> {
     let backing;
     {
         let mut cache = FILE_CACHE.lock();
-        let Some(file) = cache.files.get_mut(&file_id) else { return };
+        let Some(file) = cache.files.get_mut(&file_id) else { return Ok(()) };
         let file_size = file.size;
 
         // Beyond file size: zero-fill, no cache insert.
         if (page_idx as u64) * PAGE_SIZE as u64 >= file_size {
-            buf.fill(0);
-            return;
+            buf.fill_zero(0, buf.len());
+            return Ok(());
         }
 
         if let Some(page) = file.pages.get_mut(&page_idx) {
             page.referenced = true;
             let avail = valid_bytes_in_page(page_idx, file_size);
             copy_page_region_to_buf(&page.data[..], offset, buf, avail);
-            return;
+            return Ok(());
         }
         backing = file.backing.clone();
     }
@@ -161,14 +174,13 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
 
     let mut fetched = blank_page();
     if let Some(backing) = &backing {
-        // A fetch that failed must not become a resident page. `buf` gets the
-        // zeros either way — this path has no error channel and adding one is
-        // an ABI change — but caching them would let the next partial write
-        // through `write_page` find the page resident, merge into the zeros
-        // and flush them back over the file.
-        if backing.read_page(page_idx as u64 * PAGE_SIZE as u64, &mut fetched).is_err() {
-            buf.fill(0);
-            return;
+        // A fetch that failed must not become a resident page: caching the
+        // zeros would let the next partial write through `write_page` find the
+        // page resident, merge into them and flush the result back over the
+        // file.
+        if let Err(e) = backing.read_page(page_idx as u64 * PAGE_SIZE as u64, &mut fetched) {
+            buf.fill_zero(0, buf.len());
+            return Err(e);
         }
     }
     // else: tmpfs miss → zero-filled page (fetched is already zeroed)
@@ -176,7 +188,7 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
     let mut cache = FILE_CACHE.lock();
     let mut added = 0;
     {
-        let Some(file) = cache.files.get_mut(&file_id) else { return };
+        let Some(file) = cache.files.get_mut(&file_id) else { return Ok(()) };
         let is_cache = file.is_cache();
         if !file.pages.contains_key(&page_idx) {
             file.pages.insert(page_idx, CachedPage::new(fetched));
@@ -190,6 +202,7 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
     }
     cache.cached_pages += added;
     evict_if_needed(&mut cache);
+    Ok(())
 }
 
 /// Write data into a file page. Handles cache miss via the file's backing.
@@ -202,11 +215,11 @@ pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) 
 /// that was fine — or to refuse. It refuses. The caller decides what to do
 /// about a write that did not happen, which is a decision this layer does not
 /// have the standing to make silently.
-pub fn write_page(
+pub fn write_page<S: ByteSource + ?Sized>(
     file_id: FileId,
     page_idx: u32,
     offset: usize,
-    data: &[u8],
+    data: &S,
 ) -> Result<(), block::BlockError> {
     // A resident page is written under the acquisition that found it. The
     // fetch path below drops the lock, and a sibling CPU's eviction inside
@@ -258,10 +271,15 @@ pub fn write_page(
     Ok(())
 }
 
-fn apply_write(file: &mut CachedFile, page_idx: u32, offset: usize, data: &[u8]) {
+fn apply_write<S: ByteSource + ?Sized>(
+    file: &mut CachedFile,
+    page_idx: u32,
+    offset: usize,
+    data: &S,
+) {
     let page = file.pages.get_mut(&page_idx).expect("write_page: page not resident");
     let end = (offset + data.len()).min(PAGE_SIZE);
-    page.data[offset..end].copy_from_slice(&data[..end - offset]);
+    data.read_at(0, &mut page.data[offset..end]);
     page.dirty = true;
     page.referenced = true;
 
@@ -271,16 +289,21 @@ fn apply_write(file: &mut CachedFile, page_idx: u32, offset: usize, data: &[u8])
     }
 }
 
-/// Copy a full page out for flushing. Lock held only for the copy.
-pub fn copy_page_out(file_id: FileId, page_idx: u32, buf: &mut [u8; PAGE_SIZE]) {
+/// Copy a resident page out. `false`, and `buf` untouched, when the page is not
+/// resident.
+///
+/// The answer is a return value and not a zero-filled buffer because the two
+/// callers want opposite things from an absent page: a tmpfs read is looking at
+/// a hole, and a flush is looking at a page a truncate took away between
+/// `clone_dirty` and here. Zeros would be a page of data to both of them, and
+/// the flush would put them on the device.
+#[must_use]
+pub fn copy_page_out(file_id: FileId, page_idx: u32, buf: &mut [u8; PAGE_SIZE]) -> bool {
     let cache = FILE_CACHE.lock();
-    if let Some(file) = cache.files.get(&file_id) {
-        if let Some(page) = file.pages.get(&page_idx) {
-            *buf = *page.data;
-            return;
-        }
-    }
-    buf.fill(0);
+    let Some(file) = cache.files.get(&file_id) else { return false };
+    let Some(page) = file.pages.get(&page_idx) else { return false };
+    *buf = *page.data;
+    true
 }
 
 /// Clone the dirty set (non-destructive). Used by fsync to iterate.
@@ -336,19 +359,31 @@ pub fn set_size(file_id: FileId, new_size: u64) {
     cache.cached_pages -= dropped;
 }
 
-/// Mark a file as deleted (unlink). If no fds hold it, free immediately.
-pub fn mark_deleted(file_id: FileId) {
-    let mut cache = FILE_CACHE.lock();
-    let Some(file) = cache.files.get_mut(&file_id) else { return };
-    file.deleted = true;
-    if file.ref_count == 0 {
-        drop_file(&mut cache, file_id);
-    }
+/// What the cache holds for a file after an operation that may have freed it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Residency {
+    /// Open fds still hold it, so its pages and its id are still live.
+    Held,
+    /// The cache holds nothing for this id, and a filesystem may drop whatever
+    /// it keeps alongside.
+    Gone,
 }
 
-/// Get the ref_count for a file (used by filesystem adapters on close_file).
-pub fn ref_count(file_id: FileId) -> u32 {
-    FILE_CACHE.lock().files.get(&file_id).map_or(0, |f| f.ref_count)
+/// Mark a file as deleted (unlink). If no fds hold it, free immediately.
+///
+/// The verdict is returned rather than left to be re-derived from a refcount,
+/// because a refcount read after the unlock is a different question asked at a
+/// different moment: every caller wants to know what *this* unlink did.
+#[must_use]
+pub fn mark_deleted(file_id: FileId) -> Residency {
+    let mut cache = FILE_CACHE.lock();
+    let Some(file) = cache.files.get_mut(&file_id) else { return Residency::Gone };
+    file.deleted = true;
+    if file.ref_count > 0 {
+        return Residency::Held;
+    }
+    drop_file(&mut cache, file_id);
+    Residency::Gone
 }
 
 impl CachedPage {
@@ -388,16 +423,16 @@ fn valid_bytes_in_page(page_idx: u32, file_size: u64) -> usize {
     }
 }
 
-fn copy_page_region_to_buf(page: &[u8], offset: usize, buf: &mut [u8], valid: usize) {
+fn copy_page_region_to_buf(page: &[u8], offset: usize, buf: &mut UserBytesMut, valid: usize) {
     let start = offset.min(valid);
     let end = (offset + buf.len()).min(valid);
     let count = end.saturating_sub(start);
     if count > 0 {
-        buf[..count].copy_from_slice(&page[start..start + count]);
+        buf.write_at(0, &page[start..start + count]);
     }
     // Zero-fill remainder (past valid data or past file end).
     if count < buf.len() {
-        buf[count..].fill(0);
+        buf.fill_zero(count, buf.len() - count);
     }
 }
 

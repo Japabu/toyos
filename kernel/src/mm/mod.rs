@@ -1,11 +1,14 @@
 pub mod pmm;
 pub mod paging;
+pub mod user_span;
 mod alloc;
 mod mmio;
 mod region;
+mod unmapped;
 
 pub use mmio::Mmio;
 pub use region::KernelSlice;
+pub use unmapped::Unmapped;
 
 use crate::MemoryMapEntry;
 pub use pmm::Region;
@@ -13,8 +16,7 @@ pub use pmm::Region;
 /// All physical memory is mapped at this virtual offset.
 pub const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
-/// 2MB large page size — the only user page size in ToyOS.
-pub const PAGE_2M: u64 = 2 * 1024 * 1024;
+pub use user_span::PAGE_2M;
 
 /// Round `size` up to the next 2MB boundary.
 ///
@@ -73,7 +75,18 @@ pub fn is_kernel_addr(addr: u64) -> bool {
 pub struct UserAddr(u64);
 
 impl UserAddr {
+    /// For an address the kernel computed — a region start, a stack top, a
+    /// mapping this address space owns. It asserts nothing about `v`.
     pub const fn new(v: u64) -> Self { Self(v) }
+
+    /// For an address that crossed the syscall boundary.
+    ///
+    /// The type's name is a claim, and this is the only constructor that makes
+    /// it true of a number userland chose.
+    pub fn checked(v: u64) -> Option<Self> {
+        user_span::is_user_addr(v).then_some(Self(v))
+    }
+
     pub const fn raw(self) -> u64 { self.0 }
 }
 

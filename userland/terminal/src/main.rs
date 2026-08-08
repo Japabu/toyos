@@ -65,6 +65,15 @@ fn main() {
     let mut shell_stderr = child.stderr.take().unwrap();
     let poller = Poller::new(3 + Host::POLL_HANDLES);
 
+    // The window exists and the shell's stdin is a pipe this process owns, so
+    // from here a keystroke the compositor forwards has somewhere to land even
+    // if the shell has not reached its first read. Before it, one is dropped
+    // with no trace — which is what the desktop tests used to compensate for by
+    // retyping against a clock, making every one of their verdicts a statement
+    // about how long a desktop takes to come up on the host of the day
+    // (`specs/issues/design-debt/`).
+    eprintln!("terminal: ready");
+
     loop {
         poller.poll_add_fd(Fd(shell_stdout.as_raw_fd()), IORING_POLL_IN, TOKEN_STDOUT);
         poller.poll_add_fd(Fd(shell_stderr.as_raw_fd()), IORING_POLL_IN, TOKEN_STDERR);

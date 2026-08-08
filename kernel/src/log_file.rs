@@ -93,6 +93,7 @@ use crate::drivers::log_ring;
 use crate::file_cache::{self, FileId};
 use crate::sync::Lock;
 use crate::vfs::{self, Vfs};
+use toyos_abi::syscall::SyscallError;
 
 /// Where the logs go.
 ///
@@ -205,6 +206,27 @@ struct Sink {
 
 static SINK: Lock<Option<Sink>> = Lock::new(None);
 
+/// Whether a flush is between taking bytes out of the ring and getting them on
+/// the device.
+///
+/// [`log_ring::file_has_pending`] answers "the ring still owes the sink", which
+/// goes false at `drain_to_file` — *before* `flush_file` and `sync_mount` have
+/// run. A dying machine waiting on that predicate alone therefore stops waiting
+/// in the middle of the write and halts the CPU doing it, which is exactly what
+/// `halt_all_cpus`'s drain wait did until this existed: the report left the ring
+/// and never reached the stick.
+///
+/// The pair has no gap. `FILE_OWED` only drops inside this flag's window, so
+/// "ring empty and no flush running" cannot be observed while bytes are still
+/// owed to the volume.
+static IN_FLUSH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Is a flush still between the ring and the device? For the fatal path, which
+/// must not halt the CPU doing the writing.
+pub fn flush_in_progress() -> bool {
+    IN_FLUSH.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Start writing the kernel's log to the log volume. Call once, after `/log`
 /// is mounted.
 pub fn install() {
@@ -285,14 +307,16 @@ pub fn poll() {
         return;
     };
     sink.blocked_since = None;
+    IN_FLUSH.store(true, core::sync::atomic::Ordering::Release);
     let outcome = sink.flush(&mut vfs);
+    IN_FLUSH.store(false, core::sync::atomic::Ordering::Release);
     drop(vfs);
-    if let Err(e) = outcome {
+    if let Err((step, err)) = outcome {
         let stopped = sink.stopped_at();
         *guard = None;
         drop(guard);
         log_ring::disable_file_sink();
-        log!("log-file: {e} — {stopped}");
+        log!("log-file: {step} was refused ({err}) — {stopped}");
     }
 }
 
@@ -308,14 +332,24 @@ pub fn flush_final() {
     let mut vfs = vfs::lock();
     let outcome = sink.flush(&mut vfs);
     drop(vfs);
-    if let Err(e) = outcome {
+    if let Err((step, err)) = outcome {
         drop(guard);
-        log!("log-file: the final flush failed: {e}");
+        log!("log-file: the final flush was refused at {step}: {err}");
     }
 }
 
+/// Where a flush stopped, and what it was told there.
+///
+/// The code alone does not identify the fault: `Io` from the append is a page
+/// the stick would not give back, and `Io` from the sync is a device that would
+/// not commit what it already took. The line naming one of them is the last
+/// thing the sink ever writes, and it is written after the sink is disabled —
+/// which is why the step has to travel out of here rather than be logged where
+/// it happened.
+type Refusal = (&'static str, SyscallError);
+
 impl Sink {
-    fn flush(&mut self, vfs: &mut Vfs) -> Result<(), &'static str> {
+    fn flush(&mut self, vfs: &mut Vfs) -> Result<(), Refusal> {
         let lost = log_ring::take_file_drops();
         if lost > 0 {
             // Into the ring, so this line is itself in the batch below and the
@@ -330,7 +364,7 @@ impl Sink {
             if n == 0 {
                 break;
             }
-            self.append(&buf[..n])?;
+            self.append(&buf[..n]).map_err(|e| ("the append", e))?;
             moved += n;
         }
         if moved == 0 {
@@ -338,15 +372,16 @@ impl Sink {
         }
 
         let path = path(&self.stem, self.part);
-        vfs.flush_file(&path, self.file_id, clock::nanos_since_boot())?;
+        vfs.flush_file(&path, self.file_id, clock::nanos_since_boot())
+            .map_err(|e| ("the write-back", e))?;
         // The FAT and the directory entry have reached the device; the device's
         // own write cache has not. A log that survives a wedge has to survive
         // the power being cut with it, which is the whole point, so the flush
         // is not optional and is per batch rather than per line.
-        vfs.sync_mount(MOUNT)?;
+        vfs.sync_mount(MOUNT).map_err(|e| ("the volume sync", e))?;
 
         if self.size >= MAX_LOG_BYTES {
-            self.continue_in_next_part(vfs)?;
+            self.continue_in_next_part(vfs).map_err(|e| ("the rotation", e))?;
         }
         Ok(())
     }
@@ -361,14 +396,14 @@ impl Sink {
     /// this feature exists to produce, from the idle loop, on the one device in
     /// the machine that can be pulled out. Propagating instead disables the
     /// sink, which is what [`poll`] already does with a flush error.
-    fn append(&mut self, data: &[u8]) -> Result<(), &'static str> {
+    fn append(&mut self, data: &[u8]) -> Result<(), SyscallError> {
         let mut done = 0usize;
         while done < data.len() {
             let page = (self.size / 4096) as u32;
             let within = (self.size % 4096) as usize;
             let n = (4096 - within).min(data.len() - done);
             file_cache::write_page(self.file_id, page, within, &data[done..done + n])
-                .map_err(|_| "the log volume would not give back the page being appended to")?;
+                .map_err(|_| SyscallError::Io)?;
             self.size += n as u64;
             done += n;
         }
@@ -380,14 +415,14 @@ impl Sink {
     /// Neither end of a long boot's log is dropped: the earlier parts stay
     /// until [`MAX_LOG_FILES`] reaches them, and by then they are the oldest
     /// files on the volume by the same rule that governs every other boot's.
-    fn continue_in_next_part(&mut self, vfs: &mut Vfs) -> Result<(), &'static str> {
+    fn continue_in_next_part(&mut self, vfs: &mut Vfs) -> Result<(), SyscallError> {
         let full = path(&self.stem, self.part);
         let bytes = self.size;
         if file_cache::release(self.file_id) {
             vfs.close_file(&full, self.file_id);
         }
         if self.part >= MAX_LOG_PARTS {
-            return Err("this boot has filled every part its name can hold");
+            return Err(SyscallError::ResourceExhausted);
         }
 
         let existing = ours(vfs);
@@ -505,11 +540,12 @@ fn sweep(vfs: &mut Vfs, existing: Vec<String>, keep: usize) -> Vec<String> {
         }
         // Named, because a file disappearing off the owner's stick with nothing
         // saying why is indistinguishable from a bug in this module.
-        if vfs.delete_file(&path) {
-            log!("log-file: {DIR} holds more than {MAX_LOG_FILES} logs, so {path} was deleted");
-        } else {
-            log!("log-file: {path} is past the {MAX_LOG_FILES}-log bound and would not delete");
-            kept.push(path);
+        match vfs.delete_file(&path) {
+            Ok(()) => log!("log-file: {DIR} holds more than {MAX_LOG_FILES} logs, so {path} was deleted"),
+            Err(e) => {
+                log!("log-file: {path} is past the {MAX_LOG_FILES}-log bound and would not delete: {e}");
+                kept.push(path);
+            }
         }
     }
     kept

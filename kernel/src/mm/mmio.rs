@@ -3,7 +3,8 @@ use core::ptr::{read_volatile, write_volatile};
 use super::DirectMap;
 
 /// Bounds-checked MMIO handle. Copy, no ownership, no lifetime.
-/// Created by `AddressSpace::map_mmio()`. Accessing after unmap causes a page fault.
+/// Created by `paging::map_mmio`, which is also what makes the window readable
+/// on every CPU and not just the one that mapped it.
 #[derive(Clone, Copy)]
 pub struct Mmio {
     base: *mut u8,
@@ -47,6 +48,12 @@ impl Mmio {
     pub fn read_u8(self, offset: u64) -> u8 {
         self.check(offset, 1);
         unsafe { read_volatile(self.base.add(offset as usize) as *const u8) }
+    }
+
+    #[inline]
+    pub fn write_u8(self, offset: u64, val: u8) {
+        self.check(offset, 1);
+        unsafe { write_volatile(self.base.add(offset as usize) as *mut u8, val) }
     }
 
     #[inline]

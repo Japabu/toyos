@@ -50,6 +50,14 @@ impl<T> Lock<T> {
         let mut next_warn = 50_000_000u64;
         while self.now.load(Ordering::Acquire) != my_ticket {
             core::hint::spin_loop();
+            // A waiter answers TLB shootdowns. This spin is the one unbounded
+            // wait in the kernel that routinely runs with `IF` clear — every
+            // interrupt and exception gate clears it, and handlers take locks —
+            // so without this an initiator that waits for acknowledgements while
+            // holding a lock is a two-CPU deadlock, and which locks those are
+            // could not be enumerated once and stay true. `arch::tlb` has the
+            // argument in full.
+            crate::arch::tlb::poll();
             spins += 1;
             if spins == next_warn {
                 let caller = core::panic::Location::caller();

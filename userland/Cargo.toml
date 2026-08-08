@@ -54,15 +54,20 @@ winit = { git = "https://github.com/Japabu/winit", branch = "toyos" }
 libloading = { git = "https://github.com/Japabu/rust_libloading", branch = "toyos" }
 
 
-# Dependencies are compiled once and cached, so optimising them costs nothing
-# in iteration speed, and unoptimised DSP/render crates miss real time under
-# TCG. Workspace members stay at the dev default for fast rebuilds, except the
-# two compute-heavy apps below.
-[profile.dev.package."*"]
+# The one profile every guest binary is built with — `specs/boot-image-split.md`
+# §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
+# debug-assertions and overflow-checks on, because fail-fast beats speed here
+# and both crafted-ELF kernel panics in `specs/issues/` were *found* by
+# an overflow check. `--release` would turn the last two off silently, so this
+# build system no longer has the flag.
+#
+# What it replaces here: dependencies at 2 through `package."*"`, doom and the
+# compositor named individually at 2, and every other program at the dev
+# default of 0 — so the compositor's own code was optimised and the terminal's
+# was not. One opt-level for the whole image needs no per-package override.
+[profile.toyos]
+inherits = "dev"
 opt-level = 2
-
-[profile.dev.package.doom]
-opt-level = 2
-
-[profile.dev.package.compositor]
-opt-level = 2
+debug = true
+debug-assertions = true
+overflow-checks = true

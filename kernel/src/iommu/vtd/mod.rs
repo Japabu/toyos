@@ -290,11 +290,7 @@ fn window(base: u64) -> Option<Mmio> {
         return None;
     }
     Some(
-        crate::mm::paging::kernel()
-            .lock()
-            .as_mut()
-            .unwrap()
-            .map_mmio(base, REGISTER_WINDOW, CachePolicy::DeferToMtrr),
+        crate::mm::paging::map_mmio(base, REGISTER_WINDOW, CachePolicy::DeferToMtrr),
     )
 }
 

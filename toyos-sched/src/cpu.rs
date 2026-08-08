@@ -29,7 +29,7 @@ use crate::task::{
     BlockedTask, Claim, DeadTask, ReadyTask, RunningTask, SchedPayload, TaskKey, TaskShared,
     TaskState, TransitTask, WaitClass, WakeCause, WakeReason,
 };
-use crate::timer::{DeadlineHeap, DeadlineOracle, TimerApplied, TimerPlan};
+use crate::timer::{TimerApplied, TimerPlan};
 use crate::waitq::{CommittedTicket, CurrentTask};
 
 /// Permission to switch. Holds pointers into the stable Box-backed task
@@ -111,13 +111,54 @@ pub enum Action<X: SchedPayload> {
 
 /// A parked task, plus the two facts that are only meaningful while parked.
 ///
-/// The deadline lives *here* and nowhere else (spec §6.1), so a task that is
-/// not parked structurally cannot have one. The spec's `since` field is
+/// The deadline lives *here* and nowhere else (spec §6.1, §8.3), so a task
+/// that is not parked structurally cannot have one, and no second copy can
+/// disagree with this one about what the CPU owes. The spec's `since` field is
 /// omitted for the same reason: the residency stamp is in the task record.
 pub struct ParkedEntry<X: SchedPayload> {
     task: BlockedTask<X>,
     deadline: Option<Nanos>,
     class: WaitClass,
+}
+
+/// One parked task as an outside reader sees it. The invariants want the key
+/// and the deadline; a blocked-task dump wants the payload and how long the
+/// park has lasted, and it is the only thing that can read them — a `CpuSched`
+/// is reachable from its own CPU alone.
+pub struct ParkedView<'a, X: SchedPayload> {
+    key: TaskKey,
+    entry: &'a ParkedEntry<X>,
+}
+
+impl<X: SchedPayload> ParkedView<'_, X> {
+    pub fn key(&self) -> TaskKey {
+        self.key
+    }
+
+    pub fn deadline(&self) -> Option<Nanos> {
+        self.entry.deadline
+    }
+
+    pub fn class(&self) -> WaitClass {
+        self.entry.class
+    }
+
+    /// When this park began.
+    pub fn since(&self) -> Nanos {
+        self.entry.task.since()
+    }
+
+    pub fn ext(&self) -> &X {
+        self.entry.task.ext()
+    }
+
+    pub fn is_rt(&self) -> bool {
+        self.entry.task.rt().is_rt()
+    }
+
+    pub fn shared_state(&self) -> TaskState {
+        self.entry.task.shared().state()
+    }
 }
 
 /// What context this CPU currently has loaded — the save target of the next
@@ -136,7 +177,6 @@ pub struct CpuSched<X: SchedPayload> {
     running: Option<RunningTask<X>>,
     rq: RunQueue<X>,
     parked: BTreeMap<TaskKey, ParkedEntry<X>>,
-    deadlines: DeadlineHeap,
     /// The task that exited on this CPU, freed by the NEXT pass — a pass
     /// cannot free the stack it is running on.
     zombie: Option<DeadTask<X>>,
@@ -176,7 +216,6 @@ impl<X: SchedPayload> CpuSched<X> {
             running: None,
             rq: RunQueue::new(),
             parked: BTreeMap::new(),
-            deadlines: DeadlineHeap::new(),
             zombie: None,
             mailbox,
             steal_probe: MailboxNode::new(),
@@ -214,10 +253,8 @@ impl<X: SchedPayload> CpuSched<X> {
         &self.rq
     }
 
-    pub fn parked(&self) -> impl Iterator<Item = (TaskKey, Option<Nanos>, WaitClass)> + '_ {
-        self.parked
-            .iter()
-            .map(|(key, entry)| (*key, entry.deadline, entry.class))
+    pub fn parked(&self) -> impl Iterator<Item = ParkedView<'_, X>> + '_ {
+        self.parked.iter().map(|(key, entry)| ParkedView { key: *key, entry })
     }
 
     pub fn parked_task(&self, key: TaskKey) -> Option<&BlockedTask<X>> {
@@ -343,19 +380,6 @@ impl<H: Hw, P: PreemptGuard> Clone for Env<'_, H, P> {
 }
 
 impl<H: Hw, P: PreemptGuard> Copy for Env<'_, H, P> {}
-
-/// Validates a deadline-heap entry against the parked map: an entry whose key
-/// is gone, or whose deadline no longer matches, is a leftover of a wake that
-/// deliberately did not pay O(log n) to remove it (spec §8.3).
-struct Parked<'a, X: SchedPayload>(&'a BTreeMap<TaskKey, ParkedEntry<X>>);
-
-impl<X: SchedPayload> DeadlineOracle for Parked<'_, X> {
-    fn is_current(&self, key: TaskKey, deadline: Nanos) -> bool {
-        self.0
-            .get(&key)
-            .is_some_and(|entry| entry.deadline == Some(deadline))
-    }
-}
 
 impl<X: SchedPayload> CpuSched<X> {
     fn trace<H: Hw<Payload = X>, P: PreemptGuard>(
@@ -594,30 +618,46 @@ impl<X: SchedPayload> CpuSched<X> {
         }
     }
 
+    /// The earliest deadline this CPU owes, and the only thing `apply_timer`
+    /// arms from.
+    ///
+    /// Public because it is also the answer to *may this CPU start something
+    /// long*: a CPU that owes a wake is the wrong one to run unbounded I/O on,
+    /// and the idle loop asks before it flushes (`sched::driver::owes_deadline`).
+    pub fn earliest_deadline(&self) -> Option<Nanos> {
+        self.parked.values().filter_map(|entry| entry.deadline).min()
+    }
+
+    fn next_due(&self, now: Nanos) -> Option<TaskKey> {
+        self.parked
+            .iter()
+            .find(|(_, entry)| entry.deadline.is_some_and(|at| at <= now))
+            .map(|(key, _)| *key)
+    }
+
     /// Fire every deadline that is due, arbitrating with remote wakers
-    /// through the same claim CAS they use (spec §8.3). A CAS we lose means a
-    /// remote waker got there first and its `Wake` is in flight — the timeout
-    /// is superseded and we do nothing, which is why there is no special case
-    /// for it.
+    /// through the same claim CAS they use (spec §8.3).
     fn fire_deadlines<H: Hw<Payload = X>, P: PreemptGuard>(
         &mut self,
         env: Env<'_, H, P>,
         now: Nanos,
     ) {
-        while let Some(key) = self.deadlines.pop_due(now, &Parked(&self.parked)) {
-            let claimed = {
-                let entry = self.parked.get(&key).expect("the oracle validated it");
-                match entry.task.shared().claim_wake() {
-                    Claim::Parked(cpu) => {
-                        assert_eq!(cpu, self.id, "a task parked here claims another CPU");
-                        true
-                    }
-                    Claim::PrePark => panic!("a parked task cannot be pre-park"),
-                    Claim::Lost => false,
+        while let Some(key) = self.next_due(now) {
+            let entry = self.parked.get_mut(&key).expect("just found");
+            match entry.task.shared().claim_wake() {
+                Claim::Parked(cpu) => {
+                    assert_eq!(cpu, self.id, "a task parked here claims another CPU")
                 }
-            };
-            if !claimed {
-                continue;
+                Claim::PrePark => panic!("a parked task cannot be pre-park"),
+                // A remote waker got there first and its `Wake` is in flight;
+                // no later claim can succeed either, so this timeout can never
+                // fire and the entry stops claiming it will. Clearing it is
+                // also what advances the loop — the deadline that will not be
+                // honoured and the deadline that is not reported are one field.
+                Claim::Lost => {
+                    entry.deadline = None;
+                    continue;
+                }
             }
             let entry = self.parked.remove(&key).expect("still there");
             let task = entry.task.wake(
@@ -772,9 +812,6 @@ impl<'c, 'e, H: Hw, P: PreemptGuard> SchedPass<'c, 'e, H, P, Undisposed> {
             self.cpu.park_keeps_lapsed_lend,
         );
         task.share().leave_runnable(self.env.frontier);
-        if let Some(at) = deadline {
-            self.cpu.deadlines.insert(at, key);
-        }
         self.cpu.parked.insert(
             key,
             ParkedEntry {
@@ -818,9 +855,9 @@ impl<'c, 'e, H: Hw, P: PreemptGuard> SchedPass<'c, 'e, H, P, Undisposed> {
 impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// The only exit. Picks the next task, answers steal requests from
     /// surplus, publishes load, and — LAST — programs the timer. Arming after
-    /// every heap mutation is the whole proof of invariant T (spec §8.4):
-    /// with no window between the last mutation and the arming, "deadline
-    /// exists but timer unarmed" is not a state the code can be in.
+    /// every change to `parked` is the whole proof of invariant T (spec §8.4):
+    /// with no window between the last change and the arming, "deadline exists
+    /// but timer unarmed" is not a state the code can be in.
     pub fn finish(self) -> Action<<H as Hw>::Payload> {
         // Sampled before the pass is consumed, so the second clock read below
         // measures the pass and nothing else. `now` is threaded as a value
@@ -929,7 +966,7 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     }
 
     fn apply_timer(&mut self) -> TimerApplied {
-        let deadline = self.cpu.deadlines.min_valid(&Parked(&self.cpu.parked));
+        let deadline = self.cpu.earliest_deadline();
         let quantum = self.cpu.running.as_ref().map(|_| self.cpu.quantum_end);
         let plan = TimerPlan::compute(quantum, deadline);
         match plan {
