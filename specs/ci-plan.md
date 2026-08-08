@@ -498,11 +498,17 @@ nothing else does — the firmware is `ovmf/` in this repository on every host, 
 boot image is built in the job, and the host CPU is the same Azure vCPU (an AMD
 EPYC 7763 in all four). Runs `31245897225` and `31246245541`.
 
-| QEMU | accel | red |
-|---|---|---|
-| 8.2.2 (apt) | KVM | `metal_sim_pointer_churn`, `xhci_flap`, `desktop_typing_damage` |
-| 11.0.3 (`debian:sid`) | KVM | `metal_sim_pointer_churn`, `xhci_flap` |
-| 11.0.3 (`debian:sid`) | TCG | **none** |
+| QEMU | accel | fastest boot | red |
+|---|---|---|---|
+| 8.2.2 (apt) | KVM | 1.7–2.3 s | `metal_sim_pointer_churn`, `xhci_flap`, `desktop_typing_damage` |
+| 8.2.2 (apt) | TCG | 4.4–4.6 s | all but `abuse_gpu_resolution` |
+| 11.0.3 (`debian:sid`) | KVM | 1.7–2.3 s | `metal_sim_pointer_churn`, `xhci_flap` |
+| 11.0.3 (`debian:sid`) | TCG | 4.0–5.0 s | **none** |
+
+**The two TCG cells are the strongest thing in the table**, because their boots
+are the same speed — 4.4–4.6 s against 4.0–5.0 s — and one is green throughout
+while the other loses seven of eight. Whatever 8.2.2 does differently to the
+emulated i8042, it is not that it is slower.
 
 **Half the class was the width and neither variable.** `i8042_keyboard`,
 `i8042_mouse`, `i8042_fadt_denial` and `xhci_hotplug` are green in every arm
@@ -691,15 +697,36 @@ looks stale.
 - **An ARM runner running aarch64 guests.** Not possible: no `/dev/kvm` on
   `ubuntu-24.04-arm` and no HVF on `macos-latest`. An aarch64 guest there would
   be TCG on an arm64 host, which is what the dev host already is.
-- **A green guest suite.** 246 of 268 on the five shards that finished
-  (§7.2), against 43 of 86 on the three that finished under TCG. What is left is
-  a named list rather than a wall of clocks, and the biggest single item in it is
-  **input delivery**: six tests that inject a keystroke or a plug event fail on a
-  runner and pass here, and nobody has separated the accelerator from QEMU 8.2.2
-  against 11.0.3.
-- **The shard partition**, §7.2 — round-robin because a runner has no duration
-  profile, and shard 5 was cut off at 1932 s in its parallel phase because of it.
-- **Larger runners** were not tried. They are a billed feature even on public
-  repos, so trying one is the owner's call. §7.2 makes core count the standing
-  constraint: two lanes is the most four cores will take, and the `ALONE: GREEN`
-  class is what is left of the ones that will not fit.
+- **A green guest suite.** **280 of 290 on twelve shards, all of which finished**
+  (run `31249703011`), against 246 of 268 on the five that finished of
+  `31238056513` and 43 of 86 under TCG. Two of the ten are the xHCI plug/unplug
+  class under KVM (`xhci_hotplug`, `metal_sim_pointer_churn`, both red again
+  alone), one is `hda_tone`'s mid-tone silence, one is `usb_transport_break`
+  (serial, so nothing re-ran it), and **six failed once and passed once at one
+  lane** — a rate, not a classification, and the thing to attack next. The named
+  list is `specs/known-issues.md` §8.
+- **Whether six-in-290 is this tree's flake rate or this configuration's.** One
+  lane per machine removed the contention explanation, so what is left needs a
+  rate measured rather than argued: the same shard re-run N times is one runner
+  job and nobody has done it.
+
+### Larger runners: not purchasable for this repository
+
+The owner approved paying for them and there is nothing to buy. GitHub's larger
+hosted runners are created by name at the *organization* level and `Japabu/toyos`
+is owned by a User account, so no such label resolves. Measured rather than read
+off a page: run `31246336130` asked for `ubuntu-latest-4-cores`,
+`ubuntu-latest-8-cores` and `ubuntu-latest-16-cores` beside an `ubuntu-24.04`
+control. The control finished in **4 seconds**; the three larger jobs were still
+`queued` **thirty minutes** later, which is what an unresolvable label does — it
+waits rather than failing. Cancelled at that point.
+
+What they would have bought is bounded and now mostly spent. Core count was the
+standing constraint because four cores held two lanes; **one lane per machine and
+twelve machines removes that**, costs nothing on a public repository, and it is
+what took the `ALONE: GREEN` class from eight to zero of that shape. The one
+thing a bigger machine would still buy is the six tests that boot `-smp 8` —
+QEMU says so itself, `Number of SMP cpus requested (8) exceeds the recommended
+cpus supported by KVM (4)` — and at one lane those now pass. If the owner moves
+this repository under an organization, one 8-core shard for the wide-SMP tests is
+the shape to buy, and nothing else.

@@ -5728,11 +5728,16 @@ answer turned out to have three parts and each arm found a different one. All on
 `debian:sid` container, everything else identical — the firmware is `ovmf/` in
 this repository on every host, so it does not move):
 
-| QEMU | accel | red |
-|---|---|---|
-| 8.2.2 | KVM | `metal_sim_pointer_churn`, `xhci_flap`, `desktop_typing_damage` |
-| 11.0.3 | KVM | `metal_sim_pointer_churn`, `xhci_flap` |
-| 11.0.3 | TCG | **none** |
+| QEMU | accel | fastest boot | red |
+|---|---|---|---|
+| 8.2.2 | KVM | 1.7–2.3 s | `metal_sim_pointer_churn`, `xhci_flap`, `desktop_typing_damage` |
+| 8.2.2 | TCG | 4.4–4.6 s | all but `abuse_gpu_resolution` |
+| 11.0.3 | KVM | 1.7–2.3 s | `metal_sim_pointer_churn`, `xhci_flap` |
+| 11.0.3 | TCG | 4.0–5.0 s | **none** |
+
+The two TCG cells carry the most: their boots are the same speed, one is green
+throughout and the other loses seven of eight, so whatever 8.2.2 does to the
+emulated i8042 it is not that it is slower.
 
 **Most of the class was neither.** `i8042_keyboard`, `i8042_mouse`,
 `i8042_fadt_denial` and `xhci_hotplug` are green in *every* arm above, and all
@@ -5742,11 +5747,14 @@ accelerator — at `--jobs 2`. Two lanes on four cores is what they were, and
 `ALONE: GREEN` class `specs/known-issues.md` §7 records, reaching further than
 anyone had counted: on a four-core machine it takes the i8042 family with it.
 
-**`desktop_typing_damage` is the QEMU version**, and it is the only one. Red on
-8.2.2 under KVM, green on 11.0.3 under the same accelerator on the same runner
-image. Injection is a QMP path through an emulated device and three major
-versions of that had never had a second data point. CI now runs 11.0.3, the dev
-host's own version, which removes the variable rather than working around it.
+**`desktop_typing_damage` is the QEMU version.** Red on 8.2.2 under KVM, green on
+11.0.3 under the same accelerator on the same runner image; and `usb_storage_shapes`
+— not one of the eight, so not in the table — is the same story, red under 8.2.2
+with `the driver did not report "blocks of 4096 B"` where both QEMU disks
+reported 512, and green in 29 s under 11.0.3. Injection and device geometry are
+both QMP and device-model surface, and three major versions of it had never had a
+second data point in this tree. CI runs 11.0.3, the dev host's own version, which
+removes the variable rather than working around it.
 
 **Two are the accelerator, and by the owner's rule that makes them the guest's.**
 `metal_sim_pointer_churn` and `xhci_flap` are red on KVM at *both* QEMU versions
