@@ -1,0 +1,121 @@
+name: landing
+
+# The two checks that are about the landing protocol rather than about the code.
+#
+# Both were rules `cargo run -- --land` enforced on the dev host. `--land` is
+# retired (`specs/worktrees.md` §5), so the rules it carried needed somewhere
+# to live, and the only thing between a branch and `main` now is CI.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: landing-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # **A sysroot change may not be merged with the work that depends on it.**
+  # `toyos-abi/src`, `toyos/src` and `userland/libc/src` are compiled into the
+  # one sysroot every worktree on the dev host builds against, so a branch that
+  # changes them holds it from its first build until it lands — the rule is that
+  # the sysroot half lands first, making that window one merge instead of one
+  # task. Followed once in four times on 2026-08-07, at 35 and 50 minutes of two
+  # other agents each (`specs/worktrees.md` §3.2).
+  #
+  # The same function answers here and at `cargo run -- --pr`, deliberately: an
+  # agent that ran the preflight gets the refusal in a second, and a branch that
+  # skipped it gets the identical words from this check.
+  abi-split:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # The head branch and not the merge commit: the question is which of
+      # *this branch's* commits touch the sysroot's sources, and a merge commit
+      # is not one of them.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: landing-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: landing-${{ runner.os }}-
+
+      # Always runs, and answers "not a pull request" rather than being skipped:
+      # a required check that a `push` event skips reports a state a protection
+      # rule then has to have an opinion about, and this one has nothing to say
+      # about a commit that is already on main.
+      - name: the ABI-first rule
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "not a pull request: this rule is about a branch against its base."
+            exit 0
+          fi
+          git fetch --quiet origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          cargo run -- --abi-split-check --base "origin/${{ github.base_ref }}"
+
+  # **The guest gate is advisory, and this is what stops that being permanent.**
+  #
+  # `specs/ci-plan.md` §9.2: five names reproduce on every run, so a merge gate
+  # of "twelve green shards" would block every pull request on defects that are
+  # in the kernel, in soundd and in the HDA driver rather than in CI. Widening
+  # `EXPECTED_FAILURES` to cover them is refused — an exemption names a defect
+  # and its write-up, and buying a green run while a process can kill its
+  # neighbour is not that (§9.3).
+  #
+  # So `guest-suite` is not a required check yet, and the trigger for making it
+  # one is written down as a command rather than as an intention: **three
+  # consecutive completed `ci` runs on `main`, all green.** This job goes red the
+  # moment that is true and `GUEST_GATE` still says `advisory`, so the gate
+  # cannot quietly stay decoration — the same shape as `EXPECTED_FAILURES`'s
+  # `OnAPass`, applied to the gate's own configuration.
+  #
+  # Three and not two: six of §9.2's eleven fire at 20-40%, so one lucky green
+  # is a sample and not a state.
+  gate-stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # `advisory` or `required`. Flipping it is half the act; the other half is
+      # adding `guest-suite` to main's required status checks, and this job's
+      # refusal names both.
+      GUEST_GATE: advisory
+    steps:
+      - name: is the guest gate still owed?
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if [ "$GUEST_GATE" = required ]; then
+            echo "the guest shards are a required check."
+            exit 0
+          fi
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs"
+          # `cancel-in-progress` is on, so a superseded run has no verdict in it;
+          # only the runs that concluded either way are samples.
+          runs=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+                   "$api?branch=main&status=completed&per_page=20" \
+                 | jq -r '[.workflow_runs[]
+                           | select(.conclusion=="success" or .conclusion=="failure")
+                           | .conclusion][:3] | join(" ")')
+          echo "the last completed ci runs on main: ${runs:-none}"
+          case "$runs" in
+            "success success success")
+              echo "::error::The guest suite has been green on main three runs running, and"
+              echo "::error::guest-suite is still advisory. Make it a required status check on"
+              echo "::error::main and set GUEST_GATE=required in .github/workflows/landing.yml."
+              echo "::error::specs/ci-plan.md §10 is the trigger this is enforcing."
+              exit 1
+              ;;
+          esac
+          echo "the guest gate stays advisory: specs/ci-plan.md §9.2 has the five that reproduce."

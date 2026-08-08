@@ -201,10 +201,10 @@ fn standing(root: &Path) -> Standing {
         return Standing::Diverged;
     }
     // **A merge in progress is not this branch's statement about itself.**
-    // `--land` runs its gate against a staged, uncommitted merge of main, so
-    // every file main changed reads as local work — and a build inside that gate
-    // would be told it had standing to claim a sysroot it has no delta for.
-    // What the branch has of its own is the committed question above.
+    // An agent resolving `--pr`'s merge of main holds every file main changed as
+    // staged local work, and a build in that state would be told it had standing
+    // to claim a sysroot it has no delta for. What the branch has of its own is
+    // the committed question above.
     if merging(root) {
         return if committed == Some(0) { Standing::MatchesMain } else { Standing::Unknown };
     }
@@ -1056,10 +1056,10 @@ mod tests {
         );
     }
 
-    /// **A landing's own merge must not look like standing.** `--land` gates a
-    /// staged, uncommitted merge of main, so every file main changed is local
-    /// work as far as `git status` is concerned — and a build inside that gate
-    /// would be told it could claim a sysroot it has no delta for.
+    /// **A landing's own merge must not look like standing.** A branch part-way
+    /// through merging main holds every file main changed as local work as far
+    /// as `git status` is concerned — and a build in that state would be told it
+    /// could claim a sysroot it has no delta for.
     #[test]
     fn a_landing_s_uncommitted_merge_is_not_standing() {
         let root = scratch("mid-landing");

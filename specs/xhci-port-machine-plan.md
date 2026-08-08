@@ -253,8 +253,8 @@ the metal proof is the owner's and it is the one that counts.
   round each time. **If X2 makes it pass that is not evidence of anything** — as
   likely the race landing the other way, which is exactly why its
   `EXPECTED_FAILURES` entry expires on a date rather than on a green run.
-  Nothing to do: `cargo run -- --land` takes a run it fired in, and does not
-  take one where it failed some other way.
+  Nothing to do: the gate takes a run it fired in, and does not take one where
+  it failed some other way.
 - **There is no gate for the unplug window and it cannot be aimed.** The hazard
   is the 100 ms between the device going and the teardown running, and a QEMU
   `device_del` cannot be landed inside it. That is the answer and belongs in a

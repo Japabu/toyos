@@ -3,8 +3,8 @@
 //! `tests/toyos.rs` reads its flags by name and takes the first remaining
 //! positional argument as the run's filter. A flag it does not have therefore
 //! costs nothing and its *value* becomes that filter, so a command line naming
-//! a deleted flag runs one test and reports the run as a pass. `--land` prints
-//! that the gate was not the default and nothing else refuses it.
+//! a deleted flag runs one test and reports the run as a pass, and nothing
+//! between such a command line and a green check refuses it.
 //!
 //! So the flag table is here, one entry per flag the harness reads, and the
 //! filter falls out of the same pass rather than out of a second guess about

@@ -724,9 +724,15 @@ happened, and the second is the one that catches people:
 The rule that falls out: **before believing a CI red is the tree, name what
 differs.** The candidates are short and they are all in the table above.
 
-## 8.4 Somebody has to push `main`
+## 8.4 Somebody had to push `main`, and now nobody does
 
-`cargo run -- --land` fast-forwards the primary checkout and does not push, and
+**Closed by §10**, and not by the one line this section proposed. `main` moves
+only through a merged pull request now, so GitHub pushes it and there is nothing
+left to fall behind. The account below is kept for the failure mode, which was
+worth a section: a default branch nobody tests is a default branch whose CI
+result is about a tree that no longer exists.
+
+`cargo run -- --land` fast-forwarded the primary checkout and did not push, and
 the owner's rule is that an agent pushes its own branch and never `main`. At the
 moment this landed, `origin/main` was **64 commits behind** local `main` and
 carried no `.github` directory at all; it was pushed by hand shortly after and
@@ -755,11 +761,9 @@ behind** local `main` — every one of them the twelve-shard work — and the ne
 commits replaced. Anyone reading this repository's default-branch CI was reading
 a stale config's failure.
 
-So `--land` now *says so*. `origin_main_lag` reads the local remote-tracking ref
-after the fast-forward and prints how far behind GitHub is, with the `git push`
-that closes it. It asks no remote — a landing may not go to the network,
-`--check-forks` is the command that does and says so — so an unfetched ref makes
-it a lower bound, which is why the line says "at least". It does not push.
+`--land` was made to *say so* — `origin_main_lag`, a lower bound read off the
+local remote-tracking ref, printed with the `git push` that would close it. It
+went with the command.
 
 ## 9. Not done
 
@@ -993,3 +997,150 @@ QEMU says so itself, `Number of SMP cpus requested (8) exceeds the recommended
 cpus supported by KVM (4)` — and at one lane those now pass. If the owner moves
 this repository under an organization, one 8-core shard for the wide-SMP tests is
 the shape to buy, and nothing else.
+
+## 10. Landing moved to GitHub
+
+`cargo run -- --land` is retired. Everything reaches `main` through a pull
+request, and the gate is the twelve KVM shards rather than one cross-arch TCG
+run on the dev host.
+
+The reason is §7 and §8.1, not tidiness. The dev host is arm64 emulating x86 and
+gives you one vendor's reading of every instruction it emulates; `STAR[63:48]`
+was green in every run there had ever been here and lost 64 boots of 64 on an
+EPYC. A gate that cannot execute a class of defect is not a gate against it.
+
+### 10.1 The merge queue is not available on this repository
+
+GitHub's merge queue is precisely the feature that would have replaced
+`--land`'s integration lock and its "gate the merged result" property in one
+move: it builds a temporary branch of base + the entries ahead + this pull
+request, runs the required checks on *that*, and merges only what it tested.
+
+It cannot be turned on here. Measured, 2026-08-08, rather than read off a page:
+
+```
+$ gh api -X POST repos/Japabu/toyos/rulesets --input mq.json     # merge_queue rule
+{"message":"Validation Failed","errors":["Invalid rule 'merge_queue': "],"status":"422"}
+
+$ gh api graphql -f query='{repository(owner:"Japabu",name:"toyos"){mergeQueue(branch:"main"){id}}}'
+{"data":{"repository":{"mergeQueue":null}}}
+```
+
+`MERGE_QUEUE` **is** in the `RepositoryRuleType` enum and `MergeQueueParametersInput`
+has all seven of its fields, so this is an entitlement and not a missing API. A
+control ruleset carrying `non_fast_forward` and nothing else was accepted on the
+same repository seconds earlier and then deleted, so rulesets themselves work.
+
+Same cause as §9.4's larger runners: `Japabu/toyos` is owned by a User account.
+**If the owner ever moves this repository under an organization, the merge queue
+is the first thing to buy** — it is strictly better than §10.2, because it tests
+combinations without making anyone re-merge.
+
+### 10.2 What replaces it, and why it keeps the property
+
+**A required status check marked *strict*** — GitHub's "require branches to be
+up to date before merging". The merge button stays refused until the head branch
+contains `origin/main`, which means:
+
+- **The checks that ran on the head ran on the merged result.** That is step 2 of
+  the old protocol, unchanged in substance: `git merge --no-ff main`, then gate.
+  It is the property that catches a semantic conflict between two branches that
+  each pass alone, and losing it was the one thing a naive "CI on the PR" setup
+  would have cost.
+- **Landings serialise.** The first merge moves `main`; every other open pull
+  request is out of date from that instant and has to merge again and re-run.
+  That is the integration lock, enforced by the thing that actually moves `main`
+  rather than by an advisory `flock` on one host — and §5 already recorded two
+  landings that got past that lock because nothing outside the build system could
+  take it.
+
+What it costs against a merge queue is parallelism: two ready pull requests are
+merged one after the other with a full CI run between them, where a queue would
+have built them speculatively. On a repository with one owner and a handful of
+agents that is a queue of two, and the minutes are unmetered.
+
+`cargo run -- --pr` is the command that produces the state the button wants:
+preflight refusals, `git fetch`, this host's `main` fast-forwarded,
+`git merge --no-ff origin/main` into the branch, `git push -u`, and the `gh`
+lines to run next. It never pushes `main` and never forces anything.
+
+### 10.3 Where each of `--land`'s invariants went
+
+| invariant | where it lives now |
+|---|---|
+| integration lock, one landing at a time | GitHub, via strict required checks (§10.2). `buildlock::integration` survives with a narrower job: one process at a time moves *this host's* `main`, which is a tree somebody may be building in. |
+| `git merge --no-ff main`, gate the merged result | `cargo run -- --pr` makes the merge; the strict check refuses the button without it. |
+| `--ff-only` into main | GitHub's merge. It is still a merge commit with both parents and nothing is squashed or rebased — `allow_squash_merge` and `allow_rebase_merge` are off. |
+| the ABI-first refusal | `landing.yml`'s `abi-split` check, and `cargo run -- --pr` locally. One function (`pr::abi_lands_alone`) answers both. |
+| `--abi-inseparable` | an `Abi-Inseparable: <why>` trailer in a commit message. CI has no command line from the author, and a flag's only record was the commit `--land` wrote; a trailer is in the branch's history and lands with it. |
+| the landing commit's message | the pull request's title and body, through `merge_commit_title=PR_TITLE` / `merge_commit_message=PR_BODY`. `.github/pull_request_template.md` asks for what `--land` used to compose. |
+| "gate ok" vs "gate ok, NOT clean" | two places, and both are better than a sentence in a commit body. The declaration itself is `EXPECTED_FAILURES` in `tests/toyos.rs`, which is *in the diff being reviewed*; and every shard now writes its own `test result:` line into the run's job summary. |
+| which gate ran, and how long | the check run on the head commit, which is durable and linked from the merge. |
+| the sysroot claim and its standing rule | **local, and it stays local.** It is about one shared 50 GiB `rust/build` on one laptop; a runner has its own and §8.1 says so. Nothing about it is expressible on GitHub. |
+| `origin/main` falling behind | gone. `main` moves only through a merge, so GitHub is where it moves. |
+| fast-forwarding this host's `main` | `cargo run -- --sync`, which `--pr` runs first. The primary checkout still owns `rust/`, the rustup link and the witness every worktree compares against, so it has to keep up. |
+
+### 10.4 The two stages, and the exact trigger between them
+
+**CI cannot currently go green, and the reason is not CI.** §9.2's top five
+reproduce on every run: `std_unwind` and `std_unwind_so` (x87 state on the
+context switch, §9.3), `metal_sim_null_audio` and `hda_two_live_refused`
+(soundd's device-less path), and `hda_tone`'s mid-tone silence. Each has an owner
+and a write-up. **Widening `EXPECTED_FAILURES` to cover them is refused** — an
+exemption names a defect and its write-up, and buying a green run while any Ring
+3 process can kill the next unrelated one scheduled on that CPU is not that.
+
+So the switch is staged, and the second stage is not a matter of anyone
+remembering.
+
+**Stage 1, now.** `main` is protected: pull request required, force-push and
+deletion refused, no bypass. The required status checks are
+
+```
+host        every host crate, cargo test --lib, sshd          (host-tests.yml)
+abi-split   the ABI-first rule                                (landing.yml)
+gate-stage  whether the guest gate is still owed              (landing.yml)
+tcg         one guest boot, emulated, on x86_64               (ci.yml)
+```
+
+`guest-suite` — the twelve KVM shards behind one name — runs on every pull
+request and is **not** required.
+
+**Stage 2, on the trigger.** Add `guest-suite` to the required checks and set
+`GUEST_GATE: required` in `.github/workflows/landing.yml`.
+
+**The trigger is three consecutive completed `ci` runs on `main`, all green.**
+Three and not one, because six of §9.2's eleven fire at 20–40% and one lucky
+green is a sample rather than a state.
+
+**`gate-stage` is the check that makes the trigger fire by itself.** It reads
+this repository's own last three completed `ci` runs on `main` and goes red when
+they are all green while `GUEST_GATE` still says `advisory`, printing both halves
+of the remedy. Nothing then merges until the gate is promoted. That is
+`EXPECTED_FAILURES`'s `OnAPass` applied to the gate's configuration: an advisory
+state that cannot survive being unnecessary.
+
+### 10.5 What is configured outside the repository
+
+None of this is in VCS and none of it is reviewable in a diff, so it is listed
+here. Repository settings on `Japabu/toyos`:
+
+- **Ruleset `main`** — `pull_request` (0 approving reviews required),
+  `required_status_checks` with `strict_required_status_checks_policy: true` and
+  the four contexts of §10.4, `non_fast_forward`, `deletion`. No bypass actors.
+- `allow_squash_merge: false`, `allow_rebase_merge: false` — nothing rewrites
+  history, which is CLAUDE.md's rule said at the remote.
+- `allow_auto_merge: true` — `gh pr merge --auto --merge` is how an agent leaves
+  a pull request to merge itself when the checks come back.
+- `merge_commit_title: PR_TITLE`, `merge_commit_message: PR_BODY` — the merge
+  commit is the landing record, so it reads from main's side the way `--land`'s
+  did.
+- `delete_branch_on_merge` stays **off**: a branch is checked out in a worktree
+  and deleting it under one is not a tidy-up.
+
+**Zero approving reviews is deliberate and is the one place this is weaker than
+it looks.** There is one human and several agents; requiring a review would
+deadlock every agent on the owner being awake. The review gate `specs/worktrees.md`
+§5 argues for — changes to the files that govern other agents — is a thing the
+owner does on the pull request, and a pull request is the first artifact this
+workflow has ever had that he *can* do it on.

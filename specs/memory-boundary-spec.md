@@ -285,8 +285,8 @@ therefore M1a's first commit rather than futex.
 
 ## 3. The four stages
 
-Each leaves `main`'s tip green and is landed separately with
-`cargo run -- --land`. Ordering differs from the task order; §3.5 argues why.
+Each leaves `main`'s tip green and is landed separately, one pull request
+each. Ordering differs from the task order; §3.5 argues why.
 
 ### 3.1 Stage M1 — the validated user-memory boundary (#162c + #158)
 
@@ -1051,8 +1051,8 @@ can land whenever it is scheduled rather than riding M2 — a green discovery ru
 removes the risk that motivated the hold, but not the call on when a shared
 resource changes under five agents.
 
-**Landing this wave's stages while #156 is open** needs nothing special:
-`cargo run -- --land`. `desktop_window_child` is declared in
+**Landing this wave's stages while #156 is open** needs nothing special.
+`desktop_window_child` is declared in
 `EXPECTED_FAILURES` (`tests/toyos.rs`), so it still runs, it is named with its
 task in every run's report, and it does not red the gate. Any other red belongs
 to the change and is explained, never excluded — and the declaration cannot
