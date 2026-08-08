@@ -1,0 +1,112 @@
+name: xhci-break-probe
+
+# **Does the Bulk-Only Reset race the transfer it is recovering from, and does
+# the fix close it?**
+#
+# `usb_transport_break` is red 5 of 5 on CI (run `31258202923`, shard 6) and
+# green on the dev host, and the two `transport broke` lines it counts are not
+# the same break: the first is the injection's `no answer in the data phase`,
+# the second is `command phase completion code 6` — a Stall Error on a command
+# block, which is the *device* refusing the next CBW. QEMU 11.0.3's
+# `MassStorageReset` sets `s->mode = USB_MSDM_CBW` without cancelling `s->req`,
+# and the late `usb_msd_command_complete` then sets `s->mode = USB_MSDM_CSW`
+# over the top of it. So the reset holds only if the device's answer to the
+# abandoned transfer lands before it — which the guest wins under KVM and loses
+# under TCG, and is why this host has never seen it.
+#
+# Two arms, one session. `control` is `origin/main`'s tree, which must red with
+# that sentence: it certifies that a *filtered* run of the one test is an
+# instrument that reproduces this at all, which the twelve-shard configuration
+# is too expensive to keep asking. `fixed` is this branch. Three reps each,
+# because one green of an intermittent test is one sample.
+#
+# It never fails. A probe that reds is a probe whose own summary nobody reads.
+
+on:
+  push:
+    branches: ['ci/probe-xhci-break']
+  workflow_dispatch:
+
+jobs:
+  xhci-break:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [control, fixed]
+        rep: [1, 2, 3]
+    container:
+      image: debian:sid
+      options: --device=/dev/kvm
+    steps:
+      - name: deps
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            git curl ca-certificates jq zstd xz-utils build-essential \
+            qemu-system-x86 > /dev/null
+          qemu-system-x86_64 --version | head -1
+          grep -m1 'model name' /proc/cpuinfo
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
+          for _ in $(seq 90); do
+            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
+              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
+            [ -n "$asset" ] && break
+            sleep 60
+          done
+          test -n "$asset"
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
+          mkdir -p rust/build
+          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
+          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+
+      # The driver, its recovery sequence and the test, back to what main has.
+      # Everything else — toolchain, image, harness — stays this branch's, so
+      # the only thing that differs between the arms is the code under test.
+      - name: take the fix back out
+        if: matrix.arm == 'control'
+        run: |
+          git fetch --depth=1 origin main
+          git checkout FETCH_HEAD -- \
+            kernel/src/drivers/xhci/wait toyos-xhci/src/recovery.rs tests/common/usb.rs
+          git --no-pager diff --stat HEAD
+
+      - name: the one test
+        run: |
+          set -o pipefail
+          cargo test --test toyos-build -- usb_transport_break --host-slots 0 \
+            2>&1 | tee /tmp/probe.log || echo "SUITE-EXIT: $?"
+          echo "PROBE ${{ matrix.arm }} rep ${{ matrix.rep }}:"
+          grep -E '^  (PASS|FAIL|STALL) +usb_transport_break' /tmp/probe.log \
+            || echo "  the test did not report"
+          echo "-- what the guest said about the transport:"
+          grep -E 'transport broke|recovering|completed on attempt|disk done' \
+            /tmp/probe.log || echo "  nothing"
+
+      - name: the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xhci-break-${{ matrix.arm }}-${{ matrix.rep }}
+          path: /tmp/probe.log
+          retention-days: 5
