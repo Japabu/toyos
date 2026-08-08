@@ -13,6 +13,9 @@ mod xhci;
 use core::arch::naked_asm;
 
 use super::cpu;
+use super::entry::{
+    restore_user_state, ring3_naked_asm, save_user_state, Ring0Entry, Ring3Entry,
+};
 use super::cpu::{outb, io_wait};
 use crate::sync::Lock;
 
@@ -71,7 +74,18 @@ impl IdtEntry {
         reserved: 0,
     };
 
-    fn new(handler: u64) -> Self {
+    /// A gate for a handler that can reach another task.
+    fn ring3(entry: Ring3Entry) -> Self {
+        Self::at(entry.addr())
+    }
+
+    /// A gate for one that cannot.
+    fn ring0(entry: Ring0Entry) -> Self {
+        Self::at(entry.addr())
+    }
+
+    /// Private, so no slot can be filled by a pointer nobody classified.
+    fn at(handler: u64) -> Self {
         Self {
             offset_low: handler as u16,
             selector: 0x08, // kernel CS
@@ -185,10 +199,17 @@ macro_rules! exception_stub {
 /// A `direct` vector is its own naked entry and never reaches
 /// [`trap_dispatch`]: the device IRQs, the halt IPI, the shootdown IPI, and the
 /// NMI, whose handler must not touch the preempt count or reschedule.
+///
+/// Each `direct` row also answers whether its handler can reach another task
+/// before returning to Ring 3 — `ring3` if it can, and it must therefore
+/// bracket the user machine state (`arch::entry`), `ring0` if it cannot. There
+/// is no third spelling and no default, for the same reason the error-code
+/// column has none. Every `dispatched` vector goes through `common_entry`,
+/// which brackets, so their rows do not repeat the answer.
 macro_rules! idt_vectors {
     (
         dispatched { $($ex:ident = $exnum:literal, $stub:ident, $err:ident $(, ist $ist:literal)?;)* }
-        direct { $($direct:ident = $dnum:literal, $entry:path;)* }
+        direct { $($ring:tt $direct:ident = $dnum:literal, $entry:path;)* }
     ) => {
         /// IDT vector assignments — CPU exceptions and hardware interrupts.
         #[repr(usize)]
@@ -215,13 +236,22 @@ macro_rules! idt_vectors {
         fn install_gates(idt: &mut Idt) {
             $(
                 idt.entries[Vector::$ex as usize] =
-                    IdtEntry::new($stub as *const () as u64)$(.with_ist($ist))?;
+                    IdtEntry::ring3(Ring3Entry::new($stub))$(.with_ist($ist))?;
             )*
             $(
-                idt.entries[Vector::$direct as usize] =
-                    IdtEntry::new($entry as *const () as u64);
+                idt.entries[Vector::$direct as usize] = direct_gate!($ring, $entry);
             )*
         }
+    };
+}
+
+/// The two answers a `direct` row may give, and the whole of what each means.
+macro_rules! direct_gate {
+    (ring3, $entry:path) => {
+        IdtEntry::ring3(Ring3Entry::new($entry))
+    };
+    (ring0, $entry:path) => {
+        IdtEntry::ring0(Ring0Entry::declare($entry))
     };
 }
 
@@ -258,16 +288,19 @@ idt_vectors! {
     }
     direct {
         // Diagnostic only, and sent by `sched::dump` alone — see `idt/nmi.rs`.
-        Nmi          = 0x02, nmi::nmi_entry;
-        Timer        = 0x20, timer::timer_entry;
-        Xhci         = 0x21, xhci::xhci_entry;
-        VirtioNet    = 0x22, virtio_net::virtio_net_entry;
-        VirtioSound  = 0x23, virtio_sound::virtio_sound_entry;
-        I8042        = 0x24, i8042::i8042_entry;
-        DmaFault     = 0x25, dma_fault::dma_fault_entry;
-        Hda          = 0x26, hda::hda_entry;
-        HaltAll      = 0xFD, stub_halt_all;
-        TlbFlush     = 0xFE, tlb::tlb_flush_entry;
+        // Ring 0 because it arrives between arbitrary instructions, including
+        // inside another entry's own save, and it reschedules nothing.
+        ring0 Nmi          = 0x02, nmi::nmi_entry;
+        ring3 Timer        = 0x20, timer::timer_entry;
+        ring3 Xhci         = 0x21, xhci::xhci_entry;
+        ring3 VirtioNet    = 0x22, virtio_net::virtio_net_entry;
+        ring3 VirtioSound  = 0x23, virtio_sound::virtio_sound_entry;
+        ring3 I8042        = 0x24, i8042::i8042_entry;
+        ring3 DmaFault     = 0x25, dma_fault::dma_fault_entry;
+        ring3 Hda          = 0x26, hda::hda_entry;
+        // Ring 0 because it never returns: `cli; hlt` forever.
+        ring0 HaltAll      = 0xFD, stub_halt_all;
+        ring3 TlbFlush     = 0xFE, tlb::tlb_flush_entry;
     }
 }
 
@@ -277,25 +310,38 @@ extern "sysv64" fn stub_halt_all() {
     naked_asm!("cli", "2: hlt", "jmp 2b");
 }
 
+/// Every exception vector's second half, #PF included.
+///
+/// It reaches [`kernel_exit_to_user_check`] and therefore `do_preempt`, so a
+/// fault taken from Ring 3 can return through another task — and until this
+/// bracket existed it did so carrying whatever that task left in the registers.
+/// A demand-paging fault corrupting XMM produces a wrong number rather than a
+/// signal, which is why nothing had noticed (`specs/user-machine-state.md` §3).
+///
+/// `rdi` is taken before the bracket because the bracket moves `rsp`: the frame
+/// [`trap_dispatch`] is handed is the one the pushes above built, and the CS
+/// test after the call reads it back out of the bracket's stash.
 #[unsafe(naked)]
 extern "sysv64" fn common_entry() {
-    naked_asm!(
+    ring3_naked_asm!(
         "push r15", "push r14", "push r13", "push r12",
         "push r11", "push r10", "push r9",  "push r8",
         "push rbp", "push rdi", "push rsi", "push rdx",
         "push rcx", "push rbx", "push rax",
         "lock add dword ptr gs:[240], 1",
-        // 15 pushes from rsp=8(mod 16) leaves rsp=0(mod 16): no extra align.
         "mov rdi, rsp",
+        save_user_state!(),
         "call {dispatch}",
         "lock sub dword ptr gs:[240], 1",
         // Run exit-to-user epilogue before restoring GPRs — the call clobbers
         // scratch regs, which would otherwise leak kernel state into user.
-        "test dword ptr [rsp + 144], 3",
+        "mov r11, [rsp + {fp_bytes}]",
+        "test dword ptr [r11 + 144], 3",
         "jz 9f",
         "cli",
         "call {exit_to_user}",
         "9:",
+        restore_user_state!(),
         "pop rax",  "pop rbx",  "pop rcx",  "pop rdx",
         "pop rsi",  "pop rdi",  "pop rbp",
         "pop r8",   "pop r9",   "pop r10",  "pop r11",
