@@ -6954,6 +6954,14 @@ not see it: `xhci_slow_connect`, red alone in run `31261669826`. It has its own
 entry above — a 1 ms margin *inside the guest's boot*, which is why running alone
 moves it by milliseconds and not by a verdict.
 
+A thirteenth, with one sample each way on **one tree**: `desktop_audio_client`
+stalled wide *and* alone in run `31264914759` and passed in run `31266194663`,
+same commit, half an hour apart. It is 0 of 5 in the table's own probe, so this
+is a rate and not a reproduction — but the capture is worth the note, because it
+is #172's signature away from the T14: two clients connect, both tones say
+`done`, and only one `client N removed` ever follows. The wait it blew is
+`both clients to leave the mixer`.
+
 **The top five reproduce, so they are defects and not a rate.** The bottom six
 fire one or two runs in five, which is 20–40% and is not "noise" either: the bar
 this was measured against tolerates one in fifty *with the failure named*, and
