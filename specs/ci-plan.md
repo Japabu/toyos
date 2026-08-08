@@ -227,16 +227,32 @@ records and which a concatenation cannot see.
 
 ## 5. What runs, on what trigger
 
-| workflow | trigger | runner | what it is |
-|---|---|---|---|
-| `host-tests.yml` | every push, every PR | `macos-latest` | `cargo test --lib` plus all fourteen host crates and `userland/sshd`. No toolchain, no guest. |
-| `toolchain.yml` | every push | `ubuntu-24.04` | Publishes the content-addressed toolchain release, or does nothing. |
-| `ci.yml` | every push, every PR | `ubuntu-24.04` ×13, `debian:sid` container | Twelve guest shards on KVM at one lane each, plus one TCG canary. |
-| `gate-a.yml` | `workflow_dispatch` | `ubuntu-24.04` ×2 | The thorough audio tier, one audio test per machine. |
-| `probe-*.yml` | push to `ci/probe-*` | various | The measurement workflows this document is made of. |
+| workflow | trigger | runner | what it is | required? |
+|---|---|---|---|---|
+| `host-tests.yml` | PR, push to `main` | `macos-latest` | `cargo test --lib` plus all fourteen host crates and `userland/sshd`. No toolchain, no guest. | **`host`** |
+| `landing.yml` | PR, push to `main` | `ubuntu-latest` ×2 | The ABI-first rule, and whether the guest gate is still owed (§10.4). Seconds each. | **`abi-split`, `gate-stage`** |
+| `toolchain.yml` | PR, push to `main` | `ubuntu-24.04` | Publishes the content-addressed toolchain release, or does nothing. Its job is named `build`. | no |
+| `ci.yml` | PR, push to `main` | `ubuntu-24.04` ×14, `debian:sid` container | Twelve guest shards on KVM at one lane each, one TCG canary, and `guest-suite` fanning the twelve into one name. | **`tcg`**; `guest-suite` not yet (§10.4) |
+| `gate-a.yml` | `workflow_dispatch` | `ubuntu-24.04` ×2 | The thorough audio tier, one audio test per machine. | no |
+| `probe-*.yml` | push to `ci/probe-*` | various | The measurement workflows this document is made of. | no |
 
-`ci/**` is a throwaway namespace excluded from the first three, so a probe push
-does not start a suite.
+**A branch push on its own runs nothing, and that is deliberate.** `main` moves
+only through a merged pull request (§10), so `push` plus `pull_request` was two
+runs of the same work on every branch. Open the pull request — a draft one
+triggers everything — and it is one. `main` still runs on push because it is what
+`gate-stage` reads and because its `actions/cache` entries are the only ones
+every branch can restore. `ci/**` is a throwaway namespace and matches none of
+the first four.
+
+**Seventeen jobs is most of the budget.** A public repository on the free plan
+runs **20 jobs at once**, and one pull request is twelve shards + `guest-suite` +
+`tcg` + `host` + `abi-split` + `gate-stage` + `build`. Two pull requests in
+flight therefore queue: measured 2026-08-08 with #3 and #4 both up — 20 in
+progress, 24 queued, and `gate-stage`, a **required** check that runs in three
+seconds, sat queued twenty-two minutes behind twelve **advisory** guest shards.
+It resolves itself and costs wall clock rather than correctness, but a required
+check pending for half an hour is a queue and not a hang, and nobody should go
+looking for one.
 
 **macOS for the host tests used to be two things and is now one.** The *judge*
 was macOS-only — `fsck_msdos`, on both `toyos-fat32` and `src/image.rs` — and it
