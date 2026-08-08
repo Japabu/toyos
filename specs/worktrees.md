@@ -263,6 +263,36 @@ landed. It asks `git diff main...HEAD` against the merge base now, plus
 `toyos-abi/src` that no diff against a commit could see. Gate:
 `a_checkout_behind_main_has_no_standing_to_claim`.
 
+### 3.3 A std edit can be type-checked without claiming anything
+
+The claim is what makes a `rust/` change *usable*. It is not what makes it
+*compile*, and conflating the two is how std work came to look like it needed a
+quiet tree before a line was written.
+
+`~/.rustup/toolchains/toyos/lib/rustlib/src/rust` is a symlink to the primary's
+`rust/`, so `-Zbuild-std` compiles the working tree rather than a copy of it,
+and it writes only into a target directory you name. `cargo` is not in the
+toyos toolchain — rustup falls back to the default one's, which is fine, the
+`rustc` is what matters:
+
+    __CARGO_TESTS_ONLY_SRC_ROOT=<src> CARGO_TARGET_DIR=<scratch> \
+      cargo +toyos build -Z build-std=std,panic_abort \
+      --target x86_64-unknown-toyos --offline
+
+`<src>` needs a `library/` and a root `Cargo.toml` whose workspace names
+`library/std` — the real `rust/Cargo.toml` does not, its workspace is the
+compiler's and `library/` has its own. Pointing `<src>` at an APFS clone of
+`rust/library` (`cp -Rc`, 59 MiB, instant) under a directory holding symlinks to
+`toyos-abi` and `toyos` — std names them `../../../toyos-abi` — gives a tree
+that can be edited while the primary stays clean, which matters because a dirty
+`rust/` shows as ` M rust` in the primary's `git status` and `--land` refuses a
+dirty primary. Measured 2026-08-08: 15 s cold, 2.5 s per std edit after.
+
+Two things it does not tell you. Cargo does not re-fingerprint std on a source
+change under `-Zbuild-std`, so delete `<scratch>/<target>/debug/.fingerprint/std-*`
+between runs or you will read a stale green. And it is a compile, not a boot:
+whether the guest behaves differently still needs the sysroot.
+
 ## 4. Two lock scopes
 
 `buildlock::Scope` is named at every `act_if`, because the two are not

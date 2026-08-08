@@ -2373,7 +2373,7 @@ A removal that comes back empty for an entry `collect_all` produced is the tree
 contradicting itself, and both delete paths now report `CorruptedNode` rather than "not
 found".
 
-### ASSIGNED — an empty directory does not stat as a directory: kernel half landed, std half owed
+### An empty directory does not stat as a directory: kernel half landed, std half written and not landed
 
 **The kernel half is done and gated.** `Vfs::list` now consults `created_dirs`, so an
 empty directory answers `Ok(vec![])` and a path no directory could be answers
@@ -2386,59 +2386,76 @@ lists. Reverting the `created_dirs` lookup reds it at "an empty directory must l
 empty, not refuse". `fs::read_dir` on an empty directory therefore works now; it used to
 be `NotFound`.
 
-**The std half is one line and is not landed.** `sys::fs::toyos::is_dir`
-(`rust/library/std/src/sys/fs/toyos.rs:367`) reads a zero-length listing as "not a
-directory":
+**The std half is written and pushed and is not landed.** `Japabu/rust` branch
+`std-fixes-114`, commit `1851c83dfbf2`, pinned by monorepo branch `wt/toyos-std`.
+`sys::fs::toyos::is_dir` read a zero-length listing as "not a directory"; with the
+kernel half landed, `Err(NotFound)` is the only "not a directory" answer, so `Ok(_)`
+alone is both correct and complete — a file answers `NotFound` too (`prefix` is
+`"foo.txt/"` and nothing lives under it). Until the branch lands,
+`fs::metadata("/tmp/d").is_dir()` is still `false` for an empty `d`.
 
-```rust
-match syscall::readdir(path_bytes, &mut buf) {
-    Ok(n) => n > 0,                                 // <- becomes Ok(_) => true
-    Err(SyscallError::ResourceExhausted) => true,
-    Err(_) => false,
-}
-```
+`FileAttr::file_type` is fixed on the same commit. It answered `is_dir` with
+`self.file_type == syscall::FileType::Pipe`, and `stat` built a directory's `FileAttr`
+with `file_type: FileType::Pipe` to match — a directory spelled "pipe" throughout, with
+a comment excusing it rather than a type that could not express it. The consequence
+nobody had written down: an `fstat` of a *real* pipe answered `is_dir()`, reachable
+through `File::from_raw_fd`. `FileAttr` now holds the decoded `FileType` and each
+construction site says what it knows.
 
-With the kernel half landed, `Err(NotFound)` is the only "not a directory" answer, so
-`Ok(_) => true` is both correct and complete — a file answers `NotFound` too
-(`prefix` is `"foo.txt/"` and nothing lives under it). Until it lands,
-`fs::metadata("/tmp/d").is_dir()` is still `false` for an empty `d`, and `cp x d/` still
-writes a *file* named `d`. `toybox_file_tools` still puts a file in every directory it
-makes for that reason.
+**Why landing is the remaining cost, which is a process constraint and not a technical
+one.** `rust/` is the primary checkout's, and in a linked worktree it is the empty stub
+`git worktree add` leaves (`specs/worktrees.md` §2) — so a worktree agent can neither
+edit nor build it. The sysroot witness covers `toyos-abi`, `toyos` and `userland/libc`
+and *not* std's own sources (§3), so nothing picks the change up without
+`--claim-sysroot`, which rebuilds the shared sysroot and cleans every other worktree's
+target directories mid-session. Land it in a quiet-tree window, with the other `rust/`
+work owed in §1.
 
-**Why it was not landed with the kernel half, which is a process constraint and not a
-technical one.** `rust/` is the primary checkout's, and in a linked worktree it is the
-empty stub `git worktree add` leaves (`specs/worktrees.md` §2) — so a worktree agent can
-neither edit nor build it. The sysroot witness covers `toyos-abi`, `toyos` and
-`userland/libc` and *not* std's own sources (§3), so the change would also not be picked
-up without `--claim-sysroot`, which rebuilds the shared sysroot and cleans every other
-worktree's target directories mid-session. This is the same two-half shape as
-`std::env::current_dir()` above and takes the same answer: the kernel half lands first
-and is safe alone — `is_dir` returns `false` for an empty directory before and after it,
-so nothing regresses and the distinction becomes available. Batch the edit with the other
-`rust/` work owed in §1 in one quiet-tree window.
+**`cp x d/` is the same defect and the same commit fixes it.** `/bin/cp` is Rust —
+`toybox/src/cp.rs`'s `is_dir` is `fs::metadata(path).is_ok_and(|m| m.is_dir())`, the code
+above — so `cp x d/` writes a file named `d` today and lands inside `d` after.
+`toybox_file_tools` put an `occupied` file in every directory it made for exactly this
+reason; the branch takes that out, which is what turns the fix into a gate and is the one
+change on it whose verdict is owed to a guest nobody can boot until it lands.
 
-Found in the same file and **not** fixed, for the same reason: `FileAttr::file_type`
-(`fs/toyos.rs:88`) answers `is_dir` with `self.file_type == syscall::FileType::Pipe`, and
-`stat` at `:507` builds a directory's `FileAttr` with `file_type: FileType::Pipe` to
-match. A directory is spelled "pipe" throughout, with a comment excusing it rather than a
-type that could not express it. Same window.
+**Found beside it and not fixed: `userland/libc`'s `stat`/`lstat` cannot see a directory
+at all.** `posix_io.rs:237` tries `open` and nothing else, and `open` refuses every
+directory, empty or occupied — where std's `stat` falls back to `readdir`. Nothing in
+the tree noticed because the toybox tools are Rust; it is the C side (tinycc, doom) that
+would.
 
-### `Command::output()` returns an empty stderr, always
+### `Command::output()` returned an empty stderr, always — fixed, not landed
 
-`sys::process::toyos::output` (`rust/library/std/src/sys/process/toyos.rs:235`) reads the
-stdout pipe and then returns `Vec::new()` for stderr unconditionally. It has already asked
-`spawn` for a stderr pipe, so the bytes exist and are dropped — and a child that writes
-more than the pipe holds blocks forever against a reader that never comes.
+`sys::process::toyos::output` read the stdout pipe and then returned `Vec::new()` for
+stderr unconditionally. It had already asked `spawn` for a stderr pipe, so the bytes
+existed and were dropped, and `Output::stderr` was a documented promise it did not keep:
+the caller could not tell "the child said nothing" from "we did not look". Measured:
+`/bin/cp` refusing a missing source issues three `SYS_WRITE`s to fd 2 and
+`output().stderr` came back empty.
 
-`Output::stderr` is a documented promise this does not keep, which is the sentinel problem
-in another dress: the caller cannot tell "the child said nothing" from "we did not look".
-Measured: `/bin/cp` refusing a missing source issues three `SYS_WRITE`s to fd 2 and
-`output().stderr` comes back empty.
+Fixed on `Japabu/rust` branch `std-fixes-114`, commit `1851c83dfbf2`, pinned by monorepo
+branch `wt/toyos-std`, **not landed**. ToyOS now selects the cross-platform `output` in
+`sys::process::mod` and the platform copy is deleted; reverting the cfg arm reds the
+build on `unresolved import imp::output`, which is what makes that the selection and not
+a coincidence.
 
-`wait_with_output()` is the cross-platform path and does read the pipe, so the workaround
-is to `spawn()` and call that — which is what `toybox_file_tools` does, one stream at a
-time to stay off the two-pipe `read2` path. The fix is for `output` to read both pipes, or
-to be deleted so the cross-platform default is used.
+**Two deadlocks went with it, neither of them written down before.** The platform copy
+held the stderr pipe until the end of the function, past `wait`, so a child writing more
+to stderr than the pipe holds would never be reaped — and it held the parent's *stdin*
+write end the same way, so `Command::new("/bin/cat").output()` could not return either.
+The cross-platform version drops stdin first and reads both pipes concurrently.
+
+**No test was vacuous, which is the good news and was worth checking.** Every guest call
+site was enumerated: eight `Command::output()` calls (`readdir_bound`, `mmap_prot`,
+`abuse_pipe_map`, `heap_ceiling`, `std_process`, `poller_capacity`, `panic_recovery`,
+`userland/proctest`) and none reads `stderr` — every place that wanted a child's refusal
+message already used the documented `spawn()` + `wait_with_output()` workaround
+(`toybox_file_tools`, `locale_gate`). What changes for those eight is the *path*: they
+now go through `sys::process::toyos::read_output`, which spawns a thread per call to
+drain stderr while the caller drains stdout. That path exists and is used by
+`wait_with_output`, but no test has ever taken it with two live pipes —
+`toybox_file_tools` pipes one stream at a time specifically to stay off it. It is the
+thing to watch when this branch lands.
 
 ### The `bcachefs/` crate does not implement bcachefs — a question for the owner
 
@@ -4797,6 +4814,20 @@ lands in `git log <base>..toyos` and would put ToyOS lint policy into every
 upstream PR the estate sends. Plan, procedure and the standing-mechanism
 question: `specs/fork-lint-audit-plan.md`. It needs a quiet tree, because
 path-overriding the forks changes what every build in the repo resolves.
+
+### The std fork's ToyOS files are not rustfmt-clean, and upstream requires that they are
+
+`x fmt --check` is a hard gate on `library/` upstream. Measured against the fork's own
+`rustfmt.toml` with nightly rustfmt: `library/std/src/sys/fs/toyos.rs` produces **261**
+diff lines and `library/std/src/sys/process/toyos.rs` **38**; the longest line in the
+first is 144 characters. `library/std/src/sys/process/mod.rs` — a cross-platform file, so
+one nobody wrote freehand — is clean.
+
+Nothing in this repo runs `x fmt`, so the debt is invisible here and would be the first
+thing an upstream PR is told about. It cannot be paid inside a defect fix without burying
+the fix: a formatting pass over `fs/toyos.rs` rewrites most of the file. It needs its own
+commit, and that commit needs a sysroot claim like any other `rust/` change, so batch it
+with whatever else `rust/` owes.
 
 ### A fork pin is a moving branch frozen per workspace, and nothing re-reads it
 
