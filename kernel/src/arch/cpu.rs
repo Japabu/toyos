@@ -53,6 +53,20 @@ pub fn read_rsp() -> u64 {
 }
 
 #[inline]
+pub fn read_cr0() -> u64 {
+    let value: u64;
+    unsafe { asm!("mov {}, cr0", out(reg) value, options(nomem, nostack)); }
+    value
+}
+
+#[inline]
+pub fn read_cr4() -> u64 {
+    let value: u64;
+    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack)); }
+    value
+}
+
+#[inline]
 pub fn read_cr2() -> u64 {
     let value: u64;
     unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack)); }

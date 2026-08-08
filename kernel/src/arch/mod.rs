@@ -2,6 +2,7 @@ pub mod apic;
 pub mod cpu;
 #[allow(dead_code)]
 pub mod debug;
+pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod mtrr;
