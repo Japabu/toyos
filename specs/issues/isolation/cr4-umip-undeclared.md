@@ -6,7 +6,6 @@ opened: 2026-08-09
 
 # `CR4.UMIP` is free Ring 3 hardening that nobody has declined
 
-
 `arch/control_regs.rs`'s `CR4_OPTIONAL` is `SMEP | SMAP | PCIDE`. `UMIP` (bit
 11) is in neither it nor `CR4_REQUIRED`, so it is clear on every CPU — and since
 `write_cr4` writes the register whole, that is a decision this code takes on

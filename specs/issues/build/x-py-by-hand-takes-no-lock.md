@@ -51,3 +51,10 @@ after a failure showed `dist/deps` present with a fresh timestamp, because the
 winner had finished recreating it. That asymmetry is the same one that
 identified the link race (a probe succeeding between failures) and it is the
 cheapest check.
+
+Cost so far: two consecutive full-suite runs lost by one agent, plus the seven
+consecutive attempts that left `4fce59c` unverified for a session. A third
+attempt succeeded unchanged, so it is a race, not a broken tree.
+
+Retrying is what everyone did and it usually worked, but the failure was
+expensive because it was diagnosed from scratch each time.
