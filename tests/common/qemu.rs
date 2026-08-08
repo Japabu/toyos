@@ -127,7 +127,7 @@ pub fn host_speed() -> (Option<u32>, u32, u32, u32) {
 /// is the part of "how fast is the host today" the harness knows. It does not
 /// know the rest, and a retry loop bounded by elapsed time has that ceiling for
 /// a *verdict* the moment the rest moves: a guest that is merely late reports
-/// exactly what a wedged one reports. `specs/known-issues.md` §7 is the bill —
+/// exactly what a wedged one reports. `specs/issues/design-debt/` is the bill —
 /// `desktop_audio_client` 385 s wide against 13 s alone, a landing gate that is
 /// a coin toss, and six reds in four suites every one of which was
 /// `ALONE: GREEN`.
@@ -1309,6 +1309,12 @@ pub struct BootOptions {
 }
 
 /// The in-guest test runner's startup marker.
+///
+/// It is that runner's own first line and nothing else's. Init spawns its
+/// programs without waiting, so this marker orders nothing about any other
+/// program's startup — a test asking about a daemon's line waits on the guest
+/// for that line ([`await_guest`]), never on a span of host wall clock after
+/// this one.
 pub const DEFAULT_READY: &str = "===READY===";
 
 impl Default for BootOptions {
@@ -1908,7 +1914,7 @@ impl QemuInstance {
                         let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         // **A marker naming another test is the previous one's**,
-                        // and taking it was `specs/known-issues.md` §6's cascade:
+                        // and taking it was `specs/issues/build/`'s cascade:
                         // one timed-out test left the guest still producing its
                         // output, every later member of the block read a window
                         // that opened on it, and 110 of 238 went red on an
@@ -1995,7 +2001,7 @@ impl Drop for QemuInstance {
         // that exists before the console does.** Firmware, the bootloader and
         // the kernel up to the backend switch write here and nowhere else, so a
         // boot that dies before virtio-console comes up leaves this file and an
-        // empty capture — which is exactly the shape `specs/known-issues.md` §5
+        // empty capture — which is exactly the shape `specs/issues/diagnostics/`
         // records as looking like a kernel that never started. 1.4 KB on a
         // healthy `tests/testcases` boot, measured, against the hundreds of
         // megabytes of per-boot image beside it.

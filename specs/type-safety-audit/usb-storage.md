@@ -75,8 +75,8 @@ quotes belongs to a variable the code no longer has.
 | 13 | `BlockDevice` fallibility actually propagates | `block.rs:35-53` | **Holds** — all 18 call sites consume the `Result`; `bcachefs::BlockIO` is the known stop and is already filed |
 | 14 | `page_cache::unbind` prevents serving a previous tenant under a new number | `page_cache.rs:184-197` | **Holds** by reading; already filed as having no test that can fail |
 | 15 | `pci::enumerate` is bounded and drivers select all matches | `pci.rs:234-277` | **Holds** — `MAX_DEVICES = 256`, `xhci::init` takes every match, `nvme::init` takes the first and says so |
-| 16 | The xHCI slot is leaked "on four paths" | `device.rs:225-231`, known-issues | **Undercounted** — 11 exits (F12) |
-| 17 | Per-device EP0 rings removed one of hotplug's three obstacles | known-issues | **Holds**, and there are more obstacles left than the record names (F13) |
+| 16 | The xHCI slot is leaked "on four paths" | `device.rs:225-231`, `specs/issues/` | **Undercounted** — 11 exits (F12) |
+| 17 | Per-device EP0 rings removed one of hotplug's three obstacles | `specs/issues/` | **Holds**, and there are more obstacles left than the record names (F13) |
 
 ### The refutations that matter most, stated precisely
 
@@ -162,7 +162,7 @@ Each iteration is a real file write plus FAT and directory-entry writes plus a
 SYNCHRONIZE CACHE — that is, several USB round trips — issued under
 `XHCI.lock()`, which disables preemption. On the T14 this is the state the
 machine boots into and never leaves: 100% of one idle CPU, a `kernel.log` that
-grows to `MAX_LOG_BYTES` and rotates forever, and known-issues' "the ESP log's
+grows to `MAX_LOG_BYTES` and rotates forever, and `specs/issues/`' "the ESP log's
 flush is unbounded, uninterruptible, and in front of the scheduler pass"
 becoming permanent rather than periodic.
 
@@ -347,8 +347,8 @@ into a permanently offline one."
 the write-protected-LUN test, and this is the second half of the finding: **a
 `clear_stall` that succeeded and a `clear_stall` that was never called are
 indistinguishable in the log**, because it logs nothing on success. That is the
-`panic_console::capture` shape from known-issues §"A panic strands whatever
-lock the dead thread held" — a recovery path whose only evidence of having run
+`panic_console::capture` shape from
+`specs/issues/panic-path/panic-console-capture-untested.md` — a recovery path whose only evidence of having run
 is that nothing went wrong.
 
 **Proposed shape.** `Bot` should say which state the endpoint is in, because
@@ -738,7 +738,7 @@ down.
 
 ### F12 (low). The slot leak is 11 exits, not four plus three; three of them are unnamed anywhere
 
-**Location.** known-issues §"The xHCI driver never gives a slot back";
+**Location.** `specs/issues/hardware/xhci-slot-never-given-back.md`;
 `device.rs:225-231`.
 
 Enumerated by reading every path between the successful Enable Slot at
@@ -758,7 +758,7 @@ Enumerated by reading every path between the successful Enable Slot at
 | 10 | `device.rs:390` | **Configure Endpoint (HID) — not named** |
 | 11 | `device.rs:405` | `PointerSource::claim` exhausted — *not named* |
 
-Also: known-issues lists "a disk whose interface has no bulk pair" as one of
+Also: `specs/issues/` lists "a disk whose interface has no bulk pair" as one of
 mass storage's three additions, but that one is refused inside `parse_config`
 and exits at #5, which was already on the list. `msc::bind`'s three exits are
 #7, #8 and #9.
@@ -839,7 +839,7 @@ CAPACITY(10)) fits inside 2 ms; the ESP probe and mount, isolated from the
 concurrent AP bring-up on the same log, takes ~2 ms.
 
 **What those numbers do not say.** They are QEMU's, where a bulk transfer is a
-memcpy. known-issues records the ESP flush at 2.0–9.7 ms per flush against a
+memcpy. `specs/issues/` records the ESP flush at 2.0–9.7 ms per flush against a
 23.219 ms audio pipeline and correctly names `wait_transfer`'s spin and `Lock`'s
 preemption hold as why nothing shortens it — **all of that was measured against
 an emulated xHC.** The quantity that transfers to metal is the transfer *count*
@@ -855,7 +855,7 @@ operation more expensive; it makes the idle loop never stop issuing them.
 
 **Second-order, worth knowing.** Every storage operation runs under
 `XHCI.lock()`, which is a ticket spinlock that disables preemption and panics
-on 500M spins. known-issues already files "one command at a time per
+on 500M spins. `specs/issues/` already files "one command at a time per
 controller, under the xHCI lock, with preemption disabled for its duration".
 What is not filed is the interaction with F2 and F3: a single failing command
 holds that lock across up to three 2 s `wait_transfer` deadlines plus
@@ -931,7 +931,7 @@ reading it.
   one pool belongs to one controller.
 - **Multiple LUNs, UAS, CBI/CB, READ(16)/WRITE(16), removable media, MODE
   SENSE, one-command-at-a-time concurrency.** All seven are already written up
-  in known-issues §"USB mass storage: what is not implemented", each with its
+  in `specs/issues/filesystem/usb-mass-storage-not-implemented.md`, each with its
   reason, and I agree with every one of them.
 - **`page_cache::sync` allocating 128 KiB per call.** Transient, well under
   `MAX_HEAP_ALLOC`, and `sync` is not on a hot path. Not worth complicating.

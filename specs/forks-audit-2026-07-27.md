@@ -3,7 +3,7 @@
 > **PARTIALLY SUPERSEDED — this is a dated record, not current state.** The body
 > below is preserved verbatim as an accurate account of 2026-07-27. Do not act on
 > a finding without checking it first: `forks.toml` is the live manifest and
-> `specs/known-issues.md` carries current state.
+> `specs/issues/` carries current state.
 >
 > Resolved since, each verified against the code:
 >

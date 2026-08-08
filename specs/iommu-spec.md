@@ -46,7 +46,7 @@ Three properties, in the order they matter:
    use-after-free: unmap without invalidating the IOTLB and the device keeps a
    translation for a page the PMM has already handed to somebody else. Same shape as
    `SYS_PIPE_MAP`'s mapping outliving its page and `FileBacking` outliving unlink
-   (`specs/known-issues.md` §1), with a DMA engine instead of a process on the
+   (`specs/issues/isolation/`), with a DMA engine instead of a process on the
    reading end.
 
 What this is **not** for: it is not a performance feature, not a virtualization
@@ -548,7 +548,7 @@ past a rate ceiling the kernel clears `IRTE.P` for that binding — which the dr
 cannot undo, because the IRTE is kernel memory — and kills the process. **The ceiling
 check does not log per interrupt.** CLAUDE.md's rule applies with unusual force here:
 the log ring is drained by `esp_log` through the boot block device from the idle loop
-(`known-issues.md` §10), so an error path that logs per event is an error path that
+(`specs/issues/boot-media/`), so an error path that logs per event is an error path that
 makes a storm into a storage workload.
 
 ---
@@ -671,7 +671,7 @@ page tables and poll a hardware queue.
 from the idle loop.** `specs/capability-handles-spec.md` §5.2 drains that queue at
 syscall exit, at `do_schedule` entry, and in the idle loop — and putting an
 unbounded, uninterruptible device operation in front of `pass()` is precisely the
-`esp_log` defect (`known-issues.md` §10, and the flush that costs 2.0–9.7 ms against
+`esp_log` defect (`specs/issues/boot-media/`, and the flush that costs 2.0–9.7 ms against
 a 23.219 ms audio pipeline). Reclaim runs as an **explicit phase of `process::exit`**,
 on the exiting or killing thread's own stack, which is a live thread context that may
 block. The zero-handle hook does step 1 only, and enqueues nothing slow.

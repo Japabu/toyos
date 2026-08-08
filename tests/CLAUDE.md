@@ -1,0 +1,31 @@
+# Tests
+
+Loads when you read a file under `tests/`. Root `CLAUDE.md` has the commands, the TCG caveat and the CI-versus-this-host rule.
+
+## The harness
+
+- The harness has more machine shapes than the CLI — read `tests/common/` for the list. **Ground truth is the host side of the device**, not what the guest says it did. **Where QEMU cannot stage a failure, a kernel feature is the actuator**, and each one carries a comment saying why nothing else can reach it; a feature that merely re-states what the code does is not an actuator, and **one that replaces only a verdict makes its own gate vacuous** — replace what a real failure leaves in the buffer too, or the caller still holds bytes it would never have had. Device *order* is a shape dimension as much as size: a pool block a failed bind gave back is visible only when the refused device is enumerated first. **A test that writes to a disk decides which disk from data on the disk, never from the flag that enabled it** — the boot stick shares the bus.
+
+- **The suite runs twelve guests at once, and a test is serial until it says otherwise.** Every boot owns its image, socket and scratch files; every worker owns a lane of the pid's temp dir (`tests/common/lane.rs`). Each `MACHINE_TESTS`/`SCREEN_TESTS` entry carries a `Sched` and does not compile without one — parallel phase, then a serial tail of the tests whose *verdict* is a wall-clock margin, then **gate A alone**, which asserts the live-guest count is zero rather than trusting its position. `cargo test --test toyos-build -- --jobs N` overrides the width (a bare `cargo test -- --jobs N` hands it to the `--lib` harness, which refuses it); 12 is measured against 8 in one session on a quiet host (109.1 s against 125.6 s, 246 tests, both green), and it is a request rather than a promise now that `buildlock::guest_slot` bounds the machine at twelve guests across every worktree. **A timeout a test hands `run_test` is a liveness guard and never a verdict, so `qemu::budget` pays it out per guest the phase may have up** — `drain_serial` is the one duration that does not scale, because callers pace with it. **Every red from the wide phase is re-run alone**: green there names the classification as the bug and the run stays red on it. `group_of`'s adjacent runs are one task on one worker, and a shared boot's console is drained *by* its members. Order is longest-job-first on what the last run in this worktree measured. The harness builds at opt-level 2, and a boot's kernel, bootloader and initrd are memoized per run on what each is a function of — so a source edit mid-run is not picked up, because a run is a measurement of one tree. Costs, the three ledgers and the width table: `specs/test-cost-audit.md` §5.1–§5.4.
+
+**A device's size is a shape dimension.** Every profile declares its device size or does not compile, and the images are sparse so a realistic one is nearly free. Ask any device for its real capacity, not a token one — `specs/device-test-strategy.md`.
+
+## Gate A (audio)
+
+**Gate A (audio) has two tiers.** `tests/audio-baseline.toml` documents both in full and justifies every number in it.
+
+- **Fast** — part of every `cargo test`. One boot per config. Certifies that the instrument is alive and that this build does not *reproducibly* put silence on the wire. **The verdict is harm** — a mid-tone gap in the capture, or a period soundd submitted with no client audio behind it — and it re-boots once to confirm before failing. The per-run ceilings are measured and printed here and fail nothing: a drain that recovered is not audio anyone heard, and one boot cannot tell you how often it recovers. It certifies nothing about a rate — one run is one sample.
+
+- **Thorough** — `cargo test --test toyos-build -- --audio-gate N`. N iterations of all four configs; every per-run outcome becomes a rate or a distribution, compared against the recorded sample by Mann-Whitney (counters) and Fisher exact (yes/no outcomes). **A scheduler-migration stage transition gates on this tier.** At N=30 it detects a 25% shift in wake lateness and a 5% drop in soundd's wake count 99.9% of the time, with a 0.25% false-red rate on a clean tree; it does *not* detect a doubling of the dropout rate, and no N a human waits for would.
+
+The gate's four instrument defects and the dropout regression they hid are closed and written up in `specs/audio-gate-history.md`. The reusable lesson: these counters drift between batches on one host with no code change, so only same-session A/B numbers mean anything.
+
+**The thorough tier is currently red on `main` itself** — 7 dropout runs of 28 against a recorded `0 of 120`, measured 2026-08-07 in a three-arm session (`specs/issues/audio/`). It therefore cannot serve as a pass/fail gate until that is settled; it still answers an A/B, which is what M3 used it for. The fast tier is green.
+
+## Expected failures
+
+`EXPECTED_FAILURES` names the test, the task, the write-up in `specs/issues/` and the failure messages the exemption covers — anything else that test says still reds the run, and the run prints the pointer beside every `XFAIL`. Such a run exits 0 and the gate takes it; it is not a *clean* run, its last line says so, and every CI shard writes that line into the run's job summary. **An entry must be able to fail the build by itself**, so it declares what makes it stale: `OnAPass` where the failure is reproducible, or a review date where it is not — one green of an intermittent test is one sample and may not red a healthy tree.
+
+## Filtered runs
+
+`cargo test -- <name>` opens one capture window and a daemon's boot lines land in it, so a C-test family that compares whole stdout can be red for soundd's line rather than for its own output. Judge it from a full run.

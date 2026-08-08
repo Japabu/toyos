@@ -5,6 +5,11 @@
 # Every config must appear here. A missing section is a hard error, not a
 # pass: an ungated config would go green by omission.
 #
+# What no config here covers: `/bin/tone` and tests/toyos-rust-tests/src/tone.rs
+# are two implementations of the same generator and gate A captures only the
+# second, so nothing in the suite ever hears the tone the owner judges the
+# machine by.
+#
 # Two independent instruments per config. What each one is allowed to decide
 # differs by tier, and TWO TIERS below is where that is settled: only silence
 # that reached the device fails a single run.
@@ -85,7 +90,7 @@
 # The one statistic that separated the arms was audio_tone.smp8 wake lateness:
 # 6691 with the sink off, 7346 with it on (recorded 6658). That is the ESP
 # log's residual flush cost on the idle path, not drift, and it is written up
-# in specs/known-issues.md §10 rather than recorded here.
+# in `specs/issues/boot-media/` rather than recorded here.
 #
 # Why the counters are here at all: the wav is a rare-event detector. One 3s
 # tone samples ~1100 device periods once per run, so it only fires when a

@@ -7,7 +7,7 @@
 # its own and reaches the machine's shape only through netd — and it was the
 # one this config left out, so nothing anywhere ran the branch where it finds
 # no network. It costs the boot the second `NetdConn::connect_blocking` spends
-# retrying a netd that will never come (known-issues §3), which is the price of
+# retrying a netd that will never come (`specs/issues/kernel/`), which is the price of
 # certifying the line at all.
 # test-runner makes the boot announce itself, so the harness waits for a
 # marker instead of guessing from pixels — and it is what lets an in-guest

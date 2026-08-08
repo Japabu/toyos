@@ -158,6 +158,10 @@ pub fn post(source: Source) {
 }
 ```
 
+**A tripwire for a failure that presents as a hang must be read before the call
+that can hang**, or the one state it exists to report is the state it never
+reaches.
+
 There is no `post_inline()`, no `post_irq()`, and no second path. RT attribution and
 timestamping are derived from percpu state that is correct in every context, so there is no
 wrong-context misuse to guard against — which is why no `IrqCtx`-style capability token
@@ -252,7 +256,7 @@ source B. `arm()` replaces A (deregistering its fan-out entry, clearing any stal
 
 ### 5.2 Ring arena — 32KB per ring
 
-`io_uring` stops abusing `shared_memory` (removes the known-issues entry and the last
+`io_uring` stops abusing `shared_memory` (removes the `specs/issues/` entry and the last
 caller of `shared_memory::destroy()`). One `RingArena` per process, created on first
 user-ring creation, stored in `ProcessData`:
 

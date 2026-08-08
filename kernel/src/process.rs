@@ -124,7 +124,7 @@ impl PageAlloc {
 /// `PageAlloc`'s Drop returns the pages to the PMM and reaches no address
 /// space, so pages and mapping cannot be dropped as one. Holding the two
 /// together is what makes the unmap expressible at all; enforcing it is the
-/// `SharedToken`/RAII item in `specs/known-issues.md`.
+/// `SharedToken`/RAII item in `specs/issues/`.
 ///
 /// Dropping without unmapping is only sound when the address space itself is
 /// being destroyed (process teardown).

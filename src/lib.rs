@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod build;
 pub mod buildlock;
+pub mod docs;
 pub mod durations;
 pub mod forkcheck;
 pub mod image;

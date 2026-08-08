@@ -11,7 +11,7 @@ name: x87-probe
 #     rip: unwinding::unwinder::with_context::delegate::<..., _Unwind_RaiseException...>
 #
 # on the *spawned* thread, on cpu0, where the process's main thread was spawned
-# on cpu1. `specs/known-issues.md` §1 records that **no context switch saves x87
+# on cpu1. `specs/issues/isolation/` records that **no context switch saves x87
 # state**, and `fault_gates`' `mf` arm is the only thing in this tree that
 # executes an x87 instruction at all: it unmasks IM, computes 0/0 and expects the
 # `fwait` two bytes later to trap. If the kernel kills the child at that `fwait`,

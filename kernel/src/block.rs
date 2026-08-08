@@ -61,7 +61,7 @@ pub trait BlockDevice: Send {
 ///
 /// Both numbers are hard ceilings, not targets. Linux lets its page cache take
 /// the whole machine because it has a pressure signal and a reclaim path to
-/// give it back on demand; ToyOS has neither (known-issues §"No physical
+/// give it back on demand; ToyOS has neither (`specs/issues/isolation/no-physical-memory-fairness.md` ("No physical
 /// memory fairness"), so a cache that grows to fit the workload is a cache
 /// that starves userland with no way to stop it. Until there is a pressure
 /// signal, the ceiling has to be a number the machine can lose outright.

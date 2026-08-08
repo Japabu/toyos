@@ -15,7 +15,7 @@ elf = { version = "0.7.4", default-features = false }
 # The one profile every guest binary is built with — `specs/boot-image-split.md`
 # §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
 # debug-assertions and overflow-checks on, because fail-fast beats speed here
-# and both crafted-ELF kernel panics in `specs/known-issues.md` were *found* by
+# and both crafted-ELF kernel panics in `specs/issues/` were *found* by
 # an overflow check. `--release` would turn the last two off silently, so this
 # build system no longer has the flag.
 [profile.toyos]
