@@ -698,10 +698,22 @@ looks stale.
   `ubuntu-24.04-arm` and no HVF on `macos-latest`. An aarch64 guest there would
   be TCG on an arm64 host, which is what the dev host already is.
 - **A green guest suite. What is left is a *rate*, and that is the finding.**
-  Two runs of the same configuration on the same branch: **280 of 290** (run
-  `31249703011`) and **274 of 290** (run `31250706113`, the first to read the
-  committed profile) — against 246 of 268 on the five shards that finished of
-  `31238056513`, and 43 of 86 under TCG. Every shard finished in both.
+  Three runs of the same configuration on the same branch: **280 of 290** (run
+  `31249703011`), **274 of 290** (run `31250706113`, the first to read the
+  committed profile) and **285 of 290** (run `31252989653`, the landed tree,
+  eight of twelve shards fully green) — against 246 of 268 on the five shards
+  that finished of `31238056513`, and 43 of 86 under TCG. Every shard finished
+  every time.
+
+  The profile is doing its job on the clock even where the verdicts wander: the
+  twelve shard totals of the landed run span **273.5–530.0 s**, against
+  293.0–1194.6 s the run before and 240.2–611.2 s round-robin. The suite step is
+  about ten minutes wide and the whole run is under half an hour.
+
+  `usb_transport_break` and `screen_pager_keys` are the two of that run's five
+  that are `Sched::Serial`, so nothing re-ran them and neither has an `ALONE:`
+  line at all — which is the next small thing to fix in the harness rather than
+  in either test.
 
   The two failure lists are ten and sixteen names and **seven are in both**:
   `metal_sim_client_death`, `metal_sim_pointer_churn`, `doom_sound_flood`,

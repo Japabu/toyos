@@ -6536,12 +6536,13 @@ ready marker: a guest that will not reach `wait_for_ready` again is gone.
 
 ### OPEN, UNASSIGNED — a runner reds a rotating handful every run, and the rate is unmeasured
 
-Two runs of one configuration on one branch, twelve `debian:sid` shards on KVM at
-`--jobs 1`: **280 of 290** (run `31249703011`) and **274 of 290** (run
-`31250706113`). Every shard finished both times. The two failure lists are ten
-and sixteen names and only seven appear in both — `metal_sim_client_death`,
-`metal_sim_pointer_churn`, `doom_sound_flood`, `i8042_health_cadence`,
-`usb_transport_break`, `std_unwind`, `std_unwind_so`.
+Three runs of one configuration on one branch, twelve `debian:sid` shards on KVM
+at `--jobs 1`: **280 of 290** (run `31249703011`), **274 of 290** (run
+`31250706113`) and **285 of 290** (run `31252989653`, eight shards fully green).
+Every shard finished every time. The failure lists are ten, sixteen and five
+names; **`std_unwind`, `std_unwind_so` and `usb_transport_break` are the only
+three in all of them**, and `metal_sim_client_death`, `metal_sim_pointer_churn`,
+`doom_sound_flood` and `i8042_health_cadence` are in two of the three.
 
 **The `ALONE:` verdict rotates with them**, which is the part to hold before
 reading any entry here: `metal_sim_pointer_churn` was `red again — the defect is
