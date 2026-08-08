@@ -1086,7 +1086,7 @@ lines to run next. It never pushes `main` and never forces anything.
 | `--ff-only` into main | GitHub's merge. It is still a merge commit with both parents and nothing is squashed or rebased — `allow_squash_merge` and `allow_rebase_merge` are off. |
 | the ABI-first refusal | `landing.yml`'s `abi-split` check, and `cargo run -- --pr` locally. One function (`pr::abi_lands_alone`) answers both. |
 | `--abi-inseparable` | an `Abi-Inseparable: <why>` trailer in a commit message. CI has no command line from the author, and a flag's only record was the commit `--land` wrote; a trailer is in the branch's history and lands with it. |
-| the landing commit's message | the pull request's title and body, through `merge_commit_title=PR_TITLE` / `merge_commit_message=PR_BODY`. `.github/pull_request_template.md` asks for what `--land` used to compose. |
+| the landing commit's message | the pull request's title and body, through `merge_commit_title=PR_TITLE` / `merge_commit_message=PR_BODY`. `.github/pull_request_template.md` asks for what `--land` used to compose — **with the prose unwrapped**, because GitHub wraps the body itself and an already-wrapped paragraph comes out ragged (`1d43976`, the first merge through this workflow). The subject gains ` (#N)` and the commit keeps both parents. |
 | "gate ok" vs "gate ok, NOT clean" | two places, and both are better than a sentence in a commit body. The declaration itself is `EXPECTED_FAILURES` in `tests/toyos.rs`, which is *in the diff being reviewed*; and every shard now writes its own `test result:` line into the run's job summary. |
 | which gate ran, and how long | the check run on the head commit, which is durable and linked from the merge. |
 | the sysroot claim and its standing rule | **local, and it stays local.** It is about one shared 50 GiB `rust/build` on one laptop; a runner has its own and §8.1 says so. Nothing about it is expressible on GitHub. |
@@ -1173,3 +1173,73 @@ deadlock every agent on the owner being awake. The review gate `specs/worktrees.
 §5 argues for — changes to the files that govern other agents — is a thing the
 owner does on the pull request, and a pull request is the first artifact this
 workflow has ever had that he *can* do it on.
+
+### 10.6 What the first four pull requests proved
+
+Everything below happened on 2026-08-08, within about ninety minutes of the
+ruleset going on.
+
+**#2 — the workflow itself, through the workflow itself.** Required checks
+`abi-split` 12 s, `gate-stage` 5 s, `host` 4 m 19 s, `tcg` 10 m 21 s; auto-merge
+fired on the last of them with nobody watching. The merge commit is `1d43976`,
+a real merge naming both parents, subject `<pr title> (#2)` and body the pull
+request's. **This change could not have gone the old way**: the branch retires
+`--land`, so `cargo run -- --land` from it refuses itself. It went through the
+path it builds, which is the only honest test there was.
+
+**The protection is a wall and not an agreement.** §10.5 has the `GH013`
+refusal, taken by pushing an empty commit straight at `refs/heads/main`.
+
+**#1 — `wt/toyos-h3`, two documentation lines, the branch that motivated all of
+this.** It had failed the local landing gate twice on `screen_blocked_dump`, an
+intermittent unrelated to its content. Through the new path: merge main in,
+push, four required checks (`abi-split` 1 m 13 s, `gate-stage` 5 s, `host`
+4 m 20 s, `tcg` 9 m 20 s), merged at `e4b7279`. **Two documentation lines no
+longer need a ten-minute full-system boot suite to get in** — which is the
+change, stated as a cost. It also needed one hand merge of main, because the
+branch forked before `--pr` existed and had to take it in before it could run
+it.
+
+**#3 — `wt/toyos-fpu`, and it found a real defect in this configuration.**
+`abi-split` red in 57 s with no `[abi]` line in the log. The job was checking out
+`pull_request.head.sha` and then running `cargo run` out of *that* tree, so a
+branch forked before `--abi-split-check` existed ran a build system that has
+never heard of the flag, fell through to `check_prerequisites`, and found no
+QEMU on the runner. The reasoning was right about the question and wrong about
+the checkout: the branch's own commits are what the rule is about, but the
+tooling that asks has to be base's. The merge ref is both. **The general form is
+the reusable part** — a workflow comes from base and the code it runs comes from
+wherever it checks out, so any job running this repository's own tooling has to
+take base's.
+
+**And the transition cost eleven commits a landing, which is worth recording
+because it is the shape of every such switch.** `wt/toyos-fpu` ran
+`cargo run -- --land` — built minutes before that command was retired — while #2
+was in flight. It fast-forwarded the *dev host's* `main` onto its own branch and
+could then never push it, so the machine's `main` diverged from `origin/main`
+and every worktree's `--sync` refused. Nothing was lost: all eleven commits were
+on the branch, `main` went back to `origin/main`, and #3 is that landing redone.
+`sync`'s refusal now lists what is stranded and which branches already contain
+it, because "settle that" on its own sends an agent to read the reflog. **A
+command cannot be retired from the tree faster than the binaries built from it
+go away**, and the only defence is that the refusal names the situation.
+
+**GitHub wraps a pull request body when it composes the merge commit**, so
+prose already wrapped at 78 comes out ragged at 72 (`1d43976`) and prose left
+unwrapped comes out clean (`e4b7279`). `.github/pull_request_template.md` says
+so.
+
+### 10.7 The next candidates
+
+- **`wt/toyos-std`** (`d6c14e0`) — pushed and unlanded since before any of this.
+  `Command::output` reading its child's stderr, and an empty directory statting
+  as one. It **moves the `rust` submodule pointer**, so it is the first branch
+  whose pull request will make `toolchain.yml` build an hour-long toolchain
+  rather than answer in six seconds, and `ci.yml`'s shards will wait for it.
+  Worth knowing before anyone reads that wait as a hang. It needs `x fmt` in the
+  fork before it is a real pull request, and it touches `specs/worktrees.md`,
+  whose §5 this task rewrote — so it will conflict there.
+- **`wt/toyos-cifit`, `wt/toyos-cigreen`, `wt/toyos-sysret`, `wt/toyos-ci`,
+  `wt/toyos-cifinish`, `wt/toyos-xhcibreak`, `wt/toyos-nullsink`** are pushed
+  branches with no pull request. Most are landed already and are just stale
+  refs; a branch with commits `origin/main` does not have is the one to look at.

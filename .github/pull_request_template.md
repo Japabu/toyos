@@ -3,6 +3,11 @@ This body becomes the merge commit's body on `main`, so write it as the record
 of what landed rather than as a note to a reviewer. `git log --no-merges` is
 still how you read the work itself.
 
+**Do not hard-wrap the prose.** GitHub wraps this body itself when it composes
+the merge commit, and a paragraph you have already wrapped at 78 comes out
+ragged at 72 — measured on the first merge through this workflow, `1d43976`.
+One line per paragraph; bullets on one line each.
+
 Delete anything below that has nothing to say. An empty heading is worse than
 no heading.
 -->

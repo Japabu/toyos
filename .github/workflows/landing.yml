@@ -32,12 +32,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      # The head branch and not the merge commit: the question is which of
-      # *this branch's* commits touch the sysroot's sources, and a merge commit
-      # is not one of them.
+      # **The merge commit, which is the default, and it took a red run to see
+      # why.** This checked out `pull_request.head.sha` at first, reasoning that
+      # the question is which of *this branch's* commits touch the sysroot and a
+      # merge commit is not one of them. That is true of the question and false
+      # of the checkout: the step runs `cargo run` out of the tree it checked
+      # out, so a branch forked before `--abi-split-check` existed ran a build
+      # system that has never heard of the flag — pull request #3, `abi-split`
+      # red in 57 s with no `[abi]` line in it, because the old binary fell
+      # through to `check_prerequisites` and found no QEMU on the runner.
+      #
+      # The merge ref answers both halves. Its build system is base's, which is
+      # always the current one, and `origin/main..HEAD --no-merges` over it is
+      # exactly the branch's own commits — the merge commit is the one thing
+      # `--no-merges` drops.
+      #
+      # The general form: **a workflow comes from base and the code it runs
+      # comes from wherever it checks out**, and any job that runs this
+      # repository's own tooling has to take base's.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - uses: actions/cache@v4
