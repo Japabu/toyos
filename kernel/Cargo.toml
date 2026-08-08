@@ -241,6 +241,22 @@ xhci-hid-break-late = []
 # endpoint 0 above all, which resolves to the slot context or to EP0's — would
 # ship never having executed. See `xhci/device.rs`'s `selftest`.
 xhci-descriptor-selftest = []
+# Leave every AP holding the CR0 and CR4 that INIT left it, which is what every
+# boot before `arch/control_regs.rs` was: caching disabled, WP clear, NE clear.
+# `control_regs_negative` boots it and holds the verdict against what comes out.
+# The per-CPU line and both assertions are the shipped ones and only the two
+# register writes are absent, so the CPU it names is a real divergent CPU.
+#
+# Nothing else can stage it. A control register is written by the guest and read
+# by nobody outside it, so there is no QEMU device, machine property or `-cpu`
+# flag that leaves one wrong; the state under test is one the kernel puts itself
+# into or fails to.
+no-ap-control-regs = []
+# Time the same read loop on every CPU, either side of the `mov cr0` that turns
+# its caching on. See `arch/control_regs.rs`'s `bench` for why nothing outside
+# the kernel can ask this and why the answer is not on this host: TCG models no
+# cache at all, so `CR0.CD` there costs nothing and the number is metal's.
+control-regs-bench = []
 # Shrink both disk caches to 64 entries each. The honest ceilings are tens of
 # megabytes, so a test that reached them by doing real I/O would spend minutes
 # proving what 256 KiB proves in a second. The eviction code under test is the
