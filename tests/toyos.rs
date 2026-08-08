@@ -178,6 +178,10 @@ const RUST_SKIP: &[&str] = &[
     // 4 MiB and every other test boots that config. `doom_sound_flood` runs it
     // on `tests/doomcase`.
     "doom_sound_flood",
+    // Its failure mode is a CPU that never runs anything again, so on the
+    // shared boot it would be reported against whichever test came next — and
+    // every one after that. `short_sleep_livelock` gives it a boot of its own.
+    "abuse_short_sleep",
     // The four below were **running twice under one name**, once here on the
     // plain boot and once as the test that owns the name, and the collision was
     // invisible: `check_registration` compared the three declared lists against
@@ -363,6 +367,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("nvme_wide_sector", Sched::Parallel),
     ("iommu_discovery", Sched::Parallel),
     ("readdir_bound", Sched::Parallel),
+    ("short_sleep_livelock", Sched::Parallel),
     ("i8042_health", Sched::Parallel),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
@@ -7154,6 +7159,42 @@ fn run_machine_test(
             for line in result.stdout.lines().filter(|l| l.contains("PASS")) {
                 eprintln!("  [readdir]{}", line.trim_start_matches("  PASS"));
             }
+            Ok(())
+        }
+        "short_sleep_livelock" => {
+            // Task #156. A `nanosleep` whose deadline is already past when the
+            // pass arms the one-shot armed the register's one-tick minimum, and
+            // the Ring 0 timer stub reloads whatever was last armed — so the
+            // CPU took that interrupt again before it could execute the
+            // instruction after the `wrmsr` that armed it, forever. Eight boots
+            // of the owner's T14 caught it twice by NMI, at
+            // `arm_one_shot+0x8d` and at `timer_entry+0x0`, which are the two
+            // instruction boundaries of exactly that loop
+            // (`specs/metal-logs/2026-08-08-cpu0/`).
+            //
+            // Its own boot because the failure is a CPU that never runs
+            // anything again: on the shared boot it would be reported against
+            // whichever test followed it.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions::default(),
+            );
+            serial::Serial::boot(&qemu).must_be_clean()?;
+
+            let result = qemu.run_test("test_rs_abuse_short_sleep", Duration::from_secs(60));
+            if let Some(err) = &result.error {
+                return Err(format!(
+                    "a sleep shorter than one LAPIC tick took the CPU with it: {err}\nserial:\n{}",
+                    result.serial,
+                ));
+            }
+            if !check_rust_result(&result) {
+                return Err(format!("abuse_short_sleep failed:\n{}", result.stdout));
+            }
+            serial::Serial::named("test serial", result.serial.as_str()).must_be_clean()?;
+            eprintln!("  [sleep] {}", result.stdout.lines().last().unwrap_or("").trim());
             Ok(())
         }
         "heap_ceiling_recovery" => {
