@@ -13,6 +13,7 @@ mod xhci;
 use core::arch::naked_asm;
 
 use super::cpu;
+use super::entry::{restore_user_state, ring3_naked_asm, save_user_state};
 use super::cpu::{outb, io_wait};
 use crate::sync::Lock;
 
@@ -277,25 +278,38 @@ extern "sysv64" fn stub_halt_all() {
     naked_asm!("cli", "2: hlt", "jmp 2b");
 }
 
+/// Every exception vector's second half, #PF included.
+///
+/// It reaches [`kernel_exit_to_user_check`] and therefore `do_preempt`, so a
+/// fault taken from Ring 3 can return through another task — and until this
+/// bracket existed it did so carrying whatever that task left in the registers.
+/// A demand-paging fault corrupting XMM produces a wrong number rather than a
+/// signal, which is why nothing had noticed (`specs/user-machine-state.md` §3).
+///
+/// `rdi` is taken before the bracket because the bracket moves `rsp`: the frame
+/// [`trap_dispatch`] is handed is the one the pushes above built, and the CS
+/// test after the call reads it back out of the bracket's stash.
 #[unsafe(naked)]
 extern "sysv64" fn common_entry() {
-    naked_asm!(
+    ring3_naked_asm!(
         "push r15", "push r14", "push r13", "push r12",
         "push r11", "push r10", "push r9",  "push r8",
         "push rbp", "push rdi", "push rsi", "push rdx",
         "push rcx", "push rbx", "push rax",
         "lock add dword ptr gs:[240], 1",
-        // 15 pushes from rsp=8(mod 16) leaves rsp=0(mod 16): no extra align.
         "mov rdi, rsp",
+        save_user_state!(),
         "call {dispatch}",
         "lock sub dword ptr gs:[240], 1",
         // Run exit-to-user epilogue before restoring GPRs — the call clobbers
         // scratch regs, which would otherwise leak kernel state into user.
-        "test dword ptr [rsp + 144], 3",
+        "mov r11, [rsp + {fp_bytes}]",
+        "test dword ptr [r11 + 144], 3",
         "jz 9f",
         "cli",
         "call {exit_to_user}",
         "9:",
+        restore_user_state!(),
         "pop rax",  "pop rbx",  "pop rcx",  "pop rdx",
         "pop rsi",  "pop rdi",  "pop rbp",
         "pop r8",   "pop r9",   "pop r10",  "pop r11",
