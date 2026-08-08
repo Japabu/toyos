@@ -5797,9 +5797,61 @@ completion matched by its Command TRB address, a recovery cancelled by a
 disconnect. Not diagnosed further here; found by CI, which is the thing CI was
 built to do.
 
-**It is the one test standing between CI and green**, and it is a real red rather
-than a classification: it is not on §7's list, it fails alone, and it fails for
-the same reason twice.
+**And it is not alone.** Run `31247206462`, twelve shards on KVM at `--jobs 1`,
+put four more of its shape on the list, every one red again when re-run alone:
+
+| test | what it does over QMP | alone |
+|---|---|---|
+| `xhci_hotplug` | `device_add`/`device_del`, fixed waits against a 100 ms debounce | `timed out after 66s` |
+| `xhci_hid_break` | a staged transfer error on a HID endpoint | `timed out after 75s` |
+| `metal_sim_pointer_churn` | 8 plug/unplug cycles under a live compositor | `bound 0 pointer sources` |
+| `usb_transport_break` | one staged break, and the driver's first-try recovery | `the transport broke 2 times` |
+
+All four are green on the dev host in seconds and green under TCG on the same
+runner image and the same QEMU. So the class is one sentence: **the xHCI driver's
+plug, unplug and endpoint-recovery paths are unreliable when the guest executes
+natively**, and the ~50x speed-up between the host's two QMP writes is the only
+thing that changed. §8's own entries name the shape it would be in — one
+outstanding operation per controller, a completion matched by its Command TRB
+address, a recovery cancelled by a disconnect rather than waited out.
+
+**This class is what stands between CI and green.** It is not §7's
+classification class: it fails alone, and it fails the same way twice.
+
+### OPEN, UNASSIGNED — a `Task::Machine` group has the blast radius the shared block just lost
+
+Run `31247206462`, shard 5, the metal-sim group re-run **alone**:
+`metal_sim_compositor` and `metal_sim_scanout_wc` pass, `metal_sim_window_caps`
+times out at 177 s, and `metal_sim_ipc_hostile_peer`, `metal_sim_compositor_stall`
+and `metal_sim_client_death` time out behind it — 1418 s of the shard's 1916.9 s,
+for one test that died.
+
+It is the same defect the shared block had and the same repair does not reach it:
+`group_of`'s adjacent tests share one boot held in `Grouped`, and each member
+after a dead one pays its own full liveness ceiling against a guest that is gone.
+The shared block's fix keys on `TestResult::started`, which is the in-guest
+runner's `===TEST_START` and exists only on that path; a machine test asserts on
+a console it drives itself and has no such marker to miss.
+
+Fix shape: the same one — a group whose guest has stopped answering gets a new
+guest, bounded, rather than N ceilings. What a machine group needs first is
+something that plays `started`'s part, and the honest candidate is the boot's own
+ready marker: a guest that will not reach `wait_for_ready` again is gone.
+
+### OPEN — four reds on a runner that are not the xHCI class and not the width
+
+Run `31247206462`, each red again when re-run alone, none of them reproduced on
+the dev host:
+
+- `doom_sound_flood` — `timed out after 88s` alone, against 4–26 s here.
+- `hda_client_stall` — `the ring arm: timed out`, and `timed out after 9s` alone.
+- `metal_sim_null_audio` — `soundd did not present a null sink on a device-less
+  machine`, in 4 s.
+- `sshd_fail_closed` — red alone in 22 s, having taken 152 s in the phase.
+
+Three of the four are soundd's, which makes them worth reading together rather
+than one at a time. Nothing here is diagnosed; they are recorded so the next
+green run cannot quietly be read as their absence.
 
 ### CLOSED, superseded by the four arms above — six input tests fail on a GitHub runner and pass here
 
