@@ -6,6 +6,7 @@ pub mod forkcheck;
 pub mod image;
 pub mod land;
 pub mod libc;
+pub mod soundfont;
 pub mod stamps;
 pub mod testargs;
 pub mod toolchain;

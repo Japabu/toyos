@@ -46,10 +46,62 @@ It ships in the initrd of the default image (`system.toml`) and of
 
 **This entry is meant to become deletable.** The owner's position, 2026-08-08:
 doom is a milestone demonstration and not a required part of ToyOS, and the
-intended end state is a package manager fetching it — the shape
-`assets/soundfont.sf2` already took, where an optional asset is named when
-absent rather than required. When the WAD stops being committed, delete this
-section rather than softening it.
+intended end state is a package manager fetching it. When the WAD stops being
+committed, delete this section rather than softening it. An asset that is not
+in the working tree is named by `src/assets.rs` and skipped, so an image built
+without one says so instead of quietly going without.
+
+
+assets/soundfont.sf2 — GeneralUser GS, "License v2.0"
+------------------------------------------------------
+
+    15,546,764 bytes, `RIFF`/`sfbk`
+    sha256 89a13a5c907b5cc83c15679e07e6dcb06fd72102937e092dc4a582f1aa5905c3
+    Copyright 1997-2025 by S. Christian Collins
+    Licence text: licenses/GeneralUser-GS-License-v2.0.txt
+
+doom's music, and a **derivative**: `src/soundfont.rs` cuts GeneralUser GS
+v2.0.3 down to the 37 melodic programs and 23 percussion keys
+`assets/DOOM1.WAD`'s own MUS headers select, and
+`cargo run -- --regen-soundfont <bank.sf2>` re-runs that on the whole bank
+(32,319,396 bytes,
+sha256 9575028c7a1f589f5770fccc8cff2734566af40cd26ed836944e9a5152688cfe, from
+https://www.schristiancollins.com — not committed, because shipping both is
+shipping the same samples twice). Every one of the source's `INFO` chunks
+travels into the output unread, so the copyright above and the whole licence
+text are **inside the shipped file** as well as beside it —
+`the_shipped_bank_still_carries_its_source_licence` is that as a test, and the
+text in `licenses/` was read back out of the file.
+
+**It is not CC-BY-4.0.** `system.toml` said so until the author's own words were
+read; the record is corrected here. It is a bespoke "License v2.0" by
+S. Christian Collins, permissive in substance — "use GeneralUser GS without
+restriction for your own music creation, private or commercial", "feel free to
+use it in your software projects, and to modify the SoundFont bank or its
+packaging" — but not a standard licence, with no patent grant and no warranty
+clause.
+
+**The caveat is the author's own and belongs in plain sight.** He writes that
+GeneralUser GS began as a personal project never meant for publication, and:
+
+> I cannot be 100% sure where all of the samples originated, although I do know
+> that none of them came from commercially published SoundFont packages or
+> sample CDs.
+
+He asks anyone who becomes aware of a restricted sample to tell him so he can
+replace it, and records that he has had no ownership complaint since 2000. The
+owner took this file with that in front of him, 2026-08-08. The licence also
+asks that others not link directly to his download files — a request about how
+to obtain it rather than a restriction on redistributing it, and this repository
+carries its own copy rather than fetching one.
+
+**This entry is meant to become deletable**, exactly as the `DOOM1.WAD` entry
+is. `specs/doom-music-soundfont.md` §5 records the intended exit: an OPL3
+synthesiser driven by the `GENMIDI` lump already inside `DOOM1.WAD`, which adds
+zero bytes and raises no licence question at all, priced at 3–6 days. Taking it
+deletes this file and this section — though not the 15,546,764 bytes already in
+git history, which is the part of this decision that cannot be undone. When that
+happens, delete this section rather than softening it.
 
 
 userland/doom — GPL-2.0

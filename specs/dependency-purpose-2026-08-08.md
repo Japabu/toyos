@@ -435,15 +435,15 @@ them (distinct crate names under `userland/target/toyos/deps/`).
   dependents. Zero dependencies. Latest 1.3.6 (2025-08-10).
 - **Called at** `userland/doom/src/sound.rs:8` and used at `:643,685,753-763` —
   reads a SoundFont, sequences a MIDI file, synthesises doom's music.
-- **Why** doom's music. **And the repository ships no SoundFont**: `system.toml:28`
-  declares `soundfont.sf2` under `untracked-assets`, `assets/` contains none, and
-  `sound.rs:753` handles the missing file by printing *"playing without music"*.
-  So on a clean clone this crate compiles into `/bin/doom` and never does
-  anything.
+- **Why** doom's music. **Corrected later the same day: the repository ships a
+  SoundFont again.** This entry said it shipped none, which was true for the
+  hours between `b8b0749` and `wt/toyos-doommusic`; `assets/soundfont.sf2` is
+  committed now and every clone plays music, so this crate runs rather than
+  failing to open a file.
 - **Could it go?** It is the crate that most clearly fails *"general and often
-  used"* on the numbers, and it serves a feature that is off by default. But it
-  is zero-dependency and its removal deletes a capability rather than a
-  duplication. **Owner's call** — §13.6.
+  used"* on the numbers. But it is zero-dependency and its removal deletes a
+  capability rather than a duplication — and the capability is now shipped and
+  gated (`doom_music`). **Owner's call** — §13.6.
 
 ### `russh` 0.60.0 — `userland/sshd/Cargo.toml:8` (`rustcrypto`, `flate2`, `rsa`)
 
@@ -868,14 +868,16 @@ Stated rather than recommended, because it deletes a capability.
 - **The facts:** 84,145 downloads and 16 reverse dependents — the weakest
   download count in the estate against the owner's *"general and often used"*
   bar; only `uefi-services` (§3) has fewer reverse dependents. One maintainer. Zero dependencies, so it costs nothing transitively. It exists for
-  doom's music, and this repository ships no SoundFont
-  (`system.toml:28`, `assets/` has none), so on a clean clone the code path runs
-  once, fails to open `/share/soundfont.sf2`, prints *"playing without music"*
-  and never runs again.
+  doom's music.
+- **The argument this section was written on has since gone.** It read that the
+  repository ships no SoundFont, so the code path fails to open one and never
+  runs again — true for the hours between `b8b0749` and `wt/toyos-doommusic`,
+  and false now: `assets/soundfont.sf2` is committed, doom plays music on every
+  clone, and `doom_music` gates it at the device.
 - **Price to remove:** delete `sound.rs`'s music thread and the `[dependencies]`
-  line. Half a day. doom keeps its sound effects.
-- **Price to keep:** one crate, no transitive weight, and a feature that works
-  the moment the owner drops a file in `assets/`.
+  line. Half a day. doom keeps its sound effects and loses the milestone the
+  owner called this a blocker for.
+- **Price to keep:** one crate and no transitive weight.
 - **This is a capability question, not a hygiene one**, and it is the owner's.
 
 ### 13.7 Consider pre-rasterizing the icons
