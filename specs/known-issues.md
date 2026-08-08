@@ -6000,6 +6000,214 @@ is nothing to load into, because a translator reads the config when it starts.
 The `/home` caveat is unchanged and still true: it is tmpfs on the T14, so the
 choice survives a login and not a reboot.
 
+### The PerCpu asm contract is 47 hand-written `gs:[N]` sites bound to nothing
+
+The owner's own review note, and the one finding in it that names a hazard
+rather than a shape: *"this verifies against constants but doesnt gaurantee
+that the constants are the same used in for example preempt.rs."* He is right.
+
+`arch/percpu.rs` carries 14 `const _: () = assert!(core::mem::offset_of!(PerCpu,
+f) == N)`. Those pin the struct's layout to a set of literals. They do not pin
+anything to the assembly, and the assembly is where the offsets are actually
+used: measured 2026-08-08, **47 hand-written `gs:[N]` operands across eight
+files** — `preempt.rs` 13, `arch/percpu.rs` 9, `arch/syscall.rs` 8,
+`arch/idt/mod.rs` 5, `arch/idt/timer.rs` 5, `log.rs` 3,
+`arch/idt/device_irq.rs` 2, `arch/idt/tlb.rs` 2 — naming 15 distinct offsets
+(0, 8, 16, 24, 136, 140, 216, 224, 232, 240, 244, 248, 252, 256, 260). A third
+copy of the same numbers lives in the field comments (`cpu_id: u32, // offset
+8`). Reordering a field trips the asserts; changing one asserted literal and
+its field together does not, and the 47 asm sites then read the wrong bytes
+with no diagnostic at all — on the syscall entry path, the timer stub and the
+preemption counter.
+
+Fix shape, agreed in the 2026-08 review (`specs/code-quality-review-2026-08.md`
+§2 arch/, deep dive 1): feed `offset_of!` into the asm as `const` operands. One
+source, and all 14 asserts delete with it.
+
+Two smaller PerCpu items ride this and **must not precede it**, because field
+surgery before the unification is what the 47 copies punish:
+
+- `lapic_id` (`percpu.rs:81`) has zero readers outside the file — written at
+  `:270`, never read. Delete it.
+- `alloc_percpu` (`:262`) sets 8 of the struct's 22 fields and relies on
+  `alloc_zeroed` for the other 14. One total `ptr::write(PerCpu { .. })` says
+  what the struct is. The `current_tid`/`current_pid` `u32::MAX` sentinel stays
+  — it is an asm wire format and is already `Option`-decoded at the boundary.
+
+### Four deletions the 2026-08 review named, each small and each still there
+
+Grouped because none is worth a task of its own and all four are the same
+judgement: code that exists to have existed. Verified on `main` 2026-08-08.
+
+- **`arch/gdt.rs`** — a 4-line re-export shim left behind when the GDT went
+  per-CPU. The review recorded one caller of `KERNEL_CS`; it is now four
+  constants (`KERNEL_CS`, `STAR_SYSRET_BASE`, `USER_CS`, `USER_DS`) over five
+  sites — `arch/syscall.rs:107`, `loader/start.rs:60,61,85,86`. They import
+  from `percpu` and the file goes. The owner's note: *"no empty files no lazy
+  refactorings."*
+- **`arch::apic::init_timer_ap()`** (`apic.rs:269`) — an empty function with
+  one caller (`smp.rs:269`). The behaviour is correct: calibration is one
+  global measurement and `arm_one_shot` programs divide and LVT per call, so
+  there is genuinely nothing for an AP to do. Delete the ceremony. It may
+  legitimately return for heterogeneous ARM cores; that day reintroduces it.
+- **`arch/mod.rs:3`'s `#[allow(dead_code)]` on `debug`** — masks exactly five
+  uncalled investigation tools: `set_context`, `watch_write`, `clear`,
+  `monitor_pte`, `check_pte_monitor`, zero callers each. `read_dr6` and
+  `context` have one caller each, from the #DB handler. Delete the five (git
+  history is the shelf), keep the two, drop the allow. Distinct from the
+  crate-level `#![allow(dead_code)]` in §6, and smaller — but the same bar.
+- **`block.rs:73`'s private `PAGE_SIZE = 4096`** — the owner asked whether it
+  belongs to the paging subsystem. It does, and **there is nothing there to
+  move it to**: `mm/paging.rs` exports only `PAGE_SIZE_BIT` (a PDE flag) and
+  `mm/user_span.rs` only `PAGE_2M`. Five private 4 KiB constants exist with no
+  common owner — `block.rs:73`, `file_cache.rs:13`, `file_backing.rs:9,10`,
+  `fat32_adapter.rs:75`, `usb_gate.rs:31`. Whoever does this makes the export
+  first.
+
+### The comment-density position, and the hardware-name scrub it comes with
+
+Five of the owner's 35 review notes are one position stated five times —
+*"the whole codebase has too many comments. good code speaks for itself.
+accompanied by spec documents per subsystem or whatever that should suffice"*
+(`main.rs`), *"why so long comments?"* (`bootloader/main.rs:164`), *"does it
+make sense to have so many comments in each source file or should we instead
+refer to the spec in the module and just let the code speak for itself?"*
+(`sched/driver.rs`), *"theres slop narration in the comments"* (`log_file.rs`),
+and *"'now runs the whole way' thats narration slop"* (`bcachefs_adapter.rs:17`,
+still present verbatim). Filed once, not five times.
+
+Measured 2026-08-08, counting lines whose first non-space characters are `//`,
+`/*` or `*` (so trailing comments are **not** counted and the real figure is
+higher):
+
+- `kernel/src`: **11,920 comment lines of 43,739 — 27%.**
+- First-party Rust as a whole (`kernel bootloader toyos toyos-abi userland
+  toyos-desktop toyos-elf toyos-sched src`): **21,424 of 96,848 — 22%.**
+- Worst files over 200 lines: `heartbeat.rs` 174/260 (**66%**),
+  `arch/tlb.rs` 138/279 (49%), `log_file.rs` 264/564 (46%), `arch/apic.rs`
+  145/323 (44%), `drivers/xhci/mod.rs` 777/1825 (42%), `fat32_adapter.rs`
+  407/997 (40%).
+
+The rule this measures against already exists — CLAUDE.md's slop-comment
+paragraph, and `specs/code-quality-review-2026-08.md` §1.5, which narrows the
+surviving kinds to three: the one-clause invariant at the edit site, the
+boundary contract, and the refusal-reason at a surprising decision, with a
+module doc of contract plus one spec pointer, target ten lines. **What does not
+exist is the sweep**, and nothing in the tree measures density or would notice
+it rising.
+
+The same note carries the **hardware-name scrub**: *"never mention ThinkPad in
+the kernel source code. its just our example machine we have right now. the
+kernel is general."* The review recorded this as "~20 sites across six kernel
+files". Measured, it is much larger: **6 `ThinkPad` mentions across two kernel
+`.rs` files** (`log_file.rs:3`, `drivers/i8042/mod.rs` ×5) and **59 `T14`
+mentions across 26 kernel `.rs` files**, plus 34 more outside `kernel/`
+(`bootloader/`, `toyos/`, `toyos-abi/`, `toyos-xhci/`, `toyos-hda/`,
+`toyos-ps2/`) and a further set in `kernel/Cargo.toml`'s feature commentary.
+The bound or the behaviour stays; the machine that produced it moves to the
+commit message. Note that a plain deletion loses information in the cases where
+the machine *is* the evidence — `i8042/mod.rs:1420`'s "a device that will not
+answer at all" is one — so this is a rewrite per site, not a `sed`.
+
+### OPEN QUESTION for the owner — redesign the log subsystem, and re-shape `kernel/src`?
+
+Recorded verbatim because it is the owner asking, not the owner deciding, and
+because an agent must not answer it on his behalf: *"should we redesign and
+rewrite the log subsystem and rethink if the current file/folder structure of
+the kernel makes sense?"* (`kernel/src/log.rs`). What follows is the evidence
+that makes it decidable, and nothing else.
+
+**The log subsystem, as it exists.** Six places, no core:
+
+| File | Lines | What it is |
+|---|---|---|
+| `log.rs` | 64 | the `log!` macro and a GS-validity flag |
+| `drivers/log_ring.rs` | 549 | the ring, 64 KiB, and its drain policy |
+| `log_file.rs` | 564 | the `/log` sink and its flush |
+| `drivers/serial.rs` | 467 | the 16550 sink |
+| `drivers/panic_console/mod.rs` | 1,188 | the screen sink, panic-only |
+| `drivers/virtio_console.rs` | 221 | the second serial-shaped sink |
+
+Its known sins are already entries here and are the argument for the question:
+the flush is unbounded, uninterruptible and in front of the scheduler pass
+(§10); userland `println!` shares the ring (§5); the ring's occupancy is a wake
+condition (§5); a boot that wedges before the idle loop produces no output at
+all because the ring's only drains are the timer tick and the idle loop (§5);
+and `drain_serial`'s `BackendGuard::lock` spins with interrupts disabled with
+no bound and no deadlock panic (CLAUDE.md's idle-loop warning). Each has been
+patched where it hurt. None has been fixed by a design.
+
+The shape the review reached, **if** the owner wants it: a log core (ring +
+context stamping, once) with serial, file and screen as independent sinks
+carrying explicit backpressure — a slow sink drops-and-counts, never blocks,
+does no unbounded work in a scheduler-adjacent path, and fails alone.
+
+**The layout half.** `kernel/src` is **39 flat `.rs` files** beside seven
+directories (`arch/`, `drivers/`, `elf/`, `iommu/`, `loader/`, `mm/`,
+`sched/`). Three of those seven were flat files a month ago — `elf.rs` and
+`loader.rs` became directories in `42b29c9`, which is the precedent. The flat
+set mixes a filesystem adapter, an IPC primitive, two input devices, a page
+cache, io_uring, the process table and two cfg-gated test actuators at one
+level. The review's target was subsystem directories (fs/, ipc/, input/,
+proc/, log/, time/), and the `syscall.rs` split already forces at least one.
+
+Cost, so the question is priced: a directory move is `git mv` plus `mod` lines,
+it touches no logic, and it collides with every worktree in flight — which is
+why it is a scheduling decision and not a technical one.
+
+Two smaller layout items ride the same answer. `usb_gate.rs` (225 lines) and
+`input_merge_test.rs` (202) are correctly `#[cfg]`-gated at declaration and
+call (`main.rs:27-30`, `:446`, `:566`) and are never in an ordinary build, but
+they sit interleaved with production sources; the review's target is one
+`kernel/src/gates/` directory so that what test machinery exists is auditable
+in one listing. And `input_merge_test` is the tell that pure logic is trapped
+in the kernel: the merge state machine (one held-set, one button-merge, both
+bounded) is host-testable with synthetic multi-source streams, after which the
+gate shrinks or goes.
+
+### What is still owed on "this file is too big", with the numbers
+
+Nine of the owner's review notes asked whether a large file could become a
+crate, a host test, or both. Four have been answered and five have not; the
+numbers below are 2026-08-08 and exist so the next reader does not re-measure.
+Full verdicts and target shapes: `specs/code-quality-review-2026-08.md` §2.
+
+**Answered:**
+
+- `elf.rs` → `toyos-elf/` (1,604 lines, host-tested, crafted-input corpus),
+  `e2c6a06`; the mapping half stayed as `kernel/src/elf/` (1,186), `42b29c9`.
+- `compositor/main.rs` → `toyos-desktop/` (2,684 lines, pure), `763712b`; the
+  effects shell is `userland/compositor/` at 2,085 over five files with a
+  68-line `main.rs`, `72705d9`.
+- `xhci/mod.rs` → the port machine is `toyos-xhci/` (2,082 lines with a host
+  simulator), `2e81ae8`, with `specs/xhci-port-machine-plan.md` as the plan of
+  record. `xhci/mod.rs` is still 1,825 lines, so the shell has not shrunk to
+  match.
+- `loader.rs` → `kernel/src/loader/` (1,397 over four files), `42b29c9`, with
+  the pure decisions in `toyos-elf`. The plan/execute split — a `LoadPlan` an
+  executor applies — is **not** built, and #159 changes what a mapping's
+  protection is, so its shape is not settled.
+
+**Still owed:**
+
+- `arch/syscall.rs` — 2,061 lines at review, **2,248 now**. The biggest file in
+  the kernel and the one holding three unrelated things (entry asm, ABI
+  register mapping, every handler). The user-pointer decode being invisible
+  inside it is where the cwd-accumulation and derived-allocation bug classes
+  both lived.
+- `userland/soundd/src/main.rs` — 1,637 at review, **1,924 now**. Mixing and
+  format conversion are inline; there is one `mod tests` at `:1892`. Gate A
+  certifies the device end and nothing certifies the mixing, which is the half
+  a host test would make sample-exact.
+- `process.rs` — 1,743 lines, no host model. #142 and #156 are the standing
+  evidence that its bugs are interleaving bugs.
+- `symbols.rs` — 293 lines, `core` + `alloc` only, no crate. The smallest and
+  cheapest of the five; a real symbol blob is the fixture.
+- `drivers/acpi.rs` — no `toyos-acpi`. Better than the note feared (typed
+  `TableError`, named bounds, packed structs only for `offset_of!`), and it is
+  stage 0 of the ACPI/AML track, whose interpreter is the most host-testable
+  component this kernel will ever have.
+
 ---
 
 ## 8. Hardware and performance gaps
