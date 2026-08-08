@@ -736,7 +736,7 @@ what we chose. Two things are worth saying about it:
 
 **14** clones under `/Users/jan/Dev/jan/forks/`, **15** under
 `~/.cargo/git/checkouts/`, **14** entries in `forks.toml` plus `rust/` as a
-submodule. Enumerated because known-issues records that the estate is outside
+submodule. Enumerated because `specs/issues/` records that the estate is outside
 every check the tree runs on itself.
 
 **Result: clean on both bars.** Every fork's manifest delta against its pinned
@@ -762,7 +762,7 @@ mention: `rust/library/std/Cargo.toml` depends on `toyos-abi` and `toyos` **by
 path** (`../../../toyos-abi`), which the fork rule forbids. It resolves because
 `rust/` is a submodule that only ever exists inside the monorepo, not a
 standalone crate fork — but it is the same shape as the violation the rule
-exists to prevent, and known-issues §6 already records the ordering constraint it
+exists to prevent, and `specs/issues/build/` already records the ordering constraint it
 creates.
 
 ## 10. What passed, counted
@@ -923,7 +923,7 @@ repository standing in for a remote, so they need no network and run inside
 
 ## 12. Cross-references
 
-Filed in `specs/known-issues.md` §6 (Build and toolchain), each pointing here:
+Filed in `specs/issues/build/` (Build and toolchain), each pointing here:
 
 - Python and the host C toolchain as undeclared build prerequisites (§3, §4).
   **Now declared** — the entry says so and stays open, because declaring is not

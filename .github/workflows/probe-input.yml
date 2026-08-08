@@ -1,7 +1,7 @@
 name: input-probe
 
 # Six tests that inject a keystroke or a plug event fail on a runner and pass on
-# the dev host in seconds (`specs/known-issues.md` §8). Two things differ and
+# the dev host in seconds (`specs/issues/hardware/`). Two things differ and
 # neither has been isolated: the accelerator, and QEMU 8.2.2 on the runner
 # against 11.0.3 here.
 #

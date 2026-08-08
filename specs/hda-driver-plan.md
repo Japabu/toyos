@@ -256,7 +256,7 @@ ToyOS's audio contract is `{mask, timestamp}` and not a sample position. That
 deletes the whole of the `position_fix` family from scope, and it is worth
 stating as a design property rather than an accident.
 
-**What zero-on-complete does not buy, found on the T14 (known-issues §4).** It
+**What zero-on-complete does not buy, found on the T14 (`specs/issues/audio/`).** It
 makes an unfilled period *sound* the same on both backends. It does not make one
 *mean* the same, and soundd's free list was written for the meaning virtio has:
 a period soundd has not submitted is a period the device does not have. Here the
@@ -945,7 +945,7 @@ throughout.
 | **H7** | **Master volume and mute.** A gain on soundd's mix bus, §4.4 item 6's three messages, the existing ramp machinery, and `toybox audio` to read and set it. | ~400 lines Rust | **Harness, with real teeth**: a guest test sets master to 0.5 and the wav capture's amplitude halves; sets mute and the capture goes silent; neither transition fires the click detector. |
 | **H8** | **The volume keys.** Three `SET1_E0` entries in `toyos-ps2` — Keyboard/Keypad-page Mute, Volume Up and Volume Down usages, against what H0 observed the EC actually sends — and the surface owners consuming those three usages instead of forwarding them (§6.1). | ~150 lines Rust | Harness: QMP injects the scancodes and a guest test asserts soundd's master state moved and the capture followed. Metal: the owner presses F1/F2/F3. |
 | **H9** | **Persistence, and H0's probe deleted.** Master volume and mute survive a reboot. **Blocked** — §6.2. | ~200 lines Rust | Reboot in the harness and read the value back; on metal, only once there is a volume to write to. |
-| **H10** | **The end condition.** `userspace-drivers-spec.md` §7.5's checks pass for audio; CLAUDE.md's architecture and `metal-hardware-inventory.md`'s undriven list updated; `known-issues.md` entries closed. | — | Those commands |
+| **H10** | **The end condition.** `userspace-drivers-spec.md` §7.5's checks pass for audio; CLAUDE.md's architecture and `metal-hardware-inventory.md`'s undriven list updated; `specs/issues/` entries closed. | — | Those commands |
 
 H0 and H1 are independent of everything else and of each other, and H0 is a
 diagnostic on a boot the owner is doing anyway. **H0 should be run early and
@@ -1218,7 +1218,7 @@ file had only argued:
    machines for 44.1 kHz with `0x2011` — a 48 kHz base carrying a reserved
    multiplier — and both played 48 kHz. Every buffer was correct and the whole
    pipeline ran 8.8% fast. Closed 2026-08-08; the evidence, the two gates and
-   what it had been hiding in the `hda_tone` capture are in `known-issues.md`
+   what it had been hiding in the `hda_tone` capture are in `specs/issues/`
    §4 and `specs/metal-logs/2026-08-08-audio-underruns/`.
 6. **Association is the codec's own statement** that the speaker and the jack
    are one output: both association 1, the jack last by sequence.
@@ -1273,7 +1273,7 @@ What is built:
   up from 64.
 - **The instrument §5.3 item 5 asked for**: `audio::phase_breaks`, which reads 0
   on all four recorded virtio configs and 8–16 on the HDA arm. That is
-  `known-issues.md` §4's declared red and the largest open thing in this track.
+  `specs/issues/audio/`'s declared red and the largest open thing in this track.
 
 What is **not** built, and is H4's own gate as §5.3 states it: the four new
 `tests/audio-baseline.toml` sections. Recording them is 30 invocations of four
@@ -1357,7 +1357,7 @@ gone is the cheap exit.
 
 **And the gate did not price it, because the instrument was down.** The A arm —
 `main`, no delta — failed the thorough tier on its own at 10 dropouts in 120 runs
-against a recorded 0/120, which is `known-issues.md` §4's new entry and the rate
+against a recorded 0/120, which is `specs/issues/audio/`'s new entry and the rate
 that section had been asking for. Both B-arm attempts then stopped at iterations
 2 and 4 on a kernel double-panic in the TLB shootdown work that landed between
 the arms (§3). So **risk 3 remains unmeasured**, and the accounting above — one
@@ -1452,7 +1452,7 @@ Each with what settles it, and how early.
    backends and remains a design promise. What it does not cover is the free
    list's *meaning*, and that is where the T14 killed soundd: three mix-loop
    rules assumed a period soundd holds is one the device does not have
-   (known-issues §4). Gate A saw none of it — its clients keep their rings full
+   (`specs/issues/audio/`). Gate A saw none of it — its clients keep their rings full
    — so the gate is `hda_client_stall`, whose actuator is a client that stops.
    §5.3 item 5's phase check is built and is separately red (#88).
 8. **CLOSED — QEMU's codec may not offer 44,100 Hz.** It does, at 16-bit, and so
@@ -1516,7 +1516,7 @@ Each with what settles it, and how early.
 11. **Master-volume access control.** There is no mechanism today by which
     soundd can tell an authorized volume client from any other process — service
     names are not gated. H7 ships it open and files that, which is the same hole
-    `SYS_OPEN_DEVICE`'s first-come claim already has (`known-issues.md` §1).
+    `SYS_OPEN_DEVICE`'s first-come claim already has (`specs/issues/isolation/`).
     Closing it is `capability-handles-spec.md`'s work.
 12. **A codec amplifier as the master volume control.** §9.
 13. **Mapping any BAR writable into userland**, on this device or any other.

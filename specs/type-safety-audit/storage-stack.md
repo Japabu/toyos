@@ -836,7 +836,7 @@ construction).
 - **`DeviceSectors::lba_count` rounds down to whole 4 KiB blocks**
   (`kernel/src/gpt.rs:209`), so the final partial block's LBAs are unreachable —
   including the backup header at the last LBA. Harmless today because there is no
-  backup-GPT fallback; it becomes relevant when known-issues' "no backup-GPT
+  backup-GPT fallback; it becomes relevant when `specs/issues/`' "no backup-GPT
   fallback" is closed.
 - **Cross-linked (not cyclic) chains** — two files sharing clusters without a
   loop. No FAT driver detects this without a whole-volume pass, and `fsck` is the
@@ -853,7 +853,7 @@ construction).
 - Anything requiring the QEMU suite. There is no kernel FAT32 adapter yet, so
   nothing here was exercised against a real block device, a real ESP, or the page
   cache. `kernel/src/gpt.rs` was read but not run — `gpt::probe` is called for
-  NVMe only (`main.rs:368`), and known-issues already records that `boot_volume()`
+  NVMe only (`main.rs:368`), and `specs/issues/` already records that `boot_volume()`
   is `None` on every real machine.
 - Whether `247c403`'s `DeviceSectors` behaves correctly against the NVMe driver's
   actual `BlockResult`, since HEAD does not compile (see above) and building the

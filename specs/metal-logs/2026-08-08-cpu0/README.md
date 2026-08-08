@@ -12,7 +12,7 @@ lines of specific files, and a scratchpad path does not survive the session. The
 photographs are here because they are the **only** record of the NMI-answered
 `rip`, which the log cannot carry — the CPU that would have written it is the one
 that stopped. They are 12 MB, which the dependency audit's binary-file ledger
-should count (`known-issues.md` §6).
+should count (`specs/issues/build/`).
 
 ## What the eight say, in one line
 

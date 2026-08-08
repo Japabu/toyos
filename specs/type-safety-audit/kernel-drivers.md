@@ -30,7 +30,7 @@ could be a newtype", with no bug and no readability gain, were dropped; §6 list
 them, because a list of only hits is a monument rather than a record
 (`specs/metal-track-history.md` rule 7).
 
-`specs/known-issues.md` was read in full first. Where a finding extends a filed
+`specs/issues/` was read in full first. Where a finding extends a filed
 class it says so and points at the entry; nothing here re-files what is there.
 
 ---
@@ -202,7 +202,7 @@ non-`Copy`, minted by `poll_used` and consumed by `submit`. Same argument for
 EP0 ring, one input context and one descriptor buffer serve every device, and
 the only thing making that sound is that `init_device` runs once per port from
 `init` on one CPU. `device.rs:425` and `mod.rs:reset_ep0_ring` write the
-invariant in prose; known-issues §8 records that hotplug is precisely what
+invariant in prose; `specs/issues/hardware/` records that hotplug is precisely what
 breaks it and that the fix is an enumeration lock. **A token —
 `EnumerationLock` minted once by `scan_ports` and required by `init_device` —
 makes the prose a signature.** Today `scan_ports` has one caller so the token
@@ -327,7 +327,7 @@ bodies).
    `virtio_sound.rs:472`). Two more `panic!`s each on the vector-assignment
    read-back. That is three different answers to "this machine's device is not
    shaped the way we assumed" — the class M1 closed for xHCI's zero-HID panic
-   and known-issues §1 has filed twice more (NVMe absence, soundd's
+   and `specs/issues/isolation/` has filed twice more (NVMe absence, soundd's
    `num_buffers > 5`).
 2. **Nobody reads the table-size field.** `msg_ctrl & 0x7FF` is *table size − 1*;
    `grep -rn "0x7FF\|table_size" kernel/src/drivers/` returns **0**. All three
@@ -419,7 +419,7 @@ implementation's.
   pointer at config offset 0x28 and mapped whatever that decoded to; a BAR
   firmware left unassigned put the table at physical 0. Both refuse by name now.
   The third — an I/O BAR, which `read_bar_64` cannot see at all — is filed in
-  known-issues §1 rather than fixed, because the fix changes that function's
+  `specs/issues/isolation/` rather than fixed, because the fix changes that function's
   signature at four call sites.
 - **Counted, and it is not −50.** Kernel-side MSI-X setup went 86 → 71 lines
   (21+33+32 → 28 in `pci.rs`, 13 in `virtio.rs`, 15 in each virtio driver), and
@@ -462,7 +462,7 @@ self.slot_data(slot)
 `alloc_slot` evicts and reuses a slot that still holds the *previous* block's
 bytes. A failed read leaves them there, and the cache serves one block's
 contents under another block's number, indefinitely. Same consequence as the
-filed `FileBacking`-after-unlink leak (known-issues §1, *"reads blocks the
+filed `FileBacking`-after-unlink leak (`specs/issues/isolation/`, *"reads blocks the
 allocator has since given to another file"*) by an entirely different route, and
 not filed.
 
@@ -525,7 +525,7 @@ which can fail a read today. Every one of those is a place that currently
 believes a buffer it should not.
 
 **Standing.** Same class as `fa1e9d4`. Unfiled — `usb_storage.rs:44-56` says
-"filed rather than changed here" but no entry exists in `specs/known-issues.md`.
+"filed rather than changed here" but no entry exists in `specs/issues/`.
 
 ---
 
@@ -632,12 +632,12 @@ size_of::<Madt>();`.
 4. **A legal firmware shape kills the boot.** `init_power:203`
    `.expect("ACPI: FADT not found")`, `:215` `assert!(dsdt_addr != 0)`, `:221`
    `.expect("ACPI: \\_S5_ not found in DSDT")`. Same class as the NVMe-absence
-   panic filed in known-issues §1 and the xHCI zero-HID panic M1 closed.
+   panic filed in `specs/issues/isolation/` and the xHCI zero-HID panic M1 closed.
 5. `find_hpet_base:284-291` reads `base_address_value` while ignoring the
    Generic Address Structure's `address_space` byte, which can say I/O space.
 
 **Why now.** QEMU's tables are well-formed by construction, so none of this is
-reachable from the dev host, and `specs/known-issues.md` has no ACPI entry at
+reachable from the dev host, and `specs/issues/` has no ACPI entry at
 all. `iapc_boot_arch` — added for M2 so the i8042 driver can ask whether ports
 0x60/0x64 are even decoded — made ACPI parsing a *load-bearing input to a
 driver's decision* on the one machine whose tables nobody has read.
@@ -681,7 +681,7 @@ four unsafe blocks and two subtractions gone.
 **Blast radius.** One file, six functions, four external callers (`main.rs`,
 `ioapic::init`, `i8042::init`, `clock::init`). No ABI.
 
-**Standing. New — no ACPI entry exists in `specs/known-issues.md`.**
+**Standing. New — no ACPI entry exists in `specs/issues/`.**
 
 ---
 
@@ -872,7 +872,7 @@ against in the first place.
 
 **Standing.** The operative half of the filed design-debt entry
 "`KernelSlice::from_raw` cannot check the one thing that makes the type safe"
-(known-issues §7). That entry names `from_raw` and three constructors. **It does
+(`specs/issues/design-debt/`). That entry names `from_raw` and three constructors. **It does
 not name `ptr_at`, and `ptr_at` is where the checking actually stops** — a
 correctly-constructed `KernelSlice` still yields an unchecked pointer to anyone
 who asks. Recorded as the fourth site of the same defect.
@@ -974,7 +974,7 @@ let selftest_deadline = Deadline::in_(millis(500)).min(budget);
 ```
 
 **Code delta.** `stage` **deletes entirely** — it was `Deadline::min` written by
-hand, and it is the function whose stage-summing arithmetic known-issues §8
+hand, and it is the function whose stage-summing arithmetic `specs/issues/hardware/`
 already records as suspect. `wait_writable`, `read_data`, `command`,
 `write_data`, `device_command`, `aux_command` all take `Deadline` and stop being
 able to receive a duration.
@@ -996,7 +996,7 @@ are unbounded MMIO register polls with no deadline —
 
 **Bug permitted.** A port whose reset never completes hangs the boot with no
 output, on a machine (the T14) whose only diagnostic channel is a screen that
-stops repainting after `Boot: complete` (known-issues §8).
+stops repainting after `Boot: complete` (`specs/issues/hardware/`).
 
 **Why this is a finding and not a style note.** `xhci/mod.rs:100-115` states the
 rule and the reason: *"A device that never answers must cost that device and not
@@ -1041,7 +1041,7 @@ from being false about the file it is in.
 
 **Standing.** Not filed. Distinct from the two filed xHCI first-boot risks (xECP
 handoff, hotplug) and from the filed `submit_and_wait` spin in `virtio.rs`, which
-known-issues §2 records for the *panic* path only.
+`specs/issues/panic-path/` records for the *panic* path only.
 
 ---
 
@@ -1076,7 +1076,7 @@ Each is real; none passes either bar on its own.
 
 - **`exceptions.rs:317-321` writes raw to port `0x3F8` with no `uart_present()`
   gate**, inside `debug_handler`. `serial.rs:25-32` exists precisely because a
-  machine with no SuperIO reads `0xFF` from that port, and known-issues §2
+  machine with no SuperIO reads `0xFF` from that port, and `specs/issues/panic-path/`
   records that `panic_raw_uart`'s equivalent gap "is closed now". This one is
   not. `#DB` only, so it fires only under a hardware watchpoint.
 - **`ioapic::set_masked` (`:311-318`) does not read back**, while `route`
@@ -1152,10 +1152,10 @@ paired unmap to forget.
 operations are already guards. The one genuinely unpaired pair —
 `panic_console::detach()` / `rearm()` (`panic_console/mod.rs:190-200`) — is
 deliberately not a guard, and the filed `gpu::set_resolution` entry
-(known-issues §7) says why: the caller must survive the window even if the callee
+(`specs/issues/design-debt/`) says why: the caller must survive the window even if the callee
 refuses, which a `Drop` cannot express. Making it a guard would be worse.
 
-**`SharedToken` as a bare `u32`.** Filed (known-issues §7). Not re-filed.
+**`SharedToken` as a bare `u32`.** Filed (`specs/issues/design-debt/`). Not re-filed.
 
 **`i8042`'s atomics-instead-of-a-lock byte ring** (`:126-173`). The module doc
 gives the full argument: no `Lock`, no allocation, no `log!`, no wake, no
@@ -1175,7 +1175,7 @@ exception is F1's `id as u16`**, which is why it is F1.
 ## 7. Three cited files are not at HEAD
 
 Checked after the audit was written, with `git cat-file -e HEAD:<path>`, because
-known-issues §1's postscript says to: *"In a tree with six agents committing, the
+`specs/issues/isolation/`'s postscript says to: *"In a tree with six agents committing, the
 working tree is somebody's uncommitted opinion. `git show HEAD:<path>` is the
 arbiter."* That warning is usually about a finding looking **fixed** by
 work-in-progress on disk. This is the mirror case — a finding looking
@@ -1223,9 +1223,9 @@ read against the working tree, which is the tree the next person will also see.
 Read in full: all 17 files under `kernel/src/drivers/` and all 16 under
 `kernel/src/arch/` except `syscall.rs` (1,925 lines, skimmed for the audited
 patterns only — it is the ABI boundary, has had its own hardening passes, and its
-findings would duplicate known-issues §1). Also read for context: `mm/mod.rs`,
+findings would duplicate `specs/issues/isolation/`). Also read for context: `mm/mod.rs`,
 `mm/mmio.rs`, `mm/region.rs`, `block.rs`, `page_cache.rs` and `usb_gate.rs` (read
-paths), CLAUDE.md, `specs/known-issues.md` in full, `specs/metal-track-history.md`
+paths), CLAUDE.md, `specs/issues/` in full, `specs/metal-track-history.md`
 in full.
 
 **Nothing was built or run.** No `cargo build`, `cargo test` or `cargo run` —
