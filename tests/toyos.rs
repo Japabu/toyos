@@ -5695,9 +5695,12 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
     };
     let (injected, arrived) = (injected.get(), arrived.get());
     if let Some(err) = &result.error {
+        // The guard, not the count: the pacing means the host is *waiting* on a
+        // packet when this fires, so what it has established is that the run
+        // stopped, never that the machine dropped one.
         return Err(format!(
-            "{err} — {arrived} of the {injected} packets injected came back out, so the host \
-             stalled on one the machine never delivered\n{}",
+            "{STALLED} {err} — {arrived} of the {injected} packets injected had come back out \
+             when the host gave up waiting for the next\n{}",
             result.stdout
         ));
     }
