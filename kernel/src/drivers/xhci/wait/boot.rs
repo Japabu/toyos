@@ -487,6 +487,8 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         outstanding: Outstanding::EMPTY,
         #[cfg(feature = "xhci-portsc-rw1c")]
         software_disabled: [0u64; 4],
+        #[cfg(feature = "usb-slow-device")]
+        held_event: None,
     })
 }
 /// Initialize and configure one USB device on a port, waiting for each step.

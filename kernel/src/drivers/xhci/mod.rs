@@ -340,6 +340,35 @@ fn deadline() -> u64 {
 const CONTROLLER_ANSWERS: bool = !cfg!(feature = "xhci-deaf-controller");
 const PORT_ANSWERS: bool = !cfg!(feature = "xhci-deaf-port");
 
+/// How long a mass-storage bulk transfer's completion is held back before the
+/// driver may see it.
+///
+/// **A kernel feature because nothing on the host side can stage it, and the
+/// one QEMU property this suite most needs.** `usb-storage` answers a CBW, a
+/// data phase and a CSW in microseconds, and no device, drive or machine
+/// property makes one answer late: `rerror`/`werror` fail a transfer rather
+/// than delaying it, and QEMU's block layer throttling is per *drive* I/O and
+/// does not reach the USB transport's completion at all. A USB flash stick's
+/// 4 KiB write, on the other hand, is tens of milliseconds — the erase block is
+/// the reason and every stick has one — and that is the whole of what the
+/// T14's audio pops are made of (`specs/known-issues.md` §4).
+///
+/// What is replaced is *when the controller publishes the event*, not the
+/// event. The TRB really ran, the completion code is the controller's own and
+/// the bytes really moved; the driver simply does not get to see the Transfer
+/// Event until it is this old, which is the state a slow device leaves behind
+/// and the only state in which the cost of waiting for one is visible. Same
+/// reason `usb-transport-break` and `xhci-slow-connect` exist.
+///
+/// Two milliseconds: a Bulk-Only round trip is three transfers, and one
+/// `log_file` flush is a page write, a FAT entry, a directory entry and a
+/// SYNCHRONIZE CACHE — so about ten round trips, which puts a flush at the ~50
+/// ms the T14 measured. It is deliberately *not* one stick's number: what the
+/// gate asserts is that the machine stays responsive while a device is slow,
+/// and any value large against a 2.902 ms audio period asks that question.
+#[cfg(feature = "usb-slow-device")]
+const SLOW_TRANSFER_NS: u64 = 2_000_000;
+
 /// The boot-time connect settle measures the same interval the per-port machine
 /// does, so it reads it from the same place.
 use portmachine::DEBOUNCE_NS as PORT_DEBOUNCE_NS;
@@ -861,6 +890,11 @@ pub struct XhciController {
     /// reason `xhci-slow-connect` and `xhci-deaf-port` exist.
     #[cfg(feature = "xhci-portsc-rw1c")]
     software_disabled: PortMask,
+
+    /// The event ring slot a slow device's completion is being held in, and
+    /// when it was first seen there. See [`SLOW_TRANSFER_NS`].
+    #[cfg(feature = "usb-slow-device")]
+    held_event: Option<(u16, u64)>,
 }
 
 impl XhciController {
@@ -991,8 +1025,42 @@ impl XhciController {
         if ((event.control & 1) != 0) != self.event_phase {
             return None;
         }
+        #[cfg(feature = "usb-slow-device")]
+        if !self.slow_device_would_have_answered(&event) {
+            return None;
+        }
         self.advance_event_ring();
         Some(event)
+    }
+
+    /// Whether a stick as slow as the owner's would have answered this transfer
+    /// yet. See [`SLOW_TRANSFER_NS`]; `true` for everything that is not a bulk
+    /// completion of a bound disk, so the keyboard and the port machine are
+    /// untouched.
+    ///
+    /// Keyed on the ring position, because that is what identifies *this*
+    /// event: the head does not advance while an event is held, so a second
+    /// look finds the same slot and the same first-seen time, and the entry is
+    /// replaced rather than accumulated when the head moves on.
+    #[cfg(feature = "usb-slow-device")]
+    fn slow_device_would_have_answered(&mut self, event: &Trb) -> bool {
+        let slot = ((event.control >> 24) & 0xFF) as u8;
+        let dci = ((event.control >> 16) & 0x1F) as u8;
+        let is_disk_bulk = (event.control >> 10) & 0x3F == EVENT_TRANSFER
+            && dci >= 2
+            && self.msc.iter().any(|b| b.disk.is_some_and(|d| d.dev.slot_id() == slot));
+        if !is_disk_bulk {
+            return true;
+        }
+        let now = crate::clock::nanos_since_boot();
+        let since = match self.held_event {
+            Some((head, at)) if head == self.event_head => at,
+            _ => {
+                self.held_event = Some((self.event_head, now));
+                now
+            }
+        };
+        now.saturating_sub(since) >= SLOW_TRANSFER_NS
     }
 
     /// Give an event to the device it names. A bound device's interrupt

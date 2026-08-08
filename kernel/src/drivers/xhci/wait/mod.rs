@@ -33,6 +33,43 @@
 pub mod boot;
 pub mod msc;
 
+/// How much of the kernel is holding a spinlock at the moment a device is
+/// waited for.
+///
+/// A measurement and not an actuator: nothing here changes what the driver
+/// does. It exists because the depth cannot be read off the call graph — the
+/// backtrace it prints beside it is what says which locks those are, and one of
+/// them is named nowhere in the chain of function names. Every stage of
+/// `specs/blocking-io-plan.md` is judged on this number falling.
+///
+/// Deepest-so-far rather than every wait, because a line per transfer on a
+/// machine whose log lives on the transfer's own device is the self-sustaining
+/// write loop [`msc::MscDevice`]'s `no_write_cache` already records.
+#[cfg(feature = "io-depth-probe")]
+mod depth_probe {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::log;
+
+    static DEEPEST: AtomicU32 = AtomicU32::new(0);
+
+    pub fn report() {
+        let depth = crate::preempt::count();
+        if depth <= DEEPEST.fetch_max(depth, Ordering::Relaxed) {
+            return;
+        }
+        log!(
+            "io-depth: a disk transfer is being waited for at preempt depth {depth}, task {:?}",
+            crate::arch::percpu::current_tid().map(|t| t.raw())
+        );
+        let rbp: u64;
+        // SAFETY: reading the frame pointer. `kernel_backtrace` walks the chain
+        // defensively and stops at the first frame it cannot read.
+        unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)) };
+        crate::arch::idt::exceptions::kernel_backtrace(rbp, 20);
+    }
+}
+
 use crate::log;
 use super::{deadline, enqueue_control, log_unrecoverable, Completion, Trb, TrbRing};
 use super::{XhciController, EVENT_TRANSFER, EVENT_CMD_COMPLETE, USB_TIMEOUT_NS};
@@ -301,6 +338,8 @@ impl XhciController {
     /// well as the slot matters for mass storage, where one slot carries three
     /// endpoints and a stalled one still completes.
     fn wait_transfer(&mut self, slot: u8, dci: u8) -> Option<(u32, u32)> {
+        #[cfg(feature = "io-depth-probe")]
+        depth_probe::report();
         let deadline = deadline();
         let port = self.port_of_slot(slot);
         loop {

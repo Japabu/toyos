@@ -171,6 +171,23 @@ usb-transport-break = []
 # handed when the controller's number is discarded. See `xhci/msc.rs`'s
 # `short_read`.
 usb-short-read = ["usb-storage-gate"]
+# Hold every mass-storage bulk completion back for 2 ms before the driver may
+# see it, which is what a USB flash stick's erase block does to a 4 KiB write
+# and what the T14's audio pops are made of. QEMU's `usb-storage` answers in
+# microseconds and has no property that delays a transfer — `rerror`/`werror`
+# fail one instead of delaying it, and block-layer throttling is per drive I/O
+# and never reaches the transport's completion — so this is the only way the
+# suite can ask what the machine does while a device is slow. The event is the
+# controller's own and the bytes really moved; what is replaced is when the
+# driver is allowed to see it. See `xhci/mod.rs`'s `SLOW_TRANSFER_NS`.
+usb-slow-device = []
+# Report the preempt depth at the deepest point of a disk transfer, with the
+# backtrace that got there. The one number that says how much of the kernel is
+# holding a spinlock while a device is being waited for, and one no static read
+# of the call graph produces: it is 5 on an ordinary boot. The instrument every
+# stage of `specs/blocking-io-plan.md` is judged on. It measures and stages
+# nothing — no driver behaviour changes with it on.
+io-depth-probe = []
 # Starve one of the xHCI bring-up register waits on a controller that is
 # otherwise answering: `xhci-deaf-controller` the four in `init_one`,
 # `xhci-deaf-port` the port-reset wait in `init_device`. QEMU's xHC halts,
