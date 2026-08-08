@@ -179,6 +179,53 @@ impl Liveness {
     }
 }
 
+/// How the reason line begins when what expired was a **guard** and not an
+/// assertion.
+///
+/// A test that ran out of time has not found the guest doing the wrong thing;
+/// it has found nothing at all, and the two readings send an agent to opposite
+/// places. `screen_pager_keys` reporting `0 page moves over 30 keystrokes`
+/// after 0.3 s was bisected as a kernel regression twice in one day by two
+/// agents, and the fact it was hiding is that the whole run had collapsed
+/// before the guest could answer once.
+///
+/// Still red. A guest that stopped answering may have stopped for a reason this
+/// tree owns, and a status that is not a failure is a status nobody reads. What
+/// this buys is that the summary says which of the two kinds of red it is.
+///
+/// It lives here rather than beside the classifier because [`Liveness`] is what
+/// produces the evidence for it, and [`QemuInstance::run_test_paced`] is a
+/// second producer: a test's own ceiling is a guard of exactly this kind.
+pub const STALLED: &str = "STALLED:";
+
+/// How long a guest may say nothing before a wait on it is a stall.
+///
+/// Every config these waits run on has something on a periodic interval — the
+/// compositor's frame batch and soundd's stats window are both about 2 s — so
+/// silence here is a machine that has stopped rather than a machine that is
+/// thinking. It is not a verdict about any of them: no assertion in this suite
+/// is satisfied by the guest merely talking.
+pub const GUEST_QUIET: Duration = Duration::from_secs(15);
+
+/// The other end of the same guard: a guest can be stuck and chatty.
+///
+/// The compositor prints its interval line whatever else has stopped, so
+/// silence alone cannot end a desktop wait, and a suite that never ends is
+/// worse than one that reds.
+///
+/// **Not [`budget`]-scaled, and that is the point of the pair.** Width is what a
+/// ceiling on a *slow* guest has to be corrected for, and the silence bound
+/// above is what a slow guest is now judged by — it keeps talking, so it is
+/// never judged by this at all. What is left for this number to catch is a guest
+/// that is stuck *and* chatty, which is a state the width does not produce;
+/// scaling it would only make that state cost an hour at width 12. The longest
+/// guest action any caller waits on is eight seconds of audio.
+pub const GUEST_WEDGED: Duration = Duration::from_secs(300);
+
+pub fn guest_liveness() -> Liveness {
+    Liveness::new(GUEST_QUIET, GUEST_WEDGED)
+}
+
 /// The hardware shape QEMU presents to the guest.
 ///
 /// Not a display setting: each variant is a whole machine. `Headless` is the
@@ -1748,21 +1795,51 @@ impl QemuInstance {
         let mut stdout = String::new();
         let mut serial = String::new();
         let mut in_test = false;
+        // **Which of the two things the ceiling caught.** A test's `timeout` is
+        // a liveness guard and never a verdict, and until now its expiry said
+        // only how many seconds had passed — `metal_sim_client_death` 364 s,
+        // `metal_sim_window_drag` 355 s, `desktop_audio_client` 354 s and
+        // `blocked_dump` 329 s in run `31250706113`, four reds indistinguishable
+        // from four slow tests. The console tells them apart for free, and the
+        // fix `1cf7fee` made to the waits *inside* a test never reached this
+        // one: a guest that has said nothing for [`GUEST_QUIET`] has stopped,
+        // and one still talking at the ceiling has not.
+        let mut last_line = Instant::now();
+        let mut lines = 0usize;
 
         loop {
             if start.elapsed() > timeout {
+                let quiet = last_line.elapsed();
+                let secs = timeout.as_secs();
+                let error = if quiet >= GUEST_QUIET {
+                    format!(
+                        "{STALLED} {secs}s of guard expired, and the guest had said nothing for \
+                         the last {:.0?} of it — the ceiling caught a machine that had stopped, \
+                         which is not an answer to what this test asked",
+                        quiet
+                    )
+                } else {
+                    format!(
+                        "timed out after {secs}s, with the guest still talking {:.0?} ago \
+                         ({lines} console line(s) while it ran) — it was working and did not \
+                         finish",
+                        quiet
+                    )
+                };
                 return TestResult {
                     name: name.to_string(),
                     exit_code: None,
                     stdout,
                     serial,
-                    error: Some(format!("timed out after {}s", timeout.as_secs())),
+                    error: Some(error),
                     started: in_test,
                 };
             }
 
             match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(line) => {
+                    last_line = Instant::now();
+                    lines += 1;
                     fire(&line, self.qmp_socket.as_ref());
                     if line.contains(&format!("===TEST_START {want}===")) {
                         in_test = true;
@@ -1854,7 +1931,20 @@ impl Drop for QemuInstance {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.audio_wav);
-        let _ = fs::remove_file(&self.uart_log);
+        // **The 16550's log outlives the guest, because it is the one channel
+        // that exists before the console does.** Firmware, the bootloader and
+        // the kernel up to the backend switch write here and nowhere else, so a
+        // boot that dies before virtio-console comes up leaves this file and an
+        // empty capture — which is exactly the shape `specs/known-issues.md` §5
+        // records as looking like a kernel that never started. 1.4 KB on a
+        // healthy `tests/testcases` boot, measured, against the hundreds of
+        // megabytes of per-boot image beside it.
+        //
+        // Deleting it here is also why `ci.yml`'s "what a red run left" step had
+        // never uploaded one byte: run `31252989653` reds four shards and
+        // publishes twelve duration files and no scratch artifact at all, which
+        // reads as "there was nothing to keep" rather than "it was deleted
+        // before the step ran".
         let _ = fs::remove_file(&self.screendump);
         if let Some(socket) = &self.qmp_socket {
             let _ = fs::remove_file(socket);

@@ -245,7 +245,38 @@ fn steps(
              with the rest of this branch, so the claim window was this whole task"
         ));
     }
+    if let Some(line) = origin_main_lag(primary) {
+        report.push_str(&line);
+    }
     Ok(report)
+}
+
+/// How far the `main` GitHub has fallen behind the one this just moved.
+///
+/// **Nothing here pushes, and that is the owner's rule rather than an
+/// oversight** — whether *this command* should push `main` is a change to the
+/// landing protocol and his to make (`specs/ci-plan.md` §8.1). What a landing
+/// can do is refuse to leave the staleness silent: `main` is the only branch
+/// CI's shared cache is written from, the only one `workflow_dispatch` resolves
+/// `gate-a.yml` on, and otherwise never tested at all. Measured 2026-08-08:
+/// **31 commits**, with the newest `ci` run on it an hour and nineteen minutes
+/// of a configuration that the eight commits of harness work above it replaced.
+///
+/// Read off the local remote-tracking ref and nothing else. A landing may not go
+/// to the network — `--check-forks` is the command that does and says so — so an
+/// unfetched ref makes this a lower bound, which is what "at least" is doing in
+/// the line.
+fn origin_main_lag(primary: &Path) -> Option<String> {
+    let behind = git(primary, &["rev-list", "--count", "origin/main..main"]).ok()?;
+    match behind.trim().parse::<u32>() {
+        Ok(0) | Err(_) => None,
+        Ok(n) => Some(format!(
+            "\n[land]   origin/main is at least {n} commit(s) behind: GitHub has not seen this \
+             landing, so CI on main, the cache every branch reads and `workflow_dispatch` are \
+             all that stale. `git -C {} push origin main` closes it.",
+            primary.display()
+        )),
+    }
 }
 
 /// Everything that would make the landing wrong, asked before the lock is taken

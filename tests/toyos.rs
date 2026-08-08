@@ -7,7 +7,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::qemu::{self, BootOptions, QemuInstance, TestResult};
+use common::qemu::{self, guest_liveness, BootOptions, QemuInstance, TestResult, STALLED};
 use common::{audio, compile, faults, hostload, screen, serial, stats, storage, usb};
 use toyos_build::testargs::Shard;
 
@@ -902,11 +902,43 @@ fn check_c_build_fixture(broken: &[&str]) {
     panic!("{msg}");
 }
 
+/// How many kernel lines a dead test's report is printed with.
+///
+/// A fault report is a header, a register dump and a bounded backtrace, and the
+/// daemons keep talking beside it. Sixty holds one whole report and its
+/// surroundings; past that the tail is the part that says how it ended, and the
+/// line says how many it dropped rather than dropping them in silence.
+const MAX_KERNEL_LINES: usize = 60;
+
+/// The kernel's own account of a test that died, which `stdout` cannot carry.
+///
+/// **`exit code Some(-1)` is the kernel saying it killed the process** —
+/// `recover_or_halt` answers a Ring 3 fault with `kill_process(-1)` — and every
+/// word of *why* is a `log!`: the vector, `rip`, `cr2`, the resolved symbol.
+/// `run_test_paced` files kernel lines under `serial` and keeps them out of
+/// `stdout`, which is right for a test that passed and leaves a killed one with
+/// no evidence whatsoever. `std_unwind` and `std_unwind_so` have been red in
+/// every twelve-shard CI run there has been, and each one reported the same
+/// eleven characters and no address.
+fn kernel_account(result: &TestResult) -> String {
+    let lines: Vec<&str> = result.serial.lines().filter(|l| qemu::is_kernel_line(l)).collect();
+    if lines.is_empty() {
+        return "\n--- the kernel said nothing while it ran ---".to_string();
+    }
+    let dropped = lines.len().saturating_sub(MAX_KERNEL_LINES);
+    let how_many = if dropped > 0 {
+        format!(" (the last {MAX_KERNEL_LINES} of {})", lines.len())
+    } else {
+        String::new()
+    };
+    format!("\n--- what the kernel said{how_many} ---\n{}", lines[dropped..].join("\n"))
+}
+
 fn check_c_result(result: &TestResult) -> bool {
     let test_name = result.name.strip_prefix("test_c_").unwrap_or(&result.name);
 
     if let Some(err) = &result.error {
-        eprintln!("FAIL c::{test_name}: {err}");
+        eprintln!("FAIL c::{test_name}: {err}{}", kernel_account(result));
         return false;
     }
 
@@ -925,11 +957,15 @@ fn check_c_result(result: &TestResult) -> bool {
             true
         }
         Some(code) => {
-            eprintln!("FAIL c::{test_name}: exit code {code}\nstdout: {}", result.stdout);
+            eprintln!(
+                "FAIL c::{test_name}: exit code {code}\nstdout: {}{}",
+                result.stdout,
+                kernel_account(result)
+            );
             false
         }
         None => {
-            eprintln!("FAIL c::{test_name}: no exit code");
+            eprintln!("FAIL c::{test_name}: no exit code{}", kernel_account(result));
             false
         }
     }
@@ -939,18 +975,26 @@ fn check_rust_result(result: &TestResult) -> bool {
     let test_name = result.name.strip_prefix("test_rs_").unwrap_or(&result.name);
 
     if let Some(err) = &result.error {
-        eprintln!("FAIL rs::{test_name}: {err}");
+        eprintln!("FAIL rs::{test_name}: {err}{}", kernel_account(result));
         return false;
     }
 
     match result.exit_code {
         Some(0) => true,
         Some(code) => {
-            eprintln!("FAIL rs::{test_name}: exit code {code}\nstdout:\n{}", result.stdout);
+            eprintln!(
+                "FAIL rs::{test_name}: exit code {code}\nstdout:\n{}{}",
+                result.stdout,
+                kernel_account(result)
+            );
             false
         }
         None => {
-            eprintln!("FAIL rs::{test_name}: no exit code\nstdout:\n{}", result.stdout);
+            eprintln!(
+                "FAIL rs::{test_name}: no exit code\nstdout:\n{}{}",
+                result.stdout,
+                kernel_account(result)
+            );
             false
         }
     }
@@ -4493,49 +4537,6 @@ fn locale_detect_unrecognized(qemu: &mut QemuInstance) -> Result<(), String> {
         return Err(format!("the wizard applied a layout it could not identify:\n{}", result.stdout));
     }
     Ok(())
-}
-
-/// How the reason line begins when what expired was a **guard** and not an
-/// assertion.
-///
-/// A test that ran out of time has not found the guest doing the wrong thing;
-/// it has found nothing at all, and the two readings send an agent to opposite
-/// places. `screen_pager_keys` reporting `0 page moves over 30 keystrokes`
-/// after 0.3 s was bisected as a kernel regression twice in one day by two
-/// agents, and the fact it was hiding is that the whole run had collapsed
-/// before the guest could answer once.
-///
-/// Still red. A guest that stopped answering may have stopped for a reason this
-/// tree owns, and a status that is not a failure is a status nobody reads. What
-/// this buys is that the summary says which of the two kinds of red it is.
-const STALLED: &str = "STALLED:";
-
-/// How long a guest may say nothing before a wait on it is a stall.
-///
-/// Every config these waits run on has something on a periodic interval — the
-/// compositor's frame batch and soundd's stats window are both about 2 s — so
-/// silence here is a machine that has stopped rather than a machine that is
-/// thinking. It is not a verdict about any of them: no assertion in this file
-/// is satisfied by the guest merely talking.
-const GUEST_QUIET: Duration = Duration::from_secs(15);
-
-/// The other end of the same guard: a guest can be stuck and chatty.
-///
-/// The compositor prints its interval line whatever else has stopped, so
-/// silence alone cannot end a desktop wait, and a suite that never ends is
-/// worse than one that reds.
-///
-/// **Not [`qemu::budget`]-scaled, and that is the point of the pair.** Width is
-/// what a ceiling on a *slow* guest has to be corrected for, and the silence
-/// bound above is what a slow guest is now judged by — it keeps talking, so it
-/// is never judged by this at all. What is left for this number to catch is a
-/// guest that is stuck *and* chatty, which is a state the width does not
-/// produce; scaling it would only make that state cost an hour at width 12.
-/// The longest guest action any caller waits on is eight seconds of audio.
-const GUEST_WEDGED: Duration = Duration::from_secs(300);
-
-fn guest_liveness() -> qemu::Liveness {
-    qemu::Liveness::new(GUEST_QUIET, GUEST_WEDGED)
 }
 
 /// A round trip through a guest that is **demonstrably up**, corrected for how
@@ -10985,24 +10986,27 @@ fn main() {
     eprintln!("\nrunning {total} tests\n");
 
     let mut timed: Vec<(String, Duration)> = Vec::new();
-    let mut wide_reds: Vec<String> = Vec::new();
+    // Every red, with whether it had the host to itself when it happened. Reds
+    // only: a test the host slept through has no verdict to confirm, and
+    // re-running it would put a second guess beside the first — and an expected
+    // failure has already been answered by its entry, which names the task
+    // rather than asking which of the retry's two answers it was.
+    let mut reds: Vec<(String, bool)> = Vec::new();
+    let mut collect = |outcomes: &[Outcome], shared_the_host: bool| {
+        reds.extend(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o.verdict(), Verdict::Fail(_)))
+                .map(|o| (o.name.clone(), shared_the_host)),
+        );
+    };
     if !parallel.is_empty() {
         longest_first(&mut parallel, &known);
         eprintln!("  --- parallel, {width} wide ---");
         let started = std::time::Instant::now();
         let outcomes = run_phase(parallel, width, &bins, &slots);
         eprintln!("  --- parallel done in {:.1?} ---", started.elapsed());
-        // Reds only. A test the host slept through has no verdict to confirm,
-        // and re-running it would put a second guess beside the first — and an
-        // expected failure has already been answered by its entry, which names
-        // the task rather than asking which of the two the retry's two answers
-        // it was.
-        wide_reds.extend(
-            outcomes
-                .iter()
-                .filter(|o| matches!(o.verdict(), Verdict::Fail(_)))
-                .map(|o| o.name.clone()),
-        );
+        collect(&outcomes, width > 1);
         timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
         outcomes.into_iter().for_each(|o| tally.record(o));
     }
@@ -11011,36 +11015,44 @@ fn main() {
         let started = std::time::Instant::now();
         let outcomes = run_phase(serial, 1, &bins, &slots);
         eprintln!("  --- serial done in {:.1?} ---", started.elapsed());
+        // **The serial tail is one guest whatever `--jobs` says**, which is
+        // exactly why its reds were never re-run: the loop below was written for
+        // the parallel phase and read the *run's* width. So the two
+        // `Sched::Serial` reds of run `31252989653` — `screen_pager_keys` and
+        // `usb_transport_break` — carried no `ALONE:` line at all and nobody
+        // could say whether either was reproducible.
+        collect(&outcomes, false);
         timed.extend(outcomes.iter().map(|o| (o.name.clone(), o.elapsed)));
         outcomes.into_iter().for_each(|o| tally.record(o));
     }
     qemu::set_width(1);
 
-    if !wide_reds.is_empty() {
-        eprintln!("  --- re-running {} wide failure(s) alone ---", wide_reds.len());
-        for name in &wide_reds {
+    if !reds.is_empty() {
+        eprintln!("  --- re-running {} failure(s) alone ---", reds.len());
+        for (name, shared_the_host) in &reds {
             let Some(task) = retry_task(name, &tests_to_run) else {
                 eprintln!("  ALONE {name}: no way to run it by itself; verdict stands");
                 continue;
             };
             let outcomes = run_phase(vec![task], 1, &bins, &slots);
             match outcomes.iter().find(|o| &o.name == name).map(Outcome::verdict) {
-                // **Two different findings, and which one it is depends on the
-                // width.** At width > 1 a green retry says the first run shared
-                // the machine and this one did not, which is a classification
-                // defect. At width 1 nothing else was ever up, so the two runs
-                // differed in nothing the harness controls: it failed once and
-                // passed once, which is a *rate* and says nothing about
-                // `Sched`. CI runs one lane per machine, and the old sentence
-                // there was a claim about contention that could not be true.
-                Some(Verdict::Pass(_) | Verdict::Stale(_)) if width > 1 => eprintln!(
+                // **Two different findings, and which one it is depends on
+                // whether the first run shared the host** — the parallel
+                // phase's width, never the run's, because the serial tail is
+                // one guest at any width. Beside other guests, a green retry
+                // says this one was not, which is a classification defect.
+                // Alone both times, nothing differed that the harness controls:
+                // it failed once and passed once, which is a *rate* and says
+                // nothing about `Sched`. CI runs one lane per machine, so every
+                // one of its retries is the second kind.
+                Some(Verdict::Pass(_) | Verdict::Stale(_)) if *shared_the_host => eprintln!(
                     "  ALONE {name}: GREEN — it fails only beside other guests, so its \
                      Sched::Parallel is wrong. The run stays red on the classification."
                 ),
                 Some(Verdict::Pass(_) | Verdict::Stale(_)) => eprintln!(
-                    "  ALONE {name}: GREEN, and this run had one lane — nothing else was up \
-                     either time, so it failed once and passed once. That is a rate and not a \
-                     classification."
+                    "  ALONE {name}: GREEN, and it was alone both times — nothing the harness \
+                     controls differed, so it failed once and passed once. That is a rate and \
+                     not a classification."
                 ),
                 Some(Verdict::Fail(_) | Verdict::Expected(_)) => {
                     eprintln!("  ALONE {name}: red again — the defect is real.")
