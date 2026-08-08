@@ -4135,21 +4135,35 @@ construction. Found 2026-08-07 while pricing that stage — the 2026-07-29 versi
 of that document listed this as one of eight items a USB storage driver would
 have to bring, and it is the one that did not arrive with it.
 
-### Nothing gates doom's music, and one commit removed the SoundFont for a cycle
+### Nothing gates doom's music, and nothing ships a SoundFont to gate it with
 
-`assets/timgm6mb.sf2` is 5,994,284 bytes, `.gitignore` line 3 excludes it on
-purpose, and `userland/doom/src/sound.rs:511` opens it as
-`/share/timgm6mb.sf2`. `b34a69c` filtered the asset sweep to what git tracks and
-took it out of every image; the full suite was green with it and without it,
-`doom_sound_flood` included — that actuator "synthesises its own sound and never
-opens the WAD or the soundfont". The only evidence anywhere was one
-`assets: skipping` line in the build output.
+The original finding: `b34a69c` filtered the asset sweep to what git tracks and
+took `assets/timgm6mb.sf2` out of every image; the full suite was green with it
+and without it, `doom_sound_flood` included — that actuator "synthesises its own
+sound and never opens the WAD or the soundfont". The only evidence anywhere was
+one `assets: skipping` line in the build output. `fdcaa0b` restored the file and
+made a declared-but-absent asset a hard error, so for a while the *file* was
+gated even though the music was not.
 
-`fdcaa0b` restored it and made a declared-but-absent asset a hard error, so the
-*file* is gated now. What is still ungated is the **music**: nothing asserts
-doom's synthesiser produced anything, so a defect between the SoundFont and the
-sink is invisible to `cargo test`. Gate A measures the test tone and doom's
-sound-stress actuator; neither is the music path.
+**The file is now deliberately absent and the hard error is gone** — the owner's
+decision, 2026-08-08. TimGM6mb is GPL-2.0 and this tree is MIT OR Apache-2.0, so
+shipping it put copyleft obligations on anyone redistributing an image; every
+permissive General MIDI replacement is around six times the size of the image's
+largest entry, and the image is already too big. Music is opt-in from a `.sf2`
+dropped in as `assets/soundfont.sf2`; a declared entry the build cannot find is
+named and skipped; the absence is stated at build time and again by
+`toyos_music_init`'s "playing without music". `system.toml` names GeneralUser GS
+(CC-BY-4.0) as the recommended one and records that its author cannot be certain
+of every sample's origin.
+
+**What is left is the ungated half this entry was always about, and it is now the
+normal case rather than an accident.** Nothing asserts doom's synthesiser
+produced anything, so a defect between a SoundFont and the sink is invisible to
+`cargo test` — and on CI, on a fresh clone and in every worktree there is now no
+SoundFont for such a defect to be found with at all. Gate A measures the test
+tone and doom's sound-stress actuator; neither is the music path. A gate on
+music would have to carry a permissively-licensed `.sf2` of its own, which is
+the same licence question one size down, and that is why there is not one.
 
 ### No test boots the config the project ships
 

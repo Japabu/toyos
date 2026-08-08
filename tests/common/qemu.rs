@@ -62,6 +62,64 @@ pub fn budget(one_guest: Duration) -> Duration {
     one_guest * WIDTH.load(Ordering::SeqCst)
 }
 
+/// A liveness guard that watches the guest instead of the host's clock.
+///
+/// [`budget`] corrects a ceiling for how many guests share the machine, which
+/// is the part of "how fast is the host today" the harness knows. It does not
+/// know the rest, and a retry loop bounded by elapsed time has that ceiling for
+/// a *verdict* the moment the rest moves: a guest that is merely late reports
+/// exactly what a wedged one reports. `specs/known-issues.md` §7 is the bill —
+/// `desktop_audio_client` 385 s wide against 13 s alone, a landing gate that is
+/// a coin toss, and six reds in four suites every one of which was
+/// `ALONE: GREEN`.
+///
+/// The two are distinguishable and the console is what distinguishes them: a
+/// guest still printing is a guest still working. So the ceiling here is time in
+/// which **nothing arrived**, and a guest that keeps talking is given as long as
+/// it needs. That is the whole idea — no number in this type is a statement
+/// about the host.
+///
+/// `total` is the second half, and it is a wedge guard rather than a verdict
+/// too. A guest can be stuck and chatty: the compositor prints an interval line
+/// every two seconds whatever else has stopped, so silence alone cannot end a
+/// desktop loop and a suite that never ends is worse than one that reds.
+///
+/// The caller owns the capture, so progress is "did it grow" and costs nothing.
+pub struct Liveness {
+    quiet_for: Duration,
+    last_growth: Instant,
+    seen: usize,
+    give_up: Instant,
+}
+
+impl Liveness {
+    /// `quiet_for` of silence ends the wait, and so does `total` however loud
+    /// the guest is.
+    pub fn new(quiet_for: Duration, total: Duration) -> Self {
+        let now = Instant::now();
+        Self { quiet_for, last_growth: now, seen: 0, give_up: now + total }
+    }
+
+    /// Whether the guest may still be working, given everything it has said.
+    pub fn working(&mut self, capture: &str) -> bool {
+        if capture.len() != self.seen {
+            self.seen = capture.len();
+            self.last_growth = Instant::now();
+        }
+        let now = Instant::now();
+        now < self.give_up && now.duration_since(self.last_growth) < self.quiet_for
+    }
+
+    /// What ended the wait, for a caller putting it in a failure message.
+    pub fn why(&self) -> &'static str {
+        if Instant::now() >= self.give_up {
+            "it never stopped talking and never got there"
+        } else {
+            "it went quiet"
+        }
+    }
+}
+
 /// The hardware shape QEMU presents to the guest.
 ///
 /// Not a display setting: each variant is a whole machine. `Headless` is the

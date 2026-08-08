@@ -10,8 +10,6 @@ fn main() {
         download_doomgeneric(&root);
     }
 
-    download_soundfont(&root);
-
     // Use pre-built toyos-cc host binary (built by the build system's toolchain phase).
     let host = std::env::var("HOST").unwrap();
     let toyos_cc = root.join(format!("../../toyos-cc/target/{host}/release/toyos-cc"));
@@ -142,43 +140,6 @@ fn http_agent() -> ureq::Agent {
         .tls_config(tls)
         .build()
         .new_agent()
-}
-
-// TimGM6mb by Tim Brechbill (GPL-2.0, same license as doomgeneric). Downloaded
-// into the gitignored assets/ dir so the initrd build ships it as
-// /share/timgm6mb.sf2, which is where doom loads it from at music init.
-fn download_soundfont(root: &Path) {
-    let sf2_path = root.join("../../assets/timgm6mb.sf2");
-    // Nonexistent path forces a rerun, which re-downloads after deletion.
-    println!("cargo:rerun-if-changed={}", sf2_path.display());
-    if sf2_path.exists() {
-        return;
-    }
-    println!("Downloading TimGM6mb.sf2...");
-    // Music is the one input here a network can take away, and taking the whole
-    // image with it is the wrong trade: `toyos_music_init` already answers
-    // "playing without music" for a file that is not there, and the initrd
-    // build names it too. `cargo:warning` because a build script's stdout is
-    // captured and its warnings are not.
-    let fetch = || -> Result<Vec<u8>, String> {
-        let resp = http_agent()
-            .get("https://github.com/craffel/pretty-midi/raw/main/pretty_midi/TimGM6mb.sf2")
-            .call()
-            .map_err(|e| e.to_string())?;
-        let mut data = Vec::new();
-        std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut data)
-            .map_err(|e| e.to_string())?;
-        if !data.starts_with(b"RIFF") {
-            return Err("what came back is not a RIFF file".into());
-        }
-        Ok(data)
-    };
-    match fetch() {
-        Ok(data) => fs::write(&sf2_path, &data).expect("failed to write TimGM6mb.sf2"),
-        Err(e) => println!(
-            "cargo:warning=TimGM6mb.sf2 could not be fetched ({e}); this doom plays without music"
-        ),
-    }
 }
 
 fn download_doomgeneric(root: &Path) {

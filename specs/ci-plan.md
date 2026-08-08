@@ -226,28 +226,38 @@ compilation. With the cargo cache: 442 s (run `31201564400`).
 
 ## 6. What a fresh clone does not have
 
-**The SoundFont — and the reason it broke CI was not that a fresh clone lacks
-it.** `assets/timgm6mb.sf2` is `.gitignore` line 3, 5,994,284 bytes doom
-synthesises its music from. **`userland/doom/build.rs` downloads it**, so any
-config that builds doom has it; five configs declared it in `untracked-assets`
-and exactly one of them — the root `system.toml` — builds doom. `console`,
-`desktopcase`, `desktopaudiocase` and `metalcase` each shipped 5.99 MB into an
-initrd holding nothing that can open it, and each turned a hard error on an
-asset nothing in that image wanted. That is what reddened the whole desktop and
-metal-sim families on a runner (86 occurrences in run `31222412737`), and the
-same defect in worktree clothes is what made a brand-new worktree fail
-`metal_sim_compositor` and `metal_sim_pointer_churn` until somebody copied the
-file across.
+**The SoundFont — and neither the diagnosis nor the fix this section first
+carried survived contact with the licence.** 86 of run `31222412737`'s failures
+were `assets/timgm6mb.sf2 ... is not there`, and the same defect in worktree
+clothes made every brand-new worktree red on `metal_sim_compositor` and
+`metal_sim_pointer_churn` until somebody copied the file across.
 
-Fixed by deleting the four declarations, which loses nothing: **the config that
-builds doom is the config that declares doom's asset.** Two further changes so a
-network, rather than a licence, is all that stands between a clone and a build:
-a declared asset that is not there is now **named and skipped** rather than
-fatal (`src/assets.rs`), and a fetch that fails is a `cargo:warning` rather than
-a panic (`userland/doom/build.rs`). The absence is stated twice — at build time
-by name, and in the guest's log by `toyos_music_init`'s "playing without music".
-No repository variable and no hosted copy is needed, so `TOYOS_SOUNDFONT_URL` is
-gone.
+Two things were wrong. The first is that a fresh clone lacking it was never the
+mechanism: **`userland/doom/build.rs` downloaded it**, so any config that built
+doom had it — and of the five configs declaring it in `untracked-assets`,
+exactly one built doom. `console`, `desktopcase`, `desktopaudiocase` and
+`metalcase` each shipped 5.99 MB into an initrd holding nothing that could open
+it, and each turned a hard error on an asset nothing in that image wanted.
+
+**The second is the one that settles it. TimGM6mb is GPL-2.0 and this tree is
+MIT OR Apache-2.0**, so every image this project has ever built put copyleft
+obligations on whoever redistributed it. The owner's decision, 2026-08-08:
+**ship nothing.** The file is out of the repository, `.gitignore` carries the
+pattern rather than the one name, and doom's build script no longer fetches it.
+Music is opt-in — drop a `.sf2` in as `assets/soundfont.sf2`. `system.toml`
+records GeneralUser GS (CC-BY-4.0, ~30 MB) as the recommended one, with its
+author's own caveat that he cannot be certain of every sample's origin;
+MuseScore_General is MIT but ships as `.sf3`, whose Vorbis-compressed samples
+rustysynth does not read. Both are around six times the size of the image's
+largest current entry, which is the other reason there is no default.
+
+So the four spurious declarations are gone, which loses nothing — **the config
+that builds doom is the config that declares doom's asset** — and the one that
+remains declares an absence rather than a requirement: `src/assets.rs` **names
+and skips** a declared entry it cannot find instead of stopping the build. The
+absence is stated twice, at build time by name and in the guest's log by
+`toyos_music_init`'s "playing without music". Nothing is fetched in CI and
+`TOYOS_SOUNDFONT_URL` is gone with its step.
 
 Gate A was never affected — it runs on `tests/testcases`, which declares no
 untracked asset.

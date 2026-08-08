@@ -1,6 +1,10 @@
 target/
 .claude/
-assets/timgm6mb.sf2
+# A SoundFont is a licence question and this repository answers it by shipping
+# none: TimGM6mb was GPL-2.0 under an MIT OR Apache-2.0 tree. The pattern rather
+# than the one filename, because the reason applies to whichever one somebody
+# drops in for music of their own.
+assets/*.sf2
 .vscode/
 .mcp.json
 .DS_Store

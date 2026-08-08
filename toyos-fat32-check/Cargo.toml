@@ -1,0 +1,11 @@
+# Its own workspace, like toyos-fat32 and toyos-gpt: `cargo test` runs here on
+# the host with no target-triple juggling. No dependencies, and in particular
+# not on `toyos-fat32` — this is the outside judge of that crate's output and of
+# the image builder's, so it may not share a line of code with either.
+[workspace]
+
+[package]
+name = "toyos-fat32-check"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"

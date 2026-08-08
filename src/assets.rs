@@ -197,18 +197,18 @@ fn tracked(dir: &Path) -> BTreeSet<PathBuf> {
 /// the repository deliberately does not carry.
 ///
 /// `untracked` exists because git's index is not quite the whole declaration:
-/// `assets/timgm6mb.sf2` is 5.99 MB of SoundFont that doom synthesises its
-/// music from and `.gitignore` excludes it on purpose. A sweep cannot tell that
-/// file from a `.DS_Store` — both are "in the directory and not in git" — so
-/// the config says which.
+/// `assets/soundfont.sf2` is doom's music and no SoundFont this project could
+/// ship is licence-compatible with it, so the file is the owner of a build's to
+/// supply. A sweep cannot tell one from a `.DS_Store` — both are "in the
+/// directory and not in git" — so the config says which.
 ///
 /// **An entry the build cannot find is named and skipped, not fatal.** It used
 /// to stop the build, on the argument that a fresh clone should be told rather
 /// than handed a doom with no music; the telling is what mattered and the
 /// stopping was the part that cost — a fresh clone, a runner and every new
-/// worktree red on an asset git deliberately does not carry. Being told happens
-/// twice now: here by name, and again in the guest's own log when whatever
-/// wanted the file opens it and says what it is doing without it.
+/// worktree red on a file that is now deliberately absent from all three. Being
+/// told happens twice: here by name, and again in the guest's own log when
+/// whatever wanted the file opens it and says what it is doing without it.
 pub fn collect(dirs: &[String], untracked: &[String]) -> Vec<(String, Vec<u8>)> {
     let mut files = vec![];
 
@@ -311,7 +311,7 @@ mod tests {
     ///
     /// `declared.sf2` is the other half, and it is the half that matters most:
     /// the first version of this filter shipped without it and silently took
-    /// the real `timgm6mb.sf2` out of the image, so doom lost its music and the
+    /// the real SoundFont out of the image, so doom lost its music and the
     /// whole suite stayed green.
     #[test]
     fn the_initrd_carries_what_the_repository_declares() {

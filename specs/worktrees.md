@@ -499,8 +499,9 @@ it — including, the first time this was tried, the build-system change that
 makes worktrees work at all, which sent the new worktree straight into the
 bootstrap this document exists to prevent.
 
-**And it carries `.cargo/config.toml` but not `assets/timgm6mb.sf2`**, which is
-`.gitignore` line 3 and named in three test configs' `untracked-assets`. A
-brand-new worktree therefore reds nine tests of the desktop and metal-sim
-families — `cp` the file from the primary before the first `cargo test`. The
-full account, and the same hole on a CI runner: `specs/ci-plan.md` §6.
+**It carried `.cargo/config.toml` and not `assets/timgm6mb.sf2`**, which reddened
+nine tests of the desktop and metal-sim families in every brand-new worktree
+until somebody copied that file across. Closed 2026-08-08, and not by copying it:
+no config that builds no doom declares a SoundFont any longer, and the one that
+does declares an absence rather than a requirement. There is nothing left to copy
+— `specs/ci-plan.md` §6 is the account.

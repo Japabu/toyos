@@ -13,11 +13,19 @@ init = [
 hosted-rustc = false
 assets = ["assets"]
 
-# In the directory and not in git, on purpose: 5.99 MB of SoundFont doom
-# synthesises its music from. A sweep cannot tell it from a .DS_Store, so it is
-# named here — and only here, because this is the only config that builds doom.
-# `userland/doom/build.rs` downloads it, so it is present whenever doom is.
-untracked-assets = ["timgm6mb.sf2"]
+# doom's music, and it is opt-in: this repository ships no SoundFont, because
+# the one it used to carry (TimGM6mb) is GPL-2.0 and this tree is MIT OR
+# Apache-2.0, so an image built with it put copyleft obligations on whoever
+# redistributed one. Drop a `.sf2` here under this name and doom plays music;
+# leave it out and the build says so by name and doom says so again at startup.
+# GeneralUser GS (CC-BY-4.0, ~30 MB) is the recommended one — its author states
+# he cannot be certain of every sample's origin, which is worth knowing before
+# redistributing an image built with it. MuseScore_General is MIT and ~36 MB but
+# ships as `.sf3`, whose Vorbis-compressed samples rustysynth does not read.
+#
+# Named here because a sweep cannot tell an untracked SoundFont from a
+# .DS_Store, and only here: this is the only config that builds doom.
+untracked-assets = ["soundfont.sf2"]
 
 [programs]
 shell = {}

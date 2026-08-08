@@ -4361,12 +4361,33 @@ fn shell_answers(qemu: &mut QemuInstance, log: &mut String) -> bool {
 /// The nonce must differ between asks. `serial_until` scans everything
 /// captured so far, so a later question with an earlier answer still in the
 /// log is answered by that one whatever the shell is doing.
+///
+/// **Two waits, because the two ways this fails are different questions.** The
+/// first is "has the terminal come up", and it used to be answered by retyping
+/// against `qemu::budget(20 s)` — a guess at how long a desktop takes to come up
+/// on the host of the day, which is exactly the shape `specs/known-issues.md` §7
+/// bills for: `desktop_audio_client` 385 s wide against 13 s alone, and a
+/// landing gate that is a coin toss. The terminal knows when it is up and now
+/// says so, so this asks it and waits on the guest's own liveness. The second is
+/// "does a keystroke reach the shell", and it starts from a machine that is
+/// demonstrably up — a ceiling on *that* is a claim about the guest.
 fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> bool {
-    // Retyping rather than waiting longer, because until the terminal has a
-    // shell behind it there is nothing to swallow the line and an attempt that
-    // lands early leaves no trace. The ceiling on the retries is the phase's:
-    // how long a desktop takes to come up is not a verdict.
-    let deadline = Instant::now() + qemu::budget(Duration::from_secs(20));
+    // Printed by the terminal once its window exists and the shell's stdin is a
+    // pipe it holds. Before it a keystroke lands nowhere and leaves no trace.
+    const TERMINAL_UP: &str = "terminal: ready";
+    let mut live = qemu::Liveness::new(Duration::from_secs(15), Duration::from_secs(300));
+    while !log.contains(TERMINAL_UP) && live.working(log) {
+        let seen = qemu.drain_serial(Duration::from_millis(200));
+        log.push_str(&seen);
+    }
+    if !log.contains(TERMINAL_UP) {
+        return false;
+    }
+
+    // Retyping rather than waiting longer: a keystroke injected between two of
+    // the terminal's polls is dropped, and a dropped one leaves nothing to wait
+    // for. Unscaled, and it is a round trip through a machine already up.
+    let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         {
             let mut input = qemu::QmpInput::open(qemu.qmp_socket());
@@ -4406,10 +4427,18 @@ fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> bool 
 /// wait was `serial_until`, which scans the whole capture, so the *previous*
 /// probe's `windows=1` returned it immediately and the loop hammered GUI+Q at
 /// the speed of a QMP round trip.
+///
+/// The ceiling is the guest's own liveness rather than a phase-scaled clock,
+/// and here that cuts both ways: #156 is a *freeze*, so the machine this
+/// retries against goes silent, and the wait ends in fifteen seconds instead of
+/// spending `qemu::budget(20 s)` — up to four minutes at width 12 — hammering
+/// GUI+Q at a desktop that has stopped. `specs/known-issues.md` §7 names that
+/// cost as a lane this test holds for a quarter of every run, which is what puts
+/// whichever desktop is dispatched beside it into a red nobody acts on.
 fn close_focused_window(qemu: &mut QemuInstance, log: &mut String, new: usize) -> bool {
     const CLOSED: &str = "compositor: window closed";
-    let deadline = Instant::now() + qemu::budget(Duration::from_secs(20));
-    while Instant::now() < deadline && !log[new..].contains(CLOSED) {
+    let mut live = qemu::Liveness::new(Duration::from_secs(15), Duration::from_secs(60));
+    while !log[new..].contains(CLOSED) && live.working(log) {
         {
             let mut input = qemu::QmpInput::open(qemu.qmp_socket());
             input.keys(&[("meta_l", true), ("q", true), ("q", false), ("meta_l", false)]);

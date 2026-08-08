@@ -505,10 +505,13 @@ unsafe extern "C" fn toyos_sound_is_playing(handle: i32) -> bool {
 
 // ── Music ──
 
-// TimGM6mb by Tim Brechbill (GPL-2.0, like doomgeneric itself): a compact ~6MB
-// General MIDI soundfont. Downloaded into assets/ by build.rs and shipped in
-// the initrd rather than embedded, so the binary stays small.
-const SOUNDFONT_PATH: &str = "/share/timgm6mb.sf2";
+// A General MIDI SoundFont, and this project ships none: the one it used to
+// carry was GPL-2.0 under an MIT OR Apache-2.0 tree, and every permissive
+// replacement is around six times the size of the image's largest entry. So the
+// file is whatever the owner of a build drops into `assets/` — named for the
+// role and not for one SoundFont — and `toyos_music_init` says what it is doing
+// without it. `system.toml` is where it is declared.
+const SOUNDFONT_PATH: &str = "/share/soundfont.sf2";
 
 // ~3s of render-ahead at 44100Hz. On a saturated single core the game thread
 // starves the midi-synth thread for hundreds of ms at a time, and a ring this
