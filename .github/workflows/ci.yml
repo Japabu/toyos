@@ -19,17 +19,17 @@ concurrency:
 jobs:
   guest:
     runs-on: ubuntu-24.04
-    # 60 was too tight and cost three shards of run `31238056513`: two finished
-    # their suite and lost the artifact upload, one was cut off mid-phase at
-    # 1932 s. The partition is the reason — a runner has no
-    # `target/test-durations`, so `longest_first` prices every test the same and
-    # degenerates to round-robin, and the metal-sim shard drew far more than a
-    # sixth of the work.
-    timeout-minutes: 90
+    # A shard that cannot finish measures nothing, and 90 minutes was reached by
+    # one test taking the shared boot down (run `31241099454`, shard 1: five
+    # tests passed, `abuse_gpu_resolution` went, and the 150 behind it each paid
+    # a full ceiling for a guest that was gone). The harness answers a dead
+    # shared boot with a new one now, so this is a wedge guard again and not a
+    # budget.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       - uses: actions/checkout@v4
 
@@ -79,28 +79,46 @@ jobs:
       # `--host-slots 0`: the semaphore arbitrates between worktrees on one
       # host, and a shard is a host with one suite on it.
       #
-      # **`--jobs 2` on four cores, measured.** Run `31233476555` ran `--jobs 4`
-      # and the width, not the accelerator, was what was left: every profile
-      # boots `-smp 2` and six tests boot `-smp 8`, so four lanes is eight to
-      # thirty-two vCPUs on four, and a guest whose kernel spins with `IF` clear
-      # pays lock-holder preemption for all of it. The re-run-alone column is the
-      # whole argument — `netd_connection_caps` 551 s wide against 6 s alone,
-      # `metal_sim_input` 336 s against 4 s, `desktop_locale_detect` 51 s against
-      # 4 s. Two lanes and six shards keeps the wall clock and stops the suite
-      # measuring the runner.
+      # **`--jobs 1`, and the shard count is what replaces the width.** Run
+      # `31233476555` ran four lanes on four cores and the width, not the
+      # accelerator, was what was left: every profile boots `-smp 2` and six
+      # tests boot `-smp 8`, so four lanes is eight to thirty-two vCPUs on four,
+      # and a guest whose kernel spins with `IF` clear pays lock-holder
+      # preemption for the difference. `--jobs 2` halved it and left a named
+      # class behind — eight `ALONE: GREEN` verdicts in run `31238056513`, every
+      # one a test that fails only beside another guest.
+      #
+      # One lane removes that class by construction: there is never a second
+      # guest on the machine. It costs nothing, because a shard is a whole
+      # machine and this repository is public — twenty jobs may run at once and
+      # the minutes are unmetered. Twelve of them is the same number of guests
+      # the dev host runs, on twelve times the cores.
       - name: suite
         run: |
           cargo test --test toyos-build -- \
-            --shard ${{ matrix.shard }}/6 --jobs 2 --host-slots 0
+            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0
+
+      # Always, and not only on a red: this is the measurement that fixes the
+      # partition. A shard writes `test-durations.shard-<i>-of-<n>`, which
+      # `load_durations` never reads — `specs/ci-plan.md` §4's rule that a shard
+      # may not write the profile it partitioned on is what keeps a third of a
+      # measurement out of `tests/test-durations`. Merging the twelve is a
+      # deliberate act with a command behind it.
+      - name: what this shard measured
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: durations-shard-${{ matrix.shard }}
+          path: target/test-durations.shard-*
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: what a red run left
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}-scratch
-          path: |
-            target/test-durations
-            /tmp/toyos-tests-*/
+          path: /tmp/toyos-tests-*/
           if-no-files-found: ignore
           retention-days: 7
 
