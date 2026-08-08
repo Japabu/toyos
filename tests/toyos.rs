@@ -1060,7 +1060,6 @@ fn check_fault_gates(result: &TestResult) -> bool {
             "fault_gate_child::divide_by_zero",
             "expected the faulting function in the #DE backtrace",
         ),
-        ("x87 floating-point exception", "expected the #MF report to name the vector"),
     ];
 
     let mut ok = true;

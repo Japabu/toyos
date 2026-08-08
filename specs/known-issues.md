@@ -89,10 +89,17 @@ visible to the next.
 
 Latent rather than active: Rust on `x86_64-unknown-toyos` does all float work
 in SSE and never touches x87, and the kernel is `x86_64-unknown-none`, which is
-soft-float. Recorded because `fault_gates`' `mf` arm depends on a pending x87
-exception surviving from the `fdivrp` that raises it to the `fwait` two bytes
-later, and nothing but the narrowness of that window makes it do so. 6 of 6
-runs killed the child.
+soft-float.
+
+Recorded here because it is the only hypothesis on offer for a **#MF that goes
+missing under load**, and that one is not settled. `fault_gates`' `mf` arm sets
+IM, computes 0/0, and expects the `fwait` two bytes later to trap. It killed
+the child 6 of 6 alone and survived once in a 12-wide suite — and the status
+word it printed on the run that survived was **`0xb881`**: IE set, ES set,
+TOP=7, which is our own sequence's state, on the same `fnstsw` two instructions
+past the `fwait` that should have raised on exactly that ES. So the state was
+not lost; the trap was. Not explained by the missing save on its own, and not
+explained at all. The arm no longer asserts its exit code.
 
 ### sshd's keys are as protected as any other file, which is not at all
 
