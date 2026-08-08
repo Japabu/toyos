@@ -1,0 +1,833 @@
+[kernel 0.000 boot] panic console: framebuffer at 0x4000000000 is above the boot map, armed after mm::init
+[kernel 0.000 boot] serial: 16550 loopback read 0xff (absent or wrong port)
+[kernel 0.000 boot] PAT: IA32_PAT=0x0007040100070406, entry 4 = WC
+[kernel 0.000 boot] KernelArgs { memory_map_addr: 1672929304, memory_map_size: 2040, kernel_memory_addr: 1541406720, kernel_memory_size: 11657216, kernel_stack_addr: 3268608, kernel_stack_size: 8388608, rsdp_addr: 2495602708, initrd_addr: 1553379352, initrd_size: 82747392, init_program_addr: 1645157984, init_program_len: 37, kernel_elf_addr: 1636130840, kernel_elf_size: 3834464, gop_framebuffer: 274877906944, gop_framebuffer_size: 8294400, gop_width: 1920, gop_height: 1080, gop_stride: 1920, gop_pixel_format: 1, boot_pml4_addr: 1672876032, boot_partition_start_lba: 2048, boot_partition_blocks: 181136, boot_partition_guid: [192, 220, 226, 252, 233, 180, 121, 72, 145, 90, 7, 246, 6, 119, 182, 10], boot_partition_present: 1, log_partition_guid: [69, 97, 83, 174, 254, 222, 49, 72, 185, 195, 207, 109, 146, 195, 68, 96], rtc_utc_offset_minutes: 0, rtc_utc_offset_known: 0 }
+[kernel 0.000 boot] ACPI: MADT cpus=[0, 2, 4, 6, 1, 3, 5, 7]
+[kernel 0.000 boot] LAPIC: x2APIC enabled (ID 0)
+[kernel 0.000 cpu0] percpu: BSP cpu_id=0 lapic_id=0 smep=on smap=on pcid=on
+[kernel 0.000 cpu0] ioapic: id=2 at 0xfec00000 ver=0x20 gsi 0..119 masked 120/120
+[kernel 0.000 cpu0] ioapic: iso bus:irq->gsi [0:0->2 edge/high, 0:9->9 level/high]
+[kernel 0.000 cpu0] symbols: loaded 5152 kernel symbols
+[kernel 0.000 cpu0] ACPI: HPET at 0xfed00000
+[kernel 0.050 cpu0] TSC: 2419MHz (period=413293fs, calibrated over 50ms)
+[kernel 0.050 cpu0] ACPI: the FADT puts the RTC century register at CMOS 0x32
+[kernel 0.050 cpu0] clock: the RTC reads 2026-08-08 12:00:16; firmware named no zone, so it is taken as UTC
+[kernel 0.060 cpu0] LAPIC timer: 384065 ticks/10ms
+[kernel 0.060 cpu0] Boot: CPU ready (60ms)
+[kernel 0.065 cpu0] ACPI: RSDP at 0x94bfe014
+[kernel 0.065 cpu0] ACPI: MCFG found at 0x8f428000
+[kernel 0.065 cpu0] ACPI: ECAM base address: 0xc0000000
+[kernel 0.065 cpu0] PCI: Enumerating devices...
+[kernel 0.065 cpu0]   PCI 00:00.0 [0600] vendor=8086 device=9a14 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:02.0 [0300] vendor=8086 device=9a49 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:04.0 [1180] vendor=8086 device=9a03 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:06.0 [0604] vendor=8086 device=9a09 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:07.0 [0604] vendor=8086 device=9a25 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:07.2 [0604] vendor=8086 device=9a27 prog_if=00
+[kernel 0.065 cpu0]   PCI 00:0a.0 [1180] vendor=8086 device=9a0d prog_if=00
+[kernel 0.066 cpu0]   PCI 00:0d.0 [0c03] vendor=8086 device=9a13 prog_if=30
+[kernel 0.066 cpu0]   PCI 00:0d.2 [0c03] vendor=8086 device=9a1b prog_if=40
+[kernel 0.066 cpu0]   PCI 00:0d.3 [0c03] vendor=8086 device=9a1d prog_if=40
+[kernel 0.066 cpu0]   PCI 00:14.0 [0c03] vendor=8086 device=a0ed prog_if=30
+[kernel 0.066 cpu0]   PCI 00:14.2 [0500] vendor=8086 device=a0ef prog_if=00
+[kernel 0.066 cpu0]   PCI 00:16.0 [0780] vendor=8086 device=a0e0 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1c.0 [0604] vendor=8086 device=a0b8 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1c.4 [0604] vendor=8086 device=a0bc prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1c.7 [0604] vendor=8086 device=a0bf prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1f.0 [0601] vendor=8086 device=a082 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1f.3 [0403] vendor=8086 device=a0c8 prog_if=80
+[kernel 0.066 cpu0]   PCI 00:1f.4 [0c05] vendor=8086 device=a0a3 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1f.5 [0c80] vendor=8086 device=a0a4 prog_if=00
+[kernel 0.066 cpu0]   PCI 00:1f.6 [0200] vendor=8086 device=15fc prog_if=00
+[kernel 0.067 cpu0]   PCI 04:00.0 [0108] vendor=1c5c device=1327 prog_if=02
+[kernel 0.069 cpu0]   PCI 09:00.0 [0280] vendor=8086 device=2725 prog_if=00
+[kernel 0.072 cpu0]   PCI 0a:00.0 [0805] vendor=17a0 device=9750 prog_if=01
+[kernel 0.145 cpu0] PCI: Enumeration complete, 24 functions.
+[kernel 0.145 cpu0] iommu: DMAR haw=39 flags=0x05 intr_remap=y x2apic_opt_out=n dma_ctrl_opt_in=y
+[kernel 0.145 cpu0] iommu: unit0 @0xfed90000 seg=0 pci_all=n ver=4.0 cap=0x01c0000c40660462 ecap=0x0000029a00f0505e aw=48 sagaw=0x04 mgaw=39 nd=256 sps2m=y cm=n psi=n nfr=1 fro=0x400 qi=y ir=y eim=y pt=y coherent=n sc=n
+[kernel 0.145 cpu0] iommu: unit0 scope pci-endpoint 00:02.0 id=0
+[kernel 0.147 cpu0] iommu: identity domain aw=48 covers 0x0..0x45f800000 in 8956 2 MiB leaves
+[kernel 0.147 cpu0] iommu: unit0 @0xfed90000 translating gsts=0xc4000000 tes=y qies=y root=0x1014000 domain=1 aw=48 streams=24
+[kernel 0.147 cpu0] iommu: unit1 @0xfed85000 seg=0 pci_all=n ver=1.0 cap=0x00d2008c40660462 ecap=0x0000000000f050da aw=48 sagaw=0x04 mgaw=39 nd=256 sps2m=y cm=n psi=y nfr=1 fro=0x400 qi=y ir=y eim=y pt=y coherent=n sc=y
+[kernel 0.147 cpu0] iommu: unit1 scope pci-bridge 00:07.0 id=0
+[kernel 0.147 cpu0] iommu: unit1 @0xfed85000 translating gsts=0xc4000000 tes=y qies=y root=0x101b000 domain=1 aw=48 streams=24
+[kernel 0.147 cpu0] iommu: unit2 @0xfed86000 seg=0 pci_all=n ver=1.0 cap=0x00d2008c40660462 ecap=0x0000000000f050da aw=48 sagaw=0x04 mgaw=39 nd=256 sps2m=y cm=n psi=y nfr=1 fro=0x400 qi=y ir=y eim=y pt=y coherent=n sc=y
+[kernel 0.147 cpu0] iommu: unit2 scope pci-bridge 00:07.2 id=0
+[kernel 0.148 cpu0] iommu: unit2 @0xfed86000 translating gsts=0xc4000000 tes=y qies=y root=0x1022000 domain=1 aw=48 streams=24
+[kernel 0.148 cpu0] iommu: unit3 @0xfed91000 seg=0 pci_all=y ver=1.0 cap=0x00d2008c40660462 ecap=0x0000000000f050da aw=48 sagaw=0x04 mgaw=39 nd=256 sps2m=y cm=n psi=y nfr=1 fro=0x400 qi=y ir=y eim=y pt=y coherent=n sc=y
+[kernel 0.148 cpu0] iommu: unit3 scope ioapic 00:1e.7 id=2
+[kernel 0.148 cpu0] iommu: unit3 scope hpet 00:1e.6 id=0
+[kernel 0.148 cpu0] iommu: unit3 @0xfed91000 translating gsts=0xc4000000 tes=y qies=y root=0x1029000 domain=1 aw=48 streams=24
+[kernel 0.148 cpu0] iommu: rmrr0 seg=0 0x000000009c000000..0x00000000a07fffff
+[kernel 0.148 cpu0] iommu: rmrr0 scope pci-endpoint 00:02.0 id=0
+[kernel 0.148 cpu0] file cache: budget 63848 pages (249 MiB)
+[kernel 0.148 cpu0] gpt: the boot volume names AE536145-DEFE-4831-B9C3-CF6D92C34460 as the log partition
+[kernel 0.148 cpu0] gpt: firmware booted us from partition FCE2DCC0-B4E9-4879-915A-07F60677B60A at LBA 2048+181136
+[kernel 0.148 cpu0] NVMe: found at PCI 04:00.0
+[kernel 0.148 cpu0] NVMe: BAR0=0xbce00000
+[kernel 0.148 cpu0] NVMe: controller enabled
+[kernel 0.148 cpu0] NVMe: NS1 size=500118192 sectors, sector_size=512
+[kernel 0.148 cpu0] NVMe: block device id=1 blocks=62514774 (244198MB)
+[kernel 0.149 cpu0] gpt: device 1 has 4 partitions and none of them is ours
+[kernel 0.149 cpu0] page cache: 62514774 device blocks, index sized for 7168 cached blocks, cap 4096 slots
+[kernel 0.149 cpu0] storage: no ToyOS volume and no designation stamp at block 0 — this disk is not ours and nothing will be written to it
+[kernel 0.149 cpu0] Boot: storage ready (83ms)
+[kernel 0.160 cpu0] xHCI: found at PCI 00:0d.0
+[kernel 0.160 cpu0] xHCI: BAR0=0x603dbb0000
+[kernel 0.160 cpu0] xHCI: MSI enabled (vector 0x21)
+[kernel 0.160 cpu0] xHCI: max_slots=64 max_ports=5 ctx_size=32 pagesize=0x1
+[kernel 0.160 cpu0] xHCI: dma 2048 KiB: scratchpad=34 device blocks=64 of 12288 B (max_slots=64)
+[kernel 0.160 cpu0] xHCI: firmware did not claim the controller (USBLEGSUP 0x01002201)
+[kernel 0.160 cpu0] xHCI: USBLEGCTLSTS 0xe0000000 -> 0x00000000 (SMI generation off)
+[kernel 0.160 cpu0] xHCI: USB 2.0 on ports 1..=1
+[kernel 0.160 cpu0] xHCI: USB 3.1 on ports 2..=5
+[kernel 0.160 cpu0] xHCI: 1 USB2 and 4 USB3 port register(s) of 5 named, 0 capability(ies) refused
+[kernel 0.160 cpu0] xHCI: controller reset
+[kernel 0.161 cpu0] xHCI: 34 scratchpad buffers configured
+[kernel 0.161 cpu0] xHCI: controller started
+[kernel 0.161 cpu0] xHCI: 5/5 root-hub ports powered (PPC=0)
+[kernel 0.161 cpu0] xHCI: found at PCI 00:14.0
+[kernel 0.161 cpu0] xHCI: BAR0=0x603dba0000
+[kernel 0.161 cpu0] xHCI: MSI enabled (vector 0x21)
+[kernel 0.161 cpu0] xHCI: max_slots=64 max_ports=16 ctx_size=32 pagesize=0x1
+[kernel 0.161 cpu0] xHCI: dma 2048 KiB: scratchpad=34 device blocks=64 of 12288 B (max_slots=64)
+[kernel 0.161 cpu0] xHCI: firmware did not claim the controller (USBLEGSUP 0x01002201)
+[kernel 0.161 cpu0] xHCI: USBLEGCTLSTS 0xe0000000 -> 0x00000000 (SMI generation off)
+[kernel 0.161 cpu0] xHCI: USB 2.0 on ports 1..=12
+[kernel 0.161 cpu0] xHCI: USB 3.1 on ports 13..=16
+[kernel 0.161 cpu0] xHCI: 12 USB2 and 4 USB3 port register(s) of 16 named, 0 capability(ies) refused
+[kernel 0.161 cpu0] xHCI: controller reset
+[kernel 0.161 cpu0] xHCI: 34 scratchpad buffers configured
+[kernel 0.161 cpu0] xHCI: controller started
+[kernel 0.161 cpu0] xHCI: 16/16 root-hub ports powered (PPC=0)
+[kernel 0.283 cpu0] xHCI: no HID devices on the controller at 00:0d.0
+[kernel 0.283 cpu0] xHCI: port 3 connected
+[kernel 0.338 cpu0] xHCI: port 3 enabled, speed=1
+[kernel 0.338 cpu0] xHCI: slot 1 enabled (dma +0x50000)
+[kernel 0.339 cpu0] xHCI: device addressed
+[kernel 0.339 cpu0] xHCI: device class=0xff vendor=06cb product=00bd
+[kernel 0.339 cpu0] xHCI: no HID boot interface found on port 3, skipping it
+[kernel 0.339 cpu0] xHCI: port 4 connected
+[kernel 0.394 cpu0] xHCI: port 4 enabled, speed=3
+[kernel 0.394 cpu0] xHCI: slot 2 enabled (dma +0x53000)
+[kernel 0.394 cpu0] xHCI: device addressed
+[kernel 0.394 cpu0] xHCI: device class=0xef vendor=13d3 product=5406
+[kernel 0.395 cpu0] xHCI: no HID boot interface found on port 4, skipping it
+[kernel 0.395 cpu0] xHCI: port 6 connected
+[kernel 0.497 cpu0] xHCI: port 6 enabled, speed=3
+[kernel 0.497 cpu0] xHCI: slot 3 enabled (dma +0x56000)
+[kernel 0.558 cpu0] xHCI: device addressed
+[kernel 0.558 cpu0] xHCI: device class=0x0 vendor=0781 product=5581
+[kernel 0.558 cpu0] xHCI: mass storage iface=0 in=0x81/512 out=0x2/512
+[kernel 0.558 cpu0] xHCI: configuration set
+[kernel 0.558 cpu0] xHCI: endpoint configured
+[kernel 0.559 cpu0] usb-storage: slot 3 vendor "SanDisk." product "Ultra..........."
+[kernel 0.559 cpu0] usb-storage: disk 0 ready on slot 3, 7507812 blocks of 512 B (29327 MiB), msc_block +0x30000
+[kernel 0.559 cpu0] xHCI: port 9 connected
+[kernel 0.614 cpu0] xHCI: port 9 enabled, speed=1
+[kernel 0.614 cpu0] xHCI: slot 4 enabled (dma +0x59000)
+[kernel 0.615 cpu0] xHCI: device addressed
+[kernel 0.615 cpu0] xHCI: device class=0x0 vendor=058f product=9540
+[kernel 0.620 cpu0] xHCI: no HID boot interface found on port 9, skipping it
+[kernel 0.620 cpu0] xHCI: port 10 connected
+[kernel 0.675 cpu0] xHCI: port 10 enabled, speed=1
+[kernel 0.675 cpu0] xHCI: slot 5 enabled (dma +0x5c000)
+[kernel 0.676 cpu0] xHCI: device addressed
+[kernel 0.676 cpu0] xHCI: port 10 EP0 packet size 8 -> 64
+[kernel 0.676 cpu0] xHCI: device class=0xe0 vendor=8087 product=0032
+[kernel 0.676 cpu0] xHCI: no HID boot interface found on port 10, skipping it
+[kernel 0.676 cpu0] xHCI: no HID devices on the controller at 00:14.0
+[kernel 0.676 cpu0] xHCI: 2 controller(s), 0 HID device(s)
+[kernel 0.676 cpu0] usb-storage: 1 device(s)
+[kernel 0.688 cpu0] gpt: device 16 carries the log partition AE536145-DEFE-4831-B9C3-CF6D92C34460 at LBA 184320+69632, entry 1 of 2
+[kernel 0.688 cpu0] gpt: device 16 carries the boot partition at LBA 2048+181136 (512-byte blocks), entry 0 of 2 on disk 6132B94B-D792-4199-A7BA-954CE184A20C
+[kernel 0.688 cpu0] i8042: FADT rev 6 iapc_boot_arch=0x0011, bit 1 (8042) clear — probing either way
+[kernel 0.689 cpu0] i8042: ok selftest=0x55 cfg=0x77->0x64 port1=ok port2=ok
+[kernel 0.690 cpu0] i8042: kbd will not report its scancode set (0xF0 0x00 answered 0xee); firmware's own cfg 0x77 has translate on, so the wire is set 1
+[kernel 1.082 cpu0] i8042: kbd set2+xlat (assumed, the set query was refused) scanning on, GSI 1 -> vec 0x24 apic 0 on
+[kernel 1.082 cpu0] i8042: aux rate=100 res=8/mm, GSI 12 -> vec 0x24 apic 0
+[kernel 1.082 cpu0] ACPI: PM1a=0x1804 SLP_TYPa=7
+[kernel 1.082 cpu0] Boot: peripherals ready (921ms)
+[kernel 1.104 cpu0] SMP: AP cpu1 lapic=2 online
+[kernel 1.117 cpu0] SMP: AP cpu2 lapic=4 online
+[kernel 1.129 cpu0] SMP: AP cpu3 lapic=6 online
+[kernel 1.141 cpu0] SMP: AP cpu4 lapic=1 online
+[kernel 1.153 cpu0] SMP: AP cpu5 lapic=3 online
+[kernel 1.165 cpu0] SMP: AP cpu6 lapic=5 online
+[kernel 1.178 cpu0] SMP: AP cpu7 lapic=7 online
+[kernel 1.178 cpu0] storage: /home is a tmpfs — it will not survive a reboot
+[kernel 1.178 cpu0] boot-volume: partition mounted, 92741632 bytes of a 92741632-byte partition at device offset 1048576, 512-byte sectors, 512-byte clusters, 178340 clusters
+[kernel 1.179 cpu0] log-volume: partition mounted, 35651584 bytes of a 35651584-byte partition at device offset 94371840, 512-byte sectors, 512-byte clusters, 68552 clusters
+[kernel 1.192 cpu0] log-file: this boot's kernel log is /log/2026-08-08-120017.log
+[kernel 1.192 cpu0] Boot: subsystems ready (99ms)
+[kernel 1.205 cpu0] virtio-console: no device found
+[kernel 1.209 cpu0] VirtIO net: no device found
+[kernel 1.218 cpu0] hda: 00:1f.3 8086:a0c8 version 1.0 gcap=0x9701 statests=0x0005
+[kernel 1.218 cpu0] hda: 00:1f.3 bound, statests=0x0005, output stream 7 at 0x160, tag 1, 8 periods of 512 bytes
+[kernel 1.222 cpu0] GPU: using UEFI GOP
+[kernel 1.222 cpu0] GOP: 1920x1080 stride=1920 format=1 at 0x4000000000 tokens=[SharedToken(2), SharedToken(3)]
+[kernel 1.222 cpu0] GOP: scanout memory type WC (MTRR UC, PAT entry 4)
+[kernel 1.222 cpu0] mouse: rel scale x=36 y=64 (screen 1920x1080)
+[kernel 1.222 cpu0] Boot: devices ready (20ms)
+[kernel 1.234 cpu0] ELF: 9110 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 1.234 cpu0] spawn: TLS 1 modules, total_memsz=144
+[kernel 1.235 cpu0] spawn: /bin/compositor pid=0 tid=0 base=0x10000000000 entry=0x100001e81e4 cr3=0x1e24000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=2ms)
+[kernel 1.235 cpu0] spawned /bin/compositor pid=0
+[kernel 1.235 cpu0] ELF: 3162 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 1.235 cpu0] spawn: TLS 1 modules, total_memsz=144
+[kernel 1.236 cpu0] spawn: /bin/soundd pid=1 tid=0 base=0x10000000000 entry=0x10000038b04 cr3=0xdf9000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=0ms total=1ms)
+[kernel 1.236 cpu0] spawned /bin/soundd pid=1
+[kernel 1.237 cpu0] ELF: 3167 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 1.237 cpu0] spawn: TLS 1 modules, total_memsz=144
+[kernel 1.237 cpu0] spawn: /bin/netd pid=2 tid=0 base=0x10000000000 entry=0x1000003a0a4 cr3=0x1e57000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=0ms total=1ms)
+[kernel 1.237 cpu0] spawned /bin/netd pid=2
+[kernel 1.237 cpu0] log: no serial console - this boot is in /log/2026-08-08-120017.log and on the screen
+[kernel 1.237 cpu0] Boot: complete (1237ms)
+[kernel 1.246 cpu4] CPU 4: joining scheduler
+[kernel 1.246 cpu5] CPU 5: joining scheduler
+[kernel 1.246 cpu1] CPU 1: joining scheduler
+[kernel 1.246 cpu0] sched: cpu=0 ready=0 parked=0 current=None
+[kernel 1.246 cpu6] CPU 6: joining scheduler
+[kernel 1.246 cpu7] CPU 7: joining scheduler
+[kernel 1.246 cpu3] CPU 3: joining scheduler
+[kernel 1.246 cpu4] sched: cpu=4 ready=0 parked=0 current=None
+[kernel 1.246 cpu5] sched: cpu=5 ready=0 parked=0 current=None
+[kernel 1.246 cpu1] sched: cpu=1 ready=0 parked=0 current=None
+[kernel 1.246 cpu6] sched: cpu=6 ready=0 parked=0 current=None
+[kernel 1.246 cpu2] CPU 2: joining scheduler
+[kernel 1.246 cpu3] sched: cpu=3 ready=0 parked=0 current=None
+[kernel 1.246 cpu7] sched: cpu=7 ready=0 parked=0 current=None
+[kernel 1.246 cpu2] sched: cpu=2 ready=0 parked=0 current=None
+[kernel 1.246 cpu6] i8042: armed at 1082ms, idle at 1246ms, 0 interrupts — the pin has never asserted (kbd GSI 1, aux GSI 12)
+netd: no NIC on this machine, exiting
+[kernel 1.248 cpu2 tid=0] syscalls: pid=2 total=7 syscall_wall=0ms 0=1 6=1 31=1 63=1
+[kernel 1.248 cpu2 tid=0] memory: pid=2 peak=2MB allocs=2 frees=0
+[kernel 1.248 cpu2 tid=0] exit: netd pid=2 code=0 cpu=1ms
+soundd: hda codec0 vendor=10ec device=0257, 1 function group(s)
+soundd: hda codec2 vendor=8086 device=2812, 1 function group(s)
+soundd: hda codec0 group 0x01 converter 0x02 -> pin 0x14 (speaker), headphone 0x21, format 0x2011 (44100 Hz 2 ch 16-bit)
+soundd: hda path configured in 14 verbs, stream tag 1
+soundd: ready, 8 buffers, 44100Hz 2ch, 512 bytes/period, 128 frames/period
+soundd: suspended
+[kernel 1.404 cpu0] usb-storage: disk 0 does not implement SYNCHRONIZE CACHE (sense 0x05/0x20/0x00); its writes are durable once they complete
+[kernel 1.405 cpu0 tid=0] shm: 0x4000000000 mapped WriteCombining into pid 0
+[kernel 1.504 cpu4] heartbeat: t=1.504s alive=8/8 mask=0xff ran=4 gap=0.257s
+[kernel 1.504 cpu4] i8042: line status=0x1c irqs=0 bytes=0 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+compositor: wallpaper 1920x1080, scaling to 1920x1080
+compositor: at most 221 windows (8 MiB each of 15962 MiB total)
+compositor: ready
+[kernel 1.581 cpu0 tid=0] ELF: 3548 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 1.581 cpu0 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 1.582 cpu0 tid=0] spawn: /bin/filepicker pid=3 tid=0 base=0x10000000000 entry=0x10000017df4 cr3=0x1e57000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=1ms)
+[kernel 1.762 cpu2] heartbeat: t=1.762s alive=8/8 mask=0xff ran=11 gap=0.257s
+[kernel 1.762 cpu2] i8042: line status=0x1c irqs=0 bytes=0 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 2.019 cpu0] heartbeat: t=2.019s alive=8/8 mask=0xff ran=15 gap=0.257s
+[kernel 2.019 cpu0] i8042: line status=0x1c irqs=0 bytes=0 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 2.271 cpu0] heartbeat: t=2.271s alive=8/8 mask=0xff ran=13 gap=0.252s
+[kernel 2.271 cpu0] i8042: line status=0x1c irqs=0 bytes=0 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 2.530 cpu0] heartbeat: t=2.530s alive=8/8 mask=0xff ran=13 gap=0.258s
+[kernel 2.530 cpu0] i8042: line status=0x1c irqs=0 bytes=0 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 2.787 cpu0] heartbeat: t=2.787s alive=8/8 mask=0xff ran=13 gap=0.257s
+[kernel 2.787 cpu0] i8042: line status=0x1c irqs=0 bytes=0 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 3.047 cpu0] heartbeat: t=3.047s alive=8/8 mask=0xff ran=14 gap=0.260s
+[kernel 3.047 cpu0] i8042: line status=0x1c irqs=0 bytes=0 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 3.301 cpu0] heartbeat: t=3.301s alive=8/8 mask=0xff ran=13 gap=0.253s
+[kernel 3.301 cpu0] i8042: line status=0x1c irqs=0 bytes=0 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 3.416 cpu0] i8042: the pin asserts — 1 interrupts, 1 bytes, 1 keys, 0 motion, first seen at 3416ms
+[kernel 3.552 cpu0] heartbeat: t=3.552s alive=8/8 mask=0xff ran=14 gap=0.251s
+[kernel 3.552 cpu0] i8042: line status=0x1c irqs=2 bytes=1 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 3.574 cpu0 tid=0] ELF: 3609 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 3.574 cpu0 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 3.574 cpu0 tid=0] spawn: /bin/terminal pid=4 tid=0 base=0x10000000000 entry=0x1000001ec28 cr3=0x1ec6000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=1ms total=1ms)
+compositor: frames=3 rects=3 damage_px=2092544 damage_px_max=2073600 composite_us_min=74 composite_us_max=3065 composite_us_total=3214 scanout_wr_bytes=8370176 scanout_blits=3 back_rd_bytes=324808 cursor=1 windows=0
+[kernel 3.619 cpu5 tid=0] ELF: 2771 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 3.619 cpu5 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 3.619 cpu5 tid=0] spawn: /bin/shell pid=5 tid=0 base=0x10000000000 entry=0x1000001d93c cr3=0x1ec2000 symbols=2048KiB (layout=23ms relocs=0ms deps=0ms tls=0ms total=24ms)
+terminal: ready
+[kernel 3.807 cpu0] heartbeat: t=3.807s alive=8/8 mask=0xff ran=20 gap=0.255s
+[kernel 3.807 cpu0] i8042: line status=0x1c irqs=4 bytes=4 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 4.066 cpu0] heartbeat: t=4.066s alive=8/8 mask=0xff ran=15 gap=0.259s
+[kernel 4.066 cpu0] i8042: line status=0x1c irqs=4 bytes=4 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 4.321 cpu0] heartbeat: t=4.321s alive=8/8 mask=0xff ran=15 gap=0.255s
+[kernel 4.321 cpu0] i8042: line status=0x1c irqs=4 bytes=4 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 4.576 cpu0] heartbeat: t=4.576s alive=8/8 mask=0xff ran=15 gap=0.255s
+[kernel 4.576 cpu0] i8042: line status=0x1c irqs=4 bytes=4 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 4.830 cpu0] heartbeat: t=4.830s alive=8/8 mask=0xff ran=16 gap=0.253s
+[kernel 4.830 cpu0] i8042: line status=0x3c irqs=53 bytes=52 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 5.086 cpu0] heartbeat: t=5.086s alive=8/8 mask=0xff ran=17 gap=0.256s
+[kernel 5.086 cpu0] i8042: line status=0x3c irqs=110 bytes=109 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 5.340 cpu0] heartbeat: t=5.340s alive=8/8 mask=0xff ran=13 gap=0.253s
+[kernel 5.340 cpu0] i8042: line status=0x3c irqs=124 bytes=124 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 5.598 cpu0] heartbeat: t=5.598s alive=8/8 mask=0xff ran=15 gap=0.257s
+[kernel 5.598 cpu0] i8042: line status=0x3c irqs=149 bytes=148 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+compositor: frames=42 rects=64 damage_px=3604201 damage_px_max=1842560 composite_us_min=6 composite_us_max=3107 composite_us_total=6643 scanout_wr_bytes=14416804 scanout_blits=64 back_rd_bytes=762676 cursor=42 windows=1
+[kernel 5.852 cpu0] heartbeat: t=5.852s alive=8/8 mask=0xff ran=15 gap=0.254s
+[kernel 5.852 cpu0] i8042: line status=0x3c irqs=188 bytes=187 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 6.109 cpu2] heartbeat: t=6.109s alive=8/8 mask=0xff ran=14 gap=0.256s
+[kernel 6.109 cpu2] i8042: line status=0x3c irqs=211 bytes=211 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 6.365 cpu0] heartbeat: t=6.365s alive=8/8 mask=0xff ran=18 gap=0.255s
+[kernel 6.365 cpu0] i8042: line status=0x3c irqs=227 bytes=226 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 6.621 cpu0] heartbeat: t=6.621s alive=8/8 mask=0xff ran=16 gap=0.255s
+[kernel 6.621 cpu0] i8042: line status=0x3c irqs=254 bytes=253 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 6.886 cpu0] heartbeat: t=6.886s alive=8/8 mask=0xff ran=16 gap=0.265s
+[kernel 6.886 cpu0] i8042: line status=0x3c irqs=271 bytes=271 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 7.138 cpu0] heartbeat: t=7.138s alive=8/8 mask=0xff ran=13 gap=0.252s
+[kernel 7.138 cpu0] i8042: line status=0x3c irqs=271 bytes=271 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 7.392 cpu0] heartbeat: t=7.392s alive=8/8 mask=0xff ran=27 gap=0.253s
+[kernel 7.392 cpu0] i8042: line status=0x1c irqs=275 bytes=275 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 7.648 cpu0] heartbeat: t=7.648s alive=8/8 mask=0xff ran=28 gap=0.256s
+[kernel 7.648 cpu0] i8042: line status=0x1c irqs=279 bytes=279 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+compositor: frames=39 rects=57 damage_px=52758 damage_px_max=9912 composite_us_min=6 composite_us_max=77 composite_us_total=734 scanout_wr_bytes=211032 scanout_blits=57 back_rd_bytes=127796 cursor=34 windows=1
+[kernel 7.908 cpu0] heartbeat: t=7.908s alive=8/8 mask=0xff ran=14 gap=0.259s
+[kernel 7.908 cpu0] i8042: line status=0x1c irqs=279 bytes=279 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 8.169 cpu0] heartbeat: t=8.169s alive=8/8 mask=0xff ran=15 gap=0.261s
+[kernel 8.169 cpu0] i8042: line status=0x1c irqs=279 bytes=279 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 8.431 cpu0] heartbeat: t=8.431s alive=8/8 mask=0xff ran=15 gap=0.261s
+[kernel 8.431 cpu0] i8042: line status=0x1c irqs=279 bytes=279 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 8.690 cpu0] heartbeat: t=8.690s alive=8/8 mask=0xff ran=15 gap=0.259s
+[kernel 8.690 cpu0] i8042: line status=0x1c irqs=279 bytes=279 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+/home/root> tone
+[kernel 8.732 cpu6 tid=0] ELF: 3554 relocations indexed (RELATIVE + GLOB_DAT + TPOFF)
+[kernel 8.732 cpu6 tid=0] spawn: TLS 1 modules, total_memsz=144
+[kernel 8.732 cpu6 tid=0] spawn: /bin/tone pid=6 tid=0 base=0x10000000000 entry=0x1000002d4f4 cr3=0x1ebd000 symbols=2048KiB (layout=0ms relocs=0ms deps=0ms tls=0ms total=1ms)
+soundd: opening stream: 44100Hz 2ch fmt=0
+tone: 440Hz for 2s at amplitude 16000
+soundd: client 0 connected (id=0)
+soundd: resumed
+[kernel 8.985 cpu7] heartbeat: t=8.985s alive=8/8 mask=0xff ran=14 gap=0.295s
+[kernel 8.985 cpu7] i8042: line status=0x1c irqs=281 bytes=281 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 9.237 cpu7] heartbeat: t=9.237s alive=6/8 mask=0xfc ran=0 gap=0.252s
+[kernel 9.238 cpu7] i8042: line status=0x1c irqs=281 bytes=281 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 9.238 cpu7] heartbeat: cpu0 last reached one 0.494s ago
+[kernel 9.238 cpu7] heartbeat: cpu1 last reached one 0.440s ago
+[kernel 9.488 cpu7] heartbeat: t=9.488s alive=6/8 mask=0xfc ran=0 gap=0.250s
+[kernel 9.488 cpu7] i8042: line status=0x1c irqs=281 bytes=281 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 9.488 cpu7] heartbeat: cpu0 last reached one 0.745s ago
+[kernel 9.488 cpu7] heartbeat: cpu1 last reached one 0.690s ago
+[kernel 9.740 cpu2] heartbeat: t=9.740s alive=6/8 mask=0xfc ran=0 gap=0.251s
+[kernel 9.740 cpu2] i8042: line status=0x1c irqs=281 bytes=281 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 9.740 cpu2] heartbeat: cpu0 last reached one 0.997s ago
+[kernel 9.740 cpu2] heartbeat: cpu1 last reached one 0.942s ago
+[kernel 9.992 cpu3] heartbeat: t=9.992s alive=6/8 mask=0xfc ran=0 gap=0.251s
+[kernel 9.992 cpu3] i8042: line status=0x3c irqs=329 bytes=329 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 9.992 cpu3] heartbeat: cpu0 last reached one 1.248s ago
+[kernel 9.992 cpu3] heartbeat: cpu1 last reached one 1.194s ago
+[kernel 10.271 cpu2] heartbeat: t=10.271s alive=6/8 mask=0xfc ran=0 gap=0.279s
+[kernel 10.271 cpu2] i8042: line status=0x3c irqs=374 bytes=365 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 10.271 cpu2] heartbeat: cpu0 last reached one 1.528s ago
+[kernel 10.271 cpu2] heartbeat: cpu1 last reached one 1.473s ago
+[kernel 10.532 cpu3] heartbeat: t=10.532s alive=6/8 mask=0xfc ran=0 gap=0.260s
+[kernel 10.532 cpu3] i8042: line status=0x3c irqs=425 bytes=418 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 10.532 cpu3] heartbeat: cpu0 last reached one 1.788s ago
+[kernel 10.532 cpu3] heartbeat: cpu1 last reached one 1.734s ago
+[kernel 10.796 cpu2] heartbeat: t=10.796s alive=6/8 mask=0xfc ran=0 gap=0.264s
+[kernel 10.796 cpu2] i8042: line status=0x3c irqs=458 bytes=458 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 10.796 cpu2] heartbeat: cpu0 last reached one 2.053s ago
+[kernel 10.796 cpu2] heartbeat: cpu1 last reached one 1.998s ago
+[kernel 11.063 cpu3] heartbeat: t=11.063s alive=6/8 mask=0xfc ran=0 gap=0.267s
+[kernel 11.063 cpu3] i8042: line status=0x3c irqs=485 bytes=478 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 11.063 cpu3] heartbeat: cpu0 last reached one 2.320s ago
+[kernel 11.063 cpu3] heartbeat: cpu1 last reached one 2.265s ago
+[kernel 11.277 cpu3] sched: cpu=3 ready=0 parked=1 current=None
+[kernel 11.277 cpu3] PMM: 212/15962MB used (7875 pages free)
+[kernel 11.277 cpu3]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 11.277 cpu3]   demand-page  alloc=     8 free=     1 held=     7 (14MB) rate=0/s
+[kernel 11.277 cpu3]   mmap         alloc=    30 free=     1 held=    29 (58MB) rate=0/s
+[kernel 11.277 cpu3]   shared-mem   alloc=    10 free=     0 held=    10 (20MB) rate=0/s
+[kernel 11.277 cpu3]   pipe         alloc=     9 free=     0 held=     9 (18MB) rate=0/s
+[kernel 11.277 cpu3]   elf          alloc=     7 free=     1 held=     6 (12MB) rate=0/s
+[kernel 11.277 cpu3]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 11.277 cpu3]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 11.277 cpu3]   stack        alloc=    28 free=     4 held=    24 (48MB) rate=0/s
+[kernel 11.277 cpu3]   init-tls     alloc=     9 free=     1 held=     8 (16MB) rate=0/s
+[kernel 11.316 cpu2] sched: cpu=2 ready=0 parked=0 current=None
+[kernel 11.316 cpu2] heartbeat: t=11.316s alive=6/8 mask=0xfc ran=0 gap=0.252s
+[kernel 11.316 cpu2] i8042: line status=0x3c irqs=536 bytes=524 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 11.316 cpu2] heartbeat: cpu0 last reached one 2.572s ago
+[kernel 11.316 cpu2] heartbeat: cpu1 last reached one 2.518s ago
+[kernel 11.333 cpu5] sched: cpu=5 ready=0 parked=1 current=None
+[kernel 11.333 cpu6] sched: cpu=6 ready=0 parked=1 current=None
+[kernel 11.334 cpu4] sched: cpu=4 ready=0 parked=1 current=None
+[kernel 11.334 cpu7] sched: cpu=7 ready=0 parked=1 current=None
+[kernel 11.608 cpu7] heartbeat: t=11.608s alive=6/8 mask=0xfc ran=0 gap=0.292s
+[kernel 11.608 cpu7] i8042: line status=0x3c irqs=560 bytes=560 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 11.608 cpu7] heartbeat: cpu0 last reached one 2.865s ago
+[kernel 11.608 cpu7] heartbeat: cpu1 last reached one 2.810s ago
+[kernel 11.940 cpu4] heartbeat: t=11.940s alive=6/8 mask=0xfc ran=0 gap=0.331s
+[kernel 11.940 cpu4] i8042: line status=0x3c irqs=600 bytes=600 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 11.940 cpu4] heartbeat: cpu0 last reached one 3.197s ago
+[kernel 11.940 cpu4] heartbeat: cpu1 last reached one 3.142s ago
+[kernel 12.212 cpu7] heartbeat: t=12.212s alive=6/8 mask=0xfc ran=0 gap=0.272s
+[kernel 12.212 cpu7] i8042: line status=0x3c irqs=659 bytes=649 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 12.212 cpu7] heartbeat: cpu0 last reached one 3.469s ago
+[kernel 12.212 cpu7] heartbeat: cpu1 last reached one 3.414s ago
+[kernel 12.471 cpu5] heartbeat: t=12.471s alive=6/8 mask=0xfc ran=0 gap=0.259s
+[kernel 12.471 cpu5] i8042: line status=0x3c irqs=674 bytes=674 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 12.472 cpu5] heartbeat: cpu0 last reached one 3.728s ago
+[kernel 12.472 cpu5] heartbeat: cpu1 last reached one 3.673s ago
+[kernel 12.740 cpu3] heartbeat: t=12.740s alive=6/8 mask=0xfc ran=0 gap=0.268s
+[kernel 12.740 cpu3] i8042: line status=0x3c irqs=731 bytes=721 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 12.740 cpu3] heartbeat: cpu0 last reached one 3.997s ago
+[kernel 12.740 cpu3] heartbeat: cpu1 last reached one 3.942s ago
+[kernel 12.992 cpu7] heartbeat: t=12.992s alive=6/8 mask=0xfc ran=0 gap=0.252s
+[kernel 12.992 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 12.992 cpu7] heartbeat: cpu0 last reached one 4.249s ago
+[kernel 12.992 cpu7] heartbeat: cpu1 last reached one 4.194s ago
+[kernel 13.261 cpu6] heartbeat: t=13.261s alive=6/8 mask=0xfc ran=0 gap=0.268s
+[kernel 13.261 cpu6] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 13.261 cpu6] heartbeat: cpu0 last reached one 4.518s ago
+[kernel 13.261 cpu6] heartbeat: cpu1 last reached one 4.463s ago
+[kernel 13.440 cpu2] i8042: 764 interrupts, 764 bytes, 14 keys, 248 motion, 6 undecoded, 0 discarded, 0 overruns, 0 dropped, 0 lost edges — last byte at 12914ms
+[kernel 13.512 cpu7] heartbeat: t=13.512s alive=6/8 mask=0xfc ran=0 gap=0.250s
+[kernel 13.512 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 13.512 cpu7] heartbeat: cpu0 last reached one 4.769s ago
+[kernel 13.512 cpu7] heartbeat: cpu1 last reached one 4.714s ago
+[kernel 13.772 cpu4] heartbeat: t=13.772s alive=6/8 mask=0xfc ran=0 gap=0.259s
+[kernel 13.772 cpu4] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 13.772 cpu4] heartbeat: cpu0 last reached one 5.028s ago
+[kernel 13.772 cpu4] heartbeat: cpu1 last reached one 4.974s ago
+[kernel 14.061 cpu2] heartbeat: t=14.061s alive=6/8 mask=0xfc ran=0 gap=0.289s
+[kernel 14.061 cpu2] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 14.061 cpu2] heartbeat: cpu0 last reached one 5.318s ago
+[kernel 14.061 cpu2] heartbeat: cpu1 last reached one 5.263s ago
+[kernel 14.321 cpu7] heartbeat: t=14.321s alive=6/8 mask=0xfc ran=0 gap=0.259s
+[kernel 14.321 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 14.321 cpu7] heartbeat: cpu0 last reached one 5.578s ago
+[kernel 14.321 cpu7] heartbeat: cpu1 last reached one 5.523s ago
+[kernel 14.572 cpu7] heartbeat: t=14.572s alive=6/8 mask=0xfc ran=0 gap=0.250s
+[kernel 14.572 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 14.572 cpu7] heartbeat: cpu0 last reached one 5.829s ago
+[kernel 14.572 cpu7] heartbeat: cpu1 last reached one 5.774s ago
+[kernel 14.822 cpu2] heartbeat: t=14.822s alive=6/8 mask=0xfc ran=0 gap=0.250s
+[kernel 14.822 cpu2] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 14.822 cpu2] heartbeat: cpu0 last reached one 6.079s ago
+[kernel 14.822 cpu2] heartbeat: cpu1 last reached one 6.024s ago
+[kernel 15.076 cpu6] heartbeat: t=15.076s alive=6/8 mask=0xfc ran=0 gap=0.253s
+[kernel 15.076 cpu6] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 15.076 cpu6] heartbeat: cpu0 last reached one 6.332s ago
+[kernel 15.076 cpu6] heartbeat: cpu1 last reached one 6.278s ago
+[kernel 15.361 cpu3] heartbeat: t=15.361s alive=6/8 mask=0xfc ran=0 gap=0.285s
+[kernel 15.361 cpu3] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 15.362 cpu3] heartbeat: cpu0 last reached one 6.618s ago
+[kernel 15.362 cpu3] heartbeat: cpu1 last reached one 6.563s ago
+[kernel 15.616 cpu6] heartbeat: t=15.616s alive=6/8 mask=0xfc ran=0 gap=0.254s
+[kernel 15.616 cpu6] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 15.616 cpu6] heartbeat: cpu0 last reached one 6.872s ago
+[kernel 15.616 cpu6] heartbeat: cpu1 last reached one 6.818s ago
+[kernel 15.867 cpu2] heartbeat: t=15.867s alive=6/8 mask=0xfc ran=0 gap=0.251s
+[kernel 15.867 cpu2] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 15.868 cpu2] heartbeat: cpu0 last reached one 7.124s ago
+[kernel 15.868 cpu2] heartbeat: cpu1 last reached one 7.069s ago
+[kernel 16.151 cpu6] heartbeat: t=16.151s alive=6/8 mask=0xfc ran=0 gap=0.283s
+[kernel 16.151 cpu6] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 16.151 cpu6] heartbeat: cpu0 last reached one 7.407s ago
+[kernel 16.151 cpu6] heartbeat: cpu1 last reached one 7.353s ago
+[kernel 16.409 cpu7] heartbeat: t=16.409s alive=6/8 mask=0xfc ran=0 gap=0.258s
+[kernel 16.409 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 16.409 cpu7] heartbeat: cpu0 last reached one 7.666s ago
+[kernel 16.409 cpu7] heartbeat: cpu1 last reached one 7.611s ago
+[kernel 16.667 cpu6] heartbeat: t=16.667s alive=6/8 mask=0xfc ran=0 gap=0.257s
+[kernel 16.667 cpu6] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 16.667 cpu6] heartbeat: cpu0 last reached one 7.923s ago
+[kernel 16.667 cpu6] heartbeat: cpu1 last reached one 7.869s ago
+[kernel 16.923 cpu7] heartbeat: t=16.923s alive=6/8 mask=0xfc ran=0 gap=0.256s
+[kernel 16.923 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 16.923 cpu7] heartbeat: cpu0 last reached one 8.180s ago
+[kernel 16.923 cpu7] heartbeat: cpu1 last reached one 8.125s ago
+[kernel 17.176 cpu4] heartbeat: t=17.176s alive=6/8 mask=0xfc ran=0 gap=0.253s
+[kernel 17.176 cpu4] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 17.176 cpu4] heartbeat: cpu0 last reached one 8.433s ago
+[kernel 17.176 cpu4] heartbeat: cpu1 last reached one 8.378s ago
+[kernel 17.428 cpu7] heartbeat: t=17.428s alive=6/8 mask=0xfc ran=0 gap=0.251s
+[kernel 17.428 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 17.428 cpu7] heartbeat: cpu0 last reached one 8.685s ago
+[kernel 17.428 cpu7] heartbeat: cpu1 last reached one 8.630s ago
+[kernel 17.686 cpu6] heartbeat: t=17.686s alive=6/8 mask=0xfc ran=0 gap=0.258s
+[kernel 17.686 cpu6] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 17.686 cpu6] heartbeat: cpu0 last reached one 8.943s ago
+[kernel 17.686 cpu6] heartbeat: cpu1 last reached one 8.888s ago
+[kernel 17.968 cpu7] heartbeat: t=17.968s alive=6/8 mask=0xfc ran=0 gap=0.282s
+[kernel 17.968 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 17.968 cpu7] heartbeat: cpu0 last reached one 9.225s ago
+[kernel 17.968 cpu7] heartbeat: cpu1 last reached one 9.170s ago
+[kernel 18.233 cpu6] heartbeat: t=18.233s alive=6/8 mask=0xfc ran=0 gap=0.264s
+[kernel 18.233 cpu6] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 18.233 cpu6] heartbeat: cpu0 last reached one 9.490s ago
+[kernel 18.233 cpu6] heartbeat: cpu1 last reached one 9.435s ago
+[kernel 18.487 cpu2] heartbeat: t=18.487s alive=6/8 mask=0xfc ran=0 gap=0.254s
+[kernel 18.487 cpu2] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 18.487 cpu2] heartbeat: cpu0 last reached one 9.744s ago
+[kernel 18.487 cpu2] heartbeat: cpu1 last reached one 9.689s ago
+[kernel 18.763 cpu6] heartbeat: t=18.763s alive=6/8 mask=0xfc ran=0 gap=0.275s
+[kernel 18.763 cpu6] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 18.763 cpu6] heartbeat: cpu0 last reached one 10.020s ago
+[kernel 18.763 cpu6] heartbeat: cpu1 last reached one 9.965s ago
+[kernel 19.014 cpu7] heartbeat: t=19.014s alive=6/8 mask=0xfc ran=0 gap=0.251s
+[kernel 19.014 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 19.014 cpu7] heartbeat: cpu0 last reached one 10.271s ago
+[kernel 19.014 cpu7] heartbeat: cpu1 last reached one 10.216s ago
+[kernel 19.288 cpu6] heartbeat: t=19.288s alive=6/8 mask=0xfc ran=0 gap=0.273s
+[kernel 19.288 cpu6] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 19.288 cpu6] heartbeat: cpu0 last reached one 10.544s ago
+[kernel 19.288 cpu6] heartbeat: cpu1 last reached one 10.490s ago
+[kernel 19.544 cpu7] heartbeat: t=19.544s alive=6/8 mask=0xfc ran=0 gap=0.256s
+[kernel 19.544 cpu7] i8042: line status=0x3c irqs=764 bytes=764 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 19.544 cpu7] heartbeat: cpu0 last reached one 10.800s ago
+[kernel 19.544 cpu7] heartbeat: cpu1 last reached one 10.746s ago
+[kernel 19.796 cpu5] heartbeat: t=19.796s alive=6/8 mask=0xfc ran=0 gap=0.252s
+[kernel 19.796 cpu5] i8042: line status=0x3c irqs=776 bytes=773 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 19.796 cpu5] heartbeat: cpu0 last reached one 11.053s ago
+[kernel 19.796 cpu5] heartbeat: cpu1 last reached one 10.998s ago
+[kernel 20.058 cpu7] heartbeat: t=20.058s alive=6/8 mask=0xfc ran=0 gap=0.261s
+[kernel 20.058 cpu7] i8042: line status=0x3c irqs=837 bytes=833 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 20.058 cpu7] heartbeat: cpu0 last reached one 11.315s ago
+[kernel 20.058 cpu7] heartbeat: cpu1 last reached one 11.260s ago
+[kernel 20.324 cpu2] heartbeat: t=20.324s alive=6/8 mask=0xfc ran=0 gap=0.266s
+[kernel 20.324 cpu2] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 20.324 cpu2] heartbeat: cpu0 last reached one 11.581s ago
+[kernel 20.324 cpu2] heartbeat: cpu1 last reached one 11.526s ago
+[kernel 20.588 cpu3] heartbeat: t=20.588s alive=6/8 mask=0xfc ran=0 gap=0.264s
+[kernel 20.588 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 20.589 cpu3] heartbeat: cpu0 last reached one 11.845s ago
+[kernel 20.589 cpu3] heartbeat: cpu1 last reached one 11.790s ago
+[kernel 20.839 cpu3] heartbeat: t=20.839s alive=6/8 mask=0xfc ran=0 gap=0.250s
+[kernel 20.839 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 20.839 cpu3] heartbeat: cpu0 last reached one 12.095s ago
+[kernel 20.839 cpu3] heartbeat: cpu1 last reached one 12.041s ago
+[kernel 21.104 cpu6] heartbeat: t=21.104s alive=6/8 mask=0xfc ran=0 gap=0.264s
+[kernel 21.104 cpu6] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 21.104 cpu6] heartbeat: cpu0 last reached one 12.360s ago
+[kernel 21.104 cpu6] heartbeat: cpu1 last reached one 12.306s ago
+[kernel 21.285 cpu3] sched: cpu=3 ready=0 parked=1 current=None
+[kernel 21.285 cpu3] PMM: 212/15962MB used (7875 pages free)
+[kernel 21.285 cpu3]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 21.285 cpu3]   demand-page  alloc=     8 free=     1 held=     7 (14MB) rate=0/s
+[kernel 21.285 cpu3]   mmap         alloc=    30 free=     1 held=    29 (58MB) rate=0/s
+[kernel 21.285 cpu3]   shared-mem   alloc=    10 free=     0 held=    10 (20MB) rate=0/s
+[kernel 21.285 cpu3]   pipe         alloc=     9 free=     0 held=     9 (18MB) rate=0/s
+[kernel 21.285 cpu3]   elf          alloc=     7 free=     1 held=     6 (12MB) rate=0/s
+[kernel 21.285 cpu3]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 21.285 cpu3]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 21.285 cpu3]   stack        alloc=    28 free=     4 held=    24 (48MB) rate=0/s
+[kernel 21.285 cpu3]   init-tls     alloc=     9 free=     1 held=     8 (16MB) rate=0/s
+[kernel 21.334 cpu4] sched: cpu=4 ready=0 parked=1 current=None
+[kernel 21.349 cpu6] sched: cpu=6 ready=0 parked=1 current=None
+[kernel 21.354 cpu6] heartbeat: t=21.354s alive=6/8 mask=0xfc ran=0 gap=0.250s
+[kernel 21.354 cpu6] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 21.354 cpu6] heartbeat: cpu0 last reached one 12.610s ago
+[kernel 21.354 cpu6] heartbeat: cpu1 last reached one 12.556s ago
+[kernel 21.373 cpu2] sched: cpu=2 ready=0 parked=0 current=None
+[kernel 21.373 cpu7] sched: cpu=7 ready=0 parked=1 current=None
+[kernel 21.405 cpu5] sched: cpu=5 ready=0 parked=1 current=None
+[kernel 21.613 cpu3] heartbeat: t=21.613s alive=6/8 mask=0xfc ran=0 gap=0.259s
+[kernel 21.613 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 21.613 cpu3] heartbeat: cpu0 last reached one 12.870s ago
+[kernel 21.613 cpu3] heartbeat: cpu1 last reached one 12.815s ago
+[kernel 21.866 cpu4] heartbeat: t=21.866s alive=6/8 mask=0xfc ran=0 gap=0.252s
+[kernel 21.866 cpu4] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 21.866 cpu4] heartbeat: cpu0 last reached one 13.123s ago
+[kernel 21.866 cpu4] heartbeat: cpu1 last reached one 13.068s ago
+[kernel 22.127 cpu3] heartbeat: t=22.127s alive=6/8 mask=0xfc ran=0 gap=0.261s
+[kernel 22.127 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 22.127 cpu3] heartbeat: cpu0 last reached one 13.384s ago
+[kernel 22.127 cpu3] heartbeat: cpu1 last reached one 13.329s ago
+[kernel 22.385 cpu7] heartbeat: t=22.385s alive=6/8 mask=0xfc ran=0 gap=0.258s
+[kernel 22.385 cpu7] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 22.385 cpu7] heartbeat: cpu0 last reached one 13.642s ago
+[kernel 22.385 cpu7] heartbeat: cpu1 last reached one 13.587s ago
+[kernel 22.645 cpu7] heartbeat: t=22.645s alive=6/8 mask=0xfc ran=0 gap=0.259s
+[kernel 22.645 cpu7] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 22.645 cpu7] heartbeat: cpu0 last reached one 13.901s ago
+[kernel 22.645 cpu7] heartbeat: cpu1 last reached one 13.847s ago
+[kernel 22.901 cpu2] heartbeat: t=22.901s alive=6/8 mask=0xfc ran=0 gap=0.256s
+[kernel 22.901 cpu2] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 22.901 cpu2] heartbeat: cpu0 last reached one 14.158s ago
+[kernel 22.901 cpu2] heartbeat: cpu1 last reached one 14.103s ago
+[kernel 23.175 cpu4] heartbeat: t=23.175s alive=6/8 mask=0xfc ran=0 gap=0.273s
+[kernel 23.175 cpu4] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 23.175 cpu4] heartbeat: cpu0 last reached one 14.432s ago
+[kernel 23.175 cpu4] heartbeat: cpu1 last reached one 14.377s ago
+[kernel 23.432 cpu5] heartbeat: t=23.432s alive=6/8 mask=0xfc ran=0 gap=0.256s
+[kernel 23.432 cpu5] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 23.432 cpu5] heartbeat: cpu0 last reached one 14.688s ago
+[kernel 23.432 cpu5] heartbeat: cpu1 last reached one 14.634s ago
+[kernel 23.448 cpu2] i8042: 860 interrupts, 860 bytes, 14 keys, 279 motion, 9 undecoded, 0 discarded, 0 overruns, 0 dropped, 0 lost edges — last byte at 20149ms
+[kernel 23.685 cpu6] heartbeat: t=23.685s alive=6/8 mask=0xfc ran=0 gap=0.253s
+[kernel 23.685 cpu6] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 23.686 cpu6] heartbeat: cpu0 last reached one 14.942s ago
+[kernel 23.686 cpu6] heartbeat: cpu1 last reached one 14.887s ago
+[kernel 23.972 cpu5] heartbeat: t=23.972s alive=6/8 mask=0xfc ran=0 gap=0.286s
+[kernel 23.972 cpu5] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 23.972 cpu5] heartbeat: cpu0 last reached one 15.228s ago
+[kernel 23.972 cpu5] heartbeat: cpu1 last reached one 15.174s ago
+[kernel 24.232 cpu3] heartbeat: t=24.232s alive=6/8 mask=0xfc ran=0 gap=0.260s
+[kernel 24.232 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 24.232 cpu3] heartbeat: cpu0 last reached one 15.489s ago
+[kernel 24.232 cpu3] heartbeat: cpu1 last reached one 15.434s ago
+[kernel 24.493 cpu5] heartbeat: t=24.493s alive=6/8 mask=0xfc ran=0 gap=0.260s
+[kernel 24.493 cpu5] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 24.493 cpu5] heartbeat: cpu0 last reached one 15.750s ago
+[kernel 24.493 cpu5] heartbeat: cpu1 last reached one 15.695s ago
+[kernel 24.762 cpu3] heartbeat: t=24.762s alive=6/8 mask=0xfc ran=0 gap=0.269s
+[kernel 24.762 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 24.762 cpu3] heartbeat: cpu0 last reached one 16.019s ago
+[kernel 24.762 cpu3] heartbeat: cpu1 last reached one 15.964s ago
+[kernel 25.020 cpu6] heartbeat: t=25.020s alive=6/8 mask=0xfc ran=0 gap=0.258s
+[kernel 25.020 cpu6] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 25.021 cpu6] heartbeat: cpu0 last reached one 16.277s ago
+[kernel 25.021 cpu6] heartbeat: cpu1 last reached one 16.223s ago
+[kernel 25.273 cpu3] heartbeat: t=25.273s alive=6/8 mask=0xfc ran=0 gap=0.252s
+[kernel 25.273 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 25.273 cpu3] heartbeat: cpu0 last reached one 16.530s ago
+[kernel 25.273 cpu3] heartbeat: cpu1 last reached one 16.475s ago
+[kernel 25.530 cpu6] heartbeat: t=25.530s alive=6/8 mask=0xfc ran=0 gap=0.256s
+[kernel 25.530 cpu6] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 25.530 cpu6] heartbeat: cpu0 last reached one 16.786s ago
+[kernel 25.530 cpu6] heartbeat: cpu1 last reached one 16.732s ago
+[kernel 25.781 cpu6] heartbeat: t=25.781s alive=6/8 mask=0xfc ran=0 gap=0.251s
+[kernel 25.781 cpu6] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 25.781 cpu6] heartbeat: cpu0 last reached one 17.038s ago
+[kernel 25.781 cpu6] heartbeat: cpu1 last reached one 16.983s ago
+[kernel 26.031 cpu6] heartbeat: t=26.031s alive=6/8 mask=0xfc ran=0 gap=0.250s
+[kernel 26.031 cpu6] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 26.032 cpu6] heartbeat: cpu0 last reached one 17.288s ago
+[kernel 26.032 cpu6] heartbeat: cpu1 last reached one 17.233s ago
+[kernel 26.295 cpu7] heartbeat: t=26.295s alive=6/8 mask=0xfc ran=0 gap=0.263s
+[kernel 26.295 cpu7] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 26.295 cpu7] heartbeat: cpu0 last reached one 17.552s ago
+[kernel 26.295 cpu7] heartbeat: cpu1 last reached one 17.497s ago
+[kernel 26.567 cpu6] heartbeat: t=26.567s alive=6/8 mask=0xfc ran=0 gap=0.271s
+[kernel 26.567 cpu6] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 26.567 cpu6] heartbeat: cpu0 last reached one 17.823s ago
+[kernel 26.567 cpu6] heartbeat: cpu1 last reached one 17.769s ago
+[kernel 26.834 cpu3] heartbeat: t=26.834s alive=6/8 mask=0xfc ran=0 gap=0.267s
+[kernel 26.834 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 26.834 cpu3] heartbeat: cpu0 last reached one 18.091s ago
+[kernel 26.834 cpu3] heartbeat: cpu1 last reached one 18.036s ago
+[kernel 27.098 cpu2] heartbeat: t=27.098s alive=6/8 mask=0xfc ran=0 gap=0.264s
+[kernel 27.098 cpu2] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 27.099 cpu2] heartbeat: cpu0 last reached one 18.355s ago
+[kernel 27.099 cpu2] heartbeat: cpu1 last reached one 18.300s ago
+[kernel 27.359 cpu3] heartbeat: t=27.359s alive=6/8 mask=0xfc ran=0 gap=0.260s
+[kernel 27.359 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 27.359 cpu3] heartbeat: cpu0 last reached one 18.615s ago
+[kernel 27.359 cpu3] heartbeat: cpu1 last reached one 18.561s ago
+[kernel 27.610 cpu4] heartbeat: t=27.610s alive=6/8 mask=0xfc ran=0 gap=0.251s
+[kernel 27.610 cpu4] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 27.610 cpu4] heartbeat: cpu0 last reached one 18.867s ago
+[kernel 27.610 cpu4] heartbeat: cpu1 last reached one 18.812s ago
+[kernel 27.889 cpu3] heartbeat: t=27.889s alive=6/8 mask=0xfc ran=0 gap=0.278s
+[kernel 27.889 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 27.889 cpu3] heartbeat: cpu0 last reached one 19.145s ago
+[kernel 27.889 cpu3] heartbeat: cpu1 last reached one 19.091s ago
+[kernel 28.199 cpu3] heartbeat: t=28.199s alive=6/8 mask=0xfc ran=0 gap=0.310s
+[kernel 28.199 cpu3] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 28.199 cpu3] heartbeat: cpu0 last reached one 19.456s ago
+[kernel 28.199 cpu3] heartbeat: cpu1 last reached one 19.401s ago
+[kernel 28.507 cpu6] heartbeat: t=28.507s alive=6/8 mask=0xfc ran=0 gap=0.307s
+[kernel 28.507 cpu6] i8042: line status=0x3c irqs=860 bytes=860 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 28.507 cpu6] heartbeat: cpu0 last reached one 19.764s ago
+[kernel 28.507 cpu6] heartbeat: cpu1 last reached one 19.709s ago
+[kernel 28.797 cpu2] heartbeat: t=28.797s alive=6/8 mask=0xfc ran=0 gap=0.289s
+[kernel 28.797 cpu2] i8042: line status=0x3c irqs=875 bytes=875 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 28.797 cpu2] heartbeat: cpu0 last reached one 20.054s ago
+[kernel 28.797 cpu2] heartbeat: cpu1 last reached one 19.999s ago
+[kernel 29.141 cpu2] heartbeat: t=29.141s alive=6/8 mask=0xfc ran=0 gap=0.344s
+[kernel 29.141 cpu2] i8042: line status=0x3c irqs=875 bytes=875 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 29.141 cpu2] heartbeat: cpu0 last reached one 20.398s ago
+[kernel 29.141 cpu2] heartbeat: cpu1 last reached one 20.343s ago
+[kernel 29.441 cpu5] heartbeat: t=29.441s alive=6/8 mask=0xfc ran=0 gap=0.300s
+[kernel 29.441 cpu5] i8042: line status=0x3c irqs=875 bytes=875 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 29.441 cpu5] heartbeat: cpu0 last reached one 20.698s ago
+[kernel 29.441 cpu5] heartbeat: cpu1 last reached one 20.643s ago
+[kernel 29.733 cpu5] heartbeat: t=29.733s alive=6/8 mask=0xfc ran=0 gap=0.292s
+[kernel 29.733 cpu5] i8042: line status=0x3c irqs=875 bytes=875 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 29.733 cpu5] heartbeat: cpu0 last reached one 20.990s ago
+[kernel 29.733 cpu5] heartbeat: cpu1 last reached one 20.935s ago
+[kernel 29.988 cpu6] heartbeat: t=29.988s alive=6/8 mask=0xfc ran=0 gap=0.254s
+[kernel 29.988 cpu6] i8042: line status=0x3c irqs=875 bytes=875 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 29.988 cpu6] heartbeat: cpu0 last reached one 21.245s ago
+[kernel 29.988 cpu6] heartbeat: cpu1 last reached one 21.190s ago
+[kernel 30.241 cpu4] heartbeat: t=30.241s alive=6/8 mask=0xfc ran=0 gap=0.252s
+[kernel 30.241 cpu4] i8042: line status=0x3c irqs=875 bytes=875 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 30.241 cpu4] heartbeat: cpu0 last reached one 21.498s ago
+[kernel 30.241 cpu4] heartbeat: cpu1 last reached one 21.443s ago
+[kernel 30.528 cpu6] heartbeat: t=30.528s alive=6/8 mask=0xfc ran=0 gap=0.287s
+[kernel 30.528 cpu6] i8042: line status=0x3c irqs=875 bytes=875 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 30.529 cpu6] heartbeat: cpu0 last reached one 21.785s ago
+[kernel 30.529 cpu6] heartbeat: cpu1 last reached one 21.730s ago
+[kernel 30.790 cpu2] heartbeat: t=30.790s alive=6/8 mask=0xfc ran=0 gap=0.261s
+[kernel 30.790 cpu2] i8042: line status=0x3c irqs=875 bytes=875 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 30.790 cpu2] heartbeat: cpu0 last reached one 22.047s ago
+[kernel 30.790 cpu2] heartbeat: cpu1 last reached one 21.992s ago
+[kernel 31.041 cpu3] heartbeat: t=31.041s alive=6/8 mask=0xfc ran=0 gap=0.251s
+[kernel 31.041 cpu3] i8042: line status=0x1c irqs=877 bytes=877 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 31.041 cpu3] heartbeat: cpu0 last reached one 22.298s ago
+[kernel 31.041 cpu3] heartbeat: cpu1 last reached one 22.243s ago
+[kernel 31.110 cpu2] === blocked-task dump: 8 cpu(s), and this report takes the screen ===
+[kernel 31.110 cpu5]   cpu5 running nothing
+[kernel 31.110 cpu5]   cpu5 pid=4 tid=0 io parked 22318ms no deadline
+[kernel 31.110 cpu2]   cpu2 running nothing
+[kernel 31.110 cpu6]   cpu6 running nothing
+[kernel 31.110 cpu3]   cpu3 running nothing
+[kernel 31.110 cpu7]   cpu7 running nothing
+[kernel 31.110 cpu6]   cpu6 pid=5 tid=0 other parked 22377ms no deadline
+[kernel 31.110 cpu3]   cpu3 pid=1 tid=1 io parked 22318ms no deadline
+[kernel 31.110 cpu7]   cpu7 pid=6 tid=0 futex parked 22317ms no deadline
+[kernel 31.121 cpu4]   cpu4 running nothing
+[kernel 31.121 cpu4]   cpu4 pid=3 tid=0 ipc parked 29487ms no deadline
+[kernel 31.321 cpu3] sched: cpu=3 ready=0 parked=1 current=None
+[kernel 31.321 cpu7] PMM: 212/15962MB used (7875 pages free)
+[kernel 31.321 cpu3] heartbeat: t=31.321s alive=6/8 mask=0xfc ran=0 gap=0.279s
+[kernel 31.321 cpu7]   kernel-heap  alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 31.321 cpu7]   demand-page  alloc=     8 free=     1 held=     7 (14MB) rate=0/s
+[kernel 31.321 cpu7]   mmap         alloc=    30 free=     1 held=    29 (58MB) rate=0/s
+[kernel 31.321 cpu7]   shared-mem   alloc=    10 free=     0 held=    10 (20MB) rate=0/s
+[kernel 31.321 cpu7]   pipe         alloc=     9 free=     0 held=     9 (18MB) rate=0/s
+[kernel 31.321 cpu7]   elf          alloc=     7 free=     1 held=     6 (12MB) rate=0/s
+[kernel 31.321 cpu7]   dma          alloc=     6 free=     0 held=     6 (12MB) rate=0/s
+[kernel 31.321 cpu7]   framebuffer  alloc=     1 free=     0 held=     1 (2MB) rate=0/s
+[kernel 31.321 cpu7]   stack        alloc=    28 free=     4 held=    24 (48MB) rate=0/s
+[kernel 31.321 cpu7]   init-tls     alloc=     9 free=     1 held=     8 (16MB) rate=0/s
+[kernel 31.321 cpu3] i8042: line status=0x1c irqs=879 bytes=878 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 31.321 cpu3] heartbeat: cpu0 last reached one 22.577s ago
+[kernel 31.321 cpu3] heartbeat: cpu1 last reached one 22.523s ago
+[kernel 31.340 cpu4] sched: cpu=4 ready=0 parked=1 current=None
+[kernel 31.349 cpu6] sched: cpu=6 ready=0 parked=1 current=None
+[kernel 31.360 cpu2]   cpu0 !! no answer: it did not reach a scheduler pass
+[kernel 31.360 cpu2]   cpu1 !! no answer: it did not reach a scheduler pass
+[kernel 31.360 cpu2]   cpu0 NMI answered, it is here:
+[kernel 31.360 cpu2]     0xffff80005be35b78  kernel::arch::idt::timer::timer_entry+0x0
+[kernel 31.360 cpu2]   cpu1 NMI answered, it is here:
+[kernel 31.360 cpu2]     0xffff80005be35b78  kernel::arch::idt::timer::timer_entry+0x0
+[kernel 31.360 cpu2]   !! ready and has never run: pid=6 tid=1 tone cpu=0ms
+[kernel 31.360 cpu2]   ready: pid=0 tid=0 compositor cpu=197ms
+[kernel 31.360 cpu2] == census: 8 thread(s) — 0 running, 2 ready, 6 blocked, 0 zombie, 0 unscheduled
+[kernel 31.360 cpu2] == sched: 6/8 cpu(s) answered — 0 running, 0 queued, 5 parked
+[kernel 31.360 cpu2] == deadlines: 5 event-only, 0 pending, 0 OVERDUE, 0 ABSURD
+[kernel 31.360 cpu2] == VERDICT: 0 overdue, 0 absurd, 3 unheld, 1 never ran (of the cpus that answered)
+[kernel 31.360 cpu2] === end of dump ===
+[kernel 31.373 cpu2] sched: cpu=2 ready=0 parked=0 current=None
+[kernel 31.377 cpu7] sched: cpu=7 ready=0 parked=1 current=None
+[kernel 31.477 cpu5] sched: cpu=5 ready=0 parked=1 current=None
+[kernel 31.577 cpu3] heartbeat: t=31.577s alive=6/8 mask=0xfc ran=0 gap=0.256s
+[kernel 31.577 cpu3] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 31.577 cpu3] heartbeat: cpu0 last reached one 22.834s ago
+[kernel 31.577 cpu3] heartbeat: cpu1 last reached one 22.779s ago
+[kernel 31.898 cpu6] heartbeat: t=31.898s alive=6/8 mask=0xfc ran=0 gap=0.321s
+[kernel 31.898 cpu6] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 31.898 cpu6] heartbeat: cpu0 last reached one 23.155s ago
+[kernel 31.898 cpu6] heartbeat: cpu1 last reached one 23.100s ago
+[kernel 32.198 cpu2] heartbeat: t=32.198s alive=6/8 mask=0xfc ran=0 gap=0.300s
+[kernel 32.198 cpu2] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 32.199 cpu2] heartbeat: cpu0 last reached one 23.455s ago
+[kernel 32.199 cpu2] heartbeat: cpu1 last reached one 23.400s ago
+[kernel 32.499 cpu3] heartbeat: t=32.499s alive=6/8 mask=0xfc ran=0 gap=0.300s
+[kernel 32.499 cpu3] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 32.499 cpu3] heartbeat: cpu0 last reached one 23.756s ago
+[kernel 32.499 cpu3] heartbeat: cpu1 last reached one 23.701s ago
+[kernel 32.808 cpu5] heartbeat: t=32.808s alive=6/8 mask=0xfc ran=0 gap=0.309s
+[kernel 32.808 cpu5] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 32.808 cpu5] heartbeat: cpu0 last reached one 24.065s ago
+[kernel 32.808 cpu5] heartbeat: cpu1 last reached one 24.010s ago
+[kernel 33.073 cpu2] heartbeat: t=33.073s alive=6/8 mask=0xfc ran=0 gap=0.264s
+[kernel 33.073 cpu2] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 33.073 cpu2] heartbeat: cpu0 last reached one 24.329s ago
+[kernel 33.073 cpu2] heartbeat: cpu1 last reached one 24.275s ago
+[kernel 33.324 cpu6] heartbeat: t=33.324s alive=6/8 mask=0xfc ran=0 gap=0.250s
+[kernel 33.324 cpu6] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 33.324 cpu6] heartbeat: cpu0 last reached one 24.580s ago
+[kernel 33.324 cpu6] heartbeat: cpu1 last reached one 24.526s ago
+[kernel 33.474 cpu6] i8042: 881 interrupts, 881 bytes, 19 keys, 284 motion, 10 undecoded, 0 discarded, 0 overruns, 0 dropped, 0 lost edges — last byte at 31362ms
+[kernel 33.611 cpu6] heartbeat: t=33.611s alive=6/8 mask=0xfc ran=0 gap=0.287s
+[kernel 33.611 cpu6] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 33.611 cpu6] heartbeat: cpu0 last reached one 24.868s ago
+[kernel 33.611 cpu6] heartbeat: cpu1 last reached one 24.813s ago
+[kernel 33.913 cpu4] heartbeat: t=33.913s alive=6/8 mask=0xfc ran=0 gap=0.302s
+[kernel 33.913 cpu4] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 33.914 cpu4] heartbeat: cpu0 last reached one 25.170s ago
+[kernel 33.914 cpu4] heartbeat: cpu1 last reached one 25.115s ago
+[kernel 34.185 cpu4] heartbeat: t=34.185s alive=6/8 mask=0xfc ran=0 gap=0.272s
+[kernel 34.185 cpu4] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 34.186 cpu4] heartbeat: cpu0 last reached one 25.442s ago
+[kernel 34.186 cpu4] heartbeat: cpu1 last reached one 25.387s ago
+[kernel 34.456 cpu5] heartbeat: t=34.456s alive=6/8 mask=0xfc ran=0 gap=0.270s
+[kernel 34.456 cpu5] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 34.456 cpu5] heartbeat: cpu0 last reached one 25.712s ago
+[kernel 34.456 cpu5] heartbeat: cpu1 last reached one 25.658s ago
+[kernel 34.717 cpu5] heartbeat: t=34.717s alive=6/8 mask=0xfc ran=0 gap=0.261s
+[kernel 34.717 cpu5] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 34.717 cpu5] heartbeat: cpu0 last reached one 25.974s ago
+[kernel 34.717 cpu5] heartbeat: cpu1 last reached one 25.919s ago
+[kernel 34.982 cpu2] heartbeat: t=34.982s alive=6/8 mask=0xfc ran=0 gap=0.265s
+[kernel 34.982 cpu2] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 34.982 cpu2] heartbeat: cpu0 last reached one 26.239s ago
+[kernel 34.982 cpu2] heartbeat: cpu1 last reached one 26.184s ago
+[kernel 35.236 cpu5] heartbeat: t=35.236s alive=6/8 mask=0xfc ran=0 gap=0.254s
+[kernel 35.236 cpu5] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 35.237 cpu5] heartbeat: cpu0 last reached one 26.493s ago
+[kernel 35.237 cpu5] heartbeat: cpu1 last reached one 26.438s ago
+[kernel 35.498 cpu7] heartbeat: t=35.498s alive=6/8 mask=0xfc ran=0 gap=0.261s
+[kernel 35.498 cpu7] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 35.498 cpu7] heartbeat: cpu0 last reached one 26.755s ago
+[kernel 35.498 cpu7] heartbeat: cpu1 last reached one 26.700s ago
+[kernel 35.751 cpu5] heartbeat: t=35.751s alive=6/8 mask=0xfc ran=0 gap=0.253s
+[kernel 35.751 cpu5] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 35.751 cpu5] heartbeat: cpu0 last reached one 27.008s ago
+[kernel 35.751 cpu5] heartbeat: cpu1 last reached one 26.953s ago
+[kernel 36.010 cpu6] heartbeat: t=36.010s alive=6/8 mask=0xfc ran=0 gap=0.258s
+[kernel 36.010 cpu6] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 36.010 cpu6] heartbeat: cpu0 last reached one 27.266s ago
+[kernel 36.010 cpu6] heartbeat: cpu1 last reached one 27.212s ago
+[kernel 36.271 cpu6] heartbeat: t=36.271s alive=6/8 mask=0xfc ran=0 gap=0.261s
+[kernel 36.271 cpu6] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 36.271 cpu6] heartbeat: cpu0 last reached one 27.528s ago
+[kernel 36.271 cpu6] heartbeat: cpu1 last reached one 27.473s ago
+[kernel 36.524 cpu4] heartbeat: t=36.524s alive=6/8 mask=0xfc ran=0 gap=0.252s
+[kernel 36.524 cpu4] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 36.524 cpu4] heartbeat: cpu0 last reached one 27.780s ago
+[kernel 36.524 cpu4] heartbeat: cpu1 last reached one 27.726s ago
+[kernel 36.819 cpu7] heartbeat: t=36.819s alive=6/8 mask=0xfc ran=0 gap=0.295s
+[kernel 36.819 cpu7] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 36.819 cpu7] heartbeat: cpu0 last reached one 28.076s ago
+[kernel 36.819 cpu7] heartbeat: cpu1 last reached one 28.021s ago
+[kernel 37.071 cpu4] heartbeat: t=37.071s alive=6/8 mask=0xfc ran=0 gap=0.251s
+[kernel 37.071 cpu4] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 37.071 cpu4] heartbeat: cpu0 last reached one 28.328s ago
+[kernel 37.071 cpu4] heartbeat: cpu1 last reached one 28.273s ago
+[kernel 37.321 cpu6] heartbeat: t=37.321s alive=6/8 mask=0xfc ran=0 gap=0.250s
+[kernel 37.321 cpu6] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 37.321 cpu6] heartbeat: cpu0 last reached one 28.578s ago
+[kernel 37.321 cpu6] heartbeat: cpu1 last reached one 28.523s ago
+[kernel 37.612 cpu4] heartbeat: t=37.612s alive=6/8 mask=0xfc ran=0 gap=0.290s
+[kernel 37.612 cpu4] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 37.612 cpu4] heartbeat: cpu0 last reached one 28.868s ago
+[kernel 37.612 cpu4] heartbeat: cpu1 last reached one 28.814s ago
+[kernel 37.924 cpu2] heartbeat: t=37.924s alive=6/8 mask=0xfc ran=0 gap=0.312s
+[kernel 37.924 cpu2] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 37.924 cpu2] heartbeat: cpu0 last reached one 29.181s ago
+[kernel 37.924 cpu2] heartbeat: cpu1 last reached one 29.126s ago
+[kernel 38.237 cpu4] heartbeat: t=38.237s alive=6/8 mask=0xfc ran=0 gap=0.312s
+[kernel 38.237 cpu4] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 38.237 cpu4] heartbeat: cpu0 last reached one 29.493s ago
+[kernel 38.237 cpu4] heartbeat: cpu1 last reached one 29.439s ago
+[kernel 38.544 cpu2] heartbeat: t=38.544s alive=6/8 mask=0xfc ran=0 gap=0.307s
+[kernel 38.544 cpu2] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 38.544 cpu2] heartbeat: cpu0 last reached one 29.801s ago
+[kernel 38.544 cpu2] heartbeat: cpu1 last reached one 29.746s ago
+[kernel 38.856 cpu7] heartbeat: t=38.856s alive=6/8 mask=0xfc ran=0 gap=0.312s
+[kernel 38.856 cpu7] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 38.856 cpu7] heartbeat: cpu0 last reached one 30.113s ago
+[kernel 38.856 cpu7] heartbeat: cpu1 last reached one 30.058s ago
+[kernel 39.158 cpu3] heartbeat: t=39.158s alive=6/8 mask=0xfc ran=0 gap=0.301s
+[kernel 39.158 cpu3] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 39.158 cpu3] heartbeat: cpu0 last reached one 30.414s ago
+[kernel 39.158 cpu3] heartbeat: cpu1 last reached one 30.360s ago
+[kernel 39.458 cpu6] heartbeat: t=39.458s alive=6/8 mask=0xfc ran=0 gap=0.300s
+[kernel 39.458 cpu6] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 39.458 cpu6] heartbeat: cpu0 last reached one 30.715s ago
+[kernel 39.458 cpu6] heartbeat: cpu1 last reached one 30.660s ago
+[kernel 39.722 cpu6] heartbeat: t=39.722s alive=6/8 mask=0xfc ran=0 gap=0.263s
+[kernel 39.722 cpu6] i8042: line status=0x1c irqs=881 bytes=881 kbd gsi=1 rte=0x0000000000000024 aux gsi=12 rte=0x0000000000000024
+[kernel 39.722 cpu6] heartbeat: cpu0 last reached one 30.978s ago
+[kernel 39.722 cpu6] heartbeat: cpu1 last reached one 30.924s ago

@@ -1675,7 +1675,94 @@ one defect. Ctrl+Alt+D is now machine-wide and process-named (§5), and on the
 owner's laptop one press named three CPUs not reaching a scheduler pass and
 three threads ready-and-never-run.
 
-### OPEN (#156) — seven T14 boots in seven minutes, and the signature everyone has read as a wedge is what a healthy idle machine writes
+### CLOSED (#156) — cpu0 armed the LAPIC one-shot for less time than it takes to arm it, and the Ring 0 stub replayed that forever
+
+**Read this before the three entries below it.** They are the investigation that
+got here and they are worth keeping; this is what it found.
+
+**The evidence is committed**: `specs/metal-logs/2026-08-08-cpu0/`, eight
+consecutive boots off the owner's stick on 2026-08-08 with
+`--kernel-feature heartbeat`, seven of them photographed mid-freeze with a
+readable blocked-task dump. Its `README.md` has the tables; this entry is the
+mechanism.
+
+**What the machine was doing.** cpu0 stopped reaching a scheduler pass in all
+eight boots and never came back; the other seven CPUs stayed alive and
+dispatched **nothing at all** (`ran=0` on every heartbeat line thereafter);
+device interrupts kept being taken the whole time (`i8042: … irqs=` climbs, and
+GSIs 1 and 12 route to APIC 0). The NMI escalation answered on seven boots and
+put cpu0's `rip` inside `arm_one_shot` or `timer_entry` **every single time**,
+twice at exactly the instruction after a `wrmsr` to `X2APIC_TIMER_INIT`.
+
+**The mechanism, and every step of it is in the code.**
+
+1. `KernelHw::set_timer` arms `deadline - now` on the one-shot, and `now` is
+   read fresh, so a deadline that came due while the pass was running arms zero.
+2. `arm_one_shot` clamped that to `1` — the register cannot hold zero, which
+   means *stopped*. One LAPIC tick on the T14 is **26 ns** (`LAPIC timer: 384007
+   ticks/10ms`), which at 2419 MHz is **63 core cycles**: less than the `wrmsr`
+   that armed it takes to retire, and `iretq` has no shadow.
+3. The Ring 0 timer stub reloads `X2APIC_TIMER_INIT` from
+   `PerCpu::last_armed_ticks` in assembly before any Rust runs. It reloads *the
+   same count*. So the fire that lands in Ring 0 arms another 26 ns, and the
+   interrupted code retires nothing — which means nothing ever recomputes the
+   count. **The CPU is gone, and it is still servicing interrupts**, which is
+   why Ctrl+Alt+D worked on a machine that was to its owner dead.
+4. Nothing else can pick up the work. The compositor is *ready* on cpu0's run
+   queue, and a steal request is answered by the victim inside its own pass, so
+   `== sched: 7/8 cpu(s) answered … 0 running, 0 queued` sits above `ready:
+   pid=0 tid=0 compositor` in every dump.
+
+**Reachable from Ring 3 with no privilege**: `sys_nanosleep(0)` parks with a
+deadline that is already past. Two shipping daemons ask for it by accident —
+the compositor's drain loop spelled "do not block" `Duration::from_nanos(1)`
+(`userland/compositor/src/session.rs`, now `Duration::ZERO`) and soundd's mix
+loop still spells a past-due grid point `.max(1)` (below).
+
+**The fix is a floor at the primitive.** `apic::MIN_ONE_SHOT_NS` is 10 µs, and
+`apic::OneShot` is the only thing that reaches either `X2APIC_TIMER_INIT` or
+`last_armed_ticks` — the floor is in its constructor rather than at the three
+call sites, because the stub's reload has no Rust in the path to check anything.
+A past-due deadline now fires 10 µs later instead of never.
+
+**QEMU cannot stage it, and the reason is worth knowing.** TCG checks pending
+interrupts at translation-block boundaries, so a guest whose one-shot expires
+"immediately" still retires a whole block per interrupt and escapes. Verified:
+`tests/toyos-rust-tests/src/bin/abuse_short_sleep.rs` sweeps `nanosleep(0)`,
+`(1)`, `(26)` … across eight threads and **passes on the unfixed tree**. It is
+kept as `short_sleep_livelock` because it drives the exact path machine-wide and
+its verdict is that the machine survives, but on this host it certifies the
+syscall path and not the livelock. **The real verdict is a T14 boot.**
+
+**What the evidence does not establish**: the exact count that was armed. Four
+distinct offsets inside `arm_one_shot` across four boots say cpu0 retired *some*
+instructions rather than being pinned at one byte, so the interval was of the
+same order as the interrupt round trip rather than provably one tick. The fix
+does not depend on which — any count that does not outlast the interrupt it
+schedules produces this.
+
+### OPEN — soundd spells a past-due wake `.max(1)`, which is a one-nanosecond timer
+
+`userland/soundd/src/main.rs:955` and `:1327` both compute a poll timeout as
+`…saturating_sub(clock_nanos()).max(1)`, with a comment saying the `1` is there
+because `0` is the kernel's non-blocking sentinel. But non-blocking is exactly
+what a grid point already in the past wants, so `0` is the right answer and `1`
+is a park on a deadline that has passed. It is the trigger on boot 5 of
+`specs/metal-logs/2026-08-08-cpu0/`, where cpu0 and cpu1 both stopped within
+100 ms of `soundd: resumed`.
+
+Not fixed here, and deliberately: it is one line in the mix loop, the floor above
+makes it safe, and what it changes is when soundd wakes on a late period —
+audio timing, which is the owner's call and which gate A's thorough tier cannot
+currently adjudicate (§4). With the floor, a past-due grid point now costs up to
+10 µs of extra lateness against a 2.9 ms period.
+
+### OPEN (#156, superseded) — seven T14 boots in seven minutes, and the signature everyone has read as a wedge is what a healthy idle machine writes
+
+**Superseded by the CLOSED entry above**, which found the defect. Kept because
+its elimination of the log-shape argument is what made the heartbeat build worth
+flashing, and because it is the record of three rounds that read the ending of a
+quiescent machine's log as a wedge.
 
 **The evidence is committed**: `specs/metal-logs/2026-08-07-freeze/`, seven
 consecutive boots of one image off the owner's stick, 22:26–22:33 on
@@ -5862,6 +5949,14 @@ Sharpest first:
   four tags and neither `Artist` nor `Copyright`; git history has nothing; the
   README does not mention it. It ships as `share/wallpaper.rgb`. Recording the
   open question rather than guessing is the point of this bullet.
+
+The count above is stale by one entry and the licence question does not apply to
+it: `specs/metal-logs/2026-08-08-cpu0/photos/` is 12,606,601 bytes of the owner's
+own photographs of his own panel, committed because they are the only record of
+the `rip` that named #156 and a scratchpad does not survive a session. They ship
+in nothing. Whoever writes the binary-file ledger should decide whether evidence
+under `specs/` is in scope for it; the audit's own §7 was written before any
+existed.
 
 ### OPEN — nothing in the tree checks any of the above
 
