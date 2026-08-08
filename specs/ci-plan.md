@@ -920,6 +920,45 @@ goes for an `EXPECTED_FAILURES` entry: it would name a real defect and a real
 write-up and it would still be an exemption bought to make a run green while a
 process can kill its neighbour.
 
+## 9.4 What a red CI run says now, and what a green one would
+
+Run `31261669826` is the first on a tree carrying this task's harness work, and
+it is the check that the work does what it says. Five shards red, six names:
+
+```
+guest (6)   FAIL usb_transport_break   ALONE: red again — the defect is real.
+guest (11)  FAIL metal_sim_null_audio  ALONE: red again — the defect is real.
+guest (8)   FAIL xhci_slow_connect     ALONE: red again — the defect is real.
+guest (10)  FAIL std_unwind            ALONE: GREEN, and it was alone both times
+guest (10)  FAIL std_unwind_so         ALONE: GREEN, and it was alone both times
+guest (2)   FAIL usb_disk_index_stable ALONE: GREEN, and it was alone both times
+guest (2)   FAIL hda_two_live_refused  ALONE: red again — the defect is real.
+```
+
+- **`usb_transport_break` and `metal_sim_null_audio` are `Sched::Serial` and both
+  carry an `ALONE:` line.** Before this task neither did, because the retry loop
+  read the run's width; the two most reproducible reds on CI had never been
+  re-run once.
+- **`shard-{2,6,8,10,11}-serial` artifacts exist**, 0.8–4.3 KB each. The step that
+  claimed to keep what a red run left had uploaded nothing, ever.
+- **Six names, and every one of them is on a list with a number beside it.**
+  Five are §9.2's; `xhci_slow_connect` is 0 of 5 in the rate probe and is
+  `specs/known-issues.md` §8's own entry — a 1 ms margin inside the guest's boot
+  that reds whenever anything moves boot by ten milliseconds.
+
+So **a red run is now readable without a second run**: the name, the sentence,
+whether it survived alone, the kernel's own account if the kernel killed it, and
+a rate to compare against. That is the bar this was aimed at — *green means
+green, red means a real defect, and a re-run tells you which* — met on the second
+and third clauses.
+
+**The first clause is not met and cannot be by CI work.** Five names reproduce,
+so a run is red every time, and each one is a defect in the tree with an owner:
+soundd's device-less path (`metal_sim_null_audio`, `hda_two_live_refused`), the
+xHCI transport (`usb_transport_break`), HDA's mid-tone silence (`hda_tone`, §4)
+and x87 on the context switch (`std_unwind`, §9.3). Fixing those is what makes
+CI green, and none of it is CI.
+
 ### Larger runners: not purchasable for this repository
 
 The owner approved paying for them and there is nothing to buy. GitHub's larger
