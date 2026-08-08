@@ -715,7 +715,6 @@ const C_SKIP: &[&str] = &[
     "32_led",                 // needs system APIs
     "33_ternary_op",          // needs _Generic
     "40_stdio",               // needs FILE* APIs
-    "46_grep",                // needs argc/argv + FILE*
     "60_errors_and_warnings", // meta-test for compiler errors
     "73_arm64",               // wrong architecture
     "101_cleanup",            // needs __attribute__((cleanup))

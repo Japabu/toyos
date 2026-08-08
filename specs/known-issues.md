@@ -3852,6 +3852,48 @@ context type is unavailable" — a premise this host contradicts, which leaves a
 correct decision resting on a reason that has stopped being true. §5.7's own
 argument does not depend on it and is the one to keep.
 
+### OPEN, UNASSIGNED — `screen_pager_keys` is red on `main`, and no keystroke reaches the halted pager
+
+Found 2026-08-08 by the licence work's landing gate, and it belongs to nobody
+yet. **Not a flake and not a load artifact**: three runs in one session, the
+same hard zero every time, with the identical message.
+
+```
+FAIL screen_pager_keys: 0 page moves over 30 keystrokes in 0.4s — an
+unattended deadline alone could have produced 1.1 of them, so nothing here
+says a keystroke reached the halted pager
+```
+
+| Tree | Where | Result |
+|---|---|---|
+| `wt/toyos-licence` | full suite, its serial tail | FAIL, 0/30 over 0.4 s |
+| `wt/toyos-licence` | alone | FAIL, 0/30 over 0.3 s |
+| `b36cf64` — the branch point, i.e. `main` — same session, same host, changes stashed | alone | FAIL, 0/30 over 0.3 s |
+
+The rest of that suite was green: 291 passed, 1 failed, 292 total. So the
+branch is exonerated and the defect is on `main`.
+
+What the test asserts is not decoration. It is **the only place** the claim
+"PageUp/PageDown reach a machine that has stopped scheduling" is made at all:
+`toyos-ps2`'s decode is host-tested, but that a keystroke crosses the i8042
+into a halted CPU's poll is a fact about the controller and the poll. Its own
+comment says so. On the T14 that path is how a photographed panic report is
+steered to the page somebody needs, and CLAUDE.md advertises it.
+
+Zero of thirty says the poll never sees the byte — not that it sees it late.
+Note the earlier phases pass: the footer appears, and the *unattended* 3 s
+deadline still advances the page, so the pager is running and painting. Only
+the keyboard half is dead. Unbisected. The panic console and the blocked-task
+dump both moved recently (`f7c87ee` "the panel gets the report, and keeps it",
+`1bcbc99` log_ring marks), and `hold_report`'s 20 ms repaint is the first thing
+to rule in or out, since a repaint that restores the page a keystroke moved
+would look exactly like this.
+
+It is **not** in `EXPECTED_FAILURES` and must not be put there to get a landing
+through: an entry needs a task, a write-up and the failure text it covers, and
+declaring another agent's regression expected is how a real red becomes
+permanent.
+
 ### OPEN — a boot that wedges before the idle loop says nothing at all
 
 Not "says less": **nothing**, including everything it logged before it wedged. The
@@ -5393,10 +5435,21 @@ through a pointer into a WAD buffer.
 Defining `__GNUC__` would be a much larger change than it looks: it turns on
 every `#ifdef __GNUC__` block in doomgeneric and in any header that has one.
 
-### OPEN — the initrd ships two git-ignored files, so the image is not reproducible from the repo
+### CLOSED — the initrd shipped two git-ignored files, so the image was not reproducible from the repo
 
-`system.toml`'s `assets = ["assets"]` sweeps the directory whole. Two of the
-files it finds are not in VCS:
+**Closed by `95f78f3`/`b8b0749`; this entry outlived the code it describes by a
+day.** `src/assets.rs::tracked` asks `git ls-files` what the directory holds and
+`ships()` skips anything git does not track and no config declares, naming each
+one as it goes. The gate is `the_initrd_carries_what_the_repository_declares`,
+which builds a repository holding a `.DS_Store` and a stray `target/` on purpose
+rather than depending on this checkout having acquired them.
+
+Left below because the class is worth keeping: an image that is a function of
+what a working directory happens to hold rather than of what the repository
+declares.
+
+`system.toml`'s `assets = ["assets"]` swept the directory whole. Two of the
+files it found were not in VCS:
 
 ```
 $ git check-ignore -v assets/.DS_Store assets/target/.deps-stamp
@@ -5424,7 +5477,28 @@ anything git ignores, or take an explicit list.
 Costs 16 KiB of a 672 MB initrd, so nothing breaks. The reproducibility claim
 does.
 
-### OPEN — every toolchain build runs Python, and every host link runs `cc`
+### OPEN, now DECLARED — every toolchain build runs Python, and every host link runs `cc`
+
+**The owner ruled on 2026-08-08: *"its required by rusts toolchain i guess we can
+be transparent about that."*** Both are named in the README's Prerequisites
+section and by `check_prerequisites` in `src/main.rs`, which is now two lists —
+`REQUIRED`, which exits (`git`, `rustup`, `qemu-system-x86_64`, `cc`), and
+`ALSO_USED`, which names what is absent and continues (a Python, `df`, `ps`,
+`find`). The README's opening no longer claims Rust and QEMU are the whole
+setup.
+
+**The entry stays open because declaring is not removing.** The hole is the
+same size: `bootstrap.py` still cannot run inside ToyOS, and the second option
+below — a Rust bootstrap in the `rust/` fork — is still the only thing that
+closes it.
+
+Two details the fix had to get right. The preflight looks for *any* of
+`python3 python py python2 uv`, because that is what `rust/x` searches and a
+machine with only `python` builds fine; and it scans `PATH` rather than running
+`--version`, because asking macOS for `py` opens the Command Line Tools
+installer. `cc` is stated with its scope attached wherever it appears — no guest
+binary links through it — because *"ToyOS needs a C compiler"* is false and
+reads as a far larger claim than the truth.
 
 `specs/dependency-audit-2026-08-08.md` §3–§4 is the full inventory; this is the
 entry that says the two largest holes in *"Rust and QEMU, one command"* are real.
@@ -5448,9 +5522,15 @@ neither. Every *host* binary goes through it — the build system, the harness,
 says nothing about either of these. The cheap half of the fix is to make the
 preflight and the README say what the machine actually needs.
 
-### OPEN — `df`, `ps` and `find` are external binaries the bar does not allow
+### OPEN, now DECLARED — `df`, `ps` and `find` are external binaries the bar does not allow
 
 Three more, none of which comes with Rust or QEMU. Audit §5.
+
+All three are in the preflight's `ALSO_USED` list since 2026-08-08, so a machine
+without one is told which and what it costs. **That is a declaration and not the
+fix** — each is still called, and each replacement is still cheap: `ps` has the
+answer beside it in the same file (`getloadavg` through the `libc` crate),
+`find`'s job is a directory walk, `df`'s is one syscall.
 
 - `src/worktree.rs:141` — `df -k`, `.expect("run df")`, so `worktree add` dies
   without it. One free-space number.
@@ -5471,9 +5551,43 @@ Reach of the three FAT tools, since "nine tests" understates it:
 under `cargo test --lib` — which is in the landing gate — and
 `toyos-fat32/tests/common/mod.rs` by all 59.
 
-### OPEN — `/bin/doom` is built from a moving branch head nobody pinned
+### CLOSED 2026-08-08 — `/bin/doom` was built from a moving branch head nobody pinned
 
-`userland/doom/build.rs:download_doomgeneric` fetches
+`DOOMGENERIC_COMMIT` in `userland/doom/build.rs` is now
+`fc601639494e089702a1ada082eb51aaafc03722` and the URL is that sha's archive,
+which is the checksum as well as the pin — GitHub's archive of a sha is that
+sha's tree and can be nothing else. `forks.toml` `[doomgeneric]` records it
+under a new `source` tier, for a third-party tree that is not a crate; the
+manifest having no shape for one is part of why this was never in it.
+
+`fc60163` is not a guess at "roughly current": the checkout that produced every
+doom measurement on record was hashed file by file against every commit on
+master, and 197 of its 202 files match that commit's tree exactly — the newest
+commit for which that holds. So the pin changed nothing about the binary.
+
+The pin also binds a checkout that already has one, which is the half that
+matters: `doomgeneric/.toyos-commit` records what is on disk and a mismatch
+replaces the tree with a `cargo:warning` naming both commits. Testing only
+whether the directory exists *is* the original defect, so a pin without the
+stamp would have bound fresh clones and left every existing machine as it was.
+
+**Two local edits went with it, and they are worth knowing about**: that
+directory carried `key_menu_incscreen = '+'` in place of upstream's
+`KEY_EQUALS`, and one deleted trailing newline in `doomgeneric.c`. Untracked,
+on one machine, in nobody's history, and read by nothing in the tree. That is
+the shape a fetch cannot fix — there is no `toyos` branch for a ToyOS patch to
+the C to live on. `forks.toml`'s `followup` records the end state (a
+`Japabu/doomgeneric` submodule, deleting the fetch and the five
+build-dependencies with it); it needs a repo only the owner can create.
+
+**The race is separately closed**: `b8b0749` deleted `download_soundfont`, so
+nothing writes into `assets/` during a build and nothing races the initrd
+builders. The five build-dependencies are still there, still serving one
+download. Audit §6.
+
+What it used to say:
+
+`userland/doom/build.rs:download_doomgeneric` fetched
 `https://github.com/ozkl/doomgeneric/archive/refs/heads/master.tar.gz`. No
 commit, no tag, no hash check. It runs once, when `userland/doom/doomgeneric`
 does not exist — so **which Doom sources you build is a function of when you
@@ -5506,11 +5620,36 @@ path `main` takes — but it is committed, and a refused dependency left in the
 tree is how it comes back. `specs/ci-plan.md:242,404` discusses `fsck.vfat` as an
 option and does not record that the answer was no.
 
-### OPEN — what the repository ships is not all MIT OR Apache-2.0
+### CLOSED except the wallpaper, 2026-08-08 — what the repository ships is not all MIT OR Apache-2.0
 
-`specs/dependency-audit-2026-08-08.md` §7 has each item with its evidence. Six
+**`NOTICE` at the repository root is now the list**, item by item, with
+`licenses/` carrying four third-party licence texts and
+`tests/testcases/LICENSE` the corpus's. The README's licence section points at
+it and states the one term that constrains a build: the shareware IWAD may be
+redistributed freely but not sold and not modified, so **an image carrying it
+may not be sold.** That entry is written to be deleted — the owner's position is
+that doom is not a required part of ToyOS and should eventually be fetched by a
+package manager, and when the WAD stops being committed the section goes rather
+than decaying into a notice for a file that is not there.
+
+Item by item: `46_grep.c` **deleted**; the TinyCC corpus **attributed**, and
+upstream's own `tests/tests2/LICENSE` turns out to name **picoc** (BSD-3-Clause)
+under the LGPL-2.1, which the audit did not have; the WAD, the font, the icons
+and the firmware **declared**, each with its hash and the evidence its
+provenance was read from; `assets/wallpaper.jpg` **still open and only the owner
+can close it.**
+
+Two corrections the fix produced. The WAD does **not** ship in every image —
+`diag/system.toml` declares no assets, so `bootable-diag.img` carries no WAD, no
+wallpaper, no font and no icons. And `ovmf/DEBUGX64_OVMF.fd` is **not**
+load-bearing as the audit says all three are: it is 4,194,304 bytes nothing in
+the tree references, from a different build than the other two.
+
+What it found, kept because it is the evidence:
+
+`specs/dependency-audit-2026-08-08.md` §7 has each item. Six
 committed binary files — 11,094,369 bytes of the 14,634,080 git tracks — plus one
-committed source corpus sit outside the declared licence, and the README declares
+committed source corpus sat outside the declared licence, and the README declared
 only one exception
 (`userland/doom` is GPL-2.0). Provenance had to be established from content,
 because `assets/` and `ovmf/` both entered in the initial squashed commit
@@ -5549,6 +5688,11 @@ Sharpest first:
 Both violations that prompted the audit — `fsck_msdos` and the SoundFont's GPLv2
 — existed for months and were found by collision. There is no ledger of allowed
 crates, allowed binaries, or asset provenance, and no check reads one.
+
+`NOTICE` is now most of §11.3's asset ledger written out by hand — every
+committed third-party file with its `sha256`, its upstream and its licence — so
+the remaining work there is a `#[test]` that reads it, not the research. Nothing
+reads it today, so a new binary file still arrives unremarked.
 
 `specs/dependency-audit-2026-08-08.md` §11 proposes three, all offline, all
 inside `cargo test --lib`, and prices each including what it cannot catch — the

@@ -2,43 +2,74 @@ mod qemu;
 
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
+
+/// One prerequisite: any of `any` satisfies it, and `why` is what reaches it.
+struct Tool {
+    any: &'static [&'static str],
+    why: &'static str,
+}
+
+/// No build gets past these.
+///
+/// `cc` is here and is not ours: `rustc` drives every *host* link through it
+/// and `rustup` does not install it. Nothing that boots goes near it —
+/// `bootloader/`, `kernel/` and `userland/` all set `linker = "toyos-ld"` —
+/// which is the distinction "ToyOS needs a C compiler" would destroy.
+const REQUIRED: &[Tool] = &[
+    Tool { any: &["git"], why: "every build; the image ships what git says is tracked" },
+    Tool { any: &["rustup"], why: "the toolchain — install from https://rustup.rs" },
+    Tool { any: &["qemu-system-x86_64"], why: "every boot — install QEMU" },
+    Tool { any: &["cc"], why: "rustc links every host binary through it; no guest binary" },
+];
+
+/// Named, because a list that stops at what is fatal reads as the whole list.
+/// Each of these costs one thing when absent rather than the build, so none of
+/// them exits.
+const ALSO_USED: &[Tool] = &[
+    Tool {
+        any: &["python3", "python", "py", "python2", "uv"],
+        why: "rust/x runs rustc's bootstrap, which is Python — a clean clone and \
+              every toolchain change need one",
+    },
+    Tool { any: &["df"], why: "`--worktree add` reports the free space it leaves" },
+    Tool { any: &["ps"], why: "gate A counts concurrent guests for its host-conditions line" },
+    Tool {
+        any: &["find"],
+        why: "toyos-fat32's host tests sweep macOS resource forks off a mounted volume",
+    },
+];
+
+/// Where the OS would find `name`, if anywhere.
+///
+/// A `PATH` scan and not a `--version` run: it is what `Command::new` does
+/// anyway, and one name above must not be executed — asking macOS for `py`
+/// opens the Command Line Tools installer, which is why `rust/x` searches
+/// `python3` ahead of it.
+fn executable_on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|dir| {
+        std::fs::metadata(dir.join(name))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
 
 fn check_prerequisites() {
-    let mut missing = Vec::new();
-
-    if Command::new("git")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .status()
-        .is_err()
-    {
-        missing.push("git");
+    fn absent(tools: &'static [Tool]) -> Vec<&'static Tool> {
+        tools.iter().filter(|t| !t.any.iter().any(|n| executable_on_path(n))).collect()
     }
 
-    if Command::new("rustup")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_err()
-    {
-        missing.push("rustup (install from https://rustup.rs)");
+    for tool in absent(ALSO_USED) {
+        eprintln!("Note: no {} — {}", tool.any.join(" or "), tool.why);
     }
 
-    if Command::new("qemu-system-x86_64")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .status()
-        .is_err()
-    {
-        missing.push("qemu-system-x86_64 (install QEMU)");
-    }
-
+    let missing = absent(REQUIRED);
     if !missing.is_empty() {
         eprintln!("Error: missing required tools:");
         for tool in &missing {
-            eprintln!("  - {tool}");
+            eprintln!("  - {} ({})", tool.any.join(" or "), tool.why);
         }
         std::process::exit(1);
     }

@@ -4,6 +4,25 @@ Everything this project depends on that it did not write, judged against the
 owner's bar. **This is an inventory and a set of recommendations. Nothing here
 was removed or replaced** — that is the owner's call, item by item.
 
+## What has since been closed
+
+The owner ruled on the licence and provenance half the same day, and it was
+built. Every finding below is left standing rather than deleted, because the
+evidence is what makes the fix reviewable; each section now carries its state.
+
+| Finding | State |
+|---|---|
+| §6a doomgeneric fetched from a moving branch | **CLOSED** — pinned to `fc60163`, and in `forks.toml` |
+| §6b, §6d the SoundFont and its race with the suite | **CLOSED** by another agent before this work started (`95f78f3`, `b8b0749`) |
+| §7a `46_grep.c`, the DECUS "not for profit" clause | **CLOSED** — deleted |
+| §7a the corpus carrying no attribution | **CLOSED** — `tests/testcases/LICENSE` |
+| §7b, §7c, §7d, §7e the WAD, the font, the icons, the firmware | **CLOSED** — `NOTICE` and `licenses/` |
+| §7f `assets/wallpaper.jpg` | **OPEN, and only the owner can close it** — recorded as unknown rather than guessed |
+| §3 Python, §4 `cc`, §5 `df`/`ps`/`find` | **DECLARED**, not removed — README and preflight |
+| §2 `dosfstools` in a committed workflow | **OPEN** — the CI agent owns that file |
+| §1 the four macOS FAT tools | **OPEN** — being scoped elsewhere |
+| §8 the crate observations, §11's three ledgers | **OPEN** — decisions, not defects |
+
 ## Why it exists
 
 Two violations surfaced by accident within one day rather than by looking.
@@ -72,6 +91,15 @@ Grouped by verdict, worst first.
 The build system's own preflight (`src/main.rs:7`) checks exactly three tools:
 `git`, `rustup`, `qemu-system-x86_64`. The real set is larger. Every row below
 is a call site that exists today.
+
+**Since closed, as a declaration and not a removal.** That preflight is now two
+lists: `REQUIRED`, which exits — `git`, `rustup`, `qemu-system-x86_64` and
+`cc` — and `ALSO_USED`, which names what is missing and continues: a Python
+(any of the five `rust/x` searches for), `df`, `ps`, `find`. It is a `PATH`
+scan rather than a `--version` run, because `py` on macOS opens the Command
+Line Tools installer, which is the reason `rust/x` searches `python3` ahead of
+it. The four FAT tools are not in either list: the agent scoping their
+replacement owns that row.
 
 | Binary | Where | Reached by | Verdict |
 |---|---|---|---|
@@ -155,6 +183,17 @@ both the owner's call:
   piece of work that would also be upstream-relevant, and squarely inside the
   self-hosting north star rather than a detour from it.
 
+**DECLARED 2026-08-08**, the owner's ruling being *"its required by rusts
+toolchain i guess we can be transparent about that."* The README's Prerequisites
+section names it, the opening no longer claims Rust and QEMU are the whole
+setup, and the preflight names it when it is absent. Declaring is not removing:
+the hole is the same size and the second option is still open.
+
+Named the way `rust/x` looks for it rather than as `python3` alone — the script
+searches `python3 python py python2 uv` and then falls back to `bash -c
+"compgen -c python"`, so a machine with only `python` satisfies it and a
+preflight demanding `python3` would refuse a machine that builds.
+
 Note that `--build-only` on a machine with a warm `rust/build/` does *not* re-run
 `x`, so this bites a clean clone and a toolchain change, not every build.
 
@@ -178,6 +217,16 @@ targets the host through a C linker driver.
 
 **Recommendation.** Declare it, as in §3. Do not chase it.
 
+**DECLARED 2026-08-08.** README Prerequisites, and `REQUIRED` in the preflight.
+Stated there with its scope attached both times, because *"ToyOS needs a C
+compiler"* is false and reads as a much larger claim than the truth: no guest
+binary links through it, and no image contains a C toolchain.
+
+One property of the check is worth knowing before anyone trusts it: the binary
+running the preflight was itself linked by `cc`, so the only way this arm can
+fire is `cc` disappearing between two builds. It is there to be read, more than
+to catch anything.
+
 ## 5. `df`, `ps` and `find`
 
 Three Unix binaries, none of which comes with Rust or QEMU.
@@ -198,6 +247,11 @@ Three Unix binaries, none of which comes with Rust or QEMU.
 the answer beside it in the same file. `find`'s job is a directory walk. `df`'s
 is one syscall. Judged against the bar these are unambiguous failures with cheap
 fixes, and they are the least contentious items in this document.
+
+**DECLARED 2026-08-08, not fixed.** All three are in the preflight's `ALSO_USED`
+list, which names what is absent and continues, because each costs one feature
+rather than the build. Declaring them is not the fix and does not close them —
+the recommendation above still stands and is still cheap.
 
 ## 6. Doom's build downloads two unpinned things over the network
 
@@ -248,11 +302,69 @@ half is untouched and is the larger of the two: it should become a fork in
 point the download and its five crates go with it. Nothing new is needed to do
 that — the mechanism already exists and is used fourteen times.
 
+### CLOSED 2026-08-08
+
+**b and d were closed by the other agent** and are no longer in the tree:
+`b8b0749` deleted `download_soundfont`, `95f78f3` deleted the four
+`untracked-assets` declarations from configs that do not build doom and made a
+remaining one non-fatal. Nothing writes into `assets/` during a build any more,
+so nothing races the initrd builders. Verified by reading `build.rs` and
+`src/assets.rs` on `b36cf64`, not by re-running the gate.
+
+**a is closed by a pin rather than by a fork**, which the owner chose:
+
+`DOOMGENERIC_COMMIT` in `userland/doom/build.rs` is
+`fc601639494e089702a1ada082eb51aaafc03722`, the URL is that sha's archive, and
+`forks.toml` `[doomgeneric]` records it under a new `source` tier — the manifest
+had no shape for a third-party tree that is not a crate, which is part of why
+this one was never in it.
+
+**Which commit, and how it was established.** Not "whatever master is today":
+the checkout that produced every doom measurement on record was hashed file by
+file and compared against every commit on `ozkl/doomgeneric`'s master. 197 of
+its 202 files match `fc60163`'s `doomgeneric/` tree exactly, and it is the
+newest commit for which that holds. So the pin is what this project has been
+building, and pinning changed nothing about the binary.
+
+**The five files that did not match are the finding underneath the finding.**
+Three (`i_sound.c`, `d_main.c`, `wi_stuff.c`) have later mtimes and identical
+content — edited and reverted. Two carry real local edits, in a gitignored
+directory, on one machine, in nobody's history:
+
+```
+m_controls.c:172   -int key_menu_incscreen = KEY_EQUALS;
+                   +int key_menu_incscreen = '+';
+doomgeneric.c:27   one trailing blank line removed
+```
+
+Nothing in the tree reads either — `grep -rn "incscreen\|KEY_EQUALS" tests/
+userland/doom/` finds nothing — so the pin drops them, and a fresh clone never
+had them anyway. **That is the shape a fetch cannot fix**: there is no `toyos`
+branch for a ToyOS patch to the C to live on, so a patch lives in an untracked
+directory or nowhere. `forks.toml`'s `followup` records the end state (a
+`Japabu/doomgeneric` submodule, which deletes the fetch and the five
+build-dependencies with it); it needs a repo the owner creates.
+
+**The pin binds a checkout that already has one.** `doomgeneric/.toyos-commit`
+records what is on disk, and a mismatch replaces the tree with a
+`cargo:warning` naming both commits. Testing only whether the directory exists
+*is* the original defect: without the stamp, this pin would have bound fresh
+clones and left every existing machine exactly as it was.
+
 ## 7. Licences and provenance
 
 The repository declares **MIT OR Apache-2.0** (`LICENSE-MIT`, `LICENSE-APACHE`,
 README). The README declares two exceptions: `userland/doom` is GPL-2.0, and
 third-party crates keep their own licences. It declares nothing else.
+
+**Since 2026-08-08 it declares all of them.** `NOTICE` at the repository root is
+the list, item by item, with `licenses/` holding four third-party licence texts
+and `tests/testcases/LICENSE` the corpus's. The README's licence section points
+at it and states the one term that constrains a build. Both of this repository's
+own licence texts were checked while writing that and are present and complete:
+`LICENSE-MIT` (25 lines) and `LICENSE-APACHE` (176 lines, the full terms
+through "END OF TERMS AND CONDITIONS"; the optional "how to apply" appendix is
+not carried, which is the usual Rust-project form).
 
 Ten binary files are committed, totalling **14,634,080 bytes**. Four of them are
 ours (§7g). The other **six — 11,094,369 bytes** — are third-party, and so is one
@@ -290,6 +402,37 @@ grepping the corpus for the word "licen", which nothing in the tree does.
 either carry it with its notice or replace the cases. `46_grep.c` needs a
 decision of its own regardless of what happens to the rest.
 
+#### CLOSED 2026-08-08 — deleted, and the rest attributed
+
+`46_grep.c` and `46_grep.expect` are gone, on the owner's ruling, and
+`"46_grep"` is out of `C_SKIP` with them. It had never been run here — it needs
+`argc`/`argv` and `FILE*`, neither of which `userland/libc` provides — so
+nothing but the file count changed.
+
+The rest is now attributed by `tests/testcases/LICENSE`. Two things there that
+the audit did not have:
+
+**Upstream ships the attribution and we had dropped it.** `tests/tests2/LICENSE`
+exists in tinycc and says the corpus descends from **picoc** — so the terms are
+LGPL-2.1 over a BSD-3-Clause base (Copyright (c) 2009-2011, Zik Saleeba), not
+LGPL-2.1 alone. It is carried verbatim. LGPL-2.1 itself is confirmed from
+tinycc's own `COPYING` and README; its `RELICENSING` file is an incomplete
+effort with at least one author declining, so it does not change the answer.
+
+**A third of the corpus is ours.** Every file was compared byte for byte against
+tinycc at `64552b3` (2026-08-05), allowing for this project's `-` → `_`
+filename renames:
+
+| | `tinycc/` (312 after the deletion) | `pp_tcc/` (51) |
+|---|---|---|
+| byte-identical to upstream | 239 | 46 |
+| upstream, modified here | 17 | 2 |
+| not upstream at all | 56 | 3 |
+
+One of those 56 is not a test: `tinycc/fred.txt` is 12 bytes of output
+`40_stdio.c` writes when it runs, committed by accident. Left alone here —
+`tests/` belongs to another agent this week — and worth deleting.
+
 ### 7b. `assets/DOOM1.WAD` — 4,196,020 bytes of id Software shareware
 
 `IWAD` magic, 1,264 lumps, `sha256
@@ -304,6 +447,30 @@ the README's GPL exception does not cover it — that exception is about
 **Recommendation.** Name it in the README's licence section, or stop committing
 it. Which one is the owner's call; the finding is that the repository currently
 redistributes it while saying it redistributes only MIT/Apache material.
+
+#### CLOSED 2026-08-08 — named, with the terms carried and cited
+
+`NOTICE` leads with it and `licenses/id-software-shareware-DOOM1.txt` carries
+id's Limited Use Software License Agreement in full, obtained from Debian's
+`doom-wad-shareware` copyright file — which is a citable source rather than a
+recollection, and reproduces both the agreement and Carmack's 1999 email
+(*"The DOOM shareware wad is freely distributable."*).
+
+The two clauses that bind are §1 (no modification, no derivative works) and §2
+(copies may be given to other persons; no consideration may be charged or
+received for them without id's prior written consent). **An image carrying this
+file may not be sold**, and NOTICE and the README both say so.
+
+Corrected while writing it: it does **not** ship in "every image". `assets` is
+declared by `system.toml`, `console/system.toml` and three test configs, and
+`diag/system.toml` declares none — so `bootable-diag.img` carries no WAD, no
+wallpaper, no font and no icons.
+
+The entry is written to be deleted. The owner, 2026-08-08: *"we can make doom
+optional later. its not a required part of toyos and the future vision is to
+download it via package manager."* When the WAD stops being committed the
+section goes; it must not decay into a permanent-sounding notice for a file
+that is no longer there.
 
 ### 7c. `assets/JetBrainsMono-Regular.ttf` — OFL 1.1, notice not carried
 
@@ -323,6 +490,15 @@ guess at.
 
 **Recommendation.** Carry the OFL text. It is a file.
 
+#### CLOSED 2026-08-08
+
+`licenses/OFL-1.1-JetBrainsMono.txt`, taken from the JetBrains Mono
+distribution so it arrives with their copyright line above the licence, which
+is the form the OFL asks for. `NOTICE` names the font and both derived
+artifacts. The rasterization question is recorded there and not answered —
+answering it is not an agent's to do. The OFL's reserved-name clause is not
+engaged either way: neither artifact is distributed as a font under the name.
+
 ### 7d. `assets/icons/*.svg` — Phosphor Icons, MIT, attribution not carried
 
 All eight are **byte-identical** to files in the Phosphor Icons distribution:
@@ -338,6 +514,13 @@ notice to be included in copies. The icons ship in every initrd as
 `share/icons/*.svg`.
 
 **Recommendation.** Carry the MIT notice for them. Same shape as 7c.
+
+#### CLOSED 2026-08-08
+
+`licenses/MIT-PhosphorIcons.txt`, and `NOTICE` names all eight with the
+subdirectory each came from. The byte-identity was re-verified rather than
+taken from this document: four match `SVGs/bold/` and four `SVGs Flat/bold/`,
+which is what the audit found and what a second `cmp` sweep confirms.
 
 ### 7e. `ovmf/*.fd` — third-party firmware blobs, 6,291,456 bytes
 
@@ -361,6 +544,24 @@ installation — which would put it inside the "comes with QEMU" allowance and
 delete 6.3 MB from the repository. The second reading is available because
 firmware is QEMU's input, not ours.
 
+#### CLOSED as attribution 2026-08-08; the two questions stay open
+
+`licenses/BSD-2-Clause-Patent-EDK2.txt` is EDK II's own `License.txt`, and
+`NOTICE` records each file's size, hash and the build path read out of it.
+Neither of the recommendations above is taken — both are the owner's, and
+declaring the artifact is what makes either of them a decision rather than a
+discovery.
+
+**One correction to the paragraph above: "three committed files, and they are
+load-bearing" is wrong about the third.** `ovmf/DEBUGX64_OVMF.fd` is
+4,194,304 bytes that nothing in the tree references — `grep -rn 'ovmf\|OVMF'`
+over every `.rs`, `.toml` and `.yml` outside `target/` and `rust/` finds
+`OVMF_CODE-pure-efi.fd` and `OVMF_VARS-pure-efi.fd` at `src/qemu.rs:101,103`
+and `tests/common/qemu.rs:2207,2212`, and no reader of the third at all. It is
+also a *different* build from the other two: its embedded path is `/src/edk2`,
+not the Jenkins worker's. So it is a third of the repository's firmware bytes
+serving nothing that has been found.
+
 ### 7f. `assets/wallpaper.jpg` — provenance genuinely unknown
 
 336,669 bytes, 1920×1080, `sha256 278d580d…`. It carries JFIF, an EXIF block and
@@ -375,6 +576,20 @@ worse than the open question.
 **Recommendation.** The owner is the only person who can say. If the answer is
 not recoverable, replace it — an unattributable image in a repository offered
 under MIT is a liability that costs one afternoon to remove.
+
+#### STILL OPEN, and deliberately — 2026-08-08
+
+Re-checked rather than repeated: `strings` finds JFIF, an Exif block and a
+Photoshop 3.0 IRB and no credit of any kind; there is no IPTC block; `mdls`
+reports only filesystem dates and an sRGB profile. No `Artist`, no `Copyright`,
+no author string anywhere in the file.
+
+`NOTICE` carries it as an entry that names the gap in those words. That is the
+whole of what an agent may do here: **inventing a licence for it would be worse
+than the open question**, because the next reader would have no reason to doubt
+it. It ships as `share/wallpaper.rgb` in the default and console images and
+therefore in anything the owner hands to anyone. The decision — recall its
+origin, or replace it — is his, and it is the one item in §7 that is still live.
 
 ### 7g. Clean by inspection
 
@@ -598,11 +813,15 @@ spends a day on it.
 Filed in `specs/known-issues.md` §6 (Build and toolchain), each pointing here:
 
 - Python and the host C toolchain as undeclared build prerequisites (§3, §4).
+  **Now declared** — the entry says so and stays open, because declaring is not
+  removing.
 - `df`, `ps` and `find` as external binaries (§5); `find` is new to the list.
-- doomgeneric downloaded unpinned from a moving branch (§6).
-- `dosfstools` in a committed workflow (§2).
+  **Now declared, still there.**
+- doomgeneric downloaded unpinned from a moving branch (§6). **CLOSED.**
+- `dosfstools` in a committed workflow (§2). Open; the CI agent owns it.
 - The licence and provenance gaps (§7), including the DECUS "not for profit"
-  file, which is the sharpest of them.
+  file, which is the sharpest of them. **CLOSED except `assets/wallpaper.jpg`**,
+  which only the owner can close.
 
 Not filed, because another agent owns them: the three macOS FAT tools
 (replacement being scoped) and `assets/timgm6mb.sf2` (being removed).

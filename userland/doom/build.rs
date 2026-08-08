@@ -2,12 +2,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, path::Path};
 
+/// The upstream doomgeneric commit `/bin/doom` is built from. `forks.toml`
+/// records it as the estate's one non-crate third-party source.
+///
+/// Everything this project measures about doom is a measurement of *these*
+/// sources. Fetching `refs/heads/master` instead made which ones a function of
+/// the day the fetch happened, and two checkouts could differ with nothing
+/// reporting it.
+const DOOMGENERIC_COMMIT: &str = "fc601639494e089702a1ada082eb51aaafc03722";
+
+/// Written into the extracted tree, so the pin binds a checkout that already
+/// has one. Testing only whether the directory exists is the defect itself: a
+/// tree fetched before the pin existed would never be replaced by it.
+const PIN_STAMP: &str = ".toyos-commit";
+
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dg_dir = root.join("doomgeneric");
 
-    if !dg_dir.exists() {
+    let at = fs::read_to_string(dg_dir.join(PIN_STAMP)).ok();
+    if at.as_deref().map(str::trim) != Some(DOOMGENERIC_COMMIT) {
+        if dg_dir.exists() {
+            println!(
+                "cargo:warning=doomgeneric/ is at {} and the pin is {DOOMGENERIC_COMMIT}; \
+                 replacing it. That directory is gitignored, so anything edited in place \
+                 there goes with it.",
+                at.as_deref().map(str::trim).unwrap_or("no recorded commit")
+            );
+            fs::remove_dir_all(&dg_dir).expect("failed to remove the stale doomgeneric tree");
+        }
         download_doomgeneric(&root);
+        fs::write(dg_dir.join(PIN_STAMP), DOOMGENERIC_COMMIT).expect("failed to record the pin");
     }
 
     // Use pre-built toyos-cc host binary (built by the build system's toolchain phase).
@@ -143,10 +168,14 @@ fn http_agent() -> ureq::Agent {
 }
 
 fn download_doomgeneric(root: &Path) {
-    println!("Downloading doomgeneric...");
+    println!("Downloading doomgeneric {DOOMGENERIC_COMMIT}...");
     let agent = http_agent();
+    // The commit is the checksum: GitHub's archive of a sha is that sha's tree
+    // and can be nothing else, so pinning the URL needs no second hash of ours.
     let resp = agent
-        .get("https://github.com/ozkl/doomgeneric/archive/refs/heads/master.tar.gz")
+        .get(format!(
+            "https://github.com/ozkl/doomgeneric/archive/{DOOMGENERIC_COMMIT}.tar.gz"
+        ))
         .call()
         .expect("failed to download doomgeneric");
     let gz = flate2::read::GzDecoder::new(resp.into_body().into_reader());
@@ -155,7 +184,7 @@ fn download_doomgeneric(root: &Path) {
     for entry in archive.entries().expect("failed to read archive") {
         let mut entry = entry.expect("failed to read entry");
         let path = entry.path().expect("failed to read path").into_owned();
-        // Archive structure: doomgeneric-master/doomgeneric/<files>
+        // Archive structure: doomgeneric-<commit>/doomgeneric/<files>
         // We want only the doomgeneric/ subdirectory contents.
         let components: Vec<_> = path.components().collect();
         if components.len() < 3 {

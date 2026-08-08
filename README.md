@@ -9,9 +9,13 @@ cd toyos
 cargo run
 ```
 
-That is the whole setup. Rust and QEMU, one command, and a complete OS boots.
-No Make, no CMake, no Docker, no LLVM to install, no cross-toolchain to
-assemble, no system linker. Everything else is in the repository.
+One command, and a complete OS boots. No Make, no CMake, no Docker, no LLVM to
+install, no cross-toolchain to assemble, no system linker. Everything that
+boots is built by a toolchain in this repository.
+
+Rust and QEMU, plus the two things `rustc`'s own bootstrap needs on every
+platform — [Prerequisites](#prerequisites) says exactly what they are and why
+nothing that boots goes near them.
 
 The name has no meaning. This is not a hobby project.
 
@@ -219,6 +223,24 @@ same font the kernel blits.
 
 - Rust, with rustup
 - QEMU
+- A C compiler on `PATH` as `cc`, and a Python 3
+
+The last line is `rustc`'s and not ToyOS's, and nothing that boots touches it.
+`rustc` links every **host** binary through `cc`, which rustup does not
+install. And `rust/x`, the entry point to rustc's own bootstrap, is a shell
+script whose whole job is to find a Python to run `bootstrap.py` with — so a
+clean clone needs one, and so does every toolchain change.
+
+Nothing in the OS goes near either. `bootloader/`, `kernel/` and `userland/`
+all link with `toyos-ld`, and no image contains a C toolchain or a Python. On
+macOS both arrive with the Xcode Command Line Tools; on Debian and Ubuntu they
+are `build-essential` and `python3`.
+
+`cargo run` names anything it needs and cannot find, before it does anything
+else — including `df`, `ps` and `find`, which cost one feature each rather than
+the build. The full accounting of everything this project depends on that it
+did not write, with a verdict on each, is
+`specs/dependency-audit-2026-08-08.md`.
 
 Linux and macOS. Windows is a goal, not a claim — the build system still
 assumes Unix in places, and nothing should be advertised until a clean Windows
@@ -311,9 +333,16 @@ Licensed under either of
 
 at your option.
 
-Two exceptions: `userland/doom` links
-[doomgeneric](https://github.com/ozkl/doomgeneric) and is therefore GPL-2.0,
-and third-party crates keep their own upstream licenses.
+Some of what the repository carries is not ours and is under other terms:
+`userland/doom` is GPL-2.0, `assets/` holds a font, a set of icons, a wallpaper
+and id Software's Doom shareware IWAD, `ovmf/` holds EDK II firmware builds,
+and `tests/testcases/` holds TinyCC's test corpus. Third-party crates keep
+their own upstream licenses. **[NOTICE](NOTICE) is the list**, item by item,
+with the licence texts in [licenses/](licenses).
+
+One of them constrains what you may do with a build: the shareware IWAD may be
+redistributed freely but not sold and not modified, so **an image carrying it
+may not be sold**. NOTICE says which images carry it.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this project shall be dual licensed as above, without any
