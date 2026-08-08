@@ -97,8 +97,8 @@ use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 /// Per-CPU panic-reentry depth, indexed by x2APIC id (masked). The panic path
 /// must not trust GS/percpu: a corrupted percpu block makes `swap_fault_state`
 /// itself fault, re-entering the panic handler in an unbounded recursion that
-/// smashes the stack down through the heap. `rdmsr(IA32_X2APIC_APICID)` is the
-/// only per-CPU discriminator that needs no memory access at all.
+/// smashes the stack down through the heap. CPUID is the only per-CPU
+/// discriminator that needs no memory access and no enabled unit at all.
 ///
 /// A single global flag was rejected: it would stay set after a *recovered*
 /// panic and silently swallow every later, independent panic report, and a
@@ -109,13 +109,34 @@ use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 static PANIC_DEPTH: [core::sync::atomic::AtomicU32; 64] =
     [const { core::sync::atomic::AtomicU32::new(0) }; 64];
 
-const IA32_X2APIC_APICID: u32 = 0x802;
+/// This CPU's APIC id, from CPUID.
+///
+/// It used to be `rdmsr(IA32_X2APIC_APICID)` under a comment claiming APs
+/// enable x2APIC before running any panicking kernel code. They do not:
+/// `apic::init_ap` is three calls after `percpu::init_ap` in `ap_entry`, and
+/// that MSR is `#GP` until it has run. Every panic an AP took in between —
+/// `pat::init`'s assertion, `control_regs`', the FSGSBASE one that has been
+/// there all along — faulted *inside the reentry guard*, before the guard was
+/// armed, and the machine triple-faulted with the whole boot still unflushed in
+/// the log ring: no report, no backtrace, no serial output at all.
+///
+/// Leaf 0x1F and leaf 0xB give the full x2APIC id and leaf 1 the 8-bit initial
+/// one; the slot is masked to 64 either way, so the fallback loses nothing this
+/// array was keeping.
+fn apic_id() -> u32 {
+    let (max_leaf, _, _, _) = cpu::cpuid(0, 0);
+    for leaf in [0x1F, 0x0B] {
+        if max_leaf >= leaf {
+            let (_, _, _, edx) = cpu::cpuid(leaf, 0);
+            return edx;
+        }
+    }
+    let (_, ebx, _, _) = cpu::cpuid(1, 0);
+    ebx >> 24
+}
 
 fn panic_depth_slot() -> &'static core::sync::atomic::AtomicU32 {
-    // Safe once PERCPU_READY: apic::init (x2APIC enable) precedes it on the
-    // BSP, and APs enable x2APIC before running any panicking kernel code.
-    let id = cpu::rdmsr(IA32_X2APIC_APICID) as usize;
-    &PANIC_DEPTH[id & 63]
+    &PANIC_DEPTH[apic_id() as usize & 63]
 }
 
 /// Fixed-string output for the reentry path: direct UART port I/O — no
@@ -301,6 +322,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     drivers::panic_console::arm(&kernel_args, maps);
 
     serial::init();
+
+    // Before `pat::init`, which restores the CR0 it found around its own
+    // no-fill window and would carry a firmware CD straight through it.
+    arch::control_regs::init_cr0(0);
 
     // Before `panic_console::remap` and `mm::init`, which are the first things
     // to map a page selecting the entry it writes.

@@ -52,6 +52,77 @@ pub fn read_rsp() -> u64 {
     rsp
 }
 
+/// CPUID with both index registers, `rbx` saved by hand because Rust reserves
+/// it as a general operand.
+pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+    let eax: u32;
+    let ebx: u32;
+    let ecx: u32;
+    let edx: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "cpuid",
+            "mov {ebx:e}, ebx",
+            "pop rbx",
+            ebx = out(reg) ebx,
+            inout("eax") leaf => eax,
+            inout("ecx") subleaf => ecx,
+            out("edx") edx,
+            options(nomem),
+        );
+    }
+    (eax, ebx, ecx, edx)
+}
+
+#[inline]
+pub fn read_cr0() -> u64 {
+    let value: u64;
+    unsafe { asm!("mov {}, cr0", out(reg) value, options(nomem, nostack)); }
+    value
+}
+
+#[inline]
+pub fn read_cr4() -> u64 {
+    let value: u64;
+    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack)); }
+    value
+}
+
+/// # Safety
+/// Every bit of CR0 is written, so the caller owns the whole machine
+/// configuration rather than one flag of it —
+/// [`control_regs`](super::control_regs) is where that decision lives.
+#[inline]
+pub unsafe fn write_cr0(value: u64) {
+    asm!("mov cr0, {}", in(reg) value, options(nostack));
+}
+
+/// # Safety
+/// A bit this CPU does not define is `#GP`, and clearing `PAE` or `LA57` in long
+/// mode is `#GP` too. [`control_regs`](super::control_regs) is the only caller
+/// and asks CPUID first.
+#[inline]
+pub unsafe fn write_cr4(value: u64) {
+    asm!("mov cr4, {}", in(reg) value, options(nostack));
+}
+
+/// # Safety
+/// Writes back and invalidates every cache level. Only correct inside the
+/// no-fill window SDM Vol. 3A §11.11.8 puts it in.
+#[inline]
+pub unsafe fn wbinvd() {
+    asm!("wbinvd", options(nostack, preserves_flags));
+}
+
+/// Clear `RFLAGS.AC`, so a supervisor access to a user page faults under SMAP.
+///
+/// `#UD` on a CPU without SMAP.
+#[inline]
+pub fn clac() {
+    unsafe { asm!("clac", options(nomem, nostack)); }
+}
+
 #[inline]
 pub fn read_cr2() -> u64 {
     let value: u64;
@@ -119,199 +190,6 @@ pub fn disable_interrupts() {
     unsafe {
         asm!("cli", options(nomem, nostack));
     }
-}
-
-/// Enable SSE/SSE2+ by setting CR4.OSFXSR and CR4.OSXMMEXCPT.
-/// Must be called on each CPU before any SSE instructions execute.
-pub fn enable_sse() {
-    unsafe {
-        asm!(
-            "mov {0}, cr4",
-            "or {0}, 0x600",   // bit 9 = OSFXSR, bit 10 = OSXMMEXCPT
-            "mov cr4, {0}",
-            out(reg) _,
-            options(nostack),
-        );
-    }
-}
-
-/// Enable SMEP (Supervisor Mode Execution Prevention). Returns whether the
-/// CPU had it.
-///
-/// When enabled, the kernel cannot execute code on user-accessible pages.
-/// Must be called on each CPU during init — silently, because every CPU in a
-/// machine answers this identically and `percpu::init_bsp` reports the answer
-/// once for all of them.
-pub fn enable_smep() -> bool {
-    // Check CPUID leaf 7, subleaf 0, EBX bit 7
-    let ebx: u32;
-    unsafe {
-        asm!(
-            "push rbx",
-            "mov eax, 7",
-            "xor ecx, ecx",
-            "cpuid",
-            "mov {0:e}, ebx",
-            "pop rbx",
-            out(reg) ebx,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem),
-        );
-    }
-    if ebx & (1 << 7) == 0 {
-        return false;
-    }
-    unsafe {
-        asm!(
-            "mov {0}, cr4",
-            "or {0}, 1 << 20",  // CR4.SMEP
-            "mov cr4, {0}",
-            out(reg) _,
-            options(nostack),
-        );
-    }
-    true
-}
-
-/// Enable SMAP (Supervisor Mode Access Prevention). Returns whether the CPU
-/// had it.
-///
-/// When enabled, kernel code cannot access user pages unless RFLAGS.AC=1 (set by STAC).
-/// Must be called on each CPU during init; silent for the same reason as
-/// [`enable_smep`].
-pub fn enable_smap() -> bool {
-    // Check CPUID leaf 7, subleaf 0, EBX bit 20
-    // rbx cannot be used as an inline asm operand in Rust, so save/restore manually.
-    let ebx: u32;
-    unsafe {
-        asm!(
-            "push rbx",
-            "mov eax, 7",
-            "xor ecx, ecx",
-            "cpuid",
-            "mov {0:e}, ebx",
-            "pop rbx",
-            out(reg) ebx,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem),
-        );
-    }
-    if ebx & (1 << 20) == 0 {
-        return false;
-    }
-    unsafe {
-        asm!(
-            "mov {0}, cr4",
-            "or {0}, 1 << 21",  // CR4.SMAP
-            "mov cr4, {0}",
-            "clac",             // clear AC — kernel cannot access user pages by default
-            out(reg) _,
-            options(nostack),
-        );
-    }
-    true
-}
-
-/// Enable FSGSBASE instructions (rdfsbase, rdgsbase, wrfsbase, wrgsbase).
-/// Returns whether the CPU had it.
-///
-/// The CPUID gate is not defensive: setting a CR4 bit the CPU does not define
-/// is #GP, and this runs on the BSP before `idt::init`, where a #GP is a triple
-/// fault with no handler and no report. Every other feature here was already
-/// gated; this one was not, and nothing in TCG or on the T14 would have shown
-/// it, because both have FSGSBASE. It is a boot-time crash on the first
-/// machine we try that does not.
-///
-/// Must be called on each CPU during init, before any FSGSBASE instruction is
-/// used. Silent, for the reason [`enable_smep`] is.
-pub fn enable_fsgsbase() -> bool {
-    // CPUID leaf 7, subleaf 0, EBX bit 0.
-    let ebx: u32;
-    unsafe {
-        asm!(
-            "push rbx",
-            "mov eax, 7",
-            "xor ecx, ecx",
-            "cpuid",
-            "mov {0:e}, ebx",
-            "pop rbx",
-            out(reg) ebx,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem),
-        );
-    }
-    if ebx & 1 == 0 {
-        return false;
-    }
-    unsafe {
-        asm!(
-            "mov {0}, cr4",
-            "or {0}, 1 << 16",  // CR4.FSGSBASE
-            "mov cr4, {0}",
-            out(reg) _,
-            options(nostack),
-        );
-    }
-    true
-}
-
-/// Enable PCID + INVPCID if both are supported. Returns true if enabled.
-/// PCID without INVPCID is not useful — we need INVPCID for targeted flushes.
-/// Must be called on each CPU. CR3 must have PCID 0 when called.
-pub fn enable_pcid() -> bool {
-    // CPUID leaf 1, ECX bit 17 = PCID
-    let ecx: u32;
-    unsafe {
-        asm!(
-            "push rbx",
-            "mov eax, 1",
-            "cpuid",
-            "mov {0:e}, ecx",
-            "pop rbx",
-            out(reg) ecx,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem),
-        );
-    }
-    if ecx & (1 << 17) == 0 { return false; }
-
-    // CPUID leaf 7, subleaf 0, EBX bit 10 = INVPCID
-    let ebx: u32;
-    unsafe {
-        asm!(
-            "push rbx",
-            "mov eax, 7",
-            "xor ecx, ecx",
-            "cpuid",
-            "mov {0:e}, ebx",
-            "pop rbx",
-            out(reg) ebx,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem),
-        );
-    }
-    if ebx & (1 << 10) == 0 { return false; }
-
-    unsafe {
-        asm!(
-            "mov {0}, cr4",
-            "or {0}, 1 << 17",  // CR4.PCIDE
-            "mov cr4, {0}",
-            out(reg) _,
-            options(nostack),
-        );
-    }
-    true
 }
 
 #[inline]

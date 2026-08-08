@@ -254,15 +254,21 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
 }
 
 extern "C" fn ap_entry() -> ! {
-    // First, and before this CPU can reach a page that selects the entry it
-    // writes: the framebuffer is already mapped write-combining by now.
+    // The trampoline reaches long mode by OR-ing two bits into whatever INIT
+    // left in CR0, so this is the first instruction that gives this CPU the
+    // machine configuration the rest of the kernel is written against — and it
+    // is before `pat::init`, which restores the CR0 it found.
+    crate::arch::control_regs::init_cr0(percpu::cpu_id());
+
+    // Before this CPU can reach a page that selects the entry it writes: the
+    // framebuffer is already mapped write-combining by now.
     crate::arch::pat::init();
 
     // Switch from boot PML4 (identity + high-half) to kernel PML4 (high-half only).
     // We're already executing at a high-half address, so this is safe.
     unsafe { crate::mm::paging::kernel_cr3().load_flush(); }
 
-    // GS base was set by the trampoline; finish percpu init (GDT, SSE, SMAP).
+    // GS base was set by the trampoline; finish percpu init (GDT, CR4).
     percpu::init_ap(percpu::percpu_ptr());
     syscall::init();
     apic::init_ap();
