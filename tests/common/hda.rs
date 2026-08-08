@@ -512,10 +512,33 @@ pub fn hda_two_live_refused(
         test_config,
         c_bins,
         rust_bins,
-        BootOptions { profile: Profile::HdaTwoLive, ..Default::default() },
+        BootOptions { profile: Profile::HdaTwoLive, qmp: true, ..Default::default() },
     );
     let mut log = Serial::boot(&qemu);
     log.push(&qemu.drain_serial(Duration::from_secs(1)));
+    if !log.text().contains("presenting a null sink") {
+        let more = qemu.drain_serial(Duration::from_secs(8));
+        eprintln!(
+            "  [PROBE] absent after 1 s; a further 8 s of nobody touching the guest gave:\n{more}"
+        );
+        log.push(&more);
+    }
+    if !log.text().contains("presenting a null sink") {
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            input.keys(&[
+                ("ctrl", true),
+                ("alt", true),
+                ("d", true),
+                ("d", false),
+                ("alt", false),
+                ("ctrl", false),
+            ]);
+        }
+        let dump = qemu.drain_serial(Duration::from_secs(8));
+        eprintln!("  [PROBE] Ctrl+Alt+D said:\n{dump}");
+        log.push(&dump);
+    }
 
     log.must_say("hda: 00:")?;
     log.must_say("has a live link (statests=")?;

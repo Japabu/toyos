@@ -736,6 +736,7 @@ pub fn null_sink_real_rate(
         rust_bins,
         BootOptions {
             profile: qemu::Profile::Metal,
+            qmp: true,
             ..Default::default()
         },
     );
@@ -745,8 +746,40 @@ pub fn null_sink_real_rate(
     // races the ready marker.
     const NULL_LINE: &str = "soundd: no audio device, presenting a null sink";
     let mut early = qemu.boot_log().to_string();
+    let t0 = Instant::now();
     if !early.contains(NULL_LINE) {
         early.push_str(&qemu.drain_serial(Duration::from_millis(500)));
+    }
+    eprintln!(
+        "  [PROBE] after 500 ms: present={} at {:.3}s",
+        early.contains(NULL_LINE),
+        t0.elapsed().as_secs_f64()
+    );
+    if !early.contains(NULL_LINE) {
+        let more = qemu.drain_serial(Duration::from_secs(8));
+        eprintln!(
+            "  [PROBE] after a further 8 s of nobody touching the guest: present={} at {:.3}s; \
+             what arrived:\n{more}",
+            more.contains(NULL_LINE),
+            t0.elapsed().as_secs_f64()
+        );
+        early.push_str(&more);
+    }
+    if !early.contains(NULL_LINE) {
+        {
+            let mut input = qemu::QmpInput::open(qemu.qmp_socket());
+            input.keys(&[
+                ("ctrl", true),
+                ("alt", true),
+                ("d", true),
+                ("d", false),
+                ("alt", false),
+                ("ctrl", false),
+            ]);
+        }
+        let dump = qemu.drain_serial(Duration::from_secs(8));
+        eprintln!("  [PROBE] Ctrl+Alt+D said:\n{dump}");
+        early.push_str(&dump);
     }
     if !early.contains(NULL_LINE) {
         return Err(format!(
