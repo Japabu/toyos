@@ -154,6 +154,11 @@ const RUST_SKIP: &[&str] = &[
     // Needs a compositor, a terminal and a shell: `desktop_window_child`
     // launches it from that shell.
     "window_child",
+    // Its two spawning arms only mean anything when the two processes share a
+    // CPU, and the shared boot has two. `fpu_isolation` gives it a machine with
+    // one — and a second boot on the kernel that saves nothing, which is the
+    // only thing that proves the arms have teeth.
+    "fpu_isolation",
     // Needs netd with a NIC. `netd_connection_caps` runs it on tests/netcase.
     "netd_caps",
     // Same reason, same config: `netd_hostile_peer` runs it there.
@@ -379,6 +384,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("nvme_wide_sector", Sched::Parallel),
     ("iommu_discovery", Sched::Parallel),
     ("readdir_bound", Sched::Parallel),
+    // Two boots, and the verdict is that they answer differently. Nothing in it
+    // is timed: every arm is a process exit code or a byte comparison.
+    ("fpu_isolation", Sched::Parallel),
     ("short_sleep_livelock", Sched::Parallel),
     ("i8042_health", Sched::Parallel),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
@@ -7443,6 +7451,72 @@ fn run_machine_test(
             for line in result.stdout.lines().filter(|l| l.contains("PASS")) {
                 eprintln!("  [readdir]{}", line.trim_start_matches("  PASS"));
             }
+            Ok(())
+        }
+        "fpu_isolation" => {
+            // `specs/user-machine-state.md` §10. Two boots that must answer
+            // differently: the shipped kernel preserves the whole user machine
+            // state across every transition out of Ring 3, and the kernel built
+            // with `fpu-save-nothing` — the same bracket with the two FP
+            // instructions taken out — must fail the same three arms.
+            //
+            // Without the second arm the first proves only that the machine
+            // works, which it did before this gate existed too.
+            //
+            // smp=1 in both, and that is the stronger machine rather than the
+            // weaker one: two of the arms are about a register file surviving
+            // from one process to the next, which needs the two to share a CPU.
+            // On the shared boot's two CPUs that is a coin flip, which is why
+            // CI's own observation of the defect was intermittent.
+            let one_cpu = || BootOptions { smp: 1, ..BootOptions::default() };
+
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, one_cpu());
+            serial::Serial::boot(&qemu).must_be_clean()?;
+            let result = qemu.run_test("test_rs_fpu_isolation", Duration::from_secs(120));
+            if let Some(err) = &result.error {
+                return Err(format!(
+                    "the guest stopped answering: {err}\nserial:\n{}",
+                    result.serial
+                ));
+            }
+            if !check_rust_result(&result) {
+                return Err(format!("fpu_isolation failed:\n{}", result.stdout));
+            }
+            // No `must_be_clean` on the run: arm 2 kills `fault_gate_child`
+            // on purpose, and the kernel names every Ring 3 fault it takes.
+            for line in result.stdout.lines() {
+                eprintln!("  [fpu] {}", line.trim());
+            }
+            // The lane's disk images are one set, and QEMU takes a write lock
+            // on them for as long as a guest lives.
+            drop(qemu);
+
+            let mut blind = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions { kernel_features: &["fpu-save-nothing"], ..one_cpu() },
+            );
+            serial::Serial::boot(&blind).must_be_clean()?;
+            let negative = blind.run_test("test_rs_fpu_isolation", Duration::from_secs(120));
+            if let Some(err) = &negative.error {
+                return Err(format!(
+                    "the negative-control guest stopped answering: {err}\nserial:\n{}",
+                    negative.serial
+                ));
+            }
+            if negative.exit_code == Some(0) {
+                return Err(format!(
+                    "the kernel built with `fpu-save-nothing` passed `fpu_isolation`, so the \
+                     gate asserts nothing:\n{}",
+                    negative.stdout
+                ));
+            }
+            eprintln!(
+                "  [fpu] fpu-save-nothing: exit {:?}, which is the gate having teeth",
+                negative.exit_code
+            );
             Ok(())
         }
         "short_sleep_livelock" => {

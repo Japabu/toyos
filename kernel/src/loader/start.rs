@@ -4,8 +4,7 @@
 //! Everything else — the address space, the relocations, the TLS block — is
 //! arch-neutral, so a second architecture adds this file and nothing more.
 
-use core::arch::naked_asm;
-
+use crate::arch::entry::{initial_user_state, ring3_trampoline_asm};
 use crate::fd::FdTable;
 use crate::process::{fd_owner_data, OwnedAlloc, KERNEL_STACK_SIZE};
 use crate::scheduler;
@@ -42,14 +41,19 @@ pub(crate) fn alloc_kernel_stack(
 
 /// Entry point for new processes, reached through `context_switch`'s `ret`.
 /// r12 = entry point, r13 = user stack pointer.
+///
+/// The state is loaded after the unlock and not before: what it displaces is
+/// whatever the CPU's previous tenant left in the registers, and the unlock is
+/// still that tenant's kernel code.
 #[unsafe(naked)]
 pub(crate) extern "C" fn process_start() {
-    naked_asm!(
+    ring3_trampoline_asm!(
         "push r12",
         "push r13",
         "call {unlock}",
         "pop r13",
         "pop r12",
+        initial_user_state!(),
         "push {user_ss}",
         "push r13",         // RSP: user stack
         "push 0x202",       // RFLAGS: IF=1
@@ -65,7 +69,7 @@ pub(crate) extern "C" fn process_start() {
 /// Entry point for new threads. r14 carries the argument, which lands in rdi.
 #[unsafe(naked)]
 pub(crate) extern "C" fn thread_start() {
-    naked_asm!(
+    ring3_trampoline_asm!(
         "push r12",
         "push r13",
         "push r14",
@@ -73,6 +77,7 @@ pub(crate) extern "C" fn thread_start() {
         "pop r14",
         "pop r13",
         "pop r12",
+        initial_user_state!(),
         "mov rdi, r14",
         "sub r13, 8",       // ABI: RSP must be 16n+8 at function entry
         "push {user_ss}",

@@ -78,13 +78,27 @@ handler is a debugging facility that a userland process can summon at will, and
 it resumes a fault it has no way to stop. #DB from Ring 3 with no debugger
 attached has one correct answer, and it is the one every other fault gets.
 
-### No context switch saves x87 state
+### CLOSED — no transition out of Ring 3 saved x87 state, and two of them saved nothing at all
 
-Verified by grep across `kernel/src`: there is no `fxsave`, `fnsave` or
-`fsave` anywhere. XMM0–15 and MXCSR *are* saved and restored on all three
+**Closed by `wt/toyos-fpu`: `specs/user-machine-state.md` is the invariant, the
+design and the measurements.** `arch/entry.rs`'s `save_user_state!` /
+`restore_user_state!` is the one bracket, `fxsave64`/`fxrstor64` is its body,
+and all five Ring 3-reachable entries use it — including `common_entry` (all
+nineteen exception vectors, `#PF` among them) and `tlb_flush_entry`, which
+saved nothing at all and could return to Ring 3 holding another thread's XMM
+registers. `syscall_entry` restored *before* its exit-to-user epilogue, which
+can switch, and now brackets that too. The loader's trampolines load a declared
+initial state, so a task that has never been in Ring 3 starts from one. Gate:
+`fpu_isolation`, three arms and a `fpu-save-nothing` negative control that must
+fail all of them.
+
+The record of what it was:
+
+Verified by grep across `kernel/src`: there was no `fxsave`, `fnsave` or
+`fsave` anywhere. XMM0–15 and MXCSR *were* saved and restored on three
 Ring 3 entry paths — `arch/syscall.rs`, `idt/timer.rs`, `idt/device_irq.rs` —
-and the x87 register file, control word, status word and tag word are on none
-of them. So one process's x87 state, including a pending unmasked exception, is
+and the x87 register file, control word, status word and tag word on none
+of them. So one process's x87 state, including a pending unmasked exception, was
 visible to the next.
 
 **No longer latent, and CI is what showed it.** The paragraph that used to stand
@@ -130,22 +144,27 @@ difference is `fault_gate_child`'s control word.
 fdivp; fwait; fnstsw; fninit` runs and `fdivp` still raises IE, and nothing is
 left pending. Six for six each way.
 
-**So this is an isolation defect and not a latent one.** Any Ring 3 process can
-unmask an x87 exception, provoke it and die, and the next unrelated process
-scheduled on that CPU takes a #MF it never caused and is killed for it. Nothing
-in the process's own state is involved — the FPU is per-CPU and nothing saves it.
-`std_unwind` is the reproducer; `fault_gate_child` is an ordinary userland program
-doing nothing privileged.
+**So this was an isolation defect and not a latent one.** Any Ring 3 process
+could unmask an x87 exception, provoke it and die, and the next unrelated
+process scheduled on that CPU took a #MF it never caused and was killed for it.
+Nothing in the process's own state was involved — the FPU is per-CPU and nothing
+saved it. `std_unwind` was the reproducer; `fault_gate_child` is an ordinary
+userland program doing nothing privileged.
 
-It is also still the only hypothesis on offer for a **#MF that goes missing under
-load**, and that one is not settled. `fault_gates`' `mf` arm sets
-IM, computes 0/0, and expects the `fwait` two bytes later to trap. It killed
-the child 6 of 6 alone and survived once in a 12-wide suite — and the status
-word it printed on the run that survived was **`0xb881`**: IE set, ES set,
-TOP=7, which is our own sequence's state, on the same `fnstsw` two instructions
-past the `fwait` that should have raised on exactly that ES. So the state was
-not lost; the trap was. Not explained by the missing save on its own, and not
-explained at all. The arm no longer asserts its exit code.
+`fpu_isolation`'s fault arm is that reproduction, made deliberate and made
+local: on the `fpu-save-nothing` kernel it reports `FLDCW took an exception the
+process never caused` three times of three, and on the shipped kernel it
+survives.
+
+**The #MF that goes missing under load now has a mechanism**, and it is not this
+one. `fault_gates`' `mf` arm killed its child 6 of 6 alone and survived once in
+a 12-wide suite, printing status word **`0xb881`** — IE set, ES set, TOP=7 — on
+the `fnstsw` two instructions past the `fwait` that should have raised on
+exactly that ES. The state was not lost; the trap was. §3's AP control-register
+entry is why: `CR0.NE` is clear on every CPU but the BSP, so an unmasked x87
+exception there is signalled on the FERR# pin instead of `#MF`, and nothing is
+listening. Confirming it means pinning that arm to an AP. The arm still does not
+assert its exit code.
 
 ### sshd's keys are as protected as any other file, which is not at all
 
@@ -1354,9 +1373,31 @@ cpu2: cr0=0xe0000011 cr4=0x00310620     cpu2: cr0=0x80010033 cr4=0x00310668
 cpu3: cr0=0xe0000011 cr4=0x00310620     cpu3: cr0=0x80010033 cr4=0x00310668
 ```
 
-`wt/toyos-fpu` found it (`arch/fpu.rs::log_state`, `specs/user-machine-state.md`
-§7) and opened this entry there; its copy still says OPEN and should be dropped
-rather than merged when PR #3 lands, because this is the same defect.
+`wt/toyos-fpu` found it and opened this entry (`arch/fpu.rs::log_state`,
+`specs/user-machine-state.md` §7); what follows through the table is its
+account, kept because the consequences are the reason the fix matters.
+
+| bit | BSP | AP | consequence |
+|---|---|---|---|
+| `CR0.CD` (30), `CR0.NW` (29) | 0 | **1** | **caching disabled on every CPU but cpu0** |
+| `CR0.NE` (5) | 1 | **0** | an unmasked x87 exception goes to FERR#/IGNNE, not `#MF` |
+| `CR0.WP` (16) | 1 | **0** | supervisor writes ignore the read-only bit |
+| `CR0.MP` (1) | 1 | **0** | `WAIT`/`FWAIT` no longer trap on `TS` |
+| `CR4.MCE` (6) | 1 | **0** | a machine check is a shutdown, not `#MC` |
+| `CR4.DE` (3) | 1 | **0** | debug-register access semantics differ |
+
+**`WP` clear was an isolation weakening**, not a hole userland could reach on
+its own — a kernel bug writing through a read-only kernel mapping succeeded on 7
+of 8 CPUs and faulted on cpu0, which is the worst kind of bug to own. **`MCE`
+clear** turned a machine check into a shutdown with no report, on every CPU but
+the BSP, on the one machine with no serial port.
+
+`CR4.OSXSAVE` is clear on both CPUs on this host, so `user-machine-state.md`
+§7's first hypothesis — firmware leaving `OSXSAVE` set, cpu0 permitting AVX and
+the APs `#UD`ing on it, a migrating thread faulting — still **cannot be answered
+here**. It is now unreachable rather than unanswered: `OSXSAVE` is in the
+declaration as a bit that must be *clear*, so firmware's choice no longer
+survives into an AP or into the BSP.
 
 Gates: `control_regs` boots four CPUs and reads every one's registers against
 the bits by name; `control_regs_verdict` runs that verdict against the values
@@ -6889,6 +6930,38 @@ flash, read the per-CPU rows off the panel. cpu0's row is the control and every
 AP's `pre` against its own `warm` is the answer. Nothing in userland can ask —
 there is no CPU affinity, so no userland loop can choose its core, and the state
 under test lives only between an AP's `INIT` and its first `mov cr0`.
+
+### OPEN, UNASSIGNED — anonymous `mmap` is not demand-paged, and `.bss` is written into the file
+
+Two claims this tree makes about itself that its own code does not keep. Found
+by `wt/toyos-fpu` while building a page-fault workload for `fpu_isolation`, and
+recorded rather than fixed: both are memory-subsystem changes with their own
+blast radius.
+
+**`sys_mmap` allocates and maps the whole region up front.** `PageAlloc::new` is
+called for the full rounded size before anything is mapped, and
+`alloc_and_map` maps every 2 MiB page of it (`kernel/src/arch/syscall.rs`'s
+`sys_mmap`). So a first touch of a fresh anonymous mapping is an ordinary store
+and never a `#PF`, and a program that reserves a large region pays for all of it
+immediately. Measured: `syscall_cost` mapping 128 MiB and touching one byte per
+page reported the guest's `peak=130MB` and its fault trace named two faults, both
+in the ELF. CLAUDE.md's "Demand paging" is true of a *file-backed* segment and
+of nothing else. Whether it should be lazy is a design question with a real
+answer either way — the eager path is simpler and cannot fail late — but the
+description and the code should agree.
+
+**`toyos-ld` materializes `.bss` into the file.** A `static mut [u8; 16 MiB]`
+that is all zeroes produced an 18 MB binary, and a 128 MiB one produced a
+135 MB binary and a 465 MB initrd; both are in the same run's `initrd: adding`
+lines. A `PT_LOAD`'s `filesz` therefore equals its `memsz`, which also means the
+loader's `Anonymous` tail (`loader/mod.rs`, `file_backed_end < seg_end`) is
+always empty — that branch exists and nothing in the tree can reach it. Zeroed
+pages a linker never has to write are the whole point of `.bss`, and this is
+paid in image size, in initrd size, and in every copy of both.
+
+The one demand-paged thing a userland program can still reach is a *writable
+file-backed* page — `demand_paging_sse` and `fpu_isolation` both use one — at
+2 MiB of test image per fault.
 
 ### Metal boot is 1151 ms against QEMU's 196 ms, and the recorded accounting for it is stale
 

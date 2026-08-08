@@ -437,6 +437,20 @@ rtc-century-next = []
 # this every emulated boot assumes UTC and the arithmetic between local time and
 # UTC never runs. See `clock::init_wall`.
 rtc-zone-east = []
+# Take the FP body out of `arch::entry`'s bracket and the declared state out of
+# the loader's trampolines, leaving a kernel that preserves the *rest* of the
+# user machine state and nothing else — which is the kernel this tree had before
+# `specs/user-machine-state.md`.
+#
+# The negative control for `fpu_isolation`, and the only way to have one: the
+# defect it stages is a CPU register file surviving a task switch, and QEMU has
+# no device, machine property or `-cpu` flag that changes what an entry saves.
+#
+# It replaces the *behaviour* and not a verdict. The reservation, the alignment,
+# the rsp bookkeeping and every assertion are the shipped ones; what is absent
+# is the `fxsave64`, the `fxrstor64` and the trampoline's load. A feature that
+# flipped an assertion would make its own gate vacuous.
+fpu-save-nothing = []
 
 # The one profile every guest binary is built with — `specs/boot-image-split.md`
 # §6. Optimised, because an unoptimised guest mismeasures everything under TCG;

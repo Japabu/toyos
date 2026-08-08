@@ -408,6 +408,7 @@ pub fn init_bsp(lapic_id: u32) {
 
     unsafe { percpu.load_gdt(); }
     super::control_regs::init(0);
+    super::fpu::init();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
 
@@ -415,6 +416,7 @@ pub fn init_bsp(lapic_id: u32) {
     crate::log::PERCPU_READY.store(true, core::sync::atomic::Ordering::Release);
 
     log!("percpu: BSP cpu_id=0 lapic_id={lapic_id}");
+    super::fpu::log_state();
 }
 
 /// Allocate percpu for an AP on the BSP. Returns the raw pointer for the trampoline
@@ -429,10 +431,16 @@ pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
 
 /// Finish AP percpu initialization (called from ap_entry after GS base is set by trampoline).
 ///
+/// `control_regs::init` and `fpu::log_state` are the two things here that print,
+/// and each says at its own definition why it may not assume this CPU answers
+/// like the BSP. Everything else is silent: `boot_aps` already logs one line per
+/// AP that came up.
 pub fn init_ap(percpu_ptr: *mut PerCpu) {
     let percpu = unsafe { &mut *percpu_ptr };
     unsafe { percpu.load_gdt(); }
     super::control_regs::init(percpu.cpu_id);
+    super::fpu::init();
+    super::fpu::log_state();
 }
 
 /// Update both the percpu kernel_rsp (for syscall entry) and tss.rsp0 (for interrupts).
