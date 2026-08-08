@@ -1268,3 +1268,22 @@ so.
   `wt/toyos-cifinish`, `wt/toyos-xhcibreak`, `wt/toyos-nullsink`** are pushed
   branches with no pull request. Most are landed already and are just stale
   refs; a branch with commits `origin/main` does not have is the one to look at.
+
+### 10.8 The x87 fix, measured on the instrument that found it
+
+`std_unwind` and `std_unwind_so` were 5 of 5 in the rate probe and are §9.3's
+worked example — a #MF left pending by one Ring 3 process killing the next
+unrelated one scheduled on that CPU, a kernel isolation defect the dev host
+cannot see. Pull request #3 is the fix (`aaa7a7a`), and its own guest run
+(`31270581874`) is the first CI evidence: **shard 11, which carried both names
+and was the only red shard on run `31268632323` two hours earlier, is green.**
+
+Two shards were red in that run and neither is those:
+
+- **`kernel_heartbeat`**, red alone, §9.2's 1-of-5 entry.
+- **Shard 1 ran no test at all** — `apt-get` in the `debian:sid` container
+  failed and every later step was skipped. `sid` is a rolling release and its
+  mirror is not a fixed artifact, so this is a red shard that says nothing about
+  the tree. Both `deps` steps take three attempts now: advisory today, but once
+  `guest-suite` is required an apt mirror would be able to block a merge, and
+  that is not a gate anyone chose.
