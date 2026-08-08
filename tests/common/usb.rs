@@ -104,20 +104,11 @@ fn stage(path: &Path, bytes: u64) -> u64 {
 }
 
 /// Every claim the host can make about what the guest did to the disk.
-fn verify(path: &Path, bytes: u64, nonce: u64) -> Result<(), String> {
-    verify_except(path, bytes, nonce, &[])
-}
-
-/// The same, for a boot in which one of the guest's writes was deliberately
-/// broken mid-flight.
 ///
-/// `unwritten` names the blocks whose *content* is nobody's claim afterwards —
-/// the injected break abandons a data phase the emulator has already been handed,
-/// so whether those bytes reached the medium before the Bulk-Only Reset cancelled
-/// the command is QEMU's to decide. Everything else is still checked, which is
-/// the whole assertion: a disk taken offline by one broken transfer writes none
-/// of it.
-fn verify_except(path: &Path, bytes: u64, nonce: u64, unwritten: &[i64]) -> Result<(), String> {
+/// **Every block, on every boot, the one a staged break interrupted included.**
+/// `usb_transport_break` used to name that block as nobody's claim, which was
+/// the driver's lost write written into the harness as an expectation.
+fn verify(path: &Path, bytes: u64, nonce: u64) -> Result<(), String> {
     let blocks = bytes / BLOCK;
     let guest_nonce = !nonce;
     let mut file = std::fs::OpenOptions::new()
@@ -128,9 +119,6 @@ fn verify_except(path: &Path, bytes: u64, nonce: u64, unwritten: &[i64]) -> Resu
 
     // What the guest wrote, at the LBAs it was told to write them.
     for index in GUEST_BLOCKS {
-        if unwritten.contains(&index) {
-            continue;
-        }
         let block = block_of(blocks, index);
         let got = read_block(&mut file, block);
         if let Some(at) = (0..BLOCK as usize).find(|&i| got[i] != pattern(guest_nonce, block, i)) {
@@ -1420,21 +1408,27 @@ pub fn xhci_portsc_rw1c(
 /// transfer which ran out `USB_TIMEOUT_NS` leaves behind, byte for byte, so the
 /// recovery under test runs against a real endpoint state rather than a flag.
 ///
-/// The assertion that decides it is host-side and is about bytes: everything the
-/// guest wrote *after* the break is byte-correct in the backing file. Before the
-/// fix the disk is offline from the break onward, so the nine-block run and the
-/// second guest block never leave the guest at all.
+/// **One injection is one abandoned transfer, and not one broken transfer.** The
+/// device answers that transfer after the driver has stopped listening, and
+/// where that answer lands relative to the Bulk-Only Reset decides whether the
+/// reset holds: the guest wins the race under KVM and loses it under TCG, so
+/// this boot produces one break on the dev host and two on CI, off the same
+/// tree. Counting breaks is therefore a count of who won a race. What the driver
+/// owes either way is that the caller's write survives, and that is what is
+/// asserted here.
+///
+/// The assertion that decides it is host-side and is about bytes: **every** block
+/// the guest was told to write is byte-correct in the backing file, the broken
+/// one included. Before the recovery existed the disk is offline from the break
+/// onward, so the nine-block run and the second guest block never leave the guest
+/// at all; before the command was re-issued over the transport the recovery gave
+/// back, the broken block is missing from the image and `wr_err` is not zero.
 pub fn usb_transport_break(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     const FEATURES: &[&str] = &["usb-storage-gate", "usb-transport-break"];
-    /// The kernel arms the injection on the first WRITE(10) of the boot, and
-    /// the gate's first write is `GUEST_BLOCKS[0]`. If anything ever writes a
-    /// USB disk earlier the `wr_err=1` assertion below stops matching, which is
-    /// what keeps this constant honest.
-    const EATEN: i64 = GUEST_BLOCKS[0];
 
     let (bytes, lba) = Profile::UsbDisk.usb_disk().expect("UsbDisk declares a disk");
     let image = test_dir().join("usb-transport-break.img");
@@ -1460,15 +1454,26 @@ pub fn usb_transport_break(
     // wrong — which is the line the T14 produced, and the reason the cause of
     // that break cannot be read out of its log today.
     const BROKE: &str = "usb-storage: transport broke on SCSI 0x2a: no answer in the data phase";
-    if !log.contains(BROKE) {
-        return Err(format!("the guest never printed {BROKE:?}; did the injection run?\n{log}"));
-    }
-    let breaks = log.matches("transport broke").count();
-    if breaks != 1 {
+    let staged = log.matches(BROKE).count();
+    if staged != 1 {
         return Err(format!(
-            "the transport broke {breaks} times; the injection is armed once per boot, so \
-             anything else is a break this test did not stage\n{log}"
+            "the staged break happened {staged} times, want the one the injection arms per \
+             boot; did it run?\n{log}"
         ));
+    }
+    // And the driver got over it. Two attempts are explained by the fault — the
+    // fault itself, and the recovery the device's late answer to the abandoned
+    // transfer can undo — so a third that also breaks is the transport failing
+    // to come back rather than this test's doing.
+    let breaks = log.matches("transport broke").count();
+    if breaks > 2 {
+        return Err(format!(
+            "the transport broke {breaks} times off one abandoned transfer, which can undo one \
+             recovery and no more\n{log}"
+        ));
+    }
+    if let Some(gave_up) = log.lines().find(|l| l.contains("times running; the transport is not")) {
+        return Err(format!("{gave_up:?}\n{log}"));
     }
 
     // The endpoint state the recovery had to be chosen for, read out of the
@@ -1499,17 +1504,18 @@ pub fn usb_transport_break(
         }
     }
 
-    // One write reported a failure, and the disk stayed online through it.
-    // Before the fix this line reads `wr_err=3 healthy=false`.
-    if !log.contains("usb-gate: disk done reads=ok writes=bad refusal=true wr_err=1 healthy=true") {
-        return Err(format!("the disk did not survive one broken transfer\n{log}"));
+    // Not one write reported a failure, and the disk stayed online. Before the
+    // recovery existed this line reads `wr_err=3 healthy=false`; before the
+    // command was re-issued it reads `writes=bad ... wr_err=1`.
+    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true wr_err=0 healthy=true") {
+        return Err(format!("a write did not survive one broken transfer\n{log}"));
     }
 
     // And the bytes, which is the claim nothing in the guest can make for
-    // itself: everything written after the break is in the backing file, the
-    // host's own blocks are unchanged, and the blocks either side of the run
-    // are still zero.
-    verify_except(&image, bytes, nonce, &[EATEN])?;
+    // itself: every block the guest was told to write is in the backing file,
+    // the host's own blocks are unchanged, and the blocks either side of the
+    // run are still zero.
+    verify(&image, bytes, nonce)?;
     if !log.contains("Boot: complete") {
         return Err(format!("the boot did not finish after the break\n{log}"));
     }
@@ -1518,8 +1524,8 @@ pub fn usb_transport_break(
 
     eprintln!(
         "  [usb] a bulk transfer abandoned mid-flight: the endpoint was found Running and \
-         stopped rather than reset, the disk stayed online, and every write after the break \
-         verified host-side"
+         stopped rather than reset, the transport came back in {breaks} break(s), and every \
+         block the guest was told to write verified host-side"
     );
     Ok(())
 }

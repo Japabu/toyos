@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::common::audio::{await_null_sink, NULL_SINK};
 use crate::common::qemu::{self, BootOptions, Profile, QemuInstance};
 use crate::common::serial::Serial;
 
@@ -314,15 +315,17 @@ pub fn hda_tone(
     let gaps = crate::common::audio::gap_histogram(&analysis, wav.sample_rate);
     let dropouts: u32 = gaps.values().sum();
     let breaks = crate::common::audio::phase_breaks(&wav);
+    let pitch = crate::common::audio::dominant_hz(&wav);
     eprintln!(
-        "  [hda] {} frames at {} Hz {} ch, peak {} active {:.2}s dither {:.1}% gaps {} \
-         phase-breaks {}",
+        "  [hda] {} frames at {} Hz {} ch, peak {} active {:.2}s dither {:.1}% pitch {:.1}Hz \
+         gaps {} phase-breaks {}",
         wav.mono.len(),
         wav.sample_rate,
         wav.channels,
         analysis.peak,
         analysis.active_samples as f64 / wav.sample_rate as f64,
         analysis.dither_ratio.unwrap_or(0.0) * 100.0,
+        pitch.unwrap_or(0.0),
         crate::common::audio::format_histogram(&gaps),
         breaks.len(),
     );
@@ -331,6 +334,13 @@ pub fn hda_tone(
             "{dropouts} mid-tone silences in the capture: {}",
             crate::common::audio::format_histogram(&gaps)
         ));
+    }
+    // The rate the engine plays at is soundd's decision on this machine and
+    // nothing else here can see it: a stream format naming the wrong base is
+    // eight buffers of correct audio a second played 8.8% fast, which every
+    // other assertion in this file passes.
+    if let Some(complaint) = crate::common::audio::wrong_pitch(&wav) {
+        return Err(complaint);
     }
     // The instrument the gap detector cannot be: an engine that replays a
     // period nobody refilled puts the tone back 0.28 of a cycle out, and
@@ -514,8 +524,12 @@ pub fn hda_two_live_refused(
         rust_bins,
         BootOptions { profile: Profile::HdaTwoLive, ..Default::default() },
     );
-    let mut log = Serial::boot(&qemu);
-    log.push(&qemu.drain_serial(Duration::from_secs(1)));
+    // The refusal is a kernel boot line and is in the capture already; soundd's
+    // answer to it is a userland line that races the ready marker, so it is
+    // waited for on the guest's clock rather than on a span of the host's.
+    let mut text = qemu.boot_log().to_string();
+    let stalled = await_null_sink(&mut qemu, &mut text).err();
+    let log = Serial::named("boot console", text);
 
     log.must_say("hda: 00:")?;
     log.must_say("has a live link (statests=")?;
@@ -524,7 +538,11 @@ pub fn hda_two_live_refused(
     log.must_not_say("bound, statests=")?;
     // The machine still boots and still has a sink: absence of hardware is a
     // routing state, and a refusal must not be a machine that will not run.
-    log.must_say("presenting a null sink")?;
+    log.must_say(NULL_SINK)
+        .map_err(|why| match stalled {
+            Some(stall) => format!("{stall}\n{why}"),
+            None => why,
+        })?;
     log.must_say("Boot: complete")?;
     log.must_be_clean()
 }

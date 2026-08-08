@@ -3302,6 +3302,85 @@ does not make the transfer interruptible, and any other unbounded I/O reached
 from the idle loop inherits the same hazard. The measurement that would size it
 is a metal boot with the fix in — the owner's next one.
 
+### CLOSED 2026-08-08 — every HDA machine played 8.8% sharp: the stream format's sample-base bit was one place low
+
+`toyos_hda::stream::stream_format` built the base-rate bit at bit 13. The Intel
+HDA stream-format structure puts it at bit 14 and the three bits below it are
+the multiplier, so 44.1 kHz came out `0x2011` — a 48 kHz base carrying
+multiplier field `0b100`, which the field reserves — where the specification's
+value is `0x4011`. `SDnFMT` and the codec's `Set Converter Format` both carried
+it, so the controller and the codec agreed with each other and disagreed with
+soundd, which generated every buffer for 44100.
+
+Measured, `hda_tone` on the `intel-hda` profile, same session:
+
+| | capture pitch | dither ratio | soundd `completions` per 2 s window |
+|---|---|---|---|
+| before | 478.9 Hz | 3.3% | 764 |
+| after | 440.2 Hz | 24.4% | 695 |
+
+440 × 48000/44100 = 478.91. The owner's T14 log says the same thing from the
+other side: 751 completions per 2.000 s window is a 2.664 ms period, and 128
+frames in 2.6667 ms is 48 kHz (`specs/metal-logs/2026-08-08-audio-underruns/`).
+
+**The dither column is the second finding.** `analyze`'s silence band is derived
+from soundd's ±1 LSB TPDF dither and the expectation is 25%; 3.3% is QEMU's
+audio core resampling 48000 → 44100 into the wav backend and smearing it away.
+So **every earlier `hda_tone` capture was taken through a resampler that is now
+gone**, and the two verdicts below that rest on such a capture — #88's phase
+breaks and the mid-tone silence — have to be re-judged on a fresh sample rather
+than carried forward. Neither `EXPECTED_FAILURES` entry is touched here.
+
+Nothing in the tree could see it. `phase_breaks` cannot: an 8.8% pitch error
+perturbs its recurrence by about 12 LSB against a 400 LSB tolerance. The gap
+detector cannot, the peak check cannot, and soundd's own counters cannot — the
+DLL locks onto whatever the device does. The gate that closes it is
+`audio::wrong_pitch`, asserted by `hda_tone` and by all four gate A configs,
+with a band of 4.4% because the two rates the field can name are 8.8% apart.
+`toyos-hda`'s own gate is
+`every_rate_linux_tabulates_encodes_to_the_number_linux_tabulates` — twelve
+values from Linux's `rate_bits[]` table, a second implementation of the same
+specification, so no restatement of this crate's own arithmetic can agree with
+it — plus a round trip that decodes each built format back to the rate it was
+asked for.
+
+### OPEN, UNASSIGNED — the residual T14 underruns are the *client's* CPU taking the log flush, not soundd's
+
+`specs/metal-logs/2026-08-08-audio-underruns/` is the boot: 54 windows, **686
+underruns, 5 drains**, on the tree that already carries
+`flush_log_file_if_affordable`. Drains fell 375 → 5; underruns did not.
+
+The correlation runs the wrong way for a soundd defect. Underruns land in
+windows where soundd is *on time* (`max_batch=1`, worst wake 461–1130 µs), and
+the four windows where soundd was stalled 40–45 ms report underruns 0, 0, 0, 23
+— being late gives the client more time, not less. `max_batch=8` with
+`underruns=0` also settles the ring's shape: soundd consumed eight client
+periods in one cycle and every one was covered, so the ring is normally its full
+eight periods = 21.3 ms deep, and an empty one is a producer that stopped for at
+least that long. `/bin/tone` is one of the producers that stops and its callback
+is a sine, so it is not the client computing; it is the client not running.
+
+**The hypothesis, and it is the previous entry's fix seen from the other side.**
+`owes_deadline()` asked whether a task parked on this CPU expects a wake *at a
+time*. An audio client parks on a pipe with no deadline at all — it is woken by
+an event, by an RT daemon that expects it back inside one period — so the test
+could not see it, and the flush moved off soundd's CPU onto its client's, where
+it costs the same audio. Changed to `owes_wake()`: any parked task at all, with
+`LOG_DEFERRAL_CEILING_NS` unchanged. The T14 reports CPUs at `parked=0`
+throughout this log, so there is somewhere for the flush to go.
+
+**Unverified, and only the owner's next boot can verify it** — QEMU's `/log` is
+a fast virtual disk and the whole audio family reports `underruns=0` on this
+host either way. What to read on that boot:
+
+- `starve_max=` is new on soundd's stats line: the longest unbroken run of
+  underrun periods. Near 1 with a large `underruns` kills the hypothesis
+  outright — that is a client missing by a hair, not one that stopped. 8–20 is a
+  stall of 21–53 ms, which is the flush.
+- `max_wake_lat_us`'s cluster should move from ~2690 to ~2902 µs, because it is
+  one device period and the period is now the right one.
+- Everything should sound a tone and a half lower than it did.
+
 ### CLOSED 2026-08-08 — `/bin/tone` accumulated its phase in `f32`, so the tone the owner judges the machine by was flat and dirty
 
 `userland/toybox/src/tone.rs` advanced `phase: f32` by one increment per frame
@@ -5217,13 +5296,12 @@ changes.
   (PASS). The absolute figure moved 277→619 ms across three runs of one boot
   with no code change, so what the allowance is being asked to absorb is the
   host, and a serial slot inside one suite does not buy a quiet one.
-- **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
-  second line is not a second staged break but the driver's *recovery* retrying,
-  `transport broke on SCSI 0x2a: command phase completion code 6` against an
-  endpoint still halted from the injected one. Recovery still succeeds. So one
-  staged break and no other makes "the recovery finished on its first try" part
-  of the verdict, and how many tries it takes is how much of the host the guest
-  had.
+- **`usb_transport_break`** — now `Sched::Serial`. The cause written here was
+  wrong and the correction is in §8, *a Bulk-Only Reset that raced the transfer
+  it was recovering from*: the second line is the **device** stalling the next
+  command block, on an endpoint the recovery found Running and not halted, and
+  it was a driver defect that lost the caller's write rather than a count of how
+  much of the host the guest had. Closed.
 - **`desktop_typing_damage`** — `nothing typed at the terminal window reached a
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
@@ -7056,6 +7134,86 @@ else is a break this test did not stage`. That is the one member of this class
 that is still reproducible, and it is the one to take: it is not a ceiling, it is
 the driver reporting a second break nobody staged.
 
+**Taken, and it was the driver.** The entry below closes it.
+
+### CLOSED — a Bulk-Only Reset that raced the transfer it was recovering from
+
+`usb_transport_break`, red 5 of 5 in run `31258202923` and green on the dev host
+off the same tree. **The two `transport broke` lines are not the same break**,
+which is the thing the failure message never let anyone see:
+
+```
+usb-storage: transport broke on SCSI 0x2a: no answer in the data phase in 2000 ms
+xHCI: slot 2 endpoint 3 is Running, recovering
+xHCI: slot 2 endpoint 4 is Running, recovering
+usb-storage: transport broke on SCSI 0x2a: command phase completion code 6
+xHCI: slot 2 endpoint 3 is Stopped, recovering
+xHCI: slot 2 endpoint 4 is Halted, recovering
+usb-gate: readback of block 8388606 differs at byte 0: 0x00 not 0x3f
+usb-gate: disk done reads=ok writes=bad refusal=true wr_err=2 healthy=true
+```
+
+The first is the injection, which can produce `Broke::Silence` and nothing else
+— `transport_break::arm` spends a `UNSPENT.swap(false)`, so the actuator really
+is armed once per boot. The second is **completion code 6, Stall Error, on a
+command block**: the device refusing the next CBW. So the driver broke the
+transport a second time by itself and lost two writes doing it, one of them the
+block the readback then found empty. The reading where the *actuator* fires
+twice was never available; the message asserted it anyway, which is what a
+count in a failure line does when the thing counted has two causes.
+
+**The window is the driver's.** A transfer it stopped waiting for is not a
+transfer that is over: it is still the controller's to run and still the
+device's to answer. `reset_recovery` issued the Bulk-Only Mass Storage Reset
+*first* and restarted the endpoints after, so the device's answer landed on a
+state machine the reset had already rewound. QEMU 11.0.3's `hw/usb/dev-storage.c`
+is explicit about it: `ClassInterfaceOutRequest | MassStorageReset` sets
+`s->mode = USB_MSDM_CBW` and does **not** cancel `s->req`, and the late
+`usb_msd_command_complete` then takes `else if (s->data_len == 0)` and sets
+`s->mode = USB_MSDM_CSW` back over it. An OUT token in CSW mode reaches
+`default: goto fail` and is stalled. **Who wins that race is the whole
+difference between the two accelerators** — the aio completes long before a TCG
+guest reaches the reset and after a KVM one every time — and nothing about it is
+QEMU-only: a stick whose firmware finishes the command it was handed is the same
+picture, on the machine whose boot disk this is.
+
+Closed by two changes, neither a conditional:
+
+- **The order is structural.** `restart_endpoint` splits at the one act of a
+  recovery that puts a packet on the bus: `quiesce_endpoint` runs every command
+  `Recovery` owes and answers with `Owed`, and `reset_the_device` — the class
+  request *and* both CLEAR_FEATUREs, everything the driver says to the device —
+  takes both endpoints' `Owed` as its arguments. No order of `reset_recovery`'s
+  three lines speaks to the device first. `toyos-xhci`'s
+  `the_bus_is_reached_only_after_every_command` is what makes that a split of
+  the sequence rather than a reordering of it.
+- **Reset Recovery restores the transport and says nothing about the command**,
+  so `scsi` re-issues it. `MAX_TRANSPORT_ATTEMPTS` is 3 and is derived rather
+  than tuned: there is one abandoned transfer, it is answered once, so it can
+  undo one recovery.
+
+Proof, run `31264371902` — two arms on one runner, three reps each, one filtered
+test per job: **control (main's driver, recovery sequence and test dropped back
+into the branch's tree) 3 of 3 red**, each red twice counting its `ALONE: red
+again` re-run, the same sentence every time; **fixed 3 of 3 green**, `1
+break(s)` each and every block verified host-side. The whole twelve shards on
+the same tree (run `31264372439`) have `usb_transport_break` green in shard 6.
+
+**The test is stronger than it was.** It asserted `wr_err=1` and excluded the
+broken block from the host-side verify — the driver's lost write written into
+the harness as an expectation, and `verify_except` existed for that one caller.
+It now asserts `wr_err=0` and verifies every block. Counting `transport broke`
+was counting who won a race, so what is counted is the staged sentence, exactly
+once, with the total bounded at two by the same derivation as the attempt count
+and the driver's own give-up line a red.
+
+**What this does not explain.** `xhci_flap` is untouched by it: that is
+plug/unplug and port re-enumeration, with no Bulk-Only Reset Recovery anywhere
+in it, so its entry stays open on its own evidence. And
+`specs/test-cost-audit.md` §5.5's reading of this same line — "the driver's
+recovery retrying against an endpoint still halted from the staged break" — is
+wrong twice over: the endpoint was Running, and what stalled was the device.
+
 ### CLOSED — a `Task::Machine` group had the blast radius the shared block lost
 
 Run `31247206462`, shard 5, the metal-sim group re-run **alone**:
@@ -7087,13 +7245,13 @@ all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
 
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|
-| `usb_transport_break` | **5/5** | 6 | Serial | the transport broke 2 times; the injection is armed once per boot |
+| ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — §8, a Bulk-Only Reset that raced the transfer it was recovering from |
 | `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, see §1's x87 entry |
 | `std_unwind_so` | **5/5** | 10 | shared block | the same |
-| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine |
+| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine — **closed below** |
 | `hda_tone` | **4/5** | 4 | Serial | 1 mid-tone silence in the capture (§4) |
 | `late_storage_connect` | 2/5 | 7 | Serial | the boot scan bound a disk, so the port was not held empty |
-| `hda_two_live_refused` | 2/5 | 2 | Parallel | `"presenting a null sink" never reached the boot console` |
+| `hda_two_live_refused` | 2/5 | 2 | Parallel | `"presenting a null sink" never reached the boot console` — **closed below** |
 | `blocked_dump` | 2/5 | 3 | Parallel | two *different* reasons — the census half, and /bin/terminal racing the compositor |
 | `dump_nmi_probe` | 1/5 | 2 | Serial | the rip resolved to `u128_div_rem`, not to the spin |
 | `kernel_heartbeat` | 1/5 | 5 | Serial | 2 of 12 heartbeats dropped a healthy CPU from the mask |
@@ -7104,12 +7262,23 @@ not see it: `xhci_slow_connect`, red alone in run `31261669826`. It has its own
 entry above — a 1 ms margin *inside the guest's boot*, which is why running alone
 moves it by milliseconds and not by a verdict.
 
+A thirteenth, with one sample each way on **one tree**: `desktop_audio_client`
+stalled wide *and* alone in run `31264914759` and passed in run `31266194663`,
+same commit, half an hour apart. It is 0 of 5 in the table's own probe, so this
+is a rate and not a reproduction — but the capture is worth the note, because it
+is #172's signature away from the T14: two clients connect, both tones say
+`done`, and only one `client N removed` ever follows. The wait it blew is
+`both clients to leave the mixer`.
+
 **The top five reproduce, so they are defects and not a rate.** The bottom six
 fire one or two runs in five, which is 20–40% and is not "noise" either: the bar
 this was measured against tolerates one in fifty *with the failure named*, and
 none of these six has been looked at. **No entry here is a candidate for
 `EXPECTED_FAILURES`** — an exemption names a defect and a write-up, and "fires
 40% of the time for reasons nobody has looked at" is neither.
+
+**`metal_sim_null_audio` and `hda_two_live_refused` are the first two off this
+table**, and the entry below says what they were. The remaining nine stand.
 
 **Six of the eleven are `Sched::Serial`, and until 2026-08-08 the harness re-ran
 none of them**: the retry loop was written for the parallel phase and branched on
@@ -7127,6 +7296,73 @@ all **0 of 5** now, and the "a guest stops making progress and pays its whole
 ceiling" shape with them. Anything read off a run older than `31254054628` is
 about a different tree.
 
+### CLOSED — soundd always presented its null sink; two tests bounded the race for it with a clock
+
+`metal_sim_null_audio` (5 of 5) and `hda_two_live_refused` (2 of 5) were red on
+the same missing line, `presenting a null sink`, and both were green on the dev
+host — 5 of 5 each, measured before touching anything. So the question was one
+this host cannot answer, and it was asked on the instrument that reds:
+`probe-nullsink.yml`, run `31263831141`, three reps of `Profile::Metal` under
+KVM on the same `debian:sid` image `ci.yml` uses, with the 500 ms window
+replaced by a report and then by 8 s of nobody touching the guest.
+
+**The line always came.** Per rep, from the host's own receive clock:
+
+| rep | soundd spawned | `===READY===` (test-runner's first line) | `presenting a null sink` |
+|---|---|---|---|
+| 1 | guest 0.274 | 15:21:04.5253 | 15:21:05.0895 — **0.564 s later**, and 64 ms after the window closed at .0258 |
+| 2 | guest 0.301 | 15:21:38.3286 | 15:21:37.7784 — **0.550 s earlier** |
+| 3 | guest 0.277 | 15:20:55.4856 | 15:20:54.9524 — **0.533 s earlier** |
+
+So it is a race and not an absence: init spawns its programs without waiting, so
+`===READY===` is one child's first line and orders nothing about another's.
+`metal_sim_null_audio` allowed 500 ms of *host* wall clock after the marker and
+`hda_two_live_refused` allowed 1 s, and those were the only two tests asking
+about that line through a span rather than through the guest. On this host the
+two children's first lines are ~30 ms apart with the marker always first, which
+is why neither ever reds here.
+
+Fixed by the discipline the rest of the suite already uses: `await_guest` moved
+out of the test list into `tests/common/qemu.rs` — a test in `tests/common/`
+could not reach it there, which is most of why these two reached for a duration
+— and both now wait on the guest. The wait ends on soundd's line, on the
+kernel's `exit: soundd`, or on the guest going quiet. The middle one matters: a
+soundd that *exits* on a device-less machine is the regression being gated, and
+it has to red with the caller's own sentence rather than fifteen seconds later
+as a stall. Measured on this host with soundd's null-sink arm removed,
+`metal_sim_null_audio` reds in 5 s with `soundd did not present a null sink on a
+device-less machine` and `exit: soundd pid=0 code=0` in the capture, and
+`hda_two_live_refused` in 3 s with its own.
+
+**soundd itself was not changed, and the shape it was suspected of is not the
+one it has.** Every device refusal already reaches the null sink: both
+`Hda::Refusal` arms do, and virtio's non-`NotFound` refusal does. The single
+path that does not is `Refusal::NoDevice(e)` for `e != NotFound` on the virtio
+claim, which is a *conflict* — another soundd holding the claim — and is a
+deliberate panic with the reason written beside it. Absence is routed; only
+contention is loud.
+
+### OPEN, UNASSIGNED — a userland process reaches its first line half a second after its sibling on a runner, and ~30 ms after it here
+
+Fell out of the probe above and is not what it closed. On all three reps the two
+programs `tests/testcases` starts — soundd and test-runner, spawned 1–3 ms apart
+— printed their first lines **0.53–0.56 s apart**, and which of the two was
+first flipped between reps. On this host the same pair is ~30 ms apart, in spawn
+order, every time. The kernel's own boot is the same speed on both (`Boot:
+complete` at 275–304 ms on the runner against 269 ms here), so it is not a slow
+machine: it is the first moment two runnable tasks exist.
+
+The i8042 verdict measures the same thing from the kernel's side, since it is
+emitted from the first idle-loop trip after arming: `idle at` 523–552 ms on the
+runner against 304 ms here.
+
+Nothing here says whether that is the host descheduling a vCPU thread, something
+in userland startup, or the scheduler leaving a task unclaimed — the probe was
+not built to tell them apart. It is recorded because a half-second of skew
+between two init children is enough to decide any remaining wall-clock margin in
+the suite, and because it is invisible on a host whose TCG runs one vCPU at a
+time.
+
 ### OPEN — four reds on a runner that are not the xHCI class and not the width
 
 Run `31247206462`, each red again when re-run alone, none of them reproduced on
@@ -7142,12 +7378,12 @@ Three of the four are soundd's, which makes them worth reading together rather
 than one at a time. Nothing here is diagnosed; they are recorded so the next
 green run cannot quietly be read as their absence.
 
-**Two of the four are settled by the rate above and two are not.**
-`doom_sound_flood` and `sshd_fail_closed` are 0 of 5 on the current tree.
-`metal_sim_null_audio` is **5 of 5**, which makes it the one to take first — and
-`hda_two_live_refused`, 2 of 5 with `"presenting a null sink" never reached the
-boot console`, is the same missing line seen from the other side, so the two are
-one question about soundd's device-less path rather than two.
+**Two of the four are 0 of 5 on the current tree and one is closed.**
+`doom_sound_flood` and `sshd_fail_closed` did not fire in the rate probe.
+`metal_sim_null_audio` was 5 of 5 and is closed above, together with
+`hda_two_live_refused` — one question about how the two tests read the boot
+console, and not one about soundd's device-less path, which was doing its job on
+every one of those runs. `hda_client_stall` is the one still standing.
 
 ### CLOSED, superseded by the four arms above — six input tests fail on a GitHub runner and pass here
 

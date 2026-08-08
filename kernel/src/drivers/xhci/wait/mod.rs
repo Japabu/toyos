@@ -135,6 +135,30 @@ fn settles(ready: impl Fn() -> bool) -> bool {
 }
 
 
+/// What one endpoint's recovery still owes the **device** once the controller
+/// has taken it off the transfer it was running.
+///
+/// A value of this is what [`XhciController::quiesce_endpoint`] produces and
+/// the only thing [`XhciController::clear_endpoint_halt`] accepts, so the two
+/// halves of a recovery cannot be run in the other order. That matters to
+/// exactly one caller: Bulk-Only Transport's Reset Recovery has a device reset
+/// of its own to put between them, and it may not issue that reset while either
+/// endpoint still holds a transfer the driver stopped waiting for — see
+/// [`Act::ClearHalt`].
+#[derive(Clone, Copy)]
+pub(in crate::drivers::xhci) enum Owed {
+    /// The endpoint runs. Nothing further is owed.
+    Nothing,
+    /// The device is still holding a halt on the endpoint at this address.
+    ClearHalt { ep_addr: u8 },
+    /// The endpoint could not be taken off its transfer. Carried rather than
+    /// reported by returning early, because the *other* endpoint and the
+    /// device's own reset still have to happen — leaving one endpoint stopped
+    /// because a step on the other failed is what turns a recoverable device
+    /// into a permanently offline one.
+    Failed,
+}
+
 impl XhciController {
     /// Take one endpoint back to a state that runs TRBs, waiting for each step.
     ///
@@ -144,38 +168,54 @@ impl XhciController {
     /// faulted, which is spending its own time. A HID endpoint is recovered at
     /// the top of a scheduler pass, where it would be spending everybody's, and
     /// [`Self::step_recovery`] is the same route stepped across passes.
-    fn restart_endpoint(&mut self, ep: Restart<'_>) -> bool {
+    fn restart_endpoint(&mut self, mut ep: Restart<'_>) -> bool {
+        let owed = self.quiesce_endpoint(&mut ep);
+        self.clear_endpoint_halt(ep.slot_id, ep.ep0_ring, owed)
+    }
+
+    /// The half of one endpoint's recovery the **controller** answers: every
+    /// command [`Recovery`] owes, up to the point where the sequence would
+    /// speak to the device.
+    fn quiesce_endpoint(&mut self, ep: &mut Restart<'_>) -> Owed {
         let state = self.endpoint_state(ep.ctx_block, ep.dci);
         log!("xHCI: slot {} endpoint {} is {state}, recovering", ep.slot_id, ep.dci);
         let (mut seq, mut act) = match Recovery::begin(state) {
             Ok(begun) => begun,
             Err(NeedsConfigure(state)) => {
                 log_unrecoverable(ep.slot_id, ep.dci, state);
-                return false;
+                return Owed::Failed;
             }
         };
         loop {
-            match act {
-                Act::Running => return true,
-                Act::Command(cmd) => {
-                    let trb = self.recovery_trb(cmd, ep.slot_id, ep.dci, ep.ring, ep.ring_at);
-                    if !self.run_command(trb, cmd.name()) {
-                        return false;
-                    }
-                }
-                Act::ClearHalt => {
-                    let cleared = self.control_transfer(
-                        ep.slot_id, ep.ep0_ring, 0x02, 0x01, 0, ep.ep_addr as u16, None, 0,
-                    );
-                    if !cleared.done() {
-                        log!("xHCI: slot {} would not clear the halt on endpoint {:#04x}: \
-                             {cleared}", ep.slot_id, ep.ep_addr);
-                        return false;
-                    }
-                }
+            let cmd = match act {
+                Act::Running => return Owed::Nothing,
+                Act::ClearHalt => return Owed::ClearHalt { ep_addr: ep.ep_addr },
+                Act::Command(cmd) => cmd,
+            };
+            let trb = self.recovery_trb(cmd, ep.slot_id, ep.dci, ep.ring, ep.ring_at);
+            if !self.run_command(trb, cmd.name()) {
+                return Owed::Failed;
             }
             act = seq.completed();
         }
+    }
+
+    /// The half the **device** answers, which is the only packet a recovery
+    /// puts on the bus.
+    fn clear_endpoint_halt(&mut self, slot_id: u8, ep0_ring: &mut TrbRing, owed: Owed) -> bool {
+        let ep_addr = match owed {
+            Owed::Nothing => return true,
+            Owed::Failed => return false,
+            Owed::ClearHalt { ep_addr } => ep_addr,
+        };
+        let cleared =
+            self.control_transfer(slot_id, ep0_ring, 0x02, 0x01, 0, ep_addr as u16, None, 0);
+        if !cleared.done() {
+            log!("xHCI: slot {slot_id} would not clear the halt on endpoint {ep_addr:#04x}: \
+                 {cleared}");
+            return false;
+        }
+        true
     }
 
     /// Run whatever is outstanding to its end, waiting for each answer.
