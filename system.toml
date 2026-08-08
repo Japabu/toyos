@@ -18,10 +18,15 @@ assets = ["assets"]
 # Apache-2.0, so an image built with it put copyleft obligations on whoever
 # redistributed one. Drop a `.sf2` here under this name and doom plays music;
 # leave it out and the build says so by name and doom says so again at startup.
-# GeneralUser GS (CC-BY-4.0, ~30 MB) is the recommended one — its author states
-# he cannot be certain of every sample's origin, which is worth knowing before
-# redistributing an image built with it. MuseScore_General is MIT and ~36 MB but
-# ships as `.sf3`, whose Vorbis-compressed samples rustysynth does not read.
+# GeneralUser GS (32,319,396 B) is the recommended one. Its licence is a bespoke
+# "License v2.0" by S. Christian Collins, not CC-BY-4.0 as this said until the
+# author's own text was read, and he states he cannot be certain of every
+# sample's origin — worth knowing before redistributing an image built with it.
+# MuseScore_General is the clean-licence alternative (MIT, named copyright
+# chain) and is out on size, not on format: its `.sf2` is 215,614,036 B, and the
+# 39,900,972 B `.sf3` is Vorbis-compressed, which rustysynth refuses outright.
+# `specs/doom-music-soundfont.md` prices every option, including a subset that
+# renders bit-exact at 15,546,748 B and a zero-byte OPL3 path.
 #
 # Named here because a sweep cannot tell an untracked SoundFont from a
 # .DS_Store, and only here: this is the only config that builds doom.
