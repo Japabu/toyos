@@ -18,9 +18,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# **A superseded pull-request run is thrown away; a run on `main` never is.**
+# Cancelling a pull request's previous run is free — the newer push is the
+# question anyone is asking. `main` is not that: every merged state is a state
+# somebody will bisect through, and `landing.yml`'s `gate-stage` counts only the
+# runs that *concluded*, so a cancelled one is not a sample and the trigger for
+# promoting the guest gate never advances on it. Measured 2026-08-08: five pull
+# requests merged inside ninety minutes left `e4b7279`, `782b9e5` and `aaa7a7a`
+# each cancelled by the merge behind it, and the newest verdict `main` had was
+# from before any of them.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   guest:
