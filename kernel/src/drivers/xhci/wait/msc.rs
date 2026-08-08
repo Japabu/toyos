@@ -11,7 +11,7 @@ use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
 use super::super::device::Endpoint;
-use super::Restart;
+use super::{Owed, Restart};
 use super::super::{with_disk, Disk, StorageGeometry, Trb, TrbRing, XhciController, PAGE};
 use super::super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, OFF_INPUT_CTX};
 use super::super::USB_TIMEOUT_NS;
@@ -852,26 +852,37 @@ impl XhciController {
     /// between the guest and the device, which is why the dev host has never
     /// seen it and CI reproduces it every run (`specs/known-issues.md` §8).
     ///
-    /// [`Owed`](super::Owed) is what makes the order structural rather than a comment: the
-    /// class request sits between the value the quiesce produces and the only
-    /// thing that consumes it.
+    /// [`Owed`](super::Owed) is what keeps that order rather than a comment.
+    /// Everything this says to the device is [`Self::reset_the_device`], whose
+    /// arguments are the two endpoints' quiesces — so there is no order of
+    /// these three lines that speaks first.
     fn reset_recovery(&mut self, dev: &mut MscDevice) -> bool {
         let owed_in = self.quiesce_endpoint(&mut Self::bulk_endpoint(dev, true));
         let owed_out = self.quiesce_endpoint(&mut Self::bulk_endpoint(dev, false));
+        self.reset_the_device(dev, owed_in, owed_out)
+    }
 
+    /// Every word of Reset Recovery that reaches the device, in BOT §5.3.4's
+    /// order: the class request, then a CLEAR_FEATURE for each endpoint that is
+    /// halted.
+    ///
+    /// It takes both endpoints' [`Owed`](super::Owed) because the class request
+    /// may not go out until the controller has taken both of them off their
+    /// transfers — see [`Self::reset_recovery`]. Reading them afterwards would
+    /// have been the same code with the guarantee taken out.
+    fn reset_the_device(&mut self, dev: &mut MscDevice, in_ep: Owed, out_ep: Owed) -> bool {
         let slot = dev.slot_id;
         let iface = dev.iface as u16;
         let reset = self.control_transfer(slot, &mut dev.ep0_ring, 0x21, 0xFF, 0, iface, None, 0);
         if !reset.done() {
             log!("usb-storage: slot {slot} would not take a Bulk-Only Reset: {reset}");
         }
-
-        // BOT §5.3.4's order for the two halts, and both are cleared even if
-        // the class request did not land: the endpoints are what the next
-        // command touches, and leaving one halted because another step failed
-        // turns a recoverable device into a permanently offline one.
-        let cleared_in = self.clear_endpoint_halt(slot, &mut dev.ep0_ring, owed_in);
-        let cleared_out = self.clear_endpoint_halt(slot, &mut dev.ep0_ring, owed_out);
+        // Both halts are cleared even if the class request did not land: the
+        // endpoints are what the next command touches, and leaving one halted
+        // because another step failed turns a recoverable device into a
+        // permanently offline one.
+        let cleared_in = self.clear_endpoint_halt(slot, &mut dev.ep0_ring, in_ep);
+        let cleared_out = self.clear_endpoint_halt(slot, &mut dev.ep0_ring, out_ep);
         reset.done() && cleared_in && cleared_out
     }
 }

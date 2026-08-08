@@ -21,6 +21,13 @@ name: xhci-break-probe
 # because one green of an intermittent test is one sample.
 #
 # It never fails. A probe that reds is a probe whose own summary nobody reads.
+#
+# **Answered, run `31264371902`: control 3 of 3 red — each red twice counting
+# its `ALONE: red again` re-run — and fixed 3 of 3 green at `1 break(s)`.** So a
+# filtered single-test run does reproduce it, and the twelve-shard configuration
+# is not needed to ask this class of question again. The control arm is the
+# reusable part and is why this file is kept: before it, every claim about a
+# CI-only red rested on comparing two runs taken hours apart on different trees.
 
 on:
   push:

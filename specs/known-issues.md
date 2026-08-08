@@ -5099,13 +5099,12 @@ changes.
   (PASS). The absolute figure moved 277→619 ms across three runs of one boot
   with no code change, so what the allowance is being asked to absorb is the
   host, and a serial slot inside one suite does not buy a quiet one.
-- **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
-  second line is not a second staged break but the driver's *recovery* retrying,
-  `transport broke on SCSI 0x2a: command phase completion code 6` against an
-  endpoint still halted from the injected one. Recovery still succeeds. So one
-  staged break and no other makes "the recovery finished on its first try" part
-  of the verdict, and how many tries it takes is how much of the host the guest
-  had.
+- **`usb_transport_break`** — now `Sched::Serial`. The cause written here was
+  wrong and the correction is in §8, *a Bulk-Only Reset that raced the transfer
+  it was recovering from*: the second line is the **device** stalling the next
+  command block, on an endpoint the recovery found Running and not halted, and
+  it was a driver defect that lost the caller's write rather than a count of how
+  much of the host the guest had. Closed.
 - **`desktop_typing_damage`** — `nothing typed at the terminal window reached a
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
@@ -6906,6 +6905,86 @@ else is a break this test did not stage`. That is the one member of this class
 that is still reproducible, and it is the one to take: it is not a ceiling, it is
 the driver reporting a second break nobody staged.
 
+**Taken, and it was the driver.** The entry below closes it.
+
+### CLOSED — a Bulk-Only Reset that raced the transfer it was recovering from
+
+`usb_transport_break`, red 5 of 5 in run `31258202923` and green on the dev host
+off the same tree. **The two `transport broke` lines are not the same break**,
+which is the thing the failure message never let anyone see:
+
+```
+usb-storage: transport broke on SCSI 0x2a: no answer in the data phase in 2000 ms
+xHCI: slot 2 endpoint 3 is Running, recovering
+xHCI: slot 2 endpoint 4 is Running, recovering
+usb-storage: transport broke on SCSI 0x2a: command phase completion code 6
+xHCI: slot 2 endpoint 3 is Stopped, recovering
+xHCI: slot 2 endpoint 4 is Halted, recovering
+usb-gate: readback of block 8388606 differs at byte 0: 0x00 not 0x3f
+usb-gate: disk done reads=ok writes=bad refusal=true wr_err=2 healthy=true
+```
+
+The first is the injection, which can produce `Broke::Silence` and nothing else
+— `transport_break::arm` spends a `UNSPENT.swap(false)`, so the actuator really
+is armed once per boot. The second is **completion code 6, Stall Error, on a
+command block**: the device refusing the next CBW. So the driver broke the
+transport a second time by itself and lost two writes doing it, one of them the
+block the readback then found empty. The reading where the *actuator* fires
+twice was never available; the message asserted it anyway, which is what a
+count in a failure line does when the thing counted has two causes.
+
+**The window is the driver's.** A transfer it stopped waiting for is not a
+transfer that is over: it is still the controller's to run and still the
+device's to answer. `reset_recovery` issued the Bulk-Only Mass Storage Reset
+*first* and restarted the endpoints after, so the device's answer landed on a
+state machine the reset had already rewound. QEMU 11.0.3's `hw/usb/dev-storage.c`
+is explicit about it: `ClassInterfaceOutRequest | MassStorageReset` sets
+`s->mode = USB_MSDM_CBW` and does **not** cancel `s->req`, and the late
+`usb_msd_command_complete` then takes `else if (s->data_len == 0)` and sets
+`s->mode = USB_MSDM_CSW` back over it. An OUT token in CSW mode reaches
+`default: goto fail` and is stalled. **Who wins that race is the whole
+difference between the two accelerators** — the aio completes long before a TCG
+guest reaches the reset and after a KVM one every time — and nothing about it is
+QEMU-only: a stick whose firmware finishes the command it was handed is the same
+picture, on the machine whose boot disk this is.
+
+Closed by two changes, neither a conditional:
+
+- **The order is structural.** `restart_endpoint` splits at the one act of a
+  recovery that puts a packet on the bus: `quiesce_endpoint` runs every command
+  `Recovery` owes and answers with `Owed`, and `reset_the_device` — the class
+  request *and* both CLEAR_FEATUREs, everything the driver says to the device —
+  takes both endpoints' `Owed` as its arguments. No order of `reset_recovery`'s
+  three lines speaks to the device first. `toyos-xhci`'s
+  `the_bus_is_reached_only_after_every_command` is what makes that a split of
+  the sequence rather than a reordering of it.
+- **Reset Recovery restores the transport and says nothing about the command**,
+  so `scsi` re-issues it. `MAX_TRANSPORT_ATTEMPTS` is 3 and is derived rather
+  than tuned: there is one abandoned transfer, it is answered once, so it can
+  undo one recovery.
+
+Proof, run `31264371902` — two arms on one runner, three reps each, one filtered
+test per job: **control (main's driver, recovery sequence and test dropped back
+into the branch's tree) 3 of 3 red**, each red twice counting its `ALONE: red
+again` re-run, the same sentence every time; **fixed 3 of 3 green**, `1
+break(s)` each and every block verified host-side. The whole twelve shards on
+the same tree (run `31264372439`) have `usb_transport_break` green in shard 6.
+
+**The test is stronger than it was.** It asserted `wr_err=1` and excluded the
+broken block from the host-side verify — the driver's lost write written into
+the harness as an expectation, and `verify_except` existed for that one caller.
+It now asserts `wr_err=0` and verifies every block. Counting `transport broke`
+was counting who won a race, so what is counted is the staged sentence, exactly
+once, with the total bounded at two by the same derivation as the attempt count
+and the driver's own give-up line a red.
+
+**What this does not explain.** `xhci_flap` is untouched by it: that is
+plug/unplug and port re-enumeration, with no Bulk-Only Reset Recovery anywhere
+in it, so its entry stays open on its own evidence. And
+`specs/test-cost-audit.md` §5.5's reading of this same line — "the driver's
+recovery retrying against an endpoint still halted from the staged break" — is
+wrong twice over: the endpoint was Running, and what stalled was the device.
+
 ### CLOSED — a `Task::Machine` group had the blast radius the shared block lost
 
 Run `31247206462`, shard 5, the metal-sim group re-run **alone**:
@@ -6937,7 +7016,7 @@ all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
 
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|
-| `usb_transport_break` | **5/5** | 6 | Serial | the transport broke 2 times; the injection is armed once per boot |
+| ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — §8, a Bulk-Only Reset that raced the transfer it was recovering from |
 | `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, see §1's x87 entry |
 | `std_unwind_so` | **5/5** | 10 | shared block | the same |
 | `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine |
