@@ -512,6 +512,18 @@ pub unsafe fn drain_unlocked(out: &mut [u8]) -> usize {
 /// stays in bounds whatever the cursors do; the caller must simply tolerate a
 /// torn result. That is why the boot checkpoints call it with interrupts
 /// enabled and IRQ handlers logging: a torn line on screen, nothing more.
+pub unsafe fn peek_tail(out: &mut [u8]) -> usize {
+    let ring = unsafe { &*RING.0.get() };
+    let len = ring.retained.min(RING_SIZE);
+    let head = if ring.head >= RING_SIZE { 0 } else { ring.head };
+    let n = len.min(out.len());
+    let start = (head + RING_SIZE - n) % RING_SIZE;
+    for (i, slot) in out[..n].iter_mut().enumerate() {
+        *slot = ring.buf[(start + i) % RING_SIZE];
+    }
+    n
+}
+
 /// Copy the bytes between two marks, without taking the lock and without
 /// consuming them. Returns the number copied.
 ///
@@ -521,10 +533,7 @@ pub unsafe fn drain_unlocked(out: &mut [u8]) -> usize {
 /// shortens the same way: a mark names a byte, never a promise to have kept it.
 ///
 /// # Safety
-/// Exactly [`peek_tail`]'s contract. It takes no lock, mutates nothing, and
-/// masks every index, so concurrent appends cost a garbled line near either end
-/// and can never move a cursor or leave the ring in a state a later drain would
-/// report differently.
+/// Exactly [`peek_tail`]'s contract, and for exactly its reasons.
 pub unsafe fn peek_range(from: Mark, to: Mark, out: &mut [u8]) -> usize {
     let ring = unsafe { &*RING.0.get() };
     let written = WRITTEN.load(Ordering::Acquire);
@@ -535,18 +544,6 @@ pub unsafe fn peek_range(from: Mark, to: Mark, out: &mut [u8]) -> usize {
     let first = end - n as u64;
     for (i, slot) in out[..n].iter_mut().enumerate() {
         *slot = ring.buf[((first + i as u64) % RING_SIZE as u64) as usize];
-    }
-    n
-}
-
-pub unsafe fn peek_tail(out: &mut [u8]) -> usize {
-    let ring = unsafe { &*RING.0.get() };
-    let len = ring.retained.min(RING_SIZE);
-    let head = if ring.head >= RING_SIZE { 0 } else { ring.head };
-    let n = len.min(out.len());
-    let start = (head + RING_SIZE - n) % RING_SIZE;
-    for (i, slot) in out[..n].iter_mut().enumerate() {
-        *slot = ring.buf[(start + i) % RING_SIZE];
     }
     n
 }

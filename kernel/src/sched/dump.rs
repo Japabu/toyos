@@ -183,11 +183,6 @@ pub fn request() {
 
     let cpus = online_cpus();
     let me = percpu::cpu_id() as usize;
-    // Taken before the first line and again after the last, so the panel gets
-    // *this report* rather than the newest screenful of a ring every process on
-    // the machine writes into. It also fixes which end of the report the page
-    // shows: `Page::Last` of a bracket ends on the verdict, whatever the
-    // machine goes on logging while the CPUs are answering.
     let from = crate::drivers::log_ring::mark();
     log!("=== blocked-task dump: {cpus} cpu(s), and this report takes the screen ===");
 
