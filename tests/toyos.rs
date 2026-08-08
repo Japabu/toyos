@@ -6360,25 +6360,32 @@ fn run_machine_test(
                     unpaired.iter().take(4).cloned().collect::<Vec<_>>().join("\n"),
                 ));
             }
-            // A clear bit has to mean "that CPU stopped". On a machine with
-            // nothing to run that is only true if every CPU is woken anyway, so
-            // the assertion is that none is ever missing — and the per-CPU lines
-            // the kernel prints for a missing one must never appear at all.
+            // **What a clear bit has to mean is "that CPU stopped", and what
+            // makes that readable is that it does not come back.** `diag-tick`
+            // caps a sleep at 100 ms against a 250 ms line, so a healthy CPU
+            // contributes two or three passes to every one; a CPU absent from
+            // two consecutive lines has missed five wakes and is the shape the
+            // T14 produces — the mask thins CPU by CPU and stays thin, 56 lines
+            // naming a silent CPU and one silent for 2.811 s. A single line a
+            // CPU is missing from and is back on is the other thing entirely,
+            // and this guest has eight vCPUs on a runner's four cores: run
+            // `31283095698` rep 2 reported `cpu6 last reached one 0.349s ago`
+            // once, between eight lines of `8/8` either side of it. That is the
+            // host declining to run a halted thread, which no instrument in this
+            // guest claims anything about.
             //
-            // **It is a claim about a machine that has finished coming up, and
-            // the capture starts before that.** `boot_with_options` returns on
-            // this config's ready marker with userland still spawning, and a
-            // guest with eight vCPUs on a four-core runner does not run all
-            // eight of them while it is busy: run `31280428519` shard 5 reported
+            // **The boot is excluded for the same reason and needs a second
+            // rule.** `boot_with_options` returns on this config's ready marker
+            // with userland still spawning, and eight vCPUs on four cores do not
+            // all run while the guest is busy — run `31280428519` shard 5 had
             // `alive=7/8` at 1.373 s with `cpu1 has never reached a scheduler
-            // pass`, then `5/8` at 1.624 s, then eight of eight for the whole of
-            // the rest of the capture. That is the host, and this instrument
-            // never claimed anything about a CPU the host is not running. So the
-            // window opens at the first full mask and the assertion is that it
-            // never thins again — which is what a reader of a metal log needs it
-            // to mean, and what the tick-less control cannot satisfy: without
-            // `diag-tick` ten of eleven lines are below `8/8` and no two
-            // consecutive ones are full, so the window never opens at all.
+            // pass` and `5/8` at 1.624 s, and run `31283095698` rep 2 had cpu0
+            // missing from two consecutive lines. So the window opens at the
+            // first full mask.
+            //
+            // Neither rule lets the tick-less control through, and that was run
+            // rather than argued: `heartbeat = []` in `kernel/Cargo.toml` reds
+            // this on six of the eight CPUs.
             let Some(settled) = beats.iter().position(|l| l.contains("alive=8/8")) else {
                 return Err(format!(
                     "no heartbeat in the whole capture reported every CPU alive, so the machine \
@@ -6395,24 +6402,41 @@ fn run_machine_test(
                     beats.len()
                 ));
             }
-            let thin: Vec<&&str> = quiet.iter().filter(|l| !l.contains("alive=8/8")).collect();
+            const CPUS: usize = 8;
+            let masks: Vec<u64> = quiet
+                .iter()
+                .filter_map(|l| l.split("mask=0x").nth(1))
+                .filter_map(|m| u64::from_str_radix(m.split_whitespace().next()?, 16).ok())
+                .collect();
+            if masks.len() != quiet.len() {
+                return Err(format!(
+                    "{} of {} heartbeats carry no readable mask=0x — the field that says which CPU \
+                     stopped\n{log}",
+                    quiet.len() - masks.len(),
+                    quiet.len()
+                ));
+            }
+            let absent = |c: usize, m: &u64| m & (1 << c) == 0;
+            let stopped: Vec<usize> = (0..CPUS)
+                .filter(|&c| masks.windows(2).any(|w| absent(c, &w[0]) && absent(c, &w[1])))
+                .collect();
             let named: Vec<&str> = captured[at[settled]..]
                 .iter()
                 .filter(|l| l.contains("heartbeat: cpu"))
                 .copied()
                 .collect();
-            if !thin.is_empty() || !named.is_empty() {
+            if !stopped.is_empty() {
                 return Err(format!(
-                    "{} of {} heartbeats dropped a CPU from the mask and {} named one silent, on a \
-                     settled guest where every CPU is healthy — so a clear bit does not mean that \
-                     CPU stopped, which is the whole of the field\n{}\n{}\n{log}",
-                    thin.len(),
+                    "cpu{stopped:?} missing from two consecutive heartbeats of {}, on a settled \
+                     guest where every CPU is healthy — a CPU that misses two lines has missed \
+                     five `diag-tick` wakes, so a clear bit does not mean that CPU stopped, which \
+                     is the whole of the field\n{}\n{}\n{log}",
                     quiet.len(),
-                    named.len(),
-                    thin.iter().take(4).map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
-                    named.iter().take(4).cloned().collect::<Vec<_>>().join("\n"),
+                    quiet.join("\n"),
+                    named.iter().take(8).cloned().collect::<Vec<_>>().join("\n"),
                 ));
             }
+            let blips = masks.iter().filter(|m| **m != (1 << CPUS) - 1).count();
             // And no window between two lines may be wide enough to hide a
             // death. The metal boots this exists for went quiet for between 14 s
             // and 102 s; four times the period is far below any of them and far
@@ -6540,9 +6564,10 @@ fn run_machine_test(
             }
             eprintln!(
                 "  [heartbeat] {} whole lines in ~3 s, each with its own pin reading, {settled} \
-                 before the machine settled and {} full-mask after, {moved} with ran>0, widest gap \
-                 {worst:.3}s, t={} → t={}; {} i8042 line reading(s), vec 0x{vector} on gsi \
-                 {kbd_gsi}, none masked, none with OBF set",
+                 before the machine settled and {} after, {blips} of those missing a CPU for one \
+                 line and none for two, {moved} with ran>0, widest gap {worst:.3}s, t={} → t={}; \
+                 {} i8042 line reading(s), vec 0x{vector} on gsi {kbd_gsi}, none masked, none with \
+                 OBF set",
                 beats.len(),
                 quiet.len(),
                 stamps.first().unwrap_or(&"?"),

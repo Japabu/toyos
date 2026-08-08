@@ -1347,6 +1347,18 @@ rate about the tree.**
   pair collides *systematically*, because soundd prints a client's removal
   exactly while the kernel prints that client's exit. soundd writes whole lines
   now; the other 176 `eprintln!` sites in `userland/` do not.
+- **`kernel_heartbeat`'s mask needed a second rule, and the probe is what said
+  so.** Run `31283095698` is the same ten reps against the fixed tree: the
+  settle window alone took it from 1 of 10 to 1 of 10, and what survived was a
+  different line — `cpu6 last reached one 0.349s ago`, once, with eight `8/8`
+  lines either side of it on a guest that had settled. A CPU that has genuinely
+  stopped does not come back, and `diag-tick` caps a sleep at 100 ms against a
+  250 ms line, so what the field has to support is **no CPU missing from two
+  consecutive lines** — the T14's shape, where the mask thins CPU by CPU and
+  stays thin, and not the runner's, where one halted vCPU thread waits on a host
+  with half as many cores as the guest has CPUs. Teeth run rather than argued:
+  `heartbeat = []` in `kernel/Cargo.toml` — the same guest with no tick — reds
+  it on six of the eight CPUs.
 - **`desktop_window_child` is the tree's, and it is the one left.** The
   `/bin/terminal` boot race, `specs/issues/kernel/terminal-races-compositor-at-boot.md`,
   which that file already records as the dominant blocker of the dev host's
@@ -1364,3 +1376,16 @@ rate about the tree.**
   added for it** — an exemption names a defect and its write-up, and this one
   has both and is still a defect that reds a merge gate rather than one anybody
   decided to accept.
+
+Run `31283095698` is the fixed arm, ten reps of the same four names on the same
+image with the same accelerator:
+
+| test | before | after |
+|---|---|---|
+| `dump_nmi_probe` | 2/10 | **0/10** |
+| `desktop_audio_client` | 1/10 | **0/10** |
+| `kernel_heartbeat` | 1/10 | 1/10 on a *different* line, then the rule above |
+| `desktop_window_child` | 2/10 | 2/10, untouched |
+
+So one name is left between `main` and the trigger, it is a defect with a
+write-up and an owner's decision outstanding, and it fires one run in five.
