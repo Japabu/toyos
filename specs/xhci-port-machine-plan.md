@@ -1,6 +1,9 @@
 # The xHCI port machine: extraction, host model, and the three defects it carries
 
-Plan of record. Nothing here is built yet.
+Plan of record. **X0, X1 (`6bfeed9`), X2a and X2b are built; X2c and X3 are
+not** — §3 carries the per-stage state and is the authority. This line said
+"nothing here is built yet" until 2026-08-08, three stages after it stopped
+being true.
 
 Governed by `specs/code-quality-review-2026-08.md` — the doctrine (§1) and the
 `xhci/` verdict (§2 drivers/), which names this extraction as the vehicle for
@@ -195,8 +198,9 @@ the one most likely to need a second landing.
 
 #### Working state, so this stage survives its agent
 
-X0 and X1 are on main (`6bfeed9`); **X2a is built** and X2b is not started.
-Everything below is established and should not be re-derived.
+X0 and X1 are on main (`6bfeed9`); **X2a and X2b are both built** — see the
+X2b section below, which this line contradicted until 2026-08-08. X2c is not
+started. Everything below is established and should not be re-derived.
 
 **The three call sites that must lose the ability to wait.** `poll_if_pending`
 reaches exactly four things — `next_event`/`dispatch_event` (a drain, no wait),

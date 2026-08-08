@@ -138,7 +138,7 @@ wiring between russh's auth callbacks and that decision — `auth_publickey`,
 `auth_publickey_offered`, and the `MethodSet` that stops password auth being
 offered at all — is certified by reading. Closing it needs an SSH client on the
 host talking to the guest through `hostfwd`, which is
-`specs/daemon-testability.md` §131's step and belongs with gate N.
+`specs/daemon-testability.md` §6's step 1 and belongs with gate N.
 
 ### THE CLASS: an id or a name treated as a capability
 
@@ -965,6 +965,121 @@ same image for another. Fixing the protection (M2, `Protection` as a type)
 closes the aliasing and makes the borrow honest; converting the borrow first
 would describe a hazard that M2 removes. Recorded so the two are known to be
 one question rather than two.
+
+### CRITICAL — the NIC's virtqueue is inside the page netd is granted writable, so netd can aim the device at any physical address
+
+`virtio_net::init` registers **the whole 2 MiB `DmaPool` page** as one shared
+region (`kernel/src/drivers/virtio_net.rs:208-209`) and `device::try_claim`
+grants it to whoever claims `DeviceType::Nic` (`kernel/src/device.rs:136-141`).
+Every shared mapping is writable — `SharedRegion::map_into` passes
+`writable = true` with no alternative (`kernel/src/shared_memory.rs:64`,
+`mm/paging.rs:534-556`) — and netd maps the full 2 MiB
+(`userland/netd/src/main.rs:47`).
+
+**What is in that page besides buffers.** The layout
+(`virtio_net.rs:29-37`) puts the RX descriptor table at offset 0, the RX avail
+ring at `0x1000`, the RX used ring at `0x2000` and the entire TX virtqueue —
+descriptors, avail and used — at `0x3000`; only from `0x4000` on is it the
+buffers netd is meant to have. Derived from the constants in that file: 4096 +
+516 + 2052 bytes for the RX rings, 256 + 36 + 132 for the TX ones, **7088 bytes
+of virtqueue control structure, the last of it at `0x31a7`**, all of it inside
+the window. `NicInfo` (`toyos-abi/src/net.rs`) tells netd only
+`rx_buf_offset`/`tx_buf_offset`; the *mapping* is not bounded by what it was
+told.
+
+**Three primitives follow, in severity order.**
+
+1. **An arbitrary physical write.** Each of the 256 RX descriptors carries a
+   `u64` physical address the device will DMA the next frame into. All 256 are
+   posted at init (`virtio_net.rs:234-237`) and stay posted until frames arrive,
+   so at rest netd holds 2048 bytes of live DMA targets that the device has not
+   read yet. Rewriting one aims the NIC at any physical address in the machine —
+   kernel text, page tables, another process. `refill_rx` rewrites the
+   descriptor from `rx_phys[buf_idx]` on the *next* refill (`:68-78`), which
+   closes nothing: the device's write happens first, and the frame contents are
+   the attacker's too. Nothing else stands in the way — `kernel/src/iommu/mod.rs:11`
+   says of itself that "this module *refuses nothing*", every function is in one
+   identity-mapped domain, and stages I0–I2 are all that is built.
+2. **Kernel memory onto the wire.** The TX descriptor at `0x3000` is written by
+   `submit()` and read by the device. Same window, opposite direction: a
+   rewritten `addr`/`len` reads arbitrary physical memory out through the NIC.
+   Narrower than (1) as a race — under TCG QEMU services the notify inline — but
+   it is a race only because of how the host schedules, not because of anything
+   the kernel does.
+3. **Forged completions.** The RX used ring at `0x2000` is what
+   `Virtqueue::poll_used` reads back. See the entry below for what the kernel
+   then does with an `id` and a `len` it did not check; that entry's "a buggy or
+   malicious *device*" becomes "netd" here.
+
+**The fix shape is already in this tree, one file over.** `virtio_sound::init`
+allocates *two* pools (`virtio_sound.rs:374-375`): `dma_kernel` holds the
+descriptor tables and the TX used ring and is never registered; `dma_shared`
+holds the avail rings and the buffers and is the only token soundd is given
+(`:429-433`). A forged avail entry can then only name a chain the kernel itself
+built, and the comment at `virtio_sound.rs:403-405` states the rule for the used
+ring in as many words. virtio-gpu registers only its framebuffer and cursor
+pages and keeps its `DMA` pool private (`virtio_gpu.rs:464-479`, `:678`).
+virtio-net is the one device that hands its virtqueue out, and it predates both.
+
+**Standing.** No test stages a netd that writes outside its buffers, and none
+can while the mapping is one 2 MiB grant. `specs/type-safety-audit/kernel-drivers.md`
+F1 audits the *reading* half (the entry below) and does not reach this: it
+argues from a misbehaving device throughout, which is a hardware-failure
+argument, where this is a process-isolation one. Splitting the pool the way
+virtio-sound does is the whole fix and needs no ABI change — `NicInfo` already
+addresses everything by offset.
+
+### `poll_used` returns a device-chosen descriptor id and length, both unchecked
+
+`Virtqueue::poll_used` (`kernel/src/drivers/virtio.rs:387-399`) reads `id` and
+`len` out of the used ring — memory the *device* writes, and for virtio-net
+memory *netd* writes too (entry above) — and returns `DescSlot(id as u16)` and
+`len` with no comparison against `self.size` or against any buffer length.
+`UsedRingConsumer::poll` (`:191-205`) does the same for `id`. `DescSlot` is this
+codebase's own proof token, deliberately non-`Copy` and non-`Clone`
+(`:169-172`), and it proves the descriptor is *free*; it says nothing about the
+number being in range, and `id()` is public.
+
+**Three consequences in the code today.**
+
+- **An out-of-bounds read, in `unsafe`, from an unchecked length.**
+  `virtio_console::try_read_byte_locked` (`virtio_console.rs:132-148`) stores the
+  returned `len` and walks `*c.rx_ptrs[p.buf_idx].add(p.pos as usize)` until
+  `pos >= len`. `RX_BUF_SIZE` is 256 (`:29`) and the eight RX buffers sit 256
+  bytes apart inside one page (`:186-191`), so a `len` above 256 walks the next
+  buffer, then `OFF_RXVQ`'s virtqueue rings, then past the pool — all inside the
+  direct map, so it faults nowhere and delivers kernel memory to the console as
+  typed input.
+- **A kernel panic from an index.** `desc_to_rx` is `[u8; 16]`
+  (`virtio_console.rs:56`) and `desc_to_buf` is `[u16; 256]`
+  (`virtio_net.rs:59`), and `slot.id()` ranges over the whole `u16`. Rust bounds-
+  checks both, so the failure mode is a panic rather than a read — and on the
+  virtio-net side the value comes out of a page netd writes, which makes it a
+  userland-triggered kernel panic, the thing CLAUDE.md's corollary forbids by
+  name.
+- **A frame length nothing bounded.** `poll_rx` returns
+  `written_len as usize - NET_HDR_SIZE` (`virtio_net.rs:90-101`) and
+  `SYS_NIC_RX_POLL` packs it as `((buf_idx as u64) << 16) | (frame_len as u64)`
+  (`kernel/src/arch/syscall.rs:482`) with no mask, so a length above 65535
+  corrupts the buffer-index field of the word netd unpacks, and netd's own
+  `rx_buf(idx)` walks off its mapping.
+
+**One consumer of the four does check.** `virtio_sound::drain_tx`
+(`virtio_sound.rs:110-118`) rejects a head that is not a chain's and counts it as
+`stray` rather than trusting it; its comment at `:100-102` states the rule —
+"a head that is not a chain's is untrusted input, not a device fault". virtio-net,
+virtio-console and virtio-gpu do not, and virtio-gpu's `submit` masks a bogus id
+with `% size` (`virtio.rs:346`) so it silently aliases another submission's
+descriptors instead of failing.
+
+**Standing.** Audited and explicitly never filed:
+`specs/type-safety-audit/kernel-drivers.md` F1 has the full analysis and the
+proposed fix at the primitive — `submit` records each chain's byte total, and
+`poll_used` answers `None` on an id past `size` or a length past the chain — and
+its closing line reads "**Standing.** … Not filed." This is that filing. Two of
+its citations have since drifted: `virtio.rs:161-164` is `:169-172` today, and
+the two `virtio_sound.rs` `assert!`s it names as the counter-example are gone,
+replaced by the `stray` counter above. No test covers any of it.
 
 ---
 
@@ -2857,6 +2972,52 @@ identical to a human, and RTF is what separates them — RTF near 1.0 with the
 audio still slow means the clock, RTF well below 1.0 means synthesis is not
 keeping up.
 
+### Five driver waits spin with no deadline, and NVMe reads the timeout the spec gives it and throws it away
+
+`grep -rn "spin_loop()" kernel/src/drivers/` returns 23 sites. Five of them are
+unbounded polls of a device register, all on the boot path:
+
+- `nvme.rs:105-119` `wait_completion` — `loop { … core::hint::spin_loop(); }`
+  on the completion-queue phase bit, no deadline. **Every** admin and I/O
+  command reaches it through `submit_and_wait` (`:121-124`).
+- `nvme.rs:434-436` — `while bar.read_u32(REG_CSTS) & 1 != 0` (controller
+  disable).
+- `nvme.rs:458-460` — `while bar.read_u32(REG_CSTS) & 1 == 0` (controller
+  enable).
+- `virtio.rs:412-417` `submit_and_wait` — polls `poll_used()` forever. (Its
+  *panic-path* instance is filed in §2; this is the ordinary one.)
+- `virtio.rs:453-456` — device reset, `while common.read_u32(COMMON_DEVICE_STATUS) != 0`.
+
+**NVMe hands the driver the bound and the driver drops it.** `CAP.TO` (bits
+31:24, in 500 ms units) is defined as the worst-case time for exactly the
+`CSTS.RDY` transitions at `:434` and `:458`. `nvme.rs:429` reads the whole
+`CAP` register and `:430` takes `((cap >> 32) & 0xF)` — the doorbell stride —
+out of it; nothing else in the file touches `cap`. So the one number the device
+publishes about how long to wait is read into a local and discarded, and a
+controller that never sets `RDY` hangs the boot with nothing on the log to say
+which one.
+
+**The primitive already exists and is not shared.** The xHCI half of this closed
+on its own: those waits moved behind a bounded `settles(ready)` against
+`USB_TIMEOUT_NS` = 2 s (`xhci/wait/mod.rs:126-135`, `xhci/mod.rs:319`), and the
+legacy handoff is bounded by `HANDOFF_TIMEOUT_NS` = 1 s (`xhci/legacy.rs:55`,
+`:177-180`). It is now written three times byte-for-byte against three
+constants — `xhci/wait/mod.rs:126`, `hda.rs:758`, `hda_probe.rs:979` — plus two
+copies of the spin delay beside it (`hda.rs:769`, `hda_probe.rs:990`), plus
+`scheduler.rs:190`'s `wait_until`, plus an IOMMU variant that `assert!`s where
+the others return (`iommu/vtd/queue.rs:125-130`, `iommu/vtd/mod.rs:271-276`).
+
+**Standing.** `specs/type-safety-audit/kernel-drivers.md` F10 (`:928`, deadlines
+and durations as bare `u64` in two different units, so `wait_writable(500)`
+compiles and means "expired at boot") and F11 (`:987`, the
+`wait(off, until, pred) -> Result<u32, Timeout>` primitive and its blast radius)
+are the design; F11's own closing line is "**Standing.** Not filed." Two
+corrections to it: its count of eight unbounded MMIO polls is **five** today,
+because the xHCI sites it named are the ones that closed; and `CAP.TO` appears
+nowhere in it. **Not** `specs/iouring-blocking-spec.md` — that spec owns the
+*park* deadline (§9.1–9.2, `Instant`/`Duration`/`Deadline`, "no `0 = forever`"),
+never a driver register poll, and does not mention NVMe at all.
+
 ---
 
 ## 4. Audio and soundd
@@ -3769,6 +3930,39 @@ Cosmetic today. It stops being cosmetic the moment anything gates on it.
 
 ## 5. Diagnostics
 
+### There is no cyclictest, so nobody can ask this machine what its wake latency is
+
+`grep -rni cyclictest` over the tree returns 12 hits, all in two spec files and
+none in code: `specs/metal-boot-plan.md:350-351` ("A real cyclictest-equivalent
+for ToyOS should exist before the first metal boot — it is the instrument that
+turns the boot into a measurement") and `specs/production-audio-baselines.md:343-347`
+and `:667-670`, which state the design — an RT-priority thread that arms an
+absolute timer, sleeps, and histograms `actual − programmed` at 1 µs resolution —
+and the consequence: "Until such a tool exists, **no honest 2x claim can be made
+on this metric in either direction**." That is CLAUDE.md's hard bar, unmeasurable
+for scheduling.
+
+**What exists is not a substitute, and each instrument fails differently.**
+soundd's `max_wake_lat_ns` (`userland/soundd/src/main.rs:995-996`, the null-sink
+copy at `:1371-1372`) is read by gate A (`tests/common/audio.rs:478-488`,
+`:636-645`) and baselined in `tests/audio-baseline.toml:18-22`; the thorough tier
+runs Mann-Whitney on `max_wake_lat_us` (`tests/toyos.rs:1668`). But it is a
+**max over a ~2 s window, not a distribution** — no percentiles, no sample count;
+it measures against a DLL's *prediction of a DMA completion*, not against a
+programmed timer, so it folds in the device model; and it needs soundd plus a
+sound card to exist at all, which is exactly what the T14 has not got.
+`toyos-sched`'s invariant I4 (`specs/scheduler-core-spec.md:1043`) bounds the
+same quantity but is marked `sim`, so it can never see TCG distortion, real IPI
+delivery, or metal.
+
+**One concrete blocker before it can be written.** `SYS_SET_RT_PRIORITY` is
+gated at its dispatch site on owning an audio device claim — `PermissionDenied`
+unless the caller owns `VirtioSound` or `HdaAudio`
+(`kernel/src/arch/syscall.rs:684-689`), whose own comment says "Spec §9.4 wants
+a privilege; a claim is not one". A standalone latency tool cannot reach the RT
+band today without also taking the sound card away from soundd, which changes
+the machine it is trying to measure.
+
 ### CLOSED — `screen_blocked_dump`'s red, and the three diagnoses of it that were wrong
 
 ```
@@ -4228,6 +4422,131 @@ and a report needing two pages leaves the answer on one nobody can reach.
 ---
 
 ## 6. Build and toolchain
+
+### The boot capture landed, and two doc comments still tell agents it did not
+
+The capability is there and is used: `QemuInstance::boot_log` (`tests/common/qemu.rs:1251`,
+accessor at `:1548-1558`) holds everything `wait_for_ready` saw on the way to the
+ready marker (`:2494-2583`, accumulated into `seen` on both arms and returned at
+`:2468-2472`), and `tests/common/serial.rs:41-43` wraps it as `Serial::boot` with
+`must_say`/`must_not_say`/`must_be_clean`/`alive`. Counted with
+`grep -rn 'boot_log()' tests/ | wc -l` and its two siblings: **68** `boot_log()`
+call sites, **13** `Serial::boot`, **131** `must_say`/`must_not_say`/`must_be_clean`
+outside the helper. `tests/common/faults.rs:221-242` asserts on
+`VirtIO net: NOT INITIALISED at PCI` and four more boot lines; `metal_sim_scanout_wc`
+reads its PAT and MTRR lines out of a shared boot's seeded console
+(`tests/toyos.rs:3530`, `:3841-3893`). It arrived in `8025f57` (2026-07-31) and
+`a1ef357` (2026-08-01), both ancestors of `main`.
+
+**What is left is narrower and real.** `TestResult.serial` still starts at
+`===TEST_START` — `tests/common/qemu.rs:1747-1748` sets `in_test` there and
+nothing is appended before it — so gate A's `serial`, built at
+`tests/toyos.rs:1283` as `result.serial + &qemu.drain_serial(500ms)`, carries no
+boot prefix, and `audio::check_suspend_structure` (called at `tests/toyos.rs:1409`)
+therefore still cannot see a device started before the window opened. That is
+one line to fix now that the capture exists: prepend `qemu.boot_log()`.
+
+**And two comments now mislead about the harness, which is why this reads as
+open.** `tests/common/audio.rs:519-531` says the harness "never joins the reader
+thread's full log … Catching that needs the boot capture the harness currently
+throws away" — it does not throw it away. `tests/toyos.rs:1022-1024` says a
+device started before `===TEST_START` is "invisible here as it is everywhere
+else" — it is not invisible everywhere else. One genuine blind spot survives by
+design: `BootOptions::mute` sets `boot_log` to `String::new()`
+(`tests/common/qemu.rs:2468-2470`), and `Serial::alive()` exists so an assertion
+over an empty capture fails rather than passing vacuously.
+
+### The kernel's crate-level `allow(dead_code)` hides 49 warnings from the zero-warning bar
+
+`kernel/src/main.rs:3` is `#![allow(dead_code)]`. `kernel/.cargo/config.toml`
+carries `-Dwarnings`, so the kernel is warning-clean today *because of* that one
+line rather than in spite of it.
+
+Measured by reproducing `src/build.rs:209-256`'s invocation as a `cargo check`
+into a scratch `CARGO_TARGET_DIR`, so neither the worktree nor the shared sysroot
+was touched:
+
+```
+cd kernel && RUSTUP_TOOLCHAIN=toyos \
+  RUSTFLAGS='--force-warn dead_code -Cforce-frame-pointers=yes' \
+  CARGO_TARGET_DIR=<scratch> cargo check --target x86_64-unknown-none \
+  --profile toyos --message-format=json
+```
+
+**71 `dead_code` messages, 65 of them the kernel's** (3 `bcachefs`, 3
+`hashbrown`); the same command without `--force-warn` gives 0. `--force-warn`
+overrides item-level allows too, and four of those exist in the kernel
+(`arch/mod.rs:3` on `mod debug`, `main.rs:42` on `mod vfs`, `id_map.rs:92`,
+`drivers/virtio.rs:73`), accounting for 16 of the 65. **So deleting `main.rs:3`
+alone surfaces 49.** They are unused constants, never-read fields and unreachable
+methods — `PORTSC_CCS/PED/PR/SPEED`, `CMD_GET_DISPLAY_INFO`, `DR7_*`,
+`struct DisplayOne`, `static NEXT_CPU_ID`, `map_alloc`, `is_mapped`,
+`clear_regions`, `unmap_2m`, `wake_one`, `port_bit`, `redirection`. Default
+features only; an actuator feature could move the number.
+
+Same family as *The fork estate is invisible to the zero-warning bar* below: a
+bar with a crate-level exemption under it certifies less than it looks like it
+does, and "Dead code is deleted" is a stated principle.
+
+### `wall_clock_refusals` is five boots in one registration, and can be the longest job in the parallel phase
+
+`tests/toyos.rs:465` registers it `Sched::Parallel`; the body
+(`tests/common/wallclock.rs:281-305`) calls five helpers in sequence and each one
+goes through `boot_and_read` (`:123-176`), which builds an image and boots one
+guest. Five distinct kernel builds: `rtc-dead`, `rtc-unstable`,
+`rtc-no-century`+`rtc-century-next`, `rtc-century-next`, `rtc-zone-east`. None is
+in `INERT_ACTUATORS` (`tests/common/qemu.rs:1315-1322`), so `fold_inert` merges
+nothing — one worker takes all five, serially.
+
+Recorded durations on disk, from other worktrees' `target/test-durations`
+(this one has never been run):
+
+| file | entries | `wall_clock_refusals` | rank | that run's next-longest |
+|---|---|---|---|---|
+| `toyos-h3` (2026-08-08 00:08) | 285 | **209 405 ms** | **1st** | `i8042_kbd_echo` 187 280 |
+| `toyos-hdaprobe` (2026-08-06 11:47) | 258 | **18 989 ms** | 8th | `xhci_msi_only` 39 054 |
+
+The h3 figure is from a contended run (§7's class), so "longest" is that run's
+verdict and not a clean measurement; 19.0 s is the uncontended shape. Its
+already-split sibling `wall_clock_file` costs 2818/3189 ms in the same two files.
+`longest_first` (`tests/toyos.rs:9991`) can order jobs and can never split one,
+so the ordering cannot help here.
+
+**The split is free.** The kernel artifact memo (`src/build.rs:696-745`, keyed at
+`:772` on `[PROFILE, features]`) builds one kernel per feature set per process,
+so five registrations build exactly the five kernels the one registration already
+builds — and the parallel phase gets five jobs it can place instead of one it
+cannot.
+
+### SMEP is on everywhere except `cargo run`, and nothing asserts it anywhere
+
+Both halves of the old gap closed. The kernel enables it —
+`arch/cpu.rs:145-176` `enable_smep` (CPUID leaf 7 EBX bit 7, then `CR4.SMEP`),
+with `enable_smap` beside it at `:184-217`, called on the BSP at
+`arch/percpu.rs:411-412` and on every AP at `:468-469` — and the harness passes
+it, `tests/common/qemu.rs:2199` on both the KVM and TCG arms, landed in `5d53aa0`
+(2026-08-06, ancestor of `main`).
+
+Two residuals:
+
+- **`cargo run` was never given it.** `src/qemu.rs:88` and `:90` are still
+  `host,+rdrand,+smap,+fsgsbase,+x2apic` and `qemu64,+rdrand,+smap,+fsgsbase,+x2apic`.
+  So the interactive path — including `--metal-sim`, whose whole purpose is to
+  be the T14's shape — differs from the harness in exactly the dimension the
+  harness was changed for. `grep -rn smep tests/ src/` returns one hit, the
+  harness argument.
+- **Nothing asserts it.** No test reads `smep=on` out of a boot log
+  (`grep -rn "percpu: BSP" tests/` → nothing), so deleting the argument, or
+  breaking the CPUID gate in `enable_smep`, reds nothing. Nor does any test
+  execute a user page from ring 0 — and such a test would be a weak instrument
+  anyway, because the kernel executes out of the direct map, which has no U bit
+  (`specs/memory-boundary-spec.md` §2.1), so SMEP does not cover the kernel's own
+  alias of a user page. That is #159/#166 territory, not this.
+
+The two spec paragraphs that still described the pre-`5d53aa0` state are
+corrected in this commit (`specs/memory-boundary-spec.md` §2.1 and §3.2);
+§8 there is a dated record of the discovery run and its line citation is left
+alone.
 
 ### The page cache owns one device, and `usb_storage.rs` says it does not
 
@@ -5508,13 +5827,13 @@ option and does not record that the answer was no.
 
 ### OPEN — what the repository ships is not all MIT OR Apache-2.0
 
-`specs/dependency-audit-2026-08-08.md` §7 has each item with its evidence. Six
-committed binary files — 11,094,369 bytes of the 14,634,080 git tracks — plus one
-committed source corpus sit outside the declared licence, and the README declares
-only one exception
-(`userland/doom` is GPL-2.0). Provenance had to be established from content,
-because `assets/` and `ovmf/` both entered in the initial squashed commit
-`52eb78e` and carry no attribution.
+`specs/dependency-audit-2026-08-08.md` §7 has each item with its evidence. The
+audit found six committed binary files outside the declared licence, 11,094,369
+bytes of them; the wallpaper is now ours and the other five are 10,757,700.
+One committed source corpus is outside it too, and the README declares a single
+exception (`userland/doom` is GPL-2.0). Provenance had to be established from
+content, because `assets/` and `ovmf/` both entered in the initial squashed
+commit `52eb78e` and carry no attribution.
 
 Sharpest first:
 
@@ -5539,10 +5858,25 @@ Sharpest first:
   licence, version or recipe recorded. They are load-bearing: `src/qemu.rs:101`
   and `tests/common/qemu.rs:2090` point pflash at them, while every workflow
   installs the `ovmf` apt package and the harness ignores it.
-- **`assets/wallpaper.jpg`** has **no determinable provenance**. Its EXIF holds
-  four tags and neither `Artist` nor `Copyright`; git history has nothing; the
-  README does not mention it. It ships as `share/wallpaper.rgb`. Recording the
-  open question rather than guessing is the point of this bullet.
+- **`assets/wallpaper.jpg`** — **CLOSED 2026-08-08**, and the close is a
+  replacement rather than an attribution. The owner supplied the source the
+  file's own metadata could not: peakpx.com, whose page names no author and no
+  copyright holder, says the image was *"uploaded by our users"*, and states
+  *"License: Wallpaper use only, DMCA"*. That is worse than the unknown it
+  answers — a documented restriction from an aggregator with a takedown form and
+  no standing to grant one, and "wallpaper use only" is exactly the clause a
+  redistributable OS image violates. So the bytes are gone: `src/wallpaper.rs`
+  draws what is at that path now and `cargo run -- --regen-wallpaper` writes it.
+  **The question cannot reopen by someone dropping a picture there** —
+  `the_committed_wallpaper_is_the_one_this_file_describes` compares the file
+  against the generator on every `cargo test`.
+  **One loose end, deliberately left here rather than fixed blind:** `NOTICE`
+  exists only on branch `wt/toyos-licence`, unlanded when this landed, and
+  carries an `assets/wallpaper.jpg — PROVENANCE UNKNOWN` section. The two
+  branches touch different files, so git will merge that section in silently.
+  Whoever lands second **deletes it** — the entry describes bytes that are no
+  longer in the tree, and a `NOTICE` naming a file it does not describe is
+  worse than one line shorter.
 
 ### OPEN — nothing in the tree checks any of the above
 
@@ -5666,9 +6000,268 @@ is nothing to load into, because a translator reads the config when it starts.
 The `/home` caveat is unchanged and still true: it is tmpfs on the T14, so the
 choice survives a login and not a reboot.
 
+### The PerCpu asm contract is 47 hand-written `gs:[N]` sites bound to nothing
+
+The owner's own review note, and the one finding in it that names a hazard
+rather than a shape: *"this verifies against constants but doesnt gaurantee
+that the constants are the same used in for example preempt.rs."* He is right.
+
+`arch/percpu.rs` carries 14 `const _: () = assert!(core::mem::offset_of!(PerCpu,
+f) == N)`. Those pin the struct's layout to a set of literals. They do not pin
+anything to the assembly, and the assembly is where the offsets are actually
+used: measured 2026-08-08, **47 hand-written `gs:[N]` operands across eight
+files** — `preempt.rs` 13, `arch/percpu.rs` 9, `arch/syscall.rs` 8,
+`arch/idt/mod.rs` 5, `arch/idt/timer.rs` 5, `log.rs` 3,
+`arch/idt/device_irq.rs` 2, `arch/idt/tlb.rs` 2 — naming 15 distinct offsets
+(0, 8, 16, 24, 136, 140, 216, 224, 232, 240, 244, 248, 252, 256, 260). A third
+copy of the same numbers lives in the field comments (`cpu_id: u32, // offset
+8`). Reordering a field trips the asserts; changing one asserted literal and
+its field together does not, and the 47 asm sites then read the wrong bytes
+with no diagnostic at all — on the syscall entry path, the timer stub and the
+preemption counter.
+
+Fix shape, agreed in the 2026-08 review (`specs/code-quality-review-2026-08.md`
+§2 arch/, deep dive 1): feed `offset_of!` into the asm as `const` operands. One
+source, and all 14 asserts delete with it.
+
+Two smaller PerCpu items ride this and **must not precede it**, because field
+surgery before the unification is what the 47 copies punish:
+
+- `lapic_id` (`percpu.rs:81`) has zero readers outside the file — written at
+  `:270`, never read. Delete it.
+- `alloc_percpu` (`:262`) sets 8 of the struct's 22 fields and relies on
+  `alloc_zeroed` for the other 14. One total `ptr::write(PerCpu { .. })` says
+  what the struct is. The `current_tid`/`current_pid` `u32::MAX` sentinel stays
+  — it is an asm wire format and is already `Option`-decoded at the boundary.
+
+### Four deletions the 2026-08 review named, each small and each still there
+
+Grouped because none is worth a task of its own and all four are the same
+judgement: code that exists to have existed. Verified on `main` 2026-08-08.
+
+- **`arch/gdt.rs`** — a 4-line re-export shim left behind when the GDT went
+  per-CPU. The review recorded one caller of `KERNEL_CS`; it is now four
+  constants (`KERNEL_CS`, `STAR_SYSRET_BASE`, `USER_CS`, `USER_DS`) over five
+  sites — `arch/syscall.rs:107`, `loader/start.rs:60,61,85,86`. They import
+  from `percpu` and the file goes. The owner's note: *"no empty files no lazy
+  refactorings."*
+- **`arch::apic::init_timer_ap()`** (`apic.rs:269`) — an empty function with
+  one caller (`smp.rs:269`). The behaviour is correct: calibration is one
+  global measurement and `arm_one_shot` programs divide and LVT per call, so
+  there is genuinely nothing for an AP to do. Delete the ceremony. It may
+  legitimately return for heterogeneous ARM cores; that day reintroduces it.
+- **`arch/mod.rs:3`'s `#[allow(dead_code)]` on `debug`** — masks exactly five
+  uncalled investigation tools: `set_context`, `watch_write`, `clear`,
+  `monitor_pte`, `check_pte_monitor`, zero callers each. `read_dr6` and
+  `context` have one caller each, from the #DB handler. Delete the five (git
+  history is the shelf), keep the two, drop the allow. Distinct from the
+  crate-level `#![allow(dead_code)]` in §6, and smaller — but the same bar.
+- **`block.rs:73`'s private `PAGE_SIZE = 4096`** — the owner asked whether it
+  belongs to the paging subsystem. It does, and **there is nothing there to
+  move it to**: `mm/paging.rs` exports only `PAGE_SIZE_BIT` (a PDE flag) and
+  `mm/user_span.rs` only `PAGE_2M`. Five private 4 KiB constants exist with no
+  common owner — `block.rs:73`, `file_cache.rs:13`, `file_backing.rs:9,10`,
+  `fat32_adapter.rs:75`, `usb_gate.rs:31`. Whoever does this makes the export
+  first.
+
+### The comment-density position, and the hardware-name scrub it comes with
+
+Five of the owner's 35 review notes are one position stated five times —
+*"the whole codebase has too many comments. good code speaks for itself.
+accompanied by spec documents per subsystem or whatever that should suffice"*
+(`main.rs`), *"why so long comments?"* (`bootloader/main.rs:164`), *"does it
+make sense to have so many comments in each source file or should we instead
+refer to the spec in the module and just let the code speak for itself?"*
+(`sched/driver.rs`), *"theres slop narration in the comments"* (`log_file.rs`),
+and *"'now runs the whole way' thats narration slop"* (`bcachefs_adapter.rs:17`,
+still present verbatim). Filed once, not five times.
+
+Measured 2026-08-08, counting lines whose first non-space characters are `//`,
+`/*` or `*` (so trailing comments are **not** counted and the real figure is
+higher):
+
+- `kernel/src`: **11,920 comment lines of 43,739 — 27%.**
+- First-party Rust as a whole (`kernel bootloader toyos toyos-abi userland
+  toyos-desktop toyos-elf toyos-sched src`): **21,424 of 96,848 — 22%.**
+- Worst files over 200 lines: `heartbeat.rs` 174/260 (**66%**),
+  `arch/tlb.rs` 138/279 (49%), `log_file.rs` 264/564 (46%), `arch/apic.rs`
+  145/323 (44%), `drivers/xhci/mod.rs` 777/1825 (42%), `fat32_adapter.rs`
+  407/997 (40%).
+
+The rule this measures against already exists — CLAUDE.md's slop-comment
+paragraph, and `specs/code-quality-review-2026-08.md` §1.5, which narrows the
+surviving kinds to three: the one-clause invariant at the edit site, the
+boundary contract, and the refusal-reason at a surprising decision, with a
+module doc of contract plus one spec pointer, target ten lines. **What does not
+exist is the sweep**, and nothing in the tree measures density or would notice
+it rising.
+
+The same note carries the **hardware-name scrub**: *"never mention ThinkPad in
+the kernel source code. its just our example machine we have right now. the
+kernel is general."* The review recorded this as "~20 sites across six kernel
+files". Measured, it is much larger: **6 `ThinkPad` mentions across two kernel
+`.rs` files** (`log_file.rs:3`, `drivers/i8042/mod.rs` ×5) and **59 `T14`
+mentions across 26 kernel `.rs` files**, plus 34 more outside `kernel/`
+(`bootloader/`, `toyos/`, `toyos-abi/`, `toyos-xhci/`, `toyos-hda/`,
+`toyos-ps2/`) and a further set in `kernel/Cargo.toml`'s feature commentary.
+The bound or the behaviour stays; the machine that produced it moves to the
+commit message. Note that a plain deletion loses information in the cases where
+the machine *is* the evidence — `i8042/mod.rs:1420`'s "a device that will not
+answer at all" is one — so this is a rewrite per site, not a `sed`.
+
+### OPEN QUESTION for the owner — redesign the log subsystem, and re-shape `kernel/src`?
+
+Recorded verbatim because it is the owner asking, not the owner deciding, and
+because an agent must not answer it on his behalf: *"should we redesign and
+rewrite the log subsystem and rethink if the current file/folder structure of
+the kernel makes sense?"* (`kernel/src/log.rs`). What follows is the evidence
+that makes it decidable, and nothing else.
+
+**The log subsystem, as it exists.** Six places, no core:
+
+| File | Lines | What it is |
+|---|---|---|
+| `log.rs` | 64 | the `log!` macro and a GS-validity flag |
+| `drivers/log_ring.rs` | 549 | the ring, 64 KiB, and its drain policy |
+| `log_file.rs` | 564 | the `/log` sink and its flush |
+| `drivers/serial.rs` | 467 | the 16550 sink |
+| `drivers/panic_console/mod.rs` | 1,188 | the screen sink, panic-only |
+| `drivers/virtio_console.rs` | 221 | the second serial-shaped sink |
+
+Its known sins are already entries here and are the argument for the question:
+the flush is unbounded, uninterruptible and in front of the scheduler pass
+(§10); userland `println!` shares the ring (§5); the ring's occupancy is a wake
+condition (§5); a boot that wedges before the idle loop produces no output at
+all because the ring's only drains are the timer tick and the idle loop (§5);
+and `drain_serial`'s `BackendGuard::lock` spins with interrupts disabled with
+no bound and no deadlock panic (CLAUDE.md's idle-loop warning). Each has been
+patched where it hurt. None has been fixed by a design.
+
+The shape the review reached, **if** the owner wants it: a log core (ring +
+context stamping, once) with serial, file and screen as independent sinks
+carrying explicit backpressure — a slow sink drops-and-counts, never blocks,
+does no unbounded work in a scheduler-adjacent path, and fails alone.
+
+**The layout half.** `kernel/src` is **39 flat `.rs` files** beside seven
+directories (`arch/`, `drivers/`, `elf/`, `iommu/`, `loader/`, `mm/`,
+`sched/`). Three of those seven were flat files a month ago — `elf.rs` and
+`loader.rs` became directories in `42b29c9`, which is the precedent. The flat
+set mixes a filesystem adapter, an IPC primitive, two input devices, a page
+cache, io_uring, the process table and two cfg-gated test actuators at one
+level. The review's target was subsystem directories (fs/, ipc/, input/,
+proc/, log/, time/), and the `syscall.rs` split already forces at least one.
+
+Cost, so the question is priced: a directory move is `git mv` plus `mod` lines,
+it touches no logic, and it collides with every worktree in flight — which is
+why it is a scheduling decision and not a technical one.
+
+Two smaller layout items ride the same answer. `usb_gate.rs` (225 lines) and
+`input_merge_test.rs` (202) are correctly `#[cfg]`-gated at declaration and
+call (`main.rs:27-30`, `:446`, `:566`) and are never in an ordinary build, but
+they sit interleaved with production sources; the review's target is one
+`kernel/src/gates/` directory so that what test machinery exists is auditable
+in one listing. And `input_merge_test` is the tell that pure logic is trapped
+in the kernel: the merge state machine (one held-set, one button-merge, both
+bounded) is host-testable with synthetic multi-source streams, after which the
+gate shrinks or goes.
+
+### What is still owed on "this file is too big", with the numbers
+
+Nine of the owner's review notes asked whether a large file could become a
+crate, a host test, or both. Four have been answered and five have not; the
+numbers below are 2026-08-08 and exist so the next reader does not re-measure.
+Full verdicts and target shapes: `specs/code-quality-review-2026-08.md` §2.
+
+**Answered:**
+
+- `elf.rs` → `toyos-elf/` (1,604 lines, host-tested, crafted-input corpus),
+  `e2c6a06`; the mapping half stayed as `kernel/src/elf/` (1,186), `42b29c9`.
+- `compositor/main.rs` → `toyos-desktop/` (2,684 lines, pure), `763712b`; the
+  effects shell is `userland/compositor/` at 2,085 over five files with a
+  68-line `main.rs`, `72705d9`.
+- `xhci/mod.rs` → the port machine is `toyos-xhci/` (2,082 lines with a host
+  simulator), `2e81ae8`, with `specs/xhci-port-machine-plan.md` as the plan of
+  record. `xhci/mod.rs` is still 1,825 lines, so the shell has not shrunk to
+  match.
+- `loader.rs` → `kernel/src/loader/` (1,397 over four files), `42b29c9`, with
+  the pure decisions in `toyos-elf`. The plan/execute split — a `LoadPlan` an
+  executor applies — is **not** built, and #159 changes what a mapping's
+  protection is, so its shape is not settled.
+
+**Still owed:**
+
+- `arch/syscall.rs` — 2,061 lines at review, **2,248 now**. The biggest file in
+  the kernel and the one holding three unrelated things (entry asm, ABI
+  register mapping, every handler). The user-pointer decode being invisible
+  inside it is where the cwd-accumulation and derived-allocation bug classes
+  both lived.
+- `userland/soundd/src/main.rs` — 1,637 at review, **1,924 now**. Mixing and
+  format conversion are inline; there is one `mod tests` at `:1892`. Gate A
+  certifies the device end and nothing certifies the mixing, which is the half
+  a host test would make sample-exact.
+- `process.rs` — 1,743 lines, no host model. #142 and #156 are the standing
+  evidence that its bugs are interleaving bugs.
+- `symbols.rs` — 293 lines, `core` + `alloc` only, no crate. The smallest and
+  cheapest of the five; a real symbol blob is the fixture.
+- `drivers/acpi.rs` — no `toyos-acpi`. Better than the note feared (typed
+  `TableError`, named bounds, packed structs only for `offset_of!`), and it is
+  stage 0 of the ACPI/AML track, whose interpreter is the most host-testable
+  component this kernel will ever have.
+
 ---
 
 ## 8. Hardware and performance gaps
+
+### Metal boot is 1151 ms against QEMU's 196 ms, and the recorded accounting for it is stale
+
+**The numbers, taken out of the committed logs rather than re-measured.** Six
+healthy boots in `specs/metal-logs/2026-08-07-freeze/` report `Boot: complete` at
+1148, 1148, 1149, 1150, 1151 and 1154 ms; the seventh (`…-222741.log`) is 755 ms
+and is the control boot whose keyboard was refused, so its peripherals phase is
+448 ms instead of 842. The QEMU figure for the comparable shape is
+`Boot: complete (196ms)` on the `metal_sim_compositor` boot (§8's i8042 entry
+below records the measurement), and `(234ms)` for the diag artifact booted
+headless. **So metal is ~5.9× QEMU, not the ~17× `specs/metal-hardware-inventory.md:392-395`
+computes** — that ratio is against `(3422ms)`, and 2.30 s of those 3.42 s were
+the six `boot_checkpoint` framebuffer repaints (`metal-hardware-inventory.md:425-429`),
+which #138's write-combining change removed. Measuring the phase-boundary gaps in
+`…-223244.log` myself, all six together are **73 ms** against that boot's 2308.
+The inventory's "Boot timing on metal" section describes a machine that no longer
+exists and should be re-taken or dated.
+
+**Where the 1151 ms goes now**, from `…-223244.log`:
+
+| phase | reported |
+|---|---|
+| CPU ready | 60 ms |
+| storage ready | 84 ms |
+| **peripherals ready** | **842 ms** |
+| subsystems ready | 93 ms |
+| devices ready | 20 ms |
+
+Peripherals is 73% of the boot, and its two largest components are:
+
+- **393 ms of i8042 keyboard init** — `i8042: ok selftest=0x55` at 0.609, the
+  next i8042 line at 1.002. Real hardware, not a probe of an absent one.
+- **206 ms establishing the Thunderbolt xHC at `00:0d.0` has nothing on any
+  port** — `controller started` at 0.161, `no HID devices on the controller at
+  00:0d.0` at 0.367. Four of the PCH's port resets are 55 ms each, which is USB's
+  own and not the driver's to shorten.
+
+**Absent-device probing is ~279 ms of 1151, not ~1.1 s.** The other piece is the
+PCI walk: `PCI: Enumerating devices...` at 0.065, last real function `0a:00.0` at
+0.072, `Enumeration complete, 24 functions.` at 0.145 — **73 ms** scanning buses
+that hold nothing, against 7 ms finding everything that is there.
+
+**What this entry is for.** Metal boot time has no heading of its own; the
+accounting lives in `specs/metal-hardware-inventory.md` against the superseded
+3422 ms boot, and `known-issues.md`'s console entry below points at "#65 (boot
+time)" as its owner. Whatever #65 says, its numbers should come from this table:
+the two-thirds that motivated it were paints and are gone. Note also the NIC
+retry that looks like boot cost and is not — `toyos/src/net.rs:271`'s 100 retries
+at 10 ms run *after* `Boot: complete` (see *Every network client pays a second of
+boot retry on a machine with no NIC*), and `READY_BUDGET_NS` bounds retries
+rather than boot time (§9).
 
 ### One atomic read-modify-write per log line cost 350 ms of boot
 
@@ -7740,6 +8333,54 @@ kernel adapter is `kernel/src/fat32_adapter.rs`; §10 carries what that found.
 Nothing below is a defect found later — these are the residuals its own gate
 identified while it was being written, recorded so the adapter's author did not
 have to rediscover them.
+
+### Three of the six USB/ESP gate holes the teeth audit demonstrated are still open
+
+`specs/type-safety-audit/usb-gate-teeth.md` is the record — it names each hole,
+gives the mutation that proved it, and its Part 3 is a ranked work list. It was
+written against `8d7044c`, which `git rev-list --count 8d7044c..HEAD` puts 738
+commits behind as of this entry, and three of its six have closed since. Filed
+here so a reader does not re-investigate all six, and so the open ones are
+visible from this file:
+
+**Closed.**
+
+- The ESP fsck gate's blindness to any value in the `..` entries of `/EFI` and
+  `/toyos` (audit `:30-35`, `:230-274`) — closed by rewrite. `tests/common/volumes.rs:36`
+  now judges with `toyos-fat32-check`, which has `Complaint::DotCluster` /
+  `DotDotCluster` / `DotInRoot` and derives from neither our writer nor our
+  reader (`volumes.rs:35`), and the gate is **silence rather than sameness**: a non-empty complaint
+  list is refused before the guest runs (`volumes.rs:275-281`) and after
+  (`:342-348`). That is the audit's own ranked item 5.
+- `tests/common/usb.rs`'s needle that could never fire (audit `:43-45`) — now
+  `" designated, blocks="` at `usb.rs:292-297`, with a comment naming the old
+  defect.
+- `healthy=true` as an asserted constant (audit `:46`, `:119-128`) — now
+  `xhci::storage_online(self.index) == Some(true)` (`usb_storage.rs:73-75`) down
+  to `MscDevice::online()` (`xhci/wait/msc.rs:102-104`).
+
+**Open, unchanged.**
+
+- **`usb_storage_gate`'s read half is certified by one in-guest comparator that
+  nothing certifies.** `first_bad` (`kernel/src/usb_gate.rs:59-65`) is still the
+  only comparator and `:118-131` the only verdict on the host's blocks; nothing
+  prints a digest the harness could recompute. Audit ranked item 1, not built.
+- **`xhci_no_interrupt`'s "nothing claimed a device" tooth passes on any absent
+  line.** `tests/toyos.rs:6851-6857` is still `parse_xhci_binds(boot.text())`
+  followed by `if !binds.is_empty()` — a negative over a parser, which a renamed
+  log line satisfies vacuously.
+- **The stamp guard has no test.** `usb_gate.rs:100-104` refuses a disk whose
+  stamped block count disagrees with the device's, and `grep -rn "is stamped for" tests/`
+  returns nothing: no profile stages a mis-stamped image.
+
+Of the audit's eleven ranked items, 3, 5 and 10 are built — item 3 is
+`Profile::UsbDiskCrowd` (`tests/common/qemu.rs:307`, shape at `:936`), which also
+closed the harness gap that a `Shape` carried one disk triple (`usb_disks:
+&'static [UsbDisk]` at `:641`). Items 1, 2, 4, 6, 7, 8, 9 and 11 are not; a
+`usb-short-read` kernel feature now exists (`usb_gate.rs:147-155`,
+`xhci/mod.rs:1818-1824`) which reaches a short read but not a failed device.
+Nothing in this list is duplicated by *USB mass storage: what is not implemented*
+below — that entry records driver gaps, these are test gaps.
 
 ### OPEN — this suite still formats and populates through two macOS binaries
 

@@ -103,6 +103,11 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--regen-wallpaper") {
+        toyos_build::wallpaper::regen(&root);
+        return;
+    }
+
     if args.iter().any(|a| a == "--merge-durations") {
         toyos_build::durations::dispatch(&root, &args);
         return;
@@ -110,6 +115,13 @@ fn main() {
 
     if args.iter().any(|a| a == "--worktree") {
         toyos_build::worktree::dispatch(&root, &args);
+        return;
+    }
+
+    // On demand and nowhere else: it asks GitHub for every fork branch head, so
+    // neither `cargo test` nor `--land` may reach it.
+    if args.iter().any(|a| a == "--check-forks") {
+        toyos_build::forkcheck::dispatch(&root);
         return;
     }
 
