@@ -205,15 +205,15 @@ fn build_time() -> FatTime {
 ///
 /// Using `toyos-fat32` is not a way round them. It deletes the second FAT32
 /// writer from the project: this is the one the kernel appends `kernel.log`
-/// with, the one `toyos-fat32`'s host suite runs `fsck_msdos` and a real macOS
-/// mount against on every `cargo test` in that crate, and now the one the claim
-/// "the image we build is clean" is a claim about. `fatfs` keeps the format
-/// call, where it has never had a complaint against it — an empty volume has no
-/// subdirectory for either bug to live in.
+/// with, the one `toyos-fat32`'s host suite runs the volume checker and a real
+/// macOS mount against on every `cargo test` in that crate, and now the one the
+/// claim "the image we build is clean" is a claim about. `fatfs` keeps the
+/// format call, where it has never had a complaint against it — an empty volume
+/// has no subdirectory for either bug to live in.
 ///
-/// The free-cluster count is the third thing `fsck_msdos` used to ask for:
+/// The free-cluster count is the third thing the checker asks for:
 /// `format_volume` leaves FSInfo's field 0xFFFFFFFF, which FAT32 defines as
-/// "unknown" and `fsck_msdos` reports as `Free space in FSInfo block is unset`.
+/// "unknown" and every host then reports this volume's free space from.
 /// `free_bytes` counts the FAT when the volume arrived without a hint and
 /// `sync` writes it.
 fn populate(volume: &mut [u8], label: &str, files: &[(&str, &[u8])]) {
@@ -288,72 +288,34 @@ fn create_log_volume() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
-    /// Everything `fsck_msdos -n` has to say about a volume, minus the one
-    /// summary line a clean run prints.
+    /// The two volumes this build writes break no rule of the format, and the
+    /// gate is silence rather than sameness.
     ///
-    /// Never the exit code: `fsck_msdos -n` exits 0 while printing `Fix?` for
-    /// problems it declined to repair, and exits 0 on a volume it has just
-    /// called dirty.
-    fn fsck(volume: &[u8], name: &str) -> Vec<String> {
-        let tool = std::path::Path::new("/sbin/fsck_msdos");
-        assert!(tool.exists(), "no /sbin/fsck_msdos: this gate's outside judge is missing");
-        let path = std::env::temp_dir().join(format!("toyos-image-{}-{name}.vol", std::process::id()));
-        std::fs::write(&path, volume).expect("stage the volume for fsck");
-        let out = Command::new(tool).arg("-n").arg(&path).output().expect("run fsck_msdos");
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        let _ = std::fs::remove_file(&path);
-
-        let mut summaries = 0;
-        let mut complaints = Vec::new();
-        for line in text.lines().map(str::trim_end) {
-            if line.is_empty()
-                || line.starts_with("**")
-                || line.starts_with(&path.display().to_string())
-            {
-                continue;
-            }
-            // `Warning: 5 files, 306560 KiB free (76640 clusters)`.
-            let summary = line
-                .strip_prefix("Warning: ")
-                .and_then(|rest| rest.split_once(' '))
-                .is_some_and(|(n, tail)| {
-                    n.chars().all(|c| c.is_ascii_digit()) && tail.starts_with("files,")
-                });
-            if summary {
-                summaries += 1;
-                continue;
-            }
-            complaints.push(line.to_string());
-        }
-        assert_eq!(summaries, 1, "fsck_msdos printed {summaries} summary lines, wanted one:\n{text}");
-        complaints
-    }
-
-    /// The two volumes this build writes are `fsck_msdos`-clean, and the gate
-    /// is silence rather than sameness.
-    ///
-    /// The ESP was not, from the first image this project ever built until
-    /// [`populate`] stopped writing it with `fatfs` — twelve complaints, before
-    /// any guest ran, from two format violations that crate's `create_dir` has.
-    /// The consequence was not only a dirty volume: `esp_filesystem` could only
-    /// ask that the guest add no *new* complaint, so a complaint the guest
-    /// produced for its own reason would have hidden inside the twelve.
+    /// The ESP did break some, from the first image this project ever built
+    /// until [`populate`] stopped writing it with `fatfs` — twelve complaints,
+    /// before any guest ran, from two format violations that crate's
+    /// `create_dir` has. The consequence was not only a dirty volume:
+    /// `esp_filesystem` could only ask that the guest add no *new* complaint,
+    /// so a complaint the guest produced for its own reason would have hidden
+    /// inside the twelve.
     ///
     /// Here rather than in the boot suite because it needs no guest, no QEMU
     /// and no kernel: it is a claim about the writer, and it fails in seconds
     /// on `cargo test --lib`.
     #[test]
-    fn the_volumes_this_build_writes_are_fsck_clean() {
-        let esp = create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4());
-        let complaints = fsck(&esp, "esp");
-        assert!(complaints.is_empty(), "fsck_msdos on the ESP:\n{}", complaints.join("\n"));
-
-        let log = create_log_volume();
-        let complaints = fsck(&log, "log");
-        assert!(complaints.is_empty(), "fsck_msdos on the log volume:\n{}", complaints.join("\n"));
+    fn the_volumes_this_build_writes_break_no_format_rule() {
+        for (what, volume) in [
+            ("ESP", create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4())),
+            ("log volume", create_log_volume()),
+        ] {
+            let complaints = toyos_fat32_check::check(&volume);
+            assert!(
+                complaints.is_empty(),
+                "the {what} this build writes is not a clean FAT32 volume:\n{}",
+                toyos_fat32_check::describe(&complaints)
+            );
+        }
     }
 
     /// And it is clean because it is right, not because it is empty: a

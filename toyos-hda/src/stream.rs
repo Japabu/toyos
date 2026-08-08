@@ -11,6 +11,15 @@ use alloc::vec::Vec;
 /// The two rate bases the format field can name, and the only two.
 const BASES: [u32; 2] = [48_000, 44_100];
 
+/// Where each field of `SDnFMT` starts. The base bit is bit 14 and the three
+/// below it are the multiplier, so a base written one bit low is a 48 kHz
+/// stream carrying a reserved multiplier — a format both a codec and a
+/// controller accept, and a rate neither plays at.
+const BASE_SHIFT: u16 = 14;
+const MULT_SHIFT: u16 = 11;
+const DIV_SHIFT: u16 = 8;
+const BITS_SHIFT: u16 = 4;
+
 /// How many periods a cyclic buffer may have.
 ///
 /// Policy: the mask is a `u32` and soundd's pipeline is eight deep. A caller
@@ -47,10 +56,10 @@ pub fn stream_format(rate: u32, bits: u8, channels: u8) -> Option<u16> {
                     continue;
                 }
                 return Some(
-                    ((base_bit as u16) << 13)
-                        | (((mult - 1) as u16) << 11)
-                        | (((div - 1) as u16) << 8)
-                        | (width << 4)
+                    ((base_bit as u16) << BASE_SHIFT)
+                        | (((mult - 1) as u16) << MULT_SHIFT)
+                        | (((div - 1) as u16) << DIV_SHIFT)
+                        | (width << BITS_SHIFT)
                         | (channels - 1) as u16,
                 );
             }
@@ -180,11 +189,41 @@ pub fn decode(mask: u32, periods: usize) -> Option<Completed> {
 mod tests {
     use super::*;
 
+    /// The rate half of the field, against a second implementation of the same
+    /// specification rather than against this one restated.
+    ///
+    /// Linux carries the whole rate field as a literal table
+    /// (`sound/hda/hdac_device.c`, `rate_bits[]`), so these are twelve numbers
+    /// nothing here derived. That is the point: the encoding this crate builds
+    /// arithmetically had the base bit one place low, which every
+    /// self-consistent assertion agreed with — and it is a stream a codec and a
+    /// controller both accept and play at the wrong speed.
+    #[test]
+    fn every_rate_linux_tabulates_encodes_to_the_number_linux_tabulates() {
+        for (rate, bits) in [
+            (8_000u32, 0x0500u16),
+            (11_025, 0x4300),
+            (16_000, 0x0200),
+            (22_050, 0x4100),
+            (32_000, 0x0a00),
+            (44_100, 0x4000),
+            (48_000, 0x0000),
+            (88_200, 0x4800),
+            (96_000, 0x0800),
+            (176_400, 0x5800),
+            (192_000, 0x1800),
+            (24_000, 0x0100),
+        ] {
+            // S16 stereo, which is the width and channel fields' own bits.
+            assert_eq!(stream_format(rate, 16, 2), Some(bits | 0x11), "{rate} Hz");
+        }
+    }
+
     #[test]
     fn the_rate_this_pipeline_plays_encodes_as_the_forty_four_one_base() {
         // 44.1 kHz, S16, stereo — soundd's grid, and what both the T14's
         // converter and QEMU's offer.
-        assert_eq!(stream_format(44_100, 16, 2), Some(0x2011));
+        assert_eq!(stream_format(44_100, 16, 2), Some(0x4011));
     }
 
     #[test]
@@ -195,7 +234,7 @@ mod tests {
     #[test]
     fn a_divided_rate_uses_the_divisor_field() {
         // 22.05 kHz is 44.1 halved, not a base of its own.
-        assert_eq!(stream_format(22_050, 16, 2), Some(0x2111));
+        assert_eq!(stream_format(22_050, 16, 2), Some(0x4111));
         // 24 kHz is 48 halved.
         assert_eq!(stream_format(24_000, 16, 2), Some(0x0111));
     }
@@ -203,13 +242,34 @@ mod tests {
     #[test]
     fn a_multiplied_rate_uses_the_multiplier_field() {
         assert_eq!(stream_format(96_000, 16, 2), Some(0x0811));
-        assert_eq!(stream_format(88_200, 16, 2), Some(0x2811));
+        assert_eq!(stream_format(88_200, 16, 2), Some(0x4811));
     }
 
     #[test]
     fn widths_and_channel_counts_land_in_their_own_fields() {
         assert_eq!(stream_format(48_000, 24, 2), Some(0x0031));
         assert_eq!(stream_format(48_000, 16, 8), Some(0x0017));
+    }
+
+    /// No rate may set a bit that belongs to another field.
+    ///
+    /// The defect this crate had was exactly that: a base that landed in the
+    /// multiplier. Asserting the encoding of one rate cannot catch it — the
+    /// wrong number is a perfectly good number — but a rate whose multiplier
+    /// field contradicts the rate it asked for can be caught by decoding what
+    /// was built and comparing it with the arithmetic the field defines.
+    #[test]
+    fn a_built_format_decodes_back_to_the_rate_it_was_asked_for() {
+        for rate in [8_000u32, 11_025, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200,
+            96_000, 176_400, 192_000]
+        {
+            let format = stream_format(rate, 16, 2).expect("a rate the field can express");
+            let base = if format & (1 << BASE_SHIFT) != 0 { 44_100 } else { 48_000 };
+            let mult = ((format >> MULT_SHIFT) & 0b111) as u32 + 1;
+            let div = ((format >> DIV_SHIFT) & 0b111) as u32 + 1;
+            assert!(mult <= 4, "{rate} Hz encodes multiplier {mult}, which the field reserves");
+            assert_eq!(base * mult / div, rate, "{rate} Hz decodes back wrong ({format:#06x})");
+        }
     }
 
     #[test]

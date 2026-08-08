@@ -194,7 +194,7 @@ mod tests {
         // back clear at boot, so a path configured without this is correct and
         // silent. Removing the `pin.eapd` arm reds here and nowhere else.
         let (codecs, path) = t14();
-        let sent = verbs(&codecs, &path, 0x2011, 1).unwrap();
+        let sent = verbs(&codecs, &path, 0x4011, 1).unwrap();
         let eapd: Vec<u32> = sent
             .iter()
             .map(|v| v.raw())
@@ -209,7 +209,7 @@ mod tests {
         // §6.4 item 2: mute on the pin, gain on the converter, and neither
         // widget implements the other's field.
         let (codecs, path) = t14();
-        let sent = verbs(&codecs, &path, 0x2011, 1).unwrap();
+        let sent = verbs(&codecs, &path, 0x4011, 1).unwrap();
         let amps: Vec<u32> = sent
             .iter()
             .map(|v| v.raw())
@@ -226,7 +226,7 @@ mod tests {
         // The whole sequence exists to make a path audible. A mute here is the
         // defect that looks exactly like a driver that never ran.
         let (codecs, path) = t14();
-        for verb in verbs(&codecs, &path, 0x2011, 1).unwrap() {
+        for verb in verbs(&codecs, &path, 0x4011, 1).unwrap() {
             let raw = verb.raw();
             if (raw >> 16) & 0xF == verb::SET_AMP_GAIN_MUTE as u32 {
                 assert_eq!(raw as u16 & AMP_MUTE, 0, "{raw:#010x} mutes an amplifier");
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn the_jack_is_told_to_drive_headphones_and_the_speaker_is_not() {
         let (codecs, path) = t14();
-        let sent = verbs(&codecs, &path, 0x2011, 1).unwrap();
+        let sent = verbs(&codecs, &path, 0x4011, 1).unwrap();
         let control: Vec<u32> = sent
             .iter()
             .map(|v| v.raw())
@@ -249,17 +249,17 @@ mod tests {
     #[test]
     fn the_converter_learns_the_format_and_the_tag_last() {
         let (codecs, path) = t14();
-        let sent = verbs(&codecs, &path, 0x2011, 3).unwrap();
+        let sent = verbs(&codecs, &path, 0x4011, 3).unwrap();
         let tail: Vec<u32> = sent[sent.len() - 2..].iter().map(|v| v.raw()).collect();
         // Set Converter Format on node 0x02 with 44.1 kHz S16 stereo, then
         // stream tag 3 channel 0.
-        assert_eq!(tail, [0x0022_2011, 0x0027_0630]);
+        assert_eq!(tail, [0x0022_4011, 0x0027_0630]);
     }
 
     #[test]
     fn every_widget_on_the_path_that_has_a_power_state_is_told_d0() {
         let (codecs, path) = t14();
-        let sent = verbs(&codecs, &path, 0x2011, 1).unwrap();
+        let sent = verbs(&codecs, &path, 0x4011, 1).unwrap();
         let powered: Vec<u8> = sent
             .iter()
             .map(|v| v.raw())
@@ -278,7 +278,7 @@ mod tests {
         // selector graph is the only place a hop exists at all.
         let codecs = fixture::synthetic_selector();
         let path = find_output_path(&codecs).unwrap();
-        let sent = verbs(&codecs, &path, 0x2011, 1).unwrap();
+        let sent = verbs(&codecs, &path, 0x4011, 1).unwrap();
         let selects: Vec<u32> = sent
             .iter()
             .map(|v| v.raw())
@@ -290,11 +290,11 @@ mod tests {
     #[test]
     fn both_machines_offer_the_one_rate_this_driver_asks_for() {
         let (codecs, path) = t14();
-        assert_eq!(format(&codecs, &path), Some((0x2011, 2)));
+        assert_eq!(format(&codecs, &path), Some((0x4011, 2)));
 
         let codecs = fixture::qemu();
         let path = find_output_path(&codecs).unwrap();
-        assert_eq!(format(&codecs, &path), Some((0x2011, 2)));
+        assert_eq!(format(&codecs, &path), Some((0x4011, 2)));
     }
 
     #[test]
@@ -315,7 +315,7 @@ mod tests {
     fn qemus_path_writes_its_amplifier_on_the_converter_and_none_on_the_pin() {
         let codecs = fixture::qemu();
         let path = find_output_path(&codecs).unwrap();
-        let sent = verbs(&codecs, &path, 0x2011, 1).unwrap();
+        let sent = verbs(&codecs, &path, 0x4011, 1).unwrap();
         let amps: Vec<u32> = sent
             .iter()
             .map(|v| v.raw())

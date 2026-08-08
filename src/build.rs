@@ -26,11 +26,6 @@ struct SystemConfig {
     hosted_rustc: bool,
     #[serde(default)]
     assets: Vec<String>,
-    /// Paths inside [`Self::assets`] that ship even though git does not carry
-    /// them. See [`assets::collect`]; an entry that is not on disk stops the
-    /// build.
-    #[serde(default)]
-    untracked_assets: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -417,7 +412,7 @@ fn build_and_assemble(
     }
 
     if !config.assets.is_empty() {
-        initrd_files.extend(assets::collect(&config.assets, &config.untracked_assets));
+        initrd_files.extend(assets::collect(&config.assets));
     }
 
     // Extra files (test binaries, shared libs)

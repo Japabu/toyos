@@ -1147,11 +1147,14 @@ worktrees' suites:
 - **`i8042_mouse`: one discarded byte, green alone.** A pre-existing
   `Sched::Parallel`, red only under five concurrent suites.
 - **`usb_transport_break`: "the transport broke 2 times; the injection is armed
-  once per boot", green alone.** Also pre-existing, also five-suite load.
+  once per boot", green alone.** Also pre-existing — and not load at all, which
+  took until `specs/known-issues.md` §8 to establish. Five concurrent suites
+  slowed the host enough for the guest to win a race it loses on a quiet one,
+  which is the same variable KVM changes by 50x; the defect underneath was the
+  driver's, and load was only ever the thing that exposed it.
 
-The last two are in `specs/known-issues.md`. Neither was introduced here and
-neither reproduces on a host running one suite; both are exactly what the
-mechanism exists to surface.
+Both are in `specs/known-issues.md`. Neither was introduced here, and both are
+exactly what the mechanism exists to surface.
 
 ## 5.5 Wave 6: the regression, and pacing as the general fix
 
@@ -1279,10 +1282,16 @@ of it anyway, both fixes on their own terms and neither a response to the load:
 - `shell_answers` typed ten times with a flat two seconds between, a
   twenty-second ceiling on a desktop coming up that does not scale with the
   phase. Now `qemu::budget(20 s)`.
-- `usb_transport_break` is `Sched::Serial`. Its second `transport broke` line is
-  the driver's recovery retrying against an endpoint still halted from the
-  staged break, so "the recovery finished on its first try" was part of its
-  verdict. Costs 3 s of tail.
+- `usb_transport_break` is `Sched::Serial`. Costs 3 s of tail. **The reading of
+  its second `transport broke` line recorded here — "the driver's recovery
+  retrying against an endpoint still halted from the staged break" — was
+  wrong.** The endpoint was Running; what stalled was the *device*, refusing the
+  next command block because the Bulk-Only Reset had gone out while the
+  abandoned transfer could still be answered. A driver defect that lost a write,
+  not a measure of how much of the host the guest had
+  (`specs/known-issues.md` §8). The lesson for this document: a red attributed
+  to load without the mechanism being read out of the log is a guess, and a
+  costs table is where a guess stops being questioned.
 
 One caution recorded rather than resolved: a run under that contention wedged in
 the metal-sim desktop group — one vCPU at 100% for twenty minutes, no output,
@@ -1544,6 +1553,85 @@ message follows the queue forward rather than naming whoever was in front when
 the wait began. A thread does the talking and the kernel still keeps the queue,
 so `flock`'s ordering is given up nowhere. Gate:
 `a_lasting_wait_keeps_saying_so`, which is red on the tree as it stood.
+
+## 5.8 Wave 7: the wall-clock verdict, and what was hiding behind it
+
+`specs/known-issues.md` §6's list of `Sched::Parallel` tests that red beside
+other guests had one shared shape: a test waits a number of host seconds for the
+guest to do something, and reports the *content* it was going to assert when the
+number expires. §5.5.2 fixed that for injection by pacing; this is the same idea
+for waiting.
+
+### 5.8.1 What was changed
+
+- **`await_guest`** (`tests/toyos.rs`) replaces `serial_until`'s span of
+  seconds. It ends when the guest goes quiet (15 s of no console output) or
+  wedges (300 s flat, unscaled — width is the correction for a *slow* guest, and
+  a slow guest keeps talking). Sixteen call sites, including every wait in
+  `desktop_audio_client`, both locale wizards, `blocked_dump`'s report and
+  `screen_console_scroll`'s round marker.
+- **The two compositor tails** — `metal_sim_compositor_stall` and
+  `metal_sim_client_death` — asked for two frame batches *inside 20 s*. They now
+  ask for two frame batches.
+- **`shell_echoes` and `open_terminal`**'s retype loops became a count of
+  attempts (ten) with a per-attempt window scaled by host speed and **not** by
+  width (`round_trip`). A shell echoing a line it has not run yet is
+  microseconds of guest time whatever share of the machine it has.
+- **`screen_pager_keys`** is paced: one PageDown, then the page it moved, then
+  the next. Its verdict was `moved >= (elapsed/3 + 1) * 3`, an arithmetic that
+  asks a guest given no time to repaint once for 3.3 moves, and it reported
+  `0 page moves over 30 keystrokes in 0.3s`. Unpaced it was also wrong about the
+  wire: 60 scancodes into QEMU's 16-byte `PS2_QUEUE_SIZE`.
+- **A blown guard is named.** Such a red carries `STALLED:`, prints as `STALL`,
+  and is counted apart in the summary. Still red. Gate:
+  `stall_is_not_a_verdict`.
+
+### 5.8.2 The measurement
+
+Eight full suites, one session, 2026-08-08: two concurrent twelve-wide runs at a
+time from one worktree with `--host-slots 0`, four on `main`'s `tests/toyos.rs`
+and four on the branch's, the guest image byte-identical between them.
+
+| arm | suite wall clock | red suites |
+|---|---|---|
+| `main` | 250, 520, 472, 474 s (mean 429) | 3 of 4 |
+| branch | 202, 214, 202, 209 s (mean 207) | 2 of 4 |
+
+Per test, seconds, across the four suites of each arm:
+
+| test | `main` | branch |
+|---|---|---|
+| `desktop_audio_client` | 17, 14, **FAIL 307**, **FAIL 305** | 20, 17, 17, 17 |
+| `desktop_typing_damage` | 18, **FAIL 303**, 18, 16 | 15, 17, 17, 16 |
+| `blocked_dump` | 4, 8, 5, 3 | 5, **FAIL 2**, 5, **FAIL 2** |
+| `screen_pager_keys` | 14, 14, 14, 14 | 14, 14, 14, 14 |
+| `screen_console_scroll` | 14, 9, 15, 13 | 16, 15, 11, 13 |
+| `screen_blocked_dump` | 8, 5, 6, 7 | 6, 4, 6, 7 |
+| `metal_sim_compositor_stall` | 13, 15, 13, 13 | 13, 14, 13, 13 |
+| `metal_sim_client_death` | 4, 4, 4, 4 | 4, 4, 4, 4 |
+
+Pacing `screen_pager_keys` is free: the old loop already paid one screendump per
+keystroke, which is about what a repaint costs.
+
+### 5.8.3 What the guard was hiding
+
+**Every one of `main`'s three reds was the `/bin/terminal` boot race**
+(known-issues §3), and every one was reported as `nothing typed at the terminal
+window reached a shell` with `ALONE: GREEN` under it. Every red suite in the
+session — both arms — carried that race in a boot log, and every green suite did
+not.
+
+So the class this wave set out to kill was, in this session, one real guest
+defect wearing its clothes: the test waited out a ready marker that
+`exit: terminal pid=1 code=1` had ruled out at 0.6 s, spent 300 s of a lane
+doing it, and reported the symptom. `shell_echoes` ends on that line too now and
+names the race, which is the 307 s → 2 s in the table above and most of the
+429 s → 207 s beside it.
+
+The general lesson, and it is the one `ALONE: GREEN` invites an agent to miss: a
+verdict that expires on the host's clock does not merely fail on a busy host, it
+**cannot report anything else** — so every defect underneath it arrives wearing
+the same sentence.
 
 ## 6. What this audit did not measure
 

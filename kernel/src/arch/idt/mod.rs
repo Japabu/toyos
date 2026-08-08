@@ -22,41 +22,6 @@ const PIC1_DATA: u16 = 0x21;
 const PIC2_CMD: u16 = 0xA0;
 const PIC2_DATA: u16 = 0xA1;
 
-/// IDT vector assignments — CPU exceptions and hardware interrupts.
-#[repr(usize)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Vector {
-    Debug = 0x01,
-    /// Diagnostic only, and sent by `sched::dump` alone — see `idt/nmi.rs`.
-    Nmi = 0x02,
-    InvalidOpcode = 0x06,
-    DoubleFault = 0x08,
-    GeneralProtection = 0x0D,
-    PageFault = 0x0E,
-    Timer = 0x20,
-    Xhci = 0x21,
-    VirtioNet = 0x22,
-    VirtioSound = 0x23,
-    I8042 = 0x24,
-    DmaFault = 0x25,
-    Hda = 0x26,
-    HaltAll = 0xFD,
-    TlbFlush = 0xFE,
-}
-
-impl Vector {
-    fn from_raw(v: u64) -> Self {
-        match v {
-            0x01 => Self::Debug,
-            0x06 => Self::InvalidOpcode,
-            0x08 => Self::DoubleFault,
-            0x0D => Self::GeneralProtection,
-            0x0E => Self::PageFault,
-            _ => panic!("unhandled exception vector {:#x}", v),
-        }
-    }
-}
-
 /// The vector both PS/2 lines are routed to. Public because the driver has to
 /// name it when it programs the I/O APIC.
 pub const I8042_VECTOR: u8 = Vector::I8042 as u8;
@@ -174,36 +139,136 @@ pub struct TrapFrame {
     pub ss: u64,
 }
 
-// Exception entry stubs — tiny per-vector, jump to common_entry
-
-/// #DB — no CPU error code. Push dummy error code + vector, jump to common.
-#[unsafe(naked)]
-extern "sysv64" fn stub_db() {
-    naked_asm!("push 0", "push 1", "jmp {common}", common = sym common_entry);
+/// A `dispatched` gate's entry point: push the vector, and where the CPU
+/// pushes no error code, a zero in its place so [`TrapFrame`] has one shape.
+///
+/// Which vectors those are is SDM Vol. 3A Table 6-1 and nothing else: get it
+/// wrong and every field above `error_code` is off by eight, so the handler
+/// reads the vector as an error code and returns through whatever `iretq`
+/// finds. The number lives in [`Vector`], so the slot a stub is installed in
+/// and the number it pushes cannot disagree.
+macro_rules! exception_stub {
+    ($stub:ident, $variant:ident, no_error_code) => {
+        #[unsafe(naked)]
+        extern "sysv64" fn $stub() {
+            naked_asm!(
+                "push 0",
+                "push {vector}",
+                "jmp {common}",
+                vector = const Vector::$variant as usize,
+                common = sym common_entry,
+            );
+        }
+    };
+    ($stub:ident, $variant:ident, error_code) => {
+        #[unsafe(naked)]
+        extern "sysv64" fn $stub() {
+            naked_asm!(
+                "push {vector}",
+                "jmp {common}",
+                vector = const Vector::$variant as usize,
+                common = sym common_entry,
+            );
+        }
+    };
 }
 
-/// #UD — no CPU error code.
-#[unsafe(naked)]
-extern "sysv64" fn stub_ud() {
-    naked_asm!("push 0", "push 6", "jmp {common}", common = sym common_entry);
+/// Declares the IDT: the vector numbers, their stubs, and the one function
+/// that installs them.
+///
+/// One table, because the three statements a gate is made of have to agree and
+/// nothing else makes them. A `dispatched` vector gets a generated stub, a slot
+/// in [`install_gates`], and an arm in [`Vector::from_raw`] — so a gate the
+/// dispatcher does not know cannot be installed, which matters because
+/// `from_raw` runs on the crash path and that path may not panic.
+///
+/// A `direct` vector is its own naked entry and never reaches
+/// [`trap_dispatch`]: the device IRQs, the halt IPI, the shootdown IPI, and the
+/// NMI, whose handler must not touch the preempt count or reschedule.
+macro_rules! idt_vectors {
+    (
+        dispatched { $($ex:ident = $exnum:literal, $stub:ident, $err:ident $(, ist $ist:literal)?;)* }
+        direct { $($direct:ident = $dnum:literal, $entry:path;)* }
+    ) => {
+        /// IDT vector assignments — CPU exceptions and hardware interrupts.
+        #[repr(usize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Vector {
+            $($ex = $exnum,)*
+            $($direct = $dnum,)*
+        }
+
+        impl Vector {
+            /// The number a stub pushed. Total over every dispatched gate, so
+            /// the arm below is reachable only from a vector this module does
+            /// not install — which the CPU cannot deliver.
+            fn from_raw(v: u64) -> Self {
+                match v {
+                    $($exnum => Self::$ex,)*
+                    _ => panic!("dispatch on vector {:#x}, which has no dispatched gate", v),
+                }
+            }
+        }
+
+        $(exception_stub!($stub, $ex, $err);)*
+
+        fn install_gates(idt: &mut Idt) {
+            $(
+                idt.entries[Vector::$ex as usize] =
+                    IdtEntry::new($stub as *const () as u64)$(.with_ist($ist))?;
+            )*
+            $(
+                idt.entries[Vector::$direct as usize] =
+                    IdtEntry::new($entry as *const () as u64);
+            )*
+        }
+    };
 }
 
-/// #DF — CPU pushes error code (always 0). Push vector.
-#[unsafe(naked)]
-extern "sysv64" fn stub_df() {
-    naked_asm!("push 8", "jmp {common}", common = sym common_entry);
-}
-
-/// #GP — CPU pushes error code. Push vector.
-#[unsafe(naked)]
-extern "sysv64" fn stub_gpf() {
-    naked_asm!("push 13", "jmp {common}", common = sym common_entry);
-}
-
-/// #PF — CPU pushes error code. Push vector.
-#[unsafe(naked)]
-extern "sysv64" fn stub_pf() {
-    naked_asm!("push 14", "jmp {common}", common = sym common_entry);
+// Every vector Intel names for 64-bit mode has a gate, because a vector without
+// one does not fault the process: the CPU takes the missing gate as a second,
+// contributory fault and escalates to #DF, which halts the machine. A userland
+// `div` by zero did exactly that.
+//
+// The ones Intel reserves — 9, 15 and 22..=31 — are left out on purpose:
+// nothing can deliver them, and `from_raw`'s panic is the honest answer if one
+// ever arrives. Every gate is DPL 0, so `int n` from Ring 3 raises #GP against
+// the gate rather than entering it.
+idt_vectors! {
+    dispatched {
+        DivideError        = 0x00, stub_de, no_error_code;
+        Debug              = 0x01, stub_db, no_error_code;
+        Breakpoint         = 0x03, stub_bp, no_error_code;
+        Overflow           = 0x04, stub_of, no_error_code;
+        BoundRange         = 0x05, stub_br, no_error_code;
+        InvalidOpcode      = 0x06, stub_ud, no_error_code;
+        DeviceNotAvailable = 0x07, stub_nm, no_error_code;
+        DoubleFault        = 0x08, stub_df, error_code, ist 1;
+        InvalidTss         = 0x0A, stub_ts, error_code;
+        SegmentNotPresent  = 0x0B, stub_np, error_code;
+        StackSegment       = 0x0C, stub_ss, error_code;
+        GeneralProtection  = 0x0D, stub_gp, error_code;
+        PageFault          = 0x0E, stub_pf, error_code;
+        X87FloatingPoint   = 0x10, stub_mf, no_error_code;
+        AlignmentCheck     = 0x11, stub_ac, error_code;
+        MachineCheck       = 0x12, stub_mc, no_error_code;
+        SimdFloatingPoint  = 0x13, stub_xm, no_error_code;
+        Virtualization     = 0x14, stub_ve, no_error_code;
+        ControlProtection  = 0x15, stub_cp, error_code;
+    }
+    direct {
+        // Diagnostic only, and sent by `sched::dump` alone — see `idt/nmi.rs`.
+        Nmi          = 0x02, nmi::nmi_entry;
+        Timer        = 0x20, timer::timer_entry;
+        Xhci         = 0x21, xhci::xhci_entry;
+        VirtioNet    = 0x22, virtio_net::virtio_net_entry;
+        VirtioSound  = 0x23, virtio_sound::virtio_sound_entry;
+        I8042        = 0x24, i8042::i8042_entry;
+        DmaFault     = 0x25, dma_fault::dma_fault_entry;
+        Hda          = 0x26, hda::hda_entry;
+        HaltAll      = 0xFD, stub_halt_all;
+        TlbFlush     = 0xFE, tlb::tlb_flush_entry;
+    }
 }
 
 /// Halt IPI — received when another CPU calls halt_all_cpus(). Never returns.
@@ -288,18 +353,23 @@ fn flush_ring0_timer_fires_to_trace() {
 }
 
 /// Rust exception dispatcher — routes by vector to the appropriate handler.
+///
+/// The default arm is every other fault, and it is the one that decides on the
+/// saved CS: from Ring 3 the process dies named, from Ring 0 the kernel says so
+/// and halts. The three ahead of it are the exceptions that are not that —
+/// #DB resumes, and #DF and #MC are aborts with no instruction to return to.
 extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
     let frame = unsafe { &mut *frame };
-    match frame.vector {
-        0x01 => exceptions::debug_handler(frame),
-        0x06 | 0x0D => exceptions::exception_handler(frame),
-        0x08 => exceptions::double_fault_handler(frame),
-        0x0E => {
+    match Vector::from_raw(frame.vector) {
+        Vector::Debug => exceptions::debug_handler(frame),
+        Vector::DoubleFault => exceptions::double_fault_handler(frame),
+        Vector::MachineCheck => exceptions::machine_check_handler(frame),
+        Vector::PageFault => {
             cpu::enable_interrupts();
             exceptions::page_fault_handler(frame);
             unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
         }
-        v => panic!("unhandled exception vector {:#x}", v),
+        _ => exceptions::exception_handler(frame),
     }
 }
 
@@ -332,24 +402,7 @@ fn disable_pic() {
 pub fn init() {
     disable_pic();
 
-    {
-        let mut idt = IDT.lock();
-        idt.entries[Vector::Debug as usize] = IdtEntry::new(stub_db as *const () as u64);
-        idt.entries[Vector::Nmi as usize] = IdtEntry::new(nmi::nmi_entry as *const () as u64);
-        idt.entries[Vector::InvalidOpcode as usize] = IdtEntry::new(stub_ud as *const () as u64);
-        idt.entries[Vector::DoubleFault as usize] = IdtEntry::new(stub_df as *const () as u64).with_ist(1);
-        idt.entries[Vector::GeneralProtection as usize] = IdtEntry::new(stub_gpf as *const () as u64);
-        idt.entries[Vector::PageFault as usize] = IdtEntry::new(stub_pf as *const () as u64);
-        idt.entries[Vector::Timer as usize] = IdtEntry::new(timer::timer_entry as *const () as u64);
-        idt.entries[Vector::Xhci as usize] = IdtEntry::new(xhci::xhci_entry as *const () as u64);
-        idt.entries[Vector::VirtioNet as usize] = IdtEntry::new(virtio_net::virtio_net_entry as *const () as u64);
-        idt.entries[Vector::VirtioSound as usize] = IdtEntry::new(virtio_sound::virtio_sound_entry as *const () as u64);
-        idt.entries[Vector::I8042 as usize] = IdtEntry::new(i8042::i8042_entry as *const () as u64);
-        idt.entries[Vector::DmaFault as usize] = IdtEntry::new(dma_fault::dma_fault_entry as *const () as u64);
-        idt.entries[Vector::Hda as usize] = IdtEntry::new(hda::hda_entry as *const () as u64);
-        idt.entries[Vector::HaltAll as usize] = IdtEntry::new(stub_halt_all as *const () as u64);
-        idt.entries[Vector::TlbFlush as usize] = IdtEntry::new(tlb::tlb_flush_entry as *const () as u64);
-    }
+    install_gates(&mut IDT.lock());
 
     let ptr = IdtPointer {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,

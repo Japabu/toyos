@@ -78,7 +78,7 @@ Largest entries:
 | 12,245,032 | `bin/sshd` |
 | 6,827,984 | `bin/toyos-ld` |
 | 6,220,808 | `share/wallpaper.rgb` |
-| 5,994,284 | `share/timgm6mb.sf2` |
+| 5,994,284 | `share/timgm6mb.sf2` (gone; `share/soundfont.sf2` is 15,546,764 in its place — §5) |
 | 5,225,776 | `bin/compositor` |
 | 5,161,144 | `bin/files` |
 | 4,196,020 | `share/doom1.wad` |
@@ -415,15 +415,21 @@ than of the commit.
 **Built**, and the first attempt was wrong in the other direction. Filtering to
 what `git ls-files` returns is right about `.DS_Store` and about the stray
 `target/`, and wrong about the one file in that directory git deliberately does
-not carry: `.gitignore` line 3 is `assets/timgm6mb.sf2`, 5,994,284 bytes of
-SoundFont doom synthesises its music from. The image built after that commit did
-not have it, and the whole suite was green either way — **nothing in this tree
-gates doom's music**, which is a finding of its own.
+not carry: `assets/timgm6mb.sf2`, 5,994,284 bytes of SoundFont doom synthesises
+its music from. The image built after that commit did not have it, and the whole
+suite was green either way — **nothing in this tree gates doom's music**, which
+is a finding of its own.
 
-So `untracked-assets` in each config names the paths that ship without git
-having a copy, and an entry naming a file the build cannot find is a hard error.
-That last half is the point: a fresh clone genuinely has no SoundFont, and what
-it needs is to be told by name rather than handed a doom that plays nothing.
+That was answered with `untracked-assets`, a per-config list of paths that ship
+without git having a copy, and it lasted one day. TimGM6mb is GPL-2.0 under an
+MIT OR Apache-2.0 tree, so it left the repository and §1.2's 5,994,284-byte
+entry with it; `assets/soundfont.sf2` — the GeneralUser GS subset
+`src/soundfont.rs` produces, 15,546,764 bytes — replaced it committed, which
+left `untracked-assets` with no users and it is deleted. **The declaration is
+git's index again, and what survived is the naming**: an asset git carries that
+the working tree does not is named and skipped rather than fatal. The naming is
+what the hard error was for; the stopping is what made a fresh clone, a runner
+and every new worktree red on a file none of them was ever going to have.
 
 ## 6. One profile
 

@@ -43,14 +43,19 @@ pub fn main(args: Vec<String>) {
     let done_cb = done.clone();
     let done_err = done.clone();
 
-    let mut phase = 0.0f32;
     let mut frames_written = 0u64;
+
+    // The angle is the sample index times the increment, never a running sum:
+    // a phase that accumulates has no bound, so each step is eventually rounded
+    // against a total far larger than itself, and the tone the ear judges the
+    // machine by picks up both a flat pitch and a noise floor of its own.
+    let radians_per_frame = f64::from(freq) * 2.0 * std::f64::consts::PI / f64::from(sample_rate);
+    let amplitude = f64::from(amplitude);
 
     let stream = device
         .build_output_stream(
             config.into(),
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                let increment = freq * 2.0 * std::f32::consts::PI / sample_rate;
                 let frames = data.len() / channels;
 
                 for frame in 0..frames {
@@ -59,11 +64,11 @@ pub fn main(args: Vec<String>) {
                             data[frame * channels + ch] = 0;
                         }
                     } else {
-                        let value = (phase.sin() * amplitude) as i16;
+                        let angle = frames_written as f64 * radians_per_frame;
+                        let value = (angle.sin() * amplitude) as i16;
                         for ch in 0..channels {
                             data[frame * channels + ch] = value;
                         }
-                        phase += increment;
                         frames_written += 1;
                     }
                 }

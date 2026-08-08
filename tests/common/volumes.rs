@@ -8,11 +8,11 @@
 //! says so by moving the name and watching the mount disappear.
 //!
 //! Ground truth is the disk image the *device* received, read on the host by
-//! implementations that are not ours: the `fatfs` crate and macOS's
-//! `fsck_msdos`. The guest's account of a write it made is exactly what is in
-//! question, so it cannot also be the evidence; `esp_files` asserts what only a
-//! process inside the machine can see, and everything it claims about bytes is
-//! checked again here.
+//! implementations that are not the kernel's: the `fatfs` crate and
+//! `toyos-fat32-check`. The guest's account of a write it made is exactly what
+//! is in question, so it cannot also be the evidence; `esp_files` asserts what
+//! only a process inside the machine can see, and everything it claims about
+//! bytes is checked again here.
 //!
 //! **Where this stops.** `log_partition_layout` pins the image: type GUID,
 //! attribute bits, labels, alignment, and that our own GPT parser finds the
@@ -27,17 +27,12 @@
 //! The image is built and modified before the boot rather than after, because
 //! the host-writes-guest-reads direction has no other staging point: a file the
 //! guest itself created and read back would pass with the read path broken.
-//!
-//! `fsck_msdos -n` **exits 0 while printing `Fix?`** for problems it declined
-//! to repair, and exits 0 on a volume it has just called dirty. Its output is
-//! matched line by line against the exact shape of a clean run, never its exit
-//! code — the same rule `toyos-fat32`'s own gate follows, and for the same
-//! reason.
 
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
+
+use toyos_fat32_check::{check, describe};
 
 use fatfs::FsOptions;
 use gpt::disk::LogicalBlockSize;
@@ -238,87 +233,6 @@ fn unix_secs(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> 
     days * 86_400 + hour * 3_600 + min * 60 + sec
 }
 
-/// Everything `fsck_msdos -n` complains about, with counts normalised away.
-///
-/// The partition is copied out of the disk image because `fsck_msdos` wants a
-/// volume, not a disk: pointed at the GPT image it would read the protective
-/// MBR as a boot sector.
-///
-/// A list rather than a verdict because the callers want to say *which* thing
-/// was said, and because it used to be the only honest shape available: the
-/// boot image was not fsck-clean and never had been, so the strongest gate a
-/// guest could be held to was "adds nothing new". `src/image.rs` writes the ESP
-/// with `toyos-fat32` now, both volumes leave the build silent, and the callers
-/// require silence on both sides of the boot.
-///
-/// Digits are replaced so a legitimately changed free-cluster count does not
-/// read as a new defect.
-pub fn fsck_complaints(volume: &[u8], name: &str) -> Result<Vec<String>, String> {
-    let tool = Path::new("/sbin/fsck_msdos");
-    if !tool.exists() {
-        return Err("no /sbin/fsck_msdos: this gate's outside judge is missing".to_string());
-    }
-    let path = test_dir().join(format!("{name}.vol"));
-    std::fs::write(&path, volume).map_err(|e| format!("staging the volume for fsck: {e}"))?;
-
-    // Never the exit code: `fsck_msdos -n` exits 0 while printing `Fix?` for
-    // problems it declined to repair, and exits 0 on a volume it has just
-    // called dirty.
-    let out = Command::new(tool)
-        .arg("-n")
-        .arg(&path)
-        .output()
-        .map_err(|e| format!("running fsck_msdos: {e}"))?;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    let _ = std::fs::remove_file(&path);
-
-    let mut summaries = 0;
-    let mut complaints = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end();
-        if line.is_empty() || line.starts_with("**") || line.starts_with(&path.display().to_string())
-        {
-            continue;
-        }
-        if is_summary(line) {
-            summaries += 1;
-            continue;
-        }
-        complaints.push(mask_digits(line));
-    }
-    if summaries != 1 {
-        return Err(format!("fsck_msdos printed {summaries} summary lines, wanted one:\n{text}"));
-    }
-    complaints.sort();
-    Ok(complaints)
-}
-
-fn mask_digits(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut in_digits = false;
-    for c in line.chars() {
-        if c.is_ascii_digit() {
-            if !in_digits {
-                out.push('#');
-                in_digits = true;
-            }
-        } else {
-            in_digits = false;
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// `Warning: 5 files, 306560 KiB free (76640 clusters)` — the one line a clean
-/// run prints that is not a `**` banner.
-fn is_summary(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("Warning: ") else { return false };
-    let Some((count, tail)) = rest.split_once(' ') else { return false };
-    count.chars().all(|c| c.is_ascii_digit()) && tail.starts_with("files,")
-}
-
 pub fn esp_filesystem(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -358,11 +272,11 @@ pub fn esp_filesystem(
     // Including the file this test just wrote through `fatfs` above: the
     // fixture is part of what has to leave the volume clean, or the gate below
     // could only ever be as strong as the untidiest thing on the stick.
-    let complaints_before = fsck_complaints(&image[start..start + len], "esp-before")?;
+    let complaints_before = check(&image[start..start + len]);
     if !complaints_before.is_empty() {
         return Err(format!(
-            "the boot volume is not fsck_msdos-clean before the guest has run:\n{}",
-            complaints_before.join("\n")
+            "the boot volume breaks the format before the guest has run:\n{}",
+            describe(&complaints_before)
         ));
     }
 
@@ -425,14 +339,14 @@ pub fn esp_filesystem(
     // on every volume it wrote, all this could ask was that the guest add none
     // — which would have hidden a complaint the guest produced for its own
     // reason inside the ones it did not.
-    let complaints_after = fsck_complaints(volume, "esp-after")?;
+    let complaints_after = check(volume);
     if !complaints_after.is_empty() {
         return Err(format!(
-            "the guest left fsck_msdos something to say about the boot volume:\n{}",
-            complaints_after.join("\n")
+            "the guest left the boot volume breaking the format:\n{}",
+            describe(&complaints_after)
         ));
     }
-    eprintln!("  [esp] fsck_msdos: silent on the boot volume before and after the boot");
+    eprintln!("  [esp] the volume checker is silent on the boot volume before and after the boot");
 
     // Everything the host has to say about the boot volume, in one mount: what
     // the guest must not have left behind, and what it must not have touched.
@@ -573,12 +487,12 @@ pub fn kernel_log_file(
     // Born clean, and asserted so rather than assumed: `create_log_volume`
     // formats an empty volume and records its free-cluster count, so unlike the
     // ESP there is nothing here for the guest's own complaints to hide behind.
-    let complaints_before = fsck_complaints(&image[start..start + len], "kernel-log-before")?;
+    let complaints_before = check(&image[start..start + len]);
     if !complaints_before.is_empty() {
         return Err(format!(
-            "the log partition was not born fsck-clean, so this gate cannot tell a complaint the \
+            "the log partition was not born clean, so this gate cannot tell a complaint the \
              guest caused from one it inherited:\n{}",
-            complaints_before.join("\n")
+            describe(&complaints_before)
         ));
     }
 
@@ -685,17 +599,17 @@ pub fn kernel_log_file(
         ));
     }
 
-    let complaints_after = fsck_complaints(&after[start..start + len], "kernel-log-after")?;
+    let complaints_after = check(&after[start..start + len]);
     if !complaints_after.is_empty() {
         return Err(format!(
-            "writing the log gave fsck_msdos something to say about a volume it had nothing to \
+            "writing the log gave the checker something to say about a volume it had nothing to \
              say about:\n{}",
-            complaints_after.join("\n")
+            describe(&complaints_after)
         ));
     }
     eprintln!(
-        "  [log] {final_name}: {} bytes after the shutdown, carrying its last line; fsck still \
-         silent",
+        "  [log] {final_name}: {} bytes after the shutdown, carrying its last line; the checker \
+         still silent",
         final_log.len()
     );
     let _ = std::fs::remove_file(&image_path);
@@ -1396,18 +1310,15 @@ pub fn log_partition_layout(
     // Born clean. The ESP is not and cannot be until `fatfs` is forked (known
     // issues §10); this volume has no subdirectory for either of those defects
     // to arise in, and its free-cluster count is recorded at format time.
-    let complaints = fsck_complaints(&image[log_start..log_start + log_len], "log-layout")?;
+    let complaints = check(&image[log_start..log_start + log_len]);
     if !complaints.is_empty() {
-        return Err(format!(
-            "the log partition is not born fsck-clean:\n{}",
-            complaints.join("\n")
-        ));
+        return Err(format!("the log partition is not born clean:\n{}", describe(&complaints)));
     }
 
     let _ = std::fs::remove_file(&image_path);
     eprintln!(
         "  [log] {BASIC_DATA} with attributes 0, labelled TOYOS-LOG in both places, 4 KiB-aligned \
-         and disjoint from the ESP, fsck-clean, and named by toyos/log.guid"
+         and disjoint from the ESP, format-clean, and named by toyos/log.guid"
     );
     Ok(())
 }
@@ -1588,9 +1499,9 @@ pub fn log_partition_identity(
             found.join(", ")
         ));
     }
-    let complaints = fsck_complaints(volume, "log-identity")?;
+    let complaints = check(volume);
     if !complaints.is_empty() {
-        return Err(format!("the untouched log partition is not clean:\n{}", complaints.join("\n")));
+        return Err(format!("the untouched log partition is not clean:\n{}", describe(&complaints)));
     }
 
     let _ = std::fs::remove_file(&image_path);

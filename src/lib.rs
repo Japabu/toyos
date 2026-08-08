@@ -1,12 +1,16 @@
 pub mod assets;
 pub mod build;
 pub mod buildlock;
+pub mod durations;
+pub mod forkcheck;
 pub mod image;
-pub mod land;
 pub mod libc;
+pub mod pr;
+pub mod soundfont;
 pub mod stamps;
 pub mod testargs;
 pub mod toolchain;
+pub mod wallpaper;
 pub mod worktree;
 
 use std::path::{Path, PathBuf};

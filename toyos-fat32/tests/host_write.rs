@@ -1,10 +1,11 @@
-//! Direction two of the gate: this crate writes the volume, macOS judges it.
+//! Direction two of the gate: this crate writes the volume, and two things that
+//! are not this crate judge it.
 //!
 //! A write that only this crate's own reader can read back certifies nothing,
-//! so every test here ends with `fsck_msdos` finding no fault and a real mount
-//! producing the exact bytes. The `fsck` gate is strict about what "no fault"
-//! means — see [`common::Image::fsck`], because `fsck_msdos -n` exits 0 on
-//! volumes it has just called dirty.
+//! so every test here ends with [`common::Image::fsck`] finding no fault and a
+//! real macOS mount producing the exact bytes. Neither judge shares a line with
+//! the code under test: the checker is written from the specification, and the
+//! mount is the operating system's.
 
 mod common;
 
@@ -187,9 +188,10 @@ fn colliding_short_names_stay_unique() {
         }
     });
 
-    // The host cannot check this and neither can `fsck_msdos`: both read the
-    // long names. Duplicate 8.3 names are still a broken volume, and this is
-    // the only place that would notice.
+    // The host mount cannot check this: it reads the long names, as
+    // `fsck_msdos` did before the checker replaced it. Asked here through the
+    // crate's own device as well, because a name this crate generated is what
+    // is under test and the failure names the eleven bytes.
     let mut fs = Fat32::mount(image.device()).expect("remount");
     let root = fs.geometry().root_cluster;
     let mut shorts = common::short_names_in(&mut fs, root);
@@ -330,8 +332,8 @@ fn rename_moves_a_file_between_directories() {
     });
 }
 
-/// A moved directory's `..` must point at its new parent. `fsck_msdos` checks
-/// this and nothing else would.
+/// A moved directory's `..` must point at its new parent. The checker is what
+/// notices; a mount reads the path it walked down and never asks.
 #[test]
 fn rename_repoints_a_moved_directorys_parent() {
     let image = image("mvdir");

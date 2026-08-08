@@ -24,9 +24,8 @@
 //! the worktree cannot serialise the second, and a lock in the common directory
 //! would serialise the first against worktrees that have nothing to do with it.
 //!
-//! [`integration`] is neither: one file of its own, exclusive-only, held for the
-//! length of a landing rather than of a build. It has to be its own file because
-//! a landing's gate is a build and would otherwise queue behind it.
+//! [`integration`] is neither: one file of its own, exclusive-only, and held
+//! while this host's `main` moves rather than while anything builds.
 //!
 //! [`guest_slot`] and [`build_slot`] are not modes of anything — they are
 //! counts. The host's cores are spent by intra-suite width and by inter-worktree
@@ -211,33 +210,26 @@ pub fn artifact(root: &Path) -> Guard {
     exclusive(&lock_path(&root.join(LOCK_DIR), "artifact"), "artifact lock", "artifact staging")
 }
 
-/// The integration lock, held exclusively for the length of one landing —
-/// `specs/worktrees.md` §5, steps 1 through 5.
+/// The integration lock: one process at a time moves this host's `main`.
 ///
-/// Its own file, and that is the whole point: step 3's gate *is* a build, and a
-/// build takes `Scope::Global`'s `state` shared, so a landing that held `state`
-/// would queue its own gate behind itself.
+/// It used to hold a whole landing — lock, merge, gate, fast-forward
+/// (`specs/worktrees.md` §5). GitHub does the merging now, so what is left on
+/// this side is `--sync` fast-forwarding the primary checkout onto
+/// `origin/main`, and that is still a tree somebody may be building in.
+///
+/// Its own file and not `Scope::Global`'s `state`, because a build holds `state`
+/// shared for its whole length and this must not wait for one.
 ///
 /// No `intent` beside it either. Writer preference exists because a stream of
 /// shared acquirers can starve an exclusive one out of `state`; nothing takes
 /// this file in shared mode at all, so there is no stream to be starved by, and
 /// an `intent` here would be a file only its own exclusive holders ever touched.
 pub fn integration(root: &Path) -> Guard {
-    exclusive(&integration_path(root), "integration lock", "landing")
+    exclusive(&integration_path(root), "integration lock", "moving main")
 }
 
 fn integration_path(root: &Path) -> PathBuf {
     lock_path(&git_lock_dir(root), "integration")
-}
-
-/// Whether the integration lock could be taken right now.
-///
-/// The landing tests ask this of every refusal `--land` can return: one that
-/// gives up without putting the lock down wedges every worktree at once, and
-/// nothing else in the tree would notice.
-#[cfg(test)]
-pub fn integration_is_free(root: &Path) -> bool {
-    try_lock(&open_lock_file(&integration_path(root)), LOCK_EX)
 }
 
 /// How many guests may be up on this host at once, across every worktree.
@@ -973,9 +965,9 @@ mod tests {
         assert_eq!(describe_holder(&lock_path(&worktree_lock_dir(&root), "state")), None);
     }
 
-    /// Two landings at once is the thing `--land` exists to stop: step 4 moves
-    /// the primary's tree and step 3 measures a tree that has to still be the
-    /// one main gets.
+    /// Two processes moving this host's `main` at once is what the lock stops:
+    /// the primary is a checkout somebody may be building in, and `--sync`
+    /// fast-forwards its tree.
     #[test]
     fn two_landings_serialise() {
         let root = scratch("integration");
@@ -986,7 +978,7 @@ mod tests {
         assert!(!try_lock(&mine, LOCK_EX), "two landings held the integration lock at once");
         let holder = describe_holder(&integration_path(&root)).expect("no holder note");
         assert!(
-            holder.starts_with(&format!("held by pid {} (landing)", kid.id())),
+            holder.starts_with(&format!("held by pid {} (moving main)", kid.id())),
             "the queued landing cannot name the one ahead of it: {holder}"
         );
 
@@ -1015,10 +1007,10 @@ mod tests {
         assert_eq!(describe_holder(&integration_path(&root)), None);
     }
 
-    /// The property that forced a second file. A landing's gate is a build, and
-    /// a build takes the global `state` shared for its whole length; if the
-    /// landing held that same file the gate would wait on its own holder
-    /// forever, and the failure would be a hang rather than a message.
+    /// The property that forced a second file. A build takes the global `state`
+    /// shared for its whole length, and `--sync` must not wait for one: a
+    /// landing that queued behind every build on the host would be a hang
+    /// rather than a message.
     #[test]
     fn a_landing_and_a_build_do_not_exclude_each_other() {
         let root = scratch("integration-vs-build");

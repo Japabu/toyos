@@ -193,43 +193,50 @@ fn tracked(dir: &Path) -> BTreeSet<PathBuf> {
         .collect()
 }
 
-/// The asset files, given the directories to sweep and the paths within them
-/// the repository deliberately does not carry.
+/// The paths `declared` names under `dir` that are not there, in the order they
+/// will be named in.
 ///
-/// `untracked` exists because git's index is not quite the whole declaration:
-/// `assets/timgm6mb.sf2` is 5.99 MB of SoundFont that doom synthesises its
-/// music from, `.gitignore` excludes it on purpose, and it has shipped in every
-/// image this project ever built. A sweep cannot tell that file from a
-/// `.DS_Store` — both are "in the directory and not in git" — so the config
-/// says which, and **an entry naming a file the build cannot find stops the
-/// build**. That is why it is a list of paths and not a flag: a fresh clone has
-/// no SoundFont, and what it needs is to be told so by name rather than to
-/// produce a doom with no music.
-pub fn collect(dirs: &[String], untracked: &[String]) -> Vec<(String, Vec<u8>)> {
+/// **An asset the build cannot find is named and skipped, not fatal.** It used
+/// to stop the build, on the argument that a fresh clone should be told rather
+/// than handed a doom with no music; the telling is what mattered and the
+/// stopping was the part that cost — a fresh clone, a runner and every new
+/// worktree red on a file that was then deliberately absent from all three.
+///
+/// The SoundFont is committed again, so `declared` is now git's index and
+/// nothing else. That is what keeps this: [`tracked`] lists a file whether or
+/// not the working tree holds it, so a deleted asset would otherwise leave the
+/// image quietly without doom's music — which is exactly how `b8b0749` took it
+/// away for a cycle with nothing saying so. Being told happens twice: here by
+/// name, and again in the guest's own log when whatever wanted the file opens
+/// it.
+///
+/// Its own function so that the naming is what a test can hold: the absence is
+/// not a panic to catch, and "it printed something" is not a claim this build
+/// can check about itself.
+fn absentees(dir: &Path, declared: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    declared.iter().map(|name| dir.join(name)).filter(|path| !path.exists()).collect()
+}
+
+pub fn collect(dirs: &[String]) -> Vec<(String, Vec<u8>)> {
     let mut files = vec![];
 
     for dir in dirs {
         let dir = Path::new(dir);
-        let tracked = tracked(dir);
-        let declared: BTreeSet<PathBuf> = untracked.iter().map(PathBuf::from).collect();
-        for name in &declared {
-            let path = dir.join(name);
-            assert!(
-                path.exists(),
-                "{} is declared in `untracked-assets` and is not there. It is deliberately not \
-                 carried in git, so a fresh clone has to be given a copy.",
-                path.display()
+        let mut tracked = tracked(dir);
+        for absent in absentees(dir, &tracked) {
+            eprintln!(
+                "assets: NOT IN THIS IMAGE — {} is committed and is not in this working tree, \
+                 so whatever wants it runs without it.",
+                absent.display()
             );
+            tracked.remove(absent.strip_prefix(dir).unwrap_or(&absent));
         }
         let ships = |path: &Path| {
             let relative = path.strip_prefix(dir).unwrap_or(path);
-            if tracked.contains(relative) || declared.contains(relative) {
+            if tracked.contains(relative) {
                 return true;
             }
-            eprintln!(
-                "assets: skipping {} — git does not track it and no config declares it",
-                path.display()
-            );
+            eprintln!("assets: skipping {} — git does not track it", path.display());
             false
         };
 
@@ -292,8 +299,8 @@ pub fn collect(dirs: &[String], untracked: &[String]) -> Vec<(String, Vec<u8>)> 
 mod tests {
     use super::*;
 
-    /// The initrd carries what the repository declares: git's index, plus the
-    /// paths the config names, and nothing else.
+    /// The initrd carries what the repository declares: git's index, and
+    /// nothing else.
     ///
     /// Against a repository this test builds, not against `assets/`: the two
     /// files that shipped for real — `.DS_Store` and a stray `target/` — are
@@ -301,10 +308,10 @@ mod tests {
     /// depended on them being present would pass on a clean checkout and prove
     /// nothing. Here they are put there on purpose.
     ///
-    /// `declared.sf2` is the other half, and it is the half that matters most:
-    /// the first version of this filter shipped without it and silently took
-    /// the real `timgm6mb.sf2` out of the image, so doom lost its music and the
-    /// whole suite stayed green.
+    /// `music.sf2` is the other half, and it is the half that matters most: a
+    /// committed asset that is not in the working tree is silently absent from
+    /// the image, which is how doom lost its music for a cycle with the whole
+    /// suite green.
     #[test]
     fn the_initrd_carries_what_the_repository_declares() {
         let dir = std::env::temp_dir().join(format!("toyos-assets-{}", std::process::id()));
@@ -314,7 +321,7 @@ mod tests {
 
         fs::write(dir.join("kept.wad"), b"tracked").expect("write kept.wad");
         fs::write(dir.join("icons/kept.svg"), b"tracked").expect("write icons/kept.svg");
-        fs::write(dir.join("declared.sf2"), b"declared").expect("write declared.sf2");
+        fs::write(dir.join("music.sf2"), b"tracked").expect("write music.sf2");
         fs::write(dir.join(".DS_Store"), b"finder").expect("write .DS_Store");
         fs::write(dir.join("target/.deps-stamp"), b"cargo").expect("write target/.deps-stamp");
 
@@ -327,32 +334,47 @@ mod tests {
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         };
         git(&["init", "-q"]);
-        git(&["add", "kept.wad", "icons/kept.svg"]);
+        git(&["add", "kept.wad", "icons/kept.svg", "music.sf2"]);
 
-        let shipped: BTreeSet<String> =
-            collect(&[dir.display().to_string()], &["declared.sf2".to_string()])
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
+        let shipped: BTreeSet<String> = collect(&[dir.display().to_string()])
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
 
         assert_eq!(
             shipped,
             BTreeSet::from([
                 "share/kept.wad".to_string(),
                 "share/icons/kept.svg".to_string(),
-                "share/declared.sf2".to_string(),
+                "share/music.sf2".to_string(),
             ]),
             "the initrd's asset list is not what the repository says it is"
         );
 
-        // And the declaration has teeth in the other direction: a fresh clone
-        // has no SoundFont, and it must be told so rather than handed a doom
-        // with no music.
-        fs::remove_file(dir.join("declared.sf2")).expect("take declared.sf2 away");
-        let absent = std::panic::catch_unwind(|| {
-            collect(&[dir.display().to_string()], &["declared.sf2".to_string()])
-        });
+        // And the other half: an asset git carries that this tree does not.
+        // The build goes on without it — what has to survive is that the rest
+        // of the image is exactly what it was, and that the absent one is
+        // named.
+        fs::remove_file(dir.join("music.sf2")).expect("take music.sf2 away");
+        let without: BTreeSet<String> = collect(&[dir.display().to_string()])
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let named = absentees(&dir, &BTreeSet::from([PathBuf::from("music.sf2")]));
         fs::remove_dir_all(&dir).ok();
-        assert!(absent.is_err(), "a declared asset that is not there must stop the build");
+
+        assert_eq!(
+            without,
+            BTreeSet::from([
+                "share/kept.wad".to_string(),
+                "share/icons/kept.svg".to_string(),
+            ]),
+            "a committed asset that is not there took something else with it"
+        );
+        assert_eq!(
+            named,
+            vec![dir.join("music.sf2")],
+            "a committed asset that is not there has to be named"
+        );
     }
 }

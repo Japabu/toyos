@@ -94,13 +94,18 @@ Two further facts that bear on the shape:
   mapping, its data mapping, and a supervisor alias of every user page.
   Kernel-side NX and kernel-side W^X are a *separate and larger* change and
   must not ride this one; §3.2 says what is in and what is out.
-- **SMEP is off in every test this harness runs.** The harness passes
-  `-cpu qemu64,+rdrand,+smap,+fsgsbase,+x2apic` (`tests/common/qemu.rs:1889`).
-  Measured via `query-cpu-model-expansion` on that exact model string:
-  `smep: false`, `smap: true`, `nx: true`. The T14 reports `smep=on`
-  (`specs/metal-hardware-inventory.md:543`). So the mitigation that stops ring 0
-  executing a user page exists on the metal and in no guest test. Measured:
-  `-cpu qemu64,…,+smep` is accepted and reports `smep: true` under TCG.
+- **SMEP was off in every test this harness ran, and is on since `5d53aa0`
+  (2026-08-06).** When this was written the harness passed
+  `-cpu qemu64,+rdrand,+smap,+fsgsbase,+x2apic`, and
+  `query-cpu-model-expansion` on that exact model string answered
+  `smep: false`, `smap: true`, `nx: true` — so the mitigation that stops ring 0
+  executing a user page existed on the metal (`smep=on`,
+  `specs/metal-hardware-inventory.md:543`) and in no guest test. The flip landed
+  after §8's discovery run: both arms now carry `+smep`
+  (`tests/common/qemu.rs:2199`). What the harness still does *not* do is assert
+  it — no test reads `smep=on` out of a boot log, so deleting the argument reds
+  nothing (known-issues §6). `cargo run`'s own arguments (`src/qemu.rs:88,90`)
+  were never given it.
 
 ### 2.2 #162(a) — PCID: real on the metal, **unreachable in the harness**
 
@@ -280,8 +285,8 @@ therefore M1a's first commit rather than futex.
 
 ## 3. The four stages
 
-Each leaves `main`'s tip green and is landed separately with
-`cargo run -- --land`. Ordering differs from the task order; §3.5 argues why.
+Each leaves `main`'s tip green and is landed separately, one pull request
+each. Ordering differs from the task order; §3.5 argues why.
 
 ### 3.1 Stage M1 — the validated user-memory boundary (#162c + #158)
 
@@ -589,15 +594,15 @@ form at the wrap, which is the one place its two runs differ.
   (`loader.rs:418,431`). The change is not plumbing it further; it is stopping
   the OR from discarding it. Saying so keeps the diff honest about where the
   bug is.
-- **Added to the stated shape, and deliberately not landed with M2:** turning
-  `+smep` on in the harness. It is one argument (`tests/common/qemu.rs:1889`),
-  measured to work under TCG, and it closes a gap where the metal enforces
-  something no test does — the gap itself is filed as **#167**. It does not
-  ride M2, for a scheduling reason rather than a technical one: a global
-  harness change that reds unrelated tests would block every in-flight agent's
-  landing behind defects that are not theirs. The sequence is a **discovery
-  run** on this branch, reported, and then a scheduled flip. §8 records what
-  that run found.
+- **Added to the stated shape, deliberately not landed with M2, and landed
+  separately in `5d53aa0` (2026-08-06):** turning `+smep` on in the harness. It
+  is one argument (now `tests/common/qemu.rs:2199`), measured to work under TCG,
+  and it closed a gap where the metal enforced something no test did — the gap
+  itself was filed as **#167**. It did not ride M2, for a scheduling reason
+  rather than a technical one: a global harness change that reds unrelated tests
+  would block every in-flight agent's landing behind defects that are not
+  theirs. The sequence was a **discovery run** on this branch, reported, and
+  then a scheduled flip. §8 records what that run found.
 
 **Gates, each with its negative control.**
 
@@ -1046,8 +1051,8 @@ can land whenever it is scheduled rather than riding M2 — a green discovery ru
 removes the risk that motivated the hold, but not the call on when a shared
 resource changes under five agents.
 
-**Landing this wave's stages while #156 is open** needs nothing special:
-`cargo run -- --land`. `desktop_window_child` is declared in
+**Landing this wave's stages while #156 is open** needs nothing special.
+`desktop_window_child` is declared in
 `EXPECTED_FAILURES` (`tests/toyos.rs`), so it still runs, it is named with its
 task in every run's report, and it does not red the gate. Any other red belongs
 to the change and is explained, never excluded — and the declaration cannot

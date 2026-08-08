@@ -37,6 +37,13 @@
 //!
 //! It is also what the NMI probe below buys and a kick does not: an answer that
 //! does not require the CPU to schedule in order to give it.
+//!
+//! **The panel is the deliverable, and it is bracketed and held.** `request`
+//! marks the log before its first line and after its last, so what the console
+//! paints is this report rather than the newest screenful of a ring every
+//! process writes into — and `panic_console::hold_report` puts it back for as
+//! long as the hold lasts, because a compositor that is still composing does
+//! not know the kernel drew and will overwrite it inside a frame.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -176,6 +183,7 @@ pub fn request() {
 
     let cpus = online_cpus();
     let me = percpu::cpu_id() as usize;
+    let from = crate::drivers::log_ring::mark();
     log!("=== blocked-task dump: {cpus} cpu(s), and this report takes the screen ===");
 
     for cpu in 0..cpus {
@@ -219,7 +227,7 @@ pub fn request() {
 
     let census = census();
     summary(cpus, silent, census);
-    crate::drivers::panic_console::paint_report();
+    crate::drivers::panic_console::paint_report(from, crate::drivers::log_ring::mark());
     IN_PROGRESS.store(false, Ordering::Release);
 }
 

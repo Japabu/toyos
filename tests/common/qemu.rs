@@ -59,7 +59,231 @@ pub fn set_width(width: u32) {
 /// says a guest hung when it was only sharing a machine, which is the failure
 /// mode that put the whole shared block in the serial tail.
 pub fn budget(one_guest: Duration) -> Duration {
-    one_guest * WIDTH.load(Ordering::SeqCst)
+    let (num, den) = host_scale();
+    one_guest * WIDTH.load(Ordering::SeqCst) * num / den
+}
+
+/// The fastest boot-to-ready this run has seen, in milliseconds.
+///
+/// A boot is the one piece of guest work every test does and no test asserts on
+/// — `wait_for_ready`'s own comment names the two exceptions, and both read the
+/// guest's stamps rather than this clock — so it is a measurement of the host
+/// that costs nothing to take. The *fastest* rather than the mean because a boot
+/// taken with three other guests up measures the phase; the minimum over a run
+/// is the closest this can get to the machine with nothing else on it.
+static FASTEST_BOOT_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The same measurement on the host every ceiling in this tree was written for.
+///
+/// Dev host, M4 Pro, cross-arch TCG, measured 2026-08-08: the fastest of ten
+/// boots at `--jobs 1` was 1433 ms against a 1433–2063 ms spread, and the
+/// fastest of a whole 291-test suite at width 12 was this. The smaller of the
+/// two is the one to hold, because the factor only widens and a reference set
+/// too high is a correction that does not happen.
+const REFERENCE_BOOT_MS: u32 = 1320;
+
+fn record_boot(took: Duration) {
+    let ms = took.as_millis().min(u32::MAX as u128) as u32;
+    FASTEST_BOOT_MS.fetch_min(ms, Ordering::SeqCst);
+}
+
+/// How much slower than the host these ceilings were written on this one is, as
+/// a fraction so that a 1.4× host is not rounded to 1.
+///
+/// [`budget`] corrects a ceiling for how many guests share the machine. It never
+/// corrected for how fast the machine *is*, and that is the other half of the
+/// same mistake: a number reasoned about on an M4 Pro is not a liveness ceiling
+/// on a four-core Azure vCPU, it is a verdict about which of the two is running
+/// the test. `specs/ci-plan.md` §7.1 counted 307 bare timeouts in one CI run and
+/// every one of them was that.
+///
+/// **Only ever upward.** On a faster host the number in the source stands,
+/// because it is the number its author reasoned about, and a ceiling that shrank
+/// would start reporting wedges that are not there. The ceiling of 8 is because
+/// one anomalous boot must not be able to disable every liveness guard in the
+/// suite at once.
+fn host_scale() -> (u32, u32) {
+    let fastest = FASTEST_BOOT_MS.load(Ordering::SeqCst);
+    // Before the first boot there is no measurement, and the sentinel must not
+    // read as the slowest host imaginable.
+    if fastest == u32::MAX || fastest <= REFERENCE_BOOT_MS {
+        return (1, 1);
+    }
+    (fastest.min(REFERENCE_BOOT_MS * 8), REFERENCE_BOOT_MS)
+}
+
+/// The fastest boot seen, the reference, and the scale it produced — for a run's
+/// own report, because the number in the source is no longer the number that was
+/// enforced.
+pub fn host_speed() -> (Option<u32>, u32, u32, u32) {
+    let (num, den) = host_scale();
+    let fastest = FASTEST_BOOT_MS.load(Ordering::SeqCst);
+    ((fastest != u32::MAX).then_some(fastest), REFERENCE_BOOT_MS, num, den)
+}
+
+/// A liveness guard that watches the guest instead of the host's clock.
+///
+/// [`budget`] corrects a ceiling for how many guests share the machine, which
+/// is the part of "how fast is the host today" the harness knows. It does not
+/// know the rest, and a retry loop bounded by elapsed time has that ceiling for
+/// a *verdict* the moment the rest moves: a guest that is merely late reports
+/// exactly what a wedged one reports. `specs/known-issues.md` §7 is the bill —
+/// `desktop_audio_client` 385 s wide against 13 s alone, a landing gate that is
+/// a coin toss, and six reds in four suites every one of which was
+/// `ALONE: GREEN`.
+///
+/// The two are distinguishable and the console is what distinguishes them: a
+/// guest still printing is a guest still working. So the ceiling here is time in
+/// which **nothing arrived**, and a guest that keeps talking is given as long as
+/// it needs. That is the whole idea — no number in this type is a statement
+/// about the host.
+///
+/// `total` is the second half, and it is a wedge guard rather than a verdict
+/// too. A guest can be stuck and chatty: the compositor prints an interval line
+/// every two seconds whatever else has stopped, so silence alone cannot end a
+/// desktop loop and a suite that never ends is worse than one that reds.
+///
+/// The caller owns the capture, so progress is "did it grow" and costs nothing.
+pub struct Liveness {
+    quiet_for: Duration,
+    last_growth: Instant,
+    seen: usize,
+    give_up: Instant,
+}
+
+impl Liveness {
+    /// `quiet_for` of silence ends the wait, and so does `total` however loud
+    /// the guest is.
+    pub fn new(quiet_for: Duration, total: Duration) -> Self {
+        let now = Instant::now();
+        Self { quiet_for, last_growth: now, seen: 0, give_up: now + total }
+    }
+
+    /// Whether the guest may still be working, given everything it has said.
+    pub fn working(&mut self, capture: &str) -> bool {
+        if capture.len() != self.seen {
+            self.seen = capture.len();
+            self.last_growth = Instant::now();
+        }
+        let now = Instant::now();
+        now < self.give_up && now.duration_since(self.last_growth) < self.quiet_for
+    }
+
+    /// What ended the wait, for a caller putting it in a failure message.
+    pub fn why(&self) -> &'static str {
+        if Instant::now() >= self.give_up {
+            "it never stopped talking and never got there"
+        } else {
+            "it went quiet"
+        }
+    }
+}
+
+/// How the reason line begins when what expired was a **guard** and not an
+/// assertion.
+///
+/// A test that ran out of time has not found the guest doing the wrong thing;
+/// it has found nothing at all, and the two readings send an agent to opposite
+/// places. `screen_pager_keys` reporting `0 page moves over 30 keystrokes`
+/// after 0.3 s was bisected as a kernel regression twice in one day by two
+/// agents, and the fact it was hiding is that the whole run had collapsed
+/// before the guest could answer once.
+///
+/// Still red. A guest that stopped answering may have stopped for a reason this
+/// tree owns, and a status that is not a failure is a status nobody reads. What
+/// this buys is that the summary says which of the two kinds of red it is.
+///
+/// It lives here rather than beside the classifier because [`Liveness`] is what
+/// produces the evidence for it, and [`QemuInstance::run_test_paced`] is a
+/// second producer: a test's own ceiling is a guard of exactly this kind.
+pub const STALLED: &str = "STALLED:";
+
+/// How long a guest may say nothing before a wait on it is a stall.
+///
+/// Every config these waits run on has something on a periodic interval — the
+/// compositor's frame batch and soundd's stats window are both about 2 s — so
+/// silence here is a machine that has stopped rather than a machine that is
+/// thinking. It is not a verdict about any of them: no assertion in this suite
+/// is satisfied by the guest merely talking.
+pub const GUEST_QUIET: Duration = Duration::from_secs(15);
+
+/// The other end of the same guard: a guest can be stuck and chatty.
+///
+/// The compositor prints its interval line whatever else has stopped, so
+/// silence alone cannot end a desktop wait, and a suite that never ends is
+/// worse than one that reds.
+///
+/// **Not [`budget`]-scaled, and that is the point of the pair.** Width is what a
+/// ceiling on a *slow* guest has to be corrected for, and the silence bound
+/// above is what a slow guest is now judged by — it keeps talking, so it is
+/// never judged by this at all. What is left for this number to catch is a guest
+/// that is stuck *and* chatty, which is a state the width does not produce;
+/// scaling it would only make that state cost an hour at width 12. The longest
+/// guest action any caller waits on is eight seconds of audio.
+pub const GUEST_WEDGED: Duration = Duration::from_secs(300);
+
+pub fn guest_liveness() -> Liveness {
+    Liveness::new(GUEST_QUIET, GUEST_WEDGED)
+}
+
+/// Collect console output until `done` reads true of the whole capture, or the
+/// guest stops making progress.
+///
+/// The shape [`QemuInstance::drain_serial`] cannot have: its caller passes a
+/// number of seconds, and a number of seconds is a claim about the host. Here
+/// the wait ends when the guest goes quiet or wedges, so a guest with a twelfth
+/// of the machine costs the run wall clock and never a verdict — and when it
+/// does end early the message says so in the words the classifier reads
+/// ([`STALLED`]).
+///
+/// `doing` is what the guest was asked to do, in the caller's own words. The
+/// caller keeps its assertion; what this owns is the difference between "it did
+/// the wrong thing" and "it never got there".
+///
+/// It lives beside [`Liveness`] rather than in the test list because a test in
+/// `tests/common/` could not reach it there, and the two that could not —
+/// `metal_sim_null_audio` and `hda_two_live_refused` — each reached for a span
+/// of host wall clock instead and lost the race on a runner.
+pub fn await_guest(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    doing: &str,
+    done: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let mut live = guest_liveness();
+    while !done(log) && live.working(log) {
+        let more = qemu.drain_serial(Duration::from_millis(200));
+        log.push_str(&more);
+    }
+    if done(log) {
+        return Ok(());
+    }
+    Err(format!("{STALLED} waiting for {doing} — {}", live.why()))
+}
+
+/// [`await_guest`] for the common case: one marker anywhere in the capture.
+pub fn await_marker(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    marker: &str,
+    doing: &str,
+) -> Result<(), String> {
+    await_marker_new(qemu, log, marker, 0, doing)
+}
+
+/// [`await_marker`] over what arrives after `from`.
+///
+/// For a marker a test asks for more than once: a whole-capture scan answers
+/// the second ask with the first ask's line and carries on against a guest that
+/// has not done the thing yet.
+pub fn await_marker_new(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    marker: &str,
+    from: usize,
+    doing: &str,
+) -> Result<(), String> {
+    await_guest(qemu, log, doing, |log| log[from.min(log.len())..].contains(marker))
 }
 
 /// The hardware shape QEMU presents to the guest.
@@ -1114,6 +1338,22 @@ pub struct TestResult {
     pub stdout: String,
     pub serial: String,
     pub error: Option<String>,
+    /// Whether the guest ever announced *this* test.
+    ///
+    /// The in-guest runner reads one command, prints `===TEST_START <name>` and
+    /// spawns; so a test that never started is a guest that never got as far as
+    /// reading its command, which is a different thing from a test that ran and
+    /// hung. On a shared boot the two want different answers — the first is
+    /// about the boot, the second about the test.
+    pub started: bool,
+}
+
+impl TestResult {
+    /// The guest is not answering any more: this test's turn came, its whole
+    /// ceiling passed, and it was never even announced.
+    pub fn boot_stopped_answering(&self) -> bool {
+        !self.started && self.error.is_some()
+    }
 }
 
 pub struct QemuInstance {
@@ -1607,29 +1847,76 @@ impl QemuInstance {
         let mut fire =
             |line: &str, socket: Option<&PathBuf>| step(socket.map(PathBuf::as_path), line);
 
+        // `run <name> [args...]`, and the markers carry only the binary name.
+        let want = name.split_whitespace().next().unwrap_or(name);
+
         let timeout = budget(timeout);
         let start = Instant::now();
         let mut stdout = String::new();
         let mut serial = String::new();
         let mut in_test = false;
+        // **Which of the two things the ceiling caught.** A test's `timeout` is
+        // a liveness guard and never a verdict, and until now its expiry said
+        // only how many seconds had passed — `metal_sim_client_death` 364 s,
+        // `metal_sim_window_drag` 355 s, `desktop_audio_client` 354 s and
+        // `blocked_dump` 329 s in run `31250706113`, four reds indistinguishable
+        // from four slow tests. The console tells them apart for free, and the
+        // fix `1cf7fee` made to the waits *inside* a test never reached this
+        // one: a guest that has said nothing for [`GUEST_QUIET`] has stopped,
+        // and one still talking at the ceiling has not.
+        let mut last_line = Instant::now();
+        let mut lines = 0usize;
 
         loop {
             if start.elapsed() > timeout {
+                let quiet = last_line.elapsed();
+                let secs = timeout.as_secs();
+                let error = if quiet >= GUEST_QUIET {
+                    format!(
+                        "{STALLED} {secs}s of guard expired, and the guest had said nothing for \
+                         the last {:.0?} of it — the ceiling caught a machine that had stopped, \
+                         which is not an answer to what this test asked",
+                        quiet
+                    )
+                } else {
+                    format!(
+                        "timed out after {secs}s, with the guest still talking {:.0?} ago \
+                         ({lines} console line(s) while it ran) — it was working and did not \
+                         finish",
+                        quiet
+                    )
+                };
                 return TestResult {
                     name: name.to_string(),
                     exit_code: None,
                     stdout,
                     serial,
-                    error: Some(format!("timed out after {}s", timeout.as_secs())),
+                    error: Some(error),
+                    started: in_test,
                 };
             }
 
             match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(line) => {
+                    last_line = Instant::now();
+                    lines += 1;
                     fire(&line, self.qmp_socket.as_ref());
-                    if line.contains("===TEST_START ") {
+                    if line.contains(&format!("===TEST_START {want}===")) {
                         in_test = true;
                     } else if let Some(at) = line.find(END_MARKER) {
+                        let rest = &line[at + END_MARKER.len()..];
+                        let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
+                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                        // **A marker naming another test is the previous one's**,
+                        // and taking it was `specs/known-issues.md` §6's cascade:
+                        // one timed-out test left the guest still producing its
+                        // output, every later member of the block read a window
+                        // that opened on it, and 110 of 238 went red on an
+                        // "actual" that was verbatim the previous expectation.
+                        // The name has been on the wire the whole time.
+                        if parts[0] != want {
+                            continue;
+                        }
                         // Everything before the marker is a line some other
                         // console writer was in the middle of when the runner
                         // printed; it is still real output and the audio gate
@@ -1638,9 +1925,6 @@ impl QemuInstance {
                             serial.push_str(&line[..at]);
                             serial.push('\n');
                         }
-                        let rest = &line[at + END_MARKER.len()..];
-                        let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
-                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         let (exit_code, error) = if parts.len() > 1 {
                             if let Some(code_str) = parts[1].strip_prefix("exit=") {
                                 (code_str.parse::<i32>().ok(), None)
@@ -1658,6 +1942,7 @@ impl QemuInstance {
                             stdout,
                             serial,
                             error,
+                            started: in_test,
                         };
                     } else if line.contains("KERNEL PANIC") {
                         return TestResult {
@@ -1666,6 +1951,7 @@ impl QemuInstance {
                             stdout,
                             serial,
                             error: Some(format!("kernel panic: {line}")),
+                            started: in_test,
                         };
                     } else if in_test {
                         serial.push_str(&line);
@@ -1690,6 +1976,7 @@ impl QemuInstance {
                         stdout,
                         serial,
                         error: Some("QEMU disconnected".to_string()),
+                        started: in_test,
                     };
                 }
             }
@@ -1704,7 +1991,20 @@ impl Drop for QemuInstance {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.audio_wav);
-        let _ = fs::remove_file(&self.uart_log);
+        // **The 16550's log outlives the guest, because it is the one channel
+        // that exists before the console does.** Firmware, the bootloader and
+        // the kernel up to the backend switch write here and nowhere else, so a
+        // boot that dies before virtio-console comes up leaves this file and an
+        // empty capture — which is exactly the shape `specs/known-issues.md` §5
+        // records as looking like a kernel that never started. 1.4 KB on a
+        // healthy `tests/testcases` boot, measured, against the hundreds of
+        // megabytes of per-boot image beside it.
+        //
+        // Deleting it here is also why `ci.yml`'s "what a red run left" step had
+        // never uploaded one byte: run `31252989653` reds four shards and
+        // publishes twelve duration files and no scratch artifact at all, which
+        // reads as "there was nothing to keep" rather than "it was deleted
+        // before the step ran".
         let _ = fs::remove_file(&self.screendump);
         if let Some(socket) = &self.qmp_socket {
             let _ = fs::remove_file(socket);
@@ -2395,7 +2695,14 @@ fn wait_for_ready(
     // on how long a boot took by *this* clock: `i8042_absent` and
     // `xhci_slow_connect` do assert on boot timing and read the guest's own
     // stamps, and both are in the serial tail.
-    let boot_timeout = Duration::from_secs(10) * WIDTH.load(Ordering::SeqCst).max(2);
+    //
+    // Scaled by the host too, and the first boot of a run is the one that
+    // cannot be: nothing has been measured yet, so it gets the flat number and
+    // every boot after it gets the corrected one. Two boot timeouts in CI run
+    // `31233476555` were this — `console: ready` and `compositor: ready`, on a
+    // runner where the same boots take twice what they take here.
+    let (num, den) = host_scale();
+    let boot_timeout = Duration::from_secs(10) * WIDTH.load(Ordering::SeqCst).max(2) * num / den;
     let start = Instant::now();
     let mut seen = String::new();
     loop {
@@ -2454,5 +2761,6 @@ fn wait_for_ready(
             }
         }
     }
+    record_boot(start.elapsed());
     seen
 }
