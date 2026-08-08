@@ -13,10 +13,10 @@ init = [
 hosted-rustc = false
 assets = ["assets"]
 
-# In the directory and not in git, on purpose: 5.99 MB of SoundFont that doom
+# In the directory and not in git, on purpose: 5.99 MB of SoundFont doom
 # synthesises its music from. A sweep cannot tell it from a .DS_Store, so it is
-# named here, and a build that cannot find it stops rather than shipping a doom
-# with no music.
+# named here — and only here, because this is the only config that builds doom.
+# `userland/doom/build.rs` downloads it, so it is present whenever doom is.
 untracked-assets = ["timgm6mb.sf2"]
 
 [programs]

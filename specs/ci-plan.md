@@ -64,10 +64,25 @@ to be an AMD-only defect, so a KVM job that draws Intel reproduces nothing and
 proves nothing about that class. Nothing can select the vendor, so any KVM job
 prints its `model name` as part of its own output.
 
-§7 is closed. The guest shards still run TCG, because that is the wide
-repeatable measurement and the one comparable with the dev host's; the KVM job
-beside them is the only gate that *executes* `syscall`/`sysret`/`iret` rather
-than emulating them.
+§7 is closed.
+
+**The shards run KVM. The owner decided it on 2026-08-08**, overruling the
+paragraph this section used to end with — that TCG kept the shards comparable
+with the dev host's numbers, and that the KVM job beside them was enough to
+cover the instructions TCG only emulates. His reasoning:
+
+> "kvm sounds perfect everything should work under emulation and kvm if it
+> doesnt something with the guest is wrong."
+
+The comparability point remains true, and what changes is which two things are
+being compared. A wall clock on TCG is mostly the emulator's; on KVM it is
+mostly the guest's. The dev host's 243 s is comparable with another cross-arch
+TCG run on the dev host, and no runner was ever going to be that — §7.1 is the
+proof, four cores emulating x86 on x86 against fourteen emulating x86 on arm64.
+So CI's number is now a native one and is read as a different instrument rather
+than as a slower copy of the same one. The `tcg` job beside the shards keeps the
+emulated path from rotting: one test, `/dev/kvm` left exactly as it ships, and
+it is the only thing in CI that boots `-cpu qemu64`.
 
 **A defect this uncovered on the way.** Both KVM checks (`src/qemu.rs`,
 `tests/common/qemu.rs`) asked `Path::new("/dev/kvm").exists()`. Presence is not
@@ -211,27 +226,31 @@ compilation. With the cargo cache: 442 s (run `31201564400`).
 
 ## 6. What a fresh clone does not have
 
-**The SoundFont, and it is the one thing standing between CI and a green guest
-suite.** `assets/timgm6mb.sf2` is `.gitignore` line 3 — 5,994,284 bytes doom
-synthesises its music from, deliberately not carried in git. Three test configs
-declare it in `untracked-assets` (`desktopcase`, `desktopaudiocase`,
-`metalcase`) and a build that cannot find a declared asset is a hard error by
-design, so that a fresh clone is *told* rather than handed a doom that plays
-nothing (`specs/boot-image-split.md` §5). **A runner is a fresh clone**, so the
-whole desktop and metal-sim families red on it.
+**The SoundFont — and the reason it broke CI was not that a fresh clone lacks
+it.** `assets/timgm6mb.sf2` is `.gitignore` line 3, 5,994,284 bytes doom
+synthesises its music from. **`userland/doom/build.rs` downloads it**, so any
+config that builds doom has it; five configs declared it in `untracked-assets`
+and exactly one of them — the root `system.toml` — builds doom. `console`,
+`desktopcase`, `desktopaudiocase` and `metalcase` each shipped 5.99 MB into an
+initrd holding nothing that can open it, and each turned a hard error on an
+asset nothing in that image wanted. That is what reddened the whole desktop and
+metal-sim families on a runner (86 occurrences in run `31222412737`), and the
+same defect in worktree clothes is what made a brand-new worktree fail
+`metal_sim_compositor` and `metal_sim_pointer_churn` until somebody copied the
+file across.
 
-Whether this repository may publish that file is a licensing decision and the
-owner's, not CI's. `ci.yml` therefore reads a repository variable
-`TOYOS_SOUNDFONT_URL`: set it and the guest job fetches the file before
-building; leave it unset and the job says so in one line and lets those tests
-red by name rather than mysteriously. **Nothing else is blocking a green guest
-suite.** Gate A is unaffected — it runs on `tests/testcases`, which declares no
+Fixed by deleting the four declarations, which loses nothing: **the config that
+builds doom is the config that declares doom's asset.** Two further changes so a
+network, rather than a licence, is all that stands between a clone and a build:
+a declared asset that is not there is now **named and skipped** rather than
+fatal (`src/assets.rs`), and a fetch that fails is a `cargo:warning` rather than
+a panic (`userland/doom/build.rs`). The absence is stated twice — at build time
+by name, and in the guest's log by `toyos_music_init`'s "playing without music".
+No repository variable and no hosted copy is needed, so `TOYOS_SOUNDFONT_URL` is
+gone.
+
+Gate A was never affected — it runs on `tests/testcases`, which declares no
 untracked asset.
-
-Observed on the dev host too, and it is the same defect wearing worktree
-clothes: `cargo run -- --worktree add` carries `.cargo/config.toml` and not
-this, so a brand-new worktree fails `metal_sim_compositor` and
-`metal_sim_pointer_churn` on it until somebody copies it across.
 
 ## 6.1 What does not survive a Linux host
 

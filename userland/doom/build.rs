@@ -155,16 +155,30 @@ fn download_soundfont(root: &Path) {
         return;
     }
     println!("Downloading TimGM6mb.sf2...");
-    let agent = http_agent();
-    let resp = agent
-        .get("https://github.com/craffel/pretty-midi/raw/main/pretty_midi/TimGM6mb.sf2")
-        .call()
-        .expect("failed to download TimGM6mb.sf2");
-    let mut data = Vec::new();
-    std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut data)
-        .expect("failed to read SF2 data");
-    assert!(data.starts_with(b"RIFF"), "downloaded soundfont is not a RIFF file");
-    fs::write(&sf2_path, &data).expect("failed to write TimGM6mb.sf2");
+    // Music is the one input here a network can take away, and taking the whole
+    // image with it is the wrong trade: `toyos_music_init` already answers
+    // "playing without music" for a file that is not there, and the initrd
+    // build names it too. `cargo:warning` because a build script's stdout is
+    // captured and its warnings are not.
+    let fetch = || -> Result<Vec<u8>, String> {
+        let resp = http_agent()
+            .get("https://github.com/craffel/pretty-midi/raw/main/pretty_midi/TimGM6mb.sf2")
+            .call()
+            .map_err(|e| e.to_string())?;
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut data)
+            .map_err(|e| e.to_string())?;
+        if !data.starts_with(b"RIFF") {
+            return Err("what came back is not a RIFF file".into());
+        }
+        Ok(data)
+    };
+    match fetch() {
+        Ok(data) => fs::write(&sf2_path, &data).expect("failed to write TimGM6mb.sf2"),
+        Err(e) => println!(
+            "cargo:warning=TimGM6mb.sf2 could not be fetched ({e}); this doom plays without music"
+        ),
+    }
 }
 
 fn download_doomgeneric(root: &Path) {

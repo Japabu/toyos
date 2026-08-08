@@ -198,29 +198,37 @@ fn tracked(dir: &Path) -> BTreeSet<PathBuf> {
 ///
 /// `untracked` exists because git's index is not quite the whole declaration:
 /// `assets/timgm6mb.sf2` is 5.99 MB of SoundFont that doom synthesises its
-/// music from, `.gitignore` excludes it on purpose, and it has shipped in every
-/// image this project ever built. A sweep cannot tell that file from a
-/// `.DS_Store` — both are "in the directory and not in git" — so the config
-/// says which, and **an entry naming a file the build cannot find stops the
-/// build**. That is why it is a list of paths and not a flag: a fresh clone has
-/// no SoundFont, and what it needs is to be told so by name rather than to
-/// produce a doom with no music.
+/// music from and `.gitignore` excludes it on purpose. A sweep cannot tell that
+/// file from a `.DS_Store` — both are "in the directory and not in git" — so
+/// the config says which.
+///
+/// **An entry the build cannot find is named and skipped, not fatal.** It used
+/// to stop the build, on the argument that a fresh clone should be told rather
+/// than handed a doom with no music; the telling is what mattered and the
+/// stopping was the part that cost — a fresh clone, a runner and every new
+/// worktree red on an asset git deliberately does not carry. Being told happens
+/// twice now: here by name, and again in the guest's own log when whatever
+/// wanted the file opens it and says what it is doing without it.
 pub fn collect(dirs: &[String], untracked: &[String]) -> Vec<(String, Vec<u8>)> {
     let mut files = vec![];
 
     for dir in dirs {
         let dir = Path::new(dir);
         let tracked = tracked(dir);
-        let declared: BTreeSet<PathBuf> = untracked.iter().map(PathBuf::from).collect();
-        for name in &declared {
+        let mut declared: BTreeSet<PathBuf> = untracked.iter().map(PathBuf::from).collect();
+        declared.retain(|name| {
             let path = dir.join(name);
-            assert!(
-                path.exists(),
-                "{} is declared in `untracked-assets` and is not there. It is deliberately not \
-                 carried in git, so a fresh clone has to be given a copy.",
+            if path.exists() {
+                return true;
+            }
+            eprintln!(
+                "assets: NOT IN THIS IMAGE — {} is declared in `untracked-assets` and is not \
+                 there. It is deliberately not carried in git, so a fresh clone has to be given \
+                 a copy; whatever wants it runs without it.",
                 path.display()
             );
-        }
+            false
+        });
         let ships = |path: &Path| {
             let relative = path.strip_prefix(dir).unwrap_or(path);
             if tracked.contains(relative) || declared.contains(relative) {
