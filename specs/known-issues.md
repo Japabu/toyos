@@ -4877,6 +4877,29 @@ Do not instead shorten needles to fit inside a fragment. The splice point
 moves, and a needle short enough to survive every splice is short enough to
 match the wrong line.
 
+**The third candidate does not cover it, and the second occurrence is what
+shows that.** 2026-08-08, `wt/toyos-apregs`, the same needle split at the same
+point — but the intruder is not a kernel line:
+
+```
+soundd: hda codec===READY===
+0 vendor=1af4 device=0012, 1 function group(s)
+```
+
+`===READY===` is `/bin/test-runner`'s, so `is_kernel_line` does not identify
+it and a splice keyed on that predicate reassembles nothing. Worse for the
+harness specifically: the ready marker is what `wait_for_ready` breaks on, so
+the boot capture *ends* inside soundd's line and the rest of it is not in the
+string `must_say` searches at all — no reassembly on the captured text can
+recover a needle whose second half was never captured. Whatever the harness
+does here has to survive an arbitrary userland writer, which points back at
+the two guest-side fixes above rather than at a fourth harness one.
+
+Rate, such as one run can give it: three full suites on one tree in one
+session, `hda_tone` green in two and red on this in the third, then green 3 of
+3 alone on a quiet host. So it is not the audio path and not load in any way
+that a re-run answers — it is which two writers happen to collide.
+
 ### OPEN — the i8042 aux line's unmask result is discarded, and its log line says nothing either way
 
 `init` captures the keyboard's unmask and prints it — `"on"` or `"MASKED"`
