@@ -1166,7 +1166,7 @@ pub fn xhci_slow_connect(
     /// guest's own clock and the settle re-reads it every `PORT_POLL_NS`, so the
     /// spread is a millisecond of polling and not a share of the host. Six runs
     /// here — three sequential, three with four concurrent test processes on the
-    /// machine — put the first port line at 0.400-0.402 s, and known-issues
+    /// machine — put the first port line at 0.400-0.402 s, and `specs/issues/`
     /// records one at 0.413 under five-agent load. 13 ms of worst observed
     /// excursion against 150 of slack, and 700 of clearance to the shape above.
     const SETTLE_SLACK_S: f64 = 0.150;
@@ -1197,7 +1197,7 @@ pub fn xhci_slow_connect(
     // a delta from `controller started` instead compared a delta against an
     // absolute window, which silently required the boot to reach its controller
     // within `PORT_DEBOUNCE_NS`: a budget it has since grown out of, and four
-    // red runs and an afternoon in the driver (known-issues).
+    // red runs and an afternoon in the driver (`specs/issues/`).
     let started = stamp_of(&log, "xHCI: controller started")?;
     // The first line this driver prints about any port at all. Every other
     // per-port line is preceded by that port's connect line, so the first match

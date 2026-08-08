@@ -132,6 +132,10 @@ pub fn enable() {
 /// `gs:[256]` is `PerCpu::fault_state`, non-zero for PageFault/Fatal/Panic and
 /// asserted at that offset in `percpu.rs` alongside the other raw offsets this
 /// module uses.
+///
+/// A CPU inside a report is not reschedulable, so a `fault_state` never
+/// returned to Normal costs that CPU its preemption for the rest of the boot:
+/// a leak here is a hang, not a nuisance.
 #[inline]
 fn faulting() -> bool {
     if !percpu_ready() { return false; }

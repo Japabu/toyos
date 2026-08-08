@@ -29,7 +29,7 @@
 at open and reads them by absolute block number with no re-validation, so after an unlink
 frees those blocks to bcachefs's allocator and another file takes them, a process
 demand-paging the unlinked file reads **another process's file contents**. Ordinary
-filesystem operations, no crafting (`specs/known-issues.md` §1).
+filesystem operations, no crafting (`specs/issues/isolation/`).
 
 That is this spec's refcount, missing: the backing must keep the file's blocks alive for
 as long as it can read them. It is deliberately left unfixed pending this work, because a
@@ -37,7 +37,7 @@ local patch — re-validating extents per read, or invalidating backings on unli
 reimplements refcounting badly at one call site while every other cached reference keeps
 the same shape.
 
-`known-issues.md` §1 names the pair this closes: **an id or a name treated as a
+`specs/issues/isolation/` names the pair this closes: **an id or a name treated as a
 capability** (guessing a designation) and **a reference that outlives the object it
 names** (outliving one). Handles make the first unrepresentable by carrying rights and the
 second by carrying a refcount.
@@ -547,6 +547,14 @@ stdio pre-seeding at spawn.
 known issue. `PendingPoll` keys move from fd numbers to `(Koid, RawHandle)`;
 close-cancels-poll is preserved via the koid.
 
+**The rule underneath that move:** an fd number names a slot in one process's
+table and means nothing in another's, so anything reached across a process
+boundary is selected by the object it watches and never by the number.
+`io_uring::remove_fd` now takes `sources: &[Option<Source>]` with no fd number
+in its signature, which makes the old shape unrepresentable at its one call
+site; the rule is what stops the next cross-process structure being keyed the
+same way.
+
 ## 7. Kernel-internal integers: what stays, what dies
 
 | Today | Becomes | Why safe |
@@ -973,7 +981,7 @@ kill-soundd-respawn-audio-recovers.
 
 **Stage F — audit & shrink.**
 Dead constants and `_ =>` arms deleted; grep-gates added to CI (§12.2); CLAUDE.md
-architecture + known-issues updated (closes: `SharedToken` RAII, io_uring shm abuse,
+architecture + `specs/issues/` updated (closes: `SharedToken` RAII, io_uring shm abuse,
 `Fd` rename, unprivileged RT); census check in `log_health` behind a boot flag.
 
 Dependency notes: Stages A–D are independent of Phase 1 (scheduler) and Phase 2

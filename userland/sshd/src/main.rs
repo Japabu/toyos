@@ -22,7 +22,7 @@ use russh::{Channel, ChannelId, MethodKind, MethodSet};
 ///
 /// There is no user model and no file permissions, so the host key is readable
 /// by every process on the machine. That is a property of the system, not of
-/// this daemon — see `specs/known-issues.md`.
+/// this daemon — see `specs/issues/`.
 const SSH_DIR: &str = "/home/root/.ssh";
 const HOST_KEY: &str = "/home/root/.ssh/host_ed25519";
 const AUTHORIZED_KEYS: &str = "/home/root/.ssh/authorized_keys";

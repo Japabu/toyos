@@ -68,7 +68,7 @@ impl Serial {
     /// A line carrying a kernel prefix somewhere other than its start, which
     /// is the virtio-console's missing line atomicity showing up in the
     /// capture: `log!` and a userspace `println!` interleave mid-word (see
-    /// known-issues). Reported rather than repaired — a needle that went
+    /// `specs/issues/`). Reported rather than repaired — a needle that went
     /// missing because it was split in half should say so instead of looking
     /// like the guest never said it.
     pub fn interleaved(&self) -> Option<&str> {

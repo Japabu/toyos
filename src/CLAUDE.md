@@ -1,0 +1,31 @@
+# Build system
+
+Loads when you read a file under `src/` — the root cargo project, package name `toyos-build`. Root `CLAUDE.md` has `cargo run`, `cargo test` and the `[profile.toyos]` rule.
+
+## Boot modes
+
+- `cargo run -- --gop` boots a UEFI GOP display (`-vga std`) instead of virtio-gpu: the config where the on-screen panic console renders.
+
+- `cargo run -- --diag-boot --build-only` builds `target/bootable-diag.img` — the diagnostic boot for a machine with no serial port. Nothing in that image can claim the framebuffer, so the kernel's log stays readable off the panel. Same kernel and bootloader binaries as the ordinary build. **A flashable artifact is built from a committed tree** — `cargo` builds the working tree, and this checkout usually holds someone's uncommitted work.
+
+- `cargo run -- --kernel-feature <name>` (repeatable, any boot mode) compiles the kernel with that cargo feature — `--diag-boot --kernel-feature hda-probe` is how H0's probe reaches the flashed image. **Deliberately orthogonal to the boot mode**: a feature list on `Boot::Diag` would make the diagnostic kernel permanently a different build from the shipping one, which is the guarantee that mode exists to make. An undeclared name is refused by name against `kernel/Cargo.toml`, **before any lock**, so deleting a temporary feature takes its stale command lines with it rather than quietly building a kernel without it.
+
+- `cargo run -- --console-boot --build-only` builds `target/bootable-console.img` — `/bin/console`, the shell on the raw framebuffer with no compositor, for asking that machine questions instead of reflashing it. It seeds its scrollback from the newest `/log` files first, because claiming the framebuffer is what stops `boot_checkpoint` painting. A third mode, not a replacement for `--diag-boot`: that image contains nothing that *can* claim the screen, which is the only way to read a machine that wedges before userland.
+
+- `cargo run -- --metal-sim` boots the T14's hardware shape: GOP + NVMe + xHCI + i8042, no virtio device, no USB HID — with a 16550, so it is fully drivable and the input tests run on it. `--mute` takes the serial away, the T14's literal shape; one test uses it (`screen_panic_muted`). **Agents verify through `cargo test`, never by launching `cargo run`** — the run path opens a QEMU window on the owner's desktop by design; the harness passes `-display none`.
+
+## Other entry points
+
+- `cargo run -- --check-forks` names every lockfile pin that has fallen behind the fork branch its *manifest* consumes (never the `pr_branch` `forks.toml` records), across every lockfile that holds one — `rust/`'s two included, reached through `toolchain::rust_dir` because `rust/` is a stub in a worktree. It reports the `cargo update` that would fix a drift and never runs it. **On demand only: it asks fourteen remotes over the network, so it is in neither `cargo test` nor the landing gate**, and its own banner says so (`specs/dependency-audit-2026-08-08.md` §11.6).
+
+- `system.toml` defines which programs to build and the init sequence.
+
+## The host's locks and slots
+
+- **A red build may be the build system, not the code — re-run in isolation before believing any single red.** The `stage1-std/<target>/dist/deps` temp-dir error means a concurrent build, never a broken checkout; the tell is that the same command succeeds between attempts. Wait and re-run — **never repair or force-rebuild the toolchain**. `src/buildlock.rs` serialises the stateful phases in two scopes: `Global` (the bootstrap, the sysroot, the rustup link — one directory in `.git/`, shared by every worktree) and `Worktree` (the crate-target cleans). A `[build-lock] waiting …` line naming a holder is that working, not a hang. Only `./x.py` typed by hand in `rust/` escapes it. And a refusal that your worktree and the shared sysroot "disagree about toyos-abi/src" is correct, not a broken tree — the build it stops links your kernel against another checkout's struct layouts and no test catches that. **Whether you may claim it is not your choice**: only a checkout whose `toyos-abi`/`toyos` actually differ from main's may, and that one is told to land. If yours match main you are told to wait, because the holder landing ends the refusal by itself — five worktrees claiming at the one that legitimately needed it is what 2026-08-04 cost (`specs/worktrees.md` §3.1–§3.2). A claim queues behind every suite run in flight and never lands inside one.
+
+- **The host hands out guest slots and build slots.** `buildlock::guest_slot` — twelve across every worktree, one per task. `buildlock::build_slot` — four, and it is the count that was missing: a worker holds a guest slot while it *compiles*, so twelve workers were twelve concurrent `cargo build`s at load 49.9 on 14 cores with one guest live, and a landing gate's build half was bounded by nothing at all. Separate counts, so a suite holding every guest slot can still compile. **The order is a constraint at every acquirer**: sysroot → host slot → build lock → artifact. `[host-slots] waiting …` and `[host-builds] waiting …` name the holders, and every blocking lock now repeats itself every 30 s — a queue is never silence. `cargo test --test toyos-build -- --host-slots N --host-builds N` override, 0 turns either off — `--test toyos-build` and not a bare `cargo test`, because a bare one hands the flag to the `--lib` harness too and libtest refuses it by name.
+
+## Documentation budgets
+
+`src/docs.rs` holds the byte budget for every `CLAUDE.md` in the tree and `cargo test --lib` asserts it. Bytes rather than lines, because a line-count limit cannot see growth when one line can be an essay. Raising a number is a decision with a reason, not a way to make a red go away: the file is loaded into every session and every subagent, and the subdirectory files exist so the root does not have to carry what only one subtree needs.

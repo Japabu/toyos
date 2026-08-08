@@ -57,7 +57,7 @@ syscall is the small part.
 | Clock | TSC period in `TSC_PERIOD_FS`, `calibrated()` | TSC frequency in Hz (logged at init, never stored); the HPET mapping (a local in `clock::init`); any realtime↔monotonic offset |
 
 Two of these are already filed as defects and this work closes them rather than
-working around them: `specs/known-issues.md` §3 records that
+working around them: `specs/issues/kernel/` records that
 `specs/device-test-strategy.md` **requires a `query-pci` verification that
 exists nowhere**, and that no test compares what QEMU was told to create against
 what the guest enumerated. There is nothing to compare against because the guest

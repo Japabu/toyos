@@ -27,7 +27,7 @@ rings are a 2 MiB grant to the NIC daemon that the kernel then reads indices
 back out of, and io_uring's ring is the same shape (`io_uring.rs:248` stores
 `shm_phys` for a region the owning process holds a releasable token to). Those
 are other agents' subsystems and out of scope here. Naming the rule is the part
-that generalises; §7 records the two adjacent instances for `known-issues.md`
+that generalises; §7 records the two adjacent instances for `specs/issues/`
 so nobody has to rediscover them.
 
 ## 2. What was verified, and where the findings were wrong
@@ -104,7 +104,7 @@ Two further facts that bear on the shape:
   after §8's discovery run: both arms now carry `+smep`
   (`tests/common/qemu.rs:2199`). What the harness still does *not* do is assert
   it — no test reads `smep=on` out of a boot log, so deleting the argument reds
-  nothing (known-issues §6). `cargo run`'s own arguments (`src/qemu.rs:88,90`)
+  nothing (`specs/issues/build/`). `cargo run`'s own arguments (`src/qemu.rs:88,90`)
   were never given it.
 
 ### 2.2 #162(a) — PCID: real on the metal, **unreachable in the harness**
@@ -732,7 +732,7 @@ Two things it does not close, both recorded rather than papered over:
 - **An `IF=0` spin that is not a `Lock`.** A driver waiting on a device register
   inside a handler cannot poll. That is latency and not deadlock, because each
   carries its own deadline — but xHCI's is 2 s and it runs from `drain_irqs`
-  (known-issues §3), so `ACK_TIMEOUT_NS` is 5 s and a CPU past it is named in a
+  (`specs/issues/kernel/`), so `ACK_TIMEOUT_NS` is 5 s and a CPU past it is named in a
   **panic** rather than waited for forever. This makes that existing defect cost
   something visible on the mapping path, which is an argument for closing it and
   not a reason to lower this bound.
@@ -829,7 +829,7 @@ wake lateness 5507 µs with the wait against 6301 µs without.
 The **thorough tier is red, and it is red on `main` too** — 7 dropout runs of 28
 there against 5 of 12 on this branch and 5 of 40 with the wait deleted, all three
 failing the same `0 of 120` recorded sample. That is a finding about the estate
-rather than about M3, it is written up in known-issues §4 with the numbers, and
+rather than about M3, it is written up in `specs/issues/audio/` with the numbers, and
 it is why this stage's thorough tier is an A/B rather than a pass/fail: a gate
 that is red on `main` cannot say anything about a branch by being red on it.
 
@@ -970,10 +970,10 @@ M1a's row above and the translate probe in §3.1.
 4. **Merge pressure on `syscall.rs`** with the scheduled decomposition. M1b
    exists to bound it.
 5. **Gate A's known intermittent red** (`audio_tone_load smp=1`,
-   known-issues §4) will appear during M2 and M3 A/B runs. Stash-and-re-run
+   `specs/issues/audio/`) will appear during M2 and M3 A/B runs. Stash-and-re-run
    before attributing it, as the rule says.
 
-## 7. For `known-issues.md` §1, not fixed here
+## 7. For `specs/issues/isolation/`, not fixed here
 
 - **io_uring's ring is a grant the kernel reads through.** `io_uring::create`
   stores `shm_phys` (`io_uring.rs:248`) for a `shared_memory` region whose token
@@ -1031,7 +1031,7 @@ Re-run after merging main:
 **256 passed, 1 failed. The one red is `desktop_window_child`.**
 
 That test is documented on main as `EXPECTED RED, pending #156`
-(known-issues §3) and was verified red on main *without* `+smep`, so the flip is
+(`specs/issues/kernel/`) and was verified red on main *without* `+smep`, so the flip is
 not its cause. Two things were checked rather than assumed before accepting
 that:
 

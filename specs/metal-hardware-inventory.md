@@ -200,7 +200,7 @@ only), and a DMA pool of `2048 KiB: scratchpad=34 device blocks=64 of 12288 B`.
   bits were already clear; the three write-1-to-clear status bits (29/30/31) were
   latched and the write cleared them. So firmware was not arming SMIs on these
   controllers at handoff time. That is the fact behind the argument, recorded in
-  known-issues §8, that the port-0x60/0x64 SMM trap is disarmed before
+  `specs/issues/hardware/`, that the port-0x60/0x64 SMM trap is disarmed before
   `i8042::init` — still argued rather than observed, but the premise now has a
   reading.
 - **Both controllers were given MSI vector `0x21`.** One vector, two controllers.
@@ -338,7 +338,7 @@ Boot B is identical but for timing (`armed at 2021ms`, first assert at 12925 ms)
 - **The FADT denies its own 8042 and is wrong.** `iapc_boot_arch=0x0011` is
   LEGACY_DEVICES set, **8042 clear**, NO_ASPM set. The controller answers its
   self-test with `0x55` and both interface tests pass. This is settled and closed
-  in known-issues §8; it is repeated here because it is a *property of this
+  in `specs/issues/hardware/`; it is repeated here because it is a *property of this
   machine* that any future firmware-summary-bit gate will meet again.
 - **The keyboard will not report its scancode set.** `0xF0 0x00` is answered
   `0xee` — ECHO's reply, to a command the EC does not implement. The wire format
@@ -350,7 +350,7 @@ Boot B is identical but for timing (`armed at 2021ms`, first assert at 12925 ms)
   has still never asserted** in any recorded boot — nothing has touched the
   TrackPoint — so the aux half of the routing is argued from the keyboard half.
 - **The byte decodes.** Both boots report `1 bytes, 1 keys`. The open item in
-  known-issues §8 — "one byte reached the kernel and produced no event" — is
+  `specs/issues/hardware/` — "one byte reached the kernel and produced no event" — is
   answered in the direction that matters: on these boots the first byte the EC
   sent produced a key event. That does not retroactively identify the earlier
   `1 bytes, 0 keys` byte (a different keypress, and an extended-key prefix is the
@@ -391,7 +391,7 @@ brightness control, no panel power management.
 
 `Boot: complete (3422ms)` on boot A, `(3500ms)` on boot B. The recorded QEMU
 figure for the comparable configuration is `Boot: complete (196ms)`
-(known-issues §8, measured on the `metal_sim_compositor` boot) and `(234ms)` for
+(`specs/issues/hardware/`, measured on the `metal_sim_compositor` boot) and `(234ms)` for
 the diag artifact booted headless on the metal-sim shape. So metal is **~17×**
 the QEMU number, and almost all of the difference is one thing.
 
@@ -522,7 +522,7 @@ the metal roadmap's raw material; sequencing is the owner's.
    and none is on any milestone.
 
 Two further gaps, one from the logs and one not. **The Thunderbolt xHCI has never
-had a device on it**, so hotplug — which does nothing at all today, known-issues
+had a device on it**, so hotplug — which does nothing at all today, `specs/issues/`
 §8 — has never been exercised on this machine either; that one is the logs'.
 **There is no ACPI SCI**, so the lid and the power button raise nothing; that one
 is `specs/metal-boot-plan.md` M2's accepted limitation, and these logs neither

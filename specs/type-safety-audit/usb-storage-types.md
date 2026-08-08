@@ -288,8 +288,8 @@ those, not here.
 (`if dev.read_at(…).is_err() { return; }`).
 
 **The bug the current shape permits.** `FileBacking::read_page` returns `()`;
-that is filed (known-issues §"`bcachefs::BlockIO` is infallible", whose last
-paragraph reads *"`FileBacking::read_page` and `vfs::FileSystem`'s write path
+that was filed as the `bcachefs::BlockIO` is infallible entry, now closed and
+deleted, whose last paragraph read *"`FileBacking::read_page` and `vfs::FileSystem`'s write path
 have no error channel either, so `file_backing.rs` leaves the caller a hole of
 zeros **and says so in the log**"*). The new implementation does not say so. The
 sibling implementations both do:
@@ -300,9 +300,9 @@ kernel/src/bcachefs_adapter.rs:37 log!("bcachefs: read of block {} failed; servi
 kernel/src/fat32_adapter.rs:315   if dev.read_at(…).is_err() { return; }     ← nothing
 ```
 
-So the sentence in known-issues is now false for one of the three, and the
+So that sentence is now false for one of the three, and the
 marker `serving zeros` — which the record itself uses as a grep needle when
-triaging (`known-issues.md`, the cache-eviction investigation: *"grep over the
+triaging (`specs/issues/`, the cache-eviction investigation: *"grep over the
 failing run's serial finds zero of `could not be cached`, `serving zeros`, …"*)
 — cannot be produced by the ESP path at all. Measured: 0 occurrences in this
 session's `usb_storage_gate` boot, and there is no string it could have emitted.
@@ -346,7 +346,7 @@ if dev.read_at(extent.offset + within, &mut buf[done..done + n]).is_err() {
 ```
 
 **What it deletes.** Nothing. What it restores is one row of a three-row
-invariant that the known-issues entry asserts and that is currently 2/3 true.
+invariant that the `specs/issues/` entry asserts and that is currently 2/3 true.
 
 ### F4 (medium). The device's logical block size travels beside the device instead of inside it
 
@@ -650,7 +650,7 @@ needs a length, not a bound.
   usb-storage.md F11 and F9; F9 is fixed (`9cb9916`), F11's sentence is still
   there and still filed.
 - **`esp_log`'s "It costs nothing when nothing is logged".** Filed — CLAUDE.md's
-  known-issues entry carries the correction (userland `println!` is in the same
+  `specs/issues/` entry carries the correction (userland `println!` is in the same
   ring, so "nothing is logged" is not the idle state).
 - **`FileSystem`'s `Result<(), &'static str>` error channel.** Stringly typed,
   and `EspFs` maps `toyos_fat32::Error` into two of them at `:612-617`. It is the
