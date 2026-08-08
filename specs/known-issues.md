@@ -3217,6 +3217,85 @@ does not make the transfer interruptible, and any other unbounded I/O reached
 from the idle loop inherits the same hazard. The measurement that would size it
 is a metal boot with the fix in — the owner's next one.
 
+### CLOSED 2026-08-08 — every HDA machine played 8.8% sharp: the stream format's sample-base bit was one place low
+
+`toyos_hda::stream::stream_format` built the base-rate bit at bit 13. The Intel
+HDA stream-format structure puts it at bit 14 and the three bits below it are
+the multiplier, so 44.1 kHz came out `0x2011` — a 48 kHz base carrying
+multiplier field `0b100`, which the field reserves — where the specification's
+value is `0x4011`. `SDnFMT` and the codec's `Set Converter Format` both carried
+it, so the controller and the codec agreed with each other and disagreed with
+soundd, which generated every buffer for 44100.
+
+Measured, `hda_tone` on the `intel-hda` profile, same session:
+
+| | capture pitch | dither ratio | soundd `completions` per 2 s window |
+|---|---|---|---|
+| before | 478.9 Hz | 3.3% | 764 |
+| after | 440.2 Hz | 24.4% | 695 |
+
+440 × 48000/44100 = 478.91. The owner's T14 log says the same thing from the
+other side: 751 completions per 2.000 s window is a 2.664 ms period, and 128
+frames in 2.6667 ms is 48 kHz (`specs/metal-logs/2026-08-08-audio-underruns/`).
+
+**The dither column is the second finding.** `analyze`'s silence band is derived
+from soundd's ±1 LSB TPDF dither and the expectation is 25%; 3.3% is QEMU's
+audio core resampling 48000 → 44100 into the wav backend and smearing it away.
+So **every earlier `hda_tone` capture was taken through a resampler that is now
+gone**, and the two verdicts below that rest on such a capture — #88's phase
+breaks and the mid-tone silence — have to be re-judged on a fresh sample rather
+than carried forward. Neither `EXPECTED_FAILURES` entry is touched here.
+
+Nothing in the tree could see it. `phase_breaks` cannot: an 8.8% pitch error
+perturbs its recurrence by about 12 LSB against a 400 LSB tolerance. The gap
+detector cannot, the peak check cannot, and soundd's own counters cannot — the
+DLL locks onto whatever the device does. The gate that closes it is
+`audio::wrong_pitch`, asserted by `hda_tone` and by all four gate A configs,
+with a band of 4.4% because the two rates the field can name are 8.8% apart.
+`toyos-hda`'s own gate is
+`every_rate_linux_tabulates_encodes_to_the_number_linux_tabulates` — twelve
+values from Linux's `rate_bits[]` table, a second implementation of the same
+specification, so no restatement of this crate's own arithmetic can agree with
+it — plus a round trip that decodes each built format back to the rate it was
+asked for.
+
+### OPEN, UNASSIGNED — the residual T14 underruns are the *client's* CPU taking the log flush, not soundd's
+
+`specs/metal-logs/2026-08-08-audio-underruns/` is the boot: 54 windows, **686
+underruns, 5 drains**, on the tree that already carries
+`flush_log_file_if_affordable`. Drains fell 375 → 5; underruns did not.
+
+The correlation runs the wrong way for a soundd defect. Underruns land in
+windows where soundd is *on time* (`max_batch=1`, worst wake 461–1130 µs), and
+the four windows where soundd was stalled 40–45 ms report underruns 0, 0, 0, 23
+— being late gives the client more time, not less. `max_batch=8` with
+`underruns=0` also settles the ring's shape: soundd consumed eight client
+periods in one cycle and every one was covered, so the ring is normally its full
+eight periods = 21.3 ms deep, and an empty one is a producer that stopped for at
+least that long. `/bin/tone` is one of the producers that stops and its callback
+is a sine, so it is not the client computing; it is the client not running.
+
+**The hypothesis, and it is the previous entry's fix seen from the other side.**
+`owes_deadline()` asked whether a task parked on this CPU expects a wake *at a
+time*. An audio client parks on a pipe with no deadline at all — it is woken by
+an event, by an RT daemon that expects it back inside one period — so the test
+could not see it, and the flush moved off soundd's CPU onto its client's, where
+it costs the same audio. Changed to `owes_wake()`: any parked task at all, with
+`LOG_DEFERRAL_CEILING_NS` unchanged. The T14 reports CPUs at `parked=0`
+throughout this log, so there is somewhere for the flush to go.
+
+**Unverified, and only the owner's next boot can verify it** — QEMU's `/log` is
+a fast virtual disk and the whole audio family reports `underruns=0` on this
+host either way. What to read on that boot:
+
+- `starve_max=` is new on soundd's stats line: the longest unbroken run of
+  underrun periods. Near 1 with a large `underruns` kills the hypothesis
+  outright — that is a client missing by a hair, not one that stopped. 8–20 is a
+  stall of 21–53 ms, which is the flush.
+- `max_wake_lat_us`'s cluster should move from ~2690 to ~2902 µs, because it is
+  one device period and the period is now the right one.
+- Everything should sound a tone and a half lower than it did.
+
 ### CLOSED 2026-08-08 — `/bin/tone` accumulated its phase in `f32`, so the tone the owner judges the machine by was flat and dirty
 
 `userland/toybox/src/tone.rs` advanced `phase: f32` by one increment per frame
@@ -4880,7 +4959,10 @@ construction. Found 2026-08-07 while pricing that stage — the 2026-07-29 versi
 of that document listed this as one of eight items a USB storage driver would
 have to bring, and it is the one that did not arrive with it.
 
-### Nothing gates doom's music, and nothing ships a SoundFont to gate it with
+### CLOSED — nothing gated doom's music, and nothing shipped a SoundFont to gate it with
+
+**Closed 2026-08-08 by `wt/toyos-doommusic`: the image ships a SoundFont again
+and `doom_music` plays it at the device.**
 
 The original finding: `b34a69c` filtered the asset sweep to what git tracks and
 took `assets/timgm6mb.sf2` out of every image; the full suite was green with it
@@ -4888,27 +4970,57 @@ and without it, `doom_sound_flood` included — that actuator "synthesises its o
 sound and never opens the WAD or the soundfont". The only evidence anywhere was
 one `assets: skipping` line in the build output. `fdcaa0b` restored the file and
 made a declared-but-absent asset a hard error, so for a while the *file* was
-gated even though the music was not.
+gated even though the music was not. `b8b0749` then removed it for the licence —
+TimGM6mb is GPL-2.0 under an MIT OR Apache-2.0 tree — which fixed the licence
+and left the milestone unmet.
 
-**The file is now deliberately absent and the hard error is gone** — the owner's
-decision, 2026-08-08. TimGM6mb is GPL-2.0 and this tree is MIT OR Apache-2.0, so
-shipping it put copyleft obligations on anyone redistributing an image; every
-permissive General MIDI replacement is around six times the size of the image's
-largest entry, and the image is already too big. Music is opt-in from a `.sf2`
-dropped in as `assets/soundfont.sf2`; a declared entry the build cannot find is
-named and skipped; the absence is stated at build time and again by
-`toyos_music_init`'s "playing without music". `system.toml` names GeneralUser GS
-(CC-BY-4.0) as the recommended one and records that its author cannot be certain
-of every sample's origin.
+**What shipped.** `assets/soundfont.sf2`, 15,546,764 bytes: GeneralUser GS
+v2.0.3 cut down by `src/soundfont.rs` to the 37 melodic programs and 23
+percussion keys `assets/DOOM1.WAD`'s own MUS headers select. `NOTICE` carries
+its licence and the author's provenance caveat; `specs/doom-music-soundfont.md`
+prices every option including the zero-byte OPL3 one the owner may take later.
+The default image goes from 131,072,000 to 148,897,792 bytes, both measured in
+one session.
 
-**What is left is the ungated half this entry was always about, and it is now the
-normal case rather than an accident.** Nothing asserts doom's synthesiser
-produced anything, so a defect between a SoundFont and the sink is invisible to
-`cargo test` — and on CI, on a fresh clone and in every worktree there is now no
-SoundFont for such a defect to be found with at all. Gate A measures the test
-tone and doom's sound-stress actuator; neither is the music path. A gate on
-music would have to carry a permissively-licensed `.sf2` of its own, which is
-the same licence question one size down, and that is why there is not one.
+**Three gates where there were none.** In `cargo test --lib`, seconds and no
+guest: the shipped bank sounds every instrument the shipped WAD selects, carries
+nothing else, and still holds its source's `ICOP` and licence text — both halves
+read from the files that ship rather than from a list somebody typed, so a
+missing file, a truncated one and a bank subset against a different WAD all land
+there. In the guest, `doom_music` on `tests/doommusiccase`:
+`/bin/doom --music-check` converts `D_E1M1` through the real `mus2mid.c` and
+rustysynth and plays it at the real device, and the host asserts the byte count
+doom opened against `assets/soundfont.sf2` on disk, 1,033 mixed periods, and
+signal in the capture. First green run: 1.20 s of signal in a 3.13 s capture at
+peak 13,547, 0 underruns.
+
+**What is still not gated** is how *well* it plays. A stutter in the music is
+gate A's question and one boot of one track is one sample of an intermittent, so
+`doom_music` reports underruns and fails on none. The synthesis needs no gate
+here: `specs/doom-music-soundfont.md` §4 renders all 13 tracks bit-exact against
+the full bank, through the same `mus2mid.c` and the same rustysynth the guest
+runs.
+
+### Four configs ship doom's assets into initrds holding nothing that can open them
+
+`assets = ["assets"]` sweeps the directory whole and there is no way to name
+part of it, so `console/`, `tests/desktopcase`, `tests/desktopaudiocase` and
+`tests/metalcase` each carry `DOOM1.WAD` (4,196,020 B) and now
+`soundfont.sf2` (15,546,764 B) into an image with no doom in it. This is
+`specs/boot-image-split.md` §5's shape, four times bigger: that section records
+the same four configs paying 5,994,284 B for TimGM6mb when
+`untracked-assets` declared it in configs that did not build doom.
+
+**Measured before it was left alone**, 2026-08-08, one session, same worktree:
+`metal_sim_compositor` is 8 s either way, and the harness's own boot probe moves
+from 1,445 ms to ~1,485 ms — about 40 ms of boot for 15.5 MB of initrd. The
+flashable `--console-boot` image grows by the same 15.5 MB, which matters more
+to whoever writes it to a stick than to the suite.
+
+The fix is per-config asset selection — `assets` naming files as well as
+directories — and it changes what five configs ship, under screen tests that
+read pixels off four of them. Not worth 40 ms; worth doing when something else
+touches that code.
 
 ### No test boots the config the project ships
 
@@ -5099,13 +5211,12 @@ changes.
   (PASS). The absolute figure moved 277→619 ms across three runs of one boot
   with no code change, so what the allowance is being asked to absorb is the
   host, and a serial slot inside one suite does not buy a quiet one.
-- **`usb_transport_break`** — now `Sched::Serial`, and the cause is known: the
-  second line is not a second staged break but the driver's *recovery* retrying,
-  `transport broke on SCSI 0x2a: command phase completion code 6` against an
-  endpoint still halted from the injected one. Recovery still succeeds. So one
-  staged break and no other makes "the recovery finished on its first try" part
-  of the verdict, and how many tries it takes is how much of the host the guest
-  had.
+- **`usb_transport_break`** — now `Sched::Serial`. The cause written here was
+  wrong and the correction is in §8, *a Bulk-Only Reset that raced the transfer
+  it was recovering from*: the second line is the **device** stalling the next
+  command block, on an endpoint the recovery found Running and not halted, and
+  it was a driver defect that lost the caller's write rather than a count of how
+  much of the host the guest had. Closed.
 - **`desktop_typing_damage`** — `nothing typed at the terminal window reached a
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
@@ -6906,6 +7017,86 @@ else is a break this test did not stage`. That is the one member of this class
 that is still reproducible, and it is the one to take: it is not a ceiling, it is
 the driver reporting a second break nobody staged.
 
+**Taken, and it was the driver.** The entry below closes it.
+
+### CLOSED — a Bulk-Only Reset that raced the transfer it was recovering from
+
+`usb_transport_break`, red 5 of 5 in run `31258202923` and green on the dev host
+off the same tree. **The two `transport broke` lines are not the same break**,
+which is the thing the failure message never let anyone see:
+
+```
+usb-storage: transport broke on SCSI 0x2a: no answer in the data phase in 2000 ms
+xHCI: slot 2 endpoint 3 is Running, recovering
+xHCI: slot 2 endpoint 4 is Running, recovering
+usb-storage: transport broke on SCSI 0x2a: command phase completion code 6
+xHCI: slot 2 endpoint 3 is Stopped, recovering
+xHCI: slot 2 endpoint 4 is Halted, recovering
+usb-gate: readback of block 8388606 differs at byte 0: 0x00 not 0x3f
+usb-gate: disk done reads=ok writes=bad refusal=true wr_err=2 healthy=true
+```
+
+The first is the injection, which can produce `Broke::Silence` and nothing else
+— `transport_break::arm` spends a `UNSPENT.swap(false)`, so the actuator really
+is armed once per boot. The second is **completion code 6, Stall Error, on a
+command block**: the device refusing the next CBW. So the driver broke the
+transport a second time by itself and lost two writes doing it, one of them the
+block the readback then found empty. The reading where the *actuator* fires
+twice was never available; the message asserted it anyway, which is what a
+count in a failure line does when the thing counted has two causes.
+
+**The window is the driver's.** A transfer it stopped waiting for is not a
+transfer that is over: it is still the controller's to run and still the
+device's to answer. `reset_recovery` issued the Bulk-Only Mass Storage Reset
+*first* and restarted the endpoints after, so the device's answer landed on a
+state machine the reset had already rewound. QEMU 11.0.3's `hw/usb/dev-storage.c`
+is explicit about it: `ClassInterfaceOutRequest | MassStorageReset` sets
+`s->mode = USB_MSDM_CBW` and does **not** cancel `s->req`, and the late
+`usb_msd_command_complete` then takes `else if (s->data_len == 0)` and sets
+`s->mode = USB_MSDM_CSW` back over it. An OUT token in CSW mode reaches
+`default: goto fail` and is stalled. **Who wins that race is the whole
+difference between the two accelerators** — the aio completes long before a TCG
+guest reaches the reset and after a KVM one every time — and nothing about it is
+QEMU-only: a stick whose firmware finishes the command it was handed is the same
+picture, on the machine whose boot disk this is.
+
+Closed by two changes, neither a conditional:
+
+- **The order is structural.** `restart_endpoint` splits at the one act of a
+  recovery that puts a packet on the bus: `quiesce_endpoint` runs every command
+  `Recovery` owes and answers with `Owed`, and `reset_the_device` — the class
+  request *and* both CLEAR_FEATUREs, everything the driver says to the device —
+  takes both endpoints' `Owed` as its arguments. No order of `reset_recovery`'s
+  three lines speaks to the device first. `toyos-xhci`'s
+  `the_bus_is_reached_only_after_every_command` is what makes that a split of
+  the sequence rather than a reordering of it.
+- **Reset Recovery restores the transport and says nothing about the command**,
+  so `scsi` re-issues it. `MAX_TRANSPORT_ATTEMPTS` is 3 and is derived rather
+  than tuned: there is one abandoned transfer, it is answered once, so it can
+  undo one recovery.
+
+Proof, run `31264371902` — two arms on one runner, three reps each, one filtered
+test per job: **control (main's driver, recovery sequence and test dropped back
+into the branch's tree) 3 of 3 red**, each red twice counting its `ALONE: red
+again` re-run, the same sentence every time; **fixed 3 of 3 green**, `1
+break(s)` each and every block verified host-side. The whole twelve shards on
+the same tree (run `31264372439`) have `usb_transport_break` green in shard 6.
+
+**The test is stronger than it was.** It asserted `wr_err=1` and excluded the
+broken block from the host-side verify — the driver's lost write written into
+the harness as an expectation, and `verify_except` existed for that one caller.
+It now asserts `wr_err=0` and verifies every block. Counting `transport broke`
+was counting who won a race, so what is counted is the staged sentence, exactly
+once, with the total bounded at two by the same derivation as the attempt count
+and the driver's own give-up line a red.
+
+**What this does not explain.** `xhci_flap` is untouched by it: that is
+plug/unplug and port re-enumeration, with no Bulk-Only Reset Recovery anywhere
+in it, so its entry stays open on its own evidence. And
+`specs/test-cost-audit.md` §5.5's reading of this same line — "the driver's
+recovery retrying against an endpoint still halted from the staged break" — is
+wrong twice over: the endpoint was Running, and what stalled was the device.
+
 ### CLOSED — a `Task::Machine` group had the blast radius the shared block lost
 
 Run `31247206462`, shard 5, the metal-sim group re-run **alone**:
@@ -6937,7 +7128,7 @@ all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
 
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|
-| `usb_transport_break` | **5/5** | 6 | Serial | the transport broke 2 times; the injection is armed once per boot |
+| ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — §8, a Bulk-Only Reset that raced the transfer it was recovering from |
 | `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, see §1's x87 entry |
 | `std_unwind_so` | **5/5** | 10 | shared block | the same |
 | `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine — **closed below** |

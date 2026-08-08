@@ -1,7 +1,7 @@
 mod qemu;
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One prerequisite: any of `any` satisfies it, and `why` is what reaches it.
 struct Tool {
@@ -136,6 +136,15 @@ fn main() {
 
     if args.iter().any(|a| a == "--regen-wallpaper") {
         toyos_build::wallpaper::regen(&root);
+        return;
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--regen-soundfont") {
+        let source = args.get(pos + 1).unwrap_or_else(|| {
+            panic!("--regen-soundfont needs the whole General MIDI bank to cut down: \
+                    --regen-soundfont <bank.sf2>")
+        });
+        toyos_build::soundfont::regen(&root, Path::new(source));
         return;
     }
 

@@ -11,26 +11,13 @@ init = [
 ]
 
 hosted-rustc = false
-assets = ["assets"]
 
-# doom's music, and it is opt-in: this repository ships no SoundFont, because
-# the one it used to carry (TimGM6mb) is GPL-2.0 and this tree is MIT OR
-# Apache-2.0, so an image built with it put copyleft obligations on whoever
-# redistributed one. Drop a `.sf2` here under this name and doom plays music;
-# leave it out and the build says so by name and doom says so again at startup.
-# GeneralUser GS (32,319,396 B) is the recommended one. Its licence is a bespoke
-# "License v2.0" by S. Christian Collins, not CC-BY-4.0 as this said until the
-# author's own text was read, and he states he cannot be certain of every
-# sample's origin — worth knowing before redistributing an image built with it.
-# MuseScore_General is the clean-licence alternative (MIT, named copyright
-# chain) and is out on size, not on format: its `.sf2` is 215,614,036 B, and the
-# 39,900,972 B `.sf3` is Vorbis-compressed, which rustysynth refuses outright.
-# `specs/doom-music-soundfont.md` prices every option, including a subset that
-# renders bit-exact at 15,546,748 B and a zero-byte OPL3 path.
-#
-# Named here because a sweep cannot tell an untracked SoundFont from a
-# .DS_Store, and only here: this is the only config that builds doom.
-untracked-assets = ["soundfont.sf2"]
+# `assets/soundfont.sf2` is in here and is doom's music: GeneralUser GS cut down
+# to the 37 melodic programs and 23 percussion keys `assets/DOOM1.WAD`'s own MUS
+# headers select, by `src/soundfont.rs`. `NOTICE` carries its licence and the
+# provenance caveat that comes with it; `specs/doom-music-soundfont.md` prices
+# the alternatives, including the zero-byte OPL3 path that may one day delete it.
+assets = ["assets"]
 
 [programs]
 shell = {}

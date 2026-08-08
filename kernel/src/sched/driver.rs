@@ -711,11 +711,11 @@ static LOG_DEFERRED_SINCE: AtomicU64 = AtomicU64::new(0);
 /// whose whole duration `xhci::wait_transfer` spends with preemption disabled.
 /// It cannot be abandoned once begun, so the only place to decline is before.
 ///
-/// A CPU that owes a wake *at a time* is the wrong one to spend it: a task
-/// parks on the CPU with nothing else to run, so the CPU an audio daemon is
-/// waiting on is exactly the CPU that reaches this loop first. Whoever owes
-/// nothing takes the bytes instead — and if nobody has for
-/// [`LOG_DEFERRAL_CEILING_NS`], this CPU takes them anyway.
+/// A CPU that owes a wake is the wrong one to spend it: a task parks on the CPU
+/// with nothing else to run, so the CPU an audio daemon is waiting on is
+/// exactly the CPU that reaches this loop first. Whoever owes nothing takes the
+/// bytes instead — and if nobody has for [`LOG_DEFERRAL_CEILING_NS`], this CPU
+/// takes them anyway.
 ///
 /// The one writer of the deferral clock, so that [`log_file_flush_due`] can
 /// answer the pre-halt check without consuming an expiry this has not acted on.
@@ -724,7 +724,7 @@ fn flush_log_file_if_affordable() {
         LOG_DEFERRED_SINCE.store(0, Ordering::Relaxed);
         return;
     }
-    if owes_deadline() {
+    if owes_wake() {
         let now = crate::clock::nanos_since_boot().max(1);
         match LOG_DEFERRED_SINCE.load(Ordering::Relaxed) {
             0 => {
@@ -744,7 +744,7 @@ fn log_file_flush_due() -> bool {
     if !crate::drivers::log_ring::file_has_pending() {
         return false;
     }
-    if !owes_deadline() {
+    if !owes_wake() {
         return true;
     }
     match LOG_DEFERRED_SINCE.load(Ordering::Relaxed) {
@@ -816,15 +816,21 @@ pub fn parked_len() -> usize {
     try_with_cpu(|cpu| cpu.parked().count()).unwrap_or(0)
 }
 
-/// Does a task parked here expect to be woken at a time, rather than by an
-/// event? The idle loop's admission test for unbounded I/O.
+/// Is any task parked here? The idle loop's admission test for unbounded I/O.
+///
+/// A deadline is not the question, though it was: a timed waiter is only the
+/// subset of owed wakes whose *time* this CPU happens to know, and the audio
+/// path's producer is not in it — a client filling soundd's ring parks on a
+/// pipe with no deadline at all, and is woken by an RT daemon that expects it
+/// back inside one 2.9 ms period. Deferring only for deadlines steers the flush
+/// off the daemon's CPU and onto its client's, where it costs the same audio.
 ///
 /// A CPU cannot answer for a sibling, and does not need to: the question is
 /// only ever asked about the CPU that is about to spend the time. `true` when
 /// the answer is unavailable — declining costs a trip round the loop, and
 /// proceeding costs whatever the device takes.
-pub fn owes_deadline() -> bool {
-    try_with_cpu(|cpu| cpu.earliest_deadline().is_some()).unwrap_or(true)
+pub fn owes_wake() -> bool {
+    try_with_cpu(|cpu| cpu.parked().next().is_some()).unwrap_or(true)
 }
 
 /// The thread this CPU has loaded, if any.

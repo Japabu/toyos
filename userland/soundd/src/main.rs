@@ -476,6 +476,17 @@ struct MixStats {
     /// narrower than `submitted`, which like `wakes`/`completions`/`drains`
     /// covers the whole time soundd has clients.
     underruns: u32,
+    /// The longest unbroken run of them, which is the silence a listener
+    /// actually hears — 54 scattered singles and one gap of 54 are the same
+    /// `underruns` and are not the same defect. It is also the only thing that
+    /// separates a client that never had margin from one that lost it: the ring
+    /// is eight periods deep, so a run past one is a producer that stopped for
+    /// a measurable time rather than one that missed a deadline by a hair.
+    starve_max: u32,
+    /// The run [`starve_max`](Self::starve_max) is the maximum of. Working
+    /// state, not a field of the report; a run crossing a window boundary is
+    /// counted in both, which understates it and never invents one.
+    starve_run: u32,
     /// Cycles that found the whole DMA pipeline free (§5.9) *and* could only
     /// have got there by soundd being late. A device that retires the pipeline
     /// faster than it plays it empties the free list without soundd having
@@ -493,10 +504,25 @@ struct MixStats {
 }
 
 impl MixStats {
+    /// Account one period, whichever sink played it.
+    fn period(&mut self, streaming: bool, covered: bool) {
+        if !streaming {
+            return;
+        }
+        if covered {
+            self.starve_run = 0;
+            return;
+        }
+        self.underruns += 1;
+        self.starve_run += 1;
+        self.starve_max = self.starve_max.max(self.starve_run);
+    }
+
     fn report(&self, clients: usize) {
-        eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={}",
+        eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={}",
             self.wakes, self.completions, self.submitted, self.underruns, self.drains,
-            self.max_wake_lat_ns / 1_000, self.max_batch, clients, self.deferred);
+            self.max_wake_lat_ns / 1_000, self.max_batch, clients, self.deferred,
+            self.starve_max);
     }
 }
 
@@ -1200,7 +1226,7 @@ fn mix_thread(
             playout_until_ns = playout_until_ns.max(now) + period_nanos;
             refilled = true;
             stats.submitted += 1;
-            if any_streaming && !any_data { stats.underruns += 1; }
+            stats.period(any_streaming, any_data);
         }
         // Deferred buffers stay free and are reconsidered next cycle, by which
         // point the client has had another signal-to-mix window to produce.
@@ -1398,9 +1424,7 @@ fn null_sink_thread(
             // The mix is discarded here — no dither, no DMA buffer, no submit.
             stats.submitted += 1;
             stats.completions += 1;
-            if any_streaming && !any_data {
-                stats.underruns += 1;
-            }
+            stats.period(any_streaming, any_data);
             next_period_ns += period_nanos;
             batch += 1;
         }
