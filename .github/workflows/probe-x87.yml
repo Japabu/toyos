@@ -1,0 +1,109 @@
+name: x87-probe
+
+# **Does `fault_gates` leave the FPU dirty for the rest of the boot?**
+#
+# `std_unwind` and `std_unwind_so` are red 5 of 5 in the shared block on CI
+# (run `31258202923`) and green 5 of 5 alone. The kernel's own account, once the
+# harness stopped throwing it away, is a **#MF**:
+#
+#   !!! FAULT rip=0x10000097176 cr2=0x0 err=0x0 ... tid=1
+#   SIGFPE tid=1: x87 floating-point exception
+#     rip: unwinding::unwinder::with_context::delegate::<..., _Unwind_RaiseException...>
+#
+# on the *spawned* thread, on cpu0, where the process's main thread was spawned
+# on cpu1. `specs/known-issues.md` §1 records that **no context switch saves x87
+# state**, and `fault_gates`' `mf` arm is the only thing in this tree that
+# executes an x87 instruction at all: it unmasks IM, computes 0/0 and expects the
+# `fwait` two bytes later to trap. If the kernel kills the child at that `fwait`,
+# the trailing `fninit` never runs and that CPU's FPU keeps IM unmasked with IE
+# and ES set — waiting for the next thread scheduled there to execute anything
+# x87.
+#
+# One actuator, one token: `cw = 0x037F` masks every x87 exception, so the same
+# sequence runs, `fdivp` still raises IE, and nothing is left pending. Everything
+# else about the boot is identical. If `std_unwind` is red in `control` and green
+# in `masked`, the mechanism is proven and the defect is the missing save.
+#
+# Three reps per arm, because one green of an intermittent test is one sample.
+# Shard 10 of 12 is the one carrying the 153-test shared block on this tree.
+
+on:
+  push:
+    branches: ['ci/probe-x87']
+  workflow_dispatch:
+
+jobs:
+  x87:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [control, masked]
+        rep: [1, 2, 3]
+    container:
+      image: debian:sid
+      options: --device=/dev/kvm
+    steps:
+      - name: deps
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            git curl ca-certificates jq zstd xz-utils build-essential \
+            qemu-system-x86 > /dev/null
+          qemu-system-x86_64 --version | head -1
+          grep -m1 'model name' /proc/cpuinfo
+
+      - uses: actions/checkout@v4
+
+      - name: rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
+          for _ in $(seq 90); do
+            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
+              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
+            [ -n "$asset" ] && break
+            sleep 60
+          done
+          test -n "$asset"
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
+          mkdir -p rust/build
+          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
+          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+
+      - name: mask the x87 exception
+        if: matrix.arm == 'masked'
+        run: |
+          f=tests/toyos-rust-tests/src/bin/fault_gate_child.rs
+          sed -i 's/let cw: u16 = 0x037E;/let cw: u16 = 0x037F;/' "$f"
+          grep -n 'let cw: u16' "$f"
+
+      - name: the shared block
+        run: |
+          set -o pipefail
+          cargo test --test toyos-build -- \
+            --shard 10/12 --jobs 1 --host-slots 0 2>&1 | tee /tmp/suite.log \
+            || echo "SUITE-EXIT: $?"
+          echo "PROBE ${{ matrix.arm }} rep ${{ matrix.rep }}:"
+          grep -E '^  (PASS|FAIL|STALL) +(std_unwind|std_unwind_so|fault_gates) ' \
+            /tmp/suite.log || echo "  none of the three reported"
+
+      - name: the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x87-${{ matrix.arm }}-${{ matrix.rep }}
+          path: /tmp/suite.log
+          retention-days: 5

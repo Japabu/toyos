@@ -10333,6 +10333,22 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                 let outcome = catching(|| {
                     run_machine_test(name, bins.test_config, bins.c_bins, bins.rust_bins, &mut held)
                 });
+                // **A member that failed does not hand its guest on.** The
+                // shared block answers a boot that stopped answering with a new
+                // one; a group's guest is the same single point of failure and
+                // that repair does not reach it, because a member's body is
+                // arbitrary Rust with no `===TEST_START` for `started` to read.
+                // What a group *does* have is a verdict per member, and one that
+                // failed is reason enough not to make the next member's answer
+                // about the same machine. Run `31250706113`: three members
+                // behind one, `metal_sim_client_death` last and reported at
+                // 364 s of a ceiling for a desktop that had gone.
+                //
+                // Bounded by the group — six members at most, so at most six
+                // boots where there would have been one, and only on a red.
+                if outcome.is_err() {
+                    held = None;
+                }
                 send(name.to_string(), outcome.err(), start);
             }
         }

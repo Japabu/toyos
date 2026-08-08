@@ -635,28 +635,93 @@ was re-run **as the other test** and its `ALONE:` line described neither. The
 four are in `RUST_SKIP` now — each name's own test still runs, on the machine it
 needs — and `check_no_collisions` refuses the next one.
 
-## 8. What CI buys that the dev host cannot
+## 8. Two instruments, and what each one is evidence for
 
-- **A machine that can run these guests natively.** The dev
-  host is arm64 and every guest on it is cross-arch TCG, whose distortion
-  CLAUDE.md records at 1.06×–6.5× and non-uniform; the "every component within
-  2× of a production OS" bar is unmeasurable there.
-- **A second architecture of *host*.** Even under TCG, x86-on-x86 exercises code
-  paths — `syscall`/`sysret`, segmentation, the APIC — that cross-arch TCG
-  reimplements. §7 was found this way before KVM was even reached.
-- **No shared sysroot.** Every runner has its own, keyed on the branch's own
-  four trees, so the contention `specs/worktrees.md` §3.1–§3.2 describes — a
-  claim that refuses every other worktree, measured at 35 and 50 minutes of
-  nobody being able to build — does not exist there. Observed while writing
-  this: the local guest suite could not be run at all for the length of another
-  agent's ABI change.
+**They run the same 292 tests and they are not the same measurement.** Nothing
+in either one says so, so an agent who reads a CI red as a dev-host red — or the
+reverse — draws a conclusion neither machine supports. That is exactly the shape
+§7 was: a class of defect the dev host cannot see at all, invisible for as long
+as it was the only machine.
+
+| | dev host | a CI shard |
+|---|---|---|
+| host arch | arm64 (M4 Pro, 14 cores) | x86_64, 4 cores (Azure vCPU) |
+| guest | cross-arch TCG | **KVM**, `-cpu host` |
+| host CPU vendor | one | AMD EPYC or Intel Xeon, **not selectable** |
+| QEMU | 11.0.3 (brew) | 11.0.3 (`debian:sid`) — deliberately the same |
+| guests at once | up to twelve, `buildlock::guest_slot` | **one**, `--jobs 1` |
+| other load | every other worktree's build and suite | nothing |
+| sysroot | one, shared, claimable | its own, keyed on the branch's four trees |
+
+### 8.1 What only CI can answer
+
+- **Which vendor's reading of an instruction the kernel depends on.** A guest
+  that emulates `syscall`/`sysret`, segment loads or `iret`'s privilege checks
+  gives you one vendor's wording of it, and QEMU implements Intel's. §7 is the
+  worked example: `STAR[63:48]` was green on the dev host in every run there had
+  ever been and lost 64 boots of 64 on an EPYC. The `kvm` shards are the only
+  gate on that class, and the vendor is a lottery, which is why every job prints
+  its `model name`.
+- **What the guest does at native speed.** `xhci_flap` survives three collapsed
+  replugs and stops on the fourth under KVM, and is green under TCG on the same
+  runner image and the same QEMU, and green here — because the accelerator runs
+  the guest about fifty times further between the host's two QMP writes
+  (`specs/known-issues.md` §8). CI found a real driver defect the dev host has no
+  way of constructing.
+- **A machine that can run these guests natively at all.** The "every component
+  within 2× of a production OS" bar is unmeasurable under cross-arch TCG, whose
+  distortion CLAUDE.md records at 1.06×–6.5× and non-uniform.
+- **No shared sysroot.** Every runner has its own, so the contention
+  `specs/worktrees.md` §3.1–§3.2 describes — a claim that refuses every other
+  worktree, measured at 35 and 50 minutes of nobody being able to build — does
+  not exist there. Observed while writing this: the local guest suite could not
+  be run at all for the length of another agent's ABI change.
 - **A quiet host for gate A.** Each shard is its own VM, so
   `live_instances() == 0` holds by construction rather than by the suite
   arranging it, and no other agent's build is on that machine. The thorough tier
   is N boots per config strictly one at a time, so a second machine is the only
   thing that can shorten it: `--shard 1/2` and `2/2` put one audio test on each.
 
-## 8.1 Somebody has to push `main`
+### 8.2 What only the dev host can answer
+
+- **Anything about contention.** A shard is one guest on one machine, so
+  `HostSlots`, `buildlock::guest_slot`, `qemu::budget`'s width multiplier and the
+  whole `ALONE: GREEN` classification are untestable on a runner *by
+  construction* — there is never a second guest for the first to contend with.
+  `specs/known-issues.md` §7's parallel-red class is a dev-host phenomenon and CI
+  says nothing about whether it is fixed.
+- **Whether a `Sched::Parallel` is right.** Same reason: the answer requires two
+  guests. Every CI retry is the width-1 kind and says only that a test failed
+  once and passed once.
+- **The suite's own wall clock as a number anyone compares.** 292 tests in 536 s
+  on one machine against twelve shards spanning 273–530 s each; those are not two
+  readings of one quantity.
+- **A second architecture of host, for the parts that are not the accelerator.**
+  arm64-on-arm64 is where an ARM64 port would be gated, and there is no runner
+  that can do it (§9).
+
+### 8.3 How to read a disagreement
+
+**A red on one and green on the other is a finding about the difference, and
+about the tree only once the difference is named.** Both directions have already
+happened, and the second is the one that catches people:
+
+- **CI red, dev host green — and the tree was wrong.** §7's `SYSRET`. The dev
+  host could not execute the instruction.
+- **CI red, dev host green — and the *runner* was the variable.**
+  `desktop_typing_damage` on QEMU 8.2.2, green on 11.0.3 under the same
+  accelerator on the same runner image. Closed by putting the dev host's own QEMU
+  in the container rather than by touching the test.
+- **CI red at `--jobs 2`, dev host green at `--jobs 12`.** The whole i8042 family
+  in run `31241099454`. "Wider" and "more contended" are not the same axis: every
+  profile boots `-smp 2` and six tests boot `-smp 8`, so two lanes on four cores
+  is heavier oversubscription than twelve lanes on fourteen. Closed by one lane
+  per machine and twelve machines.
+
+The rule that falls out: **before believing a CI red is the tree, name what
+differs.** The candidates are short and they are all in the table above.
+
+## 8.4 Somebody has to push `main`
 
 `cargo run -- --land` fast-forwards the primary checkout and does not push, and
 the owner's rule is that an agent pushes its own branch and never `main`. At the
@@ -678,10 +743,20 @@ head has them. Three things need `main` itself to be current:
 
 One line in `src/land.rs` after the fast-forward closes all three
 (`git -C <primary> push origin main`), and it keeps the rule intact: `main`
-would still move only through `--land`. **Not done here** — it is a change to
-the landing protocol and to the owner's rule, and both are his. Until it is, a
-`main` that has stopped moving on GitHub is the thing to check first when CI
-looks stale.
+would still move only through `--land`. **Still not done, and still the owner's**
+— it is a change to the landing protocol and to his rule.
+
+**It bit, and the measurement is 2026-08-08.** `origin/main` was **31 commits
+behind** local `main` — every one of them the twelve-shard work — and the newest
+`ci` run on it (`31249540044`) is **1 h 18 m and red**, a configuration those 31
+commits replaced. Anyone reading this repository's default-branch CI was reading
+a stale config's failure.
+
+So `--land` now *says so*. `origin_main_lag` reads the local remote-tracking ref
+after the fast-forward and prints how far behind GitHub is, with the `git push`
+that closes it. It asks no remote — a landing may not go to the network,
+`--check-forks` is the command that does and says so — so an unfetched ref makes
+it a lower bound, which is why the line says "at least". It does not push.
 
 ## 9. Not done
 
