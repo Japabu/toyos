@@ -5329,6 +5329,14 @@ beside it — `ureq`, `webpki-roots`, `flate2`, `tar`, and `rustls-rustcrypto`
 pinned at `"0.0.2-alpha"`, which is hard to square with *"only general and often
 used rust crates"*. Making doomgeneric an ordinary fork takes all five with it.
 
+**And the downloads race the suite**, measured 2026-08-08 on this branch's first
+landing gate. A fresh worktree has no `assets/timgm6mb.sf2` — it is gitignored —
+so `metal_sim_compositor`, `metal_sim_pointer_churn` and `boot_partition_identity`
+red with *"declared in `untracked-assets` and is not there"*, while by the end of
+the same run the file was on disk with an mtime inside it and all three passed
+alone. Nothing sequences `download_soundfont` against the initrd builders that
+want its output, and the failure reads as a missing asset rather than as a race.
+
 ### OPEN — `dosfstools`, which was refused, is installed by a committed workflow
 
 `.github/workflows/probe-toolchain.yml:39` installs it beside `qemu-system-x86`

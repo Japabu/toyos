@@ -230,6 +230,17 @@ have no other purpose in the tree. `rustls-rustcrypto` is pinned at
 `"0.0.2-alpha"` — the manifest says so — which is hard to reconcile with *"only
 general and often used rust crates"* on any reading.
 
+**d. Measured today, by accident: the download races the suite.** The first
+landing gate on this branch — a fresh worktree, which has no `assets/timgm6mb.sf2`
+because it is gitignored — red on three tests with *"assets/timgm6mb.sf2 is
+declared in `untracked-assets` and is not there"*: `metal_sim_compositor`,
+`metal_sim_pointer_churn`, `boot_partition_identity`. By the end of that run the
+file was on disk with an mtime inside it, put there by `download_soundfont`, and
+all three passed alone. So the suite's greenness in a new worktree depends on
+whether doom's build script has finished a network fetch before the initrd
+builders of three configs ask for its output. Nothing sequences the two, and the
+failure reads like a missing asset rather than like a race.
+
 **Recommendation.** The SoundFont half is already being removed by another agent;
 this entry records the class rather than duplicating that work. The doomgeneric
 half is untouched and is the larger of the two: it should become a fork in
