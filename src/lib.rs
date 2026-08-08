@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod build;
 pub mod buildlock;
+pub mod durations;
 pub mod image;
 pub mod land;
 pub mod libc;

@@ -8258,7 +8258,22 @@ fn run_machine_test(
 
             // The churn has to have reached the guest, or this gate is a
             // twenty-second sleep with an assertion after it.
-            let bound = console.matches("merges as source").count();
+            //
+            // **Waited for rather than slept for.** The three `SETTLE` drains
+            // pace the *host* through one cycle; whether the guest's console has
+            // caught up by the last of them is a fact about how fast the machine
+            // is. On a KVM runner it had not — the last two cycles' bindings were
+            // still on their way out when the count was taken, and the test read
+            // six of eight as a driver that missed them (run `31246245541`,
+            // `specs/ci-plan.md` §7.3). The assertion is the same one; what
+            // changed is that a console behind the guest costs wall clock instead
+            // of a verdict.
+            let bindings = |text: &str| text.matches("merges as source").count();
+            let deadline = std::time::Instant::now() + qemu::budget(Duration::from_secs(20));
+            while std::time::Instant::now() < deadline && bindings(&console) < CYCLES {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            let bound = bindings(&console);
             if bound < CYCLES {
                 return Err(format!(
                     "{CYCLES} plug/unplug cycles bound {bound} pointer sources — the churn did \

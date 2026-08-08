@@ -1,6 +1,8 @@
-name: runner-probe
+name: larger-runner-probe
 
 # Whether a bigger machine can be bought for this repository at all.
+# `probe.yml` asks what the *free* labels are; this asks whether a paid one
+# resolves.
 #
 # GitHub's larger hosted runners are created by name, and the name is whatever
 # whoever created it chose; there is no label that simply works. These are the

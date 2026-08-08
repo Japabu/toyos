@@ -103,6 +103,11 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--merge-durations") {
+        toyos_build::durations::dispatch(&root, &args);
+        return;
+    }
+
     if args.iter().any(|a| a == "--worktree") {
         toyos_build::worktree::dispatch(&root, &args);
         return;
