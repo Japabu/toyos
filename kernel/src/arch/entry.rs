@@ -31,6 +31,45 @@ use core::mem::{align_of, size_of};
 
 use super::fpu::UserFpState;
 
+/// A gate whose handler can reach another task before it returns to Ring 3, and
+/// which therefore brackets the user machine state.
+///
+/// The type does not prove the bracket is there — nothing short of reading the
+/// assembly does. What it makes unrepresentable is installing a handler
+/// *without answering the question*, which is the same move `idt_vectors!`
+/// makes one level up for the error-code form: the classification is a column
+/// in one table and cannot silently disagree with the slot it fills.
+#[derive(Clone, Copy)]
+pub struct Ring3Entry(unsafe extern "sysv64" fn());
+
+/// A gate whose handler cannot reach another task, so it saves nothing.
+///
+/// There are two, and each says why at its row in [`idt_vectors`].
+///
+/// [`idt_vectors`]: super::idt
+#[derive(Clone, Copy)]
+pub struct Ring0Entry(unsafe extern "sysv64" fn());
+
+impl Ring3Entry {
+    pub const fn new(handler: unsafe extern "sysv64" fn()) -> Self {
+        Self(handler)
+    }
+
+    pub fn addr(self) -> u64 {
+        self.0 as *const () as u64
+    }
+}
+
+impl Ring0Entry {
+    pub const fn declare(handler: unsafe extern "sysv64" fn()) -> Self {
+        Self(handler)
+    }
+
+    pub fn addr(self) -> u64 {
+        self.0 as *const () as u64
+    }
+}
+
 // The bracket reserves `fp_bytes + fp_align` and aligns down, so the area fits
 // whatever the entry's incoming alignment was, and stashes the caller's `rsp`
 // in the slack immediately above it.

@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use super::entry::{restore_user_state, ring3_naked_asm, save_user_state};
+use super::entry::{restore_user_state, ring3_naked_asm, save_user_state, Ring3Entry};
 use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::mm::paging::CachePolicy;
@@ -105,7 +105,8 @@ pub fn init() {
 
     let star = ((gdt::STAR_SYSRET_BASE as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
     cpu::wrmsr(MSR_STAR, star);
-    cpu::wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
+    // `LSTAR` is an IDT slot by another name: the one thing `syscall` can reach.
+    cpu::wrmsr(MSR_LSTAR, Ring3Entry::new(syscall_entry).addr());
     cpu::wrmsr(MSR_FMASK, 0x40200); // mask IF (bit 9) + AC (bit 18) on SYSCALL entry
 }
 

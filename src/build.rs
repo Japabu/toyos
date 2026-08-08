@@ -298,6 +298,45 @@ fn stage_artifact(root: &Path, built: &Path, stem: &str, key: u64) -> PathBuf {
 /// with them off.
 const OVERFLOW_CHECK_MARKER: &[u8] = b"attempt to add with overflow";
 
+/// Refuse to build a kernel whose target has hardware float.
+///
+/// `arch::entry`'s bracket saves the user machine state at the ring transition
+/// and nowhere else, which is sound only because kernel code cannot disturb it:
+/// the FPU may be left dirty for a whole Ring 0 excursion because nothing in
+/// Ring 0 reads or writes it. That rests on one line of the target spec —
+/// `RustcAbi::Softfloat` and `+soft-float` in
+/// `rust/compiler/rustc_target/src/spec/targets/x86_64_unknown_none.rs` — and an
+/// edit turning it off would make every bracket in the kernel insufficient
+/// without changing a byte of `kernel/`. `specs/user-machine-state.md` §8.
+///
+/// Asked of the compiler rather than of the manifest, and once per process: it
+/// is a property of the toolchain rather than of any one image.
+fn assert_kernel_is_softfloat(path_env: &str) {
+    static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(|| {
+        let out = Command::new("rustc")
+            .args(["--print", "cfg", "--target", "x86_64-unknown-none"])
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("PATH", path_env)
+            .env_remove("RUSTFLAGS")
+            .env_remove("RUSTC")
+            .output()
+            .expect("rustc --print cfg failed to launch");
+        assert!(out.status.success(), "rustc --print cfg failed for the kernel target");
+        let cfg = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            cfg.lines().any(|l| l == r#"target_feature="x87""#),
+            "the kernel target no longer reports x87, so `arch::fpu`'s FXSAVE64 image is not \
+             the state this machine has:\n{cfg}"
+        );
+        assert!(
+            !cfg.lines().any(|l| l == r#"target_feature="sse""#),
+            "the kernel target has hardware float, so kernel code may now clobber the user \
+             machine state between `arch::entry`'s save and its restore:\n{cfg}"
+        );
+    });
+}
+
 /// Refuse to build an image whose kernel does not carry its overflow checks.
 ///
 /// [`PROFILE`] states them and `--release` is gone from this build system, so
@@ -619,6 +658,7 @@ pub fn build(
 
     let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
     assert_overflow_checked("kernel", &kernel_bytes);
+    assert_kernel_is_softfloat(&path_env);
     let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
     let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes);
     let image_path = root.join(boot.image());
@@ -821,6 +861,7 @@ pub fn build_test_image(
             {
                 let bytes = fs::read(&staged).expect("Failed to read staged kernel");
                 assert_overflow_checked("kernel", &bytes);
+                assert_kernel_is_softfloat(&path_env);
                 bytes
             }
         });
