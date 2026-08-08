@@ -19,11 +19,11 @@ concurrency:
 jobs:
   guest:
     runs-on: ubuntu-24.04
-    timeout-minutes: 110
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
 
@@ -72,10 +72,20 @@ jobs:
 
       # `--host-slots 0`: the semaphore arbitrates between worktrees on one
       # host, and a shard is a host with one suite on it.
+      #
+      # **`--jobs 2` on four cores, measured.** Run `31233476555` ran `--jobs 4`
+      # and the width, not the accelerator, was what was left: every profile
+      # boots `-smp 2` and six tests boot `-smp 8`, so four lanes is eight to
+      # thirty-two vCPUs on four, and a guest whose kernel spins with `IF` clear
+      # pays lock-holder preemption for all of it. The re-run-alone column is the
+      # whole argument — `netd_connection_caps` 551 s wide against 6 s alone,
+      # `metal_sim_input` 336 s against 4 s, `desktop_locale_detect` 51 s against
+      # 4 s. Two lanes and six shards keeps the wall clock and stops the suite
+      # measuring the runner.
       - name: suite
         run: |
           cargo test --test toyos-build -- \
-            --shard ${{ matrix.shard }}/4 --jobs 4 --host-slots 0
+            --shard ${{ matrix.shard }}/6 --jobs 2 --host-slots 0
 
       - name: what a red run left
         if: failure()
