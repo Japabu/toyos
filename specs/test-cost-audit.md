@@ -1147,11 +1147,14 @@ worktrees' suites:
 - **`i8042_mouse`: one discarded byte, green alone.** A pre-existing
   `Sched::Parallel`, red only under five concurrent suites.
 - **`usb_transport_break`: "the transport broke 2 times; the injection is armed
-  once per boot", green alone.** Also pre-existing, also five-suite load.
+  once per boot", green alone.** Also pre-existing — and not load at all, which
+  took until `specs/known-issues.md` §8 to establish. Five concurrent suites
+  slowed the host enough for the guest to win a race it loses on a quiet one,
+  which is the same variable KVM changes by 50x; the defect underneath was the
+  driver's, and load was only ever the thing that exposed it.
 
-The last two are in `specs/known-issues.md`. Neither was introduced here and
-neither reproduces on a host running one suite; both are exactly what the
-mechanism exists to surface.
+Both are in `specs/known-issues.md`. Neither was introduced here, and both are
+exactly what the mechanism exists to surface.
 
 ## 5.5 Wave 6: the regression, and pacing as the general fix
 
@@ -1279,10 +1282,16 @@ of it anyway, both fixes on their own terms and neither a response to the load:
 - `shell_answers` typed ten times with a flat two seconds between, a
   twenty-second ceiling on a desktop coming up that does not scale with the
   phase. Now `qemu::budget(20 s)`.
-- `usb_transport_break` is `Sched::Serial`. Its second `transport broke` line is
-  the driver's recovery retrying against an endpoint still halted from the
-  staged break, so "the recovery finished on its first try" was part of its
-  verdict. Costs 3 s of tail.
+- `usb_transport_break` is `Sched::Serial`. Costs 3 s of tail. **The reading of
+  its second `transport broke` line recorded here — "the driver's recovery
+  retrying against an endpoint still halted from the staged break" — was
+  wrong.** The endpoint was Running; what stalled was the *device*, refusing the
+  next command block because the Bulk-Only Reset had gone out while the
+  abandoned transfer could still be answered. A driver defect that lost a write,
+  not a measure of how much of the host the guest had
+  (`specs/known-issues.md` §8). The lesson for this document: a red attributed
+  to load without the mechanism being read out of the log is a guess, and a
+  costs table is where a guess stops being questioned.
 
 One caution recorded rather than resolved: a run under that contention wedged in
 the metal-sim desktop group — one vCPU at 100% for twenty minutes, no output,

@@ -605,7 +605,10 @@ the harness:
   `metal_sim_pointer_churn`, `usb_transport_break`, and `xhci_flap` from the
   probe. Every one drives `device_add`/`device_del` over QMP, every one is red
   again alone, and every one is green under TCG on the same runner image and the
-  same QEMU. `specs/known-issues.md` §8.
+  same QEMU. `specs/known-issues.md` §8. **`usb_transport_break` is closed and
+  belonged to the family only by its symptom** — it drives no QMP at all, and
+  what it shared with the rest is the one variable: a guest running 50x faster
+  wins a race against the device that a TCG guest loses.
 - **The `metal_sim` group and the desktop**: `metal_sim_client_death` red alone
   at 354 s, with `metal_sim_window_caps`, `metal_sim_ipc_hostile_peer` and
   `metal_sim_compositor_stall` behind it — the same blast radius the shared block
@@ -829,7 +832,7 @@ and every name that had been rotating is gone from both it and this probe:
 
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|
-| `usb_transport_break` | **5/5** | 6 | Serial | the transport broke 2 times; the injection is armed once per boot |
+| ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — the Bulk-Only Reset raced the transfer it recovered from (`specs/known-issues.md` §8) |
 | `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, §9.3 |
 | `std_unwind_so` | **5/5** | 10 | shared block | the same |
 | `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine |
@@ -958,6 +961,17 @@ soundd's device-less path (`metal_sim_null_audio`, `hda_two_live_refused`), the
 xHCI transport (`usb_transport_break`), HDA's mid-tone silence (`hda_tone`, §4)
 and x87 on the context switch (`std_unwind`, §9.3). Fixing those is what makes
 CI green, and none of it is CI.
+
+**One of the five is fixed, and it needed both instruments to be.** The xHCI
+transport red was a driver defect the dev host is structurally unable to see: a
+Bulk-Only Reset issued while the device could still answer the transfer it was
+recovering from, which a TCG guest is too slow to reach in time and a KVM guest
+wins every run (`specs/known-issues.md` §8). `probe-xhci-break.yml` is what
+settled it — the §7.3 pattern with a **control arm that drops main's driver back
+into the branch's tree**, so the reproduction and the fix are measured on one
+runner in one session: control 3 of 3 red, fixed 3 of 3 green, run
+`31264371902`. That control-arm shape is the reusable part; before it, every
+claim about a CI-only red rested on comparing two runs taken hours apart.
 
 ### Larger runners: not purchasable for this repository
 

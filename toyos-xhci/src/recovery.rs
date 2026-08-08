@@ -89,6 +89,18 @@ pub enum Act {
     /// knows this endpoint by. It clears the condition at the device, so it
     /// goes out only after a halt: an endpoint that never halted has nothing to
     /// clear and may stall the request for asking.
+    ///
+    /// **The only act of a recovery that puts a packet on the bus**, which is
+    /// the line a class driver has to cut its own device reset in at. Bulk-Only
+    /// Transport's Reset Recovery (BOT §5.3.4) is a class request followed by a
+    /// CLEAR_FEATURE on each bulk endpoint, and that class request may not go
+    /// out while either endpoint still holds a transfer the driver stopped
+    /// waiting for: the device answers that transfer afterwards, and the answer
+    /// lands on a state machine the reset has already rewound, so the transfer
+    /// being recovered from is what undoes the recovery. A command changes
+    /// nothing on the bus, so both endpoints' commands run first and the reset
+    /// goes between the halves — a split of this sequence rather than a
+    /// reordering of it, which is `the_bus_is_reached_only_after_every_command`.
     ClearHalt,
     /// The endpoint runs again. The driver queues its next transfer.
     Running,
@@ -244,6 +256,29 @@ mod tests {
             let dequeues =
                 acts[..n].iter().filter(|a| **a == Act::Command(Command::SetDequeue)).count();
             assert_eq!(dequeues, 1, "{state:?} issued {dequeues} Set TR Dequeue: {acts:?}");
+        }
+    }
+
+    /// A class driver with a device-level reset of its own runs the commands
+    /// both its endpoints owe, then that reset, then whatever is left — and
+    /// that is a *split* of this sequence rather than a reordering of it only
+    /// while no command follows an act that is on the bus. Bulk-Only
+    /// Transport's `reset_recovery` is the driver of it, and if this ever grew
+    /// a command after `ClearHalt` that driver would issue it before the
+    /// CLEAR_FEATURE without saying so.
+    #[test]
+    fn the_bus_is_reached_only_after_every_command() {
+        for state in [EndpointState::Halted, EndpointState::Running, EndpointState::Stopped] {
+            let (acts, n) = route(state).expect("recoverable");
+            let Some(bus) = acts[..n].iter().position(|a| *a == Act::ClearHalt) else {
+                continue;
+            };
+            let last_command =
+                acts[..n].iter().rposition(|a| matches!(a, Act::Command(_))).expect("a command");
+            assert!(
+                bus > last_command,
+                "{state:?} owes a command after it has spoken to the device: {acts:?}"
+            );
         }
     }
 
