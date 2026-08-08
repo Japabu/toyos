@@ -1,6 +1,5 @@
-use core::arch::naked_asm;
-
 use alloc::vec::Vec;
+use super::entry::{restore_user_state, ring3_naked_asm, save_user_state};
 use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::mm::paging::CachePolicy;
@@ -112,11 +111,14 @@ pub fn init() {
 
 // Syscall entry: GS permanently points to kernel per-CPU data (no swapgs needed).
 // PerCpu layout: offset 16 = kernel_rsp, offset 24 = user_rsp.
-// Saves/restores XMM registers because blocking syscalls context-switch,
-// and kernel Rust code is free to clobber caller-saved XMM registers.
+//
+// The bracket spans the handler *and* the exit-to-user epilogue, because both
+// can context-switch. The epilogue used to run with the user state already put
+// back, so a switch there returned to Ring 3 carrying whatever the task that
+// ran in between had left in the registers — `specs/user-machine-state.md` §3.
 #[unsafe(naked)]
 extern "sysv64" fn syscall_entry() {
-    naked_asm!(
+    ring3_naked_asm!(
         "mov gs:[24], rsp",     // save user RSP to percpu.user_rsp
         "mov gs:[216], rcx",    // save user RIP to percpu.syscall_rip
         "mov gs:[224], rdi",    // save syscall number to percpu.syscall_num
@@ -132,52 +134,11 @@ extern "sysv64" fn syscall_entry() {
         "push r9",
         "push r10",
 
-        // Save SSE state — kernel code may clobber XMM registers,
-        // and blocking syscalls context-switch away.
-        "sub rsp, 8",
-        "stmxcsr [rsp]",
-        "sub rsp, 256",
-        "movdqu [rsp + 0*16], xmm0",
-        "movdqu [rsp + 1*16], xmm1",
-        "movdqu [rsp + 2*16], xmm2",
-        "movdqu [rsp + 3*16], xmm3",
-        "movdqu [rsp + 4*16], xmm4",
-        "movdqu [rsp + 5*16], xmm5",
-        "movdqu [rsp + 6*16], xmm6",
-        "movdqu [rsp + 7*16], xmm7",
-        "movdqu [rsp + 8*16], xmm8",
-        "movdqu [rsp + 9*16], xmm9",
-        "movdqu [rsp + 10*16], xmm10",
-        "movdqu [rsp + 11*16], xmm11",
-        "movdqu [rsp + 12*16], xmm12",
-        "movdqu [rsp + 13*16], xmm13",
-        "movdqu [rsp + 14*16], xmm14",
-        "movdqu [rsp + 15*16], xmm15",
+        save_user_state!(),
 
         "lock add dword ptr gs:[240], 1",   // preempt_count++
 
         "call {handler}",
-
-        // Restore SSE state
-        "movdqu xmm0,  [rsp + 0*16]",
-        "movdqu xmm1,  [rsp + 1*16]",
-        "movdqu xmm2,  [rsp + 2*16]",
-        "movdqu xmm3,  [rsp + 3*16]",
-        "movdqu xmm4,  [rsp + 4*16]",
-        "movdqu xmm5,  [rsp + 5*16]",
-        "movdqu xmm6,  [rsp + 6*16]",
-        "movdqu xmm7,  [rsp + 7*16]",
-        "movdqu xmm8,  [rsp + 8*16]",
-        "movdqu xmm9,  [rsp + 9*16]",
-        "movdqu xmm10, [rsp + 10*16]",
-        "movdqu xmm11, [rsp + 11*16]",
-        "movdqu xmm12, [rsp + 12*16]",
-        "movdqu xmm13, [rsp + 13*16]",
-        "movdqu xmm14, [rsp + 14*16]",
-        "movdqu xmm15, [rsp + 15*16]",
-        "add rsp, 256",
-        "ldmxcsr [rsp]",
-        "add rsp, 8",
 
         "lock sub dword ptr gs:[240], 1",   // preempt_count--
         // cli before exit_to_user and pop rsp / sysretq: an interrupt after
@@ -186,11 +147,16 @@ extern "sysv64" fn syscall_entry() {
         "cli",
         // exit_to_user runs BEFORE restoring user GPRs — the sysv64 call
         // would otherwise clobber rcx/r11 (sysretq RIP/RFLAGS) and the
-        // restored arg regs. push/pop rax saves the syscall return value
-        // and re-aligns rsp to 0(mod 16) for the call.
-        "push rax",
+        // restored arg regs. The 16 bytes park the syscall return value and
+        // keep rsp aligned for the call, which the bracket left it.
+        "sub rsp, 16",
+        "mov [rsp], rax",
         "call {exit_to_user}",
-        "pop rax",
+        "mov rax, [rsp]",
+        "add rsp, 16",
+
+        restore_user_state!(),
+
         "pop r10",
         "pop r9",
         "pop r8",
