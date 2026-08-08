@@ -2925,7 +2925,10 @@ fn run_screen_test(
             let mut pages: Vec<String> = Vec::new();
             let mut report: Option<String> = None;
             let mut head_seen = false;
-            let deadline = Instant::now() + Duration::from_secs(40);
+            // A liveness ceiling on a machine that is halted and paging, so
+            // there is no console to read progress off and this is the case
+            // `qemu::budget` exists for.
+            let deadline = Instant::now() + qemu::budget(Duration::from_secs(40));
             while Instant::now() < deadline && !(head_seen && report.is_some()) {
                 let text = qemu.screendump().text();
                 let Some(footer) = text.lines().rev().find(|l| l.starts_with("[page ")) else {
@@ -2947,7 +2950,9 @@ fn run_screen_test(
             let seen = pages.join(" ");
             print_screen(name, &format!("footers seen: {seen}"));
             let Some(report) = report else {
-                return Err(format!("{TAIL:?} never reached the screen; footers seen: {seen}"));
+                return Err(format!(
+                    "{STALLED} {TAIL:?} never reached the screen; footers seen: {seen}"
+                ));
             };
             // The premise. If one screen holds both ends there is nothing to
             // page and the rest of this test would pass vacuously — which is
@@ -3775,15 +3780,17 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
         "netd: no NIC on this machine, exiting",
         "sshd: no network on this machine, exiting",
     ];
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while std::time::Instant::now() < deadline
-        && !WANT.iter().all(|w| boot.console.contains(w))
-    {
-        boot.drain(Duration::from_millis(250));
-    }
+    let stalled = await_guest(&mut boot.qemu, &mut boot.console, "every daemon's own line", |c| {
+        WANT.iter().all(|w| c.contains(w))
+    })
+    .err();
     for want in WANT {
         if !boot.console.contains(want) {
-            return Err(format!("{want:?} never reached the console:\n{}", boot.console));
+            return Err(format!(
+                "{}{want:?} never reached the console:\n{}",
+                stalled.map(|why| format!("{why}\n")).unwrap_or_default(),
+                boot.console
+            ));
         }
     }
     // The compositor's periodic self-measurement, which is how the
@@ -3795,16 +3802,19 @@ fn metal_sim_compositor(boot: &mut Boot) -> Result<(), String> {
     // Three of them, not one: the first covers the boot, which repaints the
     // whole screen, and what the idle gate below is about is every interval
     // after that.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while std::time::Instant::now() < deadline
-        && boot
-            .console
-            .lines()
-            .filter(|l| l.contains("compositor: frames=") && l.contains("windows="))
-            .count()
-            < 3
-    {
-        boot.drain(Duration::from_millis(250));
+    let intervals = |c: &str| {
+        c.lines().filter(|l| l.contains("compositor: frames=") && l.contains("windows=")).count()
+    };
+    let stalled = await_guest(&mut boot.qemu, &mut boot.console, "three frame batches", |c| {
+        intervals(c) >= 3
+    })
+    .err();
+    if let Some(why) = stalled {
+        return Err(format!(
+            "{why}\nthe compositor reported {} of the three frame batches this reads:\n{}",
+            intervals(&boot.console),
+            boot.console
+        ));
     }
     // One more drain so the tail of that line cannot still be in
     // flight when it is parsed.
@@ -3928,12 +3938,9 @@ fn metal_sim_scanout_wc(boot: &mut Boot) -> Result<(), String> {
     const SCANOUT: &str = "GOP: scanout memory type ";
     const MAPPED: &str = "mapped WriteCombining into pid ";
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while std::time::Instant::now() < deadline
-        && ![PAT, SCANOUT, MAPPED].iter().all(|w| boot.console.contains(w))
-    {
-        boot.drain(Duration::from_millis(250));
-    }
+    let _ = await_guest(&mut boot.qemu, &mut boot.console, "the three memory-type lines", |c| {
+        [PAT, SCANOUT, MAPPED].iter().all(|w| c.contains(w))
+    });
     let console = &boot.console;
 
     let Some(pat) = console.lines().find(|l| l.contains(PAT)) else {
@@ -4024,12 +4031,8 @@ fn metal_sim_window_drag(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> 
     // the frame that painted the desktop for the first time: a gate about what
     // a drag costs must not be handed the boot's own full-screen repaint.
     let mut boot_log = qemu.boot_log().to_string();
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while std::time::Instant::now() < deadline
-        && !boot_log.contains("compositor: frames=")
-    {
-        boot_log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
-    }
+    await_marker(&mut qemu, &mut boot_log, "compositor: frames=", "the boot's own repaint interval")
+        .map_err(|why| format!("{why}\n{boot_log}"))?;
     boot_log.push_str(&qemu.drain_serial(Duration::from_millis(250)));
     let screen_px = compositor_screen_px(&boot_log)?;
     let (screen_w, screen_h) = compositor_screen_size(&boot_log)?;
@@ -5863,10 +5866,7 @@ fn metal_sim_window_caps(boot: &mut Boot) -> Result<(), String> {
     // test and stop asking whether the compositor uses it. Off the group's
     // console, because the compositor says it once and an earlier member of
     // the group has already drained the line off the wire.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline && !boot.console.contains("compositor: at most ") {
-        boot.drain(Duration::from_millis(250));
-    }
+    let _ = await_marker(&mut boot.qemu, &mut boot.console, "compositor: at most ", "the window cap");
     let Some(declared) = boot
         .console
         .lines()
@@ -8616,9 +8616,13 @@ fn run_machine_test(
                 "sshd: host identity SHA256:",
                 "sshd: cannot read /home/root/.ssh/authorized_keys",
             ];
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while Instant::now() < deadline && !WANT.iter().all(|w| console.contains(w)) {
-                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            let stalled =
+                await_guest(&mut qemu, &mut console, "every line sshd owes", |c| {
+                    WANT.iter().all(|w| c.contains(w))
+                })
+                .err();
+            if let Some(why) = stalled {
+                eprintln!("  [sshd] {why}");
             }
             for want in WANT {
                 if !console.contains(want) {
@@ -8668,10 +8672,7 @@ fn run_machine_test(
             let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
 
             let mut console = qemu.boot_log().to_string();
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while Instant::now() < deadline && !console.contains("netd: ready, at most ") {
-                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
-            }
+            let _ = await_marker(&mut qemu, &mut console, "netd: ready, at most ", "netd to come up");
             let Some(declared) = console
                 .lines()
                 .find_map(|l| l.split("netd: ready, at most ").nth(1))
@@ -8751,10 +8752,7 @@ fn run_machine_test(
 
             let mut qemu = QemuInstance::boot_with_options(&config, &[], &bins, options);
             let mut console = qemu.boot_log().to_string();
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while Instant::now() < deadline && !console.contains("netd: ready, at most ") {
-                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
-            }
+            let _ = await_marker(&mut qemu, &mut console, "netd: ready, at most ", "netd to come up");
             if !console.contains("netd: ready, at most ") {
                 return Err(format!("netd never came up on a machine with a NIC:\n{console}"));
             }
