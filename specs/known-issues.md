@@ -3769,29 +3769,65 @@ Cosmetic today. It stops being cosmetic the moment anything gates on it.
 
 ## 5. Diagnostics
 
-### OPEN — `screen_blocked_dump` is `Sched::Parallel` and reds in the wide phase
+### CLOSED — `screen_blocked_dump`'s red, and the three diagnoses of it that were wrong
 
 ```
 FAIL screen_blocked_dump: the panel does not carry "cpu(s) answered", so a
      photograph of this machine answers nothing
-  FAIL  screen_blocked_dump  (3s)
   ALONE screen_blocked_dump: GREEN — it fails only beside other guests, so its
         Sched::Parallel is wrong. The run stays red on the classification.
 ```
 
-Twice on 2026-08-07 on a quiet host — once in a plain `cargo test` and once in a
-226.5 s `--land` gate — both times green on the lone re-run, and green in a
-third gate on the same tree. So it is intermittent rather than reproducible, and
-the harness's own rule is the finding: a test that fails only beside other
-guests is misclassified, not flaky.
+**It was never about the wide phase, and `Sched::Serial` was never the fix.**
+Measured 2026-08-08 with the host to itself: 1 red of 4, then 1 of 5, then 1 of
+6 — the same ~20% a second agent got independently from eight isolated runs at
+`--jobs 1` (six green, two red, on a branch whose non-`.md` diff against `main`
+is empty). The harness's own `ALONE` verdict is a coin toss on this test, so it
+classified one defect as "parallel" once and "real" the next time.
 
-What it asserts is a *count*, that every CPU answered the blocked-task dump
-inside the 250 ms budget before the NMI path takes over. That is a wall-clock
-margin, and `specs/test-cost-audit.md` §3.3 puts those in the serial tail. The
-one-word fix is `Sched::Serial` (`tests/toyos.rs` line 206); it is not taken
-here because it costs a tail slot, because it belongs to whoever owns
-`sched/dump.rs`, and because two samples of an intermittent test are two
-samples.
+**Three causes were recorded before anyone decoded the panel, and all three were
+wrong about the mechanism.**
+
+- *`Sched::Parallel` is wrong.* It reds at the same rate alone.
+- *The ring tail overruns the summary.* It cannot: `Page::Last` shows the
+  *newest* rows, so lines arriving after the dump would have to number sixty
+  before they displaced `cpu(s) answered`. The tail was a real defect for a
+  different reason, below.
+- *The panic console's 3 s deadline advanced the page.* `page_forever` is
+  reachable only from `halt_all_cpus` (`arch/apic.rs:237`), so Ctrl+Alt+D never
+  enters the pager and nothing advances anything. `[page 3/3]` on the panel is
+  the **static footer** of one `Page::Last` paint, which passes `shown = pages`
+  and therefore always reads N/N. It looks exactly like a pager that has reached
+  its last page and is not one.
+
+**What it was**, from a captured red decoded pixel by pixel: the kernel painted
+the whole report, and then **userland painted over it**. The band that lost its
+text held the compositor's own antialiased greys — `[66,66,66]`, `[191,191,191]`,
+`[237,237,237]` — and this console writes only `0x00` and `0xFF`, so those
+pixels are nobody's but a client's. What survived was a 40-pixel strip beside
+the window and the four rows below it. `== VERDICT:` was in the second group and
+`cpu(s) answered` was not, which is why that one string of the three was always
+the one that failed — the assertion was reporting *where on the glass* a line
+sat, not what the kernel wrote. Two screendumps 1.5 s apart were byte-identical,
+so it was a settled overwrite and not a torn capture.
+
+The tail was a second, independent defect: pagination ran over 32 KiB of *ring*,
+so the report came out as page 3 of 3 of a boot log — on one capture 31 of 67
+rows were ELF relocation counts — with the answer wherever it happened to land.
+
+Both are fixed. `log_ring::mark`/`peek_range` bracket the report, so the panel
+carries one report, it fits a screen and the footer is gone;
+`panic_console::hold_report` puts it back for 15 s whenever the panel stops
+carrying it. Teeth, run rather than argued: `REPORT_HOLD_NS = 0` reds 3 of 3,
+`peek_tail` in place of `peek_range` reds 3 of 3 on `[page 7/7]`.
+
+**Reusable.** `[page n/m]` in a screendump is not evidence that anything paged,
+and a screendump is not a shutter — QEMU converts the panel while the guest
+draws on it, so a capture taken across a paint carries the rows already drawn
+and nobody's rows for the rest. A predicate satisfied by one string of three
+accepts one of those and then asserts on the missing half. Decode the colours
+before naming a cause: all three wrong diagnoses were consistent with the
+decoded text and none survived one look at the pixels.
 
 ### OPEN — QEMU 11.0.3 sets `ECAP.PT`, so `Iova::identity`'s comment gives a false reason for correct behaviour
 
@@ -3944,32 +3980,14 @@ or removes it by accident.
 What is left of this entry: `ps` and `stats` still have no cross-CPU view of
 anything the handles do not publish.
 
-#### OPEN — `screen_blocked_dump` is intermittent *alone*, and the reason is the report's own design
+#### CLOSED — `screen_blocked_dump` is intermittent *alone*
 
-Measured 2026-08-07 in one session, five runs a side, the same host: **three
-green and two red on `main` at `48147c2`, three green and two red on
-`wt/toyos-wedge`.** So it is not a parallel-phase flake — it reds with the host
-to itself and at the same rate on an untouched tree. `ALONE: red again` on this
-test therefore means nothing on its own, and the harness's own re-run cannot
-classify it.
-
-The failing assertion is always `cpu(s) answered`, never `== VERDICT:` or `==
-deadlines:` — the *first* of the three summary lines, i.e. the one furthest from
-the bottom. That is the mechanism: `paint_report` shows `Page::Last` of the log
-**ring**, not of the dump, so anything logged while the dump is being assembled
-— a compositor stats line, soundd — lifts the top of the summary off the
-screenful a photograph would catch. The dump is machine-wide and the machine is
-still running, so there is always something else writing.
-
-Two consequences, neither fixed here:
-
-- **The instrument's own contract is weaker than the entry above claims.** "The
-  summary is last, so last is what a photograph catches" is true of the summary's
-  last *line* and not of the summary. On the owner's T14 that is the difference
-  between a photograph that says how many CPUs answered and one that does not.
-- **The test asserts on a screenful whose contents it does not control.** A fix
-  that made the summary one line, or had `paint_report` show the dump's own tail
-  rather than the ring's, would close both halves at once.
+The rate is right — five runs a side on 2026-08-07 gave three green and two red
+on `main` at `48147c2` and the same on `wt/toyos-wedge`, so it reds with the
+host to itself and at the same rate on an untouched tree. The mechanism recorded
+here (the ring tail lifting the summary off the page) was wrong, and §5's entry
+above has what it was: userland repaints over the report, and the failing string
+is the one that sat under the window rather than beside or below it.
 
 ### CPU attribution: the recorded "half the CPU is unattributed" claim was wrong
 
@@ -4165,7 +4183,7 @@ log cannot tell you which it was.
 
 Trivial to fix the same way the kbd line already is.
 
-### OPEN — `screen_blocked_dump` asserts a whole-report property against one page of a paged report
+### CLOSED — `screen_blocked_dump` asserts a whole-report property against one page of a paged report
 
 Red about a quarter of the time, on `main`'s own code. Found 2026-08-08 by a
 branch whose entire delta is three `.md` files — `git diff main...HEAD --
@@ -4178,10 +4196,9 @@ phase; the harness re-ran it alone both times and got `GREEN` once and
 `red again — the defect is real` once. So the `ALONE` verdict itself is a coin
 toss here, which is worth knowing before anyone trusts one.
 
-**Cause, from a captured red.** `tests/toyos.rs:3254` requires three strings on
-one screendump — `"== VERDICT:"`, `"cpu(s) answered"`, `"== deadlines:"`. But the
-report is longer than the screen, so the panic console pages it on a 3 s
-deadline, and the red capture ends:
+**Cause, from a captured red.** `tests/toyos.rs` required three strings on one
+screendump — `"== VERDICT:"`, `"cpu(s) answered"`, `"== deadlines:"` — and the
+red capture ended:
 
 ```
 [kernel 0.601 cpu0] == VERDICT: 1 overdue, 0 absurd, 0 unheld, 0 never ran
@@ -4190,16 +4207,23 @@ deadline, and the red capture ends:
 [page 3/3]
 ```
 
-Page 3 of 3 carries the verdict and the tail. `== sched: N/N cpu(s) answered`
-(`kernel/src/sched/dump.rs:524`) is on an earlier page. The test passes or fails
-on **which page the deadline had advanced to when the screendump was taken**,
-which is a property of timing and not of the dump.
+**The conclusion drawn from that footer was right and the mechanism was not.**
+Right: the report was three pages of a boot log and the answer was not all on
+one, which is a defect however the panel got there. Wrong: nothing was advancing
+those pages. `page_forever` — the 3 s deadline, PageUp/PageDown, the first key
+retiring it — is reachable only from `halt_all_cpus` (`arch/apic.rs:237`), so
+Ctrl+Alt+D never enters it. `[page 3/3]` is the *static footer* of a single
+`Page::Last` paint, which passes `shown = pages` and so always reads N/N. It is
+indistinguishable on a photograph from a pager that has reached its last page,
+and it is not one.
 
-The defect is the assertion, not the dump: a photograph of that machine does
-answer the question, on the page that carries it. Either the test steers the
-pager to each page it needs — PageUp/PageDown are polled for exactly that — or it
-asserts per page. Do not "fix" it by widening the deadline; that hides the
-coupling rather than removing it.
+The note not to widen the deadline stands and was never reachable anyway. What
+the report is paginated *against* was the real half: 32 KiB of shared ring
+rather than the report. Both that and the overwrite that hid it are fixed and
+written up in §5 — `log_ring::mark`/`peek_range` and
+`panic_console::hold_report`. The assertion was not weakened: it now also
+requires the absence of a `[page n/m]` footer, because Ctrl+Alt+D paints once
+and a report needing two pages leaves the answer on one nobody can reach.
 
 ---
 
@@ -4668,6 +4692,13 @@ every one of them this entry. The one clean 289/289 run is the one whose suite
 took **182.7 s**; the three red ones took 559, 576 and 705. That is the whole
 correlation, and it says the remaining landing blocker is this section rather
 than anything in the kernel.
+
+**Two of those seven were not this entry**, and that is the caution the rest of
+it now carries. `screen_blocked_dump` reds at the same ~20% with the host to
+itself, and the defect was in the kernel (§5, closed 2026-08-08). `ALONE: GREEN`
+on a test that is red one run in five says "this re-run was one of the four
+green ones", not "the phase did it" — so the classification is evidence only
+where the alone rate is known to be zero, and nothing measures that.
 
 ### A whole parallel phase can be starved by another agent's build
 
