@@ -127,8 +127,16 @@ fn apic_id() -> u32 {
     let (max_leaf, _, _, _) = cpu::cpuid(0, 0);
     for leaf in [0x1F, 0x0B] {
         if max_leaf >= leaf {
-            let (_, _, _, edx) = cpu::cpuid(leaf, 0);
-            return edx;
+            let (_, ebx, _, edx) = cpu::cpuid(leaf, 0);
+            // Reaching the leaf index is not the existence test: SDM Vol. 2A,
+            // `CPUID` leaf 0BH, requires `EBX[15:0]` non-zero as well, and a CPU
+            // whose maximum leaf covers it without implementing it answers zero
+            // in every register. That is not a distinguisher — every CPU would
+            // take slot 0 and share one guard — and it is reached by skipping
+            // the leaf-1 fallback that is correct for exactly that machine.
+            if ebx & 0xFFFF != 0 {
+                return edx;
+            }
         }
     }
     let (_, ebx, _, _) = cpu::cpuid(1, 0);

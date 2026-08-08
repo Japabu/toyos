@@ -7,10 +7,10 @@
 //! 1..N booted with **caching disabled**, `WP` clear and `NE` clear for the
 //! whole history of the tree.
 //!
-//! `CR0` is declared whole — every bit it defines is decided here. `CR4` cannot
-//! be, because three of its bits are a property of the silicon; it is declared
-//! as *required plus whatever of the optional set this CPU has*, which is a
-//! function every CPU evaluates and has to agree on.
+//! Both registers are written whole, so every bit of both is decided here.
+//! `CR0`'s value is a constant; three of `CR4`'s bits are the silicon's to
+//! offer, so its value is *required plus whatever of the optional set this CPU
+//! has* — a function every CPU evaluates and has to agree on.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -48,7 +48,8 @@ mod cr4 {
 /// The bits left out are as much of the declaration as the bits in it:
 ///
 /// - `EM` (2) clear and `MP` (1) set — the pair that says an x87 instruction
-///   executes rather than raising `#UD`, and that `WAIT` respects `TS`.
+///   executes on the FPU rather than raising `#NM` (SDM Vol. 3A §2.5), and that
+///   `WAIT` respects `TS`.
 /// - `TS` (3) clear — lazy FP switching is ruled out
 ///   (`specs/user-machine-state.md` §6.3), so nothing ever sets it and `#NM`
 ///   keeps its meaning of "a userland bug".
@@ -61,12 +62,17 @@ pub const CR0: u64 = cr0::PE | cr0::MP | cr0::ET | cr0::NE | cr0::WP | cr0::PG;
 
 /// The `CR4` bits every CPU must have, or the kernel does not run on it.
 ///
-/// `PAE` is long mode's. `DE`, `MCE`, `OSFXSR` and `OSXMMEXCPT` are older than
-/// x86-64 and present on everything that implements it, and `FSGSBASE` is not —
-/// but every context switch uses `rdfsbase`/`wrfsbase`, so a CPU without it
-/// would `#UD` at the first one. All five are checked against CPUID rather than
-/// assumed: setting a `CR4` bit the CPU does not define is `#GP`, and on the BSP
-/// that happens before `idt::init`, where it is a triple fault with no report.
+/// `PAE` is long mode's, `OSFXSR` and `OSXMMEXCPT` are `FXSAVE64`'s and SSE's,
+/// and `MCE` is a machine check reported rather than a shutdown with nothing to
+/// read. **`DE` is here for zero legacy and not for a need**: this kernel
+/// programs no debug register, and `DE` clear is the 386 behaviour where `DR4`
+/// and `DR5` alias `DR6` and `DR7` instead of raising `#UD` (SDM Vol. 3B
+/// §17.2.2, *Debug Registers DR4 and DR5*). All five are older than x86-64 and
+/// present on everything that implements it, and `FSGSBASE` is not — but every
+/// context switch uses `rdfsbase`/`wrfsbase`, so a CPU without it would `#UD` at
+/// the first one. All are checked against CPUID rather than assumed: setting a
+/// `CR4` bit the CPU does not define is `#GP`, and on the BSP that happens
+/// before `idt::init`, where it is a triple fault with no report.
 const CR4_REQUIRED: u64 = cr4::DE
     | cr4::PAE
     | cr4::MCE
@@ -97,11 +103,13 @@ pub fn init_cr0(cpu_id: u32) {
     if !skipped(cpu_id) {
         let live = cpu::read_cr0();
         if live & (cr0::CD | cr0::NW) != 0 {
-            // SDM Vol. 3A §11.11.8's order for leaving a cache-disabled state:
-            // no-fill first, then write back and invalidate, and only then let
-            // the caches fill again. A line an AP's caches held from before
-            // `INIT` is otherwise served to a CPU that has just been told
-            // memory is coherent.
+            // SDM Vol. 3A §11.5.3's first two steps — no-fill (`CD` set, `NW`
+            // clear), then write back and invalidate — which is the order for
+            // crossing between cached and uncached in either direction. `INIT`
+            // leaves `CD` and `NW` both set, §11.5.1's mode where memory
+            // coherency is *not* maintained, so a line this AP's caches held
+            // from before is otherwise served to a CPU that has just been told
+            // it is.
             unsafe {
                 cpu::write_cr0((live | cr0::CD) & !cr0::NW);
                 cpu::wbinvd();
@@ -123,8 +131,12 @@ pub fn init(cpu_id: u32) {
     if !skipped(cpu_id) {
         unsafe { cpu::write_cr4(declared) };
         if declared & cr4::SMAP != 0 {
-            // The kernel reaches user memory through `stac`/`clac` pairs and
-            // never with `AC` left set, so this is the state it starts in.
+            // SMAP binds only while `RFLAGS.AC` is clear, and `AC` here is
+            // whatever was inherited — `INIT` clears it on an AP, firmware
+            // answers for the BSP. Nothing in this kernel ever sets it: user
+            // memory is reached by page walk and the direct map (`user_ptr`),
+            // which SMAP does not cover, so there is no `stac`/`clac` pair
+            // anywhere and clearing it once here is the whole protocol.
             cpu::clac();
         }
     }
@@ -186,8 +198,14 @@ fn supported() -> u64 {
     const CPUID_7_EBX: [(u32, u64); 3] =
         [(0, cr4::FSGSBASE), (7, cr4::SMEP), (20, cr4::SMAP)];
 
+    let (max_leaf, _, _, _) = cpu::cpuid(0, 0);
     let (_, _, ecx1, edx1) = cpu::cpuid(1, 0);
-    let (_, ebx7, _, _) = cpu::cpuid(7, 0);
+    // A leaf above the maximum answers with the highest basic leaf's registers
+    // rather than faulting, so an unguarded read here can report `FSGSBASE` off
+    // somebody else's data — and a `CR4` bit the CPU does not define is the
+    // triple fault the CPUID gating exists to replace with a named refusal.
+    // Zero instead gives `declaration`'s assertion, which names the CPU.
+    let (_, ebx7, _, _) = if max_leaf >= 7 { cpu::cpuid(7, 0) } else { (0, 0, 0, 0) };
 
     let mut have = 0;
     for (bit, flag) in CPUID_1_EDX {

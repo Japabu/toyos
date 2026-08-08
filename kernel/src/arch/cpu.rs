@@ -100,16 +100,20 @@ pub unsafe fn write_cr0(value: u64) {
 
 /// # Safety
 /// A bit this CPU does not define is `#GP`, and clearing `PAE` or `LA57` in long
-/// mode is `#GP` too. [`control_regs`](super::control_regs) is the only caller
-/// and asks CPUID first.
+/// mode is `#GP` too. So is taking `PCIDE` from 0 to 1 while `CR3[11:0]` is
+/// non-zero (SDM Vol. 3A §4.10.1). [`control_regs`](super::control_regs) is the
+/// only caller: it asks CPUID first, and both of its call sites run on the
+/// kernel address space, whose PCID is 0.
 #[inline]
 pub unsafe fn write_cr4(value: u64) {
     asm!("mov cr4, {}", in(reg) value, options(nostack));
 }
 
 /// # Safety
-/// Writes back and invalidates every cache level. Only correct inside the
-/// no-fill window SDM Vol. 3A §11.11.8 puts it in.
+/// Writes back and invalidates every cache level. Only correct inside a no-fill
+/// window — `CR0.CD` set and `CR0.NW` clear — which is SDM Vol. 3A §11.5.3 for a
+/// plain cache-mode change and §11.11.8's MTRR procedure for the PAT write
+/// [`pat::init`](super::pat::init) wraps in one.
 #[inline]
 pub unsafe fn wbinvd() {
     asm!("wbinvd", options(nostack, preserves_flags));

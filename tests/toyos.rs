@@ -299,6 +299,7 @@ const GRAFFITI: [u8; 3] = [0x00, 0xC0, 0x00];
 const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("ioapic_topology", Sched::Parallel),
     ("control_regs", Sched::Parallel),
+    ("control_regs_negative", Sched::Parallel),
     ("input_merge", Sched::Parallel),
     ("metal_sim_input", Sched::Parallel),
     // One boot from here to `metal_sim_compositor_stall` (`METAL_SIM_DESKTOP`).
@@ -7925,6 +7926,7 @@ fn run_machine_test(
             );
             control_regs(&qemu.boot_log().to_string(), CPUS)
         }
+        "control_regs_negative" => control_regs_negative(test_config, c_bins, rust_bins),
         "input_merge" => {
             // The check runs in the kernel and panics on mismatch, so a
             // failure arrives as a dead boot; the marker is the only proof it
@@ -9253,15 +9255,22 @@ fn parse_xhci_binds(log: &str) -> Vec<XhciBind> {
 /// `OSXSAVE` is asserted *clear*: with it set the CPU would permit `XCR0` to
 /// name components `FXSAVE64` does not save, and this kernel saves user FP
 /// state with `FXSAVE64` (`specs/user-machine-state.md` §5).
+///
+/// Both halves, because the kernel writes both registers whole: every bit named
+/// below must hold its named value, **and a bit named nowhere below may not be
+/// set at all**. Silence about a bit is a hole rather than a permission.
 fn control_regs(log: &str, cpus: u32) -> Result<(), String> {
-    /// `(bit, name, must_be_set)`.
+    /// `(bit, name, must_be_set)`. Every bit `CR0` defines, so a value with any
+    /// other bit set is reserved state the kernel put there.
     const CR0_BITS: &[(u32, &str, bool)] = &[
         (0, "PE", true),
         (1, "MP", true),
         (2, "EM", false),
         (3, "TS", false),
+        (4, "ET", true),
         (5, "NE", true),
         (16, "WP", true),
+        (18, "AM", false),
         (29, "NW", false),
         (30, "CD", false),
         (31, "PG", true),
@@ -9276,6 +9285,8 @@ fn control_regs(log: &str, cpus: u32) -> Result<(), String> {
         (16, "FSGSBASE", true),
         (18, "OSXSAVE", false),
     ];
+    /// The three `CR4` bits the CPU may withhold, so neither answer is wrong.
+    const CR4_MAY: &[(u32, &str)] = &[(17, "PCIDE"), (20, "SMEP"), (21, "SMAP")];
 
     let mut seen: Vec<(u32, u64, u64)> = Vec::new();
     for line in log.lines() {
@@ -9302,16 +9313,33 @@ fn control_regs(log: &str, cpus: u32) -> Result<(), String> {
         ));
     }
 
+    // A bit named nowhere above is as much of the declaration as a named one,
+    // and the kernel writes both registers whole — so `UMIP`, `PGE`, `TSD` or
+    // `PKE` would reach every CPU with nothing here to say so. Which is why
+    // what follows is the set this gate has an opinion about, rather than a
+    // second list of bits to forbid: a forbid-list fails open on the next bit.
+    let named = |bits: &[(u32, &str, bool)], may: &[(u32, &str)]| -> u64 {
+        bits.iter().fold(0, |m, b| m | 1u64 << b.0)
+            | may.iter().fold(0, |m, b| m | 1u64 << b.0)
+    };
+
     // Every wrong bit on a CPU rather than the first: an AP holding INIT's CR0
     // is wrong in five at once and each is a different consequence, so a
     // message naming one sends the next reader after a fifth of it.
     for &(id, cr0, cr4) in &seen {
         let mut wrong = String::new();
-        for (reg, value, bits) in [("cr0", cr0, CR0_BITS), ("cr4", cr4, CR4_BITS)] {
+        for (reg, value, bits, known) in [
+            ("cr0", cr0, CR0_BITS, named(CR0_BITS, &[])),
+            ("cr4", cr4, CR4_BITS, named(CR4_BITS, CR4_MAY)),
+        ] {
             for &(bit, name, set) in bits {
                 if (value & (1 << bit) != 0) != set {
                     wrong += &format!(" {reg}.{name} must be {}", if set { "set" } else { "clear" });
                 }
+            }
+            let extra = value & !known;
+            if extra != 0 {
+                wrong += &format!(" {reg} holds {extra:#x}, which this gate never named");
             }
         }
         if !wrong.is_empty() {
@@ -9334,12 +9362,13 @@ fn control_regs(log: &str, cpus: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// [`control_regs`] against the machine it was written for, with no guest.
+/// [`control_regs`] against machines this host cannot boot, with no guest.
 ///
-/// The `no-ap-control-regs` kernel is what stages the real defect, and it kills
-/// the boot before the harness reads a line — the assertion it trips is the
-/// kernel's own. So the *verdict function* is exercised here instead, on the
-/// values a boot of this tree printed before the fix.
+/// [`control_regs_negative`] runs the real defective machine and is the link
+/// between this verdict and a kernel; what is here is the states no actuator
+/// reaches — a CPU that differs from three others, a bit set uniformly on all
+/// four, an AP that never printed. Every value is one this tree has printed or
+/// one bit away from it.
 fn control_regs_verdict() -> Result<(), String> {
     /// The pre-fix machine, `smp=4`, TCG, read off this tree on 2026-08-08:
     /// firmware's registers on the BSP and INIT's on every AP.
@@ -9383,13 +9412,98 @@ fn control_regs_verdict() -> Result<(), String> {
     // The bit that must be *absent*: with it set, XCR0 can name components
     // FXSAVE64 does not save (`specs/user-machine-state.md` §5).
     refused("OSXSAVE set", &[(DECLARED.0, DECLARED.1 | (1 << 18)); 4], "OSXSAVE")?;
-    // A CPU that agrees about every named bit and differs in an unnamed one.
-    refused("a CPU with an extra CR4 bit", &[DECLARED, DECLARED, DECLARED, (DECLARED.0, DECLARED.1 | (1 << 7))], "cpu3")?;
+    // Two bits a machine could hold uniformly, each one line of kernel diff
+    // away, and neither reachable by an actuator. `AM` is named clear above and
+    // answers by name; `UMIP` is named nowhere, which is the case the whole
+    // never-named rule exists for — `PGE`, `TSD` and `PKE` are the same case.
+    refused("every CPU with AM set", &[(DECLARED.0 | (1 << 18), DECLARED.1); 4], "AM")?;
+    refused(
+        "every CPU with UMIP set",
+        &[(DECLARED.0, DECLARED.1 | (1 << 11)); 4],
+        "never named",
+    )?;
+    // A CPU that agrees about every named bit and differs in one the CPU is
+    // allowed to withhold, so nothing above it can object.
+    refused("one CPU with PCID and three without", &[DECLARED, DECLARED, DECLARED, (DECLARED.0, DECLARED.1 | (1 << 17))], "cpu3")?;
     // And an AP that never printed at all, which is what a machine whose AP
     // died before the check looks like.
     refused("three lines for four CPUs", &[DECLARED; 3], "{0, 1, 2, 3}")?;
 
-    eprintln!("  [control_regs] the verdict refuses 7 machines and accepts the declared one");
+    eprintln!("  [control_regs] the verdict refuses 9 machines and accepts the declared one");
+    Ok(())
+}
+
+/// The negative control, executed: an AP left holding what `INIT` gave it, and
+/// [`control_regs`] refusing the machine that produces.
+///
+/// The one link the two tests above do not cover. [`control_regs`] reads a
+/// healthy boot and [`control_regs_verdict`] reads values typed into this file;
+/// between them sits the question of whether the verdict would recognise a real
+/// divergent CPU, and a `no-ap-control-regs` kernel nothing runs answers it in
+/// prose. The boot dies here — the kernel's own assertion kills it — but
+/// `self_check` logs *before* it asserts, exactly so that the values a CPU
+/// failed with survive the failure, and that is what this reads.
+///
+/// `smp=2` because the first AP to check itself panics and `halt_all_cpus`
+/// follows it: any CPU after that one is a line that never arrives, and the
+/// refusal would then be about the count rather than about the registers.
+/// [`qemu::Profile::Metal`] because there the 16550 is the console: a guest that
+/// dies during `boot_aps` has no virtio-console yet, and this way one channel
+/// carries the per-CPU line and the panic that follows it.
+fn control_regs_negative(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    const CPUS: u32 = 2;
+    // The AP's own line, which arrives whether or not the actuator did anything
+    // — so a feature that silently stopped working is a named failure below
+    // rather than a boot timeout with nothing to read.
+    const MARKER: &str = "control_regs: cpu1 cr0=";
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            smp: CPUS,
+            profile: qemu::Profile::Metal,
+            kernel_features: &["no-ap-control-regs"],
+            ready_marker: MARKER,
+            ..Default::default()
+        },
+    );
+    let mut log = qemu.boot_log().to_string();
+    log += &qemu.drain_until(Duration::from_secs(20), |l| l.contains("the declaration is"));
+
+    // The premise: a divergent CPU, not merely a dead boot. Anything can kill a
+    // boot, and a test that only asserted the panic would pass on a kernel
+    // whose registers were right and whose assertion was wrong.
+    let Err(refusal) = control_regs(&log, CPUS) else {
+        return Err(format!(
+            "the verdict accepted a `no-ap-control-regs` boot — either the actuator did \
+             nothing or the verdict cannot see the machine it was written for\n{log}"
+        ));
+    };
+    // Named, and named as the defect: `CD` is what an AP arrives with and the
+    // consequence the whole file exists for. A refusal for a missing line or an
+    // unreadable one would satisfy `is_err` and mean nothing.
+    if !refusal.contains("cpu1") || !refusal.contains("CD") {
+        return Err(format!(
+            "the verdict refused for something other than cpu1's caching: {refusal}"
+        ));
+    }
+    // And the kernel refused too, on its own assertion rather than on a fault
+    // somewhere downstream of one — the shipped check, on the shipped line.
+    for want in [
+        "control_regs: cpu1 holds cr0=0xe0000011",
+        "the declaration is 0x80010033",
+    ] {
+        if !log.contains(want) {
+            return Err(format!("the kernel never said {want:?}:\n{log}"));
+        }
+    }
+    eprintln!("  [control_regs] a real divergent AP, refused: {refusal}");
     Ok(())
 }
 

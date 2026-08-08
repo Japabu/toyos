@@ -243,9 +243,9 @@ xhci-hid-break-late = []
 xhci-descriptor-selftest = []
 # Leave every AP holding the CR0 and CR4 that INIT left it, which is what every
 # boot before `arch/control_regs.rs` was: caching disabled, WP clear, NE clear.
-# `control_regs` must fail under this, and a run of it must name a real CPU with
-# real divergent values — the per-CPU line and both assertions are the shipped
-# ones and only the two register writes are absent.
+# `control_regs_negative` boots it and holds the verdict against what comes out.
+# The per-CPU line and both assertions are the shipped ones and only the two
+# register writes are absent, so the CPU it names is a real divergent CPU.
 #
 # Nothing else can stage it. A control register is written by the guest and read
 # by nobody outside it, so there is no QEMU device, machine property or `-cpu`
