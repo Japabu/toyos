@@ -2155,6 +2155,28 @@ service registration is kernel policy. What is not in doubt is that a client
 which starts before its service is listening must not read that as "there is
 no desktop".
 
+**Measured 2026-08-08, and it is the dominant blocker of §6's `Sched::Parallel`
+red list rather than a candidate for one.** Eight full suites in one session,
+two concurrent twelve-wide runs at a time on one host (`--host-slots 0`), four
+on `main` and four on the branch that made `shell_echoes` say what it had
+found:
+
+| arm | suites | suites with the race in a boot log | red suites |
+|---|---|---|---|
+| `main` | 4 | 3 | 3 |
+| branch | 4 | 1 | 1 |
+
+**Every red suite in the session contained this race and every green one did
+not.** The two other reds in the session were `audio_tone_load (smp=8)` and
+`xhci_hid_break`, and each landed in a suite that already had one. All three on
+`main` reported it as `nothing typed at the terminal window reached a shell` —
+once as `desktop_typing_damage`, twice as `desktop_audio_client` — and each was
+`ALONE: GREEN`, which is how a defect that reproduces in roughly half of these
+suites has been read as host noise. `shell_echoes` now ends that wait on
+`exit: terminal ` as well as on `terminal: ready` and names the race, so the red
+arrives in about a second instead of holding a lane: 305 s in the run that
+produced this table, with `desktop_window_child` beside it at 285 s.
+
 ### OPEN — the desktop chain reads every stdio error as end-of-input, and says nothing
 
 Found while tracing #156's teardown, where both of these had to be worked
@@ -4749,6 +4771,18 @@ Caught by the re-run-alone pass (`specs/test-cost-audit.md` §5.4.6) on
 the moment each was re-run by itself in the same process. None predates or was
 introduced by the parallel-width work; all have been `Sched::Parallel` since the
 phase landed, and none reproduces on a host running one suite.
+
+**Read this list against `specs/test-cost-audit.md` §5.8 before adding to it.**
+Every entry below that says `nothing typed at the terminal window reached a
+shell` — `desktop_typing_damage`, `desktop_locale_detect`, `blocked_dump`, and
+`desktop_audio_client` in the entry after this one — is now known to be the
+`/bin/terminal` boot race in §3 reported through a wall-clock guard that could
+say nothing else: three of three such reds in an eight-suite session carried the
+race in their boot log, and the wait they blew had been ruled out at 0.6 s by
+`exit: terminal pid=N code=1`. `shell_echoes` names the race now. So an
+`ALONE: GREEN` beside one of those sentences was never evidence that the host
+was the cause; it was evidence that the *boot* differed, which a re-run also
+changes.
 
 - **`i8042_mouse`** — CLOSED 2026-08-06. Both red modes were the harness and
   neither was ever the driver losing a packet; §8's entry carries the mechanism,
