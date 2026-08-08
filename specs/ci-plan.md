@@ -920,6 +920,15 @@ goes for an `EXPECTED_FAILURES` entry: it would name a real defect and a real
 write-up and it would still be an exemption bought to make a run green while a
 process can kill its neighbour.
 
+**Closed by `wt/toyos-fpu`, and neither repair was taken.**
+`specs/user-machine-state.md` is the invariant and the fix: one bracket in
+`kernel/src/arch/entry.rs`, `fxsave64`/`fxrstor64`, on all five Ring 3-reachable
+entries. `fault_gates` still shares its boot and still carries no
+`EXPECTED_FAILURES` entry. The gate that asks the question on purpose is
+`fpu_isolation`, whose fault arm is this reproduction made deliberate — a
+process dies with an unmasked x87 exception pending and the next executes
+`FLDCW` — against a `fpu-save-nothing` kernel it must fail on.
+
 ## 9.4 What a red CI run says now, and what a green one would
 
 Run `31261669826` is the first on a tree carrying this task's harness work, and

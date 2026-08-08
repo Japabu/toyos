@@ -80,7 +80,7 @@ sequence, and two shapes that save nothing:
 
 | entry | saves XMM/MXCSR | can switch before returning to Ring 3 |
 |---|---|---|
-| `syscall_entry` (`arch/syscall.rs`) | yes | yes |
+| `syscall_entry` (`arch/syscall.rs`) | for the handler, not the epilogue | yes |
 | `timer_entry`, Ring 3 arm (`arch/idt/timer.rs`) | yes | yes |
 | `device_irq_entry!` ×6 (`arch/idt/device_irq.rs`) | yes | yes |
 | **`common_entry` — all 19 exception vectors, #PF included** (`arch/idt/mod.rs`) | **no** | **yes** |
@@ -94,6 +94,12 @@ Ring 3 demand-paging fault can return to userland holding another thread's XMM
 registers and MXCSR.** It corrupts data instead of faulting, which is why
 nothing has noticed: an `MXCSR` carrying the wrong rounding mode or a stale
 `xmm0` produces a wrong number, not a signal.
+
+**A third instance, found while writing the bracket.** `syscall_entry` restored
+the user state *before* calling `kernel_exit_to_user_check`, which reaches
+`do_preempt`. A switch in that window returned to Ring 3 carrying whatever the
+task that ran in between had left in the registers — the same defect through a
+narrower window, on the busiest entry there is.
 
 `arch/idt/tlb.rs` line 3 reads *"See xhci_entry for register-save rationale"* —
 and then does not follow it. `xhci_entry` expands `device_irq_entry!`, which
@@ -137,12 +143,18 @@ disagree with the type. §5 is why that matters.
 
 ### 4.3 The IDT will not install anything else
 
-`ring3_entry!` yields a `Ring3Entry(unsafe extern "sysv64" fn())` newtype and
-`IdtEntry::new`/`syscall::init` take one. A vector that legitimately must not
-switch is declared `Ring0Entry` **by name, each carrying its reason** — the NMI
-(arrives between arbitrary instructions, reschedules nothing) and the halt IPI
-(never returns). Same move as `idt_vectors!`, one level down: the thing that
-must agree is declared once.
+`Ring3Entry` and `Ring0Entry` are the two things `IdtEntry` accepts, and its
+raw-pointer constructor is private. Every `direct` row of `idt_vectors!` answers
+which it is — the same column the error-code form already is, one level down —
+with no third spelling and no default; `syscall::init` takes one too, because
+`LSTAR` is an IDT slot by another name. Two rows are `ring0` and each says why:
+the NMI arrives between arbitrary instructions, including inside another entry's
+own save, and reschedules nothing; the halt IPI never returns.
+
+**The type does not prove the bracket is present.** Nothing short of reading the
+assembly does, and the doc says so rather than claiming more. What it makes
+unrepresentable is installing a handler *without answering the question*, which
+is exactly what `tlb_flush_entry` did for its whole life.
 
 ### 4.4 Not a `Drop` guard
 
@@ -296,31 +308,34 @@ in `entry.rs` insufficient.
 
 ---
 
-## 9. Stages
+## 9. Stages — all done
 
-Each lands on its own and leaves `main` compiling. No ABI change, so no sysroot
+One commit each, each leaving `main` compiling. No ABI change, so no sysroot
 claim.
 
 - **S0** — read the machine. §7. Done first, because nothing below is honest
-  until it has run.
+  until it has run, and it found three defects of its own.
 - **S1** — `arch/fpu.rs`: `UserFpState`, `INITIAL`, `fpu::init()`,
   `fpu::self_check()` (`FNINIT` + `LDMXCSR(0x1F80)` + `FXSAVE64`, compared
-  against `INITIAL` modulo `MXCSR_MASK`, per CPU). Wired to nothing.
+  against `INITIAL` modulo `MXCSR_MASK`, per CPU).
 - **S2** — `arch/entry.rs`; the three existing FP sites rewritten through it,
-  **still XMM+MXCSR only**. A pure refactor whose cost delta should measure
-  zero, which makes it the control for S3 and S4.
-- **S3** — bracket `common_entry` and `tlb_flush_entry`. **This is defect 2.**
-  Most likely to cost something; `#PF` is hot.
-- **S4** — swap the bracket body to `fxsave64`/`fxrstor64`. One place. **This is
-  defect 1.**
-- **S5** — `INITIAL` into `alloc_kernel_stack`'s frame (`loader/start.rs`); the
-  trampolines restore it. Closes a cross-process register **leak**: today a
-  fresh thread reaches Ring 3 with whatever the previous tenant of that CPU
-  left behind.
-- **S6** — the gate (§10).
-- **S7** — `Ring3Entry`, and the soft-float build assertion (§8).
+  still XMM+MXCSR only. It also closed defect 2's third instance
+  (`syscall_entry`'s epilogue, §3).
+- **S3** — bracket `common_entry` and `tlb_flush_entry`. **Defect 2.**
+- **S4** — the bracket body becomes `fxsave64`/`fxrstor64`. One place.
+  **Defect 1.**
+- **S5** — the loader's trampolines load the declared state, so a task that has
+  never been in Ring 3 starts from one. `FNINIT` would not do: it marks the x87
+  registers empty without clearing them, so an `FXSAVE` reads the old data back
+  out, and it does not touch XMM at all.
+- **S6** — the gate (§10), and the correction that made its page-fault half
+  real.
+- **S7** — `Ring3Entry`/`Ring0Entry`, and the soft-float build assertion (§8).
 
-S3 before S4 so the two cost components are separately attributable.
+S3 before S4 so the two cost components would be separately attributable. In the
+event they are not, and §12 says why: the effect is smaller than this host's
+run-to-run spread except in the six-pair interleaved A/B, which measures the
+branch as a whole.
 
 ---
 
@@ -339,14 +354,39 @@ New permanent `fpu_isolation`, three halves, all positive assertions:
 2. **Fault.** Child A is `fault_gate_child mf`; child B executes `FLDCW` and
    must survive.
 3. **Preservation.** One process pins a state, forces many transitions of each
-   kind — syscalls, page faults via `mmap` + first touch, timer preemption —
-   with an FP-heavy sibling on another CPU, and asserts bit-identity. The
-   page-fault arm fails on today's tree. Needs `--smp 2` or more.
+   kind — 20,000 syscalls, two demand page faults, a preemption spin — against
+   an FP-heavy sibling, and asserts bit-identity.
+
+**`smp=1`, and that is the stronger machine rather than the weaker one.** Two of
+the arms are about a register file carrying from one process to the next, which
+needs the two to share a CPU; on two CPUs that is a coin flip, which is why CI's
+own observation of the defect was intermittent.
+
+**An unbracketed transition only corrupts if it switches**, and arm 3 arranges
+that rather than hoping for it. Kernel code is soft-float, so a `#PF` that
+allocates a page and returns disturbs nothing however unbracketed it is; what
+does the damage is another task running Ring 3 code in between. The sibling
+sleeps 100 µs between bursts, so several wakes land inside a single 2 MiB fault
+— hundreds of microseconds, off the kernel's own fault trace — and
+`need_resched` is set by the time `common_entry` reaches its exit.
 
 **Negative control:** a `fpu-save-nothing` kernel feature under which
 `fpu_isolation` must fail. Per CLAUDE.md the feature **replaces the behaviour,
-never the verdict** — a feature that flipped an assertion would make its own
-gate vacuous.
+never the verdict** — the reservation, the alignment, the `rsp` bookkeeping and
+every assertion are the shipped ones, and what is absent is the `fxsave64`, the
+`fxrstor64` and the trampoline's load. QEMU has no device, machine property or
+`-cpu` flag that makes a guest's FPU carry over, so there is no other way to
+have a control at all.
+
+The driver collects every arm's verdict rather than stopping at the first,
+because the control's job is to show that *each* arm has teeth. Measured on that
+kernel, all seven fail and each says why:
+
+```
+FAILED: leak, round 0..2: a process started with the previous one's FP registers
+FAILED: fault, round 0..2: FLDCW took an exception the process never caused
+FAILED: preservation: the x87 control word did not survive … 0x0c7f became 0x037f
+```
 
 ---
 
@@ -366,21 +406,57 @@ Instruction count falls; µop count and latency very plausibly rise, because
   (known-issues §8). The TCG delta is recorded anyway and **labelled**, so
   nobody bisects a boot-time regression that is not one on real silicon.
 - **A microbenchmark**: a userland loop of N `SYS_CLOCK` calls timed with
-  `rdtsc`, reporting cycles per syscall. It **prints, never asserts** — a TCG
-  threshold is meaningless and a metal one drifts. A/B at S2 (expect zero), S3
-  and S4, alternating arms in one session.
+  `rdtsc`, reporting cycles per syscall (`tests/toyos-rust-tests/src/bin/`
+  `syscall_cost.rs`; read it with `cargo test -- syscall_cost --nocapture`). It
+  **prints, never asserts** — a TCG threshold is meaningless and a metal one
+  drifts.
 - CI's KVM guest is the second real instrument. **Metal is the verdict**, and
   that needs the owner.
 
-Numbers as measured are in §12.
+**There is no page-fault arm, and the reason is a finding of its own.** The
+first two attempts measured nothing: `sys_mmap` allocates and maps its whole
+region up front, so a first touch of a fresh anonymous mapping is an ordinary
+store, and `toyos-ld` writes `.bss` into the file, so the loader's `Anonymous`
+tail is always empty. What is left is a writable file-backed page, at 2 MiB of
+test image per fault — too expensive for a benchmark, which is why
+`fpu_isolation` buys two and `syscall_cost` buys none. Both are recorded in
+known-issues §8. The exception entry pays the same two instructions the syscall
+arm measures.
 
 ---
 
 ## 12. Measurements
 
-Filled in as the stages land. Every number here comes from a command that was
-run; where a figure is TCG it says so, because TCG prices instructions unlike
-hardware and a boot-time delta measured here is not a claim about the T14.
+Every number here comes from a command that was run. All of it is **TCG on the
+dev host**, where `FXSAVE` is a QEMU helper call: it is a labelled distortion
+and not a claim about the T14 (CLAUDE.md's 1.06×–6.5× non-uniformity, and the
+`fetch_add` that cost 350 ms of boot under TCG and nothing on silicon).
+
+**Instruction count.** 34 register-moving instructions become 2, in each of the
+eight binary copies the bracket replaced: `stmxcsr` + 16 `movdqu` in, 16
+`movdqu` + `ldmxcsr` out, against `fxsave64` and `fxrstor64`.
+
+**Cycles per `SYS_CLOCK`**, minimum over 9 repetitions of 20,000 calls,
+`kernel/` checked out from the merge base for `before` and from this branch for
+`after`, alternating, two sessions of three pairs:
+
+| session | before | after |
+|---|---|---|
+| 1 | 870, 896, 907 | 993, 1007, 1016 |
+| 2 | 891, 914, 956 | 1046, **1931**, 1093 |
+
+Taking each arm's minimum over all six pairs: **870 before, 993 after — +123
+cycles, +14%.** The bold outlier was taken at host load 14.94 with another
+worktree's suite running; it is left in because dropping a number for being
+inconvenient is how a measurement stops being one.
+
+**What the same numbers say about the refactor.** S2 replaced eight copies of
+the XMM+MXCSR sequence with one bracket and changed nothing about what is saved;
+S4 changed the body. The before arm above *is* the pre-branch kernel, so the
++123 is S4's, and S2's own cost is inside the noise of a single arm.
+
+**A boot-time figure is not offered.** The suite's own boot times move by more
+between runs on this host than the whole effect.
 
 ---
 
