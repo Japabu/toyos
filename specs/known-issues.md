@@ -4165,6 +4165,42 @@ log cannot tell you which it was.
 
 Trivial to fix the same way the kbd line already is.
 
+### OPEN — `screen_blocked_dump` asserts a whole-report property against one page of a paged report
+
+Red about a quarter of the time, on `main`'s own code. Found 2026-08-08 by a
+branch whose entire delta is three `.md` files — `git diff main...HEAD --
+':(exclude)*.md'` is empty, so the kernel, bootloader and initrd it booted are
+main's byte for byte, and no A/B against a second tree is needed to say so.
+
+**Rate, measured.** Eight isolated runs (`--jobs 1`, nothing else on the host):
+six green, two red. Two landing gates on the same branch red on it in the wide
+phase; the harness re-ran it alone both times and got `GREEN` once and
+`red again — the defect is real` once. So the `ALONE` verdict itself is a coin
+toss here, which is worth knowing before anyone trusts one.
+
+**Cause, from a captured red.** `tests/toyos.rs:3254` requires three strings on
+one screendump — `"== VERDICT:"`, `"cpu(s) answered"`, `"== deadlines:"`. But the
+report is longer than the screen, so the panic console pages it on a 3 s
+deadline, and the red capture ends:
+
+```
+[kernel 0.601 cpu0] == VERDICT: 1 overdue, 0 absurd, 0 unheld, 0 never ran
+[kernel 0.601 cpu0] === end of dump ===
+
+[page 3/3]
+```
+
+Page 3 of 3 carries the verdict and the tail. `== sched: N/N cpu(s) answered`
+(`kernel/src/sched/dump.rs:524`) is on an earlier page. The test passes or fails
+on **which page the deadline had advanced to when the screendump was taken**,
+which is a property of timing and not of the dump.
+
+The defect is the assertion, not the dump: a photograph of that machine does
+answer the question, on the page that carries it. Either the test steers the
+pager to each page it needs — PageUp/PageDown are polled for exactly that — or it
+asserts per page. Do not "fix" it by widening the deadline; that hides the
+coupling rather than removing it.
+
 ---
 
 ## 6. Build and toolchain
@@ -5320,6 +5356,142 @@ anything git ignores, or take an explicit list.
 
 Costs 16 KiB of a 672 MB initrd, so nothing breaks. The reproducibility claim
 does.
+
+### OPEN — every toolchain build runs Python, and every host link runs `cc`
+
+`specs/dependency-audit-2026-08-08.md` §3–§4 is the full inventory; this is the
+entry that says the two largest holes in *"Rust and QEMU, one command"* are real.
+
+`src/toolchain.rs:749` picks `./x` when `rust/x` exists, which it does. That file
+is a `/bin/sh` script whose whole job is `SEARCH="python3 python py python2 uv"`,
+and it execs `x.py` → `src/bootstrap/bootstrap.py` (55,550 bytes). So a clean
+clone cannot build a toolchain without Python 3. It is upstream's bootstrap and
+not our code, which is why it is stated rather than blamed — but the bar has no
+upstream exemption, and `bootstrap.py` can never run inside ToyOS.
+
+Separately, and measured with `rustup run toyos rustc --print link-args` on a
+trivial host binary: rustc invokes `"cc"` and sets
+`SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`. rustup installs
+neither. Every *host* binary goes through it — the build system, the harness,
+`toyos-ld`, `toyos-cc`, rustc stage2. **No guest binary does**: both
+`.cargo/config.toml`s under `bootloader/` and `kernel/` set
+`linker = "toyos-ld"`, so nothing that boots is touched.
+
+`src/main.rs:7`'s preflight checks `git`, `rustup` and `qemu-system-x86_64` and
+says nothing about either of these. The cheap half of the fix is to make the
+preflight and the README say what the machine actually needs.
+
+### OPEN — `df`, `ps` and `find` are external binaries the bar does not allow
+
+Three more, none of which comes with Rust or QEMU. Audit §5.
+
+- `src/worktree.rs:141` — `df -k`, `.expect("run df")`, so `worktree add` dies
+  without it. One free-space number.
+- `tests/common/hostload.rs:111` — `ps -Ao comm=` for gate A's `host:` line.
+  Degrades correctly (`.ok()?`), so its absence costs a diagnostic and not a run.
+  Its neighbour `getloadavg` is already reached through the `libc` crate, which
+  is the shape this one wants.
+- `toyos-fat32/tests/common/mod.rs:301` — `find <mount> -name '._*' -delete`,
+  sweeping macOS resource forks off a freshly-populated volume. **Not on the
+  known list of that file's macOS tools**, and it belongs there: it is reached by
+  the same fixtures as `newfs_msdos`/`hdiutil`/`fsck_msdos`, which is all 59
+  `#[test]`s in `toyos-fat32/tests/`.
+
+Reach of the three FAT tools, since "nine tests" understates it:
+`fsck_complaints` is reached by five `MACHINE_TESTS` entries (`esp_filesystem`,
+`toybox_cp_volume`, `kernel_log_file`, `log_partition_layout`,
+`log_partition_identity`), `src/image.rs`'s own `fsck` by two `#[test]`s that run
+under `cargo test --lib` — which is in the landing gate — and
+`toyos-fat32/tests/common/mod.rs` by all 59.
+
+### OPEN — `/bin/doom` is built from a moving branch head nobody pinned
+
+`userland/doom/build.rs:download_doomgeneric` fetches
+`https://github.com/ozkl/doomgeneric/archive/refs/heads/master.tar.gz`. No
+commit, no tag, no hash check. It runs once, when `userland/doom/doomgeneric`
+does not exist — so **which Doom sources you build is a function of when you
+first cloned**, two developers can differ, and nothing reports it.
+
+doomgeneric is a third-party C codebase this project builds and ships. CLAUDE.md
+says the sanctioned form is a fork: a real repo, a pinned base, a `toyos` branch,
+an entry in `forks.toml`. It has none of those and is not in `forks.toml` at all.
+This is the same reproducibility property `toyos-cc/tests/determinism.rs` and
+`toyos-ld/tests/determinism.rs` exist to protect, lost one layer above them.
+
+Five build-dependencies exist only to serve that download and the SoundFont one
+beside it — `ureq`, `webpki-roots`, `flate2`, `tar`, and `rustls-rustcrypto`
+pinned at `"0.0.2-alpha"`, which is hard to square with *"only general and often
+used rust crates"*. Making doomgeneric an ordinary fork takes all five with it.
+
+**And the downloads race the suite**, measured 2026-08-08 on this branch's first
+landing gate. A fresh worktree has no `assets/timgm6mb.sf2` — it is gitignored —
+so `metal_sim_compositor`, `metal_sim_pointer_churn` and `boot_partition_identity`
+red with *"declared in `untracked-assets` and is not there"*, while by the end of
+the same run the file was on disk with an mtime inside it and all three passed
+alone. Nothing sequences `download_soundfont` against the initrd builders that
+want its output, and the failure reads as a missing asset rather than as a race.
+
+### OPEN — `dosfstools`, which was refused, is installed by a committed workflow
+
+`.github/workflows/probe-toolchain.yml:39` installs it beside `qemu-system-x86`
+and `ovmf`. It only runs on `ci/probe-toolchain` pushes, so it is not on any
+path `main` takes — but it is committed, and a refused dependency left in the
+tree is how it comes back. `specs/ci-plan.md:242,404` discusses `fsck.vfat` as an
+option and does not record that the answer was no.
+
+### OPEN — what the repository ships is not all MIT OR Apache-2.0
+
+`specs/dependency-audit-2026-08-08.md` §7 has each item with its evidence. Six
+committed binary files — 11,094,369 bytes of the 14,634,080 git tracks — plus one
+committed source corpus sit outside the declared licence, and the README declares
+only one exception
+(`userland/doom` is GPL-2.0). Provenance had to be established from content,
+because `assets/` and `ovmf/` both entered in the initial squashed commit
+`52eb78e` and carry no attribution.
+
+Sharpest first:
+
+- **`tests/testcases/tinycc/46_grep.c`** carries `Copyright (C) 1980, DECUS` and
+  *"General permission to copy or modify, **but not for profit**"*. A non-free
+  clause, in a repository offered under MIT. It sits in TinyCC's `tests2` corpus
+  — 314 files here, 51 more in `tests/testcases/pp_tcc/` — which is LGPL-2.1 and
+  carries no `LICENSE`, `COPYING` or `README` of any kind.
+- **`assets/DOOM1.WAD`** (4,196,020 bytes, `IWAD`, 1,264 lumps) is the id
+  Software shareware IWAD, redistributable only on its own terms. It ships in
+  every image. The README's GPL note is about doom's *code* and does not cover it.
+- **`assets/JetBrainsMono-Regular.ttf`** says in its own name table that it is
+  SIL OFL 1.1. No OFL text is in the repository. Two derived artifacts inherit
+  the question: the committed `kernel/src/drivers/panic_console/font8x16.bin` and
+  the `share/fonts/*.font` tables in every initrd.
+- **`assets/icons/*.svg`** are all eight byte-identical to Phosphor Icons files
+  (four from `SVGs/bold/`, four from `SVGs Flat/bold/`; verified with `cmp`).
+  Phosphor is MIT and requires its notice; the `phosphor-icons/` directory
+  holding that notice is `.gitignore` line 7.
+- **`ovmf/*.fd`** (6,291,456 bytes) are a third-party EDK II build —
+  `edk2-gf0064ac3af`, off a Jenkins worker, read out of the binary — with no
+  licence, version or recipe recorded. They are load-bearing: `src/qemu.rs:101`
+  and `tests/common/qemu.rs:2090` point pflash at them, while every workflow
+  installs the `ovmf` apt package and the harness ignores it.
+- **`assets/wallpaper.jpg`** has **no determinable provenance**. Its EXIF holds
+  four tags and neither `Artist` nor `Copyright`; git history has nothing; the
+  README does not mention it. It ships as `share/wallpaper.rgb`. Recording the
+  open question rather than guessing is the point of this bullet.
+
+### OPEN — nothing in the tree checks any of the above
+
+Both violations that prompted the audit — `fsck_msdos` and the SoundFont's GPLv2
+— existed for months and were found by collision. There is no ledger of allowed
+crates, allowed binaries, or asset provenance, and no check reads one.
+
+`specs/dependency-audit-2026-08-08.md` §11 proposes three, all offline, all
+inside `cargo test --lib`, and prices each including what it cannot catch — the
+crate ledger is the one with teeth, the binary-literal scan is the weakest, and
+neither reaches `rust/`'s own dependencies or a third-party build script. The
+same constraint that governs fork pins governs these: **anything touching the
+network must be an on-demand command, never `cargo test` and never the landing
+gate.** Nothing was built, deliberately: every one of these would go red on the
+tree as it stands, and seeding the ledgers is a decision about which findings
+above are accepted.
 
 ---
 
