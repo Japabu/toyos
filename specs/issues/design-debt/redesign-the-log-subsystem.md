@@ -1,5 +1,5 @@
 ---
-status: open
+status: owner
 kind: question
 opened: 2026-08-08
 ---
