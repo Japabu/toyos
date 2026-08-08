@@ -115,8 +115,11 @@ jobs:
             exit 0
           fi
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs"
-          # `cancel-in-progress` is on, so a superseded run has no verdict in it;
-          # only the runs that concluded either way are samples.
+          # A run with no verdict in it is not a sample. `ci.yml` stopped
+          # cancelling itself on `main` for exactly this reason — three
+          # consecutive merges cancelled three consecutive runs and this
+          # question had nothing newer than the burst to read — but a run can
+          # still be cancelled by hand or by a timeout.
           runs=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
                    "$api?branch=main&status=completed&per_page=20" \
                  | jq -r '[.workflow_runs[]
