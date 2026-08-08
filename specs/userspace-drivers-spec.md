@@ -91,7 +91,7 @@ see (`virtio_sound.rs:515-516`, `:561` registering only the second) — and
 virtio-gpu publishes framebuffer and cursor pages, never its ring pool. Only
 virtio-net publishes the rings.
 
-Read off the code, **not staged**, and filed as such in `specs/known-issues.md`
+Read off the code, **not staged**, and filed as such in `specs/issues/`
 §1 with the reproduction written out. It is here because it settles the framing:
 the question is not whether to expose a DMA engine to userland. That has already
 happened. The question is whether the thing it can reach is bounded.
@@ -188,7 +188,7 @@ A driver has to find its device and read what kind it is. `pci::enumerate`
 function; the capability exposes a read-only projection of that list.
 
 **Claiming is not first-come.** `SYS_OPEN_DEVICE` is first-come and ungated today
-(`known-issues.md` §1: "a process that beats the daemon to a device, or claims it
+(`specs/issues/isolation/`: "a process that beats the daemon to a device, or claims it
 after the daemon dies, holds everything the claim unlocks"), and reproducing that
 for something that hands out a DMA engine would be a strictly worse version of an
 already-open defect. A claim requires a right on a `SysCap` handle granted by init
@@ -273,7 +273,7 @@ Consequences, each deliberate:
 - **An IOVA is not a capability.** It names a location inside a domain the calling
   process exclusively holds. Leaked to another process it grants nothing, because
   that process cannot program the device. This is the question
-  `known-issues.md` §1 says to ask of every new syscall taking a raw id, asked and
+  `specs/issues/isolation/` says to ask of every new syscall taking a raw id, asked and
   answered rather than skipped.
 - **The range must be resident.** A demand-paged VA with no physical page behind it
   cannot be mapped; the kernel faults the pages in or returns `InvalidArgument`.
@@ -281,7 +281,7 @@ Consequences, each deliberate:
 - **A DMA mapping pins its pages.** The mapping holds the `PhysPage` values, so
   `SYS_MUNMAP` of a DMA-mapped range cannot return them to the PMM while the device
   can still write them. This is exactly the `SYS_PIPE_MAP`-mapping-outlives-its-page
-  defect (`known-issues.md` §1) with a NIC instead of a process, and it is closed
+  defect (`specs/issues/isolation/`) with a NIC instead of a process, and it is closed
   the same way `specs/capability-handles-spec.md` closes that one: by a reference
   that keeps the thing it names alive.
 - **Granularity is 2 MiB**, inherited from the kernel's page size
@@ -305,7 +305,7 @@ An MSI is edge-triggered and needs no device-side acknowledgement; a level-trigg
 INTx line must be masked at the source or it re-asserts forever, and masking it
 means the kernel touching the device. So: **a function offering neither MSI-X nor
 MSI is not eligible for userspace.** `pci.rs` already refuses such a controller by
-name for xHCI (`known-issues.md` §8, "a function offering neither is not
+name for xHCI (`specs/issues/hardware/`, "a function offering neither is not
 initialised at all"), so the shape exists.
 
 Two pieces of existing work this needs:
@@ -400,7 +400,7 @@ which is why they are **not** on the deferred zero-handle queue.
 `specs/capability-handles-spec.md` §5.2 drains that queue at syscall exit, at
 `do_schedule` entry, and **in the idle loop**, and putting an uninterruptible device
 operation in front of `pass()` is precisely the `esp_log` defect
-(`known-issues.md` §10: 2.0–9.7 ms per flush against a 23.219 ms audio pipeline,
+(`specs/issues/boot-media/`: 2.0–9.7 ms per flush against a 23.219 ms audio pipeline,
 and it is still the residual under gate A's red run). One instance of that mistake
 in the tree is enough.
 
@@ -447,7 +447,7 @@ stages 1–4.
 | **8** | **virtio-console deleted (§3.4).** Console on the 16550 for every profile; `serial.rs`'s fifteen lines and `virtio.rs` itself go. | full suite; boot-time and log-throughput A/B recorded in the commit message |
 | **9** | **The refusal.** `specs/iommu-spec.md` §9 stage I5. Sequenced here because before this point a refusal costs every machine and protects nothing that has moved. | `cargo test -- iommu_refusal` |
 | **10** | **i8042 moves** — needs a port-IO capability, and that is a separate discussion: an unrestricted IOPB would reach 0xCF8/0xCFC and every other port on the machine, so it has to be a per-port bitmap. Optional; the exception-set criterion permits the i8042 to stay if a "press a key to page the panic screen" feature is ever wanted, because that is the kernel needing a keyboard while userspace is dead. | `cargo test -- metal_sim_input i8042` |
-| **11** | **Audit and the end condition.** §7.4's mechanical checks in CI; CLAUDE.md architecture updated; `specs/known-issues.md` entries closed. | the §7.4 commands, in CI |
+| **11** | **Audit and the end condition.** §7.4's mechanical checks in CI; CLAUDE.md architecture updated; `specs/issues/` entries closed. | the §7.4 commands, in CI |
 
 Stage 2 is worth landing first regardless of whether the rest of this plan
 proceeds.
@@ -544,7 +544,7 @@ would never construct:
 - **Reclaim racing a second claim** of the same device from another process.
 - **A malformed DMAR** — the parser is fed crafted tables by a kernel-feature
   self-test, the way `xhci-xecp-selftest` feeds eight synthetic extended-capability
-  lists (`known-issues.md` §8). Firmware is untrusted input.
+  lists (`specs/issues/hardware/`). Firmware is untrusted input.
 
 ### 7.5 The mechanical end condition
 
@@ -591,7 +591,7 @@ driver file is not.
 7. **A driver framework in userland.** The first userspace driver is a program.
    The second one may share a crate with it. A framework before there are three is
    an abstraction with no evidence behind it.
-8. **Hotplug.** Unimplemented today (`known-issues.md` §8), and this plan does not
+8. **Hotplug.** Unimplemented today (`specs/issues/hardware/`), and this plan does not
    add it. §7.4 makes the refusal explicit rather than leaving it undefined.
 9. **Restarting a crashed driver's device state.** init respawns the process; the
    device was reset at reclaim; the driver initialises it from scratch. There is no

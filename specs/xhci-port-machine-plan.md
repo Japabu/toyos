@@ -52,7 +52,7 @@ has 25 call sites of the five blocking primitives across three files.
 mailbox drain.** `sched/driver.rs`'s `drain_irqs` is the only caller, and both
 `pass` and `pass_block` call it before `SchedPass::begin`. So the 2 s above is
 spent while the CPU is holding every message addressed to it. Already filed:
-known-issues "A scheduler pass may spend two seconds in xHCI before it drains
+`specs/issues/` "A scheduler pass may spend two seconds in xHCI before it drains
 its mailbox", with the T14's `retire_task` 1 s guard panic as the observed
 consequence.
 
@@ -462,13 +462,13 @@ call site contradicts.
 What X2 does **not** fix even then, stated so the task is not closed on a
 half-answer:
 `storage_read`/`storage_write` still run SCSI commands under the same lock from
-whatever thread faulted, and known-issues already says that is not fixable by
+whatever thread faulted, and `specs/issues/` already says that is not fixable by
 this conversion. That path does not run inside `drain_irqs`, so #156's prologue
 is closed and the lock-hold finding is not.
 
 Price: no new code beyond X2 — it is X2's proof obligation. One guest gate that
 measures the pass duration across a plug, plus the `sched-check` pass-budget
-assertion known-issues records as never enabled.
+assertion `specs/issues/` records as never enabled.
 
 ### #100 rides X2; there is no fourth stage
 

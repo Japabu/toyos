@@ -700,7 +700,7 @@ impl Day {
 const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
     test: "desktop_window_child",
     task: 156,
-    spec: "specs/known-issues.md §3, \"EXPECTED RED, pending #156\"",
+    spec: "specs/issues/kernel/desktop-window-child-freeze.md",
     // The rule that decides this list, so that the next fragment added to it has
     // one to be judged against: **a message belongs here when its failure is the
     // desktop ceasing to answer after a window closed.** That is what both open
@@ -726,7 +726,7 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
 }, ExpectedFailure {
     test: "hda_tone",
     task: 88,
-    spec: "specs/known-issues.md §4, \"HDA: the captured tone is not one sine\"",
+    spec: "specs/issues/audio/hda-tone-phase-check.md",
     // Only the phase check. Everything else `hda_tone` asserts — the kernel
     // binding one controller, soundd walking the codec and naming its pin, the
     // whole allow-list, a tone at full amplitude, no mid-tone silence — reds the
@@ -2644,7 +2644,7 @@ fn run_screen_test(
                 // never a console that is behind. It used to be 45 s of host
                 // clock, and `round 1: the guest never printed CHURN-DONE` at
                 // 598 s in the wide phase was that number expiring rather than
-                // anything about this panel (known-issues §6).
+                // anything about this panel (`specs/issues/build/`).
                 let done = format!("CHURN-DONE {start} {count}");
                 let mut printed = String::new();
                 if let Err(why) = await_guest(
@@ -4675,7 +4675,7 @@ fn shell_answers(qemu: &mut QemuInstance, log: &mut String) -> Result<(), String
 /// **Two waits, because the two ways this fails are different questions.** The
 /// first is "has the terminal come up", and it used to be answered by retyping
 /// against `qemu::budget(20 s)` — a guess at how long a desktop takes to come up
-/// on the host of the day, which is exactly the shape `specs/known-issues.md` §7
+/// on the host of the day, which is exactly the shape `specs/issues/design-debt/`
 /// bills for: `desktop_audio_client` 385 s wide against 13 s alone, and a
 /// landing gate that is a coin toss. The terminal knows when it is up and now
 /// says so, so this asks it and waits on the guest's own liveness. The second is
@@ -4689,7 +4689,7 @@ fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Resul
     // raw framebuffer, and the question is the same one.
     const SURFACE_UP: [&str; 2] = ["terminal: ready", "console: ready"];
     // **And the state in which it is never coming.** `/bin/terminal` exits when
-    // it loses the race with the compositor (known-issues §3), which is a fact
+    // it loses the race with the compositor (`specs/issues/kernel/`), which is a fact
     // the log states outright at 0.6 s — so waiting for a ready marker that
     // cannot arrive is not a slow guest but a defect, and the only thing a
     // ceiling decides there is how many minutes of a lane it costs to say so.
@@ -4702,7 +4702,7 @@ fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Resul
     if !up(log) {
         return Err(
             "the surface owner exited before it ever said it was ready — /bin/terminal races \
-             the compositor at boot, specs/known-issues.md §3"
+             the compositor at boot, `specs/issues/kernel/`"
                 .to_string(),
         );
     }
@@ -4761,7 +4761,7 @@ fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Resul
 /// and here that cuts both ways: #156 is a *freeze*, so the machine this
 /// retries against goes silent, and the wait ends in fifteen seconds instead of
 /// spending `qemu::budget(20 s)` — up to four minutes at width 12 — hammering
-/// GUI+Q at a desktop that has stopped. `specs/known-issues.md` §7 names that
+/// GUI+Q at a desktop that has stopped. `specs/issues/design-debt/` names that
 /// cost as a lane this test holds for a quarter of every run, which is what puts
 /// whichever desktop is dispatched beside it into a red nobody acts on.
 fn close_focused_window(qemu: &mut QemuInstance, log: &mut String, new: usize) -> bool {
@@ -5418,7 +5418,7 @@ fn desktop_audio_client() -> Result<(), String> {
     // **The count is the verdict and the wait is not.** Both of these used to be
     // `budget(60 s)`, which is a claim that a desktop with two audio clients on
     // it finishes inside a minute times the width — and at 385 s wide against
-    // 13 s alone it was the single most expensive entry in known-issues §7. What
+    // 13 s alone it was the single most expensive entry in `specs/issues/design-debt/`. What
     // ends the wait now is soundd going quiet, and what fails it is still the
     // number of connects.
     if let Err(why) = await_guest(&mut qemu, &mut log, "soundd to take up both connects", |log| {
@@ -5492,7 +5492,7 @@ fn open_terminal(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Resu
 /// Ctrl+Alt+D at a live desktop: every CPU answers, and the two halves of the
 /// report agree.
 ///
-/// The instrument known-issues §5 files against, built because QEMU cannot
+/// The instrument `specs/issues/diagnostics/` files against, built because QEMU cannot
 /// stage the T14's audio wedge and a question the owner can answer beats a fix
 /// nobody can verify. Until this landed the dump listed the *calling* CPU's
 /// parked threads and named them by scheduler key, so it could confirm a park
@@ -5656,7 +5656,7 @@ fn soundd_clients_since(log: &str, from: usize, verb: &str) -> usize {
 /// It drives the same in-guest reader as [`i8042_keyboard`], and not only for
 /// the userland half of the assertion: on a fully idle machine the kernel's
 /// log ring flushes one line behind, so the last trace line would never reach
-/// the console (filed in known-issues). A guest polling its fd keeps the ring
+/// the console (filed in `specs/issues/`). A guest polling its fd keeps the ring
 /// moving.
 fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
     let qemu = &mut boot.qemu;
@@ -8962,7 +8962,7 @@ fn run_machine_test(
 
             // `TestResult::serial` is everything the console carried while the
             // guest ran, netd's own lines included — the daemon and the test
-            // share one window (known-issues §6), which here is what makes the
+            // share one window (`specs/issues/build/`), which here is what makes the
             // daemon's side of the story readable at all.
             console.push_str(&result.serial);
             for named in ["netd: dropping pid", "netd: refusing pid"] {

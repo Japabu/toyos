@@ -380,7 +380,7 @@ somebody will want the moment `hosted-rustc = true` goes back on.
 **This stage has no gate, and that is a finding rather than an omission.**
 Nothing in the harness boots `system.toml` at all — every test config is its
 own file — so no suite test could go red for this change in either direction.
-Recorded in `known-issues.md` §6.
+Recorded in `specs/issues/` §6.
 
 ### 4.1 What it measured
 
@@ -434,7 +434,7 @@ and every new worktree red on a file none of them was ever going to have.
 ## 6. One profile
 
 `--release` bundles four knobs and this project wants three of them. Shipping
-stock `--release` silently turns overflow checks off, and `known-issues.md`'s
+stock `--release` silently turns overflow checks off, and `specs/issues/`'s
 "two crafted-ELF kernel panics the first hardening wave did not reach" is what
 that costs: both were found *because* the kernel builds with `overflow-checks`
 on, and one of them — `e_phoff + ph_entry_size * e_phnum` in `usize` — was a

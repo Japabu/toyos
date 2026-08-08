@@ -568,7 +568,7 @@ toyos -> /Users/jan/Dev/jan/toyos/rust/build/aarch64-apple-darwin/stage2
 point at *the current tree's* stage2, and `ensure` then re-links it. **Two
 worktrees would relink it away from each other on every build**, and a build in
 tree A between B's relink and A's next check either uses B's compiler or fails.
-That failure already has a name in known-issues §6 — `'rustc' is not installed
+That failure already has a name in `specs/issues/build/` — `'rustc' is not installed
 for the custom toolchain 'toyos'` — and today it is a within-tree race window.
 Worktrees would make it the steady state. **This is a hard blocker for #117 and
 it must be solved before any worktree runs a build**, not discovered by it.
@@ -780,7 +780,7 @@ default arguments, printed 400 lines to a console nothing was reading, and
 passed on its exit code. Making its arguments required is what surfaced that; it
 is in `RUST_SKIP` now, beside the other bins that are driven rather than run.
 
-Two things this found and did not fix are in `specs/known-issues.md` §8: the
+Two things this found and did not fix are in `specs/issues/hardware/`: the
 collapsed-scroll paint the workload believed it exercised is unreachable through
 a pipe and is asserted by nothing, and `Console::flush` records the rightmost
 glyph column as painted when the scrollbar clamped the blit away from it.
@@ -859,7 +859,7 @@ wants the post-cut profile, not this one.
   `allocator_stress` went from 1 s to past its 5 s. A per-test wall-clock ceiling
   *is* the tail's definition; the reasoning simply had the wrong median in it.
   It cost 114 red of 238 to learn, because a timeout desynchronises every later
-  test on that boot — known-issues §6, and a defect that predates this work.
+  test on that boot — `specs/issues/build/`, and a defect that predates this work.
 - `xhci_second_controller` joins them on its own evidence: at width 4 its four
   injected pointer events arrived and **all five keys were lost**, which reads
   exactly like the defect it exists to catch. Host-paced injection has no flow
@@ -1148,12 +1148,12 @@ worktrees' suites:
   `Sched::Parallel`, red only under five concurrent suites.
 - **`usb_transport_break`: "the transport broke 2 times; the injection is armed
   once per boot", green alone.** Also pre-existing — and not load at all, which
-  took until `specs/known-issues.md` §8 to establish. Five concurrent suites
+  took until `specs/issues/hardware/` to establish. Five concurrent suites
   slowed the host enough for the guest to win a race it loses on a quiet one,
   which is the same variable KVM changes by 50x; the defect underneath was the
   driver's, and load was only ever the thing that exposed it.
 
-Both are in `specs/known-issues.md`. Neither was introduced here, and both are
+Both are in `specs/issues/`. Neither was introduced here, and both are
 exactly what the mechanism exists to surface.
 
 ## 5.5 Wave 6: the regression, and pacing as the general fix
@@ -1217,7 +1217,7 @@ line, so an injection can be driven by what the guest has printed.
   **every injected packet arrived**, plus `0 discarded`, `0 overruns`,
   `0 dropped`, `0 lost edges` off the driver's own line — counters that a
   starved guest could previously have explained and now cannot. The lead was 32
-  for its first year and that is what made the test flaky: known-issues §8.
+  for its first year and that is what made the test flaky: `specs/issues/hardware/`.
 - `input_events_run` is the shared sequence of `metal_sim_input` and
   `xhci_second_controller` as a script whose every step waits for the guest to
   print what the step before it produced.
@@ -1289,7 +1289,7 @@ of it anyway, both fixes on their own terms and neither a response to the load:
   next command block because the Bulk-Only Reset had gone out while the
   abandoned transfer could still be answered. A driver defect that lost a write,
   not a measure of how much of the host the guest had
-  (`specs/known-issues.md` §8). The lesson for this document: a red attributed
+  (`specs/issues/hardware/`). The lesson for this document: a red attributed
   to load without the mechanism being read out of the log is a guess, and a
   costs table is where a guess stops being questioned.
 
@@ -1298,7 +1298,7 @@ the metal-sim desktop group — one vCPU at 100% for twenty minutes, no output,
 killed rather than waited out (`metal_sim_compositor_stall`'s ceiling is
 `budget(240 s)`, 48 minutes at width 12). That group is green three times out of
 three in isolation on the same tree and green in every full run that completed.
-Both are filed in `specs/known-issues.md`.
+Both are filed in `specs/issues/`.
 
 ## 5.6 The host's guest budget, and a run that knows it was invalid
 
@@ -1480,7 +1480,7 @@ are twelve concurrent `cargo build`s and no guest at all, and the semaphore that
 was written to stop four agents putting 48 guests on 14 cores was, in that
 window, guarding nothing.
 
-Measured on 2026-08-07 while the eight-landing storm in `specs/known-issues.md`
+Measured on 2026-08-07 while the eight-landing storm in `specs/issues/`
 was under way: **load average 49.9 on 14 cores, twelve `rustc`/`cargo` processes,
 and exactly one QEMU guest live.** The one worker that had got as far as booting
 had a fiftieth of the machine its wall-clock margins were written for. Two of the
@@ -1556,7 +1556,13 @@ so `flock`'s ordering is given up nowhere. Gate:
 
 ## 5.8 Wave 7: the wall-clock verdict, and what was hiding behind it
 
-`specs/known-issues.md` §6's list of `Sched::Parallel` tests that red beside
+**The direction CLAUDE.md does not state.** It says a red that is green alone
+names the classification as the bug. The converse case is a machine-wide kernel
+panic: it reds whichever test happened to be running, so the red's name is the
+workload and never the cause — including when the harness re-runs that test
+alone, it reds again, and the run reports the defect as real.
+
+`specs/issues/build/`'s list of `Sched::Parallel` tests that red beside
 other guests had one shared shape: a test waits a number of host seconds for the
 guest to do something, and reports the *content* it was going to assert when the
 number expires. §5.5.2 fixed that for injection by pacing; this is the same idea
@@ -1616,7 +1622,7 @@ keystroke, which is about what a repaint costs.
 ### 5.8.3 What the guard was hiding
 
 **Every one of `main`'s three reds was the `/bin/terminal` boot race**
-(known-issues §3), and every one was reported as `nothing typed at the terminal
+(`specs/issues/kernel/`), and every one was reported as `nothing typed at the terminal
 window reached a shell` with `ALONE: GREEN` under it. Every red suite in the
 session — both arms — carried that race in a boot log, and every green suite did
 not.

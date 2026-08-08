@@ -857,7 +857,7 @@ impl XhciController {
     /// driver sends. That is a second broken transfer out of one fault, and a
     /// caller's write lost with it. Whether the window opens at all is a race
     /// between the guest and the device, which is why the dev host has never
-    /// seen it and CI reproduces it every run (`specs/known-issues.md` §8).
+    /// seen it and CI reproduces it every run (`specs/issues/hardware/`).
     ///
     /// [`Owed`](super::Owed) is what keeps that order rather than a comment.
     /// Everything this says to the device is [`Self::reset_the_device`], whose

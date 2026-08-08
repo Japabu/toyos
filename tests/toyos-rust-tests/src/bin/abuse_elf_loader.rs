@@ -413,7 +413,7 @@ fn main() {
     //     on the push.
     //
     //     This case is also the actuator for the allocator-lock defect
-    //     (known-issues §2): the >2 MiB assert fires inside
+    //     (`specs/issues/panic-path/`): the >2 MiB assert fires inside
     //     `KernelAllocator::alloc` *while it holds the dlmalloc lock*, so the
     //     recovered CPU's next allocation spins on a lock the dead thread
     //     still owns. Nothing else in the suite stages that, which is part of

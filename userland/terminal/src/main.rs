@@ -71,7 +71,7 @@ fn main() {
     // with no trace — which is what the desktop tests used to compensate for by
     // retyping against a clock, making every one of their verdicts a statement
     // about how long a desktop takes to come up on the host of the day
-    // (`specs/known-issues.md` §7).
+    // (`specs/issues/design-debt/`).
     eprintln!("terminal: ready");
 
     loop {

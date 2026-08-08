@@ -67,7 +67,7 @@ then complete only on submit-time readiness or on close. Neither loss was
 observable at the time — soundd's streaming wakes came from its own armed DLL
 timer and it had no idle path yet, and netd's NIC poll only matters at a full
 idle that interactive use never reaches. Restored in aeeaa01 (audio) and its
-network sibling; both commit messages and the known-issues entry originally
+network sibling; both commit messages and the `specs/issues/` entry originally
 attributed the deletion to Stage 7c, which only renamed `EventSource` →
 `io_uring::Source` and does not touch `drain_irqs`. The 7c review compared two
 post-7a trees, found them identical, and concluded there was nothing there.
@@ -209,7 +209,7 @@ task's context starts at 1, the level `trampoline_entry` discharges. This also
 means a dying context's depth leaves with it, so a thread killed while holding
 locks strands nothing on the CPU.
 
-The consequence the drift was hiding is recorded in `specs/known-issues.md`: with
+The consequence the drift was hiding is recorded in `specs/issues/`: with
 the count conserved, `preempt::enable`'s slow path can never fire inside a
 syscall, so §7.4's "pass at the `preempt::enable` slow path" is not a safe point
 in syscall context and RT wake latency there is bounded by the whole syscall.
@@ -441,7 +441,7 @@ enumerates hot-plugged devices and recovers broken endpoints on a 2 s deadline
 (`xhci::USB_TIMEOUT_NS`) while holding a ticket spinlock — the driver's own
 doc-comment says so. `MAX_PASS_NS` is 200 µs. A CPU inside that recovery holds
 every message addressed to it, and `retire_task`'s deadline is the only thing in
-the tree that notices. Recorded in `specs/known-issues.md`; not fixed here,
+the tree that notices. Recorded in `specs/issues/`; not fixed here,
 because closing it means making xHCI enumeration asynchronous.
 
 ### The desktop freeze is a halted machine, not a wedged one (open, #156)
@@ -554,7 +554,7 @@ claim's `Msg::Wake` follows it within two instructions, cpu0 cannot halt with a
 non-empty mailbox (`SleepArm::confirm`), and a post to a CPU that has published
 SLEEPING returns `Kick::Send` — so the protocol still has an answer for every
 ordering that could be constructed by reading it. `desktop_window_child` stays
-an expected red and is not evidence either way (known-issues §3). And nothing
+an expected red and is not evidence either way (`specs/issues/kernel/`). And nothing
 here says anything about the T14, where 3 of 8 CPUs missed a kick and this
 machine's 8 answered.
 
@@ -602,7 +602,7 @@ GUI+Q reaches the compositor, the window goes, the client leaves with `code=0`
 — and then the shell exits, and the terminal after it, so the desktop goes
 from two windows to none inside one 2 s stats interval. `close_focused_window`
 waits for `windows=1`, never sees it, and reports "GUI+Q never reached the
-compositor", which is the message known-issues §3 already says names the wrong
+compositor", which is the message `specs/issues/kernel/` already says names the wrong
 thing. It is the shell-exit defect that entry describes, and it now fires at
 the *second* probe — the owner's case, a live client whose window is taken
 away — rather than only at the first.
@@ -625,7 +625,7 @@ boot that got further — snake now *leaves* when its window is closed, `code=0`
 after 1224 ms of CPU, where #141 is a winit app that spins forever instead.
 
 Nor is it a regression from the deadline fix: `11a88f4` wrote those same three
-exits into known-issues at 17:32, and `add6aeb` landed at 18:05 and is not an
+exits into `specs/issues/` at 17:32, and `add6aeb` landed at 18:05 and is not an
 ancestor of it.
 
 ### The desktop was told to close twice, and the second GUI+Q took the terminal
