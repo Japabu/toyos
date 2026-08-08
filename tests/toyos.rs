@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
 use common::{audio, compile, faults, hostload, screen, serial, stats, storage, usb};
+use toyos_build::testargs::Shard;
 
 struct TestDef {
     name: String,
@@ -110,6 +111,13 @@ impl HostSlots {
 /// one task among sixty.
 const SHARED_BLOCK: Sched = Sched::Parallel;
 
+/// How many times a shared block will answer a dead guest with a new one.
+///
+/// Bounded because a block whose every member kills the guest must not boot one
+/// per test; three because the failure it exists for is one test taking the boot
+/// down, and a block that does it four times has a different problem.
+const MAX_SHARED_REBOOTS: usize = 3;
+
 // Rust helper binaries that are spawned by tests, not tests themselves.
 const RUST_SKIP: &[&str] = &[
     "segfault_child",
@@ -170,6 +178,33 @@ const RUST_SKIP: &[&str] = &[
     // 4 MiB and every other test boots that config. `doom_sound_flood` runs it
     // on `tests/doomcase`.
     "doom_sound_flood",
+    // Its failure mode is a CPU that never runs anything again, so on the
+    // shared boot it would be reported against whichever test came next — and
+    // every one after that. `short_sleep_livelock` gives it a boot of its own.
+    "abuse_short_sleep",
+    // The four below were **running twice under one name**, once here on the
+    // plain boot and once as the test that owns the name, and the collision was
+    // invisible: `check_registration` compared the three declared lists against
+    // each other and never against the binaries the registry discovers.
+    // `check_no_collisions` closes that, and this is what it found.
+    //
+    // Two verdicts under one name is not extra coverage, it is a name that
+    // cannot be read: `retry_task` searches the shared registry first, so a
+    // machine test of one of these that failed wide was re-run *as the shared
+    // binary* and its `ALONE:` line was about a different test. What the shared
+    // copy adds is the binary exiting 0 on a boot that gives it nothing to
+    // measure — `cache_eviction` in 132 ms against the 22.5 s its own device
+    // shape costs (run `31247206462`).
+    //
+    // `cache_eviction` needs the small NVMe that makes the cache evict at all.
+    "cache_eviction",
+    // Needs an HDA controller, which `tests/testcases` has none of.
+    "hda_client_stall",
+    // Gate A's two, whose verdict is the wav the device captured — which the
+    // shared boot takes no capture of. The comment below has claimed since it
+    // was written that they are excluded from this boot; now they are.
+    "audio_tone",
+    "audio_tone_load",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -332,6 +367,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     ("nvme_wide_sector", Sched::Parallel),
     ("iommu_discovery", Sched::Parallel),
     ("readdir_bound", Sched::Parallel),
+    ("short_sleep_livelock", Sched::Parallel),
     ("i8042_health", Sched::Parallel),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
@@ -7324,6 +7360,42 @@ fn run_machine_test(
             }
             Ok(())
         }
+        "short_sleep_livelock" => {
+            // Task #156. A `nanosleep` whose deadline is already past when the
+            // pass arms the one-shot armed the register's one-tick minimum, and
+            // the Ring 0 timer stub reloads whatever was last armed — so the
+            // CPU took that interrupt again before it could execute the
+            // instruction after the `wrmsr` that armed it, forever. Eight boots
+            // of the owner's T14 caught it twice by NMI, at
+            // `arm_one_shot+0x8d` and at `timer_entry+0x0`, which are the two
+            // instruction boundaries of exactly that loop
+            // (`specs/metal-logs/2026-08-08-cpu0/`).
+            //
+            // Its own boot because the failure is a CPU that never runs
+            // anything again: on the shared boot it would be reported against
+            // whichever test followed it.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions::default(),
+            );
+            serial::Serial::boot(&qemu).must_be_clean()?;
+
+            let result = qemu.run_test("test_rs_abuse_short_sleep", Duration::from_secs(60));
+            if let Some(err) = &result.error {
+                return Err(format!(
+                    "a sleep shorter than one LAPIC tick took the CPU with it: {err}\nserial:\n{}",
+                    result.serial,
+                ));
+            }
+            if !check_rust_result(&result) {
+                return Err(format!("abuse_short_sleep failed:\n{}", result.stdout));
+            }
+            serial::Serial::named("test serial", result.serial.as_str()).must_be_clean()?;
+            eprintln!("  [sleep] {}", result.stdout.lines().last().unwrap_or("").trim());
+            Ok(())
+        }
         "heap_ceiling_recovery" => {
             // A panic inside the kernel allocator's own lock left the heap
             // locked for the rest of the boot: the panicking thread never
@@ -8408,7 +8480,7 @@ fn run_machine_test(
 
             // A baseline first: churn against a compositor that was never
             // drawing would be a green run proving nothing.
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + qemu::budget(Duration::from_secs(20));
             while std::time::Instant::now() < deadline && frames(&console) < 1 {
                 console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
             }
@@ -8449,7 +8521,22 @@ fn run_machine_test(
 
             // The churn has to have reached the guest, or this gate is a
             // twenty-second sleep with an assertion after it.
-            let bound = console.matches("merges as source").count();
+            //
+            // **Waited for rather than slept for.** The three `SETTLE` drains
+            // pace the *host* through one cycle; whether the guest's console has
+            // caught up by the last of them is a fact about how fast the machine
+            // is. On a KVM runner it had not — the last two cycles' bindings were
+            // still on their way out when the count was taken, and the test read
+            // six of eight as a driver that missed them (run `31246245541`,
+            // `specs/ci-plan.md` §7.3). The assertion is the same one; what
+            // changed is that a console behind the guest costs wall clock instead
+            // of a verdict.
+            let bindings = |text: &str| text.matches("merges as source").count();
+            let deadline = std::time::Instant::now() + qemu::budget(Duration::from_secs(20));
+            while std::time::Instant::now() < deadline && bindings(&console) < CYCLES {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            let bound = bindings(&console);
             if bound < CYCLES {
                 return Err(format!(
                     "{CYCLES} plug/unplug cycles bound {bound} pointer sources — the churn did \
@@ -8479,7 +8566,7 @@ fn run_machine_test(
             // reporting interval is 2 s, so two of them cannot be satisfied by
             // frames the compositor produced before the first cycle.
             let mut after = String::new();
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + qemu::budget(Duration::from_secs(20));
             while std::time::Instant::now() < deadline && frames(&after) < 2 {
                 after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
             }
@@ -10194,9 +10281,34 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
             let mut done = 0usize;
             let outcome = catching(|| {
                 let mut qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
+                let mut reboots = 0usize;
                 for test in &tests {
                     let start = common::clock::mark();
-                    let result = qemu.run_test(&test.qemu_name, test.timeout);
+                    let mut result = qemu.run_test(&test.qemu_name, test.timeout);
+                    // **A guest that stopped answering is answered with a new
+                    // one.** Its turn came, its whole ceiling passed, and it was
+                    // never announced — so what this measured is the previous
+                    // test's wreckage and not this one. Run `31241099454` is the
+                    // bill: `abuse_gpu_resolution` took the shared boot with it
+                    // and the 150 tests behind it each paid a full ceiling for a
+                    // guest that was gone, 65 minutes of nothing and a job
+                    // cancelled at 90.
+                    //
+                    // A reboot rather than an abandonment because every one of
+                    // those tests still has a verdict owed to it, and the
+                    // alternative is a suite that reports 150 reds it never ran.
+                    // Bounded, because a block whose every member kills the
+                    // guest must not boot one per test.
+                    if result.boot_stopped_answering() && reboots < MAX_SHARED_REBOOTS {
+                        reboots += 1;
+                        eprintln!(
+                            "  ---- the shared boot stopped answering before {}; rebooting \
+                             ({reboots}/{MAX_SHARED_REBOOTS}) ----",
+                            test.name
+                        );
+                        qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
+                        result = qemu.run_test(&test.qemu_name, test.timeout);
+                    }
                     let reason = (!(test.check)(&result)).then(|| {
                         result
                             .error
@@ -10248,16 +10360,31 @@ impl Task<'_> {
 
 /// Where the last run in this worktree left what each test cost it.
 ///
-/// Under `target/`, so it is per-worktree and never committed: it is a *hint*
-/// about how to order a queue and never an input to a verdict. A wrong number
-/// costs some idle lane time; a missing one costs nothing at all.
+/// Under `target/`, so it is per-worktree: it is a *hint* about how to order a
+/// queue and never an input to a verdict. A wrong number costs some idle lane
+/// time; a missing one costs nothing at all.
 fn durations_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-durations")
 }
 
-fn load_durations() -> BTreeMap<String, Duration> {
-    let mut out = BTreeMap::new();
-    let Ok(text) = fs::read_to_string(durations_path()) else { return out };
+/// The profile a checkout that has never run the suite starts from.
+///
+/// A machine with no measurement at all prices every test the same, and
+/// [`Shard::keep`]'s LPT then degenerates to round-robin — which is what put 191
+/// of 268 tests on one CI shard and cut it off at its job timeout while another
+/// finished in sixteen minutes (`specs/ci-plan.md` §7.2). Every runner is that
+/// machine on every push, because a fresh clone has no `target/`.
+///
+/// Measured on a runner rather than here, deliberately: it is read by the
+/// machines that have nothing else, and the dev host overrides it with its own
+/// numbers the first time it runs the suite. Cross-arch TCG on an M4 Pro and
+/// KVM on four Azure cores do not agree about which tests are long.
+fn committed_durations_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-durations")
+}
+
+fn read_durations(path: &Path, out: &mut BTreeMap<String, Duration>) {
+    let Ok(text) = fs::read_to_string(path) else { return };
     for line in text.lines() {
         if let Some((name, ms)) = line.rsplit_once(' ') {
             if let Ok(ms) = ms.parse::<u64>() {
@@ -10265,6 +10392,16 @@ fn load_durations() -> BTreeMap<String, Duration> {
             }
         }
     }
+}
+
+/// The committed profile, with whatever this worktree has measured on top.
+///
+/// Per name rather than per file, so a checkout that has only ever run a filter
+/// keeps the committed number for everything that filter did not name.
+fn load_durations() -> BTreeMap<String, Duration> {
+    let mut out = BTreeMap::new();
+    read_durations(&committed_durations_path(), &mut out);
+    read_durations(&durations_path(), &mut out);
     out
 }
 
@@ -10272,13 +10409,40 @@ fn load_durations() -> BTreeMap<String, Duration> {
 ///
 /// Merged rather than replaced, because a filtered run knows about four tests
 /// and would otherwise throw away what the last full one measured.
-fn save_durations(mut known: BTreeMap<String, Duration>, timed: &[(String, Duration)]) {
+///
+/// **A shard writes somewhere nothing reads.** The partition is a function of
+/// the profile, so a shard that saved would move it under its siblings — three
+/// shards of `nvme_` in one worktree ran one test twice and one nowhere, and
+/// every one of the three reported green. What a shard measures is still a
+/// measurement, and the six of them are a partition of the suite, so it goes to
+/// a file named for the shard that took it: [`load_durations`] never opens one,
+/// and merging them into the committed profile is a deliberate act with a
+/// command behind it.
+fn save_durations(
+    mut known: BTreeMap<String, Duration>,
+    timed: &[(String, Duration)],
+    shard: Option<Shard>,
+) {
     for (name, elapsed) in timed {
         known.insert(name.clone(), *elapsed);
     }
-    let body: String =
-        known.iter().map(|(n, d)| format!("{n} {}\n", d.as_millis())).collect();
-    let path = durations_path();
+    let (path, body) = match shard {
+        None => (
+            durations_path(),
+            known.iter().map(|(n, d)| format!("{n} {}\n", d.as_millis())).collect::<String>(),
+        ),
+        // This shard's own tests and no others: a third of the suite is a third
+        // of a measurement, and the merge is what makes it a whole one.
+        Some(s) => {
+            let mut mine: Vec<&(String, Duration)> = timed.iter().collect();
+            mine.sort_by(|a, b| a.0.cmp(&b.0));
+            (
+                durations_path()
+                    .with_file_name(format!("test-durations.shard-{}-of-{}", s.index, s.count)),
+                mine.iter().map(|(n, d)| format!("{n} {}\n", d.as_millis())).collect::<String>(),
+            )
+        }
+    };
     let tmp = path.with_extension("tmp");
     if fs::create_dir_all(path.parent().expect("target/ has a parent")).is_ok()
         && fs::write(&tmp, body).is_ok()
@@ -10463,6 +10627,32 @@ fn check_registration() {
             "{group} shares one boot, so its members must share one scheduling answer"
         );
     }
+}
+
+/// The half [`check_registration`] could not ask: the shared boot's tests are
+/// *discovered* from the binaries in `tests/toyos-rust-tests` and `tests/c`, so
+/// nothing declared can be compared against them until they exist.
+///
+/// A name in both places is two tests reporting one name, and the damage is not
+/// a duplicate line. [`retry_task`] searches the shared registry first, so a
+/// machine test of that name which failed wide is re-run *as the other test* and
+/// its `ALONE:` verdict is about neither. Four names were doing this and the
+/// suite had never been able to see them.
+fn check_no_collisions(shared: &[TestDef]) {
+    let declared: BTreeSet<&str> = MACHINE_TESTS
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(SCREEN_TESTS.iter().map(|(n, _)| *n))
+        .chain(AUDIO_TESTS.iter().copied())
+        .collect();
+    let clash: Vec<&str> =
+        shared.iter().map(|t| t.name.as_str()).filter(|n| declared.contains(n)).collect();
+    assert!(
+        clash.is_empty(),
+        "{clash:?} name both a binary on the shared boot and a test that declares its own \
+         machine — two verdicts under one name, and `retry_task` takes the shared one. Add \
+         each to RUST_SKIP with the reason its own test exists, or rename one of the two."
+    );
 }
 
 fn main() {
@@ -10665,6 +10855,7 @@ fn main() {
     }
 
     let all_tests = build_test_registry(&rust_bins, &c_compiled);
+    check_no_collisions(&all_tests);
     // Every name this process could produce a verdict for, which is what an
     // EXPECTED_FAILURES entry has to be one of. Taken before the filter, so a
     // filtered run cannot make a stale entry look well-formed.
@@ -10827,16 +11018,6 @@ fn main() {
         outcomes.into_iter().for_each(|o| tally.record(o));
     }
     qemu::set_width(1);
-    // **A sharded run may not write the profile it partitioned on.** The
-    // partition is a function of the durations file, so shards that disagree
-    // about that file disagree about who owns what — and a shard that saves
-    // moves it under its siblings. Run three shards of `nvme_` in one worktree
-    // and two of them ran `nvme_home_roundtrip` while `nvme_large_device` ran
-    // nowhere: three runs, three profiles, three different partitions. It is
-    // also a third of a measurement, which is not what this file is for.
-    if shard.is_none() {
-        save_durations(known, &timed);
-    }
 
     if !wide_reds.is_empty() {
         eprintln!("  --- re-running {} wide failure(s) alone ---", wide_reds.len());
@@ -10847,9 +11028,22 @@ fn main() {
             };
             let outcomes = run_phase(vec![task], 1, &bins, &slots);
             match outcomes.iter().find(|o| &o.name == name).map(Outcome::verdict) {
-                Some(Verdict::Pass(_) | Verdict::Stale(_)) => eprintln!(
+                // **Two different findings, and which one it is depends on the
+                // width.** At width > 1 a green retry says the first run shared
+                // the machine and this one did not, which is a classification
+                // defect. At width 1 nothing else was ever up, so the two runs
+                // differed in nothing the harness controls: it failed once and
+                // passed once, which is a *rate* and says nothing about
+                // `Sched`. CI runs one lane per machine, and the old sentence
+                // there was a claim about contention that could not be true.
+                Some(Verdict::Pass(_) | Verdict::Stale(_)) if width > 1 => eprintln!(
                     "  ALONE {name}: GREEN — it fails only beside other guests, so its \
                      Sched::Parallel is wrong. The run stays red on the classification."
+                ),
+                Some(Verdict::Pass(_) | Verdict::Stale(_)) => eprintln!(
+                    "  ALONE {name}: GREEN, and this run had one lane — nothing else was up \
+                     either time, so it failed once and passed once. That is a rate and not a \
+                     classification."
                 ),
                 Some(Verdict::Fail(_) | Verdict::Expected(_)) => {
                     eprintln!("  ALONE {name}: red again — the defect is real.")
@@ -10898,10 +11092,15 @@ fn main() {
                     suspended: start.suspended(),
                 };
                 report_line(&outcome);
+                timed.push((outcome.name.clone(), outcome.elapsed));
                 tally.record(outcome);
             }
         }
     }
+
+    // After gate A, because its configs are the only tasks a shard prices by a
+    // name with an `smp=` in it and they are the last thing measured.
+    save_durations(known, &timed, shard);
 
     // Three exit statuses, because there are three things a run can establish,
     // and an expected failure is deliberately none of them — see

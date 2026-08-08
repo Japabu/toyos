@@ -36,8 +36,8 @@ Driven from `cargo metadata`, as the owner asked, not from grepping manifests.
   own modules and were separated by reading every hit: `elf` (`crate::elf` in
   the kernel), `gpt` (`kernel/src/gpt.rs`), `image` (`src/image.rs`) and
   `object` (a function in `kernel/src/user_ptr.rs`). A grep that skipped that
-  step would have reported the `image` crate as having six call sites; it has
-  one.
+  step would have reported the `image` crate as having six call sites; it had
+  one, and `src/wallpaper.rs` added the second later the same day.
 - crates.io figures come from `curl` against `api/v1/crates/<name>`,
   `/reverse_dependencies?per_page=1` and `/owners`, fetched 2026-08-08. Nothing
   here is recalled.
@@ -145,18 +145,21 @@ Nine crates. The root workspace locks 134 packages.
 
 - **From** crates.io. image-rs org, five owners. 5,993 reverse dependents,
   164,361,596 downloads.
-- **Called at** **one site**: `src/assets.rs:266` —
+- **Called at** **two sites**: `src/assets.rs:266` —
   `image::load_from_memory_with_format(&jpg_data, image::ImageFormat::Jpeg)`,
   `.to_rgb8()`, written into the initrd as `share/<stem>.rgb` with a width and
-  height prefix. (The five `image::` hits in `src/build.rs` are our own
+  height prefix — and `src/wallpaper.rs`, which *encodes* the one file that
+  decode reads. (The five `image::` hits in `src/build.rs` are our own
   `src/image.rs` module.)
 - **Why** the loop at `src/assets.rs:262` decodes every `.jpg` in `assets/`, and
-  `git ls-files '*.jpg'` says `assets/` holds exactly one: `wallpaper.jpg`. So
-  the whole of this dependency is *one JPEG decode of one file, at build time*.
-- **Could it go?** Yes, and cheaply — but only by deciding what happens to that
-  file. Audit §7f could not establish its provenance and recommends replacing
-  it. If the replacement ships pre-decoded, `image` and its nine-crate closure
-  leave with it. **Strongest cheap removal in the tree** — §13.3.
+  `git ls-files '*.jpg'` says `assets/` holds exactly one: `wallpaper.jpg`.
+- **Could it go? Asked and answered on 2026-08-08: no.** The removal was priced
+  against replacing that file with a background drawn at runtime; the owner
+  chose a generated *file* instead (audit §7f), and a file in the pipeline needs
+  a decoder. The crate encoding as well as decoding is what let the generator be
+  written with no new dependency at all — a noise crate, a colour crate and a
+  PNG encoder were each one line away and none was taken. **Keep** — §13.3 is
+  closed.
 
 ### `fontdue` 0.9.3 — `Cargo.toml:9`
 
@@ -802,19 +805,20 @@ shape unchanged. That is what the day is for.
 - **Do the kernel half first.** It is the cheap one and it is independently
   landable.
 
-### 13.3 Delete `image`, when the wallpaper is decided
+### 13.3 Delete `image` — CLOSED 2026-08-08, and it stays
 
-- **Price: an afternoon, gated on a decision that is already open.**
-  `src/assets.rs:266` is the only call, decoding the only `.jpg` in `assets/`.
-  Audit §7f says that file's provenance is unrecoverable and recommends
-  replacing it. If the replacement ships as pre-decoded RGB — which is exactly
-  what the build already produces from it, `share/wallpaper.rgb` — there is
-  nothing left to decode and the loop at `src/assets.rs:262` goes with it.
-- **Buy:** 9 crates out of the root workspace's 134-package lock, and the
-  removal of a build-time image decoder from a build system that has no other
-  reason to have one.
-- **Sequencing:** do not do this first. It is downstream of an owner decision
-  about `assets/wallpaper.jpg` that this document does not make.
+The price above was real and the gate resolved the other way. The decision this
+item was downstream of got made: the wallpaper's provenance is answered by
+generating the file (audit §7f), not by removing the file, so `src/assets.rs`
+still decodes a JPEG at build time and the 9-crate closure stays where it is.
+
+The gate is worth recording because it is the one this document got wrong about
+its own leverage: **the cheapest removal in the tree was never a dependency
+question.** It was contingent on how somebody chose to answer a licence
+question, and the answer that settled the licence permanently — a picture with
+source in the repository — is the one that keeps the decoder. `image` also
+encodes, so it paid for itself twice in the same commit: no new dependency was
+needed to write the generator.
 
 ### 13.4 Make doomgeneric a fork, and delete the download
 
@@ -920,15 +924,17 @@ Stated rather than recommended, because it deletes a capability.
 | 13.8 | `sshd` opt-in at build time | an afternoon | **53 of 122** compiled crates |
 | 13.4 | doomgeneric as a fork | half a day + a repo | **21 of 122**, plus the alpha crate, plus reproducibility |
 | 13.2a | `elf` out of the kernel | an afternoon | one ELF parser fewer |
-| 13.3 | `image` | an afternoon, gated on §7f | 9 crates, one decoder |
 | 13.2b | `elf` out of the bootloader | a day + a boot | the second ELF parser |
 | 13.9 | `rand` to one major | an hour | one triple in one lock |
 | 13.5 | off `uefi-services` | a day or two | a deprecated dep, 13 versions of fixes |
 | 13.6 | `rustysynth` | half a day | owner's call — deletes a capability |
 | 13.7 | pre-rasterize icons | an afternoon | 32-crate closure — design question |
 
+§13.3 (`image`, 9 crates) was on this table and is off it: the wallpaper
+decision it was gated on went the other way, and the entry now records why.
+
 **Explicitly recommended to keep**, with reasons, so the next reader does not
-re-propose them: `fatfs` and `gpt` (each an *independent judge* of our own
+re-propose them: `image` (§13.3), `fatfs` and `gpt` (each an *independent judge* of our own
 writer's output — see §1; only the format/write halves are duplication, and
 retiring those alone saves nothing), `libc` (one call, and the answer to audit
 §5's `ps` and `df` without a new dependency), `thiserror` (removal buys exactly

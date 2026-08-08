@@ -199,13 +199,39 @@ an unmeasured item at the longest that *was* measured, which is the same
 conservatism in a form that can be added; where nothing is measured every item
 prices the same and LPT degenerates to round-robin.
 
+### `tests/test-durations` is the profile a machine that has measured nothing starts from
+
+Round-robin is what put 191 of 268 tests on one shard of run `31238056513` and
+cut it off at its job timeout while another finished in sixteen minutes. Every
+runner is that machine on every push, because a fresh clone has no `target/`. So
+the profile is committed, `load_durations` reads it first and lays whatever this
+worktree has measured on top — **per name, not per file**, so a checkout that
+has only ever run a filter keeps the committed number for everything the filter
+did not name.
+
+**Its numbers come off a runner, and that is the point.** It is read by the
+machines that have nothing else; the dev host overwrites every name it measures
+on its first full run. Cross-arch TCG on an M4 Pro and KVM on four Azure cores do
+not agree about which tests are long, and a profile taken here would be the wrong
+hint for the only reader that needs one.
+
+**§4's rule is intact and is what makes this safe.** A shard still may not write
+the profile it partitioned on. What it writes instead is
+`target/test-durations.shard-<i>-of-<n>` — its own tests and no others, in a file
+`load_durations` never opens — and CI uploads the twelve.
+`cargo run -- --merge-durations <dir>` is the deliberate act that turns them into
+the committed file, and it exists rather than a `cat` because it can check the
+one property the merged file's usefulness rests on: **a name in two shard files
+is a run whose shards were not a partition**, which is precisely the defect §4
+records and which a concatenation cannot see.
+
 ## 5. What runs, on what trigger
 
 | workflow | trigger | runner | what it is |
 |---|---|---|---|
 | `host-tests.yml` | every push, every PR | `macos-latest` | `cargo test --lib` plus all fourteen host crates and `userland/sshd`. No toolchain, no guest. |
 | `toolchain.yml` | every push | `ubuntu-24.04` | Publishes the content-addressed toolchain release, or does nothing. |
-| `ci.yml` | every push, every PR | `ubuntu-24.04` ×5 | Four guest shards on KVM, plus one TCG canary. |
+| `ci.yml` | every push, every PR | `ubuntu-24.04` ×13, `debian:sid` container | Twelve guest shards on KVM at one lane each, plus one TCG canary. |
 | `gate-a.yml` | `workflow_dispatch` | `ubuntu-24.04` ×2 | The thorough audio tier, one audio test per machine. |
 | `probe-*.yml` | push to `ci/probe-*` | various | The measurement workflows this document is made of. |
 
@@ -463,6 +489,152 @@ the whole of §7.1.
 - **The comparison §2 wants** is still available and still costs one runner: the
   `tcg` job is one test, and a whole TCG shard would be the other arm.
 
+## 7.3 The 2x2, and the input class was three things
+
+The section above named one finding and it was three. Four jobs settled it:
+`ubuntu-24.04` throughout, one commit, one toolchain, `--jobs 1`, the same eight
+tests one `cargo test` at a time. QEMU is the axis the container moves and
+nothing else does — the firmware is `ovmf/` in this repository on every host, the
+boot image is built in the job, and the host CPU is the same Azure vCPU (an AMD
+EPYC 7763 in all four). Runs `31245897225` and `31246245541`.
+
+| QEMU | accel | fastest boot | red |
+|---|---|---|---|
+| 8.2.2 (apt) | KVM | 1.7–2.3 s | `metal_sim_pointer_churn`, `xhci_flap`, `desktop_typing_damage` |
+| 8.2.2 (apt) | TCG | 4.4–4.6 s | all but `abuse_gpu_resolution` |
+| 11.0.3 (`debian:sid`) | KVM | 1.7–2.3 s | `metal_sim_pointer_churn`, `xhci_flap` |
+| 11.0.3 (`debian:sid`) | TCG | 4.0–5.0 s | **none** |
+
+**The two TCG cells are the strongest thing in the table**, because their boots
+are the same speed — 4.4–4.6 s against 4.0–5.0 s — and one is green throughout
+while the other loses seven of eight. Whatever 8.2.2 does differently to the
+emulated i8042, it is not that it is slower.
+
+**Half the class was the width and neither variable.** `i8042_keyboard`,
+`i8042_mouse`, `i8042_fadt_denial` and `xhci_hotplug` are green in every arm
+above and were red in run `31241099454` on the same runner image under the same
+accelerator — at `--jobs 2`. That is §7's contention class, reaching further than
+anyone had counted.
+
+**One is the QEMU version.** `desktop_typing_damage`, red on 8.2.2 and green on
+11.0.3 under the same accelerator. Three major versions of the QMP injection path
+was a variable this tree had never had a second data point on.
+
+**Two are the accelerator, so by the owner's rule they are the guest's.**
+`metal_sim_pointer_churn` was the harness sampling a console that had not caught
+up, and is fixed — the count waits for its evidence now instead of sleeping 400 ms
+for it. `xhci_flap` survives three collapsed replugs and stops on the fourth;
+that is a driver defect CI found, written up in `specs/known-issues.md` §8 and
+not fixed here.
+
+### What the configuration is now, and what each part of it cost
+
+- **QEMU 11.0.3 in a `debian:sid` container**, which is the dev host's exact
+  version. `ubuntu-24.04` ships 8.2.2 and a runner can install nothing newer;
+  the image survey (run `31245897225`) is `debian:trixie` 10.0.11, `debian:sid`
+  11.0.3, `ubuntu:25.10` 10.1.0, `ubuntu:24.04` 8.2.2. Cost: one `apt-get` and
+  one `rustup-init` per job that the ubuntu image gave for free. Buys:
+  `desktop_typing_damage`, and CI comparable with the dev host on the one axis
+  that is not deliberately different.
+- **`--jobs 1` and twelve shards** instead of `--jobs 2` and six. One lane
+  removes the `ALONE: GREEN` class by construction rather than by tuning: there
+  is never a second guest on the machine. It costs nothing — a shard is a whole
+  machine, this repository is public, twenty jobs may run at once and the minutes
+  are unmetered.
+- **A committed duration profile**, §4.
+
+### The shared block stays whole, and that is measured rather than assumed
+
+It is a single point of failure and it was fixed as one rather than split. Run
+`31238056513`, shard 1, the runner's own clock: the block ran from 03:59:22.9 to
+03:59:37.1 — **14.2 s for the whole 153 tests, inside a 685.6 s parallel phase**.
+Splitting it six ways would buy about twelve seconds of overlap and cost five
+more boots and five more per-boot images, which is not a 2x improvement of
+anything.
+
+What it *was* costing is the blast radius, and that is a different repair. Run
+`31241099454`, shard 1: five tests passed, `abuse_gpu_resolution` took the guest
+with it, and the 150 behind it each paid a full liveness ceiling for a machine
+that was gone — 65 minutes of nothing and a job cancelled at 90. Two changes,
+both in the harness:
+
+- **A shared boot that stopped answering is answered with a new one.** A test
+  whose turn came, whose whole ceiling passed and which was never even announced
+  is not a test that ran; `TestResult::started` is what says so, off the
+  `===TEST_START <name>` the in-guest runner has always printed. Bounded at
+  `MAX_SHARED_REBOOTS`, because a block whose every member kills the guest must
+  not boot one per test. A reboot rather than an abandonment, because those 150
+  tests are each still owed a verdict and a suite that reports 150 reds it never
+  ran is worse than one that pays for a boot.
+- **A `===TEST_END` naming another test is the previous one's.** The name has
+  been on the wire since the runner was written and was parsed and thrown away;
+  taking it was `specs/known-issues.md` §6's cascade, where one timed-out test
+  made every later member of the block read a window that opened on its
+  predecessor's output — 110 of 238 red on an "actual" that was verbatim the
+  previous expectation.
+
+### What the new configuration measured
+
+Run `31247206462`, twelve `debian:sid` shards on KVM at `--jobs 1`, still with a
+round-robin partition because the profile it would read had not been committed
+yet: **271 of 292, every shard finished**, against 246 of 268 on the five that
+finished of run `31238056513` and a shard cancelled at 110 minutes in each of
+the two before it. Shard 1 carried the 153-test shared block and reported
+**180 of 183 in 537.4 s**.
+
+The per-job fixed cost, off shard 9's own step timings: container start 8 s,
+`apt-get` 61 s, checkout 2 s, `rustup-init` 8 s, toolchain download 5 s — **85
+seconds**, which is what the `ubuntu-24.04` image was giving for free and what
+QEMU 11.0.3 costs. The suite step is a `cargo build` and then the tests; shard 9
+spent 853 s on the pair for a 556 s suite.
+
+**One configuration defect, and it cost the run two shards.** `what a red run
+left` uploaded `/tmp/toyos-tests-*/` whole, and a lane's scratch holds a per-boot
+image of a few hundred megabytes: shard 9's suite finished in 556 s and the
+upload then ran for **44 minutes** and hit the job timeout, so a job that had its
+answer reported as cancelled. It uploads logs and screendumps now.
+
+The twenty-one that were left fall into four groups, and only the first is about
+the harness:
+
+- **Eight `ALONE: GREEN` at one lane, which is a different thing from the same
+  words at width 2.** Nothing else was ever up, so the two runs differed in
+  nothing the harness controls: each failed once and passed once. That is a rate
+  and says nothing about `Sched`, and the message says so now.
+- **The xHCI plug/unplug family under KVM**: `xhci_hotplug`, `xhci_hid_break`,
+  `metal_sim_pointer_churn`, `usb_transport_break`, and `xhci_flap` from the
+  probe. Every one drives `device_add`/`device_del` over QMP, every one is red
+  again alone, and every one is green under TCG on the same runner image and the
+  same QEMU. `specs/known-issues.md` §8.
+- **The `metal_sim` group and the desktop**: `metal_sim_client_death` red alone
+  at 354 s, with `metal_sim_window_caps`, `metal_sim_ipc_hostile_peer` and
+  `metal_sim_compositor_stall` behind it — the same blast radius the shared block
+  had, in `Task::Machine`'s grouped guest, which the shared block's repair does
+  not reach. `desktop_typing_damage` and `sshd_fail_closed` are red alone too.
+- **Three that are their own**: `doom_sound_flood` (red alone, 92 s),
+  `hda_client_stall` (red alone), `metal_sim_null_audio` (`soundd did not present
+  a null sink on a device-less machine`), and `hda_tone`'s mid-tone silence,
+  which #88's exemption correctly does not cover.
+
+`usb_storage_shapes` is green here and was red under 8.2.2 — the second thing
+the QEMU version bought, and it was not one of the eight the probe measured.
+
+### Four tests were running twice under one name, and the merge command found it
+
+`check_registration` compared `MACHINE_TESTS`, `SCREEN_TESTS` and `AUDIO_TESTS`
+against each other and never against the binaries the shared registry
+*discovers*, so `cache_eviction`, `hda_client_stall`, `audio_tone` and
+`audio_tone_load` each produced two outcomes under one name — once on the plain
+boot, once as the test that owns the name. `--merge-durations` refused the twelve
+shard files on exactly that, which is the check earning its keep on its first
+use: two shards had measured `cache_eviction`, at 132 ms and 22.5 s.
+
+Two verdicts under one name is not extra coverage. `retry_task` searches the
+shared registry first, so a machine test of one of those names that failed wide
+was re-run **as the other test** and its `ALONE:` line described neither. The
+four are in `RUST_SKIP` now — each name's own test still runs, on the machine it
+needs — and `check_no_collisions` refuses the next one.
+
 ## 8. What CI buys that the dev host cannot
 
 - **A machine that can run these guests natively.** The dev
@@ -525,15 +697,49 @@ looks stale.
 - **An ARM runner running aarch64 guests.** Not possible: no `/dev/kvm` on
   `ubuntu-24.04-arm` and no HVF on `macos-latest`. An aarch64 guest there would
   be TCG on an arm64 host, which is what the dev host already is.
-- **A green guest suite.** 246 of 268 on the five shards that finished
-  (§7.2), against 43 of 86 on the three that finished under TCG. What is left is
-  a named list rather than a wall of clocks, and the biggest single item in it is
-  **input delivery**: six tests that inject a keystroke or a plug event fail on a
-  runner and pass here, and nobody has separated the accelerator from QEMU 8.2.2
-  against 11.0.3.
-- **The shard partition**, §7.2 — round-robin because a runner has no duration
-  profile, and shard 5 was cut off at 1932 s in its parallel phase because of it.
-- **Larger runners** were not tried. They are a billed feature even on public
-  repos, so trying one is the owner's call. §7.2 makes core count the standing
-  constraint: two lanes is the most four cores will take, and the `ALONE: GREEN`
-  class is what is left of the ones that will not fit.
+- **A green guest suite. What is left is a *rate*, and that is the finding.**
+  Two runs of the same configuration on the same branch: **280 of 290** (run
+  `31249703011`) and **274 of 290** (run `31250706113`, the first to read the
+  committed profile) — against 246 of 268 on the five shards that finished of
+  `31238056513`, and 43 of 86 under TCG. Every shard finished in both.
+
+  The two failure lists are ten and sixteen names and **seven are in both**:
+  `metal_sim_client_death`, `metal_sim_pointer_churn`, `doom_sound_flood`,
+  `i8042_health_cadence`, `usb_transport_break`, `std_unwind`, `std_unwind_so`.
+  The rest rotate, and they rotate *through the `ALONE:` verdict too* —
+  `metal_sim_pointer_churn` was "red again, the defect is real" in one run and
+  green alone in the next, `hda_tone`'s mid-tone silence fired in one and not the
+  other. So a single `ALONE:` line on a runner is one sample and settles nothing,
+  exactly as CLAUDE.md now says of the class.
+
+  The shapes are worth separating even so. `std_unwind` and `std_unwind_so` fail
+  in **both** runs, in the shared block, in 55–61 ms, with `exit code Some(-1)`,
+  and pass alone every time — a shared-boot interaction rather than a clock.
+  Several of the rest are a guest that stopped making progress and paid its whole
+  ceiling: `metal_sim_client_death` 364 s, `metal_sim_window_drag` 355 s,
+  `desktop_audio_client` 354 s, `blocked_dump` 329 s.
+- **The rate itself, measured.** One lane per machine removed the contention
+  explanation and what is left is unquantified: nobody has run one shard N times
+  on a runner and counted. That is one job and it is the next thing to do, because
+  every judgement above rests on two samples.
+
+### Larger runners: not purchasable for this repository
+
+The owner approved paying for them and there is nothing to buy. GitHub's larger
+hosted runners are created by name at the *organization* level and `Japabu/toyos`
+is owned by a User account, so no such label resolves. Measured rather than read
+off a page: run `31246336130` asked for `ubuntu-latest-4-cores`,
+`ubuntu-latest-8-cores` and `ubuntu-latest-16-cores` beside an `ubuntu-24.04`
+control. The control finished in **4 seconds**; the three larger jobs were still
+`queued` **thirty minutes** later, which is what an unresolvable label does — it
+waits rather than failing. Cancelled at that point.
+
+What they would have bought is bounded and now mostly spent. Core count was the
+standing constraint because four cores held two lanes; **one lane per machine and
+twelve machines removes that**, costs nothing on a public repository, and it is
+what took the `ALONE: GREEN` class from eight to zero of that shape. The one
+thing a bigger machine would still buy is the six tests that boot `-smp 8` —
+QEMU says so itself, `Number of SMP cpus requested (8) exceeds the recommended
+cpus supported by KVM (4)` — and at one lane those now pass. If the owner moves
+this repository under an organization, one 8-core shard for the wide-SMP tests is
+the shape to buy, and nothing else.

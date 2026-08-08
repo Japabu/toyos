@@ -269,7 +269,11 @@ impl Session {
         let mut waited = false;
         let drain_until = Instant::now() + DRAIN_BUDGET;
         loop {
-            let timeout = if waited { Duration::from_nanos(1) } else { FRAME_INTERVAL };
+            // Zero and not one nanosecond: every turn after the first is
+            // consuming what has already arrived, and a timeout of 1 ns is not
+            // a spelling of "do not block" — it parks the thread on a deadline
+            // that is already past, which is the whole of #156.
+            let timeout = if waited { Duration::ZERO } else { FRAME_INTERVAL };
             if !self.drain(timeout) {
                 break;
             }
