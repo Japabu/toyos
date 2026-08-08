@@ -92,6 +92,7 @@ impl LogRing {
         let mut file_dropped = 0u64;
         let to_serial = SERIAL_SINK.load(Ordering::Relaxed);
         let to_file = FILE_SINK.load(Ordering::Relaxed);
+        let written = WRITTEN.load(Ordering::Relaxed);
         for &b in data {
             if to_serial && self.len == RING_SIZE {
                 self.tail = (self.tail + 1) % RING_SIZE;
@@ -126,7 +127,13 @@ impl LogRing {
         }
         // After the copy, so a lock-free reader never sees a mark for a byte
         // the writer has not stored yet.
-        WRITTEN.fetch_add(data.len() as u64, Ordering::Release);
+        //
+        // A load and a store rather than a `fetch_add`, for the same reason
+        // `OWED` is: this runs under `RingGuard`, so nothing can be between
+        // them. Not a micro-optimisation — the `lock xadd` cost **350 ms of
+        // boot**, because every guest this host runs is TCG and an atomic
+        // read-modify-write there is not one instruction.
+        WRITTEN.store(written.wrapping_add(data.len() as u64), Ordering::Release);
         dropped
     }
 

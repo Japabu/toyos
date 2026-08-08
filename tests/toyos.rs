@@ -3362,12 +3362,19 @@ fn run_screen_test(
             }
             // Userland's turn, and the wait is the assertion's premise rather
             // than padding: measured with the hold compiled out, an idle
-            // desktop changes this panel inside 1.5 s on its own and the check
-            // below passed vacuously without it, because `screendump_while`
-            // answered on its first capture — before the compositor had
-            // composed once. It has to be shorter than the kernel's hold, or a
-            // green here would mean the desktop was asleep.
-            std::thread::sleep(qemu::budget(Duration::from_secs(3)));
+            // desktop changes this panel inside 1.5 s on its own, and without
+            // this the check below answered on its first capture — before the
+            // compositor had composed once — and passed vacuously.
+            //
+            // **Deliberately not `qemu::budget`.** That pays a *liveness
+            // ceiling* out per guest, and this is not one: it is a settle
+            // inside a window the guest itself is timing, so scaling it by the
+            // phase width walks out of the window it has to stay inside.
+            // Twelve wide it became 36 s against a 15 s hold, and the check
+            // then measured a machine that had already given the screen back.
+            // The window is guest time and a loaded guest's is *longer* in host
+            // seconds, so a fixed wait errs inwards from both sides.
+            std::thread::sleep(Duration::from_secs(2));
             let back = qemu.screendump_while(
                 Duration::from_secs(5),
                 Duration::from_millis(100),
