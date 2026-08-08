@@ -4372,15 +4372,19 @@ fn shell_answers(qemu: &mut QemuInstance, log: &mut String) -> bool {
 /// "does a keystroke reach the shell", and it starts from a machine that is
 /// demonstrably up — a ceiling on *that* is a claim about the guest.
 fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> bool {
-    // Printed by the terminal once its window exists and the shell's stdin is a
-    // pipe it holds. Before it a keystroke lands nowhere and leaves no trace.
-    const TERMINAL_UP: &str = "terminal: ready";
+    // Whichever surface owner this config put a shell behind, printed once its
+    // screen exists and the shell's stdin is a pipe it holds. Before that a
+    // keystroke lands nowhere and leaves no trace. Both, because `shell_answers`
+    // is asked of a terminal under the compositor and of `/bin/console` on the
+    // raw framebuffer, and the question is the same one.
+    const SURFACE_UP: [&str; 2] = ["terminal: ready", "console: ready"];
+    let up = |log: &str| SURFACE_UP.iter().any(|m| log.contains(m));
     let mut live = qemu::Liveness::new(Duration::from_secs(15), Duration::from_secs(300));
-    while !log.contains(TERMINAL_UP) && live.working(log) {
+    while !up(log) && live.working(log) {
         let seen = qemu.drain_serial(Duration::from_millis(200));
         log.push_str(&seen);
     }
-    if !log.contains(TERMINAL_UP) {
+    if !up(log) {
         return false;
     }
 
@@ -9203,10 +9207,10 @@ impl Tally {
         // number in the source is no longer the number that was enforced. A
         // reader comparing two runs' timings needs to know which host each was
         // taken on, and this is the suite's own measurement of that.
-        let (fastest, num, den) = qemu::host_speed();
-        if fastest != u32::MAX {
+        let (fastest, reference, num, den) = qemu::host_speed();
+        if let Some(fastest) = fastest {
             say(format!(
-                "host: fastest boot {fastest} ms against the reference {den} ms — liveness \
+                "host: fastest boot {fastest} ms against the reference {reference} ms — liveness \
                  ceilings paid at {:.2}x width",
                 f64::from(num) / f64::from(den)
             ));

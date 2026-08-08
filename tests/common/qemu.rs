@@ -75,14 +75,12 @@ static FASTEST_BOOT_MS: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// The same measurement on the host every ceiling in this tree was written for.
 ///
-/// Dev host, M4 Pro, cross-arch TCG, `--jobs 1`, the fastest of ten boots across
-/// `doom_sound_flood`, `xhci_hotplug`, `metal_sim_pointer_churn`,
-/// `hda_client_stall`, `null_sink_shipped_client`, `usb_boot_stick_pulled`,
-/// `screen_pager_keys` and `xhci_flap`, measured 2026-08-08. The spread over
-/// those ten was 1433–2063 ms, which is why the comparison is minimum against
-/// minimum: it is the one statistic of a boot that both hosts can take the same
-/// way.
-const REFERENCE_BOOT_MS: u32 = 1433;
+/// Dev host, M4 Pro, cross-arch TCG, measured 2026-08-08: the fastest of ten
+/// boots at `--jobs 1` was 1433 ms against a 1433–2063 ms spread, and the
+/// fastest of a whole 291-test suite at width 12 was this. The smaller of the
+/// two is the one to hold, because the factor only widens and a reference set
+/// too high is a correction that does not happen.
+const REFERENCE_BOOT_MS: u32 = 1320;
 
 fn record_boot(took: Duration) {
     let ms = took.as_millis().min(u32::MAX as u128) as u32;
@@ -114,10 +112,13 @@ fn host_scale() -> (u32, u32) {
     (fastest.min(REFERENCE_BOOT_MS * 8), REFERENCE_BOOT_MS)
 }
 
-/// The fastest boot seen and the factor it produced, for a run's own report.
-pub fn host_speed() -> (u32, u32, u32) {
+/// The fastest boot seen, the reference, and the scale it produced — for a run's
+/// own report, because the number in the source is no longer the number that was
+/// enforced.
+pub fn host_speed() -> (Option<u32>, u32, u32, u32) {
     let (num, den) = host_scale();
-    (FASTEST_BOOT_MS.load(Ordering::SeqCst), num, den)
+    let fastest = FASTEST_BOOT_MS.load(Ordering::SeqCst);
+    ((fastest != u32::MAX).then_some(fastest), REFERENCE_BOOT_MS, num, den)
 }
 
 /// A liveness guard that watches the guest instead of the host's clock.
