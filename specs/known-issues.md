@@ -4107,6 +4107,42 @@ log cannot tell you which it was.
 
 Trivial to fix the same way the kbd line already is.
 
+### OPEN — `screen_blocked_dump` asserts a whole-report property against one page of a paged report
+
+Red about a quarter of the time, on `main`'s own code. Found 2026-08-08 by a
+branch whose entire delta is three `.md` files — `git diff main...HEAD --
+':(exclude)*.md'` is empty, so the kernel, bootloader and initrd it booted are
+main's byte for byte, and no A/B against a second tree is needed to say so.
+
+**Rate, measured.** Eight isolated runs (`--jobs 1`, nothing else on the host):
+six green, two red. Two landing gates on the same branch red on it in the wide
+phase; the harness re-ran it alone both times and got `GREEN` once and
+`red again — the defect is real` once. So the `ALONE` verdict itself is a coin
+toss here, which is worth knowing before anyone trusts one.
+
+**Cause, from a captured red.** `tests/toyos.rs:3254` requires three strings on
+one screendump — `"== VERDICT:"`, `"cpu(s) answered"`, `"== deadlines:"`. But the
+report is longer than the screen, so the panic console pages it on a 3 s
+deadline, and the red capture ends:
+
+```
+[kernel 0.601 cpu0] == VERDICT: 1 overdue, 0 absurd, 0 unheld, 0 never ran
+[kernel 0.601 cpu0] === end of dump ===
+
+[page 3/3]
+```
+
+Page 3 of 3 carries the verdict and the tail. `== sched: N/N cpu(s) answered`
+(`kernel/src/sched/dump.rs:524`) is on an earlier page. The test passes or fails
+on **which page the deadline had advanced to when the screendump was taken**,
+which is a property of timing and not of the dump.
+
+The defect is the assertion, not the dump: a photograph of that machine does
+answer the question, on the page that carries it. Either the test steers the
+pager to each page it needs — PageUp/PageDown are polled for exactly that — or it
+asserts per page. Do not "fix" it by widening the deadline; that hides the
+coupling rather than removing it.
+
 ---
 
 ## 6. Build and toolchain
