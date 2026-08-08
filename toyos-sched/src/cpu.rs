@@ -620,7 +620,11 @@ impl<X: SchedPayload> CpuSched<X> {
 
     /// The earliest deadline this CPU owes, and the only thing `apply_timer`
     /// arms from.
-    fn earliest_deadline(&self) -> Option<Nanos> {
+    ///
+    /// Public because it is also the answer to *may this CPU start something
+    /// long*: a CPU that owes a wake is the wrong one to run unbounded I/O on,
+    /// and the idle loop asks before it flushes (`sched::driver::owes_deadline`).
+    pub fn earliest_deadline(&self) -> Option<Nanos> {
         self.parked.values().filter_map(|entry| entry.deadline).min()
     }
 
