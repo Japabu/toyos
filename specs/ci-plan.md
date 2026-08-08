@@ -1287,3 +1287,80 @@ Two shards were red in that run and neither is those:
   the tree. Both `deps` steps take three attempts now: advisory today, but once
   `guest-suite` is required an apt mirror would be able to block a merge, and
   that is not a gate anyone chose.
+
+### 10.9 Four consecutive red runs on `main`, four different names, and the rates
+
+**The trigger in §10.4 is three consecutive green `ci` runs on `main`, and
+nothing was going to fire it.** Measured 2026-08-09, `main`'s last four
+completed runs — every one red, and no two on the same test:
+
+| run | tip | red shard | name |
+|---|---|---|---|
+| `31271983043` | `911c472` | 10 | `desktop_audio_client`, `STALLED` after 324 s |
+| `31272837718` | `eaba207` | 5 | `desktop_window_child`, the `/bin/terminal` race |
+| `31273373928` | `87835d1` | 5 | `kernel_heartbeat`, 11 pin readings against 12 beats |
+| `31280877870` | `83ef8d1` | 2 | `dump_nmi_probe`, the rip in `u128_div_rem` |
+
+Four names none of which §9.2 could price: two were 1 of 5 there and two were
+0 of 5. `probe-green.yml` is §9.1's instrument aimed at exactly those four —
+the same image, the same accelerator, the same `--jobs 1`, **ten reps**, one job
+per rep and one `cargo test` per name so a stall costs the other three nothing.
+Run `31282019974`, tree `98e7247` (`main` `83ef8d1` plus the workflow):
+
+| test | red | what it said |
+|---|---|---|
+| `desktop_window_child` | **2/10** | the surface owner exited before it said it was ready |
+| `dump_nmi_probe` | **2/10** | `compiler_builtins::int::specialized_div_rem::u128_div_rem+0x99` |
+| `kernel_heartbeat` | **1/10** | 2 of 11 beats dropped a CPU from the mask |
+| `desktop_audio_client` | **1/10** | `STALLED` waiting for both clients to leave the mixer |
+
+That is 6 name-reps of 40, and it prices a `ci` run: these four alone put
+`P(all green)` at about **0.52**, which is four red runs in a row with nobody
+having introduced a defect. **Each is a rate and only one of the four was a
+rate about the tree.**
+
+- **`dump_nmi_probe` was the kernel's actuator, not the guest's state.** The
+  deaf window spun on `clock::nanos_since_boot`, whose 128-bit divide is an
+  out-of-line call into `compiler_builtins` — so a CPU that never left the spin
+  was sampled inside `__udivti3` two runs in ten and the probe reported the
+  wrong instruction, correctly and about itself. It spins on `rdtsc` against a
+  `clock::tsc_deadline` now: `rdtsc` and a 64-bit compare inline, so there is no
+  address in the loop that is not in `deaf_window`.
+- **`kernel_heartbeat` was two harness defects, both at an end of the capture.**
+  A heartbeat and its `i8042: line` are two `log!`s, and run `31273373928`'s
+  capture ended between them — twelve beats, eleven readings, read as a pin
+  whose state was unreadable. The unit is the pair now, positionally, and a beat
+  with nothing after it at all is a reading this capture does not hold. The
+  other end is the boot: `boot_with_options` returns while userland is still
+  spawning, and a guest with eight vCPUs on four cores does not run all eight of
+  them while it is busy — `alive=7/8` at 1.373 s with `cpu1 has never reached a
+  scheduler pass`, `5/8` at 1.624 s, then `8/8` for the remaining nine beats.
+  That is the host and the instrument never claimed anything about it, so the
+  window opens at the first full mask and the assertion is that it never thins
+  again. The tick-less control still reds: without `diag-tick` ten of eleven
+  lines are below `8/8` and the window never opens.
+- **`desktop_audio_client` was the console, and the finding is general.**
+  `soundd: client ` and `1 removed` came back either side of four kernel `exit:`
+  accounting lines, so the test counted one removal of two and waited out its
+  300 s guard. A userland line is several `write`s —
+  `specs/issues/design-debt/a-userland-line-is-several-writes.md` — and this
+  pair collides *systematically*, because soundd prints a client's removal
+  exactly while the kernel prints that client's exit. soundd writes whole lines
+  now; the other 176 `eprintln!` sites in `userland/` do not.
+- **`desktop_window_child` is the tree's, and it is the one left.** The
+  `/bin/terminal` boot race, `specs/issues/kernel/terminal-races-compositor-at-boot.md`,
+  which that file already records as the dominant blocker of the dev host's
+  parallel-red list and declines to fix because *where the wait belongs* is a
+  design question with three answers and no owner's ruling. What this probe adds
+  is a CI number — **2 of 10 on a runner with one guest on it and nothing to
+  contend with** — and a timing: run `31282019974` rep 2 has the compositor
+  spawned at 0.347 s, the terminal at 0.349 s, and the terminal exiting at
+  0.849 s one millisecond before the compositor maps its framebuffer.
+  `services::listen("compositor")` is already the first statement of
+  `Session::start`, which is the first statement of the compositor's `main`, so
+  there is nothing left to move earlier: the half second both processes spend
+  before their first service call is process startup, and which of the two wins
+  it is a coin toss weighted four to one. **No `EXPECTED_FAILURES` entry was
+  added for it** — an exemption names a defect and its write-up, and this one
+  has both and is still a defect that reds a merge gate rather than one anybody
+  decided to accept.
