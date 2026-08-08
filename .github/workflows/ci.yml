@@ -144,22 +144,34 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # Logs and screendumps, never the directory they sit in. A lane's scratch
-      # holds a per-boot image of a few hundred megabytes, and uploading all of
-      # them took **44 minutes** and hit the job timeout on shard 9 of run
+      # Every boot's 16550 log, and nothing else in the lane. A lane's scratch
+      # also holds a per-boot image of a few hundred megabytes, and uploading all
+      # of them took **44 minutes** and hit the job timeout on shard 9 of run
       # `31247206462` — a suite that had finished in 556 s reported as a job
-      # cancelled at the hour. The serial of every failing test is already in
-      # this job's own log; what is not is what the panel showed.
+      # cancelled at the hour.
+      #
+      # **It uploaded nothing at all until now**, and that looked identical to a
+      # run that left nothing: `QemuInstance::Drop` removed the uart log and the
+      # screendump with the guest, so the glob always matched an empty lane. Run
+      # `31252989653` reds four shards and publishes twelve duration files and no
+      # scratch artifact.
+      #
+      # What is left to keep is small and specific: firmware, the bootloader and
+      # the kernel before the console backend switches all write to the 16550 and
+      # nowhere else, so a boot that dies before virtio-console comes up leaves
+      # this file and an empty capture. The screendump is still deleted with its
+      # instance, so this no longer claims to collect one, and what a failing
+      # test *said* is in this job's own log.
+      #
+      # `warn`, not `ignore`: a red shard that left no serial at all is itself a
+      # finding, and silence read as "there was nothing to keep" for three runs.
       - name: what a red run left
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: shard-${{ matrix.shard }}-scratch
-          path: |
-            /tmp/toyos-tests-*/**/*.log
-            /tmp/toyos-tests-*/**/*.ppm
-            /tmp/toyos-tests-*/**/*.png
-          if-no-files-found: ignore
+          name: shard-${{ matrix.shard }}-serial
+          path: /tmp/toyos-tests-*/**/uart-*.log
+          if-no-files-found: warn
           retention-days: 7
 
   # The shards run natively, so this is the job that keeps the *emulator*

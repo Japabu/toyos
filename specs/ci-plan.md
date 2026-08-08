@@ -635,28 +635,93 @@ was re-run **as the other test** and its `ALONE:` line described neither. The
 four are in `RUST_SKIP` now — each name's own test still runs, on the machine it
 needs — and `check_no_collisions` refuses the next one.
 
-## 8. What CI buys that the dev host cannot
+## 8. Two instruments, and what each one is evidence for
 
-- **A machine that can run these guests natively.** The dev
-  host is arm64 and every guest on it is cross-arch TCG, whose distortion
-  CLAUDE.md records at 1.06×–6.5× and non-uniform; the "every component within
-  2× of a production OS" bar is unmeasurable there.
-- **A second architecture of *host*.** Even under TCG, x86-on-x86 exercises code
-  paths — `syscall`/`sysret`, segmentation, the APIC — that cross-arch TCG
-  reimplements. §7 was found this way before KVM was even reached.
-- **No shared sysroot.** Every runner has its own, keyed on the branch's own
-  four trees, so the contention `specs/worktrees.md` §3.1–§3.2 describes — a
-  claim that refuses every other worktree, measured at 35 and 50 minutes of
-  nobody being able to build — does not exist there. Observed while writing
-  this: the local guest suite could not be run at all for the length of another
-  agent's ABI change.
+**They run the same 292 tests and they are not the same measurement.** Nothing
+in either one says so, so an agent who reads a CI red as a dev-host red — or the
+reverse — draws a conclusion neither machine supports. That is exactly the shape
+§7 was: a class of defect the dev host cannot see at all, invisible for as long
+as it was the only machine.
+
+| | dev host | a CI shard |
+|---|---|---|
+| host arch | arm64 (M4 Pro, 14 cores) | x86_64, 4 cores (Azure vCPU) |
+| guest | cross-arch TCG | **KVM**, `-cpu host` |
+| host CPU vendor | one | AMD EPYC or Intel Xeon, **not selectable** |
+| QEMU | 11.0.3 (brew) | 11.0.3 (`debian:sid`) — deliberately the same |
+| guests at once | up to twelve, `buildlock::guest_slot` | **one**, `--jobs 1` |
+| other load | every other worktree's build and suite | nothing |
+| sysroot | one, shared, claimable | its own, keyed on the branch's four trees |
+
+### 8.1 What only CI can answer
+
+- **Which vendor's reading of an instruction the kernel depends on.** A guest
+  that emulates `syscall`/`sysret`, segment loads or `iret`'s privilege checks
+  gives you one vendor's wording of it, and QEMU implements Intel's. §7 is the
+  worked example: `STAR[63:48]` was green on the dev host in every run there had
+  ever been and lost 64 boots of 64 on an EPYC. The `kvm` shards are the only
+  gate on that class, and the vendor is a lottery, which is why every job prints
+  its `model name`.
+- **What the guest does at native speed.** `xhci_flap` survives three collapsed
+  replugs and stops on the fourth under KVM, and is green under TCG on the same
+  runner image and the same QEMU, and green here — because the accelerator runs
+  the guest about fifty times further between the host's two QMP writes
+  (`specs/known-issues.md` §8). CI found a real driver defect the dev host has no
+  way of constructing.
+- **A machine that can run these guests natively at all.** The "every component
+  within 2× of a production OS" bar is unmeasurable under cross-arch TCG, whose
+  distortion CLAUDE.md records at 1.06×–6.5× and non-uniform.
+- **No shared sysroot.** Every runner has its own, so the contention
+  `specs/worktrees.md` §3.1–§3.2 describes — a claim that refuses every other
+  worktree, measured at 35 and 50 minutes of nobody being able to build — does
+  not exist there. Observed while writing this: the local guest suite could not
+  be run at all for the length of another agent's ABI change.
 - **A quiet host for gate A.** Each shard is its own VM, so
   `live_instances() == 0` holds by construction rather than by the suite
   arranging it, and no other agent's build is on that machine. The thorough tier
   is N boots per config strictly one at a time, so a second machine is the only
   thing that can shorten it: `--shard 1/2` and `2/2` put one audio test on each.
 
-## 8.1 Somebody has to push `main`
+### 8.2 What only the dev host can answer
+
+- **Anything about contention.** A shard is one guest on one machine, so
+  `HostSlots`, `buildlock::guest_slot`, `qemu::budget`'s width multiplier and the
+  whole `ALONE: GREEN` classification are untestable on a runner *by
+  construction* — there is never a second guest for the first to contend with.
+  `specs/known-issues.md` §7's parallel-red class is a dev-host phenomenon and CI
+  says nothing about whether it is fixed.
+- **Whether a `Sched::Parallel` is right.** Same reason: the answer requires two
+  guests. Every CI retry is the width-1 kind and says only that a test failed
+  once and passed once.
+- **The suite's own wall clock as a number anyone compares.** 292 tests in 536 s
+  on one machine against twelve shards spanning 273–530 s each; those are not two
+  readings of one quantity.
+- **A second architecture of host, for the parts that are not the accelerator.**
+  arm64-on-arm64 is where an ARM64 port would be gated, and there is no runner
+  that can do it (§9).
+
+### 8.3 How to read a disagreement
+
+**A red on one and green on the other is a finding about the difference, and
+about the tree only once the difference is named.** Both directions have already
+happened, and the second is the one that catches people:
+
+- **CI red, dev host green — and the tree was wrong.** §7's `SYSRET`. The dev
+  host could not execute the instruction.
+- **CI red, dev host green — and the *runner* was the variable.**
+  `desktop_typing_damage` on QEMU 8.2.2, green on 11.0.3 under the same
+  accelerator on the same runner image. Closed by putting the dev host's own QEMU
+  in the container rather than by touching the test.
+- **CI red at `--jobs 2`, dev host green at `--jobs 12`.** The whole i8042 family
+  in run `31241099454`. "Wider" and "more contended" are not the same axis: every
+  profile boots `-smp 2` and six tests boot `-smp 8`, so two lanes on four cores
+  is heavier oversubscription than twelve lanes on fourteen. Closed by one lane
+  per machine and twelve machines.
+
+The rule that falls out: **before believing a CI red is the tree, name what
+differs.** The candidates are short and they are all in the table above.
+
+## 8.4 Somebody has to push `main`
 
 `cargo run -- --land` fast-forwards the primary checkout and does not push, and
 the owner's rule is that an agent pushes its own branch and never `main`. At the
@@ -678,10 +743,20 @@ head has them. Three things need `main` itself to be current:
 
 One line in `src/land.rs` after the fast-forward closes all three
 (`git -C <primary> push origin main`), and it keeps the rule intact: `main`
-would still move only through `--land`. **Not done here** — it is a change to
-the landing protocol and to the owner's rule, and both are his. Until it is, a
-`main` that has stopped moving on GitHub is the thing to check first when CI
-looks stale.
+would still move only through `--land`. **Still not done, and still the owner's**
+— it is a change to the landing protocol and to his rule.
+
+**It bit, and the measurement is 2026-08-08.** `origin/main` was **31 commits
+behind** local `main` — every one of them the twelve-shard work — and the newest
+`ci` run on it (`31249540044`) is **1 h 18 m and red**, a configuration those 31
+commits replaced. Anyone reading this repository's default-branch CI was reading
+a stale config's failure.
+
+So `--land` now *says so*. `origin_main_lag` reads the local remote-tracking ref
+after the fast-forward and prints how far behind GitHub is, with the `git push`
+that closes it. It asks no remote — a landing may not go to the network,
+`--check-forks` is the command that does and says so — so an unfetched ref makes
+it a lower bound, which is why the line says "at least". It does not push.
 
 ## 9. Not done
 
@@ -697,43 +772,153 @@ looks stale.
 - **An ARM runner running aarch64 guests.** Not possible: no `/dev/kvm` on
   `ubuntu-24.04-arm` and no HVF on `macos-latest`. An aarch64 guest there would
   be TCG on an arm64 host, which is what the dev host already is.
-- **A green guest suite. What is left is a *rate*, and that is the finding.**
-  Three runs of the same configuration on the same branch: **280 of 290** (run
-  `31249703011`), **274 of 290** (run `31250706113`, the first to read the
-  committed profile) and **285 of 290** (run `31252989653`, the landed tree,
-  eight of twelve shards fully green) — against 246 of 268 on the five shards
-  that finished of `31238056513`, and 43 of 86 under TCG. Every shard finished
-  every time.
+- **A green guest suite.** Eleven names are red at a rate now known to the
+  nearest fifth, and five of them reproduce. §9.1 is the measurement, §9.2 the
+  list, §9.3 the one that is diagnosed. **What is left is defects in the tree,
+  not work on CI** — which is the state this whole document was aimed at, and
+  the reason the list can be handed to whoever owns each subsystem.
 
-  The profile is doing its job on the clock even where the verdicts wander: the
-  twelve shard totals of the landed run span **273.5–530.0 s**, against
-  293.0–1194.6 s the run before and 240.2–611.2 s round-robin. The suite step is
-  about ten minutes wide and the whole run is under half an hour.
+## 9.1 The rate, measured: five reps of the whole configuration
 
-  `usb_transport_break` and `screen_pager_keys` are the two of that run's five
-  that are `Sched::Serial`, so nothing re-ran them and neither has an `ALONE:`
-  line at all — which is the next small thing to fix in the harness rather than
-  in either test.
+Every judgement above this section rested on two or three samples, and three runs
+of one configuration had produced red lists of ten, sixteen and five names with
+only three in all of them. `probe-rate.yml` is the measurement that turns that
+argument into a number: **the exact shape `ci.yml` runs** — same image, same
+accelerator, same `--jobs 1`, same twelve-way partition — **five times over**, all
+sixty jobs, every log kept.
 
-  The two failure lists are ten and sixteen names and **seven are in both**:
-  `metal_sim_client_death`, `metal_sim_pointer_churn`, `doom_sound_flood`,
-  `i8042_health_cadence`, `usb_transport_break`, `std_unwind`, `std_unwind_so`.
-  The rest rotate, and they rotate *through the `ALONE:` verdict too* —
-  `metal_sim_pointer_churn` was "red again, the defect is real" in one run and
-  green alone in the next, `hda_tone`'s mid-tone silence fired in one and not the
-  other. So a single `ALONE:` line on a runner is one sample and settles nothing,
-  exactly as CLAUDE.md now says of the class.
+Run `31258202923`, tree `f8f73e1`. **All sixty jobs finished**, none cancelled and
+none near the 60-minute guard; 292 tests per rep, **1460 outcomes**. Per-shard
+suite seconds, one column per rep:
 
-  The shapes are worth separating even so. `std_unwind` and `std_unwind_so` fail
-  in **both** runs, in the shared block, in 55–61 ms, with `exit code Some(-1)`,
-  and pass alone every time — a shared-boot interaction rather than a clock.
-  Several of the rest are a guest that stopped making progress and paid its whole
-  ceiling: `metal_sim_client_death` 364 s, `metal_sim_window_drag` 355 s,
-  `desktop_audio_client` 354 s, `blocked_dump` 329 s.
-- **The rate itself, measured.** One lane per machine removed the contention
-  explanation and what is left is unquantified: nobody has run one shard N times
-  on a runner and counted. That is one job and it is the next thing to do, because
-  every judgement above rests on two samples.
+| shard | r1 | r2 | r3 | r4 | r5 |
+|---|---|---|---|---|---|
+| 1 | 401.8 | 423.0 | 423.8 | 429.5 | 428.8 |
+| 2 | 214.3 | 219.9 | 222.1 | 230.8 | 195.1 |
+| 3 | 308.1 | 457.3 | 429.0 | 430.7 | 431.0 |
+| 4 | 407.2 | 436.7 | 386.2 | 405.7 | 328.2 |
+| 5 | 343.3 | 437.3 | 436.7 | 427.2 | 432.3 |
+| 6 | 305.8 | 319.4 | 291.2 | 304.8 | 287.4 |
+| 7 | 502.2 | 516.1 | 504.2 | 514.4 | 507.6 |
+| 8 | 349.5 | 420.1 | 400.6 | 418.1 | 334.1 |
+| 9 | 466.8 | **745.7** | 457.8 | 466.4 | 484.8 |
+| 10 (the 180-test shared block) | 507.4 | 415.2 | 529.8 | 510.8 | 498.7 |
+| 11 | 343.8 | 331.1 | 336.6 | 347.2 | 352.1 |
+| 12 | 256.7 | 202.1 | 246.4 | 236.9 | 216.7 |
+
+The partition holds: the widest shard is 502–516 s in every rep and the narrowest
+195–257 s, so the profile is doing its job. **Shard 9 rep 2 at 745.7 s against
+457.8–484.8 s for its own four siblings is the runner's own variance**, on a job
+whose every verdict was green — worth knowing before reading any single job's
+wall clock as a finding.
+
+**281 of the 292 names were green in all five reps.** The other eleven are §9.2.
+
+**The tree moved between the last write-up and this one, and it took twelve names
+off the list.** Run `31252989653`'s five reds were measured on `ab7f5d6`, which
+does **not** contain `wt/toyos-clock`'s landing (`5b6e192`, and `1cf7fee`,
+`c546335`, `02a3bc9`, `d50a8c9` under it) — the "wait N seconds, then assert what
+you were waiting for" work. Run `31254054628` is the first on a tree that has it,
+and every name that had been rotating is gone from both it and this probe:
+`metal_sim_client_death`, `metal_sim_window_drag`, `metal_sim_pointer_churn`,
+`metal_sim_compositor_stall`, `desktop_audio_client`, `desktop_typing_damage`,
+`doom_sound_flood`, `i8042_health_cadence`, `sshd_fail_closed`, `xhci_hotplug`,
+`xhci_hid_break` and `screen_pager_keys` are **0 of 5**.
+
+## 9.2 The eleven, with their rates
+
+| test | red | shard | `Sched` | what it says |
+|---|---|---|---|---|
+| `usb_transport_break` | **5/5** | 6 | Serial | the transport broke 2 times; the injection is armed once per boot |
+| `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, §9.3 |
+| `std_unwind_so` | **5/5** | 10 | shared block | the same |
+| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine |
+| `hda_tone` | **4/5** | 4 | Serial | 1 mid-tone silence in the capture |
+| `late_storage_connect` | 2/5 | 7 | Serial | the boot scan bound a disk, so the port was not held empty |
+| `hda_two_live_refused` | 2/5 | 2 | Parallel | "presenting a null sink" never reached the boot console |
+| `blocked_dump` | 2/5 | 3 | Parallel | two *different* reasons — the census half, and /bin/terminal racing the compositor |
+| `dump_nmi_probe` | 1/5 | 2 | Serial | the rip resolved to `u128_div_rem`, not to the spin |
+| `kernel_heartbeat` | 1/5 | 5 | Serial | 2 of 12 heartbeats dropped a healthy CPU from the mask |
+| `usb_disk_index_stable` | 1/5 | 2 | Parallel | nothing enumerated on the first controller |
+
+**The top five reproduce and are therefore defects, not noise.** Four of them
+fail identically every time; `hda_tone` misses one rep and is
+`specs/known-issues.md` §4's open item, which #88's exemption correctly does not
+cover.
+
+**Six of the eleven are `Sched::Serial`, and the harness re-ran none of them**
+until this task — the retry loop was written for the parallel phase and branched
+on the run's width. So half the list had no second sample at all, which is most
+of why the earlier lists looked like they rotated.
+
+**The bottom six are a rate and the rate is 20–40%, which is not "noise" either.**
+The bar this work was measured against is "green means green, red means a real
+defect, and a re-run tells you which"; one run in five is far above the one in
+fifty that bar treats as tolerable. Each is named in `specs/known-issues.md` with
+this number beside it, and none is a candidate for an `EXPECTED_FAILURES` entry —
+an exemption names a defect and its write-up, and "fires 40% of the time for
+reasons nobody has looked at" is not one.
+
+## 9.3 `std_unwind` is a #MF, and the harness had been deleting the evidence
+
+The most defect-shaped item on the list, and it took one harness fix to read.
+`exit code Some(-1)` is the kernel saying it killed the process —
+`recover_or_halt` answers a Ring 3 fault with `kill_process(-1)` — and everything
+saying why is a `log!` line, which `run_test_paced` files under `serial` and
+`check_rust_result` never printed. Three CI runs reported those eleven characters
+and nothing else. With `kernel_account` in, run `31259401277` shard 10 says:
+
+```
+[kernel 8.689 cpu1 tid=0] spawn: /bin/test_rs_std_unwind pid=112 ... cr3=0x526e000
+[kernel 8.711 cpu0 tid=1] !!! FAULT rip=0x0000010000097176 cr2=0x0 err=0x0 ... tid=1
+[kernel 8.711 cpu0 tid=1] SIGFPE tid=1: x87 floating-point exception
+[kernel 8.711 cpu0 tid=1]   rip:
+[kernel 8.711 cpu0 tid=1]     unwinding::unwinder::with_context::delegate::<
+                                UnwindReasonCode, _Unwind_RaiseException::{closure#0}>+0x1e6
+[kernel 8.711 cpu0 tid=1]   Backtrace:
+                              unwinding::unwinder::arch::x86_64::save_context
+                              __rustc::rust_panic
+                              ...
+                              std::sys::thread::toyos::thread_trampoline
+[kernel 8.716 cpu0 tid=1] exit: test_rs_std_unwind pid=112 code=-1 cpu=20ms
+```
+
+**A #MF — vector 16, no error code — inside the unwinder, on the spawned
+thread.** Both binaries fail on the same sub-test: the one that panics on a
+thread. The first two panics of each unwind cleanly and print `ok`. The process's
+main thread was spawned on **cpu1** and the fault is on **cpu0**.
+
+`specs/known-issues.md` §1 already records the other end of this: **no context
+switch saves x87 state** — no `fxsave`, `fnsave` or `fsave` anywhere in
+`kernel/src` — and `fault_gates`' `mf` arm, the only thing in this tree that
+executes an x87 instruction at all, unmasks IM, computes 0/0 and expects the
+`fwait` two bytes later to trap. If the kernel kills that child at the `fwait`,
+the trailing `fninit` never runs and that CPU's FPU keeps IM unmasked with IE and
+ES set, waiting for whatever is scheduled there next.
+
+**`probe-x87.yml` settles it in one token.** Run `31260763462`, two arms of three
+reps, one runner, one commit, one shard, and the only difference is
+`fault_gate_child`'s control word:
+
+| arm | `fault_gates` | `std_unwind` | `std_unwind_so` |
+|---|---|---|---|
+| `control` (`cw = 0x037E`, IM unmasked) | PASS ×3 | **FAIL ×3** | **FAIL ×3** |
+| `masked` (`cw = 0x037F`) | PASS ×3 | PASS ×3 | PASS ×3 |
+
+So the red is a kernel isolation defect that CI found and that the dev host
+cannot: **any Ring 3 process can leave a pending unmasked x87 exception behind
+and kill the next unrelated process scheduled on that CPU.** It belongs to
+§1's entry and is not fixed here — the fix is x87 state on the context switch,
+in `kernel/src/arch/`, which is a subsystem change with its own owner.
+
+**Two repairs would turn this red green and only one of them is a fix.** Giving
+`fault_gates` a boot of its own is the shape `readdir_bound` and
+`abuse_short_sleep` already have, it is one line, and it would delete the only
+observation of the defect this tree has. Do not take it — not before x87 state is
+saved, and not after without a gate that asks the question on purpose. The same
+goes for an `EXPECTED_FAILURES` entry: it would name a real defect and a real
+write-up and it would still be an exemption bought to make a run green while a
+process can kill its neighbour.
 
 ### Larger runners: not purchasable for this repository
 

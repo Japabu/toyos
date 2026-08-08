@@ -87,12 +87,58 @@ and the x87 register file, control word, status word and tag word are on none
 of them. So one process's x87 state, including a pending unmasked exception, is
 visible to the next.
 
-Latent rather than active: Rust on `x86_64-unknown-toyos` does all float work
-in SSE and never touches x87, and the kernel is `x86_64-unknown-none`, which is
-soft-float.
+**No longer latent, and CI is what showed it.** The paragraph that used to stand
+here said Rust on `x86_64-unknown-toyos` does all float work in SSE and never
+touches x87, so nothing could observe the missing save. Two tests observe it.
+`std_unwind` and `std_unwind_so` are red **5 of 5** in the shared block on a
+runner and green 5 of 5 alone (run `31258202923`), and once the harness stopped
+discarding a killed test's kernel lines the verdict is not a timeout or a clock
+(run `31259401277`, shard 10):
 
-Recorded here because it is the only hypothesis on offer for a **#MF that goes
-missing under load**, and that one is not settled. `fault_gates`' `mf` arm sets
+```
+[kernel 8.689 cpu1 tid=0] spawn: /bin/test_rs_std_unwind pid=112 ... cr3=0x526e000
+[kernel 8.711 cpu0 tid=1] !!! FAULT rip=0x0000010000097176 cr2=0x0 err=0x0 ... tid=1
+[kernel 8.711 cpu0 tid=1] SIGFPE tid=1: x87 floating-point exception
+[kernel 8.711 cpu0 tid=1]     unwinding::unwinder::with_context::delegate::<
+                                UnwindReasonCode, _Unwind_RaiseException::{closure#0}>+0x1e6
+[kernel 8.716 cpu0 tid=1] exit: test_rs_std_unwind pid=112 code=-1 cpu=20ms
+```
+
+A **#MF** inside the unwinder, on the spawned thread, on **cpu0** — where the
+process's main thread was spawned on **cpu1**. Both binaries die on the same
+sub-test, the one that panics on a thread; the two panics before it unwind
+cleanly and print `ok`. So the failing thread is the one scheduled onto the other
+CPU, and it takes a pending x87 exception it never raised.
+
+`fault_gates`' `mf` arm runs in the same boot about thirty tests earlier and is
+the only thing in this tree that executes an x87 instruction at all. It unmasks
+IM, computes 0/0, and expects the `fwait` two bytes later to trap — and if the
+kernel kills the child at that `fwait`, the trailing `fninit` never runs, so that
+CPU's FPU keeps IM unmasked with IE and ES set for whatever is scheduled there
+next.
+
+**That is proven, by one token.** `probe-x87.yml`, run `31260763462`: two arms of
+three reps on one runner, one commit, one toolchain, the same shard, and the only
+difference is `fault_gate_child`'s control word.
+
+| arm | `fault_gates` | `std_unwind` | `std_unwind_so` |
+|---|---|---|---|
+| `control` (`cw = 0x037E`, IM unmasked) | PASS ×3 | **FAIL ×3** | **FAIL ×3** |
+| `masked` (`cw = 0x037F`) | PASS ×3 | PASS ×3 | PASS ×3 |
+
+`0x037F` masks every x87 exception, so the same `fninit; fldcw; fldz; fldz;
+fdivp; fwait; fnstsw; fninit` runs and `fdivp` still raises IE, and nothing is
+left pending. Six for six each way.
+
+**So this is an isolation defect and not a latent one.** Any Ring 3 process can
+unmask an x87 exception, provoke it and die, and the next unrelated process
+scheduled on that CPU takes a #MF it never caused and is killed for it. Nothing
+in the process's own state is involved — the FPU is per-CPU and nothing saves it.
+`std_unwind` is the reproducer; `fault_gate_child` is an ordinary userland program
+doing nothing privileged.
+
+It is also still the only hypothesis on offer for a **#MF that goes missing under
+load**, and that one is not settled. `fault_gates`' `mf` arm sets
 IM, computes 0/0, and expects the `fwait` two bytes later to trap. It killed
 the child 6 of 6 alone and survived once in a 12-wide suite — and the status
 word it printed on the run that survived was **`0xb881`**: IE set, ES set,
@@ -6850,6 +6896,18 @@ completion matched by its Command TRB address, a recovery cancelled by a
 disconnect. Not diagnosed further here; found by CI, which is the thing CI was
 built to do.
 
+**It has stopped reproducing, which is not the same as being fixed.** Run
+`31258202923`, five reps of the whole twelve-shard configuration on the same
+image and the same accelerator: `xhci_flap` is **PASS 5 of 5, in 7–9 s**. Nothing
+in `toyos_xhci` changed between the two runs; what did change is `wt/toyos-clock`,
+which replaced flat host waits with waits bounded by the guest, so one candidate
+is that the probe's 164 s was a harness ceiling on a slow re-enumeration rather
+than a wedge — and the log above, where the guest goes silent after the fourth
+pair and never speaks again, is evidence against that reading. Left OPEN: a
+defect that stopped appearing under an unchanged driver is a defect whose trigger
+nobody has named. Re-read this entry from the log quoted above, never from a
+green run.
+
 **And it is not alone.** Run `31247206462`, twelve shards on KVM at `--jobs 1`,
 put four more of its shape on the list, every one red again when re-run alone:
 
@@ -6871,7 +6929,17 @@ address, a recovery cancelled by a disconnect rather than waited out.
 **This class is what stands between CI and green.** It is not §7's
 classification class: it fails alone, and it fails the same way twice.
 
-### OPEN, UNASSIGNED — a `Task::Machine` group has the blast radius the shared block just lost
+**Three of the four have stopped and one has not.** Run `31258202923`, five reps
+of the whole configuration on the same image and accelerator: `xhci_hotplug`,
+`xhci_hid_break` and `metal_sim_pointer_churn` are **0 of 5** — the last of those
+is closed above and the other two coincide with `wt/toyos-clock`'s waits — while
+**`usb_transport_break` is 5 of 5** with the same sentence it has always given,
+`the transport broke 2 times; the injection is armed once per boot, so anything
+else is a break this test did not stage`. That is the one member of this class
+that is still reproducible, and it is the one to take: it is not a ceiling, it is
+the driver reporting a second break nobody staged.
+
+### CLOSED — a `Task::Machine` group had the blast radius the shared block lost
 
 Run `31247206462`, shard 5, the metal-sim group re-run **alone**:
 `metal_sim_compositor` and `metal_sim_scanout_wc` pass, `metal_sim_window_caps`
@@ -6879,49 +6947,63 @@ times out at 177 s, and `metal_sim_ipc_hostile_peer`, `metal_sim_compositor_stal
 and `metal_sim_client_death` time out behind it — 1418 s of the shard's 1916.9 s,
 for one test that died.
 
-It is the same defect the shared block had and the same repair does not reach it:
-`group_of`'s adjacent tests share one boot held in `Grouped`, and each member
-after a dead one pays its own full liveness ceiling against a guest that is gone.
-The shared block's fix keys on `TestResult::started`, which is the in-guest
-runner's `===TEST_START` and exists only on that path; a machine test asserts on
-a console it drives itself and has no such marker to miss.
+It was the same defect the shared block had, and the shared block's repair could
+not reach it: that one keys on `TestResult::started`, the in-guest runner's
+`===TEST_START`, and a machine test asserts on a console it drives itself and has
+no such marker to miss.
 
-Fix shape: the same one — a group whose guest has stopped answering gets a new
-guest, bounded, rather than N ceilings. What a machine group needs first is
-something that plays `started`'s part, and the honest candidate is the boot's own
-ready marker: a guest that will not reach `wait_for_ready` again is gone.
+**Closed by the smaller answer, which the group already had: a verdict.** A
+member that failed no longer hands its guest to the next one — `run_task` drops
+`held`, and the next member boots. It needs no `started` analogue and no bound of
+its own: a group is six members at most, so it is at most six boots where there
+would have been one, and only on a red. What it costs when the member's failure
+was its own assertion on a healthy guest is one extra boot.
 
-### OPEN, UNASSIGNED — a runner reds a rotating handful every run, and the rate is unmeasured
+### OPEN, UNASSIGNED — eleven names are red on CI, at a rate that is now measured
 
-Three runs of one configuration on one branch, twelve `debian:sid` shards on KVM
-at `--jobs 1`: **280 of 290** (run `31249703011`), **274 of 290** (run
-`31250706113`) and **285 of 290** (run `31252989653`, eight shards fully green).
-Every shard finished every time. The failure lists are ten, sixteen and five
-names; **`std_unwind`, `std_unwind_so` and `usb_transport_break` are the only
-three in all of them**, and `metal_sim_client_death`, `metal_sim_pointer_churn`,
-`doom_sound_flood` and `i8042_health_cadence` are in two of the three.
+Supersedes *a runner reds a rotating handful every run, and the rate is
+unmeasured*, whose whole ask was this run. `probe-rate.yml`, run `31258202923`,
+tree `f8f73e1`: **five reps of the exact twelve-shard configuration `ci.yml`
+runs** — same image, same accelerator, same `--jobs 1` — sixty jobs, **all sixty
+finished**, 292 tests each, 1460 outcomes. **281 of the 292 names were green in
+all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
 
-**The `ALONE:` verdict rotates with them**, which is the part to hold before
-reading any entry here: `metal_sim_pointer_churn` was `red again — the defect is
-real` in the first run and green alone in the second, and `hda_tone`'s mid-tone
-silence fired in one and not the other. On a runner one `ALONE:` line is one
-sample. That is §7's warning in a place where the contention explanation has been
-removed by construction — one lane, one machine, nothing else up either time.
+| test | red | shard | `Sched` | what it says |
+|---|---|---|---|---|
+| `usb_transport_break` | **5/5** | 6 | Serial | the transport broke 2 times; the injection is armed once per boot |
+| `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, see §1's x87 entry |
+| `std_unwind_so` | **5/5** | 10 | shared block | the same |
+| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine |
+| `hda_tone` | **4/5** | 4 | Serial | 1 mid-tone silence in the capture (§4) |
+| `late_storage_connect` | 2/5 | 7 | Serial | the boot scan bound a disk, so the port was not held empty |
+| `hda_two_live_refused` | 2/5 | 2 | Parallel | `"presenting a null sink" never reached the boot console` |
+| `blocked_dump` | 2/5 | 3 | Parallel | two *different* reasons — the census half, and /bin/terminal racing the compositor |
+| `dump_nmi_probe` | 1/5 | 2 | Serial | the rip resolved to `u128_div_rem`, not to the spin |
+| `kernel_heartbeat` | 1/5 | 5 | Serial | 2 of 12 heartbeats dropped a healthy CPU from the mask |
+| `usb_disk_index_stable` | 1/5 | 2 | Parallel | nothing enumerated on the first controller |
 
-Two shapes are visible in the noise:
+**The top five reproduce, so they are defects and not a rate.** The bottom six
+fire one or two runs in five, which is 20–40% and is not "noise" either: the bar
+this was measured against tolerates one in fifty *with the failure named*, and
+none of these six has been looked at. **No entry here is a candidate for
+`EXPECTED_FAILURES`** — an exemption names a defect and a write-up, and "fires
+40% of the time for reasons nobody has looked at" is neither.
 
-- **`std_unwind` and `std_unwind_so` fail in both runs and only in the shared
-  block** — 55–61 ms, `exit code Some(-1)`, green alone every time. Not a clock;
-  something a member of the block leaves behind. The one reproducible shared-boot
-  pair on a runner, and never seen here.
-- **A guest that stops making progress and pays its whole ceiling.**
-  `metal_sim_client_death` 364 s, `metal_sim_window_drag` 355 s,
-  `desktop_audio_client` 354 s, `blocked_dump` 329 s, `doom_sound_flood` 240 s.
-  One guest, two vCPUs, four cores, nothing else on the machine.
+**Six of the eleven are `Sched::Serial`, and until 2026-08-08 the harness re-ran
+none of them**: the retry loop was written for the parallel phase and branched on
+the *run's* width. Half the list had no second sample at all, which is most of
+why the earlier lists looked like they rotated.
 
-Nothing here is diagnosed, and what is missing before anything can be is the
-rate: one shard, N runs, on one runner, counted. That is a single job and nobody
-has run it.
+**Twelve names came off the list when the wall-clock work landed**, and the
+previous write-up's samples predate it. Run `31252989653` was `ab7f5d6`, which
+does not contain `wt/toyos-clock` (`5b6e192`, and `1cf7fee`, `c546335`,
+`02a3bc9`, `d50a8c9` under it). `metal_sim_client_death`, `metal_sim_window_drag`,
+`metal_sim_pointer_churn`, `metal_sim_compositor_stall`, `desktop_audio_client`,
+`desktop_typing_damage`, `doom_sound_flood`, `i8042_health_cadence`,
+`sshd_fail_closed`, `xhci_hotplug`, `xhci_hid_break` and `screen_pager_keys` are
+all **0 of 5** now, and the "a guest stops making progress and pays its whole
+ceiling" shape with them. Anything read off a run older than `31254054628` is
+about a different tree.
 
 ### OPEN — four reds on a runner that are not the xHCI class and not the width
 
@@ -6937,6 +7019,13 @@ the dev host:
 Three of the four are soundd's, which makes them worth reading together rather
 than one at a time. Nothing here is diagnosed; they are recorded so the next
 green run cannot quietly be read as their absence.
+
+**Two of the four are settled by the rate above and two are not.**
+`doom_sound_flood` and `sshd_fail_closed` are 0 of 5 on the current tree.
+`metal_sim_null_audio` is **5 of 5**, which makes it the one to take first — and
+`hda_two_live_refused`, 2 of 5 with `"presenting a null sink" never reached the
+boot console`, is the same missing line seen from the other side, so the two are
+one question about soundd's device-less path rather than two.
 
 ### CLOSED, superseded by the four arms above — six input tests fail on a GitHub runner and pass here
 
