@@ -3883,11 +3883,26 @@ steered to the page somebody needs, and CLAUDE.md advertises it.
 Zero of thirty says the poll never sees the byte — not that it sees it late.
 Note the earlier phases pass: the footer appears, and the *unattended* 3 s
 deadline still advances the page, so the pager is running and painting. Only
-the keyboard half is dead. Unbisected. The panic console and the blocked-task
-dump both moved recently (`f7c87ee` "the panel gets the report, and keeps it",
-`1bcbc99` log_ring marks), and `hold_report`'s 20 ms repaint is the first thing
-to rule in or out, since a repaint that restores the page a keystroke moved
-would look exactly like this.
+the keyboard half is dead.
+
+**It was green a day ago, and the window is narrow.** `8273964`
+(2026-08-07 23:40) is the last landing whose gate was the whole suite, and its
+recorded last line is `test result: ok. 291 passed, 291 total (366.2s)` — this
+test among them. Between there and `e39f038` only two commits touch
+`panic_console/`, `log_ring.rs` or `sched/dump.rs`:
+
+```
+f7c87ee dump: the panel gets the report, and keeps it
+77e818d log_ring: peek_range went in above peek_tail's doc comment, not below its body
+```
+
+`f7c87ee` is the first suspect by shape rather than by suspicion:
+`panic_console::hold_report` now repaints the report from `drain_irqs` whenever
+128 remembered pixels say the panel stopped carrying it. A repaint that restores
+the page a keystroke has just moved is indistinguishable, to this test, from a
+keystroke that never arrived — the footer is its only instrument.
+
+Not bisected. That is the next step and it is two boots.
 
 It is **not** in `EXPECTED_FAILURES` and must not be put there to get a landing
 through: an entry needs a task, a write-up and the failure text it covers, and
