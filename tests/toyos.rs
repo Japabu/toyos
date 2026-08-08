@@ -4989,14 +4989,29 @@ fn desktop_audio_client() -> Result<(), String> {
 ///
 /// The nonce is per call because the verdict is that *this* terminal answered:
 /// a marker an earlier one already produced would pass on a window that never
-/// came up.
+/// came up. [`shell_echoes`]'s split applies for the same reason it does there,
+/// and `terminal: ready` is looked for after `before` rather than anywhere,
+/// because every terminal already up has printed one.
 fn open_terminal(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Result<(), String> {
+    let before = log.len();
     {
         let mut input = qemu::QmpInput::open(qemu.qmp_socket());
         input.keys(&[("ctrl", true), ("n", true), ("n", false), ("ctrl", false)]);
     }
-    let before = log.len();
-    let deadline = Instant::now() + qemu::budget(Duration::from_secs(30));
+    let mut live = qemu::Liveness::new(Duration::from_secs(15), Duration::from_secs(120));
+    while !log[before..].contains("terminal: ready") && live.working(log) {
+        let seen = qemu.drain_serial(Duration::from_millis(200));
+        log.push_str(&seen);
+    }
+    if !log[before..].contains("terminal: ready") {
+        return Err(format!(
+            "Ctrl+N opened no terminal — {}:\n{}",
+            live.why(),
+            &log[before..]
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         {
             let mut input = qemu::QmpInput::open(qemu.qmp_socket());
