@@ -408,6 +408,7 @@ pub fn init_bsp(lapic_id: u32) {
 
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
+    super::fpu::init();
     let smep = cpu::enable_smep();
     let smap = cpu::enable_smap();
     require_fsgsbase(cpu::enable_fsgsbase());
@@ -429,6 +430,7 @@ pub fn init_bsp(lapic_id: u32) {
         "percpu: BSP cpu_id=0 lapic_id={} smep={} smap={} pcid={}",
         lapic_id, on(smep), on(smap), on(pcid)
     );
+    super::fpu::log_state();
 }
 
 fn on(enabled: bool) -> &'static str {
@@ -459,16 +461,19 @@ pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
 
 /// Finish AP percpu initialization (called from ap_entry after GS base is set by trampoline).
 ///
-/// Silent throughout: `boot_aps` already logs one line per AP that came up,
-/// and this CPU's answers to the feature questions are the BSP's answers.
+/// The feature questions are silent: `boot_aps` already logs one line per AP
+/// that came up, and this CPU's answers are the BSP's answers. `fpu::log_state`
+/// is the exception and says at its own definition why it may not assume that.
 pub fn init_ap(percpu_ptr: *mut PerCpu) {
     let percpu = unsafe { &mut *percpu_ptr };
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
+    super::fpu::init();
     cpu::enable_smep();
     cpu::enable_smap();
     require_fsgsbase(cpu::enable_fsgsbase());
     crate::mm::paging::enable_pcid();
+    super::fpu::log_state();
 }
 
 /// Update both the percpu kernel_rsp (for syscall entry) and tss.rsp0 (for interrupts).
