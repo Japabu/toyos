@@ -6982,6 +6982,11 @@ all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
 | `kernel_heartbeat` | 1/5 | 5 | Serial | 2 of 12 heartbeats dropped a healthy CPU from the mask |
 | `usb_disk_index_stable` | 1/5 | 2 | Parallel | nothing enumerated on the first controller |
 
+A twelfth name has been seen since and is not in the table because the probe did
+not see it: `xhci_slow_connect`, red alone in run `31261669826`. It has its own
+entry above — a 1 ms margin *inside the guest's boot*, which is why running alone
+moves it by milliseconds and not by a verdict.
+
 **The top five reproduce, so they are defects and not a rate.** The bottom six
 fire one or two runs in five, which is 20–40% and is not "noise" either: the bar
 this was measured against tolerates one in fifty *with the failure named*, and
