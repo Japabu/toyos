@@ -361,20 +361,88 @@ installation — which would put it inside the "comes with QEMU" allowance and
 delete 6.3 MB from the repository. The second reading is available because
 firmware is QEMU's input, not ours.
 
-### 7f. `assets/wallpaper.jpg` — provenance genuinely unknown
+### 7f. `assets/wallpaper.jpg` — CLOSED 2026-08-08: the file is now generated
 
-336,669 bytes, 1920×1080, `sha256 278d580d…`. It carries JFIF, an EXIF block and
-a Photoshop 3.0 IRB. The EXIF holds four tags — resolution, resolution unit and
-the Exif IFD pointer — and **no `Artist` and no `Copyright`**. Git history has
-nothing (initial squashed commit). The README does not mention it.
+The finding was that the old 336,669-byte file's provenance could not be
+determined from its content: JFIF, an EXIF block holding four tags with **no
+`Artist` and no `Copyright`**, a Photoshop 3.0 IRB, nothing in git history and
+no mention in the README.
 
-**I cannot determine where this file came from.** It ships in every image as
-`share/wallpaper.rgb`. Stating that is the finding; inventing a licence would be
-worse than the open question.
+**The owner recalled the source, and it made the answer worse rather than
+better.** peakpx.com: a page that names no author and no copyright holder, says
+the image was *"uploaded by our users"*, and states *"License: Wallpaper use
+only, DMCA"*. So there was a documented restriction, granted by an aggregator
+with a takedown form and no standing to grant one — and "wallpaper use only" is
+precisely the clause a redistributable OS image violates. A named licence from
+a party who cannot license is not an improvement on an unknown.
 
-**Recommendation.** The owner is the only person who can say. If the answer is
-not recoverable, replace it — an unattributable image in a repository offered
-under MIT is a liability that costs one afternoon to remove.
+**His decision was to generate one.** `src/wallpaper.rs` draws the background as
+a pure function of the target size — a night sky, a glow at the horizon and
+three ridges, composited in linear light and dithered before the 8-bit encode —
+and `cargo run -- --regen-wallpaper` writes it, the same shape `--regen-font`
+already had for the panic console's table. The pipeline is untouched:
+`src/assets.rs` still pre-decodes the JPEG into `share/wallpaper.rgb` and the
+compositor still scales and blits it, so no code outside this file changed.
+
+**Nothing else in the tree changed to accommodate it, including `image`.** The
+crate's removal was priced in `specs/dependency-purpose-2026-08-08.md` at nine
+crates against a wallpaper drawn at runtime; the owner chose a file, and a file
+in the pipeline needs a decoder. It also encodes, which is why generating one
+needed no new dependency.
+
+**What keeps this closed** is `the_committed_wallpaper_is_the_one_this_file
+_describes`, which compares the committed bytes against the generator's output
+on every `cargo test`. Someone dropping a picture at that path reopens the
+finding and the build says so; there is no path back to an asset nobody can
+account for. Its sibling `the_wallpaper_neither_bands_nor_blocks` is the quality
+half — see 7f.1.
+
+#### 7f.1. Why the encoder settings are what they are
+
+Measured on the finished drawing, one session, `cargo test --lib`. `bytes` is
+the JPEG; `run` is the longest column of one unchanging green value in the
+*decoded* image, which is what banding is; `block` is the mean step across an
+8×8 block boundary over the mean step inside one, which is what JPEG blocking
+is. A picture with neither artifact sits at `block ≈ 1.0` and `run ≈ 20`, which
+is where the dithered source itself sits.
+
+| quality | bytes | max err | block | run |
+|---|---|---|---|---|
+| source | 6,220,800 | — | 1.005 | 20 |
+| 92 | 97,623 | 18 | 3.656 | 112 |
+| 95 | 158,860 | 14 | 2.470 | 59 |
+| 97 | 199,955 | 10 | 2.378 | 80 |
+| 98 | 278,284 | 10 | 2.004 | 44 |
+| **99** | **761,404** | **6** | **0.938** | **21** |
+| 100 | 762,751 | 9 | 1.123 | 29 |
+
+The cliff between 98 and 99 is the quantization table: libjpeg's scaling leaves
+every entry at 1 by quality 99, and `image`'s encoder never subsamples chroma,
+so the round trip becomes the DCT's own rounding. Below that the DC coefficient
+alone is quantized in steps of two or three levels — an 8×8 staircase across a
+field that only sweeps a few dozen levels in total. 100 is the same size to
+within 0.2% and worse on all three measures, so 99 it is.
+
+The dither is load-bearing and its amplitude was measured the same way, at
+quality 99:
+
+| grain (levels) | bytes | run |
+|---|---|---|
+| 0.0 | 154,294 | 158 |
+| 0.8 | 367,078 | 106 |
+| 1.2 | 567,102 | 37 |
+| **1.6** | **761,404** | **21** |
+| 2.4 | 1,080,183 | 14 |
+
+At 1.6 the encoded artifact is back at the source's own noise floor, which is
+the stopping point: more grain buys nothing the eye can see and costs bits
+linearly. Undithered, the same picture has 158-row flat bands — that is the
+defect these numbers exist to keep out, and it is what the test's bound of 40
+is set against.
+
+The artifact costs 424,735 bytes more in git than the file it replaces and
+**nothing at all in the image**: the initrd carries the decoded
+`share/wallpaper.rgb` either way, 6,220,808 bytes.
 
 ### 7g. Clean by inspection
 

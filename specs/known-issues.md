@@ -5827,13 +5827,13 @@ option and does not record that the answer was no.
 
 ### OPEN — what the repository ships is not all MIT OR Apache-2.0
 
-`specs/dependency-audit-2026-08-08.md` §7 has each item with its evidence. Six
-committed binary files — 11,094,369 bytes of the 14,634,080 git tracks — plus one
-committed source corpus sit outside the declared licence, and the README declares
-only one exception
-(`userland/doom` is GPL-2.0). Provenance had to be established from content,
-because `assets/` and `ovmf/` both entered in the initial squashed commit
-`52eb78e` and carry no attribution.
+`specs/dependency-audit-2026-08-08.md` §7 has each item with its evidence. The
+audit found six committed binary files outside the declared licence, 11,094,369
+bytes of them; the wallpaper is now ours and the other five are 10,757,700.
+One committed source corpus is outside it too, and the README declares a single
+exception (`userland/doom` is GPL-2.0). Provenance had to be established from
+content, because `assets/` and `ovmf/` both entered in the initial squashed
+commit `52eb78e` and carry no attribution.
 
 Sharpest first:
 
@@ -5858,10 +5858,25 @@ Sharpest first:
   licence, version or recipe recorded. They are load-bearing: `src/qemu.rs:101`
   and `tests/common/qemu.rs:2090` point pflash at them, while every workflow
   installs the `ovmf` apt package and the harness ignores it.
-- **`assets/wallpaper.jpg`** has **no determinable provenance**. Its EXIF holds
-  four tags and neither `Artist` nor `Copyright`; git history has nothing; the
-  README does not mention it. It ships as `share/wallpaper.rgb`. Recording the
-  open question rather than guessing is the point of this bullet.
+- **`assets/wallpaper.jpg`** — **CLOSED 2026-08-08**, and the close is a
+  replacement rather than an attribution. The owner supplied the source the
+  file's own metadata could not: peakpx.com, whose page names no author and no
+  copyright holder, says the image was *"uploaded by our users"*, and states
+  *"License: Wallpaper use only, DMCA"*. That is worse than the unknown it
+  answers — a documented restriction from an aggregator with a takedown form and
+  no standing to grant one, and "wallpaper use only" is exactly the clause a
+  redistributable OS image violates. So the bytes are gone: `src/wallpaper.rs`
+  draws what is at that path now and `cargo run -- --regen-wallpaper` writes it.
+  **The question cannot reopen by someone dropping a picture there** —
+  `the_committed_wallpaper_is_the_one_this_file_describes` compares the file
+  against the generator on every `cargo test`.
+  **One loose end, deliberately left here rather than fixed blind:** `NOTICE`
+  exists only on branch `wt/toyos-licence`, unlanded when this landed, and
+  carries an `assets/wallpaper.jpg — PROVENANCE UNKNOWN` section. The two
+  branches touch different files, so git will merge that section in silently.
+  Whoever lands second **deletes it** — the entry describes bytes that are no
+  longer in the tree, and a `NOTICE` naming a file it does not describe is
+  worse than one line shorter.
 
 ### OPEN — nothing in the tree checks any of the above
 
