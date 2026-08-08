@@ -18,9 +18,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# **A superseded pull-request run is thrown away; a run on `main` never is.**
+# Cancelling a pull request's previous run is free — the newer push is the
+# question anyone is asking. `main` is not that: every merged state is a state
+# somebody will bisect through, and `landing.yml`'s `gate-stage` counts only the
+# runs that *concluded*, so a cancelled one is not a sample and the trigger for
+# promoting the guest gate never advances on it. Measured 2026-08-08: five pull
+# requests merged inside ninety minutes left `e4b7279`, `782b9e5` and `aaa7a7a`
+# each cancelled by the merge behind it, and the newest verdict `main` had was
+# from before any of them.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   guest:
@@ -62,12 +71,23 @@ jobs:
     steps:
       # Before the checkout, because `actions/checkout` wants git and this image
       # has none.
+      #
+      # **Three attempts, because `sid` is a rolling release and its mirror is
+      # not a fixed artifact.** Shard 1 of run `31270581874` failed here and ran
+      # no test at all, which reads as a red shard and is not one. Advisory
+      # today; once `guest-suite` is required (§10.4) an apt mirror would be able
+      # to block a merge, and that is not a gate anyone chose.
       - name: deps
         run: |
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            git curl ca-certificates jq zstd xz-utils build-essential \
-            qemu-system-x86 > /dev/null
+          for attempt in 1 2 3; do
+            apt-get update -qq \
+              && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                   git curl ca-certificates jq zstd xz-utils build-essential \
+                   qemu-system-x86 > /dev/null \
+              && break
+            echo "apt attempt $attempt failed"
+            test "$attempt" != 3 && sleep 20
+          done
           qemu-system-x86_64 --version | head -1
           ls -l /dev/kvm
           # The vendor is a variable and not a detail — an AMD host is the only
@@ -217,12 +237,18 @@ jobs:
     container:
       image: debian:sid
     steps:
+      # Three attempts, for the reason the shards' own `deps` step carries.
       - name: deps
         run: |
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            git curl ca-certificates jq zstd xz-utils build-essential \
-            qemu-system-x86 > /dev/null
+          for attempt in 1 2 3; do
+            apt-get update -qq \
+              && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                   git curl ca-certificates jq zstd xz-utils build-essential \
+                   qemu-system-x86 > /dev/null \
+              && break
+            echo "apt attempt $attempt failed"
+            test "$attempt" != 3 && sleep 20
+          done
           qemu-system-x86_64 --version | head -1
           ls -l /dev/kvm || echo "no /dev/kvm node: this is the emulated arm"
           grep -m1 'model name' /proc/cpuinfo
