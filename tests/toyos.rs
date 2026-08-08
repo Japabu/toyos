@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
 use common::{audio, compile, faults, hostload, screen, serial, stats, storage, usb};
+use toyos_build::testargs::Shard;
 
 struct TestDef {
     name: String,
@@ -109,6 +110,13 @@ impl HostSlots {
 /// own: alone it is thirteen seconds nothing overlaps, and in the phase it is
 /// one task among sixty.
 const SHARED_BLOCK: Sched = Sched::Parallel;
+
+/// How many times a shared block will answer a dead guest with a new one.
+///
+/// Bounded because a block whose every member kills the guest must not boot one
+/// per test; three because the failure it exists for is one test taking the boot
+/// down, and a block that does it four times has a different problem.
+const MAX_SHARED_REBOOTS: usize = 3;
 
 // Rust helper binaries that are spawned by tests, not tests themselves.
 const RUST_SKIP: &[&str] = &[
@@ -9881,9 +9889,34 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
             let mut done = 0usize;
             let outcome = catching(|| {
                 let mut qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
+                let mut reboots = 0usize;
                 for test in &tests {
                     let start = common::clock::mark();
-                    let result = qemu.run_test(&test.qemu_name, test.timeout);
+                    let mut result = qemu.run_test(&test.qemu_name, test.timeout);
+                    // **A guest that stopped answering is answered with a new
+                    // one.** Its turn came, its whole ceiling passed, and it was
+                    // never announced — so what this measured is the previous
+                    // test's wreckage and not this one. Run `31241099454` is the
+                    // bill: `abuse_gpu_resolution` took the shared boot with it
+                    // and the 150 tests behind it each paid a full ceiling for a
+                    // guest that was gone, 65 minutes of nothing and a job
+                    // cancelled at 90.
+                    //
+                    // A reboot rather than an abandonment because every one of
+                    // those tests still has a verdict owed to it, and the
+                    // alternative is a suite that reports 150 reds it never ran.
+                    // Bounded, because a block whose every member kills the
+                    // guest must not boot one per test.
+                    if result.boot_stopped_answering() && reboots < MAX_SHARED_REBOOTS {
+                        reboots += 1;
+                        eprintln!(
+                            "  ---- the shared boot stopped answering before {}; rebooting \
+                             ({reboots}/{MAX_SHARED_REBOOTS}) ----",
+                            test.name
+                        );
+                        qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
+                        result = qemu.run_test(&test.qemu_name, test.timeout);
+                    }
                     let reason = (!(test.check)(&result)).then(|| {
                         result
                             .error
@@ -9935,16 +9968,31 @@ impl Task<'_> {
 
 /// Where the last run in this worktree left what each test cost it.
 ///
-/// Under `target/`, so it is per-worktree and never committed: it is a *hint*
-/// about how to order a queue and never an input to a verdict. A wrong number
-/// costs some idle lane time; a missing one costs nothing at all.
+/// Under `target/`, so it is per-worktree: it is a *hint* about how to order a
+/// queue and never an input to a verdict. A wrong number costs some idle lane
+/// time; a missing one costs nothing at all.
 fn durations_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-durations")
 }
 
-fn load_durations() -> BTreeMap<String, Duration> {
-    let mut out = BTreeMap::new();
-    let Ok(text) = fs::read_to_string(durations_path()) else { return out };
+/// The profile a checkout that has never run the suite starts from.
+///
+/// A machine with no measurement at all prices every test the same, and
+/// [`Shard::keep`]'s LPT then degenerates to round-robin — which is what put 191
+/// of 268 tests on one CI shard and cut it off at its job timeout while another
+/// finished in sixteen minutes (`specs/ci-plan.md` §7.2). Every runner is that
+/// machine on every push, because a fresh clone has no `target/`.
+///
+/// Measured on a runner rather than here, deliberately: it is read by the
+/// machines that have nothing else, and the dev host overrides it with its own
+/// numbers the first time it runs the suite. Cross-arch TCG on an M4 Pro and
+/// KVM on four Azure cores do not agree about which tests are long.
+fn committed_durations_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-durations")
+}
+
+fn read_durations(path: &Path, out: &mut BTreeMap<String, Duration>) {
+    let Ok(text) = fs::read_to_string(path) else { return };
     for line in text.lines() {
         if let Some((name, ms)) = line.rsplit_once(' ') {
             if let Ok(ms) = ms.parse::<u64>() {
@@ -9952,6 +10000,16 @@ fn load_durations() -> BTreeMap<String, Duration> {
             }
         }
     }
+}
+
+/// The committed profile, with whatever this worktree has measured on top.
+///
+/// Per name rather than per file, so a checkout that has only ever run a filter
+/// keeps the committed number for everything that filter did not name.
+fn load_durations() -> BTreeMap<String, Duration> {
+    let mut out = BTreeMap::new();
+    read_durations(&committed_durations_path(), &mut out);
+    read_durations(&durations_path(), &mut out);
     out
 }
 
@@ -9959,13 +10017,40 @@ fn load_durations() -> BTreeMap<String, Duration> {
 ///
 /// Merged rather than replaced, because a filtered run knows about four tests
 /// and would otherwise throw away what the last full one measured.
-fn save_durations(mut known: BTreeMap<String, Duration>, timed: &[(String, Duration)]) {
+///
+/// **A shard writes somewhere nothing reads.** The partition is a function of
+/// the profile, so a shard that saved would move it under its siblings — three
+/// shards of `nvme_` in one worktree ran one test twice and one nowhere, and
+/// every one of the three reported green. What a shard measures is still a
+/// measurement, and the six of them are a partition of the suite, so it goes to
+/// a file named for the shard that took it: [`load_durations`] never opens one,
+/// and merging them into the committed profile is a deliberate act with a
+/// command behind it.
+fn save_durations(
+    mut known: BTreeMap<String, Duration>,
+    timed: &[(String, Duration)],
+    shard: Option<Shard>,
+) {
     for (name, elapsed) in timed {
         known.insert(name.clone(), *elapsed);
     }
-    let body: String =
-        known.iter().map(|(n, d)| format!("{n} {}\n", d.as_millis())).collect();
-    let path = durations_path();
+    let (path, body) = match shard {
+        None => (
+            durations_path(),
+            known.iter().map(|(n, d)| format!("{n} {}\n", d.as_millis())).collect::<String>(),
+        ),
+        // This shard's own tests and no others: a third of the suite is a third
+        // of a measurement, and the merge is what makes it a whole one.
+        Some(s) => {
+            let mut mine: Vec<&(String, Duration)> = timed.iter().collect();
+            mine.sort_by(|a, b| a.0.cmp(&b.0));
+            (
+                durations_path()
+                    .with_file_name(format!("test-durations.shard-{}-of-{}", s.index, s.count)),
+                mine.iter().map(|(n, d)| format!("{n} {}\n", d.as_millis())).collect::<String>(),
+            )
+        }
+    };
     let tmp = path.with_extension("tmp");
     if fs::create_dir_all(path.parent().expect("target/ has a parent")).is_ok()
         && fs::write(&tmp, body).is_ok()
@@ -10502,16 +10587,6 @@ fn main() {
         outcomes.into_iter().for_each(|o| tally.record(o));
     }
     qemu::set_width(1);
-    // **A sharded run may not write the profile it partitioned on.** The
-    // partition is a function of the durations file, so shards that disagree
-    // about that file disagree about who owns what — and a shard that saves
-    // moves it under its siblings. Run three shards of `nvme_` in one worktree
-    // and two of them ran `nvme_home_roundtrip` while `nvme_large_device` ran
-    // nowhere: three runs, three profiles, three different partitions. It is
-    // also a third of a measurement, which is not what this file is for.
-    if shard.is_none() {
-        save_durations(known, &timed);
-    }
 
     if !wide_reds.is_empty() {
         eprintln!("  --- re-running {} wide failure(s) alone ---", wide_reds.len());
@@ -10573,10 +10648,15 @@ fn main() {
                     suspended: start.suspended(),
                 };
                 report_line(&outcome);
+                timed.push((outcome.name.clone(), outcome.elapsed));
                 tally.record(outcome);
             }
         }
     }
+
+    // After gate A, because its configs are the only tasks a shard prices by a
+    // name with an `smp=` in it and they are the last thing measured.
+    save_durations(known, &timed, shard);
 
     // Three exit statuses, because there are three things a run can establish,
     // and an expected failure is deliberately none of them — see
