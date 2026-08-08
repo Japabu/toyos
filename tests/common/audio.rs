@@ -759,6 +759,30 @@ fn silent_runs(mono: &[i32], min_len: usize) -> Vec<SilentRun> {
     runs
 }
 
+/// soundd's own word for the sink it took when the machine has none.
+pub const NULL_SINK: &str = "soundd: no audio device, presenting a null sink";
+
+/// The kernel's word for the other outcome: soundd is not there any more.
+const SOUNDD_GONE: &str = "exit: soundd";
+
+/// Wait until soundd has said which sink it took, bounded by the guest.
+///
+/// init spawns its programs without waiting, so the ready marker is one child's
+/// first line and orders nothing about another's — which of soundd and the test
+/// runner speaks first is a race the guest never promised to win. Both callers
+/// used to bound it with a span of host wall clock, and on a KVM runner soundd
+/// lost that race: `metal_sim_null_audio` was red 5 of 5 with its line arriving
+/// 64 ms past a 500 ms window (run `31258202923`, and the probe that timed it).
+///
+/// [`SOUNDD_GONE`] ends the wait too, because the regression this gates is
+/// soundd *exiting* on a device-less machine — it has to red with the caller's
+/// own sentence and not fifteen seconds later as a stall.
+pub fn await_null_sink(qemu: &mut QemuInstance, log: &mut String) -> Result<(), String> {
+    qemu::await_guest(qemu, log, "soundd to say which sink it took", |seen| {
+        seen.contains(NULL_SINK) || seen.contains(SOUNDD_GONE)
+    })
+}
+
 /// Gate: on a machine with **no audio hardware** (`Profile::Metal`, the T14's
 /// shape and the one the `tone` panic reproduced on), an audio-producing client
 /// runs to completion — exit 0, no panic — and does so at the real audio rate,
@@ -768,8 +792,8 @@ fn silent_runs(mono: &[i32], min_len: usize) -> Vec<SilentRun> {
 /// state. Before it, soundd exited on a device-less machine and released its
 /// service name, so cpal's `build_output_stream` failed `NotFound` and `tone`
 /// panicked in `.expect("failed to build audio stream")`. That pre-null tree is
-/// the negative control — reverting soundd's null-sink path reds this test with
-/// the tone panic.
+/// the negative control — reverting soundd's null-sink path reds this test on
+/// the first assertion, with the kernel's `exit: soundd` in the capture.
 ///
 /// Three host-side assertions, and there is no wav here (this machine has no
 /// device to capture from), so ground truth is the client's exit, the host wall
@@ -799,17 +823,13 @@ pub fn null_sink_real_rate(
         },
     );
 
-    // soundd must present the null sink rather than exit. It starts before the
-    // first test, so the line is in the boot log; drain a little more in case it
-    // races the ready marker.
-    const NULL_LINE: &str = "soundd: no audio device, presenting a null sink";
+    // soundd must present the null sink rather than exit.
     let mut early = qemu.boot_log().to_string();
-    if !early.contains(NULL_LINE) {
-        early.push_str(&qemu.drain_serial(Duration::from_millis(500)));
-    }
-    if !early.contains(NULL_LINE) {
+    let stalled = await_null_sink(&mut qemu, &mut early).err();
+    if !early.contains(NULL_SINK) {
         return Err(format!(
-            "soundd did not present a null sink on a device-less machine:\n{early}"
+            "{}soundd did not present a null sink on a device-less machine:\n{early}",
+            stalled.map(|why| format!("{why}\n")).unwrap_or_default()
         ));
     }
 

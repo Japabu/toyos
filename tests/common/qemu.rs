@@ -226,6 +226,66 @@ pub fn guest_liveness() -> Liveness {
     Liveness::new(GUEST_QUIET, GUEST_WEDGED)
 }
 
+/// Collect console output until `done` reads true of the whole capture, or the
+/// guest stops making progress.
+///
+/// The shape [`QemuInstance::drain_serial`] cannot have: its caller passes a
+/// number of seconds, and a number of seconds is a claim about the host. Here
+/// the wait ends when the guest goes quiet or wedges, so a guest with a twelfth
+/// of the machine costs the run wall clock and never a verdict — and when it
+/// does end early the message says so in the words the classifier reads
+/// ([`STALLED`]).
+///
+/// `doing` is what the guest was asked to do, in the caller's own words. The
+/// caller keeps its assertion; what this owns is the difference between "it did
+/// the wrong thing" and "it never got there".
+///
+/// It lives beside [`Liveness`] rather than in the test list because a test in
+/// `tests/common/` could not reach it there, and the two that could not —
+/// `metal_sim_null_audio` and `hda_two_live_refused` — each reached for a span
+/// of host wall clock instead and lost the race on a runner.
+pub fn await_guest(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    doing: &str,
+    done: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let mut live = guest_liveness();
+    while !done(log) && live.working(log) {
+        let more = qemu.drain_serial(Duration::from_millis(200));
+        log.push_str(&more);
+    }
+    if done(log) {
+        return Ok(());
+    }
+    Err(format!("{STALLED} waiting for {doing} — {}", live.why()))
+}
+
+/// [`await_guest`] for the common case: one marker anywhere in the capture.
+pub fn await_marker(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    marker: &str,
+    doing: &str,
+) -> Result<(), String> {
+    await_marker_new(qemu, log, marker, 0, doing)
+}
+
+/// [`await_marker`] over what arrives after `from`.
+///
+/// For a marker a test asks for more than once: a whole-capture scan answers
+/// the second ask with the first ask's line and carries on against a guest that
+/// has not done the thing yet.
+pub fn await_marker_new(
+    qemu: &mut QemuInstance,
+    log: &mut String,
+    marker: &str,
+    from: usize,
+    doing: &str,
+) -> Result<(), String> {
+    await_guest(qemu, log, doing, |log| log[from.min(log.len())..].contains(marker))
+}
+
 /// The hardware shape QEMU presents to the guest.
 ///
 /// Not a display setting: each variant is a whole machine. `Headless` is the

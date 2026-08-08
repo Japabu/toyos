@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::common::audio::{await_null_sink, NULL_SINK};
 use crate::common::qemu::{self, BootOptions, Profile, QemuInstance};
 use crate::common::serial::Serial;
 
@@ -523,8 +524,12 @@ pub fn hda_two_live_refused(
         rust_bins,
         BootOptions { profile: Profile::HdaTwoLive, ..Default::default() },
     );
-    let mut log = Serial::boot(&qemu);
-    log.push(&qemu.drain_serial(Duration::from_secs(1)));
+    // The refusal is a kernel boot line and is in the capture already; soundd's
+    // answer to it is a userland line that races the ready marker, so it is
+    // waited for on the guest's clock rather than on a span of the host's.
+    let mut text = qemu.boot_log().to_string();
+    let stalled = await_null_sink(&mut qemu, &mut text).err();
+    let log = Serial::named("boot console", text);
 
     log.must_say("hda: 00:")?;
     log.must_say("has a live link (statests=")?;
@@ -533,7 +538,11 @@ pub fn hda_two_live_refused(
     log.must_not_say("bound, statests=")?;
     // The machine still boots and still has a sink: absence of hardware is a
     // routing state, and a refusal must not be a machine that will not run.
-    log.must_say("presenting a null sink")?;
+    log.must_say(NULL_SINK)
+        .map_err(|why| match stalled {
+            Some(stall) => format!("{stall}\n{why}"),
+            None => why,
+        })?;
     log.must_say("Boot: complete")?;
     log.must_be_clean()
 }

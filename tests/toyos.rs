@@ -7,7 +7,10 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::qemu::{self, guest_liveness, BootOptions, QemuInstance, TestResult, STALLED};
+use common::qemu::{
+    self, await_guest, await_marker, await_marker_new, BootOptions, QemuInstance, TestResult,
+    STALLED,
+};
 use common::{audio, compile, faults, hostload, screen, serial, stats, storage, usb};
 use toyos_build::testargs::Shard;
 
@@ -4569,60 +4572,6 @@ fn locale_detect_unrecognized(qemu: &mut QemuInstance) -> Result<(), String> {
 fn round_trip(one_guest: Duration) -> Duration {
     let (_, _, num, den) = qemu::host_speed();
     one_guest * num / den
-}
-
-/// Collect console output until `done` reads true of the whole capture, or the
-/// guest stops making progress.
-///
-/// The shape [`serial_until`] cannot have: its caller passes a number of
-/// seconds, and a number of seconds is a claim about the host. Here the wait
-/// ends when the guest goes quiet or wedges, so a guest with a twelfth of the
-/// machine costs the run wall clock and never a verdict — and when it does end
-/// early the message says so in the words [`Outcome::stalled`] classifies on.
-///
-/// `doing` is what the guest was asked to do, in the caller's own words. The
-/// caller keeps its assertion; what this owns is the difference between "it did
-/// the wrong thing" and "it never got there".
-fn await_guest(
-    qemu: &mut QemuInstance,
-    log: &mut String,
-    doing: &str,
-    done: impl Fn(&str) -> bool,
-) -> Result<(), String> {
-    let mut live = guest_liveness();
-    while !done(log) && live.working(log) {
-        let more = qemu.drain_serial(Duration::from_millis(200));
-        log.push_str(&more);
-    }
-    if done(log) {
-        return Ok(());
-    }
-    Err(format!("{STALLED} waiting for {doing} — {}", live.why()))
-}
-
-/// [`await_guest`] for the common case: one marker anywhere in the capture.
-fn await_marker(
-    qemu: &mut QemuInstance,
-    log: &mut String,
-    marker: &str,
-    doing: &str,
-) -> Result<(), String> {
-    await_marker_new(qemu, log, marker, 0, doing)
-}
-
-/// [`await_marker`] over what arrives after `from`.
-///
-/// For a marker a test asks for more than once: a whole-capture scan answers
-/// the second ask with the first ask's line and carries on against a guest that
-/// has not done the thing yet.
-fn await_marker_new(
-    qemu: &mut QemuInstance,
-    log: &mut String,
-    marker: &str,
-    from: usize,
-    doing: &str,
-) -> Result<(), String> {
-    await_guest(qemu, log, doing, |log| log[from.min(log.len())..].contains(marker))
 }
 
 /// Keep collecting serial into `log` until `marker` shows up.

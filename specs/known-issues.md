@@ -7131,10 +7131,10 @@ all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
 | ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — §8, a Bulk-Only Reset that raced the transfer it was recovering from |
 | `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, see §1's x87 entry |
 | `std_unwind_so` | **5/5** | 10 | shared block | the same |
-| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine |
+| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine — **closed below** |
 | `hda_tone` | **4/5** | 4 | Serial | 1 mid-tone silence in the capture (§4) |
 | `late_storage_connect` | 2/5 | 7 | Serial | the boot scan bound a disk, so the port was not held empty |
-| `hda_two_live_refused` | 2/5 | 2 | Parallel | `"presenting a null sink" never reached the boot console` |
+| `hda_two_live_refused` | 2/5 | 2 | Parallel | `"presenting a null sink" never reached the boot console` — **closed below** |
 | `blocked_dump` | 2/5 | 3 | Parallel | two *different* reasons — the census half, and /bin/terminal racing the compositor |
 | `dump_nmi_probe` | 1/5 | 2 | Serial | the rip resolved to `u128_div_rem`, not to the spin |
 | `kernel_heartbeat` | 1/5 | 5 | Serial | 2 of 12 heartbeats dropped a healthy CPU from the mask |
@@ -7145,12 +7145,23 @@ not see it: `xhci_slow_connect`, red alone in run `31261669826`. It has its own
 entry above — a 1 ms margin *inside the guest's boot*, which is why running alone
 moves it by milliseconds and not by a verdict.
 
+A thirteenth, with one sample each way on **one tree**: `desktop_audio_client`
+stalled wide *and* alone in run `31264914759` and passed in run `31266194663`,
+same commit, half an hour apart. It is 0 of 5 in the table's own probe, so this
+is a rate and not a reproduction — but the capture is worth the note, because it
+is #172's signature away from the T14: two clients connect, both tones say
+`done`, and only one `client N removed` ever follows. The wait it blew is
+`both clients to leave the mixer`.
+
 **The top five reproduce, so they are defects and not a rate.** The bottom six
 fire one or two runs in five, which is 20–40% and is not "noise" either: the bar
 this was measured against tolerates one in fifty *with the failure named*, and
 none of these six has been looked at. **No entry here is a candidate for
 `EXPECTED_FAILURES`** — an exemption names a defect and a write-up, and "fires
 40% of the time for reasons nobody has looked at" is neither.
+
+**`metal_sim_null_audio` and `hda_two_live_refused` are the first two off this
+table**, and the entry below says what they were. The remaining nine stand.
 
 **Six of the eleven are `Sched::Serial`, and until 2026-08-08 the harness re-ran
 none of them**: the retry loop was written for the parallel phase and branched on
@@ -7168,6 +7179,73 @@ all **0 of 5** now, and the "a guest stops making progress and pays its whole
 ceiling" shape with them. Anything read off a run older than `31254054628` is
 about a different tree.
 
+### CLOSED — soundd always presented its null sink; two tests bounded the race for it with a clock
+
+`metal_sim_null_audio` (5 of 5) and `hda_two_live_refused` (2 of 5) were red on
+the same missing line, `presenting a null sink`, and both were green on the dev
+host — 5 of 5 each, measured before touching anything. So the question was one
+this host cannot answer, and it was asked on the instrument that reds:
+`probe-nullsink.yml`, run `31263831141`, three reps of `Profile::Metal` under
+KVM on the same `debian:sid` image `ci.yml` uses, with the 500 ms window
+replaced by a report and then by 8 s of nobody touching the guest.
+
+**The line always came.** Per rep, from the host's own receive clock:
+
+| rep | soundd spawned | `===READY===` (test-runner's first line) | `presenting a null sink` |
+|---|---|---|---|
+| 1 | guest 0.274 | 15:21:04.5253 | 15:21:05.0895 — **0.564 s later**, and 64 ms after the window closed at .0258 |
+| 2 | guest 0.301 | 15:21:38.3286 | 15:21:37.7784 — **0.550 s earlier** |
+| 3 | guest 0.277 | 15:20:55.4856 | 15:20:54.9524 — **0.533 s earlier** |
+
+So it is a race and not an absence: init spawns its programs without waiting, so
+`===READY===` is one child's first line and orders nothing about another's.
+`metal_sim_null_audio` allowed 500 ms of *host* wall clock after the marker and
+`hda_two_live_refused` allowed 1 s, and those were the only two tests asking
+about that line through a span rather than through the guest. On this host the
+two children's first lines are ~30 ms apart with the marker always first, which
+is why neither ever reds here.
+
+Fixed by the discipline the rest of the suite already uses: `await_guest` moved
+out of the test list into `tests/common/qemu.rs` — a test in `tests/common/`
+could not reach it there, which is most of why these two reached for a duration
+— and both now wait on the guest. The wait ends on soundd's line, on the
+kernel's `exit: soundd`, or on the guest going quiet. The middle one matters: a
+soundd that *exits* on a device-less machine is the regression being gated, and
+it has to red with the caller's own sentence rather than fifteen seconds later
+as a stall. Measured on this host with soundd's null-sink arm removed,
+`metal_sim_null_audio` reds in 5 s with `soundd did not present a null sink on a
+device-less machine` and `exit: soundd pid=0 code=0` in the capture, and
+`hda_two_live_refused` in 3 s with its own.
+
+**soundd itself was not changed, and the shape it was suspected of is not the
+one it has.** Every device refusal already reaches the null sink: both
+`Hda::Refusal` arms do, and virtio's non-`NotFound` refusal does. The single
+path that does not is `Refusal::NoDevice(e)` for `e != NotFound` on the virtio
+claim, which is a *conflict* — another soundd holding the claim — and is a
+deliberate panic with the reason written beside it. Absence is routed; only
+contention is loud.
+
+### OPEN, UNASSIGNED — a userland process reaches its first line half a second after its sibling on a runner, and ~30 ms after it here
+
+Fell out of the probe above and is not what it closed. On all three reps the two
+programs `tests/testcases` starts — soundd and test-runner, spawned 1–3 ms apart
+— printed their first lines **0.53–0.56 s apart**, and which of the two was
+first flipped between reps. On this host the same pair is ~30 ms apart, in spawn
+order, every time. The kernel's own boot is the same speed on both (`Boot:
+complete` at 275–304 ms on the runner against 269 ms here), so it is not a slow
+machine: it is the first moment two runnable tasks exist.
+
+The i8042 verdict measures the same thing from the kernel's side, since it is
+emitted from the first idle-loop trip after arming: `idle at` 523–552 ms on the
+runner against 304 ms here.
+
+Nothing here says whether that is the host descheduling a vCPU thread, something
+in userland startup, or the scheduler leaving a task unclaimed — the probe was
+not built to tell them apart. It is recorded because a half-second of skew
+between two init children is enough to decide any remaining wall-clock margin in
+the suite, and because it is invisible on a host whose TCG runs one vCPU at a
+time.
+
 ### OPEN — four reds on a runner that are not the xHCI class and not the width
 
 Run `31247206462`, each red again when re-run alone, none of them reproduced on
@@ -7183,12 +7261,12 @@ Three of the four are soundd's, which makes them worth reading together rather
 than one at a time. Nothing here is diagnosed; they are recorded so the next
 green run cannot quietly be read as their absence.
 
-**Two of the four are settled by the rate above and two are not.**
-`doom_sound_flood` and `sshd_fail_closed` are 0 of 5 on the current tree.
-`metal_sim_null_audio` is **5 of 5**, which makes it the one to take first — and
-`hda_two_live_refused`, 2 of 5 with `"presenting a null sink" never reached the
-boot console`, is the same missing line seen from the other side, so the two are
-one question about soundd's device-less path rather than two.
+**Two of the four are 0 of 5 on the current tree and one is closed.**
+`doom_sound_flood` and `sshd_fail_closed` did not fire in the rate probe.
+`metal_sim_null_audio` was 5 of 5 and is closed above, together with
+`hda_two_live_refused` — one question about how the two tests read the boot
+console, and not one about soundd's device-less path, which was doing its job on
+every one of those runs. `hda_client_stall` is the one still standing.
 
 ### CLOSED, superseded by the four arms above — six input tests fail on a GitHub runner and pass here
 

@@ -616,8 +616,8 @@ the harness:
   not reach. `desktop_typing_damage` and `sshd_fail_closed` are red alone too.
 - **Three that are their own**: `doom_sound_flood` (red alone, 92 s),
   `hda_client_stall` (red alone), `metal_sim_null_audio` (`soundd did not present
-  a null sink on a device-less machine`), and `hda_tone`'s mid-tone silence,
-  which #88's exemption correctly does not cover.
+  a null sink on a device-less machine`, since closed — §9.2), and `hda_tone`'s
+  mid-tone silence, which #88's exemption correctly does not cover.
 
 `usb_storage_shapes` is green here and was red under 8.2.2 — the second thing
 the QEMU version bought, and it was not one of the eight the probe measured.
@@ -839,10 +839,10 @@ and every name that had been rotating is gone from both it and this probe:
 | ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — the Bulk-Only Reset raced the transfer it recovered from (`specs/known-issues.md` §8) |
 | `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, §9.3 |
 | `std_unwind_so` | **5/5** | 10 | shared block | the same |
-| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine |
+| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine — **closed**, see below |
 | `hda_tone` | **4/5** | 4 | Serial | 1 mid-tone silence in the capture |
 | `late_storage_connect` | 2/5 | 7 | Serial | the boot scan bound a disk, so the port was not held empty |
-| `hda_two_live_refused` | 2/5 | 2 | Parallel | "presenting a null sink" never reached the boot console |
+| `hda_two_live_refused` | 2/5 | 2 | Parallel | "presenting a null sink" never reached the boot console — **closed**, see below |
 | `blocked_dump` | 2/5 | 3 | Parallel | two *different* reasons — the census half, and /bin/terminal racing the compositor |
 | `dump_nmi_probe` | 1/5 | 2 | Serial | the rip resolved to `u128_div_rem`, not to the spin |
 | `kernel_heartbeat` | 1/5 | 5 | Serial | 2 of 12 heartbeats dropped a healthy CPU from the mask |
@@ -852,6 +852,19 @@ and every name that had been rotating is gone from both it and this probe:
 fail identically every time; `hda_tone` misses one rep and is
 `specs/known-issues.md` §4's open item, which #88's exemption correctly does not
 cover.
+
+**Two are closed and the defect was in this file's own subject matter, not in
+the guest.** `metal_sim_null_audio` and `hda_two_live_refused` red on the same
+missing line, and `probe-nullsink.yml` (run `31263831141`, three reps on the
+`debian:sid`/KVM image) caught the line arriving 64 ms after a 500 ms window had
+closed on one rep and half a second *before* the ready marker on the other two.
+soundd presents its null sink on every one of those boots; what differed is that
+init spawns its programs without waiting, so the ready marker orders nothing
+about a daemon's own first line — and these two were the only tests reading that
+line through a span of host wall clock. Both wait on the guest now.
+`specs/known-issues.md` §8 has the table and the half-second of skew between two
+init children that the probe found and did not explain, which is §7's contention
+class showing up somewhere new.
 
 **Six of the eleven are `Sched::Serial`, and the harness re-ran none of them**
 until this task — the retry loop was written for the parallel phase and branched
@@ -1082,13 +1095,16 @@ lines to run next. It never pushes `main` and never forces anything.
 
 ### 10.4 The two stages, and the exact trigger between them
 
-**CI cannot currently go green, and the reason is not CI.** §9.2's top five
-reproduce on every run: `std_unwind` and `std_unwind_so` (x87 state on the
-context switch, §9.3), `metal_sim_null_audio` and `hda_two_live_refused`
-(soundd's device-less path), and `hda_tone`'s mid-tone silence. Each has an owner
-and a write-up. **Widening `EXPECTED_FAILURES` to cover them is refused** — an
-exemption names a defect and its write-up, and buying a green run while any Ring
-3 process can kill the next unrelated one scheduled on that CPU is not that.
+**CI cannot currently go green, and the reason is not CI.** §9.2 measured five
+names reproducing on every run. Three closed on 2026-08-08 —
+`usb_transport_break` a real xHCI driver defect only CI could see,
+`metal_sim_null_audio` and `hda_two_live_refused` two harness waits taken over a
+span of host wall clock — and **three remain**: `std_unwind` and `std_unwind_so`
+(x87 state on the context switch, §9.3) and `hda_tone`'s mid-tone silence
+(known-issues §4). Each has an owner and a write-up. **Widening
+`EXPECTED_FAILURES` to cover them is refused** — an exemption names a defect and
+its write-up, and buying a green run while any Ring 3 process can kill the next
+unrelated one scheduled on that CPU is not that.
 
 So the switch is staged, and the second stage is not a matter of anyone
 remembering.
