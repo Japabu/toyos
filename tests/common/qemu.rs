@@ -1231,6 +1231,22 @@ pub struct TestResult {
     pub stdout: String,
     pub serial: String,
     pub error: Option<String>,
+    /// Whether the guest ever announced *this* test.
+    ///
+    /// The in-guest runner reads one command, prints `===TEST_START <name>` and
+    /// spawns; so a test that never started is a guest that never got as far as
+    /// reading its command, which is a different thing from a test that ran and
+    /// hung. On a shared boot the two want different answers — the first is
+    /// about the boot, the second about the test.
+    pub started: bool,
+}
+
+impl TestResult {
+    /// The guest is not answering any more: this test's turn came, its whole
+    /// ceiling passed, and it was never even announced.
+    pub fn boot_stopped_answering(&self) -> bool {
+        !self.started && self.error.is_some()
+    }
 }
 
 pub struct QemuInstance {
@@ -1724,6 +1740,9 @@ impl QemuInstance {
         let mut fire =
             |line: &str, socket: Option<&PathBuf>| step(socket.map(PathBuf::as_path), line);
 
+        // `run <name> [args...]`, and the markers carry only the binary name.
+        let want = name.split_whitespace().next().unwrap_or(name);
+
         let timeout = budget(timeout);
         let start = Instant::now();
         let mut stdout = String::new();
@@ -1738,15 +1757,29 @@ impl QemuInstance {
                     stdout,
                     serial,
                     error: Some(format!("timed out after {}s", timeout.as_secs())),
+                    started: in_test,
                 };
             }
 
             match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(line) => {
                     fire(&line, self.qmp_socket.as_ref());
-                    if line.contains("===TEST_START ") {
+                    if line.contains(&format!("===TEST_START {want}===")) {
                         in_test = true;
                     } else if let Some(at) = line.find(END_MARKER) {
+                        let rest = &line[at + END_MARKER.len()..];
+                        let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
+                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                        // **A marker naming another test is the previous one's**,
+                        // and taking it was `specs/known-issues.md` §6's cascade:
+                        // one timed-out test left the guest still producing its
+                        // output, every later member of the block read a window
+                        // that opened on it, and 110 of 238 went red on an
+                        // "actual" that was verbatim the previous expectation.
+                        // The name has been on the wire the whole time.
+                        if parts[0] != want {
+                            continue;
+                        }
                         // Everything before the marker is a line some other
                         // console writer was in the middle of when the runner
                         // printed; it is still real output and the audio gate
@@ -1755,9 +1788,6 @@ impl QemuInstance {
                             serial.push_str(&line[..at]);
                             serial.push('\n');
                         }
-                        let rest = &line[at + END_MARKER.len()..];
-                        let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
-                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         let (exit_code, error) = if parts.len() > 1 {
                             if let Some(code_str) = parts[1].strip_prefix("exit=") {
                                 (code_str.parse::<i32>().ok(), None)
@@ -1775,6 +1805,7 @@ impl QemuInstance {
                             stdout,
                             serial,
                             error,
+                            started: in_test,
                         };
                     } else if line.contains("KERNEL PANIC") {
                         return TestResult {
@@ -1783,6 +1814,7 @@ impl QemuInstance {
                             stdout,
                             serial,
                             error: Some(format!("kernel panic: {line}")),
+                            started: in_test,
                         };
                     } else if in_test {
                         serial.push_str(&line);
@@ -1807,6 +1839,7 @@ impl QemuInstance {
                         stdout,
                         serial,
                         error: Some("QEMU disconnected".to_string()),
+                        started: in_test,
                     };
                 }
             }

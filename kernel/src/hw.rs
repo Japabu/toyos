@@ -76,9 +76,10 @@ impl Machine for KernelHw {
     /// absolute value, so the conversion here becomes ns→TSC scaling with no
     /// clock read at all.
     ///
-    /// A deadline already in the past arms the one-tick minimum and fires
-    /// immediately (`arm_one_shot` clamps), which is what a past-due deadline
-    /// should do.
+    /// A deadline already in the past arms the one-shot's floor and fires at
+    /// the end of it. Not sooner: "as soon as possible" is an interrupt the
+    /// CPU takes before it can retire the instruction that armed it, and the
+    /// Ring 0 stub then reloads the same count forever.
     fn set_timer(&self, deadline: Nanos) {
         apic::arm_one_shot(deadline.0.saturating_sub(self.now().0));
     }

@@ -166,24 +166,6 @@ permission to copy or modify "but not for profit". That is not a free licence
 and it was never TinyCC's to relicense. Do not re-import it.
 
 
-assets/wallpaper.jpg — PROVENANCE UNKNOWN
------------------------------------------
-
-    336,669 bytes, 1920x1080
-    sha256 278d580d1472491c9d06f767df1ef7a0b1d1fb95a2c6918b46ecd0425fec4ab7
-
-**Nobody knows where this file came from, and this entry says so rather than
-guessing.** It carries JFIF, an Exif block and a Photoshop 3.0 IRB; the Exif
-holds four tags and neither `Artist` nor `Copyright`; there is no IPTC credit;
-git history is the initial squashed commit; the README never mentioned it. It
-ships as `share/wallpaper.rgb` in every initrd that carries `assets/`.
-
-An image of unknown origin in a repository offered under MIT is a live risk,
-and it is one only the owner can retire — either by recalling where it came
-from, or by replacing it with something whose licence is known. Inventing a
-licence for it would be worse than this paragraph.
-
-
 Rust crates and the forks
 -------------------------
 
