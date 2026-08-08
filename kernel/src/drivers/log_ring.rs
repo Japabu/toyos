@@ -124,6 +124,9 @@ impl LogRing {
         if file_dropped > 0 {
             FILE_DROPPED.fetch_add(file_dropped, Ordering::Relaxed);
         }
+        // After the copy, so a lock-free reader never sees a mark for a byte
+        // the writer has not stored yet.
+        WRITTEN.fetch_add(data.len() as u64, Ordering::Release);
         dropped
     }
 
@@ -156,6 +159,27 @@ unsafe impl Sync for RingCell {}
 static RING: RingCell = RingCell(UnsafeCell::new(LogRing::new()));
 static RING_LOCKED: AtomicBool = AtomicBool::new(false);
 static DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Every byte ever appended. `LogRing::head` is this modulo [`RING_SIZE`] and
+/// `retained` is this capped at it, so a mark needs no other field — which is
+/// what lets [`peek_range`] read the ring with one relaxed load and no lock.
+static WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// A position in the ring's byte stream, monotonic for the life of the boot.
+///
+/// Two of them bracket a span of log, which is what lets a reader ask for *one
+/// report* rather than for the newest bytes: the lines are already in the ring
+/// in the order every CPU produced them, and the only thing missing was a way
+/// to say where the report stopped.
+#[derive(Clone, Copy)]
+pub struct Mark(u64);
+
+/// Where the stream is now. Takes no lock, because the one caller is the
+/// blocked-task dump and it takes none either.
+pub fn mark() -> Mark {
+    Mark(WRITTEN.load(Ordering::Relaxed))
+}
+
 /// A lock-free mirror of `LogRing::len` — what serial still owes the host.
 ///
 /// It exists for exactly one reader: the pre-halt recheck in
@@ -481,6 +505,33 @@ pub unsafe fn drain_unlocked(out: &mut [u8]) -> usize {
 /// stays in bounds whatever the cursors do; the caller must simply tolerate a
 /// torn result. That is why the boot checkpoints call it with interrupts
 /// enabled and IRQ handlers logging: a torn line on screen, nothing more.
+/// Copy the bytes between two marks, without taking the lock and without
+/// consuming them. Returns the number copied.
+///
+/// The *newest* bytes of the span when it does not all fit, because a caller
+/// with a screen shows the end of a report and a truncated head costs it
+/// context rather than the answer. A span the ring has since overwritten
+/// shortens the same way: a mark names a byte, never a promise to have kept it.
+///
+/// # Safety
+/// Exactly [`peek_tail`]'s contract. It takes no lock, mutates nothing, and
+/// masks every index, so concurrent appends cost a garbled line near either end
+/// and can never move a cursor or leave the ring in a state a later drain would
+/// report differently.
+pub unsafe fn peek_range(from: Mark, to: Mark, out: &mut [u8]) -> usize {
+    let ring = unsafe { &*RING.0.get() };
+    let written = WRITTEN.load(Ordering::Acquire);
+    let end = to.0.min(written);
+    let oldest = written.saturating_sub(RING_SIZE as u64);
+    let start = from.0.max(oldest).min(end);
+    let n = ((end - start) as usize).min(out.len());
+    let first = end - n as u64;
+    for (i, slot) in out[..n].iter_mut().enumerate() {
+        *slot = ring.buf[((first + i as u64) % RING_SIZE as u64) as usize];
+    }
+    n
+}
+
 pub unsafe fn peek_tail(out: &mut [u8]) -> usize {
     let ring = unsafe { &*RING.0.get() };
     let len = ring.retained.min(RING_SIZE);
