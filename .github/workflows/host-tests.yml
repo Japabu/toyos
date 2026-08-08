@@ -10,7 +10,7 @@ name: host tests
 
 on:
   push:
-    branches-ignore: ['ci/**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

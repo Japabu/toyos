@@ -77,18 +77,30 @@ fn check_prerequisites() {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-
-    check_prerequisites();
-
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    env::set_current_dir(&root).expect("Failed to cd to project root");
 
-    // Before any other flag is read: `--gate`'s tail is another command's argv,
-    // and nothing here may take a word out of it for itself.
+    // The landing protocol, and the command it replaced — **before
+    // `check_prerequisites`**, because none of these builds anything and the
+    // runner that runs `--abi-split-check` has no QEMU on it. They are git, a
+    // push, and a refusal.
     if args.iter().any(|a| a == "--land") {
-        toyos_build::land::dispatch(&root, &args);
+        toyos_build::pr::dispatch_retired_land();
+    }
+    if args.iter().any(|a| a == "--pr") {
+        toyos_build::pr::dispatch_pr(&root);
         return;
     }
+    if args.iter().any(|a| a == "--sync") {
+        toyos_build::pr::dispatch_sync(&root);
+        return;
+    }
+    if args.iter().any(|a| a == "--abi-split-check") {
+        toyos_build::pr::dispatch_abi_check(&root, &args);
+        return;
+    }
+
+    check_prerequisites();
+    env::set_current_dir(&root).expect("Failed to cd to project root");
 
     let debug = args.iter().any(|a| a == "--debug");
     let build_only = args.iter().any(|a| a == "--build-only");
