@@ -314,15 +314,17 @@ pub fn hda_tone(
     let gaps = crate::common::audio::gap_histogram(&analysis, wav.sample_rate);
     let dropouts: u32 = gaps.values().sum();
     let breaks = crate::common::audio::phase_breaks(&wav);
+    let pitch = crate::common::audio::dominant_hz(&wav);
     eprintln!(
-        "  [hda] {} frames at {} Hz {} ch, peak {} active {:.2}s dither {:.1}% gaps {} \
-         phase-breaks {}",
+        "  [hda] {} frames at {} Hz {} ch, peak {} active {:.2}s dither {:.1}% pitch {:.1}Hz \
+         gaps {} phase-breaks {}",
         wav.mono.len(),
         wav.sample_rate,
         wav.channels,
         analysis.peak,
         analysis.active_samples as f64 / wav.sample_rate as f64,
         analysis.dither_ratio.unwrap_or(0.0) * 100.0,
+        pitch.unwrap_or(0.0),
         crate::common::audio::format_histogram(&gaps),
         breaks.len(),
     );
@@ -331,6 +333,13 @@ pub fn hda_tone(
             "{dropouts} mid-tone silences in the capture: {}",
             crate::common::audio::format_histogram(&gaps)
         ));
+    }
+    // The rate the engine plays at is soundd's decision on this machine and
+    // nothing else here can see it: a stream format naming the wrong base is
+    // eight buffers of correct audio a second played 8.8% fast, which every
+    // other assertion in this file passes.
+    if let Some(complaint) = crate::common::audio::wrong_pitch(&wav) {
+        return Err(complaint);
     }
     // The instrument the gap detector cannot be: an engine that replays a
     // period nobody refilled puts the tone back 0.28 of a cycle out, and

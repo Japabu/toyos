@@ -242,7 +242,7 @@ pub fn analyze(wav: &Wav) -> Analysis {
 
 /// The test tone's frequency, which the phase check below has to know and
 /// `tests/toyos-rust-tests/src/tone.rs` states.
-const TONE_HZ: f64 = 440.0;
+pub const TONE_HZ: f64 = 440.0;
 
 /// Where the captured tone stops being one sine.
 ///
@@ -278,6 +278,65 @@ pub fn phase_breaks(wav: &Wav) -> Vec<usize> {
             (predicted - mono[n + 1] as f64).abs() > TOLERANCE
         })
         .collect()
+}
+
+/// The captured tone's pitch, in Hz, measured off the wav.
+///
+/// The rate the device *plays* at is not a fact any guest counter can state:
+/// soundd generates 44100 frames per second of content and the engine consumes
+/// them at whatever `SDnFMT` and the codec's `Set Converter Format` agreed on,
+/// so a wrong rate field is a stream that is correct in every buffer and comes
+/// out at the wrong speed. Nothing else in this file can see that —
+/// [`phase_breaks`] tolerates it (an 8.8% pitch error perturbs the recurrence
+/// by ~12 LSB against a 400 LSB tolerance) and the gap detector is blind to it.
+///
+/// Schmitt-triggered zero crossings over the strong region, which needs no
+/// transform and is exact for one sine: the dither cannot cross a ±500 LSB
+/// hysteresis band and the count is two per cycle.
+pub fn dominant_hz(wav: &Wav) -> Option<f64> {
+    let mono = &wav.mono;
+    let first = mono.iter().position(|&s| s.abs() > SIGNAL_THRESHOLD)?;
+    let last = mono.iter().rposition(|&s| s.abs() > SIGNAL_THRESHOLD)?;
+    let mut high = mono[first] > 0;
+    let mut crossings = 0u32;
+    let (mut start, mut end) = (None, first);
+    for (n, &s) in mono.iter().enumerate().take(last + 1).skip(first) {
+        if (high && s < -SIGNAL_THRESHOLD) || (!high && s > SIGNAL_THRESHOLD) {
+            high = !high;
+            crossings += 1;
+            start.get_or_insert(n);
+            end = n;
+        }
+    }
+    // Between the first and last crossing, so the partial cycles at each end
+    // are outside the measurement rather than rounded into it.
+    let span = end.checked_sub(start?)?;
+    if crossings < 3 || span == 0 {
+        return None;
+    }
+    Some((crossings - 1) as f64 * wav.sample_rate as f64 / (2.0 * span as f64))
+}
+
+/// The complaint, when the capture did not come back at [`TONE_HZ`].
+///
+/// The band is half the distance between the two rates an HDA stream format can
+/// name — 44.1 and 48 kHz are 8.8% apart — which is the coarsest error this can
+/// be asked about and the widest band that still separates every pair the field
+/// can express. Nothing narrower is wanted: this is a rate check, not a
+/// frequency meter, and the estimator is a crossing count over a ramped tone.
+pub fn wrong_pitch(wav: &Wav) -> Option<String> {
+    const TOLERANCE: f64 = 0.044;
+    let Some(hz) = dominant_hz(wav) else {
+        return Some("the capture has no tone to measure the pitch of".to_string());
+    };
+    if (hz - TONE_HZ).abs() <= TONE_HZ * TOLERANCE {
+        return None;
+    }
+    Some(format!(
+        "the capture came back at {hz:.1} Hz for a {TONE_HZ} Hz tone — the device consumed the \
+         buffers at {:+.1}% of the rate soundd generated them for",
+        (hz / TONE_HZ - 1.0) * 100.0,
+    ))
 }
 
 /// Underrun histogram keyed by gap length in device periods (rounded,

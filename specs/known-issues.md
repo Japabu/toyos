@@ -3217,6 +3217,85 @@ does not make the transfer interruptible, and any other unbounded I/O reached
 from the idle loop inherits the same hazard. The measurement that would size it
 is a metal boot with the fix in — the owner's next one.
 
+### CLOSED 2026-08-08 — every HDA machine played 8.8% sharp: the stream format's sample-base bit was one place low
+
+`toyos_hda::stream::stream_format` built the base-rate bit at bit 13. The Intel
+HDA stream-format structure puts it at bit 14 and the three bits below it are
+the multiplier, so 44.1 kHz came out `0x2011` — a 48 kHz base carrying
+multiplier field `0b100`, which the field reserves — where the specification's
+value is `0x4011`. `SDnFMT` and the codec's `Set Converter Format` both carried
+it, so the controller and the codec agreed with each other and disagreed with
+soundd, which generated every buffer for 44100.
+
+Measured, `hda_tone` on the `intel-hda` profile, same session:
+
+| | capture pitch | dither ratio | soundd `completions` per 2 s window |
+|---|---|---|---|
+| before | 478.9 Hz | 3.3% | 764 |
+| after | 440.2 Hz | 24.4% | 695 |
+
+440 × 48000/44100 = 478.91. The owner's T14 log says the same thing from the
+other side: 751 completions per 2.000 s window is a 2.664 ms period, and 128
+frames in 2.6667 ms is 48 kHz (`specs/metal-logs/2026-08-08-audio-underruns/`).
+
+**The dither column is the second finding.** `analyze`'s silence band is derived
+from soundd's ±1 LSB TPDF dither and the expectation is 25%; 3.3% is QEMU's
+audio core resampling 48000 → 44100 into the wav backend and smearing it away.
+So **every earlier `hda_tone` capture was taken through a resampler that is now
+gone**, and the two verdicts below that rest on such a capture — #88's phase
+breaks and the mid-tone silence — have to be re-judged on a fresh sample rather
+than carried forward. Neither `EXPECTED_FAILURES` entry is touched here.
+
+Nothing in the tree could see it. `phase_breaks` cannot: an 8.8% pitch error
+perturbs its recurrence by about 12 LSB against a 400 LSB tolerance. The gap
+detector cannot, the peak check cannot, and soundd's own counters cannot — the
+DLL locks onto whatever the device does. The gate that closes it is
+`audio::wrong_pitch`, asserted by `hda_tone` and by all four gate A configs,
+with a band of 4.4% because the two rates the field can name are 8.8% apart.
+`toyos-hda`'s own gate is
+`every_rate_linux_tabulates_encodes_to_the_number_linux_tabulates` — twelve
+values from Linux's `rate_bits[]` table, a second implementation of the same
+specification, so no restatement of this crate's own arithmetic can agree with
+it — plus a round trip that decodes each built format back to the rate it was
+asked for.
+
+### OPEN, UNASSIGNED — the residual T14 underruns are the *client's* CPU taking the log flush, not soundd's
+
+`specs/metal-logs/2026-08-08-audio-underruns/` is the boot: 54 windows, **686
+underruns, 5 drains**, on the tree that already carries
+`flush_log_file_if_affordable`. Drains fell 375 → 5; underruns did not.
+
+The correlation runs the wrong way for a soundd defect. Underruns land in
+windows where soundd is *on time* (`max_batch=1`, worst wake 461–1130 µs), and
+the four windows where soundd was stalled 40–45 ms report underruns 0, 0, 0, 23
+— being late gives the client more time, not less. `max_batch=8` with
+`underruns=0` also settles the ring's shape: soundd consumed eight client
+periods in one cycle and every one was covered, so the ring is normally its full
+eight periods = 21.3 ms deep, and an empty one is a producer that stopped for at
+least that long. `/bin/tone` is one of the producers that stops and its callback
+is a sine, so it is not the client computing; it is the client not running.
+
+**The hypothesis, and it is the previous entry's fix seen from the other side.**
+`owes_deadline()` asked whether a task parked on this CPU expects a wake *at a
+time*. An audio client parks on a pipe with no deadline at all — it is woken by
+an event, by an RT daemon that expects it back inside one period — so the test
+could not see it, and the flush moved off soundd's CPU onto its client's, where
+it costs the same audio. Changed to `owes_wake()`: any parked task at all, with
+`LOG_DEFERRAL_CEILING_NS` unchanged. The T14 reports CPUs at `parked=0`
+throughout this log, so there is somewhere for the flush to go.
+
+**Unverified, and only the owner's next boot can verify it** — QEMU's `/log` is
+a fast virtual disk and the whole audio family reports `underruns=0` on this
+host either way. What to read on that boot:
+
+- `starve_max=` is new on soundd's stats line: the longest unbroken run of
+  underrun periods. Near 1 with a large `underruns` kills the hypothesis
+  outright — that is a client missing by a hair, not one that stopped. 8–20 is a
+  stall of 21–53 ms, which is the flush.
+- `max_wake_lat_us`'s cluster should move from ~2690 to ~2902 µs, because it is
+  one device period and the period is now the right one.
+- Everything should sound a tone and a half lower than it did.
+
 ### CLOSED 2026-08-08 — `/bin/tone` accumulated its phase in `f32`, so the tone the owner judges the machine by was flat and dirty
 
 `userland/toybox/src/tone.rs` advanced `phase: f32` by one increment per frame

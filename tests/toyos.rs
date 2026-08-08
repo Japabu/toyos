@@ -1387,12 +1387,13 @@ fn measure_audio_run(
     let host = hostload::HostLoad::sample();
     eprintln!(
         "        {label}{name} smp={smp} gaps: {} (baseline {}) peak {} active {:.2}s dither {:.1}% \
-         phase-breaks {}",
+         pitch {:.1}Hz phase-breaks {}",
         audio::format_histogram(&gaps),
         audio::format_histogram(&baseline.gaps),
         analysis.peak,
         secs(analysis.active_samples),
         analysis.dither_ratio.unwrap_or(0.0) * 100.0,
+        audio::dominant_hz(&wav).unwrap_or(0.0),
         audio::phase_breaks(&wav).len(),
     );
     eprintln!(
@@ -1445,6 +1446,12 @@ fn measure_audio_run(
             "tone too quiet: peak {} (expected >= {TONE_MIN_PEAK})",
             analysis.peak
         ));
+    }
+    // Present, loud and continuous is not the same as right: a device consuming
+    // the buffers at a rate soundd did not ask for satisfies all three and plays
+    // the whole session off pitch.
+    if let Some(complaint) = audio::wrong_pitch(&wav) {
+        problems.push(complaint);
     }
     // Without this the gate can go green while measuring nothing: the underrun
     // detector's silence band is derived from soundd applying TPDF dither into
