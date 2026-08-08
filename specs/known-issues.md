@@ -1353,23 +1353,29 @@ extends to `capture` if this is ever seen.
 
 ## 3. Kernel correctness and hazards
 
-### OPEN, UNASSIGNED — every AP runs with caching disabled, `CR0.NE` clear, `CR0.WP` clear and `CR4.MCE` clear
+### CLOSED — every CPU but cpu0 ran with caching disabled, `WP` clear, `NE` clear and `MCE` clear
 
-Found by `arch/fpu.rs::log_state`, the permanent per-CPU control-register line
-`wt/toyos-fpu` added for `specs/user-machine-state.md` §7. Dev host, TCG,
-`smp=2`, one boot, reproduced identically across four guests in the same run:
+**Closed 2026-08-08 by `wt/toyos-apregs`: `kernel/src/arch/control_regs.rs` is
+one declaration of `CR0` and `CR4`, applied by the BSP and by every AP and
+asserted on each of them.** The trampoline reaches long mode by OR-ing `PE` and
+then `PG` into whatever `INIT` left in `CR0`, and nothing afterwards touched the
+register — so `0x60000010 | 1 | 0x80000000` is exactly the `0xe0000011` every AP
+held, for the whole history of the tree. `CR4` had the mirror problem from the
+other side: the BSP inherited firmware's and an AP built its own out of five
+read-modify-writes, so they differed in `DE` and `MCE`.
+
+The same tree, `smp=4`, TCG, before and after:
 
 ```
-[kernel 0.000 cpu0] fpu: cpu0 cr0=0x80010033 cr4=0x310668 xsave=0 osxsave=0 ...
-[kernel 0.221 cpu1] fpu: cpu1 cr0=0xe0000011 cr4=0x310620 xsave=0 osxsave=0 ...
+cpu0: cr0=0x80010033 cr4=0x00310668     cpu0: cr0=0x80010033 cr4=0x00310668
+cpu1: cr0=0xe0000011 cr4=0x00310620     cpu1: cr0=0x80010033 cr4=0x00310668
+cpu2: cr0=0xe0000011 cr4=0x00310620     cpu2: cr0=0x80010033 cr4=0x00310668
+cpu3: cr0=0xe0000011 cr4=0x00310620     cpu3: cr0=0x80010033 cr4=0x00310668
 ```
 
-The AP trampoline (`arch/smp.rs`) sets `CR0.PE`, `CR4.PAE`, `EFER.LME` and
-`CR0.PG` and touches nothing else, so an AP reaches long mode holding the INIT
-value of `CR0` with two bits or'd in. `0x60000010 | 1 | 0x80000000` is exactly
-the `0xe0000011` measured. `init_ap` then adds `CR4.OSFXSR`, `OSXMMEXCPT`,
-`SMEP`, `SMAP`, `FSGSBASE` and `PCIDE` and nothing to `CR0`. The BSP's values
-are firmware's, inherited, and were never compared against the APs'.
+`wt/toyos-fpu` found it and opened this entry (`arch/fpu.rs::log_state`,
+`specs/user-machine-state.md` §7); what follows through the table is its
+account, kept because the consequences are the reason the fix matters.
 
 | bit | BSP | AP | consequence |
 |---|---|---|---|
@@ -1380,44 +1386,63 @@ are firmware's, inherited, and were never compared against the APs'.
 | `CR4.MCE` (6) | 1 | **0** | a machine check is a shutdown, not `#MC` |
 | `CR4.DE` (3) | 1 | **0** | debug-register access semantics differ |
 
-Four separate defects, one cause. Ranked by what they cost:
+**`WP` clear was an isolation weakening**, not a hole userland could reach on
+its own — a kernel bug writing through a read-only kernel mapping succeeded on 7
+of 8 CPUs and faulted on cpu0, which is the worst kind of bug to own. **`MCE`
+clear** turned a machine check into a shutdown with no report, on every CPU but
+the BSP, on the one machine with no serial port.
 
-**`CD`/`NW` set is the expensive one.** An AP with caching disabled is running
-uncached. That is a performance defect large enough to distort every A/B this
-tree has ever taken on more than one CPU, and it is invisible to every test
-because nothing measures a per-CPU rate. Not measured here — measuring it needs
-the fix, and this entry is a report.
+`CR4.OSXSAVE` is clear on both CPUs on this host, so `user-machine-state.md`
+§7's first hypothesis — firmware leaving `OSXSAVE` set, cpu0 permitting AVX and
+the APs `#UD`ing on it, a migrating thread faulting — still **cannot be answered
+here**. It is now unreachable rather than unanswered: `OSXSAVE` is in the
+declaration as a bit that must be *clear*, so firmware's choice no longer
+survives into an AP or into the BSP.
 
-**`NE` clear explains §1's unexplained survivor.** `fault_gates`' `mf` arm
-killed its child 6 of 6 alone and survived once in a 12-wide suite, printing
-status word `0xb881` — IE and ES set, on the `fnstsw` two instructions past the
-`fwait` that should have trapped on exactly that `ES`. "The state was not lost;
-the trap was." With `NE` clear the exception is signalled on the external FERR#
-pin, which nothing in a modern machine is listening to, and a child scheduled
-onto an AP rather than the BSP would see precisely that. This is a hypothesis
-with a mechanism and a measurement behind it, not a proof: confirming it means
-running that arm pinned to an AP.
+Gates: `control_regs` boots four CPUs and reads every one's registers against
+the bits by name; `control_regs_verdict` runs that verdict against the values
+above with no guest. Negative control: the `no-ap-control-regs` kernel feature,
+under which an AP keeps `INIT`'s registers and the shipped assertion kills the
+boot.
 
-**`WP` clear is an isolation weakening**, not a hole userland can reach on its
-own — it means a kernel bug that writes through a read-only kernel mapping
-succeeds on 7 of 8 CPUs and faults on cpu0. A bug that reproduces on one core in
-eight is the worst kind to own.
+**What is *not* closed is the cost, and this host cannot close it.** See §8's
+entry: TCG models no cache, so `CR0.CD` prices at nothing here and what an AP
+was worth is a number only the T14 can give.
 
-**`CR4.MCE` clear** turns a machine check into a shutdown with no report, on
-every CPU but the BSP, on the one machine (the T14) with no serial port.
+**`NE` clear is very likely §1's unexplained `0xb881` survivor, and this does
+not prove it.** With `NE` clear an unmasked x87 exception is signalled on FERR#
+rather than as `#MF`, and a `fault_gate_child` scheduled onto an AP would see
+exactly the status word that arm printed. The mechanism is now gone on every
+CPU; whether it was *the* cause needs that arm re-run pinned to an AP, and there
+is no CPU affinity to pin it with.
 
-The fix is one place — the APs' `CR0` and `CR4` should be built to a declared
-value rather than inherited from INIT, and the BSP's should be checked against
-the same declaration rather than trusted. Deliberately **not** done in
-`wt/toyos-fpu`: that branch owns the ring-transition invariant, and changing
-what `CR0.NE` means on 7 of 8 CPUs in the same commit would make its own
-`fpu_isolation` gate unattributable.
+### CLOSED — a panic on an AP before `apic::init_ap` produced no output at all
 
-`CR4.OSXSAVE` is clear on both CPUs here, so hypothesis 1 of
-`user-machine-state.md` §7 — firmware leaving `OSXSAVE` set, cpu0 permitting AVX
-and the APs `#UD`ing on it, a migrating thread faulting — **cannot be answered
-on this host**. Its mechanism is confirmed (the two `CR4`s genuinely differ);
-its instance needs the T14.
+**Closed 2026-08-08 by `wt/toyos-apregs`.** `panic_depth_slot` read
+`IA32_X2APIC_APICID` under a comment claiming "APs enable x2APIC before running
+any panicking kernel code". They do not: `apic::init_ap` is three calls after
+`percpu::init_ap` in `ap_entry`, and that MSR is `#GP` until it has run. So a
+panic anywhere in that window — `pat::init`'s assertion, the FSGSBASE one that
+has been there since SMP was written — faulted *inside the reentry guard*,
+before the guard was armed, and the machine triple-faulted with the whole boot
+still unflushed in the log ring. No report, no backtrace, no serial: it looked
+exactly like a kernel that never started.
+
+A/B on one tree, `no-ap-control-regs` staging a real AP panic. With the MSR
+read, the last thing on the wire is a probe line placed at the top of the
+handler. With CPUID in its place, the full report arrives:
+
+```
+[kernel 0.197 cpu1] !!! PANIC !!!: panicked at src/arch/control_regs.rs:228:5:
+control_regs: cpu1 holds cr0=0xe0000011, the declaration is 0x80010033
+[kernel 0.197 cpu1]   Backtrace:
+[kernel 0.198 cpu1]     kernel::arch::control_regs::init+0x506
+[kernel 0.198 cpu1]     kernel::arch::smp::ap_entry+0xd1
+```
+
+CLAUDE.md's *a doc comment is a claim to verify*, caught by a gate whose
+negative control could not report. No test asserts on this directly — staging it
+needs a kernel that panics on an AP, which is what the feature above is for.
 
 ### CLOSED — under KVM the kernel takes a #GP returning to userland, on AMD only
 
@@ -6872,6 +6897,39 @@ Full verdicts and target shapes: `specs/code-quality-review-2026-08.md` §2.
 ---
 
 ## 8. Hardware and performance gaps
+
+### OPEN, OWNER — what an AP's caching was worth is a number only the T14 can give, and the instrument is built
+
+Cores 1..N ran uncached for the whole history of this tree (§3), so every
+multi-CPU measurement it has taken was against a machine where seven of eight
+cores were slower than they are now — by an amount nobody has measured, in an
+apportionment nobody knows, because a thread's core is the scheduler's choice.
+That does not make any recorded number wrong; it makes each of them a
+measurement of a machine that no longer exists.
+
+**This host cannot supply the missing number.** `control-regs-bench` times the
+same 4096-line read loop on every CPU either side of the `mov cr0` that turns
+its caching on. On TCG, `smp=4`:
+
+| | pre | cold | warm |
+|---|---|---|---|
+| cpu0, caching on throughout (the control) | 26000 | 22000 | 19000 |
+| cpu1, `pre` uncached, `cold`/`warm` cached | 30000 | 27000 | 20000 |
+| cpu1 with `no-ap-control-regs`, all three uncached | 30000 | 22000 | 20000 |
+
+The third row is the answer: leaving cpu1's caches **off** for all three passes
+costs it nothing against the row where two of them ran with caches on. QEMU
+models no cache at all, so `CR0.CD` is architectural state there with no timing
+consequence. Every number is a multiple of 1000 — TCG's TSC granularity — and
+cpu2 and cpu3 on the same boot answered `11000/10000/5000` with byte-identical
+registers, a fourfold spread that is the host's scheduling and not the guest's.
+
+**How the owner takes it:**
+`cargo run -- --diag-boot --kernel-feature control-regs-bench --build-only`,
+flash, read the per-CPU rows off the panel. cpu0's row is the control and every
+AP's `pre` against its own `warm` is the answer. Nothing in userland can ask —
+there is no CPU affinity, so no userland loop can choose its core, and the state
+under test lives only between an AP's `INIT` and its first `mov cr0`.
 
 ### OPEN, UNASSIGNED — anonymous `mmap` is not demand-paged, and `.bss` is written into the file
 

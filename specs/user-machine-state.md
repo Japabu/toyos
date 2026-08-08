@@ -293,7 +293,15 @@ happened to be scheduled on an AP rather than the BSP would see precisely that.
 **These are separate defects and are not fixed here.** They are recorded in
 `specs/known-issues.md` with this evidence. Note in particular that they
 confound measurement: an AP with `CR0.CD` set runs with caching off, so any
-microbenchmark that lands on one is not measuring what it thinks it is.
+microbenchmark that lands on one is not measuring what it thinks it is —
+including §12's, whose two arms were taken on a machine where three of four
+cores were uncached.
+
+**Closed 2026-08-08 by `wt/toyos-apregs`**, which is why the two lines above no
+longer have `cr0=` and `cr4=` in them: `arch/control_regs.rs` declares both
+registers, applies the declaration on every CPU and asserts it there, and prints
+its own line beside this one. The values quoted above are what `log_state` read
+before that existed.
 
 ---
 
