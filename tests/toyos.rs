@@ -4500,6 +4500,23 @@ fn guest_liveness() -> qemu::Liveness {
     qemu::Liveness::new(GUEST_QUIET, GUEST_WEDGED)
 }
 
+/// A round trip through a guest that is **demonstrably up**, corrected for how
+/// fast this host is and not for how many guests it is running.
+///
+/// [`qemu::budget`] is the ceiling on a guest that might be wedged, and it
+/// multiplies by the width because a guest with a twelfth of the machine takes
+/// longer over everything. This is the other case, and the width is wrong for
+/// it: what these callers wait on is the shell echoing a line it has not run
+/// yet, which is microseconds of guest time however little of the machine the
+/// guest has. Ten of those establishing nothing is a keystroke path that is not
+/// working, and a width-scaled ceiling turns that into four minutes of a lane —
+/// measured, on the run this was written from: 285 s of a terminal parked on a
+/// pipe it had been parked on since 1.4 s.
+fn round_trip(one_guest: Duration) -> Duration {
+    let (_, _, num, den) = qemu::host_speed();
+    one_guest * num / den
+}
+
 /// Collect console output until `done` reads true of the whole capture, or the
 /// guest stops making progress.
 ///
@@ -4644,27 +4661,41 @@ fn shell_echoes(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Resul
     // is asked of a terminal under the compositor and of `/bin/console` on the
     // raw framebuffer, and the question is the same one.
     const SURFACE_UP: [&str; 2] = ["terminal: ready", "console: ready"];
-    await_guest(qemu, log, "a surface to say it is up", |log| {
-        SURFACE_UP.iter().any(|m| log.contains(m))
-    })?;
+    // **And the state in which it is never coming.** `/bin/terminal` exits when
+    // it loses the race with the compositor (known-issues §3), which is a fact
+    // the log states outright at 0.6 s — so waiting for a ready marker that
+    // cannot arrive is not a slow guest but a defect, and the only thing a
+    // ceiling decides there is how many minutes of a lane it costs to say so.
+    // Measured on the run this came from: 305 s, against a terminal that had
+    // exited before the compositor was ready.
+    const SURFACE_GONE: [&str; 2] = ["exit: terminal ", "exit: console "];
+    let up = |log: &str| SURFACE_UP.iter().any(|m| log.contains(m));
+    let gone = |log: &str| SURFACE_GONE.iter().any(|m| log.contains(m));
+    await_guest(qemu, log, "a surface to say it is up", |log| up(log) || gone(log))?;
+    if !up(log) {
+        return Err(
+            "the surface owner exited before it ever said it was ready — /bin/terminal races \
+             the compositor at boot, specs/known-issues.md §3"
+                .to_string(),
+        );
+    }
 
     // Retyping rather than waiting longer: a keystroke injected between two of
     // the terminal's polls is dropped, and a dropped one leaves nothing to wait
     // for.
     //
     // **A count of attempts, not a span of host seconds.** This used to be a
-    // flat twenty, which was a round trip's worth of retypes on a quiet host and
-    // two on a loaded one — the same number of tries reads as a wedged shell at
-    // width 12. Each attempt gets a phase-corrected window instead, so what is
-    // fixed is how many keystrokes this is willing to lose, which is the thing
-    // the loop is actually about.
+    // flat twenty, which is a fixed number of round trips on the host it was
+    // written on and a different number on any other. Ten is the number, and
+    // each gets a round trip scaled to this host — see [`round_trip`] for why
+    // that and not the phase width.
     const TRIES: usize = 10;
     for _ in 0..TRIES {
         {
             let mut input = qemu::QmpInput::open(qemu.qmp_socket());
             type_line(&mut input, &format!("echo {nonce}"));
         }
-        if serial_until(qemu, log, nonce, qemu::budget(Duration::from_secs(2))) {
+        if serial_until(qemu, log, nonce, round_trip(Duration::from_secs(2))) {
             return Ok(());
         }
     }
@@ -5305,7 +5336,7 @@ fn open_terminal(qemu: &mut QemuInstance, log: &mut String, nonce: &str) -> Resu
             let mut input = qemu::QmpInput::open(qemu.qmp_socket());
             type_line(&mut input, &format!("echo {nonce}"));
         }
-        if serial_until(qemu, log, nonce, qemu::budget(Duration::from_secs(2))) {
+        if serial_until(qemu, log, nonce, round_trip(Duration::from_secs(2))) {
             return Ok(());
         }
     }
