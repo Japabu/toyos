@@ -160,7 +160,18 @@ livelock, and it is the argument for B2 rather than for `pass()` in the wait.
 
 ### B3 — the VFS lock and the log sink's lock stop disabling preemption
 
-`vfs::VFS`, `log_file::SINK` and `fat32_adapter::VOLUMES` become `SleepLock`s.
+`vfs::VFS`, `log_file::SINK`, `fat32_adapter::VOLUMES` and
+`process::ProcessData` become `SleepLock`s.
+
+**`ProcessData` is on that list because §2's own example needs it.**
+`SYS_FSYNC` (`arch/syscall.rs:234`) and `SYS_CLOSE` (`:842`) reach `fd.rs:644`'s
+`flush_file` from inside `process::with_fd_owner_data`, which holds an
+`Arc<Lock<ProcessData>>` — so a userland `fsync` of a disk-backed file waits
+under `{ProcessData, VFS, VOLUMES, XHCI}`, the same depth as the log sink's with
+one lock different. Convert only the other three and the first userland `fsync`
+after B4 trips `assert_baseline` at depth 2: a userland-triggered kernel panic,
+and §4 forbids weakening the assertion to make it go away.
+
 This is the stage that closes the finding and the stage that can slip: `VFS` is
 the most-taken lock in the kernel and every caller becomes a caller that may
 park. The choke point is real and small — `vfs::lock()`/`vfs::try_lock()` are
@@ -179,9 +190,12 @@ Two hazards to answer in the design, not in review:
   What must not exist is a `SleepLock` taken under `preempt::disable()` by a
   caller that believed it would park.
 
-Price: ~200 lines and the review. Instrument: `io-depth-probe` must report 1 in
-a syscall and 0 in the idle context, because after this stage the only remaining
-lock at the wait is `XHCI` — which is B4's.
+Price: ~200 lines and the review. Instrument: `io-depth-probe` must report **2
+in a syscall and 1 in the idle context** — the probe fires inside `with_disk`'s
+`XHCI` guard, so `XHCI` itself is still one of the counts until B4 removes it,
+and the syscall keeps its `BASELINE_TRAP` of 1. Reading 1 and 0 here is
+unreachable, and a stage judged on an unreachable number is one that gets
+fudged.
 
 ### B4 — the transfer submits and returns
 
