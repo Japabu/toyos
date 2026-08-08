@@ -178,6 +178,29 @@ const RUST_SKIP: &[&str] = &[
     // 4 MiB and every other test boots that config. `doom_sound_flood` runs it
     // on `tests/doomcase`.
     "doom_sound_flood",
+    // The four below were **running twice under one name**, once here on the
+    // plain boot and once as the test that owns the name, and the collision was
+    // invisible: `check_registration` compared the three declared lists against
+    // each other and never against the binaries the registry discovers.
+    // `check_no_collisions` closes that, and this is what it found.
+    //
+    // Two verdicts under one name is not extra coverage, it is a name that
+    // cannot be read: `retry_task` searches the shared registry first, so a
+    // machine test of one of these that failed wide was re-run *as the shared
+    // binary* and its `ALONE:` line was about a different test. What the shared
+    // copy adds is the binary exiting 0 on a boot that gives it nothing to
+    // measure — `cache_eviction` in 132 ms against the 22.5 s its own device
+    // shape costs (run `31247206462`).
+    //
+    // `cache_eviction` needs the small NVMe that makes the cache evict at all.
+    "cache_eviction",
+    // Needs an HDA controller, which `tests/testcases` has none of.
+    "hda_client_stall",
+    // Gate A's two, whose verdict is the wav the device captured — which the
+    // shared boot takes no capture of. The comment below has claimed since it
+    // was written that they are excluded from this boot; now they are.
+    "audio_tone",
+    "audio_tone_load",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -8217,7 +8240,7 @@ fn run_machine_test(
 
             // A baseline first: churn against a compositor that was never
             // drawing would be a green run proving nothing.
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + qemu::budget(Duration::from_secs(20));
             while std::time::Instant::now() < deadline && frames(&console) < 1 {
                 console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
             }
@@ -8303,7 +8326,7 @@ fn run_machine_test(
             // reporting interval is 2 s, so two of them cannot be satisfied by
             // frames the compositor produced before the first cycle.
             let mut after = String::new();
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + qemu::budget(Duration::from_secs(20));
             while std::time::Instant::now() < deadline && frames(&after) < 2 {
                 after.push_str(&qemu.drain_serial(Duration::from_millis(250)));
             }
@@ -10240,6 +10263,32 @@ fn check_registration() {
     }
 }
 
+/// The half [`check_registration`] could not ask: the shared boot's tests are
+/// *discovered* from the binaries in `tests/toyos-rust-tests` and `tests/c`, so
+/// nothing declared can be compared against them until they exist.
+///
+/// A name in both places is two tests reporting one name, and the damage is not
+/// a duplicate line. [`retry_task`] searches the shared registry first, so a
+/// machine test of that name which failed wide is re-run *as the other test* and
+/// its `ALONE:` verdict is about neither. Four names were doing this and the
+/// suite had never been able to see them.
+fn check_no_collisions(shared: &[TestDef]) {
+    let declared: BTreeSet<&str> = MACHINE_TESTS
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(SCREEN_TESTS.iter().map(|(n, _)| *n))
+        .chain(AUDIO_TESTS.iter().copied())
+        .collect();
+    let clash: Vec<&str> =
+        shared.iter().map(|t| t.name.as_str()).filter(|n| declared.contains(n)).collect();
+    assert!(
+        clash.is_empty(),
+        "{clash:?} name both a binary on the shared boot and a test that declares its own \
+         machine — two verdicts under one name, and `retry_task` takes the shared one. Add \
+         each to RUST_SKIP with the reason its own test exists, or rename one of the two."
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -10440,6 +10489,7 @@ fn main() {
     }
 
     let all_tests = build_test_registry(&rust_bins, &c_compiled);
+    check_no_collisions(&all_tests);
     // Every name this process could produce a verdict for, which is what an
     // EXPECTED_FAILURES entry has to be one of. Taken before the filter, so a
     // filtered run cannot make a stale entry look well-formed.
@@ -10612,9 +10662,22 @@ fn main() {
             };
             let outcomes = run_phase(vec![task], 1, &bins, &slots);
             match outcomes.iter().find(|o| &o.name == name).map(Outcome::verdict) {
-                Some(Verdict::Pass(_) | Verdict::Stale(_)) => eprintln!(
+                // **Two different findings, and which one it is depends on the
+                // width.** At width > 1 a green retry says the first run shared
+                // the machine and this one did not, which is a classification
+                // defect. At width 1 nothing else was ever up, so the two runs
+                // differed in nothing the harness controls: it failed once and
+                // passed once, which is a *rate* and says nothing about
+                // `Sched`. CI runs one lane per machine, and the old sentence
+                // there was a claim about contention that could not be true.
+                Some(Verdict::Pass(_) | Verdict::Stale(_)) if width > 1 => eprintln!(
                     "  ALONE {name}: GREEN — it fails only beside other guests, so its \
                      Sched::Parallel is wrong. The run stays red on the classification."
+                ),
+                Some(Verdict::Pass(_) | Verdict::Stale(_)) => eprintln!(
+                    "  ALONE {name}: GREEN, and this run had one lane — nothing else was up \
+                     either time, so it failed once and passed once. That is a rate and not a \
+                     classification."
                 ),
                 Some(Verdict::Fail(_) | Verdict::Expected(_)) => {
                     eprintln!("  ALONE {name}: red again — the defect is real.")

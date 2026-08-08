@@ -5719,7 +5719,89 @@ wall-clock margins on the **host** side, and re-running alone clears them. This
 margin is inside the **guest's** boot, and running alone only moves it back
 under the line by a few milliseconds.
 
-### OPEN — six input tests fail on a GitHub runner and pass here, and nobody has separated the accelerator from the QEMU version
+### CLOSED — the input class was three causes wearing one coat, and the 2x2 separated them
+
+The entry below asked for one probe and two jobs. It took four, because the
+answer turned out to have three parts and each arm found a different one. All on
+`ubuntu-24.04`, one commit, one toolchain, `--jobs 1`, eight tests each; runs
+`31245897225` (QEMU 8.2.2, from apt) and `31246245541` (QEMU 11.0.3, in a
+`debian:sid` container, everything else identical — the firmware is `ovmf/` in
+this repository on every host, so it does not move):
+
+| QEMU | accel | red |
+|---|---|---|
+| 8.2.2 | KVM | `metal_sim_pointer_churn`, `xhci_flap`, `desktop_typing_damage` |
+| 11.0.3 | KVM | `metal_sim_pointer_churn`, `xhci_flap` |
+| 11.0.3 | TCG | **none** |
+
+**Most of the class was neither.** `i8042_keyboard`, `i8042_mouse`,
+`i8042_fadt_denial` and `xhci_hotplug` are green in *every* arm above, and all
+four were red in run `31241099454` on the same runner image and the same
+accelerator — at `--jobs 2`. Two lanes on four cores is what they were, and
+`--jobs 1` with twelve shards is what CI runs now. That is the same
+`ALONE: GREEN` class `specs/known-issues.md` §7 records, reaching further than
+anyone had counted: on a four-core machine it takes the i8042 family with it.
+
+**`desktop_typing_damage` is the QEMU version**, and it is the only one. Red on
+8.2.2 under KVM, green on 11.0.3 under the same accelerator on the same runner
+image. Injection is a QMP path through an emulated device and three major
+versions of that had never had a second data point. CI now runs 11.0.3, the dev
+host's own version, which removes the variable rather than working around it.
+
+**Two are the accelerator, and by the owner's rule that makes them the guest's.**
+`metal_sim_pointer_churn` and `xhci_flap` are red on KVM at *both* QEMU versions
+and green on TCG. They are the two entries below.
+
+### CLOSED — `metal_sim_pointer_churn` counted a console that had not caught up
+
+The KVM arm of the probe above: `8 plug/unplug cycles bound 6 pointer sources —
+the churn did not reach the kernel`. The kernel had in fact bound all eight; the
+last two were still on their way out of the log ring when the count was taken.
+
+The cadence in the guest's own log says so — port events at 5.374, 6.591, 7.808
+and 9.025 s, 1.217 s apart against the test's 1.2 s cycle, so the guest was
+exactly in step with the host and never behind it. What was behind was the
+console: each cycle ends with a fixed `drain_serial(400 ms)`, which paces the
+*host* through one cycle and says nothing about whether the guest's ring has
+flushed. On a machine that goes idle the moment the last `device_del` lands, it
+had not.
+
+Fixed by waiting for the evidence instead of sleeping for it: the count is now
+taken after draining until `CYCLES` bindings have appeared or a 20 s liveness
+ceiling expires. Every assertion is the one that was there before — eight
+bindings, motion that reached the compositor, a desktop still compositing after
+— and what changed is that a console behind its guest costs wall clock rather
+than a verdict. It was also a way for the gate to pass by accident on a host slow
+enough for 400 ms to be generous, which is the direction that matters.
+
+### OPEN, UNASSIGNED — `xhci_flap`'s fourth collapsed replug wedges the driver under KVM
+
+Run `31246245541`, `debian:sid`/QEMU 11.0.3/KVM, `--jobs 1`, alone:
+`timed out after 164s`. Green under TCG on the same runner image and the same
+QEMU, and green on the dev host.
+
+Three of the four cycles are in the log and all three are the state under test —
+`port 5 was unplugged and plugged back in between two looks; tearing the old
+device down before enumerating what is there now`, followed each time by a clean
+re-enumeration and `pointer on slot 1 merges as source 2`, at 1.879, 3.084 and
+3.787 s. Then nothing: the fourth `device_del`/`device_add` pair goes in at about
+4.4 s and the guest never speaks again, never delivers the pointer motion the
+test ends on, and `test_rs_input_events` therefore never exits.
+
+So the driver survives three collapsed replugs and stops on the fourth, on the
+accelerator that runs the guest ~50x faster between the host's two QMP writes.
+The owner's rule names what this is — "everything should work under emulation and
+kvm if it doesnt something with the guest is wrong" — and it is the class §8's
+xHCI entries already track: one outstanding operation per controller, a
+completion matched by its Command TRB address, a recovery cancelled by a
+disconnect. Not diagnosed further here; found by CI, which is the thing CI was
+built to do.
+
+**It is the one test standing between CI and green**, and it is a real red rather
+than a classification: it is not on §7's list, it fails alone, and it fails for
+the same reason twice.
+
+### CLOSED, superseded by the four arms above — six input tests fail on a GitHub runner and pass here
 
 Found 2026-08-08 taking the guest suite to CI. Run `31238056513`, six
 `ubuntu-24.04` shards on KVM at `--jobs 2`, 246 of 268 passing on the five that

@@ -144,12 +144,21 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # Logs and screendumps, never the directory they sit in. A lane's scratch
+      # holds a per-boot image of a few hundred megabytes, and uploading all of
+      # them took **44 minutes** and hit the job timeout on shard 9 of run
+      # `31247206462` — a suite that had finished in 556 s reported as a job
+      # cancelled at the hour. The serial of every failing test is already in
+      # this job's own log; what is not is what the panel showed.
       - name: what a red run left
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}-scratch
-          path: /tmp/toyos-tests-*/
+          path: |
+            /tmp/toyos-tests-*/**/*.log
+            /tmp/toyos-tests-*/**/*.ppm
+            /tmp/toyos-tests-*/**/*.png
           if-no-files-found: ignore
           retention-days: 7
 
