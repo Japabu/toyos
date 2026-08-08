@@ -3854,9 +3854,9 @@ argument does not depend on it and is the one to keep.
 
 ### OPEN, UNASSIGNED — `screen_pager_keys` is red on `main`, and no keystroke reaches the halted pager
 
-Found 2026-08-08 by the licence work's landing gate, and it belongs to nobody
-yet. **Not a flake and not a load artifact**: three runs in one session, the
-same hard zero every time, with the identical message.
+Found 2026-08-08 by the licence work's gate, and it belongs to nobody yet.
+Three runs in one session, the same hard zero every time, with the identical
+message.
 
 ```
 FAIL screen_pager_keys: 0 page moves over 30 keystrokes in 0.4s — an
@@ -3903,6 +3903,21 @@ the page a keystroke has just moved is indistinguishable, to this test, from a
 keystroke that never arrived — the footer is its only instrument.
 
 Not bisected. That is the next step and it is two boots.
+
+**A second explanation the A/B cannot separate, and whoever takes this must
+rule it out first.** The sampling loop sends one key and screendumps
+immediately, with no wait in between: `footer()` returns on its first dump when
+a footer is present, and only sleeps 50 ms when there is none. Thirty samples
+took **0.3 s**, so each round trip was about 10 ms — and a guest that needs
+longer than that to repaint after a key reads as "did not move" on every
+sample, giving exactly 0 of 30. The three reds were taken with load 11–16 on a
+14-core host and boots at 1.7–1.8x the reference, so a slow guest is live.
+
+That is *not* a reason to re-run it away: it would make the test's verdict a
+wall-clock margin with no margin at all, which is a defect of the instrument and
+belongs in §7 with the rest of that class. Distinguishing the two is one
+experiment — put a bounded wait for *change* in the sample loop and see whether
+the moves appear. If they do, the test is the bug; if they do not, `f7c87ee` is.
 
 It is **not** in `EXPECTED_FAILURES` and must not be put there to get a landing
 through: an entry needs a task, a write-up and the failure text it covers, and
