@@ -4,7 +4,7 @@
 //! Every one of these cases used to park the compositor's whole event loop in
 //! a kernel wait with no deadline — no redraws, no input, nothing — because
 //! the compositor read and wrote its clients with blocking calls. The one
-//! written up in `specs/known-issues.md` §1 is the second case here: a client
+//! written up in `specs/issues/isolation/` is the second case here: a client
 //! that connects and sends four bytes, met by `ipc::recv_header` on a freshly
 //! accepted fd.
 //!

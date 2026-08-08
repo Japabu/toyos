@@ -56,7 +56,7 @@ the only difference is `fault_gate_child`'s x87 control word.
 | `masked` (`cw = 0x037F`) | PASS ×3 | PASS ×3 | PASS ×3 |
 
 `fault_gates` passing in both arms is what proves the probe is not vacuous.
-Written up in full at `specs/known-issues.md` §1 and `specs/ci-plan.md` §9.3.
+Written up in full at `specs/issues/isolation/` and `specs/ci-plan.md` §9.3.
 
 **The victim instruction is `FLDCW`**, a *waiting* x87 instruction: it checks for
 a pending unmasked exception before it executes. It sits in the unwinder's
@@ -194,7 +194,7 @@ QEMU 11.0.3's `qemu64` model, which is what gets selected whenever KVM is
 unusable, reports `fxsr: true, xsave: false, avx: false`. CI's KVM guest and the
 T14 both have it. Choosing XSAVE would mean `cargo test` exercises a *different
 kernel* from CI and metal on the one path this task exists to fix — the exact
-blind spot that hid the AMD `SYSRET` bug (known-issues §3).
+blind spot that hid the AMD `SYSRET` bug (`specs/issues/kernel/`).
 
 Two details that are not incidental:
 
@@ -281,7 +281,7 @@ cannot be answered on this host. But its *mechanism* is confirmed: the BSP's
 they already differ in two bits. On the T14 that question is open and only the
 T14 can close it.
 
-**`CR0.NE = 0` on every AP is a complete explanation for known-issues §1's
+**`CR0.NE = 0` on every AP is a complete explanation for `specs/issues/isolation/`'s
 unexplained survivor.** `fault_gates`' `mf` arm killed its child 6 of 6 alone
 and survived once under a 12-wide suite, printing status word `0xb881` — IE set,
 ES set, on the `fnstsw` two instructions past the `fwait` that should have
@@ -291,7 +291,7 @@ instead of `#MF`, and nothing in a modern machine is listening. A child that
 happened to be scheduled on an AP rather than the BSP would see precisely that.
 
 **These are separate defects and are not fixed here.** They are recorded in
-`specs/known-issues.md` with this evidence. Note in particular that they
+`specs/issues/` with this evidence. Note in particular that they
 confound measurement: an AP with `CR0.CD` set runs with caching off, so any
 microbenchmark that lands on one is not measuring what it thinks it is —
 including §12's, whose two arms were taken on a machine where three of four
@@ -411,7 +411,7 @@ Instruction count falls; µop count and latency very plausibly rise, because
 - **TCG is not evidence and will mislead.** QEMU implements `FXSAVE` as a helper
   call. The precedent points the same way: one `fetch_add` per log line cost
   **350 ms of boot** under TCG while being nearly free on hardware
-  (known-issues §8). The TCG delta is recorded anyway and **labelled**, so
+  (`specs/issues/hardware/`). The TCG delta is recorded anyway and **labelled**, so
   nobody bisects a boot-time regression that is not one on real silicon.
 - **A microbenchmark**: a userland loop of N `SYS_CLOCK` calls timed with
   `rdtsc`, reporting cycles per syscall (`tests/toyos-rust-tests/src/bin/`
@@ -428,7 +428,7 @@ store, and `toyos-ld` writes `.bss` into the file, so the loader's `Anonymous`
 tail is always empty. What is left is a writable file-backed page, at 2 MiB of
 test image per fault — too expensive for a benchmark, which is why
 `fpu_isolation` buys two and `syscall_cost` buys none. Both are recorded in
-known-issues §8. The exception entry pays the same two instructions the syscall
+`specs/issues/hardware/`. The exception entry pays the same two instructions the syscall
 arm measures.
 
 ---

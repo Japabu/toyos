@@ -232,7 +232,7 @@ stats line gate A reads).
 Worth remembering as a class: a "guest hang" that only ever appears on the audio
 tests is more likely to be the shared console than the scheduler. The underlying
 writer-side defect — the virtio-console has no line atomicity — is still open;
-see `specs/known-issues.md`.
+see `specs/issues/`.
 
 ## 2026-08-01: the gate's first real catch, and it was the filesystem
 
@@ -294,7 +294,7 @@ Eight resident blocks in `EspDevice` took the boot from **4,352 device reads to
 
 ### Two things the module's own documentation asserted that were not true
 
-Both are in `specs/known-issues.md` and both are the reusable part:
+Both are in `specs/issues/` and both are the reusable part:
 
 * *"It costs nothing when nothing is logged."* Userland console output is in the
   same ring, so every `println!` is a device write from the idle loop. soundd's

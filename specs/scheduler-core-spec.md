@@ -238,7 +238,7 @@ pub struct TaskShared {
 queues — the *invariant* the node was for, without the allocation-free list. `waitq.rs:20-26`
 records this as a deliberate departure taken to keep `unsafe` confined to `mailbox.rs`, and
 says the intrusive list is still owed. It is the same debt as the parked-thread wait-queue node
-leak in `specs/known-issues.md`.
+leak in `specs/issues/`.
 
 Legal CAS edges mirror §5.2 exactly and are written in one `match` in `task.rs`; any other
 observed edge panics. `feature = "check"` verifies word-vs-container agreement at every

@@ -12,7 +12,7 @@
 //! different things today and the difference is the point: `SYS_READDIR` now
 //! separates them, and `std`'s `is_dir` still reads a zero-length listing as
 //! "not a directory" — the half of the fix that lives in the `rust/` submodule
-//! and is recorded as owed in known-issues §3.
+//! and is recorded as owed in `specs/issues/kernel/`.
 
 use std::fs;
 

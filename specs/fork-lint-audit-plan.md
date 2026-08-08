@@ -14,7 +14,7 @@ Four instances, all confirmed:
    until someone tried to build.
 3. **Holding frozen copies of first-party crates.** A fork depending on
    `toyos-abi` by *git* rather than by version resolves — silently, against a
-   snapshot — and `[patch]` does not redirect it (`specs/known-issues.md`).
+   snapshot — and `[patch]` does not redirect it (`specs/issues/`).
 4. **Un-fixable except in a quiet-tree window**, because editing a fork means
    `.cargo/config.toml` path overrides, which change the build for every agent at
    once. So fork fixes queue behind a scheduling constraint no other work has.

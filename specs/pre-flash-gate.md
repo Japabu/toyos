@@ -163,7 +163,7 @@ console means every other failure is silent and the boot is uninterpretable.
 |---|---|
 | **Run** | `cargo test -- screen` — the suite at `tests/toyos.rs:52-58`: `screen_decoder`, `screen_recoverable_untouched`, `screen_early_panic`, `screen_late_panic`, `screen_paged_scrollback`, `screen_panic_muted`, `screen_fatal_halt`. |
 | **Expect** | All pass. These decode the framebuffer glyph-by-glyph against `font8x16.bin`; they are the only pixel-reading tests in the tree. |
-| **False pass** | **`screen_late_panic` passes with `panic_console::capture`'s body replaced by `return`** — a known dead gate (`specs/known-issues.md`). So a green `screen` suite does **not** establish that capture works. Treat these as covering *rendering*, not capture. |
+| **False pass** | **`screen_late_panic` passes with `panic_console::capture`'s body replaced by `return`** — a known dead gate (`specs/issues/`). So a green `screen` suite does **not** establish that capture works. Treat these as covering *rendering*, not capture. |
 
 ### 4.2 Scrollback is retained and pages on a timer
 
@@ -397,7 +397,7 @@ property of the design, and it is why §1.1's "read every hunk" instruction has
 to be obeyed on every future flash rather than trusted once.
 
 **`capture` being a no-op no longer implies a lost report.** The dead gate is
-still open (`known-issues` §522: `screen_late_panic` passes with `capture`'s
+still open (`specs/issues/panic-path/panic-console-capture-untested.md`: `screen_late_panic` passes with `capture`'s
 body replaced by `return`), but `daabd3c` established that capture's original
 reason is gone — retention (`3108e3a`) means `live_tail` after the flush
 returns the same text. So the consequence of the untested path has changed from

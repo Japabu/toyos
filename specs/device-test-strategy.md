@@ -89,7 +89,11 @@ fail a driver test for an unrelated reason. Input tests inject a *relative*
 delta and a button and assert the guest received that delta and that button —
 true no matter where anything is drawn.
 
-**The one exception: the panic console.** There the framebuffer *is* the device
+**The one exception: the panic console.** A screendump is a conversion
+taken while the guest is still drawing, and the panic console writes only
+`0x00` and `0xFF` — so any other colour in a band that lost its text names
+userland as the last painter, and a missing line is evidence about where on the
+glass it sat rather than about what the kernel wrote. There the framebuffer *is* the device
 under test, and on a machine with no serial port it is the only diagnostic
 channel, so asking the question without looking at pixels is not a weaker test
 but no test. Those assertions are text anyway: the harness decodes each 8x16

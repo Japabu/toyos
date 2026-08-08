@@ -468,7 +468,7 @@ impl Window {
     /// A caller that drains until `None` — which is the ordinary shape, and is
     /// what `winit`'s ToyOS backend does — never leaves that loop, so closing
     /// the window spun the client on a core instead of ending it (snake, on
-    /// the T14, `specs/known-issues.md` §3).
+    /// the T14, `specs/issues/kernel/`).
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
         if self.closed {
             return None;
