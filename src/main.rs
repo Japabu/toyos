@@ -139,6 +139,13 @@ fn main() {
         return;
     }
 
+    // On demand and nowhere else: it asks GitHub for every fork branch head, so
+    // neither `cargo test` nor `--land` may reach it.
+    if args.iter().any(|a| a == "--check-forks") {
+        toyos_build::forkcheck::dispatch(&root);
+        return;
+    }
+
     // Only where the submodules belong. In a linked worktree `rust/` is an empty
     // stub and initialising it clones the whole rust history again, into a git
     // directory of its own that shares no objects with the one beside it.

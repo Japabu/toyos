@@ -5623,7 +5623,7 @@ option and does not record that the answer was no.
 ### CLOSED except the wallpaper, 2026-08-08 — what the repository ships is not all MIT OR Apache-2.0
 
 **`NOTICE` at the repository root is now the list**, item by item, with
-`licenses/` carrying four third-party licence texts and
+`licenses/` carrying five third-party licence texts and
 `tests/testcases/LICENSE` the corpus's. The README's licence section points at
 it and states the one term that constrains a build: the shareware IWAD may be
 redistributed freely but not sold and not modified, so **an image carrying it

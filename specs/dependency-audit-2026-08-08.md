@@ -726,10 +726,18 @@ That applies here without modification: a check that asks crates.io how popular 
 crate is, or GitHub what a licence says, cannot be a gate. Everything proposed
 below is offline and reads only files already on disk.
 
-**This section proposes. It builds nothing.** Deliberately: every check below
-would go red on the tree as it stands, and a red gate landed into `--land` breaks
-every other agent's worktree. Seeding the ledgers is a decision about which of
-Part I's findings are accepted, and that decision is the owner's.
+**This section proposed four mechanisms. Decided 2026-08-08: one was built and
+three were refused, so read what follows as a record rather than as a menu.** The
+owner accepted the fork-pin check — `cargo run -- --check-forks`, §11.6 — and
+**rejected the three offline ledgers of §11.1–§11.3 as brittle**. They are left
+below unedited because the reasoning is worth reading and because a proposal that
+was put and answered should not be put again as if it were new. §11.5's ranking
+is historical for the same reason.
+
+The concern the ledgers were written against still stands: every one of them
+would have gone red on the tree as it was written, and a red gate landed into
+`--land` breaks every other agent's worktree. What was built goes red on the
+state of the world instead, and is not a gate at all.
 
 ### 11.1 A crate ledger — the one with real teeth
 
@@ -805,6 +813,43 @@ of today's violations belong to: something arrived and nobody was asked. §11.3 
 second and would have caught five of §7's seven findings on its own. §11.2 is
 third and is the weakest of the three, which is worth knowing before anyone
 spends a day on it.
+
+### 11.6 What was built — `cargo run -- --check-forks`
+
+`src/forkcheck.rs`. It takes the fork inventory from `forks.toml`, the
+**consumed** branch from the `[patch]` and git-dependency entries of every
+manifest — never from `forks.toml`, which records a `pr_branch` for
+`raw-window-handle` and `target-lexicon` that is deliberately not the branch
+cargo resolves — asks each remote for that branch's head with `git ls-remote`,
+and compares the answer against every lockfile that pins it.
+
+- **Every lockfile that holds a fork pin**, `rust/Cargo.lock` and
+  `rust/compiler/rustc_codegen_cranelift/Cargo.lock` among them. `rust/` is an
+  empty stub in a linked worktree, so it is walked through
+  `toolchain::rust_dir`. A check reading one lockfile could not have seen
+  `libloading` pinned at two revisions at once, which is what §11 was written
+  about.
+- **It reports and never re-pins.** Each drift comes with the
+  `cargo update --manifest-path … -p <crate>@<version>` that would fix it, and
+  that is where it stops: a helper that re-pins on its own lands a dependency
+  change nobody reviewed.
+- **On demand only, and it says so on every run.** It needs the network, so it
+  is in neither `cargo test` nor `--land` — the constraint this section's
+  preamble settled, restated in the command's own banner because that is the
+  line the next person adding a check reads. Exit 1 if any pin is behind or any
+  remote could not be reached.
+- A `forks.toml` entry no manifest consumes — the shape doomgeneric has, being
+  fetched by `userland/doom/build.rs` rather than by cargo — is a line under
+  `not compared:`, never a crash.
+
+Measured on `b36cf64`, 2026-08-08: **14 remotes, 16 branches, 7 lockfiles, 38
+pins, all current**, 8.3 s wall. Its teeth were shown against the real tree by
+checking the five non-submodule lockfiles out at `b15e54e^`, the state before the
+re-pin commit: it named all six drifts that commit fixed — `raw-window-handle` at
+`76c4971c` and `libloading` at `2ca5f54b` in two lockfiles among them — and
+exited 1. Five unit tests in the module keep it honest with a local git
+repository standing in for a remote, so they need no network and run inside
+`cargo test --lib`.
 
 ---
 
