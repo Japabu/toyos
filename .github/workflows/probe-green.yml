@@ -1,0 +1,105 @@
+name: green-probe
+
+# **The four names standing between `main` and a green `ci` run, counted.**
+#
+# `specs/ci-plan.md` §9.2 measured the whole suite five times and gave every red
+# a rate. Four names have appeared on `main` since and none of them is in that
+# table with a number anyone can act on: `kernel_heartbeat` and `dump_nmi_probe`
+# were 1 of 5 there, `desktop_audio_client` and `desktop_window_child` were 0 of
+# 5. A name red 5/5 is a defect and a name red 1/5 needs its rate known before
+# anyone can say a fix worked, so this counts them before anything is changed.
+#
+# One job per rep rather than one per (name, rep): the `cargo build` is the
+# fixed cost and four boots amortise it. `arm` is what makes a fix measurable in
+# one session — `control` checks out this branch's parent, `fixed` checks out the
+# branch, and both run on one runner image against one toolchain, which is the
+# shape `probe-xhci-break.yml` established.
+#
+# It never fails. A probe that reds is a probe whose own summary nobody reads.
+
+on:
+  push:
+    branches: ['ci/probe-green']
+  workflow_dispatch:
+
+jobs:
+  green:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    container:
+      image: debian:sid
+      options: --device=/dev/kvm
+    steps:
+      - name: deps
+        run: |
+          for attempt in 1 2 3; do
+            apt-get update -qq \
+              && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                   git curl ca-certificates jq zstd xz-utils build-essential \
+                   qemu-system-x86 > /dev/null \
+              && break
+            echo "apt attempt $attempt failed"
+            test "$attempt" != 3 && sleep 20
+          done
+          qemu-system-x86_64 --version | head -1
+          grep -m1 'model name' /proc/cpuinfo
+          nproc
+
+      - uses: actions/checkout@v4
+
+      - name: rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          echo "toolchain: $tag"
+          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
+          for _ in $(seq 120); do
+            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
+              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
+            [ -n "$asset" ] && break
+            echo "waiting for the toolchain workflow to publish $tag ..."
+            sleep 60
+          done
+          test -n "$asset"
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
+          mkdir -p rust/build
+          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
+          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+
+      # `|| true`: a red is the datum, not the job's verdict. Each name is its
+      # own `cargo test` so one stalling for its whole liveness guard does not
+      # take the other three's samples with it.
+      - name: the four names
+        run: |
+          set +e
+          for name in kernel_heartbeat dump_nmi_probe desktop_audio_client \
+                      desktop_window_child; do
+            cargo test --test toyos-build -- --jobs 1 --host-slots 0 "$name" \
+              2>&1 | tee "/tmp/$name.log"
+            echo "=== rep ${{ matrix.rep }} $name verdicts"
+            grep -E '^(FAIL |  ALONE |  STALL |  FAIL |XFAIL )' "/tmp/$name.log"
+          done
+          exit 0
+
+      - name: the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: green-r${{ matrix.rep }}
+          path: /tmp/*.log
+          if-no-files-found: warn
+          retention-days: 5
