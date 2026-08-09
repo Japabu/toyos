@@ -2024,6 +2024,30 @@ updated; `SysCap` and `SYS_DEVICE_CLAIM`/`SYS_RT_ENTER`; every one of the 11
 `system.toml` files rewritten. The §8.1 host gates land with the schema.
 *Gate: every config boots; `endowment_denied`; the six `--lib` config gates (§8.1).*
 
+**Sub-boundary done, 2026-08-09 (`a20c24c`): the manifest schema and the six
+§8.1 gates, staged early per the note above.** The five per-program keys plus
+`args`, and `[boot] start`, are `#[serde(default)]` on `SystemConfig`/
+`ProgramConfig` and authored in all eleven configs *beside* the still-live `init`
+field — the build still spawns from `init`. `ALL_CONFIGS`, `INIT_SERVED` and the
+six gates, each with a negative control in its own body, are in `src/build.rs`'s
+test module; `cargo test --lib` is 74 of 74 and the tree is warning-clean.
+Authoring principle: a program's `receives` in a config is its §4.6 production
+authority intersected with the services present in *that* config, so no config
+names a provider it lacks; each `boot.start` is its config's old `init`
+membership unchanged; `launcher` is init's and available in every image.
+`args`/`realtime`/`boot` carry `#[allow(dead_code)]` until they are consumed.
+
+Still owed to make chunk 4 green — the interdependent block that is not
+`cargo test --lib`-verifiable and only proves out when the guest reopens at
+chunk 5: `SpawnArgs`'s `slot_map`/`endow`/`labels` restructure (§3.6) and the
+kernel `build_child_handles` move-vector, the `mm/user_span.rs` 48→80 size
+assert, and std's `process/toyos.rs` (a `rust/` fork touch → push + pin bump);
+`SysCap`'s boot creation and the `SYS_ENDOWMENTS`/`SYS_DEVICE_CLAIM`/
+`SYS_RT_ENTER` dispatch handlers and the per-process labels blob in
+`ProcessData`; `/etc/system.manifest` generation and the `INIT_PROGRAMS` chain
+deletion with the `KernelArgs` 16-byte shrink and its `toyos-abi/src/boot.rs`
+asserts; `/bin/init` and its launcher; and `toyos/src/endow.rs`.
+
 **Chunk 5 — every server and client. Green.**
 compositor, soundd, netd, filepicker, terminal, console, toybox `screen`,
 `filepicker-api`, `window`, and the SDK's `audio`/`net`/`surface`. The two retry
