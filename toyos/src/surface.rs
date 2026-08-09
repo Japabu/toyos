@@ -24,20 +24,26 @@
 //!   carries no name: it says only that the file changed, so no translator can
 //!   hold an opinion that disagrees with it.
 //!
-//! The service name is per-host and lives in [`HOST_ENV`], which a child
-//! inherits — so a wizard three processes below a terminal still finds it.
+//! **The channel is a port, not a name.** A surface makes its own — one per
+//! terminal, one per console — and puts the connector in the namespace it
+//! builds for the shell it spawns. A wizard three processes below a terminal
+//! still finds it, because the namespace is inherited down the same chain the
+//! environment used to be; nothing outside that chain can name it, and nothing
+//! in it can name a service its parent did not pass.
 
 use toyos_abi::input::RawKeyEvent;
-use toyos_abi::syscall::SyscallError;
 use toyos_abi::RawHandle;
 
 use crate::ipc::{self, Connection, FrameRx, RxStep, TrySendError};
 use crate::poller::{Poller, IORING_POLL_IN};
-use crate::services;
-use crate::{AsHandle, Listener};
+use crate::port::Acceptor;
+use crate::AsHandle;
 
-/// The environment variable carrying a surface's service name.
-pub const HOST_ENV: &str = "TOYOS_SURFACE";
+/// What a surface is called in the namespace of everything below it.
+///
+/// One name, not one per host: a name in a private namespace does not have to
+/// be unique machine-wide, and making it so is what needed a pid in it.
+pub const SERVICE: &str = "surface";
 
 /// The file that says which keyboard layout this machine uses.
 ///
@@ -72,36 +78,6 @@ pub const MSG_KEY: u32 = 5;
 /// user is pressing now would be worse than being told no.
 pub const MAX_CLIENTS: usize = 4;
 
-/// The service name a surface owned by `pid` serves.
-///
-/// Derived rather than recorded: the host puts the same string in [`HOST_ENV`]
-/// and there is nothing for the two to disagree about.
-pub fn service_name(pid: u32, buf: &mut [u8; MAX_NAME]) -> &str {
-    const PREFIX: &[u8] = b"surface.";
-    buf[..PREFIX.len()].copy_from_slice(PREFIX);
-    let mut n = PREFIX.len();
-    let mut digits = [0u8; 10];
-    let mut d = 0;
-    let mut v = pid;
-    loop {
-        digits[d] = b'0' + (v % 10) as u8;
-        d += 1;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    while d > 0 {
-        d -= 1;
-        buf[n] = digits[d];
-        n += 1;
-    }
-    core::str::from_utf8(&buf[..n]).expect("ASCII")
-}
-
-/// Widest [`service_name`] there is: the prefix plus a `u32`'s ten digits.
-pub const MAX_NAME: usize = 8 + 10;
-
 /// Something the surface owner should log or act on.
 #[derive(Clone, Copy, Debug)]
 pub enum Notice {
@@ -134,7 +110,7 @@ struct Peer {
 
 /// The server side: a surface serving key transitions to its children.
 pub struct Host {
-    listener: Listener,
+    acceptor: Acceptor,
     peers: [Option<Peer>; MAX_CLIENTS],
     /// Index into `peers` of the client taking transitions.
     grab: Option<usize>,
@@ -146,21 +122,21 @@ pub struct Host {
 }
 
 impl Host {
-    /// Serve `name`, which the caller must also put in [`HOST_ENV`] for the
-    /// children it spawns.
-    pub fn listen(name: &str) -> Result<Self, SyscallError> {
-        Ok(Self {
-            listener: services::listen(name)?,
+    /// Serve from a port the caller made, whose connector it puts in the
+    /// namespace of every child that is to reach this surface.
+    pub fn serve(acceptor: Acceptor) -> Self {
+        Self {
+            acceptor,
             peers: [const { None }; MAX_CLIENTS],
             grab: None,
             drops: [const { None }; MAX_CLIENTS],
             pending: [const { None }; MAX_CLIENTS],
-        })
+        }
     }
 
-    /// The listener, for the caller's poller.
-    pub fn listener_fd(&self) -> RawHandle {
-        self.listener.fd()
+    /// The acceptor, for the caller's poller.
+    pub fn acceptor_fd(&self) -> RawHandle {
+        self.acceptor.as_handle()
     }
 
     /// Every connected client, for the caller's poller.
@@ -175,12 +151,12 @@ impl Host {
         self.grab.is_some()
     }
 
-    /// Accept one queued connection. Call when the listener reads ready.
+    /// Accept one queued connection. Call when the acceptor reads ready.
     ///
     /// Accept and the first frame are two events: nothing is read here, and a
     /// client that connects and then says nothing costs a slot and no more.
     pub fn accept(&mut self) {
-        let Ok(accepted) = services::accept(&self.listener) else {
+        let Ok(accepted) = self.acceptor.accept() else {
             return;
         };
         let Some(slot) = self.peers.iter().position(|p| p.is_none()) else {
@@ -336,8 +312,8 @@ impl Host {
 /// Why a client could not take the keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrabError {
-    /// Nothing is serving this surface's name — the host went away, or the
-    /// name in [`HOST_ENV`] is stale.
+    /// This process has no surface: it was given no `surface` connector, or
+    /// the surface that made the port has exited.
     HostGone,
     /// Another client on the same surface already holds them.
     Busy,
@@ -362,9 +338,9 @@ pub struct Keys {
 }
 
 impl Keys {
-    /// Ask the surface serving `name` for raw key transitions.
-    pub fn grab(name: &str) -> Result<Self, GrabError> {
-        let conn = services::connect(name).map_err(|_| GrabError::HostGone)?;
+    /// Ask this process's surface for raw key transitions.
+    pub fn grab() -> Result<Self, GrabError> {
+        let conn = crate::endow::service(SERVICE).map_err(|_| GrabError::HostGone)?;
         conn.signal(MSG_GRAB_KEYS).map_err(|_| GrabError::HostGone)?;
         let header = conn.recv_header().map_err(|_| GrabError::HostGone)?;
         match header.msg_type {
@@ -402,13 +378,13 @@ impl AsHandle for Keys {
     }
 }
 
-/// Tell the surface serving `name` that [`LAYOUT_CONFIG`] changed.
+/// Tell this process's surface that [`LAYOUT_CONFIG`] changed.
 ///
 /// Best effort by construction: the config is already written, so a program
 /// with no surface above it has still changed the layout — for the next
 /// translator that starts. There is nothing here to report.
-pub fn notify_layout_changed(name: &str) {
-    if let Ok(conn) = services::connect(name) {
+pub fn notify_layout_changed() {
+    if let Ok(conn) = crate::endow::service(SERVICE) {
         let _: Result<(), ipc::IpcError> = conn.signal(MSG_LAYOUT_CHANGED);
     }
 }

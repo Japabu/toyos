@@ -7,6 +7,7 @@
 
 pub mod audio;
 pub mod device;
+pub mod endow;
 pub mod gpu;
 pub mod poller;
 pub mod ipc;
@@ -16,6 +17,7 @@ pub mod pipe;
 pub mod port;
 pub mod surface;
 pub mod shm;
+pub mod syscap;
 pub mod system;
 
 pub use ipc::Connection;
@@ -93,6 +95,10 @@ pub struct Device(pub(crate) OwnedHandle);
 
 impl Device {
     pub fn fd(&self) -> RawHandle { self.0.fd() }
+
+    /// Give up ownership, for a claim about to be endowed. A claim carries no
+    /// `DUP` right, so this is the only way one changes hands.
+    pub fn into_raw(self) -> RawHandle { self.0.into_raw() }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, toyos_abi::syscall::SyscallError> {
         self.0.read(buf)

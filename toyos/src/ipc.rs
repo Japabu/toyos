@@ -164,8 +164,8 @@ pub enum TrySendError {
     Syscall(SyscallError),
 }
 
-/// An IPC connection. Created by [`crate::services::accept`] or
-/// [`crate::services::connect`].
+/// An IPC connection. A server gets one from [`crate::port::Acceptor::accept`]
+/// and a client from [`crate::endow::service`].
 pub struct Connection(pub(crate) OwnedHandle);
 
 impl AsHandle for Connection {

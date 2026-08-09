@@ -60,7 +60,7 @@ fn main() {
 
     let mut sent: Vec<PendingResponse> = Vec::with_capacity(burst);
     for i in 0..burst {
-        let conn = NetdConn::connect_blocking()
+        let conn = NetdConn::connect()
             .unwrap_or_else(|e| panic!("request {i}: could not reach netd: {e:?}"));
         sent.push(
             conn.request(MsgType::TcpConnectPiped, &request)

@@ -261,21 +261,15 @@ pub struct UdpBound {
 pub struct NetdConn(Connection);
 
 impl NetdConn {
-    const BOOT_RETRIES: u32 = 100;
-    const BOOT_RETRY_INTERVAL_NS: u64 = 10_000_000;
-
+    /// One connection to netd, through this process's own namespace.
+    ///
+    /// **There was a retry loop here and it is gone.** It spun a hundred times
+    /// at ten milliseconds waiting for a name to appear in a global registry;
+    /// a `netd` connector is live from this process's first instruction, so
+    /// there is nothing to wait for and `NetdNotFound` now means the manifest
+    /// did not give this program netd.
     pub fn connect() -> Result<Self, NetError> {
-        crate::services::connect("netd").map(Self).map_err(|_| NetError::NetdNotFound)
-    }
-
-    pub fn connect_blocking() -> Result<Self, NetError> {
-        for _ in 0..Self::BOOT_RETRIES {
-            if let Ok(conn) = crate::services::connect("netd") {
-                return Ok(Self(conn));
-            }
-            syscall::nanosleep(Self::BOOT_RETRY_INTERVAL_NS);
-        }
-        Err(NetError::NetdNotFound)
+        crate::endow::service("netd").map(Self).map_err(|_| NetError::NetdNotFound)
     }
 
     pub fn request<Req: IpcPayload>(self, msg_type: MsgType, payload: &Req) -> Result<PendingResponse, NetError> {
@@ -350,7 +344,7 @@ pub fn tcp_connect(
     let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Io)?;
     let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Io)?;
 
-    let result = NetdConn::connect_blocking()?
+    let result = NetdConn::connect()?
         .request(MsgType::TcpConnectPiped, &TcpConnectPipedRequest {
             addr,
             port,
@@ -387,7 +381,7 @@ pub fn tcp_bind(addr: [u8; 4], port: u16) -> Result<TcpBound, NetError> {
     let notify_pipe = syscall::pipe().map_err(|_| NetError::Io)?;
     let notify_pipe_id = syscall::pipe_id(notify_pipe.write).map_err(|_| NetError::Io)?;
 
-    let result = NetdConn::connect_blocking()?
+    let result = NetdConn::connect()?
         .request(MsgType::TcpBindPiped, &TcpBindPipedRequest {
             addr,
             port,
@@ -484,7 +478,7 @@ pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
     let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Io)?;
     let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Io)?;
 
-    let result = NetdConn::connect_blocking()?
+    let result = NetdConn::connect()?
         .request(MsgType::UdpBind, &UdpBindRequest {
             addr,
             port,
@@ -544,7 +538,7 @@ pub fn udp_close(socket_id: UdpSocketId) -> Result<(), NetError> {
 
 pub fn dns_lookup(hostname: &str, results: &mut [[u8; 4]]) -> Result<usize, NetError> {
     let mut buf = [0u8; 256];
-    let n = NetdConn::connect_blocking()?
+    let n = NetdConn::connect()?
         .request_bytes(MsgType::DnsLookup, hostname.as_bytes())?
         .response_bytes(&mut buf)?;
 

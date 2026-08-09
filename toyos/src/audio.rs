@@ -185,9 +185,6 @@ pub struct AudioStream {
 }
 
 impl AudioStream {
-    const BOOT_RETRIES: u32 = 100;
-    const BOOT_RETRY_INTERVAL_NS: u64 = 10_000_000;
-
     pub fn open(sample_rate: u32, channels: u16, format: u16) -> Result<Self, AudioError> {
         let control = Self::connect_soundd()?;
 
@@ -262,14 +259,14 @@ impl AudioStream {
         let _ = self.control.signal(MSG_STREAM_CLOSE);
     }
 
+    /// One connection to soundd, through this process's own namespace.
+    ///
+    /// **There was a retry loop here and it is gone**, along with its twin in
+    /// `net`. A `soundd` connector is live from this process's first
+    /// instruction, so `NotFound` now means the manifest did not give this
+    /// program sound.
     fn connect_soundd() -> Result<crate::Connection, AudioError> {
-        for _ in 0..Self::BOOT_RETRIES {
-            if let Ok(conn) = crate::services::connect("soundd") {
-                return Ok(conn);
-            }
-            syscall::nanosleep(Self::BOOT_RETRY_INTERVAL_NS);
-        }
-        Err(AudioError::NotFound)
+        crate::endow::service("soundd").map_err(|_| AudioError::NotFound)
     }
 }
 
