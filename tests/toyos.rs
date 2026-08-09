@@ -845,6 +845,8 @@ const NOT_RUN: &[NotRun] = &[
         why: Why::Declined("cleanup attributes; the entry used to say _Generic, which is 33_ternary_op's reason and not this one"),
     },
     NotRun { case: "18_include", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "78_vla_label", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "79_vla_continue", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
     NotRun { case: "31_args", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
     NotRun { case: "32_led", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
     NotRun {
