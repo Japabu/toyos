@@ -10,8 +10,15 @@ pub enum PickerMode {
     Save = 1,
 }
 
-/// Request the system file picker. Blocks until the user picks a file or cancels.
-/// Returns `Some(path)` if a file was chosen, `None` if cancelled.
+/// Request the system file picker.
+///
+/// **`None` is not "the user cancelled".** It is that and five other things:
+/// no process listening on `filepicker` yet, a refused send, a refused header
+/// read, a reply that is not `MSG_FILEPICKER_RESULT`, and a path that is not
+/// UTF-8. The caller cannot tell them apart, so an editor that opens its picker
+/// before the compositor has spawned one reports that the user changed their
+/// mind. `specs/terminal-boot-race-options.md` §1 is why the signature is like
+/// this and what would separate the cases.
 pub fn pick_file(mode: PickerMode, start_dir: &str) -> Option<String> {
     let conn = services::connect("filepicker").ok()?;
 
