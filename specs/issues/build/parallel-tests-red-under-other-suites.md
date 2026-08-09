@@ -15,8 +15,9 @@ phase landed, and none reproduces on a host running one suite.
 **Read this list against `specs/test-cost-audit.md` §5.8 before adding to it.**
 Every entry below that says `nothing typed at the terminal window reached a
 shell` — `desktop_typing_damage`, `desktop_locale_detect`, `blocked_dump`, and
-`desktop_audio_client` in the entry after this one — is now known to be the
-`/bin/terminal` boot race in `specs/issues/kernel/` reported through a wall-clock guard that could
+`desktop_audio_client` in `desktop-window-child-holds-a-lane` — is now known to be the
+`/bin/terminal` boot race in `specs/issues/kernel/terminal-races-compositor-at-boot.md`
+reported through a wall-clock guard that could
 say nothing else: three of three such reds in an eight-suite session carried the
 race in their boot log, and the wait they blew had been ruled out at 0.6 s by
 `exit: terminal pid=N code=1`. `shell_echoes` names the race now. So an
@@ -62,9 +63,9 @@ changes.
 - **`desktop_typing_damage`** — `nothing typed at the terminal window reached a
   shell`. `shell_answers` typed ten times with a flat two seconds between, which
   is a twenty-second ceiling on a desktop coming up; the retry window is now
-  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`. **See the entry
-  below: as of 2026-08-06 this is no longer occasional but reproducible, and the
-  mechanism is the duration profile.**
+  `qemu::budget(20 s)`, the phase's. Still `Sched::Parallel`. **See
+  `desktop-window-child-holds-a-lane`: as of 2026-08-06 this is no longer
+  occasional but reproducible, and the mechanism is the duration profile.**
 - **`desktop_locale_detect`** — added 2026-08-05. Same `nothing typed at the
   terminal window reached a shell`, same `ALONE … GREEN`, in the same run as the
   entry above and on a branch that touches neither the compositor nor the

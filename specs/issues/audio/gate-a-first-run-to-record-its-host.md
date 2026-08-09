@@ -38,8 +38,10 @@ load 37.9-49.8 on 14 cores with three to four other `toyos-build` processes and
 no other guest, against the 4.2-6.1 the 2026-07-29 ceiling derivation recorded
 per run — six to twelve times it. Under the owner's ruling of 2026-08-04 that is
 **not** an excuse and not grounds to re-run it away: it is a defect of the
-pipeline until something shows otherwise, and it is the same shape as the two otherentries beside it. What is new is only that the next investigation starts from a
-measured host state instead of a guess.
+pipeline until something shows otherwise, and it is the same shape as
+`audio-tone-load-fast-tier-intermittent` and
+`one-boot-put-142ms-of-silence-on-the-wire`. What is new is only that the next
+investigation starts from a measured host state instead of a guess.
 
 Whoever takes it: the thorough tier is the instrument for the rate, and it now
 prints `host conditions over N runs` so its own arm's conditions can be stated.

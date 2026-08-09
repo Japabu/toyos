@@ -56,7 +56,7 @@ the only difference is `fault_gate_child`'s x87 control word.
 | `masked` (`cw = 0x037F`) | PASS ×3 | PASS ×3 | PASS ×3 |
 
 `fault_gates` passing in both arms is what proves the probe is not vacuous.
-Written up in full at `specs/issues/isolation/` and `specs/ci-plan.md` §9.3.
+Written up in full at `specs/ci-plan.md` §9.3.
 
 **The victim instruction is `FLDCW`**, a *waiting* x87 instruction: it checks for
 a pending unmasked exception before it executes. It sits in the unwinder's
@@ -281,8 +281,8 @@ cannot be answered on this host. But its *mechanism* is confirmed: the BSP's
 they already differ in two bits. On the T14 that question is open and only the
 T14 can close it.
 
-**`CR0.NE = 0` on every AP is a complete explanation for `specs/issues/isolation/`'s
-unexplained survivor.** `fault_gates`' `mf` arm killed its child 6 of 6 alone
+**`CR0.NE = 0` on every AP is a complete explanation for the unexplained
+survivor.** `fault_gates`' `mf` arm killed its child 6 of 6 alone
 and survived once under a 12-wide suite, printing status word `0xb881` — IE set,
 ES set, on the `fnstsw` two instructions past the `fwait` that should have
 trapped on exactly that `ES`. "The state was not lost; the trap was." With `NE`
@@ -291,7 +291,8 @@ instead of `#MF`, and nothing in a modern machine is listening. A child that
 happened to be scheduled on an AP rather than the BSP would see precisely that.
 
 **These are separate defects and are not fixed here.** They are recorded in
-`specs/issues/` with this evidence. Note in particular that they
+`specs/issues/kernel/ap-control-registers-inherit-init.md` with this evidence.
+Note in particular that they
 confound measurement: an AP with `CR0.CD` set runs with caching off, so any
 microbenchmark that lands on one is not measuring what it thinks it is —
 including §12's, whose two arms were taken on a machine where three of four

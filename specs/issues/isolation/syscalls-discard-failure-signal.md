@@ -16,8 +16,9 @@ cases the underlying operation can already refuse, and the syscall layer throws
 the answer away — which is exactly why neither can be given a bound today
 without the bound becoming a silent failure.
 
-It is the direct counterpart of the class above. There, a client's request is an
-allocation request that needs an owner who can say no. Here the owner *does* say
+It is the direct counterpart of `client-request-is-an-allocation`. There, a
+client's request is an allocation request that needs an owner who can say no.
+Here the owner *does* say
 no and nobody is listening, so adding the cap without fixing the caller would
 convert an unbounded resource into a silently dropped request — a worse failure,
 because the first is at least visible.

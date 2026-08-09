@@ -20,7 +20,8 @@ there is no path to one. Linux retries either way — `PORT_RESET_TRIES` is 5 an
 `PORT_INIT_TRIES` 4 in `drivers/usb/core/hub.c`, and `hub_port_reset` escalates
 a failed hot reset to a warm one.
 
-Doing this properly needs the Supported Protocol capability above, because
+Doing this properly needs the Supported Protocol capability
+`xhci-legacy-handoff-unstageable` names as unbuilt, because
 "retry as a warm reset" is only correct on a USB3 port and WPR is RsvdZ on a
 USB2 one. It costs a device on a receptacle whose link does not train first
 time; on the T14 the receptacle in question is the one the boot stick is in.

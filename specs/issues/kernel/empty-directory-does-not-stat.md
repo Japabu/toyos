@@ -40,13 +40,14 @@ makes for that reason.
 technical one.** `rust/` is the primary checkout's, and in a linked worktree it is the
 empty stub `git worktree add` leaves (`specs/worktrees.md` §2) — so a worktree agent can
 neither edit nor build it. The sysroot witness covers `toyos-abi`, `toyos` and
-`userland/libc` and *not* std's own sources (`specs/issues/kernel/`), so the change would also not be picked
+`userland/libc` and *not* std's own sources
+(`specs/issues/build/std-change-needs-an-unlanded-abi-change.md`), so the change would also not be picked
 up without `--claim-sysroot`, which rebuilds the shared sysroot and cleans every other
 worktree's target directories mid-session. This is the same two-half shape as
-`std::env::current_dir()` above and takes the same answer: the kernel half lands first
+`specs/issues/isolation/current-dir-returns-wrong-path.md` and takes the same answer: the kernel half lands first
 and is safe alone — `is_dir` returns `false` for an empty directory before and after it,
-so nothing regresses and the distinction becomes available. Batch the edit with the other
-`rust/` work owed in `specs/issues/isolation/` in one quiet-tree window.
+so nothing regresses and the distinction becomes available. Batch the edit with that
+same `rust/` work in one quiet-tree window.
 
 Found in the same file and **not** fixed, for the same reason: `FileAttr::file_type`
 (`fs/toyos.rs:88`) answers `is_dir` with `self.file_type == syscall::FileType::Pipe`, and

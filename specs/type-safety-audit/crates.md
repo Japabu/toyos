@@ -27,9 +27,10 @@ a change.** Nothing in this document is softened because it is large.
 | `toyos-cc` | 9964 | 1 | 241 |
 
 **One staleness correction, up front, because it changes what is worth fixing.**
-`specs/issues/isolation/` still lists "A 3 MiB `fs::write` to `/home` panics the
+The record this was written against listed "A 3 MiB `fs::write` to `/home` panics the
 kernel — `bcachefs/src/btree.rs:184`, `MAX_PAYLOAD - used` underflows" as open and
-assigned. It is **closed at `bccab15`** (2026-08-01): `btree.rs:184` is now
+assigned; nothing under `specs/issues/` carries it now. It is **closed at
+`bccab15`** (2026-08-01): `btree.rs:184` is now
 `Ok(Self { level, entries })`, and `Node::write_to` (`:203-207`) returns
 `FsError::NodeOverfull` before the subtraction at `:217`. Not re-filed. Cited
 throughout as the precedent — the class is alive in six other places in the same

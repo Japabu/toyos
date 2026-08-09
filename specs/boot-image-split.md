@@ -380,7 +380,7 @@ somebody will want the moment `hosted-rustc = true` goes back on.
 **This stage has no gate, and that is a finding rather than an omission.**
 Nothing in the harness boots `system.toml` at all — every test config is its
 own file — so no suite test could go red for this change in either direction.
-Recorded in `specs/issues/` §6.
+Recorded in `specs/issues/build/shipped-config-is-untested.md`.
 
 ### 4.1 What it measured
 

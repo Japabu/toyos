@@ -446,7 +446,8 @@ landed puts the handles in a child module whose field `pipe.rs` cannot name, and
 different id than the count it bumped is unwritable. `exists` and `creator` are
 deleted rather than kept for careful use, and `sys_pipe_open`'s entitlement
 became a closure evaluated inside the acquisition instead of a fact read a moment
-earlier. Known issues §3 carries the three residuals.
+earlier. `specs/issues/kernel/ftruncate-takes-no-vfs-lock.md` carries the one of
+those three residuals still open.
 
 **Location.** `pipe.rs:171-181`, panicking at `:262-268` / `:270-276`.
 
@@ -656,7 +657,8 @@ there are **5** call sites: `page_cache.rs:64`, `:73`, `:235`, `:288` and
 > another agent's in-progress USB work. They are not counted above and the
 > figure will move when that lands. Counting the tree instead of `HEAD` would
 > have given 11 and been wrong for anyone reading this against `main` — the
-> failure mode `specs/issues/`'s §1 postscript records.
+> failure mode `specs/issues/isolation/capability-by-id-or-name.md`'s postscript
+> records.
 
 ### Both ways
 
@@ -1192,8 +1194,10 @@ bug **and** the proposed code does not read better — usually because it reads
 **Already filed — not re-filed. Where I found a new instance it is folded into a
 finding above rather than duplicated.**
 
-- `PipeId`, `ListenerId`, `RingId`, `SharedToken` as designations (`specs/issues/`
-  §1 THE CLASS, §7; `capability-handles-spec.md` §7 has the disposition for all
+- `PipeId`, `ListenerId`, `RingId`, `SharedToken` as designations
+  (`specs/issues/isolation/capability-by-id-or-name.md`,
+  `specs/issues/design-debt/sharedtoken-has-no-raii.md`;
+  `capability-handles-spec.md` §7 has the disposition for all
   four). `PipeId::from_raw` being `pub` and reachable from `sys_pipe_open` is the
   filed defect.
 - `FileBacking` outliving unlink and `NvmeBacking::read_page` re-deriving a block

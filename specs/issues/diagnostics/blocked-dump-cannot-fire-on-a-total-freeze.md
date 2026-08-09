@@ -11,6 +11,9 @@ sibling's queues is unwritable rather than racy. `task_cpu_ns` and
 `task_sched_state` were rebuilt on values the owning CPU *publishes* —
 `TaskHandle`'s counters, republished at each end of a pass, plus the core's
 rendezvous word — so they are accurate and lock-free, which also closes the old
+`try_lock`-and-skip misreport. `dump_blocked` had no such substitute: it printed
+the calling CPU's parked map alone, by `TaskKey` and `WaitClass`, with no
+process name, so it could confirm a park and never rule one out.
 
 `kernel/src/sched/dump.rs` replaces it, built for #172 and for #142's family.
 It walks nothing remote: the asking CPU marks every sibling, kicks it, and each
@@ -98,8 +101,10 @@ or removes it by accident.
 What is left of this entry: `ps` and `stats` still have no cross-CPU view of
 anything the handles do not publish.
 
-
 `screen_blocked_dump` is intermittent **alone**, and at the same rate on an
 untouched tree: five runs a side on 2026-08-07 gave three green and two red on
 `main` at `48147c2` and the same on `wt/toyos-wedge`. A green of it is one
-sample.
+sample. The mechanism first recorded for that red — the ring tail lifting the
+summary off the page — was wrong: userland repaints over the report, and the
+failing string is the one that sat under the window rather than beside or below
+it. That is what `panic_console::hold_report` answers.
