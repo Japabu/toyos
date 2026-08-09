@@ -1389,3 +1389,19 @@ image with the same accelerator:
 
 So one name is left between `main` and the trigger, it is a defect with a
 write-up and an owner's decision outstanding, and it fires one run in five.
+
+**And a fifth, which the fix for the second uncovered.** `main` at `1ed6f39`
+(run `31284962381`) is red on `dump_nmi_probe` again and on a signature neither
+probe ever produced — *the dump never ran*, both attempts. The actuator's cpu0
+kicks the victim and waits 100 ms for it to reach its idle loop; on that runner
+it took **251 ms**, so cpu0 gave up at 11.417 s, nothing was staged, no report
+was asked for, and the victim went deaf at 11.568 s for nobody. There is no
+bound to give: the pass a kicked CPU is finishing runs
+`flush_log_file_if_affordable` with preemption off, and on a machine whose
+`/log` is a USB device CLAUDE.md already records that as a string of bulk
+transfers. So the budget is generous now and, more to the point, no longer the
+whole answer — expiring it takes the ask back with a CAS and lets the next pass
+ask again, and a CAS that *fails* means the victim went deaf on the boundary and
+the report is asked for after all. **0 of 20 probe reps and 2 of 2 in one shard
+job** is the shape of a rate nobody has counted, which is why the give-up is
+repaired rather than the number tuned.
