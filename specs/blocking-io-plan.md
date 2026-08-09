@@ -1,5 +1,20 @@
 # A CPU never waits for a device: what that costs in this kernel, and the wave that pays it
 
+> **SUPERSEDED by `specs/completion-architecture-spec.md` (2026-08-09).** That
+> document collapses this and `specs/iouring-blocking-spec.md` into one
+> deliverable. §1's measurement, §3's `usb-slow-device` A/B and §5's boundary
+> statement are carried over verbatim and are still the evidence.
+>
+> What it corrects: B1's `SleepLock` "spins where it cannot park" is a primitive
+> whose behaviour depends on invisible context, and is replaced by a `Parkable`
+> token that separates the two worlds at compile time; B3's deferred question —
+> "a task killed while holding a `SleepLock` leaks it … it is the moment to decide
+> whether it stays one" — is answered first rather than last, because with sleep
+> locks it is no longer survivable; and B5's "the idle loop's whole remaining duty
+> is to kick the log thread" becomes no duty at all.
+>
+> Read it for the measurement; build from the superseding spec.
+
 The T14's audio pops are the log sink writing `/log` while an audio daemon waits
 for the CPU it is on. Three fixes have chosen *which* CPU absorbs that stall and
 a fourth was commissioned to remove it at its source — `xhci::wait_transfer`,

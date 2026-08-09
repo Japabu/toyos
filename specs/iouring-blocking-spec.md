@@ -1,5 +1,20 @@
 # ToyOS io_uring-Only Blocking — Technical Specification
 
+> **SUPERSEDED by `specs/completion-architecture-spec.md` (2026-08-09).** That
+> document collapses this and `specs/blocking-io-plan.md` into one deliverable,
+> because neither is safe to build alone: this spec is written about *blocking
+> syscalls*, the other about *a thread that asked to write a file*, and the change
+> both need first is that a kill in a kernel that does not unwind cannot be a jump.
+>
+> What it takes from here: the try-once-plus-park syscall shape (§8), the
+> continuous absolute deadline with no sentinel (§9), the CQE timestamp (§10), and
+> the argument against userspace blocking wrappers (§20). What it rejects: the
+> global registry and its `CORE` lock (§5, §13.2, replaced by a borrowed subject),
+> the 32 KiB `RingArena` (§5.2, replaced by the endowment spec's ring-owns-its-pages),
+> and the two park channels (§6.4 — the futex folds into the one inbox).
+>
+> Read it for the reasoning below; build from the superseding spec.
+
 This is the design for the replacement wake/blocking core, realizing the CLAUDE.md idea
 "io_uring as the only blocking I/O mechanism". Priority ordering throughout: (1) make bug
 classes unrepresentable at compile time, (2) runtime fail-fast, (3) tests. The concurrent
