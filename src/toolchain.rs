@@ -81,6 +81,159 @@ pub const SYSROOT_SOURCES: [&str; 3] = ["toyos-abi/src", "toyos/src", "userland/
 /// Of those, the ones a change to obliges an std rebuild.
 const STD_SOURCES: [&str; 2] = ["toyos-abi/src", "toyos/src"];
 
+/// The crates `library/std` names by a path relative to itself, which is why
+/// [`SourceOverride`] exists at all.
+const STD_PATH_DEPS: [&str; 2] = ["toyos-abi", "toyos"];
+
+/// The manifest those two paths are written in.
+const STD_MANIFEST: &str = "library/std/Cargo.toml";
+
+/// Point `library/std`'s two ToyOS dependencies at the worktree doing the
+/// building, for the length of one `x build`.
+///
+/// `rust/library/std/Cargo.toml` names them `../../../toyos-abi` and
+/// `../../../toyos`, and `rust/` belongs to the primary checkout, so without
+/// this every worktree's std is compiled against **main's** ABI while its kernel
+/// is compiled against its own — the kernel and std then disagree about struct
+/// layouts and both still build, link and boot
+/// (`specs/issues/build/std-change-needs-an-unlanded-abi-change.md`).
+///
+/// **The manifest and not a cargo `paths` override.** The override works —
+/// measured, the marker reached the sysroot — but cargo warns that overriding
+/// `toyos` alters `toyos-abi`'s resolved source and that the warning becomes a
+/// hard error. The manifest is where the paths are written, so it is where they
+/// are corrected, and nothing restructures a dependency graph behind cargo's
+/// back.
+///
+/// **Rewritten from whatever is there, not from one expected spelling.** A run
+/// killed between the edit and the restore leaves an absolute path naming a
+/// worktree that may since have been removed; matching either form makes the
+/// next build repair it instead of refusing.
+struct SourceOverride {
+    manifest: PathBuf,
+}
+
+impl SourceOverride {
+    /// Callers must already hold [`Scope::Global`]: this is one file, in one
+    /// tree, that every worktree builds its sysroot out of.
+    fn write(rust_dir: &Path, root: &Path) -> Self {
+        let manifest = rust_dir.join(STD_MANIFEST);
+        let held = Self { manifest };
+        held.retarget(|dep| root.join(dep).display().to_string());
+        held
+    }
+
+    fn retarget(&self, path_of: impl Fn(&str) -> String) {
+        let mut text = fs::read_to_string(&self.manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", self.manifest.display()));
+        for dep in STD_PATH_DEPS {
+            text = retarget_path_dep(&text, dep, &path_of(dep));
+        }
+        fs::write(&self.manifest, text)
+            .unwrap_or_else(|e| panic!("write {}: {e}", self.manifest.display()));
+    }
+}
+
+impl Drop for SourceOverride {
+    fn drop(&mut self) {
+        self.retarget(|dep| format!("../../../{dep}"));
+    }
+}
+
+/// Replace the path of one `<dep> = { path = "…" }` dependency.
+///
+/// Panics if the manifest does not name it exactly once: the fork moving that
+/// line is a thing to be told about, not a substitution to silently perform
+/// zero times.
+fn retarget_path_dep(manifest: &str, dep: &str, path: &str) -> String {
+    let opening = format!("\n{dep} = {{ path = \"");
+    let occurrences = manifest.matches(&opening).count();
+    assert_eq!(
+        occurrences, 1,
+        "{STD_MANIFEST} names `{dep} = {{ path = \"…\" }}` {occurrences} times, not once, so \
+         the sysroot's ABI cannot be pointed at one checkout. The fork moved it."
+    );
+    let start = manifest.find(&opening).expect("counted above") + opening.len();
+    let end = start + manifest[start..].find('"').expect("an unterminated TOML string");
+    format!("{}{path}{}", &manifest[..start], &manifest[end..])
+}
+
+/// Every `toyos-abi`/`toyos` source file the built std actually compiled, read
+/// out of cargo's dep-info rather than out of what we asked for.
+fn std_toyos_sources(rust_dir: &Path) -> Vec<String> {
+    let mut deps = Vec::new();
+    collect_dep_info(
+        &rust_dir.join(format!("build/{}/stage1-std/x86_64-unknown-toyos", host_triple())),
+        &mut deps,
+    );
+    let mut found: Vec<String> = deps
+        .iter()
+        .flat_map(|text| toyos_sources_in_dep_info(text))
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+fn collect_dep_info(dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dep_info(&path, out);
+        } else if path.extension().is_some_and(|e| e == "d") {
+            if let Ok(text) = fs::read_to_string(&path) {
+                out.push(text);
+            }
+        }
+    }
+}
+
+/// The paths in one dep-info file that name a `toyos-abi/src` or `toyos/src`
+/// source. Split out from the filesystem so the gate below has a negative
+/// control that is a string literal.
+fn toyos_sources_in_dep_info(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for word in text.split_ascii_whitespace() {
+        let word = word.strip_suffix(':').unwrap_or(word);
+        if !word.ends_with(".rs") {
+            continue;
+        }
+        if STD_SOURCES.iter().any(|src| word.contains(&format!("/{src}/"))) {
+            out.push(word.to_string());
+        }
+    }
+    out
+}
+
+/// Refuse a sysroot whose std was compiled against another checkout's ABI.
+///
+/// The witness records what the *builder* believed; this reads what the compiler
+/// was handed. They disagreed for the whole life of the defect above, and no
+/// test could see it — a worktree's kernel and its std both built, both linked,
+/// and the syscall arguments landed at different offsets.
+fn assert_std_built_from(root: &Path, rust_dir: &Path) {
+    let sources = std_toyos_sources(rust_dir);
+    assert!(
+        !sources.is_empty(),
+        "the std build under {} names no toyos-abi or toyos source at all, so the check that \
+         it was built from this worktree cannot answer. Cargo's dep-info moved.",
+        rust_dir.display(),
+    );
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let foreign: Vec<&String> =
+        sources.iter().filter(|p| !Path::new(p).starts_with(&root)).collect();
+    assert!(
+        foreign.is_empty(),
+        "std was compiled against {} sources that are not this worktree's:\n  {}\n\
+         The directory override in {} did not take effect, so this sysroot's ABI is another \
+         checkout's.",
+        foreign.len(),
+        foreign.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n  "),
+        rust_dir.join(".cargo/config.toml").display(),
+    );
+}
+
 /// What the sysroot on disk was built from.
 fn witness_path(rust_dir: &Path) -> PathBuf {
     rust_dir.join("build/toyos-sysroot-witness")
@@ -460,7 +613,7 @@ pub fn ensure(
         "build the ToyOS-hosted rustc",
         || (!hosted_stamp.exists() || !hosted_rustc.exists()).then_some(()),
         |()| {
-            build_hosted_rustc(&rust_dir, &toyos_ld_binary(root));
+            build_hosted_rustc(root, &rust_dir, &toyos_ld_binary(root));
             assert!(hosted_rustc.exists(), "Failed to build hosted rustc");
             fs::write(&hosted_stamp, "").unwrap();
         },
@@ -728,6 +881,7 @@ fn link_stale(stage2: &Path) -> bool {
 }
 
 fn full_bootstrap(root: &Path, rust_dir: &Path) {
+    let _sources = SourceOverride::write(rust_dir, root);
     let toyos_ld = toyos_ld_binary(root);
 
     // Ensure library/backtrace is checked out — std depends on it.
@@ -764,9 +918,11 @@ fn full_bootstrap(root: &Path, rust_dir: &Path) {
         );
         eprintln!("Note: some targets may have failed to link (expected), but rustc built successfully.");
     }
+    assert_std_built_from(root, rust_dir);
 }
 
 fn rebuild_std(root: &Path, rust_dir: &Path) {
+    let _sources = SourceOverride::write(rust_dir, root);
     // Ensure cross-only config (no hosted rustc) — if a previous hosted build
     // was interrupted, bootstrap.toml may still have ToyOS as host.
     let toyos_ld = toyos_ld_binary(root);
@@ -790,9 +946,11 @@ fn rebuild_std(root: &Path, rust_dir: &Path) {
         .status()
         .expect("Failed to run x build library");
     assert!(status.success(), "std rebuild failed");
+    assert_std_built_from(root, rust_dir);
 }
 
-fn build_hosted_rustc(rust_dir: &Path, toyos_ld: &Path) {
+fn build_hosted_rustc(root: &Path, rust_dir: &Path, toyos_ld: &Path) {
+    let _sources = SourceOverride::write(rust_dir, root);
     eprintln!("Building ToyOS-hosted rustc...");
     write_config(rust_dir, &host_triple(), toyos_ld, true);
 
@@ -1087,5 +1245,80 @@ mod tests {
         git(&root, &["checkout", "-qb", "only"]);
         git(&root, &["branch", "-qD", "main"]);
         assert_eq!(standing(&root), Standing::Unknown);
+    }
+
+    /// Verbatim from `rust/library/std/Cargo.toml`, so a fork edit that moves
+    /// these lines fails here rather than in a sysroot nobody looks inside.
+    const STD_DEPS: &str = "\n[target.'cfg(target_os = \"toyos\")'.dependencies]\n\
+        toyos-abi = { path = \"../../../toyos-abi\", features = [\"rustc-dep-of-std\"], public = true }\n\
+        toyos = { path = \"../../../toyos\", features = [\"rustc-dep-of-std\"], public = true }\n";
+
+    #[test]
+    fn the_two_std_deps_are_retargeted_and_nothing_else_is() {
+        let mut out = STD_DEPS.to_string();
+        for dep in STD_PATH_DEPS {
+            out = retarget_path_dep(&out, dep, &format!("/checkouts/toyos-endow/{dep}"));
+        }
+        assert_eq!(
+            out,
+            "\n[target.'cfg(target_os = \"toyos\")'.dependencies]\n\
+             toyos-abi = { path = \"/checkouts/toyos-endow/toyos-abi\", features = [\"rustc-dep-of-std\"], public = true }\n\
+             toyos = { path = \"/checkouts/toyos-endow/toyos\", features = [\"rustc-dep-of-std\"], public = true }\n",
+        );
+    }
+
+    #[test]
+    fn the_build_leaves_the_fork_byte_identical_even_after_a_killed_one() {
+        let rust_dir = std::env::temp_dir().join("toyos-source-override");
+        let _ = fs::remove_dir_all(&rust_dir);
+        fs::create_dir_all(rust_dir.join("library/std")).unwrap();
+        let manifest = rust_dir.join(STD_MANIFEST);
+
+        // What a build killed mid-flight left behind, naming a worktree that
+        // has since been removed.
+        let killed = STD_DEPS.replace("../../../", "/a-worktree-that-is-gone/");
+        fs::write(&manifest, &killed).unwrap();
+
+        {
+            let _guard = SourceOverride::write(&rust_dir, Path::new("/checkouts/toyos-endow"));
+            let held = fs::read_to_string(&manifest).unwrap();
+            assert!(held.contains("\"/checkouts/toyos-endow/toyos-abi\""), "{held}");
+            assert!(!held.contains("a-worktree-that-is-gone"), "{held}");
+        }
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), STD_DEPS);
+    }
+
+    #[test]
+    #[should_panic(expected = "The fork moved it")]
+    fn a_dep_the_fork_no_longer_names_that_way_is_a_refusal() {
+        retarget_path_dep("\ntoyos-abi = { workspace = true }\n", "toyos-abi", "/x");
+    }
+
+    /// The negative control is the defect itself: this is verbatim what cargo
+    /// wrote for a worktree build before the override existed.
+    #[test]
+    fn dep_info_names_the_checkout_std_was_really_built_from() {
+        let primary = "/Users/jan/Dev/jan/toyos/toyos-abi/src/lib.rs \
+                       /Users/jan/Dev/jan/toyos/toyos/src/audio.rs \
+                       /Users/jan/Dev/jan/toyos/rust/build/host/stage1-std/out/libcore.rmeta";
+        assert_eq!(
+            toyos_sources_in_dep_info(primary),
+            [
+                "/Users/jan/Dev/jan/toyos/toyos-abi/src/lib.rs",
+                "/Users/jan/Dev/jan/toyos/toyos/src/audio.rs"
+            ],
+        );
+
+        // A dep-info line ends in a colon when the file is its own target.
+        let target = "/Users/jan/Dev/jan/toyos-endow/toyos-abi/src/lib.rs:";
+        assert_eq!(
+            toyos_sources_in_dep_info(target),
+            ["/Users/jan/Dev/jan/toyos-endow/toyos-abi/src/lib.rs"],
+        );
+
+        // `rust/library/std/src/sys/pal/toyos/` is not one of these trees.
+        assert!(
+            toyos_sources_in_dep_info("/x/rust/library/std/src/sys/pal/toyos/mod.rs").is_empty()
+        );
     }
 }
