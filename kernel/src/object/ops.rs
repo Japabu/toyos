@@ -291,7 +291,13 @@ fn read_file(file: &FileObject, buf: &mut UserBytesMut) -> Option<u64> {
 
 fn read_device(claim: &DeviceClaim, buf: &mut UserBytesMut) -> Option<u64> {
     /// The description a claim answers with once, before its stream starts.
+    ///
+    /// **Reading it is what grants the buffers it names.** A description is a
+    /// set of addresses, and the process being told them is the one that must
+    /// be able to map them — which is never the process that minted the claim,
+    /// because init mints every claim and holds none of them.
     fn describe(claim: &DeviceClaim, bytes: &[u8], buf: &mut UserBytesMut) -> u64 {
+        device_registry::grant_buffers(claim.info(), crate::process::current_process());
         let count = buf.len().min(bytes.len());
         buf.write_at(0, &bytes[..count]);
         claim.mark_info_read();

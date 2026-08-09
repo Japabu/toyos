@@ -19,7 +19,7 @@
 //! provide <name>            this program makes its own port, once per instance
 //! receive <name>            a connector in this program's namespace
 //! device <class>            a claim init mints and endows
-//! realtime                  init endows an RT-only SysCap dup
+//! syscap <right>            a right on the SysCap dup init endows
 //! init-serve <name>         a name init serves itself
 //! start <name>              init starts this program at boot
 //! ```
@@ -36,6 +36,42 @@ pub const GUEST_PATH: &str = "/etc/system.manifest";
 /// truncated into some other program's.
 pub const MAX_PROGRAM_NAME: usize = 32;
 
+pub use toyos_abi::handle::Rights;
+pub use toyos_abi::syscall::DeviceType;
+
+/// The rights a `syscap` record may name.
+///
+/// **A short list on purpose.** Every entry is a machine-wide authority that
+/// exists nowhere else, so a name added here is a decision — and a config that
+/// can write a name init cannot act on is what this being the only spelling
+/// prevents.
+///
+/// `TRANSFER` is not nameable and is always added: init endows the duplicate,
+/// and endowing is a transfer, so a cap without it could not reach the program
+/// the config is talking about at all.
+const SYSCAP_RIGHTS: &[(&str, Rights)] = &[
+    ("rt", Rights::RT),
+    ("device", Rights::DEVICE),
+    // Not an authority over the machine but over the *capability*: it says out
+    // loud that this program hands the cap on to its own children. The test
+    // estate is its one holder — one boot runs several binaries that each need
+    // the keyboard, and a claim moves.
+    ("dup", Rights::DUP),
+];
+
+/// The whole right set a program's `syscap` list asks for.
+pub fn syscap_rights(names: &[String]) -> Result<Rights, String> {
+    let mut rights = Rights::TRANSFER;
+    for name in names {
+        let (_, right) = SYSCAP_RIGHTS
+            .iter()
+            .find(|(n, _)| n == name)
+            .ok_or_else(|| format!("`{name}` is not a syscap right"))?;
+        rights = rights.union(*right);
+    }
+    Ok(rights)
+}
+
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Program {
     pub name: String,
@@ -49,7 +85,10 @@ pub struct Program {
     /// Names in this program's namespace, each a connector.
     pub receives: Vec<String>,
     pub devices: Vec<String>,
-    pub realtime: bool,
+    /// Rights on the `SysCap` duplicate init endows this program, by the names
+    /// [`syscap_rights`] takes. Empty for all but two programs: nothing else in
+    /// the system may enter the RT band or mint a device claim.
+    pub syscap: Vec<String>,
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -118,20 +157,19 @@ pub fn render(manifest: &Manifest) -> Result<Vec<u8>, RenderError> {
             ("provides", &program.provides),
             ("receives", &program.receives),
             ("devices", &program.devices),
+            ("syscap", &program.syscap),
         ] {
             let word = match field {
                 "serves" => "serve",
                 "provides" => "provide",
                 "receives" => "receive",
-                _ => "device",
+                "devices" => "device",
+                _ => "syscap",
             };
             for value in values {
                 check(&program.name, field, value)?;
                 out.push_str(&format!("{word} {value}\n"));
             }
-        }
-        if program.realtime {
-            out.push_str("realtime\n");
         }
     }
     for name in &manifest.init_serves {
@@ -209,7 +247,7 @@ pub fn parse(text: &str) -> Manifest {
                     "provide" => program.provides.push(rest.to_string()),
                     "receive" => program.receives.push(rest.to_string()),
                     "device" => program.devices.push(rest.to_string()),
-                    "realtime" => program.realtime = true,
+                    "syscap" => program.syscap.push(rest.to_string()),
                     other => panic!("manifest: unknown record `{other}`"),
                 }
             }
@@ -238,7 +276,7 @@ mod tests {
                     path: "/bin/soundd".into(),
                     serves: vec!["soundd".into()],
                     devices: vec!["hda-audio".into(), "virtio-sound".into()],
-                    realtime: true,
+                    syscap: vec!["rt".into()],
                     ..Program::default()
                 },
                 Program {
@@ -271,12 +309,12 @@ mod tests {
     #[test]
     fn records_attach_to_the_program_above_them() {
         let m = parse(
-            "program soundd /bin/soundd\nserve soundd\nrealtime\n\
+            "program soundd /bin/soundd\nserve soundd\nsyscap rt\n\
              program toybox /bin/toybox\narg pwd\nreceive compositor\n\
              init-serve launcher\nstart soundd\n",
         );
-        assert!(m.program("soundd").unwrap().realtime);
-        assert!(!m.program("toybox").unwrap().realtime);
+        assert_eq!(m.program("soundd").unwrap().syscap, ["rt"]);
+        assert!(m.program("toybox").unwrap().syscap.is_empty());
         assert_eq!(m.program("toybox").unwrap().args, ["pwd"]);
         assert_eq!(m.served_names(), ["soundd"]);
     }
@@ -296,5 +334,28 @@ mod tests {
         let mut newline = sample();
         newline.programs[2].args = vec!["a\nb".into()];
         assert!(matches!(render(&newline), Err(RenderError::Unrepresentable { .. })));
+    }
+
+    /// `TRANSFER` is in every set and is nameable in none: init endows the
+    /// duplicate, so a set without it names a capability that cannot reach the
+    /// program the config is about.
+    #[test]
+    fn a_syscap_set_always_carries_transfer_and_never_an_invented_right() {
+        assert_eq!(syscap_rights(&[]).unwrap(), Rights::TRANSFER);
+        assert_eq!(
+            syscap_rights(&["device".into(), "dup".into()]).unwrap(),
+            Rights::TRANSFER.union(Rights::DEVICE).union(Rights::DUP)
+        );
+        assert!(syscap_rights(&["transfer".into()]).is_err());
+        assert!(syscap_rights(&["root".into()]).is_err());
+    }
+
+    /// A class name reaches init through this file, so a `devices` entry the
+    /// ABI does not know is a config that renders and cannot boot.
+    #[test]
+    fn a_device_class_name_is_the_abi_s() {
+        assert_eq!(DeviceType::from_class_name("hda-audio"), Some(DeviceType::HdaAudio));
+        assert_eq!(DeviceType::HdaAudio.class_name(), "hda-audio");
+        assert_eq!(DeviceType::from_class_name("hda_audio"), None);
     }
 }

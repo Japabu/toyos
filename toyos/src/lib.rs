@@ -75,22 +75,11 @@ impl Drop for OwnedHandle {
     }
 }
 
-/// A service listener.
+/// A claimed hardware device, out of this process's endowment table.
 ///
-/// **Transitional.** `surface` is the one thing still holding one and chunk 5
-/// moves it onto a [`port::Acceptor`]; nothing creates a `Listener` any more,
-/// because there is no global name registry to register in.
-pub struct Listener(pub(crate) OwnedHandle);
-
-impl Listener {
-    pub fn fd(&self) -> RawHandle { self.0.fd() }
-}
-
-impl AsHandle for Listener {
-    fn as_handle(&self) -> RawHandle { self.0.fd() }
-}
-
-/// A claimed hardware device. Created by [`device::open_keyboard`] etc.
+/// There is no `open`: `/bin/init` mints every claim from the machine's one
+/// system capability and endows it, so which process drives a device is a fact
+/// the image was built with. See [`endow::device`].
 pub struct Device(pub(crate) OwnedHandle);
 
 impl Device {

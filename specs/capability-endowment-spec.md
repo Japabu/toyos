@@ -2106,6 +2106,91 @@ become three variants.
 *Gate: full suite including all six desktop boots; gate A fast tier; a
 same-session A/B of the thorough tier against `main`.*
 
+**Done, 2026-08-09.** The nine `services::` sites, the surface chain and the
+test estate's eleven, plus seven things the plan did not have — five of them
+because init minting every claim changes more than the daemons' first three
+lines.
+
+- **`SYS_OPEN_DEVICE` and `SYS_SET_RT_PRIORITY` are retired here, and so are
+  the seven pid-keyed device syscalls' gates** (§3.3's nine, less the two
+  register calls chunk 2 already moved onto a handle). The moment init mints a
+  claim and endows it, `device::is_owner(class, current_pid)` is init's pid and
+  no daemon can present the display or the NIC ring. `SYS_GPU_PRESENT`'s
+  rectangle no longer fits beside the handle in four argument words, so it is
+  two packed pairs — a wire encoding decoded at the boundary and carried no
+  further. `device::is_owner` and the six `Option<Pid>` statics are gone; what
+  is left is one `bool` per class, which is all exclusivity ever needed.
+- **A device's shared buffers are granted where the description is read, not
+  where the claim is minted.** `try_claim` granted the scanout and DMA tokens to
+  the claiming pid, which is now always init's — so every claimant read an
+  address it was not allowed to map. `DeviceInfo` names its own tokens and
+  `describe` grants them to the reader; a claim admits one handle, so at most
+  one process can be that reader.
+- **`realtime = true` became `syscap = [..]`, and the test estate is why.** A
+  bool that can only ever say one thing was already the general mechanism
+  wearing one name; the general form is what lets `test-runner` hold
+  `["device", "dup"]`. It has to: five guest binaries claim the keyboard or the
+  mouse, they are not `[programs]` keys so no manifest row can name them, and a
+  claim *moves* — one boot runs `test_rs_i8042_keyboard` twice. So test-runner
+  duplicates a `DEVICE|DUP` cap into every binary it spawns, which is §6.7a's
+  "a test binary holds what test-runner holds" spelled with a capability
+  instead of a namespace. `TRANSFER` is in every set and nameable in none:
+  endowing *is* transferring, and chunk 4's `narrowed(Rights::RT)` would have
+  refused soundd's spawn outright — a latent bug no boot had reached.
+- **`Command` inherits the caller's namespace by default**, duplicated rather
+  than moved, unless the caller endowed `svc` itself. That is §4.5's clause 3
+  and §6.6's "namespace inheritance", and it is what makes §6.7a work without
+  test-runner naming a handle at all.
+- **soundd's signal pipe changed direction, and it is a simplification.** The
+  client makes the pipe and names it in `MSG_STREAM_OPEN`; soundd opens the
+  write end. It has to travel that way: a pipe id is openable by a *peer of its
+  creator*, and chunk 3 stopped recording a peer on the client's end of a
+  connection — so a client can no longer open soundd's pipes, while soundd can
+  still open a client's. The old order needed soundd to hold a read end of its
+  own until the client proved it had one, and §5.7's crash detection could not
+  fire inside that window; there is no window now, and `signal_read_fd` is
+  deleted.
+- **`pipe_peer_scope` is deleted, and it is the ending that test was written
+  for.** It asserted `be604ef`'s residual — a peer that only ever connected
+  could open any pipe the creator ever made — and carried the message saying to
+  delete it when the residual closed. Chunk 3 closed it: a client's connection
+  records no peer. `specs/spec-staleness-sweep.md` §"The inverse" is updated to
+  say so rather than to keep pointing at a file that is gone.
+- **`abuse_listener_hijack`, `abuse_connect_flood`, `fd_lifetime`,
+  `window_refusal`, `device_claim_lifetime`, `abuse_gpu_resolution`,
+  `sched_stress` and `locale_gate` are rewritten here rather than in chunk 8**,
+  because each names a deleted API and the guest does not build until they do.
+  `window_refusal` is §6.7a's fake-server pattern: a port, a namespace, a child
+  spawned holding it, and the refusals served from the parent.
+
+**Three interim widenings, each declared in the config that carries it and each
+the launcher's to remove.** They exist because chunk 4 found the launcher needs
+handle transfer (chunk 6) *and* a `Process` handle to answer with (chunk 7), so
+between here and there a parent can hand a child only what the parent holds:
+
+1. `[programs.compositor] receives` names `compositor` in the four configs that
+   have one, so a terminal or a picker the compositor starts inherits a
+   compositor connector.
+2. `[programs.terminal] receives` names `soundd` in `tests/desktopaudiocase`,
+   so a shell-started `tone` reaches the mixer.
+3. `filepicker` is in production's `[boot] start`, because its acceptor is
+   init's to hand over and the compositor's `Command::new("/bin/filepicker")`
+   is deleted — without it an editor's `pick_file` would queue on a port nobody
+   accepts from and block forever.
+
+The terminal's `KEEP_FOR_SHELL` is the same fact from the other side and says so
+where it is.
+
+Two gates the chunk added: `every_declared_capability_is_one_the_abi_has`
+(`src/build.rs`, a `devices` class or a `syscap` right the ABI does not know is
+a red in milliseconds rather than an init that panics at boot), and
+`toyos-manifest`'s two round-trip cases for `syscap` and the class table.
+
+**And one thing to carry:** `/bin/init`'s and netd's diagnostic lines are one
+`write_all` each now, for soundd's reason — `netd: ready, at most ` and
+`init: started test-runner` interleaved on the console and
+`netd_connection_caps` parsed a cap out of the wrong number.
+
 **Chunk 6 — shm objects and handle transfer. Green.**
 `object/shm.rs`, `SYS_SHM_CREATE/MAP/UNMAP`, connection in-flight queues,
 `SYS_HANDLE_SEND`/`RECV` and connection readiness. soundd's `MSG_STREAM_OPENED`

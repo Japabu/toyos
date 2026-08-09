@@ -26,7 +26,8 @@ use std::io::{BufRead, BufReader};
 use std::os::toyos::process::CommandExt;
 use std::process::{exit, Command, Stdio};
 
-use toyos::{ipc, services, Connection};
+use toyos::endow;
+use toyos::{ipc, Connection};
 use toyos_abi::syscall::{self, SyscallError};
 use toyos_abi::RawHandle;
 use window::Window;
@@ -168,7 +169,7 @@ fn run() {
 /// belongs to is made at `connect`, and that is the only thing this role has
 /// to establish before dying.
 fn connect_and_go() {
-    let conn = services::connect("compositor").expect("the compositor is not serving");
+    let conn = endow::service("compositor").expect("the compositor is not serving");
     // The kernel clones the descriptor into the child's table
     // (`loader::build_child_fds`), so the socket — and the pipes under it —
     // outlive this process.
@@ -204,7 +205,7 @@ fn create_frame() -> Vec<u8> {
 }
 
 fn clipboard_shm(token: u32, len: u32, what: &str) {
-    let conn = services::connect("compositor")
+    let conn = endow::service("compositor")
         .unwrap_or_else(|e| fail(&format!("[{what}] the compositor is not serving: {e:?}")));
     conn.send(window::MSG_CLIPBOARD_SET_SHM, &window::ClipboardShmMsg { token, len })
         .unwrap_or_else(|e| fail(&format!("[{what}] could not send: {e:?}")));
@@ -224,7 +225,7 @@ fn write_raw_fd(fd: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
 
 /// Ask the compositor something it always answers, and give it a deadline.
 fn probe(what: &str) {
-    let conn: Connection = services::connect("compositor")
+    let conn: Connection = endow::service("compositor")
         .unwrap_or_else(|e| fail(&format!("[{what}] the compositor is not serving: {e:?}")));
     if let Err(e) = ipc::signal(conn.fd(), window::MSG_GET_RESOLUTION) {
         fail(&format!("[{what}] could not ask the compositor for its resolution: {e:?}"));

@@ -19,7 +19,8 @@ use std::process::exit;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use toyos::{ipc, services, Connection};
+use toyos::endow;
+use toyos::{ipc, Connection};
 use toyos_abi::syscall::{self, SyscallError};
 use window::Window;
 
@@ -142,7 +143,7 @@ fn header(msg_type: u32, len: u32) -> [u8; 8] {
 }
 
 fn connect(what: &str) -> Connection {
-    services::connect("compositor")
+    endow::service("compositor")
         .unwrap_or_else(|e| fail(&format!("[{what}] the compositor is not serving: {e:?}")))
 }
 

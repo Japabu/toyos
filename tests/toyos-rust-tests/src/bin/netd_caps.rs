@@ -34,6 +34,32 @@ const TIMEOUT_MS: u32 = 4000;
 /// the boundary, and every request costs netd an IPC connection.
 const MARGIN: usize = 4;
 
+/// How many times one connect may be refused by the *kernel* before this gives
+/// up on it.
+///
+/// **A count of attempts, not a span of time**, and it is measuring something
+/// other than netd's cap: the port's queue holds `MAX_PENDING_CONNECTIONS`
+/// connections netd has not accepted yet, and a burst issued as fast as a
+/// single-threaded client can issue it outruns one accept per event-loop pass.
+/// That is backpressure from the kernel and is retryable against the same peer;
+/// netd's own cap is the `ResourceExhausted` in a *response*, which is what
+/// this file is about and what it must not be confused with.
+///
+/// The retry used to be invisible: `NetdConn::connect_blocking` spun a hundred
+/// times at ten milliseconds over any error at all, so this test never saw the
+/// queue at the same time as it never saw a boot race. That loop is deleted
+/// because a boot race is unrepresentable now; this is the part of it that was
+/// doing a different job.
+const CONNECT_ATTEMPTS: usize = 200;
+
+/// One netd event-loop pass, which is what an attempt is waiting for.
+///
+/// netd polls at 1 ms while it holds piped connections and accepts one
+/// connection per pass, so this paces the client to the rate the queue drains
+/// at. **The bound is [`CONNECT_ATTEMPTS`], not this** — a slow host makes the
+/// attempts cheaper, never fewer.
+const PASS_NANOS: u64 = 1_000_000;
+
 fn main() {
     let announced: usize = std::env::args()
         .nth(1)
@@ -60,8 +86,7 @@ fn main() {
 
     let mut sent: Vec<PendingResponse> = Vec::with_capacity(burst);
     for i in 0..burst {
-        let conn = NetdConn::connect()
-            .unwrap_or_else(|e| panic!("request {i}: could not reach netd: {e:?}"));
+        let conn = connect_past_the_queue(i);
         sent.push(
             conn.request(MsgType::TcpConnectPiped, &request)
                 .unwrap_or_else(|e| panic!("request {i}: netd would not take it: {e:?}")),
@@ -126,4 +151,26 @@ fn summarise(outcomes: &[Option<NetError>]) -> String {
         }
     }
     kinds.join(", ")
+}
+
+/// One connection, retrying only the kernel's queue-full answer.
+///
+/// Every other refusal ends the test where it happens: "netd is not reachable"
+/// and "netd has not drained its accept queue yet" are different facts and only
+/// the second one is worth another attempt.
+fn connect_past_the_queue(request: usize) -> NetdConn {
+    for attempt in 0..CONNECT_ATTEMPTS {
+        match NetdConn::connect() {
+            Ok(conn) => return conn,
+            Err(NetError::ResourceExhausted) => {
+                let _ = attempt;
+                syscall::nanosleep(PASS_NANOS);
+            }
+            Err(e) => panic!("request {request}: could not reach netd: {e:?}"),
+        }
+    }
+    panic!(
+        "request {request}: the port queue stayed full for {CONNECT_ATTEMPTS} attempts — \
+         netd is not accepting"
+    )
 }

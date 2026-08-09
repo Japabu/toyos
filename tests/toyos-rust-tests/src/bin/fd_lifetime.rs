@@ -1,12 +1,18 @@
-//! What a descriptor holds is released when the *last* descriptor goes, and no
-//! sooner — on `close` and on being killed alike.
+//! What a handle holds is released when the *last* handle goes, and no sooner —
+//! on `close` and on being killed alike.
 //!
 //! `Descriptor::clone` used to copy a `ListenerId` and a `RingId` as bare
 //! numbers while `close` unregistered the service and destroyed the ring
 //! unconditionally, so `dup` and then closing either fd took the object out
 //! from under the survivor. A file was already refcounted; it is here because
-//! the four kinds are one property, and a test covering three of them says
-//! nothing about the fourth.
+//! the kinds are one property, and a test covering three of them says nothing
+//! about the fourth.
+//!
+//! **The service half is now a port**, and its witness is better for it: there
+//! is no name to ask about, so what says the acceptor is alive is that a client
+//! connecting through the connector is accepted, and what says it is gone is
+//! that the next open answers [`SyscallError::Gone`] — the kernel's own record
+//! of a server that has left, rather than a name nobody re-took.
 //!
 //! The kill half is why this is a guest test and not a host one. This kernel
 //! does not unwind, so a `Drop` reached only by an orderly `close` would be
@@ -17,13 +23,16 @@
 //! what it can about it, and waits to be killed.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::toyos::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
 
-use toyos_abi::syscall::{self, OpenFlags, SeekFrom, SyscallError};
+use toyos::{namespace, port, AsHandle};
+use toyos_abi::syscall::{self, OpenFlags, SeekFrom, SyscallError, SERVE_PREFIX};
 
 const SELF_PATH: &str = "/bin/test_rs_fd_lifetime";
+/// The name this test's own namespaces map to the port under test. Private to
+/// this process and its children, which is the whole of what a namespace is.
 const SERVICE: &str = "fd-lifetime-service";
-const KILLED_SERVICE: &str = "fd-lifetime-killed-service";
 const PATH: &[u8] = b"/tmp/fd-lifetime.txt";
 const KILLED_PATH: &[u8] = b"/home/fd-lifetime-killed.txt";
 const PAYLOAD: &[u8] = b"a file outlives the fd that was closed first";
@@ -40,14 +49,14 @@ fn main() {
 
 fn test() {
     file_survives_one_close();
-    listener_survives_one_close();
+    acceptor_survives_one_close();
     ring_survives_one_close();
 
-    kill_releases_listener();
+    kill_releases_acceptor();
     kill_releases_ring();
     kill_flushes_file();
 
-    println!("file, listener and ring each outlive the first close and are released by kill");
+    println!("file, acceptor and ring each outlive the first close and are released by kill");
 }
 
 fn file_survives_one_close() {
@@ -66,30 +75,30 @@ fn file_survives_one_close() {
     syscall::close(b);
 }
 
-fn listener_survives_one_close() {
-    let a = syscall::listen(SERVICE).expect("the service name must be free");
-    let b = syscall::dup(a).expect("dup a listener fd");
+fn acceptor_survives_one_close() {
+    let (acceptor, connector) = port::create().expect("a port of our own");
+    let ns = namespace::build().add(SERVICE, &connector).finish().expect("a namespace for it");
+
+    let a = acceptor.into_raw();
+    let b = syscall::dup(a).expect("dup an acceptor handle");
     syscall::close(a);
 
-    // The name is still bound: the descriptors hold it and one is left. A
-    // second `listen` succeeding here is the hijack window — it is what let a
-    // squatter hand the name to the real service while keeping a live fd on it.
-    match syscall::listen(SERVICE) {
-        Err(SyscallError::AlreadyExists) => {}
-        other => {
-            panic!("closing one of two listener fds unbound the name: second listen said {other:?}")
-        }
-    }
-
-    // And the survivor still serves.
-    let client = syscall::connect(SERVICE).expect("connect to the surviving listener");
-    let accepted = syscall::accept(b).expect("accept on the surviving listener");
+    // The survivor still serves: a client's connection is queued on the port
+    // and this handle takes it.
+    let client = syscall::namespace_open(ns.as_handle(), SERVICE)
+        .expect("open through the connector of a live port");
+    let accepted = syscall::accept(b).expect("accept on the surviving acceptor handle");
     syscall::close(accepted.fd);
     syscall::close(client);
 
+    // And the last close is what closes the port. `Gone` and not `NotFound`:
+    // the name is still in the namespace, and it is the server that has left.
     syscall::close(b);
-    let again = syscall::listen(SERVICE).expect("the last close must free the name");
-    syscall::close(again);
+    assert_eq!(
+        syscall::namespace_open(ns.as_handle(), SERVICE).err(),
+        Some(SyscallError::Gone),
+        "the last close of an acceptor did not close the port"
+    );
 }
 
 fn ring_survives_one_close() {
@@ -112,12 +121,25 @@ fn ring_survives_one_close() {
     );
 }
 
-fn kill_releases_listener() {
-    let (mut child, _) = spawn_holder("listener");
+/// The acceptor is *endowed* to the holder, which is the only way one changes
+/// hands — so this process keeps the connector and watches the port from the
+/// client's side while the holder is killed.
+fn kill_releases_acceptor() {
+    let (acceptor, connector) = port::create().expect("a port for the holder");
+    let ns = namespace::build().add(SERVICE, &connector).finish().expect("a namespace for it");
+    assert!(
+        syscall::namespace_open(ns.as_handle(), SERVICE).is_ok(),
+        "the port was not live before its holder was killed"
+    );
+
+    let mut child = spawn_holder_endowed("acceptor", &acceptor.into_raw()).0;
     kill_and_reap(&mut child);
-    let fd = syscall::listen(KILLED_SERVICE)
-        .expect("a killed process did not give its service name back");
-    syscall::close(fd);
+
+    assert_eq!(
+        syscall::namespace_open(ns.as_handle(), SERVICE).err(),
+        Some(SyscallError::Gone),
+        "a killed process did not give its acceptor back"
+    );
 }
 
 /// The ring's release is visible through its shared-memory token: the region
@@ -163,7 +185,19 @@ fn kill_flushes_file() {
 }
 
 fn spawn_holder(kind: &str) -> (Child, BufReader<ChildStdout>) {
-    let mut child = Command::new(SELF_PATH)
+    spawn_with(kind, Command::new(SELF_PATH))
+}
+
+/// The same, with an acceptor moved into the child under the label
+/// `endow::acceptor` looks up.
+fn spawn_holder_endowed(kind: &str, acceptor: &toyos_abi::RawHandle) -> (Child, BufReader<ChildStdout>) {
+    let mut command = Command::new(SELF_PATH);
+    command.endow(&format!("{SERVE_PREFIX}{SERVICE}"), acceptor.0);
+    spawn_with(kind, command)
+}
+
+fn spawn_with(kind: &str, mut command: Command) -> (Child, BufReader<ChildStdout>) {
+    let mut child = command
         .arg("holder")
         .arg(kind)
         .stdout(Stdio::piped())
@@ -184,8 +218,12 @@ fn kill_and_reap(child: &mut Child) {
 
 fn holder(kind: &str) {
     match kind {
-        "listener" => {
-            syscall::listen(KILLED_SERVICE).expect("holder: listen");
+        "acceptor" => {
+            let acceptor =
+                toyos::endow::acceptor(SERVICE).expect("holder: the acceptor it was endowed");
+            // Held for the process's life. Nothing accepts from it: the point
+            // is what the *kill* does to it.
+            core::mem::forget(acceptor);
             println!("held");
         }
         "ring" => {

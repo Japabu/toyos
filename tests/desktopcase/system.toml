@@ -17,9 +17,14 @@ assets = ["assets"]
 [boot]
 start = ["compositor", "terminal"]
 
+# `compositor` in its own `receives` is **interim**: a terminal or a picker the
+# compositor starts inherits the compositor's namespace, and until the launcher
+# can build a child's authority from that child's own manifest row there is no
+# other way for a compositor-started window client to hold a compositor
+# connector. It comes out with the launcher.
 [programs.compositor]
 serves = ["compositor"]
-receives = ["launcher"]
+receives = ["compositor", "launcher"]
 devices = ["framebuffer", "keyboard", "mouse"]
 
 [programs.terminal]

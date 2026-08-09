@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use toyos_abi::handle::HANDLE_INVALID;
 use toyos_abi::syscall::{
-    self, SyscallError, MAX_ENDOWMENTS, MAX_LABELS_LEN,
+    self, DeviceType, SyscallError, MAX_ENDOWMENTS, MAX_LABELS_LEN,
 };
 
 use crate::ipc::Connection;
@@ -166,10 +166,13 @@ pub fn acceptor(name: &str) -> Option<Acceptor> {
 
 /// The claim for a device class the manifest says this program gets.
 ///
-/// `None` is a machine that had no such device when init asked — the honest
-/// answer, and the one soundd degrades on.
-pub fn device<T: FromHandle>(class: &str) -> Option<T> {
-    with_prefixed(DEV_PREFIX, class, |label| Endowments::get().take::<T>(label))
+/// `None` is a machine that had no such device when init asked, or a program
+/// the manifest gives none — the honest answer, and the one soundd degrades
+/// on. It replaces a two-syscall probe: "did I get an HDA or a virtio-sound?"
+/// is now "which claims are in my endowment table?", which is the same question
+/// with the answer already in hand.
+pub fn device<T: FromHandle>(class: DeviceType) -> Option<T> {
+    with_prefixed(DEV_PREFIX, class.class_name(), |label| Endowments::get().take::<T>(label))
 }
 
 /// Compose `<prefix><name>` on the stack. Nothing in the SDK allocates, and a

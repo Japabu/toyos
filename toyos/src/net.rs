@@ -266,10 +266,25 @@ impl NetdConn {
     /// **There was a retry loop here and it is gone.** It spun a hundred times
     /// at ten milliseconds waiting for a name to appear in a global registry;
     /// a `netd` connector is live from this process's first instruction, so
-    /// there is nothing to wait for and `NetdNotFound` now means the manifest
-    /// did not give this program netd.
+    /// there is nothing to wait for.
+    ///
+    /// [`NetError::ResourceExhausted`] is a separate answer and a retryable
+    /// one: it is the *kernel's* port queue full of connections netd has not
+    /// accepted yet, which is backpressure and not a limit netd chose. The
+    /// retry loop used to hide it — it retried every error alike — and
+    /// collapsing it into `NetdNotFound` would leave a caller told the machine
+    /// has no network because a burst outran one accept loop.
     pub fn connect() -> Result<Self, NetError> {
-        crate::endow::service("netd").map(Self).map_err(|_| NetError::NetdNotFound)
+        crate::endow::service("netd").map(Self).map_err(|e| match e {
+            // Both are "there is no netd to reach from here": one because the
+            // manifest gave this program none, one because it has exited.
+            crate::endow::EndowError::NotEndowed
+            | crate::endow::EndowError::ServerGone => NetError::NetdNotFound,
+            crate::endow::EndowError::Refused(
+                toyos_abi::syscall::SyscallError::ResourceExhausted,
+            ) => NetError::ResourceExhausted,
+            crate::endow::EndowError::Refused(_) => NetError::Io,
+        })
     }
 
     pub fn request<Req: IpcPayload>(self, msg_type: MsgType, payload: &Req) -> Result<PendingResponse, NetError> {

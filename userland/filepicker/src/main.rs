@@ -2,7 +2,7 @@ use filepicker_api::{PickerMode, MSG_FILEPICKER_REQUEST, MSG_FILEPICKER_RESULT};
 use font::Font;
 use std::fs;
 use toyos::Connection;
-use toyos::services;
+use toyos::endow;
 use std::path::{Path, PathBuf};
 use window::{Color, Event, Framebuffer, KeyPress, MouseEvent, Window};
 
@@ -460,10 +460,15 @@ fn run_picker(mode: PickerMode, start_dir: &str, client: &Connection) {
 // --- Main daemon loop ---
 
 fn main() {
-    let listener = services::listen("filepicker").expect("filepicker: name already taken");
+    // A statement about the manifest the image was built from, not a race: the
+    // `filepicker` port exists before any process does, so an editor holding
+    // its connector can ask for a file before this program has run an
+    // instruction.
+    let acceptor = endow::acceptor("filepicker")
+        .expect("the manifest declares this program serves `filepicker`");
 
     loop {
-        let conn = services::accept(&listener).expect("accept failed");
+        let conn = acceptor.accept().expect("accept failed");
         let Ok(header) = conn.conn.recv_header() else {
             continue;
         };

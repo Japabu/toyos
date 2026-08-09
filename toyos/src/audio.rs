@@ -18,6 +18,12 @@ pub const FORMAT_S16LE: u16 = 0;
 
 crate::ipc_payload! {
     pub struct StreamOpenRequest {
+        /// The read end of a pipe **this client made**, for soundd to signal
+        /// on. It travels this way round because a pipe id is only openable by
+        /// a peer of the pipe's creator: soundd holds a connection whose peer
+        /// is this client, and a client holds no such fact about soundd.
+        /// Chunk 6 deletes ids entirely and sends the end itself.
+        pub signal_pipe_id: u64,
         pub sample_rate: u32,
         pub channels: u16,
         pub format: u16,
@@ -25,11 +31,6 @@ crate::ipc_payload! {
 
     pub struct StreamOpenResponse {
         pub shm_token: u32,
-        /// The compiler reserved these bytes to align `signal_pipe_id`; naming
-        /// them is what stops soundd's struct literal from sending whatever
-        /// its stack held to every audio client.
-        pub _pad0: u32,
-        pub signal_pipe_id: u64,
         pub client_period_frames: u32,
         pub client_period_bytes: u32,
         pub device_sample_rate: u32,
@@ -188,7 +189,31 @@ impl AudioStream {
     pub fn open(sample_rate: u32, channels: u16, format: u16) -> Result<Self, AudioError> {
         let control = Self::connect_soundd()?;
 
-        let req = StreamOpenRequest { sample_rate, channels, format };
+        // Made here, before the request that names it: soundd opens the write
+        // end by the id the request carries.
+        let signal = syscall::pipe().map_err(|e| AudioError::Ipc(IpcError::Syscall(e)))?;
+        match Self::negotiate(control, &signal, sample_rate, channels, format) {
+            Ok(stream) => Ok(stream),
+            Err(e) => {
+                // An open that failed leaves this process holding both ends of
+                // a pipe nobody will ever signal on.
+                syscall::close(signal.read);
+                syscall::close(signal.write);
+                Err(e)
+            }
+        }
+    }
+
+    fn negotiate(
+        control: crate::Connection,
+        signal: &toyos_abi::syscall::PipeFds,
+        sample_rate: u32,
+        channels: u16,
+        format: u16,
+    ) -> Result<Self, AudioError> {
+        let signal_pipe_id = syscall::pipe_id(signal.read)
+            .map_err(|e| AudioError::Ipc(IpcError::Syscall(e)))?;
+        let req = StreamOpenRequest { signal_pipe_id, sample_rate, channels, format };
         control.send(MSG_STREAM_OPEN, &req).map_err(AudioError::Ipc)?;
 
         let header = control.recv_header().map_err(AudioError::Ipc)?;
@@ -206,13 +231,13 @@ impl AudioStream {
             .map_err(|e| AudioError::Ipc(IpcError::Syscall(e)))?;
         let slot_writer = AudioSlotWriter::new(shm, resp.client_period_bytes, slot_count);
 
-        let signal_fd = syscall::pipe_open(resp.signal_pipe_id, 0)
-            .map_err(|e| AudioError::Ipc(IpcError::Syscall(e)))?;
+        // The write end is soundd's now; this process reads and nothing else.
+        syscall::close(signal.write);
 
         Ok(Self {
             control,
             slot_writer,
-            signal_fd,
+            signal_fd: signal.read,
             period_frames: resp.client_period_frames,
             device_sample_rate: resp.device_sample_rate,
             device_channels: resp.device_channels,

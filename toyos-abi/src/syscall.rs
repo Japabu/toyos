@@ -22,8 +22,11 @@ pub const SYS_PIPE: u64 = 24;
 pub const SYS_SPAWN: u64 = 25;
 pub const SYS_WAITPID: u64 = 26;
 pub const SYS_MARK_TTY: u64 = 28;
-// Syscall numbers 29-30 unused (formerly SYS_SEND_MSG/SYS_RECV_MSG).
-pub const SYS_OPEN_DEVICE: u64 = 31;
+// Syscall numbers 29-31 unused (formerly SYS_SEND_MSG/SYS_RECV_MSG and
+// SYS_OPEN_DEVICE: first-come claiming, where whoever asked first got the
+// device. Arbitration is the manifest now — init mints every claim from a
+// `SysCap` and endows it, so who holds a device is a fact the image was built
+// with rather than a race).
 // Syscall numbers 32-33 unused (formerly SYS_REGISTER_NAME/SYS_FIND_PID).
 // Syscall number 34 unused (formerly SYS_SET_SCREEN_SIZE).
 pub const SYS_GPU_PRESENT: u64 = 35;
@@ -99,7 +102,9 @@ pub const SYS_DEBUG: u64 = 92;
 pub const SYS_SCHED_INFO: u64 = 93;
 pub const SYS_PROCESS_STATS: u64 = 94;
 pub const SYS_SET_THREAD_NAME: u64 = 95;
-pub const SYS_SET_RT_PRIORITY: u64 = 96;
+// Syscall number 96 unused (formerly SYS_SET_RT_PRIORITY: gated on holding a
+// sound-device claim, and a claim is not a privilege. [`SYS_RT_ENTER`] is the
+// privilege that gate was standing in for).
 /// Read one register of a claimed device. See [`device_reg_read`].
 pub const SYS_DEVICE_REG_READ: u64 = 97;
 /// Write one register of a claimed device. See [`device_reg_write`].
@@ -721,22 +726,31 @@ pub fn clock_epoch() -> Option<u64> {
     check(syscall(SYS_CLOCK_EPOCH, 0, 0, 0, 0)).ok()
 }
 
-/// Transfer a region of the framebuffer to the GPU and flush it.
-/// Pass (0, 0, 0, 0) to flush the full screen.
+/// Two `u32`s in one argument word.
 ///
-/// Fallible: the kernel refuses a caller that does not own the display.
-pub fn gpu_present(x: u32, y: u32, w: u32, h: u32) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GPU_PRESENT, x as u64, y as u64, w as u64, h as u64))
+/// The four device calls below take the claim handle that authorizes them, and
+/// `SYS_GPU_PRESENT`'s rectangle then does not fit in what is left. A pair is a
+/// wire encoding decoded at the kernel boundary and carried no further.
+const fn pair(hi: u32, lo: u32) -> u64 {
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// Transfer a region of the framebuffer to the GPU and flush it, presenting the
+/// framebuffer claim. Pass (0, 0, 0, 0) to flush the full screen.
+///
+/// Fallible: the kernel refuses a handle that is not a live framebuffer claim.
+pub fn gpu_present(claim: RawHandle, x: u32, y: u32, w: u32, h: u32) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GPU_PRESENT, claim.0 as u64, pair(x, y), pair(w, h), 0))
 }
 
 /// Upload the cursor image from backing and enable hardware cursor.
-pub fn gpu_set_cursor(hot_x: u32, hot_y: u32) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GPU_SET_CURSOR, hot_x as u64, hot_y as u64, 0, 0))
+pub fn gpu_set_cursor(claim: RawHandle, hot_x: u32, hot_y: u32) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GPU_SET_CURSOR, claim.0 as u64, hot_x as u64, hot_y as u64, 0))
 }
 
 /// Move the hardware cursor to screen position (x, y).
-pub fn gpu_move_cursor(x: u32, y: u32) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GPU_MOVE_CURSOR, x as u64, y as u64, 0, 0))
+pub fn gpu_move_cursor(claim: RawHandle, x: u32, y: u32) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GPU_MOVE_CURSOR, claim.0 as u64, x as u64, y as u64, 0))
 }
 
 /// Request a GPU resolution change. On success, writes the new
@@ -745,8 +759,19 @@ pub fn gpu_move_cursor(x: u32, y: u32) -> Result<(), SyscallError> {
 /// # Safety
 /// `info_out` must point to a writable buffer of at least
 /// `size_of::<FramebufferInfo>()` bytes.
-pub unsafe fn gpu_set_resolution(width: u32, height: u32, info_out: *mut u8) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GPU_SET_RESOLUTION, width as u64, height as u64, info_out as u64, 0))
+pub unsafe fn gpu_set_resolution(
+    claim: RawHandle,
+    width: u32,
+    height: u32,
+    info_out: *mut u8,
+) -> Result<(), SyscallError> {
+    check_unit(syscall(
+        SYS_GPU_SET_RESOLUTION,
+        claim.0 as u64,
+        pair(width, height),
+        info_out as u64,
+        0,
+    ))
 }
 
 /// Shut down the machine. Does not return.
@@ -755,32 +780,63 @@ pub fn shutdown() -> ! {
     loop {}
 }
 
-/// Device types for [`open_device`].
-#[repr(u64)]
-#[derive(Debug, Clone, Copy)]
-pub enum DeviceType {
-    Keyboard = 0,
-    Mouse = 1,
-    Framebuffer = 2,
-    Nic = 3,
+/// The device classes, their wire numbers, and the name a `system.toml`
+/// `devices` entry and a `dev:` endowment label spell each one with.
+///
+/// **One row per class, so the four cannot disagree.** The build system checks
+/// a config against this table, `/bin/init` mints from it, and a claimant finds
+/// its own claim by it; a second spelling anywhere is a class a config can name
+/// and no program can find. The wire number is here too, because a class whose
+/// number and name came from different lists is the same defect one level down.
+macro_rules! device_classes {
+    ($($(#[$meta:meta])* $variant:ident = $num:literal => $name:literal),+ $(,)?) => {
+        #[repr(u64)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum DeviceType {
+            $($(#[$meta])* $variant = $num),+
+        }
+
+        impl DeviceType {
+            /// What a manifest calls this class.
+            pub fn class_name(self) -> &'static str {
+                match self { $(Self::$variant => $name),+ }
+            }
+
+            /// The class a config named, or `None` — a typo in a `devices`
+            /// list, refused where the image is built.
+            pub fn from_class_name(name: &str) -> Option<Self> {
+                match name { $($name => Some(Self::$variant),)+ _ => None }
+            }
+
+            /// The wire number a syscall carries, decoded once.
+            pub fn from_raw(raw: u64) -> Option<Self> {
+                match raw { $($num => Some(Self::$variant),)+ _ => None }
+            }
+
+            /// Every class, for a caller that must consider all of them.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+device_classes! {
+    Keyboard = 0 => "keyboard",
+    Mouse = 1 => "mouse",
+    Framebuffer = 2 => "framebuffer",
+    Nic = 3 => "nic",
     // 4 was `Audio`, a sound card the kernel drove on the claimant's behalf.
     // Retired with the syscall that fed it rather than reused for the stub that
-    // replaced it: the claim below authorizes register writes and answers no
-    // submit, so a caller that still names 4 has to be refused rather than
-    // handed a capability of a different shape.
+    // replaced it: the claim authorizes register writes and answers no submit,
+    // so a caller that still names 4 has to be refused rather than handed a
+    // capability of a different shape.
     /// An Intel HDA controller the kernel has brought up but drives no policy
     /// on.
-    HdaAudio = 5,
+    HdaAudio = 5 => "hda-audio",
     /// A virtio-sound device, on the same terms: the kernel negotiated its
     /// features, built its virtqueues and owns their descriptors, and every
     /// decision above that — the stream, the rate, the format, when a period is
     /// published — belongs to whoever holds this.
-    VirtioSound = 6,
-}
-
-/// Claim exclusive access to a device.
-pub fn open_device(device: DeviceType) -> Result<RawHandle, SyscallError> {
-    check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
+    VirtioSound = 6 => "virtio-sound",
 }
 
 /// Mint a device claim for `class`, presenting a `SysCap` handle that carries
@@ -1070,15 +1126,6 @@ pub fn nanosleep(nanos: u64) {
     syscall(SYS_NANOSLEEP, nanos, 0, 0, 0);
 }
 
-/// Set or clear real-time scheduling priority on the current thread.
-///
-/// `PermissionDenied` unless the caller holds the audio device claim. A caller
-/// that discards the result drops out of the RT band with no symptom beyond
-/// the glitches the band exists to prevent.
-pub fn set_rt_priority(enable: bool) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_SET_RT_PRIORITY, enable as u64, 0, 0, 0))
-}
-
 /// What [`SYS_HANDLE_DUP`]'s rights word carries when the caller wants the
 /// source's own set.
 ///
@@ -1281,29 +1328,30 @@ pub fn pipe_map(fd: RawHandle) -> Result<*mut u8, SyscallError> {
     check(syscall(SYS_PIPE_MAP, fd.0 as u64, 0, 0, 0)).map(|v| v as *mut u8)
 }
 
-/// Poll for a received frame. Returns `(buf_index << 16) | frame_len`, or 0 if none.
+/// Poll for a received frame, presenting the NIC claim. Returns
+/// `(buf_index << 16) | frame_len`, or 0 if none.
 ///
-/// Fallible: the kernel refuses a caller that does not own the NIC. The packed
-/// success value tops out at `(255 << 16) | 4096`, far below the range
+/// Fallible: the kernel refuses a handle that is not a live NIC claim. The
+/// packed success value tops out at `(255 << 16) | 4096`, far below the range
 /// `SyscallError::from_u64` claims, so nothing is ambiguous.
-pub fn nic_rx_poll() -> Result<u64, SyscallError> {
-    check(syscall(SYS_NIC_RX_POLL, 0, 0, 0, 0))
+pub fn nic_rx_poll(claim: RawHandle) -> Result<u64, SyscallError> {
+    check(syscall(SYS_NIC_RX_POLL, claim.0 as u64, 0, 0, 0))
 }
 
 /// Tell the kernel to refill RX buffer `buf_index` after consuming the frame.
 ///
 /// A dropped refill costs an RX slot permanently: 256 of them and the NIC
 /// stops receiving.
-pub fn nic_rx_done(buf_index: u64) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_NIC_RX_DONE, buf_index, 0, 0, 0))
+pub fn nic_rx_done(claim: RawHandle, buf_index: u64) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_NIC_RX_DONE, claim.0 as u64, buf_index, 0, 0))
 }
 
 /// Submit the TX DMA buffer to hardware. `total_len` includes the net header.
 ///
 /// A refused submit means the frame never goes out, which must not be
 /// indistinguishable from a delivered one.
-pub fn nic_tx(total_len: u64) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_NIC_TX, total_len, 0, 0, 0))
+pub fn nic_tx(claim: RawHandle, total_len: u64) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_NIC_TX, claim.0 as u64, total_len, 0, 0))
 }
 
 /// Allocate a TLS block for a dlopen'd module on the current thread.

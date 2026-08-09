@@ -9,13 +9,28 @@
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::toyos::process;
+use std::os::toyos::process::CommandExt;
 use std::process::Command;
 
 use terminal::Console;
+use toyos::namespace;
 use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::port;
 use toyos::surface::{self, Delivery, Host, Notice};
 use toyos::RawHandle;
 use window::Window;
+
+/// What a shell started here reaches, beyond the surface below.
+///
+/// **A list rather than "everything this terminal holds", and it is interim.**
+/// A shell's own authority is `[programs.shell]`'s `receives`, which only
+/// `/bin/init` can act on — and init cannot spawn this shell, because the
+/// `surface` connector is this terminal's and exists nowhere else. Until the
+/// launcher can be asked to start a program *with* a connector the caller
+/// supplies, a terminal can hand its shell only what it holds itself, so this
+/// is the union its children need. A name this terminal does not hold is simply
+/// absent from the result.
+const KEEP_FOR_SHELL: &[&str] = &["compositor", "soundd", "filepicker", "launcher"];
 
 const TOKEN_STDOUT: u64 = 0;
 const TOKEN_STDERR: u64 = 1;
@@ -37,20 +52,18 @@ fn present(console: &Console, window: &Window) {
 }
 
 fn main() {
-    let mut name = [0u8; surface::MAX_NAME];
-    let name = surface::service_name(std::process::id(), &mut name).to_string();
-    // The name is this process's pid, so nothing else can be holding it: a
-    // refusal here is the kernel's registry disagreeing with `getpid`.
-    let mut host = Host::listen(&name).expect("terminal: cannot serve its own surface name");
+    // **This terminal's surface is a port it makes, not a name it registers.**
+    // One per instance: the connector goes into the namespace of the shell it
+    // spawns and nowhere else, so nothing outside that subtree can reach this
+    // terminal's keyboard and nothing inside it can name a service this
+    // process was not given. `TOYOS_SURFACE` — an ambient string naming a
+    // machine-wide service — is what that replaces.
+    let (acceptor, connector) =
+        port::create().expect("terminal: the kernel refused a port of its own");
+    let mut host = Host::serve(acceptor);
 
     // Spawn shell first so it initializes while we load the font
-    let mut child = Command::new("/bin/shell")
-        .env(surface::HOST_ENV, &name)
-        .stdin(process::tty_piped())
-        .stdout(process::tty_piped())
-        .stderr(process::tty_piped())
-        .spawn()
-        .expect("failed to spawn shell");
+    let mut child = shell(&connector);
 
     let mut window = Window::create_with_title(0, 0, "Terminal").unwrap_or_else(|e| {
         eprintln!("terminal: {e}");
@@ -78,7 +91,7 @@ fn main() {
         poller.poll_add_fd(RawHandle(shell_stdout.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDOUT);
         poller.poll_add_fd(RawHandle(shell_stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
         poller.poll_add_fd(window.fd(), IORING_POLL_IN, TOKEN_WINDOW);
-        poller.poll_add_fd(host.listener_fd(), IORING_POLL_IN, TOKEN_LISTEN);
+        poller.poll_add_fd(host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
         for fd in host.client_fds() {
             poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
         }
@@ -137,7 +150,7 @@ fn main() {
                 window::Event::KeyInput(key) if key.gui() && key.keycode == 0x06 => {
                     // Cmd+C: copy selection to clipboard
                     if let Some(text) = console.get_selection() {
-                        window::clipboard_set(&text);
+                        window::clipboard_set(&text).ok();
                     }
                 }
                 window::Event::KeyInput(key) => {
@@ -164,7 +177,7 @@ fn main() {
                         }
                         window::MOUSE_RELEASE if ev.changed == 1 => {
                             if let Some(text) = console.mouse_up(col, row) {
-                                window::clipboard_set(&text);
+                                window::clipboard_set(&text).ok();
                             }
                             present(&console, &window);
                         }
@@ -193,4 +206,28 @@ fn main() {
     drop(shell_stdout);
     drop(shell_stderr);
     child.wait().ok();
+}
+
+/// Start the shell, holding this terminal's surface and nothing this process
+/// was not itself given.
+///
+/// The namespace is built rather than inherited: what a shell may reach is a
+/// decision, and the one thing this terminal has that init could not give it is
+/// the `surface` connector for the port above.
+fn shell(surface: &toyos::port::Connector) -> std::process::Child {
+    let child_ns = namespace::build()
+        .keep(
+            toyos::endow::namespace().expect("terminal: the manifest gives this program `receives`"),
+            KEEP_FOR_SHELL,
+        )
+        .add(surface::SERVICE, surface)
+        .finish()
+        .expect("terminal: the kernel refused a namespace for the shell");
+    Command::new("/bin/shell")
+        .endow(toyos::endow::SVC_LABEL, child_ns.into_raw().0)
+        .stdin(process::tty_piped())
+        .stdout(process::tty_piped())
+        .stderr(process::tty_piped())
+        .spawn()
+        .expect("failed to spawn shell")
 }

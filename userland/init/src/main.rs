@@ -10,6 +10,23 @@
 //! spawned, there is no instant at which a name is not bound yet, and there is
 //! nothing anywhere to retry.
 
+/// One line, one `write`.
+///
+/// **`eprintln!` is not one write.** Stderr is unbuffered by design, so
+/// `write_fmt` issues a syscall per format fragment, and on this machine the
+/// console and the kernel's log ring are one stream — so a daemon's own line
+/// lands inside init's. `netd: ready, at most ` and `init: started test-runner`
+/// arrived interleaved and the harness parsed a cap out of the wrong number.
+/// `userland/soundd` has the same macro for the same reason.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let mut line = format!($($arg)*);
+        line.push('\n');
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }};
+}
+
 use std::collections::BTreeMap;
 use std::os::toyos::process::CommandExt;
 use std::process::Command;
@@ -19,33 +36,11 @@ use toyos::endow::Endowments;
 use toyos::namespace::{self, Namespace};
 use toyos::port::{self, Acceptor, Connector};
 use toyos::syscap::SysCap;
-use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{DeviceType, DEV_PREFIX, SERVE_PREFIX, SVC_LABEL, SYSCAP_LABEL};
-
-/// The manifest's spelling of a device class, and the one the kernel takes.
-///
-/// One table, so a class named in a config that no driver has is a refusal
-/// here rather than a number invented at a call site.
-const DEVICE_CLASSES: &[(&str, DeviceType)] = &[
-    ("keyboard", DeviceType::Keyboard),
-    ("mouse", DeviceType::Mouse),
-    ("framebuffer", DeviceType::Framebuffer),
-    ("nic", DeviceType::Nic),
-    ("hda-audio", DeviceType::HdaAudio),
-    ("virtio-sound", DeviceType::VirtioSound),
-];
 
 /// The service init answers on. Its own, so it has no `[programs]` row and the
 /// manifest carries it as an `init-serve` record.
 const LAUNCHER: &str = "launcher";
-
-fn class_of(name: &str) -> DeviceType {
-    DEVICE_CLASSES
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, c)| *c)
-        .unwrap_or_else(|| panic!("init: `{name}` is not a device class"))
-}
 
 fn main() {
     let syscap: SysCap = Endowments::get()
@@ -92,7 +87,7 @@ fn main() {
             // handle transfer. Until that lands the connection is refused by
             // dropping it, which the client reads as a hang-up rather than as
             // a wait.
-            Ok(_) => eprintln!("init: launcher: no protocol yet, dropping a client"),
+            Ok(_) => say!("init: launcher: no protocol yet, dropping a client"),
             Err(e) => panic!("init: launcher acceptor refused: {e:?}"),
         }
     }
@@ -125,29 +120,38 @@ fn start(
     }
 
     for class in &program.devices {
+        let class = DeviceType::from_class_name(class)
+            .unwrap_or_else(|| panic!("init: `{class}` is not a device class"));
         // A class no driver registered is not endowed, and init says which:
         // "did I get an HDA or a virtio-sound?" becomes "which claims are in
         // my endowment table?", which is the same question with the answer
         // already in hand.
-        match syscap.claim(class_of(class)) {
+        match syscap.claim::<toyos::Device>(class) {
             Ok(claim) => {
-                command.endow(&format!("{DEV_PREFIX}{class}"), claim.into_raw().0);
+                command.endow(&format!("{DEV_PREFIX}{}", class.class_name()), claim.into_raw().0);
             }
-            Err(e) => eprintln!("init: {}: no {class} on this machine ({e:?})", program.name),
+            Err(e) => say!(
+                "init: {}: no {} on this machine ({e:?})",
+                program.name,
+                class.class_name()
+            ),
         }
     }
 
-    if program.realtime {
-        // A dup carrying `RT` and nothing else: soundd may enter the band and
-        // may not mint a claim, open a process, or hand either on.
-        let rt = syscap
-            .narrowed(Rights::RT)
-            .expect("init: the system capability refused an RT-only duplicate");
-        command.endow(SYSCAP_LABEL, rt.into_raw().0);
+    if !program.syscap.is_empty() {
+        // A duplicate carrying exactly what the manifest asked for and nothing
+        // else. Rights only shrink, so soundd's `rt` cap can never mint a claim
+        // or open a process however it asks.
+        let rights = toyos_manifest::syscap_rights(&program.syscap)
+            .unwrap_or_else(|e| panic!("init: {}: {e}", program.name));
+        let narrowed = syscap
+            .narrowed(rights)
+            .expect("init: the system capability refused a narrowed duplicate");
+        command.endow(SYSCAP_LABEL, narrowed.into_raw().0);
     }
 
     match command.spawn() {
-        Ok(child) => eprintln!("init: started {} pid={}", program.name, child.id()),
+        Ok(child) => say!("init: started {} pid={}", program.name, child.id()),
         Err(e) => panic!("init: cannot start {}: {e}", program.name),
     }
 }

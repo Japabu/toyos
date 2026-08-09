@@ -50,10 +50,12 @@ macro_rules! retired_syscalls {
 retired_syscalls! {
     29 => "SYS_SEND_MSG",
     30 => "SYS_RECV_MSG",
+    31 => "SYS_OPEN_DEVICE",
     32 => "SYS_REGISTER_NAME",
     33 => "SYS_FIND_PID",
     85 => "SYS_LISTEN",
     87 => "SYS_CONNECT",
+    96 => "SYS_SET_RT_PRIORITY",
 }
 
 /// `SYS_DEBUG` action 2's lock, and nothing else's.
@@ -362,18 +364,19 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         // both ends of a pair, so a right either end lacks would refuse one
         // of the two.
         SYS_MARK_TTY => with_object(RawHandle(a1 as u32), Rights::NONE, ops::mark_tty),
-        SYS_OPEN_DEVICE => sys_open_device(a1),
         // Display integrity, not memory access: framebuffer *contents* are
         // behind shared_memory grants either way. Ungated, any process could
         // scan out over the compositor's frames and move the cursor.
         SYS_GPU_PRESENT | SYS_GPU_SET_CURSOR | SYS_GPU_MOVE_CURSOR => {
-            if !device::is_owner(device::DeviceType::Framebuffer, process::current_process()) {
-                return SyscallError::PermissionDenied.to_u64();
+            if let Err(e) = holds_claim(RawHandle(a1 as u32), device::DeviceType::Framebuffer) {
+                return e.to_u64();
             }
+            let (hi2, lo2) = unpair(a2);
+            let (hi3, lo3) = unpair(a3);
             match num {
-                SYS_GPU_PRESENT => crate::gpu::present_rect(a1 as u32, a2 as u32, a3 as u32, a4 as u32),
-                SYS_GPU_SET_CURSOR => crate::gpu::set_cursor(a1 as u32, a2 as u32),
-                _ => crate::gpu::move_cursor(a1 as u32, a2 as u32),
+                SYS_GPU_PRESENT => crate::gpu::present_rect(hi2, lo2, hi3, lo3),
+                SYS_GPU_SET_CURSOR => crate::gpu::set_cursor(a2 as u32, a3 as u32),
+                _ => crate::gpu::move_cursor(a2 as u32, a3 as u32),
             }
             0
         }
@@ -498,12 +501,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_SOCKET_CREATE => sys_socket_create(a1, a2),
         SYS_PIPE_MAP => sys_pipe_map(RawHandle(a1 as u32)),
-        // Both address the NIC by ambient authority, so without this any
-        // process could pop frames out of the used ring before netd sees them
-        // and, by never refilling, exhaust all 256 RX slots.
+        // All three drive the NIC's rings, so without the claim any process
+        // could pop frames out of the used ring before netd sees them and, by
+        // never refilling, exhaust all 256 RX slots.
         SYS_NIC_RX_POLL => {
-            if !device::is_owner(device::DeviceType::Nic, process::current_process()) {
-                return SyscallError::PermissionDenied.to_u64();
+            if let Err(e) = holds_claim(RawHandle(a1 as u32), device::DeviceType::Nic) {
+                return e.to_u64();
             }
             match crate::net::poll_rx() {
                 Some((buf_idx, frame_len)) => ((buf_idx as u64) << 16) | (frame_len as u64),
@@ -511,16 +514,16 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             }
         }
         SYS_NIC_RX_DONE => {
-            if !device::is_owner(device::DeviceType::Nic, process::current_process()) {
-                return SyscallError::PermissionDenied.to_u64();
+            if let Err(e) = holds_claim(RawHandle(a1 as u32), device::DeviceType::Nic) {
+                return e.to_u64();
             }
-            crate::net::refill_rx_buf(a1 as usize).map_or_else(|e| e.to_u64(), |()| 0)
+            crate::net::refill_rx_buf(a2 as usize).map_or_else(|e| e.to_u64(), |()| 0)
         }
         SYS_NIC_TX => {
-            if !device::is_owner(device::DeviceType::Nic, process::current_process()) {
-                return SyscallError::PermissionDenied.to_u64();
+            if let Err(e) = holds_claim(RawHandle(a1 as u32), device::DeviceType::Nic) {
+                return e.to_u64();
             }
-            match crate::net::submit_tx(a1 as usize) {
+            match crate::net::submit_tx(a2 as usize) {
                 Ok(()) => 0,
                 Err(e) => e.to_u64(),
             }
@@ -536,17 +539,19 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_readlink(&path, &mut buf)
         }
         SYS_GPU_SET_RESOLUTION => {
-            // Checked before the driver, so a non-claimant never gets its two
-            // arbitrary u32s turned into a contiguous physical allocation.
+            // Checked before the driver, so a caller with no claim never gets
+            // its two arbitrary u32s turned into a contiguous physical
+            // allocation.
             let pid = process::current_process();
-            if !device::is_owner(device::DeviceType::Framebuffer, pid) {
-                return SyscallError::PermissionDenied.to_u64();
+            if let Err(e) = holds_claim(RawHandle(a1 as u32), device::DeviceType::Framebuffer) {
+                return e.to_u64();
             }
-            // Checked before the allocation for the same reason the ownership
-            // is: a caller that named an address the kernel will not write to
-            // must not be left with a resolution it is never told about.
+            // Checked before the allocation for the same reason the claim is: a
+            // caller that named an address the kernel will not write to must
+            // not be left with a resolution it is never told about.
             let Some(info_out) = UserAddr::checked(a3) else { return bad_addr };
-            match crate::gpu::set_resolution(a1 as u32, a2 as u32) {
+            let (width, height) = unpair(a2);
+            match crate::gpu::set_resolution(width, height) {
                 Ok(gpu_info) => {
                     let fb_info = toyos_abi::FramebufferInfo {
                         token: [gpu_info.tokens[0].raw(), gpu_info.tokens[1].raw()],
@@ -709,24 +714,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             process::set_current_thread_name(&name[..len]);
             0
         },
-        SYS_SET_RT_PRIORITY => {
-            // The RT band has no priority above it, so unbounded threads in it
-            // starve soundd's mix thread at its own level. Gated on the audio
-            // claim rather than in `scheduler::set_current_rt`, which must stay
-            // callable from kernel init.
-            //
-            // Exactly as strong as the claim and no stronger: `SYS_OPEN_DEVICE`
-            // is first-come and ungated, so whoever wins the race gets the RT
-            // band with it. Spec §9.4 wants a privilege; a claim is not one.
-            let me = process::current_process();
-            if !device::is_owner(device::DeviceType::VirtioSound, me)
-                && !device::is_owner(device::DeviceType::HdaAudio, me)
-            {
-                return SyscallError::PermissionDenied.to_u64();
-            }
-            crate::scheduler::set_current_rt(a1 != 0);
-            0
-        },
         SYS_DEVICE_REG_READ => sys_device_reg(RawHandle(a1 as u32), a2, a3, None),
         SYS_DEVICE_REG_WRITE => sys_device_reg(RawHandle(a1 as u32), a2, a3, Some(a4)),
         // A number a deleted syscall used is retired, never reused, so an old
@@ -769,6 +756,25 @@ fn with_object_ref<R>(
         Ok(object) => Ok(f(object)),
         Err(e) => Err(e.to_syscall_error()),
     })
+}
+
+/// The gate on every syscall that drives a claimed device.
+///
+/// **The handle is the authority, and the class is what it is a claim on.** A
+/// process holding the NIC has no more business setting the resolution than one
+/// holding nothing, which is why the class is checked and not merely the type —
+/// the same `PermissionDenied` a wrong-typed handle gets from the table.
+fn holds_claim(h: RawHandle, class: device::DeviceType) -> Result<(), SyscallError> {
+    with_object_ref(h, Rights::WRITE, |object| match object {
+        KObjectRef::Device(d) if d.class() == class => Ok(()),
+        _ => Err(SyscallError::PermissionDenied),
+    })?
+}
+
+/// The two `u32`s a device call packs into one argument word, taken apart at
+/// the boundary and carried no further.
+fn unpair(word: u64) -> (u32, u32) {
+    ((word >> 32) as u32, word as u32)
 }
 
 /// The same, for the calls whose answer is already a raw syscall word.
@@ -1373,7 +1379,7 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
 /// manifest, checked before the image was built, rather than which of them
 /// started first.
 fn sys_device_claim(syscap: RawHandle, class: u64) -> u64 {
-    let Some(class) = device::class_of(class) else {
+    let Some(class) = device::DeviceType::from_raw(class) else {
         return SyscallError::InvalidArgument.to_u64();
     };
     if let Err(e) = process::with_fd_owner_data(|data| {
@@ -1381,15 +1387,13 @@ fn sys_device_claim(syscap: RawHandle, class: u64) -> u64 {
     }) {
         return e.to_u64();
     }
-    let pid = process::current_process();
     // `NotFound` is a machine with no such device and nothing else: init endows
     // what it got and logs what it did not, which is a different answer from
     // `AlreadyExists` — a config the build-time gate should have refused.
-    let claim = match device::try_claim(class, pid) {
+    let claim = match device::try_claim(class) {
         Ok(c) => c,
         Err(device::ClaimError::Absent) => return SyscallError::NotFound.to_u64(),
         Err(device::ClaimError::Owned) => return SyscallError::AlreadyExists.to_u64(),
-        Err(device::ClaimError::GrantFailed) => return SyscallError::ResourceExhausted.to_u64(),
     };
     process::with_fd_owner_data(|data| {
         handle_result(ops::install(&mut data.handles, KObjectRef::Device(claim)))
@@ -1413,29 +1417,6 @@ fn sys_rt_enter(syscap: RawHandle) -> u64 {
     }
     crate::scheduler::set_current_rt(true);
     0
-}
-
-fn sys_open_device(device_type: u64) -> u64 {
-    let Some(class) = device::class_of(device_type) else {
-        return SyscallError::InvalidArgument.to_u64();
-    };
-    let pid = process::current_process();
-    // NotFound means the machine has no such device and nothing else, because
-    // that is the one answer a daemon is entitled to degrade on. soundd now
-    // routes NotFound to a null sink, so collapsing Owned into it is worse than
-    // before: soundd would silently discard all audio whenever another process
-    // held the claim, instead of failing loudly on a real conflict.
-    let claim = match device::try_claim(class, pid) {
-        Ok(c) => c,
-        Err(device::ClaimError::Absent) => return SyscallError::NotFound.to_u64(),
-        Err(device::ClaimError::Owned) => return SyscallError::AlreadyExists.to_u64(),
-        Err(device::ClaimError::GrantFailed) => return SyscallError::ResourceExhausted.to_u64(),
-    };
-    // A refused install drops the object, whose `Claim` goes back with it — the
-    // device is not left owned by a process that got no handle for it.
-    process::with_fd_owner_data(|data| {
-        handle_result(ops::install(&mut data.handles, KObjectRef::Device(claim)))
-    })
 }
 
 /// Answer this process's endowment table.

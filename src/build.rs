@@ -57,8 +57,10 @@ struct ProgramConfig {
     receives: Vec<String>,
     /// Device classes init mints a claim for and endows.
     devices: Vec<String>,
-    /// Whether init endows an `RT`-only `SysCap` dup. soundd, and nothing else.
-    realtime: bool,
+    /// Rights on the `SysCap` duplicate init endows this program, by the names
+    /// `toyos_manifest::syscap_rights` takes. Two programs in the whole tree
+    /// declare one.
+    syscap: Vec<String>,
 }
 
 impl ProgramConfig {
@@ -426,7 +428,7 @@ fn render_manifest(config: &SystemConfig) -> Vec<u8> {
                     provides: cfg.provides.clone(),
                     receives: cfg.receives.clone(),
                     devices: cfg.devices.clone(),
-                    realtime: cfg.realtime,
+                    syscap: cfg.syscap.clone(),
                 }
             })
             .collect(),
@@ -1294,6 +1296,35 @@ mod tests {
         )
         .unwrap();
         assert!(one_claimant_per_device(&bad).is_err());
+    }
+
+    /// A class name the ABI does not know renders fine and leaves init with a
+    /// `devices` entry it cannot mint — a dead machine for a typo, where this is
+    /// a red in milliseconds. Same for a `syscap` right.
+    fn names_only_real_capabilities(cfg: &SystemConfig) -> Result<(), String> {
+        for (name, prog) in &cfg.programs {
+            for class in &prog.devices {
+                if toyos_manifest::DeviceType::from_class_name(class).is_none() {
+                    return Err(format!("`{name}` names device class `{class}`, which is not one"));
+                }
+            }
+            toyos_manifest::syscap_rights(&prog.syscap)
+                .map_err(|e| format!("`{name}`: {e}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_declared_capability_is_one_the_abi_has() {
+        for cfg in ALL_CONFIGS {
+            names_only_real_capabilities(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad_class: SystemConfig =
+            toml::from_str("[programs.a]\ndevices = [\"gpu\"]\n").unwrap();
+        assert!(names_only_real_capabilities(&bad_class).is_err());
+        let bad_right: SystemConfig =
+            toml::from_str("[programs.a]\nsyscap = [\"root\"]\n").unwrap();
+        assert!(names_only_real_capabilities(&bad_right).is_err());
     }
 
     fn claims_no_device(cfg: &SystemConfig) -> Result<(), String> {

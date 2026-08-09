@@ -9,10 +9,13 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use toyos::endow;
 use toyos::ipc::RxStep;
 use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::port::Acceptor;
 use toyos::shm::SharedMemory;
-use toyos::{gpu, ipc, services, system, FramebufferDev, Keyboard, Listener, Mouse};
+use toyos::{ipc, system, AsHandle, FramebufferDev, Keyboard, Mouse};
+use toyos_abi::syscall::DeviceType;
 use toyos_abi::RawHandle;
 use toyos_desktop::{
     cursor_from_abs, cursor_style, fold_mouse, hit_test, key_action, set_mode, tab_action, Chrome,
@@ -71,15 +74,15 @@ impl Wallpaper {
 }
 
 pub struct Session {
-    listener: Listener,
+    acceptor: Acceptor,
     kb: Keyboard,
     mouse: Mouse,
     poller: Poller,
 
-    /// Held because closing it gives the framebuffer back to the kernel, and
-    /// every `gpu::` call afterwards is made by a process that no longer owns
-    /// the panel it is drawing on.
-    _fb_dev: FramebufferDev,
+    /// The claim, and the thing every screen call is made *through*: closing it
+    /// gives the framebuffer back to the kernel, and there is then no handle to
+    /// present with.
+    fb_dev: FramebufferDev,
     fb_info: toyos_abi::FramebufferInfo,
     /// Held because [`Session::screen`] points into it.
     _fb_shm: SharedMemory,
@@ -127,10 +130,19 @@ pub struct Session {
 
 impl Session {
     pub fn start() -> Self {
-        let listener = services::listen("compositor").expect("compositor already running");
-        let kb = Keyboard::open().expect("failed to claim keyboard");
-        let mouse = Mouse::open().expect("failed to claim mouse");
-        let fb_dev = FramebufferDev::open().expect("failed to claim framebuffer");
+        // Every one of these is a statement about the manifest the image was
+        // built from, which `src/build.rs` checked before the image was
+        // written — so `expect` is right here where `services::listen`'s was
+        // not. There is no other process to have taken the name and no name to
+        // take.
+        let acceptor = endow::acceptor("compositor")
+            .expect("the manifest declares this program serves `compositor`");
+        let kb: Keyboard = endow::device(DeviceType::Keyboard)
+            .expect("the manifest gives this program the keyboard");
+        let mouse: Mouse = endow::device(DeviceType::Mouse)
+            .expect("the manifest gives this program the mouse");
+        let fb_dev: FramebufferDev = endow::device(DeviceType::Framebuffer)
+            .expect("the manifest gives this program the framebuffer");
 
         let fb_info = fb_dev.info().expect("failed to read framebuffer info");
         let fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
@@ -161,7 +173,7 @@ impl Session {
             ),
             crosshair: read_sprite("/share/icons/crosshair-simple-bold.svg", CURSOR_PX, [0, 0, 0]),
         };
-        render::upload_cursor(cursor_buf, &cursors.default, hw_cursor);
+        render::upload_cursor(&fb_dev, cursor_buf, &cursors.default, hw_cursor);
 
         let font_data = std::fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font")
             .expect("failed to read font");
@@ -206,28 +218,27 @@ impl Session {
         let poller = Poller::new(FIXED_POLL_FDS + MAX_WINDOW_SLOTS + MAX_PENDING_CONNS);
         poller.poll_add(&kb, IORING_POLL_IN, kb.fd().0 as u64);
         poller.poll_add(&mouse, IORING_POLL_IN, mouse.fd().0 as u64);
-        poller.poll_add(&listener, IORING_POLL_IN, listener.fd().0 as u64);
+        poller.poll_add(&acceptor, IORING_POLL_IN, acceptor.as_handle().0 as u64);
 
         let cursor = Point { x: desk.screen.w() / 2, y: desk.screen.h() / 2 };
         if hw_cursor {
-            gpu::move_cursor(cursor.x as u32, cursor.y as u32)
-                .expect("compositor owns the framebuffer");
+            fb_dev.move_cursor(cursor.x as u32, cursor.y as u32)
+                .expect("compositor holds the framebuffer claim");
         }
         let mut damage = Damage::default();
         damage.add(desk.screen);
 
         eprintln!("compositor: ready");
-        Command::new("/bin/filepicker").spawn().ok();
 
         let now = Instant::now();
         Self {
             reported_traffic: screen.traffic(),
             reported_composed: back.surface.traffic(),
-            listener,
+            acceptor,
             kb,
             mouse,
             poller,
-            _fb_dev: fb_dev,
+            fb_dev,
             fb_info,
             _fb_shm: fb_shm,
             screen,
@@ -299,7 +310,7 @@ impl Session {
 
         let kb_ready = self.is_ready(self.kb.fd());
         let mouse_ready = self.is_ready(self.mouse.fd());
-        let listener_ready = self.is_ready(self.listener.fd());
+        let accept_ready = self.is_ready(self.acceptor.as_handle());
         let client_ready = self.stack.iter().any(|w| self.is_ready(w.client.conn.fd()))
             || self.pending.iter().any(|p| self.is_ready(p.conn.fd()));
 
@@ -317,7 +328,7 @@ impl Session {
         }
         self.pending.retain(|p| now.duration_since(p.since) < HANDSHAKE_TIMEOUT);
 
-        if !kb_ready && !mouse_ready && !listener_ready && !client_ready {
+        if !kb_ready && !mouse_ready && !accept_ready && !client_ready {
             return false;
         }
 
@@ -328,13 +339,13 @@ impl Session {
         if mouse_ready {
             self.pointer();
         }
-        if listener_ready {
+        if accept_ready {
             self.accept();
         }
         let frames = self.take_frames();
         self.dispatch(frames);
         self.reap();
-        self.rearm(kb_ready, mouse_ready, listener_ready);
+        self.rearm(kb_ready, mouse_ready, accept_ready);
         true
     }
 
@@ -425,8 +436,8 @@ impl Session {
         let was = self.cursor;
         self.cursor = cursor_from_abs(sample.abs_x, sample.abs_y, self.desk.screen);
         if self.hw_cursor {
-            gpu::move_cursor(self.cursor.x as u32, self.cursor.y as u32)
-                .expect("compositor owns the framebuffer");
+            self.fb_dev.move_cursor(self.cursor.x as u32, self.cursor.y as u32)
+                .expect("compositor holds the framebuffer claim");
         } else {
             let px = CURSOR_PX as i32;
             self.damage.add(Rect::new(was.x, was.y, px, px));
@@ -438,7 +449,12 @@ impl Session {
             cursor_style(&self.desk, &self.stack, &self.grab, self.cursor, self.launcher_open);
         if wanted != self.current_cursor {
             self.current_cursor = wanted;
-            render::upload_cursor(self.cursor_buf, self.cursors.get(wanted), self.hw_cursor);
+            render::upload_cursor(
+                &self.fb_dev,
+                self.cursor_buf,
+                self.cursors.get(wanted),
+                self.hw_cursor,
+            );
         }
 
         if sample.pressed {
@@ -604,7 +620,7 @@ impl Session {
         // `accept` installs a descriptor, so it answers `ResourceExhausted` on
         // a full fd table — and clients drive that table, one fd per
         // connection. The connection is lost either way; the desktop is not.
-        match services::accept(&self.listener) {
+        match self.acceptor.accept() {
             Err(e) => eprintln!("compositor: a connection could not be accepted ({e:?})"),
             Ok(result) if self.pending.len() >= MAX_PENDING_CONNS as usize => {
                 eprintln!(
@@ -655,7 +671,7 @@ impl Session {
                     // A connection is identified by its first frame and by
                     // nothing else. `MSG_CREATE_WINDOW` promotes it to a
                     // window; anything else is a one-shot request, answered and
-                    // closed — which is what a `services::connect` caller like
+                    // closed — which is what an `endow::service` caller like
                     // `window::clipboard_set` expects.
                     //
                     // One promotion per pass keeps `i` meaningful across the
@@ -901,7 +917,7 @@ impl Session {
     }
 
     fn set_resolution(&mut self, width: u32, height: u32) {
-        let Ok(info) = gpu::set_resolution(width, height) else {
+        let Ok(info) = self.fb_dev.set_resolution(width, height) else {
             return;
         };
         self.fb_info = info;
@@ -970,15 +986,16 @@ impl Session {
     }
 
     /// Re-arm the one-shot poll registrations for every fd that fired.
-    fn rearm(&mut self, kb: bool, mouse: bool, listener: bool) {
+    fn rearm(&mut self, kb: bool, mouse: bool, acceptor: bool) {
         if kb {
             self.poller.poll_add(&self.kb, IORING_POLL_IN, self.kb.fd().0 as u64);
         }
         if mouse {
             self.poller.poll_add(&self.mouse, IORING_POLL_IN, self.mouse.fd().0 as u64);
         }
-        if listener {
-            self.poller.poll_add(&self.listener, IORING_POLL_IN, self.listener.fd().0 as u64);
+        if acceptor {
+            let h = self.acceptor.as_handle();
+            self.poller.poll_add(&self.acceptor, IORING_POLL_IN, h.0 as u64);
         }
         for win in self.stack.iter() {
             let fd = win.client.conn.fd();
@@ -1089,13 +1106,14 @@ impl Session {
         );
 
         for region in &regions {
-            gpu::present(
-                region.x0 as u32,
-                region.y0 as u32,
-                region.w() as u32,
-                region.h() as u32,
-            )
-            .expect("compositor owns the framebuffer");
+            self.fb_dev
+                .present(
+                    region.x0 as u32,
+                    region.y0 as u32,
+                    region.w() as u32,
+                    region.h() as u32,
+                )
+                .expect("compositor holds the framebuffer claim");
         }
 
         self.frame_callbacks(&regions);

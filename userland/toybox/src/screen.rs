@@ -1,7 +1,17 @@
-use toyos::services;
+use toyos::endow;
 
 pub fn main(args: Vec<String>) {
-    let conn = services::connect("compositor").expect("compositor not running");
+    // `ls` and `screen` are the same binary, so this applet's authority is
+    // toybox's row rather than its own. A toybox started somewhere with no
+    // compositor — the diagnostic image, a test runner — says so and leaves;
+    // it does not take the shell down with it.
+    let conn = match endow::service("compositor") {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("screen: no compositor to ask ({e:?})");
+            std::process::exit(1);
+        }
+    };
 
     if args.is_empty() {
         conn.signal(window::MSG_GET_RESOLUTION).ok();

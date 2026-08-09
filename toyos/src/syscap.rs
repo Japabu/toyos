@@ -9,17 +9,32 @@
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, DeviceType, SyscallError};
 
-use crate::{AsHandle, Device, OwnedHandle, RawHandle};
+use crate::endow::FromHandle;
+use crate::{AsHandle, OwnedHandle, RawHandle};
 
 pub struct SysCap(pub(crate) OwnedHandle);
 
 impl SysCap {
-    /// Mint the claim for a device class.
+    /// Mint the claim for a device class, as whichever typed wrapper the caller
+    /// drives it through.
     ///
     /// `NotFound` is a machine with no such device, which is a fact init logs
-    /// and endows nothing for — not a failure.
-    pub fn claim(&self, class: DeviceType) -> Result<Device, SyscallError> {
-        syscall::device_claim(self.0.fd(), class).map(|h| Device(OwnedHandle(h)))
+    /// and endows nothing for — not a failure. `AlreadyExists` is another
+    /// process holding the class, which is a different fact and stays loud.
+    pub fn claim<T: FromHandle>(&self, class: DeviceType) -> Result<T, SyscallError> {
+        let raw = syscall::device_claim(self.0.fd(), class)?;
+        // SAFETY: the kernel installed this handle in this process's table for
+        // this call and no other, so nothing else answers for it.
+        Ok(unsafe { T::from_handle(raw) })
+    }
+
+    /// A second handle to this capability, carrying the same rights.
+    ///
+    /// Only usable by a holder whose own cap carries [`Rights::DUP`], which in
+    /// the whole tree is the test estate: its binaries mint their own claims,
+    /// and one boot runs several that each need the keyboard.
+    pub fn duplicate(&self) -> Result<Self, SyscallError> {
+        syscall::dup(self.0.fd()).map(|h| Self(OwnedHandle(h)))
     }
 
     /// Enter the real-time band. A device claim was never enough to confer

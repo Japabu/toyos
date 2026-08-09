@@ -4,7 +4,7 @@ pub use framebuffer::{Color, Framebuffer, Screen, Traffic};
 
 use toyos::ipc;
 use toyos::poller::{Poller, IORING_POLL_IN};
-use toyos::services;
+use toyos::endow::{self, EndowError};
 use toyos::surface;
 use toyos::Connection;
 use toyos::shm::SharedMemory;
@@ -77,9 +77,14 @@ toyos::ipc_payload! {
 /// Why creating a window failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateError {
-    /// Nothing is serving the `compositor` service, or it went away between
-    /// the request and the reply.
-    NoCompositor,
+    /// This program was given no `compositor` connector. A statement about
+    /// what the manifest says this program holds, not about the machine — and
+    /// never about timing: every port exists before any server runs.
+    NotEndowed,
+    /// The compositor exited, or the connection died mid-request.
+    CompositorGone,
+    /// The compositor answered, and not with anything this exchange allows.
+    Protocol(u32),
     /// The compositor is already holding as many windows as it can afford.
     AtCapacity,
     /// The requested size is bigger than the screen it would be drawn on.
@@ -88,15 +93,13 @@ pub enum CreateError {
     NoMemory,
     /// Refused for a reason this build of the client does not know.
     Refused(u32),
-    /// The compositor answered `MSG_CREATE_WINDOW` with a message that is
-    /// neither [`MSG_WINDOW_CREATED`] nor [`MSG_WINDOW_REFUSED`].
-    Protocol(u32),
 }
 
 impl std::fmt::Display for CreateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoCompositor => write!(f, "no compositor is running"),
+            Self::NotEndowed => write!(f, "this program was given no compositor"),
+            Self::CompositorGone => write!(f, "the compositor is gone"),
             Self::AtCapacity => write!(f, "the compositor is at its window limit"),
             Self::TooLarge => write!(f, "the window is larger than the screen"),
             Self::NoMemory => write!(f, "there is no memory for a window that size"),
@@ -109,6 +112,15 @@ impl std::fmt::Display for CreateError {
 }
 
 impl std::error::Error for CreateError {}
+
+impl From<EndowError> for CreateError {
+    fn from(e: EndowError) -> Self {
+        match e {
+            EndowError::NotEndowed => Self::NotEndowed,
+            EndowError::ServerGone | EndowError::Refused(_) => Self::CompositorGone,
+        }
+    }
+}
 
 impl CreateError {
     fn from_wire(reason: u32) -> Self {
@@ -320,12 +332,16 @@ pub fn load_layout(translator: &mut Translator) {
     }
 }
 
-/// Set the system clipboard contents (standalone, uses a temporary compositor connection).
-pub fn clipboard_set(text: &str) {
+/// Put `text` on the system clipboard, over a connection of its own.
+///
+/// Fallible where it used to `expect`: a program the manifest gives no
+/// compositor is a program that cannot copy, which is an answer and not a
+/// reason to take the caller down.
+pub fn clipboard_set(text: &str) -> Result<(), CreateError> {
     use std::sync::Mutex;
     static CLIPBOARD_SHM: Mutex<Option<SharedMemory>> = Mutex::new(None);
 
-    let conn = services::connect("compositor").expect("compositor not running");
+    let conn = endow::service("compositor")?;
     let bytes = text.as_bytes();
     if bytes.len() <= 4096 {
         let _ = conn.send_bytes(MSG_CLIPBOARD_SET, bytes);
@@ -334,6 +350,7 @@ pub fn clipboard_set(text: &str) {
         let _ = conn.send(MSG_CLIPBOARD_SET_SHM, &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 });
         *CLIPBOARD_SHM.lock().unwrap() = Some(shm);
     }
+    Ok(())
 }
 
 pub struct Window {
@@ -375,7 +392,7 @@ impl Window {
         title: &str,
         flags: u8,
     ) -> Result<Self, CreateError> {
-        let conn = services::connect("compositor").map_err(|_| CreateError::NoCompositor)?;
+        let conn = endow::service("compositor")?;
 
         let mut req = CreateWindowRequest {
             width,
@@ -388,30 +405,30 @@ impl Window {
         let len = bytes.len().min(30);
         req.title[..len].copy_from_slice(&bytes[..len]);
         req.title_len = len as u8;
-        conn.send(MSG_CREATE_WINDOW, &req).map_err(|_| CreateError::NoCompositor)?;
+        conn.send(MSG_CREATE_WINDOW, &req).map_err(|_| CreateError::CompositorGone)?;
 
         // Header first, then the payload the message type calls for: the two
         // answers carry different structs, and a payload shorter than the type
         // it was asked for is a refusal from `recv_payload`, not a window.
-        let header = conn.recv_header().map_err(|_| CreateError::NoCompositor)?;
+        let header = conn.recv_header().map_err(|_| CreateError::CompositorGone)?;
         match header.msg_type {
             MSG_WINDOW_CREATED => {}
             MSG_WINDOW_REFUSED => {
                 let refused: WindowRefused = conn
                     .recv_payload(&header)
-                    .map_err(|_| CreateError::NoCompositor)?;
+                    .map_err(|_| CreateError::CompositorGone)?;
                 return Err(CreateError::from_wire(refused.reason));
             }
             other => return Err(CreateError::Protocol(other)),
         }
         let info: WindowInfo = conn
             .recv_payload(&header)
-            .map_err(|_| CreateError::NoCompositor)?;
+            .map_err(|_| CreateError::CompositorGone)?;
 
         let buf_size = info.stride as usize * info.height as usize * 4;
         // A token the compositor named and did not grant is a compositor that
         // is not serving this client, whatever else it is doing.
-        let shm = SharedMemory::map(info.token, buf_size).map_err(|_| CreateError::NoCompositor)?;
+        let shm = SharedMemory::map(info.token, buf_size).map_err(|_| CreateError::CompositorGone)?;
 
         let poller = Poller::new(1);
         Ok(Self {
