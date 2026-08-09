@@ -75,6 +75,12 @@ pub struct Codegen {
     va_indirect: Option<(FuncId, cranelift_module::DataId)>,  // x86_64: (trampoline func, target global) for indirect variadic calls
     static_funcs: HashSet<String>,                             // functions declared static
     extern_provision: HashSet<String>,                         // functions with non-inline external provision
+    /// What a statement expression declares, while one is being *typed*.
+    ///
+    /// `FuncCtx::locals` carries what the enclosing function declared, and a
+    /// `({ int i = 1; … })` names its own — which no context outside the block
+    /// has ever seen, because `expr_type` answers without entering it.
+    stmt_expr_scopes: Vec<HashMap<String, CType>>,
 }
 
 /// Where a local variable lives, named by the *origin* of its address.
@@ -164,6 +170,7 @@ impl Codegen {
             va_indirect: None,
             static_funcs: HashSet::new(),
             extern_provision: HashSet::new(),
+            stmt_expr_scopes: Vec::new(),
         }
     }
 

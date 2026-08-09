@@ -76,6 +76,17 @@ fn a_goto_can_reach_past_a_vla() {
     );
 }
 
+/// Not a dominance question, and here because it is the same shape of blind
+/// spot: a type asked about an expression from outside the block that declares
+/// its names. `expr_type` answered a statement expression without entering it,
+/// so every local the block declared was an unknown identifier.
+#[test]
+fn a_statement_expression_types_its_own_locals() {
+    accepts("int f(void) { return ({ int i = 1; i + 2; }) + 1; }");
+    accepts("long g(void) { return ({ long *p = 0; p; }) == 0; }");
+    accepts("int h(void) { return ({ int i = 1; ({ int j = i; j + 1; }); }); }");
+}
+
 /// `continue` is the way `79_vla_continue` reaches it, and it leaves the loop
 /// through a different edge from the one above.
 #[test]

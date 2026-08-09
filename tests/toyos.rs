@@ -865,8 +865,8 @@ const NOT_RUN: &[NotRun] = &[
     },
     NotRun {
         case: "89_nocode_wanted",
-        stage: Stage::Refused("expr_type: unknown identifier 'i'"),
-        why: Why::Open("specs/issues/build/toyos-cc-cannot-type-a-statement-expression-local.md"),
+        stage: Stage::Refused("failed to define function 'kb_wait_3'"),
+        why: Why::Open("specs/issues/build/toyos-cc-goto-out-of-a-statement-expression.md"),
     },
     NotRun {
         case: "83_utf8_in_identifiers",

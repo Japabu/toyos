@@ -740,6 +740,36 @@ asked whether they run" question. **Two more the review found and this wave does
 not close**: `9999b`, if T6 declares it rather than fixing it (§6.1), and the
 fact that toyos-cc's host suite asserts on no emitted code at all (§9).
 
+**What T7 did.** §4.6's two findings are closed by T3, so neither is filed. The
+"nobody has asked whether they run" question was filed by T5, because its list
+had to point at it. `9999b` and the emission-gate question are filed.
+
+`89_nocode_wanted` was time-boxed and half of it is fixed: `expr_type` answered
+a statement expression's type without ever entering the block, so every local
+the block declared was an unknown identifier — `Codegen::stmt_expr_scopes` is
+that scope now, and `dominance.rs` gates it. The case then stops one layer
+further on, in the verifier, on a **block argument** `cranelift-frontend`
+synthesized for a `goto` out of the statement expression. That is not the
+`LocalStorage` class T2 closed — it is an argument the frontend made from a
+control-flow graph we built — and it is wider than the box, so it is declined
+into the T5 list against its new refusal, with its own issue file.
+
+Two defects the wave found in passing and did not fix, both filed: every
+parse-time diagnostic names the line *after* the one it is about — measured on
+a one-line file — which matters more now that `NOT_RUN` quotes those refusals;
+and `73_arm64` stops in the verifier on a variadic call passing an i32 where the
+signature wants an i64, which is a codegen defect of ours reached through a case
+declined for an unrelated reason.
+
+**`79_vla_continue` is not measured and the wave could not measure it.** It
+builds since T2 and is therefore discovered and run — but every guest boot on
+this host needs the shared sysroot, which `wt/toyos-endow` holds for an ABI
+change that has not landed. The host half of the suite is unaffected and green.
+Its own `.expect` wants `OK` five times, which needs a VLA to reuse one stack
+address per iteration, and a heap VLA can satisfy that only by accident of the
+allocator — so the expected outcome is `NOT OK` and a declared entry. It must
+be measured before it is declared.
+
 Ordering: T1 first and alone (it is minutes, and T5/T6 cannot be written on top
 of a compiler that exits). T4 is independent of everything — it is a different
 crate. **T2 before T3**, which the plan used to leave open: T3 puts two names
