@@ -1407,3 +1407,14 @@ ask again, and a CAS that *fails* means the victim went deaf on the boundary and
 the report is asked for after all. **0 of 20 probe reps and 2 of 2 in one shard
 job** is the shape of a rate nobody has counted, which is why the give-up is
 repaired rather than the number tuned.
+
+**A sixth, and it is the same shape as the fifth.** `main` at `8d3f5b7` (run
+`31286199802`) is red on `late_storage_connect`, §9.2's 2-of-5 entry, and the
+message is the gate refusing to be vacuous: *the boot scan bound a disk, so the
+port was not held empty*. `xhci-slow-storage-connect` hid the disk's port for
+`SLOW_CONNECT_NS`, 300 ms — a claim about how far into a boot `scan_ports` runs,
+true at 253 ms on the dev host and false at **407 ms** on that runner. What the
+actuator stages is an *ordering* — the disk arrives after the scan — so the scan
+is what closes the window now, and no host's boot speed can defeat it.
+`xhci-slow-connect` keeps the duration, because what *it* stages is a settle
+that has to keep looking through one.
