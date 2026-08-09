@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use toyos::shm::SharedMemory;
 use toyos::{ipc, Connection};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_desktop::Window;
 
 /// Connections accepted but not yet identified by a first frame.
@@ -72,7 +72,7 @@ pub type Win = Window<Client>;
 /// `MSG_CREATE_WINDOW` keeps it, and every other message type answers on it
 /// and lets it close.
 pub struct ClientFrame {
-    pub fd: Fd,
+    pub fd: RawHandle,
     pub pid: u32,
     pub msg_type: u32,
     payload: [u8; MAX_KEPT_PAYLOAD],
@@ -81,7 +81,7 @@ pub struct ClientFrame {
 }
 
 impl ClientFrame {
-    pub fn new(fd: Fd, pid: u32, msg_type: u32) -> Self {
+    pub fn new(fd: RawHandle, pid: u32, msg_type: u32) -> Self {
         Self { fd, pid, msg_type, payload: [0; MAX_KEPT_PAYLOAD], payload_len: 0, conn: None }
     }
 
@@ -154,9 +154,9 @@ impl From<ipc::TrySendError> for DropReason {
 }
 
 /// A client the next removal pass will take out.
-pub type Dead = (Fd, u32, DropReason);
+pub type Dead = (RawHandle, u32, DropReason);
 
-pub fn mark_dead(dead: &mut Vec<Dead>, fd: Fd, pid: u32, reason: DropReason) {
+pub fn mark_dead(dead: &mut Vec<Dead>, fd: RawHandle, pid: u32, reason: DropReason) {
     if !dead.iter().any(|(f, _, _)| *f == fd) {
         dead.push((fd, pid, reason));
     }

@@ -2,9 +2,9 @@
 //!
 //! Wire format: `[u32 msg_type][u32 len][len bytes payload]`.
 
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, SyscallError};
-use crate::{AsHandle, Handle};
+use crate::{AsHandle, OwnedHandle};
 
 /// A type that may cross an IPC boundary as a payload.
 ///
@@ -166,14 +166,14 @@ pub enum TrySendError {
 
 /// An IPC connection. Created by [`crate::services::accept`] or
 /// [`crate::services::connect`].
-pub struct Connection(pub(crate) Handle);
+pub struct Connection(pub(crate) OwnedHandle);
 
 impl AsHandle for Connection {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 impl Connection {
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 
     pub fn send<T: IpcPayload>(&self, msg_type: u32, payload: &T) -> Result<(), IpcError> {
         send(self.fd(), msg_type, payload)
@@ -227,17 +227,17 @@ impl Connection {
 // Free functions — used by consumers that hold raw Fds (compositor, netd).
 // Will become pub(crate) once all callers migrate to Connection methods.
 
-pub fn send<T: IpcPayload>(fd: Fd, msg_type: u32, payload: &T) -> Result<(), IpcError> {
+pub fn send<T: IpcPayload>(fd: RawHandle, msg_type: u32, payload: &T) -> Result<(), IpcError> {
     let header = IpcHeader::frame(msg_type, core::mem::size_of::<T>())?;
     write_all(fd, &header.to_wire())?;
     write_all(fd, as_bytes(payload))
 }
 
-pub fn signal(fd: Fd, msg_type: u32) -> Result<(), IpcError> {
+pub fn signal(fd: RawHandle, msg_type: u32) -> Result<(), IpcError> {
     write_all(fd, &IpcHeader { msg_type, len: 0 }.to_wire())
 }
 
-pub fn send_bytes(fd: Fd, msg_type: u32, data: &[u8]) -> Result<(), IpcError> {
+pub fn send_bytes(fd: RawHandle, msg_type: u32, data: &[u8]) -> Result<(), IpcError> {
     let header = IpcHeader::frame(msg_type, data.len())?;
     write_all(fd, &header.to_wire())?;
     if !data.is_empty() {
@@ -252,7 +252,7 @@ pub fn send_bytes(fd: Fd, msg_type: u32, data: &[u8]) -> Result<(), IpcError> {
 /// `write_all` parks in the kernel until the peer drains, which is a client
 /// deciding when the server runs again. This is the same frame in one
 /// `write_nonblock`, so the peer's backlog is an answer rather than a wait.
-pub fn try_send<T: IpcPayload>(fd: Fd, msg_type: u32, payload: &T) -> Result<(), TrySendError> {
+pub fn try_send<T: IpcPayload>(fd: RawHandle, msg_type: u32, payload: &T) -> Result<(), TrySendError> {
     const { assert!(core::mem::size_of::<T>() <= MAX_TYPED_PAYLOAD) };
     let size = core::mem::size_of::<T>();
     let mut frame = [0u8; IpcHeader::WIRE_SIZE + MAX_TYPED_PAYLOAD];
@@ -263,7 +263,7 @@ pub fn try_send<T: IpcPayload>(fd: Fd, msg_type: u32, payload: &T) -> Result<(),
 }
 
 /// [`signal`] without blocking. A bare header always fits in one write.
-pub fn try_signal(fd: Fd, msg_type: u32) -> Result<(), TrySendError> {
+pub fn try_signal(fd: RawHandle, msg_type: u32) -> Result<(), TrySendError> {
     write_whole(fd, &IpcHeader { msg_type, len: 0 }.to_wire())
 }
 
@@ -271,7 +271,7 @@ pub fn try_signal(fd: Fd, msg_type: u32) -> Result<(), TrySendError> {
 ///
 /// The frame buffer is [`MAX_FRAME_LEN`] on the stack, so this is for the
 /// occasional large message — a clipboard paste — not for a per-frame path.
-pub fn try_send_bytes(fd: Fd, msg_type: u32, data: &[u8]) -> Result<(), TrySendError> {
+pub fn try_send_bytes(fd: RawHandle, msg_type: u32, data: &[u8]) -> Result<(), TrySendError> {
     let mut frame = [0u8; IpcHeader::WIRE_SIZE + MAX_FRAME_LEN as usize];
     let header = IpcHeader::frame(msg_type, data.len()).map_err(|_| TrySendError::TooLarge)?;
     frame[..IpcHeader::WIRE_SIZE].copy_from_slice(&header.to_wire());
@@ -279,7 +279,7 @@ pub fn try_send_bytes(fd: Fd, msg_type: u32, data: &[u8]) -> Result<(), TrySendE
     write_whole(fd, &frame[..IpcHeader::WIRE_SIZE + data.len()])
 }
 
-pub fn recv_header(fd: Fd) -> Result<IpcHeader, IpcError> {
+pub fn recv_header(fd: RawHandle) -> Result<IpcHeader, IpcError> {
     let mut bytes = [0u8; IpcHeader::WIRE_SIZE];
     read_exact(fd, &mut bytes)?;
     IpcHeader::from_wire(
@@ -288,7 +288,7 @@ pub fn recv_header(fd: Fd) -> Result<IpcHeader, IpcError> {
     )
 }
 
-pub fn recv_payload<T: IpcPayload>(fd: Fd, header: &IpcHeader) -> Result<T, IpcError> {
+pub fn recv_payload<T: IpcPayload>(fd: RawHandle, header: &IpcHeader) -> Result<T, IpcError> {
     let size = core::mem::size_of::<T>();
     if (header.len as usize) < size {
         return Err(IpcError::Malformed);
@@ -304,14 +304,14 @@ pub fn recv_payload<T: IpcPayload>(fd: Fd, header: &IpcHeader) -> Result<T, IpcE
 }
 
 /// Receive header + typed payload in one call.
-pub fn recv<T: IpcPayload>(fd: Fd) -> Result<(u32, T), IpcError> {
+pub fn recv<T: IpcPayload>(fd: RawHandle) -> Result<(u32, T), IpcError> {
     let header = recv_header(fd)?;
     let payload = recv_payload(fd, &header)?;
     Ok((header.msg_type, payload))
 }
 
 /// Receive raw bytes. Returns the number of valid bytes read.
-pub fn recv_bytes(fd: Fd, header: &IpcHeader, buf: &mut [u8]) -> Result<usize, IpcError> {
+pub fn recv_bytes(fd: RawHandle, header: &IpcHeader, buf: &mut [u8]) -> Result<usize, IpcError> {
     let count = (header.len as usize).min(buf.len());
     if count > 0 {
         read_exact(fd, &mut buf[..count])?;
@@ -491,7 +491,7 @@ fn as_bytes<T: IpcPayload>(val: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>()) }
 }
 
-fn skip(fd: Fd, mut remaining: usize) -> Result<(), IpcError> {
+fn skip(fd: RawHandle, mut remaining: usize) -> Result<(), IpcError> {
     let mut buf = [0u8; 128];
     while remaining > 0 {
         let chunk = remaining.min(buf.len());
@@ -501,7 +501,7 @@ fn skip(fd: Fd, mut remaining: usize) -> Result<(), IpcError> {
     Ok(())
 }
 
-fn read_exact(fd: Fd, buf: &mut [u8]) -> Result<(), IpcError> {
+fn read_exact(fd: RawHandle, buf: &mut [u8]) -> Result<(), IpcError> {
     let mut offset = 0;
     while offset < buf.len() {
         let n = syscall::read(fd, &mut buf[offset..]).map_err(IpcError::Syscall)?;
@@ -517,7 +517,7 @@ fn read_exact(fd: Fd, buf: &mut [u8]) -> Result<(), IpcError> {
 ///
 /// A short write is `Full`, not a partial success: the caller asked for a
 /// frame, and half a frame is a stream the peer can no longer parse.
-fn write_whole(fd: Fd, buf: &[u8]) -> Result<(), TrySendError> {
+fn write_whole(fd: RawHandle, buf: &[u8]) -> Result<(), TrySendError> {
     match syscall::write_nonblock(fd, buf) {
         Ok(n) if n == buf.len() => Ok(()),
         Ok(_) => Err(TrySendError::Full),
@@ -526,7 +526,7 @@ fn write_whole(fd: Fd, buf: &[u8]) -> Result<(), TrySendError> {
     }
 }
 
-fn write_all(fd: Fd, buf: &[u8]) -> Result<(), IpcError> {
+fn write_all(fd: RawHandle, buf: &[u8]) -> Result<(), IpcError> {
     let mut offset = 0;
     while offset < buf.len() {
         let n = syscall::write(fd, &buf[offset..]).map_err(IpcError::Syscall)?;

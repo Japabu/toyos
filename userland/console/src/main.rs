@@ -125,8 +125,8 @@ fn main() {
     const TOKEN_CLIENT: u64 = 4;
 
     loop {
-        poller.poll_add_fd(toyos::Fd(shell.stdout.as_raw_fd()), IORING_POLL_IN, TOKEN_STDOUT);
-        poller.poll_add_fd(toyos::Fd(shell.stderr.as_raw_fd()), IORING_POLL_IN, TOKEN_STDERR);
+        poller.poll_add_fd(toyos::RawHandle(shell.stdout.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDOUT);
+        poller.poll_add_fd(toyos::RawHandle(shell.stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
         poller.poll_add(&kb, IORING_POLL_IN, TOKEN_KEYBOARD);
         poller.poll_add_fd(host.listener_fd(), IORING_POLL_IN, TOKEN_LISTEN);
         for fd in host.client_fds() {

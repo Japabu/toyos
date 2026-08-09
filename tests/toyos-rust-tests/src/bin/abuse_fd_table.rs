@@ -5,7 +5,7 @@
 //! above the kernel's 2 MiB single-allocation ceiling.
 
 use toyos_abi::syscall::{self, MmapFlags, MmapProt, SpawnArgs, SyscallError};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 
 /// Mirrors `kernel/src/fd.rs`. A cap that moves should fail this test loudly.
 const MAX_FDS: u32 = 1024;
@@ -48,7 +48,7 @@ fn main() {
     // that carried the cap.
     let mut refused = None;
     for n in 3..40_000u32 {
-        if let Err(e) = syscall::dup2(Fd(1), Fd(n as i32)) {
+        if let Err(e) = syscall::dup2(RawHandle(1), RawHandle(n)) {
             refused = Some((n, e));
             break;
         }
@@ -59,10 +59,10 @@ fn main() {
 
     // The cap is a live limit, not a latched failure.
     for fd in 3..n {
-        syscall::close(Fd(fd as i32));
+        syscall::close(RawHandle(fd));
     }
-    syscall::dup2(Fd(1), Fd(3)).expect("dup2 must work again after closing fds");
-    syscall::close(Fd(3));
+    syscall::dup2(RawHandle(1), RawHandle(3)).expect("dup2 must work again after closing fds");
+    syscall::close(RawHandle(3));
 
     unsafe { syscall::munmap(region, REGION) }.expect("munmap");
     println!("fd table capped at {MAX_FDS} on every insert path (refused at {n})");

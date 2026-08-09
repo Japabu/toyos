@@ -502,7 +502,7 @@ fn process_sqe(ring_id: RingId, sqe: &IoUringSqe) {
 }
 
 fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
-    let fd_num = sqe.fd as u32;
+    let fd_num = sqe.fd.0;
     let flags = PollFlags::from_raw(sqe.op_flags);
     let user_data = sqe.user_data;
 
@@ -609,7 +609,7 @@ fn process_poll_remove(ring_id: RingId, target_user_data: u64) {
 }
 
 fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
-    let fd_num = sqe.fd as u32;
+    let fd_num = sqe.fd.0;
     let user_data = sqe.user_data;
 
     let listener_id = process::with_fd_owner_data(|data| {
@@ -645,7 +645,7 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
 }
 
 fn process_close(ring_id: RingId, sqe: &IoUringSqe) {
-    let fd_num = sqe.fd as u32;
+    let fd_num = sqe.fd.0;
     let user_data = sqe.user_data;
 
     let result = process::with_fd_owner_data(|data| {

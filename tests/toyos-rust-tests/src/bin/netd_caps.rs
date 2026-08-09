@@ -46,8 +46,8 @@ fn main() {
     // pending connect and only opens them if the connect completes, which none
     // of these will — so sharing them costs nothing and saves the client 4 MiB
     // and four fds per request.
-    let rx = syscall::pipe();
-    let tx = syscall::pipe();
+    let rx = syscall::pipe().expect("the rx pipe every request carries");
+    let tx = syscall::pipe().expect("the tx pipe every request carries");
     let request = TcpConnectPipedRequest {
         addr: BLACK_HOLE,
         port: PORT,

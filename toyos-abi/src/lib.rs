@@ -14,8 +14,7 @@ pub mod ring;
 pub mod syscall;
 pub mod virtio_sound;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Fd(pub i32);
+pub use handle::{RawHandle, Rights, HANDLE_INVALID};
 
 /// A process ID. Identifies a process — owns address space, FDs, vruntime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

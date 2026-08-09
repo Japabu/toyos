@@ -114,7 +114,7 @@ pub struct SpawnArgs {
     pub env_len: u64,
 }
 
-use crate::{Fd, Pid};
+use crate::{Pid, RawHandle};
 
 /// Syscall error with a specific code. Values occupy the top of the u64 range:
 /// error code N is encoded as `u64::MAX - N`. Any return value `>= u64::MAX - 255`
@@ -311,8 +311,8 @@ impl core::ops::BitOr for MmapFlags {
 /// Result of [`pipe`]: the read and write ends.
 #[derive(Debug, Clone, Copy)]
 pub struct PipeFds {
-    pub read: Fd,
-    pub write: Fd,
+    pub read: RawHandle,
+    pub write: RawHandle,
 }
 
 /// Wall-clock time from RTC.
@@ -381,12 +381,12 @@ fn encode_timeout(timeout: Option<u64>) -> u64 {
 }
 
 /// Write bytes to a file descriptor. Returns number of bytes written.
-pub fn write(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
+pub fn write(fd: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_WRITE, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Read bytes from a file descriptor. Returns number of bytes read.
-pub fn read(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
+pub fn read(fd: RawHandle, buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_READ, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
@@ -409,19 +409,24 @@ pub fn debug(action: u64) -> u64 {
     syscall(SYS_DEBUG, action, 0, 0, 0)
 }
 
-/// Create a pipe. Returns the read and write file descriptors.
+/// Create a pipe. Returns the read and write ends.
 ///
-/// The return type is dishonest and the caller must not trust it: `sys_pipe`
-/// answers `ResourceExhausted` on three paths (no pipe pages, and either fd
-/// insert hitting `MAX_FDS`), and that one word splits into `read = Fd(-1)`,
-/// `write = Fd(-8)` here. Both are rejected by any later syscall, so the
-/// failure surfaces as whatever the *next* call decides to do about a bad fd.
-pub fn pipe() -> PipeFds {
-    let raw = syscall(SYS_PIPE, 0, 0, 0, 0);
-    PipeFds {
-        read: Fd((raw >> 32) as i32),
-        write: Fd((raw & 0xFFFF_FFFF) as i32),
-    }
+/// **Fallible, because `sys_pipe` is.** It answers `ResourceExhausted` on three
+/// paths — no pipe pages, and either handle install hitting the table cap — and
+/// the old signature split that one word across the pair as `read = Fd(-1)`,
+/// `write = Fd(-8)`. Both were refused by every later syscall, so the failure
+/// surfaced as whatever the *next* call decided to do about a handle it did not
+/// recognise (`specs/issues/isolation/abi-wrappers-return-error-as-value.md`).
+///
+/// A packed pair can never be mistaken for an error word: no handle is ever
+/// `0xFFFF_FFFF`, because a slot at `MAX_GENERATION` is retired rather than
+/// reissued, and `SyscallError` occupies only the top 256 values.
+pub fn pipe() -> Result<PipeFds, SyscallError> {
+    let raw = check(syscall(SYS_PIPE, 0, 0, 0, 0))?;
+    Ok(PipeFds {
+        read: RawHandle((raw >> 32) as u32),
+        write: RawHandle((raw & 0xFFFF_FFFF) as u32),
+    })
 }
 
 /// Read the inherited environment variables into `buf`.
@@ -451,7 +456,7 @@ pub fn waitpid_flags(pid: Pid, flags: u64) -> Result<u64, SyscallError> {
 }
 
 /// Mark file descriptor as the controlling TTY for this process.
-pub fn mark_tty(fd: Fd) {
+pub fn mark_tty(fd: RawHandle) {
     syscall(SYS_MARK_TTY, fd.0 as u64, 0, 0, 0);
 }
 
@@ -476,17 +481,17 @@ pub fn set_thread_name(name: &[u8]) {
 }
 
 /// Open a file.
-pub fn open(path: &[u8], flags: OpenFlags) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags.0, 0)).map(|v| Fd(v as i32))
+pub fn open(path: &[u8], flags: OpenFlags) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags.0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Close a file descriptor.
-pub fn close(fd: Fd) {
+pub fn close(fd: RawHandle) {
     syscall(SYS_CLOSE, fd.0 as u64, 0, 0, 0);
 }
 
 /// Seek within a file descriptor. Returns new offset.
-pub fn seek(fd: Fd, pos: SeekFrom) -> Result<u64, SyscallError> {
+pub fn seek(fd: RawHandle, pos: SeekFrom) -> Result<u64, SyscallError> {
     let (offset, whence) = match pos {
         SeekFrom::Start(n) => (n as i64, 0u64),
         SeekFrom::Current(n) => (n, 1u64),
@@ -496,14 +501,14 @@ pub fn seek(fd: Fd, pos: SeekFrom) -> Result<u64, SyscallError> {
 }
 
 /// Get file metadata for a file descriptor.
-pub fn fstat(fd: Fd) -> Result<Stat, SyscallError> {
+pub fn fstat(fd: RawHandle) -> Result<Stat, SyscallError> {
     let mut stat = Stat { file_type: FileType::Unknown, size: 0, mtime: 0 };
     check_unit(syscall(SYS_FSTAT, fd.0 as u64, &mut stat as *mut Stat as u64, 0, 0))?;
     Ok(stat)
 }
 
 /// Flush file descriptor to disk.
-pub fn fsync(fd: Fd) -> Result<(), SyscallError> {
+pub fn fsync(fd: RawHandle) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_FSYNC, fd.0 as u64, 0, 0, 0))
 }
 
@@ -642,8 +647,8 @@ pub enum DeviceType {
 }
 
 /// Claim exclusive access to a device.
-pub fn open_device(device: DeviceType) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| Fd(v as i32))
+pub fn open_device(device: DeviceType) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// How wide a register access is.
@@ -692,7 +697,7 @@ impl RegWidth {
 /// name; there is no way to name an address here and no way to reach a
 /// register the list does not carry.
 pub fn device_reg_read(
-    fd: Fd,
+    fd: RawHandle,
     offset: u32,
     width: RegWidth,
 ) -> Result<u32, SyscallError> {
@@ -707,7 +712,7 @@ pub fn device_reg_read(
 /// entry costs a driver that cannot bring its stream up and says so, which is
 /// the failure mode a refusal list does not have.
 pub fn device_reg_write(
-    fd: Fd,
+    fd: RawHandle,
     offset: u32,
     width: RegWidth,
     value: u32,
@@ -726,33 +731,33 @@ pub fn device_reg_write(
 
 /// Register a named service and return a listener fd.
 /// Other processes can connect to this service by name.
-pub fn listen(name: &str) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_LISTEN, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| Fd(v as i32))
+pub fn listen(name: &str) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_LISTEN, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Result of [`accept`]: socket fd + connecting client's PID.
 pub struct AcceptResult {
-    pub fd: Fd,
+    pub fd: RawHandle,
     pub client_pid: u32,
 }
 
 /// Accept a pending connection on a listener fd.
 /// Blocks until a client connects. Returns a socket fd and the client's PID.
-pub fn accept(listener_fd: Fd) -> Result<AcceptResult, SyscallError> {
+pub fn accept(listener_fd: RawHandle) -> Result<AcceptResult, SyscallError> {
     let raw = syscall(SYS_ACCEPT, listener_fd.0 as u64, 0, 0, 0);
     if let Some(e) = SyscallError::from_u64(raw) {
         return Err(e);
     }
     Ok(AcceptResult {
-        fd: Fd((raw & 0xFFFF_FFFF) as i32),
+        fd: RawHandle((raw & 0xFFFF_FFFF) as u32),
         client_pid: (raw >> 32) as u32,
     })
 }
 
 /// Connect to a named service. Blocks until the server accepts.
 /// Returns a bidirectional socket fd.
-pub fn connect(name: &str) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_CONNECT, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| Fd(v as i32))
+pub fn connect(name: &str) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_CONNECT, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Allocate a 2MB-aligned shared memory region. Returns an opaque token.
@@ -828,14 +833,14 @@ pub fn set_rt_priority(enable: bool) -> Result<(), SyscallError> {
 }
 
 /// Duplicate a file descriptor.
-pub fn dup(fd: Fd) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_DUP, fd.0 as u64, 0, 0, 0)).map(|v| Fd(v as i32))
+pub fn dup(fd: RawHandle) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_DUP, fd.0 as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Duplicate a file descriptor to a specific fd number.
 /// If `new_fd` is already open, it is closed first.
-pub fn dup2(old_fd: Fd, new_fd: Fd) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_DUP2, old_fd.0 as u64, new_fd.0 as u64, 0, 0)).map(|v| Fd(v as i32))
+pub fn dup2(old_fd: RawHandle, new_fd: RawHandle) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_DUP2, old_fd.0 as u64, new_fd.0 as u64, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Get the current process ID.
@@ -919,7 +924,7 @@ pub unsafe fn futex_wake(addr: *const u32, count: u32) -> u64 {
 }
 
 /// Truncate file descriptor to `size` bytes.
-pub fn ftruncate(fd: Fd, size: u64) -> Result<(), SyscallError> {
+pub fn ftruncate(fd: RawHandle, size: u64) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_FTRUNCATE, fd.0 as u64, size, 0, 0))
 }
 
@@ -965,31 +970,31 @@ pub fn kill(pid: Pid) -> Result<(), SyscallError> {
 }
 
 /// Non-blocking read. Returns bytes read, or `Err(WouldBlock)` if no data available.
-pub fn read_nonblock(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
+pub fn read_nonblock(fd: RawHandle, buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_READ_NONBLOCK, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Non-blocking write. Returns bytes written, or `Err(WouldBlock)` if no space available.
-pub fn write_nonblock(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
+pub fn write_nonblock(fd: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_WRITE_NONBLOCK, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Open an existing pipe by internal ID. `mode`: 0 = read, 1 = write.
 /// Returns a new file descriptor for the pipe.
-pub fn pipe_open(pipe_id: u64, mode: u64) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_PIPE_OPEN, pipe_id, mode, 0, 0)).map(|v| Fd(v as i32))
+pub fn pipe_open(pipe_id: u64, mode: u64) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_PIPE_OPEN, pipe_id, mode, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Get the internal pipe ID for a pipe/tty file descriptor.
 /// Used to share pipe access across processes via `pipe_open`.
-pub fn pipe_id(fd: Fd) -> Result<u64, SyscallError> {
+pub fn pipe_id(fd: RawHandle) -> Result<u64, SyscallError> {
     check(syscall(SYS_PIPE_ID, fd.0 as u64, 0, 0, 0))
 }
 
 /// Create a socket file descriptor from two pipe IDs (rx for reading, tx for writing).
 /// The kernel bumps refcounts on both pipes. Caller should close original pipe fds after this.
-pub fn socket_create(rx_pipe_id: u64, tx_pipe_id: u64) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_SOCKET_CREATE, rx_pipe_id, tx_pipe_id, 0, 0)).map(|v| Fd(v as i32))
+pub fn socket_create(rx_pipe_id: u64, tx_pipe_id: u64) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_SOCKET_CREATE, rx_pipe_id, tx_pipe_id, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Map a pipe's shared-memory ring buffer into this process's address space.
@@ -997,7 +1002,7 @@ pub fn socket_create(rx_pipe_id: u64, tx_pipe_id: u64) -> Result<Fd, SyscallErro
 ///
 /// The mapping is writable, and the header is a publication: writing it tells
 /// the kernel nothing. Reads and writes still go through `SYS_READ`/`SYS_WRITE`.
-pub fn pipe_map(fd: Fd) -> Result<*mut u8, SyscallError> {
+pub fn pipe_map(fd: RawHandle) -> Result<*mut u8, SyscallError> {
     check(syscall(SYS_PIPE_MAP, fd.0 as u64, 0, 0, 0)).map(|v| v as *mut u8)
 }
 
@@ -1042,9 +1047,9 @@ pub fn tls_alloc_block(module_id: u64) -> u64 {
 /// Create an io_uring instance with the given queue depth (must be power of 2, max 256).
 /// Returns (ring_fd, shared_memory_token). The shared memory contains the SQ/CQ rings
 /// and SQE array; map it with `map_shared()` to access them.
-pub fn io_uring_setup(depth: u32) -> Result<(Fd, u32), SyscallError> {
+pub fn io_uring_setup(depth: u32) -> Result<(RawHandle, u32), SyscallError> {
     let raw = check(syscall(SYS_IO_URING_SETUP, depth as u64, 0, 0, 0))?;
-    let fd = Fd((raw & 0xFFFF_FFFF) as i32);
+    let fd = RawHandle((raw & 0xFFFF_FFFF) as u32);
     let token = (raw >> 32) as u32;
     Ok((fd, token))
 }
@@ -1054,7 +1059,7 @@ pub fn io_uring_setup(depth: u32) -> Result<(Fd, u32), SyscallError> {
 /// `min_complete`: block until at least this many CQEs are available (0 = don't block).
 /// `timeout_nanos`: 0 = non-blocking, u64::MAX = block forever, else timeout in nanos.
 /// Returns the number of CQEs available.
-pub fn io_uring_enter(fd: Fd, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> Result<u32, SyscallError> {
+pub fn io_uring_enter(fd: RawHandle, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> Result<u32, SyscallError> {
     check(syscall(SYS_IO_URING_ENTER, fd.0 as u64, to_submit as u64, min_complete as u64, timeout_nanos))
         .map(|n| n as u32)
 }

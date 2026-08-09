@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 use toyos_abi::syscall::{self, SyscallError};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("child") {
@@ -22,7 +22,7 @@ fn main() {
     }
 
     // Pipes this process created are its own business.
-    let own = syscall::pipe();
+    let own = syscall::pipe().expect("a pipe of our own");
     let own_read_id = syscall::pipe_id(own.read).expect("pipe_id(own read)");
     let own_write_id = syscall::pipe_id(own.write).expect("pipe_id(own write)");
     let fd = syscall::pipe_open(own_read_id, 0).expect("a process must be able to open its own pipe");
@@ -81,7 +81,7 @@ fn main() {
     // process holds a descriptor for are legitimately open (that includes the
     // victim's stdio, which this process created for it), so collect those
     // first by walking the fd table.
-    let held: Vec<u64> = (0..64).filter_map(|f| syscall::pipe_id(Fd(f)).ok()).collect();
+    let held: Vec<u64> = (0..64).filter_map(|f| syscall::pipe_id(RawHandle(f)).ok()).collect();
     let mut refused = 0;
     let mut vanished = 0;
     for id in 0..256u64 {
@@ -109,7 +109,7 @@ fn main() {
 }
 
 fn child() {
-    let p = syscall::pipe();
+    let p = syscall::pipe().expect("the pipe the attack is aimed at");
     let r = syscall::pipe_id(p.read).expect("pipe_id");
     let w = syscall::pipe_id(p.write).expect("pipe_id");
     println!("{r} {w}");

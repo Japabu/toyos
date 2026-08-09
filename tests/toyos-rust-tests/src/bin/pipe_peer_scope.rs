@@ -71,7 +71,7 @@ fn main() {
 
 fn creator() {
     let listener = syscall::listen(NAME).expect("creator: listen");
-    let p = syscall::pipe();
+    let p = syscall::pipe().expect("creator: pipe");
     syscall::write(p.write, NOT_FOR_YOU).expect("creator: seed the pipe");
     let id = syscall::pipe_id(p.read).expect("creator: pipe_id");
     println!("{id}");

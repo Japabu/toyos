@@ -53,7 +53,7 @@ fn test() {
     // dup2 is the same operation with a caller-chosen slot, and must answer
     // the same. A `Ok` here would put the claim on fd 9 and leave `mouse`
     // closable.
-    match syscall::dup2(mouse, toyos_abi::Fd(9)) {
+    match syscall::dup2(mouse, toyos_abi::RawHandle(9)) {
         Err(SyscallError::PermissionDenied) => {}
         other => panic!("dup2 of a device fd: expected PermissionDenied, got {other:?}"),
     }
@@ -132,7 +132,7 @@ fn claim_in_child() -> Option<SyscallError> {
 /// One mmap region for both blobs: `user_bytes` needs the window to be
 /// physically contiguous, and a stack buffer that straddled a page would make
 /// this pass on `BadAddress` without ever reaching `build_child_fds`.
-fn spawn_with_fd_map(fd: toyos_abi::Fd) -> Result<toyos_abi::Pid, SyscallError> {
+fn spawn_with_fd_map(fd: toyos_abi::RawHandle) -> Result<toyos_abi::Pid, SyscallError> {
     const REGION: usize = 4096;
     const FD_MAP_OFF: usize = 2048;
 
@@ -149,7 +149,7 @@ fn spawn_with_fd_map(fd: toyos_abi::Fd) -> Result<toyos_abi::Pid, SyscallError> 
     let argv = format!("{SELF_PATH}\0claimer\0");
     unsafe { core::ptr::copy_nonoverlapping(argv.as_ptr(), region, argv.len()) };
 
-    let pair = [3u32.to_ne_bytes(), (fd.0 as u32).to_ne_bytes()].concat();
+    let pair = [3u32.to_ne_bytes(), fd.0.to_ne_bytes()].concat();
     unsafe {
         core::ptr::copy_nonoverlapping(pair.as_ptr(), region.add(FD_MAP_OFF), pair.len())
     };

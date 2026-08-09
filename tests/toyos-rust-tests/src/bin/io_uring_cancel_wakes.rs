@@ -37,7 +37,7 @@ static REGISTERED: AtomicBool = AtomicBool::new(false);
 static RETURNED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
-    let pipe = syscall::pipe();
+    let pipe = syscall::pipe().expect("the pipe the waiter parks on");
     // The second descriptor. Closing this one is what `remove_fd` acts on,
     // while `pipe.read` keeps the pipe's reader count above zero.
     let dup = syscall::dup(pipe.read).expect("dup the read end");

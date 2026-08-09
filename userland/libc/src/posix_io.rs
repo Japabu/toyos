@@ -4,7 +4,7 @@
 
 use core::ptr;
 
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, OpenFlags, SeekFrom};
 
 // Constants (matching POSIX / Linux values)
@@ -50,7 +50,7 @@ fn set_errno(e: toyos_abi::syscall::SyscallError) -> i32 {
     -1
 }
 
-fn fd(raw: i32) -> Fd { Fd(raw) }
+fn fd(raw: i32) -> RawHandle { RawHandle(raw as u32) }
 
 pub fn c_str_to_bytes(s: *const u8) -> &'static [u8] {
     unsafe {
@@ -74,7 +74,7 @@ pub unsafe extern "C" fn open(path: *const u8, flags: i32, _mode: u32) -> i32 {
     if flags & O_APPEND != 0 { oflags |= OpenFlags::APPEND; }
 
     match syscall::open(path_bytes, oflags) {
-        Ok(f) => f.0,
+        Ok(f) => f.0 as i32,
         Err(e) => set_errno(e),
     }
 }
@@ -162,7 +162,7 @@ pub unsafe extern "C" fn fsync(raw_fd: i32) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn dup(raw_fd: i32) -> i32 {
     match syscall::dup(fd(raw_fd)) {
-        Ok(f) => f.0,
+        Ok(f) => f.0 as i32,
         Err(e) => set_errno(e),
     }
 }
@@ -171,16 +171,19 @@ pub unsafe extern "C" fn dup(raw_fd: i32) -> i32 {
 pub unsafe extern "C" fn dup2(old_fd: i32, new_fd: i32) -> i32 {
     if old_fd == new_fd { return new_fd; }
     match syscall::dup2(fd(old_fd), fd(new_fd)) {
-        Ok(f) => f.0,
+        Ok(f) => f.0 as i32,
         Err(e) => set_errno(e),
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pipe(pipefd: *mut i32) -> i32 {
-    let fds = syscall::pipe();
-    *pipefd = fds.read.0;
-    *pipefd.add(1) = fds.write.0;
+    let fds = match syscall::pipe() {
+        Ok(fds) => fds,
+        Err(e) => return set_errno(e),
+    };
+    *pipefd = fds.read.0 as i32;
+    *pipefd.add(1) = fds.write.0 as i32;
     0
 }
 
@@ -239,7 +242,7 @@ unsafe fn stat_impl(path: *const u8, buf: *mut Stat) -> i32 {
     // Try opening read-only
     match syscall::open(path_bytes, OpenFlags::READ) {
         Ok(f) => {
-            let result = fstat(f.0, buf);
+            let result = fstat(f.0 as i32, buf);
             syscall::close(f);
             result
         }
@@ -485,7 +488,7 @@ pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: u32, timeout: i32) -> i32 
         let mut flags = 0u32;
         if pfd.events & POLLIN != 0 { flags |= toyos::poller::IORING_POLL_IN; }
         if pfd.events & POLLOUT != 0 { flags |= toyos::poller::IORING_POLL_OUT; }
-        poller.poll_add_fd(toyos_abi::Fd(pfd.fd), flags, i as u64);
+        poller.poll_add_fd(toyos_abi::RawHandle(pfd.fd as u32), flags, i as u64);
     }
 
     let mut ready_set = alloc::vec![false; n];

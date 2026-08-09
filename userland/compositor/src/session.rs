@@ -13,7 +13,7 @@ use toyos::ipc::RxStep;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::shm::SharedMemory;
 use toyos::{gpu, ipc, services, system, FramebufferDev, Keyboard, Listener, Mouse};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_desktop::{
     cursor_from_abs, cursor_style, fold_mouse, hit_test, key_action, set_mode, tab_action, Chrome,
     CursorStyle, Damage, Desk, Grab, Held, Hit, KeyAction, Point, Rect, Released, Stack, TabAction,
@@ -103,7 +103,7 @@ pub struct Session {
     cursor: Point,
     prev_buttons: u8,
     grab: Grab,
-    last_click_fd: Option<Fd>,
+    last_click_fd: Option<RawHandle>,
     last_click_at: Instant,
     clipboard: String,
     launcher_open: bool,
@@ -338,7 +338,7 @@ impl Session {
         true
     }
 
-    fn is_ready(&self, fd: Fd) -> bool {
+    fn is_ready(&self, fd: RawHandle) -> bool {
         self.ready.contains(&(fd.0 as u64))
     }
 
@@ -892,7 +892,7 @@ impl Session {
         self.damage_all();
     }
 
-    fn answer_resolution(&mut self, fd: Fd, pid: u32) {
+    fn answer_resolution(&mut self, fd: RawHandle, pid: u32) {
         let reply =
             window::ResolutionInfo { width: self.fb_info.width, height: self.fb_info.height };
         if ipc::try_send(fd, window::MSG_RESOLUTION_CHANGED, &reply).is_err() {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos::poller::{IORING_POLL_IN, Poller};
 use toyos::ipc;
 use toyos::ipc::{Connection, IpcPayload, RxStep};
@@ -651,7 +651,7 @@ impl NetDaemon {
         client: &Client,
         socket: &mut udp::Socket,
         max_len: u32,
-        rx_write_fd: Fd,
+        rx_write_fd: RawHandle,
     ) -> bool {
         if !socket.can_recv() {
             return false;

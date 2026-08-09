@@ -18,7 +18,7 @@
 //! `a_queued_connection_pins_no_memory` is what says so.
 
 use toyos_abi::syscall::{self, SyscallError};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 
 const NAME: &str = "abuse-connect-flood";
 /// Comfortably past the kernel's burst allowance, and far short of `MAX_FDS`.
@@ -36,7 +36,7 @@ fn main() {
     let listener = syscall::listen(NAME).expect("listen on a name of our own");
 
     let before = used_bytes();
-    let mut held: Vec<Fd> = Vec::new();
+    let mut held: Vec<RawHandle> = Vec::new();
     let mut refused_after = None;
     for i in 0..ATTEMPTS {
         match syscall::connect(NAME) {

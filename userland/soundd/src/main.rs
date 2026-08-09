@@ -1,5 +1,5 @@
 use toyos_abi::audio::{AudioCompletionRecord, AudioSlotHeader};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos::audio::{
     AudioSlotReader, StreamOpenRequest, StreamOpenResponse, StreamSetVolume, FORMAT_S16LE,
     MSG_STREAM_OPEN, MSG_STREAM_OPENED, MSG_STREAM_SET_VOLUME, MSG_STREAM_CLOSE, MSG_STREAM_ERROR,
@@ -77,7 +77,7 @@ trait Backend {
     fn pipeline(&self) -> Pipeline;
 
     /// The handle a completion arrives on.
-    fn handle(&self) -> Fd;
+    fn handle(&self) -> RawHandle;
 
     /// Where period `idx`'s samples go. Device memory this process may write,
     /// mapped once at claim.
@@ -116,7 +116,7 @@ impl Backend for VirtioBackend {
         Pipeline::Queue
     }
 
-    fn handle(&self) -> Fd {
+    fn handle(&self) -> RawHandle {
         self.virtio.dev().as_handle()
     }
 
@@ -154,7 +154,7 @@ impl Backend for HdaBackend {
         Pipeline::Ring
     }
 
-    fn handle(&self) -> Fd {
+    fn handle(&self) -> RawHandle {
         self.hda.dev().as_handle()
     }
 
@@ -275,12 +275,12 @@ impl GainRamp {
 struct ClientStream {
     client_id: usize,
     slot_reader: AudioSlotReader,
-    signal_write_fd: Fd,
+    signal_write_fd: RawHandle,
     /// soundd's own reference to the signal pipe's read end, released the
     /// moment the client proves it holds one (see the mix loop). While soundd
     /// holds it the pipe has a reader whatever the client does, and §5.7's
     /// crash detection cannot fire.
-    signal_read_fd: Option<Fd>,
+    signal_read_fd: Option<RawHandle>,
     gain: GainRamp,
     client_channels: u16,
     client_period_frames: u32,
@@ -636,7 +636,13 @@ fn open_stream(
         hdr.read_idx.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
-    let pipe_fds = syscall::pipe();
+    let pipe_fds = match syscall::pipe() {
+        Ok(fds) => fds,
+        Err(e) => {
+            say!("soundd: no signal pipe for client {client_id} ({e:?})");
+            return None;
+        }
+    };
     let signal_pipe_id = syscall::pipe_id(pipe_fds.read).expect("pipe_id failed");
 
     let slot_reader = AudioSlotReader::new(shm, client_period_bytes, slot_count);
@@ -851,7 +857,7 @@ fn retain_active(streams: &mut Vec<ClientStream>) {
 fn mix_thread(
     backend: &mut dyn Backend,
     cmd_ring: &CommandRing,
-    cmd_pipe_read: Fd,
+    cmd_pipe_read: RawHandle,
     num_buffers: usize,
     device_sample_rate: u32,
     device_channels: u16,
@@ -1332,7 +1338,7 @@ fn mix_thread(
 /// claim there is no device to take.
 fn null_sink_thread(
     cmd_ring: &CommandRing,
-    cmd_pipe_read: Fd,
+    cmd_pipe_read: RawHandle,
     device_sample_rate: u32,
     device_channels: u16,
     device_period_frames: usize,
@@ -1562,7 +1568,7 @@ fn reject_open(req: &StreamOpenRequest) -> Option<&'static str> {
 /// forever) or asserting (soundd dead at a client's choosing). The retry is
 /// unbounded because the mix thread is the process's main thread — if it has
 /// stopped, soundd is already gone.
-fn submit(cmd_ring: &CommandRing, cmd_pipe_write: Fd, cmd: MixCommand, period_nanos: u64) {
+fn submit(cmd_ring: &CommandRing, cmd_pipe_write: RawHandle, cmd: MixCommand, period_nanos: u64) {
     let mut cmd = cmd;
     loop {
         let full = cmd_ring.try_push(cmd);
@@ -1580,7 +1586,7 @@ fn submit(cmd_ring: &CommandRing, cmd_pipe_write: Fd, cmd: MixCommand, period_na
 fn control_thread(
     listener: toyos::Listener,
     cmd_ring: &CommandRing,
-    cmd_pipe_write: Fd,
+    cmd_pipe_write: RawHandle,
     device_sample_rate: u32,
     device_channels: u16,
     device_period_frames: u32,
@@ -1859,7 +1865,7 @@ fn run_with_device(
         num_buffers, device_sample_rate, device_channels, device_period_bytes, device_period_frames);
 
     let cmd_ring = Arc::new(CommandRing::new());
-    let cmd_pipe = syscall::pipe();
+    let cmd_pipe = syscall::pipe().expect("soundd: failed to create the command pipe");
 
     let cmd_ring2 = cmd_ring.clone();
     std::thread::Builder::new()
@@ -1906,7 +1912,7 @@ fn run_null_sink(listener: toyos::Listener) {
     );
 
     let cmd_ring = Arc::new(CommandRing::new());
-    let cmd_pipe = syscall::pipe();
+    let cmd_pipe = syscall::pipe().expect("soundd: failed to create the command pipe");
 
     let cmd_ring2 = cmd_ring.clone();
     std::thread::Builder::new()

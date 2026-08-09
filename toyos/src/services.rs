@@ -1,7 +1,7 @@
 //! Service discovery via listen/connect/accept.
 
 use toyos_abi::syscall::{self, SyscallError};
-use crate::{Listener, Handle};
+use crate::{Listener, OwnedHandle};
 use crate::ipc::Connection;
 
 pub struct AcceptResult {
@@ -10,16 +10,16 @@ pub struct AcceptResult {
 }
 
 pub fn listen(name: &str) -> Result<Listener, SyscallError> {
-    syscall::listen(name).map(|fd| Listener(Handle(fd)))
+    syscall::listen(name).map(|fd| Listener(OwnedHandle(fd)))
 }
 
 pub fn accept(listener: &Listener) -> Result<AcceptResult, SyscallError> {
     syscall::accept(listener.fd()).map(|r| AcceptResult {
-        conn: Connection(Handle(r.fd)),
+        conn: Connection(OwnedHandle(r.fd)),
         client_pid: r.client_pid,
     })
 }
 
 pub fn connect(name: &str) -> Result<Connection, SyscallError> {
-    syscall::connect(name).map(|fd| Connection(Handle(fd)))
+    syscall::connect(name).map(|fd| Connection(OwnedHandle(fd)))
 }

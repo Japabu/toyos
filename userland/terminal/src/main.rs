@@ -14,7 +14,7 @@ use std::process::Command;
 use terminal::Console;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::surface::{self, Delivery, Host, Notice};
-use toyos::Fd;
+use toyos::RawHandle;
 use window::Window;
 
 const TOKEN_STDOUT: u64 = 0;
@@ -75,8 +75,8 @@ fn main() {
     eprintln!("terminal: ready");
 
     loop {
-        poller.poll_add_fd(Fd(shell_stdout.as_raw_fd()), IORING_POLL_IN, TOKEN_STDOUT);
-        poller.poll_add_fd(Fd(shell_stderr.as_raw_fd()), IORING_POLL_IN, TOKEN_STDERR);
+        poller.poll_add_fd(RawHandle(shell_stdout.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDOUT);
+        poller.poll_add_fd(RawHandle(shell_stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
         poller.poll_add_fd(window.fd(), IORING_POLL_IN, TOKEN_WINDOW);
         poller.poll_add_fd(host.listener_fd(), IORING_POLL_IN, TOKEN_LISTEN);
         for fd in host.client_fds() {

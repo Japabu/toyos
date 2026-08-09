@@ -1,5 +1,7 @@
 /// io_uring op codes. Raw u8 constants for shared memory SQEs.
 /// The kernel converts to a type-safe enum at the syscall boundary.
+use crate::RawHandle;
+
 pub const IORING_OP_NOP: u8 = 0;
 pub const IORING_OP_POLL_ADD: u8 = 1;
 pub const IORING_OP_POLL_REMOVE: u8 = 2;
@@ -17,7 +19,9 @@ pub struct IoUringSqe {
     pub op: u8,
     pub flags: u8,
     pub _pad: u16,
-    pub fd: i32,
+    /// The handle this entry is about. Signed until 2026-08-09, which made it
+    /// the one place a handle round-tripped through a type that can hold `-1`.
+    pub fd: RawHandle,
     pub off: u64,
     pub addr: u64,
     pub len: u32,
@@ -27,7 +31,7 @@ pub struct IoUringSqe {
 
 impl Default for IoUringSqe {
     fn default() -> Self {
-        Self { op: 0, flags: 0, _pad: 0, fd: 0, off: 0, addr: 0, len: 0, op_flags: 0, user_data: 0 }
+        Self { op: 0, flags: 0, _pad: 0, fd: RawHandle(0), off: 0, addr: 0, len: 0, op_flags: 0, user_data: 0 }
     }
 }
 

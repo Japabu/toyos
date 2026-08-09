@@ -29,7 +29,7 @@
 
 use toyos_abi::input::RawKeyEvent;
 use toyos_abi::syscall::SyscallError;
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 
 use crate::ipc::{self, Connection, FrameRx, RxStep, TrySendError};
 use crate::poller::{Poller, IORING_POLL_IN};
@@ -159,12 +159,12 @@ impl Host {
     }
 
     /// The listener, for the caller's poller.
-    pub fn listener_fd(&self) -> Fd {
+    pub fn listener_fd(&self) -> RawHandle {
         self.listener.fd()
     }
 
     /// Every connected client, for the caller's poller.
-    pub fn client_fds(&self) -> impl Iterator<Item = Fd> + '_ {
+    pub fn client_fds(&self) -> impl Iterator<Item = RawHandle> + '_ {
         self.peers.iter().flatten().map(|p| p.conn.fd())
     }
 
@@ -397,7 +397,7 @@ impl Keys {
 }
 
 impl AsHandle for Keys {
-    fn as_handle(&self) -> Fd {
+    fn as_handle(&self) -> RawHandle {
         self.conn.fd()
     }
 }

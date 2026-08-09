@@ -4,8 +4,8 @@
 //! and provides typed read methods.
 
 use toyos_abi::syscall::{self, DeviceType, SyscallError};
-use crate::{Device, Handle, AsHandle};
-use toyos_abi::Fd;
+use crate::{Device, OwnedHandle, AsHandle};
+use toyos_abi::RawHandle;
 
 pub(crate) fn read_info<T: Copy>(dev: &Device) -> Result<T, SyscallError> {
     let size = core::mem::size_of::<T>();
@@ -22,10 +22,10 @@ pub struct Keyboard(pub(crate) Device);
 
 impl Keyboard {
     pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::Keyboard).map(|fd| Keyboard(Device(Handle(fd))))
+        syscall::open_device(DeviceType::Keyboard).map(|fd| Keyboard(Device(OwnedHandle(fd))))
     }
 
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 
     /// Non-blocking read of pending key events; empty surfaces as `Err(WouldBlock)`.
     ///
@@ -40,17 +40,17 @@ impl Keyboard {
 }
 
 impl AsHandle for Keyboard {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 pub struct Mouse(pub(crate) Device);
 
 impl Mouse {
     pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::Mouse).map(|fd| Mouse(Device(Handle(fd))))
+        syscall::open_device(DeviceType::Mouse).map(|fd| Mouse(Device(OwnedHandle(fd))))
     }
 
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 
     /// Non-blocking read of pending mouse events; empty surfaces as `Err(WouldBlock)`.
     ///
@@ -62,14 +62,14 @@ impl Mouse {
 }
 
 impl AsHandle for Mouse {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 pub struct FramebufferDev(pub(crate) Device);
 
 impl FramebufferDev {
     pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::Framebuffer).map(|fd| FramebufferDev(Device(Handle(fd))))
+        syscall::open_device(DeviceType::Framebuffer).map(|fd| FramebufferDev(Device(OwnedHandle(fd))))
     }
 
     pub fn info(&self) -> Result<toyos_abi::FramebufferInfo, SyscallError> {
@@ -78,17 +78,17 @@ impl FramebufferDev {
 }
 
 impl AsHandle for FramebufferDev {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 pub struct Nic(pub(crate) Device);
 
 impl Nic {
     pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::Nic).map(|fd| Nic(Device(Handle(fd))))
+        syscall::open_device(DeviceType::Nic).map(|fd| Nic(Device(OwnedHandle(fd))))
     }
 
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 
     pub fn info(&self) -> Result<toyos_abi::net::NicInfo, SyscallError> {
         read_info(&self.0)
@@ -96,7 +96,7 @@ impl Nic {
 }
 
 impl AsHandle for Nic {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 /// A virtio-sound device the kernel brought up and drives no policy on.
@@ -109,7 +109,7 @@ pub struct VirtioSoundDev(pub(crate) Device);
 
 impl VirtioSoundDev {
     pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::VirtioSound).map(|fd| VirtioSoundDev(Device(Handle(fd))))
+        syscall::open_device(DeviceType::VirtioSound).map(|fd| VirtioSoundDev(Device(OwnedHandle(fd))))
     }
 
     pub fn info(&self) -> Result<toyos_abi::virtio_sound::VirtioSoundInfo, SyscallError> {
@@ -145,7 +145,7 @@ impl VirtioSoundDev {
 }
 
 impl AsHandle for VirtioSoundDev {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 /// An Intel HDA controller the kernel brought up and drives no policy on.
@@ -158,7 +158,7 @@ pub struct HdaDev(pub(crate) Device);
 
 impl HdaDev {
     pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::HdaAudio).map(|fd| HdaDev(Device(Handle(fd))))
+        syscall::open_device(DeviceType::HdaAudio).map(|fd| HdaDev(Device(OwnedHandle(fd))))
     }
 
     pub fn info(&self) -> Result<toyos_abi::hda::HdaInfo, SyscallError> {
@@ -210,5 +210,5 @@ impl HdaDev {
 }
 
 impl AsHandle for HdaDev {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }

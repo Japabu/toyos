@@ -20,22 +20,34 @@ pub mod system;
 pub use ipc::Connection;
 pub use device::{Keyboard, Mouse, FramebufferDev, Nic, VirtioSoundDev, HdaDev};
 
-pub use toyos_abi::Fd;
+pub use toyos_abi::RawHandle;
 
-/// Trait for types that wrap a kernel handle (fd).
+/// Trait for types that wrap a kernel handle.
 ///
-/// Used by [`ring::Ring::poll_add`] and other APIs that accept any handle type.
+/// Used by [`poller`] and other APIs that accept any handle type.
 pub trait AsHandle {
-    fn as_handle(&self) -> Fd;
+    fn as_handle(&self) -> RawHandle;
 }
 
-/// Internal base handle. Non-Copy. Drop calls close.
+/// One owned handle, closed when it drops.
+///
+/// `!Copy` and `!Clone`, so a handle cannot be closed twice and cannot be
+/// forgotten by accident — [`OwnedHandle::into_raw`] is the single spelling for
+/// giving up ownership, and the single thing to grep for when asking who does.
 ///
 /// Not public — consumers use the typed wrappers below.
-pub(crate) struct Handle(pub(crate) Fd);
+pub(crate) struct OwnedHandle(pub(crate) RawHandle);
 
-impl Handle {
-    pub(crate) fn fd(&self) -> Fd { self.0 }
+impl OwnedHandle {
+    pub(crate) fn fd(&self) -> RawHandle { self.0 }
+
+    /// Give up ownership: the handle stays open and this stops answering for
+    /// it.
+    pub(crate) fn into_raw(self) -> RawHandle {
+        let raw = self.0;
+        core::mem::forget(self);
+        raw
+    }
 
     pub(crate) fn read(&self, buf: &mut [u8]) -> Result<usize, toyos_abi::syscall::SyscallError> {
         toyos_abi::syscall::read(self.0, buf)
@@ -54,28 +66,28 @@ impl Handle {
     }
 }
 
-impl Drop for Handle {
+impl Drop for OwnedHandle {
     fn drop(&mut self) {
         toyos_abi::syscall::close(self.0);
     }
 }
 
 /// A service listener. Created by [`services::listen`].
-pub struct Listener(pub(crate) Handle);
+pub struct Listener(pub(crate) OwnedHandle);
 
 impl Listener {
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 }
 
 impl AsHandle for Listener {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 /// A claimed hardware device. Created by [`device::open_keyboard`] etc.
-pub struct Device(pub(crate) Handle);
+pub struct Device(pub(crate) OwnedHandle);
 
 impl Device {
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, toyos_abi::syscall::SyscallError> {
         self.0.read(buf)
@@ -83,14 +95,14 @@ impl Device {
 }
 
 impl AsHandle for Device {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 /// A kernel pipe endpoint. Created by [`pipe::open_by_id`].
-pub struct Pipe(pub(crate) Handle);
+pub struct Pipe(pub(crate) OwnedHandle);
 
 impl Pipe {
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, toyos_abi::syscall::SyscallError> {
         self.0.read(buf)
@@ -116,14 +128,12 @@ impl Pipe {
         toyos_abi::syscall::pipe_id(self.fd())
     }
 
-    /// Consume the Pipe, returning the raw fd without closing it.
-    pub fn into_fd(self) -> Fd {
-        let fd = self.0.fd();
-        core::mem::forget(self);
-        fd
+    /// Consume the `Pipe`, giving up the handle without closing it.
+    pub fn into_fd(self) -> RawHandle {
+        self.0.into_raw()
     }
 }
 
 impl AsHandle for Pipe {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }

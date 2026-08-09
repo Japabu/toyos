@@ -178,7 +178,7 @@ pub enum AudioError {
 pub struct AudioStream {
     control: crate::Connection,
     slot_writer: AudioSlotWriter,
-    signal_fd: toyos_abi::Fd,
+    signal_fd: toyos_abi::RawHandle,
     period_frames: u32,
     device_sample_rate: u32,
     device_channels: u16,

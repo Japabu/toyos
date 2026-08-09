@@ -7,7 +7,7 @@
 use toyos_abi::syscall;
 use crate::ipc::{IpcHeader, IpcPayload};
 use crate::ipc_payload;
-use crate::{Connection, Pipe, Handle};
+use crate::{Connection, Pipe, OwnedHandle};
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,6 +326,18 @@ impl PendingResponse {
     }
 }
 
+fn pipe_pair() -> Result<(syscall::PipeFds, syscall::PipeFds), NetError> {
+    let first = syscall::pipe().map_err(|_| NetError::Io)?;
+    match syscall::pipe() {
+        Ok(second) => Ok((first, second)),
+        Err(_) => {
+            syscall::close(first.read);
+            syscall::close(first.write);
+            Err(NetError::Io)
+        }
+    }
+}
+
 // TCP client functions
 
 pub fn tcp_connect(
@@ -333,8 +345,7 @@ pub fn tcp_connect(
     port: u16,
     timeout_ms: u32,
 ) -> Result<TcpConnection, NetError> {
-    let rx_pipe = syscall::pipe();
-    let tx_pipe = syscall::pipe();
+    let (rx_pipe, tx_pipe) = pipe_pair()?;
 
     let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Io)?;
     let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Io)?;
@@ -356,8 +367,8 @@ pub fn tcp_connect(
             syscall::close(rx_pipe.write);
             syscall::close(tx_pipe.read);
             Ok(TcpConnection {
-                rx: Pipe(Handle(rx_pipe.read)),
-                tx: Pipe(Handle(tx_pipe.write)),
+                rx: Pipe(OwnedHandle(rx_pipe.read)),
+                tx: Pipe(OwnedHandle(tx_pipe.write)),
                 socket_id: TcpSocketId(resp.socket_id),
                 local_port: resp.local_port,
             })
@@ -373,7 +384,7 @@ pub fn tcp_connect(
 }
 
 pub fn tcp_bind(addr: [u8; 4], port: u16) -> Result<TcpBound, NetError> {
-    let notify_pipe = syscall::pipe();
+    let notify_pipe = syscall::pipe().map_err(|_| NetError::Io)?;
     let notify_pipe_id = syscall::pipe_id(notify_pipe.write).map_err(|_| NetError::Io)?;
 
     let result = NetdConn::connect_blocking()?
@@ -389,7 +400,7 @@ pub fn tcp_bind(addr: [u8; 4], port: u16) -> Result<TcpBound, NetError> {
         Ok(resp) => {
             syscall::close(notify_pipe.write);
             Ok(TcpBound {
-                notify: Pipe(Handle(notify_pipe.read)),
+                notify: Pipe(OwnedHandle(notify_pipe.read)),
                 socket_id: TcpSocketId(resp.socket_id),
                 bound_port: resp.bound_port,
             })
@@ -403,8 +414,7 @@ pub fn tcp_bind(addr: [u8; 4], port: u16) -> Result<TcpBound, NetError> {
 }
 
 pub fn tcp_accept(socket_id: TcpSocketId) -> Result<TcpAccepted, NetError> {
-    let rx_pipe = syscall::pipe();
-    let tx_pipe = syscall::pipe();
+    let (rx_pipe, tx_pipe) = pipe_pair()?;
 
     let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Io)?;
     let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Io)?;
@@ -423,8 +433,8 @@ pub fn tcp_accept(socket_id: TcpSocketId) -> Result<TcpAccepted, NetError> {
             syscall::close(rx_pipe.write);
             syscall::close(tx_pipe.read);
             Ok(TcpAccepted {
-                rx: Pipe(Handle(rx_pipe.read)),
-                tx: Pipe(Handle(tx_pipe.write)),
+                rx: Pipe(OwnedHandle(rx_pipe.read)),
+                tx: Pipe(OwnedHandle(tx_pipe.write)),
                 socket_id: TcpSocketId(resp.socket_id),
                 remote_addr: resp.remote_addr,
                 remote_port: resp.remote_port,
@@ -469,8 +479,7 @@ pub fn tcp_get_option(socket_id: TcpSocketId, option: u32) -> Result<u32, NetErr
 // UDP client functions
 
 pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
-    let tx_pipe = syscall::pipe();
-    let rx_pipe = syscall::pipe();
+    let (tx_pipe, rx_pipe) = pipe_pair()?;
 
     let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Io)?;
     let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Io)?;
@@ -492,8 +501,8 @@ pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
             Ok(UdpBound {
                 socket_id: UdpSocketId(resp.socket_id),
                 bound_port: resp.bound_port,
-                tx: Pipe(Handle(tx_pipe.write)),
-                rx: Pipe(Handle(rx_pipe.read)),
+                tx: Pipe(OwnedHandle(tx_pipe.write)),
+                rx: Pipe(OwnedHandle(rx_pipe.read)),
             })
         }
         Err(e) => {

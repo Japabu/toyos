@@ -28,17 +28,17 @@ use std::process::{exit, Command, Stdio};
 
 use toyos::{ipc, services, Connection};
 use toyos_abi::syscall::{self, SyscallError};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use window::Window;
 
 const SELF_PATH: &str = "/bin/test_rs_compositor_client_death";
 
 /// The compositor connection, in the process that finishes the request its
 /// creator did not live to send.
-const RELAY_SOCKET: Fd = Fd(3);
+const RELAY_SOCKET: RawHandle = RawHandle(3);
 /// The other end of the root's pipe, which closes when the creator has been
 /// reaped. Nothing is ever read off it but the hang-up.
-const RELAY_GO: Fd = Fd(4);
+const RELAY_GO: RawHandle = RawHandle(4);
 
 /// `MSG_GET_RESOLUTION` is answered from the compositor's dispatch, so a reply
 /// proves the event loop reached the end of a pass rather than merely that the
@@ -174,8 +174,8 @@ fn connect_and_go() {
     // outlive this process.
     Command::new(SELF_PATH)
         .arg("finish")
-        .inherit_fd(RELAY_SOCKET.0 as u32, conn.fd().0 as u32)
-        .inherit_fd(RELAY_GO.0 as u32, 0)
+        .inherit_fd(RELAY_SOCKET.0, conn.fd().0)
+        .inherit_fd(RELAY_GO.0, 0)
         .spawn()
         .expect("spawn the process that finishes the request");
     println!("connected");
@@ -212,7 +212,7 @@ fn clipboard_shm(token: u32, len: u32, what: &str) {
 
 /// Every write here fits in the pipe it goes into, so a blocking `write` can
 /// only be the compositor's problem, never this binary's.
-fn write_raw_fd(fd: toyos_abi::Fd, bytes: &[u8], what: &str) {
+fn write_raw_fd(fd: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
     let mut offset = 0;
     while offset < bytes.len() {
         match syscall::write(fd, &bytes[offset..]) {

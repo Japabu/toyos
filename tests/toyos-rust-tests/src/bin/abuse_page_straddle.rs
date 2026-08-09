@@ -13,6 +13,7 @@
 //! them contiguously, so the bytes the kernel would have written past the end
 //! of the first physical page are bytes this process can read back.
 
+use toyos_abi::RawHandle;
 use toyos_abi::syscall::{
     self, MmapFlags, MmapProt, OpenFlags, ProcessStats, SchedInfo, SpawnArgs, SyscallError,
     SYS_FSTAT, SYS_PROCESS_STATS, SYS_SCHED_INFO,
@@ -43,8 +44,8 @@ fn raw(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     ret
 }
 
-fn fstat_raw(fd: i32, out: u64) -> u64 {
-    raw(SYS_FSTAT, fd as u64, out, 0)
+fn fstat_raw(fd: RawHandle, out: u64) -> u64 {
+    raw(SYS_FSTAT, fd.0 as u64, out, 0)
 }
 
 fn err(ret: u64) -> Option<SyscallError> {
@@ -80,7 +81,7 @@ fn main() {
     };
 
     poison(straddling, STAT_LEN);
-    let ret = fstat_raw(fd.0, straddling);
+    let ret = fstat_raw(fd, straddling);
     // The memory before the verdict: an error return the kernel produced after
     // making the write is the failure this gate exists to catch, and asserting
     // the verdict first would stop the run before anyone looked.
@@ -96,7 +97,7 @@ fn main() {
     //    refusal above is about the boundary and nothing else.
     let fitting = boundary - STAT_LEN as u64;
     poison(fitting, STAT_LEN);
-    let ret = fstat_raw(fd.0, fitting);
+    let ret = fstat_raw(fd, fitting);
     assert!(err(ret).is_none(), "fstat refused a Stat that ends at the boundary: {ret:#x}");
     let size = unsafe { (fitting as *const u64).add(1).read_volatile() };
     assert!(size > 0, "fstat wrote a Stat with no size in it");

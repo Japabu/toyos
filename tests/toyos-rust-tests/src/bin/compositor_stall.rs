@@ -152,7 +152,7 @@ fn write_raw(conn: &Connection, bytes: &[u8], what: &str) {
 
 /// Every write here fits in the pipe it goes into, so a blocking `write` can
 /// only be the compositor's problem, never this binary's.
-fn write_raw_fd(fd: toyos_abi::Fd, bytes: &[u8], what: &str) {
+fn write_raw_fd(fd: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
     let mut offset = 0;
     while offset < bytes.len() {
         match syscall::write(fd, &bytes[offset..]) {

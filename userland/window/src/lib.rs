@@ -567,7 +567,7 @@ impl Window {
         let _ = self.conn.send(MSG_PRESENT, &damage);
     }
 
-    pub fn fd(&self) -> toyos_abi::Fd {
+    pub fn fd(&self) -> toyos_abi::RawHandle {
         self.conn.fd()
     }
 
