@@ -1,0 +1,175 @@
+//! A port: the thing a service *is*, once it stops being a name.
+//!
+//! Two object types over one shared queue. A server holds the [`Acceptor`] and
+//! a client holds a [`Connector`], so "accept the connections of a service you
+//! were only given access to" is a state that cannot be written rather than a
+//! runtime `PermissionDenied` — the same reason a pipe's two ends are two
+//! types.
+//!
+//! **Both ends exist before either process runs**, which is the whole
+//! mechanism: `/bin/init` creates the port and endows the two halves, so a
+//! client's first instruction can connect whether or not the server has
+//! reached `accept` or has even been spawned. There is no instant at which a
+//! name is not bound yet, so there is nothing to retry and no timeout
+//! anywhere.
+
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use toyos_sched::task::WaitClass;
+
+use crate::io_uring::RingId;
+use crate::pipe::{PipeReader, PipeWriter};
+use crate::process::Pid;
+use crate::sched::payload::KWaitQueue;
+use crate::sched::waitqs::new_queue;
+use crate::sync::Lock;
+
+use super::{KObjectVariant, ObjectCore, ZeroHandles};
+
+/// Unaccepted connections one port may hold.
+///
+/// Policy on the primitive: past it a client sees `ResourceExhausted`, and a
+/// queued connection costs a `PendingConnection` and no memory at all until
+/// somebody writes a byte on it.
+pub const MAX_PENDING_CONNECTIONS: usize = 32;
+
+/// A connection nobody has accepted yet.
+///
+/// It owns the server's two pipe ends, so a client that exits before the
+/// accept leaves the server something to read an EOF from rather than nothing.
+pub struct PendingConnection {
+    pub rx: PipeReader,
+    pub tx: PipeWriter,
+    pub client_pid: Pid,
+}
+
+/// Everything the two ends share. Neither end holds the other, so no `Arc`
+/// cycle exists.
+pub struct PortShared {
+    queue: Lock<VecDeque<PendingConnection>>,
+    /// Threads blocked in `accept`.
+    acceptors: Arc<KWaitQueue>,
+    io_uring_watchers: Lock<Vec<RingId>>,
+    /// Set by [`Acceptor`]'s zero-handle hook. A connector whose acceptor is
+    /// gone refuses rather than queueing for a server that will never read.
+    closed: AtomicBool,
+}
+
+pub struct Acceptor {
+    pub(super) core: ObjectCore,
+    shared: Arc<PortShared>,
+}
+
+pub struct Connector {
+    pub(super) core: ObjectCore,
+    shared: Arc<PortShared>,
+}
+
+/// Why a connection was not queued.
+pub enum PushError {
+    /// The acceptor is gone: the server exited, or never existed.
+    Closed,
+    QueueFull,
+}
+
+pub fn create() -> (Arc<Acceptor>, Arc<Connector>) {
+    let shared = Arc::new(PortShared {
+        queue: Lock::new(VecDeque::new()),
+        acceptors: new_queue(WaitClass::Ipc),
+        io_uring_watchers: Lock::new(Vec::new()),
+        closed: AtomicBool::new(false),
+    });
+    (
+        Arc::new(Acceptor { core: Acceptor::new_core(), shared: shared.clone() }),
+        Arc::new(Connector { core: Connector::new_core(), shared }),
+    )
+}
+
+/// **The io_uring watch names the port, not either end**, because a client
+/// connecting through a `Connector` has to complete a poll a server registered
+/// on the `Acceptor` — and the two share exactly this.
+impl PortShared {
+    pub fn has_pending(&self) -> bool {
+        !self.queue.lock().is_empty()
+    }
+
+    /// The waiter set, cloned out so a blocking site can hold it across its own
+    /// park — the ticket borrows the queue, not the port.
+    pub fn waiters(&self) -> Arc<KWaitQueue> {
+        self.acceptors.clone()
+    }
+
+    pub fn watchers(&self) -> Vec<RingId> {
+        self.io_uring_watchers.lock().clone()
+    }
+
+    pub fn add_watcher(&self, ring: RingId) {
+        let mut watchers = self.io_uring_watchers.lock();
+        if !watchers.contains(&ring) {
+            watchers.push(ring);
+        }
+    }
+
+    pub fn remove_watcher(&self, ring: RingId) {
+        self.io_uring_watchers.lock().retain(|&id| id != ring);
+    }
+}
+
+impl Acceptor {
+    pub fn pop(&self) -> Option<PendingConnection> {
+        self.shared.queue.lock().pop_front()
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.shared.has_pending()
+    }
+
+    pub fn waiters(&self) -> Arc<KWaitQueue> {
+        self.shared.waiters()
+    }
+
+    pub fn port(&self) -> Arc<PortShared> {
+        self.shared.clone()
+    }
+}
+
+impl Connector {
+    pub fn closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
+
+    pub fn push(&self, connection: PendingConnection) -> Result<(), PushError> {
+        if self.closed() {
+            return Err(PushError::Closed);
+        }
+        let mut queue = self.shared.queue.lock();
+        if queue.len() >= MAX_PENDING_CONNECTIONS {
+            return Err(PushError::QueueFull);
+        }
+        queue.push_back(connection);
+        Ok(())
+    }
+
+    pub fn waiters(&self) -> Arc<KWaitQueue> {
+        self.shared.waiters()
+    }
+
+    pub fn port(&self) -> Arc<PortShared> {
+        self.shared.clone()
+    }
+}
+
+/// The port closes and every queued connection's pipe ends drop, which is what
+/// makes each waiting client's next write `Gone` and its next read `0`. A
+/// server that exited without serving is a bound of one process lifetime and
+/// nothing else.
+impl ZeroHandles for Acceptor {
+    fn on_zero_handles(&self) {
+        self.shared.closed.store(true, Ordering::Release);
+        let queued = core::mem::take(&mut *self.shared.queue.lock());
+        drop(queued);
+    }
+}

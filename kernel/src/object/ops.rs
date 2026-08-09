@@ -48,7 +48,7 @@ pub fn initial_rights(object: &KObjectRef) -> Rights {
             Rights::TRANSFER.union(Rights::WAIT).union(Rights::READ).union(Rights::WRITE)
         }
         KObjectRef::Console(_) => BASE.union(Rights::READ).union(Rights::WRITE),
-        KObjectRef::Listener(_) => BASE.union(Rights::READ),
+        KObjectRef::Acceptor(_) => BASE.union(Rights::READ),
         KObjectRef::IoUring(_) => {
             BASE.union(Rights::READ).union(Rights::WRITE).union(Rights::MAP)
         }
@@ -194,7 +194,7 @@ pub fn pipe_id_read(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::PipeRead(r) => Some(r.id()),
         KObjectRef::Connection(c) => Some(c.rx()),
         KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Listener(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_) => None,
     }
 }
@@ -204,7 +204,7 @@ pub fn pipe_id_write(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::PipeWrite(w) => Some(w.id()),
         KObjectRef::Connection(c) => Some(c.tx()),
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Listener(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_) => None,
     }
 }
@@ -213,7 +213,7 @@ pub fn read_source(object: &KObjectRef) -> Option<Source> {
     match object {
         KObjectRef::PipeRead(r) => Some(Source::PipeReadable(r.id())),
         KObjectRef::Connection(c) => Some(Source::PipeReadable(c.rx())),
-        KObjectRef::Listener(l) => Some(Source::Listener(l.id())),
+        KObjectRef::Acceptor(a) => Some(Source::Port(a.port())),
         KObjectRef::Console(_) => Some(Source::Keyboard),
         KObjectRef::Device(d) => match d.class() {
             device_registry::DeviceType::Keyboard => Some(Source::Keyboard),
@@ -233,7 +233,7 @@ pub fn write_source(object: &KObjectRef) -> Option<Source> {
         KObjectRef::PipeWrite(w) => Some(Source::PipeWritable(w.id())),
         KObjectRef::Connection(c) => Some(Source::PipeWritable(c.tx())),
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Listener(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_) => None,
     }
 }
@@ -369,7 +369,7 @@ pub fn try_read(object: &KObjectRef, buf: &mut UserBytesMut) -> Option<u64> {
             }
             Some(count as u64)
         }
-        KObjectRef::PipeWrite(_) | KObjectRef::Listener(_) | KObjectRef::IoUring(_)
+        KObjectRef::PipeWrite(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_) => Some(SyscallError::PermissionDenied.to_u64()),
     }
 }
@@ -425,7 +425,7 @@ pub fn try_write(object: &KObjectRef, buf: &UserBytes) -> Option<u64> {
             serial::SerialWriter::console().write_user(buf);
             Some(buf.len() as u64)
         }
-        KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Listener(_)
+        KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
         | KObjectRef::IoUring(_) | KObjectRef::SysCap(_) => {
             Some(SyscallError::PermissionDenied.to_u64())
         }
@@ -480,7 +480,7 @@ pub fn fstat(object: &KObjectRef) -> Stat {
         }
         KObjectRef::Connection(_) => plain(FileType::Socket),
         KObjectRef::Console(_) => plain(FileType::Serial),
-        KObjectRef::Listener(_) => plain(FileType::Pipe),
+        KObjectRef::Acceptor(_) => plain(FileType::Pipe),
         KObjectRef::IoUring(_) | KObjectRef::SysCap(_) => plain(FileType::Unknown),
         KObjectRef::Device(d) => plain(match d.class() {
             device_registry::DeviceType::Keyboard => FileType::Keyboard,
@@ -533,7 +533,7 @@ pub fn has_data(object: &KObjectRef) -> bool {
         KObjectRef::PipeRead(r) => pipe::has_data(r.id()),
         KObjectRef::Connection(c) => pipe::has_data(c.rx()),
         KObjectRef::Console(_) => serial::has_data(),
-        KObjectRef::Listener(l) => crate::listener::has_pending_by_id(l.id()),
+        KObjectRef::Acceptor(a) => a.has_pending(),
         KObjectRef::File(_) => true,
         KObjectRef::Device(d) => match d.class() {
             device_registry::DeviceType::Keyboard => keyboard::has_data(),
@@ -556,7 +556,7 @@ pub fn has_space(object: &KObjectRef) -> bool {
         KObjectRef::PipeWrite(w) => pipe::has_space(w.id()),
         KObjectRef::Connection(c) => pipe::has_space(c.tx()),
         KObjectRef::File(_) | KObjectRef::Console(_) => true,
-        KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Listener(_)
+        KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
         | KObjectRef::IoUring(_) | KObjectRef::SysCap(_) => false,
     }
 }
@@ -578,7 +578,7 @@ pub fn mark_tty(object: &KObjectRef) -> u64 {
             0
         }
         KObjectRef::Connection(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Listener(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_) => SyscallError::InvalidArgument.to_u64(),
     }
 }

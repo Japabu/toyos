@@ -1976,6 +1976,36 @@ shared memory to it and have nothing else to grant to until handle transfer
 exists. `kernel/src/listener.rs` deleted, `SYS_LISTEN`/`SYS_CONNECT` retired.
 `toyos/src/{port,namespace}.rs`. Kernel compiles, userland does not.
 
+**Done, 2026-08-09, and the non-green stretch is 3–5 rather than 3–4.** The
+ordering constraint the plan did not have: **`library/std` depends on `toyos` by
+path**, so the SDK is compiled as part of the sysroot build and a `toyos` that
+does not compile stops *everything* — the kernel included, since the toolchain
+step runs first. Deleting `toyos/src/services.rs` therefore has to take its four
+in-SDK callers with it, and those are `audio.rs:267`, `net.rs:268`, `net.rs:273`
+and `surface.rs:36`, every one of which needs the process's own namespace and
+therefore `toyos/src/endow.rs` — which is chunk 4's. So the three chunks are one
+stretch: **chunk 3 leaves the sysroot build red on exactly those four lines**,
+and nothing downstream of the toolchain step is compiled at all until chunk 4's
+`SYS_ENDOWMENTS` lands and chunk 5 rewrites them. Anyone resuming here should
+expect `cargo run -- --build-only` to stop in `toyos` and should not read that as
+a kernel failure: the kernel half of chunk 3 compiled clean in the run before
+`services.rs` was deleted.
+
+Two other things it found:
+
+- **The io_uring watch names the *port*, not either end.** §4.1 says
+  `Source::Listener(ListenerId)` becomes `Source::Acceptor(Koid)`. A koid cannot
+  be resolved back to an object without a registry — which is the thing being
+  deleted — and the wake that has to complete an acceptor's poll is posted by a
+  *client* going through the `Connector`, which holds no acceptor. So `Source`
+  carries `Arc<PortShared>`, the one thing both ends share, and compares by
+  `Arc::ptr_eq`. `Source` is `Clone` rather than `Copy` for it. The watch now
+  holds what it watches, which is also what stops a poll outliving its port.
+- **A `Connector` gets `Rights::TRANSFER` checked at `SYS_NAMESPACE_BUILD` and
+  the base namespace `Rights::READ`**, per §3.1, and a name the base does not
+  carry is *absent* from the result rather than an error: narrowing is an
+  intersection, and asking for a name you do not hold grants nothing either way.
+
 **`cargo test --lib` stays green across this chunk and chunk 4's first half**,
 which matters because that is the command the push rule names. It builds the
 `toyos-build` host crate — buildlock, toolchain, pr, docs, image formats — and

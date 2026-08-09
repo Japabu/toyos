@@ -77,9 +77,10 @@ pub const SYS_NIC_TX: u64 = 80;
 pub const SYS_SYMLINK: u64 = 81;
 pub const SYS_READLINK: u64 = 82;
 pub const SYS_GPU_SET_RESOLUTION: u64 = 83;
-pub const SYS_LISTEN: u64 = 85;
+/// Accept a queued connection from an [`Acceptor`] handle.
+///
+/// [`Acceptor`]: crate::handle::RawHandle
 pub const SYS_ACCEPT: u64 = 86;
-pub const SYS_CONNECT: u64 = 87;
 /// Allocate a TLS block for a dlopen'd module on the current thread.
 /// Arg0: module_id (1-based DTV index). Returns the block's virtual address,
 /// or a `SyscallError` word — see [`tls_alloc_block`].
@@ -99,6 +100,27 @@ pub const SYS_SET_RT_PRIORITY: u64 = 96;
 pub const SYS_DEVICE_REG_READ: u64 = 97;
 /// Write one register of a claimed device. See [`device_reg_write`].
 pub const SYS_DEVICE_REG_WRITE: u64 = 98;
+
+/// Make a port: one [`Acceptor`] for the server, one `Connector` for its
+/// clients, packed `(acceptor << 32) | connector`. See [`port_create`].
+///
+/// **The packing cannot be read as an error, and the reason is slot
+/// retirement.** A `SyscallError` encodes as `u64::MAX - code` for
+/// `code < 256`, so a pair could collide only if both halves could reach
+/// `0xFFFF_FFFF`. A slot at [`RawHandle::MAX_GENERATION`] is retired rather
+/// than reissued, so the largest handle any table hands out is `0xFFFF_EFFF`
+/// and the largest pair is `0xFFFF_EFFF_FFFF_EFFF` — four billion below the
+/// error range. The retirement rule and this packing are load-bearing for each
+/// other.
+///
+/// [`Acceptor`]: port_create
+pub const SYS_PORT_CREATE: u64 = 100;
+/// Build a namespace from a base and a set of `(name, connector)` additions.
+/// See [`NamespaceBuild`].
+pub const SYS_NAMESPACE_BUILD: u64 = 101;
+/// Open a connection to a name **in a namespace this process holds**. There is
+/// no other place to ask, and a name it was not given resolves to nothing.
+pub const SYS_NAMESPACE_OPEN: u64 = 102;
 
 pub const WNOHANG: u64 = 1;
 
@@ -145,6 +167,16 @@ pub enum SyscallError {
     /// triage reads them; an enum here would be a vocabulary userland has no
     /// use for and every new driver would have to guess an arm from.
     Io = 9,
+    /// The object was there and its other end is not.
+    ///
+    /// **A different fact from `NotFound`, and the design does not work without
+    /// the difference.** "The name is not in the namespace this process was
+    /// given" is a statement about this process and the answer is "you have a
+    /// bug"; "the server exited" is a statement about the machine. The SDK sees
+    /// one `u64`, so if the kernel gives one word the SDK has one answer — and
+    /// the same rule the storage layer already obeys applies here: a dead peer
+    /// must not be indistinguishable from a handle that was never there.
+    Gone = 10,
 }
 
 impl SyscallError {
@@ -168,6 +200,7 @@ impl SyscallError {
             7 => Some(Self::ResourceExhausted),
             8 => Some(Self::NotSupported),
             9 => Some(Self::Io),
+            10 => Some(Self::Gone),
             _ => Some(Self::Unknown),
         }
     }
@@ -186,6 +219,7 @@ impl core::fmt::Display for SyscallError {
             Self::ResourceExhausted => f.write_str("resource exhausted"),
             Self::NotSupported => f.write_str("not supported"),
             Self::Io => f.write_str("the device did not complete the transfer"),
+            Self::Gone => f.write_str("the other end is gone"),
         }
     }
 }
@@ -727,24 +761,118 @@ pub fn device_reg_write(
     .map(|_| ())
 }
 
-// Service IPC (listen / accept / connect)
+// Ports and namespaces
 
-/// Register a named service and return a listener fd.
-/// Other processes can connect to this service by name.
-pub fn listen(name: &str) -> Result<RawHandle, SyscallError> {
-    check(syscall(SYS_LISTEN, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| RawHandle(v as u32))
+/// Both ends of a fresh port.
+///
+/// Two types and not one object with a direction right: "accept the
+/// connections of a service you were only given access to" is a state that
+/// cannot be written, the same way a pipe's two ends are two types.
+pub struct Port {
+    pub acceptor: RawHandle,
+    pub connector: RawHandle,
 }
 
-/// Result of [`accept`]: socket fd + connecting client's PID.
+/// Make a port. Needs no right and grants none — a port with no clients is not
+/// authority.
+pub fn port_create() -> Result<Port, SyscallError> {
+    let raw = syscall(SYS_PORT_CREATE, 0, 0, 0, 0);
+    if let Some(e) = SyscallError::from_u64(raw) {
+        return Err(e);
+    }
+    Ok(Port {
+        acceptor: RawHandle((raw >> 32) as u32),
+        connector: RawHandle((raw & 0xFFFF_FFFF) as u32),
+    })
+}
+
+/// One `(name, connector)` pair `SYS_NAMESPACE_BUILD` adds.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NamespaceEntry {
+    pub off: u32,
+    pub len: u32,
+    pub connector: RawHandle,
+    /// Named, so nothing leaks kernel stack into it.
+    pub _pad: u32,
+}
+
+/// One name carried over from the base namespace.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NameRef {
+    pub off: u32,
+    pub len: u32,
+}
+
+/// Arguments for [`SYS_NAMESPACE_BUILD`], passed as a single pointer.
+///
+/// A namespace is immutable once built: there is no insert, no remove and no
+/// replace, so a narrower one is a *new* object built from this one and a
+/// handle to a namespace is a handle to a fixed set.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NamespaceBuild {
+    /// [`HANDLE_INVALID`] for an empty base.
+    ///
+    /// [`HANDLE_INVALID`]: crate::handle::HANDLE_INVALID
+    pub base: RawHandle,
+    pub _pad: u32,
+    /// `[NameRef]` — the names to carry over from `base`.
+    pub keep_ptr: u64,
+    pub keep_n: u64,
+    /// `[NamespaceEntry]` — new bindings.
+    pub add_ptr: u64,
+    pub add_n: u64,
+    /// The blob every `off`/`len` above indexes into.
+    pub names_ptr: u64,
+    pub names_len: u64,
+}
+
+/// Names one namespace may bind. Policy on the primitive; a caller asking for
+/// one more is refused by name and never truncated.
+pub const MAX_NAMESPACE_ENTRIES: usize = 64;
+/// Bytes in one service name.
+pub const MAX_SERVICE_NAME: usize = 64;
+
+/// # Safety
+/// Every pointer in `args` must name `args`'s stated length of readable memory.
+pub unsafe fn namespace_build(args: &NamespaceBuild) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_NAMESPACE_BUILD, args as *const _ as u64, 0, 0, 0))
+        .map(|v| RawHandle(v as u32))
+}
+
+/// Open a connection to `name` in the namespace `ns` holds.
+///
+/// `NotFound` means the name is not in this namespace — a fact about this
+/// process. [`SyscallError::Gone`] means the server that held the acceptor has
+/// exited. There is no third answer, and in particular there is no "not yet":
+/// the port exists before either process runs.
+pub fn namespace_open(ns: RawHandle, name: &str) -> Result<RawHandle, SyscallError> {
+    check(syscall(
+        SYS_NAMESPACE_OPEN,
+        ns.0 as u64,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        0,
+    ))
+    .map(|v| RawHandle(v as u32))
+}
+
+/// Result of [`accept`]: the connection, and the connecting client's pid.
+///
+/// **The pid goes in chunk 6.** Peer identity is not the kernel's to assert;
+/// it survives only because the compositor and soundd still grant shared
+/// memory to it and have nothing else to grant to until handle transfer
+/// exists (`specs/capability-endowment-spec.md` §3.3).
 pub struct AcceptResult {
     pub fd: RawHandle,
     pub client_pid: u32,
 }
 
-/// Accept a pending connection on a listener fd.
-/// Blocks until a client connects. Returns a socket fd and the client's PID.
-pub fn accept(listener_fd: RawHandle) -> Result<AcceptResult, SyscallError> {
-    let raw = syscall(SYS_ACCEPT, listener_fd.0 as u64, 0, 0, 0);
+/// Accept a queued connection. Blocks until there is one.
+pub fn accept(acceptor: RawHandle) -> Result<AcceptResult, SyscallError> {
+    let raw = syscall(SYS_ACCEPT, acceptor.0 as u64, 0, 0, 0);
     if let Some(e) = SyscallError::from_u64(raw) {
         return Err(e);
     }
@@ -752,12 +880,6 @@ pub fn accept(listener_fd: RawHandle) -> Result<AcceptResult, SyscallError> {
         fd: RawHandle((raw & 0xFFFF_FFFF) as u32),
         client_pid: (raw >> 32) as u32,
     })
-}
-
-/// Connect to a named service. Blocks until the server accepts.
-/// Returns a bidirectional socket fd.
-pub fn connect(name: &str) -> Result<RawHandle, SyscallError> {
-    check(syscall(SYS_CONNECT, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Allocate a 2MB-aligned shared memory region. Returns an opaque token.

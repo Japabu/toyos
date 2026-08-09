@@ -28,8 +28,10 @@ use crate::sync::Lock;
 pub mod device;
 pub mod file;
 pub mod handle;
+pub mod namespace;
 pub mod ops;
 pub mod pipe;
+pub mod port;
 pub mod service;
 pub mod syscap;
 
@@ -274,8 +276,13 @@ kobject! {
     deferred PipeWrite => pipe::PipeWriteEnd,
     deferred Connection => service::ConnectionEnd,
     deferred Device => device::DeviceClaim,
-    deferred Listener => service::ListenerObject,
+    deferred Acceptor => port::Acceptor,
     deferred IoUring => service::IoUringObject,
+    // A service with no clients right now is not a service that has stopped.
+    immediate Connector => port::Connector,
+    // Immutable once built: its `Arc<Connector>`s go with the last reference
+    // and nothing observes it.
+    immediate Namespace => namespace::Namespace,
     // A file's flush and its cache reference ride the last `Arc`, and no
     // blocking syscall strands one: `read` and `write` on a file never park.
     immediate File => file::FileObject,

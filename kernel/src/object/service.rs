@@ -1,14 +1,8 @@
-//! A connection, and the registered service it was accepted from.
-//!
-//! [`ListenerObject`] is transitional and chunk 3 deletes it: a listener that
-//! holds a *name* is the object the endowment architecture exists to remove,
-//! and `Acceptor`/`Connector` replace it. It is here so that chunk 2 — which is
-//! the `Descriptor` → `KObjectRef` move and nothing else — stays green.
+//! A connection, and the ring a process submits work on.
 
 use alloc::sync::Arc;
 
 use crate::io_uring::RingRef;
-use crate::listener::{ListenerId, ListenerRef};
 use crate::pipe::{PipeId, PipeReader, PipeWriter};
 use crate::process::Pid;
 
@@ -52,32 +46,6 @@ impl ConnectionEnd {
 }
 
 impl ZeroHandles for ConnectionEnd {
-    fn on_zero_handles(&self) {
-        self.reference.release();
-    }
-}
-
-pub struct ListenerObject {
-    pub(super) core: ObjectCore,
-    id: ListenerId,
-    reference: Held<ListenerRef>,
-}
-
-impl ListenerObject {
-    pub fn new(listener: ListenerRef) -> Arc<Self> {
-        Arc::new(Self {
-            core: Self::new_core(),
-            id: listener.id(),
-            reference: Held::new(listener),
-        })
-    }
-
-    pub fn id(&self) -> ListenerId {
-        self.id
-    }
-}
-
-impl ZeroHandles for ListenerObject {
     fn on_zero_handles(&self) {
         self.reference.release();
     }

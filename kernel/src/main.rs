@@ -58,7 +58,7 @@ mod rtc;
 mod object;
 mod io_uring;
 mod pipe;
-mod listener;
+
 mod device;
 mod net;
 mod gpu;
@@ -502,7 +502,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     scheduler::init();
     pipe::init();
     io_uring::init();
-    listener::init();
+
     shared_memory::init();
 
     // Mount initrd as read-only root filesystem (bcachefs, no extraction)

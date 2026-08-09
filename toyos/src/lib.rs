@@ -1,6 +1,6 @@
 //! ToyOS userland SDK.
 //!
-//! Typed handles, IPC framing, service discovery, shared memory, and
+//! Typed handles, IPC framing, ports and namespaces, shared memory, and
 //! ergonomic wrappers over the kernel ABI defined in `toyos-abi`.
 
 #![no_std]
@@ -10,9 +10,10 @@ pub mod device;
 pub mod gpu;
 pub mod poller;
 pub mod ipc;
+pub mod namespace;
 pub mod net;
 pub mod pipe;
-pub mod services;
+pub mod port;
 pub mod surface;
 pub mod shm;
 pub mod system;
@@ -72,7 +73,11 @@ impl Drop for OwnedHandle {
     }
 }
 
-/// A service listener. Created by [`services::listen`].
+/// A service listener.
+///
+/// **Transitional.** `surface` is the one thing still holding one and chunk 5
+/// moves it onto a [`port::Acceptor`]; nothing creates a `Listener` any more,
+/// because there is no global name registry to register in.
 pub struct Listener(pub(crate) OwnedHandle);
 
 impl Listener {

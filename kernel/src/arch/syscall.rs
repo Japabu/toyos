@@ -4,8 +4,8 @@ use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::mm::paging::CachePolicy;
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
-use crate::object::{ops, KObjectRef};
-use crate::{device, listener, log, pipe, process, shared_memory, vfs};
+use crate::object::{ops, port, KObjectRef};
+use crate::{device, log, pipe, process, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
 
 // MSR addresses
@@ -52,6 +52,8 @@ retired_syscalls! {
     30 => "SYS_RECV_MSG",
     32 => "SYS_REGISTER_NAME",
     33 => "SYS_FIND_PID",
+    85 => "SYS_LISTEN",
+    87 => "SYS_CONNECT",
 }
 
 /// `SYS_DEBUG` action 2's lock, and nothing else's.
@@ -560,14 +562,17 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                 Err(e) => e.to_u64(),
             }
         }
-        SYS_LISTEN => {
-            let name = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_listen(&name)
-        }
         SYS_ACCEPT => sys_accept(RawHandle(a1 as u32)),
-        SYS_CONNECT => {
-            let name = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
-            sys_connect(&name)
+        SYS_PORT_CREATE => sys_port_create(),
+        SYS_NAMESPACE_BUILD => {
+            let Ok(args) = ctx.copy_in::<NamespaceBuild>(UserAddr::new(a1)) else {
+                return bad_addr;
+            };
+            sys_namespace_build(&ctx, &args)
+        }
+        SYS_NAMESPACE_OPEN => {
+            let name = match ctx.user_str(UserAddr::new(a2), a3) { Ok(s) => s, Err(e) => return e.to_u64() };
+            sys_namespace_open(RawHandle(a1 as u32), &name)
         }
         SYS_TLS_ALLOC_BLOCK => sys_tls_alloc_block(a1),
         SYS_IO_URING_SETUP => sys_io_uring_setup(a1 as u32),
@@ -1363,30 +1368,209 @@ fn sys_open_device(device_type: u64) -> u64 {
     })
 }
 
-// Service IPC: listen / accept / connect
+// Ports and namespaces
 
-fn sys_listen(name: &str) -> u64 {
-    let Some(listener) = crate::listener::listen(name, process::current_process()) else {
-        return SyscallError::AlreadyExists.to_u64();
+/// Make a port and install both ends.
+///
+/// Needs no right and grants none: a port with no clients is not authority.
+/// The two handles come back packed, which cannot be read as an error — see
+/// [`SYS_PORT_CREATE`].
+fn sys_port_create() -> u64 {
+    let (acceptor, connector) = port::create();
+    process::with_fd_owner_data(|data| {
+        let Ok(a) = ops::install(&mut data.handles, KObjectRef::Acceptor(acceptor)) else {
+            return SyscallError::ResourceExhausted.to_u64();
+        };
+        let install_c =
+            ops::install(&mut data.handles, KObjectRef::Connector(connector));
+        let Ok(c) = install_c else {
+            // The acceptor goes back, so a refused pair leaves no port half in
+            // a table with nothing on the other side of it.
+            drop(data.handles.remove(a));
+            return SyscallError::ResourceExhausted.to_u64();
+        };
+        ((a.0 as u64) << 32) | c.0 as u64
+    })
+}
+
+/// A namespace built from a base's kept names plus new bindings.
+///
+/// Every name is resolved against the base *before* anything is installed, and
+/// every added connector is checked for `TRANSFER` first, so a refusal leaves
+/// the caller's table exactly as it was.
+fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
+    let total = args.keep_n.saturating_add(args.add_n);
+    if total > MAX_NAMESPACE_ENTRIES as u64 {
+        return SyscallError::InvalidArgument.to_u64();
+    }
+    if args.names_len > (MAX_NAMESPACE_ENTRIES * MAX_SERVICE_NAME) as u64 {
+        return SyscallError::InvalidArgument.to_u64();
+    }
+    let names = match ctx.user_vec(UserAddr::new(args.names_ptr), args.names_len) {
+        Ok(bytes) => bytes,
+        Err(e) => return e.to_u64(),
     };
-    // A refused install drops the reference, which unbinds the name again.
-    let object = KObjectRef::Listener(crate::object::service::ListenerObject::new(listener));
-    process::with_fd_owner_data(|data| handle_result(ops::install(&mut data.handles, object)))
+    let name_at = |off: u32, len: u32| -> Option<alloc::boxed::Box<str>> {
+        let end = (off as usize).checked_add(len as usize)?;
+        let bytes = names.get(off as usize..end)?;
+        Some(alloc::string::String::from(core::str::from_utf8(bytes).ok()?).into_boxed_str())
+    };
+
+    let mut entries: Vec<(alloc::boxed::Box<str>, alloc::sync::Arc<port::Connector>)> =
+        Vec::new();
+
+    if args.keep_n > 0 {
+        let Some(keep) = (args.keep_n as usize)
+            .checked_mul(core::mem::size_of::<NameRef>())
+            .and_then(|len| ctx.user_bytes(UserAddr::new(args.keep_ptr), len as u64))
+        else {
+            return SyscallError::BadAddress.to_u64();
+        };
+        let base = match process::with_fd_owner_data(|data| {
+            data.handles.get::<crate::object::namespace::Namespace>(args.base, Rights::READ)
+        }) {
+            Ok(base) => base,
+            Err(e) => return e.to_u64(),
+        };
+        for i in 0..args.keep_n as usize {
+            let mut raw = [0u8; 8];
+            keep.read_at(i * 8, &mut raw);
+            let off = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let len = u32::from_ne_bytes([raw[4], raw[5], raw[6], raw[7]]);
+            let Some(name) = name_at(off, len) else {
+                return SyscallError::InvalidArgument.to_u64();
+            };
+            // A name the base does not carry is silently absent from the
+            // child's: a parent narrowing a namespace is asking for an
+            // intersection, and asking for a name it does not itself hold
+            // grants nothing either way.
+            if let Some(connector) = base.lookup(&name) {
+                entries.push((name, connector.clone()));
+            }
+        }
+    }
+
+    if args.add_n > 0 {
+        let Some(add) = (args.add_n as usize)
+            .checked_mul(core::mem::size_of::<NamespaceEntry>())
+            .and_then(|len| ctx.user_bytes(UserAddr::new(args.add_ptr), len as u64))
+        else {
+            return SyscallError::BadAddress.to_u64();
+        };
+        for i in 0..args.add_n as usize {
+            let mut raw = [0u8; 16];
+            add.read_at(i * 16, &mut raw);
+            let off = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let len = u32::from_ne_bytes([raw[4], raw[5], raw[6], raw[7]]);
+            let handle = RawHandle(u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]));
+            let Some(name) = name_at(off, len) else {
+                return SyscallError::InvalidArgument.to_u64();
+            };
+            let connector = match process::with_fd_owner_data(|data| {
+                data.handles.get::<port::Connector>(handle, Rights::TRANSFER)
+            }) {
+                Ok(c) => c,
+                Err(e) => return e.to_u64(),
+            };
+            entries.push((name, connector));
+        }
+    }
+
+    let namespace = match crate::object::namespace::Namespace::build(entries) {
+        Ok(ns) => ns,
+        Err(crate::object::namespace::BuildError::TooMany) => {
+            return SyscallError::InvalidArgument.to_u64()
+        }
+        Err(crate::object::namespace::BuildError::Duplicate) => {
+            return SyscallError::AlreadyExists.to_u64()
+        }
+    };
+    process::with_fd_owner_data(|data| {
+        handle_result(ops::install(&mut data.handles, KObjectRef::Namespace(namespace)))
+    })
+}
+
+/// Open a connection to `name` in the namespace `ns_h` holds.
+///
+/// **Two facts, two words.** A name this namespace does not carry is
+/// `NotFound` — a statement about this process. A name whose port has closed is
+/// `Gone` — a statement about the machine. Only the kernel can tell them apart,
+/// so only the kernel may collapse them, and it does not.
+fn sys_namespace_open(ns_h: RawHandle, name: &str) -> u64 {
+    let connector = match process::with_fd_owner_data(|data| {
+        let ns = data
+            .handles
+            .get::<crate::object::namespace::Namespace>(ns_h, Rights::READ)?;
+        Ok(ns.lookup(name).cloned())
+    }) {
+        Ok(Some(c)) => c,
+        Ok(None) => return SyscallError::NotFound.to_u64(),
+        Err(e) => return crate::object::HandleError::to_u64(e),
+    };
+    connect_through(&connector)
+}
+
+/// The client half of a connection, and the server half queued on the port.
+fn connect_through(connector: &port::Connector) -> u64 {
+    if connector.closed() {
+        return SyscallError::Gone.to_u64();
+    }
+    let client_pid = process::current_process();
+    let (cs_reader, cs_writer) = pipe::create(client_pid); // client → server
+    let (sc_reader, sc_writer) = pipe::create(client_pid); // server → client
+
+    // The client's own end first. Installing it can fail on a full handle
+    // table, and a connection queued for a server whose client never got a
+    // handle is one the server accepts and finds already dead.
+    //
+    // `Pid::from_raw(0)` is the peer field, which nothing reads on a client's
+    // end and which chunk 6 deletes outright.
+    let object = KObjectRef::Connection(crate::object::service::ConnectionEnd::new(
+        sc_reader, // client reads from server→client
+        cs_writer, // client writes to client→server
+        process::Pid::from_raw(0),
+    ));
+    let h = match process::with_fd_owner_data(|data| ops::install(&mut data.handles, object)) {
+        Ok(h) => h,
+        Err(e) => return e.to_u64(),
+    };
+
+    let queued = connector.push(port::PendingConnection {
+        rx: cs_reader, // server reads from client→server
+        tx: sc_writer, // server writes to server→client
+        client_pid,
+    });
+    if let Err(e) = queued {
+        process::with_fd_owner_data(|data| {
+            ops::close(&mut data.handles, h, &mut data.pipe_maps);
+        });
+        return match e {
+            port::PushError::Closed => SyscallError::Gone.to_u64(),
+            port::PushError::QueueFull => SyscallError::ResourceExhausted.to_u64(),
+        };
+    }
+    let port = connector.port();
+    crate::sched::waitqs::wake_all(&port.waiters());
+    let watchers = port.watchers();
+    if !watchers.is_empty() {
+        crate::io_uring::complete_pending_for_event(
+            &watchers,
+            crate::io_uring::Source::Port(port.clone()),
+        );
+    }
+    h.0 as u64
 }
 
 fn sys_accept(h: RawHandle) -> u64 {
-    let listener_id = process::with_fd_owner_data(|data| {
-        match data.handles.get_ref(h, Rights::READ) {
-            Ok(KObjectRef::Listener(l)) => Some(l.id()),
-            _ => None,
-        }
-    });
-    let Some(listener_id) = listener_id else {
-        return SyscallError::InvalidArgument.to_u64();
+    let acceptor = match process::with_fd_owner_data(|data| {
+        data.handles.get::<port::Acceptor>(h, Rights::READ)
+    }) {
+        Ok(a) => a,
+        Err(e) => return crate::object::HandleError::to_u64(e),
     };
 
     loop {
-        if let Some(conn) = crate::listener::pop_connection(listener_id) {
+        if let Some(conn) = acceptor.pop() {
             let client_pid = conn.client_pid;
             // PipeReader/PipeWriter move from the queue into the connection. No
             // refcount change — ownership transfers.
@@ -1401,70 +1585,8 @@ fn sys_accept(h: RawHandle) -> u64 {
                 Err(e) => e.to_u64(),
             };
         }
-        match crate::listener::acceptors(listener_id) {
-            Some(q) => crate::scheduler::wait_until(&q, 0, || {
-                crate::listener::has_pending_by_id(listener_id)
-            }),
-            None => return SyscallError::NotFound.to_u64(),
-        }
-    }
-}
-
-fn sys_connect(name: &str) -> u64 {
-    // The owner lookup doubles as the existence check: a client knows only a
-    // service name, and this is where it learns which process it is talking to.
-    let Some(server_pid) = crate::listener::owner(name) else {
-        return SyscallError::NotFound.to_u64();
-    };
-
-    let client_pid = process::current_process();
-    let (cs_reader, cs_writer) = pipe::create(client_pid); // client → server
-    let (sc_reader, sc_writer) = pipe::create(client_pid); // server → client
-
-    // The client's own end first. Installing it can fail on a full handle
-    // table, and a connection queued for a server whose client never got a
-    // handle is one the server accepts and finds already dead.
-    let object = KObjectRef::Connection(crate::object::service::ConnectionEnd::new(
-        sc_reader, // client reads from server→client
-        cs_writer, // client writes to client→server
-        server_pid,
-    ));
-    let h = match process::with_fd_owner_data(|data| ops::install(&mut data.handles, object)) {
-        Ok(h) => h,
-        Err(e) => return e.to_u64(),
-    };
-
-    // Queue the server's end. PipeReader/PipeWriter in the queue keep pipes
-    // alive even if the client disconnects before accept — which is also why
-    // the queue needs a depth, and this return value used to be discarded.
-    let queued = crate::listener::push_connection(name, listener::PendingConnection {
-        rx: cs_reader,   // server reads from client→server
-        tx: sc_writer,   // server writes to server→client
-        client_pid,
-    });
-    if let Err(e) = queued {
-        process::with_fd_owner_data(|data| {
-            ops::close(&mut data.handles, h, &mut data.pipe_maps);
-        });
-        return match e {
-            listener::PushError::NoListener => SyscallError::NotFound.to_u64(),
-            listener::PushError::QueueFull => SyscallError::ResourceExhausted.to_u64(),
-        };
-    }
-    wake_poll_waiters(name);
-    h.0 as u64
-}
-
-/// Wake processes interested in this specific listener (direct blockers + io_uring watchers).
-fn wake_poll_waiters(name: &str) {
-    let Some(id) = crate::listener::listener_id(name) else { return };
-    if let Some(queue) = crate::listener::acceptors(id) {
-        crate::sched::waitqs::wake_all(&queue);
-    }
-    let event = crate::io_uring::Source::Listener(id);
-    let watchers = crate::listener::io_uring_watchers(id);
-    if !watchers.is_empty() {
-        crate::io_uring::complete_pending_for_event(&watchers, event);
+        let queue = acceptor.waiters();
+        crate::scheduler::wait_until(&queue, 0, || acceptor.has_pending());
     }
 }
 
