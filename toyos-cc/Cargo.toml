@@ -12,6 +12,12 @@ cranelift-object = "0.128"
 target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
 toyos-ld = { path = "../toyos-ld" }
 
+# Reading back what the compiler emitted. `tests/emission.rs` is the only
+# consumer: that a translation unit compiled says nothing about whether the
+# object does what the source asked for.
+[dev-dependencies]
+object = { version = "0.38", default-features = false, features = ["read", "elf", "std"] }
+
 [patch.crates-io]
 target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
 

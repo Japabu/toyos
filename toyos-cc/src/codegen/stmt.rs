@@ -317,8 +317,26 @@ impl Codegen {
         ctx.filled = true;
     }
 
+    /// A slot to hold one VLA's `malloc` result, nulled in the entry block.
+    ///
+    /// Every exit frees whatever the slot holds, and a path that reaches an
+    /// exit without reaching the declaration — a `goto` over it — has stored
+    /// nothing, so the null is what stands between that and a free of
+    /// uninitialised stack. `free(NULL)` is a no-op.
+    pub(super) fn cut_vla_slot(ctx: &mut FuncCtx) -> ir::StackSlot {
+        let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot, 8, 3,
+        ));
+        let entry = ctx.entry_block;
+        let mut cursor = FuncCursor::new(ctx.builder.func).at_first_insertion_point(entry);
+        let null = cursor.ins().iconst(I64, 0);
+        cursor.ins().stack_store(null, ss, 0);
+        ss
+    }
+
     fn free_vlas(&mut self, ctx: &mut FuncCtx) {
-        for &ptr in &ctx.vla_allocs.clone() {
+        for &slot in &ctx.vla_allocs.clone() {
+            let ptr = ctx.builder.ins().stack_load(I64, slot, 0);
             self.emit_free(ctx, ptr);
         }
     }
@@ -739,9 +757,11 @@ impl Codegen {
                     let elem_size = ctx.builder.ins().iconst(I64, elem.size() as i64);
                     let total = ctx.builder.ins().imul(count, elem_size);
                     let ptr = self.emit_malloc(ctx, total);
+                    let ss = Self::cut_vla_slot(ctx);
+                    ctx.builder.ins().stack_store(ptr, ss, 0);
                     ctx.vla_sizes.insert(name.clone(), count);
-                    ctx.vla_allocs.push(ptr);
-                    ctx.locals.insert(name, (LocalStorage::Ptr(ptr), ty));
+                    ctx.vla_allocs.push(ss);
+                    ctx.locals.insert(name, (LocalStorage::Vla(ss), ty));
                     continue;
                 }
             }
@@ -765,9 +785,9 @@ impl Codegen {
             if ty.is_aggregate() || matches!(ty, CType::Array(..)) {
                 let size = ty.size().max(1);
                 let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, size as u32, 0));
-                let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
-                ctx.locals.insert(name.clone(), (LocalStorage::Ptr(ptr), ty.clone()));
+                ctx.locals.insert(name.clone(), (LocalStorage::Slot(ss), ty.clone()));
                 if let Some(init) = &id.initializer {
+                    let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
                     self.compile_aggregate_init(ctx, ptr, &ty, init);
                 }
                 continue;
@@ -849,9 +869,7 @@ impl Codegen {
             desc.define_zeroinit(ty.size().max(1));
         }
         self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
-        let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
-        let ptr = ctx.builder.ins().global_value(I64, gv);
-        ctx.locals.insert(name.to_string(), (LocalStorage::Ptr(ptr), ty.clone()));
+        ctx.locals.insert(name.to_string(), (LocalStorage::Static(data_id), ty.clone()));
     }
 
     /// Address-taken variable — allocate on stack so the slot is valid in all basic blocks.
@@ -863,7 +881,7 @@ impl Codegen {
         let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
         // Register type before compiling initializer so sizeof/typeof
         // can resolve the variable's type in the initializer expression.
-        ctx.locals.insert(name, (LocalStorage::Spilled(ss), ty));
+        ctx.locals.insert(name, (LocalStorage::Slot(ss), ty));
         let val = match init {
             Some(Initializer::Expr(e)) => {
                 let tv = self.compile_expr(ctx, e);
