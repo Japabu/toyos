@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::*;
 use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{DataDescription, FuncId, FuncOrDataId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, FuncOrDataId, Linkage, Module};
 use cranelift_object::ObjectModule;
 use crate::ast::*;
 use crate::types::{CType, FieldDef, StructDef, TypeEnv, ParamType, EnumDef, Signedness};
@@ -76,15 +77,25 @@ pub struct Codegen {
     extern_provision: HashSet<String>,                         // functions with non-inline external provision
 }
 
-/// How a local variable is stored during code generation.
+/// Where a local variable lives, named by the *origin* of its address.
+///
+/// Never by an address some block computed: a cranelift `Value` may only be
+/// used in blocks its defining instruction dominates, so a cached one is a
+/// verifier error the moment a `goto` or a loop reaches the variable from
+/// somewhere else. Each variant here re-materialises the address in whichever
+/// block asks for it, and the one origin that is genuinely a computed pointer
+/// — a VLA's `malloc` result — gets a slot to live in.
 #[derive(Clone, Copy)]
 pub(super) enum LocalStorage {
-    /// SSA variable (cranelift Variable) — scalars that haven't had their address taken
+    /// A cranelift variable: a scalar whose address is never taken.
     Ssa(Variable),
-    /// Stack-allocated pointer (cranelift Value) — aggregates, arrays, VLAs, static locals
-    Ptr(Value),
-    /// Stack slot (address was taken) — scalars spilled because `&var` appears somewhere
-    Spilled(ir::StackSlot),
+    /// A stack slot that *is* the object: aggregates, arrays, and scalars
+    /// spilled because `&var` appears somewhere.
+    Slot(ir::StackSlot),
+    /// A static local: the object is module data, addressed by its symbol.
+    Static(DataId),
+    /// A VLA: the object is on the heap and the slot holds the `malloc` result.
+    Vla(ir::StackSlot),
 }
 
 /// State for compiling a switch statement. Held as an `Option` in `FuncCtx`
@@ -115,28 +126,13 @@ pub(super) struct FuncCtx<'a> {
     // Variadic function support
     va_area: Option<ir::StackSlot>,   // stack slot holding saved variadic args
     sret_ptr: Option<Value>,       // hidden return pointer for struct-returning functions
+    // The block every VLA's pointer slot is nulled in, so a path that reached
+    // the exit without reaching the declaration frees a null rather than
+    // whatever the slot happened to hold.
+    entry_block: ir::Block,
     // VLA support
     vla_sizes: HashMap<String, Value>,  // var name → runtime element count
-    vla_allocs: Vec<Value>,             // malloc'd pointers to free at function exit
-}
-
-impl FuncCtx<'_> {
-    /// Store a value into a local variable, regardless of storage kind.
-    pub(super) fn store_to_local(&mut self, name: &str, val: Value) {
-        let storage = self.locals.get(name)
-            .map(|(s, _)| *s)
-            .unwrap_or_else(|| panic!("store_to_local: unknown variable '{name}'"));
-        match storage {
-            LocalStorage::Ssa(var) => self.builder.def_var(var, val),
-            LocalStorage::Spilled(slot) => {
-                let ptr = self.builder.ins().stack_addr(I64, slot, 0);
-                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
-            }
-            LocalStorage::Ptr(ptr) => {
-                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
-            }
-        }
-    }
+    vla_allocs: Vec<ir::StackSlot>,     // slots holding malloc'd pointers to free at function exit
 }
 
 impl Codegen {
@@ -505,6 +501,7 @@ impl Codegen {
             labels: HashMap::new(),
             va_area: None,
             sret_ptr: None,
+            entry_block: entry,
             vla_sizes: HashMap::new(),
             vla_allocs: Vec::new(),
         };
@@ -536,7 +533,7 @@ impl Codegen {
                     // Copy from caller's address to local storage
                     let size_val = ctx.builder.ins().iconst(I64, size as i64);
                     self.emit_memcpy(&mut ctx, local_ptr, val, size_val);
-                    ctx.locals.insert(name.clone(), (LocalStorage::Ptr(local_ptr), p.ty.clone()));
+                    ctx.locals.insert(name.clone(), (LocalStorage::Slot(ss), p.ty.clone()));
                 } else {
                     let clif_ty = self.clif_type(&p.ty);
                     let var = ctx.builder.declare_var(clif_ty);
@@ -573,7 +570,7 @@ impl Codegen {
                 let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
                 let val = ctx.builder.use_var(var);
                 ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
-                ctx.locals.insert(name.clone(), (LocalStorage::Spilled(ss), ty));
+                ctx.locals.insert(name.clone(), (LocalStorage::Slot(ss), ty));
             }
         }
 
@@ -582,7 +579,8 @@ impl Codegen {
 
         // If the function doesn't end with a return, add one
         if !ctx.filled {
-            for &ptr in &ctx.vla_allocs.clone() {
+            for &slot in &ctx.vla_allocs.clone() {
+                let ptr = ctx.builder.ins().stack_load(I64, slot, 0);
                 self.emit_free(&mut ctx, ptr);
             }
             if matches!(ctx.return_type, CType::Void) || ctx.sret_ptr.is_some() {

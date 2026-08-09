@@ -810,8 +810,6 @@ const C_SKIP: &[&str] = &[
 /// not build. Unlike [`C_SKIP`] these are not a decision, they are the current
 /// state of the toolchain — the reason each gives is printed by every run.
 const C_DOES_NOT_BUILD: &[(&str, &str)] = &[
-    ("78_vla_label", "cranelift verifier rejects the VLA's stack address across blocks"),
-    ("79_vla_continue", "same VLA defect, reached through `continue`"),
     ("83_utf8_in_identifiers", "the lexer rejects a non-ASCII byte in an identifier"),
     ("85_asm_outside_function", "file-scope asm is parsed and not emitted, so `vide` is undefined"),
     ("89_nocode_wanted", "expr_type cannot type an identifier under `sizeof` in dead code"),

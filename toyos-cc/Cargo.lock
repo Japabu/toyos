@@ -488,6 +488,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-module",
  "cranelift-object",
+ "object 0.38.1",
  "target-lexicon",
  "toyos-ld",
 ]

@@ -567,12 +567,18 @@ missing**:
   `goto` past a VLA, a VLA declared in a loop body used after the loop, a static
   local used from a block that does not dominate its declaration — each of which
   must fail the Cranelift verifier before the change.
-- The whole-corpus compile-failure set **losing exactly `78_vla_label` and
-  `79_vla_continue` and gaining nothing.** Stated as a delta and no longer as
-  "24 names to 22", because that absolute is only true if T2 lands before T3:
-  T3 makes `85` and `98` refuse, which takes the set to 26. Only the first of
-  the two names is demonstrated (§4.1); the second is what T2 is predicted to
-  buy and T7 is where it is checked.
+- The whole-corpus compile-failure set losing the names of this class and
+  gaining nothing. Stated as a delta and no longer as "24 names to 22", because
+  that absolute is only true if T2 lands before T3: T3 makes `85` and `98`
+  refuse, which takes the set back up.
+
+  **Measured when T2 landed: 24 → 20, and the prediction of two names was
+  short by two.** `78_vla_label` and `79_vla_continue` went as expected, and
+  so did `115_bound_setjmp` and `123_vla_bug` — both in `C_SKIP`, so neither
+  the plan's sweep nor the harness had ever attributed their failure to
+  anything, and both are the same `uses value vN from non-dominating instM`.
+  Nothing was gained. That is the §5 hole arriving in person: a list nothing
+  attempts cannot tell you what it is standing on.
 
 **T3 — every door that changes layout or linkage is refused by name.**
 One rule, three doors: file-scope `asm(…)`, `asm("name")` after a declarator,
