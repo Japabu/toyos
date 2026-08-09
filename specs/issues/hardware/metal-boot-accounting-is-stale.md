@@ -11,8 +11,9 @@ healthy boots in `specs/metal-logs/2026-08-07-freeze/` report `Boot: complete` a
 1148, 1148, 1149, 1150, 1151 and 1154 ms; the seventh (`…-222741.log`) is 755 ms
 and is the control boot whose keyboard was refused, so its peripherals phase is
 448 ms instead of 842. The QEMU figure for the comparable shape is
-`Boot: complete (196ms)` on the `metal_sim_compositor` boot (`specs/issues/hardware/`'s i8042 entry
-below records the measurement), and `(234ms)` for the diag artifact booted
+`Boot: complete (196ms)` on the `metal_sim_compositor` boot
+(`kernel-log-unreadable-once-userland-owns-the-screen` records the
+measurement), and `(234ms)` for the diag artifact booted
 headless. **So metal is ~5.9× QEMU, not the ~17× `specs/metal-hardware-inventory.md:392-395`
 computes** — that ratio is against `(3422ms)`, and 2.30 s of those 3.42 s were
 the six `boot_checkpoint` framebuffer repaints (`metal-hardware-inventory.md:425-429`),
@@ -47,8 +48,8 @@ that hold nothing, against 7 ms finding everything that is there.
 
 **What this entry is for.** Metal boot time has no heading of its own; the
 accounting lives in `specs/metal-hardware-inventory.md` against the superseded
-3422 ms boot, and `specs/issues/`'s console entry below points at "#65 (boot
-time)" as its owner. Whatever #65 says, its numbers should come from this table:
+3422 ms boot, and `framebuffer-clients-pay-the-scanout-price` points at "#65
+(boot time)" as its owner. Whatever #65 says, its numbers should come from this table:
 the two-thirds that motivated it were paints and are gone. Note also the NIC
 retry that looks like boot cost and is not — `toyos/src/net.rs:271`'s 100 retries
 at 10 ms run *after* `Boot: complete` (see *Every network client pays a second of

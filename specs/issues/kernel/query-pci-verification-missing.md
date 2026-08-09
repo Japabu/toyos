@@ -12,6 +12,8 @@ queries QMP's `query-pci` and compares it against the guest's view. Every profil
 is therefore asserted only by the harness's own construction of the QEMU command line, which is
 the same source it would be verifying.
 
-Same class as the three scheduler instruments below: a spec requiring an instrument nobody
+Same class as the three scheduler entries this was filed beside —
+`per-process-fair-split-is-the-policy`, `granularity-bound-crossed-at-four-widths`
+and `sched-check-unreachable-from-build`: a spec requiring an instrument nobody
 built. This one matters most for the metal track, where the whole point is that the machine's
 device set is not what the harness chose.

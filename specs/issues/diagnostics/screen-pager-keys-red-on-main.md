@@ -84,7 +84,9 @@ dump when a footer is present and only sleeps 50 ms when there is none. Thirty
 samples in 0.3 s is a 10 ms round trip, so a guest slower than that to repaint
 reads as "did not move" on every sample. The bisect says that is not what is
 happening here — a timing margin would not split this cleanly by commit — but a
-verdict with no margin at all belongs in `specs/issues/design-debt/` with the rest of that class.
+verdict with no margin at all belongs with
+`specs/issues/build/parallel-tests-red-under-other-suites.md` and the rest of
+that class.
 
 It is **not** in `EXPECTED_FAILURES` and must not be put there to get a landing
 through: an entry needs a task, a write-up and the failure text it covers, and

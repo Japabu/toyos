@@ -12,8 +12,8 @@ opened: 2026-08-01
 Three instances, and the statement is here because none of the three says it
 alone — it is what predicts the fourth:
 
-- the compositor's windows (below),
-- netd's piped connections (below),
+- the compositor's windows (`compositor-and-netd-unbounded-accept`),
+- netd's piped connections (the same entry),
 - `SYS_CONNECT` pinning 4 MiB into an unbounded pending queue.
 
 **The third is worse than it looks, because the attacker does not need to find a

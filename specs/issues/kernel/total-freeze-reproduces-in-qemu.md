@@ -6,8 +6,8 @@ opened: 2026-08-06
 
 # The total freeze now reproduces in QEMU, in about seven seconds
 
-**This is the first reproduction of the freeze class.** Everything above was
-read off T14 logs because nothing in the suite could stage it; `desktop_window_child`
+**This is the first reproduction of the freeze class.** Every earlier report of
+it was read off T14 logs because nothing in the suite could stage it; `desktop_window_child`
 (landed 2026-08-06 by the compositor track, for a different property) stages it
 by accident and reliably.
 

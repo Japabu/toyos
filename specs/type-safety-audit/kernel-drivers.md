@@ -327,8 +327,8 @@ bodies).
    `virtio_sound.rs:472`). Two more `panic!`s each on the vector-assignment
    read-back. That is three different answers to "this machine's device is not
    shaped the way we assumed" — the class M1 closed for xHCI's zero-HID panic
-   and `specs/issues/isolation/` has filed twice more (NVMe absence, soundd's
-   `num_buffers > 5`).
+   and it is filed twice more (NVMe absence; soundd's `num_buffers > 5`,
+   `specs/issues/audio/soundd-panics-on-a-shallow-pipeline.md`).
 2. **Nobody reads the table-size field.** `msg_ctrl & 0x7FF` is *table size − 1*;
    `grep -rn "0x7FF\|table_size" kernel/src/drivers/` returns **0**. All three
    copies write entry 0 of a table whose length they never asked about, and none

@@ -18,7 +18,8 @@ method is to ask a false-pass question per item, and it asks it well for the two
 items whose QEMU-versus-hardware divergence it noticed: §3.2 (TCG always reports
 FSGSBASE) and §3.3 (QEMU's `stride == width`), both explicitly recorded as
 read-verified because QEMU cannot exercise them. The i8042 has **more** such
-branches than either, every one of them silent (above), and no item asks about
+branches than either, every one of them silent
+(`kernel-log-unreadable-once-userland-owns-the-screen`), and no item asks about
 any of them.
 
 What was actually established, and what was not:

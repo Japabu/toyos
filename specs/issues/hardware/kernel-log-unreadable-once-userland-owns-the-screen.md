@@ -6,6 +6,14 @@ opened: 2026-08-01
 
 # A kernel log line still cannot be read on the shipping image once userland claims the framebuffer
 
+The T14 booted from `target/bootable-diet.img` (sha256
+`9bda620d…e531aa`, the file still on disk and re-hashed) and reached the
+compositor with the integrated keyboard and the TrackPoint dead. The driver's
+entire contingency for that — `specs/metal-boot-plan.md` M2, the pre-flash
+gate's "what this gate does NOT cover" item 1, and `1bf5f61`'s commit message —
+is **"one loud line on the laptop's own screen instead of a bisect"**. That line
+is not readable, and this is the defect that made the first metal input attempt
+uninterpretable.
 
 `panic_console::boot_checkpoint` returns immediately once
 `SCREEN_OWNED_BY_USERLAND` is set (`panic_console/mod.rs:478`), and
@@ -46,6 +54,13 @@ Consequences, in the order they bite:
   owner a dead touchpad is expected (I2C-HID, unbuilt) and a keyboard refusal is
   the driver working. Neither statement is checkable without the line.
 
+**Built, as `--diag-boot`.** `diag/system.toml` plus a flag on the build system,
+the way `--gop` and `--metal-sim` are flags: it writes `target/bootable-diag.img`
+instead of `bootable.img`, so no edit to the shared `system.toml` and no image
+left contradicting the committed config. The guarantee is structural rather than
+a property of the init list — the compositor is the only process that claims the
+framebuffer and it is not built into the image at all — and the kernel and
+bootloader binaries are unchanged by the flag, so what the owner reads off a diag
 boot is what the shipping kernel does. Gated by `screen_diag_boot`
 (`tests/toyos.rs`, in `SCREEN_TESTS`): boots the same config on `Profile::Metal`,
 polls until the last checkpoint has painted, holds five seconds, and asserts an
@@ -69,6 +84,12 @@ Three things it does **not** give, in the order they will bite:
   what stops `boot_checkpoint` painting, so a machine that wedges *before*
   userland shows nothing at all in that mode. Two images, two questions.
 
+  Its own residuals: the seed is read once at startup, because the console
+  copies the shell's output to its own stdout and that is the ring `log_file`
+  drains — a tail would feed itself; and it needs `/log`, which
+  `fat32_adapter::mount` gives only to a machine that booted from USB
+  (`specs/issues/boot-media/boot-exists-only-on-a-usb-boot.md`), so on anything
+  else the console starts with one line saying the log is not there.
 
   The one exception is deliberate and is the i8042's own health verdict
   (`d13efa6`). The driver now says once whether the pin it armed has ever

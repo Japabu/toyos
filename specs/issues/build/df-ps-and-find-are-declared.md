@@ -1,6 +1,6 @@
 ---
 status: open
-kind: rejected
+kind: defect
 opened: 2026-08-08
 ---
 

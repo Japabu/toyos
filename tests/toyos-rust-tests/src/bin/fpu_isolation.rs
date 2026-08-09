@@ -239,7 +239,8 @@ fn leak_arm(round: u32) -> Result<(), String> {
 /// executes a waiting instruction and must live.
 fn fault_arm(round: u32) -> Result<(), String> {
     // The child's own verdict is not asserted: it dies on a machine that raises
-    // #MF and survives on one that does not, and `specs/issues/isolation/` has an
+    // #MF and survives on one that does not, and
+    // `specs/issues/kernel/ap-control-registers-inherit-init.md` has an
     // unexplained instance of the latter. Either way it leaves the control word
     // unmasked, which is what the next process has to be protected from.
     let _ = Command::new("/bin/test_rs_fault_gate_child").arg("mf").status();

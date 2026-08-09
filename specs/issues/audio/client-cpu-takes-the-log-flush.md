@@ -20,7 +20,7 @@ eight periods = 21.3 ms deep, and an empty one is a producer that stopped for at
 least that long. `/bin/tone` is one of the producers that stops and its callback
 is a sine, so it is not the client computing; it is the client not running.
 
-**The hypothesis, and it is the previous entry's fix seen from the other side.**
+**The hypothesis, and it is the log-flush deferral fix seen from the other side.**
 `owes_deadline()` asked whether a task parked on this CPU expects a wake *at a
 time*. An audio client parks on a pipe with no deadline at all — it is woken by
 an event, by an RT daemon that expects it back inside one period — so the test
