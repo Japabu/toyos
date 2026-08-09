@@ -1,9 +1,18 @@
 init = ["/bin/soundd", "/bin/test-runner"]
 
-[programs]
-soundd = {}
-test-runner = {}
-toybox = {}
+[boot]
+start = ["soundd", "test-runner"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+realtime = true
+
+[programs.test-runner]
+receives = ["soundd"]
+
+[programs.toybox]
+receives = ["soundd"]
 
 [symlinks]
 "bin/cat" = "/bin/toybox"

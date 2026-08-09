@@ -10,7 +10,19 @@
 # or the soundfont, so neither belongs in this initrd either.
 init = ["/bin/soundd", "/bin/test-runner"]
 
-[programs]
-soundd = {}
-test-runner = {}
-doom = {}
+[boot]
+start = ["soundd", "test-runner"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+realtime = true
+
+# test-runner passes its whole namespace to the binaries it spawns (§6.7a), so
+# it holds what doom needs. No compositor here — doom's `--sound-stress` opens
+# no window.
+[programs.test-runner]
+receives = ["soundd"]
+
+[programs.doom]
+receives = ["soundd"]

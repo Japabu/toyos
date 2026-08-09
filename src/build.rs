@@ -26,6 +26,21 @@ struct SystemConfig {
     hosted_rustc: bool,
     #[serde(default)]
     assets: Vec<String>,
+    /// What `/bin/init` starts at boot. Program *keys*, never paths — a path
+    /// here is a second spelling of a `[programs]` key and is what let a boot
+    /// list smuggle an argument through. Arguments live on the program entry's
+    /// `args` instead. Staged alongside the still-live `init` list until the
+    /// rest of chunk 4 makes it the source of truth and deletes `init`; read by
+    /// the §8.1 gates but not yet by the build, so dead until then.
+    #[serde(default)]
+    #[allow(dead_code)]
+    boot: BootConfig,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
+struct BootConfig {
+    start: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -33,6 +48,26 @@ struct SystemConfig {
 struct ProgramConfig {
     path: Option<String>,
     no_default_features: bool,
+    /// Argv this program is started with when it is in `[boot] start`. Consumed
+    /// by the manifest generation the rest of chunk 4 adds, not by any §8.1
+    /// gate, so it is dead until then.
+    #[allow(dead_code)]
+    args: Vec<String>,
+    /// Names init creates **one machine-wide port** for and endows this program
+    /// the *acceptor* of.
+    serves: Vec<String>,
+    /// Names this program creates a port for **itself**, once per instance, and
+    /// hands the connector down to its own children. init creates nothing and
+    /// holds nothing for these — `surface` is the whole of this kind.
+    provides: Vec<String>,
+    /// Names in this program's namespace, each a *connector*.
+    receives: Vec<String>,
+    /// Device classes init mints a claim for and endows.
+    devices: Vec<String>,
+    /// Whether init endows an `RT`-only `SysCap` dup. soundd, and nothing else.
+    /// Consumed by chunk 4's manifest generation, not by any §8.1 gate.
+    #[allow(dead_code)]
+    realtime: bool,
 }
 
 impl ProgramConfig {
@@ -1102,5 +1137,199 @@ mod tests {
                 "{config} starts sshd from init: {init:?}",
             );
         }
+    }
+
+    /// The eleven `system.toml` files this repository builds an image from.
+    /// `every_shipped_boot_config_is_covered` asserts this equals what a walk of
+    /// the tree finds, so a config added without a gate row reds rather than
+    /// slipping through uncovered.
+    const ALL_CONFIGS: &[&str] = &[
+        "system.toml",
+        "diag/system.toml",
+        "console/system.toml",
+        "tests/desktopcase/system.toml",
+        "tests/desktopaudiocase/system.toml",
+        "tests/doomcase/system.toml",
+        "tests/doommusiccase/system.toml",
+        "tests/metalcase/system.toml",
+        "tests/netcase/system.toml",
+        "tests/sshdcase/system.toml",
+        "tests/testcases/system.toml",
+    ];
+
+    /// Names `/bin/init` serves in every image. init is spawned by the kernel
+    /// and is in every image, so a `receives` naming one of these needs no
+    /// `[programs]` provider.
+    const INIT_SERVED: &[&str] = &["launcher"];
+
+    fn load(cfg: &str) -> SystemConfig {
+        parse_config(&Path::new(env!("CARGO_MANIFEST_DIR")).join(cfg))
+    }
+
+    /// Every name a program `receives` must be served or provided by some
+    /// program in the *same* config, or served by init. The build-time form of
+    /// "a client cannot name a service the system does not have", and the gate
+    /// with the sharpest teeth: no guest, no mutated tree.
+    fn receives_have_providers(cfg: &SystemConfig) -> Result<(), String> {
+        let mut providers: Vec<&str> = INIT_SERVED.to_vec();
+        for prog in cfg.programs.values() {
+            providers.extend(prog.serves.iter().map(String::as_str));
+            providers.extend(prog.provides.iter().map(String::as_str));
+        }
+        for (name, prog) in &cfg.programs {
+            for r in &prog.receives {
+                if !providers.contains(&r.as_str()) {
+                    return Err(format!(
+                        "program `{name}` receives `{r}`, which no program serves or provides"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_receives_names_a_provider() {
+        for cfg in ALL_CONFIGS {
+            receives_have_providers(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig =
+            toml::from_str("init = []\n[programs.client]\nreceives = [\"ghost\"]\n").unwrap();
+        assert!(receives_have_providers(&bad).is_err());
+    }
+
+    /// A `serves` name is one port machine-wide; a `provides` name is one port
+    /// per instance. A name declared both ways is a config where init makes a
+    /// port nobody accepts from while the real one is made elsewhere.
+    fn provides_disjoint_from_serves(cfg: &SystemConfig) -> Result<(), String> {
+        let serves: Vec<&str> = cfg
+            .programs
+            .values()
+            .flat_map(|p| p.serves.iter().map(String::as_str))
+            .collect();
+        for (name, prog) in &cfg.programs {
+            for p in &prog.provides {
+                if serves.contains(&p.as_str()) {
+                    return Err(format!(
+                        "`{p}` is both a serves name and `{name}`'s provides name"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_provides_name_is_never_also_a_serves_name() {
+        for cfg in ALL_CONFIGS {
+            provides_disjoint_from_serves(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig = toml::from_str(
+            "init = []\n[programs.a]\nserves = [\"x\"]\n[programs.b]\nprovides = [\"x\"]\n",
+        )
+        .unwrap();
+        assert!(provides_disjoint_from_serves(&bad).is_err());
+    }
+
+    /// A device class init can mint exactly one claim for, so two programs
+    /// naming the same class is a config init cannot satisfy — a runtime
+    /// first-come race today.
+    fn one_claimant_per_device(cfg: &SystemConfig) -> Result<(), String> {
+        let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, prog) in &cfg.programs {
+            for d in &prog.devices {
+                if let Some(prev) = seen.insert(d, name) {
+                    return Err(format!(
+                        "device class `{d}` is claimed by both `{prev}` and `{name}`"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_device_class_has_at_most_one_claimant() {
+        for cfg in ALL_CONFIGS {
+            one_claimant_per_device(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig = toml::from_str(
+            "init = []\n[programs.a]\ndevices = [\"framebuffer\"]\n\
+             [programs.b]\ndevices = [\"framebuffer\"]\n",
+        )
+        .unwrap();
+        assert!(one_claimant_per_device(&bad).is_err());
+    }
+
+    fn claims_no_device(cfg: &SystemConfig) -> Result<(), String> {
+        for (name, prog) in &cfg.programs {
+            if !prog.devices.is_empty() {
+                return Err(format!("program `{name}` claims {:?}", prog.devices));
+            }
+        }
+        Ok(())
+    }
+
+    /// The diagnostic image's whole reason for existing: nothing in it can claim
+    /// the framebuffer, so the kernel's boot log stays on the panel. `/bin/init`
+    /// is in every image and could reach a device, so the property becomes "the
+    /// config declares no `devices`" — checkable here for the first time.
+    #[test]
+    fn no_diag_program_claims_the_screen() {
+        claims_no_device(&load("diag/system.toml"))
+            .unwrap_or_else(|e| panic!("diag/system.toml: {e}"));
+        let bad: SystemConfig =
+            toml::from_str("init = []\n[programs.x]\ndevices = [\"framebuffer\"]\n").unwrap();
+        assert!(claims_no_device(&bad).is_err());
+    }
+
+    /// `[boot] start` names program keys, so a typo is a build error rather than
+    /// a kernel panic at `spawn_kernel`.
+    fn started_programs_are_declared(cfg: &SystemConfig) -> Result<(), String> {
+        for name in &cfg.boot.start {
+            if !cfg.programs.contains_key(name) {
+                return Err(format!("[boot] start names `{name}`, not a [programs] key"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_started_program_is_declared() {
+        for cfg in ALL_CONFIGS {
+            started_programs_are_declared(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig = toml::from_str("init = []\n[boot]\nstart = [\"ghost\"]\n").unwrap();
+        assert!(started_programs_are_declared(&bad).is_err());
+    }
+
+    fn walk_configs(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                let skip = matches!(name.to_str(), Some("target") | Some("rust"))
+                    || name.to_string_lossy().starts_with('.');
+                if !skip {
+                    walk_configs(&path, root, out);
+                }
+            } else if name == "system.toml" {
+                out.push(path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    /// `ALL_CONFIGS` is the list the gates above iterate; a config added without
+    /// a row would leave a hole in that coverage. Assert the list is exactly
+    /// what a walk of the tree finds, so it cannot silently drift.
+    #[test]
+    fn every_shipped_boot_config_is_covered() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = Vec::new();
+        walk_configs(root, root, &mut found);
+        found.sort();
+        let mut expected: Vec<String> = ALL_CONFIGS.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(found, expected);
     }
 }

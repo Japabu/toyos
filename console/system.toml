@@ -15,10 +15,21 @@ init = ["/bin/console"]
 
 assets = ["assets"]
 
-[programs]
-console = {}
-shell = {}
-toybox = {}
+[boot]
+start = ["console"]
+
+# `/bin/console` owns the screen and provides the surface its shell and the
+# shell's children inherit. No compositor here, so nothing receives one.
+[programs.console]
+provides = ["surface"]
+receives = ["launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.shell]
+receives = ["surface", "launcher"]
+
+[programs.toybox]
+receives = ["surface"]
 
 [symlinks]
 "bin/cat" = "/bin/toybox"

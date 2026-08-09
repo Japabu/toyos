@@ -9,12 +9,28 @@ init = ["/bin/compositor", "/bin/soundd", "/bin/terminal"]
 
 assets = ["assets"]
 
-[programs]
-compositor = {}
-soundd = {}
-terminal = {}
-shell = {}
-toybox = {}
+[boot]
+start = ["compositor", "soundd", "terminal"]
+
+[programs.compositor]
+serves = ["compositor"]
+receives = ["soundd", "launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+realtime = true
+
+[programs.terminal]
+provides = ["surface"]
+receives = ["compositor", "launcher"]
+
+[programs.shell]
+receives = ["surface", "launcher"]
+
+[programs.toybox]
+receives = ["compositor", "soundd", "surface"]
 
 [symlinks]
 "bin/echo" = "/bin/toybox"

@@ -11,7 +11,15 @@
 # would spend one of them.
 init = ["/bin/netd", "/bin/sshd", "/bin/test-runner"]
 
-[programs]
-netd = {}
-sshd = {}
-test-runner = {}
+[boot]
+start = ["netd", "sshd", "test-runner"]
+
+[programs.netd]
+serves = ["netd"]
+devices = ["nic"]
+
+[programs.sshd]
+receives = ["netd", "launcher"]
+
+[programs.test-runner]
+receives = ["netd"]

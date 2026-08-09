@@ -21,5 +21,11 @@
 # the one process this image must not contain.
 init = ["/bin/toybox pwd"]
 
-[programs]
-toybox = {}
+# The one program init starts here prints the cwd and exits. It declares no
+# `devices`, which is what `no_diag_program_claims_the_screen` now checks — the
+# structural "nothing here can claim the framebuffer" made into a build gate.
+[boot]
+start = ["toybox"]
+
+[programs.toybox]
+args = ["pwd"]

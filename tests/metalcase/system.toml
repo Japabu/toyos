@@ -18,9 +18,26 @@ init = ["/bin/compositor", "/bin/soundd", "/bin/netd", "/bin/sshd", "/bin/test-r
 
 assets = ["assets"]
 
-[programs]
-compositor = {}
-soundd = {}
-netd = {}
-sshd = {}
-test-runner = {}
+[boot]
+start = ["compositor", "soundd", "netd", "sshd", "test-runner"]
+
+[programs.compositor]
+serves = ["compositor"]
+receives = ["soundd", "launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+realtime = true
+
+[programs.netd]
+serves = ["netd"]
+devices = ["nic"]
+
+[programs.sshd]
+receives = ["netd", "launcher"]
+
+# The union its guest binaries need on this machine shape.
+[programs.test-runner]
+receives = ["compositor", "soundd", "netd"]
