@@ -142,12 +142,12 @@ inventory and the migration ledger in §18 counts against it.
 |---|---|---|---|---|
 | P1 | `arch/syscall.rs:690` | pipe writable | none | park on the write end's completion |
 | P2 | `arch/syscall.rs:797` | pipe readable | none | park on the read end's completion |
-| P3 | `arch/syscall.rs:799` | virtio-sound period | none | park on the claim's completion |
-| P4 | `arch/syscall.rs:804` | HDA period | none | park on the claim's completion |
+| P3 | `arch/syscall.rs:799` | virtio-sound period | none | park on the `DeviceClaim`'s completion |
+| P4 | `arch/syscall.rs:804` | HDA period | none | park on the `DeviceClaim`'s completion |
 | P5 | `arch/syscall.rs:809` | serial-console key | **10 ms re-poll** | park; the 10 ms is deleted (§14.3) |
-| P6 | `arch/syscall.rs:1279` | accept | none | park on the listener's completion |
-| P7 | `arch/syscall.rs:1202,1213` | child exit | none | park on `Source::Terminated(koid)` |
-| P8 | `arch/syscall.rs:1578,1584` | thread exit | none | park on `Source::Terminated(koid)` |
+| P6 | `arch/syscall.rs:1279` | accept | none | park on the **`Acceptor`**'s `PortShared` (§15 row 5) |
+| P7 | `arch/syscall.rs:1202,1213` | child exit | none | `SYS_PROCESS_WAIT(proc_h)`, parking on the `ProcessObject` |
+| P8 | `arch/syscall.rs:1578,1584` | thread exit | none | park on the `ThreadObject`; `SYS_THREAD_JOIN` keeps its `Tid` (§15 row 6) |
 | P9 | `arch/syscall.rs:1715` | an instant | caller's | park on a deadline completion |
 | P10 | `io_uring.rs:410,419` | a CQE | caller's | the ring **is** an inbox (§5.2) |
 | P11 | `scheduler.rs:325,330` | a futex word | caller's | park on the bucket's completion; `FUTEX_WAKE_GEN` deleted |
@@ -260,8 +260,9 @@ Exactly two kinds exist and both are the same type:
 - **A thread's inbox**, in `ThreadData`, holding `MAX_INBOX` records. It is the
   kernel side of every blocking syscall.
 - **An io_uring ring's inbox**, whose backing store is the CQ in the ring's own
-  pages. `IoUringObject` owns those pages (the endowment spec's Stage D), so
-  `io_uring` stops abusing `shared_memory` and the CQE *is* a `Record`.
+  pages. `IoUringObject` owns those pages by the time this lands — the endowment
+  branch's chunk 6 does that and closes `io-uring-abuses-shared-memory` with it —
+  so all this adds is that the CQE *is* a `Record`.
 
 There is no third. There is no global registry, no `CORE` lock and no
 `HashMap<Source, Vec<RingId>>`: **a watch is a node the waiter lends to the
@@ -715,22 +716,32 @@ for it.
 
 ### 14.2 Syscall numbers — the allocation that cannot collide
 
-The highest allocated number today is **98**. Retired and never reusable: 2–4, 7,
-11, 12, 16, 22, 23, 27, 29–30, 32–34, 46–48, 69, 71, 84.
+The highest number allocated on `main` today is **98**; 21 numbers in `0..=98` are
+gaps and none is reusable.
 
-**Coordination rule with the endowment branch, and the reviewer must check it:**
+**`specs/capability-endowment-spec.md` §3.1 takes 99–112** (fourteen new calls)
+and retires thirteen more (26, 31, 36–39, 65, 68, 70, 76, 85, 87, 96). It lands
+first. Its §9 merge rule is that a number added on `main` while it is open
+**shifts its own block up** rather than being resolved by picking one, so its
+top is not fixed until it merges.
 
-| range | owner |
+**This spec therefore allocates nothing until C0 reads the merged tree**, and
+takes the first clean number after the endowment delta — expected **113**, and
+C0 asserts it rather than assuming it. It needs exactly one:
+
+| new | replaces |
 |---|---|
-| 99–115 | the endowment architecture (`SYS_HANDLE_*`, `SYS_SHM_*`, `SYS_PROCESS_*`, `SYS_THREAD_JOIN_H`, `SYS_RT_ENTER` — twelve names, five spare) |
-| 116–127 | this spec |
+| `SYS_SLEEP_UNTIL` | `SYS_NANOSLEEP` (49), retired |
 
-This spec needs **two**: `SYS_SLEEP_UNTIL` (116) replacing `SYS_NANOSLEEP` (49,
-retired) and one spare left unallocated. Everything else keeps its number with
-changed semantics: `SYS_IO_URING_ENTER` (90) takes an absolute deadline,
-`SYS_FUTEX_WAIT` (58) takes an absolute deadline. **This spec allocates nothing in
-99–115 and reuses no retired number**; if the endowment spec needs more than
-seventeen, it takes them from 128 and says so.
+Everything else keeps its number with changed semantics: `SYS_IO_URING_ENTER`
+(90) and `SYS_FUTEX_WAIT` (58) take absolute deadlines.
+
+Two consequences of the one number, both already owned by the endowment branch
+and named here so neither is done twice: their chunk 9 sizes the syscall profile
+array from the ABI rather than at `[u32; 64]`
+(`specs/issues/diagnostics/syscall-profile-is-64-bins-wide.md`), which one more
+number does not change; and their `retired_syscalls!` macro takes 49's gravestone
+as one more row.
 
 ### 14.3 Semantics
 
@@ -752,33 +763,30 @@ superseded spec's §8 reasoning and it is still right.
 
 ## 15. Reconciliation with the endowment architecture
 
-`wt/toyos-endow` was **not pushed to `origin` as of 2026-08-09** (checked with
-`git ls-remote --heads origin`; the remote carries `main`, `ci/probe-green`,
-`wt/toyos-dumpnote`, `wt/toyos-hdaprobe`, `wt/toyos-racedoc`, `wt/toyos-std` and
-nothing else). This section is therefore written against
-`specs/capability-handles-spec.md` at `19c761e`, which is that work's in-tree
-ancestor, and **the implementing agent must re-read
-`specs/capability-endowment-spec.md` from the endowment branch before chunk C0 and
-correct any row below that has moved.** The plan-reviewer should treat an
-unreconciled row as a red.
+Reconciled against `specs/capability-endowment-spec.md` as it stands on
+`origin/wt/toyos-endow` at `f53a8de`, read 2026-08-09. That branch lands first;
+C0 merges the result and re-checks every row. **A row that has moved is a red for
+this spec, not a detail for the implementer to absorb.**
 
-| # | contact point | how this spec reconciles |
+| # | contact point (their §) | how this spec reconciles |
 |---|---|---|
-| 1 | **The handle table** (`HandleTable` inside `ProcessData`, `get` returns owned Arcs) | `ProcessData` becomes a `SleepLock` (§9). Their `get` is lock → clone → unlock, so no table borrow crosses a park; §6's borrow rule *proves* it rather than asserting it. No new lock, no new ordering edge. |
-| 2 | **`Rights::WAIT`**, which their §4.2 reserves as "the Phase-2 seam" | `completion::arm` requires `WAIT` on the handle naming the subject. That is the seam, taken exactly as offered. |
-| 3 | **io_uring's object kind.** Their §6.8: `IoUringObject` owns its `PageAlloc` directly, closing `io-uring-abuses-shared-memory` | Adopted unchanged. A ring's `Inbox` **is** that page's CQ (§5.2), so the two specs describe one object. Neither needs a `RingArena`; the superseded spec's 32 KiB slot allocator is dropped. |
-| 4 | **`Source` keyed by `Koid`, never by a global id.** Their §7 row: `io_uring::Source::{PipeReadable, PipeWritable, Listener}` keys become `Koid` | Stronger here: §5.3's `Subject` is a *borrowed reference to the object*, so there is no key at all and a destroyed subject is unnameable. Their rule is satisfied and its residual removed. |
-| 5 | **`io_uring::Source::Terminated(Koid)`**, their §9.1 step 7 | Adopted by name. P7/P8 park on it; `park_lot`, `PARK_BUCKETS` and `wake_task(TaskId)` are deleted here rather than there. |
-| 6 | **`on_zero_handles` and the deferred zero queue** (their §5.2) | This spec adds one row to their §5.3 table: `FileObject::on_zero_handles → writeback::push` (§13). It **depends** on their deferred queue existing, so C12 lands after their Stage B. |
-| 7 | **`KernelPayload.address_space: Option<PageTables>` → non-`Option`** (their §9.4, the one surviving retype) | §10: a kernel thread's `ProcessObject` names the **kernel** address space. Without that, this refactor would have forced the field to stay an `Option` forever. Their retype is *enabled* by this one. |
-| 8 | **Their §5.1 "no Arc across block" interim rule** and §13's "structural fix = Phase 2 try-once syscalls" | Retired by §7's cancellable park, not by try-once syscalls. A killed task returns and drops its own Arcs. They keep one-syscall blocking I/O and lose the leak class. **Tell them.** |
-| 9 | **Syscall numbers** | §14.2: 99–115 theirs, 116–127 this spec's, no retired number reused by either. |
-| 10 | **The SDK's blocking calls** (`toyos/src/io.rs`, `toyos::ipc::FrameRx`, `Poller`) | ABI shape unchanged (§14.3), so their handle rename and this spec's deadline change touch the SDK in disjoint places: they change *what* an argument names, this changes *what a timeout means*. `Poller` is replaced by `toyos::ring::Ring` in C11 either way. |
-| 11 | **`DeviceClaim`** (their §6.5) | P3/P4 park on the claim's completion, and `on_zero_handles` releasing the class posts `Outcome::Gone(Revoked)` to anyone parked. Their crash-release path gains liveness for free. |
-| 12 | **Bad-handle policy flip to kill-process** (their §4.5) | §7 makes that kill safe from a parked thread, which their stage E needs and does not have today. |
-
-Landing order: their branch lands first (the brief's ruling). C0 merges
-`origin/main` after that landing and re-reads their spec.
+| 1 | **`HandleTable` inside `ProcessData`, "behind the existing lock"** (§1.1) | That lock becomes a `SleepLock` in C8. Their `get::<T>` is lock → clone an owned Arc → unlock, so no table borrow crosses a park; §6's borrow rule *proves* it rather than asserting it. No new lock and no new ordering edge. |
+| 2 | **`Rights::WAIT` — "block on it / io_uring POLL_ADD / SYS_PROCESS_WAIT"** (§1.4) | `completion::arm` requires `WAIT` on the handle naming the subject. That is the seam, taken exactly as offered, and it is the bit that makes "may this process park on this object" a capability question. |
+| 3 | **`Acceptor`/`Connector` and `PortShared`** (§1.2), which carry `acceptors: Arc<KWaitQueue>` and `io_uring_watchers: Lock<Vec<RingId>>` | **The one file both branches write.** `kernel/src/object/port.rs` is theirs to create; C3 replaces those two fields with one watch list, exactly as it does for pipes and devices. P6 parks there. Their `Acceptor::on_zero_handles` — set `closed`, drop the queue — becomes the canceller that posts `Outcome::Gone` to every parked acceptor, which is what makes their "the bound on failure is a process lifetime and nothing else" true of a *blocked* server too. |
+| 4 | **No key at all, rather than a `Koid` key** (§1.1: `Koid` is "an identity for diagnostics and kernel-internal keys, never an authority"; their chunk 2 turns `io_uring::Source` keys into `Koid`s) | §5.3's `Subject` is a *borrowed reference to the object*, so after C3 there is no key to turn into anything and a destroyed subject is unnameable. Their chunk 2 does the `Koid` rename; C3 removes the residual. Order matters: **C3 must land after their chunk 2**, or it rewrites a `Source` that is about to be rewritten. |
+| 5 | **`SYS_LISTEN`/`SYS_CONNECT` retired, `SYS_ACCEPT`(86) takes an `Acceptor` and returns one handle** (§3.2, §3.3) | `kernel/src/listener.rs` is gone before C3 runs, so P6's "listener's completion" is the `Acceptor`'s. `listener::io_uring_watchers` and `wake_poll_waiters` are deleted by them, not by this spec — **removed from §19 so neither branch claims it twice.** |
+| 6 | **`SYS_THREAD_JOIN`(41) is *kept* with its `Tid`** (§3.4, their deviation D5) — `capability-handles-spec.md`'s `SYS_THREAD_JOIN_H` does **not** happen | P8 therefore parks on the `ThreadObject` the `Tid` resolves to inside the caller's own process, not on a handle. `SYS_PROCESS_WAIT`(108) with `Rights::WAIT` is the handle-shaped one, and P7 uses it. `park_lot`, `PARK_BUCKETS` and `wake_task(TaskId)` are still deleted here. |
+| 7 | **`SYS_OPEN_DEVICE`(31) retired; `SYS_DEVICE_CLAIM`(111) mints a claim, and only `/bin/init` holds `Rights::DEVICE`** (§1.2, §3.1) | P3/P4 park on the `DeviceClaim`. `DeviceClaim::on_zero_handles` releasing the class posts `Outcome::Gone(Revoked)` to anyone parked, so their §5.3 crash-release row gains liveness for a blocked reader for free. |
+| 8 | **`SYS_IO_URING_SETUP`(89) returns `{ handle, vaddr }`; the ring owns its `PageAlloc` and the kernel maps it at setup** (§3.3, their chunk 6) | Exactly §5.2's second inbox. **They close `io-uring-abuses-shared-memory`, not this spec** — removed from §19. C11 adopts the ring as an `Inbox` and adds nothing to its allocation. The superseded spec's 32 KiB `RingArena` is dropped by both. |
+| 9 | **`on_zero_handles` runs from a deferred per-CPU queue drained "at syscall exit, `do_schedule` entry and the idle loop"** (§1.1) | Two things. (a) C9 empties the idle loop, and that is safe because the idle loop `pass`es every iteration, so the `do_schedule` drain site subsumes the idle one — **delete the third site rather than keep an idle-loop body for it.** (b) C12 adds one row to their hook table: `FileObject::on_zero_handles → writeback::push`, because `Drop` cannot take a `&Parkable` (§13). C12 lands after their chunk 2. |
+| 10 | **Their §1.1's closing rule: "The failing shape to check any new type against is `toyos-sched`'s `Registration`: a guard that lives on the victim's own stack and is therefore never dropped when another CPU kills it. No object introduced below places a release obligation on a blocked thread's stack."** | §7 **fixes `Registration` itself**: a kill at a park is answered by `Cancelled`, the victim runs again on its own stack and drops it. So their rule stops being a constraint they must design around and becomes a property the kernel has. `retired-thread-leaks-wait-queue-node` is closed by C4, and it is this spec's to close. |
+| 11 | **Their §1.1: an `Arc` cloned before blocking "is stranded on a freed kernel stack … leaks memory, bounded and census-visible"** | Same mechanism as row 10 retires the leak class outright. `capability-handles-spec.md` §13 said the structural fix was "Phase 2 try-once syscalls"; it is not — it is the cancellable park, which keeps one-syscall blocking I/O (§14.3). **Their census baseline assertions should tighten once C4 lands.** |
+| 12 | **`KernelPayload.address_space: Option<PageTables>` → non-`Option`** (`capability-handles-spec.md` §9.4's one surviving retype, which their spec adopts through §1.3's `AddressSpaceObject`) | §10: a kernel thread's `ProcessObject` names the **kernel** address space. A kernel thread naming *no* address space would have forced that field to stay an `Option` forever. Their retype is *enabled* by this one. |
+| 13 | **Bad-handle policy flips to kill-the-process** (their chunk 7) | §7 makes that kill safe from a thread parked anywhere, including inside a sleep-locked critical section. Their chunk 7 flips it before C4 lands, so between the two landings a killed handle-abuser can still be killed at a park under the *old* locks — which is today's behaviour and no worse. |
+| 14 | **Their gates `kill_while_blocked` and `device_claim_crash_release`** (their chunk 6) | Both are strengthened rather than changed: after C4 the killed client's stack is unwound by returning, so the census returns to baseline for a reason stronger than the handle drain. Do not weaken either to accommodate this spec. |
+| 15 | **The SDK** (§6.5) | Disjoint edits: they change *what an argument names*, this changes *what a timeout means* (§14.3 keeps the blocking ABI shape). `toyos/src/services.rs` and `toyos/src/pipe.rs` are deleted by them; `Poller` is replaced by `toyos::ring::Ring` in C11 either way. |
+| 16 | **The `Abi-Inseparable` trailer and the shared sysroot** (their §9, §10.1) | They hold the sysroot claim for their branch's whole life. C0 cannot start until they land, which is the brief's ordering anyway. This branch then claims it in turn for C1 onward, because §14.1 genuinely changes `toyos-abi/src`. |
+| 17 | **Root `CLAUDE.md` headroom** (their chunk 9 measures 2,678 bytes spare against 37,322) | This spec's own edit spent 272 of them. Whoever lands second re-measures rather than trusting either figure; `src/docs.rs`'s budget test is the arbiter and it runs in `cargo test --lib`. |
 
 ---
 
@@ -889,11 +897,16 @@ Userland is untouched until C11, because §14.3 preserves the blocking ABI shape
 `wake_task`, `wake_pipe_readers`, `wake_pipe_writers`, `park_lot`, `futex_wake`'s
 generation protocol. `sched/waitqs.rs`: `PARK_BUCKETS`, `park_lot`.
 `io_uring.rs`: `Source`, `Source::is_ready`, `complete_pending_for_event`,
-`complete_pending_for_source`, `PendingPoll`'s fd keying, the `shared_memory`
-dependency. `log_file.rs`: `SINK`. `xhci/wait/mod.rs`: `wait_transfer`,
-`wait_command`. `nvme.rs`: `wait_completion`'s spin. `virtio.rs`:
-`submit_and_wait`'s spin. Five per-source `IO_URING_WATCHERS` statics
-(`net.rs`, `keyboard.rs`, `mouse.rs`, `hda.rs`, `virtio_sound.rs`).
+`complete_pending_for_source`. `log_file.rs`: `SINK`. `xhci/wait/mod.rs`:
+`wait_transfer`, `wait_command`. `nvme.rs`: `wait_completion`'s spin.
+`virtio.rs`: `submit_and_wait`'s spin. Five per-source `IO_URING_WATCHERS`
+statics (`net.rs`, `keyboard.rs`, `mouse.rs`, `hda.rs`, `virtio_sound.rs`) and
+the sixth inside their `PortShared` (§15 row 3).
+
+**Not deleted here, because the endowment branch deletes them first**:
+`kernel/src/listener.rs` whole, `wake_poll_waiters`, `io_uring`'s
+`shared_memory` dependency, and `PendingPoll`'s fd keying (their chunk 2 rekeys
+it to `Koid`, C3 removes the key entirely).
 
 **`specs/issues/` files closed.** Slugs only, deliberately: `src/docs.rs` resolves
 every `specs/issues/<area>/<slug>.md` path written anywhere in the tree, so a full
@@ -909,7 +922,6 @@ path here would red `cargo test --lib` the moment the file is deleted.
 | `scheduler-pass-blocks-in-xhci` | kernel | C7 | and its second half, `sched-check` never being turned on, is C14's |
 | `hotplug-blocks-a-scheduler-pass` | hardware | C7 | |
 | `driver-waits-without-a-deadline` | kernel | C10 | `CAP.TO` included |
-| `io-uring-abuses-shared-memory` | design-debt | C11 | jointly with the endowment spec's Stage D |
 | `io-uring-source-half-a-wake-pair` | kernel | C3 | one post, no pair to halve |
 | `panic-on-wedged-virtio-console-spins` | panic-path | C10 | `submit_and_wait` gets a `Bound` |
 | `retired-thread-leaks-wait-queue-node` | kernel | C4 | §7's consequence 1 |
@@ -1024,7 +1036,7 @@ read that trailer.
 
 | # | chunk | delivers | gate |
 |---|---|---|---|
-| C0 | merge `origin/main` (post-endowment); re-read `specs/capability-endowment-spec.md` and correct §15 | baseline `io-depth-probe` + `--slow-usb` A/B recorded in this spec | suite green; §15 has no unreconciled row |
+| C0 | merge `origin/main` (post-endowment); re-check every §15 row against the *merged* tree; assert the first clean syscall number (§14.2); claim the sysroot | baseline `io-depth-probe` + `--slow-usb` A/B recorded in this spec | suite green; §15 has no moved row |
 | C1 | `Bound`/`Cadence`/`Tripwire`/`Deadline`; `Instant`/`Duration`; `Parkable` | §3's four kinds exist; nothing uses them | no behaviour change |
 | C2 | `kernel/src/completion/`: `Record`, `Outcome`, `Inbox`, `Subject`, `arm`, `post`. Wired **behind** the existing waitq — every wake also posts | behaviour-preserving | `kernel-loom/tests/inbox.rs` |
 | C3 | the one park site. `wait_until`/`prepare_wait`/`block_on` → `completion::wait`. Futex folded in, generation protocol deleted. `park_lot`, `PARK_BUCKETS`, `wake_task` deleted. `Source::Terminated(koid)` | 12 park sites → 1 | `blocking_read_stress`; grep: one `dispose_block` caller |
@@ -1035,15 +1047,20 @@ read that trailer.
 | C8 | `VFS`, `VOLUMES`, `ProcessData` → `SleepLock`. 33 + 55 call sites. Boot/task split | §9 | `killed_holder_releases`; `park-holding-a-spinlock` reds |
 | C9 | `kernel/src/log/`: core + three sinks + `logd`. Every deletion in §11 | §11 | `idle_loop_is_one_statement`; `reintroduce-idle-flush` reds; `--slow-usb` A/B moves |
 | C10 | `Poll<T>`; NVMe `CAP.TO`; virtio, HDA, IOMMU, RTC settles; the three duplicate `settles` become one | §4.3 | `no_spin_outside_the_allow_list` |
-| C11 | blocking syscalls on the one shape; `SYS_SLEEP_UNTIL`; absolute deadlines; 24-byte CQE; io_uring owns its pages; `toyos::ring::Ring` replaces `Poller`; soundd's `delta == 0` hack deleted | §14 | full suite; gate A fast tier |
+| C11 | blocking syscalls on the one shape; `SYS_SLEEP_UNTIL`; absolute deadlines; 24-byte CQE; the ring becomes an `Inbox` (its pages are already its own — §15 row 8); `toyos::ring::Ring` replaces `Poller`; soundd's `delta == 0` hack deleted | §14 | full suite; gate A fast tier |
 | C12 | the write-back queue; `FileObject::on_zero_handles`; `SYS_FSYNC` parks; page-cache eviction to `iod` | §13 | `close-cannot-report-io-error`'s reproduction |
 | C13 | the deletion commit; grep gates; `specs/issues/` closures; CLAUDE.md | §19 | the deletion commit is the proof — nothing else compiles against the old surface |
 | C14 | measurement: gate A thorough A/B both arms both sticks; `io-depth-probe`; `sched-check` on; assertions recorded in `tests/audio-baseline.toml` | §20 | the numbers go in this spec |
 
 Dependencies: C4 needs C3. C5 is independent of C2–C4 and must land **before** C7
 and C8. C7 needs C5. C8 needs C4, C5 and C6. C9 needs C6, C7, C8 — that is the
-stage whose number moves, and it cannot move earlier. C12 needs C6 and the
-endowment spec's Stage B. C11 is independent of C7–C9 and may float.
+stage whose number moves, and it cannot move earlier. C11 is independent of
+C7–C9 and may float. C12 needs C6.
+
+Across the two branches: C3 must follow the endowment branch's chunk 2 (§15 row
+4) and C12 its chunk 2 as well (row 9). Since the whole of this branch follows
+their landing, both are satisfied by C0 — recorded so nobody reorders C3 ahead
+of the merge on the grounds that it "only touches the scheduler".
 
 ---
 
@@ -1118,8 +1135,10 @@ Runtime fail-fast, numbered so a review can cite them:
 
 ## 24. Open risks
 
-1. **§15 is written against an ancestor.** The endowment branch was unpushed when
-   this was written. C0 re-reads it; an unreconciled row is a red.
+1. **§15 is reconciled against an unlanded branch.** `origin/wt/toyos-endow` at
+   `f53a8de` is a plan, not a merge, and its own §9 says its syscall block shifts
+   if `main` moves under it. C0 re-checks every row against the merged tree; a
+   moved row is a red for this spec.
 2. **C8's blast radius.** 33 VFS sites and 55 `ProcessData` sites, in the code path
    that boots the owner's machine. The choke point is two doors and the change is
    mechanical, but a missed site is a `Parkable` that will not thread and the
