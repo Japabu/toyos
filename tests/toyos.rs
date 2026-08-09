@@ -769,60 +769,229 @@ const T14_COLS: usize = 1920 / 8;
 /// failing loudly if it drifts.
 const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
 
-// C tests that can't compile yet (missing toyos-cc features or unsupported platform APIs).
-// Tests that compile successfully are discovered automatically — only list failures here.
-const C_SKIP: &[&str] = &[
-    "03_struct",              // needs _Generic
-    "18_include",             // needs system headers we don't provide
-    "31_args",                // needs argc/argv
-    "32_led",                 // needs system APIs
-    "33_ternary_op",          // needs _Generic
-    "40_stdio",               // needs FILE* APIs
-    "60_errors_and_warnings", // meta-test for compiler errors
-    "73_arm64",               // wrong architecture
-    "101_cleanup",            // needs __attribute__((cleanup))
-    "102_alignas",            // needs _Alignas
-    "103_implicit_memmove",   // needs __builtin_memmove
-    "104_inline",             // needs weak symbols in linker
-    "106_versym",             // needs pthread
-    "107_stack_safe",         // needs alloca
-    "108_constructor",        // needs __attribute__((constructor))
-    "109_float_struct_calling", // needs struct-in-register calling convention
-    "112_backtrace",          // needs tcc_backtrace
-    "113_btdll",              // needs tcc_backtrace
-    "114_bound_signal",       // needs sigaction
-    "115_bound_setjmp",       // needs setjmp
-    "116_bound_setjmp2",      // needs setjmp
-    "117_builtins",           // needs __builtin_memmove
-    "120_alias",              // needs asm aliases
-    "122_vla_reuse",          // VLA codegen bug
-    "123_vla_bug",            // VLA codegen bug
-    "124_atomic_counter",     // needs stdatomic.h (calls process::exit, not catchable)
-    "125_atomic_misc",        // needs stdatomic.h (calls process::exit, not catchable)
-    "126_bound_global",       // needs bounds checking
-    "127_asm_goto",           // needs inline asm
-    "128_run_atexit",         // needs on_exit, and a -D per config to have a main
-    "132_bound_test",         // needs bounds checking
-    "136_atomic_gcc_style",   // needs stdatomic.h (calls process::exit, not catchable)
-];
+/// How far a corpus case gets before it stops, and what it says when it does.
+///
+/// There is no `Run`. Seventeen of these built at the moment this list was
+/// written and nobody has ever asked whether they run; turning one on is a
+/// guest slot and possibly a hung lane, so the question is filed rather than
+/// answered here.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// toyos-cc refuses it, and this is what the refusal says.
+    ///
+    /// Quoted for the same reason `EXPECTED_FAILURES` quotes a failure
+    /// message: a second defect landing on the same case must not be able to
+    /// hide under the first.
+    Refused(&'static str),
+    /// It compiles, and the link does not resolve — this symbol.
+    NoLink(&'static str),
+    /// It builds. The decision is only not to run it.
+    Built,
+}
 
-/// C tests that are discovered, compiled and then thrown away because they do
-/// not build. Unlike [`C_SKIP`] these are not a decision, they are the current
-/// state of the toolchain — the reason each gives is printed by every run.
-const C_DOES_NOT_BUILD: &[(&str, &str)] = &[
-    ("83_utf8_in_identifiers", "the lexer rejects a non-ASCII byte in an identifier"),
-    ("85_asm_outside_function", "file-scope asm(...), refused by name"),
-    ("89_nocode_wanted", "expr_type cannot type an identifier under `sizeof` in dead code"),
-    ("94_generic", "_Generic type dispatch is not implemented"),
-    ("95_bitfields", "#pragma pack, refused by name"),
-    ("95_bitfields_ms", "the same file again, through 95_bitfields.c"),
-    ("96_nodata_wanted", "every branch wants a -D the harness does not pass, so no `main`"),
-    ("98_al_ax_extend", "file-scope asm(...) again, refused by name"),
-    ("99_fastcall", "file-scope asm(...) at line 26, before anything 32-bit about it"),
+/// Why a case is not run.
+enum Why {
+    /// Considered and declined. Nothing is owed, which is why this list has no
+    /// `task` field where `EXPECTED_FAILURES` requires one: an expected
+    /// failure nobody is assigned to is a disabled test, and a *decline* is
+    /// not owed to anybody by construction.
+    Declined(&'static str),
+    /// Held open by a write-up, which is where the reason lives. `docs.rs`
+    /// resolves the path.
+    Open(&'static str),
+}
+
+impl Why {
+    fn stated(&self) -> String {
+        match self {
+            Why::Declined(reason) => format!("declined: {reason}"),
+            Why::Open(path) => format!("held open by {path}"),
+        }
+    }
+}
+
+/// A corpus case the suite does not run.
+///
+/// One list, because "is this declined or is it broken" and "how far does it
+/// get" are two questions, and the two lists this replaces each answered one
+/// of them for a different set of cases. `C_SKIP` was 32 names that nothing
+/// ever attempted: 17 of them compiled fine, several stated a reason that was
+/// not the reason — `03_struct` said `_Generic` and stopped on
+/// `__attribute__((cleanup))`, `123_vla_bug` said "VLA codegen bug" and built
+/// — and a name that no longer matched a file would have left a dead
+/// exemption behind for ever.
+///
+/// **Every entry is attempted to its declared stage on every run.** Getting
+/// further means the fix arrived and the entry goes; getting less far is a
+/// regression. Both red the run. There is no review-date escape hatch of the
+/// `Stale::OnThisDate` kind, and no need of one: a host compile is
+/// deterministic, so one green here is the whole population rather than one
+/// sample of an intermittent.
+struct NotRun {
+    /// The corpus file's stem. A name with no `.c` reds the run, so a rename
+    /// takes its entry with it.
+    case: &'static str,
+    stage: Stage,
+    why: Why,
+}
+
+/// Where the question about the `Built` set lives.
+const BUILT_NOT_RUN: &str = "specs/issues/build/c-corpus-cases-build-and-are-not-run.md";
+
+const NOT_RUN: &[NotRun] = &[
+    NotRun {
+        case: "03_struct",
+        stage: Stage::Refused("__attribute__((__cleanup__)) is not implemented"),
+        why: Why::Declined("cleanup attributes; the entry used to say _Generic, which is 33_ternary_op's reason and not this one"),
+    },
+    NotRun { case: "18_include", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "31_args", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "32_led", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "33_ternary_op",
+        stage: Stage::Refused("_Generic type dispatch is not implemented"),
+        why: Why::Declined("_Generic"),
+    },
+    NotRun { case: "40_stdio", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "60_errors_and_warnings",
+        stage: Stage::NoLink("main"),
+        why: Why::Declined("a meta-test of compiler diagnostics: every branch is behind a -D the harness does not pass, so the file preprocesses to no `main`"),
+    },
+    NotRun {
+        case: "73_arm64",
+        stage: Stage::Refused("arg 1 (v94) has type i32, expected i64"),
+        why: Why::Declined("aarch64-specific, and this target is x86-64. It does not stop with a refusal by name — it stops in the verifier, on a variadic call, which is a defect of ours reached through a case we decline anyway"),
+    },
+    NotRun {
+        case: "89_nocode_wanted",
+        stage: Stage::Refused("expr_type: unknown identifier 'i'"),
+        why: Why::Open("specs/issues/build/toyos-cc-cannot-type-a-statement-expression-local.md"),
+    },
+    NotRun {
+        case: "83_utf8_in_identifiers",
+        stage: Stage::Refused("unexpected character '\u{ef}' (0xef)"),
+        why: Why::Declined("non-ASCII identifiers. UTF-8 in strings and comments works; the lexer stops on the byte it could not read, so nothing is dropped"),
+    },
+    NotRun {
+        case: "85_asm_outside_function",
+        stage: Stage::Refused("file-scope asm(...) is not implemented"),
+        why: Why::Declined("emitting file-scope asm needs an x86-64 assembler"),
+    },
+    NotRun {
+        case: "94_generic",
+        stage: Stage::Refused("_Generic type dispatch is not implemented"),
+        why: Why::Declined("_Generic"),
+    },
+    NotRun {
+        case: "95_bitfields",
+        stage: Stage::Refused("#pragma pack(push,1) is not implemented"),
+        why: Why::Declined("a self-including bitfield torture test wanting #pragma pack, ms_struct, gcc_struct, aligned on a declaration specifier and packed bitfields — every one of them a deliberate refusal"),
+    },
+    NotRun {
+        case: "95_bitfields_ms",
+        stage: Stage::Refused("#pragma pack(push,1) is not implemented"),
+        why: Why::Declined("the same file again, through a two-line wrapper"),
+    },
+    NotRun {
+        case: "96_nodata_wanted",
+        stage: Stage::NoLink("main"),
+        why: Why::Declined("seven configurations selected by a -D from tcc's own Makefile, four of which expect compiler diagnostics. The harness compiles one configuration and compares one stdout, so no fix to toyos-cc can make it pass"),
+    },
+    NotRun {
+        case: "98_al_ax_extend",
+        stage: Stage::Refused("file-scope asm(...) is not implemented"),
+        why: Why::Declined("file-scope asm again"),
+    },
+    NotRun {
+        case: "99_fastcall",
+        stage: Stage::Refused("file-scope asm(...) is not implemented"),
+        why: Why::Declined("32-bit x86 — pushl %esp, pusha, __attribute((fastcall)). It stops on the file-scope asm at line 26 before reaching any of that"),
+    },
+    NotRun {
+        case: "101_cleanup",
+        stage: Stage::Refused("__attribute__((cleanup)) is not implemented"),
+        why: Why::Declined("cleanup attributes"),
+    },
+    NotRun {
+        case: "102_alignas",
+        stage: Stage::Refused("expected Semi, got Alignas"),
+        why: Why::Declined("_Alignas. It stops as a parse error rather than by name, which reads worse and is still a stop"),
+    },
+    NotRun { case: "103_implicit_memmove", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "104_inline",
+        stage: Stage::Refused("unexpected token in expression: Attribute"),
+        why: Why::Declined("weak symbols. The file itself compiles — the companion `104+_inline.c` is what stops, which is the stage as the harness reaches it"),
+    },
+    NotRun {
+        case: "106_versym",
+        stage: Stage::NoLink("PTHREAD_PROCESS_SHARED"),
+        why: Why::Declined("pthread condition variables"),
+    },
+    NotRun { case: "107_stack_safe", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "108_constructor",
+        stage: Stage::Refused("__attribute__((constructor)) is not implemented"),
+        why: Why::Declined("constructor attributes"),
+    },
+    NotRun { case: "109_float_struct_calling", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "112_backtrace", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "113_btdll",
+        stage: Stage::NoLink("f_1"),
+        why: Why::Declined("three shared libraries built from the same file under -DDLL=1,2,3 and loaded at run time; the harness builds one object and one binary"),
+    },
+    NotRun {
+        case: "114_bound_signal",
+        stage: Stage::Refused("expected Semi, got Ident(\"sj\")"),
+        why: Why::Declined("sigaction and sigjmp_buf, which no header here declares, so the declaration does not parse"),
+    },
+    NotRun { case: "115_bound_setjmp", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "116_bound_setjmp2", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "117_builtins",
+        stage: Stage::NoLink("__builtin_abort"),
+        why: Why::Declined("__builtin_abort, and the compiler implements no builtin under that name"),
+    },
+    NotRun {
+        case: "120_alias",
+        stage: Stage::Refused("__attribute__((alias)) is not implemented"),
+        why: Why::Declined("symbol aliases. Its two `__asm__(_\"name\")` renames at lines 19 and 20 are refused too, but the attribute at line 9 comes first"),
+    },
+    NotRun { case: "122_vla_reuse", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "123_vla_bug", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "124_atomic_counter",
+        stage: Stage::Refused("cannot find system include file: stdatomic.h"),
+        why: Why::Declined("C11 atomics"),
+    },
+    NotRun {
+        case: "125_atomic_misc",
+        stage: Stage::Refused("cannot find system include file: stdatomic.h"),
+        why: Why::Declined("C11 atomics"),
+    },
+    NotRun { case: "126_bound_global", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "127_asm_goto",
+        stage: Stage::Refused("expected LParen, got Goto"),
+        why: Why::Declined("`asm goto`, and inline asm generally"),
+    },
+    NotRun {
+        case: "128_run_atexit",
+        stage: Stage::Refused("__attribute__((constructor)) is not implemented"),
+        why: Why::Declined("constructor attributes, and a -D per configuration to have a main at all"),
+    },
+    NotRun { case: "132_bound_test", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "136_atomic_gcc_style",
+        stage: Stage::Refused("cannot find system include file: stdatomic.h"),
+        why: Why::Declined("C11 atomics"),
+    },
 ];
 
 /// Discover C tests by scanning tests/testcases/tinycc/*.c.
-/// Skips companion files (contain '+') and tests in C_SKIP.
+/// Skips companion files (contain '+') and everything in [`NOT_RUN`].
 fn discover_c_tests() -> Vec<String> {
     let dir = compile::testcases_dir();
     let mut names: Vec<String> = fs::read_dir(&dir)
@@ -833,7 +1002,7 @@ fn discover_c_tests() -> Vec<String> {
             if stem.contains('+') {
                 return None;
             }
-            if C_SKIP.contains(&stem) {
+            if NOT_RUN.iter().any(|d| d.case == stem) {
                 return None;
             }
             Some(stem.to_string())
@@ -881,47 +1050,112 @@ fn compile_c_tests(names: &[String]) -> Vec<(String, Vec<u8>)> {
 
     std::panic::set_hook(prev_hook);
 
-    for (name, why) in &broken {
-        eprintln!("[toyos] c::{name} does not build: {why}");
+    if !broken.is_empty() {
+        let mut msg = String::from(
+            "a C test that is not declared in NOT_RUN stopped building, and a test that does \
+             not build is a test that does not run:\n",
+        );
+        for (name, why) in &broken {
+            msg += &format!("  c::{name}: {why}\n");
+        }
+        panic!("{msg}");
     }
-    check_c_build_fixture(&broken.iter().map(|(n, _)| *n).collect::<Vec<_>>());
 
     bins
 }
 
+/// Attempt every declared case exactly as far as it says it gets.
+///
+/// The list this replaces was asserted in one direction for nine names and in
+/// no direction at all for thirty-two. The cost of the whole pass is a fraction
+/// of a second, so nothing here is bought with test time.
+fn check_not_run() {
+    let dir = compile::testcases_dir();
+    let mut wrong: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    for entry in NOT_RUN {
+        let case = entry.case;
+        let before = wrong.len();
+        if !seen.insert(case) {
+            wrong.push(format!("{case}: named twice"));
+            continue;
+        }
+        if !dir.join(format!("{case}.c")).is_file() {
+            wrong.push(format!("{case}: no such file in the corpus — a rename left this behind"));
+            continue;
+        }
+        let compiled = std::panic::catch_unwind(|| compile::compile_c(case));
+        match (&entry.stage, compiled) {
+            (Stage::Refused(says), Err(e)) => {
+                let said = panic_message(&e);
+                if !said.contains(says) {
+                    wrong.push(format!(
+                        "{case}: refused, but not for the declared reason.\n    \
+                         declared: {says}\n    said:     {said}"
+                    ));
+                }
+            }
+            (Stage::Refused(says), Ok(_)) => wrong.push(format!(
+                "{case}: compiles now — it was declared to stop with {says:?}. \
+                 The fix arrived; delete the entry and let the case run."
+            )),
+            (_, Err(e)) => wrong.push(format!(
+                "{case}: no longer compiles, and it was declared to get further: {}",
+                panic_message(&e)
+            )),
+            (stage, Ok((obj, extras))) => {
+                let linked = std::panic::catch_unwind(|| compile::link_toyos(&obj, &extras, case));
+                match (stage, linked) {
+                    (Stage::NoLink(symbol), Err(e)) => {
+                        let said = panic_message(&e);
+                        if !said.contains(symbol) {
+                            wrong.push(format!(
+                                "{case}: the link fails on something else.\n    \
+                                 declared: undefined symbol: {symbol}\n    said:     {said}"
+                            ));
+                        }
+                    }
+                    (Stage::NoLink(symbol), Ok(_)) => wrong.push(format!(
+                        "{case}: links now — it was declared to fail on {symbol:?}. \
+                         The fix arrived; delete the entry and let the case run."
+                    )),
+                    (Stage::Built, Err(e)) => wrong.push(format!(
+                        "{case}: no longer links, and it was declared to build: {}",
+                        panic_message(&e)
+                    )),
+                    (Stage::Built, Ok(_)) => {}
+                    (Stage::Refused(_), _) => unreachable!("handled above"),
+                }
+            }
+        }
+        for line in &mut wrong[before..] {
+            *line += &format!("\n    ({})", entry.why.stated());
+        }
+    }
+
+    std::panic::set_hook(prev_hook);
+
+    assert!(
+        wrong.is_empty(),
+        "NOT_RUN no longer describes the corpus. Every entry is attempted to its declared \
+         stage on every run, so this is a case that moved:\n  {}",
+        wrong.join("\n  "),
+    );
+}
+
+/// What a caught panic said, first line, whole. A refusal quoted in `NOT_RUN`
+/// is compared against this, so nothing here may shorten it.
 fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     let full = e
         .downcast_ref::<String>()
         .cloned()
         .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
         .unwrap_or_else(|| "<non-string panic>".to_string());
-    full.lines().next().unwrap_or_default().chars().take(160).collect()
-}
-
-/// The suite runs a C test by booting the binary, so one that does not build is
-/// not run — and until this fixture, not reported either. The set is asserted
-/// in both directions: a case that stops building is a regression, and one that
-/// starts building is a fix whose entry has to go.
-fn check_c_build_fixture(broken: &[&str]) {
-    let expected: BTreeSet<&str> = C_DOES_NOT_BUILD.iter().map(|(n, _)| *n).collect();
-    let actual: BTreeSet<&str> = broken.iter().copied().collect();
-    if actual == expected {
-        return;
-    }
-    let new: Vec<&str> = actual.difference(&expected).copied().collect();
-    let fixed: Vec<&str> = expected.difference(&actual).copied().collect();
-    let mut msg = String::from("C_DOES_NOT_BUILD is out of date.\n");
-    if !new.is_empty() {
-        msg += &format!(
-            "  stopped building, and so stopped being run at all: {}\n  \
-             (the reason for each is printed above)\n",
-            new.join(", ")
-        );
-    }
-    if !fixed.is_empty() {
-        msg += &format!("  builds now — delete from C_DOES_NOT_BUILD: {}\n", fixed.join(", "));
-    }
-    panic!("{msg}");
+    full.lines().next().unwrap_or_default().to_string()
 }
 
 /// How many kernel lines a dead test's report is printed with.
@@ -11354,7 +11588,12 @@ fn main() {
     }
 
     let c_names = discover_c_tests();
-    eprintln!("[toyos] Compiling {} C tests...", c_names.len());
+    eprintln!(
+        "[toyos] Compiling {} C tests, and attempting {} declared ones...",
+        c_names.len(),
+        NOT_RUN.len()
+    );
+    check_not_run();
     let c_bins = compile_c_tests(&c_names);
     let c_compiled: Vec<String> = c_bins.iter().map(|(n, _)| n.clone()).collect();
 

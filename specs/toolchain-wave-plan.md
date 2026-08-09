@@ -673,6 +673,22 @@ compiles the companion (§3).
 none is near the harness's stack. R3 is affordable and safe; both were open
 questions before this review.
 
+**What T5 found when it landed**, all of it invisible to the two lists it
+replaces. The declared list is **41** entries and every one is attempted every
+run: **22 refused at compile, 5 refused at link, 14 that build**. So the
+"seventeen compile" of §3 was 17 before T2 and is 19 after it — `115_bound_setjmp`
+and `123_vla_bug` were the same non-dominating-`Value` defect and neither said
+so — of which 14 build and link and 5 do not. The five that do not link name
+`main` twice (`60`, `96` — both meta-tests), `PTHREAD_PROCESS_SHARED`, `f_1`
+and `__builtin_abort`, and no list in the tree had ever recorded any of that.
+Several *stated reasons* were simply wrong: `03_struct` said `_Generic` and
+stops on `__attribute__((cleanup))`, `123_vla_bug` said "VLA codegen bug" and
+builds, `112_backtrace` said "needs tcc_backtrace" and builds.
+
+The whole pass — 41 compiles and the links behind them — costs **0.43/0.44/0.43 s**
+at opt-level 3, three reps, which is less than the plan's estimate for 32
+compiles alone.
+
 **T6 — the preprocessor corpus gets an owner.**
 `toyos-cc/tests/` over `tests/testcases/pp_tcc/`, 25 cases, driven through the
 library — no guest, no NOTICE change. Same declared-failure contract as T5.
