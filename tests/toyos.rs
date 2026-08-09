@@ -1334,6 +1334,17 @@ impl AudioRun {
     }
 }
 
+/// `--slow-usb`: give every audio boot a USB stick that answers a bulk transfer
+/// in 2 ms instead of microseconds — what a real stick's erase block does, and
+/// what the T14's audio pops are made of.
+///
+/// A switch and not a test of its own, because it changes no verdict: it makes
+/// the four audio configs measure a machine the host cannot otherwise present,
+/// and what it produces is an A/B against the same command without it in the
+/// same session. `specs/blocking-io-plan.md` is what the numbers are for and
+/// which stage turns one of them into an assertion.
+static SLOW_USB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Boot a fresh QEMU with the given CPU count, run one in-guest audio test,
 /// and measure it: soundd's in-guest counters (wake lateness, pipeline drains,
 /// periods of silence submitted) and the captured wav (mid-signal silence, hard
@@ -1368,6 +1379,11 @@ fn measure_audio_run(
         rust_bins,
         BootOptions {
             smp,
+            kernel_features: if SLOW_USB.load(std::sync::atomic::Ordering::Relaxed) {
+                &["usb-slow-device"]
+            } else {
+                &[]
+            },
             ..Default::default()
         },
     );
@@ -11227,6 +11243,9 @@ fn main() {
 
     let debug_mode = args.iter().any(|a| a == "--debug");
     let list_mode = args.iter().any(|a| a == "--list");
+    if args.iter().any(|a| a == "--slow-usb") {
+        SLOW_USB.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let nocapture = args.iter().any(|a| a == "--nocapture" || a == "--show-output");
 
     // Thorough tier. A flag rather than an env var or a test name: an env var
