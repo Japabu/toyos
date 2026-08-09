@@ -12,6 +12,9 @@ impl Codegen {
     fn expr_type_inner(&mut self, ctx: &FuncCtx, expr: &Expr) -> CType {
         match expr {
             Expr::Ident(name) => {
+                if let Some(ty) = self.stmt_expr_scopes.iter().rev().find_map(|s| s.get(name)) {
+                    return ty.clone();
+                }
                 if let Some((_, ty)) = ctx.locals.get(name) {
                     return ty.clone();
                 }
@@ -131,12 +134,34 @@ impl Codegen {
             }
             Expr::VaArg(_, type_name) => self.resolve_typename(type_name),
             Expr::StmtExpr(items) => {
-                for item in items.iter().rev() {
-                    if let BlockItem::Stmt(Statement::Expr(Some(e))) = item {
-                        return self.expr_type(ctx, e);
+                // The value is the last bare expression statement, which is
+                // what `compile_stmt_expr` takes it to be; a labelled one is
+                // not, in either.
+                let mut scope: HashMap<String, CType> = HashMap::new();
+                for item in items {
+                    let BlockItem::Decl(d) = item else { continue };
+                    if d.specifiers.iter().any(|s| {
+                        matches!(s, DeclSpecifier::StorageClass(StorageClass::Typedef))
+                    }) {
+                        continue;
+                    }
+                    let base = self.resolve_type(&d.specifiers);
+                    for id in &d.declarators {
+                        let name = self.get_declarator_name(&id.declarator);
+                        if !name.is_empty() {
+                            let ty = self.apply_declarator(&base, &id.declarator);
+                            scope.insert(name, ty);
+                        }
                     }
                 }
-                CType::Void
+                let value = items.iter().rev().find_map(|item| match item {
+                    BlockItem::Stmt(Statement::Expr(Some(e))) => Some(e),
+                    _ => None,
+                });
+                self.stmt_expr_scopes.push(scope);
+                let ty = value.map_or(CType::Void, |e| self.expr_type(ctx, e));
+                self.stmt_expr_scopes.pop();
+                ty
             }
             Expr::Builtin(name, args) => match name.as_str() {
                 "__builtin_offsetof" => CType::Long(Signedness::Unsigned),

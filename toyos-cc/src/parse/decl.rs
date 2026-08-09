@@ -4,6 +4,14 @@ use super::Parser;
 
 impl Parser {
     pub(super) fn external_decl(&mut self) -> ExternalDecl {
+        if self.peek() == &TokenKind::Asm {
+            panic!(
+                "{}: file-scope asm(...) is not implemented by toyos-cc — emitting it needs \
+                 an x86-64 assembler. Every symbol the asm defines would otherwise be left \
+                 undefined in the object with no diagnostic, and the link fails somewhere else.",
+                self.loc()
+            );
+        }
         let specifiers = self.decl_specifiers();
 
         if self.peek() == &TokenKind::Semi {
@@ -356,14 +364,17 @@ impl Parser {
     }
 
     /// `asm("name")` and `__attribute__((...))` may follow a declarator in
-    /// either order and repeat.
+    /// either order and repeat. Both are refused; only the attribute has
+    /// somewhere in the type to put itself.
     pub(super) fn skip_declarator_suffix(&mut self) {
         loop {
             match self.peek() {
-                TokenKind::Asm => {
-                    self.advance();
-                    self.skip_balanced_parens();
-                }
+                TokenKind::Asm => panic!(
+                    "{}: asm(\"name\") after a declarator renames the symbol, and toyos-cc \
+                     does not implement it. Dropping it leaves the declared name undefined \
+                     and never mentions the name the source asked for.",
+                    self.loc()
+                ),
                 TokenKind::Attribute => self.discard_attributes("a declarator"),
                 _ => break,
             }

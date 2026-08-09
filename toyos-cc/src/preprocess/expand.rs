@@ -295,6 +295,21 @@ impl Preprocessor {
                         None => { result.push(tokens[i].clone()); i += 1; }
                     }
                 }
+                // Below the macro arms, so a source that defined `_Pragma`
+                // away keeps its own definition.
+                PPToken::Ident(name) if name == "_Pragma" => {
+                    let (file, line) = self
+                        .file_stack
+                        .last()
+                        .map(|(f, l, _)| (f.clone(), *l))
+                        .unwrap_or_default();
+                    panic!(
+                        "{file}:{line}: _Pragma is not implemented by toyos-cc. It is the \
+                         operator spelling of #pragma (C99 6.10.9), so whatever it carries \
+                         reaches neither the pragma this compiler refuses by name nor the \
+                         ones it knowingly ignores."
+                    );
+                }
                 _ => { result.push(tokens[i].clone()); i += 1; }
             }
         }

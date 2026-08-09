@@ -55,7 +55,7 @@ Only **Rust** and **QEMU** (for development). Everything else is bootstrapped fr
 Nothing in the tree checks any of it. `specs/dependency-audit-2026-08-08.md` is the inventory and `specs/dependency-purpose-2026-08-08.md` says what each direct crate is *for*. **The standing failures are declared rather than removed** — the owner's ruling, not the fix: Python via `rust/x`, `cc` for every host link, and four macOS FAT tools. **What ships is licensed honestly**: `NOTICE` names every committed third-party file with its hash, upstream and licence. An image carrying `DOOM1.WAD` may not be sold.
 
 - **toyos-ld** (`toyos-ld/`) — custom linker, used for bootloader, kernel and all userland. **Its output is reproducible, and the container types are what say so**: one iterated into the output is a `BTreeMap`/`BTreeSet`, one asked only whether it holds a name stays a hash container. That line is the whole rule, and it covers the archive member pull-in worklist as much as the symbol table.
-- **toyos-cc** (`toyos-cc/`) — minimal C compiler, not meant to grow; exists to bootstrap tinycc and compile doomgeneric. **An attribute it does not implement is refused by name.** Dropping one silently is a miscompilation.
+- **toyos-cc** (`toyos-cc/`) — minimal C compiler, not meant to grow; exists to bootstrap tinycc and compile doomgeneric. **A layout or linkage change it does not implement is refused by name** — attribute, `asm`, pragma. Dropping one silently is a miscompilation.
 - **rust/** — fork of the Rust compiler and std with ToyOS platform support (submodule). Auto-bootstraps. Kept up to date with upstream.
 
 ## Ecosystem forks
