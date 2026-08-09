@@ -344,7 +344,29 @@ today, and present in the corpus only in cases that are already declined. The
 residual risk is a header outside the tree, which is what §9 says and all it
 says. `_Pragma("pack(push,1)")` was checked as a fourth spelling of the first
 door and is **not** a silent one: it is unimplemented and reaches the parser,
-which stops. Nothing to do there.
+which stops.
+
+**What T3 actually shipped is wider than this table, and the sweep was re-taken
+over the wider set.** Two things moved. `_Pragma` stops, but on
+`expected RParen, got StringLit` — a stop that names nothing, where the rule is
+that a refusal names the construct; it is now refused in the preprocessor by
+name, for five lines and no feature. And the pragma refusal is a list rather
+than one entry: `pack` plus `ms_struct`, `gcc_struct`, `weak` and
+`GCC visibility`, which is not an invented set — it is exactly the pragmas
+whose `__attribute__` twin this compiler *already* refuses by name, and
+refusing one spelling while dropping the other in silence is the very defect
+§4.6 is about. Re-swept over the same trees plus `toyos-cc/include`, at T3:
+**zero occurrences of any of the four extra names, and zero of `_Pragma`,
+anywhere.** `#pragma comment(option, …)` has six occurrences — tcc's way of
+passing itself compiler options — all in `95_bitfields` and
+`60_errors_and_warnings`, both already declined; it is left ignored, because
+what it changes is a *link input* and a missing one is a loud failure rather
+than a silent miscompilation.
+
+Every `asm` token in everything toyos-cc compiles, listed rather than counted:
+`85:9`, `98:3`, `99:26,103`, `120_alias:19,20`, `127_asm_goto:3,12,29` — all
+declined — and two in doomgeneric that are a Visual Studio project file and the
+word "asm" in a comment.
 
 **And the bootstrap target cannot be swept, which is not a reason to hold back.**
 tinycc's own source is not in this tree and not in `forks.toml` — the

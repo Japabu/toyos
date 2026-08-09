@@ -45,6 +45,47 @@ fn builtin_header(name: &str) -> Option<&'static str> {
     BUILTIN_HEADERS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
 }
 
+/// The pragma's name, with `GCC`'s and `STDC`'s second word folded in so a
+/// vendor prefix cannot smuggle one past the lists below.
+fn pragma_name(rest: &str) -> String {
+    let (first, tail) = split_first_word(rest.split('(').next().unwrap_or(rest));
+    match first {
+        "GCC" | "STDC" => format!("{first} {}", split_first_word(tail).0),
+        _ => first.to_string(),
+    }
+}
+
+/// Pragmas that change layout or linkage, each saying which. Ignoring one
+/// compiles a different program with no diagnostic — the same defect refusing
+/// `__attribute__((packed))` exists to prevent, through a door that refusal
+/// does not watch. Every entry here has an `__attribute__` twin that is
+/// already refused by name, or is `pack`, which has none.
+fn refused_pragma(rest: &str) -> Option<&'static str> {
+    match pragma_name(rest).as_str() {
+        "pack" => Some("changes the layout of every struct declared under it"),
+        "ms_struct" | "gcc_struct" => Some("selects a struct layout algorithm"),
+        "weak" => Some("gives a symbol weak linkage"),
+        "GCC visibility" => Some("changes the linkage visibility of every symbol under it"),
+        _ => None,
+    }
+}
+
+/// Pragmas toyos-cc knows and then does nothing about, each with the reason
+/// doing nothing is the same as obeying it. Everything not in either list is
+/// left alone: C99 6.10.6 requires an unrecognised pragma to be ignored, so a
+/// hard error on every unknown one would itself be a defect.
+fn inert_pragma_reason(rest: &str) -> Option<&'static str> {
+    match pragma_name(rest).as_str() {
+        "GCC diagnostic" => {
+            Some("selects which diagnostics are emitted, and toyos-cc emits none to select")
+        }
+        "GCC system_header" => {
+            Some("suppresses diagnostics for the rest of the file, and there are none")
+        }
+        _ => None,
+    }
+}
+
 pub struct Preprocessor {
     pub(crate) macros: HashMap<String, Macro>,
     macro_stack: HashMap<String, Vec<Option<Macro>>>,
@@ -334,8 +375,20 @@ impl Preprocessor {
                             if let Some((file, _, _)) = self.file_stack.last() {
                                 self.pragma_once_files.insert(file.clone());
                             }
+                        } else if let Some(what) = refused_pragma(rest) {
+                            let ln = self.file_stack.last().map(|(_,l,_)| *l).unwrap_or(0);
+                            panic!(
+                                "{filename}:{ln}: #pragma {rest} is not implemented by toyos-cc, \
+                                 and it {what}. Ignoring it compiles a different program from the \
+                                 one the source asked for, with no diagnostic anywhere."
+                            );
+                        } else if let Some(why) = inert_pragma_reason(rest) {
+                            let ln = self.file_stack.last().map(|(_,l,_)| *l).unwrap_or(0);
+                            verbose!("{filename}:{ln}: #pragma {rest} has no effect here: {why}");
                         }
-                        // Other pragmas ignored
+                        // C99 6.10.6: an unrecognised pragma is ignored, so a hard
+                        // error on every pragma this compiler does not know is
+                        // itself a defect. The two lists above are by name.
                     }
                     "line" => {
                         let expanded = self.expand_line(rest);

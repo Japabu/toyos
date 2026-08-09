@@ -811,14 +811,14 @@ const C_SKIP: &[&str] = &[
 /// state of the toolchain — the reason each gives is printed by every run.
 const C_DOES_NOT_BUILD: &[(&str, &str)] = &[
     ("83_utf8_in_identifiers", "the lexer rejects a non-ASCII byte in an identifier"),
-    ("85_asm_outside_function", "file-scope asm is parsed and not emitted, so `vide` is undefined"),
+    ("85_asm_outside_function", "file-scope asm(...), refused by name"),
     ("89_nocode_wanted", "expr_type cannot type an identifier under `sizeof` in dead code"),
     ("94_generic", "_Generic type dispatch is not implemented"),
-    ("95_bitfields", "aligned(16) on a bitfield member, which toyos-cc refuses"),
+    ("95_bitfields", "#pragma pack, refused by name"),
     ("95_bitfields_ms", "the same file again, through 95_bitfields.c"),
     ("96_nodata_wanted", "every branch wants a -D the harness does not pass, so no `main`"),
-    ("98_al_ax_extend", "file-scope asm again: `_us`, `_ss`, `_uc`, `_sc` are declared in it"),
-    ("99_fastcall", "typeof of an `&function` expression is not implemented"),
+    ("98_al_ax_extend", "file-scope asm(...) again, refused by name"),
+    ("99_fastcall", "file-scope asm(...) at line 26, before anything 32-bit about it"),
 ];
 
 /// Discover C tests by scanning tests/testcases/tinycc/*.c.
