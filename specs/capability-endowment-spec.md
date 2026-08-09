@@ -18,6 +18,18 @@ Numbers in this document come from commands run against this worktree
 (`wt/toyos-endow`, at `19c761e`) on 2026-08-09. Where a figure is an estimate it
 says so.
 
+**Reviewed 2026-08-09**, against the same tree — `origin/main`'s tree is
+byte-identical to this branch's base (`git diff --name-only 19c761e origin/main`
+is empty), so every figure below is a figure about `main` too. The review
+corrected six counts, added one ABI row the design does not work without
+(§3.5's error word), split `serves` from `provides` (§2.2) because `surface`
+could not be both, gave the launcher message the four fields it was missing
+(§4.5), added three migrations the ledger did not carry (`userland/libc` §6.5a,
+the compositor's shared memory §6.3a, the test estate's authority §6.7a), moved
+`SYS_ACCEPT`'s pid removal from chunk 3 to chunk 6 so chunk 5 can be green, and
+replaced §5.3's claim that a daemon crash is recoverable with what actually
+happens. §13 is new and is the coordination with the two other open plans.
+
 ---
 
 ## 0. The shape, in one page
@@ -46,15 +58,18 @@ After this work:
   place to ask.
 - `/bin/init` is userland. The kernel spawns exactly one program. init reads
   `/etc/system.manifest` — generated from `system.toml` — creates one port per
-  declared service **before any server runs**, builds each program's namespace
-  out of connectors, and spawns it holding them.
+  `serves` name **before any server runs**, builds each program's namespace out
+  of connectors, and spawns it holding them. A `provides` name is the other kind
+  — one port per *instance*, made by the program itself and handed down to its
+  own children — and `surface` is the whole of that kind today (§2.2).
 - A connection therefore works from the client's first instruction, whether or
   not the server has reached `accept` or has even been spawned yet. **There is
   no instant at which a name is not bound yet**, so there is nothing to retry
   and no timeout anywhere.
 - If a server exits without serving, its `Acceptor`'s last handle goes, the
   queued connections' pipe ends drop, and the client's next write is
-  `BrokenPipe`. The bound on failure is a process lifetime and nothing else.
+  `SyscallError::Gone` (§3.5). The bound on failure is a process lifetime and
+  nothing else.
 
 The two retry loops with identical magic constants
 (`NetdConn::connect_blocking` and `AudioStream::connect_soundd`, both
@@ -117,8 +132,17 @@ checked in this tree rather than assumed:
 The failing shape to check any new type against is `toyos-sched`'s
 `Registration`: a guard that lives on the victim's own stack and is therefore
 never dropped when another CPU kills it. **No object introduced below places a
-release obligation on a blocked thread's stack.** `Acceptor`, `Connector`,
-`Namespace` and `ConnectionEnd` all release through the table drain.
+*handle* release obligation on a blocked thread's stack.** `Acceptor`,
+`Connector`, `Namespace` and `ConnectionEnd` all release through the table drain.
+
+That is the whole of the claim and it is narrower than it looks, so state the
+residual. A thread blocked in `SYS_ACCEPT` is registered on `PortShared.acceptors`
+and that registration *is* on its own stack — the identical shape to
+`Registration`, and it leaks identically when another CPU kills the thread. It is
+not new: it is the existing wait-queue leak this kernel already has on every
+blocking syscall, `Acceptor` simply inherits it by being one more thing to block
+on. Nothing here fixes it and nothing here should; `wt/toyos-compl`'s cancellable
+park is the fix and §13 records that it lands after this branch.
 
 ### 1.2 New object types
 
@@ -142,7 +166,7 @@ pub struct Connector { core: ObjectCore, shared: Arc<PortShared> }
 
 `Acceptor::on_zero_handles` sets `closed`, takes the queue out and drops it. Each
 `PendingConnection`'s `PipeReader`/`PipeWriter` drop, which is what makes every
-queued client observe `BrokenPipe`/EOF. `Connector::on_zero_handles` does
+queued client observe `Gone`/EOF. `Connector::on_zero_handles` does
 nothing: a service with no clients right now is not a service that has stopped.
 
 Two types rather than one object with direction rights, for the same reason
@@ -268,7 +292,6 @@ dependency it cannot honour. That is the honest statement of the defect in
 serves   = ["compositor"]
 devices  = ["framebuffer", "keyboard", "mouse"]
 receives = ["soundd", "filepicker"]
-realtime = true
 
 [programs.soundd]
 serves   = ["soundd"]
@@ -289,20 +312,47 @@ receives = ["compositor", "soundd"]
 serves   = ["filepicker"]
 receives = ["compositor"]
 
+[programs.terminal]
+provides = ["surface"]        # one port per terminal, made by the terminal
+receives = ["compositor"]
+
 # What init starts. A list, and now it genuinely orders nothing — because
 # nothing needs it to.
 [boot]
 start = ["compositor", "soundd", "netd"]
 ```
 
-Four new per-program keys, all `#[serde(default)]`:
+Five new per-program keys, all `#[serde(default)]`:
 
 | key | type | meaning |
 |---|---|---|
-| `serves` | `Vec<String>` | init creates a port per name and endows the **acceptor** |
+| `serves` | `Vec<String>` | init creates **one machine-wide port** per name and endows the **acceptor** |
+| `provides` | `Vec<String>` | names this program creates a port for **itself**, once per instance, and puts in the namespaces of the children it spawns. init creates nothing and holds nothing |
 | `receives` | `Vec<String>` | names in this program's namespace, each a **connector** |
 | `devices` | `Vec<String>` | device classes init mints a claim for and endows |
 | `realtime` | `bool` | init endows an `RT`-only `SysCap` dup |
+
+**`realtime = true` on soundd and on nothing else.** `rg -n 'set_rt_priority'`
+outside `toyos-abi` is one line — `userland/soundd/src/main.rs:939` — so soundd
+is the whole of the RT band today. Endowing the compositor an `RT` cap it never
+calls would be authority granted for a plan rather than for a caller, which is
+the defect this branch exists to delete; putting the compositor in the RT band is
+a scheduling decision with its own gate A argument, and it is one manifest line
+away whenever that argument is made.
+
+**`serves` and `provides` are two different things and conflating them breaks
+`surface`.** A `serves` name is one port for the whole machine: there is exactly
+one soundd and every client's `soundd` connector points at the same
+`PortShared`. `surface` is not that — every terminal owns one, `/bin/console`
+owns one, and a shell must reach *its own host's* and no other's. init cannot
+create it: init does not know how many terminals there will be, and a single
+machine-wide `surface` port would let any process holding the connector talk to
+whichever terminal happened to take the acceptor. So `provides` is declared, and
+what it declares is that the program calls `SYS_PORT_CREATE` itself and hands the
+connector down (§4.4). This is what makes `surface` nameable in a `receives` list
+at all — without the distinction, §8.1's `every_receives_names_a_serves` would
+force `terminal` to `serves = ["surface"]` and §4.4's per-instance port would be
+a lie the manifest tells.
 
 `init: Vec<String>` becomes `[boot] start: Vec<String>` of **program names**, not
 paths — a path in a boot list is a second spelling of a key the same file
@@ -315,19 +365,31 @@ already has, and it is what let `diag/system.toml` smuggle an argument through
 |---|---|---|
 | `system.toml` | `compositor`, `soundd`, `netd` | unchanged set |
 | `diag/system.toml` | `toybox` with `args = ["pwd"]` | no `serves`, no `receives`, **no `devices`** — that is what "nothing in this image can claim the framebuffer" now means, and it is checkable |
-| `console/system.toml` | `console` | `devices = ["framebuffer", "keyboard", "mouse"]`, `serves = ["surface"]` |
+| `console/system.toml` | `console` | `devices = ["framebuffer", "keyboard", "mouse"]`, `provides = ["surface"]` |
 | `tests/desktopcase` | `compositor`, `terminal` | `terminal` gains `receives = ["compositor"]` — the race becomes unrepresentable here first |
 | `tests/desktopaudiocase` | `compositor`, `soundd`, `terminal` | + `receives = ["soundd"]` on terminal's children |
 | `tests/doomcase`, `tests/doommusiccase` | `soundd`, `test-runner` | `doom` gains `receives = ["soundd"]` |
 | `tests/metalcase` | `compositor`, `soundd`, `netd`, `sshd`, `test-runner` | |
-| `tests/netcase`, `tests/sshdcase` | `netd` (+ `sshd`) | |
+| `tests/netcase` | `netd`, `test-runner` | |
+| `tests/sshdcase` | `netd`, `sshd`, `test-runner` | |
 | `tests/testcases` | `soundd`, `test-runner` | |
 
-**`diag` keeps its guarantee and gains a way to state it.** The diagnostic image
-today contains nothing that *can* claim the framebuffer because of what is in
-its `[programs]`; after this it declares `devices = []` for every program, and
-§8's `no_diag_program_claims_the_screen` gate refuses a diag config that does
-otherwise. That is strictly stronger than the property it replaces.
+Every row is that config's `init` list today, unchanged in membership
+(`system.toml` 3, `diag` 1, `console` 1, `desktopcase` 2, `desktopaudiocase` 3,
+`doomcase` 2, `doommusiccase` 2, `metalcase` 5, `netcase` 2, `sshdcase` 3,
+`testcases` 2 — 26 entries across 11 files).
+
+**`diag` keeps its guarantee, and what it keeps is a different guarantee.** The
+diagnostic image today contains nothing that *can* claim the framebuffer because
+of what is in its `[programs]` — a property of the binaries in the image. After
+this, `/bin/init` is in every image and holds `Rights::DEVICE`, so the property
+becomes "the config this image was built from declares no `devices`", refused at
+build time by §8.1's `no_diag_program_claims_the_screen`. The reachable set is
+the same and it is checkable for the first time; it is not *strictly stronger*,
+because a bug in `/bin/init` could reach a device where previously no code in
+the image could. That is the trade and it is worth making — but "strictly
+stronger" would be an overclaim, and the honest version is the one that survives
+a reader checking it.
 
 ### 2.4 How the manifest reaches init
 
@@ -404,6 +466,25 @@ is the one legitimately dynamic `HandleError` per
 | `SYS_DEVICE_CLAIM` | `syscap_h` | `Rights::DEVICE` |
 | `SYS_RT_ENTER` | `syscap_h` | `Rights::RT` |
 
+**And for every syscall that keeps its number** (§3.3), because a right left
+unstated is a right each call site invents — which is the "policy at the call
+site" defect this work exists to delete. There is no default:
+
+| call | needs on its handle |
+|---|---|
+| `SYS_READ`, `SYS_READ_NONBLOCK`, `SYS_SEEK`, `SYS_FSTAT` | `Rights::READ` |
+| `SYS_WRITE`, `SYS_WRITE_NONBLOCK`, `SYS_FSYNC`, `SYS_FTRUNCATE` | `Rights::WRITE` |
+| `SYS_CLOSE` | nothing — dropping a handle is not an operation on the object |
+| `SYS_OPEN` | — (produces a handle; the mount's `UserAccess` is the gate, unchanged) |
+| `SYS_MARK_TTY` | `Rights::WRITE` |
+| `SYS_PIPE_MAP` | `Rights::MAP` |
+| `SYS_ACCEPT` | `Rights::READ` on the `Acceptor` — accepting is reading the queue, and a `WAIT`-only handle is the io_uring watch |
+| `SYS_IO_URING_SETUP` | — (produces a handle) |
+| `SYS_IO_URING_ENTER` | `Rights::READ\|WRITE` on the ring; `Rights::WAIT` on every handle a `POLL_ADD` names |
+| `SYS_HANDLE_DUP`, `SYS_HANDLE_DUP_AT` | `Rights::DUP`, and the requested set must be a subset of the source's |
+| `SYS_PROCESS_STATS` | `Rights::READ` on the `Process` |
+| the nine device calls (§3.3) | `Rights::WRITE` on the `DeviceClaim` for the seven that write; `Rights::READ` for `SYS_NIC_RX_POLL` and `SYS_DEVICE_REG_READ` |
+
 ### 3.2 Retired — 13 numbers, never reused
 
 | # | was | why it goes |
@@ -420,7 +501,7 @@ is the one legitimately dynamic `HandleError` per
 | 76 | `SYS_SOCKET_CREATE` | built a connection out of two pipe ids |
 | 85 | `SYS_LISTEN` | there is no global name registry to register in |
 | 87 | `SYS_CONNECT` | there is no global name registry to look up in |
-| 96 | `SYS_SET_RT_PRIORITY` | ungated privilege; `SYS_RT_ENTER` replaces it |
+| 96 | `SYS_SET_RT_PRIORITY` | gated on the audio claim, and a claim is not a privilege — the dispatch's own comment says so (`kernel/src/arch/syscall.rs:641-657`: *"`SYS_OPEN_DEVICE` is first-come and ungated, so whoever wins the race gets the RT band with it… a claim is not one"*). `SYS_RT_ENTER` is the privilege that comment asks for |
 
 The dispatch grows thirteen gravestone arms of the shape already at
 `kernel/src/arch/syscall.rs:305` and `:307`. That is the second such pair; a
@@ -430,10 +511,22 @@ into it in the same commit.
 
 ### 3.3 Renamed in place — same number, argument is now a `RawHandle`
 
-`SYS_WRITE`(0), `SYS_READ`(1), `SYS_CLOSE`(10), `SYS_SEEK`(13), `SYS_FSTAT`(14),
-`SYS_FSYNC`(15), `SYS_MARK_TTY`(28), `SYS_FTRUNCATE`(60),
+`SYS_OPEN`(9), `SYS_WRITE`(0), `SYS_READ`(1), `SYS_CLOSE`(10), `SYS_SEEK`(13),
+`SYS_FSTAT`(14), `SYS_FSYNC`(15), `SYS_MARK_TTY`(28), `SYS_FTRUNCATE`(60),
 `SYS_READ_NONBLOCK`(66), `SYS_WRITE_NONBLOCK`(67), `SYS_PIPE_MAP`(77),
 `SYS_IO_URING_ENTER`(90). No source change in any of them beyond the type.
+
+`SYS_OPEN` is the one that *produces* a handle rather than consuming one
+(`toyos-abi/src/syscall.rs:479` returns `Fd`), and it is here because every other
+row on this list is unreachable without it: leaving it out would leave `open`
+handing back an `Fd` that `read` no longer accepts. Nothing else in the ABI
+traffics in `Fd` — `rg -n '\bFd\b' toyos-abi/src` is 44 lines and every one of
+them is on this list, on the retired list, in one of the six shapes below, or is
+the type's own definition (`toyos-abi/src/lib.rs:17`) and the `use` that imports
+it.
+`SYS_DLOPEN`(55)/`SYS_DLSYM`(56)/`SYS_DLCLOSE`(57) carry a **module id**, not a
+handle: it names nothing outside its own process, exactly as `Tid` does (D5), and
+it stays.
 
 Six change shape as well:
 
@@ -450,10 +543,32 @@ Six change shape as well:
   model requires, not a different one.
 - **`SYS_ACCEPT`(86)** takes an `Acceptor` handle and returns **one** handle.
   Today it packs `(client_pid << 32) | fd`. The pid goes: peer identity is not
-  the kernel's to assert, no caller authorizes on it once `SYS_PIPE_OPEN` is
-  retired, and a server that wants to name its client reads it out of the
-  protocol's first frame, where it is already a client's own claim about itself.
-  `services::AcceptResult` collapses to a `Connection`.
+  the kernel's to assert, and a server that wants to name its client reads it out
+  of the protocol's first frame, where it is already a client's own claim about
+  itself. `services::AcceptResult` collapses to a `Connection`.
+
+  **Two callers authorize on that pid today and both must go first.** The
+  compositor grants the client's window buffer with `shm.grant(pid)`
+  (`userland/compositor/src/session.rs:859`) and soundd grants the stream ring
+  the same way (`userland/soundd/src/main.rs:627`), both using exactly the pid
+  `accept` returned. So **the pid survives until chunk 6**, and is deleted in the
+  same commit that replaces both grants with `SYS_HANDLE_SEND` — not in chunk 3
+  where the rest of `SYS_ACCEPT`'s shape changes. Chunk 5's green gate is what
+  this buys: with the pid gone at chunk 3 and shm handles arriving at chunk 6,
+  the compositor and soundd would have nothing to grant to for two chunks.
+
+  **It is also load-bearing for diagnostics, and that half is a deletion.** 44
+  lines of `userland/compositor/src/session.rs`, 25 of `toyos/src/surface.rs`, 11
+  of netd's and 7 of soundd's name a pid (`rg -c pid`). Two consequences that are
+  not free: `toyos::surface::Notice::{Grabbed,Released,Dropped}` carry a `pid`
+  field in the SDK's **public** API and `locale_gate` prints all three
+  (`tests/toyos-rust-tests/src/bin/locale_gate.rs:97-99`), and
+  `tests/toyos.rs:9074` asserts on the literals `"netd: dropping pid"` and
+  `"netd: refusing pid"`. A server can still name a peer — by the `Koid` of the
+  connection, which is the kernel's own identity for the object and not a
+  designation anyone can present. `Notice`'s field becomes that `Koid`, the two
+  netd literals become `"netd: dropping client"` / `"netd: refusing client"`, and
+  `tests/toyos.rs:9074` changes with them.
 - **`SYS_IO_URING_SETUP`(89)** takes an out-pointer and writes
   `{ handle: RawHandle, vaddr: u64 }`. Today it returns `(Fd, shm_token)` packed
   in a u64 and the caller maps the token — which is the whole of
@@ -481,7 +596,43 @@ Nine gain a claim-handle argument and lose their pid-keyed gate — the whole of
 - **`SYS_SYSINFO`(45)**, **`SYS_SCHED_INFO`(93)**, **`SYS_DEBUG`(92)**,
   **`SYS_SHUTDOWN`(19)**: still ambient. §12.
 
-### 3.5 Struct layouts
+### 3.5 One new error word, and why the design does not work without it
+
+```rust
+// toyos-abi/src/syscall.rs — SyscallError gains one variant
+Gone = 10,   // the object was there and its other end is not
+```
+
+`SyscallError` has ten variants today and **`BrokenPipe` is not one of them**: it
+is a kernel-internal `pipe::PipeWrite` variant that `kernel/src/fd.rs:571` and
+`:579` answer as `SyscallError::NotFound` — the same word "there is no such
+handle" uses. Two things in this design are false without a separate word:
+
+- **§4.2's whole promise.** `Err(NotEndowed)` — "the name is not in the namespace
+  this process was given, a fact about this process" — and `Err(ServerGone)` —
+  "the server exited" — are two different facts, and §5.1 answers both from
+  `SYS_NAMESPACE_OPEN`. The SDK sees one `u64`. "Distinguished in the SDK because
+  the kernel answers them from different objects" is not a mechanism: the SDK
+  cannot see which object answered. So a name absent from the namespace is
+  `NotFound` and a name whose port is `closed` is `Gone`, and it is the kernel
+  that tells them apart because only the kernel can.
+- **Every dead-peer answer in §5.1 and §5.3.** A write to a connection whose peer has
+  gone must not be indistinguishable from a write to a handle that was never
+  there — that is the storage rule ("a failed read must not be indistinguishable
+  from data") one layer up, and the client's answer to it is "retry the name"
+  versus "you have a bug".
+
+Callers: `kernel/src/fd.rs:571,579` change word; `SYS_NAMESPACE_OPEN` answers
+`Gone` on `closed`; `SYS_HANDLE_SEND` answers `Gone` on a dead connection. The
+std fork maps it to `io::ErrorKind::BrokenPipe` and `toyos::EndowError::ServerGone`
+carries it. `SyscallError::from_u64`'s match gains one arm. The two `fd.rs` sites
+are the only producers of the word being changed, and the five places userland
+matches `SyscallError::NotFound` (`rg -n 'SyscallError::NotFound' toyos/src
+userland` → `netd:1200`, `libc/posix_io.rs:41`, `soundd:797`, `soundd:1785`,
+`soundd:1796`) are each about a device or a path and none is a pipe write, so
+this is additive for every one of them.
+
+### 3.6 Struct layouts
 
 ```rust
 // toyos-abi/src/handle.rs — new file
@@ -535,7 +686,20 @@ pub struct NamespaceEntry {
 
 `SYS_ENDOWMENTS` writes the same `(EndowEntry[], label blob)` pair back to the
 child: entry count, then the entries, then the blob. One call, one copy, and the
-SDK parses it once.
+SDK parses it once. **The labels are kernel state and the only new per-process
+allocation this design adds**: `ProcessData` carries a `Box<[u8]>` of at most
+`MAX_LABELS_LEN` plus a `Box<[EndowEntry]>` of at most `MAX_ENDOWMENTS`, written
+once by spawn and freed with the process. They are *names*, not authority — the
+handles they label are in the table whether or not anybody ever calls
+`SYS_ENDOWMENTS`.
+
+**Rights on an endowed handle are the parent's, and narrowing is the parent's
+job.** `EndowEntry` has no rights field: a move carries the source handle's set
+unchanged, because a rights argument on a move would be a second place to shrink
+rights and the first one already exists. A parent that wants to hand over less
+calls `SYS_HANDLE_DUP(h, narrower)` and endows the dup — which is what init does
+for every connector, so that a child holding a `Namespace` cannot re-transfer the
+connectors inside it unless init said it could.
 
 **Two different verbs, two different vectors, and the difference is the point.**
 `slot_map` *duplicates* — the parent keeps its stdout. `endow` *moves* — the
@@ -552,7 +716,7 @@ cares, has `TRANSFER`) and only then removed. A failure removes nothing. This is
 `capability-handles-spec.md` §8.1's `TransferBatch` discipline applied to spawn,
 and it uses the same type.
 
-### 3.6 Bounds
+### 3.7 Bounds
 
 Every one is a `MAX_*` on the primitive, refuses by name, and never truncates.
 
@@ -561,7 +725,9 @@ Every one is a `MAX_*` on the primitive, refuses by name, and never truncates.
 | `MAX_ENDOWMENTS` | 32 | the widest manifest row plus stdio; the compositor's is 6 |
 | `MAX_NAMESPACE_ENTRIES` | 64 | five production names today; room for a decade |
 | `MAX_SERVICE_NAME` | 64 bytes | `surface` is 7; the longest test name is 28 |
-| `MAX_LABELS_LEN` | 4096 bytes | `MAX_ENDOWMENTS` × `MAX_SERVICE_NAME` plus slack |
+| `MAX_PROGRAM_NAME` | 32 bytes | a `[programs]` key; the longest today is `test-runner` at 11 |
+| `MAX_LAUNCH_EXTRAS` | 8 | connectors a caller may transfer with one `MSG_LAUNCH` (§4.5) |
+| `MAX_LABELS_LEN` | 4096 bytes | `MAX_ENDOWMENTS` × (`MAX_SERVICE_NAME` + the longest `serve:`/`dev:` prefix) is 2,304; the rest is slack |
 | `MAX_PENDING_CONNECTIONS` | 32 | unchanged (`kernel/src/listener.rs:170`), now per port |
 | `MAX_TRANSFER_HANDLES` | 8 | per `SYS_HANDLE_SEND` batch |
 | `MAX_QUEUED_BATCHES` | 16 | per connection direction |
@@ -580,7 +746,8 @@ spawn /bin/init:
   slots 0,1,2 = SerialConsole
   endow "syscap" = SysCap                    ->   SYS_ENDOWMENTS once, in the runtime
                                                   read /etc/system.manifest
-                                                  for each `serves` name, anywhere in the manifest:
+                                                  for each `serves` name, anywhere in the manifest
+                                                  (never a `provides` name — §2.2):
                                                       SYS_PORT_CREATE -> (acceptor, connector)
                                                   for each program in [boot] start:
                                                       SYS_DEVICE_CLAIM(syscap, class)  per `devices`
@@ -615,6 +782,17 @@ holding the `filepicker` connector can connect before the picker has run a singl
 instruction. That is the whole of
 `specs/issues/design-debt/pick-file-cannot-say-why-it-failed.md`'s reachable
 cause.
+
+**But an acceptor is endowed by move, so a `serves` program can be launched
+exactly once per boot.** After init hands the filepicker its acceptor, init holds
+nothing for that name; if the picker exits, its port is `closed` and a second
+`MSG_LAUNCH` for it has no acceptor to give. The filepicker's own loop never
+exits (`userland/filepicker/src/main.rs:463-490` accepts forever), so this is not
+reachable today — but a *crashed* one is not restartable and neither is any other
+`serves` program. This is the same fact §5.3 states from the client's side, and
+the same `SYS_PORT_REARM` (§12) closes both halves. Until it exists, init's
+answer to a second launch of a `serves` program whose acceptor is gone is a named
+refusal, never a spawn with a missing endowment.
 
 **A device class can be minted once at a time**, so a program the launcher starts
 may declare `devices` only if no boot program declares the same class — which is
@@ -751,29 +929,79 @@ inheritance alone, doom could hold sound only if the terminal did.
 So **init serves `launcher`**:
 
 ```
-MSG_LAUNCH { program: [u8; 32], argv: bytes }  ->  MSG_LAUNCHED { } + one Process handle
+MSG_LAUNCH {
+    program:   name,                  // a [programs] key, <= MAX_PROGRAM_NAME
+    argv, env, cwd,                   // bytes, exactly what SYS_SPAWN takes today
+    slot_count, extra_count,          // how many of the handles below are which
+}
++ SYS_HANDLE_SEND [ slot handles…, extra connectors… ]
+->  MSG_LAUNCHED { }  +  SYS_HANDLE_SEND [ one Process handle ]
 ```
 
-init looks the program up in the manifest it already holds, builds exactly the
+init looks the program up in the manifest it already holds, builds the
 endowments that program declares, spawns it, and sends the caller a `Process`
 handle over `SYS_HANDLE_SEND`. The asker's capability is "may ask init to start a
-declared program" — one connector — and the *policy* is the manifest. This is a
-component manager in the smallest form that does the job.
+declared program" — one connector — and the *policy* is the manifest.
 
-`toyos::process::Command` routes through the launcher when the program is in the
-manifest and uses `SYS_SPAWN` otherwise. std's `Command` (`sys/process/toyos.rs`)
-does the same, so `sh -c` and `Command::new("/bin/doom")` behave identically.
+**A launch carries four things the first draft of this message did not, and each
+is load-bearing.**
 
-**What this buys, exactly:** the shell holds `compositor`, `surface` and
-`launcher`; doom holds `compositor` and `soundd`. Neither can name the other's.
-Without the launcher, doom would hold the shell's set and item 8's example would
-be false.
+- **`env` and `cwd`.** A child started by the launcher would otherwise inherit
+  *init's* environment and working directory, so `sh -c 'cd /tmp && ls'` would
+  list `/`. The launcher is a spawn service, not a session.
+- **The stdio handles.** `Command::stdin/stdout/stderr` is how every shell child
+  and every sshd session gets its pipes (§4.7), and `slot_map` is a `SYS_SPAWN`
+  argument the caller no longer makes. They travel as transferred handles and
+  init installs them at slots 0/1/2.
+- **`extra_count` connectors the caller transfers.** This is what makes the
+  terminal→shell→`locale` chain work: `surface` is a `provides` name (§2.2), init
+  has no connector for one, and `toybox`'s `receives` row names it. The caller
+  supplies what it holds; init supplies what the manifest declares; the child's
+  namespace is the union. **This adds no authority** — a caller can only transfer
+  a handle it already has, which is the same bound `SYS_SPAWN` has — and it keeps
+  §4.6's rows exact, because a caller that transfers nothing gets exactly the
+  manifest row.
+- **A bound.** `MAX_LAUNCH_EXTRAS = 8`, refused by name, for the same reason
+  every other `MAX_*` here exists.
 
-**What it costs:** a spawn is an IPC round trip when it goes through the
-launcher, and `/bin/init` is resident in every image including `diag`. The round
-trip is not on any measured hot path — nothing in gate A or the desktop tests
-spawns in a loop — and init's resident cost is one process with a namespace, a
-manifest and an accept loop.
+**init keeps no `Process` handle from a launch.** The send is a *move*: init's
+handle count for that object goes to zero and the caller's to one. Otherwise any
+process holding the `launcher` connector exhausts init's handle table by
+launching `/bin/true` in a loop, and the machine loses the ability to start
+anything — the one process whose table cap is a machine-wide resource. init holds
+`Process` handles only for what `[boot] start` names, which the manifest bounds.
+
+**The routing rule, in three clauses, stated so it cannot be guessed.**
+`toyos::process::Command` and std's `Command` (`sys/process/toyos.rs`):
+
+1. **A caller that endowed anything itself uses `SYS_SPAWN`.** `Command::endow(..)`
+   is a statement that this caller has decided the child's authority, and the
+   launcher would overwrite that decision with a manifest row. §4.4's terminal is
+   this case: it must give its shell a `surface` connector the manifest cannot
+   name, so it spawns directly.
+2. **Otherwise, a caller holding a `launcher` connector asks the launcher**, and
+   init answers `MSG_NOT_DECLARED` for a name that is not a `[programs]` key. The
+   SDK then falls back to `SYS_SPAWN`. **The SDK never parses the manifest** —
+   init holds it and answers about it, so there is not a second reader of that
+   file in every process that can disagree with the first. The cost is one round
+   trip for a program that is not declared, which is `test-runner` spawning a
+   test binary and nothing on a user's path.
+3. **A caller with no `launcher` connector uses `SYS_SPAWN`** and gets exactly
+   inheritance, which is what a program endowed nothing should get.
+
+`sh -c` and `Command::new("/bin/doom")` therefore behave identically, and both
+give doom the manifest's `compositor` + `soundd` where the shell has neither.
+
+**Two things the launcher is not, and both are the price.** It is a
+**serialisation point** — every `ls` from a shell is now a round trip through one
+single-threaded accept loop, and `SYS_SPAWN`'s ELF load and symbol-table read
+happen on init's thread rather than the caller's. And it is a **single point of
+failure**: init wedged means no process can be created, where today each caller
+spawns for itself. Neither is on a measured hot path — nothing in gate A or the
+desktop tests spawns in a loop, and the C corpus's 110 spawns come from
+`test-runner`, whose test binaries are not `[programs]` keys and take the direct
+path (§6.7a) — but both are real and neither is bought back later by anything in
+this design.
 
 ### 4.6 What each shipped program ends up holding
 
@@ -783,19 +1011,27 @@ ask. `stdio` is slots 0/1/2 in every row and is omitted.
 
 | program | acceptors | connectors (its namespace) | devices | syscap | process handles |
 |---|---|---|---|---|---|
-| `init` | `launcher` | — | — | `DEVICE\|RT\|MANAGE` | every program it started |
-| `compositor` | `compositor` | `soundd`, `filepicker`, `launcher` | framebuffer, keyboard, mouse | `RT` | the terminals and pickers it launched |
+| `init` | `launcher` | — | — | `DEVICE\|RT\|MANAGE` | the `[boot] start` programs, and nothing a launch produced |
+| `compositor` | `compositor` | `soundd`, `filepicker`, `launcher` | framebuffer, keyboard, mouse | — | the terminals and pickers it launched |
 | `soundd` | `soundd` | — | hda-audio and/or virtio-sound | `RT` | — |
 | `netd` | `netd` | — | nic | — | — |
 | `sshd` | — | `netd`, `launcher` | — | — | its session shells |
 | `filepicker` | `filepicker` | `compositor` | — | — | — |
-| `terminal` | `surface` (created by itself) | `compositor`, `launcher` | — | — | its shell |
-| `console` | `surface` (created by itself) | `launcher` | framebuffer, keyboard, mouse | — | its shell |
+| `terminal` | `surface` (`provides`) | `compositor`, `launcher` | — | — | its shell |
+| `console` | `surface` (`provides`) | `launcher` | framebuffer, keyboard, mouse | — | its shell |
 | `shell` | — | `surface`, `launcher` | — | — | its children |
 | `doom` | — | `compositor`, `soundd` | — | — | — |
 | `snake`, `editor`, `paint`, `files` | — | `compositor`, `filepicker` | — | — | — |
 | `toybox` | — | `compositor`, `soundd`, `surface` | — | — | — |
+| `test-runner` | — | the union its guest binaries need (§6.7a) | — | — | every test binary it spawned |
 | `toyos-ld`, `toyos-cc`, `proctest`, `input-test` | — | — | — | — | own children |
+
+`toybox`'s `surface` and `shell`'s `surface` are the `provides` case: they arrive
+as a launch extra from whoever spawned them (§4.5), never from init, and a
+`toybox` started by `/bin/init` at boot — which is what `diag/system.toml` does —
+has no `surface` in its namespace at all. `locale` run there says so instead of
+reading an environment variable that was never set, which is the same answer it
+gives today and a better-typed one.
 
 Read across: **doom cannot express reaching netd, the filepicker, a device, a
 daemon or a process it was not given** — those names are not in its namespace and
@@ -834,14 +1070,24 @@ that matters for a program reachable from the network. sshd itself never holds a
 | not spawned yet | succeeds; connection queued on the port | goes into the ring | blocks |
 | spawned, not yet at `accept` | succeeds | goes into the ring | blocks |
 | accepted, alive | succeeds | ring | data |
-| exited without accepting | `NotFound` (`closed`) | `BrokenPipe` on the handle already held | `0` (EOF) |
-| exited after accepting | `NotFound` | `BrokenPipe` | `0` |
+| exited without accepting | `Gone` (`closed`) | `Gone` on the handle already held | `0` (EOF) |
+| exited after accepting | `Gone` | `Gone` | `0` |
 | never in this namespace | `NotFound`, and it is `NotEndowed` in the SDK | — | — |
 
-The two `NotFound`s are distinguished in the SDK because the kernel answers them
-from different objects: a missing namespace entry versus a closed port. The
-kernel-side error word is the same and that is correct — `NotFound` truthfully
-means "there is nothing here to connect to" in both cases.
+**Two facts, two words** — §3.5. A name the namespace does not carry is
+`NotFound` and a name whose port has closed is `Gone`, and the SDK maps them to
+`EndowError::NotEndowed` and `EndowError::ServerGone`. They cannot be told apart
+by "the kernel answers them from different objects": the SDK sees one `u64` and
+nothing else, so if the kernel returns one word the SDK has one answer.
+
+**A client already blocked in `read` when the server dies** is not a row in that
+table and is the case a reader will look for. The server's `ConnectionEnd` handle
+drops in `teardown_resources`, the `PipeShared` writer count falls to zero, and
+the pipe's reader wait queue is woken with `0`. That wake is posted from the
+zero-handle hook, which runs off the deferred per-CPU queue drained at syscall
+exit, `do_schedule` entry and the idle loop (§1.1) — so the *killer's* CPU posts
+it and the blocked reader's CPU picks it up on its next pass. It is bounded by a
+scheduler pass and by nothing that is a duration.
 
 **No row in that table is reached by waiting.** There is no timer, no deadline
 and no retry constant anywhere in this design. The one thing that used to need a
@@ -880,18 +1126,42 @@ through `teardown_resources` on the killer's CPU.
 
 | what goes | what fires | what the peer sees |
 |---|---|---|
-| last `Acceptor` handle | `closed = true`; queue dropped | queued clients: `BrokenPipe`/EOF. New opens: `NotFound` |
-| last `ConnectionEnd` handle | both `PipeShared` ends' counts fall | peer: `BrokenPipe` on write, `0` on read |
+| last `Acceptor` handle | `closed = true`; queue dropped | queued clients: `Gone`/EOF. New opens: `Gone` |
+| last `ConnectionEnd` handle | both `PipeShared` ends' counts fall | peer: `Gone` on write, `0` on read |
 | last `Connector` handle | nothing | the server keeps accepting from whoever else holds one |
 | last `Namespace` handle | its `Arc<Connector>`s drop | nothing observable; a connector outlives it if a handle does |
 | last `DeviceClaim` handle | the class is released for re-minting | init can mint a fresh claim for a respawned daemon |
 | last `SharedMemObject` handle **and** mapping | pages freed | — |
 
-**A daemon crash is recoverable and always was, but for a new reason.** Today
-`device::Claim::drop` releases the class and a respawned daemon re-claims
-first-come. After this the class is released the same way, and *only init* can
-mint the replacement — so a process racing the respawn for the claim is not a
-thing that can happen.
+**A dead port stays dead, and this is the one place the design is worse than
+what it replaces.** Say it plainly. Today a respawned daemon calls
+`services::listen("soundd")` and the name is bound again, so a process that
+connects *afterwards* reaches the new instance. After this, the acceptor moved
+into the dead process and its `PortShared` is `closed` forever; a `Namespace` is
+immutable, so every process whose namespace was built before the crash holds an
+`Arc<Connector>` onto that dead `PortShared` and can never reach the replacement.
+init can create a fresh port and put it in the namespaces of programs it launches
+*next*, so a machine recovers forward and not backward.
+
+Three things bound how much this costs, and none of them makes it not a
+regression:
+
+- **Nothing supervises a daemon today.** There is no respawn loop anywhere in the
+  tree, so the reachable difference is between two things that do not happen.
+- **No client recovers today either.** `AudioStream::open` and
+  `Window::create_with_flags` connect once; a client whose daemon died holds a
+  dead connection and does not re-`connect` in either world.
+- **The device claim half genuinely improves**, and that is the row above: the
+  class is released the same way, and *only init* can mint the replacement, so a
+  process racing the respawn for the claim is not a thing that can happen.
+
+The mechanism that would close it is small and is named in §12: a `PortOwner`
+right init retains, and a `SYS_PORT_REARM` that mints a fresh `Acceptor` for an
+existing `PortShared` and clears `closed`. Every namespace already points at that
+`PortShared`, so a re-armed port is reachable by every client that predates the
+crash. It is not built here because a re-arm with no supervisor to call it is
+speculative generality, and **113 is the number it would take** — this delta
+stops at 112 and leaves 113–115 free (§13).
 
 **The cross-pair cycle** `capability-handles-spec.md` §8.4 accepts is unchanged
 and still accepted: A's connection queued in B's while B's is queued in A's leaks
@@ -907,12 +1177,12 @@ handle naming the connection it is sent on.
 
 | program | today | after |
 |---|---|---|
-| **compositor** | `services::listen("compositor")` at `session.rs:130`, first statement of `Session::start` | `endow::get().take("serve:compositor")`. `Command::new("/bin/filepicker").spawn().ok()` at `:220` becomes a launcher call, and the filepicker port is created by *init*, so an editor's `pick_file` cannot precede it |
+| **compositor** | `services::listen("compositor")` at `session.rs:130`, first statement of `Session::start` | `endow::get().take("serve:compositor")`. `Command::new("/bin/filepicker").spawn().ok()` at `:219` becomes a launcher call, and the filepicker port is created by *init*, so an editor's `pick_file` cannot precede it |
 | **soundd** | `services::listen("soundd")` at `main.rs:1766` | acceptor endowment; `MAX_CONTROL_CLIENTS = 63` unchanged; the shm token and `signal_pipe_id` in `MSG_STREAM_OPENED` become two transferred handles (§6.3) |
 | **netd** | `services::listen("netd")` at `main.rs:1206`, after `DmaNic::open()` | acceptor + `dev:nic` claim endowment; the whole pipe-id protocol becomes handle transfer (§6.4) |
 | **filepicker** | `services::listen("filepicker")` at `main.rs:463`; `accept` at `:466` is `.expect("accept failed")` | acceptor endowment; the `.expect` stays — an acceptor that refuses is a kernel bug now, not a peer |
 | **sshd** | no service name; `TcpListener::bind` via netd | unchanged shape; `receives = ["netd", "launcher"]` |
-| **terminal / console** | `Host::listen("surface.<pid>")`, `TOYOS_SURFACE` in the child's env | `SYS_PORT_CREATE` + `"surface"` in the child's namespace |
+| **terminal / console** | `Host::listen("surface.<pid>")` (`terminal/src/main.rs:40-44`, `console/src/main.rs:65-67`), `TOYOS_SURFACE` in the child's env | `provides = ["surface"]` (§2.2): its own `SYS_PORT_CREATE`, and `"surface"` in the namespace it builds for its shell. init creates nothing for it and holds nothing of it, which is what makes one terminal's surface unreachable from another's |
 
 ### 6.2 Clients
 
@@ -933,8 +1203,9 @@ change:
 
 Deleted with them: `NetdConn::BOOT_RETRIES`, `NetdConn::BOOT_RETRY_INTERVAL_NS`,
 `AudioStream::BOOT_RETRIES`, `AudioStream::BOOT_RETRY_INTERVAL_NS` — four
-constants, two identical policies, nine source lines
-(`rg -n 'BOOT_RETRIES|BOOT_RETRY_INTERVAL_NS'` → 9 hits, 8 of them code). And
+constants, two identical policies, eight source lines
+(`rg -n --glob '!specs/**' 'BOOT_RETRIES|BOOT_RETRY_INTERVAL_NS'` → 8, all code:
+`toyos/src/net.rs:264,265,272,276` and `toyos/src/audio.rs:188,189,266,270`). And
 per boot on metal-sim, sshd's **100 `SYS_NANOSLEEP` calls and its exit at
 t=1.69 s on a boot that completed at 0.38 s**
 (`specs/issues/hardware/network-clients-pay-a-boot-retry.md`).
@@ -958,16 +1229,44 @@ soundd granted are untouched too.
 This is `capability-handles-spec.md` §8.3 verbatim, and it closes the crash-
 detection hole that spec names: a client killed while blocked in the signal-pipe
 read drains its table, the last `PipeReadEnd` handle disappears, and soundd's
-next write sees `BrokenPipe` — by construction rather than by bookkeeping.
+next write sees `Gone` — by construction rather than by bookkeeping.
+
+`shm.grant(client_pid)` at `userland/soundd/src/main.rs:627` goes in the same
+commit, and it is one of the two callers that keep `SYS_ACCEPT`'s pid alive until
+this chunk (§3.3).
+
+### 6.3a The compositor's shared memory, which is the same migration
+
+soundd is not the only protocol carrying a `SharedToken`, and the compositor's is
+larger. Four `token: u32` fields cross the window protocol
+(`userland/window/src/lib.rs:140`, `:189`, `:197`, `:198` — the last pair is
+`token`/`old_token` on a resize), six `SharedMemory::map` sites consume them
+(`window/src/lib.rs:414`, `:512`, `:532`; `compositor/src/session.rs:140`, `:152`,
+`:756`, `:909`), and the grant is `shm.grant(pid)` at `session.rs:859` —
+the other caller that keeps the accept pid alive.
+
+**And one of those tokens is the kernel's, not a client's.** The framebuffer
+claim reports `FramebufferInfo { token: [u32; N], cursor_token: u32 }` and the
+compositor maps them (`session.rs:140`, `:152`, and again at `:909` after a mode
+set). Under `SharedMemObject` those stop being tokens: the claim answers with
+`SharedMem` handles, and a mode set that reallocates the scanout sends a fresh
+one rather than a fresh number. That is the last place a `SharedToken` reaches
+userland from the kernel rather than from a peer, and it is why deleting
+`shared_memory.rs` is not finished by §6.3 alone.
+
+All of this is chunk 6, with soundd's, and the four window-protocol fields become
+transferred handles the same way.
 
 ### 6.4 netd's protocol
 
 netd is the heaviest single migration and the one with the most to gain. Its
-wire format carries **eleven** `*_pipe_id: u64` fields
-(`toyos/src/net.rs:131,132,149,166,167,181,182` and netd's mirrors at
-`main.rs:212,213`), and netd calls `pipe::open_by_id` at `main.rs:224` in five
-places (`:229`, `:230`, `:563`, `:567`, `:866`, `:935`, `:1137`). Every one
-becomes a `SYS_HANDLE_SEND` of the pipe end itself.
+wire format carries **nine** `*_pipe_id: u64` fields — seven in the shared
+message structs (`toyos/src/net.rs:131,132,149,166,167,181,182`) and two in
+netd's own `PipedConnection` (`main.rs:212,213`). `pipe::open_by_id` is called
+once, at `main.rs:224` inside `open_pipe`, which has **five** call sites
+(`:229`, `:230`, `:563`, `:567`, `:866`); `open_piped_connection` wraps two of
+them and is itself called at `:935` and `:1137`. Every one becomes a
+`SYS_HANDLE_SEND` of the pipe end itself.
 
 `SYS_SOCKET_CREATE` — netd's way of turning two pipe ids it was told about into a
 connection — has no purpose left and is retired. `toyos::net`'s public functions
@@ -988,7 +1287,29 @@ see no change beyond the `Fd` rename.
 | `toyos/src/surface.rs` | `service_name`/`MAX_NAME`/`HOST_ENV` out; namespace in |
 | `toyos/src/shm.rs` (69 lines) | `SharedToken` → `SharedMem` handle |
 | `toyos/src/ipc.rs` (536 lines) | `Connection` wraps an `OwnedHandle`; framing unchanged |
+| `toyos/src/poller.rs` (204 lines) | `Poller::new` at `:75-78` does `io_uring_setup` → `(ring_fd, shm_token)` → `try_map_shared`. `SYS_IO_URING_SETUP`'s new shape (§3.3) returns the mapping, so both lines collapse to one and the `shm_token` is gone. **Same edit as the mio fork's `selector.rs:30`, and it is here for the same reason** |
 | `toyos/src/lib.rs` | `Pipe::pipe_id` deleted, `pipe_map` keeps its handle form |
+
+### 6.5a `userland/libc`, which is not the C corpus
+
+The C test corpus needs no migration (§6.7). The layer it links against does.
+`userland/libc` is 4,665 lines across 12 files and it names the deleted surface
+in three places, none of them optional:
+
+| what | where | after |
+|---|---|---|
+| `toyos_abi::Fd` | 5 sites | `RawHandle`, chunk 2 |
+| `syscall::waitpid` | `misc.rs:110-115`'s `waitpid(pid, status, options)` | **`SYS_WAITPID` is retired** (§3.2). POSIX `waitpid` takes a pid and there is no pid-addressed wait left, so libc keeps a `pid → Process handle` map filled by whatever spawned the child and answers `ECHILD` for a pid not in it. This is the compat layer faking ambient authority, which is what CLAUDE.md says the layer is for and where it says the ugliness belongs. Chunk 7 |
+| `toyos::poller::Poller` | `socket.rs` | follows the SDK's `Poller`, above |
+
+`toyos::net::*` is 14 call sites in `socket.rs` (903 lines) and every signature is
+stable by §0's constraint, so the whole BSD-socket surface is untouched — which
+is the constraint paying for itself a second time. `fork`, `execvp` and `system`
+already return `-1` (`misc.rs:98`, `:104`, `stdio.rs:601`), so libc has no spawn
+path to route through the launcher.
+
+`userland/libc` is the one crate built outside `[profile.toyos]` and says so where
+it is; nothing here changes that.
 
 **The rename has a collision and it is resolved this way.** `toyos::Handle`
 already exists (`toyos/src/lib.rs:47-61`) as the owning RAII wrapper whose `Drop`
@@ -1062,9 +1383,12 @@ rg -n "toyos_abi::Fd|map_shared|syscall::pipe\b" ~/dev/jan/forks
   mio/src/net/tcp/toyos_listener.rs:7 use toyos_abi::Fd;
 ```
 
-`mio`: five lines across four files (`Fd`→`Handle`, `io_uring_setup` returns its
-own mapping so the `map_shared` line is deleted, `pipe()` is now fallible and
-`Waker::new` already returns `io::Result`). `socket2`: one line.
+`mio`: **six** lines across four files — four `use toyos_abi::Fd`
+(`selector.rs:7`, `waker.rs:4`, `toyos_stream.rs:6`, `toyos_listener.rs:7`)
+become `RawHandle`, `selector.rs:30`'s `map_shared` is *deleted* because
+`io_uring_setup` returns its own mapping, and `waker.rs:13`'s `pipe()` is now
+fallible where `Waker::new` already returns `io::Result`. `socket2`: one line.
+Seven lines is the whole fork estate's exposure.
 
 `cpal`, `winit`, `softbuffer`, `tokio`, `russh`, `getrandom`, `libloading`,
 `stacker`, `ctrlc`, `raw-window-handle`, `memmap2`, `target-lexicon`:
@@ -1094,8 +1418,8 @@ that reach the compositor only through the `window` crate (`window_caps`,
 (`audio_tone`, `audio_tone_load`, `audio_idle_suspend`, `hda_client_stall`,
 `null_sink_client_exits`). Call it 30 files.
 
-**Eleven of them, 1,591 lines, are *about* the model being deleted and are
-rewritten rather than migrated:**
+**Twelve of them, 1,470 lines, are *about* the model being deleted and are
+rewritten rather than migrated** (`wc -l` over the twelve names below):
 
 | file | today | after |
 |---|---|---|
@@ -1113,9 +1437,58 @@ rewritten rather than migrated:**
 `abuse_fd_table.rs` (69) keeps its subject — the table cap on all three insertion
 paths — and gains the fourth: the endowment vector.
 
-The eight test `system.toml` files gain `serves`/`receives`/`devices` rows.
+### 6.7a How a test binary gets any authority at all
+
+**The 90 guest binaries are not `[programs]` entries and never have been.**
+`src/build.rs:980-997` reads `tests/toyos-rust-tests/src/bin/` and pushes every
+built binary straight into the initrd; the `[programs]` map in a test
+`system.toml` names `soundd`, `test-runner`, `toybox` and nothing else. So the
+manifest cannot declare their `receives`, §8.1's `every_receives_names_a_serves`
+cannot see them, and the launcher cannot start them — `Command::new` from
+test-runner resolves no `[programs]` key and takes the direct `SYS_SPAWN` path
+(§4.5). Left unstated, the implementing agent discovers this at chunk 8 with
+`compositor_client_death`, `ipc_hostile_peer`, `compositor_stall`,
+`netd_hostile_peer` and the five sound clients all unable to name anything.
+
+**`test-runner` is a manifest program and its namespace is the test estate's
+authority.** Its `receives` in each test config is the union of what that
+config's binaries need — `compositor`, `soundd`, `netd`, `filepicker` — and
+`test-runner` passes **its whole namespace** to every binary it spawns, by
+`Command::endow("svc", ..)` with the handle it holds. Three things follow and all
+three are deliberate:
+
+- **The test estate is the one place least authority is not enforced**, and it is
+  named here rather than discovered. A test binary holds what test-runner holds.
+  Enforcing per-binary authority would mean a manifest row per test binary, which
+  is a build-system change (`[programs]` would have to absorb
+  `tests/toyos-rust-tests`) for a property no gate asserts.
+- **§8.3's `endowment_denied` is where least authority *is* asserted**, and it
+  works because that binary builds its own two namespaces and spawns itself —
+  it does not rely on what test-runner gave it.
+- **`test-runner`'s row in a config is checkable**, so `every_receives_names_a_serves`
+  still has teeth over it: a config whose test-runner receives `compositor` while
+  no program serves one is refused at build time, which is exactly the class of
+  mistake a hand-edited test config makes.
+
+**`window_refusal` needs one thing the estate does not have**: a *fake* server.
+Today it squats `services::listen("compositor")` in a boot where no compositor
+runs. After this it creates a port with `SYS_PORT_CREATE`, builds a namespace
+mapping `"compositor"` to that port's connector, spawns a child with it, and
+refuses from the acceptor — all inside one test binary, with no manifest row and
+no name anyone else can see. That is strictly better than what it does now, and
+it is the pattern every "hostile server" test uses from here.
+
+The eight test `system.toml` files gain `serves`/`provides`/`receives`/`devices`
+rows, `test-runner`'s among them.
 
 **Host-side harness assertions that must be re-read, not just re-run:**
+
+- `tests/toyos.rs:9074` asserts the literals `"netd: dropping pid"` and
+  `"netd: refusing pid"`. The accept pid is gone (§3.3), so both lines and this
+  assertion change together.
+- `tests/toyos-rust-tests/src/bin/locale_gate.rs:97-99` prints all three
+  `toyos::surface::Notice` variants including their `pid` field. `Notice` is
+  public SDK API and the field becomes a `Koid`.
 
 - `metal_sim_compositor` (`tests/toyos.rs:3863-3886`) asserts four exact daemon
   lines, one of which is `sshd: no network on this machine, exiting`.
@@ -1123,7 +1496,7 @@ The eight test `system.toml` files gain `serves`/`receives`/`devices` rows.
   `NetdConn::connect_blocking` spends retrying a netd that will never come".
   **After this branch that second is gone**: netd exits before or shortly after
   sshd asks, so sshd's `endow::service("netd")` is either `ServerGone` at once or
-  a connection whose first write is `BrokenPipe` — learned from the guest, never
+  a connection whose first write is `Gone` — learned from the guest, never
   from a clock. The comment is corrected in the same commit.
 - `netd_connection_caps` parses netd's own declared cap out of
   `netd: ready, at most ` and passes it to the guest binary as argv. netd's cap
@@ -1144,7 +1517,7 @@ The eight test `system.toml` files gain `serves`/`receives`/`devices` rows.
 
 | what | where | size |
 |---|---|---|
-| the whole service registry | `kernel/src/listener.rs` | 232 lines |
+| the whole service registry | `kernel/src/listener.rs` | 231 lines |
 | `sys_listen`, `sys_connect`, `wake_poll_waiters` | `kernel/src/arch/syscall.rs:1246-1344` | 99 lines |
 | `sys_pipe_open`, `sys_pipe_id`, `sys_socket_create` and `may_open_pipe` | inside `kernel/src/arch/syscall.rs:1002-1155`, which also holds `sys_pipe_map` (kept) | ~120 lines, estimated from the span less `sys_pipe_map`'s 33 |
 | `kernel/src/shared_memory.rs` | whole file | 353 lines |
@@ -1176,6 +1549,8 @@ work neither helps nor harms them.
 | `specs/issues/hardware/device-claim-succeeds-with-no-device.md` | keyboard and mouse gain the presence gate the other four have; init endows only what exists |
 | `specs/issues/isolation/abi-wrappers-return-error-as-value.md` | `pipe()` becomes fallible; the mio edit is in this branch's fork budget |
 | `specs/issues/build/std-change-needs-an-unlanded-abi-change.md` | chunk 0 |
+| `specs/issues/build/boot-config-gates-iterate-a-hand-written-list.md` | §8.1's `every_shipped_boot_config_is_covered`: one `ALL_CONFIGS` list, asserted against what the walk finds |
+| `specs/issues/build/docs-total-budget-comment-is-stale.md` | chunk 9 touches the budgets anyway; delete the measurement from the comment or print it from the assertion |
 
 ### 7.3 `specs/issues/` this re-scopes
 
@@ -1200,20 +1575,35 @@ fails on a tree with the defect reintroduced. A gate with neither is not listed.
 `src/build.rs`, the shape of `no_shipped_boot_config_starts_sshd`
 (`src/build.rs:1095`, the file's only `#[test]` today):
 
-- `every_receives_names_a_serves` — for each of the 11 configs, every name in
-  any program's `receives` must appear in some program's `serves` in the *same
-  config*. **This is the gate with the sharpest teeth on the list**: it is the
-  build-time form of "a client cannot name a service the system does not have",
-  it needs no guest and no mutated tree, and its negative control is a bad config
-  literal in the test body.
+- `every_receives_names_a_provider` — for each of the 11 configs, every name in
+  any program's `receives` must appear in some program's `serves` **or**
+  `provides` in the *same config*. **This is the gate with the sharpest teeth on
+  the list**: it is the build-time form of "a client cannot name a service the
+  system does not have", it needs no guest and no mutated tree, and its negative
+  control is a bad config literal in the test body. The `provides` arm is what
+  lets `surface` be named at all (§2.2) and it is not a loophole — a `provides`
+  name still has to be declared by *some* program in the same config, so a typo
+  in `receives = ["sruface"]` is still a build error.
+- `a_provides_name_is_never_also_a_serves_name` — the two mean different things
+  (one port machine-wide, one per instance), and a name declared both ways is a
+  config where init would create a port nobody accepts from while the real port
+  is made somewhere else. Refuse it; the failure otherwise is a dead connector in
+  somebody's namespace and no error anywhere.
 - `every_device_class_has_at_most_one_claimant` — two programs declaring
   `devices = ["framebuffer"]` is a config init cannot satisfy, and today it is a
   runtime first-come race.
 - `no_diag_program_claims_the_screen` — `diag/system.toml`'s programs declare no
   `devices`. This makes the diagnostic image's whole reason for existing
-  checkable for the first time.
+  checkable for the first time — see §2.3 for what it does and does not replace.
 - `every_started_program_is_declared` — `[boot] start` names program keys, so a
   typo is a build error rather than a kernel panic at `spawn_kernel`.
+- `every_shipped_boot_config_is_covered` — `no_shipped_boot_config_starts_sshd`
+  iterates a hand-written `[Boot::Normal, Boot::Diag, Boot::Console]`, which is
+  complete today and is complete by nobody's construction. Since this branch
+  rewrites every config anyway, the four gates above iterate a single
+  `ALL_CONFIGS` list asserted equal to `find . -name system.toml`'s answer, so a
+  config added without a gate row is a red rather than a silence
+  (`specs/issues/build/boot-config-gates-iterate-a-hand-written-list.md`).
 
 ### 8.2 Queueing — `connect_before_serve`
 
@@ -1227,7 +1617,7 @@ Two arms that must answer differently, the `hda_client_stall` shape:
 1. The client writes and reads a reply. It must succeed, and the server must find
    the client's frame **already buffered** at its first `accept`.
 2. The same binary with the server spawned and immediately exited: the client's
-   write must return `BrokenPipe` and its read `0`, and the test asserts the
+   write must return `Gone` and its read `0`, and the test asserts the
    whole thing completed in less wall clock than any plausible timeout — because
    the point is that no timer is involved. A tree that reintroduced a retry would
    fail arm 2 on duration and arm 1 on the "already buffered" assertion.
@@ -1276,9 +1666,11 @@ the assertions are unchanged. Three consequences to plan for:
   the exemption silently and reds the run. Neither entry may be touched,
   reclassified or deleted by this branch. And both carry
   `Stale::OnThisDate("2026-09-06")`, which is **28 days from the day this spec
-  was written** — `Day::today()` compares against it at harness startup and the
-  run exits 1 by itself once it arrives. A branch still open on that date reds
-  for a reason that is not its own. That is a scheduling fact, not a licence to
+  was written**. `Tally::new` compares it against `Day::today()` at startup
+  (`tests/toyos.rs:10189-10192`) and the run fails at its end whether or not
+  either test ran (`:10245`, `:10346`) — so the cost is a whole suite followed by
+  a red, not a fast refusal. A branch still open on that date reds for a reason
+  that is not its own. That is a scheduling fact, not a licence to
   move the date; §10.3 puts it in front of the owner.
 - **Gate A must not degrade.** soundd's per-period cost is unaffected — the
   change is at stream open, not in the mix loop — and its RT entry moves from
@@ -1298,7 +1690,7 @@ census asserted back to baseline after every churn test.
 
 `kill_while_blocked` is the one that matters most for this architecture: an audio
 client killed while blocked in its signal-pipe read must make soundd see
-`BrokenPipe`, and that is only true because `handle_count` is not the Arc count.
+`Gone`, and that is only true because `handle_count` is not the Arc count.
 
 ---
 
@@ -1337,6 +1729,34 @@ appear in the built `libstd`. Closes
 `specs/issues/build/std-change-needs-an-unlanded-abi-change.md`.
 *Nothing else in this plan can be verified until this works.*
 
+Four things about that file, because it is written into a directory every
+worktree shares and none of them is optional:
+
+- **Write it unconditionally at the start of every std build**, never "if
+  absent". A run killed between write and delete leaves a `paths` override
+  naming a worktree that may since have been removed, and the next build in
+  *any* checkout then fails resolving a path that is gone. Overwriting makes
+  that state unreachable; a `write-if-absent` makes it permanent.
+- **It must be inside `buildlock::Global`**, which already serialises the
+  sysroot build, or two worktrees building std at once each point the shared
+  file at the other's sources. Verify that the write and the delete are both
+  inside the scope that lock covers rather than beside it.
+- **`--pr` requires the submodule clean** (§10.2). An untracked
+  `rust/.cargo/config.toml` left behind is a dirty submodule and refuses the
+  landing of whichever worktree runs `--pr` next, not necessarily this one.
+  Either the delete is unconditional on every exit path or `rust/.gitignore`
+  carries the entry — and adding a line to the fork's `.gitignore` is a hunk
+  `forks.toml`'s "expect empty" invariant explicitly forbids, so it is the
+  delete.
+- **`paths` may not do it, and the test is what decides.** Cargo's directory
+  overrides are documented against registry and git sources; `toyos-abi` is a
+  *path* dependency of `library/std`, and cargo also warns and ignores an
+  override whose manifest alters the dependency list. If the marker test fails,
+  the fallback is not another cargo mechanism but the build system editing
+  `rust/library/std/Cargo.toml`'s two relative paths for the duration of the
+  build, under the same lock and with the same unconditional restore. Say which
+  one was used in the commit message.
+
 **Chunk 1 — object infrastructure, zero users. Green.**
 `kernel/src/object/{mod,handle,rights}.rs`, `toyos-abi/src/handle.rs`,
 `kernel/clippy.toml`'s `disallowed-methods` wall, the per-variant `LIVE_*`
@@ -1349,16 +1769,37 @@ with the four existing gravestones moved into it. Boots; nothing uses any of it.
 `Descriptor` kinds become objects; `FdTable` deleted and `HandleTable` is the
 only table with stdio pre-seeded at slots 0/1/2 generation 0; `fd.rs`'s dispatch
 becomes exhaustive matches on `KObjectRef`; `io_uring::Source` keys become
-`Koid`s. std's `Fd`→`Handle` and the mio/socket2 fork edits land here.
-Bad-handle policy is log-and-error for now.
+`Koid`s. `SYS_OPEN`'s and `SYS_PIPE`'s new return types (§3.3) are here, which is
+what makes the mio waker's fallible `pipe()` edit land in the same chunk. std's
+`Fd`→`Handle` and the mio/socket2 fork edits land here. Bad-handle policy is
+log-and-error for now.
+
+**Two transitional objects exist only between here and their deleter, and saying
+so is what keeps this chunk green.** `ListenerObject` is a `KObjectRef` variant
+in chunk 2 and is deleted by chunk 3's `Acceptor`/`Connector` — §1.3 describes the
+end state, not this one. `PipeShared` keeps its `PipeId` and the `IdMap` behind
+it until chunk 6, because `SYS_PIPE_OPEN`/`SYS_PIPE_ID`/`SYS_SOCKET_CREATE` are
+live through chunks 2–5 and netd's protocol still needs them.
 *Gate: full suite, `handle_basic`, gate A fast tier.*
 
 **Chunk 3 — ports and namespaces. Not green: the registry is gone before
 anything uses its replacement.**
 `object/port.rs`, `object/namespace.rs`, `SYS_PORT_CREATE`,
-`SYS_NAMESPACE_BUILD`, `SYS_NAMESPACE_OPEN`, `SYS_ACCEPT`'s new shape.
-`kernel/src/listener.rs` deleted, `SYS_LISTEN`/`SYS_CONNECT` retired.
+`SYS_NAMESPACE_BUILD`, `SYS_NAMESPACE_OPEN`, `SyscallError::Gone` (§3.5), and
+`SYS_ACCEPT` taking an `Acceptor` handle. **`SYS_ACCEPT` keeps returning the
+client pid until chunk 6** — §3.3 says why: the compositor and soundd both grant
+shared memory to it and have nothing else to grant to until handle transfer
+exists. `kernel/src/listener.rs` deleted, `SYS_LISTEN`/`SYS_CONNECT` retired.
 `toyos/src/{port,namespace}.rs`. Kernel compiles, userland does not.
+
+**`cargo test --lib` stays green across this chunk and chunk 4's first half**,
+which matters because that is the command the push rule names. It builds the
+`toyos-build` host crate — buildlock, toolchain, pr, docs, image formats — and
+compiles no kernel and no guest binary. The non-green stretch is invisible to
+it, so "green before push" is satisfiable on every commit of this branch even
+where the guest does not build. The one thing that *can* red it here is
+`src/docs.rs`'s reference scan, if a spec edit names a `specs/issues/` file that
+does not exist.
 
 **Chunk 4 — spawn endowment and `/bin/init`. Green.**
 `SpawnArgs`'s two new vectors, `SYS_ENDOWMENTS`, `toyos/src/endow.rs`; the
@@ -1367,7 +1808,7 @@ the port/claim/namespace/spawn loop and the `launcher` service; the
 `INIT_PROGRAMS` chain deleted and `KernelArgs` shrunk with its layout asserts
 updated; `SysCap` and `SYS_DEVICE_CLAIM`/`SYS_RT_ENTER`; every one of the 11
 `system.toml` files rewritten. The §8.1 host gates land with the schema.
-*Gate: every config boots; `endowment_denied`; the four `--lib` config gates.*
+*Gate: every config boots; `endowment_denied`; the six `--lib` config gates (§8.1).*
 
 **Chunk 5 — every server and client. Green.**
 compositor, soundd, netd, filepicker, terminal, console, toybox `screen`,
@@ -1380,17 +1821,33 @@ same-session A/B of the thorough tier against `main`.*
 **Chunk 6 — shm objects and handle transfer. Green.**
 `object/shm.rs`, `SYS_SHM_CREATE/MAP/UNMAP`, connection in-flight queues,
 `SYS_HANDLE_SEND`/`RECV` and connection readiness. soundd's `MSG_STREAM_OPENED`
-and netd's eleven pipe-id fields migrate. `shared_memory.rs`, `SharedToken`,
-`SYS_PIPE_OPEN`, `SYS_PIPE_ID`, `SYS_SOCKET_CREATE` and the shm pid-ACL deleted.
-`SYS_IO_URING_SETUP` returns its own mapping; the mio `map_shared` line goes.
+(§6.3), the compositor's four window-protocol tokens and the framebuffer claim's
+own tokens (§6.3a), and netd's nine pipe-id fields (§6.4) all migrate.
+`shared_memory.rs`, `SharedToken`, `SYS_PIPE_OPEN`, `SYS_PIPE_ID`,
+`SYS_SOCKET_CREATE` and the shm pid-ACL deleted — and with the pid-ACL gone,
+**`SYS_ACCEPT`'s client pid goes in this chunk**, together with the two
+`shm.grant(pid)` calls that were its last authorizing readers and the diagnostic
+lines and harness assertions that named it (§3.3, §6.7a).
+`SYS_IO_URING_SETUP` returns its own mapping; the mio `map_shared` line and
+`toyos/src/poller.rs:75-78` go with it.
 *Gate: `handle_transfer`, `kill_while_blocked`, gate A both tiers' fast arm,
 `device_claim_crash_release`.*
 
 **Chunk 7 — process objects and the fail-fast flip. Green.**
 `ProcessObject`/`ThreadObject`; `SYS_SPAWN` returns a handle;
 `SYS_PROCESS_WAIT/KILL/OPEN`; `SYS_WAITPID`/`SYS_KILL` retired; the zombie and
-orphan machinery deleted; std's `process/toyos.rs`. Bad-handle policy flips to
+orphan machinery deleted; std's `process/toyos.rs`; **`userland/libc`'s
+`waitpid` and its `pid → Process handle` map** (§6.5a), which is what stops the
+110 C tests going red on a retired syscall number. Bad-handle policy flips to
 kill-the-process.
+
+**The flip has an edge this branch does not close.** Killing a process for a bad
+handle kills whatever threads of it are parked in a blocking syscall, and a
+parked thread's wait-queue registration lives on its own stack (§1.1). The flip
+is still right — a handle a process cannot name is a bug in that process and
+fail-fast is for bugs — and the leak it produces is the pre-existing one, bounded
+and census-visible. `wt/toyos-compl`'s §7 makes that kill clean, and §13 records
+that it depends on this branch landing first rather than the other way round.
 *Gate: `process_lifecycle`, `handle_kill_policy`, census baselines.*
 
 **Chunk 8 — the test estate. Green.**
@@ -1400,14 +1857,28 @@ Every `tests/toyos-rust-tests/src/bin/` binary that used the deleted surface;
 
 **Chunk 9 — audit, deletion and documentation. Green.**
 The grep gate (§8.4); `[u32; 64]` sized from the ABI; dead constants and any
-surviving `_ =>` arms in object-layer code; the ten closed `specs/issues/` files
-deleted and the six re-scoped ones rewritten; `specs/capability-handles-spec.md`
+surviving `_ =>` arms in object-layer code; the twelve closed `specs/issues/`
+files deleted and the six re-scoped ones rewritten; `specs/capability-handles-spec.md`
 annotated with what this delivered and what it did not; `forks.toml` deltas;
 **one line** in the root `CLAUDE.md` — it has 2,678 bytes of headroom against its
 40,000 budget (`wc -c CLAUDE.md` → 37,322), so anything longer displaces
 something else and `src/docs.rs`'s budget test will say so. Detail goes in
 `userland/CLAUDE.md` and `kernel/CLAUDE.md`, which have 5,471 and 5,387 bytes
 spare.
+
+Two things about that paragraph that `src/docs.rs` will enforce and the numbers
+above do not show:
+
+- **`TOTAL_BUDGET` is the tighter constraint.** The five files together are
+  80,000 bytes and weigh **74,197** today, so the whole set has **5,803** bytes
+  spare — less than the 2,678 + 5,471 + 5,387 the per-file figures suggest. Three
+  additions cannot each spend their own headroom.
+- **Deleting an issue file is not one edit.** `every_named_issue_file_resolves`
+  walks every `.md`, `.rs`, `.toml`, `.yml`, `.sh`, `.json` and `.txt` in the tree
+  and reds on any `specs/issues/<area>/<slug>.md` that no longer exists. Each of
+  the ten deletions has to take every reference with it — including the ones in
+  `CLAUDE.md`, in other specs, and in source comments — and the sweep for those
+  is part of the deletion rather than a follow-up.
 *Gate: full `cargo test`, every host test suite named in the root `CLAUDE.md`,
 `cargo test --lib`.*
 
@@ -1418,6 +1889,13 @@ in principle but should not: chunk 5's gate is the first place the desktop boots
 prove the architecture, and it is worth reaching early. Chunk 7 is independent of
 5 and 6 and could move, but it changes std again and batching the two std
 touches is worth more than the parallelism.
+
+**One constraint runs the other way and is the reason chunk 5 can be green at
+all: `SYS_ACCEPT`'s client pid must outlive chunk 5 and die in chunk 6.** Chunk
+5 brings the compositor and soundd onto endowed acceptors while both still grant
+shared memory by pid; chunk 6 is where the grant becomes a transferred handle.
+Remove the pid in chunk 3 as the first draft of §3.3 said and there is no green
+chunk 5 — the two daemons have a client and no way to hand it a buffer.
 
 ---
 
@@ -1431,7 +1909,7 @@ without stopping.
 Its `toyos-abi` and `toyos` genuinely differ from main's from chunk 1 onward, so
 it must claim, and while it holds the claim **every other worktree is refused and
 none of them can fix that from its end** (`specs/worktrees.md` §3.1–§3.2; the
-refusal text is at `src/toolchain.rs:635`). This is not a week-long claim in the
+refusal is `Standing::MatchesMain`'s `panic!` at `src/toolchain.rs:638`). This is not a week-long claim in the
 usual sense — it is the whole life of a nine-chunk branch.
 
 Three ways out, and the choice is the owner's:
@@ -1472,11 +1950,12 @@ owner should decide rather than an agent:
 
 ### 10.3 Both `EXPECTED_FAILURES` entries expire on 2026-09-06 — **his call**
 
-28 days from the day this spec was written. `Stale::OnThisDate` is checked at
-harness startup and exits 1 by itself, so a branch still open on that date goes
-red on two exemptions it did not cause and cannot legitimately extend: the rule
-is that an entry must be able to fail the build by itself, and moving its date
-to make a red go away is exactly what the rule forbids.
+28 days from the day this spec was written. `Stale::OnThisDate` is evaluated
+once against `Day::today()` when the tally is built and reds the run at its end
+regardless of whether either test executed, so a branch still open on that date
+goes red on two exemptions it did not cause and cannot legitimately extend: the
+rule is that an entry must be able to fail the build by itself, and moving its
+date to make a red go away is exactly what the rule forbids.
 
 Three answers, none of them an agent's: land before it; extend both dates on
 their own merits when the day comes, which is a review of #156 and #88 rather
@@ -1488,7 +1967,9 @@ date as a real deadline rather than as something to renegotiate.**
 
 Three places where I chose against a literal reading, each argued in §11: the
 child is born holding a **connector** rather than a pre-made connection (D1);
-`accept` no longer reports the peer's pid (D3); `SYS_THREAD_JOIN` keeps its `Tid`
+`accept` no longer reports the peer's pid (D3, which is a one-line reversal in
+the ABI and two `shm.grant` call sites that keep their pid); `SYS_THREAD_JOIN`
+keeps its `Tid`
 (D5). Each is a one-line reversal if he disagrees.
 
 ---
@@ -1514,11 +1995,19 @@ and I built the design that way first. Item 7's wording settles it: libc holds
 a namespace to be served by a userland directory later without an ABI change.
 
 **D3 — `accept` returns a handle and no pid.** `capability-handles-spec.md`
-leaves the pid in place. Nothing authorizes on it once `SYS_PIPE_OPEN` is retired,
-and a peer's identity asserted by the kernel is exactly the designation-as-
-capability shape this work deletes. A server that wants to name its client reads
-the protocol's first frame, which is already the client's own claim about itself
-and already distrusted.
+leaves the pid in place. A peer's identity asserted by the kernel is exactly the
+designation-as-capability shape this work deletes, and a server that wants to
+name its client reads the protocol's first frame, which is already the client's
+own claim about itself and already distrusted.
+
+Two callers do authorize on it today and they are the ordering constraint, not a
+counterargument: the compositor's `shm.grant(pid)`
+(`userland/compositor/src/session.rs:859`) and soundd's
+(`userland/soundd/src/main.rs:627`). Both are replaced by `SYS_HANDLE_SEND` in
+chunk 6 and the pid is deleted in that same commit (§3.3). The rest of its use is
+diagnostic — 87 lines across four files name a pid — and it becomes the
+connection's `Koid`, which is the kernel's identity for the object and not
+something a process can present to anybody.
 
 **D4 — device claims are minted only by init, and `SYS_OPEN_DEVICE` is retired.**
 `capability-handles-spec.md` §14.11 scopes spawn-time device grants out of v1 and
@@ -1568,7 +2057,65 @@ connect. The launcher makes it expressible later; nothing needs it now.
 
 **Revocation** — `capability-handles-spec.md` §14.5 rejects unmap-others by name
 and this design keeps that. Forced reclaim of a wedged-alive daemon is killing
-it, which init can do because it holds the `Process` handle.
+it, which init can do because it holds the `Process` handle for what
+`[boot] start` named.
+
+**Restarting a daemon so its existing clients can reach it** — §5.3 states the
+regression plainly and this is the mechanism it names. `SYS_PORT_REARM(port_h)`
+mints a fresh `Acceptor` for an existing `PortShared` and clears `closed`; the
+right that gates it rides on the handle init keeps when it endows the acceptor,
+so only the process that created the port can re-arm it. Every namespace already
+points at that `PortShared`, so a re-armed port is reachable by every client
+whose namespace predates the crash — which is exactly what is lost today. **113
+is its number** and this delta stops at 112 so it stays free. Not built here
+because nothing in the tree supervises a daemon, and a re-arm with no caller is
+a mechanism built for a plan.
 
 **`SYS_SYSINFO`/`SYS_SCHED_INFO`** — read-only, ambient, and a read surface is
 `specs/introspection-plan.md`'s subject rather than this one's.
+
+---
+
+## 13. Coordination with the other open plans
+
+Three specs are in flight against the same ABI and two of them do not know the
+state of this one. Every row here was checked against the branch as pushed, not
+against what a spec says about it.
+
+### 13.1 `wt/toyos-compl` — the completion architecture
+
+`origin/wt/toyos-compl` at `57d6baf`, `specs/completion-architecture-spec.md`,
+1,136 lines, spec-only. Its §15 says *"`wt/toyos-endow` was not pushed to
+`origin` as of 2026-08-09 … the implementing agent must re-read
+`specs/capability-endowment-spec.md` from the endowment branch before chunk C0"*.
+It is pushed now, at `f53a8de` and at whatever this branch's head becomes, and
+that instruction is the one to follow.
+
+| what it says | how it stands against this spec |
+|---|---|
+| **§14.2: 99–115 is the endowment architecture's, 116–127 is its own, no retired number reused by either** | Holds. This delta is 99–112, fourteen numbers; **113 is reserved for `SYS_PORT_REARM` (§12) and 114–115 are free.** It allocates nothing at 116 or above, and it retires thirteen numbers none of which that spec touches |
+| It expects a `SYS_THREAD_JOIN_H` in that block | **Not delivered.** D5 keeps `SYS_THREAD_JOIN`(41) and its `Tid`, so no number is spent on one. Its reservation is simply unused |
+| **§15 row 1: `ProcessData` becomes a `SleepLock`** | Compatible. `HandleTable` lives inside `ProcessData` behind the existing lock and `get` is lock → clone → unlock, so nothing borrows the table across a park |
+| **§15 row 2: `Rights::WAIT` is the seam `completion::arm` needs** | Delivered. §1.4 carries `WAIT` and §3.1 gives it callers |
+| **§15 row 8: "their §5.1 no-Arc-across-block interim rule is retired by our cancellable park. *Tell them.*"** | Taken. §1.1 states the stranded-`Arc` leak as accepted, bounded and census-visible, and does not build a workaround for it. Its cancellable park removes the class after this lands; nothing here should anticipate it |
+| **§15 row 12: the bad-handle kill-process flip needs its §7 to be safe from a parked thread** | Chunk 7 flips it before that exists. The residual is the pre-existing wait-queue leak (§1.1), not a new one, and the flip is not held for it |
+| **Landing order: this branch first** | Its own §15 says so, and its C0 merges `origin/main` after |
+
+### 13.2 `specs/introspection-plan.md` — stale, and it collides
+
+That plan allocates `SYS_QUERY = 97`, `SYS_LOG_READ = 98` and
+`SYS_DISK_ADOPT = 99` (`specs/introspection-plan.md:78`, `:414`, `:694`, restated
+together at `:824`). **All three are wrong on today's tree**: 97 and 98 are
+`SYS_DEVICE_REG_READ`/`SYS_DEVICE_REG_WRITE`, allocated after that plan was
+written, and 99 is `SYS_ENDOWMENTS` here. Its allocation must be re-based off
+**116 or above** — 99–115 is spoken for by this spec and `wt/toyos-compl`'s
+§14.2, and 116–127 is that spec's. Nothing in this branch fixes that plan; this
+row exists so the next agent to implement it does not build a third
+`SYS_DISK_ADOPT = 99`.
+
+### 13.3 `specs/capability-handles-spec.md`
+
+Not a parallel track — this work realizes it, §11 lists the seven deviations, and
+chunk 9 annotates it with what was delivered. The one thing to carry forward: its
+§12.2 stage-F grep gate is landed early here as §8.4, so a later reader of that
+spec should not expect stage F to still be owed.
