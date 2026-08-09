@@ -121,6 +121,13 @@ impl MscDevice {
         !self.failed
     }
 
+    /// Which slot this disk is on, for a caller holding an event that needs to
+    /// know whether a disk is behind it.
+    #[cfg(feature = "usb-slow-device")]
+    pub fn slot_id(&self) -> u8 {
+        self.slot_id
+    }
+
     pub fn geometry(&self) -> StorageGeometry {
         StorageGeometry {
             logical_block_bytes: self.logical_block_bytes,
