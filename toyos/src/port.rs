@@ -23,16 +23,6 @@ pub struct Acceptor(pub(crate) OwnedHandle);
 /// read.
 pub struct Connector(pub(crate) OwnedHandle);
 
-/// Who accepted, and who connected.
-///
-/// **`client_pid` goes when handle transfer arrives.** Peer identity is not the
-/// kernel's to assert; it survives only because the compositor and soundd still
-/// grant shared memory to it.
-pub struct Accepted {
-    pub conn: Connection,
-    pub client_pid: u32,
-}
-
 /// Make a port. Grants nothing on its own — a port with no clients is not
 /// authority.
 pub fn create() -> Result<(Acceptor, Connector), SyscallError> {
@@ -42,9 +32,13 @@ pub fn create() -> Result<(Acceptor, Connector), SyscallError> {
 
 impl Acceptor {
     /// Take the oldest queued connection, blocking until there is one.
-    pub fn accept(&self) -> Result<Accepted, SyscallError> {
-        let r = syscall::accept(self.0.fd())?;
-        Ok(Accepted { conn: Connection(OwnedHandle(r.fd)), client_pid: r.client_pid })
+    ///
+    /// **It answers with the connection and nothing else.** Who connected is
+    /// not the kernel's to assert: a server that wants to name its client
+    /// reads it out of the protocol's first frame, where it is already the
+    /// client's own claim about itself and already distrusted.
+    pub fn accept(&self) -> Result<Connection, SyscallError> {
+        syscall::accept(self.0.fd()).map(|fd| Connection(OwnedHandle(fd)))
     }
 
     /// Give up ownership, for a handle about to be endowed or transferred.

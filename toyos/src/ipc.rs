@@ -211,6 +211,35 @@ impl Connection {
         recv(self.fd())
     }
 
+    /// Move `handles` to the peer and then send the frame that announces them.
+    ///
+    /// **In that order, and this is the only place it is written.** The handles
+    /// travel in a queue of their own rather than interleaved with the bytes,
+    /// so a peer that has read the frame is guaranteed to find them — and a
+    /// peer that has not is guaranteed not to act on them early. Sending the
+    /// frame first would make the receiver's `recv_handles` a poll.
+    pub fn send_with_handles<T: IpcPayload>(
+        &self,
+        handles: &[RawHandle],
+        msg_type: u32,
+        payload: &T,
+    ) -> Result<(), IpcError> {
+        syscall::handle_send(self.fd(), handles).map_err(IpcError::Syscall)?;
+        self.send(msg_type, payload)
+    }
+
+    /// Take the batch the peer sent with the frame just received.
+    ///
+    /// Never blocks. An empty answer for a frame that promised handles is a
+    /// peer that sent them out of order, which is a protocol error and not
+    /// something to wait for.
+    pub fn recv_handles(
+        &self,
+        out: &mut [RawHandle; syscall::MAX_TRANSFER_HANDLES],
+    ) -> Result<usize, SyscallError> {
+        syscall::handle_recv(self.fd(), out)
+    }
+
     pub fn recv_bytes(&self, header: &IpcHeader, buf: &mut [u8]) -> Result<usize, IpcError> {
         recv_bytes(self.fd(), header, buf)
     }

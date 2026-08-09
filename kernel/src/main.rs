@@ -62,7 +62,6 @@ mod pipe;
 mod device;
 mod net;
 mod gpu;
-mod shared_memory;
 mod user_ptr;
 mod vma;
 
@@ -267,16 +266,21 @@ pub unsafe extern "sysv64" fn _start(_kernel_args: &KernelArgs) -> ! {
 }
 
 fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
-    let fb_info = toyos_abi::FramebufferInfo {
-        token: [info.tokens[0].raw(), info.tokens[1].raw()],
-        cursor_token: info.cursor_token.raw(),
-        width: info.width,
-        height: info.height,
-        stride: info.stride,
-        pixel_format: info.pixel_format,
-        flags: info.flags,
-    };
-    crate::device::set_framebuffer_info(fb_info);
+    crate::device::set_framebuffer_info(crate::device::Screen {
+        // A description carries handles into whichever process reads it, and
+        // that process does not exist yet: `try_claim` mints them.
+        info: toyos_abi::FramebufferInfo {
+            scanout: [toyos_abi::HANDLE_INVALID; 2],
+            cursor: toyos_abi::HANDLE_INVALID,
+            width: info.width,
+            height: info.height,
+            stride: info.stride,
+            pixel_format: info.pixel_format,
+            flags: info.flags,
+        },
+        scanout: info.scanout.clone(),
+        cursor: info.cursor.clone(),
+    });
     gpu::register(driver, info);
 }
 
@@ -494,7 +498,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     pipe::init();
     io_uring::init();
 
-    shared_memory::init();
 
     // Mount initrd as read-only root filesystem (bcachefs, no extraction)
     assert!(!initrd.is_empty(), "No initrd provided");

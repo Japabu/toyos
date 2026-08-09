@@ -1,10 +1,9 @@
 use alloc::sync::Arc;
 
-use crate::object::device::{DeviceClaim, DeviceInfo};
+use crate::object::device::{DeviceClaim, DeviceInfo, FramebufferBuffers};
+use crate::object::shm::Region;
 use crate::{keyboard, mouse};
 use toyos_abi::FramebufferInfo;
-use crate::process::Pid;
-use crate::shared_memory;
 use crate::sync::Lock;
 pub use toyos_abi::syscall::DeviceType;
 
@@ -17,7 +16,19 @@ pub use toyos_abi::syscall::DeviceType;
 /// exclusivity actually needs.
 static TAKEN: [Lock<bool>; DeviceType::ALL.len()] =
     [const { Lock::new(false) }; DeviceType::ALL.len()];
-static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
+static FB_INFO: Lock<Option<Screen>> = Lock::new(None);
+
+/// What the display driver published, as a claim needs it.
+///
+/// The regions rather than objects: a claim mints its own, because a
+/// `SharedMemObject` whose handle count has reached zero is retired and the
+/// screen outlives whichever process was holding it.
+#[derive(Clone)]
+pub struct Screen {
+    pub info: FramebufferInfo,
+    pub scanout: [Region; 2],
+    pub cursor: Region,
+}
 
 fn taken(class: DeviceType) -> &'static Lock<bool> {
     &TAKEN[DeviceType::ALL
@@ -58,12 +69,12 @@ impl Drop for Claim {
     }
 }
 
-pub fn set_framebuffer_info(info: FramebufferInfo) {
+pub fn set_framebuffer_info(screen: Screen) {
     // A relative pointer accumulates into a square 0..32767 space that this
     // geometry is what gets mapped onto, so its per-axis scale is a function of
     // the screen and has to follow a mode change.
-    crate::mouse::set_screen(info.width, info.height);
-    *FB_INFO.lock() = Some(info);
+    crate::mouse::set_screen(screen.info.width, screen.info.height);
+    *FB_INFO.lock() = Some(screen);
 }
 
 /// Why a claim did not succeed.
@@ -107,53 +118,39 @@ pub fn try_claim(class: DeviceType) -> Result<Arc<DeviceClaim>, ClaimError> {
             Ok(DeviceClaim::new(class, DeviceInfo::Events, claim))
         }
         DeviceType::Framebuffer => {
-            let info = (*FB_INFO.lock()).ok_or(ClaimError::Absent)?;
+            let screen = (*FB_INFO.lock()).clone().ok_or(ClaimError::Absent)?;
             let claim = Claim::acquire(class)?;
             crate::drivers::panic_console::screen_claimed_by_userland();
-            Ok(DeviceClaim::new(class, DeviceInfo::Framebuffer(info), claim))
+            Ok(DeviceClaim::new(class, framebuffer_info(screen), claim))
         }
         DeviceType::Nic => {
-            let info = crate::net::nic_info().ok_or(ClaimError::Absent)?;
+            let (info, dma) = crate::net::nic_info().ok_or(ClaimError::Absent)?;
             let claim = Claim::acquire(class)?;
-            Ok(DeviceClaim::new(class, DeviceInfo::Nic(info), claim))
+            Ok(DeviceClaim::new(class, DeviceInfo::Nic(info, shm(dma)), claim))
         }
         DeviceType::HdaAudio => {
-            let info = crate::drivers::hda::info().ok_or(ClaimError::Absent)?;
+            let (info, pcm) = crate::drivers::hda::info().ok_or(ClaimError::Absent)?;
             let claim = Claim::acquire(class)?;
-            Ok(DeviceClaim::new(class, DeviceInfo::Hda(info), claim))
+            Ok(DeviceClaim::new(class, DeviceInfo::Hda(info, shm(pcm)), claim))
         }
         DeviceType::VirtioSound => {
-            let info = crate::drivers::virtio_sound::info().ok_or(ClaimError::Absent)?;
+            let (info, dma) = crate::drivers::virtio_sound::info().ok_or(ClaimError::Absent)?;
             let claim = Claim::acquire(class)?;
-            Ok(DeviceClaim::new(class, DeviceInfo::VirtioSound(info), claim))
+            Ok(DeviceClaim::new(class, DeviceInfo::VirtioSound(info, shm(dma)), claim))
         }
     }
 }
 
-/// Let `pid` map every kernel buffer a claim's description names.
-///
-/// **Granted where the description is read, not where the claim is minted.**
-/// init mints every claim and holds none of them: it endows each one to the
-/// program the manifest gives it, and that program is the one that has to map
-/// the scanout or the DMA region. Granting at mint time would grant to init,
-/// and the holder would read an address it is not allowed to touch.
-///
-/// A claim admits one handle, so at most one process at a time can reach this —
-/// and the grants a previous holder collected are released with the region's
-/// own accounting when that process exits.
-pub fn grant_buffers(info: &DeviceInfo, pid: Pid) {
-    let tokens: &[u32] = match info {
-        DeviceInfo::Events => &[],
-        DeviceInfo::Framebuffer(fb) => &[fb.token[0], fb.token[1], fb.cursor_token],
-        DeviceInfo::Nic(nic) => &[nic.dma_token],
-        DeviceInfo::Hda(hda) => &[hda.pcm_token],
-        DeviceInfo::VirtioSound(vs) => &[vs.dma_token],
-    };
-    for &token in tokens {
-        // A refusal here is the kernel disagreeing with itself about a region
-        // it created, and the holder would read a description naming memory it
-        // cannot map. Say which token rather than hand it over anyway.
-        shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid)
-            .unwrap_or_else(|e| panic!("device buffer {token} cannot be granted: {e:?}"));
-    }
+fn shm(region: Region) -> Arc<crate::object::shm::SharedMemObject> {
+    crate::object::shm::SharedMemObject::over(region)
+}
+
+/// The description a framebuffer claim answers with, over freshly minted
+/// buffer objects.
+pub fn framebuffer_info(screen: Screen) -> DeviceInfo {
+    let Screen { info, scanout: [front, back], cursor } = screen;
+    DeviceInfo::Framebuffer(
+        info,
+        FramebufferBuffers { scanout: [shm(front), shm(back)], cursor: shm(cursor) },
+    )
 }

@@ -2206,6 +2206,81 @@ lines and harness assertions that named it (§3.3, §6.7a).
 *Gate: `handle_transfer`, `kill_while_blocked`, gate A both tiers' fast arm,
 `device_claim_crash_release`.*
 
+**Half done, 2026-08-10. The kernel and the ABI are complete and the kernel
+compiles clean; the SDK is a third of the way and userland is untouched.** The
+tree does not build past `toyos/` and that is the state the next commit inherits
+— use `cargo build --target x86_64-unknown-none` inside `kernel/` (chunk 4's
+note) to keep the kernel honest while the guest is red.
+
+What is done, and the five things the plan did not have:
+
+- **`SYS_SOCKET_CREATE` is not retired; it is renamed `SYS_CONNECTION_JOIN` and
+  keeps number 76.** §3.2's reason for retiring it — "built a connection out of
+  two pipe ids" — is only half of what it does. The other half is *making one
+  duplex object out of two simplex ends*, and that has three callers outside
+  this repository: `rust/library/std/src/sys/net/connection/toyos.rs:55-57` and
+  `socket2/src/sys/toyos.rs:485-490,630-635`. `std`'s `TcpStream` is one handle
+  and netd's data path is two pipes, so something has to join them. Handle-
+  addressed it grants nothing — everything it reaches is already the caller's —
+  which is the same move §3.3 makes for `SYS_DUP` → `SYS_HANDLE_DUP`. §8.4's
+  grep gate is satisfied by the name being gone. **The userland map missed this
+  because it looked only at `userland/`**; the fork estate is outside every
+  check the tree runs on itself.
+- **A device description installs handles where it is read, and the read path
+  had to move.** `FramebufferInfo`, `NicInfo`, `HdaInfo` and `VirtioSoundInfo`
+  keep their layout — a `RawHandle` is a `repr(transparent)` `u32` — but the
+  fields are filled in per reader, so `ops::read_device` needs the table
+  mutably and cannot run under the borrow `get_ref` hands out. `sys_read`
+  resolves a `Device` twice: a `matches!` on the hot path, and a second slot
+  lookup on a path that runs once per device per boot. Cloning the `Arc` for
+  every read would have put an atomic on the hottest syscall in the kernel.
+- **The image is minted once and remembered on the claim.** Re-minting on each
+  read would install a fresh handle to the same buffer every time — an unbounded
+  handle leak a process drives by reading in a loop. `DeviceClaim::describe`
+  caches; `remint` replaces both the description and the cache, which is what
+  `SYS_GPU_SET_RESOLUTION` needs.
+- **A device region is minted per claim over an `Arc<Pages>`, not shared as an
+  object.** An object whose handle count reaches zero is *retired* and can never
+  be named again, so one `SharedMemObject` per screen would panic the second
+  claimant. The pages are refcounted underneath instead, which also deletes
+  `virtio_gpu::free_framebuffer`: a mode change drops the driver's reference and
+  the old scanout survives until the compositor closes its handle. That replaces
+  a forced unmap-everyone, which is the one thing a capability system may not
+  do.
+- **Handle transfer is two cross-wired queues on the connection, and the
+  ordering rule is in the SDK rather than at each call site.** `HandleQueue` is
+  `Lock<Option<VecDeque<Vec<HandleEntry>>>>`; a batch holds `HandleEntry`s, so
+  `handle_count` stays raised for the whole crossing and a region sent to a
+  client that dies before receiving is released by the queue dropping.
+  `SYS_HANDLE_RECV` never blocks, so **handles are sent before the frame that
+  announces them** and `Connection::send_with_handles` is that written once.
+  `None` means the reading end has gone and a send answers `Gone`.
+
+Two defects the audit of
+`specs/issues/kernel/ring0-jump-to-zero-under-port-polls.md` found in chunk 3's
+code, both fixed here: `WatcherGuard` unregistered a ring from a source another
+poll of the same ring still named (deleted, `io_uring::take_poll` is the one
+removal path), and `Acceptor::on_zero_handles` left a thread parked in
+`SYS_ACCEPT` on a condition that had become permanently false (it wakes now, and
+`sys_accept` answers `Gone`). Two new issues filed:
+`specs/issues/kernel/poison-set-holds-one-thread-per-cpu.md` and
+`specs/issues/isolation/a-moved-handle-is-always-re-movable.md` — the second is
+a property §6.3 assumes and the design does not have.
+
+**What is left, in order.** The SDK's `audio`/`net`/`surface`/`device`/`gpu`
+(`shm`, `poller`, `port`, `ipc` and `lib` are done, `toyos/src/pipe.rs` is
+deleted); soundd's `MSG_STREAM_OPENED` **and its hand-decode of
+`StreamOpenRequest` at `main.rs:1666-1672`, which re-implements the layout with
+literal byte ranges**; the compositor's four protocol tokens and **three**
+`shm.grant(pid)` sites (`session.rs:875`, `:1216`, `:1328` — not the one §6.3a
+counts) plus `console/src/main.rs:89`, a fourth `FramebufferInfo` reader outside
+the compositor; netd's nine pipe-id fields, which become two handles sent over
+the control connection in the direction the client already creates them; the
+accept pid out of `toyos::surface::Notice`, the compositor, netd, soundd and
+`tests/toyos.rs:9308`'s two `netd: …ing pid` literals; the fork half (std's
+`net/connection/toyos.rs`, `socket2`, and mio's `selector.rs:28-30`); and the
+test estate §6.7 lists.
+
 **Chunk 7 — process objects and the fail-fast flip. Green.**
 `ProcessObject`/`ThreadObject`; `SYS_SPAWN` returns a handle;
 `SYS_PROCESS_WAIT/KILL/OPEN`; `SYS_WAITPID`/`SYS_KILL` retired; the zombie and

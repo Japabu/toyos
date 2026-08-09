@@ -33,6 +33,7 @@ pub mod ops;
 pub mod pipe;
 pub mod port;
 pub mod service;
+pub mod shm;
 pub mod syscap;
 
 pub use handle::{HandleEntry, HandleError, HandleTable};
@@ -57,6 +58,14 @@ impl<T> Held<T> {
     pub(crate) fn release(&self) {
         let taken = self.0.lock().take();
         drop(taken);
+    }
+}
+
+impl<T: Clone> Held<T> {
+    /// A second counted reference to the same thing, or `None` once the last
+    /// handle gave it back.
+    pub(crate) fn get(&self) -> Option<T> {
+        self.0.lock().clone()
     }
 }
 
@@ -278,6 +287,10 @@ kobject! {
     deferred Device => device::DeviceClaim,
     deferred Acceptor => port::Acceptor,
     deferred IoUring => service::IoUringObject,
+    // Every mapping goes with the last handle, and the flush that makes that
+    // safe waits for every other CPU — so it runs from the queue, with nothing
+    // held, and never inline at a `close`.
+    deferred SharedMem => shm::SharedMemObject,
     // A service with no clients right now is not a service that has stopped.
     immediate Connector => port::Connector,
     // Immutable once built: its `Arc<Connector>`s go with the last reference

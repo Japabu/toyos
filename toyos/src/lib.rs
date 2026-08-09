@@ -13,7 +13,6 @@ pub mod poller;
 pub mod ipc;
 pub mod namespace;
 pub mod net;
-pub mod pipe;
 pub mod port;
 pub mod surface;
 pub mod shm;
@@ -30,6 +29,16 @@ pub use toyos_abi::RawHandle;
 /// Used by [`poller`] and other APIs that accept any handle type.
 pub trait AsHandle {
     fn as_handle(&self) -> RawHandle;
+}
+
+/// The two ends of a fresh pipe.
+///
+/// `SYS_PIPE` is unprivileged and always has been: what a pipe is *worth* is
+/// who holds its ends, and nothing but a transfer puts one in somebody else's
+/// table.
+pub fn pipe_pair() -> Result<(Pipe, Pipe), toyos_abi::syscall::SyscallError> {
+    let fds = toyos_abi::syscall::pipe()?;
+    Ok((Pipe(OwnedHandle(fds.read)), Pipe(OwnedHandle(fds.write))))
 }
 
 /// One owned handle, closed when it drops.
@@ -98,7 +107,10 @@ impl AsHandle for Device {
     fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
-/// A kernel pipe endpoint. Created by [`pipe::open_by_id`].
+/// One end of a kernel pipe.
+///
+/// Arrives either from [`pipe_pair`] or over a connection: a pipe end is a
+/// handle now, and there is no id to hand a peer instead of the thing itself.
 pub struct Pipe(pub(crate) OwnedHandle);
 
 impl Pipe {
@@ -122,10 +134,6 @@ impl Pipe {
 
     pub fn pipe_map(&self) -> Result<*mut u8, toyos_abi::syscall::SyscallError> {
         toyos_abi::syscall::pipe_map(self.fd())
-    }
-
-    pub fn pipe_id(&self) -> Result<u64, toyos_abi::syscall::SyscallError> {
-        toyos_abi::syscall::pipe_id(self.fd())
     }
 
     /// Consume the `Pipe`, giving up the handle without closing it.

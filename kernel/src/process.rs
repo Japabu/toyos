@@ -10,7 +10,7 @@ use crate::object::{ops, HandleTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
 use crate::sched::payload::ThreadSched;
-use crate::{elf, pipe, scheduler, shared_memory};
+use crate::{elf, pipe, scheduler};
 use crate::{DirectMap, UserAddr};
 use crate::loader::{
     setup_tls, setup_combined_tls, alloc_kernel_stack, thread_start,
@@ -1084,12 +1084,14 @@ fn teardown_resources(
 ///
 /// Caller must hold the PROCESS_TABLE lock, have claimed teardown, retired
 /// every other thread of the process (so none can run), and freed resources.
-/// Returns the (pid, tid) wakes to deliver after the table lock drops, and the
-/// shared regions to free after it — freeing one waits for every other CPU to
-/// flush, which is not something to do holding the process table.
+/// Returns the (pid, tid) wakes to deliver after the table lock drops.
+///
+/// It used to hand back the shared regions to free outside the lock too. There
+/// is no pid sweep left to do: a region is an object, its mappings go with the
+/// last handle, and `close_all` in phase 3 is what releases them.
 fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
                         main_cpu_ns: u64)
-                        -> (Vec<(Pid, Tid)>, crate::mm::Unmapped<shared_memory::Retired>) {
+                        -> Vec<(Pid, Tid)> {
     let proc = table.get_mut(process_pid)
         .expect("teardown_bookkeeping: process not found");
     let main_tid = proc.main_tid;
@@ -1102,13 +1104,11 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
         }
     }
 
-    let retired = shared_memory::cleanup_process(process_pid);
-
-    // Beside the shared-memory release and for the same reason: the symbol
-    // table is megabytes of the process's own pages now that it is read off the
-    // binary rather than pointed at in the initrd, and a zombie has no
-    // backtrace left for anyone to take — every caller of `resolve_user_symbol`
-    // is a crash report, which runs on the live process before this.
+    // The symbol table is megabytes of the process's own pages now that it is
+    // read off the binary rather than pointed at in the initrd, and a zombie
+    // has no backtrace left for anyone to take — every caller of
+    // `resolve_user_symbol` is a crash report, which runs on the live process
+    // before this.
     *proc.symbols.lock() = SymbolTable::empty();
 
     let proc = table.get(process_pid).unwrap();
@@ -1133,7 +1133,7 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
         }
     }
 
-    (to_wake, retired)
+    to_wake
 }
 
 /// Snapshot this process's accounting onto its parent, for `waitpid` to read.
@@ -1249,13 +1249,11 @@ pub fn exit(code: i32) -> ! {
     let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
 
     // Phase 4: table bookkeeping (zombie marks, orphan adoption, parent wake)
-    let (to_wake, retired) = {
+    let to_wake = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         teardown_bookkeeping(table, process_pid, code, main_cpu_ns)
     };
-    // After the table lock, because the drop waits for every other CPU to flush.
-    drop(retired);
 
     // Phase 5: stash accounting on the parent, wake waiters, exit
     stash_accounting_snapshot(&process_data_arc, process_pid, parent_pid, syscall_total, syscall_total_ns, main_cpu_ns);
@@ -1775,13 +1773,11 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, target_pid);
 
     // Phase 4: Table bookkeeping (same path as exit)
-    let (to_wake, retired) = {
+    let to_wake = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         teardown_bookkeeping(table, target_pid, 137, main_cpu_ns)
     };
-    // After the table lock, because the drop waits for every other CPU to flush.
-    drop(retired);
 
     // Phase 5: Stash accounting snapshot on parent
     stash_accounting_snapshot(&process_data_arc, target_pid, Some(caller), syscall_total, syscall_total_ns, main_cpu_ns);

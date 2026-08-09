@@ -20,7 +20,7 @@ use crate::process::PipeMap;
 use crate::user_ptr::{UserBytes, UserBytesMut};
 use crate::{device as device_registry, keyboard, mouse};
 
-use super::device::{DeviceClaim, DeviceInfo};
+use super::device::DeviceClaim;
 use super::file::{FileObject, OpenFileState};
 use super::handle::{HandleEntry, HandleError, HandleTable};
 use super::KObjectRef;
@@ -55,6 +55,12 @@ pub fn initial_rights(object: &KObjectRef) -> Rights {
         // Every bit on a `SysCap` is an authority init decides per program, so
         // there is no sensible default and the creator states it.
         KObjectRef::SysCap(_) => Rights::NONE,
+        // `MAP` is the whole of it. A region is a thing to look at, and every
+        // question about what is in it is asked of the memory rather than of
+        // the handle.
+        KObjectRef::SharedMem(_) => {
+            Rights::DUP.union(Rights::TRANSFER).union(Rights::MAP)
+        }
         // A connector is a ticket to a service and has no read or write path
         // at all: the only things to do with one are put it in a namespace and
         // give that namespace away.
@@ -203,7 +209,8 @@ pub fn pipe_id_read(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::Device(_)
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => None,
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::SharedMem(_) => None,
     }
 }
 
@@ -214,7 +221,8 @@ pub fn pipe_id_write(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => None,
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::SharedMem(_) => None,
     }
 }
 
@@ -234,7 +242,8 @@ pub fn read_source(object: &KObjectRef) -> Option<Source> {
         },
         KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => None,
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::SharedMem(_) => None,
     }
 }
 
@@ -245,7 +254,8 @@ pub fn write_source(object: &KObjectRef) -> Option<Source> {
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => None,
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::SharedMem(_) => None,
     }
 }
 
@@ -289,22 +299,20 @@ fn read_file(file: &FileObject, buf: &mut UserBytesMut) -> Option<u64> {
     })
 }
 
-fn read_device(claim: &DeviceClaim, buf: &mut UserBytesMut) -> Option<u64> {
-    /// The description a claim answers with once, before its stream starts.
-    ///
-    /// **Reading it is what grants the buffers it names.** A description is a
-    /// set of addresses, and the process being told them is the one that must
-    /// be able to map them — which is never the process that minted the claim,
-    /// because init mints every claim and holds none of them.
-    fn describe(claim: &DeviceClaim, bytes: &[u8], buf: &mut UserBytesMut) -> u64 {
-        device_registry::grant_buffers(claim.info(), crate::process::current_process());
-        let count = buf.len().min(bytes.len());
-        buf.write_at(0, &bytes[..count]);
-        claim.mark_info_read();
-        count as u64
-    }
-
-    match claim.info() {
+/// Read a device claim.
+///
+/// **It takes the table because the description installs handles.** A
+/// description is a set of buffers, and the process being told about them is
+/// the one that must be able to map them — which is never the process that
+/// minted the claim, because init mints every claim and holds none of them.
+/// Every other read runs under the borrow `get_ref` hands out, which is what
+/// keeps the two hottest syscalls in the kernel free of an atomic refcount.
+pub fn read_device(
+    claim: &DeviceClaim,
+    table: &mut HandleTable,
+    buf: &mut UserBytesMut,
+) -> Option<u64> {
+    match claim.class() {
         // **A read of an input device reads the queue and drives no
         // hardware.** Both of these polled xHCI first, which made whichever
         // thread happened to read the mouse into the driver's enumeration and
@@ -313,7 +321,8 @@ fn read_device(claim: &DeviceClaim, buf: &mut UserBytesMut) -> Option<u64> {
         // kernel and nothing dropped. `drain_irqs` calls the same function at
         // the top of every scheduler pass, so a reader gives up at most one
         // pass of latency.
-        DeviceInfo::Events => match claim.class() {
+        device_registry::DeviceType::Keyboard | device_registry::DeviceType::Mouse => {
+            match claim.class() {
             device_registry::DeviceType::Keyboard => {
                 let event_size = core::mem::size_of::<keyboard::RawKeyEvent>();
                 let mut count = 0;
@@ -335,12 +344,14 @@ fn read_device(claim: &DeviceClaim, buf: &mut UserBytesMut) -> Option<u64> {
                 if count > 0 { Some(count as u64) } else { None }
             }
             other => panic!("a {other:?} claim answers with events"),
-        },
-        DeviceInfo::Framebuffer(info) => Some(describe(claim, info.as_bytes(), buf)),
-        DeviceInfo::Nic(info) => Some(describe(claim, info.as_bytes(), buf)),
-        DeviceInfo::Hda(info) => {
+            }
+        }
+        device_registry::DeviceType::Framebuffer | device_registry::DeviceType::Nic => {
+            Some(claim.describe(table, buf))
+        }
+        device_registry::DeviceType::HdaAudio => {
             if !claim.info_read() {
-                return Some(describe(claim, info.as_bytes(), buf));
+                return Some(claim.describe(table, buf));
             }
             if buf.len() < toyos_abi::audio::AudioCompletionRecord::SIZE {
                 return Some(SyscallError::InvalidArgument.to_u64());
@@ -348,9 +359,9 @@ fn read_device(claim: &DeviceClaim, buf: &mut UserBytesMut) -> Option<u64> {
             let n = crate::drivers::hda::drain_completed(buf);
             if n == 0 { None } else { Some(n as u64) }
         }
-        DeviceInfo::VirtioSound(info) => {
+        device_registry::DeviceType::VirtioSound => {
             if !claim.info_read() {
-                return Some(describe(claim, info.as_bytes(), buf));
+                return Some(claim.describe(table, buf));
             }
             if buf.len() < toyos_abi::audio::AudioCompletionRecord::SIZE {
                 return Some(SyscallError::InvalidArgument.to_u64());
@@ -363,12 +374,17 @@ fn read_device(claim: &DeviceClaim, buf: &mut UserBytesMut) -> Option<u64> {
     }
 }
 
+/// Read whatever a handle names, except a device claim.
+///
+/// [`read_device`] is separate because it needs the table mutably and this runs
+/// under the borrow the handle was resolved through. Its arm here is
+/// unreachable and says so rather than silently answering `PermissionDenied`.
 pub fn try_read(object: &KObjectRef, buf: &mut UserBytesMut) -> Option<u64> {
     match object {
         KObjectRef::File(f) => read_file(f, buf),
         KObjectRef::PipeRead(r) => pipe::try_read(r.id(), buf).map(|n| n as u64),
         KObjectRef::Connection(c) => pipe::try_read(c.rx(), buf).map(|n| n as u64),
-        KObjectRef::Device(d) => read_device(d, buf),
+        KObjectRef::Device(_) => unreachable!("a device claim is read by `read_device`"),
         KObjectRef::Console(_) => {
             let mut count = 0usize;
             while count < buf.len() {
@@ -388,7 +404,8 @@ pub fn try_read(object: &KObjectRef, buf: &mut UserBytesMut) -> Option<u64> {
         }
         KObjectRef::PipeWrite(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => Some(SyscallError::PermissionDenied.to_u64()),
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::SharedMem(_) => Some(SyscallError::PermissionDenied.to_u64()),
     }
 }
 
@@ -444,7 +461,7 @@ pub fn try_write(object: &KObjectRef, buf: &UserBytes) -> Option<u64> {
             Some(buf.len() as u64)
         }
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
-        | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        | KObjectRef::IoUring(_) | KObjectRef::SharedMem(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => {
             Some(SyscallError::PermissionDenied.to_u64())
         }
@@ -500,6 +517,11 @@ pub fn fstat(object: &KObjectRef) -> Stat {
         KObjectRef::Connection(_) => plain(FileType::Socket),
         KObjectRef::Console(_) => plain(FileType::Serial),
         KObjectRef::Acceptor(_) => plain(FileType::Pipe),
+        KObjectRef::SharedMem(m) => Stat {
+            file_type: FileType::Unknown as u64,
+            size: m.size(),
+            mtime: 0,
+        },
         KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => plain(FileType::Unknown),
         KObjectRef::Device(d) => plain(match d.class() {
@@ -568,7 +590,8 @@ pub fn has_data(object: &KObjectRef) -> bool {
             }
         },
         KObjectRef::PipeWrite(_) | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => false,
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::SharedMem(_) => false,
     }
 }
 
@@ -579,7 +602,8 @@ pub fn has_space(object: &KObjectRef) -> bool {
         KObjectRef::File(_) | KObjectRef::Console(_) => true,
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
         | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => false,
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::SharedMem(_) => false,
     }
 }
 
@@ -601,7 +625,7 @@ pub fn mark_tty(object: &KObjectRef) -> u64 {
         }
         KObjectRef::Connection(_) | KObjectRef::File(_) | KObjectRef::Device(_)
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
-        | KObjectRef::SysCap(_)
+        | KObjectRef::SysCap(_) | KObjectRef::SharedMem(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => SyscallError::InvalidArgument.to_u64(),
     }
 }

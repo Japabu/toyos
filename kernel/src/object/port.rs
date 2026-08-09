@@ -22,11 +22,11 @@ use toyos_sched::task::WaitClass;
 
 use crate::io_uring::RingId;
 use crate::pipe::{PipeReader, PipeWriter};
-use crate::process::Pid;
 use crate::sched::payload::KWaitQueue;
-use crate::sched::waitqs::new_queue;
+use crate::sched::waitqs::{new_queue, wake_all};
 use crate::sync::Lock;
 
+use super::service::HandleQueue;
 use super::{KObjectVariant, ObjectCore, ZeroHandles};
 
 /// Unaccepted connections one port may hold.
@@ -38,12 +38,15 @@ pub const MAX_PENDING_CONNECTIONS: usize = 32;
 
 /// A connection nobody has accepted yet.
 ///
-/// It owns the server's two pipe ends, so a client that exits before the
-/// accept leaves the server something to read an EOF from rather than nothing.
+/// It owns the server's two pipe ends and its two handle queues, so a client
+/// that exits before the accept leaves the server something to read an EOF from
+/// rather than nothing — and a client that sent handles before the accept
+/// leaves them where the accept will find them.
 pub struct PendingConnection {
     pub rx: PipeReader,
     pub tx: PipeWriter,
-    pub client_pid: Pid,
+    pub inbox: Arc<HandleQueue>,
+    pub outbox: Arc<HandleQueue>,
 }
 
 /// Everything the two ends share. Neither end holds the other, so no `Arc`
@@ -123,6 +126,13 @@ impl Acceptor {
         self.shared.queue.lock().pop_front()
     }
 
+    /// The last handle to this acceptor has gone: nothing will ever be queued
+    /// again, so a thread parked in `accept` has to leave rather than wait for
+    /// a condition that has become permanently false.
+    pub fn closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
+
     pub fn has_pending(&self) -> bool {
         self.shared.has_pending()
     }
@@ -166,10 +176,22 @@ impl Connector {
 /// makes each waiting client's next write `Gone` and its next read `0`. A
 /// server that exited without serving is a bound of one process lifetime and
 /// nothing else.
+///
+/// **Every thread parked in `accept` is woken too.** They are parked on a
+/// condition — "the queue has something" — that has just become permanently
+/// false, and a wake is the only thing that lets them re-read `closed` and
+/// leave.
 impl ZeroHandles for Acceptor {
     fn on_zero_handles(&self) {
         self.shared.closed.store(true, Ordering::Release);
         let queued = core::mem::take(&mut *self.shared.queue.lock());
+        // The would-be server's inbox: nobody will ever hold the end that
+        // reads it, so a client's `SYS_HANDLE_SEND` on that connection must
+        // say `Gone` rather than queue.
+        for connection in &queued {
+            connection.inbox.close_now();
+        }
         drop(queued);
+        wake_all(&self.shared.acceptors);
     }
 }

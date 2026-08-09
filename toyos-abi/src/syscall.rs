@@ -30,10 +30,11 @@ pub const SYS_MARK_TTY: u64 = 28;
 // Syscall numbers 32-33 unused (formerly SYS_REGISTER_NAME/SYS_FIND_PID).
 // Syscall number 34 unused (formerly SYS_SET_SCREEN_SIZE).
 pub const SYS_GPU_PRESENT: u64 = 35;
-pub const SYS_ALLOC_SHARED: u64 = 36;
-pub const SYS_GRANT_SHARED: u64 = 37;
-pub const SYS_MAP_SHARED: u64 = 38;
-pub const SYS_RELEASE_SHARED: u64 = 39;
+// Syscall numbers 36-39 unused (formerly SYS_ALLOC_SHARED, SYS_GRANT_SHARED,
+// SYS_MAP_SHARED and SYS_RELEASE_SHARED: a shared-memory token was an id
+// treated as a capability and the grant list was a pid ACL. A region is a
+// handle now — [`SYS_SHM_CREATE`], [`SYS_SHM_MAP`], [`SYS_SHM_UNMAP`] — and
+// giving one away is [`SYS_HANDLE_SEND`]).
 pub const SYS_THREAD_SPAWN: u64 = 40;
 pub const SYS_THREAD_JOIN: u64 = 41;
 pub const SYS_CLOCK_REALTIME: u64 = 42;
@@ -64,8 +65,9 @@ pub const SYS_MUNMAP: u64 = 64;
 pub const SYS_KILL: u64 = 65;
 pub const SYS_READ_NONBLOCK: u64 = 66;
 pub const SYS_WRITE_NONBLOCK: u64 = 67;
-pub const SYS_PIPE_OPEN: u64 = 68;
-pub const SYS_PIPE_ID: u64 = 70;
+// Syscall numbers 68 and 70 unused (formerly SYS_PIPE_OPEN and SYS_PIPE_ID: a
+// pipe id was guessable, and openable by anyone its creator had ever spoken to.
+// A pipe end travels as itself now, over [`SYS_HANDLE_SEND`]).
 // Syscall numbers 71 and 84 unused (formerly SYS_AUDIO_SUBMIT and
 // SYS_AUDIO_POLL: the kernel no longer drives a sound card, so a period is
 // published into a ring the kernel built and there is nothing to submit).
@@ -76,7 +78,16 @@ pub const SYS_GET_ENV: u64 = 73;
 /// [`dup2`].
 pub const SYS_HANDLE_DUP_AT: u64 = 74;
 pub const SYS_CLOCK_EPOCH: u64 = 75;
-pub const SYS_SOCKET_CREATE: u64 = 76;
+/// Join a pipe read end and a pipe write end into one duplex `Connection`.
+/// See [`connection_join`].
+///
+/// Formerly `SYS_SOCKET_CREATE`, which took two pipe *ids* and is the same
+/// operation with the argument the capability model requires — the way
+/// [`SYS_HANDLE_DUP`] is `SYS_DUP` with a rights word. What is retired is
+/// addressing a pipe by a number anyone could guess, not making a duplex
+/// object out of two simplex ends: `std`'s `TcpStream` is one fd, and netd's
+/// data path is two pipes.
+pub const SYS_CONNECTION_JOIN: u64 = 76;
 pub const SYS_PIPE_MAP: u64 = 77;
 pub const SYS_NIC_RX_POLL: u64 = 78;
 pub const SYS_NIC_RX_DONE: u64 = 79;
@@ -140,11 +151,27 @@ pub const SYS_NAMESPACE_BUILD: u64 = 101;
 /// no other place to ask, and a name it was not given resolves to nothing.
 pub const SYS_NAMESPACE_OPEN: u64 = 102;
 
-// 103–110 are `SYS_HANDLE_SEND`/`RECV`, `SYS_SHM_CREATE`/`MAP`/`UNMAP` and
-// `SYS_PROCESS_WAIT`/`KILL`/`OPEN` — the handle-transfer, shared-memory and
-// process-object chunks. Left as gaps until those chunks add both the number
-// and its implementation, so no constant here names a syscall the kernel does
-// not answer.
+/// Move handles to the peer of a connection. See [`handle_send`].
+///
+/// The batch is queued on the connection, not interleaved with its bytes, so
+/// **handles are sent before the frame that announces them** and a receiver
+/// that has the frame already has the handles. The SDK's
+/// `Connection::send_with_handles` is that ordering written once.
+pub const SYS_HANDLE_SEND: u64 = 103;
+/// Take the oldest batch of handles the peer sent. See [`handle_recv`].
+pub const SYS_HANDLE_RECV: u64 = 104;
+/// Make a shared-memory region, sized up to whole 2 MiB pages.
+/// See [`shm_create`].
+pub const SYS_SHM_CREATE: u64 = 105;
+/// Map a region into the caller. Idempotent: a second call answers the first
+/// call's address. See [`shm_map`].
+pub const SYS_SHM_MAP: u64 = 106;
+/// Unmap a region from the caller. See [`shm_unmap`].
+pub const SYS_SHM_UNMAP: u64 = 107;
+
+// 108–110 are `SYS_PROCESS_WAIT`/`KILL`/`OPEN` — the process-object chunk.
+// Left as gaps until that chunk adds both the number and its implementation,
+// so no constant here names a syscall the kernel does not answer.
 
 /// Mint a device claim for a class, gated by [`Rights::DEVICE`] on a `SysCap`.
 /// Only `/bin/init` holds such a cap, so the set of processes that can ever
@@ -229,7 +256,7 @@ pub const MAX_ENDOWMENTS: usize = 32;
 pub const MAX_LABELS_LEN: usize = 4096;
 
 use crate::handle::Rights;
-use crate::{Pid, RawHandle};
+use crate::{Pid, RawHandle, HANDLE_INVALID};
 
 /// Syscall error with a specific code. Values occupy the top of the u64 range:
 /// error code N is encoded as `u64::MAX - N`. Any return value `>= u64::MAX - 255`
@@ -1040,78 +1067,100 @@ pub fn namespace_open(ns: RawHandle, name: &str) -> Result<RawHandle, SyscallErr
     .map(|v| RawHandle(v as u32))
 }
 
-/// Result of [`accept`]: the connection, and the connecting client's pid.
-///
-/// **The pid goes in chunk 6.** Peer identity is not the kernel's to assert;
-/// it survives only because the compositor and soundd still grant shared
-/// memory to it and have nothing else to grant to until handle transfer
-/// exists (`specs/capability-endowment-spec.md` §3.3).
-pub struct AcceptResult {
-    pub fd: RawHandle,
-    pub client_pid: u32,
-}
-
 /// Accept a queued connection. Blocks until there is one.
-pub fn accept(acceptor: RawHandle) -> Result<AcceptResult, SyscallError> {
-    let raw = syscall(SYS_ACCEPT, acceptor.0 as u64, 0, 0, 0);
-    if let Some(e) = SyscallError::from_u64(raw) {
-        return Err(e);
-    }
-    Ok(AcceptResult {
-        fd: RawHandle((raw & 0xFFFF_FFFF) as u32),
-        client_pid: (raw >> 32) as u32,
-    })
+///
+/// **It answers with the connection and nothing else.** Who connected is not
+/// the kernel's to assert: a server that wants to name its client reads it out
+/// of the protocol's first frame, where it is already the client's own claim
+/// about itself and already distrusted.
+pub fn accept(acceptor: RawHandle) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_ACCEPT, acceptor.0 as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
-/// Allocate a 2MB-aligned shared memory region. Returns an opaque token.
+/// Join a pipe read end and a pipe write end into one duplex connection.
+///
+/// The two ends stay open and this takes references of its own, so the caller
+/// closes what it handed in. The result carries no handle-transfer queue: a
+/// connection made this way has no peer holding the other half, so
+/// [`handle_send`] on one answers [`SyscallError::Gone`].
+pub fn connection_join(rx: RawHandle, tx: RawHandle) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_CONNECTION_JOIN, rx.0 as u64, tx.0 as u64, 0, 0))
+        .map(|v| RawHandle(v as u32))
+}
+
+/// Handles one [`handle_send`] may carry.
+///
+/// Policy on the primitive: a caller asking for one more is refused by name
+/// and never truncated to fit.
+pub const MAX_TRANSFER_HANDLES: usize = 8;
+
+/// Batches one direction of a connection may hold unreceived.
+pub const MAX_QUEUED_BATCHES: usize = 16;
+
+/// Move `handles` to the peer of `conn`.
+///
+/// Each handle must carry [`Rights::TRANSFER`], and so must `conn`. The move is
+/// all-or-nothing: a refusal leaves every handle where it was.
+///
+/// **Send the handles before the frame that announces them.** They travel in a
+/// queue of their own rather than interleaved with the connection's bytes, so a
+/// peer that has read the frame is guaranteed to find them only in that order.
+///
+/// [`Rights::TRANSFER`]: crate::handle::Rights::TRANSFER
+pub fn handle_send(conn: RawHandle, handles: &[RawHandle]) -> Result<(), SyscallError> {
+    check_unit(syscall(
+        SYS_HANDLE_SEND,
+        conn.0 as u64,
+        handles.as_ptr() as u64,
+        handles.len() as u64,
+        0,
+    ))
+}
+
+/// Take the oldest batch the peer sent, into `out`. Answers how many it wrote.
+///
+/// Never blocks: zero means nothing is queued right now. A batch larger than
+/// `out` is `InvalidArgument` and stays queued — `out` should be
+/// [`MAX_TRANSFER_HANDLES`] long.
+pub fn handle_recv(conn: RawHandle, out: &mut [RawHandle]) -> Result<usize, SyscallError> {
+    check(syscall(
+        SYS_HANDLE_RECV,
+        conn.0 as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        0,
+    ))
+    .map(|n| n as usize)
+}
+
+/// Make a shared-memory region and answer a handle to it.
 ///
 /// Fallible: a size the kernel cannot express in whole 2 MiB pages is
 /// `InvalidArgument` and memory it does not have is `ResourceExhausted`. A
 /// daemon reaches both through a client's request, so neither may be an
 /// assertion here.
-pub fn alloc_shared(size: usize) -> Result<u32, SyscallError> {
-    check(syscall(SYS_ALLOC_SHARED, size as u64, 0, 0, 0)).map(|token| token as u32)
+pub fn shm_create(size: usize) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_SHM_CREATE, size as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
-/// Grant another process permission to map a shared memory region.
+/// Map the region `shm` names into this process. Needs [`Rights::MAP`].
 ///
-/// Fallible: only the region's owner may grant, and only to a live process.
-pub fn grant_shared(token: u32, target_pid: Pid) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GRANT_SHARED, token as u64, target_pid.0 as u64, 0, 0))
-}
-
-/// Map a shared memory region into this process's address space.
+/// Idempotent: a second call answers the first call's address.
 ///
-/// Panics if the kernel refuses. Kept infallible because the `mio` fork calls
-/// it — an ecosystem fork is a consumer of this crate exactly as the monorepo
-/// is, and a signature change here breaks a build nothing in the tree greps.
-/// [`try_map_shared`] is the same call with the answer kept.
+/// [`Rights::MAP`]: crate::handle::Rights::MAP
 ///
 /// # Safety
 /// Caller must manage the returned pointer.
-pub unsafe fn map_shared(token: u32) -> *mut u8 {
-    match unsafe { try_map_shared(token) } {
-        Ok(ptr) => ptr,
-        Err(e) => panic!("map_shared failed: {e:?}"),
-    }
-}
-
-/// Map a shared memory region, reporting a refusal instead of panicking.
-///
-/// A token the caller was never granted is `PermissionDenied`, which is a
-/// thing callers and tests need to be able to observe rather than die on.
-///
-/// # Safety
-/// Caller must manage the returned pointer.
-pub unsafe fn try_map_shared(token: u32) -> Result<*mut u8, SyscallError> {
-    check(syscall(SYS_MAP_SHARED, token as u64, 0, 0, 0))
+pub unsafe fn shm_map(shm: RawHandle) -> Result<*mut u8, SyscallError> {
+    check(syscall(SYS_SHM_MAP, shm.0 as u64, 0, 0, 0))
         .map(|addr| core::ptr::with_exposed_provenance_mut(addr as usize))
 }
 
-/// Release this process's mapping of a shared memory region.
-pub fn release_shared(token: u32) {
-    let result = syscall(SYS_RELEASE_SHARED, token as u64, 0, 0, 0);
-    assert_eq!(result, 0, "release_shared failed");
+/// Unmap the region `shm` names from this process. Needs [`Rights::MAP`].
+///
+/// [`Rights::MAP`]: crate::handle::Rights::MAP
+pub fn shm_unmap(shm: RawHandle) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_SHM_UNMAP, shm.0 as u64, 0, 0, 0))
 }
 
 /// Query system information (memory, CPUs, processes).
@@ -1301,24 +1350,6 @@ pub fn write_nonblock(fd: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> 
     check(syscall(SYS_WRITE_NONBLOCK, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
-/// Open an existing pipe by internal ID. `mode`: 0 = read, 1 = write.
-/// Returns a new file descriptor for the pipe.
-pub fn pipe_open(pipe_id: u64, mode: u64) -> Result<RawHandle, SyscallError> {
-    check(syscall(SYS_PIPE_OPEN, pipe_id, mode, 0, 0)).map(|v| RawHandle(v as u32))
-}
-
-/// Get the internal pipe ID for a pipe/tty file descriptor.
-/// Used to share pipe access across processes via `pipe_open`.
-pub fn pipe_id(fd: RawHandle) -> Result<u64, SyscallError> {
-    check(syscall(SYS_PIPE_ID, fd.0 as u64, 0, 0, 0))
-}
-
-/// Create a socket file descriptor from two pipe IDs (rx for reading, tx for writing).
-/// The kernel bumps refcounts on both pipes. Caller should close original pipe fds after this.
-pub fn socket_create(rx_pipe_id: u64, tx_pipe_id: u64) -> Result<RawHandle, SyscallError> {
-    check(syscall(SYS_SOCKET_CREATE, rx_pipe_id, tx_pipe_id, 0, 0)).map(|v| RawHandle(v as u32))
-}
-
 /// Map a pipe's shared-memory ring buffer into this process's address space.
 /// Returns a pointer to the `RingHeader` at the start of the mapped region.
 ///
@@ -1367,14 +1398,38 @@ pub fn tls_alloc_block(module_id: u64) -> u64 {
     syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0)
 }
 
-/// Create an io_uring instance with the given queue depth (must be power of 2, max 256).
-/// Returns (ring_fd, shared_memory_token). The shared memory contains the SQ/CQ rings
-/// and SQE array; map it with `map_shared()` to access them.
-pub fn io_uring_setup(depth: u32) -> Result<(RawHandle, u32), SyscallError> {
-    let raw = check(syscall(SYS_IO_URING_SETUP, depth as u64, 0, 0, 0))?;
-    let fd = RawHandle((raw & 0xFFFF_FFFF) as u32);
-    let token = (raw >> 32) as u32;
-    Ok((fd, token))
+/// A ring and where its SQ/CQ/SQE page is mapped.
+///
+/// **The ring owns its page and the kernel maps it at setup.** It used to hand
+/// back a shared-memory token the caller mapped itself, which is the only place
+/// io_uring ever needed shared memory to be a separate thing with a separate
+/// lifetime.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IoUringSetup {
+    pub handle: RawHandle,
+    pub _pad: u32,
+    pub vaddr: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<IoUringSetup>() == 16);
+
+/// Create an io_uring instance with the given queue depth (a power of two, at
+/// most 256), and map its rings.
+///
+/// # Safety
+/// Caller must manage the returned pointer; it stops being mapped when the
+/// last handle to the ring closes.
+pub unsafe fn io_uring_setup(depth: u32) -> Result<(RawHandle, *mut u8), SyscallError> {
+    let mut out = IoUringSetup { handle: HANDLE_INVALID, _pad: 0, vaddr: 0 };
+    check_unit(syscall(
+        SYS_IO_URING_SETUP,
+        depth as u64,
+        &raw mut out as u64,
+        0,
+        0,
+    ))?;
+    Ok((out.handle, core::ptr::with_exposed_provenance_mut(out.vaddr as usize)))
 }
 
 /// Submit SQEs and/or wait for completions on an io_uring instance.
