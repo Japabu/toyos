@@ -1873,6 +1873,28 @@ what makes the mio waker's fallible `pipe()` edit land in the same chunk. std's
 `Fd`→`Handle` and the mio/socket2 fork edits land here. Bad-handle policy is
 log-and-error for now.
 
+**Split in two on 2026-08-09, and the first half is done.** The chunk has a
+seam in it the plan did not name: the `Fd` -> `RawHandle` rename touches the
+ABI, the SDK, userland, `userland/libc`, the test binaries and all three
+repositories, and **the kernel never named `toyos_abi::Fd` at all**. So the
+rename is green on its own with the kernel untouched, and it landed that way —
+`rust` @ 4288885f, `mio` @ 2517dfaf, `socket2` @ 2ad5af0d, 298 of 298.
+
+What is left of chunk 2 is the whole kernel half: `FdTable` and `Descriptor`
+become `HandleTable` and `KObjectRef`, fd numbers become slot/generation
+encodings, `io_uring::Source` keys become `Koid`s. Two things the first half
+already knows about it:
+
+- **§6.6's `AsRawFd` -> `AsRawHandle` row is not done and should not be.**
+  `std::os::fd::RawFd` is cross-platform and is what `socket2` implements
+  `AsRawFd` for; changing it widens the fork estate's exposure, which §0's
+  constraint exists to narrow. The sign crossing lives at the `toyos_abi`
+  boundary instead, one bit-preserving cast per call.
+- **`library/std/src/os/fd/owned.rs` is a ninth file §6.6's table does not
+  list** — two `toyos_abi::Fd` call sites in `cfg(target_os = "toyos")` arms of
+  a cross-platform file. `rg -o 'toyos_abi::Fd' rust/library` -> 9 hits counted
+  the *imports*, not the call sites.
+
 **Two transitional objects exist only between here and their deleter, and saying
 so is what keeps this chunk green.** `ListenerObject` is a `KObjectRef` variant
 in chunk 2 and is deleted by chunk 3's `Acceptor`/`Connector` — §1.3 describes the
