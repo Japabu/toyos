@@ -1166,7 +1166,7 @@ CLAUDE.md's "never add or change a syscall without discussion."
 - **`toyos-abi/src/ring.rs`.** The `modulus()` = `2 * capacity` argument is
   spelled out at `:44-57` and gated by three host tests, one of which actually
   walks the cursor past `2^32`. `capacity: u32` is non-atomic and written once in
-  `init`. Nothing to improve. (Known-issues §263 tracks a separate wrap concern;
+  `init`. Nothing to improve. (A separate wrap concern was on record at the time;
   not re-filed.)
 - **`SyscallError::from_u64`'s `_ => Some(Self::Unknown)`.** Correct
   forward-compatibility — an older binary meeting a newer kernel gets "an error,

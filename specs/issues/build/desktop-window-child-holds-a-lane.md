@@ -121,8 +121,8 @@ mechanism of "whichever other desktop lands beside it loses its typing window".
 
 `qemu::budget` also scales by how fast the host is now, not only by how many
 guests are on it (`specs/ci-plan.md` §7.2). Neither change touches
-`screen_blocked_dump`, `i8042_mouse`, `screen_console_scroll` or the rest of the
-list above, whose verdicts are elsewhere — this closes the desktop family's
+`screen_blocked_dump`, `i8042_mouse`, `screen_console_scroll` or the rest of
+`parallel-tests-red-under-other-suites`' list, whose verdicts are elsewhere — this closes the desktop family's
 share of it and no more. Measured after: four desktop tests wide, 16/27/28/31 s
 and 18/41/48/20 s in two runs, all green; a 291-test suite at width 12 in 478 s
 with `desktop_window_child` no longer in the long tail.

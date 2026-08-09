@@ -508,7 +508,7 @@ The most-failing names across every transcript in this session:
 24  audio_tone (smp=8)           13  i8042_keyboard
 ```
 
-**Audio is 108 of the top-ten failure count.** Known-issues already records that
+**Audio is 108 of the top-ten failure count.** It was already on record that
 gate A can fail a run on `drains` alone, with no gap and no underrun — a per-run
 failure that carries no evidence of harm. **This audit's contribution is the
 measurement: that defect is the single largest source of red full runs in the

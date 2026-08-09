@@ -536,7 +536,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // machine out of it, so a process that can write it can make the machine
     // unbootable. The log volume is not — it is a diagnostic partition whose
     // worst loss is the diagnostic, and `toybox` writes to it. That the log
-    // file itself is unprotected is the residual; see known issues.
+    // file itself is unprotected is the residual; see
+    // `specs/issues/boot-media/log-is-userland-writable.md`.
     match fat32_adapter::mount(Role::Boot) {
         Some(fs) => vfs::lock().mount(Role::Boot.mount(), Box::new(fs), UserAccess::KernelOnly),
         None => log!("boot-volume: not mounted; the kernel has no /boot this boot"),

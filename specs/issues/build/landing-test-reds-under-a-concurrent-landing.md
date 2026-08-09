@@ -33,6 +33,6 @@ second process rather than by waiting for a peer.
 
 Cost while open: a landing whose gate is otherwise clean reds on a three-second
 `--lib` test. That is the cheapest possible red, but it is indistinguishable at a
-glance from a real one. Same class as `specs/issues/design-debt/`'s wall-clock reds — a verdict that
-depends on what else the host is doing — except this one is in `--lib`, which is
-meant to be the fast hermetic half.
+glance from a real one. Same class as `parallel-tests-red-under-other-suites`'s
+wall-clock reds — a verdict that depends on what else the host is doing — except
+this one is in `--lib`, which is meant to be the fast hermetic half.

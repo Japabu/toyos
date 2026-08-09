@@ -25,4 +25,4 @@ any disk whose block 0 carries `BCFS`, version 1, and a CRC32C that checks out.
 A CRC is not authentication — whoever writes the image writes the CRC — so the
 split is *a token naming this device authorises a format, a checksum anybody can
 compute authorises a read-write mount*, and both actions write to the disk.
-Detail and a recommendation are below, under "`probe()` mounts on a checksum".
+Detail and a recommendation are in `probe-mounts-on-a-checksum`.

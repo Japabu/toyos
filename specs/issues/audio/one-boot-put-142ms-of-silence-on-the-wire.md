@@ -6,7 +6,8 @@ opened: 2026-08-03
 
 # One boot put 142 ms of silence on the wire, and the host was not quiet
 
-Observed 2026-08-03 while negative-controlling the change above, on tree `602d4e1`
+Observed 2026-08-03 while negative-controlling the change that made gate A's fast
+tier fail on harm rather than on a counter, on tree `602d4e1`
 with a harness-only diff — kernel, soundd and the tone client identical to `main`.
 `audio_tone_load` smp=1, one boot of four:
 
@@ -38,7 +39,7 @@ temporary, so the numbers above are the durable record.
 The same session's landing gate carries a smaller instance of the same shape and
 no harm at all: `audio_tone` smp=8 at `wake_lat 17050us`, 0.73 pipeline depths and
 2.1x the worst wake in that config's recorded 30-run sample, with `gaps: none`,
-`underruns` 0 and `drains` 0. Under the verdict above it passes and is printed,
+`underruns` 0 and `drains` 0. Under the harm verdict it passes and is printed,
 which is the intended reading — one boot, one sample, no audio lost.
 
 The nearest suspect on file is `specs/issues/boot-media/`'s ESP-log flush on the idle path and the

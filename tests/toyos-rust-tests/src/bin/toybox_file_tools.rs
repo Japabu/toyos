@@ -29,7 +29,8 @@
 //! Every directory this test makes gets a file put in it first. An empty
 //! directory does not stat as one — `sys_readdir` answers 0 for "empty" and for
 //! "no such path" alike — so a `cp x emptydir/` would silently write a *file*
-//! named `emptydir`. That is a kernel defect, recorded in known issues; it is
+//! named `emptydir`. That is a kernel defect, recorded in
+//! `specs/issues/kernel/empty-directory-does-not-stat.md`; it is
 //! designed around here rather than asserted, because it is not `cp`'s.
 
 use std::fs;

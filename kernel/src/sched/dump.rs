@@ -307,7 +307,17 @@ pub(super) fn deaf_window() {
     /// bounded, so the CPU rejoins and the guest still shuts down.
     const DEAF_NS: u64 = 400_000_000;
     /// How long cpu0 waits for the victim to reach its idle loop and go deaf.
-    const ACK_BUDGET_NS: u64 = 100_000_000;
+    ///
+    /// **A kicked CPU does not arrive at the top of its loop promptly and there
+    /// is no bound to give**: the pass it is finishing runs
+    /// `flush_log_file_if_affordable` with preemption off, and on a machine
+    /// whose `/log` is a USB device that is a string of bulk transfers. CI run
+    /// `31284962381` measured 251 ms of it — cpu0 gave up at 11.417 s and the
+    /// victim went deaf at 11.568 s, so nothing was staged, no dump ran, and a
+    /// CPU sat deaf for 400 ms for nobody. So this is generous and, more to the
+    /// point, no longer the whole answer: expiring it leaves the machine as it
+    /// found it and lets the next pass ask again.
+    const ACK_BUDGET_NS: u64 = 1_000_000_000;
 
     const IDLE: u64 = 0;
     const ASKED: u64 = 1;
@@ -329,11 +339,16 @@ pub(super) fn deaf_window() {
             .is_ok()
         {
             let began = crate::clock::nanos_since_boot();
-            let until = began + DEAF_NS;
+            // The counter and not the nanoseconds, because half of what this
+            // actuator stages is *where* the CPU is: `nanos_since_boot` divides
+            // 128 bits, which is a call into `compiler_builtins`, and a probe
+            // that samples the rip then names `u128_div_rem` for a CPU that
+            // never left this loop. `rdtsc` and a 64-bit compare inline.
+            let until = crate::clock::tsc_deadline(DEAF_NS);
             // SAFETY: the actuator's whole content. Interrupts come back on
             // below and the loop is bounded by the clock.
             unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
-            while crate::clock::nanos_since_boot() < until {
+            while crate::arch::cpu::rdtsc() < until {
                 core::hint::spin_loop();
             }
             unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
@@ -359,8 +374,20 @@ pub(super) fn deaf_window() {
     let deadline = crate::clock::nanos_since_boot().saturating_add(ACK_BUDGET_NS);
     while STAGE.load(Ordering::Acquire) != DEAF {
         if crate::clock::nanos_since_boot() >= deadline {
-            log!("dump-deaf-cpu: cpu{victim} never reached its idle loop to be deafened");
-            return;
+            // Take the ask back, and only then give up. The CAS is what makes
+            // the give-up safe rather than a second race: if it fails the
+            // victim has just gone deaf and the window is open after all, so
+            // this asks for the report instead of leaving a deaf CPU nobody
+            // looked at.
+            if STAGE
+                .compare_exchange(ASKED, IDLE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                log!("dump-deaf-cpu: cpu{victim} did not reach its idle loop in time; asking again");
+                FIRED.store(false, Ordering::Release);
+                return;
+            }
+            break;
         }
         core::hint::spin_loop();
     }

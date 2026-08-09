@@ -28,7 +28,8 @@ Three consequences that shape everything after:
   signature that can destroy a disk while claiming to answer a question is the
   worst version of "code must not lie about itself".
 - **Nothing here may add work to the logging hot path or to `idle_loop`.**
-  Known issues §10 measures `log_file`'s flush at **2.0–9.7 ms** against a
+  `specs/issues/boot-media/log-flush-is-unbounded.md` measures `log_file`'s
+  flush at **2.0–9.7 ms** against a
   **23.219 ms** DMA pipeline, in front of `pass()`. A follower that wakes a task
   from `write_chunk` — which runs from ISRs under arbitrary kernel locks — is
   not a feature that needs tuning; it is one that must not exist. §3 is designed
@@ -52,7 +53,7 @@ syscall is the small part.
 | Disk identity | capacity, logical block size | NVMe Identify Controller is *issued and thrown away* — no model, serial or firmware revision survives |
 | Partitions | `gpt::{FIRMWARE, LOG_GUID, RESOLVED}`; two `Volume`s | **The table.** `disk_guid`, `type_guid`, `index`, `used_entries` and every non-matching entry are logged and dropped. `toyos-gpt` has no list API and never parses the 72-byte UTF-16 name |
 | Mounts | `Vfs.mounts: HashMap<String, Box<dyn FileSystem>>` | **Enumerability, and everything but the name.** No iterator; no backing device, no extent, no kind. `mount → device` is reconstructible for `boot`/`log` only, via `Role::volume()` |
-| Log sink | `Sink { file_id, size, blocked_since }`, `FILE_OWED`, `FILE_DROPPED`, `DROPPED_BYTES`, `OWED` | Flush duration — the number known issues §10 had to measure by hand |
+| Log sink | `Sink { file_id, size, blocked_since }`, `FILE_OWED`, `FILE_DROPPED`, `DROPPED_BYTES`, `OWED` | Flush duration — the number `specs/issues/boot-media/log-flush-is-unbounded.md` had to measure by hand |
 | Input sources | `IN_USE: [AtomicU64; 4]`, `BUTTONS: [AtomicU8; 256]`, `HELD: Lock<[u64; 4]>`, `layout_name()` | **The reverse map.** `IN_USE` says which source numbers are live and nothing about who owns them; the join to `HidDevice.role` needs a walk of `XHCI` |
 | Clock | TSC period in `TSC_PERIOD_FS`, `calibrated()` | TSC frequency in Hz (logged at init, never stored); the HPET mapping (a local in `clock::init`); any realtime↔monotonic offset |
 
@@ -104,7 +105,7 @@ patterns to copy and one of them is a live wart:
   records occupy `buf[..records[0].path_offset]`, which is where the count comes
   from without a second number in the return. `query_modules_size` is the gate.
 - **`sys_process_stats` is a destructive read** of an exited direct child, once
-  (known issues §5).
+  (`specs/issues/diagnostics/process-stats-exited-child-only.md`).
 
 The return value is a length in bytes and never a count, because a count cannot
 size a retry when the records carry packed strings.
@@ -509,11 +510,12 @@ for, and scraping a daemon's `printf` was never a good way to ask it anything.
 `specs/metal-log-capture.md` asks how to get bytes off a machine with no 16550,
 and answers: xHCI DbC as the primary (gated on one host-side check the owner has
 to run), the paged on-screen console as the complement, netconsole and CDC-ACM
-rejected. Known issues §10 records what is still open: *"Every refusal on the
-path is a `log!` into a ring whose only sinks are a 16550 the T14 does not have,
-the on-screen console the compositor claims tens of milliseconds after the last
-boot checkpoint, and `/log` — the thing that had failed. A working desktop and no
-evidence is the designed outcome of that arrangement. That is task #95."*
+rejected. `specs/issues/hardware/kernel-log-unreadable-once-userland-owns-the-screen.md`
+records what is still open: every refusal on the path is a `log!` into a ring
+whose only sinks are a 16550 the T14 does not have, the on-screen console the
+compositor claims tens of milliseconds after the last boot checkpoint, and
+`/log` — the thing that had failed. A working desktop and no evidence is the
+designed outcome of that arrangement. That is task #95.
 
 `SYS_LOG_READ` adds a **fourth sink, and the first one that needs no hardware and
 no host**: any process on the machine can read the retained ring. It is not a
@@ -751,11 +753,13 @@ Said plainly, because overclaiming a safety property is worse than not having it
   witness, and any process can call `SYS_DISK_ADOPT`. The witness defends against
   *mistake* and against *TOCTOU*; it does not defend against a hostile process,
   because ToyOS has no answer to "which processes may do this" — that is
-  `specs/capability-handles-spec.md`'s question. Known issues already records the
+  `specs/capability-handles-spec.md`'s question.
+  `specs/issues/boot-media/log-is-userland-writable.md` already records the
   neighbouring hole: `/boot` has no permission model and a guest binary
   truncated `kernel.elf` to five bytes. Adopt does not make that worse and does
   not fix it.
-- **It does not make mounting a crafted volume safe.** Known issues §1 lists
+- **It does not make mounting a crafted volume safe.**
+  `specs/issues/isolation/bcachefs-untrusted-input-holes.md` lists
   three residual untrusted-input holes in `bcachefs` — an unchecked extent that
   reaches a block read, a `Vec` sized from an on-disk file size, an unchecked
   multiply — and the recommendation to tighten `Superblock::check` from `<=` to
@@ -766,7 +770,8 @@ Said plainly, because overclaiming a safety property is worse than not having it
 
 ### 4.7 The blocker to sequence against
 
-Step 3 writes `\toyos\home.guid` to the ESP, and known issues §10 records that
+Step 3 writes `\toyos\home.guid` to the ESP, and
+`specs/issues/boot-media/boot-exists-only-on-a-usb-boot.md` records that
 **`/boot` exists only on a machine that boots from USB**: `fat32_adapter::mount`
 resolves the volume through `usb_storage::open` and has no second arm, because a
 machine that boots from its internal disk has its NVMe taken by
@@ -838,7 +843,8 @@ owner's instruction and also what the section deserves.
 ## 8. What this document does not build
 
 - **`kill` and `top`** — excluded by the owner.
-- **A live per-process stats query.** Known issues §5: `SYS_PROCESS_STATS`
+- **A live per-process stats query.**
+  `specs/issues/diagnostics/process-stats-exited-child-only.md`: `SYS_PROCESS_STATS`
   reports an exited direct child, once, and cannot sample a daemon. That is a
   layer-1 gap in the diagnostics roadmap, it is real, and it is not this task.
   `SYS_QUERY` is deliberately about *the machine*, not about processes; folding

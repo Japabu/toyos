@@ -9,6 +9,13 @@ opened: 2026-08-03
 Unlink a file while a process is still demand-paging it and the backing keeps
 serving reads.
 
+**`/home` — the information disclosure — is closed.** `NvmeBacking` held
+`extents: Vec<Extent>` captured at open and turned a file offset into an
+absolute block with no re-validation, so unlink returned those blocks to
+bcachefs's `BitmapAllocator`, the next file took them, and the stale backing
+read whatever was there. Reproduced from userland with `open`, `rm` and a write:
+`byte 0 read through the deleted file's descriptor is 0x5c — the backing served
+another file's data`.
 
 `file_backing::FileBlocks` is now the one extent list every backing for a name
 reads through, and `BcacheFsAdapter` revokes it wherever the filesystem hands

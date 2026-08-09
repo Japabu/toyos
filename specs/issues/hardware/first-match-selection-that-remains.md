@@ -1,5 +1,5 @@
 ---
-status: open
+status: none
 kind: rejected
 opened: 2026-08-01
 ---

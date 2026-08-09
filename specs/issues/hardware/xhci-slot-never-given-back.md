@@ -13,10 +13,12 @@ below — so the port remembers the slot whether or not a device came of it, and
 `teardown_port` disables it. `xhci_hotplug` shows the controller handing the
 same slot id straight back to the next device plugged into that controller.
 
+What that closes is the hotplug half, which was the half that grows: without it
+every plug cycle cost a slot and 64 of them exhausted a PCH controller. What it
 does not close is a device that is **still plugged in** after a refused
 enumeration — a hub, a camera, a fingerprint reader, or any of the eleven paths
-— which keeps its slot until it is pulled. That is the rest of this entry, unchanged,
-and the count is still 11.
+— which keeps its slot until it is pulled. That is the rest of this entry,
+unchanged, and the count is still 11.
 
 `init_device` enables a slot for every connected port and issues no Disable
 Slot, on any path: not for the devices it walks past (a hub, camera or

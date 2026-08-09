@@ -12,8 +12,8 @@ exceeds a limit its own design implies** — a different and sharper statement.
 
 The bound is derived from granularities the policy itself picked:
 `lag_spread + (ΣT_i + 1) × (QUANTUM + max KernelSection + 2 × RUN_CHUNK)`. It is
-crossed at **4, 6, 8 and 12 CPUs**, by 116, 324, 418 and 634 ms (bold in the table
-above).
+crossed at **4, 6, 8 and 12 CPUs**, by 116, 324, 418 and 634 ms (bold in
+`per-process-fair-split-is-the-policy`'s table).
 
 **The gate handles this honestly rather than hiding it**, which is the part worth
 preserving. It reds on `max(derived, recorded allowance)`, so a sampled scenario

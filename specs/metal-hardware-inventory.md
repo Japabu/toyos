@@ -522,8 +522,9 @@ the metal roadmap's raw material; sequencing is the owner's.
    and none is on any milestone.
 
 Two further gaps, one from the logs and one not. **The Thunderbolt xHCI has never
-had a device on it**, so hotplug — which does nothing at all today, `specs/issues/`
-§8 — has never been exercised on this machine either; that one is the logs'.
+had a device on it**, so hotplug — which does nothing at all today,
+`specs/issues/hardware/hotplug-blocks-a-scheduler-pass.md` — has never been
+exercised on this machine either; that one is the logs'.
 **There is no ACPI SCI**, so the lid and the power button raise nothing; that one
 is `specs/metal-boot-plan.md` M2's accepted limitation, and these logs neither
 confirm nor deny it — all they show is `ACPI: PM1a=0x1804 SLP_TYPa=7`, which is

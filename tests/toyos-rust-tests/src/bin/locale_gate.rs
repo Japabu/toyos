@@ -115,7 +115,7 @@ fn spawn_locale(args: &[&str], surface_name: &str) -> Child {
 
 fn layout(mut surface: Surface, name: &str) {
     // `Command::output()` asks `spawn` for the pipe and drops it, so its
-    // stderr is always empty (`specs/issues/build/`).
+    // stderr is always empty (`specs/issues/kernel/command-output-empty-stderr.md`).
     let out = spawn_locale(&["swiss-german"], name)
         .wait_with_output()
         .expect("locale_gate: locale never exited");

@@ -238,11 +238,22 @@ fn leak_arm(round: u32) -> Result<(), String> {
 /// Arm 2. A process dies with an unmasked x87 exception pending; the next one
 /// executes a waiting instruction and must live.
 fn fault_arm(round: u32) -> Result<(), String> {
-    // The child's own verdict is not asserted: it dies on a machine that raises
-    // #MF and survives on one that does not, and `specs/issues/isolation/` has an
-    // unexplained instance of the latter. Either way it leaves the control word
-    // unmasked, which is what the next process has to be protected from.
-    let _ = Command::new("/bin/test_rs_fault_gate_child").arg("mf").status();
+    // The child's own verdict is this arm's precondition rather than a bonus
+    // check: a child that survives its `fwait` reaches the `fninit` two
+    // instructions later, which masks everything again and leaves the next
+    // process nothing to be protected from. Unasserted, this arm passes
+    // vacuously on exactly the machine it is for.
+    let child = Command::new("/bin/test_rs_fault_gate_child")
+        .arg("mf")
+        .status()
+        .unwrap_or_else(|e| panic!("failed to spawn fault_gate_child mf: {e}"));
+    require(!child.success(), || {
+        format!(
+            "fault, round {round}: the #MF child lived, so it left the FPU masked and clean \
+             and the arm below asserts nothing (exit {:?})",
+            child.code(),
+        )
+    })?;
     let status = spawn_mode("fldcw");
     require(status.success(), || {
         format!(

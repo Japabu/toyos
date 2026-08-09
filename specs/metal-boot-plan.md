@@ -66,8 +66,7 @@ controller is not.
   the screen, so a screendump is the product there rather than a proxy for it. What
   the screen carries is the *report*, not the boot log: the ring is drained
   continuously, so only what the panic handler captured before the drain is
-  there (known issues §2). Detail:
-  `kernel/src/drivers/panic_console/mod.rs`.
+  there. Detail: `kernel/src/drivers/panic_console/mod.rs`.
 - **M1 — "metal-sim" QEMU profile. BUILT.** `cargo run -- --metal-sim` and
   `BootOptions { profile: Profile::Metal }`: firmware GOP, NVMe, xHCI with the
   boot stick on it, q35's i8042, and no virtio device and no USB HID anywhere.
@@ -80,7 +79,8 @@ controller is not.
   **The profile keeps its 16550, deliberately** (reversed 2026-07-31; it was
   mute by default until then). The T14 has no UART, but every defect metal-sim
   has actually found came from the *device shape*, and the absent console found
-  exactly one thing — the observability gap now filed in known issues §8. With
+  exactly one thing — the observability gap now filed as
+  `specs/issues/panic-path/no-console-between-boot-and-terminal.md`. With
   a console the `===TEST_START===` protocol works, so the machine that gets
   flashed is the machine the input tests run on: all five i8042 tests and
   `metal_sim_input` boot this profile. `--metal-sim --mute` takes the 16550
@@ -93,10 +93,14 @@ controller is not.
   it and `kernel_main` panicked on that — which is the T14's ordinary state,
   since its keyboard is PS/2 and its touchpad I2C-HID. soundd, netd and sshd
   each panicked on their absent device; they now print one line and exit 0.
-  Three residuals are filed in known issues §8: a running system on a
-  serial-less machine has no output channel at all, keyboard/mouse claims
-  succeed with no hardware behind them, and every network client burns a second
-  of retry before giving up. The 2048x2048 mode policy was left alone.
+  Three residuals are filed: a running system on a serial-less machine has no
+  output channel at all
+  (`specs/issues/panic-path/no-console-between-boot-and-terminal.md`),
+  keyboard/mouse claims succeed with no hardware behind them
+  (`specs/issues/hardware/device-claim-succeeds-with-no-device.md`), and every
+  network client burns a second of retry before giving up
+  (`specs/issues/hardware/network-clients-pay-a-boot-retry.md`). The 2048x2048
+  mode policy was left alone.
 
   Still missing from the *simulation*: input. q35 gives the guest an i8042 and
   ToyOS has no driver for it, so metal-sim has no keyboard and no mouse at all.
@@ -234,7 +238,8 @@ controller is not.
   health line now names the bytes that produced no event, and revises itself
   once if a later byte does decode — `i8042_undecoded_bytes` gates both, by
   injecting Pause, the one key whose whole sequence is swallowed by design.
-  Filed in known issues §8; the next diag boot answers it in one line.
+  Filed as `specs/issues/hardware/t14-keyboard-will-not-report-its-scancode-set.md`;
+  the next diag boot answers it in one line.
 
   What is left of R1 is the residue: `0xEE` is a *response* byte, and the only
   defined meaning of `0xEE` on this wire is ECHO's reply, so an EC that answers
@@ -321,7 +326,8 @@ controller is not.
   a block was enumerated to completion — but not that a HID survives the
   shortage and delivers, because the one device that fits is the boot stick:
   QEMU puts it on the first SuperSpeed port register, ahead of every USB2 one,
-  so it takes slot 1 and binds nothing. One xHCI item remains in known issues §8
+  so it takes slot 1 and binds nothing. One xHCI item remains
+  (`specs/issues/hardware/hotplug-blocks-a-scheduler-pass.md`)
   and it is still M4-shaped: hotplug does nothing at all, and became reachable
   when M1 removed the zero-HID panic. The USBLEGSUP ownership handoff is built
   (`xhci/legacy.rs`), runs before the HCRST, and disarms the controller's SMI

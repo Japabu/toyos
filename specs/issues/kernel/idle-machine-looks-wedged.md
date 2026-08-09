@@ -7,7 +7,9 @@ task: 156
 
 # Seven T14 boots in seven minutes, and the signature everyone has read as a wedge is what a healthy idle machine writes
 
-**Superseded by the CLOSED entry above**, which found the defect. Kept because
+**Superseded by #156, which found the defect** — cpu0 arming the LAPIC one-shot
+for less time than it takes to arm it, and the Ring 0 stub replaying that
+forever. Kept because
 its elimination of the log-shape argument is what made the heartbeat build worth
 flashing, and because it is the record of three rounds that read the ending of a
 quiescent machine's log as a wedge.
