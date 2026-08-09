@@ -18,19 +18,44 @@ Four moves:
    console, the diagnostic tools and the test harness.
 
 Every number below comes from a command run against this worktree
-(`wt/toyos-logd`, at `19c761e`, which is `origin/main`) on 2026-08-09, or from an
+(`wt/toyos-logd`, at `19c761e`; `origin/main` has since moved to `0e48d2e`) on
+2026-08-09, or from an
 entry in `specs/issues/` that records its own measurement. Where a figure is a
 prediction it says so and names the chunk that must measure it. Every figure was
 re-derived by the adversarial review on 2026-08-09; §2.2's sizing derivation was
 wrong and is replaced, and the corrections it made are marked **CONFIRMED**
 where a command established them.
 
-**This spec implements after two other branches land** and is written against
-their world: `wt/toyos-endow` (`specs/capability-endowment-spec.md`, read at
-`8231e90`) and `wt/toyos-compl` (`specs/completion-architecture-spec.md`, read at
-`e96cd51` — the tip *after* its own adversarial review, which moved several
-things this spec depends on). §12 is the reconciliation, and it states exactly
-which parts of that second spec's C9 and C12 this absorbs.
+**This spec implements after one other branch and before the other, and the
+order was ruled on 2026-08-09: `endowment → log → completions`**, where it had
+been `endowment → completions → log`. So the baseline is `main` after
+`wt/toyos-endow` (`specs/capability-endowment-spec.md`, read at `8231e90`), and
+`wt/toyos-compl` (`specs/completion-architecture-spec.md`, read at `9890d5e`)
+opens on the tree this branch leaves.
+
+**The reasoning, recorded here so neither reader re-derives it.** Completions
+cannot compile with the kernel file sink alive. Its §11.4 traces
+`idle_loop → flush_log_file_if_affordable → log_file::poll → vfs → VOLUMES →
+xhci::with_disk → XHCI.lock()`: after its C7+C8 `with_disk` needs a `&Parkable`
+and the idle loop has no way to make one, and `SINK`'s raw guard is held across
+the park. Its two available shapes each cost something real — moving the drain
+to `iod` imports §13.4's regression list into a branch that has nothing to do
+with logging and forces re-pointing `apic.rs:160`'s `wait_for_log_file` and its
+kick loop (`apic.rs:146`); keeping the append on the idle loop needs its C12
+before its C7+C8 and rests on a tail-page-resident premise nothing enforces.
+What *this* branch needs from that one is only §2.6a's lock-free single-waiter
+post for `klogd`'s wake, and §2.6a already names its fallback. **A performance
+fallback whose shape exists in the tree today beats a compilation blocker with
+two costly workarounds** — and log-first *removes* the work rather than
+relocating it, because completions never touches `log_file.rs`: L6 has already
+deleted it. That is completions' own §11.4 third option, taken.
+
+§12 is the reconciliation, and the order change changes what it is. Completions
+is **unlanded** when this branch opens, so its rows are no longer things L0
+re-checks against a merged tree — they are **obligations this branch places on
+that one**, checkable when it opens. §12.6 is the new section: every primitive
+this branch does without because it does not exist yet, what it does instead,
+and what completions converts afterwards.
 
 ---
 
@@ -68,8 +93,11 @@ which parts of that second spec's C9 and C12 this absorbs.
 
 What that deletes: the kernel's filesystem write path from the log
 (`log_file::SINK → vfs::VFS → fat32_adapter::VOLUMES → xhci::XHCI`, preemption
-off for a device round trip), the idle loop's two log statements and the four
-pre-`hlt` conditions that exist to serve them, the "affordable flush" heuristic
+off for a device round trip), the idle loop's two log statements and **two of
+its four** pre-`hlt` conditions — `log_ring::has_pending` (`driver.rs:523`) and
+`log_file_flush_due` (`:552`), the two that exist to serve the log; the other
+two are `i8042::verdict_due` (`:534`) and `xhci::port_work_pending` (`:564`) and
+belong to the completion branch (§8.1, §12.2) — the "affordable flush" heuristic
 and its deferral ceiling, the shared byte ring that lets a userland `println!`
 land inside a kernel line, and the harness detector built to notice when it does.
 
@@ -155,12 +183,14 @@ cursor move. That the tree already knows this is recorded ten lines above it, at
 `OWED` is … the `lock xadd` cost **350 ms of boot**"* — the module avoided the
 second RMW and kept the first.
 
-The design below removes it in `Drain::Thread` and adds **one locked operation
-per `klogd` park** rather than per record (§2.6a); `Drain::Inline` keeps one, in
-`BackendGuard`, for the boot's 185 records on one CPU (§2.3). **Prediction, to be
-measured by L1's boot A/B and not asserted here: removing the per-record CAS is
-worth a similar saving to the one that issue records.** If it is not, the
-measurement is the finding.
+The design below removes it in `Drain::Thread` and adds **nothing atomic on the
+producer's path at all**: with §2.6a resolved to its fallback, `emit`'s whole
+contribution to the wake is one relaxed store, and the locked operation lives in
+`drain_irqs`'s post — at most one per `klogd` park, on a CPU already inside a
+scheduler pass. `Drain::Inline` keeps one CAS, in `BackendGuard`, for the boot's
+185 records on one CPU (§2.3). **Prediction, to be measured by L1's boot A/B and
+not asserted here: removing the per-record CAS is worth a similar saving to the
+one that issue records.** If it is not, the measurement is the finding.
 
 ---
 
@@ -402,14 +432,17 @@ pub fn emit(level: Level, args: core::fmt::Arguments);
 3. **Write the body** into `shard.slots[seq % SHARD_RECORDS]` — plain stores,
    outside the bracket, into the shard step 2 named and never into "this CPU's".
 4. **Commit**: `slot.seq.store(seq, Release)`.
-5. **Wake, only in `Drain::Thread` mode**: `fence(SeqCst)` then
-   `if LOG_WAITER.load(Relaxed) { … }` — §2.6a.
+5. **Signal, only in `Drain::Thread` mode**: `LOG_PENDING.store(true, Relaxed)`
+   — a plain store, no fence and no read-modify-write. `drain_irqs` is what
+   turns it into a wake, and §2.6a is why.
 
-**No lock and no locked RMW in `Drain::Thread`**, which is every mode after
-`scheduler::init`. The path loses today's `compare_exchange_weak` and keeps a
-three-instruction flags bracket where today's covers the whole append; it gains
-one `SeqCst` fence, and a single locked RMW per *klogd park* rather than per
-record (§2.6a). L1 measures the net.
+**No lock, no locked RMW and no fence in `Drain::Thread`**, which is every mode
+after `scheduler::init`. The path loses today's `compare_exchange_weak` and keeps
+a three-instruction flags bracket where today's covers the whole append; it gains
+one relaxed store. L1 measures the net. (§2.6a's *first* shape — the producer
+posting to a parked `klogd` itself — costs a `SeqCst` fence and a relaxed load
+here and one locked RMW per park; it is what completions converts to and it is
+not what L3 builds.)
 
 **`Drain::Inline` is not that path and must not be described as if it were.**
 Inline `emit` calls `BackendGuard::lock()` (`serial.rs:97`), which is
@@ -438,8 +471,10 @@ design is sound only while the CPU executing the `xadd` is the shard's owner, an
 task migrates between CPUs (`toyos-sched/src/cpu.rs:476`, `task.migrate(self.id,
 dst, now)`); `Hw::switch` swaps the per-context preempt depth (`hw.rs:173`), so a
 kernel context at depth 0 with `IF` set is preemptible and its next run may be on
-another CPU. A kernel thread — and after compl C6 there are three of them, `klogd`
-among them — is exactly that context, and it logs. So without the bracket:
+another CPU. A kernel thread is exactly that context, and it logs — **and under
+the ruled order L3 is what introduces the first one**, `klogd`, with completions'
+C6 adding `usbd` and `iod` on the machinery L3 builds (§4.3, §12.6). So without
+the bracket:
 
 - a preemption **between the `gs:` read and the `xadd`** puts the `xadd` on a CPU
   that does not own the shard, and two CPUs performing a non-atomic
@@ -541,7 +576,7 @@ reaches, so `log_wake.rs` would have had nothing to compile. **Both fences and
 that return a `bool` and touch no subject:
 
 ```rust
-// kernel/src/log/shard.rs — the whole modelled surface
+// kernel/src/log/shard.rs — the whole modelled surface, at the conversion
 impl Shard { fn reserve(&self) -> u64; fn commit(&self, seq: u64); }
 /// commit, fence, read the flag. True means "a reader is parked; post to it".
 pub fn commit_and_signal(shard: &Shard, seq: u64) -> bool;
@@ -549,17 +584,32 @@ pub fn commit_and_signal(shard: &Shard, seq: u64) -> bool;
 pub fn arm_waiter(cursor: &Cursor) -> bool;
 ```
 
-`mod.rs` does the `completion::post` on a `true`, and never the ordering. The
-shimmed set for `shard.rs` is then `UnsafeCell` and `percpu_fetch_add`, which is
-smaller than `sync.rs`'s.
+The caller does the post on a `true`, and never the ordering. The shimmed set for
+`shard.rs` is then `UnsafeCell` and `percpu_fetch_add`, which is smaller than
+`sync.rs`'s. **The layout requirement is stated here and honoured at L1 even
+though the two functions arrive later** (§2.6a): if `shard.rs` were allowed to
+grow a dependency on a subject, the conversion could not be modelled at all, and
+that is exactly the mistake the paragraph above records.
 
-| obligation | shape | model |
-|---|---|---|
-| **W1** publication | body stores → `seq.store(Release)`; reader's `seq.load(Acquire) == s` implies the body is visible | `kernel-loom/tests/log_record.rs` |
-| **W2** recycle detection | reader: `load(Acquire)`, copy, `fence(Acquire)`, `load(Relaxed)`, compare. The second load must not be hoisted above the copy | same |
-| **W2b** the lapped writer | a writer whose reservation was lapped by `SHARD_RECORDS` re-reads `head` and abandons; a reader mid-copy of the newer record must not observe the older `seq` (§2.4) | same |
-| **W3** the wake edge | `commit_and_signal`: `seq.store(Release); fence(SeqCst); LOG_WAITER.load(Relaxed)` against `arm_waiter`: `LOG_WAITER.store(true, Relaxed); fence(SeqCst); rescan for a committed record; park`. **Invariant: no committed record is left with a parked reader.** Store-buffer shaped, so TSO hides the missing fence and only loom sees it | `kernel-loom/tests/log_wake.rs` |
-| **W4** the reservation | `head` is written by one CPU through inline asm and read by others as an `AtomicU64` | shimmed |
+| obligation | shape | model | when |
+|---|---|---|---|
+| **W1** publication | body stores → `seq.store(Release)`; reader's `seq.load(Acquire) == s` implies the body is visible | `kernel-loom/tests/log_record.rs` | L1 |
+| **W2** recycle detection | reader: `load(Acquire)`, copy, `fence(Acquire)`, `load(Relaxed)`, compare. The second load must not be hoisted above the copy | same | L1 |
+| **W2b** the lapped writer | a writer whose reservation was lapped by `SHARD_RECORDS` re-reads `head` and abandons; a reader mid-copy of the newer record must not observe the older `seq` (§2.4) | same | L1 |
+| **W3** the wake edge | `commit_and_signal`: `seq.store(Release); fence(SeqCst); LOG_WAITER.load(Relaxed)` against `arm_waiter`: `LOG_WAITER.store(true, Relaxed); fence(SeqCst); rescan for a committed record; park`. **Invariant: no committed record is left with a parked reader.** Store-buffer shaped, so TSO hides the missing fence and only loom sees it | `kernel-loom/tests/log_wake.rs` | **not L3 — the conversion, §2.6a** |
+| **W4** the reservation | `head` is written by one CPU through inline asm and read by others as an `AtomicU64` | shimmed | L1 |
+
+**W3 is not L3's, and that is what the order change moved.** The fallback §2.6a
+resolves to has **no producer-side wake edge**: `emit` stores a relaxed flag and
+`drain_irqs` decides, from inside a scheduler pass, whether to wake — so the only
+ordering in play is the scheduler's own park/wake protocol, which
+`toyos-sched`'s `Commit` handshake already carries and which loom already covers
+through `toyos-sched`'s own models. There is nothing store-buffer-shaped to
+model, `LOG_WAITER` does not exist yet, and writing `log_wake.rs` at L3 would be
+a model of code the branch does not contain. **W3 becomes real the moment
+completions converts the wake, and it is that chunk's deliverable, named here
+because a conversion that lands without it is a lost wake nothing on x86 can
+see.**
 
 **W3's rescan is over committed records and never over `head`, and that is a
 liveness property rather than a taste.** A reader that re-scans `head[i]` and
@@ -568,7 +618,10 @@ holding an abandoned reservation (§3.1) — `drain_ordered` returns nothing for
 that shard and `head` does not move on a quiet machine, so `klogd` spins a CPU at
 100% until 512 further records arrive, which on a quiet machine is never. The
 predicate is the same one `drain_ordered` uses: *is there a committed record at
-`next[i]`*. Eight loads either way.
+`next[i]`*. Eight loads either way. **The fallback has the same obligation one
+level up**: `drain_irqs`'s decision to wake is that predicate and not
+`head[i] > next[i]`, or a shard with an abandoned reservation makes every pass
+wake a thread that finds nothing.
 
 **W4's shim, and why it is sound.** Loom cannot model inline asm, so
 `percpu_fetch_add` is shimmed to a real `fetch_add`. That is a **strictly
@@ -596,36 +649,66 @@ ring. `DROPPED_BYTES`, `FILE_DROPPED`, `take_drop_marker`, `take_file_drops` and
 `DROP_MARKER_MAX` all go (§8). It also removes the last `fetch_add` in the
 module, which today runs on the overflow path.
 
-### 2.6a The wake, and the one thing this design needs from the completion core
+### 2.6a The wake — the fallback is what L3 builds, and completions converts it
 
-**`emit` may not take a lock, and compl's ordinary post does.** compl §5.2: *"a
-watch is a node the waiter lends to the object, so a post is a walk of a list
+**`emit` may not take a lock, and an ordinary completion post does.** compl §5.2:
+*"a watch is a node the waiter lends to the object, so a post is a walk of a list
 under the object's own leaf lock."* `log!` runs inside `sync.rs`, inside IRQ
 handlers, inside the scheduler and inside every syscall's locked region, so an
 `emit` that acquired a leaf `Lock` would (a) put `preempt::disable`'s two locked
 RMWs on every record and (b) deadlock the first time anything on that lock's own
-path logged. **This spec therefore requires the log completion source to be the
-degenerate case of compl's shape and not an instance of it**, and states the
-requirement rather than assuming the core supplies it:
+path logged. So `emit` can only ever use the *degenerate* case of that shape —
+one waiter for the life of the boot, no list, and the rendezvous-word CAS
+`toyos-sched` already performs (compl §5.4's C2). **That is the one thing this
+design ever wanted from the completion core, and under the ruled order the core
+does not exist when L3 runs.**
 
-- **The log source admits exactly one waiter, `klogd`, for the life of the boot.**
-  So the "list under a leaf lock" is one rendezvous word, and the post is the CAS
-  `toyos-sched` already performs on it — compl §5.4's C2, with no list and no
-  lock in front of it.
-- **The wake is at most once per park, not once per record.** `commit_and_signal`
-  returning `true` is followed by `LOG_WAITER.swap(false, AcqRel)`, and only the
-  producer that wins the swap posts. Every other producer while `klogd` is
-  runnable-but-not-yet-running pays the fence and a relaxed load and nothing
-  else. It cannot lose a wake: the inbox is level-readable and `klogd` re-drains
-  everything on the one wake it gets, which is compl §5.2's own property.
-- **So the RMW budget is one locked operation per `klogd` park**, and §9.6 counts
-  it there rather than per record.
+**So L3 builds the fallback, which is the shape `irq_ring` already has in this
+tree: record, and let `drain_irqs` post.** Concretely, and this is the whole of
+it:
 
-**If the core cannot supply a lock-free post for one waiter, `emit` cannot call
-it and this design needs a different wake** — the fallback shape is the one
-`irq_ring` already has (record, and let `drain_irqs` post), which costs the
-idle-machine latency `log-ring-flushes-one-line-behind` is about. L0 confirms
-which, against the merged tree, and §12 carries it as a dependency.
+- `emit` does `LOG_PENDING.store(true, Relaxed)` after the commit store. One
+  plain store, no fence, no read-modify-write. It is the same predicate
+  `log_ring::has_pending()` is today, moved off the byte ring.
+- `drain_irqs` (`sched/driver.rs:578`, called at `:316` from `pass` and `:418`
+  from `pass_block`, before `SchedPass::begin` in both) reads the flag and, if
+  `klogd` is parked and `drain_ordered` would return something, wakes it through
+  today's `waitqs` — the ordinary queue wake, from a context that may take a
+  lock. §2.5's note applies to the predicate: it is *is there a committed record
+  at `next[i]`*, never `head[i] > next[i]`.
+- `klogd` parks on a `static KWaitQueue` with today's `prepare_wait`/`block_on`
+  (`scheduler.rs:170`, `:181`), not on an `Inbox`. A spurious wake is legal; the
+  body re-drains and re-parks.
+
+**What that costs, stated rather than waved at.** The wake is decided inside a
+scheduler pass rather than at the commit, so a record emitted *after*
+`drain_irqs` has run and *before* the same pass reaches its halt decision has
+nothing making `klogd` runnable. **One pre-`hlt` condition therefore survives L3
+that the first draft deleted**: `log::pending()`, a relaxed load in `execute`'s
+`Idle` arm, in the place `log_ring::has_pending` (`driver.rs:523`) occupies
+today. Without it, `log-ring-flushes-one-line-behind` does not close at L3 and
+the last line before a quiet period is still not evidence of anything — which is
+the entry §8.2 claims L3 closes, and it is not worth reopening a diagnostics
+defect to save one load. §8.1's deletion list is written accordingly: that
+condition is **re-pointed at L3, not removed**.
+
+**What completions converts it to, and what the conversion buys.** When the core
+lands, `emit`'s relaxed store becomes §2.5's `commit_and_signal` — commit,
+`fence(SeqCst)`, relaxed read of `LOG_WAITER` — with `LOG_WAITER.swap(false,
+AcqRel)` so only one producer posts per park; `klogd` parks on an `Inbox` through
+`arm_waiter`; `drain_irqs` loses the log entirely; and **the surviving pre-`hlt`
+condition is deleted then**, because a posted `klogd` is runnable at the commit
+and `toyos-sched`'s Invariant T is what stops the halt. The conversion owes W3's
+loom model (§2.5) and it is the chunk that closes the last log statement in the
+idle path's declared set (§9.5's `idle_loop_is_the_declared_body` is re-asserted
+by it).
+
+**The RMW budget is better under the fallback than under the shape it replaces,
+which is worth saying because the fallback is the concession.** `emit` pays one
+relaxed store and nothing else; the locked operation is `waitqs`'s, at most once
+per `klogd` park, on a CPU already inside a pass. The lock-free post pays a
+`SeqCst` fence and a relaxed load on *every* record for the same one locked
+operation per park. §9.6 counts both.
 
 ## 3. The read surface
 
@@ -714,8 +797,17 @@ pub fn log_read(cursor: &mut LogCursor, out: &mut [u8]) -> Result<usize, Syscall
   ignore a field it is already passing.
 - **The stream is not consumed.** Two readers see the same records. `logd` and a
   `log-follow` tool coexist with no coordination.
-- **Non-blocking.** The wait is compl's one shape: `SYS_LOG_READ` returns 0 and
-  the caller arms on the log completion source and parks. §2.5 W3 is that edge.
+- **Non-blocking, and the wait beside it is today's mechanism rather than the one
+  that does not exist yet.** `SYS_LOG_READ` returns 0 and the caller arms on a
+  readiness source and parks. Under the ruled order that source is a **sixth
+  `io_uring::Source`** — `Source::Log`, beside `Keyboard`, `Mouse`, `Network`,
+  `VirtioSound` and `Hda`, with the same per-source `IO_URING_WATCHERS` static
+  those five already have (`keyboard.rs:17`, `mouse.rs:19`, `net.rs:41`,
+  `hda.rs:220`, `virtio_sound.rs:270` — **CONFIRMED** 2026-08-09) and posted from
+  the same place `klogd`'s wake is (§2.6a). L4 adds it; compl C3 folds all six
+  into its one watch list and its §19 deletes the statics together. **Adding a
+  sixth instance of a mechanism that is about to be unified is the honest cost of
+  landing first**, and it is one static and one match arm.
 
 **`MAX_LOG_SHARDS` is `MAX_CPUS`** and the cursor is 1 KiB at the shipped 8. A
 caller passing a smaller buffer than `shards` requires gets `InvalidArgument` —
@@ -773,18 +865,20 @@ toyos-abi/src/syscall.rs`).
 | 99–112 | `capability-endowment-spec.md` §3.1, fourteen calls |
 | 113 | reserved by that spec for `SYS_PORT_REARM` |
 | 114–115 | free by that spec's own §13 |
+| **one number, unnumbered** | **`SYS_LOG_READ`, this spec** — first, under the ruled order |
 | **one number, unnumbered** | `completion-architecture-spec.md` §14.2 — `SYS_SLEEP_UNTIL`, replacing a retired `SYS_NANOSLEEP` |
-| **one number, unnumbered** | **`SYS_LOG_READ`, this spec** |
 | after those | what is left of `specs/introspection-plan.md` |
 
-**The first draft of this table gave compl 116–127 and this spec 128, and both
-are wrong.** compl's §14.2 was rewritten by its own adversarial review at
-`e96cd51`: it now takes **exactly one number**, refuses to write it down, and
-says why in terms that apply verbatim here — *"a literal one clause away from the
-word 'asserts' is what an implementer hard-codes."* This spec had that literal
-twice, once in §3.2's code block. Both are gone. Neither block is contiguous
-either: 114 and 115 are free, so the two remaining numbers are 114 and 115 in
-merge order, and a landing on `main` moves them.
+**The first draft of this table gave the completion spec 116–127 and this one
+128, and both are wrong.** Its §14.2 was rewritten by its own adversarial review:
+it now takes **exactly one number**, refuses to write it down, and says why in
+terms that apply verbatim here — *"a literal one clause away from the word
+'asserts' is what an implementer hard-codes."* This spec had that literal twice,
+once in §3.2's code block. Both are gone. Neither block is contiguous either: 114
+and 115 are free, so the two remaining numbers are 114 and 115 in merge order.
+**The order change swaps which is which** — this branch merges first, so it takes
+the lower — and that is exactly why neither spec writes a literal: whichever
+lands first takes what is clean, and a landing on `main` moves them both anyway.
 
 **`specs/introspection-plan.md` is wrong on today's tree and must be re-based.**
 It allocates `SYS_QUERY = 97`, `SYS_LOG_READ = 98` and `SYS_DISK_ADOPT = 99`
@@ -801,10 +895,11 @@ writes either. L8 edits that plan to say so.
 
 **This spec allocates nothing and predicts nothing.** L0 computes the first clean
 number from the merged `toyos-abi` and asserts only that its choice is clean —
-never `assert_eq!` against a literal, which is wrong in the two live cases compl
-names: `main` moves while both branches are open, and endow's §10.1 option 2
-lands its chunks 0+1 as an earlier PR, which leaves 99–112 unclaimed at the
-moment this branch opens.
+never `assert_eq!` against a literal, which is wrong in the two live cases the
+completion spec names: `main` moves while both branches are open, and endow's
+§10.1 option 2 lands its chunks 0+1 as an earlier PR, which leaves 99–112
+unclaimed at the moment this branch opens. **CONFIRMED** 2026-08-09 that `main`
+has already moved under both, from `19c761e` to `0e48d2e`.
 
 ---
 
@@ -823,12 +918,24 @@ file"**:
   channel, so it cannot leave the kernel: there is no userland at panic and none
   during boot. It stays, and it is drained by something that can afford it.
 
-This also resolves an open question in the completion architecture. Its §10
-gives `logd` (a kernel thread) the drain into *both* sinks and its §22 records
-the consequence — *"the log sink parks on a dead stick … takes the serial sink
-with it"* — as **unresolved**. Here it cannot arise: the kernel's console drainer
-has no disk in it, so a hung `/log` stick cannot take serial with it, and the
-file sink's give-up is a userland policy (§5.4).
+This also resolves **half** of an open question in the completion architecture,
+and the first draft of this paragraph claimed the whole of it. Its §10 gives
+`logd` (a kernel thread) the drain into *both* sinks and its §22 records the
+consequence — *"the log sink parks on a dead stick … takes the serial sink with
+it"* — as **unresolved**.
+
+- **True of the console, and it is the half that matters on a T14.** The kernel's
+  console drainer has no disk in it, so a hung `/log` stick cannot take serial
+  with it and "total logging loss with no line saying why" is gone by
+  construction.
+- **False of the file, and its §12.3's bound question survives with a different
+  victim.** Something still parks on a hung stick — after this branch it is
+  `/bin/logd`, and after completions' C12 it is `iod`, which carries **every**
+  write-back in the machine and not only the log: `SYS_FSYNC`, deferred close
+  flushes and page-cache eviction. So the give-up is a policy that has to exist
+  and be owned, not one the split deletes. §5.4 is this branch's answer for
+  logd's own writes and it does not answer for `iod`; that is compl §12.3's, and
+  it is still open.
 
 ### 4.2 Three modes, one transition each, and none of them is a fallback
 
@@ -839,7 +946,7 @@ enum Drain { Inline, Thread }
 | phase | who drains to the console | why it is the only thing that can |
 |---|---|---|
 | boot, up to `scheduler::init` (`main.rs:501`) | **`Drain::Inline`** — `emit` writes the record to the backend synchronously, after committing it | there is no scheduler and no thread; one CPU, nothing else running |
-| steady state | **`Drain::Thread`** — `klogd`, a kernel thread, runnable whenever records are pending | it must run on an idle machine, and a runnable task is what stops a CPU halting (`toyos-sched` Invariant T) |
+| steady state | **`Drain::Thread`** — `klogd`, a kernel thread, made runnable by the next `drain_irqs` after a record is committed (§2.6a), and at the commit itself once completions converts the wake | it must run on an idle machine, and a runnable task is what stops a CPU halting (`toyos-sched` Invariant T); until the conversion, the one surviving pre-`hlt` condition covers the gap between the commit and the pass |
 | panic and shutdown | `drain_inline()` called directly | `klogd` will never run again |
 
 A fallback is a path taken when another fails. These are phases: exactly one is
@@ -858,20 +965,45 @@ watching.** The number decides; the design does not pre-empt it.
 
 ### 4.3 `klogd`
 
-Body: `loop { drain_ordered(&mut cursor, &mut backend); park_on(log_completion); }`.
+Body: `loop { drain_ordered(&mut cursor, &mut backend); park(); }`, where `park`
+is today's `prepare_wait`/`block_on` on a `static KWaitQueue` (§2.6a) and becomes
+a completion park at the conversion.
 
-- It is **compl C6's `logd` kernel thread, renamed and narrowed.** C6 owns the
-  kernel-thread machinery — identity, the trampoline, the `ProcessObject`, the
-  dump naming, the recoverable-panic predicate. This spec owns its body. The
-  rename matters because `logd` is now a userland program and two things with one
-  name in one machine is the kind of collision a dump report cannot survive; §12
-  records it as the one-word change C6 owes.
+- **The kernel-thread machinery is L3's, and this is the largest thing the order
+  change moved.** The first draft said *"it is compl C6's `logd` kernel thread,
+  renamed and narrowed — C6 owns the machinery, this spec owns its body."* With
+  completions landing second there is no C6 to inherit from: **CONFIRMED**
+  2026-08-09, `kernel/src` contains no kernel-thread machinery of any kind
+  (`grep -rn 'kernel thread\|kernel_thread' kernel/src/sched/driver.rs
+  kernel/src/loader/start.rs` is empty). So L3 builds it, for one thread:
+  - a trampoline beside `process_start`/`thread_start`, which is *simpler* than
+    either — no `initial_user_state!`, no `iretq`, no `USER_CS` —
+    `alloc_kernel_stack` (`loader/start.rs:17`) already takes one as a parameter;
+  - a `ProcessObject` whose address space **is** the kernel address space, which
+    means wiring `driver::spawn` (`sched/driver.rs:222`, whose
+    `.expect("spawn: task without an address space")` is the thing in the way)
+    to `paging::KERNEL`;
+  - `sched::dump` naming it, and the recoverable-panic predicate
+    (`syscall_rip() != 0 && current_tid().is_some()`) gaining `klogd`'s row — the
+    non-recoverable one, below.
+
+  **compl C6 then shrinks to spawning `usbd` and `iod` on machinery that already
+  exists**, their two rows in the predicate, and the
+  `KernelPayload.address_space: Option<PageTables>` → non-`Option` retype
+  (`sched/payload.rs:88`, **CONFIRMED** still `Option` today), which compl §15
+  row 12 says nobody else owns. That retype stays C6's: it is only *enabled* by a
+  kernel thread naming the kernel address space, and L3 has no second caller to
+  justify it.
+- **The name is `klogd` from the start and no rename is owed.** compl §12.3's
+  "one-word change C6 owes" is discharged before C6 is written: `/bin/logd` is a
+  userland program from L6, `sched::dump` names threads, and two things with one
+  name in one machine is a collision a dump report cannot survive.
 - It never takes a filesystem lock, never touches a block device, and holds only
   `BackendGuard` — for one bounded chunk at a time, exactly as
   `drain_chunk_to_serial` does today, so an IRQs-off window is never longer than
   one chunk.
 - **It is not `usbd` and not `iod`.** Those two stay exactly as compl §10 defines
-  them.
+  them, and neither exists until that branch lands.
 
 **`klogd` is one thread where `drain_serial` was every idle CPU, and that is a
 reduction this design accepts and must name.** Today any CPU going idle drains,
@@ -882,14 +1014,15 @@ a requirement:
 1. Boot is `Drain::Inline` and needs no thread at all.
 2. Panic and shutdown call `drain_inline()` directly, so the two paths that
    matter most never depend on `klogd` being schedulable.
-3. **`klogd`'s own death must not be a silent one.** compl C6 extends the
-   recoverable-panic predicate to cover a kernel thread, which turns a panic
-   inside `klogd` into a killed thread — and a machine whose only console drainer
-   has been killed goes quiet with nothing saying so, which is the exact failure
-   the panel exists to make impossible. So `klogd` is the one kernel thread whose
+3. **`klogd`'s own death must not be a silent one.** Extending the
+   recoverable-panic predicate to cover a kernel thread turns a panic inside
+   `klogd` into a killed thread — and a machine whose only console drainer has
+   been killed goes quiet with nothing saying so, which is the exact failure the
+   panel exists to make impossible. So `klogd` is the one kernel thread whose
    panic is **not** recoverable: it halts, by the same argument that makes a
-   Ring 0 fault fatal. C6 owns the predicate; this spec owns `klogd`'s row in it,
-   and L3 writes it.
+   Ring 0 fault fatal. **L3 owns the predicate now** — it is the first caller —
+   and compl C6 adds `usbd`'s and `iod`'s rows to it, which are the recoverable
+   ones.
 
 ### 4.4 The console object, and where line atomicity actually comes from
 
@@ -1023,7 +1156,7 @@ primitive, answering the caller, never a truncation.
 
 **A server never blocks on a client**, which here means logd never blocks reading
 one stream while another has data: it uses `ipc::FrameRx` and an io_uring poll
-set over every registered pipe plus the log completion source, exactly as the
+set over every registered pipe plus `Source::Log` (§3.2), exactly as the
 compositor and netd do.
 
 ### 5.3 Back-pressure, per client
@@ -1057,12 +1190,16 @@ is unambiguously better is that the loss is confined and counted.
 
 ### 5.4 The give-up policy, and where the bound comes from
 
-**The bound is logd's and it is a `Budget`.** `LOG_WRITE_BUDGET` — logd's own
-constant, in logd's own source, with its reason there: the longest logd will wait
-for the log volume before it declares the volume dead. Recommended value 5 s,
-which is a policy number and says so; nothing about the device supplies one, and
+**The bound is logd's.** `LOG_WRITE_BUDGET` — logd's own constant, in logd's own
+source, with its reason there: the longest logd will wait for the log volume
+before it declares the volume dead. Recommended value 5 s, which is a policy
+number and says so; nothing about the device supplies one, and
 `specs/completion-architecture-spec.md` §12.3 establishes that USB publishes no
-bound for a bulk transfer and that SCSI timeouts are host policy everywhere.
+bound for a bulk transfer and that SCSI timeouts are host policy everywhere. It
+is compl §3.3's `Budget` **kind** and not that **type**: RT7 and the six duration
+kinds reach `kernel/src/` and logd is userland, so until that vocabulary exists
+this is a named `u64` in a userland program with its justification beside it,
+and it stays one afterwards.
 
 What happens when it expires, in order:
 
@@ -1073,41 +1210,48 @@ What happens when it expires, in order:
    not exit, does not retry, and does not queue for a device that is not
    answering. "I stop waiting for this stick and say so" is the whole policy.
 
-**This requires a mechanism the completion architecture leaves open, and this
-spec owns it.** compl §12.3 — as rewritten by its own review at `e96cd51` —
-states that after its change the correct count of cancellers for a
-present-but-hung stick is **zero**, and leaves the resolution as *"the plan's one
-open decision with three named options, because it is the owner's call."* A
-parked writer holding the VFS sleep lock forever wedges every other filesystem
-user, so "logd just parks" is not available. **This spec requires the caller-side
-form: the log volume's write path takes an absolute `Deadline` from its caller,
-and expiry both answers `SyscallError::Io` and cancels the outstanding transfer
-through Bulk-Only Reset Recovery** — which is reachable exactly because the
-caller's budget, rather than a 2 s transport bound, is what expired. That
-preserves today's chain end to end (an `Io` from the device → the sink turns
-itself off → it says why), with the sink in userland. compl's own text calls this
-option *"where Linux puts it and is probably better"*, so the requirement is not
-a fight. If the owner picks the transport `Tripwire` instead, logd's policy
-becomes unexpressible and L6 must add the deadline argument itself; either way L6
-owns the outcome and §12 records it as a dependency to re-check at L0.
+**Under the ruled order this needs nothing new from the transport, and the
+requirement inverts into an obligation on the other branch.** The first draft
+required a mechanism completions leaves open — *the log volume's write path takes
+an absolute `Deadline` from its caller, expiry answers `SyscallError::Io` and
+cancels the outstanding transfer through Bulk-Only Reset Recovery* — because it
+assumed L6 ran on a tree where compl C7 had already deleted the transport bound.
+It has not. **CONFIRMED 2026-08-09: `USB_TIMEOUT_NS = 2_000_000_000`
+(`kernel/src/drivers/xhci/mod.rs:319`) is live**, and it is what produces
+`Scsi::Broken` → `write_blocks` `Err` → `SyscallError::Io` on a stick that stops
+answering. So at L6 logd's writes come back with an error inside 2 s per transfer
+and `LOG_WRITE_BUDGET` is an ordinary policy over repeated errors and a
+slow-but-answering device. Nothing in the xHCI driver changes for this branch.
 
-**This design also restores a canceller compl says it has lost.** §12.3's
+**What that makes it is compl §12.3's problem, with a caller it can now see.**
+That section — rewritten by its own review — states that once the transport bound
+goes, the correct count of cancellers for a present-but-hung stick is **zero**,
+and leaves the resolution as *"the plan's one open decision with three named
+options, because it is the owner's call."* Whichever option C7 takes, **it must
+leave `/bin/logd` an error rather than an unbounded park**, because the
+self-disable chain this spec puts in userland (§5.4's three steps) needs a value
+to fire on. compl's own text calls the caller-side `Budget` *"where Linux puts it
+and is probably better"*; if it picks the transport `Tripwire` instead, the chain
+survives too, because a `Tripwire` panics rather than hanging. What is not
+available to C7 is "no bound anywhere", and after this branch lands that is not a
+hypothetical — it is a shipped daemon whose give-up policy it would silently make
+unreachable.
+
+**And this design restores a canceller compl §12.3 says it has lost.** Its
 canceller 2 is *"kill of the waiting thread — real for a userland thread, and not
-reachable for `logd`, `usbd` or `iod`."* Its `logd` is a kernel thread and
-therefore unkillable; **ours is a userland process, so canceller 2 is real
-again** — init holds its `Process` handle and can kill it, which is one more way
-out of a hung stick than any arrangement in that spec has. It is a second line
-behind the `Deadline` and not a replacement for it, because a kill through
-compl §7's cancellation path while the victim holds the VFS sleep lock is the
-delicate case that spec's review spent §7.2 on.
+reachable for `logd`, `usbd` or `iod`."* Its `logd` was a kernel thread and
+therefore unkillable; **ours is a userland process, so canceller 2 is real** —
+init holds its `Process` handle and can kill it. That is one more way out of a
+hung stick than any arrangement in that spec has, and after this branch lands it
+is true on that branch's own baseline rather than a claim about a future one.
 
 **What `LOG_WRITE_BUDGET` is not.** It is not the move of an existing number:
 today there are two bounds and neither is it. `wait_transfer`'s 2 s transport
-deadline is what produces `Scsi::Broken` today, and compl deletes it;
+deadline is what produces `Scsi::Broken`, and it is what logd rides at L6;
 `log_file.rs`'s `MAX_BLOCKED_NANOS` is **10 s** (`:190`, **CONFIRMED**) and bounds
-*VFS lock contention*, not the device. 5 s is a new number in a new place and the
-recommendation says so; L6 records what it measured under `usb-slow-device`
-beside it.
+*VFS lock contention*, not the device — L6 deletes it with the file. 5 s is a new
+number in a new place and the recommendation says so; L6 records what it measured
+under `usb-slow-device` beside it.
 
 ### 5.5 Rotation, retention and naming
 
@@ -1277,9 +1421,20 @@ FAT append plus a sync."* After L6 the same wait covers a **userland process
 being scheduled**, two syscalls, a page-cache write-back, a FAT append, a device
 cache flush and a second `SYS_LOG_READ` to publish. L6 measures it under
 `usb-slow-device` and writes the number it found. This is the mechanism that
-keeps `screen_fatal_composited`'s second half — the assertion that the fatal
-report is in `/log` and not only in a photograph — green, and root `CLAUDE.md`'s
-"three investigations argued from JPEGs" is why it must be.
+keeps **`screen_fatal_halt_composited`**'s second half — the assertion that the
+fatal report is in `/log` and not only in a photograph
+(`tests/toyos.rs:3402-3427`) — green, and root `CLAUDE.md`'s "three
+investigations argued from JPEGs" is why it must be.
+
+**The test is `screen_fatal_halt_composited`, and this spec named it
+`screen_fatal_composited` in five places, which is a test that does not exist.**
+**CONFIRMED** 2026-08-09 (`grep -rn screen_fatal tests/`): the two real names are
+`screen_fatal_halt` (`tests/toyos.rs:261`) and `screen_fatal_halt_composited`
+(`:267`), and **only the second has a `/log` half** — it is `mute: true` exactly
+so that `wait_for_log_file` is reachable, and after dropping the guest it reads
+the newest log off the image's own partition (`:3411-3427`).
+`screen_fatal_halt` asserts on the panel alone. All five sites are corrected; a
+gate named in a spec and absent from the tree is a gate nobody runs.
 
 **What it cannot cover**, and this is the pstore's subject. The first draft named
 four cases and called them the same four that fail today; §13.4 now states what
@@ -1352,8 +1507,12 @@ render through the same `Display`.
 
 ## 7. Diagnostics that must keep working
 
-Every one of these runs from a context with no `Parkable` (compl §6.1), so none
-of them can take a sleep lock, and none of them takes a `Lock` today either.
+**None of these takes a `Lock` today, and after L3 none of them takes one at
+all.** That is the property this branch is responsible for, on a tree where
+`Parkable` and `SleepLock` do not exist yet. When completions lands, every one of
+them still runs from a context with no `Parkable` (compl §6.1), so a sleep lock
+in a diagnostic stays untypeable — this branch does not weaken that and the L3
+deletion below is what makes it cheaper to keep.
 
 | facility | today | after |
 |---|---|---|
@@ -1364,20 +1523,24 @@ of them can take a sleep lock, and none of them takes a `Lock` today either.
 | `/bin/console` scrollback seeding | reads the newest `/log` files | unchanged; the files are logd's now and their names and format do not change. With `logread` it also gains this boot's records live, off the cursor (§5.1a) |
 | the harness's console capture | `is_kernel_line`, `Serial::interleaved` | both stay; `interleaved` becomes an assertion where it is safe to be one, §8.1 |
 
-**One lock the dump reaches goes with `log_ring.rs`, and it is worth claiming
-because compl's review says the refactor does not deliver one.** compl §17.1
-enumerates the three locks `sched/dump.rs` reaches indirectly and concludes
-*"after all five conversions the one lock that can refuse the dump is still a raw
-ticket `Lock` … `SleepLock::holder()` buys the dump nothing."* Its middle row is
-`log!` → `log_ring.rs:314`'s `RingGuard`, *"hand-rolled CLI spinlock, unbounded"*.
-**This design deletes it**: after L3 the dump's own `log!` calls take no lock at
-all, on any path, so that row disappears rather than being converted. It is a
-small win and it is one compl explicitly says it cannot make.
+**One lock the dump reaches goes with `log_ring.rs`, and landing first is what
+turns that from a claim into that branch's baseline.** compl §17.1 enumerates
+three locks `sched/dump.rs` reaches indirectly and concludes *"after all five
+conversions the one lock that can refuse the dump is still a raw ticket `Lock` …
+`SleepLock::holder()` buys the dump nothing."* Its middle row is `log!` →
+`log_ring.rs:314`'s `RingGuard`, *"hand-rolled CLI spinlock, unbounded"* — a
+`cli` bracket and a `compare_exchange_weak` spin (`:318`, `:323-328`,
+**CONFIRMED**). **After L3 the dump's own `log!` calls take no lock at all, on
+any path.** Under the ruled order that happens before compl opens, so its §17.1
+should find **two** rows rather than three at its own C0, and the row is deleted
+rather than converted. It is a small win and it is one compl explicitly says it
+cannot make.
 
 Gates that must be green throughout, per compl §17: `blocked_dump`,
 `screen_blocked_dump`, `dump_nmi_probe`, `screen_panic_muted`,
-`screen_fatal_composited`, `screen_console_shell`, `screen_console_panic`,
-`disk_backtrace`, `fault_gates`, `fpu_isolation`, `kernel_log_file`.
+`screen_fatal_halt`, `screen_fatal_halt_composited`, `screen_console_shell`,
+`screen_console_panic`, `disk_backtrace`, `fault_gates`, `fpu_isolation`,
+`kernel_log_file`.
 
 ---
 
@@ -1407,10 +1570,18 @@ values. The `log-rotate-fast` cargo feature goes; it becomes a logd argument.
 `LOG_DEFERRAL_CEILING_NS` (`:701`), `LOG_DEFERRED_SINCE` (`:706`),
 `log_file_flush_due` (`:743`), `owes_wake` (`:832`, whose only caller is the
 above), `drain_serial` (`:762`) and its `BackendGuard::lock` spin with interrupts
-disabled, and **two** of the four pre-`hlt` conditions in `execute`'s `Idle` arm:
-`log_ring::has_pending` (`:523`) and `log_file_flush_due` (`:552`). The idle
-loop's `drain_serial()` (`:681`) and `flush_log_file_if_affordable()` (`:689`)
-statements.
+disabled, and **one** of the four pre-`hlt` conditions in `execute`'s `Idle` arm:
+`log_file_flush_due` (`:552`), at L6. The idle loop's `drain_serial()` (`:681`)
+and `flush_log_file_if_affordable()` (`:689`) statements.
+
+**`log_ring::has_pending` (`:523`) is re-pointed at L3, not deleted, and the
+order change is why.** §2.6a's fallback decides the wake inside a scheduler pass,
+so a record committed after that pass's `drain_irqs` has nothing making `klogd`
+runnable before the halt decision in the same pass. The condition becomes
+`log::pending()` — the same relaxed load against the shard's flag instead of the
+byte ring's — and **completions deletes it when it converts the wake**, because a
+posted `klogd` is runnable at the commit and Invariant T covers the halt. The
+first draft deleted it here, on the strength of a wake this branch does not have.
 
 The other two pre-`hlt` conditions — `i8042::verdict_due` (`:534`) and
 `xhci::port_work_pending` (`:564`) — are **compl C9's, not this spec's** (§12).
@@ -1490,7 +1661,7 @@ edit that removes the citation.
 | `log-flush-is-unbounded` | boot-media | L6 | there is no flush on the idle path and no kernel file write |
 | `client-cpu-takes-the-log-flush` | audio | L6 | there is no heuristic left to steer, and no CPU takes a flush. **Its hypothesis is closed unverified and L8 says so where it goes**: the entry's own last section is *"only the owner's next boot can verify it"*, and deleting the mechanism makes it permanently unfalsifiable. The T14 arm is owed, filed the same way §6.6 files pstore's |
 | `pre-idle-wedge-says-nothing` | diagnostics | L3 | `Drain::Inline` puts every boot record on the wire as it is written |
-| `log-ring-flushes-one-line-behind` | kernel | L3 | `klogd` is runnable whenever records are pending, so a CPU does not halt with a line unsent |
+| `log-ring-flushes-one-line-behind` | kernel | L3 | a CPU does not halt with a line unsent. **Under §2.6a's fallback that is two mechanisms and not one**: `drain_irqs` makes `klogd` runnable within a pass of the commit, and the surviving `log::pending()` pre-`hlt` condition covers the window between a commit and the next pass. Delete the condition without the conversion and this entry reopens — which is why §8.1 keeps it |
 | `shutdown-path-logs-never-reach-console` | kernel | L6 | §6.3's ordered shutdown |
 | `serial-console-has-no-line-atomicity` | diagnostics | L5 | §4.4: three producers, whole units, one lock |
 | `sink-append-error-unreachable` | boot-media | L6 | its *subject* (`Sink::append`) is deleted, so the entry goes — but **not "moot", which the first draft said and which is backwards**. Its durable finding is *reactivated*: the entry's premise is that the kernel sink's tail page stays resident, and after L6 the appender is an ordinary userland process whose tail page is ordinary page-cache and *is* evictable. So `file_cache::write_page`'s merge-into-a-failed-read is reachable from the log path again, and the sentence moves to the file cache's own doc as a **live hazard with `log_backing_read_error` as its stager**, not as history |
@@ -1589,10 +1760,18 @@ Three readings, all from the same run:
 1. **`audio_tone --slow-usb`, smp=1, soundd's worst wake.** Recorded before:
    165,948 µs against a 7,117 µs ordinary-stick control. The assertion is
    whatever the same-session A/B measures on the tree that lands, added to
-   `tests/audio-baseline.toml` with the run that produced it.
-2. **`io-depth-probe`.** Today 4 from the idle loop and 5 from a syscall. The log
-   contributes **zero** levels after this: the kernel's log path reaches no
-   filesystem, no volume and no controller.
+   `tests/audio-baseline.toml` with the run that produced it. **Landing first
+   moves this number here.** compl §20.2 puts it at its C7+C8; under the ruled
+   order the *idle-loop* half of it is L6's, because L6 is what removes the only
+   path by which an idle CPU reaches a block device. What remains for C7+C8 is
+   the syscall half — `fd.rs:644`'s write-back and `wait_transfer`'s spin — and
+   the two are separable readings of one instrument, so L9 records which it
+   moved.
+2. **`io-depth-probe`.** Today 4 from the idle loop and 5 from a syscall. After
+   L6 **the idle-loop arm has no path to measure**: the kernel's log path reaches
+   no filesystem, no volume and no controller, and nothing else on the idle loop
+   does either. The syscall arm is untouched by this branch and is compl
+   C7+C8's.
 3. **The positive log-content assertion, in the same run.** compl §20.2 makes
    this point and it is sharper here: `/log` is a USB volume in every profile, so
    the cheapest way to make reading 1 look good is for the log to stop being
@@ -1611,7 +1790,7 @@ Three readings, all from the same run:
 | `log-commit-early` | the commit store moves **before** the body write | §9.1's checksum, within one storm |
 | `log-shared-reservation` | the reservation becomes a load-then-store | §9.2, deterministically |
 | `log-unbracketed-reserve` | §2.3a's `pushfq`/`cli`/`popfq` around the shard-read and the `xadd` is removed, so a preempted producer can `xadd` a shard it does not own | `log_migration_storm`'s conservation law at `--smp 8` |
-| `log-trusts-durable` | the §6.4 clamp on `LogCursor::durable` is removed | a test logd publishing `u64::MAX` makes `wait_for_log_file` return with nothing written, and `screen_fatal_composited`'s `/log` half reds |
+| `log-trusts-durable` | the §6.4 clamp on `LogCursor::durable` is removed | a test logd publishing `u64::MAX` makes `wait_for_log_file` return with nothing written, and `screen_fatal_halt_composited`'s `/log` half reds |
 | `log-writes-the-file` | `klogd`'s drain appends records to `/log` through the VFS, from the idle loop — the coupling, rebuilt in miniature | `io-depth-probe`'s depth, and §9.3 reading 1 by the recorded margin |
 | `console-unbuffered` | `ConsoleObject`'s line buffer is bypassed; each `write` reaches the backend — **which is literally L3's own intermediate state** (§8.1) | `console_line_atomicity`, and `Serial::interleaved` on the same capture |
 
@@ -1622,6 +1801,20 @@ own rule for what makes an actuator worth having;
 `log-unbracketed-reserve` is the one that has to exist, because §2.3a is the
 correctness claim the whole design rests on and nothing else can make it fail on
 purpose.
+
+**`log-writes-the-file` also inherits a control from the other branch, and the
+order change is what makes it an inheritance rather than a pair.** compl §20.3's
+`reintroduce-idle-flush` puts `log_file::poll()` back on the idle loop; its own
+text says the two *"are not interchangeable — this one reds on a tree where the
+flush is on the wrong context, that one on a tree where the kernel writes a file
+at all"*, and that **"whichever branch lands second inherits both; neither
+retires the other."** Under the ruled order the second branch cannot build
+`reintroduce-idle-flush`: after L6 there is no `log_file::poll` to reintroduce
+and no kernel file path for it to sit on. So it **is** retired, and
+`log-writes-the-file` is the only control of that class the tree ends up with.
+That is a real loss of one shade of coverage — a tree where the flush is on the
+wrong *context* is no longer stageable — and it is the price of the work not
+existing. Named rather than discovered at compl's C14.
 
 ### 9.5 New named tests
 
@@ -1658,7 +1851,14 @@ purpose.
 - **`idle_loop_is_the_declared_body`** — a **host-side source gate**, not a guest
   test: `idle_loop`'s body and `execute`'s pre-`hlt` condition list are exactly
   the declared sets. A condition quietly re-added is invisible to every
-  behavioural test. This is compl C9's test and it lands here (§12).
+  behavioural test. compl §20.4 struck it from that branch and gave it here
+  (§12.1). **What it declares at L6 is not the end state**, and the order change
+  is why: the body is `log_health`, `reap_poisoned`, `pass` and three `#[cfg]`
+  probes, and the pre-`hlt` list is `log::pending()` (§8.1), `i8042::verdict_due`
+  and `xhci::port_work_pending` — the last two are compl C9's and the first is
+  deleted by its wake conversion (§2.6a). So the gate is written to be
+  **amended twice by the other branch**, which is what a declared-set gate is
+  for: each amendment is a diff a reviewer reads.
 - **`one_console_holder`** — a `cargo test --lib` gate over **all six manifests**
   (§5.1a), reading the *parsed* `ProgramConfig` and never the file text (§3.2):
   each declares exactly one `console = true` program, each with a `[boot] start`
@@ -1677,17 +1877,26 @@ purpose.
 - **`Drain::Inline`'s cost on a real UART** (§4.2). L3.
 - **The RMW budget**, counted rather than asserted, and **counted per mode**
   because the two differ:
-  - `Drain::Thread` (everything after `scheduler::init`): loses one
-    `compare_exchange_weak` per record, keeps a `pushfq`/`cli`/`popfq` bracket
-    narrowed from the whole append to two instructions (§2.3a), gains one
-    `SeqCst` fence per record and **one locked RMW per `klogd` park** rather than
-    per record (§2.6a).
+  - `Drain::Thread` (everything after `scheduler::init`), **as L3 builds it under
+    §2.6a's fallback**: loses one `compare_exchange_weak` per record, keeps a
+    `pushfq`/`cli`/`popfq` bracket narrowed from the whole append to two
+    instructions (§2.3a), and gains **one relaxed store** per record. No fence,
+    no locked RMW on the producer's path at all. The locked operation is
+    `waitqs`'s wake, at most once per `klogd` park, inside a pass. Against that,
+    `drain_irqs` gains one relaxed load per pass on every CPU — a cost on a hot
+    path, small, and the one the fallback adds that the conversion removes.
+  - `Drain::Thread` **after completions converts the wake**: the relaxed store
+    becomes a `SeqCst` fence plus a relaxed load per record, for the same one
+    locked RMW per park, and `drain_irqs`'s load goes. **The conversion is not
+    free in either direction and the A/B is owed by whoever does it**, not
+    assumed here.
   - `Drain::Inline` (boot, 185 records on one CPU): pays `BackendGuard`'s
     `compare_exchange_weak` and its `cli` per record, plus the synchronous
     backend write. Not a saving and not meant to be one; §4.2's measurement is
     what decides whether it is gated on `has_console()`.
 
-  L1 counts both; L9 measures.
+  L1 counts the first and the third; L9 measures. The second is the other
+  branch's to count when it writes the conversion.
 - **`LOG_FILE_DRAIN_NANOS` re-derived** against a userland writer under
   `usb-slow-device` (§6.4). L6.
 
@@ -1710,15 +1919,15 @@ rebase, never amend.
 
 | # | chunk | delivers | gate |
 |---|---|---|---|
-| **L0** | merge `origin/main` (post-endowment, post-completion). Re-derive every number in this spec against the merged tree; re-check §12 row by row against the two hashes it names; compute and assert the first clean syscall number; confirm the §12.3 owner decision and what it leaves L6 to add (§5.4); **confirm the completion core can post to one waiter without a lock (§2.6a) — if it cannot, `emit` cannot wake and L3's shape changes**; confirm where `log_health` landed (§12.2); claim the sysroot | suite green; §12 has no moved row; the baselines of §9.3 recorded here |
+| **L0** | merge `origin/main` (**post-endowment, and that is the whole of it** — completions lands after this branch, §12). Re-derive every number in this spec against the merged tree; re-check §12.5's endowment rows against the merged *code* and not only its plan; compute and assert the first clean syscall number; claim the sysroot. **Nothing about the completion core is confirmable here and L0 must not wait on it** — §2.6a is resolved to its fallback by the ordering ruling, not by a measurement | suite green; §12.5 has no moved row; the baselines of §9.3 recorded here |
 | **L1** | `kernel/src/log/`: `LogRecord`, `Slot`, `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions. Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The `KernelArgs` `{:?}` site split into several records. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W2b, W4); `log_conservation`; `log_nested_emit`; `log_migration_storm`; `nmi_does_not_log`'s second clause; the boot A/B of §9.6 |
-| **L2** | the two readers; the `toyos-abi` formatter; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records; `Mark` → `Instant` | `screen_panic_muted`, `screen_fatal_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green |
-| **L3** | `Drain::{Inline,Thread}`; `klogd`'s body on compl C6's thread and its non-recoverable panic row (§4.3); `kernel-loom/tests/log_wake.rs`; `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`fd.rs:585`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement, and `log_ring::has_pending` from the pre-`hlt` check | `pre_idle_wedge_speaks`; W3 under loom; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement |
+| **L2** | the two readers; the `toyos-abi` formatter; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records; `Mark` → `Instant` | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green |
+| **L3** | `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's fallback wake (`LOG_PENDING`, `drain_irqs` posts, `waitqs` park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`fd.rs:585`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; re-point the `:523` pre-`hlt` condition at `log::pending()` rather than deleting it | `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement. **No `log_wake.rs` and no W3** — the fallback has no producer-side wake edge to model and writing one here would model absent code (§2.5) |
 | **L4** | ABI: `SYS_LOG_READ`, `LogCursor` with its clamped `durable`, `LogRecord` and its `Display` in `toyos-abi`; `Rights::LOG`; `logread` on `ProgramConfig` and on `test-runner`'s row in the three test configs; the `toyos` SDK wrapper. **This is the ABI chunk** — §11 | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall |
 | **L5** | one `ConsoleObject` per endowment over one backend, its line buffer, `Console` losing `DUP`; the ANSI strip moves; `MAX_CONSOLE_LINE` | `console_line_atomicity`; `console-unbuffered` reds both its clauses; `one_console_holder` |
-| **L6** | `/bin/logd`: the program, **its row in all six manifests** (§5.1a) including `diag/`'s and its restated comment, the protocol, rotation, retention, per-client backlog, the give-up policy and the write deadline §5.4 requires; `SYS_FSYNC`'s device flush or its named alternative (§12.4). **Delete `log_file.rs` whole**, `flush_log_file_if_affordable` and everything in §8.1's `driver.rs` list; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`; §6.3's shutdown | `kernel_log_file` re-pointed and green mid-run and after shutdown; `log_is_durable_after_fsync`; `screen_fatal_composited`'s `/log` half green; `logd_gone`; `shutdown_last_line`; `idle_loop_is_the_declared_body`; `log-writes-the-file` and `log-trusts-durable` red |
+| **L6** | `/bin/logd`: the program, **its row in all six manifests** (§5.1a) including `diag/`'s and its restated comment, the protocol, rotation, retention, per-client backlog, the give-up policy on today's live 2 s transport bound (§5.4); **`SYS_FSYNC`'s device flush, outright — there is no C12 to hand it to (§12.4)**. **Delete `log_file.rs` whole**, `flush_log_file_if_affordable` and everything in §8.1's `driver.rs` list; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`, **including `apic.rs:146`'s comment and its kick loop, which name the idle loop's `log_file::poll`**; §6.3's shutdown | `kernel_log_file` re-pointed and green mid-run and after shutdown; `log_is_durable_after_fsync`; `screen_fatal_halt_composited`'s `/log` half green; `logd_gone`; `shutdown_last_line`; `idle_loop_is_the_declared_body`; `log-writes-the-file` and `log-trusts-durable` red |
 | **L7** | userland stdio → IPC: init creates and registers the pipes; the launcher and sshd do the same for what they spawn; the std PAL's `Gone` behaviour; every console assertion in the suite re-pointed | full suite; the 234 `println!`/141 `eprintln!` sites unchanged and their output still on the console |
-| **L8** | the deletion commit; the `specs/issues/` closures of §8.2 **and the citations that go stale with them**; `specs/introspection-plan.md` re-based (§3.4); the three `MAX_CPUS` declarations filed as an issue; all five `CLAUDE.md` files | `cargo test --lib` — `every_named_issue_file_resolves` is the gate, not "it compiles" |
+| **L8** | the deletion commit; the `specs/issues/` closures of §8.2 **and the citations that go stale with them**; `specs/introspection-plan.md` re-based (§3.4); the three `MAX_CPUS` declarations filed as an issue; all five `CLAUDE.md` files. **`specs/completion-architecture-spec.md` is not in this tree** (**CONFIRMED**: it exists only on `wt/toyos-compl`, not on `origin/main`), so L8 cannot de-path its citations and `every_named_issue_file_resolves` will not see them — but it cites three of these slugs by full path and that becomes *its* C0's red, which §12.7 records so it is not discovered by CI | `cargo test --lib` — `every_named_issue_file_resolves` is the gate, not "it compiles" |
 | **L9** | measurement: the interleaved four-arm A/B (compl §20.1's protocol, ~68 min of guest time, two worktrees); `io-depth-probe`; the positive log-content assertion; assertions written into `tests/audio-baseline.toml` and the numbers into this spec | §9.3 |
 | **L10** | **conditional on the owner (§6.6, §13.1)** — pstore: the reserved region, the panic copy, the boot validate, the `SYS_LOG_READ` flag, logd's `prev-crash` file, `pstore_survives_reset` over QMP, and the `specs/issues/` entry recording that the metal arm is owed | its own; a red here is not a red on L1–L9 |
 
@@ -1771,53 +1980,79 @@ branch and every other worktree's build with it.
 
 ---
 
-## 12. Coordination — the C9/C12 absorption boundary
+## 12. Coordination — what this branch leaves the completion branch
 
-Checked against `origin/wt/toyos-compl` at **`e96cd51`** and
-`origin/wt/toyos-endow` at **`8231e90`**, both read 2026-08-09. **L0 re-checks
-every row against the merged tree; a row that has moved is a red for this spec,
-not a detail to absorb** — and this section has already been wrong once about a
-moving target, which is why the hashes are here.
+**Two branches, two directions, and the ruled order decides which is which.**
+Checked against `origin/wt/toyos-compl` at **`9890d5e`** and
+`origin/wt/toyos-endow` at **`8231e90`**, both read 2026-08-09.
 
-### 12.0 Nobody owns striking C9, and that has to be raised before L0
+- **§12.5 is a dependency.** The endowment branch lands *first*, so its rows are
+  things this branch consumes and **L0 re-checks every one against the merged
+  tree; a row that has moved is a red for this spec**. That is unchanged.
+- **§12.1 to §12.4 and §12.6 to §12.7 are obligations, not dependencies.** The
+  completion branch lands *second*, so nothing in them is re-checkable at L0 and
+  L0 must not try. They are what that branch will find, and what it owes. The
+  hash is here because the obligations are quoted from a document that is still
+  being edited.
 
-§12.1 says a list of C9 items *"must be struck from C9"*. **This spec cannot make
-that edit and neither can this branch**: `specs/completion-architecture-spec.md`
-lives on `wt/toyos-compl`, compl implements first, and by the time this branch
-opens C9 will either have been built as written or not. So:
+**`specs/completion-architecture-spec.md` is not in this tree.** **CONFIRMED**
+2026-08-09: `git ls-tree origin/main specs/` does not carry it, and it exists
+only on `wt/toyos-compl`. Every citation of it below is a citation of a document
+on another branch, which is why they are by section and not by line.
 
-- **If it is raised now**, compl's C9 shrinks to `scheduler::log_health`, the
-  `i8042` and xHCI pre-`hlt` conditions and `reap_poisoned`'s non-move, and this
-  branch builds `kernel/src/log/` once.
-- **If it is not**, C9 builds a 64 KiB byte ring with three sinks in
-  `kernel/src/log/{mod,ring,serial,file,panel}.rs`, and L1–L3 delete and replace
-  it. Effort is never an argument, so that is not a reason to change the design —
-  but it is a week of somebody's work built and thrown away, and it is avoidable
-  by one edit on a branch that is already open.
+### 12.0 The order, and what it decided
 
-**This is an owner-level coordination item, not a technical one**, and it is
-listed as §13.5 so it is answered rather than discovered at L0.
+**Ruled 2026-08-09: `endowment → log → completions`.** The prologue argues it;
+this subsection records what the ruling settled and what it did not.
 
-### 12.1 What this spec takes from compl's C9
+- **Settled: `kernel/src/log/` is built once, here.** The earlier concern — that
+  compl's C9 would build a 64 KiB byte ring with three sinks and L1–L3 would
+  delete it — is moot in a second, stronger way: C9 is written against a tree
+  that already has the record ring. §13.5's strike stands and is now belt to the
+  ordering's braces.
+- **Settled: §11.4's obligation on that branch is discharged.** Its C7+C8 cannot
+  leave the kernel file sink on the idle loop, and it does not have to: L6 has
+  deleted it. Its two shapes — the drain onto `iod`, and the append staying on
+  the idle loop behind C12 — are both struck, and the trace that justified them
+  stays there as evidence.
+- **Not settled, and it is the cost: §2.6a takes its fallback.** The lock-free
+  single-waiter post does not exist when L3 runs, so the wake is
+  `drain_irqs`-decided and one pre-`hlt` condition survives. That is a
+  *performance* fallback with a shape the tree already has, against a
+  *compilation* blocker with two costly workarounds, and it is why the ruling
+  went this way.
+- **Not settled, and it is the other cost: L3 builds the kernel-thread
+  machinery** (§4.3). C6 does not exist to inherit from. That is the largest
+  single thing the reorder moves and neither spec had planned for it.
 
-C9 is *"`kernel/src/log/`: core + three sinks + `logd`. Every deletion in §11,
-minus `reap_poisoned`"*. **All of the following is this spec's and must be struck
-from C9:**
+### 12.1 What this branch takes off compl's C9, and what C9 finds already done
+
+C9 was *"`kernel/src/log/`: core + three sinks + `logd`. Every deletion in §11,
+minus `reap_poisoned`"*. **All of the following is this spec's; §13.5 records
+that the rows were struck on that branch while it was open, and under the ruled
+order C9 additionally finds each of them already built or already deleted:**
 
 | C9 item | lands as |
 |---|---|
-| `kernel/src/log/` — the core and its file layout | L1 (and it is a **record** ring, not the 64 KiB byte ring §11 assumes) |
+| `kernel/src/log/` — the core and its file layout | L1 (and it is a **record** ring, not the 64 KiB byte ring its §11 assumed) |
 | the serial sink and its drain | L3 |
 | the file sink | **deleted, not rebuilt** — it moves to userland, L6 |
 | the panel sink | L2 |
 | `flush_log_file_if_affordable`, `LOG_DEFERRAL_CEILING_NS`, `LOG_DEFERRED_SINCE`, `log_file_flush_due`, `owes_wake` | L6 |
 | `drain_serial` from the idle loop, and its IRQs-off `BackendGuard::lock` spin | L3 |
-| the pre-`hlt` conditions `log_ring::has_pending` (`:523`) and `log_file_flush_due` (`:552`) | L3 and L6 |
-| `log_file.rs::SINK` from its §9 lock table and its §19 ledger | L6 |
-| `MAX_BLOCKED_NANOS` (its §3.2 names it) | L6, with the file it is in |
-| `idle_loop_is_the_declared_body` | L6 |
+| the pre-`hlt` condition `log_file_flush_due` (`:552`) | L6 |
+| the pre-`hlt` condition `log_ring::has_pending` (`:523`) | **L3 re-points it, and does not delete it** (§8.1, §2.6a). It becomes `log::pending()` and the *completion branch* deletes it when it converts the wake — one row this branch hands **back** rather than taking |
+| `log_file.rs::SINK` from its §9 lock table and its §19 ledger | L6. **Not "conditionally"** — its §9 leaves the row hanging on §11.4's choice; after L6 there is no `SINK`, no `Lock` and no fifth row, and its lock table converts four statics |
+| `MAX_BLOCKED_NANOS` (`log_file.rs:190`) and `LOG_DEFERRAL_CEILING_NS` from its §3.2's classification sweep | L6, with the file they are in — and **before its C1 runs**, so C1 has nothing to classify and its count of 41 production durations drops. C1 re-derives it rather than taking a number from here |
+| `idle_loop_is_the_declared_body` | L6, and amended twice afterwards (§9.5) |
+| `apic.rs:160`'s `wait_for_log_file`, its `:146` comment naming the idle loop's `log_file::poll`, and its kick loop | L6. Its §11.4 gave these to C7+C8; there is no idle-loop `poll` left for C7+C8 to re-point |
+| its §20.3's `reintroduce-idle-flush` negative control | **retired, not inherited** (§9.4). After L6 there is no `log_file::poll` to put back |
+| its §19's *"One name may come back"* — `flush_log_file_if_affordable` and `SINK`'s `Lock` dying at C7+C8 instead of at L6 | **void.** They die at L6 |
+| the three `specs/issues/` slugs its §19 says left its ledger — `client-cpu-takes-the-log-flush` (audio), `log-flush-is-unbounded` (boot-media), `pre-idle-wedge-says-nothing` (diagnostics) | **L6, L6 and L3** — the same rows §8.2 carries. Its §19 is right that this table omitted them and it was the only place the transfer was written down; that is fixed here, and its §19's *"§1.3's citation goes stale at log L8, not at C13"* becomes *"goes stale before its C0"* under the ruled order (§12.7) |
 | its §11 conclusion *"A userland `logd` was considered and rejected"* | **overruled**, and §12.1a argues it on the merits rather than on the ruling |
-| its §10 *"Three is one too few"* — the open choice between two `logd` threads and a bounded file-sink wait | **void.** There is no kernel file sink to split off, so `klogd` drains one backend and the question it asks cannot be posed. C6's thread table is `klogd`, `usbd`, `iod` with nothing left open |
+| its §10 *"Three is one too few"* — the open choice between two `logd` threads and a bounded file-sink wait | **void.** There is no kernel file sink to split off, so `klogd` drains one backend and the question it asks cannot be posed. Its C6 thread table is `klogd`, `usbd`, `iod` with nothing left open |
+| the kernel-thread machinery its C6 owns — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate | **L3 builds it, for `klogd`** (§4.3). C6 spawns `usbd` and `iod` on it, adds their two predicate rows, and keeps the `KernelPayload.address_space` retype (its §15 row 12), which L3 has no second caller to justify |
+| its §12.3's *"the one-word change C6 owes"* — `logd` → `klogd` | **discharged before C6 is written.** The thread is `klogd` from L3 |
 
 ### 12.1a The overruling, argued rather than asserted
 
@@ -1840,82 +2075,102 @@ argument the first draft of this section did not have.**
   logd's death, which §13.4 records as one of the three new regressions rather
   than waving away.
 - **And compl's own second-stage review reached the same split from the other
-  side.** Its §12.3 at `e96cd51`: *"the parked thread is `logd`, and `logd` owns
-  the serial sink too — so a hung `/log` stick costs the machine all logging …
-  on the T14, which has no serial port … that is total logging loss with no line
-  saying why."* That is the failure mode a kernel `logd` has and a userland one
-  cannot: the kernel's drainer has no disk in it. The design that spec's review
-  says is broken is the one it rejected the alternative in favour of, and this
-  is the alternative.
+  side.** Its §12.3: *"the parked thread is `logd`, and `logd` owns the serial
+  sink too — so a hung `/log` stick costs the machine all logging … on the T14,
+  which has no serial port … that is total logging loss with no line saying
+  why."* That is the failure mode a kernel `logd` has and a userland one cannot:
+  the kernel's drainer has no disk in it. The design that spec's review says is
+  broken is the one it rejected the alternative in favour of, and this is the
+  alternative.
 
-### 12.2 What stays with C9
+### 12.2 What stays with the completion branch
 
-- **`scheduler::log_health()`** (`driver.rs:679`) — C9 moves it off the idle loop.
-  It is a scheduler diagnostic that happens to log; nothing about it is the log
-  subsystem, and C9 also owns re-pointing the two tests that read its
-  `sched: cpu=` counts (`tests/toyos.rs:8229`, `:8722`).
-
-  **But C9 says "a `logd` deadline park" and that home no longer exists.**
-  `klogd`'s body is one drain and one park on one source (§4.3); a periodic
-  cadence in it makes the log drainer wake on a scheduler diagnostic's clock,
-  which is the coupling this whole spec is undoing. C9 must place it on `iod` or
-  give it its own cadence source. **Named here because "it stays with C9" is not
-  an answer when the thing C9 planned to stand it on has been redefined by this
-  spec.** L0 confirms where it went.
-- **`scheduler::reap_poisoned()`** — C9's §11 establishes it cannot move
-  (`IdleProof`), and this spec does not touch it. The idle loop's end state is
-  therefore `pass`, `reap_poisoned` and three `#[cfg]` probes, exactly as C9 says.
+- **`scheduler::log_health()`** (`driver.rs:679`) — **it stays in the idle loop,
+  and that is settled by compl §11.1 rather than open.** This spec's earlier
+  draft asked that branch to put it on `iod` or give it a cadence source, on the
+  premise that C9 was about to empty the loop. That branch answered: `NEXT_HEALTH`
+  is per-CPU because *"which CPUs reach idle is most of what the line says"*, and
+  `ready_len`/`parked_len` read the caller's own `!Sync` `CpuSched`, so a single
+  thread can only ever report the CPU it is on; the line's own doc forbids reading
+  it as a heartbeat, which a periodic park would make it; and a 10 s park is a
+  wake on a machine that would otherwise halt. **The answer is right and this spec
+  adopts it.** L6's `idle_loop_is_the_declared_body` therefore declares
+  `log_health` as part of the body, and the two tests that read its `sched: cpu=`
+  counts (`tests/toyos.rs:8229`, `:8722`) stay live and unmodified across this
+  branch.
+- **`scheduler::reap_poisoned()`** (`driver.rs:680`) — compl §11.2 establishes it
+  cannot move (`IdleProof`), and this spec does not touch it. The idle loop's end
+  state after L6 is therefore `log_health`, `reap_poisoned`, `pass` and three
+  `#[cfg]` probes.
 - **`i8042::verdict_due` (`:534`) and `xhci::port_work_pending` (`:564`)** — the
   other two pre-`hlt` conditions. Neither is a log condition; both become a
-  `usbd` deadline park or a `Poll`, which is C9's and C10's work.
-- **`poll_if_pending` leaving `drain_irqs`** — C7's.
-- The kernel-thread machinery itself — **C6's**, including the recoverable-panic
-  predicate and the `KernelPayload.address_space` retype.
+  `usbd` deadline park or a `Poll`, which is that branch's C9 and C10 work, and
+  both are still standing when this branch ends.
+- **`poll_if_pending` leaving `drain_irqs`** — its C7's.
+- **The `KernelPayload.address_space` retype** — its C6's, per §12.1.
 
-### 12.3 The one-word change C6 owes
+### 12.3 The one-word change is already made
 
-C6's table spawns `logd`, `usbd` and `iod`. **Its `logd` is this spec's `klogd`**
-and must be named that, because `/bin/logd` is a userland program in the same
-machine and `sched::dump` names threads. That is the whole of the change: same
-thread, same identity work, a different name and the body in §4.3.
+That branch's C6 table spawned `logd`, `usbd` and `iod`, and owed the rename to
+`klogd` because `/bin/logd` is a userland program in the same machine and
+`sched::dump` names threads. **Under the ruled order the thread is `klogd` from
+L3 and there is nothing to rename** — C6 finds it spawned, named and dumped, and
+adds two threads beside it. The reason for the name survives because a later
+agent will otherwise re-collide them: two things called `logd` in one report is a
+collision a dump cannot survive.
 
-### 12.4 C12 — the write-back queue
+### 12.4 C12 — the write-back queue, and the device flush L6 now owes outright
 
-**C12 stays entirely with compl.** It is `fd::OpenFile::drop`, the `iod`
-write-back queue, `FileObject::on_zero_handles`, `SYS_FSYNC` parking, page-cache
-eviction, §13.1's page pinning and `close_file`, and the `disk_backtrace` /
-`esp_files` obligations. None of it is log-specific, and the reason it appeared
-adjacent is only that `log_file::Sink::append` was one of its callers.
+**C12 stays entirely with the completion branch.** It is `fd::OpenFile::drop`,
+the `iod` write-back queue, `FileObject::on_zero_handles`, `SYS_FSYNC` parking,
+page-cache eviction, its §13.1's page pinning and `close_file`, and the
+`disk_backtrace` / `esp_files` obligations. None of it is log-specific, and the
+reason it appeared adjacent is only that `log_file::Sink::append` was one of its
+callers.
 
-**What this spec removes from C12's surface**, and it is a simplification worth
-naming: after L6 the kernel has no `flush_file` caller of its own on a
-diagnostic path. `log_file.rs` was the one place where a *kernel* thread reached
-the file cache from something that was not a syscall, and it is gone. C12's
-remaining callers are all userland-driven.
+**What this branch removes from C12's surface, and landing first makes it
+already-true rather than promised.** `Vfs::flush_file` (`vfs.rs:538`) has exactly
+three callers today: `fd::OpenFile::drop` (`fd.rs:48`), `fd::fsync` (`fd.rs:644`)
+and `log_file.rs:376` — **CONFIRMED** 2026-08-09. The third is the only one not
+reached from a syscall, and L6 deletes it. So C12 opens on a tree where every
+`flush_file` in the kernel is userland-driven and its queue has one class of
+producer instead of two.
 
-**One coupling, and the first draft left it conditional on C12 when the answer is
-already known and is "no".** logd's durability claim (`LOG_DURABLE_NS`, §6.4) is
-only true if `SYS_FSYNC` means what it says on the log volume, including the
-device-level cache flush. **CONFIRMED against this tree, 2026-08-09:**
+**The device-level flush is the coupling, and the order change makes it L6's
+outright.** logd's durability claim (`LOG_DURABLE_NS`, §6.4) is only true if
+`SYS_FSYNC` means what it says on the log volume, including the device's own
+cache flush. **CONFIRMED against this tree, 2026-08-09:**
 
-- `log_file.rs:382` is `vfs.flush_file(...)` **and then** `vfs.sync_mount(MOUNT)`,
-  whose own comment is the reason — *"The FAT and the directory entry have reached
-  the device; the device's own write cache has not. A log that survives a wedge
-  has to survive the power being cut with it."* `sync_mount` (`vfs.rs:698`) reaches
-  `Fat32::sync` (`toyos-fat32/src/fs.rs:901`), which writes FSInfo and calls
-  **`self.dev.flush()`** — the block device's flush, SCSI SYNCHRONIZE CACHE on a
-  stick.
-- `fd::fsync` (`fd.rs:639`) calls **only** `vfs::lock().flush_file(...)`. There is
-  no `sync_mount` and no `dev.flush()` on that path.
+- `log_file.rs:376` is `vfs.flush_file(...)` **and then** `vfs.sync_mount(MOUNT)`
+  at `:382`, whose own comment is the reason — *"The FAT and the directory entry
+  have reached the device; the device's own write cache has not. A log that
+  survives a wedge has to survive the power being cut with it."* `sync_mount`
+  (`vfs.rs:698`) reaches `Fat32::sync` (`toyos-fat32/src/fs.rs:901`), which writes
+  FSInfo and then calls **`self.dev.flush()`** at `:908` — the block device's
+  flush, SCSI SYNCHRONIZE CACHE on a stick.
+- `fd::fsync` (`fd.rs:639`), which is what `SYS_FSYNC` dispatches to, calls
+  **only** `crate::vfs::lock().flush_file(...)` at `:644`. There is no
+  `sync_mount` and no `dev.flush()` anywhere on that path.
 
-So today's `SYS_FSYNC` stops one level short of what `log_file` does, and **L6
-owes the equivalent regardless of what C12 does to parking.** That is a change to
-a shipped syscall's semantics, so it is a decision rather than an implementation
+So today's `SYS_FSYNC` stops one level short of what `log_file` does. **The
+earlier draft said "L6 owes the equivalent regardless of what C12 does to
+parking"; under the ruled order the hedge is gone and L6 owes it, full stop** —
+C12 does not exist yet, and a logd that fsyncs and calls the result durable
+without it is a spec lying about its own guarantee. That is a change to a shipped
+syscall's semantics and therefore a decision rather than an implementation
 detail: either `SYS_FSYNC` gains the mount sync for every caller — which makes
 every `fsync` in the machine slower and more honest — or logd gets a distinct
 call and the asymmetry is written down. **L6 raises it; the second option needs a
-new syscall number, which needs discussion.** `log_is_durable_after_fsync`
+new syscall number, which needs discussion, and it would be a *second* number on
+a branch §11 has already structured around one.** `log_is_durable_after_fsync`
 (§9.5) is the gate, and it reds on today's behaviour.
+
+**What C12 then inherits.** compl §13 says *"`SYS_FSYNC` parks on a real
+completion"* and separately that parking is not durability. After L6 the two
+questions are answered in the two places: L6 settles what `SYS_FSYNC`
+*guarantees*, C12 settles what it *costs a CPU*. C12 must not undo the first
+while changing the second, and `log_is_durable_after_fsync` is what would catch
+it.
 
 ### 12.5 The endowment architecture
 
@@ -1950,6 +2205,46 @@ layout.
 from** — `console` and `test-runner` are in `console/system.toml` and the three
 `tests/*case/system.toml` respectively, never in `system.toml`. §5.1a is the
 six-manifest table that follows from it.
+
+### 12.6 Every completion primitive this branch does without
+
+One table, so an implementer never reaches for something that is not there and a
+reviewer can check the conversions off afterwards. **None of these is optional
+scope this branch declined — each is a type or a mechanism the completion branch
+introduces, and the ruled order puts that branch second.**
+
+| primitive | what this branch does instead | what the completion branch converts |
+|---|---|---|
+| the completion core (`Record`, `Inbox`, `arm`, `wait`, `post`) | §2.6a's fallback: `emit` stores a relaxed flag, `drain_irqs` posts through today's `waitqs`, `klogd` parks with `prepare_wait`/`block_on` (`scheduler.rs:170`, `:181`) | its C2+C3: the park becomes an `Inbox` park, the post becomes `commit_and_signal`, and §2.5's W3 becomes real and owed |
+| the lock-free single-waiter post | as above, plus **one surviving pre-`hlt` condition**, `log::pending()` (§8.1) | the condition is deleted at the conversion, because a posted `klogd` is runnable at the commit and Invariant T covers the halt |
+| a userland readiness source for `SYS_LOG_READ` | `Source::Log`, a sixth `io_uring::Source` with the sixth per-source `IO_URING_WATCHERS` static (§3.2) | its C3 folds all six into one watch list and its §19 deletes the statics together |
+| kernel threads (its C6) | **L3 builds the machinery for one** (§4.3): trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate | C6 spawns `usbd` and `iod` on it, adds their predicate rows, and does the `KernelPayload.address_space` retype |
+| `Parkable` (its C5) | nothing needs one: no path this branch adds takes a sleep lock, and §7's diagnostics take no `Lock` at all after L3 | the token arrives and every one of §7's contexts still lacks it, so a diagnostic that blocks stays untypeable — this branch does not weaken that |
+| `SleepLock` (its C5) | nothing: `BackendGuard` stays a spin (compl §4.5a keeps it on the allow-list either way) and `klogd` holds it for one bounded chunk | its C7+C8 converts `VFS`, `VOLUMES`, `XHCI` and `ProcessData`; **none of the four is on any path this branch adds** |
+| the six duration kinds (its C1) | `LOG_WRITE_BUDGET` is a named `u64` in a userland program with its reason beside it (§5.4); RT7 reaches `kernel/src/` and logd is not in it | nothing to convert. `LOG_FILE_DRAIN_NANOS` is the one kernel duration this branch touches and L6 re-derives its *value*, leaving C1 to give it a *kind* |
+| a caller-side write `Deadline` (its §12.3) | the live 2 s `USB_TIMEOUT_NS` (`xhci/mod.rs:319`, **CONFIRMED**) gives logd an `Io` to act on | whatever C7 picks, **it must leave logd an error rather than an unbounded park** (§5.4) |
+| the write-back queue (its C12) | `SYS_FSYNC` gains the mount sync at L6 (§12.4) | C12 changes what `SYS_FSYNC` *costs*, never what it *guarantees* |
+
+### 12.7 One thing this branch breaks on the other branch, named so CI does not find it
+
+`src/docs.rs`'s `every_named_issue_file_resolves` walks every text file in the
+tree and reds on a `specs/issues/<area>/<slug>.md` path that does not resolve.
+L8 deletes ten entries (§8.2) and de-paths every citation **in this tree**.
+`specs/completion-architecture-spec.md` is not in this tree, and its §19 records
+that it cites `client-cpu-takes-the-log-flush` by full path in its own §1.3, that
+`specs/introspection-plan.md` cites `log-flush-is-unbounded` by full path twice
+(`:31`, `:56`), and that seven of its twelve remaining slugs are cited by full
+path from files that are not their own entry.
+
+Its §19 concludes that *"§1.3's full-path citation therefore stays live through
+this branch and goes stale at log L8, not at C13."* **Under the ruled order that
+is backwards**: L8 lands first, so the citation is already dead when that branch
+merges `origin/main` at its C0, and `cargo test --lib` reds on its own spec file
+the moment it does. It is a one-line edit and it is in nobody's chunk budget, so
+it is written here: **the completion branch's C0 de-paths every citation of a
+slug this branch closed, in the same commit as the merge.** The
+`specs/issues/README.md` protocol — move the durable rule into the spec that owns
+the subject — is the same edit.
 
 ---
 
@@ -2026,10 +2321,14 @@ that has no analogue today**:
    trip round a loop; logd needs a runnable task chosen on some sibling. A panic
    that happened inside the scheduler, or on a CPU holding a run-queue lock, can
    leave nothing able to choose it.
-2. **logd needs four locks the panicking thread is not the only candidate to
-   hold.** VFS, the volume, the controller, and after C12 the write-back queue —
-   any wedged CPU holding any of them is enough, where the old sentence only
-   considered the panicking thread and only the VFS.
+2. **logd needs three locks the panicking thread is not the only candidate to
+   hold, and a fourth once the completion branch lands.** VFS, the volume and
+   the controller at L6; the write-back queue when its C12 puts one between logd
+   and the disk. Any wedged CPU holding any of them is enough, where the old
+   sentence only considered the panicking thread and only the VFS. **The count
+   was four because this spec assumed C12 had already landed; under the ruled
+   order it is three at L6 and grows to four later**, which does not soften the
+   case and is stated because a number nobody can reproduce is worse than none.
 3. **logd is killable and restartable-by-nobody.** §5.7: no `SYS_PORT_REARM`, so
    a logd that died earlier in the boot for an unrelated reason means every later
    panic on that boot is panel-only, and init's one line about it is minutes
@@ -2043,30 +2342,23 @@ Against those: the design also *removes* a failure this path has today, because
 closes it properly, and it is the reason that recommendation is a recommendation
 rather than a nice-to-have. **Recorded rather than asked — and then put to him anyway; see this section's ruling above.**
 
-### 13.5 C9's log rows — **struck, 2026-08-09**
+### 13.5 C9's log rows — **struck, 2026-08-09; and then the order was ruled**
 
-**Resolved: the compl branch was told while it was still open.** This section's
-premise — that compl implements first and this edit cannot be made from here —
-was true of the branch and false of the schedule: compl is planned and reviewed
-but **parked** behind the endowment branch, no agent holds it, and the
-orchestrator struck the rows directly on `wt/toyos-compl`. So C9 shrinks to
-`scheduler::log_health`, the `i8042` and xHCI pre-`hlt` conditions and
-`reap_poisoned`'s non-move, and `kernel/src/log/` is built once, here.
+**Resolved twice, and the second resolution subsumes the first.** The premise —
+that the completion branch implements first and this edit cannot be made from
+here — was true of the branch and false of the schedule: that branch is planned
+and reviewed but **parked** behind the endowment branch, no agent holds it, and
+the orchestrator struck the rows on it directly. **Then, the same day, the
+orchestrator ruled the pipeline order to `endowment → log → completions`**, which
+makes the strike belt to the ordering's braces: C9 is now written against a tree
+that already carries the record ring, so there is no version of it that builds a
+64 KiB byte ring and no duplicated work to avoid.
 
 The general lesson is worth more than the item: **a spec that says "another
 branch must do X" has named an owner who does not exist.** Cross-branch
-obligations belong to whoever schedules the branches, and saying so out loud is
-what got this one done instead of discovered at L0.
-
-§12.0 is the argument that produced it. This spec says a list of items *"must be struck from C9"*, and no agent on
-this branch can make that edit: it lives in
-`specs/completion-architecture-spec.md` on `wt/toyos-compl`, which implements
-first. Left alone, C9 builds `kernel/src/log/` as a 64 KiB byte ring with three
-sinks and L1–L3 delete it. Effort is never an argument for changing the design
-and this is not asking for one — it is asking whether the compl branch is told
-now, while it is open, or whether the duplicated work is accepted. **The only
-thing that would be a mistake is nobody deciding**, because the default is the
-expensive branch of it and it arrives silently.
+obligations belong to whoever schedules the branches. Saying so out loud got the
+strike made instead of discovered at L0 — and it is also what surfaced the
+sequencing question the strike could not answer, which is §12.0's ruling.
 
 ---
 
@@ -2097,7 +2389,11 @@ Recorded because each is attractive and the next reader will re-derive it.
    under TCG. §1.4.
 6. **A per-record wake with no fence, backstopped by a bounded park.** That is a
    timer hiding a lost wake, which the completion architecture forbids by name.
-   §2.5 W3 pays the fence and loom proves it is needed.
+   §2.5 W3 pays the fence and loom proves it is needed. **§2.6a's fallback is not
+   this and the difference is the whole of why it is acceptable**: it has no
+   per-record wake to lose, because `drain_irqs` re-evaluates the predicate on
+   every scheduler pass, so a wake that did not happen is taken on the next pass
+   rather than by a deadline nobody can justify. Nothing in it is a timer.
 7. **A harness-side splice *repair*.** The issue itself shows why: the second
    recorded occurrence had a *userland* intruder that `is_kernel_line` cannot
    identify, and the capture ended inside the split line, so no reassembly on the
@@ -2110,12 +2406,14 @@ Recorded because each is attractive and the next reader will re-derive it.
    is two locked RMWs where §1.4 prices one at 350 ms of boot. §2.3a.
 10. **No bracket at all, on the ground that `log!` mostly runs with `IF` already
     clear.** True of every syscall and every IRQ handler, and false of a kernel
-    thread at preempt depth 0 — of which C6 adds three, one of them `klogd`
-    itself. A correctness argument that holds for most callers is not one. §2.3a.
-11. **Making `emit` post a completion through compl's ordinary path.** It walks a
-    list under the subject's leaf lock, which `emit` may not take and which
-    deadlocks the first time anything on that lock's path logs. §2.6a states the
-    narrower thing the log source must be instead.
+    thread at preempt depth 0 — of which L3 adds the first, `klogd` itself, and
+    completions' C6 two more. A correctness argument that holds for most callers
+    is not one. §2.3a.
+11. **Making `emit` post a completion through the completion core's ordinary
+    path.** It walks a list under the subject's leaf lock, which `emit` may not
+    take and which deadlocks the first time anything on that lock's path logs.
+    §2.6a states the narrower thing the log source must be instead — and, under
+    the ruled order, the fallback L3 builds before that narrower thing exists.
 8. **Converting all 654 `log!` sites to a finer level set.** A level with no
    reader is a field built for a plan; §2.1's three variants each have callers
    today.
