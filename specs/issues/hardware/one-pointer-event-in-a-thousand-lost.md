@@ -4,8 +4,10 @@ kind: defect
 opened: 2026-08-06
 ---
 
-# One pointer event in a thousand still does not reach userland, inside the pacing bound
+# `i8042_mouse`: the host outran QEMU's PS/2 queue, twice over
 
+Both red modes are fixed and both were the harness. Neither was ever a packet
+the driver lost.
 
 **The count.** `MOUSE_LEAD` let the host hold 32 packets — 96 bytes — injected
 but unreported, and justified it against "a 256-byte ring in the kernel and
@@ -22,6 +24,13 @@ is why every observed shortfall was even (996/1004, 1002/1004) and why the
 stalls sat at a deficit of exactly 32: losses accumulate until the lead is full
 and the host never injects again.
 
+Reproduced by pipelining QMP commands without awaiting their replies, which is
+what an oversubscribed host does to the vCPU thread by accident. Floods of
+4/8/16/32/64/128/256 back-to-back packets, two sweeps in one boot:
+
+    [4, 8, 16, 32, 62, 128, 256, 4, 8, 16, 32, 64, 126, 256]
+    [4, 8, 16, 32, 62, 128, 256, 4, 8, 16, 32, 64, 100, 256]
+
 and in an earlier boot a 32 that delivered 18. Paced injection on a quiet host
 never merged at any lead, including no pacing at all — which is exactly why this
 only ever reddened under contention, and why a branch's kernel had nothing to do
@@ -36,6 +45,8 @@ on — that QEMU sums motion between syncs rather than dropping it — is staged
 the run itself: `MERGE_MOTIONS` moves in one `input-send-event` must come back
 as one packet of that many steps. Making `mouse_merged` send one command per
 move instead reds it (1012 events for 1009 packets), so the stage has teeth.
+Cost: the injection takes about 2× the guest time it did (578 ms → 1313 ms
+measured alone), against a 60 s failure mode removed.
 
 **The lost edge.** `service` reads the source's `irq_ring` record, then reads
 the byte ring. The ISR fills the byte ring *before* it publishes its record, so

@@ -34,7 +34,7 @@ one. So a spawn is the most delivery-dependent operation in the system: unlike a
 wake, which goes to a task's home CPU where other work usually is, a spawn
 routinely aims its only reap-or-run event at a CPU that must be interrupted to
 see it, and then must complete a whole pass before the thread's first
-instruction runs. Everything in `specs/issues/kernel/`'s first entry — `drain_irqs`'s xHCI recovery
+instruction runs. Everything in `scheduler-pass-blocks-in-xhci` — `drain_irqs`'s xHCI recovery
 ahead of the mailbox drain, `log_file::poll()` ahead of the idle loop's `pass()`
 — sits between that IPI and that first instruction. This machine boots off the
 stick it logs to (`usb-storage: disk 0 ready on slot 3, SanDisk Ultra`, and

@@ -52,7 +52,7 @@ const RING_SIZE: usize = 64 * 1024;
 /// double fault runs on IST1, a 4096-byte stack. Measured with `ist1_report`:
 /// the report used **9968 bytes**, so it ran 5872 bytes past the end of the
 /// stack and into the heap underneath while writing the explanation for the
-/// fault that had just happened. (Known issues estimated ~1.4 KiB; it was
+/// fault that had just happened. (The first estimate was ~1.4 KiB; it was
 /// four times that.)
 ///
 /// 512 is what `drain_chunk_to_serial` already used for the bounded-latency

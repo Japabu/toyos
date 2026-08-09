@@ -1,6 +1,6 @@
 ---
 status: open
-kind: rejected
+kind: defect
 opened: 2026-08-08
 ---
 
@@ -45,6 +45,6 @@ neither. Every *host* binary goes through it — the build system, the harness,
 `.cargo/config.toml`s under `bootloader/` and `kernel/` set
 `linker = "toyos-ld"`, so nothing that boots is touched.
 
-`src/main.rs:7`'s preflight checks `git`, `rustup` and `qemu-system-x86_64` and
-says nothing about either of these. The cheap half of the fix is to make the
-preflight and the README say what the machine actually needs.
+The cheap half of the fix — a preflight and a README that say what the machine
+actually needs — is done. `REQUIRED` carries `cc` and `ALSO_USED` carries the
+Python search list (`src/main.rs:18`, `:28`). The expensive half is untouched.

@@ -345,7 +345,8 @@ The hand-built fixture passes `fsck_msdos -n` clean, so it is a real volume.
 `toyos-fat32/tests/` builds its volumes with `newfs_msdos` and populates them
 through a `hdiutil` mount, which is the point of that suite — our reader against
 bytes we did not write. Replacing those two is a larger job and is scoped in
-`specs/issues/` §9. Nothing in the *guest* suite touches them.
+`specs/issues/filesystem/fat32-suite-needs-macos-binaries.md`. Nothing in the
+*guest* suite touches them.
 
 `ps -Ao comm=` and `getloadavg` — the other two host calls the harness makes —
 are both Linux-native, so with the judge portable there is nothing left in the
@@ -385,8 +386,9 @@ an Intel Xeon passed. Both facts are one cause. `STAR[63:48]` held `0x10`, and
 does not, so an AMD host ran userland with `SS = 0x18` and the first `iretq`
 back to such a thread died on "SS.RPL must equal CS.RPL". QEMU's `helper_sysret`
 implements Intel's wording, which is why no TCG guest anywhere — runner or dev
-host — can see the class. Fixed in `arch/percpu.rs`; the write-up and the
-evidence are `specs/issues/` §3.
+host — can see the class. Fixed in `arch/percpu.rs`; the surviving record is
+`specs/issues/kernel/sysret-ss-attrs-unfixed.md`, the residual the RPL fix does
+not reach.
 
 **The reusable part is the shape of the blind spot**, not the bug. A guest that
 emulates an instruction gives you one vendor's reading of it, and the dev host
@@ -621,7 +623,7 @@ the harness:
   `metal_sim_pointer_churn`, `usb_transport_break`, and `xhci_flap` from the
   probe. Every one drives `device_add`/`device_del` over QMP, every one is red
   again alone, and every one is green under TCG on the same runner image and the
-  same QEMU. `specs/issues/` §8. **`usb_transport_break` is closed and
+  same QEMU. `specs/issues/hardware/`. **`usb_transport_break` is closed and
   belonged to the family only by its symptom** — it drives no QMP at all, and
   what it shared with the rest is the one variable: a guest running 50x faster
   wins a race against the device that a TCG guest loses.
@@ -924,7 +926,7 @@ thread.** Both binaries fail on the same sub-test: the one that panics on a
 thread. The first two panics of each unwind cleanly and print `ok`. The process's
 main thread was spawned on **cpu1** and the fault is on **cpu0**.
 
-`specs/issues/isolation/` already records the other end of this: **no context
+The other end of this was already on record: **no context
 switch saves x87 state** — no `fxsave`, `fnsave` or `fsave` anywhere in
 `kernel/src` — and `fault_gates`' `mf` arm, the only thing in this tree that
 executes an x87 instruction at all, unmasks IM, computes 0/0 and expects the
@@ -944,7 +946,7 @@ reps, one runner, one commit, one shard, and the only difference is
 So the red is a kernel isolation defect that CI found and that the dev host
 cannot: **any Ring 3 process can leave a pending unmasked x87 exception behind
 and kill the next unrelated process scheduled on that CPU.** It belongs to
-§1's entry and is not fixed here — the fix is x87 state on the context switch,
+that entry and is not fixed here — the fix is x87 state on the context switch,
 in `kernel/src/arch/`, which is a subsystem change with its own owner.
 
 **Two repairs would turn this red green and only one of them is a fix.** Giving
@@ -1389,3 +1391,19 @@ image with the same accelerator:
 
 So one name is left between `main` and the trigger, it is a defect with a
 write-up and an owner's decision outstanding, and it fires one run in five.
+
+**And a fifth, which the fix for the second uncovered.** `main` at `1ed6f39`
+(run `31284962381`) is red on `dump_nmi_probe` again and on a signature neither
+probe ever produced — *the dump never ran*, both attempts. The actuator's cpu0
+kicks the victim and waits 100 ms for it to reach its idle loop; on that runner
+it took **251 ms**, so cpu0 gave up at 11.417 s, nothing was staged, no report
+was asked for, and the victim went deaf at 11.568 s for nobody. There is no
+bound to give: the pass a kicked CPU is finishing runs
+`flush_log_file_if_affordable` with preemption off, and on a machine whose
+`/log` is a USB device CLAUDE.md already records that as a string of bulk
+transfers. So the budget is generous now and, more to the point, no longer the
+whole answer — expiring it takes the ask back with a CAS and lets the next pass
+ask again, and a CAS that *fails* means the victim went deaf on the boundary and
+the report is asked for after all. **0 of 20 probe reps and 2 of 2 in one shard
+job** is the shape of a rate nobody has counted, which is why the give-up is
+repaired rather than the number tuned.

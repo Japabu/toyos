@@ -1218,8 +1218,8 @@ file had only argued:
    machines for 44.1 kHz with `0x2011` — a 48 kHz base carrying a reserved
    multiplier — and both played 48 kHz. Every buffer was correct and the whole
    pipeline ran 8.8% fast. Closed 2026-08-08; the evidence, the two gates and
-   what it had been hiding in the `hda_tone` capture are in `specs/issues/`
-   §4 and `specs/metal-logs/2026-08-08-audio-underruns/`.
+   what it had been hiding in the `hda_tone` capture are in
+   `specs/issues/audio/` and `specs/metal-logs/2026-08-08-audio-underruns/`.
 6. **Association is the codec's own statement** that the speaker and the jack
    are one output: both association 1, the jack last by sequence.
 7. **QEMU has no speaker pin, so §2.3's rule is widened. Decided 2026-08-06.**

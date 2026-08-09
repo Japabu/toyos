@@ -6,8 +6,9 @@ opened: 2026-08-05
 
 # A `winit` app spins forever when its window is closed, and never exits
 
-Separate from the above, in the fork rather than the tree, and **decided by
-reading rather than by a reproduction.** `snake` (pid 23) had a real window —
+Separate from `total-freeze-reproduces-in-qemu`, in the fork rather than the
+tree, and **decided by reading rather than by a reproduction.** `snake` (pid 23)
+had a real window —
 the compositor reports `windows=2` and 86 frames per 2 s batch from 883.7 s —
 which went away at ~896 s, leaving `windows=1`. The process never exited, and
 it did not exit when the compositor itself died at 952.8 s either.
@@ -51,4 +52,4 @@ on his machine and in `desktop_window_child`, three rounds, one of them played.
 
 **What that session leaves open is not snake.** 34 ms after snake exited the
 shell exited too, and 13 ms after that the terminal — so the owner got no
-prompt back. That is the next entry.
+prompt back. That is `desktop-window-child-freeze`.

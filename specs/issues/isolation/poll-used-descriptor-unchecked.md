@@ -8,7 +8,7 @@ opened: 2026-08-08
 
 `Virtqueue::poll_used` (`kernel/src/drivers/virtio.rs:387-399`) reads `id` and
 `len` out of the used ring — memory the *device* writes, and for virtio-net
-memory *netd* writes too (entry above) — and returns `DescSlot(id as u16)` and
+memory *netd* writes too (`netd-writable-virtqueue`) — and returns `DescSlot(id as u16)` and
 `len` with no comparison against `self.size` or against any buffer length.
 `UsedRingConsumer::poll` (`:191-205`) does the same for `id`. `DescSlot` is this
 codebase's own proof token, deliberately non-`Copy` and non-`Clone`

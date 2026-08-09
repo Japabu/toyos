@@ -701,7 +701,8 @@ impl FileSystem for FatFs {
     ///
     /// The read side is not closed here — the `FatBacking` an open fd already
     /// holds still names those byte ranges, which is the same live
-    /// cross-process leak known issues records for `/home`. This closes the
+    /// cross-process leak `specs/issues/isolation/tmpfs-backing-outlives-deletion.md`
+    /// records for `/home`. This closes the
     /// destructive half only.
     fn delete(&mut self, name: &str) -> Result<(), SyscallError> {
         if let Some(file_id) = self.by_name.remove(name) {
@@ -907,7 +908,8 @@ fn probe_announced(mut probed: usize) -> usize {
 /// Only USB today. A machine that boots off an internal disk lands in the
 /// `None` arm and gets neither mount, because the NVMe device is owned by the
 /// page cache from the moment storage comes up and there is no second handle
-/// to it — see the report in known issues rather than a workaround here.
+/// to it — see the report in `specs/issues/build/page-cache-owns-one-device.md`
+/// rather than a workaround here.
 fn device_carrying(id: crate::block::DeviceId) -> Option<Box<dyn BlockDevice>> {
     (0..usb_storage::count())
         .filter_map(usb_storage::open)

@@ -59,8 +59,8 @@ That is a splice with no silence in it, which is this signature exactly. Six
 `hda_tone` runs in one session, instrumented with a counter of fills that were
 not in the engine's order, separated cleanly: **one run at `out_of_order=2`,
 `max_batch=7`, 9 phase breaks; five at `out_of_order=0`, `max_batch=4`, 0
-breaks.** It is fixed and the fill order is now the
-engine's by construction.
+breaks.** It is fixed (`hda-ring-fix-unverified-on-metal` is what that fix still
+owes) and the fill order is now the engine's by construction.
 
 **The breaks survive it.** Two runs on the fixed tree gave 8 and 6, with
 `deferred=0` and an ordering that can no longer be wrong. So the ordering was a
@@ -78,3 +78,4 @@ new numbers add:
 
 So the next step is the host side. `isr_complete` is a weaker candidate than it
 was: `stream::decode` now refuses any mask that is not a walk of the ring, and
+soundd fills in the order that walk names rather than in index order.

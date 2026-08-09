@@ -235,7 +235,7 @@ const IDLE_GUARD_SIZE: usize = 4096;
 /// Both numbers here are `ist1_report`'s, off a real #DF, not estimates:
 /// **9968 bytes** used before the drain buffers were cut to `DRAIN_CHUNK`, and
 /// **4512** after. So the overrun was 5872 bytes — four times the ~1.4 KiB
-/// known issues estimated — and, more to the point, cutting the buffers was
+/// first estimated — and, more to the point, cutting the buffers was
 /// never going to be sufficient on its own: 4512 still does not fit 4096. The
 /// stack had to grow whatever happened to the buffers.
 ///

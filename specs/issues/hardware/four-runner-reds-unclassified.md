@@ -21,7 +21,7 @@ green run cannot quietly be read as their absence.
 
 **Two of the four are 0 of 5 on the current tree and one is closed.**
 `doom_sound_flood` and `sshd_fail_closed` did not fire in the rate probe.
-`metal_sim_null_audio` was 5 of 5 and is closed above, together with
+`metal_sim_null_audio` was 5 of 5 and is closed, together with
 `hda_two_live_refused` — one question about how the two tests read the boot
 console, and not one about soundd's device-less path, which was doing its job on
 every one of those runs. `hda_client_stall` is the one still standing.

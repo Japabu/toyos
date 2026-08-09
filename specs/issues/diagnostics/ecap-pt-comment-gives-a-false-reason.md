@@ -20,8 +20,8 @@ raw words are recorded so the next reader need not take a name for it.
 
 **No behaviour is affected.** §5.7 already writes an identity-mapped domain
 "always, and never a passthrough context entry, even on a unit that offers
-one", and `specs/issues/hardware/`'s item 8 carries the argument. What is now false is the *reason*
-attached to it: `kernel/src/iommu/mod.rs`'s `Iova::identity` says "§8.1 measured
+one", and that spec's §8 item 8 carries the argument. What is now false is the
+*reason* attached to it: `kernel/src/iommu/mod.rs`'s `Iova::identity` says "§8.1 measured
 `ECAP.PT` clear on the only unit anyone here can boot, **so** §5.7's passthrough
 context type is unavailable" — a premise this host contradicts, which leaves a
 correct decision resting on a reason that has stopped being true. §5.7's own
