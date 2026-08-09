@@ -22,8 +22,9 @@ Recorded durations on disk, from other worktrees' `target/test-durations`
 | `toyos-h3` (2026-08-08 00:08) | 285 | **209 405 ms** | **1st** | `i8042_kbd_echo` 187 280 |
 | `toyos-hdaprobe` (2026-08-06 11:47) | 258 | **18 989 ms** | 8th | `xhci_msi_only` 39 054 |
 
-The h3 figure is from a contended run (`specs/issues/design-debt/`'s class), so "longest" is that run's
-verdict and not a clean measurement; 19.0 s is the uncontended shape. Its
+The h3 figure is from a contended run (`parallel-tests-red-under-other-suites`'s
+class), so "longest" is that run's verdict and not a clean measurement; 19.0 s
+is the uncontended shape. Its
 already-split sibling `wall_clock_file` costs 2818/3189 ms in the same two files.
 `longest_first` (`tests/toyos.rs:9991`) can order jobs and can never split one,
 so the ordering cannot help here.

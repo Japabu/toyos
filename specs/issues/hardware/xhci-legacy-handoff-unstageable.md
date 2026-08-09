@@ -31,7 +31,12 @@ past the register window, a link that leaves it, a window reading all ones, a
 chain of minimum-length links, ours first/last/absent) and logs how many were
 refused. The walk cannot loop, for three independent reasons — the next pointer
 is a strictly positive forward delta, every read is bounds-checked against the
+mapped window, and the iteration count is capped at 64 — and the self-test's
+teeth were shown by deleting the end-of-list check, which turned one case into
+`Err(TooMany)` instead of `Ok(None)`: still bounded, still red.
 
+Not built: the Supported Protocol capability (ID 2) is walked past. Nothing
+reads it yet, so this is a gap in the parse rather than in behaviour. It was
 also the leading suspect for the T14's five ports that reset and did not enable,
 and it was not the cause — see `2b0631f`; the reset write is the same for both
 protocols, and knowing which port is which would not have changed it. What it

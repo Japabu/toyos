@@ -14,6 +14,29 @@ use toyos_hda::stream;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+/// One line, one `write`.
+///
+/// **`eprintln!` is not one write and `println!` is not either.** Stderr is
+/// unbuffered by design, so `write_fmt` issues a syscall per format fragment;
+/// stdout's `LineWriter` makes it two, one flushing what it had buffered and
+/// one for the rest. Every gap between two of those is somewhere the kernel's
+/// own log can land, because on this machine the console and the log ring are
+/// one stream — and `soundd: client ` came back with four `exit:` accounting
+/// lines inside it and `1 removed` under them, on CI run `31271983043`. The
+/// collision is systematic and not unlucky: this daemon prints a client's
+/// removal exactly when the kernel is printing that client's exit.
+///
+/// `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` is the class
+/// and where it should be fixed for everyone.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let mut line = format!($($arg)*);
+        line.push('\n');
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }};
+}
+
 mod hda;
 mod virtio;
 
@@ -519,7 +542,7 @@ impl MixStats {
     }
 
     fn report(&self, clients: usize) {
-        eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={}",
+        say!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={}",
             self.wakes, self.completions, self.submitted, self.underruns, self.drains,
             self.max_wake_lat_ns / 1_000, self.max_batch, clients, self.deferred,
             self.starve_max);
@@ -597,12 +620,12 @@ fn open_stream(
     let shm = match SharedMemory::allocate(shm_size as usize) {
         Ok(shm) => shm,
         Err(e) => {
-            eprintln!("soundd: no {shm_size}-byte ring for client {client_id} ({e:?})");
+            say!("soundd: no {shm_size}-byte ring for client {client_id} ({e:?})");
             return None;
         }
     };
     if shm.grant(client_pid).is_err() {
-        eprintln!("soundd: client {client_id} (pid {client_pid}) is gone; no stream opened");
+        say!("soundd: client {client_id} (pid {client_pid}) is gone; no stream opened");
         return None;
     }
     let shm_token = shm.token();
@@ -629,7 +652,7 @@ fn open_stream(
         slot_count: slot_count as u16,
     }).is_err() {
         // Client died mid-open; the dropped control connection removes it.
-        eprintln!("soundd: client {client_id} vanished during stream open");
+        say!("soundd: client {client_id} vanished during stream open");
     }
 
     let resampler = if req.sample_rate != device_sample_rate {
@@ -774,7 +797,7 @@ fn signal_clients(streams: &mut [ClientStream], ramp_frames: u32) {
             Err(syscall::SyscallError::NotFound)
         );
         if died && stream.signal_read_fd.is_none() && !stream.pending_removal {
-            eprintln!("soundd: client {} died, ramping down", stream.client_id);
+            say!("soundd: client {} died, ramping down", stream.client_id);
             stream.gain.set_target(Gain::SILENT, ramp_frames);
             stream.pending_removal = true;
         }
@@ -788,7 +811,7 @@ fn apply_commands(cmd_ring: &CommandRing, streams: &mut Vec<ClientStream>, ramp_
     while let Some(cmd) = cmd_ring.pop() {
         match cmd {
             MixCommand::AddClient(client) => {
-                eprintln!("soundd: client {} connected (id={})", streams.len(), client.client_id);
+                say!("soundd: client {} connected (id={})", streams.len(), client.client_id);
                 let _ = syscall::write_nonblock(client.signal_write_fd, &[1]);
                 streams.push(*client);
             }
@@ -813,7 +836,7 @@ fn apply_commands(cmd_ring: &CommandRing, streams: &mut Vec<ClientStream>, ramp_
 fn retain_active(streams: &mut Vec<ClientStream>) {
     streams.retain(|s| {
         if s.pending_removal && s.gain.is_idle() {
-            eprintln!("soundd: client {} removed", s.client_id);
+            say!("soundd: client {} removed", s.client_id);
             syscall::close(s.signal_write_fd);
             if let Some(fd) = s.signal_read_fd {
                 syscall::close(fd);
@@ -946,7 +969,7 @@ fn mix_thread(
     // ===TEST_START, long after soundd starts — and `soundd: resumed` is read
     // by no test at all. Renaming either of those two breaks nothing that
     // would tell you; they are diagnostics.
-    eprintln!("soundd: suspended");
+    say!("soundd: suspended");
 
     loop {
         let was_streaming = !streams.is_empty();
@@ -1217,7 +1240,7 @@ fn mix_thread(
                 // Before the submit, because that is where a stopped stream is
                 // started: the marker has to precede whatever the backend logs
                 // about starting.
-                eprintln!("soundd: resumed");
+                say!("soundd: resumed");
             }
             backend.submit(idx, device_period_bytes);
             unplayed += 1;
@@ -1268,7 +1291,7 @@ fn mix_thread(
             dll.reset();
             backend.stop();
             started = false;
-            eprintln!("soundd: suspended");
+            say!("soundd: suspended");
         }
 
         // Flushing on the last disconnect keeps the tail between the final
@@ -1337,7 +1360,7 @@ fn null_sink_thread(
     // first client of a run connects.
     let mut next_period_ns = syscall::clock_nanos();
 
-    eprintln!("soundd: null sink idle");
+    say!("soundd: null sink idle");
 
     loop {
         let was_streaming = !streams.is_empty();
@@ -1444,7 +1467,7 @@ fn null_sink_thread(
             stats.report(0);
             stats = MixStats::default();
             next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
-            eprintln!("soundd: null sink idle");
+            say!("soundd: null sink idle");
         } else if now_ns >= next_stats_ns {
             if !streams.is_empty() {
                 stats.report(streams.len());
@@ -1607,7 +1630,7 @@ fn control_thread(
                 // accepted first — leaving it in the listener queue keeps the
                 // listener readable and spins this loop.
                 Ok(accepted) if clients.len() >= MAX_CONTROL_CLIENTS => {
-                    eprintln!("soundd: refusing connection, {MAX_CONTROL_CLIENTS} clients already connected");
+                    say!("soundd: refusing connection, {MAX_CONTROL_CLIENTS} clients already connected");
                     let _ = accepted.conn.signal(MSG_STREAM_ERROR);
                 }
                 Ok(accepted) => {
@@ -1619,7 +1642,7 @@ fn control_thread(
                     });
                     client_pids.push(accepted.client_pid);
                 }
-                Err(e) => eprintln!("soundd: accept failed: {e:?}"),
+                Err(e) => say!("soundd: accept failed: {e:?}"),
             }
         }
 
@@ -1651,14 +1674,14 @@ fn control_thread(
                             format: u16::from_le_bytes(payload[6..8].try_into().unwrap()),
                         };
                         if let Some(reason) = reject_open(&req) {
-                            eprintln!("soundd: rejecting stream ({reason}): {}Hz {}ch fmt={}",
+                            say!("soundd: rejecting stream ({reason}): {}Hz {}ch fmt={}",
                                 req.sample_rate, req.channels, req.format);
                             let _ = clients[i].conn.signal(MSG_STREAM_ERROR);
                             dead.push(i);
                             disconnected = true;
                             break 'msgs;
                         }
-                        eprintln!("soundd: opening stream: {}Hz {}ch fmt={}",
+                        say!("soundd: opening stream: {}Hz {}ch fmt={}",
                             req.sample_rate, req.channels, req.format);
                         let idx = next_idx;
                         next_idx += 1;
@@ -1684,7 +1707,7 @@ fn control_thread(
                     (MSG_STREAM_SET_VOLUME, Some(idx)) if plen == core::mem::size_of::<StreamSetVolume>() => {
                         let raw = f32::from_le_bytes(payload[0..4].try_into().unwrap());
                         let Some(gain) = Gain::from_wire(raw) else {
-                            eprintln!("soundd: volume is not a number, disconnecting client");
+                            say!("soundd: volume is not a number, disconnecting client");
                             submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
                             dead.push(i);
                             disconnected = true;
@@ -1699,7 +1722,7 @@ fn control_thread(
                         break 'msgs;
                     }
                     (other, _) => {
-                        eprintln!("soundd: protocol violation (msg {other}), disconnecting client");
+                        say!("soundd: protocol violation (msg {other}), disconnecting client");
                         if let Some(idx) = clients[i].stream_idx {
                             submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
                         }
@@ -1764,7 +1787,7 @@ fn main() {
             panic!("soundd: cannot claim the virtio-sound device: {e}")
         }
         Err(why) => {
-            eprintln!("soundd: the virtio-sound device cannot carry audio: {why}");
+            say!("soundd: the virtio-sound device cannot carry audio: {why}");
             return run_null_sink(listener);
         }
     }
@@ -1772,7 +1795,7 @@ fn main() {
         Ok((hda, _path, channels)) => run_hda(listener, hda, channels),
         Err(hda::Refusal::NoDevice(syscall::SyscallError::NotFound)) => run_null_sink(listener),
         Err(why) => {
-            eprintln!("soundd: the HDA controller cannot carry audio: {why}");
+            say!("soundd: the HDA controller cannot carry audio: {why}");
             run_null_sink(listener)
         }
     }
@@ -1832,7 +1855,7 @@ fn run_with_device(
     // ~5ms connect/disconnect/volume ramp
     let ramp_frames = device_sample_rate * 5 / 1000;
 
-    eprintln!("soundd: ready, {} buffers, {}Hz {}ch, {} bytes/period, {} frames/period",
+    say!("soundd: ready, {} buffers, {}Hz {}ch, {} bytes/period, {} frames/period",
         num_buffers, device_sample_rate, device_channels, device_period_bytes, device_period_frames);
 
     let cmd_ring = Arc::new(CommandRing::new());
@@ -1877,7 +1900,7 @@ fn run_null_sink(listener: toyos::Listener) {
     // ~5ms connect/disconnect/volume ramp, same as the device path.
     let ramp_frames = device_sample_rate * 5 / 1000;
 
-    eprintln!(
+    say!(
         "soundd: no audio device, presenting a null sink ({}Hz {}ch, {} frames/period, streams discarded)",
         device_sample_rate, device_channels, device_period_frames
     );

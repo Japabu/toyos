@@ -301,7 +301,7 @@ impl Virtio {
         }
 
         let pcm = virtio.pcm_info()?;
-        eprintln!(
+        say!(
             "virtio-sound: stream {STREAM_ID}: dir={} ch={}-{} fmts={:#x} rates={:#x}",
             pcm.direction, pcm.channels_min, pcm.channels_max, pcm.formats, pcm.rates
         );
@@ -355,7 +355,7 @@ impl Virtio {
         self.simple_ctrl(R_PCM_START, "START")
             .unwrap_or_else(|e| panic!("soundd: virtio-sound could not start its stream: {e}"));
         self.running = true;
-        eprintln!("virtio-sound: stream {STREAM_ID} started");
+        say!("virtio-sound: stream {STREAM_ID} started");
     }
 
     pub fn stop(&mut self) {
@@ -365,7 +365,7 @@ impl Virtio {
         self.simple_ctrl(R_PCM_STOP, "STOP")
             .unwrap_or_else(|e| panic!("soundd: virtio-sound could not stop its stream: {e}"));
         self.running = false;
-        eprintln!("virtio-sound: stream {STREAM_ID} stopped");
+        say!("virtio-sound: stream {STREAM_ID} stopped");
     }
 
     /// Report what the device says went wrong, and repost the buffer it said it
@@ -375,7 +375,7 @@ impl Virtio {
         while let Some(id) = self.events_done.poll() {
             let idx = id as usize;
             if idx >= abi::EVENT_BUFS {
-                eprintln!("soundd: virtio-sound returned event buffer {idx}, which it never had");
+                say!("soundd: virtio-sound returned event buffer {idx}, which it never had");
                 continue;
             }
             let event = unsafe {
@@ -391,7 +391,7 @@ impl Virtio {
                 EVT_PCM_XRUN => " (PCM XRUN)",
                 _ => "",
             };
-            eprintln!(
+            say!(
                 "virtio-sound: device event {:#x}{name} data={}",
                 event.code, event.data
             );
@@ -432,7 +432,7 @@ impl Virtio {
         };
         self.ctrl(&params, "SET_PARAMS")?;
         self.simple_ctrl(R_PCM_PREPARE, "PREPARE")?;
-        eprintln!("virtio-sound: configured stream {STREAM_ID}: {rate}Hz {channels}ch s16le");
+        say!("virtio-sound: configured stream {STREAM_ID}: {rate}Hz {channels}ch s16le");
         Ok(())
     }
 
@@ -486,7 +486,7 @@ fn rate_code(hz: u32) -> Option<u8> {
 /// bitmap by hand on a laptop with no serial.
 fn choose_params(info: &PcmInfo) -> Option<(u32, u8)> {
     if info.formats & (1 << FMT_S16) == 0 {
-        eprintln!(
+        say!(
             "virtio-sound: no usable format — device offers {:#x}, driver needs S16 (bit {FMT_S16})",
             info.formats
         );
@@ -495,7 +495,7 @@ fn choose_params(info: &PcmInfo) -> Option<(u32, u8)> {
 
     let Some(&(rate, _)) = SUPPORTED_RATES.iter().find(|(_, code)| info.rates & (1 << code) != 0)
     else {
-        eprintln!(
+        say!(
             "virtio-sound: no usable rate — device offers {:#x}, driver needs 44100 (bit \
              {RATE_44100}) or 48000 (bit {RATE_48000})",
             info.rates
@@ -506,7 +506,7 @@ fn choose_params(info: &PcmInfo) -> Option<(u32, u8)> {
     // Stereo if the device takes it; soundd converts either way, so the only
     // unusable case is a device whose minimum is more channels than we mix.
     if info.channels_min > 2 {
-        eprintln!(
+        say!(
             "virtio-sound: no usable channel count — device needs at least {}, driver mixes at \
              most 2",
             info.channels_min
@@ -515,7 +515,7 @@ fn choose_params(info: &PcmInfo) -> Option<(u32, u8)> {
     }
     let channels = if info.channels_max >= 2 { 2 } else { info.channels_max };
     if channels == 0 {
-        eprintln!("virtio-sound: device advertises a maximum of zero channels");
+        say!("virtio-sound: device advertises a maximum of zero channels");
         return None;
     }
     Some((rate, channels))

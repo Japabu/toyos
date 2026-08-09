@@ -345,7 +345,8 @@ The hand-built fixture passes `fsck_msdos -n` clean, so it is a real volume.
 `toyos-fat32/tests/` builds its volumes with `newfs_msdos` and populates them
 through a `hdiutil` mount, which is the point of that suite — our reader against
 bytes we did not write. Replacing those two is a larger job and is scoped in
-`specs/issues/` §9. Nothing in the *guest* suite touches them.
+`specs/issues/filesystem/fat32-suite-needs-macos-binaries.md`. Nothing in the
+*guest* suite touches them.
 
 `ps -Ao comm=` and `getloadavg` — the other two host calls the harness makes —
 are both Linux-native, so with the judge portable there is nothing left in the
@@ -385,8 +386,9 @@ an Intel Xeon passed. Both facts are one cause. `STAR[63:48]` held `0x10`, and
 does not, so an AMD host ran userland with `SS = 0x18` and the first `iretq`
 back to such a thread died on "SS.RPL must equal CS.RPL". QEMU's `helper_sysret`
 implements Intel's wording, which is why no TCG guest anywhere — runner or dev
-host — can see the class. Fixed in `arch/percpu.rs`; the write-up and the
-evidence are `specs/issues/` §3.
+host — can see the class. Fixed in `arch/percpu.rs`; the surviving record is
+`specs/issues/kernel/sysret-ss-attrs-unfixed.md`, the residual the RPL fix does
+not reach.
 
 **The reusable part is the shape of the blind spot**, not the bug. A guest that
 emulates an instruction gives you one vendor's reading of it, and the dev host
@@ -621,7 +623,7 @@ the harness:
   `metal_sim_pointer_churn`, `usb_transport_break`, and `xhci_flap` from the
   probe. Every one drives `device_add`/`device_del` over QMP, every one is red
   again alone, and every one is green under TCG on the same runner image and the
-  same QEMU. `specs/issues/` §8. **`usb_transport_break` is closed and
+  same QEMU. `specs/issues/hardware/`. **`usb_transport_break` is closed and
   belonged to the family only by its symptom** — it drives no QMP at all, and
   what it shared with the rest is the one variable: a guest running 50x faster
   wins a race against the device that a TCG guest loses.
@@ -924,7 +926,7 @@ thread.** Both binaries fail on the same sub-test: the one that panics on a
 thread. The first two panics of each unwind cleanly and print `ok`. The process's
 main thread was spawned on **cpu1** and the fault is on **cpu0**.
 
-`specs/issues/isolation/` already records the other end of this: **no context
+The other end of this was already on record: **no context
 switch saves x87 state** — no `fxsave`, `fnsave` or `fsave` anywhere in
 `kernel/src` — and `fault_gates`' `mf` arm, the only thing in this tree that
 executes an x87 instruction at all, unmasks IM, computes 0/0 and expects the
@@ -944,7 +946,7 @@ reps, one runner, one commit, one shard, and the only difference is
 So the red is a kernel isolation defect that CI found and that the dev host
 cannot: **any Ring 3 process can leave a pending unmasked x87 exception behind
 and kill the next unrelated process scheduled on that CPU.** It belongs to
-§1's entry and is not fixed here — the fix is x87 state on the context switch,
+that entry and is not fixed here — the fix is x87 state on the context switch,
 in `kernel/src/arch/`, which is a subsystem change with its own owner.
 
 **Two repairs would turn this red green and only one of them is a fix.** Giving
@@ -1287,3 +1289,171 @@ Two shards were red in that run and neither is those:
   the tree. Both `deps` steps take three attempts now: advisory today, but once
   `guest-suite` is required an apt mirror would be able to block a merge, and
   that is not a gate anyone chose.
+
+### 10.9 Four consecutive red runs on `main`, four different names, and the rates
+
+**The trigger in §10.4 is three consecutive green `ci` runs on `main`, and
+nothing was going to fire it.** Measured 2026-08-09, `main`'s last four
+completed runs — every one red, and no two on the same test:
+
+| run | tip | red shard | name |
+|---|---|---|---|
+| `31271983043` | `911c472` | 10 | `desktop_audio_client`, `STALLED` after 324 s |
+| `31272837718` | `eaba207` | 5 | `desktop_window_child`, the `/bin/terminal` race |
+| `31273373928` | `87835d1` | 5 | `kernel_heartbeat`, 11 pin readings against 12 beats |
+| `31280877870` | `83ef8d1` | 2 | `dump_nmi_probe`, the rip in `u128_div_rem` |
+
+Four names none of which §9.2 could price: two were 1 of 5 there and two were
+0 of 5. `probe-green.yml` is §9.1's instrument aimed at exactly those four —
+the same image, the same accelerator, the same `--jobs 1`, **ten reps**, one job
+per rep and one `cargo test` per name so a stall costs the other three nothing.
+Run `31282019974`, tree `98e7247` (`main` `83ef8d1` plus the workflow):
+
+| test | red | what it said |
+|---|---|---|
+| `desktop_window_child` | **2/10** | the surface owner exited before it said it was ready |
+| `dump_nmi_probe` | **2/10** | `compiler_builtins::int::specialized_div_rem::u128_div_rem+0x99` |
+| `kernel_heartbeat` | **1/10** | 2 of 11 beats dropped a CPU from the mask |
+| `desktop_audio_client` | **1/10** | `STALLED` waiting for both clients to leave the mixer |
+
+That is 6 name-reps of 40, and it prices a `ci` run: these four alone put
+`P(all green)` at about **0.52**, which is four red runs in a row with nobody
+having introduced a defect. **Each is a rate and only one of the four was a
+rate about the tree.**
+
+- **`dump_nmi_probe` was the kernel's actuator, not the guest's state.** The
+  deaf window spun on `clock::nanos_since_boot`, whose 128-bit divide is an
+  out-of-line call into `compiler_builtins` — so a CPU that never left the spin
+  was sampled inside `__udivti3` two runs in ten and the probe reported the
+  wrong instruction, correctly and about itself. It spins on `rdtsc` against a
+  `clock::tsc_deadline` now: `rdtsc` and a 64-bit compare inline, so there is no
+  address in the loop that is not in `deaf_window`.
+- **`kernel_heartbeat` was two harness defects, both at an end of the capture.**
+  A heartbeat and its `i8042: line` are two `log!`s, and run `31273373928`'s
+  capture ended between them — twelve beats, eleven readings, read as a pin
+  whose state was unreadable. The unit is the pair now, positionally, and a beat
+  with nothing after it at all is a reading this capture does not hold. The
+  other end is the boot: `boot_with_options` returns while userland is still
+  spawning, and a guest with eight vCPUs on four cores does not run all eight of
+  them while it is busy — `alive=7/8` at 1.373 s with `cpu1 has never reached a
+  scheduler pass`, `5/8` at 1.624 s, then `8/8` for the remaining nine beats.
+  That is the host and the instrument never claimed anything about it, so the
+  window opens at the first full mask and the assertion is that it never thins
+  again. The tick-less control still reds: without `diag-tick` ten of eleven
+  lines are below `8/8` and the window never opens.
+- **`desktop_audio_client` was the console, and the finding is general.**
+  `soundd: client ` and `1 removed` came back either side of four kernel `exit:`
+  accounting lines, so the test counted one removal of two and waited out its
+  300 s guard. A userland line is several `write`s —
+  `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` — and this
+  pair collides *systematically*, because soundd prints a client's removal
+  exactly while the kernel prints that client's exit. soundd writes whole lines
+  now; the other 176 `eprintln!` sites in `userland/` do not.
+- **`kernel_heartbeat`'s mask needed a second rule, and the probe is what said
+  so.** Run `31283095698` is the same ten reps against the fixed tree: the
+  settle window alone took it from 1 of 10 to 1 of 10, and what survived was a
+  different line — `cpu6 last reached one 0.349s ago`, once, with eight `8/8`
+  lines either side of it on a guest that had settled. A CPU that has genuinely
+  stopped does not come back, and `diag-tick` caps a sleep at 100 ms against a
+  250 ms line, so what the field has to support is **no CPU missing from two
+  consecutive lines** — the T14's shape, where the mask thins CPU by CPU and
+  stays thin, and not the runner's, where one halted vCPU thread waits on a host
+  with half as many cores as the guest has CPUs. Teeth run rather than argued:
+  `heartbeat = []` in `kernel/Cargo.toml` — the same guest with no tick — reds
+  it on six of the eight CPUs.
+- **`desktop_window_child` is the tree's, and it is the one left.** The
+  `/bin/terminal` boot race, `specs/issues/kernel/terminal-races-compositor-at-boot.md`,
+  which that file already records as the dominant blocker of the dev host's
+  parallel-red list and declines to fix because *where the wait belongs* is a
+  design question with three answers and no owner's ruling. What this probe adds
+  is a CI number — **2 of 10 on a runner with one guest on it and nothing to
+  contend with** — and a timing: run `31282019974` rep 2 has the compositor
+  spawned at 0.347 s, the terminal at 0.349 s, and the terminal exiting at
+  0.849 s one millisecond before the compositor maps its framebuffer.
+  `services::listen("compositor")` is already the first statement of
+  `Session::start`, which is the first statement of the compositor's `main`, so
+  there is nothing left to move earlier: the half second both processes spend
+  before their first service call is process startup, and which of the two wins
+  it is a coin toss weighted four to one. **No `EXPECTED_FAILURES` entry was
+  added for it** — an exemption names a defect and its write-up, and this one
+  has both and is still a defect that reds a merge gate rather than one anybody
+  decided to accept.
+
+Run `31283095698` is the fixed arm, ten reps of the same four names on the same
+image with the same accelerator:
+
+| test | before | after |
+|---|---|---|
+| `dump_nmi_probe` | 2/10 | **0/10** |
+| `desktop_audio_client` | 1/10 | **0/10** |
+| `kernel_heartbeat` | 1/10 | 1/10 on a *different* line, then the rule above |
+| `desktop_window_child` | 2/10 | 2/10, untouched |
+
+So one name is left between `main` and the trigger, it is a defect with a
+write-up and an owner's decision outstanding, and it fires one run in five.
+
+**And a fifth, which the fix for the second uncovered.** `main` at `1ed6f39`
+(run `31284962381`) is red on `dump_nmi_probe` again and on a signature neither
+probe ever produced — *the dump never ran*, both attempts. The actuator's cpu0
+kicks the victim and waits 100 ms for it to reach its idle loop; on that runner
+it took **251 ms**, so cpu0 gave up at 11.417 s, nothing was staged, no report
+was asked for, and the victim went deaf at 11.568 s for nobody. There is no
+bound to give: the pass a kicked CPU is finishing runs
+`flush_log_file_if_affordable` with preemption off, and on a machine whose
+`/log` is a USB device CLAUDE.md already records that as a string of bulk
+transfers. So the budget is generous now and, more to the point, no longer the
+whole answer — expiring it takes the ask back with a CAS and lets the next pass
+ask again, and a CAS that *fails* means the victim went deaf on the boundary and
+the report is asked for after all. **0 of 20 probe reps and 2 of 2 in one shard
+job** is the shape of a rate nobody has counted, which is why the give-up is
+repaired rather than the number tuned.
+
+**A sixth, and it is the same shape as the fifth.** `main` at `8d3f5b7` (run
+`31286199802`) is red on `late_storage_connect`, §9.2's 2-of-5 entry, and the
+message is the gate refusing to be vacuous: *the boot scan bound a disk, so the
+port was not held empty*. `xhci-slow-storage-connect` hid the disk's port for
+`SLOW_CONNECT_NS`, 300 ms — a claim about how far into a boot `scan_ports` runs,
+true at 253 ms on the dev host and false at **407 ms** on that runner. What the
+actuator stages is an *ordering* — the disk arrives after the scan — so the scan
+is what closes the window now, and no host's boot speed can defeat it.
+`xhci-slow-connect` keeps the duration, because what *it* stages is a settle
+that has to keep looking through one.
+
+### 10.10 Nine runs on `main`, and what the tail looks like
+
+Every completed `ci` run on `main` between 2026-08-08 18:48 and 2026-08-09
+01:36, in order, with the one name each was red on:
+
+| tip | run | verdict |
+|---|---|---|
+| `eaba207` | `31272837718` | `desktop_window_child` — the `/bin/terminal` race |
+| `87835d1` | `31273373928` | `kernel_heartbeat` — the torn pin pairing |
+| `83ef8d1` | `31280877870` | `dump_nmi_probe` — the rip in `u128_div_rem` |
+| `6e2dac6` | `31283147352` | **green** |
+| `1ed6f39` | `31284962381` | `dump_nmi_probe` — the dump never ran |
+| `8d3f5b7` | `31286199802` | `late_storage_connect` — the scan bound the disk |
+| `e7e1c72` | `31286791466` | `desktop_audio_client` — the `/bin/terminal` race |
+| `53d29d5` | `31287853270` | `screen_pager_keys` — keystroke 14 of 30 |
+
+(`911c472`/`31271983043`, `desktop_audio_client`'s console splice, is the ninth
+and sits before the window's first row.)
+
+**One green in nine, and eight different reds between two names.** That is the
+shape to plan against: the suite has a tail of low-rate names, each fires at
+10–20%, and 292 tests is enough of them that a whole run is a coin toss. Five of
+the eight are closed by this section's work. The two that are not:
+
+- **The `/bin/terminal` boot race**
+  (`specs/issues/kernel/terminal-races-compositor-at-boot.md`), which is a
+  design question and the dominant one. It is not one test's: it reds whichever
+  desktop test's boot happens to lose, and it took `desktop_window_child` and
+  `desktop_audio_client` here. 2 of 10 per desktop boot, and a suite has four of
+  them.
+- **`screen_pager_keys`** (`specs/issues/diagnostics/screen-pager-keys-red-on-main.md`),
+  bisected there to a merge whose two parents are both green, and open.
+
+So the §10.4 trigger is reachable on luck and not on state, and **that is worth
+one more thought before anyone promotes the gate**: three consecutive greens was
+chosen because "one lucky green is a sample rather than a state", and at 0.8 per
+run three of them is a coin toss too. Promoting `guest-suite` to required with
+either of the two above still open makes every merge pay the same rate.

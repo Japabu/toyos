@@ -8,8 +8,8 @@ opened: 2026-08-03
 
 The owner's machine went dead — no typing, no cursor — about 64 s into a
 session, with the kernel log still streaming to the stick for another 9.6 s
-until the power went off. That log is what prompted the work above. What it
-establishes, and what it cannot:
+until the power went off. That log is what prompted the SDK IPC-framing work.
+What it establishes, and what it cannot:
 
 **Established.** The compositor's 2 s report runs unbroken from 4.5 s to the
 batch ending ~64.3 s and then stops, so the compositor stopped compositing

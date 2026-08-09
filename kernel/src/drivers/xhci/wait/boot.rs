@@ -578,6 +578,13 @@ pub fn scan_ports(ctrl: &mut XhciController) {
     // further interrupt, so without this a device whose *first* transfer failed
     // during the boot scan would stay recorded and silent for the whole boot.
     ctrl.settle_outstanding();
+    // The disk this port carries is now allowed to exist, and the ordinary
+    // hotplug path enumerates it. Here rather than on a clock because "after
+    // the boot scan" is what the actuator stages, and after
+    // `acknowledge_port_changes` so the connect it raises is one the port
+    // machine sees as a change rather than one the scan just cleared.
+    #[cfg(feature = "xhci-slow-storage-connect")]
+    super::super::BOOT_SCAN_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "xhci-portsc-rw1c")]
     log!("xHCI: PED as RW1C, {} port(s) disabled by a driver write",
         ctrl.software_disabled_ports());

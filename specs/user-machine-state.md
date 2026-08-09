@@ -56,7 +56,7 @@ the only difference is `fault_gate_child`'s x87 control word.
 | `masked` (`cw = 0x037F`) | PASS ×3 | PASS ×3 | PASS ×3 |
 
 `fault_gates` passing in both arms is what proves the probe is not vacuous.
-Written up in full at `specs/issues/isolation/` and `specs/ci-plan.md` §9.3.
+Written up in full at `specs/ci-plan.md` §9.3.
 
 **The victim instruction is `FLDCW`**, a *waiting* x87 instruction: it checks for
 a pending unmasked exception before it executes. It sits in the unwinder's
@@ -276,13 +276,12 @@ exactly `0xe0000011`:
 
 `CR4.OSXSAVE` (18) is clear on both here, so hypothesis 1's *specific* worry —
 firmware leaving `OSXSAVE` set so cpu0 permits AVX and the APs `#UD` on it —
-cannot be answered on this host. But its *mechanism* is confirmed: the BSP's
-`CR4` genuinely is firmware's and the APs' genuinely is built from zero, and
-they already differ in two bits. On the T14 that question is open and only the
-T14 can close it.
+could not be answered on this host. But its *mechanism* is confirmed: the BSP's
+`CR4` genuinely was firmware's and the APs' genuinely was built from zero, and
+they already differed in two bits.
 
-**`CR0.NE = 0` on every AP is a complete explanation for `specs/issues/isolation/`'s
-unexplained survivor.** `fault_gates`' `mf` arm killed its child 6 of 6 alone
+**`CR0.NE = 0` on every AP is a complete explanation for the unexplained
+survivor.** `fault_gates`' `mf` arm killed its child 6 of 6 alone
 and survived once under a 12-wide suite, printing status word `0xb881` — IE set,
 ES set, on the `fnstsw` two instructions past the `fwait` that should have
 trapped on exactly that `ES`. "The state was not lost; the trap was." With `NE`
@@ -290,10 +289,21 @@ clear, an unmasked x87 exception is signalled through the external FERR# pin
 instead of `#MF`, and nothing in a modern machine is listening. A child that
 happened to be scheduled on an AP rather than the BSP would see precisely that.
 
-**These are separate defects and are not fixed here.** They are recorded in
-`specs/issues/` with this evidence. Note in particular that they
-confound measurement: an AP with `CR0.CD` set runs with caching off, so any
-microbenchmark that lands on one is not measuring what it thinks it is.
+**These are separate defects, and they were fixed after this section was
+written** — 2026-08-08, by `wt/toyos-apregs`, which is also why the two lines
+above no longer have `cr0=` and `cr4=` in them: `arch/control_regs.rs` declares
+both registers, applies the declaration on every CPU and asserts it there, and
+prints its own line beside this one. The values quoted above are what
+`log_state` read before that existed, and hypothesis 1 went with them —
+`OSXSAVE` is in neither half of the declaration and `CR4` is written whole, so
+no CPU can hold it and the T14 has nothing left to say about it.
+
+What the fix does not undo is that these defects **confound every measurement
+taken before it**: an AP with `CR0.CD` set ran with caching off, so any
+microbenchmark that landed on one is not measuring what it thinks it is —
+including §12's, whose two arms were taken on a machine where three of four
+cores were uncached. How much that cost is unmeasured and needs bare metal:
+`specs/issues/kernel/ap-control-registers-inherit-init.md`.
 
 ---
 
@@ -341,10 +351,12 @@ branch as a whole.
 
 ## 10. Gating
 
-`fault_gates` is not touched and no `EXPECTED_FAILURES` entry is added.
+`fault_gates` is not touched here and no `EXPECTED_FAILURES` entry is added.
 `specs/ci-plan.md` §9.3 already ruled on both: giving `fault_gates` its own boot
 would delete the only observation of the defect this tree has, and an exemption
 would be one bought to make a run green while a process can kill its neighbour.
+Its `mf` arm became `Expect::Killed` once `CR0.NE` was declared on every CPU,
+and it still shares that boot, which is the half the ruling protects.
 
 New permanent `fpu_isolation`, three halves, all positive assertions:
 

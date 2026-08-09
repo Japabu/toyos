@@ -91,8 +91,9 @@ see (`virtio_sound.rs:515-516`, `:561` registering only the second) — and
 virtio-gpu publishes framebuffer and cursor pages, never its ring pool. Only
 virtio-net publishes the rings.
 
-Read off the code, **not staged**, and filed as such in `specs/issues/`
-§1 with the reproduction written out. It is here because it settles the framing:
+Read off the code, **not staged**, and filed as such in
+`specs/issues/isolation/netd-writable-virtqueue.md` with the reproduction
+written out. It is here because it settles the framing:
 the question is not whether to expose a DMA engine to userland. That has already
 happened. The question is whether the thing it can reach is bounded.
 

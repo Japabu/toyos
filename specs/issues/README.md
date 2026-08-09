@@ -8,42 +8,80 @@ reference to an issue a reference that rots.
 `ls specs/issues/*/` lists everything. To ask a question of the set:
 
 ```
-rg -l '^kind: question' specs/issues/     # what is waiting on the owner
+rg -l '^status: open' specs/issues/       # every unheld piece of work
 rg -l '^status: assigned' specs/issues/   # what somebody is holding
+rg -l '^status: owner' specs/issues/      # what is waiting on the owner
 rg -c '' specs/issues/audio/              # how much audio owes
 ```
 
 ## Frontmatter
 
-Four fields, all required, no defaults.
+Four fields, all required, no defaults. `src/docs.rs`'s `every_issue_is_well_formed`
+is the gate; it runs under `cargo test --lib` and takes seconds.
 
 | field | values | means |
 |---|---|---|
-| `status` | `open` | nobody is holding it |
-| | `assigned` | somebody is, and the body says who or which task |
+| `status` | `open` | it is work, and nobody is holding it |
+| | `assigned` | it is work, and somebody is — the body says who or which task |
 | | `expected-red` | a test fails on this today and `EXPECTED_FAILURES` names it |
+| | `owner` | it is the owner's to decide, and nobody else may |
+| | `none` | nothing is owed |
 | `kind` | `defect` | real, reproducible, someone should fix it |
 | | `finding` | noticed in passing; may never be worth fixing |
 | | `question` | blocked on the owner, and nobody else can decide it |
 | | `rejected` | considered and declined, recorded so nobody re-proposes it |
-| `opened` | a date | the first commit whose `specs/issues/` or `specs/issues/` carried this heading. Before 2026-08-08 that is derived from the single file this directory replaced, so a reworded heading dates from the rewording |
+| `opened` | `YYYY-MM-DD` | the first commit whose `specs/known-issues.md` or `specs/issues/` carried this heading. Before 2026-08-08 that is derived from the single file this directory replaced, so a reworded heading dates from the rewording |
 | `task` | a number | optional; present only where the issue names one |
+
+**`status` and `kind` are not free of each other, and the gate enforces it.**
+`kind` says what the entry is; `status` says what is owed. Two of the kinds
+answer that second question by themselves, so they may not contradict it:
+
+| `kind` | `status` must be |
+|---|---|
+| `defect`, `finding` | `open`, `assigned` or `expected-red` |
+| `question` | `owner` |
+| `rejected` | `none` |
+
+That rule is what makes `rg -l '^status: open'` mean *unheld work* rather than
+"every file that was not assigned to somebody" — the eleven `question` and
+`rejected` files all said `open` before it existed, so the query over-reported
+by eleven and nothing could tell.
 
 **`kind: rejected` is not work.** It is here so the next agent does not spend a
 day re-deriving an answer the owner already gave. Nothing in a `rejected` file
-is owed.
+is owed — and if the body says otherwise, the *kind* is what is wrong. A ruling
+that declared a standing failure rather than removing it deferred the work; it
+did not decline it, so the entry is a `defect` and stays open.
 
 **`kind: question` is not work either** — not yours. It is owed by the owner,
-and an agent that "fixes" one has decided something that was his to decide.
+and an agent that "fixes" one has decided something that was his to decide. But
+a file blocked on an *instrument* — a gate, a machine, a measurement — is not a
+question. Nobody has to decide it; somebody has to run it.
 
 ## Areas
 
 `isolation` · `panic-path` · `kernel` · `audio` · `diagnostics` · `build` ·
 `design-debt` · `hardware` · `filesystem` · `boot-media`
 
-An area is a directory because it makes every cross-reference a path that
-resolves. Moving an issue between areas is a `git mv`; the **slug** is its
-identity, so `rg <slug>` finds every pointer at it wherever it has been put.
+That list is closed, and the gate refuses a file outside it. An area is a
+directory because it makes every cross-reference a path that resolves. Moving
+an issue between areas is a `git mv`; the **slug** is its identity — unique
+across every area, which the gate also checks — so `rg <slug>` finds every
+pointer at it wherever it has been put.
+
+## Pointing at one
+
+**Name the file, not the directory.** `specs/issues/audio/hda-tone-phase-check.md`
+is a claim something can check; `specs/issues/audio/` is a claim that an area
+exists, which says nothing about whether the entry you meant is still there. The
+gate resolves every `specs/issues/<area>/<slug>.md` path written anywhere in the
+tree and names the ones that do not exist.
+
+Never write "the entry above" or "the entry below". Position was what the
+numbered document had and what this directory exists to be rid of; a positional
+reference inside a file that no longer sits beside its neighbour points at
+nothing at all.
 
 ## Filing one
 

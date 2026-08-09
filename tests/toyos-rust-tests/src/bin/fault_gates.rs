@@ -18,10 +18,10 @@ enum Expect {
     /// Measured wide and alone: the CPU raises this from Ring 3 every time, so
     /// the child must die.
     Killed,
-    /// It does not, or does not always, and `fault_gate_child` prints the
-    /// status word that says which. The exit code is deliberately not asserted:
-    /// what these arms contribute is the machine still being here for the next
-    /// one, and that is the half a missing gate would take away.
+    /// It does not, and `fault_gate_child` prints the register readback that
+    /// says why. The exit code is deliberately not asserted: what these arms
+    /// contribute is the machine still being here for the next one, and that is
+    /// the half a missing gate would take away.
     MachineLives,
 }
 
@@ -31,12 +31,15 @@ const ARMS: &[(&str, Expect)] = &[
     // Both #SS routes arrive as #GP under TCG; see the child.
     ("ss", Expect::Killed),
     ("ss_rsp", Expect::Killed),
-    // Killed 6 of 6 alone, and survived once in a 12-wide suite with the x87
-    // status word reading 0xb881 — IE and ES set, and no trap taken from a
-    // `fwait` two bytes later. Unexplained; `specs/issues/isolation/` carries it. An arm
-    // that is right most of the time is not an assertion.
-    ("mf", Expect::MachineLives),
+    // Trappable at all only because `CR0.NE` is in the declaration every CPU
+    // is held to (`arch/control_regs.rs`): with it clear the exception is
+    // signalled on FERR#, which nothing in a modern machine listens to.
+    ("mf", Expect::Killed),
+    // TCG raises no #XM whatever MXCSR says. `CR4.OSXMMEXCPT` is declared set,
+    // so this arm is `Killed` on metal and cannot be here.
     ("xm", Expect::MachineLives),
+    // `CR0.AM` is declared clear, so `RFLAGS.AC` buys a Ring 3 process nothing
+    // on any machine this kernel runs on — emulated or not.
     ("ac", Expect::MachineLives),
 ];
 

@@ -20,8 +20,9 @@ no delta at all**, run as H3's A arm before that branch existed:
 
 The ten, by config and iteration: `audio_tone_load smp=1` at 4, 9, 13, 15;
 `audio_tone_load smp=8` at 9, 13, 14; `audio_tone smp=8` at 8, 9;
-`audio_tone smp=1` at 13. So **`audio_tone` at both widths reds too**, which the
-entry below had only established for `audio_tone_load`.
+`audio_tone smp=1` at 13. So **`audio_tone` at both widths reds too**, which
+`audio-tone-load-fast-tier-intermittent` had only established for
+`audio_tone_load`.
 
 **The load correlation is the wrong way round, and that is the finding.** The
 1-minute average across the run spanned 7.2 to 19.1 on 14 cores, with one to

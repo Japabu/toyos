@@ -1,5 +1,5 @@
 ---
-status: open
+status: owner
 kind: question
 opened: 2026-08-08
 ---
@@ -24,12 +24,16 @@ that makes it decidable, and nothing else.
 | `drivers/virtio_console.rs` | 221 | the second serial-shaped sink |
 
 Its known sins are already entries here and are the argument for the question:
-the flush is unbounded, uninterruptible and in front of the scheduler pass
-(`specs/issues/boot-media/`); userland `println!` shares the ring (`specs/issues/diagnostics/`); the ring's occupancy is a wake
-condition (`specs/issues/diagnostics/`); a boot that wedges before the idle loop produces no output at
-all because the ring's only drains are the timer tick and the idle loop (`specs/issues/diagnostics/`);
-and `drain_serial`'s `BackendGuard::lock` spins with interrupts disabled with
-no bound and no deadlock panic (CLAUDE.md's idle-loop warning). Each has been
+the flush is unbounded, uninterruptible and in front of the scheduler pass, and
+userland `println!` shares the ring — both
+`specs/issues/boot-media/log-flush-is-unbounded.md`; a boot that wedges before
+the idle loop produces no output at all because the ring's only drains are the
+timer tick and the idle loop
+(`specs/issues/diagnostics/pre-idle-wedge-says-nothing.md`); the ring's occupancy
+is one of the pre-`hlt` recheck's conditions, so a CPU with bytes pending
+declines to sleep; and `drain_serial`'s `BackendGuard::lock` spins with
+interrupts disabled with no bound and no deadlock panic (both, CLAUDE.md's
+idle-loop warning). Each has been
 patched where it hurt. None has been fixed by a design.
 
 The shape the review reached, **if** the owner wants it: a log core (ring +

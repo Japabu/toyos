@@ -390,9 +390,11 @@ use portmachine::DEBOUNCE_NS as PORT_DEBOUNCE_NS;
 /// appears afterwards is enumerated by the ordinary path with the ordinary
 /// bytes behind it. Same reason `xhci-one-slot` and `xhci-deaf-port` exist.
 ///
-/// [`xhci-slow-storage-connect`](SLOW_STORAGE_PORT) uses the same window
-/// against one port instead of all of them, which is a different machine and
-/// not a weaker version of this one.
+/// [`xhci-slow-storage-connect`](SLOW_STORAGE_PORT) hides one port instead of
+/// all of them, which is a different machine and not a weaker version of this
+/// one — and it closes its window on the boot scan rather than on this clock,
+/// because what it stages is an ordering and what this stages is a duration the
+/// settle has to keep looking through.
 #[cfg(any(feature = "xhci-slow-connect", feature = "xhci-slow-storage-connect"))]
 const SLOW_CONNECT_NS: u64 = 300_000_000;
 
@@ -411,8 +413,22 @@ const SLOW_CONNECT_NS: u64 = 300_000_000;
 /// Port index 0 because that is where the boot stick lands: it is the only
 /// SuperSpeed device the profiles attach, so it takes the SuperSpeed view of the
 /// first port register while every HID takes the USB2 view of a later one.
+///
+/// **The window is the boot scan itself and not a span of nanoseconds**, which
+/// [`SLOW_CONNECT_NS`] is and which this used to share. What has to be staged is
+/// "the disk arrives after `scan_ports`", and 300 ms is a claim about how far
+/// into a boot that runs — true at 253 ms on the dev host and false at 407 ms on
+/// the runner that red `late_storage_connect` on CI run `31286199802`, where the
+/// scan bound the disk and the gate correctly reported that it was measuring an
+/// ordinary boot. The scan is an event, so it is the event that closes this.
 #[cfg(feature = "xhci-slow-storage-connect")]
 const SLOW_STORAGE_PORT: u8 = 0;
+
+/// Whether the boot port scan has run. Until it has, [`SLOW_STORAGE_PORT`]
+/// reads unpopulated.
+#[cfg(feature = "xhci-slow-storage-connect")]
+pub(super) static BOOT_SCAN_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// One bit per root-hub port. HCSPARAMS1's MaxPorts is a byte, so four words
 /// cover every controller that can exist, and "did the connect state change"
@@ -915,7 +931,9 @@ impl XhciController {
             return raw & !(PORTSC_CCS | PORTSC_PED | PORTSC_SPEED);
         }
         #[cfg(feature = "xhci-slow-storage-connect")]
-        if port_idx == SLOW_STORAGE_PORT && crate::clock::nanos_since_boot() < SLOW_CONNECT_NS {
+        if port_idx == SLOW_STORAGE_PORT
+            && !BOOT_SCAN_DONE.load(core::sync::atomic::Ordering::Relaxed)
+        {
             return raw & !(PORTSC_CCS | PORTSC_PED | PORTSC_SPEED);
         }
         #[cfg(feature = "xhci-portsc-rw1c")]

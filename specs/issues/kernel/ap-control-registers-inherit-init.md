@@ -1,71 +1,77 @@
 ---
 status: open
-kind: defect
-opened: 2026-08-08
+kind: finding
+opened: 2026-08-09
 ---
 
-# Every AP runs with caching disabled, `CR0.NE` clear, `CR0.WP` clear and `CR4.MCE` clear
+# What an AP's disabled caching cost is unmeasured, and only bare metal can measure it
 
-Found by `arch/fpu.rs::log_state`, the permanent per-CPU control-register line
-`wt/toyos-fpu` added for `specs/user-machine-state.md` §7. Dev host, TCG,
-`smp=2`, one boot, reproduced identically across four guests in the same run:
+`arch/control_regs.rs` closed the defect this slug is named for: until
+2026-08-08 an AP kept the `INIT` value of `CR0` that the trampoline OR'd `PE`
+and `PG` into, so cores 1..N ran with `CD`/`NW` set — caching off — and with
+`WP`, `NE` and `MP` clear. Both registers are now written whole from one
+declaration, applied on every CPU and asserted there, and the `control_regs`
+gate holds every bit of `CR0` and eight of `CR4` against that declaration
+independently of the kernel's own self-check.
 
-```
-[kernel 0.000 cpu0] fpu: cpu0 cr0=0x80010033 cr4=0x310668 xsave=0 osxsave=0 ...
-[kernel 0.221 cpu1] fpu: cpu1 cr0=0xe0000011 cr4=0x310620 xsave=0 osxsave=0 ...
-```
+What that leaves is a number nobody has: **how much an uncached AP cost.** It is
+worth having because every multi-CPU measurement in this tree predates the fix
+— the audio numbers, the scheduler work, the boot timings, and
+`specs/user-machine-state.md` §12's `+123 cycles` per syscall, whose two arms
+were both taken on a machine where three of four cores were uncached. None of
+them is wrong; each is a measurement of a different machine, and without this
+number there is no way to say how different.
 
-The AP trampoline (`arch/smp.rs`) sets `CR0.PE`, `CR4.PAE`, `EFER.LME` and
-`CR0.PG` and touches nothing else, so an AP reaches long mode holding the INIT
-value of `CR0` with two bits or'd in. `0x60000010 | 1 | 0x80000000` is exactly
-the `0xe0000011` measured. `init_ap` then adds `CR4.OSFXSR`, `OSXMMEXCPT`,
-`SMEP`, `SMAP`, `FSGSBASE` and `PCIDE` and nothing to `CR0`. The BSP's values
-are firmware's, inherited, and were never compared against the APs'.
+**Neither instrument this project runs on can answer it.** Both rows are from
+`6e2dac6`:
 
-| bit | BSP | AP | consequence |
+| host | an AP that has executed nothing but the trampoline |
+|---|---|
+| dev host, TCG | `cr0=0xe0000011 cr4=0x00000020` |
+| CI shard 3, KVM on an Intel Xeon 6973P-C | `cr0=0x80000011 cr4=0x00000020` |
+
+Under KVM the AP arrives with `CD` and `NW` **already clear**, so no CI shard
+could ever have failed on the caching half of the defect however long it stood.
+And TCG models no cache, so the bit is architectural state there with no timing
+consequence — which the instrument itself measured, `smp=4`, 4096 cache lines
+read either side of the `mov cr0` that turns caching on:
+
+| | pre | cold | warm |
 |---|---|---|---|
-| `CR0.CD` (30), `CR0.NW` (29) | 0 | **1** | **caching disabled on every CPU but cpu0** |
-| `CR0.NE` (5) | 1 | **0** | an unmasked x87 exception goes to FERR#/IGNNE, not `#MF` |
-| `CR0.WP` (16) | 1 | **0** | supervisor writes ignore the read-only bit |
-| `CR0.MP` (1) | 1 | **0** | `WAIT`/`FWAIT` no longer trap on `TS` |
-| `CR4.MCE` (6) | 1 | **0** | a machine check is a shutdown, not `#MC` |
-| `CR4.DE` (3) | 1 | **0** | debug-register access semantics differ |
+| cpu0, caching on throughout (the control) | 26000 | 22000 | 19000 |
+| cpu1, `pre` uncached, `cold`/`warm` cached | 30000 | 27000 | 20000 |
+| cpu1 under `no-ap-control-regs`, all three uncached | 30000 | 22000 | 20000 |
 
-Four separate defects, one cause. Ranked by what they cost:
+The third row is the verdict: leaving cpu1's caches off for all three passes
+costs it nothing against the row where two of them ran with caches on. Every
+number is a multiple of 1000 — TCG's TSC granularity — and cpu2 and cpu3 on the
+same boot answered `11000/10000/5000` with byte-identical registers, a fourfold
+spread that is the host's scheduling rather than the guest's.
 
-**`CD`/`NW` set is the expensive one.** An AP with caching disabled is running
-uncached. That is a performance defect large enough to distort every A/B this
-tree has ever taken on more than one CPU, and it is invisible to every test
-because nothing measures a per-CPU rate. Not measured here — measuring it needs
-the fix, and this entry is a report.
+**The instrument is built and has never been run on silicon.**
+`cargo run -- --diag-boot --kernel-feature control-regs-bench --build-only`,
+flash, and read the per-CPU rows off the panel; cpu0's row is the control,
+because it arrives with caching already on, and every AP's `pre` against its own
+`warm` is the number. Nothing shorter reaches it: there is no CPU affinity, so
+no userland loop can choose the core it runs on, and the state under test exists
+only between an AP's `INIT` and its first `mov cr0` — a window with no userland
+in it at all. `syscall_cost` cannot be pinned to an AP for the same reason, and
+on a host that prices `CD` at zero it would answer the same on both.
 
-**`NE` clear explains `specs/issues/isolation/`'s unexplained survivor.** `fault_gates`' `mf` arm
-killed its child 6 of 6 alone and survived once in a 12-wide suite, printing
-status word `0xb881` — IE and ES set, on the `fnstsw` two instructions past the
-`fwait` that should have trapped on exactly that `ES`. "The state was not lost;
-the trap was." With `NE` clear the exception is signalled on the external FERR#
-pin, which nothing in a modern machine is listening to, and a child scheduled
-onto an AP rather than the BSP would see precisely that. This is a hypothesis
-with a mechanism and a measurement behind it, not a proof: confirming it means
-running that arm pinned to an AP.
+## What is *not* open, recorded because three places used to say it was
 
-**`WP` clear is an isolation weakening**, not a hole userland can reach on its
-own — it means a kernel bug that writes through a read-only kernel mapping
-succeeds on 7 of 8 CPUs and faults on cpu0. A bug that reproduces on one core in
-eight is the worst kind to own.
+**`CR4.OSXSAVE` diverging between the BSP and the APs** —
+`specs/user-machine-state.md` §7's hypothesis 1, firmware leaving it set so cpu0
+permits AVX and an AP `#UD`s on it, killing a thread that migrates. The
+declaration is written whole rather than OR'd, so `write_cr4` clears the bit on
+the BSP as well; it is in neither `CR4_REQUIRED` nor `CR4_OPTIONAL`, the gate
+asserts it clear on every CPU by name, and a second arm refuses any bit the gate
+never named. The divergence is unrepresentable on the T14 as much as here, so
+that hypothesis needs no machine.
 
-**`CR4.MCE` clear** turns a machine check into a shutdown with no report, on
-every CPU but the BSP, on the one machine (the T14) with no serial port.
-
-The fix is one place — the APs' `CR0` and `CR4` should be built to a declared
-value rather than inherited from INIT, and the BSP's should be checked against
-the same declaration rather than trusted. Deliberately **not** done in
-`wt/toyos-fpu`: that branch owns the ring-transition invariant, and changing
-what `CR0.NE` means on 7 of 8 CPUs in the same commit would make its own
-`fpu_isolation` gate unattributable.
-
-`CR4.OSXSAVE` is clear on both CPUs here, so hypothesis 1 of
-`user-machine-state.md` §7 — firmware leaving `OSXSAVE` set, cpu0 permitting AVX
-and the APs `#UD`ing on it, a migrating thread faulting — **cannot be answered
-on this host**. Its mechanism is confirmed (the two `CR4`s genuinely differ);
-its instance needs the T14.
+**Whether `CR0.NE` clear was *the* cause of `fault_gates`' one `0xb881`
+survivor** — an unmasked x87 exception signalled on FERR# instead of raising
+`#MF`, on a child that happened to land on an AP. It was left open for want of a
+way to pin the arm to an AP. It is no longer owed: `NE` is declared set and
+asserted on every CPU, the `mf` arm asserts a kill rather than tolerating a
+survivor, and a recurrence is a red naming the test instead of a line in a log.

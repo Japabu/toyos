@@ -16,12 +16,12 @@ all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|
 | ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — `specs/issues/hardware/`, a Bulk-Only Reset that raced the transfer it was recovering from |
-| `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, see `specs/issues/isolation/`'s x87 entry |
+| `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — the #MF of `specs/user-machine-state.md` §2, whose fix landed after this probe and has not been re-measured on CI |
 | `std_unwind_so` | **5/5** | 10 | shared block | the same |
-| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine — **closed below** |
+| `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine — **closed**: it always did, and the test read the line through a span of host wall clock |
 | `hda_tone` | **4/5** | 4 | Serial | 1 mid-tone silence in the capture (`specs/issues/audio/`) |
 | `late_storage_connect` | 2/5 | 7 | Serial | the boot scan bound a disk, so the port was not held empty |
-| `hda_two_live_refused` | 2/5 | 2 | Parallel | `"presenting a null sink" never reached the boot console` — **closed below** |
+| `hda_two_live_refused` | 2/5 | 2 | Parallel | `"presenting a null sink" never reached the boot console` — **closed** with it |
 | `blocked_dump` | 2/5 | 3 | Parallel | two *different* reasons — the census half, and /bin/terminal racing the compositor |
 | `dump_nmi_probe` | 1/5 | 2 | Serial | the rip resolved to `u128_div_rem`, not to the spin |
 | `kernel_heartbeat` | 1/5 | 5 | Serial | 2 of 12 heartbeats dropped a healthy CPU from the mask |
@@ -29,8 +29,8 @@ all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
 
 A twelfth name has been seen since and is not in the table because the probe did
 not see it: `xhci_slow_connect`, red alone in run `31261669826`. It has its own
-entry above — a 1 ms margin *inside the guest's boot*, which is why running alone
-moves it by milliseconds and not by a verdict.
+entry, `xhci-slow-connect-has-a-1ms-margin` — a 1 ms margin *inside the guest's
+boot*, which is why running alone moves it by milliseconds and not by a verdict.
 
 A thirteenth, with one sample each way on **one tree**: `desktop_audio_client`
 stalled wide *and* alone in run `31264914759` and passed in run `31266194663`,

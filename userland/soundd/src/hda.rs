@@ -118,7 +118,7 @@ impl Hda {
         for entry in found {
             match entry {
                 Ok(codec) => {
-                    eprintln!(
+                    say!(
                         "soundd: hda codec{} vendor={:04x} device={:04x}, {} function group(s)",
                         codec.address,
                         codec.vendor,
@@ -128,7 +128,7 @@ impl Hda {
                     codecs.push(codec);
                 }
                 Err((address, fault)) => {
-                    eprintln!("soundd: hda codec{address} answered nothing usable ({fault:?})")
+                    say!("soundd: hda codec{address} answered nothing usable ({fault:?})")
                 }
             }
         }
@@ -138,7 +138,7 @@ impl Hda {
 
         let path = toyos_hda::find_output_path(&codecs).map_err(Refusal::NoOutput)?;
         let (format, channels) = config::format(&codecs, &path).ok_or(Refusal::Rate)?;
-        eprintln!(
+        say!(
             "soundd: hda codec{} group {:#04x} converter {:#04x} -> pin {:#04x} ({}), \
              headphone {}, format {:#06x} ({} Hz {} ch {}-bit)",
             path.codec,
@@ -169,7 +169,7 @@ impl Hda {
         hda.write(SD_CTL_TAG, RegWidth::U8, (info.stream_tag as u32) << 4)
             .map_err(Refusal::Kernel)?;
         hda.write(SD_FMT, RegWidth::U16, format as u32).map_err(Refusal::Kernel)?;
-        eprintln!("soundd: hda path configured in {sent} verbs, stream tag {}", info.stream_tag);
+        say!("soundd: hda path configured in {sent} verbs, stream tag {}", info.stream_tag);
         Ok((hda, path, channels))
     }
 

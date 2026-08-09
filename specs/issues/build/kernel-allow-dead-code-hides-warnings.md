@@ -32,6 +32,6 @@ methods — `PORTSC_CCS/PED/PR/SPEED`, `CMD_GET_DISPLAY_INFO`, `DR7_*`,
 `clear_regions`, `unmap_2m`, `wake_one`, `port_bit`, `redirection`. Default
 features only; an actuator feature could move the number.
 
-Same family as *The fork estate is invisible to the zero-warning bar* below: a
+Same family as `fork-estate-outside-the-warning-bar`: a
 bar with a crate-level exemption under it certifies less than it looks like it
 does, and "Dead code is deleted" is a stated principle.
