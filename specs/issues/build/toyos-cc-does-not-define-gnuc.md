@@ -1,10 +1,10 @@
 ---
-status: open
-kind: finding
+status: none
+kind: rejected
 opened: 2026-08-05
 ---
 
-# `toyos-cc` does not define `__GNUC__`, so doomgeneric compiles unpacked
+# Defining `__GNUC__` is declined: it would claim a GNU C this compiler is not
 
 `PACKEDATTR` in `userland/doom/include/doomtype.h` and in doomgeneric's own
 `doomtype.h` is `__attribute__((packed))` under `#ifdef __GNUC__` and empty
@@ -22,5 +22,12 @@ from its own pack pointer, and `offsetof(pcx_t, data)` is 128 either way. The
 remaining thirteen differ only in alignment, and every one of them is read
 through a pointer into a WAD buffer.
 
-Defining `__GNUC__` would be a much larger change than it looks: it turns on
-every `#ifdef __GNUC__` block in doomgeneric and in any header that has one.
+**Declined on the merits.** Defining `__GNUC__` is a claim to implement GNU C,
+and toyos-cc stops on a long list of GNU constructs: some refused by name
+(`__attribute__((cleanup))`, `((constructor))`, `((alias))`, file-scope `asm`,
+`#pragma pack`), some as parse errors (`asm goto`, `_Alignas`). Seeding the
+macro turns on every `#ifdef __GNUC__` block in every header at once and hands
+all of it to a compiler that will refuse most of it — the attribute ruling read
+backwards, where the defect is claiming a capability you do not have. The
+measurement above shows it buys nothing today, so there is no gain to weigh
+against that, and nothing is owed once it is declined.
