@@ -5,7 +5,7 @@ use consteval::{ConstEval, IfState, has_unbalanced_parens, split_first_word};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::{fs, process};
+use std::fs;
 
 #[derive(Clone)]
 pub(crate) enum Macro {
@@ -305,8 +305,7 @@ impl Preprocessor {
                     "endif" => { if_stack.pop(); }
                     "error" => {
                         let ln = self.file_stack.last().map(|(_,l,_)| *l).unwrap_or(0);
-                        eprintln!("{}:{}: #error {}", filename, ln, rest);
-                        process::exit(1);
+                        panic!("{}:{}: #error {}", filename, ln, rest);
                     }
                     "warning" => {
                         let ln = self.file_stack.last().map(|(_,l,_)| *l).unwrap_or(0);
@@ -523,11 +522,9 @@ impl Preprocessor {
             }
             self.process_source(&content, &resolved, idx);
         } else if is_system {
-            eprintln!("fatal error: cannot find system include file: {}", path_str);
-            std::process::exit(1);
+            panic!("fatal error: cannot find system include file: {}", path_str);
         } else {
-            eprintln!("fatal error: cannot find include file: {}", path_str);
-            std::process::exit(1);
+            panic!("fatal error: cannot find include file: {}", path_str);
         }
     }
 

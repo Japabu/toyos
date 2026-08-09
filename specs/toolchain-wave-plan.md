@@ -363,9 +363,9 @@ five in all; the other two are `main.rs:102` (a link error) and `main.rs:185`
 (no input files), which are the binary's own and stay. A CLI exiting is not a
 library denying its caller a choice.
 
-`specs/issues/build/toyos-cc-preprocessor-exits-the-process.md` says "Every
-other error in the crate returns". **That is wrong, and the fix depends on which
-it is:** `toyos-cc/src` has **98 `panic!`s and zero `-> Result`**. The crate's
+The issue file this closes said "Every other error in the crate returns".
+**That is wrong, and the fix depends on which it is:** `toyos-cc/src` has
+**98 `panic!`s and zero `-> Result`**. The crate's
 convention is to panic, the harness's mechanism is `catch_unwind`, and a
 `process::exit` is the one error shape that defeats it. So the fix is to panic
 like the other 98 — not to introduce a `Result` the rest of the crate does not
