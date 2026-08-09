@@ -40,14 +40,18 @@ fn main() {
     let args = SpawnArgs {
         argv_ptr: argv as u64,
         argv_len: 10,
-        fd_map_ptr: region as u64,
-        fd_map_count: PAIRS as u64,
+        slot_map_ptr: region as u64,
+        slot_map_count: PAIRS as u64,
         env_ptr: 0,
         env_len: 0,
+        endow_ptr: 0,
+        endow_count: 0,
+        labels_ptr: 0,
+        labels_len: 0,
     };
     let err = unsafe { syscall::spawn(&args) }
-        .expect_err("a spawn fd_map past MAX_HANDLES must be rejected");
-    assert_eq!(err, SyscallError::ResourceExhausted, "wrong error for oversized fd_map");
+        .expect_err("a spawn slot_map past MAX_HANDLES must be rejected");
+    assert_eq!(err, SyscallError::ResourceExhausted, "wrong error for oversized slot_map");
 
     // dup2 picks the slot, so it never went through the allocating path that
     // carried the cap.

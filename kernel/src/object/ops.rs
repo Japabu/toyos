@@ -55,6 +55,13 @@ pub fn initial_rights(object: &KObjectRef) -> Rights {
         // Every bit on a `SysCap` is an authority init decides per program, so
         // there is no sensible default and the creator states it.
         KObjectRef::SysCap(_) => Rights::NONE,
+        // A connector is a ticket to a service and has no read or write path
+        // at all: the only things to do with one are put it in a namespace and
+        // give that namespace away.
+        KObjectRef::Connector(_) => Rights::DUP.union(Rights::TRANSFER),
+        // `READ` is what resolving a name through it takes, and what narrowing
+        // one into a child's takes.
+        KObjectRef::Namespace(_) => Rights::DUP.union(Rights::TRANSFER).union(Rights::READ),
     }
 }
 
@@ -195,7 +202,8 @@ pub fn pipe_id_read(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::Connection(c) => Some(c.rx()),
         KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::Device(_)
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
-        | KObjectRef::SysCap(_) => None,
+        | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => None,
     }
 }
 
@@ -205,7 +213,8 @@ pub fn pipe_id_write(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::Connection(c) => Some(c.tx()),
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
-        | KObjectRef::SysCap(_) => None,
+        | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => None,
     }
 }
 
@@ -224,7 +233,8 @@ pub fn read_source(object: &KObjectRef) -> Option<Source> {
             device_registry::DeviceType::Framebuffer => None,
         },
         KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::IoUring(_)
-        | KObjectRef::SysCap(_) => None,
+        | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => None,
     }
 }
 
@@ -234,7 +244,8 @@ pub fn write_source(object: &KObjectRef) -> Option<Source> {
         KObjectRef::Connection(c) => Some(Source::PipeWritable(c.tx())),
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
-        | KObjectRef::SysCap(_) => None,
+        | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => None,
     }
 }
 
@@ -370,7 +381,8 @@ pub fn try_read(object: &KObjectRef, buf: &mut UserBytesMut) -> Option<u64> {
             Some(count as u64)
         }
         KObjectRef::PipeWrite(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
-        | KObjectRef::SysCap(_) => Some(SyscallError::PermissionDenied.to_u64()),
+        | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => Some(SyscallError::PermissionDenied.to_u64()),
     }
 }
 
@@ -426,7 +438,8 @@ pub fn try_write(object: &KObjectRef, buf: &UserBytes) -> Option<u64> {
             Some(buf.len() as u64)
         }
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
-        | KObjectRef::IoUring(_) | KObjectRef::SysCap(_) => {
+        | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => {
             Some(SyscallError::PermissionDenied.to_u64())
         }
     }
@@ -481,7 +494,8 @@ pub fn fstat(object: &KObjectRef) -> Stat {
         KObjectRef::Connection(_) => plain(FileType::Socket),
         KObjectRef::Console(_) => plain(FileType::Serial),
         KObjectRef::Acceptor(_) => plain(FileType::Pipe),
-        KObjectRef::IoUring(_) | KObjectRef::SysCap(_) => plain(FileType::Unknown),
+        KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => plain(FileType::Unknown),
         KObjectRef::Device(d) => plain(match d.class() {
             device_registry::DeviceType::Keyboard => FileType::Keyboard,
             device_registry::DeviceType::Mouse => FileType::Mouse,
@@ -547,7 +561,8 @@ pub fn has_data(object: &KObjectRef) -> bool {
                 !d.info_read() || crate::drivers::virtio_sound::has_pending()
             }
         },
-        KObjectRef::PipeWrite(_) | KObjectRef::IoUring(_) | KObjectRef::SysCap(_) => false,
+        KObjectRef::PipeWrite(_) | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => false,
     }
 }
 
@@ -557,7 +572,8 @@ pub fn has_space(object: &KObjectRef) -> bool {
         KObjectRef::Connection(c) => pipe::has_space(c.tx()),
         KObjectRef::File(_) | KObjectRef::Console(_) => true,
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
-        | KObjectRef::IoUring(_) | KObjectRef::SysCap(_) => false,
+        | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => false,
     }
 }
 
@@ -579,6 +595,7 @@ pub fn mark_tty(object: &KObjectRef) -> u64 {
         }
         KObjectRef::Connection(_) | KObjectRef::File(_) | KObjectRef::Device(_)
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
-        | KObjectRef::SysCap(_) => SyscallError::InvalidArgument.to_u64(),
+        | KObjectRef::SysCap(_)
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => SyscallError::InvalidArgument.to_u64(),
     }
 }

@@ -134,7 +134,7 @@ fn claim_in_child() -> Option<SyscallError> {
 /// this pass on `BadAddress` without ever reaching `build_child_fds`.
 fn spawn_with_fd_map(fd: toyos_abi::RawHandle) -> Result<toyos_abi::Pid, SyscallError> {
     const REGION: usize = 4096;
-    const FD_MAP_OFF: usize = 2048;
+    const SLOT_MAP_OFF: usize = 2048;
 
     let region = unsafe {
         syscall::mmap(
@@ -151,17 +151,21 @@ fn spawn_with_fd_map(fd: toyos_abi::RawHandle) -> Result<toyos_abi::Pid, Syscall
 
     let pair = [3u32.to_ne_bytes(), fd.0.to_ne_bytes()].concat();
     unsafe {
-        core::ptr::copy_nonoverlapping(pair.as_ptr(), region.add(FD_MAP_OFF), pair.len())
+        core::ptr::copy_nonoverlapping(pair.as_ptr(), region.add(SLOT_MAP_OFF), pair.len())
     };
 
     let result = unsafe {
         syscall::spawn(&SpawnArgs {
             argv_ptr: region as u64,
             argv_len: argv.len() as u64,
-            fd_map_ptr: region as u64 + FD_MAP_OFF as u64,
-            fd_map_count: 1,
+            slot_map_ptr: region as u64 + SLOT_MAP_OFF as u64,
+            slot_map_count: 1,
             env_ptr: 0,
             env_len: 0,
+            endow_ptr: 0,
+            endow_count: 0,
+            labels_ptr: 0,
+            labels_len: 0,
         })
     };
     unsafe { syscall::munmap(region, REGION) }.expect("munmap");

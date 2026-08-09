@@ -4,15 +4,21 @@
 //! Everything else — the address space, the relocations, the TLS block — is
 //! arch-neutral, so a second architecture adds this file and nothing more.
 
+use alloc::vec::Vec;
+
 use crate::arch::entry::{initial_user_state, ring3_trampoline_asm};
 use crate::object::{HandleError, HandleTable};
-use crate::process::{fd_owner_data, OwnedAlloc, KERNEL_STACK_SIZE};
+use crate::process::{
+    fd_owner_data, Endowments, OwnedAlloc, ENDOW_ENTRY_LEN, KERNEL_STACK_SIZE,
+};
 use crate::scheduler;
-use toyos_abi::handle::RawHandle;
-use toyos_abi::syscall::SyscallError;
+use crate::user_ptr::UserBytes;
+use toyos_abi::handle::{RawHandle, Rights};
+use toyos_abi::syscall::{EndowEntry, SyscallError, MAX_ENDOWMENTS, MAX_LABELS_LEN};
 
-/// One `[child_slot, parent_handle]` pair of `SpawnArgs::fd_map_ptr`, in bytes.
-pub const FD_PAIR_LEN: usize = 8;
+/// One `[child_slot, parent_handle]` pair of `SpawnArgs::slot_map_ptr`, in
+/// bytes.
+pub const SLOT_PAIR_LEN: usize = 8;
 
 /// Allocate a kernel stack and lay out the frame `context_switch` will restore.
 pub(crate) fn alloc_kernel_stack(
@@ -102,27 +108,44 @@ pub(crate) fn make_name(path: &str) -> [u8; crate::process::THREAD_NAME_LEN] {
     name
 }
 
-/// Build a child's `HandleTable` by duplicating the parent handles it names.
+/// Build a child's table out of the two vectors `SpawnArgs` carries.
 ///
-/// A pair naming a parent handle that does not resolve contributes nothing: the
-/// child simply does not get it, which is what a caller asking for a closed
-/// handle deserves and is not a reason to refuse the spawn.
+/// **Two verbs.** `slot_map` *duplicates* — the parent keeps its stdout — and
+/// `endow` *moves*, which is what makes handing over a device claim expressible
+/// at all: a claim carries no `DUP`, so a move is its only form and the parent
+/// provably no longer holds it afterwards.
+///
+/// **All or nothing.** Everything is verified under one hold of the parent's
+/// lock — the handles resolve, they carry `TRANSFER`, the labels are in range
+/// and the child's table has room — and only then is anything removed. A
+/// refusal leaves the parent's table exactly as it was.
 pub fn build_child_handles(
-    pairs: &crate::user_ptr::UserBytes,
-) -> Result<HandleTable, SyscallError> {
+    slot_map: &UserBytes,
+    endow: &UserBytes,
+    labels: &[u8],
+) -> Result<(HandleTable, Endowments), SyscallError> {
+    if endow.len() / ENDOW_ENTRY_LEN > MAX_ENDOWMENTS {
+        return Err(SyscallError::InvalidArgument);
+    }
+    if labels.len() > MAX_LABELS_LEN {
+        return Err(SyscallError::InvalidArgument);
+    }
     let data_arc = fd_owner_data();
-    let data = data_arc.lock();
+    let mut data = data_arc.lock();
     let mut handles = HandleTable::new();
-    for i in 0..pairs.len() / FD_PAIR_LEN {
-        let mut pair = [0u8; FD_PAIR_LEN];
-        pairs.read_at(i * FD_PAIR_LEN, &mut pair);
+    for i in 0..slot_map.len() / SLOT_PAIR_LEN {
+        let mut pair = [0u8; SLOT_PAIR_LEN];
+        slot_map.read_at(i * SLOT_PAIR_LEN, &mut pair);
         let child_slot = u32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
         let parent = RawHandle(u32::from_ne_bytes([pair[4], pair[5], pair[6], pair[7]]));
+        // A pair naming a parent handle that does not resolve contributes
+        // nothing: the child simply does not get it, which is what a caller
+        // asking for a closed handle deserves and is not a reason to refuse the
+        // spawn.
         let Ok(rights) = data.handles.rights_of(parent) else { continue };
-        // A device claim carries no `DUP`, so it cannot be given to a child
-        // this way: that would be a transfer, and `slot_map` duplicates. The
+        // A device claim carries no `DUP`, so it cannot come this way. The
         // refusal is by name rather than a skip, which would start the child
-        // without a handle it asked for. Chunk 4's endowment vector is the
+        // without a handle it asked for — the endowment vector below is the
         // move that *can* carry one.
         let entry = data
             .handles
@@ -135,5 +158,47 @@ pub fn build_child_handles(
             .map_err(HandleError::to_syscall_error)?;
         drop(displaced);
     }
-    Ok(handles)
+
+    let count = endow.len() / ENDOW_ENTRY_LEN;
+    let mut moving: Vec<(EndowEntry, RawHandle)> = Vec::with_capacity(count);
+    for i in 0..count {
+        let mut raw = [0u8; ENDOW_ENTRY_LEN];
+        endow.read_at(i * ENDOW_ENTRY_LEN, &mut raw);
+        let label_off = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let label_len = u32::from_ne_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        let handle = RawHandle(u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]));
+        let end = (label_off as usize)
+            .checked_add(label_len as usize)
+            .ok_or(SyscallError::InvalidArgument)?;
+        if end > labels.len() {
+            return Err(SyscallError::InvalidArgument);
+        }
+        // Verified against the *parent's* rights here and removed below, so a
+        // handle that is missing `TRANSFER` refuses the spawn rather than
+        // leaving the child a hole where its parent said a capability would be.
+        let rights = data.handles.rights_of(handle).map_err(HandleError::to_syscall_error)?;
+        if !rights.contains(Rights::TRANSFER) {
+            return Err(SyscallError::PermissionDenied);
+        }
+        moving.push((EndowEntry { label_off, label_len, handle, _pad: 0 }, handle));
+    }
+    // The child's table must be able to take all of them before the parent's
+    // gives any up: an install that failed halfway would have moved a handle
+    // out of a table that is about to be told the spawn did not happen.
+    if !handles.has_room(moving.len()) {
+        return Err(SyscallError::ResourceExhausted);
+    }
+
+    let mut entries = Vec::with_capacity(moving.len());
+    for (mut entry, parent_handle) in moving {
+        let moved = data
+            .handles
+            .remove(parent_handle)
+            .expect("an endowed handle verified under this lock stopped resolving");
+        entry.handle = handles
+            .install(moved)
+            .expect("a child table with verified room refused an endowment");
+        entries.push(entry);
+    }
+    Ok((handles, Endowments::new(entries, labels.to_vec())))
 }

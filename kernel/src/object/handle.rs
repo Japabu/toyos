@@ -155,6 +155,15 @@ impl HandleTable {
         self.slots.iter().filter(|s| s.entry.is_some()).count()
     }
 
+    /// Whether `n` more `install`s can all succeed.
+    ///
+    /// Spawn's endowment vector asks before it takes anything out of the
+    /// parent's table, because a move that fails halfway has already emptied a
+    /// slot the caller is about to be told nothing happened to.
+    pub fn has_room(&self, n: usize) -> bool {
+        self.free.len() + (MAX_HANDLES - self.slots.len()) >= n
+    }
+
     pub fn install(&mut self, entry: HandleEntry) -> Result<RawHandle, HandleError> {
         if let Some(slot) = self.free.pop() {
             let s = &mut self.slots[slot as usize];

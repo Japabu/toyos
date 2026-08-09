@@ -584,8 +584,8 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
             user_data,
             handle,
             flags,
-            read_source,
-            write_source,
+            read_source: read_source.clone(),
+            write_source: write_source.clone(),
             _watcher: watcher,
         };
 

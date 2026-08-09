@@ -308,24 +308,36 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_SPAWN => {
             let Ok(args) = ctx.copy_in::<SpawnArgs>(UserAddr::new(a1)) else { return bad_addr };
             let text = match ctx.user_str(UserAddr::new(args.argv_ptr), args.argv_len) { Ok(s) => s, Err(e) => return e.to_u64() };
-            let fd_count = args.fd_map_count as usize;
-            let fds = if fd_count > 0 {
-                // One pair read out of the window at a time rather than the map
-                // copied wholesale: `fd_map_count` is userland's, and a copy
-                // would put it on the allocator for a loop that reads each pair
-                // exactly once.
-                let Some(bytes) = fd_count
-                    .checked_mul(crate::loader::FD_PAIR_LEN)
-                    .and_then(|len| ctx.user_bytes(UserAddr::new(args.fd_map_ptr), len as u64))
-                else {
-                    return bad_addr;
-                };
-                match process::build_child_handles(&bytes) {
-                    Ok(handles) => handles,
-                    Err(e) => return e.to_u64(),
-                }
-            } else {
-                crate::object::HandleTable::new()
+            if args.endow_count as usize > toyos_abi::syscall::MAX_ENDOWMENTS
+                || args.labels_len > toyos_abi::syscall::MAX_LABELS_LEN as u64
+            {
+                return SyscallError::InvalidArgument.to_u64();
+            }
+            // One pair read out of each window at a time rather than the
+            // vectors copied wholesale: both counts are userland's, and a copy
+            // would put them on the allocator for a loop that reads each entry
+            // exactly once. The label blob is the exception — the child keeps
+            // it, so it is copied in and bounded by `MAX_LABELS_LEN`.
+            let Some(slot_map) = (args.slot_map_count as usize)
+                .checked_mul(crate::loader::SLOT_PAIR_LEN)
+                .and_then(|len| ctx.user_bytes(UserAddr::new(args.slot_map_ptr), len as u64))
+            else {
+                return bad_addr;
+            };
+            let Some(endow) = (args.endow_count as usize)
+                .checked_mul(core::mem::size_of::<toyos_abi::syscall::EndowEntry>())
+                .and_then(|len| ctx.user_bytes(UserAddr::new(args.endow_ptr), len as u64))
+            else {
+                return bad_addr;
+            };
+            let labels = match ctx.user_vec(UserAddr::new(args.labels_ptr), args.labels_len) {
+                Ok(bytes) => bytes,
+                Err(e) => return e.to_u64(),
+            };
+            let (fds, endowments) = match process::build_child_handles(&slot_map, &endow, &labels)
+            {
+                Ok(built) => built,
+                Err(e) => return e.to_u64(),
             };
             // The env blob is kept for the child's whole life, so it needs a
             // bound of its own — `user_vec` is the one accessor that puts a
@@ -342,7 +354,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             } else {
                 alloc::vec::Vec::new()
             };
-            sys_spawn(&text, fds, env)
+            sys_spawn(&text, fds, endowments, env)
         }
         SYS_WAITPID => sys_waitpid(a1, a2),
 
@@ -561,6 +573,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                 }
                 Err(e) => e.to_u64(),
             }
+        }
+        SYS_ENDOWMENTS => {
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
+            sys_endowments(&mut buf)
         }
         SYS_ACCEPT => sys_accept(RawHandle(a1 as u32)),
         SYS_PORT_CREATE => sys_port_create(),
@@ -1305,11 +1321,12 @@ fn sys_write_nonblock(h: RawHandle, buf: &UserBytes) -> u64 {
 fn sys_spawn(
     text: &str,
     handles: crate::object::HandleTable,
+    endowments: process::Endowments,
     env: alloc::vec::Vec<u8>,
 ) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
     let parent = process::current_process();
-    match process::spawn(&args, handles, Some(parent), env) {
+    match process::spawn(&args, handles, endowments, Some(parent), env) {
         Ok(pid) => pid.raw() as u64,
         Err(e) => e.to_u64(),
     }
@@ -1366,6 +1383,29 @@ fn sys_open_device(device_type: u64) -> u64 {
     process::with_fd_owner_data(|data| {
         handle_result(ops::install(&mut data.handles, KObjectRef::Device(claim)))
     })
+}
+
+/// Answer this process's endowment table.
+///
+/// An empty buffer asks how many bytes the answer needs, so a caller sizes once
+/// and reads once. A short one is refused rather than truncated: half an
+/// endowment table is not a smaller endowment table, it is a caller that would
+/// go on to look up a label that is not in what it got.
+fn sys_endowments(out: &mut crate::user_ptr::UserBytesMut) -> u64 {
+    let data_arc = process::fd_owner_data();
+    let data = data_arc.lock();
+    let needed = data.endowments.encoded_len();
+    if out.is_empty() {
+        return needed as u64;
+    }
+    if out.len() < needed {
+        return SyscallError::InvalidArgument.to_u64();
+    }
+    let mut buf = alloc::vec![0u8; needed];
+    data.endowments.encode(&mut buf);
+    drop(data);
+    out.write_at(0, &buf);
+    needed as u64
 }
 
 // Ports and namespaces

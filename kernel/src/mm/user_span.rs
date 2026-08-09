@@ -40,8 +40,8 @@ pub fn in_user_half(ptr: u64, len: u64) -> bool {
 /// A translation answers for the 2 MiB page holding its first byte; the
 /// physical page after that one belongs to whoever the PMM last gave it to. So
 /// an object crossing the boundary is refused rather than served out of the
-/// page it started in — userland can always move a value that is at most 48
-/// bytes long, and the alternative is a write into another process's memory.
+/// page it started in — every `UserSafe` type is small enough for userland to
+/// move, and the alternative is a write into another process's memory.
 pub fn is_user_object(ptr: u64, size: u64, align: u64) -> bool {
     if size == 0 || !align.is_power_of_two() {
         return false;
@@ -67,7 +67,8 @@ mod tests {
         ("Stat", 24, 8),
         ("SchedInfo", 24, 8),
         ("FramebufferInfo", 32, 4),
-        ("SpawnArgs", 48, 8),
+        ("SpawnArgs", 80, 8),
+        ("NamespaceBuild", 56, 8),
         ("ProcessStats", 128, 8),
     ];
 

@@ -18,6 +18,11 @@ use crate::loader::{
 
 pub use toyos_abi::{Pid, Tid};
 pub use crate::scheduler::TaskId;
+use toyos_abi::syscall::EndowEntry;
+
+/// One `EndowEntry` on the wire. Named once, because both the reader in
+/// `loader::start` and the writer in [`Endowments::encode`] index by it.
+pub const ENDOW_ENTRY_LEN: usize = core::mem::size_of::<EndowEntry>();
 
 // Re-export loader functions so existing callers (via `process::`) keep working.
 pub use crate::loader::{spawn, spawn_kernel, build_child_handles};
@@ -529,6 +534,56 @@ pub struct ProcessData {
     pub accounting: ProcessAccounting,
     /// Stashed stats from exited children (capped at 64).
     pub child_stats: Vec<(Pid, toyos_abi::syscall::ProcessStats)>,
+    /// What this process's parent called each handle it moved in at spawn.
+    pub endowments: Endowments,
+}
+
+/// The labels a parent put on the handles it endowed, and nothing else.
+///
+/// **Names, not authority.** The handles are in the table whether or not the
+/// child ever asks; this is only how it learns which of its slots its parent
+/// meant by `serve:compositor`. Written once by spawn and freed with the
+/// process, which is the whole of the per-process state the endowment design
+/// adds.
+pub struct Endowments {
+    entries: alloc::boxed::Box<[EndowEntry]>,
+    labels: alloc::boxed::Box<[u8]>,
+}
+
+impl Endowments {
+    pub fn empty() -> Self {
+        Self { entries: alloc::boxed::Box::new([]), labels: alloc::boxed::Box::new([]) }
+    }
+
+    pub fn new(entries: Vec<EndowEntry>, labels: Vec<u8>) -> Self {
+        Self { entries: entries.into_boxed_slice(), labels: labels.into_boxed_slice() }
+    }
+
+    /// Bytes [`SYS_ENDOWMENTS`] answers with: a `u64` count, the entries, then
+    /// the blob their offsets index.
+    ///
+    /// [`SYS_ENDOWMENTS`]: toyos_abi::syscall::SYS_ENDOWMENTS
+    pub fn encoded_len(&self) -> usize {
+        8 + self.entries.len() * ENDOW_ENTRY_LEN + self.labels.len()
+    }
+
+    /// Render into `out`, which the caller has sized at [`Self::encoded_len`].
+    ///
+    /// Field by field rather than a transmute of the slice: `EndowEntry`'s
+    /// padding word is written as a zero here, so nothing of the kernel's
+    /// reaches a child in it.
+    pub fn encode(&self, out: &mut [u8]) {
+        out[..8].copy_from_slice(&(self.entries.len() as u64).to_ne_bytes());
+        for (i, entry) in self.entries.iter().enumerate() {
+            let at = 8 + i * ENDOW_ENTRY_LEN;
+            out[at..at + 4].copy_from_slice(&entry.label_off.to_ne_bytes());
+            out[at + 4..at + 8].copy_from_slice(&entry.label_len.to_ne_bytes());
+            out[at + 8..at + 12].copy_from_slice(&entry.handle.0.to_ne_bytes());
+            out[at + 12..at + 16].copy_from_slice(&0u32.to_ne_bytes());
+        }
+        let blob = 8 + self.entries.len() * ENDOW_ENTRY_LEN;
+        out[blob..blob + self.labels.len()].copy_from_slice(&self.labels);
+    }
 }
 
 /// Per-process accounting counters. Accumulated from all threads on exit.

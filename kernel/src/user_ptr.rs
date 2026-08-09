@@ -49,6 +49,7 @@ unsafe impl UserSafe for crate::object::ops::Stat {}
 
 // ABI types.
 unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
+unsafe impl UserSafe for toyos_abi::syscall::NamespaceBuild {}
 unsafe impl UserSafe for toyos_abi::syscall::SchedInfo {}
 unsafe impl UserSafe for toyos_abi::syscall::ProcessStats {}
 unsafe impl UserSafe for toyos_abi::FramebufferInfo {}

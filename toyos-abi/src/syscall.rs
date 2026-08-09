@@ -152,16 +152,34 @@ pub const SYS_RT_ENTER: u64 = 112;
 pub const WNOHANG: u64 = 1;
 
 /// Arguments for the `SYS_SPAWN` syscall, passed as a single pointer.
+///
+/// **Two vectors, two verbs.** `slot_map` *duplicates* — the parent keeps its
+/// stdout — and `endow` *moves*, so a parent that wants to keep what it endows
+/// duplicates first. That is what makes endowing a device claim work with no
+/// special case: a claim carries no [`Rights::DUP`], so the move is the only
+/// expressible form and the parent provably no longer holds it.
+///
+/// [`Rights::DUP`]: crate::handle::Rights::DUP
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SpawnArgs {
     pub argv_ptr: u64,
     pub argv_len: u64,
-    pub fd_map_ptr: u64,
-    pub fd_map_count: u64,
+    /// `[[child_slot: u32, parent_handle: RawHandle]]`, duplicated into the
+    /// child. Stdio and nothing else, in practice.
+    pub slot_map_ptr: u64,
+    pub slot_map_count: u64,
     pub env_ptr: u64,
     pub env_len: u64,
+    /// `[EndowEntry]`, moved out of the parent's table.
+    pub endow_ptr: u64,
+    pub endow_count: u64,
+    /// The label blob every [`EndowEntry`]'s `label_off`/`label_len` indexes.
+    pub labels_ptr: u64,
+    pub labels_len: u64,
 }
+
+const _: () = assert!(core::mem::size_of::<SpawnArgs>() == 80);
 
 /// One `(label, handle)` pair of a process's endowment table.
 ///
@@ -913,6 +931,10 @@ pub struct NamespaceBuild {
     pub names_ptr: u64,
     pub names_len: u64,
 }
+
+const _: () = assert!(core::mem::size_of::<NamespaceBuild>() == 56);
+const _: () = assert!(core::mem::size_of::<NamespaceEntry>() == 16);
+const _: () = assert!(core::mem::size_of::<NameRef>() == 8);
 
 /// Names one namespace may bind. Policy on the primitive; a caller asking for
 /// one more is refused by name and never truncated.

@@ -362,17 +362,14 @@ serves   = ["netd"]
 devices  = ["nic"]
 
 [programs.terminal]
-receives = ["compositor"]
+provides = ["surface"]        # one port per terminal, made by the terminal
+receives = ["compositor", "launcher"]
 
 [programs.doom]
 receives = ["compositor", "soundd"]
 
 [programs.filepicker]
 serves   = ["filepicker"]
-receives = ["compositor"]
-
-[programs.terminal]
-provides = ["surface"]        # one port per terminal, made by the terminal
 receives = ["compositor"]
 
 # What init starts. A list, and now it genuinely orders nothing — because
@@ -2037,16 +2034,32 @@ names a provider it lacks; each `boot.start` is its config's old `init`
 membership unchanged; `launcher` is init's and available in every image.
 `args`/`realtime`/`boot` carry `#[allow(dead_code)]` until they are consumed.
 
-Still owed to make chunk 4 green — the interdependent block that is not
-`cargo test --lib`-verifiable and only proves out when the guest reopens at
-chunk 5: `SpawnArgs`'s `slot_map`/`endow`/`labels` restructure (§3.6) and the
-kernel `build_child_handles` move-vector, the `mm/user_span.rs` 48→80 size
-assert, and std's `process/toyos.rs` (a `rust/` fork touch → push + pin bump);
-`SysCap`'s boot creation and the `SYS_ENDOWMENTS`/`SYS_DEVICE_CLAIM`/
-`SYS_RT_ENTER` dispatch handlers and the per-process labels blob in
-`ProcessData`; `/etc/system.manifest` generation and the `INIT_PROGRAMS` chain
-deletion with the `KernelArgs` 16-byte shrink and its `toyos-abi/src/boot.rs`
-asserts; `/bin/init` and its launcher; and `toyos/src/endow.rs`.
+**Second sub-boundary done, 2026-08-09: spawn endows, and a process can read
+its own table back.** `SpawnArgs` is 80 bytes with `slot_map`/`endow`/`labels`
+(§3.6, layout asserted); `build_child_handles` verifies every endowed handle —
+resolves, carries `TRANSFER`, label in range, and *the child's table has room*
+— under one hold of the parent's lock and only then removes, so the
+all-or-nothing claim is true rather than nearly true; `ProcessData` carries the
+labels and `SYS_ENDOWMENTS` answers them; std's `SpawnArgs` and
+`CommandExt::endow` are `rust` @ `e36a68a6`, pushed, pinned.
+
+**And it found that chunk 3 never compiled the kernel.** The stretch note above
+says the guest build stops in `toyos`, which is upstream of the kernel — so
+nothing compiled `kernel/` after chunk 3 added its two `KObjectRef` variants.
+`cargo build --target x86_64-unknown-none` inside `kernel/` reaches the
+`toyos-ld` linker without the build system and is the loop that found it:
+thirteen errors, all chunk 3's — eleven `ops.rs` matches missing their
+`Connector`/`Namespace` arms, no `UserSafe` for `NamespaceBuild`, and a
+`Source` that stopped being `Copy` when it started holding an `Arc<PortShared>`.
+Anyone working inside the non-green stretch should use that command.
+
+Still owed to make chunk 4 green: `SysCap`'s boot creation and the
+`SYS_DEVICE_CLAIM`/`SYS_RT_ENTER` dispatch handlers; `/etc/system.manifest`
+generation and the `INIT_PROGRAMS` chain deletion with the `KernelArgs` 16-byte
+shrink and its `toyos-abi/src/boot.rs` asserts; `/bin/init` and its launcher;
+and `toyos/src/endow.rs` — which is worth doing **before** the rest, because it
+and the SDK's four remaining `services::` call sites are the whole of what
+keeps the sysroot, and therefore every other verification, shut.
 
 **Chunk 5 — every server and client. Green.**
 compositor, soundd, netd, filepicker, terminal, console, toybox `screen`,

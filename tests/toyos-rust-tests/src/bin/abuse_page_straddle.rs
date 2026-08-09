@@ -1,11 +1,11 @@
 //! A translation answers for one 2 MiB page. The typed syscall arguments are
-//! read and written through exactly one of them, and five of the seven
+//! read and written through exactly one of them, and ten of the twelve
 //! `UserSafe` types are longer than their alignment — so a value placed near
 //! the end of a page had its tail read or written *past the physical page*, in
 //! whatever the PMM had handed out next.
 //!
 //! Two are reachable from userland: `fstat`'s 24-byte `Stat`, a kernel write,
-//! and `spawn`'s 48-byte `SpawnArgs`, a kernel read whose `argv_ptr` and
+//! and `spawn`'s 80-byte `SpawnArgs`, a kernel read whose `argv_ptr` and
 //! `argv_len` the kernel then acts on.
 //!
 //! **The verdict is not the assertion.** The canary is the sixteen bytes on the
@@ -20,7 +20,7 @@ use toyos_abi::syscall::{
 };
 
 const PAGE_2M: u64 = 2 * 1024 * 1024;
-/// `Stat` is three `u64`, and `SpawnArgs` six.
+/// `Stat` is three `u64`, and `SpawnArgs` ten.
 const STAT_LEN: usize = 24;
 const CANARY: u8 = 0xA5;
 
@@ -115,10 +115,14 @@ fn main() {
     let args = SpawnArgs {
         argv_ptr: base,
         argv_len: argv.len() as u64,
-        fd_map_ptr: 0,
-        fd_map_count: 0,
+        slot_map_ptr: 0,
+        slot_map_count: 0,
         env_ptr: 0,
         env_len: 0,
+        endow_ptr: 0,
+        endow_count: 0,
+        labels_ptr: 0,
+        labels_len: 0,
     };
     let placed = (boundary - 8) as *mut SpawnArgs;
     unsafe { placed.write_volatile(args) };

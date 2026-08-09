@@ -14,7 +14,7 @@ mod start;
 mod symbols;
 mod tls;
 
-pub use start::{build_child_handles, FD_PAIR_LEN};
+pub use start::{build_child_handles, SLOT_PAIR_LEN};
 pub(crate) use start::{alloc_kernel_stack, process_start, thread_start};
 pub use tls::{setup_combined_tls, setup_tls, DTV_INITIAL_CAPACITY};
 
@@ -27,7 +27,7 @@ use crate::object::{ops, HandleTable, KObjectRef};
 use crate::mm::paging::CachePolicy;
 use crate::mm::PAGE_2M;
 use crate::process::{
-    vma_map, ElfInfo, OwnedAlloc, PageAlloc, PageFaultTrace, PageTables, Pid,
+    vma_map, ElfInfo, Endowments, OwnedAlloc, PageAlloc, PageFaultTrace, PageTables, Pid,
     ProcessAccounting, ProcessData, ProcessEntry, ThreadData, ThreadEntry, UserStack,
     PROCESS_TABLE,
 };
@@ -383,6 +383,7 @@ fn rela_dyn_from_sections(
 pub fn spawn(
     argv: &[&str],
     handles: HandleTable,
+    endowments: Endowments,
     parent: Option<Pid>,
     env: Vec<u8>,
 ) -> Result<Pid, SyscallError> {
@@ -640,6 +641,7 @@ pub fn spawn(
         spawn_ns: crate::clock::nanos_since_boot(),
         accounting: ProcessAccounting::default(),
         child_stats: Vec::new(),
+        endowments,
     }));
 
     let thread_data = Arc::new(Lock::new(ThreadData {
@@ -904,5 +906,6 @@ pub fn spawn_kernel(argv: &[&str]) -> Pid {
             .expect("spawn_kernel: three slots cannot exhaust an empty table");
         assert!(displaced.is_none(), "an empty table had something at slot {slot}");
     }
-    spawn(argv, handles, None, Vec::new()).expect("spawn_kernel: failed to spawn")
+    spawn(argv, handles, Endowments::empty(), None, Vec::new())
+        .expect("spawn_kernel: failed to spawn")
 }
