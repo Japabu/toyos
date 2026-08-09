@@ -1176,7 +1176,7 @@ here. Repository settings on `Japabu/toyos`:
 - **Ruleset `main`** (id `20589156`) — `pull_request` with
   `required_approving_review_count: 0` and `allowed_merge_methods: ["merge"]`,
   `required_status_checks` with `strict_required_status_checks_policy: true` and
-  the four contexts of §10.4, `non_fast_forward`, `deletion`. **No bypass
+  the five contexts of §10.4, `non_fast_forward`, `deletion`. **No bypass
   actors**, so it binds the owner too; taking it off is one API call and a
   visible act rather than a habit.
 
