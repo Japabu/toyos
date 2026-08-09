@@ -26,7 +26,7 @@ use std::sync::Arc;
 /// collision is systematic and not unlucky: this daemon prints a client's
 /// removal exactly when the kernel is printing that client's exit.
 ///
-/// `specs/issues/design-debt/a-userland-line-is-several-writes.md` is the class
+/// `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` is the class
 /// and where it should be fixed for everyone.
 macro_rules! say {
     ($($arg:tt)*) => {{

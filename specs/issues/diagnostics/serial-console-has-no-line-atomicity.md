@@ -89,3 +89,25 @@ Rate, such as one run can give it: three full suites on one tree in one
 session, `hda_tone` green in two and red on this in the third, then green 3 of
 3 alone on a quiet host. So it is not the audio path and not load in any way
 that a re-run answers — it is which two writers happen to collide.
+
+**`println!` is not the escape, and one collision is systematic rather than
+chance.** 2026-08-09, `desktop_audio_client` on CI: `soundd: client ` and
+`1 removed` came back either side of the kernel's four `exit:` accounting
+lines, on run `31271983043` and again on `31282019974` rep 10 — a measured
+**1 run in 10**, which is a rate and not a coincidence, because soundd prints a
+client's removal exactly while the kernel prints that client's exit. The test
+counted one removal of two and waited out its whole 300 s liveness guard.
+
+Moving such a line to stdout does not fix it: `LineWriter` makes it **two**
+syscalls rather than one per fragment — `flush_buf()` for what it had buffered,
+then `inner.write(lines)` for the rest
+(`library/alloc/src/io/buffered/linewritershim.rs`) — so the splice point moves
+and does not go away. What does work is building the line and issuing one
+`write_all`, which is what `userland/soundd`'s local `say!` does now. That is
+one crate of the 176 `eprintln!` sites in `userland/`, `compositor: ready` and
+`terminal: ready` among them.
+
+The general fix belongs in `toyos/`, and the reason it was not put there is
+worth knowing: `toyos/src` is one of the four trees in the content-addressed
+toolchain witness (`specs/ci-plan.md` §3), so touching it rebuilds the sysroot
+and `--pr` refuses a branch that mixes it with other work.

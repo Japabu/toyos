@@ -1345,7 +1345,7 @@ rate about the tree.**
   `soundd: client ` and `1 removed` came back either side of four kernel `exit:`
   accounting lines, so the test counted one removal of two and waited out its
   300 s guard. A userland line is several `write`s —
-  `specs/issues/design-debt/a-userland-line-is-several-writes.md` — and this
+  `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` — and this
   pair collides *systematically*, because soundd prints a client's removal
   exactly while the kernel prints that client's exit. soundd writes whole lines
   now; the other 176 `eprintln!` sites in `userland/` do not.
@@ -1418,3 +1418,42 @@ actuator stages is an *ordering* — the disk arrives after the scan — so the 
 is what closes the window now, and no host's boot speed can defeat it.
 `xhci-slow-connect` keeps the duration, because what *it* stages is a settle
 that has to keep looking through one.
+
+### 10.10 Nine runs on `main`, and what the tail looks like
+
+Every completed `ci` run on `main` between 2026-08-08 18:48 and 2026-08-09
+01:36, in order, with the one name each was red on:
+
+| tip | run | verdict |
+|---|---|---|
+| `eaba207` | `31272837718` | `desktop_window_child` — the `/bin/terminal` race |
+| `87835d1` | `31273373928` | `kernel_heartbeat` — the torn pin pairing |
+| `83ef8d1` | `31280877870` | `dump_nmi_probe` — the rip in `u128_div_rem` |
+| `6e2dac6` | `31283147352` | **green** |
+| `1ed6f39` | `31284962381` | `dump_nmi_probe` — the dump never ran |
+| `8d3f5b7` | `31286199802` | `late_storage_connect` — the scan bound the disk |
+| `e7e1c72` | `31286791466` | `desktop_audio_client` — the `/bin/terminal` race |
+| `53d29d5` | `31287853270` | `screen_pager_keys` — keystroke 14 of 30 |
+
+(`911c472`/`31271983043`, `desktop_audio_client`'s console splice, is the ninth
+and sits before the window's first row.)
+
+**One green in nine, and eight different reds between two names.** That is the
+shape to plan against: the suite has a tail of low-rate names, each fires at
+10–20%, and 292 tests is enough of them that a whole run is a coin toss. Five of
+the eight are closed by this section's work. The two that are not:
+
+- **The `/bin/terminal` boot race**
+  (`specs/issues/kernel/terminal-races-compositor-at-boot.md`), which is a
+  design question and the dominant one. It is not one test's: it reds whichever
+  desktop test's boot happens to lose, and it took `desktop_window_child` and
+  `desktop_audio_client` here. 2 of 10 per desktop boot, and a suite has four of
+  them.
+- **`screen_pager_keys`** (`specs/issues/diagnostics/screen-pager-keys-red-on-main.md`),
+  bisected there to a merge whose two parents are both green, and open.
+
+So the §10.4 trigger is reachable on luck and not on state, and **that is worth
+one more thought before anyone promotes the gate**: three consecutive greens was
+chosen because "one lucky green is a sample rather than a state", and at 0.8 per
+run three of them is a coin toss too. Promoting `guest-suite` to required with
+either of the two above still open makes every merge pay the same rate.
