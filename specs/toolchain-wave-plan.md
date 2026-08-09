@@ -625,7 +625,7 @@ reproduces the bug it is testing for, so the invented hash is the point.
 `ObjBuilder` builds exactly the object needed and is a private `struct` inside
 `toyos-ld/tests/determinism.rs`, so a new test file cannot reach it: move it to a
 shared module rather than writing a second one, or the two drift.
-Closes `specs/issues/build/alloc-shim-names-a-dead-compiler-hash.md`.
+Closes the alloc-shim issue file, whose count of eleven was nine.
 
 **T5 — one declared list over the whole corpus, asserted in both directions.**
 `C_SKIP` and `C_DOES_NOT_BUILD` become one list whose entries answer two separate
