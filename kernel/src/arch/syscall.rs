@@ -410,8 +410,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_sysinfo(&mut buf)
         }
         SYS_NANOSLEEP => sys_nanosleep(a1),
-        SYS_DUP => sys_dup(RawHandle(a1 as u32)),
-        SYS_DUP2 => sys_dup2(RawHandle(a1 as u32), a2),
+        SYS_HANDLE_DUP => sys_handle_dup(RawHandle(a1 as u32), a2),
+        SYS_HANDLE_DUP_AT => sys_dup2(RawHandle(a1 as u32), a2),
         SYS_GETPID => process::current_process().raw() as u64,
         SYS_RENAME => {
             let old = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
@@ -578,6 +578,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
             sys_endowments(&mut buf)
         }
+        SYS_DEVICE_CLAIM => sys_device_claim(RawHandle(a1 as u32), a2),
+        SYS_RT_ENTER => sys_rt_enter(RawHandle(a1 as u32)),
         SYS_ACCEPT => sys_accept(RawHandle(a1 as u32)),
         SYS_PORT_CREATE => sys_port_create(),
         SYS_NAMESPACE_BUILD => {
@@ -1362,6 +1364,57 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
     }
 }
 
+/// Mint the claim for a device class, presenting a `SysCap` that carries
+/// [`Rights::DEVICE`].
+///
+/// The kernel makes one such cap, at boot, for `/bin/init`, so the set of
+/// processes that can reach this at all is exactly what init endowed. What
+/// arbitrates between two programs wanting the framebuffer is then the
+/// manifest, checked before the image was built, rather than which of them
+/// started first.
+fn sys_device_claim(syscap: RawHandle, class: u64) -> u64 {
+    let Some(class) = device::class_of(class) else {
+        return SyscallError::InvalidArgument.to_u64();
+    };
+    if let Err(e) = process::with_fd_owner_data(|data| {
+        data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::DEVICE)
+    }) {
+        return e.to_u64();
+    }
+    let pid = process::current_process();
+    // `NotFound` is a machine with no such device and nothing else: init endows
+    // what it got and logs what it did not, which is a different answer from
+    // `AlreadyExists` — a config the build-time gate should have refused.
+    let claim = match device::try_claim(class, pid) {
+        Ok(c) => c,
+        Err(device::ClaimError::Absent) => return SyscallError::NotFound.to_u64(),
+        Err(device::ClaimError::Owned) => return SyscallError::AlreadyExists.to_u64(),
+        Err(device::ClaimError::GrantFailed) => return SyscallError::ResourceExhausted.to_u64(),
+    };
+    process::with_fd_owner_data(|data| {
+        handle_result(ops::install(&mut data.handles, KObjectRef::Device(claim)))
+    })
+}
+
+/// Enter the real-time band, presenting a `SysCap` that carries
+/// [`Rights::RT`].
+///
+/// The RT band has no priority above it, so unbounded threads in it starve
+/// soundd's mix thread at its own level. It used to be gated on holding an
+/// audio claim, which the dispatch's own comment called out as not a
+/// privilege: whoever won the first-come race for the sound card got the band
+/// with it. This is the privilege that comment asked for, and it is endowed
+/// per manifest rather than won.
+fn sys_rt_enter(syscap: RawHandle) -> u64 {
+    if let Err(e) = process::with_fd_owner_data(|data| {
+        data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::RT)
+    }) {
+        return e.to_u64();
+    }
+    crate::scheduler::set_current_rt(true);
+    0
+}
+
 fn sys_open_device(device_type: u64) -> u64 {
     let Some(class) = device::class_of(device_type) else {
         return SyscallError::InvalidArgument.to_u64();
@@ -2012,10 +2065,27 @@ fn sys_nanosleep(nanos: u64) -> u64 {
 /// that admits a single descriptor, and `Descriptor::duplicate` says so at the
 /// only place that can. Before this, `dup` handed back a claim's exclusivity
 /// while leaving the caller a working descriptor.
-fn sys_dup(h: RawHandle) -> u64 {
+/// A second handle to the same object, carrying no more than the first.
+///
+/// `want` is the wire form of `Option<Rights>` — [`RIGHTS_UNCHANGED`] for the
+/// source's own set — decoded here and nowhere else. A set with a bit no right
+/// uses is a caller with a bug, and so is one the source does not hold: rights
+/// only shrink, and the refusal names which.
+fn sys_handle_dup(h: RawHandle, want: u64) -> u64 {
     process::with_fd_owner_data(|data| {
-        let Ok(rights) = data.handles.rights_of(h) else {
+        let Ok(held) = data.handles.rights_of(h) else {
             return SyscallError::NotFound.to_u64();
+        };
+        let rights = if want == RIGHTS_UNCHANGED {
+            held
+        } else {
+            let Ok(bits) = u32::try_from(want) else {
+                return SyscallError::InvalidArgument.to_u64();
+            };
+            let Some(rights) = Rights::from_bits(bits) else {
+                return SyscallError::InvalidArgument.to_u64();
+            };
+            rights
         };
         match data.handles.duplicate(h, rights) {
             Ok(new_h) => new_h.0 as u64,

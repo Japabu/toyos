@@ -14,7 +14,6 @@
 # marker instead of guessing from pixels — and it is what lets an in-guest
 # binary run on the machine shape that gets flashed. Under `mute` it simply
 # parks on a console that never produces a byte.
-init = ["/bin/compositor", "/bin/soundd", "/bin/netd", "/bin/sshd", "/bin/test-runner"]
 
 assets = ["assets"]
 

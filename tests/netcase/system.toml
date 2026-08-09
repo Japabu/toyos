@@ -9,7 +9,6 @@
 # test-runner is here for the same reason it is in metalcase: it makes the boot
 # announce itself and lets an in-guest binary be driven over the
 # ===TEST_START=== protocol.
-init = ["/bin/netd", "/bin/test-runner"]
 
 [boot]
 start = ["netd", "test-runner"]

@@ -9,7 +9,6 @@
 # Its own config rather than a fourth program in `tests/netcase`, because
 # netcase's test measures how many connections netd will hold and sshd's bind
 # would spend one of them.
-init = ["/bin/netd", "/bin/sshd", "/bin/test-runner"]
 
 [boot]
 start = ["netd", "sshd", "test-runner"]

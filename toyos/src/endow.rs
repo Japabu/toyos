@@ -25,18 +25,7 @@ use crate::port::{Acceptor, Connector};
 use crate::syscap::SysCap;
 use crate::{Device, OwnedHandle, RawHandle};
 
-/// The well-known label for the namespace a program's `receives` becomes.
-pub const SVC: &str = "svc";
-/// The well-known label for the system capability. init's, and the `RT`-only
-/// dup a `realtime` program gets.
-pub const SYSCAP: &str = "syscap";
-
-/// `serve:<name>` — the acceptor of a machine-wide port the manifest says this
-/// program serves.
-pub const SERVE_PREFIX: &str = "serve:";
-/// `dev:<class>` — the claim for a device class the manifest says this program
-/// gets.
-pub const DEV_PREFIX: &str = "dev:";
+pub use toyos_abi::syscall::{DEV_PREFIX, SERVE_PREFIX, SVC_LABEL, SYSCAP_LABEL};
 
 /// Why a service name did not become a connection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -253,7 +242,7 @@ impl EndowTable {
 
 impl NamespaceCell {
     fn get(&'static self) -> &'static Option<Namespace> {
-        self.0.get_or_init(|| Endowments::get().take::<Namespace>(SVC))
+        self.0.get_or_init(|| Endowments::get().take::<Namespace>(SVC_LABEL))
     }
 }
 

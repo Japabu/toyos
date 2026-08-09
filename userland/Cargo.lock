@@ -1516,6 +1516,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "init"
+version = "0.1.0"
+dependencies = [
+ "toyos",
+ "toyos-abi",
+ "toyos-manifest",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3609,6 +3618,10 @@ version = "0.1.0"
 
 [[package]]
 name = "toyos-keymap"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-manifest"
 version = "0.1.0"
 
 [[package]]

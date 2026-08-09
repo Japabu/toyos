@@ -41,7 +41,9 @@ pub const SYS_SYSINFO: u64 = 45;
 // an ungated frame-copy path that no program ever used — netd drives the NIC
 // through its DMA descriptor instead).
 pub const SYS_NANOSLEEP: u64 = 49;
-pub const SYS_DUP: u64 = 50;
+/// A second handle to the same object, carrying no more than the first. See
+/// [`dup`] and [`dup_narrowed`].
+pub const SYS_HANDLE_DUP: u64 = 50;
 pub const SYS_GETPID: u64 = 51;
 pub const SYS_RENAME: u64 = 52;
 pub const SYS_MKDIR: u64 = 53;
@@ -67,7 +69,9 @@ pub const SYS_PIPE_ID: u64 = 70;
 // 84 never had a dispatch arm or a caller, so retiring it saves nothing.
 pub const SYS_EXIT: u64 = 72;
 pub const SYS_GET_ENV: u64 = 73;
-pub const SYS_DUP2: u64 = 74;
+/// A second handle to the same object, at a slot the caller picks. See
+/// [`dup2`].
+pub const SYS_HANDLE_DUP_AT: u64 = 74;
 pub const SYS_CLOCK_EPOCH: u64 = 75;
 pub const SYS_SOCKET_CREATE: u64 = 76;
 pub const SYS_PIPE_MAP: u64 = 77;
@@ -199,6 +203,19 @@ pub struct EndowEntry {
 
 const _: () = assert!(core::mem::size_of::<EndowEntry>() == 16);
 
+/// The label the kernel puts on `/bin/init`'s system capability, and the one
+/// init puts on the `RT`-only dup it endows a `realtime` program.
+///
+/// Here rather than in the SDK because the kernel writes it and userland reads
+/// it, and a label spelled twice is a label that can be spelled two ways.
+pub const SYSCAP_LABEL: &str = "syscap";
+/// The label for a program's namespace — what its manifest `receives` becomes.
+pub const SVC_LABEL: &str = "svc";
+/// `serve:<name>`: the acceptor of a machine-wide port this program serves.
+pub const SERVE_PREFIX: &str = "serve:";
+/// `dev:<class>`: the claim for a device class this program was given.
+pub const DEV_PREFIX: &str = "dev:";
+
 /// Endowed `(label, handle)` pairs one spawn may carry. Policy on the
 /// primitive, refused by name, never truncated — the widest manifest row plus
 /// stdio.
@@ -206,6 +223,7 @@ pub const MAX_ENDOWMENTS: usize = 32;
 /// Bytes of label blob one endowment table may carry.
 pub const MAX_LABELS_LEN: usize = 4096;
 
+use crate::handle::Rights;
 use crate::{Pid, RawHandle};
 
 /// Syscall error with a specific code. Values occupy the top of the u64 range:
@@ -1061,9 +1079,29 @@ pub fn set_rt_priority(enable: bool) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_SET_RT_PRIORITY, enable as u64, 0, 0, 0))
 }
 
-/// A second handle to the same object.
+/// What [`SYS_HANDLE_DUP`]'s rights word carries when the caller wants the
+/// source's own set.
+///
+/// A wire encoding of `Option<Rights>`, decoded at the syscall boundary and
+/// never carried inward: `Rights` is nine bits, so this value is not one. The
+/// two wrappers below are the only writers, so no caller ever spells it.
+pub const RIGHTS_UNCHANGED: u64 = u64::MAX;
+
+/// A second handle to the same object, carrying what the first carries.
 pub fn dup(handle: RawHandle) -> Result<RawHandle, SyscallError> {
-    check(syscall(SYS_DUP, handle.0 as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
+    check(syscall(SYS_HANDLE_DUP, handle.0 as u64, RIGHTS_UNCHANGED, 0, 0))
+        .map(|v| RawHandle(v as u32))
+}
+
+/// A second handle to the same object, carrying **less**.
+///
+/// `PermissionDenied` for a set the source does not itself hold: rights only
+/// shrink, and asking to widen is a bug in the asker rather than a request to
+/// be quietly cut down to size. This is how init hands a program an `RT`-only
+/// `SysCap` while keeping the full one.
+pub fn dup_narrowed(handle: RawHandle, rights: Rights) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_HANDLE_DUP, handle.0 as u64, rights.bits() as u64, 0, 0))
+        .map(|v| RawHandle(v as u32))
 }
 
 /// A second handle to the same object, at a **slot** the caller picks.
@@ -1072,8 +1110,12 @@ pub fn dup(handle: RawHandle) -> Result<RawHandle, SyscallError> {
 /// business choosing, and the one this hands back is the slot's own — so the
 /// answer is not the number that went in. Whatever was at that slot is closed
 /// first.
+/// The rights are the source's: narrowing at a slot is [`dup_narrowed`]
+/// followed by this, and a third argument no caller writes would be a right
+/// nobody can request.
 pub fn dup2(handle: RawHandle, slot: u16) -> Result<RawHandle, SyscallError> {
-    check(syscall(SYS_DUP2, handle.0 as u64, slot as u64, 0, 0)).map(|v| RawHandle(v as u32))
+    check(syscall(SYS_HANDLE_DUP_AT, handle.0 as u64, slot as u64, 0, 0))
+        .map(|v| RawHandle(v as u32))
 }
 
 /// Get the current process ID.

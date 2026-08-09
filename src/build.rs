@@ -17,7 +17,6 @@ use crate::toolchain;
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct SystemConfig {
-    init: Vec<String>,
     #[serde(default)]
     programs: HashMap<String, ProgramConfig>,
     #[serde(default)]
@@ -29,11 +28,8 @@ struct SystemConfig {
     /// What `/bin/init` starts at boot. Program *keys*, never paths — a path
     /// here is a second spelling of a `[programs]` key and is what let a boot
     /// list smuggle an argument through. Arguments live on the program entry's
-    /// `args` instead. Staged alongside the still-live `init` list until the
-    /// rest of chunk 4 makes it the source of truth and deletes `init`; read by
-    /// the §8.1 gates but not yet by the build, so dead until then.
+    /// `args` instead.
     #[serde(default)]
-    #[allow(dead_code)]
     boot: BootConfig,
 }
 
@@ -48,10 +44,7 @@ struct BootConfig {
 struct ProgramConfig {
     path: Option<String>,
     no_default_features: bool,
-    /// Argv this program is started with when it is in `[boot] start`. Consumed
-    /// by the manifest generation the rest of chunk 4 adds, not by any §8.1
-    /// gate, so it is dead until then.
-    #[allow(dead_code)]
+    /// Argv this program is started with, after argv[0].
     args: Vec<String>,
     /// Names init creates **one machine-wide port** for and endows this program
     /// the *acceptor* of.
@@ -65,8 +58,6 @@ struct ProgramConfig {
     /// Device classes init mints a claim for and endows.
     devices: Vec<String>,
     /// Whether init endows an `RT`-only `SysCap` dup. soundd, and nothing else.
-    /// Consumed by chunk 4's manifest generation, not by any §8.1 gate.
-    #[allow(dead_code)]
     realtime: bool,
 }
 
@@ -287,23 +278,25 @@ fn cargo_build(
 
 // --- Artifact staging ---
 //
-// The bootloader's init list is *compiled in* (`bootloader/build.rs` declares
-// `rerun-if-env-changed=INIT_PROGRAMS`; `main.rs` reads `env!("INIT_PROGRAMS")`),
-// and the kernel's features likewise change its binary. But cargo keys the
-// artifact path on (crate, target, profile) and nothing else, so every config
-// writes and reads one path.
+// A kernel's feature list changes its binary, but cargo keys the artifact path
+// on (crate, target, profile) and nothing else, so every config writes and reads
+// one path.
 //
-// The window is not a moment: `build_test_image` builds the bootloader, then
-// runs the entire userland build and initrd assembly, and only then reads the
-// `.efi`. Seconds to minutes, during which another config's build overwrites it.
-// Observed: an image carrying metalcase's initrd and another config's bootloader,
-// whose 28-byte init string was `"/bin/soundd;/bin/test-runner"`. The compositor
-// was never spawned and the test failed as though the daemon under test were
-// broken.
+// The window is not a moment: `build_test_image` builds, then runs the entire
+// userland build and initrd assembly, and only then reads the artifact back.
+// Seconds to minutes, during which another config's build overwrites it.
 //
 // So: hold [`buildlock::artifact`] across each build→stage pair, and copy the
 // artifact to a name carrying what it is actually keyed by. Readers use the
 // staged name, which no other config can overwrite.
+//
+// The bootloader used to be here for the same reason and no longer is: its init
+// list was compiled into it, so the `.efi` was a function of the boot config,
+// and an image once carried metalcase's initrd beside another config's
+// bootloader whose 28-byte init string was `"/bin/soundd;/bin/test-runner"` —
+// the compositor was never spawned and the test failed as though the daemon
+// under test were broken. The bootloader carries no config now, so it is
+// memoized once per profile and that hazard is not expressible.
 
 fn key_hash(parts: &[&str]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -399,6 +392,51 @@ fn assert_overflow_checked(what: &str, image: &[u8]) {
 // --- Shared initrd assembly ---
 
 /// Build all programs from a config and assemble an initrd.
+/// The one program the kernel starts, in **every** image whatever `[programs]`
+/// says. It reads the manifest below and starts what that names, so an initrd
+/// without it is a machine with a kernel and no userland at all.
+const INIT_PROGRAM: &str = "init";
+
+/// Names `/bin/init` serves itself.
+///
+/// init is in every image and is no `[programs]` key, so these have no
+/// declaration to come from. They travel in the manifest so init creates
+/// exactly the ports the build-time gate counted as provided — one producer,
+/// rather than a constant here and a string in init.
+const INIT_SERVED: &[&str] = &["launcher"];
+
+/// The resolved config as the records `/bin/init` reads.
+///
+/// The format, the renderer and the parser are `toyos-manifest/`, whose
+/// round-trip test is what makes "what the build writes is what init reads" a
+/// fact rather than two hand-matched implementations.
+fn render_manifest(config: &SystemConfig) -> Vec<u8> {
+    let mut names: Vec<&String> = config.programs.keys().collect();
+    names.sort();
+    let manifest = toyos_manifest::Manifest {
+        programs: names
+            .iter()
+            .map(|name| {
+                let cfg = &config.programs[*name];
+                toyos_manifest::Program {
+                    name: (*name).clone(),
+                    path: format!("/bin/{name}"),
+                    args: cfg.args.clone(),
+                    serves: cfg.serves.clone(),
+                    provides: cfg.provides.clone(),
+                    receives: cfg.receives.clone(),
+                    devices: cfg.devices.clone(),
+                    realtime: cfg.realtime,
+                }
+            })
+            .collect(),
+        init_serves: INIT_SERVED.iter().map(|s| (*s).to_string()).collect(),
+        start: config.boot.start.clone(),
+    };
+    toyos_manifest::render(&manifest)
+        .unwrap_or_else(|e| panic!("system.toml cannot be rendered as a manifest: {e:?}"))
+}
+
 fn build_and_assemble(
     root: &Path,
     config: &SystemConfig,
@@ -408,7 +446,7 @@ fn build_and_assemble(
 ) -> Vec<u8> {
     let userland_dir = root.join("userland");
 
-    let mut workspace_packages: Vec<&str> = Vec::new();
+    let mut workspace_packages: Vec<&str> = vec![INIT_PROGRAM];
     let mut standalone: Vec<(&String, &ProgramConfig)> = Vec::new();
     for (name, cfg) in &config.programs {
         let crate_dir = cfg.crate_dir(root, name);
@@ -479,6 +517,11 @@ fn build_and_assemble(
                 fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));
             initrd_files.push((format!("bin/{name}"), data));
         }
+
+        let init = ws_target.join(INIT_PROGRAM);
+        let data = fs::read(&init).expect("Failed to read binary for init");
+        initrd_files.push((format!("bin/{INIT_PROGRAM}"), data));
+        initrd_files.push((toyos_manifest::PATH.to_string(), render_manifest(config)));
 
         if config.hosted_rustc {
             collect_hosted_rustc(root, &mut initrd_files);
@@ -633,8 +676,6 @@ pub fn build(
 
     invalidate_stale(root, &mut lock, &config_targets(root, &config));
 
-    let init_programs = config.init.join(";");
-
     // Same lock-and-stage as `build_test_image`: `cargo run --build-only` and
     // `cargo test` share these paths, so this races the harness too.
     let (kernel_art, bl_art) = {
@@ -665,7 +706,7 @@ pub fn build(
                 "x86_64-unknown-uefi",
                 &[],
                 &path_env,
-                &[("INIT_PROGRAMS", init_programs.as_str())],
+                &[],
                 false,
             );
         }
@@ -683,7 +724,7 @@ pub fn build(
                     "bootloader/target/x86_64-unknown-uefi/{PROFILE}/bootloader.efi"
                 )),
                 "bootloader.efi",
-                key_hash(&[PROFILE, &init_programs]),
+                key_hash(&[PROFILE]),
             ),
         )
     };
@@ -837,10 +878,9 @@ pub fn build_test_image(
     extra_files: &[(String, Vec<u8>)],
 ) -> Vec<u8> {
     let config = parse_config(config_path);
-    let init_programs = config.init.join(";");
     let features = kernel_features.join(",");
     let kernel_key = key_hash(&[PROFILE, &features]);
-    let bl_key = key_hash(&[PROFILE, &init_programs]);
+    let bl_key = key_hash(&[PROFILE]);
     let initrd_key = initrd_key(config_path, extra_files);
 
     // Nothing left to build, so nothing for the lock, the toolchain check or the
@@ -906,7 +946,7 @@ pub fn build_test_image(
                 "x86_64-unknown-uefi",
                 &[],
                 &path_env,
-                &[("INIT_PROGRAMS", init_programs.as_str())],
+                &[],
                 quiet,
             );
             let staged = stage_artifact(
@@ -1124,17 +1164,17 @@ mod tests {
     /// It listens on every interface and authenticates against a file that is
     /// absent on a fresh install, so on a default boot it would be a port that
     /// accepts connections and refuses all of them. Whoever wants it runs
-    /// `/bin/sshd` themselves. It stays in `[programs]` — the gate is on the
-    /// init list, not on the binary being present.
+    /// `/bin/sshd` themselves. It stays in `[programs]` — the gate is on what
+    /// init starts, not on the binary being present.
     #[test]
     fn no_shipped_boot_config_starts_sshd() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for boot in [Boot::Normal, Boot::Diag, Boot::Console] {
             let config = boot.config();
-            let init = parse_config(&root.join(config)).init;
+            let start = parse_config(&root.join(config)).boot.start;
             assert!(
-                !init.iter().any(|p| p.ends_with("/sshd")),
-                "{config} starts sshd from init: {init:?}",
+                !start.iter().any(|p| p == "sshd"),
+                "{config} starts sshd: {start:?}",
             );
         }
     }
@@ -1156,11 +1196,6 @@ mod tests {
         "tests/sshdcase/system.toml",
         "tests/testcases/system.toml",
     ];
-
-    /// Names `/bin/init` serves in every image. init is spawned by the kernel
-    /// and is in every image, so a `receives` naming one of these needs no
-    /// `[programs]` provider.
-    const INIT_SERVED: &[&str] = &["launcher"];
 
     fn load(cfg: &str) -> SystemConfig {
         parse_config(&Path::new(env!("CARGO_MANIFEST_DIR")).join(cfg))
@@ -1284,7 +1319,7 @@ mod tests {
     }
 
     /// `[boot] start` names program keys, so a typo is a build error rather than
-    /// a kernel panic at `spawn_kernel`.
+    /// a refusal `/bin/init` reports at boot.
     fn started_programs_are_declared(cfg: &SystemConfig) -> Result<(), String> {
         for name in &cfg.boot.start {
             if !cfg.programs.contains_key(name) {

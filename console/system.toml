@@ -11,7 +11,6 @@
 # Deliberately three programs. Every extra one is something that can fail
 # between the kernel and a prompt, on the machine where a failure costs a
 # reflash — and there is no daemon here that a shell needs.
-init = ["/bin/console"]
 
 assets = ["assets"]
 

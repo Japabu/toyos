@@ -33,6 +33,7 @@ use crate::process::{
 };
 use crate::sync::Lock;
 use crate::{scheduler, vfs, DirectMap, UserAddr};
+use toyos_abi::handle::Rights;
 use toyos_abi::syscall::SyscallError;
 use toyos_elf::section::SectionTable;
 use toyos_elf::sym::{self, SymTab};
@@ -890,10 +891,18 @@ fn exe_tpoff(
     0
 }
 
-/// Spawn a process from kernel context during boot. Resolves bare names to
-/// `/bin/<name>`. Panics on failure: a boot that cannot start its init
-/// programs has nowhere to report to.
-pub fn spawn_kernel(argv: &[&str]) -> Pid {
+/// The one program the kernel starts. `src/build.rs` puts this binary in every
+/// image regardless of `[programs]`, so an initrd without it is a build that
+/// went wrong rather than a machine that boots differently.
+pub const INIT_PATH: &str = "/bin/init";
+
+/// Start `/bin/init`, holding the machine's one full-rights `SysCap`.
+///
+/// Nothing else can construct one, so the set of processes that can ever mint
+/// a device claim, enter the RT band or open a process by pid is exactly what
+/// init endows. Panics on failure: a boot that cannot start init has nowhere
+/// to report to and nothing left to do.
+pub fn spawn_init() -> Pid {
     let mut handles = HandleTable::new();
     let console = KObjectRef::Console(crate::object::device::ConsoleObject::new());
     for slot in 0..3 {
@@ -903,9 +912,28 @@ pub fn spawn_kernel(argv: &[&str]) -> Pid {
         );
         let (_, displaced) = handles
             .install_at(slot, entry)
-            .expect("spawn_kernel: three slots cannot exhaust an empty table");
+            .expect("spawn_init: three slots cannot exhaust an empty table");
         assert!(displaced.is_none(), "an empty table had something at slot {slot}");
     }
-    spawn(argv, handles, Endowments::empty(), None, Vec::new())
-        .expect("spawn_kernel: failed to spawn")
+    let cap = KObjectRef::SysCap(crate::object::syscap::SysCap::new());
+    let rights = Rights::DUP
+        .union(Rights::TRANSFER)
+        .union(Rights::DEVICE)
+        .union(Rights::RT)
+        .union(Rights::MANAGE);
+    let cap_handle = handles
+        .install(crate::object::HandleEntry::new(cap, rights))
+        .expect("spawn_init: an empty table refused the system capability");
+    let label = toyos_abi::syscall::SYSCAP_LABEL;
+    let endowments = Endowments::new(
+        alloc::vec![toyos_abi::syscall::EndowEntry {
+            label_off: 0,
+            label_len: label.len() as u32,
+            handle: cap_handle,
+            _pad: 0,
+        }],
+        label.as_bytes().to_vec(),
+    );
+    spawn(&[INIT_PATH], handles, endowments, None, Vec::new())
+        .expect("spawn_init: failed to spawn")
 }

@@ -8,7 +8,6 @@
 #
 # No `assets`: the actuator synthesises its own sound and never opens the WAD
 # or the soundfont, so neither belongs in this initrd either.
-init = ["/bin/soundd", "/bin/test-runner"]
 
 [boot]
 start = ["soundd", "test-runner"]

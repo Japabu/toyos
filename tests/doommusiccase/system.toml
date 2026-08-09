@@ -7,7 +7,6 @@
 # share a config, and this one pays 19 MiB of initrd that no other test should.
 #
 # No compositor: `/bin/doom --music-check` never opens a window.
-init = ["/bin/soundd", "/bin/test-runner"]
 
 assets = ["assets"]
 

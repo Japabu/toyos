@@ -843,6 +843,7 @@ dependencies = [
  "toyos-fat32-check",
  "toyos-gpt",
  "toyos-ld",
+ "toyos-manifest",
  "uuid",
 ]
 
@@ -879,6 +880,10 @@ dependencies = [
  "thiserror",
  "zerocopy",
 ]
+
+[[package]]
+name = "toyos-manifest"
+version = "0.1.0"
 
 [[package]]
 name = "ttf-parser"

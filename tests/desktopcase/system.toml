@@ -8,7 +8,6 @@
 #
 # The terminal is in `init` rather than launched with the compositor's Ctrl+N,
 # so it is the only window and therefore the focused one from the first frame.
-init = ["/bin/compositor", "/bin/terminal"]
 
 assets = ["assets"]
 

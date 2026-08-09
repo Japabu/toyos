@@ -6,6 +6,7 @@
 //! `/bin/init`, so the set of processes that can ever do any of the three is
 //! exactly what init endowed.
 
+use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, DeviceType, SyscallError};
 
 use crate::{AsHandle, Device, OwnedHandle, RawHandle};
@@ -25,6 +26,15 @@ impl SysCap {
     /// this; a right is.
     pub fn enter_rt(&self) -> Result<(), SyscallError> {
         syscall::rt_enter(self.0.fd())
+    }
+
+    /// A second handle to this capability carrying **less**.
+    ///
+    /// How init gives a program the RT band and nothing else: rights only
+    /// shrink, so the dup can never mint a claim or open a process however the
+    /// holder asks.
+    pub fn narrowed(&self, rights: Rights) -> Result<Self, SyscallError> {
+        syscall::dup_narrowed(self.0.fd(), rights).map(|h| Self(OwnedHandle(h)))
     }
 
     /// Give up ownership, for a handle about to be endowed.

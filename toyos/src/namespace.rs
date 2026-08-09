@@ -114,7 +114,10 @@ mod heapless_names {
 }
 
 /// A namespace with nothing carried over from anywhere.
-pub fn build() -> Builder<'static> {
+///
+/// The lifetime is the caller's: `add` borrows the connectors, so a builder
+/// lives no longer than they do.
+pub fn build<'a>() -> Builder<'a> {
     Builder {
         base: HANDLE_INVALID,
         names: heapless_names::Names::new(),

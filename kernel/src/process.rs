@@ -25,7 +25,7 @@ use toyos_abi::syscall::EndowEntry;
 pub const ENDOW_ENTRY_LEN: usize = core::mem::size_of::<EndowEntry>();
 
 // Re-export loader functions so existing callers (via `process::`) keep working.
-pub use crate::loader::{spawn, spawn_kernel, build_child_handles};
+pub use crate::loader::{build_child_handles, spawn, spawn_init, INIT_PATH};
 pub(crate) use crate::loader::read_file_range;
 
 /// Page tables shared between a process and all its threads.

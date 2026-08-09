@@ -2053,13 +2053,50 @@ thirteen errors, all chunk 3's — eleven `ops.rs` matches missing their
 `Source` that stopped being `Copy` when it started holding an `Arc<PortShared>`.
 Anyone working inside the non-green stretch should use that command.
 
-Still owed to make chunk 4 green: `SysCap`'s boot creation and the
-`SYS_DEVICE_CLAIM`/`SYS_RT_ENTER` dispatch handlers; `/etc/system.manifest`
-generation and the `INIT_PROGRAMS` chain deletion with the `KernelArgs` 16-byte
-shrink and its `toyos-abi/src/boot.rs` asserts; `/bin/init` and its launcher;
-and `toyos/src/endow.rs` — which is worth doing **before** the rest, because it
-and the SDK's four remaining `services::` call sites are the whole of what
-keeps the sysroot, and therefore every other verification, shut.
+**Third sub-boundary done, 2026-08-09: the SDK, and with it the sysroot.**
+`toyos/src/endow.rs` (`Endowments::get`/`take`/`service`, `EndowError`'s two
+words), `toyos/src/syscap.rs`, both retry loops deleted, and `toyos::surface`
+moved onto a port — `HOST_ENV`, `service_name` and `MAX_NAME` gone. That is
+what reopened `cargo run -- --build-only`: it now gets through the sysroot and
+std and stops in `userland/window` on `use toyos::services`, which is chunk 5.
+
+**Fourth sub-boundary done, 2026-08-09: the kernel spawns one program.** The
+boot `SysCap` and its endowment to `/bin/init`; `SYS_DEVICE_CLAIM` and
+`SYS_RT_ENTER`; `SYS_DUP`/`SYS_DUP2` renamed to `SYS_HANDLE_DUP`/`_AT` with the
+rights word; the whole `INIT_PROGRAMS` chain deleted and `KernelArgs` shrunk to
+192 bytes; `[boot] start` authoritative and `init` deleted from all eleven
+configs; `/bin/init` built into every image with the port/claim/namespace/spawn
+loop.
+
+Four things it decided that the plan did not have:
+
+- **`SYS_HANDLE_DUP_AT` does not take a rights argument.** §3.3 gives it one; a
+  narrowed handle at a slot is `dup_narrowed` then `dup2`, so the third
+  argument would be a right no caller can request. `SYS_HANDLE_DUP`'s rights
+  word carries `Option<Rights>` as `RIGHTS_UNCHANGED` — a wire encoding decoded
+  at the boundary — so `dup` keeps its meaning and the seven `syscall::dup`
+  call sites in the std fork do not move.
+- **The manifest's format has one definition, `toyos-manifest/`.** The renderer
+  is the build system's and the parser is init's, so a round-trip test is the
+  only thing that makes them one format; it lives beside both. Its `parse` is
+  `assert`-based on purpose — this is the build system's own output travelling
+  beside the binary that reads it, not untrusted input. Add it to the root
+  `CLAUDE.md`'s host-test list in chunk 9, with `toyos-abi`.
+- **init's own served names travel in the manifest** as `init-serve` records,
+  because `launcher` has no `[programs]` row to come from and a constant in
+  init beside `INIT_SERVED` in the gate would be two spellings of one fact.
+- **The launcher cannot be built in chunk 4, and this is a plan error.** §4.5's
+  `MSG_LAUNCH` carries the child's stdio and answers with a `Process` handle,
+  both over `SYS_HANDLE_SEND` — which is chunk 6's. So chunk 4 creates the
+  `launcher` port (every namespace that names it resolves) and init parks in
+  `accept` on it, dropping a client with a line rather than answering. **The
+  protocol belongs in chunk 6** and the compositor's two launch sites keep
+  `SYS_SPAWN` until then; the filepicker cannot be started between chunk 5 and
+  chunk 6, because its acceptor is init's to hand over and the launcher is how.
+
+Still owed for chunk 4: nothing. **Chunk 5 is next and is where the guest
+reopens** — `userland/window` is the first line of it, and the migration list
+is §6.1/§6.2 plus the eight `services::` sites in the test estate.
 
 **Chunk 5 — every server and client. Green.**
 compositor, soundd, netd, filepicker, terminal, console, toybox `screen`,
