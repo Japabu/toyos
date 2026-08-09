@@ -33,7 +33,8 @@ const ARMS: &[(&str, Expect)] = &[
     ("ss_rsp", Expect::Killed),
     // Killed 6 of 6 alone, and survived once in a 12-wide suite with the x87
     // status word reading 0xb881 — IE and ES set, and no trap taken from a
-    // `fwait` two bytes later. Unexplained; `specs/issues/isolation/` carries it. An arm
+    // `fwait` two bytes later. Unexplained;
+    // `specs/issues/kernel/ap-control-registers-inherit-init.md` carries it. An arm
     // that is right most of the time is not an assertion.
     ("mf", Expect::MachineLives),
     ("xm", Expect::MachineLives),

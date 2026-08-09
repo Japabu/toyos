@@ -309,7 +309,7 @@ All 35 notes from `60855a4` and `d5b492e`, verbatim, with where each went.
 | 2 | `arch/apic.rs` `init_timer_ap` | why? | §2 arch/ — OPEN, delete the ceremony |
 | 3 | `arch/gdt.rs` | no empty files no lazy refactorings | §2 arch/ — OPEN, delete the shim |
 | 4 | `arch/idt/mod.rs` `from_raw` | all of this mapping is brittle … can we use macros smarter and reduce code and complexity? | **ANSWERED `9bd7a9e`** (`idt_vectors!`) |
-| 5 | `arch/mod.rs` | `#[allow(dead_code)]` on `debug` — why is that needed? | §2 arch/ — OPEN, five uncalled tools; `specs/issues/build/` + §7 |
+| 5 | `arch/mod.rs` | `#[allow(dead_code)]` on `debug` — why is that needed? | §2 arch/ — OPEN, five uncalled tools; `specs/issues/build/` + `specs/issues/design-debt/` |
 | 6 | `arch/mtrr.rs` | what is this for? do we still need / want this? | §2 arch/ — answered, keep as-is |
 | 7 | `arch/percpu.rs` `PerCpu` | are all of those fields needed? | §2 — OPEN, `lapic_id` is the one dead field |
 | 8 | `arch/percpu.rs` asserts | verifies against constants but doesnt guarantee the constants are the same used in e.g. `preempt.rs` | **`specs/issues/design-debt/`** — 47 `gs:[N]` sites bound to nothing |

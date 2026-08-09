@@ -23,8 +23,9 @@ client's callback thread is woken as an ordinary thread. The T14 has no audio
 device. So the one thing that keeps a 2.9 ms deadline met was absent there and
 is present in every config the suite runs.
 
-That is a mechanism, not a measurement, and two others are equally live: `specs/issues/isolation/`'s
-`drain_irqs` entry, where any syscall on that thread can become the USB
+That is a mechanism, not a measurement, and two others are equally live: the
+`drain_irqs` entry, `specs/issues/kernel/scheduler-pass-blocks-in-xhci.md`,
+where any syscall on that thread can become the USB
 driver's engine for as long as a second; and plain scheduling pressure from a
 game thread and a compositor that never yield to it.
 

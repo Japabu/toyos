@@ -31,8 +31,8 @@ as authority, guessing or outliving the designation was the entire attack:
   **The setup is gone too** (tasks #61/#170): a listener is refcounted by the
   descriptors naming it (`listener::ListenerRef`), so the `close(fd)` in that
   three-call attack unregisters nothing and the real compositor's `listen` is
-  *refused*. What is left is a squat, which is the "no namespace" bullet in the
-  next entry and a different defect. `abuse_listener_hijack.rs` now asserts that
+  *refused*. What is left is a squat, which is the "no namespace" bullet in
+  `process-isolation-ungated` and a different defect. `abuse_listener_hijack.rs` now asserts that
   refusal; the `ListenerId` half is the second line and is no longer reachable
   from userland at all, because nothing can produce a descriptor whose listener
   is gone.
@@ -49,7 +49,8 @@ as authority, guessing or outliving the designation was the entire attack:
   say `PermissionDenied`. `device_claim_lifetime.rs` is the exploit test.
 
 The adjacent failure, same root: **a reference that outlives the object it
-names.** `FileBacking` after an unlink is the live instance (below) — the
+names.** `FileBacking` after an unlink is the live instance
+(`tmpfs-backing-outlives-deletion`) — the
 reference stays valid-looking while the thing it designates is freed and reused
 underneath it. Guessing a designation and outliving one are the two ways a name
 gets you something you were never given.

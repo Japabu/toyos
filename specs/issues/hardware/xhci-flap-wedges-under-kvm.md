@@ -57,13 +57,15 @@ thing that changed. `specs/issues/hardware/`'s own entries name the shape it wou
 outstanding operation per controller, a completion matched by its Command TRB
 address, a recovery cancelled by a disconnect rather than waited out.
 
-**This class is what stands between CI and green.** It is not `specs/issues/design-debt/`'s
-classification class: it fails alone, and it fails the same way twice.
+**This class is what stands between CI and green.** It is not
+`specs/issues/build/parallel-tests-red-under-other-suites.md`'s classification
+class: it fails alone, and it fails the same way twice.
 
 **Three of the four have stopped and one has not.** Run `31258202923`, five reps
 of the whole configuration on the same image and accelerator: `xhci_hotplug`,
 `xhci_hid_break` and `metal_sim_pointer_churn` are **0 of 5** — the last of those
-is closed above and the other two coincide with `wt/toyos-clock`'s waits — while
+is closed, a console the test had counted before it caught up, and the other two
+coincide with `wt/toyos-clock`'s waits — while
 **`usb_transport_break` is 5 of 5** with the same sentence it has always given,
 `the transport broke 2 times; the injection is armed once per boot, so anything
 else is a break this test did not stage`. That is the one member of this class

@@ -4,7 +4,7 @@ kind: defect
 opened: 2026-08-08
 ---
 
-# Nothing in the tree checks any of the above
+# Nothing in the tree checks the dependency bar
 
 Both violations that prompted the audit — `fsck_msdos` and the SoundFont's GPLv2
 — existed for months and were found by collision. There is no ledger of allowed
@@ -22,5 +22,5 @@ neither reaches `rust/`'s own dependencies or a third-party build script. The
 same constraint that governs fork pins governs these: **anything touching the
 network must be an on-demand command, never `cargo test` and never the landing
 gate.** Nothing was built, deliberately: every one of these would go red on the
-tree as it stands, and seeding the ledgers is a decision about which findings
-above are accepted.
+tree as it stands, and seeding the ledgers is a decision about which of the
+audit's findings are accepted.

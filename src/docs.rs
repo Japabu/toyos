@@ -15,9 +15,9 @@
 //! being waved through, so adding one is a decision somebody made on purpose.
 //!
 //! `specs/issues/` is the same argument one level down. Its frontmatter is the
-//! only query anybody has over 219 files, and a field nothing checks is a field
-//! that is right until the day it is not: the directory was 219/219 well formed
-//! on the day it was split and eleven files already disagreed with what its own
+//! only query anybody has over two hundred files, and a field nothing checks is
+//! a field that is right until the day it is not: every field parsed on the day
+//! the directory was split, and eleven files still disagreed with what its own
 //! README said `status: open` meant.
 
 use std::collections::{BTreeMap, BTreeSet};

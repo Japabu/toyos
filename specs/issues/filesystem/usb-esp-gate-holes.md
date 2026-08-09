@@ -49,5 +49,5 @@ closed the harness gap that a `Shape` carried one disk triple (`usb_disks:
 &'static [UsbDisk]` at `:641`). Items 1, 2, 4, 6, 7, 8, 9 and 11 are not; a
 `usb-short-read` kernel feature now exists (`usb_gate.rs:147-155`,
 `xhci/mod.rs:1818-1824`) which reaches a short read but not a failed device.
-Nothing in this list is duplicated by *USB mass storage: what is not implemented*
-below — that entry records driver gaps, these are test gaps.
+Nothing in this list is duplicated by `usb-mass-storage-not-implemented` — that
+entry records driver gaps, these are test gaps.

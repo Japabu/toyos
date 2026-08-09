@@ -9,8 +9,9 @@ task: 142
 
 Owner-reported (task #141) and read off two T14 session logs. **It is one
 defect, not the two it looked like from the symptoms**, plus a second
-independent one in a fork (below). The investigation is the scheduler agent's;
-what is here is the evidence and the eliminations, so it is not re-derived.
+independent one in a fork (`winit-app-never-exits`). The investigation is the
+scheduler agent's; what is here is the evidence and the eliminations, so it is
+not re-derived.
 
 **What the log establishes.** `/bin/ls` was spawned twelve times. Ten exited
 `code=0` in 12–59 ms. Two — pid 10 at 692.459 s and pid 26 at 904.327 s —
@@ -29,7 +30,7 @@ terminal blocked in `child.wait()` on that shell
 |---|---|---|
 | 5 | 6 | `ls` 10, hung |
 | 11 | 12 | `rustc` 18, hung |
-| 19 | 20 | `snake` 23, see below |
+| 19 | 20 | `snake` 23, see `winit-app-never-exits` |
 | 24 | 25 | `ls` 26, hung |
 | 27 | 28 | none — **and it is the only pair that exited** |
 

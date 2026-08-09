@@ -16,7 +16,9 @@ the audit that removed action 3 turned up what they cost:
   resolution, and a `panic_flush` that drains the ring synchronously. A loop
   calling `debug(0)` therefore floods the one channel the kernel reports on and
   spends unbounded time in the panic path, and each iteration takes the
-  recovery route, which is documented above as able to strand locks.
+  recovery route, which
+  `specs/issues/panic-path/panic-holding-process-table-hangs.md` documents as
+  able to strand locks.
 - **2** costs one lock permanently, by design, and is one-shot for that reason.
 
 None of this is memory-unsafe and none of it kills the machine. It is a syscall

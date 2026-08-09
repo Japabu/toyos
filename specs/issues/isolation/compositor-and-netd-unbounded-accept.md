@@ -18,7 +18,7 @@ ceiling and enforced at the one primitive that can breach it. Nobody wrote these
 two. A defect on its own terms, not poller plumbing: the poller capacity is where
 it happens to surface first.
 
-**It compounds "No physical memory fairness" below, and the pair is worse than
+**It compounds `no-physical-memory-fairness`, and the pair is worse than
 either alone.** An unbounded window count is a memory-growth path any client can
 drive, on a system with no per-process limits, no pressure signal and no OOM
 killer. Neither entry is alarming by itself; together a single misbehaving client

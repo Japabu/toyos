@@ -170,7 +170,8 @@ const CHUNK: usize = 512;
 /// How long the VFS lock may stay held before the sink gives up on it.
 ///
 /// It bounds the one case that never clears — a thread that panicked holding
-/// the VFS lock, which known issues records as live. Without it the ring would
+/// the VFS lock, which `specs/issues/panic-path/panic-holding-process-table-hangs.md`
+/// records as live. Without it the ring would
 /// report bytes pending forever and the idle loop, which declines to sleep on
 /// that, would spin a CPU with nothing to do about it.
 ///
