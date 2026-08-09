@@ -43,10 +43,12 @@ to `iod` imports §13.4's regression list into a branch that has nothing to do
 with logging and forces re-pointing `apic.rs:160`'s `wait_for_log_file` and its
 kick loop (`apic.rs:146`); keeping the append on the idle loop needs its C12
 before its C7+C8 and rests on a tail-page-resident premise nothing enforces.
-What *this* branch needs from that one is only §2.6a's lock-free single-waiter
-post for `klogd`'s wake, and §2.6a already names its fallback. **A performance
-fallback whose shape exists in the tree today beats a compilation blocker with
-two costly workarounds** — and log-first *removes* the work rather than
+What *this* branch needs from that one is **nothing**: the lock-free
+single-waiter post `klogd`'s wake wants is `toyos_sched::waitq::wake_direct`,
+in the tree today at `toyos-sched/src/waitq.rs:236` (§2.6a, **CONFIRMED**
+2026-08-10). **So the ordering question is one-sided** — a compilation blocker
+with two costly workarounds against no cost at all — and log-first *removes*
+the work rather than
 relocating it, because completions never touches `log_file.rs`: L6 has already
 deleted it. That is completions' own §11.4 third option, taken.
 
@@ -66,7 +68,7 @@ and what completions converts afterwards.
   log!/alert!/       │  kernel/src/log/                     │
   boot_phase!  ─────►│    emit()  →  per-CPU Shard          │
   (654 + 6 sites)    │      one reservation, one commit     │
-                     │      no lock, no locked RMW, no cli  │
+                     │      no lock, no locked RMW          │
                      └───────┬──────────────┬───────────────┘
                              │              │
               drain_ordered  │              │  snapshot_committed
@@ -183,11 +185,12 @@ cursor move. That the tree already knows this is recorded ten lines above it, at
 `OWED` is … the `lock xadd` cost **350 ms of boot**"* — the module avoided the
 second RMW and kept the first.
 
-The design below removes it in `Drain::Thread` and adds **nothing atomic on the
-producer's path at all**: with §2.6a resolved to its fallback, `emit`'s whole
-contribution to the wake is one relaxed store, and the locked operation lives in
-`drain_irqs`'s post — at most one per `klogd` park, on a CPU already inside a
-scheduler pass. `Drain::Inline` keeps one CAS, in `BackendGuard`, for the boot's
+The design below removes it in `Drain::Thread` and puts **no locked RMW on the
+producer's path at all**: `emit`'s whole contribution to the wake is a
+`fence(SeqCst)` and a relaxed load, and the five locked operations the post
+costs are paid at most once per `klogd` park, by whichever producer wins the
+`LOG_WAITER` swap (§2.6a counts them). `Drain::Inline` keeps one CAS, in
+`BackendGuard`, for the boot's
 185 records on one CPU (§2.3). **Prediction, to be measured by L1's boot A/B and
 not asserted here: removing the per-record CAS is worth a similar saving to the
 one that issue records.** If it is not, the measurement is the finding.
@@ -431,18 +434,18 @@ pub fn emit(level: Level, args: core::fmt::Arguments);
    wide.
 3. **Write the body** into `shard.slots[seq % SHARD_RECORDS]` — plain stores,
    outside the bracket, into the shard step 2 named and never into "this CPU's".
-4. **Commit**: `slot.seq.store(seq, Release)`.
-5. **Signal, only in `Drain::Thread` mode**: `LOG_PENDING.store(true, Relaxed)`
-   — a plain store, no fence and no read-modify-write. `drain_irqs` is what
-   turns it into a wake, and §2.6a is why.
+4. **Commit and read the waiter flag**: `commit_and_signal(shard, seq)` —
+   `slot.seq.store(seq, Release)`, `fence(SeqCst)`, `LOG_WAITER.load(Relaxed)`,
+   and on `true` the swap that admits one poster per park (§2.5, §2.6a).
+5. **Post the wake, only in `Drain::Thread` mode and only when step 4 returned
+   `true`**: `wake_direct` to `klogd`, inside a flags bracket of its own. Not
+   once per record — once per park.
 
-**No lock, no locked RMW and no fence in `Drain::Thread`**, which is every mode
-after `scheduler::init`. The path loses today's `compare_exchange_weak` and keeps
-a three-instruction flags bracket where today's covers the whole append; it gains
-one relaxed store. L1 measures the net. (§2.6a's *first* shape — the producer
-posting to a parked `klogd` itself — costs a `SeqCst` fence and a relaxed load
-here and one locked RMW per park; it is what completions converts to and it is
-not what L3 builds.)
+**No lock and no locked RMW in `Drain::Thread`**, which is every mode after
+`scheduler::init`. The path loses today's `compare_exchange_weak` and keeps a
+three-instruction flags bracket where today's covers the whole append; it gains
+one `SeqCst` fence and one relaxed load. L1 measures the net for the ring and L3
+for the fence, which arrives with the wake (§9.6).
 
 **`Drain::Inline` is not that path and must not be described as if it were.**
 Inline `emit` calls `BackendGuard::lock()` (`serial.rs:97`), which is
@@ -493,7 +496,9 @@ sub` plus a `need_resched` poll — **two locked RMWs per record**, which is the
 cost §1.4 exists to avoid, to buy a property `cli` buys with `pushfq`/`popfq`.
 The flags bracket is also what every `log!` caller inside a syscall already has
 (`IF` is clear for the whole of every syscall), so on the dominant path the
-`popfq` restores a flag that was already clear.
+`popfq` restores a flag that was already clear. **`emit` has a second bracket of
+the same kind and it is not this one**: the wake post sits after the commit
+store, outside this bracket by construction, and §2.6a is where it is argued.
 
 **W4's shim is sound for this shape and only this shape** (§2.5): loom models the
 `xadd` as a real `fetch_add`, which is strictly stronger, and the bracket is what
@@ -570,13 +575,13 @@ works only because `sync.rs` and `shootdown.rs` name almost nothing outside
 themselves — compl §16.1 counts four shimmed items in total (`cell::UnsafeCell`,
 `preempt::{disable,enable}`, `arch::tlb::poll`, `log!`). The first draft put the
 wake edge in `emit`, which lives in `mod.rs` and names `core::fmt::Arguments`,
-`clock::nanos_since_boot` and `completion::post` — three surfaces no shim
+`clock::nanos_since_boot` and the wake post — three surfaces no shim
 reaches, so `log_wake.rs` would have had nothing to compile. **Both fences and
 `LOG_WAITER` therefore live in `shard.rs` with the ring**, behind two functions
 that return a `bool` and touch no subject:
 
 ```rust
-// kernel/src/log/shard.rs — the whole modelled surface, at the conversion
+// kernel/src/log/shard.rs — the whole modelled surface
 impl Shard { fn reserve(&self) -> u64; fn commit(&self, seq: u64); }
 /// commit, fence, read the flag. True means "a reader is parked; post to it".
 pub fn commit_and_signal(shard: &Shard, seq: u64) -> bool;
@@ -587,29 +592,25 @@ pub fn arm_waiter(cursor: &Cursor) -> bool;
 The caller does the post on a `true`, and never the ordering. The shimmed set for
 `shard.rs` is then `UnsafeCell` and `percpu_fetch_add`, which is smaller than
 `sync.rs`'s. **The layout requirement is stated here and honoured at L1 even
-though the two functions arrive later** (§2.6a): if `shard.rs` were allowed to
-grow a dependency on a subject, the conversion could not be modelled at all, and
-that is exactly the mistake the paragraph above records.
+though the two functions arrive at L3** (§2.6a): if `shard.rs` were allowed to
+grow a dependency on a subject, W3 could not be modelled at all, and that is
+exactly the mistake the paragraph above records.
 
 | obligation | shape | model | when |
 |---|---|---|---|
 | **W1** publication | body stores → `seq.store(Release)`; reader's `seq.load(Acquire) == s` implies the body is visible | `kernel-loom/tests/log_record.rs` | L1 |
 | **W2** recycle detection | reader: `load(Acquire)`, copy, `fence(Acquire)`, `load(Relaxed)`, compare. The second load must not be hoisted above the copy | same | L1 |
 | **W2b** the lapped writer | a writer whose reservation was lapped by `SHARD_RECORDS` re-reads `head` and abandons; a reader mid-copy of the newer record must not observe the older `seq` (§2.4) | same | L1 |
-| **W3** the wake edge | `commit_and_signal`: `seq.store(Release); fence(SeqCst); LOG_WAITER.load(Relaxed)` against `arm_waiter`: `LOG_WAITER.store(true, Relaxed); fence(SeqCst); rescan for a committed record; park`. **Invariant: no committed record is left with a parked reader.** Store-buffer shaped, so TSO hides the missing fence and only loom sees it | `kernel-loom/tests/log_wake.rs` | **not L3 — the conversion, §2.6a** |
+| **W3** the wake edge | `commit_and_signal`: `seq.store(Release); fence(SeqCst); LOG_WAITER.load(Relaxed)` against `arm_waiter`: `LOG_WAITER.store(true, Relaxed); fence(SeqCst); rescan for a committed record; park`. **Invariant: no committed record is left with a parked reader.** Store-buffer shaped, so TSO hides the missing fence and only loom sees it. Carries its own negative case — either fence removed behind a `cfg`, and the model must red — because a model that has never failed proves nothing | `kernel-loom/tests/log_wake.rs` | L3 |
 | **W4** the reservation | `head` is written by one CPU through inline asm and read by others as an `AtomicU64` | shimmed | L1 |
 
-**W3 is not L3's, and that is what the order change moved.** The fallback §2.6a
-resolves to has **no producer-side wake edge**: `emit` stores a relaxed flag and
-`drain_irqs` decides, from inside a scheduler pass, whether to wake — so the only
-ordering in play is the scheduler's own park/wake protocol, which
-`toyos-sched`'s `Commit` handshake already carries and which loom already covers
-through `toyos-sched`'s own models. There is nothing store-buffer-shaped to
-model, `LOG_WAITER` does not exist yet, and writing `log_wake.rs` at L3 would be
-a model of code the branch does not contain. **W3 becomes real the moment
-completions converts the wake, and it is that chunk's deliverable, named here
-because a conversion that lands without it is a lost wake nothing on x86 can
-see.**
+**W3 is L3's, and it is the one obligation the wake's own correctness rests on.**
+The producer-side edge is real in this branch — `emit` reads `LOG_WAITER` after
+its commit and posts (§2.6a) — so the store-buffer pair exists in code L3 writes
+and x86 cannot fail it on purpose. A tree that drops either fence loses a wake
+against a parked `klogd` and goes quiet with a committed record behind it; loom
+is the only instrument that sees it, which is why the model ships in the same
+chunk as the code.
 
 **W3's rescan is over committed records and never over `head`, and that is a
 liveness property rather than a taste.** A reader that re-scans `head[i]` and
@@ -618,10 +619,7 @@ holding an abandoned reservation (§3.1) — `drain_ordered` returns nothing for
 that shard and `head` does not move on a quiet machine, so `klogd` spins a CPU at
 100% until 512 further records arrive, which on a quiet machine is never. The
 predicate is the same one `drain_ordered` uses: *is there a committed record at
-`next[i]`*. Eight loads either way. **The fallback has the same obligation one
-level up**: `drain_irqs`'s decision to wake is that predicate and not
-`head[i] > next[i]`, or a shard with an abandoned reservation makes every pass
-wake a thread that finds nothing.
+`next[i]`*. Eight loads either way.
 
 **W4's shim, and why it is sound.** Loom cannot model inline asm, so
 `percpu_fetch_add` is shimmed to a real `fetch_add`. That is a **strictly
@@ -649,7 +647,7 @@ ring. `DROPPED_BYTES`, `FILE_DROPPED`, `take_drop_marker`, `take_file_drops` and
 `DROP_MARKER_MAX` all go (§8). It also removes the last `fetch_add` in the
 module, which today runs on the overflow path.
 
-### 2.6a The wake — the fallback is what L3 builds, and completions converts it
+### 2.6a The wake — `emit` posts it, and the primitive was never missing
 
 **`emit` may not take a lock, and an ordinary completion post does.** compl §5.2:
 *"a watch is a node the waiter lends to the object, so a post is a walk of a list
@@ -657,58 +655,129 @@ under the object's own leaf lock."* `log!` runs inside `sync.rs`, inside IRQ
 handlers, inside the scheduler and inside every syscall's locked region, so an
 `emit` that acquired a leaf `Lock` would (a) put `preempt::disable`'s two locked
 RMWs on every record and (b) deadlock the first time anything on that lock's own
-path logged. So `emit` can only ever use the *degenerate* case of that shape —
-one waiter for the life of the boot, no list, and the rendezvous-word CAS
-`toyos-sched` already performs (compl §5.4's C2). **That is the one thing this
-design ever wanted from the completion core, and under the ruled order the core
-does not exist when L3 runs.**
+path logged. What the log needs is the *degenerate* case of that shape — one
+waiter, no list, the rendezvous-word CAS and nothing else.
 
-**So L3 builds the fallback, which is the shape `irq_ring` already has in this
-tree: record, and let `drain_irqs` post.** Concretely, and this is the whole of
-it:
+**That primitive is in the tree, and it is not the completion core's to supply.**
+`toyos_sched::waitq::wake_direct` (`toyos-sched/src/waitq.rs:236`), whose own doc
+comment is *"join / waitpid / sleep and the local deadline fire: the same claim
+CAS, without a queue. `true` if this caller owns the wake."* **CONFIRMED**
+2026-08-10 by reading every line its `Claim::Parked` arm reaches:
 
-- `emit` does `LOG_PENDING.store(true, Relaxed)` after the commit store. One
-  plain store, no fence, no read-modify-write. It is the same predicate
-  `log_ring::has_pending()` is today, moved off the byte ring.
-- `drain_irqs` (`sched/driver.rs:578`, called at `:316` from `pass` and `:418`
-  from `pass_block`, before `SchedPass::begin` in both) reads the flag and, if
-  `klogd` is parked and `drain_ordered` would return something, wakes it through
-  today's `waitqs` — the ordinary queue wake, from a context that may take a
-  lock. §2.5's note applies to the predicate: it is *is there a committed record
-  at `next[i]`*, never `head[i] > next[i]`.
-- `klogd` parks on a `static KWaitQueue` with today's `prepare_wait`/`block_on`
-  (`scheduler.rs:170`, `:181`), not on an `Inbox`. A spurious wake is legal; the
-  body re-drains and re-parks.
+| step | what it is | takes a lock? |
+|---|---|---|
+| `shared.claim_wake()` | `task.rs:412` — a CAS loop on the packed state word, `Blocked → WakeQueued` | no |
+| `shared.wake_node().claim()` | `mailbox.rs:154` — `in_flight.swap(true, AcqRel)` on a node embedded in the task | no |
+| `CpuHandle::post` | `cpu.rs:1141` → `MailboxProducer::post` (`mailbox.rs:255`): a plain store into the node's slot, one `tail.swap`, one release store | no |
+| `Doorbell::ring` | `mailbox.rs:457` — `bits.fetch_or(KICK_PENDING)`, returning whether the IPI is owed | no |
+| `Kicker::kick` | `kernel/src/hw.rs:60` → `apic::kick_cpu` (`apic.rs:89`): one x2APIC ICR `wrmsr`, and only on `Kick::Send` | no |
 
-**What that costs, stated rather than waved at.** The wake is decided inside a
-scheduler pass rather than at the commit, so a record emitted *after*
-`drain_irqs` has run and *before* the same pass reaches its halt decision has
-nothing making `klogd` runnable. **One pre-`hlt` condition therefore survives L3
-that the first draft deleted**: `log::pending()`, a relaxed load in `execute`'s
-`Idle` arm, in the place `log_ring::has_pending` (`driver.rs:523`) occupies
-today. Without it, `log-ring-flushes-one-line-behind` does not close at L3 and
-the last line before a quiet period is still not evidence of anything — which is
-the entry §8.2 claims L3 closes, and it is not worth reopening a diagnostics
-defect to save one load. §8.1's deletion list is written accordingly: that
-condition is **re-pointed at L3, not removed**.
+No list, no leaf lock, no allocation. **And the kernel already wraps it**:
+`scheduler::wake_sched` (`kernel/src/scheduler.rs:264`) is
+`preempt_off(|p| wake_direct(…))`, serving `waitpid`, `thread_join` and the
+panic-recovery notify. `sched/waitqs.rs`'s module doc states the idiom `klogd`
+joins: a park bucket is *"never woken as a queue: `wake_direct` claims the task's
+own rendezvous word and the queue node is cleaned up by the waiter's own
+`Registration`."* `klogd` is a fourth waiter of a shape this kernel has, not a
+mechanism this branch invents. **Posting from an IRQ handler, from inside a lock
+or from inside a pass is the mailbox's ordinary case**, not an exemption `emit`
+needs: the producer half is the `Sync` face of a CPU (`cpu.rs:1104`) and never
+touches the `!Sync` `CpuSched`, and a wake that lands on the posting CPU's own
+queue is what park-before-switch already relies on (`driver.rs:20-22`).
 
-**What completions converts it to, and what the conversion buys.** When the core
-lands, `emit`'s relaxed store becomes §2.5's `commit_and_signal` — commit,
-`fence(SeqCst)`, relaxed read of `LOG_WAITER` — with `LOG_WAITER.swap(false,
-AcqRel)` so only one producer posts per park; `klogd` parks on an `Inbox` through
-`arm_waiter`; `drain_irqs` loses the log entirely; and **the surviving pre-`hlt`
-condition is deleted then**, because a posted `klogd` is runnable at the commit
-and `toyos-sched`'s Invariant T is what stops the halt. The conversion owes W3's
-loom model (§2.5) and it is the chunk that closes the last log statement in the
-idle path's declared set (§9.5's `idle_loop_is_the_declared_body` is re-asserted
-by it).
+**The witness `wake_direct` asks for is free.** `PreemptGuard` is
+`pub unsafe trait PreemptGuard {}` (`mailbox.rs:60`) — an empty marker trait, and
+the cost read into it belongs to a witness *type*'s constructors. `PreemptOff`
+(`driver.rs:52`) is one such type, and `preempt_off` raises the preempt count:
+`lock add` plus `lock sub` (`preempt.rs:90`, `:112`) and a `need_resched` poll
+that can reach `do_preempt`, which is a scheduling pass. `emit` may have neither.
 
-**The RMW budget is better under the fallback than under the shape it replaces,
-which is worth saying because the fallback is the concession.** `emit` pays one
-relaxed store and nothing else; the locked operation is `waitqs`'s, at most once
-per `klogd` park, on a CPU already inside a pass. The lock-free post pays a
-`SeqCst` fence and a relaxed load on *every* record for the same one locked
-operation per park. §9.6 counts both.
+**So the post takes a flags bracket of its own, and §2.3a's is not it.** That
+bracket ends at the `xadd` on purpose (§2.3a's second bullet) and the post comes
+after the commit store, so the wake is *not* inside a bracket that already
+exists — it gets a second one of the same kind and by the same argument.
+`IrqGuard::close()` (`kernel/src/hw.rs:42`) is `pushfq`/`pop`/`cli` with
+`push`/`popfq` on drop: no locked RMW, and on the dominant path `IF` is already
+clear.
+
+The witness is a type beside `PreemptOff` in `sched/driver.rs`, constructible
+only by that bracket, and its `unsafe impl PreemptGuard` carries this SAFETY
+argument: **preemption in this kernel is delivered at an interrupt.**
+`do_preempt` has exactly three callers — the LAPIC timer
+(`arch/idt/timer.rs:101`), the exit-to-user epilogue (`arch/idt/mod.rs:370`,
+which `sti`s before it calls) and `preempt::enable`'s poll (`preempt.rs:126`) —
+**CONFIRMED**. With `IF` masked the first two are unreachable, and the bracketed
+region calls `wake_direct` and nothing else, so it reaches neither
+`preempt::enable` nor a voluntary pass. A voluntary pass is the one way to be
+descheduled with `IF` clear, which is why the witness has no constructor but the
+bracket. The scheduler core grants the same impl to an IRQ context in its own
+loom model (`toyos-sched/loom/src/model.rs:105`) and the trait's own SAFETY
+paragraph names one.
+
+**`LOG_WAITER` is the gate, and it is what keeps the record path free of locked
+RMWs.** Without it every record would pay `claim_wake`'s CAS. §2.5's two
+functions, in `shard.rs` with the ring:
+
+- `commit_and_signal`: `slot.seq.store(seq, Release)`, `fence(SeqCst)`,
+  `LOG_WAITER.load(Relaxed)`, and **only** on `true` the
+  `LOG_WAITER.swap(false, AcqRel)` that admits exactly one poster per park. It
+  returns whether this caller owns the post; the caller does the post, and never
+  the ordering.
+- `arm_waiter`: `LOG_WAITER.store(true, Relaxed)`, `fence(SeqCst)`, rescan for a
+  committed record. `true` means do not park.
+
+**Both fences are load-bearing.** This is a store-buffer shape, and x86's one
+permitted reordering is store-then-load — exactly the producer's commit-then-read
+and the waiter's arm-then-scan — so without them both sides can miss and a
+committed record is left under a parked reader. Buying that ordering with an
+RMW instead, by reading `LOG_WAITER` with an unconditional `swap`, is §1.4's
+price on every record. W3 is the model, and it is L3's (§2.5).
+
+**`klogd` registers before it arms, and that ordering is the lost wake's other
+half.** The body is `drain_ordered`, then `prepare_wait(park_lot())`
+(`scheduler.rs:170`, `:201`), then `arm_waiter`, then `block_on` (`:181`) or a
+cancel. Registration moves the word to `Committing` (`waitq.rs:128`), so a
+producer that wins the swap from that point on gets `Claim::PrePark` and
+`klogd`'s own commit refuses to park. Arming *before* registering leaves a window
+where the producer claims a still-`Running` `klogd`, takes `Claim::Lost`, drops
+the wake, and `klogd` parks on a committed record — which is the window
+`prepare_wait`'s own doc says registering first exists to close, with the rescan
+as the re-check.
+
+**`emit` finds `klogd` through a static, never the process table.** `wake_task`'s
+`process::thread_sched` lookup takes a lock; L3 publishes `klogd`'s
+`Arc<KShared>` once at spawn, leaked and reached through an `AtomicPtr` read
+`Acquire` — the shape `CPUS` already has in the same file (`driver.rs:69`, read
+at `:78`, set once from a leaked `Box`). Null means "no `klogd` yet", which is
+`Drain::Inline`'s state and needs no branch of its own.
+
+**The RMW budget, counted from the code rather than measured.** Per record in
+`Drain::Thread`: **no locked RMW**, one `fence(SeqCst)`, one relaxed load. Per
+`klogd` park: **five** — the `LOG_WAITER` swap, `claim_wake`'s CAS, the node's
+`in_flight` swap, the mailbox's `tail.swap` and the doorbell's `fetch_or` — plus
+one `wrmsr` when the doorbell says `Kick::Send`. The fallback this section
+carried until 2026-08-10 was cheaper by one fence per record and dearer
+everywhere else: a relaxed store per record, a relaxed load per pass on **every**
+CPU in `drain_irqs`, and a park wake through `waitqs::wake_one`, which is
+`preempt_off`'s two locked RMWs plus the queue's leaf lock and a list pop
+(`waitq.rs:154`) *before* the same four. §9.6 states what is owed: the fence
+arrives at L3 and its cost is L3's to measure.
+
+**And the pre-`hlt` condition goes with the fallback.** A commit makes `klogd`
+runnable there and then, including a record committed inside the very pass that
+is about to halt: `execute`'s `Idle` arm opens with `doorbell().kick_pending()` and
+`!mailbox_is_empty()` (`driver.rs:474-478`, **CONFIRMED**), the doorbell
+publishes `SLEEPING` before the final mailbox check so a post after it kicks
+(`mailbox.rs:487`), and `toyos-sched`'s Invariant T refuses the halt while
+anything is runnable. `log_ring::has_pending` (`:523`) is therefore **deleted**
+at L3 as the first draft planned, and `log-ring-flushes-one-line-behind` closes
+on one mechanism (§8.1, §8.2).
+
+**Why this section carried a fallback at all, recorded because the failure mode
+repeats.** The primitive was looked for in the completion spec's *description* of
+a post rather than in the scheduler that already had one — reasoning about the
+tree from a document instead of grepping it, which is the same mistake in the
+same section as the wrong-CPU reservation §2.3a exists to fix.
 
 ## 3. The read surface
 
@@ -803,8 +872,13 @@ pub fn log_read(cursor: &mut LogCursor, out: &mut [u8]) -> Result<usize, Syscall
   `io_uring::Source`** — `Source::Log`, beside `Keyboard`, `Mouse`, `Network`,
   `VirtioSound` and `Hda`, with the same per-source `IO_URING_WATCHERS` static
   those five already have (`keyboard.rs:17`, `mouse.rs:19`, `net.rs:41`,
-  `hda.rs:220`, `virtio_sound.rs:270` — **CONFIRMED** 2026-08-09) and posted from
-  the same place `klogd`'s wake is (§2.6a). L4 adds it; compl C3 folds all six
+  `hda.rs:220`, `virtio_sound.rs:270` — **CONFIRMED** 2026-08-09) and posted by
+  `klogd` after each drain batch. **Not by `emit`**, and the reason is §2.6a's
+  own: each of those statics is a `Lock<Vec<RingId>>` and the post clones it
+  under the lock (`keyboard.rs:71` — **CONFIRMED** 2026-08-10), which is the one
+  thing `emit` may not do. `klogd` is the context that has just observed
+  committed records and may take a lock, and posting there costs one wake per
+  batch rather than one per record. L4 adds it; compl C3 folds all six
   into its one watch list and its §19 deletes the statics together. **Adding a
   sixth instance of a mechanism that is about to be unified is the honest cost of
   landing first**, and it is one static and one match arm.
@@ -946,7 +1020,7 @@ enum Drain { Inline, Thread }
 | phase | who drains to the console | why it is the only thing that can |
 |---|---|---|
 | boot, up to `scheduler::init` (`main.rs:501`) | **`Drain::Inline`** — `emit` writes the record to the backend synchronously, after committing it | there is no scheduler and no thread; one CPU, nothing else running |
-| steady state | **`Drain::Thread`** — `klogd`, a kernel thread, made runnable by the next `drain_irqs` after a record is committed (§2.6a), and at the commit itself once completions converts the wake | it must run on an idle machine, and a runnable task is what stops a CPU halting (`toyos-sched` Invariant T); until the conversion, the one surviving pre-`hlt` condition covers the gap between the commit and the pass |
+| steady state | **`Drain::Thread`** — `klogd`, a kernel thread, made runnable at the commit of the record it will drain, by the producer's own `wake_direct` (§2.6a) | it must run on an idle machine, and a runnable task is what stops a CPU halting (`toyos-sched` Invariant T) — including a record committed inside the pass that was about to halt, which the doorbell's own handshake catches |
 | panic and shutdown | `drain_inline()` called directly | `klogd` will never run again |
 
 A fallback is a path taken when another fails. These are phases: exactly one is
@@ -966,8 +1040,9 @@ watching.** The number decides; the design does not pre-empt it.
 ### 4.3 `klogd`
 
 Body: `loop { drain_ordered(&mut cursor, &mut backend); park(); }`, where `park`
-is today's `prepare_wait`/`block_on` on a `static KWaitQueue` (§2.6a) and becomes
-a completion park at the conversion.
+is `prepare_wait(park_lot())`, then `arm_waiter`, then `block_on` or a cancel —
+in that order, which is §2.6a's. A spurious wake is legal; the body re-drains and
+re-parks.
 
 - **The kernel-thread machinery is L3's, and this is the largest thing the order
   change moved.** The first draft said *"it is compl C6's `logd` kernel thread,
@@ -1570,18 +1645,18 @@ values. The `log-rotate-fast` cargo feature goes; it becomes a logd argument.
 `LOG_DEFERRAL_CEILING_NS` (`:701`), `LOG_DEFERRED_SINCE` (`:706`),
 `log_file_flush_due` (`:743`), `owes_wake` (`:832`, whose only caller is the
 above), `drain_serial` (`:762`) and its `BackendGuard::lock` spin with interrupts
-disabled, and **one** of the four pre-`hlt` conditions in `execute`'s `Idle` arm:
-`log_file_flush_due` (`:552`), at L6. The idle loop's `drain_serial()` (`:681`)
-and `flush_log_file_if_affordable()` (`:689`) statements.
+disabled, and **two** of the four pre-`hlt` conditions in `execute`'s `Idle` arm:
+`log_ring::has_pending` (`:523`) at L3 and `log_file_flush_due` (`:552`) at L6.
+The idle loop's `drain_serial()` (`:681`) and `flush_log_file_if_affordable()`
+(`:689`) statements.
 
-**`log_ring::has_pending` (`:523`) is re-pointed at L3, not deleted, and the
-order change is why.** §2.6a's fallback decides the wake inside a scheduler pass,
-so a record committed after that pass's `drain_irqs` has nothing making `klogd`
-runnable before the halt decision in the same pass. The condition becomes
-`log::pending()` — the same relaxed load against the shard's flag instead of the
-byte ring's — and **completions deletes it when it converts the wake**, because a
-posted `klogd` is runnable at the commit and Invariant T covers the halt. The
-first draft deleted it here, on the strength of a wake this branch does not have.
+**`log_ring::has_pending` (`:523`) is deleted outright and nothing replaces it.**
+The producer posts `klogd`'s wake at the commit (§2.6a), so the halt is refused
+by the mechanism that refuses it for every other runnable task: the `Idle` arm's
+own `doorbell().kick_pending()` and `!mailbox_is_empty()` (`driver.rs:474-478`),
+the `SLEEPING`-before-the-final-check handshake, and Invariant T. A log-specific
+condition on the halt path is exactly the scaffolding §1.2 calls the patch for a
+drain that could not be woken.
 
 The other two pre-`hlt` conditions — `i8042::verdict_due` (`:534`) and
 `xhci::port_work_pending` (`:564`) — are **compl C9's, not this spec's** (§12).
@@ -1661,7 +1736,7 @@ edit that removes the citation.
 | `log-flush-is-unbounded` | boot-media | L6 | there is no flush on the idle path and no kernel file write |
 | `client-cpu-takes-the-log-flush` | audio | L6 | there is no heuristic left to steer, and no CPU takes a flush. **Its hypothesis is closed unverified and L8 says so where it goes**: the entry's own last section is *"only the owner's next boot can verify it"*, and deleting the mechanism makes it permanently unfalsifiable. The T14 arm is owed, filed the same way §6.6 files pstore's |
 | `pre-idle-wedge-says-nothing` | diagnostics | L3 | `Drain::Inline` puts every boot record on the wire as it is written |
-| `log-ring-flushes-one-line-behind` | kernel | L3 | a CPU does not halt with a line unsent. **Under §2.6a's fallback that is two mechanisms and not one**: `drain_irqs` makes `klogd` runnable within a pass of the commit, and the surviving `log::pending()` pre-`hlt` condition covers the window between a commit and the next pass. Delete the condition without the conversion and this entry reopens — which is why §8.1 keeps it |
+| `log-ring-flushes-one-line-behind` | kernel | L3 | a CPU does not halt with a line unsent, **and it is one mechanism**: the commit posts `klogd`'s wake (§2.6a), so the halt is refused by the doorbell and Invariant T rather than by a log-specific pre-`hlt` condition, and the last line before a quiet period reaches the wire |
 | `shutdown-path-logs-never-reach-console` | kernel | L6 | §6.3's ordered shutdown |
 | `serial-console-has-no-line-atomicity` | diagnostics | L5 | §4.4: three producers, whole units, one lock |
 | `sink-append-error-unreachable` | boot-media | L6 | its *subject* (`Sink::append`) is deleted, so the entry goes — but **not "moot", which the first draft said and which is backwards**. Its durable finding is *reactivated*: the entry's premise is that the kernel sink's tail page stays resident, and after L6 the appender is an ordinary userland process whose tail page is ordinary page-cache and *is* evictable. So `file_cache::write_page`'s merge-into-a-failed-read is reachable from the log path again, and the sentence moves to the file cache's own doc as a **live hazard with `log_backing_read_error` as its stager**, not as history |
@@ -1802,6 +1877,11 @@ own rule for what makes an actuator worth having;
 correctness claim the whole design rests on and nothing else can make it fail on
 purpose.
 
+**There is deliberately no actuator for §2.6a's fences.** A guest build with
+either one removed behaves identically on x86 — that is the whole reason W3
+exists — so the negative control belongs where it can red, in `log_wake.rs`
+(§2.5), and a seventh image would buy a test that cannot fail.
+
 **`log-writes-the-file` also inherits a control from the other branch, and the
 order change is what makes it an inheritance rather than a pair.** compl §20.3's
 `reintroduce-idle-flush` puts `log_file::poll()` back on the idle loop; its own
@@ -1852,13 +1932,13 @@ existing. Named rather than discovered at compl's C14.
   test: `idle_loop`'s body and `execute`'s pre-`hlt` condition list are exactly
   the declared sets. A condition quietly re-added is invisible to every
   behavioural test. compl §20.4 struck it from that branch and gave it here
-  (§12.1). **What it declares at L6 is not the end state**, and the order change
-  is why: the body is `log_health`, `reap_poisoned`, `pass` and three `#[cfg]`
-  probes, and the pre-`hlt` list is `log::pending()` (§8.1), `i8042::verdict_due`
-  and `xhci::port_work_pending` — the last two are compl C9's and the first is
-  deleted by its wake conversion (§2.6a). So the gate is written to be
-  **amended twice by the other branch**, which is what a declared-set gate is
-  for: each amendment is a diff a reviewer reads.
+  (§12.1). **What it declares at L6 is not the end state**: the body is
+  `log_health`, `reap_poisoned`, `pass` and three `#[cfg]` probes, and the
+  pre-`hlt` list is `i8042::verdict_due` and `xhci::port_work_pending` — **no log
+  condition survives this branch** (§8.1), and both of those are compl's C9 and
+  C10. So the gate is written to be **amended by the other branch as each of the
+  two goes**, which is what a declared-set gate is for: each amendment is a diff
+  a reviewer reads.
 - **`one_console_holder`** — a `cargo test --lib` gate over **all six manifests**
   (§5.1a), reading the *parsed* `ProgramConfig` and never the file text (§3.2):
   each declares exactly one `console = true` program, each with a `[boot] start`
@@ -1877,26 +1957,22 @@ existing. Named rather than discovered at compl's C14.
 - **`Drain::Inline`'s cost on a real UART** (§4.2). L3.
 - **The RMW budget**, counted rather than asserted, and **counted per mode**
   because the two differ:
-  - `Drain::Thread` (everything after `scheduler::init`), **as L3 builds it under
-    §2.6a's fallback**: loses one `compare_exchange_weak` per record, keeps a
-    `pushfq`/`cli`/`popfq` bracket narrowed from the whole append to two
-    instructions (§2.3a), and gains **one relaxed store** per record. No fence,
-    no locked RMW on the producer's path at all. The locked operation is
-    `waitqs`'s wake, at most once per `klogd` park, inside a pass. Against that,
-    `drain_irqs` gains one relaxed load per pass on every CPU — a cost on a hot
-    path, small, and the one the fallback adds that the conversion removes.
-  - `Drain::Thread` **after completions converts the wake**: the relaxed store
-    becomes a `SeqCst` fence plus a relaxed load per record, for the same one
-    locked RMW per park, and `drain_irqs`'s load goes. **The conversion is not
-    free in either direction and the A/B is owed by whoever does it**, not
-    assumed here.
+  - `Drain::Thread` (everything after `scheduler::init`): loses one
+    `compare_exchange_weak` per record, keeps a `pushfq`/`cli`/`popfq` bracket
+    narrowed from the whole append to two instructions (§2.3a), and gains **one
+    `SeqCst` fence and one relaxed load** per record. No locked RMW on the
+    producer's path at all. The five locked operations of the post (§2.6a) are
+    paid at most once per `klogd` park, by one producer, inside a second bracket
+    of the same kind.
   - `Drain::Inline` (boot, 185 records on one CPU): pays `BackendGuard`'s
     `compare_exchange_weak` and its `cli` per record, plus the synchronous
     backend write. Not a saving and not meant to be one; §4.2's measurement is
     what decides whether it is gated on `has_console()`.
 
-  L1 counts the first and the third; L9 measures. The second is the other
-  branch's to count when it writes the conversion.
+  L1 counts both; L9 measures. **The fence is L3's to A/B**, on the same
+  instrument as §1.4's — `xhci_slow_connect`'s `Boot: complete`, interleaved —
+  because it arrives with the wake and not with the ring, and it is separable
+  behind a `#[cfg]` if that chunk moves the number.
 - **`LOG_FILE_DRAIN_NANOS` re-derived** against a userland writer under
   `usb-slow-device` (§6.4). L6.
 
@@ -1919,10 +1995,10 @@ rebase, never amend.
 
 | # | chunk | delivers | gate |
 |---|---|---|---|
-| **L0** | merge `origin/main` (**post-endowment, and that is the whole of it** — completions lands after this branch, §12). Re-derive every number in this spec against the merged tree; re-check §12.5's endowment rows against the merged *code* and not only its plan; compute and assert the first clean syscall number; claim the sysroot. **Nothing about the completion core is confirmable here and L0 must not wait on it** — §2.6a is resolved to its fallback by the ordering ruling, not by a measurement | suite green; §12.5 has no moved row; the baselines of §9.3 recorded here |
+| **L0** | merge `origin/main` (**post-endowment, and that is the whole of it** — completions lands after this branch, §12). Re-derive every number in this spec against the merged tree; re-check §12.5's endowment rows against the merged *code* and not only its plan; compute and assert the first clean syscall number; claim the sysroot. **Nothing about the completion core is confirmable here and L0 must not wait on it** — §2.6a needs nothing from it | suite green; §12.5 has no moved row; the baselines of §9.3 recorded here |
 | **L1** | `kernel/src/log/`: `LogRecord`, `Slot`, `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions. Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The `KernelArgs` `{:?}` site split into several records. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W2b, W4); `log_conservation`; `log_nested_emit`; `log_migration_storm`; `nmi_does_not_log`'s second clause; the boot A/B of §9.6 |
 | **L2** | the two readers; the `toyos-abi` formatter; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records; `Mark` → `Instant` | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green |
-| **L3** | `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's fallback wake (`LOG_PENDING`, `drain_irqs` posts, `waitqs` park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`fd.rs:585`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; re-point the `:523` pre-`hlt` condition at `log::pending()` rather than deleting it | `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement. **No `log_wake.rs` and no W3** — the fallback has no producer-side wake edge to model and writing one here would model absent code (§2.5) |
+| **L3** | `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`commit_and_signal`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`fd.rs:585`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement and the fence's A/B |
 | **L4** | ABI: `SYS_LOG_READ`, `LogCursor` with its clamped `durable`, `LogRecord` and its `Display` in `toyos-abi`; `Rights::LOG`; `logread` on `ProgramConfig` and on `test-runner`'s row in the three test configs; the `toyos` SDK wrapper. **This is the ABI chunk** — §11 | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall |
 | **L5** | one `ConsoleObject` per endowment over one backend, its line buffer, `Console` losing `DUP`; the ANSI strip moves; `MAX_CONSOLE_LINE` | `console_line_atomicity`; `console-unbuffered` reds both its clauses; `one_console_holder` |
 | **L6** | `/bin/logd`: the program, **its row in all six manifests** (§5.1a) including `diag/`'s and its restated comment, the protocol, rotation, retention, per-client backlog, the give-up policy on today's live 2 s transport bound (§5.4); **`SYS_FSYNC`'s device flush, outright — there is no C12 to hand it to (§12.4)**. **Delete `log_file.rs` whole**, `flush_log_file_if_affordable` and everything in §8.1's `driver.rs` list; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`, **including `apic.rs:146`'s comment and its kick loop, which name the idle loop's `log_file::poll`**; §6.3's shutdown | `kernel_log_file` re-pointed and green mid-run and after shutdown; `log_is_durable_after_fsync`; `screen_fatal_halt_composited`'s `/log` half green; `logd_gone`; `shutdown_last_line`; `idle_loop_is_the_declared_body`; `log-writes-the-file` and `log-trusts-durable` red |
@@ -2015,12 +2091,12 @@ this subsection records what the ruling settled and what it did not.
   deleted it. Its two shapes — the drain onto `iod`, and the append staying on
   the idle loop behind C12 — are both struck, and the trace that justified them
   stays there as evidence.
-- **Not settled, and it is the cost: §2.6a takes its fallback.** The lock-free
-  single-waiter post does not exist when L3 runs, so the wake is
-  `drain_irqs`-decided and one pre-`hlt` condition survives. That is a
-  *performance* fallback with a shape the tree already has, against a
-  *compilation* blocker with two costly workarounds, and it is why the ruling
-  went this way.
+- **Settled, and it cost nothing: §2.6a needs no completion primitive.** The
+  lock-free single-waiter post is `toyos_sched::waitq::wake_direct` and has been
+  in the tree all along, so `emit` posts at the commit, no pre-`hlt` condition
+  survives, and this branch inherits and owes nothing on the wake. The ruling
+  therefore rests on the *compilation* blocker alone, which is the stronger half
+  of the argument that produced it.
 - **Not settled, and it is the other cost: L3 builds the kernel-thread
   machinery** (§4.3). C6 does not exist to inherit from. That is the largest
   single thing the reorder moves and neither spec had planned for it.
@@ -2041,7 +2117,7 @@ order C9 additionally finds each of them already built or already deleted:**
 | `flush_log_file_if_affordable`, `LOG_DEFERRAL_CEILING_NS`, `LOG_DEFERRED_SINCE`, `log_file_flush_due`, `owes_wake` | L6 |
 | `drain_serial` from the idle loop, and its IRQs-off `BackendGuard::lock` spin | L3 |
 | the pre-`hlt` condition `log_file_flush_due` (`:552`) | L6 |
-| the pre-`hlt` condition `log_ring::has_pending` (`:523`) | **L3 re-points it, and does not delete it** (§8.1, §2.6a). It becomes `log::pending()` and the *completion branch* deletes it when it converts the wake — one row this branch hands **back** rather than taking |
+| the pre-`hlt` condition `log_ring::has_pending` (`:523`) | **L3 deletes it** (§8.1, §2.6a), with nothing in its place: the commit posts `klogd`'s wake, so the doorbell and Invariant T refuse the halt. C9 finds two conditions in that arm, both its own |
 | `log_file.rs::SINK` from its §9 lock table and its §19 ledger | L6. **Not "conditionally"** — its §9 leaves the row hanging on §11.4's choice; after L6 there is no `SINK`, no `Lock` and no fifth row, and its lock table converts four statics |
 | `MAX_BLOCKED_NANOS` (`log_file.rs:190`) and `LOG_DEFERRAL_CEILING_NS` from its §3.2's classification sweep | L6, with the file they are in — and **before its C1 runs**, so C1 has nothing to classify and its count of 41 production durations drops. C1 re-derives it rather than taking a number from here |
 | `idle_loop_is_the_declared_body` | L6, and amended twice afterwards (§9.5) |
@@ -2211,12 +2287,14 @@ six-manifest table that follows from it.
 One table, so an implementer never reaches for something that is not there and a
 reviewer can check the conversions off afterwards. **None of these is optional
 scope this branch declined — each is a type or a mechanism the completion branch
-introduces, and the ruled order puts that branch second.**
+introduces, and the ruled order puts that branch second.** The one exception is
+the struck row: it was in the tree the whole time, and it is kept visible because
+a spec that quietly drops a wrong claim teaches the next reader nothing.
 
 | primitive | what this branch does instead | what the completion branch converts |
 |---|---|---|
-| the completion core (`Record`, `Inbox`, `arm`, `wait`, `post`) | §2.6a's fallback: `emit` stores a relaxed flag, `drain_irqs` posts through today's `waitqs`, `klogd` parks with `prepare_wait`/`block_on` (`scheduler.rs:170`, `:181`) | its C2+C3: the park becomes an `Inbox` park, the post becomes `commit_and_signal`, and §2.5's W3 becomes real and owed |
-| the lock-free single-waiter post | as above, plus **one surviving pre-`hlt` condition**, `log::pending()` (§8.1) | the condition is deleted at the conversion, because a posted `klogd` is runnable at the commit and Invariant T covers the halt |
+| the completion core (`Record`, `Inbox`, `arm`, `wait`, `post`) | the wake needs none of it: `emit` posts through `toyos_sched::waitq::wake_direct` and `klogd` parks with `prepare_wait`/`block_on` (`scheduler.rs:170`, `:181`) on a park-lot bucket (§2.6a) | **nothing.** C2+C3 may re-express the park as an `Inbox` park if that unifies something on its own side; it converts no log code, inherits no obligation, and W3 (§2.5) is already paid here |
+| ~~the lock-free single-waiter post~~ | **it was never missing** — `wake_direct` (`waitq.rs:236`) is exactly it, and the row is kept struck rather than deleted so the next reader does not re-derive the fallback | nothing |
 | a userland readiness source for `SYS_LOG_READ` | `Source::Log`, a sixth `io_uring::Source` with the sixth per-source `IO_URING_WATCHERS` static (§3.2) | its C3 folds all six into one watch list and its §19 deletes the statics together |
 | kernel threads (its C6) | **L3 builds the machinery for one** (§4.3): trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate | C6 spawns `usbd` and `iod` on it, adds their predicate rows, and does the `KernelPayload.address_space` retype |
 | `Parkable` (its C5) | nothing needs one: no path this branch adds takes a sleep lock, and §7's diagnostics take no `Lock` at all after L3 | the token arrives and every one of §7's contexts still lacks it, so a diagnostic that blocks stays untypeable — this branch does not weaken that |
@@ -2389,11 +2467,9 @@ Recorded because each is attractive and the next reader will re-derive it.
    under TCG. §1.4.
 6. **A per-record wake with no fence, backstopped by a bounded park.** That is a
    timer hiding a lost wake, which the completion architecture forbids by name.
-   §2.5 W3 pays the fence and loom proves it is needed. **§2.6a's fallback is not
-   this and the difference is the whole of why it is acceptable**: it has no
-   per-record wake to lose, because `drain_irqs` re-evaluates the predicate on
-   every scheduler pass, so a wake that did not happen is taken on the next pass
-   rather than by a deadline nobody can justify. Nothing in it is a timer.
+   §2.6a is a per-record wake **with** both fences, W3's model is what proves
+   they are needed, and nothing in it is backstopped: no deadline, no pre-`hlt`
+   condition, no pass that re-evaluates a predicate. §2.5.
 7. **A harness-side splice *repair*.** The issue itself shows why: the second
    recorded occurrence had a *userland* intruder that `is_kernel_line` cannot
    identify, and the capture ended inside the split line, so no reassembly on the
@@ -2403,7 +2479,10 @@ Recorded because each is attractive and the next reader will re-derive it.
    it teeth.
 9. **`preempt::disable()` around the reservation instead of the flags bracket.**
    It buys the same property and costs `lock add` + `lock sub` per record, which
-   is two locked RMWs where §1.4 prices one at 350 ms of boot. §2.3a.
+   is two locked RMWs where §1.4 prices one at 350 ms of boot. §2.3a. **The same
+   choice for the same reason on the wake post** (§2.6a), where `preempt_off`
+   would additionally put `enable`'s `need_resched` poll — a scheduling pass —
+   inside `emit`.
 10. **No bracket at all, on the ground that `log!` mostly runs with `IF` already
     clear.** True of every syscall and every IRQ handler, and false of a kernel
     thread at preempt depth 0 — of which L3 adds the first, `klogd` itself, and
@@ -2412,8 +2491,8 @@ Recorded because each is attractive and the next reader will re-derive it.
 11. **Making `emit` post a completion through the completion core's ordinary
     path.** It walks a list under the subject's leaf lock, which `emit` may not
     take and which deadlocks the first time anything on that lock's path logs.
-    §2.6a states the narrower thing the log source must be instead — and, under
-    the ruled order, the fallback L3 builds before that narrower thing exists.
+    The narrower thing §2.6a takes instead is `wake_direct`, which the scheduler
+    has had all along.
 8. **Converting all 654 `log!` sites to a finer level set.** A level with no
    reader is a field built for a plan; §2.1's three variants each have callers
    today.
