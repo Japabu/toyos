@@ -232,10 +232,12 @@ pub enum KObjectRef {
     Device(Arc<DeviceClaim>),
     Process(Arc<ProcessObject>),  Thread(Arc<ThreadObject>),
     SysCap(Arc<SysCap>),
+    Console(Arc<ConsoleObject>),
 }
 ```
 
-Thirteen variants. `ListenerObject` from that spec is replaced by the
+Fourteen variants — the thirteenth was thirteen until §1.5 found that
+`Descriptor::SerialConsole` has no home among them. `ListenerObject` from that spec is replaced by the
 `Acceptor`/`Connector` pair, because a listener that holds a *name* is the
 object this whole architecture exists to delete.
 
@@ -261,6 +263,63 @@ Rights::DEVICE     // on a SysCap: SYS_DEVICE_CLAIM
 `Command` duplicates a namespace handle to hand a child the same one. A
 `DeviceClaim` is created **without** `DUP`, which is what keeps at most one
 handle to a claim in existence and makes endowment of a claim a move.
+
+### 1.5 Every `Descriptor` kind, and the object it becomes
+
+Written out because §1.2 and §1.3 between them do not cover the table this
+replaces, and two of its fifteen kinds have no home in the variant set above.
+Added 2026-08-09 by the implementing agent, against `kernel/src/fd.rs:68-103`.
+
+| `Descriptor` kind | becomes |
+|---|---|
+| `File(OpenFile)` | `File` |
+| `PipeRead`, `PipeWrite` | `PipeRead` / `PipeWrite` |
+| `TtyRead`, `TtyWrite` | the same two, carrying a mark — below |
+| `Socket { rx, tx, peer }` | `Connection` |
+| `Keyboard`, `Mouse`, `Framebuffer`, `Nic`, `Hda`, `VirtioSound` | `Device`, one class each |
+| `Listener(ListenerRef)` | transitional in chunk 2; `Acceptor`/`Connector` in chunk 3 |
+| `IoUring(RingRef)` | `IoUring` |
+| `SerialConsole` | **`Console`, a fourteenth variant** — below |
+
+**`SerialConsole` needs its own variant and the thirteen do not contain one.**
+It is what `spawn_kernel` puts in `/bin/init`'s three stdio slots, so it
+survives everything this branch does. It is not a `DeviceClaim`: a claim's whole
+content is exclusivity, and every kernel-spawned process holds one of these at
+once. It is not a `File`: it has no path, no cursor and no backing. So
+`Console(Arc<ConsoleObject>)` is the fourteenth variant, `READ|WRITE|DUP|
+TRANSFER|WAIT`, and there is exactly one of them for the machine.
+
+**A tty mark is per *end*, not per pipe.** `SYS_MARK_TTY` converts one
+descriptor today (`PipeRead` → `TtyRead`), and `duplicate` carries the mark, so
+an `AtomicBool` on `PipeReadEnd`/`PipeWriteEnd` is the faithful mapping and a
+flag on the shared `PipeShared` is not. Its one caller marks both ends anyway
+(`rust/library/std/src/sys/process/toyos.rs:212-213`), so the two designs are
+indistinguishable in practice — which is the reason to pick the one that says
+what it means rather than the one that happens to work. `FileType::Tty` is then
+read off the end rather than off a variant, and `mark_tty`'s `table.update`
+disappears with the two variants it existed to swap between.
+
+**`Hda` and `VirtioSound` carry `info_read: bool` per descriptor**; it moves
+onto the claim, which is sound only because a claim admits one handle. That is
+`DeviceClaim`'s no-`DUP` rule doing a second job, and it is worth noticing
+rather than relying on silently.
+
+### 1.6 Why a packed pair of handles cannot be read as an error
+
+`SYS_PORT_CREATE` answers `(acceptor << 32) | connector` (§3.1), and
+`SyscallError` encodes as `u64::MAX - code` for `code < 256` — the top 256
+values of the range. A packed pair could therefore be read as an error if both
+handles could reach `0xFFFF_FFFF`.
+
+They cannot, and the reason is [`RawHandle`]'s slot retirement: a slot at
+`MAX_GENERATION` is retired rather than reissued, so the largest handle any
+table hands out is `0xFFFF_EFFF` and the largest pair is
+`0xFFFF_EFFF_FFFF_EFFF`, four billion below the error range. **The retirement
+rule and the packing are therefore load-bearing for each other**, which neither
+of them says, and a future handle encoding that wraps generations instead would
+make `SYS_PORT_CREATE` occasionally return `Unknown`.
+
+[`RawHandle`]: ../toyos-abi/src/handle.rs
 
 ---
 
@@ -350,7 +409,7 @@ machine-wide `surface` port would let any process holding the connector talk to
 whichever terminal happened to take the acceptor. So `provides` is declared, and
 what it declares is that the program calls `SYS_PORT_CREATE` itself and hands the
 connector down (§4.4). This is what makes `surface` nameable in a `receives` list
-at all — without the distinction, §8.1's `every_receives_names_a_serves` would
+at all — without the distinction, a gate that knew only `serves` would
 force `terminal` to `serves = ["surface"]` and §4.4's per-instance port would be
 a lie the manifest tells.
 
@@ -1443,7 +1502,7 @@ paths — and gains the fourth: the endowment vector.
 `src/build.rs:980-997` reads `tests/toyos-rust-tests/src/bin/` and pushes every
 built binary straight into the initrd; the `[programs]` map in a test
 `system.toml` names `soundd`, `test-runner`, `toybox` and nothing else. So the
-manifest cannot declare their `receives`, §8.1's `every_receives_names_a_serves`
+manifest cannot declare their `receives`, §8.1's `every_receives_names_a_provider`
 cannot see them, and the launcher cannot start them — `Command::new` from
 test-runner resolves no `[programs]` key and takes the direct `SYS_SPAWN` path
 (§4.5). Left unstated, the implementing agent discovers this at chunk 8 with
@@ -1465,7 +1524,7 @@ three are deliberate:
 - **§8.3's `endowment_denied` is where least authority *is* asserted**, and it
   works because that binary builds its own two namespaces and spawns itself —
   it does not rely on what test-runner gave it.
-- **`test-runner`'s row in a config is checkable**, so `every_receives_names_a_serves`
+- **`test-runner`'s row in a config is checkable**, so `every_receives_names_a_provider`
   still has teeth over it: a config whose test-runner receives `compositor` while
   no program serves one is refused at build time, which is exactly the class of
   mistake a hand-edited test config makes.
@@ -1757,12 +1816,52 @@ worktree shares and none of them is optional:
   build, under the same lock and with the same unconditional restore. Say which
   one was used in the commit message.
 
+**Done, 2026-08-09, and it is the fallback that shipped.** `paths` does apply to
+path dependencies — measured, the marker reached the sysroot — so the question
+the test was written to answer is settled and the answer is yes. It was not
+taken. Overriding `toyos` alters `toyos-abi`'s resolved source, and cargo says
+so in fifteen lines on every toolchain build, ending "in the future this message
+will become a hard error". The manifest edit produces none of that, and the
+crash residue is the same either way: a killed run leaves the submodule dirty
+under both, and both self-heal because the rewrite matches whatever path is
+there rather than one expected spelling.
+
+The gate is stronger than the marker the chunk asked for. `assert_std_built_from`
+reads cargo's **dep-info** after every std build and refuses a sysroot naming any
+`toyos-abi/src` or `toyos/src` file outside the building worktree — the witness
+records what the builder intended, this reads what the compiler was handed, and
+the two disagreed for the whole life of the defect. Empty dep-info is a refusal
+too, so it cannot go vacuous if cargo moves the files.
+
 **Chunk 1 — object infrastructure, zero users. Green.**
 `kernel/src/object/{mod,handle,rights}.rs`, `toyos-abi/src/handle.rs`,
 `kernel/clippy.toml`'s `disallowed-methods` wall, the per-variant `LIVE_*`
 census, the deferred zero-handle queue and its three drain sites. `HandleTable`
 lives inside `ProcessData` alongside `FdTable`, empty. `retired_syscalls!` macro
 with the four existing gravestones moved into it. Boots; nothing uses any of it.
+
+**Done, 2026-08-09, with two deviations and one measurement the plan did not
+have.**
+
+- **There is no `kernel/clippy.toml`, because nothing in this repository runs
+  clippy** — not CI, not `cargo test`, not the build. A `clippy.toml` is a wall
+  with nothing behind it, which is the shape this project refuses. The wall is
+  `src/sourcegate.rs`, a scan in `cargo test --lib` over `kernel/src` and
+  `toyos-sched/src`, whose two `mem::forget` exceptions carry a **count** — so
+  an added `forget` beside a permitted one is a red, and a permitted one that
+  disappears is a red too.
+- **There is no `kernel/src/object/rights.rs`.** `Rights` has to live in
+  `toyos-abi` for the ABI to name it, so a kernel module for it would re-export
+  and nothing else.
+- **The zero-handle drain is guarded by a plain atomic load before the lock.**
+  It runs at every syscall exit and `Lock::lock` is a `fetch_add` — the one
+  operation TCG cannot emit inline, at a few hundred a boot of which one cost
+  350 ms (known-issues §8). The flag is written under the lock at both ends, so
+  it never reads empty over a queued object.
+
+`toyos-abi` has host tests now and is in no list of host-test crates; chunk 9
+adds it to the root `CLAUDE.md`. Its `ring` tests were already there and already
+unrun.
 
 **Chunk 2 — `Fd` → `Handle`. Green, and this is the big mechanical one.**
 `pipe.rs` → `object/pipe.rs` with `PipeShared` and two end types; the remaining
