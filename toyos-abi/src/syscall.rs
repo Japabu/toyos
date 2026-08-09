@@ -101,6 +101,15 @@ pub const SYS_DEVICE_REG_READ: u64 = 97;
 /// Write one register of a claimed device. See [`device_reg_write`].
 pub const SYS_DEVICE_REG_WRITE: u64 = 98;
 
+/// Read this process's endowment table back: the `(label, handle)` pairs its
+/// parent gave it at spawn, as an `[EndowEntry]` count followed by the entries
+/// and the label blob they index into. `buf_len == 0` asks how many bytes the
+/// answer needs. See [`endowments`].
+///
+/// The handles themselves are in the table whether or not this is ever called —
+/// the labels are *names* for them, not the authority.
+pub const SYS_ENDOWMENTS: u64 = 99;
+
 /// Make a port: one [`Acceptor`] for the server, one `Connector` for its
 /// clients, packed `(acceptor << 32) | connector`. See [`port_create`].
 ///
@@ -122,6 +131,24 @@ pub const SYS_NAMESPACE_BUILD: u64 = 101;
 /// no other place to ask, and a name it was not given resolves to nothing.
 pub const SYS_NAMESPACE_OPEN: u64 = 102;
 
+// 103–110 are `SYS_HANDLE_SEND`/`RECV`, `SYS_SHM_CREATE`/`MAP`/`UNMAP` and
+// `SYS_PROCESS_WAIT`/`KILL`/`OPEN` — the handle-transfer, shared-memory and
+// process-object chunks. Left as gaps until those chunks add both the number
+// and its implementation, so no constant here names a syscall the kernel does
+// not answer.
+
+/// Mint a device claim for a class, gated by [`Rights::DEVICE`] on a `SysCap`.
+/// Only `/bin/init` holds such a cap, so the set of processes that can ever
+/// claim a device is exactly what init endowed. See [`device_claim`].
+///
+/// [`Rights::DEVICE`]: crate::handle::Rights::DEVICE
+pub const SYS_DEVICE_CLAIM: u64 = 111;
+/// Enter the real-time scheduling band, gated by [`Rights::RT`] on a `SysCap`.
+/// A claim is not a privilege; this is. See [`rt_enter`].
+///
+/// [`Rights::RT`]: crate::handle::Rights::RT
+pub const SYS_RT_ENTER: u64 = 112;
+
 pub const WNOHANG: u64 = 1;
 
 /// Arguments for the `SYS_SPAWN` syscall, passed as a single pointer.
@@ -135,6 +162,31 @@ pub struct SpawnArgs {
     pub env_ptr: u64,
     pub env_len: u64,
 }
+
+/// One `(label, handle)` pair of a process's endowment table.
+///
+/// `label_off`/`label_len` index the label blob that travels beside the
+/// entries — in [`SpawnArgs`] going in, in [`endowments`]'s answer coming back.
+/// The label is a *local name* in one process's own table and buys nothing to
+/// guess: a name not in your table resolves to nothing.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EndowEntry {
+    pub label_off: u32,
+    pub label_len: u32,
+    pub handle: RawHandle,
+    /// Named, so nothing leaks kernel stack into it.
+    pub _pad: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<EndowEntry>() == 16);
+
+/// Endowed `(label, handle)` pairs one spawn may carry. Policy on the
+/// primitive, refused by name, never truncated — the widest manifest row plus
+/// stdio.
+pub const MAX_ENDOWMENTS: usize = 32;
+/// Bytes of label blob one endowment table may carry.
+pub const MAX_LABELS_LEN: usize = 4096;
 
 use crate::{Pid, RawHandle};
 
@@ -478,6 +530,16 @@ pub unsafe fn spawn(args: &SpawnArgs) -> Result<Pid, SyscallError> {
         .map(|pid| Pid(pid as u32))
 }
 
+/// Read this process's endowment table into `buf`: an `[EndowEntry]` count and
+/// entries followed by the label blob. Returns the bytes written, or — when
+/// `buf` is empty — the bytes the answer needs.
+///
+/// The one place a name is resolved to a handle at all: there is no global
+/// registry, so a process learns what it holds only from its own table.
+pub fn endowments(buf: &mut [u8]) -> usize {
+    syscall(SYS_ENDOWMENTS, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as usize
+}
+
 /// Wait for process to exit. Returns exit code (blocking).
 pub fn waitpid(pid: Pid) -> u64 {
     syscall(SYS_WAITPID, pid.0 as u64, 0, 0, 0)
@@ -683,6 +745,29 @@ pub enum DeviceType {
 /// Claim exclusive access to a device.
 pub fn open_device(device: DeviceType) -> Result<RawHandle, SyscallError> {
     check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
+}
+
+/// Mint a device claim for `class`, presenting a `SysCap` handle that carries
+/// [`Rights::DEVICE`]. `NotFound` for a class no driver registered — init
+/// endows what exists and logs what it did not.
+///
+/// The claim comes back **without** [`Rights::DUP`], so it can only be moved,
+/// which is what makes endowing one to a child a provable hand-off.
+///
+/// [`Rights::DEVICE`]: crate::handle::Rights::DEVICE
+/// [`Rights::DUP`]: crate::handle::Rights::DUP
+pub fn device_claim(syscap: RawHandle, class: DeviceType) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_DEVICE_CLAIM, syscap.0 as u64, class as u64, 0, 0))
+        .map(|v| RawHandle(v as u32))
+}
+
+/// Enter the real-time scheduling band, presenting a `SysCap` handle that
+/// carries [`Rights::RT`]. The privilege a device claim was never enough to
+/// confer.
+///
+/// [`Rights::RT`]: crate::handle::Rights::RT
+pub fn rt_enter(syscap: RawHandle) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_RT_ENTER, syscap.0 as u64, 0, 0, 0))
 }
 
 /// How wide a register access is.
