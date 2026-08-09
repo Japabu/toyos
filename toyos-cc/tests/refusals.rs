@@ -71,6 +71,15 @@ fn a_pragma_with_no_effect_here_still_compiles() {
     accepts("#pragma push_macro(\"X\")\n#pragma pop_macro(\"X\")\nint a;");
 }
 
+/// GNU's `#define f(x...)` bound `x` to the first argument and dropped every
+/// argument after it. That is the same silence, one directive along.
+#[test]
+fn a_named_variadic_macro_parameter_is_refused_by_name() {
+    refuses("#define F(y...) y\nint a = F(1, 2);", "named variadic parameter");
+    accepts("#define G(y, ...) y\nint a = G(1, 2);");
+    accepts("#define H(...) 0\nint a = H(1, 2);");
+}
+
 /// C99 6.10.6 requires this one, and it is the reason the refusal is a list of
 /// names rather than a default.
 #[test]

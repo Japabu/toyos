@@ -686,6 +686,21 @@ impl Preprocessor {
                     break;
                 }
                 if !param.is_empty() {
+                    let mut after = chars.clone();
+                    while after.peek().is_some_and(|c| c.is_ascii_whitespace()) { after.next(); }
+                    if after.peek() == Some(&'.') {
+                        let ln = self.file_stack.last().map(|(_,l,_)| *l).unwrap_or(0);
+                        panic!(
+                            "{}: #define {name}({param}...) is GNU's named variadic parameter, \
+                             which toyos-cc does not implement. It would bind {param} to the \
+                             first argument and drop every argument after it with no diagnostic. \
+                             Use `...` and `__VA_ARGS__`.",
+                            self.file_stack.last().map_or_else(
+                                || format!("<line {ln}>"),
+                                |(f, l, _)| format!("{f}:{l}"),
+                            ),
+                        );
+                    }
                     params.push(param);
                 }
                 while chars.peek().is_some_and(|c| c.is_ascii_whitespace()) { chars.next(); }

@@ -448,8 +448,7 @@ and only its hash is loosened.
 
 ## 5. What the harness does and does not do
 
-`c-test-compile-failure-is-skipped.md` is **half closed already** and the file
-does not say so: `check_c_build_fixture` (`tests/toyos.rs:907`) asserts
+The C-test-visibility issue file is **half closed already** and does not say so: `check_c_build_fixture` (`tests/toyos.rs:907`) asserts
 `C_DOES_NOT_BUILD` in both directions and reds the run when the set moves. What
 is left:
 
@@ -710,8 +709,25 @@ Declared failures after that: `02`, `05`, `24`, as spacing against every
 reference preprocessor and inert for one feeding our own lexer. `11.expect` is
 **corrected**, not declined — it is our own file and it disagrees with the
 standard (§5.1). `12.S` is §6.1's ruling: refuse `params...` by name, declare
-`9999b`. Closes the rest of
-`specs/issues/build/c-test-compile-failure-is-skipped.md`.
+`9999b`.
+
+**One thing the normalisation rule had to settle that §5.1 did not name.** Its
+three clauses decide `05` and `24` on a *leading* run against nothing, and
+`16` on a blank line that moved — but `18` has one *trailing* space its
+`.expect` does not, and BSD `diff -b` ignores that where the rule as stated
+would not. So the rule carries a fourth clause: trailing whitespace is dropped,
+because nothing downstream of a preprocessor can see it. With it: 20 pass and 5
+fail before `11.expect` is corrected, which is §5.1's number, and 21 and 4
+after.
+
+**And the gate drives the binary rather than the library**, which the chunk
+list did not intend and case `16` requires: the diagnostics that must be
+compared alongside the output are `eprintln!` on the process's own stderr, and
+capturing those in-process needs a file descriptor the library does not offer.
+Still host-only, still under a second, and it is what makes "the source is
+named as its `.expect` names it" expressible — the binary runs with the corpus
+directory as its cwd. Closes the rest of the C-test-visibility issue file, which T5 had already
+reduced to this half.
 
 **T7 — measure, then declare.**
 After T2: what does `79_vla_continue` do — build and print `OK`, build and print
