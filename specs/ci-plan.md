@@ -1144,10 +1144,15 @@ host        every host crate, cargo test --lib, sshd          (host-tests.yml)
 abi-split   the ABI-first rule                                (landing.yml)
 gate-stage  whether the guest gate is still owed              (landing.yml)
 tcg         one guest boot, emulated, on x86_64               (ci.yml)
+guest-suite the twelve KVM shards behind one name             (ci.yml)
 ```
 
-`guest-suite` — the twelve KVM shards behind one name — runs on every pull
-request and is **not** required.
+`guest-suite` was promoted to a required check on 2026-08-09, on the §10.4
+trigger firing after three consecutive green `ci` runs on `main`
+(`855e722`, `19c761e`, `73f4758`). The owner ruled the promotion the moment the
+trigger fired. The caution §10.4 records still stands — three greens is
+reachable on luck as well as on state — so a `guest-suite` red on a PR is read
+against §9.2 before it is believed, not merged around.
 
 **Stage 2, on the trigger.** Add `guest-suite` to the required checks and set
 `GUEST_GATE: required` in `.github/workflows/landing.yml`.
