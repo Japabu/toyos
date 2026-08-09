@@ -110,7 +110,15 @@ impl Drop for HandleEntry {
             );
             // Never inline: see `object::drain_zero_handles`. This is the one
             // statement that makes "a hook cannot run under a lock" structural.
-            super::enqueue_zero_handles(self.object.clone());
+            //
+            // Only for a type that *has* a hook. An object with none has
+            // nothing to run with nothing held, and queueing it would move its
+            // destructor off this stack onto whichever CPU drains next — a
+            // killed process's file flush landed on a 16 KiB idle stack that
+            // way and wrote through the guard page below it.
+            if self.object.defers_release() {
+                super::enqueue_zero_handles(self.object.clone());
+            }
         }
     }
 }
@@ -174,8 +182,11 @@ impl HandleTable {
         entry: HandleEntry,
     ) -> Result<(RawHandle, Option<HandleEntry>), HandleError> {
         let slot_index = slot as usize;
+        // `MAX_HANDLES` **is** the slot range, so a slot past the end is the
+        // table's cap rather than a malformed argument, and the caller sees the
+        // same `ResourceExhausted` the allocating path gives it.
         if slot_index >= MAX_HANDLES {
-            return Err(HandleError::BadHandle);
+            return Err(HandleError::TableFull);
         }
         while self.slots.len() <= slot_index {
             self.free.push(self.slots.len() as u16);
@@ -218,8 +229,26 @@ impl HandleTable {
             .ok_or(HandleError::WrongType { held: entry.object.kind(), wanted: T::NAME })
     }
 
-    /// The untyped one, for close, dup, transfer and stat. Clones the object
-    /// reference out; still no borrow escapes.
+    /// The borrowing accessor, for a call that runs to completion under the
+    /// guard it was resolved through.
+    ///
+    /// `read` and `write` are that call, and they are the hottest pair in the
+    /// kernel: cloning the `Arc` out would put one atomic read-modify-write on
+    /// each of them, which is the operation TCG runs a translation block
+    /// exclusively for
+    /// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Nothing escapes —
+    /// the lifetime is `&self`'s, so the compiler refuses a borrow that
+    /// outlives the table.
+    pub fn get_ref(&self, h: RawHandle, need: Rights) -> Result<&KObjectRef, HandleError> {
+        let entry = self.entry_of(h)?;
+        if !entry.rights.contains(need) {
+            return Err(HandleError::Rights { held: entry.rights, needed: need });
+        }
+        Ok(&entry.object)
+    }
+
+    /// The untyped owning one, for close, dup, transfer and stat. Clones the
+    /// object reference out; still no borrow escapes.
     pub fn get_any(
         &self,
         h: RawHandle,
@@ -239,6 +268,20 @@ impl HandleTable {
     ) -> Result<RawHandle, HandleError> {
         let entry = self.entry_of(h)?.duplicate(rights)?;
         self.install(entry)
+    }
+
+    /// What a handle carries, for a caller about to duplicate it unchanged.
+    pub fn rights_of(&self, h: RawHandle) -> Result<Rights, HandleError> {
+        Ok(self.entry_of(h)?.rights)
+    }
+
+    /// A duplicate for *another* table — a child's, built at spawn.
+    pub fn duplicate_entry(
+        &self,
+        h: RawHandle,
+        rights: Rights,
+    ) -> Result<HandleEntry, HandleError> {
+        self.entry_of(h)?.duplicate(rights)
     }
 
     /// Take a handle out of the table.

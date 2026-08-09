@@ -832,15 +832,19 @@ pub fn set_rt_priority(enable: bool) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_SET_RT_PRIORITY, enable as u64, 0, 0, 0))
 }
 
-/// Duplicate a file descriptor.
-pub fn dup(fd: RawHandle) -> Result<RawHandle, SyscallError> {
-    check(syscall(SYS_DUP, fd.0 as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
+/// A second handle to the same object.
+pub fn dup(handle: RawHandle) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_DUP, handle.0 as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
-/// Duplicate a file descriptor to a specific fd number.
-/// If `new_fd` is already open, it is closed first.
-pub fn dup2(old_fd: RawHandle, new_fd: RawHandle) -> Result<RawHandle, SyscallError> {
-    check(syscall(SYS_DUP2, old_fd.0 as u64, new_fd.0 as u64, 0, 0)).map(|v| RawHandle(v as u32))
+/// A second handle to the same object, at a **slot** the caller picks.
+///
+/// A slot and not a handle: a handle carries a generation the caller has no
+/// business choosing, and the one this hands back is the slot's own — so the
+/// answer is not the number that went in. Whatever was at that slot is closed
+/// first.
+pub fn dup2(handle: RawHandle, slot: u16) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_DUP2, handle.0 as u64, slot as u64, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Get the current process ID.

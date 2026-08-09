@@ -45,7 +45,7 @@ unsafe impl UserSafe for [u32; 2] {}
 unsafe impl UserSafe for [u64; 2] {}
 
 // Kernel types.
-unsafe impl UserSafe for crate::fd::Stat {}
+unsafe impl UserSafe for crate::object::ops::Stat {}
 
 // ABI types.
 unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
@@ -205,7 +205,7 @@ impl<'a> SyscallContext<'a> {
 ///
 /// Read-only, and [`UserBytesMut`] is the other direction, because `&[u8]` and
 /// `&mut [u8]` told a syscall's two paths apart and a single type would not:
-/// `SYS_WRITE`'s buffer is the caller's to read and nothing below `fd::try_write`
+/// `SYS_WRITE`'s buffer is the caller's to read and nothing below `ops::try_write`
 /// has any business storing into it.
 pub struct UserBytes<'a> {
     kptr: *const u8,

@@ -54,7 +54,7 @@ mod irq_ring;
 mod trace;
 mod clock;
 mod rtc;
-mod fd;
+
 mod object;
 mod io_uring;
 mod pipe;
@@ -268,7 +268,7 @@ pub unsafe extern "sysv64" fn _start(_kernel_args: &KernelArgs) -> ! {
 }
 
 fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
-    let fb_info = fd::FramebufferInfo {
+    let fb_info = toyos_abi::FramebufferInfo {
         token: [info.tokens[0].raw(), info.tokens[1].raw()],
         cursor_token: info.cursor_token.raw(),
         width: info.width,

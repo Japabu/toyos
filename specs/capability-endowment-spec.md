@@ -531,11 +531,12 @@ site" defect this work exists to delete. There is no default:
 
 | call | needs on its handle |
 |---|---|
-| `SYS_READ`, `SYS_READ_NONBLOCK`, `SYS_SEEK`, `SYS_FSTAT` | `Rights::READ` |
+| `SYS_READ`, `SYS_READ_NONBLOCK`, `SYS_SEEK` | `Rights::READ` |
 | `SYS_WRITE`, `SYS_WRITE_NONBLOCK`, `SYS_FSYNC`, `SYS_FTRUNCATE` | `Rights::WRITE` |
 | `SYS_CLOSE` | nothing — dropping a handle is not an operation on the object |
+| `SYS_FSTAT` | nothing — corrected below |
 | `SYS_OPEN` | — (produces a handle; the mount's `UserAccess` is the gate, unchanged) |
-| `SYS_MARK_TTY` | `Rights::WRITE` |
+| `SYS_MARK_TTY` | nothing — corrected below |
 | `SYS_PIPE_MAP` | `Rights::MAP` |
 | `SYS_ACCEPT` | `Rights::READ` on the `Acceptor` — accepting is reading the queue, and a `WAIT`-only handle is the io_uring watch |
 | `SYS_IO_URING_SETUP` | — (produces a handle) |
@@ -543,6 +544,23 @@ site" defect this work exists to delete. There is no default:
 | `SYS_HANDLE_DUP`, `SYS_HANDLE_DUP_AT` | `Rights::DUP`, and the requested set must be a subset of the source's |
 | `SYS_PROCESS_STATS` | `Rights::READ` on the `Process` |
 | the nine device calls (§3.3) | `Rights::WRITE` on the `DeviceClaim` for the seven that write; `Rights::READ` for `SYS_NIC_RX_POLL` and `SYS_DEVICE_REG_READ` |
+
+**Two rows above said `READ` and `WRITE` and were wrong against the tree.**
+Corrected 2026-08-09 by the implementing agent, in chunk 2, with the call sites
+that disprove them:
+
+- **`SYS_FSTAT` requires nothing.** It answers what kind of thing a handle names
+  and how big it is; it moves no content. `userland/libc/src/stdio.rs:174`
+  `fstat`s slots 1 and 2 to decide line buffering and `posix_io.rs:264`'s
+  `isatty` does the same, and both are write ends with no `READ`. A right that
+  refuses `isatty(1)` is not a right.
+- **`SYS_MARK_TTY` requires nothing.** Its one caller
+  (`rust/library/std/src/sys/process/toyos.rs:212-213`) marks *both* ends of a
+  pair, and neither end carries the other's right, so any single right refuses
+  one of the two calls. The mark is a statement about the end by whoever created
+  the pipe, not an operation on what flows through it.
+
+Both are the same shape as `SYS_CLOSE`'s row, which the table already had.
 
 ### 3.2 Retired — 13 numbers, never reused
 
@@ -600,6 +618,15 @@ Six change shape as well:
   **`SYS_DUP2`(74)** → `SYS_HANDLE_DUP_AT(h, slot, rights)`. Both keep their
   numbers: this is the same operation with the rights argument the capability
   model requires, not a different one.
+
+  **`slot` is a `u16` and not a `RawHandle`, and the answer is not the number
+  that went in.** A handle carries a generation the caller has no business
+  choosing, and the handle this returns carries the slot's own — so
+  `dup2(x, 1)` answers `1` only while slot 1 has never been closed. That breaks
+  POSIX's "returns `newfd`" for a caller that closes first, which
+  `userland/libc` says out loud at its `dup2` and nothing in the tree does:
+  `grep -rn dup2` over `tests/testcases/` is empty and the only in-tree callers
+  are libc's shim and two abuse tests.
 - **`SYS_ACCEPT`(86)** takes an `Acceptor` handle and returns **one** handle.
   Today it packs `(client_pid << 32) | fd`. The pid goes: peer identity is not
   the kernel's to assert, and a server that wants to name its client reads it out
@@ -1873,17 +1900,53 @@ what makes the mio waker's fallible `pipe()` edit land in the same chunk. std's
 `Fd`→`Handle` and the mio/socket2 fork edits land here. Bad-handle policy is
 log-and-error for now.
 
-**Split in two on 2026-08-09, and the first half is done.** The chunk has a
+**Split in two on 2026-08-09, and both halves are done.** The chunk has a
 seam in it the plan did not name: the `Fd` -> `RawHandle` rename touches the
 ABI, the SDK, userland, `userland/libc`, the test binaries and all three
 repositories, and **the kernel never named `toyos_abi::Fd` at all**. So the
 rename is green on its own with the kernel untouched, and it landed that way —
 `rust` @ 4288885f, `mio` @ 2517dfaf, `socket2` @ 2ad5af0d, 298 of 298.
 
-What is left of chunk 2 is the whole kernel half: `FdTable` and `Descriptor`
-become `HandleTable` and `KObjectRef`, fd numbers become slot/generation
-encodings, `io_uring::Source` keys become `Koid`s. Two things the first half
-already knows about it:
+**The kernel half is done, 2026-08-09, 298 of 298 and gate A fast green on all
+four configs.** `kernel/src/fd.rs` is deleted; `FdTable`/`Descriptor` are
+`HandleTable`/`KObjectRef` with nine variants (six `deferred`, three
+`immediate` — below); `object/ops.rs` is the dispatch, exhaustive with no `_`
+arms. Five things it found that the plan did not have:
+
+- **A row says whether its last handle is an event, and the queue is only for
+  the ones where it is.** `HandleEntry::drop` enqueued *every* object, so the
+  last `Arc` — and therefore the destructor — moved off the dropping thread's
+  stack onto whichever CPU drained next. A killed process's dirty file was
+  flushed from `drain_zero_handles` in the idle loop, and the VFS write path
+  wrote through the guard page below a **16 KiB** per-CPU idle stack
+  (`IDLE_STACK_SIZE`, against 128 KiB for a task): `fd_lifetime` panicked with
+  `write unmapped address`, took its shared boot down and cost 147 collateral
+  reds. `kobject!` rows are now `deferred` or `immediate`; an `immediate` row
+  gets its empty `ZeroHandles` impl **from the macro**, so a hand-written hook
+  beside one is a coherence error and "a hook that never runs" is
+  unrepresentable. `ZeroHandles::on_zero_handles` lost its default body for the
+  same reason from the other side.
+- **`HandleTable::get_ref` is a borrowing accessor beside the owning one.**
+  §1.1 says every accessor hands back an owned `Arc`; `read` and `write` run to
+  completion under the guard they resolved through — exactly where the
+  descriptor dispatch ran — and cloning an `Arc` there would put one atomic
+  read-modify-write on the two hottest syscalls in the kernel. Nothing escapes:
+  the lifetime is `&self`'s.
+- **`io_uring::Source` keeps its `PipeId` and `ListenerId`.** The chunk line
+  said the keys become `Koid`s; what was actually keyed by an fd number is
+  `PendingPoll`, and that is a `RawHandle` now. A `PipeId` is the *kernel's*
+  identity for the ring and not a number a process chose, and two
+  `PipeReadEnd`s can name one pipe while a `Koid` names neither — so the move
+  belongs with the objects that replace them, in chunks 3 and 6.
+- **A file's `writable` field is gone; the right carries it.** `SYS_OPEN`
+  installs without `Rights::WRITE` when the flags do not ask for it, and the
+  refusal is the same `PermissionDenied` the field produced.
+- **Two handles to one file share the cursor** — `capability-handles-spec.md`
+  §6.8's declared semantic change, which is also what Unix `dup` does. The one
+  in-tree caller that could have cared is `fd_lifetime`, which reads through the
+  survivor after a `seek`, and it passes.
+
+Two things the first half already knew about it:
 
 - **§6.6's `AsRawFd` -> `AsRawHandle` row is not done and should not be.**
   `std::os::fd::RawFd` is cross-platform and is what `socket2` implements

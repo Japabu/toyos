@@ -19,7 +19,7 @@ use core::sync::atomic::Ordering;
 
 use toyos_sched::task::WaitClass;
 
-use crate::fd;
+use crate::object::{ops, KObjectRef};
 use crate::id_map::{IdKey, IdMap};
 use crate::listener::ListenerId;
 use crate::pipe::{self, PipeId};
@@ -35,6 +35,7 @@ use toyos_abi::io_uring::{
     IoUringCqe, IoUringParams, IoUringRingHeader, IoUringSqe,
     SQ_RING_OFF, CQ_RING_OFF, SQES_OFF,
 };
+use toyos_abi::handle::{RawHandle, Rights};
 use toyos_abi::syscall::SyscallError;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -56,7 +57,7 @@ impl IdKey for RingId {
 
 /// An owned reference to a ring. Creation and `Clone` bump the ring's
 /// reference count, `Drop` tears it down at zero — the `PipeReader` shape.
-/// Held by `Descriptor::IoUring`, so a `dup`ped ring fd stays usable after the
+/// Held by an `IoUringObject`, so a `dup`ped ring handle stays usable after the
 /// original is closed instead of naming a destroyed instance.
 pub struct RingRef(RingId);
 
@@ -184,7 +185,10 @@ impl Drop for WatcherGuard {
 
 struct PendingPoll {
     user_data: u64,
-    fd_num: u32,
+    /// The handle the poll was submitted against, and the dedup key. A handle
+    /// is a slot in *this* process's table, so it is only ever compared with
+    /// another poll on the same ring — which is the whole of what dedup needs.
+    handle: RawHandle,
     flags: PollFlags,
     read_source: Option<Source>,
     write_source: Option<Source>,
@@ -502,20 +506,21 @@ fn process_sqe(ring_id: RingId, sqe: &IoUringSqe) {
 }
 
 fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
-    let fd_num = sqe.fd.0;
+    let handle = sqe.fd;
     let flags = PollFlags::from_raw(sqe.op_flags);
     let user_data = sqe.user_data;
 
-    // Check readiness first (use fd_owner_data — fds belong to the process, not the thread)
+    // Readiness first, on the process's table rather than the thread's: a ring
+    // is process-wide. A handle without `WAIT` is not watchable, and answers as
+    // if it were not there.
     let (ready, read_source, write_source) = process::with_fd_owner_data(|data| {
-        let readable = flags.readable() && fd::has_data(&data.fds, fd_num);
-        let writable = flags.writable() && fd::has_space(&data.fds, fd_num);
-        let rsrc = if flags.readable() {
-            data.fds.get(fd_num).and_then(|d| d.read_source())
-        } else { None };
-        let wsrc = if flags.writable() {
-            data.fds.get(fd_num).and_then(|d| d.write_source())
-        } else { None };
+        let Ok(object) = data.handles.get_ref(handle, Rights::WAIT) else {
+            return (false, None, None);
+        };
+        let readable = flags.readable() && ops::has_data(object);
+        let writable = flags.writable() && ops::has_space(object);
+        let rsrc = if flags.readable() { ops::read_source(object) } else { None };
+        let wsrc = if flags.writable() { ops::write_source(object) } else { None };
         (readable || writable, rsrc, wsrc)
     });
 
@@ -538,8 +543,8 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     if let Some(instance) = map.get_mut(ring_id) {
-        // Remove existing PendingPoll for this fd (drops old WatcherGuard)
-        if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.fd_num == fd_num) {
+        // Remove existing PendingPoll for this handle (drops old WatcherGuard)
+        if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.handle == handle) {
             instance.pending_polls.swap_remove(pos);
         }
 
@@ -555,7 +560,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
 
         let new_pp = PendingPoll {
             user_data,
-            fd_num,
+            handle,
             flags,
             read_source,
             write_source,
@@ -579,7 +584,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
         let became_ready = read_source.is_some_and(Source::is_ready)
             || write_source.is_some_and(Source::is_ready);
         if became_ready {
-            if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.fd_num == fd_num) {
+            if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.handle == handle) {
                 let pp = instance.pending_polls.swap_remove(pos);
                 let mut result_flags = 0u32;
                 if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
@@ -609,12 +614,11 @@ fn process_poll_remove(ring_id: RingId, target_user_data: u64) {
 }
 
 fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
-    let fd_num = sqe.fd.0;
     let user_data = sqe.user_data;
 
     let listener_id = process::with_fd_owner_data(|data| {
-        match data.fds.get(fd_num) {
-            Some(fd::Descriptor::Listener(l)) => Some(l.id()),
+        match data.handles.get_ref(sqe.fd, Rights::READ) {
+            Ok(KObjectRef::Listener(l)) => Some(l.id()),
             _ => None,
         }
     });
@@ -626,15 +630,18 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
 
     match crate::listener::pop_connection(listener_id) {
         Some(conn) => {
-            let new_fd = process::with_fd_owner_data(|data| {
-                data.fds.insert(fd::Descriptor::Socket {
-                    rx: conn.rx,
-                    tx: conn.tx,
-                    peer: conn.client_pid,
-                })
+            let installed = process::with_fd_owner_data(|data| {
+                ops::install(
+                    &mut data.handles,
+                    KObjectRef::Connection(crate::object::service::ConnectionEnd::new(
+                        conn.rx,
+                        conn.tx,
+                        conn.client_pid,
+                    )),
+                )
             });
-            match new_fd {
-                Ok(fd_num) => post_cqe_locked(ring_id, user_data, fd_num as i32, 0),
+            match installed {
+                Ok(h) => post_cqe_locked(ring_id, user_data, h.0 as i32, 0),
                 Err(e) => post_cqe_locked(ring_id, user_data, -(e as i32), 0),
             }
         }
@@ -645,11 +652,10 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
 }
 
 fn process_close(ring_id: RingId, sqe: &IoUringSqe) {
-    let fd_num = sqe.fd.0;
     let user_data = sqe.user_data;
 
     let result = process::with_fd_owner_data(|data| {
-        fd::close(&mut data.fds, fd_num, &mut data.pipe_maps)
+        ops::close(&mut data.handles, sqe.fd, &mut data.pipe_maps)
     });
 
     post_cqe_locked(ring_id, user_data, result as i32, 0);

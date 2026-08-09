@@ -1,5 +1,8 @@
-use crate::fd::{Descriptor, FramebufferInfo};
+use alloc::sync::Arc;
+
+use crate::object::device::{DeviceClaim, DeviceInfo};
 use crate::{keyboard, mouse};
+use toyos_abi::FramebufferInfo;
 use crate::process::Pid;
 use crate::shared_memory;
 use crate::sync::Lock;
@@ -42,12 +45,11 @@ fn owner_of(class: DeviceType) -> &'static Lock<Option<Pid>> {
 /// Not `Clone` and not `Copy`, and the field is private, so the only ways to
 /// obtain one are [`Claim::acquire`] and moving an existing one. That is the
 /// exclusivity: at most one `Claim` per class can exist at a time, and the
-/// compiler — not a check in `dup` — is what says so. `Descriptor` therefore
-/// cannot implement `Clone` either, which is where the rule reaches userland
-/// (`Descriptor::duplicate`).
+/// compiler — not a check in `dup` — is what says so.
 ///
-/// `capability-handles-spec.md` §6.5 reaches the same shape from the other
-/// end: a claim handle carries no DUP right, and TRANSFER moves it whole.
+/// The rule reaches userland through the object that holds one: a
+/// [`DeviceClaim`] is created without `Rights::DUP`, so at most one handle to
+/// it can exist and a transfer moves it whole.
 pub struct Claim {
     class: DeviceType,
 }
@@ -103,7 +105,7 @@ pub enum ClaimError {
 /// process that was refused it. The three hand-written `*owner = None`
 /// rollbacks this replaced were what an added grant would have had to
 /// remember.
-pub fn try_claim(class: DeviceType, pid: Pid) -> Result<Descriptor, ClaimError> {
+pub fn try_claim(class: DeviceType, pid: Pid) -> Result<Arc<DeviceClaim>, ClaimError> {
     // Availability is decided before the claim, so a second claimant of an
     // absent device is told `Absent` and not `Owned` — the distinction soundd
     // and netd degrade on.
@@ -116,12 +118,12 @@ pub fn try_claim(class: DeviceType, pid: Pid) -> Result<Descriptor, ClaimError> 
             // would open with the tail of what was being typed into the one
             // that died.
             keyboard::discard_queued();
-            Ok(Descriptor::Keyboard(claim))
+            Ok(DeviceClaim::new(class, DeviceInfo::Events, claim))
         }
         DeviceType::Mouse => {
             let claim = Claim::acquire(class, pid)?;
             mouse::discard_queued();
-            Ok(Descriptor::Mouse(claim))
+            Ok(DeviceClaim::new(class, DeviceInfo::Events, claim))
         }
         DeviceType::Framebuffer => {
             let info = (*FB_INFO.lock()).ok_or(ClaimError::Absent)?;
@@ -131,25 +133,25 @@ pub fn try_claim(class: DeviceType, pid: Pid) -> Result<Descriptor, ClaimError> 
             }
             grant(info.cursor_token, pid)?;
             crate::drivers::panic_console::screen_claimed_by_userland();
-            Ok(Descriptor::Framebuffer(claim, info))
+            Ok(DeviceClaim::new(class, DeviceInfo::Framebuffer(info), claim))
         }
         DeviceType::Nic => {
             let info = crate::net::nic_info().ok_or(ClaimError::Absent)?;
             let claim = Claim::acquire(class, pid)?;
             grant(info.dma_token, pid)?;
-            Ok(Descriptor::Nic(claim, info))
+            Ok(DeviceClaim::new(class, DeviceInfo::Nic(info), claim))
         }
         DeviceType::HdaAudio => {
             let info = crate::drivers::hda::info().ok_or(ClaimError::Absent)?;
             let claim = Claim::acquire(class, pid)?;
             grant(info.pcm_token, pid)?;
-            Ok(Descriptor::Hda { claim, info, info_read: false })
+            Ok(DeviceClaim::new(class, DeviceInfo::Hda(info), claim))
         }
         DeviceType::VirtioSound => {
             let info = crate::drivers::virtio_sound::info().ok_or(ClaimError::Absent)?;
             let claim = Claim::acquire(class, pid)?;
             grant(info.dma_token, pid)?;
-            Ok(Descriptor::VirtioSound { claim, info, info_read: false })
+            Ok(DeviceClaim::new(class, DeviceInfo::VirtioSound(info), claim))
         }
     }
 }

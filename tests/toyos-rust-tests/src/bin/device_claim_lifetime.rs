@@ -51,9 +51,9 @@ fn test() {
     }
 
     // dup2 is the same operation with a caller-chosen slot, and must answer
-    // the same. A `Ok` here would put the claim on fd 9 and leave `mouse`
+    // the same. A `Ok` here would put the claim in slot 9 and leave `mouse`
     // closable.
-    match syscall::dup2(mouse, toyos_abi::RawHandle(9)) {
+    match syscall::dup2(mouse, 9) {
         Err(SyscallError::PermissionDenied) => {}
         other => panic!("dup2 of a device fd: expected PermissionDenied, got {other:?}"),
     }

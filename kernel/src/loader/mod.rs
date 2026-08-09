@@ -14,7 +14,7 @@ mod start;
 mod symbols;
 mod tls;
 
-pub use start::{build_child_fds, FD_PAIR_LEN};
+pub use start::{build_child_handles, FD_PAIR_LEN};
 pub(crate) use start::{alloc_kernel_stack, process_start, thread_start};
 pub use tls::{setup_combined_tls, setup_tls, DTV_INITIAL_CAPACITY};
 
@@ -23,7 +23,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::elf;
-use crate::fd::{Descriptor, FdTable};
+use crate::object::{ops, HandleTable, KObjectRef};
 use crate::mm::paging::CachePolicy;
 use crate::mm::PAGE_2M;
 use crate::process::{
@@ -380,7 +380,12 @@ fn rela_dyn_from_sections(
     }
 }
 
-pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> Result<Pid, SyscallError> {
+pub fn spawn(
+    argv: &[&str],
+    handles: HandleTable,
+    parent: Option<Pid>,
+    env: Vec<u8>,
+) -> Result<Pid, SyscallError> {
     // An argv of only separators survives the split in sys_spawn as an empty
     // slice; there is no argv[0] to load.
     let Some(&path) = argv.first() else {
@@ -389,8 +394,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let t0 = crate::clock::nanos_since_boot();
 
     // The guard is scoped rather than held across the match: every `return`
-    // past this point drops `fds`, and releasing a file descriptor takes the
-    // VFS lock (`fd::OpenFile::drop`).
+    // past this point drops `handles`, and releasing a file object takes the
+    // VFS lock (`object::file::OpenFileState::drop`).
     let opened = vfs::lock().open_backing(path);
     let backing: Arc<dyn crate::file_backing::FileBacking> = match opened {
         Ok(b) => b,
@@ -604,8 +609,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let NeededLibs { libs: loaded_libs, paths: lib_paths } = loaded_libs;
     let proc_data = Arc::new(Lock::new(ProcessData {
-        fds,
-        handles: crate::object::HandleTable::new(),
+        handles,
         cwd,
         env,
         elf: ElfInfo {
@@ -888,10 +892,17 @@ fn exe_tpoff(
 /// `/bin/<name>`. Panics on failure: a boot that cannot start its init
 /// programs has nowhere to report to.
 pub fn spawn_kernel(argv: &[&str]) -> Pid {
-    let mut fds = FdTable::new();
-    for fd in 0..3 {
-        fds.insert_at(fd, Descriptor::SerialConsole)
-            .expect("spawn_kernel: three fds cannot exhaust an empty table");
+    let mut handles = HandleTable::new();
+    let console = KObjectRef::Console(crate::object::device::ConsoleObject::new());
+    for slot in 0..3 {
+        let entry = crate::object::HandleEntry::new(
+            console.clone(),
+            ops::initial_rights(&console),
+        );
+        let (_, displaced) = handles
+            .install_at(slot, entry)
+            .expect("spawn_kernel: three slots cannot exhaust an empty table");
+        assert!(displaced.is_none(), "an empty table had something at slot {slot}");
     }
-    spawn(argv, fds, None, Vec::new()).expect("spawn_kernel: failed to spawn")
+    spawn(argv, handles, None, Vec::new()).expect("spawn_kernel: failed to spawn")
 }

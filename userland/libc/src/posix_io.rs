@@ -167,10 +167,18 @@ pub unsafe extern "C" fn dup(raw_fd: i32) -> i32 {
     }
 }
 
+/// **This does not honour POSIX's "returns `newfd`".** `newfd` is a slot, and
+/// the handle the kernel hands back carries that slot's generation, so
+/// `dup2(x, 1)` answers `1` only while slot 1 has never been closed. Nothing in
+/// the tree redirects by closing a slot first, and this layer is where the
+/// bookkeeping to fake it would go if something ever does.
 #[no_mangle]
 pub unsafe extern "C" fn dup2(old_fd: i32, new_fd: i32) -> i32 {
     if old_fd == new_fd { return new_fd; }
-    match syscall::dup2(fd(old_fd), fd(new_fd)) {
+    let Ok(slot) = u16::try_from(new_fd) else {
+        return set_errno(syscall::SyscallError::InvalidArgument);
+    };
+    match syscall::dup2(fd(old_fd), slot) {
         Ok(f) => f.0 as i32,
         Err(e) => set_errno(e),
     }

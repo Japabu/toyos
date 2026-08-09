@@ -6,7 +6,7 @@ use core::ptr::NonNull;
 use crate::arch::percpu;
 use crate::mm::paging::CachePolicy;
 use crate::mm::PAGE_2M;
-use crate::fd::{self, FdTable};
+use crate::object::{ops, HandleTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
 use crate::sched::payload::ThreadSched;
@@ -20,7 +20,7 @@ pub use toyos_abi::{Pid, Tid};
 pub use crate::scheduler::TaskId;
 
 // Re-export loader functions so existing callers (via `process::`) keep working.
-pub use crate::loader::{spawn, spawn_kernel, build_child_fds};
+pub use crate::loader::{spawn, spawn_kernel, build_child_handles};
 pub(crate) use crate::loader::read_file_range;
 
 /// Page tables shared between a process and all its threads.
@@ -496,14 +496,12 @@ pub struct ElfInfo {
 }
 
 /// Process-level data shared across all threads via `Arc<Lock<ProcessData>>`.
-/// Contains fds, memory mappings, ELF state, accounting — everything that belongs to the process.
+/// Contains handles, memory mappings, ELF state, accounting — everything that belongs to the process.
 /// Accessed via `with_fd_owner_data`. All threads of a process share the same Arc.
 pub struct ProcessData {
-    pub fds: FdTable,
-    /// The handle table that replaces `fds` in chunk 2. Empty until then, and
-    /// beside it rather than after it so the object layer has somewhere to live
-    /// while it has no users.
-    pub handles: crate::object::HandleTable,
+    /// Every kernel object this process can name. Stdio is slots 0, 1 and 2 at
+    /// generation 0, which is what makes those handles literally `0`, `1`, `2`.
+    pub handles: HandleTable,
     pub cwd: String,
     /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
     pub env: Vec<u8>,
@@ -572,14 +570,14 @@ pub struct ThreadData {
 ///
 /// Recorded so it can be taken away. The page belongs to the pipe, and the
 /// pipe is freed the moment its last reader and writer reference drop — so a
-/// mapping that outlives the process's descriptors is a writable window onto
+/// mapping that outlives the process's handles is a writable window onto
 /// memory the PMM has already handed to something else. Nothing on the
-/// fd-close path used to touch it.
+/// close path used to touch it.
 ///
 /// One entry per *pipe*, not per call: `sys_pipe_map` returns the window it
 /// already made. That is what bounds this vector — every entry needs a live
-/// descriptor naming its pipe, and distinct pipes need distinct descriptors,
-/// so it can never hold more than `fd::MAX_FDS` entries.
+/// handle naming its pipe, and distinct pipes need distinct handles, so it can
+/// never hold more than `object::handle::MAX_HANDLES` entries.
 pub struct PipeMap {
     pub pipe: pipe::PipeId,
     pub addr: UserAddr,
@@ -587,7 +585,7 @@ pub struct PipeMap {
 
 /// Take back every window onto `pipe` that `maps` holds.
 ///
-/// Called when the process's last descriptor for the pipe goes: from there on
+/// Called when the process's last handle for the pipe goes: from there on
 /// nothing keeps the ring page alive, so the mapping has to stop before the
 /// page can be reissued.
 pub fn revoke_pipe_maps(maps: &mut Vec<PipeMap>, pt: &PageTables, pipe: pipe::PipeId) {
@@ -933,7 +931,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     };
 
     // Phase 3: Insert into table (brief table lock)
-    // Threads share the parent's ProcessData Arc — no empty fds or zeroed process fields.
+    // Threads share the parent's ProcessData Arc — no empty handle table or zeroed process fields.
     let thread_data = Arc::new(Lock::new(ThreadData {
         tls_pages: Some(tls_alloc),
         stack_pages: None,
@@ -1015,7 +1013,7 @@ fn teardown_resources(
             data.peak_memory / (1024 * 1024), data.alloc_count, data.free_count);
     }
 
-    fd::close_all(&mut data.fds);
+    ops::close_all(&mut data.handles);
     data.elf.elf_alloc.take();
     data.elf.loaded_libs.clear();
     data.mmap_regions.clear();

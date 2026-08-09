@@ -5,12 +5,13 @@
 //! arch-neutral, so a second architecture adds this file and nothing more.
 
 use crate::arch::entry::{initial_user_state, ring3_trampoline_asm};
-use crate::fd::FdTable;
+use crate::object::{HandleError, HandleTable};
 use crate::process::{fd_owner_data, OwnedAlloc, KERNEL_STACK_SIZE};
 use crate::scheduler;
+use toyos_abi::handle::RawHandle;
 use toyos_abi::syscall::SyscallError;
 
-/// One `[child_fd, parent_fd]` pair of `SpawnArgs::fd_map_ptr`, in bytes.
+/// One `[child_slot, parent_handle]` pair of `SpawnArgs::fd_map_ptr`, in bytes.
 pub const FD_PAIR_LEN: usize = 8;
 
 /// Allocate a kernel stack and lay out the frame `context_switch` will restore.
@@ -101,29 +102,38 @@ pub(crate) fn make_name(path: &str) -> [u8; crate::process::THREAD_NAME_LEN] {
     name
 }
 
-/// Build a child's `FdTable` by duplicating the parent descriptors it names.
+/// Build a child's `HandleTable` by duplicating the parent handles it names.
 ///
-/// A pair naming a parent fd that does not exist contributes nothing: the
-/// child simply does not get that descriptor, which is what a caller asking
-/// for a closed fd deserves and is not a reason to refuse the spawn.
-pub fn build_child_fds(pairs: &crate::user_ptr::UserBytes) -> Result<FdTable, SyscallError> {
+/// A pair naming a parent handle that does not resolve contributes nothing: the
+/// child simply does not get it, which is what a caller asking for a closed
+/// handle deserves and is not a reason to refuse the spawn.
+pub fn build_child_handles(
+    pairs: &crate::user_ptr::UserBytes,
+) -> Result<HandleTable, SyscallError> {
     let data_arc = fd_owner_data();
     let data = data_arc.lock();
-    let mut fds = FdTable::new();
+    let mut handles = HandleTable::new();
     for i in 0..pairs.len() / FD_PAIR_LEN {
         let mut pair = [0u8; FD_PAIR_LEN];
         pairs.read_at(i * FD_PAIR_LEN, &mut pair);
-        let child_fd = u32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
-        let parent_fd = u32::from_ne_bytes([pair[4], pair[5], pair[6], pair[7]]);
-        if let Some(desc) = data.fds.get(parent_fd) {
-            // A device claim admits one descriptor, so it cannot be given to a
-            // child: that would be a transfer, and there is no transfer
-            // operation — `capability-handles-spec.md` §6.5 scopes spawn-time
-            // device grants out of v1. Refused by name rather than skipped,
-            // which would start the child without an fd it asked for.
-            let child_desc = desc.duplicate().ok_or(SyscallError::PermissionDenied)?;
-            fds.insert_at(child_fd, child_desc)?;
-        }
+        let child_slot = u32::from_ne_bytes([pair[0], pair[1], pair[2], pair[3]]);
+        let parent = RawHandle(u32::from_ne_bytes([pair[4], pair[5], pair[6], pair[7]]));
+        let Ok(rights) = data.handles.rights_of(parent) else { continue };
+        // A device claim carries no `DUP`, so it cannot be given to a child
+        // this way: that would be a transfer, and `slot_map` duplicates. The
+        // refusal is by name rather than a skip, which would start the child
+        // without a handle it asked for. Chunk 4's endowment vector is the
+        // move that *can* carry one.
+        let entry = data
+            .handles
+            .duplicate_entry(parent, rights)
+            .map_err(HandleError::to_syscall_error)?;
+        let slot = u16::try_from(child_slot)
+            .map_err(|_| SyscallError::ResourceExhausted)?;
+        let (_, displaced) = handles
+            .install_at(slot, entry)
+            .map_err(HandleError::to_syscall_error)?;
+        drop(displaced);
     }
-    Ok(fds)
+    Ok(handles)
 }

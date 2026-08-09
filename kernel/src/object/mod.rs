@@ -25,10 +25,38 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::Lock;
 
+pub mod device;
+pub mod file;
 pub mod handle;
+pub mod ops;
+pub mod pipe;
+pub mod service;
 pub mod syscap;
 
-pub use handle::HandleTable;
+pub use handle::{HandleEntry, HandleError, HandleTable};
+
+/// A resource an object owns and must give back when its **last handle** goes.
+///
+/// A plain field gives it back when the last `Arc` goes, and an `Arc` stranded
+/// on a killed thread's kernel stack would hold it forever — a writer that
+/// never closes is a reader that never sees EOF, which is exactly the audio
+/// client this layer exists to get right. `on_zero_handles` takes it instead,
+/// from the deferred queue with nothing held.
+pub(crate) struct Held<T>(Lock<Option<T>>);
+
+impl<T> Held<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(Lock::new(Some(value)))
+    }
+
+    /// Drop what is held, outside the lock: whatever `T`'s destructor reaches
+    /// for — `PIPES`, the listener registry, a device owner — must not be taken
+    /// under this one.
+    pub(crate) fn release(&self) {
+        let taken = self.0.lock().take();
+        drop(taken);
+    }
+}
 
 /// A kernel object's identity.
 ///
@@ -99,20 +127,31 @@ impl Drop for ObjectCore {
     }
 }
 
+/// What an object does when its last handle goes.
+///
+/// Separate from [`KObjectVariant`], which the macro writes: a `deferred` row
+/// must write this one itself and the method has no default body, so adding a
+/// type does not compile until somebody has said what its last handle means.
+/// An `immediate` row gets an empty impl from the macro, and a hand-written one
+/// beside it is a coherence error — so "a hook that is never run" is not a
+/// state this module can be left in.
+pub trait ZeroHandles {
+    /// Runs exactly once, from the deferred queue, with no lock held. Never
+    /// inline at drop time — see [`drain_zero_handles`].
+    fn on_zero_handles(&self);
+}
+
 /// One object type's plumbing.
 ///
 /// Implemented by the [`kobject!`] macro and by nothing else, so a new object
 /// type is one macro row and a compile error at every exhaustive match.
-pub trait KObjectVariant: Send + Sync + Sized + 'static {
+pub trait KObjectVariant: ZeroHandles + Send + Sync + Sized + 'static {
     const NAME: &'static str;
     fn from_ref(r: &KObjectRef) -> Option<&Arc<Self>>;
     fn into_ref(this: Arc<Self>) -> KObjectRef;
     fn core(&self) -> &ObjectCore;
     /// A fresh core, enrolled in this type's census. The only way to build one.
     fn new_core() -> ObjectCore;
-    /// Runs exactly once, from the deferred queue, with no lock held. Never
-    /// inline at drop time — see [`drain_zero_handles`].
-    fn on_zero_handles(&self) {}
 }
 
 /// Declare the closed set of object types.
@@ -121,8 +160,15 @@ pub trait KObjectVariant: Send + Sync + Sized + 'static {
 /// impl and a live census counter. Object-layer dispatch matches this enum
 /// exhaustively with no `_` arms, so adding a row is a compile error wherever a
 /// decision has to be made about it.
+///
+/// **Each row says whether its last handle is an event.** A `deferred` row has
+/// a [`ZeroHandles`] hook and is released from the queue, with nothing held. An
+/// `immediate` row has none, so there is nothing to defer and the last `Arc`
+/// goes where the handle did — which is where it went before this layer
+/// existed, and which is what keeps a killed process's file flush on the
+/// killer's 128 KiB kernel stack instead of a 16 KiB idle one.
 macro_rules! kobject {
-    ($($variant:ident => $ty:ty),+ $(,)?) => {
+    ($($kind:ident $variant:ident => $ty:ty),+ $(,)?) => {
         /// Every kind of thing a handle can name.
         #[derive(Clone)]
         pub enum KObjectRef {
@@ -148,9 +194,18 @@ macro_rules! kobject {
                     $(Self::$variant(o) => o.on_zero_handles(),)+
                 }
             }
+
+            /// Whether releasing this object waits for the deferred queue.
+            fn defers_release(&self) -> bool {
+                match self {
+                    $(Self::$variant(_) => kobject!(@defers $kind),)+
+                }
+            }
         }
 
         $(
+            kobject!(@empty_hook $kind $ty);
+
             impl KObjectVariant for $ty {
                 const NAME: &'static str = stringify!($variant);
 
@@ -202,10 +257,32 @@ macro_rules! kobject {
             }
         }
     };
+
+    (@defers deferred) => { true };
+    (@defers immediate) => { false };
+
+    (@empty_hook deferred $ty:ty) => {};
+    (@empty_hook immediate $ty:ty) => {
+        impl ZeroHandles for $ty {
+            fn on_zero_handles(&self) {}
+        }
+    };
 }
 
 kobject! {
-    SysCap => syscap::SysCap,
+    deferred PipeRead => pipe::PipeReadEnd,
+    deferred PipeWrite => pipe::PipeWriteEnd,
+    deferred Connection => service::ConnectionEnd,
+    deferred Device => device::DeviceClaim,
+    deferred Listener => service::ListenerObject,
+    deferred IoUring => service::IoUringObject,
+    // A file's flush and its cache reference ride the last `Arc`, and no
+    // blocking syscall strands one: `read` and `write` on a file never park.
+    immediate File => file::FileObject,
+    immediate Console => device::ConsoleObject,
+    // The authority is the rights on the handle, so a handle going away *is*
+    // the whole event.
+    immediate SysCap => syscap::SysCap,
 }
 
 /// Objects whose last handle has gone, waiting for a context with nothing held.
@@ -226,10 +303,11 @@ static ZERO_QUEUE: Lock<Vec<KObjectRef>> = Lock::new(Vec::new());
 /// Whether [`ZERO_QUEUE`] holds anything, readable without taking it.
 ///
 /// The drain runs at every syscall exit and every scheduler pass, and
-/// `Lock::lock` is a `fetch_add` — the one operation TCG cannot emit inline, at
-/// a few hundred a boot of which one cost 350 ms (known-issues §8). Written
-/// under the lock at both ends, so it never says "empty" over a queued object;
-/// a stale "non-empty" costs one drain that finds nothing.
+/// `Lock::lock` is a `fetch_add` — the one operation TCG cannot emit inline,
+/// and a few hundred a boot of it cost 350 ms of boot
+/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Written under the lock at
+/// both ends, so it never says "empty" over a queued object; a stale
+/// "non-empty" costs one drain that finds nothing.
 static ZERO_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn enqueue_zero_handles(object: KObjectRef) {
