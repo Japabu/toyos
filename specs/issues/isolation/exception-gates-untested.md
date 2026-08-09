@@ -12,15 +12,17 @@ keeping, because it is the list a later change makes reachable.
 
 Measured on the QEMU profile the suite boots, off `info registers` on a live
 guest whose GDT limit says the kernel had already loaded its own:
-`CR0=0x80010033`, `CR4=0x00310668`.
+`CR0=0x80010033`, `CR4=0x00310668`. Those are now `arch/control_regs.rs`'s
+declaration, held by every CPU and asserted there, so each bit named below is a
+decision rather than an observation.
 
 - **#NM (7)** — CR0.TS and CR0.EM are both clear, so nothing can raise it. Only
   a lazy-FPU scheme would, and there is none.
 - **#AC (17)** — CR0.AM is clear, so RFLAGS.AC buys a Ring 3 process nothing.
   The `ac` arm sets AC, reads it back as 1, and the misaligned load still does
   not fault.
-- **#MC (18)** — CR4.MCE is **set**, by firmware, and the kernel never clears
-  it, so a machine check does arrive on vector 18 rather than shutting the
+- **#MC (18)** — CR4.MCE is in `CR4_REQUIRED`, so a machine check arrives on
+  vector 18 rather than shutting the
   processor down. Nothing in the harness can stage one. Handled as an abort:
   `machine_check_handler` halts from either ring rather than killing a process
   over a machine that has stopped being trustworthy.
