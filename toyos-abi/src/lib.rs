@@ -5,6 +5,7 @@ extern crate std;
 
 pub mod audio;
 pub mod boot;
+pub mod handle;
 pub mod hda;
 pub mod input;
 pub mod io_uring;

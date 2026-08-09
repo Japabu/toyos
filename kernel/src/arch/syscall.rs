@@ -15,6 +15,43 @@ const MSR_FMASK: u32 = 0xC000_0084;
 
 use toyos_abi::syscall::*;
 
+/// The numbers deleted syscalls used, and what each one was.
+///
+/// **A number a deleted syscall used is retired, never reused.** This was two
+/// hand-written `29 | 30 =>` arms with the names in a trailing comment; a third
+/// pair would have been a table, and thirteen more arrive with this branch.
+///
+/// The rows must be strictly ascending, which is checked rather than asked for:
+/// it is the whole of what stops one number being retired twice.
+macro_rules! retired_syscalls {
+    ($($num:literal => $name:literal),+ $(,)?) => {
+        const RETIRED_SYSCALLS: &[(u64, &str)] = &[$(($num, $name)),+];
+
+        const _: () = {
+            let mut i = 1;
+            while i < RETIRED_SYSCALLS.len() {
+                assert!(
+                    RETIRED_SYSCALLS[i - 1].0 < RETIRED_SYSCALLS[i].0,
+                    "the retired-syscall table is not strictly ascending, so a \
+                     number is retired twice or the list is unreadable",
+                );
+                i += 1;
+            }
+        };
+
+        fn retired_syscall(num: u64) -> Option<&'static str> {
+            RETIRED_SYSCALLS.iter().find(|(n, _)| *n == num).map(|(_, name)| *name)
+        }
+    };
+}
+
+retired_syscalls! {
+    29 => "SYS_SEND_MSG",
+    30 => "SYS_RECV_MSG",
+    32 => "SYS_REGISTER_NAME",
+    33 => "SYS_FIND_PID",
+}
+
 /// `SYS_DEBUG` action 2's lock, and nothing else's.
 ///
 /// Action 2 takes it and then calls a switching scheduler entry — the shape
@@ -302,9 +339,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_WAITPID => sys_waitpid(a1, a2),
 
         SYS_MARK_TTY => process::with_fd_owner_data(|data| fd::mark_tty(&mut data.fds, a1 as u32)),
-        29 | 30 => SyscallError::NotSupported.to_u64(), // formerly SYS_SEND_MSG/SYS_RECV_MSG
         SYS_OPEN_DEVICE => sys_open_device(a1),
-        32 | 33 => SyscallError::NotSupported.to_u64(), // formerly SYS_REGISTER_NAME/SYS_FIND_PID
         // Display integrity, not memory access: framebuffer *contents* are
         // behind shared_memory grants either way. Ungated, any process could
         // scan out over the compositor's frames and move the cursor.
@@ -658,8 +693,22 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         },
         SYS_DEVICE_REG_READ => sys_device_reg(a1 as u32, a2, a3, None),
         SYS_DEVICE_REG_WRITE => sys_device_reg(a1 as u32, a2, a3, Some(a4)),
-        _ => SyscallError::InvalidArgument.to_u64(),
+        // A number a deleted syscall used is retired, never reused, so an old
+        // binary is told which call it is asking for rather than that its
+        // number is nonsense.
+        _ => match retired_syscall(num) {
+            Some(name) => {
+                crate::log!("syscall {num} is retired (formerly {name})");
+                SyscallError::NotSupported.to_u64()
+            }
+            None => SyscallError::InvalidArgument.to_u64(),
+        },
     };
+
+    // The first of the object layer's three drain sites. Here rather than at
+    // the drop that queued it: a hook must not run under whatever guard the
+    // syscall was holding when the last handle went (`object::drain_zero_handles`).
+    crate::object::drain_zero_handles();
 
     // Track wall-clock syscall time (includes preemption — see plan for documented limitation)
     let elapsed = crate::clock::nanos_since_boot() - t0;

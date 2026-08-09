@@ -55,6 +55,7 @@ mod trace;
 mod clock;
 mod rtc;
 mod fd;
+mod object;
 mod io_uring;
 mod pipe;
 mod listener;

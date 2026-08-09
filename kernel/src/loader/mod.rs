@@ -605,6 +605,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let NeededLibs { libs: loaded_libs, paths: lib_paths } = loaded_libs;
     let proc_data = Arc::new(Lock::new(ProcessData {
         fds,
+        handles: crate::object::HandleTable::new(),
         cwd,
         env,
         elf: ElfInfo {

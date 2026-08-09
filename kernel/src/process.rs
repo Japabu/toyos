@@ -500,6 +500,10 @@ pub struct ElfInfo {
 /// Accessed via `with_fd_owner_data`. All threads of a process share the same Arc.
 pub struct ProcessData {
     pub fds: FdTable,
+    /// The handle table that replaces `fds` in chunk 2. Empty until then, and
+    /// beside it rather than after it so the object layer has somewhere to live
+    /// while it has no users.
+    pub handles: crate::object::HandleTable,
     pub cwd: String,
     /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
     pub env: Vec<u8>,
