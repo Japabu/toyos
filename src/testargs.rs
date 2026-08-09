@@ -131,6 +131,7 @@ pub const FLAGS: &[Flag] = &[
     flag("--host-slots", Value::Required),
     flag("--host-builds", Value::Required),
     flag("--shard", Value::Required),
+    flag("--slow-usb", Value::None),
 ];
 
 fn accepted() -> String {
