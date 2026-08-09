@@ -329,11 +329,16 @@ pub(super) fn deaf_window() {
             .is_ok()
         {
             let began = crate::clock::nanos_since_boot();
-            let until = began + DEAF_NS;
+            // The counter and not the nanoseconds, because half of what this
+            // actuator stages is *where* the CPU is: `nanos_since_boot` divides
+            // 128 bits, which is a call into `compiler_builtins`, and a probe
+            // that samples the rip then names `u128_div_rem` for a CPU that
+            // never left this loop. `rdtsc` and a 64-bit compare inline.
+            let until = crate::clock::tsc_deadline(DEAF_NS);
             // SAFETY: the actuator's whole content. Interrupts come back on
             // below and the loop is bounded by the clock.
             unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
-            while crate::clock::nanos_since_boot() < until {
+            while crate::arch::cpu::rdtsc() < until {
                 core::hint::spin_loop();
             }
             unsafe { core::arch::asm!("sti", options(nomem, nostack)) };

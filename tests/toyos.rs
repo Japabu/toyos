@@ -6308,40 +6308,135 @@ fn run_machine_test(
             let mut log = qemu.boot_log().to_string();
             log.push_str(&qemu.drain_serial(Duration::from_secs(3)));
 
-            let beats: Vec<&str> =
-                log.lines().filter(|l| l.contains("heartbeat: t=")).collect();
+            // **A heartbeat and the `i8042: line` under it are one reading**,
+            // and `heartbeat::poll` emits them as two `log!`s — so a capture can
+            // end between them. Run `31273373928` on `main` did: twelve beats,
+            // eleven pin readings, and the last beat was the last line of the
+            // log. Counting the two kinds against each other reads that as a pin
+            // whose state was unreadable, which is the one thing this pairing
+            // exists to detect. So the unit is the pair, and a beat with nothing
+            // after it at all is a reading this capture does not hold.
+            let captured: Vec<&str> = log.lines().collect();
+            let at: Vec<usize> = captured
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains("heartbeat: t="))
+                .map(|(i, _)| i)
+                .collect();
+            let torn = at.last().is_some_and(|&i| i + 1 == captured.len());
+            let at = &at[..at.len() - usize::from(torn)];
+            let beats: Vec<&str> = at.iter().map(|&i| captured[i]).collect();
             // Three seconds of drain at a 250 ms period is twelve; a guest that
             // spends some of it booting produces fewer. Four is "the machine
             // kept saying it was alive" with room, and zero or one is the
             // failure this exists to make impossible.
             if beats.len() < 4 {
                 return Err(format!(
-                    "{} heartbeat line(s) in ~3 s at a 250 ms period — the instrument does not \
-                     keep reporting, so a log that stops says nothing\n{log}",
+                    "{} whole heartbeat line(s) in ~3 s at a 250 ms period — the instrument does \
+                     not keep reporting, so a log that stops says nothing\n{log}",
                     beats.len()
                 ));
             }
-            // A clear bit has to mean "that CPU stopped". On a machine with
-            // nothing to run that is only true if every CPU is woken anyway, so
-            // the assertion is that none is ever missing — and the per-CPU lines
-            // the kernel prints for a missing one must never appear at all.
-            let thin: Vec<&&str> = beats.iter().filter(|l| !l.contains("alive=8/8")).collect();
-            let named: Vec<&str> = log
-                .lines()
-                .filter(|l| l.contains("heartbeat: cpu"))
+            // Each pair, positionally: `report_line` is the statement after the
+            // heartbeat's `log!`, and another CPU's line may land between the
+            // two commits, so what is asserted is one pin reading before the
+            // next beat rather than the line immediately below.
+            let pin_in = |from: usize, to: usize| {
+                captured[from..to].iter().filter(|l| l.contains("i8042: line ")).count()
+            };
+            let unpaired: Vec<String> = at
+                .iter()
+                .enumerate()
+                .filter(|&(n, &i)| pin_in(i + 1, at.get(n + 1).copied().unwrap_or(captured.len())) != 1)
+                .map(|(_, &i)| captured[i].to_string())
                 .collect();
-            if !thin.is_empty() || !named.is_empty() {
+            if !unpaired.is_empty() {
                 return Err(format!(
-                    "{} of {} heartbeats dropped a CPU from the mask and {} named one silent, on a \
-                     guest where every CPU is healthy — so a clear bit does not mean that CPU \
-                     stopped, which is the whole of the field\n{}\n{}\n{log}",
-                    thin.len(),
+                    "{} of {} heartbeats carry no `i8042: line` of their own — the pin's state is \
+                     what separates a machine with nothing to do from one whose input died, and it \
+                     has to be readable at every heartbeat or the pairing is a guess\n{}\n{log}",
+                    unpaired.len(),
                     beats.len(),
-                    named.len(),
-                    thin.iter().take(4).map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
-                    named.iter().take(4).cloned().collect::<Vec<_>>().join("\n"),
+                    unpaired.iter().take(4).cloned().collect::<Vec<_>>().join("\n"),
                 ));
             }
+            // **What a clear bit has to mean is "that CPU stopped", and what
+            // makes that readable is that it does not come back.** `diag-tick`
+            // caps a sleep at 100 ms against a 250 ms line, so a healthy CPU
+            // contributes two or three passes to every one; a CPU absent from
+            // two consecutive lines has missed five wakes and is the shape the
+            // T14 produces — the mask thins CPU by CPU and stays thin, 56 lines
+            // naming a silent CPU and one silent for 2.811 s. A single line a
+            // CPU is missing from and is back on is the other thing entirely,
+            // and this guest has eight vCPUs on a runner's four cores: run
+            // `31283095698` rep 2 reported `cpu6 last reached one 0.349s ago`
+            // once, between eight lines of `8/8` either side of it. That is the
+            // host declining to run a halted thread, which no instrument in this
+            // guest claims anything about.
+            //
+            // **The boot is excluded for the same reason and needs a second
+            // rule.** `boot_with_options` returns on this config's ready marker
+            // with userland still spawning, and eight vCPUs on four cores do not
+            // all run while the guest is busy — run `31280428519` shard 5 had
+            // `alive=7/8` at 1.373 s with `cpu1 has never reached a scheduler
+            // pass` and `5/8` at 1.624 s, and run `31283095698` rep 2 had cpu0
+            // missing from two consecutive lines. So the window opens at the
+            // first full mask.
+            //
+            // Neither rule lets the tick-less control through, and that was run
+            // rather than argued: `heartbeat = []` in `kernel/Cargo.toml` reds
+            // this on six of the eight CPUs.
+            let Some(settled) = beats.iter().position(|l| l.contains("alive=8/8")) else {
+                return Err(format!(
+                    "no heartbeat in the whole capture reported every CPU alive, so the machine \
+                     never reached the state the mask is a claim about\n{log}"
+                ));
+            };
+            let quiet = &beats[settled..];
+            if quiet.len() < 4 {
+                return Err(format!(
+                    "the mask was full for only the last {} of {} heartbeats — the machine did not \
+                     settle inside this capture, and a clear bit before it settles says nothing\n\
+                     {log}",
+                    quiet.len(),
+                    beats.len()
+                ));
+            }
+            const CPUS: usize = 8;
+            let masks: Vec<u64> = quiet
+                .iter()
+                .filter_map(|l| l.split("mask=0x").nth(1))
+                .filter_map(|m| u64::from_str_radix(m.split_whitespace().next()?, 16).ok())
+                .collect();
+            if masks.len() != quiet.len() {
+                return Err(format!(
+                    "{} of {} heartbeats carry no readable mask=0x — the field that says which CPU \
+                     stopped\n{log}",
+                    quiet.len() - masks.len(),
+                    quiet.len()
+                ));
+            }
+            let absent = |c: usize, m: &u64| m & (1 << c) == 0;
+            let stopped: Vec<usize> = (0..CPUS)
+                .filter(|&c| masks.windows(2).any(|w| absent(c, &w[0]) && absent(c, &w[1])))
+                .collect();
+            let named: Vec<&str> = captured[at[settled]..]
+                .iter()
+                .filter(|l| l.contains("heartbeat: cpu"))
+                .copied()
+                .collect();
+            if !stopped.is_empty() {
+                return Err(format!(
+                    "cpu{stopped:?} missing from two consecutive heartbeats of {}, on a settled \
+                     guest where every CPU is healthy — a CPU that misses two lines has missed \
+                     five `diag-tick` wakes, so a clear bit does not mean that CPU stopped, which \
+                     is the whole of the field\n{}\n{}\n{log}",
+                    quiet.len(),
+                    quiet.join("\n"),
+                    named.iter().take(8).cloned().collect::<Vec<_>>().join("\n"),
+                ));
+            }
+            let blips = masks.iter().filter(|m| **m != (1 << CPUS) - 1).count();
             // And no window between two lines may be wide enough to hide a
             // death. The metal boots this exists for went quiet for between 14 s
             // and 102 s; four times the period is far below any of them and far
@@ -6421,15 +6516,6 @@ fn run_machine_test(
             let kbd_gsi = fields.next().unwrap_or("").to_string();
             let vector = fields.nth(2).unwrap_or("").trim_start_matches("0x").to_string();
             let lines: Vec<&str> = log.lines().filter(|l| l.contains("i8042: line ")).collect();
-            if lines.len() < beats.len() {
-                return Err(format!(
-                    "{} `i8042: line` reading(s) against {} heartbeats — the pin's state is what \
-                     separates a machine with nothing to do from one whose input died, and it has \
-                     to be readable at every heartbeat or the pairing is a guess\n{log}",
-                    lines.len(),
-                    beats.len(),
-                ));
-            }
             // `rte=0x0000000000000024`: the vector is the low byte, bit 16 is
             // the mask. Both are the chip's answer, not ours.
             let healthy = |l: &str| {
@@ -6477,10 +6563,13 @@ fn run_machine_test(
                 ));
             }
             eprintln!(
-                "  [heartbeat] {} lines in ~3 s, all alive=8/8, {moved} with ran>0, widest gap \
-                 {worst:.3}s, t={} → t={}; {} i8042 line reading(s), vec 0x{vector} on gsi \
-                 {kbd_gsi}, none masked, none with OBF set",
+                "  [heartbeat] {} whole lines in ~3 s, each with its own pin reading, {settled} \
+                 before the machine settled and {} after, {blips} of those missing a CPU for one \
+                 line and none for two, {moved} with ran>0, widest gap {worst:.3}s, t={} → t={}; \
+                 {} i8042 line reading(s), vec 0x{vector} on gsi {kbd_gsi}, none masked, none with \
+                 OBF set",
                 beats.len(),
+                quiet.len(),
                 stamps.first().unwrap_or(&"?"),
                 stamps.last().unwrap_or(&"?"),
                 lines.len(),
