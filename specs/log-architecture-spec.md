@@ -1955,7 +1955,14 @@ six-manifest table that follows from it.
 
 ## 13. Owner-level decisions
 
+**All five were put to the owner on 2026-08-09 and he agreed with every
+recommendation.** Each subsection keeps its argument, because a decision whose
+reasoning is not written down is one the next agent re-opens; the **Ruled** line
+under each is what binds. Nothing in §13 is an open question any more.
+
 ### 13.1 pstore — build it or not
+
+**Ruled 2026-08-09: yes, as L10, last, with the metal arm filed as owed.**
 
 §6.6 has both columns. **Recommended: yes, as L10, last, gated on this answer,
 with the metal arm filed as owed.** The gate it can have proves the format and
@@ -1966,6 +1973,12 @@ one `SYS_LOG_READ` flag, and a promise that is best-effort on real hardware.
 
 ### 13.2 One pull request, or an ABI-only one first — §11
 
+**Ruled 2026-08-09: the ABI-only pull request at L4, then the rest on this
+branch.** The owner's one-branch-one-PR ruling stands wherever its premise holds;
+here it does not, and he said so rather than making the trailer carry a false
+reason. So L4 lands alone and the sysroot claim is released at that merge instead
+of being held for five more chunks.
+
 The pipeline's instruction is one branch, one PR. Root `CLAUDE.md`'s instruction
 is that an ABI change lands first, and the `Abi-Inseparable` trailer is for
 splits that genuinely cannot be made. **Mine can**, so the trailer would be a
@@ -1975,15 +1988,23 @@ that is not true, which is worse than the extra landing.
 
 ### 13.3 Memory — 1 MiB of per-CPU record ring at the shipped 8 CPUs
 
+**Ruled 2026-08-09: accepted.** The 16 MiB at 128 cores is accepted with it, and
+the named escape stays available rather than pre-emptively taken.
+
 §2.2. Today's log costs 64 KiB. The increase buys fixed-size records (which is
 where the atomicity property comes from) times eight CPUs, and 512 slots so
 cpu0's whole boot survives until logd runs — 185 records measured, 2.7× headroom.
 16 MiB at the 128-core target. The escape is one line and is named. Note that
 seven eighths of it is seven 128 KiB `alloc_zeroed`s from the kernel heap at AP
 bring-up, which is where the idle and IST1 stacks already come from.
-**Recorded so he can overrule, not asked.**
+**Recorded rather than asked — and then put to him anyway; see this section's ruling above.**
 
 ### 13.4 The regression this design accepts, stated plainly
+
+**Ruled 2026-08-09: accepted, and §13.1's pstore is what closes it.** The three
+new cases are accepted as new — not as "the same as today", which is the sentence
+this subsection exists to have retracted. L10 is therefore not optional polish:
+it is the item this acceptance is conditioned on.
 
 If `wait_for_log_file` (§6.4) does not do its job, a T14 fatal panic leaves the
 report on the panel and not in `/log`. **The first draft said "today the same
@@ -2020,12 +2041,24 @@ Against those: the design also *removes* a failure this path has today, because
 
 **So the trade is real and it is a trade, not a wash.** §13.1's pstore is what
 closes it properly, and it is the reason that recommendation is a recommendation
-rather than a nice-to-have. **Recorded so he can overrule**, not asked.
+rather than a nice-to-have. **Recorded rather than asked — and then put to him anyway; see this section's ruling above.**
 
-### 13.5 C9 is being built on another branch right now — **his call, and it is
-time-sensitive**
+### 13.5 C9's log rows — **struck, 2026-08-09**
 
-§12.0. This spec says a list of items *"must be struck from C9"*, and no agent on
+**Resolved: the compl branch was told while it was still open.** This section's
+premise — that compl implements first and this edit cannot be made from here —
+was true of the branch and false of the schedule: compl is planned and reviewed
+but **parked** behind the endowment branch, no agent holds it, and the
+orchestrator struck the rows directly on `wt/toyos-compl`. So C9 shrinks to
+`scheduler::log_health`, the `i8042` and xHCI pre-`hlt` conditions and
+`reap_poisoned`'s non-move, and `kernel/src/log/` is built once, here.
+
+The general lesson is worth more than the item: **a spec that says "another
+branch must do X" has named an owner who does not exist.** Cross-branch
+obligations belong to whoever schedules the branches, and saying so out loud is
+what got this one done instead of discovered at L0.
+
+§12.0 is the argument that produced it. This spec says a list of items *"must be struck from C9"*, and no agent on
 this branch can make that edit: it lives in
 `specs/completion-architecture-spec.md` on `wt/toyos-compl`, which implements
 first. Left alone, C9 builds `kernel/src/log/` as a 64 KiB byte ring with three
