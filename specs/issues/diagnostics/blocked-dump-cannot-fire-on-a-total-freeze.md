@@ -108,3 +108,14 @@ sample. The mechanism first recorded for that red — the ring tail lifting the
 summary off the page — was wrong: userland repaints over the report, and the
 failing string is the one that sat under the window rather than beside or below
 it. That is what `panic_console::hold_report` answers.
+
+**A second red shape, one occurrence: the report painted but carried no
+`== VERDICT:` line at all** (2026-08-09, 12-wide, 520 s, host carrying a second
+worktree's suite; `ALONE: GREEN`). The recorded mechanism does not cover it —
+that one names a string the window covered, and the verdict is the report's
+*last* line rather than one the desktop sits on top of. `dump-deaf-cpu` is ruled
+out despite landing on `sched/dump.rs` hours earlier: `deaf_window` is
+`#[cfg(feature = "dump-deaf-cpu")]`, only `dump_nmi_probe` asks for that feature
+(`tests/common/faults.rs:321`), and `screen_blocked_dump` boots a kernel that
+does not contain the function. One occurrence is not a shape; what it is worth
+is the next reader not filing it as the repaint above.
