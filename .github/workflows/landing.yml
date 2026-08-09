@@ -103,7 +103,7 @@ jobs:
       # `advisory` or `required`. Flipping it is half the act; the other half is
       # adding `guest-suite` to main's required status checks, and this job's
       # refusal names both.
-      GUEST_GATE: advisory
+      GUEST_GATE: required
     steps:
       - name: is the guest gate still owed?
         env:
