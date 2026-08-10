@@ -255,6 +255,83 @@ fn witness(root: &Path) -> String {
     lines.join("\n")
 }
 
+/// The std fork the sysroot's `library` was compiled from.
+///
+/// **The fourth source, and it was witnessed by nothing until 2026-08-10.** A
+/// worktree that edits `rust/library` edits the primary's, because `rust/` is
+/// one submodule for the whole repository and a linked worktree's is an empty
+/// stub. [`adopt_shared_sysroot`] then compared the three trees above, found
+/// them equal and returned, so the worktree compiled against the std already on
+/// disk — silently, with the only symptom being the compiler refusing a method
+/// the source plainly has. It cost one agent three cycles and let a branch reach
+/// CI with an std that does not compile (`error[E0433]`, run `31370078581`).
+///
+/// **Its own file rather than a line in [`witness`]**, and the reason is
+/// migration rather than taxonomy. Every checkout compares that file for
+/// equality, including ones built from a commit older than this one, so a new
+/// line in it refuses every worktree on the host until each merges — a build
+/// system breaking every agent's tree in order to add a check.
+///
+/// **A fingerprint and not 2,159 lines.** The three trees above are 34 files,
+/// where naming the one that differs is worth a line each; this is 39 MiB and
+/// `git -C rust status` is what names a file inside it.
+fn std_fork_path(rust_dir: &Path) -> PathBuf {
+    rust_dir.join("build/toyos-std-fork-witness")
+}
+
+/// What `rust/library` currently hashes to, or `None` where there is no `rust/`
+/// source to read.
+///
+/// `None` is [`Owner::Installed`] and nothing else: a toolchain that arrived as
+/// an artifact is named for `HEAD:rust` by the workflow that published it, so
+/// its std fork is pinned by the tag — and a checkout that cannot read a source
+/// may not report having checked it.
+///
+/// The cost was measured before it was chosen: 45 ms warm over 2,159 files on
+/// the dev host, against 1.3 ms for the other three trees, deciding a rebuild
+/// that is minutes long.
+fn std_fork_witness(rust_dir: &Path) -> Option<String> {
+    let mut files = Vec::new();
+    collect_sources(&rust_dir.join("library"), &mut files);
+    if files.is_empty() {
+        return None;
+    }
+    files.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in files {
+        let data = fs::read(&path).unwrap_or_else(|e| panic!("witness {}: {e}", path.display()));
+        path.strip_prefix(rust_dir).unwrap_or(&path).hash(&mut hasher);
+        data.hash(&mut hasher);
+    }
+    Some(format!("{:016x}\n", hasher.finish()))
+}
+
+/// Whether the sysroot's std was compiled from a different `rust/library` than
+/// the one on disk now.
+///
+/// **No record is staleness here, where [`std_sources_stale`] reads it as
+/// ignorance.** That one may assume the primary built what is beside it,
+/// because the primary is the only thing that ever wrote the sysroot. This
+/// cannot: an edit to `rust/library` that nobody has built is exactly the state
+/// this exists to catch, and it is indistinguishable from a sysroot that
+/// predates the record. So the first build after this lands rebuilds std once,
+/// everywhere, and every build after that has an answer.
+fn std_fork_stale(rust_dir: &Path) -> bool {
+    let Some(want) = std_fork_witness(rust_dir) else {
+        return false;
+    };
+    fs::read_to_string(std_fork_path(rust_dir)).ok().as_deref() != Some(want.as_str())
+}
+
+/// Record the std fork the sysroot was just built from.
+fn record_std_fork(rust_dir: &Path) {
+    let Some(want) = std_fork_witness(rust_dir) else {
+        return;
+    };
+    fs::write(std_fork_path(rust_dir), want)
+        .unwrap_or_else(|e| panic!("write {}: {e}", std_fork_path(rust_dir).display()));
+}
+
 fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -404,7 +481,6 @@ pub fn ensure(
     }
 
     let compiler_stamp = stamps_dir.join("compiler.stamp");
-    let std_stamp = stamps_dir.join("std.stamp");
     let hosted_stamp = stamps_dir.join("hosted-rustc.stamp");
     let libc_stamp = stamps_dir.join("toyos-libc.stamp");
     lock.act_if(
@@ -422,9 +498,7 @@ pub fn ensure(
                 Some(Bootstrap::Full { invalidate_hosted: true })
             } else if !toolchain_exists {
                 Some(Bootstrap::Full { invalidate_hosted: false })
-            } else if stamps::dir_changed(&rust_dir.join("library"), &std_stamp)
-                || std_sources_stale(root, &rust_dir)
-            {
+            } else if std_sources_stale(root, &rust_dir) || std_fork_stale(&rust_dir) {
                 Some(Bootstrap::Std)
             } else {
                 None
@@ -442,7 +516,6 @@ pub fn ensure(
                     rebuild_std(root, &rust_dir);
                 }
             }
-            stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
             if kind == (Bootstrap::Full { invalidate_hosted: true }) {
                 let _ = fs::remove_file(&hosted_stamp);
             }
@@ -497,12 +570,14 @@ pub fn ensure(
         "record what the sysroot was built from",
         || {
             let want = witness(root);
-            (fs::read_to_string(witness_path(&rust_dir)).ok().as_deref() != Some(want.as_str()))
-                .then_some(want)
+            let stale = fs::read_to_string(witness_path(&rust_dir)).ok().as_deref()
+                != Some(want.as_str());
+            (stale || std_fork_stale(&rust_dir)).then_some(want)
         },
         |want| {
             fs::write(witness_path(&rust_dir), &want)
                 .unwrap_or_else(|e| panic!("write {}: {e}", witness_path(&rust_dir).display()));
+            record_std_fork(&rust_dir);
             record_claimant(root, &rust_dir);
         },
     );
@@ -515,6 +590,10 @@ pub fn ensure(
 /// amount of source here can rebuild a sysroot without `rust/`, so there is
 /// nothing to arbitrate and the answer is always to publish a toolchain built
 /// from these sources.
+///
+/// It is also the one checkout that cannot ask about the std fork at all — see
+/// [`std_fork_witness`], which answers `None` here because there is no `rust/`
+/// to read, and the artifact's own tag is what pins it instead.
 fn check_installed_toolchain(root: &Path, rust_dir: &Path, force_rebuild: bool, claim: bool) {
     let stage2 = rust_dir.join(format!("build/{}/stage2", host_triple()));
     assert!(
@@ -561,7 +640,10 @@ fn check_installed_toolchain(root: &Path, rust_dir: &Path, force_rebuild: bool, 
 /// answer the question across checkouts — two worktrees of one commit hold
 /// identical bytes at different paths with different mtimes — and answered it
 /// wrongly within one, since `git checkout` rewriting an unchanged file bought
-/// a full std rebuild.
+/// a full std rebuild. `rust/library` had such a stamp until 2026-08-10 and
+/// [`std_fork_stale`] is what replaced it, for the second reason as much as the
+/// first — and because a stamp under one worktree's `target/` answers for that
+/// worktree and for nobody else.
 fn std_sources_stale(root: &Path, rust_dir: &Path) -> bool {
     let Ok(recorded) = fs::read_to_string(witness_path(rust_dir)) else {
         // No record is ignorance, not disagreement. The primary checkout is the
@@ -619,6 +701,29 @@ fn adopt_shared_sysroot(
     let want = witness(root);
     let recorded = fs::read_to_string(witness_path(rust_dir)).ok();
     if recorded.as_deref() == Some(want.as_str()) {
+        // **A std fork that has moved is staleness, and staleness is not a
+        // claim.** `rust/` is the primary's and every checkout compiles against
+        // that one directory, so rebuilding std out of it produces the sysroot
+        // each of them wants and takes nothing from any of them — where a
+        // `toyos-abi` claim refuses every other worktree until it lands. So
+        // this rebuilds rather than refusing, and leaves the claimant alone.
+        if std_fork_stale(rust_dir) {
+            lock.act_if(
+                Scope::Global,
+                "rebuild std for a std fork that has moved",
+                || std_fork_stale(rust_dir).then_some(()),
+                |()| {
+                    eprintln!(
+                        "The std fork under {} has changed since the sysroot was built. \
+                         Rebuilding std.",
+                        rust_dir.display()
+                    );
+                    rebuild_std(root, rust_dir);
+                    crate::libc::build(root, rust_dir);
+                    record_std_fork(rust_dir);
+                },
+            );
+        }
         return;
     }
 
@@ -688,13 +793,15 @@ fn adopt_shared_sysroot(
         Scope::Global,
         "rebuild the shared sysroot from a linked worktree",
         || {
-            (fs::read_to_string(witness_path(rust_dir)).ok().as_deref() != Some(want.as_str()))
-                .then_some(())
+            (fs::read_to_string(witness_path(rust_dir)).ok().as_deref() != Some(want.as_str())
+                || std_fork_stale(rust_dir))
+            .then_some(())
         },
         |()| {
             eprintln!("Rebuilding the shared sysroot from {}...", root.display());
             rebuild_std(root, rust_dir);
             crate::libc::build(root, rust_dir);
+            record_std_fork(rust_dir);
             fs::write(witness_path(rust_dir), &want)
                 .unwrap_or_else(|e| panic!("write {}: {e}", witness_path(rust_dir).display()));
             record_claimant(root, rust_dir);
@@ -727,6 +834,93 @@ fn link_stale(stage2: &Path) -> bool {
     rustup_link().is_none_or(|current| current != stage2)
 }
 
+/// Run bootstrap, streaming its output where it was going anyway and keeping a
+/// copy.
+///
+/// `.status()` was enough while the only question was the exit code. It is not
+/// enough for the question [`refuse_on_compile_error`] asks, which is what the
+/// failure *was*.
+fn x_build(rust_dir: &Path, args: &[&str], what: &str) -> (bool, Vec<String>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let x = if rust_dir.join("x").exists() { "./x" } else { "./x.py" };
+    let mut child = Command::new(x)
+        .args(args)
+        .env("BOOTSTRAP_SKIP_TARGET_SANITY", "1")
+        .current_dir(rust_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("Failed to run {x} for {what}: {e}"));
+
+    // One log in the order the two streams produced it, because the error and
+    // the `--> file:line` under it are what a reader needs together.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let pump = |stream: Box<dyn Read + Send>, to_stderr: bool, log: Arc<Mutex<Vec<String>>>| {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if to_stderr {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                    let _ = std::io::stdout().flush();
+                }
+                log.lock().expect("the log outlives both pumps").push(line);
+            }
+        })
+    };
+    let out = pump(Box::new(child.stdout.take().expect("piped")), false, Arc::clone(&log));
+    let err = pump(Box::new(child.stderr.take().expect("piped")), true, Arc::clone(&log));
+    let status = child.wait().unwrap_or_else(|e| panic!("waiting for {x} {what}: {e}"));
+    out.join().expect("the stdout pump");
+    err.join().expect("the stderr pump");
+
+    let log = Arc::try_unwrap(log).expect("both pumps are joined").into_inner();
+    (status.success(), log.expect("no pump panicked while holding it"))
+}
+
+/// Where a compile error starts in an `x build` log, if there is one.
+///
+/// Both bootstrap callers let a non-zero `x build` through when the artifacts
+/// they need are on disk, because rustdoc for ToyOS does not link and never
+/// has. That allowance used to be *anything at all*, as long as a `rustc` from
+/// some earlier build was still there — so run `31370078581` compiled std with
+/// `error[E0433]`, took the allowance, and died 83 seconds and 260 lines later
+/// at a missing file. The reported failure was the consequence.
+///
+/// A compile error cannot be a link failure, so it cannot be the thing that
+/// allowance is for.
+fn compile_error_at(log: &[String]) -> Option<usize> {
+    log.iter().position(|l| {
+        let l = l.trim_start();
+        l.starts_with("error[") || l.starts_with("error: could not compile")
+    })
+}
+
+/// Stop on the first real error rather than on what it goes on to break.
+fn refuse_on_compile_error(log: &[String], what: &str) {
+    let Some(at) = compile_error_at(log) else { return };
+    let end = (at + 6).min(log.len());
+    panic!("{what} did not compile:\n{}", log[at..end].join("\n"));
+}
+
+/// What an `x build` failure the artifact check is willing to tolerate actually
+/// said, so that "expected" is a claim the reader can check.
+fn tolerated_failure(log: &[String], what: &str) {
+    let errors: Vec<&str> =
+        log.iter().map(String::as_str).filter(|l| l.trim_start().starts_with("error")).collect();
+    eprintln!(
+        "Note: {what} exited non-zero and the artifacts it must produce are all there, so this \
+         is the ToyOS rustdoc link failure. It reported:\n{}",
+        if errors.is_empty() {
+            "  (no line beginning `error`)".to_string()
+        } else {
+            errors.join("\n")
+        }
+    );
+}
+
 fn full_bootstrap(root: &Path, rust_dir: &Path) {
     let toyos_ld = toyos_ld_binary(root);
 
@@ -747,22 +941,21 @@ fn full_bootstrap(root: &Path, rust_dir: &Path) {
         }
     }
 
-    let x = if rust_dir.join("x").exists() { "./x" } else { "./x.py" };
-    let status = Command::new(x)
-        .args(["build", "--stage", "2", "--warnings", "warn"])
-        .env("BOOTSTRAP_SKIP_TARGET_SANITY", "1")
-        .current_dir(rust_dir)
-        .status()
-        .expect("Failed to run x build");
+    let build = ["build", "--stage", "2", "--warnings", "warn"];
+    let (ok, log) = x_build(rust_dir, &build, "the toolchain");
 
-    if !status.success() {
-        // Check if essential artifacts exist (rustdoc for ToyOS may fail, that's ok)
+    if !ok {
+        refuse_on_compile_error(&log, "the toolchain");
+        // rustdoc for ToyOS may fail to link; rustc may not be missing.
         let stage2 = rust_dir.join(format!("build/{host}/stage2"));
         assert!(
             stage2.join("bin/rustc").exists(),
-            "Toolchain build failed and rustc artifacts are missing"
+            "the toolchain build failed and {} is not there.\n\
+             Nothing in its output was a compile error, so this is a link or a bootstrap \
+             failure — the last lines above are the whole of what it said.",
+            stage2.join("bin/rustc").display()
         );
-        eprintln!("Note: some targets may have failed to link (expected), but rustc built successfully.");
+        tolerated_failure(&log, "the toolchain build");
     }
 }
 
@@ -782,43 +975,38 @@ fn rebuild_std(root: &Path, rust_dir: &Path) {
         }
     }
 
-    let x = if rust_dir.join("x").exists() { "./x" } else { "./x.py" };
-    let status = Command::new(x)
-        .args(["build", "--stage", "2", "library", "--warnings", "warn"])
-        .env("BOOTSTRAP_SKIP_TARGET_SANITY", "1")
-        .current_dir(rust_dir)
-        .status()
-        .expect("Failed to run x build library");
-    assert!(status.success(), "std rebuild failed");
+    let (ok, log) =
+        x_build(rust_dir, &["build", "--stage", "2", "library", "--warnings", "warn"], "std");
+    refuse_on_compile_error(&log, "std");
+    assert!(ok, "the std rebuild failed, and nothing in its output was a compile error");
 }
 
 fn build_hosted_rustc(rust_dir: &Path, toyos_ld: &Path) {
     eprintln!("Building ToyOS-hosted rustc...");
     write_config(rust_dir, &host_triple(), toyos_ld, true);
 
-    let x = if rust_dir.join("x").exists() { "./x" } else { "./x.py" };
-    let status = Command::new(x)
-        .args(["build", "--stage", "2", "--warnings", "warn"])
-        .env("BOOTSTRAP_SKIP_TARGET_SANITY", "1")
-        .current_dir(rust_dir)
-        .status()
-        .expect("Failed to run x build for hosted rustc");
+    let (ok, log) =
+        x_build(rust_dir, &["build", "--stage", "2", "--warnings", "warn"], "the hosted rustc");
+    refuse_on_compile_error(&log, "the hosted rustc");
 
-    // rustdoc for ToyOS may fail to link (expected), but rustc + librustc_driver must exist
+    // rustdoc for ToyOS may fail to link; rustc and librustc_driver may not.
     let toyos_stage2 = rust_dir.join("build/x86_64-unknown-toyos/stage2");
     assert!(
         toyos_stage2.join("bin/rustc").exists(),
-        "Hosted rustc build failed: {} missing", toyos_stage2.join("bin/rustc").display()
+        "the hosted rustc build failed and {} is not there.\n\
+         Nothing in its output was a compile error, so this is a link or a bootstrap failure.",
+        toyos_stage2.join("bin/rustc").display()
     );
     assert!(
         fs::read_dir(toyos_stage2.join("lib"))
             .map(|d| d.filter_map(|e| e.ok())
                 .any(|e| e.file_name().to_string_lossy().starts_with("librustc_driver")))
             .unwrap_or(false),
-        "Hosted rustc build failed: librustc_driver*.so missing"
+        "the hosted rustc build failed: librustc_driver*.so is not in {}",
+        toyos_stage2.join("lib").display()
     );
-    if !status.success() {
-        eprintln!("Note: rustdoc for ToyOS failed to link (expected), but rustc built successfully.");
+    if !ok {
+        tolerated_failure(&log, "the hosted rustc build");
     }
     // No config restore needed — full_bootstrap and rebuild_std write the
     // cross-only config before they run, so the next non-hosted build
@@ -1087,5 +1275,104 @@ mod tests {
         git(&root, &["checkout", "-qb", "only"]);
         git(&root, &["branch", "-qD", "main"]);
         assert_eq!(standing(&root), Standing::Unknown);
+    }
+
+    /// Verbatim from run `31370078581`, the run this check exists because of:
+    /// the four warnings are real and were what the error had to be told apart
+    /// from, and the allowance took it and reported a missing file 83 seconds
+    /// later.
+    fn run_31370078581() -> Vec<String> {
+        [
+            "   Compiling panic_unwind v0.0.0 (/home/runner/work/toyos/toyos/rust/library/panic_unwind)",
+            "error[E0433]: cannot find `rtabort` in `crate`",
+            "  --> library/std/src/sys/pal/toyos/tls.rs:35:26",
+            "   |",
+            "35 |         Err(_) => crate::rtabort!(\"no TLS block for a dlopen'd module\"),",
+            "   |                          ^^^^^^^ could not find `rtabort` in the crate root",
+            "warning: unused import: `IntoInner`",
+            "  --> library/std/src/os/fd/owned.rs:24:38",
+            "warning: unnecessary `unsafe` block",
+            "warning: unused variable: `e`",
+            "For more information about this error, try `rustc --explain E0433`.",
+            "warning: `std` (lib) generated 4 warnings",
+            "error: could not compile `std` (lib) due to 1 previous error; 4 warnings emitted",
+            "Build completed unsuccessfully in 0:01:23",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    #[test]
+    fn the_first_real_error_is_the_one_reported() {
+        let log = run_31370078581();
+        let at = compile_error_at(&log).expect("a compile error");
+        assert_eq!(log[at], "error[E0433]: cannot find `rtabort` in `crate`");
+        assert!(
+            log[at + 1].contains("library/std/src/sys/pal/toyos/tls.rs:35"),
+            "the file and line have to come with it, or the report is a name and a shrug"
+        );
+    }
+
+    /// The negative control is the failure the allowance is *for*: a link
+    /// failure has no `error[` and no `could not compile`, so it must not be
+    /// mistaken for a compile error and stop a build that has its artifacts.
+    #[test]
+    fn a_link_failure_is_not_a_compile_error() {
+        let log = [
+            "error: linking with `toyos-ld` failed: exit status: 1",
+            "  |",
+            "  = note: rust-lld: error: undefined symbol: __rust_probestack",
+            "Build completed unsuccessfully in 0:00:41",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(compile_error_at(&log), None);
+    }
+
+    /// **The three cycles this cost, as a test.** A `rust/library` edit was
+    /// invisible to every checkout: the record did not exist, so a build
+    /// compiled against the std already on disk.
+    ///
+    /// And the fourth state is the one only a runner is in — no `rust/` source
+    /// at all, where the question cannot be asked and must not be answered
+    /// `stale`, or every CI shard refuses the toolchain it just downloaded.
+    #[test]
+    fn a_std_fork_edit_is_seen_and_a_missing_fork_is_not_a_verdict() {
+        let rust_dir = std::env::temp_dir().join("toyos-std-fork-witness");
+        let _ = fs::remove_dir_all(&rust_dir);
+        fs::create_dir_all(rust_dir.join("build")).unwrap();
+
+        // No `rust/library`: Owner::Installed, and nothing to say.
+        assert_eq!(std_fork_witness(&rust_dir), None);
+        assert!(!std_fork_stale(&rust_dir), "a shard must not refuse what it cannot read");
+        record_std_fork(&rust_dir);
+        assert!(!std_fork_path(&rust_dir).exists(), "and it records nothing either");
+
+        fs::create_dir_all(rust_dir.join("library/std/src/sys/pal/toyos")).unwrap();
+        let tls = rust_dir.join("library/std/src/sys/pal/toyos/tls.rs");
+        fs::write(&tls, b"pub fn block() {}\n").unwrap();
+
+        assert!(std_fork_stale(&rust_dir), "no record is staleness, not ignorance");
+        record_std_fork(&rust_dir);
+        assert!(!std_fork_stale(&rust_dir));
+
+        fs::write(&tls, b"pub fn block() { crate::rtabort!(\"no TLS block\") }\n").unwrap();
+        assert!(std_fork_stale(&rust_dir), "the edit that reached CI uncompiled");
+        record_std_fork(&rust_dir);
+        assert!(!std_fork_stale(&rust_dir));
+    }
+
+    /// **A new line in the witness would refuse every worktree on the host**
+    /// until each merged, because every checkout compares that file for
+    /// equality and the ones built from an older commit compare the whole of
+    /// it. That is why the std fork has a file of its own.
+    #[test]
+    fn the_witness_a_worktree_compares_is_unchanged_by_the_std_fork() {
+        let root = scratch("witness-shape");
+        assert!(
+            witness(&root).lines().all(|l| SYSROOT_SOURCES.iter().any(|t| l.starts_with(t))),
+            "witness: {}",
+            witness(&root)
+        );
     }
 }
