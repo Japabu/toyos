@@ -147,7 +147,35 @@ fn dup_at_answers_the_slot_not_the_number() {
         "a reused slot answered its old generation, so the closed handle still names it",
     );
     syscall::close(second);
-    println!("  dup2: slot {SPARE_SLOT} answered generation 0, then 1");
+
+    // **And replacing a *live* slot keeps its generation, deliberately.** The
+    // number is what a POSIX caller goes on using — `printf` writes to the
+    // literal `1`, and `userland/libc`'s `dup2` hands back the raw value — so a
+    // bump here would make every write after `dup2(pipe, 1)` `Stale`, which
+    // ends the process. The cost is that a handle the caller still holds for
+    // the displaced object now names the replacement, which is exactly what
+    // `dup2` is for and is stated at `HandleTable::install_at`.
+    //
+    // **Witnessed through the rights and not through a data path**, because the
+    // two objects have to be told apart by what the *table* says: a pipe write
+    // end carries `WRITE` and a region carries `DUP|TRANSFER|MAP` and does not.
+    let held = syscall::dup2(write.as_handle(), SPARE_SLOT).expect("dup2 onto the spare slot");
+    let writable = syscall::dup_narrowed(held, Rights::WRITE)
+        .expect("the spare slot does not name the pipe end that was put there");
+    syscall::close(writable);
+
+    let region = toyos::shm::SharedMemory::create(4096).expect("a region of our own");
+    let over = syscall::dup2(region.as_handle(), SPARE_SLOT).expect("dup2 over a live slot");
+    assert_eq!(over, held, "replacing a live slot moved its generation");
+    // The number resolves — a `Stale` one would end this process rather than
+    // answer — and what it names is the region, which has no `WRITE` to give.
+    assert_eq!(
+        syscall::dup_narrowed(held, Rights::WRITE),
+        Err(SyscallError::PermissionDenied),
+        "a replaced slot did not name its replacement",
+    );
+    syscall::close(over);
+    println!("  dup2: slot {SPARE_SLOT} answered generation 0, then 1, and a live replace kept it");
 }
 
 /// Every object above is made and closed, so nothing of any kind is left.

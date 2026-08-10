@@ -179,11 +179,19 @@ fn launch_forever<'a>(
         // deadline that removes it has to be a wake in its own right —
         // otherwise a silent client is only ever timed out by some other
         // client's traffic, and with the table full there is no other client.
-        let timeout = if pending.is_empty() {
-            u64::MAX
-        } else {
-            HANDSHAKE_TIMEOUT.as_nanos() as u64
-        };
+        //
+        // **What is left of the oldest one's deadline, not a fresh
+        // `HANDSHAKE_TIMEOUT`.** Any readiness at all restarts a wait, so a
+        // full timeout each round is a bound of nearly twice the number for a
+        // client that goes quiet just before some other connection wakes the
+        // loop — and a bound that is not the bound is the class this whole
+        // change is about.
+        let now = Instant::now();
+        let timeout = pending
+            .iter()
+            .map(|p| HANDSHAKE_TIMEOUT.saturating_sub(now.duration_since(p.since)))
+            .min()
+            .map_or(u64::MAX, |left| left.as_nanos() as u64);
         ready.clear();
         poller.wait(1, timeout, |token| ready.push(token));
 

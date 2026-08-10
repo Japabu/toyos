@@ -14,7 +14,7 @@ use crate::process::{
 use crate::scheduler;
 use crate::user_ptr::UserBytes;
 use toyos_abi::handle::{RawHandle, Rights};
-use toyos_abi::syscall::{EndowEntry, SyscallError, MAX_ENDOWMENTS, MAX_LABELS_LEN};
+use toyos_abi::syscall::{EndowEntry, SyscallError, MAX_ENDOWMENTS, MAX_LABELS_LEN, MAX_SLOT_MAP};
 
 /// One `[child_slot, parent_handle]` pair of `SpawnArgs::slot_map_ptr`, in
 /// bytes.
@@ -159,6 +159,16 @@ impl PendingHandles {
             if !rights.contains(Rights::TRANSFER) {
                 return Err(SyscallError::PermissionDenied.into());
             }
+            // **Named twice is refused here, because the preflight cannot see
+            // it later.** Every check above runs against a table nothing has
+            // been taken out of yet, so a repeat passes both times; the first
+            // removal then retires the slot and the second answers `Stale`,
+            // which the `expect` below turns into a kernel panic a caller
+            // reaches with one argument. `sys_handle_send` refuses the same
+            // shape for the same reason.
+            if moving.iter().any(|(_, seen)| *seen == handle) {
+                return Err(SyscallError::InvalidArgument.into());
+            }
             moving.push((EndowEntry { label_off, label_len, handle, _pad: 0 }, handle));
         }
         // The child's table must be able to take all of them before the
@@ -196,6 +206,15 @@ pub fn build_child_handles(
     labels: &[u8],
 ) -> Result<PendingHandles, Refusal> {
     if endow.len() / ENDOW_ENTRY_LEN > MAX_ENDOWMENTS {
+        return Err(SyscallError::InvalidArgument.into());
+    }
+    // **Before the loop, because the loop is the cost.** `install_at`'s cap
+    // refuses a *slot* past the table and says nothing about how many pairs
+    // name the same one: a caller repeating `(0, h)` keeps the child's table at
+    // one entry while every iteration duplicates a handle under the parent's
+    // lock and hands back a live entry this call has to hold until the lock is
+    // released.
+    if slot_map.len() / SLOT_PAIR_LEN > MAX_SLOT_MAP {
         return Err(SyscallError::InvalidArgument.into());
     }
     if labels.len() > MAX_LABELS_LEN {

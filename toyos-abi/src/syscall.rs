@@ -312,6 +312,17 @@ pub const PROVIDE_PREFIX: &str = "provide:";
 /// primitive, refused by name, never truncated — the widest manifest row plus
 /// stdio.
 pub const MAX_ENDOWMENTS: usize = 32;
+/// `(child slot, parent handle)` pairs one spawn may carry.
+///
+/// **Derived rather than chosen.** A slot map installs into the child's table,
+/// which has [`RawHandle::MAX_SLOTS`] slots, so a longer one necessarily names
+/// a slot twice and the second pair says everything the first did. Without it
+/// the count was bounded only by the 2 MiB window the arguments are read
+/// through — 262,144 pairs, every one of them a `duplicate_entry` under the
+/// parent's own lock, and every repeat of one slot displacing a live entry the
+/// caller has to carry out of that lock. That vector passes `MAX_HEAP_ALLOC`
+/// at 87,211 repeats, and the allocator's refusal there is a kernel panic.
+pub const MAX_SLOT_MAP: usize = RawHandle::MAX_SLOTS;
 /// Bytes of label blob one endowment table may carry.
 pub const MAX_LABELS_LEN: usize = 4096;
 

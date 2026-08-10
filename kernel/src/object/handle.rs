@@ -255,6 +255,22 @@ impl HandleTable {
     /// Spawn's stdio seeding and `SYS_HANDLE_DUP_AT`. The displaced entry is
     /// returned rather than dropped here, so its `handle_count` decrement
     /// happens where the caller decides — outside whatever guard it is holding.
+    ///
+    /// **Replacing a live slot does not advance its generation, and that is the
+    /// point of `dup2` rather than an oversight.** A handle the caller was
+    /// already holding for the displaced object therefore names the
+    /// replacement. The alternative was considered and is wrong: the number is
+    /// what a POSIX caller keeps using — `printf` writes to the literal `1`,
+    /// and `userland/libc`'s `dup2` hands back `f.0 as i32` — so bumping here
+    /// would make every write after `dup2(pipe, 1)` `Stale`, which ends the
+    /// process. [`remove`](Self::remove) bumps because *there* the slot is
+    /// being given up; here it is being pointed somewhere else by its owner,
+    /// and no authority crosses a process boundary either way.
+    ///
+    /// The consequence to know: a `RawHandle` names one object for as long as
+    /// its holder does not itself redirect the slot. Anything using a handle
+    /// value as a *name* — `toyos::surface::ClientId` — is relying on that
+    /// narrower statement.
     #[must_use = "the displaced entry must be dropped by the caller"]
     pub fn install_at(
         &mut self,
