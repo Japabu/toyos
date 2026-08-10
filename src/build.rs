@@ -646,33 +646,43 @@ pub fn declared_actuators(root: &Path) -> Vec<String> {
     names
 }
 
-/// Refuse to write a shipping image whose kernel binary names an actuator.
+/// Refuse to write an image whose kernel does not carry exactly the actuators
+/// its feature set says it does.
 ///
 /// [`assert_overflow_checked`]'s shape and for its reason: the property is
 /// about the artifact, so the artifact is what is asked. Two builds quietly
 /// becoming one build with test hooks in it is the failure mode this exists
 /// for, and a convention nothing enforces is not a bar.
 ///
-/// Only a kernel built with no features at all is asked, because that is what
-/// "shipping" means here — `--kernel-feature`, `--kernel-param` and `--debug`
+/// **Both directions, because one of them is a spelling of `true`.** A shipping
+/// kernel must name none of them; the test kernel must name all of them, which
+/// is what says the search works at all — measured on the two binaries this
+/// build produces, 0 of 47 in one and 47 of 47 in the other.
+///
+/// A kernel built with no features is the shipping one, because that is what
+/// "shipping" means here: `--kernel-feature`, `--kernel-param` and `--debug`
 /// each say out loud that this image is not one.
-fn assert_no_actuators(root: &Path, kernel: &[u8]) {
-    let found: Vec<String> = declared_actuators(root)
-        .into_iter()
-        .filter(|name| {
-            let needle = name.as_bytes();
-            kernel
-                .windows(needle.len())
-                .any(|w| w == needle)
-        })
-        .collect();
+fn assert_actuators_match_features(root: &Path, features: &str, kernel: &[u8]) {
+    let want = match features {
+        "" => false,
+        f if f == TEST_KERNEL.join(",") => true,
+        _ => return,
+    };
+    let names = declared_actuators(root);
+    let named = |name: &String| {
+        let needle = name.as_bytes();
+        kernel.windows(needle.len()).any(|w| w == needle)
+    };
+    let wrong: Vec<&String> = names.iter().filter(|n| named(n) != want).collect();
     assert!(
-        found.is_empty(),
-        "the shipping kernel names {} actuator(s): {}.\n\
-         Everything under `kernel/src/actuator.rs` belongs to a kernel built with \
-         `boot-actuators`, and an image that ships must not be able to be told to break.",
-        found.len(),
-        found.join(", "),
+        wrong.is_empty(),
+        "the {} kernel {} {} of the {} actuators `kernel/src/actuator.rs` declares: {wrong:?}.\n\
+         Everything under that file belongs to a kernel built with `boot-actuators`, and an \
+         image that ships must not be able to be told to break.",
+        if want { "test" } else { "shipping" },
+        if want { "is missing" } else { "names" },
+        wrong.len(),
+        names.len(),
     );
 }
 
@@ -774,9 +784,7 @@ pub fn build(
 
     let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
     assert_overflow_checked("kernel", &kernel_bytes);
-    if kernel_features.is_empty() {
-        assert_no_actuators(root, &kernel_bytes);
-    }
+    assert_actuators_match_features(root, &kernel_features, &kernel_bytes);
     assert_kernel_is_softfloat(&path_env);
     let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
     let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, &cmdline);
@@ -991,9 +999,7 @@ pub fn build_test_image(
             {
                 let bytes = fs::read(&staged).expect("Failed to read staged kernel");
                 assert_overflow_checked("kernel", &bytes);
-                if features.is_empty() {
-                    assert_no_actuators(root, &bytes);
-                }
+                assert_actuators_match_features(root, &features, &bytes);
                 assert_kernel_is_softfloat(&path_env);
                 bytes
             }

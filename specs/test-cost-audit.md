@@ -1874,8 +1874,11 @@ The owner took §3.6 on 2026-08-10. What landed:
   is the earliest of the 47. It is our own image builder's string through our
   own bootloader, so an unknown token panics by name: no trust boundary is
   crossed anywhere on that path.
-- **`assert_no_actuators` refuses to write a shipping image whose kernel binary
-  names an actuator**, in `assert_overflow_checked`'s place and for its reason.
+- **`assert_actuators_match_features` asks the artifact, both ways**, in
+  `assert_overflow_checked`'s place and for its reason: a shipping kernel must
+  name none of the 47 and the test kernel must name all of them, which is what
+  keeps the search from being a spelling of `true`. Measured on the two binaries
+  this build produces — 0 of 47 at 3,829,512 bytes and 47 of 47 at 4,247,272.
   The names come from `kernel/src/actuator.rs`, so deleting one takes its
   command lines with it, exactly as `declared_kernel_features` does for a
   feature.
