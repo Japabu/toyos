@@ -78,6 +78,23 @@ pub const MSG_KEY: u32 = 5;
 /// user is pressing now would be worse than being told no.
 pub const MAX_CLIENTS: usize = 4;
 
+/// How a surface owner tells its clients apart in a log line.
+///
+/// **The connection's own handle, in this process's table.** A peer used to be
+/// named by the pid the kernel reported at accept; the kernel does not assert
+/// that any more, and a client's own claim about itself is a claim. A handle
+/// carries a generation and a closed slot is reissued at the next one, so this
+/// names one connection over the whole life of the process holding it — and it
+/// designates nothing anywhere else, because a handle is a slot in one table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientId(RawHandle);
+
+impl core::fmt::Display for ClientId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0 .0)
+    }
+}
+
 /// Something the surface owner should log or act on.
 #[derive(Clone, Copy, Debug)]
 pub enum Notice {
@@ -86,11 +103,11 @@ pub enum Notice {
     LayoutChanged,
     /// This client now takes the key transitions the surface would have
     /// translated.
-    Grabbed { pid: u32 },
+    Grabbed { client: ClientId },
     /// The client holding the grab has gone; translation resumes.
-    Released { pid: u32 },
+    Released { client: ClientId },
     /// A peer was dropped, and why — for the log line that names it.
-    Dropped { pid: u32, why: &'static str },
+    Dropped { client: ClientId, why: &'static str },
 }
 
 /// What [`Host::deliver`] did with a transition.
@@ -104,7 +121,7 @@ pub enum Delivery {
 
 struct Peer {
     conn: Connection,
-    pid: u32,
+    id: ClientId,
     rx: FrameRx<0>,
 }
 
@@ -117,7 +134,7 @@ pub struct Host {
     /// One slot per peer, so a drop decided inside `deliver` cannot be lost
     /// before the caller next asks for notices. A peer is dropped once, and
     /// its slot is written at that moment and read by the next [`Host::poll`].
-    drops: [Option<(u32, &'static str)>; MAX_CLIENTS],
+    drops: [Option<(ClientId, &'static str)>; MAX_CLIENTS],
     pending: [Option<Notice>; MAX_CLIENTS],
 }
 
@@ -156,20 +173,20 @@ impl Host {
     /// Accept and the first frame are two events: nothing is read here, and a
     /// client that connects and then says nothing costs a slot and no more.
     pub fn accept(&mut self) {
-        let Ok(accepted) = self.acceptor.accept() else {
+        let Ok(conn) = self.acceptor.accept() else {
             return;
         };
+        let id = ClientId(conn.fd());
         let Some(slot) = self.peers.iter().position(|p| p.is_none()) else {
             // Dropping the connection is the refusal: the client's next read
             // sees the hang-up.
             self.note(Notice::Dropped {
-                pid: accepted.client_pid,
+                client: id,
                 why: "this surface already holds as many input clients as it will",
             });
             return;
         };
-        self.peers[slot] =
-            Some(Peer { conn: accepted.conn, pid: accepted.client_pid, rx: FrameRx::new() });
+        self.peers[slot] = Some(Peer { conn, id, rx: FrameRx::new() });
     }
 
     /// Read what every client has sent, and hand back one notice.
@@ -179,8 +196,8 @@ impl Host {
     /// succeeded.
     pub fn poll(&mut self) -> Option<Notice> {
         for i in 0..MAX_CLIENTS {
-            if let Some((pid, why)) = self.drops[i].take() {
-                return Some(Notice::Dropped { pid, why });
+            if let Some((client, why)) = self.drops[i].take() {
+                return Some(Notice::Dropped { client, why });
             }
             if let Some(notice) = self.pending[i].take() {
                 return Some(notice);
@@ -188,25 +205,25 @@ impl Host {
         }
         for i in 0..MAX_CLIENTS {
             let Some(peer) = &mut self.peers[i] else { continue };
-            let (pid, step) = (peer.pid, peer.rx.pump(&peer.conn));
+            let (client, step) = (peer.id, peer.rx.pump(&peer.conn));
             match step {
                 RxStep::Idle => {}
                 RxStep::Eof => {
                     let held_the_grab = self.grab == Some(i);
                     self.close(i);
                     if held_the_grab {
-                        return Some(Notice::Released { pid });
+                        return Some(Notice::Released { client });
                     }
                 }
                 RxStep::Malformed => {
                     self.close(i);
                     return Some(Notice::Dropped {
-                        pid,
+                        client,
                         why: "its frame is not one this protocol can produce",
                     });
                 }
                 RxStep::Frame { msg_type, .. } => {
-                    if let Some(notice) = self.frame(i, pid, msg_type) {
+                    if let Some(notice) = self.frame(i, client, msg_type) {
                         return Some(notice);
                     }
                 }
@@ -215,7 +232,7 @@ impl Host {
         None
     }
 
-    fn frame(&mut self, i: usize, pid: u32, msg_type: u32) -> Option<Notice> {
+    fn frame(&mut self, i: usize, client: ClientId, msg_type: u32) -> Option<Notice> {
         match msg_type {
             MSG_GRAB_KEYS => {
                 let free = self.grab.is_none();
@@ -229,20 +246,23 @@ impl Host {
                 if !taken {
                     self.close(i);
                     return Some(Notice::Dropped {
-                        pid,
+                        client,
                         why: "it would not take the answer to its own request",
                     });
                 }
                 if free {
                     self.grab = Some(i);
-                    return Some(Notice::Grabbed { pid });
+                    return Some(Notice::Grabbed { client });
                 }
                 None
             }
             MSG_LAYOUT_CHANGED => Some(Notice::LayoutChanged),
             _ => {
                 self.close(i);
-                Some(Notice::Dropped { pid, why: "it sent a message this surface does not serve" })
+                Some(Notice::Dropped {
+                    client,
+                    why: "it sent a message this surface does not serve",
+                })
             }
         }
     }
@@ -255,11 +275,11 @@ impl Host {
             return Delivery::NotGrabbed;
         };
         let peer = self.peers[i].as_ref().expect("the grab names a live peer");
-        let (pid, sent) = (peer.pid, peer.conn.try_send(MSG_KEY, &event));
+        let (client, sent) = (peer.id, peer.conn.try_send(MSG_KEY, &event));
         match sent {
             Ok(()) => Delivery::Sent,
             other => {
-                self.refused(i, pid, other, "it would not take a key event it asked for");
+                self.refused(i, client, other, "it would not take a key event it asked for");
                 Delivery::NotGrabbed
             }
         }
@@ -269,8 +289,8 @@ impl Host {
     pub fn notify_layout(&mut self) {
         for i in 0..MAX_CLIENTS {
             let Some(peer) = &self.peers[i] else { continue };
-            let (pid, sent) = (peer.pid, peer.conn.try_signal(MSG_LAYOUT_CHANGED));
-            self.refused(i, pid, sent, "it would not take a layout notification");
+            let (client, sent) = (peer.id, peer.conn.try_signal(MSG_LAYOUT_CHANGED));
+            self.refused(i, client, sent, "it would not take a layout notification");
         }
     }
 
@@ -284,13 +304,19 @@ impl Host {
     /// fault: it means the pipe is full, so the peer has a backlog of messages
     /// it asked for and never read, and there is no way to retract the half a
     /// frame the kernel took.
-    fn refused(&mut self, i: usize, pid: u32, sent: Result<(), TrySendError>, why: &'static str) {
+    fn refused(
+        &mut self,
+        i: usize,
+        client: ClientId,
+        sent: Result<(), TrySendError>,
+        why: &'static str,
+    ) {
         match sent {
             Ok(()) => {}
             Err(TrySendError::Syscall(_)) => self.close(i),
             Err(TrySendError::Full) | Err(TrySendError::TooLarge) => {
                 self.close(i);
-                self.drops[i] = Some((pid, why));
+                self.drops[i] = Some((client, why));
             }
         }
     }

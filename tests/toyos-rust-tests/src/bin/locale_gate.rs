@@ -108,9 +108,13 @@ impl Surface {
                     self.host.notify_layout();
                     println!("surface: layout is now {}", self.translator.layout());
                 }
-                Notice::Grabbed { pid } => println!("surface: pid {pid} has the keys"),
-                Notice::Released { pid } => println!("surface: pid {pid} gave the keys back"),
-                Notice::Dropped { pid, why } => println!("surface: dropped pid {pid} — {why}"),
+                Notice::Grabbed { client } => println!("surface: client {client} has the keys"),
+                Notice::Released { client } => {
+                    println!("surface: client {client} gave the keys back")
+                }
+                Notice::Dropped { client, why } => {
+                    println!("surface: dropped client {client} — {why}")
+                }
             }
         }
     }

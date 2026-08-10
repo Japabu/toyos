@@ -3,9 +3,11 @@
 //!
 //! The owner's machine lost its whole desktop to this: doom aborted, and three
 //! seconds later the compositor granted a resized window's buffer to it —
-//! `grant_shared` answers `InvalidArgument` for a pid the process table no
-//! longer has, `SharedMemory::grant` was infallible over that, and every other
-//! window went with it. `exit: compositor code=101`.
+//! `grant_shared` answered `InvalidArgument` for a pid the process table no
+//! longer had, `SharedMemory::grant` was infallible over that, and every other
+//! window went with it. `exit: compositor code=101`. There is no grant left to
+//! be infallible over: a buffer travels as a handle and a client that has gone
+//! is a refused send.
 //!
 //! Five cases. The first is that one; the next three are the same shape found
 //! by reading for it — places where a message from any client reached a
@@ -27,6 +29,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::{exit, Command, Stdio};
 
 use toyos::endow;
+use toyos::shm::SharedMemory;
 use toyos::{ipc, Connection};
 use toyos_abi::syscall::{self, SyscallError};
 use toyos_abi::RawHandle;
@@ -106,17 +109,18 @@ fn run() {
     write_raw_fd(doubled.fd(), &create_frame(), "a second create");
     probe("a second create on a live window");
 
-    // A region this process owns and has granted to nobody: the compositor is
-    // refused when it maps the token, which is the only answer the kernel can
-    // give and one message from any client.
-    let token = syscall::alloc_shared(4096).expect("a region of our own");
-    clipboard_shm(token, 64, "an ungranted clipboard token");
-    probe("an ungranted clipboard token");
+    // A clipboard frame with no region sent ahead of it. The receive is not a
+    // poll — a short batch is a peer that sent its frame first — so this must
+    // cost the client its connection and nothing else.
+    clipboard_shm(None, 64, "a clipboard frame with no region");
+    probe("a clipboard frame with no region");
 
-    // The same token with a length no region can satisfy. The length decides
-    // how much of somebody else's memory gets read as clipboard text, so it is
-    // the compositor's to bound rather than the client's to choose.
-    clipboard_shm(token, u32::MAX, "a clipboard longer than any region");
+    // A region really sent, with a length no region can satisfy. The length
+    // decides how much of the region is read as clipboard text, so it is the
+    // compositor's to bound rather than the client's to choose.
+    let region = SharedMemory::create(4096).expect("a region of our own");
+    let shared = region.share().expect("a second handle to it");
+    clipboard_shm(Some(shared), u32::MAX, "a clipboard longer than any region");
     probe("a clipboard longer than any region");
 
     // The other side of a window ending: the client has to be able to leave.
@@ -204,11 +208,15 @@ fn create_frame() -> Vec<u8> {
     frame
 }
 
-fn clipboard_shm(token: u32, len: u32, what: &str) {
+fn clipboard_shm(region: Option<toyos_abi::RawHandle>, len: u32, what: &str) {
     let conn = endow::service("compositor")
         .unwrap_or_else(|e| fail(&format!("[{what}] the compositor is not serving: {e:?}")));
-    conn.send(window::MSG_CLIPBOARD_SET_SHM, &window::ClipboardShmMsg { token, len })
-        .unwrap_or_else(|e| fail(&format!("[{what}] could not send: {e:?}")));
+    let msg = window::ClipboardShmMsg { len };
+    let sent = match region {
+        Some(h) => conn.send_with_handles(&[h], window::MSG_CLIPBOARD_SET_SHM, &msg),
+        None => conn.send(window::MSG_CLIPBOARD_SET_SHM, &msg),
+    };
+    sent.unwrap_or_else(|e| fail(&format!("[{what}] could not send: {e:?}")));
 }
 
 /// Every write here fits in the pipe it goes into, so a blocking `write` can

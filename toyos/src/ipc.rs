@@ -199,6 +199,22 @@ impl Connection {
         try_send_bytes(self.fd(), msg_type, data)
     }
 
+    /// [`send_with_handles`](Self::send_with_handles) for a server that will
+    /// not park on a client.
+    ///
+    /// The handles move first here too, and a refused frame leaves them in the
+    /// peer's queue — where the queue releases them when the connection goes,
+    /// which is the next thing that happens to a peer this refused.
+    pub fn try_send_with_handles<T: IpcPayload>(
+        &self,
+        handles: &[RawHandle],
+        msg_type: u32,
+        payload: &T,
+    ) -> Result<(), TrySendError> {
+        syscall::handle_send(self.fd(), handles).map_err(TrySendError::Syscall)?;
+        self.try_send(msg_type, payload)
+    }
+
     pub fn recv_header(&self) -> Result<IpcHeader, IpcError> {
         recv_header(self.fd())
     }
@@ -238,6 +254,17 @@ impl Connection {
         out: &mut [RawHandle; syscall::MAX_TRANSFER_HANDLES],
     ) -> Result<usize, SyscallError> {
         syscall::handle_recv(self.fd(), out)
+    }
+
+    /// The `N` handles this frame's message type says travel with it.
+    ///
+    /// `None` for any other count, with whatever did arrive closed rather than
+    /// leaked: a short batch is a peer that sent its frame first, a long one is
+    /// a protocol this endpoint does not speak, and neither is something to
+    /// wait for. Every protocol here sends a fixed number per message type, so
+    /// this is the shape every caller wants.
+    pub fn recv_handles_exact<const N: usize>(&self) -> Option<[RawHandle; N]> {
+        recv_handles_exact(self.fd())
     }
 
     pub fn recv_bytes(&self, header: &IpcHeader, buf: &mut [u8]) -> Result<usize, IpcError> {
@@ -289,6 +316,37 @@ pub fn try_send<T: IpcPayload>(fd: RawHandle, msg_type: u32, payload: &T) -> Res
     frame[..IpcHeader::WIRE_SIZE].copy_from_slice(&header.to_wire());
     frame[IpcHeader::WIRE_SIZE..IpcHeader::WIRE_SIZE + size].copy_from_slice(as_bytes(payload));
     write_whole(fd, &frame[..IpcHeader::WIRE_SIZE + size])
+}
+
+/// [`try_send`] preceded by the move of the handles its payload describes.
+pub fn try_send_with_handles<T: IpcPayload>(
+    fd: RawHandle,
+    handles: &[RawHandle],
+    msg_type: u32,
+    payload: &T,
+) -> Result<(), TrySendError> {
+    syscall::handle_send(fd, handles).map_err(TrySendError::Syscall)?;
+    try_send(fd, msg_type, payload)
+}
+
+/// The `N` handles the frame just read off `fd` says travel with it.
+///
+/// See [`Connection::recv_handles_exact`]. This is the spelling for a server
+/// that buffers frames and dispatches them by handle rather than holding the
+/// `Connection` — the compositor reads every client this way.
+pub fn recv_handles_exact<const N: usize>(fd: RawHandle) -> Option<[RawHandle; N]> {
+    const { assert!(N <= syscall::MAX_TRANSFER_HANDLES) };
+    let mut batch = [toyos_abi::HANDLE_INVALID; syscall::MAX_TRANSFER_HANDLES];
+    let n = syscall::handle_recv(fd, &mut batch).ok()?;
+    if n != N {
+        for h in &batch[..n] {
+            syscall::close(*h);
+        }
+        return None;
+    }
+    let mut out = [toyos_abi::HANDLE_INVALID; N];
+    out.copy_from_slice(&batch[..N]);
+    Some(out)
 }
 
 /// [`signal`] without blocking. A bare header always fits in one write.

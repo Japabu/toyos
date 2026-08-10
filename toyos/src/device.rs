@@ -10,6 +10,15 @@ use toyos_abi::syscall::{self, SyscallError};
 use crate::{Device, AsHandle};
 use toyos_abi::RawHandle;
 
+/// Read a claim's description, whose buffer fields are handles this call
+/// installs.
+///
+/// **They are installed once.** The kernel remembers what it minted for a
+/// claim and answers a later read with the same numbers, so the description is
+/// read once per claim and the handles in it are owned from then on — reading
+/// twice and adopting both answers closes one buffer twice. A mode set is the
+/// exception and says so: [`FramebufferDev::set_resolution`] remints, and its
+/// answer is the fresh set.
 pub(crate) fn read_info<T: Copy>(dev: &Device) -> Result<T, SyscallError> {
     let size = core::mem::size_of::<T>();
     let mut val = unsafe { core::mem::zeroed::<T>() };

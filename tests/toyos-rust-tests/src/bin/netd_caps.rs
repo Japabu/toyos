@@ -17,8 +17,10 @@
 
 use toyos::net::{
     MsgType, NetError, NetdConn, PendingResponse, TcpConnectPipedRequest, TcpConnectResponse,
+    DATA_FROM_CLIENT, DATA_HANDLES, DATA_TO_CLIENT,
 };
 use toyos_abi::syscall;
+use toyos_abi::RawHandle;
 
 /// TEST-NET-1 (RFC 5737), reserved for documentation and guaranteed not to be
 /// a real host. What matters is only that it does not complete a handshake.
@@ -68,27 +70,18 @@ fn main() {
         .expect("the announced cap must be a number");
     let burst = announced + MARGIN;
 
-    // One pair of pipes for every request. netd stores the ids with the
-    // pending connect and only opens them if the connect completes, which none
-    // of these will — so sharing them costs nothing and saves the client 4 MiB
-    // and four fds per request.
-    let rx = syscall::pipe().expect("the rx pipe every request carries");
-    let tx = syscall::pipe().expect("the tx pipe every request carries");
     let request = TcpConnectPipedRequest {
         addr: BLACK_HOLE,
         port: PORT,
         _pad: 0,
         timeout_ms: TIMEOUT_MS,
-        _pad2: 0,
-        rx_pipe_id: syscall::pipe_id(rx.write).expect("rx pipe id"),
-        tx_pipe_id: syscall::pipe_id(tx.read).expect("tx pipe id"),
     };
 
     let mut sent: Vec<PendingResponse> = Vec::with_capacity(burst);
     for i in 0..burst {
         let conn = connect_past_the_queue(i);
         sent.push(
-            conn.request(MsgType::TcpConnectPiped, &request)
+            conn.request_with_handles(&data_path(), MsgType::TcpConnectPiped, &request)
                 .unwrap_or_else(|e| panic!("request {i}: netd would not take it: {e:?}")),
         );
     }
@@ -138,6 +131,26 @@ fn main() {
         "netd caps: {granted} connections accepted then refused (accepted ones ended as {})",
         summarise(&outcomes[..granted])
     );
+}
+
+/// The two ends one request hands netd.
+///
+/// **A fresh pair per request, where one pair used to serve the whole burst.**
+/// The ends travel with the request now rather than being named by an id netd
+/// would reopen later, and a handle that has been moved cannot be moved again.
+/// This side's own two ends are dropped where they are made: nothing here will
+/// read or write them, and each pipe stays alive on the end netd holds — which
+/// is exactly where the cap is counting it.
+fn data_path() -> [RawHandle; DATA_HANDLES] {
+    let (to_client_read, to_client_write) = toyos::pipe_pair().expect("the pipe netd writes into");
+    let (from_client_read, from_client_write) =
+        toyos::pipe_pair().expect("the pipe netd reads from");
+    let mut handles = [toyos_abi::HANDLE_INVALID; DATA_HANDLES];
+    handles[DATA_TO_CLIENT] = to_client_write.into_fd();
+    handles[DATA_FROM_CLIENT] = from_client_read.into_fd();
+    drop(to_client_read);
+    drop(from_client_write);
+    handles
 }
 
 /// The distinct outcomes, in first-seen order. Printed so the log says what

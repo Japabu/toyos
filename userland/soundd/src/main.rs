@@ -277,11 +277,10 @@ impl GainRamp {
 struct ClientStream {
     client_id: usize,
     slot_reader: AudioSlotReader,
-    /// The write end of a pipe the **client** created. soundd never holds a
-    /// read end of it, so §5.7's crash detection is by construction: the moment
-    /// the client's last read end goes, the next signal breaks. It used to make
-    /// the pipe itself and hold a read end until the client proved it had one,
-    /// and that window was what made the detection conditional.
+    /// The write end of the signal pipe. soundd makes both ends and sends the
+    /// read end to the client, so §5.7's crash detection is by construction:
+    /// the moment the client's table goes, the read end goes with it and the
+    /// next signal breaks.
     signal_write_fd: RawHandle,
     gain: GainRamp,
     client_channels: u16,
@@ -594,7 +593,6 @@ impl Dll {
 
 fn open_stream(
     client_id: usize,
-    client_pid: u32,
     req: &StreamOpenRequest,
     control: &Connection,
     device_sample_rate: u32,
@@ -619,18 +617,20 @@ fn open_stream(
     // refusals end the open rather than the daemon: a client that exited
     // between asking and being served cannot be granted memory, and neither
     // can one that asked while the machine had none.
-    let shm = match SharedMemory::allocate(shm_size as usize) {
+    let shm = match SharedMemory::create(shm_size as usize) {
         Ok(shm) => shm,
         Err(e) => {
             say!("soundd: no {shm_size}-byte ring for client {client_id} ({e:?})");
             return None;
         }
     };
-    if shm.grant(client_pid).is_err() {
-        say!("soundd: client {client_id} (pid {client_pid}) is gone; no stream opened");
-        return None;
-    }
-    let shm_token = shm.token();
+    let client_shm = match shm.share() {
+        Ok(h) => h,
+        Err(e) => {
+            say!("soundd: cannot share the ring with client {client_id} ({e:?})");
+            return None;
+        }
+    };
 
     unsafe {
         let hdr = &*(shm.as_ptr() as *const AudioSlotHeader);
@@ -638,28 +638,36 @@ fn open_stream(
         hdr.read_idx.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
-    // **The client made the pipe and this opens the write end.** A pipe id is
-    // openable by a peer of its creator, and the peer relation runs one way:
-    // soundd holds a connection whose peer is this client, and a client holds
-    // no such fact about soundd. Chunk 6 sends the end itself and deletes ids.
-    let signal_write = match syscall::pipe_open(req.signal_pipe_id, 1) {
-        Ok(fd) => fd,
+    // **soundd makes the pipe and keeps the write end.** That is what makes a
+    // dead client detectable without bookkeeping: the read end it is sent goes
+    // when its table does, and the next signal answers `Gone`. The client used
+    // to make the pipe and name it by an id, because an id was only openable
+    // by a peer of its creator and the peer relation ran one way.
+    let (signal_read, signal_write) = match toyos::pipe_pair() {
+        Ok(ends) => ends,
         Err(e) => {
-            say!("soundd: client {client_id} named a signal pipe it does not own ({e:?})");
+            syscall::close(client_shm);
+            say!("soundd: no signal pipe for client {client_id} ({e:?})");
             return None;
         }
     };
 
     let slot_reader = AudioSlotReader::new(shm, client_period_bytes, slot_count);
 
-    if control.send(MSG_STREAM_OPENED, &StreamOpenResponse {
-        shm_token,
-        client_period_frames,
-        client_period_bytes,
-        device_sample_rate,
-        device_channels,
-        slot_count: slot_count as u16,
-    }).is_err() {
+    // Handles first, then the frame that announces them — `send_with_handles`
+    // is that order, and a client reading the frame is guaranteed to find
+    // them. Both are moved whether or not this succeeds.
+    if control.send_with_handles(
+        &[client_shm, signal_read.into_fd()],
+        MSG_STREAM_OPENED,
+        &StreamOpenResponse {
+            client_period_frames,
+            client_period_bytes,
+            device_sample_rate,
+            device_channels,
+            slot_count: slot_count as u16,
+        },
+    ).is_err() {
         // Client died mid-open; the dropped control connection removes it.
         say!("soundd: client {client_id} vanished during stream open");
     }
@@ -698,7 +706,7 @@ fn open_stream(
     Some(ClientStream {
         client_id,
         slot_reader,
-        signal_write_fd: signal_write,
+        signal_write_fd: signal_write.into_fd(),
         gain,
         client_channels: req.channels,
         client_period_frames,
@@ -1605,7 +1613,6 @@ fn control_thread(
     }
 
     let mut clients: Vec<ControlClient> = Vec::new();
-    let mut client_pids: Vec<u32> = Vec::new();
     let mut next_idx: usize = 0;
 
     const TOKEN_ACCEPT: u64 = u64::MAX;
@@ -1625,18 +1632,17 @@ fn control_thread(
                 // poller's watchable set would never be read from. It is still
                 // accepted first — leaving it in the port's queue keeps the
                 // acceptor readable and spins this loop.
-                Ok(accepted) if clients.len() >= MAX_CONTROL_CLIENTS => {
+                Ok(conn) if clients.len() >= MAX_CONTROL_CLIENTS => {
                     say!("soundd: refusing connection, {MAX_CONTROL_CLIENTS} clients already connected");
-                    let _ = accepted.conn.signal(MSG_STREAM_ERROR);
+                    let _ = conn.signal(MSG_STREAM_ERROR);
                 }
-                Ok(accepted) => {
+                Ok(conn) => {
                     clients.push(ControlClient {
-                        conn: accepted.conn,
+                        conn,
                         msg: MsgBuf::new(),
                         stream_idx: None,
                         pending_volume: None,
                     });
-                    client_pids.push(accepted.client_pid);
                 }
                 Err(e) => say!("soundd: accept failed: {e:?}"),
             }
@@ -1664,12 +1670,8 @@ fn control_thread(
                 };
                 match (msg_type, clients[i].stream_idx) {
                     (MSG_STREAM_OPEN, None) if plen == core::mem::size_of::<StreamOpenRequest>() => {
-                        let req = StreamOpenRequest {
-                            signal_pipe_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
-                            sample_rate: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
-                            channels: u16::from_le_bytes(payload[12..14].try_into().unwrap()),
-                            format: u16::from_le_bytes(payload[14..16].try_into().unwrap()),
-                        };
+                        let req: StreamOpenRequest = toyos::ipc::decode_payload(&payload[..plen])
+                            .expect("a payload as long as the struct decodes");
                         if let Some(reason) = reject_open(&req) {
                             say!("soundd: rejecting stream ({reason}): {}Hz {}ch fmt={}",
                                 req.sample_rate, req.channels, req.format);
@@ -1684,7 +1686,6 @@ fn control_thread(
                         next_idx += 1;
                         let Some(client) = open_stream(
                             idx,
-                            client_pids[i],
                             &req,
                             &clients[i].conn,
                             device_sample_rate,
@@ -1741,7 +1742,6 @@ fn control_thread(
         }
         for &i in dead.iter().rev() {
             clients.remove(i);
-            client_pids.remove(i);
         }
     }
 }
@@ -1811,8 +1811,8 @@ fn run_hda(acceptor: Acceptor, hda: hda::Hda, channels: u8) {
     let info = hda.info();
     let num_buffers = info.periods as usize;
     let period_bytes = info.period_bytes as usize;
-    let ring = SharedMemory::map(info.pcm_token, 2 * 1024 * 1024)
-        .expect("the PCM token the HDA device just reported");
+    let ring = SharedMemory::adopt(info.pcm, 2 * 1024 * 1024)
+        .expect("the PCM buffer the HDA claim just handed over");
     // One region, `periods` buffers end to end: the buffer descriptor list the
     // kernel built points at exactly these offsets.
     let base = ring.as_ptr();

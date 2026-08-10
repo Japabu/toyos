@@ -4,10 +4,9 @@
 //! All networking in ToyOS goes through the `netd` daemon via message passing
 //! and kernel pipes.
 
-use toyos_abi::syscall;
 use crate::ipc::{IpcHeader, IpcPayload};
 use crate::ipc_payload;
-use crate::{Connection, Pipe, OwnedHandle};
+use crate::{Connection, Pipe, RawHandle};
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,15 +120,28 @@ pub struct UdpSocketId(pub u32);
 
 // Protocol request/response structs
 
+/// A duplex data path is **two pipe ends, sent with the request that opens
+/// it**, in this order. The client makes both pipes and keeps the ends facing
+/// itself.
+///
+/// Stated once because the two sides of the swap are in different programs: a
+/// reversed pair is two working pipes carrying each other's bytes, which no
+/// type here can catch.
+pub const DATA_HANDLES: usize = 2;
+/// The end netd writes into and the client reads from.
+pub const DATA_TO_CLIENT: usize = 0;
+/// The end the client writes into and netd reads from.
+pub const DATA_FROM_CLIENT: usize = 1;
+
+/// A bind sends one end: the one netd writes an accept notification into.
+pub const NOTIFY_HANDLES: usize = 1;
+
 ipc_payload! {
     pub struct TcpConnectPipedRequest {
         pub addr: [u8; 4],
         pub port: u16,
         pub _pad: u16,
         pub timeout_ms: u32,
-        pub _pad2: u32,
-        pub rx_pipe_id: u64,
-        pub tx_pipe_id: u64,
     }
 
     pub struct TcpConnectResponse {
@@ -146,7 +158,6 @@ ipc_payload! {
         pub addr: [u8; 4],
         pub port: u16,
         pub _pad: u16,
-        pub notify_pipe_id: u64,
     }
 
     pub struct TcpBindResponse {
@@ -162,9 +173,6 @@ ipc_payload! {
 
     pub struct TcpAcceptPipedRequest {
         pub socket_id: u32,
-        pub _pad: u32,
-        pub rx_pipe_id: u64,
-        pub tx_pipe_id: u64,
     }
 
     pub struct TcpAcceptPipedResponse {
@@ -178,8 +186,6 @@ ipc_payload! {
         pub addr: [u8; 4],
         pub port: u16,
         pub _pad: u16,
-        pub tx_pipe_id: u64,
-        pub rx_pipe_id: u64,
     }
 
     pub struct UdpBindResponse {
@@ -292,6 +298,22 @@ impl NetdConn {
         Ok(PendingResponse(self))
     }
 
+    /// A request that hands netd pipe ends.
+    ///
+    /// **The handles are moved whether or not this answers `Ok`**: a send the
+    /// kernel refuses drops the batch rather than putting it back, so the
+    /// caller must have given up ownership before calling and has nothing to
+    /// close on the error path.
+    pub fn request_with_handles<Req: IpcPayload>(
+        self,
+        handles: &[RawHandle],
+        msg_type: MsgType,
+        payload: &Req,
+    ) -> Result<PendingResponse, NetError> {
+        self.0.send_with_handles(handles, msg_type as u32, payload).map_err(|_| NetError::Io)?;
+        Ok(PendingResponse(self))
+    }
+
     pub fn request_bytes(self, msg_type: MsgType, data: &[u8]) -> Result<PendingResponse, NetError> {
         self.0.send_bytes(msg_type as u32, data).map_err(|_| NetError::Io)?;
         Ok(PendingResponse(self))
@@ -335,15 +357,27 @@ impl PendingResponse {
     }
 }
 
-fn pipe_pair() -> Result<(syscall::PipeFds, syscall::PipeFds), NetError> {
-    let first = syscall::pipe().map_err(|_| NetError::Io)?;
-    match syscall::pipe() {
-        Ok(second) => Ok((first, second)),
-        Err(_) => {
-            syscall::close(first.read);
-            syscall::close(first.write);
-            Err(NetError::Io)
-        }
+/// The two pipes behind a duplex data path, split into what the caller keeps
+/// and what netd is given.
+///
+/// The `to_netd` ends are owned here only until the send; a caller that errors
+/// out before then drops this and both pipes go with it.
+struct DataPath {
+    rx: Pipe,
+    tx: Pipe,
+    to_netd: [Pipe; DATA_HANDLES],
+}
+
+impl DataPath {
+    fn create() -> Result<Self, NetError> {
+        let (rx, netd_tx) = crate::pipe_pair().map_err(|_| NetError::Io)?;
+        let (netd_rx, tx) = crate::pipe_pair().map_err(|_| NetError::Io)?;
+        Ok(Self { rx, tx, to_netd: [netd_tx, netd_rx] })
+    }
+
+    fn split(self) -> (Pipe, Pipe, [RawHandle; DATA_HANDLES]) {
+        let [to_client, from_client] = self.to_netd;
+        (self.rx, self.tx, [to_client.into_fd(), from_client.into_fd()])
     }
 }
 
@@ -354,110 +388,54 @@ pub fn tcp_connect(
     port: u16,
     timeout_ms: u32,
 ) -> Result<TcpConnection, NetError> {
-    let (rx_pipe, tx_pipe) = pipe_pair()?;
+    let netd = NetdConn::connect()?;
+    let (rx, tx, handles) = DataPath::create()?.split();
 
-    let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Io)?;
-    let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Io)?;
-
-    let result = NetdConn::connect()?
-        .request(MsgType::TcpConnectPiped, &TcpConnectPipedRequest {
+    let resp: TcpConnectResponse = netd
+        .request_with_handles(&handles, MsgType::TcpConnectPiped, &TcpConnectPipedRequest {
             addr,
             port,
             _pad: 0,
             timeout_ms,
-            _pad2: 0,
-            rx_pipe_id,
-            tx_pipe_id,
         })?
-        .response::<TcpConnectResponse>();
+        .response()?;
 
-    match result {
-        Ok(resp) => {
-            syscall::close(rx_pipe.write);
-            syscall::close(tx_pipe.read);
-            Ok(TcpConnection {
-                rx: Pipe(OwnedHandle(rx_pipe.read)),
-                tx: Pipe(OwnedHandle(tx_pipe.write)),
-                socket_id: TcpSocketId(resp.socket_id),
-                local_port: resp.local_port,
-            })
-        }
-        Err(e) => {
-            syscall::close(rx_pipe.read);
-            syscall::close(rx_pipe.write);
-            syscall::close(tx_pipe.read);
-            syscall::close(tx_pipe.write);
-            Err(e)
-        }
-    }
+    Ok(TcpConnection { rx, tx, socket_id: TcpSocketId(resp.socket_id), local_port: resp.local_port })
 }
 
 pub fn tcp_bind(addr: [u8; 4], port: u16) -> Result<TcpBound, NetError> {
-    let notify_pipe = syscall::pipe().map_err(|_| NetError::Io)?;
-    let notify_pipe_id = syscall::pipe_id(notify_pipe.write).map_err(|_| NetError::Io)?;
+    let netd = NetdConn::connect()?;
+    let (notify, netd_notify) = crate::pipe_pair().map_err(|_| NetError::Io)?;
 
-    let result = NetdConn::connect()?
-        .request(MsgType::TcpBindPiped, &TcpBindPipedRequest {
-            addr,
-            port,
-            _pad: 0,
-            notify_pipe_id,
-        })?
-        .response::<TcpBindResponse>();
+    let resp: TcpBindResponse = netd
+        .request_with_handles(
+            &[netd_notify.into_fd()],
+            MsgType::TcpBindPiped,
+            &TcpBindPipedRequest { addr, port, _pad: 0 },
+        )?
+        .response()?;
 
-    match result {
-        Ok(resp) => {
-            syscall::close(notify_pipe.write);
-            Ok(TcpBound {
-                notify: Pipe(OwnedHandle(notify_pipe.read)),
-                socket_id: TcpSocketId(resp.socket_id),
-                bound_port: resp.bound_port,
-            })
-        }
-        Err(e) => {
-            syscall::close(notify_pipe.read);
-            syscall::close(notify_pipe.write);
-            Err(e)
-        }
-    }
+    Ok(TcpBound { notify, socket_id: TcpSocketId(resp.socket_id), bound_port: resp.bound_port })
 }
 
 pub fn tcp_accept(socket_id: TcpSocketId) -> Result<TcpAccepted, NetError> {
-    let (rx_pipe, tx_pipe) = pipe_pair()?;
+    let netd = NetdConn::connect()?;
+    let (rx, tx, handles) = DataPath::create()?.split();
 
-    let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Io)?;
-    let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Io)?;
-
-    let result = NetdConn::connect()?
-        .request(MsgType::TcpAcceptPiped, &TcpAcceptPipedRequest {
+    let resp: TcpAcceptPipedResponse = netd
+        .request_with_handles(&handles, MsgType::TcpAcceptPiped, &TcpAcceptPipedRequest {
             socket_id: socket_id.0,
-            _pad: 0,
-            rx_pipe_id,
-            tx_pipe_id,
         })?
-        .response::<TcpAcceptPipedResponse>();
+        .response()?;
 
-    match result {
-        Ok(resp) => {
-            syscall::close(rx_pipe.write);
-            syscall::close(tx_pipe.read);
-            Ok(TcpAccepted {
-                rx: Pipe(OwnedHandle(rx_pipe.read)),
-                tx: Pipe(OwnedHandle(tx_pipe.write)),
-                socket_id: TcpSocketId(resp.socket_id),
-                remote_addr: resp.remote_addr,
-                remote_port: resp.remote_port,
-                local_port: resp.local_port,
-            })
-        }
-        Err(e) => {
-            syscall::close(rx_pipe.read);
-            syscall::close(rx_pipe.write);
-            syscall::close(tx_pipe.read);
-            syscall::close(tx_pipe.write);
-            Err(e)
-        }
-    }
+    Ok(TcpAccepted {
+        rx,
+        tx,
+        socket_id: TcpSocketId(resp.socket_id),
+        remote_addr: resp.remote_addr,
+        remote_port: resp.remote_port,
+        local_port: resp.local_port,
+    })
 }
 
 pub fn tcp_shutdown(socket_id: TcpSocketId, how: u32) -> Result<(), NetError> {
@@ -488,40 +466,14 @@ pub fn tcp_get_option(socket_id: TcpSocketId, option: u32) -> Result<u32, NetErr
 // UDP client functions
 
 pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
-    let (tx_pipe, rx_pipe) = pipe_pair()?;
+    let netd = NetdConn::connect()?;
+    let (rx, tx, handles) = DataPath::create()?.split();
 
-    let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Io)?;
-    let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Io)?;
+    let resp: UdpBindResponse = netd
+        .request_with_handles(&handles, MsgType::UdpBind, &UdpBindRequest { addr, port, _pad: 0 })?
+        .response()?;
 
-    let result = NetdConn::connect()?
-        .request(MsgType::UdpBind, &UdpBindRequest {
-            addr,
-            port,
-            _pad: 0,
-            tx_pipe_id,
-            rx_pipe_id,
-        })?
-        .response::<UdpBindResponse>();
-
-    match result {
-        Ok(resp) => {
-            syscall::close(tx_pipe.read);
-            syscall::close(rx_pipe.write);
-            Ok(UdpBound {
-                socket_id: UdpSocketId(resp.socket_id),
-                bound_port: resp.bound_port,
-                tx: Pipe(OwnedHandle(tx_pipe.write)),
-                rx: Pipe(OwnedHandle(rx_pipe.read)),
-            })
-        }
-        Err(e) => {
-            syscall::close(tx_pipe.read);
-            syscall::close(tx_pipe.write);
-            syscall::close(rx_pipe.read);
-            syscall::close(rx_pipe.write);
-            Err(e)
-        }
-    }
+    Ok(UdpBound { socket_id: UdpSocketId(resp.socket_id), bound_port: resp.bound_port, tx, rx })
 }
 
 pub fn udp_send_to(socket_id: UdpSocketId, addr: [u8; 4], port: u16, len: u16) -> Result<u32, NetError> {

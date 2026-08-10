@@ -148,8 +148,9 @@ toyos::ipc_payload! {
         pub h: u32,
     }
 
+    /// How much of the region that travels with this message is text. The
+    /// region itself is one transferred handle, sent ahead of the frame.
     pub struct ClipboardShmMsg {
-        pub token: u32,
         pub len: u32,
     }
 
@@ -197,17 +198,22 @@ toyos::ipc_payload! {
         pub scroll: i8,
     }
 
+    /// The shape of the window's buffer. **The buffer is one transferred
+    /// handle**, sent ahead of the frame that carries this.
     pub struct WindowInfo {
-        pub token: u32,
         pub width: u32,
         pub height: u32,
         pub stride: u32,
         pub pixel_format: u32,
     }
 
+    /// The shape of the window's new buffer, which arrives as a handle the same
+    /// way [`WindowInfo`]'s does.
+    ///
+    /// It used to name the *old* buffer too, so the client could tell which
+    /// token was being replaced. A client holds the old buffer as a handle now
+    /// and needs nobody to name it.
     pub struct ResizeInfo {
-        pub token: u32,
-        pub old_token: u32,
         pub width: u32,
         pub height: u32,
         pub stride: u32,
@@ -345,9 +351,15 @@ pub fn clipboard_set(text: &str) -> Result<(), CreateError> {
     let bytes = text.as_bytes();
     if bytes.len() <= 4096 {
         let _ = conn.send_bytes(MSG_CLIPBOARD_SET, bytes);
-    } else if let Ok(mut shm) = SharedMemory::allocate(bytes.len()) {
+    } else if let Ok(mut shm) = SharedMemory::create(bytes.len()) {
         shm.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        let _ = conn.send(MSG_CLIPBOARD_SET_SHM, &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 });
+        if let Ok(handle) = shm.share() {
+            let _ = conn.send_with_handles(
+                &[handle],
+                MSG_CLIPBOARD_SET_SHM,
+                &ClipboardShmMsg { len: bytes.len() as u32 },
+            );
+        }
         *CLIPBOARD_SHM.lock().unwrap() = Some(shm);
     }
     Ok(())
@@ -426,9 +438,11 @@ impl Window {
             .map_err(|_| CreateError::CompositorGone)?;
 
         let buf_size = info.stride as usize * info.height as usize * 4;
-        // A token the compositor named and did not grant is a compositor that
-        // is not serving this client, whatever else it is doing.
-        let shm = SharedMemory::map(info.token, buf_size).map_err(|_| CreateError::CompositorGone)?;
+        // The buffer crossed ahead of the frame. A compositor that announced a
+        // window and sent nothing with it is not serving this client, whatever
+        // else it is doing.
+        let [buffer] = conn.recv_handles_exact::<1>().ok_or(CreateError::CompositorGone)?;
+        let shm = SharedMemory::adopt(buffer, buf_size).map_err(|_| CreateError::CompositorGone)?;
 
         let poller = Poller::new(1);
         Ok(Self {
@@ -526,7 +540,10 @@ impl Window {
                 // The old buffer is already gone on the compositor's side, so
                 // a window that cannot map the new one has nothing to draw
                 // into and its session is over.
-                let Ok(shm) = SharedMemory::map(info.token, buf_size) else {
+                let Some([buffer]) = self.conn.recv_handles_exact::<1>() else {
+                    return Event::Close;
+                };
+                let Ok(shm) = SharedMemory::adopt(buffer, buf_size) else {
                     return Event::Close;
                 };
                 self.shm = shm;
@@ -546,7 +563,10 @@ impl Window {
                 let Ok(info) = self.conn.recv_payload::<ClipboardShmMsg>(header) else {
                     return Event::Close;
                 };
-                let Ok(shm) = SharedMemory::map(info.token, info.len as usize) else {
+                let Some([buffer]) = self.conn.recv_handles_exact::<1>() else {
+                    return Event::ClipboardPaste(Vec::new());
+                };
+                let Ok(shm) = SharedMemory::adopt(buffer, info.len as usize) else {
                     return Event::ClipboardPaste(Vec::new());
                 };
                 Event::ClipboardPaste(shm.as_slice().to_vec())

@@ -1,149 +1,146 @@
-//! Being allowed to map a shared region must not carry the right to hand it on.
+//! A region is reachable by the process that was **sent** it, and by nobody
+//! else.
 //!
-//! `shared_memory::grant` accepted the caller if it was the owner *or already
-//! in the region's `allowed` list*, so permission was transitive: soundd grants
-//! its per-client audio ring to a client, and that client can grant it to
-//! anyone it likes. Nothing anywhere reports it to the owner. The target pid
-//! was also unchecked, so `allowed` would take pids that have never existed —
-//! a userland-driven kernel `Vec` with no bound at all, since `Pid`s are
-//! monotonic and never reused.
+//! This test used to be about `shared_memory::grant`'s ACL: the list accepted
+//! the owner *or anyone already on it*, so permission was transitive and
+//! unreported, and the target pid was unchecked so the list would take pids
+//! that had never existed. None of that has a spelling any more — a region is a
+//! handle, holding one is the whole of being allowed to map it, and giving one
+//! away is `SYS_HANDLE_SEND` over a connection the giver already holds.
 //!
-//! Three roles. `owner <middleman-pid>` allocates a region, writes a secret,
-//! grants it to the middleman only, and stays alive. The default role *is* the
-//! middleman: legitimately granted, it then tries to pass the region on to
-//! `attacker <token>`, which maps it and reports what it saw.
+//! So the subject moves to what replaced it. The negative arm is the one the
+//! ACL could never state: a process that was sent nothing cannot reach the
+//! region **by any number at all**, including the exact handle value its owner
+//! is using. The positive arm is what makes that non-vacuous — the same region,
+//! reached by the peer that was sent it, with the secret in it.
+//!
+//! Two roles. The default role owns the region and serves a port; `peer` is
+//! spawned twice from it, once holding a connector and once holding nothing.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
+use std::os::toyos::process::CommandExt;
 use std::process::{Command, Stdio};
 
-use toyos_abi::syscall::{self, SyscallError};
-use toyos_abi::Pid;
+use toyos::shm::SharedMemory;
+use toyos::{namespace, port, AsHandle};
+use toyos_abi::syscall::{self, SyscallError, SVC_LABEL};
+use toyos_abi::RawHandle;
 
 const SELF_PATH: &str = "/bin/test_rs_abuse_shared_grant";
 const SECRET: &[u8] = b"owner-private-bytes-do-not-share";
 const REGION: usize = 4096;
+const SERVICE: &str = "region";
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("owner") => owner(args.next().expect("owner needs the middleman pid").parse().unwrap()),
-        Some("attacker") => attacker(args.next().expect("attacker needs a token").parse().unwrap()),
+    match std::env::args().nth(1).as_deref() {
+        Some("peer") => peer(),
         Some(other) => panic!("unknown role {other:?}"),
-        None => middleman(),
+        None => owner(),
     }
 }
 
-fn middleman() {
-    let me = syscall::getpid();
+fn owner() {
+    let mut region = SharedMemory::create(REGION).expect("a region of our own");
+    region.as_mut_slice()[..SECRET.len()].copy_from_slice(SECRET);
+    let own_handle = region.as_handle();
 
-    let mut owner = Command::new(SELF_PATH)
-        .arg("owner")
-        .arg(me.0.to_string())
+    let (acceptor, connector) = port::create().expect("the kernel refused a port");
+
+    // The peer that is *given* the region. It holds one connector and this is
+    // where it points.
+    let ns = namespace::build()
+        .add(SERVICE, &connector)
+        .finish()
+        .expect("the kernel refused a namespace");
+    let mut invited = Command::new(SELF_PATH)
+        .arg("peer")
+        .arg(own_handle.0.to_string())
+        .endow(SVC_LABEL, ns.into_raw().0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn owner");
-    let owner_pid = owner.id();
-    let mut owner_out = BufReader::new(owner.stdout.take().expect("owner stdout"));
-    let mut line = String::new();
-    owner_out.read_line(&mut line).expect("owner token line");
-    let token: u32 = line.trim().parse().expect("owner token");
+        .expect("spawn the invited peer");
 
-    // The grant we were actually given still works, and this is what makes the
-    // rest of the test non-vacuous: the region is real and holds the secret.
-    let ptr = unsafe { syscall::try_map_shared(token) }.expect("the owner granted us; this map must work");
-    let seen = unsafe { core::slice::from_raw_parts(ptr, SECRET.len()) };
-    assert_eq!(seen, SECRET, "the owner's region did not contain the secret");
+    let conn = acceptor.accept().expect("the invited peer connects");
+    let shared = region.share().expect("a second handle to our own region");
+    syscall::handle_send(conn.as_handle(), &[shared]).expect("send the region to its peer");
+    // The frame the handle was sent ahead of. The peer reads the frame first
+    // and is guaranteed to find the handle already queued.
+    conn.signal(1).expect("announce the region");
 
-    // Pass it on to a process the owner never named.
-    let mut attacker = Command::new(SELF_PATH)
-        .arg("attacker")
-        .arg(token.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn attacker");
-    let attacker_pid = attacker.id();
-    let regrant = syscall::grant_shared(token, Pid(attacker_pid));
-
-    let mut attacker_in = attacker.stdin.take().expect("attacker stdin");
-    writeln!(attacker_in, "go").expect("release the attacker");
-    attacker_in.flush().expect("flush");
-    let mut attacker_out = BufReader::new(attacker.stdout.take().expect("attacker stdout"));
-    let mut said = String::new();
-    attacker_out.read_line(&mut said).expect("attacker report");
-    let said = said.trim().to_string();
-
-    // Asserted after the fact so a kernel that allows the re-grant is caught
-    // with the stolen bytes in hand rather than at the first refusal.
+    let said = report(&mut invited);
     assert_eq!(
-        regrant,
-        Err(SyscallError::PermissionDenied),
-        "a grantee re-granted the owner's region to pid {attacker_pid}, which then reported {said:?}"
+        said,
+        format!("read {}", String::from_utf8_lossy(SECRET)),
+        "the peer that was sent the region could not read it",
     );
+
+    // The peer that is given *nothing*. Same binary, same argument — the exact
+    // handle value the owner is using — and no namespace, so it holds no
+    // connection to this process at all.
+    let mut uninvited = Command::new(SELF_PATH)
+        .arg("peer")
+        .arg(own_handle.0.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the uninvited peer");
+    let said = report(&mut uninvited);
     assert!(
-        said.starts_with("denied"),
-        "the attacker mapped a region its owner never granted it: {said:?}"
+        said.starts_with("no region"),
+        "a process that was sent nothing reached the owner's region: {said:?}",
     );
 
-    drop(attacker_in);
-    assert!(attacker.wait().expect("wait attacker").success(), "attacker exited nonzero");
-
-    // A region of our own, to test the target rather than the caller.
-    let own = syscall::alloc_shared(REGION).expect("a region of our own");
-
-    // `Pid`s come from a monotonic `IdMap` and are never reused, so this one
-    // has never named a process and never will before this test ends.
-    let ghost = Pid(me.0 + 100_000);
+    // A region whose last handle is gone is gone. There is no `release` and no
+    // list to take a name off: the drop is the whole of it, and the mapping the
+    // invited peer holds is its own handle's business.
+    drop(region);
     assert_eq!(
-        syscall::grant_shared(own, ghost),
-        Err(SyscallError::InvalidArgument),
-        "granting to pid {} — a process that has never existed — must be refused",
-        ghost.0
+        unsafe { syscall::shm_map(own_handle) }.err(),
+        Some(SyscallError::NotFound),
+        "the owner's own handle still resolved after it was dropped",
     );
 
-    // …while the owner granting to a live process is exactly what daemons do,
-    // and must keep working.
-    syscall::grant_shared(own, Pid(owner_pid))
-        .expect("an owner granting its own region to a live process must still work");
-
-    syscall::release_shared(own);
-    syscall::release_shared(token);
-
-    let mut owner_in = owner.stdin.take().expect("owner stdin");
-    writeln!(owner_in, "quit").expect("tell the owner to quit");
-    drop(owner_in);
-    assert!(owner.wait().expect("wait owner").success(), "owner exited nonzero");
-
-    println!("re-grant refused, ghost target refused, owner grant and map still work");
+    println!("the region reached the peer it was sent to and no other, and its handle is gone");
 }
 
-fn owner(middleman_pid: u32) {
-    let token = syscall::alloc_shared(REGION).expect("a region of our own");
-    let ptr = unsafe { syscall::try_map_shared(token) }.expect("owner: map its own region");
-    unsafe { core::ptr::copy_nonoverlapping(SECRET.as_ptr(), ptr, SECRET.len()) };
-
-    syscall::grant_shared(token, Pid(middleman_pid)).expect("owner: grant to the middleman");
-    println!("{token}");
-    std::io::stdout().flush().expect("owner: flush token");
-
+/// Let a peer run, and take the one line it reports.
+fn report(child: &mut std::process::Child) -> String {
+    use std::io::{BufRead, BufReader};
+    let mut stdin = child.stdin.take().expect("peer stdin");
+    writeln!(stdin, "go").expect("release the peer");
+    stdin.flush().expect("flush");
+    let mut out = BufReader::new(child.stdout.take().expect("peer stdout"));
     let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
-    syscall::release_shared(token);
+    out.read_line(&mut line).expect("peer report");
+    drop(stdin);
+    assert!(child.wait().expect("wait peer").success(), "peer exited nonzero");
+    line.trim().to_string()
 }
 
-fn attacker(token: u32) {
+fn peer() {
+    let guess = RawHandle(
+        std::env::args().nth(2).expect("peer needs the owner's handle value").parse().unwrap(),
+    );
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line).expect("attacker: wait for go");
-    match unsafe { syscall::try_map_shared(token) } {
-        Ok(ptr) => {
-            let seen = unsafe { core::slice::from_raw_parts(ptr, SECRET.len()) };
-            println!("read {}", String::from_utf8_lossy(seen));
+    std::io::stdin().read_line(&mut line).expect("peer: wait for go");
+
+    // Whatever this process ends up holding, the *number* is never how it got
+    // there. Tried first, and on its own it must reach nothing.
+    let guessed = unsafe { syscall::shm_map(guess) };
+
+    let sent = toyos::endow::service(SERVICE).ok().and_then(|conn| {
+        // The frame first, then the handle it was sent ahead of.
+        conn.recv_header().ok()?;
+        let [region] = conn.recv_handles_exact::<1>()?;
+        SharedMemory::adopt(region, REGION).ok()
+    });
+
+    match sent {
+        Some(region) => {
+            println!("read {}", String::from_utf8_lossy(&region.as_slice()[..SECRET.len()]))
         }
-        Err(e) => println!("denied {e:?}"),
+        None => println!("no region ({guessed:?})"),
     }
-    std::io::stdout().flush().expect("attacker: flush report");
-    // Drain stdin so the parent's close is what ends us.
-    let mut rest = String::new();
-    let _ = std::io::stdin().read_to_string(&mut rest);
+    std::io::stdout().flush().expect("peer: flush report");
 }

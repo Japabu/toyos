@@ -164,8 +164,8 @@ fn test_connect_storm() {
     let server = thread::spawn(move || {
         let fd = acceptor.into_raw();
         for _ in 0..num_clients {
-            let result = syscall::accept(fd).expect("accept failed");
-            syscall::close(result.fd);
+            let conn = syscall::accept(fd).expect("accept failed");
+            syscall::close(conn);
         }
         syscall::close(fd);
     });

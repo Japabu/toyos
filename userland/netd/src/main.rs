@@ -24,7 +24,6 @@ macro_rules! say {
 }
 
 use toyos::endow;
-use toyos::pipe;
 use toyos::shm;
 use toyos_abi::syscall::DeviceType;
 use toyos::{Nic as NicDev, Pipe};
@@ -63,8 +62,8 @@ impl DmaNic {
         let info = nic_dev.info().expect("netd: failed to read NicInfo");
 
         let rx_buf_size = info.rx_buf_size as usize;
-        let dma_region = shm::SharedMemory::map(info.dma_token, 2 * 1024 * 1024)
-            .expect("the DMA token the NIC just reported");
+        let dma_region = shm::SharedMemory::adopt(info.dma, 2 * 1024 * 1024)
+            .expect("the DMA region the NIC claim just handed over");
         let dma_base = dma_region.as_ptr() as *const u8;
         let rx_base = unsafe { dma_base.add(info.rx_buf_offset as usize) };
         let tx_ptr = unsafe { dma_base.add(info.tx_buf_offset as usize) as *mut u8 };
@@ -231,8 +230,11 @@ struct PendingPipedConnect {
     client: Client,
     socket_id: u32,
     handle: SocketHandle,
-    rx_pipe_id: u64,
-    tx_pipe_id: u64,
+    /// Held from the moment the request arrived. The ends came *with* it, so
+    /// there is nothing left to open when the handshake completes and nothing
+    /// to fail there — where a pipe id could still be refused after netd had
+    /// already told smoltcp to connect.
+    pipes: DataPipes,
     deadline: Option<Instant>,
 }
 
@@ -241,24 +243,39 @@ fn map_pipe_ring(pipe: &Pipe) -> *const toyos_abi::ring::RingHeader {
         .expect("pipe_map failed") as *const toyos_abi::ring::RingHeader
 }
 
-/// Open a pipe by ID and return the handle. `read_end=true` opens for reading, false for writing.
-fn open_pipe(pipe_id: u64, read_end: bool) -> Option<Pipe> {
-    pipe::open_by_id(pipe_id, read_end).ok()
+/// The two ends of a client's data path, as the client's request handed them
+/// over.
+///
+/// A pipe end travels as itself now: the client makes both pipes, keeps the
+/// ends facing itself, and moves these two. They used to be ids in the request
+/// payload, which netd reopened by number — and any peer of the pipe's creator
+/// could have named the same one.
+struct DataPipes {
+    to_client: Pipe,
+    from_client: Pipe,
 }
 
-/// Open rx (write) and tx (read) pipe fds and create a PipedConnection.
-fn open_piped_connection(handle: SocketHandle, rx_pipe_id: u64, tx_pipe_id: u64) -> Option<PipedConnection> {
-    let rx_write_fd = open_pipe(rx_pipe_id, false)?;
-    let tx_read_fd = open_pipe(tx_pipe_id, true)?;
-    let rx_ring = map_pipe_ring(&rx_write_fd);
-    let tx_ring = map_pipe_ring(&tx_read_fd);
-    Some(PipedConnection {
+impl DataPipes {
+    /// Take the pair the frame just read off `client` promised.
+    fn take(client: &Client) -> Option<Self> {
+        let [to_client, from_client] = client.conn.recv_handles_exact::<{ DATA_HANDLES }>()?;
+        Some(Self {
+            to_client: unsafe { Pipe::from_raw(to_client) },
+            from_client: unsafe { Pipe::from_raw(from_client) },
+        })
+    }
+}
+
+fn piped_connection(handle: SocketHandle, pipes: DataPipes) -> PipedConnection {
+    let rx_ring = map_pipe_ring(&pipes.to_client);
+    let tx_ring = map_pipe_ring(&pipes.from_client);
+    PipedConnection {
         handle,
-        rx_write_fd: Some(rx_write_fd),
-        tx_read_fd: Some(tx_read_fd),
+        rx_write_fd: Some(pipes.to_client),
+        tx_read_fd: Some(pipes.from_client),
         rx_ring,
         tx_ring,
-    })
+    }
 }
 
 // --- One request, and the client waiting for its answer ---
@@ -266,7 +283,7 @@ fn open_piped_connection(handle: SocketHandle, rx_pipe_id: u64, tx_pipe_id: u64)
 const RESP_RESULT: u32 = RespType::Result as u32;
 const RESP_ERROR: u32 = RespType::Error as u32;
 
-/// One client's connection, and the pid to name it by.
+/// One client's connection, which is also how netd names it.
 ///
 /// netd answers a connection exactly once and then lets it close, so a handler
 /// owns this for as long as its operation lasts: the synchronous ones drop it
@@ -276,7 +293,6 @@ const RESP_ERROR: u32 = RespType::Error as u32;
 /// `close` calls that had to agree with each other on every path.
 struct Client {
     conn: Connection,
-    pid: u32,
 }
 
 impl Client {
@@ -312,7 +328,7 @@ impl Client {
                 ipc::TrySendError::TooLarge => "the answer netd built is larger than a frame",
                 ipc::TrySendError::Syscall(_) => "its connection is gone",
             };
-            say!("netd: dropping pid {} — {why}", self.pid);
+            say!("netd: dropping client {} — {why}", self.conn.fd().0);
         }
     }
 }
@@ -369,7 +385,6 @@ type ClientRx = ipc::FrameRx<MAX_KEPT_REQUEST>;
 /// used to fuse them with a blocking `recv_header` on the fresh fd.
 struct PendingConn {
     conn: Connection,
-    pid: u32,
     rx: ClientRx,
     since: Instant,
 }
@@ -582,14 +597,11 @@ impl NetDaemon {
         };
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
 
-        let Some(tx_read_fd) = open_pipe(req.tx_pipe_id, true) else {
+        let Some(pipes) = DataPipes::take(&msg.client) else {
             msg.client.error(ERR_INVALID_INPUT);
             return;
         };
-        let Some(rx_write_fd) = open_pipe(req.rx_pipe_id, false) else {
-            msg.client.error(ERR_INVALID_INPUT);
-            return;
-        };
+        let (rx_write_fd, tx_read_fd) = (pipes.to_client, pipes.from_client);
 
         let rx_buf = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; 16],
@@ -841,6 +853,13 @@ impl NetDaemon {
             msg.client.error(ERR_RESOURCE_EXHAUSTED);
             return;
         }
+        // Taken before the socket exists, for the same reason the capacity
+        // check is: a missing pair leaves nothing to unwind and no SYN on the
+        // wire.
+        let Some(pipes) = DataPipes::take(&msg.client) else {
+            msg.client.error(ERR_INVALID_INPUT);
+            return;
+        };
         let remote = IpEndpoint::new(
             IpAddress::Ipv4(Ipv4Addr::from(req.addr)),
             req.port,
@@ -870,8 +889,7 @@ impl NetDaemon {
             client: msg.client,
             socket_id,
             handle,
-            rx_pipe_id: req.rx_pipe_id,
-            tx_pipe_id: req.tx_pipe_id,
+            pipes,
             deadline,
         });
     }
@@ -883,12 +901,13 @@ impl NetDaemon {
         };
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
 
-        // Open the pipe before the socket goes into socket_set: a pipe failure
+        // Take the pipe before the socket goes into socket_set: a missing one
         // then has no half-built socket to unwind.
-        let Some(notify_write_fd) = open_pipe(req.notify_pipe_id, false) else {
+        let Some([notify]) = msg.client.conn.recv_handles_exact::<{ NOTIFY_HANDLES }>() else {
             msg.client.error(ERR_INVALID_INPUT);
             return;
         };
+        let notify_write_fd = unsafe { Pipe::from_raw(notify) };
 
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER]);
@@ -931,6 +950,10 @@ impl NetDaemon {
             msg.client.error(ERR_RESOURCE_EXHAUSTED);
             return;
         }
+        let Some(pipes) = DataPipes::take(&msg.client) else {
+            msg.client.error(ERR_INVALID_INPUT);
+            return;
+        };
         let Some(listener) = self.piped_listeners.get(&req.socket_id) else {
             msg.client.error(ERR_NOT_CONNECTED);
             return;
@@ -954,11 +977,7 @@ impl NetDaemon {
         let stream_id = self.alloc_id();
         self.sockets.insert(stream_id, SocketKind::TcpStream(old_handle));
 
-        let Some(conn) = open_piped_connection(old_handle, req.rx_pipe_id, req.tx_pipe_id) else {
-            msg.client.error(ERR_INVALID_INPUT);
-            return;
-        };
-        self.piped_connections.push(conn);
+        self.piped_connections.push(piped_connection(old_handle, pipes));
 
         // Create replacement listener
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER]);
@@ -1156,24 +1175,14 @@ impl NetDaemon {
             let socket = socket_set.get_mut::<tcp::Socket>(pc.handle);
             if socket.may_send() {
                 let local_port = socket.local_endpoint().map(|e| e.port).unwrap_or(0);
-                let Some(conn) = open_piped_connection(pc.handle, pc.rx_pipe_id, pc.tx_pipe_id) else {
-                    // Client died or pipes invalid — clean up the smoltcp socket
-                    pc.client.error(ERR_OTHER);
-                    socket.abort();
-                    let (socket_id, handle) = (pc.socket_id, pc.handle);
-                    self.sockets.remove(&socket_id);
-                    socket_set.remove(handle);
-                    self.pending_piped_connects.swap_remove(i);
-                    continue;
-                };
                 let resp = TcpConnectResponse {
                     socket_id: pc.socket_id,
                     local_port,
                     _pad: 0,
                 };
                 pc.client.result(&resp);
-                self.piped_connections.push(conn);
-                self.pending_piped_connects.swap_remove(i);
+                let pc = self.pending_piped_connects.swap_remove(i);
+                self.piped_connections.push(piped_connection(pc.handle, pc.pipes));
                 continue;
             }
             if socket.state() == tcp::State::Closed {
@@ -1334,7 +1343,10 @@ fn main() {
         // client's traffic.
         let now_wall = Instant::now();
         for p in pending.iter().filter(|p| now_wall.duration_since(p.since) >= HANDSHAKE_TIMEOUT) {
-            say!("netd: dropping pid {} — it never finished its request", p.pid);
+            say!(
+                "netd: dropping client {} — it never finished its request",
+                p.conn.fd().0
+            );
         }
         pending.retain(|p| now_wall.duration_since(p.since) < HANDSHAKE_TIMEOUT);
 
@@ -1342,20 +1354,15 @@ fn main() {
         // that connects and then says nothing costs a slot and a deadline, not
         // the network stack.
         if ready.contains(&TOKEN_LISTENER) {
-            let result = acceptor.accept().expect("accept failed");
+            let conn = acceptor.accept().expect("accept failed");
             if pending.len() >= MAX_PENDING_CONNS as usize {
                 say!(
-                    "netd: refusing pid {} — {MAX_PENDING_CONNS} connections are already \
+                    "netd: refusing client {} — {MAX_PENDING_CONNS} connections are already \
                      waiting to say what they want",
-                    result.client_pid
+                    conn.fd().0
                 );
             } else {
-                pending.push(PendingConn {
-                    conn: result.conn,
-                    pid: result.client_pid,
-                    rx: ClientRx::new(),
-                    since: Instant::now(),
-                });
+                pending.push(PendingConn { conn, rx: ClientRx::new(), since: Instant::now() });
             }
         }
 
@@ -1385,8 +1392,9 @@ fn main() {
                 }
                 RxStep::Malformed => {
                     say!(
-                        "netd: dropping pid {} — it sent a frame this protocol cannot describe",
-                        pending[i].pid
+                        "netd: dropping client {} — it sent a frame this protocol cannot \
+                         describe",
+                        pending[i].conn.fd().0
                     );
                     pending.remove(i);
                 }
@@ -1395,7 +1403,7 @@ fn main() {
                     payload[..payload_len].copy_from_slice(pending[i].rx.payload(payload_len));
                     let p = pending.remove(i);
                     requests.push(Request {
-                        client: Client { conn: p.conn, pid: p.pid },
+                        client: Client { conn: p.conn },
                         msg_type,
                         payload,
                         payload_len,

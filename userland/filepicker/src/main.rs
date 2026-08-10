@@ -469,7 +469,7 @@ fn main() {
 
     loop {
         let conn = acceptor.accept().expect("accept failed");
-        let Ok(header) = conn.conn.recv_header() else {
+        let Ok(header) = conn.recv_header() else {
             continue;
         };
         if header.msg_type != MSG_FILEPICKER_REQUEST {
@@ -477,7 +477,7 @@ fn main() {
         }
 
         let mut data = [0u8; 4096];
-        let n = conn.conn.recv_bytes(&header, &mut data).unwrap_or(0);
+        let n = conn.recv_bytes(&header, &mut data).unwrap_or(0);
         let mode = if n > 0 && data[0] == PickerMode::Save as u8 {
             PickerMode::Save
         } else {
@@ -489,6 +489,6 @@ fn main() {
             "/"
         };
 
-        run_picker(mode, start_dir, &conn.conn);
+        run_picker(mode, start_dir, &conn);
     }
 }

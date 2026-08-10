@@ -78,7 +78,7 @@ fn server() {
 /// readable once the writer is gone.
 fn serve_one(acceptor: &Acceptor, reply: Option<u32>) {
     let accepted = acceptor.accept().expect("accept a client");
-    let fd = accepted.conn.fd();
+    let fd = accepted.fd();
     let header = ipc::recv_header(fd).expect("request header");
     assert_eq!(header.msg_type, window::MSG_CREATE_WINDOW, "client sent the wrong request");
     let _req: window::CreateWindowRequest =

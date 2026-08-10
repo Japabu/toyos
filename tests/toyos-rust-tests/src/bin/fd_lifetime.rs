@@ -27,6 +27,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 use toyos::{namespace, port, AsHandle};
+use toyos_abi::io_uring::IoUringParams;
 use toyos_abi::syscall::{self, OpenFlags, SeekFrom, SyscallError, SERVE_PREFIX};
 
 const SELF_PATH: &str = "/bin/test_rs_fd_lifetime";
@@ -37,6 +38,11 @@ const PATH: &[u8] = b"/tmp/fd-lifetime.txt";
 const KILLED_PATH: &[u8] = b"/home/fd-lifetime-killed.txt";
 const PAYLOAD: &[u8] = b"a file outlives the fd that was closed first";
 const KILLED_PAYLOAD: &[u8] = b"written by a process that was killed before it could close";
+/// How many rings the `ring` holder makes. One is 2 MiB, and the witness for
+/// a killed process giving them back is the machine's own free memory — so the
+/// figure has to be far enough above what the rest of a boot moves under it
+/// that a reclaim cannot hide in the noise.
+const HOLDER_RINGS: usize = 8;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -88,7 +94,7 @@ fn acceptor_survives_one_close() {
     let client = syscall::namespace_open(ns.as_handle(), SERVICE)
         .expect("open through the connector of a live port");
     let accepted = syscall::accept(b).expect("accept on the surviving acceptor handle");
-    syscall::close(accepted.fd);
+    syscall::close(accepted);
     syscall::close(client);
 
     // And the last close is what closes the port. `Gone` and not `NotFound`:
@@ -102,22 +108,25 @@ fn acceptor_survives_one_close() {
 }
 
 fn ring_survives_one_close() {
-    let (a, token) = syscall::io_uring_setup(8).expect("io_uring_setup");
-    let b = syscall::dup(a).expect("dup a ring fd");
+    let (a, base) = unsafe { syscall::io_uring_setup(8) }.expect("io_uring_setup");
+    let b = syscall::dup(a).expect("dup a ring handle");
     syscall::close(a);
 
-    // Two independent witnesses that the instance is alive: its pages are
-    // still ours to map, and it still accepts an `enter`.
-    unsafe { syscall::try_map_shared(token) }
-        .expect("closing one of two ring fds freed the ring's pages");
+    // Two independent witnesses that the instance is alive: it still accepts an
+    // `enter`, and its own page is still mapped. The page is the ring's now —
+    // there is no separate region and no token naming one — so reading the
+    // params back through the pointer setup handed over is what says the close
+    // did not unmap it.
     syscall::io_uring_enter(b, 0, 0, 0)
-        .expect("closing one of two ring fds destroyed the instance");
+        .expect("closing one of two ring handles destroyed the instance");
+    let params = unsafe { core::ptr::read_volatile(base as *const IoUringParams) };
+    assert_eq!(params.sq_ring_size, 8, "the ring's page no longer describes the ring");
 
     syscall::close(b);
     assert_eq!(
-        unsafe { syscall::try_map_shared(token) }.err(),
+        syscall::io_uring_enter(b, 0, 0, 0).err(),
         Some(SyscallError::NotFound),
-        "the last close did not free the ring"
+        "the last close left the ring's handle behind"
     );
 }
 
@@ -142,27 +151,38 @@ fn kill_releases_acceptor() {
     );
 }
 
-/// The ring's release is visible through its shared-memory token: the region
-/// is not granted to us, so a live one answers `PermissionDenied` and a freed
-/// one `NotFound`. Read before anything else can allocate, because tokens are
-/// reusable.
+/// A ring's pages are its own and no second name reaches them, so the witness
+/// is the machine's free memory rather than a token this process could try to
+/// map. The holder makes [`HOLDER_RINGS`] of them, which is 16 MiB.
 fn kill_releases_ring() {
-    let (mut child, mut out) = spawn_holder("ring");
-    let mut line = String::new();
-    out.read_line(&mut line).expect("holder's ring token");
-    let token: u32 = line.trim().parse().expect("holder's ring token");
-    assert_eq!(
-        unsafe { syscall::try_map_shared(token) }.err(),
-        Some(SyscallError::PermissionDenied),
-        "the ring's region was already gone while its holder still ran"
+    let before = free_bytes();
+    let (mut child, _) = spawn_holder("ring");
+    let held = free_bytes();
+
+    // Non-vacuity: an instrument that cannot see 16 MiB leave cannot see it
+    // come back either, and the reclaim assertion would pass on a kernel that
+    // frees nothing.
+    let taken = before.saturating_sub(held);
+    assert!(
+        taken >= 12 * 1024 * 1024,
+        "the holder made {HOLDER_RINGS} rings and free memory only moved {taken} bytes"
     );
 
     kill_and_reap(&mut child);
-    assert_eq!(
-        unsafe { syscall::try_map_shared(token) }.err(),
-        Some(SyscallError::NotFound),
-        "a killed process did not give its io_uring back"
+    let leaked = before.saturating_sub(free_bytes());
+    assert!(
+        leaked < 6 * 1024 * 1024,
+        "a killed process kept {leaked} bytes of its io_urings"
     );
+}
+
+fn free_bytes() -> u64 {
+    let mut buf = [0u8; 48];
+    let n = syscall::sysinfo(&mut buf);
+    assert!(n >= 48, "sysinfo returned {n} bytes");
+    let total = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let used = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    total - used
 }
 
 /// A killed process's dirty file must still reach the filesystem: that flush
@@ -227,9 +247,12 @@ fn holder(kind: &str) {
             println!("held");
         }
         "ring" => {
-            let (_fd, token) = syscall::io_uring_setup(8).expect("holder: io_uring_setup");
+            let rings: Vec<_> = (0..HOLDER_RINGS)
+                .map(|_| unsafe { syscall::io_uring_setup(8) }.expect("holder: io_uring_setup"))
+                .collect();
+            // Held for the process's life: the point is what the kill does.
+            core::mem::forget(rings);
             println!("held");
-            println!("{token}");
         }
         "file" => {
             let fd = syscall::open(

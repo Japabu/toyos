@@ -132,12 +132,14 @@ fn main() {
                 // broadcasts to every window, this one included, so the
                 // re-read arrives back through `Event::LayoutChanged`.
                 Notice::LayoutChanged => window.notify_layout_changed(),
-                Notice::Grabbed { pid } => {
-                    eprintln!("terminal: pid {pid} has the keyboard until it exits")
+                Notice::Grabbed { client } => {
+                    eprintln!("terminal: client {client} has the keyboard until it exits")
                 }
-                Notice::Released { pid } => eprintln!("terminal: pid {pid} gave the keyboard back"),
-                Notice::Dropped { pid, why } => {
-                    eprintln!("terminal: dropping pid {pid} — {why}")
+                Notice::Released { client } => {
+                    eprintln!("terminal: client {client} gave the keyboard back")
+                }
+                Notice::Dropped { client, why } => {
+                    eprintln!("terminal: dropping client {client} — {why}")
                 }
             }
         }

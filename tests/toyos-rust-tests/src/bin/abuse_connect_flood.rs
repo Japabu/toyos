@@ -102,7 +102,7 @@ fn main() {
     // the negative control for the ceiling above — a kernel that allocated
     // nothing ever would pass that assertion and fail this one.
     let before_write = used_bytes();
-    let wrote = syscall::write(accepted.fd, b"x").expect("write one byte to an accepted socket");
+    let wrote = syscall::write(accepted, b"x").expect("write one byte to an accepted socket");
     assert_eq!(wrote, 1);
     let ring = used_bytes().saturating_sub(before_write);
     assert!(
@@ -111,7 +111,7 @@ fn main() {
     );
     println!("  the first write on a connection allocated {} KiB", ring / 1024);
 
-    syscall::close(accepted.fd);
+    syscall::close(accepted);
     let fd = syscall::namespace_open(ns.as_handle(), NAME)
         .expect("an open must succeed once the server drains one");
     held.push(fd);

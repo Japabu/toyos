@@ -260,7 +260,7 @@ impl Virtio {
     /// soundd's first instruction.
     pub fn claim(dev: VirtioSoundDev) -> Result<(Self, u32, u8), Refusal> {
         let info = dev.info().map_err(Refusal::Kernel)?;
-        let shm = SharedMemory::map(info.dma_token, 2 * 1024 * 1024)
+        let shm = SharedMemory::adopt(info.dma, 2 * 1024 * 1024)
             .map_err(Refusal::Kernel)?;
         let base = shm.as_ptr();
 

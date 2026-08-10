@@ -9305,7 +9305,7 @@ fn run_machine_test(
             // share one window (`specs/issues/build/`), which here is what makes the
             // daemon's side of the story readable at all.
             console.push_str(&result.serial);
-            for named in ["netd: dropping pid", "netd: refusing pid"] {
+            for named in ["netd: dropping client", "netd: refusing client"] {
                 if !console.contains(named) {
                     return Err(format!(
                         "netd got rid of clients without a `{named}` line — a daemon that \

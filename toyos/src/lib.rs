@@ -140,6 +140,15 @@ impl Pipe {
     pub fn into_fd(self) -> RawHandle {
         self.0.into_raw()
     }
+
+    /// Take ownership of a pipe end that arrived over a connection.
+    ///
+    /// # Safety
+    /// `raw` must be a live pipe-end handle this process owns and nothing else
+    /// answers for.
+    pub unsafe fn from_raw(raw: RawHandle) -> Self {
+        Self(OwnedHandle(raw))
+    }
 }
 
 impl AsHandle for Pipe {

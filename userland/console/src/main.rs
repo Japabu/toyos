@@ -86,8 +86,8 @@ fn main() {
         return;
     };
     let info = fb_dev.info().expect("console: framebuffer info");
-    let shm = SharedMemory::map(info.token[0], info.stride as usize * info.height as usize * 4)
-        .expect("console: the scanout token the framebuffer device just reported");
+    let shm = SharedMemory::adopt(info.scanout[0], info.stride as usize * info.height as usize * 4)
+        .expect("console: the scanout buffer the framebuffer claim just handed over");
     let screen = Screen::new(
         shm.as_ptr(),
         info.width as usize,
@@ -190,11 +190,15 @@ fn main() {
                     host.notify_layout();
                     eprintln!("console: keyboard layout is now {}", translator.layout());
                 }
-                Notice::Grabbed { pid } => {
-                    eprintln!("console: pid {pid} has the keyboard until it exits")
+                Notice::Grabbed { client } => {
+                    eprintln!("console: client {client} has the keyboard until it exits")
                 }
-                Notice::Released { pid } => eprintln!("console: pid {pid} gave the keyboard back"),
-                Notice::Dropped { pid, why } => eprintln!("console: dropping pid {pid} — {why}"),
+                Notice::Released { client } => {
+                    eprintln!("console: client {client} gave the keyboard back")
+                }
+                Notice::Dropped { client, why } => {
+                    eprintln!("console: dropping client {client} — {why}")
+                }
             }
         }
 

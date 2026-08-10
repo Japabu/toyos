@@ -29,8 +29,9 @@ impl FramebufferDev {
     }
 
     /// Ask for a mode change. The answer describes the new scanout, whose
-    /// buffers are fresh: the tokens in it are not the ones the claim first
-    /// reported.
+    /// buffers are fresh handles — the old ones stay mapped and valid until
+    /// their holder closes them, because a capability system may not take a
+    /// mapping away.
     pub fn set_resolution(&self, width: u32, height: u32) -> Result<FramebufferInfo, SyscallError> {
         let mut info = unsafe { core::mem::zeroed::<FramebufferInfo>() };
         // SAFETY: `info` is this frame's own storage and outlives the call.
