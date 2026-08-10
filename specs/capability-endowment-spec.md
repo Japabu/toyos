@@ -340,7 +340,7 @@ for programs and on whitespace for argv (`kernel/src/main.rs:603-610`).
 
 `init` is an ordered list that orders nothing, and the config can express a
 dependency it cannot honour. That is the honest statement of the defect in
-`specs/issues/kernel/terminal-races-compositor-at-boot.md`.
+`kernel/terminal-races-compositor-at-boot`.
 
 ### 2.2 The new shape
 
@@ -572,7 +572,6 @@ Both are the same shape as `SYS_CLOSE`'s row, which the table already had.
 | 65 | `SYS_KILL` | pid-addressed |
 | 68 | `SYS_PIPE_OPEN` | the original id-guessing hole; nothing left to guess |
 | 70 | `SYS_PIPE_ID` | there is no id to hand a peer |
-| 76 | `SYS_SOCKET_CREATE` | built a connection out of two pipe ids |
 | 85 | `SYS_LISTEN` | there is no global name registry to register in |
 | 87 | `SYS_CONNECT` | there is no global name registry to look up in |
 | 96 | `SYS_SET_RT_PRIORITY` | gated on the audio claim, and a claim is not a privilege — the dispatch's own comment says so (`kernel/src/arch/syscall.rs:641-657`: *"`SYS_OPEN_DEVICE` is first-come and ungated, so whoever wins the race gets the RT band with it… a claim is not one"*). `SYS_RT_ENTER` is the privilege that comment asks for |
@@ -607,7 +606,7 @@ Six change shape as well:
 - **`SYS_PIPE`(24)** returns two handles rather than two `Fd`s, and gains a
   `Result` — `sys_pipe` already answers `ResourceExhausted` on three paths and
   the wrapper splits the error word into `Fd(-1)`/`Fd(-8)`
-  (`specs/issues/isolation/abi-wrappers-return-error-as-value.md`). That issue's
+  (`isolation/abi-wrappers-return-error-as-value`). That issue's
   fork edit (mio's waker) is in this branch's fork budget anyway, so it is fixed
   here.
 - **`SYS_SPAWN`(25)** returns a `Process` handle; `SpawnArgs` grows (§4.2).
@@ -647,15 +646,19 @@ Six change shape as well:
   field in the SDK's **public** API and `locale_gate` prints all three
   (`tests/toyos-rust-tests/src/bin/locale_gate.rs:97-99`), and
   `tests/toyos.rs:9074` asserts on the literals `"netd: dropping pid"` and
-  `"netd: refusing pid"`. A server can still name a peer — by the `Koid` of the
-  connection, which is the kernel's own identity for the object and not a
-  designation anyone can present. `Notice`'s field becomes that `Koid`, the two
-  netd literals become `"netd: dropping client"` / `"netd: refusing client"`, and
-  `tests/toyos.rs:9074` changes with them.
+  `"netd: refusing pid"`. A server can still name a peer, and **what it ended up naming one by is the
+  connection's own `RawHandle` rather than a `Koid`**: none of §3.1's fourteen
+  numbers answers a koid, and adding a fifteenth was not chunk 6's to decide. A
+  handle carries a generation and a closed slot is reissued at the next one, so a
+  handle value names one object for the life of the process holding it and
+  designates nothing in any other table — the same property, with no ABI. That is
+  `toyos::surface::ClientId`; the two netd literals become
+  `"netd: dropping client"` / `"netd: refusing client"`, and `tests/toyos.rs:9074`
+  changes with them. The koid stays a named option: one number and one arm.
 - **`SYS_IO_URING_SETUP`(89)** takes an out-pointer and writes
   `{ handle: RawHandle, vaddr: u64 }`. Today it returns `(Fd, shm_token)` packed
   in a u64 and the caller maps the token — which is the whole of
-  `specs/issues/design-debt/io-uring-abuses-shared-memory.md`. The ring owns its
+  `design-debt/io-uring-abuses-shared-memory`. The ring owns its
   `PageAlloc` and the kernel maps it at setup.
 - **`SYS_PROCESS_STATS`(94)** takes a `Process` handle. That re-scopes
   `specs/issues/diagnostics/process-stats-exited-child-only.md`: with a handle
@@ -809,7 +812,7 @@ Every one is a `MAX_*` on the primitive, refuses by name, and never truncates.
 | `MAX_NAMESPACE_ENTRIES` | 64 | five production names today; room for a decade |
 | `MAX_SERVICE_NAME` | 64 bytes | `surface` is 7; the longest test name is 28 |
 | `MAX_PROGRAM_NAME` | 32 bytes | a `[programs]` key; the longest today is `test-runner` at 11 |
-| `MAX_LAUNCH_EXTRAS` | 8 | connectors a caller may transfer with one `MSG_LAUNCH` (§4.5) |
+| `MAX_LAUNCH_EXTRAS` | 5 | connectors a caller may transfer with one `MSG_LAUNCH` (§4.5). Not 8: the batch also carries the three stdio handles and `MAX_TRANSFER_HANDLES` is 8, and splitting a launch across two batches would let a child's authority arrive in pieces |
 | `MAX_LABELS_LEN` | 4096 bytes | `MAX_ENDOWMENTS` × (`MAX_SERVICE_NAME` + the longest `serve:`/`dev:` prefix) is 2,304; the rest is slack |
 | `MAX_PENDING_CONNECTIONS` | 32 | unchanged (`kernel/src/listener.rs:170`), now per port |
 | `MAX_TRANSFER_HANDLES` | 8 | per `SYS_HANDLE_SEND` batch |
@@ -863,7 +866,7 @@ serves a name and is launched by the compositor; init creates its port up front
 and endows the *acceptor* through the launcher when it spawns it, so an editor
 holding the `filepicker` connector can connect before the picker has run a single
 instruction. That is the whole of
-`specs/issues/design-debt/pick-file-cannot-say-why-it-failed.md`'s reachable
+`design-debt/pick-file-cannot-say-why-it-failed`'s reachable
 cause.
 
 **But an acceptor is endowed by move, so a `serves` program can be launched
@@ -1044,8 +1047,9 @@ is load-bearing.**
   a handle it already has, which is the same bound `SYS_SPAWN` has — and it keeps
   §4.6's rows exact, because a caller that transfers nothing gets exactly the
   manifest row.
-- **A bound.** `MAX_LAUNCH_EXTRAS = 8`, refused by name, for the same reason
-  every other `MAX_*` here exists.
+- **A bound.** `MAX_LAUNCH_EXTRAS = 5`, refused by name, for the same reason
+  every other `MAX_*` here exists — five and not eight because the same batch
+  carries stdio and a launch is one crossing (§3.7).
 
 **init keeps no `Process` handle from a launch.** The send is a *move*: init's
 handle count for that object goes to zero and the caller's to one. Otherwise any
@@ -1291,7 +1295,7 @@ constants, two identical policies, eight source lines
 `toyos/src/net.rs:264,265,272,276` and `toyos/src/audio.rs:188,189,266,270`). And
 per boot on metal-sim, sshd's **100 `SYS_NANOSLEEP` calls and its exit at
 t=1.69 s on a boot that completed at 0.38 s**
-(`specs/issues/hardware/network-clients-pay-a-boot-retry.md`).
+(`hardware/network-clients-pay-a-boot-retry`).
 
 ### 6.3 soundd's stream protocol
 
@@ -1351,10 +1355,18 @@ once, at `main.rs:224` inside `open_pipe`, which has **five** call sites
 them and is itself called at `:935` and `:1137`. Every one becomes a
 `SYS_HANDLE_SEND` of the pipe end itself.
 
-`SYS_SOCKET_CREATE` — netd's way of turning two pipe ids it was told about into a
-connection — has no purpose left and is retired. `toyos::net`'s public functions
-keep their signatures, so the mio fork's `toyos_stream.rs`/`toyos_listener.rs`
-see no change beyond the `Fd` rename.
+`SYS_SOCKET_CREATE` is **renamed `SYS_CONNECTION_JOIN` and keeps number 76.**
+The first draft of this section retired it, having read only half of what it
+does: taking two pipe *ids* is the half that dies, and making one duplex object
+out of two simplex ends is the half that has three callers outside this
+repository — `rust/library/std/src/sys/net/connection/toyos.rs:55-57` and
+`socket2/src/sys/toyos.rs:485-490,630-635`. std's `TcpStream` is one handle and
+netd's data path is two pipes, so something has to join them. Handle-addressed
+it grants nothing, because everything it reaches is already the caller's, which
+is the same move §3.3 makes for `SYS_DUP` → `SYS_HANDLE_DUP`. §8.4's grep gate
+is satisfied by the *name* being gone. `toyos::net`'s public functions keep their
+signatures, so the mio fork's `toyos_stream.rs`/`toyos_listener.rs` see no change
+beyond the `Fd` rename.
 
 ### 6.5 The SDK
 
@@ -1407,7 +1419,7 @@ calls `close`, and `AsHandle::as_handle() -> Fd` is implemented by `Listener`,
   `core::mem::forget` becomes that `into_raw`.
 - `AsHandle::as_handle() -> RawHandle` keeps its name and its meaning.
 
-`specs/issues/design-debt/fd-is-a-unix-ism.md` asks for `Fd` → `Handle`. It gets
+`design-debt/fd-is-a-unix-ism` asks for `Fd` → `Handle`. It gets
 `Fd` → `RawHandle`, because `Handle` was taken by the *owning* type and the owning
 type is the one that should hold the short name.
 
@@ -1440,7 +1452,7 @@ wc -l`). The ones this touches:
 main's — no matter which worktree runs it and no matter who holds the sysroot.
 `--claim-sysroot` records a witness of *this* worktree's sources while building
 from the primary's. That is
-`specs/issues/build/std-change-needs-an-unlanded-abi-change.md`, and for a branch
+`build/std-change-needs-an-unlanded-abi-change`, and for a branch
 whose whole content is an ABI change it is not an inconvenience but a wall: the
 kernel would link against this tree's struct layouts and std against main's.
 
@@ -1620,20 +1632,30 @@ work neither helps nor harms them.
 
 ### 7.2 `specs/issues/` this closes
 
+Deleted on 2026-08-10; `git log -- specs/issues/<area>/<slug>.md` is the story.
+
 | file | how |
 |---|---|
-| `specs/issues/kernel/terminal-races-compositor-at-boot.md` | the race is unrepresentable: the port exists before either process |
-| `specs/issues/design-debt/pick-file-cannot-say-why-it-failed.md` | `Result<Option<String>, PickError>`, and the reachable cause is gone |
-| `specs/issues/hardware/network-clients-pay-a-boot-retry.md` | no retry loop exists |
-| `specs/issues/isolation/capability-by-id-or-name.md` | all four instances: `PipeId`, the service name, `SharedToken`, the device claim |
-| `specs/issues/design-debt/fd-is-a-unix-ism.md` | `Fd` → `Handle` |
-| `specs/issues/design-debt/sharedtoken-has-no-raii.md` | `SharedToken` deleted; `SharedMemObject` is Arc-lifetimed |
-| `specs/issues/design-debt/io-uring-abuses-shared-memory.md` | the ring owns its `PageAlloc`; `SYS_IO_URING_SETUP` returns its own mapping |
-| `specs/issues/hardware/device-claim-succeeds-with-no-device.md` | keyboard and mouse gain the presence gate the other four have; init endows only what exists |
-| `specs/issues/isolation/abi-wrappers-return-error-as-value.md` | `pipe()` becomes fallible; the mio edit is in this branch's fork budget |
-| `specs/issues/build/std-change-needs-an-unlanded-abi-change.md` | chunk 0 |
-| `specs/issues/build/boot-config-gates-iterate-a-hand-written-list.md` | §8.1's `every_shipped_boot_config_is_covered`: one `ALL_CONFIGS` list, asserted against what the walk finds |
-| `specs/issues/build/docs-total-budget-comment-is-stale.md` | chunk 9 touches the budgets anyway; delete the measurement from the comment or print it from the assertion |
+| `kernel/terminal-races-compositor-at-boot` | the race is unrepresentable: the port exists before either process |
+| `design-debt/pick-file-cannot-say-why-it-failed` | `Result<Option<String>, PickError>`, and the reachable cause is gone |
+| `hardware/network-clients-pay-a-boot-retry` | no retry loop exists |
+| `isolation/capability-by-id-or-name` | all four instances: `PipeId`, the service name, `SharedToken`, the device claim |
+| `design-debt/fd-is-a-unix-ism` | `Fd` → `Handle` |
+| `design-debt/sharedtoken-has-no-raii` | `SharedToken` deleted; `SharedMemObject` is Arc-lifetimed |
+| `design-debt/io-uring-abuses-shared-memory` | the ring owns its `PageAlloc`; `SYS_IO_URING_SETUP` returns its own mapping |
+| `isolation/abi-wrappers-return-error-as-value` | both halves: `pipe()` in chunk 2, `tls_alloc_block()` in chunk 9, and std's `__tls_get_addr_slow` `rtabort!`s rather than adding an offset to a refusal |
+| `build/std-change-needs-an-unlanded-abi-change` | chunk 0 |
+| `build/boot-config-gates-iterate-a-hand-written-list` | §8.1's `every_shipped_boot_config_is_covered`: one `ALL_CONFIGS` list, asserted against what the walk finds |
+| `build/docs-total-budget-comment-is-stale` | the measurement is out of the comment and the assertion prints what is spare |
+| `diagnostics/syscall-profile-is-64-bins-wide` | `SYSCALL_PROFILE_BINS` is the ABI's, and a number it does not issue lands in `SYSCALL_PROFILE_OTHER` rather than nowhere — the parts sum to the total |
+
+**One row of the first draft of this table was wrong and the file stays open.**
+`hardware/device-claim-succeeds-with-no-device` said "keyboard and mouse gain the
+presence gate the other four have"; they did not. `device::try_claim` still
+answers `Ok` for `Keyboard` and `Mouse` on a machine with no HID of any kind,
+because nothing registers their presence the way a framebuffer, a NIC and the
+two sound cards register theirs. Nothing in this branch needed it and inventing
+a presence signal for two input classes is its own piece of work.
 
 ### 7.3 `specs/issues/` this re-scopes
 
@@ -1641,10 +1663,16 @@ work neither helps nor harms them.
 |---|---|
 | `specs/issues/isolation/process-isolation-ungated.md` | `SYS_LISTEN`'s squat and the `SYS_GRANT_SHARED` no-revoke clause both go. What remains is the general revocation question, and the entry's own trigger fires: *"It stops being sound the moment the reachable set is no longer exactly what the owner named — … when `SYS_HANDLE_SEND` makes a grant transferable."* Rewrite it around that. |
 | `specs/issues/diagnostics/process-stats-exited-child-only.md` | addressing fixed by the handle; the accounting gap is untouched |
-| `specs/issues/diagnostics/syscall-profile-is-64-bins-wide.md` | worse, then fixed: the highest number goes 98 → 112, so the `[u32; 64]` must be sized from the ABI in this branch rather than after it |
 | `specs/issues/isolation/client-request-is-an-allocation.md` | the third instance's "the attacker can be its own service" clause dies with `SYS_LISTEN`; the compositor's unbounded windows remain |
 | `specs/issues/isolation/compositor-and-netd-unbounded-accept.md` | unchanged; the compositor's half is still owed |
 | `specs/issues/build/abi-split-reads-commits-not-the-tree.md` | this branch is the case the `Abi-Inseparable` trailer exists for; the finding is unaffected |
+
+**And two the branch filed rather than closed**:
+`specs/issues/isolation/a-moved-handle-is-always-re-movable.md` (§6.3 assumes a
+`MAP`-only send the rights model cannot express) and
+`specs/issues/isolation/a-provided-name-cannot-reach-an-undeclared-child.md`
+(`SYS_NAMESPACE_BUILD` has no "keep everything in base", so the direct spawn
+path cannot merge a transferred name into an inherited namespace).
 
 ---
 
@@ -1686,7 +1714,7 @@ fails on a tree with the defect reintroduced. A gate with neither is not listed.
   rewrites every config anyway, the four gates above iterate a single
   `ALL_CONFIGS` list asserted equal to `find . -name system.toml`'s answer, so a
   config added without a gate row is a red rather than a silence
-  (`specs/issues/build/boot-config-gates-iterate-a-hand-written-list.md`).
+  (`build/boot-config-gates-iterate-a-hand-written-list`).
 
 ### 8.2 Queueing — `connect_before_serve`
 
@@ -1809,7 +1837,7 @@ resolved by picking one.
 override so `x build library` reads the building worktree's `toyos-abi`/`toyos`.
 A host test proves it: a marker constant in this worktree's `toyos-abi` must
 appear in the built `libstd`. Closes
-`specs/issues/build/std-change-needs-an-unlanded-abi-change.md`.
+`build/std-change-needs-an-unlanded-abi-change`.
 *Nothing else in this plan can be verified until this works.*
 
 Four things about that file, because it is written into a directory every
@@ -2425,7 +2453,7 @@ owner should decide rather than an agent:
   edits in `rust/library/std/src/sys/{process,pal,pipe,stdio,net,fs}/toyos*` for
   the length of chunks 2, 5 and 7. On 2026-08-05 a single uncommitted std patch
   sitting there for about an hour failed three other worktrees' landings
-  (`specs/issues/build/std-change-needs-an-unlanded-abi-change.md`). Recommended:
+  (`build/std-change-needs-an-unlanded-abi-change`). Recommended:
   commit and push the std half to the fork's branch at the end of each chunk that
   touches it, and bump the submodule pointer in the monorepo at the same moment,
   rather than accumulating.
@@ -2494,8 +2522,9 @@ counterargument: the compositor's `shm.grant(pid)`
 (`userland/soundd/src/main.rs:627`). Both are replaced by `SYS_HANDLE_SEND` in
 chunk 6 and the pid is deleted in that same commit (§3.3). The rest of its use is
 diagnostic — 87 lines across four files name a pid — and it becomes the
-connection's `Koid`, which is the kernel's identity for the object and not
-something a process can present to anybody.
+connection's own `RawHandle`, which is a name in one process's table and not
+something anyone can present anywhere else. §6.7a says why that rather than the
+`Koid` this paragraph first asked for.
 
 **D4 — device claims are minted only by init, and `SYS_OPEN_DEVICE` is retired.**
 `capability-handles-spec.md` §14.11 scopes spawn-time device grants out of v1 and

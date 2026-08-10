@@ -1367,7 +1367,7 @@ rate about the tree.**
   `heartbeat = []` in `kernel/Cargo.toml` — the same guest with no tick — reds
   it on six of the eight CPUs.
 - **`desktop_window_child` is the tree's, and it is the one left.** The
-  `/bin/terminal` boot race, `specs/issues/kernel/terminal-races-compositor-at-boot.md`,
+  `/bin/terminal` boot race (`kernel/terminal-races-compositor-at-boot`, closed),
   which that file already records as the dominant blocker of the dev host's
   parallel-red list and declines to fix because *where the wait belongs* is a
   design question with three answers and no owner's ruling. What this probe adds
@@ -1449,7 +1449,7 @@ shape to plan against: the suite has a tail of low-rate names, each fires at
 the eight are closed by this section's work. The two that are not:
 
 - **The `/bin/terminal` boot race**
-  (`specs/issues/kernel/terminal-races-compositor-at-boot.md`), which is a
+  (`kernel/terminal-races-compositor-at-boot`, since closed), which is a
   design question and the dominant one. It is not one test's: it reds whichever
   desktop test's boot happens to lose, and it took `desktop_window_child` and
   `desktop_audio_client` here. 2 of 10 per desktop boot, and a suite has four of

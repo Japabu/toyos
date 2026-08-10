@@ -223,11 +223,9 @@ const MAX_PENDING_POLLS: usize = 1024;
 struct IoUringInstance {
     id: RingId,
     shm_phys: DirectMap,
-    /// The ring's own pages. It used to be a `SharedToken` the caller mapped
-    /// for itself, which is the whole of
-    /// `specs/issues/design-debt/io-uring-abuses-shared-memory.md`: a ring is
-    /// not something two processes share, and its page had a lifetime of its
-    /// own for no reason but the ABI.
+    /// The ring's own pages. **A ring is not something two processes share**,
+    /// so its page has no lifetime of its own and no second name: it goes with
+    /// the last handle to the ring.
     shm: alloc::sync::Arc<SharedMemObject>,
     /// Live `RingRef`s. Never zero while this entry is in the map.
     refs: u32,

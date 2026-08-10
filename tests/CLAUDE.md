@@ -26,6 +26,12 @@ The gate's four instrument defects and the dropout regression they hid are close
 
 `EXPECTED_FAILURES` names the test, the task, the write-up in `specs/issues/` and the failure messages the exemption covers — anything else that test says still reds the run, and the run prints the pointer beside every `XFAIL`. Such a run exits 0 and the gate takes it; it is not a *clean* run, its last line says so, and every CI shard writes that line into the run's job summary. **An entry must be able to fail the build by itself**, so it declares what makes it stale: `OnAPass` where the failure is reproducible, or a review date where it is not — one green of an intermittent test is one sample and may not red a healthy tree.
 
+## Probing a refusal
+
+**A guest binary cannot ask what a handle it does not hold does.** `BadHandle`, `Stale` and `WrongType` end the caller with exit 139, so an arm that used to read an error word is now a **child** — one fault per child, the parent asserting the death. Give each child a `println!` marker before the call and require it: without one, a child that died on the way to the thing under test passes while asserting nothing. `handle_kill_policy` is the matrix and the pattern; `abuse_gpu_resolution`, `abuse_listener_hijack`, `abuse_pipe_owner` and `abuse_shared_grant` are it applied.
+
+**A test binary holds what `test-runner` holds** (`specs/capability-endowment-spec.md` §6.7a) — the 90 guest binaries are not `[programs]` keys, so no manifest row can name what any of them needs. Its namespace travels to every child by inheritance and its `SysCap` is endowed explicitly at `SYSCAP_LABEL`. A test that needs a *server* builds one: a port, a namespace over its connector, and a child spawned holding it, all inside one binary — `window_refusal`, `connect_before_serve`, `endowment_denied`.
+
 ## Filtered runs
 
 `cargo test -- <name>` opens one capture window and a daemon's boot lines land in it, so a C-test family that compares whole stdout can be red for soundd's line rather than for its own output. Judge it from a full run.

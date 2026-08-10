@@ -9,6 +9,13 @@
 //!
 //! The exceptions are per file and per line count, so an *added* `forget`
 //! beside a permitted one is a red rather than a silence.
+//!
+//! The second scan is `specs/capability-endowment-spec.md` §8.4: the global
+//! registry's names must be gone from the code, not merely unused. It reads
+//! **code only** — comments and string literals are stripped first — because
+//! the history of what a name used to mean is worth keeping and the
+//! retired-syscall gravestone table names every one of them as a string on
+//! purpose.
 
 use std::path::{Path, PathBuf};
 
@@ -77,6 +84,9 @@ fn rust_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     entries.sort();
     for path in entries {
         if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
             rust_files(root, &path, out);
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
@@ -97,6 +107,80 @@ fn occurrences(needle: &str) -> Vec<(String, usize)> {
         let n = text.matches(needle).count();
         if n > 0 {
             found.push((rel(&root, &path), n));
+        }
+    }
+    found
+}
+
+/// The names the global registry left behind, and one that is not a name at
+/// all: `services::connect` was the call that resolved one.
+///
+/// Each is retired rather than renamed — `SYS_CONNECTION_JOIN` keeps number 76
+/// and is a different call, addressed by handle, granting nothing. A word
+/// boundary is what tells the two apart here.
+const RETIRED_REGISTRY: &[&str] = &[
+    "SYS_CONNECT",
+    "SYS_LISTEN",
+    "SYS_PIPE_OPEN",
+    "SYS_PIPE_ID",
+    "SYS_SOCKET_CREATE",
+    "SharedToken",
+    "services::connect",
+];
+
+/// Everything this repository compiles into the guest.
+const GUEST_TREES: &[&str] =
+    &["kernel/src", "toyos/src", "toyos-abi/src", "userland", "tests"];
+
+/// `line` with its comment and its string literals removed.
+///
+/// What is left is the part that names things. Prose explaining what a deleted
+/// call used to do is legal and worth keeping; a gravestone table mapping a
+/// retired number to the string `"SYS_LISTEN"` is the point of the table.
+fn code_only(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if in_string => {
+                chars.next();
+            }
+            '"' => in_string = !in_string,
+            '/' if !in_string && chars.peek() == Some(&'/') => break,
+            _ if !in_string => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `code` names `needle` as an identifier rather than as a fragment of
+/// a longer one.
+fn names(code: &str, needle: &str) -> bool {
+    let bytes = code.as_bytes();
+    let word = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    code.match_indices(needle).any(|(at, _)| {
+        !word(at.checked_sub(1).and_then(|j| bytes.get(j)))
+            && !word(bytes.get(at + needle.len()))
+    })
+}
+
+/// `(file, line number)` for every place `needle` is named in code, over
+/// [`GUEST_TREES`].
+fn named_in_code(needle: &str) -> Vec<String> {
+    let root = repo_root();
+    let mut files = Vec::new();
+    for tree in GUEST_TREES {
+        rust_files(&root, &root.join(tree), &mut files);
+    }
+    let mut found = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        for (n, line) in text.lines().enumerate() {
+            if names(&code_only(line), needle) {
+                found.push(format!("{}:{}", rel(&root, &path), n + 1));
+            }
         }
     }
     found
@@ -142,6 +226,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **There is no global registry.** `specs/capability-endowment-spec.md`
+    /// §8.4: a name a process could present and have resolved for it is the
+    /// thing this architecture deletes, so its identifiers may not be reachable
+    /// from any code the guest compiles.
+    #[test]
+    fn no_name_resolves_through_a_registry_any_more() {
+        let mut complaints = Vec::new();
+        for needle in RETIRED_REGISTRY {
+            for at in named_in_code(needle) {
+                complaints.push(format!("{at}: names `{needle}`"));
+            }
+        }
+        assert!(
+            complaints.is_empty(),
+            "the registry is deleted, and these still name it:\n  {}",
+            complaints.join("\n  "),
+        );
+    }
+
+    /// What the scan above can and cannot see, stated as cases, because a
+    /// well-formed tree exercises none of them.
+    #[test]
+    fn the_registry_scan_reads_code_and_not_prose() {
+        assert!(names(&code_only("    let x = syscall(SYS_LISTEN, 0);"), "SYS_LISTEN"));
+        assert!(names(&code_only("pub const SYS_PIPE_ID: u64 = 70;"), "SYS_PIPE_ID"));
+        assert!(!names(&code_only("/// `SYS_LISTEN` used to register a name."), "SYS_LISTEN"));
+        assert!(!names(&code_only("    // SYS_PIPE_ID was 70"), "SYS_PIPE_ID"));
+        assert!(!names(&code_only("    85 => \"SYS_LISTEN\","), "SYS_LISTEN"));
+        // The live call keeps the retired one's number and must not be read as
+        // it: this is the whole reason the match is on a word boundary.
+        assert!(!names(&code_only("SYS_CONNECTION_JOIN => join(a, b),"), "SYS_CONNECT"));
+        assert!(names(&code_only("SYS_CONNECT => connect(a),"), "SYS_CONNECT"));
+        // And the walk reaches real code: a live name it is capable of finding
+        // must actually be found.
+        assert!(
+            !named_in_code("SYS_CONNECTION_JOIN").is_empty(),
+            "the scan found no `SYS_CONNECTION_JOIN` in code, so it is not reading the guest trees",
+        );
     }
 
     /// The scan has teeth only if it can find anything: this file names every

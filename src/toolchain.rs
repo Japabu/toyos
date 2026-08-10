@@ -95,8 +95,7 @@ const STD_MANIFEST: &str = "library/std/Cargo.toml";
 /// `../../../toyos`, and `rust/` belongs to the primary checkout, so without
 /// this every worktree's std is compiled against **main's** ABI while its kernel
 /// is compiled against its own — the kernel and std then disagree about struct
-/// layouts and both still build, link and boot
-/// (`specs/issues/build/std-change-needs-an-unlanded-abi-change.md`).
+/// layouts and both still build, link and boot.
 ///
 /// **The manifest and not a cargo `paths` override.** The override works —
 /// measured, the marker reached the sysroot — but cargo warns that overriding
