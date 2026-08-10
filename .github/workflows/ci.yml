@@ -196,6 +196,7 @@ jobs:
         run: .github/instrument.sh
 
       - id: key
+        name: the toolchain this tree needs
         run: |
           git config --global --add safe.directory "$PWD"
           echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
@@ -429,6 +430,7 @@ jobs:
         run: .github/instrument.sh
 
       - id: key
+        name: the toolchain this tree needs
         run: |
           git config --global --add safe.directory "$PWD"
           echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \

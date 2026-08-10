@@ -1849,16 +1849,30 @@ from a sibling anyway: the twelve start together, so the win is across runs. A
 cache written on `main` is the only one every branch can restore (§8.4), and a
 branch's own second push restores its first.
 
-Projected onto the shards, and it is a projection: the widest shard of run
-`31330069053` was 1,058 s with ≈435 s of build in it, so the probe's difference
-predicts ≈820 s and its ratio ≈870 s — **19–22% off the critical path**, and
-about **49 minutes of runner time per run** across thirteen jobs, which is the
-compute number and a different statement.
+**And then measured on the shards themselves, which is the arm that matters.**
+Run `31389081797`, one commit, two consecutive attempts: attempt 1 wrote the
+entry and attempt 2 read it. **Both attempts were green in all sixteen jobs**,
+which is the check anyone is really being asked to accept — a restored `target/`
+that produced a different verdict is the whole objection to doing this at all.
 
-**Two things the probe leaves open, honestly.** Its two arms drew different
-runner CPUs — an EPYC 7763 cold and an EPYC 9V74 warm — so some part of the
-237 s is the machine rather than the cache, and the compile counts are the part
-that is not. And the 8 cleans in the warm arm are `external_fingerprint` keying
-on the *mtime* of a `toyos-ld` binary that every job rebuilds, which is a
-further win still on the table with its own entry
+| | attempt 1, cold | attempt 2, warm |
+|---|---|---|
+| widest shard | 974 s | **746 s** |
+| narrowest shard | 822 s | 477 s |
+| `tcg` | 624 s | 409 s |
+| twelve shards + `tcg`, summed | 11,359 s | **8,323 s** |
+| the restore itself | — | 16–22 s |
+
+**−228 s on the critical path (−23%), and −3,036 s of runner time per run (−51
+minutes).** Those are two different statements about one change, and the second
+is the one that keeps somebody else's pull request out of the queue §5 measured.
+`tcg`'s own build went 534 s to 302 s inside it.
+
+**Two things left open, honestly.** The probe's two arms drew different runner
+CPUs — an EPYC 7763 cold and an EPYC 9V74 warm — so some part of its 237 s is
+the machine rather than the cache; the compile counts are the part that is not,
+and the shard A/B above has no such confound because both attempts are the same
+matrix on the same day. And the 8 cleans in the warm arm are
+`external_fingerprint` keying on the *mtime* of a `toyos-ld` binary that every
+job rebuilds, which is a further win still on the table with its own entry
 (`specs/issues/build/external-dep-fingerprint-is-mtime-not-content.md`).
