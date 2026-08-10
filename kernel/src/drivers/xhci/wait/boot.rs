@@ -583,7 +583,9 @@ pub fn scan_ports(ctrl: &mut XhciController) {
     // the boot scan" is what the actuator stages, and after
     // `acknowledge_port_changes` so the connect it raises is one the port
     // machine sees as a change rather than one the scan just cleared.
-    super::super::BOOT_SCAN_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
+    if crate::actuator::xhci_slow_storage_connect() {
+        super::super::BOOT_SCAN_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     if crate::actuator::xhci_portsc_rw1c() {
         log!("xHCI: PED as RW1C, {} port(s) disabled by a driver write",
             ctrl.software_disabled_ports());

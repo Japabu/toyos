@@ -609,7 +609,7 @@ static FAULT: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 fn buffer_full(status: u8) -> bool {
-    if FAULT.load(Ordering::Relaxed) {
+    if crate::actuator::i8042_fault() && FAULT.load(Ordering::Relaxed) {
         return true;
     }
     status & OBF != 0
