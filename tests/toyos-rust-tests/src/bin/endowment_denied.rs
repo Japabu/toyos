@@ -21,9 +21,15 @@
 //! — and each is one bit on a handle to a `SysCap` the kernel mints exactly once,
 //! for `/bin/init`. A handle that carries the wrong *bit* is refused with a word,
 //! because probing what an attenuated capability can still do is what
-//! attenuation is for; a handle that is not a capability at all, or is no handle
-//! at all, ends the caller, because naming one of those is a bug rather than a
-//! question. Both are asserted, and the split is the design.
+//! attenuation is for; a handle that is **no handle at all** ends the caller.
+//!
+//! **A wrong-typed handle is refused with a word here, and that is a property of
+//! the check rather than an exception to the policy.** The table resolves rights
+//! before type, and `DEVICE` and `RT` are bits only a `SysCap` ever carries — so
+//! nothing of another type can reach the type check at all, and presenting one is
+//! indistinguishable from presenting an attenuated capability. Asserted, because
+//! it is the answer a caller gets and a test that expected the kill would be
+//! asserting something the design cannot do.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::toyos::process::CommandExt;
@@ -43,19 +49,17 @@ const PRIVILEGED: &str = "privileged";
 /// `process::HANDLE_FAULT_EXIT_CODE`.
 const HANDLE_FAULT: i32 = 139;
 
-/// The kinds of handle that are not a capability, each raised in a child of its
-/// own because the kernel's answer to them is to end the caller.
-const NOT_A_CAPABILITY: &[(&str, &str)] = &[
+/// Presenting no handle at all, each raised in a child of its own because the
+/// kernel's answer to it is to end the caller.
+const NOT_A_HANDLE: &[(&str, &str)] = &[
     ("claim-absent", "SYS_DEVICE_CLAIM took a handle nobody holds"),
-    ("claim-mistyped", "SYS_DEVICE_CLAIM took a pipe"),
     ("rt-absent", "SYS_RT_ENTER took a handle nobody holds"),
-    ("rt-mistyped", "SYS_RT_ENTER took a pipe"),
 ];
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("probe") => probe(),
-        Some(role) => not_a_capability(role),
+        Some(role) => not_a_handle(role),
         None => test(),
     }
 }
@@ -63,7 +67,7 @@ fn main() {
 fn test() {
     only_what_was_given();
     a_right_the_capability_lacks_is_a_word();
-    for (role, what_would_be_wrong) in NOT_A_CAPABILITY {
+    for (role, what_would_be_wrong) in NOT_A_HANDLE {
         killed(role, what_would_be_wrong);
     }
     println!("a name outside the namespace resolves to nothing, and a capability is its bits");
@@ -131,11 +135,25 @@ fn a_right_the_capability_lacks_is_a_word() {
         "a capability without DEVICE minted a claim",
     );
 
-    // And the unnarrowed one does carry `DEVICE`, so the refusal above was the
-    // bit and not the call. What it answers beyond that is a fact about the
-    // machine — `NotFound` for a class this boot has no driver for — and the
-    // assertion says only that it is not the refusal. A claim is released as
-    // soon as it is taken, because a claim moves and the boot runs other
+    // A handle that is not a capability at all. It never reaches the type
+    // check: `DEVICE` and `RT` are bits nothing else carries, so this is the
+    // same refusal the narrowed capability got.
+    assert_eq!(
+        syscall::device_claim(RawHandle(1), DeviceType::Keyboard).err(),
+        Some(SyscallError::PermissionDenied),
+        "a pipe was taken as a capability by SYS_DEVICE_CLAIM",
+    );
+    assert_eq!(
+        syscall::rt_enter(RawHandle(1)),
+        Err(SyscallError::PermissionDenied),
+        "a pipe was taken as a capability by SYS_RT_ENTER",
+    );
+
+    // And the unnarrowed one does carry `DEVICE`, so the refusals above were
+    // the bit and not the call. What it answers beyond that is a fact about
+    // the machine — `NotFound` for a class this boot has no driver for — and
+    // the assertion says only that it is not the refusal. A claim is released
+    // as soon as it is taken, because a claim moves and the boot runs other
     // binaries that need this one.
     let with_the_bit = syscall::device_claim(cap.as_handle(), DeviceType::Keyboard);
     assert_ne!(
@@ -146,7 +164,7 @@ fn a_right_the_capability_lacks_is_a_word() {
     if let Ok(claim) = with_the_bit {
         syscall::close(claim);
     }
-    println!("  capability: refused for the bit it lacks, allowed for the bit it has");
+    println!("  capability: refused for the bit it lacks and for having none, allowed for the bit it has");
 }
 
 /// Run `role` and require that the kernel ended it at its call.
@@ -179,20 +197,14 @@ fn probe() {
     std::io::stdout().flush().expect("probe: flush");
 }
 
-fn not_a_capability(role: &str) -> ! {
-    assert!(
-        NOT_A_CAPABILITY.iter().any(|(name, _)| *name == role),
-        "unknown role {role:?}",
-    );
+fn not_a_handle(role: &str) -> ! {
+    assert!(NOT_A_HANDLE.iter().any(|(name, _)| *name == role), "unknown role {role:?}");
     println!("reached {role}");
     std::io::stdout().flush().expect("flush the marker");
-    // stdout: a handle this process certainly holds, and certainly not a
-    // capability.
-    let handle = if role.ends_with("mistyped") { RawHandle(1) } else { HANDLE_INVALID };
     let answered = if role.starts_with("claim") {
-        format!("{:?}", syscall::device_claim(handle, DeviceType::Keyboard))
+        format!("{:?}", syscall::device_claim(HANDLE_INVALID, DeviceType::Keyboard))
     } else {
-        format!("{:?}", syscall::rt_enter(handle))
+        format!("{:?}", syscall::rt_enter(HANDLE_INVALID))
     };
     panic!("{role} was answered {answered} instead of ending the caller");
 }

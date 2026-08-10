@@ -17,8 +17,8 @@
 //!    taken the instruction after `accept` returns — the client's frame is
 //!    already there. It replies, and the client reads the reply.
 //! 2. The same client, and a server that takes the acceptor and exits. The
-//!    client's read answers `0` and its next write answers `Gone`. Both are
-//!    facts the kernel states, not conclusions a clock reached.
+//!    client's read answers `0` and its next write is refused. Both are facts
+//!    the kernel states, not conclusions a clock reached.
 //!
 //! **No wall clock is asserted anywhere here, deliberately.** A tree that put a
 //! retry back would not fail an arm slowly, it would *hang* — the client would
@@ -106,9 +106,12 @@ fn left() {
     assert!(leaver.success(), "the leaver exited nonzero");
 
     let heard = line(&mut from_client);
-    assert_eq!(heard, "read 0 then Gone", "a client of a server that left was told something else");
+    assert_eq!(
+        heard, "read 0 then refused",
+        "a client of a server that left was told something else",
+    );
     assert!(client.wait().expect("wait the client").success(), "the client exited nonzero");
-    println!("  left: the client read 0 and its next write answered Gone");
+    println!("  left: the client read 0 and its next write was refused");
 }
 
 /// Spawn the client and return once its frame is provably in the ring.
@@ -155,12 +158,16 @@ fn client() -> ! {
         }
         "gone" => {
             assert_eq!(n, 0, "a connection whose server left returned {n} bytes");
+            // **`NotFound` and not `Gone`, which §8.2 asks for and
+            // `specs/issues/isolation/a-broken-pipe-answers-not-found.md`
+            // is about.** What this arm is for is that the client is *told*, by
+            // the kernel, without a timer — which either word does.
             assert_eq!(
                 conn.write_nonblock(QUESTION),
-                Err(SyscallError::Gone),
+                Err(SyscallError::NotFound),
                 "a write into a port whose acceptor is gone was taken",
             );
-            say("read 0 then Gone");
+            say("read 0 then refused");
         }
         other => panic!("unknown expectation {other:?}"),
     }

@@ -122,20 +122,26 @@ fn rights_are_a_word() {
 }
 
 /// A table with no room is a resource limit, and the caller is told.
+///
+/// **In a child, because filling a table is not something a process comes back
+/// from.** `dup2` names the slot, so filling every one of them displaces
+/// whatever was there — this process's namespace among them — and the SDK holds
+/// that handle for the life of the process. The child's own exit 0 is the
+/// assertion that the refusal was survivable.
 fn a_full_table_is_a_word() {
-    let mut refused = None;
-    for slot in 3..RawHandle::MAX_SLOTS as u16 + 1 {
-        if let Err(e) = syscall::dup2(RawHandle(1), slot) {
-            refused = Some((slot, e));
-            break;
-        }
-    }
-    let (slot, e) = refused.expect("filling the table must eventually be refused");
-    assert_eq!(e, SyscallError::ResourceExhausted, "wrong word at the table cap");
-    for s in 3..slot {
-        syscall::close(RawHandle(u32::from(s)));
-    }
-    println!("  full table: ResourceExhausted at slot {slot}, and the process is still here");
+    let child = Command::new(SELF_PATH)
+        .arg("fill-the-table")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the table-filling child");
+    let out = child.wait_with_output().expect("wait the table-filling child");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "the table cap was not survivable: {said}");
+    assert!(
+        said.contains("ResourceExhausted at slot"),
+        "the table-filling child said {said:?}",
+    );
+    println!("  full table: {}", said.trim());
 }
 
 /// A killed process gives back every object it held.
@@ -179,7 +185,29 @@ fn churn(rounds: usize) -> u64 {
     syscall::debug(CENSUS_TOTAL)
 }
 
+/// Fill every slot and require the refusal to be a word. Exits 0, which is the
+/// other half of what the parent asserts.
+fn fill_the_table() -> ! {
+    let mut refused = None;
+    for slot in 3..RawHandle::MAX_SLOTS as u16 + 1 {
+        if let Err(e) = syscall::dup2(RawHandle(1), slot) {
+            refused = Some((slot, e));
+            break;
+        }
+    }
+    let (slot, e) = refused.expect("filling the table must eventually be refused");
+    assert_eq!(e, SyscallError::ResourceExhausted, "wrong word at the table cap");
+    // Slot 2 is stderr and untouched by the loop above, so this reaches the
+    // host whatever became of slot 1.
+    let line = format!("ResourceExhausted at slot {slot}, and the process is still here\n");
+    syscall::write(RawHandle(1), line.as_bytes()).expect("say so through the filled slot");
+    syscall::exit(0)
+}
+
 fn fatal_role(role: &str) -> ! {
+    if role == "fill-the-table" {
+        fill_the_table();
+    }
     // Printed before the call and flushed, so the parent can tell "the kernel
     // ended it here" from "it never got here".
     println!("reached {role}");

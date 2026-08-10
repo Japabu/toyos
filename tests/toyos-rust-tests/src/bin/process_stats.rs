@@ -7,19 +7,34 @@
 //! exactly once, only after the child died — is what the third case used to
 //! assert the opposite of.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::toyos::process::ChildExt;
 use std::process::{Command, Stdio};
 use toyos::process::Process;
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, ProcessStats, SyscallError};
 
+const SELF_PATH: &str = "/bin/test_rs_process_stats";
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("held") {
+        return held();
+    }
     exited_child();
     live_process();
     repeatable();
     refused_without_read();
     println!("all process_stats tests passed");
+}
+
+/// Says it is running, then blocks until it is killed. The marker is flushed, so
+/// a parent that has read it knows this process has been scheduled and has
+/// faulted its own image in.
+fn held() {
+    println!("running");
+    std::io::stdout().flush().expect("held: flush the marker");
+    let mut buf = [0u8; 1];
+    let _ = std::io::stdin().read(&mut buf);
 }
 
 /// std hands back the handle rather than wrapping the call: `ProcessStats` is
@@ -63,19 +78,22 @@ fn exited_child() {
 
 /// The whole of what the handle bought: a target that has not exited.
 fn live_process() {
-    let mut child = Command::new("/bin/cat")
+    // **A line out of the child, not a bare spawn.** `spawn` returns before the
+    // child has been scheduled, so a sample taken there reads a process that has
+    // faulted nothing and the assertions below become a race against the
+    // scheduler. A role of this binary rather than `/bin/cat`, because what is
+    // needed is a *flushed* line from something still running, and a filter's
+    // buffering is not this test's to depend on.
+    let mut child = Command::new(SELF_PATH)
+        .arg("held")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn cat");
-    // **A round trip, not a spawn.** `spawn` returns before the child has been
-    // scheduled, so a sample taken there reads a process that has faulted
-    // nothing and the assertions below become a race against the scheduler. A
-    // byte that has come back out of `cat` is proof it ran.
-    child.stdin.as_mut().expect("cat stdin").write_all(b"running\n").expect("write to cat");
-    let mut echoed = [0u8; 8];
-    child.stdout.as_mut().expect("cat stdout").read_exact(&mut echoed).expect("read back from cat");
-    assert_eq!(&echoed, b"running\n", "cat did not echo");
+        .expect("spawn the held child");
+    let mut out = BufReader::new(child.stdout.take().expect("held stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("the held child's marker");
+    assert_eq!(line.trim(), "running", "the held child said {line:?}");
 
     let s = stats_of(&child).expect("a live process answers");
     assert!(s.wall_ns > 0, "a running process has spent wall time");
@@ -84,8 +102,8 @@ fn live_process() {
         "a running process has faulted its own image in"
     );
     println!("  live process: ok (pid={} wall={}ns)", s.pid, s.wall_ns);
-    child.kill().expect("kill cat");
-    child.wait().expect("wait cat");
+    child.kill().expect("kill the held child");
+    child.wait().expect("wait the held child");
 }
 
 /// Reading does not spend it. This asserted the opposite before the handle:
