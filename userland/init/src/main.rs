@@ -38,6 +38,7 @@ use toyos::launch::{self, Request};
 use toyos::namespace::{self, Namespace};
 use toyos::port::{self, Acceptor, Connector};
 use toyos::syscap::SysCap;
+use toyos::AsHandle;
 use toyos_abi::syscall::{
     DeviceType, DEV_PREFIX, PROVIDE_PREFIX, SERVE_PREFIX, SVC_LABEL, SYSCAP_LABEL,
 };
@@ -115,11 +116,11 @@ fn main() {
 /// manifest's row for it plus whatever connectors the caller transferred, and
 /// the caller could only transfer what it already had — so a launch confers
 /// exactly the manifest row and nothing beyond it.
-fn serve_launch(
+fn serve_launch<'a>(
     conn: &Connection,
-    system: &Manifest,
+    system: &'a Manifest,
     syscap: &SysCap,
-    acceptors: &mut BTreeMap<&str, Acceptor>,
+    acceptors: &mut BTreeMap<&'a str, Acceptor>,
     connectors: &BTreeMap<&str, Connector>,
 ) {
     let Ok(header) = conn.recv_header() else { return };
@@ -130,28 +131,45 @@ fn serve_launch(
     let Ok(len) = conn.recv_bytes(&header, &mut buf) else { return };
     let mut batch = [toyos::RawHandle(0); toyos_abi::syscall::MAX_TRANSFER_HANDLES];
     let received = conn.recv_handles(&mut batch).unwrap_or(0);
+
+    // **Owned on the statement after they arrive, and before anything can
+    // refuse.** The send moved them into init's table, so every path out of
+    // here releases them — a launcher that leaked a handle per refused launch
+    // would exhaust the one table the machine cannot do without, and a client
+    // picks which refusal it takes.
+    let mut held = Moved(batch[..received].to_vec());
+
     let Some(request) = Request::decode(&buf[..len]) else { return };
-    if received != request.slot_count() + request.extra_count {
-        say!("init: launcher: a frame promising {} handles carried {received}",
-            request.slot_count() + request.extra_count);
+    // `extra_names` drops an empty or non-UTF-8 name, so its count is what
+    // will actually be paired with a handle. A frame whose two counts
+    // disagree would otherwise leave the unpaired handles behind.
+    let names: Vec<&str> = request.extra_names().collect();
+    if received != request.slot_count() + request.extra_count
+        || names.len() != request.extra_count
+    {
+        say!(
+            "init: launcher: a frame promising {} handles under {} names carried {received}",
+            request.slot_count() + request.extra_count,
+            names.len(),
+        );
         return;
     }
 
-    // **Owned before anything can refuse.** The send moved these into init's
-    // table, so every path out of here releases them — a launcher that leaked a
-    // handle per refused launch would exhaust the one table the machine cannot
-    // do without, and a client can refuse as often as it likes.
-    let held = &batch[..received];
-    let (slot_handles, extra_handles) = held.split_at(request.slot_count());
+    // Past every refusal that does not know which handle is which, so ownership
+    // can be split. Both halves still release on every path below.
+    let all = held.take();
+    let (slot_handles, extra_handles) = all.split_at(request.slot_count());
     let slots = Moved(slot_handles.to_vec());
     // Owned, so they close when this call returns: `SYS_NAMESPACE_BUILD` copies
     // a connector into the namespace and leaves the caller's handle, and init's
     // copy of a client's connector has no life beyond this launch.
-    let extras: Vec<(&str, Connector)> = request
-        .extra_names()
+    let extras: Vec<(&str, Connector)> = names
+        .into_iter()
         .zip(extra_handles.iter().copied())
         // SAFETY: the kernel moved these into init's table with the frame, and
-        // nothing else answers for them.
+        // nothing else answers for them. **Not a claim about the type** — a
+        // client sends what it likes, and everything below treats a wrong one
+        // as a refused launch rather than as init's own bug.
         .map(|(name, handle)| (name, unsafe { Connector::from_raw(handle) }))
         .collect();
 
@@ -215,9 +233,16 @@ fn serve_launch(
 
 /// Handles a launch moved into init, released on every path out of it.
 ///
-/// A `Drop` and not a close at each `return`: there are five ways out of
+/// A `Drop` and not a close at each `return`: there are seven ways out of
 /// `serve_launch` and a client picks which one by what it sends.
 struct Moved(Vec<toyos::RawHandle>);
+
+impl Moved {
+    /// Give up the obligation, for a caller taking it on itself.
+    fn take(&mut self) -> Vec<toyos::RawHandle> {
+        std::mem::take(&mut self.0)
+    }
+}
 
 impl Drop for Moved {
     fn drop(&mut self) {
@@ -255,19 +280,32 @@ fn declared<'a>(system: &'a Manifest, path: &str) -> Option<&'a Program> {
 /// a terminal's `surface`. They are added *to* the manifest's row rather than
 /// replacing it, and a caller could only transfer what it already held, so a
 /// launch confers the row and nothing beyond it.
-fn start(
+fn start<'a>(
     mut command: Command,
-    program: &Program,
+    program: &'a Program,
     system: &Manifest,
     syscap: &SysCap,
-    acceptors: &mut BTreeMap<&str, Acceptor>,
+    acceptors: &mut BTreeMap<&'a str, Acceptor>,
     connectors: &BTreeMap<&str, Connector>,
     extras: &[(&str, Connector)],
 ) -> std::io::Result<Child> {
     command.args(&program.args);
 
-    if let Some(ns) = build_namespace(program, system, connectors, extras) {
-        command.endow(SVC_LABEL, ns.into_raw().0);
+    // **Everything endowed stays owned until the spawn that moves it
+    // succeeds.** `endow` records a number; a refused spawn moves nothing
+    // (`build_child_handles` is all-or-nothing), so a handle whose owner had
+    // already been forgotten would be one init holds for ever and a device
+    // class nothing can mint again. A client picks whether a spawn fails — an
+    // unreachable `cwd` is enough — so this is its path as much as a bug's.
+    let mut held = Moved(Vec::new());
+    // Acceptors are given *back* rather than closed: a `serves` port whose
+    // acceptor is gone can never be served again.
+    let mut taken: Vec<(&'a str, Acceptor)> = Vec::new();
+
+    if let Some(ns) = build_namespace(program, system, connectors, extras)? {
+        let raw = ns.into_raw();
+        command.endow(SVC_LABEL, raw.0);
+        held.0.push(raw);
     }
 
     // The namespace answers with connections, so a child holding `surface`
@@ -275,10 +313,15 @@ fn start(
     // the terminal → shell → `locale` chain. The connector travels labelled as
     // well, and a duplicate because the namespace above took one of its own.
     for (name, connector) in extras {
-        let handed = connector
-            .duplicate()
-            .expect("init: the kernel refused a duplicate of a provided connector");
-        command.endow(&format!("{PROVIDE_PREFIX}{name}"), handed.into_raw().0);
+        // **Not an `expect`.** The connector is a client's, and a client may
+        // send one it narrowed `DUP` away from. That is a refused launch, not
+        // init's bug — and init is the one process the machine cannot lose.
+        let Ok(handed) = connector.duplicate() else {
+            return Err(std::io::Error::other("a provided connector cannot be duplicated"));
+        };
+        let raw = handed.into_raw();
+        command.endow(&format!("{PROVIDE_PREFIX}{name}"), raw.0);
+        held.0.push(raw);
     }
 
     for name in &program.serves {
@@ -289,7 +332,8 @@ fn start(
             // its own service should be.
             panic!("init: `{}` has already been given the `{name}` acceptor", program.name)
         });
-        command.endow(&format!("{SERVE_PREFIX}{name}"), acceptor.into_raw().0);
+        command.endow(&format!("{SERVE_PREFIX}{name}"), acceptor.as_handle().0);
+        taken.push((name.as_str(), acceptor));
     }
 
     for class in &program.devices {
@@ -301,7 +345,9 @@ fn start(
         // already in hand.
         match syscap.claim::<toyos::Device>(class) {
             Ok(claim) => {
-                command.endow(&format!("{DEV_PREFIX}{}", class.class_name()), claim.into_raw().0);
+                let raw = claim.into_raw();
+                command.endow(&format!("{DEV_PREFIX}{}", class.class_name()), raw.0);
+                held.0.push(raw);
             }
             Err(e) => say!(
                 "init: {}: no {} on this machine ({e:?})",
@@ -320,12 +366,29 @@ fn start(
         let narrowed = syscap
             .narrowed(rights)
             .expect("init: the system capability refused a narrowed duplicate");
-        command.endow(SYSCAP_LABEL, narrowed.into_raw().0);
+        let raw = narrowed.into_raw();
+        command.endow(SYSCAP_LABEL, raw.0);
+        held.0.push(raw);
     }
 
-    let child = command.spawn()?;
-    say!("init: started {}", program.name);
-    Ok(child)
+    match command.spawn() {
+        Ok(child) => {
+            // The spawn moved every one of them into the child's table, so
+            // nothing here may close them.
+            held.take();
+            for (_, acceptor) in taken {
+                let _ = acceptor.into_raw();
+            }
+            say!("init: started {}", program.name);
+            Ok(child)
+        }
+        Err(e) => {
+            for (name, acceptor) in taken {
+                acceptors.insert(name, acceptor);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// The namespace this program's `receives` names.
@@ -334,14 +397,17 @@ fn start(
 /// is one port per instance, made by whoever spawns the holder, and it reaches
 /// this program from its own parent. A name that is neither is a config the
 /// build-time gate should have refused, so it is a panic here.
+/// A refusal is a launch that does not happen, never a panic: `extras` are a
+/// client's handles and the kernel judges their type, so `finish` answers
+/// `InvalidArgument` for a client that sent a pipe where a connector belongs.
 fn build_namespace(
     program: &Program,
     system: &Manifest,
     connectors: &BTreeMap<&str, Connector>,
     extras: &[(&str, Connector)],
-) -> Option<Namespace> {
+) -> std::io::Result<Option<Namespace>> {
     if program.receives.is_empty() && extras.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut builder = namespace::build();
     for name in &program.receives {
@@ -359,9 +425,11 @@ fn build_namespace(
     for (name, connector) in extras {
         builder = builder.add(name, connector);
     }
-    Some(
-        builder
-            .finish()
-            .unwrap_or_else(|e| panic!("init: no namespace for {}: {e:?}", program.name)),
-    )
+    match builder.finish() {
+        Ok(ns) => Ok(Some(ns)),
+        Err(e) if extras.is_empty() => {
+            panic!("init: no namespace for {}: {e:?}", program.name)
+        }
+        Err(e) => Err(std::io::Error::other(format!("a provided connector was refused: {e:?}"))),
+    }
 }

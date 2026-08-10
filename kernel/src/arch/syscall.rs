@@ -376,7 +376,23 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                 data.handles
                     .get::<crate::object::process::ProcessObject>(RawHandle(a1 as u32), Rights::MANAGE)
             }) {
-                Ok(object) => process::kill_process(&object),
+                Ok(object) => {
+                    // **Killing yourself is exiting, and `kill_process` cannot
+                    // do it.** It retires every thread of its target, and
+                    // `retire_task` asserts that a CPU never retires the task
+                    // it is running on — so a process holding a `MANAGE`
+                    // handle to itself panicked the kernel. Nothing stops one
+                    // holding one: `Process` carries `TRANSFER`, so a parent
+                    // may send a child the child's own handle.
+                    if object.pid() == process::current_process() {
+                        // `exit` does not come back and nothing unwinds past
+                        // it, so the clone this match is holding is dropped
+                        // where it can still be dropped.
+                        drop(object);
+                        process::exit(process::KILLED_EXIT_CODE);
+                    }
+                    process::kill_process(&object)
+                }
                 Err(e) => e.refuse(),
             }
         }
@@ -1586,6 +1602,15 @@ fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
                 data.handles.get::<port::Connector>(handle, Rights::TRANSFER)
             }) {
                 Ok(c) => c,
+                // **The one place a wrong type is not provably the caller's
+                // bug.** An added connector is routinely one a *peer*
+                // transferred — that is what a `provides` name is, and
+                // `/bin/init`'s launcher builds a namespace out of handles a
+                // client sent it. Faulting here let any process holding the
+                // `launcher` connector end init by sending it a pipe.
+                Err(crate::object::HandleError::WrongType { .. }) => {
+                    return SyscallError::InvalidArgument.to_u64()
+                }
                 Err(e) => return e.refuse(),
             };
             entries.push((name, connector));
@@ -1874,36 +1899,46 @@ fn sys_handle_send(conn_h: RawHandle, handles: &crate::user_ptr::UserBytes, coun
 /// whose size was checked is the batch that is installed — the peer can only
 /// add to the far end of the queue, and a sibling thread of this process is
 /// serialised by the same lock.
+///
+/// **Every refusal is answered outside that hold**, per [`HandleError::refuse`]:
+/// three of the five kinds end the caller, and ending it takes the same
+/// non-reentrant lock this closure is running under.
+///
+/// [`HandleError::refuse`]: crate::object::HandleError::refuse
 fn sys_handle_recv(
     conn_h: RawHandle,
     out: &mut crate::user_ptr::UserBytesMut,
     cap: usize,
 ) -> u64 {
-    process::with_fd_owner_data(|data| {
-        let conn = match data
+    let taken = process::with_fd_owner_data(|data| {
+        let conn = data
             .handles
-            .get::<crate::object::service::ConnectionEnd>(conn_h, Rights::READ)
-        {
-            Ok(conn) => conn,
-            Err(e) => return e.refuse(),
-        };
-        let batch = match conn.recv_bounded(cap) {
-            Ok(None) => return 0,
-            Ok(Some(batch)) => batch,
-            // A batch the caller cannot hold stays queued: refusing with it
-            // dropped would lose handles nobody can ask for again.
-            Err(e) => return e.to_u64(),
-        };
-        let count = batch.len();
-        if !data.handles.has_room(count) {
-            return SyscallError::ResourceExhausted.to_u64();
+            .get::<crate::object::service::ConnectionEnd>(conn_h, Rights::READ)?;
+        // **Measured before it is taken, and both refusals leave it queued.**
+        // A batch popped and then dropped is capabilities nobody can ask for
+        // again, reported as an error a caller reads as "they did not arrive".
+        // Only the peer pushes, and only to the far end, so the front this saw
+        // is the front the pop takes — or the queue closed under it, which is
+        // the same answer as an empty one.
+        let Some(width) = conn.peek_width() else { return Ok(0) };
+        if width > cap {
+            return Err(SyscallError::InvalidArgument.into());
         }
+        if !data.handles.has_room(width) {
+            return Err(SyscallError::ResourceExhausted.into());
+        }
+        let Some(batch) = conn.recv_bounded(cap)? else { return Ok(0) };
+        let count = batch.len();
         for (i, entry) in batch.into_iter().enumerate() {
             let h = data.handles.install(entry).expect("room was asked for first");
             out.write_at(i * HANDLE_LEN, &h.0.to_ne_bytes());
         }
-        count as u64
-    })
+        Ok::<_, crate::object::Refusal>(count as u64)
+    });
+    match taken {
+        Ok(n) => n,
+        Err(e) => e.refuse(),
+    }
 }
 
 /// Map anonymous memory, honouring `prot`.

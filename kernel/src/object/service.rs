@@ -60,6 +60,17 @@ impl HandleQueue {
         }
     }
 
+    /// How wide the oldest batch is, without taking it.
+    ///
+    /// `None` for an empty or closed queue. A caller measures with this and
+    /// takes with [`pop_bounded`](Self::pop_bounded) rather than taking and
+    /// then refusing: a batch dropped on a refusal is capabilities nobody can
+    /// ask for again. Only the peer pushes, and only to the back, so the front
+    /// this reports is the front the pop takes.
+    fn front_width(&self) -> Option<usize> {
+        self.0.lock().as_ref()?.front().map(Vec::len)
+    }
+
     /// Nothing will ever read this again. Takes the batches out under the lock
     /// and drops them outside it, because releasing a handle can run another
     /// object's zero-handle hook.
@@ -133,6 +144,11 @@ impl ConnectionEnd {
 
     pub fn recv_bounded(&self, cap: usize) -> Result<Option<Vec<HandleEntry>>, SyscallError> {
         self.inbox.pop_bounded(cap)
+    }
+
+    /// See [`HandleQueue::front_width`].
+    pub fn peek_width(&self) -> Option<usize> {
+        self.inbox.front_width()
     }
 }
 

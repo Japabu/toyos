@@ -102,10 +102,16 @@ pub const SYS_NIC_TX: u64 = 80;
 pub const SYS_SYMLINK: u64 = 81;
 pub const SYS_READLINK: u64 = 82;
 pub const SYS_GPU_SET_RESOLUTION: u64 = 83;
+// Syscall number 85 is retired and unused: it was `SYS_LISTEN`, which took a
+// service name first-come from a flat global registry. There is no registry;
+// a server is endowed an acceptor.
 /// Accept a queued connection from an [`Acceptor`] handle.
 ///
 /// [`Acceptor`]: crate::handle::RawHandle
 pub const SYS_ACCEPT: u64 = 86;
+// Syscall number 87 is retired and unused: it was `SYS_CONNECT`, which
+// resolved a name through that registry. A name resolves in a namespace a
+// process was given, through `SYS_NAMESPACE_OPEN`, or nowhere.
 /// Allocate a TLS block for a dlopen'd module on the current thread.
 /// Arg0: module_id (1-based DTV index). Returns the block's virtual address,
 /// or a `SyscallError` word — see [`tls_alloc_block`].

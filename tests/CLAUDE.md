@@ -32,6 +32,6 @@ The gate's four instrument defects and the dropout regression they hid are close
 
 **A test binary holds what `test-runner` holds** (`specs/capability-endowment-spec.md` §6.7a) — the 90 guest binaries are not `[programs]` keys, so no manifest row can name what any of them needs. Its namespace travels to every child by inheritance and its `SysCap` is endowed explicitly at `SYSCAP_LABEL`. A test that needs a *server* builds one: a port, a namespace over its connector, and a child spawned holding it, all inside one binary — `window_refusal`, `connect_before_serve`, `endowment_denied`.
 
-## Filtered runs
+## Waiting for a program's line
 
-`cargo test -- <name>` opens one capture window and a daemon's boot lines land in it, so a C-test family that compares whole stdout can be red for soundd's line rather than for its own output. Judge it from a full run.
+**`/bin/init` speaks in every program's name before that program runs** — `init: netd: no nic on this machine` is in the boot capture before netd exists — so a predicate keyed on a `<program>: ` prefix is satisfied by the wrong speaker. Wait for the whole line, in the constant the assertion also reads. Invisible here and red on CI, because on TCG the daemon's own line arrives first anyway. Anything hostile to init goes on `tests/netcase`, the one config whose test-runner is endowed a `launcher` connector — `launcher_refusals`.

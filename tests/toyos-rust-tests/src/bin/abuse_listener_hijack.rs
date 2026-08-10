@@ -19,16 +19,22 @@
 //!
 //! Four arms, each the runtime half of a thing the compiler already refuses to
 //! spell. **They no longer answer the same way, and the split is the design.**
-//! An attenuated handle is a thing a process may legitimately probe, so arms 1
-//! and 4 come back as words; naming a handle of the wrong type or one from
-//! somebody else's table is a bug no correct program has, so arms 2 and 3 end
-//! the caller and are raised in children that print a marker first.
+//! An attenuated handle is a thing a process may legitimately probe, so arms 1,
+//! 2 and 4 come back as words; naming a handle from somebody else's table is a
+//! bug no correct program has, so arm 3 ends the caller and is raised in a child
+//! that prints a marker first.
 //!
 //! 1. **A connector cannot accept.** `Connector` has no `accept` method, and
 //!    the handle behind one carries no `READ` — so `SYS_ACCEPT` refuses it with
 //!    a word before it ever looks at the type.
 //! 2. **An acceptor cannot be put in a namespace as a connector.** Two types,
 //!    one wire word, and the kernel checks the type rather than trusting it.
+//!    **It answers `InvalidArgument` rather than ending the caller, and it is
+//!    the only wrong-typed handle in the ABI that does**: an `add` entry's
+//!    connector is routinely one a *peer* transferred — a `provides` name is
+//!    exactly that — so presenting the wrong one may be reporting a peer's bug
+//!    rather than your own. `/bin/init`'s launcher is why, and
+//!    `launcher_refusals` is the other end of the same property.
 //! 3. **A handle number from another process's table names nothing here.** The
 //!    victim prints the raw number of a live acceptor of its own; the thief
 //!    presenting it is ended, and the victim's port is still serving afterwards.
@@ -50,7 +56,6 @@ const HANDLE_FAULT: i32 = 139;
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("victim") => victim(),
-        Some("smuggler") => smuggler(),
         Some("thief") => thief(),
         Some(other) => panic!("unknown role {other:?}"),
         None => test(),
@@ -72,8 +77,29 @@ fn test() {
 
     // 2. And the server's end is not a ticket to hand out: an acceptor in an
     //    `add` entry is a wrong-typed handle, so nothing can build a namespace
-    //    whose entry hands the *acceptor* to whoever holds it.
-    killed("smuggler", None, "an acceptor was accepted as a namespace's connector");
+    //    whose entry hands the *acceptor* to whoever holds it. A word rather
+    //    than a death — see the header — so it is raised here and needs no
+    //    child and no marker.
+    let (smuggled, its_connector) = port::create().expect("a second port, to smuggle");
+    // SAFETY: read for its number and nothing else. `ManuallyDrop` is what
+    // stops it being closed as a second owner, and it does not outlive
+    // `smuggled`.
+    let fake = core::mem::ManuallyDrop::new(unsafe {
+        port::Connector::from_raw(smuggled.as_handle())
+    });
+    assert_eq!(
+        namespace::build().add(NAME, &fake).finish().err(),
+        Some(SyscallError::InvalidArgument),
+        "an acceptor was taken as a namespace's connector",
+    );
+    // The *same port's* connector is taken, so the refusal was the type and
+    // not the port — which is what stops this arm passing against a
+    // `SYS_NAMESPACE_BUILD` that refuses everything.
+    namespace::build()
+        .add(NAME, &its_connector)
+        .finish()
+        .expect("the same port's connector is a namespace entry");
+    drop(smuggled);
 
     // 3. A handle is an index into one process's own table and means nothing
     //    outside it. The victim holds a live acceptor and says what number it
@@ -140,21 +166,6 @@ fn killed(role: &str, arg: Option<&str>, what_would_be_wrong: &str) {
 fn marker(role: &str) {
     println!("reached {role}");
     std::io::stdout().flush().expect("flush the marker");
-}
-
-/// An `Acceptor`'s handle wearing a `Connector`'s type, which is the only way
-/// to make the kernel decide arm 2 — the SDK's two types make it unwritable.
-fn smuggler() -> ! {
-    let (acceptor, _connector) = port::create().expect("smuggler: a port of its own");
-    marker("smuggler");
-    // SAFETY: read for its number and nothing else. `ManuallyDrop` keeps it
-    // from being closed as an owning handle, and it does not outlive
-    // `acceptor`.
-    let fake = core::mem::ManuallyDrop::new(unsafe {
-        port::Connector::from_raw(acceptor.as_handle())
-    });
-    let smuggled = namespace::build().add(NAME, &fake).finish();
-    panic!("an acceptor was taken as a connector: {:?}", smuggled.map(|_| ()));
 }
 
 /// Presents a number the victim published. It holds no acceptor of its own, so

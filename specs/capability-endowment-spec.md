@@ -559,7 +559,12 @@ that disprove them:
 
 Both are the same shape as `SYS_CLOSE`'s row, which the table already had.
 
-### 3.2 Retired — 13 numbers, never reused
+### 3.2 Retired — 12 numbers, never reused
+
+**Twelve and not the thirteen this heading said until 2026-08-10.** The
+thirteenth was `SYS_SOCKET_CREATE`(76), and chunk 6 found it was renamed rather
+than retired — §3.3's list below carries it now, and the table here has twelve
+rows and always did.
 
 | # | was | why it goes |
 |---|---|---|
@@ -588,6 +593,12 @@ into it in the same commit.
 `SYS_FSTAT`(14), `SYS_FSYNC`(15), `SYS_MARK_TTY`(28), `SYS_FTRUNCATE`(60),
 `SYS_READ_NONBLOCK`(66), `SYS_WRITE_NONBLOCK`(67), `SYS_PIPE_MAP`(77),
 `SYS_IO_URING_ENTER`(90). No source change in any of them beyond the type.
+
+**And `SYS_SOCKET_CREATE`(76) → `SYS_CONNECTION_JOIN`(76)**, which §6.4 and
+chunk 6 argue at length and this list omitted until 2026-08-10 — the one place a
+reader looking for the ABI delta would go. Its two arguments were pipe *ids* and
+are handles; the operation is unchanged and grants nothing, because everything it
+reaches is already the caller's.
 
 `SYS_OPEN` is the one that *produces* a handle rather than consuming one
 (`toyos-abi/src/syscall.rs:479` returns `Fd`), and it is here because every other
@@ -1110,7 +1121,7 @@ ask. `stdio` is slots 0/1/2 in every row and is omitted.
 | `doom` | — | `compositor`, `soundd` | — | — | — |
 | `snake`, `editor`, `paint`, `files` | — | `compositor`, `filepicker` | — | — | — |
 | `toybox` | — | `compositor`, `soundd`, `surface` | — | — | — |
-| `test-runner` | — | the union its guest binaries need (§6.7a) | — | — | every test binary it spawned |
+| `test-runner` | — | the union its guest binaries need (§6.7a) | — | `DEVICE\|DUP` in `tests/testcases`, none elsewhere | every test binary it spawned |
 | `toyos-ld`, `toyos-cc`, `proctest`, `input-test` | — | — | — | — | own children |
 
 `toybox`'s `surface` and `shell`'s `surface` are the `provides` case: they arrive
@@ -1126,7 +1137,7 @@ its handle table has nothing else in it. sshd, the one program reachable from th
 network, holds `netd` and `launcher` and cannot acquire a compositor connection at
 all. `toyos-cc` and `toyos-ld` hold nothing but stdio.
 
-Two honest limits, both visible in the table:
+Three honest limits, two of them visible in the table:
 
 - **`toybox` is one binary with many applets, so its row is the union of what
   every applet needs**: `screen` wants the compositor
@@ -1135,6 +1146,14 @@ Two honest limits, both visible in the table:
   use. Splitting applets into binaries is the fix and it is not this branch's;
   the granularity of least authority is the granularity of the binary.
 - **Every row can still open any path.** The filesystem is ambient (D6, §12).
+- **"Nothing else is reachable" is true of a program init started and not of one
+  it did not.** §4.5 clause 3 is inheritance: a caller holding no `launcher`
+  connector spawns directly and its child gets the *parent's* namespace, not its
+  own row. `toybox` holds `compositor`, `soundd` and `surface` and no
+  `launcher`, so anything toybox spawns holds all three whatever its row says.
+  Nothing in the tree reaches it — toybox spawns nothing, and every program that
+  does spawn holds a `launcher` — but the sentence above the table is stronger
+  than the mechanism. Added 2026-08-10 by the adversarial review.
 
 ### 4.7 sshd sessions
 

@@ -69,6 +69,7 @@ mod tests {
         ("FramebufferInfo", 32, 4),
         ("SpawnArgs", 80, 8),
         ("NamespaceBuild", 56, 8),
+        ("IoUringSetup", 16, 8),
         ("ProcessStats", 128, 8),
     ];
 
