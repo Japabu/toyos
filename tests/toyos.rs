@@ -4780,7 +4780,7 @@ fn locale_detect(qemu: &mut QemuInstance) -> Result<(), String> {
         // the surface acted on the config it wrote. Both are new: this ran on
         // a machine whose keyboard the gate binary claims, which is the state
         // that used to make the wizard refuse.
-        "surface: pid",
+        "surface: client",
         "surface: layout is now swiss-german",
     ] {
         if !result.stdout.contains(want) {
@@ -6441,15 +6441,21 @@ fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
     }
 
     // Non-vacuity, and the case that motivated the whole run: the compositor
-    // has to have met a request from a pid the kernel no longer knows, or
-    // nothing here exercised the grant that killed the desktop. The guest
-    // orders that by construction — reap, then release the process holding the
-    // socket — so a run without this line is a defect and never a lost race.
-    const VANISHED: &str = "the process behind it has exited";
+    // has to have met a request whose creator the kernel no longer knows. The
+    // guest orders that by construction — reap, then release the process
+    // holding the socket — so a run without this line is a defect and never a
+    // lost race.
+    //
+    // **The line is the compositor serving that request, where it used to be
+    // the compositor saying the process had exited.** The grant that killed the
+    // desktop named a pid; a buffer is a handle now and the connection is what
+    // it travels over, so a reaped creator costs its heir nothing and the
+    // refusal this once asserted on cannot happen.
+    const VANISHED: &str = "a reaped creator's connection still got a window";
     if !result.stdout.contains(VANISHED) {
         return Err(format!(
-            "the compositor never met a request from a reaped creator, so this run says \
-             nothing about the grant:\n{}",
+            "the compositor never served a request from a reaped creator, so this run says \
+             nothing about what replaced the grant:\n{}",
             result.stdout
         ));
     }
@@ -6473,8 +6479,8 @@ fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
     let console = format!("{}\n{after}", result.serial);
     serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
     eprintln!(
-        "  [metal-sim] {CASES} client deaths survived, a reaped creator's request refused by \
-         name, desktop still compositing"
+        "  [metal-sim] {CASES} client deaths survived, a reaped creator's request served \
+         anyway, desktop still compositing"
     );
     Ok(())
 }

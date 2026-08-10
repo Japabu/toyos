@@ -56,7 +56,6 @@ fn owner() {
         .arg("peer")
         .arg(own_handle.0.to_string())
         .endow(SVC_LABEL, ns.into_raw().0)
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn the invited peer");
@@ -81,7 +80,6 @@ fn owner() {
     let mut uninvited = Command::new(SELF_PATH)
         .arg("peer")
         .arg(own_handle.0.to_string())
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn the uninvited peer");
@@ -104,16 +102,16 @@ fn owner() {
     println!("the region reached the peer it was sent to and no other, and its handle is gone");
 }
 
-/// Let a peer run, and take the one line it reports.
+/// The one line a peer reports, and its exit.
+///
+/// **No handshake, and that is a constraint rather than a simplification**: the
+/// owner is blocked in `accept` when the invited peer starts, so a peer told to
+/// wait for a go-ahead would be waiting for a process that is waiting for it.
 fn report(child: &mut std::process::Child) -> String {
     use std::io::{BufRead, BufReader};
-    let mut stdin = child.stdin.take().expect("peer stdin");
-    writeln!(stdin, "go").expect("release the peer");
-    stdin.flush().expect("flush");
     let mut out = BufReader::new(child.stdout.take().expect("peer stdout"));
     let mut line = String::new();
     out.read_line(&mut line).expect("peer report");
-    drop(stdin);
     assert!(child.wait().expect("wait peer").success(), "peer exited nonzero");
     line.trim().to_string()
 }
@@ -122,9 +120,6 @@ fn peer() {
     let guess = RawHandle(
         std::env::args().nth(2).expect("peer needs the owner's handle value").parse().unwrap(),
     );
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).expect("peer: wait for go");
-
     // Whatever this process ends up holding, the *number* is never how it got
     // there. Tried first, and on its own it must reach nothing.
     let guessed = unsafe { syscall::shm_map(guess) };

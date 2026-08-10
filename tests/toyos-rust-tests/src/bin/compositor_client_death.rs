@@ -195,6 +195,20 @@ fn finish() {
     // process table.
     while let Ok(1) = syscall::read(RELAY_GO, &mut byte) {}
     write_raw_fd(RELAY_SOCKET, &create_frame(), "finish");
+
+    // **The answer is the non-vacuity witness, and it changed sides.** The
+    // compositor used to say "the process behind it has exited" here, because
+    // it granted the buffer to the pid `accept` reported and the kernel had
+    // forgotten that pid. There is no pid and no grant: the buffer is a handle
+    // sent over this connection, which is alive because this process holds it.
+    // So the request is *served*, and the line that proves the compositor met
+    // it is the answer rather than a refusal.
+    let header = ipc::recv_header(RELAY_SOCKET).expect("the compositor answered");
+    let what = if header.msg_type == window::MSG_WINDOW_CREATED { "a window" } else { "nothing" };
+    // Stderr, because stdout is the pipe the root read one line off and let go
+    // of: this process outlives the reader of its own stdout, and stderr is the
+    // console both it and the compositor already share.
+    eprintln!("a reaped creator's connection still got {what}");
 }
 
 /// A whole `MSG_CREATE_WINDOW` for a 64x64 window, header and payload.

@@ -1235,8 +1235,23 @@ fn sys_connection_join(rx_h: RawHandle, tx_h: RawHandle) -> u64 {
 }
 
 fn sys_read_nonblock(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
-    let result = with_object_ref(h, Rights::READ, |object| {
-        (ops::try_read(object, buf), ops::pipe_id_read(object))
+    let result = process::with_fd_owner_data(|data| {
+        let object = match data.handles.get_ref(h, Rights::READ) {
+            Ok(object) => object,
+            Err(e) => return Err(e.to_syscall_error()),
+        };
+        // The two-step [`sys_read`] makes, for the same reason: a device
+        // description installs handles for the buffers it names, so that arm
+        // needs the table mutably and the borrow above has to end first. This
+        // is the path the compositor reads its keyboard and its mouse on.
+        if matches!(object, KObjectRef::Device(_)) {
+            let claim = data
+                .handles
+                .get::<crate::object::device::DeviceClaim>(h, Rights::READ)
+                .expect("a Device resolved a moment ago under this same hold");
+            return Ok((ops::read_device(&claim, &mut data.handles, buf), None));
+        }
+        Ok((ops::try_read(object, buf), ops::pipe_id_read(object)))
     });
     match result {
         Ok((Some(n), wake)) => {
@@ -1790,14 +1805,15 @@ fn sys_handle_recv(
             // dropped would lose handles nobody can ask for again.
             Err(e) => return e.to_u64(),
         };
-        if !data.handles.has_room(batch.len()) {
+        let count = batch.len();
+        if !data.handles.has_room(count) {
             return SyscallError::ResourceExhausted.to_u64();
         }
         for (i, entry) in batch.into_iter().enumerate() {
             let h = data.handles.install(entry).expect("room was asked for first");
             out.write_at(i * HANDLE_LEN, &h.0.to_ne_bytes());
         }
-        0
+        count as u64
     })
 }
 
@@ -2530,14 +2546,21 @@ fn sys_io_uring_enter(
     min_complete: u32,
     timeout_nanos: u64,
 ) -> u64 {
+    // The table's own words, not one invented here: a handle that is gone is
+    // `NotFound` and one of the wrong type is `PermissionDenied`, the same as
+    // every other call. Collapsing both into `InvalidArgument` made "this ring
+    // was closed" indistinguishable from "this argument is nonsense".
     let ring_id = process::with_fd_owner_data(|data| {
-        match data.handles.get_ref(ring_h, Rights::READ.union(Rights::WRITE)) {
-            Ok(KObjectRef::IoUring(r)) => Some(r.id()),
-            _ => None,
-        }
+        data.handles
+            .get::<crate::object::service::IoUringObject>(
+                ring_h,
+                Rights::READ.union(Rights::WRITE),
+            )
+            .map(|r| r.id())
     });
-    let Some(ring_id) = ring_id else {
-        return SyscallError::InvalidArgument.to_u64();
+    let ring_id = match ring_id {
+        Ok(id) => id,
+        Err(e) => return crate::object::HandleError::to_u64(e),
     };
     match crate::io_uring::enter(ring_id, to_submit, min_complete, timeout_nanos) {
         Ok(n) => n as u64,
