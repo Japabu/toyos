@@ -237,9 +237,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 
     process::with_current_data(|data| {
         data.syscall_total += 1;
-        if (num as usize) < data.syscall_counts.len() {
-            data.syscall_counts[num as usize] += 1;
-        }
+        // Clamped rather than guarded: a number this ABI does not issue is
+        // still a call the total counted, so it lands in the last bin instead
+        // of nowhere.
+        data.syscall_counts[(num as usize).min(toyos_abi::syscall::SYSCALL_PROFILE_OTHER)] += 1;
     });
 
     // SAFETY: current process's page tables remain active for the duration of this call.
@@ -348,8 +349,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                 Ok(bytes) => bytes,
                 Err(e) => return e.to_u64(),
             };
-            let (fds, endowments) = match process::build_child_handles(&slot_map, &endow, &labels)
-            {
+            let pending = match process::build_child_handles(&slot_map, &endow, &labels) {
                 Ok(built) => built,
                 Err(e) => return e.refuse(),
             };
@@ -368,7 +368,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             } else {
                 alloc::vec::Vec::new()
             };
-            sys_spawn(&text, fds, endowments, env)
+            sys_spawn(&text, pending, env)
         }
         SYS_PROCESS_WAIT => sys_process_wait(RawHandle(a1 as u32), a2),
         SYS_PROCESS_KILL => {
@@ -715,6 +715,20 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             12 => crate::arch::tlb::debug_arm_ack_delay(a2),
             #[cfg(feature = "test-tlb-ack-delay")]
             13 => crate::arch::tlb::debug_disarm_ack_delay(),
+            // The two leaks this object model accepts — an `Arc` stranded on a
+            // killed thread's stack, and the cross-pair connection cycle — are
+            // visible in no other way, so the census needs a reader or it is a
+            // counter nothing ever reads. Unlike every action above it this one
+            // is in the shipping kernel: a churn test that needed its own boot
+            // would not be run after every change, and a live object count is
+            // not authority over anything.
+            14 => crate::object::census::total(),
+            15 => {
+                for (kind, live) in crate::object::census::live() {
+                    log!("census: {kind} {live}");
+                }
+                0
+            }
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => match ctx.copy_out(UserAddr::new(a1), &sys_sched_info()) {
@@ -1330,13 +1344,12 @@ fn sys_write_nonblock(h: RawHandle, buf: &UserBytes) -> u64 {
 /// makes the answer "no process was started" true.
 fn sys_spawn(
     text: &str,
-    handles: crate::object::HandleTable,
-    endowments: process::Endowments,
+    pending: crate::loader::PendingHandles,
     env: alloc::vec::Vec<u8>,
 ) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
     let cwd = process::with_fd_owner_data(|data| data.cwd.clone());
-    let object = match process::spawn(&args, handles, endowments, cwd, env) {
+    let object = match process::spawn(&args, pending, cwd, env) {
         Ok(object) => object,
         Err(e) => return e.to_u64(),
     };
@@ -2574,10 +2587,8 @@ fn sys_dlsym(handle: u64, name: &str) -> u64 {
 
 /// Make a ring and tell the caller where it is.
 ///
-/// The ring owns its page and this maps it, which is
-/// `specs/issues/design-debt/io-uring-abuses-shared-memory.md`: a ring is not
-/// something two processes share, and its page had a lifetime of its own for no
-/// reason but the shape of this call's answer.
+/// The ring owns its page and this maps it. A ring is not something two
+/// processes share, so nothing else may name that page.
 fn sys_io_uring_setup(ctx: &SyscallContext, depth: u32, out: u64) -> u64 {
     let out = match UserAddr::checked(out) {
         Some(addr) => addr,

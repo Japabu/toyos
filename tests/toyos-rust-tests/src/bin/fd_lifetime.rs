@@ -38,6 +38,8 @@ const PATH: &[u8] = b"/tmp/fd-lifetime.txt";
 const KILLED_PATH: &[u8] = b"/home/fd-lifetime-killed.txt";
 const PAYLOAD: &[u8] = b"a file outlives the fd that was closed first";
 const KILLED_PAYLOAD: &[u8] = b"written by a process that was killed before it could close";
+/// `process::HANDLE_FAULT_EXIT_CODE`.
+const HANDLE_FAULT: i32 = 139;
 /// How many rings the `ring` holder makes. One is 2 MiB, and the witness for
 /// a killed process giving them back is the machine's own free memory — so the
 /// figure has to be far enough above what the rest of a boot moves under it
@@ -48,6 +50,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("holder") => holder(&args.next().expect("holder needs a kind")),
+        Some("closed-ring") => closed_ring(),
         Some(other) => panic!("unknown role {other:?}"),
         None => test(),
     }
@@ -123,10 +126,26 @@ fn ring_survives_one_close() {
     assert_eq!(params.sq_ring_size, 8, "the ring's page no longer describes the ring");
 
     syscall::close(b);
+
+    // **And the last close leaves no handle behind, which is now a fact about
+    // the caller rather than a word it is handed.** Naming a slot a process
+    // closed is a bug in that process, so the kernel ends it — which is why
+    // this is a child and not a fourth line here.
+    let probe = Command::new(SELF_PATH)
+        .arg("closed-ring")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the closed-ring probe");
+    let out = probe.wait_with_output().expect("wait the closed-ring probe");
     assert_eq!(
-        syscall::io_uring_enter(b, 0, 0, 0).err(),
-        Some(SyscallError::NotFound),
-        "the last close left the ring's handle behind"
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "closed",
+        "the closed-ring probe never reached its call",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(HANDLE_FAULT),
+        "the last close left the ring's handle behind",
     );
 }
 
@@ -230,10 +249,21 @@ fn spawn_with(kind: &str, mut command: Command) -> (Child, BufReader<ChildStdout
     (child, out)
 }
 
-/// `Child::kill` is unimplemented in the ToyOS std, so this is the syscall.
 fn kill_and_reap(child: &mut Child) {
     child.kill().expect("kill the holder");
     child.wait().expect("reap the holder");
+}
+
+/// Both handles to one ring, both closed, and then the number presented again.
+fn closed_ring() -> ! {
+    let (a, _base) = unsafe { syscall::io_uring_setup(8) }.expect("closed-ring: io_uring_setup");
+    let b = syscall::dup(a).expect("closed-ring: dup");
+    syscall::close(a);
+    syscall::close(b);
+    println!("closed");
+    std::io::stdout().flush().expect("closed-ring: flush");
+    let answered = syscall::io_uring_enter(b, 0, 0, 0);
+    panic!("a ring handle closed twice over answered {answered:?}");
 }
 
 fn holder(kind: &str) {

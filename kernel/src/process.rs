@@ -616,7 +616,7 @@ pub struct ThreadData {
     pub user_stack_base: UserAddr,
     pub user_stack_size: u64,
     /// Syscall counts per syscall number (for profiling)
-    pub syscall_counts: [u32; 64],
+    pub syscall_counts: [u32; toyos_abi::syscall::SYSCALL_PROFILE_BINS],
     pub syscall_total: u64,
     /// Wall-clock nanoseconds spent in syscall dispatch (includes preemption time)
     pub syscall_total_ns: u64,
@@ -1027,7 +1027,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         stack_pages: None,
         user_stack_base: UserAddr::new(stack_base),
         user_stack_size: if stack_base > 0 { stack_ptr - stack_base } else { 0 },
-        syscall_counts: [0; 64],
+        syscall_counts: [0; toyos_abi::syscall::SYSCALL_PROFILE_BINS],
         syscall_total: 0,
         syscall_total_ns: 0,
     }));

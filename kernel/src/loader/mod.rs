@@ -14,7 +14,7 @@ mod start;
 mod symbols;
 mod tls;
 
-pub use start::{build_child_handles, SLOT_PAIR_LEN};
+pub use start::{build_child_handles, PendingHandles, SLOT_PAIR_LEN};
 pub(crate) use start::{alloc_kernel_stack, process_start, thread_start};
 pub use tls::{setup_combined_tls, setup_tls, DTV_INITIAL_CAPACITY};
 
@@ -391,8 +391,7 @@ fn rela_dyn_from_sections(
 /// against.
 pub fn spawn(
     argv: &[&str],
-    handles: HandleTable,
-    endowments: Endowments,
+    pending: PendingHandles,
     cwd: String,
     env: Vec<u8>,
 ) -> Result<Arc<crate::object::process::ProcessObject>, SyscallError> {
@@ -404,7 +403,7 @@ pub fn spawn(
     let t0 = crate::clock::nanos_since_boot();
 
     // The guard is scoped rather than held across the match: every `return`
-    // past this point drops `handles`, and releasing a file object takes the
+    // past this point drops `pending`, and releasing a file object takes the
     // VFS lock (`object::file::OpenFileState::drop`).
     let opened = vfs::lock().open_backing(path);
     let backing: Arc<dyn crate::file_backing::FileBacking> = match opened {
@@ -606,6 +605,18 @@ pub fn spawn(
 
 
     let NeededLibs { libs: loaded_libs, paths: lib_paths } = loaded_libs;
+    // **The point of no return, and the last thing that can refuse.** Every
+    // failure above this line answers the caller with its table untouched; the
+    // endowed handles leave it here, where nothing between this and the process
+    // entry can fail.
+    let (handles, endowments) = pending.commit().map_err(|e| match e {
+        crate::object::Refusal::Error(e) => e,
+        // A handle that stopped resolving between the arguments being read and
+        // this line is the caller racing its own spawn. It is still a bug in
+        // the caller and still fatal — but the process it would have started
+        // does not exist yet, so this reports rather than ending it here.
+        crate::object::Refusal::Handle(e) => e.refuse_as_error(),
+    })?;
     let proc_data = Arc::new(Lock::new(ProcessData {
         handles,
         cwd,
@@ -645,7 +656,7 @@ pub fn spawn(
         stack_pages: Some(stack_pages),
         user_stack_base: user_stack.base(),
         user_stack_size: user_stack.size(),
-        syscall_counts: [0; 64],
+        syscall_counts: [0; toyos_abi::syscall::SYSCALL_PROFILE_BINS],
         syscall_total: 0,
         syscall_total_ns: 0,
     }));
@@ -929,7 +940,7 @@ pub fn spawn_init() -> Pid {
         }],
         label.as_bytes().to_vec(),
     );
-    spawn(&[INIT_PATH], handles, endowments, String::from("/"), Vec::new())
+    spawn(&[INIT_PATH], PendingHandles::Ready(handles, endowments), String::from("/"), Vec::new())
         .expect("spawn_init: failed to spawn")
         .pid()
 }

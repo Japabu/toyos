@@ -160,7 +160,11 @@ fn serve_launch(
         return;
     };
 
-    let mut command = Command::new(&program.path);
+    // **The caller's path, not the row's, and `argv[0]` is why.** `declared`
+    // has already established that the two name one binary, so this grants
+    // nothing extra — and `/bin/echo` spawned as `/bin/toybox` is a toybox that
+    // was never told which applet it is.
+    let mut command = Command::new(request.program);
     for (slot, handle) in request.slot_numbers().zip(slots.0.iter().copied()) {
         command.inherit_fd(slot, handle.0);
     }
@@ -228,13 +232,20 @@ impl Drop for Moved {
 /// `/bin/ls` is a symlink to `/bin/toybox`, and what an applet may hold is
 /// `toybox`'s row: the granularity of least authority is the granularity of the
 /// binary.
+///
+/// **The row's own path has to match, and matching it is the whole check.** The
+/// path is a client's claim and the row is authority: keyed on the basename
+/// alone, a caller writing `/tmp/toybox` would be handed `toybox`'s namespace
+/// for a binary it wrote itself. So the answer is a row only where the caller
+/// named that row's binary — directly, or through a link that lands on it.
 fn declared<'a>(system: &'a Manifest, path: &str) -> Option<&'a Program> {
     let key = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-    if let Some(program) = system.program(&key(path)) {
+    let row = |p: &str| system.program(&key(p)).filter(|program| program.path == p);
+    if let Some(program) = row(path) {
         return Some(program);
     }
     let target = std::fs::read_link(path).ok()?;
-    system.program(&key(target.to_str()?))
+    row(target.to_str()?)
 }
 
 /// Build one program's authority and spawn it holding exactly that.

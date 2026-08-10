@@ -108,22 +108,93 @@ pub(crate) fn make_name(path: &str) -> [u8; crate::process::THREAD_NAME_LEN] {
     name
 }
 
-/// Build a child's table out of the two vectors `SpawnArgs` carries.
+/// A child's table, and the endowments that have not left the parent yet.
+///
+/// **The move is the last thing a spawn does.** `SYS_SPAWN` can still fail long
+/// after its arguments are read — the program may not exist, its ELF may not
+/// parse, its stack may not fit — and a parent told "that did not happen" while
+/// its endowed handles have already gone holds numbers that name nothing. Under
+/// the bad-handle policy its own `close` of one is then fatal, which is how a
+/// `spawn: /bin/pull-probe-0: not found` killed `test-runner`.
+pub enum PendingHandles {
+    /// Built by the kernel and owing nobody anything — the boot's `/bin/init`.
+    Ready(HandleTable, Endowments),
+    /// A caller's request: the table holds the `slot_map` duplicates, and the
+    /// blob is the `endow` vector that still has to leave the caller's table.
+    Moving { table: HandleTable, endow: Vec<u8>, labels: Vec<u8> },
+}
+
+impl PendingHandles {
+    /// Take the endowed handles out of the parent's table.
+    ///
+    /// **All or nothing, under one hold of the parent's lock**: the handles
+    /// resolve, they carry `TRANSFER`, the labels are in range and the child's
+    /// table has room — and only then is anything removed. A refusal leaves the
+    /// parent's table exactly as it was.
+    pub fn commit(self) -> Result<(HandleTable, Endowments), Refusal> {
+        let (mut table, endow, labels) = match self {
+            Self::Ready(table, endowments) => return Ok((table, endowments)),
+            Self::Moving { table, endow, labels } => (table, endow, labels),
+        };
+        let data_arc = fd_owner_data();
+        let mut data = data_arc.lock();
+
+        let count = endow.len() / ENDOW_ENTRY_LEN;
+        let mut moving: Vec<(EndowEntry, RawHandle)> = Vec::with_capacity(count);
+        for raw in endow.chunks_exact(ENDOW_ENTRY_LEN) {
+            let label_off = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let label_len = u32::from_ne_bytes([raw[4], raw[5], raw[6], raw[7]]);
+            let handle = RawHandle(u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]));
+            let end = (label_off as usize)
+                .checked_add(label_len as usize)
+                .ok_or(SyscallError::InvalidArgument)?;
+            if end > labels.len() {
+                return Err(SyscallError::InvalidArgument.into());
+            }
+            // Verified against the *parent's* rights here and removed below, so
+            // a handle that is missing `TRANSFER` refuses the spawn rather than
+            // leaving the child a hole where its parent said a capability would
+            // be.
+            let rights = data.handles.rights_of(handle)?;
+            if !rights.contains(Rights::TRANSFER) {
+                return Err(SyscallError::PermissionDenied.into());
+            }
+            moving.push((EndowEntry { label_off, label_len, handle, _pad: 0 }, handle));
+        }
+        // The child's table must be able to take all of them before the
+        // parent's gives any up: an install that failed halfway would have
+        // moved a handle out of a table that is about to be told the spawn did
+        // not happen.
+        if !table.has_room(moving.len()) {
+            return Err(SyscallError::ResourceExhausted.into());
+        }
+
+        let mut entries = Vec::with_capacity(moving.len());
+        for (mut entry, parent_handle) in moving {
+            let moved = data
+                .handles
+                .remove(parent_handle)
+                .expect("an endowed handle verified under this lock stopped resolving");
+            entry.handle = table
+                .install(moved)
+                .expect("a child table with verified room refused an endowment");
+            entries.push(entry);
+        }
+        Ok((table, Endowments::new(entries, labels)))
+    }
+}
+
+/// Read the two vectors `SpawnArgs` carries.
 ///
 /// **Two verbs.** `slot_map` *duplicates* — the parent keeps its stdout — and
-/// `endow` *moves*, which is what makes handing over a device claim expressible
-/// at all: a claim carries no `DUP`, so a move is its only form and the parent
-/// provably no longer holds it afterwards.
-///
-/// **All or nothing.** Everything is verified under one hold of the parent's
-/// lock — the handles resolve, they carry `TRANSFER`, the labels are in range
-/// and the child's table has room — and only then is anything removed. A
-/// refusal leaves the parent's table exactly as it was.
+/// `endow` *moves*. The duplicates are taken here, because a copy costs the
+/// parent nothing if the spawn then fails; the moves are checked for shape and
+/// carried to [`PendingHandles::commit`], which is the point of no return.
 pub fn build_child_handles(
     slot_map: &UserBytes,
     endow: &UserBytes,
     labels: &[u8],
-) -> Result<(HandleTable, Endowments), Refusal> {
+) -> Result<PendingHandles, Refusal> {
     if endow.len() / ENDOW_ENTRY_LEN > MAX_ENDOWMENTS {
         return Err(SyscallError::InvalidArgument.into());
     }
@@ -131,7 +202,7 @@ pub fn build_child_handles(
         return Err(SyscallError::InvalidArgument.into());
     }
     let data_arc = fd_owner_data();
-    let mut data = data_arc.lock();
+    let data = data_arc.lock();
     let mut handles = HandleTable::new();
     for i in 0..slot_map.len() / SLOT_PAIR_LEN {
         let mut pair = [0u8; SLOT_PAIR_LEN];
@@ -156,46 +227,9 @@ pub fn build_child_handles(
         drop(displaced);
     }
 
-    let count = endow.len() / ENDOW_ENTRY_LEN;
-    let mut moving: Vec<(EndowEntry, RawHandle)> = Vec::with_capacity(count);
-    for i in 0..count {
-        let mut raw = [0u8; ENDOW_ENTRY_LEN];
-        endow.read_at(i * ENDOW_ENTRY_LEN, &mut raw);
-        let label_off = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        let label_len = u32::from_ne_bytes([raw[4], raw[5], raw[6], raw[7]]);
-        let handle = RawHandle(u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]));
-        let end = (label_off as usize)
-            .checked_add(label_len as usize)
-            .ok_or(SyscallError::InvalidArgument)?;
-        if end > labels.len() {
-            return Err(SyscallError::InvalidArgument.into());
-        }
-        // Verified against the *parent's* rights here and removed below, so a
-        // handle that is missing `TRANSFER` refuses the spawn rather than
-        // leaving the child a hole where its parent said a capability would be.
-        let rights = data.handles.rights_of(handle)?;
-        if !rights.contains(Rights::TRANSFER) {
-            return Err(SyscallError::PermissionDenied.into());
-        }
-        moving.push((EndowEntry { label_off, label_len, handle, _pad: 0 }, handle));
-    }
-    // The child's table must be able to take all of them before the parent's
-    // gives any up: an install that failed halfway would have moved a handle
-    // out of a table that is about to be told the spawn did not happen.
-    if !handles.has_room(moving.len()) {
-        return Err(SyscallError::ResourceExhausted.into());
-    }
+    drop(data);
 
-    let mut entries = Vec::with_capacity(moving.len());
-    for (mut entry, parent_handle) in moving {
-        let moved = data
-            .handles
-            .remove(parent_handle)
-            .expect("an endowed handle verified under this lock stopped resolving");
-        entry.handle = handles
-            .install(moved)
-            .expect("a child table with verified room refused an endowment");
-        entries.push(entry);
-    }
-    Ok((handles, Endowments::new(entries, labels.to_vec())))
+    let mut raw = alloc::vec![0u8; endow.len() as usize];
+    endow.read_at(0, &mut raw);
+    Ok(PendingHandles::Moving { table: handles, endow: raw, labels: labels.to_vec() })
 }

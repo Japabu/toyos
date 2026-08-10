@@ -7,8 +7,9 @@
 //! exactly once, only after the child died — is what the third case used to
 //! assert the opposite of.
 
+use std::io::{Read, Write};
 use std::os::toyos::process::ChildExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use toyos::process::Process;
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, ProcessStats, SyscallError};
@@ -62,11 +63,22 @@ fn exited_child() {
 
 /// The whole of what the handle bought: a target that has not exited.
 fn live_process() {
-    let mut child = Command::new("/bin/cat").spawn().expect("spawn cat");
-    // `cat` with an inherited stdin blocks reading it, so it is alive here and
-    // has done work — the ELF load faulted pages in before it ever ran.
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    // **A round trip, not a spawn.** `spawn` returns before the child has been
+    // scheduled, so a sample taken there reads a process that has faulted
+    // nothing and the assertions below become a race against the scheduler. A
+    // byte that has come back out of `cat` is proof it ran.
+    child.stdin.as_mut().expect("cat stdin").write_all(b"running\n").expect("write to cat");
+    let mut echoed = [0u8; 8];
+    child.stdout.as_mut().expect("cat stdout").read_exact(&mut echoed).expect("read back from cat");
+    assert_eq!(&echoed, b"running\n", "cat did not echo");
+
     let s = stats_of(&child).expect("a live process answers");
-    assert_eq!(s.wall_ns > 0, true, "a running process has spent wall time");
+    assert!(s.wall_ns > 0, "a running process has spent wall time");
     assert!(
         s.fault_demand_count > 0 || s.fault_zero_count > 0,
         "a running process has faulted its own image in"

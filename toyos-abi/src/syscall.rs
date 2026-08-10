@@ -214,6 +214,21 @@ pub const SYS_DEVICE_CLAIM: u64 = 111;
 /// [`Rights::RT`]: crate::handle::Rights::RT
 pub const SYS_RT_ENTER: u64 = 112;
 
+/// Bins in the per-process syscall profile — one for every number this ABI
+/// issues, and one at the end for every number it does not.
+///
+/// **The profile's parts sum to its total, and that is the whole requirement.**
+/// It was `[u32; 64]` while the ABI reached 98, and the bump was guarded by a
+/// silent `if num < len`: every audio, network, IPC and pipe call fell out of
+/// the line, 15% of doom's, with the total still counting them.
+pub const SYSCALL_PROFILE_BINS: usize = 128;
+
+/// Where a number this ABI does not issue is counted. Merging is a degradation
+/// a reader can see in the line; dropping is one nobody can.
+pub const SYSCALL_PROFILE_OTHER: usize = SYSCALL_PROFILE_BINS - 1;
+
+const _: () = assert!(SYS_RT_ENTER < SYSCALL_PROFILE_OTHER as u64);
+
 pub const WNOHANG: u64 = 1;
 
 /// Arguments for the `SYS_SPAWN` syscall, passed as a single pointer.
@@ -606,10 +621,8 @@ pub fn debug(action: u64) -> u64 {
 ///
 /// **Fallible, because `sys_pipe` is.** It answers `ResourceExhausted` on three
 /// paths — no pipe pages, and either handle install hitting the table cap — and
-/// the old signature split that one word across the pair as `read = Fd(-1)`,
-/// `write = Fd(-8)`. Both were refused by every later syscall, so the failure
-/// surfaced as whatever the *next* call decided to do about a handle it did not
-/// recognise (`specs/issues/isolation/abi-wrappers-return-error-as-value.md`).
+/// a wrapper that cannot say so hands the caller a pair of handles that are an
+/// error word cut in half.
 ///
 /// A packed pair can never be mistaken for an error word: no handle is ever
 /// `0xFFFF_FFFF`, because a slot at `MAX_GENERATION` is retired rather than
@@ -1441,16 +1454,14 @@ pub fn nic_tx(claim: RawHandle, total_len: u64) -> Result<(), SyscallError> {
 }
 
 /// Allocate a TLS block for a dlopen'd module on the current thread.
-/// Returns the block's *virtual* address, which is what the kernel writes into
-/// the DTV.
 ///
-/// The return type is dishonest and the caller must not trust it: the kernel
-/// answers `InvalidArgument` for a `module_id` of 0 or one outside the
-/// process's module list, and `ResourceExhausted` past `DTV_INITIAL_CAPACITY`
-/// or when the mapping fails. Each arrives here as a value near `u64::MAX`
-/// that `__tls_get_addr_slow` adds an offset to and returns as a pointer.
-pub fn tls_alloc_block(module_id: u64) -> u64 {
-    syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0)
+/// The block's *virtual* address, which is what the kernel writes into the DTV.
+/// `InvalidArgument` for a `module_id` of 0 or one outside the process's module
+/// list, `ResourceExhausted` past `DTV_INITIAL_CAPACITY` or when the mapping
+/// fails — and every user address is far below where `SyscallError` encodes, so
+/// no block is ever read as one.
+pub fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
+    check(syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0))
 }
 
 /// A ring and where its SQ/CQ/SQE page is mapped.

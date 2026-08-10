@@ -18,21 +18,24 @@
 //! and the kernel enforces underneath it.
 //!
 //! Four arms, each the runtime half of a thing the compiler already refuses to
-//! spell:
+//! spell. **They no longer answer the same way, and the split is the design.**
+//! An attenuated handle is a thing a process may legitimately probe, so arms 1
+//! and 4 come back as words; naming a handle of the wrong type or one from
+//! somebody else's table is a bug no correct program has, so arms 2 and 3 end
+//! the caller and are raised in children that print a marker first.
 //!
-//! 1. **A connector cannot accept.** `Connector` has no `accept` method; the
-//!    handle behind one is refused by `SYS_ACCEPT` as well.
+//! 1. **A connector cannot accept.** `Connector` has no `accept` method, and
+//!    the handle behind one carries no `READ` — so `SYS_ACCEPT` refuses it with
+//!    a word before it ever looks at the type.
 //! 2. **An acceptor cannot be put in a namespace as a connector.** Two types,
 //!    one wire word, and the kernel checks the type rather than trusting it.
 //! 3. **A handle number from another process's table names nothing here.** The
-//!    child prints the raw number of a live acceptor of its own; this process
-//!    presenting it reaches nothing.
+//!    victim prints the raw number of a live acceptor of its own; the thief
+//!    presenting it is ended, and the victim's port is still serving afterwards.
 //! 4. **A name a namespace does not carry resolves to nothing** — and that is
 //!    `NotFound`, which is a different word from a port that has closed.
-//!
-//! Run with `child` it is the process in arm 3.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 use toyos::{namespace, port, AsHandle};
@@ -41,21 +44,26 @@ use toyos_abi::syscall::{self, SyscallError};
 const SELF_PATH: &str = "/bin/test_rs_abuse_listener_hijack";
 const NAME: &str = "abuse-listener-hijack";
 
+/// `process::HANDLE_FAULT_EXIT_CODE`.
+const HANDLE_FAULT: i32 = 139;
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
-        Some("child") => child(),
+        Some("victim") => victim(),
+        Some("smuggler") => smuggler(),
+        Some("thief") => thief(),
         Some(other) => panic!("unknown role {other:?}"),
         None => test(),
     }
 }
 
 fn test() {
-    let (acceptor, connector) = port::create().expect("a port of our own");
+    let (_acceptor, connector) = port::create().expect("a port of our own");
 
     // 1. The client's end has no read path at all. `Connector` exposes no
-    //    `accept`, and the handle under it is refused by the syscall too — so
-    //    a client given access to a service cannot take that service's
-    //    connections however it addresses the call.
+    //    `accept`, and the handle under it carries no `READ` — so a client
+    //    given access to a service cannot take that service's connections
+    //    however it addresses the call.
     assert_eq!(
         syscall::accept(connector.as_handle()).err(),
         Some(SyscallError::PermissionDenied),
@@ -63,33 +71,38 @@ fn test() {
     );
 
     // 2. And the server's end is not a ticket to hand out: an acceptor in an
-    //    `add` entry is refused, so nothing can build a namespace whose entry
-    //    hands the *acceptor* to whoever holds it.
-    let smuggled = namespace::build().add(NAME, unsafe { &fake_connector(&acceptor) }).finish();
-    assert_eq!(
-        smuggled.err(),
-        Some(SyscallError::PermissionDenied),
-        "an acceptor was accepted as a namespace's connector"
-    );
+    //    `add` entry is a wrong-typed handle, so nothing can build a namespace
+    //    whose entry hands the *acceptor* to whoever holds it.
+    killed("smuggler", None, "an acceptor was accepted as a namespace's connector");
 
     // 3. A handle is an index into one process's own table and means nothing
-    //    outside it. The child holds a live acceptor and says what number it
-    //    is; presenting that number here reaches whatever this process has at
-    //    that slot, and never the child's port.
-    let child = Command::new(SELF_PATH)
-        .arg("child")
+    //    outside it. The victim holds a live acceptor and says what number it
+    //    is; a sibling presenting that number is ended where it stands, and the
+    //    victim's port is untouched — which is what stops this arm passing
+    //    against a number that named nothing anywhere.
+    let mut victim = Command::new(SELF_PATH)
+        .arg("victim")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn the child");
-    let mut out = BufReader::new(child.stdout.expect("child stdout"));
+        .expect("spawn the victim");
+    let mut out = BufReader::new(victim.stdout.take().expect("victim stdout"));
     let mut line = String::new();
-    out.read_line(&mut line).expect("the child's acceptor handle");
-    let theirs = toyos_abi::RawHandle(line.trim().parse().expect("a handle number"));
-    match syscall::accept(theirs) {
-        Err(SyscallError::NotFound) | Err(SyscallError::PermissionDenied) => {}
-        Err(e) => panic!("another process's handle number answered {e:?}"),
-        Ok(_) => panic!("another process's handle number accepted a connection"),
-    }
+    out.read_line(&mut line).expect("the victim's acceptor handle");
+    let theirs = line.trim().to_string();
+    assert!(theirs.parse::<u32>().is_ok(), "the victim published {theirs:?}");
+
+    killed("thief", Some(&theirs), "another process's handle number accepted a connection");
+
+    drop(victim.stdin.take());
+    let mut said = String::new();
+    out.read_to_string(&mut said).expect("the victim's report");
+    assert!(victim.wait().expect("wait the victim").success(), "the victim exited nonzero");
+    assert_eq!(
+        said.trim(),
+        "port still mine",
+        "the victim's port did not survive the number being presented elsewhere",
+    );
 
     // 4. A name is resolved in a namespace this process holds, and in no other
     //    place. One that is not in it is `NotFound` — a fact about this
@@ -105,22 +118,76 @@ fn test() {
     println!("a connector cannot accept, an acceptor cannot be a connector, and a handle is one process's");
 }
 
-/// An `Acceptor`'s handle wearing a `Connector`'s type, which is the only way
-/// to make the kernel decide arm 2 — the SDK's two types make it unwritable.
+/// Run `role` and require that the kernel ended it at its call.
 ///
-/// # Safety
-/// The returned value must not outlive `acceptor` and must not be dropped as an
-/// owning handle; it is read for its number and nothing else.
-unsafe fn fake_connector(acceptor: &port::Acceptor) -> core::mem::ManuallyDrop<port::Connector> {
-    core::mem::ManuallyDrop::new(unsafe { port::Connector::from_raw(acceptor.as_handle()) })
+/// The marker is what gives the arm teeth: without it a child that failed
+/// before reaching the call would pass, having asserted nothing.
+fn killed(role: &str, arg: Option<&str>, what_would_be_wrong: &str) {
+    let mut command = Command::new(SELF_PATH);
+    command.arg(role);
+    command.args(arg);
+    let child =
+        command.stdout(Stdio::piped()).spawn().unwrap_or_else(|e| panic!("spawn {role}: {e}"));
+    let out = child.wait_with_output().unwrap_or_else(|e| panic!("wait {role}: {e}"));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("reached {role}"),
+        "{role} never reached its call",
+    );
+    assert_eq!(out.status.code(), Some(HANDLE_FAULT), "{what_would_be_wrong}");
 }
 
-fn child() {
-    let (acceptor, _connector) = port::create().expect("child: a port of its own");
+fn marker(role: &str) {
+    println!("reached {role}");
+    std::io::stdout().flush().expect("flush the marker");
+}
+
+/// An `Acceptor`'s handle wearing a `Connector`'s type, which is the only way
+/// to make the kernel decide arm 2 — the SDK's two types make it unwritable.
+fn smuggler() -> ! {
+    let (acceptor, _connector) = port::create().expect("smuggler: a port of its own");
+    marker("smuggler");
+    // SAFETY: read for its number and nothing else. `ManuallyDrop` keeps it
+    // from being closed as an owning handle, and it does not outlive
+    // `acceptor`.
+    let fake = core::mem::ManuallyDrop::new(unsafe {
+        port::Connector::from_raw(acceptor.as_handle())
+    });
+    let smuggled = namespace::build().add(NAME, &fake).finish();
+    panic!("an acceptor was taken as a connector: {:?}", smuggled.map(|_| ()));
+}
+
+/// Presents a number the victim published. It holds no acceptor of its own, so
+/// whatever is at that slot here is not a port anybody serves.
+fn thief() -> ! {
+    let theirs = toyos_abi::RawHandle(
+        std::env::args().nth(2).expect("thief needs a handle number").parse().expect("a number"),
+    );
+    marker("thief");
+    let taken = syscall::accept(theirs);
+    panic!("another process's handle number answered {taken:?}");
+}
+
+/// Holds a live port for the length of arm 3, and proves afterwards that it
+/// still holds it.
+fn victim() -> ! {
+    let (acceptor, connector) = port::create().expect("victim: a port of its own");
     println!("{}", acceptor.as_handle().0);
-    // Held for the life of this process: the number above must name something
-    // live, or arm 3 would pass against a table slot that is simply empty.
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    std::io::stdout().flush().expect("victim: flush");
+
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+
+    // Nobody else ever reached this port, and it is still the victim's to
+    // accept from: the number it published named something live for the whole
+    // of the attack.
+    let ns = namespace::build()
+        .add(NAME, &connector)
+        .finish()
+        .expect("victim: a namespace over its own port");
+    let _client = ns.open(NAME).expect("victim: connect to its own port");
+    let _served = acceptor.accept().expect("victim: accept its own connection");
+    println!("port still mine");
+    std::io::stdout().flush().expect("victim: flush the report");
+    std::process::exit(0);
 }
