@@ -1878,7 +1878,7 @@ The owner took §3.6 on 2026-08-10. What landed:
   `assert_overflow_checked`'s place and for its reason: a shipping kernel must
   name none of the 47 and the test kernel must name all of them, which is what
   keeps the search from being a spelling of `true`. Measured on the two binaries
-  this build produces — 0 of 47 at 3,829,440 bytes and 47 of 47 at 4,247,272.
+  this build produces — 0 of 47 at 3,910,240 bytes and 47 of 47 at 4,339,640.
   The names come from `kernel/src/actuator.rs`, so deleting one takes its
   command lines with it, exactly as `declared_kernel_features` does for a
   feature.
@@ -1886,7 +1886,7 @@ The owner took §3.6 on 2026-08-10. What landed:
   runner prints it, and `DECLARED_KERNEL_BUILDS` refuses a boot that asks for a
   build outside the three.
 
-#### The count
+#### The count, and what it cost
 
 **45 before, from a static enumeration of every `kernel_features` site in
 `tests/toyos.rs` and `tests/common/*.rs` and the constants behind them** — which
@@ -1896,6 +1896,28 @@ gets wrong and are worth writing down: the count is not reachable from
 and four of the sets name **two** actuators — `usb-storage-gate` with each of
 `usb-short-read`, `xhci-slow-connect` and `usb-transport-break`, and
 `rtc-no-century` with `rtc-century-next`.
+
+**Three after, and a run says so itself**: `ls target/kernel-*` after a full
+`cargo test` is three files, and the run's own last line reads
+`3 kernel build(s): ["", "boot-actuators,test-actuators", "fpu-save-nothing"]`
+over 134 guests. The census is not a static count and cannot be satisfied by
+editing a list.
+
+**What the 42 cost, measured on this host on 2026-08-11.** One pass over every
+distinct kernel feature set, each set being its own cargo fingerprint, after
+touching `kernel/src/main.rs`: **302 s for 43 sets at `origin/main`** against
+**9 s for 3 on this branch**. (43 rather than 45 because that scan resolved two
+fewer constants than the hand enumeration; main's own dependency rebuild after
+the branch switch is inside the 302.) A full green `cargo test` on this branch
+after a kernel edit is **469 s**, so the suite that used to pay ~300 s of it to
+cargo now pays nine.
+
+**The suite-level A/B the brief asked for could not be taken**, and the reason is
+structural rather than an omission: `toyos-abi` differs between this branch and
+main, so the two cannot share this host's sysroot, and a checkout at `origin/main`
+is refused a build here for as long as this branch holds it. The number above is
+the term that changed, measured on both trees by the same procedure; the rest of
+the run is the same tests.
 
 **Three after**, and the third is declared:
 
@@ -1951,6 +1973,23 @@ is a *duration*, it is. None of the five is timed. The positive halves
 (`control_regs`, `control_regs_verdict`, `fpu_isolation`, the ordinary xHCI and
 i8042 boots) all run on the shipping kernel, which is the coverage that actually
 moved and it moved the right way.
+
+**The refusal has teeth, and it proved it on this landing's own harness.** The
+conversion's bulk rename moved one site it should not have: `Task::Shared`
+handed `ACTUATOR_KERNEL` — a *feature* list — to `kernel_params`, so every
+`SYS_DEBUG` test booted with `\toyos\cmdline` reading
+`boot-actuators,test-actuators`. All six died before serial came up, with
+
+```
+!!! EARLY PANIC !!!: boot parameter "boot-actuators": this kernel declares no
+such actuator
+```
+
+which is §5.9.5's "an unknown parameter is refused by name" doing exactly what
+it was designed for. Two fields of the same type are swappable, so
+`build_boot_image_with` now asks `kernel/src/actuator.rs` which kind each name
+is and refuses before a guest is started — the guest's refusal is right and
+late.
 
 **Two things this change gives up and nothing replaces.**
 
