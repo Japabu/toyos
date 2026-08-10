@@ -2,7 +2,6 @@
 
 use core::sync::atomic::Ordering;
 use toyos_abi::audio::AudioSlotHeader;
-use toyos_abi::syscall;
 use crate::ipc::IpcError;
 use crate::shm::SharedMemory;
 
@@ -23,13 +22,10 @@ crate::ipc_payload! {
         pub format: u16,
     }
 
+    /// What the ring is shaped like. **The ring itself and the signal pipe
+    /// arrive as handles**, sent ahead of this frame — see
+    /// [`STREAM_OPENED_HANDLES`].
     pub struct StreamOpenResponse {
-        pub shm_token: u32,
-        /// The compiler reserved these bytes to align `signal_pipe_id`; naming
-        /// them is what stops soundd's struct literal from sending whatever
-        /// its stack held to every audio client.
-        pub _pad0: u32,
-        pub signal_pipe_id: u64,
         pub client_period_frames: u32,
         pub client_period_bytes: u32,
         pub device_sample_rate: u32,
@@ -41,6 +37,17 @@ crate::ipc_payload! {
         pub gain: f32,
     }
 }
+
+/// The two handles `MSG_STREAM_OPENED` is sent with: the slot ring, then the
+/// read end of the pipe soundd signals on.
+///
+/// **Both travel soundd → client**, which is the direction that makes a dead
+/// client detectable: the last `PipeReadEnd` handle goes with the client's
+/// table and soundd's next signal answers `Gone`, by construction rather than
+/// by bookkeeping.
+pub const STREAM_OPENED_HANDLES: usize = 2;
+pub const STREAM_OPENED_SHM: usize = 0;
+pub const STREAM_OPENED_SIGNAL: usize = 1;
 
 pub struct AudioSlotWriter {
     shm: SharedMemory,
@@ -171,6 +178,10 @@ pub enum AudioError {
     Rejected,
     /// soundd closed the signal pipe (daemon exit or client removal).
     Disconnected,
+    /// soundd announced the stream and did not send the ring and the signal
+    /// pipe with it. Handles cross before the frame that names them, so a
+    /// short batch is a protocol violation and never something to wait for.
+    MissingHandles,
     Ipc(IpcError),
     Protocol(u32),
 }
@@ -178,19 +189,15 @@ pub enum AudioError {
 pub struct AudioStream {
     control: crate::Connection,
     slot_writer: AudioSlotWriter,
-    signal_fd: toyos_abi::Fd,
+    signal: crate::Pipe,
     period_frames: u32,
     device_sample_rate: u32,
     device_channels: u16,
 }
 
 impl AudioStream {
-    const BOOT_RETRIES: u32 = 100;
-    const BOOT_RETRY_INTERVAL_NS: u64 = 10_000_000;
-
     pub fn open(sample_rate: u32, channels: u16, format: u16) -> Result<Self, AudioError> {
         let control = Self::connect_soundd()?;
-
         let req = StreamOpenRequest { sample_rate, channels, format };
         control.send(MSG_STREAM_OPEN, &req).map_err(AudioError::Ipc)?;
 
@@ -201,21 +208,21 @@ impl AudioStream {
             other => return Err(AudioError::Protocol(other)),
         };
 
+        let batch = control
+            .recv_handles_exact::<STREAM_OPENED_HANDLES>()
+            .ok_or(AudioError::MissingHandles)?;
+        let signal = crate::Pipe(crate::OwnedHandle(batch[STREAM_OPENED_SIGNAL]));
+
         let slot_count = resp.slot_count as u32;
         let shm_size = AudioSlotHeader::SIZE + slot_count as usize * resp.client_period_bytes as usize;
-        // The ring soundd says it granted. A token this process may not map is
-        // a daemon that did not open the stream it just said it opened.
-        let shm = SharedMemory::map(resp.shm_token, shm_size)
+        let shm = SharedMemory::adopt(batch[STREAM_OPENED_SHM], shm_size)
             .map_err(|e| AudioError::Ipc(IpcError::Syscall(e)))?;
         let slot_writer = AudioSlotWriter::new(shm, resp.client_period_bytes, slot_count);
-
-        let signal_fd = syscall::pipe_open(resp.signal_pipe_id, 0)
-            .map_err(|e| AudioError::Ipc(IpcError::Syscall(e)))?;
 
         Ok(Self {
             control,
             slot_writer,
-            signal_fd,
+            signal,
             period_frames: resp.client_period_frames,
             device_sample_rate: resp.device_sample_rate,
             device_channels: resp.device_channels,
@@ -229,7 +236,7 @@ impl AudioStream {
     /// removed this client) — the caller must stop the stream, not retry.
     pub fn wait_and_fill(&mut self, mut callback: impl FnMut(&mut [u8])) -> Result<(), AudioError> {
         let mut buf = [0u8; 64];
-        match syscall::read(self.signal_fd, &mut buf) {
+        match self.signal.read(&mut buf) {
             Ok(0) => return Err(AudioError::Disconnected),
             Ok(_) => {}
             Err(e) => return Err(AudioError::Ipc(IpcError::Syscall(e))),
@@ -262,19 +269,13 @@ impl AudioStream {
         let _ = self.control.signal(MSG_STREAM_CLOSE);
     }
 
+    /// One connection to soundd, through this process's own namespace.
+    ///
+    /// **There was a retry loop here and it is gone**, along with its twin in
+    /// `net`. A `soundd` connector is live from this process's first
+    /// instruction, so `NotFound` now means the manifest did not give this
+    /// program sound.
     fn connect_soundd() -> Result<crate::Connection, AudioError> {
-        for _ in 0..Self::BOOT_RETRIES {
-            if let Ok(conn) = crate::services::connect("soundd") {
-                return Ok(conn);
-            }
-            syscall::nanosleep(Self::BOOT_RETRY_INTERVAL_NS);
-        }
-        Err(AudioError::NotFound)
-    }
-}
-
-impl Drop for AudioStream {
-    fn drop(&mut self) {
-        syscall::close(self.signal_fd);
+        crate::endow::service("soundd").map_err(|_| AudioError::NotFound)
     }
 }

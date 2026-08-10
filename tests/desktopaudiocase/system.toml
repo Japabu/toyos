@@ -5,16 +5,31 @@
 # meets a null sink existed in neither. That machine is this one: the client's
 # stdio are pipes to a terminal, the terminal is a compositor surface, and
 # soundd has no device.
-init = ["/bin/compositor", "/bin/soundd", "/bin/terminal"]
 
 assets = ["assets"]
 
-[programs]
-compositor = {}
-soundd = {}
-terminal = {}
-shell = {}
-toybox = {}
+[boot]
+start = ["compositor", "soundd", "terminal"]
+
+[programs.compositor]
+serves = ["compositor"]
+receives = ["soundd", "launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+syscap = ["rt"]
+
+[programs.terminal]
+provides = ["surface"]
+receives = ["compositor", "launcher"]
+
+[programs.shell]
+receives = ["surface", "launcher"]
+
+[programs.toybox]
+receives = ["compositor", "soundd", "surface"]
 
 [symlinks]
 "bin/echo" = "/bin/toybox"

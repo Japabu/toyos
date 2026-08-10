@@ -3,7 +3,7 @@
 use alloc::alloc::{alloc as heap_alloc, dealloc as heap_dealloc};
 use alloc::vec::Vec;
 use core::ptr;
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_abi::syscall;
 use toyos::net::{NetError, TcpSocketId, UdpSocketId, OPT_NODELAY};
 
@@ -219,8 +219,8 @@ pub unsafe extern "C" fn connect(fd: i32, addr: *const Sockaddr, addrlen: Sockle
             entry.remote_addr = ip;
             entry.remote_port = port;
             entry.connected = true;
-            entry.rx_fd = conn.rx.into_fd().0;
-            entry.tx_fd = conn.tx.into_fd().0;
+            entry.rx_fd = conn.rx.into_fd().0 as i32;
+            entry.tx_fd = conn.tx.into_fd().0 as i32;
             0
         }
         SocketKind::Udp => {
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn bind(fd: i32, addr: *const Sockaddr, addrlen: SocklenT)
             entry.netd_id = bound.socket_id.0;
             entry.local_port = bound.bound_port;
             entry.bound = true;
-            entry.notify_fd = bound.notify.into_fd().0;
+            entry.notify_fd = bound.notify.into_fd().0 as i32;
             0
         }
         SocketKind::Udp => {
@@ -267,8 +267,8 @@ pub unsafe extern "C" fn bind(fd: i32, addr: *const Sockaddr, addrlen: SocklenT)
             entry.netd_id = bound.socket_id.0;
             entry.local_port = bound.bound_port;
             entry.bound = true;
-            entry.tx_fd = bound.tx.into_fd().0;
-            entry.rx_fd = bound.rx.into_fd().0;
+            entry.tx_fd = bound.tx.into_fd().0 as i32;
+            entry.rx_fd = bound.rx.into_fd().0 as i32;
             0
         }
     }
@@ -299,7 +299,7 @@ pub unsafe extern "C" fn accept(
 
     // Block until a connection arrives (read 1 byte from notify pipe)
     let mut notify_byte = [0u8; 1];
-    let _ = syscall::read(Fd(notify_fd), &mut notify_byte);
+    let _ = syscall::read(RawHandle(notify_fd as u32), &mut notify_byte);
 
     let accepted = match toyos::net::tcp_accept(listener_id) {
         Ok(a) => a,
@@ -318,14 +318,14 @@ pub unsafe extern "C" fn accept(
         local_port: accepted.local_port,
         remote_addr: accepted.remote_addr,
         remote_port: accepted.remote_port,
-        rx_fd: accepted.rx.into_fd().0,
-        tx_fd: accepted.tx.into_fd().0,
+        rx_fd: accepted.rx.into_fd().0 as i32,
+        tx_fd: accepted.tx.into_fd().0 as i32,
         notify_fd: 0,
     };
     let new_fd = alloc_socket(new_entry);
     if new_fd < 0 {
-        syscall::close(Fd(new_entry.rx_fd));
-        syscall::close(Fd(new_entry.tx_fd));
+        syscall::close(RawHandle(new_entry.rx_fd as u32));
+        syscall::close(RawHandle(new_entry.tx_fd as u32));
         let _ = toyos::net::tcp_close(accepted.socket_id);
         set_errno(ENOMEM);
     }
@@ -349,7 +349,7 @@ pub unsafe extern "C" fn send(fd: i32, buf: *const u8, len: usize, _flags: i32) 
     match entry.kind {
         SocketKind::Tcp => {
             let data = core::slice::from_raw_parts(buf, len);
-            match syscall::write(Fd(entry.tx_fd), data) {
+            match syscall::write(RawHandle(entry.tx_fd as u32), data) {
                 Ok(n) => n as isize,
                 Err(_) => { set_errno(EIO); -1 }
             }
@@ -383,7 +383,7 @@ pub unsafe extern "C" fn recv(fd: i32, buf: *mut u8, len: usize, _flags: i32) ->
     match entry.kind {
         SocketKind::Tcp => {
             let data = core::slice::from_raw_parts_mut(buf, len);
-            match syscall::read(Fd(entry.rx_fd), data) {
+            match syscall::read(RawHandle(entry.rx_fd as u32), data) {
                 Ok(n) => n as isize,
                 Err(_) => { set_errno(EIO); -1 }
             }
@@ -427,7 +427,7 @@ pub unsafe extern "C" fn sendto(
             };
             // Write data to tx pipe
             let data = core::slice::from_raw_parts(buf, len);
-            if let Err(_) = syscall::write(Fd(entry.tx_fd), data) {
+            if let Err(_) = syscall::write(RawHandle(entry.tx_fd as u32), data) {
                 set_errno(EIO);
                 return -1;
             }
@@ -481,7 +481,7 @@ pub unsafe extern "C" fn recvfrom(
             if n > 0 {
                 // Read data from rx pipe
                 let data = core::slice::from_raw_parts_mut(buf, n);
-                match syscall::read(Fd(entry.rx_fd), data) {
+                match syscall::read(RawHandle(entry.rx_fd as u32), data) {
                     Ok(bytes_read) => bytes_read as isize,
                     Err(_) => { set_errno(EIO); -1 }
                 }
@@ -527,9 +527,9 @@ pub unsafe extern "C" fn close_socket(fd: i32) -> bool {
     };
 
     // Close pipe fds
-    if entry.rx_fd != 0 { syscall::close(Fd(entry.rx_fd)); }
-    if entry.tx_fd != 0 { syscall::close(Fd(entry.tx_fd)); }
-    if entry.notify_fd != 0 { syscall::close(Fd(entry.notify_fd)); }
+    if entry.rx_fd != 0 { syscall::close(RawHandle(entry.rx_fd as u32)); }
+    if entry.tx_fd != 0 { syscall::close(RawHandle(entry.tx_fd as u32)); }
+    if entry.notify_fd != 0 { syscall::close(RawHandle(entry.notify_fd as u32)); }
 
     // Tell netd to close the socket
     if entry.netd_id != 0 {

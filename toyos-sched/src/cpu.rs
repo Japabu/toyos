@@ -298,9 +298,9 @@ impl<X: SchedPayload> CpuSched<X> {
         }
     }
 
-    /// `SYS_SET_RT_PRIORITY` on the running task — permanent RT, as opposed
-    /// to the bounded window a waker lends. The privilege gate lives at the
-    /// syscall layer (spec §9.2).
+    /// `SYS_RT_ENTER` on the running task — permanent RT, as opposed to the
+    /// bounded window a waker lends. The privilege gate lives at the syscall
+    /// layer (spec §9.2).
     pub fn set_current_rt(&mut self, permanent: bool) {
         if let Some(current) = self.running.as_mut() {
             current.set_permanent_rt(permanent);

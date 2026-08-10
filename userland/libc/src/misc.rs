@@ -3,7 +3,6 @@
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use toyos_abi::Pid;
 use toyos_abi::syscall;
 
 // errno (shared with other modules)
@@ -106,18 +105,22 @@ pub unsafe extern "C" fn execvp(_file: *const u8, _argv: *const *const u8) -> i3
     -1
 }
 
+/// POSIX `waitpid`, for a layer that cannot make a child.
+///
+/// **There is no pid-addressed wait left**: `SYS_WAITPID` is retired and
+/// `SYS_PROCESS_WAIT` takes the handle a spawn answered with. This layer holds
+/// no such handle for anything, because it has no spawn path at all — `fork`,
+/// `execvp` and `system` all answer `-1` above — so every pid it could be
+/// asked about is a pid it has no child for, and `ECHILD` is the true answer
+/// rather than a stub.
+///
+/// The day this layer grows `posix_spawn`, it grows a `pid -> Process handle`
+/// map beside it and this reads that. Faking ambient authority is what the
+/// compat layer is for; faking it over an empty set is not.
 #[no_mangle]
-pub unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, _options: i32) -> i32 {
-    if pid <= 0 {
-        super::stdio::errno = ECHILD;
-        return -1;
-    }
-    let code = syscall::waitpid(Pid(pid as u32));
-    if !status.is_null() {
-        // Encode exit code in wait status format (exit_code << 8)
-        *status = (code as i32) << 8;
-    }
-    pid
+pub unsafe extern "C" fn waitpid(_pid: i32, _status: *mut i32, _options: i32) -> i32 {
+    super::stdio::errno = ECHILD;
+    -1
 }
 
 // Exit / abort / atexit

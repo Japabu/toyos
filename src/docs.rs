@@ -221,8 +221,12 @@ mod tests {
         ///
         /// Strictly below the sum of `BUDGETS` (96,000), because five per-file
         /// budgets can each be honoured while the set grows past what a session
-        /// spanning the tree would tolerate, and nothing prices the set. 72,254 at
-        /// the 2026-08-09 measurement.
+        /// spanning the tree would tolerate, and nothing prices the set.
+        ///
+        /// **What the set weighs today is not written here.** A measurement in a
+        /// comment has no gate on it and drifts; this one drifted 1,943 bytes,
+        /// which is enough for an agent budgeting an addition against it to red
+        /// the gate it was trying to respect. The assertion prints it instead.
         const TOTAL_BUDGET: usize = 80_000;
 
         fn issue_files() -> Vec<PathBuf> {
@@ -280,6 +284,10 @@ mod tests {
                  Every file may be inside its own budget and the set still be too large: \
                  what an agent pays is the root plus every subtree it reads."
             );
+            // Printed on the way past, because the number a reader wants before
+            // writing a paragraph is what is *left* — and the only honest place
+            // for it is a run rather than a comment.
+            println!("CLAUDE.md set: {total} bytes, {} spare", TOTAL_BUDGET - total);
         }
 
         #[test]

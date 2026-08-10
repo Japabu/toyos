@@ -1,13 +1,21 @@
 use alloc::boxed::Box;
 use toyos_abi::syscall::SyscallError;
-use crate::shared_memory::SharedToken;
+use crate::object::shm::Region;
 use crate::sync::Lock;
 
 pub const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
 
+/// What a display driver publishes about its screen.
+///
+/// The three regions are physical ranges and their memory types, not handles: a
+/// fresh [`SharedMemObject`] is minted over each one per claim, because an
+/// object whose handle count has reached zero is retired for good while the
+/// scanout under it outlives every compositor the machine runs.
+///
+/// [`SharedMemObject`]: crate::object::shm::SharedMemObject
 pub struct GpuInfo {
-    pub tokens: [SharedToken; 2],
-    pub cursor_token: SharedToken,
+    pub scanout: [Region; 2],
+    pub cursor: Region,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -73,8 +81,8 @@ pub fn set_resolution(width: u32, height: u32) -> Result<GpuInfo, SyscallError> 
     };
     let mut info = INFO.lock();
     *info = Some(GpuInfo {
-        tokens: new_info.tokens,
-        cursor_token: new_info.cursor_token,
+        scanout: new_info.scanout.clone(),
+        cursor: new_info.cursor.clone(),
         width: new_info.width,
         height: new_info.height,
         stride: new_info.stride,

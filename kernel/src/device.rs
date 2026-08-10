@@ -1,40 +1,40 @@
-use crate::fd::{Descriptor, FramebufferInfo};
+use alloc::sync::Arc;
+
+use crate::object::device::{DeviceClaim, DeviceInfo, FramebufferBuffers};
+use crate::object::shm::Region;
 use crate::{keyboard, mouse};
-use crate::process::Pid;
-use crate::shared_memory;
+use toyos_abi::FramebufferInfo;
 use crate::sync::Lock;
 pub use toyos_abi::syscall::DeviceType;
 
-/// The wire number `SYS_OPEN_DEVICE` carries, decoded once.
-pub fn class_of(raw: u64) -> Option<DeviceType> {
-    match raw {
-        0 => Some(DeviceType::Keyboard),
-        1 => Some(DeviceType::Mouse),
-        2 => Some(DeviceType::Framebuffer),
-        3 => Some(DeviceType::Nic),
-        5 => Some(DeviceType::HdaAudio),
-        6 => Some(DeviceType::VirtioSound),
-        _ => None,
-    }
+/// Whether each class is claimed — and deliberately not by whom.
+///
+/// This was six `Lock<Option<Pid>>` statics, and the pid in them existed for
+/// one caller: `is_owner`, which nine device syscalls asked before driving the
+/// hardware. That is designation by ambient property, and every one of those
+/// nine takes the claim handle now, so the only question left is the one
+/// exclusivity actually needs.
+static TAKEN: [Lock<bool>; DeviceType::ALL.len()] =
+    [const { Lock::new(false) }; DeviceType::ALL.len()];
+static FB_INFO: Lock<Option<Screen>> = Lock::new(None);
+
+/// What the display driver published, as a claim needs it.
+///
+/// The regions rather than objects: a claim mints its own, because a
+/// `SharedMemObject` whose handle count has reached zero is retired and the
+/// screen outlives whichever process was holding it.
+#[derive(Clone)]
+pub struct Screen {
+    pub info: FramebufferInfo,
+    pub scanout: [Region; 2],
+    pub cursor: Region,
 }
 
-static KEYBOARD_OWNER: Lock<Option<Pid>> = Lock::new(None);
-static MOUSE_OWNER: Lock<Option<Pid>> = Lock::new(None);
-static FRAMEBUFFER_OWNER: Lock<Option<Pid>> = Lock::new(None);
-static NIC_OWNER: Lock<Option<Pid>> = Lock::new(None);
-static HDA_OWNER: Lock<Option<Pid>> = Lock::new(None);
-static VIRTIO_SOUND_OWNER: Lock<Option<Pid>> = Lock::new(None);
-static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
-
-fn owner_of(class: DeviceType) -> &'static Lock<Option<Pid>> {
-    match class {
-        DeviceType::Keyboard => &KEYBOARD_OWNER,
-        DeviceType::Mouse => &MOUSE_OWNER,
-        DeviceType::Framebuffer => &FRAMEBUFFER_OWNER,
-        DeviceType::Nic => &NIC_OWNER,
-        DeviceType::HdaAudio => &HDA_OWNER,
-        DeviceType::VirtioSound => &VIRTIO_SOUND_OWNER,
-    }
+fn taken(class: DeviceType) -> &'static Lock<bool> {
+    &TAKEN[DeviceType::ALL
+        .iter()
+        .position(|c| *c == class)
+        .expect("`DeviceType::ALL` names every class")]
 }
 
 /// The claim itself, as a value.
@@ -42,40 +42,39 @@ fn owner_of(class: DeviceType) -> &'static Lock<Option<Pid>> {
 /// Not `Clone` and not `Copy`, and the field is private, so the only ways to
 /// obtain one are [`Claim::acquire`] and moving an existing one. That is the
 /// exclusivity: at most one `Claim` per class can exist at a time, and the
-/// compiler — not a check in `dup` — is what says so. `Descriptor` therefore
-/// cannot implement `Clone` either, which is where the rule reaches userland
-/// (`Descriptor::duplicate`).
+/// compiler — not a check in `dup` — is what says so.
 ///
-/// `capability-handles-spec.md` §6.5 reaches the same shape from the other
-/// end: a claim handle carries no DUP right, and TRANSFER moves it whole.
+/// The rule reaches userland through the object that holds one: a
+/// [`DeviceClaim`] is created without `Rights::DUP`, so at most one handle to
+/// it can exist and a transfer moves it whole.
 pub struct Claim {
     class: DeviceType,
 }
 
 impl Claim {
-    /// Take the class for `pid`, or say who has it.
-    fn acquire(class: DeviceType, pid: Pid) -> Result<Self, ClaimError> {
-        let mut owner = owner_of(class).lock();
-        if owner.is_some() {
+    /// Take the class, or say it is already held.
+    fn acquire(class: DeviceType) -> Result<Self, ClaimError> {
+        let mut held = taken(class).lock();
+        if *held {
             return Err(ClaimError::Owned);
         }
-        *owner = Some(pid);
+        *held = true;
         Ok(Self { class })
     }
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        *owner_of(self.class).lock() = None;
+        *taken(self.class).lock() = false;
     }
 }
 
-pub fn set_framebuffer_info(info: FramebufferInfo) {
+pub fn set_framebuffer_info(screen: Screen) {
     // A relative pointer accumulates into a square 0..32767 space that this
     // geometry is what gets mapped onto, so its per-axis scale is a function of
     // the screen and has to follow a mode change.
-    crate::mouse::set_screen(info.width, info.height);
-    *FB_INFO.lock() = Some(info);
+    crate::mouse::set_screen(screen.info.width, screen.info.height);
+    *FB_INFO.lock() = Some(screen);
 }
 
 /// Why a claim did not succeed.
@@ -92,76 +91,66 @@ pub enum ClaimError {
     Owned,
     /// This machine has no such device — no driver ever registered one.
     Absent,
-    /// The device exists and is free, but its buffers could not be granted.
-    GrantFailed,
 }
 
 /// Try to claim exclusive access to a device.
 ///
-/// Every `?` past the `acquire` gives the class straight back: the `Claim` is
-/// on this stack frame, so a failure cannot leave the device owned by a
-/// process that was refused it. The three hand-written `*owner = None`
-/// rollbacks this replaced were what an added grant would have had to
-/// remember.
-pub fn try_claim(class: DeviceType, pid: Pid) -> Result<Descriptor, ClaimError> {
+/// The `Claim` is on this stack frame until the object takes it, so a failure
+/// past the `acquire` cannot leave a class held by nobody.
+pub fn try_claim(class: DeviceType) -> Result<Arc<DeviceClaim>, ClaimError> {
     // Availability is decided before the claim, so a second claimant of an
     // absent device is told `Absent` and not `Owned` — the distinction soundd
     // and netd degrade on.
     match class {
         DeviceType::Keyboard => {
-            let claim = Claim::acquire(class, pid)?;
+            let claim = Claim::acquire(class)?;
             // Whatever was typed while nobody held the device belongs to
             // nobody. Delivering it to whoever claims next hands one program
             // another's keystrokes, and a compositor restarted mid-sentence
             // would open with the tail of what was being typed into the one
             // that died.
             keyboard::discard_queued();
-            Ok(Descriptor::Keyboard(claim))
+            Ok(DeviceClaim::new(class, DeviceInfo::Events, claim))
         }
         DeviceType::Mouse => {
-            let claim = Claim::acquire(class, pid)?;
+            let claim = Claim::acquire(class)?;
             mouse::discard_queued();
-            Ok(Descriptor::Mouse(claim))
+            Ok(DeviceClaim::new(class, DeviceInfo::Events, claim))
         }
         DeviceType::Framebuffer => {
-            let info = (*FB_INFO.lock()).ok_or(ClaimError::Absent)?;
-            let claim = Claim::acquire(class, pid)?;
-            for &token in &info.token {
-                grant(token, pid)?;
-            }
-            grant(info.cursor_token, pid)?;
+            let screen = (*FB_INFO.lock()).clone().ok_or(ClaimError::Absent)?;
+            let claim = Claim::acquire(class)?;
             crate::drivers::panic_console::screen_claimed_by_userland();
-            Ok(Descriptor::Framebuffer(claim, info))
+            Ok(DeviceClaim::new(class, framebuffer_info(screen), claim))
         }
         DeviceType::Nic => {
-            let info = crate::net::nic_info().ok_or(ClaimError::Absent)?;
-            let claim = Claim::acquire(class, pid)?;
-            grant(info.dma_token, pid)?;
-            Ok(Descriptor::Nic(claim, info))
+            let (info, dma) = crate::net::nic_info().ok_or(ClaimError::Absent)?;
+            let claim = Claim::acquire(class)?;
+            Ok(DeviceClaim::new(class, DeviceInfo::Nic(info, shm(dma)), claim))
         }
         DeviceType::HdaAudio => {
-            let info = crate::drivers::hda::info().ok_or(ClaimError::Absent)?;
-            let claim = Claim::acquire(class, pid)?;
-            grant(info.pcm_token, pid)?;
-            Ok(Descriptor::Hda { claim, info, info_read: false })
+            let (info, pcm) = crate::drivers::hda::info().ok_or(ClaimError::Absent)?;
+            let claim = Claim::acquire(class)?;
+            Ok(DeviceClaim::new(class, DeviceInfo::Hda(info, shm(pcm)), claim))
         }
         DeviceType::VirtioSound => {
-            let info = crate::drivers::virtio_sound::info().ok_or(ClaimError::Absent)?;
-            let claim = Claim::acquire(class, pid)?;
-            grant(info.dma_token, pid)?;
-            Ok(Descriptor::VirtioSound { claim, info, info_read: false })
+            let (info, dma) = crate::drivers::virtio_sound::info().ok_or(ClaimError::Absent)?;
+            let claim = Claim::acquire(class)?;
+            Ok(DeviceClaim::new(class, DeviceInfo::VirtioSound(info, shm(dma)), claim))
         }
     }
 }
 
-fn grant(token: u32, pid: Pid) -> Result<(), ClaimError> {
-    shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid)
-        .map_err(|_| ClaimError::GrantFailed)
+fn shm(region: Region) -> Arc<crate::object::shm::SharedMemObject> {
+    crate::object::shm::SharedMemObject::over(region)
 }
 
-/// True when `pid` currently holds the claim on `class`. Syscalls that drive a
-/// claimed device gate on this — a claim is what makes a process the device's
-/// owner, so it is also what makes it allowed to reconfigure it.
-pub fn is_owner(class: DeviceType, pid: Pid) -> bool {
-    *owner_of(class).lock() == Some(pid)
+/// The description a framebuffer claim answers with, over freshly minted
+/// buffer objects.
+pub fn framebuffer_info(screen: Screen) -> DeviceInfo {
+    let Screen { info, scanout: [front, back], cursor } = screen;
+    DeviceInfo::Framebuffer(
+        info,
+        FramebufferBuffers { scanout: [shm(front), shm(back)], cursor: shm(cursor) },
+    )
 }

@@ -17,7 +17,6 @@ use crate::toolchain;
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct SystemConfig {
-    init: Vec<String>,
     #[serde(default)]
     programs: HashMap<String, ProgramConfig>,
     #[serde(default)]
@@ -26,6 +25,18 @@ struct SystemConfig {
     hosted_rustc: bool,
     #[serde(default)]
     assets: Vec<String>,
+    /// What `/bin/init` starts at boot. Program *keys*, never paths — a path
+    /// here is a second spelling of a `[programs]` key and is what let a boot
+    /// list smuggle an argument through. Arguments live on the program entry's
+    /// `args` instead.
+    #[serde(default)]
+    boot: BootConfig,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
+struct BootConfig {
+    start: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -33,6 +44,23 @@ struct SystemConfig {
 struct ProgramConfig {
     path: Option<String>,
     no_default_features: bool,
+    /// Argv this program is started with, after argv[0].
+    args: Vec<String>,
+    /// Names init creates **one machine-wide port** for and endows this program
+    /// the *acceptor* of.
+    serves: Vec<String>,
+    /// Names this program creates a port for **itself**, once per instance, and
+    /// hands the connector down to its own children. init creates nothing and
+    /// holds nothing for these — `surface` is the whole of this kind.
+    provides: Vec<String>,
+    /// Names in this program's namespace, each a *connector*.
+    receives: Vec<String>,
+    /// Device classes init mints a claim for and endows.
+    devices: Vec<String>,
+    /// Rights on the `SysCap` duplicate init endows this program, by the names
+    /// `toyos_manifest::syscap_rights` takes. Two programs in the whole tree
+    /// declare one.
+    syscap: Vec<String>,
 }
 
 impl ProgramConfig {
@@ -252,23 +280,25 @@ fn cargo_build(
 
 // --- Artifact staging ---
 //
-// The bootloader's init list is *compiled in* (`bootloader/build.rs` declares
-// `rerun-if-env-changed=INIT_PROGRAMS`; `main.rs` reads `env!("INIT_PROGRAMS")`),
-// and the kernel's features likewise change its binary. But cargo keys the
-// artifact path on (crate, target, profile) and nothing else, so every config
-// writes and reads one path.
+// A kernel's feature list changes its binary, but cargo keys the artifact path
+// on (crate, target, profile) and nothing else, so every config writes and reads
+// one path.
 //
-// The window is not a moment: `build_test_image` builds the bootloader, then
-// runs the entire userland build and initrd assembly, and only then reads the
-// `.efi`. Seconds to minutes, during which another config's build overwrites it.
-// Observed: an image carrying metalcase's initrd and another config's bootloader,
-// whose 28-byte init string was `"/bin/soundd;/bin/test-runner"`. The compositor
-// was never spawned and the test failed as though the daemon under test were
-// broken.
+// The window is not a moment: `build_test_image` builds, then runs the entire
+// userland build and initrd assembly, and only then reads the artifact back.
+// Seconds to minutes, during which another config's build overwrites it.
 //
 // So: hold [`buildlock::artifact`] across each build→stage pair, and copy the
 // artifact to a name carrying what it is actually keyed by. Readers use the
 // staged name, which no other config can overwrite.
+//
+// The bootloader used to be here for the same reason and no longer is: its init
+// list was compiled into it, so the `.efi` was a function of the boot config,
+// and an image once carried metalcase's initrd beside another config's
+// bootloader whose 28-byte init string was `"/bin/soundd;/bin/test-runner"` —
+// the compositor was never spawned and the test failed as though the daemon
+// under test were broken. The bootloader carries no config now, so it is
+// memoized once per profile and that hazard is not expressible.
 
 /// The staged-artifact key of a kernel built with `features`.
 ///
@@ -377,6 +407,51 @@ fn assert_overflow_checked(what: &str, image: &[u8]) {
 // --- Shared initrd assembly ---
 
 /// Build all programs from a config and assemble an initrd.
+/// The one program the kernel starts, in **every** image whatever `[programs]`
+/// says. It reads the manifest below and starts what that names, so an initrd
+/// without it is a machine with a kernel and no userland at all.
+const INIT_PROGRAM: &str = "init";
+
+/// Names `/bin/init` serves itself.
+///
+/// init is in every image and is no `[programs]` key, so these have no
+/// declaration to come from. They travel in the manifest so init creates
+/// exactly the ports the build-time gate counted as provided — one producer,
+/// rather than a constant here and a string in init.
+const INIT_SERVED: &[&str] = &["launcher"];
+
+/// The resolved config as the records `/bin/init` reads.
+///
+/// The format, the renderer and the parser are `toyos-manifest/`, whose
+/// round-trip test is what makes "what the build writes is what init reads" a
+/// fact rather than two hand-matched implementations.
+fn render_manifest(config: &SystemConfig) -> Vec<u8> {
+    let mut names: Vec<&String> = config.programs.keys().collect();
+    names.sort();
+    let manifest = toyos_manifest::Manifest {
+        programs: names
+            .iter()
+            .map(|name| {
+                let cfg = &config.programs[*name];
+                toyos_manifest::Program {
+                    name: (*name).clone(),
+                    path: format!("/bin/{name}"),
+                    args: cfg.args.clone(),
+                    serves: cfg.serves.clone(),
+                    provides: cfg.provides.clone(),
+                    receives: cfg.receives.clone(),
+                    devices: cfg.devices.clone(),
+                    syscap: cfg.syscap.clone(),
+                }
+            })
+            .collect(),
+        init_serves: INIT_SERVED.iter().map(|s| (*s).to_string()).collect(),
+        start: config.boot.start.clone(),
+    };
+    toyos_manifest::render(&manifest)
+        .unwrap_or_else(|e| panic!("system.toml cannot be rendered as a manifest: {e:?}"))
+}
+
 fn build_and_assemble(
     root: &Path,
     config: &SystemConfig,
@@ -386,7 +461,7 @@ fn build_and_assemble(
 ) -> Vec<u8> {
     let userland_dir = root.join("userland");
 
-    let mut workspace_packages: Vec<&str> = Vec::new();
+    let mut workspace_packages: Vec<&str> = vec![INIT_PROGRAM];
     let mut standalone: Vec<(&String, &ProgramConfig)> = Vec::new();
     for (name, cfg) in &config.programs {
         let crate_dir = cfg.crate_dir(root, name);
@@ -457,6 +532,11 @@ fn build_and_assemble(
                 fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));
             initrd_files.push((format!("bin/{name}"), data));
         }
+
+        let init = ws_target.join(INIT_PROGRAM);
+        let data = fs::read(&init).expect("Failed to read binary for init");
+        initrd_files.push((format!("bin/{INIT_PROGRAM}"), data));
+        initrd_files.push((toyos_manifest::PATH.to_string(), render_manifest(config)));
 
         if config.hosted_rustc {
             collect_hosted_rustc(root, &mut initrd_files);
@@ -611,8 +691,6 @@ pub fn build(
 
     invalidate_stale(root, &mut lock, &config_targets(root, &config));
 
-    let init_programs = config.init.join(";");
-
     // Same lock-and-stage as `build_test_image`: `cargo run --build-only` and
     // `cargo test` share these paths, so this races the harness too.
     let (kernel_art, bl_art) = {
@@ -643,7 +721,7 @@ pub fn build(
                 "x86_64-unknown-uefi",
                 &[],
                 &path_env,
-                &[("INIT_PROGRAMS", init_programs.as_str())],
+                &[],
                 false,
             );
         }
@@ -661,7 +739,7 @@ pub fn build(
                     "bootloader/target/x86_64-unknown-uefi/{PROFILE}/bootloader.efi"
                 )),
                 "bootloader.efi",
-                key_hash(&[PROFILE, &init_programs]),
+                key_hash(&[PROFILE]),
             ),
         )
     };
@@ -815,10 +893,9 @@ pub fn build_test_image(
     extra_files: &[(String, Vec<u8>)],
 ) -> Vec<u8> {
     let config = parse_config(config_path);
-    let init_programs = config.init.join(";");
     let features = kernel_features.join(",");
     let kernel_key = kernel_key(&features);
-    let bl_key = key_hash(&[PROFILE, &init_programs]);
+    let bl_key = key_hash(&[PROFILE]);
     let initrd_key = initrd_key(config_path, extra_files);
 
     // Nothing left to build, so nothing for the lock, the toolchain check or the
@@ -884,7 +961,7 @@ pub fn build_test_image(
                 "x86_64-unknown-uefi",
                 &[],
                 &path_env,
-                &[("INIT_PROGRAMS", init_programs.as_str())],
+                &[],
                 quiet,
             );
             let staged = stage_artifact(
@@ -1152,18 +1229,236 @@ mod tests {
     /// It listens on every interface and authenticates against a file that is
     /// absent on a fresh install, so on a default boot it would be a port that
     /// accepts connections and refuses all of them. Whoever wants it runs
-    /// `/bin/sshd` themselves. It stays in `[programs]` — the gate is on the
-    /// init list, not on the binary being present.
+    /// `/bin/sshd` themselves. It stays in `[programs]` — the gate is on what
+    /// init starts, not on the binary being present.
     #[test]
     fn no_shipped_boot_config_starts_sshd() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for boot in [Boot::Normal, Boot::Diag, Boot::Console] {
             let config = boot.config();
-            let init = parse_config(&root.join(config)).init;
+            let start = parse_config(&root.join(config)).boot.start;
             assert!(
-                !init.iter().any(|p| p.ends_with("/sshd")),
-                "{config} starts sshd from init: {init:?}",
+                !start.iter().any(|p| p == "sshd"),
+                "{config} starts sshd: {start:?}",
             );
         }
+    }
+
+    /// The eleven `system.toml` files this repository builds an image from.
+    /// `every_shipped_boot_config_is_covered` asserts this equals what a walk of
+    /// the tree finds, so a config added without a gate row reds rather than
+    /// slipping through uncovered.
+    const ALL_CONFIGS: &[&str] = &[
+        "system.toml",
+        "diag/system.toml",
+        "console/system.toml",
+        "tests/desktopcase/system.toml",
+        "tests/desktopaudiocase/system.toml",
+        "tests/doomcase/system.toml",
+        "tests/doommusiccase/system.toml",
+        "tests/metalcase/system.toml",
+        "tests/netcase/system.toml",
+        "tests/sshdcase/system.toml",
+        "tests/testcases/system.toml",
+    ];
+
+    fn load(cfg: &str) -> SystemConfig {
+        parse_config(&Path::new(env!("CARGO_MANIFEST_DIR")).join(cfg))
+    }
+
+    /// Every name a program `receives` must be served or provided by some
+    /// program in the *same* config, or served by init. The build-time form of
+    /// "a client cannot name a service the system does not have", and the gate
+    /// with the sharpest teeth: no guest, no mutated tree.
+    fn receives_have_providers(cfg: &SystemConfig) -> Result<(), String> {
+        let mut providers: Vec<&str> = INIT_SERVED.to_vec();
+        for prog in cfg.programs.values() {
+            providers.extend(prog.serves.iter().map(String::as_str));
+            providers.extend(prog.provides.iter().map(String::as_str));
+        }
+        for (name, prog) in &cfg.programs {
+            for r in &prog.receives {
+                if !providers.contains(&r.as_str()) {
+                    return Err(format!(
+                        "program `{name}` receives `{r}`, which no program serves or provides"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_receives_names_a_provider() {
+        for cfg in ALL_CONFIGS {
+            receives_have_providers(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig =
+            toml::from_str("init = []\n[programs.client]\nreceives = [\"ghost\"]\n").unwrap();
+        assert!(receives_have_providers(&bad).is_err());
+    }
+
+    /// A `serves` name is one port machine-wide; a `provides` name is one port
+    /// per instance. A name declared both ways is a config where init makes a
+    /// port nobody accepts from while the real one is made elsewhere.
+    fn provides_disjoint_from_serves(cfg: &SystemConfig) -> Result<(), String> {
+        let serves: Vec<&str> = cfg
+            .programs
+            .values()
+            .flat_map(|p| p.serves.iter().map(String::as_str))
+            .collect();
+        for (name, prog) in &cfg.programs {
+            for p in &prog.provides {
+                if serves.contains(&p.as_str()) {
+                    return Err(format!(
+                        "`{p}` is both a serves name and `{name}`'s provides name"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_provides_name_is_never_also_a_serves_name() {
+        for cfg in ALL_CONFIGS {
+            provides_disjoint_from_serves(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig = toml::from_str(
+            "init = []\n[programs.a]\nserves = [\"x\"]\n[programs.b]\nprovides = [\"x\"]\n",
+        )
+        .unwrap();
+        assert!(provides_disjoint_from_serves(&bad).is_err());
+    }
+
+    /// A device class init can mint exactly one claim for, so two programs
+    /// naming the same class is a config init cannot satisfy — a runtime
+    /// first-come race today.
+    fn one_claimant_per_device(cfg: &SystemConfig) -> Result<(), String> {
+        let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, prog) in &cfg.programs {
+            for d in &prog.devices {
+                if let Some(prev) = seen.insert(d, name) {
+                    return Err(format!(
+                        "device class `{d}` is claimed by both `{prev}` and `{name}`"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_device_class_has_at_most_one_claimant() {
+        for cfg in ALL_CONFIGS {
+            one_claimant_per_device(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig = toml::from_str(
+            "init = []\n[programs.a]\ndevices = [\"framebuffer\"]\n\
+             [programs.b]\ndevices = [\"framebuffer\"]\n",
+        )
+        .unwrap();
+        assert!(one_claimant_per_device(&bad).is_err());
+    }
+
+    /// A class name the ABI does not know renders fine and leaves init with a
+    /// `devices` entry it cannot mint — a dead machine for a typo, where this is
+    /// a red in milliseconds. Same for a `syscap` right.
+    fn names_only_real_capabilities(cfg: &SystemConfig) -> Result<(), String> {
+        for (name, prog) in &cfg.programs {
+            for class in &prog.devices {
+                if toyos_manifest::DeviceType::from_class_name(class).is_none() {
+                    return Err(format!("`{name}` names device class `{class}`, which is not one"));
+                }
+            }
+            toyos_manifest::syscap_rights(&prog.syscap)
+                .map_err(|e| format!("`{name}`: {e}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_declared_capability_is_one_the_abi_has() {
+        for cfg in ALL_CONFIGS {
+            names_only_real_capabilities(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad_class: SystemConfig =
+            toml::from_str("[programs.a]\ndevices = [\"gpu\"]\n").unwrap();
+        assert!(names_only_real_capabilities(&bad_class).is_err());
+        let bad_right: SystemConfig =
+            toml::from_str("[programs.a]\nsyscap = [\"root\"]\n").unwrap();
+        assert!(names_only_real_capabilities(&bad_right).is_err());
+    }
+
+    fn claims_no_device(cfg: &SystemConfig) -> Result<(), String> {
+        for (name, prog) in &cfg.programs {
+            if !prog.devices.is_empty() {
+                return Err(format!("program `{name}` claims {:?}", prog.devices));
+            }
+        }
+        Ok(())
+    }
+
+    /// The diagnostic image's whole reason for existing: nothing in it can claim
+    /// the framebuffer, so the kernel's boot log stays on the panel. `/bin/init`
+    /// is in every image and could reach a device, so the property becomes "the
+    /// config declares no `devices`" — checkable here for the first time.
+    #[test]
+    fn no_diag_program_claims_the_screen() {
+        claims_no_device(&load("diag/system.toml"))
+            .unwrap_or_else(|e| panic!("diag/system.toml: {e}"));
+        let bad: SystemConfig =
+            toml::from_str("init = []\n[programs.x]\ndevices = [\"framebuffer\"]\n").unwrap();
+        assert!(claims_no_device(&bad).is_err());
+    }
+
+    /// `[boot] start` names program keys, so a typo is a build error rather than
+    /// a refusal `/bin/init` reports at boot.
+    fn started_programs_are_declared(cfg: &SystemConfig) -> Result<(), String> {
+        for name in &cfg.boot.start {
+            if !cfg.programs.contains_key(name) {
+                return Err(format!("[boot] start names `{name}`, not a [programs] key"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_started_program_is_declared() {
+        for cfg in ALL_CONFIGS {
+            started_programs_are_declared(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig = toml::from_str("init = []\n[boot]\nstart = [\"ghost\"]\n").unwrap();
+        assert!(started_programs_are_declared(&bad).is_err());
+    }
+
+    fn walk_configs(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                let skip = matches!(name.to_str(), Some("target") | Some("rust"))
+                    || name.to_string_lossy().starts_with('.');
+                if !skip {
+                    walk_configs(&path, root, out);
+                }
+            } else if name == "system.toml" {
+                out.push(path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    /// `ALL_CONFIGS` is the list the gates above iterate; a config added without
+    /// a row would leave a hole in that coverage. Assert the list is exactly
+    /// what a walk of the tree finds, so it cannot silently drift.
+    #[test]
+    fn every_shipped_boot_config_is_covered() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = Vec::new();
+        walk_configs(root, root, &mut found);
+        found.sort();
+        let mut expected: Vec<String> = ALL_CONFIGS.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(found, expected);
     }
 }

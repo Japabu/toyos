@@ -35,10 +35,14 @@ fn main() {
     let base = SpawnArgs {
         argv_ptr: region as u64,
         argv_len: 0,
-        fd_map_ptr: 0,
-        fd_map_count: 0,
+        slot_map_ptr: 0,
+        slot_map_count: 0,
         env_ptr: 0,
         env_len: 0,
+        endow_ptr: 0,
+        endow_count: 0,
+        labels_ptr: 0,
+        labels_len: 0,
     };
 
     let err = unsafe {

@@ -1,8 +1,13 @@
 # Where the wait belongs: `/bin/terminal` and the compositor at boot
 
-`specs/issues/kernel/terminal-races-compositor-at-boot.md` is the defect and the
-measurement. This file costs the ways out of it. **Nothing here is decided** —
-option D changes a syscall, and that is the owner's call.
+**Settled by the capability endowment branch, and it is option E in all but
+name.** A port exists before either end's process does, so a client's first
+frame is queued on it whether or not a server has been spawned: there is no
+instant at which a lookup can fail and nothing to retry. The two retry loops
+this file costs are deleted, `connect_before_serve` is the gate, and
+`specs/capability-endowment-spec.md` is the design. The menu below is kept as
+the record of what the alternatives cost — the defect it opens on
+(`kernel/terminal-races-compositor-at-boot`) is closed and its file is gone.
 
 ## 0. The menu
 
@@ -87,7 +92,7 @@ relocation.
 
 That is option B's objection already realised: the policy was put in one client
 and the next client repeated it, constants and all. It also has its own open
-defect — `specs/issues/hardware/network-clients-pay-a-boot-retry.md`: on
+defect — `hardware/network-clients-pay-a-boot-retry`, closed with the loops: on
 metal-sim sshd spends 100 `SYS_NANOSLEEP` calls and exits at t=1.69 s on a boot
 that completed at 0.38 s, because netd will never come and the loop cannot know.
 
@@ -334,7 +339,7 @@ there is one. `Descriptor::Socket` is duplicable today
 - **Serves**: the destination named in `specs/capability-handles-spec.md` §8 —
   possession is the authority, and there is no name to look up and no instant at
   which the lookup can fail. It is also the answer to
-  `specs/issues/isolation/capability-by-id-or-name.md`'s whole class.
+  `isolation/capability-by-id-or-name`'s whole class, which is closed.
 - **Strains**: nothing in the principles. It strains scope: it covers exactly
   the clients whose parent already holds a connection, and a program the user
   starts from a shell is not one of them.
