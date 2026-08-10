@@ -64,5 +64,8 @@ twelve-shard run, which at the time was queueing behind that branch. The number
 to beat is 466.1 s against an even split of 369.1 s, on a profile that is
 already accurate — so the A/B needs no new measurement of anything else.
 
-Beside it, and larger: `specs/issues/build/every-shard-rebuilds-the-whole-tree.md`
-is 435 s of the same critical path.
+Beside it, and larger, was the 435 s of `cargo build` every shard paid. Measured
+and mostly recovered on 2026-08-10 by a restored `target/` (`specs/ci-plan.md`
+§12.5), which leaves this one the largest item on the critical path that belongs
+to the harness rather than to the machine. The second CI task did not have
+`tests/toyos.rs` either.
