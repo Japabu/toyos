@@ -139,7 +139,7 @@ So:
   bonus.
 - Nothing at all → **B or C**, which the build below then separates.
 
-**Then the one reflash: `cargo run -- --build-only --kernel-feature heartbeat`,
+**Then the one reflash: `cargo run -- --build-only --kernel-param heartbeat`,
 and flash `target/bootable.img`.** The *ordinary* image and not `--diag-boot`:
 the freeze happens with the desktop up, and the diagnostic image has no
 compositor, so it is a different workload and would not be a re-run of these

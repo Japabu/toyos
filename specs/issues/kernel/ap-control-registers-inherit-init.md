@@ -49,7 +49,7 @@ same boot answered `11000/10000/5000` with byte-identical registers, a fourfold
 spread that is the host's scheduling rather than the guest's.
 
 **The instrument is built and has never been run on silicon.**
-`cargo run -- --diag-boot --kernel-feature control-regs-bench --build-only`,
+`cargo run -- --diag-boot --kernel-param control-regs-bench --build-only`,
 flash, and read the per-CPU rows off the panel; cpu0's row is the control,
 because it arrives with caching already on, and every AP's `pre` against its own
 `warm` is the number. Nothing shorter reaches it: there is no CPU affinity, so

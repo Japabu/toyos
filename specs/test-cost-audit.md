@@ -447,22 +447,27 @@ target lock, so it needs 31 separate target dirs, and `kernel/target` measures
 **7.4 GB**. There is 111 GB free. **Not viable.** Recorded so nobody re-derives
 it.
 
-### 3.6 One runtime-actuator kernel instead of 31 feature kernels — **owner's call, not recommended**
+### 3.6 One runtime-actuator kernel instead of 45 feature kernels — **taken, 2026-08-10**
 
-Replacing the 31 compile-time feature sets with one kernel carrying every
-actuator behind `SYS_DEBUG` actions would cut the cold-rebuild cost (§1.5) from
-124–155 s to near zero.
+Replacing the compile-time feature sets with one kernel carrying every actuator
+behind a boot parameter cuts the cold-rebuild cost (§1.5, §5.9.2) from 45 kernel
+builds to two.
 
-**It is a coverage trade, not a cost optimisation, which is why it is the
-owner's.** Today the binary under test is the shipping kernel plus one switch.
-Several of these features do not merely inject a value — `xhci-deaf-controller`,
-`i8042-fadt-denial`, `test-tiny-va`, `test-heap-ceiling`, `usb-flush-fails`
-change which path runs, and some exist precisely to make the shipping path fail.
-A runtime-selected actuator kernel is a *different binary* with dead branches
-the shipping one does not have, and CLAUDE.md's rule that "a feature that merely
-re-states what the code does is not an actuator" cuts against collapsing them.
+**It was presented as a coverage trade and not recommended**, on the grounds
+that a runtime-selected actuator kernel is *a different binary with dead
+branches the shipping one does not have*. **The owner took it on 2026-08-10, and
+the split is what answers the objection**: the dead branches are in the test
+kernel, which never ships, and without `boot-actuators` every accessor is
+`const fn … { false }` — so the shipping kernel has no branch, no arm set and no
+name in it, and `assert_no_actuators` refuses to write an image where it does.
 
-Presented, priced, **not recommended.**
+That is strictly better than what it replaced. Before, 45 near-shipping kernels
+each differed from the shipped binary in one *live* path and the shipped binary
+was booted by one boot in the suite; now it is booted by every boot that does
+not need a perturbation, which is most of them.
+
+§5.9.7 is what was built, what it cost, and the one actuator that kept its own
+build.
 
 ### 3.7 Selective test running — **owner's call, and the audit's position is no**
 
@@ -1028,12 +1033,12 @@ written.** `test-heap-ceiling` is not inert — it also moves
 shipped bound. And folding *into every image* meant no test had ever booted the
 kernel an image ships. Read §5.9 for the sweep that replaces this table.
 
-**The owner's "collapse toward a handful" needs §3.6, and this is not it.** The
-other twenty-seven each change a path a boot takes; unioning any two of them
-gives a kernel where both subsystems are broken, and every one of these tests
-boots a whole machine. Making them runtime-selected is §3.6 — a different binary
-with dead branches the shipping one does not have — and stays the owner's call
-and not recommended.
+**The whole of this table is superseded.** Its criterion — is a kernel carrying
+the feature identical to one that does not — was the right question for a world
+where a feature was a build. Since 2026-08-10 an actuator is a *boot parameter*
+and the question does not arise: one test kernel carries all 47, arms whichever
+the parameter names, and the shipping kernel carries none of them at all. Read
+§5.9.7 for what replaced it, and §3.6 for the trade the owner took.
 
 ### 5.4.4 Ledger 2 — coverage
 
@@ -1825,6 +1830,13 @@ in the initrd busts the initrd memo once per parameter set, the kernel cannot
 mount the ESP itself until long after the earliest arm has to fire, and
 overloading `init_program_addr` is a sentinel by another name.
 
+**Built on 2026-08-10 and §5.9.7 is the record.** Two things the design above
+did not have: `name=value` was dropped — every one of the 47 is a boolean and a
+signature that parses a value nothing supplies is a promise the code does not
+keep — and the feature that carries the parser is `boot-actuators`, separate
+from `test-actuators`, so a diagnostic image the owner flashes can arm
+`heartbeat` without also gaining a debug syscall.
+
 ### 5.9.6 What the sweep found beyond the brief
 
 - **`wall_clock_refusals` is five boots and five kernel builds in one
@@ -1839,3 +1851,97 @@ overloading `init_program_addr` is a sentinel by another name.
 - **`toyos-abi`'s `debug` wrapper still documents actions 0–3 as if they were
   always there.** Left alone deliberately: touching `toyos-abi/src` for a comment
   would make this an ABI branch and claim the sysroot.
+
+### 5.9.7 Wave 9: two kernels
+
+The owner took §3.6 on 2026-08-10. What landed:
+
+- **`kernel/src/actuator.rs` declares all 47 actuators** — the wire name, the
+  accessor the kernel calls, and the claim each rests on, which is the comment
+  `kernel/Cargo.toml` used to carry. `kernel/Cargo.toml` is left with six
+  features and a test that says so by name.
+- **`boot-actuators` is what a build decides about them, and nothing else.**
+  With it: a `NAMES` table, one `AtomicU64`, and an accessor per actuator that
+  is a plain relaxed load. Without it: no table, no word, no parser, and every
+  accessor is `#[inline(always)] const fn … { false }` — so `vma::alloc_floor`,
+  both disk-cache ceilings, `log_file::max_log_bytes` and the i8042's report
+  length fold to the constants they were, and `init` *refuses* a non-empty
+  parameter rather than ignoring one.
+- **`test-actuators` stays separate**, because a diagnostic image the owner
+  flashes wants `heartbeat` and `diag-tick` and must not also gain `SYS_DEBUG`.
+- **The parameter rides `KernelArgs`** (§5.9.5), parsed at the top of
+  `kernel_main` after `serial::init` and before `test-early-panic`'s site, which
+  is the earliest of the 47. It is our own image builder's string through our
+  own bootloader, so an unknown token panics by name: no trust boundary is
+  crossed anywhere on that path.
+- **`assert_no_actuators` refuses to write a shipping image whose kernel binary
+  names an actuator**, in `assert_overflow_checked`'s place and for its reason.
+  The names come from `kernel/src/actuator.rs`, so deleting one takes its
+  command lines with it, exactly as `declared_kernel_features` does for a
+  feature.
+- **A run counts its own kernels.** `qemu::boot_census` returns the set, the
+  runner prints it, and `DECLARED_KERNEL_BUILDS` refuses a boot that asks for a
+  build outside the three.
+
+#### The count
+
+**45 before, from a static enumeration of every `kernel_features` site in
+`tests/toyos.rs` and `tests/common/*.rs` and the constants behind them** — which
+is §5.9.2's number, re-derived independently here. Two things a partial scan
+gets wrong and are worth writing down: the count is not reachable from
+`tests/toyos.rs` alone (nineteen of the sets are constants in `tests/common/`),
+and four of the sets name **two** actuators — `usb-storage-gate` with each of
+`usb-short-read`, `xhci-slow-connect` and `usb-transport-break`, and
+`rtc-no-century` with `rtc-century-next`.
+
+**Three after**, and the third is declared:
+
+| build | who asks | why it is not one of the other two |
+|---|---|---|
+| `""` | every test that needs no perturbation, `cargo run`, every image | it is what ships |
+| `boot-actuators,test-actuators` | every actuator test, and the `SYS_DEBUG` shared boot | the actuators, and the debug syscall |
+| `fpu-save-nothing` | `fpu_isolation_negative` | below |
+
+`fpu-save-nothing` empties `arch::entry`'s save/restore bracket, which is
+`naked_asm!` expanded into every ring-transition stub. A boot parameter there is
+a branch on the path the gate is about, in a binary the shipping one no longer
+resembles — the gate would then certify a bracket nothing ships. It keeps its
+build and `kernel/Cargo.toml` says so where it is declared.
+
+Two more features remain and neither is a build a `cargo test` makes:
+`sched-check` forwards to `toyos-sched/check`, a dependency's cargo feature that
+no runtime value can reach, and `debug-wait` is what `cargo run -- --debug`
+compiles in — a parameter would have to put it in the shipping kernel, and what
+`--debug` exists to debug is the kernel an image ships.
+
+#### What the negative gates still prove
+
+The owner asked for this walk by name, because a gate whose actuator moved into
+the test kernel now proves that the *test* kernel's verdict has teeth. That is
+acceptable only where the verdict is shipping code and only the actuator is
+test-only.
+
+| gate | the verdict under test | the actuator | after |
+|---|---|---|---|
+| `control_regs_negative` | `control_regs`' per-CPU line and its two assertions | skip the two register writes on an AP | **unchanged in kind.** The verdict is shipping source; `control_regs` and `control_regs_verdict` run it on the shipping *binary* |
+| `iommu_context_absent`, `iommu_empty_domain` | the DMA-fault handler and its report | leave one function out of the root table / give it an empty domain | **unchanged in kind**, same reason |
+| `xhci_deaf_controller`, `xhci_deaf_port` | `settles`' deadline and refusal | starve one register wait | **unchanged in kind** |
+| `i8042_fault` | the ISR's 16-byte bound and the quarantine path | make the output-buffer check lie | **unchanged in kind** |
+| `fpu_isolation_negative` | `arch::entry`'s bracket | empty it | **unchanged, and that is why it kept its build** |
+
+**What is genuinely weaker, stated rather than papered over.** Each of the four
+"unchanged in kind" rows certifies the verdict *as compiled into the test
+kernel*. That binary carries branches the shipping one does not — `if
+actuator::x()` at every site, folded away in the shipping build — so its
+inlining and layout are not the shipping binary's. For a verdict that is a
+comparison or a log line this is not a difference anybody can name; for one that
+is a *duration*, it is. None of the five is timed. The positive halves
+(`control_regs`, `control_regs_verdict`, `fpu_isolation`, the ordinary xHCI and
+i8042 boots) all run on the shipping kernel, which is the coverage that actually
+moved and it moved the right way.
+
+**One thing this change gives up and nothing replaces.** Before, a boot with an
+actuator was the shipping kernel plus one live path; nothing now checks that the
+test kernel with *nothing* armed behaves as the shipping kernel does. The
+`SYS_DEBUG` shared boot is that machine and 150 tests do not run on it, so a
+divergence would show as a broad red rather than a named one.

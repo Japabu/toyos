@@ -56,17 +56,17 @@ bug that has produced every metal-track blocker so far.
 
 The crowded-USB config is built: `Profile::MetalUsb` is metal-sim with six
 devices on the xHCI, two of them keyboards, and it cost two boots, one extra
-kernel build and no new instrument. The extra build is the shortage config's:
-a distinct `kernel_features` set is a distinct cargo fingerprint, so budget one
-rebuild per feature-carrying config, not one boot. It also fixed the shape of
+kernel build and no new instrument. The extra build was the shortage
+config's, when an actuator was still a cargo feature; since
+`specs/test-cost-audit.md` §5.9.7 it is a boot parameter and costs no build at
+all. It also fixed the shape of
 the assertion — the driver logs the DMA offset of each device's interrupt ring
 and the block count it derived, so "these two devices are independent" and "this
 number came from HCSPARAMS" are both text assertions rather than hopes. One
 caveat it recorded: a *shortage*
 scenario is not always host-stageable. QEMU's `nec-usb-xhci,slots=N` does not
 reach HCSPARAMS1 and its Enable Slot ignores the MaxSlotsEn the driver writes,
-so the exhaustion path needs a kernel feature (`xhci-one-slot`) as its
-actuator. Check that the actuator exists before promising the config.
+so the exhaustion path needs an actuator (`xhci-one-slot`). Check that the actuator exists before promising the config.
 
 Protocol depth comes second, and only where the device is load-bearing: storage
 (data loss is unrecoverable) and network (gate N).
