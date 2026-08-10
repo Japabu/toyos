@@ -244,6 +244,18 @@ impl Connection {
         self.send(msg_type, payload)
     }
 
+    /// [`send_with_handles`](Self::send_with_handles) for a message whose
+    /// payload is a byte blob rather than a fixed struct.
+    pub fn send_bytes_with_handles(
+        &self,
+        handles: &[RawHandle],
+        msg_type: u32,
+        data: &[u8],
+    ) -> Result<(), IpcError> {
+        syscall::handle_send(self.fd(), handles).map_err(IpcError::Syscall)?;
+        self.send_bytes(msg_type, data)
+    }
+
     /// Take the batch the peer sent with the frame just received.
     ///
     /// Never blocks. An empty answer for a frame that promised handles is a

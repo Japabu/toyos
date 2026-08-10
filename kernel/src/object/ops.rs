@@ -22,7 +22,7 @@ use crate::{device as device_registry, keyboard, mouse};
 
 use super::device::DeviceClaim;
 use super::file::{FileObject, OpenFileState};
-use super::handle::{HandleEntry, HandleError, HandleTable};
+use super::handle::{HandleEntry, HandleTable};
 use super::KObjectRef;
 
 /// What a freshly created object's one handle carries.
@@ -68,13 +68,19 @@ pub fn initial_rights(object: &KObjectRef) -> Rights {
         // `READ` is what resolving a name through it takes, and what narrowing
         // one into a child's takes.
         KObjectRef::Namespace(_) => Rights::DUP.union(Rights::TRANSFER).union(Rights::READ),
+        // `WAIT` takes the exit code, `MANAGE` kills, `READ` samples the
+        // accounting. A spawner gets all three, and narrows on the way to
+        // whoever it hands the process on to.
+        KObjectRef::Process(_) => BASE.union(Rights::READ).union(Rights::MANAGE),
     }
 }
 
 /// Install a new object at the next free slot, with the rights its type gets.
 pub fn install(table: &mut HandleTable, object: KObjectRef) -> Result<RawHandle, SyscallError> {
     let rights = initial_rights(&object);
-    table.install(HandleEntry::new(object, rights)).map_err(HandleError::to_syscall_error)
+    table
+        .install(HandleEntry::new(object, rights))
+        .map_err(|_| SyscallError::ResourceExhausted)
 }
 
 /// A file opened at `path`, installed in `table`.
@@ -150,7 +156,7 @@ pub fn open(table: &mut HandleTable, path: &str, flags: OpenFlags) -> u64 {
     }
     match table.install(HandleEntry::new(object, rights)) {
         Ok(h) => h.0 as u64,
-        Err(e) => e.to_u64(),
+        Err(_) => SyscallError::ResourceExhausted.to_u64(),
     }
 }
 
@@ -166,11 +172,12 @@ pub fn open(table: &mut HandleTable, path: &str, flags: OpenFlags) -> u64 {
 /// handle rather than with the process. [`close_all`] needs no such argument —
 /// its only caller is process teardown, which destroys the address space the
 /// windows are in.
-pub fn close(table: &mut HandleTable, h: RawHandle, pipe_maps: &mut Vec<PipeMap>) -> u64 {
-    let entry = match table.remove(h) {
-        Ok(entry) => entry,
-        Err(e) => return e.to_u64(),
-    };
+pub fn close(
+    table: &mut HandleTable,
+    h: RawHandle,
+    pipe_maps: &mut Vec<PipeMap>,
+) -> Result<(), super::HandleError> {
+    let entry = table.remove(h)?;
     let object = entry.object().clone();
     // The decrement — and the deferred hook it may enqueue — happen here, with
     // the table's own borrow already given up.
@@ -189,7 +196,7 @@ pub fn close(table: &mut HandleTable, h: RawHandle, pipe_maps: &mut Vec<PipeMap>
     if sources.iter().any(|s| s.is_some()) {
         crate::io_uring::remove_fd(&sources);
     }
-    0
+    Ok(())
 }
 
 /// Release every handle a process holds. Called by exit *and by kill*, so the
@@ -210,7 +217,7 @@ pub fn pipe_id_read(object: &KObjectRef) -> Option<PipeId> {
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
-        | KObjectRef::SharedMem(_) => None,
+        | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
     }
 }
 
@@ -222,7 +229,7 @@ pub fn pipe_id_write(object: &KObjectRef) -> Option<PipeId> {
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
-        | KObjectRef::SharedMem(_) => None,
+        | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
     }
 }
 
@@ -243,7 +250,7 @@ pub fn read_source(object: &KObjectRef) -> Option<Source> {
         KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
-        | KObjectRef::SharedMem(_) => None,
+        | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
     }
 }
 
@@ -255,7 +262,7 @@ pub fn write_source(object: &KObjectRef) -> Option<Source> {
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
-        | KObjectRef::SharedMem(_) => None,
+        | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
     }
 }
 
@@ -405,7 +412,7 @@ pub fn try_read(object: &KObjectRef, buf: &mut UserBytesMut) -> Option<u64> {
         KObjectRef::PipeWrite(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
-        | KObjectRef::SharedMem(_) => Some(SyscallError::PermissionDenied.to_u64()),
+        | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => Some(SyscallError::PermissionDenied.to_u64()),
     }
 }
 
@@ -462,7 +469,8 @@ pub fn try_write(object: &KObjectRef, buf: &UserBytes) -> Option<u64> {
         }
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
         | KObjectRef::IoUring(_) | KObjectRef::SharedMem(_) | KObjectRef::SysCap(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => {
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::Process(_) => {
             Some(SyscallError::PermissionDenied.to_u64())
         }
     }
@@ -523,7 +531,8 @@ pub fn fstat(object: &KObjectRef) -> Stat {
             mtime: 0,
         },
         KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => plain(FileType::Unknown),
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::Process(_) => plain(FileType::Unknown),
         KObjectRef::Device(d) => plain(match d.class() {
             device_registry::DeviceType::Keyboard => FileType::Keyboard,
             device_registry::DeviceType::Mouse => FileType::Mouse,
@@ -591,7 +600,7 @@ pub fn has_data(object: &KObjectRef) -> bool {
         },
         KObjectRef::PipeWrite(_) | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
-        | KObjectRef::SharedMem(_) => false,
+        | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => false,
     }
 }
 
@@ -603,7 +612,7 @@ pub fn has_space(object: &KObjectRef) -> bool {
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
         | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
-        | KObjectRef::SharedMem(_) => false,
+        | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => false,
     }
 }
 
@@ -626,6 +635,7 @@ pub fn mark_tty(object: &KObjectRef) -> u64 {
         KObjectRef::Connection(_) | KObjectRef::File(_) | KObjectRef::Device(_)
         | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
         | KObjectRef::SysCap(_) | KObjectRef::SharedMem(_)
-        | KObjectRef::Connector(_) | KObjectRef::Namespace(_) => SyscallError::InvalidArgument.to_u64(),
+        | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
+        | KObjectRef::Process(_) => SyscallError::InvalidArgument.to_u64(),
     }
 }

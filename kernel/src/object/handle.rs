@@ -15,13 +15,25 @@ use toyos_abi::syscall::SyscallError;
 
 use super::{KObjectRef, KObjectVariant};
 
+/// The table has no slot left. The one failure of an *install*, which is why it
+/// is its own type: [`HandleError::refuse`] may take the process down, and the
+/// object layer installs under the process's own lock where it may not be
+/// called. A type with one state cannot carry a kind that kills.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TableFull;
+
 /// Why a handle did not resolve.
 ///
-/// Three of these are userland bugs and one is not: a process may legitimately
-/// hold an attenuated handle and probe what it can do with it, so `Rights` is
-/// an error return for ever. The other three become a kill in chunk 7 —
-/// naming a handle you do not hold is a bug in the namer, and fail-fast is for
-/// bugs.
+/// **Three of these are bugs in the process that named the handle and two are
+/// not.** A process may legitimately hold an attenuated handle and probe what
+/// it can do with it, so `Rights` is an error return for ever, and a table with
+/// no room is a resource limit. `BadHandle`, `Stale` and `WrongType` are
+/// different: a handle is a local name a process was given, so naming one it
+/// does not hold — or asking a pipe to accept a connection — is not something a
+/// correct program can do. Fail-fast is for bugs, so [`refuse`] takes the
+/// process down for those three rather than handing back a word it can ignore.
+///
+/// [`refuse`]: Self::refuse
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HandleError {
     /// Out of range, or an empty slot.
@@ -35,16 +47,75 @@ pub enum HandleError {
 }
 
 impl HandleError {
-    pub fn to_syscall_error(self) -> SyscallError {
-        match self {
-            Self::BadHandle | Self::Stale => SyscallError::NotFound,
-            Self::WrongType { .. } | Self::Rights { .. } => SyscallError::PermissionDenied,
-            Self::TableFull => SyscallError::ResourceExhausted,
-        }
+    /// Answer this failure at the syscall boundary.
+    ///
+    /// **Call it with nothing held.** For the three kinds that are a bug in the
+    /// caller it does not come back: it tears the process down where it stands,
+    /// which needs the process's own lock, the table lock and the VFS lock.
+    /// Every producer therefore carries the error *out* of whatever guard
+    /// resolved the handle and refuses it there.
+    pub fn refuse(self) -> u64 {
+        self.refuse_as_error().to_u64()
     }
 
-    pub fn to_u64(self) -> u64 {
-        self.to_syscall_error().to_u64()
+    /// [`refuse`](Self::refuse) for a call site whose answer is a `Result`. The
+    /// same rule: nothing held.
+    pub fn refuse_as_error(self) -> SyscallError {
+        match self {
+            Self::Rights { .. } => SyscallError::PermissionDenied,
+            Self::TableFull => SyscallError::ResourceExhausted,
+            fault => crate::process::handle_fault(fault),
+        }
+    }
+}
+
+/// A refusal on its way out of the guard that produced it.
+///
+/// A syscall that resolves handles under the process's own lock cannot answer a
+/// [`HandleError`] where it finds one — [`HandleError::refuse`] may take the
+/// process down, which needs that lock. So the closure hands back one of these
+/// and the caller refuses it with nothing held. The `From` impls are what make
+/// `?` inside such a closure work for both halves.
+pub enum Refusal {
+    Handle(HandleError),
+    Error(SyscallError),
+}
+
+impl Refusal {
+    /// See [`HandleError::refuse`]: nothing held.
+    pub fn refuse(self) -> u64 {
+        match self {
+            Self::Handle(e) => e.refuse(),
+            Self::Error(e) => e.to_u64(),
+        }
+    }
+}
+
+impl From<HandleError> for Refusal {
+    fn from(e: HandleError) -> Self {
+        Self::Handle(e)
+    }
+}
+
+impl From<SyscallError> for Refusal {
+    fn from(e: SyscallError) -> Self {
+        Self::Error(e)
+    }
+}
+
+impl core::fmt::Display for HandleError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BadHandle => write!(f, "no such handle"),
+            Self::Stale => write!(f, "a handle closed at an earlier generation"),
+            Self::WrongType { held, wanted } => {
+                write!(f, "a {held} where the call takes a {wanted}")
+            }
+            Self::Rights { held, needed } => {
+                write!(f, "rights {:#x} where the call needs {:#x}", held.bits(), needed.bits())
+            }
+            Self::TableFull => write!(f, "no free handle slot"),
+        }
     }
 }
 
@@ -164,7 +235,7 @@ impl HandleTable {
         self.free.len() + (MAX_HANDLES - self.slots.len()) >= n
     }
 
-    pub fn install(&mut self, entry: HandleEntry) -> Result<RawHandle, HandleError> {
+    pub fn install(&mut self, entry: HandleEntry) -> Result<RawHandle, TableFull> {
         if let Some(slot) = self.free.pop() {
             let s = &mut self.slots[slot as usize];
             debug_assert!(s.entry.is_none(), "a live slot was on the free list");
@@ -172,7 +243,7 @@ impl HandleTable {
             return Ok(RawHandle::new(slot, s.generation));
         }
         if self.slots.len() >= MAX_HANDLES {
-            return Err(HandleError::TableFull);
+            return Err(TableFull);
         }
         let slot = self.slots.len() as u16;
         self.slots.push(Slot { generation: 0, entry: Some(entry) });
@@ -189,13 +260,13 @@ impl HandleTable {
         &mut self,
         slot: u16,
         entry: HandleEntry,
-    ) -> Result<(RawHandle, Option<HandleEntry>), HandleError> {
+    ) -> Result<(RawHandle, Option<HandleEntry>), TableFull> {
         let slot_index = slot as usize;
         // `MAX_HANDLES` **is** the slot range, so a slot past the end is the
         // table's cap rather than a malformed argument, and the caller sees the
         // same `ResourceExhausted` the allocating path gives it.
         if slot_index >= MAX_HANDLES {
-            return Err(HandleError::TableFull);
+            return Err(TableFull);
         }
         while self.slots.len() <= slot_index {
             self.free.push(self.slots.len() as u16);
@@ -276,7 +347,7 @@ impl HandleTable {
         rights: Rights,
     ) -> Result<RawHandle, HandleError> {
         let entry = self.entry_of(h)?.duplicate(rights)?;
-        self.install(entry)
+        self.install(entry).map_err(|TableFull| HandleError::TableFull)
     }
 
     /// What a handle carries, for a caller about to duplicate it unchanged.

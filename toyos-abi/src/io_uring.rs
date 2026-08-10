@@ -6,7 +6,10 @@ pub const IORING_OP_NOP: u8 = 0;
 pub const IORING_OP_POLL_ADD: u8 = 1;
 pub const IORING_OP_POLL_REMOVE: u8 = 2;
 pub const IORING_OP_ACCEPT: u8 = 3;
-pub const IORING_OP_CLOSE: u8 = 4;
+// Op code 4 unused (formerly IORING_OP_CLOSE). It had no submitter anywhere —
+// not in the SDK, not in userland, not in mio — and it was the one handle path
+// that could not obey the bad-handle policy: it runs under the ring's own lock,
+// where taking the process down is not available.
 
 /// Poll interest flags for IORING_OP_POLL_ADD (stored in sqe.op_flags).
 pub const IORING_POLL_IN: u32 = 1;

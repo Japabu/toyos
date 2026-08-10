@@ -10,7 +10,7 @@ use toyos_abi::FramebufferInfo;
 
 use crate::device::{Claim, DeviceType};
 
-use super::handle::{HandleEntry, HandleError, HandleTable};
+use super::handle::{HandleEntry, HandleTable};
 use super::shm::SharedMemObject;
 use super::{Held, KObjectRef, KObjectVariant, ObjectCore, ZeroHandles};
 
@@ -52,7 +52,7 @@ fn install_buffer(
 ) -> Result<RawHandle, SyscallError> {
     table
         .install(HandleEntry::new(KObjectRef::SharedMem(buffer.clone()), BUFFER_RIGHTS))
-        .map_err(HandleError::to_syscall_error)
+        .map_err(|_| SyscallError::ResourceExhausted)
 }
 
 impl DeviceInfo {

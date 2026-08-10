@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 
 use crate::arch::entry::{initial_user_state, ring3_trampoline_asm};
-use crate::object::{HandleError, HandleTable};
+use crate::object::{HandleTable, Refusal};
 use crate::process::{
     fd_owner_data, Endowments, OwnedAlloc, ENDOW_ENTRY_LEN, KERNEL_STACK_SIZE,
 };
@@ -123,12 +123,12 @@ pub fn build_child_handles(
     slot_map: &UserBytes,
     endow: &UserBytes,
     labels: &[u8],
-) -> Result<(HandleTable, Endowments), SyscallError> {
+) -> Result<(HandleTable, Endowments), Refusal> {
     if endow.len() / ENDOW_ENTRY_LEN > MAX_ENDOWMENTS {
-        return Err(SyscallError::InvalidArgument);
+        return Err(SyscallError::InvalidArgument.into());
     }
     if labels.len() > MAX_LABELS_LEN {
-        return Err(SyscallError::InvalidArgument);
+        return Err(SyscallError::InvalidArgument.into());
     }
     let data_arc = fd_owner_data();
     let mut data = data_arc.lock();
@@ -147,15 +147,12 @@ pub fn build_child_handles(
         // refusal is by name rather than a skip, which would start the child
         // without a handle it asked for — the endowment vector below is the
         // move that *can* carry one.
-        let entry = data
-            .handles
-            .duplicate_entry(parent, rights)
-            .map_err(HandleError::to_syscall_error)?;
+        let entry = data.handles.duplicate_entry(parent, rights)?;
         let slot = u16::try_from(child_slot)
             .map_err(|_| SyscallError::ResourceExhausted)?;
         let (_, displaced) = handles
             .install_at(slot, entry)
-            .map_err(HandleError::to_syscall_error)?;
+            .map_err(|_| SyscallError::ResourceExhausted)?;
         drop(displaced);
     }
 
@@ -171,14 +168,14 @@ pub fn build_child_handles(
             .checked_add(label_len as usize)
             .ok_or(SyscallError::InvalidArgument)?;
         if end > labels.len() {
-            return Err(SyscallError::InvalidArgument);
+            return Err(SyscallError::InvalidArgument.into());
         }
         // Verified against the *parent's* rights here and removed below, so a
         // handle that is missing `TRANSFER` refuses the spawn rather than
         // leaving the child a hole where its parent said a capability would be.
-        let rights = data.handles.rights_of(handle).map_err(HandleError::to_syscall_error)?;
+        let rights = data.handles.rights_of(handle)?;
         if !rights.contains(Rights::TRANSFER) {
-            return Err(SyscallError::PermissionDenied);
+            return Err(SyscallError::PermissionDenied.into());
         }
         moving.push((EndowEntry { label_off, label_len, handle, _pad: 0 }, handle));
     }
@@ -186,7 +183,7 @@ pub fn build_child_handles(
     // gives any up: an install that failed halfway would have moved a handle
     // out of a table that is about to be told the spawn did not happen.
     if !handles.has_room(moving.len()) {
-        return Err(SyscallError::ResourceExhausted);
+        return Err(SyscallError::ResourceExhausted.into());
     }
 
     let mut entries = Vec::with_capacity(moving.len());

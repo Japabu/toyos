@@ -25,7 +25,7 @@ use crate::port::{Acceptor, Connector};
 use crate::syscap::SysCap;
 use crate::{Device, OwnedHandle, RawHandle};
 
-pub use toyos_abi::syscall::{DEV_PREFIX, SERVE_PREFIX, SVC_LABEL, SYSCAP_LABEL};
+pub use toyos_abi::syscall::{DEV_PREFIX, PROVIDE_PREFIX, SERVE_PREFIX, SVC_LABEL, SYSCAP_LABEL};
 
 /// Why a service name did not become a connection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -162,6 +162,28 @@ pub fn service(name: &str) -> Result<Connection, EndowError> {
 /// have taken the name and no name to take.
 pub fn acceptor(name: &str) -> Option<Acceptor> {
     with_prefixed(SERVE_PREFIX, name, |label| Endowments::get().take::<Acceptor>(label))
+}
+
+/// Every connector a launching client transferred, taken out of the table.
+///
+/// **What makes a `provides` name forwardable.** A namespace hands back
+/// connections; this hands back the connector itself, so a shell can give its
+/// own children the surface its terminal gave it — and it is a `take`, so the
+/// caller owns exactly one and duplicates for each child.
+pub fn provided(labels: &mut [Option<(&'static str, Connector)>]) -> usize {
+    let table = Endowments::get();
+    let mut n = 0;
+    for i in 0..table.count {
+        let label = table.label_at(i);
+        let Some(name) = label.strip_prefix(PROVIDE_PREFIX) else { continue };
+        if n == labels.len() {
+            break;
+        }
+        let Some(connector) = table.take::<Connector>(label) else { continue };
+        labels[n] = Some((name, connector));
+        n += 1;
+    }
+    n
 }
 
 /// The claim for a device class the manifest says this program gets.

@@ -238,7 +238,7 @@ pub fn exit_current(code: i32) -> ! {
         let table = guard.as_mut().unwrap();
         let tid = percpu::current_tid().unwrap();
         let pid = percpu::current_pid().unwrap();
-        process::zombify_tid(table, pid, tid, code);
+        process::mark_thread_zombie(table, pid, tid, code);
     }
     driver::pass(Dispose::Exit);
     unreachable!("exit_current: returned from the exit pass");
@@ -416,11 +416,15 @@ pub fn poison_tid(id: TaskId) {
 /// them. Called from the idle loop, which is the one context that provably
 /// holds none of the locks the panicking thread may have been holding.
 pub(crate) fn reap_poisoned() {
-    let mut wakes = [None; MAX_CPUS];
+    let mut wakes: [Option<process::PoisonWake>; MAX_CPUS] = [const { None }; MAX_CPUS];
+    // Both are dropped after the guard: an entry's drop reaches
+    // `remove_vruntime`, and a process whose teardown never ran still holds its
+    // whole `ProcessData` here.
+    let reaped;
     {
         let mut guard = process::PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
-        process::collect_orphan_zombies(table, unsafe { process::IdleProof::new_unchecked() });
+        reaped = process::reap_finished(table, unsafe { process::IdleProof::new_unchecked() });
         for (slot, wake) in POISONED.iter().zip(wakes.iter_mut()) {
             let raw = slot.load(Ordering::Relaxed);
             if raw == u64::MAX {
@@ -431,8 +435,20 @@ pub(crate) fn reap_poisoned() {
             slot.store(u64::MAX, Ordering::Relaxed);
         }
     }
-    for (pid, tid) in wakes.into_iter().flatten() {
-        wake_task(TaskId(pid, tid));
+    drop(reaped);
+    for wake in wakes.into_iter().flatten() {
+        match wake {
+            process::PoisonWake::Joiner(pid, tid) => wake_task(TaskId(pid, tid)),
+            // The code a killed process gets: nobody asked for this exit, and
+            // the accounting the teardown would have taken was never taken.
+            process::PoisonWake::Process(object) => {
+                let stats = toyos_abi::syscall::ProcessStats {
+                    pid: object.pid().raw(),
+                    ..Default::default()
+                };
+                object.publish_exit(crate::object::process::Exit { code: -1, stats })
+            }
+        }
     }
 }
 

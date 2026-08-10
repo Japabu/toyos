@@ -28,15 +28,19 @@ macro_rules! say {
 }
 
 use std::collections::BTreeMap;
-use std::os::toyos::process::CommandExt;
-use std::process::Command;
+use std::os::toyos::process::{ChildExt, CommandExt};
+use std::process::{Child, Command};
 
 use toyos_manifest::{Manifest, Program};
 use toyos::endow::Endowments;
+use toyos::ipc::Connection;
+use toyos::launch::{self, Request};
 use toyos::namespace::{self, Namespace};
 use toyos::port::{self, Acceptor, Connector};
 use toyos::syscap::SysCap;
-use toyos_abi::syscall::{DeviceType, DEV_PREFIX, SERVE_PREFIX, SVC_LABEL, SYSCAP_LABEL};
+use toyos_abi::syscall::{
+    DeviceType, DEV_PREFIX, PROVIDE_PREFIX, SERVE_PREFIX, SVC_LABEL, SYSCAP_LABEL,
+};
 
 /// The service init answers on. Its own, so it has no `[programs]` row and the
 /// manifest carries it as an `init-serve` record.
@@ -68,11 +72,25 @@ fn main() {
         connectors.insert(name, connector);
     }
 
+    // Kept for the machine's life: init is the only thing that can kill a
+    // daemon, and there is no other way back to a process it started.
+    let mut booted: Vec<Child> = Vec::new();
     for name in &system.start {
         let program = system
             .program(name)
             .unwrap_or_else(|| panic!("init: [boot] start names `{name}`, which is not declared"));
-        start(program, &system, &syscap, &mut acceptors, &connectors);
+        match start(
+            Command::new(&program.path),
+            program,
+            &system,
+            &syscap,
+            &mut acceptors,
+            &connectors,
+            &[],
+        ) {
+            Ok(child) => booted.push(child),
+            Err(e) => panic!("init: cannot start {}: {e}", program.name),
+        }
     }
 
     // Nothing else holds a `serves` acceptor that has not been launched yet, so
@@ -83,29 +101,173 @@ fn main() {
         .expect("init: the manifest declares init serves `launcher`");
     loop {
         match launcher.accept() {
-            // The protocol carries stdio and a `Process` handle, so it needs
-            // handle transfer. Until that lands the connection is refused by
-            // dropping it, which the client reads as a hang-up rather than as
-            // a wait.
-            Ok(_) => say!("init: launcher: no protocol yet, dropping a client"),
+            Ok(conn) => serve_launch(&conn, &system, &syscap, &mut acceptors, &connectors),
             Err(e) => panic!("init: launcher acceptor refused: {e:?}"),
         }
     }
 }
 
-/// Build one program's authority and spawn it holding exactly that.
-fn start(
-    program: &Program,
+/// One `MSG_LAUNCH`, from the frame to the `Process` handle that answers it.
+///
+/// **Everything in the request is a client's claim about itself.** A program
+/// nothing declares is refused by name; a frame that does not decode is a
+/// dropped connection and nothing else. What the child ends up holding is the
+/// manifest's row for it plus whatever connectors the caller transferred, and
+/// the caller could only transfer what it already had — so a launch confers
+/// exactly the manifest row and nothing beyond it.
+fn serve_launch(
+    conn: &Connection,
     system: &Manifest,
     syscap: &SysCap,
     acceptors: &mut BTreeMap<&str, Acceptor>,
     connectors: &BTreeMap<&str, Connector>,
 ) {
+    let Ok(header) = conn.recv_header() else { return };
+    if header.msg_type != launch::MSG_LAUNCH {
+        return;
+    }
+    let mut buf = [0u8; toyos::ipc::MAX_FRAME_LEN as usize];
+    let Ok(len) = conn.recv_bytes(&header, &mut buf) else { return };
+    let mut batch = [toyos::RawHandle(0); toyos_abi::syscall::MAX_TRANSFER_HANDLES];
+    let received = conn.recv_handles(&mut batch).unwrap_or(0);
+    let Some(request) = Request::decode(&buf[..len]) else { return };
+    if received != request.slot_count() + request.extra_count {
+        say!("init: launcher: a frame promising {} handles carried {received}",
+            request.slot_count() + request.extra_count);
+        return;
+    }
+
+    // **Owned before anything can refuse.** The send moved these into init's
+    // table, so every path out of here releases them — a launcher that leaked a
+    // handle per refused launch would exhaust the one table the machine cannot
+    // do without, and a client can refuse as often as it likes.
+    let held = &batch[..received];
+    let (slot_handles, extra_handles) = held.split_at(request.slot_count());
+    let slots = Moved(slot_handles.to_vec());
+    // Owned, so they close when this call returns: `SYS_NAMESPACE_BUILD` copies
+    // a connector into the namespace and leaves the caller's handle, and init's
+    // copy of a client's connector has no life beyond this launch.
+    let extras: Vec<(&str, Connector)> = request
+        .extra_names()
+        .zip(extra_handles.iter().copied())
+        // SAFETY: the kernel moved these into init's table with the frame, and
+        // nothing else answers for them.
+        .map(|(name, handle)| (name, unsafe { Connector::from_raw(handle) }))
+        .collect();
+
+    let Some(program) = declared(system, request.program) else {
+        let _ = conn.send_bytes(launch::MSG_NOT_DECLARED, &[]);
+        return;
+    };
+
     let mut command = Command::new(&program.path);
+    for (slot, handle) in request.slot_numbers().zip(slots.0.iter().copied()) {
+        command.inherit_fd(slot, handle.0);
+    }
+    // **Carried, not inherited.** A child of the launcher would otherwise get
+    // init's environment and init's working directory, so `cd /tmp && ls` would
+    // list `/`. The launcher is a spawn service, not a session.
+    command.env_clear();
+    for entry in request.env.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let Some(eq) = entry.iter().position(|&b| b == b'=') else { continue };
+        if let (Ok(key), Ok(value)) =
+            (std::str::from_utf8(&entry[..eq]), std::str::from_utf8(&entry[eq + 1..]))
+        {
+            command.env(key, value);
+        }
+    }
+    if !request.cwd.is_empty() {
+        command.current_dir(request.cwd);
+    }
+    for arg in request.argv.split(|&b| b == 0).skip(1).filter(|a| !a.is_empty()) {
+        if let Ok(arg) = std::str::from_utf8(arg) {
+            command.arg(arg);
+        }
+    }
+
+    // `inherit_fd` duplicates into the child, so init's own copies go with
+    // `slots` when this returns.
+    let started = start(command, program, system, syscap, acceptors, connectors, &extras);
+    match started {
+        Ok(child) => {
+            let handle = toyos::RawHandle(child.into_raw_handle());
+            if conn
+                .send_bytes_with_handles(&[handle], launch::MSG_LAUNCHED, &[])
+                .is_err()
+            {
+                // **init keeps no `Process` handle from a launch.** A send that
+                // did not happen leaves it holding one, and a client that could
+                // do that in a loop would exhaust the one handle table the whole
+                // machine depends on.
+                toyos_abi::syscall::close(handle);
+            }
+        }
+        Err(e) => {
+            say!("init: launcher: cannot start {}: {e}", program.name);
+            let _ = conn.send_bytes(launch::MSG_REFUSED, &[]);
+        }
+    }
+}
+
+/// Handles a launch moved into init, released on every path out of it.
+///
+/// A `Drop` and not a close at each `return`: there are five ways out of
+/// `serve_launch` and a client picks which one by what it sends.
+struct Moved(Vec<toyos::RawHandle>);
+
+impl Drop for Moved {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            toyos_abi::syscall::close(*handle);
+        }
+    }
+}
+
+/// The `[programs]` row a launch's path names, following one symlink.
+///
+/// `/bin/ls` is a symlink to `/bin/toybox`, and what an applet may hold is
+/// `toybox`'s row: the granularity of least authority is the granularity of the
+/// binary.
+fn declared<'a>(system: &'a Manifest, path: &str) -> Option<&'a Program> {
+    let key = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    if let Some(program) = system.program(&key(path)) {
+        return Some(program);
+    }
+    let target = std::fs::read_link(path).ok()?;
+    system.program(&key(target.to_str()?))
+}
+
+/// Build one program's authority and spawn it holding exactly that.
+///
+/// `extras` are connectors a launching client transferred: names the manifest
+/// cannot know because there is one port per instance of whoever made them —
+/// a terminal's `surface`. They are added *to* the manifest's row rather than
+/// replacing it, and a caller could only transfer what it already held, so a
+/// launch confers the row and nothing beyond it.
+fn start(
+    mut command: Command,
+    program: &Program,
+    system: &Manifest,
+    syscap: &SysCap,
+    acceptors: &mut BTreeMap<&str, Acceptor>,
+    connectors: &BTreeMap<&str, Connector>,
+    extras: &[(&str, Connector)],
+) -> std::io::Result<Child> {
     command.args(&program.args);
 
-    if let Some(ns) = build_namespace(program, system, connectors) {
+    if let Some(ns) = build_namespace(program, system, connectors, extras) {
         command.endow(SVC_LABEL, ns.into_raw().0);
+    }
+
+    // The namespace answers with connections, so a child holding `surface`
+    // only there could never hand `surface` to a child of its own — which is
+    // the terminal → shell → `locale` chain. The connector travels labelled as
+    // well, and a duplicate because the namespace above took one of its own.
+    for (name, connector) in extras {
+        let handed = connector
+            .duplicate()
+            .expect("init: the kernel refused a duplicate of a provided connector");
+        command.endow(&format!("{PROVIDE_PREFIX}{name}"), handed.into_raw().0);
     }
 
     for name in &program.serves {
@@ -150,10 +312,9 @@ fn start(
         command.endow(SYSCAP_LABEL, narrowed.into_raw().0);
     }
 
-    match command.spawn() {
-        Ok(child) => say!("init: started {} pid={}", program.name, child.id()),
-        Err(e) => panic!("init: cannot start {}: {e}", program.name),
-    }
+    let child = command.spawn()?;
+    say!("init: started {}", program.name);
+    Ok(child)
 }
 
 /// The namespace this program's `receives` names.
@@ -166,8 +327,9 @@ fn build_namespace(
     program: &Program,
     system: &Manifest,
     connectors: &BTreeMap<&str, Connector>,
+    extras: &[(&str, Connector)],
 ) -> Option<Namespace> {
-    if program.receives.is_empty() {
+    if program.receives.is_empty() && extras.is_empty() {
         return None;
     }
     let mut builder = namespace::build();
@@ -180,6 +342,11 @@ fn build_namespace(
                 program.name,
             ),
         }
+    }
+    // A `provides` name reaches its holder from whoever made the port, never
+    // from init, and this is where it arrives.
+    for (name, connector) in extras {
+        builder = builder.add(name, connector);
     }
     Some(
         builder

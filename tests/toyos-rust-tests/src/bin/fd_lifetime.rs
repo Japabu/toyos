@@ -232,7 +232,7 @@ fn spawn_with(kind: &str, mut command: Command) -> (Child, BufReader<ChildStdout
 
 /// `Child::kill` is unimplemented in the ToyOS std, so this is the syscall.
 fn kill_and_reap(child: &mut Child) {
-    syscall::kill(toyos_abi::Pid(child.id())).expect("kill the holder");
+    child.kill().expect("kill the holder");
     child.wait().expect("reap the holder");
 }
 

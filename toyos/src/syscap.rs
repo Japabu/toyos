@@ -52,6 +52,18 @@ impl SysCap {
         syscall::dup_narrowed(self.0.fd(), rights).map(|h| Self(OwnedHandle(h)))
     }
 
+    /// A `Process` handle for a pid.
+    ///
+    /// The one place a pid becomes authority over anything, and only a cap
+    /// carrying [`Rights::MANAGE`] reaches it — which in the whole system is
+    /// `/bin/init`'s.
+    pub fn open_process(&self, pid: toyos_abi::Pid) -> Result<crate::process::Process, SyscallError> {
+        let raw = syscall::process_open(self.0.fd(), pid)?;
+        // SAFETY: the kernel installed this handle in this process's table for
+        // this call and no other.
+        Ok(unsafe { crate::process::Process::from_raw(raw) })
+    }
+
     /// Give up ownership, for a handle about to be endowed.
     pub fn into_raw(self) -> RawHandle {
         self.0.into_raw()

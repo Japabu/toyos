@@ -127,7 +127,7 @@ fn main() {
     let placed = (boundary - 8) as *mut SpawnArgs;
     unsafe { placed.write_volatile(args) };
     let err_ = unsafe { syscall::spawn(&*placed) }
-        .map(|pid| panic!("spawn read a straddling SpawnArgs and started {pid:?}"))
+        .map(|h| panic!("spawn read a straddling SpawnArgs and started {h:?}"))
         .unwrap_err();
     assert_eq!(err_, SyscallError::BadAddress, "wrong error for a straddling SpawnArgs");
 
@@ -135,8 +135,8 @@ fn main() {
     //    the boundary and not the argument.
     let fitting = (boundary - core::mem::size_of::<SpawnArgs>() as u64) as *mut SpawnArgs;
     unsafe { fitting.write_volatile(args) };
-    let pid = unsafe { syscall::spawn(&*fitting) }.expect("spawn a SpawnArgs that fits");
-    syscall::waitpid(pid);
+    let child = unsafe { syscall::spawn(&*fitting) }.expect("spawn a SpawnArgs that fits");
+    syscall::process_wait(child).expect("wait for the child that fits");
 
     // 5. `SchedInfo`, 24 bytes the kernel fills. It used to be reached by
     //    casting a validated byte slice to `&mut SchedInfo`, which checked
@@ -156,14 +156,13 @@ fn main() {
     let ret = raw(SYS_SCHED_INFO, boundary - info_len as u64, 0, 0);
     assert!(err(ret).is_none(), "sched_info refused a SchedInfo that ends at the boundary: {ret:#x}");
 
-    // 6. `ProcessStats` is 128 bytes, and the child reaped above left one. The
-    //    snapshot may be read exactly once, so the refusal must not spend it:
-    //    the second call is the assertion that the kernel copies before it
-    //    removes, and it says `NotFound` if that order is reversed.
+    // 6. `ProcessStats` is 128 bytes, and the child waited for above still
+    //    answers for one — the numbers are the object's and the handle outlives
+    //    the process.
     let stats_len = core::mem::size_of::<ProcessStats>();
     let straddling = boundary - 8;
     poison(straddling, stats_len);
-    let ret = raw(SYS_PROCESS_STATS, pid.0 as u64, straddling, stats_len as u64);
+    let ret = raw(SYS_PROCESS_STATS, child.0 as u64, straddling, stats_len as u64);
     assert!(
         intact(boundary, stats_len - 8),
         "process_stats wrote {} bytes past the end of the physical page it translated",
@@ -175,10 +174,10 @@ fn main() {
         "process_stats took a straddling ProcessStats",
     );
 
-    let ret = raw(SYS_PROCESS_STATS, pid.0 as u64, base, stats_len as u64);
+    let ret = raw(SYS_PROCESS_STATS, child.0 as u64, base, stats_len as u64);
     assert!(
         err(ret).is_none(),
-        "process_stats had already spent the snapshot on the call it refused: {ret:#x}",
+        "process_stats refused a ProcessStats that fits: {ret:#x}",
     );
     let wall_ns = unsafe { (base as *const u64).read_volatile() };
     assert!(wall_ns > 0, "process_stats wrote a snapshot with no wall time in it");

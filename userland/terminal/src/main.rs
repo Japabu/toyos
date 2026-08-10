@@ -13,24 +13,11 @@ use std::os::toyos::process::CommandExt;
 use std::process::Command;
 
 use terminal::Console;
-use toyos::namespace;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::port;
 use toyos::surface::{self, Delivery, Host, Notice};
 use toyos::RawHandle;
 use window::Window;
-
-/// What a shell started here reaches, beyond the surface below.
-///
-/// **A list rather than "everything this terminal holds", and it is interim.**
-/// A shell's own authority is `[programs.shell]`'s `receives`, which only
-/// `/bin/init` can act on — and init cannot spawn this shell, because the
-/// `surface` connector is this terminal's and exists nowhere else. Until the
-/// launcher can be asked to start a program *with* a connector the caller
-/// supplies, a terminal can hand its shell only what it holds itself, so this
-/// is the union its children need. A name this terminal does not hold is simply
-/// absent from the result.
-const KEEP_FOR_SHELL: &[&str] = &["compositor", "soundd", "filepicker", "launcher"];
 
 const TOKEN_STDOUT: u64 = 0;
 const TOKEN_STDERR: u64 = 1;
@@ -210,23 +197,21 @@ fn main() {
     child.wait().ok();
 }
 
-/// Start the shell, holding this terminal's surface and nothing this process
-/// was not itself given.
+/// Start the shell: `[programs.shell]`'s own row, plus this terminal's surface.
 ///
-/// The namespace is built rather than inherited: what a shell may reach is a
-/// decision, and the one thing this terminal has that init could not give it is
-/// the `surface` connector for the port above.
+/// **The row is init's to build and the surface is this terminal's to give.**
+/// A shell's authority is a decision the manifest makes, and until the launcher
+/// existed a terminal could hand a child only what it held itself — so it
+/// handed over a hand-written union of its own names. `provide` is the shape
+/// that replaces it: the one connector no manifest can name travels from here,
+/// everything else comes from the declaration, and a name this terminal happens
+/// to hold is no longer a name its shell inherits.
 fn shell(surface: &toyos::port::Connector) -> std::process::Child {
-    let child_ns = namespace::build()
-        .keep(
-            toyos::endow::namespace().expect("terminal: the manifest gives this program `receives`"),
-            KEEP_FOR_SHELL,
-        )
-        .add(surface::SERVICE, surface)
-        .finish()
-        .expect("terminal: the kernel refused a namespace for the shell");
+    let handed = surface
+        .duplicate()
+        .expect("terminal: the kernel refused a duplicate of its own surface connector");
     Command::new("/bin/shell")
-        .endow(toyos::endow::SVC_LABEL, child_ns.into_raw().0)
+        .provide(surface::SERVICE, handed.into_raw().0)
         .stdin(process::tty_piped())
         .stdout(process::tty_piped())
         .stderr(process::tty_piped())

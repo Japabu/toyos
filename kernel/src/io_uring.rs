@@ -108,7 +108,6 @@ pub enum IoUringOp {
     PollAdd,
     PollRemove,
     Accept,
-    Close,
 }
 
 impl IoUringOp {
@@ -118,7 +117,6 @@ impl IoUringOp {
             1 => Ok(Self::PollAdd),
             2 => Ok(Self::PollRemove),
             3 => Ok(Self::Accept),
-            4 => Ok(Self::Close),
             _ => Err(SyscallError::InvalidArgument),
         }
     }
@@ -526,9 +524,6 @@ fn process_sqe(ring_id: RingId, sqe: &IoUringSqe) {
         IoUringOp::Accept => {
             process_accept(ring_id, sqe);
         }
-        IoUringOp::Close => {
-            process_close(ring_id, sqe);
-        }
     }
 }
 
@@ -666,16 +661,6 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
             post_cqe_locked(ring_id, user_data, -(SyscallError::WouldBlock as i32), 0);
         }
     }
-}
-
-fn process_close(ring_id: RingId, sqe: &IoUringSqe) {
-    let user_data = sqe.user_data;
-
-    let result = process::with_fd_owner_data(|data| {
-        ops::close(&mut data.handles, sqe.fd, &mut data.pipe_maps)
-    });
-
-    post_cqe_locked(ring_id, user_data, result as i32, 0);
 }
 
 /// Post a CQE and wake this ring's waiters.

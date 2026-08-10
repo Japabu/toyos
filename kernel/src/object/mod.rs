@@ -32,11 +32,12 @@ pub mod namespace;
 pub mod ops;
 pub mod pipe;
 pub mod port;
+pub mod process;
 pub mod service;
 pub mod shm;
 pub mod syscap;
 
-pub use handle::{HandleEntry, HandleError, HandleTable};
+pub use handle::{HandleEntry, HandleError, HandleTable, Refusal};
 
 /// A resource an object owns and must give back when its **last handle** goes.
 ///
@@ -303,6 +304,10 @@ kobject! {
     // The authority is the rights on the handle, so a handle going away *is*
     // the whole event.
     immediate SysCap => syscap::SysCap,
+    // A process nobody holds a handle to is not a process that should stop. The
+    // last handle going is the loss of the *ability to wait*, and the object
+    // outlives it only for as long as the table entry does.
+    immediate Process => process::ProcessObject,
 }
 
 /// Objects whose last handle has gone, waiting for a context with nothing held.

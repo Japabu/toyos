@@ -19,8 +19,12 @@ pub const SYS_GETCWD: u64 = 21;
 // Syscall number 23 unused (formerly SYS_SET_KEYBOARD_LAYOUT: the kernel has
 // no layout to set — it delivers key transitions and userland translates).
 pub const SYS_PIPE: u64 = 24;
+/// Start a program, endowing it exactly what the caller names. Answers a
+/// `Process` handle — see [`spawn`].
 pub const SYS_SPAWN: u64 = 25;
-pub const SYS_WAITPID: u64 = 26;
+// Syscall number 26 unused (formerly SYS_WAITPID: a pid is not authority over
+// a process, and a pid outlives nothing — the number is reissued. Waiting is
+// [`SYS_PROCESS_WAIT`] on the handle the spawn answered with).
 pub const SYS_MARK_TTY: u64 = 28;
 // Syscall numbers 29-31 unused (formerly SYS_SEND_MSG/SYS_RECV_MSG and
 // SYS_OPEN_DEVICE: first-come claiming, where whoever asked first got the
@@ -62,7 +66,10 @@ pub const SYS_STACK_INFO: u64 = 61;
 pub const SYS_CPU_COUNT: u64 = 62;
 pub const SYS_MMAP: u64 = 63;
 pub const SYS_MUNMAP: u64 = 64;
-pub const SYS_KILL: u64 = 65;
+// Syscall number 65 unused (formerly SYS_KILL: pid-addressed, and gated on
+// being the target's parent — which is a relationship the kernel happened to
+// remember, not a capability anyone was given. [`SYS_PROCESS_KILL`] takes a
+// handle carrying `Rights::MANAGE`).
 pub const SYS_READ_NONBLOCK: u64 = 66;
 pub const SYS_WRITE_NONBLOCK: u64 = 67;
 // Syscall numbers 68 and 70 unused (formerly SYS_PIPE_OPEN and SYS_PIPE_ID: a
@@ -169,9 +176,31 @@ pub const SYS_SHM_MAP: u64 = 106;
 /// Unmap a region from the caller. See [`shm_unmap`].
 pub const SYS_SHM_UNMAP: u64 = 107;
 
-// 108–110 are `SYS_PROCESS_WAIT`/`KILL`/`OPEN` — the process-object chunk.
-// Left as gaps until that chunk adds both the number and its implementation,
-// so no constant here names a syscall the kernel does not answer.
+/// Wait for the process a handle names and take its exit code, gated by
+/// [`Rights::WAIT`]. See [`process_wait`].
+///
+/// **An exit code is a property of the object, not of a table entry**, so this
+/// answers whether or not the process is still around: a spawner that waits a
+/// second time gets the same code, and one that waits for the first time long
+/// after the process is gone gets it too. There is nothing to reap and no
+/// window in which an exit is missed.
+///
+/// [`Rights::WAIT`]: crate::handle::Rights::WAIT
+pub const SYS_PROCESS_WAIT: u64 = 108;
+/// Kill the process a handle names, gated by [`Rights::MANAGE`].
+/// See [`process_kill`].
+///
+/// [`Rights::MANAGE`]: crate::handle::Rights::MANAGE
+pub const SYS_PROCESS_KILL: u64 = 109;
+/// A `Process` handle for a pid, gated by [`Rights::MANAGE`] on a `SysCap`.
+/// See [`process_open`].
+///
+/// The one place a pid becomes authority, and only `/bin/init` holds a cap that
+/// carries the right — so the set of processes that can reach a process they
+/// did not start is exactly what init endowed.
+///
+/// [`Rights::MANAGE`]: crate::handle::Rights::MANAGE
+pub const SYS_PROCESS_OPEN: u64 = 110;
 
 /// Mint a device claim for a class, gated by [`Rights::DEVICE`] on a `SysCap`.
 /// Only `/bin/init` holds such a cap, so the set of processes that can ever
@@ -247,6 +276,16 @@ pub const SVC_LABEL: &str = "svc";
 pub const SERVE_PREFIX: &str = "serve:";
 /// `dev:<class>`: the claim for a device class this program was given.
 pub const DEV_PREFIX: &str = "dev:";
+/// `provide:<name>`: a connector a *launching client* transferred, beside the
+/// namespace entry the launcher made from it.
+///
+/// **Both, and the second is what makes the chain work.** A namespace answers
+/// with connections, not with connectors, so a process holding `surface` only
+/// in its namespace cannot hand `surface` to a child — and the terminal → shell
+/// → `locale` chain is exactly that. The connector arrives labelled as well, so
+/// the holder can pass it on and the child's own manifest row still decides
+/// everything else it gets.
+pub const PROVIDE_PREFIX: &str = "provide:";
 
 /// Endowed `(label, handle)` pairs one spawn may carry. Policy on the
 /// primitive, refused by name, never truncated — the widest manifest row plus
@@ -591,11 +630,16 @@ pub fn get_env(buf: &mut [u8]) -> usize {
 
 /// Spawn a new process. The `SpawnArgs` struct contains argv, fd_map, and env.
 ///
+/// Answers a `Process` handle carrying `WAIT|MANAGE|READ|DUP|TRANSFER`. A
+/// caller that wants nothing to do with the child closes it; a caller that
+/// wants to hand it on transfers it. There is no pid-addressed way back to a
+/// process, so this handle is the whole of what a spawn confers.
+///
 /// # Safety
 /// The raw pointer fields in `SpawnArgs` must point to valid memory.
-pub unsafe fn spawn(args: &SpawnArgs) -> Result<Pid, SyscallError> {
+pub unsafe fn spawn(args: &SpawnArgs) -> Result<RawHandle, SyscallError> {
     check(syscall(SYS_SPAWN, args as *const SpawnArgs as u64, 0, 0, 0))
-        .map(|pid| Pid(pid as u32))
+        .map(|h| RawHandle(h as u32))
 }
 
 /// Read this process's endowment table into `buf`: an `[EndowEntry]` count and
@@ -608,15 +652,31 @@ pub fn endowments(buf: &mut [u8]) -> usize {
     syscall(SYS_ENDOWMENTS, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as usize
 }
 
-/// Wait for process to exit. Returns exit code (blocking).
-pub fn waitpid(pid: Pid) -> u64 {
-    syscall(SYS_WAITPID, pid.0 as u64, 0, 0, 0)
+/// Block until the process `proc` names has exited, and take its exit code.
+pub fn process_wait(proc: RawHandle) -> Result<i32, SyscallError> {
+    check(syscall(SYS_PROCESS_WAIT, proc.0 as u64, 0, 0, 0)).map(|code| code as i32)
 }
 
-/// Wait for process with flags. Returns exit code, or `Err(WouldBlock)` with WNOHANG
-/// if the child has not exited yet.
-pub fn waitpid_flags(pid: Pid, flags: u64) -> Result<u64, SyscallError> {
-    check(syscall(SYS_WAITPID, pid.0 as u64, flags, 0, 0))
+/// The exit code if the process has already exited, `Err(WouldBlock)` if it has
+/// not.
+///
+/// [`WNOHANG`] rather than a syscall of its own: this is the same question with
+/// the wait taken out, and a caller that polls is asking about the same object.
+pub fn process_wait_nonblock(proc: RawHandle) -> Result<i32, SyscallError> {
+    check(syscall(SYS_PROCESS_WAIT, proc.0 as u64, WNOHANG, 0, 0)).map(|code| code as i32)
+}
+
+/// Kill the process `proc` names. Answers `Ok` for one already dead: the
+/// caller asked for it to be gone and it is.
+pub fn process_kill(proc: RawHandle) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_PROCESS_KILL, proc.0 as u64, 0, 0, 0))
+}
+
+/// A `Process` handle for `pid`, presenting a `SysCap` that carries
+/// `Rights::MANAGE`.
+pub fn process_open(syscap: RawHandle, pid: Pid) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_PROCESS_OPEN, syscap.0 as u64, pid.0 as u64, 0, 0))
+        .map(|h| RawHandle(h as u32))
 }
 
 /// Mark file descriptor as the controlling TTY for this process.
@@ -1335,11 +1395,6 @@ pub unsafe fn munmap(addr: *mut u8, size: usize) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_MUNMAP, addr as u64, size as u64, 0, 0))
 }
 
-/// Terminate a child process.
-pub fn kill(pid: Pid) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_KILL, pid.0 as u64, 0, 0, 0))
-}
-
 /// Non-blocking read. Returns bytes read, or `Err(WouldBlock)` if no data available.
 pub fn read_nonblock(fd: RawHandle, buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_READ_NONBLOCK, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
@@ -1506,8 +1561,7 @@ pub fn sched_info() -> SchedInfo {
     info
 }
 
-/// Per-process accounting statistics. Used as the snapshot stashed on the parent
-/// at process exit and returned by SYS_PROCESS_STATS.
+/// Per-process accounting statistics, as [`SYS_PROCESS_STATS`] answers them.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ProcessStats {
@@ -1519,7 +1573,11 @@ pub struct ProcessStats {
     pub fault_zero_count: u32,
     pub fault_ns: u64,
     pub io_read_ops: u32,
-    pub _pad: u32,
+    /// The process's own pid. Not authority — nothing takes a pid but
+    /// [`SYS_PROCESS_OPEN`], which takes a `SysCap` beside it — but it is the
+    /// name a diagnostic prints, and this is where a holder of a handle reads
+    /// it. It also fills what was named padding.
+    pub pid: u32,
     pub io_read_bytes: u64,
     pub blocked_io_ns: u64,
     pub blocked_futex_ns: u64,
@@ -1531,12 +1589,13 @@ pub struct ProcessStats {
     pub alloc_count: u64,
 }
 
-/// Read accounting stats for an exited child process.
-/// Returns Ok(()) on success, Err if no stats available for that pid.
-pub fn process_stats(child_pid: Pid, stats: &mut ProcessStats) -> Result<(), SyscallError> {
+/// Read accounting for the process a `Process` handle names, alive or exited.
+///
+/// Repeatable: the numbers are the object's, so sampling one does not spend it.
+pub fn process_stats(proc: RawHandle, stats: &mut ProcessStats) -> Result<(), SyscallError> {
     check_unit(syscall(
         SYS_PROCESS_STATS,
-        child_pid.0 as u64,
+        proc.0 as u64,
         stats as *mut ProcessStats as u64,
         core::mem::size_of::<ProcessStats>() as u64,
         0,

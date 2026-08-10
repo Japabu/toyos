@@ -129,7 +129,7 @@ fn test(cap: &SysCap) {
     );
 
     // `Child::kill` is unimplemented in the ToyOS std, so this is the syscall.
-    syscall::kill(toyos_abi::Pid(holder.id())).expect("kill the holder");
+    holder.kill().expect("kill the holder");
     holder.wait().expect("reap the holder");
 
     let reclaimed: Device = cap
@@ -160,7 +160,7 @@ fn claim_in_child(cap: &SysCap) -> Option<SyscallError> {
 /// One mmap region for both blobs: `user_bytes` needs the window to be
 /// physically contiguous, and a stack buffer that straddled a page would make
 /// this pass on `BadAddress` without ever reaching `build_child_fds`.
-fn spawn_with_fd_map(fd: toyos_abi::RawHandle) -> Result<toyos_abi::Pid, SyscallError> {
+fn spawn_with_fd_map(fd: toyos_abi::RawHandle) -> Result<toyos_abi::RawHandle, SyscallError> {
     const REGION: usize = 4096;
     const SLOT_MAP_OFF: usize = 2048;
 

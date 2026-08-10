@@ -31,7 +31,6 @@ use terminal::Console;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::shm::SharedMemory;
 use toyos::endow;
-use toyos::namespace;
 use toyos::port::{self, Connector};
 use toyos::surface::{self, Delivery, Host, Notice};
 use toyos::{FramebufferDev, Keyboard};
@@ -341,19 +340,13 @@ struct Shell {
 
 impl Shell {
     fn spawn(surface: &Connector) -> Shell {
-        // Every name this console holds, plus the surface above. There is no
-        // compositor in this image, so the shell's own row is `surface` and
-        // `launcher` and this is exactly it.
-        let child_ns = namespace::build()
-            .keep(
-                endow::namespace().expect("console: the manifest gives this program `receives`"),
-                &["launcher"],
-            )
-            .add(surface::SERVICE, surface)
-            .finish()
-            .expect("console: the kernel refused a namespace for the shell");
+        // `[programs.shell]`'s row plus this console's surface, which is the
+        // one name no manifest can carry: there is a port per console instance.
+        let surface_copy = surface
+            .duplicate()
+            .expect("console: the kernel refused a duplicate of its own surface connector");
         let mut child = Command::new("/bin/shell")
-            .endow(toyos::endow::SVC_LABEL, child_ns.into_raw().0)
+            .provide(surface::SERVICE, surface_copy.into_raw().0)
             .stdin(process::tty_piped())
             .stdout(process::tty_piped())
             .stderr(process::tty_piped())

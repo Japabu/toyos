@@ -55,6 +55,12 @@ impl Acceptor {
 }
 
 impl Connector {
+    /// A second connector to the same port, for a holder handing one on while
+    /// keeping its own.
+    pub fn duplicate(&self) -> Result<Self, SyscallError> {
+        syscall::dup(self.0.fd()).map(|h| Self(OwnedHandle(h)))
+    }
+
     pub fn into_raw(self) -> RawHandle {
         self.0.into_raw()
     }

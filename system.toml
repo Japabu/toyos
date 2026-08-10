@@ -16,10 +16,11 @@ assets = ["assets"]
 # What `/bin/init` starts at boot. Program keys, not paths, and the order means
 # nothing: every port exists before any server runs.
 [boot]
-# `filepicker` is here and is **interim**. Its acceptor is init's to hand over,
-# and the launcher — which is how the compositor would ask for it — needs handle
-# transfer. Starting it at boot is what makes an editor's `pick_file` reach a
-# picker instead of queueing on a port nobody accepts from.
+# `filepicker` is a `serves` daemon like the three beside it: a machine-wide
+# port with one server, started where every other one is. It was called interim
+# while the compositor had no way to ask for a program's *declared* authority —
+# the launcher gives it one, and starting a service from `[boot] start` is not
+# the thing that needed fixing.
 start = ["compositor", "soundd", "netd", "filepicker"]
 
 [programs]
@@ -29,14 +30,9 @@ toyos-ld = { path = "toyos-ld" }
 toyos-cc = { path = "toyos-cc" }
 # cargo = { path = "userland/cargo", no-default-features = true }
 
-# `compositor` in its own `receives` is **interim**: a terminal or a picker the
-# compositor starts inherits the compositor's namespace, and until the launcher
-# can build a child's authority from that child's own manifest row there is no
-# other way for a compositor-started window client to hold a compositor
-# connector. It comes out with the launcher.
 [programs.compositor]
 serves = ["compositor"]
-receives = ["compositor", "soundd", "filepicker", "launcher"]
+receives = ["soundd", "filepicker", "launcher"]
 devices = ["framebuffer", "keyboard", "mouse"]
 
 [programs.soundd]

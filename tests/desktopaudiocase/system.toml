@@ -11,14 +11,9 @@ assets = ["assets"]
 [boot]
 start = ["compositor", "soundd", "terminal"]
 
-# `compositor` in its own `receives` is **interim**: a terminal or a picker the
-# compositor starts inherits the compositor's namespace, and until the launcher
-# can build a child's authority from that child's own manifest row there is no
-# other way for a compositor-started window client to hold a compositor
-# connector. It comes out with the launcher.
 [programs.compositor]
 serves = ["compositor"]
-receives = ["compositor", "soundd", "launcher"]
+receives = ["soundd", "launcher"]
 devices = ["framebuffer", "keyboard", "mouse"]
 
 [programs.soundd]
@@ -26,12 +21,9 @@ serves = ["soundd"]
 devices = ["hda-audio", "virtio-sound"]
 syscap = ["rt"]
 
-# `soundd` on the terminal is **interim** and travels the same road: `tone` is a
-# toybox applet a shell starts, the shell holds what its terminal gave it, and
-# only the launcher can give a child the row the manifest wrote for it.
 [programs.terminal]
 provides = ["surface"]
-receives = ["compositor", "soundd", "launcher"]
+receives = ["compositor", "launcher"]
 
 [programs.shell]
 receives = ["surface", "launcher"]

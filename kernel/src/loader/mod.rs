@@ -381,13 +381,21 @@ fn rela_dyn_from_sections(
     }
 }
 
+/// Load a program and place its main thread, answering the object a handle to
+/// the new process names.
+///
+/// **No parent argument, because a process has no parent.** The one thing the
+/// spawning process contributed beyond what it endowed was its working
+/// directory, and the caller passes that: nothing else about the caller is
+/// recorded, so there is no relationship for a later call to authorize
+/// against.
 pub fn spawn(
     argv: &[&str],
     handles: HandleTable,
     endowments: Endowments,
-    parent: Option<Pid>,
+    cwd: String,
     env: Vec<u8>,
-) -> Result<Pid, SyscallError> {
+) -> Result<Arc<crate::object::process::ProcessObject>, SyscallError> {
     // An argv of only separators survives the split in sys_spawn as an empty
     // slice; there is no argv[0] to load.
     let Some(&path) = argv.first() else {
@@ -596,18 +604,6 @@ pub fn spawn(
         }
     };
 
-    let cwd = match parent {
-        Some(ppid) => {
-            let arc = {
-                let guard = PROCESS_TABLE.lock();
-                let table = guard.as_ref().unwrap();
-                Arc::clone(table.get(ppid).unwrap().process_data())
-            };
-            let cwd = arc.lock().cwd.clone();
-            cwd
-        }
-        None => String::from("/"),
-    };
 
     let NeededLibs { libs: loaded_libs, paths: lib_paths } = loaded_libs;
     let proc_data = Arc::new(Lock::new(ProcessData {
@@ -641,7 +637,6 @@ pub fn spawn(
         exe_path: String::from(path),
         spawn_ns: crate::clock::nanos_since_boot(),
         accounting: ProcessAccounting::default(),
-        child_stats: Vec::new(),
         endowments,
     }));
 
@@ -659,13 +654,13 @@ pub fn spawn(
     let table = guard.as_mut().unwrap();
     let pid = table.insert_with(|pid| ProcessEntry::new(
         pid,
-        parent,
         start::make_name(path),
         proc_data,
         Arc::new(Lock::new(syms)),
         ThreadEntry::new(thread_data),
     ));
     let tid = table.get(pid).unwrap().main_tid();
+    let object = Arc::clone(table.get(pid).unwrap().object());
 
     // Placed while still holding the table lock: kill_process claims teardown
     // under this lock, so once the pid is visible its main thread is already in
@@ -687,7 +682,7 @@ pub fn spawn(
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t_deps - t2) / 1_000_000,
         (t_tls - t_deps) / 1_000_000, (t3 - t0) / 1_000_000);
 
-    Ok(pid)
+    Ok(object)
 }
 
 /// The libraries an executable's `DT_NEEDED` entries name, and the paths they
@@ -934,6 +929,7 @@ pub fn spawn_init() -> Pid {
         }],
         label.as_bytes().to_vec(),
     );
-    spawn(&[INIT_PATH], handles, endowments, None, Vec::new())
+    spawn(&[INIT_PATH], handles, endowments, String::from("/"), Vec::new())
         .expect("spawn_init: failed to spawn")
+        .pid()
 }
