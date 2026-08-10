@@ -66,7 +66,7 @@ fn main() {
 }
 
 fn child() {
-    let p = syscall::pipe();
+    let p = syscall::pipe().expect("a pipe to map");
     let base = syscall::pipe_map(p.write).expect("pipe_map on a pipe we hold") as *mut u8;
 
     // One window per pipe, not one per call: a second map is what bounds the

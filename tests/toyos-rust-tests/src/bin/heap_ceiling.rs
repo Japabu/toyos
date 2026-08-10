@@ -14,15 +14,14 @@
 
 use std::process::Command;
 
-/// `SYS_DEBUG` actions a `test-actuators` kernel provides. Each takes one
-/// kernel heap allocation and releases it: at `mm::MAX_HEAP_ALLOC`, at
-/// `mm::PAGE_2M`, and at `MAX_HEAP_ALLOC` with 4096-byte alignment.
-const AT_CEILING: u64 = 5;
-const OVER_CEILING: u64 = 6;
-const AT_CEILING_PAGE_ALIGNED: u64 = 7;
-
-/// Lower `SYS_SYSINFO`'s thread bound to a count this guest can reach.
-const LOWER_SYSINFO_BOUND: u64 = 14;
+// `SYS_DEBUG` actions a `test-actuators` kernel provides. The first three take
+// one kernel heap allocation each and release it again — at
+// `mm::MAX_HEAP_ALLOC`, at `mm::PAGE_2M`, and at `MAX_HEAP_ALLOC` with
+// 4096-byte alignment; the last lowers `SYS_SYSINFO`'s thread bound to a count
+// this guest can reach.
+use toyos_abi::syscall::debug_action::{
+    HEAP_AT_CEILING, HEAP_AT_CEILING_PAGE_ALIGNED, HEAP_OVER_CEILING, LOWER_SYSINFO_BOUND,
+};
 
 /// `SyscallError::ResourceExhausted`, as `SyscallError::to_u64` encodes it.
 const RESOURCE_EXHAUSTED: u64 = u64::MAX - 7;
@@ -44,9 +43,9 @@ fn main() {
 /// ask the heap for more than `MAX_HEAP_ALLOC` and trip the assert three
 /// functions above — from any process, with no privilege.
 ///
-/// Action 14 puts 16 in `MAX_SYSINFO_THREADS`'s place, because 65,536 threads
-/// is 8 GiB of kernel stacks and no guest can make them. The count, the
-/// comparison and the refusal are the shipped ones.
+/// [`LOWER_SYSINFO_BOUND`] puts 16 in `MAX_SYSINFO_THREADS`'s place, because
+/// 65,536 threads is 8 GiB of kernel stacks and no guest can make them. The
+/// count, the comparison and the refusal are the shipped ones.
 ///
 /// **Armed here rather than compiled in, and the arming is itself an
 /// assertion**: the bound is the shipped 65,536 until this call, so a kernel
@@ -110,7 +109,7 @@ fn sysinfo_answers() -> bool {
 /// It is also the negative side of the case below it: an assert that simply
 /// refused every large allocation would satisfy that one and fail this.
 fn at_ceiling_is_servable() {
-    let rc = toyos_abi::syscall::debug(AT_CEILING);
+    let rc = toyos_abi::syscall::debug(HEAP_AT_CEILING);
     assert_eq!(
         rc, 0,
         "an allocation at MAX_HEAP_ALLOC was refused (rc={rc:#x}) — the documented \
@@ -129,7 +128,7 @@ fn at_ceiling_is_servable() {
 /// inside `Dlmalloc::malloc`, with the allocator lock held, and the guest went
 /// silent — so no bound at the entry could ever have closed it.
 fn aligned_at_ceiling_is_refused_not_fatal() {
-    let rc = toyos_abi::syscall::debug(AT_CEILING_PAGE_ALIGNED);
+    let rc = toyos_abi::syscall::debug(HEAP_AT_CEILING_PAGE_ALIGNED);
     assert_eq!(
         rc, RESOURCE_EXHAUSTED,
         "a page-aligned allocation at MAX_HEAP_ALLOC returned {rc:#x}; expected the \
@@ -141,7 +140,7 @@ fn aligned_at_ceiling_is_refused_not_fatal() {
 /// One page over the ceiling: the caller dies, and nothing else does.
 fn over_ceiling_kills_only_the_caller() {
     let status = Command::new("/bin/test_rs_test_panic_child")
-        .arg(OVER_CEILING.to_string())
+        .arg(HEAP_OVER_CEILING.to_string())
         .status()
         .expect("failed to spawn child");
     assert!(

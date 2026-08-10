@@ -1,6 +1,7 @@
+use std::os::toyos::process::ChildExt;
 use std::process::Command;
-use toyos_abi::Pid;
-use toyos_abi::syscall::{ProcessStats, process_stats};
+use toyos_abi::syscall::{process_stats, ProcessStats};
+use toyos_abi::RawHandle;
 
 pub fn main(args: Vec<String>) {
     if args.is_empty() {
@@ -16,21 +17,22 @@ pub fn main(args: Vec<String>) {
             std::process::exit(1);
         });
 
-    let child_pid = Pid(child.id());
     let status = child.wait().unwrap_or_else(|e| {
         eprintln!("stats: wait failed: {e}");
         std::process::exit(1);
     });
 
+    // Read *after* the wait and still answered: the numbers are the process
+    // object's, and the handle outlives the process.
     let mut s = ProcessStats::default();
-    if process_stats(child_pid, &mut s).is_err() {
-        eprintln!("stats: no stats for pid {}", child_pid.0);
+    if process_stats(RawHandle(child.as_raw_handle()), &mut s).is_err() {
+        eprintln!("stats: the kernel would not answer for the child");
         std::process::exit(1);
     }
 
     let code = status.code().unwrap_or(-1);
     eprintln!();
-    eprintln!("── process stats (pid {}, exit {code}) ──────────", child_pid.0);
+    eprintln!("── process stats (pid {}, exit {code}) ──────────", s.pid);
     eprintln!("  wall      {}", fmt_ns(s.wall_ns));
     eprintln!("  cpu       {}", fmt_ns(s.cpu_ns));
     eprintln!();

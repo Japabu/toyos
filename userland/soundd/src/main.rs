@@ -1,14 +1,16 @@
 use toyos_abi::audio::{AudioCompletionRecord, AudioSlotHeader};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos::audio::{
     AudioSlotReader, StreamOpenRequest, StreamOpenResponse, StreamSetVolume, FORMAT_S16LE,
     MSG_STREAM_OPEN, MSG_STREAM_OPENED, MSG_STREAM_SET_VOLUME, MSG_STREAM_CLOSE, MSG_STREAM_ERROR,
 };
+use toyos::endow::{self, Endowments};
 use toyos::poller::{Poller, IORING_POLL_IN};
-use toyos::services;
+use toyos::port::Acceptor;
 use toyos::shm::SharedMemory;
-use toyos::{AsHandle, Connection};
-use toyos_abi::syscall;
+use toyos::syscap::SysCap;
+use toyos::{AsHandle, Connection, HdaDev, VirtioSoundDev};
+use toyos_abi::syscall::{self, DeviceType};
 use toyos_hda::stream;
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -77,7 +79,7 @@ trait Backend {
     fn pipeline(&self) -> Pipeline;
 
     /// The handle a completion arrives on.
-    fn handle(&self) -> Fd;
+    fn handle(&self) -> RawHandle;
 
     /// Where period `idx`'s samples go. Device memory this process may write,
     /// mapped once at claim.
@@ -116,7 +118,7 @@ impl Backend for VirtioBackend {
         Pipeline::Queue
     }
 
-    fn handle(&self) -> Fd {
+    fn handle(&self) -> RawHandle {
         self.virtio.dev().as_handle()
     }
 
@@ -154,7 +156,7 @@ impl Backend for HdaBackend {
         Pipeline::Ring
     }
 
-    fn handle(&self) -> Fd {
+    fn handle(&self) -> RawHandle {
         self.hda.dev().as_handle()
     }
 
@@ -275,12 +277,11 @@ impl GainRamp {
 struct ClientStream {
     client_id: usize,
     slot_reader: AudioSlotReader,
-    signal_write_fd: Fd,
-    /// soundd's own reference to the signal pipe's read end, released the
-    /// moment the client proves it holds one (see the mix loop). While soundd
-    /// holds it the pipe has a reader whatever the client does, and §5.7's
-    /// crash detection cannot fire.
-    signal_read_fd: Option<Fd>,
+    /// The write end of the signal pipe. soundd makes both ends and sends the
+    /// read end to the client, so §5.7's crash detection is by construction:
+    /// the moment the client's table goes, the read end goes with it and the
+    /// next signal breaks.
+    signal_write_fd: RawHandle,
     gain: GainRamp,
     client_channels: u16,
     client_period_frames: u32,
@@ -306,7 +307,7 @@ impl ClientStream {
 
 /// Control connections soundd will hold at once.
 ///
-/// The control thread watches one handle per client plus the listener in a
+/// The control thread watches one handle per client plus the acceptor in a
 /// single poller and io_uring rings are powers of two, so the limit is a ring
 /// size minus one. 64 costs the same 2 MiB page as 32; 63 simultaneous streams
 /// is already past what the mixer renders inside one 2.9 ms period, and costs
@@ -592,7 +593,6 @@ impl Dll {
 
 fn open_stream(
     client_id: usize,
-    client_pid: u32,
     req: &StreamOpenRequest,
     control: &Connection,
     device_sample_rate: u32,
@@ -617,18 +617,20 @@ fn open_stream(
     // refusals end the open rather than the daemon: a client that exited
     // between asking and being served cannot be granted memory, and neither
     // can one that asked while the machine had none.
-    let shm = match SharedMemory::allocate(shm_size as usize) {
+    let shm = match SharedMemory::create(shm_size as usize) {
         Ok(shm) => shm,
         Err(e) => {
             say!("soundd: no {shm_size}-byte ring for client {client_id} ({e:?})");
             return None;
         }
     };
-    if shm.grant(client_pid).is_err() {
-        say!("soundd: client {client_id} (pid {client_pid}) is gone; no stream opened");
-        return None;
-    }
-    let shm_token = shm.token();
+    let client_shm = match shm.share() {
+        Ok(h) => h,
+        Err(e) => {
+            say!("soundd: cannot share the ring with client {client_id} ({e:?})");
+            return None;
+        }
+    };
 
     unsafe {
         let hdr = &*(shm.as_ptr() as *const AudioSlotHeader);
@@ -636,21 +638,36 @@ fn open_stream(
         hdr.read_idx.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
-    let pipe_fds = syscall::pipe();
-    let signal_pipe_id = syscall::pipe_id(pipe_fds.read).expect("pipe_id failed");
+    // **soundd makes the pipe and keeps the write end.** That is what makes a
+    // dead client detectable without bookkeeping: the read end it is sent goes
+    // when its table does, and the next signal answers `Gone`. The client used
+    // to make the pipe and name it by an id, because an id was only openable
+    // by a peer of its creator and the peer relation ran one way.
+    let (signal_read, signal_write) = match toyos::pipe_pair() {
+        Ok(ends) => ends,
+        Err(e) => {
+            syscall::close(client_shm);
+            say!("soundd: no signal pipe for client {client_id} ({e:?})");
+            return None;
+        }
+    };
 
     let slot_reader = AudioSlotReader::new(shm, client_period_bytes, slot_count);
 
-    if control.send(MSG_STREAM_OPENED, &StreamOpenResponse {
-        shm_token,
-        _pad0: 0,
-        signal_pipe_id,
-        client_period_frames,
-        client_period_bytes,
-        device_sample_rate,
-        device_channels,
-        slot_count: slot_count as u16,
-    }).is_err() {
+    // Handles first, then the frame that announces them — `send_with_handles`
+    // is that order, and a client reading the frame is guaranteed to find
+    // them. Both are moved whether or not this succeeds.
+    if control.send_with_handles(
+        &[client_shm, signal_read.into_fd()],
+        MSG_STREAM_OPENED,
+        &StreamOpenResponse {
+            client_period_frames,
+            client_period_bytes,
+            device_sample_rate,
+            device_channels,
+            slot_count: slot_count as u16,
+        },
+    ).is_err() {
         // Client died mid-open; the dropped control connection removes it.
         say!("soundd: client {client_id} vanished during stream open");
     }
@@ -689,8 +706,7 @@ fn open_stream(
     Some(ClientStream {
         client_id,
         slot_reader,
-        signal_write_fd: pipe_fds.write,
-        signal_read_fd: Some(pipe_fds.read),
+        signal_write_fd: signal_write.into_fd(),
         gain,
         client_channels: req.channels,
         client_period_frames,
@@ -796,7 +812,7 @@ fn signal_clients(streams: &mut [ClientStream], ramp_frames: u32) {
             syscall::write_nonblock(stream.signal_write_fd, &[1]),
             Err(syscall::SyscallError::NotFound)
         );
-        if died && stream.signal_read_fd.is_none() && !stream.pending_removal {
+        if died && !stream.pending_removal {
             say!("soundd: client {} died, ramping down", stream.client_id);
             stream.gain.set_target(Gain::SILENT, ramp_frames);
             stream.pending_removal = true;
@@ -838,9 +854,6 @@ fn retain_active(streams: &mut Vec<ClientStream>) {
         if s.pending_removal && s.gain.is_idle() {
             say!("soundd: client {} removed", s.client_id);
             syscall::close(s.signal_write_fd);
-            if let Some(fd) = s.signal_read_fd {
-                syscall::close(fd);
-            }
             false
         } else {
             true
@@ -851,7 +864,7 @@ fn retain_active(streams: &mut Vec<ClientStream>) {
 fn mix_thread(
     backend: &mut dyn Backend,
     cmd_ring: &CommandRing,
-    cmd_pipe_read: Fd,
+    cmd_pipe_read: RawHandle,
     num_buffers: usize,
     device_sample_rate: u32,
     device_channels: u16,
@@ -934,9 +947,17 @@ fn mix_thread(
     // at boot.
     let mut playout_until_ns = pipeline_filled_ns;
 
-    // Gated on the audio device claim `main` already took, so a refusal is a
-    // kernel bug. Mixing on without the RT band would show up only as glitches.
-    syscall::set_rt_priority(true).expect("soundd holds the audio device claim");
+    // **The band is a privilege now, not a side effect of holding a card.**
+    // Until this branch it was gated on the audio claim, which the dispatch's
+    // own comment called out as not a privilege at all: whoever won the
+    // first-come race for the sound card got the RT band with it. This is the
+    // `RT`-only capability the manifest's `syscap = ["rt"]` row asks init for,
+    // and soundd is the only program in the tree that has one. Mixing on
+    // without the band would show up only as glitches, so a refusal is loud.
+    let rt: SysCap = Endowments::get()
+        .take(toyos_abi::syscall::SYSCAP_LABEL)
+        .expect("the manifest declares this program `syscap = [\"rt\"]`");
+    rt.enter_rt().expect("an RT capability refused the band it names");
 
     let poller = Poller::new(64);
     let mut mix_f32 = vec![0.0f32; device_period_samples];
@@ -1213,16 +1234,6 @@ fn mix_thread(
                 );
                 if covered && !stream.delivered {
                     stream.delivered = true;
-                    // §5.7 wants a client crash to break soundd's next write to
-                    // the signal pipe, which it cannot while soundd holds a
-                    // read end of its own. A delivered period proves the client
-                    // holds one: `AudioStream::open` maps the ring and opens
-                    // the pipe before returning, and the slot-filling thread is
-                    // spawned after that. A client that fills without ever
-                    // opening the pipe loses its stream on the next signal.
-                    if let Some(fd) = stream.signal_read_fd.take() {
-                        syscall::close(fd);
-                    }
                 }
                 any_data |= covered;
                 any_streaming |= stream.is_streaming();
@@ -1328,11 +1339,10 @@ fn mix_thread(
 /// Idle discipline matches §5.8: with no streams it holds no timer and takes no
 /// wakes, blocking on the command pipe alone, so an audience of zero costs
 /// exactly zero CPU. It does not request the RT band — it protects no audible
-/// output, and could not anyway: `SYS_SET_RT_PRIORITY` is gated on the audio
-/// claim there is no device to take.
+/// output, so there is nothing for the band to protect.
 fn null_sink_thread(
     cmd_ring: &CommandRing,
-    cmd_pipe_read: Fd,
+    cmd_pipe_read: RawHandle,
     device_sample_rate: u32,
     device_channels: u16,
     device_period_frames: usize,
@@ -1432,14 +1442,8 @@ fn null_sink_thread(
                     device_channels as usize,
                     device_period_frames,
                 );
-                // §5.7: a delivered period proves the client holds its signal
-                // pipe's read end, so soundd releases its own — the next write
-                // then breaks if the client dies. Identical to the device path.
                 if covered && !stream.delivered {
                     stream.delivered = true;
-                    if let Some(fd) = stream.signal_read_fd.take() {
-                        syscall::close(fd);
-                    }
                 }
                 any_data |= covered;
                 any_streaming |= stream.is_streaming();
@@ -1562,7 +1566,7 @@ fn reject_open(req: &StreamOpenRequest) -> Option<&'static str> {
 /// forever) or asserting (soundd dead at a client's choosing). The retry is
 /// unbounded because the mix thread is the process's main thread — if it has
 /// stopped, soundd is already gone.
-fn submit(cmd_ring: &CommandRing, cmd_pipe_write: Fd, cmd: MixCommand, period_nanos: u64) {
+fn submit(cmd_ring: &CommandRing, cmd_pipe_write: RawHandle, cmd: MixCommand, period_nanos: u64) {
     let mut cmd = cmd;
     loop {
         let full = cmd_ring.try_push(cmd);
@@ -1578,16 +1582,16 @@ fn submit(cmd_ring: &CommandRing, cmd_pipe_write: Fd, cmd: MixCommand, period_na
 }
 
 fn control_thread(
-    listener: toyos::Listener,
+    acceptor: Acceptor,
     cmd_ring: &CommandRing,
-    cmd_pipe_write: Fd,
+    cmd_pipe_write: RawHandle,
     device_sample_rate: u32,
     device_channels: u16,
     device_period_frames: u32,
     slot_count: u32,
     ramp_frames: u32,
 ) {
-    // One handle per client plus the listener; `MAX_CONTROL_CLIENTS` is derived
+    // One handle per client plus the acceptor; `MAX_CONTROL_CLIENTS` is derived
     // from this ring, so the set always fits in one batch.
     let poller = Poller::new(MAX_CONTROL_CLIENTS as u32 + 1);
     let period_nanos = (device_period_frames as u64 * 1_000_000_000) / device_sample_rate as u64;
@@ -1609,13 +1613,12 @@ fn control_thread(
     }
 
     let mut clients: Vec<ControlClient> = Vec::new();
-    let mut client_pids: Vec<u32> = Vec::new();
     let mut next_idx: usize = 0;
 
-    const TOKEN_LISTENER: u64 = u64::MAX;
+    const TOKEN_ACCEPT: u64 = u64::MAX;
 
     loop {
-        poller.poll_add(&listener, IORING_POLL_IN, TOKEN_LISTENER);
+        poller.poll_add(&acceptor, IORING_POLL_IN, TOKEN_ACCEPT);
         for (i, client) in clients.iter().enumerate() {
             poller.poll_add(&client.conn, IORING_POLL_IN, i as u64);
         }
@@ -1623,24 +1626,23 @@ fn control_thread(
         let mut ready: Vec<u64> = Vec::new();
         poller.wait(1, u64::MAX, |t| ready.push(t));
 
-        if ready.contains(&TOKEN_LISTENER) {
-            match services::accept(&listener) {
+        if ready.contains(&TOKEN_ACCEPT) {
+            match acceptor.accept() {
                 // Refused rather than left queued: a connection past the
                 // poller's watchable set would never be read from. It is still
-                // accepted first — leaving it in the listener queue keeps the
-                // listener readable and spins this loop.
-                Ok(accepted) if clients.len() >= MAX_CONTROL_CLIENTS => {
+                // accepted first — leaving it in the port's queue keeps the
+                // acceptor readable and spins this loop.
+                Ok(conn) if clients.len() >= MAX_CONTROL_CLIENTS => {
                     say!("soundd: refusing connection, {MAX_CONTROL_CLIENTS} clients already connected");
-                    let _ = accepted.conn.signal(MSG_STREAM_ERROR);
+                    let _ = conn.signal(MSG_STREAM_ERROR);
                 }
-                Ok(accepted) => {
+                Ok(conn) => {
                     clients.push(ControlClient {
-                        conn: accepted.conn,
+                        conn,
                         msg: MsgBuf::new(),
                         stream_idx: None,
                         pending_volume: None,
                     });
-                    client_pids.push(accepted.client_pid);
                 }
                 Err(e) => say!("soundd: accept failed: {e:?}"),
             }
@@ -1668,11 +1670,8 @@ fn control_thread(
                 };
                 match (msg_type, clients[i].stream_idx) {
                     (MSG_STREAM_OPEN, None) if plen == core::mem::size_of::<StreamOpenRequest>() => {
-                        let req = StreamOpenRequest {
-                            sample_rate: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
-                            channels: u16::from_le_bytes(payload[4..6].try_into().unwrap()),
-                            format: u16::from_le_bytes(payload[6..8].try_into().unwrap()),
-                        };
+                        let req: StreamOpenRequest = toyos::ipc::decode_payload(&payload[..plen])
+                            .expect("a payload as long as the struct decodes");
                         if let Some(reason) = reject_open(&req) {
                             say!("soundd: rejecting stream ({reason}): {}Hz {}ch fmt={}",
                                 req.sample_rate, req.channels, req.format);
@@ -1687,7 +1686,6 @@ fn control_thread(
                         next_idx += 1;
                         let Some(client) = open_stream(
                             idx,
-                            client_pids[i],
                             &req,
                             &clients[i].conn,
                             device_sample_rate,
@@ -1744,7 +1742,6 @@ fn control_thread(
         }
         for &i in dead.iter().rev() {
             clients.remove(i);
-            client_pids.remove(i);
         }
     }
 }
@@ -1763,47 +1760,45 @@ const NULL_SINK_PERIOD_FRAMES: usize = 128;
 const NULL_SINK_BUFFERS: usize = 8;
 
 fn main() {
-    let listener = services::listen("soundd").expect("soundd already running");
+    let acceptor = endow::acceptor("soundd")
+        .expect("the manifest declares this program serves `soundd`");
 
-    // A machine with no sound card is a routing state, not a bug: soundd
-    // presents a virtual output and discards what is played to it, so a client
-    // building an audio stream succeeds whether or not hardware is present.
-    // Exiting was the old behavior — it released the name and left every audio
-    // client's connect failing NotFound, which crashed uncontrolled programs
-    // like `tone`. Hardware absence is a route, and the route when there is no
-    // sink is the null sink.
+    // **"Which sound card does this machine have?" is already answered.** init
+    // mints a claim per class the manifest names and endows what the machine
+    // actually had, so an absent card is a label missing from this process's
+    // own table rather than two probing syscalls — and a card another process
+    // holds is not a state that can arise, because only init mints.
     //
-    // NotFound and nothing else means "no device". `services::listen` is not the
-    // whole "already running" check: it releases the name and the audio claim
-    // under different locks, so a soundd restarted the instant the previous one
-    // exits can pass it and still lose the claim. That is a conflict, not an
-    // absent sound card, and it has to stay loud.
+    // A machine with no sound card is a routing state and not a bug: soundd
+    // presents a virtual output and discards what is played to it, so a client
+    // building a stream succeeds whether or not hardware is present.
+    //
     // The order is virtio first, and it is not a preference between two cards:
     // no machine in this project has both. The T14 has only the second.
-    match virtio::Virtio::claim() {
-        Ok((virtio, rate, channels)) => return run_virtio(listener, virtio, rate, channels),
-        Err(virtio::Refusal::NoDevice(syscall::SyscallError::NotFound)) => {}
-        Err(virtio::Refusal::NoDevice(e)) => {
-            panic!("soundd: cannot claim the virtio-sound device: {e}")
-        }
-        Err(why) => {
-            say!("soundd: the virtio-sound device cannot carry audio: {why}");
-            return run_null_sink(listener);
+    if let Some(dev) = endow::device::<VirtioSoundDev>(DeviceType::VirtioSound) {
+        match virtio::Virtio::claim(dev) {
+            Ok((virtio, rate, channels)) => return run_virtio(acceptor, virtio, rate, channels),
+            Err(why) => {
+                say!("soundd: the virtio-sound device cannot carry audio: {why}");
+                return run_null_sink(acceptor);
+            }
         }
     }
-    match hda::Hda::claim() {
-        Ok((hda, _path, channels)) => run_hda(listener, hda, channels),
-        Err(hda::Refusal::NoDevice(syscall::SyscallError::NotFound)) => run_null_sink(listener),
+    let Some(dev) = endow::device::<HdaDev>(DeviceType::HdaAudio) else {
+        return run_null_sink(acceptor);
+    };
+    match hda::Hda::claim(dev) {
+        Ok((hda, _path, channels)) => run_hda(acceptor, hda, channels),
         Err(why) => {
             say!("soundd: the HDA controller cannot carry audio: {why}");
-            run_null_sink(listener)
+            run_null_sink(acceptor)
         }
     }
 }
 
-fn run_virtio(listener: toyos::Listener, virtio: virtio::Virtio, rate: u32, channels: u8) {
+fn run_virtio(acceptor: Acceptor, virtio: virtio::Virtio, rate: u32, channels: u8) {
     run_with_device(
-        listener,
+        acceptor,
         &mut VirtioBackend { virtio },
         toyos_abi::virtio_sound::PERIODS,
         rate,
@@ -1812,19 +1807,19 @@ fn run_virtio(listener: toyos::Listener, virtio: virtio::Virtio, rate: u32, chan
     );
 }
 
-fn run_hda(listener: toyos::Listener, hda: hda::Hda, channels: u8) {
+fn run_hda(acceptor: Acceptor, hda: hda::Hda, channels: u8) {
     let info = hda.info();
     let num_buffers = info.periods as usize;
     let period_bytes = info.period_bytes as usize;
-    let ring = SharedMemory::map(info.pcm_token, 2 * 1024 * 1024)
-        .expect("the PCM token the HDA device just reported");
+    let ring = SharedMemory::adopt(info.pcm, 2 * 1024 * 1024)
+        .expect("the PCM buffer the HDA claim just handed over");
     // One region, `periods` buffers end to end: the buffer descriptor list the
     // kernel built points at exactly these offsets.
     let base = ring.as_ptr();
     let buffers = (0..num_buffers).map(|i| unsafe { base.add(i * period_bytes) }).collect();
 
     run_with_device(
-        listener,
+        acceptor,
         &mut HdaBackend { hda, buffers, period_bytes },
         num_buffers,
         toyos_hda::config::RATE,
@@ -1834,7 +1829,7 @@ fn run_hda(listener: toyos::Listener, hda: hda::Hda, channels: u8) {
 }
 
 fn run_with_device(
-    listener: toyos::Listener,
+    acceptor: Acceptor,
     backend: &mut dyn Backend,
     num_buffers: usize,
     device_sample_rate: u32,
@@ -1859,14 +1854,14 @@ fn run_with_device(
         num_buffers, device_sample_rate, device_channels, device_period_bytes, device_period_frames);
 
     let cmd_ring = Arc::new(CommandRing::new());
-    let cmd_pipe = syscall::pipe();
+    let cmd_pipe = syscall::pipe().expect("soundd: failed to create the command pipe");
 
     let cmd_ring2 = cmd_ring.clone();
     std::thread::Builder::new()
         .name("soundd-ctrl".into())
         .spawn(move || {
             control_thread(
-                listener,
+                acceptor,
                 &cmd_ring2,
                 cmd_pipe.write,
                 device_sample_rate,
@@ -1891,7 +1886,7 @@ fn run_with_device(
     );
 }
 
-fn run_null_sink(listener: toyos::Listener) {
+fn run_null_sink(acceptor: Acceptor) {
     let device_sample_rate = NULL_SINK_RATE;
     let device_channels = NULL_SINK_CHANNELS;
     let device_period_frames = NULL_SINK_PERIOD_FRAMES;
@@ -1906,14 +1901,14 @@ fn run_null_sink(listener: toyos::Listener) {
     );
 
     let cmd_ring = Arc::new(CommandRing::new());
-    let cmd_pipe = syscall::pipe();
+    let cmd_pipe = syscall::pipe().expect("soundd: failed to create the command pipe");
 
     let cmd_ring2 = cmd_ring.clone();
     std::thread::Builder::new()
         .name("soundd-ctrl".into())
         .spawn(move || {
             control_thread(
-                listener,
+                acceptor,
                 &cmd_ring2,
                 cmd_pipe.write,
                 device_sample_rate,

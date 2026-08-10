@@ -285,7 +285,7 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
         if let Some(guard) = process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_ref() {
                 if let Some(proc) = table.get(pid) {
-                    log!("  Process: {} pid={} state={}", proc.name_str(), proc.pid(), proc.state().name());
+                    log!("  Process: {} pid={} state={}", proc.name_str(), proc.pid(), if proc.tearing_down() { "TearingDown" } else { "Live" });
                 }
             }
         }

@@ -1,9 +1,10 @@
 //! The in-guest half of the layout and wizard gates, as a surface.
 //!
 //! This program is a **surface owner**, built out of exactly the pieces
-//! `/bin/terminal` and `/bin/console` are: it claims the keyboard, holds one
-//! `Translator`, serves `toyos::surface::Host`, and gives its child the
-//! service name in the environment. What it does not have is a screen — so
+//! `/bin/terminal` and `/bin/console` are: it holds the keyboard claim and one
+//! `Translator`, makes a port of its own and serves `toyos::surface::Host` on
+//! it, and puts that port's connector in the namespace of the child it spawns.
+//! What it does not have is a screen — so
 //! every assertion the host makes reads a console line instead of a pixel,
 //! which is why the layout and wizard gates run here and not against
 //! `/bin/console`.
@@ -30,9 +31,15 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::os::toyos::process::CommandExt;
 use toyos::device::Keyboard;
+use toyos::endow::Endowments;
+use toyos::namespace;
 use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::port::{self, Connector};
 use toyos::surface::{self, Delivery, Host, Notice};
+use toyos::syscap::SysCap;
+use toyos_abi::syscall::{DeviceType, SVC_LABEL, SYSCAP_LABEL};
 use toyos_abi::input::RawKeyEvent;
 use window::Translator;
 
@@ -43,15 +50,22 @@ const TOKEN_LISTEN: u64 = 2;
 const TOKEN_CLIENT: u64 = 3;
 
 fn main() {
-    let mut buf = [0u8; surface::MAX_NAME];
-    let name = surface::service_name(std::process::id(), &mut buf).to_string();
-    let host = Host::listen(&name).expect("locale_gate: cannot serve its own surface name");
-    let keyboard = Keyboard::open().expect("locale_gate: no keyboard device");
-    let surface = Surface { host, keyboard, translator: window::configured_translator() };
+    // One port, this instance's, exactly as a terminal makes one. The
+    // connector goes into the namespace of the `locale` it spawns and nowhere
+    // else, so the wizard reaches *this* surface and no other.
+    let (acceptor, connector) =
+        port::create().expect("locale_gate: the kernel refused a port of its own");
+    let cap: SysCap = Endowments::get()
+        .take(SYSCAP_LABEL)
+        .expect("the test estate is endowed a device-minting capability");
+    let keyboard: Keyboard =
+        cap.claim(DeviceType::Keyboard).expect("locale_gate: no keyboard device");
+    let surface =
+        Surface { host: Host::serve(acceptor), keyboard, translator: window::configured_translator() };
 
     match std::env::args().nth(1).as_deref() {
-        Some("layout") => layout(surface, &name),
-        Some("detect") => detect(surface, &name),
+        Some("layout") => layout(surface, &connector),
+        Some("detect") => detect(surface, &connector),
         other => panic!("locale_gate: unknown mode {other:?}"),
     }
 }
@@ -94,29 +108,38 @@ impl Surface {
                     self.host.notify_layout();
                     println!("surface: layout is now {}", self.translator.layout());
                 }
-                Notice::Grabbed { pid } => println!("surface: pid {pid} has the keys"),
-                Notice::Released { pid } => println!("surface: pid {pid} gave the keys back"),
-                Notice::Dropped { pid, why } => println!("surface: dropped pid {pid} — {why}"),
+                Notice::Grabbed { client } => println!("surface: client {client} has the keys"),
+                Notice::Released { client } => {
+                    println!("surface: client {client} gave the keys back")
+                }
+                Notice::Dropped { client, why } => {
+                    println!("surface: dropped client {client} — {why}")
+                }
             }
         }
     }
 }
 
-fn spawn_locale(args: &[&str], surface_name: &str) -> Child {
+fn spawn_locale(args: &[&str], surface: &Connector) -> Child {
+    // The whole of what the wizard is given: one connector, to this surface.
+    let child_ns = namespace::build()
+        .add(surface::SERVICE, surface)
+        .finish()
+        .expect("locale_gate: the kernel refused a namespace for the wizard");
     Command::new("/bin/toybox")
         .arg("locale")
         .args(args)
-        .env(surface::HOST_ENV, surface_name)
+        .endow(SVC_LABEL, child_ns.into_raw().0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("locale_gate: cannot run /bin/toybox")
 }
 
-fn layout(mut surface: Surface, name: &str) {
+fn layout(mut surface: Surface, connector: &Connector) {
     // `Command::output()` asks `spawn` for the pipe and drops it, so its
     // stderr is always empty (`specs/issues/kernel/command-output-empty-stderr.md`).
-    let out = spawn_locale(&["swiss-german"], name)
+    let out = spawn_locale(&["swiss-german"], connector)
         .wait_with_output()
         .expect("locale_gate: locale never exited");
     for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -145,8 +168,8 @@ fn layout(mut surface: Surface, name: &str) {
     println!("kev done seen={seen}");
 }
 
-fn detect(mut surface: Surface, name: &str) {
-    let mut child = spawn_locale(&["detect"], name);
+fn detect(mut surface: Surface, connector: &Connector) {
+    let mut child = spawn_locale(&["detect"], connector);
     let stdout = child.stdout.take().expect("locale_gate: no stdout pipe");
 
     // The relay is a thread doing blocking reads, and the surface runs here.
@@ -179,7 +202,7 @@ fn detect(mut surface: Surface, name: &str) {
     let deadline = Instant::now() + Duration::from_secs(25);
     while !wizard_done.load(Ordering::Relaxed) && Instant::now() < deadline {
         poller.poll_add(&surface.keyboard, IORING_POLL_IN, TOKEN_KEYBOARD);
-        poller.poll_add_fd(surface.host.listener_fd(), IORING_POLL_IN, TOKEN_LISTEN);
+        poller.poll_add_fd(surface.host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
         for fd in surface.host.client_fds() {
             poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
         }

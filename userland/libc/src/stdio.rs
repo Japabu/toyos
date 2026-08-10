@@ -1,5 +1,5 @@
 use core::ptr;
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, OpenFlags, SeekFrom};
 
 // Platform fd operations
@@ -17,17 +17,17 @@ fn sys_open(path: &[u8], read: bool, write: bool, create: bool, truncate: bool, 
     }
 }
 
-fn sys_close(fd: i32) { syscall::close(Fd(fd)); }
+fn sys_close(fd: i32) { syscall::close(RawHandle(fd as u32)); }
 
 fn sys_read(fd: i32, buf: &mut [u8]) -> isize {
-    match syscall::read(Fd(fd), buf) {
+    match syscall::read(RawHandle(fd as u32), buf) {
         Ok(n) => n as isize,
         Err(_) => -1,
     }
 }
 
 fn sys_write(fd: i32, buf: &[u8]) -> isize {
-    match syscall::write(Fd(fd), buf) {
+    match syscall::write(RawHandle(fd as u32), buf) {
         Ok(n) => n as isize,
         Err(_) => -1,
     }
@@ -40,13 +40,13 @@ fn sys_seek(fd: i32, offset: i64, whence: i32) -> i64 {
         2 => SeekFrom::End(offset),
         _ => return -1,
     };
-    match syscall::seek(Fd(fd), pos) {
+    match syscall::seek(RawHandle(fd as u32), pos) {
         Ok(n) => n as i64,
         Err(_) => -1,
     }
 }
 
-fn sys_fsync(fd: i32) { let _ = syscall::fsync(Fd(fd)); }
+fn sys_fsync(fd: i32) { let _ = syscall::fsync(RawHandle(fd as u32)); }
 
 fn sys_delete(path: &[u8]) -> i32 {
     match syscall::delete(path) { Ok(()) => 0, Err(_) => -1 }
@@ -171,7 +171,7 @@ unsafe fn unregister_stream(f: *mut FILE) {
 /// failure mode that is hardest to tell apart from the program never having run.
 /// C's rule is "interactive device", not "terminal", and a serial console is one.
 unsafe fn fd_is_interactive(fd: i32) -> bool {
-    match syscall::fstat(Fd(fd)) {
+    match syscall::fstat(RawHandle(fd as u32)) {
         Ok(st) => matches!(
             st.file_type,
             syscall::FileType::Tty | syscall::FileType::Serial | syscall::FileType::Keyboard

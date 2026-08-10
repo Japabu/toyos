@@ -19,9 +19,10 @@
 use std::process::exit;
 use std::time::{Duration, Instant};
 
+use toyos::endow;
 use toyos::ipc::{self, RxStep};
 use toyos::net::{MsgType, RespType};
-use toyos::{services, Connection};
+use toyos::Connection;
 use toyos_abi::syscall;
 
 /// How long netd may take to answer a question it answers from the request
@@ -93,7 +94,7 @@ fn cases() -> Vec<Case> {
 fn main() {
     let cases = cases();
     for case in &cases {
-        let conn = services::connect("netd")
+        let conn = endow::service("netd")
             .unwrap_or_else(|e| panic!("[{}] netd is not serving: {e:?}", case.name));
         if !case.bytes.is_empty() {
             let written = syscall::write(conn.fd(), &case.bytes)
@@ -119,7 +120,7 @@ fn main() {
     }
 
     // A connection that never says anything must not be netd's to hold forever.
-    let silent = services::connect("netd").expect("netd is not serving");
+    let silent = endow::service("netd").expect("netd is not serving");
     let opened = Instant::now();
     if !closed_by_peer(&silent, HANDSHAKE_CEILING) {
         eprintln!("netd held a silent connection for {:?} without dropping it", opened.elapsed());
@@ -134,7 +135,7 @@ fn main() {
     // asserting the opposite of the design.
     let mut held = Vec::new();
     for _ in 0..SILENT_BURST {
-        if let Ok(conn) = services::connect("netd") {
+        if let Ok(conn) = endow::service("netd") {
             held.push(conn);
         }
         syscall::nanosleep(BURST_PACE.as_nanos() as u64);
@@ -172,7 +173,7 @@ fn main() {
 /// [`ipc::FrameRx`] is the SDK's non-blocking framing — the same type netd now
 /// reads its clients with — so the deadline is this test's and not the peer's.
 fn still_serving() -> Result<(), String> {
-    let conn = services::connect("netd").map_err(|e| format!("netd refused a connection: {e:?}"))?;
+    let conn = endow::service("netd").map_err(|e| format!("netd refused a connection: {e:?}"))?;
     conn.try_send_bytes(MsgType::DnsLookup as u32, LITERAL)
         .map_err(|e| format!("netd would not take a request: {e:?}"))?;
 

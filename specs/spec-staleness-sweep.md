@@ -111,12 +111,17 @@ The dead-gate pattern is prose claiming a test proves something. Its **inverse**
 is a test that asserts the current, *known-wrong* behaviour on purpose, so that
 fixing the behaviour turns the test red and tells you the limitation lifted.
 
-`pipe_peer_scope` is the model. It asserts `be604ef`'s stated residual — a peer
-that only ever called `connect()` can open a pipe it was never handed and read
-another client's data. It passes today. The day `SYS_HANDLE_SEND` lands it goes
-red, with a panic message that says what to do:
+`pipe_peer_scope` was the model, and it worked: it asserted `be604ef`'s stated
+residual — a peer that only ever called `connect()` could open a pipe it was
+never handed and read another client's data — and carried the message that said
+what to do the day the residual closed:
 
 > `GOOD NEWS, BAD TEST: delete this file and assert the refusal instead.`
+
+Capability endowment closed it: a client's connection records no peer pid, so
+the clause that gave a peer its creator's pipes cannot fire. The file is
+deleted, which is the ending this pattern is *for* — `abuse_pipe_owner` carries
+the general property from here.
 
 **Use this whenever an entry is blocked on a named condition.** Of the three
 isolation items currently blocked, it is the only one that can watch for its own

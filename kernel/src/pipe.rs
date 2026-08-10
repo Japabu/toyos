@@ -11,7 +11,6 @@ use crate::mm::PAGE_2M;
 use crate::sched::payload::KWaitQueue;
 use crate::sched::waitqs::new_queue;
 use crate::io_uring::RingId;
-use crate::process::Pid;
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
 use crate::user_ptr::{UserBytes, UserBytesMut};
@@ -138,11 +137,6 @@ struct Pipe {
     /// byte — for a pending connection, before the server had even agreed to
     /// the conversation.
     backing: Option<Backing>,
-    /// The process that called `create`. `PipeId`s are dense sequential
-    /// integers and userland passes raw ones to `SYS_PIPE_OPEN`, so this is
-    /// the only thing that distinguishes "a peer handed me this id" from
-    /// "I counted up from zero". See `sys_pipe_open`.
-    creator: Pid,
     readers: u32,
     writers: u32,
     io_uring_watchers: Vec<RingId>,
@@ -162,11 +156,10 @@ struct Pipe {
 unsafe impl Send for Pipe {}
 
 impl Pipe {
-    fn new(id: PipeId, creator: Pid) -> Self {
+    fn new(id: PipeId) -> Self {
         Self {
             id,
             backing: None,
-            creator,
             readers: 0,
             writers: 0,
             io_uring_watchers: Vec::new(),
@@ -237,56 +230,13 @@ pub fn init() {
 /// the first `try_write` or `map_page`, and *that* is where userland driving
 /// physical memory — `SYS_PIPE` or `SYS_CONNECT` in a loop — meets an error
 /// return.
-pub fn create(creator: Pid) -> (PipeReader, PipeWriter) {
+pub fn create() -> (PipeReader, PipeWriter) {
     with_pipes_mut(|pipes| {
-        let id = pipes.insert_with(|id| Pipe::new(id, creator));
+        let id = pipes.insert_with(Pipe::new);
         let pipe = pipes.get_mut(id).expect("the pipe just inserted");
         let reader = PipeReader::acquire(pipe);
         let writer = PipeWriter::acquire(pipe);
         (reader, writer)
-    })
-}
-
-/// Why no reference to a pipe was taken.
-pub enum NotOpened {
-    /// No pipe has this id — it never existed, or both its ends have closed.
-    /// `IdMap` never reuses a key, so this can never mean some *other* pipe.
-    NoSuchPipe,
-    /// The pipe is there and `permitted` declined it.
-    NotPermitted,
-}
-
-/// Take a reader reference to an existing pipe, if `permitted` agrees with the
-/// pid that created it.
-///
-/// The creator is decided upon inside the acquisition that finds the pipe and
-/// counts the new reference, and is never handed back to be judged afterwards:
-/// the pipe the verdict is about and the pipe the count belongs to are the same
-/// `&mut Pipe`. `permitted` therefore must not touch `PIPES` itself — the lock
-/// is a non-reentrant ticket spinlock.
-pub fn open_reader(
-    id: PipeId,
-    permitted: impl FnOnce(Pid) -> bool,
-) -> Result<PipeReader, NotOpened> {
-    with_pipes_mut(|pipes| {
-        let pipe = pipes.get_mut(id).ok_or(NotOpened::NoSuchPipe)?;
-        if !permitted(pipe.creator) {
-            return Err(NotOpened::NotPermitted);
-        }
-        Ok(PipeReader::acquire(pipe))
-    })
-}
-
-pub fn open_writer(
-    id: PipeId,
-    permitted: impl FnOnce(Pid) -> bool,
-) -> Result<PipeWriter, NotOpened> {
-    with_pipes_mut(|pipes| {
-        let pipe = pipes.get_mut(id).ok_or(NotOpened::NoSuchPipe)?;
-        if !permitted(pipe.creator) {
-            return Err(NotOpened::NotPermitted);
-        }
-        Ok(PipeWriter::acquire(pipe))
     })
 }
 

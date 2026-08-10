@@ -128,10 +128,14 @@ fn spawn_err(name: &str, bytes: &[u8]) -> SyscallError {
         syscall::spawn(&SpawnArgs {
             argv_ptr: argv.as_ptr() as u64,
             argv_len: argv.len() as u64,
-            fd_map_ptr: 0,
-            fd_map_count: 0,
+            slot_map_ptr: 0,
+            slot_map_count: 0,
             env_ptr: 0,
             env_len: 0,
+            endow_ptr: 0,
+            endow_count: 0,
+            labels_ptr: 0,
+            labels_len: 0,
         })
     }
     .map(|pid| panic!("{name}: spawn succeeded (pid {pid:?}) — the header is malformed"))

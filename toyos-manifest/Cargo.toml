@@ -1,0 +1,11 @@
+[package]
+name = "toyos-manifest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# The one place a `devices` class name and a `syscap` right name are decoded.
+# Both are ABI vocabulary, and a manifest crate holding its own copy of either
+# would be a config the build system accepts and `/bin/init` cannot act on.
+[dependencies]
+toyos-abi = { path = "../toyos-abi" }

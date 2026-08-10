@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 
 use toyos_abi::syscall;
 use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::{namespace, port};
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -19,7 +20,7 @@ fn main() {
 }
 
 fn run_tests() {
-    test_listener_isolation_io_uring();
+    test_acceptor_isolation_io_uring();
     test_min_vruntime_invariant();
     test_connect_storm();
     println!("all sched_stress tests passed");
@@ -47,21 +48,24 @@ fn child_sched_info() {
     println!("{} {} {}", info.vruntime, info.min_vruntime, info.lag);
 }
 
-// Test 1: Listener isolation via io_uring POLL_IN
+// Test 1: Acceptor isolation via io_uring POLL_IN
 
-/// Two listeners create io_uring POLL_IN watches on their fds. A connect to
-/// svc_a must complete svc_a's poll and only svc_a's — a readiness signal keyed
-/// on "some listener" instead of on the object wakes every waiter in the
-/// system, which froze the compositor.
-fn test_listener_isolation_io_uring() {
+/// Two acceptors create io_uring POLL_IN watches on their handles. A connection
+/// opened through port A's connector must complete A's poll and only A's — a
+/// readiness signal keyed on "some acceptor" instead of on the object wakes
+/// every waiter in the system, which froze the compositor.
+fn test_acceptor_isolation_io_uring() {
     let a_ready = Arc::new(AtomicBool::new(false));
     let b_ready = Arc::new(AtomicBool::new(false));
     let a_ready2 = Arc::clone(&a_ready);
     let b_ready2 = Arc::clone(&b_ready);
 
-    // Thread A: listen, poll via io_uring, report whether poll completed
+    let (acc_a, con_a) = port::create().expect("port a");
+    let (acc_b, _con_b) = port::create().expect("port b");
+
+    // Thread A: watch its acceptor, report whether the poll completed
     let a = thread::spawn(move || -> bool {
-        let fd = syscall::listen("test_uring_a").expect("listen a");
+        let fd = acc_a.into_raw();
         a_ready2.store(true, Ordering::Release);
         let poller = Poller::new(1);
         poller.poll_add_fd(fd, IORING_POLL_IN, 0);
@@ -71,9 +75,9 @@ fn test_listener_isolation_io_uring() {
         ready
     });
 
-    // Thread B: listen on different service, poll via io_uring
+    // Thread B: a different port, watched the same way
     let b = thread::spawn(move || -> bool {
-        let fd = syscall::listen("test_uring_b").expect("listen b");
+        let fd = acc_b.into_raw();
         b_ready2.store(true, Ordering::Release);
         let poller = Poller::new(1);
         poller.poll_add_fd(fd, IORING_POLL_IN, 0);
@@ -83,25 +87,24 @@ fn test_listener_isolation_io_uring() {
         ready
     });
 
-    // Wait for both to be listening
+    // Wait for both to be watching
     while !a_ready.load(Ordering::Acquire) || !b_ready.load(Ordering::Acquire) {
         thread::yield_now();
     }
     thread::sleep(Duration::from_millis(20));
 
-    // Connect to svc_a only
-    let client = syscall::connect("test_uring_a").expect("connect a");
-    syscall::close(client);
+    // Open a connection through port A's connector only.
+    let ns = namespace::build().add("a", &con_a).finish().expect("a namespace naming port a");
+    let client = ns.open("a").expect("open a");
+    drop(client);
 
     let a_poll_ready = a.join().unwrap();
     let b_poll_ready = b.join().unwrap();
 
-    assert!(a_poll_ready, "svc_a poll should have completed (connection pending)");
-    assert!(!b_poll_ready, "svc_b poll completed spuriously — listener isolation broken!");
+    assert!(a_poll_ready, "port a's poll should have completed (connection pending)");
+    assert!(!b_poll_ready, "port b's poll completed spuriously — acceptor isolation broken!");
 
-    // Clean up: accept svc_a's connection so the listener can be removed
-
-    println!("  listener isolation (io_uring): ok");
+    println!("  acceptor isolation (io_uring): ok");
 }
 
 /// Verify the post-wake lag invariant: when a process transitions from
@@ -153,11 +156,16 @@ fn test_min_vruntime_invariant() {
 fn test_connect_storm() {
     let num_clients = 8;
 
+    let (acceptor, connector) = port::create().expect("a port to storm");
+    let ns = Arc::new(
+        namespace::build().add("storm", &connector).finish().expect("a namespace naming it"),
+    );
+
     let server = thread::spawn(move || {
-        let fd = syscall::listen("test_storm").expect("listen failed");
+        let fd = acceptor.into_raw();
         for _ in 0..num_clients {
-            let result = syscall::accept(fd).expect("accept failed");
-            syscall::close(result.fd);
+            let conn = syscall::accept(fd).expect("accept failed");
+            syscall::close(conn);
         }
         syscall::close(fd);
     });
@@ -166,9 +174,9 @@ fn test_connect_storm() {
 
     let mut clients = Vec::new();
     for _ in 0..num_clients {
-        clients.push(thread::spawn(|| {
-            let fd = syscall::connect("test_storm").expect("connect failed");
-            syscall::close(fd);
+        let ns = Arc::clone(&ns);
+        clients.push(thread::spawn(move || {
+            drop(ns.open("storm").expect("open failed"));
         }));
     }
 

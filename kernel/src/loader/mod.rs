@@ -14,7 +14,7 @@ mod start;
 mod symbols;
 mod tls;
 
-pub use start::{build_child_fds, FD_PAIR_LEN};
+pub use start::{build_child_handles, PendingHandles, SLOT_PAIR_LEN};
 pub(crate) use start::{alloc_kernel_stack, process_start, thread_start};
 pub use tls::{setup_combined_tls, setup_tls, DTV_INITIAL_CAPACITY};
 
@@ -23,16 +23,17 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::elf;
-use crate::fd::{Descriptor, FdTable};
+use crate::object::{ops, HandleTable, KObjectRef};
 use crate::mm::paging::CachePolicy;
 use crate::mm::PAGE_2M;
 use crate::process::{
-    vma_map, ElfInfo, OwnedAlloc, PageAlloc, PageFaultTrace, PageTables, Pid,
+    vma_map, ElfInfo, Endowments, OwnedAlloc, PageAlloc, PageFaultTrace, PageTables, Pid,
     ProcessAccounting, ProcessData, ProcessEntry, ThreadData, ThreadEntry, UserStack,
     PROCESS_TABLE,
 };
 use crate::sync::Lock;
 use crate::{scheduler, vfs, DirectMap, UserAddr};
+use toyos_abi::handle::Rights;
 use toyos_abi::syscall::SyscallError;
 use toyos_elf::section::SectionTable;
 use toyos_elf::sym::{self, SymTab};
@@ -380,23 +381,45 @@ fn rela_dyn_from_sections(
     }
 }
 
-pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> Result<Pid, SyscallError> {
+/// Load a program and place its main thread, answering the object a handle to
+/// the new process names.
+///
+/// **No parent argument, because a process has no parent.** The one thing the
+/// spawning process contributed beyond what it endowed was its working
+/// directory, and the caller passes that: nothing else about the caller is
+/// recorded, so there is no relationship for a later call to authorize
+/// against.
+/// **The refusal is a value, and that is what stops eight megabytes going with
+/// it.** Every failure below owns a partly built process — the child's address
+/// space with its ELF regions mapped, `USER_STACK_SIZE` of stack, a 128 KiB
+/// kernel stack, the symbol table, the loaded libraries — and nothing unwinds,
+/// so a `-> !` taken from inside this frame strands all of it. `Refusal` is
+/// therefore the error type: the three handle kinds that end the caller are
+/// carried out to the dispatcher and refused there, with this frame gone. It is
+/// the same shape `c29bb8a` fixed one layer up, where the stranded values were
+/// three `Arc`s rather than 8 MB.
+pub fn spawn(
+    argv: &[&str],
+    pending: PendingHandles,
+    cwd: String,
+    env: Vec<u8>,
+) -> Result<Arc<crate::object::process::ProcessObject>, crate::object::Refusal> {
     // An argv of only separators survives the split in sys_spawn as an empty
     // slice; there is no argv[0] to load.
     let Some(&path) = argv.first() else {
-        return Err(SyscallError::InvalidArgument);
+        return Err(SyscallError::InvalidArgument.into());
     };
     let t0 = crate::clock::nanos_since_boot();
 
     // The guard is scoped rather than held across the match: every `return`
-    // past this point drops `fds`, and releasing a file descriptor takes the
-    // VFS lock (`fd::OpenFile::drop`).
+    // past this point drops `pending`, and releasing a file object takes the
+    // VFS lock (`object::file::OpenFileState::drop`).
     let opened = vfs::lock().open_backing(path);
     let backing: Arc<dyn crate::file_backing::FileBacking> = match opened {
         Ok(b) => b,
         Err(e) => {
             log!("spawn: {}: {e}", path);
-            return Err(e);
+            return Err(e.into());
         }
     };
 
@@ -406,14 +429,14 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         Ok(l) => l,
         Err(msg) => {
             log!("spawn: {}: {}", path, msg);
-            return Err(SyscallError::InvalidArgument);
+            return Err(SyscallError::InvalidArgument.into());
         }
     };
 
     if !image_fits_user_half(&layout) {
         log!("spawn: {}: image spans {:#x} bytes, past the user half from {:#x}",
             path, layout.span(), USER_VM_BASE);
-        return Err(SyscallError::InvalidArgument);
+        return Err(SyscallError::InvalidArgument.into());
     }
     let base = USER_VM_BASE - layout.vaddr_min;
 
@@ -429,7 +452,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         elf::RelocationIndex::with_capacity(u64_writes, exe.relas.tpoff32.len())
     else {
         log!("spawn: {}: {} relocations do not fit one index", path, u64_writes);
-        return Err(SyscallError::ResourceExhausted);
+        return Err(SyscallError::ResourceExhausted.into());
     };
     for &(r_offset, r_addend) in &exe.relas.relative {
         reloc_index.add_u64(r_offset, (base as i64 + r_addend) as u64);
@@ -500,7 +523,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         Some(a) => a,
         None => {
             log!("spawn: {}: failed to allocate user stack ({} bytes)", path, USER_STACK_SIZE);
-            return Err(SyscallError::ResourceExhausted);
+            return Err(SyscallError::ResourceExhausted.into());
         }
     };
     let stack_phys = DirectMap::from_phys(stack_pages.phys());
@@ -526,13 +549,13 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             // ceiling here.
             let Some(tls_buf) = OwnedAlloc::new(tls.memsz as usize, 16) else {
                 log!("spawn: {}: cannot allocate a {}-byte TLS template", path, tls.memsz);
-                return Err(SyscallError::ResourceExhausted);
+                return Err(SyscallError::ResourceExhausted.into());
             };
             if elf::read_backing_into(backing.as_ref(), tls_file_off, tls_buf.ptr(), tls.filesz as usize)
                 .is_err()
             {
                 log!("spawn: {}: the TLS template could not be read off the device", path);
-                return Err(SyscallError::NotFound);
+                return Err(SyscallError::NotFound.into());
             }
             Some(tls_buf)
         }
@@ -543,7 +566,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         tls::build_tls_layout(&loaded_libs.libs, &layout, exe_tls_template.as_ref())
     else {
         log!("spawn: {}: the TLS modules do not fit one block", path);
-        return Err(SyscallError::ResourceExhausted);
+        return Err(SyscallError::ResourceExhausted.into());
     };
 
     apply_tls_relocs(&exe, backing.as_ref(), &loaded_libs.libs, &tls_modules,
@@ -567,7 +590,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         tls::map_block(&child_pt, &tls_modules, tls_total_memsz, max_tls_align)
     else {
         log!("spawn: {}: failed to allocate TLS ({} bytes)", path, tls_total_memsz);
-        return Err(SyscallError::ResourceExhausted);
+        return Err(SyscallError::ResourceExhausted.into());
     };
 
     let entry = base + layout.entry;
@@ -585,26 +608,23 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         Some(ks) => ks,
         None => {
             log!("spawn: {}: failed to allocate kernel stack", path);
-            return Err(SyscallError::ResourceExhausted);
+            return Err(SyscallError::ResourceExhausted.into());
         }
     };
 
-    let cwd = match parent {
-        Some(ppid) => {
-            let arc = {
-                let guard = PROCESS_TABLE.lock();
-                let table = guard.as_ref().unwrap();
-                Arc::clone(table.get(ppid).unwrap().process_data())
-            };
-            let cwd = arc.lock().cwd.clone();
-            cwd
-        }
-        None => String::from("/"),
-    };
 
     let NeededLibs { libs: loaded_libs, paths: lib_paths } = loaded_libs;
+    // **The point of no return, and the last thing that can refuse.** Every
+    // failure above this line answers the caller with its table untouched; the
+    // endowed handles leave it here, where nothing between this and the process
+    // entry can fail.
+    // A handle that stopped resolving between the arguments being read and this
+    // line is the caller racing its own spawn: a bug in the caller, and fatal.
+    // It travels out as a value so this frame's eight megabytes drop on the
+    // way, and the dispatcher ends the caller with nothing held.
+    let (handles, endowments) = pending.commit()?;
     let proc_data = Arc::new(Lock::new(ProcessData {
-        fds,
+        handles,
         cwd,
         env,
         elf: ElfInfo {
@@ -634,7 +654,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         exe_path: String::from(path),
         spawn_ns: crate::clock::nanos_since_boot(),
         accounting: ProcessAccounting::default(),
-        child_stats: Vec::new(),
+        endowments,
     }));
 
     let thread_data = Arc::new(Lock::new(ThreadData {
@@ -642,7 +662,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         stack_pages: Some(stack_pages),
         user_stack_base: user_stack.base(),
         user_stack_size: user_stack.size(),
-        syscall_counts: [0; 64],
+        syscall_counts: [0; toyos_abi::syscall::SYSCALL_PROFILE_BINS],
         syscall_total: 0,
         syscall_total_ns: 0,
     }));
@@ -651,13 +671,13 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let table = guard.as_mut().unwrap();
     let pid = table.insert_with(|pid| ProcessEntry::new(
         pid,
-        parent,
         start::make_name(path),
         proc_data,
         Arc::new(Lock::new(syms)),
         ThreadEntry::new(thread_data),
     ));
     let tid = table.get(pid).unwrap().main_tid();
+    let object = Arc::clone(table.get(pid).unwrap().object());
 
     // Placed while still holding the table lock: kill_process claims teardown
     // under this lock, so once the pid is visible its main thread is already in
@@ -679,7 +699,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t_deps - t2) / 1_000_000,
         (t_tls - t_deps) / 1_000_000, (t3 - t0) / 1_000_000);
 
-    Ok(pid)
+    Ok(object)
 }
 
 /// The libraries an executable's `DT_NEEDED` entries name, and the paths they
@@ -883,14 +903,52 @@ fn exe_tpoff(
     0
 }
 
-/// Spawn a process from kernel context during boot. Resolves bare names to
-/// `/bin/<name>`. Panics on failure: a boot that cannot start its init
-/// programs has nowhere to report to.
-pub fn spawn_kernel(argv: &[&str]) -> Pid {
-    let mut fds = FdTable::new();
-    for fd in 0..3 {
-        fds.insert_at(fd, Descriptor::SerialConsole)
-            .expect("spawn_kernel: three fds cannot exhaust an empty table");
+/// The one program the kernel starts. `src/build.rs` puts this binary in every
+/// image regardless of `[programs]`, so an initrd without it is a build that
+/// went wrong rather than a machine that boots differently.
+pub const INIT_PATH: &str = "/bin/init";
+
+/// Start `/bin/init`, holding the machine's one full-rights `SysCap`.
+///
+/// Nothing else can construct one, so the set of processes that can ever mint
+/// a device claim, enter the RT band or open a process by pid is exactly what
+/// init endows. Panics on failure: a boot that cannot start init has nowhere
+/// to report to and nothing left to do.
+pub fn spawn_init() -> Pid {
+    let mut handles = HandleTable::new();
+    let console = KObjectRef::Console(crate::object::device::ConsoleObject::new());
+    for slot in 0..3 {
+        let entry = crate::object::HandleEntry::new(
+            console.clone(),
+            ops::initial_rights(&console),
+        );
+        let (_, displaced) = handles
+            .install_at(slot, entry)
+            .expect("spawn_init: three slots cannot exhaust an empty table");
+        assert!(displaced.is_none(), "an empty table had something at slot {slot}");
     }
-    spawn(argv, fds, None, Vec::new()).expect("spawn_kernel: failed to spawn")
+    let cap = KObjectRef::SysCap(crate::object::syscap::SysCap::new());
+    let rights = Rights::DUP
+        .union(Rights::TRANSFER)
+        .union(Rights::DEVICE)
+        .union(Rights::RT)
+        .union(Rights::MANAGE);
+    let cap_handle = handles
+        .install(crate::object::HandleEntry::new(cap, rights))
+        .expect("spawn_init: an empty table refused the system capability");
+    let label = toyos_abi::syscall::SYSCAP_LABEL;
+    let endowments = Endowments::new(
+        alloc::vec![toyos_abi::syscall::EndowEntry {
+            label_off: 0,
+            label_len: label.len() as u32,
+            handle: cap_handle,
+            _pad: 0,
+        }],
+        label.as_bytes().to_vec(),
+    );
+    match spawn(&[INIT_PATH], PendingHandles::Ready(handles, endowments), String::from("/"), Vec::new()) {
+        Ok(object) => object.pid(),
+        Err(crate::object::Refusal::Error(e)) => panic!("spawn_init: failed to spawn: {e:?}"),
+        Err(crate::object::Refusal::Handle(e)) => panic!("spawn_init: {e}"),
+    }
 }

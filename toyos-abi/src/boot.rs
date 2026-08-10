@@ -10,8 +10,6 @@ pub struct KernelArgs {
     pub rsdp_addr: u64,
     pub initrd_addr: u64,
     pub initrd_size: u64,
-    pub init_program_addr: u64,
-    pub init_program_len: u64,
     pub kernel_elf_addr: u64,
     pub kernel_elf_size: u64,
     pub gop_framebuffer: u64,
@@ -133,16 +131,16 @@ const _: () = {
     assert!(offset_of!(KernelArgs, kernel_memory_addr) == 16);
     assert!(offset_of!(KernelArgs, kernel_stack_addr) == 32);
     assert!(offset_of!(KernelArgs, kernel_stack_size) == 40);
-    assert!(offset_of!(KernelArgs, boot_partition_start_lba) == 144);
-    assert!(offset_of!(KernelArgs, boot_partition_blocks) == 152);
-    assert!(offset_of!(KernelArgs, boot_partition_guid) == 160);
-    assert!(offset_of!(KernelArgs, boot_partition_present) == 176);
-    assert!(offset_of!(KernelArgs, log_partition_guid) == 180);
-    assert!(offset_of!(KernelArgs, rtc_utc_offset_minutes) == 196);
-    assert!(offset_of!(KernelArgs, rtc_utc_offset_known) == 200);
-    assert!(offset_of!(KernelArgs, cmdline_addr) == 208);
-    assert!(offset_of!(KernelArgs, cmdline_len) == 216);
-    assert!(size_of::<KernelArgs>() == 224);
+    assert!(offset_of!(KernelArgs, boot_partition_start_lba) == 128);
+    assert!(offset_of!(KernelArgs, boot_partition_blocks) == 136);
+    assert!(offset_of!(KernelArgs, boot_partition_guid) == 144);
+    assert!(offset_of!(KernelArgs, boot_partition_present) == 160);
+    assert!(offset_of!(KernelArgs, log_partition_guid) == 164);
+    assert!(offset_of!(KernelArgs, rtc_utc_offset_minutes) == 180);
+    assert!(offset_of!(KernelArgs, rtc_utc_offset_known) == 184);
+    assert!(offset_of!(KernelArgs, cmdline_addr) == 192);
+    assert!(offset_of!(KernelArgs, cmdline_len) == 200);
+    assert!(size_of::<KernelArgs>() == 208);
     assert!(align_of::<KernelArgs>() == 8);
 };
 

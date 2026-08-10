@@ -7,9 +7,9 @@
 //! Two refusals, both of which used to be impossible to express:
 //!
 //! - a size no machine can back. `req.width`/`req.height` are unvalidated u32
-//!   from the client and `content_w * content_h * 4` reached
-//!   `SharedMemory::allocate`, which asserted on the size the kernel refused.
-//!   One message from any client and the compositor was gone.
+//!   from the client and `content_w * content_h * 4` reached the region
+//!   allocation, which asserted on the size the kernel refused. One message
+//!   from any client and the compositor was gone.
 //! - one window past the memory budget. There was no budget.
 //!
 //! The count is printed rather than asserted against a constant here: the host
