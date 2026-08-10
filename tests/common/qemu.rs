@@ -30,6 +30,21 @@ pub fn live_instances() -> u32 {
     LIVE.load(Ordering::SeqCst)
 }
 
+/// Guests this run has started, and how many of them were not the shipping
+/// kernel.
+///
+/// A registration is not a boot — several tests boot two machines and one boots
+/// four — so the count that decides whether a scheduling or build change worked
+/// cannot be read off the test lists. It was static analysis until now, and
+/// `specs/test-cost-audit.md` §6 records that as a lower bound.
+static BOOTS: AtomicU32 = AtomicU32::new(0);
+static FEATURE_BOOTS: AtomicU32 = AtomicU32::new(0);
+
+/// `(boots, boots that asked for a kernel feature)`.
+pub fn boot_census() -> (u32, u32) {
+    (BOOTS.load(Ordering::Relaxed), FEATURE_BOOTS.load(Ordering::Relaxed))
+}
+
 /// How many guests the phase now running may have up at once.
 ///
 /// The harness's own wall-clock margins are margins on the *host*, and they were
@@ -1416,47 +1431,10 @@ pub fn build_boot_image(
     toyos_build::build::build_test_image(
         &compile::repo_root(),
         &config_path,
-        &fold_inert(kernel_features),
+        kernel_features,
         quiet,
         &extra_files,
     )
-}
-
-/// Actuators that are a `SYS_DEBUG` action arm and nothing else.
-///
-/// A boot cannot reach any of them; only a test that asks for one by number
-/// can. So the kernels that differ only in which of them they carry are
-/// several builds of the same machine, and [`fold_inert`] makes them one.
-///
-/// **Membership is a claim about the kernel, not about the test that uses it**,
-/// and the claim is checkable: each name below has its `#[cfg]` sites in
-/// `arch/syscall.rs`'s `SYS_DEBUG` match and nowhere on any path a boot runs.
-/// A feature that changes what `init` does, what a driver reads, or what a
-/// ceiling is worth belongs in its own build and is not eligible.
-/// `specs/test-cost-audit.md` §5.4.3 classifies every one of them.
-///
-/// `test-tlb-ack-delay` is the one member whose code is not confined to the
-/// match arm: `arch::tlb::serve_ipi` loads one relaxed word per flush. Nothing
-/// writes that word except the arm, and its own gate re-measures with the delay
-/// disarmed, so a kernel carrying the feature and never asked flushes exactly as
-/// one without it. Stated rather than assumed, because the claim above is what
-/// makes folding sound.
-const INERT_ACTUATORS: &[&str] = &[
-    "test-fatal-halt",
-    "test-screen-graffiti",
-    "test-double-fault",
-    "test-heap-ceiling",
-    "test-kernel-canary",
-    "test-tlb-ack-delay",
-];
-
-/// The feature set to build, with every inert actuator replaced by the union of
-/// them. A test still names the actuator it needs — that is what its assertion
-/// is about — and the build system stops treating the name as a distinct kernel.
-fn fold_inert<'a>(requested: &[&'a str]) -> Vec<&'a str> {
-    let mut out: Vec<&'a str> = vec!["test-actuators"];
-    out.extend(requested.iter().copied().filter(|f| !INERT_ACTUATORS.contains(f)));
-    out
 }
 
 /// Build all binaries in a test crate.
@@ -1499,6 +1477,10 @@ impl QemuInstance {
         let mut features: Vec<&str> = options.kernel_features.to_vec();
         if options.debug_wait {
             features.push("debug-wait");
+        }
+        BOOTS.fetch_add(1, Ordering::Relaxed);
+        if !features.is_empty() {
+            FEATURE_BOOTS.fetch_add(1, Ordering::Relaxed);
         }
         let disk = build_boot_image(test_crate, c_tests, rust_tests, &features);
 

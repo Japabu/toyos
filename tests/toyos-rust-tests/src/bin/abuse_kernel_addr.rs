@@ -15,8 +15,8 @@
 //! would return the same error to a userland that cannot read a byte of the
 //! kernel's address space to notice. So the kernel keeps sixteen bytes with a
 //! known value and answers two questions about them
-//! (`kernel/Cargo.toml`'s `test-kernel-canary`): where they are, and whether
-//! they still say what it put there.
+//! (`SYS_DEBUG` actions 10 and 11): where they are, and whether they still say
+//! what it put there.
 
 use toyos_abi::syscall::{self, MmapFlags, MmapProt, SyscallError, SYS_DLOPEN};
 

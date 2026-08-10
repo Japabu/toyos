@@ -409,8 +409,8 @@ from it or settles something it left open:
   contiguous pages, so a correct piecewise copy writes exactly the bytes the
   broken code wrote and no assertion can tell them apart. Refusing is one
   comparison, and it is observable.
-- **`test-kernel-canary` is the actuator the dlopen gate needs**, and it joins
-  the inert-actuator bundle, so it costs no extra kernel build. A guest cannot
+- **`SYS_DEBUG` 10 and 11 are the actuator the dlopen gate needs**, and they are
+  arms of the one test feature, so they cost no extra kernel build. A guest cannot
   read a byte of the kernel's address space, so a syscall that writes there
   leaves nothing to assert on; SYS_DEBUG 10 and 11 answer where sixteen known
   bytes are and whether they still say what the kernel put there.
