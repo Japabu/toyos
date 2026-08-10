@@ -469,9 +469,22 @@ jobs:
           path: /tmp/durations
           merge-multiple: false
 
+      # **A run whose shards never finished measured nothing, and that is not a
+      # finding about the profile.** `--merge-durations` refuses an empty
+      # directory by name — right for the human typing it, wrong here, where a
+      # cancelled or gated-off run would red a job that has nothing to say. Run
+      # `31376796572` is the instance: `toolchain-ready` was green, the twelve
+      # shards were cancelled by the next push, and this job failed on
+      # `no test-durations.shard-*`.
       - name: what the partition cost
         run: |
           set -o pipefail
+          if ! ls /tmp/durations/*/test-durations.shard-* >/dev/null 2>&1; then
+            echo "no shard left a measurement: ${{ needs.guest.result }}"
+            echo "- no shard measured anything (\`guest\`: ${{ needs.guest.result }})" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           cargo run -- --merge-durations /tmp/durations 2>&1 | tee /tmp/merged.log
           {
             echo "### the duration profile"
