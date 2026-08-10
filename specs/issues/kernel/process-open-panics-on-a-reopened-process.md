@@ -48,3 +48,22 @@ The first is the honest one.
 
 Whichever: the assert must not be reachable from a syscall argument. *"Fail-fast
 is for kernel bugs, not for untrusted input"*, and a pid is untrusted input.
+
+## Ruled not a merge blocker, 2026-08-10
+
+Judged while clearing PR #22's blockers.
+
+**It is not reachable from userland at all today.** `SYS_PROCESS_OPEN` needs
+`Rights::MANAGE` on a `SysCap`; the kernel mints exactly one, for `/bin/init`,
+and init narrows every duplicate to what a program's `syscap` row asks for —
+`rg -n 'syscap' */system.toml tests/*/system.toml` names `rt`, `device` and
+`dup` and never `manage`. `SysCap::open_process` has no caller anywhere. So the
+panic is latent: the mechanism exists in the ABI and the first caller finds it.
+
+**And the fix is not a line.** `retired` is set by `HandleEntry::drop` for every
+row, and the honest repair is a `kobject!` column saying which objects outlive
+their handles — a second keyword on all thirteen rows, plus a weakening of the
+resurrection assert for exactly one of them. That is a change with its own
+argument to make about which objects the *kernel* answers for after userland
+stops naming them, and it should be made where somebody is looking at that
+question rather than beside a launcher fix.

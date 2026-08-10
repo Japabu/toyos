@@ -27,21 +27,53 @@
 //! ordinary spawn, which goes through init because this process holds a
 //! `launcher` connector and `/bin/toybox` is a declared program. It runs last,
 //! so it also asserts init survived all three.
+//!
+//! **A fourth shape, and it is the one init could not survive at all: a client
+//! that connects and says nothing.** `serve_launch`'s first statement was a
+//! blocking `recv_header` on the fresh connection, so two syscalls from any
+//! holder of the connector — the compositor, every terminal, every shell, sshd
+//! — parked the machine's only way to start a process for ever, with init alive
+//! and looking healthy.
+//!
+//! **Every answer this file waits for is bounded, and that is not decoration.**
+//! A test that hangs instead of failing is worse than no test: a harness
+//! timeout is a liveness guard rather than a verdict, and a guest that never
+//! returns takes its whole shared boot down with it. So the launcher's replies
+//! are read with [`answer_within`], and a launcher that has stopped answering
+//! is an assertion with a name on it. The one arm that cannot be bounded from
+//! here — `Command`, which blocks inside `std` — runs after a bounded launch
+//! has already proved init is answering.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
+use toyos::census::Census;
+use toyos::ipc::{Connection, FrameRx, RxStep};
 use toyos::launch::{self, Launch};
 use toyos::{namespace, port, AsHandle};
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, SyscallError};
 use toyos_abi::RawHandle;
 
-/// `SYS_DEBUG` action 14: how many kernel objects are alive right now.
-const CENSUS_TOTAL: u64 = 14;
-
 /// Rounds per census sample. Large enough that one leaked handle per round is
 /// a number no drain lag can hide.
 const ROUNDS: usize = 16;
+
+/// How long init may take to answer a launch before this file calls it wedged.
+///
+/// Generous by two orders of magnitude: a refusal is a frame decode and a
+/// namespace build, and a grant is one `SYS_SPAWN`. What this bounds is the
+/// launcher that answers *never*, and the number only decides how long the red
+/// takes to arrive.
+const ANSWER_BUDGET: Duration = Duration::from_secs(5);
+
+/// Clients that connect to the launcher and then say nothing, held open across
+/// the launch that must still be answered.
+///
+/// Well under init's own `MAX_PENDING_LAUNCHES`, because what is under test is
+/// that a silent client costs a slot rather than the event loop — not the bound
+/// on how many slots there are.
+const QUIET_CLIENTS: usize = 8;
 
 /// A program `tests/netcase` declares that serves nothing and provides
 /// nothing, so a refused launch of it takes no acceptor with it.
@@ -49,25 +81,93 @@ const DECLARED: &str = "/bin/toybox";
 
 fn main() {
     the_kernel_answers_rather_than_faults();
+    a_quiet_client_does_not_wedge_the_launcher();
     not_a_connector();
     a_connector_it_cannot_duplicate();
 
     let before = churn();
     let after = churn();
+    let grown: Vec<_> = after.grown_since(&before).collect();
     assert!(
-        after <= before,
-        "{ROUNDS} more refused launches left {} more live objects ({before} then {after}): \
-         init is keeping the handles a refusal took",
-        after.saturating_sub(before),
+        grown.is_empty(),
+        "{ROUNDS} more refused launches left more live objects behind: {grown:?} — \
+         first {before}, then {after}: init is keeping the handles a refusal took",
     );
-    println!("  census: {before} live objects, then {after}");
+    println!("  census: {} live objects, then {}", before.total(), after.total());
 
     the_launcher_still_works();
     println!("a bad launch is refused, and init is still the launcher");
 }
 
-fn launcher() -> toyos::ipc::Connection {
+fn launcher() -> Connection {
     toyos::endow::service("launcher").expect("this process was endowed a launcher connector")
+}
+
+/// Read the launcher's reply without ever blocking on it.
+///
+/// `Err` is the verdict this file exists to be able to reach: a launcher that
+/// has not answered inside the budget is one no `recv_header` would ever come
+/// back from.
+fn answer_within(conn: &Connection, budget: Duration) -> Result<u32, &'static str> {
+    let deadline = Instant::now() + budget;
+    // The replies are bare headers, so nothing of a payload has to be kept.
+    let mut rx = FrameRx::<0>::new();
+    loop {
+        match rx.pump(conn) {
+            RxStep::Frame { msg_type, .. } => return Ok(msg_type),
+            RxStep::Eof => return Err("the launcher dropped the connection"),
+            RxStep::Malformed => return Err("the launcher sent a frame this protocol cannot describe"),
+            RxStep::Idle => {
+                if Instant::now() >= deadline {
+                    return Err("the launcher never answered");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+/// Clients that connect and go quiet, and a launch that must be answered anyway.
+///
+/// Two silences, because they park a server at different statements: a
+/// connection that never writes a byte, and one that writes half a header and
+/// stops. The first is what `accept` used to be fused to; the second is what a
+/// frame read in one blocking call used to wait out.
+fn a_quiet_client_does_not_wedge_the_launcher() {
+    let quiet: Vec<Connection> = (0..QUIET_CLIENTS).map(|_| launcher()).collect();
+    let half = launcher();
+    half.write_nonblock(&[0u8; 4]).expect("half a frame header");
+
+    // **A launch init answers and does not grant.** What is under test is that
+    // the event loop reaches a frame at all while other connections are silent;
+    // a *granted* launch would put a spawned process's output on init's own
+    // stdio, which is this boot's console, and hand back a `Process` handle for
+    // the census arm below to account for.
+    let conn = launcher();
+    let mut buf = [0u8; 512];
+    let request = Launch {
+        program: "/bin/no-such-program",
+        argv: b"",
+        env: b"",
+        cwd: "/",
+        extras: &[],
+        slots: &[],
+    };
+    let len = request.encode(&mut buf).expect("encode a launch");
+    conn.send_bytes_with_handles(&[], launch::MSG_LAUNCH, &buf[..len])
+        .expect("the launcher took the frame");
+
+    match answer_within(&conn, ANSWER_BUDGET) {
+        Ok(launch::MSG_NOT_DECLARED) => {}
+        Ok(other) => panic!("the launcher answered {other} for a program nothing declares"),
+        Err(why) => panic!(
+            "{QUIET_CLIENTS} clients that said nothing and one that said half a header \
+             left the machine unable to start a process: {why}",
+        ),
+    }
+    drop(quiet);
+    drop(half);
+    println!("  quiet clients: {QUIET_CLIENTS} silent and one half-spoken, and a launch still ran");
 }
 
 /// One frame that promises no handles, with two in the batch beside it.
@@ -94,7 +194,7 @@ fn a_frame_that_lies() {
     drop(write);
 }
 
-fn churn() -> u64 {
+fn churn() -> Census {
     for _ in 0..ROUNDS {
         a_frame_that_lies();
     }
@@ -105,7 +205,7 @@ fn churn() -> u64 {
     // the sampled window, and an exiting process leaves objects on the
     // deferred release queue — the sample would be reading that lag.
     assert_eq!(a_launch_it_refuses(), launch::MSG_REFUSED, "the synchronising launch was granted");
-    syscall::debug(CENSUS_TOTAL)
+    Census::now()
 }
 
 /// A launch init answers and does not grant: an extra naming a pipe where a
@@ -144,7 +244,7 @@ fn refused_with(extras: &[(&str, RawHandle)]) -> u32 {
     let conn = launcher();
     conn.send_bytes_with_handles(&handles[..count], launch::MSG_LAUNCH, &buf[..len])
         .expect("the launcher took the frame");
-    conn.recv_header().expect("init answered the launch").msg_type
+    answer_within(&conn, ANSWER_BUDGET).expect("init answered the launch")
 }
 
 /// The non-vacuity arm. `/bin/toybox` is a `[programs]` key, so a caller

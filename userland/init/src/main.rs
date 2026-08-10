@@ -30,12 +30,14 @@ macro_rules! say {
 use std::collections::BTreeMap;
 use std::os::toyos::process::{ChildExt, CommandExt};
 use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use toyos_manifest::{Manifest, Program};
 use toyos::endow::Endowments;
-use toyos::ipc::Connection;
+use toyos::ipc::{self, Connection, RxStep};
 use toyos::launch::{self, Request};
 use toyos::namespace::{self, Namespace};
+use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::port::{self, Acceptor, Connector};
 use toyos::syscap::SysCap;
 use toyos::AsHandle;
@@ -46,6 +48,50 @@ use toyos_abi::syscall::{
 /// The service init answers on. Its own, so it has no `[programs]` row and the
 /// manifest carries it as an `init-serve` record.
 const LAUNCHER: &str = "launcher";
+
+/// Connections accepted and not yet carrying a whole launch.
+///
+/// **The bound is init's handle table, not memory.** A connection nobody has
+/// spoken on costs a `PendingConnection` and no ring page, so what this stops a
+/// client from doing is filling the one table the machine cannot do without.
+/// Thirty-two is the kernel's own per-port queue depth
+/// (`MAX_PENDING_CONNECTIONS`), which is the allowance one step earlier on the
+/// same path — past it init refuses by name rather than growing.
+const MAX_PENDING_LAUNCHES: usize = 32;
+
+/// How long an accepted connection may go without completing its launch.
+///
+/// Policy, and generous: every caller sends its frame in the statement after
+/// `connect` (`toyos::launch::launch`). What this bounds is the one that never
+/// sends it, and it is what guarantees the table above drains.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One caller's inbound framing.
+///
+/// **init never reads a client with a blocking read.** `recv_header` and
+/// `recv_bytes` park the caller until the peer sends the bytes it promised, so
+/// a client that connected and said nothing used to park init — and init is the
+/// machine's only way to start a process. The whole request blob is kept
+/// because a launch carries the child's argv, environment and working
+/// directory, and a truncated one is a launch refused for a reason the caller
+/// did not cause.
+type LaunchRx = ipc::FrameRx<{ ipc::MAX_FRAME_LEN as usize }>;
+
+/// A connection that has been accepted and has not yet said what to start.
+///
+/// It exists because accept and the request frame are two events, and init used
+/// to fuse them with a blocking `recv_header` on the fresh connection.
+struct Pending {
+    conn: Connection,
+    rx: LaunchRx,
+    since: Instant,
+}
+
+/// The poll token for the `launcher` acceptor. A pending connection's token is
+/// [`TOKEN_PENDING_BASE`] plus its handle, which is unique among the
+/// connections init holds at once.
+const TOKEN_ACCEPTOR: u64 = 0;
+const TOKEN_PENDING_BASE: u64 = 1;
 
 fn main() {
     let syscap: SysCap = Endowments::get()
@@ -100,10 +146,115 @@ fn main() {
     let launcher = acceptors
         .remove(LAUNCHER)
         .expect("init: the manifest declares init serves `launcher`");
+    launch_forever(&launcher, &system, &syscap, &mut acceptors, &connectors);
+}
+
+/// Serve `launcher` for the rest of the machine's life.
+///
+/// **An event loop and not an accept loop, because the rule every other server
+/// in this tree obeys binds init hardest.** A server never blocks on a client:
+/// accept and the first frame are two events, a frame is buffered until whole
+/// before anything acts on it, and a reply is one non-blocking write. init used
+/// to read the fresh connection with `recv_header`, so any process holding a
+/// `launcher` connector — the compositor, every terminal, every shell, sshd,
+/// the one thing reachable from the network — could connect, say nothing, and
+/// take the machine's only way to create a process with two syscalls, leaving
+/// init alive and looking healthy.
+fn launch_forever<'a>(
+    launcher: &Acceptor,
+    system: &'a Manifest,
+    syscap: &SysCap,
+    acceptors: &mut BTreeMap<&'a str, Acceptor>,
+    connectors: &BTreeMap<&str, Connector>,
+) -> ! {
+    let poller = Poller::new(1 + MAX_PENDING_LAUNCHES as u32);
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut ready: Vec<u64> = Vec::new();
     loop {
-        match launcher.accept() {
-            Ok(conn) => serve_launch(&conn, &system, &syscap, &mut acceptors, &connectors),
-            Err(e) => panic!("init: launcher acceptor refused: {e:?}"),
+        poller.poll_add(launcher, IORING_POLL_IN, TOKEN_ACCEPTOR);
+        for p in &pending {
+            poller.poll_add(&p.conn, IORING_POLL_IN, TOKEN_PENDING_BASE + p.conn.fd().0 as u64);
+        }
+        // A client that connects and then says nothing wakes nothing, so the
+        // deadline that removes it has to be a wake in its own right —
+        // otherwise a silent client is only ever timed out by some other
+        // client's traffic, and with the table full there is no other client.
+        let timeout = if pending.is_empty() {
+            u64::MAX
+        } else {
+            HANDSHAKE_TIMEOUT.as_nanos() as u64
+        };
+        ready.clear();
+        poller.wait(1, timeout, |token| ready.push(token));
+
+        let now = Instant::now();
+        for p in pending.iter().filter(|p| now.duration_since(p.since) >= HANDSHAKE_TIMEOUT) {
+            say!(
+                "init: launcher: dropping client {} — it never finished its launch",
+                p.conn.fd().0
+            );
+        }
+        pending.retain(|p| now.duration_since(p.since) < HANDSHAKE_TIMEOUT);
+
+        // Accept and the request are two events. Nothing is read here.
+        if ready.contains(&TOKEN_ACCEPTOR) {
+            let conn = match launcher.accept() {
+                Ok(conn) => conn,
+                Err(e) => panic!("init: launcher acceptor refused: {e:?}"),
+            };
+            if pending.len() >= MAX_PENDING_LAUNCHES {
+                say!(
+                    "init: launcher: refusing client {} — {MAX_PENDING_LAUNCHES} connections are \
+                     already waiting to say what to start",
+                    conn.fd().0
+                );
+            } else {
+                pending.push(Pending { conn, rx: LaunchRx::new(), since: Instant::now() });
+            }
+        }
+
+        // `remove` rather than `swap_remove`: the entries after `i` shift down,
+        // so leaving `i` alone visits each connection exactly once.
+        let mut i = 0;
+        while i < pending.len() {
+            let fd = pending[i].conn.fd();
+            if !ready.contains(&(TOKEN_PENDING_BASE + fd.0 as u64)) {
+                i += 1;
+                continue;
+            }
+            let step = {
+                let p = &mut pending[i];
+                p.rx.pump(&p.conn)
+            };
+            match step {
+                RxStep::Idle => i += 1,
+                // Unlogged, and the only removal here that is: a caller may
+                // connect to find out whether it holds a launcher at all and
+                // hang up, which is its business.
+                RxStep::Eof => {
+                    pending.remove(i);
+                }
+                RxStep::Malformed => {
+                    say!(
+                        "init: launcher: dropping client {} — it sent a frame this protocol \
+                         cannot describe",
+                        fd.0
+                    );
+                    pending.remove(i);
+                }
+                RxStep::Frame { msg_type, payload_len } => {
+                    let p = pending.remove(i);
+                    serve_launch(
+                        &p.conn,
+                        msg_type,
+                        p.rx.payload(payload_len),
+                        system,
+                        syscap,
+                        acceptors,
+                        connectors,
+                    );
+                }
+            }
         }
     }
 }
@@ -118,17 +269,16 @@ fn main() {
 /// exactly the manifest row and nothing beyond it.
 fn serve_launch<'a>(
     conn: &Connection,
+    msg_type: u32,
+    payload: &[u8],
     system: &'a Manifest,
     syscap: &SysCap,
     acceptors: &mut BTreeMap<&'a str, Acceptor>,
     connectors: &BTreeMap<&str, Connector>,
 ) {
-    let Ok(header) = conn.recv_header() else { return };
-    if header.msg_type != launch::MSG_LAUNCH {
+    if msg_type != launch::MSG_LAUNCH {
         return;
     }
-    let mut buf = [0u8; toyos::ipc::MAX_FRAME_LEN as usize];
-    let Ok(len) = conn.recv_bytes(&header, &mut buf) else { return };
     let mut batch = [toyos::RawHandle(0); toyos_abi::syscall::MAX_TRANSFER_HANDLES];
     let received = conn.recv_handles(&mut batch).unwrap_or(0);
 
@@ -139,7 +289,7 @@ fn serve_launch<'a>(
     // picks which refusal it takes.
     let mut held = Moved(batch[..received].to_vec());
 
-    let Some(request) = Request::decode(&buf[..len]) else { return };
+    let Some(request) = Request::decode(payload) else { return };
     // `extra_names` drops an empty or non-UTF-8 name, so its count is what
     // will actually be paired with a handle. A frame whose two counts
     // disagree would otherwise leave the unpaired handles behind.
@@ -174,7 +324,11 @@ fn serve_launch<'a>(
         .collect();
 
     let Some(program) = declared(system, request.program) else {
-        let _ = conn.send_bytes(launch::MSG_NOT_DECLARED, &[]);
+        // **`try_signal` and not `send`.** A bare header is what every answer
+        // here is, and a blocking write is the other half of the rule that made
+        // the read side an event loop: a client that never drains its end
+        // decides when init runs again.
+        let _ = conn.try_signal(launch::MSG_NOT_DECLARED);
         return;
     };
 
@@ -213,20 +367,25 @@ fn serve_launch<'a>(
     match started {
         Ok(child) => {
             let handle = toyos::RawHandle(child.into_raw_handle());
-            if conn
-                .send_bytes_with_handles(&[handle], launch::MSG_LAUNCHED, &[])
-                .is_err()
-            {
-                // **init keeps no `Process` handle from a launch.** A send that
-                // did not happen leaves it holding one, and a client that could
-                // do that in a loop would exhaust the one handle table the whole
-                // machine depends on.
-                toyos_abi::syscall::close(handle);
+            // **Which side owns the handle is the whole of what the two arms
+            // differ by.** A refused `handle_send` leaves it in init's table
+            // and init must close it — init keeps no `Process` handle from a
+            // launch, or a client launching `/bin/true` in a loop exhausts the
+            // one table the machine cannot do without. A send that *took* it
+            // and a frame that then did not go leaves it queued on a connection
+            // this call is about to drop, which releases it — and closing it
+            // here would be closing a handle init no longer holds, which under
+            // the bad-handle policy is init exiting.
+            match toyos_abi::syscall::handle_send(conn.fd(), &[handle]) {
+                Ok(()) => {
+                    let _ = conn.try_signal(launch::MSG_LAUNCHED);
+                }
+                Err(_) => toyos_abi::syscall::close(handle),
             }
         }
         Err(e) => {
             say!("init: launcher: cannot start {}: {e}", program.name);
-            let _ = conn.send_bytes(launch::MSG_REFUSED, &[]);
+            let _ = conn.try_signal(launch::MSG_REFUSED);
         }
     }
 }

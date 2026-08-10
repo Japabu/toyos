@@ -52,3 +52,27 @@ does not hold across a transfer.
 (1) is the recommendation. It is not this review's to take — it is an ABI
 change, and `specs/capability-endowment-spec.md` §3.1's fourteen numbers were
 the owner's to approve.
+
+## Ruled not a merge blocker, 2026-08-10
+
+Judged while clearing PR #22's blockers, with the reasoning written down because
+the next reader will ask why a class this wide was left open.
+
+- **The one instance a hostile *client* can reach is closed.** `/bin/init`'s
+  launcher takes `extra` connectors from anybody holding a `launcher` connector
+  and hands them to `SYS_NAMESPACE_BUILD`, and that call answers
+  `InvalidArgument` for a wrong type rather than ending the caller. It is the
+  one handle argument in the ABI that routinely crosses a trust boundary,
+  `kernel/CLAUDE.md` says so where the policy is stated, and `launcher_refusals`
+  gates it.
+- **Every other instance needs a hostile *server*** — soundd sending an audio
+  client its region, the compositor sending a window its buffer. A client whose
+  server is hostile has already lost: that server chooses what the client sees,
+  when it is answered, and whether it is answered at all. Ending it with a
+  `WrongType` is not a new capability.
+- **The fix is an ABI shape change and the ABI was the owner's to approve.** It
+  widens `SYS_HANDLE_RECV`'s answer from `n` to `n` pairs, which is a number of
+  the fourteen §3.1 lists changing shape after the fact.
+
+So it stays open, and what it is waiting on is a decision rather than an
+instrument.

@@ -615,13 +615,105 @@ pub fn exit(code: i32) -> ! {
     loop { syscall(SYS_EXIT, code as u64, 0, 0, 0); }
 }
 
-/// Debug syscall. `action`: 0 = kernel panic, 1 = kernel fault,
-/// 2 = kernel lock held across a scheduler entry, 3 = fatal halt.
-/// 0, 1 and 2 kill the calling process and the system survives; 3 halts
-/// every CPU and does not return.
+/// Ask the kernel to do one of the things [`SYS_DEBUG`] does. The actions are
+/// the `DEBUG_*` constants below, not bare numbers.
 pub fn debug(action: u64) -> u64 {
     syscall(SYS_DEBUG, action, 0, 0, 0)
 }
+
+/// [`debug`] for the actions that take an argument.
+pub fn debug_with(action: u64, arg: u64) -> u64 {
+    syscall(SYS_DEBUG, action, arg, 0, 0)
+}
+
+/// What [`SYS_DEBUG`] can be asked to do.
+///
+/// **One declaration, because a number that means something is a constant.**
+/// These were bare integers in the kernel's dispatch and re-declared in each
+/// test binary that called one — five spellings of `14`, and the kernel's own
+/// arms said nothing about which was which except in prose beside them. An
+/// action's *reason* stays at the kernel arm, where the code it runs is; its
+/// number lives here once, where both sides read it.
+///
+/// Most are compiled only into a kernel built with the matching feature, and a
+/// number whose feature is off answers `InvalidArgument`. The three at the end
+/// are in every kernel: a live-object count is not authority over anything, and
+/// a churn test that needed its own boot would not be run after every change.
+pub mod debug_action {
+    /// Panic the kernel. Kills the caller's machine, deliberately.
+    pub const PANIC: u64 = 0;
+    /// Read through a null pointer in Ring 0.
+    pub const NULL_READ: u64 = 1;
+    /// Hold a kernel lock across a scheduler entry. Armed once per boot.
+    pub const LOCK_ACROSS_SWITCH: u64 = 2;
+    /// Halt every CPU. `test-fatal-halt`.
+    pub const FATAL_HALT: u64 = 3;
+    /// Provoke a real #DF, to exercise the IST1 stack. `test-double-fault`.
+    pub const DOUBLE_FAULT: u64 = 4;
+    /// Heap allocations either side of `MAX_HEAP_ALLOC`. `test-heap-ceiling`.
+    pub const HEAP_AT_CEILING: u64 = 5;
+    pub const HEAP_OVER_CEILING: u64 = 6;
+    pub const HEAP_AT_CEILING_PAGE_ALIGNED: u64 = 7;
+    /// Draw over the screen a userland process owns. `test-screen-graffiti`.
+    pub const SCREEN_GRAFFITI: u64 = 8;
+    /// Read the guard page below this CPU's idle stack. `test-idle-guard`.
+    pub const IDLE_GUARD_READ: u64 = 9;
+    /// The kernel canary's address, and whether it still holds what the kernel
+    /// wrote. `test-kernel-canary`.
+    pub const CANARY_ADDR: u64 = 10;
+    pub const CANARY_CHANGED: u64 = 11;
+    /// Make the last CPU a shootdown waits for answer `arg` nanoseconds late,
+    /// and take it away again. `test-tlb-ack-delay`.
+    pub const TLB_ACK_DELAY_ARM: u64 = 12;
+    pub const TLB_ACK_DELAY_DISARM: u64 = 13;
+    /// How many kernel objects are alive right now, machine-wide.
+    pub const CENSUS_TOTAL: u64 = 14;
+    /// The same, per kind, into the kernel log.
+    pub const CENSUS_BREAKDOWN: u64 = 15;
+    /// The same for one [`OBJECT_KINDS`](super::OBJECT_KINDS) index, which is
+    /// the argument. The one a guest test can assert on.
+    pub const CENSUS_KIND: u64 = 16;
+    /// The deepest any CPU's idle stack has been this boot, in bytes.
+    ///
+    /// The idle loop is where `object::drain_zero_handles` releases objects
+    /// with nothing held, and a release path that reaches the filesystem is the
+    /// deepest thing this kernel does. This is how a test asserts that stack is
+    /// sized for it, rather than waiting for the guard page below it to say so
+    /// by halting the machine.
+    pub const IDLE_STACK_HIGH_WATER: u64 = 17;
+    /// How big that stack is, so the reading above is a *fraction* rather than
+    /// a number nobody can judge. The size is the kernel's choice and not the
+    /// ABI's, which is why it is asked for rather than declared here.
+    pub const IDLE_STACK_SIZE: u64 = 18;
+}
+
+/// Every kind of kernel object, in the order the kernel's own `kobject!`
+/// declares them — so an index into this is the index
+/// [`debug_action::CENSUS_KIND`] takes.
+///
+/// **In the ABI rather than in the kernel alone, because a census nobody can
+/// read per kind is a total.** Every leak assertion in the test estate was
+/// against the machine-wide count, where a leak of one kind is hidden by churn
+/// in another, and six of the thirteen kinds were exercised by no census
+/// assertion at all. The kernel checks this list against its own declaration
+/// order when the action is called, so a row added to `kobject!` without a row
+/// here is a named refusal rather than an index that quietly names its
+/// neighbour.
+pub const OBJECT_KINDS: &[&str] = &[
+    "PipeRead",
+    "PipeWrite",
+    "Connection",
+    "Device",
+    "Acceptor",
+    "IoUring",
+    "SharedMem",
+    "Connector",
+    "Namespace",
+    "File",
+    "Console",
+    "SysCap",
+    "Process",
+];
 
 /// Create a pipe. Returns the read and write ends.
 ///

@@ -16,7 +16,6 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use toyos_sched::task::WaitClass;
 
@@ -49,16 +48,30 @@ pub struct PendingConnection {
     pub outbox: Arc<HandleQueue>,
 }
 
+/// The queue, and whether anything will ever read it again.
+///
+/// **One lock over both, because `closed` is a decision *about* the queue.** It
+/// was an `AtomicBool` read outside the lock and taken afterwards, which buys a
+/// lock-free read on a path that takes the lock in the next statement anyway —
+/// and leaves a window: a connect that reads `closed == false`, an
+/// [`Acceptor`]'s hook that then sets it and drains the queue, and a
+/// `push_back` that lands in a queue nothing will ever look at again. The hook
+/// runs exactly once, so that connection is orphaned: nothing closes its inbox,
+/// the client's write succeeds into a ring nobody reads and its read blocks for
+/// ever. That is the one outcome this design says cannot happen — the bound on
+/// failure is a process lifetime — and there it is no bound at all.
+struct PortQueue {
+    closed: bool,
+    pending: VecDeque<PendingConnection>,
+}
+
 /// Everything the two ends share. Neither end holds the other, so no `Arc`
 /// cycle exists.
 pub struct PortShared {
-    queue: Lock<VecDeque<PendingConnection>>,
+    queue: Lock<PortQueue>,
     /// Threads blocked in `accept`.
     acceptors: Arc<KWaitQueue>,
     io_uring_watchers: Lock<Vec<RingId>>,
-    /// Set by [`Acceptor`]'s zero-handle hook. A connector whose acceptor is
-    /// gone refuses rather than queueing for a server that will never read.
-    closed: AtomicBool,
 }
 
 pub struct Acceptor {
@@ -80,10 +93,9 @@ pub enum PushError {
 
 pub fn create() -> (Arc<Acceptor>, Arc<Connector>) {
     let shared = Arc::new(PortShared {
-        queue: Lock::new(VecDeque::new()),
+        queue: Lock::new(PortQueue { closed: false, pending: VecDeque::new() }),
         acceptors: new_queue(WaitClass::Ipc),
         io_uring_watchers: Lock::new(Vec::new()),
-        closed: AtomicBool::new(false),
     });
     (
         Arc::new(Acceptor { core: Acceptor::new_core(), shared: shared.clone() }),
@@ -96,7 +108,11 @@ pub fn create() -> (Arc<Acceptor>, Arc<Connector>) {
 /// on the `Acceptor` — and the two share exactly this.
 impl PortShared {
     pub fn has_pending(&self) -> bool {
-        !self.queue.lock().is_empty()
+        !self.queue.lock().pending.is_empty()
+    }
+
+    fn closed(&self) -> bool {
+        self.queue.lock().closed
     }
 
     /// The waiter set, cloned out so a blocking site can hold it across its own
@@ -123,14 +139,14 @@ impl PortShared {
 
 impl Acceptor {
     pub fn pop(&self) -> Option<PendingConnection> {
-        self.shared.queue.lock().pop_front()
+        self.shared.queue.lock().pending.pop_front()
     }
 
     /// The last handle to this acceptor has gone: nothing will ever be queued
     /// again, so a thread parked in `accept` has to leave rather than wait for
     /// a condition that has become permanently false.
     pub fn closed(&self) -> bool {
-        self.shared.closed.load(Ordering::Acquire)
+        self.shared.closed()
     }
 
     pub fn has_pending(&self) -> bool {
@@ -148,18 +164,19 @@ impl Acceptor {
 
 impl Connector {
     pub fn closed(&self) -> bool {
-        self.shared.closed.load(Ordering::Acquire)
+        self.shared.closed()
     }
 
+    /// **One acquisition for the question and the insert.** See [`PortQueue`].
     pub fn push(&self, connection: PendingConnection) -> Result<(), PushError> {
-        if self.closed() {
+        let mut queue = self.shared.queue.lock();
+        if queue.closed {
             return Err(PushError::Closed);
         }
-        let mut queue = self.shared.queue.lock();
-        if queue.len() >= MAX_PENDING_CONNECTIONS {
+        if queue.pending.len() >= MAX_PENDING_CONNECTIONS {
             return Err(PushError::QueueFull);
         }
-        queue.push_back(connection);
+        queue.pending.push_back(connection);
         Ok(())
     }
 
@@ -183,8 +200,14 @@ impl Connector {
 /// leave.
 impl ZeroHandles for Acceptor {
     fn on_zero_handles(&self) {
-        self.shared.closed.store(true, Ordering::Release);
-        let queued = core::mem::take(&mut *self.shared.queue.lock());
+        // Closing and draining in one acquisition, so no connect can be between
+        // the two. The batches are dropped after the guard: releasing a handle
+        // can run another object's zero-handle hook.
+        let queued = {
+            let mut queue = self.shared.queue.lock();
+            queue.closed = true;
+            core::mem::take(&mut queue.pending)
+        };
         // The would-be server's inbox: nobody will ever hold the end that
         // reads it, so a client's `SYS_HANDLE_SEND` on that connection must
         // say `Gone` rather than queue.

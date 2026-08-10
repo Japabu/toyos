@@ -34,8 +34,7 @@ const FLOOR_NANOS: u64 = DELAY_NANOS / 2;
 
 const PAGE_2M: usize = 2 * 1024 * 1024;
 
-const ARM: u64 = 12;
-const DISARM: u64 = 13;
+use toyos_abi::syscall::debug_action::{TLB_ACK_DELAY_ARM as ARM, TLB_ACK_DELAY_DISARM as DISARM};
 
 fn debug(action: u64, arg: u64) -> u64 {
     let ret: u64;

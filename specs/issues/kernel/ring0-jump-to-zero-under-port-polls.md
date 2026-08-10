@@ -113,9 +113,21 @@ Audited in code, not assumed.
   the cascade `PortShared` → `PendingConnection` → `PipeReader` → `PIPES` from
   ever running under `IO_URINGS`. That cascade would be a self-deadlock, because
   `close_read` re-enters `complete_pending_for_event` when the pipe still has a
-  writer and a watcher. **It is unreachable rather than absent**, and it is
-  unreachable because of an ordering nothing states: worth knowing before
-  anything makes the hook lazier.
+  writer and a watcher. **It is unreachable rather than absent.**
+
+  **That paragraph was false when it was written, and this is the correction.**
+  It rested on "the queue is already empty", and `closed` was an `AtomicBool`
+  read *outside* the queue's lock: a connect could read it false, the hook could
+  then set it and drain, and the connect's `push_back` landed in a queue whose
+  one hook had already run. So a connection could be queued onto a closing port,
+  the cascade was reachable rather than unreachable, and the connection itself
+  was orphaned — nothing closed its inbox, so the client's read blocked for ever
+  against §0's promise that the bound on failure is a process lifetime. Filed as
+  `a-connect-can-queue-onto-a-closing-port` and fixed on the same branch: the
+  flag now lives *inside* the queue's lock (`PortQueue`), so `push` asks and
+  inserts in one acquisition and the hook closes and drains in one. The argument
+  above holds again, and it now rests on a lock rather than on an ordering
+  nothing states.
 
 ### 4. Two defects found by the audit, both fixed in chunk 6
 
@@ -147,6 +159,18 @@ Neither is the fault above. Both are the class it was filed under.
 - `Connection` stays deferred and now also closes its inbound handle queue,
   which drops `HandleEntry`s and can enqueue further zero-handle work — a queue
   iteration, which `drain_zero_handles` already loops for.
+
+  **True for the entries whose rows are `deferred`, and false for the rest**,
+  which is the half this bullet missed. A `HandleEntry` for an `immediate` row
+  enqueues nothing: its destructor runs inline, wherever the drain is running.
+  So a `File` sent over a connection whose peer died reached `vfs::flush_file`
+  from the drain, and the idle loop is one of the drain's three sites — the
+  16 KiB idle stack, through the guard page, which is exactly the defect
+  `6d81a73` had closed per object and which returned through a container. Filed
+  as `an-immediate-object-can-be-released-on-the-idle-stack` and fixed on the
+  same branch by giving the drain a stack: `IDLE_STACK_SIZE` is
+  `KERNEL_STACK_SIZE` now, so there is one stack size for every context Rust
+  kernel code runs on and the question this bullet was asking has one answer.
 - `Connector`, `Namespace`, `File`, `Console`, `SysCap` are unchanged.
 
 ### 6. The instrument, and what it did not find

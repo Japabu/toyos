@@ -389,16 +389,25 @@ fn rela_dyn_from_sections(
 /// directory, and the caller passes that: nothing else about the caller is
 /// recorded, so there is no relationship for a later call to authorize
 /// against.
+/// **The refusal is a value, and that is what stops eight megabytes going with
+/// it.** Every failure below owns a partly built process — the child's address
+/// space with its ELF regions mapped, `USER_STACK_SIZE` of stack, a 128 KiB
+/// kernel stack, the symbol table, the loaded libraries — and nothing unwinds,
+/// so a `-> !` taken from inside this frame strands all of it. `Refusal` is
+/// therefore the error type: the three handle kinds that end the caller are
+/// carried out to the dispatcher and refused there, with this frame gone. It is
+/// the same shape `c29bb8a` fixed one layer up, where the stranded values were
+/// three `Arc`s rather than 8 MB.
 pub fn spawn(
     argv: &[&str],
     pending: PendingHandles,
     cwd: String,
     env: Vec<u8>,
-) -> Result<Arc<crate::object::process::ProcessObject>, SyscallError> {
+) -> Result<Arc<crate::object::process::ProcessObject>, crate::object::Refusal> {
     // An argv of only separators survives the split in sys_spawn as an empty
     // slice; there is no argv[0] to load.
     let Some(&path) = argv.first() else {
-        return Err(SyscallError::InvalidArgument);
+        return Err(SyscallError::InvalidArgument.into());
     };
     let t0 = crate::clock::nanos_since_boot();
 
@@ -410,7 +419,7 @@ pub fn spawn(
         Ok(b) => b,
         Err(e) => {
             log!("spawn: {}: {e}", path);
-            return Err(e);
+            return Err(e.into());
         }
     };
 
@@ -420,14 +429,14 @@ pub fn spawn(
         Ok(l) => l,
         Err(msg) => {
             log!("spawn: {}: {}", path, msg);
-            return Err(SyscallError::InvalidArgument);
+            return Err(SyscallError::InvalidArgument.into());
         }
     };
 
     if !image_fits_user_half(&layout) {
         log!("spawn: {}: image spans {:#x} bytes, past the user half from {:#x}",
             path, layout.span(), USER_VM_BASE);
-        return Err(SyscallError::InvalidArgument);
+        return Err(SyscallError::InvalidArgument.into());
     }
     let base = USER_VM_BASE - layout.vaddr_min;
 
@@ -443,7 +452,7 @@ pub fn spawn(
         elf::RelocationIndex::with_capacity(u64_writes, exe.relas.tpoff32.len())
     else {
         log!("spawn: {}: {} relocations do not fit one index", path, u64_writes);
-        return Err(SyscallError::ResourceExhausted);
+        return Err(SyscallError::ResourceExhausted.into());
     };
     for &(r_offset, r_addend) in &exe.relas.relative {
         reloc_index.add_u64(r_offset, (base as i64 + r_addend) as u64);
@@ -514,7 +523,7 @@ pub fn spawn(
         Some(a) => a,
         None => {
             log!("spawn: {}: failed to allocate user stack ({} bytes)", path, USER_STACK_SIZE);
-            return Err(SyscallError::ResourceExhausted);
+            return Err(SyscallError::ResourceExhausted.into());
         }
     };
     let stack_phys = DirectMap::from_phys(stack_pages.phys());
@@ -540,13 +549,13 @@ pub fn spawn(
             // ceiling here.
             let Some(tls_buf) = OwnedAlloc::new(tls.memsz as usize, 16) else {
                 log!("spawn: {}: cannot allocate a {}-byte TLS template", path, tls.memsz);
-                return Err(SyscallError::ResourceExhausted);
+                return Err(SyscallError::ResourceExhausted.into());
             };
             if elf::read_backing_into(backing.as_ref(), tls_file_off, tls_buf.ptr(), tls.filesz as usize)
                 .is_err()
             {
                 log!("spawn: {}: the TLS template could not be read off the device", path);
-                return Err(SyscallError::NotFound);
+                return Err(SyscallError::NotFound.into());
             }
             Some(tls_buf)
         }
@@ -557,7 +566,7 @@ pub fn spawn(
         tls::build_tls_layout(&loaded_libs.libs, &layout, exe_tls_template.as_ref())
     else {
         log!("spawn: {}: the TLS modules do not fit one block", path);
-        return Err(SyscallError::ResourceExhausted);
+        return Err(SyscallError::ResourceExhausted.into());
     };
 
     apply_tls_relocs(&exe, backing.as_ref(), &loaded_libs.libs, &tls_modules,
@@ -581,7 +590,7 @@ pub fn spawn(
         tls::map_block(&child_pt, &tls_modules, tls_total_memsz, max_tls_align)
     else {
         log!("spawn: {}: failed to allocate TLS ({} bytes)", path, tls_total_memsz);
-        return Err(SyscallError::ResourceExhausted);
+        return Err(SyscallError::ResourceExhausted.into());
     };
 
     let entry = base + layout.entry;
@@ -599,7 +608,7 @@ pub fn spawn(
         Some(ks) => ks,
         None => {
             log!("spawn: {}: failed to allocate kernel stack", path);
-            return Err(SyscallError::ResourceExhausted);
+            return Err(SyscallError::ResourceExhausted.into());
         }
     };
 
@@ -609,14 +618,11 @@ pub fn spawn(
     // failure above this line answers the caller with its table untouched; the
     // endowed handles leave it here, where nothing between this and the process
     // entry can fail.
-    let (handles, endowments) = pending.commit().map_err(|e| match e {
-        crate::object::Refusal::Error(e) => e,
-        // A handle that stopped resolving between the arguments being read and
-        // this line is the caller racing its own spawn. It is still a bug in
-        // the caller and still fatal — but the process it would have started
-        // does not exist yet, so this reports rather than ending it here.
-        crate::object::Refusal::Handle(e) => e.refuse_as_error(),
-    })?;
+    // A handle that stopped resolving between the arguments being read and this
+    // line is the caller racing its own spawn: a bug in the caller, and fatal.
+    // It travels out as a value so this frame's eight megabytes drop on the
+    // way, and the dispatcher ends the caller with nothing held.
+    let (handles, endowments) = pending.commit()?;
     let proc_data = Arc::new(Lock::new(ProcessData {
         handles,
         cwd,
@@ -940,7 +946,9 @@ pub fn spawn_init() -> Pid {
         }],
         label.as_bytes().to_vec(),
     );
-    spawn(&[INIT_PATH], PendingHandles::Ready(handles, endowments), String::from("/"), Vec::new())
-        .expect("spawn_init: failed to spawn")
-        .pid()
+    match spawn(&[INIT_PATH], PendingHandles::Ready(handles, endowments), String::from("/"), Vec::new()) {
+        Ok(object) => object.pid(),
+        Err(crate::object::Refusal::Error(e)) => panic!("spawn_init: failed to spawn: {e:?}"),
+        Err(crate::object::Refusal::Handle(e)) => panic!("spawn_init: {e}"),
+    }
 }

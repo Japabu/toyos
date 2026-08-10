@@ -372,23 +372,94 @@ impl HandleTable {
     /// a handle to it `Stale` rather than a name for whatever lands there next.
     #[must_use = "the removed entry must be dropped by the caller"]
     pub fn remove(&mut self, h: RawHandle) -> Result<HandleEntry, HandleError> {
-        let slot_index = h.slot() as usize;
-        let slot = self.slots.get_mut(slot_index).ok_or(HandleError::BadHandle)?;
+        let entry = self.take_for_transfer(h)?;
+        self.retire(h);
+        Ok(entry)
+    }
+
+    /// Take an entry out, leaving its slot claimed and at its own generation.
+    ///
+    /// [`remove`](Self::remove) is this plus [`retire`](Self::retire), and the
+    /// split exists because retiring is what makes putting an entry back
+    /// unrepresentable: a bumped generation means the handle number the caller
+    /// still holds names nothing. See [`transfer`](Self::transfer).
+    #[must_use = "the entry must be given back or its slot retired"]
+    fn take_for_transfer(&mut self, h: RawHandle) -> Result<HandleEntry, HandleError> {
+        let slot = self.slots.get_mut(h.slot() as usize).ok_or(HandleError::BadHandle)?;
         if slot.generation != h.generation() {
             return Err(HandleError::Stale);
         }
-        let entry = slot.entry.take().ok_or(HandleError::BadHandle)?;
-        // **A slot at the last generation is retired, never wrapped.** One
-        // leaked slot of 4096 against a handle that silently names a different
-        // object is not a trade; it is also what keeps `HANDLE_INVALID`
-        // unreachable, since that encoding is slot 4095 at this generation.
+        slot.entry.take().ok_or(HandleError::BadHandle)
+    }
+
+    /// The handle is gone for good.
+    ///
+    /// **A slot at the last generation is retired, never wrapped.** One leaked
+    /// slot of 4096 against a handle that silently names a different object is
+    /// not a trade; it is also what keeps `HANDLE_INVALID` unreachable, since
+    /// that encoding is slot 4095 at this generation.
+    fn retire(&mut self, h: RawHandle) {
+        let slot = &mut self.slots[h.slot() as usize];
         if slot.generation == RawHandle::MAX_GENERATION - 1 {
             slot.generation = RawHandle::MAX_GENERATION;
         } else {
             slot.generation += 1;
             self.free.push(h.slot());
         }
-        Ok(entry)
+    }
+
+    /// Put an entry back at the number it was taken from.
+    fn give_back(&mut self, h: RawHandle, entry: HandleEntry) {
+        let slot = &mut self.slots[h.slot() as usize];
+        debug_assert!(
+            slot.entry.is_none() && slot.generation == h.generation(),
+            "a slot taken for transfer was written under the same lock",
+        );
+        slot.entry = Some(entry);
+    }
+
+    /// Move `handles` out of this table into `sink`, and put every one of them
+    /// back at its own number if `sink` refuses.
+    ///
+    /// **A refusal that keeps the handles is the reason this exists.** The two
+    /// things a peer's queue can say — the reading end has gone, and the queue
+    /// is full — are ones a caller reads as backpressure, and `ResourceExhausted`
+    /// is exactly what a slow or hostile peer produces. Taking the entries out
+    /// and dropping them on that answer destroys capabilities the caller was
+    /// told nothing happened to: its next `close` of one is `Stale`, which ends
+    /// it. `/bin/init` was that caller — a client that hung up after its launch
+    /// frame made init's answering `Process` handle vanish and init's own close
+    /// of it fatal.
+    ///
+    /// `sink` therefore hands the batch back with its refusal, which is the
+    /// whole of the discipline: the type says a refused transfer still owns
+    /// what it was given. Every handle must have been verified under this same
+    /// hold — a number that does not resolve here is a kernel bug.
+    pub fn transfer<E>(
+        &mut self,
+        handles: &[RawHandle],
+        sink: impl FnOnce(Vec<HandleEntry>) -> Result<(), (Vec<HandleEntry>, E)>,
+    ) -> Result<(), E> {
+        let mut batch = Vec::with_capacity(handles.len());
+        for h in handles {
+            batch.push(
+                self.take_for_transfer(*h).expect("a handle verified under this same hold"),
+            );
+        }
+        match sink(batch) {
+            Ok(()) => {
+                for h in handles {
+                    self.retire(*h);
+                }
+                Ok(())
+            }
+            Err((batch, e)) => {
+                for (h, entry) in handles.iter().zip(batch) {
+                    self.give_back(*h, entry);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Empty the table. Process exit and kill both come through here, on the

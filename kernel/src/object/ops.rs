@@ -87,7 +87,10 @@ pub fn install(table: &mut HandleTable, object: KObjectRef) -> Result<RawHandle,
 ///
 /// Takes the VFS lock itself and gives it up before the object exists, so a
 /// refused install drops the `OpenFileState` — and re-takes the lock in its
-/// `Drop` — with nothing held.
+/// `Drop` — without the *VFS* lock held. **Not with nothing held**, which this
+/// used to claim: its one caller runs it inside `with_fd_owner_data`, so the
+/// process's own lock is still there. What the sequencing buys is that the VFS
+/// lock is not taken twice, and that is all it buys.
 pub fn open(table: &mut HandleTable, path: &str, flags: OpenFlags) -> u64 {
     let writable = flags.contains(OpenFlags::WRITE);
     let create = flags.contains(OpenFlags::CREATE);

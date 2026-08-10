@@ -15,6 +15,7 @@ const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0084;
 
 use toyos_abi::handle::{RawHandle, Rights};
+use toyos_abi::syscall::debug_action as DA;
 use toyos_abi::syscall::*;
 
 /// One [`RawHandle`] on the wire, for a vector of them a syscall reads out of
@@ -646,9 +647,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_query_modules(&mut buf)
         }
         SYS_DEBUG => match a1 {
-            0 => panic!("SYS_DEBUG: kernel panic triggered by userspace"),
-            1 => { unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()); } 0 }
-            2 => {
+            DA::PANIC => panic!("SYS_DEBUG: kernel panic triggered by userspace"),
+            DA::NULL_READ => { unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()); } 0 }
+            DA::LOCK_ACROSS_SWITCH => {
                 if !LOCK_ACROSS_SWITCH_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed) {
                     return SyscallError::InvalidArgument.to_u64();
                 }
@@ -660,7 +661,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // costs the caller its own process; this one costs the machine,
             // and no latch fixes that — one call is already a permanent halt.
             #[cfg(feature = "test-fatal-halt")]
-            3 => { log!("{}", FATAL_HALT_NONCE); crate::arch::apic::halt_all_cpus(); }
+            DA::FATAL_HALT => { log!("{}", FATAL_HALT_NONCE); crate::arch::apic::halt_all_cpus(); }
             // A real double fault, produced the way the hardware produces one:
             // fault while RSP cannot be pushed to. The push below raises #SS on
             // a non-canonical stack address, and delivering *that* needs another
@@ -675,7 +676,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // Only #DF has an IST, so every other vector on the way is
             // delivered onto this same unusable stack.
             #[cfg(feature = "test-double-fault")]
-            4 => {
+            DA::DOUBLE_FAULT => {
                 log!("SYS_DEBUG: provoking a double fault");
                 unsafe {
                     core::arch::asm!(
@@ -692,16 +693,16 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // back — must come back as an error rather than as a panic taken
             // inside the allocator's lock, which is what it used to be.
             #[cfg(feature = "test-heap-ceiling")]
-            5 => debug_heap_alloc(crate::mm::MAX_HEAP_ALLOC, 8),
+            DA::HEAP_AT_CEILING => debug_heap_alloc(crate::mm::MAX_HEAP_ALLOC, 8),
             #[cfg(feature = "test-heap-ceiling")]
-            6 => debug_heap_alloc(crate::mm::PAGE_2M as usize, 8),
+            DA::HEAP_OVER_CEILING => debug_heap_alloc(crate::mm::PAGE_2M as usize, 8),
             #[cfg(feature = "test-heap-ceiling")]
-            7 => debug_heap_alloc(crate::mm::MAX_HEAP_ALLOC, 4096),
+            DA::HEAP_AT_CEILING_PAGE_ALIGNED => debug_heap_alloc(crate::mm::MAX_HEAP_ALLOC, 4096),
             // Returns, unlike every other action here: what is under test is
             // what the *console* does next, so the machine and the process
             // both have to survive being drawn over.
             #[cfg(feature = "test-screen-graffiti")]
-            8 => {
+            DA::SCREEN_GRAFFITI => {
                 crate::drivers::panic_console::graffiti();
                 0
             }
@@ -711,16 +712,16 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // without a guard page that byte is dlmalloc's bookkeeping for the
             // chunk the idle stack lives in, and the read succeeds.
             #[cfg(feature = "test-idle-guard")]
-            9 => {
+            DA::IDLE_GUARD_READ => {
                 let addr = super::percpu::idle_guard_byte();
                 log!("SYS_DEBUG: reading the idle stack guard at {addr:#x}");
                 unsafe { core::ptr::read_volatile(addr as *const u8) };
                 0
             }
             #[cfg(feature = "test-kernel-canary")]
-            10 => canary::address(),
+            DA::CANARY_ADDR => canary::address(),
             #[cfg(feature = "test-kernel-canary")]
-            11 => canary::changed() as u64,
+            DA::CANARY_CHANGED => canary::changed() as u64,
             // Make the last CPU a shootdown waits for answer `a2` nanoseconds
             // late, take one, and answer with how long it took. The number is
             // the gate: an initiator that does not wait measures roughly the
@@ -728,9 +729,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // outlives the call, so the caller can then time an ordinary
             // syscall and learn whether *its* free path shoots down.
             #[cfg(feature = "test-tlb-ack-delay")]
-            12 => crate::arch::tlb::debug_arm_ack_delay(a2),
+            DA::TLB_ACK_DELAY_ARM => crate::arch::tlb::debug_arm_ack_delay(a2),
             #[cfg(feature = "test-tlb-ack-delay")]
-            13 => crate::arch::tlb::debug_disarm_ack_delay(),
+            DA::TLB_ACK_DELAY_DISARM => crate::arch::tlb::debug_disarm_ack_delay(),
             // The two leaks this object model accepts — an `Arc` stranded on a
             // killed thread's stack, and the cross-pair connection cycle — are
             // visible in no other way, so the census needs a reader or it is a
@@ -738,13 +739,34 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // is in the shipping kernel: a churn test that needed its own boot
             // would not be run after every change, and a live object count is
             // not authority over anything.
-            14 => crate::object::census::total(),
-            15 => {
+            DA::CENSUS_TOTAL => crate::object::census::total(),
+            DA::CENSUS_BREAKDOWN => {
                 for (kind, live) in crate::object::census::live() {
                     log!("census: {kind} {live}");
                 }
                 0
             }
+            // The same count for one kind. A total hides a leak of one kind
+            // behind churn in another, and six of the thirteen kinds had no
+            // census assertion anywhere in the estate.
+            //
+            // The names are checked rather than the order assumed: this is the
+            // one place two declarations of the same list meet, and an index
+            // that quietly names its neighbour is worse than no census.
+            DA::CENSUS_KIND => {
+                assert!(
+                    crate::object::census::live()
+                        .map(|(kind, _)| kind)
+                        .eq(toyos_abi::syscall::OBJECT_KINDS.iter().copied()),
+                    "kobject! and toyos_abi::syscall::OBJECT_KINDS declare different objects",
+                );
+                match crate::object::census::live().nth(a2 as usize) {
+                    Some((_, live)) => live,
+                    None => SyscallError::InvalidArgument.to_u64(),
+                }
+            }
+            DA::IDLE_STACK_HIGH_WATER => super::percpu::idle_stack_high_water() as u64,
+            DA::IDLE_STACK_SIZE => super::percpu::idle_stack_size() as u64,
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => match ctx.copy_out(UserAddr::new(a1), &sys_sched_info()) {
@@ -1364,9 +1386,12 @@ fn sys_spawn(
 ) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
     let cwd = process::with_fd_owner_data(|data| data.cwd.clone());
+    // Refused with this frame holding nothing: `spawn`'s own frame owned the
+    // child's address space and its stacks, and the three handle kinds that end
+    // the caller do so from `refuse`.
     let object = match process::spawn(&args, pending, cwd, env) {
         Ok(object) => object,
-        Err(e) => return e.to_u64(),
+        Err(e) => return e.refuse(),
     };
     let installed = process::with_fd_owner_data(|data| {
         ops::install(&mut data.handles, KObjectRef::Process(object.clone()))
@@ -1842,9 +1867,13 @@ fn sys_shm_unmap(h: RawHandle) -> u64 {
 ///
 /// Every handle is verified — it resolves, it carries `TRANSFER`, it is named
 /// once, and it is not the connection itself — before any of them is removed,
-/// so a refusal leaves the caller's table exactly as it was. Refusing to send
-/// the connection over itself is what keeps `capability-handles-spec.md`
-/// §8.4's cross-pair cycle to two objects rather than one.
+/// and a peer's queue that refuses the batch afterwards hands it back. **So
+/// every refusal leaves the caller's table exactly as it was**, which is what
+/// makes `Gone` and `ResourceExhausted` honest: they are answers about the
+/// peer, and a caller retrying or closing what it still holds is right rather
+/// than fatal. Refusing to send the connection over itself is what keeps
+/// `capability-handles-spec.md` §8.4's cross-pair cycle to two objects rather
+/// than one.
 ///
 /// **Rights travel unchanged, `TRANSFER` included.** A move requires it and
 /// carries it, so everything that can be moved can be moved on: the
@@ -1873,23 +1902,17 @@ fn sys_handle_send(conn_h: RawHandle, handles: &crate::user_ptr::UserBytes, coun
                 return Err(SyscallError::PermissionDenied.into());
             }
         }
-        let mut batch = Vec::with_capacity(count);
-        for h in wanted {
-            batch.push(data.handles.remove(*h).expect("verified under this same hold"));
-        }
-        Ok::<_, crate::object::Refusal>((conn, batch))
+        // The peer's queue can still refuse, and both of its refusals are ones
+        // a caller reads as "the handles did not go" — so they must not have
+        // gone. `transfer` puts every entry back at its own number, under this
+        // same hold, where nothing can observe the gap.
+        data.handles
+            .transfer(wanted, |batch| conn.send(batch))
+            .map_err(crate::object::Refusal::Error)
     });
-    let (conn, batch) = match sent {
-        Ok(v) => v,
-        Err(e) => return e.refuse(),
-    };
-    // A refused send drops the batch here rather than putting it back, so the
-    // verification above has to be the whole of it: what is left to refuse are
-    // two facts about the peer's queue, both of which a caller reads as "the
-    // handles did not go".
-    match conn.send(batch) {
+    match sent {
         Ok(()) => 0,
-        Err(e) => e.to_u64(),
+        Err(e) => e.refuse(),
     }
 }
 
@@ -2297,18 +2320,34 @@ fn sys_dup2(old: RawHandle, slot: u64) -> u64 {
     let result = process::with_fd_owner_data(|data| {
         let rights = data.handles.rights_of(old)?;
         let entry = data.handles.duplicate_entry(old, rights)?;
-        let (new_h, displaced) = data
-            .handles
+        data.handles
             .install_at(slot, entry)
-            .map_err(|_| SyscallError::ResourceExhausted)?;
-        drop(displaced);
-        Ok::<_, crate::object::Refusal>(new_h)
+            .map_err(|_| SyscallError::ResourceExhausted.into())
+            .map(|(new_h, displaced)| (new_h, Displaced(displaced)))
     });
     match result {
-        Ok(new_h) => new_h.0 as u64,
-        Err(e) => e.refuse(),
+        // **Dropped here, and `install_at` is `#[must_use]` to say so.** A
+        // `File` is an `immediate` row, so a `dup2` over the last handle to a
+        // modified file runs `vfs::lock()` and a device round trip in this
+        // statement. Inside the closure that would happen holding the process's
+        // own lock — the one every sibling thread's page-fault handler takes —
+        // four ticket spinlocks deep, on a path userland reaches with one
+        // syscall.
+        Ok((new_h, displaced)) => {
+            drop(displaced);
+            new_h.0 as u64
+        }
+        Err(e) => crate::object::Refusal::refuse(e),
     }
 }
+
+/// A handle a call displaced, on its way out of the guard that displaced it.
+///
+/// It exists to make the obligation survive a `?`: a bare `Option<HandleEntry>`
+/// carried out of a closure is easy to drop at the wrong statement, and
+/// `install_at`'s contract is about *where* the decrement happens rather than
+/// whether it happens.
+struct Displaced(Option<crate::object::HandleEntry>);
 
 fn sys_rename(old: &str, new: &str) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());

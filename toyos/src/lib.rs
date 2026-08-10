@@ -6,6 +6,7 @@
 #![no_std]
 
 pub mod audio;
+pub mod census;
 pub mod device;
 pub mod endow;
 pub mod gpu;

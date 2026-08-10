@@ -34,11 +34,16 @@ impl HandleQueue {
         Arc::new(Self(Lock::new(None)))
     }
 
-    fn push(&self, batch: Vec<HandleEntry>) -> Result<(), SyscallError> {
+    /// **A refusal hands the batch back.** Both refusals below are ones a
+    /// sender reads as backpressure, and a batch dropped here is capabilities
+    /// destroyed under a word that says they were not — so the signature is
+    /// what says the sender still owns them, and `HandleTable::transfer` is
+    /// what puts each one back at its own number.
+    fn push(&self, batch: Vec<HandleEntry>) -> Result<(), (Vec<HandleEntry>, SyscallError)> {
         let mut guard = self.0.lock();
-        let queue = guard.as_mut().ok_or(SyscallError::Gone)?;
+        let Some(queue) = guard.as_mut() else { return Err((batch, SyscallError::Gone)) };
         if queue.len() >= MAX_QUEUED_BATCHES {
-            return Err(SyscallError::ResourceExhausted);
+            return Err((batch, SyscallError::ResourceExhausted));
         }
         queue.push_back(batch);
         Ok(())
@@ -138,7 +143,11 @@ impl ConnectionEnd {
         self.tx
     }
 
-    pub fn send(&self, batch: Vec<HandleEntry>) -> Result<(), SyscallError> {
+    /// See [`HandleQueue::push`]: a refusal comes back with the batch.
+    pub fn send(
+        &self,
+        batch: Vec<HandleEntry>,
+    ) -> Result<(), (Vec<HandleEntry>, SyscallError)> {
         self.outbox.push(batch)
     }
 

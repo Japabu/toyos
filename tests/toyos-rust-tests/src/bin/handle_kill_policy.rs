@@ -27,6 +27,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use toyos::census::Census;
 use toyos::AsHandle;
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, SyscallError};
@@ -38,11 +39,6 @@ const SELF_PATH: &str = "/bin/test_rs_handle_kill_policy";
 /// SIGSEGV", which is the same class of mistake with a pointer instead of a
 /// handle.
 const HANDLE_FAULT: i32 = 139;
-
-/// `SYS_DEBUG` action 14: how many kernel objects are alive right now.
-const CENSUS_TOTAL: u64 = 14;
-/// Action 15: the same number broken down per object type, into the kernel log.
-const CENSUS_BREAKDOWN: u64 = 15;
 
 /// A slot no process in this tree reaches. `RawHandle::MAX_SLOTS` is 4096 and a
 /// process holding 3000 handles would be a different bug.
@@ -155,25 +151,24 @@ fn a_full_table_is_a_word() {
 /// Two samples rather than one against a baseline: an object released by a
 /// child is dropped from the deferred queue on whichever CPU drains next, so a
 /// single reading can be high by whatever has not drained yet. A leak is not a
-/// lag — it accumulates — so the sample after the second round of rounds must
-/// not exceed the one after the first.
+/// lag — it accumulates — so no *kind* may be higher after the second round of
+/// rounds than after the first. Per kind and not in total, because a total
+/// hides a leak of one kind behind churn in another.
 fn the_kills_release_what_they_held() {
     let after_first = churn(CHURN_ROUNDS);
     let after_second = churn(CHURN_ROUNDS);
-    if after_second > after_first {
-        syscall::debug(CENSUS_BREAKDOWN);
-        panic!(
-            "{CHURN_ROUNDS} more killed processes left {} more live objects \
-             ({after_first} then {after_second}) — the per-type counts are in the kernel log",
-            after_second - after_first,
-        );
-    }
-    println!("  census: {after_first} live objects, then {after_second}");
+    let grown: Vec<_> = after_second.grown_since(&after_first).collect();
+    assert!(
+        grown.is_empty(),
+        "{CHURN_ROUNDS} more killed processes left more live objects behind: \
+         {grown:?} — first {after_first}, then {after_second}",
+    );
+    println!("  census: {} live objects, then {}", after_first.total(), after_second.total());
 }
 
 /// `CHURN_ROUNDS` processes that each hold a pipe and a region and then die on a
 /// bad handle, and what the kernel holds when they are all gone.
-fn churn(rounds: usize) -> u64 {
+fn churn(rounds: usize) -> Census {
     for _ in 0..rounds {
         let status = Command::new(SELF_PATH)
             .arg("holder")
@@ -182,7 +177,7 @@ fn churn(rounds: usize) -> u64 {
             .expect("spawn a holder");
         assert_eq!(status.code(), Some(HANDLE_FAULT), "a holder did not die on its bad handle");
     }
-    syscall::debug(CENSUS_TOTAL)
+    Census::now()
 }
 
 /// Fill every slot and require the refusal to be a word. Exits 0, which is the

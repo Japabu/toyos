@@ -204,6 +204,12 @@ pub fn build_child_handles(
     let data_arc = fd_owner_data();
     let data = data_arc.lock();
     let mut handles = HandleTable::new();
+    // Carried out of the guard rather than dropped inside it. Every entry a
+    // stdio pair displaces here is a duplicate this same loop just made, so the
+    // decrement reaches nothing — but `install_at`'s contract is that the
+    // caller decides *where* it happens, and a site that is right by accident
+    // is one an added slot kind makes wrong.
+    let mut displaced = Vec::new();
     for i in 0..slot_map.len() / SLOT_PAIR_LEN {
         let mut pair = [0u8; SLOT_PAIR_LEN];
         slot_map.read_at(i * SLOT_PAIR_LEN, &mut pair);
@@ -221,13 +227,14 @@ pub fn build_child_handles(
         let entry = data.handles.duplicate_entry(parent, rights)?;
         let slot = u16::try_from(child_slot)
             .map_err(|_| SyscallError::ResourceExhausted)?;
-        let (_, displaced) = handles
+        let (_, replaced) = handles
             .install_at(slot, entry)
             .map_err(|_| SyscallError::ResourceExhausted)?;
-        drop(displaced);
+        displaced.push(replaced);
     }
 
     drop(data);
+    drop(displaced);
 
     let mut raw = alloc::vec![0u8; endow.len() as usize];
     endow.read_at(0, &mut raw);

@@ -1822,6 +1822,23 @@ census asserted back to baseline after every churn test.
 client killed while blocked in its signal-pipe read must make soundd see
 `Gone`, and that is only true because `handle_count` is not the Arc count.
 
+**Three of those six did not exist until 2026-08-10, this one included.** Chunk
+8 landed the estate's migration and none of the object layer's own gates;
+`device_claim_crash_release` is `device_claim_lifetime` under another name and
+`process_lifecycle` and `handle_kill_policy` are real. The three that were
+missing are now `tests/toyos-rust-tests/src/bin/{handle_basic,handle_transfer,
+kill_while_blocked}.rs`, on the shared `tests/testcases` boot.
+
+**And the census clause was two-thirds unmet, which is where three of the
+review's findings lived.** The per-variant counters existed and their only
+reader wrote them to the *kernel log*, so every leak assertion in the estate was
+against the machine-wide total — where a leak of one kind is hidden by churn in
+another, and `File`, `Device`, `Acceptor`, `Connection`, `IoUring` and `Console`
+were covered by nothing at all. `toyos_abi::syscall::OBJECT_KINDS` declares the
+kinds, `debug_action::CENSUS_KIND` answers one, `toyos::census::Census` is the
+reader, and the kernel checks the two declarations against each other on every
+call. Every churn assertion in the estate is per kind now.
+
 ---
 
 ## 9. The work breakdown
@@ -2389,6 +2406,40 @@ that it depends on this branch landing first rather than the other way round.
 Every `tests/toyos-rust-tests/src/bin/` binary that used the deleted surface;
 `abuse_listener_hijack` and the pipe-id sweeps rewritten to their general forms;
 `connect_before_serve` and `endowment_denied` land here if they have not already.
+
+**Chunk 10 — the adversarial review's merge blockers. Green.**
+Not in the plan, because the plan had no place for what twenty green checks
+could not see. Added 2026-08-10 after a review of the whole branch fixed six
+defects and filed nine; two of the nine blocked the merge and both are the same
+sentence one layer apart — *the kernel must never crash from userland, and
+neither may the one process the machine cannot lose*.
+
+- **`/bin/init` is an event loop.** `serve_launch`'s first statement was a
+  blocking `recv_header` on a fresh connection, so any holder of a `launcher`
+  connector — the compositor, every terminal, every shell, sshd — could connect,
+  say nothing, and park the machine's only way to create a process, with init
+  alive and looking healthy. init is now the shape `userland/netd` and the
+  compositor already had: a poller over the acceptor and every accepted
+  connection, `ipc::FrameRx` per connection, `MAX_PENDING_LAUNCHES` half-spoken
+  launches, a handshake deadline, and every reply a `try_signal` — because a
+  blocking *write* is the same defect from the other side.
+- **The deferred drain has a stack.** `kobject!`'s `deferred`/`immediate` split
+  is per object and a `deferred` container may hold an `immediate` member, so a
+  `File` sent over a connection whose peer dies runs `vfs::flush_file` from
+  `drain_zero_handles` — which the idle loop calls, on 16 KiB. That is the
+  defect `6d81a73` measured and closed at a cost of 147 collateral reds,
+  returning through a container, and nothing expressible in the object layer
+  stops it: the entries are dropped wherever the drain runs. `IDLE_STACK_SIZE`
+  is `KERNEL_STACK_SIZE` now — one stack size for every context Rust kernel code
+  runs on — and `debug_action::IDLE_STACK_HIGH_WATER` is the instrument that
+  says so from a running machine rather than from a guard page on a halted one.
+- **§8.6's three missing gates and the per-kind census**, above.
+- Four of the other seven filed issues, all in the same class of *a refusal that
+  destroys what it refused*: `SYS_HANDLE_SEND` gives the batch back
+  (`HandleTable::transfer`), `PortShared`'s `closed` moved inside the queue's
+  lock, `SYS_SPAWN`'s handle refusal travels out as a value rather than ending
+  the caller with 8 MB on the frame, and `dup2`'s displaced entry drops outside
+  the process's own lock.
 
 **Chunk 9 — audit, deletion and documentation. Green.**
 The grep gate (§8.4); `[u32; 64]` sized from the ABI; dead constants and any
