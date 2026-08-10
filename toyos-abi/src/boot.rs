@@ -89,6 +89,22 @@ pub struct KernelArgs {
     /// format defines, and carrying it inward would make every reader of this
     /// struct know that.
     pub rtc_utc_offset_known: u32,
+    /// The boot parameter, as ASCII with no terminator: a comma-separated list
+    /// naming the actuators this boot arms, read out of `\toyos\cmdline` on the
+    /// volume the bootloader loaded itself from.
+    ///
+    /// Empty on every image anyone ships, and a kernel that carries no actuators
+    /// refuses a non-empty one rather than ignoring it
+    /// (`kernel/src/actuator.rs`). It is in this struct rather than anywhere the
+    /// kernel could go and fetch it because the earliest actuator panics before
+    /// `mm::init` and another acts at AP bring-up: a parameter that is not here
+    /// arrives too late to be one.
+    ///
+    /// Pool memory the bootloader forgets, like the initrd — but unlike the
+    /// initrd it is not in the kernel's reserved list, because it is parsed into
+    /// a word before `mm::init` runs and there is nothing left to protect.
+    pub cmdline_addr: u64,
+    pub cmdline_len: u64,
 }
 
 impl KernelArgs {
@@ -124,7 +140,9 @@ const _: () = {
     assert!(offset_of!(KernelArgs, log_partition_guid) == 180);
     assert!(offset_of!(KernelArgs, rtc_utc_offset_minutes) == 196);
     assert!(offset_of!(KernelArgs, rtc_utc_offset_known) == 200);
-    assert!(size_of::<KernelArgs>() == 208);
+    assert!(offset_of!(KernelArgs, cmdline_addr) == 208);
+    assert!(offset_of!(KernelArgs, cmdline_len) == 216);
+    assert!(size_of::<KernelArgs>() == 224);
     assert!(align_of::<KernelArgs>() == 8);
 };
 

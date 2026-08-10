@@ -673,7 +673,7 @@ pub fn build(
     assert_overflow_checked("kernel", &kernel_bytes);
     assert_kernel_is_softfloat(&path_env);
     let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
-    let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes);
+    let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, "");
     let image_path = root.join(boot.image());
     fs::write(&image_path, disk_bytes).expect("Failed to write image");
 
@@ -826,7 +826,7 @@ pub fn build_test_image(
     if let (Some(kernel), Some(bl), Some(initrd)) =
         (KERNEL.get(kernel_key), BOOTLOADER.get(bl_key), INITRD.get(initrd_key))
     {
-        return image::create_boot_image(&kernel, &bl, &initrd);
+        return image::create_boot_image(&kernel, &bl, &initrd, "");
     }
 
     // **Below the memo's early return, so a boot that builds nothing queues for
@@ -902,7 +902,7 @@ pub fn build_test_image(
         build_and_assemble(root, &config, &path_env, extra_files, quiet)
     });
 
-    image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes)
+    image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, "")
 }
 
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
