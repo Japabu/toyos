@@ -54,15 +54,14 @@ fn main() {
 /// the three kinds that end the caller, so this arm asserts the number rather
 /// than trying to use it. `handle_kill_policy`'s `stale` child asserts the kill.
 fn a_closed_slot_comes_back_at_a_new_generation() {
-    let (read, write) = toyos::pipe_pair().expect("a pipe of our own");
-    let closed = read.as_handle();
-    drop(read);
-    drop(write);
+    let (_read, write) = toyos::pipe_pair().expect("a pipe of our own");
 
-    // The freed slot is at the front of the free list, so the next install
-    // takes it. Nothing else in this process allocates between the two.
-    let (read, write) = toyos::pipe_pair().expect("a second pipe of our own");
-    let reissued = read.as_handle();
+    // One handle freed and one taken, so which slot the table offers next is
+    // not a question about the order two of them were dropped in: the free list
+    // has exactly this one on it.
+    let closed = syscall::dup(write.as_handle()).expect("a duplicate to close");
+    syscall::close(closed);
+    let reissued = syscall::dup(write.as_handle()).expect("a duplicate at the freed slot");
     assert_eq!(
         reissued.slot(),
         closed.slot(),
@@ -75,8 +74,7 @@ fn a_closed_slot_comes_back_at_a_new_generation() {
     );
     assert_ne!(reissued, closed, "a closed handle names the object that replaced it");
     assert_ne!(reissued, HANDLE_INVALID, "a table issued the invalid handle");
-    drop(read);
-    drop(write);
+    syscall::close(reissued);
     println!("  reissue: slot {} came back at generation {}", closed.slot(), reissued.generation());
 }
 

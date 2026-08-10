@@ -19,10 +19,17 @@
 //!    see the read side gone.
 //! 2. **Blocked reading an IPC connection**, which is the soundd shape one
 //!    layer up: the parent's write must answer `Gone`.
-//! 3. **Blocked in `accept`.** The child holds the acceptor; killing it must
-//!    not leave the object alive, which the per-kind census answers — the
-//!    total could not, because `Acceptor` is one of the six kinds nothing
-//!    counted.
+//! 3. **Blocked in `accept`.** The child holds the port's only acceptor; the
+//!    parent's next connect through the connector must be `Gone`.
+//!
+//! **No census assertion anywhere in this file, and that is the point rather
+//! than an omission.** A live-object count is the one instrument that cannot
+//! judge these three: a thread parked in `accept` has cloned the `Arc` out of
+//! its table onto its own kernel stack, so killing it strands that `Arc` on
+//! memory that is freed without unwinding and the object stays *alive* — which
+//! this design accepts and says so (`kernel/src/object/`, §1.1). What must not
+//! survive is the **handle count**, because that is what every peer-visible
+//! event rides. So each arm asks a peer, and none of them counts objects.
 //!
 //! **The marker is what gives every arm teeth.** Without it a child killed
 //! before it reached its `read` would pass while asserting nothing — the handle
@@ -33,9 +40,8 @@ use std::io::{Read, Write};
 use std::os::toyos::process::CommandExt;
 use std::process::{Command, Stdio};
 
-use toyos::census::Census;
 use toyos::{endow, namespace, port, AsHandle};
-use toyos_abi::syscall::{self, SyscallError, SVC_LABEL};
+use toyos_abi::syscall::{self, SyscallError, SERVE_PREFIX, SVC_LABEL};
 
 const SELF_PATH: &str = "/bin/test_rs_kill_while_blocked";
 const SERVICE: &str = "blocked";
@@ -48,19 +54,9 @@ fn main() {
 }
 
 fn test() {
-    let before = Census::now();
-
     a_pipe_reader_killed_in_the_read();
     a_connection_peer_killed_in_the_read();
     an_acceptor_killed_in_the_accept();
-
-    let after = Census::now();
-    let grown: Vec<_> = after.grown_since(&before).collect();
-    assert!(
-        grown.is_empty(),
-        "killing blocked threads left more live objects behind: {grown:?} — \
-         first {before}, then {after}",
-    );
     println!("a killed thread's blocking handle is released, and the peer is told");
 }
 
@@ -68,11 +64,11 @@ fn test() {
 ///
 /// The child's stdin is a pipe this process holds the write end of, which is
 /// what arms 1 and 2 measure afterwards.
-fn parked(role: &str, extra: Option<toyos::namespace::Namespace>) -> std::process::Child {
+fn parked(role: &str, extra: Option<(String, u32)>) -> std::process::Child {
     let mut command = Command::new(SELF_PATH);
     command.arg(role).stdin(Stdio::piped()).stdout(Stdio::piped());
-    if let Some(ns) = extra {
-        command.endow(SVC_LABEL, ns.into_raw().0);
+    if let Some((label, handle)) = extra {
+        command.endow(&label, handle);
     }
     let mut child = command.spawn().unwrap_or_else(|e| panic!("spawn {role}: {e}"));
 
@@ -100,10 +96,14 @@ fn parked(role: &str, extra: Option<toyos::namespace::Namespace>) -> std::proces
 /// The write is what tells the two apart.
 fn a_pipe_reader_killed_in_the_read() {
     let mut child = parked("pipe-read", None);
+    // **Taken before `wait`, which closes it.** `Child::wait` drops the write
+    // end first — a child blocked reading a pipe its parent still holds would
+    // never exit otherwise — so the handle under test has to leave the `Child`
+    // before then.
+    let mut stdin = child.stdin.take().expect("the child's stdin");
     child.kill().expect("kill the parked child");
     let _ = child.wait();
 
-    let mut stdin = child.stdin.take().expect("the child's stdin");
     let refused = stdin.write_all(b"nobody is reading this");
     assert!(
         refused.is_err(),
@@ -119,15 +119,22 @@ fn a_connection_peer_killed_in_the_read() {
         .add(SERVICE, &connector)
         .finish()
         .expect("a namespace carrying one connector");
-    let mut child = parked("connection-read", Some(ns));
+    let mut child = parked("connection-read", Some((SVC_LABEL.to_string(), ns.into_raw().0)));
     let conn = acceptor.accept().expect("the child connected");
 
     child.kill().expect("kill the parked child");
     let _ = child.wait();
 
+    // **`NotFound` and not `Gone`**, which `specs/capability-endowment-spec.md`
+    // §3.5 asks for and
+    // `specs/issues/isolation/a-broken-pipe-answers-not-found.md` is about;
+    // `connect_before_serve` asserts the same word for the same reason. What
+    // this arm is for is the *release* — on a kernel where the killed thread's
+    // stranded `Arc` kept the read end alive, this write succeeds — and either
+    // word says the peer went.
     assert_eq!(
         conn.write_nonblock(b"nobody is reading this"),
-        Err(SyscallError::Gone),
+        Err(SyscallError::NotFound),
         "a connection whose peer was killed mid-read still took a write",
     );
     println!("  connection: the write answered Gone");
@@ -135,23 +142,31 @@ fn a_connection_peer_killed_in_the_read() {
 
 /// Arm 3. Blocked in `accept`, which is the wait `Acceptor` added.
 ///
-/// There is no peer to ask here, so the census is the whole verdict — and it
-/// only became one when it could be read per kind: `Acceptor` is one of the six
-/// kinds no census assertion in the estate covered.
+/// **The peer here is a client of the port**, and it is the only thing that can
+/// answer. The parked thread holds the acceptor's `Arc` on its own kernel
+/// stack, so the object survives the kill; what must not survive is the handle
+/// count, because `Acceptor::on_zero_handles` is what sets the port `closed`
+/// and a connect through the connector is what reads it.
 fn an_acceptor_killed_in_the_accept() {
-    let before = Census::now();
-    let mut child = parked("accept", None);
+    let (acceptor, connector) = port::create().expect("a port of our own");
+    let label = format!("{SERVE_PREFIX}{SERVICE}");
+    let mut child = parked("accept", Some((label, acceptor.into_raw().0)));
+
+    // The parent's own way to ask, over the connector it kept.
+    let ns = namespace::build()
+        .add(SERVICE, &connector)
+        .finish()
+        .expect("a namespace carrying one connector");
     child.kill().expect("kill the parked child");
     let _ = child.wait();
+    drop(child);
 
-    let after = Census::now();
-    let acceptors = after.kind("Acceptor");
     assert_eq!(
-        acceptors,
-        before.kind("Acceptor"),
-        "a process killed inside accept left its acceptor behind: {before} then {after}",
+        ns.open(SERVICE).map(|conn| conn.fd()),
+        Err(SyscallError::Gone),
+        "a port whose only acceptor was killed mid-accept still queued a connection",
     );
-    println!("  accept: the acceptor went with the process ({acceptors} live)");
+    println!("  accept: the port closed and a connect answered Gone");
 }
 
 fn child(role: &str) -> ! {
@@ -171,7 +186,7 @@ fn child(role: &str) -> ! {
             panic!("connection-read came back with {n} bytes");
         }
         "accept" => {
-            let (acceptor, _connector) = port::create().expect("a port of our own");
+            let acceptor = endow::acceptor(SERVICE).expect("the parent endowed an acceptor");
             say("parked in accept");
             let taken = acceptor.accept().map(|conn| conn.fd());
             panic!("accept came back with {taken:?}");

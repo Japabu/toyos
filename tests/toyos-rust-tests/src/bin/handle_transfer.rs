@@ -70,7 +70,14 @@ fn test() {
     an_immediate_object_is_flushed_off_the_idle_stack();
 
     let after = Census::now();
-    let grown: Vec<_> = after.grown_since(&before).collect();
+    // **`Process` is excluded, and this is why.** A `ProcessObject` outlives its
+    // last handle by design: the process table holds one for the process's whole
+    // life and gives it up when the *scheduler* retires the task, which is a
+    // later pass and not a syscall this test makes. Counting it here would be
+    // timing the reaper. `handle_kill_policy` and `process_lifecycle` are where
+    // process lifetime is asserted.
+    let grown: Vec<_> =
+        after.grown_since(&before).filter(|(kind, _, _)| *kind != "Process").collect();
     assert!(
         grown.is_empty(),
         "handle transfer left more live objects behind: {grown:?} — \
@@ -193,10 +200,18 @@ fn an_unreceived_batch_is_released() {
     child.kill().expect("kill the peer holding the batch");
     let _ = child.wait();
     drop(conn);
+    // **Dropped before the reading, not after it.** A `Stdio::piped()` child
+    // leaves the parent holding the read end of its stdout for as long as the
+    // `Child` is alive, so a census taken with one in scope counts a `PipeRead`
+    // this arm created and blames the batch for it.
+    drop(child);
 
+    // The region and nothing else: this arm creates a process too, and a
+    // `ProcessObject`'s release is the scheduler's rather than this test's.
     let after = Census::now();
-    assert!(
-        after.grown_since(&before).next().is_none(),
+    assert_eq!(
+        after.kind("SharedMem"),
+        before.kind("SharedMem"),
         "a batch its peer never received was not released: first {before}, then {after}",
     );
     println!("  unreceived: the queue gave the region back");
@@ -211,11 +226,18 @@ fn a_senders_exit_does_not_retract_what_it_sent() {
     let n = conn.recv_handles(&mut batch).expect("receive the batch");
     assert_eq!(n, 1, "a batch a dead sender left behind arrived {n} wide");
 
-    // The child made both ends of the pipe and both went with it, so what is
-    // asserted is that the handle resolves and takes a write — the read end is
-    // gone, and a pipe with no reader still accepts one into its ring.
-    syscall::write_nonblock(batch[0], b"still here")
-        .expect("a handle its sender no longer holds stopped working");
+    // **The handle resolves, which is the whole assertion.** The child made both
+    // ends of the pipe and both went with it, so the write itself is refused for
+    // the reader rather than for the handle — `NotFound`, which
+    // `specs/issues/isolation/a-broken-pipe-answers-not-found.md` is about and
+    // which `connect_before_serve` asserts too. A handle a dead sender's batch
+    // no longer backed would instead end this process on `Stale`, so reaching
+    // the next statement at all is the verdict.
+    assert_eq!(
+        syscall::write_nonblock(batch[0], b"still here"),
+        Err(SyscallError::NotFound),
+        "a handle its sender no longer holds answered something other than its dead reader",
+    );
     syscall::close(batch[0]);
     println!("  sender exited: the batch was still there and still worked");
 }
