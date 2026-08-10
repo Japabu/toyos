@@ -4,7 +4,7 @@
 //! All networking in ToyOS goes through the `netd` daemon via message passing
 //! and kernel pipes.
 
-use crate::ipc::{IpcHeader, IpcPayload};
+use crate::ipc::{IpcError, IpcHeader, IpcPayload};
 use crate::ipc_payload;
 use crate::{Connection, Pipe, RawHandle};
 
@@ -294,7 +294,7 @@ impl NetdConn {
     }
 
     pub fn request<Req: IpcPayload>(self, msg_type: MsgType, payload: &Req) -> Result<PendingResponse, NetError> {
-        self.0.send(msg_type as u32, payload).map_err(|_| NetError::Io)?;
+        self.0.send(msg_type as u32, payload).map_err(hangup)?;
         Ok(PendingResponse(self))
     }
 
@@ -310,13 +310,31 @@ impl NetdConn {
         msg_type: MsgType,
         payload: &Req,
     ) -> Result<PendingResponse, NetError> {
-        self.0.send_with_handles(handles, msg_type as u32, payload).map_err(|_| NetError::Io)?;
+        self.0.send_with_handles(handles, msg_type as u32, payload).map_err(hangup)?;
         Ok(PendingResponse(self))
     }
 
     pub fn request_bytes(self, msg_type: MsgType, data: &[u8]) -> Result<PendingResponse, NetError> {
-        self.0.send_bytes(msg_type as u32, data).map_err(|_| NetError::Io)?;
+        self.0.send_bytes(msg_type as u32, data).map_err(hangup)?;
         Ok(PendingResponse(self))
+    }
+}
+
+/// A netd that hung up mid-exchange is a netd that is not there.
+///
+/// **[`NetdConn::connect`] already says so and the exchange did not, which is
+/// a distinction this architecture removed.** A connector is in the namespace
+/// from a program's first instruction, so connecting to a netd that has
+/// already exited *succeeds* — the connection queues on a port nobody will
+/// ever accept from — and the hang-up arrives at the first send or the first
+/// read instead. Reporting that as [`NetError::Io`] left every caller unable
+/// to tell "this machine has no network" from "netd failed", and `/bin/sshd`
+/// panicked across the boot of every NIC-less machine that lost the race
+/// rather than exiting with the line it has for exactly this.
+fn hangup(e: IpcError) -> NetError {
+    match e {
+        IpcError::Disconnected => NetError::NetdNotFound,
+        _ => NetError::Io,
     }
 }
 
@@ -326,9 +344,9 @@ impl PendingResponse {
     fn conn(&self) -> &Connection { &(self.0).0 }
 
     fn recv_checked_header(&self) -> Result<IpcHeader, NetError> {
-        let header = self.conn().recv_header().map_err(|_| NetError::Io)?;
+        let header = self.conn().recv_header().map_err(hangup)?;
         if header.msg_type == RespType::Error as u32 {
-            let err: ErrorResponse = self.conn().recv_payload(&header).map_err(|_| NetError::Io)?;
+            let err: ErrorResponse = self.conn().recv_payload(&header).map_err(hangup)?;
             return Err(NetError::from_error_code(err.code));
         }
         if header.msg_type != RespType::Result as u32 {
@@ -339,12 +357,12 @@ impl PendingResponse {
 
     pub fn response<Resp: IpcPayload>(self) -> Result<Resp, NetError> {
         let header = self.recv_checked_header()?;
-        self.conn().recv_payload(&header).map_err(|_| NetError::Io)
+        self.conn().recv_payload(&header).map_err(hangup)
     }
 
     pub fn response_bytes(self, buf: &mut [u8]) -> Result<usize, NetError> {
         let header = self.recv_checked_header()?;
-        self.conn().recv_bytes(&header, buf).map_err(|_| NetError::Io)
+        self.conn().recv_bytes(&header, buf).map_err(hangup)
     }
 
     pub fn status(self) -> Result<(), NetError> {

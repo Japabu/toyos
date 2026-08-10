@@ -1059,19 +1059,18 @@ fn sys_open(path: &str, flags: OpenFlags) -> u64 {
     process::with_fd_owner_data(|data| ops::open(&mut data.handles, &resolved, flags))
 }
 
+/// **Closing a handle wakes nobody, and that is the whole of it.**
+///
+/// A handle to a pipe end is not the end. `pipe::close_write` decrements the
+/// reference count and wakes readers when it reaches *zero* — the one place
+/// that knows whether the writer is gone — and the release that gets there runs
+/// off this call's own zero-handle drain. A second wake here fired on *every*
+/// close, so a pipe with a live writer and no bytes in it was announced
+/// readable; a one-shot io_uring poll consumed on that never fires again.
 fn sys_close(h: RawHandle) -> u64 {
-    let (result, wake_readers, wake_writers) = process::with_fd_owner_data(|data| {
-        // Grab pipe IDs before close drops the handle.
-        let (wake_r, wake_w) = match data.handles.get_ref(h, Rights::NONE) {
-            // writer closed → wake readers; reader closed → wake writers
-            Ok(o) => (ops::pipe_id_write(o), ops::pipe_id_read(o)),
-            Err(_) => (None, None),
-        };
-        let r = ops::close(&mut data.handles, h, &mut data.pipe_maps);
-        (r, wake_r, wake_w)
+    let result = process::with_fd_owner_data(|data| {
+        ops::close(&mut data.handles, h, &mut data.pipe_maps)
     });
-    if let Some(id) = wake_readers { process::wake_pipe_readers(id); }
-    if let Some(id) = wake_writers { process::wake_pipe_writers(id); }
     match result {
         Ok(()) => 0,
         Err(e) => e.refuse(),
@@ -2252,12 +2251,14 @@ fn sys_handle_dup(h: RawHandle, want: u64) -> u64 {
 /// is the slot's own. Whatever was at that slot is closed first, and the slot's
 /// generation moves — so an older handle to it is `Stale` rather than a name
 /// for whatever landed there.
+///
+/// Displacing a handle wakes nobody, for [`sys_close`]'s reason: the reference
+/// the entry held is what a wake is owed for, and dropping it is what gives it
+/// back.
 fn sys_dup2(old: RawHandle, slot: u64) -> u64 {
     let Ok(slot) = u16::try_from(slot) else {
         return SyscallError::ResourceExhausted.to_u64();
     };
-    let mut wake_read = None;
-    let mut wake_write = None;
     let result = process::with_fd_owner_data(|data| {
         let rights = data.handles.rights_of(old)?;
         let entry = data.handles.duplicate_entry(old, rights)?;
@@ -2265,15 +2266,9 @@ fn sys_dup2(old: RawHandle, slot: u64) -> u64 {
             .handles
             .install_at(slot, entry)
             .map_err(|_| SyscallError::ResourceExhausted)?;
-        if let Some(displaced) = displaced {
-            wake_read = ops::pipe_id_write(displaced.object());
-            wake_write = ops::pipe_id_read(displaced.object());
-            drop(displaced);
-        }
+        drop(displaced);
         Ok::<_, crate::object::Refusal>(new_h)
     });
-    if let Some(id) = wake_read { process::wake_pipe_readers(id); }
-    if let Some(id) = wake_write { process::wake_pipe_writers(id); }
     match result {
         Ok(new_h) => new_h.0 as u64,
         Err(e) => e.refuse(),
