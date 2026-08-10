@@ -62,7 +62,9 @@ jobs:
       # protocol, the sysroot witness, and the format check on the two volumes
       # the image builder writes.
       - name: build system
-        run: cargo test --lib
+        run: |
+          set -o pipefail
+          cargo test --lib 2>&1 | tee -a /tmp/host.log
 
       # CLAUDE.md's list, whole. It used to be nine of the thirteen — the four
       # that were missing (`toyos-elf`, `toyos-ld`, `toyos-pci`,
@@ -71,17 +73,34 @@ jobs:
       # the tests it was cheapest to run.
       - name: host crates
         run: |
-          set -e
+          set -e -o pipefail
           for crate in toyos-sched toyos-ps2 toyos-gpt toyos-elf toyos-cc \
                        toyos-ld toyos-hda toyos-pci toyos-xhci toyos-desktop \
                        kernel-loom kernel-span toyos-fat32 toyos-fat32-check; do
-            echo "=== $crate"
-            cargo test --manifest-path "$crate/Cargo.toml"
+            echo "=== $crate" | tee -a /tmp/host.log
+            cargo test --manifest-path "$crate/Cargo.toml" 2>&1 | tee -a /tmp/host.log
           done
 
       # `userland/.cargo/config.toml` cross-compiles by default, so its host
       # tests have to name the host.
       - name: sshd
         run: |
+          set -o pipefail
           host=$(rustc -vV | sed -n 's/^host: //p')
-          cargo test --manifest-path userland/sshd/Cargo.toml --target "$host"
+          cargo test --manifest-path userland/sshd/Cargo.toml --target "$host" 2>&1 \
+            | tee -a /tmp/host.log
+
+      # Fifteen `cargo test` invocations in three steps, and a red is one line
+      # somewhere among them. The summary is what a reader sees before opening
+      # anything: which crate, and the first thing that failed in it.
+      - name: what failed
+        if: failure()
+        run: |
+          {
+            echo "### host tests"
+            echo ""
+            echo '```'
+            grep -E '^(=== |error(\[|:)|test .* FAILED|failures:$|    [a-z_:]+$|test result: FAILED)' \
+              /tmp/host.log | tail -40 || echo "(nothing matched; read the log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -231,8 +231,8 @@ records and which a concatenation cannot see.
 |---|---|---|---|---|
 | `host-tests.yml` | PR, push to `main` | `macos-latest` | `cargo test --lib` plus all fourteen host crates and `userland/sshd`. No toolchain, no guest. | **`host`** |
 | `landing.yml` | PR, push to `main` | `ubuntu-latest` ×2 | The ABI-first rule, and whether the guest gate is still owed (§10.4). Seconds each. | **`abi-split`, `gate-stage`** |
-| `toolchain.yml` | PR, push to `main` | `ubuntu-24.04` | Publishes the content-addressed toolchain release, or does nothing. Its job is named `build`. | no |
-| `ci.yml` | PR, push to `main` | `ubuntu-24.04` ×14, `debian:sid` container | Twelve guest shards on KVM at one lane each, one TCG canary, and `guest-suite` fanning the twelve into one name. | **`tcg`**; `guest-suite` not yet (§10.4) |
+| `toolchain.yml` | PR, push to `main` | `ubuntu-24.04` | Publishes the content-addressed toolchain release, or does nothing. Its job is named `build`. | no (§11.1) |
+| `ci.yml` | PR, push to `main` | `ubuntu-24.04` ×16, `debian:sid` container | `toolchain-ready` (§11.1), twelve guest shards on KVM at one lane each, one TCG canary, `durations` (§11.2), and `guest-suite` fanning the twelve into one name. | **`tcg`, `guest-suite`** |
 | `gate-a.yml` | `workflow_dispatch` | `ubuntu-24.04` ×2 | The thorough audio tier, one audio test per machine. | no |
 | `probe-*.yml` | push to `ci/probe-*` | various | The measurement workflows this document is made of. | no |
 
@@ -244,15 +244,19 @@ triggers everything — and it is one. `main` still runs on push because it is w
 every branch can restore. `ci/**` is a throwaway namespace and matches none of
 the first four.
 
-**Seventeen jobs is most of the budget.** A public repository on the free plan
+**Nineteen jobs is most of the budget.** A public repository on the free plan
 runs **20 jobs at once**, and one pull request is twelve shards + `guest-suite` +
-`tcg` + `host` + `abi-split` + `gate-stage` + `build`. Two pull requests in
-flight therefore queue: measured 2026-08-08 with #3 and #4 both up — 20 in
-progress, 24 queued, and `gate-stage`, a **required** check that runs in three
-seconds, sat queued twenty-two minutes behind twelve **advisory** guest shards.
-It resolves itself and costs wall clock rather than correctness, but a required
-check pending for half an hour is a queue and not a hang, and nobody should go
-looking for one.
+`tcg` + `host` + `abi-split` + `gate-stage` + `build` + `toolchain-ready` +
+`durations`. Two pull requests in flight therefore queue: measured 2026-08-08
+with #3 and #4 both up — 20 in progress, 24 queued, and `gate-stage`, a
+**required** check that runs in three seconds, sat queued twenty-two minutes
+behind twelve **advisory** guest shards. It resolves itself and costs wall clock
+rather than correctness, but a required check pending for half an hour is a queue
+and not a hang, and nobody should go looking for one.
+
+**§11.1 is the same budget read the other way.** Twelve of those nineteen no
+longer *start* until the toolchain exists, where before they started and waited,
+so a branch whose toolchain is building occupies one slot rather than thirteen.
 
 **macOS for the host tests used to be two things and is now one.** The *judge*
 was macOS-only — `fsck_msdos`, on both `toyos-fat32` and `src/image.rs` — and it
@@ -1462,3 +1466,195 @@ one more thought before anyone promotes the gate**: three consecutive greens was
 chosen because "one lucky green is a sample rather than a state", and at 0.8 per
 run three of them is a coin toss too. Promoting `guest-suite` to required with
 either of the two above still open makes every merge pay the same rate.
+
+## 11. What a merge pays for, and the four places it was paying for nothing
+
+Everything above is about whether CI's verdict is *true*. This section is about
+what it costs to get one, and it starts from a single run: **pull request #22's
+first, on 2026-08-10.** Its std did not compile, and reading that run end to end
+found four separate things wrong with the machinery around it.
+
+### 11.1 Nothing gated the shards on the build
+
+`toolchain.yml`'s `build` failed at 09:00:07 with `error[E0433]`. It published
+no release. The twelve `guest` shards and `tcg` have — had — no `needs:` at all,
+so all thirteen started, installed nothing, and sat in the two-hour wait loop
+each of them carries. Measured off the run's own job records: **2,775–2,785
+seconds apiece before they were cancelled**, about ten hours of runner time and
+the entire 20-job concurrency budget, spent on a tree that could not build. §5
+already recorded what that budget does to somebody else's pull request: a
+required three-second check queued twenty-two minutes behind twelve advisory
+shards.
+
+**`needs:` does not reach across workflows and `toolchain.yml` must stay its own
+workflow** — `ci.yml` cancels a superseded run by design, and an hour-long
+bootstrap thrown away by the next push starts again from nothing. So the wait
+stays and the thing that could not tell *not yet* from *never* is what changed.
+`toolchain-ready` is that wait, once, in one job that also reads the toolchain
+workflow's own verdict for this head sha and fails the moment it concludes
+anything but success. One runner waits; thirteen do not start. The two wait loops
+it replaces are a short retry now, because by then the release is known to be
+there and anything still failing is the API.
+
+**`tcg` takes `if: always()` and a guard step rather than a bare `needs:`.**
+GitHub reports a job skipped by an unmet `needs:` as a state a protection rule
+reads as satisfied, so a required check that can be skipped is a required check
+that cannot fail. `guest-suite` names `toolchain-ready` from the other side, for
+the reader of the merge button: a skipped `guest` does not say why it skipped.
+
+**`build` is still not a required check** (§10.4's list). It is now refused *by
+construction* through `guest-suite`, so the accident is gone, but the check whose
+name says "the toolchain did not build" is still advisory. Adding it costs
+nothing — 6 seconds on nearly every branch, since the release almost always
+exists — and it is a ruleset change, which is the owner's. **Recommended.**
+
+Measured on the first run that carried it, `31377439504`: `toolchain-ready` took
+**6 seconds** on a branch whose release was already published, which is the case
+on nearly every branch. What it costs when the release is *not* there is one
+runner waiting instead of thirteen.
+
+### 11.2 The duration profile had drifted, and nothing was watching it
+
+§4 committed `tests/test-durations` because every runner is a machine that has
+measured nothing. Nothing then kept it true. Measured against run
+`31331494794` (`main` at `0e48d2e`):
+
+- **Eight names it did not price at all** — `control_regs`,
+  `control_regs_negative`, `control_regs_verdict`, `doom_music`,
+  `fpu_isolation`, `short_sleep_livelock`, `stall_is_not_a_verdict`,
+  `syscall_cost`. `Shard::keep` prices an unseen name at the longest it *did*
+  know, which is deliberate conservatism and, eight times over, eight phantom
+  four-minute tests steering a twelve-way split.
+- **Names it did price were out by twentyfold in both directions**:
+  `foreign_disk_untouched` 87.0 s recorded against 4.3 s measured,
+  `double_fault_stack` 82.3 s against 4.3 s, `ioapic_topology` 83.9 s against
+  5.9 s; the other way `kernel_heartbeat` 33.2 s against 150.6 s and
+  `xhci_deaf_registers` 73.3 s against 122.6 s.
+
+What it cost, from that run's own shard files: shards carried **228.7 s to
+508.8 s** of tests against an even split of **365.7 s**. Simulating the same LPT
+over the same items under the two profiles puts the widest bin at **566.9 s
+against 363.9 s**, so the drift is the whole of the gap and the algorithm is not
+at fault.
+
+**Refreshed from that run, and then measured against it.** Run `31377439504`
+(`wt/toyos-ciperfect` at `4e6a5a6`) is the same twelve shards on the same image
+with the profile rebuilt:
+
+| | widest | narrowest | sum | even split | widest over even |
+|---|---|---|---|---|---|
+| `31331494794`, the old profile | 508.8 s | 228.7 s | 4,506.7 s | 375.6 s | 133.2 s |
+| `31377439504`, this one | 466.1 s | 283.5 s | 4,463.4 s | 371.9 s | 94.2 s |
+
+**−42.7 s on the critical path**, for the same work: the sums differ by 1%.
+
+That is a third of what the simulation predicted, and why is worth recording,
+because it is now the whole of what is left. With the profile refreshed the
+prices *are* the times — per shard the measured sum is within 0.1 s of the wall
+clock, except where a red bought a re-run — so the residual 94 s is not the
+profile. It is that `tests/toyos.rs` calls `Shard::keep` three times, for the
+parallel tasks, the serial tail and gate A's configs, and each call starts from
+twelve empty bins: three good partitions, three imbalances, added.
+`specs/issues/build/the-shard-partition-is-taken-three-times.md` has the per-shard
+table and the one-accumulator fix. Its call sites are in `tests/toyos.rs`, which
+this task did not have.
+
+The `durations` job is what stops the profile rotting again: it runs
+`--merge-durations` over the twelve artifacts on every
+`ci` run and puts the spread, the even split and **the names no entry priced**
+into the job summary with the command to update. Advisory by construction — a
+slow partition is not a wrong verdict, and a pull request that adds a test must
+not be red for the profile not knowing it yet. One thing in it is a gate and
+always was: `--merge-durations` refuses a name two shards both measured, which is
+§4's partition defect that a concatenation cannot see.
+
+`--merge-durations` also moved above `check_prerequisites`, beside `--pr` and
+`--abi-split-check`. It reads twelve files and writes one, it needed a QEMU on
+the machine, and the machine holding those files is a runner that has none.
+
+### 11.3 A red was a dig, and is now a glance
+
+The real failure of #22 was four lines of `error[E0433]` among four pre-existing
+std warnings, an hour into a 2,300-line log, and reaching it took `gh run view
+--log-failed | grep`. Three job summaries carry it now: `toolchain` lifts the
+first compile error and the panic that ended the run, `host` lifts the crate and
+the first failure in it, and every shard adds the sentences the harness already
+writes — `FAIL`, `XFAIL`, `STALL`, `INVL` and the `ALONE:` verdict that says
+whether a re-run tells you anything.
+
+Two things in the build system are upstream of that, and both are
+`src/toolchain.rs`:
+
+- **The build reported a missing file and the cause was a compile error.** At
+  08:58:41 `x build` failed with `error: could not compile std`; `full_bootstrap`
+  found a `rustc` from an earlier build on disk, printed "some targets may have
+  failed to link (expected), but rustc built successfully" and carried on; at
+  09:00:04 it died with `Hosted rustc build failed: .../stage2/bin/rustc
+  missing`. **83 seconds and about 260 log lines between the report and the
+  cause.** The allowance is narrow now — anything that is not a compile error —
+  and what it still swallows is printed rather than asserted.
+- **The sysroot witness did not cover the std fork.** `adopt_shared_sysroot`
+  hashed `toyos-abi/src`, `toyos/src` and `userland/libc/src`; a linked
+  worktree's `rust/` is an empty stub, so a worktree editing the std fork edits
+  the primary's `rust/library` and then compiles against the std already on disk.
+  That is why the error reached CI at all. `rust/build/toyos-std-fork-witness` is
+  the record, in a file of its own so that adding it does not refuse every
+  worktree built from an older commit, and a worktree whose *only* disagreement
+  is the std fork rebuilds it rather than claiming — `rust/` is one directory for
+  the whole repository, so that takes nothing from anybody.
+
+### 11.4 `gate-stage` had become the thing it was built to refuse
+
+Its body was `exit 0`: a required status check that could not fail, left behind
+when §10.4's trigger fired and the owner promoted `guest-suite` (#21).
+
+§10.5 says of the settings that govern every merge, "none of this is in VCS and
+none of it is reviewable in a diff". Half of it is readable from `GET
+/repos/{owner}/{repo}/rules/branches/main`, which needs **no token at all** on a
+public repository — asked unauthenticated: `200`, and the five required contexts,
+`strict_required_status_checks_policy: true` and `allowed_merge_methods:
+["merge"]` in the body. So `gate-stage` reads main's protection back and refuses
+a disagreement, and §10.5's list is a diff for as much of itself as GitHub will
+answer for.
+
+**A minimum and not an equality**, in both directions on purpose: a context this
+repository names and GitHub does not is a gate somebody dropped, and reds; a
+context required at GitHub that the workflow does not name is reported in the
+summary and nothing else, because the owner adding one must not red every merge
+until a workflow catches up. It keeps the name `gate-stage` — the context is
+matched by job name, and renaming it is a ruleset change with a window in which a
+required check reports nothing.
+
+Verified against the live configuration: green, and the negative control —
+declaring `build` required, which it is not — reds with `main does not require
+the check \`build\``. Run `31377439495` is the first CI run of it.
+
+### 11.5 And a mirror that fails three times says so
+
+`test "$attempt" != 3 && sleep 20` does not end the step under `bash -e`
+(verified: all three attempts run and the script reaches its end with status 0),
+so three apt failures were reported three lines later as
+`qemu-system-x86_64: command not found` — which reads as a broken image rather
+than as a rolling mirror. §10.8 put that retry there so a mirror could not block
+a merge, now that `guest-suite` is required. The failure names itself now.
+
+### 11.6 What is left, and what was deliberately not done
+
+- **`gate-a.yml` runs `ubuntu-24.04`'s QEMU 8.2.2**, where every shard runs
+  11.0.3 in `debian:sid`. §7.3 is the measurement that says a three-major-version
+  gap changes test outcomes, and §9's open question is whether a runner's gate A
+  spread is comparable with the dev host's — which cannot be answered on a
+  different QEMU from either. Not changed here, because a `workflow_dispatch`
+  workflow cannot be verified without a three-hour run.
+  `specs/issues/build/gate-a-runs-a-different-qemu.md`.
+- **The `cargo build` inside each shard's suite step is 435 s of the widest
+  shard's 1,058 s** (run `31330069053`, shard 10: suite step 976 s, harness total
+  540.8 s). It is the same build on all thirteen machines and it is the largest
+  single item left on the critical path — larger than the partition this task
+  fixed. Nothing was done about it: a restored `target/` is the obvious lever and
+  it is a class of change that wants its own measurement.
+  `specs/issues/build/every-shard-rebuilds-the-whole-tree.md`.
+- **The per-job fixed cost is 53 s of `apt-get`** in every one of thirteen
+  containers, for the same four packages (run `31330069053`, `deps` step:
+  52–84 s). A prebuilt image on ghcr.io would replace it with a pull. Not taken:
+  it trades an `apt-get` for a registry, and 53 s of 1,058 is 5%.
