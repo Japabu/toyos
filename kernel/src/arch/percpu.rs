@@ -506,7 +506,7 @@ pub fn idle_rsp_ptr() -> *mut u64 {
 
 /// The byte immediately below this CPU's idle stack — the last byte of its
 /// guard page, and the first thing an overflowing frame reaches.
-#[cfg(feature = "test-idle-guard")]
+#[cfg(feature = "test-actuators")]
 pub fn idle_guard_byte() -> u64 {
     idle_stack_top() - IDLE_STACK_SIZE as u64 - 1
 }

@@ -36,7 +36,7 @@ pub fn double_fault_stack(
         rust_bins,
         BootOptions {
             profile: qemu::Profile::Metal,
-            kernel_features: &["test-double-fault"],
+            kernel_features: &["test-actuators"],
             ..Default::default()
         },
     );
@@ -98,8 +98,8 @@ pub fn double_fault_stack(
 ///
 /// Absence is invisible to every log line and every screendump, so the only
 /// way to ask whether the page is really gone is to touch it — which nothing
-/// in the kernel does, that being the point of a guard page. `test-idle-guard`
-/// supplies the one read.
+/// in the kernel does, that being the point of a guard page. `SYS_DEBUG` action
+/// 9 supplies the one read.
 pub fn idle_stack_guard(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -110,7 +110,7 @@ pub fn idle_stack_guard(
         c_bins,
         rust_bins,
         BootOptions {
-            kernel_features: &["test-idle-guard"],
+            kernel_features: &["test-actuators"],
             ..Default::default()
         },
     );
@@ -126,7 +126,7 @@ pub fn idle_stack_guard(
         .find_map(|l| l.split("reading the idle stack guard at ").nth(1))
         .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
         .ok_or_else(|| {
-            format!("the kernel never reached the guard read — is `test-idle-guard` on?\n{log}")
+            format!("the kernel never reached the guard read — is `test-actuators` on?\n{log}")
         })?;
 
     // The tell of a guard that is not there: `SYS_DEBUG` returned, so the read
