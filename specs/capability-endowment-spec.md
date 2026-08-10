@@ -2206,13 +2206,11 @@ lines and harness assertions that named it (§3.3, §6.7a).
 *Gate: `handle_transfer`, `kill_while_blocked`, gate A both tiers' fast arm,
 `device_claim_crash_release`.*
 
-**Half done, 2026-08-10. The kernel and the ABI are complete and the kernel
-compiles clean; the SDK is a third of the way and userland is untouched.** The
-tree does not build past `toyos/` and that is the state the next commit inherits
-— use `cargo build --target x86_64-unknown-none` inside `kernel/` (chunk 4's
-note) to keep the kernel honest while the guest is red.
+**Done, 2026-08-10. `cargo test` is 298/298 including gate A's fast tier, and
+`cargo test --lib` 75/75.** One thing is outstanding and it is not code: the
+`rust` submodule pin. See "What the pin owes" below.
 
-What is done, and the five things the plan did not have:
+What is done, and the eight things the plan did not have:
 
 - **`SYS_SOCKET_CREATE` is not retired; it is renamed `SYS_CONNECTION_JOIN` and
   keeps number 76.** §3.2's reason for retiring it — "built a connection out of
@@ -2267,19 +2265,58 @@ removal path), and `Acceptor::on_zero_handles` left a thread parked in
 `specs/issues/isolation/a-moved-handle-is-always-re-movable.md` — the second is
 a property §6.3 assumes and the design does not have.
 
-**What is left, in order.** The SDK's `audio`/`net`/`surface`/`device`/`gpu`
-(`shm`, `poller`, `port`, `ipc` and `lib` are done, `toyos/src/pipe.rs` is
-deleted); soundd's `MSG_STREAM_OPENED` **and its hand-decode of
-`StreamOpenRequest` at `main.rs:1666-1672`, which re-implements the layout with
-literal byte ranges**; the compositor's four protocol tokens and **three**
-`shm.grant(pid)` sites (`session.rs:875`, `:1216`, `:1328` — not the one §6.3a
-counts) plus `console/src/main.rs:89`, a fourth `FramebufferInfo` reader outside
-the compositor; netd's nine pipe-id fields, which become two handles sent over
-the control connection in the direction the client already creates them; the
-accept pid out of `toyos::surface::Notice`, the compositor, netd, soundd and
-`tests/toyos.rs:9308`'s two `netd: …ing pid` literals; the fork half (std's
-`net/connection/toyos.rs`, `socket2`, and mio's `selector.rs:28-30`); and the
-test estate §6.7 lists.
+- **A peer is named by the connection's own handle, because there is no syscall
+  that answers a `Koid`.** §6.7a and D3 both say the diagnostic pid becomes the
+  connection's koid; §3.1's fourteen numbers contain nothing that reports one,
+  and adding a fifteenth is not this chunk's decision. A `RawHandle` does the
+  same job with what already exists: it carries a generation, and a closed slot
+  is reissued at the next one, so a handle value names one object for the life
+  of the process holding it and designates nothing in any other table. That is
+  `toyos::surface::ClientId`, the compositor's `dropping client N` and netd's
+  `dropping client N`. If the owner wants the koid it is one number and one arm.
+- **`ResizeInfo::old_token` is deleted rather than migrated.** It told a client
+  which token was being replaced; a client holds its old buffer as a handle and
+  needs nobody to name it. No reader ever used it.
+- **Two "hold it or the peer cannot map it" statics are deleted** —
+  `window::clipboard_set`'s `CLIPBOARD_SHM` and the compositor's `PASTE_SHM`.
+  Each existed because a token meant nothing after its owner dropped the region.
+  The receiver's own handle is what keeps the region alive now, so the sender
+  drops its mapping in the statement after the send.
+- **`DropReason::Vanished` is deleted.** Its only producer was
+  `grant_shared` naming a pid the process table no longer had. A client that has
+  gone is a refused send, which is `Gone`, which the compositor already had.
+
+**Three defects the first green suite found, all in chunk 6's own kernel half.**
+Named because none of them could be seen while the tree did not build:
+
+- `SYS_HANDLE_RECV` installed the batch and answered **zero**, so every receiver
+  read "the peer sent no handles" while holding them — and leaked one handle per
+  message. Every audio client and every window failed on it.
+- `SYS_READ_NONBLOCK` had no `Device` arm, so it reached `ops::try_read`'s
+  `unreachable!`. That is the path the compositor polls its keyboard and mouse
+  on: the desktop died on its first poll.
+- `SYS_IO_URING_ENTER` answered `InvalidArgument` for every handle failure, so a
+  closed ring and a nonsense argument were one word. It uses the table's own
+  words now.
+
+**`metal_sim_client_death`'s non-vacuity witness changed sides**, and the
+harness moved with it. It asserted the compositor said "the process behind it
+has exited" when a reaped creator's heir asked for a window — the grant that
+killed the owner's desktop. There is no grant: the buffer travels over the
+connection, the heir holds it, and the request is *served*. The heir's own
+report of being served is the witness.
+
+**What the pin owes.** The `rust` submodule pin on this branch is
+`0e27504731a5f6a2f7c9d43e9e40e6b28b56a0e5`, recorded at chunk 5, and **that
+commit exists nowhere** — not locally and not on `Japabu/rust`. The fork's
+`origin/main` was `0e27504731a51efe…` (the same twelve-character prefix, which
+is why it went unnoticed) and is now `d91d5a423708b67f67b3aca99631f0dd085c7d33`
+with this chunk's `connection_join` on top and pushed. **The branch must record
+`d91d5a423708b67f67b3aca99631f0dd085c7d33` for `rust` before the pull request**,
+which in a worktree — where `rust/` is deliberately an empty stub — is
+`git update-index --add --cacheinfo 160000,d91d5a423708b67f67b3aca99631f0dd085c7d33,rust`.
+Nothing in the tree checks a submodule pin resolves, and CI has never run on
+this branch, so this class of breakage is invisible until the pull request.
 
 **Chunk 7 — process objects and the fail-fast flip. Green.**
 `ProcessObject`/`ThreadObject`; `SYS_SPAWN` returns a handle;
