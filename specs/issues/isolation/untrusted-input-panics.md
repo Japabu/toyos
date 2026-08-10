@@ -39,7 +39,9 @@ is no growth-by-doubling overshoot left to absorb. The residual is that the
 thread count itself is still uncapped: this bounds the syscall, not the machine.
 
 **The gate is the actuator's, not the bound's.** 65,536 threads is 8 GiB of
-kernel stacks and no guest can make them, so `test-heap-ceiling` drops the
-constant to 16 and `heap_ceiling` spawns threads until the refusal comes (13, on
-that boot) and then joins them and checks it recovers. What runs is the shipped
+kernel stacks and no guest can make them, so `SYS_DEBUG` action 14 puts 16 in
+the constant's place *at runtime* and `heap_ceiling` spawns threads until the
+refusal comes (13, on that boot) and then joins them and checks it recovers.
+Runtime because as a `#[cfg]` the 16 travelled into every kernel the suite
+booted and the shipped 65,536 was executed by nothing. What runs is the shipped
 count, comparison and error return; the number is the only thing replaced.

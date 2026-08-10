@@ -42,7 +42,7 @@ takes a 4 KiB page out of the direct map below every idle stack
 overflow faults where it happens and is reported instead of being found later
 somewhere else. `idle_stack_guard` is the gate — the guard page is the one
 page in the kernel deliberately absent from the direct map, and absence is
-invisible to every log line, so `test-idle-guard` supplies the one read that
+invisible to every log line, so `SYS_DEBUG` action 9 supplies the one read that
 touches it. Note what it does *not* change: a fault on a kernel address is
 fatal by policy either way, so the machine still halts; what is new is that it
 halts with a report naming the address. Instrumented at the block layer, with the

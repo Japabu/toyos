@@ -2614,15 +2614,14 @@ It can still `SYS_OPEN("/etc/passwd")`, because paths are ambient and per-proces
 directory namespaces are the follow-on stage (§12). The least-authority table in
 §8.3's gate asserts what is true and does not assert what is not.
 
-**D7 — `SYS_DEBUG` and `SYS_SHUTDOWN` stay ungated.** Both want a `SysCap` right
-and this design supplies the mechanism, but gating `SYS_DEBUG` means threading a
-`SysCap` through `/bin/test-runner` into seven test binaries and their children
-(`test_panic_child`, `heap_ceiling`, `abuse_kernel_addr`, `tlb_shootdown_waits`,
-`test_screen_graffiti` and two more). That is a change to the test estate's
+**D7 — `SYS_SHUTDOWN` stays ungated.** It wants a `SysCap` right and this design
+supplies the mechanism, but adding one means threading a `SysCap` through
+`/bin/test-runner` into the binaries that call it: a change to the test estate's
 authority model made in passing, inside a branch that already rewrites it, and it
-would be indistinguishable in the diff from the work it rode in on.
-`specs/issues/isolation/sys-debug-ungated.md` stays open and gets one sentence
-saying the mechanism now exists.
+would be indistinguishable in the diff from the work it rode in on. `SYS_DEBUG`
+wanted the same right and now needs nothing — the whole syscall is compiled only
+under `test-actuators`, so a shipping kernel does not carry the number and there
+is nothing for a capability to guard.
 
 ---
 

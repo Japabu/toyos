@@ -300,6 +300,19 @@ fn cargo_build(
 // under test were broken. The bootloader carries no config now, so it is
 // memoized once per profile and that hazard is not expressible.
 
+/// The staged-artifact key of a kernel built with `features`.
+///
+/// **Both build paths go through this and that is the whole of the claim** that
+/// a test which asks for no feature boots the binary an image ships: the staged
+/// file is named for this key, so an equal key is not a similar kernel but the
+/// same file. `cargo run --build-only` passes what `kernel_features` made of an
+/// empty request; the harness passes `BootOptions::kernel_features` joined.
+/// Nothing between them may add a name — which is what `qemu::fold_inert` used
+/// to do to every boot in the suite.
+fn kernel_key(features: &str) -> u64 {
+    key_hash(&[PROFILE, features])
+}
+
 fn key_hash(parts: &[&str]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -718,7 +731,7 @@ pub fn build(
                 root,
                 &root.join(format!("kernel/target/x86_64-unknown-none/{PROFILE}/kernel")),
                 "kernel",
-                key_hash(&[PROFILE, &kernel_features]),
+                kernel_key(&kernel_features),
             ),
             stage_artifact(
                 root,
@@ -881,7 +894,7 @@ pub fn build_test_image(
 ) -> Vec<u8> {
     let config = parse_config(config_path);
     let features = kernel_features.join(",");
-    let kernel_key = key_hash(&[PROFILE, &features]);
+    let kernel_key = kernel_key(&features);
     let bl_key = key_hash(&[PROFILE]);
     let initrd_key = initrd_key(config_path, extra_files);
 
@@ -1160,6 +1173,56 @@ fn find_host_rlibs(root: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test that asks for no kernel feature boots the binary an image ships.
+    ///
+    /// **That claim is a file, not a resemblance.** A kernel is staged under
+    /// [`kernel_key`] and read back from there, so the two paths agreeing about
+    /// the key means one artifact — and the day something re-inserts a name
+    /// between `BootOptions::kernel_features` and the build, this goes red.
+    /// Until 2026-08-10 something did: `qemu::fold_inert` prepended
+    /// `test-actuators` to every boot in the suite, so no test had ever booted
+    /// the shipping kernel and nothing in the tree could have said so.
+    ///
+    /// The third assertion is the negative control: a key that ignored its
+    /// features would satisfy the first two and certify nothing.
+    #[test]
+    fn a_boot_that_asks_for_no_feature_gets_the_shipping_kernel() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let shipping = kernel_features(root, false, &[]);
+        assert_eq!(shipping, "", "`cargo run` asks the kernel for {shipping:?}, not nothing");
+        let harness = <&[&str]>::default().join(",");
+        assert_eq!(
+            kernel_key(&shipping),
+            kernel_key(&harness),
+            "a featureless boot and the shipping build stage different kernels"
+        );
+        assert_ne!(
+            kernel_key(&shipping),
+            kernel_key("test-actuators"),
+            "the key ignores the features, so it cannot tell two kernels apart"
+        );
+    }
+
+    /// `test-actuators` is one name and pulls in nothing.
+    ///
+    /// The seven it replaced were seven kernel builds differing only in which
+    /// unreachable `SYS_DEBUG` arm they carried. Re-introducing one as an implied
+    /// feature rebuilds that, silently, and only this notices.
+    #[test]
+    fn the_actuator_umbrella_is_a_leaf() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = fs::read_to_string(root.join("kernel/Cargo.toml")).expect("read the manifest");
+        let manifest: KernelManifest = toml::from_str(&text).expect("parse the manifest");
+        let implied = manifest
+            .features
+            .get("test-actuators")
+            .expect("the kernel declares no `test-actuators`");
+        assert!(
+            implied.is_empty(),
+            "`test-actuators` implies {implied:?}, so it is several kernel builds again"
+        );
+    }
 
     /// No image this repository ships starts sshd.
     ///

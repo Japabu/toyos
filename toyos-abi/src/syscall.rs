@@ -646,10 +646,11 @@ pub fn debug_with(action: u64, arg: u64) -> u64 {
 /// action's *reason* stays at the kernel arm, where the code it runs is; its
 /// number lives here once, where both sides read it.
 ///
-/// Most are compiled only into a kernel built with the matching feature, and a
-/// number whose feature is off answers `InvalidArgument`. The three at the end
-/// are in every kernel: a live-object count is not authority over anything, and
-/// a churn test that needed its own boot would not be run after every change.
+/// **Every action here needs a kernel built with `test-actuators`, and a kernel
+/// without it has no `SYS_DEBUG` at all** — the number falls to the dispatch's
+/// default and answers `InvalidArgument`, which is what an unassigned number
+/// answers. So a constant below is a number a shipping kernel does not have,
+/// and the caller of one is a test that has to be given the kernel that does.
 pub mod debug_action {
     /// Panic the kernel. Kills the caller's machine, deliberately.
     pub const PANIC: u64 = 0;
@@ -657,24 +658,24 @@ pub mod debug_action {
     pub const NULL_READ: u64 = 1;
     /// Hold a kernel lock across a scheduler entry. Armed once per boot.
     pub const LOCK_ACROSS_SWITCH: u64 = 2;
-    /// Halt every CPU. `test-fatal-halt`.
+    /// Halt every CPU.
     pub const FATAL_HALT: u64 = 3;
-    /// Provoke a real #DF, to exercise the IST1 stack. `test-double-fault`.
+    /// Provoke a real #DF, to exercise the IST1 stack.
     pub const DOUBLE_FAULT: u64 = 4;
-    /// Heap allocations either side of `MAX_HEAP_ALLOC`. `test-heap-ceiling`.
+    /// Heap allocations either side of `MAX_HEAP_ALLOC`.
     pub const HEAP_AT_CEILING: u64 = 5;
     pub const HEAP_OVER_CEILING: u64 = 6;
     pub const HEAP_AT_CEILING_PAGE_ALIGNED: u64 = 7;
-    /// Draw over the screen a userland process owns. `test-screen-graffiti`.
+    /// Draw over the screen a userland process owns.
     pub const SCREEN_GRAFFITI: u64 = 8;
-    /// Read the guard page below this CPU's idle stack. `test-idle-guard`.
+    /// Read the guard page below this CPU's idle stack.
     pub const IDLE_GUARD_READ: u64 = 9;
     /// The kernel canary's address, and whether it still holds what the kernel
-    /// wrote. `test-kernel-canary`.
+    /// wrote.
     pub const CANARY_ADDR: u64 = 10;
     pub const CANARY_CHANGED: u64 = 11;
     /// Make the last CPU a shootdown waits for answer `arg` nanoseconds late,
-    /// and take it away again. `test-tlb-ack-delay`.
+    /// and take it away again.
     pub const TLB_ACK_DELAY_ARM: u64 = 12;
     pub const TLB_ACK_DELAY_DISARM: u64 = 13;
     /// How many kernel objects are alive right now, machine-wide.
@@ -696,6 +697,11 @@ pub mod debug_action {
     /// a number nobody can judge. The size is the kernel's choice and not the
     /// ABI's, which is why it is asked for rather than declared here.
     pub const IDLE_STACK_SIZE: u64 = 18;
+    /// Put a count this guest can reach in `MAX_SYSINFO_THREADS`'s place, for
+    /// the rest of the boot. `SYS_SYSINFO`'s real bound is a thread count no
+    /// guest can make, so only the number can move and moving it runs the
+    /// shipped count, comparison and refusal.
+    pub const LOWER_SYSINFO_BOUND: u64 = 19;
 }
 
 /// Every kind of kernel object, in the order the kernel's own `kobject!`

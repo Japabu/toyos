@@ -14,11 +14,13 @@
 
 use std::process::Command;
 
-// The three `test-heap-ceiling` actions: one kernel heap allocation each,
-// released again — at `mm::MAX_HEAP_ALLOC`, at `mm::PAGE_2M`, and at
-// `MAX_HEAP_ALLOC` with 4096-byte alignment.
+// `SYS_DEBUG` actions a `test-actuators` kernel provides. The first three take
+// one kernel heap allocation each and release it again — at
+// `mm::MAX_HEAP_ALLOC`, at `mm::PAGE_2M`, and at `MAX_HEAP_ALLOC` with
+// 4096-byte alignment; the last lowers `SYS_SYSINFO`'s thread bound to a count
+// this guest can reach.
 use toyos_abi::syscall::debug_action::{
-    HEAP_AT_CEILING, HEAP_AT_CEILING_PAGE_ALIGNED, HEAP_OVER_CEILING,
+    HEAP_AT_CEILING, HEAP_AT_CEILING_PAGE_ALIGNED, HEAP_OVER_CEILING, LOWER_SYSINFO_BOUND,
 };
 
 /// `SyscallError::ResourceExhausted`, as `SyscallError::to_u64` encodes it.
@@ -41,14 +43,22 @@ fn main() {
 /// ask the heap for more than `MAX_HEAP_ALLOC` and trip the assert three
 /// functions above — from any process, with no privilege.
 ///
-/// This kernel carries `MAX_SYSINFO_THREADS = 16` instead of 65,536, because
+/// [`LOWER_SYSINFO_BOUND`] puts 16 in `MAX_SYSINFO_THREADS`'s place, because
 /// 65,536 threads is 8 GiB of kernel stacks and no guest can make them. The
 /// count, the comparison and the refusal are the shipped ones.
+///
+/// **Armed here rather than compiled in, and the arming is itself an
+/// assertion**: the bound is the shipped 65,536 until this call, so a kernel
+/// that answered it and did nothing would fail at the loop below rather than
+/// pass. As a `#[cfg]` the 16 rode into every kernel the suite booted, and
+/// `SYS_SYSINFO` answered against it in every guest.
 fn sysinfo_refuses_rather_than_allocating_past_the_ceiling() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     assert!(sysinfo_answers(), "sysinfo already refuses with no threads of ours");
+    let rc = toyos_abi::syscall::debug(LOWER_SYSINFO_BOUND);
+    assert_eq!(rc, 0, "SYS_DEBUG {LOWER_SYSINFO_BOUND} did not lower the bound (rc={rc:#x})");
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut parked = Vec::new();

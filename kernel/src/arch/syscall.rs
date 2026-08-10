@@ -15,6 +15,7 @@ const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0084;
 
 use toyos_abi::handle::{RawHandle, Rights};
+#[cfg(feature = "test-actuators")]
 use toyos_abi::syscall::debug_action as DA;
 use toyos_abi::syscall::*;
 
@@ -78,16 +79,18 @@ retired_syscalls! {
 /// still alive, so the guard never drops and this lock stays held for the rest
 /// of the boot; that is why it is private to the one deliberate-panic action
 /// and shared with nothing.
+#[cfg(feature = "test-actuators")]
 static LOCK_ACROSS_SWITCH: crate::sync::Lock<()> = crate::sync::Lock::new(());
 
 /// One trip per boot, because the lock above is never released.
 ///
-/// `SYS_DEBUG` is ungated, so without this any process could call action 2 a
-/// second time and spin `Lock::lock`'s full 500M iterations on a lock nothing
-/// will ever hand over — with IF=0 (`MSR_FMASK` masks it on syscall entry) and
-/// preemption disabled, so on a single-CPU machine the timer, the log drains
-/// and every other thread are frozen for that whole window. Refusing the
+/// On a kernel that carries `SYS_DEBUG` at all, without this a process could
+/// call action 2 a second time and spin `Lock::lock`'s full 500M iterations on a
+/// lock nothing will ever hand over — with IF=0 (`MSR_FMASK` masks it on syscall
+/// entry) and preemption disabled, so on a single-CPU machine the timer, the log
+/// drains and every other thread are frozen for that whole window. Refusing the
 /// second call keeps the tripwire testable and the stall unreachable.
+#[cfg(feature = "test-actuators")]
 static LOCK_ACROSS_SWITCH_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
@@ -101,7 +104,7 @@ static LOCK_ACROSS_SWITCH_ARMED: core::sync::atomic::AtomicBool =
 /// The string is the whole synchronisation mechanism for the screen test:
 /// `halt_all_cpus` renders *before* it flushes serial, so a host that has
 /// seen this line knows the paint already finished — no sleep, no polling.
-#[cfg(feature = "test-fatal-halt")]
+#[cfg(feature = "test-actuators")]
 pub const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
 
 /// One kernel heap allocation of `bytes` at `align`, taken and released.
@@ -112,7 +115,7 @@ pub const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
 /// observed, and an actuator the optimiser can remove certifies nothing. The
 /// null return is reported rather than unwrapped for the same reason — a
 /// refusal and a success have to be distinguishable from userland.
-#[cfg(feature = "test-heap-ceiling")]
+#[cfg(feature = "test-actuators")]
 fn debug_heap_alloc(bytes: usize, align: usize) -> u64 {
     let Ok(layout) = core::alloc::Layout::from_size_align(bytes, align) else {
         return SyscallError::InvalidArgument.to_u64();
@@ -135,7 +138,7 @@ fn debug_heap_alloc(bytes: usize, align: usize) -> u64 {
 /// still made it. Nothing here is faked: the address is this static's own, the
 /// write a broken kernel makes is a real one, and what is read back is the
 /// memory itself.
-#[cfg(feature = "test-kernel-canary")]
+#[cfg(feature = "test-actuators")]
 mod canary {
     use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -646,6 +649,15 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
             sys_query_modules(&mut buf)
         }
+        // **The whole of `SYS_DEBUG` is here or it is nowhere.** A shipping
+        // kernel carries no debug syscall: the number falls to the dispatch's
+        // default and answers `InvalidArgument`, which is what an unassigned
+        // number answers, so there is nothing for a process to reach and
+        // nothing for it to discover. Every action below is a *test's* only
+        // route to a state the host cannot stage, and four of them cost the
+        // caller its process or the machine its CPUs by design — which is why
+        // the feature is the boundary rather than a capability check inside it.
+        #[cfg(feature = "test-actuators")]
         SYS_DEBUG => match a1 {
             DA::PANIC => panic!("SYS_DEBUG: kernel panic triggered by userspace"),
             DA::NULL_READ => { unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()); } 0 }
@@ -660,7 +672,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // Not compiled into a kernel anyone ships. Every other action
             // costs the caller its own process; this one costs the machine,
             // and no latch fixes that — one call is already a permanent halt.
-            #[cfg(feature = "test-fatal-halt")]
             DA::FATAL_HALT => { log!("{}", FATAL_HALT_NONCE); crate::arch::apic::halt_all_cpus(); }
             // A real double fault, produced the way the hardware produces one:
             // fault while RSP cannot be pushed to. The push below raises #SS on
@@ -675,7 +686,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // be written to, and the test would pass having faulted nothing.
             // Only #DF has an IST, so every other vector on the way is
             // delivered onto this same unusable stack.
-            #[cfg(feature = "test-double-fault")]
             DA::DOUBLE_FAULT => {
                 log!("SYS_DEBUG: provoking a double fault");
                 unsafe {
@@ -692,16 +702,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // size page-aligned, which `memalign` pads past what one page can
             // back — must come back as an error rather than as a panic taken
             // inside the allocator's lock, which is what it used to be.
-            #[cfg(feature = "test-heap-ceiling")]
             DA::HEAP_AT_CEILING => debug_heap_alloc(crate::mm::MAX_HEAP_ALLOC, 8),
-            #[cfg(feature = "test-heap-ceiling")]
             DA::HEAP_OVER_CEILING => debug_heap_alloc(crate::mm::PAGE_2M as usize, 8),
-            #[cfg(feature = "test-heap-ceiling")]
             DA::HEAP_AT_CEILING_PAGE_ALIGNED => debug_heap_alloc(crate::mm::MAX_HEAP_ALLOC, 4096),
             // Returns, unlike every other action here: what is under test is
             // what the *console* does next, so the machine and the process
             // both have to survive being drawn over.
-            #[cfg(feature = "test-screen-graffiti")]
             DA::SCREEN_GRAFFITI => {
                 crate::drivers::panic_console::graffiti();
                 0
@@ -711,16 +717,13 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // handing userland a kernel store. Returning 0 is the failure —
             // without a guard page that byte is dlmalloc's bookkeeping for the
             // chunk the idle stack lives in, and the read succeeds.
-            #[cfg(feature = "test-idle-guard")]
             DA::IDLE_GUARD_READ => {
                 let addr = super::percpu::idle_guard_byte();
                 log!("SYS_DEBUG: reading the idle stack guard at {addr:#x}");
                 unsafe { core::ptr::read_volatile(addr as *const u8) };
                 0
             }
-            #[cfg(feature = "test-kernel-canary")]
             DA::CANARY_ADDR => canary::address(),
-            #[cfg(feature = "test-kernel-canary")]
             DA::CANARY_CHANGED => canary::changed() as u64,
             // Make the last CPU a shootdown waits for answer `a2` nanoseconds
             // late, take one, and answer with how long it took. The number is
@@ -728,17 +731,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // cost of one ICR write however slow its siblings are. The arming
             // outlives the call, so the caller can then time an ordinary
             // syscall and learn whether *its* free path shoots down.
-            #[cfg(feature = "test-tlb-ack-delay")]
             DA::TLB_ACK_DELAY_ARM => crate::arch::tlb::debug_arm_ack_delay(a2),
-            #[cfg(feature = "test-tlb-ack-delay")]
             DA::TLB_ACK_DELAY_DISARM => crate::arch::tlb::debug_disarm_ack_delay(),
             // The two leaks this object model accepts — an `Arc` stranded on a
             // killed thread's stack, and the cross-pair connection cycle — are
             // visible in no other way, so the census needs a reader or it is a
-            // counter nothing ever reads. Unlike every action above it this one
-            // is in the shipping kernel: a churn test that needed its own boot
-            // would not be run after every change, and a live object count is
-            // not authority over anything.
+            // counter nothing ever reads.
             DA::CENSUS_TOTAL => crate::object::census::total(),
             DA::CENSUS_BREAKDOWN => {
                 for (kind, live) in crate::object::census::live() {
@@ -767,6 +765,16 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             }
             DA::IDLE_STACK_HIGH_WATER => super::percpu::idle_stack_high_water() as u64,
             DA::IDLE_STACK_SIZE => super::percpu::idle_stack_size() as u64,
+            // Lower `SYS_SYSINFO`'s thread bound to `GATED_SYSINFO_THREADS`
+            // for the rest of the boot. The bound itself is unreachable — no
+            // guest can make 65,536 threads — and this is the only way to run
+            // the refusal against the shipped count, comparison and error
+            // return. Armed rather than compiled, because as a `#[cfg]` it
+            // travelled into every kernel this suite booted.
+            DA::LOWER_SYSINFO_BOUND => {
+                SYSINFO_BOUND_LOWERED.store(true, core::sync::atomic::Ordering::Relaxed);
+                0
+            }
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => match ctx.copy_out(UserAddr::new(a1), &sys_sched_info()) {
@@ -2162,18 +2170,34 @@ fn sys_thread_join(tid: u64) -> u64 {
 /// doubling overshoot to absorb. A machine with more live threads than this
 /// gets `ResourceExhausted` from `ps`, which is a refusal rather than a
 /// kernel panic — the bound is policy, the ceiling it is derived from is not.
-#[cfg(not(feature = "test-heap-ceiling"))]
 const MAX_SYSINFO_THREADS: usize = 65_536;
 
-/// Sixteen, so the refusal above has a gate.
+/// The bound `SYS_DEBUG` action 14 puts in its place, so the refusal has a gate.
 ///
-/// The bound is a function of `MAX_HEAP_ALLOC` and nothing in this harness can
-/// make 65,536 threads — each carries a 128 KiB kernel stack, which is 8 GiB
-/// of a guest given 128 MiB. Only the constant can move, and moving it runs
-/// the whole refusal: the count, the comparison and the error return are the
-/// shipped ones.
-#[cfg(feature = "test-heap-ceiling")]
-const MAX_SYSINFO_THREADS: usize = 16;
+/// Nothing in this harness can make 65,536 threads — each carries a 128 KiB
+/// kernel stack, which is 8 GiB of a guest given 128 MiB — so only the number
+/// can move, and moving it runs the whole refusal: the count, the comparison
+/// and the error return are the shipped ones.
+///
+/// **Armed at runtime rather than compiled in, and that is the whole of why the
+/// action exists.** As a `#[cfg]` it rode into every kernel the suite booted on
+/// `test-actuators`' coat-tails, so `SYS_SYSINFO` answered against 16 in every
+/// guest and the shipped 65,536 was executed by nothing.
+#[cfg(feature = "test-actuators")]
+const GATED_SYSINFO_THREADS: usize = 16;
+
+#[cfg(feature = "test-actuators")]
+static SYSINFO_BOUND_LOWERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// What [`sys_sysinfo`] compares against on this boot.
+fn sysinfo_thread_bound() -> usize {
+    #[cfg(feature = "test-actuators")]
+    if SYSINFO_BOUND_LOWERED.load(core::sync::atomic::Ordering::Relaxed) {
+        return GATED_SYSINFO_THREADS;
+    }
+    MAX_SYSINFO_THREADS
+}
 
 fn sys_sysinfo(out: &mut UserBytesMut) -> u64 {
     const HEADER_SIZE: usize = 48;
@@ -2192,7 +2216,7 @@ fn sys_sysinfo(out: &mut UserBytesMut) -> u64 {
     let table = guard.as_ref().unwrap();
 
     let entry_count: u32 = table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))).count() as u32;
-    if entry_count as usize > MAX_SYSINFO_THREADS {
+    if entry_count as usize > sysinfo_thread_bound() {
         return SyscallError::ResourceExhausted.to_u64();
     }
 
