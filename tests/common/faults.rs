@@ -36,7 +36,7 @@ pub fn double_fault_stack(
         rust_bins,
         BootOptions {
             profile: qemu::Profile::Metal,
-            kernel_features: &["test-actuators"],
+            kernel_features: toyos_build::build::TEST_KERNEL,
             ..Default::default()
         },
     );
@@ -110,7 +110,7 @@ pub fn idle_stack_guard(
         c_bins,
         rust_bins,
         BootOptions {
-            kernel_features: &["test-actuators"],
+            kernel_features: toyos_build::build::TEST_KERNEL,
             ..Default::default()
         },
     );
@@ -318,7 +318,7 @@ pub fn dump_nmi_probe(
         c_bins,
         rust_bins,
         BootOptions {
-            kernel_features: &["dump-deaf-cpu"],
+            kernel_params: &["dump-deaf-cpu"],
             ..Default::default()
         },
     );

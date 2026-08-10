@@ -145,8 +145,10 @@ pub const CAP_ID_PROTOCOL: u8 = 2;
 /// fighting it. What this buys is that when the fight happens there is a line
 /// naming it, which is the whole difference on a laptop with no serial port.
 pub fn take_ownership(bar: &Mmio, bar_size: u64, hccparams1: u32) {
-    #[cfg(feature = "xhci-xecp-selftest")]
-    selftest();
+    #[cfg(feature = "boot-actuators")]
+    if crate::actuator::xhci_xecp_selftest() {
+        selftest();
+    }
 
     let xecp = hccparams1 >> 16;
     let read = |offset: u64| -> Option<u32> {
@@ -212,7 +214,7 @@ pub fn take_ownership(bar: &Mmio, bar_size: u64, hccparams1: u32) {
 /// the bounds in [`find`] would ship having never been executed. Each expected
 /// value is the *refusal*, not the answer — the property under test is that a
 /// list which makes no sense costs the handoff and nothing else.
-#[cfg(feature = "xhci-xecp-selftest")]
+#[cfg(feature = "boot-actuators")]
 fn selftest() {
     /// A 16-dword register window, so a dword at or past 0x40 is outside it.
     const WINDOW: u64 = 64;

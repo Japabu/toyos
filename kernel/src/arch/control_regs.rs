@@ -270,7 +270,7 @@ fn opt(value: u64, bit: u64, name: &'static str) -> &'static str {
 /// reads it clear (`specs/issues/kernel/ap-control-registers-inherit-init.md`).
 /// The number is bare metal's, not a VM on
 /// it, and the owner takes it with
-/// `--diag-boot --kernel-feature control-regs-bench`, off the panel.
+/// `--diag-boot --kernel-param control-regs-bench`, off the panel.
 ///
 /// Nothing outside the kernel can ask. There is no CPU affinity, so no userland
 /// loop can choose the core it runs on, and the state under test lives only
@@ -278,7 +278,7 @@ fn opt(value: u64, bit: u64, name: &'static str) -> &'static str {
 /// it at all. **The BSP's own row is the control**: it arrives with caching
 /// already on, so its three numbers are the instrument's spread rather than an
 /// effect.
-#[cfg(feature = "control-regs-bench")]
+#[cfg(feature = "boot-actuators")]
 mod bench {
     use super::cpu;
     use crate::log;
@@ -291,6 +291,9 @@ mod bench {
     static PROBE: [u64; LINES * STRIDE] = [0; LINES * STRIDE];
 
     pub fn sample() -> u64 {
+        if !crate::actuator::control_regs_bench() {
+            return 0;
+        }
         let start = cpu::rdtsc();
         let mut acc = 0u64;
         let mut i = 0;
@@ -304,6 +307,9 @@ mod bench {
     }
 
     pub fn report(cpu_id: u32, before: u64) {
+        if !crate::actuator::control_regs_bench() {
+            return;
+        }
         let cold = sample();
         let warm = sample();
         log!(
@@ -313,7 +319,7 @@ mod bench {
     }
 }
 
-#[cfg(not(feature = "control-regs-bench"))]
+#[cfg(not(feature = "boot-actuators"))]
 mod bench {
     pub fn sample() -> u64 {
         0
@@ -325,9 +331,9 @@ mod bench {
 /// machine every boot before this file was; nothing else can stage it, because
 /// a control register is the guest's own to write and no QEMU flag reaches one.
 ///
-/// The check and its log line are the shipped ones, so what a run under this
-/// feature produces is a real divergent CPU and a real failure.
+/// The check and its log line are the shipped ones, so what a run with this
+/// armed produces is a real divergent CPU and a real failure.
 fn skipped(cpu_id: u32) -> bool {
-    cfg!(feature = "no-ap-control-regs") && cpu_id != 0
+    crate::actuator::no_ap_control_regs() && cpu_id != 0
 }
 

@@ -45,7 +45,7 @@ pub mod msc;
 /// Deepest-so-far rather than every wait, because a line per transfer on a
 /// machine whose log lives on the transfer's own device is the self-sustaining
 /// write loop [`msc::MscDevice`]'s `no_write_cache` already records.
-#[cfg(feature = "io-depth-probe")]
+#[cfg(feature = "boot-actuators")]
 mod depth_probe {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -338,8 +338,10 @@ impl XhciController {
     /// well as the slot matters for mass storage, where one slot carries three
     /// endpoints and a stalled one still completes.
     fn wait_transfer(&mut self, slot: u8, dci: u8) -> Option<(u32, u32)> {
-        #[cfg(feature = "io-depth-probe")]
-        depth_probe::report();
+        #[cfg(feature = "boot-actuators")]
+        if crate::actuator::io_depth_probe() {
+            depth_probe::report();
+        }
         let deadline = deadline();
         let port = self.port_of_slot(slot);
         loop {

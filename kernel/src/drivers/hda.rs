@@ -552,8 +552,10 @@ pub fn init(devices: &[PciDevice]) {
         pci.func
     );
 
-    #[cfg(feature = "hda-allowlist-selftest")]
-    allowlist_selftest(stream_offset);
+    #[cfg(feature = "boot-actuators")]
+    if crate::actuator::hda_allowlist_selftest() {
+        allowlist_selftest(stream_offset);
+    }
 }
 
 /// Every arm of [`write_permit`] and [`read_permit`], run against the bound
@@ -568,7 +570,7 @@ pub fn init(devices: &[PciDevice]) {
 /// The permitted cases really write: `ICW` takes a null verb nothing has told
 /// the controller to send, and `SDnFMT` takes back the word it already holds,
 /// so what runs is the shipped path and not a rehearsal of the table.
-#[cfg(feature = "hda-allowlist-selftest")]
+#[cfg(feature = "boot-actuators")]
 fn allowlist_selftest(stream_offset: u64) {
     let sd = |field: u64| stream_offset + field;
     let cases: &[(&str, u64, RegWidth, u32)] = &[

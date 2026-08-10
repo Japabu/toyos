@@ -30,20 +30,44 @@ pub fn live_instances() -> u32 {
     LIVE.load(Ordering::SeqCst)
 }
 
-/// Guests this run has started, and how many of them were not the shipping
-/// kernel.
+/// Guests this run has started, how many of them were not the shipping kernel,
+/// and every distinct kernel build it asked cargo for.
 ///
 /// A registration is not a boot — several tests boot two machines and one boots
 /// four — so the count that decides whether a scheduling or build change worked
 /// cannot be read off the test lists. It was static analysis until now, and
 /// `specs/test-cost-audit.md` §6 records that as a lower bound.
+///
+/// **The third is the one this run is judged on.** A kernel build is ~6.9 s of
+/// wall clock and ~29.6 s of CPU after any edit to `kernel/` (§5.9.2), and
+/// until 2026-08-10 a full run made 45 of them. The set is what a run reports
+/// and what [`declared_kernel_builds`] refuses an addition to.
 static BOOTS: AtomicU32 = AtomicU32::new(0);
 static FEATURE_BOOTS: AtomicU32 = AtomicU32::new(0);
+static KERNELS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// `(boots, boots that asked for a kernel feature)`.
-pub fn boot_census() -> (u32, u32) {
-    (BOOTS.load(Ordering::Relaxed), FEATURE_BOOTS.load(Ordering::Relaxed))
+/// `(boots, boots that were not the shipping kernel, the kernels built)`.
+pub fn boot_census() -> (u32, u32, Vec<String>) {
+    (
+        BOOTS.load(Ordering::Relaxed),
+        FEATURE_BOOTS.load(Ordering::Relaxed),
+        KERNELS.lock().expect("the kernel census").iter().cloned().collect(),
+    )
 }
+
+/// The kernel builds a run is allowed to make, and the whole list.
+///
+/// `""` is what an image ships. [`toyos_build::build::TEST_KERNEL`] is every
+/// actuator compiled in, armed by boot parameter. `fpu-save-nothing` is the one
+/// actuator that could not become a parameter — it takes the `fxsave64` out of
+/// `arch::entry`'s `naked_asm!` bracket, which is the path its own gate is
+/// about — and `specs/test-cost-audit.md` §5.9.7 is where that is argued.
+///
+/// A fourth entry is a decision to pay a kernel build per run forever, so it is
+/// made here and out loud rather than by adding a `kernel_features` to a
+/// `BootOptions`.
+pub const DECLARED_KERNEL_BUILDS: [&str; 3] = ["", "boot-actuators,test-actuators", "fpu-save-nothing"];
 
 /// How many guests the phase now running may have up at once.
 ///
@@ -1272,7 +1296,14 @@ pub struct BootOptions {
     /// Open a per-instance QMP socket, which `screendump` needs. Per-instance
     /// because screen tests boot their own QEMU and several may exist at once.
     pub qmp: bool,
+    /// Which of [`DECLARED_KERNEL_BUILDS`] this boot wants, and empty for the
+    /// kernel an image ships. Only a test whose subject *is* a build sets it —
+    /// `fpu-save-nothing`, and the `SYS_DEBUG` boot; everything else names an
+    /// actuator in [`BootOptions::kernel_params`] instead.
     pub kernel_features: &'static [&'static str],
+    /// The actuators this boot arms, by the names `kernel/src/actuator.rs`
+    /// declares. Non-empty selects the test kernel, which carries all of them.
+    pub kernel_params: &'static [&'static str],
     /// Give the machine an i8042 at all. `-machine q35,i8042=off` is the one
     /// absence scenario QEMU can stage.
     pub i8042: bool,
@@ -1341,6 +1372,7 @@ impl Default for BootOptions {
             profile: Profile::Headless,
             qmp: false,
             kernel_features: &[],
+            kernel_params: &[],
             i8042: true,
             mute: false,
             ready_marker: DEFAULT_READY,
@@ -1406,8 +1438,47 @@ pub fn build_boot_image(
     test_crate: &Path,
     c_tests: &[(String, Vec<u8>)],
     rust_tests: &[(String, Vec<u8>)],
-    kernel_features: &[&str],
+    kernel_params: &[&str],
 ) -> Vec<u8> {
+    let kernel: &[&str] =
+        if kernel_params.is_empty() { &[] } else { toyos_build::build::TEST_KERNEL };
+    build_boot_image_with(test_crate, c_tests, rust_tests, kernel, kernel_params)
+}
+
+/// Which of [`DECLARED_KERNEL_BUILDS`] this boot wants.
+///
+/// **A parameter never decides a build.** Every actuator lives in the one test
+/// kernel, so asking for one selects that kernel and nothing more; the third
+/// build is asked for by name and by one test.
+fn kernel_of(options: &BootOptions) -> Vec<&'static str> {
+    if options.kernel_params.is_empty() {
+        return options.kernel_features.to_vec();
+    }
+    assert!(
+        options.kernel_features.is_empty(),
+        "a boot asking to arm {:?} also asks for the kernel build {:?}; an actuator is a \
+         parameter and the test kernel carries all of them",
+        options.kernel_params,
+        options.kernel_features,
+    );
+    toyos_build::build::TEST_KERNEL.to_vec()
+}
+
+fn build_boot_image_with(
+    test_crate: &Path,
+    c_tests: &[(String, Vec<u8>)],
+    rust_tests: &[(String, Vec<u8>)],
+    kernel_features: &[&str],
+    kernel_params: &[&str],
+) -> Vec<u8> {
+    let joined = kernel_features.join(",");
+    assert!(
+        DECLARED_KERNEL_BUILDS.contains(&joined.as_str()),
+        "this boot asks for the kernel build {joined:?}, which is not one of the {} a run may \
+         make: {DECLARED_KERNEL_BUILDS:?}",
+        DECLARED_KERNEL_BUILDS.len(),
+    );
+    KERNELS.lock().expect("the kernel census").insert(joined);
     let mut extra_files: Vec<(String, Vec<u8>)> = Vec::new();
     for (name, data) in c_tests {
         extra_files.push((format!("bin/test_c_{name}"), data.clone()));
@@ -1432,6 +1503,7 @@ pub fn build_boot_image(
         &compile::repo_root(),
         &config_path,
         kernel_features,
+        kernel_params,
         quiet,
         &extra_files,
     )
@@ -1474,7 +1546,7 @@ impl QemuInstance {
         rust_tests: &[(String, Vec<u8>)],
         options: BootOptions,
     ) -> Self {
-        let mut features: Vec<&str> = options.kernel_features.to_vec();
+        let mut features: Vec<&str> = kernel_of(&options);
         if options.debug_wait {
             features.push("debug-wait");
         }
@@ -1482,7 +1554,8 @@ impl QemuInstance {
         if !features.is_empty() {
             FEATURE_BOOTS.fetch_add(1, Ordering::Relaxed);
         }
-        let disk = build_boot_image(test_crate, c_tests, rust_tests, &features);
+        let disk =
+            build_boot_image_with(test_crate, c_tests, rust_tests, &features, options.kernel_params);
 
         let test_dir = super::lane::dir();
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);

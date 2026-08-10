@@ -15,7 +15,7 @@ use crate::common::audio::{await_null_sink, NULL_SINK};
 use crate::common::qemu::{self, BootOptions, Profile, QemuInstance};
 use crate::common::serial::Serial;
 
-const FEATURE: &[&str] = &["hda-probe"];
+const PARAMS: &[&str] = &["hda-probe"];
 
 /// The three controllers [`Profile::MetalHda`] stages, by the bus address the
 /// probe names each one. Read from here rather than restated per assertion:
@@ -37,7 +37,7 @@ pub fn hda_probe(
     _c_bins: &[(String, Vec<u8>)],
     _rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    let log = probe_boot(FEATURE)?;
+    let log = probe_boot(PARAMS)?;
 
     // (a) handoff, both arms of the scope rule on one machine.
     let scopes = lines(log.text(), "hda: (a) scope members=");
@@ -211,11 +211,11 @@ fn ordinary_boot_is_untouched() -> Result<(), String> {
 /// The **diag config**, because that is the image H0 ships in: no test binaries
 /// in the initrd and no process that can claim the framebuffer, so what the
 /// harness boots here is what gets flashed.
-fn probe_boot(features: &'static [&'static str]) -> Result<Serial, String> {
+fn probe_boot(params: &'static [&'static str]) -> Result<Serial, String> {
     let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("diag");
     let options = BootOptions {
         profile: Profile::MetalHda,
-        kernel_features: features,
+        kernel_params: params,
         // No test runner in this image, so the kernel's own last phase line is
         // the marker.
         ready_marker: "Boot: complete",
@@ -252,7 +252,7 @@ pub fn hda_tone(
         rust_bins,
         BootOptions {
             profile: Profile::Hda,
-            kernel_features: &["hda-allowlist-selftest"],
+            kernel_params: &["hda-allowlist-selftest"],
             ..Default::default()
         },
     );

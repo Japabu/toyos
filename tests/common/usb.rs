@@ -244,7 +244,7 @@ pub fn usb_storage_gate(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: GATE,
+            kernel_params: GATE,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -271,7 +271,7 @@ pub fn usb_storage_gate(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: GATE,
+            kernel_params: GATE,
             usb_images: vec![foreign.clone()],
             ..Default::default()
         },
@@ -293,7 +293,7 @@ pub fn usb_storage_gate(
     // was ever attached".
     let options = BootOptions {
         profile: Profile::Metal,
-        kernel_features: GATE,
+        kernel_params: GATE,
         ..Default::default()
     };
     let argv = qemu::profile_argv(&options);
@@ -346,7 +346,7 @@ pub fn usb_short_read(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["usb-storage-gate", "usb-short-read"];
+    const PARAMS: &[&str] = &["usb-storage-gate", "usb-short-read"];
     /// Mirrors `short_read::SHORT_BY`. One wire format with the kernel's, in
     /// the same sense the stamp is: a change to either without the other stops
     /// the line below matching rather than passing silently.
@@ -362,7 +362,7 @@ pub fn usb_short_read(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: FEATURES,
+            kernel_params: PARAMS,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -595,7 +595,7 @@ pub fn usb_pool_exhausted(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDiskCrowd,
-            kernel_features: GATE,
+            kernel_params: GATE,
             usb_images: vec![bound.clone(), refused.clone()],
             ..Default::default()
         },
@@ -662,7 +662,7 @@ pub fn usb_storage_shapes(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk4k,
-            kernel_features: GATE,
+            kernel_params: GATE,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -687,7 +687,7 @@ pub fn usb_storage_shapes(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDiskHuge,
-            kernel_features: GATE,
+            kernel_params: GATE,
             ..Default::default()
         },
     )?;
@@ -729,7 +729,7 @@ pub fn usb_storage_write_error(
 
     let options = BootOptions {
         profile: Profile::UsbDiskReadOnly,
-        kernel_features: GATE,
+        kernel_params: GATE,
         usb_images: vec![image.clone()],
         ..Default::default()
     };
@@ -843,11 +843,11 @@ fn optional_flush_keeps_the_log(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURE: &[&str] = &["usb-flush-unimplemented"];
+    const PARAMS: &[&str] = &["usb-flush-unimplemented"];
     const REPORTED: &str = "usb-storage: disk 0 does not implement SYNCHRONIZE CACHE";
 
     let image_path = test_dir().join("usb-flush-optional.img");
-    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURE);
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, PARAMS);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
     let (start, len) = super::volumes::log_extent(&image, &image_path)?;
 
@@ -858,7 +858,7 @@ fn optional_flush_keeps_the_log(
         BootOptions {
             profile: Profile::Metal,
             boot_image: Some(image_path.clone()),
-            kernel_features: FEATURE,
+            kernel_params: PARAMS,
             ..Default::default()
         },
     );
@@ -942,7 +942,7 @@ fn failed_flush_stops_once(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURE: &[&str] = &["usb-flush-fails"];
+    const PARAMS: &[&str] = &["usb-flush-fails"];
     /// A per-failure line, and the thing that has to stay bounded. Before the
     /// fix it is emitted by every pass of the idle loop for the life of the
     /// boot; after it, once by the flush that gives up and once by the
@@ -955,7 +955,7 @@ fn failed_flush_stops_once(
         rust_bins,
         BootOptions {
             profile: Profile::Metal,
-            kernel_features: FEATURE,
+            kernel_params: PARAMS,
             ..Default::default()
         },
     );
@@ -1058,7 +1058,7 @@ pub fn xhci_deaf_registers(
         rust_bins,
         BootOptions {
             profile: Profile::Metal,
-            kernel_features: &["xhci-deaf-controller"],
+            kernel_params: &["xhci-deaf-controller"],
             ..Default::default()
         },
     )?;
@@ -1085,7 +1085,7 @@ pub fn xhci_deaf_registers(
         rust_bins,
         BootOptions {
             profile: Profile::Metal,
-            kernel_features: &["xhci-deaf-port"],
+            kernel_params: &["xhci-deaf-port"],
             ..Default::default()
         },
     )?;
@@ -1144,7 +1144,7 @@ pub fn xhci_slow_connect(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["usb-storage-gate", "xhci-slow-connect"];
+    const PARAMS: &[&str] = &["usb-storage-gate", "xhci-slow-connect"];
     /// Mirrors `xhci/mod.rs`'s `SLOW_CONNECT_NS` and `PORT_DEBOUNCE_NS`. These
     /// are one wire format with the kernel's in the same sense the gate's stamp
     /// is: a change to either without the other shows up as a failed assertion,
@@ -1181,7 +1181,7 @@ pub fn xhci_slow_connect(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: FEATURES,
+            kernel_params: PARAMS,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -1299,7 +1299,7 @@ pub fn xhci_portsc_rw1c(
     // stick attaches at SuperSpeed, so both protocols' reset paths run here.
     let options = BootOptions {
         profile: Profile::MetalUsb,
-        kernel_features: &["xhci-portsc-rw1c"],
+        kernel_params: &["xhci-portsc-rw1c"],
         ..Default::default()
     };
     let argv = qemu::profile_argv(&options);
@@ -1428,7 +1428,7 @@ pub fn usb_transport_break(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["usb-storage-gate", "usb-transport-break"];
+    const PARAMS: &[&str] = &["usb-storage-gate", "usb-transport-break"];
 
     let (bytes, lba) = Profile::UsbDisk.usb_disk().expect("UsbDisk declares a disk");
     let image = test_dir().join("usb-transport-break.img");
@@ -1440,7 +1440,7 @@ pub fn usb_transport_break(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: FEATURES,
+            kernel_params: PARAMS,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -1795,7 +1795,7 @@ fn hid_break_boot(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
-    features: &'static [&'static str],
+    params: &'static [&'static str],
     which: &str,
 ) -> Result<(), String> {
     /// The delta the assertion is about, injected after the break is spent.
@@ -1816,7 +1816,7 @@ fn hid_break_boot(
         // QEMU delivers the keystrokes over PS/2 and every assertion below
         // passes with the interrupt endpoint dead.
         i8042: false,
-        kernel_features: features,
+        kernel_params: params,
         ..Default::default()
     };
     let argv = qemu::profile_argv(&options);
@@ -2523,7 +2523,7 @@ pub fn usb_refused_disk_first(
     // order".
     let options = BootOptions {
         profile: Profile::UsbDiskRefusedFirst,
-        kernel_features: GATE,
+        kernel_params: GATE,
         qmp: true,
         ..Default::default()
     };
@@ -2698,7 +2698,7 @@ pub fn usb_boot_stick_pulled(
         // FAT allocation and directory writes in flight at the moment of the
         // pull, which is the state the owner's machine is in and the one a
         // quiet idle desktop never reaches.
-        kernel_features: &["log-rotate-fast"],
+        kernel_params: &["log-rotate-fast"],
         // The T14's core count. How many CPUs are in the idle loop when the
         // device goes is the whole question on one hypothesis.
         smp: 8,

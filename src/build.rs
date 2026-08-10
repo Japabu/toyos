@@ -540,10 +540,21 @@ impl Boot {
 /// Cargo would refuse an unknown feature too — after the build lock, the
 /// toolchain check and the userland build, and with `kernel` in the message
 /// rather than the flag the user typed. This runs before any of them.
-fn kernel_features(root: &Path, debug: bool, requested: &[String]) -> String {
+fn kernel_features(
+    root: &Path,
+    debug: bool,
+    requested: &[String],
+    params: &[String],
+) -> String {
     let mut features: Vec<&str> = Vec::new();
     if debug {
         features.push("debug-wait");
+    }
+    // A parameter names an actuator, and only a kernel compiled with them can
+    // be told to arm one. This is the whole of what `--kernel-param` decides
+    // about the build — which actuator is a boot's business, not a build's.
+    if !params.is_empty() {
+        features.push("boot-actuators");
     }
     if !requested.is_empty() {
         let declared = declared_kernel_features(root);
@@ -551,13 +562,38 @@ fn kernel_features(root: &Path, debug: bool, requested: &[String]) -> String {
             assert!(
                 declared.contains(name),
                 "--kernel-feature {name}: the kernel declares no such feature.\n\
-                 Features it declares: {}.",
+                 Features it declares: {}.\n\
+                 Every actuator is now a --kernel-param; `cargo run -- --kernel-param --help` \
+                 lists them.",
                 declared.join(", ")
             );
             features.push(name);
         }
     }
     features.join(",")
+}
+
+/// The boot parameter this build writes to the ESP, with every name checked
+/// against `kernel/src/actuator.rs`.
+///
+/// Refused here as well as in the kernel, and before any lock, so that deleting
+/// an actuator takes its stale command lines down with it instead of quietly
+/// producing an image that arms nothing — the same rule `--kernel-feature` runs
+/// on, one layer further in.
+fn kernel_cmdline(root: &Path, params: &[String]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    let declared = declared_actuators(root);
+    for name in params {
+        assert!(
+            declared.contains(name),
+            "--kernel-param {name}: the kernel declares no such actuator.\n\
+             Actuators it declares: {}.",
+            declared.join(", ")
+        );
+    }
+    params.join(",")
 }
 
 #[derive(Deserialize)]
@@ -575,6 +611,71 @@ fn declared_kernel_features(root: &Path) -> Vec<String> {
     manifest.features.into_keys().collect()
 }
 
+/// The kernel every test that needs an actuator boots: all of them compiled in
+/// and none of them armed, plus the `SYS_DEBUG` number.
+///
+/// **One list, so one build.** `kernel_key` is over the joined string, so a
+/// second spelling of this set would be a second kernel and nothing would say
+/// so.
+pub const TEST_KERNEL: &[&str] = &["boot-actuators", "test-actuators"];
+
+/// Every actuator `kernel/src/actuator.rs` declares, read out of the file that
+/// declares them.
+///
+/// Read rather than listed here for `declared_kernel_features`' reason, one
+/// layer in: deleting an actuator has to take its own command lines and its own
+/// `BootOptions` with it, rather than leaving a name that quietly arms nothing.
+/// The kernel's own parser refuses an unknown token as well, so this is the
+/// early half of a two-sided answer and not the only one.
+pub fn declared_actuators(root: &Path) -> Vec<String> {
+    let path = root.join("kernel/src/actuator.rs");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+    let body = text
+        .split_once("\nactuators! {\n")
+        .expect("kernel/src/actuator.rs has no `actuators!` block")
+        .1;
+    let body = body.split_once("\n}\n").expect("the `actuators!` block does not end").0;
+    let names: Vec<String> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("///"))
+        .filter_map(|line| line.split_once(" = \"")?.1.strip_suffix("\";").map(str::to_string))
+        .collect();
+    assert!(!names.is_empty(), "{} declares no actuators", path.display());
+    names
+}
+
+/// Refuse to write a shipping image whose kernel binary names an actuator.
+///
+/// [`assert_overflow_checked`]'s shape and for its reason: the property is
+/// about the artifact, so the artifact is what is asked. Two builds quietly
+/// becoming one build with test hooks in it is the failure mode this exists
+/// for, and a convention nothing enforces is not a bar.
+///
+/// Only a kernel built with no features at all is asked, because that is what
+/// "shipping" means here — `--kernel-feature`, `--kernel-param` and `--debug`
+/// each say out loud that this image is not one.
+fn assert_no_actuators(root: &Path, kernel: &[u8]) {
+    let found: Vec<String> = declared_actuators(root)
+        .into_iter()
+        .filter(|name| {
+            let needle = name.as_bytes();
+            kernel
+                .windows(needle.len())
+                .any(|w| w == needle)
+        })
+        .collect();
+    assert!(
+        found.is_empty(),
+        "the shipping kernel names {} actuator(s): {}.\n\
+         Everything under `kernel/src/actuator.rs` belongs to a kernel built with \
+         `boot-actuators`, and an image that ships must not be able to be told to break.",
+        found.len(),
+        found.join(", "),
+    );
+}
+
 /// Full build: kernel, bootloader, all programs, boot image. Returns the image.
 pub fn build(
     root: &Path,
@@ -583,11 +684,13 @@ pub fn build(
     rebuild_toolchain: bool,
     claim_sysroot: bool,
     kernel_feature: &[String],
+    kernel_param: &[String],
 ) -> PathBuf {
-    // Before the locks: a misspelled feature is the user's own command line and
+    // Before the locks: a misspelled name is the user's own command line and
     // has to come back now, not after this build has waited out every other
     // worktree's hold on the sysroot.
-    let kernel_features = kernel_features(root, debug, kernel_feature);
+    let kernel_features = kernel_features(root, debug, kernel_feature, kernel_param);
+    let cmdline = kernel_cmdline(root, kernel_param);
 
     // Outermost, before any build lock, and that order is the whole deadlock
     // argument: every acquirer of both takes the sysroot lock first. It waits
@@ -671,9 +774,12 @@ pub fn build(
 
     let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
     assert_overflow_checked("kernel", &kernel_bytes);
+    if kernel_features.is_empty() {
+        assert_no_actuators(root, &kernel_bytes);
+    }
     assert_kernel_is_softfloat(&path_env);
     let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
-    let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, "");
+    let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, &cmdline);
     let image_path = root.join(boot.image());
     fs::write(&image_path, disk_bytes).expect("Failed to write image");
 
@@ -738,18 +844,19 @@ pub fn designate_for_format(path: &Path, len: u64) {
 
 /// One part of a boot image, built once per key for the life of this process.
 ///
-/// A `cargo test` run boots ~76 machines, and 41 of those boots ask for an image
-/// some earlier boot already built; the three `cargo` invocations then take
-/// ~1.4 s between them to answer "nothing changed" (`specs/test-cost-audit.md`
-/// §1.4). In memory and never on disk, so a run gets one answer for the tree it
-/// started against and the next run asks cargo again.
+/// A `cargo test` run boots ~76 machines, and most of those boots ask for an
+/// image some earlier boot already built; the three `cargo` invocations then
+/// take ~1.4 s between them to answer "nothing changed"
+/// (`specs/test-cost-audit.md` §1.4). In memory and never on disk, so a run gets
+/// one answer for the tree it started against and the next run asks cargo
+/// again.
 ///
 /// Per part rather than per image, because a part is what a key can be true of:
 /// the kernel is its feature set, the bootloader is its init list, the initrd is
 /// its config and the caller's extra files. That is the same split
 /// [`stage_artifact`] already writes into the artifact names, and it is what
-/// makes this affordable — the 31 kernel feature sets a full run builds share a
-/// handful of initrds, and an initrd is hundreds of megabytes.
+/// makes this affordable — the kernels a full run builds share a handful of
+/// initrds, and an initrd is hundreds of megabytes.
 ///
 /// What it does not see is a source edit that lands mid-run. A run is a
 /// measurement of one tree, so that is the behaviour wanted either way; a run
@@ -811,12 +918,22 @@ pub fn build_test_image(
     root: &Path,
     config_path: &Path,
     kernel_features: &[&str],
+    kernel_params: &[&str],
     quiet: bool,
     extra_files: &[(String, Vec<u8>)],
 ) -> Vec<u8> {
     let config = parse_config(config_path);
     let init_programs = config.init.join(";");
     let features = kernel_features.join(",");
+    // **The kernel is not keyed on this and that is the whole change.** A
+    // parameter picks which actuator the one test kernel arms, so 45 builds
+    // became two; keying the image on it is what keeps two boots asking for
+    // different actuators from sharing one disk.
+    assert!(
+        kernel_params.is_empty() || kernel_features == TEST_KERNEL,
+        "a boot asking for {kernel_params:?} must boot the test kernel, not {kernel_features:?}"
+    );
+    let cmdline = kernel_params.join(",");
     let kernel_key = kernel_key(&features);
     let bl_key = key_hash(&[PROFILE, &init_programs]);
     let initrd_key = initrd_key(config_path, extra_files);
@@ -826,7 +943,7 @@ pub fn build_test_image(
     if let (Some(kernel), Some(bl), Some(initrd)) =
         (KERNEL.get(kernel_key), BOOTLOADER.get(bl_key), INITRD.get(initrd_key))
     {
-        return image::create_boot_image(&kernel, &bl, &initrd, "");
+        return image::create_boot_image(&kernel, &bl, &initrd, &cmdline);
     }
 
     // **Below the memo's early return, so a boot that builds nothing queues for
@@ -874,6 +991,9 @@ pub fn build_test_image(
             {
                 let bytes = fs::read(&staged).expect("Failed to read staged kernel");
                 assert_overflow_checked("kernel", &bytes);
+                if features.is_empty() {
+                    assert_no_actuators(root, &bytes);
+                }
                 assert_kernel_is_softfloat(&path_env);
                 bytes
             }
@@ -902,7 +1022,7 @@ pub fn build_test_image(
         build_and_assemble(root, &config, &path_env, extra_files, quiet)
     });
 
-    image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, "")
+    image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, &cmdline)
 }
 
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
@@ -1112,7 +1232,7 @@ mod tests {
     #[test]
     fn a_boot_that_asks_for_no_feature_gets_the_shipping_kernel() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let shipping = kernel_features(root, false, &[]);
+        let shipping = kernel_features(root, false, &[], &[]);
         assert_eq!(shipping, "", "`cargo run` asks the kernel for {shipping:?}, not nothing");
         let harness = <&[&str]>::default().join(",");
         assert_eq!(
@@ -1124,6 +1244,52 @@ mod tests {
             kernel_key(&shipping),
             kernel_key("test-actuators"),
             "the key ignores the features, so it cannot tell two kernels apart"
+        );
+    }
+
+    /// **An actuator is a boot parameter and never a kernel build.**
+    ///
+    /// A name that reappears in `kernel/Cargo.toml` is a 46th kernel, and the
+    /// suite would build it without anything saying so — which is the state
+    /// `specs/test-cost-audit.md` §5.9.7 replaced. The two lists are read from
+    /// the two files that declare them, so neither can be satisfied by editing
+    /// this test.
+    #[test]
+    fn no_actuator_is_also_a_cargo_feature() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let actuators = declared_actuators(root);
+        let features = declared_kernel_features(root);
+        let both: Vec<&String> = actuators.iter().filter(|a| features.contains(a)).collect();
+        assert!(both.is_empty(), "declared as both an actuator and a kernel feature: {both:?}");
+        assert!(
+            actuators.iter().all(|a| a.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')),
+            "an actuator name is ASCII `[a-z0-9-]`, and these are not: {actuators:?}"
+        );
+    }
+
+    /// The features a kernel build may still carry, and the whole list.
+    ///
+    /// **The gate on the count this landing is about.** Each name here is a
+    /// kernel `cargo test` may build beside the two, so adding one is a
+    /// decision to pay ~6.9 s of wall clock and ~29.6 s of CPU per full run
+    /// after any kernel edit (§5.9.2) — and `boot-actuators` exists so that
+    /// the answer is almost always a parameter instead.
+    #[test]
+    fn the_kernel_declares_only_the_builds_that_earned_one() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut declared = declared_kernel_features(root);
+        declared.sort();
+        assert_eq!(
+            declared,
+            [
+                "boot-actuators",
+                "debug-wait",
+                "fpu-save-nothing",
+                "loom",
+                "sched-check",
+                "test-actuators",
+            ],
+            "the kernel declares a feature `specs/test-cost-audit.md` §5.9.7 does not account for"
         );
     }
 

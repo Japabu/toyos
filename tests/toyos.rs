@@ -141,8 +141,9 @@ const ACTUATOR_TESTS: &[&str] = &[
     "tlb_shootdown_waits",
 ];
 
-/// What [`ACTUATOR_TESTS`] boots.
-const ACTUATOR_KERNEL: &[&str] = &["test-actuators"];
+/// What [`ACTUATOR_TESTS`] boots: the one kernel that carries `SYS_DEBUG`, with
+/// no actuator armed in it.
+const ACTUATOR_KERNEL: &[&str] = toyos_build::build::TEST_KERNEL;
 
 /// How many times a shared block will answer a dead guest with a new one.
 ///
@@ -1653,7 +1654,7 @@ fn measure_audio_run(
         rust_bins,
         BootOptions {
             smp,
-            kernel_features: if SLOW_USB.load(std::sync::atomic::Ordering::Relaxed) {
+            kernel_params: if SLOW_USB.load(std::sync::atomic::Ordering::Relaxed) {
                 &["usb-slow-device"]
             } else {
                 &[]
@@ -2635,7 +2636,7 @@ fn run_screen_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["test-actuators"],
+                kernel_features: ACTUATOR_KERNEL,
                 ready_marker: "console: ready",
                 ..Default::default()
             };
@@ -2826,7 +2827,7 @@ fn run_screen_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["test-actuators"],
+                kernel_features: ACTUATOR_KERNEL,
                 ready_marker: "console: ready",
                 ..Default::default()
             };
@@ -3037,7 +3038,7 @@ fn run_screen_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["test-actuators"],
+                kernel_features: ACTUATOR_KERNEL,
                 ready_marker: "console: ready",
                 ..Default::default()
             };
@@ -3167,7 +3168,7 @@ fn run_screen_test(
                 profile: qemu::Profile::Metal,
                 qmp: true,
                 mute: true,
-                kernel_features: &["test-late-panic"],
+                kernel_params: &["test-late-panic"],
                 ..Default::default()
             };
             let argv = qemu::profile_argv(&options);
@@ -3210,7 +3211,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
-                    kernel_features: &["test-early-panic"],
+                    kernel_params: &["test-early-panic"],
                     ready_marker: "!!! EARLY PANIC !!!",
                     ..Default::default()
                 },
@@ -3238,7 +3239,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
-                    kernel_features: &["test-late-panic"],
+                    kernel_params: &["test-late-panic"],
                     ready_marker: "!!! PANIC !!!",
                     ..Default::default()
                 },
@@ -3275,7 +3276,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
-                    kernel_features: &["test-late-panic"],
+                    kernel_params: &["test-late-panic"],
                     ready_marker: "!!! PANIC !!!",
                     ..Default::default()
                 },
@@ -3356,7 +3357,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Metal,
                     qmp: true,
-                    kernel_features: &["test-late-panic"],
+                    kernel_params: &["test-late-panic"],
                     ready_marker: "!!! PANIC !!!",
                     ..Default::default()
                 },
@@ -3540,7 +3541,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
-                    kernel_features: &["test-actuators"],
+                    kernel_features: ACTUATOR_KERNEL,
                     ..Default::default()
                 },
             );
@@ -3617,7 +3618,7 @@ fn run_screen_test(
                 // `/log` — tests anything at all. The probe is time-based, so
                 // it needs no console to drive it.
                 mute: true,
-                kernel_features: &["metal-panic-probe"],
+                kernel_params: &["metal-panic-probe"],
                 ..Default::default()
             };
             metal_sim_argv_check(&qemu::profile_argv(&options))?;
@@ -4039,7 +4040,7 @@ fn boot_i8042_trace(
     let options = BootOptions {
         profile: qemu::Profile::Metal,
         qmp: true,
-        kernel_features: &["i8042-trace"],
+        kernel_params: &["i8042-trace"],
         ..Default::default()
     };
     metal_sim_argv_check(&qemu::profile_argv(&options)).unwrap_or_else(|e| panic!("{e}"));
@@ -6596,7 +6597,7 @@ fn run_machine_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 smp: 8,
-                kernel_features: &["heartbeat"],
+                kernel_params: &["heartbeat"],
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
@@ -7779,7 +7780,7 @@ fn run_machine_test(
             // arena too small for a process to map its TLS and its heap would
             // prove the actuator works and nothing about the kernel.
             let options = BootOptions {
-                kernel_features: &["test-tiny-va"],
+                kernel_params: &["test-tiny-va"],
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
@@ -7962,7 +7963,7 @@ fn run_machine_test(
             // be observed on its own.
             let options = BootOptions {
                 smp: 1,
-                kernel_features: &["test-actuators"],
+                kernel_features: ACTUATOR_KERNEL,
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
@@ -8032,7 +8033,7 @@ fn run_machine_test(
 
             let options = BootOptions {
                 profile: qemu::Profile::MetalDisk,
-                kernel_features: &["test-small-caches"],
+                kernel_params: &["test-small-caches"],
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
@@ -8117,7 +8118,7 @@ fn run_machine_test(
             // bound, not the controller's politeness.
             let options = BootOptions {
                 profile: qemu::Profile::MetalUsb,
-                kernel_features: &["xhci-one-slot"],
+                kernel_params: &["xhci-one-slot"],
                 ..Default::default()
             };
             let argv = qemu::profile_argv(&options);
@@ -8321,7 +8322,7 @@ fn run_machine_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    kernel_features: &["test-input-merge"],
+                    kernel_params: &["test-input-merge"],
                     ..Default::default()
                 },
             );
@@ -8352,7 +8353,7 @@ fn run_machine_test(
                 BootOptions {
                     profile: qemu::Profile::Metal,
                     qmp: true,
-                    kernel_features: &["i8042-fast-health"],
+                    kernel_params: &["i8042-fast-health"],
                     ..Default::default()
                 },
             );
@@ -8532,7 +8533,7 @@ fn run_machine_test(
                 rust_bins,
                 BootOptions {
                     profile: qemu::Profile::Metal,
-                    kernel_features: &["xhci-descriptor-selftest"],
+                    kernel_params: &["xhci-descriptor-selftest"],
                     ..Default::default()
                 },
             );
@@ -8578,7 +8579,7 @@ fn run_machine_test(
                 rust_bins,
                 BootOptions {
                     profile: qemu::Profile::Metal,
-                    kernel_features: &["xhci-xecp-selftest"],
+                    kernel_params: &["xhci-xecp-selftest"],
                     ..Default::default()
                 },
             );
@@ -8633,7 +8634,7 @@ fn run_machine_test(
                 rust_bins,
                 BootOptions {
                     profile: qemu::Profile::Metal,
-                    kernel_features: &["i8042-budget-expired"],
+                    kernel_params: &["i8042-budget-expired"],
                     ..Default::default()
                 },
             );
@@ -8678,7 +8679,7 @@ fn run_machine_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["i8042-fadt-denial"],
+                kernel_params: &["i8042-fadt-denial"],
                 ..Default::default()
             };
             metal_sim_argv_check(&qemu::profile_argv(&options))?;
@@ -8744,7 +8745,7 @@ fn run_machine_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["i8042-kbd-echo"],
+                kernel_params: &["i8042-kbd-echo"],
                 ..Default::default()
             };
             metal_sim_argv_check(&qemu::profile_argv(&options))?;
@@ -8954,7 +8955,7 @@ fn run_machine_test(
                 BootOptions {
                     profile: qemu::Profile::Metal,
                     qmp: true,
-                    kernel_features: &["i8042-fault"],
+                    kernel_params: &["i8042-fault"],
                     ..Default::default()
                 },
             );
@@ -9853,7 +9854,7 @@ fn control_regs_negative(
         BootOptions {
             smp: CPUS,
             profile: qemu::Profile::Metal,
-            kernel_features: &["no-ap-control-regs"],
+            kernel_params: &["no-ap-control-regs"],
             ready_marker: MARKER,
             ..Default::default()
         },
@@ -11233,7 +11234,7 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                         bins.test_config,
                         bins.c_bins,
                         bins.rust_bins,
-                        BootOptions { kernel_features: features, ..Default::default() },
+                        BootOptions { kernel_params: features, ..Default::default() },
                     )
                 };
                 let mut qemu = boot();
@@ -12123,6 +12124,16 @@ fn main() {
     // A run with both real failures and invalidated tests exits 1: a red that
     // survives is still a red, and re-running the suspended ones does not make
     // it green.
+    // What this run cost cargo, and the number `specs/test-cost-audit.md` §5.9.7
+    // is about: a kernel build is ~6.9 s of wall clock and ~29.6 s of CPU after
+    // any edit under `kernel/`, and a full run used to make 45 of them.
+    let (boots, feature_boots, kernels) = qemu::boot_census();
+    eprintln!(
+        "  --- {boots} guests, {feature_boots} of them not the shipping kernel, {} kernel \
+         build(s): {kernels:?}",
+        kernels.len(),
+    );
+
     eprint!("{}", tally.summary(total, suite_start.elapsed(), suite_start.suspended()));
     std::process::exit(tally.exit_code());
 }

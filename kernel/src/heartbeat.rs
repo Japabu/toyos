@@ -119,9 +119,9 @@
 //! whatever `/log` sits on. Against `log_file`'s 1 MiB rotation that is a new
 //! part roughly every 70 minutes and sixteen of them kept, so a diagnostic
 //! session of any length anyone will sit through fits. **That is a diagnostic
-//! budget and not a shipping one**, which is why this is a feature — and with
-//! `diag-tick` under it, the instrument is no longer a passive observer of the
-//! boot it is watching.
+//! budget and not a shipping one**, which is why the shipping kernel does not
+//! carry this module at all — and with `diag-tick` under it, the instrument is
+//! no longer a passive observer of the boot it is watching.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -158,6 +158,9 @@ static LAST_DISPATCHED: AtomicU64 = AtomicU64::new(0);
 /// is reaching a pass, and an interrupt taken by a CPU that then fails to
 /// schedule would report that CPU as healthy.
 pub fn note_pass() {
+    if !crate::actuator::heartbeat() {
+        return;
+    }
     let cpu = percpu::cpu_id() as usize;
     if cpu < MAX_CPUS {
         TICKED[cpu].store(crate::clock::nanos_since_boot().max(1), Ordering::Relaxed);
@@ -171,6 +174,9 @@ pub fn note_pass() {
 /// the locked RMW would buy nothing on the one path in the kernel that runs at
 /// context-switch rate.
 pub fn note_dispatch() {
+    if !crate::actuator::heartbeat() {
+        return;
+    }
     let cpu = percpu::cpu_id() as usize;
     if cpu < MAX_CPUS {
         let n = DISPATCHED[cpu].load(Ordering::Relaxed);
@@ -181,6 +187,9 @@ pub fn note_dispatch() {
 /// Emit a heartbeat if one is due. Called from the idle loop, immediately
 /// before the log sink's own poll.
 pub fn poll() {
+    if !crate::actuator::heartbeat() {
+        return;
+    }
     let now = crate::clock::nanos_since_boot();
     let last = LAST_AT.load(Ordering::Relaxed);
     if last != 0 && now.saturating_sub(last) < PERIOD_NS {
