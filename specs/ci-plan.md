@@ -1508,6 +1508,11 @@ name says "the toolchain did not build" is still advisory. Adding it costs
 nothing — 6 seconds on nearly every branch, since the release almost always
 exists — and it is a ruleset change, which is the owner's. **Recommended.**
 
+Measured on the first run that carried it, `31377439504`: `toolchain-ready` took
+**6 seconds** on a branch whose release was already published, which is the case
+on nearly every branch. What it costs when the release is *not* there is one
+runner waiting instead of thirteen.
+
 ### 11.2 The duration profile had drifted, and nothing was watching it
 
 §4 committed `tests/test-durations` because every runner is a machine that has
@@ -1532,8 +1537,30 @@ over the same items under the two profiles puts the widest bin at **566.9 s
 against 363.9 s**, so the drift is the whole of the gap and the algorithm is not
 at fault.
 
-The profile is refreshed from that run. The `durations` job is what stops it
-rotting again: it runs `--merge-durations` over the twelve artifacts on every
+**Refreshed from that run, and then measured against it.** Run `31377439504`
+(`wt/toyos-ciperfect` at `4e6a5a6`) is the same twelve shards on the same image
+with the profile rebuilt:
+
+| | widest | narrowest | sum | even split | widest over even |
+|---|---|---|---|---|---|
+| `31331494794`, the old profile | 508.8 s | 228.7 s | 4,506.7 s | 375.6 s | 133.2 s |
+| `31377439504`, this one | 466.1 s | 283.5 s | 4,463.4 s | 371.9 s | 94.2 s |
+
+**−42.7 s on the critical path**, for the same work: the sums differ by 1%.
+
+That is a third of what the simulation predicted, and why is worth recording,
+because it is now the whole of what is left. With the profile refreshed the
+prices *are* the times — per shard the measured sum is within 0.1 s of the wall
+clock, except where a red bought a re-run — so the residual 94 s is not the
+profile. It is that `tests/toyos.rs` calls `Shard::keep` three times, for the
+parallel tasks, the serial tail and gate A's configs, and each call starts from
+twelve empty bins: three good partitions, three imbalances, added.
+`specs/issues/build/the-shard-partition-is-taken-three-times.md` has the per-shard
+table and the one-accumulator fix. Its call sites are in `tests/toyos.rs`, which
+this task did not have.
+
+The `durations` job is what stops the profile rotting again: it runs
+`--merge-durations` over the twelve artifacts on every
 `ci` run and puts the spread, the even split and **the names no entry priced**
 into the job summary with the command to update. Advisory by construction — a
 slow partition is not a wrong verdict, and a pull request that adds a test must
@@ -1600,7 +1627,7 @@ required check reports nothing.
 
 Verified against the live configuration: green, and the negative control —
 declaring `build` required, which it is not — reds with `main does not require
-the check \`build\``.
+the check \`build\``. Run `31377439495` is the first CI run of it.
 
 ### 11.5 And a mirror that fails three times says so
 
