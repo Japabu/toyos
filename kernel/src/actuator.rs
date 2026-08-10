@@ -552,4 +552,17 @@ const _: () = {
         }
         i += 1;
     }
+    // Every side of [`IMPLIES`] too, so a name it misspells is this build
+    // failing rather than the one boot that asks for it panicking.
+    let mut i = 0;
+    while i < IMPLIES.len() {
+        let (name, implied) = IMPLIES[i];
+        bit_of(name);
+        let mut j = 0;
+        while j < implied.len() {
+            bit_of(implied[j]);
+            j += 1;
+        }
+        i += 1;
+    }
 };
