@@ -1471,6 +1471,30 @@ fn build_boot_image_with(
     kernel_features: &[&str],
     kernel_params: &[&str],
 ) -> Vec<u8> {
+    // **The two fields have the same type, so swapping them compiles.** It
+    // happened once, in this file's own conversion: the shared boot handed
+    // `["boot-actuators", "test-actuators"]` to `kernel_params` and every
+    // `SYS_DEBUG` test died with the kernel refusing `boot-actuators` as a
+    // parameter it does not declare. The kernel's refusal is what found it and
+    // it is the right refusal, but a name is a name on this side of the wire
+    // too, and the guest need not be started to know which kind it is.
+    static ACTUATORS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let actuators =
+        ACTUATORS.get_or_init(|| toyos_build::build::declared_actuators(&compile::repo_root()));
+    for name in kernel_params {
+        assert!(
+            actuators.iter().any(|a| a == name),
+            "{name:?} is a `kernel_params` and `kernel/src/actuator.rs` declares no such actuator"
+        );
+    }
+    for name in kernel_features {
+        assert!(
+            !actuators.iter().any(|a| a == name),
+            "{name:?} is an actuator and was passed as a `kernel_features`; it is a boot \
+             parameter, so it belongs in `kernel_params`"
+        );
+    }
+
     let joined = kernel_features.join(",");
     assert!(
         DECLARED_KERNEL_BUILDS.contains(&joined.as_str()),
@@ -2769,7 +2793,14 @@ fn wait_for_ready(
     loop {
         if !no_timeout && start.elapsed() > boot_timeout {
             let _ = child.kill();
-            panic!("[qemu] Boot timed out waiting for {ready}");
+            // With what it did say. A timeout that discards the console is the
+            // one failure in this harness that arrives with no evidence at all,
+            // and "the guest printed nothing" and "the guest printed sixty
+            // lines and then stopped" are different machines.
+            panic!(
+                "[qemu] Boot timed out waiting for {ready}; the console carried:\n{}",
+                if seen.is_empty() { "nothing at all".to_string() } else { seen.clone() }
+            );
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(line) if line.contains(ready) => {

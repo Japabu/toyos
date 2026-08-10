@@ -11285,7 +11285,8 @@ fn retry_task<'a>(name: &str, all_tests: &[&'a TestDef]) -> Option<Task<'a>> {
     Some(Task::Machine(names))
 }
 
-/// Which of the two shared boots a name belongs on.
+/// Which of the two shared boots a name belongs on — a *kernel build*, because
+/// `SYS_DEBUG` is compiled in or it is not, and never a boot parameter.
 fn shared_kernel(name: &str) -> &'static [&'static str] {
     if ACTUATOR_TESTS.contains(&name) {
         ACTUATOR_KERNEL
@@ -11325,7 +11326,7 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                         bins.test_config,
                         bins.c_bins,
                         bins.rust_bins,
-                        BootOptions { kernel_params: features, ..Default::default() },
+                        BootOptions { kernel_features: features, ..Default::default() },
                     )
                 };
                 let mut qemu = boot();
