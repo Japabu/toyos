@@ -174,6 +174,16 @@ fn boot_partition(handle: Handle, system_table: &SystemTable<Boot>) -> Option<Bo
 /// by something that is not this project — and booting it anyway would mean a
 /// kernel that quietly has nowhere to write its log, on the machine that has no
 /// other channel.
+/// The boot parameter the kernel arms its actuators from, byte for byte as
+/// `src/image.rs` wrote it.
+///
+/// Missing panics, for [`log_partition_guid`]'s reason: one function writes all
+/// four files, so a volume with three of them was not assembled by this project.
+/// Empty is the ordinary case and is what every image anyone ships carries.
+fn cmdline(handle: Handle, system_table: &SystemTable<Boot>) -> vec::Vec<u8> {
+    load_file_bytes(handle, system_table, cstr16!("\\toyos\\cmdline"))
+}
+
 fn log_partition_guid(handle: Handle, system_table: &SystemTable<Boot>) -> [u8; 16] {
     let bytes = load_file_bytes(handle, system_table, cstr16!("\\toyos\\log.guid"));
     <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or_else(|_| {
@@ -453,7 +463,7 @@ unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
     pml4 as u64
 }
 
-fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, boot_part: Option<BootPartition>, log_partition_guid: [u8; 16], rtc_utc_offset: Option<i32>, system_table: SystemTable<Boot>) -> ! {
+fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, cmdline: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, boot_part: Option<BootPartition>, log_partition_guid: [u8; 16], rtc_utc_offset: Option<i32>, system_table: SystemTable<Boot>) -> ! {
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
     let mut memory_map = vec::Vec::<MemoryMapEntry>::with_capacity(memory_map_entry_count);
@@ -516,6 +526,8 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         log_partition_guid,
         rtc_utc_offset_minutes: rtc_utc_offset.unwrap_or(0),
         rtc_utc_offset_known: rtc_utc_offset.is_some() as u32,
+        cmdline_addr: cmdline.as_ptr() as u64,
+        cmdline_len: cmdline.len() as u64,
     };
 
     // Build boot page tables: identity map + high-half map for first 4GB.
@@ -531,6 +543,7 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
     mem::forget(kernel.memory);
     mem::forget(kernel_elf_bytes);
     mem::forget(initrd);
+    mem::forget(cmdline);
 
     let entry: extern "sysv64" fn(&KernelArgs) -> ! = unsafe { mem::transmute(entry_virt) };
     entry(&kernel_args);
@@ -570,6 +583,9 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let log_guid = log_partition_guid(handle, &system_table);
     println!("Log partition: signature {:02x?}", log_guid);
 
+    let cmdline = cmdline(handle, &system_table);
+    println!("Boot parameter: {:?}", core::str::from_utf8(&cmdline));
+
     println!("Loading kernel elf...");
     let loaded_kernel = load_kernel_elf(&kernel_bytes);
 
@@ -581,5 +597,5 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let rtc_offset = rtc_utc_offset(&system_table);
 
     println!("Starting kernel...");
-    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, gop, boot_part, log_guid, rtc_offset, system_table);
+    start_kernel(loaded_kernel, kernel_bytes, initrd, cmdline, rsdp_addr, gop, boot_part, log_guid, rtc_offset, system_table);
 }
