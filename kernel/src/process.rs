@@ -1208,6 +1208,24 @@ pub fn stats_from(
 }
 
 pub fn exit(code: i32) -> ! {
+    release_process(code);
+    scheduler::exit_current(code);
+}
+
+/// Everything a process's own teardown gives back — and it **returns**, which
+/// is the whole reason it is a function.
+///
+/// `exit_current` never comes back and nothing here unwinds, so a value still
+/// live at that call is a value nothing will ever drop: the kernel stack it
+/// sits on is freed by the exit pass without running a destructor. Three `Arc`s
+/// were — the [`ProcessObject`], the process's `ProcessData` and the exiting
+/// thread's `ThreadData` — which leaked one live kernel object per process the
+/// machine had ever run, and the per-variant census is what saw it. A scope
+/// that ends is the only thing that releases them, and a caller that diverges
+/// has none.
+///
+/// [`ProcessObject`]: crate::object::process::ProcessObject
+fn release_process(code: i32) {
     let process_pid = current_process();
     let tid = current_tid();
 
@@ -1220,12 +1238,12 @@ pub fn exit(code: i32) -> ! {
         let Some(proc) = table.get_mut(process_pid) else {
             drop(guard);
             unsafe { crate::mm::paging::kernel_cr3().activate(); }
-            scheduler::exit_current(code);
+            return;
         };
         if proc.threads.get(tid).is_none() || !proc.claim_teardown() {
             drop(guard);
             unsafe { crate::mm::paging::kernel_cr3().activate(); }
-            scheduler::exit_current(code);
+            return;
         };
         let other_tids: Vec<Tid> = proc.threads.iter()
             .map(|(t, _)| t)
@@ -1277,8 +1295,6 @@ pub fn exit(code: i32) -> ! {
     let stats =
         final_stats(&process_data_arc, process_pid, syscall_total, syscall_total_ns, main_cpu_ns);
     object.publish_exit(crate::object::process::Exit { code, stats });
-
-    scheduler::exit_current(code);
 }
 
 /// Exit the current thread. If this is the main thread, tears down the entire
@@ -1296,6 +1312,17 @@ pub fn thread_exit(code: i32) -> ! {
         exit(code);
     }
 
+    let parent_main_tid = release_thread(process_pid, tid, code);
+    scheduler::wake_task(TaskId(process_pid, parent_main_tid));
+    scheduler::exit_current(code);
+}
+
+/// A child thread's own teardown, and the main thread it must wake.
+///
+/// Returns for [`release_process`]'s reason: the address space this clones out
+/// is an `Arc`, and one left live where `exit_current` is called is one nothing
+/// ever drops.
+fn release_thread(process_pid: Pid, tid: Tid, code: i32) -> Tid {
     // Thread-only exit path: release this thread's mappings, zombify, wake parent.
     let addr_space = current_address_space();
     unsafe { crate::mm::paging::kernel_cr3().activate(); }
@@ -1315,21 +1342,16 @@ pub fn thread_exit(code: i32) -> ! {
     // takes with `IF` clear.
     drop(released);
 
-    let parent_main_tid = {
-        let mut guard = PROCESS_TABLE.lock();
-        let table = guard.as_mut().unwrap();
-        let cpu_ms = table.get(process_pid).and_then(|p| p.threads.get(tid))
-            .and_then(|t| t.sched())
-            .map_or(0, scheduler::task_cpu_ns) / 1_000_000;
-        table.get_mut(process_pid).unwrap().threads.get_mut(tid).unwrap().state = ThreadLocation::Zombie(code);
-        let proc = table.get(process_pid).unwrap();
-        let name = proc.name_str();
-        log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
-        proc.main_tid
-    };
-
-    scheduler::wake_task(TaskId(process_pid, parent_main_tid));
-    scheduler::exit_current(code);
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().unwrap();
+    let cpu_ms = table.get(process_pid).and_then(|p| p.threads.get(tid))
+        .and_then(|t| t.sched())
+        .map_or(0, scheduler::task_cpu_ns) / 1_000_000;
+    table.get_mut(process_pid).unwrap().threads.get_mut(tid).unwrap().state = ThreadLocation::Zombie(code);
+    let proc = table.get(process_pid).unwrap();
+    let name = proc.name_str();
+    log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
+    proc.main_tid
 }
 
 /// A thread's scheduler record, cloned out of the table.
