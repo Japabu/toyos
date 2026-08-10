@@ -6,6 +6,18 @@ name: gate A, thorough
 # thing in this tree that a second machine shortens rather than perturbs — and
 # each job's guest has a runner to itself, which is the quiet host the recorded
 # sample was attested on and the dev host can no longer offer.
+#
+# **The container the twelve shards run in, and the reason is this job's whole
+# purpose.** It ran on a bare `ubuntu-24.04` until 2026-08-10 — QEMU 8.2.2,
+# against 11.0.3 everywhere else in CI and on the dev host — which made the one
+# arm that exists to be *compared* a third instrument. `specs/ci-plan.md` §7.3
+# is the measurement: three major versions of QEMU changes test outcomes. §9's
+# open question is whether a runner's gate A spread is comparable with the dev
+# host's, and a number taken on a QEMU neither of them runs cannot answer it.
+#
+# What still differs from the dev host after this, deliberately, is the
+# accelerator (KVM against cross-arch TCG) and the host CPU — §8's table, and
+# the axis the whole CI configuration is arranged to isolate.
 
 on:
   workflow_dispatch:
@@ -29,35 +41,93 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2]
+    # `--device=/dev/kvm` and root inside the container, exactly as the shards:
+    # the node ships `crw-rw---- root:kvm` and root opens it, so the
+    # `sudo chmod 666 /dev/kvm` a bare runner needed went with the bare runner.
+    container:
+      image: debian:sid
+      options: --device=/dev/kvm
     steps:
+      # Before the checkout, because `actions/checkout` wants git and this
+      # image has none. Three attempts, for the reason `ci.yml`'s own `deps`
+      # carries: `sid` is a rolling release and its mirror is not a fixed
+      # artifact.
+      #
+      # No `ovmf` package: the firmware is `ovmf/` in this repository on every
+      # host (`src/qemu.rs`, `tests/common/qemu.rs`), so the apt one the bare
+      # runner installed was never opened.
+      - name: deps
+        run: |
+          got=no
+          for attempt in 1 2 3; do
+            if apt-get update -qq \
+               && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    git curl ca-certificates jq zstd xz-utils build-essential \
+                    qemu-system-x86 > /dev/null; then
+              got=yes
+              break
+            fi
+            echo "apt attempt $attempt failed"
+            [ "$attempt" = 3 ] || sleep 20
+          done
+          if [ "$got" != yes ]; then
+            echo "::error::apt failed three times against sid's mirror. Nothing here is about"
+            echo "::error::the tree — re-run the job."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: unlock kvm
-        run: sudo chmod 666 /dev/kvm
+      # A gate A verdict is only comparable with the sample it is compared
+      # against, so the instrument is named before anything boots.
+      - name: the instrument
+        run: .github/instrument.sh
 
-      - name: deps
+      - name: rust
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            qemu-system-x86 ovmf zstd
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - id: key
-        run: |
-          sum=$(git rev-parse HEAD:rust HEAD:toyos-abi/src HEAD:toyos/src \
-                              HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          echo "tag=toolchain-linux-x86_64-$sum" >> "$GITHUB_OUTPUT"
-
+      # The key `toolchain.yml` publishes under, fetched through the API rather
+      # than `gh`, which this image has not.
+      #
+      # **This workflow builds no toolchain and never waits for one.** It is
+      # dispatch-only, so by the time anyone runs it the branch has been through
+      # `toolchain.yml` on its pull request; a missing release is a mistake
+      # about which ref was dispatched, and it says so rather than sitting in a
+      # two-hour loop.
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "${{ steps.key.outputs.tag }}" \
-            -p 'toyos-toolchain.tar.zst' -O /tmp/toolchain.tar.zst
+          git config --global --add safe.directory "$PWD"
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          echo "toolchain: $tag"
+          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
+          for _ in $(seq 10); do
+            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
+              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
+            [ -n "$asset" ] && break
+            echo "the release $tag did not answer; retrying"
+            sleep 15
+          done
+          if [ -z "$asset" ]; then
+            echo "::error::$tag is not published, and this workflow builds nothing."
+            echo "::error::toolchain.yml publishes it on a pull request and on a push to main;"
+            echo "::error::open one for this ref, or dispatch a ref that has been through it."
+            exit 1
+          fi
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
           mkdir -p rust/build
-          zstd -dc /tmp/toolchain.tar.zst | tar -C rust/build -x
-          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
+          stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+          rustup toolchain link toyos "$stage2"
+          "$stage2/bin/rustc" -vV
 
       # The host conditions line every run prints is the point of running it
       # here, so nothing is captured away from it.

@@ -175,14 +175,17 @@ jobs:
             echo "::error::the tree — re-run the job."
             exit 1
           fi
-          qemu-system-x86_64 --version | head -1
-          ls -l /dev/kvm
-          # The vendor is a variable and not a detail — an AMD host is the only
-          # one that can reproduce `specs/ci-plan.md` §7's class.
-          grep -m1 'model name' /proc/cpuinfo
-          nproc
 
       - uses: actions/checkout@v4
+
+      # The QEMU version, the host CPU vendor and whether `/dev/kvm` is there —
+      # the three variables a verdict from this job has to be read against, and
+      # the first of them is now a declaration this checks rather than a line in
+      # a log nobody reads. `.github/instrument.sh` says why each is here.
+      - name: the instrument
+        env:
+          MATRIX_LABEL: shard ${{ matrix.shard }}/12
+        run: .github/instrument.sh
 
       - name: rust
         run: |
@@ -381,11 +384,13 @@ jobs:
             echo "::error::the tree — re-run the job."
             exit 1
           fi
-          qemu-system-x86_64 --version | head -1
-          ls -l /dev/kvm || echo "no /dev/kvm node: this is the emulated arm"
-          grep -m1 'model name' /proc/cpuinfo
 
       - uses: actions/checkout@v4
+
+      # The same three readings the shards take, and the one that differs is
+      # the point of this job: no `/dev/kvm` in the container at all.
+      - name: the instrument
+        run: .github/instrument.sh
 
       - name: rust
         run: |
