@@ -400,6 +400,72 @@ jobs:
   # It is what `specs/ci-plan.md` §10's stage 2 makes required. Until then it
   # runs, it reds when a shard reds, and `landing.yml`'s `gate-stage` is what
   # stops that being a permanent arrangement.
+  # **The partition is only as good as the profile, and nothing was checking the
+  # profile.** `tests/test-durations` is what every runner reads, because a fresh
+  # clone has measured nothing (§4), and it had drifted: eight names of run
+  # `31331494794` were not in it at all — each costed by `Shard::keep` at the
+  # longest it *did* know, so eight phantom four-minute tests steered a twelve-way
+  # split — and names it did price were out by twentyfold in both directions
+  # (`foreign_disk_untouched` 87.0s recorded against 4.3s measured). That run's
+  # shards carried 228.7s to 508.8s of tests against an even split of 365.7s:
+  # **143.1 s of critical path, on every merge**, now that `guest-suite` is
+  # required.
+  #
+  # It goes stale silently because a test added without a profile entry is
+  # silent, and stays silent until somebody reads two shard timings side by side.
+  # So the run that produces the measurement reports on it. Advisory by
+  # construction — a slow partition is not a wrong verdict, and a pull request
+  # that adds a test cannot be red for the profile not knowing it yet — with one
+  # thing in it that *is* a gate: `--merge-durations` refuses a name two shards
+  # both measured, which is §4's partition defect and a concatenation cannot see
+  # it.
+  durations:
+    needs: [guest]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: landing-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: landing-${{ runner.os }}-
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: durations-shard-*
+          path: /tmp/durations
+          merge-multiple: false
+
+      - name: what the partition cost
+        run: |
+          set -o pipefail
+          cargo run -- --merge-durations /tmp/durations 2>&1 | tee /tmp/merged.log
+          {
+            echo "### the duration profile"
+            echo ""
+            grep '^\[durations\]' /tmp/merged.log | sed 's/^/- /'
+            if git diff --quiet -- tests/test-durations; then
+              echo "- \`tests/test-durations\` is what this run measured."
+            else
+              echo "- \`tests/test-durations\` disagrees with what this run measured."
+              echo "  Update it: \`gh run download ${{ github.run_id }} -p 'durations-shard-*'\`"
+              echo "  then \`cargo run -- --merge-durations <dir>\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-durations-merged
+          path: tests/test-durations
+          retention-days: 7
+
   guest-suite:
     needs: [toolchain-ready, guest]
     if: always()

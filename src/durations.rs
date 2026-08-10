@@ -68,8 +68,11 @@ pub fn dispatch(root: &Path, args: &[String]) {
         }
     }
 
-    let body: String = merged.iter().map(|(n, (ms, _))| format!("{n} {ms}\n")).collect();
     let out = root.join("tests/test-durations");
+    let before = read_profile(&out);
+    report(&merged, &before, files.len());
+
+    let body: String = merged.iter().map(|(n, (ms, _))| format!("{n} {ms}\n")).collect();
     fs::write(&out, body).unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
     println!(
         "{}: {} test(s) from {} shard file(s)",
@@ -77,6 +80,73 @@ pub fn dispatch(root: &Path, args: &[String]) {
         merged.len(),
         files.len()
     );
+}
+
+fn read_profile(path: &Path) -> BTreeMap<String, u64> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.rsplit_once(' '))
+        .filter_map(|(n, ms)| ms.parse().ok().map(|ms| (n.to_string(), ms)))
+        .collect()
+}
+
+/// What the run this merges was actually partitioned into, and what the profile
+/// it partitioned on had to say about it.
+///
+/// **Both halves are measurements and neither is a model.** The spread is the
+/// shard files' own totals; the ideal is their sum over the shard count. Nobody
+/// has to be told what a better partition would have produced, because the run
+/// that produced these files already answered it.
+///
+/// The unpriced names are the ones that made this worth printing. `Shard::keep`
+/// costs a name the profile has never seen at the longest that *was* measured —
+/// deliberate conservatism, and eight such names in run `31331494794` were
+/// eight phantom four-minute tests steering a twelve-way partition. Nothing in
+/// the tree noticed: a test added without a profile entry is silent, and it
+/// stays silent until somebody reads two shard timings side by side.
+fn report(
+    merged: &BTreeMap<String, (u64, String)>,
+    before: &BTreeMap<String, u64>,
+    shards: usize,
+) {
+    let mut totals: BTreeMap<&str, u64> = BTreeMap::new();
+    for (ms, who) in merged.values() {
+        *totals.entry(who.as_str()).or_default() += ms;
+    }
+    let (low, high) = (
+        totals.values().min().copied().unwrap_or(0),
+        totals.values().max().copied().unwrap_or(0),
+    );
+    let ideal = merged.values().map(|(ms, _)| ms).sum::<u64>() / shards.max(1) as u64;
+    println!(
+        "[durations] the shards measured {:.1}s to {:.1}s of tests; an even split is {:.1}s, \
+         so this partition cost {:.1}s of critical path",
+        low as f64 / 1000.0,
+        high as f64 / 1000.0,
+        ideal as f64 / 1000.0,
+        (high.saturating_sub(ideal)) as f64 / 1000.0,
+    );
+
+    let unpriced: Vec<&str> =
+        merged.keys().filter(|n| !before.contains_key(*n)).map(String::as_str).collect();
+    if !unpriced.is_empty() {
+        println!(
+            "[durations] {} name(s) the profile did not price, each costed at the longest it \
+             knew: {}",
+            unpriced.len(),
+            unpriced.join(", ")
+        );
+    }
+    let gone: Vec<&str> =
+        before.keys().filter(|n| !merged.contains_key(*n)).map(String::as_str).collect();
+    if !gone.is_empty() {
+        println!(
+            "[durations] {} name(s) the profile prices and no shard ran: {}",
+            gone.len(),
+            gone.join(", ")
+        );
+    }
 }
 
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
