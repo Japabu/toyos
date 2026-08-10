@@ -3858,6 +3858,11 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
+                    // Action 0 is a `SYS_DEBUG` arm, and a kernel that ships
+                    // has none: the child would be answered `InvalidArgument`
+                    // and exit 0, which is this test's own red for a reason
+                    // that is not about the screen at all.
+                    kernel_features: ACTUATOR_KERNEL,
                     ..Default::default()
                 },
             );
@@ -10999,6 +11004,16 @@ fn needs_actuators(sources: &[(String, String)], registry: &[&str]) -> BTreeSet<
 
 /// [`ACTUATOR_TESTS`] is exactly the shared-boot binaries that reach
 /// `SYS_DEBUG`, and the binaries are what is asked.
+///
+/// **What this does not cover, stated because the hole is real:** a machine or
+/// screen test that *drives* one of those binaries on a boot of its own.
+/// `screen_recoverable_untouched` was the instance — it runs
+/// `test_rs_test_panic_child` on a featureless kernel, where action 0 is answered
+/// `InvalidArgument` and the child exits 0 — and no static rule here can say
+/// which `BootOptions` a `run_test` call belongs to. What answers it instead is
+/// the guest: `test_panic_child` names `InvalidArgument` as *this kernel carries
+/// no actuators* rather than reporting a kernel that failed to kill anybody, so
+/// the red says what is wrong wherever it happens.
 ///
 /// **Both directions are the point.** A binary that gains a `debug()` call and
 /// no entry would run on the shipping kernel, where the syscall answers
