@@ -153,15 +153,28 @@ jobs:
       # to block a merge, and that is not a gate anyone chose.
       - name: deps
         run: |
+          got=no
           for attempt in 1 2 3; do
-            apt-get update -qq \
-              && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-                   git curl ca-certificates jq zstd xz-utils build-essential \
-                   qemu-system-x86 > /dev/null \
-              && break
+            if apt-get update -qq \
+               && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    git curl ca-certificates jq zstd xz-utils build-essential \
+                    qemu-system-x86 > /dev/null; then
+              got=yes
+              break
+            fi
             echo "apt attempt $attempt failed"
-            test "$attempt" != 3 && sleep 20
+            [ "$attempt" = 3 ] || sleep 20
           done
+          # **Named, because three failures used to be reported as
+          # `qemu-system-x86_64: command not found`** three lines later, which
+          # reads as a broken image rather than as a mirror. `sid` is a rolling
+          # release and its mirror is not a fixed artifact; this says nothing
+          # about the tree, and `guest-suite` is a required check now.
+          if [ "$got" != yes ]; then
+            echo "::error::apt failed three times against sid's mirror. Nothing here is about"
+            echo "::error::the tree — re-run the job."
+            exit 1
+          fi
           qemu-system-x86_64 --version | head -1
           ls -l /dev/kvm
           # The vendor is a variable and not a detail — an AMD host is the only
@@ -346,15 +359,28 @@ jobs:
       # Three attempts, for the reason the shards' own `deps` step carries.
       - name: deps
         run: |
+          got=no
           for attempt in 1 2 3; do
-            apt-get update -qq \
-              && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-                   git curl ca-certificates jq zstd xz-utils build-essential \
-                   qemu-system-x86 > /dev/null \
-              && break
+            if apt-get update -qq \
+               && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    git curl ca-certificates jq zstd xz-utils build-essential \
+                    qemu-system-x86 > /dev/null; then
+              got=yes
+              break
+            fi
             echo "apt attempt $attempt failed"
-            test "$attempt" != 3 && sleep 20
+            [ "$attempt" = 3 ] || sleep 20
           done
+          # **Named, because three failures used to be reported as
+          # `qemu-system-x86_64: command not found`** three lines later, which
+          # reads as a broken image rather than as a mirror. `sid` is a rolling
+          # release and its mirror is not a fixed artifact; this says nothing
+          # about the tree, and `guest-suite` is a required check now.
+          if [ "$got" != yes ]; then
+            echo "::error::apt failed three times against sid's mirror. Nothing here is about"
+            echo "::error::the tree — re-run the job."
+            exit 1
+          fi
           qemu-system-x86_64 --version | head -1
           ls -l /dev/kvm || echo "no /dev/kvm node: this is the emulated arm"
           grep -m1 'model name' /proc/cpuinfo
