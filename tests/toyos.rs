@@ -114,6 +114,36 @@ impl HostSlots {
 /// one task among sixty.
 const SHARED_BLOCK: Sched = Sched::Parallel;
 
+/// The shared-boot binaries that call `SYS_DEBUG`, and so cannot run on the
+/// kernel an image ships.
+///
+/// **Everything else on the shared boot now runs on that kernel** — no features,
+/// the same staged artifact `cargo run --build-only` writes. Until
+/// `test-actuators` became one name, `qemu::fold_inert` put it on *every* test
+/// kernel, so nothing in this suite had ever booted the shipping binary and two
+/// of the three names below depended on that without saying so.
+///
+/// A second boot rather than a second image: the block costs a fraction of a
+/// second of guest time between its members, and what these three need is a
+/// syscall number the other 150 must not have.
+const ACTUATOR_TESTS: &[&str] = &[
+    // Actions 0, 1 and 2: a kernel `panic!`, a null read in kernel context, and
+    // a spinlock held across a scheduler entry. Each kills the caller and the
+    // machine has to survive it, which is the whole verdict.
+    "panic_recovery",
+    // Actions 10 and 11: the address of sixteen bytes of kernel memory and
+    // whether they still hold what the kernel put there. A guest cannot read the
+    // kernel's address space, so without them a kernel that still made the write
+    // under test answers a userland that cannot notice.
+    "abuse_kernel_addr",
+    // Actions 12 and 13: hold one CPU's shootdown acknowledgement back, so that
+    // whether the initiator waits becomes a duration userland can read.
+    "tlb_shootdown_waits",
+];
+
+/// What [`ACTUATOR_TESTS`] boots.
+const ACTUATOR_KERNEL: &[&str] = &["test-actuators"];
+
 /// How many times a shared block will answer a dead guest with a new one.
 ///
 /// Bounded because a block whose every member kills the guest must not boot one
@@ -131,8 +161,9 @@ const RUST_SKIP: &[&str] = &[
     "i8042_mouse",
     "input_events",
     "va_exhaustion",
-    // Needs SYS_DEBUG actions 5 and 6, which only the `test-heap-ceiling`
-    // kernel has. `heap_ceiling_recovery` boots that kernel.
+    // Needs SYS_DEBUG, which the shipping kernel has no arm of at all.
+    // `heap_ceiling_recovery` boots the `test-actuators` kernel on one CPU,
+    // which is also what makes its claim about *the recovered CPU* precise.
     "heap_ceiling",
     // Fills /tmp to the VFS listing limit, so it needs a boot nothing else
     // shares — every later `read_dir("/tmp")` in it would be refused.
@@ -176,6 +207,12 @@ const RUST_SKIP: &[&str] = &[
     // ever answers it. `swiss_german_layout`, `locale_detect` and
     // `locale_detect_unrecognized` drive it.
     "locale_gate",
+    // Driven, not run: `screen_console_clear` types its name at a console it is
+    // watching, and on its own it asks the kernel to paint over a panel nobody
+    // is reading and exits 0. A verdict its own exit code cannot carry — the
+    // same shape as `test_screen_churn` below, and it was in the shared registry
+    // for the same reason nobody had looked.
+    "test_screen_graffiti",
     // A workload, not a test: it prints a pattern for `screen_console_scroll`
     // to assert a panel against, and on its own it has no verdict at all. It
     // used to sit in the shared boot with defaults for its arguments, where it
@@ -564,6 +601,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Same: the control-register verdict, against the machine this tree
     // actually booted before `arch/control_regs.rs`.
     ("control_regs_verdict", Sched::Parallel),
+    // Same: which of the two shared boots each binary belongs on, asked of the
+    // binaries rather than of the list that claims to name them.
+    ("suite_split", Sched::Parallel),
 ];
 
 /// What makes an entry stale, which is the whole safety argument for having a
@@ -763,8 +803,8 @@ const T14_ROWS: usize = 1080 / 16;
 const T14_COLS: usize = 1920 / 8;
 
 /// The line `SYS_DEBUG` action 3 logs immediately before halting every CPU.
-/// Action 3 exists only under the `test-fatal-halt` kernel feature, which
-/// screen_fatal_halt is the only caller of. Kept in sync with
+/// It exists only on a `test-actuators` kernel — every other action costs the
+/// caller its own process, this one costs the machine. Kept in sync with
 /// `kernel/src/arch/syscall.rs` by this comment and by screen_fatal_halt
 /// failing loudly if it drifts.
 const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
@@ -2595,7 +2635,7 @@ fn run_screen_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["test-screen-graffiti"],
+                kernel_features: &["test-actuators"],
                 ready_marker: "console: ready",
                 ..Default::default()
             };
@@ -2786,7 +2826,7 @@ fn run_screen_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["test-screen-graffiti"],
+                kernel_features: &["test-actuators"],
                 ready_marker: "console: ready",
                 ..Default::default()
             };
@@ -2997,7 +3037,7 @@ fn run_screen_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["test-fatal-halt"],
+                kernel_features: &["test-actuators"],
                 ready_marker: "console: ready",
                 ..Default::default()
             };
@@ -3500,7 +3540,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
-                    kernel_features: &["test-fatal-halt"],
+                    kernel_features: &["test-actuators"],
                     ..Default::default()
                 },
             );
@@ -7678,6 +7718,7 @@ fn run_machine_test(
         "expected_failure_exit_status" => expected_failure_exit_status(),
         "expected_failure_entries" => expected_failure_entries(),
         "control_regs_verdict" => control_regs_verdict(),
+        "suite_split" => suite_split(),
         "nvme_wide_sector" => {
             // The other half of "a device's size is a shape dimension": not how
             // many sectors, but how big one is. `lba_ds` is an 8-bit
@@ -7908,15 +7949,15 @@ fn run_machine_test(
             // machine `/bin/echo` could run somewhere else and pass without
             // touching it. With one CPU there is nowhere else.
             //
-            // The actuator is `test-heap-ceiling`'s three SYS_DEBUG actions,
-            // and the reason it is not an ordinary workload is on the feature
-            // in `kernel/Cargo.toml`: routes past the ceiling do still exist,
+            // The actuator is SYS_DEBUG 5, 6 and 7, and the reason it is not
+            // an ordinary workload is beside them in `arch/syscall.rs`: routes
+            // past the ceiling do still exist,
             // and each of them holds the VFS lock when it dies, so the
             // machine wedges either way and the allocator's recovery cannot
             // be observed on its own.
             let options = BootOptions {
                 smp: 1,
-                kernel_features: &["test-heap-ceiling"],
+                kernel_features: &["test-actuators"],
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
@@ -10185,8 +10226,12 @@ fn run_debug_mode(c_tests: &[(String, Vec<u8>)], rust_bins: &[(String, Vec<u8>)]
 /// load-bearing and a group split across two workers would boot two machines
 /// and drain one console between them.
 enum Task<'a> {
-    /// Every Rust and C test, on the one guest they share.
-    Shared(Vec<&'a TestDef>),
+    /// Rust and C tests on one guest, and the kernel that guest boots.
+    ///
+    /// Two blocks rather than one: [`ACTUATOR_TESTS`] needs `SYS_DEBUG` and
+    /// everything else must not have it, which is what makes the second list
+    /// the shipping binary's own coverage.
+    Shared(Vec<&'a TestDef>, &'static [&'static str]),
     Machine(Vec<&'static str>),
     Screen(&'static str),
 }
@@ -10929,6 +10974,95 @@ fn expected_failure_exit_status() -> Result<(), String> {
 }
 
 /// What the declaration itself has to be, before any of it means anything.
+/// Which shared-boot binaries need `SYS_DEBUG`, asked of their source.
+///
+/// A name reaches the syscall directly, or through a child it spawns —
+/// `panic_recovery`'s three actions are all `test_panic_child`'s, and a rule
+/// that only read the test's own source would miss the one test in the list
+/// whose whole subject is the syscall.
+fn needs_actuators(sources: &[(String, String)], registry: &[&str]) -> BTreeSet<String> {
+    let calls = |text: &str| text.contains("SYS_DEBUG") || text.contains("syscall::debug(");
+    let direct: BTreeSet<&str> =
+        sources.iter().filter(|(_, t)| calls(t)).map(|(n, _)| n.as_str()).collect();
+    let mut out = BTreeSet::new();
+    for (name, text) in sources {
+        if !registry.contains(&name.as_str()) {
+            continue;
+        }
+        let spawns = direct.iter().any(|d| text.contains(&format!("test_rs_{d}")));
+        if direct.contains(name.as_str()) || spawns {
+            out.insert(name.clone());
+        }
+    }
+    out
+}
+
+/// [`ACTUATOR_TESTS`] is exactly the shared-boot binaries that reach
+/// `SYS_DEBUG`, and the binaries are what is asked.
+///
+/// **Both directions are the point.** A binary that gains a `debug()` call and
+/// no entry would run on the shipping kernel, where the syscall answers
+/// `InvalidArgument` — and a test whose verdict is that a process died would
+/// then fail for a reason with nothing to do with what it is about. An entry
+/// whose binary no longer calls it is a test kept off the shipping kernel for
+/// nothing, which is the erosion this split exists to stop.
+fn suite_split() -> Result<(), String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/toyos-rust-tests/src/bin");
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path).map_err(|e| format!("read {name}: {e}"))?;
+        sources.push((name, text));
+    }
+    let registry: Vec<&str> =
+        sources.iter().map(|(n, _)| n.as_str()).filter(|n| !RUST_SKIP.contains(n)).collect();
+
+    // The negative control, and it carries its own bad input: a binary that
+    // calls the syscall and is on no list must be named, or the check above is
+    // a spelling of `true`.
+    let staged = vec![
+        ("a_listed_one".to_string(), "syscall::debug(3)".to_string()),
+        ("an_unlisted_one".to_string(), "SYS_DEBUG".to_string()),
+        ("its_parent".to_string(), "Command::new(\"/bin/test_rs_an_unlisted_one\")".to_string()),
+        ("innocent".to_string(), "println!()".to_string()),
+    ];
+    let staged_registry = ["a_listed_one", "an_unlisted_one", "its_parent", "innocent"];
+    let found = needs_actuators(&staged, &staged_registry);
+    let want: BTreeSet<String> =
+        ["a_listed_one", "an_unlisted_one", "its_parent"].iter().map(|s| s.to_string()).collect();
+    if found != want {
+        return Err(format!("the check does not work: on staged input it named {found:?}"));
+    }
+
+    let want: BTreeSet<String> = needs_actuators(&sources, &registry);
+    let listed: BTreeSet<String> = ACTUATOR_TESTS.iter().map(|s| s.to_string()).collect();
+    let missing: Vec<&String> = want.difference(&listed).collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{missing:?} reach SYS_DEBUG and are on the shipping boot, where the syscall answers \
+             InvalidArgument. Add each to ACTUATOR_TESTS, or to RUST_SKIP if it is driven rather \
+             than run."
+        ));
+    }
+    let stale: Vec<&String> = listed.difference(&want).collect();
+    if !stale.is_empty() {
+        return Err(format!(
+            "{stale:?} are held off the shipping kernel and no longer reach SYS_DEBUG. Delete \
+             each entry — coverage of the binary an image ships is what it costs."
+        ));
+    }
+    println!(
+        "  [split] {} shared binaries on the shipping kernel, {} on the actuator one",
+        registry.len() - listed.len(),
+        listed.len()
+    );
+    Ok(())
+}
+
 fn expected_failure_entries() -> Result<(), String> {
     static NAMED_NOTHING: &[ExpectedFailure] = &[ExpectedFailure {
         test: "a_test_that_was_renamed",
@@ -11027,7 +11161,7 @@ fn expected_failure_entries() -> Result<(), String> {
 /// thing that changed between the two attempts is how many guests the host had.
 fn retry_task<'a>(name: &str, all_tests: &[&'a TestDef]) -> Option<Task<'a>> {
     if let Some(def) = all_tests.iter().find(|t| t.name == name) {
-        return Some(Task::Shared(vec![def]));
+        return Some(Task::Shared(vec![def], shared_kernel(name)));
     }
     if let Some((registered, _)) = SCREEN_TESTS.iter().find(|(n, _)| *n == name) {
         return Some(Task::Screen(registered));
@@ -11042,6 +11176,15 @@ fn retry_task<'a>(name: &str, all_tests: &[&'a TestDef]) -> Option<Task<'a>> {
             .collect(),
     };
     Some(Task::Machine(names))
+}
+
+/// Which of the two shared boots a name belongs on.
+fn shared_kernel(name: &str) -> &'static [&'static str] {
+    if ACTUATOR_TESTS.contains(&name) {
+        ACTUATOR_KERNEL
+    } else {
+        &[]
+    }
 }
 
 /// The binaries and config every task boots with.
@@ -11064,13 +11207,21 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
         });
     };
     match task {
-        Task::Shared(tests) => {
+        Task::Shared(tests, features) => {
             // The boot itself can fail, and it used to take the run with it.
             // Reporting the block's tests against its reason keeps the count
             // honest and says which one it died on.
             let mut done = 0usize;
             let outcome = catching(|| {
-                let mut qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
+                let boot = || {
+                    QemuInstance::boot_with_options(
+                        bins.test_config,
+                        bins.c_bins,
+                        bins.rust_bins,
+                        BootOptions { kernel_features: features, ..Default::default() },
+                    )
+                };
+                let mut qemu = boot();
                 let mut reboots = 0usize;
                 for test in &tests {
                     let start = common::clock::mark();
@@ -11096,7 +11247,7 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                              ({reboots}/{MAX_SHARED_REBOOTS}) ----",
                             test.name
                         );
-                        qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
+                        qemu = boot();
                         result = qemu.run_test(&test.qemu_name, test.timeout);
                     }
                     let reason = (!(test.check)(&result)).then(|| {
@@ -11157,7 +11308,7 @@ impl Task<'_> {
     /// Every name this task will report an outcome for.
     fn names(&self) -> Vec<&str> {
         match self {
-            Task::Shared(tests) => tests.iter().map(|t| t.name.as_str()).collect(),
+            Task::Shared(tests, _) => tests.iter().map(|t| t.name.as_str()).collect(),
             Task::Machine(names) => names.to_vec(),
             Task::Screen(name) => vec![name],
         }
@@ -11734,15 +11885,26 @@ fn main() {
     let mut parallel: Vec<Task> = Vec::new();
     let mut serial: Vec<Task> = Vec::new();
     if !tests_to_run.is_empty() {
+        let (actuator, shipping): (Vec<&TestDef>, Vec<&TestDef>) =
+            tests_to_run.iter().copied().partition(|t| ACTUATOR_TESTS.contains(&t.name.as_str()));
         eprintln!(
-            "[toyos] The shared boot carries {} C + {} Rust binaries",
+            "[toyos] The shared boot carries {} C + {} Rust binaries: {} on the shipping \
+             kernel, {} on the actuator one",
             c_bins.len(),
-            rust_bins.len()
+            rust_bins.len(),
+            shipping.len(),
+            actuator.len(),
         );
-        let task = Task::Shared(tests_to_run.clone());
-        match SHARED_BLOCK {
-            Sched::Parallel => parallel.push(task),
-            Sched::Serial => serial.push(task),
+        for tests in [shipping, actuator] {
+            if tests.is_empty() {
+                continue;
+            }
+            let features = shared_kernel(&tests[0].name);
+            let task = Task::Shared(tests, features);
+            match SHARED_BLOCK {
+                Sched::Parallel => parallel.push(task),
+                Sched::Serial => serial.push(task),
+            }
         }
     }
     for (sched, names) in machine_tasks(&machine_to_run) {

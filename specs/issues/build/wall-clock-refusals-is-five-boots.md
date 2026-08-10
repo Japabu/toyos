@@ -10,9 +10,9 @@ opened: 2026-08-08
 (`tests/common/wallclock.rs:281-305`) calls five helpers in sequence and each one
 goes through `boot_and_read` (`:123-176`), which builds an image and boots one
 guest. Five distinct kernel builds: `rtc-dead`, `rtc-unstable`,
-`rtc-no-century`+`rtc-century-next`, `rtc-century-next`, `rtc-zone-east`. None is
-in `INERT_ACTUATORS` (`tests/common/qemu.rs:1315-1322`), so `fold_inert` merges
-nothing — one worker takes all five, serially.
+`rtc-no-century`+`rtc-century-next`, `rtc-century-next`, `rtc-zone-east`. Each is
+a machine a boot really is, so nothing merges them — one worker takes all five,
+serially.
 
 Recorded durations on disk, from other worktrees' `target/test-durations`
 (this one has never been run):

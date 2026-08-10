@@ -3,7 +3,7 @@
 //!
 //! **Why this needs an actuator at all.** A correct wait and no wait whatsoever
 //! measure the same zero on a machine where every CPU answers in microseconds,
-//! so nothing a guest can do distinguishes them. `test-tlb-ack-delay` makes the
+//! so nothing a guest can do distinguishes them. `SYS_DEBUG` action 12 makes the
 //! last CPU an initiator waits for answer late — after flushing, so what is
 //! staged is a slow answer and never an incorrect one — and the wait becomes a
 //! duration userland can read off its own clock.

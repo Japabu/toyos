@@ -1124,7 +1124,7 @@ fn row_base(fb: &Fb, y: usize, len: usize) -> Option<*mut u32> {
 ///
 /// It covers the strip below the last glyph row too, which is the half of this
 /// a console composing cell by cell can never reach on its own.
-#[cfg(feature = "test-screen-graffiti")]
+#[cfg(feature = "test-actuators")]
 pub fn graffiti() {
     let Some(fb) = snapshot() else { return };
     if !mapped(&fb) {
