@@ -1943,8 +1943,18 @@ is a *duration*, it is. None of the five is timed. The positive halves
 i8042 boots) all run on the shipping kernel, which is the coverage that actually
 moved and it moved the right way.
 
-**One thing this change gives up and nothing replaces.** Before, a boot with an
-actuator was the shipping kernel plus one live path; nothing now checks that the
-test kernel with *nothing* armed behaves as the shipping kernel does. The
-`SYS_DEBUG` shared boot is that machine and 150 tests do not run on it, so a
-divergence would show as a broad red rather than a named one.
+**Two things this change gives up and nothing replaces.**
+
+Before, a boot with an actuator was the shipping kernel plus one live path;
+nothing now checks that the test kernel with *nothing* armed behaves as the
+shipping kernel does. The `SYS_DEBUG` shared boot is that machine and 150 tests
+do not run on it, so a divergence would show as a broad red rather than a named
+one.
+
+And `hda_probe`'s boots used to run the kernel binary a diagnostic image ships.
+A flashed diagnostic build is `boot-actuators` alone; the suite has two kernels
+and the actuator one carries `test-actuators` with it, so that test now boots a
+kernel with a debug syscall the flashed one does not have. Giving it back is a
+third build in every run, which is the trade §3.6 is about. The *image* — the
+diag config, no test binaries, nothing that can claim the framebuffer — is still
+the flashed one.

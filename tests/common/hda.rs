@@ -210,8 +210,15 @@ fn ordinary_boot_is_untouched() -> Result<(), String> {
 /// One diagnostic boot of the three-controller machine.
 ///
 /// The **diag config**, because that is the image H0 ships in: no test binaries
-/// in the initrd and no process that can claim the framebuffer, so what the
-/// harness boots here is what gets flashed.
+/// in the initrd and no process that can claim the framebuffer, so the *image*
+/// the harness boots here is the one that gets flashed.
+///
+/// The kernel in it is not, and that is the one thing this cannot claim. A
+/// flashed diagnostic image is built with `boot-actuators` alone; the suite has
+/// only two kernels and the one carrying actuators carries `test-actuators`
+/// too, so what boots here has a debug syscall the flashed one does not
+/// (`specs/test-cost-audit.md` §5.9.7). Everything the probe touches is the
+/// same code either way.
 fn probe_boot(params: &'static [&'static str]) -> Result<Serial, String> {
     let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("diag");
     let options = BootOptions {
