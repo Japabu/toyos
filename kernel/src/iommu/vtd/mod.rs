@@ -188,7 +188,7 @@ pub fn init(rsdp_addr: u64, devices: &[PciDevice]) {
 /// the catch-all. Answering "the last unit" or "unit 0" instead would be a
 /// number this file made up, and the whole value of this call is that it is
 /// firmware's answer.
-#[cfg(feature = "hda-probe")]
+#[cfg(feature = "boot-actuators")]
 pub(super) fn describe_device(rsdp_addr: u64, stream: StreamId) -> crate::iommu::DeviceFacts {
     use crate::iommu::{DeviceFacts, ReservedRegion, UnitFacts};
 
@@ -236,7 +236,7 @@ pub(super) fn describe_device(rsdp_addr: u64, stream: StreamId) -> crate::iommu:
 /// Whether any scope in this list names `stream` directly. A scope reached
 /// through a bridge carries no requester id (`Scope::stream_id`), so it cannot
 /// answer yes or no here and does not pretend to.
-#[cfg(feature = "hda-probe")]
+#[cfg(feature = "boot-actuators")]
 fn names(scopes: Scopes, stream: StreamId) -> bool {
     scopes.flatten().any(|scope| scope.stream_id() == Some(stream))
 }
@@ -449,8 +449,9 @@ fn enable(mut unit: Unit, devices: &[PciDevice], domains: &mut [Option<Table>; 2
             // silently and with no fault (measured — §8.2). A control that
             // waited for a device's first write would therefore hang the boot
             // instead of faulting.
-            #[cfg(feature = "iommu-context-absent")]
-            if device.matches_class(NVME_CLASS, NVME_SUBCLASS, None) {
+            if crate::actuator::iommu_context_absent()
+                && device.matches_class(NVME_CLASS, NVME_SUBCLASS, None)
+            {
                 log!("iommu: unit{index} leaves {stream} out of the root table (actuator)");
                 continue;
             }
@@ -460,8 +461,9 @@ fn enable(mut unit: Unit, devices: &[PciDevice], domains: &mut [Option<Table>; 2
             // entry at all, and would ignore every second-level table this
             // kernel writes. Only a device whose empty domain is walked can
             // fault on this.
-            #[cfg(feature = "iommu-empty-domain")]
-            if device.matches_class(NVME_CLASS, NVME_SUBCLASS, None) {
+            if crate::actuator::iommu_empty_domain()
+                && device.matches_class(NVME_CLASS, NVME_SUBCLASS, None)
+            {
                 let empty = tables.alloc();
                 log!("iommu: unit{index} gives {stream} a domain with no mappings (actuator)");
                 table::bind(&mut tables, root, stream, empty, width);
@@ -509,9 +511,7 @@ fn enable(mut unit: Unit, devices: &[PciDevice], domains: &mut [Option<Table>; 2
 /// bus/device/function because which slot QEMU puts a controller in is not
 /// this kernel's business — and because the harness reads the same answer out
 /// of `pci::enumerate`'s own lines, so neither side is told the other's.
-#[cfg(any(feature = "iommu-context-absent", feature = "iommu-empty-domain"))]
 const NVME_CLASS: u8 = 0x01;
-#[cfg(any(feature = "iommu-context-absent", feature = "iommu-empty-domain"))]
 const NVME_SUBCLASS: u8 = 0x08;
 
 /// Which slot of the per-width domain cache a unit's tables live in.

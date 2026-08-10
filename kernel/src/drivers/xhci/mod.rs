@@ -337,8 +337,13 @@ fn deadline() -> u64 {
 /// certify is the deadline and the refusal, which is exactly the code that has
 /// no other way to execute. Same reason `xhci-one-slot` and `i8042-fault`
 /// exist.
-const CONTROLLER_ANSWERS: bool = !cfg!(feature = "xhci-deaf-controller");
-const PORT_ANSWERS: bool = !cfg!(feature = "xhci-deaf-port");
+fn controller_answers() -> bool {
+    !crate::actuator::xhci_deaf_controller()
+}
+
+fn port_answers() -> bool {
+    !crate::actuator::xhci_deaf_port()
+}
 
 /// How long a mass-storage bulk transfer's completion is held back before the
 /// driver may see it.
@@ -366,7 +371,6 @@ const PORT_ANSWERS: bool = !cfg!(feature = "xhci-deaf-port");
 /// ms the T14 measured. It is deliberately *not* one stick's number: what the
 /// gate asserts is that the machine stays responsive while a device is slow,
 /// and any value large against a 2.902 ms audio period asks that question.
-#[cfg(feature = "usb-slow-device")]
 const SLOW_TRANSFER_NS: u64 = 2_000_000;
 
 /// The boot-time connect settle measures the same interval the per-port machine
@@ -395,7 +399,6 @@ use portmachine::DEBOUNCE_NS as PORT_DEBOUNCE_NS;
 /// one — and it closes its window on the boot scan rather than on this clock,
 /// because what it stages is an ordering and what this stages is a duration the
 /// settle has to keep looking through.
-#[cfg(any(feature = "xhci-slow-connect", feature = "xhci-slow-storage-connect"))]
 const SLOW_CONNECT_NS: u64 = 300_000_000;
 
 /// Report *one* root-hub port empty for the first [`SLOW_CONNECT_NS`], while
@@ -421,12 +424,10 @@ const SLOW_CONNECT_NS: u64 = 300_000_000;
 /// the runner that red `late_storage_connect` on CI run `31286199802`, where the
 /// scan bound the disk and the gate correctly reported that it was measuring an
 /// ordinary boot. The scan is an event, so it is the event that closes this.
-#[cfg(feature = "xhci-slow-storage-connect")]
 const SLOW_STORAGE_PORT: u8 = 0;
 
 /// Whether the boot port scan has run. Until it has, [`SLOW_STORAGE_PORT`]
 /// reads unpopulated.
-#[cfg(feature = "xhci-slow-storage-connect")]
 pub(super) static BOOT_SCAN_DONE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -653,10 +654,13 @@ const MIN_DEVICE_BLOCKS: usize = 8;
 /// controller hands back a slot the pool has no room for. Nothing else can
 /// stage it: QEMU's `nec-usb-xhci,slots=N` does not reach HCSPARAMS1 and its
 /// Enable Slot ignores MaxSlotsEn, and a real pool holds ~250 devices.
-#[cfg(feature = "xhci-one-slot")]
-const DEVICE_CEILING: usize = 1;
-#[cfg(not(feature = "xhci-one-slot"))]
-const DEVICE_CEILING: usize = usize::MAX;
+fn device_ceiling() -> usize {
+    if crate::actuator::xhci_one_slot() {
+        1
+    } else {
+        usize::MAX
+    }
+}
 
 /// Where each structure sits in the pool, derived from what the controller
 /// reported. Nothing here is a constant except the strides above.
@@ -704,7 +708,7 @@ impl Layout {
         let pool_size = crate::mm::align_2m(dev_base + MIN_DEVICE_BLOCKS * DEV_STRIDE);
         let dev_blocks = ((pool_size - dev_base) / DEV_STRIDE)
             .min(max_slots as usize)
-            .min(DEVICE_CEILING);
+            .min(device_ceiling());
 
         Self {
             scratch_array,
@@ -904,12 +908,10 @@ pub struct XhciController {
     /// on all five of its ports — and only a reset clears it, because a reset is
     /// the one thing that takes a real port out of Disabled (§4.19.1.1.3). Same
     /// reason `xhci-slow-connect` and `xhci-deaf-port` exist.
-    #[cfg(feature = "xhci-portsc-rw1c")]
     software_disabled: PortMask,
 
     /// The event ring slot a slow device's completion is being held in, and
     /// when it was first seen there. See [`SLOW_TRANSFER_NS`].
-    #[cfg(feature = "usb-slow-device")]
     held_event: Option<(u16, u64)>,
 }
 
@@ -926,26 +928,26 @@ impl XhciController {
 
     fn read_portsc_raw(&self, port_idx: u8) -> u32 {
         let raw = self.op_base.read_u32(OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE);
-        #[cfg(feature = "xhci-slow-connect")]
-        if crate::clock::nanos_since_boot() < SLOW_CONNECT_NS {
+        if crate::actuator::xhci_slow_connect() && crate::clock::nanos_since_boot() < SLOW_CONNECT_NS
+        {
             return raw & !(PORTSC_CCS | PORTSC_PED | PORTSC_SPEED);
         }
-        #[cfg(feature = "xhci-slow-storage-connect")]
-        if port_idx == SLOW_STORAGE_PORT
+        if crate::actuator::xhci_slow_storage_connect()
+            && port_idx == SLOW_STORAGE_PORT
             && !BOOT_SCAN_DONE.load(core::sync::atomic::Ordering::Relaxed)
         {
             return raw & !(PORTSC_CCS | PORTSC_PED | PORTSC_SPEED);
         }
-        #[cfg(feature = "xhci-portsc-rw1c")]
-        if port_bit(&self.software_disabled, port_idx) {
+        if crate::actuator::xhci_portsc_rw1c() && port_bit(&self.software_disabled, port_idx) {
             return raw & !PORTSC_PED;
         }
         // A port that never finishes a reset does not read Enabled either — and
         // on QEMU a SuperSpeed port reads Enabled the instant the register is
         // touched. Without this the deaf port is one the driver correctly
         // declines to reset, so the actuator stages nothing at all.
-        #[cfg(feature = "xhci-deaf-port")]
-        let raw = raw & !PORTSC_PED;
+        if crate::actuator::xhci_deaf_port() {
+            return raw & !PORTSC_PED;
+        }
         raw
     }
 
@@ -957,8 +959,7 @@ impl XhciController {
     /// unreachable rather than asserted against.
     fn write_portsc(&mut self, port_idx: u8, write: toyos_xhci::portsc::Write) {
         let value = write.raw();
-        #[cfg(feature = "xhci-portsc-rw1c")]
-        {
+        if crate::actuator::xhci_portsc_rw1c() {
             let word = port_idx as usize / 64;
             let bit = 1u64 << (port_idx % 64);
             if value & PORTSC_PED != 0 {
@@ -975,7 +976,6 @@ impl XhciController {
     /// PED=1. Zero on a driver that neutralises PORTSC before writing it, and
     /// the reason the gate can tell "the emulation is compiled in and saw
     /// nothing" from "the emulation is not compiled in".
-    #[cfg(feature = "xhci-portsc-rw1c")]
     fn software_disabled_ports(&self) -> u32 {
         self.software_disabled.iter().map(|w| w.count_ones()).sum()
     }
@@ -1043,8 +1043,7 @@ impl XhciController {
         if ((event.control & 1) != 0) != self.event_phase {
             return None;
         }
-        #[cfg(feature = "usb-slow-device")]
-        if !self.slow_device_would_have_answered(&event) {
+        if crate::actuator::usb_slow_device() && !self.slow_device_would_have_answered(&event) {
             return None;
         }
         self.advance_event_ring();
@@ -1060,7 +1059,6 @@ impl XhciController {
     /// event: the head does not advance while an event is held, so a second
     /// look finds the same slot and the same first-seen time, and the entry is
     /// replaced rather than accumulated when the head moves on.
-    #[cfg(feature = "usb-slow-device")]
     fn slow_device_would_have_answered(&mut self, event: &Trb) -> bool {
         let slot = ((event.control >> 24) & 0xFF) as u8;
         let dci = ((event.control >> 16) & 0x1F) as u8;
@@ -1140,7 +1138,7 @@ impl XhciController {
         let Some(at) = self.devices.iter().position(|d| d.slot_id == slot) else {
             return;
         };
-        #[cfg(any(feature = "xhci-hid-break-first", feature = "xhci-hid-break-late"))]
+        #[cfg(feature = "boot-actuators")]
         let code = self.devices[at].stage_break(code);
         let dev = &mut self.devices[at];
         if code == CC_SUCCESS || code == CC_SHORT_PACKET {
@@ -1904,7 +1902,7 @@ pub fn storage_online(index: usize) -> Option<bool> {
 /// Under-deliver the next READ(10) on the disk the gate is driving. Armed by
 /// `usb_gate`, so which transfer it lands on is a known one — see
 /// [`msc::short_read`].
-#[cfg(feature = "usb-short-read")]
+#[cfg(feature = "boot-actuators")]
 pub fn arm_short_read() {
     msc::short_read::arm();
 }

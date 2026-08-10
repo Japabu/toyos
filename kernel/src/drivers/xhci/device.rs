@@ -305,7 +305,7 @@ pub fn reset_port(ctrl: &mut XhciController, port_idx: u8, kind: Reset) {
 
 /// Whether the port has finished the reset it was asked for.
 pub fn reset_done(ctrl: &XhciController, port_idx: u8) -> bool {
-    super::PORT_ANSWERS && ctrl.read_portsc(port_idx).reset_changed()
+    super::port_answers() && ctrl.read_portsc(port_idx).reset_changed()
 }
 
 /// One device's enumeration, as everything the acts still owed will need.
@@ -836,7 +836,6 @@ fn bind_hid(
         prev_report: [0; 8],
         broke_with: None,
         failures: 0,
-        #[cfg(any(feature = "xhci-hid-break-first", feature = "xhci-hid-break-late"))]
         completions: 0,
     };
 
@@ -904,7 +903,7 @@ pub(super) fn cancel_on(ctrl: &mut XhciController, port_idx: u8) {
 /// two that matter are the endpoint addresses naming endpoint 0: they are
 /// non-zero bytes, which is all the acceptance tests used to be, and they
 /// resolve to the slot context and to EP0's.
-#[cfg(feature = "xhci-descriptor-selftest")]
+#[cfg(feature = "boot-actuators")]
 pub fn selftest() {
     /// (kind, config value, first DCI, second DCI); kind 1 is HID, 2 is mass
     /// storage. A tuple rather than the enum, because what is under test is the

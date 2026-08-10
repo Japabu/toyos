@@ -67,7 +67,6 @@ pub struct HidDevice {
     pub failures: u8,
     /// Completions this endpoint has produced, which nothing but the injection
     /// below counts.
-    #[cfg(any(feature = "xhci-hid-break-first", feature = "xhci-hid-break-late"))]
     pub completions: u32,
 }
 
@@ -178,18 +177,26 @@ impl HidDevice {
 /// leaves what a failed transfer leaves — nothing delivered — so the motion the
 /// gate measures can only have crossed an endpoint that was restarted. Same
 /// reason `usb-transport-break` skips a wait rather than forging a CSW.
-#[cfg(any(feature = "xhci-hid-break-first", feature = "xhci-hid-break-late"))]
+#[cfg(feature = "boot-actuators")]
 impl HidDevice {
     /// Which completion is taken. The first is the shape the T14 showed — a
     /// freshly configured endpoint whose very first transfer fails, before the
     /// device has ever delivered — and the fourth is the mid-stream shape,
     /// where a device that has been working stops. They are different states
     /// of the driver and neither is a weaker version of the other.
-    const BREAK_AT: u32 = if cfg!(feature = "xhci-hid-break-first") { 1 } else { 4 };
+    fn break_at() -> Option<u32> {
+        if crate::actuator::xhci_hid_break_first() {
+            Some(1)
+        } else if crate::actuator::xhci_hid_break_late() {
+            Some(4)
+        } else {
+            None
+        }
+    }
 
     pub fn stage_break(&mut self, code: u32) -> u32 {
         self.completions += 1;
-        if self.completions != Self::BREAK_AT {
+        if Self::break_at() != Some(self.completions) {
             return code;
         }
         unsafe { core::ptr::write_bytes(self.report_ptr, 0, self.report_size as usize); }
