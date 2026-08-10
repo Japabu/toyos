@@ -652,9 +652,9 @@ fn rotation(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURE: &[&str] = &["log-rotate-fast"];
+    const PARAMS: &[&str] = &["log-rotate-fast"];
     let image_path = test_dir().join("kernel-log-rotate.img");
-    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURE);
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, PARAMS);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
     let (start, len) = log_extent(&image, &image_path)?;
 
@@ -665,7 +665,7 @@ fn rotation(
         BootOptions {
             profile: qemu::Profile::Metal,
             boot_image: Some(image_path.clone()),
-            kernel_features: FEATURE,
+            kernel_params: PARAMS,
             ..Default::default()
         },
     );
@@ -770,9 +770,9 @@ pub fn late_storage_connect(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURE: &[&str] = &["xhci-slow-storage-connect"];
+    const PARAMS: &[&str] = &["xhci-slow-storage-connect"];
     let image_path = test_dir().join("late-connect-boot.img");
-    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURE);
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, PARAMS);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
     let (start, len) = log_extent(&image, &image_path)?;
     let guid = esp_guid(&image, &image_path)?;
@@ -788,7 +788,7 @@ pub fn late_storage_connect(
             // `EMPTY_BUS_NS` and never reach this interleaving.
             profile: qemu::Profile::MetalUsb,
             boot_image: Some(image_path.clone()),
-            kernel_features: FEATURE,
+            kernel_params: PARAMS,
             ..Default::default()
         },
     );
@@ -910,7 +910,7 @@ pub fn log_backing_read_error(
     // shipped ceiling the log's few pages stay resident for the whole boot and
     // the re-read the injection targets never happens. The eviction code is the
     // shipped code; only the bound moves.
-    const FEATURES: &[&str] = &["fat-backing-read-fails"];
+    const PARAMS: &[&str] = &["fat-backing-read-fails"];
     const SERVING_ZEROS: &str = "failed; serving zeros";
     /// Mirrored in `tests/toyos-rust-tests/src/bin/log_volume_reread.rs`.
     const STAGED: &str = "staged-reread.txt";
@@ -921,7 +921,7 @@ pub fn log_backing_read_error(
                                  started, and not to be changed by it\n";
 
     let image_path = test_dir().join("fat-backing-read-fails.img");
-    let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURES);
+    let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, PARAMS);
     // Written before the extent is asked for: `log_extent` parses the GPT off
     // the file, not the buffer.
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
@@ -943,7 +943,7 @@ pub fn log_backing_read_error(
         BootOptions {
             profile: qemu::Profile::Metal,
             boot_image: Some(image_path.clone()),
-            kernel_features: FEATURES,
+            kernel_params: PARAMS,
             ..Default::default()
         },
     );
@@ -1065,12 +1065,12 @@ pub fn boot_volume_metadata_error(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["fat-boot-reads-fail"];
+    const PARAMS: &[&str] = &["fat-boot-reads-fail"];
     /// What the injection prints from under `Fat32`, once per refused read.
     const REFUSED: &str = "boot-volume: read of";
 
     let image_path = test_dir().join("fat-boot-reads-fail.img");
-    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURES);
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, PARAMS);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
 
     let mut qemu = QemuInstance::boot_with_options(
@@ -1080,7 +1080,7 @@ pub fn boot_volume_metadata_error(
         BootOptions {
             profile: qemu::Profile::Metal,
             boot_image: Some(image_path.clone()),
-            kernel_features: FEATURES,
+            kernel_params: PARAMS,
             ..Default::default()
         },
     );

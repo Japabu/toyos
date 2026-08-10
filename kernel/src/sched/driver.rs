@@ -583,7 +583,7 @@ fn execute(action: Action<KernelPayload>) {
 fn drain_irqs() {
     // First in the function, so the stamp means "this CPU reached a pass" and
     // not "this CPU got all the way through one".
-    #[cfg(feature = "heartbeat")]
+    #[cfg(feature = "boot-actuators")]
     crate::heartbeat::note_pass();
     // xHCI (keyboard/mouse): the controller poll dispatches HID reports, which
     // wake the keyboard/mouse queues from inside the driver.
@@ -673,11 +673,13 @@ extern "C" fn idle_loop() -> ! {
     loop {
         // The idle loop and not a pass: the state it stages is a CPU that never
         // reaches one.
-        #[cfg(feature = "dump-deaf-cpu")]
-        super::dump::deaf_window();
+        #[cfg(feature = "boot-actuators")]
+        if crate::actuator::dump_deaf_cpu() {
+            super::dump::deaf_window();
+        }
         // Here and not from a syscall: the panic handler recovers rather than
         // paints when a userland thread is current, and this context has none.
-        #[cfg(feature = "metal-panic-probe")]
+        #[cfg(feature = "boot-actuators")]
         if crate::drivers::panic_console::probe_due() {
             panic!("metal-panic-probe: a fatal report over a desktop that owns the screen");
         }
@@ -691,7 +693,7 @@ extern "C" fn idle_loop() -> ! {
         drain_serial();
         // Immediately before the sink's poll, so the line it appends is flushed
         // by the very next statement rather than waiting a trip round the loop.
-        #[cfg(feature = "heartbeat")]
+        #[cfg(feature = "boot-actuators")]
         crate::heartbeat::poll();
         // After the serial drain and before the pass, for the same reason that
         // one is here: both are I/O off the critical path, and this is the one

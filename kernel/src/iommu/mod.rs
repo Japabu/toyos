@@ -28,7 +28,7 @@
 
 pub mod vtd;
 
-#[cfg(feature = "hda-probe")]
+#[cfg(feature = "boot-actuators")]
 use alloc::vec::Vec;
 
 /// The address width a device's translations cover.
@@ -146,7 +146,7 @@ pub fn init(rsdp_addr: u64, devices: &[crate::drivers::pci::PciDevice]) {
 /// `specs/hda-driver-plan.md` H0's handoff half, and the only reader: I2 keeps
 /// no inventory of units, so this re-reads firmware's table rather than making
 /// it keep one for a diagnostic. Deleted with H0's probe.
-#[cfg(feature = "hda-probe")]
+#[cfg(feature = "boot-actuators")]
 pub struct DeviceFacts {
     /// The unit whose scope claims this device, and how it claims it.
     pub unit: Option<UnitFacts>,
@@ -156,7 +156,7 @@ pub struct DeviceFacts {
     pub reserved: Vec<ReservedRegion>,
 }
 
-#[cfg(feature = "hda-probe")]
+#[cfg(feature = "boot-actuators")]
 pub struct UnitFacts {
     /// Numbered as the boot's own `iommu: unitN` lines number it.
     pub index: usize,
@@ -169,14 +169,14 @@ pub struct UnitFacts {
     pub snoop_control: bool,
 }
 
-#[cfg(feature = "hda-probe")]
+#[cfg(feature = "boot-actuators")]
 pub struct ReservedRegion {
     pub base: u64,
     /// Inclusive, as firmware states it.
     pub limit: u64,
 }
 
-#[cfg(feature = "hda-probe")]
+#[cfg(feature = "boot-actuators")]
 pub fn describe_device(rsdp_addr: u64, bus: u8, dev: u8, func: u8) -> DeviceFacts {
     vtd::describe_device(rsdp_addr, StreamId::pci(bus, dev, func))
 }

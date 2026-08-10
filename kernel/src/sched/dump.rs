@@ -299,7 +299,7 @@ fn probe_silent(asked: &[bool; MAX_CPUS], cpus: usize) {
 /// [`ANSWER_BUDGET_NS`] so the CPU is named silent, and short enough that it
 /// rejoins and the guest shuts down cleanly — which is itself part of the
 /// assertion, since a CPU the NMI merely interrupted must come back.
-#[cfg(feature = "dump-deaf-cpu")]
+#[cfg(feature = "boot-actuators")]
 pub(super) fn deaf_window() {
     /// Late enough that the machine is up and every CPU has joined.
     const ARM_AT_NS: u64 = 3_000_000_000;

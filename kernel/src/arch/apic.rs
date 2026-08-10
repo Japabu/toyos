@@ -338,7 +338,7 @@ pub fn arm_one_shot(nanos: u64) {
 ///
 /// Traces nothing, unlike [`arm_one_shot`]: no scheduler deadline is being set
 /// here, and a `TimerArm` record would make the trace say one was.
-#[cfg(feature = "diag-tick")]
+#[cfg(feature = "boot-actuators")]
 pub fn arm_within(nanos: u64) {
     let want = OneShot::after(nanos);
     // A running count never reaches zero without the fire that reloads it, so

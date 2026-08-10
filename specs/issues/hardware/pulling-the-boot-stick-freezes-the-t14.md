@@ -484,7 +484,7 @@ the field means what it says from `diag-tick` on.
 
 **Already answered: the probe painted.** Kept as the record of what it settled.
 No further reflash for that question.
-`cargo run -- --console-boot --kernel-feature metal-panic-probe --build-only`
+`cargo run -- --console-boot --kernel-param metal-panic-probe --build-only`
 (or `--diag-boot`, or the ordinary image — the probe is orthogonal to the boot
 mode). Flash it, boot to the desktop, and wait. Five seconds after a process
 claims the framebuffer the kernel raises a real fatal panic from an idle CPU —
@@ -507,7 +507,7 @@ measures ~460 ms there.
 
 #### CLOSED — the heartbeat's first build was blind on an idle machine, and the eight boots that proved it
 
-Eight `--console-boot --kernel-feature heartbeat --kernel-feature
+Eight `--console-boot --kernel-param heartbeat --kernel-param
 metal-panic-probe` boots, logs at `2026-08-07-15{3347,3603,3819,3854,4108,4203,
 4259,4532}.log`. Every one has the same shape:
 
@@ -571,7 +571,7 @@ mask that **varies**, so it was satisfied by the defect and certified it.
 #### What the owner should run next — the ninth boot
 
 ```
-cargo run -- --kernel-feature heartbeat --build-only
+cargo run -- --kernel-param heartbeat --build-only
 ```
 
 The **ordinary** image and not `--console-boot`: the desktop is what freezes and

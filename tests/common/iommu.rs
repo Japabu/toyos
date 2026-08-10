@@ -313,7 +313,7 @@ fn fault_boot(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
-    features: &'static [&'static str],
+    params: &'static [&'static str],
 ) -> Result<(Serial, Blocked), String> {
     let mut qemu = QemuInstance::boot_with_options(
         test_config,
@@ -321,7 +321,7 @@ fn fault_boot(
         rust_bins,
         BootOptions {
             profile: Profile::Metal,
-            kernel_features: features,
+            kernel_params: params,
             ready_marker: FAULT,
             ..Default::default()
         },
