@@ -66,10 +66,17 @@ jobs:
           # only about the name the run is filed under.
           sha="${{ github.event.pull_request.head.sha || github.sha }}"
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          # **The asset and not the tag.** What every job below installs is
+          # `toyos-toolchain.tar.zst`, and the release that carries it is
+          # created first and uploaded to afterwards — 401 MiB of it. Publishing
+          # is idempotent by design (§3), so two branches with the same four
+          # trees both build and there is a window where the tag answers 200 and
+          # the artifact is not there. A gate that reads the tag releases
+          # thirteen shards into that window and each of them reds on a missing
+          # asset: a red whose name is the shard and whose cause is this job.
           published() {
-            curl -sSL -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer $GH_TOKEN" "$api/releases/tags/$tag" \
-              | grep -q '^200$'
+            curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api/releases/tags/$tag" \
+              | jq -e '.assets[]? | select(.name=="toyos-toolchain.tar.zst")' >/dev/null
           }
           for _ in $(seq 240); do
             if published; then
@@ -82,10 +89,11 @@ jobs:
               | jq -r '.workflow_runs[0] // empty | "\(.status) \(.conclusion) \(.html_url)"')
             case "$verdict" in
               completed\ success*)
-                # Published between the two calls, or the workflow answered
+                # Uploaded between the two calls, or the workflow answered
                 # green without leaving the artifact everything below installs.
                 published && continue
-                echo "::error::the toolchain workflow was green and $tag is not there."
+                echo "::error::the toolchain workflow was green and $tag carries no"
+                echo "::error::toyos-toolchain.tar.zst, so there is nothing to install."
                 echo "::error::$verdict"
                 exit 1
                 ;;
@@ -175,14 +183,25 @@ jobs:
             echo "::error::the tree — re-run the job."
             exit 1
           fi
-          qemu-system-x86_64 --version | head -1
-          ls -l /dev/kvm
-          # The vendor is a variable and not a detail — an AMD host is the only
-          # one that can reproduce `specs/ci-plan.md` §7's class.
-          grep -m1 'model name' /proc/cpuinfo
-          nproc
 
       - uses: actions/checkout@v4
+
+      # The QEMU version, the host CPU vendor and whether `/dev/kvm` is there —
+      # the three variables a verdict from this job has to be read against, and
+      # the first of them is now a declaration this checks rather than a line in
+      # a log nobody reads. `.github/instrument.sh` says why each is here.
+      - name: the instrument
+        env:
+          MATRIX_LABEL: shard ${{ matrix.shard }}/12
+        run: .github/instrument.sh
+
+      - id: key
+        name: the toolchain this tree needs
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
+            >> "$GITHUB_OUTPUT"
 
       - name: rust
         run: |
@@ -198,27 +217,48 @@ jobs:
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config --global --add safe.directory "$PWD"
-          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
-                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          echo "toolchain: $tag"
-          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          for _ in $(seq 10); do
-            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
-              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
-            [ -n "$asset" ] && break
-            echo "the release $tag did not answer; retrying"
-            sleep 15
-          done
-          test -n "$asset"
-          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
-          mkdir -p rust/build
-          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
-          stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
-          rustup toolchain link toyos "$stage2"
-          "$stage2/bin/rustc" -vV
+          TAG: ${{ steps.key.outputs.tag }}
+        run: .github/install-toolchain.sh
+
+      # **The build below is the same build on thirteen machines, and it was
+      # 435 s of the widest shard's 1,058 s.** Measured cold against warm in one
+      # run on one image, `probe-cache.yml` run `31385467644`: 519 s against
+      # **282 s**, 177 crate compiles against 10, a 786 MB entry and a 7 s
+      # restore. What the cache eliminates is every third-party crate; what it
+      # cannot is our own, because `actions/checkout` writes every source with
+      # the current time and cargo's fingerprint for a path crate is an mtime
+      # comparison. **That is the direction of error worth stating: a fresh
+      # checkout makes cargo rebuild more than it needs to, never less.**
+      #
+      # **The key is the toolchain tag first and the lockfiles second.** The one
+      # thing cargo cannot see is the sysroot — `toyos-abi`, `toyos` and
+      # `userland/libc` are compiled into it, and its `rustc -vV` does not change
+      # when they do — so the tag is in the *prefix* and `restore-keys` cannot
+      # fall back across a sysroot change. `src/build.rs`'s `external_fingerprint`
+      # is the belt to that brace and it fires either way: 8 `external deps
+      # changed: cleaning` lines in both arms of the probe.
+      #
+      # **`tcg` writes it and the twelve shards only read it.** Twelve concurrent
+      # uploads of the same content race for one key, and none of them would
+      # benefit from a sibling anyway — the twelve start together, so the win is
+      # across runs. A cache written on `main` is the only one every branch can
+      # restore (§8.4), and a branch's own second push restores its first.
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            kernel/target
+            bootloader/target
+            userland/target
+            toyos-ld/target
+            toyos-cc/target
+            tests/target
+            tests/toyos-rust-tests/*/target
+          key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: guest-${{ steps.key.outputs.tag }}-
 
       # `--host-slots 0`: the semaphore arbitrates between worktrees on one
       # host, and a shard is a host with one suite on it.
@@ -381,11 +421,21 @@ jobs:
             echo "::error::the tree — re-run the job."
             exit 1
           fi
-          qemu-system-x86_64 --version | head -1
-          ls -l /dev/kvm || echo "no /dev/kvm node: this is the emulated arm"
-          grep -m1 'model name' /proc/cpuinfo
 
       - uses: actions/checkout@v4
+
+      # The same three readings the shards take, and the one that differs is
+      # the point of this job: no `/dev/kvm` in the container at all.
+      - name: the instrument
+        run: .github/instrument.sh
+
+      - id: key
+        name: the toolchain this tree needs
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
+            >> "$GITHUB_OUTPUT"
 
       - name: rust
         run: |
@@ -396,27 +446,53 @@ jobs:
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config --global --add safe.directory "$PWD"
-          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
-                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          for _ in $(seq 10); do
-            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
-              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
-            [ -n "$asset" ] && break
-            echo "the release $tag did not answer; retrying"
-            sleep 15
-          done
-          test -n "$asset"
-          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
-          mkdir -p rust/build
-          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
-          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+          TAG: ${{ steps.key.outputs.tag }}
+        run: .github/install-toolchain.sh
+
+      # **This job is the one that writes what the twelve shards read**, and the
+      # `guest` job's own restore step carries the argument for all of it. It is
+      # the right writer because it is one job rather than twelve racing for a
+      # key, it builds exactly the shared set the shards pay for before their
+      # first boot, and it runs on every run — the guard above means it reds
+      # rather than skipping.
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            kernel/target
+            bootloader/target
+            userland/target
+            toyos-ld/target
+            toyos-cc/target
+            tests/target
+            tests/toyos-rust-tests/*/target
+          key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: guest-${{ steps.key.outputs.tag }}-
 
       - name: one test, emulated
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
+
+      # After the test and not before it: what is worth keeping is a tree that
+      # built *and booted*. `actions/cache/save` warns rather than fails when the
+      # key is already there, which is what a re-run of this run does.
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            kernel/target
+            bootloader/target
+            userland/target
+            toyos-ld/target
+            toyos-cc/target
+            tests/target
+            tests/toyos-rust-tests/*/target
+          key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
 
   # **One name for twelve shards, because a required status check is matched by
   # job name and a matrix produces twelve of them.** Twelve entries in a
@@ -476,6 +552,15 @@ jobs:
       # `31376796572` is the instance: `toolchain-ready` was green, the twelve
       # shards were cancelled by the next push, and this job failed on
       # `no test-durations.shard-*`.
+      # **A run whose shards did not all finish is not a partition of anything,
+      # and `--merge-durations` refuses one.** Right for the human typing it —
+      # it writes the committed profile, and eleven files of twelve write one
+      # missing a twelfth of the suite, which every later run then prices at the
+      # longest it knows. Wrong here, where this job is advisory and a shard
+      # cancelled at its timeout has already reddened `guest`. So the count is
+      # checked before the command is run, and a short set is reported rather
+      # than merged. The refusal that stays a refusal is the other one: a name
+      # two shards both measured, which is §4's defect.
       - name: what the partition cost
         run: |
           set -o pipefail
@@ -483,6 +568,15 @@ jobs:
             echo "no shard left a measurement: ${{ needs.guest.result }}"
             echo "- no shard measured anything (\`guest\`: ${{ needs.guest.result }})" \
               >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          have=$(ls /tmp/durations/*/test-durations.shard-* | wc -l | tr -d ' ')
+          want=$(ls /tmp/durations/*/test-durations.shard-* | sed 's/.*-of-//' | sort -u)
+          if [ "$(echo "$want" | wc -l | tr -d ' ')" != 1 ] || [ "$have" != "$want" ]; then
+            echo "$have shard file(s) of a $want-way run"
+            echo "- $have of $want shards left a measurement (\`guest\`: \
+              ${{ needs.guest.result }}), so this run measured no whole partition and \
+              \`tests/test-durations\` was not touched." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           cargo run -- --merge-durations /tmp/durations 2>&1 | tee /tmp/merged.log
@@ -521,4 +615,13 @@ jobs:
             echo "::error::the toolchain for this tree did not build, so no shard ran."
             exit 1
           fi
-          test "${{ needs.guest.result }}" = success
+          # This name is what a reader of the merge button sees, and
+          # `needs.guest.result` is an aggregate — the shard, the test and its
+          # `ALONE:` verdict are all in the run summary, which is the one place
+          # all twelve write.
+          if [ "${{ needs.guest.result }}" != success ]; then
+            echo "::error::a guest shard reported ${{ needs.guest.result }}. The run summary"
+            echo "::error::names the shard, the test and whether it survived being re-run"
+            echo "::error::alone; specs/ci-plan.md §9.2 is the rate to read that against."
+            exit 1
+          fi

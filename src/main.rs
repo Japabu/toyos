@@ -56,7 +56,7 @@ fn executable_on_path(name: &str) -> bool {
     })
 }
 
-fn check_prerequisites() {
+fn check_prerequisites(root: &Path) {
     fn absent(tools: &'static [Tool]) -> Vec<&'static Tool> {
         tools.iter().filter(|t| !t.any.iter().any(|n| executable_on_path(n))).collect()
     }
@@ -72,6 +72,13 @@ fn check_prerequisites() {
             eprintln!("  - {} ({})", tool.any.join(" or "), tool.why);
         }
         std::process::exit(1);
+    }
+
+    // The one prerequisite whose *version* decides verdicts rather than whether
+    // anything runs at all, so a scan of `PATH` cannot ask it.
+    // `toyos_build::ci` carries why this is a note here and a red in CI.
+    if let Some(note) = toyos_build::ci::qemu_version_note(root) {
+        eprintln!("{note}");
     }
 }
 
@@ -107,7 +114,7 @@ fn main() {
         return;
     }
 
-    check_prerequisites();
+    check_prerequisites(&root);
     env::set_current_dir(&root).expect("Failed to cd to project root");
 
     let debug = args.iter().any(|a| a == "--debug");
