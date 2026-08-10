@@ -137,7 +137,7 @@ const _: () = {
 #[derive(Clone, Copy)]
 pub struct VirtioSoundInfo {
     /// The shared region, mapped writable, laid out by the constants above.
-    pub dma_token: u32,
+    pub dma: crate::RawHandle,
     /// Byte offsets into the notification region — the offset space
     /// [`device_reg_write`] names for this device, and the only one it has.
     ///

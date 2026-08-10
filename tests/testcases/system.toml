@@ -1,9 +1,22 @@
-init = ["/bin/soundd", "/bin/test-runner"]
 
-[programs]
-soundd = {}
-test-runner = {}
-toybox = {}
+[boot]
+start = ["soundd", "test-runner"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+syscap = ["rt"]
+
+# The test estate's authority (`specs/capability-endowment-spec.md` §6.7a).
+# `device` because five of the guest binaries claim the keyboard or the mouse
+# and no manifest row can name them — they are not `[programs]` keys — and `dup`
+# because a claim moves and one boot runs several of them.
+[programs.test-runner]
+receives = ["soundd"]
+syscap = ["device", "dup"]
+
+[programs.toybox]
+receives = ["soundd"]
 
 [symlinks]
 "bin/cat" = "/bin/toybox"

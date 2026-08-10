@@ -7,6 +7,9 @@
 
 use std::time::{Duration, Instant};
 use toyos::device::Mouse;
+use toyos::endow::Endowments;
+use toyos::syscap::SysCap;
+use toyos_abi::syscall::{DeviceType, SYSCAP_LABEL};
 
 const EVENT_SIZE: usize = 6;
 
@@ -19,7 +22,8 @@ const RIGHT: u8 = 0x02;
 const RUN_CEILING: Duration = Duration::from_secs(60);
 
 fn main() {
-    let mouse = Mouse::open().expect("i8042_mouse: no mouse device");
+    let mouse: Mouse =
+        capability().claim(DeviceType::Mouse).expect("i8042_mouse: no mouse device");
     println!("===I8042_MOUSE_READY===");
 
     let deadline = Instant::now() + RUN_CEILING;
@@ -52,4 +56,14 @@ fn main() {
         }
     }
     println!("mev done seen={seen}");
+}
+
+/// The device-minting capability the test estate is endowed
+/// (`specs/capability-endowment-spec.md` §6.7a). A claim is `/bin/init`'s to
+/// mint everywhere else; here test-runner passes a `DEVICE` duplicate down, so
+/// a boot can run several binaries that each need an input device.
+fn capability() -> SysCap {
+    Endowments::get()
+        .take(SYSCAP_LABEL)
+        .expect("the test estate is endowed a device-minting capability")
 }

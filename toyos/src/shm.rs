@@ -1,19 +1,20 @@
 //! Shared memory with RAII.
+//!
+//! A region is a **handle**, not a token. Holding one is the whole of being
+//! allowed to map it, so there is no grant and no list of pids to keep: giving
+//! a peer access is [`SharedMemory::share`] plus
+//! [`Connection::send_handles`](crate::ipc::Connection::send_handles), and a
+//! peer that never receives it can never name it.
+//!
+//! The mapping goes away with the last handle, so dropping this is all the
+//! cleanup there is.
 
-use toyos_abi::Pid;
 use toyos_abi::syscall::{self, SyscallError};
 
-/// A shared memory region with automatic cleanup.
-///
-/// When dropped, the region is unmapped and released.
-///
-/// **Nothing here is infallible, because none of the three syscalls under it
-/// is.** A token arrives over a wire and names a region the kernel will not
-/// let this process map; a grant names a process that has exited since it
-/// asked. A server holding an infallible signature over either dies of its
-/// client — which is what the compositor did, on `grant`, when doom aborted.
+use crate::{AsHandle, OwnedHandle, RawHandle};
+
 pub struct SharedMemory {
-    token: u32,
+    handle: OwnedHandle,
     ptr: *mut u8,
     size: usize,
 }
@@ -22,27 +23,34 @@ unsafe impl Send for SharedMemory {}
 unsafe impl Sync for SharedMemory {}
 
 impl SharedMemory {
-    pub fn allocate(size: usize) -> Result<Self, SyscallError> {
-        let token = syscall::alloc_shared(size)?;
-        Self::map(token, size).inspect_err(|_| syscall::release_shared(token))
-    }
-
-    pub fn map(token: u32, size: usize) -> Result<Self, SyscallError> {
-        let ptr = unsafe { syscall::try_map_shared(token) }?;
-        assert!(!ptr.is_null(), "map_shared returned null");
-        Ok(Self { token, ptr, size })
-    }
-
-    pub fn token(&self) -> u32 {
-        self.token
-    }
-
-    /// Let `pid` map this region.
+    /// A fresh region, rounded up to whole 2 MiB pages and mapped.
     ///
-    /// `InvalidArgument` names a process the table does not have: a peer that
-    /// exited between asking for the memory and being handed it.
-    pub fn grant(&self, pid: u32) -> Result<(), SyscallError> {
-        syscall::grant_shared(self.token, Pid(pid))
+    /// Fallible: a size the kernel cannot express is `InvalidArgument` and
+    /// memory it does not have is `ResourceExhausted`. A daemon reaches both
+    /// through a client's request, so neither may be an assertion here.
+    pub fn create(size: usize) -> Result<Self, SyscallError> {
+        Self::adopt(syscall::shm_create(size)?, size)
+    }
+
+    /// Map a region a peer sent, or one a device description named.
+    ///
+    /// `size` is the caller's own belief about the region and is not checked
+    /// against it — a peer that says 4 MiB and sends 2 is a peer, and every
+    /// reader of this memory is already writing bounds against the size it
+    /// negotiated.
+    pub fn adopt(handle: RawHandle, size: usize) -> Result<Self, SyscallError> {
+        let handle = OwnedHandle(handle);
+        let ptr = unsafe { syscall::shm_map(handle.fd()) }?;
+        assert!(!ptr.is_null(), "shm_map answered null");
+        Ok(Self { handle, ptr, size })
+    }
+
+    /// A second handle to the same region, for sending to a peer.
+    ///
+    /// The send *moves* what it is given, so a sender that wants to keep the
+    /// region duplicates first — which is the same rule spawn endowment has.
+    pub fn share(&self) -> Result<RawHandle, SyscallError> {
+        syscall::dup(self.handle.fd())
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
@@ -51,6 +59,10 @@ impl SharedMemory {
 
     pub fn len(&self) -> usize {
         self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -62,8 +74,8 @@ impl SharedMemory {
     }
 }
 
-impl Drop for SharedMemory {
-    fn drop(&mut self) {
-        syscall::release_shared(self.token);
+impl AsHandle for SharedMemory {
+    fn as_handle(&self) -> RawHandle {
+        self.handle.fd()
     }
 }

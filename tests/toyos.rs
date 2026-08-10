@@ -124,8 +124,8 @@ const SHARED_BLOCK: Sched = Sched::Parallel;
 /// of the three names below depended on that without saying so.
 ///
 /// A second boot rather than a second image: the block costs a fraction of a
-/// second of guest time between its members, and what these three need is a
-/// syscall number the other 150 must not have.
+/// second of guest time between its members, and what these need is a syscall
+/// number the other 150 must not have.
 const ACTUATOR_TESTS: &[&str] = &[
     // Actions 0, 1 and 2: a kernel `panic!`, a null read in kernel context, and
     // a spinlock held across a scheduler entry. Each kills the caller and the
@@ -139,6 +139,13 @@ const ACTUATOR_TESTS: &[&str] = &[
     // Actions 12 and 13: hold one CPU's shootdown acknowledgement back, so that
     // whether the initiator waits becomes a duration userland can read.
     "tlb_shootdown_waits",
+    // Actions 14 to 16, the live-object census, and 17 and 18 for the idle
+    // stack the deferred release path runs on. A leak is two readings and a
+    // comparison, so on a kernel that answers `InvalidArgument` both readings
+    // are the same error and the assertion passes having counted nothing.
+    "handle_basic",
+    "handle_kill_policy",
+    "handle_transfer",
 ];
 
 /// What [`ACTUATOR_TESTS`] boots: the one kernel that carries `SYS_DEBUG`, with
@@ -195,6 +202,10 @@ const RUST_SKIP: &[&str] = &[
     "netd_caps",
     // Same reason, same config: `netd_hostile_peer` runs it there.
     "netd_hostile_peer",
+    // Needs a `launcher` connector, which `tests/testcases`'s test-runner has
+    // no reason to hold. `launcher_refusals` runs it on tests/netcase, whose
+    // test-runner receives one for exactly this.
+    "launcher_refusals",
     // Needs a boot image the harness staged a file into before the machine
     // started, which only `esp_filesystem` builds.
     "esp_files",
@@ -393,6 +404,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // before that deadline could expire any of them. Both are wall-clock
     // margins, which is the definition of [`Sched::Serial`].
     ("netd_hostile_peer", Sched::Serial),
+    ("launcher_refusals", Sched::Parallel),
     ("foreign_disk_untouched", Sched::Parallel),
     ("boot_partition_identity", Sched::Parallel),
     ("double_fault_stack", Sched::Parallel),
@@ -4828,7 +4840,7 @@ fn locale_detect(qemu: &mut QemuInstance) -> Result<(), String> {
         // the surface acted on the config it wrote. Both are new: this ran on
         // a machine whose keyboard the gate binary claims, which is the state
         // that used to make the wizard refuse.
-        "surface: pid",
+        "surface: client",
         "surface: layout is now swiss-german",
     ] {
         if !result.stdout.contains(want) {
@@ -6489,15 +6501,21 @@ fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
     }
 
     // Non-vacuity, and the case that motivated the whole run: the compositor
-    // has to have met a request from a pid the kernel no longer knows, or
-    // nothing here exercised the grant that killed the desktop. The guest
-    // orders that by construction — reap, then release the process holding the
-    // socket — so a run without this line is a defect and never a lost race.
-    const VANISHED: &str = "the process behind it has exited";
+    // has to have met a request whose creator the kernel no longer knows. The
+    // guest orders that by construction — reap, then release the process
+    // holding the socket — so a run without this line is a defect and never a
+    // lost race.
+    //
+    // **The line is the compositor serving that request, where it used to be
+    // the compositor saying the process had exited.** The grant that killed the
+    // desktop named a pid; a buffer is a handle now and the connection is what
+    // it travels over, so a reaped creator costs its heir nothing and the
+    // refusal this once asserted on cannot happen.
+    const VANISHED: &str = "a reaped creator's connection still got a window";
     if !result.stdout.contains(VANISHED) {
         return Err(format!(
-            "the compositor never met a request from a reaped creator, so this run says \
-             nothing about the grant:\n{}",
+            "the compositor never served a request from a reaped creator, so this run says \
+             nothing about what replaced the grant:\n{}",
             result.stdout
         ));
     }
@@ -6521,8 +6539,8 @@ fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
     let console = format!("{}\n{after}", result.serial);
     serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
     eprintln!(
-        "  [metal-sim] {CASES} client deaths survived, a reaped creator's request refused by \
-         name, desktop still compositing"
+        "  [metal-sim] {CASES} client deaths survived, a reaped creator's request served \
+         anyway, desktop still compositing"
     );
     Ok(())
 }
@@ -9354,7 +9372,7 @@ fn run_machine_test(
             // share one window (`specs/issues/build/`), which here is what makes the
             // daemon's side of the story readable at all.
             console.push_str(&result.serial);
-            for named in ["netd: dropping pid", "netd: refusing pid"] {
+            for named in ["netd: dropping client", "netd: refusing client"] {
                 if !console.contains(named) {
                     return Err(format!(
                         "netd got rid of clients without a `{named}` line — a daemon that \
@@ -9364,6 +9382,66 @@ fn run_machine_test(
             }
             serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
             eprintln!("  [netcase] {refused} hostile frames refused, netd named every peer it dropped");
+            Ok(())
+        }
+        "launcher_refusals" => {
+            // **`/bin/init` is the one process the machine cannot lose**, and
+            // every launcher client — the compositor, every terminal, every
+            // shell, sshd — can send it whatever it likes. The guest carries
+            // the verdicts: init answered, init is still launching, and the
+            // kernel's live-object count did not grow across sixteen refused
+            // launches. The host carries the one the guest cannot see —
+            // whether init said anything about what it refused.
+            //
+            // `tests/netcase` because its test-runner is the only one that
+            // receives a `launcher` connector, and because two boot programs
+            // is the smallest blast radius for a test whose whole subject is
+            // making init misbehave.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/netcase");
+            let bins: Vec<(String, Vec<u8>)> = rust_bins
+                .iter()
+                .filter(|(name, _)| name == "launcher_refusals")
+                .cloned()
+                .collect();
+            if bins.is_empty() {
+                return Err("launcher_refusals was not built".to_string());
+            }
+            let mut qemu = QemuInstance::boot_with_options(
+                &config,
+                &[],
+                &bins,
+                BootOptions {
+                    profile: qemu::Profile::Headless,
+                    // The live-object count is a `SYS_DEBUG` action, and a
+                    // shipping kernel has none: both readings would be the same
+                    // `InvalidArgument` and the leak arm would pass having
+                    // counted nothing.
+                    kernel_features: ACTUATOR_KERNEL,
+                    ..Default::default()
+                },
+            );
+            let mut console = qemu.boot_log().to_string();
+            let _ = await_marker(&mut qemu, &mut console, "===READY===", "test-runner to come up");
+
+            let result = qemu.run_test("test_rs_launcher_refusals", Duration::from_secs(120));
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            if result.exit_code != Some(0) {
+                return Err(format!(
+                    "launcher_refusals exited {:?}:\n{}",
+                    result.exit_code, result.stdout
+                ));
+            }
+            console.push_str(&result.serial);
+            if !console.contains("init: launcher: cannot start") {
+                return Err(format!(
+                    "init refused a launch without a line saying so — a launcher that \
+                     drops requests silently cannot be asked what happened:\n{console}"
+                ));
+            }
+            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+            eprintln!("  [netcase] init refused three bad launches, named them, and kept launching");
             Ok(())
         }
         "metal_sim_input" => {
@@ -10989,7 +11067,14 @@ fn expected_failure_exit_status() -> Result<(), String> {
 /// that only read the test's own source would miss the one test in the list
 /// whose whole subject is the syscall.
 fn needs_actuators(sources: &[(String, String)], registry: &[&str]) -> BTreeSet<String> {
-    let calls = |text: &str| text.contains("SYS_DEBUG") || text.contains("syscall::debug(");
+    // The third spelling is the SDK's: `toyos::census` calls `debug_with` on the
+    // caller's behalf, so a binary whose leak assertion is a census names no
+    // syscall of its own and reads as innocent to the two above.
+    let calls = |text: &str| {
+        text.contains("SYS_DEBUG")
+            || text.contains("syscall::debug(")
+            || text.contains("census::Census")
+    };
     let direct: BTreeSet<&str> =
         sources.iter().filter(|(_, t)| calls(t)).map(|(n, _)| n.as_str()).collect();
     let mut out = BTreeSet::new();
@@ -11046,12 +11131,16 @@ fn suite_split() -> Result<(), String> {
         ("a_listed_one".to_string(), "syscall::debug(3)".to_string()),
         ("an_unlisted_one".to_string(), "SYS_DEBUG".to_string()),
         ("its_parent".to_string(), "Command::new(\"/bin/test_rs_an_unlisted_one\")".to_string()),
+        ("a_censor".to_string(), "use toyos::census::Census;".to_string()),
         ("innocent".to_string(), "println!()".to_string()),
     ];
-    let staged_registry = ["a_listed_one", "an_unlisted_one", "its_parent", "innocent"];
+    let staged_registry =
+        ["a_listed_one", "an_unlisted_one", "its_parent", "a_censor", "innocent"];
     let found = needs_actuators(&staged, &staged_registry);
-    let want: BTreeSet<String> =
-        ["a_listed_one", "an_unlisted_one", "its_parent"].iter().map(|s| s.to_string()).collect();
+    let want: BTreeSet<String> = ["a_listed_one", "an_unlisted_one", "its_parent", "a_censor"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     if found != want {
         return Err(format!("the check does not work: on staged input it named {found:?}"));
     }

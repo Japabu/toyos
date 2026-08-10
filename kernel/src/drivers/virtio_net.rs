@@ -8,7 +8,7 @@ use crate::mm::paging::CachePolicy;
 use crate::log;
 use crate::mm::KernelSlice;
 use crate::net::NicInfo;
-use crate::shared_memory;
+use crate::object::shm::Region;
 use crate::sync::Lock;
 use toyos_abi::syscall::SyscallError;
 
@@ -206,17 +206,22 @@ pub fn init(devices: &[PciDevice]) {
     let tx_ptr = dma.ptr_at(OFF_TX_BUF);
 
     let dma_base_phys = dma.phys() & !(crate::mm::PAGE_2M - 1);
-    let dma_token = shared_memory::register(crate::DirectMap::from_phys(dma_base_phys), crate::mm::PAGE_2M, CachePolicy::DeferToMtrr);
+    let dma_region = Region {
+        phys: crate::DirectMap::from_phys(dma_base_phys),
+        size: crate::mm::PAGE_2M,
+        cache: CachePolicy::DeferToMtrr,
+        pages: None,
+    };
 
     crate::net::set_nic_info(NicInfo {
-        dma_token: dma_token.raw(),
+        dma: toyos_abi::HANDLE_INVALID,
         rx_buf_offset: OFF_RX_BUFS as u32,
         tx_buf_offset: OFF_TX_BUF as u32,
         mac,
         rx_buf_count: RX_BUF_COUNT as u16,
         rx_buf_size: RX_BUF_SIZE as u16,
         net_hdr_size: NET_HDR_SIZE as u16,
-    });
+    }, dma_region);
 
     let mut rx_slots = rxq.initial_slots();
     let mut tx_slots = txq.initial_slots();

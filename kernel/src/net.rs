@@ -37,7 +37,7 @@ pub trait Nic: Send {
 }
 
 static NIC: Lock<Option<Box<dyn Nic>>> = Lock::new(None);
-static NIC_INFO: Lock<Option<NicInfo>> = Lock::new(None);
+static NIC_INFO: Lock<Option<(NicInfo, crate::object::shm::Region)>> = Lock::new(None);
 static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
 
 pub fn add_io_uring_watcher(id: RingId) {
@@ -62,12 +62,12 @@ pub fn register(nic: Box<dyn Nic>) {
     *NIC.lock() = Some(nic);
 }
 
-pub fn set_nic_info(info: NicInfo) {
-    *NIC_INFO.lock() = Some(info);
+pub fn set_nic_info(info: NicInfo, dma: crate::object::shm::Region) {
+    *NIC_INFO.lock() = Some((info, dma));
 }
 
-pub fn nic_info() -> Option<NicInfo> {
-    *NIC_INFO.lock()
+pub fn nic_info() -> Option<(NicInfo, crate::object::shm::Region)> {
+    NIC_INFO.lock().clone()
 }
 
 pub fn has_packet() -> bool {

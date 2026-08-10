@@ -55,14 +55,14 @@ mod irq_ring;
 mod trace;
 mod clock;
 mod rtc;
-mod fd;
+
+mod object;
 mod io_uring;
 mod pipe;
-mod listener;
+
 mod device;
 mod net;
 mod gpu;
-mod shared_memory;
 mod user_ptr;
 mod vma;
 
@@ -90,7 +90,6 @@ mod late_panic {
 
 use crate::mm::paging::CachePolicy;
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use arch::{apic, cpu, idt, pat, percpu, smp, syscall};
 use drivers::{acpi, gop, i8042, ioapic, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
@@ -268,16 +267,21 @@ pub unsafe extern "sysv64" fn _start(_kernel_args: &KernelArgs) -> ! {
 }
 
 fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
-    let fb_info = fd::FramebufferInfo {
-        token: [info.tokens[0].raw(), info.tokens[1].raw()],
-        cursor_token: info.cursor_token.raw(),
-        width: info.width,
-        height: info.height,
-        stride: info.stride,
-        pixel_format: info.pixel_format,
-        flags: info.flags,
-    };
-    crate::device::set_framebuffer_info(fb_info);
+    crate::device::set_framebuffer_info(crate::device::Screen {
+        // A description carries handles into whichever process reads it, and
+        // that process does not exist yet: `try_claim` mints them.
+        info: toyos_abi::FramebufferInfo {
+            scanout: [toyos_abi::HANDLE_INVALID; 2],
+            cursor: toyos_abi::HANDLE_INVALID,
+            width: info.width,
+            height: info.height,
+            stride: info.stride,
+            pixel_format: info.pixel_format,
+            flags: info.flags,
+        },
+        scanout: info.scanout.clone(),
+        cursor: info.cursor.clone(),
+    });
     gpu::register(driver, info);
 }
 
@@ -383,11 +387,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         DirectMap::from_phys(kernel_args.kernel_elf_addr).as_ptr::<u8>(),
         kernel_args.kernel_elf_size as usize,
     );
-    let init_bytes = core::slice::from_raw_parts(
-        DirectMap::from_phys(kernel_args.init_program_addr).as_ptr::<u8>(),
-        kernel_args.init_program_len as usize,
-    );
-    let init_programs = core::str::from_utf8(init_bytes).expect("init_programs: invalid UTF-8");
     let kernel_args = &kernel_args;
 
     // Phase 1: Memory
@@ -399,11 +398,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         mm::Region { start: 0x8000, end: 0x9000 }, // AP trampoline page
     ];
 
-    // Copy init_programs into heap before mm::init reclaims bootloader memory.
     mm::init(maps, &reserved);
     drivers::panic_console::remap();
-    let init_programs = alloc::string::String::from(init_programs);
-    let init_programs: &str = &init_programs;
 
     // Phase 2: CPU — exceptions, LAPIC, clock
     // Get exception handlers up ASAP so bugs in later phases produce diagnostics
@@ -520,8 +516,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     scheduler::init();
     pipe::init();
     io_uring::init();
-    listener::init();
-    shared_memory::init();
+
 
     // Mount initrd as read-only root filesystem (bcachefs, no extraction)
     assert!(!initrd.is_empty(), "No initrd provided");
@@ -621,14 +616,13 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         input_merge_test::run();
     }
 
-    // Phase 7: Userland
-    assert!(!init_programs.is_empty(), "bootloader must provide init_programs");
-    for entry in init_programs.split(';') {
-        let args: Vec<&str> = entry.split_whitespace().collect();
-        assert!(!args.is_empty(), "empty entry in init_programs");
-        let pid = process::spawn_kernel(&args);
-        log!("spawned {} pid={pid}", args[0]);
-    }
+    // Phase 7: Userland. One program, and it is not a choice the boot config
+    // makes any more: init reads `/etc/system.manifest` and starts what that
+    // says. What the bootloader used to carry — a `;`-joined argv blob baked
+    // into its own binary — made the `.efi` a function of the boot config, and
+    // a concurrent build could hand an image another config's init string.
+    let pid = process::spawn_init();
+    log!("spawned {} pid={pid}", process::INIT_PATH);
 
     report_log_destination();
     boot_phase!("complete", 0);

@@ -9,6 +9,7 @@ members = [
     "filepicker-api",
     "files",
     "font",
+    "init",
     "input-test",
     "netd",
     "paint",

@@ -657,7 +657,7 @@ there are **5** call sites: `page_cache.rs:64`, `:73`, `:235`, `:288` and
 > another agent's in-progress USB work. They are not counted above and the
 > figure will move when that lands. Counting the tree instead of `HEAD` would
 > have given 11 and been wrong for anyone reading this against `main` — the
-> failure mode `specs/issues/isolation/capability-by-id-or-name.md`'s postscript
+> failure mode `isolation/capability-by-id-or-name`'s postscript
 > records.
 
 ### Both ways
@@ -1195,8 +1195,8 @@ bug **and** the proposed code does not read better — usually because it reads
 finding above rather than duplicated.**
 
 - `PipeId`, `ListenerId`, `RingId`, `SharedToken` as designations
-  (`specs/issues/isolation/capability-by-id-or-name.md`,
-  `specs/issues/design-debt/sharedtoken-has-no-raii.md`;
+  (`isolation/capability-by-id-or-name`,
+  `design-debt/sharedtoken-has-no-raii`, both closed by the endowment branch;
   `capability-handles-spec.md` §7 has the disposition for all
   four). `PipeId::from_raw` being `pub` and reachable from `sys_pipe_open` is the
   filed defect.

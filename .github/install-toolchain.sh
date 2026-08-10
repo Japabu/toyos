@@ -49,10 +49,35 @@ if [ -z "$asset" ]; then
   exit 1
 fi
 
-curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-  -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
-mkdir -p rust/build
-zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
+# **The retry belongs on the transfer, not only on the lookup above.** The loop
+# that waits for the asset to exist costs one small JSON request; this is 401
+# MiB over TLS, so it is the request that actually fails — run `31407229079`,
+# shard 8: `curl: (35) TLS connect error: unexpected eof while reading`, one
+# shard of thirteen, on a required check, with nothing to catch it.
+#
+# `--retry` alone would not have: curl retries transient *HTTP* status and
+# connection refusals, and 35 is a handshake that got part-way. `--retry-all-errors`
+# is what covers it, and the outer loop covers the case where curl exits after
+# its own attempts are spent. The unpack is inside the loop because a truncated
+# body is a `zstd` failure rather than a `curl` one, and retrying the download
+# without it would install a corrupt toolchain and blame the compiler.
+for attempt in 1 2 3; do
+  if curl -sSL --retry 3 --retry-all-errors --retry-delay 5 \
+       -H "Authorization: Bearer $GH_TOKEN" \
+       -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst \
+     && mkdir -p rust/build \
+     && zstd -dc /tmp/t.tar.zst | tar -C rust/build -x; then
+    break
+  fi
+  if [ "$attempt" = 3 ]; then
+    echo "::error::the toolchain asset did not download and unpack in three attempts."
+    echo "::error::The last failure is above; this is the transfer, not the build."
+    exit 1
+  fi
+  echo "toolchain download/unpack attempt $attempt failed; retrying"
+  rm -f /tmp/t.tar.zst
+  sleep 10
+done
 stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
 rustup toolchain link toyos "$stage2"
 "$stage2/bin/rustc" -vV

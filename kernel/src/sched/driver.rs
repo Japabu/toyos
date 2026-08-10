@@ -314,6 +314,11 @@ pub fn pass(dispose: Dispose) {
     // request still standing on every iteration.
     crate::preempt::clear_need_resched();
     drain_irqs();
+    // The object layer's second drain site. After `drain_irqs` and before the
+    // pass picks, so a wake a zero-handle hook posts is in the run queue by the
+    // time this pass chooses — the same placement, and the same reason, as the
+    // irq drain above it.
+    crate::object::drain_zero_handles();
     let now = HW.now();
     let action = with_cpu(|cpu| {
         let pass = SchedPass::begin(cpu, env(&PreemptOff(())), now);
@@ -680,6 +685,11 @@ extern "C" fn idle_loop() -> ! {
         }
         crate::scheduler::log_health();
         crate::scheduler::reap_poisoned();
+        // The third drain site. `pass` below covers it too; this one is here so
+        // a CPU that reaches the loop and then halts has run every hook first,
+        // rather than leaving one queued behind an interrupt that may be 102 s
+        // away.
+        crate::object::drain_zero_handles();
         drain_serial();
         // Immediately before the sink's poll, so the line it appends is flushed
         // by the very next statement rather than waiting a trip round the loop.

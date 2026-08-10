@@ -3,9 +3,11 @@
 //!
 //! The owner's machine lost its whole desktop to this: doom aborted, and three
 //! seconds later the compositor granted a resized window's buffer to it —
-//! `grant_shared` answers `InvalidArgument` for a pid the process table no
-//! longer has, `SharedMemory::grant` was infallible over that, and every other
-//! window went with it. `exit: compositor code=101`.
+//! `grant_shared` answered `InvalidArgument` for a pid the process table no
+//! longer had, `SharedMemory::grant` was infallible over that, and every other
+//! window went with it. `exit: compositor code=101`. There is no grant left to
+//! be infallible over: a buffer travels as a handle and a client that has gone
+//! is a refused send.
 //!
 //! Five cases. The first is that one; the next three are the same shape found
 //! by reading for it — places where a message from any client reached a
@@ -26,19 +28,21 @@ use std::io::{BufRead, BufReader};
 use std::os::toyos::process::CommandExt;
 use std::process::{exit, Command, Stdio};
 
-use toyos::{ipc, services, Connection};
+use toyos::endow;
+use toyos::shm::SharedMemory;
+use toyos::{ipc, Connection};
 use toyos_abi::syscall::{self, SyscallError};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use window::Window;
 
 const SELF_PATH: &str = "/bin/test_rs_compositor_client_death";
 
 /// The compositor connection, in the process that finishes the request its
 /// creator did not live to send.
-const RELAY_SOCKET: Fd = Fd(3);
+const RELAY_SOCKET: RawHandle = RawHandle(3);
 /// The other end of the root's pipe, which closes when the creator has been
 /// reaped. Nothing is ever read off it but the hang-up.
-const RELAY_GO: Fd = Fd(4);
+const RELAY_GO: RawHandle = RawHandle(4);
 
 /// `MSG_GET_RESOLUTION` is answered from the compositor's dispatch, so a reply
 /// proves the event loop reached the end of a pass rather than merely that the
@@ -105,17 +109,18 @@ fn run() {
     write_raw_fd(doubled.fd(), &create_frame(), "a second create");
     probe("a second create on a live window");
 
-    // A region this process owns and has granted to nobody: the compositor is
-    // refused when it maps the token, which is the only answer the kernel can
-    // give and one message from any client.
-    let token = syscall::alloc_shared(4096).expect("a region of our own");
-    clipboard_shm(token, 64, "an ungranted clipboard token");
-    probe("an ungranted clipboard token");
+    // A clipboard frame with no region sent ahead of it. The receive is not a
+    // poll — a short batch is a peer that sent its frame first — so this must
+    // cost the client its connection and nothing else.
+    clipboard_shm(None, 64, "a clipboard frame with no region");
+    probe("a clipboard frame with no region");
 
-    // The same token with a length no region can satisfy. The length decides
-    // how much of somebody else's memory gets read as clipboard text, so it is
-    // the compositor's to bound rather than the client's to choose.
-    clipboard_shm(token, u32::MAX, "a clipboard longer than any region");
+    // A region really sent, with a length no region can satisfy. The length
+    // decides how much of the region is read as clipboard text, so it is the
+    // compositor's to bound rather than the client's to choose.
+    let region = SharedMemory::create(4096).expect("a region of our own");
+    let shared = region.share().expect("a second handle to it");
+    clipboard_shm(Some(shared), u32::MAX, "a clipboard longer than any region");
     probe("a clipboard longer than any region");
 
     // The other side of a window ending: the client has to be able to leave.
@@ -168,14 +173,14 @@ fn run() {
 /// belongs to is made at `connect`, and that is the only thing this role has
 /// to establish before dying.
 fn connect_and_go() {
-    let conn = services::connect("compositor").expect("the compositor is not serving");
+    let conn = endow::service("compositor").expect("the compositor is not serving");
     // The kernel clones the descriptor into the child's table
     // (`loader::build_child_fds`), so the socket — and the pipes under it —
     // outlive this process.
     Command::new(SELF_PATH)
         .arg("finish")
-        .inherit_fd(RELAY_SOCKET.0 as u32, conn.fd().0 as u32)
-        .inherit_fd(RELAY_GO.0 as u32, 0)
+        .inherit_fd(RELAY_SOCKET.0, conn.fd().0)
+        .inherit_fd(RELAY_GO.0, 0)
         .spawn()
         .expect("spawn the process that finishes the request");
     println!("connected");
@@ -190,6 +195,20 @@ fn finish() {
     // process table.
     while let Ok(1) = syscall::read(RELAY_GO, &mut byte) {}
     write_raw_fd(RELAY_SOCKET, &create_frame(), "finish");
+
+    // **The answer is the non-vacuity witness, and it changed sides.** The
+    // compositor used to say "the process behind it has exited" here, because
+    // it granted the buffer to the pid `accept` reported and the kernel had
+    // forgotten that pid. There is no pid and no grant: the buffer is a handle
+    // sent over this connection, which is alive because this process holds it.
+    // So the request is *served*, and the line that proves the compositor met
+    // it is the answer rather than a refusal.
+    let header = ipc::recv_header(RELAY_SOCKET).expect("the compositor answered");
+    let what = if header.msg_type == window::MSG_WINDOW_CREATED { "a window" } else { "nothing" };
+    // Stderr, because stdout is the pipe the root read one line off and let go
+    // of: this process outlives the reader of its own stdout, and stderr is the
+    // console both it and the compositor already share.
+    eprintln!("a reaped creator's connection still got {what}");
 }
 
 /// A whole `MSG_CREATE_WINDOW` for a 64x64 window, header and payload.
@@ -203,16 +222,20 @@ fn create_frame() -> Vec<u8> {
     frame
 }
 
-fn clipboard_shm(token: u32, len: u32, what: &str) {
-    let conn = services::connect("compositor")
+fn clipboard_shm(region: Option<toyos_abi::RawHandle>, len: u32, what: &str) {
+    let conn = endow::service("compositor")
         .unwrap_or_else(|e| fail(&format!("[{what}] the compositor is not serving: {e:?}")));
-    conn.send(window::MSG_CLIPBOARD_SET_SHM, &window::ClipboardShmMsg { token, len })
-        .unwrap_or_else(|e| fail(&format!("[{what}] could not send: {e:?}")));
+    let msg = window::ClipboardShmMsg { len };
+    let sent = match region {
+        Some(h) => conn.send_with_handles(&[h], window::MSG_CLIPBOARD_SET_SHM, &msg),
+        None => conn.send(window::MSG_CLIPBOARD_SET_SHM, &msg),
+    };
+    sent.unwrap_or_else(|e| fail(&format!("[{what}] could not send: {e:?}")));
 }
 
 /// Every write here fits in the pipe it goes into, so a blocking `write` can
 /// only be the compositor's problem, never this binary's.
-fn write_raw_fd(fd: toyos_abi::Fd, bytes: &[u8], what: &str) {
+fn write_raw_fd(fd: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
     let mut offset = 0;
     while offset < bytes.len() {
         match syscall::write(fd, &bytes[offset..]) {
@@ -224,7 +247,7 @@ fn write_raw_fd(fd: toyos_abi::Fd, bytes: &[u8], what: &str) {
 
 /// Ask the compositor something it always answers, and give it a deadline.
 fn probe(what: &str) {
-    let conn: Connection = services::connect("compositor")
+    let conn: Connection = endow::service("compositor")
         .unwrap_or_else(|e| fail(&format!("[{what}] the compositor is not serving: {e:?}")));
     if let Err(e) = ipc::signal(conn.fd(), window::MSG_GET_RESOLUTION) {
         fail(&format!("[{what}] could not ask the compositor for its resolution: {e:?}"));

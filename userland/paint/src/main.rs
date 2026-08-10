@@ -1002,7 +1002,7 @@ impl PaintApp {
                 Some('y') => { self.pop_redo(); return; }
                 Some('s') => {
                     if self.save_path.is_none() {
-                        if let Some(path) = filepicker_api::pick_file(PickerMode::Save, "/") {
+                        if let Some(path) = pick(PickerMode::Save) {
                             self.save_path = Some(path);
                         }
                     }
@@ -1010,7 +1010,7 @@ impl PaintApp {
                     return;
                 }
                 Some('o') => {
-                    if let Some(path) = filepicker_api::pick_file(PickerMode::Open, "/") {
+                    if let Some(path) = pick(PickerMode::Open) {
                         self.load_ppm(&path);
                     }
                     return;
@@ -1104,4 +1104,19 @@ fn main() {
         app.load_ppm(&path);
     }
     app.run();
+}
+
+/// The picker's answer, with a refusal named on stderr.
+///
+/// A cancellation and "this program was given no file picker" are different
+/// facts and only one of them is the user's; the caller does the same thing
+/// either way, so the difference goes in the log rather than into the return.
+fn pick(mode: PickerMode) -> Option<String> {
+    match filepicker_api::pick_file(mode, "/") {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("{}: {e}", env!("CARGO_PKG_NAME"));
+            None
+        }
+    }
 }

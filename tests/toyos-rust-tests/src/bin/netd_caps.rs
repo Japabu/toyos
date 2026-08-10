@@ -17,8 +17,10 @@
 
 use toyos::net::{
     MsgType, NetError, NetdConn, PendingResponse, TcpConnectPipedRequest, TcpConnectResponse,
+    DATA_FROM_CLIENT, DATA_HANDLES, DATA_TO_CLIENT,
 };
 use toyos_abi::syscall;
+use toyos_abi::RawHandle;
 
 /// TEST-NET-1 (RFC 5737), reserved for documentation and guaranteed not to be
 /// a real host. What matters is only that it does not complete a handshake.
@@ -34,6 +36,32 @@ const TIMEOUT_MS: u32 = 4000;
 /// the boundary, and every request costs netd an IPC connection.
 const MARGIN: usize = 4;
 
+/// How many times one connect may be refused by the *kernel* before this gives
+/// up on it.
+///
+/// **A count of attempts, not a span of time**, and it is measuring something
+/// other than netd's cap: the port's queue holds `MAX_PENDING_CONNECTIONS`
+/// connections netd has not accepted yet, and a burst issued as fast as a
+/// single-threaded client can issue it outruns one accept per event-loop pass.
+/// That is backpressure from the kernel and is retryable against the same peer;
+/// netd's own cap is the `ResourceExhausted` in a *response*, which is what
+/// this file is about and what it must not be confused with.
+///
+/// The retry used to be invisible: `NetdConn::connect_blocking` spun a hundred
+/// times at ten milliseconds over any error at all, so this test never saw the
+/// queue at the same time as it never saw a boot race. That loop is deleted
+/// because a boot race is unrepresentable now; this is the part of it that was
+/// doing a different job.
+const CONNECT_ATTEMPTS: usize = 200;
+
+/// One netd event-loop pass, which is what an attempt is waiting for.
+///
+/// netd polls at 1 ms while it holds piped connections and accepts one
+/// connection per pass, so this paces the client to the rate the queue drains
+/// at. **The bound is [`CONNECT_ATTEMPTS`], not this** — a slow host makes the
+/// attempts cheaper, never fewer.
+const PASS_NANOS: u64 = 1_000_000;
+
 fn main() {
     let announced: usize = std::env::args()
         .nth(1)
@@ -42,28 +70,18 @@ fn main() {
         .expect("the announced cap must be a number");
     let burst = announced + MARGIN;
 
-    // One pair of pipes for every request. netd stores the ids with the
-    // pending connect and only opens them if the connect completes, which none
-    // of these will — so sharing them costs nothing and saves the client 4 MiB
-    // and four fds per request.
-    let rx = syscall::pipe();
-    let tx = syscall::pipe();
     let request = TcpConnectPipedRequest {
         addr: BLACK_HOLE,
         port: PORT,
         _pad: 0,
         timeout_ms: TIMEOUT_MS,
-        _pad2: 0,
-        rx_pipe_id: syscall::pipe_id(rx.write).expect("rx pipe id"),
-        tx_pipe_id: syscall::pipe_id(tx.read).expect("tx pipe id"),
     };
 
     let mut sent: Vec<PendingResponse> = Vec::with_capacity(burst);
     for i in 0..burst {
-        let conn = NetdConn::connect_blocking()
-            .unwrap_or_else(|e| panic!("request {i}: could not reach netd: {e:?}"));
+        let conn = connect_past_the_queue(i);
         sent.push(
-            conn.request(MsgType::TcpConnectPiped, &request)
+            conn.request_with_handles(&data_path(), MsgType::TcpConnectPiped, &request)
                 .unwrap_or_else(|e| panic!("request {i}: netd would not take it: {e:?}")),
         );
     }
@@ -115,6 +133,26 @@ fn main() {
     );
 }
 
+/// The two ends one request hands netd.
+///
+/// **A fresh pair per request, where one pair used to serve the whole burst.**
+/// The ends travel with the request now rather than being named by an id netd
+/// would reopen later, and a handle that has been moved cannot be moved again.
+/// This side's own two ends are dropped where they are made: nothing here will
+/// read or write them, and each pipe stays alive on the end netd holds — which
+/// is exactly where the cap is counting it.
+fn data_path() -> [RawHandle; DATA_HANDLES] {
+    let (to_client_read, to_client_write) = toyos::pipe_pair().expect("the pipe netd writes into");
+    let (from_client_read, from_client_write) =
+        toyos::pipe_pair().expect("the pipe netd reads from");
+    let mut handles = [toyos_abi::HANDLE_INVALID; DATA_HANDLES];
+    handles[DATA_TO_CLIENT] = to_client_write.into_fd();
+    handles[DATA_FROM_CLIENT] = from_client_read.into_fd();
+    drop(to_client_read);
+    drop(from_client_write);
+    handles
+}
+
 /// The distinct outcomes, in first-seen order. Printed so the log says what
 /// the accepted connects actually died of rather than only how many there were.
 fn summarise(outcomes: &[Option<NetError>]) -> String {
@@ -126,4 +164,26 @@ fn summarise(outcomes: &[Option<NetError>]) -> String {
         }
     }
     kinds.join(", ")
+}
+
+/// One connection, retrying only the kernel's queue-full answer.
+///
+/// Every other refusal ends the test where it happens: "netd is not reachable"
+/// and "netd has not drained its accept queue yet" are different facts and only
+/// the second one is worth another attempt.
+fn connect_past_the_queue(request: usize) -> NetdConn {
+    for attempt in 0..CONNECT_ATTEMPTS {
+        match NetdConn::connect() {
+            Ok(conn) => return conn,
+            Err(NetError::ResourceExhausted) => {
+                let _ = attempt;
+                syscall::nanosleep(PASS_NANOS);
+            }
+            Err(e) => panic!("request {request}: could not reach netd: {e:?}"),
+        }
+    }
+    panic!(
+        "request {request}: the port queue stayed full for {CONNECT_ATTEMPTS} attempts — \
+         netd is not accepting"
+    )
 }

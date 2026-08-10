@@ -8,18 +8,34 @@
 #
 # The terminal is in `init` rather than launched with the compositor's Ctrl+N,
 # so it is the only window and therefore the focused one from the first frame.
-init = ["/bin/compositor", "/bin/terminal"]
 
 assets = ["assets"]
 
-[programs]
-compositor = {}
-terminal = {}
-shell = {}
-toybox = {}
+# The terminal receiving `compositor` is what makes the boot race unrepresentable
+# here first: the port exists before either process runs. No soundd or filepicker
+# in this config, so nothing receives them.
+[boot]
+start = ["compositor", "terminal"]
+
+[programs.compositor]
+serves = ["compositor"]
+receives = ["launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.terminal]
+provides = ["surface"]
+receives = ["compositor", "launcher"]
+
+[programs.shell]
+receives = ["surface", "launcher"]
+
+[programs.toybox]
+receives = ["compositor", "surface"]
+
 # The winit app the owner closed the window of. `desktop_window_child`
 # launches it from the shell; nothing else in this config uses it.
-snake = {}
+[programs.snake]
+receives = ["compositor"]
 
 [symlinks]
 "bin/echo" = "/bin/toybox"

@@ -7,11 +7,21 @@
 # share a config, and this one pays 19 MiB of initrd that no other test should.
 #
 # No compositor: `/bin/doom --music-check` never opens a window.
-init = ["/bin/soundd", "/bin/test-runner"]
 
 assets = ["assets"]
 
-[programs]
-soundd = {}
-test-runner = {}
-doom = {}
+[boot]
+start = ["soundd", "test-runner"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+syscap = ["rt"]
+
+# No compositor: `/bin/doom --music-check` opens no window. test-runner passes
+# its namespace to doom (§6.7a).
+[programs.test-runner]
+receives = ["soundd"]
+
+[programs.doom]
+receives = ["soundd"]

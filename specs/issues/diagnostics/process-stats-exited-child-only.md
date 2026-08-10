@@ -4,20 +4,24 @@ kind: defect
 opened: 2026-07-31
 ---
 
-# `SYS_PROCESS_STATS` can only report an exited direct child, once
+# `SYS_PROCESS_STATS` reaches any process a handle names, and still cannot see a daemon
 
-`sys_process_stats` (`kernel/src/arch/syscall.rs:1640`) positions in
-`data.child_stats` — a per-parent list, populated only when a child exits
-(`kernel/src/process.rs:998`) — and `remove`s the entry it finds. So the
-syscall answers exactly one question: what did my own child, which has
-already exited, cost? It cannot sample a live process, cannot be differenced
-across two calls, and cannot see a daemon at all.
+**The addressing half is closed and the accounting half is not.** The call takes
+a `Process` handle now: a live process is sampled from its own `ProcessData`, an
+exited one from the object, reading spends nothing, and two reads of a finished
+process give the same numbers. `ProcessData::child_stats` is deleted, so
+"exactly one question, asked once, by the parent, after the child died" is gone.
+`process_stats` is the gate and `process_lifecycle` the surrounding shape.
 
-That is the whole of layer 1's read path, and nothing said so outside
-`toyos-abi/src/syscall.rs`'s doc comment. `userland/toybox`'s `stats` is a
-spawn-and-measure wrapper, which is why it works. Anyone asking "where is
-soundd's / the compositor's / netd's time going?" has to reach past it —
-`audio_idle_suspend` pays exactly that cost, name-matching `SYS_SYSINFO`
-entries into a byte buffer to sample a running daemon twice. A per-process
-query on a live target is the missing piece; it is a layer-1 gap, not a
-layer-2 one.
+What is left is who can ask. A handle is the whole of the right, and nothing
+hands a diagnostic tool a handle to a daemon: `/bin/init` holds the only
+`Process` handles for what `[boot] start` names and the only `SysCap` carrying
+`Rights::MANAGE`, which is the one thing `SYS_PROCESS_OPEN` takes. So "where is
+soundd's / the compositor's / netd's time going?" is still unanswerable from a
+shell — `audio_idle_suspend` still name-matches `SYS_SYSINFO` entries out of a
+byte buffer to sample a running daemon twice.
+
+That is now a *policy* gap rather than an ABI one, and it has an obvious shape:
+init serves a diagnostic port that answers a program name with a `Process`
+handle narrowed to `Rights::READ`. `specs/introspection-plan.md` is where that
+belongs; nothing in the kernel has to change for it.

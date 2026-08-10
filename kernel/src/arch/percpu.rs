@@ -201,16 +201,37 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, last_seen_ring0_fires) == 25
 const _: () = assert!(core::mem::offset_of!(PerCpu, fault_state) == 256);
 const _: () = assert!(core::mem::offset_of!(PerCpu, last_armed_ticks) == 260);
 
-const IDLE_STACK_SIZE: usize = 16384; // 16KB
+/// **One stack size, so "which stack am I on" is not a question kernel code
+/// has to answer.**
+///
+/// It was 16 KiB, and that number was never a decision about the work this
+/// stack carries. The idle loop runs a scheduler pass, `drain_irqs` — which
+/// reaches USB enumeration — `log_file::poll`, a filesystem write down to a
+/// block device whose measured high water was **11,505 bytes of the 16,384**
+/// with the USB command path still below the probe, and
+/// `object::drain_zero_handles`, which releases arbitrary kernel objects.
+///
+/// That last one is why this is the same number a task's kernel stack is.
+/// `kobject!` classifies each object `deferred` or `immediate`, and an
+/// `immediate` row's promise is that its destructor runs on the dropping
+/// thread's 128 KiB stack rather than here — which `6d81a73` bought at 147
+/// collateral reds after a killed process's file flush wrote through the guard
+/// page below. **A `deferred` object may own an `immediate` one**: a `File`
+/// sent over a connection whose peer dies is released from the drain, so the
+/// classification is defeated by nesting and the macro cannot see it. Nothing
+/// expressible in the object layer fixes that, because the entries are dropped
+/// wherever the drain runs — so the drain gets a stack, and the invariant
+/// becomes one every release path already has.
+///
+/// The cost is 112 KiB per CPU of a machine's physical memory, 14 MiB at 128
+/// cores.
+const IDLE_STACK_SIZE: usize = crate::process::KERNEL_STACK_SIZE;
 
 /// One unmapped 4 KiB page below every idle stack.
 ///
-/// The idle stack is ordinary heap, so without this an overflow does not fault
-/// — it rewrites whatever the allocator put underneath, and the damage
-/// surfaces later and elsewhere. That is not hypothetical here: the idle loop
-/// runs `log_file::poll`, a filesystem write reaching a block device, whose
-/// measured high water was 11,505 bytes of the 16,384 with the USB command
-/// path still below the probe.
+/// The idle stack is ordinary physical memory, so without this an overflow does
+/// not fault — it rewrites whatever is underneath, and the damage surfaces
+/// later and elsewhere.
 ///
 /// Unmapped rather than [`IST1_GUARD_SIZE`]'s fill pattern, and the difference
 /// is the stack, not the taste: #PF has no IST, so a frame pushed past the
@@ -286,22 +307,30 @@ const IDLE_SLOT: usize = IDLE_GUARD_SIZE + IDLE_STACK_SIZE;
 /// structures, and they went from one TLB entry to 512 — measured against the
 /// same tree with the guard as the only difference, `i8042_mouse` fell from
 /// 1006 pointer events to 27 under the full suite, three runs to one. An arena
-/// the stacks alone share keeps that cost where it belongs: 102 of them per
+/// the stacks alone share keeps that cost where it belongs: 15 of them per
 /// leaf, and nothing else in it.
 ///
 /// Never freed, which is what makes the permanent split sound — a leaf handed
 /// back to the PMM would be reissued with a hole in its direct map.
-static IDLE_STACKS: crate::sync::Lock<IdleArena> =
-    crate::sync::Lock::new(IdleArena { pages: alloc::vec::Vec::new(), next: 0, left: 0 });
+static IDLE_STACKS: crate::sync::Lock<IdleArena> = crate::sync::Lock::new(IdleArena {
+    pages: alloc::vec::Vec::new(),
+    stacks: alloc::vec::Vec::new(),
+    next: 0,
+    left: 0,
+});
 
 struct IdleArena {
     pages: alloc::vec::Vec<crate::mm::pmm::PhysPage>,
+    /// The bottom of every idle stack this machine has, so the deepest any of
+    /// them has ever gone can be read from one CPU. Without it the measurement
+    /// is per-CPU and the CPU that ran deepest is the one that is not asking.
+    stacks: alloc::vec::Vec<u64>,
     /// Direct-map address of the next free slot.
     next: u64,
     left: usize,
 }
 
-/// A zeroed, 4 KiB-aligned `IDLE_SLOT` from the arena.
+/// A 4 KiB-aligned `IDLE_SLOT` from the arena.
 fn alloc_idle_slot() -> u64 {
     let mut arena = IDLE_STACKS.lock();
     if arena.left < IDLE_SLOT {
@@ -314,14 +343,56 @@ fn alloc_idle_slot() -> u64 {
     let base = arena.next;
     arena.next += IDLE_SLOT as u64;
     arena.left -= IDLE_SLOT;
+    arena.stacks.push(base + IDLE_GUARD_SIZE as u64);
     base
 }
 
 fn alloc_idle_stack(percpu: &mut PerCpu) {
     let base = alloc_idle_slot();
     crate::mm::paging::guard_kernel_page(base);
+    // Filled rather than zeroed, for [`idle_stack_high_water`]: a zero is a
+    // value the stack legitimately holds, so it cannot tell untouched from
+    // written. After the guard, because the guard's page is no longer mapped.
+    unsafe {
+        core::ptr::write_bytes(
+            (base + IDLE_GUARD_SIZE as u64) as *mut u8,
+            STACK_FILL,
+            IDLE_STACK_SIZE,
+        )
+    };
     percpu.idle_stack_top = base + IDLE_SLOT as u64;
     percpu.idle_rsp = percpu.idle_stack_top;
+}
+
+/// How big one idle stack is. Read by `SYS_DEBUG`, so the high water below is
+/// a fraction of something rather than a number with no scale.
+pub fn idle_stack_size() -> usize {
+    IDLE_STACK_SIZE
+}
+
+/// The deepest any CPU's idle stack has ever been, in bytes.
+///
+/// **The instrument that says whether [`IDLE_STACK_SIZE`] is a decision or a
+/// hope.** The guard page below turns an overflow into a reported fault, which
+/// is a machine that stopped; this answers before it, from a running one, and
+/// is what a churn test asserts against so a release path that grows deep is a
+/// red rather than a halt.
+///
+/// Read from the bottom up, so it is the high water and not the current depth:
+/// nothing legitimate writes [`STACK_FILL`], and a frame that reached a byte
+/// leaves it changed for the rest of the boot.
+pub fn idle_stack_high_water() -> usize {
+    let arena = IDLE_STACKS.lock();
+    arena
+        .stacks
+        .iter()
+        .map(|&bottom| {
+            let untouched =
+                words(bottom, IDLE_STACK_SIZE).take_while(|&w| w == STACK_FILL_WORD).count() * 8;
+            IDLE_STACK_SIZE - untouched
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn alloc_ist1_stack(percpu: &mut PerCpu) {

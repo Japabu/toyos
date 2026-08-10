@@ -41,7 +41,7 @@ technical one.** `rust/` is the primary checkout's, and in a linked worktree it 
 empty stub `git worktree add` leaves (`specs/worktrees.md` §2) — so a worktree agent can
 neither edit nor build it. The sysroot witness covers `toyos-abi`, `toyos` and
 `userland/libc` and *not* std's own sources
-(`specs/issues/build/std-change-needs-an-unlanded-abi-change.md`), so the change would also not be picked
+(`specs/issues/build/sysroot-witness-ignores-the-std-fork.md`), so the change would also not be picked
 up without `--claim-sysroot`, which rebuilds the shared sysroot and cleans every other
 worktree's target directories mid-session. This is the same two-half shape as
 `specs/issues/isolation/current-dir-returns-wrong-path.md` and takes the same answer: the kernel half lands first
