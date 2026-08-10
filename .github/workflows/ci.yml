@@ -32,7 +32,81 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # **Nothing here may run against a tree whose toolchain does not build.**
+  #
+  # `toolchain.yml` is a separate workflow because it must never be cancelled
+  # (an hour-long bootstrap thrown away by the next push starts again from
+  # nothing), and `needs:` does not reach across workflows. So the shards waited
+  # for the release instead of depending on it — and a wait cannot tell "not yet"
+  # from "never". Pull request #22 measured what that costs: std failed to
+  # compile, no release was ever published, and **thirteen jobs sat for 46
+  # minutes each** — 10 hours of runner time, and the whole 20-job concurrency
+  # budget, spent on a tree that could not build. `specs/ci-plan.md` §5 already
+  # recorded the other end of that: a *required* three-second check queued
+  # twenty-two minutes behind twelve advisory shards.
+  #
+  # This is that wait, once, in one job that also watches the workflow doing the
+  # building. One runner waits; thirteen do not start.
+  toolchain-ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the toolchain this tree needs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          echo "toolchain: $tag"
+          # The workflow run is keyed on the *head* sha even though the tag is
+          # computed from the merge ref: `toolchain.yml` checks out the same
+          # merge ref this job did, so the two agree about the tag and disagree
+          # only about the name the run is filed under.
+          sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          published() {
+            curl -sSL -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" "$api/releases/tags/$tag" \
+              | grep -q '^200$'
+          }
+          for _ in $(seq 240); do
+            if published; then
+              echo "$tag is published."
+              echo "- toolchain: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            verdict=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+                "$api/actions/workflows/toolchain.yml/runs?head_sha=$sha&per_page=1" \
+              | jq -r '.workflow_runs[0] // empty | "\(.status) \(.conclusion) \(.html_url)"')
+            case "$verdict" in
+              completed\ success*)
+                # Published between the two calls, or the workflow answered
+                # green without leaving the artifact everything below installs.
+                published && continue
+                echo "::error::the toolchain workflow was green and $tag is not there."
+                echo "::error::$verdict"
+                exit 1
+                ;;
+              completed*)
+                echo "::error::the toolchain for this tree did not build, so the guest"
+                echo "::error::shards would have waited two hours to install nothing."
+                echo "::error::$verdict"
+                echo "### the toolchain did not build" >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "\`$tag\` was never published: $verdict" >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+                ;;
+            esac
+            echo "waiting for the toolchain workflow to publish $tag (${verdict:-no run yet}) ..."
+            sleep 30
+          done
+          echo "::error::$tag was not published within two hours."
+          exit 1
+
   guest:
+    needs: [toolchain-ready]
     runs-on: ubuntu-24.04
     # A shard that cannot finish measures nothing, and 90 minutes was reached by
     # one test taking the shared boot down (run `31241099454`, shard 1: five
@@ -103,10 +177,11 @@ jobs:
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # The same key `toolchain.yml` publishes under. Waited for rather than
-      # depended on, because that workflow must survive this one being
-      # cancelled — and on nearly every branch the release is already there.
-      # Fetched through the API rather than `gh`, which this image has not.
+      # The same key `toolchain.yml` publishes under. **A short retry and not a
+      # two-hour wait**: `toolchain-ready` has already established that the
+      # release is there, so anything this loop is still waiting for is the API
+      # rather than a build. Fetched through the API rather than `gh`, which
+      # this image has not.
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
@@ -116,12 +191,12 @@ jobs:
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
           echo "toolchain: $tag"
           api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          for _ in $(seq 120); do
+          for _ in $(seq 10); do
             asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
               | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
             [ -n "$asset" ] && break
-            echo "waiting for the toolchain workflow to publish $tag ..."
-            sleep 60
+            echo "the release $tag did not answer; retrying"
+            sleep 15
           done
           test -n "$asset"
           curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
@@ -166,12 +241,29 @@ jobs:
       # The filter is `--land`'s: `cargo test` runs several binaries and the last
       # `test result:` is the doc-tests', so the suite's own line is the one that
       # counts a total, which libtest's never does.
+      #
+      # **And the names, because a count is not a finding.** A red run's real
+      # error took `gh run view --log-failed | grep` to reach; the summary is one
+      # page for all twelve shards, so what belongs in it is the sentence the
+      # harness already wrote — the name, why it failed, and its `ALONE:`
+      # verdict, which is what says whether a re-run tells you anything.
       - name: what the suite said
         if: always()
         run: |
           line=$(grep 'test result:' /tmp/suite.log | grep ' total (' | tail -1)
           echo "- shard ${{ matrix.shard }}: ${line:-no suite result line}" \
             >> "$GITHUB_STEP_SUMMARY"
+          verdicts=$(grep -E '^(FAIL|XFAIL) |^ +(STALL|INVL|STALE|ALONE) ' /tmp/suite.log || true)
+          if [ -n "$verdicts" ]; then
+            {
+              echo "<details><summary>shard ${{ matrix.shard }}: what it said</summary>"
+              echo ""
+              echo '```'
+              echo "$verdicts"
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # Always, and not only on a red: this is the measurement that fixes the
       # partition. A shard writes `test-durations.shard-<i>-of-<n>`, which
@@ -231,12 +323,26 @@ jobs:
   #
   # Same image as the shards, so the accelerator is the only thing that differs
   # between this job and one of them.
+  #
+  # **`if: always()` and a guard step rather than a bare `needs:`, because this
+  # one is a required check.** GitHub reports a job skipped by an unmet `needs:`
+  # as a state a protection rule reads as satisfied, so a required check that
+  # skips is a required check that cannot fail. The guard costs a container
+  # start and makes the report honest: `tcg` runs, and reds, when the toolchain
+  # did not build.
   tcg:
+    needs: [toolchain-ready]
+    if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
       image: debian:sid
     steps:
+      - name: the toolchain built
+        run: |
+          test "${{ needs.toolchain-ready.result }}" = success \
+            || { echo "::error::toolchain-ready: ${{ needs.toolchain-ready.result }}"; exit 1; }
+
       # Three attempts, for the reason the shards' own `deps` step carries.
       - name: deps
         run: |
@@ -269,12 +375,12 @@ jobs:
           tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
           api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          for _ in $(seq 90); do
+          for _ in $(seq 10); do
             asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
               | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
             [ -n "$asset" ] && break
-            echo "waiting for the toolchain workflow to publish $tag ..."
-            sleep 60
+            echo "the release $tag did not answer; retrying"
+            sleep 15
           done
           test -n "$asset"
           curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
@@ -295,11 +401,19 @@ jobs:
   # runs, it reds when a shard reds, and `landing.yml`'s `gate-stage` is what
   # stops that being a permanent arrangement.
   guest-suite:
-    needs: [guest]
+    needs: [toolchain-ready, guest]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # `toolchain-ready` is named here as well as in the shards' `needs:`,
+      # because a skipped `guest` says nothing about why it was skipped and this
+      # is the name a reader of the merge button sees.
       - name: every shard
         run: |
+          echo "toolchain: ${{ needs.toolchain-ready.result }}"
           echo "twelve shards: ${{ needs.guest.result }}"
+          if [ "${{ needs.toolchain-ready.result }}" != success ]; then
+            echo "::error::the toolchain for this tree did not build, so no shard ran."
+            exit 1
+          fi
           test "${{ needs.guest.result }}" = success
