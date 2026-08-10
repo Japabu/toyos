@@ -141,3 +141,29 @@ jobs:
             --notes "x86_64-unknown-linux-gnu toolchain for rust $(git rev-parse HEAD:rust), built from ${{ github.sha }}." \
             /tmp/toyos-toolchain.tar.zst \
             || gh release view "${{ steps.key.outputs.tag }}"
+
+      # **A release without its asset is not a publication, and the line above
+      # cannot tell that from being second.** `create` makes the release and
+      # then uploads 401 MiB to it, so a failed upload leaves a tag that answers
+      # 200 and nothing to install — while this job reports success, which is
+      # the verdict `ci.yml` reads to decide that thirteen shards may start. The
+      # wait is for the *other* branch's upload, in the idempotent case the
+      # `||` above exists for.
+      - name: the artifact is on the release
+        if: steps.have.outputs.build == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 20); do
+            if gh release view "${{ steps.key.outputs.tag }}" --json assets \
+                 --jq '.assets[].name' | grep -qx toyos-toolchain.tar.zst; then
+              echo "${{ steps.key.outputs.tag }} carries toyos-toolchain.tar.zst."
+              exit 0
+            fi
+            echo "the release is there and the asset is not on it yet; waiting"
+            sleep 15
+          done
+          echo "::error::${{ steps.key.outputs.tag }} exists and carries no"
+          echo "::error::toyos-toolchain.tar.zst. Nothing can install this toolchain, and a"
+          echo "::error::green here is what lets ci.yml start thirteen shards."
+          exit 1

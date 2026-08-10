@@ -120,11 +120,11 @@ mod tests {
     /// a guest without naming its instrument produces a verdict nobody can
     /// compare with another.
     ///
-    /// This is `specs/issues/build/gate-a-runs-a-different-qemu.md` made
-    /// unrepeatable rather than fixed: gate A ran QEMU 8.2.2 against every other
-    /// guest in CI on 11.0.3 for as long as that workflow existed, and the way
-    /// it stayed invisible is that the workflow reads perfectly well and never
-    /// says what it is comparing against.
+    /// The rule is here rather than in one workflow's review because the way
+    /// this hides is that a workflow reads perfectly well and never says what
+    /// it is comparing against — gate A ran QEMU 8.2.2 against every other
+    /// guest in CI on 11.0.3 for as long as that file existed
+    /// (`specs/ci-plan.md` §12.1).
     fn nameless(text: &str) -> Vec<String> {
         jobs(text)
             .into_iter()

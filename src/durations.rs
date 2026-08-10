@@ -48,6 +48,7 @@ pub fn dispatch(root: &Path, args: &[String]) {
         "no {SHARD_PREFIX}* under {}: a sharded run uploads one per shard",
         dir.display()
     );
+    let count = whole_run(&files);
 
     let mut merged: BTreeMap<String, (u64, String)> = BTreeMap::new();
     for file in &files {
@@ -70,7 +71,7 @@ pub fn dispatch(root: &Path, args: &[String]) {
 
     let out = root.join("tests/test-durations");
     let before = read_profile(&out);
-    report(&merged, &before, files.len());
+    report(&merged, &before, count);
 
     let body: String = merged.iter().map(|(n, (ms, _))| format!("{n} {ms}\n")).collect();
     fs::write(&out, body).unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
@@ -80,6 +81,69 @@ pub fn dispatch(root: &Path, args: &[String]) {
         merged.len(),
         files.len()
     );
+}
+
+/// The shard count these files are all of, refusing anything that is not a
+/// whole run.
+///
+/// **The other half of the partition, and it was not being checked.** The
+/// merge already refuses a name two shards both measured, which is
+/// `specs/ci-plan.md` §4's defect from one side. From the other side a shard
+/// that measured *nothing* — cancelled at its timeout, or an artifact upload
+/// that failed — leaves eleven files, and merging them wrote a profile missing
+/// a twelfth of the suite. Those names then price at the longest the profile
+/// knows on every later run, which is exactly the eight phantom four-minute
+/// tests §11.2 measured steering a twelve-way split. The command that exists to
+/// keep the profile honest was the thing that could quietly break it.
+///
+/// The information was always there: a shard writes
+/// `test-durations.shard-<i>-of-<n>`, so the file names say both how many
+/// shards there were and which one each is.
+fn whole_run(files: &[std::path::PathBuf]) -> usize {
+    let mut seen: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    let mut counts: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for file in files {
+        let name = file.file_name().expect("a file has a name").to_string_lossy().into_owned();
+        let spec = name.strip_prefix(SHARD_PREFIX).unwrap_or_else(|| {
+            panic!("{name} was collected as a shard file and does not start with {SHARD_PREFIX}")
+        });
+        let (index, count) = spec.split_once("-of-").unwrap_or_else(|| {
+            panic!("{name}: a shard file is named {SHARD_PREFIX}<index>-of-<count>")
+        });
+        let (index, count) = match (index.parse::<usize>(), count.parse::<usize>()) {
+            (Ok(i), Ok(n)) if i >= 1 && i <= n => (i, n),
+            _ => panic!("{name}: {index:?}/{count:?} is not a shard of a run"),
+        };
+        counts.insert(count);
+        seen.entry(index).or_default().push(name);
+    }
+
+    assert!(
+        counts.len() == 1,
+        "these files are from more than one sharded run — shard counts {:?}. A profile merged \
+         across two runs is a partition of neither.",
+        counts
+    );
+    let count = *counts.iter().next().expect("one count");
+
+    let twice: Vec<String> = seen
+        .values()
+        .filter(|f| f.len() > 1)
+        .map(|f| f.join(" and "))
+        .collect();
+    assert!(twice.is_empty(), "one shard left two files: {}", twice.join("; "));
+
+    let missing: Vec<String> =
+        (1..=count).filter(|i| !seen.contains_key(i)).map(|i| i.to_string()).collect();
+    assert!(
+        missing.is_empty(),
+        "shard(s) {} of {count} left no measurement, so this is not a whole run. Merging what is \
+         here would write a profile missing everything those shards own, and every later run \
+         would price those names at the longest this one knew — which is the imbalance the \
+         profile exists to remove. Re-run the shards that did not finish.",
+        missing.join(", ")
+    );
+    count
 }
 
 fn read_profile(path: &Path) -> BTreeMap<String, u64> {
@@ -146,6 +210,43 @@ fn report(
             gone.len(),
             gone.join(", ")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn shards(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(|n| PathBuf::from("/tmp").join(format!("{SHARD_PREFIX}{n}"))).collect()
+    }
+
+    #[test]
+    fn a_whole_run_is_every_shard_of_one_run_exactly_once() {
+        assert_eq!(whole_run(&shards(&["1-of-3", "2-of-3", "3-of-3"])), 3);
+        assert_eq!(whole_run(&shards(&["1-of-1"])), 1);
+    }
+
+    /// Teeth, and the middle one is the defect this was written for: eleven
+    /// files of a twelve-way run merged to a profile missing a twelfth of the
+    /// suite, and said so in a line among others while writing it anyway.
+    #[test]
+    fn a_partial_or_mixed_set_is_refused_by_name() {
+        let refusal = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let err = std::panic::catch_unwind(|| whole_run(&shards(&refs)))
+                .expect_err("this set is not a whole run");
+            err.downcast_ref::<String>().cloned().unwrap_or_default()
+        };
+
+        assert!(refusal(&["1-of-3", "3-of-3"]).contains("shard(s) 2 of 3 left no measurement"));
+        assert!(refusal(&["1-of-2", "2-of-2", "1-of-3"]).contains("more than one sharded run"));
+        assert!(refusal(&["1-of-2", "1-of-2", "2-of-2"]).contains("one shard left two files"));
+        assert!(refusal(&["4-of-3"]).contains("is not a shard of a run"));
+        assert!(refusal(&["one-of-three"]).contains("is not a shard of a run"));
+        assert!(refusal(&["7"]).contains("<index>-of-<count>"));
     }
 }
 

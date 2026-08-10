@@ -1645,16 +1645,141 @@ a merge, now that `guest-suite` is required. The failure names itself now.
   gap changes test outcomes, and §9's open question is whether a runner's gate A
   spread is comparable with the dev host's — which cannot be answered on a
   different QEMU from either. Not changed here, because a `workflow_dispatch`
-  workflow cannot be verified without a three-hour run.
-  `specs/issues/build/gate-a-runs-a-different-qemu.md`.
+  workflow cannot be verified without a three-hour run. **Done in §12.1, and the
+  verification cost eight minutes rather than three hours: a dispatch takes a
+  `ref` and runs that branch's own copy of the file.**
 - **The `cargo build` inside each shard's suite step is 435 s of the widest
   shard's 1,058 s** (run `31330069053`, shard 10: suite step 976 s, harness total
   540.8 s). It is the same build on all thirteen machines and it is the largest
   single item left on the critical path — larger than the partition this task
   fixed. Nothing was done about it: a restored `target/` is the obvious lever and
-  it is a class of change that wants its own measurement.
-  `specs/issues/build/every-shard-rebuilds-the-whole-tree.md`.
+  it is a class of change that wants its own measurement. **§12.5 is that
+  measurement**, and
+  `specs/issues/build/every-shard-rebuilds-the-whole-tree.md` carries it.
 - **The per-job fixed cost is 53 s of `apt-get`** in every one of thirteen
   containers, for the same four packages (run `31330069053`, `deps` step:
   52–84 s). A prebuilt image on ghcr.io would replace it with a pull. Not taken:
   it trades an `apt-get` for a registry, and 53 s of 1,058 is 5%.
+
+## 12. What CI measures with, and it was not written down anywhere
+
+§11 is about what a merge costs. This section is about the instrument itself —
+which QEMU each job ran, which was a fact in a log line nobody reads and is a
+declaration something checks now — and about two gates that turned out to be
+half of themselves.
+
+### 12.1 Gate A ran a third QEMU, in the one job whose purpose is a comparison
+
+`gate-a.yml` ran on a bare `ubuntu-24.04` and apt-installed **8.2.2**, where
+`ci.yml`'s twelve shards and its `tcg` canary run in a `debian:sid` container for
+**11.0.3** — the dev host's version, put there by §7.3 *so that* CI and the dev
+host differ in the accelerator and nothing else. Nothing says the audio path is
+version-sensitive; virtio-sound and HDA are not the QMP injection path §7.3
+caught. What is wrong with it is structural: the arm that exists to be compared
+was a third instrument, and it was invisible, because the workflow reads
+perfectly well and never printed what it was comparing against.
+
+It runs in the shards' container now, with their `deps`, `rust` and toolchain
+steps. Four things went with the bare runner: `sudo chmod 666 /dev/kvm` (root
+inside the container opens the node), `gh release download` (the image has no
+`gh`, so it is the curl/jq form the shards use), the apt `ovmf` package (the
+firmware is `ovmf/` in this repository on every host, so it was never opened),
+and a missing toolchain release failing on `gh` rather than saying which ref to
+dispatch.
+
+**And it was verified by running it, which §11.6 said would take three hours.**
+A `workflow_dispatch` is dispatchable against a ref as long as a workflow of that
+path and trigger exists on the default branch, and what runs is *that ref's* copy
+of the file. So `gh workflow run gate-a.yml --ref <branch> -f iterations=30` is
+the whole verification, and the thorough tier at N=30 is two jobs of about half
+an hour rather than three.
+
+### 12.2 §9's open item is closer and is still not answerable by the gate
+
+§9 says the thorough tier may not move until somebody measures whether a
+runner's gate A spread is comparable with the dev host's, and §12.1 removes the
+one axis that was there by accident. Two remain, and only one of them is the
+answer.
+
+**The accelerator is the axis, and it is not a detail of the spread — it moves
+the level.** A `guest` shard's own fast-tier line, run `31377439504` shard 1:
+`audio_tone smp=1 soundd: wake_lat 178583us`, against `tests/audio-baseline.toml`'s
+recorded 5,666–10,090 µs over 30 runs on the dev host. That is twenty times the
+recorded maximum, on a *quiet* machine — so the thorough tier's own verdict on a
+runner is a comparison of a KVM guest against a cross-arch TCG sample and will
+reject on level whatever the dispersion does. **The product of a gate A run on a
+runner is therefore its printed `toml:` sample and not its exit code**, and §9's
+question has to be asked of the two dispersions rather than of the gate.
+
+**The vendor lottery is the second.** §2: `kvm_amd` and `kvm_intel` are both in
+play and nothing selects one, so the two shards of one gate A run are two
+machines and two reps are four. Every job prints its `model name` now (§12.3),
+which is what makes that readable rather than a confound.
+
+So the run that answers §9 is `gh workflow run gate-a.yml -f iterations=30`
+repeated enough times to have a *distribution of dispersions* rather than one —
+three dispatches is six jobs and about an hour and a half — and the comparison is
+`max_wake_lat_us`'s spread and `wakes`'s spread against
+`tests/audio-baseline.toml`'s, by ratio and not by Mann-Whitney against the
+recorded sample. Nothing in the tree does that arithmetic today; the gate prints
+the whole sorted sample as `toml:` lines, which is what it takes.
+
+### 12.3 The instrument is a declaration now
+
+`.github/qemu-version` holds one version. `.github/instrument.sh` is the step
+every job that boots a guest runs after its checkout, in `ci.yml`'s shards, in
+`tcg` and in `gate-a.yml`: it prints the QEMU version, the host CPU model and
+whether `/dev/kvm` is there, puts one line of that in the run summary, and
+**reds** when the version disagrees with the declaration.
+
+The reason it reds rather than warns is that `debian:sid` is a rolling release.
+The container was chosen in §7.3 for one specific version, and nothing was
+holding it: sid's QEMU moving would have re-run §7.3's experiment on every merge
+with nobody looking at the result. **The cost is stated rather than hidden — a
+sid QEMU bump reds all thirteen guest jobs and blocks merges until one line is
+committed.** That is not §10.8's apt retry in disguise: a mirror hiccup says
+nothing and is fixed by a re-run, and a version bump says the instrument changed
+and is fixed by recording it.
+
+This host reads the same file and answers with a `Note:` from
+`check_prerequisites`, never a refusal — brew moves QEMU when it feels like it
+and a build must not stop for that — because the dev host is where
+`tests/audio-baseline.toml` was recorded and its drifting is the same fact about
+the same comparison. Measured 2026-08-10: the dev host is 11.0.3 and the
+declaration matches.
+
+`cargo test --lib` holds the half that keeps it true (`src/ci.rs`): every
+workflow on the gate list that installs QEMU must run `instrument.sh`, the scan
+must find at least one such job in each — a scan that found none would report
+every gate clean — the declared version must parse, and the script must keep its
+exec bit. Teeth run rather than argued: with the instrument step taken back out
+of `gate-a.yml`, which is the state §12.1 repairs, the gate reds naming `gate`.
+
+### 12.4 Two gates that were half of themselves
+
+- **`toolchain-ready` asked whether the release *tag* existed.** What all
+  thirteen jobs install is the `toyos-toolchain.tar.zst` on it, and `gh release
+  create` makes the release and then uploads 401 MiB to it — and publishing is
+  idempotent by design (§3), so two branches carrying the same four trees both
+  build. There is a window in which the tag answers 200 and the artifact is not
+  there, and a gate that reads the tag releases thirteen shards into it, each to
+  red on a missing asset: a red whose name is the shard and whose cause is
+  `toolchain-ready`. It asks for the asset now. `toolchain.yml` gained the other
+  end: its `publish` step ends by waiting for the asset to be on the release,
+  because `gh release create … || gh release view` cannot tell *being second*
+  from *the upload failed*, and a green there is the verdict that starts the
+  thirteen.
+- **`--merge-durations` checked one half of the partition.** §4's defect has two
+  sides and the command refused only the first: a name two shards both measured.
+  The other is a shard that measured *nothing* — cancelled at its timeout, or an
+  artifact upload that failed — which leaves eleven files of twelve, and merging
+  those writes a committed profile with a twelfth of the suite deleted from it.
+  Every later run then prices those names at the longest the profile knows, which
+  is precisely the eight phantom four-minute tests §11.2 measured steering a
+  twelve-way split: the command that exists to keep the profile honest was the
+  one thing that could quietly break it. The file names always carried the
+  answer — `test-durations.shard-<i>-of-<n>` — and it is read now: one `n` across
+  the set, every `i` in `1..=n`, each exactly once. `ci.yml`'s `durations` job
+  counts the files before it runs the command and reports a short set instead of
+  merging it, because that job is advisory and a cancelled shard has already
+  reddened `guest`.
