@@ -183,16 +183,17 @@ pub fn hda_probe(
     ordinary_boot_is_untouched()
 }
 
-/// The other half of the feature's promise: **the probe is the feature and
+/// The other half of the actuator's promise: **the probe is the actuator and
 /// nothing else.**
 ///
-/// Same machine, same three controllers, a kernel without the flag. Not implied
-/// by anything above — a probe wired into `drivers::init` rather than behind it
-/// would satisfy every assertion in this file.
+/// Same machine, same three controllers, the kernel an image ships — which has
+/// no probe in it at all. Not implied by anything above: a probe wired into
+/// `drivers::init` rather than behind the parameter would satisfy every
+/// assertion in this file.
 ///
 /// It can no longer be "the log says nothing about HDA": H4's driver brings
 /// every class-0403 function up on every boot, which is what it is for. What
-/// the flag owns is the four verdict blocks and the widget dump, and those are
+/// the actuator owns is the four verdict blocks and the widget dump, and those are
 /// what must be absent.
 fn ordinary_boot_is_untouched() -> Result<(), String> {
     let log = probe_boot(&[])?;

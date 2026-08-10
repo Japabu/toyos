@@ -8,7 +8,7 @@
 //! received, never off anything the guest said about it — the boot log is used
 //! only to say *why* a disagreement happened.
 //!
-//! # What only a kernel feature can stage
+//! # What only an actuator can stage
 //!
 //! Four states of the clock, and the host can produce none of them: QEMU has no
 //! switch that removes or wedges the mc146818, its RTC always presents the

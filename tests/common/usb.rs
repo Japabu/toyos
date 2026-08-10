@@ -30,7 +30,7 @@ const GUEST_BLOCKS: [i64; 2] = [2, -2];
 const RUN_START: u64 = 4;
 const RUN_LEN: u64 = 9;
 
-/// The one kernel feature these boots need. A raw block device has no path to
+/// The one actuator these boots need. A raw block device has no path to
 /// userland, so the kernel is the only in-guest actor that can drive one — the
 /// same reason `xhci-one-slot` exists. What decides *which* disk gets written
 /// is the stamp in block 0 and not this flag, which is why the unstamped boot
@@ -327,7 +327,7 @@ pub fn usb_storage_gate(
 /// never arrived — a different LBA's data, under this LBA's number, with no
 /// error anywhere.
 ///
-/// **The actuator is a kernel feature and it corrupts the transfer, not the
+/// **The actuator corrupts the transfer, not the
 /// verdict.** QEMU derives the CSW residue from the same transfer the xHC
 /// completed, so the two accounts are one number there and can never
 /// contradict each other; `rerror` fails the whole command instead. The
@@ -826,7 +826,7 @@ fn check_geometry(log: &str, bytes: u64, lba: u32) -> Result<(), String> {
 ///   notice once and stop. Fixing `msc_flush` alone cannot produce that: the
 ///   error is swallowed and the loop is the one above.
 ///
-/// Neither boot can be green because the feature was not on: each asserts a
+/// Neither boot can be green because the actuator was not armed: each asserts a
 /// line that only the injected answer produces.
 pub fn usb_flush_optional(
     test_config: &Path,
@@ -1124,7 +1124,7 @@ pub fn xhci_deaf_registers(
 /// `no HID devices` in the same millisecond, on both controllers, while running
 /// off a stick plugged into one of them.
 ///
-/// **The actuator is a kernel feature, and the reason is timing rather than
+/// **The actuator is a boot parameter, and the reason is timing rather than
 /// expressiveness.** QEMU *can* stage a late attach: `usb-bot` and `usb-uas`
 /// are the two devices whose QOM `attached` property is settable, so
 /// `qom-set /machine/peripheral/<id> attached false|true` detaches and
@@ -1272,7 +1272,7 @@ pub fn xhci_slow_connect(
 /// enabled — on every port, on every controller, on any machine whose PORTSC is
 /// made of silicon.
 ///
-/// **The actuator is a kernel feature because nothing on the host side can
+/// **The actuator is a boot parameter because nothing on the host side can
 /// reach it.** QEMU's `xhci_port_write` clears only
 /// `CSC|PEC|WRC|OCC|PRC|PLC|CEC` on a written '1', and PED is in neither that
 /// set nor its read/write set, so writing PED=1 there does nothing at all
@@ -1284,7 +1284,7 @@ pub fn xhci_slow_connect(
 /// clears it, because a reset is what takes a real port out of Disabled
 /// (§4.19.1.1.3).
 ///
-/// The count line is what stops this from passing because the feature was off.
+/// The count line is what stops this from passing because nothing was armed.
 /// Only the emulation prints it, and it has to say zero — so "the injection is
 /// live" and "the driver never wrote PED" are separate assertions, and the
 /// per-port ones below are the register's own consequence rather than a verdict.
@@ -1398,7 +1398,7 @@ pub fn xhci_portsc_rw1c(
 /// offline for the rest of the boot with `/boot/toyos/kernel.log` — the only
 /// diagnostic channel that machine has — stopped where it stood.
 ///
-/// **The actuator is a kernel feature, and it replaces no verdict.** QEMU's
+/// **The actuator is a boot parameter, and it replaces no verdict.** QEMU's
 /// `usb-storage` answers every CBW, data phase and CSW it is handed; nothing on
 /// the host side makes one bulk transfer not complete, and `rerror`/`werror`
 /// fail a whole drive rather than leaving a transfer in flight.
@@ -1756,7 +1756,7 @@ pub fn xhci_full_speed_device(
 /// that never delivered at all — which is the shape the T14 showed and the one
 /// whose recovery has to work before any report has ever arrived.
 ///
-/// The actuator is a kernel feature and `xhci/hid.rs`'s `stage_break` says why
+/// The actuator is a boot parameter and `xhci/hid.rs`'s `stage_break` says why
 /// nothing on the host side can reach it. What it replaces is the completion
 /// code **and the report that transfer delivered**: QEMU really moved a mouse
 /// report into the buffer, so a driver that dispatched it despite the error
@@ -1971,7 +1971,7 @@ fn hid_break_boot(
 /// same `usb_device_attach` → `xhci_port_update` → `xhci_port_notify` path a
 /// device attached at startup does, so what the guest sees is a real Port
 /// Status Change Event with a real device behind it. That is the whole
-/// difference from `xhci_slow_connect`, which needs a kernel feature because
+/// difference from `xhci_slow_connect`, which needs an actuator because
 /// it has to aim at a window the boot opens and closes in milliseconds; here
 /// the window is the entire life of the machine.
 ///
@@ -2235,7 +2235,7 @@ fn hotplug_delivered(stdout: &str, word: &str, want: (i32, i32)) -> Result<(), S
 /// Four times, once per ordinary unplug.
 ///
 /// The actuator is QEMU's own `device_del`/`device_add` with no wait between
-/// them, which lands both edges inside one debounce. No kernel feature: the
+/// them, which lands both edges inside one debounce. No actuator: the
 /// window is 100 ms wide and two QMP commands on a unix socket cross it easily.
 pub fn xhci_flap(
     test_config: &Path,
@@ -2489,7 +2489,7 @@ fn hotplug_unbound(log: &str) -> Result<(), String> {
 ///
 /// Every other USB profile puts the boot stick on port 1, where it binds and
 /// the reuse cannot happen; that is why a full gate boot never reached this.
-/// The actuator is not a kernel feature: QEMU can already stage a disk this
+/// The actuator is not a boot parameter: QEMU can already stage a disk this
 /// driver refuses (3 TB, more sectors than READ(10) addresses) and it assigns
 /// ports in device-creation order, so attaching it ahead of the boot stick is
 /// the whole injection. Nothing about the driver is modified to run this.
@@ -2752,7 +2752,7 @@ pub fn usb_boot_stick_pulled(
         ));
     }
     // The rotation actually ran, so "the sink was busy" is a fact rather than a
-    // feature flag that might have been dropped.
+    // parameter that might have been dropped.
     if !console.contains("log-file: /log/") || !console.contains("and this boot continues in") {
         return Err(format!(
             "the log sink never rotated, so the pull below lands on a sink that is only \

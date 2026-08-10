@@ -275,9 +275,11 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 // desktop are how those tests passed vacuously twice.
 // `screen_decoder` needs no guest at all; it proves the decoder against a
 // bitmap it rendered itself, before anything points it at a real screen.
-/// Feature-carrying tests last: each distinct kernel feature set is one more
-/// kernel rebuild, and ending on one leaves the plain-kernel tests above it
-/// untouched by the thrash.
+/// The order was once about kernel rebuilds — every actuator was a build, and a
+/// feature-carrying test last left the plain-kernel ones above it untouched by
+/// the thrash. Since `specs/test-cost-audit.md` §5.9.7 there are two kernels and
+/// nothing to thrash; the order is kept because these are read the way they are
+/// written.
 const SCREEN_TESTS: &[(&str, Sched)] = &[
     ("screen_decoder", Sched::Parallel),
     ("screen_diag_boot", Sched::Parallel),
