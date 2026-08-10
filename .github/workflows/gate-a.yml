@@ -91,43 +91,15 @@ jobs:
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # The key `toolchain.yml` publishes under, fetched through the API rather
-      # than `gh`, which this image has not.
-      #
       # **This workflow builds no toolchain and never waits for one.** It is
       # dispatch-only, so by the time anyone runs it the branch has been through
-      # `toolchain.yml` on its pull request; a missing release is a mistake
-      # about which ref was dispatched, and it says so rather than sitting in a
-      # two-hour loop.
+      # `toolchain.yml` on its pull request; a missing release is a mistake about
+      # which ref was dispatched, and the script says so rather than sitting in
+      # a loop.
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config --global --add safe.directory "$PWD"
-          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
-                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          echo "toolchain: $tag"
-          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          for _ in $(seq 10); do
-            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
-              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
-            [ -n "$asset" ] && break
-            echo "the release $tag did not answer; retrying"
-            sleep 15
-          done
-          if [ -z "$asset" ]; then
-            echo "::error::$tag is not published, and this workflow builds nothing."
-            echo "::error::toolchain.yml publishes it on a pull request and on a push to main;"
-            echo "::error::open one for this ref, or dispatch a ref that has been through it."
-            exit 1
-          fi
-          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
-          mkdir -p rust/build
-          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
-          stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
-          rustup toolchain link toyos "$stage2"
-          "$stage2/bin/rustc" -vV
+        run: .github/install-toolchain.sh
 
       # The host conditions line every run prints is the point of running it
       # here, so nothing is captured away from it.

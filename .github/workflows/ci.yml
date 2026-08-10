@@ -195,6 +195,13 @@ jobs:
           MATRIX_LABEL: shard ${{ matrix.shard }}/12
         run: .github/instrument.sh
 
+      - id: key
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
+            >> "$GITHUB_OUTPUT"
+
       - name: rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -209,27 +216,48 @@ jobs:
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config --global --add safe.directory "$PWD"
-          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
-                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          echo "toolchain: $tag"
-          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          for _ in $(seq 10); do
-            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
-              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
-            [ -n "$asset" ] && break
-            echo "the release $tag did not answer; retrying"
-            sleep 15
-          done
-          test -n "$asset"
-          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
-          mkdir -p rust/build
-          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
-          stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
-          rustup toolchain link toyos "$stage2"
-          "$stage2/bin/rustc" -vV
+          TAG: ${{ steps.key.outputs.tag }}
+        run: .github/install-toolchain.sh
+
+      # **The build below is the same build on thirteen machines, and it was
+      # 435 s of the widest shard's 1,058 s.** Measured cold against warm in one
+      # run on one image, `probe-cache.yml` run `31385467644`: 519 s against
+      # **282 s**, 177 crate compiles against 10, a 786 MB entry and a 7 s
+      # restore. What the cache eliminates is every third-party crate; what it
+      # cannot is our own, because `actions/checkout` writes every source with
+      # the current time and cargo's fingerprint for a path crate is an mtime
+      # comparison. **That is the direction of error worth stating: a fresh
+      # checkout makes cargo rebuild more than it needs to, never less.**
+      #
+      # **The key is the toolchain tag first and the lockfiles second.** The one
+      # thing cargo cannot see is the sysroot — `toyos-abi`, `toyos` and
+      # `userland/libc` are compiled into it, and its `rustc -vV` does not change
+      # when they do — so the tag is in the *prefix* and `restore-keys` cannot
+      # fall back across a sysroot change. `src/build.rs`'s `external_fingerprint`
+      # is the belt to that brace and it fires either way: 8 `external deps
+      # changed: cleaning` lines in both arms of the probe.
+      #
+      # **`tcg` writes it and the twelve shards only read it.** Twelve concurrent
+      # uploads of the same content race for one key, and none of them would
+      # benefit from a sibling anyway — the twelve start together, so the win is
+      # across runs. A cache written on `main` is the only one every branch can
+      # restore (§8.4), and a branch's own second push restores its first.
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            kernel/target
+            bootloader/target
+            userland/target
+            toyos-ld/target
+            toyos-cc/target
+            tests/target
+            tests/toyos-rust-tests/*/target
+          key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: guest-${{ steps.key.outputs.tag }}-
 
       # `--host-slots 0`: the semaphore arbitrates between worktrees on one
       # host, and a shard is a host with one suite on it.
@@ -400,6 +428,13 @@ jobs:
       - name: the instrument
         run: .github/instrument.sh
 
+      - id: key
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
+            >> "$GITHUB_OUTPUT"
+
       - name: rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -409,27 +444,53 @@ jobs:
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config --global --add safe.directory "$PWD"
-          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
-                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          for _ in $(seq 10); do
-            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
-              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
-            [ -n "$asset" ] && break
-            echo "the release $tag did not answer; retrying"
-            sleep 15
-          done
-          test -n "$asset"
-          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
-          mkdir -p rust/build
-          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
-          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+          TAG: ${{ steps.key.outputs.tag }}
+        run: .github/install-toolchain.sh
+
+      # **This job is the one that writes what the twelve shards read**, and the
+      # `guest` job's own restore step carries the argument for all of it. It is
+      # the right writer because it is one job rather than twelve racing for a
+      # key, it builds exactly the shared set the shards pay for before their
+      # first boot, and it runs on every run — the guard above means it reds
+      # rather than skipping.
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            kernel/target
+            bootloader/target
+            userland/target
+            toyos-ld/target
+            toyos-cc/target
+            tests/target
+            tests/toyos-rust-tests/*/target
+          key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: guest-${{ steps.key.outputs.tag }}-
 
       - name: one test, emulated
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
+
+      # After the test and not before it: what is worth keeping is a tree that
+      # built *and booted*. `actions/cache/save` warns rather than fails when the
+      # key is already there, which is what a re-run of this run does.
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            kernel/target
+            bootloader/target
+            userland/target
+            toyos-ld/target
+            toyos-cc/target
+            tests/target
+            tests/toyos-rust-tests/*/target
+          key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
 
   # **One name for twelve shards, because a required status check is matched by
   # job name and a matrix produces twelve of them.** Twelve entries in a

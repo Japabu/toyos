@@ -26,7 +26,12 @@ cleans=$(grep -c 'external deps changed: cleaning' "$log" || true)
 # The target directories this tree actually has, for the arm that prices the
 # cache entry. Written rather than guessed, because a path the cache does not
 # name is a path the warm arm rebuilds.
+#
+# To stdout as well as to the summary: a job summary is not readable from the
+# REST API, so a number that lives only there cannot be quoted afterwards.
 find . -maxdepth 3 -name target -type d -not -path './rust/*' > /tmp/target-dirs
+echo "PROBE-CACHE $arm TARGET-DIRS:"
+du -sh $(cat /tmp/target-dirs) 2>/dev/null | sort -h
 
 {
   echo "- **$arm**: ${elapsed}s, exit $status, $compiles crate compiles, $cleans external-dep cleans"

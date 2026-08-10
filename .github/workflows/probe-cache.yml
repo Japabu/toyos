@@ -1,12 +1,12 @@
 name: probe cache
 
 # **Does a restored `target/` buy a shard anything, and what does carrying it
-# cost?** `specs/issues/build/every-shard-rebuilds-the-whole-tree.md` measured
-# the thing to beat — about 435 s of `cargo build` inside every one of thirteen
-# jobs, 41% of the widest shard's critical path — and asked for its own A/B
-# rather than a change folded into somebody else's task. This is that A/B, in
-# the shape the issue names: one shard-shaped build with a warm cache against
-# one without, in the same run, on the same image, from the same commit.
+# cost?** The thing to beat was about 435 s of `cargo build` inside every one of
+# thirteen jobs, 41% of the widest shard's critical path, and it was filed as a
+# finding wanting its own A/B rather than a change folded into somebody else's
+# task. This is that A/B, and `specs/ci-plan.md` §12.5 is what it answered: one
+# shard-shaped build with a warm cache against one without, in the same run, on
+# the same image, from the same commit.
 #
 # The arms differ in one thing, which is whether `actions/cache/restore` found
 # anything. `cold` writes the entry `warm` reads, so `needs:` is what makes the
@@ -70,20 +70,7 @@ jobs:
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config --global --add safe.directory "$PWD"
-          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
-                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          echo "toolchain: $tag"
-          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
-            | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
-          test -n "$asset"
-          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
-          mkdir -p rust/build
-          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
-          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+        run: .github/install-toolchain.sh
 
       - name: build, cold
         run: .github/probe-cache.sh cold
@@ -144,19 +131,7 @@ jobs:
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config --global --add safe.directory "$PWD"
-          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
-                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
-            | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
-          test -n "$asset"
-          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
-          mkdir -p rust/build
-          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
-          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+        run: .github/install-toolchain.sh
 
       # The one difference between the two arms. Timed by the step itself,
       # because a restore that costs more than the build it saves is the answer
