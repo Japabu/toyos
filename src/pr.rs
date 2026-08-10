@@ -672,4 +672,36 @@ mod tests {
         sh(&wt, &["switch", "-q", "main"]);
         assert!(preflight(&wt).expect_err("main is not a branch to land").contains("on main"));
     }
+
+    /// **The draft has to be the answer on the push that creates the branch**,
+    /// because that is the only moment an agent is reading for what to do next
+    /// and CI runs on a pull request and on nothing else.
+    ///
+    /// `ls-remote` is the question, and the whole point is that it is asked
+    /// *before* the push — a second later the answer is the wrong one for ever.
+    #[test]
+    fn the_first_push_is_told_to_open_a_draft_and_later_ones_are_not() {
+        let (_origin, wt) = repo("first-push");
+        commit(&wt, "g", "mine\n", "work");
+
+        let before = git(&wt, &["ls-remote", "--heads", "origin", "wt"]).unwrap();
+        assert!(before.trim().is_empty(), "the branch is not on the remote yet");
+        assert!(open_it_now("wt").contains("gh pr create --draft"));
+
+        let first = prepare(&wt).expect("the first --pr should push and print");
+        assert!(first.contains("Open it as a draft now"), "{first}");
+        assert!(
+            !first.contains("create --fill"),
+            "--fill composes what becomes the merge commit's message: {first}"
+        );
+
+        let after = git(&wt, &["ls-remote", "--heads", "origin", "wt"]).unwrap();
+        assert!(!after.trim().is_empty(), "the push happened");
+
+        commit(&wt, "g2", "more\n", "more work");
+        let later = prepare(&wt).expect("a later --pr should push and print");
+        assert!(later.contains("gh pr ready"), "{later}");
+        assert!(!later.contains("Open it as a draft now"), "{later}");
+        assert!(!later.contains("create --fill"), "{later}");
+    }
 }
