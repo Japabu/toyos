@@ -2306,17 +2306,20 @@ killed the owner's desktop. There is no grant: the buffer travels over the
 connection, the heir holds it, and the request is *served*. The heir's own
 report of being served is the witness.
 
-**What the pin owes.** The `rust` submodule pin on this branch is
-`0e27504731a5f6a2f7c9d43e9e40e6b28b56a0e5`, recorded at chunk 5, and **that
-commit exists nowhere** — not locally and not on `Japabu/rust`. The fork's
-`origin/main` was `0e27504731a51efe…` (the same twelve-character prefix, which
-is why it went unnoticed) and is now `d91d5a423708b67f67b3aca99631f0dd085c7d33`
-with this chunk's `connection_join` on top and pushed. **The branch must record
-`d91d5a423708b67f67b3aca99631f0dd085c7d33` for `rust` before the pull request**,
-which in a worktree — where `rust/` is deliberately an empty stub — is
-`git update-index --add --cacheinfo 160000,d91d5a423708b67f67b3aca99631f0dd085c7d33,rust`.
-Nothing in the tree checks a submodule pin resolves, and CI has never run on
-this branch, so this class of breakage is invisible until the pull request.
+**The `rust` pin was broken from chunk 5 and is fixed here.** It read
+`0e27504731a5f6a2f7c9d43e9e40e6b28b56a0e5`, and that commit exists in no
+repository. The fork's head at the time was `0e27504731a51efe…` — the same
+twelve hex characters, which is why nothing looked twice. It now reads
+`d91d5a423708b67f67b3aca99631f0dd085c7d33`, which is pushed and carries this
+chunk's `connection_join`.
+
+**Nothing in the tree would have caught it.** A worktree leaves `rust/` an empty
+stub by design, so no build here ever resolves the pin, and CI is the first
+thing that would — on a branch CI has never run. Recording one from a worktree
+is `git update-index --add --cacheinfo 160000,<sha>,rust`, or the same change
+applied to the index as a patch; there is no `git add` for a submodule you do
+not have checked out. Chunks 7 and 8 both touch the std fork and both have to
+do it.
 
 **Chunk 7 — process objects and the fail-fast flip. Green.**
 `ProcessObject`/`ThreadObject`; `SYS_SPAWN` returns a handle;
