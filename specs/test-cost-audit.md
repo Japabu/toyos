@@ -1878,7 +1878,7 @@ The owner took §3.6 on 2026-08-10. What landed:
   `assert_overflow_checked`'s place and for its reason: a shipping kernel must
   name none of the 47 and the test kernel must name all of them, which is what
   keeps the search from being a spelling of `true`. Measured on the two binaries
-  this build produces — 0 of 47 at 3,829,512 bytes and 47 of 47 at 4,247,272.
+  this build produces — 0 of 47 at 3,829,440 bytes and 47 of 47 at 4,247,272.
   The names come from `kernel/src/actuator.rs`, so deleting one takes its
   command lines with it, exactly as `declared_kernel_features` does for a
   feature.
@@ -1916,6 +1916,15 @@ Two more features remain and neither is a build a `cargo test` makes:
 no runtime value can reach, and `debug-wait` is what `cargo run -- --debug`
 compiles in — a parameter would have to put it in the shipping kernel, and what
 `--debug` exists to debug is the kernel an image ships.
+
+#### What the shipping kernel cost
+
+**304 bytes**, from 3,829,136 at `cb52cdb` to 3,829,440, both linked on the dev
+host at `[profile.toyos]` and both with 0 of the 47 names in them. It is the
+`KernelArgs` field — 16 bytes of struct, its `Debug` arm, and the refusal
+`actuator::init` carries for a parameter this binary cannot honour. Nothing else
+reaches it: every accessor is `const fn … { false }`, so each call site is an
+`if false` the optimiser removes along with the arm behind it.
 
 #### What the negative gates still prove
 
