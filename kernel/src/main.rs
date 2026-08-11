@@ -172,7 +172,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
     // Early boot: percpu not ready, just halt (single CPU at this point)
     if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
-        log!("!!! EARLY PANIC !!!: {}", info);
+        alert!("!!! EARLY PANIC !!!: {}", info);
         // This branch halts directly and never reaches halt_all_cpus, so it
         // owns both halves itself — and inverts halt_all_cpus' order. It runs
         // before idt::init, the one window with no exception handlers at all,
@@ -206,7 +206,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let prev = percpu::swap_fault_state(percpu::CpuFaultState::Panic);
     if prev != percpu::CpuFaultState::Normal {
         // Nested: Panic→Panic, Fatal→Panic, PageFault→Panic. Escalate.
-        log!("!!! DOUBLE PANIC !!!");
+        alert!("!!! DOUBLE PANIC !!!");
         apic::halt_all_cpus();
     }
 
@@ -295,9 +295,10 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
 /// nothing to read afterwards. A `/log` that refused to mount already says so,
 /// once, in the middle of phase 5, in white, among sixty-seven other rows.
 ///
-/// `!!!` is the panic console's alert marker (`panic_console::has_alert`),
-/// which paints the row red. It is claimed here for the two states in which
-/// this boot leaves no readable account of itself anywhere.
+/// `alert!` is what says the row is red, and it is used here for the two states
+/// in which this boot leaves no readable account of itself anywhere. The `!!!`
+/// is still in the text because the panel still finds a red row by scanning for
+/// it; L2 re-points the panel at `Level` and the marker goes with that.
 ///
 /// ASCII throughout, unlike the rest of the kernel's prose: the panel's font is
 /// codepoints 0x20..=0x7E and `draw_glyph` renders everything else as a dot, so
@@ -309,10 +310,10 @@ fn report_log_destination() {
             log!("log: no serial console - this boot is in {path} and on the screen")
         }
         (true, None) => {
-            log!("!!! log: no /log - this boot is on the console only, and nothing outlives the power !!!")
+            alert!("!!! log: no /log - this boot is on the console only, and nothing outlives the power !!!")
         }
         (false, None) => {
-            log!("!!! log: no serial console and no /log - this boot is on this screen and nowhere else !!!")
+            alert!("!!! log: no serial console and no /log - this boot is on this screen and nowhere else !!!")
         }
     }
 }

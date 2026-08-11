@@ -1,6 +1,6 @@
 use crate::arch::{apic, cpu, debug, syscall, percpu};
 use crate::arch::percpu::CpuFaultState;
-use crate::{log, mm, process, scheduler, symbols};
+use crate::{alert, log, mm, process, scheduler, symbols};
 
 use super::{Vector, TrapFrame, RPL_MASK, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
 
@@ -273,7 +273,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
 }
 
 fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
-    log!("!!! PANIC !!!: {}", info);
+    alert!("!!! PANIC !!!: {}", info);
 
     log!("  Backtrace:");
     kernel_backtrace(rbp, 20);
@@ -569,10 +569,10 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
 
     let tid_raw = percpu::current_tid().map_or(u32::MAX, |t| t.raw());
     if recursive {
-        log!("!!! FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={} RECURSIVE",
+        alert!("!!! FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={} RECURSIVE",
             ctx.frame.rip, ctx.cr2, ctx.frame.error_code, cpu::read_cr3(), ctx.frame.rsp, tid_raw);
     } else {
-        log!("!!! FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={}",
+        alert!("!!! FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={}",
             ctx.frame.rip, ctx.cr2, ctx.frame.error_code, cpu::read_cr3(), ctx.frame.rsp, tid_raw);
     }
 

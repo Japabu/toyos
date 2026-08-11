@@ -50,6 +50,25 @@ pub mod arch {
     pub mod tlb {
         pub fn poll() {}
     }
+
+    /// **A strictly stronger model than the instruction, and the direction is
+    /// the whole argument.**
+    ///
+    /// The kernel's `percpu_fetch_add` is one `xadd` with no `lock` prefix
+    /// inside a `cli` bracket. The only behaviour it has that a real
+    /// `fetch_add` does not is non-atomicity against *another CPU's* write to
+    /// the same word — and the bracket is what makes "no other CPU writes
+    /// `head`" true rather than hopeful. So every interleaving the real code
+    /// can produce, loom explores here; the shim cannot hide a race.
+    ///
+    /// Stated with its precondition, because without the bracket this shim is
+    /// the thing hiding the bug rather than the thing modelling around it.
+    ///
+    /// # Safety
+    /// Same contract as the kernel's: a word only one CPU writes.
+    pub unsafe fn percpu_fetch_add(counter: &loom::sync::atomic::AtomicU64) -> u64 {
+        counter.fetch_add(1, loom::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// The contention and deadlock reports are unreachable in these models — the
@@ -65,3 +84,6 @@ pub mod sync;
 
 #[path = "../../kernel/src/shootdown.rs"]
 pub mod shootdown;
+
+#[path = "../../kernel/src/log/shard.rs"]
+pub mod log_shard;

@@ -84,7 +84,7 @@ pub fn check_pte_monitor() {
     if current & mask != expected & mask {
         MONITOR_PTE_ADDR.store(0, Ordering::Relaxed);
 
-        crate::log!("!!! PTE CORRUPTION DETECTED !!!");
+        crate::alert!("!!! PTE CORRUPTION DETECTED !!!");
         crate::log!("  PTE addr={:#x}", addr);
         crate::log!("  expected={:#018x}", expected);
         crate::log!("  actual  ={:#018x}", current);

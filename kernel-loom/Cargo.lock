@@ -53,6 +53,7 @@ name = "kernel-loom"
 version = "0.1.0"
 dependencies = [
  "loom",
+ "toyos-abi",
 ]
 
 [[package]]
@@ -180,6 +181,10 @@ checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "toyos-abi"
+version = "0.1.0"
 
 [[package]]
 name = "tracing"

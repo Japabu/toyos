@@ -26,6 +26,9 @@ loom = []
 
 [dependencies]
 loom = "0.7"
+# The record layout the shard is a ring of. `no_std`, no atomics of its own,
+# so it compiles into the model unchanged.
+toyos-abi = { path = "../toyos-abi" }
 
 [lib]
 path = "src/lib.rs"

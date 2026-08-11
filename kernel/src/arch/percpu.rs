@@ -107,6 +107,13 @@ pub struct PerCpu {
     /// timers are armed independently on every CPU; a shared value would let
     /// any CPU's arm/stop clobber every other CPU's re-arm fallback.
     pub last_armed_ticks: AtomicU32,       // offset 260
+    /// This CPU's [`log::Shard`], reached by [`reserve_log_slot`].
+    ///
+    /// **Never null on a live CPU**: [`alloc_percpu`] fills it for cpu0 and for
+    /// every AP, and the BSP allocates an AP's whole `PerCpu` before that AP
+    /// executes an instruction. That is why `emit` needs no check — an absent
+    /// shard is not a state this field can be in.
+    log_shard: u64,                        // offset 264
 }
 
 // GDT layout:
@@ -200,6 +207,7 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, ring0_timer_fires) == 248);
 const _: () = assert!(core::mem::offset_of!(PerCpu, last_seen_ring0_fires) == 252);
 const _: () = assert!(core::mem::offset_of!(PerCpu, fault_state) == 256);
 const _: () = assert!(core::mem::offset_of!(PerCpu, last_armed_ticks) == 260);
+const _: () = assert!(core::mem::offset_of!(PerCpu, log_shard) == 264);
 
 /// **One stack size, so "which stack am I on" is not a question kernel code
 /// has to answer.**
@@ -294,7 +302,74 @@ fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     percpu.tss = Tss::new();
     percpu.gdt = GDT_ENTRIES;
     percpu.init_tss_descriptor();
+    percpu.log_shard = alloc_log_shard(cpu_id);
     ptr
+}
+
+/// This CPU's log shard: cpu0's is the boot shard, and every other is a fresh
+/// zeroed one.
+///
+/// **Here rather than in [`init_ap`], which is where an earlier draft of the
+/// spec put it.** `init_ap` calls `control_regs::init` and `fpu::log_state`,
+/// both of which log — so an AP whose shard were allocated there would log into
+/// a shard that did not exist yet, and the only candidate is cpu0's, which
+/// another CPU is writing. The whole `PerCpu` is BSP-allocated before the AP
+/// runs an instruction, so allocating here closes that window rather than
+/// narrowing it.
+///
+/// `alloc_zeroed`, because a zeroed slot is what `Shard::read`'s `seq < head`
+/// test is written against and what cpu0's `.bss` shard already is.
+fn alloc_log_shard(cpu_id: u32) -> u64 {
+    if cpu_id == 0 {
+        return &raw const log::BOOT_SHARD as u64;
+    }
+    let layout = Layout::from_size_align(size_of::<log::Shard>(), 64).unwrap();
+    let ptr = unsafe { alloc_zeroed(layout) };
+    assert!(!ptr.is_null(), "percpu: log shard alloc failed for cpu{cpu_id}");
+    ptr as u64
+}
+
+/// This CPU's shard, its identity, and one sequence number out of that shard —
+/// with interrupts masked across exactly the pointer read and the add.
+///
+/// The `xadd` has **no `lock` prefix**. It is atomic against an interrupt on its
+/// own CPU because instructions retire whole, and it is not atomic against
+/// another CPU — which is sound only while this CPU owns the shard, and the
+/// `cli` is what makes that true across the two steps. `log::reserve` carries
+/// the argument in full; the short version is that work stealing can move a
+/// preemptible kernel context between the `gs:` read and the add.
+///
+/// Everything after the add is outside the bracket on purpose: the sequence
+/// number is exclusively ours from that instruction on, so a preemption there
+/// costs nothing. The identity fields are read inside it so that a record
+/// cannot name a CPU it was not written on.
+pub fn reserve_log_slot() -> (*const log::Shard, u64, u32, u32, u32) {
+    let shard: u64;
+    let seq: u64;
+    let cpu: u32;
+    let tid: u32;
+    let pid: u32;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "cli",
+            "mov {shard}, gs:[{shard_off}]",
+            "mov {cpu:e}, gs:[8]",
+            "mov {tid:e}, gs:[136]",
+            "mov {pid:e}, gs:[140]",
+            "mov {seq}, 1",
+            "xadd [{shard}], {seq}",
+            "popfq",
+            shard = out(reg) shard,
+            seq = out(reg) seq,
+            cpu = out(reg) cpu,
+            tid = out(reg) tid,
+            pid = out(reg) pid,
+            shard_off = const core::mem::offset_of!(PerCpu, log_shard),
+            options(preserves_flags),
+        );
+    }
+    (shard as *const log::Shard, seq, cpu, tid, pid)
 }
 
 /// One idle stack and the guard page under it.
