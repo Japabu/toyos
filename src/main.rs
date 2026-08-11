@@ -113,6 +113,14 @@ fn main() {
         toyos_build::durations::dispatch(&root, &args);
         return;
     }
+    // Reads two directories and two files and prints. Here for the same reason
+    // again, and for one more: the question it answers — "is this red known,
+    // and on what?" — is asked while a build is broken as often as while one
+    // works.
+    if args.iter().any(|a| a == "--known-red") {
+        toyos_build::redlist::dispatch(&root, &args);
+        return;
+    }
 
     check_prerequisites(&root);
     env::set_current_dir(&root).expect("Failed to cd to project root");
