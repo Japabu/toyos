@@ -855,6 +855,12 @@ and every name that had been rotating is gone from both it and this probe:
 
 ## 9.2 The eleven, with their rates
 
+**This table is prose and the index is `src/redlist.rs`.** Every row here, the
+three that say CLOSED, and the twelve §9.1 names as 0 of 5 are transcribed there
+with their instrument, their run and the day they were taken;
+`cargo run -- --known-red <test>` is the query. Read this section for why each
+number is what it is, never to decide whether a name is on the list.
+
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|
 | ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — the Bulk-Only Reset raced the transfer it recovered from (`specs/issues/hardware/`) |
