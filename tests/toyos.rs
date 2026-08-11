@@ -97,10 +97,12 @@ impl HostSlots {
 
 /// Which tier the shared boot's 153 binaries are in.
 ///
-/// [`Tier::Fast`] and not a judgement call: the block costs about thirteen
-/// seconds between all of them, and not one of its members is within an order of
-/// magnitude of `toyos_build::tiers::FAST_CEILING_MS`. Declared beside
-/// [`SHARED_BLOCK`] rather than assumed, for the same reason that is declared.
+/// [`Tier::Fast`] because every member in the effective CI profile is at or
+/// under `toyos_build::tiers::FAST_CEILING_MS`. [`check_no_collisions`] refuses
+/// a Fast shared member with no current measurement or one over the line, so a
+/// newly discovered binary starts conservative instead of inheriting this
+/// answer silently. Declared beside [`SHARED_BLOCK`] rather than assumed, for
+/// the same reason that is declared.
 const SHARED_TIER: Tier = Tier::Fast;
 
 /// The one boot that carries every Rust and C test.
@@ -280,7 +282,8 @@ const RUST_SKIP: &[&str] = &[
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
 // asserts on the wav the virtio-sound device captured, so they are excluded
 // from the shared multi-test boot.
-const AUDIO_TESTS: &[&str] = &["audio_tone", "audio_tone_load"];
+const AUDIO_TESTS: &[(&str, Tier)] =
+    &[("audio_tone", Tier::Fast), ("audio_tone_load", Tier::Nightly)];
 
 // Scheduler-core gate A covers both SMP configs: smp=1 is the audio spec's
 // first-class single-CPU case, smp=8 the full-SMP case.
@@ -315,9 +318,9 @@ const SCREEN_TESTS: &[(&str, Sched, Tier)] = &[
     ("screen_recoverable_untouched", Sched::Parallel, Tier::Fast),
     ("screen_early_panic", Sched::Parallel, Tier::Fast),
     ("screen_late_panic", Sched::Parallel, Tier::Fast),
-    ("screen_paged_scrollback", Sched::Parallel, Tier::Fast),
+    ("screen_paged_scrollback", Sched::Parallel, Tier::Nightly),
     ("screen_panic_muted", Sched::Parallel, Tier::Fast),
-    ("screen_console_panic", Sched::Parallel, Tier::Fast),
+    ("screen_console_panic", Sched::Parallel, Tier::Nightly),
     ("screen_fatal_halt", Sched::Parallel, Tier::Fast),
     // The same fatal path with a compositor holding the panel, which is the
     // only configuration the owner's laptop is ever in and the one no screen
@@ -358,10 +361,10 @@ const GRAFFITI: [u8; 3] = [0x00, 0xC0, 0x00];
 /// tidy.
 const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("ioapic_topology", Sched::Parallel, Tier::Fast),
-    ("control_regs", Sched::Parallel, Tier::Fast),
+    ("control_regs", Sched::Parallel, Tier::Nightly),
     ("control_regs_negative", Sched::Parallel, Tier::Nightly),
     ("input_merge", Sched::Parallel, Tier::Fast),
-    ("metal_sim_input", Sched::Parallel, Tier::Fast),
+    ("metal_sim_input", Sched::Parallel, Tier::Nightly),
     // One boot from here to `metal_sim_compositor_stall` (`METAL_SIM_DESKTOP`).
     ("metal_sim_compositor", Sched::Parallel, Tier::Nightly),
     // Reads the boot log this group already has, after the member above has
@@ -388,7 +391,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // verdict rather than a slower one. Watched to happen, on a compositor made
     // slow on purpose. Its own boot too: it leaves the pointer somewhere else
     // and the window in a different place than it found them.
-    ("metal_sim_window_drag", Sched::Serial, Tier::Fast),
+    ("metal_sim_window_drag", Sched::Serial, Tier::Nightly),
     // A host-measured drain rate with an 8 s ceiling on a 3.3 s expectation.
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
@@ -404,7 +407,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // callback's own period count, and the capture is read for amplitude and
     // for what fraction of it carries signal — never for when.
     ("doom_music", Sched::Parallel, Tier::Nightly),
-    ("netd_connection_caps", Sched::Parallel, Tier::Fast),
+    ("netd_connection_caps", Sched::Parallel, Tier::Nightly),
     // Its own boot with a NIC under it, because sshd leaves at the bind on
     // every other config. Every verdict is a line of text; no clock in any.
     ("sshd_fail_closed", Sched::Parallel, Tier::Nightly),
@@ -415,7 +418,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("netd_hostile_peer", Sched::Serial, Tier::Fast),
     ("launcher_refusals", Sched::Parallel, Tier::Nightly),
     ("foreign_disk_untouched", Sched::Parallel, Tier::Fast),
-    ("boot_partition_identity", Sched::Parallel, Tier::Fast),
+    ("boot_partition_identity", Sched::Parallel, Tier::Nightly),
     ("double_fault_stack", Sched::Parallel, Tier::Fast),
     // Its own boot, its own feature, and it drives the guest only through
     // stdin — nothing it touches is shared with another test.
@@ -449,8 +452,8 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // Two boots, and the verdict is that they answer differently. Nothing in it
     // is timed: every arm is a process exit code or a byte comparison.
     ("fpu_isolation", Sched::Parallel, Tier::Nightly),
-    ("short_sleep_livelock", Sched::Parallel, Tier::Fast),
-    ("i8042_health", Sched::Parallel, Tier::Fast),
+    ("short_sleep_livelock", Sched::Parallel, Tier::Nightly),
+    ("i8042_health", Sched::Parallel, Tier::Nightly),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
     //
@@ -458,9 +461,9 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // than QEMU's PS/2 device holds — `i8042_mouse` by pacing against the
     // guest's own report, within [`MOUSE_LEAD`] — so a guest with less of the
     // host is a longer run and not a smaller count.
-    ("i8042_keyboard", Sched::Parallel, Tier::Fast),
-    ("i8042_no_spurious_wake", Sched::Parallel, Tier::Fast),
-    ("i8042_mouse", Sched::Parallel, Tier::Fast),
+    ("i8042_keyboard", Sched::Parallel, Tier::Nightly),
+    ("i8042_no_spurious_wake", Sched::Parallel, Tier::Nightly),
+    ("i8042_mouse", Sched::Parallel, Tier::Nightly),
     // A boot each, and deliberately not a group: every one of them changes
     // the machine's layout, which `i8042_keyboard` asserts against, and a
     // wizard that exits the instant it has its answer leaves the guest with
@@ -482,7 +485,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // The wizard on the two surfaces the machine actually has, rather than on
     // the stand-in `locale_gate` is. Each costs a boot of a different image.
     ("console_locale_detect", Sched::Parallel, Tier::Fast),
-    ("desktop_locale_detect", Sched::Parallel, Tier::Fast),
+    ("desktop_locale_detect", Sched::Parallel, Tier::Nightly),
     // Typing at the same desktop, measured rather than transcribed: it waits
     // for its eight echoes instead of asserting how many arrived in a window,
     // so a guest that is slow costs seconds and not a verdict, and the verdict
@@ -498,12 +501,12 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // verdicts are counts the report has to agree with itself about, not a
     // wall-clock margin — the one duration in it is the dump's own 250 ms
     // ceiling, which the guest spends and the host never measures.
-    ("blocked_dump", Sched::Parallel, Tier::Fast),
+    ("blocked_dump", Sched::Parallel, Tier::Nightly),
     // Two boots of one machine compared on the guest's own `Boot: complete`
     // with a 300 ms allowance, which is the whole assertion.
-    ("i8042_absent", Sched::Serial, Tier::Fast),
+    ("i8042_absent", Sched::Serial, Tier::Nightly),
     ("i8042_quarantine", Sched::Parallel, Tier::Fast),
-    ("i8042_budget_expiry", Sched::Parallel, Tier::Fast),
+    ("i8042_budget_expiry", Sched::Parallel, Tier::Nightly),
     ("i8042_fadt_denial", Sched::Parallel, Tier::Fast),
     ("i8042_kbd_echo", Sched::Parallel, Tier::Fast),
     ("i8042_undecoded_bytes", Sched::Parallel, Tier::Fast),
@@ -511,11 +514,11 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // off the guest's own `last byte at Nms` stamps. The gap it injects is
     // 3 s against a 500 ms period, so six periods of margin decide whether the
     // report is on the pin or on a timer.
-    ("i8042_health_cadence", Sched::Parallel, Tier::Fast),
+    ("i8042_health_cadence", Sched::Parallel, Tier::Nightly),
     ("xhci_xecp_walk", Sched::Parallel, Tier::Fast),
-    ("xhci_slot_exhaustion", Sched::Parallel, Tier::Fast),
-    ("usb_storage_gate", Sched::Parallel, Tier::Fast),
-    ("usb_storage_shapes", Sched::Parallel, Tier::Fast),
+    ("xhci_slot_exhaustion", Sched::Parallel, Tier::Nightly),
+    ("usb_storage_gate", Sched::Parallel, Tier::Nightly),
+    ("usb_storage_shapes", Sched::Parallel, Tier::Nightly),
     ("usb_refused_disk_first", Sched::Parallel, Tier::Fast),
     // The owner's freeze, staged: `device_del` on the stick carrying `/boot`
     // and `/log` while the desktop draws. Serial because both verdicts are
@@ -531,7 +534,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // debounce the driver finishes in microseconds under TCG.
     ("usb_disk_index_stable", Sched::Parallel, Tier::Fast),
     ("usb_storage_write_error", Sched::Parallel, Tier::Fast),
-    ("usb_flush_optional", Sched::Parallel, Tier::Fast),
+    ("usb_flush_optional", Sched::Parallel, Tier::Nightly),
     ("xhci_deaf_registers", Sched::Parallel, Tier::Nightly),
     // Mirrors the kernel's `SLOW_CONNECT_NS` as a constant of its own and
     // bounds the first port line from *both* sides. Both instants are the
@@ -544,15 +547,15 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // all the same. The fix it asks for is the kernel's: anchor the window on
     // the controller's own reset rather than on boot, which is where a real root
     // hub's detection delay starts anyway.
-    ("xhci_slow_connect", Sched::Serial, Tier::Fast),
+    ("xhci_slow_connect", Sched::Serial, Tier::Nightly),
     ("xhci_portsc_rw1c", Sched::Parallel, Tier::Fast),
     // One staged break and no other, which puts the driver's recovery finishing
     // on its first try in the verdict: a retried command that reaches an
     // endpoint still halted from the staged break logs a second `transport
     // broke`, and how many tries it takes is how much of the host the guest had.
     ("usb_transport_break", Sched::Serial, Tier::Fast),
-    ("xhci_full_speed_device", Sched::Parallel, Tier::Fast),
-    ("xhci_superspeed_ports", Sched::Parallel, Tier::Fast),
+    ("xhci_full_speed_device", Sched::Parallel, Tier::Nightly),
+    ("xhci_superspeed_ports", Sched::Parallel, Tier::Nightly),
     // Two of the three below stage plug and unplug with fixed waits, and both
     // waits are 600-800 ms against a 100 ms debounce the driver finishes in
     // microseconds under TCG — a margin, not a race, and every verdict either
@@ -564,16 +567,16 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // debounce, so this run never staged the race`. A host that delays the
     // second write past 100 ms turns a green machine red with that sentence,
     // which is indistinguishable from the driver defect it hunts.
-    ("xhci_flap", Sched::Serial, Tier::Fast),
+    ("xhci_flap", Sched::Serial, Tier::Nightly),
     ("xhci_hid_break", Sched::Parallel, Tier::Nightly),
     ("xhci_descriptor_walk", Sched::Parallel, Tier::Fast),
     ("esp_filesystem", Sched::Parallel, Tier::Fast),
     ("toybox_cp_volume", Sched::Parallel, Tier::Nightly),
-    ("kernel_log_file", Sched::Parallel, Tier::Fast),
+    ("kernel_log_file", Sched::Parallel, Tier::Nightly),
     // Serial: its verdict is a cadence — heartbeats against a 250 ms period —
     // and a guest sharing the host with eleven others reaches its idle loop
     // late for reasons that are not the defect.
-    ("kernel_heartbeat", Sched::Serial, Tier::Fast),
+    ("kernel_heartbeat", Sched::Serial, Tier::Nightly),
     // Both own their images and their lanes, and neither verdict is a
     // wall-clock margin: the guest's clock starts from an instant the host set
     // and the only duration either measures is how long a boot takes to reach
@@ -586,7 +589,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // that outgrows the window binds the disk in the port scan and it reports
     // `the boot scan bound a disk, so the port was not held empty`. Same
     // measurement, same afternoon.
-    ("late_storage_connect", Sched::Serial, Tier::Fast),
+    ("late_storage_connect", Sched::Serial, Tier::Nightly),
     ("log_backing_read_error", Sched::Parallel, Tier::Fast),
     ("boot_volume_metadata_error", Sched::Parallel, Tier::Fast),
     ("log_partition_layout", Sched::Parallel, Tier::Fast),
@@ -598,11 +601,11 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("iommu_empty_domain", Sched::Parallel, Tier::Fast),
     // Two boots, one kernel build each: the probe's own, and the plain kernel
     // on the same machine to show it stays out of an ordinary boot.
-    ("hda_probe", Sched::Parallel, Tier::Nightly),
+    ("hda_probe", Sched::Parallel, Tier::Fast),
     // H4: soundd driving an Intel HDA controller itself, read back off the
     // device. Serial — its verdict is a wav capture, and one taken while eleven
     // other guests contend for the host measures the host.
-    ("hda_tone", Sched::Serial, Tier::Fast),
+    ("hda_tone", Sched::Serial, Tier::Nightly),
     // The T14's panic, staged: a client that stops producing for longer than
     // the DMA ring takes to come round. The verdict is soundd's own liveness
     // and its counters rather than a capture, so it runs wide.
@@ -628,7 +631,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // Same: which of the two shared boots each binary belongs on, asked of the
     // binaries rather than of the list that claims to name them.
     ("suite_split", Sched::Parallel, Tier::Fast),
-    // Same: whether a run that did not attempt a third of the suite's cost says
+    // Same: whether a run that did not attempt most of the suite's measured cost says
     // so where its verdict is read.
     ("nightly_tier_is_announced", Sched::Parallel, Tier::Fast),
 ];
@@ -1090,7 +1093,9 @@ fn discover_rust_tests(bins: &[(String, Vec<u8>)]) -> Vec<String> {
             if name.ends_with(".so") {
                 return None;
             }
-            if RUST_SKIP.contains(&name.as_str()) || AUDIO_TESTS.contains(&name.as_str()) {
+            if RUST_SKIP.contains(&name.as_str())
+                || AUDIO_TESTS.iter().any(|(audio, _)| *audio == name)
+            {
                 return None;
             }
             Some(name.clone())
@@ -3367,7 +3372,7 @@ fn run_screen_test(
             Ok(())
         }
         "screen_pager_keys" => {
-            // The halted pager takes PageUp/PageDown off the i8042 with every
+            // The halted pager takes PageDown off the i8042 with every
             // CPU stopped, and this is the only place that claim can be made:
             // the decode is `toyos-ps2`'s and host-tested, but that a keystroke
             // reaches a machine which has stopped scheduling is a fact about
@@ -10492,10 +10497,10 @@ fn stall_is_not_a_verdict() -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a run that did not attempt a third of the suite's cost says so.
+/// Whether a run that did not attempt most of the suite's measured cost says so.
 ///
 /// **The failure mode the tier introduces is silence, not a wrong answer.** A
-/// green run holding back 31 tests and a green run holding back none print the
+/// green run holding back 60 tests and a green run holding back none print the
 /// same word, and the difference between them is the whole reason `--nightly`
 /// exists. `src/tiers.rs`'s gates hold the declaration against the measured
 /// profile and `check_registration` holds it against the registration; neither
@@ -10512,7 +10517,7 @@ fn nightly_tier_is_announced() -> Result<(), String> {
     for want in [
         "not run — the nightly tier",
         "desktop_window_child, sshd_fail_closed",
-        "`--nightly` runs them",
+        "`cargo test --test toyos-build -- --nightly` runs them",
         "specs/test-cost-audit.md",
         "2 held back for the nightly tier",
     ] {
@@ -10526,9 +10531,9 @@ fn nightly_tier_is_announced() -> Result<(), String> {
     let ms: u64 = tiers::RELEGATED
         .iter()
         .filter(|r| held.contains(&r.test))
-        .map(|r| r.dev_ms)
+        .map(|r| r.ci_ms)
         .sum();
-    let want = format!("{:.1} s of dev-host test time", ms as f64 / 1000.0);
+    let want = format!("{:.1} s of effective CI test time", ms as f64 / 1000.0);
     if !announced.contains(&want) {
         return Err(format!("the summary does not price what it held back as {want:?}:\n{announced}"));
     }
@@ -10803,16 +10808,17 @@ impl Tally {
             let ms: u64 = tiers::RELEGATED
                 .iter()
                 .filter(|r| self.relegated.contains(&r.test))
-                .map(|r| r.dev_ms)
+                .map(|r| r.ci_ms)
                 .sum();
             say(format!(
-                "not run — the nightly tier, {:.1} s of dev-host test time:",
+                "not run — the nightly tier, {:.1} s of effective CI test time:",
                 ms as f64 / 1000.0
             ));
             say(format!("    {}", self.relegated.join(", ")));
             say(
-                "    `--nightly` runs them. specs/test-cost-audit.md §7 says what each one \
-                 guarded and why it is not gated per pull request."
+                "    `cargo test --test toyos-build -- --nightly` runs them. \
+                 specs/test-cost-audit.md §7 says what each one guarded and why it is not \
+                 gated per pull request."
                     .to_string(),
             );
             say(String::new());
@@ -11761,19 +11767,57 @@ fn machine_tasks(selected: &[(&'static str, Sched)]) -> Vec<(Sched, Vec<&'static
     out
 }
 
-/// Every claim the two registration lists make about themselves, before
-/// anything boots.
+/// The conservative half of the CI cutoff: a Fast registration must have a
+/// committed price at/below the line or the explicit one-run UNMEASURED marker.
+/// Missing evidence is refused rather than quietly joining Fast. The one-off
+/// measurement-branch bootstrap for a new name is recorded in the cost audit;
+/// its provisional price is never the evidence a final change lands with.
+fn assert_fast_profile_label(
+    label: &str,
+    tier: Tier,
+    profile: &BTreeMap<String, Duration>,
+) {
+    if tier == Tier::Nightly {
+        return;
+    }
+    let measured = profile.get(label).unwrap_or_else(|| {
+        panic!(
+            "{label} is registered Fast but the committed CI profile has no measurement; \
+             obtain its one-off KVM measurement and commit the resulting profile before \
+             assigning its final tier"
+        )
+    });
+    if measured.as_millis() == tiers::UNMEASURED_MS as u128 {
+        return;
+    }
+    assert!(
+        measured.as_millis() <= tiers::FAST_CEILING_MS as u128,
+        "{label} is registered Fast but the committed CI profile measures it at {} ms, \
+         over the {} ms line",
+        measured.as_millis(),
+        tiers::FAST_CEILING_MS,
+    );
+}
+
+/// Every claim the three explicit registration lists make about themselves,
+/// before anything boots.
 ///
 /// A group whose members drifted apart still passes — each one boots its own
 /// machine and reads its own console — so nothing downstream would notice, and
 /// a group split across the two phases could not share a guest at all.
 fn check_registration() {
+    let mut profile = BTreeMap::new();
+    read_durations(&committed_durations_path(), &mut profile);
     let mut seen: BTreeMap<&str, ()> = BTreeMap::new();
-    for (name, _, _) in MACHINE_TESTS.iter().chain(SCREEN_TESTS) {
+    for (name, _, tier) in MACHINE_TESTS.iter().chain(SCREEN_TESTS) {
         assert!(seen.insert(name, ()).is_none(), "{name} is registered twice");
+        assert_fast_profile_label(name, *tier, &profile);
     }
-    for name in AUDIO_TESTS {
-        assert!(!seen.contains_key(name), "{name} is registered twice");
+    for (name, tier) in AUDIO_TESTS {
+        assert!(seen.insert(name, ()).is_none(), "{name} is registered twice");
+        for smp in AUDIO_SMP {
+            assert_fast_profile_label(&format!("{name} (smp={smp})"), *tier, &profile);
+        }
     }
 
     let mut groups: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
@@ -11798,10 +11842,23 @@ fn check_registration() {
         // charge the fast tier the whole group's cost — which is the arithmetic
         // the ceiling exists to control. It is also what makes
         // `tiers::Why::RidesTheBootOf` an honest row rather than an excuse: the
-        // four cheap metal-sim tests are relegated *because* this is enforced.
+        // six cheap members of the metal-sim and i8042 boots are relegated
+        // *because* this is enforced.
         assert!(
             MACHINE_TESTS[first..=last].windows(2).all(|w| w[0].2 == w[1].2),
             "{group} shares one boot, so its members must share one tier"
+        );
+    }
+    for row in tiers::RELEGATED {
+        let tiers::Why::RidesTheBootOf(carrier) = row.why else { continue };
+        let rider_group = group_of(row.test);
+        let carrier_group = group_of(carrier);
+        assert!(
+            rider_group.is_some() && rider_group == carrier_group,
+            "{} says it rides {carrier}, but group_of gives {:?} and {:?}",
+            row.test,
+            rider_group,
+            carrier_group,
         );
     }
 
@@ -11815,6 +11872,7 @@ fn check_registration() {
         .chain(SCREEN_TESTS)
         .filter(|(_, _, tier)| *tier == Tier::Nightly)
         .map(|(name, _, _)| *name)
+        .chain(AUDIO_TESTS.iter().filter(|(_, tier)| *tier == Tier::Nightly).map(|(name, _)| *name))
         .collect();
     let declared = tiers::relegated_names();
     let undeclared: Vec<&&str> = registered.difference(&declared).collect();
@@ -11843,11 +11901,22 @@ fn check_registration() {
 /// its `ALONE:` verdict is about neither. Four names were doing this and the
 /// suite had never been able to see them.
 fn check_no_collisions(shared: &[TestDef]) {
+    let mut shared_seen = BTreeSet::new();
+    let shared_twice: Vec<&str> = shared
+        .iter()
+        .map(|test| test.name.as_str())
+        .filter(|name| !shared_seen.insert(*name))
+        .collect();
+    assert!(
+        shared_twice.is_empty(),
+        "{shared_twice:?} name two binaries on the shared boot; every verdict and duration \
+         label must identify exactly one execution"
+    );
     let declared: BTreeSet<&str> = MACHINE_TESTS
         .iter()
         .map(|(n, _, _)| *n)
         .chain(SCREEN_TESTS.iter().map(|(n, _, _)| *n))
-        .chain(AUDIO_TESTS.iter().copied())
+        .chain(AUDIO_TESTS.iter().map(|(name, _)| *name))
         .collect();
     let clash: Vec<&str> =
         shared.iter().map(|t| t.name.as_str()).filter(|n| declared.contains(n)).collect();
@@ -11857,6 +11926,13 @@ fn check_no_collisions(shared: &[TestDef]) {
          machine — two verdicts under one name, and `retry_task` takes the shared one. Add \
          each to RUST_SKIP with the reason its own test exists, or rename one of the two."
     );
+    if SHARED_TIER == Tier::Fast {
+        let mut profile = BTreeMap::new();
+        read_durations(&committed_durations_path(), &mut profile);
+        for test in shared {
+            assert_fast_profile_label(&test.name, SHARED_TIER, &profile);
+        }
+    }
 }
 
 fn main() {
@@ -12011,7 +12087,7 @@ fn main() {
         for t in &tests {
             println!("{}", t.name);
         }
-        for name in AUDIO_TESTS {
+        for (name, _) in AUDIO_TESTS {
             println!("{name}");
         }
         for (name, _, _) in SCREEN_TESTS {
@@ -12031,7 +12107,7 @@ fn main() {
     if let Some(iterations) = audio_gate {
         let mut audio_to_run: Vec<&str> = AUDIO_TESTS
             .iter()
-            .copied()
+            .map(|(name, _)| *name)
             .filter(|n| filter.map_or(true, |f| n.contains(f)))
             .collect();
         assert!(!audio_to_run.is_empty(), "no audio test matches filter {filter:?}");
@@ -12078,7 +12154,7 @@ fn main() {
     let runnable: BTreeSet<&str> = all_tests
         .iter()
         .map(|t| t.name.as_str())
-        .chain(AUDIO_TESTS.iter().copied())
+        .chain(AUDIO_TESTS.iter().map(|(name, _)| *name))
         .chain(SCREEN_TESTS.iter().map(|(n, _, _)| *n))
         .chain(MACHINE_TESTS.iter().map(|(n, _, _)| *n))
         .collect();
@@ -12098,8 +12174,11 @@ fn main() {
         .iter()
         .filter(|t| keep(t.name.as_str()) && in_tier(SHARED_TIER))
         .collect();
-    let mut audio_to_run: Vec<&str> =
-        AUDIO_TESTS.iter().copied().filter(|n| keep(n)).collect();
+    let mut audio_to_run: Vec<&str> = AUDIO_TESTS
+        .iter()
+        .filter(|(name, tier)| keep(name) && in_tier(*tier))
+        .map(|(name, _)| *name)
+        .collect();
     let screen_to_run: Vec<(&str, Sched)> = SCREEN_TESTS
         .iter()
         .filter(|(n, _, tier)| keep(n) && in_tier(*tier))
@@ -12121,15 +12200,21 @@ fn main() {
         .chain(SCREEN_TESTS)
         .filter(|(n, _, tier)| keep(n) && !in_tier(*tier))
         .map(|(n, _, _)| *n)
+        .chain(
+            AUDIO_TESTS
+                .iter()
+                .filter(|(name, tier)| keep(name) && !in_tier(*tier))
+                .map(|(name, _)| *name),
+        )
         .collect();
     if !held_back.is_empty() {
         let ms: u64 = tiers::RELEGATED
             .iter()
             .filter(|r| held_back.contains(&r.test))
-            .map(|r| r.dev_ms)
+            .map(|r| r.ci_ms)
             .sum();
         eprintln!(
-            "[toyos] nightly tier: {} test(s) NOT run, {:.1} s of dev-host test time. \
+            "[toyos] nightly tier: {} test(s) NOT run, {:.1} s of effective CI test time. \
              `cargo test --test toyos-build -- --nightly` runs them manually; scheduled CI \
              is not built: specs/issues/build/nightly-tier-has-no-workflow.md. \
              specs/test-cost-audit.md §7 says what each one guards.",
@@ -12261,6 +12346,10 @@ fn main() {
     // shard's own total is what its summary has to add up against.
     let total = parallel.iter().chain(serial.iter()).map(|t| t.names().len()).sum::<usize>()
         + audio_to_run.len() * AUDIO_SMP.len();
+    if let Err(refusal) = toyos_build::testargs::validate_ordinary_shard(shard, filter, total) {
+        eprintln!("[toyos] {refusal}");
+        std::process::exit(1);
+    }
     eprintln!("\nrunning {total} tests\n");
 
     let mut timed: Vec<(String, Duration)> = Vec::new();

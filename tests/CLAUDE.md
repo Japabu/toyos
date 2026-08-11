@@ -14,7 +14,7 @@ Every profile declares its device size or does not compile, and the images are s
 
 ## The two tiers
 
-**Every `cargo test` runs the *fast* tier and names what it did not run.** The owner's line, 2026-08-11: ten seconds or less per test. `src/tiers.rs`'s `RELEGATED` is the other 31, with what each cost and what it guarded; `-- --nightly` runs them manually. Each entry carries a `Tier` beside its `Sched` or does not compile, `check_registration` ties the two lists, and a group shares one tier because it shares one boot. Scheduled CI remains unbuilt (`specs/issues/build/nightly-tier-has-no-workflow.md`); #188 only optimises tests back into fast CI. Interim: `specs/test-cost-audit.md` §7.
+**`cargo test` runs Fast and names what it withheld.** The CI ceiling is ≤10 s per execution. `RELEGATED` records 54 slow tests plus six shared-boot riders; `--nightly` runs all 60. Registrations carry `Tier`, close shared groups, and refuse missing evidence. Bootstrap new names exactly as `specs/test-cost-audit.md` §7.2 says. `guest-suite` requires the merged-profile gate. Scheduled Nightly CI is still open; #188 only optimises tests back into Fast.
 
 ## Gate A (audio)
 

@@ -13,8 +13,9 @@
 //! own, and the file exists for the checkout that has measured nothing.
 //!
 //! Why a command and not a `cat`: the shards are a *partition*, and that is the
-//! property the merged file's usefulness rests on. A name in two of them means
-//! two shards ran the same test — which is exactly the failure
+//! property the merged file's usefulness rests on. A repeated name means two
+//! shards claimed one test or one shard ran the same label twice — the first is
+//! exactly the failure
 //! `specs/ci-plan.md` §4 records, three shards of `nvme_` where one test ran
 //! twice and one ran nowhere, and all three reported green. A concatenation
 //! cannot see it; this refuses it by name.
@@ -58,14 +59,7 @@ pub fn dispatch(root: &Path, args: &[String]) {
         for line in text.lines() {
             let Some((name, ms)) = line.rsplit_once(' ') else { continue };
             let Ok(ms) = ms.parse::<u64>() else { continue };
-            if let Some((_, first)) = merged.insert(name.to_string(), (ms, who.clone())) {
-                assert_eq!(
-                    first, who,
-                    "{name} was measured by both {first} and {who}, so those two shards were \
-                     not a partition and one of them ran a test the other owned — the profile \
-                     they were taken with disagreed with itself"
-                );
-            }
+            insert_measurement(&mut merged, name, ms, &who);
         }
     }
 
@@ -73,22 +67,112 @@ pub fn dispatch(root: &Path, args: &[String]) {
     let before = read_profile(&out);
     report(&merged, &before, count);
 
-    let body: String = merged.iter().map(|(n, (ms, _))| format!("{n} {ms}\n")).collect();
+    let profile = merged_profile(&merged, &before);
+    let body: String = profile.iter().map(|(n, ms)| format!("{n} {ms}\n")).collect();
     fs::write(&out, body).unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
+    if let Err(refusal) = validate_written_profile(&profile, &before) {
+        panic!(
+            "the merged CI profile and tier declaration disagree:\n{refusal}\n\
+             The measured profile was written to {} for inspection",
+            out.display()
+        );
+    }
     println!(
-        "{}: {} test(s) from {} shard file(s)",
+        "{}: {} measured test(s) from {} shard file(s), {} timing row(s) written",
         out.display(),
         merged.len(),
-        files.len()
+        files.len(),
+        profile.len(),
     );
+}
+
+/// The verdict issued only after the measured artifact has been written.
+///
+/// A new test's explicit UNMEASURED row buys exactly one KVM instrument run.
+/// Even when that execution is fast, the commit carrying the marker stays red;
+/// the next commit must replace it with the artifact's measured value.
+fn validate_written_profile(
+    profile: &BTreeMap<String, u64>,
+    before: &BTreeMap<String, u64>,
+) -> Result<(), String> {
+    let provisional: Vec<&str> = before
+        .iter()
+        .filter(|(_, ms)| **ms == crate::tiers::UNMEASURED_MS)
+        .map(|(label, _)| label.as_str())
+        .collect();
+    if !provisional.is_empty() {
+        return Err(format!(
+            "committed UNMEASURED profile marker(s) are provisional and may not land: {}. \
+             Replace them with the values in the measured artifact and assign the final tier",
+            provisional.join(", ")
+        ));
+    }
+    crate::tiers::validate_ci_profile(profile)
+}
+
+/// Add one execution label to a whole-run profile.
+///
+/// A duplicate is never a second sample. Across files it means two shards
+/// disagreed about ownership; within one file it means a shard ran one label
+/// twice. Keeping either duration would let the other verdict disappear.
+fn insert_measurement(
+    merged: &mut BTreeMap<String, (u64, String)>,
+    name: &str,
+    ms: u64,
+    who: &str,
+) {
+    if let Some((_, first)) = merged.insert(name.to_string(), (ms, who.to_string())) {
+        panic!(
+            "{name} was measured twice, first in {first} and again in {who}. Every execution \
+             label must occur exactly once: two shards may disagree about ownership, or one \
+             shard may have run the same test twice"
+        );
+    }
+}
+
+/// The profile a completed sharded run leaves behind.
+///
+/// Fast CI intentionally does not run the nightly tier, so absence from its
+/// shard files is not evidence that a nightly timing row is stale. Preserve
+/// those committed measurements while still letting a run that did measure a
+/// nightly test replace its old number. Every other absent row is a refusal:
+/// otherwise a complete-looking shard set could drop a Fast test and erase the
+/// only evidence that the required duration gate should have expected it.
+fn merged_profile(
+    measured: &BTreeMap<String, (u64, String)>,
+    before: &BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    let mut after: BTreeMap<String, u64> =
+        measured.iter().map(|(name, (ms, _))| (name.clone(), *ms)).collect();
+    let nightly = crate::tiers::relegated_names();
+    let missing_fast: Vec<&str> = before
+        .keys()
+        .filter(|label| !measured.contains_key(*label))
+        .filter(|label| !nightly.contains(crate::tiers::canonical_profile_name(label)))
+        .map(String::as_str)
+        .collect();
+    assert!(
+        missing_fast.is_empty(),
+        "the completed shard set did not measure Fast profile label(s): {}. A successful \
+         fast run may omit only Nightly labels; delete a removed test's committed profile \
+         row in the same change that removes its registration",
+        missing_fast.join(", ")
+    );
+    for (label, ms) in before {
+        if nightly.contains(crate::tiers::canonical_profile_name(label)) {
+            after.entry(label.clone()).or_insert(*ms);
+        }
+    }
+    after
 }
 
 /// The shard count these files are all of, refusing anything that is not a
 /// whole run.
 ///
 /// **The other half of the partition, and it was not being checked.** The
-/// merge already refuses a name two shards both measured, which is
-/// `specs/ci-plan.md` §4's defect from one side. From the other side a shard
+/// merge already refuses any duplicate execution label, including the
+/// `specs/ci-plan.md` §4 defect where two shards claimed one name. From the
+/// other side a shard
 /// that measured *nothing* — cancelled at its timeout, or an artifact upload
 /// that failed — leaves eleven files, and merging them wrote a profile missing
 /// a twelfth of the suite. Those names then price at the longest the profile
@@ -247,6 +331,103 @@ mod tests {
         assert!(refusal(&["4-of-3"]).contains("is not a shard of a run"));
         assert!(refusal(&["one-of-three"]).contains("is not a shard of a run"));
         assert!(refusal(&["7"]).contains("<index>-of-<count>"));
+    }
+
+    #[test]
+    fn a_fast_only_merge_preserves_committed_nightly_timings() {
+        let nightly = crate::tiers::relegated_names()
+            .into_iter()
+            .find(|name| *name != "audio_tone_load")
+            .expect("an ordinary nightly test");
+        let measured = BTreeMap::from([("fast".to_string(), (120, "shard-1".to_string()))]);
+        let before = BTreeMap::from([
+            ("fast".to_string(), 999),
+            (nightly.to_string(), 45_000),
+        ]);
+
+        let after = merged_profile(&measured, &before);
+        assert_eq!(after.get("fast"), Some(&120));
+        assert_eq!(after.get(nightly), Some(&45_000));
+    }
+
+    #[test]
+    fn a_complete_fast_run_may_not_erase_an_unmeasured_fast_label() {
+        let measured = BTreeMap::from([("some_fast_test".to_string(), (120, "shard-1".to_string()))]);
+        let before = BTreeMap::from([
+            ("some_fast_test".to_string(), 999),
+            ("missing_fast_test".to_string(), 321),
+        ]);
+        let err = std::panic::catch_unwind(|| merged_profile(&measured, &before))
+            .expect_err("a complete fast run silently erased a Fast label");
+        let refusal = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(refusal.contains("missing_fast_test"), "{refusal}");
+        assert!(refusal.contains("may omit only Nightly"), "{refusal}");
+    }
+
+    #[test]
+    fn one_shard_may_not_report_the_same_execution_label_twice() {
+        let mut merged = BTreeMap::new();
+        insert_measurement(&mut merged, "foo", 11_001, "test-durations.shard-1-of-12");
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            insert_measurement(&mut merged, "foo", 1, "test-durations.shard-1-of-12");
+        }))
+        .expect_err("the later short timing overwrote an over-ceiling execution");
+        let refusal = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(refusal.contains("foo was measured twice"), "{refusal}");
+        assert!(refusal.contains("one shard may have run"), "{refusal}");
+    }
+
+    #[test]
+    fn an_unmeasured_marker_buys_one_red_measurement_commit() {
+        let measured = BTreeMap::from([(
+            "new_fast_test".to_string(),
+            (321, "test-durations.shard-1-of-12".to_string()),
+        )]);
+        let before =
+            BTreeMap::from([("new_fast_test".to_string(), crate::tiers::UNMEASURED_MS)]);
+        let after = merged_profile(&measured, &before);
+        assert_eq!(after.get("new_fast_test"), Some(&321));
+
+        let refusal = validate_written_profile(&after, &before).unwrap_err();
+        assert!(refusal.contains("new_fast_test"), "{refusal}");
+        assert!(refusal.contains("may not land"), "{refusal}");
+        assert!(refusal.contains("measured artifact"), "{refusal}");
+    }
+
+    #[test]
+    fn a_measured_nightly_timing_replaces_the_committed_one() {
+        let nightly = crate::tiers::relegated_names()
+            .into_iter()
+            .find(|name| *name != "audio_tone_load")
+            .expect("an ordinary nightly test");
+        let measured = BTreeMap::from([(
+            nightly.to_string(),
+            (12_345, "shard-1".to_string()),
+        )]);
+        let before = BTreeMap::from([(nightly.to_string(), 45_000)]);
+
+        assert_eq!(merged_profile(&measured, &before).get(nightly), Some(&12_345));
+    }
+
+    #[test]
+    fn audio_config_labels_follow_their_one_nightly_registration() {
+        let measured = BTreeMap::from([
+            ("fast".to_string(), (120, "shard-1".to_string())),
+            ("audio_tone (smp=1)".to_string(), (7_000, "shard-1".to_string())),
+            ("not_audio (smp=8)".to_string(), (8_000, "shard-1".to_string())),
+        ]);
+        let before = BTreeMap::from([
+            ("audio_tone_load (smp=1)".to_string(), 40_524),
+            ("audio_tone_load (smp=8)".to_string(), 11_121),
+            ("audio_tone (smp=1)".to_string(), 8_156),
+            ("not_audio (smp=8)".to_string(), 99_999),
+        ]);
+
+        let after = merged_profile(&measured, &before);
+        assert_eq!(after.get("audio_tone_load (smp=1)"), Some(&40_524));
+        assert_eq!(after.get("audio_tone_load (smp=8)"), Some(&11_121));
+        assert_eq!(after.get("audio_tone (smp=1)"), Some(&7_000));
+        assert_eq!(after.get("not_audio (smp=8)"), Some(&8_000));
     }
 }
 

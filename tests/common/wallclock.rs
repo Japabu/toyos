@@ -273,10 +273,10 @@ pub fn wall_clock_file(
     Ok(())
 }
 
-/// Every way the clock can fail to answer, and the century register's absence.
+/// Five RTC/firmware shapes: two refusals, two century sources and one zone.
 ///
 /// One boot per state because each is a different kernel build. They share this
-/// function so the four of them are one entry in the schedule and one line of
+/// function so the five of them are one entry in the schedule and one line of
 /// output.
 pub fn wall_clock_refusals(
     test_config: &Path,

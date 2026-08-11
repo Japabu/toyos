@@ -103,6 +103,28 @@ pub fn parse_shard(args: &[String]) -> Result<Option<Shard>, String> {
     Ok(out)
 }
 
+/// Refuse a shard that owns nothing after the ordinary suite's filter, tier,
+/// and task grouping have all been applied.
+///
+/// A valid shard number is not enough to establish that the selected suite has
+/// at least that many bins. The check therefore belongs after `Shard::keep`,
+/// where `total` is the number of verdicts this process can actually produce.
+pub fn validate_ordinary_shard(
+    shard: Option<Shard>,
+    filter: Option<&str>,
+    total: usize,
+) -> Result<(), String> {
+    let Some(shard) = shard else { return Ok(()) };
+    if total > 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "--shard {}/{} with filter {filter:?} owns no ordinary-tier tests after selection; \
+         refusing a false-green shard run",
+        shard.index, shard.count,
+    ))
+}
+
 /// Whether a flag is followed by a separate word, which is then not the filter.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Value {
@@ -188,6 +210,16 @@ pub fn parse(args: &[String]) -> Result<Option<&str>, String> {
             i += 1;
         }
     }
+    let has = |want: &str| {
+        args.iter().any(|arg| arg == want || arg.strip_prefix(want).is_some_and(|v| v.starts_with('=')))
+    };
+    if has("--nightly") && has("--audio-gate") {
+        return Err(
+            "--nightly and --audio-gate are separate tiers and cannot be combined; run one \
+             tier at a time"
+                .to_string(),
+        );
+    }
     Ok(filter)
 }
 
@@ -216,6 +248,19 @@ mod tests {
         assert_eq!(parse_owned(&["--audio-gate", "30"]).unwrap(), None);
         assert_eq!(parse_owned(&["--host-slots", "0"]).unwrap(), None);
         assert_eq!(parse_owned(&["--host-builds", "0"]).unwrap(), None);
+    }
+
+    #[test]
+    fn nightly_and_audio_gate_are_refused_by_the_argv_validator() {
+        for argv in [
+            vec!["--nightly", "--audio-gate", "30"],
+            vec!["--audio-gate=30", "--nightly"],
+        ] {
+            let refusal = parse_owned(&argv).unwrap_err();
+            assert!(refusal.contains("--nightly"), "{refusal}");
+            assert!(refusal.contains("--audio-gate"), "{refusal}");
+            assert!(refusal.contains("cannot be combined"), "{refusal}");
+        }
     }
 
     #[test]
@@ -258,6 +303,18 @@ mod tests {
         }
         assert!(shard_of(&["--shard", "half"]).is_err());
         assert!(shard_of(&["--shard", "x/4"]).is_err());
+    }
+
+    #[test]
+    fn an_empty_selected_shard_is_a_named_false_green() {
+        let shard = Some(Shard { index: 8, count: 12 });
+        let refusal = validate_ordinary_shard(shard, Some("one_test"), 0).unwrap_err();
+        assert!(refusal.contains("--shard 8/12"), "{refusal}");
+        assert!(refusal.contains("filter Some(\"one_test\")"), "{refusal}");
+        assert!(refusal.contains("false-green"), "{refusal}");
+
+        assert!(validate_ordinary_shard(shard, None, 1).is_ok());
+        assert!(validate_ordinary_shard(None, Some("nothing"), 0).is_ok());
     }
 
     /// The property every verdict rests on: the shards are a partition. Not one
