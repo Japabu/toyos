@@ -220,6 +220,32 @@ pub const SYS_DEVICE_CLAIM: u64 = 111;
 /// [`Rights::RT`]: crate::handle::Rights::RT
 pub const SYS_RT_ENTER: u64 = 112;
 
+// Number 113 is **reserved, not free**: it is `SYS_PORT_REARM`
+// (`specs/capability-endowment-spec.md` §12), which mints a fresh `Acceptor`
+// for a port whose server died and is the one thing that would make any
+// `serves` daemon restartable. Nothing needs it yet, so nothing is built.
+//
+// 115 is likewise held, for `SYS_SLEEP_UNTIL`
+// (`specs/completion-architecture-spec.md`), which replaces a retired
+// `SYS_NANOSLEEP`.
+//
+// **Both are recorded here rather than in those specs alone**, because this
+// file is where an agent allocating a number looks and a reservation nobody
+// reads is not a reservation. Holes are already ordinary here — a retired
+// number is never reused either.
+
+/// Copy kernel log records into a caller's buffer, advancing a cursor the
+/// caller owns. Gated by [`Rights::LOG`] on a `SysCap`. See [`log_read`] and
+/// [`crate::log`].
+///
+/// **The kernel keeps no per-reader state**, so a second reader costs nothing
+/// and the stream is not consumed: `/bin/logd` and a `log-follow` tool coexist
+/// with no coordination. Reading the whole machine's log is authority, which is
+/// why it rides a right rather than being ambient.
+///
+/// [`Rights::LOG`]: crate::handle::Rights::LOG
+pub const SYS_LOG_READ: u64 = 114;
+
 /// Bins in the per-process syscall profile — one for every number this ABI
 /// issues, and one at the end for every number it does not.
 ///
@@ -233,7 +259,7 @@ pub const SYSCALL_PROFILE_BINS: usize = 128;
 /// a reader can see in the line; dropping is one nobody can.
 pub const SYSCALL_PROFILE_OTHER: usize = SYSCALL_PROFILE_BINS - 1;
 
-const _: () = assert!(SYS_RT_ENTER < SYSCALL_PROFILE_OTHER as u64);
+const _: () = assert!(SYS_LOG_READ < SYSCALL_PROFILE_OTHER as u64);
 
 pub const WNOHANG: u64 = 1;
 
@@ -805,6 +831,34 @@ pub fn process_kill(proc: RawHandle) -> Result<(), SyscallError> {
 pub fn process_open(syscap: RawHandle, pid: Pid) -> Result<RawHandle, SyscallError> {
     check(syscall(SYS_PROCESS_OPEN, syscap.0 as u64, pid.0 as u64, 0, 0))
         .map(|h| RawHandle(h as u32))
+}
+
+/// Copy records into `out`, oldest first and merged by `at_ns`, advancing
+/// `cursor`. Answers how many records were written, and `0` when there is
+/// nothing new.
+///
+/// **It never blocks.** A caller with nothing to read arms on a readiness
+/// source and parks; a syscall that waited would be a second blocking mechanism
+/// in a kernel that is converging on one.
+///
+/// `out` is whole [`crate::log::LogRecord`]s at a fixed stride, so the caller
+/// indexes by shift and the kernel does no length arithmetic. A buffer that
+/// cannot hold one record, or that cannot hold what the machine's shard count
+/// requires, is `InvalidArgument` — untrusted input that cannot be satisfied is
+/// refused, never truncated to fit.
+pub fn log_read(
+    syscap: RawHandle,
+    cursor: &mut crate::log::LogCursor,
+    out: &mut [crate::log::LogRecord],
+) -> Result<usize, SyscallError> {
+    check(syscall(
+        SYS_LOG_READ,
+        syscap.0 as u64,
+        cursor as *mut crate::log::LogCursor as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    ))
+    .map(|n| n as usize)
 }
 
 /// Mark file descriptor as the controlling TTY for this process.
