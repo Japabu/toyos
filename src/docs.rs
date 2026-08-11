@@ -121,23 +121,7 @@ mod tests {
 
     /// `true` for a `YYYY-MM-DD` that names a day that exists.
     fn is_a_date(s: &str) -> bool {
-        let parts: Vec<&str> = s.split('-').collect();
-        let [y, m, d] = parts[..] else { return false };
-        if (y.len(), m.len(), d.len()) != (4, 2, 2) {
-            return false;
-        }
-        let (Ok(y), Ok(m), Ok(d)) = (y.parse::<u32>(), m.parse::<u32>(), d.parse::<u32>()) else {
-            return false;
-        };
-        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-        let last = match m {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 if leap => 29,
-            2 => 28,
-            _ => return false,
-        };
-        (1..=last).contains(&d)
+        crate::day::Day::parse(s).is_some()
     }
 
     /// Every `specs/issues/<area>/<slug>.md` path this text names.
