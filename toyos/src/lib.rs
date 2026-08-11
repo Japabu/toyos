@@ -14,6 +14,7 @@ pub mod poller;
 pub mod ipc;
 pub mod namespace;
 pub mod launch;
+pub mod log;
 pub mod net;
 pub mod port;
 pub mod process;
