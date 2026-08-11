@@ -9,6 +9,7 @@ pub mod handle;
 pub mod hda;
 pub mod input;
 pub mod io_uring;
+pub mod log;
 pub mod net;
 pub mod ring;
 pub mod syscall;

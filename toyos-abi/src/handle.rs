@@ -77,10 +77,19 @@ impl Rights {
     pub const RT: Rights = Rights(1 << 7);
     /// On a `SysCap`: mint a device claim.
     pub const DEVICE: Rights = Rights(1 << 8);
+    /// On a `SysCap`: read the whole machine's kernel log.
+    ///
+    /// [`SYS_LOG_READ`] answers every record every CPU wrote, which is every
+    /// process's business and no process's right by default. `/bin/logd` holds
+    /// it because writing `/log` is its job, `/bin/console` because it paints
+    /// the panel, and `test-runner` because a gate reads what the kernel said.
+    ///
+    /// [`SYS_LOG_READ`]: crate::syscall::SYS_LOG_READ
+    pub const LOG: Rights = Rights(1 << 9);
 
     /// Every bit that has a caller. A wider set than this is a bug in whoever
     /// composed it, not a right nobody uses.
-    pub const ALL: Rights = Rights(0x1ff);
+    pub const ALL: Rights = Rights(0x3ff);
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL.0 == 0 { Some(Rights(bits)) } else { None }
@@ -111,7 +120,7 @@ impl Rights {
 /// refusal saying which right was missing.
 impl core::fmt::Debug for Rights {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        const NAMES: [(Rights, &str); 9] = [
+        const NAMES: [(Rights, &str); 10] = [
             (Rights::DUP, "DUP"),
             (Rights::TRANSFER, "TRANSFER"),
             (Rights::READ, "READ"),
@@ -121,6 +130,7 @@ impl core::fmt::Debug for Rights {
             (Rights::MANAGE, "MANAGE"),
             (Rights::RT, "RT"),
             (Rights::DEVICE, "DEVICE"),
+            (Rights::LOG, "LOG"),
         ];
         if self.0 == 0 {
             return f.write_str("NONE");
@@ -182,5 +192,31 @@ mod tests {
     fn a_bit_no_right_uses_is_not_a_rights_set() {
         assert!(Rights::from_bits(Rights::ALL.bits()).is_some());
         assert!(Rights::from_bits(Rights::ALL.bits() | (1 << 31)).is_none());
+    }
+
+    /// **`ALL` and the `Debug` table are two spellings of one set**, and a
+    /// right added to one and not the other is invisible in both directions: a
+    /// missing `ALL` bit makes `from_bits` refuse a legitimate set, and a
+    /// missing name makes the one place a right is ever printed — a refusal
+    /// saying which one was absent — omit it without saying so.
+    ///
+    /// The second assertion is the one that has teeth against a *future* right:
+    /// an unnamed non-zero bit renders as the empty string rather than as
+    /// anything a reader would question.
+    #[test]
+    fn every_right_in_all_has_a_name_and_every_name_is_in_all() {
+        let named = |r: Rights| std::format!("{r:?}").split('|').count();
+        assert_eq!(
+            named(Rights::ALL),
+            Rights::ALL.bits().count_ones() as usize,
+            "a bit in ALL has no name in Debug: {:?}",
+            Rights::ALL
+        );
+        assert_eq!(
+            std::format!("{:?}", Rights(u32::MAX)),
+            std::format!("{:?}", Rights::ALL),
+            "a named right is outside ALL, so from_bits refuses a set that has it"
+        );
+        assert_eq!(std::format!("{:?}", Rights::LOG), "LOG");
     }
 }
