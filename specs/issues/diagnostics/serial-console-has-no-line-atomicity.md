@@ -111,3 +111,26 @@ The general fix belongs in `toyos/`, and the reason it was not put there is
 worth knowing: `toyos/src` is one of the four trees in the content-addressed
 toolchain witness (`specs/ci-plan.md` §3), so touching it rebuilds the sysroot
 and `--pr` refuses a branch that mixes it with other work.
+
+**Fifth occurrence, and the first to red a screen test.** 2026-08-11, CI job
+`93680198564` on pull request #30 — **a branch whose whole diff is one spec
+file** — `metal_sim_window_drag`, shard 9:
+
+```
+FAIL metal_sim_window_drag: unreadable height in "1920x1080[kernel 1.258 cpu0
+tid=0] syscalls: pid=4 total=17 syscall_wall=4ms 0=2 6=1 8=3 …"
+```
+
+Two things make it worth adding rather than being a sixth tally mark. It is
+**not the known-red rotation**: `specs/ci-plan.md` §9.1 names
+`metal_sim_window_drag` among the twelve that went to **0 of 5** once
+`wt/toyos-clock` landed, so a red here is this defect and not that list. And
+the collision is **correlated the way `desktop_audio_client`'s is** rather than
+chance — the kernel prints a process's syscall accounting as that process
+exits, which on this test is exactly when the compositor prints the geometry
+the assertion reads. Chance decides *which* line is hit; it does not decide
+whether two writers with a shared cause will meet.
+
+The fix is `specs/log-architecture-spec.md` §4.4, and this entry closes at its
+L5: userland console output stops sharing the kernel's ring, and a
+`ConsoleObject` accumulates whole lines under the backend lock.
