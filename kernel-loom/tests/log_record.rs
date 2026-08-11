@@ -10,11 +10,22 @@
 //! `SHARD_RECORDS` is 4 here, which is what makes the recycle cases reachable
 //! in a model at all — `shard.rs` says why.
 //!
-//! `specs/log-architecture-spec.md` §2.5, obligations W1, W2, W2b and W4.
+//! `specs/log-architecture-spec.md` §2.5, obligations W1, W2 and W4.
 
 use kernel_loom::log_shard::{Shard, FIRST_SEQ, SHARD_RECORDS};
 use loom::sync::Arc;
 use toyos_abi::log::{LogRecord, MAX_RECORD_MESSAGE};
+
+/// The model's witness for the production IF/TF-off bracket.
+fn commit_one(shard: &Shard) -> u64 {
+    let guard = kernel_loom::arch::LogCommitGuard::close();
+    // SAFETY: every caller is this model's sole producer for the shard. The
+    // real witness additionally prevents that producer being preempted between
+    // these two operations.
+    let seq = unsafe { shard.reserve(&guard) };
+    unsafe { shard.commit(seq, &record(seq), &guard) };
+    seq
+}
 
 /// A record whose body is entirely derivable from its sequence number, so a
 /// reader that sees a body from a different record fails an equality rather
@@ -66,9 +77,10 @@ fn a_committed_record_is_whole_or_absent() {
         let w = loom::thread::spawn(move || {
             // SAFETY: this thread is the shard's sole writer, which is the
             // precondition the shim's own doc states.
-            let seq = unsafe { writer.reserve() };
+            let guard = kernel_loom::arch::LogCommitGuard::close();
+            let seq = unsafe { writer.reserve(&guard) };
             let r = record(seq);
-            assert!(unsafe { writer.commit(seq, &r) }, "an unlapped commit must publish");
+            unsafe { writer.commit(seq, &r, &guard) };
         });
 
         // The reader races the writer and must see nothing or everything.
@@ -98,12 +110,8 @@ fn the_readable_window_is_exactly_the_last_shard_records() {
     loom::model(|| {
         let shard = Shard::new();
         let total = SHARD_RECORDS as u64 + 1;
-        // SAFETY: sole writer throughout.
-        unsafe {
-            for _ in 0..total {
-                let seq = shard.reserve();
-                assert!(shard.commit(seq, &record(seq)), "an unlapped commit must publish");
-            }
+        for _ in 0..total {
+            commit_one(&shard);
         }
 
         let head = shard.head();
@@ -140,12 +148,8 @@ fn the_readable_window_is_exactly_the_last_shard_records() {
 fn a_recycled_slot_does_not_answer_for_the_record_it_replaced() {
     loom::model(|| {
         let shard = Shard::new();
-        // SAFETY: sole writer throughout.
-        unsafe {
-            for _ in 0..SHARD_RECORDS {
-                let seq = shard.reserve();
-                shard.commit(seq, &record(seq));
-            }
+        for _ in 0..SHARD_RECORDS {
+            commit_one(&shard);
         }
         assert_whole(&shard.read(FIRST_SEQ).expect("the first record is still in the window"), FIRST_SEQ);
 
@@ -153,7 +157,8 @@ fn a_recycled_slot_does_not_answer_for_the_record_it_replaced() {
         // from the moment `head` moves, before a byte of its body is written —
         // which is the guarantee the reader's lower bound rests on.
         // SAFETY: sole writer.
-        let recycling = unsafe { shard.reserve() };
+        let guard = kernel_loom::arch::LogCommitGuard::close();
+        let recycling = unsafe { shard.reserve(&guard) };
         assert_eq!(recycling % SHARD_RECORDS as u64, FIRST_SEQ % SHARD_RECORDS as u64);
         assert!(
             shard.read(FIRST_SEQ).is_none(),
@@ -161,48 +166,9 @@ fn a_recycled_slot_does_not_answer_for_the_record_it_replaced() {
         );
 
         // SAFETY: the number came from this shard and is used once.
-        unsafe { shard.commit(recycling, &record(recycling)) };
+        unsafe { shard.commit(recycling, &record(recycling), &guard) };
         assert_whole(&shard.read(recycling).expect("the new record is readable"), recycling);
         assert!(shard.read(FIRST_SEQ).is_none(), "the replaced record came back");
-    });
-}
-
-/// **W2b — the lapped writer.** A writer whose reservation was lapped by
-/// `SHARD_RECORDS` abandons it, and a reader mid-copy of the *newer* record in
-/// that slot must never observe the older sequence number.
-///
-/// The reachable case in the kernel is a `#DB` storm inside one record's body
-/// write. Writing anyway is not unsound — the exact-equality test rejects the
-/// stale commit — but it turns a committed record back into an uncommitted one,
-/// which is the transition the design says cannot happen.
-#[test]
-fn a_lapped_reservation_is_abandoned_rather_than_committed() {
-    loom::model(|| {
-        let shard = Arc::new(Shard::new());
-
-        // The outer writer takes the first sequence number and is then
-        // interrupted.
-        // SAFETY: sole writer at this point.
-        let stale = unsafe { shard.reserve() };
-        assert_eq!(stale, FIRST_SEQ);
-
-        // The nested run laps it: `SHARD_RECORDS` further reservations put a
-        // live record in slot 0 as `SHARD_RECORDS`.
-        for _ in 0..SHARD_RECORDS {
-            // SAFETY: sole writer.
-            let seq = unsafe { shard.reserve() };
-            unsafe { shard.commit(seq, &record(seq)) };
-        }
-
-        // SAFETY: the sequence number came from this shard and is used once.
-        let published = unsafe { shard.commit(stale, &record(stale)) };
-        assert!(!published, "a lapped reservation must not publish over a live record");
-
-        // The live record is untouched, and the abandoned one is not readable
-        // as itself either — it was overwritten before it was ever committed.
-        let live = FIRST_SEQ + SHARD_RECORDS as u64;
-        assert_whole(&shard.read(live).expect("the live record survives the lapped write"), live);
-        assert!(shard.read(stale).is_none(), "an overwritten number must not read back");
     });
 }
 
@@ -234,8 +200,7 @@ fn a_concurrent_reader_sees_head_grow_and_never_shrink() {
 
         let w = loom::thread::spawn(move || {
             // SAFETY: sole writer.
-            let seq = unsafe { writer.reserve() };
-            unsafe { writer.commit(seq, &record(seq)) };
+            commit_one(&writer);
         });
 
         let first = shard.head();

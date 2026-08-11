@@ -456,7 +456,8 @@ machine-wide.
 #[repr(C, align(64))]
 pub struct Shard {
     /// Reservation counter. **Only the owning CPU writes it**; every other CPU
-    /// reads. Starts at 0, so `seq < head` is half of §2.4's validity test.
+    /// reads. Starts at `FIRST_SEQ` (1); `seq < head` is half of §2.4's
+    /// validity test.
     head: AtomicU64,
     slots: [Slot; SHARD_RECORDS],
 }
@@ -481,6 +482,17 @@ and the only candidate — cpu0's — is one another CPU is writing. The whole
 closes the window rather than narrowing it. `control_regs::init_cr0`, which does
 run before `init_ap`, logs only under the `control-regs-bench` feature; that is
 the whole of the pre-`init_ap` exposure and it goes with this placement.
+
+**`alloc_zeroed` is not the AP shard's constructor.** L1 originally cast the
+zeroed allocation straight to `Shard`, leaving `head == 0` even though
+`Shard::new()` gives cpu0 `head == FIRST_SEQ`. The AP's first reservation then
+issued sequence 0, collided with every slot's empty-state word, and was
+deterministically unreadable. `Shard::initialize_zeroed` now writes
+`AtomicU64::new(FIRST_SEQ)` into the unpublished allocation in place; the slots
+stay zero. Constructing a full `Shard::new()` value and moving it is rejected
+because it can materialise 128 KiB on the BSP's 16 KiB stack. The host-fast
+`log_zeroed_init` test allocates the real layout with `alloc_zeroed`, runs this
+constructor, and proves the first reservation is `FIRST_SEQ`.
 
 **Why 512, re-derived — the first derivation measured the wrong thing and got
 the wrong number.** It said "the measured worst cpu0 boot in `specs/metal-logs/`
@@ -543,28 +555,30 @@ pub fn emit(level: Level, args: core::fmt::Arguments);
    stack, both **16384** bytes (`percpu.rs:246`, `:204`), and 224 bytes is 1.4%
    of one. The 512-byte drain buffers that used to live on those stacks go away
    entirely (§8).
-2. **Reserve, and this is the one step that must not be interruptible by the
-   scheduler.** `let (shard, seq) = reserve();` — read this CPU's shard pointer
-   from `gs:`, then one **non-`lock`-prefixed `xadd`** on `shard.head`, behind
-   `arch::percpu_fetch_add`, documented as *interrupt-atomic, not SMP-atomic;
-   sound only for a counter one CPU writes*. **The two instructions are bracketed
-   by `pushfq`/`cli`/`popfq` and nothing else is inside the bracket** — §2.3a
-   says why the bracket is not optional and why it is only three instructions
-   wide.
-3. **Write the body** into `shard.slots[seq % SHARD_RECORDS]` — plain stores,
-   outside the bracket, into the shard step 2 named and never into "this CPU's".
-4. **Commit and read the waiter flag**: `commit_and_signal(shard, seq)` —
-   `slot.seq.store(seq, Release)`, `fence(SeqCst)`, `LOG_WAITER.load(Relaxed)`,
-   and on `true` the swap that admits one poster per park (§2.5, §2.6a).
+2. **Close one publication guard.** `LogCommitGuard::close()` saves RFLAGS and
+   clears both `IF` and `TF`. Inside it, read this CPU's shard pointer and
+   identity from `gs:`, then reserve with one **non-`lock`-prefixed `xadd`** on
+   `shard.head`, behind `arch::percpu_fetch_add`, documented as
+   *interrupt-atomic, not SMP-atomic; sound only for a counter one CPU writes*.
+3. **Write and commit before reopening the guard.** Fill the record's five
+   identity fields, store `WRITING`, perform the release fence, copy the
+   248-byte body into `shard.slots[seq % SHARD_RECORDS]`, and finally
+   `slot.seq.store(seq, Release)`. Only then restore the caller's complete
+   RFLAGS. Formatting and the 224-byte message copy into the local `LogRecord`
+   remain outside; §2.3a says why reservation through final publication cannot.
+4. **Read the waiter flag after the guarded commit**: `signal_after_commit()` —
+   `fence(SeqCst)`, `LOG_WAITER.load(Relaxed)`, and on `true` the swap that
+   admits one poster per park (§2.5, §2.6a).
 5. **Post the wake, only in `Drain::Thread` mode and only when step 4 returned
    `true`**: `wake_direct` to `klogd`, inside a flags bracket of its own. Not
    once per record — once per park.
 
 **No lock and no locked RMW in `Drain::Thread`**, which is every mode after
 `scheduler::init`. The path loses today's `compare_exchange_weak` and keeps a
-three-instruction flags bracket where today's covers the whole append; it gains
-one `SeqCst` fence and one relaxed load. L1 measures the net for the ring and L3
-for the fence, which arrives with the wake (§9.6).
+flags bracket across reservation and one bounded 248-byte publication; it gains
+one `SeqCst` fence and one relaxed load. The guard never polls, spins, schedules,
+or waits for a prior writer. L1 measures the widened bracket and the net for the
+ring; L3 measures the fence, which arrives with the wake (§9.6).
 
 **`Drain::Inline` is not that path and must not be described as if it were.**
 Inline `emit` calls `BackendGuard::lock()` (`serial.rs:97`), which is
@@ -573,16 +587,18 @@ record pays one locked RMW and a synchronous backend write. That is one CPU and
 185 records (§2.2), so the cost is nil; the claim is what has to be accurate.
 §9.6's RMW budget counts both modes separately.
 
-**And Inline `emit` is not reentrant, where Thread `emit` is.** `BackendGuard`
-clears `IF` before it spins, so an IRQ cannot re-enter it, but an exception can —
-and a Ring 0 fault during boot whose handler logs would spin on a lock its own
-CPU holds. That is today's shape exactly (`RingGuard::lock` has the same `cli`
-and the same CAS), and it is covered by the same mechanism: a Ring 0 fault is
-fatal, so it reaches `panic_flush`, which waits out a live `BackendGuard` holder
-and then bypasses a wedged one. Stated because §2.4's fourth property is about
-the *shard* and does not extend to the inline backend.
+**Inline and Thread have different nesting rules.** `BackendGuard` makes Inline
+non-reentrant: it clears `IF` before it spins, but a Ring 0 exception can enter
+while the same CPU holds it. That is today's shape exactly (`RingGuard::lock`
+has the same `cli` and CAS), and the fatal path is covered by `panic_flush`,
+which waits out a live holder and then bypasses a wedged one. Thread takes no
+lock and never waits for an interrupted producer; instead its publication is
+non-preemptible for every returning IRQ and single-step path. A fatal #DF or #MC
+may nest, append its own records, and halt without returning; §3.1's snapshot
+reader skips the interrupted `WRITING` slot. Stated because the shard's rule and
+the inline backend's rule are deliberately different.
 
-### 2.3a Why the reservation is bracketed, and why three instructions is enough
+### 2.3a Why reservation and publication are one bracket
 
 A non-`lock`-prefixed `xadd` is atomic against an interrupt on its own CPU —
 instructions retire whole — and it is **not** atomic against another CPU. The
@@ -595,8 +611,8 @@ dst, now)`); `Hw::switch` swaps the per-context preempt depth (`hw.rs:173`), so 
 kernel context at depth 0 with `IF` set is preemptible and its next run may be on
 another CPU. A kernel thread is exactly that context, and it logs — **and under
 the ruled order L3 is what introduces the first one**, `klogd`, with completions'
-C6 adding `usbd` and `iod` on the machinery L3 builds (§4.3, §12.6). So without
-the bracket:
+C6 adding `usbd` and `iod` on the machinery L3 builds (§4.3, §12.6). Without one
+bracket across the operation there are two independent failures:
 
 - a preemption **between the `gs:` read and the `xadd`** puts the `xadd` on a CPU
   that does not own the shard, and two CPUs performing a non-atomic
@@ -604,24 +620,52 @@ the bracket:
   `seq`, share a slot, and one overwrites the other. §9.1's conservation law is
   what would eventually catch it; a race that needs a preemption inside a
   two-instruction window is not something a suite catches on purpose.
-- a preemption **after the `xadd`** is harmless, and that is why the bracket ends
-  there: the sequence number is already exclusively owned, and step 3 writes into
-  the shard step 2 named rather than into whatever `gs:` says now. Only the `cpu`
-  field can then be stale, and it is stamped inside the bracket.
+- a preemption **during the body copy is not harmless.** Suppose the outer
+  writer owns `s`, marks its slot `WRITING`, copies part of the body, and is
+  scheduled away. The original CPU can publish a whole newer generation,
+  including `s + SHARD_RECORDS`, before the outer task resumes. The outer then
+  overwrites the tail of that committed record and may finally store the stale
+  `s`. A head check before the copy only covers a lap that already happened;
+  one immediately before the final sequence store notices too late, after the
+  newer record's body is corrupt. There is no re-check position outside the
+  copy that repairs bytes already written.
+
+The guard therefore spans the `gs:` reads, the unlocked `xadd`, the identity
+stores, the `WRITING` mark, the body copy and the final release store. It restores
+RFLAGS only after the slot is committed. No newer committed record can move
+back to `WRITING` or acquire another body's bytes **because an older writer
+resumed**: a live writer cannot be scheduled away inside that interval. Normal
+drop-oldest recycling still moves the oldest generation through `WRITING`, by
+design. The guard is crate-private and carries `PhantomData<*mut ()>`, making it
+neither `Send` nor `Sync`; safe code cannot restore one CPU's saved RFLAGS after
+moving the guard to another CPU.
 
 **Why the flags bracket and not `preempt::disable()`.** `preempt::disable`
 (`preempt.rs:93`) is `lock add dword ptr gs:[240], 1` and `enable` is a `lock
 sub` plus a `need_resched` poll — **two locked RMWs per record**, which is the
-cost §1.4 exists to avoid, to buy a property `cli` buys with `pushfq`/`popfq`.
+cost §1.4 exists to avoid. It buys scheduler migration exclusion and still does
+not clear `TF`, so it does not buy the complete property. Single-step #DB is an
+exception, not a maskable interrupt, and Ring 3 can set TF; restoring it before
+publication would reintroduce same-CPU nesting one instruction later. The flags
+guard clears `TF` as well as `IF`. Hardware-watchpoint #DB is
+the one returning path flags cannot mask. Its handler now clears DR7 and DR6
+*before its first `log!`*, preventing recursion when the watched address is the
+shard head or body, and the handler emits at most 32 records including its
+20-frame backtrace — less than one 512-record lap. NMI does not log; the shard,
+record and kernel stack are resident and cannot fault; #DF and #MC do not
+return. Those are the complete exceptional entries into this bounded region.
+
 The flags bracket is also what every `log!` caller inside a syscall already has
-(`IF` is clear for the whole of every syscall), so on the dominant path the
-`popfq` restores a flag that was already clear. **`emit` has a second bracket of
-the same kind and it is not this one**: the wake post sits after the commit
-store, outside this bracket by construction, and §2.6a is where it is argued.
+for `IF` (it is clear for the whole syscall), while `TF` is normally clear
+machine-wide. **`emit` has a second bracket of the same kind and it is not this
+one**: the wake post sits after the commit store and after RFLAGS restoration,
+and §2.6a is where that bracket is argued.
 
 **W4's shim is sound for this shape and only this shape** (§2.5): loom models the
 `xadd` as a real `fetch_add`, which is strictly stronger, and the bracket is what
-makes "no other CPU writes `head`" true rather than hopeful.
+makes "no other CPU writes `head`" true rather than hopeful. Loom has no CPU
+flags or strict same-CPU preemption, so it carries a `LogCommitGuard` witness and
+the negative control belongs to §9.2's guest actuator.
 
 ### 2.4 What makes atomicity unrepresentable to violate
 
@@ -641,8 +685,10 @@ Four properties, each structural rather than checked:
   **`slot.seq == s` alone is not a total test and an earlier draft of this
   section said it was.** Slots are zero at boot — cpu0's shard is `.bss` and an
   AP's is `alloc_zeroed` — so slot 0 of a shard that has never been written holds
-  `seq == 0`, which *equals* sequence number 0. A reader checking only equality
-  would read an all-zero record as record 0 of every shard on every boot.
+  `seq == 0`, which *equals* sequence number 0. The AP constructor changes only
+  `head` to `FIRST_SEQ`; it deliberately leaves this slot state zero. A reader
+  checking only equality would read an all-zero record as record 0 of every
+  shard on every boot.
 
   **And `s < head` does not repair it, which is L1's first correction.** `head`
   counts *reservations*: it is bumped before the body exists, so on the very
@@ -652,8 +698,9 @@ Four properties, each structural rather than checked:
   start at 1** (`FIRST_SEQ`), so no issued number can collide with the zeroed
   state, and the reader's lower bound is `oldest_readable` rather than nothing.
   Both ends are compared against words the reader loads anyway (§2.6).
-  `kernel-loom`'s `a_shard_nothing_has_written_answers_for_nothing` is what
-  fails if either goes back.
+  `kernel-loom`'s `a_shard_nothing_has_written_answers_for_nothing` fails if
+  either goes back, and host-fast `log_zeroed_init` binds the AP allocation path
+  to the same first sequence as cpu0.
 
   **A stale value can never be mistaken for a live one, and that is what kills
   ABA.** Slot `j` only ever holds sequence numbers `≡ j (mod SHARD_RECORDS)`, the
@@ -702,21 +749,22 @@ Four properties, each structural rather than checked:
   the `UnsafeCell` is the form, and the reason goes in the doc comment on the
   copy. **Loom cannot model that access either**, and W2's entry in §2.5 says
   what it models instead.
-- **Reentrancy cannot collide.** An exception or IRQ that logs while a record is
-  being written on the same CPU takes its own reservation, so the two never share
-  a slot. The nested record commits first and the outer commits after; §3.2 says
-  what each reader does with that.
+- **A live reservation cannot be abandoned or lapped.** The same IF/TF-off
+  guard covers reservation through the final sequence store, and that region
+  contains no lock, wait, spin, scheduler call, allocation, formatting, or
+  fallible memory access. Ordinary IRQ preemption and single-step #DB are
+  excluded. A hardware-watchpoint #DB clears its trigger before logging and is
+  statically bounded to 32 nested records, below `SHARD_RECORDS`; NMI does not
+  log. A #DF or #MC may nest and then halt, so the interrupted reservation can
+  remain `WRITING`, but no outer writer resumes and a dying machine uses
+  `snapshot_committed` (§3.1).
 
-  **A reservation that is lapped is abandoned rather than committed.** If the
-  nested run emits `SHARD_RECORDS` or more records before the outer resumes — a
-  `#DB` storm inside one record's body write is the reachable case
-  (`rflags-tf-log-flood`) — the outer's slot has been recycled, and writing its
-  body would destroy a live newer record for every reader that had not yet taken
-  it. So step 3 re-reads `head` first and skips the body and the commit when
-  `head - seq >= SHARD_RECORDS`; one load and one comparison, no atomic. Without
-  it nothing is *unsound* — the readers' exact-equality test rejects the stale
-  commit — but a record that was committed becomes uncommitted, which is the one
-  transition the rest of this section says cannot happen.
+  Therefore every reservation on a live machine reaches its release store and
+  a quiet shard cannot retain a permanent hole in front of `klogd`. `commit`
+  has no lapping check: the former pre-body check missed preemption during its
+  248-byte copy, while a final check would merely diagnose corruption already
+  performed. The non-preemptible publication is what prevents the transition;
+  no producer ever waits for the interrupted one.
 
 ### 2.5 Memory-ordering obligations, and the loom models
 
@@ -738,16 +786,20 @@ that return a `bool` and touch no subject:
 
 ```rust
 // kernel/src/log/shard.rs — the whole modelled surface
-impl Shard { fn reserve(&self) -> u64; fn commit(&self, seq: u64); }
-/// commit, fence, read the flag. True means "a reader is parked; post to it".
-pub fn commit_and_signal(shard: &Shard, seq: u64) -> bool;
+impl Shard {
+    unsafe fn reserve(&self, guard: &LogCommitGuard) -> u64;
+    unsafe fn commit(&self, seq: u64, record: &LogRecord,
+                     guard: &LogCommitGuard);
+}
+/// Fence, read the flag after commit. True means "a reader is parked; post".
+pub fn signal_after_commit() -> bool;
 /// set the flag, fence, re-scan for a committed record. True means "do not park".
 pub fn arm_waiter(cursor: &Cursor) -> bool;
 ```
 
 The caller does the post on a `true`, and never the ordering. The shimmed set for
-`shard.rs` is then `UnsafeCell` and `percpu_fetch_add`, which is smaller than
-`sync.rs`'s. **The layout requirement is stated here and honoured at L1 even
+`shard.rs` is then `UnsafeCell`, `LogCommitGuard` and `percpu_fetch_add`, which
+is smaller than `sync.rs`'s. **The layout requirement is stated here and honoured at L1 even
 though the two functions arrive at L3** (§2.6a): if `shard.rs` were allowed to
 grow a dependency on a subject, W3 could not be modelled at all, and that is
 exactly the mistake the paragraph above records.
@@ -756,13 +808,13 @@ exactly the mistake the paragraph above records.
 |---|---|---|---|
 | **W1** publication | body stores → `seq.store(Release)`; reader's `seq.load(Acquire) == s` implies the body is visible | `kernel-loom/tests/log_record.rs` | L1 |
 | **W2** recycle detection | the readable window is exactly the last `SHARD_RECORDS`, and a slot a writer has entered answers for neither generation. **Deterministic, not raced** — loom's `UnsafeCell` records every access as a write and reports the unsynchronised *pair*, so a seqlock read looks to it like a second writer; and a two-thread model over a whole ring is hundreds of thousands of interleavings, which did not finish in ten minutes here. What loom checks concurrently is W1; what makes W2 a state rather than a schedule is that the mark is published before the body | same | L1 |
-| **W2b** the lapped writer | a writer whose reservation was lapped by `SHARD_RECORDS` re-reads `head` and abandons rather than publishing over a live record (§2.4) | same | L1 |
-| **W3** the wake edge | `commit_and_signal`: `seq.store(Release); fence(SeqCst); LOG_WAITER.load(Relaxed)` against `arm_waiter`: `LOG_WAITER.store(true, Relaxed); fence(SeqCst); rescan for a committed record; park`. **Invariant: no committed record is left with a parked reader.** Store-buffer shaped, so TSO hides the missing fence and only loom sees it. Carries its own negative case — either fence removed behind a `cfg`, and the model must red — because a model that has never failed proves nothing | `kernel-loom/tests/log_wake.rs` | L3 |
+| **W2b** non-preemptible publication | one `LogCommitGuard` witnesses shard selection, reservation, `WRITING`, body copy and the final sequence store. A stale writer can neither migrate nor resume after a newer generation. CPU flags and strict same-CPU preemption are outside Loom; §9.2's guest actuator is the negative proof | `log_nested_emit` plus `log-unbracketed-reserve` | L4 |
+| **W3** the wake edge | `signal_after_commit`: `fence(SeqCst); LOG_WAITER.load(Relaxed)` after `seq.store(Release)`, against `arm_waiter`: `LOG_WAITER.store(true, Relaxed); fence(SeqCst); rescan for a committed record; park`. **Invariant: no committed record is left with a parked reader.** Store-buffer shaped, so TSO hides the missing fence and only loom sees it. Carries its own negative case — either fence removed behind a `cfg`, and the model must red — because a model that has never failed proves nothing | `kernel-loom/tests/log_wake.rs` | L3 |
 | **W4** the reservation | `head` is written by one CPU through inline asm and read by others as an `AtomicU64` | shimmed | L1 |
 
 **L1's models are green and they have teeth, which is checked rather than
 claimed**: with the commit store's `Release` weakened to `Relaxed`,
-`a_committed_record_is_whole_or_absent` reds and the other five stay green.
+`a_committed_record_is_whole_or_absent` reds and the other four stay green.
 `SHARD_RECORDS` is 4 under loom, which is what makes the recycle cases
 reachable at all — at 512 a model that has to lap a slot explores a branch it
 never finishes. The layout `const` assertions are skipped in that build,
@@ -778,13 +830,15 @@ is the only instrument that sees it, which is why the model ships in the same
 chunk as the code.
 
 **W3's rescan is over committed records and never over `head`, and that is a
-liveness property rather than a taste.** A reader that re-scans `head[i]` and
-declines to park whenever `head[i] > next[i]` never parks at all on a shard
-holding an abandoned reservation (§3.1) — `drain_ordered` returns nothing for
-that shard and `head` does not move on a quiet machine, so `klogd` spins a CPU at
-100% until 512 further records arrive, which on a quiet machine is never. The
-predicate is the same one `drain_ordered` uses: *is there a committed record at
-`next[i]`*. Eight loads either way.
+liveness property rather than a taste.** `head[i] > next[i]` can mean one writer
+is inside the bounded publication window; it does not mean the next slot is
+committed. Busy-waiting on that inequality spends a CPU until the copy finishes.
+The waiter instead asks the predicate `drain_ordered` uses — *is there a
+committed record at `next[i]`* — and may park. If the writer is still active, its
+post-commit signal wakes the waiter; if it already committed, W3's two fences
+prevent the lost wake. Since §2.4 permits no abandoned reservation on a live
+machine, a quiet shard cannot strand later records behind a permanent gap.
+Eight loads either way.
 
 **W4's shim, and why it is sound.** Loom cannot model inline asm, so
 `percpu_fetch_add` is shimmed to a real `fetch_add`. That is a **strictly
@@ -858,9 +912,9 @@ the cost read into it belongs to a witness *type*'s constructors. `PreemptOff`
 that can reach `do_preempt`, which is a scheduling pass. `emit` may have neither.
 
 **So the post takes a flags bracket of its own, and §2.3a's is not it.** That
-bracket ends at the `xadd` on purpose (§2.3a's second bullet) and the post comes
-after the commit store, so the wake is *not* inside a bracket that already
-exists — it gets a second one of the same kind and by the same argument.
+bracket ends after the commit store and restores the caller's RFLAGS before the
+post, so the wake is *not* inside a bracket that already exists — it gets a
+second one of the same kind and by the same argument.
 `IrqGuard::close()` (`kernel/src/hw.rs:42`) is `pushfq`/`pop`/`cli` with
 `push`/`popfq` on drop: no locked RMW, and on the dominant path `IF` is already
 clear.
@@ -883,8 +937,8 @@ paragraph names one.
 RMWs.** Without it every record would pay `claim_wake`'s CAS. §2.5's two
 functions, in `shard.rs` with the ring:
 
-- `commit_and_signal`: `slot.seq.store(seq, Release)`, `fence(SeqCst)`,
-  `LOG_WAITER.load(Relaxed)`, and **only** on `true` the
+- `signal_after_commit`: after the guarded `slot.seq.store(seq, Release)`,
+  `fence(SeqCst)`, `LOG_WAITER.load(Relaxed)`, and **only** on `true` the
   `LOG_WAITER.swap(false, AcqRel)` that admits exactly one poster per park. It
   returns whether this caller owns the post; the caller does the post, and never
   the ordering.
@@ -977,9 +1031,11 @@ uncommitted record does not stop the merge: the other shards keep flowing and
 their records are emitted. So the merge is in `at_ns` order *among what it
 emits*, and a blocked shard's records arrive later than records with larger
 timestamps once it unblocks. That is the only ordering this design does not
-give, it is bounded by the block's duration (microseconds for a nested writer,
-unbounded for an abandoned reservation), and the alternative — stalling every
-shard on the slowest — is what turns one wedged CPU into a silent machine.
+give. On a live machine it is bounded by one non-preemptible 248-byte
+publication; on a fatal machine the interrupted `WRITING` slot can remain
+forever, but that machine uses `snapshot_committed` instead. The alternative —
+stalling every shard on the slowest — is what turns one wedged CPU into a silent
+machine.
 `logd` renders in arrival order and the timestamp is in every line, so a reader
 sorts if it cares.
 
@@ -989,12 +1045,12 @@ on the stack (8 × 16 bytes at the shipped count), pick the smallest `at_ns`,
 advance. `snapshot_committed` walks each shard from `head - SHARD_RECORDS` to
 `head`, which is at most 4,096 slot reads machine-wide.
 
-On a live machine a shard can only be blocked by an abandoned reservation, and
-the drop-oldest window unblocks it as soon as that shard writes
-`SHARD_RECORDS` more records. On a machine quiet enough that it never does, the
-records behind it are lost to the streaming reader and present to the snapshot
-one. Stated rather than papered over — and §2.5's W3 note is what stops the
-streaming reader burning a CPU while it waits.
+There is no abandoned reservation on a live machine (§2.4). If a reader reaches
+an in-flight slot, it may park rather than burn a CPU; the bounded writer commits
+and the W3 signal wakes it. A fatal handler may leave the interrupted slot
+permanently `WRITING`, but the machine does not return to `klogd` and the panic
+surface uses the skipping snapshot reader. That split is what makes both the
+live liveness claim and the dying-machine diagnostic claim true.
 
 ### 3.2 The cursor syscall
 
@@ -2069,12 +2125,27 @@ wrong *workload* for it.
 
 ### 9.2 Nesting — the case loom cannot express
 
-Loom models threads, not strict LIFO reentrancy on one CPU, so §2.4's fourth
-property needs an actuator. `log-nested-emit` arms a one-shot LAPIC timer to fire
-inside a record's body-write window, from a handler that emits its own record.
-The verdict: both records are read out, both pass §9.1's checksum, and their
-sequences differ. On a tree where the reservation is a load-then-store rather
-than an interrupt-atomic increment, they collide and the gate reds.
+Loom models threads, not CPU flags or strict LIFO reentrancy on one CPU, so
+§2.4's fourth property needs an actuator. `log_nested_emit` has two deterministic
+arms in the actuator kernel:
+
+- for `log-shared-reservation`, a one-shot LAPIC timer is admitted between the
+  reservation's load and store and the handler emits one record. The verdict is
+  that both records are read, both pass §9.1's checksum, and their sequences
+  differ. A load-then-store reservation collides and reds.
+- for `log-unbracketed-reserve`, the outer record pauses for a fixed test-only
+  interval halfway through its body copy while a one-shot timer is armed. With
+  the production guard, IF defers the timer until the outer sequence store; the
+  handler's patterned burst of exactly `SHARD_RECORDS` records then overwrites
+  the outer record only as the ring's declared drop-oldest policy. With the
+  guard removed, the timer lands mid-copy, the burst commits
+  `s + SHARD_RECORDS` into the outer slot, and the resumed outer writer corrupts
+  that committed body. §9.1's checksum or conservation equality must red.
+
+The second arm is specifically a negative proof against the tempting final-head
+re-check: leaving the newer sequence word in place does not undo the stale body
+bytes already copied. The shipping arm neither waits nor delays; the pause and
+burst exist only behind the named test stimulus in the actuator kernel.
 
 ### 9.3 A hung device cannot stall audio
 
@@ -2128,7 +2199,7 @@ holds them out of a shipping kernel.
 |---|---|---|
 | `log-commit-early` | the commit store moves **before** the body write | §9.1's checksum, within one storm |
 | `log-shared-reservation` | the reservation becomes a load-then-store | §9.2, deterministically |
-| `log-unbracketed-reserve` | §2.3a's `pushfq`/`cli`/`popfq` around the shard-read and the `xadd` is removed, so a preempted producer can `xadd` a shard it does not own | `log_migration_storm`'s conservation law at `--smp 8` |
+| `log-unbracketed-reserve` | §2.3a's complete IF/TF guard is removed from shard selection through final publication, so a producer can migrate before `xadd` or resume its body copy after a newer generation committed | `log_migration_storm` at `--smp 8` and `log_nested_emit`'s patterned mid-body lap |
 | `log-trusts-durable` | the §6.4 clamp on `LogCursor::durable` is removed | a test logd publishing `u64::MAX` makes `wait_for_log_file` return with nothing written, and `screen_fatal_halt_composited`'s `/log` half reds |
 | `log-writes-the-file` | `klogd`'s drain appends records to `/log` through the VFS, from the idle loop — the coupling, rebuilt in miniature | `io-depth-probe`'s depth, and §9.3 reading 1 by the recorded margin |
 | `console-unbuffered` | `ConsoleObject`'s line buffer is bypassed; each `write` reaches the backend — **which is literally L3's own intermediate state** (§8.1) | `console_line_atomicity`, and `Serial::interleaved` on the same capture |
@@ -2166,7 +2237,9 @@ existing. Named rather than discovered at compl's C14.
 - **`log_conservation`** — §9.1, at `--smp 1`, `4` and `8`. **It runs inside
   `test-runner`**, which is the manifest program that holds `logread` in each
   test config; a spawned test binary does not inherit a `SysCap` dup (§3.2).
-- **`log_nested_emit`** — §9.2.
+- **`log_nested_emit`** — §9.2's two deterministic arms: one nested record for
+  the load-then-store reservation control, and one full-generation burst for the
+  mid-body stale-writer control.
 - **`log_migration_storm`** — the gate for §2.3a, and the one §9.1 cannot supply
   on its own: `log-storm` from **kernel threads at preempt depth 0 with `IF`
   set** rather than from a tight per-CPU loop, at `--smp 8` with stealing on, so
@@ -2224,18 +2297,26 @@ existing. Named rather than discovered at compl's C14.
 - **The RMW budget**, counted rather than asserted, and **counted per mode**
   because the two differ:
   - `Drain::Thread` (everything after `scheduler::init`): loses one
-    `compare_exchange_weak` per record, keeps a `pushfq`/`cli`/`popfq` bracket
-    narrowed from the whole append to two instructions (§2.3a), and gains **one
-    `SeqCst` fence and one relaxed load** per record. No locked RMW on the
-    producer's path at all. The five locked operations of the post (§2.6a) are
-    paid at most once per `klogd` park, by one producer, inside a second bracket
-    of the same kind.
+    `compare_exchange_weak` per record, keeps one `pushfq`/`cli`/`popfq`-shaped
+    guard widened from shard selection through the bounded 248-byte publication
+    (§2.3a), and gains **one `SeqCst` fence and one relaxed load** per record. No
+    locked RMW on the producer's path at all. The five locked operations of the
+    post (§2.6a) are paid at most once per `klogd` park, by one producer, inside
+    a second bracket of the same kind.
   - `Drain::Inline` (boot, 185 records on one CPU): pays `BackendGuard`'s
     `compare_exchange_weak` and its `cli` per record, plus the synchronous
     backend write. Not a saving and not meant to be one; §4.2's measurement is
     what decides whether it is gated on `has_console()`.
 
-  L1 counts both; L9 measures. **The fence is L3's to A/B**, on the same
+  L1 counts both; L9 measures. **The review-time paired smoke measurement found
+  no regression at its 1 ms guest-clock resolution**: immediately before the
+  widened guard, `i8042_absent` reached `Boot: complete` in 254 ms without i8042
+  and 257 ms with it; immediately after, both arms read 255 ms. This is evidence
+  for the owner-approved bounded cost; two later clean rebuilds read 251/252 ms
+  and 251/263 ms, for fixed-tree medians of 251/255 ms. The 11 ms scatter in the
+  device-present arm is also why this smoke check is not a replacement for the
+  interleaved `xhci_slow_connect` measurement this section requires. **The fence
+  is L3's to A/B**, on the same
   instrument as §1.4's — `xhci_slow_connect`'s `Boot: complete`, interleaved —
   because it arrives with the wake and not with the ring, and it is separable
   behind a `#[cfg]` if that chunk moves the number.
@@ -2263,9 +2344,9 @@ rebase, never amend.
 |---|---|---|---|
 | **L0** | merge `origin/main` (**post-endowment, and that is the whole of it** — completions lands after this branch, §12). Re-derive every number in this spec against the merged tree; re-check §12.5's endowment rows against the merged *code* and not only its plan; compute the first clean syscall number. **Nothing about the completion core is confirmable here and L0 must not wait on it** — §2.6a needs nothing from it. **Done 2026-08-11 against `f1724a9`; §0.0 is the walk** | suite green; §0.0 accounts for every moved row; the baselines of §9.3 recorded here |
 | **L-ABI** | **its own branch off `main`, landed before L1** (§11). `toyos-abi/src/log.rs` — `LogRecord`, `Level`, `LogCursor` with its clamped `durable`, `MAX_LOG_SHARDS`, the two layout `const` assertions and the `Display` of §3.3; `SYS_LOG_READ = 114`; `Rights::LOG`; the `toyos` SDK wrapper. **No kernel dispatch**: there is no shard to read until L1, so the number falls to the dispatch's default and answers `InvalidArgument`, which is what an unassigned number answers | `cargo test` in `toyos-abi/`: the layout asserts, and the `Display` rendering a known record byte for byte |
-| **L1** | `kernel/src/log/`: `Slot` over L-ABI's `LogRecord` and `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions **carrying the level with their text unchanged** (below). Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W2b, W4); the full suite indistinguishable from `main`'s; the boot A/B of §9.6 |
+| **L1** | `kernel/src/log/`: `Slot` over L-ABI's `LogRecord` and `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions **carrying the level with their text unchanged** (below). Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W4); host-fast `log_zeroed_init`; the full suite indistinguishable from `main`'s; the boot A/B of §9.6. W2b's CPU-flags negative arrives with `log_nested_emit` at L4 |
 | **L2** | the two readers; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records and at `Level`; **the `!!!` sentinel deleted from the seven `alert!` texts and from the ~20 assertions that read it**; the `KernelArgs` `{:?}` site split into several records; `Mark` → `Instant` | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green |
-| **L3** | `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`commit_and_signal`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement and the fence's A/B |
+| **L3** | `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`signal_after_commit`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement and the fence's A/B |
 | **L4** | the kernel's half of L-ABI, which touches no sysroot source: the `SYS_LOG_READ` dispatch over `drain_ordered`, `Source::Log` and its watcher static (§3.2), `logread` in `toyos_manifest`'s `SYSCAP_RIGHTS` and on `test-runner`'s row in the six test configs that have one | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall |
 | **L5** | one `ConsoleObject` per endowment over one backend, its line buffer, `Console` losing `DUP`; the ANSI strip moves; `MAX_CONSOLE_LINE` | `console_line_atomicity`; `console-unbuffered` reds both its clauses; `one_console_holder` |
 | **L6** | `/bin/logd`: the program, **its row in all eleven manifests** (§5.1a) including `diag/`'s and its restated comment, the protocol, rotation, retention, per-client backlog, the give-up policy on today's live 2 s transport bound (§5.4); **`SYS_FSYNC`'s device flush, outright — there is no C12 to hand it to (§12.4)**. **Delete `log_file.rs` whole**, `flush_log_file_if_affordable` and everything in §8.1's `driver.rs` list; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`, **including `apic.rs:146`'s comment and its kick loop, which name the idle loop's `log_file::poll`**; §6.3's shutdown | `kernel_log_file` re-pointed and green mid-run and after shutdown; `log_is_durable_after_fsync`; `screen_fatal_halt_composited`'s `/log` half green; `logd_gone`; `shutdown_last_line`; `idle_loop_is_the_declared_body`; `log-writes-the-file` and `log-trusts-durable` red |
@@ -2777,17 +2858,19 @@ Recorded because each is attractive and the next reader will re-derive it.
    **This is not an argument for deleting the harness's splice *detector*, and
    the first draft used it as one** — §8.1 keeps `Serial::interleaved` and gives
    it teeth.
-9. **`preempt::disable()` around the reservation instead of the flags bracket.**
-   It buys the same property and costs `lock add` + `lock sub` per record, which
-   is two locked RMWs where §1.4 prices one at 350 ms of boot. §2.3a. **The same
-   choice for the same reason on the wake post** (§2.6a), where `preempt_off`
-   would additionally put `enable`'s `need_resched` poll — a scheduling pass —
-   inside `emit`.
+9. **`preempt::disable()` around reservation and publication instead of the flags bracket.**
+   It excludes scheduler migration and costs `lock add` + `lock sub` per record,
+   which is two locked RMWs where §1.4 prices one at 350 ms of boot, while still
+   leaving TF's returning #DB path enabled. A correct variant therefore needs
+   the flags operation too and has no advantage. §2.3a. **The same cost reason
+   applies on the wake post** (§2.6a), where `preempt_off` would additionally put
+   `enable`'s `need_resched` poll — a scheduling pass — inside `emit`.
 10. **No bracket at all, on the ground that `log!` mostly runs with `IF` already
     clear.** True of every syscall and every IRQ handler, and false of a kernel
     thread at preempt depth 0 — of which L3 adds the first, `klogd` itself, and
     completions' C6 two more. A correctness argument that holds for most callers
-    is not one. §2.3a.
+    is not one. It also leaves the stale mid-body resume of §2.3a even if the
+    reservation itself happens not to migrate.
 11. **Making `emit` post a completion through the completion core's ordinary
     path.** It walks a list under the subject's leaf lock, which `emit` may not
     take and which deadlocks the first time anything on that lock's path logs.

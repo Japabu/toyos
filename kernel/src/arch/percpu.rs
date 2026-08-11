@@ -317,15 +317,19 @@ fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
 /// runs an instruction, so allocating here closes that window rather than
 /// narrowing it.
 ///
-/// `alloc_zeroed`, because a zeroed slot is what `Shard::read`'s `seq < head`
-/// test is written against and what cpu0's `.bss` shard already is.
+/// The slots stay zeroed, while [`log::Shard::initialize_zeroed`] writes the
+/// nonzero first reservation number into `head`. cpu0 gets the same state from
+/// [`log::Shard::new`] in `.bss`.
 fn alloc_log_shard(cpu_id: u32) -> u64 {
     if cpu_id == 0 {
         return &raw const log::BOOT_SHARD as u64;
     }
     let layout = Layout::from_size_align(size_of::<log::Shard>(), 64).unwrap();
-    let ptr = unsafe { alloc_zeroed(layout) };
+    let ptr = unsafe { alloc_zeroed(layout) } as *mut log::Shard;
     assert!(!ptr.is_null(), "percpu: log shard alloc failed for cpu{cpu_id}");
+    // SAFETY: this is a fresh zeroed, 64-byte-aligned allocation which is not
+    // published into `PerCpu` until this function returns.
+    unsafe { log::Shard::initialize_zeroed(ptr) };
     ptr as u64
 }
 
@@ -350,21 +354,16 @@ pub fn log_identity() -> (u32, u32) {
     (cpu, tid)
 }
 
-/// This CPU's shard, its identity, and one sequence number out of that shard —
-/// with interrupts masked across exactly the pointer read and the add.
+/// This CPU's shard, its identity, and one sequence number out of that shard.
 ///
 /// The `xadd` has **no `lock` prefix**. It is atomic against an interrupt on its
 /// own CPU because instructions retire whole, and it is not atomic against
-/// another CPU — which is sound only while this CPU owns the shard, and the
-/// `cli` is what makes that true across the two steps. `log::reserve` carries
-/// the argument in full; the short version is that work stealing can move a
-/// preemptible kernel context between the `gs:` read and the add.
-///
-/// Everything after the add is outside the bracket on purpose: the sequence
-/// number is exclusively ours from that instruction on, so a preemption there
-/// costs nothing. The identity fields are read inside it so that a record
-/// cannot name a CPU it was not written on.
-pub fn reserve_log_slot() -> (*const log::Shard, u64, u32, u32, u32) {
+/// another CPU — which is sound only while this CPU owns the shard. The live
+/// [`crate::arch::LogCommitGuard`] proves that neither migration nor a
+/// single-step #DB can happen from this pointer read through publication.
+pub fn reserve_log_slot(
+    guard: &crate::arch::LogCommitGuard,
+) -> (*const log::Shard, u64, u32, u32, u32) {
     let shard: u64;
     let seq: u64;
     let cpu: u32;
@@ -372,23 +371,18 @@ pub fn reserve_log_slot() -> (*const log::Shard, u64, u32, u32, u32) {
     let pid: u32;
     unsafe {
         core::arch::asm!(
-            "pushfq",
-            "cli",
             "mov {shard}, gs:[{shard_off}]",
             "mov {cpu:e}, gs:[8]",
             "mov {tid:e}, gs:[136]",
             "mov {pid:e}, gs:[140]",
-            "mov {seq}, 1",
-            "xadd [{shard}], {seq}",
-            "popfq",
             shard = out(reg) shard,
-            seq = out(reg) seq,
             cpu = out(reg) cpu,
             tid = out(reg) tid,
             pid = out(reg) pid,
             shard_off = const core::mem::offset_of!(PerCpu, log_shard),
             options(preserves_flags),
         );
+        seq = (&*(shard as *const log::Shard)).reserve(guard);
     }
     (shard as *const log::Shard, seq, cpu, tid, pid)
 }
@@ -724,4 +718,3 @@ pub fn swap_fault_state(new: CpuFaultState) -> CpuFaultState {
 pub fn set_fault_state(new: CpuFaultState) {
     unsafe { (*percpu_ptr()).fault_state = new as u8; }
 }
-

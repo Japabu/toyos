@@ -351,6 +351,16 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
     }
 
     let dr6 = debug::read_dr6();
+    // Disable the watchpoint before the first `log!`: the watched word may be
+    // the log shard's own head or body, in which case reserving this report
+    // would otherwise enter #DB again before this handler reached its old
+    // clear-at-exit site. This returning handler emits at most 32 records
+    // (including a 20-frame backtrace), far short of one 512-record lap; the
+    // publication guard's safety argument relies on both facts.
+    unsafe {
+        core::arch::asm!("mov dr7, {}", in(reg) 0u64);
+        core::arch::asm!("mov dr6, {}", in(reg) 0u64);
+    }
     let is_user = frame.cs & RPL_MASK != 0;
     let tid = percpu::current_tid();
     let pid = percpu::current_pid();
@@ -397,12 +407,6 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
     }
 
     log!("=== END WATCHPOINT ===");
-
-    // Clear DR6 so we don't re-trigger, then disable watchpoint
-    unsafe {
-        core::arch::asm!("mov dr6, {}", in(reg) 0u64);
-        core::arch::asm!("mov dr7, {}", in(reg) 0u64);
-    }
 }
 
 /// Double fault handler — runs on IST1. Always from kernel. Never returns.

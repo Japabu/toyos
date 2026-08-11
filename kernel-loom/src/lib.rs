@@ -47,6 +47,17 @@ pub mod preempt {
 /// interrupts. Empty here: the models do not drive that spin at all (see the
 /// scope note above), and the protocol it would call has its own models.
 pub mod arch {
+    /// The kernel implementation masks IF and TF across reservation and
+    /// publication. Loom has no per-CPU flags; the model's sole-writer
+    /// precondition is the corresponding witness here.
+    pub struct LogCommitGuard;
+
+    impl LogCommitGuard {
+        pub fn close() -> Self {
+            Self
+        }
+    }
+
     pub mod tlb {
         pub fn poll() {}
     }
@@ -66,8 +77,21 @@ pub mod arch {
     ///
     /// # Safety
     /// Same contract as the kernel's: a word only one CPU writes.
-    pub unsafe fn percpu_fetch_add(counter: &loom::sync::atomic::AtomicU64) -> u64 {
+    #[cfg(feature = "loom")]
+    pub unsafe fn percpu_fetch_add(
+        counter: &loom::sync::atomic::AtomicU64,
+        _guard: &LogCommitGuard,
+    ) -> u64 {
         counter.fetch_add(1, loom::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Host-fast form used to exercise the real zero-allocation constructor.
+    #[cfg(not(feature = "loom"))]
+    pub unsafe fn percpu_fetch_add(
+        counter: &core::sync::atomic::AtomicU64,
+        _guard: &LogCommitGuard,
+    ) -> u64 {
+        counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
     }
 }
 

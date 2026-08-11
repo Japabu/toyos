@@ -44,7 +44,7 @@ pub const SHARD_RECORDS: usize = 512;
 /// **Four under loom, and shrinking it is what makes the recycle properties
 /// expressible at all.** A model that had to emit 512 records to lap a
 /// reservation would explore an unbounded branch and never finish; at four, W2
-/// and W2b are two threads and a handful of steps. Nothing the models check
+/// is a handful of steps. Nothing the models check
 /// depends on the value — the validity test is exact equality against a
 /// `u64` that never wraps, and `seq % SHARD_RECORDS` is the only place the
 /// number appears.
@@ -197,30 +197,39 @@ impl Shard {
         self.head().saturating_sub(SHARD_RECORDS as u64).max(FIRST_SEQ)
     }
 
+    /// Finish constructing a shard obtained from zeroed allocation.
+    ///
+    /// Zero is the valid empty state of every slot, but it is not the initial
+    /// reservation counter: issued sequence numbers start at [`FIRST_SEQ`].
+    /// Keeping this as an in-place constructor avoids materialising a 128 KiB
+    /// [`Shard`] on the BSP's stack.
+    ///
+    /// # Safety
+    /// `ptr` must point to a zeroed, properly aligned, unpublished allocation
+    /// large enough for one [`Shard`]. It may be called exactly once.
+    #[cfg(not(feature = "loom"))]
+    pub unsafe fn initialize_zeroed(ptr: *mut Self) {
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr).head).write(AtomicU64::new(FIRST_SEQ));
+        }
+    }
+
     /// Take the next sequence number, **on the CPU that owns this shard**.
     ///
     /// One non-`lock`-prefixed `xadd`, which is atomic against an interrupt on
     /// its own CPU — instructions retire whole — and **not** atomic against
-    /// another CPU. `arch::percpu_fetch_add`'s bracket is what makes the second
-    /// half true; `log/mod.rs`'s `reserve` is the only caller and §2.3a is the
-    /// argument.
+    /// another CPU. The [`crate::arch::LogCommitGuard`] passed to
+    /// `arch::percpu_fetch_add` is what makes the second half true;
+    /// `log/mod.rs`'s `reserve` is the only caller and §2.3a is the argument.
     ///
     /// # Safety
-    /// The caller must be the CPU this shard belongs to, and must not be
-    /// preemptible between choosing this shard and returning from here.
-    pub unsafe fn reserve(&self) -> u64 {
-        crate::arch::percpu_fetch_add(&self.head)
+    /// The caller must be the CPU this shard belongs to, and `guard` must stay
+    /// live through the matching [`Shard::commit`].
+    pub unsafe fn reserve(&self, guard: &crate::arch::LogCommitGuard) -> u64 {
+        crate::arch::percpu_fetch_add(&self.head, guard)
     }
 
     /// Write a record's body into the slot `seq` names and publish it.
-    ///
-    /// Answers `false` when the reservation was **lapped** — a nested writer
-    /// emitted `SHARD_RECORDS` or more records before this one resumed, so the
-    /// slot now holds a live newer record. A `#DB` storm inside one record's
-    /// body write is the reachable case. Writing anyway is not *unsound* (the
-    /// readers' exact-equality test rejects the stale commit) but it destroys a
-    /// committed record for every reader that had not yet taken it, which is
-    /// the one transition the rest of this module says cannot happen.
     ///
     /// **It takes a whole [`LogRecord`] and never a field at a time**, which is
     /// what makes the caller unable to publish a record it only half built: the
@@ -230,12 +239,15 @@ impl Shard {
     /// number after — and the comment inside says why one is not enough.
     ///
     /// # Safety
-    /// `seq` must have come from this shard's own [`Shard::reserve`] and must
-    /// not have been passed here before.
-    pub unsafe fn commit(&self, seq: u64, record: &LogRecord) -> bool {
-        if self.head().saturating_sub(seq) >= SHARD_RECORDS as u64 {
-            return false;
-        }
+    /// `seq` must have come from this shard's own [`Shard::reserve`], `guard`
+    /// must be the same live guard passed to that call, and this must be the
+    /// first call for `seq`.
+    pub unsafe fn commit(
+        &self,
+        seq: u64,
+        record: &LogRecord,
+        _guard: &crate::arch::LogCommitGuard,
+    ) {
         let slot = &self.slots[(seq % SHARD_RECORDS as u64) as usize];
 
         // **Two stores publish, not one, and the first is what makes the
@@ -255,10 +267,9 @@ impl Shard {
         slot.seq.store(WRITING, Ordering::Relaxed);
         fence(Ordering::Release);
 
-        // SAFETY: this sequence number is exclusively ours until we publish it,
-        // and the check above established the slot has not been recycled out
-        // from under us. The slot now reads `WRITING`, so no reader will accept
-        // anything it finds here.
+        // SAFETY: the live guard makes this sequence number and slot exclusively
+        // ours until we publish it. The slot now reads `WRITING`, so no reader
+        // will accept anything it finds here.
         unsafe {
             *slot.body.get() = Body {
                 at_ns: record.at_ns,
@@ -275,7 +286,6 @@ impl Shard {
 
         // The store that publishes, and it is the last one.
         slot.seq.store(seq, Ordering::Release);
-        true
     }
 
     /// Copy record `seq` out, or `None` if this shard cannot answer for it.

@@ -124,30 +124,27 @@ struct Origin {
 
 /// This CPU's shard, its identity, and the sequence number this record owns.
 ///
-/// **The bracket is not optional and it is exactly three instructions wide.**
-/// A non-`lock`-prefixed `xadd` is atomic against an interrupt on its own CPU
-/// and not against another CPU, so the design is sound only while the CPU
-/// executing it owns the shard — and work stealing is on, so a kernel context
-/// at preempt depth 0 with `IF` set can be moved between reading `gs:` and
-/// performing the add. Two CPUs then read-modify-write one `head`, lose an
-/// update, and two records share a slot.
+/// **The bracket is not optional, and it ends at publication rather than at the
+/// reservation.** A non-`lock`-prefixed `xadd` is atomic against an interrupt
+/// on its own CPU and not against another CPU, so the design is sound only
+/// while the CPU executing it owns the shard — and work stealing is on. The
+/// same bracket must cover the body: a writer preempted there can resume after
+/// a whole newer generation committed into its slot and overwrite that live
+/// record before any final re-check can help.
 ///
-/// A preemption *after* the add is harmless, which is why the bracket ends
-/// there: the sequence number is already exclusively ours, and the body goes
-/// into the shard this returned rather than into whatever `gs:` says by then.
-///
-/// `preempt::disable` would buy the same property for two locked
-/// read-modify-writes per record, which is the cost this whole design exists to
-/// avoid — one `fetch_add` per line cost 350 ms of boot under TCG. On the
-/// dominant path the `popfq` restores a flag that was already clear, because
-/// `IF` is clear for the whole of every syscall.
-fn reserve() -> (Origin, u64) {
+/// `preempt::disable` would buy migration exclusion for two locked
+/// read-modify-writes per record and would still leave single-step #DB enabled.
+/// That is the cost this whole design exists to avoid — one `fetch_add` per line
+/// cost 350 ms of boot under TCG — without buying the full property. On the
+/// dominant path IF and TF were already clear, because IF is clear for the whole
+/// of every syscall and TF is normally clear machine-wide.
+fn reserve(guard: &crate::arch::LogCommitGuard) -> (Origin, u64) {
     if !PERCPU_READY.load(Ordering::Relaxed) {
         // One CPU, no scheduler, no GS base to read. An interrupt can still
         // land, and the `xadd` is still what makes that safe.
         //
         // SAFETY: nothing else is running, so this CPU owns the boot shard.
-        let seq = unsafe { BOOT_SHARD.reserve() };
+        let seq = unsafe { BOOT_SHARD.reserve(guard) };
         let origin = Origin {
             shard: &BOOT_SHARD,
             cpu: 0,
@@ -158,9 +155,9 @@ fn reserve() -> (Origin, u64) {
         return (origin, seq);
     }
 
-    let (shard, seq, cpu, tid, pid) = crate::arch::percpu::reserve_log_slot();
+    let (shard, seq, cpu, tid, pid) = crate::arch::percpu::reserve_log_slot(guard);
     // SAFETY: `reserve_log_slot` read this pointer out of this CPU's own
-    // `PerCpu`, with interrupts masked across the read and the add, and
+    // `PerCpu`, with IF and TF masked through the eventual commit, and
     // `alloc_percpu` gives every CPU a shard before that CPU executes an
     // instruction — so this is a live `Shard` and it is ours.
     let shard: &'static Shard = unsafe { &*shard };
@@ -169,32 +166,40 @@ fn reserve() -> (Origin, u64) {
 
 /// The only producer.
 ///
-/// Steps, in order, and only the second is uninterruptible: format on the
-/// stack, reserve, fill the record, publish it.
+/// Steps, in order: format on the stack, prepare the body, then reserve and
+/// publish under one IF/TF-off bracket.
 pub fn emit(level: Level, args: core::fmt::Arguments) {
     let at_ns = crate::clock::nanos_since_boot();
 
     let mut tee = Tee::open(at_ns);
     let _ = core::fmt::Write::write_fmt(&mut tee, args);
 
-    let (origin, seq) = reserve();
-
-    let record = LogRecord {
-        seq,
+    let mut record = LogRecord {
+        seq: 0,
         at_ns,
-        pid: origin.pid,
-        tid: origin.tid,
-        cpu: origin.cpu,
+        pid: 0,
+        tid: 0,
+        cpu: 0,
         len: tee.len as u16,
         elided: tee.elided.min(u16::MAX as usize) as u16,
         level: level as u8,
-        flags: origin.flags,
+        flags: 0,
         msg: tee.msg,
     };
 
+    let guard = crate::arch::LogCommitGuard::close();
+    let (origin, seq) = reserve(&guard);
+    record.seq = seq;
+    record.pid = origin.pid;
+    record.tid = origin.tid;
+    record.cpu = origin.cpu;
+    record.flags = origin.flags;
+
     // SAFETY: `seq` came from this shard's own `reserve`, on this CPU, and is
-    // published exactly once.
-    unsafe { origin.shard.commit(seq, &record) };
+    // published exactly once while the same guard keeps that CPU and its trap
+    // state unchanged.
+    unsafe { origin.shard.commit(seq, &record, &guard) };
+    drop(guard);
 
     tee.finish();
 }

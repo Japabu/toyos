@@ -14,6 +14,68 @@ pub mod smp;
 pub mod syscall;
 pub mod tlb;
 
+/// The witness that one log reservation and its publication cannot be
+/// preempted on this CPU.
+///
+/// **Both IF and TF are clear.** IF excludes IRQ delivery and scheduler
+/// preemption; TF matters independently because Ring 3 may set it and a #DB
+/// handler logs before returning. Leaving TF set lets that handler reserve a
+/// whole newer generation while the interrupted writer is halfway through its
+/// slot body.
+///
+/// The bracket is deliberately narrower than formatting: it covers only the
+/// shard pointer and identity reads, the unlocked `xadd`, and the 248-byte body
+/// publication. It takes no lock and performs no locked read-modify-write.
+#[must_use = "dropping the log commit guard reopens interrupts and single-step traps"]
+pub(crate) struct LogCommitGuard {
+    rflags: u64,
+    /// Restoring saved RFLAGS is a same-CPU operation. Keep safe code from
+    /// moving this guard to another CPU before Drop.
+    _not_send_sync: core::marker::PhantomData<*mut ()>,
+}
+
+impl LogCommitGuard {
+    pub fn close() -> Self {
+        const TF: u64 = 1 << 8;
+        const IF: u64 = 1 << 9;
+
+        let rflags: u64;
+        unsafe {
+            // Deliberately no `nomem`: besides these instructions using the
+            // stack, the implicit memory clobber keeps shard selection and
+            // publication on the closed side of this compiler barrier.
+            core::arch::asm!(
+                "pushfq",
+                "pop {saved}",
+                "cli",
+                saved = out(reg) rflags,
+            );
+            if rflags & TF != 0 {
+                let masked = rflags & !(TF | IF);
+                core::arch::asm!(
+                    "push {masked}",
+                    "popfq",
+                    masked = in(reg) masked,
+                );
+            }
+        }
+        Self { rflags, _not_send_sync: core::marker::PhantomData }
+    }
+}
+
+impl Drop for LogCommitGuard {
+    fn drop(&mut self) {
+        unsafe {
+            // Deliberately no `nomem`: the final slot store must stay before
+            // interrupts and single-step traps are reopened.
+            core::arch::asm!(
+                "push {saved}",
+                "popfq",
+                saved = in(reg) self.rflags,
+            );
+        }
+    }
+}
 
 /// Add one to a counter **only this CPU writes**, atomically against an
 /// interrupt on it and against nothing else, and answer the value before the
@@ -26,26 +88,28 @@ pub mod tlb;
 /// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). An unlocked
 /// `xadd` still retires whole, so an interrupt on this CPU cannot split it.
 ///
-/// The `cli` bracket is here rather than at the call site because the property
-/// this function claims — "no other CPU writes this word" — is false the moment
-/// the caller can be migrated. `pushfq`/`popfq` rather than `preempt::disable`,
-/// which is itself two locked read-modify-writes.
+/// [`LogCommitGuard`] is the bracket. It lives at the call site because the
+/// reservation and the body publication are one operation: reopening IF after
+/// the `xadd` lets a preempted writer resume after a whole newer generation has
+/// committed into the same slot.
 ///
 /// # Safety
-/// `counter` must be a word no other CPU ever writes, and the caller must have
-/// established that this CPU is its owner.
+/// `counter` must be a word no other CPU ever writes, and `guard` must cover
+/// the shard selection that established this CPU is its owner.
 #[inline(always)]
-pub unsafe fn percpu_fetch_add(counter: &core::sync::atomic::AtomicU64) -> u64 {
+pub unsafe fn percpu_fetch_add(
+    counter: &core::sync::atomic::AtomicU64,
+    _guard: &LogCommitGuard,
+) -> u64 {
     let previous: u64;
     unsafe {
+        // No `preserves_flags`: `xadd` changes arithmetic flags. The guard's
+        // later `popfq` restores the caller's flags, but code between these two
+        // asm blocks must still see an honest compiler contract.
         core::arch::asm!(
-            "pushfq",
-            "cli",
             "xadd [{ptr}], {out}",
-            "popfq",
             ptr = in(reg) counter.as_ptr(),
             out = inout(reg) 1u64 => previous,
-            options(preserves_flags),
         );
     }
     previous
