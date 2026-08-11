@@ -329,6 +329,27 @@ fn alloc_log_shard(cpu_id: u32) -> u64 {
     ptr as u64
 }
 
+/// This CPU's number and its current thread, for the legacy byte ring's prefix.
+///
+/// Unbracketed, which is what the `log!` macro did before the record ring and
+/// is why it is only good enough for a line that is about to be rendered as
+/// text. The record's own identity is read inside [`reserve_log_slot`]'s
+/// bracket. Both this and the caller go with the byte ring at L3.
+pub fn log_identity() -> (u32, u32) {
+    let cpu: u32;
+    let tid: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {cpu:e}, gs:[8]",
+            "mov {tid:e}, gs:[136]",
+            cpu = out(reg) cpu,
+            tid = out(reg) tid,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (cpu, tid)
+}
+
 /// This CPU's shard, its identity, and one sequence number out of that shard —
 /// with interrupts masked across exactly the pointer read and the add.
 ///

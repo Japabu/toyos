@@ -283,10 +283,36 @@ producer's path at all**: `emit`'s whole contribution to the wake is a
 `fence(SeqCst)` and a relaxed load, and the five locked operations the post
 costs are paid at most once per `klogd` park, by whichever producer wins the
 `LOG_WAITER` swap (§2.6a counts them). `Drain::Inline` keeps one CAS, in
-`BackendGuard`, for the boot's
-185 records on one CPU (§2.3). **Prediction, to be measured by L1's boot A/B and
-not asserted here: removing the per-record CAS is worth a similar saving to the
-one that issue records.** If it is not, the measurement is the finding.
+`BackendGuard`, for the boot's 185 records on one CPU (§2.3).
+
+**L1's half of that is measured and the ring is free.** Interleaved A/B, one
+session, one host (the dev laptop, arm64 cross-arch TCG), `xhci_slow_connect`'s
+`Boot: complete` as the instrument, five reps per arm alternating so a drift in
+host load falls on both:
+
+| arm | reps | mean |
+|---|---|---|
+| the record ring, in *addition* to the byte ring | 495, 495, 494, 494, 494 | **494.4 ms** |
+| `main` | 497, 497, 498, 498, 497 | **497.4 ms** |
+
+**Not a cost — a 3.0 ms saving, and the two arms do not overlap** (A's slowest
+is 495, B's fastest 497). The reading is stronger than a wash for a second
+reason: arm A does strictly *more* work than arm B. It writes the shard **and**
+does everything `main` does, the per-record `compare_exchange_weak` included.
+The most likely source of the difference is that 658 macro expansions became
+658 calls to one out-of-line `emit`, which is less code in the instruction
+cache; it is small, it is not what this chunk was for, and it is not worth
+chasing.
+
+What it establishes is the thing L1 owed: **the shard's reserve-and-commit is
+free at this instrument's resolution**, so what §1.4 prices at 350 ms is still
+entirely in the byte ring L3 deletes, and the new ring will not eat that saving.
+
+An earlier run of the same protocol, before `Tee` (below) put both sinks on one
+format pass, gave 499.0 against 500.4 — the same verdict with the arms
+overlapping. **Both arms moved by ~4 ms between the two sessions with no code
+between them on the B side**, which is the whole reason this protocol is
+same-session and interleaved.
 
 ---
 
@@ -608,18 +634,26 @@ Four properties, each structural rather than checked:
   `write_chunk_blocking` and `SerialWriter`'s spill-on-overflow, which is the
   mechanism every recorded splice went through.
 - **The validity word and the identity word are the same word.** A slot is
-  readable as record `s` exactly when **`s < head` and `slot.seq == s`.** There is
-  no separate "valid" flag that could disagree, and no even/odd seqlock
-  convention to get backwards.
+  readable as record `s` exactly when **`oldest_readable <= s < head` and
+  `slot.seq == s`.** There is no separate "valid" flag that could disagree with
+  the sequence number.
 
   **`slot.seq == s` alone is not a total test and an earlier draft of this
   section said it was.** Slots are zero at boot — cpu0's shard is `.bss` and an
   AP's is `alloc_zeroed` — so slot 0 of a shard that has never been written holds
   `seq == 0`, which *equals* sequence number 0. A reader checking only equality
-  would read an all-zero record as record 0 of every shard on every boot. `head`
-  starts at 0 and only grows, so `s < head` says "this sequence number was
-  reserved" and costs one comparison against a word the reader loads anyway
-  (§2.6). It is the load-bearing half.
+  would read an all-zero record as record 0 of every shard on every boot.
+
+  **And `s < head` does not repair it, which is L1's first correction.** `head`
+  counts *reservations*: it is bumped before the body exists, so on the very
+  first record of a boot `0 < head` and `slot.seq == 0` are both true while the
+  writer is still filling the slot — a reader accepts an uncommitted, half-built
+  record 0, on every boot, on every shard. **The fix is that sequence numbers
+  start at 1** (`FIRST_SEQ`), so no issued number can collide with the zeroed
+  state, and the reader's lower bound is `oldest_readable` rather than nothing.
+  Both ends are compared against words the reader loads anyway (§2.6).
+  `kernel-loom`'s `a_shard_nothing_has_written_answers_for_nothing` is what
+  fails if either goes back.
 
   **A stale value can never be mistaken for a live one, and that is what kills
   ABA.** Slot `j` only ever holds sequence numbers `≡ j (mod SHARD_RECORDS)`, the
@@ -627,18 +661,47 @@ Four properties, each structural rather than checked:
   *exact equality* rather than a range. So a slot carrying an older generation's
   number fails against every `s` the reader can ask for, and there is no value the
   reader accepts that was not written for that `s`.
-- **Exactly one store publishes**, and it is the last one. A record is visible
-  whole or not at all, and the reader's re-check of the same word after copying
-  the body is total: the only thing that can change a slot's body is a writer
-  reserving `s + SHARD_RECORDS`, and that writer's own commit store changes
-  `slot.seq` away from `s`.
+- **Two stores publish, and this section said one until L1 built it.** The claim
+  was: *"Exactly one store publishes, and it is the last one … the reader's
+  re-check of the same word after copying the body is total: the only thing that
+  can change a slot's body is a writer reserving `s + SHARD_RECORDS`, and that
+  writer's own commit store changes `slot.seq` away from `s`."*
+
+  **The re-check is not total, because that store comes after the body write.**
+  Throughout the recycling writer's body write the word still reads the
+  *previous* generation's number, so a reader that loads `s`, copies a
+  half-overwritten body and re-checks reads `s` **both times** and accepts the
+  tear. The window is the whole body write, which is the longest part of a
+  commit.
+
+  So the writer stores `WRITING` **before** it touches the body and the sequence
+  number after it, with a release fence between the mark and the body so the
+  mark is ahead of it for the reader too. The reader's re-check is then total for
+  the reason the first draft gave: any writer that started during the copy moved
+  the word first.
+
+  `WRITING` is `u64::MAX` and it is the second state one atomic word has to be
+  able to hold. A second word would be a second thing that can disagree with the
+  first, which is what this whole scheme exists to avoid; the value is
+  unreachable as a sequence number by 2^64 records, it is decoded at the
+  boundary, and no `LogRecord` ever carries it. **This is the even/odd seqlock
+  convention the first draft said it did not need**, with an explicit marker in
+  place of parity because slot `j` already constrains the word modulo
+  `SHARD_RECORDS` and parity would collide with that.
+
+  **`kernel-loom` found both of these on its first run**, before any guest test
+  existed to disagree, and neither is reachable on x86 in a way a test could
+  catch: `a_committed_record_is_whole_or_absent` and
+  `a_recycled_slot_does_not_answer_for_the_record_it_replaced` are the models.
+  This is the thing the model was built for and it earned itself immediately.
 
   **The body copy is a volatile byte copy, and that is a requirement rather than
   a style.** Reading 248 bytes that a writer may concurrently be storing into is a
   data race in Rust's model whatever x86 does about it; the re-check makes the
   *result* sound and does not make the *access* defined. `read_volatile` through
-  the `UnsafeCell` is the form, loom does not see this and neither does any guest
-  test, and the reason goes in the doc comment on the copy.
+  the `UnsafeCell` is the form, and the reason goes in the doc comment on the
+  copy. **Loom cannot model that access either**, and W2's entry in §2.5 says
+  what it models instead.
 - **Reentrancy cannot collide.** An exception or IRQ that logs while a record is
   being written on the same CPU takes its own reservation, so the two never share
   a slot. The nested record commits first and the outer commits after; §3.2 says
@@ -692,10 +755,19 @@ exactly the mistake the paragraph above records.
 | obligation | shape | model | when |
 |---|---|---|---|
 | **W1** publication | body stores → `seq.store(Release)`; reader's `seq.load(Acquire) == s` implies the body is visible | `kernel-loom/tests/log_record.rs` | L1 |
-| **W2** recycle detection | reader: `load(Acquire)`, copy, `fence(Acquire)`, `load(Relaxed)`, compare. The second load must not be hoisted above the copy | same | L1 |
-| **W2b** the lapped writer | a writer whose reservation was lapped by `SHARD_RECORDS` re-reads `head` and abandons; a reader mid-copy of the newer record must not observe the older `seq` (§2.4) | same | L1 |
+| **W2** recycle detection | the readable window is exactly the last `SHARD_RECORDS`, and a slot a writer has entered answers for neither generation. **Deterministic, not raced** — loom's `UnsafeCell` records every access as a write and reports the unsynchronised *pair*, so a seqlock read looks to it like a second writer; and a two-thread model over a whole ring is hundreds of thousands of interleavings, which did not finish in ten minutes here. What loom checks concurrently is W1; what makes W2 a state rather than a schedule is that the mark is published before the body | same | L1 |
+| **W2b** the lapped writer | a writer whose reservation was lapped by `SHARD_RECORDS` re-reads `head` and abandons rather than publishing over a live record (§2.4) | same | L1 |
 | **W3** the wake edge | `commit_and_signal`: `seq.store(Release); fence(SeqCst); LOG_WAITER.load(Relaxed)` against `arm_waiter`: `LOG_WAITER.store(true, Relaxed); fence(SeqCst); rescan for a committed record; park`. **Invariant: no committed record is left with a parked reader.** Store-buffer shaped, so TSO hides the missing fence and only loom sees it. Carries its own negative case — either fence removed behind a `cfg`, and the model must red — because a model that has never failed proves nothing | `kernel-loom/tests/log_wake.rs` | L3 |
 | **W4** the reservation | `head` is written by one CPU through inline asm and read by others as an `AtomicU64` | shimmed | L1 |
+
+**L1's models are green and they have teeth, which is checked rather than
+claimed**: with the commit store's `Release` weakened to `Relaxed`,
+`a_committed_record_is_whole_or_absent` reds and the other five stay green.
+`SHARD_RECORDS` is 4 under loom, which is what makes the recycle cases
+reachable at all — at 512 a model that has to lap a slot explores a branch it
+never finishes. The layout `const` assertions are skipped in that build,
+because loom's atomics and cells are wider than the real ones; they bind the
+build whose layout matters and the model is about the ordering.
 
 **W3 is L3's, and it is the one obligation the wake's own correctness rests on.**
 The producer-side edge is real in this branch — `emit` reads `LOG_WAITER` after
@@ -2191,8 +2263,8 @@ rebase, never amend.
 |---|---|---|---|
 | **L0** | merge `origin/main` (**post-endowment, and that is the whole of it** — completions lands after this branch, §12). Re-derive every number in this spec against the merged tree; re-check §12.5's endowment rows against the merged *code* and not only its plan; compute the first clean syscall number. **Nothing about the completion core is confirmable here and L0 must not wait on it** — §2.6a needs nothing from it. **Done 2026-08-11 against `f1724a9`; §0.0 is the walk** | suite green; §0.0 accounts for every moved row; the baselines of §9.3 recorded here |
 | **L-ABI** | **its own branch off `main`, landed before L1** (§11). `toyos-abi/src/log.rs` — `LogRecord`, `Level`, `LogCursor` with its clamped `durable`, `MAX_LOG_SHARDS`, the two layout `const` assertions and the `Display` of §3.3; `SYS_LOG_READ = 114`; `Rights::LOG`; the `toyos` SDK wrapper. **No kernel dispatch**: there is no shard to read until L1, so the number falls to the dispatch's default and answers `InvalidArgument`, which is what an unassigned number answers | `cargo test` in `toyos-abi/`: the layout asserts, and the `Display` rendering a known record byte for byte |
-| **L1** | `kernel/src/log/`: `Slot` over L-ABI's `LogRecord` and `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions. Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The `KernelArgs` `{:?}` site split into several records. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W2b, W4); `log_conservation`; `log_nested_emit`; `log_migration_storm`; `nmi_does_not_log`'s second clause; the boot A/B of §9.6 |
-| **L2** | the two readers; the `toyos-abi` formatter; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records; `Mark` → `Instant` | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green |
+| **L1** | `kernel/src/log/`: `Slot` over L-ABI's `LogRecord` and `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions **carrying the level with their text unchanged** (below). Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W2b, W4); the full suite indistinguishable from `main`'s; the boot A/B of §9.6 |
+| **L2** | the two readers; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records and at `Level`; **the `!!!` sentinel deleted from the seven `alert!` texts and from the ~20 assertions that read it**; the `KernelArgs` `{:?}` site split into several records; `Mark` → `Instant` | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green |
 | **L3** | `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`commit_and_signal`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement and the fence's A/B |
 | **L4** | the kernel's half of L-ABI, which touches no sysroot source: the `SYS_LOG_READ` dispatch over `drain_ordered`, `Source::Log` and its watcher static (§3.2), `logread` in `toyos_manifest`'s `SYSCAP_RIGHTS` and on `test-runner`'s row in the six test configs that have one | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall |
 | **L5** | one `ConsoleObject` per endowment over one backend, its line buffer, `Console` losing `DUP`; the ANSI strip moves; `MAX_CONSOLE_LINE` | `console_line_atomicity`; `console-unbuffered` reds both its clauses; `one_console_holder` |
@@ -2204,6 +2276,24 @@ rebase, never amend.
 
 **Dependencies.** L-ABI → L1. L1 → L2, L3, L4. L3 and L4 → L6. L5 → L7. L6 → L7.
 L8 after L7. L9 last. L10 independent of everything after L4.
+
+**Two rows moved at L1, and each is a thing this table had in the wrong chunk.**
+
+- **`log_conservation`, `log_nested_emit` and `log_migration_storm` are L4's, not
+  L1's.** All three read records back through `SYS_LOG_READ`, and L4 is what
+  dispatches it — at L1 there is no way for `test-runner` to see a shard at all.
+  The `log-storm`, `log-nested-emit`, `log-shared-reservation` and
+  `log-unbracketed-reserve` actuators go with them.
+- **Deleting the `!!!` sentinel is L2's, not L1's.** §2.1 has it happening with
+  the `alert!` conversion, and it cannot: the panel finds a red row by scanning
+  the *text* until L2 re-points it at `Level`, and the suite asserts on
+  `!!! PANIC !!!` and `!!! EARLY PANIC !!!` in about twenty places. Deleting the
+  marker at L1 would red every one of them while the mechanism that replaces it
+  is still two chunks away, against L1's own "nothing observable changes". So L1
+  makes the seven sites carry `Level::Alert` **with their text byte-identical**,
+  and L2 deletes the marker, re-points the panel and moves the assertions in one
+  commit. `nmi_does_not_log`'s second clause — *no `log!` in `kernel/` has `!!!`
+  in its format string* — is true from L1 and lands with the rest of that gate.
 
 ---
 

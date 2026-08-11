@@ -30,21 +30,68 @@ pub static PERCPU_READY: AtomicBool = AtomicBool::new(false);
 /// Zeroed, so it costs `.bss` and not 128 KiB of kernel image.
 pub static BOOT_SHARD: Shard = Shard::new();
 
-/// A message being formatted, on the caller's stack.
+/// One format pass, two sinks: the record's bounded message and — until L3
+/// deletes it — the byte ring.
 ///
-/// Formatting happens here rather than inside any critical section: today it
-/// happens inside `SerialWriter`, which is at least something the code claims
-/// to be a lock.
-struct MessageBuf {
+/// **The byte ring gets every byte and the record gets the first
+/// [`MAX_RECORD_MESSAGE`].** They have to differ, and finding out why is what
+/// L1's "nothing observable changes" claim was for: `screen_late_panic`'s
+/// stimulus is `late_panic::Nest`, a symbol demangled deliberately wider than
+/// any console grid, and it is far past the record bound. Rendering the byte
+/// ring *from the truncated record* dropped its tail and reddened the gate that
+/// exists to prove the panel wraps rather than clips. Feeding both from one
+/// pass costs nothing extra — the formatter runs once either way — and keeps
+/// this chunk byte-identical on the wire.
+///
+/// **The record bound is still too small and that is not fixed here**;
+/// `specs/issues/diagnostics/a-record-cannot-hold-a-demangled-frame.md` is the
+/// entry, and it has to be answered before L2 makes records what the panel
+/// renders.
+struct Tee {
     msg: [u8; MAX_RECORD_MESSAGE],
     len: usize,
-    /// Bytes that did not fit, saturating. **Counted rather than dropped** —
-    /// the difference between a bound and a lie.
+    /// Bytes past the record's bound, saturating. **Counted rather than
+    /// dropped** — the difference between a bound and a lie.
     elided: usize,
+    wire: crate::drivers::serial::SerialWriter,
 }
 
-impl core::fmt::Write for MessageBuf {
+impl Tee {
+    /// The legacy prefix, byte for byte what `log!` produced before this chunk.
+    ///
+    /// Its `cpu` and `tid` come from an unbracketed `gs:` read, exactly as the
+    /// old macro's did — a migration between here and the reservation would
+    /// mislabel this line and not the record. That is today's behaviour, it
+    /// goes away with the byte ring at L3, and the record's own identity is
+    /// read inside the bracket where it cannot be wrong.
+    fn open(at_ns: u64) -> Self {
+        use core::fmt::Write;
+        let mut wire = crate::drivers::serial::SerialWriter::lock();
+        let secs = at_ns / 1_000_000_000;
+        let millis = at_ns % 1_000_000_000 / 1_000_000;
+        if PERCPU_READY.load(Ordering::Relaxed) {
+            let (cpu, tid) = crate::arch::percpu::log_identity();
+            if tid == u32::MAX {
+                let _ = write!(wire, "[kernel {secs}.{millis:03} cpu{cpu}] ");
+            } else {
+                let _ = write!(wire, "[kernel {secs}.{millis:03} cpu{cpu} tid={tid}] ");
+            }
+        } else {
+            let _ = write!(wire, "[kernel {secs}.{millis:03} boot] ");
+        }
+        Self { msg: [0; MAX_RECORD_MESSAGE], len: 0, elided: 0, wire }
+    }
+
+    fn finish(mut self) {
+        use core::fmt::Write;
+        let _ = self.wire.write_str("\n");
+    }
+}
+
+impl core::fmt::Write for Tee {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.wire.write_bytes(s.as_bytes());
+
         let room = MAX_RECORD_MESSAGE - self.len;
         let bytes = s.as_bytes();
         if bytes.len() <= room {
@@ -53,8 +100,8 @@ impl core::fmt::Write for MessageBuf {
             return Ok(());
         }
         // Split on a character boundary: a record whose tail is half a UTF-8
-        // sequence renders as a truncated line for every consumer, and the one
-        // that matters paints a panel.
+        // sequence renders as mojibake for every consumer, and the one that
+        // matters paints a panel.
         let mut fit = room;
         while fit > 0 && !s.is_char_boundary(fit) {
             fit -= 1;
@@ -127,8 +174,8 @@ fn reserve() -> (Origin, u64) {
 pub fn emit(level: Level, args: core::fmt::Arguments) {
     let at_ns = crate::clock::nanos_since_boot();
 
-    let mut buf = MessageBuf { msg: [0; MAX_RECORD_MESSAGE], len: 0, elided: 0 };
-    let _ = core::fmt::Write::write_fmt(&mut buf, args);
+    let mut tee = Tee::open(at_ns);
+    let _ = core::fmt::Write::write_fmt(&mut tee, args);
 
     let (origin, seq) = reserve();
 
@@ -138,44 +185,18 @@ pub fn emit(level: Level, args: core::fmt::Arguments) {
         pid: origin.pid,
         tid: origin.tid,
         cpu: origin.cpu,
-        len: buf.len as u16,
-        elided: buf.elided.min(u16::MAX as usize) as u16,
+        len: tee.len as u16,
+        elided: tee.elided.min(u16::MAX as usize) as u16,
         level: level as u8,
         flags: origin.flags,
-        msg: buf.msg,
+        msg: tee.msg,
     };
 
     // SAFETY: `seq` came from this shard's own `reserve`, on this CPU, and is
     // published exactly once.
     unsafe { origin.shard.commit(seq, &record) };
 
-    to_byte_ring(&record);
-}
-
-/// The old byte ring, still fed, because this chunk changes nothing anybody can
-/// observe.
-///
-/// Every consumer — the serial drain, the file sink, the panel, `Ctrl+Alt+D` —
-/// still reads bytes; L2 re-points them at records and L3 deletes this. Keeping
-/// both live for two chunks is what lets the suite answer whether the record
-/// ring costs anything, against a tree whose output is byte-identical.
-fn to_byte_ring(record: &LogRecord) {
-    use core::fmt::Write;
-    let mut w = crate::drivers::serial::SerialWriter::lock();
-    let secs = record.at_ns / 1_000_000_000;
-    let millis = record.at_ns % 1_000_000_000 / 1_000_000;
-    if record.is_early() {
-        let _ = write!(w, "[kernel {secs}.{millis:03} boot] ");
-    } else if record.tid == u32::MAX {
-        let _ = write!(w, "[kernel {secs}.{millis:03} cpu{}] ", record.cpu);
-    } else {
-        let _ = write!(w, "[kernel {secs}.{millis:03} cpu{} tid={}] ", record.cpu, record.tid);
-    }
-    let _ = w.write_str(record.message());
-    if record.elided != 0 {
-        let _ = write!(w, " …[{} bytes elided]", record.elided);
-    }
-    let _ = w.write_str("\n");
+    tee.finish();
 }
 
 /// A line of ordinary kernel log. 658 sites.
