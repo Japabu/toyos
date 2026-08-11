@@ -2,23 +2,24 @@
 //! with what each relegation costs the tree written beside it.
 //!
 //! **The owner's line, 2026-08-11: the fast per-PR path runs tests taking ten
-//! seconds or less.** Everything above it moves to a nightly tier, which task
-//! #188 builds and which will be slower anyway because it also carries TCG and
-//! the long-running audio and stress work. This module is that decision in a
-//! form the nightly job can read: [`RELEGATED`] is exactly the set it has to
-//! run, and `tests/toyos.rs` writes [`Tier::Nightly`] against each of those
-//! names in its own registration.
+//! seconds or less.** Everything above it moves to a manually invoked nightly
+//! tier. `--nightly` exists now; scheduled CI is separate, unassigned work in
+//! `specs/issues/build/nightly-tier-has-no-workflow.md`. This module is that
+//! decision as data: [`RELEGATED`] is exactly the set the manual command selects
+//! and a future scheduled job must include, and `tests/toyos.rs` writes
+//! [`Tier::Nightly`] against each of those names in its own registration.
 //!
 //! **This is interim and it is a loss.** Twenty-seven names are over the line on
 //! their own and four more ride a boot with one that is; between them they are
 //! 1,347.7 s of the 1,760.5 s of test time the dev host measured, and none of
-//! them is gated per pull request until #188 lands. `guards` on every row says
-//! what stopped being gated, because a run that quietly does less is the whole
-//! failure mode here — `specs/test-cost-audit.md` §7 is the long form.
+//! them is gated per pull request. `guards` on every row says what stopped being
+//! gated, because a run that quietly does less is the whole failure mode here —
+//! `specs/test-cost-audit.md` §7 is the long form.
 //!
 //! **Nothing here is an optimisation and nothing here changes an assertion.**
-//! A relegated test measures exactly what it measured; it is run later. #188
-//! holds the work that would make one of these fast enough to come back.
+//! A relegated test measures exactly what it measured; the manual nightly
+//! command runs it. #188 holds only the optimisation work that would make one
+//! of these fast enough to come back to the per-PR tier.
 //!
 //! **The two instruments do not agree about which tests are long**, which is
 //! why the ceiling is applied to one reading and the other is only asked to
@@ -45,8 +46,9 @@ pub const FAST_CEILING_MS: u64 = 10_000;
 pub enum Tier {
     /// Every `cargo test`.
     Fast,
-    /// Only `cargo test --test toyos-build -- --nightly`, and the nightly
-    /// workflow #188 builds.
+    /// Only manual `cargo test --test toyos-build -- --nightly` until the
+    /// scheduled workflow in `specs/issues/build/nightly-tier-has-no-workflow.md`
+    /// is built.
     Nightly,
 }
 

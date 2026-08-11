@@ -2014,10 +2014,12 @@ the flashed one.
 **The owner's decision, in his words: "for now just disable the tests that cost
 the most and write it down. we will do it with the nightly ci task."** The line
 is his too: **the fast per-PR path runs tests taking ten seconds or less**, and
-everything above it goes to a nightly tier that task #188 builds. This section
-is the "write it down" half. It is the record the owner reads to decide whether
-the interim is acceptable, so it names every test by what the tree loses while
-that test is not gated per pull request — not by what the test does.
+everything above it goes to a manually invoked nightly tier. The command exists
+now; scheduled CI is separate, unassigned work tracked by
+`specs/issues/build/nightly-tier-has-no-workflow.md`. This section is the "write
+it down" half. It is the record the owner reads to decide whether the interim is
+acceptable, so it names every test by what the tree loses while that test is not
+gated per pull request — not by what the test does.
 
 **This changed no assertion and optimised nothing.** §3.7 is the audit's
 standing position that selective test running is the owner's call and that the
@@ -2037,8 +2039,9 @@ better than a nightly job.
   holds the two lists against each other in both directions at suite startup —
   a registered `Tier::Nightly` with no row, or a row nothing registers, refuses
   the run before anything boots.
-- `cargo test --test toyos-build -- --nightly` runs them. That is the flag the
-  nightly workflow takes, and the flag anybody touching one of these tests uses.
+- `cargo test --test toyos-build -- --nightly` runs them manually. It is also
+  the flag the future scheduled workflow takes; that workflow is still open in
+  `specs/issues/build/nightly-tier-has-no-workflow.md`.
 - **Every run says what it held back**, by name, in the header and again above
   the result line, and the result line itself carries `N held back for the
   nightly tier` — which is the line CI's per-shard job summary extracts.
@@ -2083,13 +2086,14 @@ identical, and nobody has explained the first reading. Its relegation does not
 rest on which of the two is right — either way it is the most expensive name in
 the suite.
 
-**What the profile will do next.** Once #188's workflow runs the nightly tier
-separately, a per-PR shard no longer measures these names, so
+**What the profile will do once scheduled CI exists.** When the workflow in
+`specs/issues/build/nightly-tier-has-no-workflow.md` runs the nightly tier, a
+per-PR shard no longer measures these names, so
 `--merge-durations` will report them as "names the profile prices and no shard
 ran" and drop them from `tests/test-durations`. The corroboration gate skips a
 name the profile has never seen, so it degrades to silence rather than to a
-false green — but #188 should merge the nightly run's own shard files, or the
-gate loses its second instrument.
+false green — but the scheduled workflow should merge the nightly run's own
+shard files, or the gate loses its second instrument.
 
 ### 7.3 What stopped being gated per pull request
 

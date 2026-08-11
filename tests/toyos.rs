@@ -11807,7 +11807,7 @@ fn check_registration() {
 
     // The declaration and the registration, against each other and in both
     // directions. `src/tiers.rs` carries what each relegated name cost and what
-    // it guarded — the record the owner reads and the input task #188's nightly
+    // it guarded — the record the owner reads and the input a future scheduled
     // workflow takes — and this is the only place the two can be compared: the
     // registration is here, and `cargo test --lib` cannot see it.
     let registered: BTreeSet<&str> = MACHINE_TESTS
@@ -12130,8 +12130,9 @@ fn main() {
             .sum();
         eprintln!(
             "[toyos] nightly tier: {} test(s) NOT run, {:.1} s of dev-host test time. \
-             `cargo test --test toyos-build -- --nightly` runs them; task #188 gives them a \
-             nightly workflow; specs/test-cost-audit.md §7 says what each one guards.",
+             `cargo test --test toyos-build -- --nightly` runs them manually; scheduled CI \
+             is not built: specs/issues/build/nightly-tier-has-no-workflow.md. \
+             specs/test-cost-audit.md §7 says what each one guards.",
             held_back.len(),
             ms as f64 / 1000.0,
         );
