@@ -1095,6 +1095,28 @@ file"**:
   channel, so it cannot leave the kernel: there is no userland at panic and none
   during boot. It stays, and it is drained by something that can afford it.
 
+**Two constraints bind every chunk of this branch and not only its end state.**
+They are here rather than in §10 because a stage that breaks either is wrong
+*with a green suite* — neither failure is reachable from the dev host.
+
+1. **No panic path may route through `logd`, at any stage.** Not
+   `panic_console`, not `page_forever`, not `halt_all_cpus`'s final lines. The
+   moment a panic depends on a userland daemon being alive, the machine that
+   needed the report is the machine that cannot produce one, and no test here
+   can stage that. §4.4's second `ConsoleObject` is the mechanism; this is the
+   rule it serves. `wait_for_log_file` (§6.4) is the one place the dying machine
+   *waits* for `logd`, and it is bounded, best-effort and already prints the
+   line that says the panel is the only copy — it never routes the report
+   through it.
+2. **A boot that wedges before the idle loop must not get quieter.** It produces
+   nothing at all today
+   (`specs/issues/diagnostics/pre-idle-wedge-says-nothing.md`), which is the
+   worst diagnostic hole in the tree. This branch is not obliged to fix it —
+   **and it does**: `Drain::Inline` (§4.2) puts every boot record on the wire as
+   it is written, for the whole boot, so the hole closes at L3 rather than
+   narrowing. §8.3 is the root `CLAUDE.md` rule that has to be repealed when it
+   does, and `pre_idle_wedge_speaks` (§9.5) is the gate.
+
 This also resolves **half** of an open question in the completion architecture,
 and the first draft of this paragraph claimed the whole of it. Its §10 gives
 `logd` (a kernel thread) the drain into *both* sinks and its §22 records the
@@ -1230,6 +1252,16 @@ is the line buffer plus a reference to the one backend, and the backend keeps
 fresh object per call (`object/device.rs:202`), so this is the shape the code
 has; what it does not have is a second call site.
 
+**Why there must be two at all, which is a stronger reason than the buffer and
+is the one a future agent will otherwise miss.** **The panic path must not
+depend on `logd`.** If `logd` held the machine's only console object, a panic
+after `logd` had died or been killed would have nowhere to write — and on the
+T14 the panic console and its pager *are* the diagnostic story. The kernel keeps
+one so that path survives `logd`'s death; `logd` gets the other for ordinary
+logging. Two objects over one backend is therefore not a concession to the line
+buffer, and **anyone who arrives here and tries to unify them is removing the
+kernel's last independent way to speak.**
+
 **Where the second one comes from, and it needs no new syscall.** init can only
 endow what it holds, and nothing in userland can mint a `ConsoleObject` — so
 `spawn_init` (`loader/mod.rs:912`) mints **two**: the first fills slots 0/1/2 as
@@ -1242,6 +1274,10 @@ is why `one_console_holder` (§9.5) is a second line rather than the only one. A
 image whose manifest marks nothing `console = true` leaves init holding the
 spare, which it closes; an image that marks two is refused by that gate at
 `cargo test --lib`, before any boot.
+
+**A syscall that mints a `ConsoleObject` was the other candidate and is
+rejected** (§14 row 12): it would let a process *name* its way to a console,
+which is the one thing the endowment architecture exists to make impossible.
 
 **`Console` loses `Rights::DUP`** (`initial_rights` gives it `BASE | READ |
 WRITE`, and `BASE` is `DUP | TRANSFER | WAIT` — `object/ops.rs:35`, `:50`).
@@ -2667,6 +2703,11 @@ Recorded because each is attractive and the next reader will re-derive it.
     take and which deadlocks the first time anything on that lock's path logs.
     The narrower thing §2.6a takes instead is `wake_direct`, which the scheduler
     has had all along.
+12. **A syscall that mints a `ConsoleObject`.** It is the obvious way to give
+    `logd` the second one, and it hands every process a name it can ask the
+    machine's console for — connect-by-name, rebuilt at the one object the
+    panic path depends on. `spawn_init` minting both is the same capability
+    moved by endowment, which is what §4.4 takes.
 8. **Converting all 654 `log!` sites to a finer level set.** A level with no
    reader is a field built for a plan; §2.1's three variants each have callers
    today.
