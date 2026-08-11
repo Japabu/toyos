@@ -163,7 +163,6 @@ fn cp_round_trip() {
     fs::remove_file(BIG_SRC).expect("cleanup");
     fs::remove_file(BIG_DST).expect("cleanup");
     fs::remove_file(landed).expect("cleanup");
-    fs::remove_file("/tmp/toybox_cp_dir/occupied").expect("cleanup");
 }
 
 fn cp_refusals() {
@@ -215,7 +214,6 @@ fn mv_within_a_mount() {
     println!("  PASS mv refuses a missing source before it renames anything");
 
     fs::remove_file("/tmp/toybox_mv_dir/toybox_mv_b.bin").expect("cleanup");
-    fs::remove_file("/tmp/toybox_mv_dir/occupied").expect("cleanup");
 }
 
 /// Whether `/home`'s listing holds a name. Other tests write there in the same
