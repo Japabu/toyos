@@ -132,6 +132,7 @@ pub const FLAGS: &[Flag] = &[
     flag("--host-builds", Value::Required),
     flag("--shard", Value::Required),
     flag("--slow-usb", Value::None),
+    flag("--nightly", Value::None),
 ];
 
 fn accepted() -> String {
@@ -332,6 +333,7 @@ mod tests {
             vec!["--host-slots", "0"],
             vec!["--host-builds", "0"],
             vec!["--shard", "2/4"],
+            vec!["--nightly"],
             vec!["--debug"],
         ] {
             assert!(parse_owned(&argv).is_ok(), "{argv:?}");

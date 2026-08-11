@@ -2006,3 +2006,153 @@ kernel with a debug syscall the flashed one does not have. Giving it back is a
 third build in every run, which is the trade §3.6 is about. The *image* — the
 diag config, no test binaries, nothing that can claim the framebuffer — is still
 the flashed one.
+
+---
+
+## 7. The nightly tier: what the fast path stopped gating, 2026-08-11
+
+**The owner's decision, in his words: "for now just disable the tests that cost
+the most and write it down. we will do it with the nightly ci task."** The line
+is his too: **the fast per-PR path runs tests taking ten seconds or less**, and
+everything above it goes to a nightly tier that task #188 builds. This section
+is the "write it down" half. It is the record the owner reads to decide whether
+the interim is acceptable, so it names every test by what the tree loses while
+that test is not gated per pull request — not by what the test does.
+
+**This changed no assertion and optimised nothing.** §3.7 is the audit's
+standing position that selective test running is the owner's call and that the
+audit's own answer is no; this is the owner overriding that for a stated
+interval, with the mechanism built so the override is loud and its end state is
+one command. #188 holds the postponed optimisation work — the reason to reach
+for it is that a name below becomes fast enough to come back, and that reason is
+better than a nightly job.
+
+### 7.1 The mechanism
+
+- `src/tiers.rs` is the declaration: `RELEGATED`, one row per test, carrying the
+  measured cost, why it is out, and what it guarded. `cargo test --lib` holds
+  every row against `FAST_CEILING_MS` and against the committed profile.
+- `tests/toyos.rs`'s registration carries `Tier::Fast` or `Tier::Nightly` beside
+  each entry's `Sched`, and does not compile without one. `check_registration`
+  holds the two lists against each other in both directions at suite startup —
+  a registered `Tier::Nightly` with no row, or a row nothing registers, refuses
+  the run before anything boots.
+- `cargo test --test toyos-build -- --nightly` runs them. That is the flag the
+  nightly workflow takes, and the flag anybody touching one of these tests uses.
+- **Every run says what it held back**, by name, in the header and again above
+  the result line, and the result line itself carries `N held back for the
+  nightly tier` — which is the line CI's per-shard job summary extracts.
+  `nightly_tier_is_announced` gates both directions of that, because a run that
+  quietly does less is the whole failure mode of a tier.
+- A filter that matches only relegated names refuses and names `--nightly`
+  rather than reporting "no tests match". The tier filter does *not* have an
+  exception for filtered runs: a rule with an exception is two rules, and the
+  second is the one nobody remembers.
+
+### 7.2 The measurement, and why it is one instrument's
+
+Taken from `target/test-durations` in the primary checkout on 2026-08-11, 310
+rows, **1,760.5 s of test time**. Twenty-seven names are over the ten-second
+line; four more are under it and go anyway because they share a boot with one
+that is over. Between them: **1,347.7 s, 76.6% of all test time.**
+
+**The dev host and CI do not agree about which tests are long, so the line is
+applied to one reading and the other is only asked to corroborate.** The
+disagreement is not noise and it is not a scale factor — it runs both ways by
+more than an order of magnitude:
+
+| test | dev host | CI (`tests/test-durations`) |
+|---|---|---|
+| `desktop_window_child` | 293.6 s | 63.3 s |
+| `metal_sim_pointer_churn` | 16.2 s | 235.2 s |
+| `boot_partition_identity` | 4.5 s | 247.0 s |
+| `screen_console_scroll` | 49.6 s | 11.1 s |
+| `kernel_heartbeat` | 4.9 s | 214.4 s |
+
+Of the 27 dev-host names over the line, **26 are also over it on CI** and the
+27th (`launcher_refusals`) postdates the last `--merge-durations`, so the
+relegation is not an artefact of one machine. The reverse does not hold at all:
+CI prices **44 further names** above ten seconds that the dev host runs in under
+ten, which is why `the_committed_profile_corroborates_every_relegation` is a
+one-directional gate and says so.
+
+**One reading of one run, and one of the rows knows it.** `desktop_window_child`
+is a standing expected failure whose cost is the liveness ceilings it exhausts;
+the same profile file was read at 24.8 s and at 293.6 s for it, mtime and size
+identical, and nobody has explained the first reading. Its relegation does not
+rest on which of the two is right — either way it is the most expensive name in
+the suite.
+
+**What the profile will do next.** Once #188's workflow runs the nightly tier
+separately, a per-PR shard no longer measures these names, so
+`--merge-durations` will report them as "names the profile prices and no shard
+ran" and drop them from `tests/test-durations`. The corroboration gate skips a
+name the profile has never seen, so it degrades to silence rather than to a
+false green — but #188 should merge the nightly run's own shard files, or the
+gate loses its second instrument.
+
+### 7.3 What stopped being gated per pull request
+
+Sorted by cost. `src/tiers.rs` carries the full sentence for each; this is the
+index and the reason each one is worth a reader's attention.
+
+| test | dev host | what is no longer gated per PR |
+|---|---|---|
+| `desktop_window_child` | 293.6 s | #156's only reproduction anywhere: a window opened from a shell and closed, and whether the desktop answers afterwards. 17% of all test time by itself. |
+| `sshd_fail_closed` | 116.1 s | **sshd once accepted every credential**; this is the gate for that class, including the half a missing-file check passes without — that a daemon which can accept no key is not holding port 22. |
+| `fpu_isolation` | 94.5 s | The user machine state surviving every exit from Ring 3, **against a second boot of an `fpu-save-nothing` kernel that must fail the same arms**. A negative gate: the first boot alone proves only that the machine works. |
+| `desktop_audio_client` | 80.7 s | An audio client spawned by a shell inside a terminal inside the compositor — the T14's only configuration — a second client connecting mid-stream, and the desktop surviving both. |
+| `wall_clock_refusals` | 73.7 s | Every way the wall clock can fail to answer, and the century register's absence. Four boots, a kernel build each. |
+| `hda_probe` | 67.5 s | Stage H0 of `specs/hda-driver-plan.md`: every branch of the probe's four questions, plus the plain kernel showing the probe stays out of an ordinary boot. |
+| `screen_fatal_halt_composited` | 67.4 s | Whether a fatal panic can paint the panel once a compositor owns the scanout — the T14's only configuration, and the assumption three freeze investigations rested on. |
+| `metal_sim_compositor` | 62.6 s | The four daemons surviving the T14's device shape, each in its own words. Nothing supervises any of them, so the message is the entire diagnostic. Carries five more tests on its boot. |
+| `doom_music` | 57.5 s | That doom opened the committed SoundFont, played to the end of the check, and reached the device — the three links the host tests cannot make, and the three `b8b0749` broke with the suite green. |
+| `doom_sound_flood` | 56.6 s | doom's sound producer outrunning its audio callback without the game dying: the first domino of the T14 freeze. |
+| `screen_console_scroll` | 49.6 s | Every row of the panel, character for character, after a workload built to leave stale glyphs. #90. |
+| `launcher_refusals` | 46.3 s | **The capability architecture's own enforcement gate**, and endowment landed the day before: sixteen malformed launches at `/bin/init`, with init still launching and the live-object count unchanged. |
+| `xhci_msi_only` | 37.5 s | The T14's Thunderbolt controller path, whose "polled mode" did not exist. `msix=off` is the only way the branch executes at all. |
+| `control_regs_negative` | 36.4 s | **The negative control** for the control-register verdict: a real divergent AP that `control_regs` must refuse. Without it, whether the verdict has teeth is prose. |
+| `desktop_typing_damage` | 23.0 s | What one typed character costs the desktop, off the compositor's own `damage_px_max`. |
+| `idle_stack_guard` | 22.8 s | The guard page under every per-CPU idle stack, whose absence is invisible to every log line and every screendump. |
+| `dump_nmi_probe` | 22.4 s | Ctrl+Alt+D's NMI probe, and the `rip` it brings back resolved against the kernel's symbols. |
+| `metal_sim_pointer_churn` | 16.2 s | Eight plug-and-pull cycles of a pointer under a compositor holding the merged fd — the owner's freeze, which landed on the fourth. |
+| `toybox_cp_volume` | 16.1 s | The real `/bin/cp` against a FAT32 volume, including the case where it fills. |
+| `usb_boot_stick_pulled` | 15.6 s | #152's only instrument: the boot stick pulled while the desktop draws. The failure has no other witness. |
+| `screen_pager_keys` | 14.6 s | PageUp/PageDown reaching the panic console's pager with every CPU stopped. |
+| `xhci_deaf_registers` | 14.2 s | Five register spins that had no deadline, which on the T14 is a silent hang and nothing else. |
+| `hda_client_stall` | 13.7 s | A client that stops producing mid-stream on both a cyclic ring and a queue, which must answer differently. |
+| `metal_sim_compositor_stall` | 13.3 s | A client that stops talking, stops listening, or never stops, with the host watching whether the desktop still paints. |
+| `xhci_hid_break` | 10.6 s | A HID endpoint completing with a code the driver dropped where it read it — the Logitech mouse that went silent on the T14. |
+| `swiss_german_layout` | 10.5 s | Swiss German end to end by physical key position: the table, the modifier levels, the ISO key and the dead keys at once. |
+| `iommu_discovery` | 10.2 s | Four machines differing in one advertised capability each, and whether the kernel's decode moves with them. |
+
+**And four that are under the line and go anyway**, because `group_of` makes a
+run of adjacent names one guest and a group cannot be split: `metal_sim_client_death`
+(4.0 s), `metal_sim_window_caps` (0.5 s), `metal_sim_ipc_hostile_peer` (0.1 s)
+and `metal_sim_scanout_wc` (0.0 s) ride `metal_sim_compositor`'s boot.
+`check_registration` refuses a group whose members disagree about their tier,
+for the same reason it refuses one that disagrees about `Sched`: the boot would
+land in the fast tier for whichever member ran first and charge it the whole
+group's cost. That is 4.6 s of collateral against 75.9 s of group, and it is the
+part of this change with the worst ratio.
+
+### 7.4 What was deliberately not touched
+
+- **Gate A.** Four boots in every `cargo test`, the owner's floor for anything
+  certifying audio, and not a row in the duration profile at all. Out of scope
+  by instruction.
+- **`EXPECTED_FAILURES`.** Both standing entries survive unchanged.
+  `desktop_window_child` being relegated does not touch its exemption, and
+  because that entry is `Stale::OnThisDate` rather than `Stale::OnAPass`, it
+  still expires on 2026-09-06 whether or not the test has run since — `expired`
+  is computed from the declaration and the day, never from what ran. Had either
+  entry been `OnAPass`, relegating it would have disabled its own staleness
+  detection, and that is the trap to check before relegating anything else.
+- **Every assertion, every negative gate, every actuator control.** Two of the
+  five scheduler negative gates and one actuator negative control are in the
+  relegated set (`control_regs_negative`, `fpu_isolation`); relegating one is a
+  scheduling decision and none of them was weakened.
+- **The `i8042_keyboard` group.** All three members are under the line
+  (7.7 s, 5.0 s, 1.0 s), so it stays whole in the fast tier even though the
+  group totals 13.7 s. The line is applied per registered test, which is the
+  unit the profile measures.
